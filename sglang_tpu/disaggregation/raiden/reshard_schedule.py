@@ -26,7 +26,7 @@ whole packs. These builders turn that geometry into
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Protocol, Sequence, Tuple
 
 
 class FusedKVLayerTensor(Protocol):
@@ -197,23 +197,124 @@ class ReshardGeometry:
                 f"({src_hpr} src head(s) vs {dst_hpr} dst head(s))."
             )
         packed_heads = -(-num_heads // heads_per_pack) * heads_per_pack
+        return self._entry(sh_start, packed_heads, dh_start)
+
+    def _entry(self, src_head: int, num_heads: int, dst_head: int):
+        """(src_offset, size, src_stride, dst_offset, dst_stride) of a run of
+        ``num_heads`` heads, per token; the strides are the two row widths."""
         return (
-            sh_start * self.hp_bytes,  # src_offset
-            packed_heads * self.hp_bytes,  # size
-            self.token_bytes(self.src_tp),  # src_stride (src per-token width)
-            dh_start * self.hp_bytes,  # dst_offset
-            self.token_bytes(self.dst_tp),  # dst_stride (dst per-token width)
+            src_head * self.hp_bytes,
+            num_heads * self.hp_bytes,
+            self.token_bytes(self.src_tp),
+            dst_head * self.hp_bytes,
+            self.token_bytes(self.dst_tp),
         )
 
     def check_decode_rank(self, decode_rank: int) -> None:
         """Raise ``entry_bytes``' error for any source of ``decode_rank``, so a
         decode can refuse an unsupported reshard before asking for the KV."""
-        if self.src_tp >= self.dst_tp:
-            sources = source_ranks_for(decode_rank % self.dst_tp, self.ratio)
-        else:
-            sources = [decode_rank % self.dst_tp * self.src_tp // self.dst_tp]
-        for prefill_rank in sources:
+        for prefill_rank in self.sources_of(decode_rank):
             self.entry_bytes(prefill_rank, decode_rank)
+
+    def sources_of(self, decode_rank: int) -> List[int]:
+        """Attention-TP ranks of the prefill that feed ``decode_rank``."""
+        if self.src_tp >= self.dst_tp:
+            return source_ranks_for(decode_rank % self.dst_tp, self.ratio)
+        return [decode_rank % self.dst_tp * self.src_tp // self.dst_tp]
+
+    def slot_bytes(self) -> int:
+        """Bytes one K/V slot adds to a token row (a pack row / kv_packing)."""
+        return self.padded_head_dim * self.element_size
+
+    def decode_rank_plan(self, decode_rank: int) -> Dict[int, WriterPlan]:
+        """Determine whether each prefill source lands DIRECT or STAGED for decode_rank."""
+        heads_per_pack = max(1, self.kv_packing // 2)
+        src_row = self.token_bytes(self.src_tp)
+        dst_row = self.token_bytes(self.dst_tp)
+        dst_heads = self.heads_per_rank(self.dst_tp)
+        dst_padded_heads = -(-dst_heads // heads_per_pack) * heads_per_pack
+        slot_bytes = self.slot_bytes()
+        direct: Dict[int, Tuple[int, int, int]] = {}  # rank -> (dh, n, packed)
+        staged: List[int] = []
+        slices = {}
+        for prefill_rank in self.sources_of(decode_rank):
+            sh, n, dh, src_hpr, _ = head_slice_params(
+                self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
+            )
+            slices[prefill_rank] = (sh, n, dh)
+            packed = -(-n // heads_per_pack) * heads_per_pack
+            aligned = sh % heads_per_pack == 0 and dh % heads_per_pack == 0
+            padded_tail = sh + n == src_hpr and dh + packed <= dst_padded_heads
+            if aligned and (n == packed or padded_tail):
+                direct[prefill_rank] = (dh, n, packed)
+            else:
+                staged.append(prefill_rank)
+        # Replicas of one kv-head (more prefill ranks than kv-heads) carry the
+        # same bytes: they share one staging slot and land identically.
+        staged_slices = list(dict.fromkeys(slices[p] for p in staged))
+        if len(staged_slices) * src_row > dst_row:
+            src_hpr = self.heads_per_rank(self.src_tp)
+            dst_hpr = self.heads_per_rank(self.dst_tp)
+            raise ValueError(
+                f"Partial FP8 head packs are unsupported: staging {len(staged_slices)} "
+                f"prefill rows ({len(staged_slices) * src_row} B) exceeds decode row "
+                f"({dst_row} B) for {self.src_tp} -> {self.dst_tp} "
+                f"({src_hpr} src head(s) vs {dst_hpr} dst head(s))."
+            )
+        plans: Dict[int, WriterPlan] = {}
+        merged = set()
+        for prefill_rank in staged:
+            sh, n, dh = slices[prefill_rank]
+            k = staged_slices.index((sh, n, dh))
+            stage_slot = k * (src_row // slot_bytes) + 2 * sh
+            merged.update(range(dh, dh + n))
+            plans[prefill_rank] = WriterPlan(
+                staged=True,
+                entry=(0, src_row, src_row, k * src_row, dst_row),
+                merges=((stage_slot, 2 * dh, 2 * n),),
+            )
+        direct_heads, padding = set(), set()
+        for prefill_rank, (dh, n, packed) in direct.items():
+            direct_heads.update(range(dh, dh + n))
+            padding.update(range(dh + n, dh + packed))
+            plans[prefill_rank] = WriterPlan(
+                staged=False,
+                entry=self._entry(slices[prefill_rank][0], packed, dh),
+                merges=(),
+            )
+        # Each decode head's final bytes come from a merge (which runs after
+        # every push), or from a direct push no other padded pack overwrites.
+        unplaced = [
+            h
+            for h in range(dst_heads)
+            if h not in merged and (h not in direct_heads or h in padding)
+        ]
+        if unplaced:
+            src_hpr = self.heads_per_rank(self.src_tp)
+            dst_hpr = self.heads_per_rank(self.dst_tp)
+            raise ValueError(
+                f"Unsupported reshard layout: {self.src_tp} -> {self.dst_tp} "
+                f"splits a {self.kv_packing}-slot pack across ranks "
+                f"({src_hpr} src head(s) vs {dst_hpr} dst head(s))."
+            )
+        return plans
+
+    def writer_plan(self, prefill_rank: int, decode_rank: int) -> WriterPlan:
+        return self.decode_rank_plan(decode_rank)[prefill_rank % self.src_tp]
+
+    def merge_spec(self, decode_rank: int) -> Tuple[Tuple[int, int, int], ...]:
+        """Return (staging_slot, decode_slot, num_slots) copy specs for staged head merges."""
+        plans = self.decode_rank_plan(decode_rank)
+        merges = (m for rank in sorted(plans) for m in plans[rank].merges)
+        return tuple(dict.fromkeys(merges))  # replicas merge the same slots
+
+
+class WriterPlan(NamedTuple):
+    """How one prefill rank's contribution lands on one decode rank."""
+
+    staged: bool  # lands in the decode's staging pages, not its real pages
+    entry: Tuple[int, int, int, int, int]  # per-token schedule entry bytes
+    merges: Tuple[Tuple[int, int, int], ...]  # (staging_slot, decode_slot, n)
 
 
 def _add_entry(
@@ -260,14 +361,15 @@ def build_sender_request(
 
     ``src_block_ids``/``dst_block_ids`` are physical page ids on each side, paired
     by token order; ``live_tokens[i]`` is the token count (``count``) of page ``i``.
+    For a staged writer the decode sent its staging page ids as ``dst_block_ids``.
     """
     if not (len(src_block_ids) == len(dst_block_ids) == len(live_tokens)):
         raise ValueError(
             "src_block_ids, dst_block_ids, live_tokens must be equal length"
         )
-    src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
+    src_off, size, src_stride, dst_off, dst_stride = geom.writer_plan(
         prefill_rank % geom.src_tp, decode_rank
-    )
+    ).entry
     req = pb2.StartTransferRequest()
     req.uuid = uuid
     req.req_id = req_id
@@ -306,6 +408,7 @@ def build_receiver_request(
     dst_block_ids: Sequence[int],
     live_tokens: Sequence[int],
     expected_block_count: Optional[int] = None,
+    staging_block_ids: Optional[Sequence[int]] = None,
 ):
     """Receiver-side StartTransferRequest assembling all sources into decode HBM.
 
@@ -316,7 +419,12 @@ def build_receiver_request(
     full id, while the byte geometry uses the engine's attention-TP rank within
     its replica (``sender_id % src_tp``). ``dst_mem_type = HBM`` makes the
     receiver auto-H2D the assembled host staging into HBM.
+
+    A staged source (``ReshardGeometry.decode_rank_plan``) lands in
+    ``staging_block_ids`` -- decode pages paired one-to-one with
+    ``dst_block_ids`` -- instead of the real pages.
     """
+    plans = geom.decode_rank_plan(decode_rank)
     req = pb2.StartTransferRequest()
     req.uuid = uuid
     req.req_id = req_id
@@ -325,11 +433,20 @@ def build_receiver_request(
     req.use_block_chunks = True
     total = 0
     for sender_id, src_block_ids in sources:
-        src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
-            sender_id % geom.src_tp, decode_rank
-        )
+        plan = plans[sender_id % geom.src_tp]
+        src_off, size, src_stride, dst_off, dst_stride = plan.entry
+        targets = dst_block_ids
+        if plan.staged:
+            if staging_block_ids is None or len(staging_block_ids) != len(
+                dst_block_ids
+            ):
+                raise ValueError(
+                    f"Raiden reshard source {sender_id} lands in staging pages, "
+                    f"but got {staging_block_ids!r} for {len(dst_block_ids)} pages"
+                )
+            targets = staging_block_ids
         schedule = req.shard_push_schedules[sender_id]
-        for src_b, dst_b, n in zip(src_block_ids, dst_block_ids, live_tokens):
+        for src_b, dst_b, n in zip(src_block_ids, targets, live_tokens):
             if n <= 0:
                 continue
             _add_entry(

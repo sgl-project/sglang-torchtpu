@@ -875,11 +875,23 @@ class RaidenReceiverMixin:
         # prefill for anything, so the room fails with the reason instead of
         # timing out (or, with an fp8 pool sized as bf16, landing heads in the
         # wrong slots).
+        # Writers whose heads share a decode pack with another writer's land
+        # in staging pages and are merged in on completion.
+        staging = None
         try:
+            staged_ranks = set()
             for swa in (False, True) if self._swa_kv_caches else (False,):
                 geometry = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=swa)
-                geometry.check_decode_rank(r)
-        except ValueError as e:
+                plans = geometry.decode_rank_plan(r)
+                staged_ranks |= {p for p, plan in plans.items() if plan.staged}
+                if staged_ranks and self._staging_allocator is None:
+                    # No allocator to stage with: keep the strict refusal.
+                    geometry.check_decode_rank(r)
+            if staged_ranks:
+                staging = self._alloc_reshard_staging(
+                    len(local_blocks), len(local_swa_blocks or [])
+                )
+        except (ValueError, RuntimeError) as e:
             reason = f"Raiden receive failed: room {room}: {e}"
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
@@ -910,18 +922,25 @@ class RaidenReceiverMixin:
             self._decode.reshard_swa_sources[room] = {}
             if aux_index is not None:
                 self._decode.decode_aux_index[room] = aux_index
-        payload = ReshardReq(
-            room=room,
-            decode_ip=self.local_ip,
-            decode_port=self.rank_port,
-            push_endpoint=push_endpoint,
-            decode_blocks=list(local_blocks),
-            dst_attn_tp=self.attn_tp_size,
-            decode_swa_blocks=list(local_swa_blocks or []),
-            swa_push_endpoint=swa_push_endpoint,
-            kv_offload=self.dram_offload_channel is not None,
-        ).to_frames()
-        for info in bootstrap_infos:
+            if staging is not None:
+                self._decode.reshard_staging[room] = staging
+        for source_rank, info in zip(source_ranks, bootstrap_infos):
+            # A staged source pushes into the staging pages paired one-to-one
+            # with the room's pages; it needs no other protocol change.
+            blocks, swa_blocks = local_blocks, local_swa_blocks or []
+            if source_rank in staged_ranks:
+                blocks, swa_blocks = staging.pages, staging.swa_pages
+            payload = ReshardReq(
+                room=room,
+                decode_ip=self.local_ip,
+                decode_port=self.rank_port,
+                push_endpoint=push_endpoint,
+                decode_blocks=list(blocks),
+                dst_attn_tp=self.attn_tp_size,
+                decode_swa_blocks=list(swa_blocks),
+                swa_push_endpoint=swa_push_endpoint,
+                kv_offload=self.dram_offload_channel is not None,
+            ).to_frames()
             endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
             self._send_multipart_locked(endpoint, payload)
 
@@ -1019,6 +1038,7 @@ class RaidenReceiverMixin:
             local_blocks = list(meta["local_blocks"])
             src_attn_tp = meta["src_attn_tp"]
             ready_endpoints = list(meta["ready_endpoints"])
+            staging = self._decode.reshard_staging.get(room)
         window = chunk_pull_window(start, length, total_pages, len(local_blocks))
         if not window:
             return None
@@ -1026,7 +1046,9 @@ class RaidenReceiverMixin:
         sources = [
             (p_rank, sources_map[p_rank][1][lo:hi]) for p_rank in sorted(sources_map)
         ]
-        dst = local_blocks[window.local_offset : window.local_offset + window.length]
+        dst_lo, dst_hi = window.local_offset, window.local_offset + window.length
+        dst = local_blocks[dst_lo:dst_hi]
+        staging_dst = staging.pages[dst_lo:dst_hi] if staging is not None else None
         # Independent decoders share a prefill. Use positive IDs that
         # fit the reshard RPC's signed int64 field.
         uuid = secrets.randbelow((1 << 63) - 1) + 1
@@ -1042,6 +1064,7 @@ class RaidenReceiverMixin:
                 sources=sources,
                 dst_block_ids=dst,
                 live_tokens=[self.kv_args.page_size] * window.length,
+                staging_block_ids=staging_dst,
             )
         except Exception as e:
             self._fail_reshard_plan_build(room, req_id, e)
@@ -1241,6 +1264,8 @@ class RaidenReceiverMixin:
                 return False
             sources.append((p_rank, pages[-n:]))
 
+        with self._state_lock:
+            staging = self._decode.reshard_staging.get(room)
         try:
             geom = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=True)
             req = build_receiver_request(
@@ -1253,14 +1278,11 @@ class RaidenReceiverMixin:
                 sources=sources,
                 dst_block_ids=local_swa_blocks,
                 live_tokens=[self.kv_args.page_size] * n,
+                staging_block_ids=staging.swa_pages if staging is not None else None,
             )
             self._swa_engine.register_active_plan(room, req, is_sender=False)
         except Exception as e:
-            reason = f"Raiden reshard SWA receive: cannot stage plan {room}: {e}"
-            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
-            with self._state_lock:
-                if room in self._decode.reshard_meta:
-                    self._fail_room_locked(room, reason)
+            self._fail_reshard_plan_build(room, self._swa_req_id(room), e)
             return False
         with self._state_lock:
             if room not in self._decode.reshard_meta or room in self._aborted:
@@ -1334,6 +1356,8 @@ class RaidenReceiverMixin:
             ready_endpoints = list(meta["ready_endpoints"])
             sources_map = dict(self._decode.reshard_sources[room])
             swa_sources_map = dict(self._decode.reshard_swa_sources.get(room, {}))
+            staging = self._decode.reshard_staging.get(room)
+            staging_blocks = list(staging.pages) if staging is not None else None
 
         # Arm the sliding-window receive before the READY goes out: the READY is
         # what tells every source to push, and its closing push carries the SWA
@@ -1400,6 +1424,10 @@ class RaidenReceiverMixin:
             local_blocks = [local_blocks[pg - base] for pg in missing] + (
                 local_swa_blocks if unified_swa_sources is not None else []
             )
+            if staging_blocks is not None:
+                staging_blocks = [staging_blocks[pg - base] for pg in missing] + (
+                    list(staging.swa_pages) if unified_swa_sources is not None else []
+                )
             n = len(local_blocks)
         else:
             # A decode prefix hit leaves decode holding fewer (tail) pages than
@@ -1428,6 +1456,7 @@ class RaidenReceiverMixin:
                 sources=sources,
                 dst_block_ids=local_blocks,
                 live_tokens=live,
+                staging_block_ids=staging_blocks,
             )
         except Exception as e:
             self._fail_reshard_plan_build(room, str(room), e)
@@ -1566,6 +1595,15 @@ class RaidenKVReceiver(CommonKVReceiver):
             # notify.
             return self._conclude_failed(notify=False)
         if self.kv_mgr.is_recv_done(self.bootstrap_room):
+            # Staged reshard writers are merged into the real pages
+            # here, on the scheduler thread, before the request can run.
+            try:
+                self.kv_mgr.merge_reshard_staging(self.bootstrap_room)
+            except Exception as e:
+                return self._conclude_failed(
+                    reason=f"Raiden reshard merge failed for room "
+                    f"{self.bootstrap_room}: {e}"
+                )
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
         if self._check_waiting_timeout() is not None:

@@ -6,7 +6,7 @@ manager because they can survive protocol-state cleanup.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 
 @dataclass
@@ -117,3 +117,17 @@ class DecodeState:
     reshard_swa_sources: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
     reshard_meta: Dict[int, dict] = field(default_factory=dict)
     reshard_registered: Set[int] = field(default_factory=set)
+
+    # Staging pages of rooms whose reshard has staged writers. Freed
+    # by clear_room, not by the generic table cleanup, so that the token
+    # allocator gets them back exactly once.
+    reshard_staging: Dict[int, "ReshardStaging"] = field(default_factory=dict)
+
+
+@dataclass
+class ReshardStaging:
+    """Tracks staging pages and allocator handles allocated for staged resharding."""
+
+    pages: List[int]
+    swa_pages: List[int]
+    frees: List[Tuple[Any, Any]]
