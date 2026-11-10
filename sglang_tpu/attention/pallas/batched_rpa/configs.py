@@ -120,6 +120,8 @@ class ServingConfigs:
     transposed_chunk_vt: bool = False
     # Unshifted streaming tile: the QK matmul pops bf16 scores (no f32->bf16 pass).
     transposed_s_bf16: bool = False
+    # Profiling: the grid step body and the full / masked tiles as named trace regions.
+    trace_regions: bool = False
 
     @property
     def pages_per_seq(self) -> int:

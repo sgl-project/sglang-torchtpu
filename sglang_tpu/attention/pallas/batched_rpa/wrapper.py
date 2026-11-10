@@ -917,6 +917,7 @@ def ragged_paged_attention(
         transposed_fp8_p=tpu_envs.SGLANG_TPU_RPA_TRANSPOSED_FP8_P.get(),
         transposed_chunk_vt=tpu_envs.SGLANG_TPU_RPA_CHUNK_VT.get(),
         transposed_s_bf16=tpu_envs.SGLANG_TPU_RPA_S_BF16.get(),
+        trace_regions=tpu_envs.SGLANG_TPU_RPA_TRACE_REGIONS.get(),
         transposed=(
             tpu_envs.SGLANG_TPU_RPA_TRANSPOSED.get()
             and kv_layout == configs.KVLayout.SEQ_ALONG_LANE

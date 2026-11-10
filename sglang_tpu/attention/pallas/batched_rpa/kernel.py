@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import dataclasses
 import functools
 import math
@@ -221,6 +222,17 @@ def calculate_and_store_out(
             jax.lax.cond(
                 is_last_k, accum_named_call, lambda *_: None, b, acc_val, l_val, m_val
             )
+
+
+def _scope(cfgs: configs.RpaConfigs, name: str):
+    return (
+        jax.named_scope(name) if cfgs.serve.trace_regions else contextlib.nullcontext()
+    )
+
+
+def traced_rpa_body(*args, cfgs: configs.RpaConfigs, **kwargs):
+    with _scope(cfgs, "rpa_step"):
+        rpa_body(*args, cfgs=cfgs, **kwargs)
 
 
 def rpa_body(
@@ -478,8 +490,13 @@ def rpa_body(
             full_tile = _full_tile(
                 step, schedule_ref, processed_q_len, processed_kv_len, cfgs
             )
-            pl.when(full_tile)(lambda: run_tile(apply_mask=False))
-            pl.when(jnp.logical_not(full_tile))(lambda: run_tile(apply_mask=True))
+
+            def traced_tile(apply_mask: bool):
+                with _scope(cfgs, "rpa_masked_tile" if apply_mask else "rpa_full_tile"):
+                    run_tile(apply_mask=apply_mask)
+
+            pl.when(full_tile)(lambda: traced_tile(False))
+            pl.when(jnp.logical_not(full_tile))(lambda: traced_tile(True))
         transposed.store_tile(step, schedule_ref, acc_scratch_ref, o_vref, cfgs=cfgs)
         return
 
@@ -910,7 +927,7 @@ def rpa_kernel(
 
                 pipeline_func = pltpu.emit_pipeline(
                     body=functools.partial(
-                        rpa_body,
+                        traced_rpa_body,
                         cfgs=cfgs,
                         cu_q_lens_ref=cu_q_lens_ref,
                         kv_lens_ref=kv_lens_ref,

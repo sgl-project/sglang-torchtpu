@@ -752,6 +752,9 @@ class TpuEnvs:
     # (e.g. bq=1024, bkv=1536 on Muse Spark global layers and 512:512 on window=2048).
     SGLANG_TPU_FORCE_RPA_PREFILL_BQ = EnvInt(None)
     SGLANG_TPU_FORCE_RPA_PREFILL_BQ_C = EnvInt(None)
+    # Batched RPA: in-kernel trace regions (step body, full / masked tile), visible in
+    # xprof with libtpu's --xla_enable_custom_call_region_trace=true. Profiling only.
+    SGLANG_TPU_RPA_TRACE_REGIONS = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
