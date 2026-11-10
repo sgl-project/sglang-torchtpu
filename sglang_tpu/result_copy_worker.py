@@ -125,6 +125,15 @@ class TPUAsyncCopyWorker:
             # supports_kv_free_fence). The returned copy stays referenced by
             # the submission future.
             draft_tail = None if tail is None else tail.to("cpu", non_blocking=True)
+            # A spec worker may report one tensor as both lengths; copy it once.
+            shared_lens = (
+                result.accept_lens is not None
+                and result.block_accept_lens is result.accept_lens
+            )
+            if shared_lens:
+                result.block_accept_lens = None
             # copy_to_cpu calls result.copy_done.record() after issuing the copies.
             result.copy_to_cpu(return_logprob, return_hidden_states)
+            if shared_lens:
+                result.block_accept_lens = result.accept_lens
             return draft_tail

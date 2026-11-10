@@ -142,7 +142,12 @@ def test_worker_preserves_context_and_serializes_copies(monkeypatch):
     def make_result(first):
         event = DelayedCopyEvent()
         event.transferred.set()
-        result = SimpleNamespace(copy_done=event, next_draft_input=None)
+        result = SimpleNamespace(
+            copy_done=event,
+            next_draft_input=None,
+            accept_lens=None,
+            block_accept_lens=None,
+        )
 
         def copy_to_cpu(return_logprob, return_hidden_states):
             assert get_ident() != scheduler_thread
@@ -236,7 +241,10 @@ def test_copy_done_covers_spec_draft_extend(
     event = Mock()
     event.record.side_effect = lambda: issued.append("record")
     result = SimpleNamespace(
-        copy_done=event, next_draft_input=make_draft_input(device_tail)
+        copy_done=event,
+        next_draft_input=make_draft_input(device_tail),
+        accept_lens=None,
+        block_accept_lens=None,
     )
     result.copy_to_cpu = lambda *args: (
         issued.append("copy"),
@@ -282,7 +290,12 @@ def test_view_tail_is_cloned_on_the_submitting_thread(monkeypatch):
         bonus_tokens=torch.zeros(1), new_seq_lens=torch.zeros(1)
     )
     draft_input.kv_fence_tail = view_tail
-    result = SimpleNamespace(copy_done=Mock(), next_draft_input=draft_input)
+    result = SimpleNamespace(
+        copy_done=Mock(),
+        next_draft_input=draft_input,
+        accept_lens=None,
+        block_accept_lens=None,
+    )
     result.copy_to_cpu = lambda *args: result.copy_done.record()
 
     worker = TPUAsyncCopyWorker(copy_draft_tail=True)
@@ -294,6 +307,47 @@ def test_view_tail_is_cloned_on_the_submitting_thread(monkeypatch):
     assert clone_threads == [threading.current_thread()]
     view_tail.to.assert_not_called()
     assert tail is draft_tail
+
+
+def test_shared_accept_lens_copy_once(monkeypatch):
+    """A worker reporting one tensor as accept_lens and block_accept_lens pays one D2H."""
+    device_module = SimpleNamespace(
+        Stream=Mock(),
+        stream=lambda value: contextmanager(lambda: (yield))(),
+    )
+    monkeypatch.setattr(torch, "get_device_module", Mock(return_value=device_module))
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "device_index",
+        lambda value: contextmanager(lambda: (yield))(),
+    )
+    lens = torch.ones(2, dtype=torch.int32)
+    host_lens = torch.ones(2, dtype=torch.int32)
+    copied = []
+
+    def copy_to_cpu(*args):
+        for name in ("accept_lens", "block_accept_lens"):
+            if getattr(result, name) is not None:
+                copied.append(name)
+        result.accept_lens = host_lens
+        result.copy_done.record()
+
+    result = SimpleNamespace(
+        copy_done=Mock(),
+        next_draft_input=None,
+        accept_lens=lens,
+        block_accept_lens=lens,
+    )
+    result.copy_to_cpu = copy_to_cpu
+    worker = TPUAsyncCopyWorker(copy_draft_tail=False)
+    try:
+        worker.submit(result, return_logprob=False, return_hidden_states=False)
+        result.copy_done.submitted.result(timeout=5)
+    finally:
+        worker.close()
+    assert copied == ["accept_lens"]
+    assert result.block_accept_lens is host_lens
 
 
 if __name__ == "__main__":
