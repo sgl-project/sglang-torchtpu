@@ -163,6 +163,11 @@ class TestDecodingStageParallelism(unittest.TestCase):
                 StageParallelismType.REPLICATED,
             )
 
+    # A platform whose subgroup collectives run while other ranks work.
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av.current_platform.supports_rank_subset_collectives",
+        new=lambda: True,
+    )
     def test_ltx2_refinement_broadcasts_when_decode_uses_all_ranks(self):
         stage = object.__new__(LTX2RefinementStage)
         stage.server_args = SimpleNamespace(enable_cfg_parallel=True)
@@ -183,6 +188,11 @@ class TestDecodingStageParallelism(unittest.TestCase):
                 StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS,
             )
 
+    # A platform whose subgroup collectives run while other ranks work.
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av.current_platform.supports_rank_subset_collectives",
+        new=lambda: True,
+    )
     def test_ltx2_refinement_stays_main_rank_only_without_parallel_decode(self):
         stage = object.__new__(LTX2RefinementStage)
         stage.server_args = SimpleNamespace(enable_cfg_parallel=True)
