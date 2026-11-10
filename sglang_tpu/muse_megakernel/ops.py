@@ -357,6 +357,15 @@ class MuseMegakernel(torch.nn.Module):
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
+        if parallel.moe_ep_size == parallel.tp_size > 1:
+            # the EP megakernel (MuseMegakernel(ep=True), ep_mk) has no serving weight load
+            raise NotImplementedError(
+                "the Muse EP megakernel is not wired for serving: it needs replicated "
+                "pre/post_expert_proj (ColumnParallel under EP), experts in ep_mk's layout "
+                "(kperm rows, chunk_cols-interleaved gate/up, which the native fused-RS MoE "
+                "and the prefill program also read) and, with SGLANG_TPU_EP_QBLOCK, "
+                "block-requantized scales shared with them"
+            )
         if not (
             parallel.moe_ep_size == 1
             and parallel.moe_tp_size == parallel.tp_size == parallel.attn_tp_size
