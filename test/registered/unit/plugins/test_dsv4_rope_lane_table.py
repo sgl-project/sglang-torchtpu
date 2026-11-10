@@ -176,5 +176,54 @@ class TestRopeLaneTableKernels(CustomTestCase):
             )
 
 
+class TestPrewarmTableRouting(CustomTestCase):
+    """Plain V4 shares one freqs_cis between attention and its compressor and
+    indexer, whose kernels need the plain table: every user of that freqs_cis
+    must get the same plain table, with no second 256 MB lane table. A
+    freqs_cis no compressor or indexer holds (V4.1) gets the lane table."""
+
+    class _Compressor(torch.nn.Module):
+        def __init__(self, freqs):
+            super().__init__()
+            self.wkv_gate = self.ape = self.norm = None
+            self.register_buffer("freqs_cis", freqs, persistent=False)
+
+    class _Attention(torch.nn.Module):
+        def __init__(self, freqs):
+            super().__init__()
+            self.register_buffer("freqs_cis", freqs, persistent=False)
+
+    def _prewarm(self, model):
+        from sglang_tpu.dsv4 import dsv4_attention_backend as backend
+
+        dsv4_memory_pool._COS_SIN_CACHE.clear()
+        dsv4_memory_pool._ROPE_LANE_TABLE.clear()
+
+        def ensure_compressor(module):
+            module._tpu_cos_sin_cache = get_or_build_cos_sin_cache(module.freqs_cis)
+            module._tpu_caches_ready = True
+
+        runner = type("Runner", (), {"model": model})()
+        with patch.object(backend, "ensure_tpu_compressor_caches", ensure_compressor):
+            backend.DSV4TPUAttnBackend._prewarm_model_caches(
+                type("Backend", (), {"model_runner": runner})()
+            )
+
+    def test_freqs_shared_with_a_compressor_keep_one_plain_table(self):
+        freqs = make_freqs(64)
+        compressor, attention = self._Compressor(freqs), self._Attention(freqs)
+        self._prewarm(torch.nn.ModuleList([compressor, attention]))
+        self.assertEqual(tuple(attention.freqs_cis.shape), (64, 64))
+        self.assertIs(attention.freqs_cis, compressor._tpu_cos_sin_cache)
+        self.assertEqual(dsv4_memory_pool._ROPE_LANE_TABLE, {})
+
+    def test_freqs_without_a_compressor_get_the_lane_table(self):
+        attention = self._Attention(make_freqs(64))
+        compressor = self._Compressor(make_freqs(64))  # its own freqs_cis
+        self._prewarm(torch.nn.ModuleList([compressor, attention]))
+        self.assertEqual(tuple(attention.freqs_cis.shape), (32, 128))
+        self.assertEqual(tuple(compressor.freqs_cis.shape), (64, 64))
+
+
 if __name__ == "__main__":
     unittest.main()

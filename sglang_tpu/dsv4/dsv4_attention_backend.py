@@ -77,6 +77,11 @@ _attn_hca_custom_op = None
 # =============================================================================
 
 
+def _freqs_key(freqs_cis: torch.Tensor) -> tuple[int, torch.device]:
+    """The key dsv4_memory_pool caches a freqs_cis' cos/sin tables under."""
+    return (id(freqs_cis), freqs_cis.device)
+
+
 def _register_rope_op():
     global _rope_custom_op
     if _rope_custom_op is not None:
@@ -878,6 +883,8 @@ class DSV4TPUAttnBackend(
         model = self.model_runner.model
         if model is None:
             return
+        # freqs_cis whose plain table a compressor or indexer kernel holds.
+        plain_freqs: set[tuple[int, torch.device]] = set()
         for module in model.modules():
             if (
                 hasattr(module, "wkv_gate")
@@ -885,6 +892,7 @@ class DSV4TPUAttnBackend(
                 and hasattr(module, "norm")
                 and hasattr(module, "freqs_cis")
             ):
+                plain_freqs.add(_freqs_key(module.freqs_cis))
                 ensure_tpu_compressor_caches(module)
             if (
                 hasattr(module, "wq_b")
@@ -892,6 +900,7 @@ class DSV4TPUAttnBackend(
                 and hasattr(module, "compressor")
                 and hasattr(module, "freqs_cis")
             ):
+                plain_freqs.add(_freqs_key(module.freqs_cis))
                 ensure_tpu_indexer_caches(module)
             if hasattr(module, "_local_attn_sink") and hasattr(
                 module, "_kernel_num_heads"
@@ -903,9 +912,10 @@ class DSV4TPUAttnBackend(
                 if isinstance(freqs_cis, torch.Tensor) and freqs_cis.is_complex():
                     # RoPE users take the lane-packed table: torch_tpu stores a
                     # [max_pos, 64] one transposed, which costs a full-table
-                    # relayout per Pallas call. The compressor and indexer
-                    # kernels keep the plain table they already hold.
-                    if getattr(module, "_tpu_caches_ready", False):
+                    # relayout per Pallas call. A freqs_cis shared with a
+                    # compressor/indexer (plain V4) keeps its plain table for
+                    # every user, so no second 256 MB table is built.
+                    if _freqs_key(freqs_cis) in plain_freqs:
                         cos_sin = get_or_build_cos_sin_cache(freqs_cis)
                     else:
                         cos_sin = get_or_build_rope_lane_table(freqs_cis)
