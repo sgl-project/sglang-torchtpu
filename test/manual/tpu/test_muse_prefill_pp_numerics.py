@@ -62,7 +62,10 @@ TOL_QKV = 1e-2  # attention inputs: bf16 roundings of nearly equal f32 values
 # transposed tile 2.2%; gmm_v2's W8A8 (fp8 layers) 3.6-4.3%, NVFP4 W4A16 0.45%. The port itself
 # is checked exactly: the stage's attention and slot outputs equal the served calls' bits.
 TOL_ATTN = 3e-2
-TOL_EXPERTS = {"fp4": 1e-2, "fp8": 5e-2}
+TOL_EXPERTS = {
+    "fp4": 1e-2,
+    "fp8": 5e-2,
+}  # MUSE_PP_QBLOCK_A8's W4A8 fp4: the fp8 (A8) bound
 # a token whose top-k set differs from the reference's must be a near tie of biased scores
 NEAR_TIE = 2e-3
 
@@ -620,7 +623,7 @@ def main() -> int:
                 and qkv_rel < TOL_QKV
                 and o_rel < TOL_ATTN
                 and xe_rel < TOL_QKV
-                and y_rel < TOL_EXPERTS[KINDS[l]]
+                and y_rel < TOL_EXPERTS["fp8" if fp4_qblock_a8() else KINDS[l]]
                 and o_port == 0.0
                 and y_port == 0.0
                 and kv_rel < TOL_KV
