@@ -39,6 +39,10 @@ from sglang_tpu.hooks.encoder import (
     reject_encoder_dp,
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
+from sglang_tpu.hooks.glm5_next_vision import (
+    compile_glm5_next_decoder_only,
+    encode_glm5_next_vision_on_host,
+)
 from sglang_tpu.hooks.glm_flash_megakernel import route_glm_flash_megakernel
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
@@ -229,6 +233,21 @@ HOOKS: list[tuple] = [
         "sglang.srt.layers.layer_boundary.adapters.attention."
         "_device_supports_input_scattered",
         device_supports_input_scattered,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.__init__",
+        compile_glm5_next_decoder_only,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.get_image_feature",
+        encode_glm5_next_vision_on_host,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.get_video_feature",
+        encode_glm5_next_vision_on_host,
         HookType.AROUND,
     ),
     (
