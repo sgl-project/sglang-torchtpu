@@ -252,8 +252,11 @@ def delayed_pre_flat_jax(
     dim = width // mult
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
     mixes = mult * (mult + 2)
-    if 3 * mixes > 128 or (
-        tokens not in (64, 96, 128, 256) and (tokens < 1024 or tokens % 64 != 0)
+    if (
+        3 * mixes > 128
+        or dim % 128 != 0
+        or tokens < 64
+        or (tokens % 64 != 0 and tokens != 96)
     ):
         return _delayed_pre_flat_small(flat, fn, scale, base, previous_pre, *constants)
     tile = tokens if tokens <= 128 else (128 if tokens == 256 else 64)
@@ -430,8 +433,11 @@ def delayed_post_pre_flat_jax(
     dim = width // mult
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
     mixes = mult * (mult + 2)
-    if 3 * mixes > 128 or (
-        tokens not in (64, 96, 128, 256) and (tokens < 1024 or tokens % 64 != 0)
+    if (
+        3 * mixes > 128
+        or dim % 128 != 0
+        or tokens < 64
+        or (tokens % 64 != 0 and tokens != 96)
     ):
         flat_new, value = jax.lax.optimization_barrier(
             _post_and_collapse_jax(

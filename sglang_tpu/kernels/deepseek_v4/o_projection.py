@@ -31,12 +31,13 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 SUBLANE = 8
 
 
-def _largest_divisor(x: int, cap: int) -> int:
-    """Largest divisor of ``x`` that is <= ``cap``."""
-    for candidate in range(min(x, cap), 0, -1):
+def _largest_divisor(x: int, cap: int, align: int = 1) -> int:
+    """Largest divisor of ``x`` that is <= ``cap`` and a multiple of ``align``."""
+    hi = (min(x, cap) // align) * align
+    for candidate in range(hi, 0, -align):
         if x % candidate == 0:
             return candidate
-    return 1
+    return align
 
 
 # RoPE lane helpers adapted from vllm-project/vllm-torchtpu (Apache-2.0).
@@ -204,20 +205,36 @@ def wo_a_projection(
         assert cos_sin.ndim == 2 and cos_sin.shape == (num_tokens, 2 * LANE)
     assert head_dim % LANE == 0
 
+    orig_tokens = num_tokens
     if tile_r is None:
         tile_r = lora_rank
     if tile_t is None:
-        tile_t = _largest_divisor(num_tokens, cap=1024)
+        padded_tokens = ((num_tokens + SUBLANE - 1) // SUBLANE) * SUBLANE
+        tile_t = _largest_divisor(padded_tokens, cap=1024, align=SUBLANE)
+        if padded_tokens > 64 and tile_t < 64:
+            padded_tokens = ((num_tokens + 63) // 64) * 64
+            tile_t = _largest_divisor(padded_tokens, cap=1024, align=SUBLANE)
+    else:
+        assert tile_t % SUBLANE == 0
+        padded_tokens = ((num_tokens + tile_t - 1) // tile_t) * tile_t
     if sub_t is None:
         # 128 is chosen based on large batch size (t) microbenchmarks
-        sub_t = _largest_divisor(tile_t, cap=128)
+        sub_t = _largest_divisor(tile_t, cap=128, align=SUBLANE)
+    if padded_tokens != num_tokens:
+        pad = padded_tokens - num_tokens
+        x = jnp.pad(x, ((0, pad), (0, 0), (0, 0)))
+        if cos_sin is not None:
+            cos_sin = jnp.pad(cos_sin, ((0, pad), (0, 0)))
+        num_tokens = padded_tokens
     assert lora_rank % tile_r == 0
     assert num_tokens % tile_t == 0
     assert tile_t % sub_t == 0
+    assert tile_t % SUBLANE == 0
+    assert sub_t % SUBLANE == 0
     num_t_tiles = num_tokens // tile_t
     num_r_tiles = lora_rank // tile_r
 
-    return pl.pallas_call(
+    out = pl.pallas_call(
         functools.partial(
             _kernel,
             tile_t=tile_t,
@@ -252,3 +269,4 @@ def wo_a_projection(
         ),
         name=name,
     )(x, wo_a, wo_a_scale.reshape(1, out_features), cos_sin)
+    return out[:orig_tokens]
