@@ -4673,6 +4673,17 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             owner, rl = r // Rc, r % Rc
                         src = ystage.at[b, pl.ds(j, 1)]
                         dst = pad_y.at[me, rl, pl.ds(k, 1)]
+                        if q_idx:
+                            # one remote copy per row, own rows too (y_rs counts them):
+                            # a local/remote pair runs both copies' bounds checks
+                            pltpu.make_async_remote_copy(
+                                src_ref=src,
+                                dst_ref=dst,
+                                send_sem=S["ystage_sems"].at[b],
+                                recv_sem=y_rsem,
+                                device_id=(owner,),
+                            ).start()
+                            return carry
 
                         @pl.when(owner == me)
                         def _():
@@ -5421,7 +5432,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         return carry
 
                     jax.lax.fori_loop(
-                        0, (c.tp - 1) * jnp.clip(n_live - me * Rc, 0, Rc), recv_row, 0
+                        0,
+                        (c.tp if q_idx else c.tp - 1)
+                        * jnp.clip(n_live - me * Rc, 0, Rc),
+                        recv_row,
+                        0,
                     )
 
             with _scope("combine"):
