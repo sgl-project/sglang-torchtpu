@@ -33,6 +33,9 @@ _INNER = frozenset(
         "own_rows",
         "y_row_wait",
         "combine_rows",
+        "route_count",
+        "route_perm",
+        "route_dma",
     )
 )
 

@@ -3934,12 +3934,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     )
                 return count, key
 
-            count, key = jax.lax.fori_loop(
-                0,
-                R // R_ct,
-                count_tile,
-                (jnp.zeros((1, Ep), f32), jnp.full((1, Ep), big, f32)),
-            )
+            with _scope("route_count"):
+                count, key = jax.lax.fori_loop(
+                    0,
+                    R // R_ct,
+                    count_tile,
+                    (jnp.zeros((1, Ep), f32), jnp.full((1, Ep), big, f32)),
+                )
             present = count > 0
             split = c.split_rows
             mult = 2 if split else 1
@@ -4034,10 +4035,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     )
                 return running + jnp.sum(onehot, axis=0, keepdims=True)
 
-            jax.lax.fori_loop(0, NT, perm_tile, jnp.zeros((1, Ep), f32))
-            cp = pltpu.make_async_copy(rv, S["route_s"], S["route_sem"].at[0])
-            cp.start()
-            cp.wait()
+            with _scope("route_perm"):
+                jax.lax.fori_loop(0, NT, perm_tile, jnp.zeros((1, Ep), f32))
+            with _scope("route_dma"):
+                cp = pltpu.make_async_copy(rv, S["route_s"], S["route_sem"].at[0])
+                cp.start()
+                cp.wait()
             return S["route_s"][4 * NB, 0]
 
         def mv_tiled(l, name, nxt, smr, col_off=None, on_col=None):
