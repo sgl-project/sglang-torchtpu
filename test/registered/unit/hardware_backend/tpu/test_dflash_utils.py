@@ -13,15 +13,27 @@ import torch
 
 import sglang.srt.managers.overlap_utils as overlap_utils
 import sglang.srt.speculative.dflash_info_v2 as dflash_info_v2
+import sglang_tpu.compilation.spec_decode_compile_policy_dflash as dflash_policy_mod
 import sglang_tpu.dflash_utils_tpu as dflash_utils_tpu
 from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_worker_v2 import (
+    DFlashWorkerV2,
+    _build_cpu_extend_positions,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang_tpu.compilation.compiled_forward_shim import _REAL_B_KEY, _REAL_Q_KEY
+from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
+    DFlashSpecDecodeCompilePolicyMixin,
+    _kv_appender_specialization_key,
+)
 from sglang_tpu.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
     argmax_draft_tokens_tpu,
     build_dflash_draft_block,
     gather_dflash_candidate_window,
+    pad_tensor_on_host,
     select_dflash_verify_cache_locs_tpu,
 )
 from sglang_tpu.experimental.speculative.spec_ops import select_verify_rows
@@ -505,10 +517,6 @@ def test_fused_draft_block_matches_the_step_by_step_prep():
         assert torch.equal(embeds, embed(block_ids=expected_ids))
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 def test_sharded_draft_argmax_outside_pallas_sizes_takes_the_global_best():
     """A DP-attention draft on TP2/TP4 has a vocab-sharded head the Pallas TopK cannot
     serve; drafting from the local shard alone would silently drop acceptance."""
@@ -550,3 +558,286 @@ def test_sharded_draft_argmax_outside_pallas_sizes_takes_the_global_best():
             lm_head=lm_head, hidden_states=hidden, block_size=3
         )
     assert tokens.tolist() == [[1, 7]]
+
+
+def test_pad_tensor_on_host_pads_to_target_and_preserves_noop_when_large():
+    t = torch.tensor([11, 22, 33], dtype=torch.int64)
+    padded = pad_tensor_on_host(t, 6)
+    assert padded.dtype == torch.int64
+    assert padded.device.type == "cpu"
+    assert padded.tolist() == [11, 22, 33, 0, 0, 0]
+
+    assert pad_tensor_on_host(t, 3) is t
+    assert pad_tensor_on_host(t, 2) is t
+
+    t2d = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    padded_2d = pad_tensor_on_host(t2d, 4, dim=1)
+    assert padded_2d.dtype == torch.int32
+    assert padded_2d.tolist() == [[1, 2, 0, 0], [3, 4, 0, 0]]
+
+
+def test_build_cpu_extend_positions_packs_segments_and_pads():
+    positions = _build_cpu_extend_positions([5, 10, 0], [3, 0, 2], 8)
+    assert positions.dtype == torch.int64
+    assert positions.device.type == "cpu"
+    assert positions.tolist() == [5, 6, 7, 0, 1, 0, 0, 0]
+
+    tensor_positions = _build_cpu_extend_positions(
+        torch.tensor([2, 7], dtype=torch.int32),
+        torch.tensor([2, 3], dtype=torch.int32),
+        4,
+    )
+    assert tensor_positions.dtype == torch.int64
+    assert tensor_positions.tolist() == [2, 3, 7, 8, 9]
+
+
+def test_finalize_forward_batch_keeps_extend_hidden_when_eligible_and_trims_otherwise():
+    class _TestPolicy(DFlashSpecDecodeCompilePolicyMixin):
+        def __init__(self, worker):
+            self._dflash_worker = worker
+
+    for worker, mode, cap_mode, mix_w, before_norm, expect_padded in [
+        (None, ForwardMode.EXTEND, CaptureHiddenMode.FULL, 1, False, True),
+        (
+            SimpleNamespace(lilicorr=None),
+            ForwardMode.EXTEND,
+            CaptureHiddenMode.FULL,
+            1,
+            False,
+            True,
+        ),
+        (
+            SimpleNamespace(lilicorr=object()),
+            ForwardMode.EXTEND,
+            CaptureHiddenMode.FULL,
+            1,
+            False,
+            False,
+        ),
+        (
+            SimpleNamespace(lilicorr=None),
+            ForwardMode.EXTEND,
+            CaptureHiddenMode.LAST,
+            1,
+            False,
+            False,
+        ),
+        (
+            SimpleNamespace(lilicorr=None),
+            ForwardMode.EXTEND,
+            CaptureHiddenMode.FULL,
+            2,
+            False,
+            False,
+        ),
+        (
+            SimpleNamespace(lilicorr=None),
+            ForwardMode.EXTEND,
+            CaptureHiddenMode.FULL,
+            1,
+            True,
+            False,
+        ),
+        (
+            SimpleNamespace(lilicorr=None),
+            ForwardMode.DECODE,
+            CaptureHiddenMode.FULL,
+            1,
+            False,
+            False,
+        ),
+    ]:
+        policy = _TestPolicy(worker)
+        padded_hidden = torch.arange(12, dtype=torch.float32).view(6, 2)
+        outputs = SimpleNamespace(
+            next_token_logits=torch.zeros((6, 4)),
+            hidden_states=padded_hidden,
+        )
+        fb = SimpleNamespace(
+            forward_mode=mode,
+            capture_hidden_mode=cap_mode,
+            mix_verify_width=mix_w,
+            return_hidden_states_before_norm=before_norm,
+            sampling_info=None,
+            spec_info=SimpleNamespace(keep_outputs_padded=False),
+            **{_REAL_Q_KEY: 2, _REAL_B_KEY: 2},
+        )
+        finalized = policy.finalize_forward_batch(outputs, fb)
+        assert finalized.next_token_logits.shape[0] == 2
+        if expect_padded:
+            assert finalized.hidden_states is padded_hidden
+        else:
+            assert finalized.hidden_states.shape[0] == 2
+
+
+def test_dflash_kv_append_dtype_normalization_and_precompile():
+    recorded: list[dict[str, object]] = []
+
+    class _PolicyStub(DFlashSpecDecodeCompilePolicyMixin):
+        def __init__(self) -> None:
+            self.b_bucketer = SimpleNamespace(
+                buckets=[1, 4], next_bucket=lambda bs: 1 if bs <= 1 else 4
+            )
+            self.t_bucketer = SimpleNamespace(
+                buckets=[1024, 2048, 4096],
+                next_bucket=lambda n: next(b for b in (1024, 2048, 4096) if b >= n),
+            )
+            self.draft_token_num = 16
+            self.dflash_target_hidden_size = 8
+            self.model_runner = SimpleNamespace(
+                device=torch.device("cpu"), dtype=torch.bfloat16
+            )
+
+            def appender(**kwargs):
+                recorded.append(dict(kwargs))
+                return kwargs["cache_loc"][:1] + 1
+
+            self._compiled_kv_appender = appender
+
+        def _dummy_out_cache_loc_dtype(self, mode):
+            return torch.int32
+
+        def _precompile_shapes(self, label, shapes, run_fn):
+            for shape in shapes:
+                run_fn(shape)
+
+    policy = _PolicyStub()
+
+    policy._precompile_draft_append_kv_extend()
+    extend_calls = list(recorded)
+    assert [tuple(c["cache_loc"].shape) for c in extend_calls] == [
+        (1024,),
+        (2048,),
+        (4096,),
+    ]
+    extend_keys = {}
+    for call in extend_calls:
+        assert call["cache_loc"].dtype == torch.int64
+        assert call["positions"].dtype == torch.int64
+        assert call["cache_loc_2d"] is None
+        assert call["commit_lens"] is None
+        extend_keys[int(call["cache_loc"].shape[0])] = _kv_appender_specialization_key(
+            **call
+        )
+
+    recorded.clear()
+    policy._precompile_draft_append_kv_verify()
+    verify_calls = list(recorded)
+    assert [tuple(c["cache_loc_2d"].shape) for c in verify_calls] == [
+        (1, 16),
+        (4, 16),
+    ]
+    for call in verify_calls:
+        assert call["cache_loc"].dtype == torch.int64
+        assert call["positions"].dtype == torch.int64
+        assert call["cache_loc_2d"].dtype == torch.int64
+        assert call["commit_lens"].dtype == torch.int32
+
+    recorded.clear()
+    policy.append_target_hidden_to_draft_kv_by_loc_tpu(
+        target_hidden=torch.zeros((1500, 8), dtype=torch.bfloat16),
+        cache_loc=torch.arange(1500, dtype=torch.int32),
+        positions=torch.arange(1500, dtype=torch.int32),
+    )
+    assert len(recorded) == 1
+    assert recorded[0]["cache_loc"].dtype == torch.int64
+    assert recorded[0]["positions"].dtype == torch.int64
+    assert _kv_appender_specialization_key(**recorded[0]) == extend_keys[2048]
+
+    recorded.clear()
+    cl_exact = torch.arange(1024, dtype=torch.int64)
+    pos_exact = torch.arange(1024, dtype=torch.int64)
+    policy.append_target_hidden_to_draft_kv_by_loc_tpu(
+        target_hidden=torch.zeros((1024, 8), dtype=torch.bfloat16),
+        cache_loc=cl_exact,
+        positions=pos_exact,
+    )
+    assert recorded[0]["cache_loc"] is cl_exact
+    assert recorded[0]["positions"] is pos_exact
+
+    recorded.clear()
+    policy.append_target_hidden_to_draft_kv_by_loc_tpu(
+        target_hidden=torch.zeros((16, 8), dtype=torch.bfloat16),
+        cache_loc=torch.zeros((16,), dtype=torch.int32),
+        positions=torch.zeros((16,), dtype=torch.int32),
+        cache_loc_2d=torch.zeros((1, 16), dtype=torch.int32),
+        commit_lens=torch.ones((1,), dtype=torch.int64),
+    )
+    assert recorded[0]["cache_loc"].dtype == torch.int64
+    assert recorded[0]["positions"].dtype == torch.int64
+    assert recorded[0]["cache_loc_2d"].dtype == torch.int64
+    assert recorded[0]["commit_lens"].dtype == torch.int32
+
+    recorded.clear()
+    cl_v = torch.zeros((64,), dtype=torch.int64)
+    pos_v = torch.zeros((64,), dtype=torch.int64)
+    cl2_v = torch.zeros((4, 16), dtype=torch.int64)
+    com_v = torch.ones((4,), dtype=torch.int32)
+    policy.append_target_hidden_to_draft_kv_by_loc_tpu(
+        target_hidden=torch.zeros((64, 8), dtype=torch.bfloat16),
+        cache_loc=cl_v,
+        positions=pos_v,
+        cache_loc_2d=cl2_v,
+        commit_lens=com_v,
+    )
+    assert recorded[0]["cache_loc"] is cl_v
+    assert recorded[0]["positions"] is pos_v
+    assert recorded[0]["cache_loc_2d"] is cl2_v
+    assert recorded[0]["commit_lens"] is com_v
+
+
+def test_pad_append_target_hidden_uses_host_pad_for_tpu_tensors():
+    class _PolicyStub(DFlashSpecDecodeCompilePolicyMixin):
+        def __init__(self) -> None:
+            self.t_bucketer = SimpleNamespace(next_bucket=lambda n: 8)
+            self.b_bucketer = None
+
+    class _FakeTpuTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls, data):
+            return torch.Tensor._make_subclass(cls, data.detach())
+
+        @property
+        def device(self):
+            return SimpleNamespace(type="tpu")
+
+    policy = _PolicyStub()
+    pos = _FakeTpuTensor(torch.tensor([1, 2, 3], dtype=torch.int64))
+    loc = _FakeTpuTensor(torch.tensor([10, 20, 30], dtype=torch.int32))
+    hidden = torch.zeros((3, 4), dtype=torch.bfloat16)
+
+    seen_calls: list[tuple[int, torch.Tensor]] = []
+
+    def fake_host_pad(t: torch.Tensor, target_size: int, dim: int = 0) -> torch.Tensor:
+        seen_calls.append((target_size, t))
+        return pad_tensor_on_host(t.as_subclass(torch.Tensor), target_size, dim=dim)
+
+    with patch.object(dflash_policy_mod, "pad_tensor_on_host", fake_host_pad):
+        out_h, out_loc, out_pos, out_loc2d, out_com = (
+            policy.pad_append_target_hidden_tpu(
+                target_hidden=hidden, cache_loc=loc, positions=pos
+            )
+        )
+    assert out_h.shape == (8, 4)
+    assert out_loc.shape == (8,) and out_loc.tolist()[:3] == [10, 20, 30]
+    assert out_pos.shape == (8,) and out_pos.tolist()[:3] == [1, 2, 3]
+    assert out_loc2d is None and out_com is None
+    assert len(seen_calls) == 2 and all(size == 8 for size, _ in seen_calls)
+
+
+def test_get_num_token_non_padded_tensor_caches_int32_scalars():
+    worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
+    worker.device = torch.device("cpu")
+    worker._num_token_non_padded_cache = {}
+
+    t16 = worker._get_num_token_non_padded_tensor(16)
+    t16_again = worker._get_num_token_non_padded_tensor(16)
+    t32 = worker._get_num_token_non_padded_tensor(32)
+    assert t16 is t16_again
+    assert t16 is not t32
+    assert t16.dtype == torch.int32 and int(t16.item()) == 16
+    assert t32.dtype == torch.int32 and int(t32.item()) == 32
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -623,3 +623,24 @@ def plan_dflash_device_accept(
             batch.device, dtype=torch.int64, non_blocking=True
         ),
     )
+
+
+def pad_tensor_on_host(t: torch.Tensor, target_size: int, dim: int = 0) -> torch.Tensor:
+    """Pad ``t`` along ``dim`` on CPU and transfer back to ``t.device`` non-blocking."""
+    ndim = t.ndim
+    if dim < 0:
+        dim += ndim
+    if dim < 0 or dim >= ndim:
+        raise IndexError(f"dim {dim} out of range for {ndim}D tensor")
+    cur_size = int(t.shape[dim])
+    if cur_size >= target_size:
+        return t
+    target_shape = list(t.shape)
+    target_shape[dim] = int(target_size)
+    out_cpu = torch.zeros(target_shape, dtype=t.dtype, device="cpu")
+    slices = [slice(None)] * ndim
+    slices[dim] = slice(0, cur_size)
+    out_cpu[tuple(slices)].copy_(t.to("cpu"))
+    return (
+        out_cpu if t.device.type == "cpu" else out_cpu.to(t.device, non_blocking=True)
+    )
