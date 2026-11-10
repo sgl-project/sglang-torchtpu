@@ -233,8 +233,10 @@ def fp4_qblock_a8() -> bool:
 
 def fp4_qblock_tile_m() -> int:
     """MUSE_PP_QBLOCK_TM=rows with MUSE_PP_QBLOCK: the block-scaled grouped matmuls' m tile
-    (0: the served lookup's)."""
-    tm = int(os.environ.get("MUSE_PP_QBLOCK_TM", "0"))
+    (0: the served lookup's); unset, 256 under MUSE_PP_QBLOCK_A8 (its VALU work is per tile:
+    192 / 256 / 384 measured 38.8 / 36.0 / 47.6 ms of gmm_v2 per stage), else the lookup's."""
+    unset = "256" if fp4_qblock() and fp4_qblock_a8() else "0"
+    tm = int(os.environ.get("MUSE_PP_QBLOCK_TM", unset))
     if tm and (not fp4_qblock() or tm % 16):
         raise ValueError(
             f"MUSE_PP_QBLOCK_TM={tm} needs MUSE_PP_QBLOCK and 16-row tiles"
