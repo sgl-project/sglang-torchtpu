@@ -4372,9 +4372,20 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         for d in range(5, 8):
                             mine = mine + _unpack_bf16x2(S["pad_o_rs"][d, rs])
                         S["o_send"][rs] = _pack_bf16x2(mine)
+                        if c.pipe_ag:
+                            ag_tile_start(
+                                "o_ag",
+                                S["o_send"],
+                                S["pad_o_ag"],
+                                me,
+                                t,
+                                S["oag_tsems"],
+                            )
 
                     vpads_tiles(_tile)
-                    if c.fold_o:
+                    if c.pipe_ag:
+                        pass  # sent per tile above
+                    elif c.fold_o:
                         coll.all_gather_blocks_start(
                             "o_ag", S["o_send"], me, S["o_rsems"]
                         )
@@ -4400,9 +4411,20 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             for d in range(1, c.tp):
                                 mine = mine + _unpack_bf16x2(S["pad_o_rs"][d, rs])
                             S["o_send"][rs] = _pack_bf16x2(mine)
+                            if c.pipe_ag:
+                                ag_tile_start(
+                                    "o_ag",
+                                    S["o_send"],
+                                    S["pad_o_ag"],
+                                    me,
+                                    t,
+                                    S["oag_tsems"],
+                                )
 
                         vpads_tiles(_tile)
-                        if c.fold_o:
+                        if c.pipe_ag:
+                            pass  # sent per tile above
+                        elif c.fold_o:
                             coll.all_gather_blocks_start(
                                 "o_ag", S["o_send"], me, S["o_rsems"]
                             )
@@ -5890,13 +5912,20 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         S["f_send"][rs] = _pack_bf16x2(
                             S["acc"][rs, pl.ds(0, Hl)].astype(bf16).astype(f32)
                         )
+                        if c.pipe_ag:
+                            ag_tile_start(
+                                "f", S["f_send"], S["pad_f"], tp_rank, t, S["fag_tsems"]
+                            )
 
                     vpads_tiles(_tile)
                 else:
+                    assert not c.pipe_ag
                     S["f_send"][...] = _pack_bf16x2(
                         S["acc"][:, pl.ds(0, Hl)].astype(bf16).astype(f32)
                     )
-                if c.fold_f and nxt is not None:
+                if c.pipe_ag:
+                    pass  # sent per tile above
+                elif c.fold_f and nxt is not None:
                     coll.all_gather_blocks_start(
                         "f", S["f_send"], tp_rank, S["f_rsems"]
                     )
@@ -5971,8 +6000,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
             if ep is None and not c.fold_o:  # the EP hook's o_proj did it on own rows
                 if c.tiled_vmem_pads:
+                    if c.pipe_ag:
+                        oag_ready = ag_tile_ready(
+                            S["o_send"], S["pad_o_ag"], S["oag_tsems"]
+                        )
 
                     def _tile(rs, t):
+                        if c.pipe_ag:
+                            oag_ready(t)
                         s = row("attn_alpha") * S["h_stream"][rs] + row(
                             "attn_beta"
                         ) * _rms(
@@ -5982,6 +6017,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         S["lhs"][rs] = _rms(s, c.rms_eps, row("pre_ffn_w")).astype(bf16)
 
                     vpads_tiles(_tile)
+                    if c.pipe_ag:  # o_send (and what borrows it) is reused after this
+                        ag_tile_sent("o_ag", S["o_send"], S["pad_o_ag"])
                 else:
                     oag_rdy = ag_tile_ready(S["o_send"], S["pad_o_ag"], S["oag_tsems"])
 
@@ -6061,8 +6098,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
                 if not (c.fold_f and nxt is not None):
                     if c.tiled_vmem_pads:
+                        if c.pipe_ag:
+                            fag_ready = ag_tile_ready(
+                                S["f_send"], S["pad_f"], S["fag_tsems"]
+                            )
 
                         def _tile(rs, t):
+                            if c.pipe_ag:
+                                fag_ready(t)
                             s = row("ffn_alpha") * S["h_stream"][rs] + row(
                                 "ffn_beta"
                             ) * _rms(
@@ -6073,6 +6116,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             S["h_stream"][rs] = s
 
                         vpads_tiles(_tile)
+                        if c.pipe_ag:
+                            ag_tile_sent("f", S["f_send"], S["pad_f"])
                     else:
                         fag_rdy = ag_tile_ready(S["f_send"], S["pad_f"], S["fag_tsems"])
 

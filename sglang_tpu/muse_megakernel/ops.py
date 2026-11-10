@@ -925,7 +925,13 @@ class MuseMegakernel(torch.nn.Module):
                         cand = msgspec.structs.replace(cand, fold_f=False, fold_o=False)
                     # QBLOCK: the chosen plan's VMEM-pads passes run as loops (bit-identical)
                     if cand.qblock and cand.row_tile and cand.tiled_vmem_pads:
-                        cand = msgspec.structs.replace(cand, tile_loops=True)
+                        pipe = cand.combine_loop and cand.rows > 64
+                        cand = msgspec.structs.replace(
+                            cand,
+                            tile_loops=True,
+                            pipe_ag=pipe,
+                            trim_sems=cand.trim_sems and not pipe,
+                        )
                     return cand
         raise ValueError(
             f"no Muse megakernel ring fits the VMEM budget at {rows} rows of {q}"
