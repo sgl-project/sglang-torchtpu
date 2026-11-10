@@ -131,40 +131,56 @@ def _fp4_qblock_dot(
 
 
 def _qblock_part(
-    x: jax.Array, wslot, sslot, k0: int, K: int, n0: int, tn: int, block: int
+    lhs: Callable[[int], jax.Array],
+    wslot,
+    sslot,
+    k0: int,
+    K: int,
+    n0: int,
+    tn: int,
+    block: int,
 ) -> jax.Array:
-    """x [R, K] bf16 @ rows [k0, k0 + K) x columns [n0, n0 + tn) of a block-scaled slab -> f32
-    [R, tn], in _fp4_qblock_dot's block order."""
+    """lhs(kk) [R, block] bf16 for kk in [k0, k0 + K) @ those rows x columns [n0, n0 + tn) of a
+    block-scaled slab -> f32 [R, tn], in _fp4_qblock_dot's block order."""
     acc = None
     for kk in range(k0, k0 + K, block):
         w = pltpu.bitcast(
             wslot[pl.ds(kk // FP4_PACK, block // FP4_PACK), pl.ds(n0, tn)],
             jnp.float4_e2m1fn,
         ).astype(jnp.float8_e4m3fn)
-        part = jnp.dot(
-            x[:, kk - k0 : kk - k0 + block], w, preferred_element_type=jnp.float32
-        )
+        part = jnp.dot(lhs(kk), w, preferred_element_type=jnp.float32)
         s = sslot[pl.ds(kk // block, 1), pl.ds(n0, tn)].astype(jnp.float32)
         acc = part * s if acc is None else acc + part * s
     return acc
 
 
 def _fp4_qblock_ffn(
-    x: jax.Array, w13, s13, w2, s2, He: int, Il: int, block: int
+    x_blk: Callable[[int], jax.Array],
+    nrows: int,
+    w13,
+    s13,
+    w2,
+    s2,
+    He: int,
+    Il: int,
+    block: int,
 ) -> jax.Array:
-    """silu(x @ gate) * (x @ up) @ w2 on block-scaled slabs -> f32 [R, He], in values. h comes
-    in block columns (gate and up of a block together) and w2 runs K block by K block over
-    every column tile, so the MXU streams w2 while the last block's SiLU is in flight."""
-    xb = x.astype(jnp.bfloat16)
+    """silu(x @ gate) * (x @ up) @ w2 on block-scaled slabs -> f32 [nrows, He], in values;
+    x_blk(k0) is x[:, k0 : k0 + block] (gathered at first use, so loads overlap the MXU). h
+    comes in block columns (gate and up of a block together) and w2 runs K block by K block
+    over every column tile, so the MXU streams w2 while the last block's SiLU is in flight."""
     hs = []
     for c0 in range(0, Il, block):
-        g = _qblock_part(xb, w13, s13, 0, He, c0, block, block)
-        u = _qblock_part(xb, w13, s13, 0, He, Il + c0, block, block)
+        g = _qblock_part(x_blk, w13, s13, 0, He, c0, block, block)
+        u = _qblock_part(x_blk, w13, s13, 0, He, Il + c0, block, block)
         hs.append((g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16))
-    tn = min(He, QBLOCK_TN if x.shape[0] <= 32 else QBLOCK_TN // 2)
+    tn = min(He, QBLOCK_TN if nrows <= 32 else QBLOCK_TN // 2)
     tiles = range(0, He, tn)
     parts = [
-        [_qblock_part(h, w2, s2, kb * block, block, n0, tn, block) for n0 in tiles]
+        [
+            _qblock_part(lambda kk, h=h: h, w2, s2, kb * block, block, n0, tn, block)
+            for n0 in tiles
+        ]
         for kb, h in enumerate(hs)
     ]
     cols = []

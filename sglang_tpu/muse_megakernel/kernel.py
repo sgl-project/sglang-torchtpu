@@ -4663,8 +4663,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     ydrain(b)
                     ystage.at[b][pl.ds(0, n), :] = yp
 
-                    def issue(j, carry):
-                        p = perm_at(first + j)
+                    def issue(j, live):
+                        p = perm_at(
+                            first + (j if live is True else jnp.minimum(j, n_valid - 1))
+                        )
                         if q_idx:
                             r, k = divmod_nn(p, K)
                             owner, rl = divmod_nn(r, Rc)
@@ -4673,14 +4675,19 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             owner, rl = r // Rc, r % Rc
                         src = ystage.at[b, pl.ds(j, 1)]
                         dst = pad_y.at[me, rl, pl.ds(k, 1)]
+                        mine = owner == me
+                        if live is not True:
+                            mine, other = live & mine, live & (owner != me)
+                        else:
+                            other = owner != me
 
-                        @pl.when(owner == me)
+                        @pl.when(mine)
                         def _():
                             pltpu.make_async_copy(
                                 src, dst, S["ystage_sems"].at[b]
                             ).start()
 
-                        @pl.when(owner != me)
+                        @pl.when(other)
                         def _():
                             pltpu.make_async_remote_copy(
                                 src_ref=src,
@@ -4690,9 +4697,17 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                 device_id=(owner,),
                             ).start()
 
-                        return carry
+                    if q_idx:
+                        # unrolled over the bucket: independent rows' scalar chains overlap
+                        for j in range(n):
+                            issue(j, j < n_valid)
+                    else:
 
-                    jax.lax.fori_loop(0, n_valid, issue, 0)
+                        def issue_step(j, carry):
+                            issue(j, True)
+                            return carry
+
+                        jax.lax.fori_loop(0, n_valid, issue_step, 0)
                     S["ypend"][b] = n_valid
                     S["ypend"][2] = S["ypend"][2] + 1
 
@@ -4781,11 +4796,26 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     wait_w2_if_needed(slot, wait_w2)
                     pairs = [pair_fn(j) for j in range(nrows)]
                     rk = [divmod_nn(p, K) if q_idx else (p // K, p % K) for p in pairs]
-                    xs = jnp.concatenate(
-                        [S["xfull"][pl.ds(r, 1), :] for r, _ in rk], axis=0
-                    )
+                    words = {}
+
+                    def x_blk(k0):
+                        # xfull packs x[:, j] low and x[:, j + He / 2] high in word j
+                        w0 = k0 % (He // 2)
+                        if w0 not in words:
+                            words[w0] = jnp.concatenate(
+                                [
+                                    S["xfull"][pl.ds(r, 1), pl.ds(w0, c.qblock)]
+                                    for r, _ in rk
+                                ],
+                                axis=0,
+                            )
+                        w = words[w0]
+                        w = w & jnp.uint32(0xFFFF0000) if k0 >= He // 2 else w << 16
+                        return jax.lax.bitcast_convert_type(w, f32).astype(bf16)
+
                     y = _fp4_qblock_ffn(
-                        _unpack_bf16x2(xs).astype(bf16),
+                        x_blk,
+                        nrows,
                         W13.at[slot],
                         S["w13s"].at[slot],
                         W2.at[slot],
