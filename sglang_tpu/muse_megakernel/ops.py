@@ -1249,9 +1249,10 @@ def _swa_window_table(kv_sal: bool, n_page_entries: int) -> bool:
 _DEPTH_RING_PREFERENCE = ((3, 11), (3, 6), (3, 5), (3, 4), (1, 4))
 # Row-tiled steps: deepest expert prefetch, then the largest dense ring that fits.
 _TILED_DEPTH_RING_PREFERENCE = tuple((d, s) for d in (3, 1) for s in range(11, 1, -1))
-# Streamed-Y plans with VMEM pads: depth 3 and a 3-slot ring at least, as the VMEM-Y plans.
-_TILED_VY0_PADS_RING_PREFERENCE = tuple((3, s) for s in range(11, 3, -1))
-_TILED_VY0_PADS_VMEM_BUDGET = 50 * 2**20
+# Streamed-Y plans with VMEM pads: depth 3 only. Their LLO temporaries take ~13.2 MiB (176
+# rows of 8: 49.38 MiB declared needed 62.60 MiB of the 62 MiB limit).
+_TILED_VY0_PADS_RING_PREFERENCE = tuple((3, s) for s in range(11, 1, -1))
+_TILED_VY0_PADS_VMEM_BUDGET = 48 * 2**20
 # Measured device step (real geometry, random routing): the 8-row block-diag variant is
 # slower than the 4-row one at 8-24 rows and faster once expert_split >= 32 rows.
 _COMPACT4_MAX_ROWS = 24
