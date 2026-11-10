@@ -30,7 +30,7 @@ def stage_forward(
     kv_lens,
     page_tables,
     cu_q,
-    dist,
+    dist,  # noqa: ARG001
     scratch: bool = False,
     fixed_ids=None,
 ):
@@ -39,6 +39,8 @@ def stage_forward(
     (w13, w13_scale, w2, w2_scale); experts_fp8: the stage's fp8 set; pools: one per slot
     (global slots' as wide as the page table); page_tables: (global, sliding window);
     fixed_ids: timing control only, [slots, T, top_k] expert picks used instead of the router's.
+    dist is unused (kept for the callers' signature): attention puts every sequence of cu_q on
+    the batched RPA's MIXED pass whatever distribution convention the caller assumed.
     Returns (x, pools), and with scratch each slot's (ids, routing weights, q, k, v, attention
     output, expert input, slot outputs)."""
     skip = skipped_phases()
@@ -64,7 +66,6 @@ def stage_forward(
                     kv_lens,
                     page_tables[0 if is_g else 1],
                     cu_q,
-                    dist,
                 )
         with jax.named_scope(f"slot{s}/route"):
             x, xe, ids, tw = route_call(ctl_s, slots, x, o, g, *weights)

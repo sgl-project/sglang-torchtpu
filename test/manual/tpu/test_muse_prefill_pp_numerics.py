@@ -357,7 +357,7 @@ def served_attention(c, is_global, q, k, v, pool, table):
         k.astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, c.head_dim),
         v.astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, c.head_dim),
         pool, jnp.array([CTX + T], jnp.int32), table, jnp.array([0, T], jnp.int32),
-        jnp.array([0, 0, 1], jnp.int32), sm_scale=c.head_dim**-0.5,
+        jnp.array([1, 1, 1], jnp.int32), sm_scale=c.head_dim**-0.5,
         sliding_window=None if is_global else c.window, k_scale=1.0, v_scale=1.0,
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE, out_head_norm_eps=-1.0,
     )  # fmt: skip
@@ -544,7 +544,7 @@ def main() -> int:
                 jnp.array([CTX + T], jnp.int32),
                 tables,
                 jnp.array([0, T], jnp.int32),
-                jnp.array([0, 0, 1], jnp.int32),
+                jnp.array([1, 1, 1], jnp.int32),
                 scratch=True,
             )
 

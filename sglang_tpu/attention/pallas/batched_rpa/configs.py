@@ -167,13 +167,15 @@ class RpaCase(enum.StrEnum):
     def get_range(
         self, distribution: jax.Array
     ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
+        # main's (and the serving bridge's) convention: MIXED [0, d0), PREFILL [d0, d1),
+        # DECODE [d1, d2); an extend sent as DECODE runs bq=1 blocks past its step bound.
         assert distribution.shape == (3,)
         match self:
-            case RpaCase.DECODE:
+            case RpaCase.MIXED:
                 return 0, distribution[0]
             case RpaCase.PREFILL:
                 return distribution[0], distribution[1]
-            case RpaCase.MIXED:
+            case RpaCase.DECODE:
                 return distribution[1], distribution[2]
 
 
