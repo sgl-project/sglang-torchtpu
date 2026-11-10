@@ -311,12 +311,64 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
         self.assertEqual(len(reply.children), 1)
         demoted = []
         lru = w.cache.tree_core.lru_lists[ComponentType.SWA]
-        with mock.patch.object(lru, "reset_node_lru", side_effect=demoted.append):
+        with mock.patch.object(
+            lru, "reset_node_lru", side_effect=lambda node, **_: demoted.append(node)
+        ):
             w.prefill(prompt + _tokens(12, 6 * PAGE), self.CHUNK, decode=1)
         self.assertIn(reply, demoted)
         self.assertIn(next(iter(reply.children.values())), demoted)
         # The previous turn's window above the branch.
         self.assertIn(reply.parent, demoted)
+
+    def test_write_back_copies_no_stale_window_to_host(self):
+        """Under write_back, evicting a node's SWA first copies its window to host. A
+        window the switch demoted is never read, and a copy taken before its device
+        eviction can't be reclaimed, so none is taken until a match makes it live again."""
+        w = self._world(enabled=True)
+        core = w.cache.tree_core
+        core.is_write_back = True
+        core.has_swa_host_pool = True
+        swa = w.cache.components[ComponentType.SWA]
+        lru = core.lru_lists[ComponentType.SWA]
+        prompt = _tokens(11, 16 * PAGE - 1)
+        w.prefill(prompt, self.CHUNK, decode=1)
+        # Less than a window more: the window above the dropped reply stays live.
+        nxt = prompt + _tokens(12, 2 * PAGE)
+        with mock.patch.object(
+            lru, "reset_node_lru", wraps=lru.reset_node_lru
+        ) as demote:
+            w.prefill(nxt, self.CHUNK, decode=1)
+        stale = [c.args[0] for c in demote.call_args_list if lru.in_list(c.args[0])]
+        self.assertGreater(len(stale), 1)
+        # Evicting one copies neither it nor the live windows above it.
+        for n in stale:
+            self.assertEqual(swa._collect_unbacked_swa_nodes(n), [])
+        # A later demotion that does not mark, such as the final-window one, keeps it.
+        window = next(n for n in stale if n.output_offset is None)
+        lru.reset_node_lru(window)
+        self.assertEqual(swa._collect_unbacked_swa_nodes(window), [])
+        # write_through copies at insert; the switch leaves its backups alone.
+        core.is_write_back = False
+        for n in stale:
+            self.assertIn(n, swa._collect_unbacked_swa_nodes(n))
+        core.is_write_back = True
+        # A split leaves both halves stale.
+        big = next(n for n in stale if n is not window and len(n.key) >= 2 * PAGE)
+        prefix, _ = core._split_node(big.key, big, PAGE)
+        for half in (prefix, big):
+            self.assertEqual(swa._collect_unbacked_swa_nodes(half), [])
+        # A match ending in a stale window makes it live, so it is copied again.
+        depth = 0
+        node = window
+        while node is not core.root_node:
+            depth += len(node.key)
+            node = node.parent
+        w.match(nxt[: depth + 1])
+        self.assertIn(window, swa._collect_unbacked_swa_nodes(window))
+        # A live window still copies a stale node inside it, which it reads.
+        tail = core.node_by_id(w.match(nxt + [1]).last_device_node)
+        lru.reset_node_lru(tail.parent, skip_host_backup=True)
+        self.assertIn(tail.parent, swa._collect_unbacked_swa_nodes(tail))
 
     def test_other_reply_to_the_same_prompt_keeps_its_place(self):
         """Two conversations open with the same message and get different replies; the
