@@ -14,11 +14,64 @@ import logging
 
 import torch
 
+from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
 from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
 
 _AXIS = "tp"
+
+
+def _pad(t: torch.Tensor, n: int) -> torch.Tensor:
+    return torch.nn.functional.pad(t, (0, n - t.shape[0]))
+
+
+@compiled_op()
+def _step_inputs_op(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    page_indices: torch.Tensor,
+    req_rows: torch.Tensor,
+    slot_map: torch.Tensor,
+    v2p: torch.Tensor | None,
+    read_offsets: torch.Tensor | None,
+    *,
+    q: int,
+    bucket: int,
+    pages_per_seq: int,
+    window_start: int,
+    checkpoint_width: int,
+):
+    """The kernel's int32 SMEM inputs for one call's n requests (inputs already
+    sliced to those rows), padded to `bucket` requests: one program instead of
+    ~15 eager launches per call. Shapes depend on n only."""
+    n = req_rows.shape[0]
+    rows = bucket * q
+    tok = _pad(input_ids.to(torch.int32), rows)
+    pos = _pad(positions.to(torch.int32).reshape(n, q)[:, 0], bucket)
+    tab = _pad(page_indices.to(torch.int32), bucket * pages_per_seq)
+    slots = slot_map[req_rows]
+    if v2p is not None:
+        slots = v2p[slots]
+    slots = slots.to(torch.int64)
+    if read_offsets is None:
+        # No checkpoint windows (no spec): the slot's own row is read and written.
+        srow, ckrow = slots, slots
+    else:
+        bases = window_start + req_rows.clamp(min=0) * checkpoint_width
+        offsets = read_offsets.index_select(0, slots)
+        srow = torch.where(offsets < 0, slots, bases + offsets)
+        steps = torch.arange(
+            checkpoint_width, dtype=req_rows.dtype, device=req_rows.device
+        )
+        ckrow = (bases.unsqueeze(1) + steps).reshape(-1)
+    return (
+        tok,
+        pos,
+        tab,
+        _pad(srow.to(torch.int32), bucket),
+        _pad(ckrow.to(torch.int32), rows),
+    )
 
 
 def _owned(t: torch.Tensor) -> torch.Tensor:
@@ -28,6 +81,16 @@ def _owned(t: torch.Tensor) -> torch.Tensor:
 
 def enabled() -> bool:
     return tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL.get()
+
+
+def require_expert_tp(ep_size: int) -> None:
+    # The kernel streams each rank's TP slice of every expert; whole local experts
+    # under EP>1 do not match its DMA shapes (#2034).
+    if ep_size != 1:
+        raise ValueError(
+            f"GLM-Flash megakernel requires ep_size == 1 (experts sliced over TP); "
+            f"got ep_size={ep_size}. Set SGLANG_TPU_GLM_FLASH_MEGAKERNEL=0 or ep_size=1."
+        )
 
 
 def _buckets(max_req: int) -> list[int]:
@@ -49,6 +112,7 @@ class GlmFlashMegakernel:
         max_rows: int,
         backend,
         call_rows: int | None = None,
+        max_requests: int | None = None,
     ):
         import jax
         from jax.sharding import NamedSharding
@@ -92,6 +156,10 @@ class GlmFlashMegakernel:
         # Requests per kernel call; a larger batch is split into calls of this size.
         call_rows = max_rows if call_rows is None else min(call_rows, max_rows)
         self.call_req = max(1, call_rows // n_query)
+        # The scheduler never batches past its concurrency cap, so larger buckets
+        # would only be compiled (one Pallas kernel each), never run.
+        if max_requests is not None:
+            self.call_req = max(1, min(self.call_req, max_requests))
         km_tile = 512 if self.max_req * n_query == 1 else 256
 
         def cfg_for(b):
@@ -207,9 +275,7 @@ class GlmFlashMegakernel:
                 f"jax_glm_flash_mk_L{max_len}_q{n_query}_b{b}",
                 step,
                 in_specs,
-                # Keep logits vocab-sharded: replicated here, their mesh sharding leaks into
-                # serving's compiled ops, which then fail to compile.
-                [P(None, _AXIS), P(None, None)] + pspec,
+                [P(None, None), P(None, None)] + pspec,
                 donate=tuple(range(pool0, pool0 + n_pool)),
                 aliases={pool0 + i: 2 + i for i in range(n_pool)},
             )
@@ -224,6 +290,7 @@ class GlmFlashMegakernel:
         }
         # Set when the radix cache is on: only then does serving snapshot KDA state.
         self.radix_snapshots = False
+        self._warmup_step_inputs(device)
 
     def handles(self, forward_batch, input_ids) -> bool:
         bs = forward_batch.batch_size
@@ -253,37 +320,68 @@ class GlmFlashMegakernel:
             b0 += n
         return out
 
-    @staticmethod
-    def _pad(t: torch.Tensor, n: int) -> torch.Tensor:
-        return torch.nn.functional.pad(t, (0, n - t.shape[0]))
+    def _step_input_tables(self):
+        """(slot map, virtual->physical slot table, checkpoint read offsets) and the
+        window constants the input program reads."""
+        mamba = self._mamba
+        return dict(
+            slot_map=self._req_pool.req_index_to_mamba_index_mapping,
+            v2p=self._req_pool.mamba_v2p_table,
+            read_offsets=mamba.checkpoint_read_offsets,
+            window_start=mamba.window_start or 0,
+            checkpoint_width=mamba.checkpoint_width,
+        )
+
+    def _warmup_step_inputs(self, device) -> None:
+        """Compile the input program for every call size; the Dynamo tracer refuses
+        to recompile at serving time, and the inputs are sliced so only n matters."""
+        Q = self.Q
+        zeros = lambda *shape, dtype=torch.int64: torch.zeros(
+            shape, dtype=dtype, device=device
+        )
+        # Dynamo guards grad mode: trace as the verify path calls it (no_grad).
+        for n in range(1, self.call_req + 1):
+            with torch.no_grad():
+                warmup_compiled_op(
+                    _step_inputs_op,
+                    zeros(n * Q),
+                    zeros(n * Q),
+                    zeros(n * self.pages_per_seq, dtype=torch.int32),
+                    zeros(n),
+                    q=Q,
+                    bucket=self._bucket(n),
+                    pages_per_seq=self.pages_per_seq,
+                    **self._step_input_tables(),
+                )
 
     def _step_inputs(
         self, input_ids, positions, forward_batch, b0: int, n: int, bucket: int
     ):
         """The kernel's SMEM inputs for requests [b0, b0 + n), padded to `bucket` requests."""
-        Q, bs = self.Q, forward_batch.batch_size
+        Q, pps = self.Q, self.pages_per_seq
         rows = bucket * Q
         r0, r1 = b0 * Q, (b0 + n) * Q
-        tok = self._pad(input_ids[r0:r1].to(torch.int32), rows)
-        pos = self._pad(positions[r0:r1].to(torch.int32).reshape(n, Q)[:, 0], bucket)
-        req_rows = forward_batch.req_pool_indices[b0 : b0 + n]
-        # [padded_bs * pages_per_seq] from the sparse backend, one row per request.
-        tab = self._full.forward_metadata.page_indices.reshape(-1, self.pages_per_seq)
-        tab = tab[b0 : b0 + n].reshape(-1)
-        tab = self._pad(tab.to(torch.int32), bucket * self.pages_per_seq)
-        slots, _ = self._lin._slot_indices(req_rows)
-        srow = self._mamba.committed_state_rows(slots, req_rows).to(torch.int32)
-        if Q > 1:
-            ckrow = self._mamba.checkpoint_rows(req_rows).reshape(-1).to(torch.int32)
-        else:
-            ckrow = slots.to(torch.int32)
+        # Views at offset 0 for the first call; later calls of a split batch clone.
+        tab = self._full.forward_metadata.page_indices[b0 * pps : (b0 + n) * pps]
+        with torch.no_grad():
+            tok, pos, tab, srow, ckrow = _step_inputs_op(
+                input_ids[r0:r1],
+                positions[r0:r1],
+                tab,
+                forward_batch.req_pool_indices[b0 : b0 + n],
+                q=Q,
+                bucket=bucket,
+                pages_per_seq=pps,
+                **self._step_input_tables(),
+            )
+        assert ckrow.shape[0] == rows, (ckrow.shape, rows)
         return (
             tok,
             pos,
             self._meta[n],
             tab,
-            self._pad(srow, bucket),
-            self._pad(ckrow, rows),
+            srow,
+            ckrow,
             self.k_scales,
             self.init_streams[bucket],
         )
@@ -312,7 +410,6 @@ class GlmFlashMegakernel:
         )
 
     def forward(self, input_ids, positions, forward_batch):
-        from sglang.srt.distributed import tensor_model_parallel_all_gather
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         bs = forward_batch.batch_size
@@ -330,7 +427,7 @@ class GlmFlashMegakernel:
             hidden.append(out[1][: n * self.Q])
         logits = torch.cat(logits) if len(logits) > 1 else logits[0]
         hidden = torch.cat(hidden) if len(hidden) > 1 else hidden[0]
-        logits = tensor_model_parallel_all_gather(logits, dim=-1)[:, : self.vocab]
+        logits = logits[:, : self.vocab]
         if self.radix_snapshots and self.Q == 1:
             self._decode_snapshot(forward_batch)
         return LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden)

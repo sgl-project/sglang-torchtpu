@@ -55,7 +55,8 @@ TPU_WAN22_CASES = [
             output_size="832x480",
             num_frames=NUM_FRAMES,
             # Workaround: seeding a TPU torch.Generator can deadlock on the GIL in
-            # torch_tpu's blocking host-to-device copy; drop once TorchTPU fixes it.
+            # torch_tpu's blocking host-to-device copy; drop it together with
+            # TpuOOTPlatform.drain_device_queue_after_request once TorchTPU fixes it.
             extras={"num_inference_steps": 4, "seed": 0, "generator_device": "cpu"},
         ),
         run_perf_check=False,

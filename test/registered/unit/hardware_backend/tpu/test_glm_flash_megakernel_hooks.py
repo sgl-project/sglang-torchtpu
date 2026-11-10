@@ -19,6 +19,15 @@ class TestGlmFlashMegakernelBuckets(CustomTestCase):
                 self.assertTrue(any(b >= n for b in bs), (max_req, n))
 
 
+class TestServingGuards(CustomTestCase):
+    def test_expert_parallel_is_rejected_at_startup(self):
+        """EP>1 ranks hold whole experts, which the kernel's per-rank expert DMA cannot
+        stream; the hook must refuse at startup, not fail Mosaic verification mid-serve."""
+        ops.require_expert_tp(1)
+        with self.assertRaises(ValueError):
+            ops.require_expert_tp(8)
+
+
 class TestPoolBookkeeping(CustomTestCase):
     def test_record_bytes_match_the_pool_layout(self):
         """The kernel's record stride is the pool's: a mismatch reads the wrong pooled key."""

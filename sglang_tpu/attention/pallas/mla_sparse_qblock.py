@@ -126,6 +126,7 @@ def _qblock_kernel(
     kv_lens_ref,  # i32[num_blocks] kv length of each block's request
     # Inputs
     q_ref,  # bf16[1, rows, 640] rows = h * query_block + q; 576 real lanes
+    # (bf16[1, rows, 512] with read_rope=False)
     qpos_ref,  # i32[1, 1, query_block] query positions, -1 on padded rows
     member_ref,  # i32[1, pages_pad, query_block] selection word per page
     units_ref,  # SMEM i32[1, 1, pages_pad] union, request-relative pages
@@ -147,6 +148,7 @@ def _qblock_kernel(
     num_heads: int,
     page_size: int,
     kpool: int,
+    read_rope: bool = True,
 ):
     b = pl.program_id(0)
     num_pages = cache_nope_hbm.shape[0]
@@ -165,10 +167,14 @@ def _qblock_kernel(
 
         def copies(j, slot):
             page = phys_ref[0, 0, j]
+            nope_copy = pltpu.make_async_copy(
+                nope_pages.at[page], nope_ring.at[slot], sems.at[0, slot]
+            )
+            if not read_rope:
+                # Identically-zero rope lane: the rope term is 0, skip its DMA.
+                return (nope_copy,)
             return (
-                pltpu.make_async_copy(
-                    nope_pages.at[page], nope_ring.at[slot], sems.at[0, slot]
-                ),
+                nope_copy,
                 pltpu.make_async_copy(
                     rope_pages.at[page], rope_ring.at[slot], sems.at[1, slot]
                 ),
@@ -220,13 +226,10 @@ def _qblock_kernel(
                 cp.wait()
             nope = nope_ring[slot].reshape(page_size, NOPE_DIM)
             nope = pltpu.bitcast(nope, jnp.float8_e4m3fn).astype(jnp.bfloat16)
-            rope = pltpu.bitcast(rope_ring[slot], jnp.float8_e4m3fn)
-            rope = rope.astype(jnp.bfloat16)
             # Rows past the request's kv length were never written and can
             # decode to FP8 NaN; 0 * NaN would poison the PV sum.
             live = rows < kv_len - g * page_size
             nope = jnp.where(live, nope, 0)
-            rope = jnp.where(live, rope, 0)
 
             # Key-major score: [page_size keys, rows].
             q = q_ref[0]
@@ -237,12 +240,15 @@ def _qblock_kernel(
                 nt,
                 preferred_element_type=_ACCUMULATOR_DTYPE,
             )
-            s += lax.dot_general(
-                rope,
-                q[:, NOPE_DIM : NOPE_DIM + ROPE_LANES],
-                nt,
-                preferred_element_type=_ACCUMULATOR_DTYPE,
-            )
+            if read_rope:
+                rope = pltpu.bitcast(rope_ring[slot], jnp.float8_e4m3fn)
+                rope = jnp.where(live, rope.astype(jnp.bfloat16), 0)
+                s += lax.dot_general(
+                    rope,
+                    q[:, NOPE_DIM : NOPE_DIM + ROPE_LANES],
+                    nt,
+                    preferred_element_type=_ACCUMULATOR_DTYPE,
+                )
             s = s * scale + bias
 
             # Flash softmax over keys (axis 0, the sublane axis).
@@ -338,7 +344,14 @@ def _selection_words(topk_indices, tok, is_row, *, kpool, pages_pad):
 
 @functools.partial(
     jax.jit,
-    static_argnames=("sm_scale", "k_scale", "kpool", "query_block", "interpret"),
+    static_argnames=(
+        "sm_scale",
+        "k_scale",
+        "kpool",
+        "query_block",
+        "interpret",
+        "read_rope",
+    ),
 )
 def sparse_mla_prefill_qblock(
     ql_nope: jax.Array,  # bf16[num_tokens, num_q_heads, 512]
@@ -356,13 +369,16 @@ def sparse_mla_prefill_qblock(
     kpool: int,
     query_block: int = QUERY_BLOCK,
     interpret: bool = False,
+    read_rope: bool = True,
 ) -> jax.Array:
     """Sparse MLA attention over pooled DSA selections, ``query_block`` at a time.
 
     Same result as ``sparse_ragged_paged_attention`` on the same rows (up to
     bf16 rounding of the softmax weights), for rows in the pooled indexer's
     format: selected pools' tokens, then the open pool's tail, then ``-1``.
-    The cache must already hold this step's tokens.
+    The cache must already hold this step's tokens. ``read_rope=False`` skips
+    the rope cache and the rope score term: exact only when ``q_pe`` is
+    identically zero (a model without rope).
 
     Returns ``bf16[num_tokens, num_q_heads, 512]``; rows of padding tokens are 0.
     """
@@ -421,8 +437,9 @@ def sparse_mla_prefill_qblock(
         req[:, None] * pages_per_seq + jnp.minimum(units, pages_per_seq - 1)
     ]
 
-    # Queries in block layout, head-major rows, 128-aligned head dim.
-    q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+    # Queries in block layout, head-major rows, 128-aligned head dim. Without
+    # rope the kernel only reads the NoPE lanes, so the rope lanes are dropped.
+    q = jnp.concatenate([ql_nope, q_pe], axis=-1) if read_rope else ql_nope
     head_dim = _align(q.shape[-1], _LANES)
     q = jnp.pad(q, ((0, 0), (0, 0), (0, head_dim - q.shape[-1])))
     q = jnp.where(is_row[..., None, None], q[tok], 0)  # [nb, qb, H, D]
@@ -436,6 +453,7 @@ def sparse_mla_prefill_qblock(
         num_heads=num_heads,
         page_size=page_size,
         kpool=kpool,
+        read_rope=read_rope,
     )
 
     def live(b, num_live_ref, *_):
