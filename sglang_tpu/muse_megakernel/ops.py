@@ -804,6 +804,7 @@ class MuseMegakernel(torch.nn.Module):
                         tiled_pair_y=0,
                         y_block_send=False,
                         attn_streams=min(cfg.attn_streams, 4),
+                        pair_o_rs=False,
                         tile_loops=True,
                     ),
                 ):
