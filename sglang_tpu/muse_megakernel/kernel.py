@@ -172,6 +172,7 @@ from sglang_tpu.muse_megakernel.mk.scratch import (  # noqa: F401
     _use_attn_p_fp8,
     scratch_plan,
     scratch_vmem_bytes,
+    yrow_ring,
 )
 from sglang_tpu.muse_megakernel.mk.stream import (  # noqa: F401
     _WeightStream,
@@ -5683,54 +5684,48 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         u = jnp.sum(ynorm * wk_rc, axis=1)  # [Rc, He]
                         S["u_send"][...] = _pack_bf16x2(u)
                 else:
-                    # vmem_trim: one row's worth of buffer as two half-row (tp / 2 sources)
-                    # buffers, so a half lands while the other is summed. A buffer fills with one
-                    # DMA per source, all in flight at once.
-                    hs = c.tp // 2 if c.vmem_trim else c.tp
+                    # pad_y rows stream through a ring of NB buffers of YP parts per row (tp / YP
+                    # sources each), NB - 1 parts in flight: one row ahead left the DMA latency
+                    # exposed (y_row_wait 25.8 of combine's 40 us/layer at 256 rows of 8)
+                    YP, NB = yrow_ring(c)
+                    hs = c.tp // YP
+                    n_units = Rc * YP
 
-                    def ycopies(r, b, half=0):
+                    def ycopies(u, b):
+                        r, part = u // YP, u % YP
                         return [
                             pltpu.make_async_copy(
-                                S["pad_y"].at[half * hs + d, pl.ds(r, 1)],
+                                S["pad_y"].at[part * hs + d, pl.ds(r, 1)],
                                 S["yrow"].at[b, d],
                                 S["yrow_sems"].at[b],
                             )
                             for d in range(hs)
                         ]
 
-                    def ystart(r, b, half=0):
-                        for cp in ycopies(r, b, half):
+                    def ystart(u):
+                        for cp in ycopies(u, u % NB):
                             cp.start()
 
-                    def ywait(r, b, half=0):
+                    def ywait(u):
                         with _scope("y_row_wait"):
-                            for cp in ycopies(r, b, half):
+                            for cp in ycopies(u, u % NB):
                                 cp.wait()
 
-                    pl.when(my_live)(lambda: ystart(0, 0))
+                    for u0 in range(NB - 1):
+                        pl.when(my_live & (u0 < n_units))(functools.partial(ystart, u0))
 
                     def combine_row(r, carry):
-                        nxt_cp = my_live & (r + 1 < Rc)
-                        if c.vmem_trim:
-                            pl.when(my_live)(lambda: ystart(r, 1, 1))
-                            pl.when(my_live)(lambda: ywait(r, 0, 0))
-                            yr = S["yrow"].at[0]
-                            ysum = _unpack_y(yr[0, 0], c)  # [K, He]
-                            for d in range(1, hs):
-                                ysum = ysum + _unpack_y(yr[d, 0], c)
-                            pl.when(my_live)(lambda: ywait(r, 1, 1))
-                            pl.when(nxt_cp)(lambda: ystart(r + 1, 0, 0))
-                            yr = S["yrow"].at[1]
+                        ysum = None
+                        for part in range(YP):
+                            u = r * YP + part
+                            pl.when(my_live)(functools.partial(ywait, u))
+                            pl.when(my_live & (u + NB - 1 < n_units))(
+                                functools.partial(ystart, u + NB - 1)
+                            )
+                            yr = S["yrow"].at[u % NB]
                             for d in range(hs):
-                                ysum = ysum + _unpack_y(yr[d, 0], c)
-                        else:
-                            b = r % 2
-                            pl.when(nxt_cp)(lambda: ystart(r + 1, 1 - b))
-                            pl.when(my_live)(lambda: ywait(r, b))
-                            yr = S["yrow"].at[b]
-                            ysum = _unpack_y(yr[0, 0], c)  # [K, He]
-                            for d in range(1, c.tp):
-                                ysum = ysum + _unpack_y(yr[d, 0], c)
+                                y_d = _unpack_y(yr[d, 0], c)  # [K, He]
+                                ysum = y_d if ysum is None else ysum + y_d
                         # rows past n_live received nothing (stale HBM): keep them zero
                         ysum = (
                             jnp.where(my_live & (me * Rc + r < n_live), ysum, 0.0)

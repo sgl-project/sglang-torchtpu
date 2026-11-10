@@ -209,6 +209,14 @@ def _alias_u_xfull(c: MKConfig) -> bool:
     return bool(c.vmem_trim and c.rows_per_dev % 8 == 0)
 
 
+def yrow_ring(c: MKConfig) -> tuple[int, int]:
+    """Combine's pad_y row ring (parts per row, buffers): under tile_loops two rows of bytes
+    in half rows (vmem_trim) or three rows; otherwise two rows."""
+    if not c.tile_loops:
+        return (1, 2)
+    return (2, 4) if c.vmem_trim else (1, 3)
+
+
 def _alias_tiled_ids_kv(c: MKConfig) -> bool:
     return bool(c.row_tile and c.alias_tiled_temps and c.kv_dim == LANE)
 
@@ -399,8 +407,11 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
         ]
     if vy < 2:
         items += [
-            ("yrow", vmem((2, tp // 2 if c.vmem_trim else tp, 1, K, yw), u32)),
-            ("yrow_sems", pltpu.SemaphoreType.DMA((2,))),
+            (
+                "yrow",
+                vmem((yrow_ring(c)[1], tp // yrow_ring(c)[0], 1, K, yw), u32),
+            ),
+            ("yrow_sems", pltpu.SemaphoreType.DMA((yrow_ring(c)[1],))),
         ]
     return items
 
