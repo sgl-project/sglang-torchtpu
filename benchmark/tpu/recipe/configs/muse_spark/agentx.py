@@ -275,6 +275,9 @@ def config_for(
             # the host heap is released before the pools are built.
             "SGLANG_TPU_RAIDEN_COALESCE_PAGES": "1",
             "SGLANG_TPU_HICACHE_TRIM_BEFORE_ALLOC": "1",
+            # The per-step TP all-reduce of ready HiCache acks costs ~0.9 ms of host
+            # time; while no rank has one, poll every 50th step.
+            "SGLANG_HICACHE_QUIET_SYNC_EVERY": "50",
             "TPU_PREMAPPED_BUFFER_SIZE": "4294967296",
             # Outlast AIPerf's pooled keep-alive connections (300 s).
             "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
