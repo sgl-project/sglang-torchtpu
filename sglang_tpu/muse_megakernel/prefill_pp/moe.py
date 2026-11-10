@@ -118,12 +118,19 @@ def _permute(c: PPConfig, xe, ids, tw):
     return rows, group_sizes, order, tw
 
 
+QBLOCK_MAX_TILE_N = 2048  # with the whole K and 256-row tiles: the A8 VMEM bound
+
+
 def _with_tile_m(tile_info):
-    """tile_info (a gmm_v2 tile function) with MUSE_PP_QBLOCK_TM rows per m tile."""
+    """tile_info (a gmm_v2 tile function) with MUSE_PP_QBLOCK_TM rows per m tile and at most
+    QBLOCK_MAX_TILE_N columns."""
     import dataclasses
 
     def tiles(*args):
-        return dataclasses.replace(tile_info(*args), tile_m=fp4_qblock_tile_m())
+        t = tile_info(*args)
+        return dataclasses.replace(
+            t, tile_m=fp4_qblock_tile_m(), tile_n=min(t.tile_n, QBLOCK_MAX_TILE_N)
+        )
 
     return tiles
 
