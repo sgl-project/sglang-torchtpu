@@ -475,6 +475,13 @@ class TpuEnvs:
     # Set at startup by SGLANG_TPU_K3_STATIC_FP8 moe_front or latent_up: there a
     # one-hot permute feeding the SparseCore combine gave wrong tokens.
     SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE = EnvBool(False)
+    # MoE: under EP with SparseCore gather, remap non-local experts to sentinel
+    # ``num_local_experts``, compute ``unsort_idx`` and ``group_sizes`` via MXU
+    # block counting-sort, and gather only the ``[0, valid_count)`` local prefix.
+    SGLANG_TPU_FUSED_MOE_EP_COUNTING_SORT = EnvBool(False)
+    # MoE: SparseCore combine kernel version under EP (2 = source-streaming v2,
+    # 3 = destination-major FP32 VMEM scatter-add v3 when aligned).
+    SGLANG_TPU_RAGGED_GATHER_REDUCE_VERSION = EnvInt(2)
     # Turn off EP-local expert reads (models that opt in read only their EP
     # rank's routed experts with --weight-loader-disable-mmap).
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
