@@ -104,23 +104,24 @@ class TpuEnvs:
     # not only pooled DSA. Not bit-exact with the per-query kernel (summation
     # order); False keeps it.
     SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL = EnvBool(False)
-    # DSA indexer token split for prefill (EXTEND / MIXED batches of at least
-    # _MIN_TOKENS tokens; the minimum is also 32 rows per rank): every
-    # attention-TP rank stores the index keys of all tokens but scores and
-    # top-k-selects only its contiguous slice of ceil(T / attn_tp) query rows
-    # (rounded up to 8); an int32 all-reduce over the attention-TP group puts
-    # the [T, topk] rows together (attention_pallas_mla_sparse.py). Same rows
-    # bit for bit; attention is unchanged. _MAX_ROWS caps the rows per rank
-    # (the all-reduce buffer is [attn_tp, rows, topk] int32 per DSA layer);
-    # larger batches keep the replicated path, as do decode and verify.
-    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT = EnvBool(False)
+    # DSA indexer token split, always on with attention TP > 1: prefill
+    # (EXTEND / MIXED) batches of at least this many tokens (and at least 32
+    # rows per rank) have every attention-TP rank store the index keys of all
+    # tokens but score and top-k-select only its contiguous slice of
+    # ceil(T / attn_tp) query rows (rounded up to 8); an int32 all-reduce over
+    # the attention-TP group puts the [T, topk] rows together
+    # (attention_pallas_mla_sparse.py). Same rows bit for bit; attention is
+    # unchanged. The pooled (kpool) indexer (GLM-5.3-Flash) splits the same
+    # way, and the ranks exchange their rows' picked pools ([T, topk // kpool])
+    # and expand them to tokens afterwards. No cap on the rows per rank (the
+    # all-reduce buffer, [attn_tp, rows, topk] int32 per DSA layer, grows with
+    # the chunk); decode and verify keep the replicated path.
     SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MIN_TOKENS = EnvInt(1024)
-    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MAX_ROWS = EnvInt(512)
     # Sparse MLA, on top of the indexer token split: each rank attends only the
     # rows it selected, with every head, so each selected cache row is gathered
     # by one rank instead of all; a Pallas all-to-all (kernels/oneshot_all_to_all.py)
-    # moves queries and outputs, and the rows' all-reduce is skipped. Prefill
-    # batches of the per-query kernel; attention TP must span the world.
+    # moves queries and outputs, and the rows' all-reduce is skipped. Plain DSA
+    # prefill batches of the per-query kernel; attention TP must span the world.
     SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT = EnvBool(False)
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.

@@ -114,30 +114,29 @@ class TestAttentionSplitRowsQblockGate(CustomTestCase):
 
 
 class TestAttentionSplitNeedsTheIndexerSplit(CustomTestCase):
-    def test_flag_without_the_indexer_split_raises(self):
+    def test_flag_without_a_plain_indexer_split_raises(self):
         from sglang_tpu.envs import envs as tpu_envs
 
-        backend = TpuPallasSparseMlaAttnBackend.__new__(TpuPallasSparseMlaAttnBackend)
-        backend._idx_split_group = None  # SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT off
-        backend._idx_split_size = 1
-        with (
-            tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.override(True),
-            mock.patch("torch.distributed.get_world_size", return_value=4),
-            mock.patch("torch.distributed.get_rank", return_value=0),
-            mock.patch(
-                "sglang.srt.runtime_context.get_parallel",
-                return_value=SimpleNamespace(attn_tp_rank=0),
-            ),
-        ):
-            with self.assertRaisesRegex(
-                RuntimeError, "SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT"
+        # Attention TP 1 (no indexer split), and the pooled indexer's split.
+        for kpool, group, size in ((1, None, 1), (4, SimpleNamespace(), 4)):
+            backend = _backend(size)
+            backend._kpool, backend._idx_split_group = kpool, group
+            with (
+                tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.override(True),
+                mock.patch("torch.distributed.get_world_size", return_value=4),
+                mock.patch("torch.distributed.get_rank", return_value=0),
+                mock.patch(
+                    "sglang.srt.runtime_context.get_parallel",
+                    return_value=SimpleNamespace(attn_tp_rank=0),
+                ),
             ):
-                backend._init_attention_token_split()
+                with self.assertRaisesRegex(RuntimeError, "plain DSA"):
+                    backend._init_attention_token_split()
 
 
 class TestIndexTopkKeepsLocalRows(CustomTestCase):
     def _index_topk(self, attention_split):
-        # T=2048 at TP4: 512 rows per rank, the indexer split's default cap.
+        # T=2048 at TP4: 512 rows per rank.
         backend = _backend(4, split=attention_split, qblock_op=False)
         local = torch.arange(512 * 16, dtype=torch.int32).view(512, 16)
         backend._index_topk_split_op = mock.MagicMock(return_value=local)
