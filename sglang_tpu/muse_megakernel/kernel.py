@@ -289,6 +289,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             assert not (c.fold_f or c.fold_o)
             S["final_norm"] = S["smalls"].at[1 - (c.n_layers - 1) % 2, pl.ds(0, 8)]
             S["f_send"] = S["o_send"]
+            # lifetimes: o_ag, then the pool all-gather, then f_ag; u_send after the experts
+            S["pool_send"] = S["o_send"].at[:, pl.ds(0, c.expert_hidden_local // 2)]
+            S["u_send"] = S["xfull"].at[pl.ds(0, c.rows_per_dev)]
         if _alias_tiled_ids_kv(c):
             S["kb_s"] = S["ids_v"].bitcast(jnp.float32)
             S["vb_s"] = S["wsel_v"]

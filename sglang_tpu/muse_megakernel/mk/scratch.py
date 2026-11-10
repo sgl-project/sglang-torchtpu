@@ -286,7 +286,8 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
         ("wsel_v", vmem((R, LANE), f32)),
         ("wk_s", vmem((owner_window_rows(c), K, LANE), f32)),
         ("xfull", vmem((R, He // 2), u32)),
-        ("pool_send", vmem((R, Hel // 2), u32)),
+        # vmem_trim: pool_send is o_send's first columns, u_send xfull's first rows
+        *([] if c.vmem_trim else [("pool_send", vmem((R, Hel // 2), u32))]),
     ]
     if not _alias_tiled_obuf_ysend(c):
         items += [("o_buf", vmem((ob_n, R, Hl // 2), u32))]
@@ -294,7 +295,7 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
         ("o_send", vmem((R, Hl // 2), u32)),
         # vmem_trim: f_send is o_send (both all-gathers wait for their sends)
         *([] if c.vmem_trim else [("f_send", vmem((R, Hl // 2), u32))]),
-        ("u_send", vmem((Rc, He // 2), u32)),
+        *([] if c.vmem_trim else [("u_send", vmem((Rc, He // 2), u32))]),
     ]
     if not vpads:
         items += [("bin", vmem((2, RT, H), jnp.bfloat16))]
