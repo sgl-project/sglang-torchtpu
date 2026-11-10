@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import DEFAULT, Mock, patch
 
 import torch
+import torch.compiler.config as compiler_config
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
@@ -41,6 +42,7 @@ from sglang.multimodal_gen.test.unit.test_minimax_h3_encoder_device import (  # 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.multimodal_gen import minimax_h3, worker
+from sglang_tpu.multimodal_gen.platform import TpuOOTPlatform
 from sglang_tpu.multimodal_gen.tpu_splash_attn import TpuSplashAttentionImpl
 
 # The TPU lane installs the diffusion_tpu extras (cache-dit) the H3 DiT imports.
@@ -67,7 +69,6 @@ def _installed():
             (comfyui_step, "MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"),
             (dit, "_minimax_h3_attention_core_bcg"),
             (dit.MiniMaxH3DiTModel, "_compile_conditions"),
-            (dit.MiniMaxH3DiTBlock, "forward"),
         ):
             stack.enter_context(patch.object(target, name, getattr(target, name)))
         minimax_h3.install()
@@ -332,6 +333,9 @@ class _OneBlockDiT(torch.nn.Module):
         super().__init__()
         self.blocks = torch.nn.ModuleList([block])
         self._compile_conditions = dit.MiniMaxH3DiTModel._compile_conditions
+        self._compile_regions_spmd_safe = (
+            dit.MiniMaxH3DiTModel._compile_regions_spmd_safe
+        )
 
     def forward(self, *args, **kwargs):
         return self.blocks[0](*args, **kwargs)
@@ -349,7 +353,12 @@ def _compiled_block_ops(regional):
 
     compile_kwargs = dict(backend=counting_backend, fullgraph=True, dynamic=False)
     registry = torch_compile.CompiledModuleRegistry()
-    with _installed(), torch.no_grad():
+    with (
+        _installed(),
+        patch.object(torch_compile, "current_platform", TpuOOTPlatform()),
+        compiler_config.patch(cache_key_tag=""),
+        torch.no_grad(),
+    ):
         eager = {used: run(block, used) for used in (100, 77, 128)}
         model = _OneBlockDiT(block)
         if regional:

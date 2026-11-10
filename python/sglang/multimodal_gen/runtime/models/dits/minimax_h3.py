@@ -1723,6 +1723,9 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
     _fsdp_mixed_dtype_params = True
     mps_stream_non_layer_weights = True
     _compile_conditions = [is_block]
+    # SP ranks run each block on fresh per-rank tensors of the same shape, with
+    # the live length as device data, so all ranks compile the same block program.
+    _compile_regions_spmd_safe = True
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
