@@ -1596,7 +1596,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "custom logit processors"):
             check(batch=batch(custom=True), pp_proxy_tensors=None)
         worker._bsearch_filtering = True
-        check(batch=batch(top_k=1 << 30, top_p=0.9), pp_proxy_tensors=None)
+        # The per-step host filter reductions only matter without the bsearch path.
+        with patch.object(
+            base_spec_worker, "_sampled_row_filters", side_effect=AssertionError
+        ):
+            check(batch=batch(top_k=1 << 30, top_p=0.9), pp_proxy_tensors=None)
 
         penalized = batch(top_k=1 << 30, top_p=0.9)
         penalized.sampling_info.acc_additive_penalties = torch.full((2, 32), -0.5)

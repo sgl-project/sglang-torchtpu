@@ -1846,8 +1846,11 @@ class TpuSpecWorker(BaseSpecWorker):
             )
         # The sort-based target filter keeps different boundary ties than the
         # verify filter, so filtered sampling needs the sort-free path on both.
-        filters = _sampled_row_filters(sampling_info)
-        if not self._bsearch_filtering and (
+        # Checked only without it: the host reductions run every decode step.
+        filters = (
+            None if self._bsearch_filtering else _sampled_row_filters(sampling_info)
+        )
+        if filters is not None and (
             filters["need_top_k"] or filters["need_top_p"] or filters["need_min_p"]
         ):
             raise NotImplementedError(
