@@ -190,6 +190,20 @@ def _alias_tiled_xfull_attn(c: MKConfig) -> bool:
     )
 
 
+def _alias_pool_ysend(c: MKConfig) -> bool:
+    """vmem_trim: pad_pool in ysend. Peers write it only after this device's o all-gather
+    (past attn_p and o_buf) and ex_setup reads it before zeroing ysend."""
+    return bool(
+        c.vmem_trim
+        and c.row_tile
+        and c.tiled_vmem_pads
+        and c.tiled_vmem_y >= 1
+        and (c.rows * c.top_k) % c.tp == 0
+        and (c.rows * c.top_k) // c.tp >= c.rows
+        and y_words(c) >= c.expert_hidden_local // 2
+    )
+
+
 def _alias_tiled_ids_kv(c: MKConfig) -> bool:
     return bool(c.row_tile and c.alias_tiled_temps and c.kv_dim == LANE)
 
@@ -315,7 +329,7 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
     n_tc_s = len(_TC_VPADS_S) if (vpads and c.trim_sems) else len(_TC)
     n_tc_r = len(_TC_VPADS_R) if (vpads and c.trim_sems) else len(_TC)
     items += [
-        ("pad_pool", pmem((tp, R, Hel // 2), u32)),
+        *([] if _alias_pool_ysend(c) else [("pad_pool", pmem((tp, R, Hel // 2), u32))]),
         (
             "pad_y",
             (vmem if vy >= 2 else hbm)((tp, Rc, K, yw), u32),

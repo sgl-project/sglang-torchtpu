@@ -157,6 +157,7 @@ from sglang_tpu.muse_megakernel.mk.scratch import (  # noqa: F401
     _alias_attn_p_ysend,
     _alias_oag_into_f,
     _alias_pads_into_y,
+    _alias_pool_ysend,
     _alias_tiled_ids_kv,
     _alias_tiled_obuf_ysend,
     _alias_tiled_padu_attn,
@@ -297,6 +298,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 S["ysend"]
                 .reshape(ob_n, (R * K) // ob_n, yw)
                 .at[:, pl.ds(0, R), pl.ds(0, Hl // 2)]
+            )
+        if _alias_pool_ysend(c):
+            S["pad_pool"] = (
+                S["ysend"]
+                .reshape(c.tp, (R * K) // c.tp, yw)
+                .at[:, pl.ds(0, R), pl.ds(0, c.expert_hidden_local // 2)]
             )
         n_live = meta_ref[0]
         tp_rank = meta_ref[1]
