@@ -18,8 +18,8 @@ and draft-extend, and decode batches above the threshold) uses the regular
 Because the kernel returns an already all-reduced output, the decoder layer
 must tell its FFN boundary not to sum it again (`summed_by_compute`). Only MoE
 blocks whose decoder layer does that set `allow_tpu_fused_moe_decode = True`
-(`DeepseekV2DecoderLayer` and `Glm5NextDecoderLayer`); others are never
-prepared.
+(`DeepseekV2DecoderLayer`, `Glm5NextDecoderLayer`, `Qwen3_5LinearDecoderLayer`,
+and `Qwen3_5AttentionDecoderLayer`); others are never prepared.
 """
 
 import functools
@@ -54,6 +54,8 @@ def _own_storage(tensor: torch.Tensor) -> torch.Tensor:
     device buffer so TorchTPU does not reject the view or insert a runtime relay copy
     on every compiled call.
     """
+    if torch.compiler.is_compiling():
+        return tensor.contiguous()
     if (
         not tensor.is_contiguous()
         or tensor.storage_offset() != 0
@@ -89,6 +91,7 @@ def _build_op(
     routed_scaling_factor: float,
     swiglu_limit: Optional[float] = None,
     has_shared: bool = True,
+    has_shared_gate: bool = False,
     axis_name: str = _DEFAULT_MESH_AXIS,
 ) -> Callable:
     import jax
@@ -107,13 +110,102 @@ def _build_op(
         if swiglu_limit is None
         else f"{swiglu_limit:.6g}".replace(".", "_").replace("-", "m")
     )
-    mode_tag = f"s{int(has_shared)}"
+    mode_tag = (
+        f"s{int(has_shared)}g1"
+        if (has_shared and has_shared_gate)
+        else f"s{int(has_shared)}"
+    )
     op_name = (
         f"sglang_tpu_pallas::fused_moe_decode_tp{world_size}_s{scale_tag}"
         f"_l{limit_tag}_{mode_tag}_{axis_name}"
     )
 
     if has_shared:
+        if has_shared_gate:
+
+            def _shared_gated_body(
+                x: jax.Array,
+                topk_ids: jax.Array,
+                topk_weights: jax.Array,
+                w1: jax.Array,
+                w1_scale: jax.Array,
+                w2: jax.Array,
+                w2_scale: jax.Array,
+                s_w1: jax.Array,
+                s_w1_scale: jax.Array,
+                s_w2: jax.Array,
+                s_w2_scale: jax.Array,
+                s_gate_w: jax.Array,
+                rank: jax.Array,
+            ) -> jax.Array:
+                expert_start = rank[0] * w2.shape[0] if world_size > 1 else None
+                return fused_moe_decode(
+                    rank,
+                    x,
+                    w1,
+                    w2,
+                    w1_scale,
+                    w2_scale,
+                    s_w1,
+                    s_w1_scale,
+                    s_w2,
+                    s_w2_scale,
+                    s_gate_w,
+                    topk_weights,
+                    topk_ids,
+                    n_ranks=world_size,
+                    expert_start=expert_start,
+                    routed_scale=routed_scaling_factor,
+                    swiglu_limit=swiglu_limit,
+                    has_shared=True,
+                )
+
+            sharded_gated_fn = jax.shard_map(
+                _shared_gated_body,
+                mesh=mesh,
+                in_specs=(spec,) * 13,
+                out_specs=spec,
+                check_vma=False,
+            )
+
+            def _jax_gated_fn(
+                x: jax.Array,
+                topk_ids: jax.Array,
+                topk_weights: jax.Array,
+                w1: jax.Array,
+                w1_scale: jax.Array,
+                w2: jax.Array,
+                w2_scale: jax.Array,
+                s_w1: jax.Array,
+                s_w1_scale: jax.Array,
+                s_w2: jax.Array,
+                s_w2_scale: jax.Array,
+                s_gate_w: jax.Array,
+                rank: jax.Array,
+            ) -> jax.Array:
+                return sharded_gated_fn(
+                    x,
+                    topk_ids,
+                    topk_weights,
+                    w1,
+                    w1_scale,
+                    w2,
+                    w2_scale,
+                    s_w1,
+                    s_w1_scale,
+                    s_w2,
+                    s_w2_scale,
+                    s_gate_w,
+                    rank,
+                )
+
+            return cpu_export_jax_op(
+                op_name,
+                _jax_gated_fn,
+                mesh=mesh,
+                input_partition_specs=(spec,) * 13,
+                output_partition_specs=(spec,),
+            )
 
         def _shared_body(
             x: jax.Array,
@@ -271,6 +363,7 @@ def _get_op(
     routed_scaling_factor: float,
     swiglu_limit: Optional[float] = None,
     has_shared: bool = True,
+    has_shared_gate: bool = False,
     axis_name: str = _DEFAULT_MESH_AXIS,
 ) -> Callable:
     key = (
@@ -278,6 +371,7 @@ def _get_op(
         float(routed_scaling_factor),
         None if swiglu_limit is None else float(swiglu_limit),
         bool(has_shared),
+        bool(has_shared and has_shared_gate),
         str(axis_name),
     )
     op = _OPS.get(key)
@@ -381,6 +475,11 @@ def _static_ineligibility_reason(moe_layer: torch.nn.Module) -> Optional[str]:
         return "all-to-all (DeepEP/mega MoE) dispatch"
     if getattr(moe_layer, "_shared_expert_tp1", False):
         return "replicated (TP1) shared expert"
+    if (
+        getattr(moe_layer, "enable_shared_expert_fusion", False)
+        or getattr(moe_layer, "num_fused_shared_experts", 0) > 0
+    ):
+        return "shared expert fused into routed top-k slots"
     return None
 
 
@@ -416,7 +515,10 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
         return False
 
     shared = getattr(moe_layer, "shared_experts", None)
+    if shared is None:
+        shared = getattr(moe_layer, "shared_expert", None)
     has_shared = shared is not None
+    has_shared_gate = False
     if has_shared:
         gate_up = getattr(shared, "gate_up_proj", None)
         down = getattr(shared, "down_proj", None)
@@ -475,6 +577,20 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
         experts.register_buffer("_fmd_sw2", sw2_buf, persistent=False)
         experts.register_buffer("_fmd_s2s", s2s_buf, persistent=False)
 
+        shared_gate_mod = getattr(moe_layer, "shared_expert_gate", None)
+        if shared_gate_mod is not None:
+            if getattr(shared_gate_mod, "bias", None) is not None:
+                return False
+            sg_w = getattr(shared_gate_mod, "weight", None)
+            if sg_w is None or int(sg_w.numel()) != h:
+                return False
+            sgw_buf = _own_storage(
+                sg_w.data.to(torch.bfloat16).reshape(h, 1).contiguous()
+            )
+            sgw_buf = sgw_buf.cpu().to(sg_w.data.device)
+            experts.register_buffer("_fmd_sgw", sgw_buf, persistent=False)
+            has_shared_gate = True
+
     routed_scaling_factor = (
         1.0
         if getattr(experts, "should_fuse_routed_scaling_factor_in_topk", False)
@@ -483,15 +599,24 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
     swiglu_limit = _resolve_swiglu_limit(moe_layer, experts, shared)
 
     # Eagerly build the custom op outside torch.compile / Dynamo tracing.
-    _get_op(tp_size, routed_scaling_factor, swiglu_limit, has_shared=has_shared)
+    _get_op(
+        tp_size,
+        routed_scaling_factor,
+        swiglu_limit,
+        has_shared=has_shared,
+        has_shared_gate=has_shared_gate,
+    )
 
     moe_layer._tpu_fused_moe_decode_ready = True
     moe_layer._tpu_fused_moe_decode_has_shared = has_shared
+    moe_layer._tpu_fused_moe_decode_has_shared_gate = has_shared_gate
     moe_layer._tpu_fused_moe_decode_world_size = int(tp_size)
     moe_layer._tpu_fused_moe_decode_ep_rank = int(parallel.moe_ep_rank)
     moe_layer._tpu_fused_moe_decode_routed_scale = routed_scaling_factor
     moe_layer._tpu_fused_moe_decode_swiglu_limit = swiglu_limit
     moe_layer._tpu_fused_moe_decode_max_tokens = get_fused_moe_decode_max_tokens()
+    moe_layer._tpu_fused_moe_decode_should_use = should_use_fused_moe_decode
+    moe_layer._tpu_fused_moe_decode_apply = apply_fused_moe_decode
     return True
 
 
@@ -548,6 +673,9 @@ def should_use_fused_moe_decode(
     return True
 
 
+_FMD_KERNEL_CHUNK_TOKENS = 256
+
+
 def apply_fused_moe_decode(
     moe_layer: torch.nn.Module,
     hidden_states: torch.Tensor,
@@ -563,33 +691,74 @@ def apply_fused_moe_decode(
     routed_scale = float(moe_layer._tpu_fused_moe_decode_routed_scale)
     swiglu_limit = moe_layer._tpu_fused_moe_decode_swiglu_limit
     has_shared = bool(moe_layer._tpu_fused_moe_decode_has_shared)
+    has_shared_gate = bool(
+        getattr(moe_layer, "_tpu_fused_moe_decode_has_shared_gate", False)
+    )
 
     ep_rank = int(moe_layer._tpu_fused_moe_decode_ep_rank)
     rank = _resolve_rank_tensor(experts, ep_rank, world_size)
 
-    op = _get_op(world_size, routed_scale, swiglu_limit, has_shared=has_shared)
-    if has_shared:
+    op = _get_op(
+        world_size,
+        routed_scale,
+        swiglu_limit,
+        has_shared=has_shared,
+        has_shared_gate=has_shared_gate,
+    )
+
+    def _run_single(h, ids, w):
+        if has_shared:
+            if has_shared_gate:
+                return op(
+                    h,
+                    ids,
+                    w,
+                    experts.w13_weight,
+                    experts._fmd_w1_scale,
+                    experts.w2_weight,
+                    experts._fmd_w2_scale,
+                    experts._fmd_sw1,
+                    experts._fmd_s1s,
+                    experts._fmd_sw2,
+                    experts._fmd_s2s,
+                    experts._fmd_sgw,
+                    rank,
+                )
+            return op(
+                h,
+                ids,
+                w,
+                experts.w13_weight,
+                experts._fmd_w1_scale,
+                experts.w2_weight,
+                experts._fmd_w2_scale,
+                experts._fmd_sw1,
+                experts._fmd_s1s,
+                experts._fmd_sw2,
+                experts._fmd_s2s,
+                rank,
+            )
         return op(
-            hidden_states,
-            topk_ids,
-            topk_weights,
+            h,
+            ids,
+            w,
             experts.w13_weight,
             experts._fmd_w1_scale,
             experts.w2_weight,
             experts._fmd_w2_scale,
-            experts._fmd_sw1,
-            experts._fmd_s1s,
-            experts._fmd_sw2,
-            experts._fmd_s2s,
             rank,
         )
-    return op(
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        experts.w13_weight,
-        experts._fmd_w1_scale,
-        experts.w2_weight,
-        experts._fmd_w2_scale,
-        rank,
-    )
+
+    num_tokens = int(hidden_states.shape[0])
+    if num_tokens <= _FMD_KERNEL_CHUNK_TOKENS:
+        return _run_single(hidden_states, topk_ids, topk_weights)
+
+    # Chunk execution for num_tokens above 256 to avoid VMEM exhaustion on TPU v7x.
+    out_chunks = []
+    for start in range(0, num_tokens, _FMD_KERNEL_CHUNK_TOKENS):
+        end = min(start + _FMD_KERNEL_CHUNK_TOKENS, num_tokens)
+        h_chunk = hidden_states[start:end].clone()
+        ids_chunk = topk_ids[start:end].clone()
+        w_chunk = topk_weights[start:end].clone()
+        out_chunks.append(_run_single(h_chunk, ids_chunk, w_chunk))
+    return torch.cat(out_chunks, dim=0)

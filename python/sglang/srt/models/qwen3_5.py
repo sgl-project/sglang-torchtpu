@@ -1109,6 +1109,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
+            self.mlp.allow_tpu_fused_moe_decode = True
             is_layer_sparse = True
             is_next_layer_sparse = True
         elif config.model_type == "qwen3_5_text":
@@ -1187,7 +1188,13 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(
+            forward_batch,
+            summed_by_compute=(
+                isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+                and self.mlp.use_tpu_fused_moe_decode(hidden_states, forward_batch)
+            ),
+        ) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
                     hidden_states,
@@ -1374,6 +1381,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
+            self.mlp.allow_tpu_fused_moe_decode = True
             is_layer_sparse = True
             is_next_layer_sparse = True
         else:
@@ -1658,7 +1666,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+        with self.ffn_boundary.exit(
+            forward_batch,
+            summed_by_compute=(
+                isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+                and self.mlp.use_tpu_fused_moe_decode(hidden_states, forward_batch)
+            ),
+        ) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
                     hidden_states,
@@ -2474,6 +2488,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             if "mtp" in name:
                 continue
+            if getattr(self, "language_model_only", False) and "visual" in name:
+                continue
             if name.startswith("language_model."):
                 # A bare Qwen3_5Model save, which has no LM head of its own.
                 name = "model." + name
@@ -2768,6 +2784,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
+                continue
+            if getattr(self, "language_model_only", False) and "visual" in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
