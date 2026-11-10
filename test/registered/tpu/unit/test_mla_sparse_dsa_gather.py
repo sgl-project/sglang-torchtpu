@@ -160,6 +160,25 @@ class CsaGatherTest(parameterized.TestCase):
         indices = np.full(512, 77, np.int32)
         self._check(nope_cache, rope_cache, nope_bytes, rope_bytes, indices)
 
+    @parameterized.named_parameters(
+        dict(testcase_name="small_odd", pages=2, n=17),
+        # A multiple of one pipeline step, short of a block: exact-size outputs.
+        dict(testcase_name="exact_size", pages=4, n=320),
+        dict(testcase_name="large", pages=16, n=8192),
+    )
+    def test_skip_rope_gathers_nope_and_zero_rope(self, pages, n):
+        """gather_rope=False: the same nope bytes, all-zero rope rows."""
+        nope_cache, rope_cache, nope_bytes, _ = self._make_caches(pages)
+        indices = self.rng.integers(0, pages * PAGE_SIZE, n).astype(np.int32)
+        nope_out, rope_out = dsa_gather.dsa_gather(
+            nope_cache, rope_cache, jnp.asarray(indices), gather_rope=False
+        )
+        np.testing.assert_array_equal(
+            np.asarray(nope_out).reshape(n, -1), nope_bytes[indices]
+        )
+        self.assertEqual(rope_out.shape, (n, kv_cache_utils.TILE_LANE_BYTES))
+        self.assertFalse(np.asarray(rope_out).any())
+
 
 if __name__ == "__main__":
     unittest.main()

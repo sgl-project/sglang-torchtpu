@@ -344,6 +344,7 @@ def update_sparse_mla_kv_cache(
     *,
     nope_spec: SparseMLAKVCacheSpec,
     rope_spec: SparseMLAKVCacheSpec,
+    write_rope: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Scatter this step's new MLA latents into the split sparse-MLA cache.
 
@@ -363,6 +364,10 @@ def update_sparse_mla_kv_cache(
       query_start_loc: Cumulative new-token counts (`[num_seqs + 1]`).
       nope_spec: Layout descriptor the nope cache was allocated from.
       rope_spec: Layout descriptor the rope cache was allocated from.
+      write_rope: False leaves the rope cache untouched. Only for a model
+        whose rope lane is identically zero (GLM-5.3-Flash has no rope; the
+        backend attends with a zero lane): the cache is allocated zeroed, so
+        skipping the write changes nothing.
 
     Returns:
       The updated (nope, rope) kv caches, same shapes/dtypes as the inputs.
@@ -384,6 +389,7 @@ def update_sparse_mla_kv_cache(
         slot,
         nope_spec,
         rope_spec,
+        write_rope=write_rope,
     )
 
 
@@ -396,6 +402,7 @@ def _scatter_caches(
     slot: jax.Array,
     nope_spec: SparseMLAKVCacheSpec,
     rope_spec: SparseMLAKVCacheSpec,
+    write_rope: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Write both caches at (`page`, `slot`), with Pallas wherever it can.
 
@@ -411,6 +418,8 @@ def _scatter_caches(
     kv_cache_nope = scatter.scatter(
         kv_cache_nope, kv_c_normed, nope_spec, dst_rows=dst_rows
     )
+    if not write_rope:
+        return kv_cache_nope, kv_cache_rope
     if rope_spec.layout is KVCacheLayout.SPARSECORE:
         kv_cache_rope = scatter.scatter(
             kv_cache_rope, k_pe, rope_spec, dst_rows=dst_rows
