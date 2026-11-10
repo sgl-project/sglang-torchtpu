@@ -387,8 +387,7 @@ class WeightUpdater:
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        device_module = torch.get_device_module(self.device)
-        infered_device = device_module.current_device()
+        infered_device = torch.accelerator.current_device_index()
 
         # The payload lists one entry per deployment TP rank. An
         # attention-owning draft records its narrowed rank at init, so read the
