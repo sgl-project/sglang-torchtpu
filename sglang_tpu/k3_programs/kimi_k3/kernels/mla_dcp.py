@@ -228,6 +228,33 @@ class DcpWorkspace:
     query_scale: Any  # [held, heads, 1] FP32 dequantization scale for FP8 Q
 
 
+@dataclasses.dataclass(frozen=True)
+class DcpSelection:
+    """Kimi-K3.1's DSA selection for one DCP attention call (see
+    ``dsa_dcp.IndexSelect``): each row attends only its selected tokens. A
+    local token is selected when ``dsa_dcp.selected(key, position, tau[row],
+    p_tie[row])``; each step's keys are read with its pages."""
+
+    keys: Any  # HBM [B, key rows, 128] int32: row b's local page j at rows j * T / 128
+    tau: Any  # SMEM [B] int32
+    p_tie: Any  # SMEM [B] int32
+    own: Any  # SMEM [B] int32: 1 when the row's own new token is selected
+    key_buf: Any  # VMEM [buffers, sequence rows, span * T / 128, 128] int32
+    key_semaphores: Any  # DMA [buffers]
+
+
+def selection_scratch(batch, span=SPAN, buffers=BUFFERS, page_tokens=PAGE_TOKENS, *, sequence_rows=1,
+                      cache_dtype=jnp.float8_e4m3fn):
+    """``DcpSelection``'s step key buffers and semaphores (FP8 cache)."""
+    if cache_dtype == jnp.float8_e4m3fn and batch in (8, 16, 32, 48, 64):
+        span = min(span, SPAN * PAGE_TOKENS // page_tokens)
+    else:
+        span = span * PAGE_TOKENS // page_tokens
+    span = max(1, span)
+    return (tpu.VMEM((buffers, sequence_rows, span * page_tokens // 128, 128), jnp.int32),
+            tpu.SemaphoreType.DMA((buffers,)))
+
+
 def chunked(batch, force=False) -> bool:
     """Whether a call of ``batch`` rows runs as chunks of ``MAX_ROWS``
     (``force``: even a single chunk, e.g. for the two-stage combine)."""
@@ -378,7 +405,7 @@ class DcpAttention:
 
     def __init__(self, cache: DcpCache, workspace: DcpWorkspace, position_ref, batch, *,
                  probability_hilo=False, skip=(), sequence_rows=1, heads=HEADS_PER_RANK,
-                 chunk_rows=None, cache_verify_rows=False):
+                 chunk_rows=None, cache_verify_rows=False, selection: DcpSelection | None = None):
         if batch > MAX_ROWS:
             chunk = chunk_layout(batch, heads, chunk_rows=chunk_rows)[0]  # validates
             if chunk % sequence_rows:
@@ -431,6 +458,14 @@ class DcpAttention:
             self.counts.append(count if not self.shared or b % sequence_rows == 0 else 0)
             starts.append(starts[-1] + (self.counts[-1] + self.span - 1) // self.span)
         self.starts, self.total = starts, starts[-1]
+        self.selection = selection
+        if selection is not None:
+            if not self.fp8 or self.native or self.folds != 1 or heads != HEADS_PER_RANK:
+                raise ValueError("DSA selection: FP8 DCP32 decode with three heads per rank")
+            if sequence_rows > 1 and not cache_verify_rows:
+                raise ValueError("DSA selection: multi-row sequences need cached verify rows")
+            if selection.key_buf.shape[2] * 128 != self.span * self.page_tokens:
+                raise ValueError("DSA selection key buffers must hold one step's tokens")
         if batch in (32, 48, 64):
             for b in range(batch):
                 workspace.lookup_bounds[b] = starts[b]
@@ -464,6 +499,12 @@ class DcpAttention:
         last page (masked by position)."""
         row, local_step, count = self._locate(step)
         slot = step % self.buffers
+        if self.selection is not None:
+            sel = self.selection
+            rows = sel.key_buf.shape[1]
+            tpu.make_async_copy(
+                sel.keys.at[pl.ds(row, rows), pl.ds(local_step * sel.key_buf.shape[2], sel.key_buf.shape[2])],
+                sel.key_buf.at[slot], sel.key_semaphores.at[slot]).start()
         if self.native:
             self.cache.start_native_copies(
                 row, [jnp.minimum(local_step * self.span + index, count - 1) for index in range(self.span)],
@@ -483,6 +524,22 @@ class DcpAttention:
         slot = step % self.buffers
         tpu.make_async_copy(self.ws.pages.at[slot], self.ws.pages.at[slot],
                             self.ws.page_semaphores.at[slot]).wait()
+        if self.selection is not None:
+            buf = self.selection.key_buf.at[slot]
+            tpu.make_async_copy(buf, buf, self.selection.key_semaphores.at[slot]).wait()
+
+    def _selected(self, slot, local_step, row, r=0):
+        """The step's selection mask ``[1, span * page_tokens]`` of row
+        ``row + r`` (``r``: its index in a shared sequence's key buffer)."""
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
+
+        sel = self.selection
+        keys = jnp.concatenate([sel.key_buf[slot, r, pl.ds(i, 1), :] for i in range(sel.key_buf.shape[2])],
+                               axis=1)  # [1, span * page_tokens]: tokens on lanes
+        offset = jax.lax.broadcasted_iota(jnp.int32, keys.shape, 1)
+        page = (local_step * self.span + offset // self.page_tokens) * self.group + self.owner
+        token = page * self.page_tokens + offset % self.page_tokens
+        return dsa_dcp.selected(keys, token, sel.tau[row + r], sel.p_tie[row + r])
 
     def _attend_step(self, step, base=0):
         """One step of the local attention: wait for its pages, prefetch
@@ -576,16 +633,25 @@ class DcpAttention:
         offset = jax.lax.broadcasted_iota(jnp.int32, (1, self.span * self.page_tokens), 1)
         page = (local_step * self.span + offset // self.page_tokens) * self.group + self.owner
         token = page * self.page_tokens + offset % self.page_tokens
+        slot = step % self.buffers
         if _grouped_spec(self.batch, self.group, self.heads, self.sequence_rows):
             for first in range(0, self.sequence_rows, 4):
                 query = jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0) // self.tile
                 visible = token < self.position_ref[row] + first + query
+                if self.selection is not None:
+                    chosen = self._selected(slot, local_step, row, first)
+                    for i in range(1, 4):
+                        chosen = jnp.where(query == i, self._selected(slot, local_step, row, first + i), chosen)
+                    visible = visible & chosen
                 score = self._group_scores(load, visible, row - base + first, 4)
                 self._group_fold(score, load, row - base + first, 4)
         else:
             @pl.loop(0, self.sequence_rows)
             def query(r):
-                self._fold_pages(load, token < self.position_ref[row + r], row - base + r)
+                visible = token < self.position_ref[row + r]
+                if self.selection is not None:
+                    visible = visible & self._selected(slot, local_step, row, r)
+                self._fold_pages(load, visible, row - base + r)
 
     def _step_pages(self, step):
         """Step ``step``'s row, the mask of its visible tokens and a reader of
@@ -596,6 +662,8 @@ class DcpAttention:
         token = global_page * self.page_tokens + offset % self.page_tokens
         visible = token < self._limit(row)
         slot = step % self.buffers
+        if self.selection is not None and not self.shared:
+            visible = visible & self._selected(slot, local_step, row)
         self._clean_step(slot, row, local_step)
         return row, visible, self._pages(slot)
 
@@ -780,8 +848,9 @@ class DcpAttention:
         ws = self.ws
         previous = jnp.concatenate([ws.maximum[held + i] for i in range(count)], axis=0)
         new_maximum = jnp.maximum(previous, jnp.max(score, axis=1, keepdims=True))
-        scale = jnp.exp(previous - new_maximum)
-        probabilities = jnp.exp(score - new_maximum)
+        base = self._safe_maximum(new_maximum)
+        scale = jnp.exp(previous - base)
+        probabilities = jnp.exp(score - base)
         totals = jnp.sum(probabilities, axis=1, keepdims=True)
         high = (probabilities * 256).astype(jnp.float8_e4m3fn)
         values = load(pl.ds(0, LATENT))
@@ -792,6 +861,23 @@ class DcpAttention:
             ws.denominator[held + i] = ws.denominator[held + i] * scale[rows] + totals[rows]
             ws.maximum[held + i] = new_maximum[rows]
             ws.accumulator[held + i] = ws.accumulator[held + i] * scale[rows] + weighted[rows]
+
+    def _safe_maximum(self, maximum):
+        """The softmax shift: with a selection a row may have seen no token
+        yet (maximum -inf), whose exponentials must be 0, not NaN."""
+        if self.selection is None:
+            return maximum
+        return jnp.where(maximum == -jnp.inf, 0.0, maximum)
+
+    def _own_column(self, first, rows_per_batch_row, count):
+        """``[slots count, 1]`` 1.0 where batch row ``first + j``'s own new
+        token is selected (packet rows ``slots j ..``); ``first`` may be traced."""
+        rows = rows_per_batch_row * count
+        index = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0) // rows_per_batch_row
+        column = jnp.zeros((rows, 1), jnp.float32)
+        for j in range(count):
+            column = jnp.where(index == j, self.selection.own[first + j].astype(jnp.float32), column)
+        return column
 
     def _fold_pages(self, load, visible, held):
         """Fold a step's pages (``load(lanes)`` reads them) into the running
@@ -831,8 +917,9 @@ class DcpAttention:
         ws = self.ws
         previous = ws.maximum[held]  # [head_rows, 1]
         new_maximum = jnp.maximum(previous, jnp.max(score, axis=1, keepdims=True))
-        scale = jnp.exp(previous - new_maximum)
-        probabilities = jnp.exp(score - new_maximum)  # [head_rows, span * page_tokens]
+        base = self._safe_maximum(new_maximum)
+        scale = jnp.exp(previous - base)
+        probabilities = jnp.exp(score - base)  # [head_rows, span * page_tokens]
         ws.denominator[held] = ws.denominator[held] * scale + jnp.sum(probabilities, axis=1, keepdims=True)
         ws.maximum[held] = new_maximum
         # Keep FP32 probabilities for the denominator; use scaled E4M3 for PV.
@@ -1118,6 +1205,8 @@ class DcpAttention:
                 for s in range(sequences)], axis=0)
         elif self.sequence_rows == 1 or self.cache_verify_rows:
             new_score = jnp.sum(ws.own_rows[...] * ws.new_rows[...], axis=1, keepdims=True)  # [rows, 1]
+            if self.selection is not None:
+                new_score = jnp.where(self._own_column(0, self.slots, batch) > 0, new_score, -jnp.inf)
             top = jnp.maximum(jnp.max(lse, axis=0), new_score)
             weights = jnp.exp(lse - top[None])
             new_weight = jnp.exp(new_score - top)
@@ -1148,7 +1237,7 @@ class DcpAttention:
         return result
 
 
-def _merge_received(received, own_rows, new_rows, group, *, unroll=1):
+def _merge_received(received, own_rows, new_rows, group, *, unroll=1, own=None):
     """Log-sum-exp merge of the ``group`` peers' partials in ``received``
     [G, rows, 640] (a ref: normalized outputs, lse hi/lo in lanes 512:514)
     with the new token (``own_rows`` the rows' queries, ``new_rows`` its
@@ -1158,6 +1247,10 @@ def _merge_received(received, own_rows, new_rows, group, *, unroll=1):
     top = jnp.sum(own_rows * new_rows, axis=1, keepdims=True)  # [rows, 1]: the new token's score
     accumulator = new_rows[:, :LATENT]
     denominator = jnp.ones_like(top)
+    if own is not None:  # DSA: the new token only where selected ([rows, 1] 0/1)
+        top = jnp.where(own > 0, top, -jnp.inf)
+        accumulator = accumulator * own
+        denominator = own
 
     def fold(peer, carry):
         top, accumulator, denominator = carry
@@ -1453,7 +1546,8 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
             # Attention DP2's B128 and FP8 B96 merge four peers a step.
             ws.merged[c, :rows, :] = _merge_received(
                 ws.receive.at[ring(c)], ws.own_rows[c, :rows, :], ws.new_rows[c, :rows, :], group,
-                unroll=4 if self.heads == 6 and (batch == 64 or batch == 48 and self.fp8) else 1)
+                unroll=4 if self.heads == 6 and (batch == 64 or batch == 48 and self.fp8) else 1,
+                own=None if self.selection is None else self._own_column(c * chunk, slots, chunk))
             return
         if keys is not None:
             assert key_valid is not None

@@ -13,7 +13,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config
 from sglang_tpu.k3_programs.kimi_k3.kernels import load
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -295,3 +295,105 @@ class TestIndexCommit(CustomTestCase):
                         self.assertEqual(int(gexp[t, 0]), int(wexp[0, 0]))
                     else:
                         self.assertFalse(np.asarray(pools[m][block]).any())
+
+
+class TestIndexSelect(CustomTestCase):
+    """The decode selection kernel (``dsa_dcp.select_call``) in Pallas
+    interpret mode on a 4-rank DCP group of host devices: every rank's keys
+    match the reference scores, the thresholds select exactly the top-k
+    (lowest positions among tied keys) and agree on every rank, in-flight
+    tokens are scored from their records (the pool holds garbage there), and
+    the own-token flags follow the selection."""
+
+    SCRIPT = """
+        import os, sys
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3 import dsa
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
+
+        G, T = 4, 512
+        def case(firsts, S, topk, ties, seed):
+            rng = np.random.default_rng(seed)
+            B = len(firsts) * S
+            positions = np.array([p0 + r for p0 in firsts for r in range(S)], np.int32)
+            pages = max(-(-((p + T) // T) // G) for p in positions) + 1
+            pools = rng.integers(0, 256, (G, 1 + len(firsts) * pages, 132, 4, 128), dtype=np.uint8)
+            tables = np.zeros((G, B, pages), np.int32)
+            new_k8 = np.zeros((B, 128), np.float32); new_exp = np.zeros(B, np.int32)
+            seq_keys = []
+            for s, p0 in enumerate(firsts):
+                L = p0 + S
+                raw = rng.standard_normal((L, 128)).astype(np.float32)
+                if ties:  # five distinct keys: ties at the threshold
+                    raw = rng.standard_normal((5, 128)).astype(np.float32)[rng.integers(0, 5, L)]
+                k8, kexp = dsa.quantize_fp8(raw)
+                seq_keys.append((k8, kexp))
+                rec = np.asarray(dsa_dcp.key_records(jnp.asarray(raw)))
+                for r in range(S):
+                    tables[:, s * S + r] = 1 + s * pages + np.arange(pages)
+                    new_k8[s * S + r] = k8[p0 + r]; new_exp[s * S + r] = rec[p0 + r, 128]
+                for t in range(p0):
+                    page = t // T
+                    blk = tables[page % G, s * S, page // G]
+                    (row, sub), (srow, lane) = dsa_dcp.record_place(t % T)
+                    pools[page % G, blk, row, sub] = rec[t, :128]
+                    pools[page % G, blk, srow, 0, lane] = rec[t, 128]
+            q8 = np.zeros((B, 32, 128), np.float32); w = np.zeros((B, 32), np.float32)
+            for b in range(B):
+                q8[b], w[b] = dsa.index_query(rng.standard_normal(4096).astype(np.float32),
+                                              rng.standard_normal(32).astype(np.float32))
+            w_t = np.zeros((32, 128), np.float32); w_t[:, :B] = w.T
+            mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+            def body(q8, w_t, pool, tables, positions, new_k8, new_exp):
+                out = dsa_dcp.select_call(q8, w_t, new_k8, pool[0], tables[0], positions, new_exp,
+                                          pages=pages, topk=topk, group=G, max_local_pages=pages,
+                                          sequence_rows=S, interpret=pltpu.InterpretParams())
+                return tuple(x[None] for x in out)
+            f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P(), P("tp"), P("tp"), P(), P(), P()),
+                                      out_specs=(P("tp"),) * 4, check_vma=False))
+            tau, ptie, own, keys = (np.asarray(x) for x in f(
+                q8.astype(ml_dtypes.float8_e4m3fn), w_t, pools, tables.reshape(G, -1), positions, new_k8, new_exp))
+            tied = 0
+            for b in range(B):
+                L = positions[b] + 1
+                k8, kexp = seq_keys[b // S]
+                t = np.arange(L)
+                member = (t // T) % G
+                kk = keys[member, b, (t // T) // G * (T // 128) + (t % T) // 128, t % 128].astype(np.int64)
+                ref = dsa.monotone_key(dsa.scores(q8[b], w[b], k8[:L], kexp[:L]).astype(np.float32))
+                unkey = lambda k: (k ^ ((k >> 31) & 0x7FFFFFFF)).astype(np.int32).view(np.float32)
+                err = np.abs(unkey(kk) - unkey(ref)).max() / np.abs(unkey(ref)).max()
+                assert err < 1e-5, (b, err)
+                for name, v in (("tau", tau), ("p_tie", ptie), ("own", own)):
+                    assert len(set(v[:, b])) == 1, (name, b, v[:, b])
+                got = dsa_dcp.selected(kk, t, tau[0, b], ptie[0, b])
+                np.testing.assert_array_equal(got, dsa.topk_mask(kk, t, topk))
+                assert bool(own[0, b]) == bool(got[-1]), b
+                tied += int(L > topk and np.sum(kk == tau[0, b]) > 1)
+            return tied
+
+        case([300, 2500], 1, 256, False, 0)
+        assert case([1500, 2600], 2, 300, True, 1) > 0  # position tie-breaks exercised
+        print("OK")
+    """
+
+    def test_selection_matches_the_reference_on_a_dcp_group(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True, text=True, env=env, timeout=900,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
