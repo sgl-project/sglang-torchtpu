@@ -214,7 +214,7 @@ def tile(
         kc_cap = cfgs.serve.transposed_key_chunk or min(bkv, 1536)
         kc = math.gcd(bkv, min(bkv, kc_cap))
         chunk_vt = cfgs.serve.transposed_chunk_vt
-        mxu_split = int(os.environ.get("RPA_EXP_MXU", "0"))
+        mxu_split = int(os.environ.get("RPA_EXP_MXU", "0")) if cfgs.model.sliding_window is None else 0
         for kv_head in range(cfgs.model.num_kv_heads):
             kh = k[0, kv_head]  # [hd, bkv] fp8
             ones_rows = cfgs.acct_scratch_shape[1] - hd
