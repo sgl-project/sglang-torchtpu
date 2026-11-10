@@ -442,6 +442,20 @@ def inner_kernel(
             moe_kperm = os.environ.get("MUSE_PF_MOE_KPERM", "0") == "1"
 
             def _quant_col_step(block_lhs, start_k, end_k, start_n, end_n):
+                # KPERM weights read through the 16-contiguous-K scale arms are silently wrong.
+                if (
+                    moe_kperm
+                    and cfgs.rhs_cfgs.has_scale
+                    and rhs_qbs == 16
+                    and (apply_rhs_scale_after_matmul or (end_k - start_k) % 256)
+                ):
+                    raise NotImplementedError(
+                        "MUSE_PF_MOE_KPERM (KPERM-layout NVFP4 experts) needs 256-multiple "
+                        f"K steps with scales folded before the matmul; got K step "
+                        f"{end_k - start_k}, tile_k {cfgs.tiles.tile_k}, lhs block "
+                        f"{q_block_size}. Check MUSE_FUSED_RS_W4A16_KBLOCK or unset "
+                        "SGLANG_TPU_MUSE_MK_KPERM."
+                    )
                 block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
                 if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
                     if moe_kperm and rhs_qbs == 16 and (end_k - start_k) % 256 == 0:

@@ -250,6 +250,28 @@ class TpuEnvs:
     # hidden states (pd_hidden_pool.py) and the decode builds the draft KV and carry,
     # instead of the prefill running the draft over the prompt.
     SGLANG_TPU_PD_DECODE_DRAFT_PREFILL = EnvBool(False)
+    # With it and a windowed draft, the prefill writes only the hidden rows a decode
+    # can read: the window before the prompt end, or before each chunk end when a
+    # prefix-sharing tree may hand that window to a later request.
+    SGLANG_TPU_ENABLE_PD_HIDDEN_WINDOW_WRITE = EnvBool(True)
+    # P/D prefix pull (disaggregation/prefix_pull.py): the least prefix gap, in
+    # tokens, worth pulling from the decode instead of recomputing (one chunk).
+    SGLANG_TPU_PD_PREFIX_PULL_MIN_TOKENS = EnvInt(4096)
+    # Seconds between the cumulative prefix-gap / decode-window log lines; 0 = off.
+    SGLANG_TPU_PD_PREFIX_GAP_LOG_INTERVAL_S = EnvFloat(60.0)
+    # Pull prefixes from the decode: the decode locks the prefix it reports as
+    # pullable until the request's KV lands, and the prefill fetches it.
+    SGLANG_TPU_PD_PREFIX_PULL = EnvBool(False)
+    # Decode: prompt-end SWA windows kept locked by the cache for the next turn's
+    # pull, least recently used released first and under memory pressure; 0 = off.
+    SGLANG_TPU_PD_DECODE_PROMPT_END_ANCHORS = EnvInt(0)
+    # What a failed or timed-out prefix pull does. 1 (bring-up default): the
+    # request fails with the reason, an error log and
+    # sglang:pd_prefill_prefix_pull_failed_total{reason}; nothing is recomputed.
+    # 0: every PP stage recomputes the prefix instead, an explicit reliability
+    # path that logs a warning with the room, reason and recomputed tokens each
+    # time and counts sglang:pd_prefill_prefix_pull_fallback_total{reason}.
+    SGLANG_TPU_PD_PREFIX_PULL_STRICT = EnvBool(True)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.
@@ -478,6 +500,11 @@ class TpuEnvs:
     # and the step runs more blocks than it needs. Rounded up to a page
     # multiple. Unset (None) means the wrapper's own search decides.
     SGLANG_TPU_FORCE_RPA_PREFILL_BKV = EnvInt(None)
+    # "bq:bq_c:bkv:n_buffer": prefill blocks for every layer, skipping the VMEM search, whose
+    # estimate refuses tiles that fit at TP1 head counts (PP prefill); n_buffer >= 2.
+    SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS = EnvStr(None)
+    # Log batched RPA metadata per forward (debugging the PP profile core halt).
+    SGLANG_TPU_DEBUG_RPA_METADATA = EnvBool(True)
     # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 causing performance
     # regression in fused MoE with reduce scatter.
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
@@ -540,9 +567,6 @@ class TpuEnvs:
     # chunk is masked by key column only (MKConfig.attn_col_mask).
     SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE = EnvBool(False)
     SGLANG_TPU_MUSE_MK_ATTN_COL_MASK = EnvBool(False)
-    # pages_swa windows DMA'd into SMEM instead of the whole table: "auto" (when the two page
-    # tables exceed the SMEM budget), "1" or "0" (forced, e.g. to A/B the two paths)
-    SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE = EnvStr("auto")
     # Experimental: the pipelined SAL attention loop (MKConfig.attn_pipe) on steps of 33-64 rows
     # too, not only up to _BASE_STEP_MAX_ROWS (12-16 decoding requests at 4-token verify).
     SGLANG_TPU_MUSE_MK_LARGE_STEP_ATTN_PIPE = EnvBool(False)
@@ -567,6 +591,12 @@ class TpuEnvs:
     # 0 off) run in a second loop after each owner group's few-row experts (MKConfig.expert_split;
     # exact). Steps of more than 24 rows only.
     SGLANG_TPU_MUSE_MK_EXPERT_SPLIT = EnvInt(0)
+    # Megakernel row-tiled steps: an expert with more than 32 live (row, slot) pairs runs one
+    # staged pass in a 64 / 128 / ... / R-row bucket, dequantizing its slabs once, instead of
+    # 32- or 64-row passes that each dequantize them again (MKConfig.ex_one_pass; exact).
+    # Unset: on with SGLANG_TPU_MUSE_MK_KPERM (-1.3 / -0.8 ms at 64 / 128 rows), off without it
+    # (no step-time gain measured there).
+    SGLANG_TPU_MUSE_MK_EXPERT_ONE_PASS = EnvBool(None)
     # Megakernel attention on fp8 SEQ_ALONG_LANE pools: feed K (and V) to the MXU as fp8
     # instead of widening each chunk to bf16 on the VPU first. 0 = off, 1 = K only, 2 = K and V
     # (exact). With the 2026-10-27 megakernel, 2 saves 0.09 / 0.20 / 0.40 ms per q = 1 step at
@@ -728,6 +758,9 @@ class TpuEnvs:
     # (e.g. bq=1024, bkv=1536 on Muse Spark global layers and 512:512 on window=2048).
     SGLANG_TPU_FORCE_RPA_PREFILL_BQ = EnvInt(None)
     SGLANG_TPU_FORCE_RPA_PREFILL_BQ_C = EnvInt(None)
+    # Batched RPA: in-kernel trace regions (step body, full / masked tile), visible in
+    # xprof with libtpu's --xla_enable_custom_call_region_trace=true. Profiling only.
+    SGLANG_TPU_RPA_TRACE_REGIONS = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

@@ -39,6 +39,8 @@ from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 # contract for compatibility.
 TPU_NVFP4_GROUP_SIZE = 512
 TPU_NVFP4_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256, TPU_NVFP4_GROUP_SIZE)
+# gmm_v2 dequantizes blocks up to 128 in VMEM (W4A16); wider blocks run W4A8.
+_MAX_W4A16_GROUP_SIZE = 128
 PACKING = 2  # two FP4 codes per uint8 byte
 
 # Keep a bounded fallback above the largest configured serving bucket. The 8K
@@ -46,6 +48,32 @@ PACKING = 2  # two FP4 codes per uint8 byte
 # weights and repeat kernel setup inside the same compiled graph. Calls above
 # 8K remain deterministically chunked.
 _FUSED_RS_MAX_TOKENS_PER_CALL = 8192
+
+# Env the fused-RS NVFP4 GMM reads to apply block scales in the KPERM layout.
+KPERM_KERNEL_ENV = "MUSE_PF_MOE_KPERM"
+
+
+def mark_kperm_layout(layer: torch.nn.Module) -> None:
+    """Record that the megakernel permuted this layer's NVFP4 experts (SGLANG_TPU_MUSE_MK_KPERM)."""
+    layer.__dict__["_tpu_nvfp4_kperm"] = True
+
+
+def is_kperm_layout(layer: torch.nn.Module) -> bool:
+    return layer.__dict__.get("_tpu_nvfp4_kperm", False)
+
+
+def check_native_kperm_layout(layer: torch.nn.Module, *, use_fused_rs: bool) -> None:
+    """Raise instead of running a native GMM that would misread KPERM-layout experts."""
+    if not is_kperm_layout(layer):
+        return
+    # Only fused-RS's GMM has the KPERM block-scale arm; plain gmm_v2 reads 16 contiguous K.
+    if not use_fused_rs:
+        raise RuntimeError(
+            "NVFP4 experts are in the megakernel KPERM layout "
+            "(SGLANG_TPU_MUSE_MK_KPERM=1), which the native non-fused-RS MoE "
+            "(gmm_v2) cannot read. Run this step on the megakernel or the "
+            "pallas_tpu_fused_rs MoE backend, or unset SGLANG_TPU_MUSE_MK_KPERM."
+        )
 
 
 def _transpose_packed_fp4(matrix: torch.Tensor) -> torch.Tensor:
@@ -103,19 +131,57 @@ _UNUSED_NVFP4_MOE_PARAMS = (
 def _to_gmm_v2_scale_layout(
     scale: torch.Tensor, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
-    """``(E, OUT, num_blocks_K)`` -> gmm_v2 ``(E, num_blocks_K, 1, OUT)``.
+    """``(E, OUT, num_blocks_K)`` -> ``(E, num_blocks_K, OUT)`` in ``dtype``, own storage.
 
-    The stored scale ``dtype`` defaults to fp32. Passing ``torch.float8_e4m3fn``
-    (or ``torch.bfloat16``) re-quantizes the scale to a narrower type,
-    cutting the per-block scale stream 4x (fp8) / 2x (bf16) — gmm_v2 sizes its
-    scale traffic from the tensor's own dtype, so no kernel change is needed
-    beyond honoring ``scale.dtype``.
-
-    Materialize the declared rank-4 layout in its own buffer. Adding a size-1
-    dimension to a contiguous rank-3 tensor produces a contiguous view, so a
-    later ``contiguous()`` call alone cannot guarantee independent storage.
+    The rank-4 ``(E, blocks, 1, OUT)`` form is stored unit-dim-major on TPU
+    while the kernels tile it minor, so XLA relayouts it before every call.
+    Transpose directly: a clone of a squeezed view is rebuilt from its base on
+    every compiled call (torch-tpu 0.2).
     """
+    return _own_storage(scale.to(dtype).permute(0, 2, 1).contiguous())
+
+
+def _to_gmm_v2_rank4_scale_layout(
+    scale: torch.Tensor, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """``(E, OUT, num_blocks_K)`` -> ``(E, num_blocks_K, 1, OUT)``, own storage."""
     return _own_storage(scale.to(dtype).unsqueeze(-1).permute(0, 2, 3, 1).contiguous())
+
+
+def _to_gmm_v2_bf16_pair_scale_layout(scale: torch.Tensor) -> torch.Tensor:
+    """``(E, OUT, num_blocks_K)`` -> ``(E, num_blocks_K / 2, OUT)`` int32.
+
+    Word j holds the bf16 scales of K blocks 2j (low half) and 2j + 1 (high
+    half); gmm_v2 DMAs these as 32-bit tiles, faster than packed bf16 tiles.
+    """
+    e, out, blocks = scale.shape
+    if blocks % 2:
+        raise ValueError(f"bf16-pair scales need an even block count, got {blocks}")
+    pairs = (
+        scale.to(torch.bfloat16)
+        .permute(0, 2, 1)
+        .reshape(e, blocks // 2, 2, out)
+        .transpose(2, 3)
+        .contiguous()
+    )
+    packed = pairs.cpu().view(torch.int32).reshape(e, blocks // 2, out).clone()
+    return packed.to(scale.device)
+
+
+def _to_native_gmm_v2_scale_layout(
+    scale: torch.Tensor, dtype: torch.dtype, group_size: int
+) -> torch.Tensor:
+    """Scale layout for the stock gmm_v2 path (see gmm_v2's rhs_scale)."""
+    if group_size > _MAX_W4A16_GROUP_SIZE or dtype not in (
+        torch.bfloat16,
+        torch.float32,
+    ):
+        # W4A8 applies scales per block after the dot; its rank-3 tile would
+        # break the sublane alignment, and the copy is 32x smaller than block-16's.
+        return _to_gmm_v2_rank4_scale_layout(scale, dtype)
+    if dtype == torch.bfloat16:
+        return _to_gmm_v2_bf16_pair_scale_layout(scale)
+    return _to_gmm_v2_scale_layout(scale, dtype)
 
 
 def _expert_global_scales(
@@ -251,11 +317,13 @@ def prepare_tpu_nvfp4_moe_weights(
 
     Layout in (checkpoint) -> out (local gmm_v2), with ``G = group_size``:
       * ``w13_weight``       (E, 2I, H/2) u8  -> (E, H/2, 2*I_pad) u8
-      * ``w13_weight_scale`` (E, 2I, H/G) f8  -> (E, H/G, 1, 2*I_pad) scale_dtype
+      * ``w13_weight_scale`` (E, 2I, H/G) f8  -> (E, H/G, 2*I_pad) scale_dtype
       * ``w2_weight``        (E, H, I/2) u8   -> (E, I_pad/2, H) u8
-      * ``w2_weight_scale``  (E, H, I/G) f8   -> (E, I_pad/G, 1, H) scale_dtype
+      * ``w2_weight_scale``  (E, H, I/G) f8   -> (E, I_pad/G, H) scale_dtype
 
-    The fused-RS kernel takes the scales without the unit dim, (E, K/G, N).
+    That scale layout is fused-RS's. The stock gmm_v2 path stores
+    ``_to_native_gmm_v2_scale_layout`` instead: bf16 block-16..128 scales as
+    int32 bf16 pairs (E, K/G/2, N), W4A8 as (E, K/G, 1, N).
     """
     if group_size not in TPU_NVFP4_SUPPORTED_GROUP_SIZES:
         raise NotImplementedError(
@@ -314,15 +382,10 @@ def prepare_tpu_nvfp4_moe_weights(
     del w13
     if use_fused_rs:
         w13_w = _materialize_packed_fp4(_transpose_packed_fp4(w13_w))
-        # Fused-RS reads [E, K_blocks, N]. The unit dim of the gmm_v2 layout is
-        # stored major-most on TPU while the kernel needs it tiled, so XLA would
-        # relayout both scale tensors before every call. Transpose directly: a
-        # clone of a squeezed view is rebuilt from its base on every compiled
-        # call (torch-tpu 0.2).
-        w13_scale = _own_storage(w13_s.to(scale_dtype).permute(0, 2, 1).contiguous())
+        w13_scale = _to_gmm_v2_scale_layout(w13_s, scale_dtype)
     else:
         w13_w = w13_w.permute(0, 2, 1).contiguous()
-        w13_scale = _to_gmm_v2_scale_layout(w13_s, scale_dtype)  # (E, H/G, 1, 2*I_pad)
+        w13_scale = _to_native_gmm_v2_scale_layout(w13_s, scale_dtype, group_size)
     del w13_s
     _wait_for(w13_w, w13_scale)
     old_w13 = layer.w13_weight.data
@@ -345,10 +408,10 @@ def prepare_tpu_nvfp4_moe_weights(
     del w2
     if use_fused_rs:
         w2_w = _materialize_packed_fp4(_transpose_packed_fp4(w2_w))
-        w2_scale = _own_storage(w2_s.to(scale_dtype).permute(0, 2, 1).contiguous())
+        w2_scale = _to_gmm_v2_scale_layout(w2_s, scale_dtype)
     else:
         w2_w = w2_w.permute(0, 2, 1).contiguous()
-        w2_scale = _to_gmm_v2_scale_layout(w2_s, scale_dtype)  # (E, I_pad/G, 1, H)
+        w2_scale = _to_native_gmm_v2_scale_layout(w2_s, scale_dtype, group_size)
     del w2_s
     _wait_for(w2_w, w2_scale)
     old_w2 = layer.w2_weight.data
@@ -390,6 +453,8 @@ def apply_tpu_nvfp4_moe(
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
+
+    check_native_kperm_layout(layer, use_fused_rs=use_fused_rs)
 
     if use_fused_rs:
         from sglang_tpu.moe.pallas.fused_moe_rs_op import (

@@ -191,7 +191,7 @@ def _lookup_tile_info(
     """
     import jax.numpy as jnp
 
-    from sglang_tpu.moe.pallas.gmm_v2 import TileSizes
+    from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, num_scale_blocks
     from sglang_tpu.moe.pallas.tuned_block_sizes import (
         get_tuned_block_sizes,
     )
@@ -201,7 +201,7 @@ def _lookup_tile_info(
     # Packed FP4 stores 2 codes/byte along K, so real K = stored K * 2.
     _k = _k_raw * 2 if packed_fp4 else _k_raw
     assert _k == k, f"gmm_v2 lhs/rhs k mismatch: {k=} vs {_k=}"
-    quant_block_size = k if rhs_scale is None else k // rhs_scale.shape[1]
+    quant_block_size = k if rhs_scale is None else k // num_scale_blocks(rhs_scale)
     rhs_dtype = "float4_e2m1fn" if packed_fp4 else str(jnp.dtype(rhs.dtype).name)
     tiles = get_tuned_block_sizes(
         m=int(m),
@@ -266,7 +266,9 @@ def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
     """
     if not w2_packed:
         return _tuned_or_calculated(lhs, w2, w2_scale, num_experts)
-    return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
+    return _lookup_tile_info(
+        lhs, w2, w2_scale, num_experts, packed_fp4=True, gmm_v2_only=True
+    ) or _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
 
 
 def _tuned_or_calculated(lhs, rhs, rhs_scale, num_experts):
@@ -793,6 +795,11 @@ def _fused_moe_jax(
 
     # Weights arrive lane-aligned from the loader (bf16: pad activations to
     # match; quantized: unpadded-at-load dims are unsupported)
+    if gmm1_tile_info is None and w1_packed:
+        # Packed FP4 pins only gmm_v2-measured shapes; tile_n is per projection.
+        gmm1_tile_info = _lookup_tile_info(
+            x_sorted, w1, w1_scale, num_experts, packed_fp4=True, gmm_v2_only=True
+        )
     gmm1_tiling = _dividing_tile_k(
         _vmem_safe_packed_tile_n(
             gmm1_tile_info
