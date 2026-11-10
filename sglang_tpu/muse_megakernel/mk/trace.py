@@ -31,6 +31,8 @@ _INNER = frozenset(
         "ex_accum",
         "kv_prologue",
         "own_rows",
+        "y_row_wait",
+        "combine_rows",
     )
 )
 

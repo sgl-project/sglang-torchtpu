@@ -5703,8 +5703,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             cp.start()
 
                     def ywait(r, b, half=0):
-                        for cp in ycopies(r, b, half):
-                            cp.wait()
+                        with _scope("y_row_wait"):
+                            for cp in ycopies(r, b, half):
+                                cp.wait()
 
                     pl.when(my_live)(lambda: ystart(0, 0))
 
@@ -5748,7 +5749,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         S["u_send"][pl.ds(r, 1), :] = _pack_bf16x2(u)
                         return carry
 
-                    jax.lax.fori_loop(0, Rc, combine_row, 0)
+                    with _scope("combine_rows"):
+                        jax.lax.fori_loop(0, Rc, combine_row, 0)
 
             if vpads:
                 with _scope("u_ag"):
