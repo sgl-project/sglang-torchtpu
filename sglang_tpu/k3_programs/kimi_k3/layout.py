@@ -73,3 +73,18 @@ def cache_layout(dtype: str = "auto") -> KVLayout:
     raise NotImplementedError(
         f"K3 cache dtype {dtype!r} is unsupported; use auto/bfloat16 or fp8/fp8_e4m3"
     )
+
+
+# Kimi-K3.1 DSA index keys beside the latent pages (kimi_k3/dsa.py): per
+# 128-token sub-page, 32 rows of four tokens' 128 fp8 key bytes and one row
+# whose sublane 0 holds the 128 tokens' UE8M0 scale bytes (the compact layout
+# of sglang_tpu/k3_megakernel/kernel/stages/dsa.py). A pool row holds the
+# index keys of the latent row with the same block id.
+INDEX_SUBPAGE_TOKENS = 128
+INDEX_SUBPAGE_ROWS = 33
+
+
+def index_block_shape(layout: KVLayout) -> tuple[int, int, int]:
+    """One index-key pool row (uint8) for ``layout``'s latent rows."""
+    subpages = layout.tokens_per_block // INDEX_SUBPAGE_TOKENS
+    return (subpages * INDEX_SUBPAGE_ROWS, 4, 128)

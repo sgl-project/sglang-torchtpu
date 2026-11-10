@@ -134,11 +134,17 @@ def _k3_program_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
             for k in KDA
         }.values()
     )
-    _assert_root_buffers("K3 unified pools", target + draft)
+    # Kimi-K3.1: the DSA index-key pools (target state, after the MLA pools)
+    # share the KV pages' block ids; their ids follow the draft band.
+    index = list(getattr(full_pool, "index_pools", ()))
+    _assert_root_buffers("K3 unified pools", target + index + draft)
+    index_ids = range(NUM_LAYERS + len(draft), NUM_LAYERS + len(draft) + len(index))
     return RaidenKVCacheGroups(
-        full=target + draft,
+        full=target + index + draft,
         swa=[],
-        full_layer_ids=list(MLA) + list(range(NUM_LAYERS, NUM_LAYERS + len(draft))),
+        full_layer_ids=list(MLA)
+        + list(index_ids)
+        + list(range(NUM_LAYERS, NUM_LAYERS + len(draft))),
         num_draft_full=len(draft),
         state=hosts,
         state_type=StateType.MAMBA,

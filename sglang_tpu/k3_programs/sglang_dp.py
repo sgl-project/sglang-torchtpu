@@ -343,7 +343,12 @@ def make_swapper(program):
     draft = getattr(program, "draft", None)
 
     def pools():
-        return list(ops.unified_pools) + list(getattr(draft, "pools", ()) or ())
+        # The 24 unified pools, the draft's, and Kimi-K3.1's index-key pools.
+        return (
+            list(ops.unified_pools)
+            + list(getattr(draft, "pools", ()) or ())
+            + list(getattr(program, "index_pools", ()) or ())
+        )
 
     built = {}
 

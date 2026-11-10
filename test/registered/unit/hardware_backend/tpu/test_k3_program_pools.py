@@ -347,6 +347,20 @@ class TestConfiguratorHook(CustomTestCase):
         with mock.patch.object(hooks, "k3_program_active", return_value=False):
             hooks.size_k3_program_pools(None, other, None)
         self.assertEqual(other._cell_size, 27_648)
+        # Kimi-K3.1: plus the index-key pools (24 x 66 x 4 x 128 bytes a block
+        # of 8192 bf16-layout tokens: 99 bytes a token).
+        k31 = SimpleNamespace(_cell_size=27_648)
+        kvc = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(text_config=SimpleNamespace(dsa_config={"index_topk": 2048}))
+            )
+        )
+        with (
+            mock.patch.object(hooks, "k3_program_active", return_value=True),
+            _model("auto"),
+        ):
+            hooks.size_k3_program_pools(None, k31, kvc)
+        self.assertEqual(k31._cell_size, 1160 + 99)
 
 
 class TestSpecCheckHook(CustomTestCase):

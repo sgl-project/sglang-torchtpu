@@ -235,6 +235,8 @@ def _role_steps(role, program, config, pool):
         # and KDA heads, and Raiden pairs equal TP ranks), and a device's TP
         # rank need not be its kernel mesh position.
         program.kv_by_tp_rank = True
+    # Kimi-K3.1: the DSA index-key pools beside the unified pools (rows aligned).
+    program.index_pools = list(getattr(pool, "index_pools", ()))
     program.bind_kv_caches(pool.caches, groups)
     program.warmup()
     if role == "prefill":

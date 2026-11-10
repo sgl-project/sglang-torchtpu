@@ -201,6 +201,24 @@ def allocate_pools(
     return caches
 
 
+def allocate_index_pools(plan: UnifiedPoolPlan, device) -> list[torch.Tensor]:
+    """Kimi-K3.1: the 24 MLA layers' DSA index-key pools (uint8), rows aligned
+    with the unified pools' blocks (``layout.index_block_shape``)."""
+    from sglang_tpu.k3_programs.kimi_k3.layout import index_block_shape
+
+    shape = index_block_shape(plan.layout)
+    return [
+        torch.zeros((plan.num_blocks, *shape), dtype=torch.uint8, device=device)
+        for _ in MLA
+    ]
+
+
+def index_block_bytes(layout: KVLayout) -> int:
+    from sglang_tpu.k3_programs.kimi_k3.layout import index_block_shape
+
+    return int(np.prod(index_block_shape(layout)))
+
+
 def _block_bytes(pool: torch.Tensor) -> int:
     return pool[0].numel() * pool.element_size()
 
@@ -208,13 +226,17 @@ def _block_bytes(pool: torch.Tensor) -> int:
 BufInfos = tuple[list[int], list[int], list[int]]  # (data ptrs, lengths, item lengths)
 
 
-def kv_buf_infos(caches: dict[str, torch.Tensor], plan: UnifiedPoolPlan) -> BufInfos:
+def kv_buf_infos(
+    caches: dict[str, torch.Tensor], plan: UnifiedPoolPlan, index_pools=()
+) -> BufInfos:
     """The KV pages as sglang's P/D transfer addresses them: per MLA pool, then
-    per draft pool, page ``p`` at ``ptr + p * item_len`` (block ``p``)."""
+    per draft pool (then, Kimi-K3.1, per DSA index-key pool), page ``p`` at
+    ``ptr + p * item_len`` (block ``p``)."""
     from sglang_tpu.k3_programs.kimi_k3.pools import draft_raw_pools
 
     tensors = [caches[mla_layer_name(layer)] for layer in MLA]
     tensors += draft_raw_pools(caches)
+    tensors += list(index_pools)
     ptrs, lens, items = [], [], []
     for pool in tensors:
         block = _block_bytes(pool)

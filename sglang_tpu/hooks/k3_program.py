@@ -221,8 +221,11 @@ def size_k3_program_pools(result: None, configurator, kvc, *args, **kwargs) -> N
 
     # The host tier's stack for the unified radix cache built after the pools.
     sglang_hicache.install()
+    from sglang_tpu.k3_programs.sglang_pools import is_k31
+
     configurator._cell_size = K3UnifiedKVPool.bytes_per_token(
-        get_model().kv_cache_dtype
+        get_model().kv_cache_dtype,
+        dsa=is_k31(getattr(getattr(kvc, "model_config", None), "hf_config", None)),
     )
     return result
 

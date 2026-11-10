@@ -205,3 +205,52 @@ class TestDsaReference(CustomTestCase):
                     np.testing.assert_array_equal(got, want)
                     self.assertEqual(int(got.sum()), min(total, topk))
                     self.assertLessEqual(rounds, 7)  # 4 key digits + 3 position digits
+
+
+class TestIndexPools(CustomTestCase):
+    """Kimi-K3.1's DSA index-key pools beside the unified pools: one per MLA
+    layer, rows aligned with the latent blocks, and in every list the P/D
+    transfer and the host tier read."""
+
+    def test_pools_transfer_and_layer_ids(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import torch
+
+        from sglang_tpu.hooks import k3_program as hooks
+        from sglang_tpu.k3_programs import sglang_pools
+        from sglang_tpu.k3_programs.kimi_k3.layout import KDA, MLA, NUM_LAYERS
+
+        model = mock.patch(
+            "sglang.srt.runtime_context.get_model",
+            return_value=SimpleNamespace(kv_cache_dtype="fp8_e4m3"),
+        )
+        with model:
+            state = sglang_pools.K3StatePool(size=4, mamba_layer_ids=KDA, device="cpu")
+            kv = sglang_pools.K3UnifiedKVPool(
+                size=6 * 16384, page_size=16384, dtype=torch.float8_e4m3fn,
+                layer_num=len(MLA), device="cpu", index_head_dim=128,
+            )
+        self.assertEqual(len(kv.index_pools), len(MLA))
+        self.assertEqual(
+            tuple(kv.index_pools[0].shape), (kv.plan.num_blocks, 4 * 33, 4, 128)
+        )
+        self.assertEqual(kv.index_pools[0].dtype, torch.uint8)
+        self.assertEqual(len(kv.raw_pools()), len(MLA) + 5 + len(MLA))
+        ptrs, lens, items = kv.get_contiguous_buf_infos()
+        ids = kv.get_kv_layer_ids()
+        self.assertEqual(len(ptrs), len(ids))
+        self.assertEqual(set(items[-len(MLA):]), {4 * 33 * 4 * 128})
+        self.assertEqual(ids[-len(MLA):], list(range(NUM_LAYERS + 5, NUM_LAYERS + 5 + len(MLA))))
+        self.assertEqual(len(set(ids)), len(ids))
+        # Kimi-K3 builds none.
+        with model:
+            sglang_pools.K3StatePool(size=4, mamba_layer_ids=KDA, device="cpu")
+            k3 = sglang_pools.K3UnifiedKVPool(
+                size=6 * 16384, page_size=16384, dtype=torch.float8_e4m3fn,
+                layer_num=len(MLA), device="cpu",
+            )
+        self.assertEqual(k3.index_pools, [])
+        self.assertEqual(len(k3.get_kv_layer_ids()), len(MLA) + 5)
+        del hooks, state

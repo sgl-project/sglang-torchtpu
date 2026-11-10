@@ -59,6 +59,12 @@ def _colocated_dp_share() -> float:
     return float(tpu_envs.SGLANG_TPU_K3_PROGRAM_DP_ROW_SHARE.get())
 
 
+def is_k31(hf_config) -> bool:
+    """Whether ``hf_config`` is Kimi-K3.1's (a DSA indexer on its MLA layers)."""
+    text = getattr(hf_config, "text_config", hf_config)
+    return getattr(text, "dsa_config", None) is not None
+
+
 def _copy_rows(tensors, src: torch.Tensor, dst: torch.Tensor) -> None:
     for pool in tensors:
         device_src, device_dst = src.to(pool.device), dst.to(pool.device)
@@ -236,6 +242,13 @@ class K3UnifiedKVPool:
         self.caches = bridge.allocate_pools(
             self.plan, device, draft_layers=bridge.DSPARK_DRAFT_LAYERS
         )
+        # Kimi-K3.1: the DSA index keys, one pool per MLA layer beside the
+        # latent rows (sglang builds this pool as its DSA pool: index_head_dim).
+        self.index_pools = (
+            bridge.allocate_index_pools(self.plan, device)
+            if kwargs.get("index_head_dim") is not None
+            else []
+        )
         state.bind(self.plan, self.caches)
         _pending_state_pool = None
         self.state_pool = state
@@ -261,22 +274,26 @@ class K3UnifiedKVPool:
         return None
 
     @classmethod
-    def bytes_per_token(cls, kv_cache_dtype: str) -> int:
+    def bytes_per_token(cls, kv_cache_dtype: str, dsa: bool = False) -> int:
         """A logical token's share of the unified pools on one rank: every
-        pool's block holds this rank's share of a logical block's tokens."""
+        pool's block holds this rank's share of a logical block's tokens
+        (``dsa``: and Kimi-K3.1's index-key pools)."""
         layout = cache_layout(program_kv_cache_dtype(kv_cache_dtype))
         pools = len(MLA) + bridge.DSPARK_DRAFT_LAYERS
         tokens = bridge.TP_SIZE * layout.tokens_per_block
         block = pools * _block_bytes(program_kv_cache_dtype(kv_cache_dtype))
+        if dsa:
+            block += len(MLA) * bridge.index_block_bytes(layout)
         # Colocated DP2's B rows ride on the KV pages' budget.
         return int(block * (1 + _colocated_dp_share())) // tokens
 
     def raw_pools(self) -> list[torch.Tensor]:
-        """The distinct tensors: 24 unified pools, then the draft's."""
+        """The distinct tensors: 24 unified pools, then the draft's, then
+        (Kimi-K3.1) the DSA index-key pools."""
         seen: dict[int, torch.Tensor] = {}
         for tensor in self.caches.values():
             seen.setdefault(tensor.data_ptr(), tensor)
-        return list(seen.values())
+        return list(seen.values()) + list(getattr(self, "index_pools", ()))
 
     def copy_blocks(self, src_blocks, dst_blocks) -> None:
         """Copy whole blocks of every pool (the 24 unified pools and the
@@ -297,7 +314,7 @@ class K3UnifiedKVPool:
         self.layer_transfer_counter = counter
 
     def get_contiguous_buf_infos(self) -> bridge.BufInfos:
-        return bridge.kv_buf_infos(self.caches, self.plan)
+        return bridge.kv_buf_infos(self.caches, self.plan, self.index_pools)
 
     def get_kv_layer_ids(self) -> list[int]:
         """The model layer of each KV entry: the MLA layers, then the draft
@@ -305,4 +322,6 @@ class K3UnifiedKVPool:
         from sglang_tpu.k3_programs.kimi_k3.layout import NUM_LAYERS
 
         draft = range(NUM_LAYERS, NUM_LAYERS + bridge.DSPARK_DRAFT_LAYERS)
-        return list(MLA) + list(draft)
+        # Kimi-K3.1's index-key pools after the draft band (get_contiguous_buf_infos' order).
+        index = range(draft.stop, draft.stop + len(self.index_pools))
+        return list(MLA) + list(draft) + list(index)

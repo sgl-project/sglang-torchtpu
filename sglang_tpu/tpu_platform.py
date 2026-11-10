@@ -1409,6 +1409,12 @@ class TpuSRTPlatform(SRTPlatform):
         return MLATokenToKVPool
 
     def get_dsa_kv_pool_cls(self) -> type:
+        if _k3_program_selected():
+            # Kimi-K3.1 on the K3 programs: the unified pools plus the DSA
+            # index-key pools beside them.
+            from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
+
+            return K3UnifiedKVPool
         from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
 
         return TpuSplitMLATokenToKVPool
