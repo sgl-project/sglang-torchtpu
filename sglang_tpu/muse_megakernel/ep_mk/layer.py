@@ -21,12 +21,13 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel.ep_mk import a2a, attn, route
 from sglang_tpu.muse_megakernel.ep_mk.config import (
+    DN_TN,
     EPPlan,
     ep_buffers,
     ep_plan,
     ep_scratch,
 )
-from sglang_tpu.muse_megakernel.ep_mk.dense import stream_matmul
+from sglang_tpu.muse_megakernel.ep_mk.dense import stream_matmul, stream_prefetch
 from sglang_tpu.muse_megakernel.ep_mk.experts import (
     ChunkRefs,
     chunk_compute,
@@ -131,6 +132,10 @@ class EPExperts:
 
         with _phase("experts"):
             expert_loop(step, p, n_items, dispatched)
+        if not _dev_skip("unpool"):  # its first weight tiles stream under the y return
+            stream_prefetch(
+                S, step.W["wunpool"], step.layer, c.expert_hidden, c.hidden, 0, DN_TN
+            )
         with _phase("combine_a2a"):
             if moving:
                 a2a.wait_give_back(c, S, me)
@@ -151,6 +156,7 @@ class EPExperts:
 
 _window = attn.window
 _aligned8 = attn._aligned8
+_tile_value, _tile_store = attn.tile_value, attn.tile_store
 
 
 def _row(smr, name, n):
@@ -583,8 +589,9 @@ def _combine(step: EPLayerStep, win) -> None:
 def _stream_rows(c: MKConfig, S: dict):
     """(load(row0, n), rows(row0, n, fn)) on S["h_stream"]: VMEM with tiled_vmem_pads, else
     HBM through the row-tile staging S["sin"][0]. load: n <= row_tile rows as a value;
-    rows: fn(row, t0, m) on each tile of rows [row0 + t0, row0 + t0 + m), row(i) the ref of
-    its row i, written back unless write_back=False. HBM: one copy each way per tile when row0
+    rows: fn(row, t0, m, blk) on each tile of rows [row0 + t0, row0 + t0 + m), row(i) the ref
+    of its row i, blk the tile's [m, H] ref (None where VMEM rows are not 8-row aligned),
+    written back unless write_back=False. HBM: one copy each way per tile when row0
     is 8-row aligned (n % 8 == 0: row0 = rank * n), else one per row, all in flight (an
     aligned tile's write-back of another rank's row would race with its all-gather)."""
     hs, RT = S["h_stream"], c.row_tile
@@ -595,7 +602,9 @@ def _stream_rows(c: MKConfig, S: dict):
 
         def rows_v(r0, n, fn, write_back=True):
             for t0 in range(0, n, RT):
-                fn(lambda i, t0=t0: hs.at[pl.ds(r0 + t0 + i, 1)], t0, min(RT, n - t0))
+                m = min(RT, n - t0)
+                blk = hs.at[pl.ds(_aligned8(r0 + t0), m)] if n % 8 == 0 else None
+                fn(lambda i, t0=t0: hs.at[pl.ds(r0 + t0 + i, 1)], t0, m, blk)
 
         return load_v, rows_v
     stage, sem = S["sin"].at[0], S["ep_misc_sems"].at[3]
@@ -626,7 +635,7 @@ def _stream_rows(c: MKConfig, S: dict):
                 cp.start()
             for cp in cps:
                 cp.wait()
-            fn(lambda i: stage.at[pl.ds(i, 1)], t0, m)
+            fn(lambda i: stage.at[pl.ds(i, 1)], t0, m, stage.at[pl.ds(0, m)])
             if write_back:
                 cps = [
                     pltpu.make_async_copy(stage.at[b], hs.at[a], sem) for a, b in pairs
@@ -659,23 +668,22 @@ def _unpool_residual(step: EPLayerStep, win) -> None:
         H,
         put,
         skip=_dev_skip("unpool"),
+        prefetched=True,
     )
     fw = S["ep_f"][pl.ds(0, wn), :] * _row(smr, "post_ffn_w", H)
     S["ep_f"][pl.ds(0, wn), :] = _rms(fw, c.post_eps).astype(bf16).astype(f32)
     _, rows = _stream_rows(c, S)
     alpha, beta = _row(smr, "ffn_alpha", H), _row(smr, "ffn_beta", H)
 
-    def residual(row, t0, m):
-        h = jnp.concatenate([row(i)[...] for i in range(m)], axis=0)
+    def residual(row, t0, m, blk):
+        h = _tile_value(row, m, blk)
         if rc % 8 == 0:  # the window offset is 8-row aligned
             branch = S["ep_f"][pl.ds(_aligned8(w_off + t0), m), :]
         else:  # an unaligned window offset: one-row loads
             branch = jnp.concatenate(
                 [S["ep_f"][pl.ds(w_off + t0 + i, 1), :] for i in range(m)], axis=0
             )
-        s = alpha * h + beta * branch
-        for i in range(m):
-            row(i)[...] = s[i : i + 1]
+        _tile_store(row, m, blk, alpha * h + beta * branch)
 
     if not _dev_skip("residual"):  # own rows only: the all-gather fills the others
         rows(w0 + w_off, rc, residual)
@@ -693,8 +701,8 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
     w = nsmr[SMALL["pre_attn_w"] : SMALL["pre_attn_w"] + 1, :H]
     _, rows = _stream_rows(c, S)
 
-    def norm(row, t0, m):
-        h = jnp.concatenate([row(i)[...] for i in range(m)], axis=0)
+    def norm(row, t0, m, blk):
+        h = _tile_value(row, m, blk)
         own[pl.ds(t0, m), :] = _pack_bf16x2(
             _rms(h, c.rms_eps, w).astype(bf16).astype(f32)
         )

@@ -27,6 +27,21 @@ def _aligned8(x):
     return x if isinstance(x, int) else pl.multiple_of(x, 8)
 
 
+def tile_value(row, m: int, blk):
+    """A row tile's [m, H] value: from its block ref, or row by row."""
+    if blk is not None:
+        return blk[...]
+    return jnp.concatenate([row(i)[...] for i in range(m)], axis=0)
+
+
+def tile_store(row, m: int, blk, v) -> None:
+    if blk is not None:
+        blk[...] = v
+        return
+    for i in range(m):
+        row(i)[...] = v[i : i + 1]
+
+
 def window(c: MKConfig, me):
     """(w0, win, w_off): the 16-row aligned window holding own rows at [w_off, w_off + Rc)."""
     rc, win = c.rows_per_dev, window_rows(c)
@@ -92,7 +107,7 @@ def o_proj(step: EPOProjStep, p: EPPlan, stream_rows) -> None:
     s_win = S["ep_f"]  # [window, H] f32: own rows' post-attention stream, others zero
     s_win[...] = jnp.zeros((wn, H), f32)
 
-    def residual(row, t0, m):
+    def residual(row, t0, m, blk):
         # the tile's m rows at once (one-row arrays cost a permute per bf16 unpack)
         a = (
             jnp.concatenate(
@@ -111,10 +126,9 @@ def o_proj(step: EPOProjStep, p: EPPlan, stream_rows) -> None:
         s_a = jax.lax.rsqrt(
             jnp.mean(jnp.square(a), axis=-1, keepdims=True) + c.post_eps
         )
-        h = jnp.concatenate([row(i)[...] for i in range(m)], axis=0)
+        h = tile_value(row, m, blk)
         s = a_alpha * h + a_beta * (a * s_a).astype(bf16).astype(f32)
-        for i in range(m):
-            row(i)[...] = s[i : i + 1]
+        tile_store(row, m, blk, s)
         if rc % 8 == 0:  # the window offset is 8-row aligned
             s_win[pl.ds(_aligned8(w_off + t0), m), :] = s
         else:  # an unaligned window offset: one-row stores
