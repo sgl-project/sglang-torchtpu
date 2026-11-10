@@ -16,7 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     LogitsOutputMode,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.compiled_forward_shim import (
@@ -96,8 +96,51 @@ class BaseSpecDecodeCompilePolicyMixin:
             pending += self._precompile_target_verify()
         if disagg_mode != "decode":
             pending += self._precompile_extend_full()
+            pending += self._precompile_mixed_verify()
         cases = self._eager_logits_cases(disagg_mode)
         pending.append(PendingCall(lambda: self.warmup_eager_logits(cases)))
+        return pending
+
+    def _precompile_mixed_verify(self) -> list[PendingCall]:
+        """Compile mixed batches whose decoding requests carry whole DFLASH verify
+        blocks (SGLANG_DFLASH_MIXED_VERIFY): FULL capture, verify-width logits rows.
+        The eager runner runs a mixed batch as EXTEND, so the graph is an EXTEND one."""
+        from sglang.srt.managers.schedule_batch import mixed_tail_width
+
+        if not get_schedule().enable_mixed_chunk:
+            return []
+        width = mixed_tail_width(self.model_runner.spec_algorithm)
+        if width <= 1:
+            return []
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        bs = self._extend_compile_cap()
+        shapes = [
+            (t, has_spec_info, variant)
+            for t in self.t_bucketer.buckets
+            if t >= bs
+            for has_spec_info in (False, True)
+            for variant in self._extend_input_variants()
+        ]
+        logger.info(
+            "[spec compile policy] EXTEND mixed verify (FULL, width %d): %d shapes (bs=%d)",
+            width,
+            len(shapes),
+            bs,
+        )
+        pending = []
+        for num_tokens, has_spec_info, variant in shapes:
+            warmup = self._run_one(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=ForwardMode.EXTEND,
+                variant=variant,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                spec_info=self.make_null_spec_info() if has_spec_info else None,
+                mix_verify_width=width,
+            )
+            if warmup is not None:
+                pending.append(warmup)
         return pending
 
     def _eager_logits_cases(self, disagg_mode: str) -> list[EagerLogitsCase]:
@@ -134,7 +177,7 @@ class BaseSpecDecodeCompilePolicyMixin:
         """Compile TARGET_VERIFY across the batch-size buckets."""
         assert self.b_bucketer is not None
         draft_token_num = self.draft_token_num
-        bs_buckets = list(self.b_bucketer.buckets)
+        bs_buckets = self.full_verify_buckets()
         modes = self.target_verify_logits_output_modes()
         logger.info(
             "[spec compile policy] TARGET_VERIFY: %d shapes "
@@ -254,6 +297,11 @@ class BaseSpecDecodeCompilePolicyMixin:
                     f"Compiled {desc} ({shape_desc}) in {elapsed:.1f}s{hbm_str}"
                 )
 
+    def full_verify_buckets(self) -> list[int]:
+        """Batch buckets whose verify runs the full draft_token_num width."""
+        assert self.b_bucketer is not None
+        return list(self.b_bucketer.buckets)
+
     def make_null_spec_info(self) -> SpecInput:
         """Create null speculative input metadata for extend compilation.
 
@@ -338,6 +386,8 @@ class BaseSpecDecodeCompilePolicyMixin:
         if next_token_logits is not None and real_b < next_token_logits.shape[0]:
             if is_verify:
                 logit_rows = real_q
+            elif forward_batch.mix_verify_width > 1:
+                logit_rows = real_b * forward_batch.mix_verify_width
             elif host_padded:
                 # HOST_PADDED sampling rows are padded to the batch bucket; sample at that shape.
                 logit_rows = sampling_info.temperatures.shape[0]

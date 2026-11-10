@@ -5,8 +5,9 @@ applies its _Patch: KV layout (bf16 at c4/c8, fp8 1M-context elsewhere), running
 requests, prefill/decode interval and megakernel row cap. The mode picks the engine:
 
 - mixed: one TP8 server, prefill and decode together.
-- prefill / decode: one Raiden P/D engine each, a PP2 x TP4 prefill host feeding a TP8
-  megakernel decode host.
+- prefill / decode: one Raiden P/D engine each on Haolin's ms-v11 AgentX config
+  (agentx.py): a PP8 prefill host without the megakernel feeding a TP8 decode host
+  (c32: r32 on the row-tiled decode megakernel).
 
 Every mode serves DFlash on the experimental spec worker, the only one that runs it on
 a PP prefill.
@@ -33,6 +34,7 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
+from benchmark.tpu.recipe.configs.muse_spark import agentx
 from benchmark.tpu.recipe.configs.muse_spark.server import CONFIG as SERVER_CONFIG
 
 # 7 proposals + the anchor; SIMULATED_ACC_LEN is InferenceX's reference for 8-token verify.
@@ -183,6 +185,44 @@ _PATCHES_BY_CONCURRENCY: dict[int, dict[str, dict]] = {
 }
 
 
+# Decoding requests per P/D concurrency: the decode host admits every session at once.
+_PD_RUNNING: dict[int, int] = {32: 32}
+
+# Wave7 decode megakernel (PR #1909): steps above 32 rows run its row-tiled program,
+# and steps above 24 rows run experts with few live rows in their own loop.
+_PD_MK_DECODE_ENV: dict[str, str] = {
+    "SGLANG_TPU_MUSE_MK_OPT": "1",
+    "SGLANG_TPU_MUSE_MK_EXPERT_GROUP": "15",
+    "SGLANG_TPU_MUSE_MK_EXPERT_SPLIT": "4",
+}
+
+
+def _pd_config(concurrency: int) -> dict:
+    """Haolin's ms-v11 AgentX config, run by the experimental worker at the P/D running cap."""
+    running = _PD_RUNNING[concurrency]
+    config = agentx.config_for(concurrency)
+    args, env = config["server_args"], config["runtime_env"]
+    if args["speculative_num_draft_tokens"] != DRAFT_TOKENS:
+        raise ValueError(f"P/D runs {DRAFT_TOKENS}-token verify blocks")
+    # Only the experimental worker runs DFlash on a PP prefill; it simulates acceptance
+    # with fixed draft tokens and has no adaptive verify width.
+    env.pop("SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY", None)
+    env.update(
+        SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER="1",
+        SGLANG_SIMULATE_ACC_TOKEN_MODE="fixed",
+        SGLANG_TPU_MUSE_MK_MAX_ROWS=str(
+            agentx.megakernel_rows(running, DRAFT_TOKENS, None)
+        ),
+        **_PD_MK_DECODE_ENV,
+    )
+    args.update(
+        max_running_requests=running,
+        torch_compile_max_bs=running,
+        tpu_compile_bs=agentx.compile_bs(running, DRAFT_TOKENS, None),
+    )
+    return config
+
+
 def _apply(patch: dict[str, dict]) -> dict:
     config = deepcopy(_BASE)
     for section, overrides in patch.items():
@@ -205,6 +245,9 @@ _PD: dict[str, dict] = {
         "PORT": None,
         # Each engine is rank 0 of its own one-host group, whatever TPU_WORKER_ID its pod has.
         "SGLANG_LAUNCHER_RANK": "0",
+        # The decode builds the draft KV from the prefill's shipped hidden rows, so no draft
+        # KV crosses the PP8 -> TP8 head split; both ends must agree (layout fingerprint).
+        "SGLANG_TPU_PD_DECODE_DRAFT_PREFILL": "1",
     },
 }
 
@@ -212,23 +255,28 @@ _ROLES: dict[str, dict[str, dict]] = {
     "prefill": {
         "server_args": {
             "disaggregation_mode": "prefill",
-            # Raiden's pipeline producer needs attention TP=1 (DP attention), while NVFP4
-            # MoE needs fused-RS expert TP > 1; PP rejects the overlap schedule.
-            "tp_size": 4,
-            "dp_size": 4,
-            "enable_dp_attention": True,
-            # The DFlash draft shares the target head, sharded over attention TP under DP.
-            "enable_dp_lm_head": True,
+            # Raiden's pipeline producer needs attention TP=1; PP rejects the overlap schedule.
+            "tp_size": 1,
             "ep_size": 1,
-            "pp_size": 2,
+            "pp_size": 8,
+            # Fused-RS needs TP/EP > 1; auto picks stock Pallas gmm_v2 at PP8/EP1.
+            "moe_runner_backend": "auto",
             "disable_overlap_schedule": True,
         },
-        # The megakernel runs the whole decoder in one kernel, so it cannot be staged.
-        "runtime_env": {"SGLANG_TPU_MUSE_MEGAKERNEL": "0"},
+        "runtime_env": {
+            # The megakernel runs the whole decoder in one kernel, so it cannot be staged.
+            "SGLANG_TPU_MUSE_MEGAKERNEL": "0",
+            # Sequence-parallel prefill shards tokens over TP, which is 1 here.
+            "SGLANG_TPU_MUSE_PREFILL_SP": "0",
+            # Stages 0 and 7 also hold the BF16->FP8 boundary layers, embed and lm_head.
+            "SGLANG_PP_LAYER_PARTITION": "7,8,8,8,8,8,8,7",
+        },
     },
     "decode": {
         "server_args": {
             "disaggregation_mode": "decode",
+            # HiCache needs the radix tree, which a decode only keeps when asked.
+            "disaggregation_decode_enable_radix_cache": True,
             # The decode HiCache (pd_decode_swa_hicache) rejects host_pool retraction.
             "disaggregation_decode_retraction_backup": "cpu_tensor",
         },
@@ -239,13 +287,17 @@ _ROLES: dict[str, dict[str, dict]] = {
 
 
 def get_config(concurrency: int, mode: str = "mixed") -> dict:
-    if concurrency not in _PATCHES_BY_CONCURRENCY:
-        raise ValueError(
-            f"no patch for concurrency {concurrency}; defined: {sorted(_PATCHES_BY_CONCURRENCY)}"
-        )
     if mode not in MODES:
         raise ValueError(f"mode {mode!r} is not one of {MODES}")
-    config = _apply(_PATCHES_BY_CONCURRENCY[concurrency])
+    defined = _PATCHES_BY_CONCURRENCY if mode == "mixed" else _PD_RUNNING
+    if concurrency not in defined:
+        raise ValueError(
+            f"no {mode} config for concurrency {concurrency}; defined: {sorted(defined)}"
+        )
+    if mode == "mixed":
+        config = _apply(_PATCHES_BY_CONCURRENCY[concurrency])
+    else:
+        config = _pd_config(concurrency)
     if mode != "mixed":
         for patch in (_PD, _ROLES[mode]):
             for section, overrides in patch.items():

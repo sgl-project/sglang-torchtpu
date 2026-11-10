@@ -57,6 +57,7 @@ from sglang_tpu.experimental.speculative.draft_forward import forward_draft_rows
 from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
+from sglang_tpu.experimental.speculative.pd_draft_prefill import swa_mapped_starts
 from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
     build_draft_block_inputs,
@@ -344,10 +345,15 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         bonus_tokens: torch.Tensor,
     ) -> None:
         del bonus_tokens
-        if self._block_draft_worker.full_to_swa is not None:
-            raise NotImplementedError(
-                "PD decode-side draft prefill does not support a hybrid-SWA draft."
-            )
+        full_to_swa = self._block_draft_worker.full_to_swa
+        if full_to_swa is not None:
+            # The hidden rows sit at full slots; a windowed draft writes the SWA slots.
+            cache_loc_cpu = batch.out_cache_loc
+            assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
+            cache_loc = pad_rows(
+                full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype),
+                target_hidden.shape[0],
+            ).to(self.device, non_blocking=True)
         positions = pad_rows(
             prompt_positions(
                 prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
@@ -358,6 +364,16 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             self._block_draft_worker.write_draft_kv(
                 target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
             )
+
+    def pd_draft_prompt_starts(self, batch: ScheduleBatch) -> list[int]:
+        full_to_swa = self._block_draft_worker.full_to_swa
+        if full_to_swa is None:
+            return super().pd_draft_prompt_starts(batch)
+        # The decode preallocates SWA slots for the window tail only; a token before
+        # it has no draft KV slot (mapping 0), so its draft write would be dropped.
+        cache_loc_cpu = batch.out_cache_loc
+        assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
+        return swa_mapped_starts(full_to_swa[cache_loc_cpu], batch.extend_lens)
 
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows

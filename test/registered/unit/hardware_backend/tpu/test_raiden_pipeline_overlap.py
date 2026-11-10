@@ -155,6 +155,7 @@ class Manager:
 
 def make(mode, pp_rank, pp_size, controller, bus, name, heads, stage_parts=False):
     t = object.__new__(pl.PipelineTransfer)
+    t.seq_along_lane = False
     mgr = Manager(mode, pp_rank, pp_size, bus, name)
     groups = SimpleNamespace(
         full=[Tensor(32, 2 * heads, 8, 4)],
@@ -164,6 +165,7 @@ def make(mode, pp_rank, pp_size, controller, bus, name, heads, stage_parts=False
         num_draft_full=0,
         num_hidden_full=0,
         num_draft_swa=0,
+        seq_along_lane=False,
     )
     if mode == DisaggregationMode.DECODE:  # the decode owns every layer
         groups.full = [Tensor(32, 2 * heads, 8, 4), Tensor(32, 2 * heads, 8, 4)]
@@ -933,6 +935,7 @@ def test_early_close_refuses_stage_groups_and_a_loop_without_deferred_sends(
     """Stage groups replace the closing transfer, and without the deferred
     output send the last stage would silently close at its result point."""
     t = object.__new__(pl.PipelineTransfer)
+    t.seq_along_lane = False
     t.producer = True
 
     def depth(value):
