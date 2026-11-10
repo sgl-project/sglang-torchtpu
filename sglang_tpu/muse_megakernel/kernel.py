@@ -285,7 +285,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 S["xfull"].bitcast(jnp.float32).at[:, pl.ds(c.q_dim, c.q_dim)]
             )
         if c.vmem_trim:
+            assert not (c.fold_f or c.fold_o)
             S["final_norm"] = S["smalls"].at[1 - (c.n_layers - 1) % 2, pl.ds(0, 8)]
+            S["f_send"] = S["o_send"]
         if _alias_tiled_ids_kv(c):
             S["kb_s"] = S["ids_v"].bitcast(jnp.float32)
             S["vb_s"] = S["wsel_v"]

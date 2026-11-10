@@ -278,7 +278,8 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
         items += [("o_buf", vmem((ob_n, R, Hl // 2), u32))]
     items += [
         ("o_send", vmem((R, Hl // 2), u32)),
-        ("f_send", vmem((R, Hl // 2), u32)),
+        # vmem_trim: f_send is o_send (both all-gathers wait for their sends)
+        *([] if c.vmem_trim else [("f_send", vmem((R, Hl // 2), u32))]),
         ("u_send", vmem((Rc, He // 2), u32)),
     ]
     if not vpads:
