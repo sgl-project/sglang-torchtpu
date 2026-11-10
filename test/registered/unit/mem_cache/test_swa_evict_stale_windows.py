@@ -21,7 +21,10 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache import tree_core_registry
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import (
+    ComponentType,
+    EvictLayer,
+)
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -369,6 +372,48 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
         tail = core.node_by_id(w.match(nxt + [1]).last_device_node)
         lru.reset_node_lru(tail.parent, skip_host_backup=True)
         self.assertIn(tail.parent, swa._collect_unbacked_swa_nodes(tail))
+
+    def test_stale_window_host_copy_is_the_next_host_victim(self):
+        """write_through copies every window to host at insert (simulated here by giving
+        each node a host value). When the device evicts a window the switch demoted, its
+        host copy is the next host victim, ahead of the host copies of windows evicted
+        earlier, which requests still read."""
+        w = self._world(enabled=True)
+        core = w.cache.tree_core
+        ct = ComponentType.SWA
+        swa = w.cache.components[ct]
+        lru, host_lru = core.lru_lists[ct], core.host_lru_lists[ct]
+        prompt = _tokens(11, 16 * PAGE - 1)
+        w.prefill(prompt, self.CHUNK, decode=1)
+        nxt = prompt + _tokens(12, 2 * PAGE)
+        with mock.patch.object(
+            lru, "reset_node_lru", wraps=lru.reset_node_lru
+        ) as demote:
+            w.prefill(nxt, self.CHUNK, decode=1)
+        # The demoted prompt window; a dropped reply's node has an output offset.
+        stale = next(
+            c.args[0]
+            for c in demote.call_args_list
+            if lru.skips_host_backup(c.args[0]) and c.args[0].output_offset is None
+        )
+        live = core.node_by_id(w.match(nxt + [1]).last_device_node).parent
+        self.assertFalse(lru.skips_host_backup(live))
+
+        def evict_device_swa(node):
+            cd = node.component_data[ct]
+            cd.host_value = torch.arange(len(cd.value))
+            core._evict_component_and_detach_lru(
+                node,
+                swa,
+                device_frees={ct: []},
+                host_frees={ct: []},
+                target=EvictLayer.DEVICE,
+            )
+
+        evict_device_swa(live)
+        evict_device_swa(stale)
+        self.assertIs(host_lru.get_lru_no_host_lock(), stale)
+        self.assertIs(host_lru.get_prev_no_host_lock(stale), live)
 
     def test_other_reply_to_the_same_prompt_keeps_its_place(self):
         """Two conversations open with the same message and get different replies; the

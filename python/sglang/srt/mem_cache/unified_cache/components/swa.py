@@ -713,6 +713,10 @@ class SWAComponent(TreeComponent):
         ):
             if not host_lru.in_list(node):
                 host_lru.insert_mru(node)
+                # A stale window's host copy goes next: at MRU it outlives windows
+                # that are read.
+                if self.tree_core.lru_lists[ct].skips_host_backup(node):
+                    host_lru.reset_node_lru(node)
 
         return freed, host_freed
 
