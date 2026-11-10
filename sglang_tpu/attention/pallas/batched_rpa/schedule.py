@@ -110,9 +110,6 @@ class HeadAlongSublaneDmaNew(DmaNew):
     fetch_hbm = FieldOffset(1)
     fetch_vmem = FieldOffset(2)
     wb_vmem = FieldOffset(2)
-    # fetch size in the low 16 bits, writeback size in the high 16 (a page is
-    # at most 2**16 tokens). They differ under context parallelism, where a
-    # rank fetches every new token but writes back only its own pages.
     _flags = FieldOffset(3)
 
     @staticmethod
@@ -121,14 +118,14 @@ class HeadAlongSublaneDmaNew(DmaNew):
 
     @property
     def fetch_val(self):
-        return self._flags[...] & 0xFFFF
+        return self._flags[...]
 
     @property
     def wb_val(self):
-        return self._flags[...] >> 16
+        return self._flags[...]
 
     def set_flags(self, fetch_val, wb_val):
-        self._flags[...] = fetch_val | (wb_val << 16)
+        self._flags[...] = fetch_val
 
 
 @jax.tree_util.register_dataclass
@@ -525,7 +522,8 @@ def compute_metadata(
 
     `cfgs.serve.cache_only` reads the whole `kv_len` from the cache too, but the
     queries follow every key: no causal bound, and every q block gets at least
-    one k block. `cp_rank_ref` / `kv_lens_global_ref` (with `cp_group_size`)
+    one k block. Without `cfgs.serve.causal` every q block runs to the last k
+    block; the sliding window still sets the first. `cp_rank_ref` / `kv_lens_global_ref` (with `cp_group_size`)
     move the sliding window to global positions.
     """
 
@@ -571,39 +569,9 @@ def compute_metadata(
             # locally-computed k/v is unused. Drives kv_left_frm_new -> 0 ->
             # new_sz -> 0 -> do_writeback -> 0 automatically.
             kv_left_frm_cache = kv_left
-        elif cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
-            # Under STRIPED decode, this rank only writes back if it owns the page
-            # of the new token (global position k_len_global - 1).
-            k_len_global = (
-                kv_lens_global_ref[s_idx] if kv_lens_global_ref is not None else 0
-            )
-            page_size = cfgs.serve.page_size
-            cp_size = cfgs.serve.cp_group_size
-            rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
-            owns_token = (
-                (k_len_global > 0)
-                & (q_len == 1)
-                & (((k_len_global - 1) // page_size) % cp_size == rank)
-            )
-            kv_left_frm_cache = jnp.where(
-                owns_token, jnp.maximum(kv_left - q_len, 0), kv_left
-            )
         else:
             kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
-        # NEW_TOKENS_ONLY keeps the cached keys' VMEM slots (so the new tokens
-        # sit at their global offsets and the page-aligned writeback below
-        # applies) but, on HEAD_ALONG_SUBLANE, fetches none of them; the
-        # kernel masks them out. SEQ_ALONG_LANE writes back whole pages, so
-        # the one page the first new token shares with cached keys is fetched
-        # (its cached head would otherwise be written back stale); every
-        # other cached page stays unfetched. Under cp_group_size the lengths
-        # are global and the cache page-striped: global page g is local slot
-        # g // cp on rank g % cp, and only that rank fetches (and writes) it.
-        skip_cached = cfgs.serve.attention_scope.skips_cached_keys
-        cp_size = cfgs.serve.cp_group_size
-        rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
-        sal = cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
 
         for i in range(cfgs.bkv_p_cache):
             dst_vmem = i << cfgs.serve.page_size_log2
@@ -611,22 +579,8 @@ def compute_metadata(
             dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
 
             src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
-            if skip_cached:
-                if sal:
-                    # Only the page shared with the first new token, and only
-                    # on the rank that owns it.
-                    shared = (dma_sz > 0) & (dma_sz < cfgs.serve.page_size)
-                    if cp_size is not None:
-                        g = kv_p_start + i
-                        shared &= g % cp_size == rank
-                        src_hbm = s_idx * cfgs.serve.pages_per_seq + jnp.minimum(
-                            g // cp_size, cfgs.serve.pages_per_seq - 1
-                        )
-                    dma_sz = jnp.where(shared, dma_sz, 0)
-                else:
-                    dma_sz = 0
 
-            if sal:
+            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
                 dma_valid = jnp.where(dma_sz > 0, 1, 0)
                 schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
                 schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
@@ -642,7 +596,12 @@ def compute_metadata(
 
         # Writeback logic: each new k block is written back by the first q block
         # that attends to it.
-        q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
+        if cfgs.serve.causal:
+            q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
+        else:
+            # Non-causal q block 0 visits every k block from its window start on,
+            # which precedes the first new token.
+            q_wb = 0
 
         do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
         if cfgs.serve.skip_kv_write:
@@ -673,29 +632,12 @@ def compute_metadata(
                 # immediately following the existing cached pages. E.g., if
                 # cache_pages=2, new pages go to offsets 2*page_size, 3*page_size, etc.
                 fetch_vmem = (cache_pages + i) * cfgs.serve.page_size
-                tok_idx = kv_len_start + slot_start
-                if skip_cached and cp_size is not None:
-                    # Page-striped cache: global page g lives in local slot
-                    # g // cp of rank g % cp. Only the owner writes, and only
-                    # for multi-token rows (a single new token is written by
-                    # the STRIPED launch that also attends it). The page's
-                    # cached head was fetched above, so the whole-page write
-                    # carries it back intact.
-                    g = jnp.minimum(
-                        tok_idx >> cfgs.serve.page_size_log2,
-                        cfgs.serve.pages_per_seq * cp_size - 1,
-                    )
-                    p_idx = g // cp_size
-                    wb_val = jnp.where(
-                        (dma_sz > 0) & (g % cp_size == rank) & (q_len > 1), 1, 0
-                    )
-                else:
-                    p_idx = jnp.minimum(
-                        tok_idx >> cfgs.serve.page_size_log2,
-                        cfgs.serve.pages_per_seq - 1,
-                    )
-                    wb_val = jnp.where(dma_sz > 0, 1, 0)
+                p_idx = jnp.minimum(
+                    (kv_len_start + slot_start) >> cfgs.serve.page_size_log2,
+                    cfgs.serve.pages_per_seq - 1,
+                )
                 dst_hbm = s_idx * cfgs.serve.pages_per_seq + p_idx
+                wb_val = jnp.where(dma_sz > 0, 1, 0)
 
                 dma_entry.fetch_hbm[...] = new_page_start
                 dma_entry.fetch_vmem[...] = fetch_vmem
@@ -703,36 +645,20 @@ def compute_metadata(
                 dma_entry.wb_vmem[...] = slot_start
                 dma_entry.set_flags(fetch_val, wb_val)
             else:
-                tok_idx = kv_len_start + dst_vmem
-                p_off = tok_idx & cfgs.serve.page_size_mask
-                if skip_cached and cp_size is not None:
-                    # Page-striped cache: global page g lives in local slot
-                    # g // cp of rank g % cp. Only the owner writes, and only
-                    # for multi-token rows (a single new token is written by
-                    # the STRIPED launch that also attends it).
-                    p_idx = jnp.minimum(
-                        tok_idx >> cfgs.serve.page_size_log2,
-                        cfgs.serve.pages_per_seq * cp_size - 1,
-                    )
-                    local_slot = p_idx // cp_size
-                    wb_sz = jnp.where(
-                        (p_idx % cp_size == rank) & (q_len > 1), dma_sz, 0
-                    )
-                else:
-                    local_slot = jnp.minimum(
-                        tok_idx >> cfgs.serve.page_size_log2,
-                        cfgs.serve.pages_per_seq - 1,
-                    )
-                    wb_sz = dma_sz
+                p_idx = jnp.minimum(
+                    (kv_len_start + dst_vmem) >> cfgs.serve.page_size_log2,
+                    cfgs.serve.pages_per_seq - 1,
+                )
+                p_off = (kv_len_start + dst_vmem) & cfgs.serve.page_size_mask
                 dst_hbm = (
-                    (s_idx * cfgs.serve.pages_per_seq + local_slot)
+                    (s_idx * cfgs.serve.pages_per_seq + p_idx)
                     << cfgs.serve.page_size_log2
                 ) | p_off
 
                 dma_entry.fetch_hbm[...] = src_hbm
                 dma_entry.fetch_vmem[...] = dst_vmem
                 dma_entry.wb_hbm[...] = dst_hbm
-                dma_entry.set_flags(dma_sz, wb_sz)
+                dma_entry.set_flags(dma_sz, dma_sz)
 
         if cfgs.block.bq_sz == 1:
             # Decode path
@@ -783,56 +709,41 @@ def compute_metadata(
 
         start_k_idx = 0
         if (sliding_window := cfgs.model.sliding_window) is not None:
-            if (
-                q_global_start is not None
-                and cfgs.serve.attention_scope.walks_cache_stripe
-            ):
-                # First local key inside the window of the block's first query.
-                # The cache is page-striped: local page l of this rank is
-                # global page l * cp_group_size + cp_rank, so the first local
-                # page at or after the window's first global page p0 is
-                # ceil((p0 - cp_rank) / cp_group_size); keys of that page before
-                # the window are masked by the kernel.
+            if q_global_start is not None:
+                # First local key j inside the window of the block's first query;
+                # local key j holds global position j * cp_group_size + cp_rank.
                 cp_group_size = cfgs.serve.cp_group_size
-                first_global = jnp.maximum(
-                    q_global_start + q_idx * cfgs.bq_sz - sliding_window + 1, 0
-                )
-                first_page = first_global >> cfgs.serve.page_size_log2
-                first_local_page = (
-                    jnp.maximum(first_page - cp_rank_ref[0] + cp_group_size - 1, 0)
+                first_kv_idx = (
+                    jnp.maximum(
+                        q_global_start
+                        + q_idx * cfgs.bq_sz
+                        - sliding_window
+                        - cp_rank_ref[0]
+                        + cp_group_size,
+                        0,
+                    )
                     // cp_group_size
                 )
-                start_k_idx = (
-                    first_local_page << cfgs.serve.page_size_log2
-                ) // cfgs.bkv_sz
+                start_k_idx = first_kv_idx // cfgs.bkv_sz
             elif cfgs.serve.cache_only:
                 sw_start_idx = k_len + q_idx * cfgs.bq_sz - sliding_window + 1
                 start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
             else:
                 sw_start_idx = k_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
                 start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
-        if cfgs.serve.attention_scope.skips_cached_keys:
-            # Cached keys are not attended: start at the block holding the
-            # first new token.
-            start_k_idx = jnp.maximum(start_k_idx, (k_len - q_len) // cfgs.bkv_sz)
 
-        if cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe:
+        if cfgs.serve.cache_only:
             # No causal bound. One k block always runs, so a q block with no key
             # in range still writes output 0 and LSE -inf.
             end_k_idx = jnp.maximum(num_k, start_k_idx + 1)
+        elif not cfgs.serve.causal:
+            # Queries also see the keys after them, up to kv_len.
+            end_k_idx = num_k
         else:
             end_k_idx_causal = (
                 k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1
             ) // cfgs.bkv_sz + 1
             end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
-            if (
-                cfgs.serve.attention_scope.skips_cached_keys
-                and cfgs.serve.cp_group_size is not None
-            ):
-                # A single-token row is the STRIPED launch's (attended and
-                # written there); leave it unprocessed here: output untouched,
-                # LSE -inf.
-                end_k_idx = jnp.where(q_len == 1, start_k_idx, end_k_idx)
 
         k_loop_fn = functools.partial(
             k_loop,
@@ -916,8 +827,8 @@ def rpa_metadata_schedule_kernel(
             length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
             b=cu_q_lens[i+1] represents q/k/v of sequence i.
         kv_lens_ref: [max_num_seqs]. Existing kv cache length of each sequence.
-        distribution_ref: [3]. Cumulative sum of the number of mixed, prefill
-            and decode sequences, in that batch order (see ``RpaCase``).
+            distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
+            mixed
         schedule_hbm_ref: HBM memory that will store output of the kernel.
         schedule_ref: Scratch memory where schedule results gets written.
         dma_sem: Semaphore used for writing scheduler output to HBM.

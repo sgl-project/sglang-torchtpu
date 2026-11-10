@@ -32,12 +32,14 @@ from sglang_tpu.disaggregation.raiden.pp_common import (
     _kv_rank,
     _new_transfer_state,
     group_ranks,
+    is_hidden_pool,
     is_swa_pool,
     parse_req_id,
     part_destination_blocks,
     part_req_id,
     part_spans,
     part_uuid,
+    pool_is_seq_along_lane,
     pool_kind,
     stage_group,
     stage_req_id,
@@ -138,7 +140,12 @@ def materialized_storage_layout(tensor, getter):
 
 
 def layout_fingerprint(
-    pools: Sequence[dict], tensors: Sequence[Any], getter, *, ships_pd_hidden: bool
+    pools: Sequence[dict],
+    tensors: Sequence[Any],
+    getter,
+    *,
+    ships_pd_hidden: bool,
+    seq_along_lane: bool,
 ) -> str:
     """Compare per-class page geometry and materialized layout across layer
     subsets; the per-rank head count is left out so a tensor-parallel consumer
@@ -149,13 +156,17 @@ def layout_fingerprint(
     for pool, tensor in zip(pools, tensors):
         # Only the last stage holds the PD hidden pool, whose pages match no target
         # class; both ends build it from the same geometry (pd_hidden_pool.py).
-        if pool_kind(pool["tag"]).startswith("pdhid."):
+        if is_hidden_pool(pool["tag"]):
             continue
         layout = materialized_storage_layout(tensor, getter)
         if layout is None:
             raise ValueError("Raiden pipeline KV must have a materialized TPU layout")
         major, tiles, bits = layout
-        if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
+        if pool_is_seq_along_lane(pool["tag"], seq_along_lane):
+            # Axis 1, the per-rank 2 * kv_heads, is left out.
+            schema = "sglang-seq-along-lane-kv-v1"
+            page_shape = [int(n) for n in tensor.shape[2:]]
+        elif _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             # Axis 1, the per-rank 2 * kv_heads, is left out.
             schema = "sglang-rpa-seq-kv-v1"
             page_shape = [int(tensor.shape[2]), int(tensor.shape[3])]
@@ -360,6 +371,7 @@ class PipelineTransfer:
         self.lock = threading.RLock()
         self.draft_kv_heads = getattr(groups, "draft_kv_head_num", None)
         self.draft_swa_kv_heads = getattr(groups, "draft_swa_kv_head_num", None)
+        self.seq_along_lane: bool = groups.seq_along_lane
         # A hybrid pool's sliding-window layers get an engine of their own.
         self.pools, swa_pools = pp_swa.split_manifest(pool_manifest(groups))
         self.tensors = list(groups.full)
@@ -662,6 +674,7 @@ class PipelineTransfer:
             tensors,
             tpu_torch_compile.get_device_layout_if_materialized,
             ships_pd_hidden=_ships_pd_hidden(),
+            seq_along_lane=self.seq_along_lane,
         )
         client.register_work_unit(
             unit=unit,
@@ -753,6 +766,19 @@ class PipelineTransfer:
             state["offered"] = p_start + len(p_blocks)
             self._reply_part(room, part)
 
+    def _check_consumer_layout(self, room) -> None:
+        """Refuse a consumer whose KV pages are in the other layout: the spans would
+        land producer bytes in the wrong places of every page."""
+        for meta in self.replies[room].values():
+            consumer = bool(meta["seq_along_lane"])
+            if consumer != self.seq_along_lane:
+                name = {True: "SEQ_ALONG_LANE", False: "fused token-major"}
+                raise ValueError(
+                    f"Raiden pipeline producer holds {name[self.seq_along_lane]} KV "
+                    f"and the decode {name[consumer]} KV; set "
+                    "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV the same on both"
+                )
+
     def _dst_attn_tp(self, room) -> int:
         widths = {int(meta["attn_tp_size"]) for meta in self.replies[room].values()}
         if len(widths) != 1:
@@ -776,6 +802,7 @@ class PipelineTransfer:
         room."""
         try:
             dst_attn_tp = self._dst_attn_tp(room)
+            self._check_consumer_layout(room)
             spans = part_spans(
                 self.pools,
                 self.tensors,
@@ -783,6 +810,7 @@ class PipelineTransfer:
                 swa,
                 dst_attn_tp,
                 int(self.manager.kv_args.total_kv_head_num),
+                seq_along_lane=self.seq_along_lane,
                 draft_total_kv_heads=self.draft_kv_heads,
                 draft_swa_total_kv_heads=self.draft_swa_kv_heads,
                 with_swa=with_swa,
@@ -1200,7 +1228,11 @@ class PipelineTransfer:
             )
         endpoint = NetworkAddress(mgr.local_ip, mgr.rank_port).to_tcp()
         consumer = json.dumps(
-            dict(attn_tp_size=mgr.attn_tp_size, attn_tp_rank=mgr.attn_tp_rank)
+            dict(
+                attn_tp_size=mgr.attn_tp_size,
+                attn_tp_rank=mgr.attn_tp_rank,
+                seq_along_lane=self.seq_along_lane,
+            )
         ).encode()
         for info in infos:
             peer = NetworkAddress(info["rank_ip"], int(info["rank_port"])).to_tcp()

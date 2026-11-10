@@ -52,53 +52,6 @@ class ModelConfigs:
         return self.num_q_heads // self.num_kv_heads
 
 
-class AttentionScope(enum.StrEnum):
-    """Which KV positions to attend to.
-
-    FULL:            attend all positions (default).
-    CACHE_ONLY:      attend only cached tokens, skip new tokens.
-    NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens. The KV index
-                     space is the sequence's global positions (``kv_lens`` is
-                     the full length, the last ``q_len`` of it new), the cached
-                     pages are not attended, and the new tokens are written
-                     back as in FULL. HEAD_ALONG_SUBLANE fetches none of the
-                     cached pages; SEQ_ALONG_LANE writes back whole pages, so
-                     it fetches the cached head of the page the first new
-                     token shares (and nothing else) to write it back intact.
-                     With ``cp_group_size`` the cache is page-striped, so the
-                     write of each new token goes to its owner rank's stripe
-                     slot (``page // cp`` on rank ``page % cp``) and only the
-                     owner issues it (and, under SEQ_ALONG_LANE, fetches the
-                     shared page's head); a single-token row is left
-                     unprocessed (output untouched, LSE -inf), its token being
-                     the STRIPED launch's to attend and write.
-    STRIPED:         decode under decode context parallelism in one launch:
-                     attend this rank's page stripe of the cache plus the
-                     sequence's new token when this rank owns its page. The
-                     caller passes kv_new_lens / update_kv_cache as 1
-                     on the owner and 0 elsewhere; the new token is stitched
-                     and written at the end of the stripe, which is exactly
-                     its slot because the owner's stripe ends on that page.
-                     Decode-only (one query per sequence); the mask attends
-                     every key of the stripe, so no causal offset is needed.
-    """
-
-    FULL = enum.auto()
-    CACHE_ONLY = enum.auto()
-    NEW_TOKENS_ONLY = enum.auto()
-    STRIPED = enum.auto()
-
-    @property
-    def walks_cache_stripe(self) -> bool:
-        """Whether the KV index space of this call is one rank's page stripe."""
-        return self in (AttentionScope.CACHE_ONLY, AttentionScope.STRIPED)
-
-    @property
-    def skips_cached_keys(self) -> bool:
-        """Whether cached keys are left unfetched and masked out."""
-        return self == AttentionScope.NEW_TOKENS_ONLY
-
-
 class KVLayout(enum.StrEnum):
     """Represents the different layouts for KV cache.
 
@@ -127,19 +80,48 @@ class ServingConfigs:
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
     smem_fraction_limit_for_schedule_generation: float = 0.33
     max_schedule_size_multiplier: int = 16
-    decode_query_size: int = 1
     # Context-parallel modes; see `wrapper.ragged_paged_attention`.
     cache_only: bool = False
     skip_kv_write: bool = False
+    # False: each query sees every key below kv_len, bounded below only by the
+    # sliding window (RPA v3 causal=0).
+    causal: bool = True
     return_lse: bool = False
     cp_group_size: int | None = None
-    attention_scope: AttentionScope = AttentionScope.FULL
-
-    def __post_init__(self):
-        if self.cache_only and self.attention_scope == AttentionScope.FULL:
-            object.__setattr__(self, "attention_scope", AttentionScope.CACHE_ONLY)
-        elif self.attention_scope == AttentionScope.CACHE_ONLY and not self.cache_only:
-            object.__setattr__(self, "cache_only", True)
+    # Prefill tiles whose every key precedes every query (and lies inside the
+    # sliding window) run without the mask, and a power-of-two sm_scale is folded
+    # into q; both are exact.
+    skip_full_tile_mask: bool = False
+    # Softmax variants (env-gated in the wrapper): exp2 with log2e folded into the
+    # q scale; row sums from ones rows appended to V (l rides in the accumulator).
+    exp2_softmax: bool = False
+    ones_v: bool = False
+    # Softmax without the running row max (env-gated in the wrapper): scores must be
+    # bounded so exp cannot overflow, e.g. QK-normed models.
+    no_max: bool = False
+    # Prefill tiles with transposed scores and fp8 q (see transposed.py);
+    # env-gated in the wrapper, applied where `use_transposed` holds.
+    transposed: bool = False
+    # Transposed tiles skip the compute blocks past a partial q block's last
+    # query (a sequence's last block) instead of scoring padded rows; exact.
+    skip_pad_q: bool = False
+    # Query tokens per group of the partial-block loop (a multiple of bq_c_sz).
+    skip_pad_q_group: int = 128
+    # Per-head RMS norm of the output rows (weightless, this eps), applied to the
+    # output-dtype values as a model's following norm would (Muse Spark).
+    out_head_norm_eps: float | None = None
+    # Transposed tile with no_max: keys per streamed chunk (None: the whole bkv).
+    transposed_key_chunk: int | None = None
+    # Unshifted streaming tile: every Nth key chunk's exp2 runs on the VALU (0: none).
+    transposed_valu_exp2_every: int = 0
+    # Shifted transposed tile: the PV (O^T) matmul in fp8 (p in (0, 1], fp8 V).
+    transposed_fp8_p: bool = False
+    # Unshifted streaming tile: build V^T (+ ones rows) per key chunk, not per tile.
+    transposed_chunk_vt: bool = False
+    # Unshifted streaming tile: the QK matmul pops bf16 scores (no f32->bf16 pass).
+    transposed_s_bf16: bool = False
+    # Profiling: the grid step body and the full / masked tiles as named trace regions.
+    trace_regions: bool = False
 
     @property
     def pages_per_seq(self) -> int:
@@ -168,12 +150,6 @@ class RpaCase(enum.StrEnum):
     - DECODE: Sequences are in decode-only mode (q_len = 1).
     - PREFILL: Sequences are in prefill-only mode (q_len > 1, static).
     - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
-
-    A batch lists its MIXED sequences first, then PREFILL, then DECODE, and
-    ``distribution`` holds the cumulative counts in that order:
-    ``[n_mixed, n_mixed + n_prefill, total]``. This is the order SGLang's
-    scheduler produces (prefill chunks first, running decode rows appended
-    after them), so a mixed batch needs no permutation of its rows.
     """
 
     DECODE = enum.auto()
@@ -191,6 +167,8 @@ class RpaCase(enum.StrEnum):
     def get_range(
         self, distribution: jax.Array
     ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
+        # main's (and the serving bridge's) convention: MIXED [0, d0), PREFILL [d0, d1),
+        # DECODE [d1, d2); an extend sent as DECODE runs bq=1 blocks past its step bound.
         assert distribution.shape == (3,)
         match self:
             case RpaCase.MIXED:
@@ -273,24 +251,6 @@ class RpaConfigs:
         num_lanes = pltpu.get_tpu_info().num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
         return int(max_steps_ub)
-
-    def local_kv_cache_len(self, global_kv_cache_len, rank):
-        """This call's cache length in its own KV index space. CP only.
-
-        The cache is page-striped across the CP group, so a cache-phase call walks
-        only one rank's stripe.
-        """
-        if (
-            self.serve.cp_group_size is None
-            or not self.serve.attention_scope.walks_cache_stripe
-        ):
-            return global_kv_cache_len
-        return utils.cp_local_cache_len(
-            global_kv_cache_len,
-            self.serve.cp_group_size,
-            rank,
-            self.serve.page_size,
-        )
 
     @property
     def bkv_p(self) -> int:
@@ -444,16 +404,85 @@ class RpaConfigs:
 
     @property
     def acc_scratch_shape(self):
+        # With ones_v the accumulator is a full vreg wide: the head in the low
+        # lanes, the row sum l in the lanes above it.
+        width = self.acc_width if self.serve.ones_v else self.aligned_kv_head_dim
         return (
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+            width,
+        )
+
+    @property
+    def acc_width(self) -> int:
+        return pltpu.get_tpu_info().num_lanes
+
+    @property
+    def use_transposed(self) -> bool:
+        # One sequence per tile, compute blocks of whole lane vregs, the head
+        # inside half a vreg so O^T pads to one lane tile at the store.
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return (
+            self.serve.transposed
+            and self.mode != RpaCase.DECODE
+            and self.batch_size == 1
+            and self.bq_sz > 1
+            and self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE
+            and (self.bq_c_sz * self.aligned_num_q_heads_per_kv_head) % num_lanes == 0
+            and self.aligned_kv_head_dim * 2 <= num_lanes
+        )
+
+    @property
+    def mt_scratch_shape(self):
+        return (
+            self.model.num_kv_heads,
+            1,
+            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+        )
+
+    @property
+    def acct_scratch_shape(self):
+        # O^T rows, then one bf16 sublane tile of row sums (ones rows in V^T).
+        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        return (
+            self.model.num_kv_heads,
+            self.aligned_kv_head_dim + 2 * num_sublanes,
+            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+        )
+
+    @property
+    def qt_scratch_shape(self):
+        return (
+            self.model.num_kv_heads,
             self.aligned_kv_head_dim,
+            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
         )
 
     @property
     def max_schedule_size_multiplier(self) -> int:
         # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
-        return self.serve.max_schedule_size_multiplier
+        # Grown to the static step bound: a long prefill padded to many rows (whose
+        # page table shrinks max_steps_ub) needs more steps than 16 SMEM chunks, and
+        # the schedule kernel flushes chunks past the HBM buffer end without a check.
+        return max(
+            self.serve.max_schedule_size_multiplier,
+            -(-(self.static_max_steps + 1) // self.max_steps_ub),
+        )
+
+    @property
+    def static_max_steps(self) -> int:
+        """Upper bound on schedule steps for any input of these static shapes."""
+        num_k = -(
+            -(self.serve.pages_per_seq * self.serve.page_size) // self.block.bkv_sz
+        )
+        if self.mode == RpaCase.DECODE:
+            steps = self.serve.num_seqs * num_k
+        else:
+            num_q = (
+                -(-self.serve.total_q_tokens // self.block.bq_sz) + self.serve.num_seqs
+            )
+            steps = num_q * num_k
+        return -(-steps // self.block.batch_size)
 
     def validate_inputs(
         self,
@@ -560,6 +589,15 @@ class RpaConfigs:
                 f" {self.serve.page_size=} when the kernel reads cached pages."
             )
 
+        if (
+            self.serve.cache_only
+            and self.serve.kv_layout != KVLayout.HEAD_ALONG_SUBLANE
+        ):
+            # SEQ_ALONG_LANE fetches whole pages, so the stale tail of a shard's
+            # last page would reach p * v unmasked.
+            raise NotImplementedError("cache_only requires HEAD_ALONG_SUBLANE.")
+        if not self.serve.causal:
+            self._validate_non_causal()
         num_lanes = pltpu.get_tpu_info().num_lanes
         if self.serve.return_lse and self.aligned_num_q_heads_per_kv_head > num_lanes:
             raise ValueError(
@@ -569,11 +607,8 @@ class RpaConfigs:
         if self.serve.cp_group_size is not None:
             if self.serve.cp_group_size < 1:
                 raise ValueError(f"Expected {self.serve.cp_group_size=} >= 1.")
-            if self.serve.attention_scope == AttentionScope.FULL:
-                raise ValueError(
-                    "Context Parallel does not support AttentionScope.FULL"
-                    " where cache is sharded."
-                )
+            if not self.serve.cache_only:
+                raise ValueError("cp_group_size requires cache_only.")
             if cp_rank is None or kv_lens_global is None:
                 raise ValueError("cp_group_size requires cp_rank and kv_lens_global.")
             if cp_rank.shape != (1,) or cp_rank.dtype != jnp.int32:
@@ -584,15 +619,23 @@ class RpaConfigs:
                 raise ValueError(
                     f"Expected int32 {kv_lens_global.shape=} to be {kv_lens.shape}."
                 )
-        elif self.serve.attention_scope == AttentionScope.STRIPED:
-            raise ValueError("AttentionScope.STRIPED requires cp_group_size.")
         elif cp_rank is not None or kv_lens_global is not None:
             raise ValueError("cp_rank and kv_lens_global require cp_group_size.")
 
-        if self.serve.attention_scope == AttentionScope.STRIPED:
-            if self.serve.decode_query_size != 1:
-                raise ValueError(
-                    "AttentionScope.STRIPED requires decode_query_size == 1, got"
-                    f" {self.serve.decode_query_size=}; use the CACHE_ONLY +"
-                    " NEW_TOKENS_ONLY pair for multi-token decode."
-                )
+    def _validate_non_causal(self):
+        # Only the plain extend/verify path has a non-causal mask; the other modes
+        # carry their own visibility rules or are untested without the causal bound.
+        unsupported = {
+            # Stale lanes past kv_len are zeroed only in the seq-along-lane V load.
+            "HEAD_ALONG_SUBLANE": self.serve.kv_layout != KVLayout.SEQ_ALONG_LANE,
+            "attention_sink": self.model.has_attention_sink,
+            "cache_only": self.serve.cache_only,
+            "cp_group_size": self.serve.cp_group_size is not None,
+            "return_lse": self.serve.return_lse,
+            "transposed": self.serve.transposed,
+        }
+        enabled = [name for name, on in unsupported.items() if on]
+        if enabled:
+            raise NotImplementedError(
+                f"Non-causal batched RPA does not support {', '.join(enabled)}."
+            )

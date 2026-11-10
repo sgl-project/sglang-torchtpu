@@ -41,16 +41,29 @@ class TpuDMAKVTransfer(Protocol):
     registration); ``TpuDMAHostKVPool`` owns which pages are free.
     """
 
-    def backup(self, device_pages: list[int], host_pages: list[int]) -> TransferEvent:
+    def backup(
+        self,
+        device_pages: list[int],
+        host_pages: list[int],
+        num_pages: list[int] | None = None,
+    ) -> TransferEvent:
         """Start copying every layer of ``device_pages[i]`` to ``host_pages[i]``.
+
+        With num_pages, segment i is num_pages[i] consecutive pages on both sides.
 
         Returns without waiting. The copy is not ordered against compute, so the
         caller fences it (``kv_free_fence``) and keeps torch off the pages until
         the event is done.
         """
 
-    def load(self, host_pages: list[int], device_pages: list[int]) -> TransferEvent:
-        """Start copying every layer of ``host_pages[i]`` to ``device_pages[i]``.
+    def load(
+        self,
+        host_pages: list[int],
+        device_pages: list[int],
+        num_pages: list[int] | None = None,
+    ) -> TransferEvent:
+        """Start copying every layer of ``host_pages[i]`` to ``device_pages[i]``,
+        segmented as in backup.
 
         Returns without waiting; the caller keeps the forward pass off the pages
         until the event is done.

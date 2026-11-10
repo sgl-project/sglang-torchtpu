@@ -59,6 +59,10 @@ class DFlashDraftInputV2(SpecInput):
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
 
+    # A tensor ready only once this forward's draft KV writes have landed, or
+    # None. The TPU result copy copies it so copy_done covers those writes.
+    draft_kv_write_tail: Optional[torch.Tensor] = None
+
     verify_token_budget: Optional[int] = None
 
     # TPU device-resident verify addressing. The flag states that
