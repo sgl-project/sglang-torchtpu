@@ -1441,6 +1441,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             S["kv_chunk_sems"].at[slot],
                         ).start()
 
+                def refill_ring(ref, i0):
+                    """Chunks [i0 + KR_g, i0 + KR_g + NS) into the slots PV of chunks [i0, i0 + NS)
+                    just read: issued before the next QK so the DMA issue overlaps it."""
+                    assert KR_g >= 2 * NS, (KR_g, NS)
+                    if ref is not None:
+                        for t in range(NS):
+                            refill_slot(ref, i0 + KR_g + t)
+                    else:
+                        refill_global(i0 + KR_g)
+
                 def pipelined_po(n_it):
                     """attn_preones clean-chunk pipeline (M > 64): QK on the raw [K0; V0; K1; V1] chunk
 
@@ -1508,13 +1518,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                 wait_chunk(geo, (i0 + NS + t) % KR_g)
                         for t in range(NS):
                             ac = ac + pv_po(i0 + t, p_get(par, t))
+                        refill_ring(ref, i0)
                         for t in range(NS):
                             p_put(npar, t, qk_po(i0 + NS + t))
-                        if ref is not None:
-                            for t in range(NS):
-                                refill_slot(ref, i0 + KR_g + t)
-                        else:
-                            refill_global(i0 + KR_g)
                         return ac
 
                     za = jnp.zeros((M, AW), jnp.float32)
@@ -1917,12 +1923,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                 for t in range(NS):
                                     wait_chunk(geo, (i0 + NS + t) % KR_g)
                             pv_all_h(i0, par)
+                            refill_ring(ref, i0)
                             qk_all_h(i0 + NS, npar)
-                            if ref is not None:
-                                for t in range(NS):
-                                    refill_slot(ref, i0 + KR_g + t)
-                            else:
-                                refill_global(i0 + KR_g)
                             return dummy
 
                         k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
@@ -2121,12 +2123,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                 for t in range(NS):
                                     wait_chunk(geo, (i0 + NS + t) % KR_g)
                             accs = pv_all(i0, par, accs)
+                            refill_ring(ref, i0)
                             ls = ls + qk_all(i0 + NS, npar)
-                            if ref is not None:
-                                for t in range(NS):
-                                    refill_slot(ref, i0 + KR_g + t)
-                            else:
-                                refill_global(i0 + KR_g)
                             return ls, accs
 
                         k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
@@ -2194,6 +2192,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                         dpv = _scale_pv(dpv, psc_get(par, t))
                                     new_accs.append(a + dpv)
                                 accs = new_accs
+                            refill_ring(ref, i0)
                             nxt = [qk_exp_opt(i0 + NS + t, lsums[t]) for t in range(NS)]
                             for t in range(NS):
                                 if use_fp8_p:
@@ -2201,11 +2200,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                     psc_put(npar, t, nxt[t][0][1])
                                 else:
                                     p_put(npar, t, nxt[t][0])
-                            if ref is not None:
-                                for t in range(NS):
-                                    refill_slot(ref, i0 + KR_g + t)
-                            else:
-                                refill_global(i0 + KR_g)
                             return [x[1] for x in nxt], accs
 
                         k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
@@ -2293,6 +2287,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                 ac0 = ac0 + dpv
                             else:
                                 ac1 = ac1 + dpv
+                        refill_ring(ref, i0)
                         for u in range(NS // 2):
                             pa, pb, psc_ab, ls0, ls1 = qk_pair(
                                 i0 + NS + 2 * u, i0 + NS + 2 * u + 1, ls0, ls1
@@ -2301,11 +2296,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             p_put(npar, 2 * u + 1, pb)
                             if use_fp8_p:
                                 psc_put(npar, 2 * u, psc_ab)
-                        if ref is not None:
-                            for t in range(NS):
-                                refill_slot(ref, i0 + KR_g + t)
-                        else:
-                            refill_global(i0 + KR_g)
                         return ls0, ls1, ac0, ac1
 
                     k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
