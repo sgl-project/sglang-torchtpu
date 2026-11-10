@@ -12,6 +12,8 @@ count exchange, no ragged all-to-all). Per layer:
 The dense matmuls read only this rank's columns of the replicated wpool / wunpool.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -140,6 +142,7 @@ def gather_scratch(c: MKConfig, p: EPPlan) -> list:
         ("ep_x_sems", dma((2,))),
         ("ep_misc_sems", dma((4,))),
         ("eg_rsems", dma((6,))),
+        ("eg_psems", dma((6, tp))),  # pair all-gathers: per phase, per source block
         ("eg_ssems", dma((6,))),
         ("eg_osent", dma((2,))),
         ("eg_lsems", dma((2,))),
@@ -151,10 +154,19 @@ def _wait(tmpl, n: int) -> None:
         tmpl.wait()
 
 
+def _pair_ag(c: MKConfig) -> bool:
+    """All-gathers relay through the partner core (4 chips x 2 cores: half the ICI bytes);
+    SGLANG_TPU_EP_GATHER_PAIR_AG=0 sends to every peer directly (A/B, read at trace time)."""
+    return c.tp == 8 and os.environ.get("SGLANG_TPU_EP_GATHER_PAIR_AG", "1") != "0"
+
+
 def _all_gather(c: MKConfig, S: dict, me, buf, ph: int) -> None:
     """buf[me] (filled here) into every rank's buf[me]."""
     rsem, ssem = S["eg_rsems"].at[ph], S["eg_ssems"].at[ph]
     with _phase(_PH_NAMES[ph]):
+        if _pair_ag(c):
+            _all_gather_pair(S, me, buf, ph)
+            return
         for d in range(1, c.tp):
             pltpu.make_async_remote_copy(
                 src_ref=buf.at[me],
@@ -165,6 +177,37 @@ def _all_gather(c: MKConfig, S: dict, me, buf, ph: int) -> None:
             ).start()
         _wait(pltpu.make_async_copy(buf.at[0], buf.at[0], rsem), c.tp - 1)
         _wait(pltpu.make_async_copy(buf.at[0], buf.at[0], ssem), c.tp - 1)
+
+
+def _all_gather_pair(S: dict, me, buf, ph: int) -> None:
+    """Own block to the partner core and to the same core of the 3 other chips; each block
+    from another chip is relayed to the partner on arrival."""
+    core, chip, partner = me % 2, me // 2, jnp.bitwise_xor(me, 1)
+    psem, ssem = S["eg_psems"].at[ph], S["eg_ssems"].at[ph]
+
+    def send(k, peer):
+        pltpu.make_async_remote_copy(
+            src_ref=buf.at[k],
+            dst_ref=buf.at[k],
+            send_sem=ssem,
+            recv_sem=psem.at[k],
+            device_id=(peer,),
+        ).start()
+
+    def arrived(k):
+        pltpu.make_async_copy(buf.at[0], buf.at[0], psem.at[k]).wait()
+
+    far = [2 * jnp.bitwise_xor(chip, d) + core for d in (1, 2, 3)]
+    send(me, partner)
+    for k in far:
+        send(me, k)
+    for k in far:
+        arrived(k)
+        send(k, partner)
+    arrived(partner)
+    for k in far:
+        arrived(jnp.bitwise_xor(k, 1))
+    _wait(pltpu.make_async_copy(buf.at[0], buf.at[0], ssem), 7)
 
 
 def _local_copy(S: dict, src, dst) -> None:
