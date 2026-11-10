@@ -5129,7 +5129,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         jax.lax.fori_loop(0, (cnt + 7) // 8, bd_chunk_step, 0)
 
                     with _scope("ex_full"):
-                        if c.ex_opt and vy >= 1 and not use_bd_chunk:
+                        # qblock: streamed-Y plans bucket busy experts too (a pass
+                        # costs its rows, not CH)
+                        if c.ex_opt and (vy >= 1 or c.qblock) and not use_bd_chunk:
                             lo_b = c.compact_rows if kind == "fp4" else 0
                             far = []
                             if c.ex_bd_max_rows > lo_b and can_bd:
