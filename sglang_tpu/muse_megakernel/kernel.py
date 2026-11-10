@@ -4754,6 +4754,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 nrows, pair_fn, slot, e, blockdiag, first, n_valid, wait_w2=True
             ):
                 if c.qblock and kind == "fp4":
+                    # w2 waited for up front: a mid-arm DMA wait is a scheduling barrier
+                    # that drains the MXU between w13 and w2
+                    wait_w2_if_needed(slot, wait_w2)
                     pairs = [pair_fn(j) for j in range(nrows)]
                     y = _fp4_qblock_ffn(
                         gather_x(pairs),
@@ -4764,7 +4767,6 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         He,
                         Il,
                         c.qblock,
-                        lambda: wait_w2_if_needed(slot, wait_w2),
                     )
                     ystore(_pack_y(y, c), pairs, first, n_valid)
                     return
