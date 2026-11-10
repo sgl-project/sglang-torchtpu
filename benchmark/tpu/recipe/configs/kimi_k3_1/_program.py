@@ -8,13 +8,18 @@ import os
 # AgentX accepts at the curve's mean length per draft width
 # (infx/golden_al_distribution/kimi-k3.1-pro__dspark__...): 1.82 at one
 # draft, 2.88 at three, 3.69 at seven.
+MODEL = "moonshotai/Kimi-K3.1-Pro"
 DRAFT = "Inferact/Kimi-K3.1-Pro-DSpark-preview"
 ACC_LENGTHS = "7:3.69,3:2.88,1:1.82"
 
 
 def apply(config: dict) -> dict:
     """``config`` (a Kimi-K3 program recipe's CONFIG) for Kimi-K3.1-Pro."""
+    config["server_args"]["model_path"] = MODEL
     env = config["runtime_env"]
+    if env.get("SGLANG_TPU_K3_PROGRAM_ATTENTION_DP", "1") != "1":
+        # The DSA indexer gathers its 32 query heads over a DCP32 group.
+        raise ValueError("Kimi-K3.1 on the K3 programs decodes with attention DP1 (DCP32)")
     env["SGLANG_TPU_K3_PROGRAM_DRAFT"] = DRAFT
     env["SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS"] = os.environ.get(
         "K3_PROGRAM_SIMULATE_ACC_LENGTHS", ACC_LENGTHS
