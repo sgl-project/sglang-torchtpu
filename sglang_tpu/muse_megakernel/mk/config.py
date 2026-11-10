@@ -177,6 +177,8 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     tiled_vmem_pads: bool = False
     # row-tiled VMEM-pads passes run as one loop over row tiles, not unrolled per tile
     tile_loops: bool = False
+    # VMEM-Y at 240-256 rows: one yrow buffer, final_norm in a smalls slot, attn_buf in xfull
+    vmem_trim: bool = False
     tiled_fold: bool = False
     attn_opt: int = 0
     # fp8 SAL global attention on steps of more than 64 attention rows per request: each ring

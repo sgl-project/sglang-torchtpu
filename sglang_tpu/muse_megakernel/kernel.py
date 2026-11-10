@@ -160,6 +160,7 @@ from sglang_tpu.muse_megakernel.mk.scratch import (  # noqa: F401
     _alias_tiled_ids_kv,
     _alias_tiled_obuf_ysend,
     _alias_tiled_padu_attn,
+    _alias_tiled_xfull_attn,
     _alias_tiled_xfull_q,
     _attn_p_rows,
     _attn_p_ysend_streams,
@@ -279,6 +280,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 .bitcast(jnp.float32)
                 .at[:, pl.ds(0, c.q_dim)]
             )
+        if _alias_tiled_xfull_attn(c):
+            S["attn_buf"] = (
+                S["xfull"].bitcast(jnp.float32).at[:, pl.ds(c.q_dim, c.q_dim)]
+            )
+        if c.vmem_trim:
+            S["final_norm"] = S["smalls"].at[1 - (c.n_layers - 1) % 2, pl.ds(0, 8)]
         if _alias_tiled_ids_kv(c):
             S["kb_s"] = S["ids_v"].bitcast(jnp.float32)
             S["vb_s"] = S["wsel_v"]
@@ -5579,17 +5586,20 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     pl.when(my_live)(ycopy(0, 0).start)
 
                     def combine_row(r, carry):
-                        b = r % 2
-
-                        @pl.when(my_live & (r + 1 < Rc))
-                        def _():
-                            ycopy(r + 1, 1 - b).start()
+                        b = 0 if c.vmem_trim else r % 2
+                        nxt_cp = my_live & (r + 1 < Rc)
+                        if not c.vmem_trim:
+                            pl.when(nxt_cp)(ycopy(r + 1, 1 - b).start)
 
                         pl.when(my_live)(ycopy(r, b).wait)
                         yr = S["yrow"].at[b]
                         ysum = _unpack_y(yr[0, 0], c)  # [K, He]
                         for d in range(1, c.tp):
                             ysum = ysum + _unpack_y(yr[d, 0], c)
+                        if (
+                            c.vmem_trim
+                        ):  # one buffer: the next row lands while this one finishes
+                            pl.when(nxt_cp)(ycopy(r + 1, 0).start)
                         # rows past n_live received nothing (stale HBM): keep them zero
                         ysum = (
                             jnp.where(my_live & (me * Rc + r < n_live), ysum, 0.0)

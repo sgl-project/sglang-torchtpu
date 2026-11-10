@@ -180,6 +180,16 @@ def _alias_tiled_padu_attn(c: MKConfig) -> bool:
     )
 
 
+def _alias_tiled_xfull_attn(c: MKConfig) -> bool:
+    """vmem_trim: attn_buf in the xfull columns past qn_s (dead before o_proj writes xfull)."""
+    return bool(
+        c.vmem_trim
+        and _alias_tiled_xfull_q(c)
+        and not _alias_tiled_padu_attn(c)
+        and 2 * c.q_dim <= c.expert_hidden // 2
+    )
+
+
 def _alias_tiled_ids_kv(c: MKConfig) -> bool:
     return bool(c.row_tile and c.alias_tiled_temps and c.kv_dim == LANE)
 
@@ -230,6 +240,8 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
     nsc = 8 if c.vec_route else R * K + 8
     base = dict(_scratch_plan_base(c))
     use_p_fp8 = _use_attn_p_fp8(c)
+    if c.vmem_trim:
+        base["final_norm"] = vmem((8, LANE), f32)
     if _alias_attn_p_ysend(c):
         base["attn_p"] = vmem(
             (1, 1, 32 if use_p_fp8 else 8, LANE),
@@ -248,7 +260,7 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
     ]
     if not _alias_tiled_xfull_q(c):
         items += [("qn_s", vmem((R, c.q_dim), f32))]
-    if not _alias_tiled_padu_attn(c):
+    if not (_alias_tiled_padu_attn(c) or _alias_tiled_xfull_attn(c)):
         items += [("attn_buf", vmem((R, c.q_dim), f32))]
     if not _alias_tiled_ids_kv(c):
         items += [
@@ -358,7 +370,7 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
         ]
     if vy < 2:
         items += [
-            ("yrow", vmem((2, tp, 1, K, yw), u32)),
+            ("yrow", vmem((1 if c.vmem_trim else 2, tp, 1, K, yw), u32)),
             ("yrow_sems", pltpu.SemaphoreType.DMA((2,))),
         ]
     return items

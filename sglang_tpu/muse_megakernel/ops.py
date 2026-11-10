@@ -796,21 +796,29 @@ class MuseMegakernel(torch.nn.Module):
                     )
                     * 2**20
                 )
-                for c_loops in (
-                    msgspec.structs.replace(cfg, tiled_vmem_y=1, tile_loops=True),
-                    msgspec.structs.replace(
-                        cfg,
-                        tiled_vmem_y=0,
-                        tiled_pair_y=0,
-                        y_block_send=False,
-                        attn_streams=min(cfg.attn_streams, 4),
-                        pair_o_rs=False,
-                        tile_loops=True,
+                # rings of <= 3 slots leave the folds no stream depth (K.fold_fits)
+                c_tl = msgspec.structs.replace(
+                    cfg, fold_o=False, fold_f=False, tile_loops=True
+                )
+                vy1 = msgspec.structs.replace(c_tl, tiled_vmem_y=1)
+                vy0 = msgspec.structs.replace(
+                    c_tl,
+                    tiled_vmem_y=0,
+                    tiled_pair_y=0,
+                    y_block_send=False,
+                    attn_streams=min(cfg.attn_streams, 4),
+                    pair_o_rs=False,
+                )
+                plans += [
+                    (vy1, loops_budget, _TILE_LOOPS_RING_PREFERENCE[:1], False),
+                    (
+                        msgspec.structs.replace(vy1, vmem_trim=True),
+                        loops_budget,
+                        _TILE_LOOPS_RING_PREFERENCE,
+                        False,
                     ),
-                ):
-                    plans.append(
-                        (c_loops, loops_budget, _TILE_LOOPS_RING_PREFERENCE, False)
-                    )
+                    (vy0, loops_budget, _TILE_LOOPS_RING_PREFERENCE, False),
+                ]
             # The y_block_send VMEM-Y alternative fails the numerics test at 192 rows of 8
             # (layer 4, global attention + fp8 experts: rows off by 25.6% against the CPU
             # reference; the VMEM-Y and streamed-Y plans pass): off unless asked for.
@@ -890,6 +898,7 @@ class MuseMegakernel(torch.nn.Module):
                 if (
                     tiled
                     and base_cfg.tiled_vmem_y >= 1
+                    and not base_cfg.tile_loops
                     and slots
                     <= _dev_int(
                         "SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS", _TILED_VY_MIN_SLOTS
