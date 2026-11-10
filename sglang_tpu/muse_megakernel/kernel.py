@@ -4674,7 +4674,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
 
                     tile_pass([(pad_view(S["pad_pool"]), S["pltile"])], xfull_tile)
                 if vy >= 1:
-                    if c.combine_loop and R > 64:
+                    if c.tile_loops:
+
+                        def _zero_row(r, carry_):
+                            S["ysend"][pl.ds(r, 1)] = jnp.zeros((1, K, yw), jnp.uint32)
+                            return carry_
+
+                        jax.lax.fori_loop(0, R, _zero_row, 0)
+                    elif c.combine_loop and R > 64:
                         z_rt = jnp.zeros((RT, K, yw), jnp.uint32)
                         for t in range(R // RT):
                             S["ysend"][pl.ds(t * RT, RT)] = z_rt
