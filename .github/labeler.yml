@@ -144,6 +144,20 @@ tpu:
       - 'python/sglang/multimodal_gen/runtime/managers/memory_managers/layerwise_offload.py'
       - 'python/sglang/multimodal_gen/test/unit/test_tpu_*.py'
       - 'python/sglang/multimodal_gen/test/unit/test_platform_detection.py'
+      # Shared diffusion files behind the TPU-only platform hooks (SPMD-safe
+      # regions, fusion barrier, request drain), and their core test.
+      - 'python/sglang/multimodal_gen/runtime/managers/gpu_worker.py'
+      - 'python/sglang/multimodal_gen/runtime/models/dits/base.py'
+      - 'python/sglang/multimodal_gen/runtime/models/dits/wanvideo.py'
+      - 'python/sglang/multimodal_gen/runtime/platforms/interface.py'
+      - 'python/sglang/multimodal_gen/runtime/utils/torch_compile.py'
+      - 'python/sglang/multimodal_gen/test/unit/test_spmd_safe_regions.py'
+      # Shared diffusion files behind Ulysses head padding and the Wan SP
+      # tail-pad mask, and the core tests the TPU wrappers import.
+      - 'python/sglang/multimodal_gen/runtime/layers/attention/layer.py'
+      - 'python/sglang/multimodal_gen/runtime/models/dits/zimage.py'
+      - 'python/sglang/multimodal_gen/test/unit/test_usp_*.py'
+      - 'python/sglang/multimodal_gen/test/unit/test_wan_sp_padding.py'
       - 'python/pyproject_tpu.toml'
       - 'benchmark/tpu/**'
       - 'docker/tpu.Dockerfile'

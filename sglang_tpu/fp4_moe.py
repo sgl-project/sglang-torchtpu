@@ -12,7 +12,6 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _pad_gate_up_halves_axis1,
     _pad_last_axis,
@@ -30,6 +29,7 @@ from sglang_tpu.fused_rs_sequence_parallel import (
     prepare_fused_moe_sequence_parallel_input,
     prepare_tpu_fused_rs_post_expert_norm,
 )
+from sglang_tpu.moe.ep_rank import mask_tpu_moe_non_local_experts, traced_moe_ep_rank
 from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
 # Block-512 matches the original FP8 activation quantization block. Both stock
@@ -263,6 +263,11 @@ def prepare_tpu_nvfp4_moe_weights(
 
         prepare_tpu_fused_rs_post_expert_norm(layer)
         prepare_fused_moe_rs(layer)
+    else:
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.get():
+            scale_dtype = torch.float32
 
     # W13: fold global scale, pad gate/up halves, and rebind before touching W2
     # so single-device PP stages do not hold both layers' temporaries at once.
@@ -450,6 +455,7 @@ def apply_tpu_nvfp4_moe(
         topk_ids,
         layer.num_local_experts,
         layer.moe_ep_rank,
+        traced_ep_rank=traced_moe_ep_rank(),
     )
 
     output = fused_moe_call(

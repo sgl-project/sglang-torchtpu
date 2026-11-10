@@ -695,6 +695,24 @@ class TestTpuSplashDispatch(CustomTestCase):
             tsa._autotune_block_sizes(75600, 75600, 128, 32 * 2**20)[0], 6400
         )
 
+    def test_measured_block_sizes_override_one_ring_step(self):
+        from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
+
+        # The Wan2.2-TI2V-5B 1280x704x121 ring resume step, where a sweep on
+        # device beat the model's (4608, 2048, 2048). The same shard on the
+        # first ring step or outside a ring keeps the model's pick.
+        self.assertEqual(
+            tsa._autotune_block_sizes(13640, 13640, 128, carry_bytes_per_q_row=2176),
+            (6912, 1024, 1024),
+        )
+        for carry_bytes_per_q_row in (0, 1088):
+            self.assertEqual(
+                tsa._autotune_block_sizes(
+                    13640, 13640, 128, carry_bytes_per_q_row=carry_bytes_per_q_row
+                ),
+                (4608, 2048, 2048),
+            )
+
     def test_rejects_non_positive_scale_and_ragged_causal(self):
         from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
 

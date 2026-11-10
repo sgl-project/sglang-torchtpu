@@ -84,39 +84,39 @@ class TestBuildEngines(CustomTestCase):
         manager._transfer_parallelism = 4
         manager.chunked_transfer = True
         manager._build_engine()
-        sizes = [(e["num_slots"], e["num_staging_layers"]) for e in self.engines]
+        sizes = [(e["num_slots"], e.get("num_staging_layers")) for e in self.engines]
         return manager, sizes
 
     def test_fixed_slots_share_one_count(self):
-        # 3 GiB per rank over a 280 MiB full plus a 6.75 MiB SWA slot.
+        # 8 GiB per rank over a 280 MiB full plus a 6.75 MiB SWA slot.
         manager, sizes = self._built(dynamic=False)
-        self.assertEqual(sizes, [(10, 2), (10, 6)])
+        self.assertEqual(sizes, [(28, 2), (28, 6)])
         self.assertTrue(manager._bounded_staging)
-        self.assertEqual(manager._pulling.capacity, 10 * 1120)
-        self.assertEqual(manager._pulling.swa_capacity, 10 * 9)
+        self.assertEqual(manager._pulling.capacity, 28 * 1120)
+        self.assertEqual(manager._pulling.swa_capacity, 28 * 9)
 
     def test_dynamic_staging_gives_windows_eight_slots_per_full_slot(self):
-        # 3 GiB per rank over 280 MiB plus eight 6.75 MiB slots.
+        # 8 GiB per rank over 280 MiB plus eight 6.75 MiB slots.
         manager, sizes = self._built(dynamic=True)
-        self.assertEqual(sizes, [(9, 2), (72, 6)])
-        self.assertEqual(manager._pulling.swa_capacity, 72 * 9)
+        self.assertEqual(sizes, [(24, 2), (192, 6)])
+        self.assertEqual(manager._pulling.swa_capacity, 192 * 9)
 
     def test_slots_stop_at_what_requests_can_claim(self):
-        # The budget fits (9, 72), but a rank cannot claim more than 24 slots.
+        # The budget fits (24, 192), but a rank cannot claim more than 24 slots.
         _, sizes = self._built(dynamic=True, slot_ceiling=24)
-        self.assertEqual(sizes, [(9, 2), (24, 6)])
+        self.assertEqual(sizes, [(24, 2), (24, 6)])
 
     def test_zero_layers_keep_full_mirrors(self):
-        # The default 3 GiB per rank fits one 2240 MiB full plus eight 51.75 MiB
+        # The default 8 GiB per rank fits three 2240 MiB full plus 24 51.75 MiB
         # SWA mirrors.
         manager, sizes = self._built(dynamic=True, layers=0)
-        self.assertEqual(sizes, [(1, 16), (8, 46)])
+        self.assertEqual(sizes, [(3, 16), (24, 46)])
         self.assertFalse(manager._bounded_staging)
 
     def test_configured_budget_applies_to_full_mirrors(self):
-        with envs.SGLANG_RAIDEN_HOST_POOL_GB.override(64):
+        with envs.SGLANG_RAIDEN_HOST_POOL_GB.override(24):
             _, sizes = self._built(dynamic=True, layers=0)
-        self.assertEqual(sizes, [(3, 16), (24, 46)])
+        self.assertEqual(sizes, [(1, 16), (8, 46)])
 
     def test_bounded_decode_rejects_an_asymmetric_prefill(self):
         manager = object.__new__(RaidenKVManager)
@@ -139,6 +139,31 @@ class TestBuildEngines(CustomTestCase):
         with envs.SGLANG_RAIDEN_HOST_POOL_GB.override(1):
             _, sizes = self._built(dynamic=True)
         self.assertEqual(sizes, [(1, 2), (8, 6)])
+
+    def test_tpu_sync_without_staging_layers_keeps_full_mirrors(self):
+        # A pinned tpu-sync-torch from before num_staging_layers existed.
+        engines = self.engines
+
+        class OldEngine:
+            def __init__(
+                self,
+                kv_caches,
+                node_id,
+                local_control_port,
+                max_blocks,
+                num_slots,
+                timeout_s,
+                parallelism,
+            ):
+                engines.append(dict(num_slots=num_slots))
+
+        module = sys.modules["tpu_sync.api.torch.kv_cache_manager"]
+        self.stack.enter_context(patch.object(module, "KVCacheManager", OldEngine))
+        manager, sizes = self._built(dynamic=True)
+        # Same full-mirror plan as SGLANG_TPU_RAIDEN_STAGING_LAYERS=0.
+        self.assertEqual(sizes, [(3, None), (24, None)])
+        self.assertEqual(manager._staging_layers_total, 0)
+        self.assertFalse(manager._bounded_staging)
 
 
 if __name__ == "__main__":

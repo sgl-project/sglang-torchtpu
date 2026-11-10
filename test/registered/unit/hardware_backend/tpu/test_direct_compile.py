@@ -29,7 +29,7 @@ from sglang.srt.speculative.eagle_info import (
 )
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.compilation import direct_compile
+from sglang_tpu.compilation import decoder_compile_policy, direct_compile
 from sglang_tpu.compilation.attention_rank_inputs import (
     use_attention_rank_tensors,
 )
@@ -198,7 +198,7 @@ class TestPPProxyPytree(CustomTestCase):
 
 class TestAuxHiddenStatePytree(CustomTestCase):
     def test_aux_list_output_flattens_to_tensor_leaves_and_rebuilds(self):
-        """A target verify that returns (hidden, aux) for DFlash capture must trace.
+        """A target that returns (hidden, aux), for EAGLE3 or DFlash capture, must trace.
 
         Unregistered, the aux list is one opaque leaf and direct_compile rejects
         the output as a non-tensor.
@@ -233,22 +233,82 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
     )
 
 
-class TestAuxHiddenStatePytree(CustomTestCase):
-    def test_aux_states_flatten_to_tensor_leaves_and_rebuild(self):
-        """An EAGLE3 target's (hidden, aux) output must reach direct_compile as
-        tensor leaves; an opaque list leaf fails its all-TPU-tensors check."""
-        hidden, first, second = torch.zeros(2), torch.ones(2), torch.full((2,), 2.0)
-        leaves, treespec = tree_util.tree_flatten(
-            (hidden, AuxHiddenStateList([first, second]))
-        )
-        self.assertEqual(len(leaves), 3)
-        self.assertTrue(all(isinstance(leaf, torch.Tensor) for leaf in leaves))
-        _, aux = tree_util.tree_unflatten(treespec, leaves)
-        self.assertIsInstance(aux, AuxHiddenStateList)
-        self.assertIs(aux[1], second)
-
-
 class TestDirectCompile(CustomTestCase):
+    def test_helper_warmup_preserves_shared_queue_participation(self):
+        for verify, shared in ((False, False), (True, False), (True, True)):
+            with self.subTest(verify=verify, shared=shared):
+                queue = SimpleNamespace(verify=verify, spmd_compiler=object(), calls=[])
+                compiled = MagicMock()
+                compiled.cache = {}
+                compiled.precompile.return_value = PendingCall(lambda: None)
+
+                def scale(value, factor):
+                    return value * factor
+
+                def build(fn, **options):
+                    compiled.cache[options["specialization_key"](torch.ones(2), 3)] = (
+                        object()
+                    )
+                    return compiled
+
+                op = compiled_op(spmd_safe=shared)(scale)
+                with (
+                    patch(
+                        "sglang.srt.compilation.compiled_op.is_tpu", return_value=True
+                    ),
+                    patch(
+                        "sglang.srt.compilation.compiled_op.current_warmup_queue",
+                        return_value=queue,
+                    ),
+                    patch(
+                        "sglang.srt.compilation.compiled_op.direct_compile",
+                        side_effect=build,
+                    ) as compile_fn,
+                    get_context().override_server_args(tpu_compile_tracer="direct"),
+                    envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+                    envs.SGLANG_DIRECT_COMPILE_ASYNC.override(False),
+                ):
+                    for _ in range(2):
+                        warmup_compiled_op(op, torch.ones(2), factor=3)
+                    self.assertEqual(
+                        compile_fn.call_count, 0 if verify and not shared else 1
+                    )
+                    self.assertEqual(compiled.precompile.call_count, 2 if shared else 0)
+                    if shared:
+                        self.assertTrue(
+                            compiled.precompile.call_args.kwargs["async_compile"]
+                        )
+                    # Verification must never suppress ordinary helper execution.
+                    op(torch.ones(2), 3)
+                    compiled.assert_called_once()
+
+    def test_verification_skips_only_unshared_warmups(self):
+        for verify, shared in ((False, False), (True, False), (True, True)):
+            with self.subTest(verify=verify, shared=shared):
+                compiled = direct_compile.direct_compile(
+                    lambda value: value + 1,
+                    specialization_key=lambda value: tuple(value.shape),
+                    name="test/model.forward",
+                    spmd_safe=shared,
+                )
+                queue = SimpleNamespace(verify=verify, spmd_compiler=object())
+                with (
+                    patch.object(
+                        direct_compile, "current_warmup_queue", return_value=queue
+                    ),
+                    patch.object(compiled, "_get_artifact") as get_artifact,
+                ):
+                    value = torch.ones(2)
+                    compiled.warmup_async(value).wait()
+                    compiled.precompile(value).wait()
+                    compiled.precompile(value, async_compile=True).wait()
+                    self.assertEqual(
+                        get_artifact.call_count, 0 if verify and not shared else 3
+                    )
+                    get_artifact.reset_mock()
+                    compiled(value)
+                    get_artifact.assert_called_once()
+
     def test_random_compiled_op_warmup_preserves_rng(self):
         torch_compile = torch.compile
 
@@ -1644,6 +1704,46 @@ class _RankModel(torch.nn.Module):
 class _RankPolicy(DecoderTpuCompilePolicy):
     def _direct_compile_specialization_key(self, metadata, input_ids, *args, **kwargs):
         return tuple(input_ids.shape)
+
+
+class TestPolicyRankLifting(unittest.TestCase):
+    def test_subgroups_require_shared_compilation(self):
+        model = torch.nn.Identity()
+        policy = _RankPolicy(
+            model_runner=SimpleNamespace(model=model, token_to_kv_pool=None),
+            owner=model,
+            tracer="direct",
+        )
+        for initialized, tp_size, world_size, shared, expected in (
+            (False, 1, 1, False, False),
+            (True, 2, 16, False, False),  # PP8/TP2
+            (True, 1, 16, False, False),  # PP16/TP1
+            (True, 4, 8, False, False),
+            (True, 4, 8, True, True),  # DP2/TP4 shared compilation
+            (True, 16, 16, False, True),
+        ):
+            with (
+                self.subTest(tp_size=tp_size, world_size=world_size, shared=shared),
+                patch("torch.distributed.is_initialized", return_value=initialized),
+                patch("torch.distributed.get_world_size", return_value=world_size),
+                patch.object(
+                    decoder_compile_policy,
+                    "get_parallel",
+                    return_value=SimpleNamespace(
+                        tp_group=SimpleNamespace(world_size=tp_size)
+                    ),
+                ),
+                patch.object(
+                    decoder_compile_policy,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        graph=SimpleNamespace(use_spmd_compile=shared)
+                    ),
+                ),
+                patch.object(direct_compile, "direct_compile") as compile_mock,
+            ):
+                policy._direct_compile(model.forward)
+                self.assertIs(compile_mock.call_args.kwargs["lift_rank"], expected)
 
 
 class TestAttentionRankTensorScope(unittest.TestCase):

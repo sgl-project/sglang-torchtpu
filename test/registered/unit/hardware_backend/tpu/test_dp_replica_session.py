@@ -327,8 +327,9 @@ def test_bad_session_topology_is_rejected_before_device_work(monkeypatch, tp_siz
 
 @pytest.mark.parametrize("tp_size", [1, 4])
 @pytest.mark.parametrize("disaggregation_mode", ["null", "prefill", "decode"])
+@pytest.mark.parametrize("speculative_algorithm", [None, "EAGLE"])
 def test_worker_prepares_replicas_at_every_tp_size(
-    monkeypatch, tp_size, disaggregation_mode
+    monkeypatch, tp_size, disaggregation_mode, speculative_algorithm
 ):
     cfg = SimpleNamespace(
         dp_size=8 // tp_size,
@@ -344,7 +345,8 @@ def test_worker_prepares_replicas_at_every_tp_size(
         dcp_size=1,
         moe_dp_size=1,
         shared_experts_tp_size=None,
-        speculative_algorithm=None,
+        # A draft worker builds its groups on the engine's precreated device groups.
+        speculative_algorithm=speculative_algorithm,
         disaggregation_mode=disaggregation_mode,
         dist_timeout=17,
     )
