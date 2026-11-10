@@ -755,9 +755,6 @@ class TpuEnvs:
     # Batched RPA: in-kernel trace regions (step body, full / masked tile), visible in
     # xprof with libtpu's --xla_enable_custom_call_region_trace=true. Profiling only.
     SGLANG_TPU_RPA_TRACE_REGIONS = EnvBool(False)
-    # Batched RPA: pipeline buffers of the q and output blocks (unset: n_buffer and 2);
-    # 1 frees the VMEM a larger prefill q block needs (e.g. 384:32:768:2 on Muse Spark).
-    SGLANG_TPU_RPA_QO_BUFFERS = EnvInt(None)
 
     @classmethod
     def names(cls) -> list[str]:
