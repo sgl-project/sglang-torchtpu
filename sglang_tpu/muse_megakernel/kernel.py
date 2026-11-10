@@ -3752,6 +3752,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
         # pipe_ag: pair_ag's two-stage all-gather per row tile. A tile goes to the same core
         # of the three other chips as it is written; the consumer forwards each chip's tile to
         # its pair partner one tile ahead of its own use.
+        import os as _os
+
+        _pb = int(_os.environ.get("DBG_PIPE", "3"))
+        PIPE_O, PIPE_F = c.pipe_ag and bool(_pb & 1), c.pipe_ag and bool(_pb & 2)
         p_core, p_chip = me % 2, me // 2
         p_partner = jnp.bitwise_xor(me, 1)
 
@@ -4424,7 +4428,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         for d in range(5, 8):
                             mine = mine + _unpack_bf16x2(S["pad_o_rs"][d, rs])
                         S["o_send"][rs] = _pack_bf16x2(mine)
-                        if c.pipe_ag:
+                        if PIPE_O:
                             ag_tile_start(
                                 "o_ag",
                                 S["o_send"],
@@ -4435,7 +4439,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             )
 
                     vpads_tiles(_tile)
-                    if c.pipe_ag:
+                    if PIPE_O:
                         pass  # sent per tile above
                     elif c.fold_o:
                         coll.all_gather_blocks_start(
@@ -4463,7 +4467,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             for d in range(1, c.tp):
                                 mine = mine + _unpack_bf16x2(S["pad_o_rs"][d, rs])
                             S["o_send"][rs] = _pack_bf16x2(mine)
-                            if c.pipe_ag:
+                            if PIPE_O:
                                 hag_start(
                                     "o_ag",
                                     S["o_send"],
@@ -4473,7 +4477,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                 )
 
                         vpads_tiles(_tile)
-                        if c.pipe_ag:
+                        if PIPE_O:
                             pass  # sent per tile above
                         elif c.fold_o:
                             coll.all_gather_blocks_start(
@@ -5963,16 +5967,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         S["f_send"][rs] = _pack_bf16x2(
                             S["acc"][rs, pl.ds(0, Hl)].astype(bf16).astype(f32)
                         )
-                        if c.pipe_ag:
+                        if PIPE_F:
                             hag_start("f", S["f_send"], S["pad_f"], t, S["fag_tsems"])
 
                     vpads_tiles(_tile)
                 else:
-                    assert not c.pipe_ag
+                    assert not PIPE_F
                     S["f_send"][...] = _pack_bf16x2(
                         S["acc"][:, pl.ds(0, Hl)].astype(bf16).astype(f32)
                     )
-                if c.pipe_ag:
+                if PIPE_F:
                     pass  # sent per tile above
                 elif c.fold_f and nxt is not None:
                     coll.all_gather_blocks_start(
@@ -6050,11 +6054,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             if ep is None and not c.fold_o:  # the EP hook's o_proj did it on own rows
                 if c.tiled_vmem_pads:
                     o_ag_args = ("o_ag", S["o_send"], S["pad_o_ag"], S["oag_tsems"])
-                    if c.pipe_ag:
+                    if PIPE_O:
                         hag_forward(*o_ag_args, 0, S["oag_ptsems"])
 
                     def _tile(rs, t):
-                        if c.pipe_ag:
+                        if PIPE_O:
                             pl.when(t + 1 < NT)(
                                 lambda: hag_forward(*o_ag_args, t + 1, S["oag_ptsems"])
                             )
@@ -6068,7 +6072,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         S["lhs"][rs] = _rms(s, c.rms_eps, row("pre_ffn_w")).astype(bf16)
 
                     vpads_tiles(_tile)
-                    if c.pipe_ag:  # o_send (and what borrows it) is reused after this
+                    if PIPE_O:  # o_send (and what borrows it) is reused after this
                         hag_sent(*o_ag_args, S["oag_ptsems"])
                 else:
                     oag_rdy = ag_tile_ready(S["o_send"], S["pad_o_ag"], S["oag_tsems"])
@@ -6150,11 +6154,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                 if not (c.fold_f and nxt is not None):
                     if c.tiled_vmem_pads:
                         f_ag_args = ("f", S["f_send"], S["pad_f"], S["fag_tsems"])
-                        if c.pipe_ag:
+                        if PIPE_F:
                             hag_forward(*f_ag_args, 0, S["fag_ptsems"])
 
                         def _tile(rs, t):
-                            if c.pipe_ag:
+                            if PIPE_F:
                                 pl.when(t + 1 < NT)(
                                     lambda: hag_forward(
                                         *f_ag_args, t + 1, S["fag_ptsems"]
@@ -6171,7 +6175,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             S["h_stream"][rs] = s
 
                         vpads_tiles(_tile)
-                        if c.pipe_ag:
+                        if PIPE_F:
                             hag_sent(*f_ag_args, S["fag_ptsems"])
                     else:
                         fag_rdy = ag_tile_ready(S["f_send"], S["pad_f"], S["fag_tsems"])
