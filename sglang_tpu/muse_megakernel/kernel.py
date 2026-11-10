@@ -2922,6 +2922,22 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                             with _scope("ex_wait"):
                                 wait_expert(slot, (2, 3))
 
+                    # QBLOCK fp4 arms wait for w2 up front (a mid-arm DMA wait is a scheduling
+                    # barrier that drains the MXU) and run _fp4_qblock_ffn
+                    q_ffn = bool(c.qblock and kind == "fp4")
+
+                    def qb_ffn(xc):
+                        return _fp4_qblock_ffn(
+                            xc,
+                            W13.at[slot],
+                            S["w13s"].at[slot],
+                            W2.at[slot],
+                            S["w2s"].at[slot],
+                            He,
+                            Il,
+                            c.qblock,
+                        )
+
                     e = rget("uniq", i)
 
                     def gather_x_base(ps_):
@@ -2946,70 +2962,76 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         ]
                         with _scope("ex_gather"):
                             xc = gather_x_base(ps_)
-                        cw13 = (
-                            64
-                            if c.ex_opt and c.fp4_chunk_words == 128
-                            else c.fp4_chunk_words
-                        )
-                        if kind == "fp4":
-                            gu = _fp4_dot(
-                                xc,
-                                W13.at[slot],
-                                S["w13s"].at[slot],
-                                He,
-                                2 * Il,
-                                cw13,
-                                fast_bf16=c.ex_opt,
-                                kperm=c.ex_kperm,
-                                qblock=c.qblock,
-                                via_fp8=c.ex_via_fp8,
-                                vec_dequant=c.vec_dequant_kperm,
-                                fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 1),
-                                n_tile=c.bd_n_tile,
-                            )
+                        if q_ffn:
+                            w2_wait()
+                            yp = _pack_y(qb_ffn(xc), c)
                         else:
-                            gu = _fp8_dot(
-                                xc,
-                                W13.at[slot],
-                                S13[slot, 0:1, pl.ds(0, 2 * Il)].astype(jnp.float32),
-                                He,
-                                2 * Il,
-                                c.fp4_chunk_words,
-                                fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 1),
+                            cw13 = (
+                                64
+                                if c.ex_opt and c.fp4_chunk_words == 128
+                                else c.fp4_chunk_words
                             )
-                        gate, up = gu[:, :Il], gu[:, Il:]
-                        if gscale:
-                            g_gate, g_up, g_down = globals_of(e)
-                            gate, up = gate * g_gate, up * g_up
-                        h = (gate * jax.nn.sigmoid(gate) * up).astype(jnp.bfloat16)
-                        w2_wait()
-                        if kind == "fp4":
-                            y = _fp4_dot(
-                                h,
-                                W2.at[slot],
-                                S["w2s"].at[slot],
-                                Il,
-                                He,
-                                min(Il // FP4_PACK, 64 if c.ex_opt else 16),
-                                fast_bf16=c.ex_opt,
-                                kperm=c.ex_kperm,
-                                qblock=c.qblock,
-                                via_fp8=c.ex_via_fp8,
-                                vec_dequant=c.vec_dequant_kperm,
-                                fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 2),
-                                n_tile=c.bd_n_tile,
-                            )
-                        else:
-                            y = _fp8_dot(
-                                h,
-                                W2.at[slot],
-                                S2[slot, 0:1, :].astype(jnp.float32),
-                                Il,
-                                He,
-                                min(Il // 4, 128 if c.ex_opt else 32),
-                                fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 2),
-                            )
-                        yp = _pack_y(y * g_down if gscale else y, c)
+                            if kind == "fp4":
+                                gu = _fp4_dot(
+                                    xc,
+                                    W13.at[slot],
+                                    S["w13s"].at[slot],
+                                    He,
+                                    2 * Il,
+                                    cw13,
+                                    fast_bf16=c.ex_opt,
+                                    kperm=c.ex_kperm,
+                                    qblock=c.qblock,
+                                    via_fp8=c.ex_via_fp8,
+                                    vec_dequant=c.vec_dequant_kperm,
+                                    fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 1),
+                                    n_tile=c.bd_n_tile,
+                                )
+                            else:
+                                gu = _fp8_dot(
+                                    xc,
+                                    W13.at[slot],
+                                    S13[slot, 0:1, pl.ds(0, 2 * Il)].astype(
+                                        jnp.float32
+                                    ),
+                                    He,
+                                    2 * Il,
+                                    c.fp4_chunk_words,
+                                    fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 1),
+                                )
+                            gate, up = gu[:, :Il], gu[:, Il:]
+                            if gscale:
+                                g_gate, g_up, g_down = globals_of(e)
+                                gate, up = gate * g_gate, up * g_up
+                            h = (gate * jax.nn.sigmoid(gate) * up).astype(jnp.bfloat16)
+                            w2_wait()
+                            if kind == "fp4":
+                                y = _fp4_dot(
+                                    h,
+                                    W2.at[slot],
+                                    S["w2s"].at[slot],
+                                    Il,
+                                    He,
+                                    min(Il // FP4_PACK, 64 if c.ex_opt else 16),
+                                    fast_bf16=c.ex_opt,
+                                    kperm=c.ex_kperm,
+                                    qblock=c.qblock,
+                                    via_fp8=c.ex_via_fp8,
+                                    vec_dequant=c.vec_dequant_kperm,
+                                    fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 2),
+                                    n_tile=c.bd_n_tile,
+                                )
+                            else:
+                                y = _fp8_dot(
+                                    h,
+                                    W2.at[slot],
+                                    S2[slot, 0:1, :].astype(jnp.float32),
+                                    Il,
+                                    He,
+                                    min(Il // 4, 128 if c.ex_opt else 32),
+                                    fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 2),
+                                )
+                            yp = _pack_y(y * g_down if gscale else y, c)
                         with _scope("ex_scatter"):
                             for j, p in enumerate(ps_):
                                 S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[
@@ -3017,71 +3039,77 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                 ]
 
                     def full_expert_():
-                        cw13 = (
-                            64
-                            if c.ex_opt and c.fp4_chunk_words == 128
-                            else c.fp4_chunk_words
-                        )
-                        if kind == "fp4":
-                            gu = _fp4_dot(
-                                x_full,
-                                W13.at[slot],
-                                S["w13s"].at[slot],
-                                He,
-                                2 * Il,
-                                cw13,
-                                fast_bf16=c.ex_opt,
-                                kperm=c.ex_kperm,
-                                qblock=c.qblock,
-                                via_fp8=c.ex_via_fp8,
-                                vec_dequant=c.vec_dequant_kperm,
-                                fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 1),
-                                n_tile=c.bd_n_tile,
-                            )
+                        if q_ffn:
+                            w2_wait()
+                            y = qb_ffn(x_full)
                         else:
-                            gu = _fp8_dot(
-                                x_full,
-                                W13.at[slot],
-                                S13[slot, 0:1, pl.ds(0, 2 * Il)].astype(jnp.float32),
-                                He,
-                                2 * Il,
-                                c.fp4_chunk_words,
-                                fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 1),
+                            cw13 = (
+                                64
+                                if c.ex_opt and c.fp4_chunk_words == 128
+                                else c.fp4_chunk_words
                             )
-                        gate, up = gu[:, :Il], gu[:, Il:]
-                        if gscale:
-                            g_gate, g_up, g_down = globals_of(e)
-                            gate, up = gate * g_gate, up * g_up
-                        h = (gate * jax.nn.sigmoid(gate) * up).astype(jnp.bfloat16)
-                        w2_wait()
-                        if kind == "fp4":
-                            y = _fp4_dot(
-                                h,
-                                W2.at[slot],
-                                S["w2s"].at[slot],
-                                Il,
-                                He,
-                                min(Il // FP4_PACK, 64 if c.ex_opt else 16),
-                                fast_bf16=c.ex_opt,
-                                kperm=c.ex_kperm,
-                                qblock=c.qblock,
-                                via_fp8=c.ex_via_fp8,
-                                vec_dequant=c.vec_dequant_kperm,
-                                fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 2),
-                                n_tile=c.bd_n_tile,
-                            )
-                        else:
-                            y = _fp8_dot(
-                                h,
-                                W2.at[slot],
-                                S2[slot, 0:1, :].astype(jnp.float32),
-                                Il,
-                                He,
-                                min(Il // 4, 128 if c.ex_opt else 32),
-                                fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 2),
-                            )
-                        if gscale:
-                            y = y * g_down
+                            if kind == "fp4":
+                                gu = _fp4_dot(
+                                    x_full,
+                                    W13.at[slot],
+                                    S["w13s"].at[slot],
+                                    He,
+                                    2 * Il,
+                                    cw13,
+                                    fast_bf16=c.ex_opt,
+                                    kperm=c.ex_kperm,
+                                    qblock=c.qblock,
+                                    via_fp8=c.ex_via_fp8,
+                                    vec_dequant=c.vec_dequant_kperm,
+                                    fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 1),
+                                    n_tile=c.bd_n_tile,
+                                )
+                            else:
+                                gu = _fp8_dot(
+                                    x_full,
+                                    W13.at[slot],
+                                    S13[slot, 0:1, pl.ds(0, 2 * Il)].astype(
+                                        jnp.float32
+                                    ),
+                                    He,
+                                    2 * Il,
+                                    c.fp4_chunk_words,
+                                    fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 1),
+                                )
+                            gate, up = gu[:, :Il], gu[:, Il:]
+                            if gscale:
+                                g_gate, g_up, g_down = globals_of(e)
+                                gate, up = gate * g_gate, up * g_up
+                            h = (gate * jax.nn.sigmoid(gate) * up).astype(jnp.bfloat16)
+                            w2_wait()
+                            if kind == "fp4":
+                                y = _fp4_dot(
+                                    h,
+                                    W2.at[slot],
+                                    S["w2s"].at[slot],
+                                    Il,
+                                    He,
+                                    min(Il // FP4_PACK, 64 if c.ex_opt else 16),
+                                    fast_bf16=c.ex_opt,
+                                    kperm=c.ex_kperm,
+                                    qblock=c.qblock,
+                                    via_fp8=c.ex_via_fp8,
+                                    vec_dequant=c.vec_dequant_kperm,
+                                    fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 2),
+                                    n_tile=c.bd_n_tile,
+                                )
+                            else:
+                                y = _fp8_dot(
+                                    h,
+                                    W2.at[slot],
+                                    S2[slot, 0:1, :].astype(jnp.float32),
+                                    Il,
+                                    He,
+                                    min(Il // 4, 128 if c.ex_opt else 32),
+                                    fp8_lhs=(c.ex_fp8_lhs or c.ex_lhs_fp8 >= 2),
+                                )
+                            if gscale:
+                                y = y * g_down
                         # slot space: row r, slot k gets y[r] where ids[r, k] == e
                         with _scope("ex_accum"):
                             S["ysend"][...] = jnp.where(
@@ -3099,58 +3127,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         ]
                         with _scope("ex_gather"):
                             xc = gather_x_base(ps_)
-                        with _scope("bd_w13"):
-                            gu = _fp4_blockdiag_dot(
-                                xc,
-                                W13.at[slot],
-                                S["w13s"].at[slot],
-                                He,
-                                2 * Il,
-                                bd_kc,
-                                kperm=bool(c.ex_kperm),
-                                qblock=c.qblock,
-                                fp8_lhs=c.bd_fp8_lhs,
-                                n_tile=c.bd_n_tile,
-                            )
-                            gate, up = gu[:, :Il], gu[:, Il:]
-                            if gscale:
-                                g_gate, g_up, g_down = globals_of(e)
-                                gate, up = gate * g_gate, up * g_up
-                            h = (gate * jax.nn.sigmoid(gate) * up).astype(jnp.bfloat16)
-                        w2_wait()
-                        with _scope("bd_w2"):
-                            yc = _fp4_blockdiag_dot(
-                                h,
-                                W2.at[slot],
-                                S["w2s"].at[slot],
-                                Il,
-                                He,
-                                bd_kc,
-                                kperm=bool(c.ex_kperm),
-                                qblock=c.qblock,
-                                fp8_lhs=c.bd_fp8_lhs,
-                                n_tile=c.bd_n_tile,
-                            )
-                            yp = _pack_y(yc * g_down if gscale else yc, c)
-                        with _scope("ex_scatter"):
-                            # a padded row repeats the last pair's row, so its write repeats that
-                            # pair's identical write: no branch per row
-                            for j, p in enumerate(ps_):
-                                S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[
-                                    j : j + 1
-                                ]
-
-                    def bd_chunks():
-                        bd_kc = c.blockdiag_kc
-                        off, cnt = rget("ex_off", i), rget("ex_cnt", i)
-
-                        def bd_step(ch, carry_):
-                            ps_ = [
-                                rget("perm", off + jnp.minimum(ch * 8 + j, cnt - 1))
-                                for j in range(8)
-                            ]
-                            with _scope("ex_gather"):
-                                xc = gather_x_base(ps_)
+                        if q_ffn:
+                            w2_wait()
+                            yp = _pack_y(qb_ffn(xc), c)
+                        else:
                             with _scope("bd_w13"):
                                 gu = _fp4_blockdiag_dot(
                                     xc,
@@ -3171,7 +3151,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                 h = (gate * jax.nn.sigmoid(gate) * up).astype(
                                     jnp.bfloat16
                                 )
-                            pl.when(ch == 0)(w2_wait)
+                            w2_wait()
                             with _scope("bd_w2"):
                                 yc = _fp4_blockdiag_dot(
                                     h,
@@ -3186,6 +3166,64 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                                     n_tile=c.bd_n_tile,
                                 )
                                 yp = _pack_y(yc * g_down if gscale else yc, c)
+                        with _scope("ex_scatter"):
+                            # a padded row repeats the last pair's row, so its write repeats that
+                            # pair's identical write: no branch per row
+                            for j, p in enumerate(ps_):
+                                S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[
+                                    j : j + 1
+                                ]
+
+                    def bd_chunks():
+                        bd_kc = c.blockdiag_kc
+                        off, cnt = rget("ex_off", i), rget("ex_cnt", i)
+
+                        def bd_step(ch, carry_):
+                            ps_ = [
+                                rget("perm", off + jnp.minimum(ch * 8 + j, cnt - 1))
+                                for j in range(8)
+                            ]
+                            with _scope("ex_gather"):
+                                xc = gather_x_base(ps_)
+                            if q_ffn:
+                                pl.when(ch == 0)(w2_wait)
+                                yp = _pack_y(qb_ffn(xc), c)
+                            else:
+                                with _scope("bd_w13"):
+                                    gu = _fp4_blockdiag_dot(
+                                        xc,
+                                        W13.at[slot],
+                                        S["w13s"].at[slot],
+                                        He,
+                                        2 * Il,
+                                        bd_kc,
+                                        kperm=bool(c.ex_kperm),
+                                        qblock=c.qblock,
+                                        fp8_lhs=c.bd_fp8_lhs,
+                                        n_tile=c.bd_n_tile,
+                                    )
+                                    gate, up = gu[:, :Il], gu[:, Il:]
+                                    if gscale:
+                                        g_gate, g_up, g_down = globals_of(e)
+                                        gate, up = gate * g_gate, up * g_up
+                                    h = (gate * jax.nn.sigmoid(gate) * up).astype(
+                                        jnp.bfloat16
+                                    )
+                                pl.when(ch == 0)(w2_wait)
+                                with _scope("bd_w2"):
+                                    yc = _fp4_blockdiag_dot(
+                                        h,
+                                        W2.at[slot],
+                                        S["w2s"].at[slot],
+                                        Il,
+                                        He,
+                                        bd_kc,
+                                        kperm=bool(c.ex_kperm),
+                                        qblock=c.qblock,
+                                        fp8_lhs=c.bd_fp8_lhs,
+                                        n_tile=c.bd_n_tile,
+                                    )
+                                    yp = _pack_y(yc * g_down if gscale else yc, c)
                             with _scope("ex_scatter"):
                                 for j, p in enumerate(ps_):
                                     S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[
