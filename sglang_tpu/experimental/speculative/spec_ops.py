@@ -16,6 +16,7 @@ from sglang.srt.compilation.compiled_op import compiled_op
 from sglang_tpu.dflash_utils_tpu import select_dflash_verify_cache_locs_tpu
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
+    BlockStep,
     DraftBlockInputs,
     VerifyRows,
     map_carry,
@@ -168,14 +169,21 @@ def select_block_step(
     live_mask: torch.Tensor,
     mask_token_id: int,
     width: int,
-) -> tuple[tuple[VerifyRows, ...], DraftBlockInputs]:
-    """A block-draft step's verify rows per map and its draft inputs, one program.
+) -> BlockStep:
+    """A block-draft step's verify rows per map, draft inputs and RPA kv lengths, one program.
 
     Fuses select_window_rows with build_draft_block_inputs on map 0's rows.
     """
     rows = _window_rows(window, window_maps, seq_lens, num_rows)
-    return rows, _draft_block_inputs(
+    inputs = _draft_block_inputs(
         bonus_tokens, rows[0], seq_lens, live_mask, mask_token_id, width
+    )
+    return BlockStep(
+        rows=rows,
+        draft_inputs=inputs,
+        # TARGET_VERIFY RPA attends seq_lens + the forward's query width.
+        draft_kv_lens=(inputs.seq_lens + width).to(torch.int32),
+        verify_kv_lens=(seq_lens + num_rows).to(torch.int32),
     )
 
 

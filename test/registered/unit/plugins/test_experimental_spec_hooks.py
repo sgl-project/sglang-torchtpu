@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import pkgutil
 import subprocess
 import sys
@@ -216,6 +217,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 return_value=SimpleNamespace(spec_info=metadata),
             ) as build,
             patch.object(base_spec_worker, "accept_greedy_step", return_value=accepted),
+            # The step's select_step_rows would have built the kv lengths.
+            patch.object(worker, "take_verify_kv_lens", return_value=None),
         ):
             result = worker.verify(batch, bucket, rows, draft, addressing)
         make.assert_called_once_with(
@@ -664,7 +667,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         for maps, slot_maps in ((1, [full]), (2, [full, swa])):
             with self.subTest(maps=maps):
                 window = torch.cat([*slot_maps, committed[:, None]], dim=1)
-                rows, inputs = select_block_step(
+                step = select_block_step(
                     window,
                     maps,
                     seq_lens,
@@ -673,6 +676,18 @@ class TestExperimentalSpecHooks(CustomTestCase):
                     live,
                     99,
                     width,
+                )
+                rows, inputs = step.rows, step.draft_inputs
+                # The RPA backend's TARGET_VERIFY lengths: the forward's seq_lens + width.
+                self.assertTrue(
+                    torch.equal(
+                        step.draft_kv_lens, (inputs.seq_lens + width).to(torch.int32)
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        step.verify_kv_lens, (seq_lens + num_rows).to(torch.int32)
+                    )
                 )
                 self.assertEqual(len(rows), maps)
                 for got, slots in zip(rows, slot_maps):
@@ -692,6 +707,72 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 window_rows = select_window_rows(window, maps, seq_lens, num_rows)
                 for got, want in zip(window_rows, rows):
                     self.assertTrue(torch.equal(got.cache_locs, want.cache_locs))
+
+    def test_block_step_hands_both_forwards_their_kv_lens(self):
+        """The draft and the verify forward read select_block_step's kv lengths once."""
+        from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
+        from sglang_tpu.experimental.speculative import block_spec_worker
+
+        backend = object.__new__(BaseTpuPallasRpaAttnBackend)
+        backend._next_verify_kv_lens = None
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._draft_block_width = 3
+        worker._draft_runner = SimpleNamespace(attn_backend=backend)
+        worker._block_draft_worker = SimpleNamespace(
+            draft_context=contextlib.nullcontext
+        )
+        worker._spec_algorithm = None
+        worker._draft_block_spec_info = None
+        draft_kv_lens = torch.tensor([5, 0], dtype=torch.int32)
+        verify_kv_lens = torch.tensor([6, 0], dtype=torch.int32)
+        worker._step_draft_inputs = object()
+        worker._step_draft_kv_lens = draft_kv_lens
+        worker._step_verify_kv_lens = verify_kv_lens
+        seen = []
+
+        def forward_draft_rows(**kwargs):
+            seen.append(backend._next_verify_kv_lens)
+            return SimpleNamespace(
+                hidden_states=torch.zeros(6, 1),
+                next_draft_tokens=torch.zeros(2, 2),
+                next_draft_lattice=None,
+            )
+
+        with patch.object(block_spec_worker, "forward_draft_rows", forward_draft_rows):
+            worker._forward_draft_block(
+                state=SimpleNamespace(
+                    seq_lens=torch.zeros(2), req_pool_indices=torch.zeros(2)
+                ),
+                live_mask=None,
+                rows=None,
+                verify_input=None,
+            )
+        self.assertEqual(seen, [(3, draft_kv_lens)])
+        self.assertIsNone(worker._step_draft_kv_lens)
+        self.assertIs(worker.take_verify_kv_lens(), verify_kv_lens)
+        with self.assertRaises(RuntimeError):
+            worker.take_verify_kv_lens()
+
+    def test_rpa_backend_uses_handed_verify_kv_lens_once(self):
+        from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
+
+        backend = object.__new__(BaseTpuPallasRpaAttnBackend)
+        backend._next_verify_kv_lens = None
+        batch = SimpleNamespace(seq_lens=torch.tensor([10, 0]))
+        handed = torch.tensor([7, 7], dtype=torch.int32)
+        backend.set_next_verify_kv_lens(4, handed)
+        with self.assertRaises(RuntimeError):
+            backend.set_next_verify_kv_lens(4, handed)
+        self.assertIs(backend._target_verify_kv_lens(batch, 4), handed)
+        # Nothing handed: derived from seq_lens, as for every other caller.
+        derived = backend._target_verify_kv_lens(batch, 4)
+        self.assertEqual(derived.dtype, torch.int32)
+        self.assertEqual(derived.tolist(), [14, 4])
+        backend.set_next_verify_kv_lens(3, handed)
+        with self.assertRaises(ValueError):
+            backend._target_verify_kv_lens(batch, 4)
+        with self.assertRaises(TypeError):
+            backend.set_next_verify_kv_lens(4, handed.to(torch.int64))
 
     def test_mtp_takes_the_chain_paths_only_when_enabled(self):
         from sglang_tpu.experimental import is_experimental_spec_worker

@@ -765,6 +765,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         ] = {}
         # Host req_to_token page-slot columns, built by _host_page_columns.
         self._host_page_cols: torch.Tensor | None = None
+        # (width, int32 [bs] seq_lens + width) a spec worker's compiled program
+        # built for the next TARGET_VERIFY forward; spares two eager launches.
+        self._next_verify_kv_lens: tuple[int, torch.Tensor] | None = None
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the
@@ -814,6 +817,32 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         return self._get_dcp_lens(
             lens, self._dcp, self._dcp_rank, interleave_size=self.page_size
         )
+
+    def set_next_verify_kv_lens(self, width: int, kv_lens: torch.Tensor) -> None:
+        """Hand the next TARGET_VERIFY forward its int32 kv lengths (seq_lens + width)."""
+        if self._next_verify_kv_lens is not None:
+            raise RuntimeError("The previous TARGET_VERIFY kv lengths were never used.")
+        if kv_lens.dtype != torch.int32:
+            raise TypeError(
+                f"TARGET_VERIFY kv lengths must be int32, got {kv_lens.dtype}"
+            )
+        self._next_verify_kv_lens = (width, kv_lens)
+
+    def _target_verify_kv_lens(
+        self, forward_batch: ForwardBatch, verify_width: int
+    ) -> torch.Tensor:
+        handed = self._next_verify_kv_lens
+        if handed is None:
+            return (forward_batch.seq_lens + verify_width).to(torch.int32)
+        self._next_verify_kv_lens = None
+        width, kv_lens = handed
+        if width != verify_width or kv_lens.shape != forward_batch.seq_lens.shape:
+            raise ValueError(
+                f"Handed TARGET_VERIFY kv lengths (width {width}, shape "
+                f"{tuple(kv_lens.shape)}) do not match the forward (width "
+                f"{verify_width}, shape {tuple(forward_batch.seq_lens.shape)})."
+            )
+        return kv_lens
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Land deferred HiCache reload commits into the KV buffers before any
@@ -1014,7 +1043,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             assert forward_batch.spec_info is not None
             verify_width = forward_batch.spec_info.num_tokens_per_req
             kv_len_bump = verify_width
-            seq_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
+            seq_lens = self._target_verify_kv_lens(forward_batch, verify_width)
             extend_seq_lens = torch.full(
                 (bs,), verify_width, dtype=torch.int32, device=device
             )
@@ -1199,7 +1228,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             assert forward_batch.spec_info is not None
             verify_width = forward_batch.spec_info.num_tokens_per_req
             kv_len_bump = verify_width
-            kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
+            kv_lens = self._target_verify_kv_lens(forward_batch, verify_width)
             query_width = verify_width
         elif self._is_extend_including_draft(forward_batch.forward_mode):
             # EXTEND and DRAFT_EXTEND use current lengths.

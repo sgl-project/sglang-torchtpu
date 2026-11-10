@@ -81,6 +81,7 @@ from sglang.srt.speculative.spec_utils import (
     sample_simulated_acc_len,
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
@@ -913,6 +914,14 @@ class TpuSpecWorker(BaseSpecWorker):
             self._simulated_drafts[padded_bs],
         )
 
+    def take_verify_kv_lens(self) -> torch.Tensor | None:
+        """int32 [pbs] RPA kv lengths of this step's verify, if the step's compiled op built them.
+
+        Why: the backend otherwise derives them from seq_lens with two eager launches.
+        Noop: None lets the backend derive them.
+        """
+        return None
+
     def verify_swa_slot_map(self) -> torch.Tensor | None:
         """Host full -> SWA slot map whose verify rows each step also selects, if any."""
         return None
@@ -1718,6 +1727,13 @@ class TpuSpecWorker(BaseSpecWorker):
         # Keep logits/hidden on the batch bucket so the compiled accept op needs no re-pad.
         assert verify_forward_batch.spec_info is not None
         verify_forward_batch.spec_info.keep_outputs_padded = True
+        kv_lens = self.take_verify_kv_lens()
+        if kv_lens is not None:
+            hand_verify_kv_lens(
+                self.target_worker.model_runner.attn_backend,
+                self.num_verify_rows,
+                kv_lens,
+            )
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -1848,6 +1864,13 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError(
                 "TpuSpecWorker does not support deterministic sampling."
             )
+
+
+def hand_verify_kv_lens(backend: object, width: int, kv_lens: torch.Tensor) -> None:
+    """Give an RPA backend the next TARGET_VERIFY forward's precomputed kv lengths."""
+    # Other backends derive their own lengths and read nothing from here.
+    if isinstance(backend, BaseTpuPallasRpaAttnBackend):
+        backend.set_next_verify_kv_lens(width, kv_lens)
 
 
 def _idle_bucket(state: SpecState) -> BucketState:

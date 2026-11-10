@@ -192,6 +192,22 @@ class DraftBlockInputs(NamedTuple):
     extend_seq_lens: torch.Tensor
 
 
+class BlockStep(NamedTuple):
+    """select_block_step's outputs, [pbs] rows.
+
+    Attributes:
+      rows: Verify rows per slot map of the packed window (map 0: target slots).
+      draft_inputs: The block draft forward's inputs over map 0's rows.
+      draft_kv_lens: int32 RPA kv lengths of the draft forward (TARGET_VERIFY).
+      verify_kv_lens: int32 RPA kv lengths of the target verify forward.
+    """
+
+    rows: tuple[VerifyRows, ...]
+    draft_inputs: DraftBlockInputs
+    draft_kv_lens: torch.Tensor
+    verify_kv_lens: torch.Tensor
+
+
 class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     """Addressing for one verify step; the scheduler's plan already padded it to the bucket.
 

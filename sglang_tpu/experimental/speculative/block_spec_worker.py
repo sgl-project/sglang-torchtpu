@@ -41,6 +41,7 @@ from sglang_tpu.compilation.recompilation_checker import (
 )
 from sglang_tpu.experimental.speculative.base_spec_worker import (
     TpuSpecWorker,
+    hand_verify_kv_lens,
 )
 from sglang_tpu.experimental.speculative.block_draft_worker import (
     DraftLattice,
@@ -124,6 +125,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         # select_step_rows' outputs for the step in flight, consumed by draft and commit.
         self._step_draft_inputs: DraftBlockInputs | None = None
         self._step_swa_rows: VerifyRows | None = None
+        # select_block_step's RPA kv lengths for the step's draft and verify forwards.
+        self._step_draft_kv_lens: torch.Tensor | None = None
+        self._step_verify_kv_lens: torch.Tensor | None = None
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
@@ -457,9 +461,11 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         padded_bs = state.seq_lens.shape[0]
         width = self._draft_block_width
         inputs = self._step_draft_inputs
-        if inputs is None:
+        kv_lens = self._step_draft_kv_lens
+        if inputs is None or kv_lens is None:
             raise RuntimeError("draft needs select_step_rows' draft block inputs")
-        self._step_draft_inputs = None
+        self._step_draft_inputs = self._step_draft_kv_lens = None
+        hand_verify_kv_lens(self._draft_runner.attn_backend, width, kv_lens)
         # Writes the block's draft KV into the same slots target verify uses next.
         with self._block_draft_worker.draft_context():
             logits_output = forward_draft_rows(
@@ -504,7 +510,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 f"window carries {maps} maps, expected {self._window_maps()}"
             )
         state = bucket.state
-        rows, inputs = select_block_step(
+        step = select_block_step(
             verify_input.window,
             maps,
             state.seq_lens,
@@ -514,9 +520,18 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             self._mask_token_id,
             self._draft_block_width,
         )
-        self._step_draft_inputs = inputs
-        self._step_swa_rows = rows[1] if maps == 2 else None
-        return rows[0]
+        self._step_draft_inputs = step.draft_inputs
+        self._step_swa_rows = step.rows[1] if maps == 2 else None
+        self._step_draft_kv_lens = step.draft_kv_lens
+        self._step_verify_kv_lens = step.verify_kv_lens
+        return step.rows[0]
+
+    def take_verify_kv_lens(self) -> torch.Tensor | None:
+        kv_lens = self._step_verify_kv_lens
+        if kv_lens is None:
+            raise RuntimeError("verify needs select_step_rows' kv lengths")
+        self._step_verify_kv_lens = None
+        return kv_lens
 
     def warmup_step_rows(self, padded_bs: int, width: int) -> None:
         # Width and mask token come from the draft config, so the shared spec-op grid cannot warm it.
