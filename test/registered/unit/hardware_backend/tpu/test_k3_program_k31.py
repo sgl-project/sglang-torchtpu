@@ -254,3 +254,44 @@ class TestIndexPools(CustomTestCase):
         self.assertEqual(k3.index_pools, [])
         self.assertEqual(len(k3.get_kv_layer_ids()), len(MLA) + 5)
         del hooks, state
+
+
+class TestIndexCommit(CustomTestCase):
+    """New tokens' index keys land on their DCP owner, in the block their
+    latents go to, and read back as the reference quantization."""
+
+    def test_records_round_trip_on_their_owners(self):
+        from unittest import mock
+
+        import jax.numpy as jnp
+
+        from sglang_tpu.k3_programs.kimi_k3 import dsa
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp, mla_dcp
+
+        rng = np.random.default_rng(3)
+        tokens, group, blocks, layers = 512, 32, 6, 2
+        positions = np.array([5, 511, 512 * 33 + 130, 512 * 40 + 511], np.int32)
+        keys = rng.standard_normal((len(positions), layers, 128)).astype(np.float32)
+        records = dsa_dcp.key_records(jnp.asarray(keys))
+        # Local tables: entry e covers global pages e*32 .. e*32+31; block ids 1.. per row.
+        tables = np.zeros((len(positions), 4), np.int32)
+        for b in range(len(positions)):
+            tables[b] = np.arange(1, 5) + 4 * b
+        for member in range(group):
+            pools = tuple(jnp.zeros((blocks * 4, 4 * 33, 4, 128), jnp.uint8) for _ in range(layers))
+            with mock.patch.object(mla_dcp, "owner_index", return_value=member):
+                pools = dsa_dcp.commit_index_rows(
+                    pools, records, jnp.asarray(tables), jnp.asarray(positions), group=group
+                )
+            for b, p in enumerate(positions):
+                page = p // tokens
+                block = tables[b, page // group]
+                for m in range(layers):
+                    got, gexp = dsa_dcp.read_records(pools[m][block], tokens)
+                    t = p % tokens
+                    if page % group == member:
+                        want, wexp = dsa.quantize_fp8(keys[b, m][None])
+                        np.testing.assert_array_equal(np.asarray(got[t]), want[0])
+                        self.assertEqual(int(gexp[t, 0]), int(wexp[0, 0]))
+                    else:
+                        self.assertFalse(np.asarray(pools[m][block]).any())
