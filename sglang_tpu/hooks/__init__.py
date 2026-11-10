@@ -82,7 +82,10 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
-from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+from sglang_tpu.hooks.scheduler import (
+    configure_tpu_scheduler,
+    initialize_dense_moe_config,
+)
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.swa_miss_metrics import hook_specs as swa_miss_metrics_hooks
@@ -109,6 +112,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.managers.scheduler.Scheduler.run_event_loop",
         pin_scheduler_main_thread,
         HookType.BEFORE,
+    ),
+    (
+        "sglang.srt.managers.scheduler.Scheduler.__init__",
+        configure_tpu_scheduler,
+        HookType.AFTER,
     ),
     (
         "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
