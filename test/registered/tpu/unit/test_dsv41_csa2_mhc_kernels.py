@@ -54,6 +54,27 @@ from sglang_tpu.kernels.deepseek_v41.mhc.delayed import (
 )
 
 
+def _pack_swa_word_pages(swa_bf16: jax.Array) -> jax.Array:
+    u16 = jax.lax.bitcast_convert_type(
+        swa_bf16.reshape(swa_bf16.shape[0], swa_bf16.shape[1], 2, 2, 128).transpose(
+            0, 2, 1, 3, 4
+        ),
+        jnp.uint16,
+    ).astype(jnp.uint32)
+    words_u32 = u16[:, :, :, 0, :] | (u16[:, :, :, 1, :] << 16)
+    return jax.lax.bitcast_convert_type(words_u32, jnp.int32)
+
+
+def _unpack_swa_word_pages(pages_i32: jax.Array) -> jax.Array:
+    u32 = jax.lax.bitcast_convert_type(pages_i32, jnp.uint32)
+    lo = (u32 & 0xFFFF).astype(jnp.uint16)
+    hi = ((u32 >> 16) & 0xFFFF).astype(jnp.uint16)
+    bf16_u16 = jnp.stack((lo, hi), axis=3).transpose(0, 2, 1, 3, 4)
+    return jax.lax.bitcast_convert_type(bf16_u16, jnp.bfloat16).reshape(
+        pages_i32.shape[0], pages_i32.shape[2], 512
+    )
+
+
 def prefill_reference(
     q: jax.Array,
     words: jax.Array,
@@ -64,41 +85,58 @@ def prefill_reference(
     sink: jax.Array,
     rope: jax.Array,
     *,
-    swa_metadata: jax.Array,
-    main_lengths: jax.Array,
+    swa_metadata: jax.Array | None = None,
+    main_lengths: jax.Array | None = None,
     swa_bounds: jax.Array | None = None,
     scale: float = 512**-0.5,
+    compress_ratio: int = 2,
 ) -> jax.Array:
     """Independent JAX attention reference for validating CSA2 modes."""
-    banks = swa_kv if isinstance(swa_kv, tuple) else (swa_kv,)
-    pages, bounds, lengths = swa_metadata, swa_bounds, main_lengths
     tokens = q.shape[0]
-    request = jnp.minimum(
-        jnp.searchsorted(starts[1:], jnp.arange(tokens), side="right"),
-        pages.shape[0] - 1,
-    )
-    page_size = banks[0].shape[1]
-    left = jnp.maximum(0, positions - 127) if bounds is None else bounds[request, 0]
-    right = positions + 1 if bounds is None else bounds[request, 1]
-    keys = left[:, None] + jnp.arange(128 if bounds is None else 192)
-    columns = (keys - pages[request, 0, None]) // page_size
-    valid = (keys < right[:, None]) & (keys >= pages[request, 1, None])
-    valid &= (columns >= 0) & (columns < pages.shape[1] - 2)
-    columns = jnp.clip(columns, 0, pages.shape[1] - 3)
-    page_ids = pages[request[:, None], columns + 2]
-    swa = banks[0][jnp.clip(page_ids, 0, banks[0].shape[0] - 1), keys % page_size]
-    if len(banks) == 2:
-        high = banks[1][
-            jnp.clip(page_ids - banks[0].shape[0], 0, banks[1].shape[0] - 1),
-            keys % page_size,
-        ]
-        swa = jnp.where((page_ids < banks[0].shape[0])[..., None], swa, high)
-    swa = jnp.where(valid[..., None], swa, 0)
-    bits = (words[:, :, None, :] >> (8 * jnp.arange(4))[None, None, :, None]).astype(
-        jnp.uint8
-    )
-    main = lax.bitcast_convert_type(bits, jnp.float8_e4m3fn).astype(jnp.bfloat16)
+    if swa_metadata is None:
+        assert not isinstance(swa_kv, tuple)
+        swa = swa_kv
+        valid = jnp.arange(128)[None, :] < jnp.minimum(positions + 1, 128)[:, None]
+        swa = jnp.where(valid[..., None], swa, 0)
+    else:
+        banks = swa_kv if isinstance(swa_kv, tuple) else (swa_kv,)
+        if banks[0].dtype == jnp.int32:
+            banks = tuple(_unpack_swa_word_pages(b) for b in banks)
+        pages, bounds = swa_metadata, swa_bounds
+        request = jnp.minimum(
+            jnp.searchsorted(starts[1:], jnp.arange(tokens), side="right"),
+            pages.shape[0] - 1,
+        )
+        page_size = banks[0].shape[1]
+        left = jnp.maximum(0, positions - 127) if bounds is None else bounds[request, 0]
+        right = positions + 1 if bounds is None else bounds[request, 1]
+        keys = left[:, None] + jnp.arange(128 if bounds is None else 192)
+        columns = (keys - pages[request, 0, None]) // page_size
+        valid = (keys < right[:, None]) & (keys >= pages[request, 1, None])
+        valid &= (columns >= 0) & (columns < pages.shape[1] - 2)
+        columns = jnp.clip(columns, 0, pages.shape[1] - 3)
+        page_ids = pages[request[:, None], columns + 2]
+        swa = banks[0][jnp.clip(page_ids, 0, banks[0].shape[0] - 1), keys % page_size]
+        if len(banks) == 2:
+            high = banks[1][
+                jnp.clip(page_ids - banks[0].shape[0], 0, banks[1].shape[0] - 1),
+                keys % page_size,
+            ]
+            swa = jnp.where((page_ids < banks[0].shape[0])[..., None], swa, high)
+        swa = jnp.where(valid[..., None], swa, 0)
+    if words.dtype == jnp.int32:
+        bits = (
+            words[:, :, None, :] >> (8 * jnp.arange(4))[None, None, :, None]
+        ).astype(jnp.uint8)
+        main = lax.bitcast_convert_type(bits, jnp.float8_e4m3fn).astype(jnp.bfloat16)
+    else:
+        main = words.astype(jnp.bfloat16)
     main = main.reshape(tokens, 512, 512)
+    lengths = (
+        jnp.minimum((positions + 1) // compress_ratio, 512)
+        if main_lengths is None
+        else main_lengths
+    )
     main_logits = jnp.einsum(
         "thd,tkd->thk", q, main, preferred_element_type=jnp.float32
     )
@@ -131,7 +169,14 @@ def prefill_reference(
     return jnp.where((jnp.arange(tokens) < starts[-1])[:, None, None], output, 0)
 
 
-def _prefill_inputs(banked=False, non_causal=False, heads=8, page_size=64):
+def _prefill_inputs(
+    banked=False,
+    non_causal=False,
+    heads=8,
+    page_size=64,
+    word_swa=False,
+    fp8_main=False,
+):
     rng = np.random.default_rng(103)
     tokens = 27
     starts = np.array([0, 0, 17, 17, 25, 25], np.int32)
@@ -158,6 +203,8 @@ def _prefill_inputs(banked=False, non_causal=False, heads=8, page_size=64):
         swa = swa.at[table[request]].set(
             jnp.where(keep[..., None], swa[table[request]], jnp.nan)
         )
+    if word_swa:
+        swa = _pack_swa_word_pages(swa)
     if banked:
         split = 3 * columns + 1
         swa = (swa[:split], swa[split:])
@@ -168,7 +215,7 @@ def _prefill_inputs(banked=False, non_causal=False, heads=8, page_size=64):
     lengths = jnp.resize(jnp.array([0, 1, 127, 511, 512], jnp.int32), tokens)
     args = (
         random((tokens, heads, 512)),
-        words,
+        main if fp8_main else words,
         jnp.asarray(rng.uniform(0.1, 0.3, (tokens, 512)), jnp.float32),
         swa,
         jnp.asarray(starts),
@@ -185,22 +232,54 @@ def _prefill_inputs(banked=False, non_causal=False, heads=8, page_size=64):
 
 
 @pytest.mark.parametrize(
-    "bq,banked,non_causal,heads,page_size",
+    "bq,banked,non_causal,heads,page_size,word_swa,fp8_main",
     [
-        (6, False, False, 8, 64),
-        (16, True, True, 8, 64),
-        (16, True, False, 128, 64),
-        (6, False, False, 64, 32),
-        (16, False, True, 64, 32),
+        (6, False, False, 8, 64, False, False),
+        (16, True, True, 8, 64, False, False),
+        (16, True, False, 128, 64, False, False),
+        (6, False, False, 64, 32, False, False),
+        (16, False, True, 64, 32, False, False),
+        (6, False, False, 8, 64, True, True),
+        (16, True, True, 8, 32, True, False),
     ],
 )
 def test_csa2_prefill_visibility_and_tail_rows(
-    bq, banked, non_causal, heads, page_size
+    bq, banked, non_causal, heads, page_size, word_swa, fp8_main
 ):
-    args, kwargs = _prefill_inputs(banked, non_causal, heads, page_size)
+    args, kwargs = _prefill_inputs(
+        banked, non_causal, heads, page_size, word_swa=word_swa, fp8_main=fp8_main
+    )
     expected = prefill_reference(*args, **kwargs)
-    actual = (
-        csa2(*args, **kwargs, bq=bq) if jax.default_backend() == "tpu" else expected
+    actual = csa2(*args, **kwargs, bq=bq, interpret=(jax.default_backend() != "tpu"))
+    np.testing.assert_allclose(
+        np.asarray(actual, np.float32),
+        np.asarray(expected, np.float32),
+        atol=3e-3,
+        rtol=3e-2,
+    )
+    np.testing.assert_array_equal(actual[25:], 0)
+
+
+@pytest.mark.parametrize("fp8_main", [False, True])
+def test_csa2_unpaged_swa_and_direct_fp8(fp8_main):
+    args, _ = _prefill_inputs(fp8_main=fp8_main)
+    q, main_kv, scales, _, starts, positions, sink, rope = args
+    rng = np.random.default_rng(77)
+    seq_kv = jnp.asarray(rng.normal(size=(5, 512, 512)) * 0.2, jnp.bfloat16)
+    tokens = q.shape[0]
+    request = jnp.minimum(
+        jnp.searchsorted(starts[1:], jnp.arange(tokens), side="right"),
+        4,
+    )
+    pos_window = jnp.maximum(0, positions[:, None] - 127) + jnp.arange(128)[None, :]
+    swa = seq_kv[request[:, None], pos_window]
+    args_unpaged = (q, main_kv, scales, swa, starts, positions, sink, rope)
+    expected = prefill_reference(*args_unpaged, compress_ratio=2)
+    actual = csa2(
+        *args_unpaged,
+        bq=6,
+        compress_ratio=2,
+        interpret=(jax.default_backend() != "tpu"),
     )
     np.testing.assert_allclose(
         np.asarray(actual, np.float32),
@@ -236,9 +315,7 @@ def test_csa2_single_request_direct_output_preserves_padding(non_causal, valid_t
         swa_bounds=kwargs["swa_bounds"][1:2] if non_causal else None,
     )
     expected = prefill_reference(*args, **kwargs)
-    actual = (
-        csa2(*args, **kwargs, bq=16) if jax.default_backend() == "tpu" else expected
-    )
+    actual = csa2(*args, **kwargs, bq=16, interpret=(jax.default_backend() != "tpu"))
     np.testing.assert_allclose(
         np.asarray(actual, np.float32),
         np.asarray(expected, np.float32),
@@ -271,16 +348,6 @@ def test_csa2_short_batches(tokens):
     actual = csa2(*args, **kwargs, bq=8)
     expected = prefill_reference(*args, **kwargs)
     np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
-
-
-def _unpack_swa_word_pages(pages_i32: jax.Array) -> jax.Array:
-    u32 = jax.lax.bitcast_convert_type(pages_i32, jnp.uint32)
-    lo = (u32 & 0xFFFF).astype(jnp.uint16)
-    hi = ((u32 >> 16) & 0xFFFF).astype(jnp.uint16)
-    bf16_u16 = jnp.stack((lo, hi), axis=3).transpose(0, 2, 1, 3, 4)
-    return jax.lax.bitcast_convert_type(bf16_u16, jnp.bfloat16).reshape(
-        pages_i32.shape[0], pages_i32.shape[2], 512
-    )
 
 
 @pytest.mark.parametrize("page_size", [16, 32, 64])
@@ -354,7 +421,7 @@ def test_csa2_kv_publish_and_gather_round_trip(banked):
 
     gather_ids = np.full((2, 512), -1, dtype=np.int32)
     gather_ids[0, :6] = [5, 19, 112, 113, 114, 240]
-    gather_ids[1, :3] = [113, -1, 5]
+    gather_ids[1, :4] = [113, -1, 300, 5]
     got_words, got_scales = gather_csa2_kv_sc(
         word_owner,
         scale_owner,
@@ -366,7 +433,11 @@ def test_csa2_kv_publish_and_gather_round_trip(banked):
     np.testing.assert_array_equal(got_scales[0, 6:], 0)
     np.testing.assert_array_equal(got_words[1, 0], expected_words[3])
     np.testing.assert_array_equal(got_words[1, 1], 0)
-    np.testing.assert_array_equal(got_words[1, 2], expected_words[0])
+    np.testing.assert_array_equal(got_scales[1, 1], 0)
+    np.testing.assert_array_equal(got_words[1, 2], 0)
+    np.testing.assert_array_equal(got_scales[1, 2], 0)
+    np.testing.assert_array_equal(got_words[1, 3], expected_words[0])
+    np.testing.assert_array_equal(got_scales[1, 3], expected_scales[0])
 
 
 @pytest.mark.parametrize("banked", [False, True])
