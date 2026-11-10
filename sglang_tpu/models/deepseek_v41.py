@@ -8,6 +8,7 @@ Checkpoint names and the core loader remain unchanged.
 
 import functools
 
+import torch
 from torch import nn
 
 from sglang.srt.compilation.support_torch_compile import support_torch_compile
@@ -39,6 +40,7 @@ from sglang_tpu.dsv41.mhc import (
     pack_layer_weights,
 )
 from sglang_tpu.dsv41.moe import DSV41MoE
+from sglang_tpu.engram import _MM_PAD_SHIFT_VALUE
 
 
 class DSV41Attention(MqaAttentionBase):
@@ -138,11 +140,20 @@ class DSV41Layer(nn.Module):
             previous_pre = carry.pre if carry is not None else None
             if carry is not None:
                 residual = self.attn_mhc.commit(carry)
+            before_engram = residual
             # The host coordinator has already gathered these rows. The index
             # tensor supplies only the local token/head shape to the adapter.
             heads = (self.config.engram_max_ngram_size - 1) * self.config.engram_n_heads
             indices = input_ids[:, None].expand(-1, heads)
             residual = self.engram(residual, indices, forward_batch)
+            sentinel = (input_ids < 0) | (input_ids >= _MM_PAD_SHIFT_VALUE)
+            image_token_id = getattr(self.config, "image_token_id", None)
+            if (
+                image_token_id is not None
+                and getattr(self.config, "vision_n_layers", 0) > 0
+            ):
+                sentinel = sentinel | (input_ids == image_token_id)
+            residual = torch.where(sentinel[:, None, None], before_engram, residual)
             post, comb, value, pre = self.attn_mhc.start(residual, previous_pre)
         elif carry is None:
             post, comb, value, pre = self.attn_mhc.start(residual)
@@ -181,7 +192,17 @@ class DSV41Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.engram_hasher = (
-            EngramHasher.from_config(config, layout) if layout else None
+            EngramHasher.from_config(
+                config,
+                layout,
+                image_token_id=(
+                    getattr(config, "image_token_id", None)
+                    if getattr(config, "vision_n_layers", 0) > 0
+                    else None
+                ),
+            )
+            if layout
+            else None
         )
         self.hc_pre_from_prev_sublayer = True
         self.hc_head_fn = self.hc_head_scale = self.hc_head_base = None
@@ -204,9 +225,22 @@ class DSV41Model(nn.Module):
     ):
         residual = None
         if start == 0:
-            embedded = (
-                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
-            )
+            if input_embeds is None:
+                image_token_id = getattr(self.config, "image_token_id", None)
+                fallback_id = (
+                    image_token_id
+                    if image_token_id is not None
+                    and 0 <= image_token_id < self.config.vocab_size
+                    else getattr(self.config, "engram_pad_token_id", 0)
+                )
+                safe_ids = torch.where(
+                    (input_ids < 0) | (input_ids >= _MM_PAD_SHIFT_VALUE),
+                    fallback_id,
+                    input_ids,
+                )
+                embedded = self.embed_tokens(safe_ids)
+            else:
+                embedded = input_embeds
             residual = embedded[:, None, :].expand(-1, self.hc_mult, -1).contiguous()
         for layer in self.layers[start:stop]:
             carry = layer(residual, carry, input_ids, positions, forward_batch)
@@ -243,6 +277,14 @@ class DSV41Model(nn.Module):
             # Submit this segment before host lookup for the next Engram layer.
             # Its output tensors carry the device dependency into that segment.
             synchronize(list(carry), wait=False)
+            if layer.engram is not None and self.host_engram is not None:
+                self.host_engram.finish_segment(
+                    layer.engram.layer_hash_index,
+                    input_ids.shape[0],
+                    list(carry),
+                )
+        if self.host_engram is not None:
+            self.host_engram.finish_forward(input_ids.shape[0])
         return carry
 
 
