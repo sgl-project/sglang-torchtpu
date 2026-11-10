@@ -45,12 +45,13 @@ FRAME_SHAPE = (480, 832, 3)
 # request measures std 86, temporal diff 4.2 and neighbour ratio 0.037 (CPU run,
 # same seed); real Wan2.2 TPU videos cut to 9x480x832 measure std 39-79,
 # temporal diff 1.0-33 and neighbour ratio 0.012-0.056.
-# Pixel std: black, constant and NaN output (cast to black) measure 0.
+# Pixel std of every frame: black, constant and NaN output (cast to black)
+# measure 0, so a clip that turns blank partway through fails too.
 MIN_PIXEL_STD = 10.0
 # Mean |frame[t+1] - frame[t]|: frozen copies of those videos measure 0.02 at most.
 MIN_TEMPORAL_DIFF = 0.1
-# Mean |pixel - right neighbour| / std: a random latent decoded by the VAE, what
-# a DiT or scheduler that never denoises yields, measures 0.13.
+# Mean |pixel - right neighbour| / std, per frame: a random latent decoded by the
+# VAE, what a DiT or scheduler that never denoises yields, measures 0.13.
 MAX_NEIGHBOUR_DIFF_RATIO = 0.08
 
 TPU_WAN22_CASES = [
@@ -93,16 +94,24 @@ def _assert_plausible_video(frames: np.ndarray) -> None:
         f"decoded {frames.shape}, expected {expected_shape}"
     )
     pixels = frames.astype(np.float32)
-    std = float(pixels.std())
+    frame_std = pixels.std(axis=(1, 2, 3))
     temporal = float(np.abs(np.diff(pixels, axis=0)).mean())
-    ratio = float(np.abs(np.diff(pixels, axis=2)).mean()) / max(std, 1e-6)
-    print(
-        f"video {frames.shape}: mean {pixels.mean():.2f}, std {std:.2f}, "
-        f"temporal diff {temporal:.3f}, neighbour diff {ratio:.3f} x std"
+    frame_ratio = np.abs(np.diff(pixels, axis=2)).mean(axis=(1, 2, 3)) / np.maximum(
+        frame_std, 1e-6
     )
-    assert std > MIN_PIXEL_STD, f"pixel std {std:.2f}: blank or constant frames"
+    worst_std, worst_ratio = int(frame_std.argmin()), int(frame_ratio.argmax())
+    print(
+        f"video {frames.shape}: mean {pixels.mean():.2f}, "
+        f"min frame std {frame_std[worst_std]:.2f}, temporal diff {temporal:.3f}, "
+        f"max frame neighbour diff {frame_ratio[worst_ratio]:.3f} x std"
+    )
+    assert frame_std[worst_std] > MIN_PIXEL_STD, (
+        f"frame {worst_std} pixel std {frame_std[worst_std]:.2f}: blank or constant"
+    )
     assert temporal > MIN_TEMPORAL_DIFF, f"temporal diff {temporal:.3f}: frozen video"
-    assert ratio < MAX_NEIGHBOUR_DIFF_RATIO, f"neighbour diff {ratio:.3f} x std: noise"
+    assert frame_ratio[worst_ratio] < MAX_NEIGHBOUR_DIFF_RATIO, (
+        f"frame {worst_ratio} neighbour diff {frame_ratio[worst_ratio]:.3f} x std: noise"
+    )
 
 
 @pytest.mark.skipif(not hasattr(torch, "tpu"), reason="torch_tpu found no TPU")
