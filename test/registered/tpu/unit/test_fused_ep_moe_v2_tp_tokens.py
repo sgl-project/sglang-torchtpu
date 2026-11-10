@@ -2,11 +2,10 @@
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: tests/kernels/fused_moe/test_fused_ep_moe_v2_tp_tokens.py
 # Revision: bdb38700dd25959c029c7d77f00cee91ccd3a0bc
-"""SPMD TP-replica numerical checks on one host, plus a two-host regression.
+"""SPMD TP-replica numerical checks on eight local TPU devices.
 
-Single-host tests use eight local TPU devices, with deliberately permuted mesh
-order. Run with TPU_SKIP_MDS_QUERY=true and select ``-k single_host``. Device
-queries happen during fixture setup, never during pytest collection.
+The mesh order is deliberately permuted. Device queries happen during fixture
+setup, never during pytest collection.
 """
 
 import sys
@@ -19,10 +18,6 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
-
-import json
-import os
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -167,7 +162,6 @@ def _assert_outputs_match(actual, reference, rows, groups):
         s.device.id: np.asarray(s.data).astype(np.float32)
         for s in reference.addressable_shards
     }
-    stats = {}
     by_rank = {}
     for shard in actual.addressable_shards:
         got = np.asarray(shard.data).astype(np.float32)
@@ -185,18 +179,12 @@ def _assert_outputs_match(actual, reference, rows, groups):
         )
         assert relative < 0.002, (shard.device.id, relative)
         assert worst < 0.01, (shard.device.id, worst)
-        stats[str(shard.device.id)] = {
-            "relative_l2": relative,
-            "worst_token_relative_l2": worst,
-            "bitwise_equal": bool(np.array_equal(got, want)),
-        }
         by_rank[shard.index[0].start // rows] = got
     # Every TP member must regain the complete output in the same row order.
     for group in groups:
-        local = [by_rank[r] for r in group if r in by_rank]
+        local = [by_rank[r] for r in group]
         for output in local[1:]:
             np.testing.assert_array_equal(output, local[0])
-    return stats
 
 
 @pytest.mark.parametrize(
@@ -314,42 +302,21 @@ def test_single_host_replica_routing_options(
 
 
 @pytest.mark.parametrize(
-    "case,rows",
+    "groups,rows",
     [
-        ("tp1", 32),
-        ("tp2", 256),
-        ("tp2_permuted", 24),
-        ("tp2_cross_host", 264),
-        ("tp4_permuted", 24),
+        # Each member's 136-row share selects in 17 blocks of 8 rows;
+        # the 264-row reference exceeds MAX_ROUTING_BLOCK (256).
+        pytest.param(((4, 0), (5, 1), (6, 2), (7, 3)), 264, id="tp2-cross-half"),
+        # Non-power-of-two sub-tile share=6 must round up to local_rows=8 for Mosaic.
+        pytest.param(_TP4_PERMUTED, 24, id="tp4-sub-block-share"),
     ],
 )
-def test_fp4_replicas_match_original_layer(case, rows):
-    if jax.default_backend() != "tpu" or jax.device_count() != 16:
-        pytest.skip("requires the two-host 16-device SPMD slice")
-    ep = 16
-    mesh = Mesh(np.asarray(jax.devices()), (AXIS,))
-    if case == "tp1":
-        groups = tuple((i,) for i in range(ep))
-    elif case == "tp2":
-        groups = tuple((i, i + 1) for i in range(0, ep, 2))
-    elif case == "tp2_permuted":
-        groups = tuple(tuple(i + h for i in g) for h in (0, 8) for g in _TP2_PERMUTED)
-    elif case == "tp2_cross_host":
-        groups = tuple((i + 8, i) for i in range(8))
-    else:
-        groups = tuple(tuple(i + h for i in g) for h in (0, 8) for g in _TP4_PERMUTED)
+def test_fp4_replicas_match_original_layer(single_host_mesh, groups, rows):
+    mesh = single_host_mesh
     rank, inputs = _make_inputs(mesh, groups, rows, WeightFormat.FP4)
     reference = _run_layer(mesh, rank, inputs, None, WeightFormat.FP4, True)
     actual = _run_layer(mesh, rank, inputs, groups, WeightFormat.FP4, True)
-    stats = _assert_outputs_match(actual, reference, rows, groups)
-    output_dir = os.environ.get("MOE_TP_TEST_OUTPUT")
-    if output_dir:
-        p = Path(output_dir) / f"host{jax.process_index()}"
-        p.mkdir(parents=True, exist_ok=True)
-        (p / f"{case}.json").write_text(
-            json.dumps({"groups": groups, "rows": rows, "results": stats}, indent=2)
-            + "\n"
-        )
+    _assert_outputs_match(actual, reference, rows, groups)
 
 
 @pytest.mark.parametrize(
