@@ -1726,6 +1726,10 @@ def make_gmm_configs(
         if compact_tile_n != tiles.tile_n:
             tiles = dataclasses.replace(tiles, tile_n=compact_tile_n)
 
+    if fp4_qblock is not None and tiles.tile_k // (2 * fp4_qblock) % 8:
+        # A scale tile is whole sublane tiles of bf16 pairs (or all of them): one K tile.
+        tiles = dataclasses.replace(tiles, tile_k=dims.size_k)
+
     if rhs_cfgs.scale_without_unit_dim:
         # Rank-3 scale tiles put quant blocks on the sublane axis.
         scale_rows = rhs_scale.shape[1]
