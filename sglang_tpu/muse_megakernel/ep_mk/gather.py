@@ -27,7 +27,7 @@ from sglang_tpu.muse_megakernel.ep_mk.config import (
     gather_plan,
     item_scratch,
 )
-from sglang_tpu.muse_megakernel.ep_mk.dense import stream_matmul
+from sglang_tpu.muse_megakernel.ep_mk.dense import stream_matmul, stream_prefetch
 from sglang_tpu.muse_megakernel.ep_mk.experts import item_sizes, sized
 from sglang_tpu.muse_megakernel.ep_mk.layer import _phase, expert_loop
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
@@ -92,6 +92,16 @@ class EPGatherExperts:
             expert_loop(
                 step, p, n_items[0], lambda: None, x_src="ep_xo", emit=_emit(step, p)
             )
+        # the unpool's first weight tiles stream in under the u reduce-scatter / all-gather
+        stream_prefetch(
+            S,
+            step.W["wunpool"],
+            step.layer,
+            c.expert_hidden,
+            c.hidden_local,
+            step.me * c.hidden_local,
+            c.hidden_local,
+        )
         with _phase("u_rs"):
             _u_reduce(step)
         with _phase("unpool"):
@@ -543,6 +553,7 @@ def _unpool(step: EPLayerStep) -> None:
         put,
         n_off=me * Hl,
         tn=Hl,
+        prefetched=True,
     )
     _all_gather(c, S, me, fag, PH_FAG)
 
