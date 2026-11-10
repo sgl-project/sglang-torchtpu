@@ -30,6 +30,7 @@ from sglang_tpu.muse_megakernel.ep_mk.experts import (
     chunk_compute,
     item_sizes,
     qblock,
+    qblock_s2_rows,
     scale_group,
     sized,
 )
@@ -213,9 +214,18 @@ def _fill_send(step: EPLayerStep, p: EPPlan, win) -> None:
     jax.lax.fori_loop(0, n, wait, 0)
 
 
+def _divmod(k: jax.Array, n: int) -> tuple[jax.Array, jax.Array]:
+    """k // n, k % n of a k >= 0; a shift and a mask for a power of two (floor division of a
+    signed index costs sign fix-ups in the scalar code)."""
+    if n & (n - 1):
+        return k // n, k % n
+    return k >> (n.bit_length() - 1), k & (n - 1)
+
+
 def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
-    """The four DMAs of expert e's I-chunk j into ring slot `slot` (w13 and its scales in
-    chunk_cols order: a chunk's gate | up columns are one slab)."""
+    """The DMAs of expert e's I-chunk j into ring slot `slot` (w13 and its scales in
+    chunk_cols order: a chunk's gate | up columns are one slab); three under
+    SGLANG_TPU_EP_QBLOCK, whose w13 scale slab carries the w2 scales."""
     c, S, kind = step.c, step.S, step.kind
     He = c.expert_hidden
     CI = p.chunk(kind)
@@ -231,15 +241,16 @@ def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
     )
     c0 = pl.multiple_of(j * 2 * CI, 2 * CI)
     k2 = pl.multiple_of(j * (CI // pack), CI // pack)
+    q = kind == "fp4" and qblock()
     if kind == "fp4":
         g = scale_group(kind)
-        srows = He // g
+        srows = He // g + (qblock_s2_rows(He, g) if q else 0)
         s2_src = s2.at[e, pl.ds(j * (CI // g), CI // g)]
         s2_dst = S["w2s"].at[slot, pl.ds(0, CI // g)]
     else:
         srows, s2_src = 2, s2.at[e]
         s2_dst = S["w2s"].at[slot, pl.ds(0, 2)]
-    return [
+    copies = [
         pltpu.make_async_copy(
             w13.at[e, :, pl.ds(c0, 2 * CI)],
             W13.at[slot, :, pl.ds(0, 2 * CI)],
@@ -253,8 +264,10 @@ def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
         pltpu.make_async_copy(
             w2.at[e, pl.ds(k2, CI // pack)], W2.at[slot], sems.at[slot, 2]
         ),
-        pltpu.make_async_copy(s2_src, s2_dst, sems.at[slot, 3]),
     ]
+    if q:  # the w2 scales came with the w13 scale slab
+        return copies
+    return copies + [pltpu.make_async_copy(s2_src, s2_dst, sems.at[slot, 3])]
 
 
 def _ring(step: EPLayerStep, p: EPPlan):
@@ -280,12 +293,8 @@ def _chunk_refs(step: EPLayerStep, p: EPPlan, slot) -> ChunkRefs:
         s2 = S["w2s"].at[slot]
     else:
         sg, su = S13.at[slot, :, pl.ds(0, CI)], S13.at[slot, :, pl.ds(CI, CI)]
-        # the q arms read their rows of the whole slab (a short row slice won't lay out)
-        s2 = (
-            S["w2s"].at[slot]
-            if qblock()
-            else S["w2s"].at[slot, pl.ds(0, CI // FP4_GROUP)]
-        )
+        # the q arms read the w2 scales from the whole w13 scale slab (qblock_scale_slab)
+        s2 = S13.at[slot] if qblock() else S["w2s"].at[slot, pl.ds(0, CI // FP4_GROUP)]
     return ChunkRefs(
         wg=W13.at[slot, :, pl.ds(0, CI)],
         wu=W13.at[slot, :, pl.ds(CI, CI)],
@@ -334,14 +343,14 @@ def _expert_loop_on(
     ysem = S["ep_misc_sems"].at[1]
 
     def item(k):
-        i = k // NC
-        return i, items[1 + 3 * i], items[2 + 3 * i], items[3 + 3 * i], k % NC
+        i, j = _divmod(k, NC)
+        return i, items[1 + 3 * i], items[2 + 3 * i], items[3 + 3 * i], j
 
     def start(k):
         @pl.when(k < (jnp.minimum(total, D) if _dev_skip("wdma") else total))
         def _():
             _, e, _, _, j = item(k)
-            for cp in _chunk_copies(step, p, refs, off, e, j, k % D):
+            for cp in _chunk_copies(step, p, refs, off, e, j, _divmod(k, D)[1]):
                 cp.start()
 
     def wait(slot, k):
@@ -367,7 +376,7 @@ def _expert_loop_on(
     def body(k, carry):
         i, _, first, n, j = item(k)
         b = i % 2  # x rows alternate between items
-        slot = k % D
+        slot = _divmod(k, D)[1]
 
         @pl.when(j == 0)
         @_phase_fn("item_in", 2)

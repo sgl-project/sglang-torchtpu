@@ -384,6 +384,10 @@ def ep_expert_slabs(l: int, rank: int, kind: str) -> list:
             s2 = sl[0][3]
             w13 = _permute_packed_rows(w13, 8, kp_he)
         w13, s13 = w13[:, cc], s13[:, cc]
+        if kind == "fp4" and qblock():  # experts.qblock_scale_slab: w2 scales by chunk
+            rows = he // (2 * qblock())
+            blob = s2.reshape(TP, rows, 2 * il).permute(1, 0, 2).reshape(rows, -1)
+            s13 = torch.cat([s13, blob.to(s13.dtype)], dim=0)
         for j, t in enumerate((w13, s13, w2, s2)):
             out[j].append(t)
     return [torch.stack(t) for t in out]
