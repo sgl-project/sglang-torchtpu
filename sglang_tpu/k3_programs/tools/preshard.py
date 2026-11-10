@@ -147,7 +147,8 @@ def expert_values(checkpoint, rank: int, layer: int) -> dict[str, np.ndarray]:
 def convert_rank(load, checkpoint, rank: int, output: Path, log) -> dict:
     """Write one rank's files; returns its index."""
     shapes = load.selected_local_shapes(
-        LAYERS, checkpoint.config.dim, vocab=checkpoint.config.vocab
+        LAYERS, checkpoint.config.dim, vocab=checkpoint.config.vocab,
+        dsa=checkpoint.config.dsa,
     )
     rank_dir = output / f"rank{rank:02d}"
     rank_dir.mkdir(parents=True, exist_ok=True)
@@ -410,7 +411,8 @@ def verify(args, log) -> bool:
     rank_dir = Path(args.against) / f"rank{args.rank:02d}"
     families = json.loads((rank_dir / "index.json").read_text())["families"]
     shapes = load.selected_local_shapes(
-        LAYERS, checkpoint.config.dim, vocab=checkpoint.config.vocab
+        LAYERS, checkpoint.config.dim, vocab=checkpoint.config.vocab,
+        dsa=checkpoint.config.dsa,
     )
     # Older pre-shards store k_projection with the gate columns inside (the
     # loader splits them off): compare it combined.

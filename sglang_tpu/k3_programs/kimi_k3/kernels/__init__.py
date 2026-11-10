@@ -37,6 +37,20 @@ class Config:
     situ_linear_beta: float = 25.0
     gate_lower_bound: float = -5.0
     full_attention: tuple[int, ...] = tuple(range(3, 92, 4)) + (92,)
+    # Kimi-K3.1: a DSA ("lightning") indexer on every MLA layer selects each
+    # query's top ``index_topk`` keys (0: Kimi-K3, dense MLA).
+    index_topk: int = 0
+    index_heads: int = 32
+    index_dim: int = 128
+
+    @property
+    def dsa(self) -> bool:
+        return self.index_topk > 0
+
+    def without_dsa(self) -> "Config":
+        from dataclasses import replace
+
+        return replace(self, index_topk=0)
 
     @classmethod
     def from_checkpoint(cls, directory):
@@ -60,6 +74,20 @@ class Config:
                 raise ValueError(f"Unsupported K3 setting {name}={c[name]!r}")
         if not a["use_full_rank_gate"]:
             raise ValueError("K3 requires the full-rank output gate")
+        dsa = c.get("dsa_config") or {}
+        if dsa:
+            full = sorted(a["full_attn_layers"])
+            supported = {
+                "index_rope_dim": 0,
+                "index_k_norm_type": "layernorm",
+                "index_topk_freq": 1,
+                "index_skip_topk_offset": 1,
+            }
+            for name, expected in supported.items():
+                if dsa.get(name, expected) != expected:
+                    raise ValueError(f"Unsupported K3.1 DSA setting {name}={dsa.get(name)!r}")
+            if sorted(dsa["dsa_layers"]) != full:
+                raise ValueError("K3.1 DSA must index every full-attention (MLA) layer")
         return cls(
             dim=c["hidden_size"],
             latent=c["routed_expert_hidden_size"],
@@ -82,6 +110,9 @@ class Config:
             situ_linear_beta=c["activation_situ_linear_beta"],
             gate_lower_bound=a["gate_lower_bound"],
             full_attention=tuple(i - 1 for i in a["full_attn_layers"]),
+            index_topk=int(dsa.get("index_topk", 0)),
+            index_heads=int(dsa.get("index_num_heads", 32)),
+            index_dim=int(dsa.get("index_head_dim", 128)),
         )
 
 

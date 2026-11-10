@@ -88,8 +88,13 @@ class Checkpoint:
     def __init__(self, path):
         self.path = Path(path)
         self.config = Config.from_checkpoint(path)
-        if self.config != Config():
-            raise ValueError("This loader requires the full 93-layer/896-expert K3 contract")
+        if self.config.without_dsa() != Config() or (
+            self.config.dsa and (self.config.index_heads, self.config.index_dim) != (32, 128)
+        ):
+            raise ValueError(
+                "This loader requires the full 93-layer/896-expert K3 (or K3.1: plus a "
+                "32 x 128 DSA indexer) contract"
+            )
         self.index = json.loads((self.path / "model.safetensors.index.json").read_text())[
             "weight_map"
         ]
@@ -427,6 +432,21 @@ class Checkpoint:
             return read(
                 "self_attn." + ("q_a" if name == "m_qnorm" else "kv_a") + "_layernorm.weight"
             )[None]
+        # Kimi-K3.1 DSA indexer (one per MLA layer). The query projection is
+        # head-sharded (rank r: index head r, gathered over the ranks); the key
+        # and head-weight projections and the key LayerNorm are replicated.
+        if name == "d_wqb":
+            dim = self.config.index_dim
+            return matrix("self_attn.indexer.wq_b", slice(rank * dim, (rank + 1) * dim))
+        if name == "d_wk":
+            return matrix("self_attn.indexer.wk")
+        if name == "d_wproj":
+            value = matrix("self_attn.indexer.weights_proj")
+            return np.pad(value, ((0, 0), (0, 128 - value.shape[1])))
+        if name == "d_knorm":
+            return np.stack(
+                [read("self_attn.indexer.k_norm." + p) for p in ("weight", "bias")]
+            ).astype(BF16)
         raise KeyError(name)
 
     def dense_selected(self, name, layer, rank):
@@ -481,12 +501,12 @@ class Checkpoint:
         return self.dense(name, layer, rank)
 
 
-def selected_local_shapes(layers=93, hidden=7168, *, vocab=163840):
+def selected_local_shapes(layers=93, hidden=7168, *, vocab=163840, dsa=False):
     """Per-rank shapes of the kernel layout.
 
     TP4/EP8 packed routed experts, output-sharded host-local ``latent_up``,
     compact shared experts, split KDA gate projection, and paired attention
-    output projections.
+    output projections. ``dsa``: Kimi-K3.1's indexer families too.
     """
     if not 2 <= layers <= 93:
         raise ValueError("Kimi stack supports a prefix of 2..93 layers")
@@ -533,6 +553,13 @@ def selected_local_shapes(layers=93, hidden=7168, *, vocab=163840):
         output_res=(1, hidden),
         final_norm=(1, hidden),
     )
+    if dsa:
+        shapes.update(
+            d_wqb=(m, 1536, 128),
+            d_wk=(m, hidden, 128),
+            d_wproj=(m, hidden, 128),
+            d_knorm=(m, 2, 128),
+        )
     return shapes
 
 
@@ -540,6 +567,7 @@ def _family_layers(config, name, layers):
     """Checkpoint layer ids stored along a family's leading axis (None: not per layer)."""
     kda = {"k_gate", "k_projection", "k_fb", "k_o", "k_conv", "k_a_log", "k_dt", "k_norm"}
     mla = {"m_qa", "m_ka", "m_qb", "m_kb", "m_gate", "m_o", "m_qnorm", "m_knorm"}
+    mla |= {"d_wqb", "d_wk", "d_wproj", "d_knorm"}
     moe = {
         "router", "router_bias", "latent_down", "latent_up", "latent_norm",
         "shared_gu", "shared_down", "expert_gu", "expert_gus", "expert_down", "expert_ds",
