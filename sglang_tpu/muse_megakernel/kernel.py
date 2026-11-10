@@ -163,6 +163,7 @@ from sglang_tpu.muse_megakernel.mk.scratch import (  # noqa: F401
     _alias_tiled_padu_attn,
     _alias_tiled_xfull_attn,
     _alias_tiled_xfull_q,
+    _alias_u_xfull,
     _attn_p_rows,
     _attn_p_ysend_streams,
     _can_w2_attn_scratch,
@@ -289,8 +290,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
             assert not (c.fold_f or c.fold_o)
             S["final_norm"] = S["smalls"].at[1 - (c.n_layers - 1) % 2, pl.ds(0, 8)]
             S["f_send"] = S["o_send"]
-            # lifetimes: o_ag, then the pool all-gather, then f_ag; u_send after the experts
+            # lifetimes: o_ag, then the pool all-gather, then f_ag (u_send: after the experts)
             S["pool_send"] = S["o_send"].at[:, pl.ds(0, c.expert_hidden_local // 2)]
+        if _alias_u_xfull(c):
             S["u_send"] = S["xfull"].at[pl.ds(0, c.rows_per_dev)]
         if _alias_tiled_ids_kv(c):
             S["kb_s"] = S["ids_v"].bitcast(jnp.float32)
