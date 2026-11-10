@@ -156,36 +156,16 @@ def requant_fp4_kperm(
     return out, sb
 
 
-def qblock_s2_rows(he: int, block: int) -> int:
-    """Rows of a chunk's w2 scales ([I_c / block, he]) laid out 2 I_c wide: they follow the
-    w13 scales in the chunk's columns of the w13 scale slab, so one copy moves both."""
-    return he // (2 * block)
-
-
-def qblock_scale_slab(
-    s13: jax.Array, s2: jax.Array, chunk: int, block: int
-) -> jax.Array:
-    """The QBLOCK w13 scale slab [..., he / block + qblock_s2_rows, 2I] (columns in chunk_cols
-    order) from s13 [..., he / block, 2I] and s2 [..., I / block, he]: chunk j's w2 scales,
-    flattened row-major, fill its 2 chunk columns of the extra rows."""
-    *lead, ib, he = s2.shape
-    nc = ib * block // chunk
-    rows = qblock_s2_rows(he, block)
-    blob = s2.reshape(*lead, nc, rows, 2 * chunk)
-    blob = jnp.moveaxis(blob, -3, -2).reshape(*lead, rows, nc * 2 * chunk)
-    return jnp.concatenate([s13, blob.astype(s13.dtype)], axis=-2)
-
-
 def scale_group(kind: str) -> int:
     """K rows per scale row of a chunk's fp4 scale slabs."""
     assert kind == "fp4", kind
     return qblock() or FP4_GROUP
 
 
-def qblock_dot(x, wref, srow, k0, K, n0, tn, block):
+def qblock_dot(x, wref, sref, k0, K, n0, tn, block):
     """x [R, K] bf16 @ rows [k0, k0 + K) x columns [n0, n0 + tn) of a block-scaled NVFP4 slab ->
     f32 [R, tn]: each dot pushes raw codes (as e4m3) of one block and scales its partial by
-    the block's row srow(block index, n0, tn) [1, tn]."""
+    the block's row."""
     acc = None
     for kk in range(k0, k0 + K, block):
         w = pltpu.bitcast(
@@ -195,7 +175,7 @@ def qblock_dot(x, wref, srow, k0, K, n0, tn, block):
         part = jnp.dot(
             x[:, kk - k0 : kk - k0 + block], w, preferred_element_type=jnp.float32
         )
-        s = srow(kk // block, n0, tn).astype(jnp.float32)
+        s = sref[pl.ds(kk // block, 1), pl.ds(n0, tn)].astype(jnp.float32)
         acc = part * s if acc is None else acc + part * s
     return acc
 
@@ -205,26 +185,16 @@ def _q_arm(
 ) -> None:
     """Up to R slots on B-row block-scaled weights: plain R-row dots on the codes. h comes in
     B-column blocks and w2 takes each block for every column tile before the next, so the MXU
-    streams w2 while the last block's SiLU is in flight. w.s2: the whole scale slab
-    (qblock_scale_slab)."""
-    assert He % (2 * CI) == 0 and (2 * CI) % QB_TN == 0, (He, CI)
+    streams w2 while the last block's SiLU is in flight."""
     xt = x_rows(R).astype(jnp.bfloat16)
-
-    def srow(ref):
-        return lambda kb, n0, tn: ref[pl.ds(kb, 1), pl.ds(n0, tn)]
-
-    def s2row(kb, n0, tn):
-        f = kb * He + n0  # chunk w2 scales flattened row-major, 2 CI per slab row
-        return w.s2[pl.ds(He // B + f // (2 * CI), 1), pl.ds(f % (2 * CI), tn)]
-
     hs = []
     for c0 in range(0, CI, B):
-        g = qblock_dot(xt, w.wg, srow(w.sg), 0, He, c0, B, B)
-        u = qblock_dot(xt, w.wu, srow(w.su), 0, He, c0, B, B)
+        g = qblock_dot(xt, w.wg, w.sg, 0, He, c0, B, B)
+        u = qblock_dot(xt, w.wu, w.su, 0, He, c0, B, B)
         hs.append((g * jax.nn.sigmoid(g) * u).astype(jnp.bfloat16))
     tiles = range(0, He, QB_TN)
     parts = [
-        [qblock_dot(h, w.w2, s2row, kb * B, B, n0, QB_TN, B) for n0 in tiles]
+        [qblock_dot(h, w.w2, w.s2, kb * B, B, n0, QB_TN, B) for n0 in tiles]
         for kb, h in enumerate(hs)
     ]
     for t, n0 in enumerate(tiles):

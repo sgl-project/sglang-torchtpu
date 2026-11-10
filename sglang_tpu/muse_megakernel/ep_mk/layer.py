@@ -30,7 +30,6 @@ from sglang_tpu.muse_megakernel.ep_mk.experts import (
     chunk_compute,
     item_sizes,
     qblock,
-    qblock_s2_rows,
     scale_group,
     sized,
 )
@@ -223,9 +222,8 @@ def _divmod(k: jax.Array, n: int) -> tuple[jax.Array, jax.Array]:
 
 
 def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
-    """The DMAs of expert e's I-chunk j into ring slot `slot` (w13 and its scales in
-    chunk_cols order: a chunk's gate | up columns are one slab); three under
-    SGLANG_TPU_EP_QBLOCK, whose w13 scale slab carries the w2 scales."""
+    """The four DMAs of expert e's I-chunk j into ring slot `slot` (w13 and its scales in
+    chunk_cols order: a chunk's gate | up columns are one slab)."""
     c, S, kind = step.c, step.S, step.kind
     He = c.expert_hidden
     CI = p.chunk(kind)
@@ -241,16 +239,15 @@ def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
     )
     c0 = pl.multiple_of(j * 2 * CI, 2 * CI)
     k2 = pl.multiple_of(j * (CI // pack), CI // pack)
-    q = kind == "fp4" and qblock()
     if kind == "fp4":
         g = scale_group(kind)
-        srows = He // g + (qblock_s2_rows(He, g) if q else 0)
+        srows = He // g
         s2_src = s2.at[e, pl.ds(j * (CI // g), CI // g)]
         s2_dst = S["w2s"].at[slot, pl.ds(0, CI // g)]
     else:
         srows, s2_src = 2, s2.at[e]
         s2_dst = S["w2s"].at[slot, pl.ds(0, 2)]
-    copies = [
+    return [
         pltpu.make_async_copy(
             w13.at[e, :, pl.ds(c0, 2 * CI)],
             W13.at[slot, :, pl.ds(0, 2 * CI)],
@@ -264,10 +261,8 @@ def _chunk_copies(step: EPLayerStep, p: EPPlan, refs, off, e, j, slot) -> list:
         pltpu.make_async_copy(
             w2.at[e, pl.ds(k2, CI // pack)], W2.at[slot], sems.at[slot, 2]
         ),
+        pltpu.make_async_copy(s2_src, s2_dst, sems.at[slot, 3]),
     ]
-    if q:  # the w2 scales came with the w13 scale slab
-        return copies
-    return copies + [pltpu.make_async_copy(s2_src, s2_dst, sems.at[slot, 3])]
 
 
 def _ring(step: EPLayerStep, p: EPPlan):
@@ -293,8 +288,12 @@ def _chunk_refs(step: EPLayerStep, p: EPPlan, slot) -> ChunkRefs:
         s2 = S["w2s"].at[slot]
     else:
         sg, su = S13.at[slot, :, pl.ds(0, CI)], S13.at[slot, :, pl.ds(CI, CI)]
-        # the q arms read the w2 scales from the whole w13 scale slab (qblock_scale_slab)
-        s2 = S13.at[slot] if qblock() else S["w2s"].at[slot, pl.ds(0, CI // FP4_GROUP)]
+        # the q arms read their rows of the whole slab (a short row slice won't lay out)
+        s2 = (
+            S["w2s"].at[slot]
+            if qblock()
+            else S["w2s"].at[slot, pl.ds(0, CI // FP4_GROUP)]
+        )
     return ChunkRefs(
         wg=W13.at[slot, :, pl.ds(0, CI)],
         wu=W13.at[slot, :, pl.ds(CI, CI)],
