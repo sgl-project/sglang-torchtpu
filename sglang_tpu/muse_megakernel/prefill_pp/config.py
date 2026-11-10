@@ -208,6 +208,19 @@ def balanced_routing() -> bool:
     return os.environ.get("MUSE_PP_BALANCED_ROUTING", "0") not in ("", "0")
 
 
+QBLOCK_SIZES = (256, 512)
+
+
+def fp4_qblock() -> int:
+    """MUSE_PP_QBLOCK=256 (or 512): NVFP4 experts requantized to one bf16 scale per that many K
+    rows (moe.requant_fp4_blocks); gmm_v2 pushes their codes as e4m3 against bf16 rows and
+    scales each block's product. The weights must be requantized; 0 runs the served W4A16."""
+    b = int(os.environ.get("MUSE_PP_QBLOCK", "0"))
+    if b not in (0, *QBLOCK_SIZES):
+        raise ValueError(f"MUSE_PP_QBLOCK={b}: 0 or one of {QBLOCK_SIZES}")
+    return b
+
+
 def skipped_phases() -> frozenset[str]:
     """MUSE_PP_SKIP=a,b: timing ablation only (wrong numerics), those phases do not run."""
     skip = frozenset(p for p in os.environ.get("MUSE_PP_SKIP", "").split(",") if p)

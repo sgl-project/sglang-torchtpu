@@ -11,6 +11,9 @@ stage runs with 1, 2 and 3 valid layers; layer l's reference is
 fed the kernel's stream after l - 1 layers (teacher forcing), and its chunk K/V is compared
 with what the kernel wrote into the pool.
 
+MUSE_PP_QBLOCK=256 requantizes the NVFP4 experts to block-256 scales (the reference uses the
+requantized weights) and also reports the expert outputs against the exact block-16 reference.
+
     python3 test/manual/tpu/test_muse_prefill_pp_numerics.py
 """
 
@@ -24,6 +27,7 @@ import numpy as np
 
 from sglang_tpu.muse_megakernel import prefill_pp as PP
 from sglang_tpu.muse_megakernel.prefill_pp import moe as PP_MOE
+from sglang_tpu.muse_megakernel.prefill_pp.config import fp4_qblock
 
 # the batched RPA prefill attention as the P/D prefill serves it (read when the stage is traced);
 # MUSE_PP_TEST_RPA_TRANSPOSED=0 runs the standard tile (bf16 queries) as a control
@@ -204,15 +208,15 @@ def rope_table(n):
 
 
 def _dq4(packed, scales):
-    """[K / 2, N] u8 e2m1 pairs (low nibble row 2b) + [K / 32, N] i32 bf16-scale pairs (low half
-    block 2j) -> [K, N] f32."""
+    """[K / 2, N] u8 e2m1 pairs (low nibble row 2b) + [K / (2 g), N] i32 bf16-scale pairs (low
+    half block 2j) of g-row blocks -> [K, N] f32."""
     codes = jnp.stack([packed & 0xF, packed >> 4], axis=1).reshape(-1, packed.shape[1])
     v = _E2M1[codes.astype(jnp.int32)]
     u = jax.lax.bitcast_convert_type(scales, jnp.uint32)
     halves = jnp.stack([u & 0xFFFF, u >> 16], axis=1).astype(jnp.uint16)
     sc = jax.lax.bitcast_convert_type(halves, jnp.bfloat16).astype(jnp.float32)
-    sc = sc.reshape(-1, packed.shape[1])  # [K / 16, N]
-    return v * jnp.repeat(sc, 16, axis=0)
+    sc = sc.reshape(-1, packed.shape[1])  # [K / g, N]
+    return v * jnp.repeat(sc, codes.shape[0] // sc.shape[0], axis=0)
 
 
 def _untile(t):
@@ -440,8 +444,19 @@ def expert_outputs(c, w, l, xe, ids, slot, cap=96):
 def main() -> int:
     c = config()
     dev = jax.devices()[0]
+    qblock = fp4_qblock()
     with jax.default_device(dev):
         w = build_weights(c, seed=11)
+        if qblock:
+            requant = jax.jit(lambda a, b: PP_MOE.requant_fp4_blocks(a, b, qblock))
+            done = {}
+            for ex in w["fp4"]:
+                if id(ex) not in done:
+                    w13, s13 = requant(ex[0], ex[1])
+                    w2, s2 = requant(ex[2], ex[3])
+                    done[id(ex)] = (w13, s13, w2, s2)
+            w["fp4_exact"] = w["fp4"]
+            w["fp4"] = [done[id(ex)] for ex in w["fp4"]]
         rope = rope_table(c.max_position)
         tables = {}
         perm = (
@@ -533,6 +548,18 @@ def main() -> int:
                 jnp.abs(yn_r).sum(-1, keepdims=True) > 0
             )  # the picked (token, slot) rows
             y_rel = rel_of(jnp.where(live, yn_k, 0), yn_r)
+            y_exact = ""
+            if qblock and KINDS[l] == "fp4":
+                w_exact = {**w_ref, "fp4": w["fp4_exact"]}
+                yn_x = expert_outputs(
+                    c,
+                    w_exact,
+                    l,
+                    xe_k.astype(jnp.float32),
+                    kernel[0][:, : c.top_k],
+                    first + l,
+                )
+                y_exact = f" (vs exact block-16 ref {rel_of(jnp.where(live, yn_k, 0), yn_x):.2e})"
             ids_k, tw_k = kernel[0], kernel[1]
             ex = w["fp8"] if KINDS[l] == "fp8" else w["fp4"][first + l]
             y_served = jax.jit(lambda *a: PP_MOE.experts(c, *a))(xe_k, ids_k, tw_k, ex)
@@ -567,7 +594,7 @@ def main() -> int:
             print(
                 f"layer {l} ({KINDS[l]}, {'global' if GLOBAL[l] else 'window'}): q/k/v rel "
                 f"{qkv_rel:.2e} | attention rel {o_rel:.2e} | expert input rel {xe_rel:.2e} | "
-                f"expert out rel {y_rel:.2e} | vs served calls: attention {o_port:.1e} experts "
+                f"expert out rel {y_rel:.2e}{y_exact} | vs served calls: attention {o_port:.1e} experts "
                 f"{y_port:.1e} | chunk kv rel {kv_rel:.2e} cached "
                 f"kept {cached_same} | row rel max {worst:.2e} mean {mean:.2e} rows>10% {n_bad} "
                 f"| top-k flips {n_flip} (worst gap {gap:.1e}) | {'OK' if good else 'FAIL'}"
