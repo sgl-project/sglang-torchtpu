@@ -214,6 +214,7 @@ def tile(
         kc_cap = cfgs.serve.transposed_key_chunk or min(bkv, 1536)
         kc = math.gcd(bkv, min(bkv, kc_cap))
         chunk_vt = cfgs.serve.transposed_chunk_vt
+        mxu_split = int(os.environ.get("RPA_EXP_MXU", "0"))
         for kv_head in range(cfgs.model.num_kv_heads):
             kh = k[0, kv_head]  # [hd, bkv] fp8
             ones_rows = cfgs.acct_scratch_shape[1] - hd
@@ -227,9 +228,29 @@ def tile(
                     axis=0,
                 )  # [acc rows, bkv]
 
+            if mxu_split:
+                kht = _padded_kt(kh)
+
+                def q_chunk(bq_start, cs, par=0, defer=False, kht=kht, vt=vt, kv_head=kv_head):
+                    mask = None
+                    if apply_mask:
+                        lo = offset - bq_start
+                        hi = None if cfgs.model.sliding_window is None else (
+                            cfgs.model.sliding_window + lo)
+                        mask = (lo, hi)
+                    pend = _q_chunk_mxu(kht, vt, qt_ref, acc_ref, kv_head, cs, par,
+                                        q_kv_diff if apply_mask else None, mask, cfgs)
+                    if not defer:
+                        _q_chunk_finish(pend[0], *pend[1])
+                        return None
+                    return pend
+
             def q_chunk(
-                bq_start, cs, kh=kh, vt=vt, kv_head=kv_head, ones_rows=ones_rows
+                bq_start, cs, par=0, defer=False, kh=kh, vt=vt, kv_head=kv_head, ones_rows=ones_rows,
+                _mxu=q_chunk if mxu_split else None,
             ):
+                if _mxu is not None:
+                    return _mxu(bq_start, cs, par, defer)
                 qt = qt_ref[kv_head, :, cs]  # [hd, lanes] fp8
                 o_t = None
                 for c0 in range(0, bkv, kc):
@@ -309,7 +330,7 @@ def tile(
                     for j in range(sub):
                         bq_start = s_idx * sub_tokens + j * cfgs.bq_c_sz
                         lane0 = pl.multiple_of(s_idx * sub_lanes + j * lanes, lanes)
-                        q_chunk(bq_start, pl.ds(lane0, lanes))
+                        q_chunk(bq_start, pl.ds(lane0, lanes), j % 2)
                     return carry
 
                 lax.fori_loop(0, live_groups * steps_per_group, run_group, 0)
@@ -322,9 +343,21 @@ def tile(
                     return carry
 
                 lax.fori_loop(0, n_qc, body, 0, unroll=min(mask_loop_unroll, n_qc))
+            elif mxu_split and os.environ.get("RPA_EXP_SWP") == "1":
+                prev = None
+                for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
+                    cur = q_chunk(bq_start, slice(bq_start * heads, bq_start * heads + lanes), 0, True)
+                    if prev is not None:
+                        _q_chunk_finish(prev[0], *prev[1])
+                    prev = cur
+                _q_chunk_finish(prev[0], *prev[1])
             else:
                 for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
-                    q_chunk(bq_start, slice(bq_start * heads, bq_start * heads + lanes))
+                    q_chunk(
+                        bq_start,
+                        slice(bq_start * heads, bq_start * heads + lanes),
+                        (bq_start // cfgs.bq_c_sz) % 2,
+                    )
     else:
         _tile_shifted(
             step,
@@ -448,3 +481,119 @@ def _tile_shifted(
 
         lax.fori_loop(0, live_groups, run_group, 0)
         lax.fori_loop(live_groups, n_groups, reset_group, 0)
+
+
+_PIECE = 128  # keys per MXU result pop group
+
+
+def _padded_kt(kh: jax.Array) -> jax.Array:
+    """K^T with the head padded to the 256-deep MXU contraction: [bkv, 256] fp8."""
+    hd, bkv = kh.shape
+    kt = kh.astype(jnp.bfloat16).T
+    kt = jnp.concatenate([kt, jnp.zeros((bkv, 256 - hd), jnp.bfloat16)], axis=1)
+    return kt.astype(kh.dtype)
+
+
+class _MrbRing:
+    """Static ring allocation of one MXU's accumulators (units of 8 result rows)."""
+
+    def __init__(self, base: int, size: int):
+        self.base, self.size, self.next = base, size, 0
+
+    def take(self, n: int) -> int:
+        if self.next + n > self.size:
+            self.next = 0
+        a = self.base + self.next
+        self.next += n
+        return a
+
+
+_RINGS: dict[int, _MrbRing] = {}
+
+
+def _q_chunk_mxu(kht, vt, qt_ref, acc_ref, kv_head, cs, par, q_kv_diff, mask, cfgs):
+    """One compute block on explicitly placed MXUs: QK keys [0, k1) on MXU 0, keys
+    [k1, bkv) and PV on MXU 1, result buffers as rings; the last valu_keys keys' exp2
+    on the VALU (unmasked tiles)."""
+    del par
+    k1 = int(os.environ.get("RPA_EXP_MXU", "0"))
+    piece = int(os.environ.get("RPA_EXP_PIECE", "32"))
+    valu_keys = 0 if mask is not None else int(os.environ.get("RPA_EXP_VALU_KEYS", "0"))
+    hd = cfgs.aligned_kv_head_dim
+    bkv, lanes = kht.shape[0], 256
+    acc_rows = vt.shape[0]
+    pv_accs = acc_rows // 4  # result buffer entries are [8, 128] f32
+    if not _RINGS:
+        _RINGS[0] = _MrbRing(0, 256)
+        _RINGS[1] = _MrbRing(0, 256 - 2 * pv_accs)
+        _RINGS[2] = _MrbRing(256 - 2 * pv_accs, 2 * pv_accs)
+    qt = qt_ref[kv_head, :, cs]
+    assert qt.shape[1] == lanes and bkv % 256 == 0 and k1 % piece == 0
+    qt = jnp.concatenate([qt, jnp.zeros((256 - hd, lanes), qt.dtype)], axis=0)
+    return _qk_issue(kht, qt, k1, piece, bkv), (kht, vt, acc_ref, kv_head, cs, q_kv_diff, mask, cfgs, k1, piece, valu_keys, pv_accs, acc_rows, lanes)
+
+
+def _qk_issue(kht, qt, k1, piece, bkv):
+    if k1:
+        pltpu.matmul_push_rhs(qt, staging_register=0, mxu_index=0)
+    if bkv - k1:
+        pltpu.matmul_push_rhs(qt, staging_register=0, mxu_index=1)
+    addr = []
+    m1_every = int(os.environ.get("RPA_EXP_M1_EVERY", "0"))
+    loaded = set()
+    for i, j in enumerate(range(0, bkv, piece)):
+        if m1_every:
+            mxu = 1 if i % m1_every == m1_every - 1 else 0
+        else:
+            mxu = 0 if j < k1 else 1
+        a = _RINGS[mxu].take(piece // 4)
+        pltpu.matmul_acc_lhs(a, kht[j:j + piece], mxu_index=mxu,
+                             load_staged_rhs=None if mxu in loaded else 0)
+        loaded.add(mxu)
+        addr.append((a, mxu))
+    return addr
+
+
+def _q_chunk_finish(addr, kht, vt, acc_ref, kv_head, cs, q_kv_diff, mask, cfgs, k1, piece, valu_keys, pv_accs, acc_rows, lanes):
+    bkv = kht.shape[0]
+    pa = _RINGS[2].take(pv_accs)
+    ps = []
+    for (a, mxu), j in zip(addr, range(0, bkv, piece)):
+        sj = pltpu.matmul_pop(a, (piece, lanes), jnp.float32, mxu_index=mxu)
+        sj = sj.astype(jnp.bfloat16)
+        if mask is not None:
+            lo, hi = mask
+            diff = q_kv_diff[j:j + piece]
+            m = diff >= lo
+            if hi is not None:
+                m = jnp.logical_and(m, diff < hi)
+            sj = jnp.where(m, sj, cfgs.model.mask_value)
+        ve = int(os.environ.get("RPA_EXP_VALU_EVERY", "0"))
+        on_valu = (ve and mask is None and (j // piece) % ve == ve - 1) or j >= bkv - valu_keys
+        ps.append(_exp2_valu_bf16(sj) if on_valu else jnp.exp2(sj))
+        if (j + piece) % 256 == 0:
+            t = j // 256
+            tile = jnp.concatenate(ps, axis=0)
+            ps = []
+            reg = 1 - t % 2
+            pltpu.matmul_push_rhs(tile, staging_register=reg, mxu_index=1)
+            pltpu.matmul_acc_lhs(pa, vt[:, 256 * t:256 * t + 256], mxu_index=1,
+                                 load_staged_rhs=reg)
+    o_t = pltpu.matmul_pop(pa, (acc_rows, lanes), jnp.float32, mxu_index=1)
+    acc_ref[kv_head, :, cs] = acc_ref[kv_head, :, cs] + o_t
+
+
+_EXP2_C_HALF = (1.0, 0.69314718, 0.24022651, 0.05550411)
+
+
+def _exp2_valu_bf16(x: jax.Array) -> jax.Array:
+    """2^x for bf16 x (|x| < 64) on the VALU: rounding by the 1.5 * 2^7 magic, a cubic
+    on [-0.5, 0.5] in bf16, 2^n from the magic sum's low mantissa bits."""
+    magic = jnp.bfloat16(192.0)
+    t = x + magic
+    f = x - (t - magic)
+    c0, c1, c2, c3 = _EXP2_C_HALF
+    poly = c0 + f * (c1 + f * (c2 + f * c3))
+    u = pltpu.bitcast(t, jnp.uint32)
+    bits = ((u & 0x007F007F) + 0x003F003F) << 7
+    return poly * pltpu.bitcast(bits, jnp.bfloat16)

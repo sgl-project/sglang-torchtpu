@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import os
 import math
 
 import jax
@@ -478,7 +479,14 @@ def rpa_body(
             full_tile = _full_tile(
                 step, schedule_ref, processed_q_len, processed_kv_len, cfgs
             )
-            pl.when(full_tile)(lambda: run_tile(apply_mask=False))
+            def _full():
+                if os.environ.get("RPA_TRACE") == "1":
+                    with jax.named_scope("rpa_full_tile"):
+                        run_tile(apply_mask=False)
+                else:
+                    run_tile(apply_mask=False)
+
+            pl.when(full_tile)(_full)
             pl.when(jnp.logical_not(full_tile))(lambda: run_tile(apply_mask=True))
         transposed.store_tile(step, schedule_ref, acc_scratch_ref, o_vref, cfgs=cfgs)
         return
