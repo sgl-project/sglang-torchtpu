@@ -6,10 +6,14 @@ changes is how state crosses forwards. The reference keeps one cache row per bat
 scalar `start_pos`; here every token carries its own position and its request's ReqToTokenPool
 slot, so one graph serves any mix of prefill chunks and decode steps:
 
-- The model owns its caches, one row per request slot (row 0 is the pool's padding row) and one
-  column per position: raw window KV, compressor inputs, compressed KV, index keys and engram
-  token ids. Each forward writes its tokens first, then gathers what each token may attend to.
-- The sliding window is positions pos-127..pos read from the raw KV cache instead of a ring.
+- The model owns its caches, one row per KV-pool location (`out_cache_loc`; page 0 is the pool's
+  padding page): window KV, compressor inputs, compressed KV, index keys and engram token ids.
+  `loc_table` maps (request slot, position) to a location, so a radix-cached prefix is read from
+  the locations its donor wrote (see dsv41_native/kv_layout.py). Each forward writes its tokens
+  first, then gathers what each token may attend to.
+- Window KV, compressed KV and index keys are stored as fp8 codes plus per-block scales
+  (dsv41_native/kv_quant.py); a read dequantizes to the bf16 the reference's in-place quant gives.
+- The sliding window is positions pos-127..pos read from the window KV cache instead of a ring.
 - A compressed group is pooled by the token that completes it, from the cached compressor inputs;
   a query sees groups below (pos + 1) // ratio, which is what the reference prefill mask and its
   decode slice both give.
@@ -39,6 +43,11 @@ from torch import nn
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+    has_forward_context,
+)
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
@@ -69,12 +78,26 @@ from sglang_tpu.dsv41_native.kernel_ref import (
     scale_f32,
     sparse_attn_gathered,
 )
+from sglang_tpu.dsv41_native.kv_layout import (
+    check_page_layout,
+    group_tail_positions,
+    num_locs,
+    prefix_loc_writes,
+)
+from sglang_tpu.dsv41_native.kv_quant import (
+    CODE_DTYPE,
+    dequant,
+    quantize_fp4_e4m3,
+    quantize_fp4_e8m0,
+    quantize_fp8_ue8m0,
+)
 from sglang_tpu.ep_local_expert_reader import _SAFETENSORS_DTYPES
 
 logger = get_logger(__name__)
 
 FP8_BLOCK = 32  # one fp8 scale per 32x32 weight block / 32 activations
 FP4_BLOCK = 32  # one fp4 scale per 32 elements along K
+COMPRESS_KV_BLOCK = 16  # compressed KV: one E4M3 scale per 16 elements
 SCALE_FMT = "ue8m0"
 # E8M0 scales are kept as raw bytes; kernel_ref.scale_f32 decodes them.
 SCALE_STORAGE = torch.uint8
@@ -101,6 +124,9 @@ class _Args(msgspec.Struct, frozen=True):
 
     max_slots: int  # ReqToTokenPool rows: max_running_requests + the padding row 0
     max_seq_len: int
+    num_locs: (
+        int  # rows of the loc-indexed caches: KV-pool locations incl. the padding page
+    )
     tp_size: int
     tp_rank: int
     vocab_size: int
@@ -144,11 +170,14 @@ class _Args(msgspec.Struct, frozen=True):
     gate_temp: float = 1.0
 
     @classmethod
-    def from_hf_config(cls, config, *, max_slots: int, max_seq_len: int) -> _Args:
+    def from_hf_config(
+        cls, config, *, max_slots: int, max_seq_len: int, num_locs: int
+    ) -> _Args:
         rope_theta, rope = get_rope_config(config)
         return cls(
             max_slots=max_slots,
             max_seq_len=max_seq_len,
+            num_locs=num_locs,
             tp_size=get_parallel().tp_size,
             tp_rank=get_parallel().tp_rank,
             vocab_size=config.vocab_size,
@@ -193,32 +222,88 @@ class _Args(msgspec.Struct, frozen=True):
 
 
 class _TokenCtx(NamedTuple):
-    """Per-token cache addressing, built inside the compiled forward. [T] int64 each."""
+    """Per-token cache addressing, built inside the compiled forward. [T] int32 unless noted.
+
+    A NamedTuple, not a Struct: it is built inside the compiled region."""
 
     positions: torch.Tensor
     slots: (
         torch.Tensor
     )  # ReqToTokenPool row of the token's request; padding tokens use row 0
+    locs: (
+        torch.Tensor
+    )  # KV-pool location the token writes (out_cache_loc); padding writes 0
+    req_idx: torch.Tensor  # batch index of the token's request, clamped to [0, B)
+    batch_slots: torch.Tensor  # [B] ReqToTokenPool row of each request in the batch
+    loc_table: (
+        torch.Tensor
+    )  # [max_slots, max_seq_len] int32: location of (slot, position)
+    decode: bool  # one token per request, so token i belongs to request i
+    first_pos: torch.Tensor  # position of the request's first token in this forward
+    last_pos: torch.Tensor  # position of the request's last token in this forward
 
 
 def _token_ctx(
-    *, positions: torch.Tensor, forward_batch: ForwardBatch
+    *, positions: torch.Tensor, forward_batch: ForwardBatch, loc_table: torch.Tensor
 ) -> tuple[_TokenCtx, torch.Tensor]:
     """Token addressing plus each request's last-token row ([B]), all int32: positions and slots
     feed modulo/divide index math, and XLA's 64-bit emulation aborted the TPU compiler (r6)."""
     req = forward_batch.req_pool_indices.to(torch.int32)
     positions = positions.to(torch.int32)
+    locs = forward_batch.out_cache_loc.to(torch.int32)
     num_tokens = positions.shape[0]
     tok = torch.arange(num_tokens, device=positions.device, dtype=torch.int32)
     if forward_batch.forward_mode.is_decode():
-        return _TokenCtx(positions=positions, slots=req), tok
+        ctx = _TokenCtx(
+            positions=positions,
+            slots=req,
+            locs=locs,
+            req_idx=tok,
+            batch_slots=req,
+            loc_table=loc_table,
+            decode=True,
+            first_pos=positions,
+            last_pos=positions,
+        )
+        return ctx, tok
     # Padded requests have extend_seq_lens 0, so tokens past the real ones land on index B.
     # cumsum/sum of int32 or bool promote to int64 in torch unless dtype is given.
     ends = torch.cumsum(forward_batch.extend_seq_lens, dim=0, dtype=torch.int32)
     req_idx = (tok.unsqueeze(1) >= ends.unsqueeze(0)).sum(1, dtype=torch.int32)
     batch = req.shape[0]
     slots = torch.where(req_idx < batch, req[req_idx.clamp_max(batch - 1)], 0)
-    return _TokenCtx(positions=positions, slots=slots), (ends - 1).clamp_min(0)
+    req_idx = req_idx.clamp_max(batch - 1)
+    lens = forward_batch.extend_seq_lens.to(torch.int32)
+    first_tok = (ends - lens).clamp(0, num_tokens - 1)
+    last_tok = (ends - 1).clamp(0, num_tokens - 1)
+    ctx = _TokenCtx(
+        positions=positions,
+        slots=slots,
+        locs=locs,
+        req_idx=req_idx,
+        batch_slots=req,
+        loc_table=loc_table,
+        decode=False,
+        first_pos=positions[first_tok][req_idx],
+        last_pos=positions[last_tok][req_idx],
+    )
+    return ctx, (ends - 1).clamp_min(0)
+
+
+def _locs_at(
+    loc_table: torch.Tensor, slots: torch.Tensor, pos: torch.Tensor
+) -> torch.Tensor:
+    """KV-pool locations of positions `pos` (any shape broadcasting with `slots`); pos < 0 reads
+    position 0, the caller masks it."""
+    return loc_table[slots, pos.clamp_min(0)]
+
+
+def _group_rows(
+    loc_table: torch.Tensor, slots: torch.Tensor, groups: torch.Tensor, ratio: int
+) -> torch.Tensor:
+    """Compressed-cache rows of `groups` of the requests in `slots`: loc(last token) // ratio."""
+    tail = group_tail_positions(groups.clamp_min(0), ratio)
+    return _locs_at(loc_table, slots, tail) // ratio
 
 
 def _param(shape: tuple[int, ...], dtype: torch.dtype) -> nn.Parameter:
@@ -452,15 +537,15 @@ class _EngramHasher(nn.Module):
         buf("m_limbs", multiplier_limbs(multipliers))
         buf("offsets", offsets)
         buf("token_map", torch.tensor(token_map))
-        buf("cache", torch.zeros(args.max_slots, args.max_seq_len))
+        buf("cache", torch.zeros(args.num_locs))
 
     def forward(self, input_ids: torch.Tensor, ctx: _TokenCtx) -> torch.Tensor:
         """[T] ids -> [1, T, n_engram_layers, n_hash_cols] hash ids (int32)."""
         pos = ctx.positions
-        self.cache[ctx.slots, pos] = self.token_map[input_ids]
+        self.cache[ctx.locs] = self.token_map[input_ids]
         tokens, blocked = [], torch.zeros_like(pos, dtype=torch.bool)
         for shift in range(self.max_ngram_size):
-            source = self.cache[ctx.slots, (pos - shift).clamp_min(0)]
+            source = self.cache[_locs_at(ctx.loc_table, ctx.slots, pos - shift)]
             blocked = blocked | (pos < shift)
             tokens.append(torch.where(blocked, self.pad_id, source))
         tokens = torch.stack(tokens, dim=-1).unsqueeze(0)  # [1, T, max_ngram_size]
@@ -521,8 +606,12 @@ class Engram(nn.Module):
 
 
 class Compressor(nn.Module):
-    """Pools `ratio` consecutive tokens into one pre-RoPE latent with a softmax gate. The inputs of
-    every position are cached, so the token that completes a group pools it from the cache."""
+    """Pools `ratio` consecutive tokens into one pre-RoPE latent with a softmax gate.
+
+    A group's inputs come from this forward's own projections, except the positions before the
+    request's first token here, which an earlier forward of the same request left in a per-slot
+    ring of `ratio` entries. A radix-cached prefix is page-aligned and page_size % ratio == 0, so an
+    extend after a prefix starts a new group and never reads the ring of a fresh slot."""
 
     def __init__(self, args: _Args, layer_id: int):
         super().__init__()
@@ -533,7 +622,7 @@ class Compressor(nn.Module):
         self.wkv = Linear(args.dim, args.head_dim, dtype=dtype)
         if self.ratio > 1:
             self.wgate = Linear(args.dim, args.head_dim, dtype=torch.float32)
-            shape = (args.max_slots, args.max_seq_len, args.head_dim)
+            shape = (args.max_slots, self.ratio, args.head_dim)
             self.register_buffer(
                 "kv_state", torch.zeros(shape, dtype=torch.float32), persistent=False
             )
@@ -545,19 +634,25 @@ class Compressor(nn.Module):
         """x [1, T, dim] -> [1, T, head_dim]: the latent of the group ending at each token."""
         if self.ratio == 1:
             return self.norm(self.wkv(x))
+        r = self.ratio
         dtype, xf = x.dtype, x.float()
-        self.kv_state[ctx.slots, ctx.positions] = self.wkv(xf)[0]
-        self.score_state[ctx.slots, ctx.positions] = self.wgate(xf)[0]
-        group = (
-            ctx.positions.unsqueeze(1)
-            - (self.ratio - 1)
-            + torch.arange(self.ratio, device=x.device, dtype=torch.int32)
+        kv_now, score_now = self.wkv(xf)[0], self.wgate(xf)[0]  # [T, d]
+        offs = torch.arange(r, device=x.device, dtype=torch.int32) - (r - 1)
+        pos = ctx.positions.unsqueeze(1) + offs  # [T, r] positions of the group
+        tok = torch.arange(pos.shape[0], device=x.device, dtype=torch.int32).unsqueeze(
+            1
         )
-        rows, cols = ctx.slots.unsqueeze(1), group.clamp_min(0)
-        kv, score = (
-            self.kv_state[rows, cols],
-            self.score_state[rows, cols],
-        )  # [T, ratio, d]
+        here = pos >= ctx.first_pos.unsqueeze(1)  # computed by this forward
+        src = (tok + offs).clamp_min(0)
+        ring = (ctx.slots.unsqueeze(1), pos.clamp_min(0) % r)
+        kv = torch.where(here.unsqueeze(-1), kv_now[src], self.kv_state[ring])
+        score = torch.where(here.unsqueeze(-1), score_now[src], self.score_state[ring])
+        # a request's last r tokens refill its ring (distinct entries); the others write slot 0
+        tail = ctx.positions > ctx.last_pos - r
+        wslot = torch.where(tail, ctx.slots, 0)
+        wpos = ctx.positions % r
+        self.kv_state[wslot, wpos] = kv_now
+        self.score_state[wslot, wpos] = score_now
         pooled = (kv * score.softmax(dim=1)).sum(dim=1)
         return self.norm(pooled.to(dtype)).unsqueeze(0)
 
@@ -609,29 +704,56 @@ class Indexer(nn.Module):
         if self.owns_k:
             self.wk = Linear(args.head_dim, self.head_dim, dtype=torch.bfloat16)
             self.k_norm = RMSNorm(self.head_dim, args.norm_eps)
-            shape = (args.max_slots, self.num_compressed, self.head_dim)
+            rows = args.num_locs // self.ratio
             self.register_buffer(
-                "k_cache", torch.zeros(shape, dtype=torch.bfloat16), persistent=False
+                "k_cache",
+                torch.zeros(rows, self.head_dim, dtype=CODE_DTYPE),
+                persistent=False,
+            )
+            self.register_buffer(
+                "k_cache_scale",
+                torch.zeros(rows, self.head_dim // FP4_BLOCK, dtype=SCALE_STORAGE),
+                persistent=False,
             )
 
-    def _write_index_k(self, latent, rope_c, write_slots, group, shared) -> None:
+    def _write_index_k(self, latent, rope_c, rows, shared) -> None:
         """Index keys of the groups completed in this forward; latent is pre-RoPE."""
         k = self.k_norm(self.wk(latent))
         k = _rope_tail(k, *rope_c, self.rope_head_dim)
-        k = fp4_act_quant(k, FP4_BLOCK, True)
-        self.k_cache[write_slots, group] = k[0]
-        shared["index_k"] = self.k_cache
+        codes, scales = quantize_fp4_e8m0(k[0], FP4_BLOCK)
+        self.k_cache[rows] = codes
+        self.k_cache_scale[rows] = scales
+        shared["index_k"] = (self.k_cache, self.k_cache_scale)
+
+    def _request_keys(self, ctx: _TokenCtx, shared: dict) -> torch.Tensor:
+        """[B, num_compressed, d] index keys of each request in the batch, dequantized."""
+        codes, scales = shared["index_k"]
+        groups = torch.arange(
+            self.num_compressed, device=codes.device, dtype=torch.int32
+        )
+        rows = _group_rows(
+            ctx.loc_table, ctx.batch_slots.unsqueeze(1), groups, self.ratio
+        )
+        return dequant(codes[rows], scales[rows], torch.bfloat16)
 
     def forward(self, x, qr, rope, ctx: _TokenCtx, shared: dict) -> torch.Tensor:
         """[T, topk] compressed positions per query, -1 where unreachable."""
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         q = fp4_act_quant(_rope_tail(q, *rope, self.rope_head_dim), FP4_BLOCK, True)
-        index_k = shared["index_k"][ctx.slots]  # [T, num_compressed, d]
+        index_k = self._request_keys(ctx, shared)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
-        score = torch.einsum("thd,tcd->thc", q[0], index_k)
-        score = tensor_model_parallel_all_reduce(
-            (score.relu() * weights[0].unsqueeze(-1)).sum(dim=1)
-        )
+        if ctx.decode:
+            assert q.shape[1] == index_k.shape[0], "decode is one token per request"
+            score = torch.einsum("thd,tcd->thc", q[0], index_k)
+            score = (score.relu() * weights[0].unsqueeze(-1)).sum(dim=1)
+        else:
+            # Scores against every request's keys, then each token keeps its own request's;
+            # a single prefill has B == 1, and the cost grows with B.
+            score = torch.einsum("thd,bcd->tbhc", q[0], index_k)
+            score = (score.relu() * weights[0][:, None, :, None]).sum(dim=2)
+            tok = torch.arange(score.shape[0], device=x.device, dtype=torch.int32)
+            score = score[tok, ctx.req_idx]
+        score = tensor_model_parallel_all_reduce(score)
         # a group becomes visible once the query has passed its last token
         compress_lens = ((ctx.positions + 1) // self.ratio).unsqueeze(-1)
         positions = torch.arange(
@@ -689,15 +811,29 @@ class Attention(nn.Module):
         self.is_index_source = layer_id in args.index_source_layers
         self.compressor = Compressor(args, layer_id) if self.is_kv_source else None
         self.indexer = Indexer(args, layer_id) if self.is_index_source else None
-        shape = (args.max_slots, args.max_seq_len, self.head_dim)
         self.register_buffer(
-            "kv_cache", torch.zeros(shape, dtype=torch.bfloat16), persistent=False
+            "kv_cache",
+            torch.zeros(args.num_locs, self.head_dim, dtype=CODE_DTYPE),
+            persistent=False,
+        )
+        self.register_buffer(
+            "kv_cache_scale",
+            torch.zeros(args.num_locs, self.head_dim // FP8_BLOCK, dtype=SCALE_STORAGE),
+            persistent=False,
         )
         if self.is_kv_source:
-            shape = (args.max_slots, args.max_seq_len // self.ratio, self.head_dim)
+            rows = args.num_locs // self.ratio
             self.register_buffer(
                 "compress_kv_cache",
-                torch.zeros(shape, dtype=torch.bfloat16),
+                torch.zeros(rows, self.head_dim, dtype=CODE_DTYPE),
+                persistent=False,
+            )
+            # compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0
+            self.register_buffer(
+                "compress_kv_cache_scale",
+                torch.zeros(
+                    rows, self.head_dim // COMPRESS_KV_BLOCK, dtype=torch.float8_e4m3fn
+                ),
                 persistent=False,
             )
         if self.ratio:
@@ -721,15 +857,18 @@ class Attention(nn.Module):
         """[T, window, d] raw KV at positions pos-window+1..pos, and which of them exist. The KV
         stays fp8-rounded over the whole post-RoPE vector, as the reference stores it."""
         kv = _rope_tail(self.kv_norm(self.wkv(x)), *rope, self.rope_head_dim)
-        kv = act_quant(kv, FP8_BLOCK, SCALE_FMT, torch.float32, True)
-        self.kv_cache[ctx.slots, ctx.positions] = kv[0]
+        codes, scales = quantize_fp8_ue8m0(kv[0], FP8_BLOCK)
+        self.kv_cache[ctx.locs] = codes
+        self.kv_cache_scale[ctx.locs] = scales
         win = self.window_size
         idx = (
             ctx.positions.unsqueeze(1)
             - (win - 1)
             + torch.arange(win, device=x.device, dtype=torch.int32)
         )
-        return self.kv_cache[ctx.slots.unsqueeze(1), idx.clamp_min(0)], idx >= 0
+        rows = _locs_at(ctx.loc_table, ctx.slots.unsqueeze(1), idx)
+        window = dequant(self.kv_cache[rows], self.kv_cache_scale[rows], kv.dtype)
+        return window, idx >= 0
 
     def _write_compressed(self, x, qr, rope, ctx: _TokenCtx, shared: dict):
         """KV-source step: pool completed groups, hand the pre-RoPE latent to the indexer, then
@@ -737,19 +876,20 @@ class Attention(nn.Module):
         latent = self.compressor(x, ctx)
         done = (ctx.positions + 1) % self.ratio == 0
         group = ((ctx.positions + 1) // self.ratio - 1).clamp_min(0)
-        # tokens that complete nothing write the padding row
-        write_slots = torch.where(done, ctx.slots, 0)
+        # the completing token is the group's last, so its loc // ratio is the group's row;
+        # tokens that complete nothing write row 0, inside the padding page
+        rows = torch.where(done, ctx.locs // self.ratio, 0)
         group_pos = (
             group * self.ratio
         )  # a latent stands for the first token of its group
         rope_c = (self.rope_cos[group_pos], self.rope_sin[group_pos])
         if self.indexer is not None and self.indexer.owns_k:
-            self.indexer._write_index_k(latent, rope_c, write_slots, group, shared)
+            self.indexer._write_index_k(latent, rope_c, rows, shared)
         latent = _rope_tail(latent, *rope_c, self.rope_head_dim)
-        # compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0
-        latent = fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
-        self.compress_kv_cache[write_slots, group] = latent[0]
-        shared["compress_kv"] = self.compress_kv_cache
+        codes, scales = quantize_fp4_e4m3(latent[0], COMPRESS_KV_BLOCK)
+        self.compress_kv_cache[rows] = codes
+        self.compress_kv_cache_scale[rows] = scales
+        shared["compress_kv"] = (self.compress_kv_cache, self.compress_kv_cache_scale)
 
     def _compress_kv(self, x, qr, rope, ctx: _TokenCtx, shared: dict):
         """[T, topk, d] compressed KV each query attends to, and which entries are real."""
@@ -758,8 +898,9 @@ class Attention(nn.Module):
         if self.is_index_source:
             shared["topk_idxs"] = self.indexer(x, qr, rope, ctx, shared)
         idxs = shared["topk_idxs"]
-        cache = shared["compress_kv"]
-        return cache[ctx.slots.unsqueeze(1), idxs.clamp_min(0)], idxs >= 0
+        codes, scales = shared["compress_kv"]
+        rows = _group_rows(ctx.loc_table, ctx.slots.unsqueeze(1), idxs, self.ratio)
+        return dequant(codes[rows], scales[rows], torch.bfloat16), idxs >= 0
 
     def forward(self, x: torch.Tensor, ctx: _TokenCtx, shared: dict) -> torch.Tensor:
         rd = self.rope_head_dim
@@ -970,14 +1111,22 @@ class DeepseekV41NativeForCausalLM(nn.Module):
 
     def __init__(self, config, quant_config=None, prefix: str = ""):
         super().__init__()
-        max_running_requests = get_schedule().max_running_requests
-        assert max_running_requests is not None, (
-            "set --max-running-requests: it sizes the model caches"
+        schedule = get_schedule()
+        assert schedule.max_running_requests is not None, (
+            "set --max-running-requests: it sizes the model's loc table"
         )
+        assert schedule.max_total_tokens is not None, (
+            "set --max-total-tokens: it sizes the model's loc-indexed caches"
+        )
+        check_page_layout(page_size=schedule.page_size, ratios=config.compress_ratios)
         args = _Args.from_hf_config(
             config,
-            max_slots=max_running_requests + 1,
+            max_slots=schedule.max_running_requests + 1,
             max_seq_len=process_model_config().context_len,
+            num_locs=num_locs(
+                max_total_tokens=schedule.max_total_tokens,
+                page_size=schedule.page_size,
+            ),
         )
         self.config = config
         self.args = args
@@ -990,18 +1139,51 @@ class DeepseekV41NativeForCausalLM(nn.Module):
         )
         self.norm = RMSNorm(args.dim, args.norm_eps)
         self.head = ParallelHead(args)
+        # (request slot, position) -> KV-pool location; the forward writes its own tokens,
+        # prepare_forward_batch copies radix-cached prefixes from req_to_token.
+        self.register_buffer(
+            "loc_table",
+            torch.zeros(args.max_slots, args.max_seq_len, dtype=torch.int32),
+            persistent=False,
+        )
         logger.info(
-            "DeepSeek-V4.1 native: %d layers, tp=%d rank=%d, %d local experts, %d cache slots x %d positions",
+            "DeepSeek-V4.1 native: %d layers, tp=%d rank=%d, %d local experts, "
+            "%d KV locations, loc table %d slots x %d positions",
             args.n_layers,
             args.tp_size,
             args.tp_rank,
             self.layers[0].ffn.n_local_experts,
+            args.num_locs,
             args.max_slots,
             args.max_seq_len,
         )
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed
+
+    def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        """Copy radix-cached prefix locations into loc_table; runs eagerly before padding."""
+        if has_forward_context():
+            pool = get_token_to_kv_pool()
+            assert pool.size + pool.page_size <= self.args.num_locs, (
+                f"KV pool has {pool.size + pool.page_size} locations but the model caches "
+                f"hold {self.args.num_locs}; --max-total-tokens must bound the pool"
+            )
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if forward_batch.forward_mode.is_decode() or not prefix_lens:
+            return
+        if max(prefix_lens) == 0:
+            return
+        slots = forward_batch.req_pool_indices_cpu
+        if slots is None:
+            slots = forward_batch.req_pool_indices.cpu()
+        rows, cols, locs = prefix_loc_writes(
+            req_to_token=get_req_to_token_pool().req_to_token,
+            slots=slots[: len(prefix_lens)].tolist(),
+            prefix_lens=list(prefix_lens),
+        )
+        device = self.loc_table.device
+        self.loc_table[rows.to(device), cols.to(device)] = locs.to(device)
 
     @torch.no_grad()
     def forward(
@@ -1015,7 +1197,11 @@ class DeepseekV41NativeForCausalLM(nn.Module):
     ) -> LogitsProcessorOutput:
         assert input_embeds is None and pp_proxy_tensors is None
         input_ids = input_ids.to(torch.int32)  # the scheduler passes int64 ids
-        ctx, last = _token_ctx(positions=positions, forward_batch=forward_batch)
+        ctx, last = _token_ctx(
+            positions=positions, forward_batch=forward_batch, loc_table=self.loc_table
+        )
+        # before any cache read: this forward's tokens resolve to the locations they write
+        self.loc_table[ctx.slots, ctx.positions] = ctx.locs
         hashes = self.engram_hash(input_ids, ctx)
         h = self.embed(input_ids).unsqueeze(0)  # [1, T, dim]
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
