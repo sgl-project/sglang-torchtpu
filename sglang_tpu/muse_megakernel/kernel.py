@@ -5198,15 +5198,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                     CH = 8 if use_bd_chunk else min(c.expert_chunk, R)
 
                     def full_one(nrows):
-                        run_ffn_and_store(
-                            nrows,
-                            lambda j: perm_at(off + jnp.minimum(j, cnt - 1)),
-                            slot,
-                            e,
-                            False,
-                            off,
-                            cnt,
-                        )
+                        with _scope(f"ex_f{nrows}"):
+                            run_ffn_and_store(
+                                nrows,
+                                lambda j: perm_at(off + jnp.minimum(j, cnt - 1)),
+                                slot,
+                                e,
+                                False,
+                                off,
+                                cnt,
+                            )
 
                     def chunk(ch, carry_):
                         run_ffn_and_store(
@@ -5222,7 +5223,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None):
                         return carry_
 
                     def run_chunks():
-                        jax.lax.fori_loop(0, (cnt + CH - 1) // CH, chunk, 0)
+                        with _scope("ex_fch"):
+                            jax.lax.fori_loop(0, (cnt + CH - 1) // CH, chunk, 0)
 
                     def bd_chunk_step(ch, carry_):
                         run_ffn_and_store(
