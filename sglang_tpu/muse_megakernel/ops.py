@@ -765,9 +765,29 @@ class MuseMegakernel(torch.nn.Module):
                 (cfg.tiled_vmem_y, 1) if cfg.tiled_vmem_y >= 2 else (cfg.tiled_vmem_y,)
             )
             plans = []
-            # QBLOCK: under tile_loops the LLO temporaries stay small, so VMEM Y reaches 208
-            # rows of 8 and streamed Y keeps the VMEM pads and pair collectives up to 256
-            # (q8 cc21 at 32k: 41.8 ms on the plain streamed-Y plan, 34.9 ms on VMEM Y).
+            for vy in vys:
+                c_vy = (
+                    msgspec.structs.replace(cfg, tiled_vmem_y=vy)
+                    if vy != cfg.tiled_vmem_y
+                    else cfg
+                )
+                b_vy = (
+                    _TILED_VY2_VMEM_BUDGET
+                    if vy >= 2
+                    else (
+                        (
+                            _TILED_VPADS_SMALL_VMEM_BUDGET
+                            if rows <= 128
+                            else _TILED_VPADS_VMEM_BUDGET
+                        )
+                        if cfg.tiled_vmem_pads
+                        else _SCRATCH_VMEM_BUDGET
+                    )
+                )
+                plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
+            # QBLOCK, past the VMEM-Y plans above: under tile_loops the LLO temporaries stay
+            # small, so VMEM Y reaches 208 rows of 8 and streamed Y keeps the VMEM pads and pair
+            # collectives up to 256 (q8 cc21 at 32k: 41.4 ms on plain streamed Y, 34.7 ms).
             if cfg.qblock and cfg.tiled_vmem_pads:
                 loops_budget = (
                     _dev_int(
@@ -790,26 +810,6 @@ class MuseMegakernel(torch.nn.Module):
                     plans.append(
                         (c_loops, loops_budget, _TILE_LOOPS_RING_PREFERENCE, False)
                     )
-            for vy in vys:
-                c_vy = (
-                    msgspec.structs.replace(cfg, tiled_vmem_y=vy)
-                    if vy != cfg.tiled_vmem_y
-                    else cfg
-                )
-                b_vy = (
-                    _TILED_VY2_VMEM_BUDGET
-                    if vy >= 2
-                    else (
-                        (
-                            _TILED_VPADS_SMALL_VMEM_BUDGET
-                            if rows <= 128
-                            else _TILED_VPADS_VMEM_BUDGET
-                        )
-                        if cfg.tiled_vmem_pads
-                        else _SCRATCH_VMEM_BUDGET
-                    )
-                )
-                plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
             # The y_block_send VMEM-Y alternative fails the numerics test at 192 rows of 8
             # (layer 4, global attention + fp8 experts: rows off by 25.6% against the CPU
             # reference; the VMEM-Y and streamed-Y plans pass): off unless asked for.
