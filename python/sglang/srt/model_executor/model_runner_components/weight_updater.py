@@ -387,7 +387,10 @@ class WeightUpdater:
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        if torch.device(self.device).type == "cpu" or not torch.accelerator.is_available():
+        if (
+            torch.device(self.device).type == "cpu"
+            or not torch.accelerator.is_available()
+        ):
             infered_device = "cpu"
         else:
             infered_device = torch.accelerator.current_device_index()
