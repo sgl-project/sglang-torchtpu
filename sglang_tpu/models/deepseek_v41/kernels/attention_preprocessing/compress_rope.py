@@ -65,7 +65,7 @@ def _encode_csa2(values):
     return jax.lax.bitcast_convert_type(words, jnp.int32), scale
 
 
-def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks):
+def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks, precision):
     refs = list(refs)
     # Ratio-2-only refs; ratio 1 never reads them.
     unused: Any = None
@@ -240,6 +240,10 @@ def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks):
         )
     else:
         values = product
+    if precision == "core_finish_bf16":
+        # Core ratio-1 nn.Linear emits BF16, and finish rounds pooled values
+        # before FP32 RMSNorm. Keep the original gamma precision until multiply.
+        values = values.astype(jnp.bfloat16).astype(jnp.float32)
     inv_rms = jax.lax.rsqrt(jnp.mean(values * values, axis=-1, keepdims=True) + eps)
     latent = (values * inv_rms * gamma_ref[...].astype(jnp.float32)[None, :]).astype(
         jnp.bfloat16
@@ -369,6 +373,7 @@ def fused_compress_rope(
     *,
     eps: float = 1e-6,
     ratio: int = 2,
+    precision: str = "epic_fp32",
     config: CompressConfig | None = None,
     ring_tables: tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None = None,
 ):
@@ -380,6 +385,9 @@ def fused_compress_rope(
     Ratio-1 layers share the token-position rows of ``qa_rope``/``qb_rope``;
     ratio-2 layers share one group-start block per step.
     ``has_prev`` / ``valid`` are INT32 ``[T, 1]``.
+    ``precision='epic_fp32'`` preserves the existing FP32 pooling/norm path.
+    The opt-in ratio-1-only ``core_finish_bf16`` rounds values to BF16 before
+    FP32 normalization and gamma multiply, matching core's finish boundary.
 
     Ratio 2 only (``state`` is returned as None for ratio 1): ``state`` is
     the compressor state pool, INT32 ``[rows, 128]`` or its two banks (bank
@@ -394,6 +402,10 @@ def fused_compress_rope(
     ``(write_pairs, write_offsets, read_pairs, read_offsets)`` from the same
     stable compaction. This requires unpadded tokens and matching tile offsets.
     """
+    if precision not in ("epic_fp32", "core_finish_bf16"):
+        raise ValueError("Unknown compressor precision mode")
+    if precision == "core_finish_bf16" and ratio != 1:
+        raise ValueError("core_finish_bf16 is validated for ratio 1 only")
     tokens, hidden = x.shape
     width = ratio * _DIM
     if ratio not in (1, 2):
@@ -495,6 +507,7 @@ def fused_compress_rope(
             tb=tb,
             chunk=config.weight_chunk,
             banks=banks,
+            precision=precision,
         ),
         grid_spec=grid_spec,
         out_shape=(
