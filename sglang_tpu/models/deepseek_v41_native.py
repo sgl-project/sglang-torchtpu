@@ -105,6 +105,10 @@ FP4_BLOCK = 32  # one fp4 scale per 32 elements along K
 SCALE_FMT = "ue8m0"
 # E8M0 scales are kept as raw bytes; kernel_ref.scale_f32 decodes them.
 SCALE_STORAGE = torch.uint8
+# Target size of one chunk's temporaries in the indexer and attention; arbitrary, not tuned.
+# Unchunked, a 16384-token prefill needed 126.58G of temporaries against 94.74G of HBM, and a
+# 768-row decode gathered [768, 98304, 128] bf16 index keys (18 GiB) in one go.
+_CHUNK_BYTES = 2 << 30
 # Bound on one readinto() while reading an engram row range (not tuned).
 _READ_CHUNK_BYTES = 64 * 1024 * 1024
 _EXPERT_RE = re.compile(
@@ -322,6 +326,20 @@ def _after(x: torch.Tensor, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
     if x.device.type != "tpu":
         return (x, *tensors)
     return tuple(torch.ops.tpu._optimization_barrier([x, *tensors]))
+
+
+def _row_chunks(num_rows: int, row_bytes: int) -> list[tuple[int, int]]:
+    """[start, stop) row ranges whose temporaries take about _CHUNK_BYTES each."""
+    size = max(1, _CHUNK_BYTES // row_bytes)
+    return [(s, min(s + size, num_rows)) for s in range(0, num_rows, size)]
+
+
+def _in_order(prev: Optional[torch.Tensor], *tensors: torch.Tensor):
+    """`tensors`, held back until `prev` (the previous chunk's output) is computed, so XLA runs
+    the chunks one at a time instead of keeping every chunk's temporaries live at once."""
+    if prev is None:
+        return tensors
+    return _after(prev, *tensors)[1:]
 
 
 def linear(
@@ -730,53 +748,94 @@ class Indexer(nn.Module):
         self.k_cache_scale[rows] = scales
         shared["index_k"] = (self.k_cache, self.k_cache_scale)
 
-    def _request_keys(self, ctx: _TokenCtx, shared: dict) -> torch.Tensor:
-        """[B, num_compressed, d] index keys of each request in the batch, dequantized."""
+    def _request_keys(
+        self, loc_table: torch.Tensor, slots: torch.Tensor, shared: dict
+    ) -> torch.Tensor:
+        """[len(slots), num_compressed, d] index keys of the requests in `slots`, dequantized."""
         codes, scales = shared["index_k"]
         groups = torch.arange(
             self.num_compressed, device=codes.device, dtype=torch.int32
         )
-        rows = _group_rows(
-            ctx.loc_table, ctx.batch_slots.unsqueeze(1), groups, self.ratio
-        )
+        rows = _group_rows(loc_table, slots.unsqueeze(1), groups, self.ratio)
         return dequant(codes[rows], scales[rows], torch.bfloat16)
 
-    def forward(self, x, qr, rope, ctx: _TokenCtx, shared: dict) -> torch.Tensor:
-        """[T, topk] compressed positions per query, -1 where unreachable."""
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        q = fp4_act_quant(_rope_tail(q, *rope, self.rope_head_dim), FP4_BLOCK, True)
-        index_k = self._request_keys(ctx, shared)
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+    def _chunk_scores(
+        self, q, weights, slots, req_idx, ctx: _TokenCtx, index_k, shared
+    ):
+        """[rows, num_compressed] scores of one chunk of query rows, summed over local heads.
+        Decode passes the chunk's request slots, prefill its tokens' batch indices."""
         if ctx.decode:
-            assert q.shape[1] == index_k.shape[0], "decode is one token per request"
-            score = torch.einsum("thd,tcd->thc", q[0], index_k)
-            score = (score.relu() * weights[0].unsqueeze(-1)).sum(dim=1)
-        else:
-            # Scores against every request's keys, then each token keeps its own request's;
-            # a single prefill has B == 1, and the cost grows with B.
-            score = torch.einsum("thd,bcd->tbhc", q[0], index_k)
-            score = (score.relu() * weights[0][:, None, :, None]).sum(dim=2)
-            tok = torch.arange(score.shape[0], device=x.device, dtype=torch.int32)
-            score = score[tok, ctx.req_idx]
-        score = tensor_model_parallel_all_reduce(score)
+            # token i is request i, so the chunk gathers only its own requests' keys
+            keys = self._request_keys(ctx.loc_table, slots, shared)
+            score = torch.einsum("thd,tcd->thc", q, keys)
+            return (score.relu() * weights.unsqueeze(-1)).sum(dim=1)
+        # Scores against every request's keys, then each token keeps its own request's;
+        # a single prefill has B == 1, and the cost grows with B.
+        score = torch.einsum("thd,bcd->tbhc", q, index_k)
+        score = (score.relu() * weights[:, None, :, None]).sum(dim=2)
+        tok = torch.arange(q.shape[0], device=q.device, dtype=torch.int32)
+        return score[tok, req_idx]
+
+    def _chunk_topk(self, score, positions, candidates):
+        """[rows, topk] picks from all-reduced scores; returns (picks, candidate mask or None)."""
         # a group becomes visible once the query has passed its last token
-        compress_lens = ((ctx.positions + 1) // self.ratio).unsqueeze(-1)
-        positions = torch.arange(
-            self.num_compressed, device=x.device, dtype=torch.int32
+        compress_lens = ((positions + 1) // self.ratio).unsqueeze(-1)
+        groups = torch.arange(
+            self.num_compressed, device=score.device, dtype=torch.int32
         )
-        score = score.masked_fill(positions >= compress_lens, -torch.inf)
+        score = score.masked_fill(groups >= compress_lens, -torch.inf)
+        keep = None
         if self.is_candidate_source:
-            shared["candidates"] = select_candidate_blocks(
+            keep = select_candidate_blocks(
                 score,
                 compress_lens,
                 self.candidate_topk_blocks,
                 self.candidate_block_size,
             )
         elif self.uses_candidates:
-            score = score.masked_fill(~shared["candidates"], -torch.inf)
+            score = score.masked_fill(~candidates, -torch.inf)
         idxs = score.topk(self.topk, dim=-1, sorted=False).indices.sort(dim=-1).values
         idxs = idxs.to(torch.int32)
-        return torch.where(idxs < compress_lens, idxs, -1)
+        return torch.where(idxs < compress_lens, idxs, -1), keep
+
+    def forward(self, x, qr, rope, ctx: _TokenCtx, shared: dict) -> torch.Tensor:
+        """[T, topk] compressed positions per query, -1 where unreachable.
+
+        Every step is per query row, so the rows run in chunks: decode gathers each request's
+        whole key history ([B, context / ratio, d]) and a prefill scores every token against
+        the whole context ([T, context / ratio]), neither of which fits HBM at target load."""
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q = fp4_act_quant(_rope_tail(q, *rope, self.rope_head_dim), FP4_BLOCK, True)
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+        num_tokens, c = q.shape[1], self.num_compressed
+        if ctx.decode:
+            assert num_tokens == ctx.batch_slots.shape[0], (
+                "decode is one token per request"
+            )
+            index_k = None
+            # gathered fp8 keys, their bf16 copy, scores and masks
+            row_bytes = c * (3 * self.head_dim + 32)
+        else:
+            index_k = self._request_keys(ctx.loc_table, ctx.batch_slots, shared)
+            row_bytes = c * (4 * self.n_local_heads * index_k.shape[0] + 32)
+        picks, keeps, prev = [], [], None
+        for s, e in _row_chunks(num_tokens, row_bytes):
+            # the slots feed the decode key gather, so they wait for the previous chunk too
+            q_c, w_c, slots_c = _in_order(
+                prev, q[0, s:e], weights[0, s:e], ctx.batch_slots[s:e]
+            )
+            score = self._chunk_scores(
+                q_c, w_c, slots_c, ctx.req_idx[s:e], ctx, index_k, shared
+            )
+            score = tensor_model_parallel_all_reduce(score)
+            candidates = shared["candidates"][s:e] if self.uses_candidates else None
+            idxs, keep = self._chunk_topk(score, ctx.positions[s:e], candidates)
+            picks.append(idxs)
+            keeps.append(keep)
+            prev = idxs
+        if self.is_candidate_source:
+            shared["candidates"] = torch.cat(keeps)
+        return torch.cat(picks)
 
 
 class Attention(nn.Module):
@@ -865,21 +924,25 @@ class Attention(nn.Module):
         self.register_buffer("rope_cos", cos.to(device), persistent=False)
         self.register_buffer("rope_sin", sin.to(device), persistent=False)
 
-    def _window_kv(self, x, rope, ctx: _TokenCtx):
-        """[T, window, d] raw KV at positions pos-window+1..pos, and which of them exist. The KV
-        stays fp8-rounded over the whole post-RoPE vector, as the reference stores it."""
+    def _write_window(self, x, rope, ctx: _TokenCtx) -> None:
+        """Store this forward's raw KV, fp8-rounded over the whole post-RoPE vector as the
+        reference stores it."""
         kv = _rope_tail(self.kv_norm(self.wkv(x)), *rope, self.rope_head_dim)
         codes, scales = quantize_fp8_ue8m0(kv[0], FP8_BLOCK)
         self.kv_cache[ctx.locs] = codes
         self.kv_cache_scale[ctx.locs] = scales
+
+    def _window_kv(self, loc_table, positions, slots):
+        """[rows, window, d] raw KV at positions pos-window+1..pos, and which of them exist."""
         win = self.window_size
         idx = (
-            ctx.positions.unsqueeze(1)
+            positions.unsqueeze(1)
             - (win - 1)
-            + torch.arange(win, device=x.device, dtype=torch.int32)
+            + torch.arange(win, device=positions.device, dtype=torch.int32)
         )
-        rows = _locs_at(ctx.loc_table, ctx.slots.unsqueeze(1), idx)
-        window = dequant(self.kv_cache[rows], self.kv_cache_scale[rows], kv.dtype)
+        rows = _locs_at(loc_table, slots.unsqueeze(1), idx)
+        # wkv and kv_norm output bf16, so the cache reads back as bf16
+        window = dequant(self.kv_cache[rows], self.kv_cache_scale[rows], torch.bfloat16)
         return window, idx >= 0
 
     def _write_compressed(self, x, qr, rope, ctx: _TokenCtx, shared: dict):
@@ -908,19 +971,55 @@ class Attention(nn.Module):
             self.compress_kv_cache_rope,
         )
 
-    def _compress_kv(self, x, qr, rope, ctx: _TokenCtx, shared: dict):
-        """[T, topk, d] compressed KV each query attends to, and which entries are real."""
+    def _compressed_picks(self, x, qr, rope, ctx: _TokenCtx, shared: dict):
+        """[T, topk] compressed groups each query attends to, -1 where unreachable."""
         if self.is_kv_source:
             self._write_compressed(x, qr, rope, ctx, shared)
         if self.is_index_source:
             shared["topk_idxs"] = self.indexer(x, qr, rope, ctx, shared)
-        idxs = shared["topk_idxs"]
+        return shared["topk_idxs"]
+
+    def _compressed_kv(self, loc_table, slots, idxs, shared: dict):
+        """[rows, topk, d] compressed KV of the picked groups, and which entries are real."""
         codes, scales, rope_part = shared["compress_kv"]
-        rows = _group_rows(ctx.loc_table, ctx.slots.unsqueeze(1), idxs, self.ratio)
+        rows = _group_rows(loc_table, slots.unsqueeze(1), idxs, self.ratio)
         kv = dequant_lane_periodic(
             codes[rows], scales[rows], rope_part[rows], torch.bfloat16
         )
         return kv, idxs >= 0
+
+    def _attend(self, q, ctx: _TokenCtx, idxs, shared: dict) -> torch.Tensor:
+        """[1, T, h, d] sparse attention over the window plus the picked compressed rows.
+
+        Each query row is independent, so the rows run in chunks: one forward's gathered KV is
+        [T, window + topk, d], 20 GiB per layer in fp32 for a 16384-token prefill."""
+        width = self.window_size + (0 if idxs is None else idxs.shape[1])
+        # fp8 codes, the bf16 dequant and the two fp32 copies sparse_attn_gathered makes
+        row_bytes = width * self.head_dim * 11
+        outs, prev = [], None
+        for s, e in _row_chunks(q.shape[1], row_bytes):
+            # the gathers index by positions and slots, so those wait for the previous chunk
+            parts = [q[:, s:e], ctx.positions[s:e], ctx.slots[s:e]]
+            if idxs is not None:
+                parts.append(idxs[s:e])
+            q_c, pos_c, slots_c, *rest = _in_order(prev, *parts)
+            kv, valid = self._window_kv(ctx.loc_table, pos_c, slots_c)
+            if idxs is not None:
+                ckv, cvalid = self._compressed_kv(
+                    ctx.loc_table, slots_c, rest[0], shared
+                )
+                kv = torch.cat([kv, ckv], dim=1)
+                valid = torch.cat([valid, cvalid], dim=1)
+            o = sparse_attn_gathered(
+                q_c,
+                kv.unsqueeze(0),
+                valid.unsqueeze(0),
+                self.attn_sink,
+                self.softmax_scale,
+            )
+            outs.append(o)
+            prev = o
+        return torch.cat(outs, dim=1)
 
     def forward(self, x: torch.Tensor, ctx: _TokenCtx, shared: dict) -> torch.Tensor:
         rd = self.rope_head_dim
@@ -928,14 +1027,10 @@ class Attention(nn.Module):
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         q = _rope_tail(q, *rope, rd)
-        kv, valid = self._window_kv(x, rope, ctx)
-        if self.ratio:
-            compress_kv, compress_valid = self._compress_kv(x, qr, rope, ctx, shared)
-            kv = torch.cat([kv, compress_kv], dim=1)
-            valid = torch.cat([valid, compress_valid], dim=1)
-        o = sparse_attn_gathered(
-            q, kv.unsqueeze(0), valid.unsqueeze(0), self.attn_sink, self.softmax_scale
-        )
+        # every write of this forward lands before any chunk reads the caches
+        self._write_window(x, rope, ctx)
+        idxs = self._compressed_picks(x, qr, rope, ctx, shared) if self.ratio else None
+        o = self._attend(q, ctx, idxs, shared)
         o = _rope_tail(o, rope[0], -rope[1], rd)
         # wo_a is block-diagonal over groups, hence einsum; o is fp8-rounded first
         o = o.view(1, o.size(1), self.n_local_groups, -1)
