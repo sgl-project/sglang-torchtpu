@@ -189,7 +189,12 @@ def run_decode(args, records: harness.Records) -> None:
         num_slots=Control.total_slots(sub_base) if args.dspark else sub_base,
         batch_sizes=sizes,
     )
-    pools = k3.Pools(blocks, pages, 1, pattern=True)
+    from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_decode
+
+    # Kimi-K3.1 (the indexer's families pre-sharded): index-key pools too.
+    ops.load_weights()  # once; the decoder's bind reuses them
+    index = all(name in ops.weights for name in dsa_decode.FAMILIES)
+    pools = k3.Pools(blocks, pages, 1, pattern=True, index=index)
 
     # Serving's DSpark schedule: seven drafts through batch four, three
     # through eight, none above. --spec-drafts: that many at every batch;
@@ -243,7 +248,8 @@ def run_decode(args, records: harness.Records) -> None:
     harness.sync()
     decoder.warmup()
     harness.log(
-        f"warm: {len(pools.tensors)} pools of {blocks} blocks, batch sizes {sizes}"
+        f"warm: {len(pools.tensors)} pools of {blocks} blocks"
+        f"{' + DSA index pools' if index else ''}, batch sizes {sizes}"
     )
     sampling = (args.temperature, 0.95 if args.temperature > 0 else 1.0, 0, 7)
 
@@ -375,7 +381,9 @@ def run_prefill(args, records: harness.Records) -> None:
         max_model_len // k3.LOGICAL,
         max_model_len // k3.PAGE,
         pattern=True,
+        index="d_wk" in prefiller.program.weights.get("mla", {}),
     )
+    prefiller.index_pools = list(pools.index_pools)
     prefiller.bind_kv_caches(pools.caches, pools.groups)
     prefiller.warmup()
     harness.sync()

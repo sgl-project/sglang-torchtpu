@@ -54,7 +54,12 @@ class Pools:
     block."""
 
     def __init__(
-        self, num_blocks: int, mla_width: int, state_width: int, pattern: bool = False
+        self,
+        num_blocks: int,
+        mla_width: int,
+        state_width: int,
+        pattern: bool = False,
+        index: bool = False,
     ) -> None:
         import torch
 
@@ -106,6 +111,15 @@ class Pools:
             )
             for g in range(3)
         ]
+        # Kimi-K3.1: the MLA layers' DSA index-key pools (rows aligned with
+        # the blocks); under ``pattern`` every token holds a random FP8 key at
+        # scale 1, the same on every rank.
+        self.index_pools = []
+        if index:
+            self.index_pools = [
+                block.to("tpu").repeat(num_blocks, 1, 1, 1)
+                for block in [index_block(cache, pattern)] * 24
+            ]
         self.num_blocks = num_blocks
         self.mla_width, self.state_width = mla_width, state_width
         self._next = 1
@@ -134,6 +148,27 @@ class Pools:
         return (padded(mla, self.mla_width),) + tuple(
             padded(t, self.state_width) for t in kda
         )
+
+
+def index_block(cache, pattern: bool):
+    """One block of a Kimi-K3.1 index-key pool (``layout.index_block_shape``):
+    per 128-token subpage, token ``t``'s FP8 key at row ``t // 4``, sublane
+    ``t % 4``, and its UE8M0 scale byte at row 32, sublane 0, lane ``t``."""
+    import ml_dtypes
+    import torch
+
+    from sglang_tpu.k3_programs.kimi_k3 import layout
+
+    shape = layout.index_block_shape(cache)
+    if not pattern:
+        return torch.zeros((1, *shape), dtype=torch.uint8)
+    subpages = cache.tokens_per_block // layout.INDEX_SUBPAGE_TOKENS
+    rng = np.random.default_rng(1)
+    keys = (rng.standard_normal((subpages, 32, 4, 128)) * 0.5).astype(ml_dtypes.float8_e4m3fn)
+    rows = np.zeros((subpages, layout.INDEX_SUBPAGE_ROWS, 4, 128), np.uint8)
+    rows[:, :32] = keys.view(np.uint8)
+    rows[:, 32, 0] = 127  # 2^0
+    return torch.from_numpy(rows.reshape(1, *shape))
 
 
 def engine_config(
@@ -192,6 +227,7 @@ def decoder(
         num_speculative_tokens_per_batch_size=schedule,
     )
     decoder = KimiDecoder(config, ops, draft if schedule else None, tp_rank=ops.rank)
+    decoder.index_pools = list(pools.index_pools)
     decoder.bind_kv_caches(pools.caches, pools.groups)
     return decoder
 
