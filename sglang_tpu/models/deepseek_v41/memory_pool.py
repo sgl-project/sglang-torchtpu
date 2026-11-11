@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence, Tuple
 from unittest.mock import patch
 
@@ -39,11 +40,42 @@ from sglang.srt.mem_cache.memory_pool import get_tensor_size_bytes
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import ceil_div
 from sglang_tpu.dsv4.dsv4_memory_pool import _zeros_kv_buffer
-from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
-    PAGE_RECORDS,
-    PAGE_ROWS,
-    PackedFP8Layout,
-)
+
+try:
+    from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
+        PAGE_RECORDS,
+        PAGE_ROWS,
+        PackedFP8Layout,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "jax" and not (exc.name or "").startswith("jax."):
+        raise
+    PAGE_RECORDS = 128
+    PAGE_ROWS = 33
+
+    @dataclass(frozen=True)
+    class PackedFP8Layout:  # type: ignore[no-redef]
+        """Pure-Python layout fallback when JAX is absent (CPU unit tests)."""
+
+        pages: int
+        page_stride: int = PAGE_ROWS
+        page_offset: int = 0
+        page_size: int = PAGE_RECORDS
+
+        @property
+        def page_rows(self) -> int:
+            return (PAGE_ROWS * self.page_size + PAGE_RECORDS - 1) // PAGE_RECORDS
+
+        def validate(self, bank_rows: Tuple[int, ...]) -> None:
+            if (
+                self.pages < 1
+                or self.page_stride < self.page_rows
+                or self.page_offset < 0
+                or len(bank_rows) != 1
+                or self.page_offset + self.pages * self.page_stride > bank_rows[0]
+            ):
+                raise ValueError("Packed FP8 page addresses exceed their owners")
+
 
 logger = logging.getLogger(__name__)
 
