@@ -1,7 +1,9 @@
 """Tests for the Muse megakernel's per-step config selection (host-only; needs jax)."""
 
 import unittest
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -184,7 +186,7 @@ class TestMuseMegakernelConfig(CustomTestCase):
     def test_ep_steps_validate(self):
         # the EP kernel validates ep_mk_config's config (no VMEM Y, no single-row collectives)
         for q, n_req in ((1, 1), (8, 2), (8, 8), (8, 16)):
-            for pool in ({}, _FP8_SAL):
+            for pool in ({}, _FP8_SAL, {"unified_kv": True, **_FP8_SAL}):
                 with self.subTest(q=q, n_req=n_req, **pool):
                     cfg = _raw_config(_megakernel(moe_mode="ep"), q, n_req, **pool)
                     self.assertEqual(cfg.row_tile, 16)
@@ -194,6 +196,250 @@ class TestMuseMegakernelConfig(CustomTestCase):
         groups = ops.expert_groups_of(_KINDS, 15)
         self.assertEqual(groups, ((1, 16), (16, 31), (31, 46), (46, 61)))
         self.assertEqual(ops.expert_groups_of(_KINDS, 0), ())
+
+    @staticmethod
+    @contextmanager
+    def _mock_tpu7x():
+        from jax._src.pallas.mosaic import tpu_info
+        from jax.experimental.pallas import tpu as pltpu
+
+        import sglang_tpu.pallas_export as pallas_export
+
+        try:
+            from jax._src import tpu_info as core_tpu_info
+
+            modules = (tpu_info, core_tpu_info)
+        except ImportError:
+            modules = (tpu_info,)
+        info = tpu_info.get_tpu_info_for_chip(
+            tpu_info.chip_version_from_device_kind("TPU7x"), 1
+        )
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(pltpu, "get_tpu_info", lambda: info))
+            for mod in modules:
+                stack.enter_context(patch.object(mod, "get_tpu_info", lambda: info))
+                stack.enter_context(
+                    patch.object(mod, "get_device_kind", lambda: "TPU7x")
+                )
+                stack.enter_context(patch.object(mod, "is_tpu_device", lambda: True))
+            stack.enter_context(
+                patch.object(
+                    pallas_export, "get_pallas_tpu_device_kind", lambda: "TPU7x"
+                )
+            )
+            if len(modules) == 1:
+                stack.enter_context(
+                    patch.object(pallas_export, "tpu_info_for_cpu_export", nullcontext)
+                )
+            yield
+
+    def test_unified_kv_maps_and_pool_validation(self):
+        import torch
+
+        from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
+        from sglang_tpu.unified_kv_pool import AttnLayerSpec, TpuUnifiedSWAKVPool
+
+        gl = _GEOMETRY.global_layers
+        swa_ids = [i for i in range(_LAYERS) if i not in set(gl)]
+        buf_map, grp_map = ops.unified_kv_maps(_LAYERS, gl)
+        self.assertEqual((max(buf_map) + 1, max(grp_map) + 1), (16, 3))
+
+        def mk_pool(cls, dt, ps=16, fids=gl, sids=swa_ids):
+            f_spec = AttnLayerSpec(2, 64, fids)
+            s_spec = AttnLayerSpec(2, 64, sids)
+            return TpuUnifiedSWAKVPool(
+                size=2 * ps,
+                page_size=ps,
+                dtype=dt,
+                full=f_spec,
+                swa=s_spec,
+                device="cpu",
+                token_to_kv_pool_class=cls,
+            )
+
+        with self._mock_tpu7x():
+            sal = mk_pool(TpuSeqAlongLaneKVPool, torch.bfloat16, 256)
+            self.assertEqual(buf_map, tuple(sal._buffer_idx(i) for i in range(_LAYERS)))
+            self.assertEqual(
+                grp_map, tuple(sal.swa_page_group(i) for i in range(_LAYERS))
+            )
+            ops.MuseMegakernel.check_kv_pools(_megakernel(), sal)
+            b = object.__new__(BaseTpuPallasRpaAttnBackend)
+            b._swa_group_pages = sal.swa_group_pages
+            sp = torch.tensor([1, 2], dtype=torch.int64)
+            s_all = b._build_swa_all_page_indices_cpu(sp)
+            self.assertTrue(torch.equal(s_all[0], sp.to(torch.int32)))
+            self.assertTrue(torch.equal(s_all[1:], sal.swa_group_pages[:, sp]))
+            self.assertEqual(s_all.reshape(-1).data_ptr(), s_all.data_ptr())
+            ops.MuseMegakernel.check_kv_pools(
+                _megakernel(), mk_pool(TpuSeqAlongLaneKVPool, torch.float8_e4m3fn, 256)
+            )
+            fused_u = mk_pool(TpuFusedMHATokenToKVPool, torch.bfloat16)
+            ops.MuseMegakernel.check_kv_pools(_megakernel(kv_packed=False), fused_u)
+            with self.assertRaises(NotImplementedError):
+                ops.MuseMegakernel.check_kv_pools(_megakernel(kv_packed=True), fused_u)
+            with self.assertRaises(NotImplementedError):
+                ops.MuseMegakernel.check_kv_pools(
+                    _megakernel(), mk_pool(TpuSeqAlongLaneKVPool, torch.float32, 256)
+                )
+            with self.assertRaises(ValueError):
+                ops.MuseMegakernel.check_kv_pools(
+                    _megakernel(),
+                    mk_pool(
+                        TpuSeqAlongLaneKVPool,
+                        torch.bfloat16,
+                        256,
+                        gl[:-1],
+                        [*swa_ids, gl[-1]],
+                    ),
+                )
+
+    def test_unified_kv_config_tables_and_mosaic_export(self):
+        import jax
+        import jax.export
+        import jax.numpy as jnp
+
+        from sglang_tpu.muse_megakernel.mk.scratch import scratch_plan
+
+        cfg = _config(_megakernel(kv_packed=False), 4, 2, unified_kv=True)
+        self.assertEqual((cfg.n_kv_buffers, cfg.n_swa_groups), (16, 3))
+        self.assertFalse(ops._swa_window_table(True, 40000, n_swa_groups=1))
+        self.assertTrue(ops._swa_window_table(True, 40000, n_swa_groups=3))
+
+        cfg_sal = ops.MuseMegakernel.config(
+            _megakernel(),
+            rows=16,
+            q=8,
+            n_req=2,
+            n_page_entries=44020,
+            page_size=256,
+            capture=(1,),
+            unified_kv=True,
+            **_FP8_SAL,
+        ).validate()
+        self.assertTrue(cfg_sal.swa_window_table)
+        tp_pad = K.table_entries_padded(cfg_sal)
+        padded = K.pad_table(
+            cfg_sal, jnp.arange(3 * cfg_sal.n_pages_entries, dtype=jnp.int32) + 1
+        )
+        self.assertEqual(padded.shape, (3 * tp_pad,))
+        self.assertIs(K.pad_table(cfg_sal, padded), padded)
+        for sg in range(3):
+            self.assertEqual(int(padded[sg * tp_pad]), 1 + sg * cfg_sal.n_pages_entries)
+        self.assertEqual(
+            dict(scratch_plan(cfg_sal))["psw_win"].shape,
+            (3 * 2 * K.swa_window_entries(cfg_sal),),
+        )
+
+        from jax.sharding import AbstractMesh, NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        mesh = AbstractMesh((8,), ("model",))
+        sh = NamedSharding(mesh, P("model"))
+        L = 5
+
+        def sd(shape, dt):
+            return jax.ShapeDtypeStruct((shape[0] * 8, *shape[1:]), dt, sharding=sh)
+
+        geo = SimpleNamespace(
+            **{**_GEOMETRY.__dict__, "n_layers": L, "global_layers": (1, 4)}
+        )
+        kinds = ("fp8",) + ("fp4",) * (L - 2) + ("fp8",)
+        mk_obj = SimpleNamespace(
+            geo=geo,
+            tp_size=8,
+            kinds=kinds,
+            max_position=8192,
+            chunk_pages=4,
+            kv_packed=False,
+            expert_groups=(),
+            moe_mode="tp",
+        )
+        with self._mock_tpu7x():
+            for n_ent, kw in (
+                (66, {"unified_kv": True}),
+                (22010, {"unified_kv": True, **_FP8_SAL}),
+            ):
+                c = ops.MuseMegakernel.config(
+                    mk_obj,
+                    rows=8,
+                    q=4,
+                    n_req=2,
+                    n_page_entries=2 * n_ent,
+                    page_size=256 if kw.get("kv_sal") else 128,
+                    capture=(1, 4),
+                    **kw,
+                ).validate()
+                B, qd, kd = (
+                    c.n_kv_buffers,
+                    c.q_heads * c.head_dim,
+                    c.kv_heads * c.head_dim,
+                )
+                He, Il = c.expert_hidden, c.inter_local
+                w = {
+                    "rope": sd((c.max_position, 2 * c.head_dim), jnp.float32),
+                    "final_norm": sd((8, c.hidden), jnp.float32),
+                    "smalls": sd((L, K.SMALL_ROWS, c.hidden), jnp.float32),
+                    "wrouter": sd((L, c.hidden, c.n_experts), jnp.bfloat16),
+                    "wqkvg": sd((L, c.hidden, 2 * qd + 2 * kd), jnp.float8_e4m3fn),
+                    "wo": sd((L, qd, c.hidden), jnp.float8_e4m3fn),
+                    "wpool": sd((L, c.hidden, He // 8), jnp.float8_e4m3fn),
+                    "wunpool": sd((L, He, c.hidden // 8), jnp.float8_e4m3fn),
+                }
+                ex_by_k = {
+                    "fp4": [
+                        sd((c.n_experts, He // 8, 2 * Il), jnp.int32),
+                        sd((c.n_experts, He // 16, 2 * Il), jnp.bfloat16),
+                        sd((c.n_experts, Il // 8, He), jnp.int32),
+                        sd((c.n_experts, Il // 16, He), jnp.bfloat16),
+                    ],
+                    "fp8": [
+                        sd((c.n_experts, He // 4, 2 * Il), jnp.int32),
+                        sd((c.n_experts, 2, 2 * Il), jnp.bfloat16),
+                        sd((c.n_experts, Il // 4, He), jnp.int32),
+                        sd((c.n_experts, 2, He), jnp.bfloat16),
+                    ],
+                }
+                kv_s = (
+                    (32, 2 * c.kv_heads, c.head_dim // 4, 4, c.page_size)
+                    if c.kv_sal
+                    else (32, c.page_size, c.kv_heads, 2, K.LANE)
+                )
+                kv_dt = jnp.float8_e4m3fn if c.kv_sal_fp8 else jnp.bfloat16
+                args = (
+                    sd((2,), jnp.int32),
+                    sd((c.rows,), jnp.int32),
+                    sd((c.n_pages_entries,), jnp.int32),
+                    sd((2 * c.n_pages_entries,), jnp.int32),
+                    sd((c.rows, c.hidden), jnp.bfloat16),
+                    *[w[n] for n in K.WEIGHT_NAMES],
+                    *[t for k in kinds for t in ex_by_k[k]],
+                    *[sd(kv_s, kv_dt) for _ in range(B)],
+                )
+                kv0, n_out = len(args) - B, 2 + B
+                mk_c, kvw_c = K.megakernel_call(c), K.kv_write_call(c)
+
+                def _body(*xs, c=c, mk_c=mk_c, kvw_c=kvw_c, kv0=kv0):
+                    psw = K.pad_table(c, xs[3]) if c.swa_window_table else xs[3]
+                    o = mk_c(*xs[:3], psw, *xs[4:])
+                    return (*o[:2], *kvw_c(*xs[:3], psw, o[2], *xs[kv0:]))
+
+                sharded = jax.shard_map(
+                    _body,
+                    mesh=mesh,
+                    in_specs=(P("model"),) * len(args),
+                    out_specs=(P("model"),) * n_out,
+                    check_vma=False,
+                )
+                jit_fn = jax.jit(
+                    lambda *xs, sharded=sharded: tuple(sharded(*xs)),
+                    donate_argnums=tuple(range(kv0, len(args))),
+                    out_shardings=(sh,) * n_out,
+                )
+                with jax._src.config.export_ignore_forward_compatibility(True):
+                    exp = jax.export.export(jit_fn, platforms=["tpu"])(*args)
+                self.assertEqual(len(exp.out_avals), n_out)
 
 
 if __name__ == "__main__":

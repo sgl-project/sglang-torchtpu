@@ -179,8 +179,11 @@ DEFAULT_EXACT = (
     ("fused_c2q8_s", "o_rs_streamed=False"),
     ("fused_c2q8_s", "o_rs_rotate=False"),
     ("fused_c2q8_s", "expert_group=2"),
+    ("fused_c2q8_s", "unified_kv=True"),
+    ("sal_c2q8_s", "unified_kv=True"),
     ("salfp8_c2q8_s", "y_block_send=False"),
     ("salfp8_c2q8_s", "o_rs_streamed=False"),
+    ("salfp8_c2q8_s", "unified_kv=True"),
 )
 
 
@@ -765,8 +768,43 @@ class _Runner:
             for l in range(self.n_layers)
         ]
 
+    def unified_pools(self, case: Case, st: StepInputs):
+        """Pack the L per-layer pools into B = len(global_layers) unified buffers with disjoint
+        page ranges for Full and each SWA group (matching TpuUnifiedSWAKVPool)."""
+        buf_map, grp_map = self.ops.unified_kv_maps(self.n_layers, self.global_layers)
+        b_cnt, m_swa = max(buf_map) + 1, max(grp_map) + 1
+        nf, ns = case.n_req * st.pps, case.n_req * st.swa_pages
+        proto = pool_layout(kv_logical(case, 0, self.rank, 1), case.kv)
+        bufs = [
+            torch.zeros((1 + nf + m_swa * ns, *proto.shape[1:]), dtype=proto.dtype)
+            for _ in range(b_cnt)
+        ]
+        for l in range(self.n_layers):
+            is_gl = l in self.global_layers
+            pages = (nf if is_gl else ns) + 1
+            src = pool_layout(kv_logical(case, l, self.rank, pages), case.kv)
+            off = 0 if is_gl else nf + grp_map[l] * ns
+            src_u = src.view(torch.uint8) if src.dtype == torch.float8_e4m3fn else src
+            dst_u = (
+                bufs[buf_map[l]].view(torch.uint8)
+                if src.dtype == torch.float8_e4m3fn
+                else bufs[buf_map[l]]
+            )
+            dst_u[1 + off : 1 + off + pages - 1].copy_(src_u[1:])
+        psw_u = torch.cat([st.psw + (nf + sg * ns) for sg in range(m_swa)], dim=0)
+        return [b.to(self.device) for b in bufs], st.pf, psw_u
+
     def step(
-        self, case: Case, st: StepInputs, kv: list, expert_group: int, overrides: dict
+        self,
+        case: Case,
+        st: StepInputs,
+        kv: list,
+        expert_group: int,
+        overrides: dict,
+        *,
+        pf: torch.Tensor | None = None,
+        psw: torch.Tensor | None = None,
+        unified_kv: bool = False,
     ):
         """(hidden [rows, H] bf16, aux [rows, L * H] bf16, the MKConfig used); kv updated in place."""
         self.overrides = dict(overrides)
@@ -790,6 +828,7 @@ class _Runner:
                 case.q,
                 case.n_req,
                 capture,
+                unified_kv,
             )
 
         torch._dynamo.reset()
@@ -800,8 +839,8 @@ class _Runner:
         hid, aux = compiled(
             meta,
             st.pos.to(d),
-            st.pf.to(d),
-            st.psw.to(d),
+            (st.pf if pf is None else pf).to(d),
+            (st.psw if psw is None else psw).to(d),
             st.emb.to(d),
             self.weights,
             experts,
@@ -813,16 +852,37 @@ class _Runner:
             )
         return hid.cpu(), aux.cpu(), self.last_cfg
 
-    def new_kv(self, case: Case, st: StepInputs, kv: list) -> torch.Tensor:
+    def new_kv(
+        self,
+        case: Case,
+        st: StepInputs,
+        kv: list,
+        *,
+        pf: torch.Tensor | None = None,
+        psw: torch.Tensor | None = None,
+        unified_kv: bool = False,
+    ) -> torch.Tensor:
         """This step's K/V rows read back from the pools: [L, n_live, kv_heads, 2, head_dim]."""
         ps = _PAGES[case.kv]
+        pf_t = st.pf if pf is None else pf
+        psw_t = st.psw if psw is None else psw
+        buf_map, grp_map = (
+            self.ops.unified_kv_maps(self.n_layers, self.global_layers)
+            if unified_kv
+            else (tuple(range(self.n_layers)), (0,) * self.n_layers)
+        )
+        n_ent = case.n_req * st.pps
         out = []
         for l in range(self.n_layers):
-            tab = st.pf if l in self.global_layers else st.psw
             r = torch.arange(st.n_live)
             pos = st.pos[: st.n_live].long()
-            page = tab[(r // case.q) * st.pps + pos // ps].long()
-            pool = kv[l].cpu()
+            ent = (r // case.q) * st.pps + pos // ps
+            page = (
+                pf_t[ent]
+                if l in self.global_layers
+                else psw_t[grp_map[l] * n_ent + ent]
+            ).long()
+            pool = kv[buf_map[l]].cpu()
             if pool.dtype == torch.float8_e4m3fn:  # index the bytes
                 pool = pool.view(torch.uint8)
             if case.kv == "fused":
@@ -1225,6 +1285,29 @@ def run_case(
         elif k == "expert_group":
             hid2, aux2, cfg2 = runner.step(case, st, kv, v, base)
             applied = cfg2.expert_groups == runner.ops.expert_groups_of(runner.kinds, v)
+        elif k == "unified_kv":
+            if not v:
+                raise ValueError("unified_kv exact check expects unified_kv=True")
+            ukv, upf, upsw = runner.unified_pools(case, st)
+            hid2, aux2, cfg2 = runner.step(
+                case,
+                st,
+                ukv,
+                case.expert_group,
+                base,
+                pf=upf,
+                psw=upsw,
+                unified_kv=True,
+            )
+            new_kv2 = runner.new_kv(case, st, ukv, pf=upf, psw=upsw, unified_kv=True)
+            exp_buf, exp_grp = runner.ops.unified_kv_maps(
+                runner.n_layers, runner.global_layers
+            )
+            applied = (
+                cfg2.kv_buf_map == exp_buf
+                and cfg2.swa_group_map == exp_grp
+                and bool(torch.equal(new_kv, new_kv2))
+            )
         else:
             hid2, aux2, cfg2 = runner.step(
                 case, st, kv, case.expert_group, {**base, k: v}
