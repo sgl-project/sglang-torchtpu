@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+from collections.abc import Callable
 
 import torch
 
@@ -26,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -83,6 +85,39 @@ _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
     SpeculativeAlgorithm.DSPARK: TpuDsparkDraftWorker,
 }
 
+# (target runner) -> whether the registered drafter serves this target.
+BlockDraftWorkerMatcher = Callable[[ModelRunner], bool]
+# (target runner) -> the drafter; it builds the draft ModelRunner.
+BlockDraftWorkerFactory = Callable[[ModelRunner], TpuBlockDraftWorker]
+
+_DRAFT_WORKER_OVERRIDES: dict[
+    SpeculativeAlgorithm, list[tuple[BlockDraftWorkerMatcher, BlockDraftWorkerFactory]]
+] = {}
+
+
+def register_block_draft_worker(
+    *,
+    algorithm: SpeculativeAlgorithm,
+    matches: BlockDraftWorkerMatcher,
+    factory: BlockDraftWorkerFactory,
+) -> None:
+    """Serve `algorithm` with `factory(target_runner)` when `matches(target_runner)`.
+
+    The first registration that matches wins; otherwise _DRAFT_WORKER_CLS applies.
+    The draft ModelRunner does not exist yet when this runs, so `matches` can only
+    read the target runner.
+    """
+    _DRAFT_WORKER_OVERRIDES.setdefault(algorithm, []).append((matches, factory))
+
+
+def _create_draft_worker(
+    *, algorithm: SpeculativeAlgorithm, target_runner: ModelRunner
+) -> TpuBlockDraftWorker:
+    for matches, factory in _DRAFT_WORKER_OVERRIDES.get(algorithm, ()):
+        if matches(target_runner):
+            return factory(target_runner)
+    return _DRAFT_WORKER_CLS[algorithm](target_runner)
+
 
 class TpuBlockSpecWorker(TpuSpecWorker):
     def __init__(
@@ -100,7 +135,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             )
         target_runner = target_worker.model_runner
         self._spec_algorithm = target_runner.spec_algorithm
-        draft_worker = _DRAFT_WORKER_CLS[self._spec_algorithm](target_runner)
+        draft_worker = _create_draft_worker(
+            algorithm=self._spec_algorithm, target_runner=target_runner
+        )
         super().__init__(target_worker, draft_worker, draft_worker.num_drafts)
         # prepare_for_decode gathers the verify window and KV reserve at this width.
         if get_spec().speculative_num_draft_tokens != self.num_verify_rows:
