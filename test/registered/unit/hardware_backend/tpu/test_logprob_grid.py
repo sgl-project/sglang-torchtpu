@@ -449,6 +449,7 @@ def _forward_batch(extend_lens, start_lens, return_logprob=True, mode=None):
         global_num_tokens_for_logprob_cpu=None,
         global_num_tokens_for_logprob_gpu=None,
         mm_input_embeds=None,
+        mix_verify_width=1,
         spec_info=None,
     )
 

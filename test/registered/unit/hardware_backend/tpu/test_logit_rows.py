@@ -99,6 +99,7 @@ class TestLogitRows(CustomTestCase):
         return SimpleNamespace(
             is_prefill_only=False,
             mm_input_embeds=None,
+            mix_verify_width=1,
             input_embeds=None,
             spec_info=None,
             seq_lens=torch.zeros(len(lens), dtype=torch.int32),
