@@ -9,9 +9,13 @@ from typing import Any, NamedTuple
 import numpy as np
 
 LOG2_E = 1.44269504
+# Fixed-m heads compute p = exp2(s - m) for base-2 logits s with one m for every
+# head. A head is admitted when Cauchy-Schwarz bounds |s| by
+# FIXED_M_RING_SAFE_BOUND, and m = floor(bound) - FIXED_M_RECENTER keeps every
+# exp2 argument in [-102, 88]: l and o stay finite in float32, and p * v stays a
+# normal float (TPU flushes subnormals) down to |v| = 2**-24.
 FIXED_M_RECENTER = 88.0
-FIXED_M_SAFE_BOUND = 213.0
-FIXED_M_RING_SAFE_BOUND = FIXED_M_SAFE_BOUND / 2.0
+FIXED_M_RING_SAFE_BOUND = 95.0
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.float32).max)
 NUM_SUBLANES = 8
@@ -316,7 +320,11 @@ def max_row_norm_per_head(x, *, seq_axis: int = 2):
 
 
 def ring_fixed_m_operands(qn_max, mk_h):
-    """Build the (2, heads) scalar-prefetch array for hybrid fixed-m ring attention."""
+    """Build the (2, heads) scalar-prefetch array for hybrid fixed-m ring attention.
+
+    ``qn_max`` is the per-head max query row norm times the base-2 softmax scale,
+    so ``qn_max * mk_h`` bounds the head's base-2 logits.
+    """
     import jax.numpy as jnp
 
     bound = qn_max * mk_h
@@ -325,12 +333,12 @@ def ring_fixed_m_operands(qn_max, mk_h):
     return jnp.stack([m, (bound <= FIXED_M_RING_SAFE_BOUND).astype(jnp.float32)])
 
 
-def fixed_m_update(qk, v, m):
+def fixed_m_update(qk, v, m, scale_log2):
     """Compute one KV sub-block's softmax sum and output at a pinned m."""
     import jax.numpy as jnp
     from jax import lax
 
-    s_curr = jnp.exp2(qk - m)
+    s_curr = jnp.exp2(qk * scale_log2 - m)
     s_cast = s_curr.astype(jnp.bfloat16)
     l_curr = s_curr.sum(axis=0, keepdims=True).astype(jnp.float32)
     o_curr = lax.dot_general(
@@ -339,14 +347,15 @@ def fixed_m_update(qk, v, m):
     return l_curr, o_curr
 
 
-def online_update(qk, v, m_prev):
+def online_update(qk, v, m_prev, scale_log2):
     """Compute one KV sub-block's online-softmax terms."""
     import jax.numpy as jnp
     from jax import lax
 
-    m_curr = qk.max(axis=0)[None, :]
+    # scale_log2 > 0, so scaling the max equals the max of the scaled logits.
+    m_curr = qk.max(axis=0)[None, :] * scale_log2
     m_next = jnp.maximum(m_prev, m_curr)
-    s_curr = jnp.exp2(qk - m_next[0:1])
+    s_curr = jnp.exp2(qk * scale_log2 - m_next[0:1])
     s_cast = s_curr.astype(jnp.bfloat16)
     l_curr = s_curr.sum(axis=0, keepdims=True)
     alpha = jnp.exp2(m_prev - m_next)
@@ -431,6 +440,7 @@ class Blocks(NamedTuple):
         ring_axis: str,
         ring_size: int,
         axis_names: tuple[str, ...],
+        scale_log2: float,
         use_fixed_m: bool = False,
         mk=None,
         interpret: Any = False,
@@ -456,6 +466,7 @@ class Blocks(NamedTuple):
             ring_axis=ring_axis,
             ring_size=ring_size,
             axis_names=axis_names,
+            scale_log2=scale_log2,
             use_fixed_m=use_fixed_m,
             mk=mk,
             interpret=interpret,
@@ -509,6 +520,7 @@ class _KernelConfig(NamedTuple):
     q_sub: int
     axis_names: tuple[str, ...]
     ring_axis: str
+    scale_log2: float
 
 
 class _GridStep(NamedTuple):
@@ -765,7 +777,7 @@ def _online_inner(cfg: _KernelConfig, qk, v_chunk, m_prev, l_prev, o_prev):
     chunk = cfg.bkv_compute_in
     for c in range(0, qk.shape[0], chunk):
         m_next, alpha, l_curr, o_curr = online_update(
-            qk[c : c + chunk], v_chunk[c : c + chunk], m_prev
+            qk[c : c + chunk], v_chunk[c : c + chunk], m_prev, cfg.scale_log2
         )
         o_prev = alpha[0:1, ...] * o_prev + o_curr
         m_prev, l_prev = m_next, l_curr + alpha * l_prev
@@ -776,7 +788,7 @@ def _fixed_inner(cfg: _KernelConfig, qk, v_chunk, m_fix, l_prev, o_prev):
     chunk = cfg.bkv_compute_in
     for c in range(0, qk.shape[0], chunk):
         l_curr, o_curr = fixed_m_update(
-            qk[c : c + chunk], v_chunk[c : c + chunk], m_fix
+            qk[c : c + chunk], v_chunk[c : c + chunk], m_fix, cfg.scale_log2
         )
         l_prev, o_prev = l_prev + l_curr, o_prev + o_curr
     return l_prev, o_prev
@@ -1011,13 +1023,18 @@ def ring_attention_forward(
     ring_axis: str,
     ring_size: int,
     axis_names: tuple[str, ...],
+    scale_log2: float,
     use_fixed_m: bool = False,
     mk=None,
     vmem_limit_bytes: int | None = VMEM_LIMIT_BYTES,
     mask_value: float = DEFAULT_MASK_VALUE,
     interpret: Any = False,
 ):
-    """Launch single-call Pallas ring attention over [B, H, S, D] shards."""
+    """Launch single-call Pallas ring attention over [B, H, S, D] shards.
+
+    ``q`` is unscaled; ``scale_log2`` (softmax scale times log2(e)) multiplies
+    the float32 logits inside the kernel.
+    """
     import jax
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
@@ -1076,6 +1093,7 @@ def ring_attention_forward(
             q_sub=q_sub,
             axis_names=tuple(axis_names),
             ring_axis=ring_axis,
+            scale_log2=scale_log2,
         ),
         grid_spec=grid_spec,
         compiler_params=pltpu.CompilerParams(
@@ -1123,13 +1141,18 @@ def ring_attention_sharded(
     ring_size = jax.lax.axis_size(ring_axis)
     shard_len = q_s.shape[1]
     head_dim = q_s.shape[-1]
-    q_s = (q_s * (scale * LOG2_E)).astype(q_s.dtype)
+    if head_dim != 128:
+        # The tuned tiles and the VMEM model are measured at head_dim 128.
+        raise ValueError(f"ring attention supports head_dim 128, got {head_dim}")
+    # Scaling the bf16 query before QK^T would round it again; the kernel
+    # scales the float32 logits instead.
+    scale_log2 = scale * LOG2_E
 
     mk = None
     if use_fixed_m:
         # Prevent XLA from duplicating Q/K producers into the norm reductions.
         q_s, k_s = jax.lax.optimization_barrier((q_s, k_s))
-        qn_max = max_row_norm_per_head(q_s, seq_axis=1)
+        qn_max = max_row_norm_per_head(q_s, seq_axis=1) * scale_log2
         mk_h = max_row_norm_per_head(k_s, seq_axis=1)
         if q_s.shape[2] != k_s.shape[2]:
             mk_h = jnp.repeat(mk_h, q_s.shape[2] // k_s.shape[2], axis=0)
@@ -1150,6 +1173,7 @@ def ring_attention_sharded(
         ring_axis=ring_axis,
         ring_size=ring_size,
         axis_names=axis_names,
+        scale_log2=scale_log2,
         use_fixed_m=use_fixed_m,
         mk=mk,
         interpret=interpret,
