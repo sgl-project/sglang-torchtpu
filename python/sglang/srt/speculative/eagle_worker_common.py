@@ -607,6 +607,8 @@ def run_eagle_verify(
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
     """
+    # torch.accelerator.current_stream raises for a device that is not the
+    # current accelerator (e.g. CPU), so CPU uses torch.cpu's stub stream.
     fwd_stream = (
         torch.cpu.current_stream()
         if torch.device(device).type == "cpu"

@@ -425,6 +425,8 @@ class NGRAMWorker(BaseSpecWorker):
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
+        # torch.accelerator.current_stream raises for a device that is not the
+        # current accelerator (e.g. CPU), so CPU uses torch.cpu's stub stream.
         fwd_stream = (
             torch.cpu.current_stream()
             if torch.device(self.device).type == "cpu"
