@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )
@@ -29,6 +30,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
@@ -92,8 +94,14 @@ def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
     return scheduler
 
 
-def _make_input_validation_stage() -> InputValidationStage:
-    return InputValidationStage()
+def _make_input_validation_stage(server_args) -> InputValidationStage:
+    # PipelineStage.__init__ reads the global server args. The unit conftest sets
+    # them only under pytest; the TPU CI wrapper runs this module under unittest.
+    with patch(
+        "sglang.multimodal_gen.runtime.server_args.server_args._global_server_args",
+        server_args,
+    ):
+        return InputValidationStage()
 
 
 def _make_generation_req() -> Req:
@@ -111,6 +119,55 @@ def _make_validation_server_args(enable_cfg_parallel: bool) -> MagicMock:
     sa.enable_cfg_parallel = enable_cfg_parallel
     sa.pipeline_config.task_type = ModelTaskType.T2I
     return sa
+
+
+class TestWarmupSequenceShard(unittest.TestCase):
+    """Warmup requests resolve enable_sequence_shard as real requests do in
+    SamplingParams._adjust_visual_fields, so they run the per-rank shapes that
+    serving runs (and the torch.compile prewarm request inherits them)."""
+
+    def _server_args(self, pipeline_config):
+        server_args = _make_bare_scheduler(enable_cfg_parallel=True).server_args
+        server_args.pipeline_config = pipeline_config
+        server_args.num_gpus = 1
+        return server_args
+
+    def _warmup_reqs(self, pipeline_config):
+        server_args = self._server_args(pipeline_config)
+        server_args.enable_torch_compile = True
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(num_frames=81, num_inference_steps=40),
+        ):
+            return build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["832x480"],
+                server_based_warmup=True,
+            )
+
+    def test_sequence_shard_pipeline_warms_up_sharded(self):
+        reqs = self._warmup_reqs(WanT2V480PConfig())
+        self.assertGreater(len(reqs), 1)  # the bucket and its real-path prewarm
+        for req in reqs:
+            self.assertIs(req.sampling_params.enable_sequence_shard, True)
+            self.assertIs(req.sampling_params.adjust_frames, False)
+
+    def test_explicit_opt_out_is_kept(self):
+        server_args = self._server_args(WanT2V480PConfig())
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(num_frames=81, enable_sequence_shard=False),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["832x480"],
+                server_based_warmup=True,
+            )[0]
+        self.assertIs(req.sampling_params.enable_sequence_shard, False)
+
+    def test_other_pipelines_do_not_shard(self):
+        for req in self._warmup_reqs(FluxPipelineConfig()):
+            self.assertIs(req.sampling_params.enable_sequence_shard, False)
 
 
 class TestWarmupReqCfgParallel(unittest.TestCase):
@@ -1188,8 +1245,8 @@ class TestInputValidationCfgParallelSingleBranch(unittest.TestCase):
             "Sanity: the setup must leave do_cfg=False, or this tests nothing.",
         )
 
-        stage = _make_input_validation_stage()
         server_args = _make_validation_server_args(enable_cfg_parallel=True)
+        stage = _make_input_validation_stage(server_args)
 
         with patch.object(InputValidationStage, "_generate_seeds"):
             try:
@@ -1217,8 +1274,8 @@ class TestInputValidationCfgParallelSingleBranch(unittest.TestCase):
             "Sanity: req must enable CFG for this positive-case test.",
         )
 
-        stage = _make_input_validation_stage()
         server_args = _make_validation_server_args(enable_cfg_parallel=True)
+        stage = _make_input_validation_stage(server_args)
 
         with patch.object(InputValidationStage, "_generate_seeds"):
             try:
