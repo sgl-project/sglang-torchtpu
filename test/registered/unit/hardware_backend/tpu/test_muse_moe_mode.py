@@ -11,10 +11,6 @@ from sglang_tpu.muse_megakernel.moe_mode import parse_moe_mode, resolve_moe_mode
 register_tpu_ci(est_time=1, suite="stage-a-test-tpu-unit", chips=1)
 
 
-@unittest.skipUnless(
-    os.environ.get("SGLANG_TPU_RUN_MUSE_MK_TESTS") == "1",
-    "Muse megakernel tests are opt-in: set SGLANG_TPU_RUN_MUSE_MK_TESTS=1",
-)
 class TestMuseMoeMode(CustomTestCase):
     def setUp(self):
         patcher = mock.patch.dict(os.environ)
