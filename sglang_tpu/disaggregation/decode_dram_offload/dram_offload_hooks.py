@@ -45,6 +45,8 @@ from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_victim_pusher im
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     anchor_host_pool,
     deletion_orphans_host_only_child,
+    swa_host_pool,
+    window_tokens,
 )
 from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
     DramOffloadWorkerContext,
@@ -82,14 +84,17 @@ def attach_dram_offload_extension(
 ) -> DramOffloadExtension:
     """Extend ``cache``'s L2 controller to the peer role's DRAM, reached over
     the raiden ``channel``. A decode passes its transfer queue."""
-    host_pool = anchor_host_pool(cache)
-    channel.bind_host_pool(host_pool)
+    host_pool, swa_pool = anchor_host_pool(cache), swa_host_pool(cache)
+    channel.bind_host_pools(host_pool, swa_pool)
+    page_size = int(scheduler.token_to_kv_pool_allocator.page_size)
     ctx = DramOffloadWorkerContext(
         cache=cache,
         host_pool=host_pool,
-        page_size=int(scheduler.token_to_kv_pool_allocator.page_size),
+        page_size=page_size,
         channel=channel,
         lockstep=RankLockstep.of(scheduler),
+        swa_host_pool=swa_pool,
+        window_tokens=window_tokens(cache, page_size),
     )
     extension = (
         PrefillDramOffloadExtension(

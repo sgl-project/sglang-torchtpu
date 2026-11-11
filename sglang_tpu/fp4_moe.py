@@ -263,6 +263,11 @@ def prepare_tpu_nvfp4_moe_weights(
 
         prepare_tpu_fused_rs_post_expert_norm(layer)
         prepare_fused_moe_rs(layer)
+    else:
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.get():
+            scale_dtype = torch.float32
 
     # W13: fold global scale, pad gate/up halves, and rebind before touching W2
     # so single-device PP stages do not hold both layers' temporaries at once.
