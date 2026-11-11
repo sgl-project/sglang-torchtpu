@@ -101,6 +101,10 @@ class K3StatePool:
     """The Mamba pool's stand-in: slot ``i``'s KDA state is its three blocks of
     the unified pools (``UnifiedPoolPlan.state_row``)."""
 
+    # Kimi-K3.1: the index-key pools have rows for the state blocks too
+    # (set by hooks.k3_program before sglang sizes the state pool).
+    dsa = False
+
     slot_allocator_device = "cpu"
     # HybridReqToTokenPool resets GDN ReplaySSM rings on fresh slots; KDA has none.
     replayssm_write_pos = None
@@ -128,14 +132,16 @@ class K3StatePool:
         slot count, and the tails sit beside the slots)."""
         from sglang.srt.runtime_context import get_schedule
 
-        pools = len(MLA) + bridge.DSPARK_DRAFT_LAYERS
-        block = _block_bytes(_kv_cache_dtype())
-        slot_bytes = bridge.KDA_PER_POOL * pools * block
+        dtype = _kv_cache_dtype()
+        block = (len(MLA) + bridge.DSPARK_DRAFT_LAYERS) * _block_bytes(dtype)
+        if cls.dsa:  # Kimi-K3.1: the slot's rows of the 24 index-key pools
+            block += len(MLA) * bridge.index_block_bytes(cache_layout(dtype))
+        slot_bytes = bridge.KDA_PER_POOL * block
         tails = _prefix_tails()
         if not tails:
             return slot_bytes
         slots = int(get_schedule().max_mamba_cache_size or 1) + 1
-        tail_bytes = (1 + bridge.KDA_PER_POOL) * pools * block * tails
+        tail_bytes = (1 + bridge.KDA_PER_POOL) * block * tails
         return slot_bytes + -(-tail_bytes // slots)
 
     def bind(self, plan: bridge.UnifiedPoolPlan, caches: dict[str, torch.Tensor]):

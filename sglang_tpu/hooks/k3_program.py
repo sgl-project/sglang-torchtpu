@@ -280,7 +280,12 @@ def k3_program_no_spec_state_reserve(original, configurator: Any, *args, **kwarg
     if not k3_program_active():
         return original(configurator, *args, **kwargs)
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang_tpu.k3_programs.sglang_pools import K3StatePool, is_k31
 
+    # The state slots' budget counts Kimi-K3.1's index-key rows.
+    K3StatePool.dsa = is_k31(
+        getattr(getattr(configurator, "model_config", None), "hf_config", None)
+    )
     algorithm = configurator.spec_algorithm
     configurator.spec_algorithm = SpeculativeAlgorithm.NONE
     try:
