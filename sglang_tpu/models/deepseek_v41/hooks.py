@@ -72,6 +72,26 @@ tpu_dsv41_engram_hash_ids
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TPU lowers 64-bit integer arithmetic.
 
+tpu_dsv41_int32_input_ids
+  Why: with a vision tower, DeepseekV4ForCausalLM.forward compares int64
+       input_ids against MM_PAD_SHIFT_VALUE and the model compares them with
+       image_token_id inside the fused Engram torch.where; TPU lowering fails
+       on the 64-bit compare ("Unsupported conversion from vmreg/vreg to U64").
+  How: AROUND DeepseekV4ForCausalLM.forward casts V4.1 input_ids to int32 on
+       non-CUDA devices; token ids and multimodal pad ids fit in int32.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: TPU lowers 64-bit integer compares.
+
+tpu_dsv41_torch_hash_ids
+  Why: EngramHasher._torch_hash_ids (the non-CUDA hash path) widens ids,
+       history and positions to int64 before building the predecessor table,
+       so 64-bit compares and gathers reach TPU lowering.
+  How: AROUND _torch_hash_ids builds the same table in int32 on non-CUDA
+       devices and calls compute_engram_hash_ids (itself hooked to the 32-bit
+       op); token ids, positions and MM_PAD_SHIFT_VALUE fit in int32.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: TPU lowers 64-bit integer arithmetic.
+
 trace_tpu_env_default
   Why: EnvField._resolve_default calls callable(self.default) for lazily
        computed defaults (e.g. SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)),
@@ -81,15 +101,6 @@ trace_tpu_env_default
        defaults depend only on the platform, fixed before any model is traced.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: callable env defaults are resolved at import or are traceable.
-tpu_dsv41_engram_hash_ids
-  Why: compute_engram_hash_ids multiplies, XORs and reduces 63-bit hashes in
-       int64; TPU lowering fails on the 64-bit vector values ("Unsupported
-       conversion from vmreg/vreg to U64").
-  How: AROUND compute_engram_hash_ids keeps the original on CUDA; elsewhere
-       runs ops.engram.engram_hash_ids, the same integers on uint32 pairs
-       (vllm-torchtpu epic engram_hash), returning int32 row ids.
-  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
-  Remove when: TPU lowers 64-bit integer vector arithmetic.
 """
 
 from __future__ import annotations
@@ -198,14 +209,6 @@ def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value)
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
 
 
-def tpu_dsv41_engram_hash_ids(original, tokens, blocked, pad_id, *tables):
-    if tokens.is_cuda:
-        return original(tokens, blocked, pad_id, *tables)
-    from sglang_tpu.models.deepseek_v41.ops.engram import engram_hash_ids
-
-    return engram_hash_ids(tokens, blocked, pad_id, *tables)
-
-
 def tpu_dsv41_engram_hash_ids(
     original, tokens, blocked, pad_id, token_map, multipliers, primes, offsets
 ):
@@ -216,6 +219,81 @@ def tpu_dsv41_engram_hash_ids(
     from sglang_tpu.models.deepseek_v41.ops.engram import engram_hash_ids
 
     return engram_hash_ids(tokens, blocked, pad_id)
+
+
+def tpu_dsv41_torch_hash_ids(
+    original, hasher, input_ids, positions, kmode, history, num_real, block, row, starts
+):
+    """EngramHasher._torch_hash_ids with an int32 predecessor table on TPU.
+
+    The original widens ids, history and positions to int64 before hashing;
+    token ids, positions and the multimodal pad shift all fit in int32.
+    """
+    if input_ids.is_cuda:
+        return original(
+            hasher, input_ids, positions, kmode, history, num_real, block, row, starts
+        )
+    from sglang.kernels.ops.embeddings.engram_hash import MODE_DECODE, MODE_VERIFY
+    from sglang.srt.layers.engram import compute_engram_hash_ids
+    from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+    i32 = torch.int32
+    n = hasher.max_ngram_size
+    num_tokens = input_ids.shape[0]
+    device = input_ids.device
+    input_ids = input_ids.to(i32)
+    shifts = torch.arange(n, device=device, dtype=i32)
+    if kmode == MODE_DECODE:
+        tokens = torch.cat([input_ids.unsqueeze(-1), history.to(i32).flip(-1)], dim=-1)
+    else:
+        t = torch.arange(num_real, device=device, dtype=i32)
+        if kmode == MODE_VERIFY:
+            row = t // block
+            offset = t - row * block
+        else:
+            row = row.to(i32)
+            offset = t - starts.to(i32)[row]
+        from_batch = shifts.unsqueeze(0) <= offset.unsqueeze(-1)
+        in_batch = input_ids[(t.unsqueeze(-1) - shifts).clamp_min(0)]
+        hist_col = (n - 2 - (shifts.unsqueeze(0) - offset.unsqueeze(-1) - 1)).clamp(
+            0, n - 2
+        )
+        from_hist = history.to(i32)[row].gather(1, hist_col.to(torch.int64))
+        tokens = torch.where(from_batch, in_batch, from_hist)
+    if num_real < num_tokens:
+        tokens = torch.cat([tokens, tokens.new_zeros(num_tokens - num_real, n)])
+    blocked = positions.to(i32).unsqueeze(-1) < shifts
+    if num_real < num_tokens:
+        blocked[num_real:] = True
+    if hasher.image_token_id is not None:
+        tokens = tokens.masked_fill(tokens >= MM_PAD_SHIFT_VALUE, hasher.image_token_id)
+        blocked = (
+            (blocked | (tokens == hasher.image_token_id))
+            .to(i32)
+            .cummax(-1)
+            .values.bool()
+        )
+    hash_ids = compute_engram_hash_ids(
+        tokens,
+        blocked,
+        hasher.pad_id,
+        hasher.token_map,
+        hasher.multipliers,
+        hasher.primes,
+        hasher.offsets,
+    )
+    return hash_ids, tokens
+
+
+def tpu_dsv41_int32_input_ids(original, model, input_ids, *args, **kwargs):
+    """AROUND DeepseekV4ForCausalLM.forward: V4.1 token ids fit in int32."""
+    if (
+        not input_ids.is_cuda
+        and input_ids.dtype == torch.int64
+        and model.config.model_type == "deepseek_v41"
+    ):
+        input_ids = input_ids.to(torch.int32)
+    return original(model, input_ids, *args, **kwargs)
 
 
 def hook_specs():
@@ -264,8 +342,13 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
-            "sglang.srt.layers.engram.compute_engram_hash_ids",
-            tpu_dsv41_engram_hash_ids,
+            "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.forward",
+            tpu_dsv41_int32_input_ids,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.engram.EngramHasher._torch_hash_ids",
+            tpu_dsv41_torch_hash_ids,
             HookType.AROUND,
         ),
     ]
