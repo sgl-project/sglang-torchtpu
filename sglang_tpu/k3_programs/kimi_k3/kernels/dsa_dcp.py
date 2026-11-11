@@ -432,16 +432,23 @@ class IndexSelect:
         buf = self.refs["key_buf"].at[step % self.key_slots]
         pltpu.make_async_copy(buf, buf, self.refs["key_sems"].at[step % self.key_slots]).wait()
 
-    def _count(self, thresholds_of):
+    def _loads(self, first):
+        """Whether a key pass copies its chunks: always the selection's first
+        pass; later passes only when the chunks outnumber the ring's slots
+        (else each still holds its chunk, step ``s`` in slot ``s``)."""
+        return True if first else self.refs["chunk_starts"][self.batch] > self.key_slots
+
+    def _count(self, thresholds_of, first=False):
         """This rank's counts ``[COUNT_ROWS, LANES]`` (sublane ``j``: candidate
         ``j + 1``, lane ``b``: row ``b``) of its keys passing
         ``thresholds_of(row)``'s tests: a callable ``(row) -> test(key, position,
-        j)`` for ``j < CANDIDATES``."""
+        j)`` for ``j < CANDIDATES`` (``first``: the selection's first pass)."""
         refs, chunk = self.refs, self.chunk
         total = refs["chunk_starts"][self.batch]
+        load = self._loads(first)
         refs["local"][...] = jnp.zeros((COUNT_ROWS, LANES), jnp.int32)
         for step in range(self.key_slots - 1):
-            pl_when(step < total)(lambda step=step: self._chunk_copy(step))
+            pl_when(load & (step < total))(lambda step=step: self._chunk_copy(step))
         sub8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 0)
         lane8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 1)
         cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
@@ -450,8 +457,8 @@ class IndexSelect:
 
         def step_fn(step, accs):
             row, local = refs["step_row"][step], refs["step_local"][step]
-            self._wait_chunk(step)
-            pl_when(step + self.key_slots - 1 < total)(lambda: self._chunk_copy(step + self.key_slots - 1))
+            pl_when(load)(lambda: self._wait_chunk(step))
+            pl_when(load & (step + self.key_slots - 1 < total))(lambda: self._chunk_copy(step + self.key_slots - 1))
             start = jnp.minimum(local * chunk, self.key_rows - chunk)
             rows_valid = refs["counts"][row] * self.subpages
             accs = tuple(jnp.where(local == 0, 0, a) for a in accs)
@@ -514,14 +521,14 @@ class IndexSelect:
         refs, topk = self.refs, self.topk
         cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
         parity = 0
-        for shift in KEY_SHIFTS:
+        for round_, shift in enumerate(KEY_SHIFTS):
             self._row_scalars(_PREFIX, "row_prefix")
 
             def key_test(row, shift=shift):
                 prefix = refs["row_prefix"][row]
                 return lambda key, position, j: key >= ((prefix + _i32((j + 1) << shift)) ^ INT_MIN)
 
-            total = self._all_reduce(self._count(key_test), parity)
+            total = self._all_reduce(self._count(key_test, first=round_ == 0), parity)
             parity ^= 1
             ge = ((total >= topk) & (cand < CANDIDATES)).astype(jnp.int32)
             digit = jnp.sum(ge, axis=0, keepdims=True)  # [1, LANES]
@@ -594,15 +601,16 @@ def _step_activity(self, span_rows: int, active_ref, steps: int):
     def scan():
         fill(jnp.int32(0))
         total = refs["chunk_starts"][self.batch]
+        load = self._loads(False)
         for step in range(self.key_slots - 1):
-            pl_when(step < total)(lambda step=step: self._chunk_copy(step))
+            pl_when(load & (step < total))(lambda step=step: self._chunk_copy(step))
         sub = jax.lax.broadcasted_iota(jnp.int32, (span_rows, LANES), 0)
         lane = jax.lax.broadcasted_iota(jnp.int32, (span_rows, LANES), 1)
 
         def step_fn(step, carry):
             row, local = refs["step_row"][step], refs["step_local"][step]
-            self._wait_chunk(step)
-            pl_when(step + self.key_slots - 1 < total)(lambda: self._chunk_copy(step + self.key_slots - 1))
+            pl_when(load)(lambda: self._wait_chunk(step))
+            pl_when(load & (step + self.key_slots - 1 < total))(lambda: self._chunk_copy(step + self.key_slots - 1))
             start = jnp.minimum(local * chunk, self.key_rows - chunk)
             rows_valid = refs["counts"][row] * self.subpages
             tau, p_tie = refs["tau"][row], refs["p_tie"][row]
