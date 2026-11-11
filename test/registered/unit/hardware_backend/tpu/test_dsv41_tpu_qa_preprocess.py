@@ -84,6 +84,23 @@ class TestQABinding(CustomTestCase):
         self.assertEqual(binder.bind_model_qa(layer), 1)
         self.assertEqual(layer._dsv41_qa.eps, 1e-5)
 
+    def test_real_eval_norm_parameters_bind_detached_inference_snapshots(self):
+        layer = _layer()
+        for name, width in (("q_norm", 1280), ("kv_norm", 512)):
+            setattr(layer, name, RMSNorm(width, eps=1e-6).bfloat16())
+        layer.eval()
+        self.assertTrue(layer.q_norm.weight.requires_grad)
+        self.assertTrue(layer.kv_norm.weight.requires_grad)
+        self.assertEqual(binder.bind_model_qa(layer), 1)
+        for actual, norm in (
+            (layer._dsv41_qa.gamma_qr, layer.q_norm),
+            (layer._dsv41_qa.gamma_kv, layer.kv_norm),
+        ):
+            self.assertFalse(actual.requires_grad)
+            self.assertIsNone(actual.grad_fn)
+            torch.testing.assert_close(actual, norm.weight.float(), rtol=0, atol=0)
+        self.assertTrue(layer.q_norm.weight.requires_grad)
+
     def test_unsupported_state_never_binds(self):
         """Namesakes, wqa-only, noncanonical quantization and norm changes fall back."""
         namesake = type("MQALayer", (nn.Module,), {})

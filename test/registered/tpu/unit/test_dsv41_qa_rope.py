@@ -13,6 +13,8 @@ import unittest
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
+import jax
+import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import torch
@@ -97,6 +99,49 @@ def _tensor(array, device="cpu"):
     return tensor.contiguous().to(device)
 
 
+def _independent_quantize(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    values = x.astype(jnp.float32)
+    scale = jnp.max(jnp.abs(values), axis=-1, keepdims=True) / 448
+    scale = jnp.where(scale == 0, 1.0, scale)
+    return jnp.clip(values / scale, -448, 448).astype(jnp.float8_e4m3fn), scale
+
+
+def _independent_project(
+    encoded: jax.Array, weight: jax.Array, row_scale: jax.Array, scale: jax.Array
+) -> jax.Array:
+    # Materialized quantization and BF16 projection are separate exported ops.
+    # A single dense graph can fuse/reassociate this epilogue differently from
+    # the production scaled_mm and Pallas boundaries. Decode uses the same
+    # 16-row MXU padding as both production implementations.
+    tokens = encoded.shape[0]
+    pad = (-tokens) % 16
+    encoded = jnp.pad(encoded, ((0, pad), (0, 0)))
+    product = jnp.dot(
+        encoded,
+        weight,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )[:tokens]
+    return (product * row_scale * scale).astype(jnp.bfloat16)
+
+
+def _finish_projection(projected, gamma_qr, gamma_kv, cache, positions):
+    qr = _normalize(projected[:, :1280], gamma_qr)
+    kv = _normalize(projected[:, 1280:], gamma_kv).astype(np.float32)
+    return qr.astype(np.float32), _rotate_kv(kv, cache, positions)
+
+
+def _rotate_kv(kv, cache, positions):
+    kv = kv.copy()
+    rows = cache[np.clip(positions, 0, len(cache) - 1)]
+    tail = kv[:, -64:].reshape(len(kv), 32, 2)
+    rotated = (tail[..., 0].astype(np.float64) + 1j * tail[..., 1]) * (
+        rows[:, :32].astype(np.float64) + 1j * rows[:, 32:]
+    )
+    kv[:, -64::2], kv[:, -63::2] = rotated.real, rotated.imag
+    return kv.astype(BF16).astype(np.float32)
+
+
 class TestQAReferenceBoundaries(CustomTestCase):
     def test_norm_matches_real_core_fp32_multiply_boundary(self):
         """A BF16 cast before gamma multiplication is not the core contract."""
@@ -145,7 +190,19 @@ class TestQARopeTPU(CustomTestCase):
         super().setUpClass()
         import torch_tpu  # noqa: F401
 
+        from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
         ops.register_ops()
+        cls.quantize = staticmethod(
+            cpu_export_jax_op(
+                "sglang_tpu_test::qa_independent_quantize", _independent_quantize
+            )
+        )
+        cls.project = staticmethod(
+            cpu_export_jax_op(
+                "sglang_tpu_test::qa_independent_project", _independent_project
+            )
+        )
 
     def _check(self, tokens, compiled=False):
         arrays = _inputs(tokens)
@@ -157,7 +214,26 @@ class TestQARopeTPU(CustomTestCase):
             if replay:
                 arrays = (*arrays[:-1], arrays[-1][::-1].copy())
                 inputs = (*inputs[:-1], _tensor(arrays[-1], "tpu"))
-            expected = _reference(*arrays)
+            from sglang_tpu.fp8_linear import apply_tpu_fp8_linear
+            from sglang.srt.layers.layernorm import RMSNorm
+
+            encoded, row_scale = self.quantize(inputs[0])
+            projected = self.project(encoded, inputs[1], row_scale, inputs[2])
+            expected = _finish_projection(projected.cpu().float().numpy(), *arrays[3:])
+            # A second gate checks actual model compatibility, not only the
+            # independent mathematical variant. Tiny rows intentionally differ
+            # under generic's minfloor and are excluded from this gate only.
+            generic_projection = apply_tpu_fp8_linear(*inputs[:3])
+            generic_norms = []
+            for width, gamma, values in (
+                (1280, inputs[3], generic_projection[:, :1280]),
+                (512, inputs[4], generic_projection[:, 1280:]),
+            ):
+                norm = RMSNorm(width, eps=EPS)
+                norm.weight = torch.nn.Parameter(gamma.bfloat16(), requires_grad=False)
+                generic_norms.append(norm.forward_native(values).cpu().float().numpy())
+            # Norm is real core; rotate independently via host complex pairs.
+            generic = (generic_norms[0], _rotate_kv(generic_norms[1], *arrays[-2:]))
             outputs = run(*inputs)
             for width, output, reference in zip((1280, 512), outputs, expected):
                 self.assertEqual(tuple(output.shape), (tokens, width))
@@ -165,6 +241,15 @@ class TestQARopeTPU(CustomTestCase):
                 actual = output.cpu().float().numpy()
                 reference = reference.astype(np.float32)
                 np.testing.assert_allclose(actual, reference, atol=1e-2, rtol=1e-2)
+                baseline = generic[0 if width == 1280 else 1]
+                ordinary = (
+                    np.arange(tokens) != 1
+                    if tokens > 1
+                    else np.ones(tokens, dtype=bool)
+                )
+                np.testing.assert_allclose(
+                    actual[ordinary], baseline[ordinary], atol=1e-2, rtol=1e-2
+                )
                 if tokens > 1:
                     np.testing.assert_array_equal(actual[0], 0)
                     # Tiny rows need their own scaled error: global atol=1e-2
