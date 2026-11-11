@@ -455,16 +455,18 @@ class PrefillProgram:
                 jnp.zeros((32, *shape), dtype), state_sharding
             )
 
+        # Kimi-K3.1: each MLA layer's DSA index pool follows its latent pools.
+        dsa = "d_wk" in self.names["mla"]
+
         def prefix_specs(pools: int):
-            """Specs of an op's prefix operands: its MLA layers' pools, then
-            this rank's prefix ids and the local bases/counts."""
-            return (sharded,) * (pools + 2)
+            """Specs of an op's prefix operands: its MLA layers' pools (and
+            index pools), then this rank's prefix ids and the local bases/counts."""
+            return (sharded,) * (pools * (2 if dsa else 1) + 2)
 
         def split(args, pools: int):
-            return (
-                kernels.CpPrefix(tuple(args[:pools]), args[pools], args[pools + 1]),
-                args[pools + 2 :],
-            )
+            index = tuple(args[pools:2 * pools]) if dsa else ()
+            rest = args[2 * pools:] if dsa else args[pools:]
+            return kernels.CpPrefix(tuple(args[:pools]), rest[0], rest[1], index), rest[2:]
 
         def run_first(tokens, length, segments, rec, hist, *args):
             arena, args = split(args, 1)
@@ -632,6 +634,7 @@ class PrefillProgram:
         local: torch.Tensor,
         ring: Any = None,
         keep: tuple[int, ...] = (),
+        index_pools: list | None = None,
     ):
         """Prefill a packed window: ``shard`` [1, W/32] this rank's token
         ids (its SP stripes, :meth:`sp_order`), ``extent`` [1] the end of
@@ -652,6 +655,7 @@ class PrefillProgram:
         92 (the final layer's input)."""
         ops = self._build(int(shard.shape[-1]) * 32)
         tail = (ids, local)
+        index_pools = list(index_pools or ())
         *state, tap3 = ops["first"](
             shard,
             extent,
@@ -659,6 +663,7 @@ class PrefillProgram:
             recurrent,
             conv,
             pools[0],
+            *index_pools[:1],
             *tail,
             *self._flat("io", "common", "kda", "mla", "moe"),
         )
@@ -674,6 +679,7 @@ class PrefillProgram:
                 segments,
                 pools[2 * p + 1],
                 pools[2 * p + 2],
+                *index_pools[2 * p + 1:2 * p + 3],
                 *tail,
                 *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
             )
@@ -690,6 +696,7 @@ class PrefillProgram:
             extent,
             segments,
             pools[MLA_LAYERS - 1],
+            *index_pools[MLA_LAYERS - 1:],
             *tail,
             *self._flat("io", "common", "mla", "moe", expert_bank=12),
         )
@@ -806,6 +813,10 @@ class PoolWriter:
     def mla_pools(self) -> list[torch.Tensor]:
         """The 24 MLA layers' pools, MLA layer m's at m."""
         return [self.raw_pools[self.mla_raw[m]] for m in range(MLA_LAYERS)]
+
+    def index_pools(self) -> list[torch.Tensor]:
+        """Kimi-K3.1: the 24 MLA layers' DSA index pools (empty without)."""
+        return [self.raw_pools[i] for i in self.index_raw]
 
     def _adopt(self, new) -> list[torch.Tensor]:
         new = [new] if isinstance(new, torch.Tensor) else list(new)
@@ -1670,6 +1681,7 @@ class KimiPrefiller:
                 local_bases,
                 ring_hook,
                 keep=self._draft_keep(),
+                index_pools=self._writer.index_pools(),
             )
         )
         self._writer.write_packed(
@@ -1983,6 +1995,7 @@ class KimiPrefiller:
                     _rank_zeros_i32(2 * count),
                     ring_hook,
                     keep=self._draft_keep(),
+                    index_pools=writer.index_pools(),
                 )
             )
             outputs += [logits, self.program.split_states(recurrent, conv)[0][0]]

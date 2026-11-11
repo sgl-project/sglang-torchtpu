@@ -72,6 +72,9 @@ class KernelConfig:
     # Prefill MLA flash tiles (queries x keys per step).
     mla_flash_qtile: int = 1024
     mla_flash_ktile: int = 2048
+    # Kimi-K3.1: the prefill's MLA attends each token's DSA top-k (token-split
+    # indexer, sparse MLA kernels) instead of every earlier token.
+    prefill_sparse: bool = False
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.

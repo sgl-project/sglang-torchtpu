@@ -369,7 +369,7 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
             if name == "m_o":
                 family = _sequence_parallel_output(family, peer_dir, "m_o", rank)
             yield "mla", name, family
-        for name in ("d_wk", "d_knorm"):  # Kimi-K3.1's indexer key projection (the window's index keys)
+        for name in ("d_wk", "d_knorm", "d_wqb", "d_wproj"):  # Kimi-K3.1's indexer (index keys, sparse prefill)
             if name in families:
                 yield "mla", name, families[name]
         for name in PREFILL_MOE_DENSE:

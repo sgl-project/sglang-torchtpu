@@ -3139,7 +3139,8 @@ def kda_chunk(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, invert=No
 # ---------------------------------------------------------------------------
 
 
-def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query_scale=1.0):
+def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query_scale=1.0,
+                    return_query_latent=False):
     """MLA Q/K/V projections for a token window (per-rank layout).
 
     ``hidden``: [T, hidden] BF16. Returns (query [T,3,256] times
@@ -3187,6 +3188,8 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
     output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
     if return_latent:
         latent = jnp.concatenate((kv_latent, compressed[:, 512:576]), axis=1)
+        if return_query_latent:
+            return query, new_key, new_value, output_gate, latent, query_latent
         return query, new_key, new_value, output_gate, latent
     return query, new_key, new_value, output_gate
 
@@ -4198,9 +4201,13 @@ class CpPrefix(NamedTuple):
     pools: tuple
     ids: Any
     local: Any
+    # Kimi-K3.1 sparse prefill: the layers' DSA index-key pools, one per pool.
+    index_pools: tuple = ()
 
     def split(self):
-        return tuple(CpPrefix((pool, ), self.ids, self.local) for pool in self.pools)
+        return tuple(CpPrefix((pool, ), self.ids, self.local,
+                              (self.index_pools[i],) if self.index_pools else ())
+                     for i, pool in enumerate(self.pools))
 
 
 GATHER_STREAMS = 6  # the three physical ring cycles, both directions
@@ -4810,15 +4817,17 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
     tables = ring_tables(list(mesh.devices.flat), token_ranks)
     local_tokens = seq_len // 32
 
-    def local_packed_cp(full_hidden, weights, segment_desc, length, pool, ids, local):
+    def local_packed_cp(full_hidden, weights, segment_desc, length, pool, ids, local, *index_pool):
         """One rank's view: this rank's 3 heads over every rank's prefix
         pages and the window."""
         local_weights = jax.tree.map(lambda value: value[0], weights)
         projections = ProjectionWeights(
             *(local_weights[name] for name in _PROJECTION_NAMES)
         )
-        query, new_key, new_value, output_gate, latent = mla_projections(
-            full_hidden, projections, return_latent=True, query_scale=SCALE_LOG2)
+        sparse = bool(index_pool) and _config().prefill_sparse and "index_query_projection" in local_weights
+        query, new_key, new_value, output_gate, latent, query_latent = mla_projections(
+            full_hidden, projections, return_latent=True, query_scale=1.0 if sparse else SCALE_LOG2,
+            return_query_latent=True)
         if "index_key_projection" in local_weights:
             # Kimi-K3.1: the window tokens' normed DSA index keys (as the
             # decode computes them) ride in lanes 576:704 of the latents.
@@ -4828,6 +4837,23 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
                           preferred_element_type=jnp.float32).astype(jnp.bfloat16).astype(jnp.float32)
             norm = local_weights["index_key_norm"].astype(jnp.float32)
             index_key = dsa_decode.layer_norm(raw, norm[0:1], norm[1:2], 1e-5).astype(jnp.bfloat16)
+            if sparse:
+                from sglang_tpu.k3_programs.kimi_k3.kernels import sparse_prefill
+
+                pages, order = gathered_prefix_pages(pool, ids[0], local[0], tables, "k3_sp", count=segments,
+                                                     capacity=prefix_capacity)
+                page_tokens = pool.shape[-3] * pool.shape[-2]
+                arena = order[1:]
+                arena_tokens = pages[arena].reshape(-1, pages.shape[-1])  # [capacity, 640]: arena order
+                index_rows = sparse_prefill.gathered_index_pages(index_pool[0], ids[0], "k3_sp")[arena]
+                attended = sparse_prefill.sparse_mla(
+                    query.transpose(1, 0, 2), latent, index_key, query_latent, full_hidden, local_weights,
+                    arena_tokens, index_rows, segment_desc[:5 * segments], count=segments,
+                    capacity=prefix_capacity, page_tokens=page_tokens, axis="k3_sp")  # [3, T, 128]
+                attended = attended.transpose(1, 0, 2).reshape(query.shape[0], 384)
+                gate = jax.nn.sigmoid(output_gate.astype(jnp.float32)).astype(jnp.bfloat16)
+                latent = jnp.concatenate((latent, index_key), axis=-1)
+                return (attended * gate).astype(jnp.bfloat16)[None], latent[None]
             latent = jnp.concatenate((latent, index_key), axis=-1)
         tokens = query.shape[0]
         real = (jnp.arange(tokens) < length.reshape(()))[None, :, None]
@@ -4846,12 +4872,13 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
 
     def run(hidden, prefix, weights, segment_desc, length, arena):
         (pool, ) = arena.pools
+        index_pools = tuple(arena.index_pools)
         gated, latent = jax.shard_map(
             local_packed_cp, mesh=mesh,
-            in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")),
+            in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")) + (P("k3_sp"),) * len(index_pools),
             out_specs=(P("k3_sp"), P("k3_sp")),
             check_vma=False,
-        )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local)
+        )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local, *index_pools)
         projected = project_reduce_scatter(
             gated, weights["output_projection_repacked"], mesh, tables,
             collective_id=collective_id,
@@ -5322,8 +5349,8 @@ MLA_FIELD_NAMES = (
 
 # Kimi-K3.1: the DSA indexer's key projection and LayerNorm (the window
 # tokens' index keys go out with the latents, lanes 576:704).
-DSA_FAMILIES = ("d_wk", "d_knorm")
-DSA_FIELD_NAMES = ("index_key_projection", "index_key_norm")
+DSA_FAMILIES = ("d_wk", "d_knorm", "d_wqb", "d_wproj")
+DSA_FIELD_NAMES = ("index_key_projection", "index_key_norm", "index_query_projection", "index_gate_projection")
 
 
 def make_indexed_mla_layer_sp_ring(mesh, *, seq_len=8192, segments, prefix_capacity, flash_tile=256):
