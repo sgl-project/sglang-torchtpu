@@ -94,8 +94,8 @@ class SWAComponent(TreeComponent):
             else 0
         )
         self.cap_text = _cap_text_mode()
-        # Each of these demotions keeps a first-visit media window live
-        # (see ``_media_window``).
+        # Each of these keeps a first-visit media window live (see ``_media_window``);
+        # CAP's page release then spares it too.
         self._keeps_media_window = (
             self._evict_stale_windows_first
             or self.demotes_final_windows

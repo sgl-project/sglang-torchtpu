@@ -1223,8 +1223,8 @@ class Req(ReqDllmMixin):
         self.storage_prefetch_last_match_len: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
-        # Matched prefix length at this request's first radix insert, set only
-        # under SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST,
+        # Matched prefix length at this request's first radix insert (kept across
+        # retraction), set only under SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST,
         # SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS or SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS:
         # final-window demotion stops here, and media past it is a first visit.
         self.swa_stale_window_floor: Optional[int] = None
@@ -2004,8 +2004,8 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
-        self.swa_stale_window_floor = None
-        self.swa_media_end = None
+        # swa_stale_window_floor and swa_media_end, set at the first radix insert,
+        # survive retraction: the re-prefill extends the same tokens.
         self.swa_media_anchored = False
         self.swa_branching_seqlen = None
         self.extend_range = None
