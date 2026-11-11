@@ -714,14 +714,15 @@ def _for_each_q_chunk(refs: _KernelRefs, cfg: _KernelConfig, fn) -> None:
             fn(qs)
 
 
-def _two_body_last(refs: _KernelRefs, cfg: _KernelConfig) -> bool:
-    """Whether fixed-m heads get their own last-KV-block body.
+def _two_body_last(cfg: _KernelConfig) -> bool:
+    """Whether fixed-m heads get their own body for the last KV block.
 
-    With a single query chunk and several KV blocks, the last block runs the
-    online body for every head (one body less to compile); fixed-m heads then
-    resume from m pinned at the fixed value.
+    Only with a single KV block. Otherwise the last block runs the online body
+    for every head, and fixed-m heads resume from m pinned at the fixed value:
+    one compiled body less keeps the program inside tpu7x's instruction memory
+    (about 64K bundles), past which the kernel runs far slower.
     """
-    return refs.q.shape[0] // cfg.q_sub > 1 or cfg.grid_width == 1
+    return cfg.grid_width == 1
 
 
 def _init_accumulators(
@@ -743,7 +744,7 @@ def _init_accumulators(
     def _init_fixed_chunk(qs):
         qsl = pl.ds(qs, q_sub)
         _zero_out_and_sum(qsl)
-        if not _two_body_last(refs, cfg):
+        if not _two_body_last(cfg):
             refs.m_scratch[:, qsl] = jnp.full(
                 (refs.m_scratch.shape[0], q_sub),
                 _m_fixed(refs, step),
@@ -908,7 +909,7 @@ def _accumulate_hop(
         def _body_online():
             _run_full(refs, cfg, step, False)
 
-    if _two_body_last(refs, cfg):
+    if _two_body_last(cfg):
 
         @pl.when((j == last_j) & is_fixed)
         def _last_body_fixed():

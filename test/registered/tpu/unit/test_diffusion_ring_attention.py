@@ -200,8 +200,9 @@ class TestRingAttentionInterpret(unittest.TestCase):
         """Ring 4 in Pallas interpret mode against an fp32 reference, per head.
 
         ring_size=4 separates upstream from downstream. shard_len=310 with
-        bq=256, q_sub=256 and bkv=128 runs 3 KV blocks with a ragged tail, 2 Q
-        passes and the n_q == 1 hybrid last body. GQA 2:1: head 0 is gated to
+        bq=256, q_sub=128 and bkv=128 runs 3 KV blocks with a ragged tail, 2 Q
+        passes of 2 query chunks, and the hybrid last body (fixed-m heads
+        resume in the online body). GQA 2:1: head 0 is gated to
         fixed-m; head 1's query is 9x its key, so its base-2 logits (~147)
         would overflow exp2 if it were gated to fixed-m.
         """
@@ -227,7 +228,7 @@ class TestRingAttentionInterpret(unittest.TestCase):
             "block_q": 256,
             "block_kv": 128,
             "block_kv_compute": 128,
-            "block_q_sub": 256,
+            "block_q_sub": 128,
         }
 
         k_np = rng.standard_normal((1, seq_len, 1, head_dim), dtype=np.float32)
