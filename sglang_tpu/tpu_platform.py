@@ -1259,6 +1259,20 @@ class TpuSRTPlatform(SRTPlatform):
     # Subsystem factory methods
     # ------------------------------------------------------------------
 
+    def get_dsv41_index_page_size(self) -> int:
+        # The TPU packed-FP8 scorer is native at 128 records per page; smaller
+        # pages take its slower repeat/lane-gather path. The TPU pool requires
+        # page_size 256, so a C2 FULL page holds 128 slots: pages must divide it.
+        from sglang_tpu.envs import envs as tpu_envs
+
+        size = tpu_envs.SGLANG_TPU_DSV41_INDEX_PAGE_SIZE.get()
+        if size < 1 or size & (size - 1) or 128 % size:
+            raise ValueError(
+                f"SGLANG_TPU_DSV41_INDEX_PAGE_SIZE={size} must be a power of two "
+                "dividing 128"
+            )
+        return size
+
     def get_default_attention_backend(self) -> str:
         # Three Pallas backends are registered for TPU:
         #   - "pallas_tpu_rpa_v3" (default): ragged_paged_attention v3 kernel

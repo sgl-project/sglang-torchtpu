@@ -51,6 +51,10 @@ class TpuEnvs:
     # XLA's all-gather returned wrong logits in the batched-prefill graph of
     # Kimi-K3.1 at TP32 (wrong first tokens), so this is on by default.
     SGLANG_TPU_LOGITS_GATHER_ALLREDUCE = EnvBool(True)
+    # DeepSeek-V4.1 ratio-1/2 index-K page, in records (dsv41_index_page_size).
+    # 128 is the packed FP8 scorer's native page; 64 was the previous default.
+    # Prefill and decode peers of a PD deployment must use the same value.
+    SGLANG_TPU_DSV41_INDEX_PAGE_SIZE = EnvInt(128)
     # Kimi-K3 KDA decode: fence the static fp8 [q, k, v, g] GEMV behind the
     # b_proj / f_a / f_b GEMVs (an XLA optimization barrier, same values) so
     # they run while its weight prefetch is in flight (kimi_k3/order_op.py).
