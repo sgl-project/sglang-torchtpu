@@ -18,6 +18,7 @@ that every decode rank's (token, head, K/V, head-dim) element holds the right
 prefill value.
 """
 
+import sys
 import threading
 import unittest
 from types import SimpleNamespace
@@ -426,27 +427,26 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
         self.assertIsNone(mgr.finer_decode_refusal(4))
 
     def test_swa_receiver_registers_plan(self):
-        from unittest import mock
-
-        from sglang_tpu.disaggregation.raiden.receiver import RaidenKVReceiver
-
-        mgr = _manager(_fused_layer(torch.float8_e4m3fn, 2), 4)
-        mgr._swa_kv_caches = [_fused_layer(torch.float8_e4m3fn, 2)]
+        """The decode registers its sliding-window receive plan with the SWA
+        engine (tpu_sync is stubbed so this runs on CPU-only CI)."""
+        mgr = _manager(_fused_layer(FP8, 2), 4)
+        mgr._swa_kv_caches = [_fused_layer(FP8, 2)]
         mgr._engine = mock.Mock()
         mgr._swa_engine = mock.Mock(transfer_address="")
-        from sglang_tpu.disaggregation.raiden.state import DecodeState
-
         mgr._decode = DecodeState()
-        mgr._aborted = set()
-        mgr._state_lock = mock.MagicMock()
+        mgr._aborted = {}
+        mgr._state_lock = threading.Lock()
         mgr._reshard_plans = {}
-        mgr._decode.reshard_staging = {}
-        receiver = object.__new__(RaidenKVReceiver)
-        receiver.kv_mgr = mgr
-        receiver._swa_req_id = lambda room: str(room)
-        mgr._register_reshard_swa_receiver(
-            room=1, local_swa_blocks=[0], swa_sources_map={0: [0]}, src_attn_tp=8
-        )
+        rpc = SimpleNamespace(raiden_service_pb2=_Pb2)
+        stub = {
+            "tpu_sync": SimpleNamespace(rpc=rpc),
+            "tpu_sync.rpc": rpc,
+            "tpu_sync.rpc.raiden_service_pb2": _Pb2,
+        }
+        with mock.patch.dict(sys.modules, stub):
+            mgr._register_reshard_swa_receiver(
+                room=1, local_swa_blocks=[0], swa_sources_map={0: [0]}, src_attn_tp=8
+            )
         mgr._swa_engine.register_active_plan.assert_called_once_with(
             1, mock.ANY, is_sender=False
         )
