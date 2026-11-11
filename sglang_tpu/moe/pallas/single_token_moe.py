@@ -193,9 +193,6 @@ def eligible(
         return False
     if w1_scale is None or w2_scale is None:
         return False
-    if w1_scale.ndim != 4 or w2_scale.ndim != 4:
-        # The kernel's scale BlockSpecs index the [E, blocks, 1, N] form.
-        return False
     if any(
         t is not None for t in (w1_bias, w2_bias, w1_channel_scale, w2_channel_scale)
     ):

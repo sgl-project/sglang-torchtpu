@@ -269,9 +269,7 @@ def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
     """
     if not w2_packed:
         return _tuned_or_calculated(lhs, w2, w2_scale, num_experts)
-    return _lookup_tile_info(
-        lhs, w2, w2_scale, num_experts, packed_fp4=True, gmm_v2_only=True
-    ) or _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
+    return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
 
 
 def _tuned_or_calculated(lhs, rhs, rhs_scale, num_experts):
@@ -812,11 +810,6 @@ def _fused_moe_jax(
 
     # Weights arrive lane-aligned from the loader (bf16: pad activations to
     # match; quantized: unpadded-at-load dims are unsupported)
-    if gmm1_tile_info is None and w1_packed:
-        # Packed FP4 pins only gmm_v2-measured shapes; tile_n is per projection.
-        gmm1_tile_info = _lookup_tile_info(
-            x_sorted, w1, w1_scale, num_experts, packed_fp4=True, gmm_v2_only=True
-        )
     gmm1_tiling = _dividing_tile_k(
         _vmem_safe_packed_tile_n(
             gmm1_tile_info
