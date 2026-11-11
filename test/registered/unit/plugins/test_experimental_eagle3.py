@@ -847,14 +847,16 @@ class TestExperimentalEagle3(CustomTestCase):
         )
 
     def test_pd_prefill_ships_the_carried_hidden(self):
-        """A PD prefill hands core one seed row per request: the carried hidden at
-        the extend cap (copied to host whole), topk as host placeholders."""
+        """A PD prefill hands core one seed row per request: the carried hidden and DSA
+        top-k at the extend cap (copied to host whole), topk as host placeholders."""
         draft_input = HostPaddedChainDraftInput(
             bonus_tokens=torch.tensor([1, 2]), new_seq_lens=torch.tensor([3, 4])
         )
         tail_hidden = torch.arange(8.0).view(4, 2)
-        _attach_pd_seeds(draft_input, tail_hidden=tail_hidden, bs=2)
+        dsa_topk = torch.full((4, 3), -1, dtype=torch.int32)
+        _attach_pd_seeds(draft_input, tail_hidden=tail_hidden, dsa_topk=dsa_topk, bs=2)
         self.assertIs(draft_input.hidden_states, tail_hidden)
+        self.assertIs(draft_input.dsa_topk_indices, dsa_topk)
         self.assertEqual(draft_input.topk_p.shape, (2, 1))
         self.assertEqual(draft_input.topk_index.device.type, "cpu")
 

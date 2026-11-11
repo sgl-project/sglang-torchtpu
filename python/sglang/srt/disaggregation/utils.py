@@ -665,8 +665,9 @@ class MetadataBuffers:
             if self.output_dsa_topk_indices is not None:
                 dsa_topk_indices = req.output_dsa_topk_indices
                 if dsa_topk_indices is not None:
+                    # A TPU row is padded with -1 past the wire width.
                     self.output_dsa_topk_indices[req.metadata_buffer_index].copy_(
-                        dsa_topk_indices
+                        dsa_topk_indices[: self.output_dsa_topk_indices_dim]
                     )
                 else:
                     self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)

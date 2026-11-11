@@ -18,7 +18,7 @@ decode writes it back into the table. Not ported yet: a draft sliding window.
 
 A DSA draft that shares its indexer top-k (MTP index sharing) keeps a second
 table beside g: the top-k of the row g was taken from, which commit and extend
-capture and every draft step reuses. Not under PD: prefill does not ship it.
+capture and every draft step reuses. Under PD, prefill ships it along with g.
 """
 
 from __future__ import annotations
@@ -327,8 +327,9 @@ class TpuChainSpecWorker(TpuSpecWorker):
             # The decode runs the draft over the prompt from these rows.
             kv_fence_tail = self.write_pd_hidden(batch, target_hidden)
             tail_hidden = self._pd_seed_hidden(target_hidden.device)
+            seed_capture = None
         else:
-            tail_hidden = self._extend_draft(
+            tail_hidden, seed_capture = self._extend_draft(
                 batch,
                 target_hidden=target_hidden,
                 bucket_tokens=bucket_tokens,
@@ -347,7 +348,9 @@ class TpuChainSpecWorker(TpuSpecWorker):
         # The draft prompt forward (or the hidden write) is the step's last KV write.
         draft_input.kv_fence_tail = kv_fence_tail
         if self._disagg_mode == "prefill":
-            _attach_pd_seeds(draft_input, tail_hidden=tail_hidden, bs=bs)
+            _attach_pd_seeds(
+                draft_input, tail_hidden=tail_hidden, dsa_topk=seed_capture, bs=bs
+            )
         result.next_draft_input = draft_input
         return result
 
@@ -358,8 +361,9 @@ class TpuChainSpecWorker(TpuSpecWorker):
         target_hidden: torch.Tensor,
         bucket_tokens: torch.Tensor,
         mm_input_embeds: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Draft forward on the prompt shifted by one token; store and return each request's last hidden."""
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Draft forward on the prompt shifted by one token; store and return each
+        request's last hidden and DSA top-k capture (None without index sharing)."""
         # finalize keeps HOST_PADDED target hidden (and mm embeds) at the token bucket.
         padded_tokens = target_hidden.shape[0]
         draft_ids = self._draft_prompt_ids(
@@ -402,7 +406,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         if seed_table is not None:
             assert seed_capture is not None
             seed_table.index_copy_(0, pool_rows, seed_capture)
-        return tail_hidden
+        return tail_hidden, seed_capture
 
     def _prompt_seed_capture(
         self, batch: ScheduleBatch
@@ -452,16 +456,29 @@ class TpuChainSpecWorker(TpuSpecWorker):
         )
 
     def _seed_carry(
-        self, req_pool_indices_cpu: torch.Tensor, hidden_cpu: torch.Tensor
+        self,
+        req_pool_indices_cpu: torch.Tensor,
+        hidden_cpu: torch.Tensor,
+        dsa_topk_cpu: torch.Tensor | None = None,
     ) -> None:
-        """Write a PD seed's [bs, H] host hidden into the carry table at the batch bucket."""
+        """Write a PD seed's [bs, H] host hidden into the carry table at the batch
+        bucket and, with index sharing, its [bs, W] DSA top-k into the seed table."""
         padded_bs = self._pad_bs(req_pool_indices_cpu.shape[0])
         # Padded rows write the reserved pool row 0.
+        rows = padded_h2d(req_pool_indices_cpu.to(torch.int64), padded_bs, self.device)
         self._chain_draft_worker.carry.index_copy_(
             0,
-            padded_h2d(req_pool_indices_cpu.to(torch.int64), padded_bs, self.device),
+            rows,
             padded_h2d(hidden_cpu.to(self._draft_runner.dtype), padded_bs, self.device),
         )
+        seed_table = self._chain_draft_worker.dsa_seed_topk_table
+        if seed_table is not None:
+            # -1 selects no key: past the wire width, or when the prefill sent no seed.
+            seeds = torch.full((padded_bs, seed_table.shape[1]), -1, dtype=torch.int32)
+            if dsa_topk_cpu is not None:
+                bs, width = dsa_topk_cpu.shape
+                seeds[:bs, :width] = dsa_topk_cpu
+            seed_table.index_copy_(0, rows, padded_h2d(seeds, padded_bs, self.device))
 
     def _warmup_seed_carry(self) -> None:
         """_seed_carry at every batch bucket a PD seed batch pads to."""
@@ -823,17 +840,23 @@ def shift_prompt_tokens(
 
 
 def _attach_pd_seeds(
-    draft_input: HostPaddedChainDraftInput, *, tail_hidden: torch.Tensor, bs: int
+    draft_input: HostPaddedChainDraftInput,
+    *,
+    tail_hidden: torch.Tensor,
+    dsa_topk: torch.Tensor | None,
+    bs: int,
 ) -> None:
     """The per-request seed core PD prefill ships to decode (output_topk_*, hidden_states_tensor).
 
     A chain decode stores only the hidden and re-derives d_1 from it, so topk is
     a host placeholder. hidden stays at the extend cap: core copies it to host
-    whole and reads rows by request, so no slice compiles per bs.
+    whole and reads rows by request, so no slice compiles per bs. So does
+    dsa_topk, an index-sharing draft's capture (output_dsa_topk_indices).
     """
     draft_input.hidden_states = tail_hidden
     draft_input.topk_p = torch.ones((bs, 1), dtype=torch.float32)
     draft_input.topk_index = torch.zeros((bs, 1), dtype=torch.int64)
+    draft_input.dsa_topk_indices = dsa_topk
 
 
 def _chunked_tail(batch: ScheduleBatch) -> tuple[int | None, int | None]:

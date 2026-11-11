@@ -750,13 +750,15 @@ _future_map_direct_handoff_patched = False
 def _patch_future_map_direct_handoff() -> None:
     """Route FutureMap.stash/publish through the TPU direct handoff, so an
     unchanged EAGLE3 top-k-1 decode batch skips the store/gather round trip.
-    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu."""
+    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu.
+    stash also keeps the chain drafter's DSA top-k seeds out of FutureMap."""
     global _future_map_direct_handoff_patched
     if _future_map_direct_handoff_patched:
         return
     _future_map_direct_handoff_patched = True
 
     from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang_tpu.experimental import is_experimental_chain
     from sglang_tpu.overlap_utils_tpu import (
         flush_direct_handoff_tpu,
         publish_tpu,
@@ -771,6 +773,10 @@ def _patch_future_map_direct_handoff() -> None:
     FutureMap.tpu_published_seq_lens = None
 
     def stash(self, future_indices, payload):
+        if is_experimental_chain(self.spec_algo):
+            # The chain drafter keeps its DSA seeds in a req-pool-indexed table. A PD
+            # prefill's draft input holds them at the extend cap only for core to ship.
+            payload.dsa_topk_indices = None
         if not stash_tpu(self, future_indices, payload):
             orig_stash(self, future_indices, payload)
 

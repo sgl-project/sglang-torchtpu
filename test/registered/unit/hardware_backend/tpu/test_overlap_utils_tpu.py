@@ -261,6 +261,18 @@ class TestDirectHandoff(CustomTestCase):
         )
         self.assertIsNone(fm.tpu_direct_handoff)
 
+    def test_chain_stash_keeps_dsa_seeds_out_of_the_relay(self):
+        # A chain PD prefill's DSA seeds sit at the extend cap (4 rows), not at
+        # the 2 future rows, so the relay must not store them.
+        fm, _, indices, payload, seq_lens = make_case()
+        payload.dsa_topk_indices = torch.full((4, 3), 7, dtype=torch.int32)
+        with patch(
+            "sglang_tpu.experimental.experimental_spec_enabled", return_value=True
+        ):
+            stash(fm, indices, payload, seq_lens, published=None)
+        self.assertIsNone(fm.dsa_topk_indices_buf)
+        torch.testing.assert_close(fm.output_tokens_buf[indices], payload.bonus_tokens)
+
 
 if __name__ == "__main__":
     unittest.main()

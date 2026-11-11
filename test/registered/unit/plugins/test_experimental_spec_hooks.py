@@ -1220,7 +1220,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 output_topk_p=torch.tensor([0.5]),
                 output_topk_index=torch.tensor([7]),
                 hidden_states_tensor=torch.full((4,), float(i)),
-                output_dsa_topk_indices=None,
+                output_dsa_topk_indices=torch.tensor([i, 9], dtype=torch.int32),
             )
             for i in range(2)
         ]
@@ -1259,27 +1259,24 @@ class TestExperimentalSpecHooks(CustomTestCase):
             seeded = []
             with patch(
                 "sglang_tpu.experimental._pd_carry_seeder",
-                lambda indices, hidden: seeded.append((indices, hidden)),
+                lambda *args: seeded.append(args),
             ):
                 chain = build_disagg_eagle_input(
                     core, batch(algorithm), bonus, future_map
                 )
             self.assertIsInstance(chain, HostPaddedChainDraftInput)
             check_relayed(chain)
-            ((indices, hidden),) = seeded
+            ((indices, hidden, dsa_topk),) = seeded
             self.assertIs(indices, rows)
             self.assertEqual(hidden[:, 0].tolist(), [0.0, 1.0])
+            # With index sharing the prefill's DSA top-k rides along.
+            self.assertEqual(dsa_topk.tolist(), [[0, 9], [1, 9]])
 
         for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
             block = build_disagg_block_input(core, batch(algorithm), bonus, future_map)
             self.assertIsInstance(block, HostPaddedBlockDraftInput)
             check_relayed(block)
 
-        reqs[0].output_dsa_topk_indices = torch.zeros(4)
-        with self.assertRaisesRegex(NotImplementedError, "DSA"):
-            build_disagg_eagle_input(
-                core, batch(SpeculativeAlgorithm.EAGLE3), bonus, future_map
-            )
         plain = batch(SpeculativeAlgorithm.EAGLE3)
         plain.host_pad_bs = None
         sentinel = object()
@@ -1349,13 +1346,20 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker._pad_bs = _pad
         worker._draft_runner = SimpleNamespace(dtype=torch.float32)
         carry = torch.zeros((8, 2))
-        worker._chain_draft_worker = SimpleNamespace(carry=MagicMock(wraps=carry))
-        worker._seed_carry(torch.tensor([3, 5]), torch.ones((2, 2)))
+        seed_table = torch.full((8, 5), 7, dtype=torch.int32)
+        worker._chain_draft_worker = SimpleNamespace(
+            carry=MagicMock(wraps=carry), dsa_seed_topk_table=seed_table
+        )
+        seeds = torch.tensor([[4, 5, 6], [8, 9, -1]], dtype=torch.int32)
+        worker._seed_carry(torch.tensor([3, 5]), torch.ones((2, 2)), seeds)
         (dim, rows, hidden), _ = worker._chain_draft_worker.carry.index_copy_.call_args
         self.assertEqual(rows.tolist(), [3, 5, 0, 0])
         self.assertEqual(hidden.shape, (4, 2))
         self.assertEqual(carry[3].tolist(), [1.0, 1.0])
         self.assertEqual(carry[0].tolist(), [0.0, 0.0])
+        # With index sharing the DSA seed rows are padded with -1 to the table width.
+        self.assertEqual(seed_table[3].tolist(), [4, 5, 6, -1, -1])
+        self.assertEqual(seed_table[1].tolist(), [7] * 5)
 
     def _retraction_worker(self, draft_pool, *, mode="decode", backup="cpu_tensor"):
         from sglang_tpu.experimental.speculative.block_spec_worker import (
