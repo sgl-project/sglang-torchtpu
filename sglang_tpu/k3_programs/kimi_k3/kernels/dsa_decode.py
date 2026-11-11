@@ -135,6 +135,8 @@ def scoped_scratch(batch, *, hidden, index_block_shape, key_rows, page_tokens, s
         "own": pltpu.SMEM((batch,), jnp.int32),
         "attend_keys": key_buf,
         "attend_key_sems": key_sems,
+        # Attention steps holding a selected token (row-major, ``key_rows / step rows`` a row).
+        "active": pltpu.SMEM((batch * (key_rows // key_buf.shape[2]),), jnp.int32),
         **select,
     }
 
@@ -298,6 +300,9 @@ class DecodeIndexer:
         select.in_flight(query, s["w_t"], s["new_k8"])
         select.score(query, s["w_t"])
         select.select()
+        span_rows = s["attend_keys"].shape[2]
+        steps = self.keys.shape[1] // span_rows
+        select.step_activity(span_rows, s["active"], steps)
         record_copy.wait()
         return mla_dcp.DcpSelection(self.keys, s["tau"], s["p_tie"], s["own"],
-                                    s["attend_keys"], s["attend_key_sems"])
+                                    s["attend_keys"], s["attend_key_sems"], active=s["active"], steps=steps)

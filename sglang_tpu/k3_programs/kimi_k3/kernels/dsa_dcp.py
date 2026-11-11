@@ -493,6 +493,54 @@ class IndexSelect:
             refs["own"][b] = selected(own_key, self.position_ref[b], tau_b, p_tie_b).astype(jnp.int32)
 
 
+def _step_activity(self, span_rows: int, active_ref, steps: int):
+    """``active_ref[b * steps + s]`` = 1 where attention step ``s`` (key rows
+    ``[s span_rows, (s + 1) span_rows)``) of row ``b``'s sequence (``b`` its
+    first row) holds a selected token of any of its rows; after ``select``."""
+    refs, chunk = self.refs, self.chunk
+    if chunk % span_rows or self.key_rows % span_rows:
+        raise ValueError("attention steps must tile the key chunks")
+
+    def clear(i, carry):
+        active_ref[i] = jnp.int32(0)
+        return carry
+
+    jax.lax.fori_loop(0, self.batch * steps, clear, 0)
+    total = refs["chunk_starts"][self.batch]
+    for step in range(SLOTS - 1):
+        pl_when(step < total)(lambda step=step: self._chunk_copy(step))
+    sub = jax.lax.broadcasted_iota(jnp.int32, (span_rows, LANES), 0)
+    lane = jax.lax.broadcasted_iota(jnp.int32, (span_rows, LANES), 1)
+
+    def step_fn(step, carry):
+        row, local = _locate(refs["chunk_starts"], step, self.batch)
+        self._wait_chunk(step)
+        pl_when(step + SLOTS - 1 < total)(lambda: self._chunk_copy(step + SLOTS - 1))
+        start = jnp.minimum(local * chunk, self.key_rows - chunk)
+        rows_valid = refs["counts"][row] * self.subpages
+        tau, p_tie = refs["tau"][row], refs["p_tie"][row]
+        target = row - row % self.S if self.S > 1 else row
+        for v in range(chunk // span_rows):
+            key = refs["key_buf"][step % SLOTS, pl_ds(v * span_rows, span_rows), :]
+            key_row = start + v * span_rows + sub
+            valid = (key_row >= local * chunk) & (key_row < rows_valid)
+            page = key_row // self.subpages
+            position = ((page * self.group + self.owner) * self.T
+                        + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS + lane)
+            hit = jnp.sum((valid & selected(key, position, tau, p_tie)).astype(jnp.int32))
+            index = target * steps + (start + v * span_rows) // span_rows
+
+            @pl_when(hit > 0)
+            def mark(index=index):
+                active_ref[index] = jnp.int32(1)
+        return carry
+
+    jax.lax.fori_loop(0, total, step_fn, 0)
+
+
+IndexSelect.step_activity = _step_activity
+
+
 def pl_when(condition):
     from jax.experimental import pallas as pl
 

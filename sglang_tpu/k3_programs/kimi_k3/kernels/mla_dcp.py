@@ -246,6 +246,11 @@ class DcpSelection:
     own: Any  # SMEM [B] int32: 1 when the row's own new token is selected
     key_buf: Any  # VMEM [buffers, sequence rows, span * T / 128, 128] int32
     key_semaphores: Any  # DMA [buffers]
+    # SMEM [B * steps] int32 or None: 1 where row b's step (a sequence's
+    # first row: any of its rows) holds a selected token. Other steps read
+    # no pages and attend nothing.
+    active: Any = None
+    steps: int = 0
 
 
 def selection_scratch(batch, span=SPAN, buffers=BUFFERS, page_tokens=PAGE_TOKENS, *, sequence_rows=1,
@@ -508,6 +513,19 @@ class DcpAttention:
         """The step's ``span`` page DMAs; pages past the row's last re-read its
         last page (masked by position)."""
         row, local_step, count = self._locate(step)
+        if self.selection is not None and self.selection.active is not None:
+            pl.when(self._active(row, local_step))(lambda: self._start_copies(step, row, local_step, count))
+            return
+        self._start_copies(step, row, local_step, count)
+
+    def _active(self, row, local_step):
+        """Whether ``row``'s step ``local_step`` holds a selected token (always without a table)."""
+        sel = self.selection
+        if sel is None or sel.active is None:
+            return True
+        return sel.active[row * sel.steps + local_step] != 0
+
+    def _start_copies(self, step, row, local_step, count):
         slot = step % self.buffers
         if self.selection is not None:
             sel = self.selection
@@ -531,6 +549,13 @@ class DcpAttention:
                 self.ws.page_semaphores.at[slot])
 
     def _wait_step(self, step):
+        if self.selection is not None and self.selection.active is not None:
+            row, local_step, _ = self._locate(step)
+            pl.when(self._active(row, local_step))(lambda: self._wait_copies(step))
+            return
+        self._wait_copies(step)
+
+    def _wait_copies(self, step):
         slot = step % self.buffers
         tpu.make_async_copy(self.ws.pages.at[slot], self.ws.pages.at[slot],
                             self.ws.page_semaphores.at[slot]).wait()
@@ -549,7 +574,10 @@ class DcpAttention:
         offset = jax.lax.broadcasted_iota(jnp.int32, keys.shape, 1)
         page = (local_step * self.span + offset // self.page_tokens) * self.group + self.owner
         token = page * self.page_tokens + offset % self.page_tokens
-        return dsa_dcp.selected(keys, token, sel.tau[row + r], sel.p_tie[row + r])
+        mask = dsa_dcp.selected(keys, token, sel.tau[row + r], sel.p_tie[row + r])
+        if sel.active is not None:  # a skipped step's buffers hold an earlier step's bytes
+            mask = mask & self._active(row, local_step)
+        return mask
 
     def _attend_step(self, step, base=0):
         """One step of the local attention: wait for its pages, prefetch
