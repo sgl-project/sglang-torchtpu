@@ -15,6 +15,9 @@ from pathlib import Path
 from time import perf_counter
 from typing import Mapping
 
+import numpy as np
+import torch
+
 from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
 
 logger = logging.getLogger(__name__)
@@ -23,6 +26,35 @@ logger = logging.getLogger(__name__)
 _EXPERT = re.compile(
     r"^layers\.(0|[1-9]\d*)\.ffn\.experts\.(0|[1-9]\d*)\.w[123]\.(weight|scale)$"
 )
+# Engram hash tables are ~100 GB ranges, far above any per-rank RunAI buffer.
+# Every rank copies only its own row range, so they are mapped, not streamed.
+_ENGRAM_TABLE = re.compile(r"^layers\.(0|[1-9]\d*)\.engram\.embed\.(weight|scale)$")
+
+_SAFETENSORS_DTYPES = {
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E8M0": torch.float8_e8m0fnu,
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "I32": torch.int32,
+    "I64": torch.int64,
+}
+
+
+def mapped_safetensors(path: str, names: set[str]):
+    """Yield (name, tensor) views over an mmap of ``path``; no bytes are read
+    until a slice of the view is touched."""
+    with open(path, "rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(header_len))
+    data = np.memmap(path, dtype=np.uint8, mode="r", offset=8 + header_len)
+    for name in sorted(names):
+        entry = header[name]
+        start, end = entry["data_offsets"]
+        raw = torch.from_numpy(data[start:end])
+        yield name, raw.view(_SAFETENSORS_DTYPES[entry["dtype"]]).view(entry["shape"])
 
 
 @dataclass(frozen=True)
@@ -138,11 +170,18 @@ class DSV41RunaiModelStreamerLoader(RunaiModelStreamerLoader):
             ep_size=parallel.moe_ep_size,
             ep_rank=parallel.moe_ep_rank,
         )
-        files = [path for path in files if path.rsplit("/", 1)[-1] in plan.shard_names]
-        if len(files) != len(plan.shard_names):
+        weight_map = index["weight_map"]
+        mapped = {n for n in plan.tensor_names if _ENGRAM_TABLE.fullmatch(n)}
+        streamed = plan.tensor_names - mapped
+        if mapped and is_runai_obj_uri(folder):
+            raise ValueError("Engram tables need a local or mounted checkpoint path")
+        by_name = {path.rsplit("/", 1)[-1]: path for path in files}
+        if not plan.shard_names <= by_name.keys():
             raise ValueError(
                 "RunAI shard list does not cover the selected checkpoint index"
             )
+        stream_shards = {weight_map[n] for n in streamed}
+        files = [by_name[s] for s in sorted(stream_shards)]
         logger.info(
             "V4.1 EP rank %d/%d: reading %d/%d tensors (%d local expert tensors) from %d shards",
             parallel.moe_ep_rank,
@@ -163,12 +202,17 @@ class DSV41RunaiModelStreamerLoader(RunaiModelStreamerLoader):
                 files,
                 device="cpu",
                 is_distributed=False,
-                tensor_names=plan.tensor_names,
+                tensor_names=streamed,
             )
             for name, tensor in streamer.get_tensors():
                 size += tensor.numel() * tensor.element_size()
                 count += 1
                 setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+                yield name, tensor
+        for shard in sorted({weight_map[n] for n in mapped}):
+            names = {n for n in mapped if weight_map[n] == shard}
+            for name, tensor in mapped_safetensors(by_name[shard], names):
+                count += 1
                 yield name, tensor
         logger.info(
             "V4.1 EP rank %d: consumed %d selected tensors, %.3f GB in %.3f s (includes parameter loading)",
