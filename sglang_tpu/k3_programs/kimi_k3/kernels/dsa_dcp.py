@@ -273,6 +273,19 @@ class IndexSelect:
             return jax.lax.fori_loop(0, refs["chunk_starts"][b + 1] - first, one, carry)
 
         jax.lax.fori_loop(0, self.batch, fill, 0)
+
+        # Each scoring step's (sequence, local page), likewise.
+        def fill_pages(seq, carry):
+            first = refs["page_starts"][seq]
+
+            def one(j, carry):
+                refs["page_seq"][first + j] = seq
+                refs["page_local"][first + j] = j
+                return carry
+
+            return jax.lax.fori_loop(0, refs["page_starts"][seq + 1] - first, one, carry)
+
+        jax.lax.fori_loop(0, self.batch // self.S, fill_pages, 0)
         refs["state"][...] = state
 
     # ------------------------------------------------------------------ scoring
@@ -305,7 +318,7 @@ class IndexSelect:
     def _page_copy(self, step):
         from jax.experimental.pallas import tpu as pltpu
 
-        seq, local = _locate(self.refs["page_starts"], step, self.batch // self.S)
+        seq, local = self.refs["page_seq"][step], self.refs["page_local"][step]
         slot = step % self.page_slots
         block = self._block(seq * self.S, local)
         for index, pool in enumerate(self.pools):
@@ -347,7 +360,7 @@ class IndexSelect:
         lane_row = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
 
         def page_step(step, carry):
-            seq, local = _locate(refs["page_starts"], step, sequences)
+            seq, local = refs["page_seq"][step], refs["page_local"][step]
             first_row = seq * S
             slot, stage = step % self.page_slots, step % 2
             self._wait_page(step)
@@ -695,6 +708,8 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         "chunk_starts": pltpu.SMEM((batch + 1,), jnp.int32),
         "step_row": pltpu.SMEM((batch * -(-key_rows // min(CHUNK_ROWS, key_rows)),), jnp.int32),
         "step_local": pltpu.SMEM((batch * -(-key_rows // min(CHUNK_ROWS, key_rows)),), jnp.int32),
+        "page_seq": pltpu.SMEM((batch * -(-key_rows * LANES // (subpages * INDEX_SUBPAGE_TOKENS)),), jnp.int32),
+        "page_local": pltpu.SMEM((batch * -(-key_rows * LANES // (subpages * INDEX_SUBPAGE_TOKENS)),), jnp.int32),
         "row_prefix": pltpu.SMEM((batch,), jnp.int32),
         "row_position": pltpu.SMEM((batch,), jnp.int32),
     }
