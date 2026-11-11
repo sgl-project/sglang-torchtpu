@@ -47,6 +47,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
@@ -276,6 +277,18 @@ class EngramHasher(nn.Module):
         result.image_token_id = image_token_id
         return result
 
+    def prepare_extend_rows(self, lens, starts, *, bs, device, output_size) -> torch.Tensor:
+        """Map real packed extend tokens to batch rows for an external backend.
+
+        ``starts`` is the exclusive prefix sum of nonnegative ``lens``; repeated
+        starts are valid for empty requests. Return int64 rows on ``device``,
+        excluding graph padding. ``output_size`` may be None when no host total
+        is available. The default retains the native repeat-interleave behavior.
+        """
+        return torch.repeat_interleave(
+            torch.arange(bs, device=device), lens, output_size=output_size
+        )
+
     def forward(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -314,12 +327,21 @@ class EngramHasher(nn.Module):
             lens = forward_batch.extend_seq_lens.to(torch.int64)
             starts = forward_batch.extend_start_loc.to(torch.int64)
             lens_cpu = forward_batch.extend_seq_lens_cpu
-            row = torch.repeat_interleave(
-                torch.arange(bs, device=device),
-                lens,
-                # The host total skips the device sum's sync.
-                output_size=sum(lens_cpu) if lens_cpu is not None else None,
-            )
+            if current_platform.is_out_of_tree():
+                row = self.prepare_extend_rows(
+                    lens,
+                    starts,
+                    bs=bs,
+                    device=device,
+                    output_size=sum(lens_cpu) if lens_cpu is not None else None,
+                )
+            else:
+                row = torch.repeat_interleave(
+                    torch.arange(bs, device=device),
+                    lens,
+                    # The host total skips the device sum's sync.
+                    output_size=sum(lens_cpu) if lens_cpu is not None else None,
+                )
             num_real = row.shape[0]
             kmode = MODE_EXTEND
             if forward_batch.engram_history is not None:
