@@ -96,8 +96,11 @@ def qa_eligibility_reason(module: torch.nn.Module) -> str | None:
             or gamma.shape != (size,)
         ):
             return f"{name} needs original BF16 gamma [{size}] for exact FP32 upcast"
-        if gamma.requires_grad or gamma.device != weight.device:
-            return f"{name} gamma must be frozen on the Q-A weight device"
+        # Core RMSNorm keeps Parameter.requires_grad=True even in eval models.
+        # The inference adapter snapshots a detached FP32 upcast below; rejecting
+        # that metadata would silently disable every normally loaded QA layer.
+        if gamma.device != weight.device:
+            return f"{name} gamma must be on the Q-A weight device"
         if getattr(norm, "variance_epsilon", None) != eps:
             return "both norm eps must equal the shared kernel epsilon"
         if (
