@@ -41,6 +41,7 @@ from sglang_tpu.compilation.recompilation_checker import (
 from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.experimental import runs_draft_prompt_pass
 from sglang_tpu.experimental.compilation.spec_compile_policy import (
     TpuSpecDecodeCompilePolicyMixin,
 )
@@ -301,7 +302,7 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
                 target_feature_size=target_feature_size,
                 dsa_seed_topk_width=dsa_seed_topk_width,
             )
-        if disagg_mode != "decode":
+        if runs_draft_prompt_pass(disagg_mode):
             self._precompile_draft_prompt_extend(
                 target_feature_size, dsa_seed_topk_width=dsa_seed_topk_width
             )

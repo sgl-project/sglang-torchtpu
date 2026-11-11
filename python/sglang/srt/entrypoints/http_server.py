@@ -66,7 +66,7 @@ from fastapi.routing import APIRoute
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX, HEALTH_CHECK_TIMEOUT
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -141,7 +141,9 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
+    PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -198,7 +200,6 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 # Global constants
-HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
 
 
@@ -433,7 +434,7 @@ async def lifespan(fast_api_app: FastAPI):
         # Execute the general warmup
         warmup_thread = threading.Thread(
             target=_wait_and_warmup,
-            kwargs=warmup_thread_kwargs,
+            kwargs={**warmup_thread_kwargs, "event_loop": asyncio.get_running_loop()},
         )
         warmup_thread.start()
 
@@ -702,12 +703,12 @@ async def ready() -> Response:
 def _retrieve_health_probe_outcome(task: asyncio.Task) -> None:
     """Consume the outcome of a health probe task that nobody awaits.
 
-    health_generate decides from last_receive_tstamp and only requests
-    cancellation of its probe. The cancel can lose a race with the probe's own
-    wait_for timeout in _stream_one_response: the task then finishes with the
-    client-disconnect ValueError (the handler has already returned) instead of
-    CancelledError, and asyncio logs "Task exception was never retrieved" when
-    the task is garbage-collected.
+    health_generate decides from the completion acknowledgement and only
+    requests cancellation of its probe. The cancel can lose a race with the
+    probe's own wait_for timeout in _stream_one_response: the task then
+    finishes with the client-disconnect ValueError (the handler has already
+    returned) instead of CancelledError, and asyncio logs "Task exception was
+    never retrieved" when the task is garbage-collected.
     """
     if task.cancelled():
         return
@@ -719,11 +720,13 @@ def _retrieve_health_probe_outcome(task: asyncio.Task) -> None:
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
-    """
-    Check the health of the inference server by sending a special request to generate one token.
+    """Report 200 only after the engine completes inference for this probe.
 
-    If the server is running something, this request will be ignored, so it creates zero overhead.
-    If the server is not running anything, this request will be run, so we know whether the server is healthy.
+    The scheduler registers the probe and acknowledges it, by rid, after a
+    batch with real work finishes: a chunk or step of running traffic when
+    busy (no extra forward), or the probe's own tiny forward when idle. HTTP
+    liveness, control replies, aborts and errors prove nothing, so a stalled
+    model keeps failing until it completes work again.
     """
 
     if _global_state.tokenizer_manager.gracefully_exit:
@@ -746,7 +749,11 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
-    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
+    disaggregation_mode = get_disagg().disaggregation_mode
+    # A decode engine finishes a 1-token probe at the prebuilt fake-handoff
+    # stage without a forward; the second token forces a real decode step.
+    max_new_tokens = 2 if disaggregation_mode == DisaggregationMode.DECODE.value else 1
+    sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0.0}
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
     # collide and crash the shared DetokenizerManager decode_status).
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
@@ -758,7 +765,7 @@ async def health_generate(request: Request) -> Response:
             sampling_params=sampling_params,
             log_metrics=False,
         )
-        if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
+        if disaggregation_mode != DisaggregationMode.NULL.value:
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
     else:
@@ -770,35 +777,38 @@ async def health_generate(request: Request) -> Response:
         async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
             break
 
+    # Registered before dispatch so the acknowledgement cannot arrive first.
+    probe = _global_state.tokenizer_manager.register_health_probe(rid)
+    tic = time.time()
     task = asyncio.create_task(gen())
     # A done callback, not an await: if the cancel below loses its race, the
     # task runs until the next SGLANG_REQUEST_STATE_WAIT_TIMEOUT tick, and
     # awaiting it would add that to the probe's latency.
     task.add_done_callback(_retrieve_health_probe_outcome)
 
-    # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
-    tic = time.time()
-    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-        await asyncio.sleep(1)
-        if _global_state.tokenizer_manager.last_receive_tstamp > tic:
-            task.cancel()
-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
-            return Response(status_code=200)
-
-    task.cancel()
-    tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
-    last_receive_time = time.strftime(
-        "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
-    )
-    logger.error(
-        f"Health check failed. Server couldn't get a response from detokenizer for last "
-        f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
-        f"last_heartbeat time: {last_receive_time}"
-    )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
-    return Response(status_code=503)
+    try:
+        await asyncio.wait_for(probe.event.wait(), HEALTH_CHECK_TIMEOUT)
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+        return Response(status_code=200)
+    except asyncio.TimeoutError:
+        tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
+        last_receive_time = time.strftime(
+            "%H:%M:%S",
+            time.localtime(_global_state.tokenizer_manager.last_receive_tstamp),
+        )
+        logger.error(
+            f"Health check failed. No batch completed inference for probe {rid} within "
+            f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
+            f"last completion per dp_rank (incarnation, seq): "
+            f"{_global_state.tokenizer_manager.health_progress}. "
+            f"last message from scheduler/detokenizer: {last_receive_time}"
+        )
+        _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+        return Response(status_code=503)
+    finally:
+        task.cancel()
+        _global_state.tokenizer_manager.discard_health_probe(rid)
+        _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
 
 
 @app.get("/get_model_info")
@@ -1293,6 +1303,19 @@ async def update_weights_from_disk(
         )
 
 
+@app.post("/pull_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pull_weights(obj: Annotated[PullWeightsReqInput, Body()], request: Request):
+    """Have every host of this deployment pull published weight deltas into its
+    local checkpoint (materialized from the model path on first use)."""
+    success, message = await _global_state.tokenizer_manager.pull_weights(obj, request)
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+    )
+
+
 @app.post("/init_weights_send_group_for_remote_instance")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_send_group_for_remote_instance(
@@ -1450,6 +1473,24 @@ async def end_weight_update(
         {"success": success, "message": message},
         status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
     )
+
+
+@app.post("/plugin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def plugin_weight_update(
+    obj: Annotated[PluginWeightUpdateReqInput, Body()], request: Request
+):
+    """Receive weights through a platform transport and load them, as /update_weights_from_distributed does."""
+    reply = await _global_state.tokenizer_manager.plugin_weight_update(obj, request)
+    content = {
+        "success": reply.success,
+        "message": reply.message,
+        "received_tensor_counts": reply.received_tensor_counts,
+    }
+    if reply.success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/update_weights_from_distributed")
@@ -2222,7 +2263,8 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     architectures = model_info.get("architectures") or []
     if (
         "KimiK3ForConditionalGeneration" in architectures
-        or model_info.get("model_type") == "kimi_k3"
+        or "KimiK31ForConditionalGeneration" in architectures
+        or model_info.get("model_type") in ("kimi_k3", "kimi_k31")
     ):
         logger.info(
             "Using a 448x448 image for Kimi K3 VLM startup warmup to exercise "
@@ -2447,57 +2489,25 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
-# Arbitrary margin: the server listens within a second of the warmup thread starting.
-# A retry window for connecting; scheduler cleanup uses the warmup timeout.
-_FREEZE_GC_RETRY_SECS = 30.0
 _FREEZE_GC_TIMEOUT_SECS = 600
 
 
-def _freeze_gc_after_server_warmup(server_args: ServerArgs):
-    # Freeze GC after server warmup so static objects skip future GC gen2 collection.
-    # Use /freeze_gc to freeze scheduler and detokenizer as well.
-    freeze_key = get_serving().admin_api_key or get_serving().api_key
-    freeze_headers = {}
-    if freeze_key:
-        freeze_headers["Authorization"] = f"Bearer {freeze_key}"
-    start = time.monotonic()
+def _freeze_gc_after_server_warmup(event_loop: asyncio.AbstractEventLoop):
+    # Use the serving loop that owns the tokenizer's IPC handlers. This reaches
+    # every scheduler without waiting for the server to accept HTTP connections.
+    cleanup = asyncio.run_coroutine_threadsafe(
+        _global_state.tokenizer_manager.freeze_gc(), event_loop
+    )
     timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            res = requests.post(
-                server_args.url() + "/freeze_gc",
-                headers=freeze_headers,
-                timeout=timeout if timeout > 0 else _FREEZE_GC_TIMEOUT_SECS,
-                verify=ssl_verify_of(server_args),
-            )
-            res.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            # Without the full warmup's wait for /model_info this can run before the
-            # server listens; an SSLError is a ConnectionError that retrying cannot fix.
-            retry = isinstance(
-                e, requests.exceptions.ConnectionError
-            ) and not isinstance(e, requests.exceptions.SSLError)
-            if retry and time.monotonic() - start < _FREEZE_GC_RETRY_SECS:
-                time.sleep(0.5)
-                continue
-            logger.warning("post-warmup freeze_gc failed", exc_info=True)
-            raise
-        if attempt > 1:
-            # Scheduler cleanup has completed before this response is sent.
-            logger.info(
-                "post-warmup freeze_gc completed on attempt %d (%.1f s)",
-                attempt,
-                time.monotonic() - start,
-            )
-        return
+    cleanup.result(timeout=timeout if timeout > 0 else _FREEZE_GC_TIMEOUT_SECS)
 
 
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
+    *,
+    event_loop: asyncio.AbstractEventLoop,
 ):
     if get_model().checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
@@ -2516,7 +2526,7 @@ def _wait_and_warmup(
 
     if not envs.SGLANG_RUST_SERVER.get():
         # Rust owns its readiness lifecycle and has no /freeze_gc endpoint.
-        _freeze_gc_after_server_warmup(server_args)
+        _freeze_gc_after_server_warmup(event_loop)
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     # The server is ready for requests

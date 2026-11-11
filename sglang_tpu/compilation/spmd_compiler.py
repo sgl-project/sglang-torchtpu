@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import importlib.metadata
+import math
 import os
 import time
 from collections.abc import Callable, Iterator
@@ -22,6 +23,7 @@ from torch_tpu._internal.distributed import device_mesh
 
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.graph_identity import canonical, digest
+from sglang_tpu.compilation.shared_compile_cost import estimator_from_env
 
 logger = get_logger(__name__)
 T = TypeVar("T")
@@ -104,8 +106,10 @@ def _prepare_executable(
 class SPMDCompiler:
     """Coordinate shared compilation or graph verification for a warmup queue.
 
-    Sharing assigns each named specialization to a rank in round-robin order.
-    Only that rank traces and compiles it; ``finish`` distributes the executable
+    Sharing assigns each named specialization to one rank: the rank with the
+    least estimated trace work so far under a cost profile
+    (``shared_compile_cost``), else round-robin. Only that rank traces and
+    compiles it; ``finish`` distributes the executable
     and binds it to every rank's local inputs and callbacks. All ranks must
     enqueue the same keys in the same order.
 
@@ -123,21 +127,37 @@ class SPMDCompiler:
         self.group = group
         self.rank = dist.get_rank(group)
         self.size = dist.get_world_size(group)
+        self.global_rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
         self.verify_spmd_safe = verify_spmd_safe
         self.submissions: dict[str, Submission] = {}
         self.mlirs: dict[str, str] = {}
         self.argument_layouts: dict[str, list[list[int]]] = {}
+        # Trace-cost estimate per graph, or None for round-robin owners.
+        # Verification never assigns owners, so only sharing loads a profile.
+        self._estimate: Callable[[str], float] | None = None
+        self._estimated_load = [0.0] * self.size
+        self.trace_seconds: dict[str, float] = {}
+        """Owner-only trace time of each graph this rank traced."""
         self.directory = (
             Path(os.environ["VERIFY_SPMD_SAFE_DUMP_DIR"]) if verify_spmd_safe else None
         )
         self._serializer: ThreadPoolExecutor | None = None
+        self._verification_group = None
         if verify_spmd_safe:
-            if self.size != dist.get_world_size():
-                raise ValueError("SPMD verification requires the full TPU TP group")
+            # All engines must finish tracing before any worker exits: the
+            # serving launcher treats an early worker exit as startup failure.
+            if self.size != self.world_size:
+                self._verification_group = dist.new_group(backend="gloo")
             return
         runtime = None
         error: str | None = None
+        stage = "load the shared compile cost profile"
         try:
+            # Ranks assign owners independently, so a rank that cannot load the
+            # profile, or loads a different one, must fail every rank below.
+            self._estimate, cost_profile = estimator_from_env()
+            stage = "identify the compiler runtime"
             mapping = [int(value) for value in device_mesh.get_device_assignment()]
             runtime = dict(
                 device_assignment=mapping,
@@ -147,11 +167,12 @@ class SPMDCompiler:
                 },
                 XLA_FLAGS=os.environ.get("XLA_FLAGS", ""),
                 LIBTPU_INIT_ARGS=os.environ.get("LIBTPU_INIT_ARGS", ""),
+                cost_profile=cost_profile,
             )
-            if self.size != len(mapping) or self.size != dist.get_world_size():
-                error = "only the full TPU TP group is supported"
+            if len(mapping) != self.world_size:
+                error = "the TPU session and distributed world must have the same size"
         except Exception as caught:
-            error = f"cannot identify the compiler runtime: {type(caught).__name__}: {caught}"
+            error = f"cannot {stage}: {type(caught).__name__}: {caught}"
         records = self.gather((runtime, error))
         reasons = [
             f"rank {rank}: {reason}"
@@ -197,7 +218,19 @@ class SPMDCompiler:
             return
         if graph in self.submissions:
             raise ValueError(f"Duplicate shared TPU graph name: {graph}")
-        self.submissions[graph] = Submission(owner=len(self.submissions) % self.size)
+        if self._estimate is None:
+            owner = len(self.submissions) % self.size
+        else:
+            cost = float(self._estimate(graph))
+            if not math.isfinite(cost) or cost < 0:
+                raise ValueError(f"Invalid shared TPU graph cost {cost!r}: {graph}")
+            owner = min(range(self.size), key=self._estimated_load.__getitem__)
+            self._estimated_load[owner] += cost
+        self.submissions[graph] = Submission(owner=owner)
+
+    def record_trace(self, graph: str, seconds: float) -> None:
+        """Record how long the owner took to trace and submit ``graph``."""
+        self.trace_seconds[graph] = seconds
 
     def compile(
         self,
@@ -247,10 +280,16 @@ class SPMDCompiler:
         assignments = [(graph, item.owner) for graph, item in self.submissions.items()]
         if any(peer != assignments for peer in self.gather(assignments)):
             raise ValueError("Shared TPU graph order or owners differ across ranks")
+        traces = self.gather(self.trace_seconds)
         start = time.perf_counter()
         if self.rank == 0:
             for graph, owner in assignments:
-                logger.info("[shared_compile] owner=%d graph=%s", owner, graph)
+                logger.info(
+                    "[shared_compile] owner=%d trace=%.3fs graph=%s",
+                    owner,
+                    traces[owner].get(graph, math.nan),
+                    graph,
+                )
         self._distribute()
         logger.info(
             "[shared_compile] compile/distribute wait=%.3fs",
@@ -296,13 +335,16 @@ class SPMDCompiler:
         for graph in self.mlirs.keys() & (
             differences.keys() | layout_differences.keys()
         ):
-            prefix = self.directory / f"{digest(graph)}-rank-{self.rank}"
+            prefix = self.directory / f"{digest(graph)}-rank-{self.global_rank}"
             with gzip.open(f"{prefix}.mlir.gz", "wt") as output:
                 output.write(self.mlirs[graph])
         result = {
             "passed": not errors,
-            "world_size": self.size,
-            "rank": self.rank,
+            "world_size": self.world_size,
+            "rank": self.global_rank,
+            "group_ranks": [
+                dist.get_global_rank(self.group, i) for i in range(self.size)
+            ],
             "pid": os.getpid(),
             "keys": keys,
             "mlir_hashes": mlir_hashes,
@@ -311,11 +353,12 @@ class SPMDCompiler:
             "layout_differences": layout_differences,
             "errors": errors,
         }
-        (self.directory / f"worker-{self.rank}.json").write_text(
-            canonical(result) + "\n"
-        )
-        # Every worker has retained its evidence before the parent observes exits.
-        dist.barrier(group=self.group)
+        marker = self.directory / f"worker-{self.global_rank}.json.tmp"
+        marker.write_text(canonical(result) + "\n")
+        # Parents may stop the launcher as soon as all local results are visible.
+        # Retain every rank's diagnostics and finish collectives before publishing.
+        dist.barrier(group=self._verification_group or self.group)
+        marker.replace(self.directory / f"worker-{self.global_rank}.json")
         if self.rank == 0:
             logger.info("SPMD_VERIFICATION_GRAPHS %s", canonical(result))
         # Verification never executes pending calls or announces server readiness.
@@ -361,12 +404,17 @@ class SPMDCompiler:
                     header[0] = (
                         True,
                         len(serialized) if serialized is not None else None,
+                        executable.subslice_origin(),
                     )
                 except Exception as caught:
-                    header[0] = (False, f"{type(caught).__name__}: {str(caught)[:512]}")
+                    header[0] = (
+                        False,
+                        f"{type(caught).__name__}: {str(caught)[:512]}",
+                        None,
+                    )
             source = dist.get_global_rank(self.group, item.owner)
             dist.broadcast_object_list(header, src=source, group=self.group)
-            success, length = header[0]
+            success, length, subslice_origin = header[0]
             with self.coordinate_errors("preparing transfer"):
                 if not success:
                     raise RuntimeError(length)
@@ -380,15 +428,21 @@ class SPMDCompiler:
                 dist.broadcast(buffer, src=source, group=self.group)
             with self.coordinate_errors("loading executable"):
                 if executable is None:
+                    # Serialized bytes omit the TPU subslice's chip coordinates.
+                    # Preserve the owner's origin when loading on its TP peers.
                     executable = tc.load_serialized_executable(
                         zstandard.ZstdDecompressor().decompress(
                             buffer.numpy().tobytes()
-                        )
+                        ),
+                        subslice_origin=subslice_origin,
                     )
                 item.executable = executable
 
     def clear(self) -> None:
         """Wait for native work and release this queue's graphs and submissions."""
+        if self._verification_group is not None:
+            dist.destroy_process_group(self._verification_group)
+            self._verification_group = None
         if self._serializer is not None:
             self._serializer.shutdown(wait=True, cancel_futures=True)
         for item in self.submissions.values():
@@ -401,3 +455,5 @@ class SPMDCompiler:
         self.submissions.clear()
         self.mlirs.clear()
         self.argument_layouts.clear()
+        self.trace_seconds.clear()
+        self._estimated_load = [0.0] * self.size

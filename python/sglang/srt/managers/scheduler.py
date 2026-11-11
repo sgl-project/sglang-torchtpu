@@ -153,7 +153,6 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReqOutput,
     GetInternalStateReq,
     GetWeightsByNameReqInput,
-    HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -167,7 +166,9 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
+    PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -233,6 +234,9 @@ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
+from sglang.srt.managers.scheduler_components.health_monitor import (
+    SchedulerHealthMonitor,
+)
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -262,6 +266,9 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     RECORD_STEP_TIME,
     PrefillStats,
     SchedulerMetricsReporter,
+)
+from sglang.srt.managers.scheduler_components.mm_feature_releaser import (
+    MM_FEATURE_RELEASER,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -1341,7 +1348,10 @@ class Scheduler(
         self.enable_continuous_input_polling = False
         self.forward_ct = 0
         self.recompile_stance_set = False
-        self.return_health_check_ipcs: Deque[Optional[str]] = deque()
+        self.health_monitor = SchedulerHealthMonitor(
+            self.ipc_channels.send_to_tokenizer.send_output,
+            get_parallel().dp_rank if get_parallel().dp_rank is not None else 0,
+        )
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
@@ -1944,6 +1954,10 @@ class Scheduler(
                     self.weight_updater.end_weight_update,
                 ),
                 (
+                    PluginWeightUpdateReqInput,
+                    self.weight_updater.plugin_weight_update,
+                ),
+                (
                     UpdateWeightsFromDistributedReqInput,
                     self.weight_updater.update_weights_from_distributed,
                 ),
@@ -1974,6 +1988,10 @@ class Scheduler(
                 (
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
+                ),
+                (
+                    PullWeightsReqInput,
+                    self.weight_updater.pull_weights,
                 ),
                 (SlowDownReqInput, self.slow_down),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
@@ -2324,14 +2342,14 @@ class Scheduler(
             if get_mm().mm_feature_transport == "cuda_vmm":
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
-            # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
-            ):
-                self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
-                )
-                continue
+            if is_health_check_generate_req(recv_req):
+                # A busy engine proves itself with the batch it is running, so
+                # the probe waits for that completion instead of a forward of
+                # its own; on_idle admits it if no completion follows.
+                admitted = self.is_fully_idle(for_health_check=True)
+                self.health_monitor.register(recv_req, admitted=admitted)
+                if not admitted:
+                    continue
 
             if vmm_errors is not None and any(vmm_errors):
                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
@@ -2988,7 +3006,7 @@ class Scheduler(
             if req.session:
                 continue
             # For non-session requests, clear features and mm_inputs
-            mm_inputs.release_features()
+            MM_FEATURE_RELEASER.release(mm_inputs)
             req.multimodal_inputs = None
 
     def handle_generate_request(
@@ -4280,6 +4298,11 @@ class Scheduler(
                 self.page_size,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        # add_chunked_req parks a next chunk that does not fit: it returns the
+        # request without adding it to the batch.
+        memory_blocked = (
+            self.chunked_req is not None and self.chunked_req not in adder.can_run_list
+        )
 
         if self.enable_lora:
             running_loras = {
@@ -4387,6 +4410,7 @@ class Scheduler(
                         )
                     else:
                         running_batch.batch_is_full = True
+                    memory_blocked = True
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
@@ -4410,6 +4434,16 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            # CAP media anchors (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS) are
+            # cache-owned locks: a pass that admits nothing for lack of memory
+            # (a NO_TOKEN, or a parked chunk) releases the least recently used
+            # one, so the next pass can evict it.
+            if (
+                memory_blocked
+                and envs.SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS.get() > 0
+                and hasattr(self.tree_cache, "release_cap_anchor")
+            ):
+                self.tree_cache.release_cap_anchor()
             return None, running_batch
 
         can_run_set = set(can_run_list)
@@ -5185,11 +5219,16 @@ class Scheduler(
             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
         self._maybe_clear_mm_inputs(batch)
-        self.maybe_send_health_check_signal()
-        self.maybe_signal_queued_health_checks(batch)
         self.metrics_reporter.update_device_timer()
         if self.kv_free_fence is not None:
             self.kv_free_fence.on_forward_done(result)
+        # Last: everything above has synchronized and consumed the device
+        # results, so an acknowledgement here certifies completed inference.
+        if not self.health_monitor.on_batch_completed(batch):
+            # Idle, prebuilt or aborted-only passes prove nothing and, under
+            # DP attention, an otherwise idle rank runs them in lockstep
+            # without ever reaching on_idle.
+            self.admit_deferred_health_probes()
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -5244,56 +5283,16 @@ class Scheduler(
                 result.get_num_generated_tokens(batch_size),
             )
 
-    def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
-            # Return some signal for the health check.
-            # This is used to prevent the health check signal being blocked by long context prefill.
-            # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.ipc_channels.send_to_tokenizer.send_output(
-                HealthCheckOutput(
-                    http_worker_ipc=self.return_health_check_ipcs.popleft()
-                )
-            )
+    def admit_deferred_health_probes(self) -> None:
+        """Run probes that were deferred as busy when no completion will follow.
 
-    def maybe_signal_queued_health_checks(self, batch: ScheduleBatch) -> None:
-        """Answer health probes that are queued behind a prefill doing real work.
-
-        A probe that arrives while the scheduler looks idle is admitted like a
-        normal request, yet it can still land behind a long prompt (e.g. on a
-        PD prefill both leave the bootstrap queue in the same poll, prompt
-        first). Each chunk of that prompt fills the prefill token budget, so
-        the probe is not scheduled until the chain ends, and a prefill server
-        sends the tokenizer nothing meanwhile. A completed prefill batch with
-        real work is the evidence the busy path in process_input_requests
-        relies on, so send the same HealthCheckOutput that
-        maybe_send_health_check_signal sends.
-
-        The queues are the only state: each queued probe is flagged when
-        signaled, so a long chain answers it once, not once per chunk. A
-        scheduler that completes no batch sends nothing, so a hung engine still
-        fails the probe. The probe stays queued and runs its 1-token forward
-        later; the tokenizer drops that late output.
+        A probe deferred in the iteration after the last real batch completed
+        has nothing left to wait for; its own tiny forward is the only
+        evidence an idle engine can produce, and it does not depend on router
+        traffic that an unhealthy engine is not receiving.
         """
-        if (
-            not batch.forward_mode.is_extend_without_speculative()
-            or not batch.reqs
-            or all(is_health_check_generate_req(req) for req in batch.reqs)
-        ):
-            return
-        queues = [self.waiting_queue]
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            queues.append(self.disagg_prefill_bootstrap_queue.queue)
-        for queue in queues:
-            for req in queue:
-                if not is_health_check_generate_req(req) or getattr(
-                    req, "_health_check_signaled", False
-                ):
-                    continue
-                req._health_check_signaled = True
-                # One per probe rid, so an own-rid probe waiter can match it.
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    HealthCheckOutput(rid=req.rid, http_worker_ipc=req.http_worker_ipc)
-                )
+        for recv_req in self.health_monitor.pop_deferred():
+            self._request_dispatcher(recv_req)
 
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
@@ -5338,8 +5337,9 @@ class Scheduler(
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
-        # Flush any health-check signal deferred while the engine was busy.
-        self.maybe_send_health_check_signal()
+        # Nothing is waiting on the device: drop parked multimodal features.
+        MM_FEATURE_RELEASER.drain_all()
+        self.admit_deferred_health_probes()
 
         # Publish before the fully-idle gate: a no-batch-but-not-idle stall
         # (queues parked under KV pressure / disagg transfer) has no

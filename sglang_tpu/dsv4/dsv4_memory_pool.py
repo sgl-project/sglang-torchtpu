@@ -456,6 +456,70 @@ class TPUCompressStatePool(CompressStatePool):
 class DSV4TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     """TPU 3-tier KV cache and compressor state pool for DeepSeek-V4."""
 
+    SWA_BYTES_PER_TOKEN = 1024
+    CSA_BYTES_PER_TOKEN = 640
+    HCA_BYTES_PER_TOKEN = 1024
+    INDEXER_BYTES_PER_TOKEN = 256
+
+    @classmethod
+    def bytes_per_swa_token(cls, *, num_layers_total: int) -> float:
+        """Bytes one SWA slot costs across the stage (raw bf16, 1024 B/token)."""
+        return float(cls.SWA_BYTES_PER_TOKEN * num_layers_total)
+
+    @classmethod
+    def bytes_per_full_token(
+        cls,
+        *,
+        swa_ratio: float,
+        bytes_per_swa_token: float,
+        c4_shrink_factor: int,
+        num_c4_layers: int,
+        num_c128_layers: int,
+    ) -> float:
+        """Bytes one full token adds across the stage in 4D uint8 Pallas layouts."""
+        c4_frac = 1.0 / (4 * c4_shrink_factor)
+        return (
+            swa_ratio * bytes_per_swa_token
+            + c4_frac * cls.CSA_BYTES_PER_TOKEN * num_c4_layers
+            + (1.0 / 128) * cls.HCA_BYTES_PER_TOKEN * num_c128_layers
+            + (1.0 / 4) * cls.INDEXER_BYTES_PER_TOKEN * num_c4_layers
+        )
+
+    @staticmethod
+    def c128_state_fixed_bytes(
+        *,
+        num_req_slots: int,
+        attn_head_dim: int,
+        num_c128_layers: int,
+    ) -> int:
+        """Fixed byte budget for C128 TPUCompressStatePool across the stage."""
+        if num_c128_layers == 0:
+            return 0
+        state_pages = (
+            1 + num_req_slots * _TPU_STATE_SLOT_STRIDE_PAGES + _TPU_STATE_SCRATCH_PAGES
+        )
+        state_rows = state_pages * 8
+        return state_rows * (2 * attn_head_dim * 4) * num_c128_layers
+
+    @staticmethod
+    def c4_state_fixed_bytes(
+        *,
+        num_req_slots: int,
+        attn_head_dim: int,
+        indexer_head_dim: int,
+        num_c4_layers: int,
+    ) -> int:
+        """Fixed byte budget for C4 + C4-Indexer TPUCompressStatePools across the stage."""
+        if num_c4_layers == 0:
+            return 0
+        state_pages = (
+            1 + num_req_slots * _TPU_STATE_SLOT_STRIDE_PAGES + _TPU_STATE_SCRATCH_PAGES
+        )
+        state_rows = state_pages * 4
+        core_bytes = 4 * attn_head_dim * 4
+        indexer_bytes = 4 * indexer_head_dim * 4
+        return state_rows * (core_bytes + indexer_bytes) * num_c4_layers
+
     def __init__(self, *args, **kwargs):
         if (
             kwargs.get("start_layer") is None

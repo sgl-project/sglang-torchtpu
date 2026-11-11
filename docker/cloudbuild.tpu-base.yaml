@@ -15,14 +15,36 @@ options:
   machineType: E2_HIGHCPU_8
 
 steps:
-  - id: build-base
-    name: gcr.io/cloud-builders/docker
+  # Use the build service account for nightly wheels; keep its token out of
+  # the Docker context, image layers, build arguments, and logs.
+  - id: registry-auth
+    name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
     entrypoint: bash
+    volumes:
+      - name: registry-auth
+        path: /registry-auth
     args:
       - -c
       - |
         set -euo pipefail
+        umask 077
+        token="$$(gcloud auth print-access-token)"
+        printf 'machine us-python.pkg.dev login oauth2accesstoken password %s\n' \
+          "$$token" > /registry-auth/netrc
+
+  - id: build-base
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    volumes:
+      - name: registry-auth
+        path: /registry-auth
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        trap 'rm -f /registry-auth/netrc' EXIT
         DOCKER_BUILDKIT=1 docker build \
+          --secret id=gar_netrc,src=/registry-auth/netrc \
           -f docker/tpu-base.Dockerfile \
           -t "${_IMAGE}:${_TAG}" .
 

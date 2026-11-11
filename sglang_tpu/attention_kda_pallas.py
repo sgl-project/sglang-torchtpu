@@ -27,7 +27,7 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self._layer_state(layer.layer_id)
         num_tokens = mixed_qkv.shape[0]
         n_v, d_k, d_v = layer.num_v_heads, layer.head_k_dim, layer.head_v_dim
         # Kimi-Linear / Bailing bind [dim, K]; Kimi-K3 binds its depthwise
@@ -68,6 +68,9 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             fused_qkvg=getattr(layer, "fused_qkvg", False),
             # Kimi-K3 packs conv / dt_bias / A_log into one f32 operand post-load.
             packed_weights=getattr(layer, "packed_kernel_weights", None),
+            # Radix snapshot plan; None with the radix cache off.
+            track_indices=self._track_indices,
+            track_end=self._track_end,
             read_offsets=read_offsets,
             num_spec_tokens=self._num_spec_tokens,
         )

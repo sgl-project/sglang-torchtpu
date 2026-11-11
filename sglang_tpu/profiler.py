@@ -7,8 +7,8 @@ from pathlib import Path
 
 import msgspec
 
-from sglang.srt.environ import envs
 from sglang_tpu._logging import get_logger
+from sglang_tpu.envs import envs
 
 logger = get_logger(__name__)
 

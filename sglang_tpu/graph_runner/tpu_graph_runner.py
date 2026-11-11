@@ -33,7 +33,6 @@ from sglang.srt.compilation.support_torch_compile import (
     DecoderCompilePolicy,
     get_torch_compile_policy,
 )
-from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.core_compile_annotations import (
@@ -57,6 +56,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
 from sglang_tpu.compile_cache import (
     add_tpu_rank_assignment_to_compile_cache_key,
 )
+from sglang_tpu.envs import envs
 from sglang_tpu.experimental import (
     is_experimental_chain,
     is_experimental_spec_worker,

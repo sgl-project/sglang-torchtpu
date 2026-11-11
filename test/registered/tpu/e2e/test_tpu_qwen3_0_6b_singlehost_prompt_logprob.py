@@ -15,7 +15,6 @@ from contextlib import ExitStack
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import (
@@ -24,6 +23,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+from sglang_tpu.envs import envs
 
 register_tpu_ci(
     est_time=110,

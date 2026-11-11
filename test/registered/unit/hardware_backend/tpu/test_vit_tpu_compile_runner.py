@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.vision import (
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang_tpu.compilation import direct_compile
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.graph_runner import vit_tpu_compile_runner as vit_runner
 from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     Qwen3VLVisionTpuCompilePolicy,
@@ -30,11 +31,13 @@ register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 def _graph_config(
     *,
     tpu_compile_tracer: str,
+    use_spmd_compile: bool = False,
     unsafe_save_torch_compile_bundle: str | None = None,
     unsafe_load_torch_compile_bundle: str | None = None,
 ):
     graph = SimpleNamespace(
         tpu_compile_tracer=tpu_compile_tracer,
+        use_spmd_compile=use_spmd_compile,
         unsafe_save_torch_compile_bundle=unsafe_save_torch_compile_bundle,
         unsafe_load_torch_compile_bundle=unsafe_load_torch_compile_bundle,
     )
@@ -217,6 +220,34 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             self.assertEqual(policy.run(torch.arange(4)).tolist(), [0, 2])
             self.assertEqual(len(policy.compiled_fn.cache), 2)
 
+    def test_direct_subgroups_require_shared_compilation(self):
+        policy = _DirectVisionPolicy(nn.Identity())
+        for initialized, tp_size, world_size, shared, expected in (
+            (False, 1, 1, False, False),
+            (True, 2, 16, False, False),
+            (True, 1, 16, False, False),
+            (True, 4, 8, False, False),
+            (True, 4, 8, True, True),
+            (True, 16, 16, False, True),
+        ):
+            with (
+                self.subTest(tp_size=tp_size, world_size=world_size, shared=shared),
+                envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+                patch("torch.distributed.is_initialized", return_value=initialized),
+                patch("torch.distributed.get_world_size", return_value=world_size),
+                patch.object(
+                    vit_runner,
+                    "get_parallel",
+                    return_value=SimpleNamespace(
+                        tp_group=SimpleNamespace(world_size=tp_size)
+                    ),
+                ),
+                _graph_config(tpu_compile_tracer="direct", use_spmd_compile=shared),
+                patch.object(direct_compile, "direct_compile") as compile_mock,
+            ):
+                policy._compile_method(lambda x: x, use_bundle=False)
+                self.assertIs(compile_mock.call_args.kwargs["lift_rank"], expected)
+
     def test_default_policy_keeps_dynamo_with_async_enabled(self):
         policy = _FakeVisionPolicy()
         with (
@@ -290,9 +321,9 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
     def test_qwen3_vl_patch_buckets_honor_the_env_override(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
-        sizes = envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
+        sizes = tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
 
-        with _unset(sizes), _unset(envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES):
+        with _unset(sizes), _unset(tpu_envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES):
             ladder = policy.compute_patch_buckets()
         self.assertEqual((ladder[0], ladder[-1]), (196, 4900))
 
@@ -317,8 +348,8 @@ class TestViTTpuCompileRunner(unittest.TestCase):
     def test_env_cap_bounds_the_ladder_but_is_not_its_top_bucket(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
         with (
-            _unset(envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
-            envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(5000),
+            _unset(tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
+            tpu_envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(5000),
         ):
             ladder = policy.compute_patch_buckets()
         # 72^2 = 5184 overshoots the cap, so the real ceiling stays 70^2. Callers
@@ -485,11 +516,11 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         unwarmed = patch.object(vit_runner, "_precompiled_max_patch_count", None)
         with (
             unwarmed,
-            _unset(envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
-            envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1600),
+            _unset(tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
+            tpu_envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1600),
         ):
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 1600)
-        with unwarmed, envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("196, 1024"):
+        with unwarmed, tpu_envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("196, 1024"):
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 1024)
 
     def test_qwen3_vl_unpad_trims_bucket_padding_and_selects_rows(self):

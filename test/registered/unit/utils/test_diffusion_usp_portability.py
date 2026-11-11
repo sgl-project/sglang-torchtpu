@@ -7,6 +7,7 @@ these CPU tests do not establish TPU lowering or full-model support.
 """
 
 import importlib.util
+import itertools
 import math
 import os
 import subprocess
@@ -80,6 +81,7 @@ def _gloo_worker(rank, world, init_method):
                 torch.testing.assert_close(exchanged, reference, rtol=0, atol=0)
                 restored = usp._usp_output_all_to_all(exchanged, head_dim=head_dim)
                 torch.testing.assert_close(restored, shard, rtol=0, atol=0)
+                assert restored.is_contiguous()
             qkv = usp._usp_input_all_to_all_qkv(local, local + 10, local + 20)
             for index, actual in enumerate(qkv):
                 torch.testing.assert_close(
@@ -93,8 +95,77 @@ def _gloo_worker(rank, world, init_method):
                     torch.testing.assert_close(
                         actual, expected[0] + 10 * index, rtol=0, atol=0
                     )
+        _check_head_dim2_output_exchange(usp, rank, world)
     finally:
         dist.destroy_process_group()
+
+
+def _check_head_dim2_output_exchange(usp, rank, world):
+    """Heads-major output (an attention kernel's [b, h, s, d] result viewed as
+    [b, s, h, d], more than one local head) is exchanged in head slabs where
+    the platform prefers it (TPU); any other layout or platform takes the
+    sequence-major relayout. Both return bit-identical values in a contiguous
+    tensor; the head-slab result is always a fresh one."""
+    exchange = usp._usp_all_to_all_single
+    exchanged_ndims = []
+
+    def recording_exchange(x, role=None):
+        exchanged_ndims.append(x.ndim)
+        return exchange(x, role=role)
+
+    staging = {}
+
+    def reused_staging_buffer(role, shape, dtype, device):
+        # CUDA's per-role buffer: the next exchange overwrites any alias of it.
+        numel = math.prod(shape)
+        if role not in staging or staging[role].numel() < numel:
+            staging[role] = torch.empty(numel, dtype=dtype, device=device)
+        return staging[role][:numel].view(shape)
+
+    usp._usp_all_to_all_single = recording_exchange
+    usp._a2a_staging_buffer = reused_staging_buffer
+    prefix, dim = 2, 5
+    # local_seq == batch == 1 is where a contiguous() of the gathered slabs
+    # would alias the reused staging buffer.
+    for slabs_preferred, batch, local_heads, local_seq in itertools.product(
+        (False, True), (1, 2), (1, 2), (1, 3)
+    ):
+        usp.current_platform = SimpleNamespace(
+            prefers_head_slab_output_exchange=lambda value=slabs_preferred: value
+        )
+        shape = (batch, prefix + local_seq * world, local_heads * world, dim)
+        full = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape)
+        start = prefix + rank * local_seq
+        local = full[:, start : start + local_seq]
+        heads = full[:, :, rank * local_heads : (rank + 1) * local_heads]
+        heads_major = heads.transpose(1, 2).contiguous().transpose(1, 2)
+        cases = {
+            "sequence-major": (heads[:, prefix:].contiguous(), False),
+            "heads-major": (
+                heads[:, prefix:].transpose(1, 2).contiguous().transpose(1, 2),
+                slabs_preferred and local_heads > 1,
+            ),
+            # A replicated prefix sliced off a heads-major result, as in
+            # USPAttention._forward_with_replicated_prefix.
+            "prefix-sliced heads-major": (heads_major[:, prefix:], False),
+        }
+        for name, (x, head_slabs) in cases.items():
+            case = (
+                f"{name}, slabs_preferred={slabs_preferred}, batch={batch}, "
+                f"local_heads={local_heads}, local_seq={local_seq}"
+            )
+            exchanged_ndims.clear()
+            out = usp._usp_output_all_to_all(x, head_dim=2)
+            assert exchanged_ndims == [5 if head_slabs else 4], case
+            torch.testing.assert_close(out, local, rtol=0, atol=0, msg=case)
+            assert out.is_contiguous(), case
+            if not head_slabs and batch == local_seq == 1:
+                # The sequence-major merge is a no-op permute here, so its
+                # result is the staging buffer itself, as on main.
+                continue
+            kept = out.clone()
+            usp._usp_output_all_to_all(x + 1, head_dim=2)
+            torch.testing.assert_close(out, kept, rtol=0, atol=0, msg=case)
 
 
 class TestUspPortableLayouts(unittest.TestCase):
@@ -133,6 +204,30 @@ class TestUspPortableLayouts(unittest.TestCase):
             self.assertIs(actual, x)
         for actual in usp._usp_input_all_to_all_packed_qkv(x[0], x[0], x[0]):
             torch.testing.assert_close(actual, x[0], rtol=0, atol=0)
+
+    def test_exchange_keeps_the_tensor_shape(self):
+        # Equal dim-0 splits equal the flat exchange; a flattened buffer costs
+        # torch_tpu relayout copies around the collective.
+        usp = _load_usp()
+        usp.get_sp_group = lambda: SimpleNamespace(ulysses_group=object())
+        usp.get_ulysses_parallel_world_size = lambda: 2
+        seen = []
+
+        def all_to_all_single(output, input, group=None):
+            seen.append(tuple(input.shape))
+            output.copy_(input)
+
+        x = torch.arange(4 * 3 * 2 * 5, dtype=torch.float32).reshape(4, 3, 2, 5)
+        with patch.object(
+            usp.torch.distributed, "all_to_all_single", all_to_all_single
+        ):
+            # A non-contiguous view of x: exchanged as a contiguous copy.
+            out = usp._usp_all_to_all_single(
+                x.transpose(2, 3).contiguous().transpose(2, 3)
+            )
+        self.assertEqual(seen, [(4, 3, 2, 5)])
+        self.assertEqual(out.shape, x.shape)
+        torch.testing.assert_close(out, x, rtol=0, atol=0)
 
     def test_eligible_eager_merge_still_dispatches_to_cuda(self):
         # Routing only; CUDA numerical coverage lives in the layout kernel tests.

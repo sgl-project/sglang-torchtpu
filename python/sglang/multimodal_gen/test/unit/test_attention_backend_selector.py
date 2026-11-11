@@ -86,6 +86,16 @@ class _FakeSparseBackend:
         return ()
 
 
+class _FakeOOTBackend:
+    @classmethod
+    def get_enum(cls) -> AttentionBackendEnum:
+        return AttentionBackendEnum.OOT
+
+    @classmethod
+    def unsupported_requirements(cls, _requirements) -> tuple[str, ...]:
+        return ()
+
+
 class _FakePlatform:
     device_name = "test"
     selected_backend = None
@@ -97,14 +107,21 @@ class _FakePlatform:
             return "fake.AITERBackend"
         if selected_backend == AttentionBackendEnum.LASER_ATTN:
             return "fake.SparseBackend"
+        if selected_backend == AttentionBackendEnum.OOT:
+            return "fake.OOTBackend"
         if selected_backend in (None, AttentionBackendEnum.FA):
             return "fake.FABackend"
         return "fake.SDPABackend"
+
+    @classmethod
+    def oot_attn_backend_serves(cls, supported_attention_backends) -> bool:
+        return AttentionBackendEnum.TORCH_SDPA in supported_attention_backends
 
 
 _FAKE_BACKENDS = {
     "fake.AITERBackend": _FakeAITERBackend,
     "fake.FABackend": _FakeFABackend,
+    "fake.OOTBackend": _FakeOOTBackend,
     "fake.SparseBackend": _FakeSparseBackend,
     "fake.SDPABackend": _FakeSDPABackend,
 }
@@ -237,6 +254,24 @@ class TestAttentionBackendFallback(unittest.TestCase):
 
         self.assertIs(backend, _FakeAITERBackend)
         self.assertEqual(_FakePlatform.selected_backend, AttentionBackendEnum.AITER)
+
+    def test_implicit_oot_backend_serves_where_the_platform_says(self):
+        for supported, expected in (
+            (
+                {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+                _FakeOOTBackend,
+            ),
+            ({AttentionBackendEnum.FA}, _FakeFABackend),
+        ):
+            with self.subTest(supported=sorted(b.name for b in supported)):
+                _cached_get_attn_backend.cache_clear()
+                backend = self._resolve(
+                    AttentionBackendEnum.OOT,
+                    explicit=False,
+                    is_cross_attention=False,
+                    supported=supported,
+                )
+                self.assertIs(backend, expected)
 
     def test_explicit_backend_still_fails_missing_capability(self):
         with self.assertRaisesRegex(ValueError, "packed varlen attention"):

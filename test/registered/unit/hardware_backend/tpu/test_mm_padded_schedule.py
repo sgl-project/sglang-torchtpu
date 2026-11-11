@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu import mm_schedule_tpu
 from sglang_tpu.mm_embedding import (
+    EmbeddingSpan,
     PaddedEmbedding,
     TpuEmbeddingResult,
 )
@@ -54,6 +55,57 @@ def test_padded_cache_charges_full_buffer_and_evicts_by_physical_size():
     assert cache.current_size == 128
     cache.free(2, None)
     assert cache.current_size == 0
+
+
+def test_padded_cache_charges_a_shared_buffer_once():
+    # Encoder DP returns every item of a round as a span of one gathered buffer.
+    buffer = torch.zeros(112 * 4, 4)
+    items = [PaddedEmbedding((EmbeddingSpan(buffer, 4 * i, 4),)) for i in range(112)]
+    nbytes = buffer.untyped_storage().nbytes()
+    cache = MultiModalStaticCache(nbytes)
+    for i, item in enumerate(items):
+        assert cache.set(i, TpuEmbeddingResult(embedding=item))
+    assert len(cache) == 112
+    assert cache.current_size == nbytes
+
+    # The buffer stays charged until its last entry goes.
+    for i in range(111):
+        cache.free(i, None)
+    assert cache.current_size == nbytes
+    cache.free(111, None)
+    assert cache.current_size == 0
+
+
+def test_padded_cache_recharges_a_shared_buffer_released_while_making_room():
+    # The new entry spans an already-charged buffer and a new one. Evicting the
+    # shared buffer's last other holder uncharges it, so room is needed for both.
+    shared, new, small = torch.zeros(8, 4), torch.zeros(8, 4), torch.zeros(1, 4)
+    nbytes = shared.untyped_storage().nbytes()
+    cache = MultiModalStaticCache(2 * nbytes)
+    assert cache.set(
+        1, TpuEmbeddingResult(embedding=PaddedEmbedding((EmbeddingSpan(shared, 0, 4),)))
+    )
+    assert cache.set(
+        2, TpuEmbeddingResult(embedding=PaddedEmbedding.from_buffer(small, 1))
+    )
+    spans = (EmbeddingSpan(shared, 4, 4), EmbeddingSpan(new, 0, 8))
+    assert cache.set(3, TpuEmbeddingResult(embedding=PaddedEmbedding(spans)))
+    assert list(cache.mm_cache) == [3]
+    assert cache.current_size == 2 * nbytes
+
+
+def test_padded_cache_rejects_an_oversized_entry_without_evicting():
+    small = torch.zeros(2, 4)
+    cache = MultiModalStaticCache(small.untyped_storage().nbytes())
+    assert cache.set(
+        1, TpuEmbeddingResult(embedding=PaddedEmbedding.from_buffer(small, 2))
+    )
+    big = torch.zeros(16, 4)
+    assert not cache.set(
+        2, TpuEmbeddingResult(embedding=PaddedEmbedding.from_buffer(big, 1))
+    )
+    assert cache.get_single(1) is not None
+    assert cache.current_size == small.untyped_storage().nbytes()
 
 
 @pytest.mark.parametrize("entry_type", [EmbeddingResult, TpuEmbeddingResult])

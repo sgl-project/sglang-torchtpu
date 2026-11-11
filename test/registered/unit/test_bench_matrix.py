@@ -21,6 +21,7 @@ slice. Each case here answers "someone extended X without updating Y":
 import ast
 import glob
 import importlib.util
+import math
 import os
 import subprocess
 import sys
@@ -40,13 +41,19 @@ BENCH_MATRIX = os.path.join(REPO, "benchmark", "tpu", "recipe", "bench_matrix")
 sys.path.insert(0, E2E)
 import bench_matrix_base as bench_base  # noqa: E402
 
-MODELS = ("gpt_oss_120b", "qwen3_coder_480b")
 RECIPES = {
     "1host_pc": "external-nightly-2x2x2",
     "1host_pc_spec_kvoff": "external-nightly-2x2x2",
     "pd_2p2d_pc_spec_kvoff": "external-nightly-2x2x4",
 }
 WORKLOADS = ("agentic", "8k1k")
+_FULL = {recipe: WORKLOADS for recipe in RECIPES}
+# model -> recipe -> workloads, one test file per cell.
+CELLS = {
+    "gpt_oss_120b": _FULL,
+    "qwen3_coder_480b": _FULL,
+    "muse_spark": {"1host_pc": ("8k1k",)},
+}
 
 
 def _scan_file(path):
@@ -76,10 +83,9 @@ class TestBenchMatrix(CustomTestCase):
         files = sorted(glob.glob(os.path.join(E2E, "test_tpu_bench_*.py")))
         self.assertEqual(
             len(files),
-            len(MODELS) * len(RECIPES) * len(WORKLOADS),
-            "the matrix is 2 models x 3 recipes x 2 workloads; a missing or "
-            "extra test_tpu_bench_* file means a cell was added or dropped "
-            "without updating this inventory",
+            sum(len(w) for recipes in CELLS.values() for w in recipes.values()),
+            "a missing or extra test_tpu_bench_* file means a cell was added "
+            "or dropped without updating CELLS",
         )
         return files
 
@@ -96,10 +102,10 @@ class TestBenchMatrix(CustomTestCase):
     def test_workload_pairs_share_one_launch_group(self):
         """Files sharing (suite, launch_script, weights) share one server; a
         drifted field silently doubles the bring-up cost of the cell."""
-        for model in MODELS:
-            for recipe in RECIPES:
+        for model, recipes in CELLS.items():
+            for recipe, workloads in recipes.items():
                 keys = set()
-                for workload in WORKLOADS:
+                for workload in workloads:
                     path = os.path.join(
                         E2E, f"test_tpu_bench_{model}_{recipe}_{workload}.py"
                     )
@@ -124,9 +130,9 @@ class TestBenchMatrix(CustomTestCase):
                 f"{path}: recipe {recipe} must register to {RECIPES[recipe]}",
             )
 
-    def test_discovery_buckets_one_group_per_slice(self):
-        """The even-split contract: 4 single-host groups over the four 2x2x2
-        slices, 2 pd groups over the two 2x2x4 slices, none serialized."""
+    def test_discovery_spreads_groups_over_slices(self):
+        """The even-split contract: a shape's bench groups spread over its
+        slices, so no slice serializes more than its share."""
         spec = importlib.util.spec_from_file_location(
             "render_external_jobset",
             os.path.join(
@@ -143,29 +149,6 @@ class TestBenchMatrix(CustomTestCase):
         slices = mod.list_groups(
             cfg, os.path.join(REPO, "test", "registered"), nightly_only=True
         )
-        per_suite = {}
-        for sl in slices:
-            ours = [
-                g
-                for g in sl["groups"]
-                if g.get("launch_script", "").startswith("recipe/bench_matrix/")
-            ]
-            self.assertLessEqual(
-                len(ours),
-                1,
-                f"{sl['name']}: {len(ours)} bench_matrix groups serialize on "
-                f"one slice -- the matrix is sized to fill each slice exactly "
-                f"once ({[g['name'] for g in ours]})",
-            )
-            per_suite.setdefault(sl["suite"], 0)
-            per_suite[sl["suite"]] += len(ours)
-            for g in ours:
-                self.assertEqual(
-                    g["timeout_per_file"],
-                    bench_base.TIMEOUT_PER_FILE_BUDGET,
-                    f"{g['name']}: discovery must carry the files' declared "
-                    "timeout_per_file (the JobSet deadline is sized from it)",
-                )
         # Expected group counts follow the files themselves: a cell disabled
         # with a reason (e.g. the raiden P/D transfer finding) is skipped by
         # discovery, and this test must not force it back on.
@@ -176,6 +159,33 @@ class TestBenchMatrix(CustomTestCase):
                 continue
             key = (suite, launch["launch_script"])
             expected.setdefault(suite, set()).add(key)
+        per_suite = {}
+        for sl in slices:
+            ours = [
+                g
+                for g in sl["groups"]
+                if g.get("launch_script", "").startswith("recipe/bench_matrix/")
+            ]
+            share = math.ceil(
+                len(expected.get(sl["suite"], ()))
+                / len(cfg["suites"][sl["suite"]]["nodepool_vars"])
+            )
+            self.assertLessEqual(
+                len(ours),
+                share,
+                f"{sl['name']}: {len(ours)} bench_matrix groups serialize on "
+                f"one slice, more than its share of {share} "
+                f"({[g['name'] for g in ours]})",
+            )
+            per_suite.setdefault(sl["suite"], 0)
+            per_suite[sl["suite"]] += len(ours)
+            for g in ours:
+                self.assertEqual(
+                    g["timeout_per_file"],
+                    bench_base.TIMEOUT_PER_FILE_BUDGET,
+                    f"{g['name']}: discovery must carry the files' declared "
+                    "timeout_per_file (the JobSet deadline is sized from it)",
+                )
         self.assertEqual(
             per_suite.get("external-nightly-2x2x2", 0),
             len(expected.get("external-nightly-2x2x2", ())),
@@ -190,9 +200,9 @@ class TestBenchMatrix(CustomTestCase):
         requests {1,2,4} for agentic and none for 8k1k, for every
         (model, recipe)."""
         expected_long = {"agentic": "1 2 4", "8k1k": "0"}
-        for model in MODELS:
-            for recipe in RECIPES:
-                for workload in WORKLOADS:
+        for model, recipes in CELLS.items():
+            for recipe, workloads in recipes.items():
+                for workload in workloads:
                     out = subprocess.run(
                         [
                             "bash",

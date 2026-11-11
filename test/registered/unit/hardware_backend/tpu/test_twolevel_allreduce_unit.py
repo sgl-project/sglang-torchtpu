@@ -52,6 +52,46 @@ class TestFallbacks(CustomTestCase):
                 tl.merged_moe_all_reduce_around(original, latent, shared), ("a", "b")
             )
 
+    def test_merged_passes_norm_to_original_when_not_registered(self):
+        original = mock.Mock(return_value=("a", "b"))
+        latent = torch.zeros(1, 3584, dtype=torch.bfloat16)
+        shared = torch.zeros(1, 7168, dtype=torch.bfloat16)
+        norm = mock.Mock()
+        with mock.patch.object(tl, "_READY", False):
+            self.assertEqual(
+                tl.merged_moe_all_reduce_around(original, latent, shared, norm),
+                ("a", "b"),
+            )
+        original.assert_called_once_with(latent, shared, norm)
+
+    def test_merged_norm_unfused_without_2n_op(self):
+        """Registered pair op but no fused-norm op: reduce, then the norm."""
+        latent = torch.zeros(1, 3584, dtype=torch.bfloat16)
+        shared = torch.zeros(1, 7168, dtype=torch.bfloat16)
+        norm = mock.Mock(return_value="normed")
+        pair = mock.Mock(return_value=("l", "s"))
+        with (
+            mock.patch.object(tl, "_READY", True),
+            mock.patch.dict(tl._OPS, {2: pair}, clear=True),
+        ):
+            got = tl.merged_moe_all_reduce_around(mock.Mock(), latent, shared, norm)
+        self.assertEqual(got, ("normed", "s"))
+        norm.assert_called_once_with("l")
+
+    def test_row_parallel_linear_calls_original_without_ar1r_op(self):
+        """No fused attention-residual op: o_proj keeps its own all-reduce."""
+        original = mock.Mock(return_value=("y", None))
+        layer = mock.Mock()
+        x = torch.zeros(1, 384, dtype=torch.bfloat16)
+        with mock.patch.dict(tl._OPS, {}, clear=True):
+            self.assertEqual(
+                tl.row_parallel_linear_forward_around(original, layer, x),
+                ("y", None),
+            )
+        original.assert_called_once_with(
+            layer, x, skip_all_reduce=False, forward_batch=None, output_tensor=None
+        )
+
     def test_merged_falls_back_on_mixed_dtypes(self):
         """A non-bf16 shared output is not cast into the packed exchange."""
         original = mock.Mock(return_value=("a", "b"))

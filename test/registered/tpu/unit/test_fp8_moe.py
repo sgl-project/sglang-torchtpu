@@ -160,6 +160,7 @@ class TestTpuFp8MoE(CustomTestCase):
         topk_ids = torch.tensor([[0, -1], [1, 0]], dtype=torch.int64)
         layer = SimpleNamespace(
             num_fused_shared_experts=0,
+            moe_runner_config=SimpleNamespace(routed_scaling_factor=None),
             w13_weight=torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn),
             w2_weight=torch.empty(2, 8, 8, dtype=torch.float8_e4m3fn),
             w13_weight_scale=torch.ones(2, 1, 1, 16, dtype=torch.float32),
@@ -225,6 +226,7 @@ class TestTpuFp8MoE(CustomTestCase):
         layer = SimpleNamespace(
             num_fused_shared_experts=0,
             num_local_experts=2,
+            moe_runner_config=SimpleNamespace(routed_scaling_factor=None),
             w13_weight=torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn),
             w2_weight=torch.empty(2, 8, 8, dtype=torch.float8_e4m3fn),
             w13_weight_scale=torch.ones(2, 1, 1, 16, dtype=torch.float32),
@@ -277,6 +279,7 @@ class TestTpuFp8MoE(CustomTestCase):
         hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
         layer = SimpleNamespace(
             num_fused_shared_experts=0,
+            moe_runner_config=SimpleNamespace(routed_scaling_factor=None),
             w13_weight=torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn),
             w2_weight=torch.empty(2, 8, 8, dtype=torch.float8_e4m3fn),
             w13_weight_scale=torch.ones(2, 1, 1, 16, dtype=torch.float32),

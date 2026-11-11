@@ -34,12 +34,15 @@ CONFIG["server_args"].update(
         "disable_radix_cache": False,
         "reasoning_parser": "muse",
         "tool_call_parser": "muse",
+        "weight_loader_prefetch_checkpoints": True,
         "watchdog_timeout": 3600,
     }
 )
 CONFIG["runtime_env"].update(
     {
         "FORCE_SINGLE_HOST": "1",
+        # Divide checkpoint prefetch across the host's eight ranks, including PP8.
+        "LOCAL_SIZE": "8",
         # The measured configuration also keeps the SparseCore all-gather offload off.
         "LIBTPU_INIT_ARGS": " ".join(
             LIBTPU_FLAGS

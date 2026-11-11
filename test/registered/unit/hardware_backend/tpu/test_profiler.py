@@ -2,6 +2,7 @@
 
 import dataclasses
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from sglang.srt.managers.scheduler_components import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.profiler import (
     _tpu_profile_options,
     start_tpu_profile,
@@ -71,8 +73,8 @@ class TestTpuProfileOptions(CustomTestCase):
         profile_options_cls=_BaseProfileOptions,
     ):
         with (
-            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(num_chips),
-            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(num_sparse_cores),
+            tpu_envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(num_chips),
+            tpu_envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(num_sparse_cores),
             patch.dict(sys.modules, _fake_torch_tpu(profile_options_cls)),
         ):
             return _tpu_profile_options(with_cpu=with_cpu)
@@ -131,7 +133,7 @@ class TestTpuProfileOptions(CustomTestCase):
         self.assertEqual(options.python_tracer_level, 0)
 
     def test_python_tracer_opt_in(self):
-        with envs.SGLANG_TPU_PROFILE_PYTHON_TRACER.override(True):
+        with tpu_envs.SGLANG_TPU_PROFILE_PYTHON_TRACER.override(True):
             options = self._options(num_chips=1, num_sparse_cores=1)
 
         self.assertEqual(options.python_tracer_level, 1)
@@ -166,8 +168,8 @@ class TestStartStopUsesLibtpuTrace(CustomTestCase):
     def test_start_calls_start_trace_with_output_dir(self):
         calls = []
         with (
-            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(0),
-            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(0),
+            tpu_envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(0),
+            tpu_envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(0),
             patch.dict(sys.modules, _fake_torch_tpu(calls=calls)),
         ):
             trace = start_tpu_profile(output_dir=Path("/tmp/xprof-unit-test"))
@@ -179,8 +181,8 @@ class TestStartStopUsesLibtpuTrace(CustomTestCase):
     def test_start_forwards_narrowing_options(self):
         calls = []
         with (
-            envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(1),
-            envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(1),
+            tpu_envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(1),
+            tpu_envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.override(1),
             patch.dict(sys.modules, _fake_torch_tpu(calls=calls)),
         ):
             start_tpu_profile(output_dir=Path("/tmp/xprof-unit-test"))
@@ -197,71 +199,76 @@ class TestStartStopUsesLibtpuTrace(CustomTestCase):
         self.assertEqual([c[0] for c in calls], ["stop"])
 
 
-def _stopping_manager(tmp_path, trace):
-    with envs.SGLANG_PROFILE_V2.override(False):
-        manager = scheduler_profiler.SchedulerProfilerManager(
-            ps=types.SimpleNamespace(),
-            dp_tp_cpu_group=None,
-            get_forward_ct=lambda: 0,
-        )
-    manager.profile_in_progress = True
-    manager.tpu_profiler = trace
-    manager.torch_profiler_output_dir = tmp_path
-    manager.profiler_activities = ["TPU"]
-    manager.profile_prefix = ""
-    return manager
+class TestStopProfileSynchronization(CustomTestCase):
+    """A staged TPU stop must drain the device before xprof stops.
 
+    Without the synchronize, the trace ends while the profiled step is still
+    queued on the device, so the staged capture misses it.
+    """
 
-def test_stage_tpu_profile_synchronizes_before_stopping(tmp_path):
-    calls = []
-    trace = object()
-    manager = _stopping_manager(tmp_path, trace)
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
 
-    with (
-        patch.object(
-            scheduler_profiler.current_platform,
-            "synchronize",
-            side_effect=lambda: calls.append("synchronize"),
-        ),
-        patch(
-            "sglang_tpu.profiler.stop_tpu_profile",
-            side_effect=lambda actual: calls.append(("stop", actual)),
-        ),
-    ):
-        manager._stop_profile(stage=ForwardMode.EXTEND)
+    def _stopping_manager(self, trace):
+        with (
+            envs.SGLANG_PROFILE_V2.override(False),
+            patch.object(
+                scheduler_profiler,
+                "get_dp_tp_group",
+                return_value=types.SimpleNamespace(cpu_group=None),
+            ),
+        ):
+            manager = scheduler_profiler.SchedulerProfilerManager(
+                get_forward_ct=lambda: 0
+            )
+        manager.profile_in_progress = True
+        manager.tpu_profiler = trace
+        manager.torch_profiler_output_dir = Path(self._tmp.name)
+        manager.profiler_activities = ["TPU"]
+        manager.profile_prefix = ""
+        return manager
 
-    assert calls == ["synchronize", ("stop", trace)]
+    def _stop_and_record(self, manager, **stop_kwargs):
+        calls = []
+        with (
+            envs.SGLANG_PROFILE_V2.override(False),
+            patch.object(
+                scheduler_profiler.current_platform,
+                "synchronize",
+                side_effect=lambda: calls.append("synchronize"),
+            ),
+            patch(
+                "sglang_tpu.profiler.stop_tpu_profile",
+                side_effect=lambda actual: calls.append(("stop", actual)),
+            ),
+        ):
+            manager._stop_profile(**stop_kwargs)
+        return calls
 
+    def test_stage_tpu_profile_synchronizes_before_stopping(self):
+        trace = object()
+        manager = self._stopping_manager(trace)
 
-def test_non_stage_tpu_profile_stops_without_synchronizing(tmp_path):
-    calls = []
-    trace = object()
-    manager = _stopping_manager(tmp_path, trace)
+        calls = self._stop_and_record(manager, stage=ForwardMode.EXTEND)
 
-    with (
-        patch.object(
-            scheduler_profiler.current_platform,
-            "synchronize",
-            side_effect=lambda: calls.append("synchronize"),
-        ),
-        patch(
-            "sglang_tpu.profiler.stop_tpu_profile",
-            side_effect=lambda actual: calls.append(("stop", actual)),
-        ),
-    ):
-        manager._stop_profile()
+        self.assertEqual(calls, ["synchronize", ("stop", trace)])
 
-    assert calls == [("stop", trace)]
+    def test_non_stage_tpu_profile_stops_without_synchronizing(self):
+        trace = object()
+        manager = self._stopping_manager(trace)
 
+        calls = self._stop_and_record(manager)
 
-def test_stage_profile_without_tpu_trace_does_not_synchronize(tmp_path):
-    manager = _stopping_manager(tmp_path, None)
-    manager.profiler_activities = ["CPU"]
+        self.assertEqual(calls, [("stop", trace)])
 
-    with patch.object(scheduler_profiler.current_platform, "synchronize") as sync:
-        manager._stop_profile(stage=ForwardMode.EXTEND)
+    def test_stage_profile_without_tpu_trace_does_not_synchronize(self):
+        manager = self._stopping_manager(None)
+        manager.profiler_activities = ["CPU"]
 
-    sync.assert_not_called()
+        calls = self._stop_and_record(manager, stage=ForwardMode.EXTEND)
+
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

@@ -33,6 +33,20 @@ def get_pd_carry_seeder() -> PdCarrySeeder:
     return _pd_carry_seeder
 
 
+def pd_decode_draft_prefill() -> bool:
+    """Whether a PD decode, not its prefill, runs the draft over each prompt."""
+    return tpu_envs.SGLANG_TPU_PD_DECODE_DRAFT_PREFILL.get()
+
+
+def runs_draft_prompt_pass(disagg_mode: str) -> bool:
+    """Whether this server runs the draft over prompts: a PD decode only under the flag."""
+    if disagg_mode == "decode":
+        return pd_decode_draft_prefill()
+    if disagg_mode == "prefill":
+        return not pd_decode_draft_prefill()
+    return True
+
+
 def uses_host_batch(batch) -> bool:
     """Whether batch is a HOST_PADDED TpuSpecWorker batch (the init_new hook set its padder)."""
     return getattr(batch, "host_pad_bs", None) is not None

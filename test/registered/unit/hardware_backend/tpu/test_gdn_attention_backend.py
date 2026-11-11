@@ -28,12 +28,13 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 import importlib.util
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
 
@@ -123,9 +124,11 @@ class TestGDNSinglePassFlags(CustomTestCase):
         backend._extra_buffer_enabled = False
         backend.req_to_token_pool = SimpleNamespace(
             mamba_pool=SimpleNamespace(
-                checkpoint_width=1, checkpoint_read_offsets=None
+                checkpoint_width=1,
+                checkpoint_read_offsets=None,
+                mamba2_layer_cache=lambda _: cache,
             ),
-            mamba2_layer_cache=lambda _: cache,
+            mamba_map=defaultdict(int),
             get_mamba_indices=lambda indices: indices,
             translate_mamba_indices=lambda indices: indices,
             # Read by the slot-id memo (TpuGDNAttnBackend._slot_indices).
@@ -275,6 +278,65 @@ class TestGDNVerifyMetadata(CustomTestCase):
         self.assertEqual(track_slots.tolist(), [3, -1])
         self.assertIs(req_pool_indices, backend._req_pool_indices)
         self.assertIs(steps, steps_to_track)
+
+
+class TestGDNTrackEndForDecodeRowsRunAsExtend(CustomTestCase):
+    """Under attention DP every rank pads to MAX_LEN, so when a peer rank
+    prefills, this rank's decode batch runs as 1-token extends
+    (ForwardBatch.prepare_mlp_sync_batch). Those rows keep the decode track
+    plan (mask + track slots, no mamba_track_seqlens), and the decode result
+    path records the snapshot as taken, so it must land after the row's token,
+    exactly as a decode forward would place it."""
+
+    def _backend(self):
+        backend = _BackendNoInit()
+        backend._extra_buffer_enabled = True
+        backend.req_to_token_pool = SimpleNamespace(
+            get_mamba_indices=lambda indices: indices,
+            translate_mamba_indices=lambda indices: indices,
+            req_index_to_mamba_index_mapping=torch.arange(8, dtype=torch.int32),
+            mamba_v2p_table=None,
+        )
+        return backend
+
+    def _batch(self, mode, original_mode):
+        # Three real rows padded to a bucket of four; rows 0 and 2 reach the
+        # track grid (seq_len 256 and 512) with this token.
+        seq_lens = torch.tensor([256, 300, 512, 1])
+        batch = SimpleNamespace(
+            _tpu_real_b=3,
+            forward_mode=mode,
+            _original_forward_mode=original_mode,
+            seq_lens=seq_lens,
+            req_pool_indices=torch.tensor([1, 2, 3, 0]),
+            extend_seq_lens=torch.tensor([1, 1, 1, 0], dtype=torch.int32),
+            extend_prefix_lens=(seq_lens - 1).to(torch.int32),
+            mamba_track_indices=torch.tensor([5, 6, 7, 0]),
+            mamba_track_mask=torch.tensor([True, False, True, False]),
+            mamba_track_seqlens=None,
+        )
+        batch.mamba_track_aligned_lens = lambda: ForwardBatch.mamba_track_aligned_lens(
+            batch
+        )
+        return batch
+
+    def test_decode_rows_run_as_extend_snapshot_after_their_token(self):
+        backend = self._backend()
+        backend.init_forward_metadata(
+            self._batch(ForwardMode.EXTEND, ForwardMode.DECODE)
+        )
+        self.assertEqual(backend._query_start_loc.tolist(), [0, 1, 2, 3, 3])
+        self.assertEqual(backend._track_end.tolist(), [1, -1, 3, -1])
+        self.assertEqual(backend._track_indices.tolist(), [5, 6, 7, 0])
+
+    def test_matches_the_native_decode_forward(self):
+        backend = self._backend()
+        backend.init_forward_metadata(self._batch(ForwardMode.DECODE, None))
+        decode_end = backend._track_end.tolist()
+        backend.init_forward_metadata(
+            self._batch(ForwardMode.EXTEND, ForwardMode.DECODE)
+        )
+        self.assertEqual(backend._track_end.tolist(), decode_end)
 
 
 class _RowReadRecorder:

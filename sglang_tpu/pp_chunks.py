@@ -236,13 +236,13 @@ class StepCostModel:
 
 def uses_dynamic_chunks() -> bool:
     """Whether this TPU pipeline uses profiled prefill step budgets."""
-    from sglang.srt.environ import envs
     from sglang.srt.runtime_context import (
         get_device,
         get_disagg,
         get_parallel,
         get_schedule,
     )
+    from sglang_tpu.envs import envs
 
     return (
         get_device().device == "tpu"

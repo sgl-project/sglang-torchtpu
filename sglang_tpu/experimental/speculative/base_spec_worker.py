@@ -88,7 +88,10 @@ from sglang_tpu.compilation.recompilation_checker import (
 )
 from sglang_tpu.compilation.warmup_queue import eager_warmup
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.experimental import register_host_batch_padder
+from sglang_tpu.experimental import (
+    pd_decode_draft_prefill,
+    register_host_batch_padder,
+)
 from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
     is_host_padded,
@@ -96,6 +99,16 @@ from sglang_tpu.experimental.sampling.sampling_batch_info import (
 from sglang_tpu.experimental.speculative.draft_forward import set_bucket_dp_metadata
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
+from sglang_tpu.experimental.speculative.pd_draft_prefill import (
+    build_pd_hidden_pool,
+    prebuilt_extend_groups,
+    prebuilt_extend_view,
+    register_pd_draft_prefiller,
+)
+from sglang_tpu.experimental.speculative.pd_hidden_pool import (
+    PdHiddenPool,
+    register_pd_hidden_pool,
+)
 from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
     accept_candidates_step,
@@ -121,7 +134,11 @@ from sglang_tpu.experimental.speculative.spec_types import (
     VerifyRows,
     map_carry,
 )
-from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
+from sglang_tpu.experimental.speculative.spec_utils import (
+    overridden_fields,
+    pad_rows,
+    padded_h2d,
+)
 from sglang_tpu.mamba_pool import (
     TpuMambaPool,
     committed_read_offsets,
@@ -175,6 +192,7 @@ class TpuSpecWorker(BaseSpecWorker):
     """
 
     supports_logprobs = False
+    supports_grammar = False
     # Opt in only when verification applies the scheduler's additive snapshot
     # at the padded batch size. Live penalizer state is still unsupported.
     supports_additive_penalties = False
@@ -198,7 +216,7 @@ class TpuSpecWorker(BaseSpecWorker):
             )
         self._target_worker = target_worker
         runner = target_worker.model_runner
-        self._bsearch_filtering = envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
+        self._bsearch_filtering = tpu_envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
         if not isinstance(runner.sampler, TpuSampler):
             # HOST_PADDED sampling params stay on host until TpuSampler uploads
             # them; with full logits it samples exactly like a plain Sampler
@@ -257,11 +275,141 @@ class TpuSpecWorker(BaseSpecWorker):
         # Per (batch bucket, forced num_correct_drafts).
         self._simulated_correct: dict[tuple[int, int], torch.Tensor] = {}
         register_host_batch_padder(self._pad_bs)
+        # Built in init_cuda_graphs: the target KV pool it pages after does not exist yet.
+        self._pd_hidden_pool: PdHiddenPool | None = None
+
+    def _init_pd_hidden_pool(self) -> PdHiddenPool | None:
+        """The PD hidden pool when the decode runs the draft prompt pass, else None."""
+        disagg_mode = get_disagg().disaggregation_mode
+        if not pd_decode_draft_prefill() or disagg_mode == "null":
+            return None
+        if self._dp_attention:
+            # Prebuilt batches land per DP rank; the draft pass would need the idle mirror.
+            raise NotImplementedError(
+                "SGLANG_TPU_PD_DECODE_DRAFT_PREFILL does not support DP attention."
+            )
+        pool = build_pd_hidden_pool(self.target_worker.model_runner)
+        register_pd_hidden_pool(pool)
+        if disagg_mode == "decode":
+            register_pd_draft_prefiller(
+                self.prefill_draft_from_pd,
+                max_prompt_tokens=self._pd_draft_max_prompt_tokens,
+            )
+        return pool
+
+    @property
+    def ships_pd_hidden(self) -> bool:
+        """Whether this PD prefill hands the draft's hidden rows to the decode."""
+        return (
+            self._pd_hidden_pool is not None
+            and get_disagg().disaggregation_mode == "prefill"
+        )
+
+    def write_pd_hidden(
+        self, batch: ScheduleBatch, target_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        """Store an extend's target hidden rows for the decode; returns the kv_fence_tail."""
+        assert self._pd_hidden_pool is not None
+        cache_loc_cpu = batch.out_cache_loc
+        assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
+        segments = self._pd_hidden_pool.write_segments(
+            cache_loc_cpu, target_hidden.shape[0]
+        )
+        return self._pd_hidden_pool.write(
+            target_hidden, segments=segments.to(self.device, non_blocking=True)
+        )
+
+    def _pd_draft_max_prompt_tokens(self) -> int:
+        """The decode draft prompt pass takes a prompt in one extend bucket."""
+        t_bucketer = self._compile_policy().t_bucketer
+        assert t_bucketer is not None
+        return t_bucketer.max_val
+
+    def prefill_draft_from_pd(self, batch: ScheduleBatch) -> None:
+        """Draft prompt pass of a PD decode's prebuilt batch, from the shipped hidden rows."""
+        assert self._pd_hidden_pool is not None
+        compile_policy = self._compile_policy()
+        t_bucketer = compile_policy.t_bucketer
+        assert t_bucketer is not None
+        cap = compile_policy._extend_compile_cap()
+        vocab_size = self.target_worker.model_runner.model_config.vocab_size
+        for group in prebuilt_extend_groups(
+            batch, max_tokens=t_bucketer.max_val, max_reqs=cap
+        ):
+            view = prebuilt_extend_view(batch, group, vocab_size=vocab_size)
+            # The draft graphs and writer were warmed with the allocator's dtype.
+            view.out_cache_loc = view.out_cache_loc.to(
+                compile_policy.live_cache_loc_dtype()
+            )
+            padded_tokens = t_bucketer.next_bucket(max(view.extend_num_tokens, cap))
+            cache_loc = pad_rows(view.out_cache_loc, padded_tokens).to(
+                self.device, non_blocking=True
+            )
+            bonus_tokens = padded_h2d(
+                torch.tensor(
+                    [req.output_ids[-1] for req in view.reqs], dtype=torch.int64
+                ),
+                self._pad_bs(len(view.reqs)),
+                self.device,
+            )
+            self.extend_draft_from_hidden(
+                view,
+                target_hidden=self._pd_hidden_pool.read(cache_loc),
+                cache_loc=cache_loc,
+                bonus_tokens=bonus_tokens,
+            )
+
+    def extend_draft_from_hidden(
+        self,
+        batch: ScheduleBatch,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+    ) -> None:
+        """The draft's prompt pass over an extend batch's target hidden [token bucket, F]."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not run the PD decode draft prompt pass."
+        )
+
+    def _warmup_pd_hidden(self) -> None:
+        """The prefill's hidden write or the decode's read, per extend token bucket."""
+        pool = self._pd_hidden_pool
+        if pool is None:
+            return
+        compile_policy = self._compile_policy()
+        assert compile_policy.t_bucketer is not None
+        cap = compile_policy._extend_compile_cap()
+        with torch.no_grad():
+            for tokens in compile_policy.t_bucketer.buckets:
+                if tokens < cap:
+                    continue
+                if self.ships_pd_hidden:
+                    segments = pool.write_segments(
+                        torch.zeros((0,), dtype=torch.int64), tokens
+                    )
+                    pool.write(
+                        torch.zeros(
+                            (tokens, pool.feature_size),
+                            dtype=pool.buffer.dtype,
+                            device=self.device,
+                        ),
+                        segments=segments.to(self.device),
+                    ).cpu()
+                else:
+                    cache_loc = torch.zeros(
+                        (tokens,), dtype=compile_policy.live_cache_loc_dtype()
+                    ).to(self.device)
+                    pool.read(cache_loc).cpu()
+            for pbs in self._b_bucketer().buckets:
+                padded_h2d(torch.zeros((0,), dtype=torch.int64), pbs, self.device)
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
         # accept_drafts_candidates' TopK op must exist before its first trace.
         register_tpu_top_k_ops()
+        # Before the Raiden manager, which registers it, and before its warmup.
+        self._pd_hidden_pool = self._init_pd_hidden_pool()
         self._all_drafts = {
             padded_bs: torch.full(
                 (padded_bs,), self.num_drafts, dtype=torch.int32, device=self.device
@@ -271,6 +419,7 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
+        self._warmup_pd_hidden()
         if not self._sampled_drafts and get_disagg().disaggregation_mode != "prefill":
             self._warmup_target_only_accept()
         # A PD prefill server never verifies, so its mamba pool has no checkpoints.
@@ -531,6 +680,8 @@ class TpuSpecWorker(BaseSpecWorker):
         rows: VerifyRows,
         draft_result: DraftResult,
         verify_input: TpuSpecVerifyInput,
+        *,
+        grammar_barrier: Callable[[], None] | None = None,
     ) -> tuple[LogitsProcessorOutput, AcceptResult]:
         """Score [r, d] with the target in one forward and accept losslessly.
 
@@ -590,8 +741,8 @@ class TpuSpecWorker(BaseSpecWorker):
         """DISTRIBUTED_TOP_K when the accept reads only the target's top-k (greedy or candidates)."""
         if self._verify_top_k_width is None:
             return LogitsOutputMode.FULL_VOCAB
-        if self._simulate_acc_len > 0:
-            return LogitsOutputMode.FULL_VOCAB
+        # A simulated accept reads no logits; keep serving's mode so the benchmark
+        # pays the same logits traffic as production.
         if bucket.temperatures is None or draft_result.draft_candidates is not None:
             return LogitsOutputMode.DISTRIBUTED_TOP_K
         return LogitsOutputMode.FULL_VOCAB
@@ -605,6 +756,17 @@ class TpuSpecWorker(BaseSpecWorker):
         """Accept and finalize in one program; ranks agree without a broadcast (hash_uniforms)."""
         draft_tokens = draft_result.draft_tokens
         state = bucket.state
+        if self._simulate_acc_len > 0:
+            num_correct_drafts, bonus_tokens, draft_tokens = self._simulated_accept(
+                draft_tokens.shape[0]
+            )
+            return finalize_accept(
+                draft_tokens,
+                num_correct_drafts,
+                bonus_tokens,
+                state.seq_lens,
+                bucket.live_mask,
+            )
         num_rows = draft_tokens.shape[0] * self.num_verify_rows
         if logits_output.has_next_token_global_top_k:
             top_logits = logits_output.next_token_global_top_k_logits
@@ -640,17 +802,6 @@ class TpuSpecWorker(BaseSpecWorker):
         assert target_logits.shape[0] == num_rows, (
             "verify logits must keep the bucket rows"
         )
-        if self._simulate_acc_len > 0:
-            num_correct_drafts, bonus_tokens, draft_tokens = self._simulated_accept(
-                draft_tokens.shape[0]
-            )
-            return finalize_accept(
-                draft_tokens,
-                num_correct_drafts,
-                bonus_tokens,
-                state.seq_lens,
-                bucket.live_mask,
-            )
         if bucket.temperatures is None or bucket.top_ks is None:
             return accept_greedy_step(
                 target_logits,
@@ -738,16 +889,32 @@ class TpuSpecWorker(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         bucket: BucketState,
-        rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        *,
+        grammar_barrier: Callable[[], None] | None = None,
     ) -> tuple[CommitResult, LogitsProcessorOutput, AcceptResult]:
+        # Algorithms that only need these rows after drafting can fuse their preparation.
+        rows = select_verify_rows(
+            verify_input.verify_cache_candidates,
+            verify_input.committed_lens,
+            bucket.state.seq_lens,
+            self.num_verify_rows,
+        )
         draft_result = self.draft(batch, bucket, rows, verify_input)
         logits_output, accept = self.verify(
-            batch, bucket, rows, draft_result, verify_input
+            batch,
+            bucket,
+            rows,
+            draft_result,
+            verify_input,
+            grammar_barrier=grammar_barrier,
         )
         if self._target_has_linear_attn:
             self._commit_linear_attn_states(
-                batch=batch, accept=accept, verify_input=verify_input
+                batch=batch,
+                accept=accept,
+                pre_verify_lens=bucket.state.seq_lens,
+                verify_input=verify_input,
             )
         committed = self.commit(
             batch, bucket.state, rows, verify_input, logits_output, accept
@@ -759,6 +926,7 @@ class TpuSpecWorker(BaseSpecWorker):
         *,
         batch: ScheduleBatch,
         accept: AcceptResult,
+        pre_verify_lens: torch.Tensor,
         verify_input: TpuSpecVerifyInput,
     ) -> None:
         """Select each slot's verify checkpoint at its last accepted token, and
@@ -766,21 +934,33 @@ class TpuSpecWorker(BaseSpecWorker):
         runner = self.target_worker.model_runner
         attn_backend = runner.attn_backend
         assert isinstance(attn_backend, HybridLinearAttnBackend), type(attn_backend)
-        steps_to_track = None
-        if batch.mamba_track_indices is not None:
-            steps_to_track = verify_track_steps(
-                verify_input.committed_lens,
-                accept.last_steps,
-                mamba_track_grid(batch.tree_cache.page_size),
-            )
+        track_indices, steps_to_track = batch.mamba_track_indices, None
+        if track_indices is not None:
+            track_grid = mamba_track_grid(batch.tree_cache.page_size)
+            if self._may_cross_track_boundary(verify_input, track_grid):
+                # Device lengths: under overlap the host committed_lens trail by one commit.
+                steps_to_track = verify_track_steps(
+                    pre_verify_lens, accept.last_steps, track_grid
+                )
+            else:
+                track_indices = None
         # Slots come from the verify forward's bucket metadata; padded rows accept 0,
         # so their -1 step leaves the slot untouched.
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=accept.last_steps,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=track_indices,
             mamba_steps_to_track=steps_to_track,
             model=runner.model,
         )
+
+    def _may_cross_track_boundary(
+        self, verify_input: TpuSpecVerifyInput, track_grid: int
+    ) -> bool:
+        """Whether a request may cross a track boundary in this verify: its device
+        length runs from at least the host committed base to at most the KV bound."""
+        low = verify_input.seq_lens_cpu
+        high, _ = verify_input.kv_lens_after_rows(self.num_verify_rows)
+        return bool((low // track_grid != high // track_grid).any())
 
     def forward_batch_generation(
         self,
@@ -792,6 +972,9 @@ class TpuSpecWorker(BaseSpecWorker):
     ) -> GenerationBatchResult:
         self._check_supported(batch=batch, pp_proxy_tensors=pp_proxy_tensors)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            # Mixed prefill samples another token for its running requests.
+            if batch.has_grammar and grammar_barrier is not None:
+                grammar_barrier()
             result = self.extend(batch, pp_proxy_tensors=pp_proxy_tensors)
         elif batch.forward_mode.is_idle():
             if self._dp_attention and max(batch.global_num_tokens or (0,)) > 0:
@@ -799,7 +982,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 self._forward_idle_decode(batch)
             result = self._idle_result()
         else:
-            result = self._forward_decode(batch)
+            result = self._forward_decode(batch, grammar_barrier=grammar_barrier)
         next_draft_input = result.next_draft_input
         assert isinstance(next_draft_input, HostPaddedDraftInput)
         # Rows with requests write KV; idle rows write only the reserved slot 0.
@@ -808,22 +991,18 @@ class TpuSpecWorker(BaseSpecWorker):
             on_publish(result.new_seq_lens)
         return result
 
-    def _forward_decode(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def _forward_decode(
+        self, batch: ScheduleBatch, *, grammar_barrier: Callable[[], None] | None = None
+    ) -> GenerationBatchResult:
         bs = batch.seq_lens.shape[0]
         padded_bs = self._decode_bucket(batch, bs)
         verify_input = TpuSpecVerifyInput.from_batch(
             batch, self.num_verify_rows, padded_bs
         )
         bucket = self._bucket_state(batch, padded_bs, verify_input)
-        # req_to_token is host-resident on TPU; the host gathered the candidate
-        # slot window, so the block is picked on device without a D2H sync.
-        rows = select_verify_rows(
-            verify_input.verify_cache_candidates,
-            verify_input.committed_lens,
-            bucket.state.seq_lens,
-            self.num_verify_rows,
+        committed, logits_output, accept = self.step(
+            batch, bucket, verify_input, grammar_barrier=grammar_barrier
         )
-        committed, logits_output, accept = self.step(batch, bucket, rows, verify_input)
         next_state = committed.state
         # The scheduler stores this key as the next spec_info.future_indices.
         self._bucket = bucket._replace(key=batch.req_pool_indices, state=next_state)
@@ -1415,19 +1594,24 @@ class TpuSpecWorker(BaseSpecWorker):
         *,
         bucket_state: SpecState,
         verify_input: TpuSpecVerifyInput,
-        kv_rows: int,
+        host_kv_rows: int | None,
         **overrides: Any,
     ) -> contextlib.AbstractContextManager[ScheduleBatch]:
         """batch with its row fields at the bucket, restored on exit, for code that reads them.
 
         init_new snapshots these; feeding the bucket rows leaves the shim nothing
         to pad. Padded rows hold pool row 0 and host KV length 0, inactive in RPA;
-        seq_lens_cpu bounds the KV length once kv_rows rows past seq_lens are
-        written. overrides set (and restore) further batch fields.
+        host_kv_rows bounds the extra KV rows written past seq_lens; None skips
+        host bounds for device-built attention metadata. overrides set (and
+        restore) further batch fields.
         """
         padded_bs = bucket_state.seq_lens.shape[0]
         assert verify_input.req_pool_indices_cpu.shape[0] == padded_bs
-        seq_lens_cpu, seq_lens_sum = verify_input.padded_kv_lens_after_rows(kv_rows)
+        seq_lens_cpu, seq_lens_sum = (
+            (None, None)
+            if host_kv_rows is None
+            else verify_input.padded_kv_lens_after_rows(host_kv_rows)
+        )
         multimodal_inputs = batch.multimodal_inputs
         if multimodal_inputs is not None:
             # Spec M-RoPE positions read one entry per (bucket) row.
@@ -1463,7 +1647,7 @@ class TpuSpecWorker(BaseSpecWorker):
             batch,
             bucket_state=bucket_state,
             verify_input=verify_input,
-            kv_rows=self.num_verify_rows,
+            host_kv_rows=self.num_verify_rows,
         ) as view:
             return self._prepare_verify_forward_batch(view, spec_info)
 
@@ -1610,7 +1794,7 @@ class TpuSpecWorker(BaseSpecWorker):
             batch.forward_mode.is_extend() or batch.is_extend_in_batch
         ):
             raise NotImplementedError("TpuSpecWorker under PP only extends.")
-        if batch.has_grammar:
+        if batch.has_grammar and not self.supports_grammar:
             raise NotImplementedError("TpuSpecWorker does not support grammar.")
         if batch.return_logprob and not self.supports_logprobs:
             raise NotImplementedError("TpuSpecWorker does not support logprobs.")

@@ -150,6 +150,22 @@ def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
     return shard_offsets
 
 
+def pad_block_scale_tail(loaded_weight: torch.Tensor, dim: int, blocks: int):
+    # Blockwise scale counterpart of pad_or_narrow_weight: when a TP-sharded
+    # parameter was padded to block alignment (fp8 blockwise, intermediate
+    # sizes such as 1280 at TP8), the ranks past the checkpoint tail read scale
+    # rows that do not exist. Padding conventions must match the weight side:
+    # zeros appended at the tail. Zero scales are inert because the padded
+    # weight rows they cover are zeros too.
+    shortfall = blocks - loaded_weight.size(dim)
+    if shortfall <= 0:
+        return loaded_weight
+    pad_shape = list(loaded_weight.shape)
+    pad_shape[dim] = shortfall
+    pad = torch.zeros(pad_shape, dtype=loaded_weight.dtype, device=loaded_weight.device)
+    return torch.cat([loaded_weight, pad], dim=dim)
+
+
 class LinearBase(torch.nn.Module):
     """Base linear layer.
 
@@ -973,6 +989,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_size = (
                     global_start + local_size + block_n - 1
                 ) // block_n - global_start // block_n
+                loaded_weight = pad_block_scale_tail(
+                    loaded_weight,
+                    param.output_dim,
+                    global_start // block_n + shard_size,
+                )
                 loaded_weight = loaded_weight.narrow(
                     param.output_dim, global_start // block_n, shard_size
                 )
@@ -1303,6 +1324,11 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_size = (
                     global_start + local_size + block_n - 1
                 ) // block_n - global_start // block_n
+                loaded_weight = pad_block_scale_tail(
+                    loaded_weight,
+                    param.output_dim,
+                    global_start // block_n + shard_size,
+                )
                 loaded_weight = loaded_weight.narrow(
                     param.output_dim, global_start // block_n, shard_size
                 )
@@ -1727,6 +1753,9 @@ class RowParallelLinear(LinearBase):
                 global_start + self.input_size_per_partition + block_k - 1
             ) // block_k
             block_count = block_end - block_start
+            loaded_weight = pad_block_scale_tail(
+                loaded_weight, param.input_dim, block_end
+            )
             loaded_weight = loaded_weight.narrow(
                 param.input_dim, block_start, block_count
             )

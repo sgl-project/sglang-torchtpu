@@ -875,7 +875,11 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 )
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
-        self.cnt += 1
+        # Only TeaCache reads the step counter (Wan's borrowed
+        # should_skip_forward_for_cached_states); under torch.compile a mutated
+        # int attribute recompiles the forward every step.
+        if self.enable_teacache:
+            self.cnt += 1
 
         if sequence_shard_enabled:
             hidden_states = sequence_model_parallel_all_gather(
