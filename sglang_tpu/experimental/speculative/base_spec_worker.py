@@ -248,8 +248,11 @@ class TpuSpecWorker(BaseSpecWorker):
         # requests take the target-only accept, as TPU EAGLE does.
         self._sampled_drafts = not self._dp_attention
         if self._dp_attention:
+            # A drafter that lives inside the target (V4.1 DSpark) has no draft worker
+            # and projects through the target's lm_head, so check that head.
+            head_owner = draft_worker if draft_worker is not None else target_worker
             _check_draft_lm_head_group(
-                draft_worker.model_runner.model, attn_tp_size=parallel.attn_tp_size
+                head_owner.model_runner.model, attn_tp_size=parallel.attn_tp_size
             )
         self._target_has_linear_attn = (
             mambaish_config(target_worker.model_runner.model_config) is not None
@@ -554,6 +557,9 @@ class TpuSpecWorker(BaseSpecWorker):
     def retraction_draft_kv_pools(self) -> tuple[KVCache, ...]:
         # Core backs up only EAGLE draft pools; without these, a request resumed
         # on a PD decode server drafts over whatever KV its new slots hold.
+        if self._draft_worker is None:
+            # In-target drafter (V4.1 DSpark): no draft runner, no draft KV pool.
+            return ()
         pools = tuple(
             runner.token_to_kv_pool for runner in self._draft_worker.draft_runners
         )
