@@ -524,8 +524,19 @@ class TpuChainSpecWorker(TpuSpecWorker):
             return_hidden_states_before_norm=False,
         )
         idle_hidden = target_hidden[:0]
+        # Present the same spec_info structure as an active rank's draft prompt
+        # extend (_extend_draft): target hidden at the token bucket and, for a
+        # draft sharing its DSA top-k, a seed capture/select pair at the extend
+        # cap. The compiled draft forward guards on these (shape, and None vs
+        # tensor), and precompile only warms the active-rank form; a 0-row
+        # hidden with no seed tensors misses every graph and recompiles, which
+        # fail_on_recompile turns into a crash on the first DP-attention prefill.
+        seed_capture, seed_select = self._idle_prompt_seed_capture()
         forward_batch.spec_info = chain_draft_forward_input(
-            hidden_states=idle_hidden, width=1
+            hidden_states=target_hidden,
+            width=1,
+            dsa_seed_topk_capture=seed_capture,
+            dsa_seed_topk_select=seed_select,
         )
         forward_batch.return_logprob = False
         # The TPU forward relabels this idle rank DECODE; core's speculative decode
@@ -537,6 +548,20 @@ class TpuChainSpecWorker(TpuSpecWorker):
         )
         with self._chain_draft_worker.draft_context(), torch.no_grad():
             self._draft_runner.forward(forward_batch)
+
+    def _idle_prompt_seed_capture(
+        self,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """_prompt_seed_capture for a rank without prompts: same shapes, row 0 kept."""
+        cap = self._compile_policy()._extend_compile_cap()
+        capture = dsa_seed_topk_buffer(
+            num_rows=cap,
+            width=self._chain_draft_worker.dsa_seed_topk_width,
+            device=self.device,
+        )
+        if capture is None:
+            return None, None
+        return capture, torch.zeros((cap,), dtype=torch.int64, device=self.device)
 
     def _set_draft_prefill_dp_counts(
         self, forward_batch: ForwardBatch, *, padded_tokens: int
