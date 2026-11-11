@@ -28,6 +28,7 @@ from sglang_tpu.experimental.speculative.chain_draft_input import (
     chain_draft_forward_input,
 )
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
+from sglang_tpu.host_upload import device_scalar
 
 # (forward_batch, carry, req_pool_indices, positions, cache_locs, seq_lens,
 #  temperatures, top_ks, uniforms, dsa_seed_topk_table)
@@ -189,7 +190,7 @@ class TpuChainDraftWorker(TpuDraftWorker):
             spec_info=chain_draft_forward_input(hidden_states=hidden, width=1),
             capture_hidden_mode=CaptureHiddenMode.FULL,
             num_token_non_padded=(
-                torch.tensor(bs, dtype=torch.int32, device=seq_lens.device)
+                device_scalar(bs, torch.int32, seq_lens.device)
                 if enable_num_token_non_padded()
                 else None
             ),

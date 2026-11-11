@@ -46,6 +46,7 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool, get_tensor_size_bytes
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang_tpu.host_upload import upload
 
 logger = logging.getLogger(__name__)
 
@@ -295,8 +296,8 @@ class TpuMambaPool(MambaPool):
             raise RuntimeError("GDN checkpoint storage was not allocated")
         indices, offsets = committed_read_offsets(
             self.checkpoint_read_offsets,
-            indices.to(self.device),
-            last_correct_step_indices.to(self.device),
+            upload(indices, self.device),
+            upload(last_correct_step_indices, self.device),
         )
         self.checkpoint_read_offsets.index_copy_(0, indices, offsets)
 
@@ -347,7 +348,9 @@ class TpuMambaPool(MambaPool):
     ) -> None:
         """Copy window checkpoint steps[i] of request i into track_slots[i] (radix
         snapshot after a verify); a negative step or track slot skips that row."""
-        track_slots = track_slots.to(self.device)
+        # Runs after the verify is queued: a blocking upload of the host track
+        # slots would wait for the whole verify.
+        track_slots = upload(track_slots, self.device)
         states = self._copy_states()
         if states[0].device.type == "cpu":
             valid = ((steps >= 0) & (track_slots > 0)).nonzero(as_tuple=True)[0]
@@ -449,9 +452,9 @@ class TpuMambaPool(MambaPool):
         padding = copy_bucket_size(count) - count
         src = torch.nn.functional.pad(src_indices.to(torch.int32), (0, padding))
         dst = torch.nn.functional.pad(dst_indices.to(torch.int32), (0, padding))
-        copy_count = torch.tensor([count], dtype=torch.int32, device=self.device)
+        copy_count = upload(torch.tensor([count], dtype=torch.int32), self.device)
         compiled_state_copy()(
-            states, src.to(self.device), dst.to(self.device), copy_count
+            states, upload(src, self.device), upload(dst, self.device), copy_count
         )
 
     @torch.no_grad()

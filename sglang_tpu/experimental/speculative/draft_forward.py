@@ -20,6 +20,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     DraftBlockInputs,
     TpuSpecVerifyInput,
 )
+from sglang_tpu.host_upload import device_scalar
 
 
 def set_bucket_dp_metadata(
@@ -67,8 +68,10 @@ def forward_draft_rows(
     # Padded rows carry kv len 0, so RPA keeps them inactive.
     kv_lens_cpu, kv_lens_sum = verify_input.padded_kv_lens_after_rows(offset + width)
     num_live_tokens = bs * width
+    # This runs right after the verify launch, so a blocking upload would wait
+    # for the whole verify; the cached scalar needs no upload at all.
     num_token_non_padded = (
-        torch.tensor(num_live_tokens, dtype=torch.int32, device=device)
+        device_scalar(num_live_tokens, torch.int32, device)
         if enable_num_token_non_padded()
         else None
     )
