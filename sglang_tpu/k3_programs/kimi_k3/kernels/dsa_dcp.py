@@ -119,6 +119,10 @@ CHUNK_ROWS = 64  # key rows (of 128 tokens) a counting step reads
 PAGE_SLOTS = 4  # index pages (scoring)
 KEY_SLOTS = 8  # key chunks (counting, step activity)
 WIDE_BATCH = 64  # from this many rows: rings of 3 and 4 (the decode's VMEM plan)
+# A row holds topk / group selected tokens a rank (64 over DCP32): with at most
+# this many local attention steps per row nearly every step holds one, so the
+# step activity marks them all instead of scanning the keys.
+ACTIVITY_MIN_STEPS = 16
 
 
 def ring_slots(batch: int) -> tuple[int, int]:
@@ -566,46 +570,59 @@ class IndexSelect:
 def _step_activity(self, span_rows: int, active_ref, steps: int):
     """``active_ref[b * steps + s]`` = 1 where attention step ``s`` (key rows
     ``[s span_rows, (s + 1) span_rows)``) of row ``b``'s sequence (``b`` its
-    first row) holds a selected token of any of its rows; after ``select``."""
+    first row) holds a selected token of any of its rows; after ``select``.
+    When no row has more than ``ACTIVITY_MIN_STEPS`` local steps every step
+    is marked (the attention masks the tokens either way)."""
     refs, chunk = self.refs, self.chunk
     if chunk % span_rows or self.key_rows % span_rows:
         raise ValueError("attention steps must tile the key chunks")
 
-    def clear(i, carry):
-        active_ref[i] = jnp.int32(0)
-        return carry
+    def fill(value):
+        def one(i, carry):
+            active_ref[i] = value
+            return carry
 
-    jax.lax.fori_loop(0, self.batch * steps, clear, 0)
-    total = refs["chunk_starts"][self.batch]
-    for step in range(self.key_slots - 1):
-        pl_when(step < total)(lambda step=step: self._chunk_copy(step))
-    sub = jax.lax.broadcasted_iota(jnp.int32, (span_rows, LANES), 0)
-    lane = jax.lax.broadcasted_iota(jnp.int32, (span_rows, LANES), 1)
+        jax.lax.fori_loop(0, self.batch * steps, one, 0)
 
-    def step_fn(step, carry):
-        row, local = refs["step_row"][step], refs["step_local"][step]
-        self._wait_chunk(step)
-        pl_when(step + self.key_slots - 1 < total)(lambda: self._chunk_copy(step + self.key_slots - 1))
-        start = jnp.minimum(local * chunk, self.key_rows - chunk)
-        rows_valid = refs["counts"][row] * self.subpages
-        tau, p_tie = refs["tau"][row], refs["p_tie"][row]
-        target = row - row % self.S if self.S > 1 else row
-        for v in range(chunk // span_rows):
-            key = refs["key_buf"][step % self.key_slots, pl_ds(v * span_rows, span_rows), :]
-            key_row = start + v * span_rows + sub
-            valid = (key_row >= local * chunk) & (key_row < rows_valid)
-            page = key_row // self.subpages
-            position = ((page * self.group + self.owner) * self.T
-                        + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS + lane)
-            hit = jnp.sum((valid & selected(key, position, tau, p_tie)).astype(jnp.int32))
-            index = target * steps + (start + v * span_rows) // span_rows
+    longest = refs["counts"][0]
+    for b in range(1, self.batch):
+        longest = jnp.maximum(longest, refs["counts"][b])
+    dense = (longest * self.subpages + span_rows - 1) // span_rows <= ACTIVITY_MIN_STEPS
+    pl_when(dense)(lambda: fill(jnp.int32(1)))
 
-            @pl_when(hit > 0)
-            def mark(index=index):
-                active_ref[index] = jnp.int32(1)
-        return carry
+    @pl_when(jnp.logical_not(dense))
+    def scan():
+        fill(jnp.int32(0))
+        total = refs["chunk_starts"][self.batch]
+        for step in range(self.key_slots - 1):
+            pl_when(step < total)(lambda step=step: self._chunk_copy(step))
+        sub = jax.lax.broadcasted_iota(jnp.int32, (span_rows, LANES), 0)
+        lane = jax.lax.broadcasted_iota(jnp.int32, (span_rows, LANES), 1)
 
-    jax.lax.fori_loop(0, total, step_fn, 0)
+        def step_fn(step, carry):
+            row, local = refs["step_row"][step], refs["step_local"][step]
+            self._wait_chunk(step)
+            pl_when(step + self.key_slots - 1 < total)(lambda: self._chunk_copy(step + self.key_slots - 1))
+            start = jnp.minimum(local * chunk, self.key_rows - chunk)
+            rows_valid = refs["counts"][row] * self.subpages
+            tau, p_tie = refs["tau"][row], refs["p_tie"][row]
+            target = row - row % self.S if self.S > 1 else row
+            for v in range(chunk // span_rows):
+                key = refs["key_buf"][step % self.key_slots, pl_ds(v * span_rows, span_rows), :]
+                key_row = start + v * span_rows + sub
+                valid = (key_row >= local * chunk) & (key_row < rows_valid)
+                page = key_row // self.subpages
+                position = ((page * self.group + self.owner) * self.T
+                            + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS + lane)
+                hit = jnp.sum((valid & selected(key, position, tau, p_tie)).astype(jnp.int32))
+                index = target * steps + (start + v * span_rows) // span_rows
+
+                @pl_when(hit > 0)
+                def mark(index=index):
+                    active_ref[index] = jnp.int32(1)
+            return carry
+
+        jax.lax.fori_loop(0, total, step_fn, 0)
 
 
 IndexSelect.step_activity = _step_activity
