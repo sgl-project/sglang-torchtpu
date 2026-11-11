@@ -41,9 +41,22 @@ class DSV41RunaiModelStreamerLoader(RunaiModelStreamerLoader):
         from sglang_tpu.models.deepseek_v41.preprocess import bind_model_preprocessing
         from sglang_tpu.models.deepseek_v41.qa_preprocess import bind_model_qa
 
-        bind_model_preprocessing(model)
-        bind_model_qa(model)
-        bind_model_compressor(model)
+        bound_qb = bind_model_preprocessing(model)
+        bound_qa = bind_model_qa(model)
+        bound_compressor = bind_model_compressor(model)
+        if (
+            bound_qb or bound_qa or bound_compressor
+        ) and getattr(model, "_derived_weight_cache_error", None) is None:
+            # Public online updates bypass load_model, leaving gamma snapshots,
+            # compressor transposes and captured adapter references stale. Use
+            # the core's startup-determined, rank-uniform rejection contract;
+            # an explicit offline reload/rebind is still allowed.
+            model._derived_weight_cache_error = (
+                "Online weight updates are not supported while DeepSeek-V4.1 TPU "
+                "projection/compressor adapters are bound: cached derived weights "
+                "and compiled references would become stale. Restart the server "
+                "to load new weights and rebuild the adapters."
+            )
         return model
 
     def _get_weights_iterator(self, source):

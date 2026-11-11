@@ -33,6 +33,73 @@ def _layer(ratio=1):
 
 
 class TestCompressorBinding(CustomTestCase):
+    def test_online_updates_reject_before_mutating_bound_transpose(self):
+        """Public updates bypass adapter rebinding and must reject stale caches."""
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            WeightUpdater,
+        )
+
+        from sglang_tpu.models.deepseek_v41.loader import (
+            DSV41RunaiModelStreamerLoader,
+            RunaiModelStreamerLoader,
+        )
+
+        layer = _layer()
+        loader = DSV41RunaiModelStreamerLoader.__new__(DSV41RunaiModelStreamerLoader)
+        # Model construction/checkpoint I/O is the boundary; real post-load
+        # binders and the production update admission/mutation methods run below.
+        with mock.patch.object(RunaiModelStreamerLoader, "load_model", return_value=layer):
+            model = loader.load_model(model_config=None, device_config=None)
+        runner = SimpleNamespace(
+            get_model=lambda: model,
+            _assert_weight_cache_inactive=lambda op: None,
+        )
+        before = model.compressor.wkv.weight.detach().clone()
+        replacement = torch.full_like(before, 0.25)
+        rejection = WeightUpdater.load_rejection(runner, "update_weights_from_tensor")
+        self.assertIn("adapters are bound", rejection)
+        updates = (
+            lambda: WeightUpdater.update_weights_from_tensor(
+                runner, [("compressor.wkv.weight", replacement)], load_format="direct"
+            ),
+            lambda: WeightUpdater.load_weights_from_distributed(
+                runner, [("compressor.wkv.weight", replacement)]
+            ),
+            lambda: WeightUpdater.update_weights_from_disk(runner, "unused", "auto"),
+            lambda: WeightUpdater.update_weights_from_ipc(runner, None),
+        )
+        for update in updates:
+            success, reason = update()
+            self.assertFalse(success)
+            self.assertEqual(reason, rejection)
+            torch.testing.assert_close(model.compressor.wkv.weight, before)
+        # A complete, explicit offline reload/rebind still refreshes the cache.
+        model.compressor.wkv.weight.copy_(replacement)
+        binder.bind_model_compressor(model)
+        torch.testing.assert_close(model._dsv41_compressor.weight, replacement.t())
+
+    def test_load_preserves_existing_update_rejection_without_blocking_fallback(self):
+        from sglang_tpu.models.deepseek_v41.loader import (
+            DSV41RunaiModelStreamerLoader,
+            RunaiModelStreamerLoader,
+        )
+
+        loader = DSV41RunaiModelStreamerLoader.__new__(DSV41RunaiModelStreamerLoader)
+        for ratio, existing in ((1, "another derived cache"), (2, None)):
+            with self.subTest(ratio=ratio):
+                layer = _layer(ratio)
+                if existing is not None:
+                    layer._derived_weight_cache_error = existing
+                with mock.patch.object(
+                    RunaiModelStreamerLoader, "load_model", return_value=layer
+                ):
+                    loader.load_model(model_config=None, device_config=None)
+                self.assertEqual(
+                    getattr(layer, "_derived_weight_cache_error", None), existing
+                )
+
     def test_real_eval_constructor_grad_metadata_does_not_block_inference(self):
         """eval does not freeze Parameters; binding must detach, not reject them."""
         layer = MQALayer.__new__(MQALayer)
