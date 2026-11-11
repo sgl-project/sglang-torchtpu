@@ -118,14 +118,28 @@ from __future__ import annotations
 import torch
 
 
-def _pool_hooks():
-    from sglang_tpu.models.deepseek_v41 import memory_pool
-
-    return (
-        memory_pool.build_tpu_dsv41_kv_pool,
-        memory_pool.get_tpu_dsv41_bytes_per_swa_token,
-        memory_pool.get_tpu_dsv41_bytes_per_full_token,
+def build_tpu_dsv41_kv_pool(original, kvc, *args, **kwargs):
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        build_tpu_dsv41_kv_pool as _impl,
     )
+
+    return _impl(original, kvc, *args, **kwargs)
+
+
+def get_tpu_dsv41_bytes_per_swa_token(original, configurator) -> float:
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        get_tpu_dsv41_bytes_per_swa_token as _impl,
+    )
+
+    return _impl(original, configurator)
+
+
+def get_tpu_dsv41_bytes_per_full_token(original, configurator) -> float:
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        get_tpu_dsv41_bytes_per_full_token as _impl,
+    )
+
+    return _impl(original, configurator)
 
 
 def select_tpu_dsv41_loader(result, load_config, model_config=None):
@@ -326,11 +340,18 @@ def hook_specs():
 
     kvc = "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator"
     cfg = "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator"
-    build_pool, swa_bytes, full_bytes = _pool_hooks()
     return [
-        (f"{kvc}._build_dsv4_kv_pool", build_pool, HookType.AROUND),
-        (f"{cfg}._get_bytes_per_swa_token", swa_bytes, HookType.AROUND),
-        (f"{cfg}._get_bytes_per_full_token", full_bytes, HookType.AROUND),
+        (f"{kvc}._build_dsv4_kv_pool", build_tpu_dsv41_kv_pool, HookType.AROUND),
+        (
+            f"{cfg}._get_bytes_per_swa_token",
+            get_tpu_dsv41_bytes_per_swa_token,
+            HookType.AROUND,
+        ),
+        (
+            f"{cfg}._get_bytes_per_full_token",
+            get_tpu_dsv41_bytes_per_full_token,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.model_loader.loader.get_model_loader",
             select_tpu_dsv41_loader,
