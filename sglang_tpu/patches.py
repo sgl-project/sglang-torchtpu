@@ -749,8 +749,9 @@ _future_map_direct_handoff_patched = False
 
 def _patch_future_map_direct_handoff() -> None:
     """Route FutureMap.stash/publish through the TPU direct handoff, so an
-    unchanged EAGLE3 top-k-1 decode batch skips the store/gather round trip.
-    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu."""
+    unchanged EAGLE3 top-k-1 or DFLASH-family decode batch skips the store/gather
+    round trip. The resolve side is hooked via resolve_device_accept_seq_lens_tpu
+    and _resolve_spec_extras."""
     global _future_map_direct_handoff_patched
     if _future_map_direct_handoff_patched:
         return
@@ -758,6 +759,8 @@ def _patch_future_map_direct_handoff() -> None:
 
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang_tpu.overlap_utils_tpu import (
+        PublishedSeqLens,
+        device_accept_resolved_tpu,
         flush_direct_handoff_tpu,
         publish_tpu,
         stash_tpu,
@@ -767,6 +770,7 @@ def _patch_future_map_direct_handoff() -> None:
     orig_publish = FutureMap.publish
     orig_stash_bonus_tokens = FutureMap.stash_bonus_tokens
     orig_resolve_mixed_spec_tails = FutureMap.resolve_mixed_spec_tails
+    orig_resolve_spec_extras = FutureMap._resolve_spec_extras
     FutureMap.tpu_direct_handoff = None
     FutureMap.tpu_published_seq_lens = None
 
@@ -775,8 +779,14 @@ def _patch_future_map_direct_handoff() -> None:
             orig_stash(self, future_indices, payload)
 
     def publish(self, future_indices, new_seq_lens, confidence=None):
-        orig_publish(self, future_indices, new_seq_lens, confidence)
-        publish_tpu(self, future_indices, new_seq_lens)
+        if not publish_tpu(self, future_indices, new_seq_lens, confidence):
+            orig_publish(self, future_indices, new_seq_lens, confidence)
+            if future_indices.shape[0] > 0:
+                self.tpu_published_seq_lens = PublishedSeqLens(
+                    indices=future_indices,
+                    seq_lens=new_seq_lens,
+                    seq_lens_deferred=False,
+                )
 
     # Every other buffer reader or writer must see the pending rows stored first.
     def stash_bonus_tokens(self, indices, bonus_tokens):
@@ -788,10 +798,17 @@ def _patch_future_map_direct_handoff() -> None:
         flush_direct_handoff_tpu(self)
         orig_resolve_mixed_spec_tails(self, batch)
 
+    def resolve_spec_extras(self, batch):
+        if device_accept_resolved_tpu(self, batch):
+            return
+        flush_direct_handoff_tpu(self)
+        orig_resolve_spec_extras(self, batch)
+
     FutureMap.stash = stash
     FutureMap.publish = publish
     FutureMap.stash_bonus_tokens = stash_bonus_tokens
     FutureMap.resolve_mixed_spec_tails = resolve_mixed_spec_tails
+    FutureMap._resolve_spec_extras = resolve_spec_extras
 
 
 _raiden_is_load_back_event_done_patched = False
