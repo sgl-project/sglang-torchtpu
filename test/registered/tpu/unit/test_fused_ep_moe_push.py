@@ -31,9 +31,23 @@ Every test needs the eight-way expert-parallel slice (8 JAX devices, e.g. a
 tpu7x 2x2x1 host); on anything else the module skips at setup.
 """
 
+import os
+import shlex
 import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
+
+# The DP8 topology-preprocessing path uses remote DMA between SparseCores.
+# Set its two startup requirements before creating the JAX client, as the
+# upstream DP8 serving recipe does. Keep any explicit caller overrides.
+_libtpu_args = shlex.split(os.environ.get("LIBTPU_INIT_ARGS", ""))
+for _flag in (
+    "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0",
+    "--xla_mosaic_unsafe_allow_multicore_remote_dma=true",
+):
+    if not any(a.split("=", 1)[0] == _flag.split("=", 1)[0] for a in _libtpu_args):
+        _libtpu_args.append(_flag)
+os.environ["LIBTPU_INIT_ARGS"] = " ".join(_libtpu_args)
 
 # Unmeasured estimate for the eight-device sweep at the served dims; the
 # weekly est-time job refreshes it. Nightly, like the v2 numerical sweep.
@@ -42,7 +56,7 @@ register_tpu_ci(
     suite="nightly-tpu-4-v7",
     nightly=True,
     chips=4,
-    labels=["singlehost", "infra"],
+    labels=["singlehost", "deepseek-v4.1-flash", "accuracy", "dpa"],
 )
 
 if __name__ == "__main__":
@@ -633,3 +647,293 @@ def test_dispatch_push_through_v2_is_the_push_layer():
     direct = fused_ep_moe_push(x, *weights, gating, **options, **common)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     np.testing.assert_array_equal(np.asarray(got), np.asarray(direct))
+
+
+@pytest.fixture(scope="module")
+def four_chip_weights():
+    """Full EP8 expert sets, cached across the model's token buckets."""
+    mesh = _mesh()
+    cache = {}
+
+    def build(experts):
+        if experts not in cache:
+            logical = _served_fp4_weights(mesh, 101, e_total=experts)
+            slot_expert, table = _contiguous_plus_one(experts, EP)
+            shard = NamedSharding(mesh, P(AXIS))
+            physical = []
+            for w in logical:
+                # Flat scales are reordered by expert, not by scale row.
+                grouped = w.reshape(experts, -1, w.shape[-1])
+                placed = jnp.take(grouped, jnp.asarray(slot_expert), axis=0)
+                if w.ndim == 2:
+                    placed = placed.reshape(-1, w.shape[-1])
+                physical.append(jax.device_put(placed, shard))
+            cache[experts] = mesh, logical, tuple(physical), table
+        return cache[experts]
+
+    return build
+
+
+def _served_dense_samples(mesh, weights, x, ids, coefficients):
+    """Independent FP32 dequantize/matmul reference on a few global rows.
+
+    Every rank computes its local experts then sums contributions. It shares
+    no routing, packing, activation, or combine implementation with the kernel.
+    Sampling bounds reference work while still using the full expert matrices.
+    """
+
+    def local(x, ids, coefficients, w1, w2, s1, s2):
+        count = w1.shape[0]
+        s1 = s1.reshape(count, -1, w1.shape[-1])
+        s2 = s2.reshape(count, -1, w2.shape[-1])
+        first = lax.axis_index(AXIS) * count
+
+        def expert(e, acc):
+            def decode(w, scale):
+                k, n = w.shape[1:]
+                raw = w[e].astype(jnp.float32).reshape(k // 512, 512, n)
+                return (raw * scale[e, : k // 512, None, :]).reshape(k, n)
+
+            proj = jnp.matmul(
+                x.astype(jnp.float32), decode(w1, s1), precision=lax.Precision.HIGHEST
+            )
+            gate, up = jnp.split(proj, 2, axis=-1)
+            gate = jnp.minimum(gate, 10.0)
+            up = jnp.clip(up, -10.0, 10.0)
+            hidden = (gate * jax.nn.sigmoid(gate)) * up
+            out = jnp.matmul(hidden, decode(w2, s2), precision=lax.Precision.HIGHEST)
+            coef = jnp.where(ids == first + e, coefficients, 0).sum(-1)
+            return acc + out * coef[:, None]
+
+        mine = lax.fori_loop(0, count, expert, jnp.zeros(x.shape, jnp.float32))
+        return lax.psum(mine, AXIS)
+
+    return jax.jit(
+        jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=(P(),) * 3 + (P(AXIS),) * 4,
+            out_specs=P(),
+            check_vma=False,
+        )
+    )(x, ids, coefficients, *weights)
+
+
+@pytest.mark.parametrize(
+    "experts,rows,topk",
+    [(384, 288, 6), (128, 240, 3), (384, 2048, 6)],
+    ids=["verify", "draft", "prefill"],
+)
+def test_four_chip_full_experts_and_static_eplb(four_chip_weights, experts, rows, topk):
+    """EP8: 384/128 logical experts plus one replica slot per rank.
+
+    Catch wrong expert/flat-scale placement, dropped or double-counted replicas,
+    stale load buffers, and push synchronization/combine errors. Uneven padding
+    includes an entirely idle rank; hot experts require multiple dispatch tiles.
+    """
+    mesh, logical, physical, table = four_chip_weights(experts)
+    physical_count = experts + EP
+    shard, repl = NamedSharding(mesh, P(AXIS)), NamedSharding(mesh, P())
+    x, gating = _inputs(
+        mesh, 102, hidden=SERVED_HIDDEN, e_logical=experts, tokens=EP * rows
+    )
+    x = x * 8  # Exercise the model's activation clamp as well as its padding.
+    gate_host = np.asarray(gating).copy()
+    active = np.ones((EP, rows), bool)
+    for rank in range(EP):
+        active[rank, -(rank + 1) :] = False
+    active[-1] = False
+    active = active.reshape(-1)
+    gate_host[~active] = -np.inf
+    gating = jax.device_put(gate_host, shard)
+    bias = np.zeros(experts, np.float32)
+    bias[:: experts // EP] = 0.75
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        score_bias=jax.device_put(bias, repl),
+        routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp",
+        logical_intermediate_size=SERVED_LOGICAL_INTER,
+    )
+    plain = np.asarray(fused_ep_moe_v2(x, *logical, gating, **common))
+    assert np.isfinite(plain.astype(np.float32)).all()
+    np.testing.assert_array_equal(plain[~active], 0)
+
+    scores = np.sqrt(np.logaddexp(0, gate_host))
+    ids = np.argsort(-(scores + bias), axis=-1, kind="stable")[:, :topk]
+    selected = np.take_along_axis(scores, ids, axis=-1)
+    sample = np.arange(EP - 1) * rows
+    coefficients = selected[sample] / selected[sample].sum(-1, keepdims=True) * 2.5
+    reference = _served_dense_samples(
+        mesh,
+        logical,
+        jax.device_put(x[sample], repl),
+        jax.device_put(ids[sample].astype(np.int32), repl),
+        jax.device_put(coefficients, repl),
+    )
+
+    def check_reference(result, dispatch):
+        error = _rel(result[sample], reference)
+        per_row = np.linalg.norm(
+            result[sample].astype(np.float32) - np.asarray(reference), axis=-1
+        )
+        per_row /= np.linalg.norm(np.asarray(reference), axis=-1)
+        print(
+            f"EP8 {experts=} {rows=} {topk=} {dispatch=} FP32 reference "
+            f"relative_l2={error} worst_row={per_row.max()}"
+        )
+        assert error < 0.06
+        assert per_row.max() < 0.075
+
+    check_reference(plain, "all_gather")
+
+    copies = (table >= 0).sum(-1)
+    slots = table[ids, np.arange(EP * rows)[:, None] % copies[ids]]
+    counts = np.bincount(slots[active].ravel(), minlength=physical_count)
+    assert counts.sum() == active.sum() * topk
+    initial = jax.device_put(np.arange(physical_count, dtype=np.int32), repl)
+    placement = dict(expert_slot=jax.device_put(table, repl), expert_load=initial)
+    placed, load = fused_ep_moe_v2(x, *physical, gating, **placement, **common)
+    np.testing.assert_array_equal(np.asarray(placed), plain)
+    np.testing.assert_array_equal(np.asarray(load), np.arange(physical_count) + counts)
+
+    if rows == 288:
+        from sglang_tpu.moe.pallas.fused_moe_v2.preprocessing import (
+            topology_for_coordinates,
+        )
+
+        topology = topology_for_coordinates(
+            tuple((*d.coords, d.core_on_chip) for d in mesh.devices.flat)
+        )
+        assert topology is not None
+        placed, load = fused_ep_moe_v2(
+            x, *physical, gating, preprocess_topology=topology, **placement, **common
+        )
+        np.testing.assert_array_equal(np.asarray(placed), plain)
+        np.testing.assert_array_equal(
+            np.asarray(load), np.arange(physical_count) + counts
+        )
+
+    # A conservative push plus the combined options the model can opt into.
+    push_plain = None
+    for options in (
+        dict(sc_prepush=2, tc_exchange=True),
+        dict(
+            sc_prepush=2,
+            tc_exchange=True,
+            onehot_slots=True,
+            tail_barrier=False,
+            hbm_staging=True,
+            dispatch_ahead=physical_count // EP,
+            matmul_scale_repeat=True,
+            exchange_row_gather=True,
+            bf16_sort_counts=True,
+            slim_prepush_barrier=True,
+            fused_dispatch_meta=True,
+            table_kernel=True,
+            exchange_tables=True,
+            kernel_plan_tables=True,
+            light_prepush=2,
+            single_barrier=True,
+            early_scale_scatter=2,
+        ),
+    ):
+        got, load = fused_ep_moe_v2(
+            x,
+            *physical,
+            gating,
+            dispatch="push",
+            push_options=options,
+            **placement,
+            **common,
+        )
+        got = np.asarray(got)
+        if push_plain is None:
+            assert np.isfinite(got.astype(np.float32)).all()
+            np.testing.assert_array_equal(got[~active], 0)
+            check_reference(got, "push")
+            # Upstream's measured all-gather router and generic push router
+            # use different scoring/normalization lowerings at these shapes.
+            # Cross-dispatch accuracy is numerical; push scheduling options
+            # below must still preserve every output bit.
+            delta = np.linalg.norm(
+                got.astype(np.float32) - plain.astype(np.float32), axis=-1
+            )
+            norm = np.linalg.norm(plain.astype(np.float32), axis=-1)
+            relative = np.linalg.norm(delta) / np.linalg.norm(norm)
+            worst = np.max(delta / np.maximum(norm, 1e-30))
+            print(f"push/all_gather relative_l2={relative} worst_row={worst}")
+            assert relative < 1e-4
+            assert worst < 1e-3
+            push_plain = got
+        else:
+            np.testing.assert_array_equal(got, push_plain, err_msg=str(options))
+        np.testing.assert_array_equal(
+            np.asarray(load), np.arange(physical_count) + counts
+        )
+    # The returned count tensor is an accumulator, while the input stays intact.
+    got, twice = fused_ep_moe_v2(
+        x,
+        *physical,
+        gating,
+        dispatch="push",
+        push_options=options,
+        expert_slot=placement["expert_slot"],
+        expert_load=load,
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(got), push_plain)
+    np.testing.assert_array_equal(
+        np.asarray(twice), np.arange(physical_count) + 2 * counts
+    )
+    np.testing.assert_array_equal(np.asarray(initial), np.arange(physical_count))
+
+    if rows in (288, 240):
+        from sglang_tpu.fp8_swiglu_mlp import fp8_swiglu_mlp
+
+        shared = _shared_expert_weights(mesh, 103)
+
+        def with_shared(x, gating, load, *weights):
+            return fused_ep_moe_v2(
+                x,
+                *weights[:4],
+                gating,
+                dispatch="push",
+                push_options=options,
+                expert_slot=placement["expert_slot"],
+                expert_load=load,
+                shared_expert=weights[4:],
+                shared_limit=10.0,
+                **common,
+            )
+
+        routed, counted, got_shared = jax.jit(
+            with_shared,
+            compiler_options=_AS_SERVED,
+        )(x, gating, initial, *physical, *shared)
+        want_shared = jax.jit(
+            jax.shard_map(
+                lambda xl, *w: fp8_swiglu_mlp(xl, *w, limit=10.0),
+                mesh=mesh,
+                in_specs=(P(AXIS),) + (P(),) * 4,
+                out_specs=P(AXIS),
+                check_vma=False,
+            ),
+            compiler_options=_AS_SERVED,
+        )(x, *shared)
+        # This outer JIT uses serving's excess-precision setting; the standalone
+        # calls above use JAX defaults. Check basic accuracy across that boundary.
+        assert np.isfinite(np.asarray(routed, np.float32)).all()
+        assert _rel(routed, push_plain) < 0.01
+        np.testing.assert_array_equal(
+            np.asarray(counted), np.arange(physical_count) + counts
+        )
+        assert np.isfinite(np.asarray(got_shared, np.float32)).all()
+        assert _rel(got_shared, want_shared) < 0.01
