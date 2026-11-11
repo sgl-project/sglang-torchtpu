@@ -184,6 +184,10 @@ class Checkpoint:
             )
         return packed[part * width:(part + 1) * width], scale[part * width:(part + 1) * width]
 
+    # E8M0 scale bytes: 255 is NaN (rejected); 0 encodes 2^-127, which the
+    # kernels decode as exactly zero (bitcast of ``e << 23``). Kimi-K3.1 stores
+    # unused experts' w2 / w3 with all-zero scale bytes (e.g. layer 75's 822).
+
     def experts(self, layer, first, count, *, part=None, parts=4):
         """``(gate_up, gate_up_scales, down, down_scales)`` for ``count`` consecutive experts.
 
@@ -206,8 +210,8 @@ class Checkpoint:
                 packed, scale = self._expert_parts(
                     tensors[prefix + name + ".weight_packed"], tensors[prefix + name + ".weight_scale"], False, part, parts
                 )
-                if scale.dtype != np.uint8 or np.any((scale == 0) | (scale == 255)):
-                    raise ValueError(f"{prefix}{name}: expected normal, finite E8M0 scales")
+                if scale.dtype != np.uint8 or np.any(scale == 255):  # E8M0 255 is NaN
+                    raise ValueError(f"{prefix}{name}: expected finite E8M0 scales")
                 weights.append(pack_expert_bytes(packed))
                 scales.append(scale.T.copy())
             gate_up.append(np.concatenate(weights, axis=1))
@@ -215,8 +219,8 @@ class Checkpoint:
             packed, scale = self._expert_parts(
                 tensors[prefix + "w2.weight_packed"], tensors[prefix + "w2.weight_scale"], True, part, parts
             )
-            if scale.dtype != np.uint8 or np.any((scale == 0) | (scale == 255)):
-                raise ValueError(f"{prefix}w2: expected normal, finite E8M0 scales")
+            if scale.dtype != np.uint8 or np.any(scale == 255):  # E8M0 255 is NaN
+                raise ValueError(f"{prefix}w2: expected finite E8M0 scales")
             downs.append(pack_expert_bytes(packed))
             down_scales.append(scale.T.copy())
         return gate_up, gate_up_scales, downs, down_scales
@@ -299,8 +303,8 @@ class Checkpoint:
                 packed = packed[packed_slice]
                 scale = scale[scale_slice]
             weights.append(pack_expert_bytes(packed))
-            if scale.dtype != np.uint8 or np.any((scale == 0) | (scale == 255)):
-                raise ValueError(f"{base}{name}: expected normal, finite E8M0 scales")
+            if scale.dtype != np.uint8 or np.any(scale == 255):  # E8M0 255 is NaN
+                raise ValueError(f"{base}{name}: expected finite E8M0 scales")
             scales.append(scale.T.copy())
         return np.concatenate(weights, axis=1), np.concatenate(scales, axis=1)
 
