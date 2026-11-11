@@ -53,7 +53,10 @@ class HostPaddingFutureMap(FutureMap):
         device_indices = self._indices(indices, width)
         tokens = self.output_tokens_buf[device_indices]
         if overlap_utils._DEBUG_ASSERT:
-            valid = (torch.arange(width) < len(indices)).to(self.device)
+            # Mark the mask upload non-blocking to avoid a performance penalty.
+            valid = (torch.arange(width) < len(indices)).to(
+                self.device, non_blocking=True
+            )
             tokens = torch.where(valid, tokens, 0)
             overlap_utils._assert_nonneg_and_invalidate(
                 tokens, self.output_tokens_buf, device_indices
