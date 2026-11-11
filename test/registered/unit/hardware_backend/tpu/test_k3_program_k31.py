@@ -147,7 +147,11 @@ class TestIndexerFamilies(CustomTestCase):
         self.assertNotIn("d_wqb", load.selected_local_shapes(93, 7168))
         layers = load._family_layers(self.ckpt.config, "d_wk", 93)
         self.assertEqual(layers, list(self.ckpt.config.full_attention))
-        for name in ("d_wqb", "d_wk", "d_wproj", "d_knorm"):
+        # Every pre-shard family comes from the checkpoint (the decode's d_wks /
+        # d_wpt are derived at load: rank_loader.decode_indexer_families).
+        names = [n for n in shapes if n.startswith("d_")]
+        self.assertEqual(sorted(names), ["d_knorm", "d_wk", "d_wproj", "d_wqb"])
+        for name in names:
             value = self.ckpt.dense(name, 3, 0)
             self.assertEqual(tuple(value.shape), shapes[name][1:])
 
