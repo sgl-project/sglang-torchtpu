@@ -103,7 +103,7 @@ def _permute(c: PPConfig, xe, ids, tw):
     if _padded_token_count(T, K, lhs_sublane_tiling(xe.dtype)) != T:
         raise ValueError(f"{T} x {K} routed rows do not tile gmm_v2's LHS")
     xe, ids, tw = _drop_invalid_slots(
-        xe, ids[:, :K], tw[:, :K].astype(BF16), E, zero_dropped_tokens=False
+        xe, ids[:, :K], tw[:, :K].astype(BF16), E, one_hot_permute=False
     )
     flat = ids.reshape(-1).astype(jnp.int32)
     order = jnp.argsort(flat)

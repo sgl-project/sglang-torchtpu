@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The PP prefill stage's attention: sglang_tpu's batched RPA prefill kernel, called as the P/D
-prefill serves it (its env picks the tiles: SGLANG_TPU_RPA_* and the forced prefill blocks)."""
+"""The PP prefill stage's attention: sglang_tpu's batched RPA prefill kernel with main's tiles."""
 
 import jax.numpy as jnp
 
