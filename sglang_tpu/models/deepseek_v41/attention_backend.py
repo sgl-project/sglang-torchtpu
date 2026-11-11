@@ -368,6 +368,23 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self.rope_tables: Dict[int, torch.Tensor] = {}
         self.csa2_ops, self.indexer_ops = self._register_ops()
         self._prewarm_model_caches()
+        self._drop_text_only_image_mask(model_runner)
+
+    @staticmethod
+    def _drop_text_only_image_mask(model_runner) -> None:
+        """Without multimodal serving no prompt holds image tokens, so the forward's
+        image-token torch.where after each Engram layer is the identity.
+
+        The vision tower, MoE correction bias and hasher read vision_n_layers at
+        construction, already done; only that where reads it in the forward, and
+        its fused select has no valid TPU window ("Cannot find a valid window").
+        """
+        model = model_runner.model
+        if model is None or model_runner.model_config.is_multimodal:
+            return
+        config = model.model.config
+        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+            config.vision_n_layers = 0
 
     @staticmethod
     def _register_ops():
