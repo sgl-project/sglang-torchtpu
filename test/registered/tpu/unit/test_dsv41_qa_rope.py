@@ -27,9 +27,9 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import torch
-
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+
 from sglang_tpu.models.deepseek_v41.ops import qa_preprocess as ops
 
 register_tpu_ci(
@@ -223,8 +223,9 @@ class TestQARopeTPU(CustomTestCase):
             if replay:
                 arrays = (*arrays[:-1], arrays[-1][::-1].copy())
                 inputs = (*inputs[:-1], _tensor(arrays[-1], "tpu"))
-            from sglang_tpu.fp8_linear import apply_tpu_fp8_linear
             from sglang.srt.layers.layernorm import RMSNorm
+
+            from sglang_tpu.fp8_linear import apply_tpu_fp8_linear
 
             encoded, row_scale = self.quantize(inputs[0])
             projected = self.project(encoded, inputs[1], row_scale, inputs[2])

@@ -105,6 +105,7 @@ class TestCompressRopeTPU(CustomTestCase):
     def setUpClass(cls):
         super().setUpClass()
         import torch_tpu  # noqa: F401
+
         from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
         ops.register_ops()
