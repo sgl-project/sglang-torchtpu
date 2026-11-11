@@ -313,6 +313,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices_cpu: Optional[torch.Tensor] = None,
         return_host: bool = False,
     ):
+        """``out_indices_cpu``: optional caller-owned host (extend_num_tokens,)
+        buffer filled with the returned full-attention locations. Requires inner
+        allocators that accept it (TPU)."""
         assert self.page_size > 1
         # Opt-in: inner allocators return host indices for later padded upload.
         host_kwargs = {"return_host": True} if return_host else {}
@@ -323,6 +326,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if not self.new_pages_available(num_new_pages, num_new_pages):
             return None
 
+        full_alloc_kwargs = {"num_new_pages": num_new_pages, **host_kwargs}
+        if out_indices_cpu is not None:
+            assert _is_tpu
+            full_alloc_kwargs["out_indices_cpu"] = out_indices_cpu
+
         if self._swa_req_ring:
             # Ring mode pages full KV only; full_to_swa_index_mapping stays unwritten.
             return self.full_attn_allocator.alloc_extend(
@@ -332,19 +340,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 seq_lens_cpu,
                 last_loc,
                 extend_num_tokens,
-                num_new_pages=num_new_pages,
-                **host_kwargs,
+                **full_alloc_kwargs,
             )
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
-
-        full_alloc_kwargs = {"num_new_pages": num_new_pages, **host_kwargs}
+        swa_alloc_kwargs = {"num_new_pages": num_new_pages, **host_kwargs}
         if out_indices_cpu is not None:
-            # TPU speculative decoding preallocates this host output buffer.
-            # Only the full-attention locations are returned to the caller;
-            # the SWA allocator needs its own independently populated indices.
-            assert _is_tpu
-            full_alloc_kwargs["out_indices_cpu"] = out_indices_cpu
+            # Host SWA locations as well, so the mapping update below reads
+            # neither result back from the device.
+            swa_alloc_kwargs["return_host"] = True
 
         alloc_full_indices = self.full_attn_allocator.alloc_extend(
             prefix_lens,
@@ -362,13 +366,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             swa_last_loc,
             extend_num_tokens,
-            num_new_pages=num_new_pages,
-            **host_kwargs,
+            **swa_alloc_kwargs,
         )
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        self.set_full_to_swa_mapping(alloc_full_indices, alloc_swa_indices)
+        self.set_full_to_swa_mapping(
+            alloc_full_indices if out_indices_cpu is None else out_indices_cpu,
+            alloc_swa_indices,
+        )
 
         return alloc_full_indices
 
