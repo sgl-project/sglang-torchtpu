@@ -674,7 +674,10 @@ def _validate_dsa(server_args) -> None:
     _validate_mtp_index_share(cfg, hf_config)
     if not is_deepseek_dsa(hf_config):
         return
-    if cfg.attention_backend != "pallas_tpu_mla_sparse":
+    # K3_PROGRAM serves the attention and the DSA indexer in its own programs
+    # (sglang_tpu/k3_programs): neither sglang's sparse backend nor its tracer runs.
+    k3_program = str(getattr(cfg, "speculative_algorithm", "") or "").upper() == "K3_PROGRAM"
+    if not k3_program and cfg.attention_backend != "pallas_tpu_mla_sparse":
         raise ValueError(
             "Sparse attention (DSA) on TPU needs --attention-backend "
             f"pallas_tpu_mla_sparse, got {cfg.attention_backend!r}."
@@ -696,7 +699,7 @@ def _validate_dsa(server_args) -> None:
     # buffers, so the first compile would fail.
     # TODO(sglang-torchtpu#1072): implement them and run DSA with the direct
     # tracer.
-    if cfg.tpu_compile_tracer != "dynamo":
+    if not k3_program and cfg.tpu_compile_tracer != "dynamo":
         raise ValueError(
             "DSA on TPU needs --tpu-compile-tracer dynamo, got "
             f"{cfg.tpu_compile_tracer!r}."
