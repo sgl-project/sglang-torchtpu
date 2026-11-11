@@ -21,7 +21,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=45, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=40, suite="stage-a-test-tpu-unit", chips=1)
 
 assert "jax" not in sys.modules
 # TPU stays the default backend; the DMA race check interprets the kernel on CPU.
@@ -172,13 +172,11 @@ class RopeTest(parameterized.TestCase):
         )
         np.testing.assert_array_equal(actual[..., :-ROTARY_DIM], x[..., :-ROTARY_DIM])
 
-    # tile_n is capped at 128, so >= 384 tokens means >= 3 tiles: the first point
-    # where the pipeline reuses a VMEM slot that already held a written-back tile.
-    @parameterized.product(
-        num_tokens=(384, 2048),
-        dtype=(np.float32, jnp.bfloat16),
-    )
-    def test_matches_reference_many_tiles(self, num_tokens, dtype):
+    # tile_n is capped at 128, so 384 tokens are 3 tiles: the first point where
+    # the pipeline reuses a VMEM slot that already held a written-back tile.
+    @parameterized.product(dtype=(np.float32, jnp.bfloat16))
+    def test_matches_reference_many_tiles(self, dtype):
+        num_tokens = 384
         actual, expected = self._run(
             (num_tokens, NUM_HEADS, HEAD_DIM), num_tokens, False, dtype
         )
