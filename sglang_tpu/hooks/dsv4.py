@@ -357,6 +357,10 @@ def _tpu_deepseek_v4_env_adjustments(server_args: Any, previous) -> None:
     envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
     envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.set(False)
     envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.set(True)
+    # Resolve the callable HIP default before fullgraph tracing reaches the DP
+    # MoE path. Preserve explicit choices and the platform's ordinary default.
+    if not envs.SGLANG_DP_USE_REDUCE_SCATTER.is_set():
+        envs.SGLANG_DP_USE_REDUCE_SCATTER.set(envs.SGLANG_DP_USE_REDUCE_SCATTER.get())
 
 
 def register_tpu_dsv4_resolution_hooks() -> None:
