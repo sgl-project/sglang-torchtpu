@@ -1231,6 +1231,11 @@ class Req(ReqDllmMixin):
         # End (exclusive) of the last multimodal item's tokens, read at the first
         # radix insert (SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS); None for text.
         self.swa_media_end: Optional[int] = None
+        # Tree time counter at this request's first tree-cache checkpoint (insert or
+        # deferred chunk; kept across retraction), set only under
+        # SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST: the stale-window walk never demotes
+        # tree nodes created after it.
+        self.swa_insert_epoch: Optional[float] = None
         # CAP media anchor taken for this request (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS).
         self.swa_media_anchored: bool = False
         # Logical-page KV sharding: rotation base of the chain this request
@@ -2006,6 +2011,7 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released = False
         self.swa_stale_window_floor = None
         self.swa_media_end = None
+        # swa_insert_epoch survives: the re-prefill re-inserts the request's own nodes.
         self.swa_media_anchored = False
         self.swa_branching_seqlen = None
         self.extend_range = None
