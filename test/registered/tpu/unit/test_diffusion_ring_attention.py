@@ -408,9 +408,7 @@ class TestRingMeshSpec(unittest.TestCase):
             self._check_spec(8, [5, 7], replica_ranks=[4, 5, 6, 7]), (1, 2, 2)
         )
         # Ring ranks outside the replica group are rejected.
-        self.assertIsNone(
-            self._check_spec(8, [0, 1, 2, 3], replica_ranks=[4, 5, 6, 7])
-        )
+        self.assertIsNone(self._check_spec(8, [0, 1, 2, 3], replica_ranks=[4, 5, 6, 7]))
 
     def test_non_grid_or_trivial_returns_none(self):
         from sglang_tpu.multimodal_gen import tpu_splash_attn
@@ -434,11 +432,12 @@ class TestRingAttentionDispatch(unittest.TestCase):
     def test_env_switch_disables_ring_kernel(self):
         from unittest.mock import patch
 
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.multimodal_gen import tpu_splash_attn
         from sglang_tpu.multimodal_gen.tpu_splash_attn import TpuSplashAttentionImpl
 
         with (
-            patch.dict(os.environ, {"SGLANG_TPU_ENABLE_DIFFUSION_RING_KERNEL": "0"}),
+            tpu_envs.SGLANG_TPU_ENABLE_DIFFUSION_RING_KERNEL.override(False),
             patch.object(tpu_splash_attn, "_check_splash_available", return_value=True),
             patch.object(tpu_splash_attn, "_register_ops", side_effect=lambda: None),
             patch.object(tpu_splash_attn, "_FLASH_OP", object()),

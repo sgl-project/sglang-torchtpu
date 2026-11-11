@@ -520,10 +520,14 @@ class TpuEnvs:
     # offload does not support are refused at startup
     # (disaggregation/decode_dram_offload/startup_validation.py).
     SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM = EnvBool(False)
-    # Enable the Pallas ICI-DMA diffusion ring attention kernel (0 falls back to the all-gather ring).
+
+    # Diffusion ring attention
+    # Run sequence-parallel ring attention with the Pallas ICI-DMA kernel; off
+    # keeps the K/V all-gather ring (multimodal_gen/tpu_splash_attn.py).
     SGLANG_TPU_ENABLE_DIFFUSION_RING_KERNEL = EnvBool(True)
-    # Enable hybrid per-head fixed-m softmax in the diffusion ring attention kernel.
-    SGLANG_TPU_DIFFUSION_RING_FIXED_M = EnvBool(True)
+    # Give heads whose logit bound allows it the fixed-m softmax instead of the
+    # online one (multimodal_gen/diffusion_ring_attention.py).
+    SGLANG_TPU_ENABLE_DIFFUSION_RING_FIXED_M = EnvBool(True)
 
     @classmethod
     def names(cls) -> list[str]:

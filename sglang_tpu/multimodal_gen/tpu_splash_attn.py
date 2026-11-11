@@ -978,9 +978,9 @@ def tpu_ring_attention_step(
     return out.to(query.dtype), (out, lse)
 
 
-def _resolve_ring_replica_ranks() -> (
-    tuple[list[int], torch.distributed.ProcessGroup | None]
-):
+def _resolve_ring_replica_ranks() -> tuple[
+    list[int], torch.distributed.ProcessGroup | None
+]:
     world_size = torch.distributed.get_world_size()
     replica_group = get_replica_group()
     if replica_group.world_size < world_size:
@@ -1319,7 +1319,7 @@ class TpuSplashAttentionImpl(SDPAImpl):
                     ring_size,
                     inner_size,
                     self.softmax_scale,
-                    tpu_envs.SGLANG_TPU_DIFFUSION_RING_FIXED_M.get(),
+                    tpu_envs.SGLANG_TPU_ENABLE_DIFFUSION_RING_FIXED_M.get(),
                     process_group=replica_pg,
                     replica_lead=replica_lead,
                 )
