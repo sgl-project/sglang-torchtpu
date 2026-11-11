@@ -37,6 +37,7 @@ rehome_kimi_k3_kda_weights
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 
@@ -57,6 +58,11 @@ def bind_glm5_next_kda_weights(result: None, model: Any, *args, **kwargs) -> Non
             if proj is not None:
                 proj.weight.data = proj.weight.data.cpu().to(proj.weight.device)
         attn.conv_weights = module.qkv_conv1d.weight
+        # EXPERIMENT (lkchen): SGLANG_TPU_KDA_PACK_WEIGHTS=0 keeps the three
+        # separate operands. The packed array pads dt_bias rows to the full conv
+        # width (6.75 MiB of VMEM at 64 heads per rank under attention DP).
+        if os.environ.get("SGLANG_TPU_KDA_PACK_WEIGHTS", "1") == "0":
+            continue
         attn.packed_kernel_weights = pack_kda_weights(
             module.qkv_conv1d.weight,
             module.dt_bias,
