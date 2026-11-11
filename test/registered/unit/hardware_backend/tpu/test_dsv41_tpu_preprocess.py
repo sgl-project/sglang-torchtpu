@@ -15,11 +15,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-from torch import nn
-
 from sglang.srt.models.deepseek_v4 import MQALayer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from torch import nn
+
 from sglang_tpu.models.deepseek_v41 import preprocess
 from sglang_tpu.models.deepseek_v41.ops import preprocess as ops
 

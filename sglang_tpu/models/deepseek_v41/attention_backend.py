@@ -383,11 +383,17 @@ class DSV41TPUAttnBackend(AttentionBackend):
     @staticmethod
     def _register_ops():
         # Registration must precede torch.compile tracing.
-        from sglang_tpu.models.deepseek_v41.ops import csa2, indexer, preprocess
+        from sglang_tpu.models.deepseek_v41.ops import (
+            csa2,
+            indexer,
+            preprocess,
+            qa_preprocess,
+        )
 
         csa2.register_csa2_ops()
         indexer.register_indexer_ops()
         preprocess.register_ops()
+        qa_preprocess.register_ops()
         return csa2, indexer
 
     def _prewarm_model_caches(self) -> None:
@@ -458,6 +464,55 @@ class DSV41TPUAttnBackend(AttentionBackend):
     # ------------------------------------------------------------------ #
     # MQALayer hooks
     # ------------------------------------------------------------------ #
+
+    def prepare_mqa_input(
+        self,
+        layer,
+        x_linear,
+        positions,
+        forward_batch,
+        *,
+        q_out=None,
+        q_rope_out=None,
+        k_nope_out=None,
+        k_rope_out=None,
+    ):
+        """Early projection hook supplied by the separate neutral MQA seam.
+
+        On older core revisions the hook is not consulted, so the existing
+        preparation path (including fused QB) remains intact. No forward inputs
+        are cached on a projection module to communicate between these paths.
+        """
+        qa = getattr(layer, "_dsv41_qa", None)
+        qb = getattr(layer, "_dsv41_qb", None)
+        if (
+            qa is None
+            or qb is None
+            or not isinstance(x_linear, torch.Tensor)
+            or x_linear.dtype != torch.bfloat16
+            or any(v is not None for v in (q_rope_out, k_nope_out, k_rope_out))
+        ):
+            return None
+        from sglang.srt.models.deepseek_v4 import MQAInputPreparation
+        from sglang_tpu.models.deepseek_v41.ops.preprocess import qb_rope
+        from sglang_tpu.models.deepseek_v41.ops.qa_preprocess import qa_rope
+
+        table = self.rope_tables[layer.layer_id]
+        q_lora, kv = qa_rope(
+            x_linear,
+            qa.weight,
+            qa.scale,
+            qa.gamma_qr,
+            qa.gamma_kv,
+            table,
+            positions,
+            qa.eps,
+        )
+        q = qb_rope(q_lora, qb.weight, qb.scale, table, positions)
+        if q_out is not None:
+            q_out.copy_(q)
+            q = q_out
+        return MQAInputPreparation(q_lora, q, kv)
 
     def prepare_mqa_qkv(
         self,
