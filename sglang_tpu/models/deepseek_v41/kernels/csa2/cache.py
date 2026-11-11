@@ -639,7 +639,7 @@ def prepare_main_records(
     valid = (selected >= 0) & (jnp.arange(tokens)[:, None] < starts[-1])
     logical = jnp.maximum(selected, 0)
     if jax.default_backend() == "tpu":
-        from sglang_tpu.models.deepseek_v41.kernels.v4.core_attention import sparse_mla
+        from sglang_tpu.dsv4.core_attention import sparse_mla
 
         # Preserve the epic optimized page lookup. Ordinary JAX indexing is
         # especially expensive for single-request, long-context prefill.
