@@ -459,6 +459,9 @@ class TpuEnvs:
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
     # 0 = SparseCore always. Measured crossover is 1024 (Kimi, R1, Qwen3-480B).
     SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
+    # MoE under EP, off the dense permute, with the SparseCore gather and combine:
+    # route on local expert ids (counting sort) and gather only this rank's rows.
+    SGLANG_TPU_FUSED_MOE_EP_COUNTING_ROUTE = EnvBool(True)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, the permute is dense below this many tokens per
