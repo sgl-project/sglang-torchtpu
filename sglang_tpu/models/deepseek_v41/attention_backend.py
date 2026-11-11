@@ -384,6 +384,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
     def _register_ops():
         # Registration must precede torch.compile tracing.
         from sglang_tpu.models.deepseek_v41.ops import (
+            compressor,
             csa2,
             indexer,
             preprocess,
@@ -394,6 +395,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
         indexer.register_indexer_ops()
         preprocess.register_ops()
         qa_preprocess.register_ops()
+        compressor.register_ops()
         return csa2, indexer
 
     def _prewarm_model_caches(self) -> None:
@@ -538,7 +540,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
         else:
             q, _ = layer.wq_b(q_lora)
             q = apply_rope(
-                q.view(-1, layer.n_local_heads, layer.head_dim), positions, layer.freqs_cis
+                q.view(-1, layer.n_local_heads, layer.head_dim),
+                positions,
+                layer.freqs_cis,
             )
         if qkv_a is not None:
             kv = qkv_a[..., layer.q_lora_rank :]
@@ -569,9 +573,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_idle() or not x.shape[0]:
             return
         metadata = self.get_or_create_metadata(forward_batch)
-        assert x.shape[0] == metadata.positions.shape[0], (
-            f"{x.shape[0]} rows, metadata for {metadata.positions.shape[0]}"
-        )
+        assert (
+            x.shape[0] == metadata.positions.shape[0]
+        ), f"{x.shape[0]} rows, metadata for {metadata.positions.shape[0]}"
         if run_compressor and layer.compressor is not None:
             self._compress_and_publish(layer=layer, x=x, metadata=metadata)
         if run_indexer and layer.indexer is not None:
@@ -584,14 +588,30 @@ class DSV41TPUAttnBackend(AttentionBackend):
         ratio = layer.compress_ratio
         compressor = layer.compressor
         records = metadata.low_ratio[ratio].out_loc
-        kv, score = compressor.project(x)
-        if ratio == 1:
-            pooled, group_pos = kv, metadata.positions.long()
-        else:
-            pooled, group_pos = self._pool_pairs(
-                layer=layer, kv=kv, score=score, metadata=metadata
+        prepared = getattr(layer, "_dsv41_compressor", None) if ratio == 1 else None
+        encoded = encoded_scales = None
+        if prepared is not None:
+            from sglang_tpu.models.deepseek_v41.ops.compressor import compress_rope
+
+            group_pos = metadata.positions.long()
+            latent, encoded, encoded_scales = compress_rope(
+                x,
+                prepared.weight,
+                prepared.gamma,
+                self.rope_tables[layer.layer_id],
+                metadata.positions,
+                (records >= 0)[:, None].to(torch.int32),
+                prepared.eps,
             )
-        latent = compressor.finish(pooled)
+        else:
+            kv, score = compressor.project(x)
+            if ratio == 1:
+                pooled, group_pos = kv, metadata.positions.long()
+            else:
+                pooled, group_pos = self._pool_pairs(
+                    layer=layer, kv=kv, score=score, metadata=metadata
+                )
+            latent = compressor.finish(pooled)
 
         # Index keys come from the pre-RoPE latent.
         indexer = layer.indexer
@@ -606,16 +626,21 @@ class DSV41TPUAttnBackend(AttentionBackend):
                 )
             )
 
-        latent = apply_rope(latent, group_pos, layer.freqs_cis)
         group = metadata.gathered_main
         if group is not None and group.source_layer_id == pool.source_layer_of(
             layer.layer_id
         ):
             metadata.gathered_main = None
         words, scales = pool.get_main_kv(layer.layer_id)
-        new_words, new_scales = self.csa2_ops.publish_main(
-            words, scales, records, latent
-        )
+        if encoded is not None:
+            new_words, new_scales = self.csa2_ops.publish_main_encoded(
+                words, scales, records, encoded, encoded_scales
+            )
+        else:
+            latent = apply_rope(latent, group_pos, layer.freqs_cis)
+            new_words, new_scales = self.csa2_ops.publish_main(
+                words, scales, records, latent
+            )
         words.copy_(new_words)
         scales.copy_(new_scales)
 

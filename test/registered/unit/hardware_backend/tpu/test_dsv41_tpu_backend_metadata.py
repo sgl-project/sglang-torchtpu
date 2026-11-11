@@ -11,10 +11,9 @@ replaced by torch reference stubs.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
-
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from torch import nn
@@ -33,6 +32,8 @@ from sglang_tpu.models.deepseek_v41.attention_backend import (
     DSV41TPUAttnBackend,
     apply_rope,
 )
+
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 # Request slot 1 owns full pages 3 then 5; slot 2 owns full page 2.
 # full -> SWA token mapping: full page 3 -> SWA page 1, 5 -> 2, 2 -> 3.
@@ -582,6 +583,77 @@ class _PayloadCSA2Stub(_CSA2Stub):
 
 
 class TestDSV41BackendWiring(CustomTestCase):
+    def test_prepared_ratio1_publishes_encoded_and_indexes_prerope(self):
+        """Main KV must not rotate/encode twice; index keys need pre-RoPE latent."""
+        backend = self._backend()
+        pool = backend.token_to_kv_pool
+        pool.words = torch.zeros(RECORDS, 128, dtype=torch.int32)
+        pool.scales = torch.zeros(RECORDS)
+        backend.init_forward_metadata(_decode_batch())
+        metadata = backend.forward_metadata
+        metadata.gathered_main = SimpleNamespace(source_layer_id=2)
+        table = torch.zeros(1024, 64)
+        table[:, :32] = 0.5
+        table[:, 32:] = 0.75
+        backend.rope_tables[2] = table
+        latent = torch.arange(4 * 512).reshape(4, 512).to(torch.bfloat16) / 512
+        encoded = torch.arange(4 * 128, dtype=torch.int32).reshape(4, 128)
+        encoded_scales = torch.arange(1, 5, dtype=torch.float32)[:, None]
+        prepared = SimpleNamespace(
+            weight=torch.empty(5120, 512, dtype=torch.bfloat16),
+            gamma=torch.ones(512),
+            eps=1e-6,
+        )
+        layer = SimpleNamespace(
+            layer_id=2,
+            compress_ratio=1,
+            freqs_cis=table,
+            _dsv41_compressor=prepared,
+            compressor=SimpleNamespace(
+                project=mock.Mock(side_effect=AssertionError("generic projection")),
+                finish=mock.Mock(side_effect=AssertionError("generic finish")),
+            ),
+            indexer=SimpleNamespace(
+                owns_k=True, wk=nn.Identity(), k_norm=nn.Identity()
+            ),
+        )
+        pool.index_k = torch.zeros(RECORDS, 512)
+        backend.indexer_ops = _RecordingOps()
+
+        def publish(words, scales, records, payload, payload_scales):
+            live = records >= 0
+            out_words, out_scales = words.clone(), scales.clone()
+            out_words[records[live].long()] = payload[live]
+            out_scales[records[live].long()] = payload_scales[live, 0]
+            return out_words, out_scales
+
+        backend.csa2_ops = SimpleNamespace(
+            publish_main_encoded=publish,
+            publish_main=mock.Mock(side_effect=AssertionError("double encoding")),
+        )
+        x = torch.zeros(4, 5120, dtype=torch.bfloat16)
+        with mock.patch(
+            "sglang_tpu.models.deepseek_v41.ops.compressor.compress_rope",
+            return_value=(latent, encoded, encoded_scales),
+        ) as fused:
+            backend._compress_and_publish(layer=layer, x=x, metadata=metadata)
+        records = metadata.low_ratio[1].out_loc
+        live = records >= 0
+        torch.testing.assert_close(pool.words[records[live].long()], encoded[live])
+        torch.testing.assert_close(
+            pool.scales[records[live].long()], encoded_scales[live, 0]
+        )
+        expected_keys = apply_rope(latent, metadata.positions.long(), table)
+        torch.testing.assert_close(
+            pool.index_k[records[live].long()], expected_keys[live].float()
+        )
+        self.assertIsNone(metadata.gathered_main)
+        args = fused.call_args.args
+        self.assertIs(args[0], x)
+        self.assertIs(args[3], table)
+        torch.testing.assert_close(args[4], metadata.positions)
+        torch.testing.assert_close(args[5], live[:, None].to(torch.int32))
+
     def _backend(self):
         pool = _PairPool()
         pool.swa = torch.zeros(4 * 128, 128, dtype=torch.int32)

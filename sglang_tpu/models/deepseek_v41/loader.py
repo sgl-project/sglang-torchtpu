@@ -37,11 +37,13 @@ class DSV41RunaiModelStreamerLoader(RunaiModelStreamerLoader):
         model = super().load_model(
             model_config=model_config, device_config=device_config
         )
+        from sglang_tpu.models.deepseek_v41.compressor import bind_model_compressor
         from sglang_tpu.models.deepseek_v41.preprocess import bind_model_preprocessing
         from sglang_tpu.models.deepseek_v41.qa_preprocess import bind_model_qa
 
         bind_model_preprocessing(model)
         bind_model_qa(model)
+        bind_model_compressor(model)
         return model
 
     def _get_weights_iterator(self, source):

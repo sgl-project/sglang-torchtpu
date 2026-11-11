@@ -97,6 +97,20 @@ def _publish_main(
     return publish_csa2_kv(words, scales, records, encoded, encoded_scales)
 
 
+def _publish_encoded(
+    words: jax.Array,
+    scales: jax.Array,
+    records: jax.Array,
+    encoded: jax.Array,
+    encoded_scales: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    return publish_csa2_kv(words, scales, records, encoded, encoded_scales)
+
+
+def _fake_publish_encoded(words, scales, records, encoded, encoded_scales):
+    return torch.empty_like(words), torch.empty_like(scales)
+
+
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
     """CSA2's ``[T, 2, 128]`` rotation of the output's last 128 features.
 
@@ -319,6 +333,7 @@ _DEFINITIONS = {
     "swa_metadata": (_swa_metadata, _fake_swa_metadata, ()),
     "publish_swa": (_publish_swa, _fake_publish_swa, (0,)),
     "publish_main": (_publish_main, _fake_publish_main, (0, 1)),
+    "publish_encoded": (_publish_encoded, _fake_publish_encoded, (0, 1)),
     "attend_swa": (_attend_swa, _fake_attend, ()),
     "attend_main": (_attend_main, _fake_attend, ()),
     "gather_attend": (_gather_attend, _fake_gather_attend, ()),
@@ -405,6 +420,21 @@ def publish_main(
     valid records must be unique. Returns the new ``(words, scales)``.
     """
     return _op("publish_main")(words, scales, _i32(records), latent)
+
+
+def publish_main_encoded(
+    words: torch.Tensor,
+    scales: torch.Tensor,
+    records: torch.Tensor,
+    encoded: torch.Tensor,
+    encoded_scales: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Publish already encoded INT32 [T,128] and FP32 [T,1] without reencoding.
+
+    Donate only the owning words/scales pools. Records -1 skip padding; valid
+    records must be unique. Caller copies the returned owners back as usual.
+    """
+    return _op("publish_encoded")(words, scales, _i32(records), encoded, encoded_scales)
 
 
 def attention(

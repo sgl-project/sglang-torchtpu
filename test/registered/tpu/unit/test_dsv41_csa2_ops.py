@@ -148,6 +148,16 @@ def _bridge_examples():
             ),
             (),
         ),
+        "publish_encoded": (
+            (
+                ((4 * _RECORDS, 128), i32),
+                ((4 * _RECORDS,), np.float32),
+                ((24,), i32),
+                ((24, 128), i32),
+                ((24, 1), np.float32),
+            ),
+            (),
+        ),
         "attend_swa": ((q, pages, *common, meta), (SCALE,)),
         "attend_main": (
             (
@@ -622,6 +632,41 @@ def test_swa_publication_preserves_paired_neighbors(tpu_ops):
     assert actual.shape == (3 * 128, 128) and actual.dtype == np.int32
     np.testing.assert_array_equal(actual, _pack_swa(expected))
     np.testing.assert_array_equal(_unpack_swa(actual), expected.reshape(-1, 512))
+
+
+@requires_tpu
+def test_compiled_encoded_publication_updates_both_pool_owners(tpu_ops):
+    """Already encoded bytes/scales survive donation, copy-back and replay."""
+    words = _device(np.full((512, 128), 17, np.int32))
+    scales = _device(np.full(512, 0.125, np.float32))
+    records = np.array([257, -1, 130, 511], np.int32)
+    ids = _device(records)
+    expected_words = np.full((512, 128), 17, np.int32)
+    expected_scales = np.full(512, 0.125, np.float32)
+
+    @functools.partial(torch.compile, backend="tpu", fullgraph=True, dynamic=False)
+    def publish(words, scales, ids, encoded, encoded_scales):
+        new_words, new_scales = ops.publish_main_encoded(
+            words, scales, ids, encoded, encoded_scales
+        )
+        words.copy_(new_words)
+        scales.copy_(new_scales)
+        # A real consumer reads both owners after copy-back.
+        return words[130].clone(), scales[130].clone()
+
+    for replay in range(2):
+        payload = np.arange(4 * 128, dtype=np.int32).reshape(4, 128) + replay * 1000
+        payload_scales = (np.arange(1, 5, dtype=np.float32) + replay)[:, None] / 32
+        read_words, read_scale = publish(
+            words, scales, ids, _device(payload), _device(payload_scales)
+        )
+        live = records >= 0
+        expected_words[records[live]] = payload[live]
+        expected_scales[records[live]] = payload_scales[live, 0]
+        np.testing.assert_array_equal(_host(words), expected_words)
+        np.testing.assert_array_equal(_host(scales), expected_scales)
+        np.testing.assert_array_equal(_host(read_words), payload[2])
+        np.testing.assert_array_equal(_host(read_scale), payload_scales[2, 0])
 
 
 @requires_tpu
