@@ -123,13 +123,15 @@ def window_tokens(cache: Any, page_size: int) -> int:
     return -(-window // page_size) * page_size
 
 
-def _page_hashes(tokens: List[int], page_size: int) -> List[str]:
-    # The hashes only feed L3 storage and cache events, neither of which the
-    # offload uses; without the native hash extension they are left empty.
-    try:
-        hashes = get_hash_str(tokens, None, page_size)
-    except RuntimeError:
+def _page_hashes(core: Any, tokens: List[int], page_size: int) -> List[str]:
+    """Page hashes for a host insert, computed only when the tree keeps them
+    (an L3 storage backend or an external cache linker), as core does for its
+    own inserts. Otherwise the native hash extension is never loaded: loading
+    it on every recall rebuilt it each time on a host whose ranks share the
+    extension's build directory."""
+    if not (core.enable_storage or core.enable_external_cache_linker):
         return [""] * (len(tokens) // page_size)
+    hashes = get_hash_str(tokens, None, page_size)
     return [hashes] if isinstance(hashes, str) else list(hashes)
 
 
@@ -173,7 +175,7 @@ def insert_host_prefix(
     backup (``adopt_received_backups``), counted in ``stats``."""
     core = cache.tree_core
     full_pool = anchor_host_pool(cache)
-    hashes = _page_hashes(list(key.token_ids[: len(key)]), page_size)
+    hashes = _page_hashes(core, list(key.token_ids[: len(key)]), page_size)
     result = core.insert_host(core.root_node.id, key, indices, hashes)
     cache._apply_cache_actions(result.cache_actions)
     node_id = None if result.host_insert_dropped else result.inserted_host_node
