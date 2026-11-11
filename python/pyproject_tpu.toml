@@ -94,7 +94,7 @@ dependencies = [
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
-runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+runai = ["runai-model-streamer[s3,gcs,azure]>=0.17.0"]
 
 # Ray is required only for the --use-ray multihost launch path (RayEngine).
 # Mirrors the `ray` extra in the base pyproject so `sglang[ray]` resolves on TPU
