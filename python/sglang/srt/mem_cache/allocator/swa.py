@@ -328,7 +328,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         full_alloc_kwargs = {"num_new_pages": num_new_pages, **host_kwargs}
         if out_indices_cpu is not None:
-            assert _is_tpu
             full_alloc_kwargs["out_indices_cpu"] = out_indices_cpu
 
         if self._swa_req_ring:

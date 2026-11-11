@@ -7,7 +7,7 @@ last partial page. Fix replaces with get_num_new_pages-based gating.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -78,17 +78,16 @@ class TestSWAAllocExtendPageEstimation(CustomTestCase):
         # tensor the mapping reads.
         out_indices_cpu = torch.tensor([12, 13], dtype=torch.int32)
 
-        with patch("sglang.srt.mem_cache.allocator.swa._is_tpu", True):
-            result = SWATokenToKVPoolAllocator.alloc_extend(
-                stub,
-                prefix_lens=prefix,
-                prefix_lens_cpu=prefix,
-                seq_lens=seq,
-                seq_lens_cpu=seq,
-                last_loc=prefix - 1,
-                extend_num_tokens=2,
-                out_indices_cpu=out_indices_cpu,
-            )
+        result = SWATokenToKVPoolAllocator.alloc_extend(
+            stub,
+            prefix_lens=prefix,
+            prefix_lens_cpu=prefix,
+            seq_lens=seq,
+            seq_lens_cpu=seq,
+            last_loc=prefix - 1,
+            extend_num_tokens=2,
+            out_indices_cpu=out_indices_cpu,
+        )
 
         self.assertIsNotNone(result)
         self.assertIs(
