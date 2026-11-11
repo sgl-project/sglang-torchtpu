@@ -242,14 +242,10 @@ def _check_dsv41_pool_supported(
             f"DSV41TPUTokenToKVPool supports compress ratios {SUPPORTED_RATIOS}, "
             f"got {unsupported}"
         )
-    # Same stage rule as the core constructor: only a slice it honours is a PP stage.
-    is_stage_slice = (
-        start_layer is not None
-        and end_layer is not None
-        and len(compression_ratios) >= end_layer
-        and (start_layer, end_layer) != (0, len(compression_ratios))
-    )
-    if layer_num != len(compression_ratios) or is_stage_slice:
+    # compress_ratios also lists the trailing MTP layers, which the target model
+    # does not build: [0, layer_num) is the whole target, anything else a PP stage.
+    is_stage_slice = start_layer not in (None, 0) or end_layer not in (None, layer_num)
+    if layer_num > len(compression_ratios) or is_stage_slice:
         raise ValueError(
             "DSV41TPUTokenToKVPool does not support pipeline parallelism: "
             f"{layer_num=} {start_layer=} {end_layer=} of {len(compression_ratios)}"
