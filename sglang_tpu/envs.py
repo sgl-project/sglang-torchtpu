@@ -120,10 +120,6 @@ class TpuEnvs:
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
-    # RPA v3: sum the softmax row on the MXU through a ones column in V's last
-    # padding lane instead of on the vector ALU. Only applies when head_dim is
-    # not a multiple of 128 (e.g. 64).
-    SGLANG_TPU_ENABLE_RPA_PAD_LANE_ROWSUM = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
@@ -258,28 +254,6 @@ class TpuEnvs:
     # hidden states (pd_hidden_pool.py) and the decode builds the draft KV and carry,
     # instead of the prefill running the draft over the prompt.
     SGLANG_TPU_PD_DECODE_DRAFT_PREFILL = EnvBool(False)
-    # With it and a windowed draft, the prefill writes only the hidden rows a decode
-    # can read: the window before the prompt end, or before each chunk end when a
-    # prefix-sharing tree may hand that window to a later request.
-    SGLANG_TPU_ENABLE_PD_HIDDEN_WINDOW_WRITE = EnvBool(True)
-    # P/D prefix pull (disaggregation/prefix_pull.py): the least prefix gap, in
-    # tokens, worth pulling from the decode instead of recomputing (one chunk).
-    SGLANG_TPU_PD_PREFIX_PULL_MIN_TOKENS = EnvInt(4096)
-    # Seconds between the cumulative prefix-gap / decode-window log lines; 0 = off.
-    SGLANG_TPU_PD_PREFIX_GAP_LOG_INTERVAL_S = EnvFloat(60.0)
-    # Pull prefixes from the decode: the decode locks the prefix it reports as
-    # pullable until the request's KV lands, and the prefill fetches it.
-    SGLANG_TPU_PD_PREFIX_PULL = EnvBool(False)
-    # Decode: prompt-end SWA windows kept locked by the cache for the next turn's
-    # pull, least recently used released first and under memory pressure; 0 = off.
-    SGLANG_TPU_PD_DECODE_PROMPT_END_ANCHORS = EnvInt(0)
-    # What a failed or timed-out prefix pull does. 1 (bring-up default): the
-    # request fails with the reason, an error log and
-    # sglang:pd_prefill_prefix_pull_failed_total{reason}; nothing is recomputed.
-    # 0: every PP stage recomputes the prefix instead, an explicit reliability
-    # path that logs a warning with the room, reason and recomputed tokens each
-    # time and counts sglang:pd_prefill_prefix_pull_fallback_total{reason}.
-    SGLANG_TPU_PD_PREFIX_PULL_STRICT = EnvBool(True)
     # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.
@@ -293,6 +267,9 @@ class TpuEnvs:
     # experts of a BF16 checkpoint. The Muse megakernel reads only fp4 or fp8 experts,
     # so it cannot be combined with this.
     SGLANG_TPU_ENABLE_MUSE_BF16_FIRST_LAST_LAYER_EXPERTS = EnvBool(False)
+    # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
+    # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
+    SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
     # Allocates RPA v3 MHA KV as [num_blocks, layer_num, page_size, ...],
     # so all layers for a page form one row for single-DMA Raiden P/D transfers.
     # Both P/D servers must agree; tpu_platform refuses the configurations that
@@ -523,11 +500,6 @@ class TpuEnvs:
     # and the step runs more blocks than it needs. Rounded up to a page
     # multiple. Unset (None) means the wrapper's own search decides.
     SGLANG_TPU_FORCE_RPA_PREFILL_BKV = EnvInt(None)
-    # "bq:bq_c:bkv:n_buffer": prefill blocks for every layer, skipping the VMEM search, whose
-    # estimate refuses tiles that fit at TP1 head counts (PP prefill); n_buffer >= 2.
-    SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS = EnvStr(None)
-    # Log batched RPA metadata per forward (debugging the PP profile core halt).
-    SGLANG_TPU_DEBUG_RPA_METADATA = EnvBool(True)
     # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 causing performance
     # regression in fused MoE with reduce scatter.
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
@@ -553,20 +525,6 @@ class TpuEnvs:
     # offload does not support are refused at startup
     # (disaggregation/decode_dram_offload/startup_validation.py).
     SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM = EnvBool(False)
-    # With the megakernel: prefill and other native-path steps run the dense linears and routers
-    # on the kernel's fp8 K-major copies (per-column scales, as in decode) and the bf16
-    # weights are freed for the KV pool.
-    SGLANG_TPU_MUSE_SHARED_DENSE = EnvBool(False)
-    # Muse Spark prefill sequence parallelism: extend forwards of at least MIN_TOKENS tokens
-    # keep the fp32 residual stream token-sharded over the TP group between layers.
-    SGLANG_TPU_MUSE_PREFILL_SP = EnvBool(False)
-    SGLANG_TPU_MUSE_PREFILL_SP_MIN_TOKENS = EnvInt(1024)
-    # Muse Spark: gather prefill-sized column shards with one all-gather along the column
-    # dim instead of a token-dim all-gather plus a transpose.
-    SGLANG_TPU_MUSE_GATHER_COLUMNS_DIM = EnvBool(False)
-    # Muse Spark rotary embedding by a one-lane roll on [tokens, heads * head_dim]
-    # instead of a [..., head_dim // 2, 2] pair view (same arithmetic).
-    SGLANG_TPU_MUSE_ROPE_ROLL = EnvBool(False)
     # Muse expert layout for the megakernel: tp | ep | auto
     # (auto: ep when the server's EP size > 1). muse_megakernel/moe_mode.py.
     SGLANG_TPU_MUSE_MOE_MODE = EnvStr("auto")
@@ -578,9 +536,6 @@ class TpuEnvs:
     # operand per slab (0 = one operand per layer); the layer params become views into it.
     # 15 measured 3-4% faster decode / verify steps (cc = 1, q = 1 and 8, 128k-512k).
     SGLANG_TPU_MUSE_MK_EXPERT_GROUP = EnvInt(0)
-    # DFlash: verify only the first WIDTH tokens of each draft block once the decode batch
-    # reaches MIN_BS requests (dflash_adaptive_verify.py); "" verifies the full block.
-    SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY = EnvStr("")
     # > 0: megakernel sliding-window layers on SEQ_ALONG_LANE pools use KV chunks of this many
     # tokens (a divisor of the 2 * inter_local-token chunk); their 2048-token window gains nothing.
     SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS = EnvInt(0)
@@ -592,36 +547,9 @@ class TpuEnvs:
     # pages_swa windows DMA'd into SMEM instead of the whole table: "auto" (when the two page
     # tables exceed the SMEM budget), "1" or "0" (forced, e.g. to A/B the two paths)
     SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE = EnvStr("auto")
-    # Experimental: the pipelined SAL attention loop (MKConfig.attn_pipe) on steps of 33-64 rows
-    # too, not only up to _BASE_STEP_MAX_ROWS (12-16 decoding requests at 4-token verify).
-    SGLANG_TPU_MUSE_MK_LARGE_STEP_ATTN_PIPE = EnvBool(False)
-    # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
-    # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
-    SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
-    # Fused KV pool and RPA v3 pad head_dim to this before it becomes the minor (lane)
-    # axis. 64 halves an unpacked head_dim-64 pool; fp8 then reaches 256 B per token at
-    # two KV heads per rank. Must stay >= the sublane x packing tile.
-    SGLANG_TPU_KV_HEAD_DIM_ALIGN = EnvInt(128)
     # Fused-RS NVFP4 experts keep the checkpoint's e4m3 block scales and apply the
     # per-expert global scales after each dot: half the scale bytes of folded bf16.
     SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
-    # Megakernel MoE: send each row's expert outputs to their reduce-scatter owner as
-    # soon as the row's last expert is done (MKConfig.y_early).
-    SGLANG_TPU_MK_Y_EARLY = EnvBool(False)
-    # Megakernel MoE: run the experts owner block by owner block and send each block of
-    # reduce-scatter rows to its owner as one DMA while the remaining experts run
-    # (MKConfig.y_block_send; exact). Ignored where SGLANG_TPU_MK_Y_EARLY applies.
-    SGLANG_TPU_MK_Y_BLOCK_SEND = EnvBool(True)
-    # Experimental: megakernel experts with more than this many live (row, slot) pairs (1, 2 or 4;
-    # 0 off) run in a second loop after each owner group's few-row experts (MKConfig.expert_split;
-    # exact). Steps of more than 24 rows only.
-    SGLANG_TPU_MUSE_MK_EXPERT_SPLIT = EnvInt(0)
-    # Megakernel row-tiled steps: an expert with more than 32 live (row, slot) pairs runs one
-    # staged pass in a 64 / 128 / ... / R-row bucket, dequantizing its slabs once, instead of
-    # 32- or 64-row passes that each dequantize them again (MKConfig.ex_one_pass; exact).
-    # Unset: on with SGLANG_TPU_MUSE_MK_KPERM (-1.3 / -0.8 ms at 64 / 128 rows), off without it
-    # (no step-time gain measured there).
-    SGLANG_TPU_MUSE_MK_EXPERT_ONE_PASS = EnvBool(None)
     # Megakernel attention on fp8 SEQ_ALONG_LANE pools: feed K (and V) to the MXU as fp8
     # instead of widening each chunk to bf16 on the VPU first. 0 = off, 1 = K only, 2 = K and V
     # (exact). With the 2026-10-27 megakernel, 2 saves 0.09 / 0.20 / 0.40 ms per q = 1 step at
@@ -631,18 +559,6 @@ class TpuEnvs:
     # --xla_enable_custom_call_region_trace=true and a device tracer level above 1);
     # 2 also names the per-chunk / per-expert regions, which distort the timing they show.
     SGLANG_TPU_MK_TRACE_REGIONS = EnvInt(0)
-    # Profiling only: scoped VMEM limit (MiB) for every step while TRACE_REGIONS is on; the region
-    # markers take stack VMEM (the 16-row step overflowed the default 60 MiB by 1.1 MiB).
-    SGLANG_TPU_MK_TRACE_VMEM_LIMIT_MB = EnvFloat(None)
-    # Tuning only: declared-scratch budget cut per row past 64 rows (KiB), for the VMEM sweep.
-    SGLANG_TPU_MK_LARGE_STEP_BUDGET_PER_ROW_KB = EnvInt(None)
-    # Tuning only: scoped VMEM limit (MiB) for steps past 64 rows (default 60; 64 MiB physical).
-    SGLANG_TPU_MK_LARGE_STEP_VMEM_LIMIT_MB = EnvFloat(None)
-    # Tuning only: force the 16-bit packed page tables on (1) or off (0); unset = by table size.
-    SGLANG_TPU_MK_PACK_PAGE_TABLES = EnvInt(None)
-    # Fixed batch shape of MIXED (mixed-chunk) batches; unset = the largest bs bucket. Raise it
-    # when more requests decode inside mixed chunks than any decode bucket holds.
-    SGLANG_TPU_MIXED_MAX_BS = EnvInt(None)
     # Megakernel attention: fold a power-of-two attn_scale into the bf16 queries instead of
     # scaling every score (exact).
     SGLANG_TPU_MK_FOLD_ATTN_SCALE = EnvBool(False)
@@ -658,134 +574,6 @@ class TpuEnvs:
     # Decode megakernel (TP): fp4 experts requantized to one scale per this many K rows (0 off,
     # 64 / 128 / 256); the expert dots push raw e2m1 codes to the MXU (MKConfig.qblock).
     SGLANG_TPU_MUSE_MK_QBLOCK = EnvInt(0)
-    # Megakernel KV write on SEQ_ALONG_LANE pools: all page read-modify-writes of a layer in
-    # flight together, overlapped with the next layer's (MKConfig.kv_write_pipelined; exact).
-    SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED = EnvBool(False)
-    # Raiden HiCache transfers move each run of pages that is consecutive on both the
-    # device and the host as one segment instead of one segment per page.
-    SGLANG_TPU_RAIDEN_COALESCE_PAGES = EnvBool(False)
-    # Fused-RS expert TP passes each device only its own block of routed rows, so a
-    # call is no longer capped at 1/ep_size of the tokens and the expert weights are
-    # streamed once per chunk rather than once per capped call.
-    SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS = EnvBool(False)
-    # Expert-TP fused-RS: sum the per-device partial rows in the kernel's tiled
-    # (rows, hidden // 128, 128) layout instead of relayouting them to 2D first.
-    SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE = EnvBool(False)
-    # Expert-TP fused-RS: skip zeroing the output buffer, which the per-row writes
-    # cover exactly once.
-    SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO = EnvBool(False)
-    # Fused-RS NVFP4 GMMs widen fp4 weights to bf16 through fp8 (bit-identical, fewer VPU ops).
-    SGLANG_TPU_FP4_DEQUANT_VIA_FP8 = EnvBool(False)
-    # Tuning only: comma list of fused-RS row buckets to keep (the tile_m bucket always stays).
-    SGLANG_TPU_FUSED_RS_M_BUCKETS = EnvStr(None)
-    # Fused-RS tiles (tile_m,k1,n1,k2,n2,w1_bufs,w2_bufs) for EP-layout prefill calls
-    # (>= 32768 routed rows), overriding the tuned table.
-    SGLANG_TPU_FUSED_RS_EP_PREFILL_TILES = EnvStr(None)
-    # Fused-RS EP mode leaves each tile's output row writes in flight until its staging
-    # slot is reused, as expert-TP mode does, instead of waiting for them after every tile.
-    SGLANG_TPU_FUSED_RS_EP_DEFER_WRITES = EnvBool(False)
-    # Expert-TP fused-RS with a post-expert norm: ep sum, norm and top-k combine in one Pallas
-    # pass instead of three XLA fusions. Equal up to f32 summation order (bf16 casts kept).
-    SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE = EnvBool(False)
-    # Fused-RS: rows issued per iteration of the per-row gather / write DMA loops.
-    SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL = EnvInt(1)
-    # Fused-RS: output staging buffers a tile's deferred direct writes stay in flight
-    # across (VMEM: slots x tile_m x hidden x 2 B). Measured on the Muse Spark expert-TP
-    # call: 6 slots -1.5% per layer vs 3, 8 slots -2%.
-    SGLANG_TPU_FUSED_RS_STAGING_SLOTS = EnvInt(3)
-    # Fused-RS: when an expert's W1 and W2 each fit one DMA, they alternate between the two
-    # weight buffers by expert parity and the next expert's are fetched at the start of a tile,
-    # behind its whole compute, instead of one buffer refilled between matmuls (exact).
-    SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG = EnvBool(False)
-    # Expert-TP fused-RS: the two cores of a chip add their partials on-chip and send one
-    # pair sum per row to another chip's owner, halving off-chip bytes (one extra bf16 rounding).
-    SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE = EnvBool(False)
-    # Pair exchange: issue each tile's five runs (own, sibling, one per other chip) from a
-    # per-tile table built with the routing metadata instead of walking all owners in-kernel.
-    SGLANG_TPU_FUSED_RS_PAIR_RUN_TABLE = EnvBool(False)
-    # Fused-RS: GMM2 stores each 256-column block straight into the row-DMA staging layout
-    # (overlaps the relayout with the next block's matmul) instead of relayouting the tile after.
-    SGLANG_TPU_FUSED_RS_GMM2_ROW_OUT = EnvBool(False)
-    # Pair exchange with the run table on a 4-chip ring: send the diagonal chip's pair sums
-    # through a neighbor chip, which adds them to its own run for that owner (no 2-hop
-    # transfers; one more bf16 rounding). Relay direction alternates by tile.
-    SGLANG_TPU_FUSED_RS_PAIR_RELAY = EnvBool(False)
-    # Chip offset (in ep-rank chip order) of the diagonal chip on the ring.
-    SGLANG_TPU_FUSED_RS_PAIR_RELAY_DIAG = EnvInt(2)
-    # Pair exchange: add the sibling's partial only over the tile's valid rows (bit-identical).
-    SGLANG_TPU_FUSED_RS_PAIR_WINDOW_ADD = EnvBool(False)
-    # Pair exchange with the run table: add the sibling's partial only over the rows of this
-    # core's three forwarded runs (the only pair sums it sends); bit-identical.
-    SGLANG_TPU_FUSED_RS_PAIR_RUN_ADD = EnvBool(False)
-    # Pair exchange combine: derive each owned rank's token and top-k weight from a stable sort
-    # of this rank's own (token, slot) pairs instead of argsorting every row and gathering back.
-    # Same arrays (bit-identical).
-    SGLANG_TPU_FUSED_RS_PAIR_LOCAL_RANKS = EnvBool(False)
-    # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
-    # with a q block of that width; the prefill block search otherwise pads each request's
-    # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).
-    SGLANG_TPU_RPA_BATCHED_VERIFY_BLOCKS = EnvBool(False)
-    # Batched RPA, mixed verify: keep the MIXED batch's order (prefill sequences, then the
-    # decoding tails) and run the tails as the verify pass's MIXED range, instead of
-    # permuting every layer's q/k/v rows to put the tails first and permuting the output back.
-    SGLANG_TPU_MIXED_VERIFY_TAILS_LAST = EnvBool(False)
-    # Raiden HiCache: per-rank host RAM budget (GB) for the full, SWA and draft host pools
-    # together, replacing the free-RAM / local-ranks sample taken as each rank arrives.
-    SGLANG_TPU_HICACHE_HOST_BUDGET_GB = EnvFloat(None)
-    # Raiden HiCache: before building the host pools, release freed heap pages and wait for
-    # every rank, so no rank allocates while a peer still holds its weight-loading buffers.
-    SGLANG_TPU_HICACHE_TRIM_BEFORE_ALLOC = EnvBool(False)
-    # Batched RPA prefill: tiles whose keys all precede their queries skip the causal
-    # (and sliding-window) mask, and a power-of-two sm_scale is folded into q. Exact.
-    SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)
-    # Batched RPA (non-transposed tiles, e.g. verify blocks): softmax without the running
-    # row max. Only for bounded scores: Muse's weightless per-head RMS-normed q and k keep
-    # |s| <= ~44, so exp(s) fits; rounding differs from the max-subtracted form.
-    SGLANG_TPU_RPA_NO_MAX = EnvBool(False)
-    # Batched RPA prefill softmax (the per-score vector chain, not the MXU, sets the
-    # time): exp2 with log2e folded into the q scale, one VALU op per score fewer.
-    # Off with an attention sink or an LSE output, which would see base-2 m and l;
-    # the folded scale rounds q in bf16, so the output is not bit-identical.
-    SGLANG_TPU_RPA_EXP2_SOFTMAX = EnvBool(False)
-    # Row sums from the PV matmul: V tiles get ones rows in the lanes head_dim 64
-    # leaves idle on the MXU, so the accumulator carries l and the vector row-sum
-    # reduce and the separate l rescale go away. SEQ_ALONG_LANE, head_dim <= 64.
-    SGLANG_TPU_RPA_ONES_V = EnvBool(False)
-    # Prefill attention tiles with transposed scores (keys along sublanes) and
-    # fp8 q; not bit-exact with the default tile. Mixed/prefill, SEQ_ALONG_LANE,
-    # head_dim <= 64, no sink / LSE / soft cap / cache-only / context parallel.
-    SGLANG_TPU_RPA_TRANSPOSED = EnvBool(False)
-    # Transposed prefill tiles skip the compute blocks past the last query of a
-    # partial q block (a sequence's last) instead of scoring padded rows. Exact.
-    SGLANG_TPU_RPA_SKIP_PAD_Q = EnvBool(False)
-    # Query tokens per iteration of that skip's loop (fewer, longer iterations overlap better).
-    SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP = EnvInt(128)
-    # "bq:bkv": batched-RPA prefill q / k block sizes for full-attention layers and
-    # for sliding-window layers, instead of the VMEM search's; unset keeps the search.
-    SGLANG_TPU_RPA_PREFILL_BLOCKS = EnvStr(None)
-    SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS = EnvStr(None)
-    # Batched RPA outputs come per-head RMS-normalized (weightless, this eps), as Muse
-    # Spark's attention output norm; the model then skips its own. Muse only.
-    SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS = EnvFloat(None)
-    # Transposed tiles with SGLANG_TPU_RPA_NO_MAX run an unshifted streaming softmax
-    # (no running max, no alpha rescale) over key chunks of this many keys (the largest
-    # divisor of the k block up to it); unset streams the whole k block up to 1536 keys.
-    SGLANG_TPU_RPA_TRANSPOSED_KEY_CHUNK = EnvInt(None)
-    # Rejected experiments of the unshifted / transposed tiles (kept for A/B): every Nth
-    # key chunk's exp2 on the VALU, fp8 PV in the shifted tile, V^T per key chunk, bf16
-    # QK scores. Rolled q-chunk loop: SGLANG_TPU_RPA_QCHUNK_LOOP (transposed.py).
-    SGLANG_TPU_RPA_VALU_EXP2_EVERY = EnvInt(0)
-    SGLANG_TPU_RPA_TRANSPOSED_FP8_P = EnvBool(False)
-    SGLANG_TPU_RPA_CHUNK_VT = EnvBool(False)
-    SGLANG_TPU_RPA_S_BF16 = EnvBool(False)
-    # Pin the RPA prefill q block / q compute chunk of full-attention layers (bq_c is
-    # reduced to a divisor of bq); unset uses calculate_block_sizes's power-of-2 search
-    # (e.g. bq=1024, bkv=1536 on Muse Spark global layers and 512:512 on window=2048).
-    SGLANG_TPU_FORCE_RPA_PREFILL_BQ = EnvInt(None)
-    SGLANG_TPU_FORCE_RPA_PREFILL_BQ_C = EnvInt(None)
-    # Batched RPA: in-kernel trace regions (step body, full / masked tile), visible in
-    # xprof with libtpu's --xla_enable_custom_call_region_trace=true. Profiling only.
-    SGLANG_TPU_RPA_TRACE_REGIONS = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
