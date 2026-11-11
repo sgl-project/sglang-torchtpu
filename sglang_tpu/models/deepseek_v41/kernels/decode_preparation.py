@@ -26,7 +26,7 @@ from sglang_tpu.models.deepseek_v41.kernels.quantized_matmul.tuned_block_sizes i
 
 # Stdlib logging under vLLM's namespace: kernels/ must not import vLLM
 # (R-2.1), yet vLLM's handlers still format these records when present.
-logger = logging.getLogger("vllm." + __name__)
+logger = logging.getLogger(__name__)
 
 
 class FusionMode(enum.Enum):
