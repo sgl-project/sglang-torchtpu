@@ -2,7 +2,7 @@
 MTP verify on the decode megakernel up to 128k of context, the model path beyond.
 
     AGENTX_CONC=4 python3 -m benchmark.tpu.launch_server \\
-        --config recipe/configs/glm_5_3_flash/agentx_1m.py
+        --config recipe/configs/glm_5_3_flash/experimental/agentx_1m.py
 
 Then `agentx profile --concurrency $AGENTX_CONC --public-dataset
 semianalysis_cc_traces_weka_062126 --benchmark-duration 3600 ...` against port 30000.
