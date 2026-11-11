@@ -18,8 +18,8 @@ import ml_dtypes
 import numpy as np
 import pytest
 import torch
-
 from sglang.test.ci.ci_register import register_cpu_ci
+
 from sglang_tpu.models.deepseek_v41.kernels.csa2.cache import prepare_main_records
 from sglang_tpu.models.deepseek_v41.ops import csa2 as ops
 
@@ -219,7 +219,7 @@ def test_swa_metadata_records_and_padding():
     starts = np.array([0, 5, 5, 35], np.int32)
     table = rng.permutation(np.arange(1, 1 + _BATCH * _COLUMNS)).astype(np.int32)
     table = table.reshape(_BATCH, _COLUMNS)
-    meta, bounds, records = map(
+    meta, _bounds, records = map(
         np.asarray,
         ops._swa_metadata(
             jnp.asarray(table),
