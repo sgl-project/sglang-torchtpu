@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import torch
@@ -158,6 +159,11 @@ def _vision_window_index(
     return window_index, torch.unique_consecutive(cu_window_seqlens)
 
 
+def _packed_metadata(cu_seqlens: torch.Tensor, device) -> PackedSequenceMetadata:
+    metadata = PackedSequenceMetadata.from_cu_seqlens(cu_seqlens)
+    return dataclasses.replace(metadata, cu_seqlens=cu_seqlens.to(device))
+
+
 class Qwen2_5VLVisionTransformer(nn.Module):
     def __init__(self, config: Any) -> None:
         super().__init__()
@@ -202,7 +208,9 @@ class Qwen2_5VLVisionTransformer(nn.Module):
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
     ) -> torch.Tensor:
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
-        grid_thw = grid_thw.to(self.device)
+        # Index tables from the host grid: the device would take an int64
+        # cumsum, boolean indexing and unique_consecutive.
+        grid_thw = grid_thw.cpu()
         hidden_states = self.patch_embed(hidden_states)
 
         position_ids = _vision_position_ids(grid_thw, self.spatial_merge_size)
@@ -212,6 +220,9 @@ class Qwen2_5VLVisionTransformer(nn.Module):
             window_size=self.window_size,
             patch_size=self.patch_size,
         )
+        reverse_index = torch.argsort(window_index).to(self.device)
+        position_ids = position_ids.to(self.device)
+        window_index = window_index.to(self.device)
 
         seq_len = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(
@@ -235,8 +246,8 @@ class Qwen2_5VLVisionTransformer(nn.Module):
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-        full_metadata = PackedSequenceMetadata.from_cu_seqlens(cu_seqlens)
-        window_metadata = PackedSequenceMetadata.from_cu_seqlens(cu_window_seqlens)
+        full_metadata = _packed_metadata(cu_seqlens, self.device)
+        window_metadata = _packed_metadata(cu_window_seqlens, self.device)
 
         for layer_idx, block in enumerate(self.blocks):
             metadata = (
@@ -251,4 +262,4 @@ class Qwen2_5VLVisionTransformer(nn.Module):
             )
 
         merged = self.merger(hidden_states)
-        return merged[torch.argsort(window_index)]
+        return merged[reverse_index]
