@@ -7,6 +7,7 @@ exported JAX function only fails at TPU run time, so both are compared here.
 """
 
 import os
+import sys
 from unittest.mock import patch
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -109,3 +110,7 @@ def test_write_lands_records_on_contract_pages(ratio):
     )
     # Nothing but the given records changed: page 0 (full page 0) stays null.
     assert not np.asarray(written[: (2 if ratio == 1 else 1) * 33]).any()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
