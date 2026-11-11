@@ -3,10 +3,11 @@
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=45, suite="stage-a-test-tpu-unit", chips=1)
 
 import functools
 import importlib.util
+import math
 import os
 import subprocess
 import sys
@@ -38,9 +39,7 @@ def _has_tpu_v7x_pair() -> bool:
     )
 
 
-def _fp32_attention_reference(
-    q_bf16, k_bf16, v_bf16, scale: float
-) -> np.ndarray:
+def _fp32_attention_reference(q_bf16, k_bf16, v_bf16, scale: float) -> np.ndarray:
     qf = np.asarray(q_bf16, dtype=np.float32).transpose(0, 2, 1, 3)
     rep = q_bf16.shape[2] // k_bf16.shape[2]
     kf = np.repeat(np.asarray(k_bf16, dtype=np.float32), rep, axis=2).transpose(
@@ -140,17 +139,46 @@ class TestRingFixedMOperands(unittest.TestCase):
     def test_constant_row0_and_gate_eligibility(self):
         import jax.numpy as jnp
 
-        qn = jnp.array([5.0, 12.0, 10.65], dtype=jnp.float32)
+        qn = jnp.array([5.0, 12.0, 9.5], dtype=jnp.float32)
         kn = jnp.array([10.0, 10.0, 10.0], dtype=jnp.float32)
         mk = np.asarray(diffusion_ring_attention.ring_fixed_m_operands(qn, kn))
         self.assertEqual(mk.shape, (2, 3))
-        np.testing.assert_allclose(mk[0], [106.0, 106.0, 106.0])
+        np.testing.assert_allclose(mk[0], [95.0, 95.0, 95.0])
         np.testing.assert_allclose(mk[1], [1.0, 0.0, 1.0])
+
+    def test_fixed_m_window_keeps_pv_normal(self):
+        """Admitted heads keep every exp2 argument in [-102, 88].
+
+        Below -102, p * v with |v| < 2**-24 is subnormal, which TPU flushes to
+        zero: the output shrinks while l keeps the term. Above 88, l and o can
+        overflow float32 when summed over ~2**17 keys.
+        """
+        bound = diffusion_ring_attention.FIXED_M_RING_SAFE_BOUND
+        recenter = diffusion_ring_attention.FIXED_M_RECENTER
+        m = math.floor(bound) - recenter
+        self.assertLessEqual(bound - m, recenter + 1.0)
+        self.assertGreaterEqual(-bound - m, -102.0)
+
+
+def _assert_per_head_close(test, out, ref, tol, label):
+    test.assertTrue(np.all(np.isfinite(out)), label)
+    for head in range(ref.shape[2]):
+        err = np.linalg.norm(out[:, :, head] - ref[:, :, head])
+        rel_l2 = float(err / np.linalg.norm(ref[:, :, head]))
+        test.assertLess(rel_l2, tol, f"{label} head {head}")
 
 
 @unittest.skipUnless(_has_jax(), "jax not installed")
 class TestRingAttentionInterpret(unittest.TestCase):
     def test_ring4_interpret_multiblock_matches_fp32_reference(self):
+        """Ring 4 in Pallas interpret mode against an fp32 reference, per head.
+
+        ring_size=4 separates upstream from downstream. shard_len=310 with
+        bq=256, q_sub=256 and bkv=128 runs 3 KV blocks with a ragged tail, 2 Q
+        passes and the n_q == 1 hybrid last body. GQA 2:1: head 0 is gated to
+        fixed-m; head 1's query is 9x its key, so its base-2 logits (~147)
+        would overflow exp2 if it were gated to fixed-m.
+        """
         import jax
 
         cpu_devices = jax.devices("cpu")
@@ -185,14 +213,9 @@ class TestRingAttentionInterpret(unittest.TestCase):
         from jax.experimental.pallas import tpu as pltpu
         from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-        # ring_size=4 separates upstream from downstream; shard_len=310 with
-        # bq=256, q_sub=256, bkv=128 exercises 3 KV blocks (_run_full + per-block
-        # _reload_own + ragged KV tail), 2 Q passes, n_q == 1 hybrid last body,
-        # batch=2, and GQA 4:2 with mixed fixed-m / online heads.
         rng = np.random.default_rng(0)
         ring_size = 4
         shard_len = 310
-        batch = 2
         seq_len = ring_size * shard_len
         head_dim = 128
         scale = head_dim**-0.5
@@ -203,10 +226,10 @@ class TestRingAttentionInterpret(unittest.TestCase):
             "block_q_sub": 256,
         }
 
-        q_np = rng.standard_normal((batch, seq_len, 4, head_dim), dtype=np.float32)
-        q_np[:, :, 3, :] *= 8.0
-        k_np = rng.standard_normal((batch, seq_len, 2, head_dim), dtype=np.float32)
-        v_np = rng.standard_normal((batch, seq_len, 2, head_dim), dtype=np.float32)
+        k_np = rng.standard_normal((1, seq_len, 1, head_dim), dtype=np.float32)
+        v_np = rng.standard_normal((1, seq_len, 1, head_dim), dtype=np.float32)
+        q_np = rng.standard_normal((1, seq_len, 2, head_dim), dtype=np.float32)
+        q_np[:, :, 1, :] = 9.0 * k_np[:, :, 0, :]
 
         q_bf16 = jnp.asarray(q_np, dtype=jnp.bfloat16)
         k_bf16 = jnp.asarray(k_np, dtype=jnp.bfloat16)
@@ -214,51 +237,52 @@ class TestRingAttentionInterpret(unittest.TestCase):
         ref = _fp32_attention_reference(q_bf16, k_bf16, v_bf16, scale)
 
         axis_names = ("batch", "ring", "uly")
-        mesh = Mesh(np.asarray(cpu_devices[:ring_size]).reshape(1, ring_size, 1), axis_names)
+        mesh = Mesh(
+            np.asarray(cpu_devices[:ring_size]).reshape(1, ring_size, 1), axis_names
+        )
         spec = PartitionSpec(*axis_names)
         sharding = NamedSharding(mesh, spec)
 
-        def _put(x, heads: int):
-            reshaped = jnp.swapaxes(
-                x.reshape(batch, ring_size, shard_len, heads, head_dim), 0, 1
-            )
-            return jax.device_put(reshaped[None, :, None, :, :, :, :], sharding)
+        def _put(x):
+            reshaped = x.reshape(ring_size, shard_len, x.shape[2], head_dim)
+            return jax.device_put(reshaped[None, :, None, None], sharding)
 
-        q_in, k_in, v_in = _put(q_bf16, 4), _put(k_bf16, 2), _put(v_bf16, 2)
-
+        outs = {}
         for use_fixed_m in (True, False):
-            with self.subTest(use_fixed_m=use_fixed_m):
-                pltpu.reset_tpu_interpret_mode_state()
-                fn = jax.jit(
-                    jax.shard_map(
-                        functools.partial(
-                            diffusion_ring_attention.ring_attention_sharded,
-                            ring_axis="ring",
-                            axis_names=axis_names,
-                            scale=scale,
-                            use_fixed_m=use_fixed_m,
-                            pinned=pinned,
-                            interpret=pltpu.InterpretParams(detect_races=True),
-                        ),
-                        mesh=mesh,
-                        in_specs=(spec, spec, spec),
-                        out_specs=spec,
-                        check_vma=False,
-                    )
+            pltpu.reset_tpu_interpret_mode_state()
+            # Both launches run the same DMA schedule; race-check one of them.
+            interpret = pltpu.InterpretParams(detect_races=use_fixed_m)
+            fn = jax.jit(
+                jax.shard_map(
+                    functools.partial(
+                        diffusion_ring_attention.ring_attention_sharded,
+                        ring_axis="ring",
+                        axis_names=axis_names,
+                        scale=scale,
+                        use_fixed_m=use_fixed_m,
+                        pinned=pinned,
+                        interpret=interpret,
+                    ),
+                    mesh=mesh,
+                    in_specs=(spec, spec, spec),
+                    out_specs=spec,
+                    check_vma=False,
                 )
-                out_sharded = np.asarray(fn(q_in, k_in, v_in), dtype=np.float32)[
-                    0, :, 0
-                ]
-                out = np.swapaxes(out_sharded, 0, 1).reshape(
-                    batch, seq_len, 4, head_dim
-                )
+            )
+            out = np.asarray(fn(_put(q_bf16), _put(k_bf16), _put(v_bf16)))
+            outs[use_fixed_m] = out.astype(np.float32).reshape(1, seq_len, 2, head_dim)
+            if use_fixed_m:
                 self.assertFalse(
                     ipc.races is not None and ipc.races.races_found,
                     "Pallas interpret detected a DMA or semaphore race",
                 )
-                self.assertTrue(np.all(np.isfinite(out)))
-                rel_l2 = float(np.linalg.norm(out - ref) / np.linalg.norm(ref))
-                self.assertLess(rel_l2, 7e-3)
+
+        for use_fixed_m, out in outs.items():
+            _assert_per_head_close(self, out, ref, 4e-3, f"fixed_m={use_fixed_m}")
+        # Head 0 takes the fixed-m body only when fixed-m is on; head 1 takes
+        # the online body in both launches.
+        self.assertFalse(np.array_equal(outs[True][:, :, 0], outs[False][:, :, 0]))
+        np.testing.assert_array_equal(outs[True][:, :, 1], outs[False][:, :, 1])
 
 
 @unittest.skipUnless(_has_tpu_v7x_pair(), "requires TPU v7x with >= 2 TensorCores")
@@ -330,9 +354,7 @@ class TestRingAttentionOnDevice(unittest.TestCase):
                 out = np.asarray(fn(q_in, k_in, v_in), dtype=np.float32)[
                     0, :, 0, 0
                 ].reshape(1, seq_len, 4, head_dim)
-                self.assertTrue(np.all(np.isfinite(out)))
-                rel_l2 = float(np.linalg.norm(out - ref) / np.linalg.norm(ref))
-                self.assertLess(rel_l2, 7e-3)
+                _assert_per_head_close(self, out, ref, 4e-3, f"fixed_m={use_fixed_m}")
 
 
 class TestRingMeshSpec(unittest.TestCase):
