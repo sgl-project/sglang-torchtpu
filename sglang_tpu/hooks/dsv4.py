@@ -60,6 +60,16 @@ tpu_dsv4_silu_and_mul_clamp
   Remove when: silu_and_mul_clamp is converted to a BaseFusedOp with a
        forward_native fallback.
 
+tpu_dsv4_hc_combine, tpu_dsv4_hc_split_sinkhorn
+  Why: The public generic mHC combine and split/Sinkhorn APIs unconditionally
+       launch CUDA Triton/TileLang kernels, including the DeepSeek-V4.1 native
+       path. The GLM-specific Pallas mHC hook does not cover this API or D=5120.
+  How: AROUND the two public layernorm.mhc functions uses traceable native
+       PyTorch math under the TPU plugin. Combine accumulates in FP32 and casts
+       before the caller's RMSNorm; Sinkhorn reuses the existing torch reference.
+  Upstream PR or issue: sgl-project/sglang-torchtpu#2101.
+  Remove when: these public APIs dispatch through BaseFusedOp native/OOT backends.
+
 tpu_dsv4_current_mhc_post_fusion
   Why: sglang.srt.layers.moe.mhc_post_fusion.current_mhc_post_fusion reads a
        ContextVar that causes a Dynamo graph break under torch.compile(fullgraph=True)
@@ -260,6 +270,30 @@ def tpu_dsv4_silu_and_mul_clamp(
     output.copy_(res.to(output.dtype))
 
 
+def tpu_dsv4_hc_combine(
+    original, x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
+) -> torch.Tensor:
+    del original
+    streams = x_flat.unflatten(-1, (hc, -1)).float()
+    # Match the public Triton kernel's stream-order FP32 accumulation, then
+    # round to out_dtype BEFORE RMSNorm (not a fused FP32 combine+norm).
+    acc = torch.zeros_like(streams[:, 0, :])
+    for k in range(hc):
+        acc = acc + pre[:, k : k + 1].float() * streams[:, k, :]
+    return acc.to(out_dtype)
+
+
+def tpu_dsv4_hc_split_sinkhorn(
+    original, mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, eps=1e-6
+):
+    del original
+    from sglang.kernels.ops.layernorm.mhc import _hc_split_sinkhorn_torch
+
+    return _hc_split_sinkhorn_torch(
+        mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+    )
+
+
 def tpu_dsv4_current_mhc_post_fusion(original):
     if torch.compiler.is_compiling():
         return None
@@ -403,6 +437,16 @@ def hook_specs():
         (
             "sglang.srt.models.deepseek_v2.silu_and_mul_clamp",
             tpu_dsv4_silu_and_mul_clamp,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.layernorm.mhc.hc_combine",
+            tpu_dsv4_hc_combine,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn",
+            tpu_dsv4_hc_split_sinkhorn,
             HookType.AROUND,
         ),
         (
