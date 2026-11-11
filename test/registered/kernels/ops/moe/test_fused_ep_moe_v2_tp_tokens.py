@@ -12,12 +12,14 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=240, suite="stage-a-test-tpu-unit", chips=4)
+register_tpu_ci(
+    est_time=240,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=4,
+    labels=["singlehost", "infra"],
+)
 
-if __name__ == "__main__":
-    import pytest
-
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
 
 import json
 import os
@@ -398,3 +400,9 @@ def test_split_stages_with_replicas_are_bit_exact(single_host_mesh, groups, rows
         )
     )(rank, (q_g, weights, payload), *inputs)
     np.testing.assert_array_equal(np.asarray(split), np.asarray(fused))
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

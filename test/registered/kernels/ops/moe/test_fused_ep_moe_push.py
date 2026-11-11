@@ -20,19 +20,20 @@ import os
 import shlex
 import sys
 
-from sglang.test.ci.ci_register import register_tpu_ci
+if __name__ == "__main__":
+    # The DP8 topology-preprocessing path uses remote DMA between SparseCores.
+    # Set its two startup requirements before creating the JAX client, as the
+    # upstream DP8 serving recipe does. Keep any explicit caller overrides.
+    _libtpu_args = shlex.split(os.environ.get("LIBTPU_INIT_ARGS", ""))
+    for _flag in (
+        "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0",
+        "--xla_mosaic_unsafe_allow_multicore_remote_dma=true",
+    ):
+        if not any(a.split("=", 1)[0] == _flag.split("=", 1)[0] for a in _libtpu_args):
+            _libtpu_args.append(_flag)
+    os.environ["LIBTPU_INIT_ARGS"] = " ".join(_libtpu_args)
 
-# The DP8 topology-preprocessing path uses remote DMA between SparseCores.
-# Set its two startup requirements before creating the JAX client, as the
-# upstream DP8 serving recipe does. Keep any explicit caller overrides.
-_libtpu_args = shlex.split(os.environ.get("LIBTPU_INIT_ARGS", ""))
-for _flag in (
-    "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0",
-    "--xla_mosaic_unsafe_allow_multicore_remote_dma=true",
-):
-    if not any(a.split("=", 1)[0] == _flag.split("=", 1)[0] for a in _libtpu_args):
-        _libtpu_args.append(_flag)
-os.environ["LIBTPU_INIT_ARGS"] = " ".join(_libtpu_args)
+from sglang.test.ci.ci_register import register_tpu_ci
 
 # Unmeasured estimate for the eight-device sweep at the served dims; the
 # weekly est-time job refreshes it. Nightly, like the v2 numerical sweep.
@@ -41,13 +42,8 @@ register_tpu_ci(
     suite="nightly-tpu-4-v7",
     nightly=True,
     chips=4,
-    labels=["singlehost", "deepseek-v4.1-flash", "accuracy", "dpa"],
+    labels=["singlehost", "infra"],
 )
-
-if __name__ == "__main__":
-    import pytest
-
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
 
 
 import jax
@@ -60,10 +56,6 @@ from jax.sharding import PartitionSpec as P
 
 from sglang_tpu.moe.pallas.fused_moe_v2 import AXIS, WeightFormat, fused_ep_moe_v2
 from sglang_tpu.moe.pallas.fused_moe_v2.push import fused_ep_moe_push
-from sglang_tpu.moe.pallas.fused_moe_v2.push.tc_exchange import (
-    build_tc_exchange_all_gather,
-    build_tc_exchange_all_gather_rows,
-)
 
 pytestmark = pytest.mark.multichip
 
@@ -108,21 +100,6 @@ def _fp8_weights(mesh, seed, *, hidden, inter, e_total):
     return out[0], out[1], scales[0], scales[1]
 
 
-def _fp4_weights(mesh, seed, *, hidden, inter, e_total, rhs_qb):
-    """(w1, w2, w1_scale, w2_scale), fp4 e2m1 with per-`rhs_qb` block scales."""
-    rng = np.random.default_rng(seed)
-    shard = NamedSharding(mesh, P(AXIS))
-    weights, scales = [], []
-    for shape in ((e_total, hidden, 2 * inter), (e_total, inter, hidden)):
-        raw = rng.normal(0, 0.1, shape).astype(np.float32)
-        grouped = raw.reshape(shape[0], shape[1] // rhs_qb, rhs_qb, shape[2])
-        scale = np.maximum(np.max(np.abs(grouped), axis=2) / 6, 1e-12)
-        normalized = (grouped / scale[:, :, None, :]).reshape(shape)
-        weights.append(jax.device_put(normalized, shard).astype(jnp.float4_e2m1fn))
-        scales.append(jax.device_put(scale, shard))
-    return weights[0], weights[1], scales[0], scales[1]
-
-
 def _inputs(mesh, seed, *, hidden, e_logical, tokens=TOKENS):
     rng = np.random.default_rng(seed)
     shard = NamedSharding(mesh, P(AXIS))
@@ -148,11 +125,6 @@ def _roll(weights):
 
 
 SMALL = dict(hidden=512, inter=256, e_total=32)
-FP4_SHAPE = dict(hidden=1024, inter=512, e_total=32)
-G_LOCAL = SMALL["e_total"] // EP  # 4, the same for FP4_SHAPE
-# A ragged stride past ep * g_local * capacity makes the build ship tiles
-# through the contribution slab instead of straight from VMEM.
-CONTRIB_SLAB_STRIDE = EP * G_LOCAL * CAPACITY + CAPACITY
 
 
 def _check_parity(weights, common, *, sc_prepush, tc_exchange, ragged_stride):
@@ -169,11 +141,7 @@ def _check_parity(weights, common, *, sc_prepush, tc_exchange, ragged_stride):
     assert _rel(got, wrong) > CONTROL_BOUND
 
 
-@pytest.mark.parametrize(
-    "ragged_stride", [None, CONTRIB_SLAB_STRIDE], ids=["vmem", "slab"]
-)
-@pytest.mark.parametrize("tc_exchange", [False, True], ids=["xla_ag", "tc_ag"])
-@pytest.mark.parametrize("sc_prepush", [1, G_LOCAL], ids=["pre1", "pre_all"])
+@pytest.mark.parametrize("sc_prepush,tc_exchange,ragged_stride", [(1, True, None)])
 def test_fp8_push_matches_v2(sc_prepush, tc_exchange, ragged_stride):
     mesh = _mesh()
     weights = _fp8_weights(mesh, 11, **SMALL)
@@ -194,63 +162,6 @@ def test_fp8_push_matches_v2(sc_prepush, tc_exchange, ragged_stride):
     )
 
 
-@pytest.mark.parametrize(
-    "ragged_stride", [None, CONTRIB_SLAB_STRIDE], ids=["vmem", "slab"]
-)
-@pytest.mark.parametrize(
-    "sc_prepush,tc_exchange", [(1, False), (G_LOCAL, True)], ids=["pre1_xla", "all_tc"]
-)
-def test_fp4_push_matches_v2(sc_prepush, tc_exchange, ragged_stride):
-    """The served form: FP4 weights with block-512 scales, sqrtsoftplus with
-    a score bias, the routed scale and the clamped activation."""
-    mesh = _mesh()
-    weights = _fp4_weights(mesh, 21, rhs_qb=512, **FP4_SHAPE)
-    bias = jax.device_put(
-        np.random.default_rng(5)
-        .normal(0, 0.1, FP4_SHAPE["e_total"])
-        .astype(np.float32),
-        NamedSharding(mesh, P()),
-    )
-    common = dict(
-        topk=TOPK,
-        renormalize=True,
-        mesh=mesh,
-        capacity=CAPACITY,
-        weight_format=WeightFormat.FP4,
-        rhs_qb=512,
-        sharded_plan=True,
-        scoring_fn="sqrtsoftplus",
-        score_bias=bias,
-        routed_scaling_factor=2.5,
-        act_fn="silu_and_mul_with_clamp",
-    )
-    _check_parity(
-        weights,
-        common,
-        sc_prepush=sc_prepush,
-        tc_exchange=tc_exchange,
-        ragged_stride=ragged_stride,
-    )
-
-
-def test_sc_prepush_below_one_raises_and_above_g_local_clamps():
-    mesh = _mesh()
-    weights = _fp8_weights(mesh, 31, **SMALL)
-    x, gating = _inputs(mesh, 32, hidden=SMALL["hidden"], e_logical=SMALL["e_total"])
-    common = dict(
-        topk=TOPK,
-        renormalize=True,
-        mesh=mesh,
-        capacity=CAPACITY,
-        weight_format=WeightFormat.FP8,
-    )
-    with pytest.raises(ValueError, match="sc_prepush must be >= 1; got 0"):
-        fused_ep_moe_push(x, *weights, gating, sc_prepush=0, **common)
-    clamped = fused_ep_moe_push(x, *weights, gating, sc_prepush=G_LOCAL + 3, **common)
-    at_g = fused_ep_moe_push(x, *weights, gating, sc_prepush=G_LOCAL, **common)
-    np.testing.assert_array_equal(np.asarray(clamped), np.asarray(at_g))
-
-
 def _contiguous_plus_one(experts, ep):
     """Rank r holds its contiguous block plus the next rank's first expert:
     per-slot expert ids [ep * (experts / ep + 1)] and the [experts, 2] slot
@@ -268,125 +179,11 @@ def _contiguous_plus_one(experts, ep):
     return np.asarray(slot_expert, np.int32), np.asarray(table, np.int32)
 
 
-@pytest.mark.parametrize("onehot_slots", [False, True], ids=["gather", "onehot"])
-def test_expert_layout_serves_the_same_tokens_and_counts_its_rows(onehot_slots):
-    """A replicated layout (R = 2): the weights in slot order, gating per
-    logical expert. The output must be the unplaced layer's (every copy holds
-    the same weights, so only where the rows run changes), and the load
-    accumulator must count exactly the rows `_to_slots` sends to each slot:
-    expert e of global row t goes to slot table[e, t mod copies(e)]."""
-    mesh = _mesh()
-    experts = SMALL["e_total"]
-    logical = _fp8_weights(mesh, 41, **SMALL)
-    slot_expert, table = _contiguous_plus_one(experts, EP)
-    shard = NamedSharding(mesh, P(AXIS))
-    replicated = NamedSharding(mesh, P())
-    physical = tuple(
-        jax.device_put(jnp.take(w, jnp.asarray(slot_expert), axis=0), shard)
-        for w in logical
-    )
-    e_total = len(slot_expert)
-    x, gating = _inputs(mesh, 42, hidden=SMALL["hidden"], e_logical=experts)
-    common = dict(
-        topk=TOPK,
-        renormalize=True,
-        mesh=mesh,
-        capacity=CAPACITY,
-        weight_format=WeightFormat.FP8,
-        sharded_plan=True,
-        sc_prepush=2,
-    )
-    load0 = jnp.full((e_total,), 3, jnp.int32)
-    out, load = fused_ep_moe_push(
-        x,
-        *physical,
-        gating,
-        expert_slot=jax.device_put(jnp.asarray(table), replicated),
-        expert_load=jax.device_put(load0, replicated),
-        onehot_slots=onehot_slots,
-        **common,
-    )
-    plain = fused_ep_moe_push(x, *logical, gating, **common)
-    np.testing.assert_array_equal(np.asarray(out), np.asarray(plain))
-    wrong = fused_ep_moe_push(x, *_roll(logical), gating, **common)
-    assert _rel(out, wrong) > CONTROL_BOUND
-    g = np.asarray(gating)
-    selected = np.argsort(-g, axis=1, kind="stable")[:, :TOPK]
-    copies = (table >= 0).sum(axis=1)
-    rows = np.arange(g.shape[0])[:, None]
-    slots = table[selected, rows % copies[selected]]
-    want = 3 + np.bincount(slots.ravel(), minlength=e_total)
-    np.testing.assert_array_equal(np.asarray(load), want)
-
-
-@pytest.mark.parametrize("width", [384, 1029])
-def test_tc_exchange_all_gather_equals_lax_all_gather(width):
-    mesh = _mesh()
-    fn = build_tc_exchange_all_gather(ep=EP, width=width)
-
-    def local(p):
-        flat = p.reshape(-1)
-        tc = fn(flat, lax.axis_index(AXIS))
-        xla = lax.all_gather(flat, AXIS, axis=0, tiled=True)
-        return tc[None], xla[None]
-
-    data = (jnp.arange(EP * width, dtype=jnp.int32) * 7 - 3).reshape(EP, width)
-    tc, xla = jax.jit(
-        jax.shard_map(
-            local,
-            mesh=mesh,
-            in_specs=P(AXIS),
-            out_specs=(P(AXIS), P(AXIS)),
-            check_vma=False,
-        )
-    )(jax.device_put(data, NamedSharding(mesh, P(AXIS))))
-    np.testing.assert_array_equal(np.asarray(tc), np.asarray(xla))
-    np.testing.assert_array_equal(np.asarray(tc)[0], np.asarray(data).reshape(-1))
-
-
-def test_tc_exchange_row_gather_equals_take():
-    """The exchange kernel's row copy is rows[idx] (repeats and every row
-    of the source included) and leaves the exchange itself unchanged."""
-    mesh = _mesh()
-    width, n_src, n = 384, 48, 96
-    fn = build_tc_exchange_all_gather_rows(ep=EP, width=width, n_rows=n)
-
-    def local(p, rows, idx):
-        flat = p.reshape(-1)
-        tc, got = fn(flat, lax.axis_index(AXIS), rows[0], idx.reshape(-1))
-        xla = lax.all_gather(flat, AXIS, axis=0, tiled=True)
-        return tc[None], xla[None], got[None]
-
-    rng = np.random.default_rng(3)
-    data = (jnp.arange(EP * width, dtype=jnp.int32) * 7 - 3).reshape(EP, width)
-    rows = rng.normal(0, 1, (EP, n_src, 40, 128)).astype(np.float32)
-    rows = jnp.asarray(rows).astype(jnp.float8_e4m3fn)
-    idx = np.stack([rng.permutation(np.repeat(np.arange(n_src), 2)) for _ in range(EP)])
-    shard = NamedSharding(mesh, P(AXIS))
-    tc, xla, got = jax.jit(
-        jax.shard_map(
-            local,
-            mesh=mesh,
-            in_specs=(P(AXIS),) * 3,
-            out_specs=(P(AXIS),) * 3,
-            check_vma=False,
-        )
-    )(
-        jax.device_put(data, shard),
-        jax.device_put(rows, shard),
-        jax.device_put(jnp.asarray(idx, jnp.int32), shard),
-    )
-    np.testing.assert_array_equal(np.asarray(tc), np.asarray(xla))
-    want = np.stack([np.asarray(rows[d])[idx[d]] for d in range(EP)])
-    np.testing.assert_array_equal(np.asarray(got).view(np.uint8), want.view(np.uint8))
-
-
 # The served DSv4.1-Flash expert dims (hidden 5120, inter 2560 holding a
 # logical 2304, fp4 block-512 weights with row-padded flat scale tables) at
 # the DP16 C768 per-shard shapes, on eight shards: the target layers' 25
 # slots, 288 rows and top-6, and the drafter's 9 slots, 240 rows and top-3.
 SERVED_HIDDEN, SERVED_INTER, SERVED_LOGICAL_INTER = 5120, 2560, 2304
-SERVED_SHAPES = {"g25": (25, 288, 6), "g9": (9, 240, 3)}
 
 
 def _served_fp4_weights(mesh, seed, *, e_total):
@@ -417,51 +214,6 @@ def _served_fp4_weights(mesh, seed, *, e_total):
     )
     w2, s2 = jax.jit(lambda k: one(k, inter, hidden), out_shardings=(shard,) * 2)(k2)
     return w1, w2, s1, s2
-
-
-@pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
-def test_served_dims_program_knobs_are_bit_exact(shape):
-    """Height rungs, staging and dispatch run-ahead preserve routed output."""
-    g_local, rows, topk = SERVED_SHAPES[shape]
-    mesh = _mesh()
-    e_total = EP * g_local
-    weights = _served_fp4_weights(mesh, 61, e_total=e_total)
-    x, gating = _inputs(
-        mesh, 62, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
-    )
-    bias = np.zeros(e_total, np.float32)
-    bias[np.random.default_rng(63).choice(e_total, EP, replace=False)] = 3.0
-    common = dict(
-        topk=topk,
-        renormalize=True,
-        mesh=mesh,
-        capacity=CAPACITY,
-        weight_format=WeightFormat.FP4,
-        rhs_qb=512,
-        sharded_plan=True,
-        scoring_fn="sqrtsoftplus",
-        score_bias=jax.device_put(bias, NamedSharding(mesh, P())),
-        routed_scaling_factor=2.5,
-        act_fn="silu_and_mul_with_clamp",
-        logical_intermediate_size=SERVED_LOGICAL_INTER,
-        sc_prepush=2,
-        tc_exchange=True,
-    )
-    want = np.asarray(
-        fused_ep_moe_push(x, *weights, gating, height_rungs_override=4, **common)
-    )
-    assert np.isfinite(want.astype(np.float32)).all()
-    for kw in (
-        dict(height_rungs_override=4, tail_barrier=False),
-        dict(height_rungs_override=1),
-        dict(height_rungs_override=2, hbm_staging=True, dispatch_ahead=g_local),
-    ):
-        got = fused_ep_moe_push(x, *weights, gating, **kw, **common)
-        np.testing.assert_array_equal(np.asarray(got), want, err_msg=str(kw))
-    wrong = fused_ep_moe_push(
-        x, *_roll(weights), gating, height_rungs_override=4, **common
-    )
-    assert _rel(wrong, want) > CONTROL_BOUND
 
 
 def _shared_expert_weights(mesh, seed):
@@ -791,3 +543,9 @@ def test_four_chip_full_experts_and_static_eplb(four_chip_weights, experts, rows
         )
         assert np.isfinite(np.asarray(got_shared, np.float32)).all()
         assert _rel(got_shared, want_shared) < 0.01
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

@@ -457,7 +457,7 @@ def _build_push_moe_kernel(
         #   recv_row_off == push_dst << ROWBLK_SHIFT -- `recv_base` is a cumsum
         #     of ALIGNED run lengths, so the row offset is the block offset in
         #     rows. Asserted over eight shards and several routings by
-        #     test/registered/tpu/unit/test_fused_ep_moe_v2_tables.py; that test
+        #     test/registered/kernels/ops/moe/test_fused_ep_moe_v2_tables.py; that test
         #     is what keeps this derivation honest if recv_base ever changes to
         #     track true lengths.
         (commit_start_sm, commit_len_sm, contrib_off_sm, push_dst_sm) = (

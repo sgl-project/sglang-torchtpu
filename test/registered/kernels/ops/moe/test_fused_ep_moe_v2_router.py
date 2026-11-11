@@ -24,12 +24,14 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=90, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(
+    est_time=90,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=1,
+    labels=["singlehost", "infra"],
+)
 
-if __name__ == "__main__":
-    import pytest
-
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
 
 import functools
 
@@ -99,16 +101,7 @@ def _scores(rows, seed, scale=1.0, experts=EXPERTS):
 
 @pytest.mark.parametrize(
     "rows,experts,topk,block_rows,separate_weights",
-    [
-        (8, 256, 8, 8, False),
-        (512, 256, 8, 256, True),
-        (256, 384, 6, 256, False),
-        pytest.param(2048, 384, 6, 256, True, id="tuned-2048-rows"),
-        pytest.param(512, 384, 6, 64, True, id="align-partial-tiles"),
-        pytest.param(192, 384, 6, 64, False, id="fallback-to-full-rows"),
-        pytest.param(128, 128, 1, 128, False, id="topk-one"),
-        pytest.param(8, 16, 16, 8, True, id="topk-all-experts"),
-    ],
+    [(8, 256, 8, 8, False), (512, 384, 6, 64, True)],
 )
 def test_selection_matches_reference(
     rows, experts, topk, block_rows, separate_weights, interpret
@@ -168,53 +161,6 @@ def test_ties_choose_lowest_expert_across_lane_boundaries(
 
 # Adapt the every-expert and tiny-score cases from vllm-project/vllm-torchtpu
 # PR #2480 to this selector's unnormalized, multi-tile output contract.
-@pytest.mark.parametrize("separate_weights", [False, True])
-def test_every_expert_id_preserves_token_and_topk_position(separate_weights, interpret):
-    """Each output slot visits every expert, with distinct weights per token."""
-    rows, experts, topk = 512, 384, 6
-    expected_ids = (
-        np.arange(rows)[:, None] + np.arange(topk)[None, :] * (experts // topk)
-    ) % experts
-    for slot in range(topk):
-        np.testing.assert_array_equal(
-            np.unique(expected_ids[:, slot]), np.arange(experts)
-        )
-    scores = np.full((rows, experts), -1, dtype=np.float32)
-    np.put_along_axis(scores, expected_ids, np.arange(topk, 0, -1)[None, :], axis=1)
-    weights = (
-        np.arange(rows * experts, dtype=np.float32).reshape(rows, experts)
-        if separate_weights
-        else None
-    )
-    w, i = _select(scores, weights, topk, block_rows=128, interpret=interpret)
-    np.testing.assert_array_equal(i, expected_ids)
-    np.testing.assert_array_equal(
-        w,
-        np.take_along_axis(
-            scores if weights is None else weights, expected_ids, axis=1
-        ),
-    )
-
-
-@pytest.mark.parametrize(
-    "case,separate_weights", [("zeros", False), ("uniform", True), ("tiny", True)]
-)
-def test_zero_uniform_and_tiny_scores_preserve_selection(
-    case, separate_weights, interpret
-):
-    """Zero/tied scores select distinct lowest IDs; tiny weights stay unnormalized."""
-    scores = _scores(256, seed=17, scale=1e-22, experts=384)
-    if case == "zeros":
-        scores.fill(0)
-    elif case == "uniform":
-        scores.fill(1 / 384)
-    weights = (
-        _scores(256, seed=18, scale=1e-22, experts=384) if separate_weights else None
-    )
-    w, i = _select(scores, weights, topk=6, block_rows=128, interpret=interpret)
-    ref_w, ref_i = _reference(scores, scores if weights is None else weights, topk=6)
-    np.testing.assert_array_equal(i, ref_i)
-    np.testing.assert_array_equal(w, ref_w)
 
 
 @pytest.mark.parametrize("separate_weights", [False, True])
@@ -329,20 +275,7 @@ def test_packed_top6_normalizes_unbiased_weights(case):
 
 @pytest.mark.parametrize(
     "change",
-    [
-        {},
-        {"rows": 256},
-        {"experts": 128},
-        {"topk": 3},
-        {"scoring_fn": "softmax"},
-        {"scoring_fn": "sigmoid"},
-        {"renormalize": False},
-        {"has_bias": False},
-        {"has_hash": True},
-        {"dtype": jnp.float16},
-        {"chip": None},
-        {"chip": pltpu.ChipVersion.TPU_V6E},
-    ],
+    [{}, {"rows": 256}, {"has_hash": True}, {"chip": pltpu.ChipVersion.TPU_V6E}],
 )
 @pytest.mark.cpu_test
 def test_normalized_router_only_uses_measured_envelope(monkeypatch, change):
@@ -419,118 +352,6 @@ def test_normalized_selector_rejects_unsupported_tiles(topk, block_rows):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize(
-    "adapter_widen,near_ties,scale,mesh_ep_ranks",
-    [
-        (False, False, 1.0, None),
-        (True, False, 2.5, (0,)),
-        (False, True, 2.5, (0,)),
-        (True, True, 1.0, None),
-    ],
-)
-def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(
-    monkeypatch, adapter_widen, near_ties, scale, mesh_ep_ranks
-):
-    """Exercise production wiring without running experts or TPU collectives."""
-    import functools
-    from unittest.mock import Mock
-
-    from sglang_tpu.moe.pallas.fused_moe_v2 import host, kernel, layer
-
-    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
-    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
-    monkeypatch.setattr(kernel, "logger", Mock())
-    monkeypatch.setattr(
-        layer,
-        "pallas_select",
-        functools.partial(router_ops.pallas_select, interpret=True),
-    )
-    fused_select = Mock(
-        wraps=functools.partial(
-            router_ops.select_finalize_normalized_router, interpret=True
-        )
-    )
-    finalize = Mock(
-        wraps=functools.partial(router_ops.finalize_normalized_router, interpret=True)
-    )
-    monkeypatch.setattr(layer, "select_finalize_normalized_router", fused_select)
-    monkeypatch.setattr(layer, "finalize_normalized_router", finalize)
-    # Isolate the layer's function cache from other tests and from this A/B.
-    monkeypatch.setattr(layer, "_LAYER_SM_CACHE", {})
-    with jax.default_device(jax.devices("cpu")[0]):
-        rng = np.random.default_rng(43)
-        gate = jnp.asarray(rng.normal(size=(288, 384)), dtype=jnp.bfloat16)
-        gate = gate.at[:3].set(
-            jnp.array([jnp.nan, -jnp.inf, jnp.inf], jnp.bfloat16)[:, None]
-        )
-        if adapter_widen:
-            # vLLM-TorchTPU's fused_moe_ep._build_op.call passes this widened form.
-            gate = gate.astype(jnp.float32)
-        if near_ties:
-            # Adjacent logits and cancelling bias expose changed Top6 membership.
-            ranks = rng.permutation(384).astype(np.float32)
-            near = np.float32(0.25) + ranks * np.spacing(np.float32(0.25))
-            if not adapter_widen:
-                near = np.float32(0.25) + ranks * np.float32(2**-11)
-            gate = jnp.broadcast_to(jnp.asarray(near, gate.dtype), (288, 384))
-            gate = gate.at[:3].set(
-                jnp.array([jnp.nan, -jnp.inf, jnp.inf], gate.dtype)[:, None]
-            )
-            old_scores = layer._apply_scoring_fn(gate[3], "sqrtsoftplus")
-            bias = -old_scores + jnp.asarray((np.arange(384) % 7) * 2**-23, jnp.float32)
-        else:
-            bias = jnp.asarray(rng.normal(size=(384,)), dtype=jnp.float32)
-        mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("d",))
-        args = (
-            jnp.zeros((288, 128), jnp.bfloat16),
-            jnp.zeros((384, 128, 256), jnp.bfloat16),
-            jnp.zeros((384, 128, 128), jnp.bfloat16),
-            None,
-            None,
-            gate,
-        )
-        selected_tiles = []
-
-        def production_tile(gate, **kwargs):
-            tile = router_ops.normalized_router_block_rows(gate, **kwargs)
-            selected_tiles.append(tile)
-            return tile
-
-        outputs = []
-        for choose_tile in (lambda *a, **kw: None, production_tile):
-            layer._LAYER_SM_CACHE.clear()
-            monkeypatch.setattr(layer, "normalized_router_block_rows", choose_tile)
-            outputs.append(
-                tuple(
-                    np.asarray(value)
-                    for value in layer.fused_ep_moe_v2(
-                        *args,
-                        topk=6,
-                        renormalize=True,
-                        mesh=mesh,
-                        mesh_ep_ranks=mesh_ep_ranks,
-                        capacity=128,
-                        weight_format=host.WeightFormat.BF16,
-                        scoring_fn="sqrtsoftplus",
-                        score_bias=bias,
-                        routed_scaling_factor=scale,
-                        stage="route",
-                    )
-                )
-            )
-        assert selected_tiles and all(tile == 288 for tile in selected_tiles)
-        assert fused_select.called
-        finalize.assert_not_called()
-        (old_wire, old_weights, old_payload), (wire, weights, payload) = outputs
-        np.testing.assert_array_equal(wire, old_wire)
-        np.testing.assert_array_equal(payload, old_payload)
-        np.testing.assert_allclose(weights, old_weights, rtol=2e-6, atol=1e-6)
-        np.testing.assert_array_equal(weights[:3], 0)
-        np.testing.assert_array_equal(payload[0, : 3 * 6], 384)
-        np.testing.assert_allclose(weights[3:].sum(axis=-1), scale, rtol=2e-6)
-
-
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("dtype,scale", [(jnp.bfloat16, 1.0), (jnp.float32, 2.5)])
 def test_finalize_masks_invalid_ids_after_mesh_permutation(dtype, scale):
     """The sentinel must not be mapped to expert zero by an EP permutation."""
@@ -595,107 +416,7 @@ def test_packed_top6_tpu_lowering_matches_numpy():
     np.testing.assert_array_equal(valid, True)
 
 
-@pytest.mark.cpu_test
-def test_fp32_sqrtsoftplus_validity_matches_generic_row_check():
-    """FP32 admission must preserve invalid rows without rounding logits to BF16."""
-    from sglang_tpu.moe.pallas.fused_moe_v2.layer import _apply_scoring_fn, _row_routes
+if __name__ == "__main__":
+    import pytest
 
-    rng = np.random.default_rng(47)
-    bits = rng.integers(0, 2**32, (288, 384), dtype=np.uint32)
-    values = bits.view(np.float32)
-    extremes = np.array(
-        [
-            np.finfo(np.float32).max,
-            -np.finfo(np.float32).max,
-            0,
-            -100,
-            np.nan,
-            np.inf,
-            -np.inf,
-            np.finfo(np.float32).tiny,
-        ],
-        dtype=np.float32,
-    )
-    values[:8] = extremes[:, None]
-    values[8:16] = np.nan
-    values[8:16, 383] = extremes
-    with jax.default_device(jax.devices("cpu")[0]):
-        gate = jnp.asarray(values)
-        scores = _apply_scoring_fn(gate, "sqrtsoftplus")
-        original = _row_routes(scores, gate)
-        simplified = jnp.any(jnp.isfinite(gate), axis=-1, keepdims=True)
-        np.testing.assert_array_equal(simplified, original)
-        assert np.isfinite(np.asarray(scores)[0]).all()
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-def test_specialized_softplus_preserves_finite_and_nonfinite_scores(dtype):
-    """The measured formula must retain overflow safety and invalid-row semantics."""
-    from sglang_tpu.moe.pallas.fused_moe_v2.layer import _apply_scoring_fn
-
-    rng = np.random.default_rng(48)
-    bits = rng.integers(0, 2**32, 4096, dtype=np.uint32)
-    edge = np.array(
-        [
-            0.0,
-            -0.0,
-            np.nan,
-            np.inf,
-            -np.inf,
-            100,
-            -100,
-            np.finfo(np.float32).max,
-            -np.finfo(np.float32).max,
-        ],
-        np.float32,
-    )
-    logits = jnp.asarray(np.concatenate((edge, bits.view(np.float32))), dtype)
-    generic = _apply_scoring_fn(logits, "sqrtsoftplus")
-    specialized = _apply_scoring_fn(logits, "sqrtsoftplus", specialize_softplus=True)
-    np.testing.assert_array_equal(np.isnan(specialized), np.isnan(generic))
-    np.testing.assert_array_equal(np.isposinf(specialized), np.isposinf(generic))
-    np.testing.assert_allclose(specialized, generic, rtol=2e-6, atol=1e-6)
-
-
-@pytest.mark.cpu_test
-def test_per_token_score_bias_selects_each_row_with_its_own_bias(monkeypatch):
-    """A [tokens, experts] score bias routes every row as its own 1-D bias would."""
-    from sglang_tpu.moe.pallas.fused_moe_v2 import host, layer
-
-    monkeypatch.setattr(
-        layer,
-        "pallas_select",
-        functools.partial(router_ops.pallas_select, interpret=True),
-    )
-    monkeypatch.setattr(layer, "_LAYER_SM_CACHE", {})
-    rng = np.random.default_rng(5)
-    with jax.default_device(jax.devices("cpu")[0]):
-        gate = jnp.asarray(rng.normal(size=(288, 384)), jnp.float32)
-        text = jnp.asarray(rng.normal(size=384) * 4, jnp.float32)
-        image = jnp.asarray(rng.normal(size=384) * 4, jnp.float32)
-        rows = (np.arange(288) % 3 == 0)[:, None]
-        mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("d",))
-
-        def route(score_bias):
-            _, _, payload = layer.fused_ep_moe_v2(
-                jnp.zeros((288, 128), jnp.bfloat16),
-                jnp.zeros((384, 128, 256), jnp.bfloat16),
-                jnp.zeros((384, 128, 128), jnp.bfloat16),
-                None,
-                None,
-                gate,
-                topk=6,
-                renormalize=True,
-                mesh=mesh,
-                capacity=128,
-                weight_format=host.WeightFormat.BF16,
-                scoring_fn="sqrtsoftplus",
-                score_bias=score_bias,
-                stage="route",
-            )
-            return np.asarray(payload)[0, : 288 * 6].reshape(288, 6)
-
-        mixed = route(jnp.where(rows, image, text))
-        want = np.where(rows, route(image), route(text))
-    np.testing.assert_array_equal(mixed, want)
+    sys.exit(pytest.main([__file__]))

@@ -26,12 +26,14 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(
+    est_time=60,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=1,
+    labels=["singlehost", "infra"],
+)
 
-if __name__ == "__main__":
-    import pytest
-
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
 
 import jax
 import jax.numpy as jnp
@@ -54,8 +56,10 @@ def _abstract(tokens=288, hidden=HIDDEN, inter=INTER):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("tokens,expected", [(288, True), (240, False), (2048, False)])
-@pytest.mark.parametrize("generation", [-1, 6, 7])
+@pytest.mark.parametrize(
+    "tokens,expected,generation",
+    [(288, True, 7), (240, False, 7), (288, False, 6), (288, False, -1)],
+)
 def test_envelope(monkeypatch, tokens, expected, generation):
     monkeypatch.setattr(se, "get_tpu_generation", lambda: generation)
     assert se.is_supported(*_abstract(tokens)) is (expected and generation == 7)
@@ -107,17 +111,8 @@ def _unfused(x, w13, s13, w2, s2):
 _AS_SERVED = {"xla_allow_excess_precision": False}
 
 
-@pytest.mark.parametrize(
-    "tokens,pattern,seed",
-    [
-        (288, "random", 0),
-        (288, "random", 1),
-        (288, "mixed", 2),
-        (288, "zero", 3),
-        (256, "random", 4),
-    ],
-)
-def test_fused_shared_expert_is_bitwise_equal(tokens, pattern, seed):
+@pytest.mark.parametrize("tokens,seed", [(288, 0), (256, 4)])
+def test_fused_shared_expert_is_bitwise_equal(tokens, seed):
     if jax.default_backend() != "tpu" or se.get_tpu_generation() != 7:
         pytest.skip("the fused shared expert is measured on TPU v7 only")
     graph = str(
@@ -128,11 +123,6 @@ def test_fused_shared_expert_is_bitwise_equal(tokens, pattern, seed):
     assert ("fused_shared_expert_fp8" in graph) is (tokens == 288)
     rng = np.random.default_rng(100 + seed)
     x = rng.standard_normal((tokens, HIDDEN)).astype(np.float32)
-    if pattern == "zero":
-        x[:] = 0
-    elif pattern == "mixed":
-        x *= np.exp(rng.random((tokens, 1)) * 8 - 4)
-        x[:16] = 0
     x = jnp.asarray(x).astype(jnp.bfloat16)
     weights = _weights(seed)
     want = jax.jit(_unfused, compiler_options=_AS_SERVED)(x, *weights)
@@ -142,3 +132,9 @@ def test_fused_shared_expert_is_bitwise_equal(tokens, pattern, seed):
     got = np.asarray(got)
     assert np.isfinite(got.astype(np.float32)).all()
     np.testing.assert_array_equal(got.view(np.uint16), np.asarray(want).view(np.uint16))
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

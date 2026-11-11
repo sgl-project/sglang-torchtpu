@@ -113,14 +113,24 @@ Cross-dispatch accuracy is numerical because the measured all-gather router
 and generic push router use different lowerings; scheduling-only push options
 retain bitwise checks.
 
-Run the focused cases in the checkout's declared dependency environment:
+Run the nightly kernel suite in the checkout's declared dependency environment:
 
 ```bash
-python -m pytest test/registered/tpu/unit/test_fused_ep_moe_push.py -k four_chip -v
+python test/registered/kernels/ops/moe/test_fused_ep_moe_push.py
 ```
 
 Verify the actual Python executable, imported JAX/JAXLIB versions and loaded
-libtpu before testing. The test supplies the upstream DP8 remote-DMA startup
+libtpu before testing. The script supplies the upstream DP8 remote-DMA startup
 flags before creating a JAX client; a launcher that initializes JAX earlier
 must supply those flags itself. This coverage uses synthetic weights and does
 not establish checkpoint loading, model E2E accuracy or multi-host support.
+
+## Test cadence
+
+Kernel checks live under `test/registered/kernels/ops/moe/`; the standalone
+shared-expert check lives under `test/registered/kernels/ops/gemm/`. These
+checks run in `nightly-tpu-4-v7`, with explicit chip requirements and `infra`
+labels. They use synthetic weights and do not claim model accuracy coverage.
+The push suite keeps one FP8 parity case, the public dispatch entry point,
+and the full-expert V4.1 verify/draft/prefill cases; broader tuning sweeps are
+outside this basic-function suite.

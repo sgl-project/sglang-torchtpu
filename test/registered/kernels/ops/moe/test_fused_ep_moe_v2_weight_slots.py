@@ -19,12 +19,14 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(
+    est_time=15,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=1,
+    labels=["singlehost", "infra"],
+)
 
-if __name__ == "__main__":
-    import pytest
-
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
 import jax.numpy as jnp
 import pytest
 
@@ -174,3 +176,9 @@ def test_the_height_ladder():
     # never the short one.
     assert rungs[-1] == TILE_M
     assert all(step % host.ROWBLK == 0 for step in rungs)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

@@ -48,10 +48,6 @@ register_tpu_ci(
     labels=["singlehost", "infra"],
 )
 
-if __name__ == "__main__":
-    import pytest
-
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
 
 import jax
 import jax.numpy as jnp
@@ -1309,3 +1305,9 @@ def test_expert_load_counts_the_rows_per_physical_slot():
     np.testing.assert_array_equal(np.asarray(out), np.asarray(plain))
     expected = 5 + np.bincount(np.asarray(hash_ids).ravel(), minlength=e_total)
     np.testing.assert_array_equal(np.asarray(updated), expected)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__]))

@@ -18,15 +18,18 @@
 """CPU routing-table identities, payload layout and rank-order round trips."""
 
 import sys
+from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(
+    est_time=60,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    chips=1,
+    labels=["singlehost", "infra"],
+)
 
-if __name__ == "__main__":
-    import pytest
-
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
 
 import numpy as np
 import pytest
@@ -35,6 +38,9 @@ jax = pytest.importorskip("jax")
 jnp = jax.numpy
 
 from sglang_tpu.moe.pallas.fused_moe_v2 import host, layer  # noqa: E402
+from sglang_tpu.moe.pallas.fused_moe_v2.push import fusion  # noqa: E402
+from sglang_tpu.moe.pallas.fused_moe_v2.push import routing  # noqa: E402
+from sglang_tpu.moe.pallas.fused_moe_v2.push import host as push_host  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -482,3 +488,126 @@ def test_unpermute_load_to_ep_rank_order_inverts_mesh_relabeling():
         )
     )
     np.testing.assert_array_equal(unpermuted, ep_counts)
+
+
+def test_push_segments_preserve_row_counts_and_destinations():
+    """Every non-padding routing pair is sent once to its destination slot."""
+    ep, tokens, local_experts, topk = 4, 64, 2, 2
+    experts = ep * local_experts
+    ids = (np.arange(ep * tokens)[:, None] + np.arange(topk)) % experts
+    ids[::7] = experts
+    counts = np.stack(
+        [
+            np.bincount(rows.ravel(), minlength=experts + 1)[:experts]
+            for rows in ids.reshape(ep, tokens, topk)
+        ]
+    ).astype(np.int32)
+    by_dest = jnp.asarray(counts)
+    runs = push_host.run_tables(by_dest)
+    for rank in (0, ep - 1):
+        starts = np.cumsum(counts[rank]) - counts[rank]
+        segments, metadata, _ = push_host.push_dispatch_segments(
+            runs[3],
+            runs[2],
+            by_dest,
+            jnp.int32(rank),
+            jnp.asarray(starts),
+            e_total=experts,
+            ep=ep,
+        )
+        segments = np.asarray(segments).reshape(3, -1)
+        seen = np.zeros(experts, np.int32)
+        for packed, start in zip(segments[0], segments[1]):
+            size = int(packed) & 65535
+            if size:
+                dest, local = int(packed) >> 24, (int(packed) >> 16) & 255
+                expert = dest * local_experts + local
+                assert start == starts[expert]
+                seen[expert] += size
+        np.testing.assert_array_equal(seen, counts[rank])
+        received = counts[:, rank * local_experts : (rank + 1) * local_experts].sum(0)
+        np.testing.assert_array_equal(
+            np.asarray(metadata)[local_experts + 1 : 2 * local_experts + 1], received
+        )
+
+
+@pytest.mark.parametrize(
+    "options,match",
+    [
+        ({"dispatch": "scatter"}, "dispatch must be one of"),
+        ({"push_options": {"sc_prepush": 1}}, 'need dispatch="push"'),
+        ({"shared_limit": 10.0}, 'need dispatch="push"'),
+        ({"dispatch": "push", "stage": "route"}, "fused stage only"),
+        (
+            {"dispatch": "push", "push_options": {"sc_pre_push": 1}},
+            "unknown push_options",
+        ),
+    ],
+)
+def test_public_dispatch_rejects_invalid_options(options, match):
+    with pytest.raises(ValueError, match=match):
+        layer.fused_ep_moe_v2(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            topk=6,
+            renormalize=True,
+            mesh=None,
+            capacity=128,
+            **options,
+        )
+
+
+def test_push_option_inventory_matches_the_public_wrapper():
+    """A new push keyword must be forwarded or exposed as an explicit option."""
+    from inspect import signature
+
+    from sglang_tpu.moe.pallas.fused_moe_v2.push import PUSH_OPTIONS, fused_ep_moe_push
+
+    options = signature(fused_ep_moe_push).parameters.keys()
+    forwarded = signature(layer.fused_ep_moe_v2).parameters.keys()
+    assert set(PUSH_OPTIONS) == options - forwarded
+
+
+@pytest.mark.parametrize(
+    "tokens,ep,generation,expected",
+    [
+        (288, 16, 7, True),
+        (289, 16, 7, False),
+        (288, 8, 7, False),
+        (288, 16, 6, False),
+        (288, 16, -1, False),
+    ],
+)
+def test_push_metadata_admission_checks_geometry_and_target(
+    monkeypatch, tokens, ep, generation, expected
+):
+    monkeypatch.setattr(fusion, "get_tpu_generation", lambda: generation)
+    i32 = jax.ShapeDtypeStruct((1,), jnp.int32)
+    gathered = SimpleNamespace(
+        topk=6, n_tokens=tokens * ep, local_blocks=i32, block_hist=i32
+    )
+    problem = routing.routing_problem(
+        gathered,
+        (i32,) * 4,
+        i32,
+        e_total=384,
+        ep=ep,
+        t_local=tokens,
+        block=host.routing_block(tokens, 6),
+        tile_m=128,
+        shard_stride=host.ragged_stride_bound(tokens * ep, 6, 384, 128),
+    )
+    assert (
+        fusion.admit("routing", problem, tokens=tokens, buckets=fusion.ROUTING_TOKENS)
+        is expected
+    )
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__]))
