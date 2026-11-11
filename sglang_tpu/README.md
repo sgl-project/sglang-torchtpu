@@ -293,10 +293,13 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
 - `--ring-degree` (non-causal, by K/V all-gather) on the splash backend, its
   default under ring; an automatic selection may give it to any layer that takes
   `torch_sdpa`. The built-in platform has no ring-capable backend.
-- Runtime patches applied at worker init (`multimodal_gen/worker.py`), with
-  the debt header: `rope.py` (RoPE without stride-2 lane access); worker init
-  also registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
-  `logaddexp`).
+- Runtime patches applied at worker init (`multimodal_gen/worker.py`), each with
+  the debt header: `rope.py` (RoPE without stride-2 lane access) and
+  `ministral3.py` (ERNIE-Image's prompt enhancer decodes with a static KV cache
+  in two compiled shapes and draws on the host from the top 64 logits, seeded
+  per request; the text encoder's causal and padding mask is built on the
+  host); worker init also registers srt's ATen fallbacks
+  (`patches._register_aten_fallbacks`, e.g. `logaddexp`).
 
 Gates that take the OOT arm, with the same outcome as the built-in platform:
 
