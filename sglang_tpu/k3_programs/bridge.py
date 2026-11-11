@@ -130,6 +130,97 @@ def _keyed_on_kernel_config(export_key: str | None) -> str | None:
     return f"{export_key}|config={config.key()}"
 
 
+# A torch op schema holds at most 64 arguments.
+TORCH_OP_ARGS = 64
+
+
+def _operand_runs(in_specs: tuple, donate_argnums: tuple[int, ...]) -> list[tuple[int, int]]:
+    """The operands' ``[start, end)`` runs, one per op argument.
+
+    Up to ``TORCH_OP_ARGS`` operands, one run each. Past it (Kimi-K3.1's steps
+    add the DSA weights and an index pool per MLA layer), each run of
+    neighbouring operands with the same partition spec and donation becomes one
+    ``Tensor[]`` argument: torch_tpu shards every element of a list argument
+    by its one spec and donates the whole list.
+    """
+    count = len(in_specs)
+    if count <= TORCH_OP_ARGS:
+        return [(i, i + 1) for i in range(count)]
+    donated = set(donate_argnums)
+    runs, start = [], 0
+    for i in range(1, count + 1):
+        if (
+            i == count
+            or in_specs[i] != in_specs[start]
+            or (i in donated) != (start in donated)
+        ):
+            runs.append((start, i))
+            start = i
+    if len(runs) > TORCH_OP_ARGS:
+        raise ValueError(
+            f"{count} operands form {len(runs)} runs; a torch op takes at most "
+            f"{TORCH_OP_ARGS} arguments"
+        )
+    return runs
+
+
+class _RunOp:
+    """A torch op whose arguments are operand runs, called with flat operands."""
+
+    def __init__(self, op: Any, runs: list[tuple[int, int]]) -> None:
+        self.op, self.runs = op, runs
+        # export_cache.prepare_distributed reads the registered JaxCallable.
+        self._init_fn = getattr(op, "_init_fn", None)
+
+    def __call__(self, *operands: Any) -> Any:
+        return self.op(
+            *(operands[s] if e - s == 1 else list(operands[s:e]) for s, e in self.runs)
+        )
+
+
+def _register(
+    name: str,
+    mesh: Mesh,
+    traced: Callable[..., Any],
+    in_specs: tuple,
+    out_specs: tuple,
+    donate_argnums: tuple[int, ...],
+    export_key: str | None,
+) -> Any:
+    """The torch custom op calling ``traced`` with the flat operands.
+
+    torch_tpu derives the op schema from annotated positional parameters, so
+    the wrapper spells out one ``jax.Array`` parameter per input -- or, past
+    torch's argument limit, one per run of operands (:func:`_operand_runs`).
+    """
+    runs = _operand_runs(in_specs, donate_argnums)
+    params = ", ".join(
+        f"a{i}: {'jax.Array' if e - s == 1 else 'list[jax.Array]'}"
+        for i, (s, e) in enumerate(runs)
+    )
+    call = ", ".join(
+        f"a{i}" if e - s == 1 else f"*a{i}" for i, (s, e) in enumerate(runs)
+    )
+    returns = ", ".join("jax.Array" for _ in out_specs)
+    namespace: dict[str, Any] = {"jax": jax, "_traced": traced}
+    exec(  # noqa: S102 -- fixed template, no external input
+        f"def op({params}) -> tuple[{returns}]:\n    return _traced({call})\n",
+        namespace,
+    )
+    donated = set(donate_argnums)
+    op = sharded_jax_op(
+        name,
+        namespace["op"],
+        mesh=mesh,
+        input_partition_specs=tuple(in_specs[s] for s, _ in runs),
+        output_partition_specs=out_specs,
+        donate_argnums=tuple(i for i, (s, _) in enumerate(runs) if s in donated)
+        or None,
+        configure_callable=export_cache.hook(_keyed_on_kernel_config(export_key)),
+    )
+    return op if len(runs) == len(in_specs) else _RunOp(op, runs)
+
+
 def register_op(
     name: str,
     mesh: Mesh,
@@ -141,36 +232,19 @@ def register_op(
 ) -> Any:
     """A torch custom op running ``shard_map(body)`` over ``mesh``.
 
-    torch_tpu derives the op schema from annotated positional parameters, so
-    the wrapper spells out one ``jax.Array`` parameter per input.
     ``export_key``: the static configuration ``body`` bakes into its trace,
     opting the op into the persistent export cache (``export_cache``).
     """
     mapped = jax.shard_map(
         body, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
     )
-    count = len(in_specs)
 
     def traced(*args):
         with spmd_safe_axis_index():
             return mapped(*args)
 
-    params = ", ".join(f"a{i}: jax.Array" for i in range(count))
-    call = ", ".join(f"a{i}" for i in range(count))
-    returns = ", ".join("jax.Array" for _ in out_specs)
-    namespace: dict[str, Any] = {"jax": jax, "_traced": traced}
-    exec(  # noqa: S102 -- fixed template, no external input
-        f"def op({params}) -> tuple[{returns}]:\n    return _traced({call})\n",
-        namespace,
-    )
-    return sharded_jax_op(
-        name,
-        namespace["op"],
-        mesh=mesh,
-        input_partition_specs=in_specs,
-        output_partition_specs=out_specs,
-        donate_argnums=donate_argnums or None,
-        configure_callable=export_cache.hook(_keyed_on_kernel_config(export_key)),
+    return _register(
+        name, mesh, traced, in_specs, out_specs, donate_argnums, export_key
     )
 
 
@@ -189,28 +263,13 @@ def register_global_op(
     its shard) and may call the kernels' own ``jit(shard_map(...))``
     programs; it is traced under ``spmd_safe_axis_index`` like :func:`register_op`.
     """
-    count = len(in_specs)
 
     def traced(*args):
         with spmd_safe_axis_index():
             return fn(*args)
 
-    params = ", ".join(f"a{i}: jax.Array" for i in range(count))
-    call = ", ".join(f"a{i}" for i in range(count))
-    returns = ", ".join("jax.Array" for _ in out_specs)
-    namespace: dict[str, Any] = {"jax": jax, "_traced": traced}
-    exec(  # noqa: S102 -- fixed template, no external input
-        f"def op({params}) -> tuple[{returns}]:\n    return _traced({call})\n",
-        namespace,
-    )
-    return sharded_jax_op(
-        name,
-        namespace["op"],
-        mesh=mesh,
-        input_partition_specs=in_specs,
-        output_partition_specs=out_specs,
-        donate_argnums=donate_argnums or None,
-        configure_callable=export_cache.hook(_keyed_on_kernel_config(export_key)),
+    return _register(
+        name, mesh, traced, in_specs, out_specs, donate_argnums, export_key
     )
 
 

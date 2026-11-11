@@ -647,6 +647,66 @@ class TestDecodeIndexer(CustomTestCase):
                 self.assertIn("OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:])
 
 
+class TestManyOperandOps(CustomTestCase):
+    """Kimi-K3.1's decode steps take more operands than a torch op schema holds (64):
+    neighbouring operands with one spec and donation become one ``Tensor[]`` argument."""
+
+    SCRIPT = r"""
+import os
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+import jax, numpy as np, torch
+from jax.sharding import Mesh, PartitionSpec as P
+from sglang_tpu.k3_programs import bridge
+
+mesh = Mesh(np.array(jax.devices("cpu")[:4]), ("x",))
+W, POOLS = 40, 50
+def body(*args):
+    acc = sum(a.sum() for a in args[:W])
+    return (args[-1] + acc, *(p + 1 for p in args[W:W + POOLS]))
+in_specs = (P("x"),) * (W + POOLS) + (P(),)
+donated = tuple(range(W, W + POOLS))
+op = bridge.register_op("pallas::k31_runs_check", mesh, body, in_specs,
+                        (P(),) + (P("x"),) * POOLS, donate_argnums=donated)
+assert op.runs == [(0, W), (W, W + POOLS), (W + POOLS, W + POOLS + 1)], op.runs
+assert str(op.op._schema).startswith("(Tensor[] a0, Tensor[] a1, Tensor a2)"), op.op._schema
+init = op._init_fn
+assert init.donate_argnums in ([1], (1,)), init.donate_argnums
+flat = [torch.zeros(2, 8)] * W + [torch.zeros(3, 8)] * POOLS + [torch.zeros(5)]
+grouped = [flat[s] if e - s == 1 else list(flat[s:e]) for s, e in op.runs]
+args, kwargs = init._get_jax_placeholders(*init._normalize_invocation_args(grouped, {}))
+with jax._src.config.export_ignore_forward_compatibility(True):
+    lowered = init.exported(*args, **kwargs)
+assert len(lowered.in_avals) == W + POOLS + 1 and lowered.in_avals[0].shape == (8, 8)
+assert len(lowered.out_avals) == POOLS + 1 and lowered.out_avals[1].shape == (12, 8)
+small = bridge.register_op("pallas::k31_runs_small", mesh, lambda a, b: (a + b,),
+                           (P("x"), P("x")), (P("x"),))
+assert not isinstance(small, bridge._RunOp)
+print("OK")
+"""
+
+    def test_operand_runs(self):
+        from sglang_tpu.k3_programs import bridge
+        from jax.sharding import PartitionSpec as P
+
+        specs = (P("x"),) * 3 + (P(),)
+        self.assertEqual(bridge._operand_runs(specs, (1,)), [(0, 1), (1, 2), (2, 3), (3, 4)])
+        many = (P("x"),) * 70 + (P(),)
+        self.assertEqual(
+            bridge._operand_runs(many, tuple(range(40, 70))), [(0, 40), (40, 70), (70, 71)]
+        )
+
+    def test_registers_and_traces_with_flat_operands(self):
+        import os
+        import subprocess
+        import sys
+
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), JAX_PLATFORMS="cpu")
+        result = subprocess.run(
+            [sys.executable, "-c", self.SCRIPT], capture_output=True, text=True, env=env, timeout=600
+        )
+        self.assertIn("OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:])
+
+
 class TestK31Draft(CustomTestCase):
     """Kimi-K3.1's DSpark draft (``Inferact/Kimi-K3.1-Pro-DSpark-preview``)
     in the MLA draft's config: three heads a rank, causal block rows, YaRN's

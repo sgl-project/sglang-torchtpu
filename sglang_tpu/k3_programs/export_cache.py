@@ -80,6 +80,8 @@ class _ExportCache:
                 signature.append(("static", repr(arg)))
             elif arg is None:
                 signature.append(None)
+            elif isinstance(arg, (list, tuple)):  # a Tensor[] argument (bridge._operand_runs)
+                signature.append(tuple((tuple(t.shape), str(t.dtype)) for t in arg))
             else:
                 signature.append((tuple(arg.shape), str(arg.dtype)))
         env = sorted(
