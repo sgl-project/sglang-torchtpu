@@ -5,6 +5,15 @@ No seam, model weights, server, or mesh required. CPU tests establish reference
 boundaries; only the hardware tests establish kernel numerical agreement. The
 kernel's tiny-row quantization policy intentionally differs from generic TPU
 linear's 1e-12 scale floor; test that discrepancy explicitly, not as equivalence.
+
+The original monolithic NumPy/dense-XLA oracle failed elementwise 1e-2 on
+TPU even where fused agreed with production (shape-dependent quantization/dot
+lowering). Keep host arithmetic for CPU boundary properties, not as a bitwise
+MXU oracle. Device reference stages materialize FP8 codes and BF16 projection
+separately, and pad decode to 16 rows, to preserve the production boundaries.
+Both the staged independent reference and actual production baseline are gated
+at unchanged 1e-2 tolerances; tiny rows are compared only to the kernel-policy
+reference, never advertised as generic-minfloor equivalent.
 """
 
 import importlib.util
