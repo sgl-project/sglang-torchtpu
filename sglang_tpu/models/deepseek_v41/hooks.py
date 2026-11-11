@@ -105,6 +105,16 @@ tpu_dsv41_engram_owned_rows
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TPU lowers float8_e8m0fnu to float32.
 
+tpu_dsv41_hasher_forward
+  Why: the extend path of EngramHasher.forward builds per-token request rows
+       with repeat_interleave over int64 lengths, which lowers to a while loop
+       on 64-bit counters that TPU lowering rejects.
+  How: AROUND EngramHasher.forward on non-CUDA extend computes the rows in
+       int32 as a compare-sum against request ends, then hashes and commits
+       history exactly as the original.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: TPU lowers 64-bit integer arithmetic.
+
 trace_tpu_env_default
   Why: EnvField._resolve_default calls callable(self.default) for lazily
        computed defaults (e.g. SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)),
@@ -294,12 +304,13 @@ def tpu_dsv41_torch_hash_ids(
         blocked[num_real:] = True
     if hasher.image_token_id is not None:
         tokens = tokens.masked_fill(tokens >= MM_PAD_SHIFT_VALUE, hasher.image_token_id)
-        blocked = (
-            (blocked | (tokens == hasher.image_token_id))
-            .to(i32)
-            .cummax(-1)
-            .values.bool()
-        )
+        # Cumulative OR over the n columns, unrolled: cummax lowers to a loop
+        # with a 64-bit counter.
+        stop = blocked | (tokens == hasher.image_token_id)
+        cols = [stop[:, 0]]
+        for k in range(1, n):
+            cols.append(cols[-1] | stop[:, k])
+        blocked = torch.stack(cols, dim=-1)
     hash_ids = compute_engram_hash_ids(
         tokens,
         blocked,
@@ -310,6 +321,60 @@ def tpu_dsv41_torch_hash_ids(
         hasher.offsets,
     )
     return hash_ids, tokens
+
+
+def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
+    """EngramHasher.forward for TPU extend with int32 request rows.
+
+    The original builds token rows with repeat_interleave over int64 lengths,
+    which lowers to a loop of 64-bit counters; rows here are a compare-sum
+    against each request's end (requests are contiguous in extend_start_loc).
+    """
+    num_tokens = input_ids.shape[0]
+    if (
+        input_ids.is_cuda
+        or num_tokens == 0
+        or not forward_batch.forward_mode.is_extend()
+    ):
+        return original(hasher, input_ids, forward_batch)
+    from sglang.kernels.ops.embeddings.engram_hash import MODE_EXTEND
+
+    i32 = torch.int32
+    n = hasher.max_ngram_size
+    req_slots = forward_batch.req_pool_indices
+    bs = req_slots.shape[0]
+    lens = forward_batch.extend_seq_lens.to(i32)
+    starts = forward_batch.extend_start_loc.to(i32)
+    lens_cpu = forward_batch.extend_seq_lens_cpu
+    num_real = sum(lens_cpu) if lens_cpu is not None else int(lens.sum())
+    ends = starts + lens
+    t = torch.arange(num_real, device=input_ids.device, dtype=i32)
+    row = (t.unsqueeze(-1) >= ends.unsqueeze(0)).sum(-1).clamp(max=bs - 1).to(i32)
+    if forward_batch.engram_history is not None:
+        history = forward_batch.engram_history
+    else:
+        history = hasher.history[req_slots]
+    hash_ids, tokens = hasher._torch_hash_ids(
+        input_ids,
+        forward_batch.positions,
+        MODE_EXTEND,
+        history,
+        num_real,
+        1,
+        row,
+        starts,
+    )
+    commit_rows = torch.where(lens > 0, req_slots.to(i32), hasher.pad_row)
+    commit_last = (ends - 1).clamp(0, num_tokens - 1)
+    out_loc = forward_batch.out_cache_loc
+    if out_loc is not None:
+        commit_rows = torch.where(
+            out_loc[commit_last] == 0, hasher.pad_row, commit_rows
+        )
+    hasher.history[commit_rows] = (
+        tokens[commit_last][:, : n - 1].flip(-1).to(hasher.history.dtype)
+    )
+    return hash_ids
 
 
 _INT32_BATCH_FIELDS = ("input_ids", "positions", "req_pool_indices")
@@ -416,6 +481,11 @@ def hook_specs():
         (
             "sglang_tpu.compilation.compiled_forward_shim.CompiledForwardShim._forward",
             tpu_dsv41_int32_graph_inputs,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.engram.EngramHasher.forward",
+            tpu_dsv41_hasher_forward,
             HookType.AROUND,
         ),
         (
