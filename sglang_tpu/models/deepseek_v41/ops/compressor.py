@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unconnected, mesh-free ratio-1 compressor CPU-export building block."""
+"""Mesh-free ratio-1 compressor CPU-export operator for the TPU backend."""
 
 import math
 from threading import Lock
@@ -87,8 +87,9 @@ def compress_rope(x, weight, gamma, cos_sin, positions, valid, eps=1e-6):
 
     No state or donation. Invalid rows emit zero latent/words and the encoder's
     ordinary zero-row scale (1e-4/448). Positions clamp inside JAX, including
-    invalid rows. Gamma is the original frozen norm tensor, never downcast.
-    This building block does not enable model dispatch or claim TPU validation.
+    invalid rows. Gamma is a detached alias of the original norm tensor, never
+    downcast. The backend publishes encoded outputs without another RoPE or
+    quantization; the pre-RoPE latent remains available to the indexer.
     """
     if not isinstance(eps, (float, int)) or not math.isfinite(eps) or eps <= 0:
         raise ValueError("eps must be positive and finite")

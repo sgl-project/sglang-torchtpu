@@ -378,34 +378,6 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         return total
 
-    @staticmethod
-    def c2_state_fixed_bytes(
-        *, num_req_slots: int, ring_size: int, attn_head_dim: int, num_c2_layers: int
-    ) -> int:
-        """Core ratio-2 pair-state pools (_make_pair_state_pool): `slots * ring +
-        ring + 1` fp32 (kv, score) rows padded to 2, per ratio-2 kv_source layer."""
-        if num_c2_layers == 0:
-            return 0
-        rows = ceil_div(num_req_slots * ring_size + ring_size + 1, 2) * 2
-        return rows * 2 * attn_head_dim * torch.float32.itemsize * num_c2_layers
-
-    @staticmethod
-    def kv_buffer_bytes(
-        *,
-        full_size: int,
-        swa_size: int,
-        num_layers: int,
-        sources_by_ratio: Mapping[int, Sequence[int]],
-    ) -> int:
-        """Exact SWA + main KV + indexer K bytes this pool allocates (no state)."""
-        total = num_swa_pages64(swa_size) * SWA_PAGE_TOKENS * SWA_BYTES_PER_TOKEN
-        total *= num_layers
-        for ratio, sources in sources_by_ratio.items():
-            main = num_main_records(full_size, ratio) * MAIN_BYTES_PER_RECORD
-            index = num_index_pages(full_size, ratio) * PAGE_ROWS * WORD_LANES * 4
-            total += (main + index) * len(sources)
-        return total
-
     def get_kv_size_bytes(self) -> Tuple[int, int]:
         pools = [self.swa_kv_pool, *self.kv_pools.values(), *self.index_pools.values()]
         total = sum(pool.get_kv_size_bytes()[0] for pool in pools if pool is not None)

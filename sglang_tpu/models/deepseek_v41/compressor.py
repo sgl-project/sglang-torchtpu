@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Model-owned ratio-1 adapters. Binding does not wire or enable execution."""
+"""Model-owned ratio-1 adapters consumed by the TPU attention backend."""
 
+import logging
 import math
 from dataclasses import dataclass
 
 import torch
 
 from sglang_tpu.models.deepseek_v41.preprocess import _is_mqa
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, eq=False)
@@ -89,10 +92,18 @@ def prepare_compressor_adapter(module: torch.nn.Module) -> PreparedCompressor | 
 def bind_model_compressor(model: torch.nn.Module) -> int:
     """Refresh _dsv41_compressor after loading; leave core/state/dispatch alone."""
     count = 0
-    for module in model.modules():
+    for name, module in model.named_modules():
         if not _is_mqa(module):
             continue
-        prepared = prepare_compressor_adapter(module)
+        reason = compressor_eligibility_reason(module)
+        prepared = prepare_compressor_adapter(module) if reason is None else None
         module._dsv41_compressor = prepared
         count += prepared is not None
+        outcome = (
+            reason or "bound ratio-1 BF16 compressor + RoPE + encode (5 MiB transpose)"
+        )
+        if getattr(module, "_dsv41_compressor_bind_outcome", None) != outcome:
+            logger.info("DeepSeek-V4.1 compressor %s: %s", name or "<root>", outcome)
+            module._dsv41_compressor_bind_outcome = outcome
+    logger.info("DeepSeek-V4.1 compressor bound %d ratio-1 adapters", count)
     return count
