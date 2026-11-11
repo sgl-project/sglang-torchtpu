@@ -157,8 +157,12 @@ class TestMuseMegakernelConfig(CustomTestCase):
                     )
                     self.assertEqual(cfg.row_tile, 16)
                     self.assertEqual(cfg.rows % 16, 0)
-                    if cfg.rows <= 128:
+                    if cfg.rows < 128:
                         self.assertTrue(cfg.fold_f and cfg.fold_o)
+                    else:
+                        # 48 MiB budget at 128 rows: a 3-slot ring, no stream depth for folds.
+                        self.assertEqual((cfg.expert_depth, cfg.ring_slots), (3, 3))
+                        self.assertFalse(cfg.fold_f or cfg.fold_o)
                     if cfg.fold_f or cfg.fold_o:
                         self.assertTrue(K.fold_fits(cfg))
                     self.assertEqual(cfg.sal_fp8_dot, 0)  # env default; recipes set 2
@@ -166,7 +170,11 @@ class TestMuseMegakernelConfig(CustomTestCase):
                         ops._TILED_VY2_VMEM_BUDGET
                         if cfg.tiled_vmem_y >= 2
                         else (
-                            ops._TILED_VPADS_VMEM_BUDGET
+                            (
+                                ops._TILED_VPADS_SMALL_VMEM_BUDGET
+                                if cfg.rows <= 128
+                                else ops._TILED_VPADS_VMEM_BUDGET
+                            )
                             if cfg.tiled_vmem_pads
                             else ops._SCRATCH_VMEM_BUDGET
                         )

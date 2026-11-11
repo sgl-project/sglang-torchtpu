@@ -407,7 +407,8 @@ class TestKernelBlockSizes(CustomTestCase):
         from sglang_tpu.attention.pallas.batched_rpa import configs
 
         shrunk = 0
-        for vmem_mib in range(30, 46):
+        # Two buffers at least: a one-page k block fits from 70 MiB on.
+        for vmem_mib in range(60, 110, 2):
             try:
                 _, prefill = self._block_sizes(
                     page_size=1024,
@@ -419,7 +420,8 @@ class TestKernelBlockSizes(CustomTestCase):
             except ValueError:
                 continue
             self.assertGreater(prefill.bq_sz, 1, f"{vmem_mib} MiB")
-            shrunk += prefill.bq_sz < 256
+            # The searched q block starts at total_q_tokens (16), rounded to a power of 2.
+            shrunk += prefill.bq_sz < 16
         self.assertGreater(shrunk, 0)  # some budget must exercise the shrinking
 
     def test_explicit_partial_page_k_block_is_refused(self):
@@ -455,7 +457,7 @@ class TestKernelBlockSizes(CustomTestCase):
             kv_lens=jnp.zeros((num_seqs,), jnp.int32),
             page_indices=jnp.zeros((num_seqs * pages_per_seq,), jnp.int32),
             cu_q_lens=jnp.arange(num_seqs + 1, dtype=jnp.int32),
-            distribution=jnp.asarray([num_seqs] * 3, jnp.int32),
+            distribution=jnp.asarray([0, 0, num_seqs], jnp.int32),
         )
 
         def validate(bkv_sz, mode):
@@ -487,7 +489,7 @@ class TestKernelBlockSizes(CustomTestCase):
         from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
         from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
-        page_size, num_seqs, pages_per_seq, vmem_limit_bytes = 256, 4, 2, 1 << 20
+        page_size, num_seqs, pages_per_seq, vmem_limit_bytes = 256, 4, 2, 1 << 18
         with self.assertRaises(ValueError):
             self._block_sizes(
                 page_size=page_size,
@@ -522,23 +524,29 @@ class TestKernelBlockSizes(CustomTestCase):
                 jax.ShapeDtypeStruct((3,), jnp.int32),
             )
 
-    def test_budget_below_one_lane_and_one_buffer_is_refused(self):
-        """A VMEM budget too small for one lane and one buffer is refused, not
-        answered with a buffer count below one."""
+    def test_budget_below_one_lane_and_two_buffers_is_refused(self):
+        """A VMEM budget too small for one lane and two buffers is refused, not
+        answered with a buffer count below two."""
         import jax.numpy as jnp
 
-        from sglang_tpu.attention.pallas.batched_rpa import configs
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
 
-        for vmem_limit_bytes in (1 << 18, 1 << 19, 1 << 20, 1 << 21):
+        def block_sizes(vmem_limit_bytes):
+            return self._block_sizes(
+                page_size=256,
+                kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+                dtype_kv=jnp.float8_e4m3fn,
+                geometry=(4, 1, 128, None),
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+
+        for vmem_limit_bytes in (1 << 18, 1 << 19, 1 << 20):
             with self.subTest(vmem_limit_bytes=vmem_limit_bytes):
                 with self.assertRaises(ValueError):
-                    self._block_sizes(
-                        page_size=256,
-                        kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
-                        dtype_kv=jnp.float8_e4m3fn,
-                        geometry=(4, 1, 128, None),
-                        vmem_limit_bytes=vmem_limit_bytes,
-                    )
+                    block_sizes(vmem_limit_bytes)
+        # 2 MiB fits once the prefill search halves its q block; still two buffers.
+        for blocks in block_sizes(1 << 21):
+            self.assertGreaterEqual(blocks.n_buffer, wrapper._MIN_N_BUFFER)
 
 
 if __name__ == "__main__":
