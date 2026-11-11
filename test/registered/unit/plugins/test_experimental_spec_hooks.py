@@ -1790,6 +1790,24 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 "built-in",
             )
 
+    def test_block_policy_reads_the_width_the_drafter_published(self):
+        """A draft that is not a dense DFlash-family model (a plain nn.Module such
+        as the V4.1 MoE draft) gets its block width from the drafter; without one
+        the policy still refuses it instead of guessing."""
+        from torch import nn
+
+        from sglang_tpu.experimental.compilation.block_compile_policy import (
+            TpuBlockSpecDecodeCompilePolicyMixin,
+        )
+
+        policy = object.__new__(TpuBlockSpecDecodeCompilePolicyMixin)
+        policy.model_runner = SimpleNamespace(model=nn.Module())
+        policy.draft_token_num = 6
+        with self.assertRaises(TypeError):
+            policy.draft_block_width
+        policy._draft_block_width = 5
+        self.assertEqual(policy.draft_block_width, 5)
+
 
 if __name__ == "__main__":
     unittest.main()
