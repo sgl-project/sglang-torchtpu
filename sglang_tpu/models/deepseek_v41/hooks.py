@@ -15,6 +15,15 @@ get_tpu_dsv41_bytes_per_full_token
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: KVCacheConfigurator and DSV4PoolConfigurator query
        current_platform for the DSV4 pool class and its byte sizing.
+
+select_tpu_dsv41_loader
+  Why: RunaiModelStreamerLoader reads every routed expert on every rank; under
+       EP8 each rank keeps 1/8 of them, so startup reads ~8x the bytes it needs.
+       The loader has no model-owned tensor selection seam.
+  How: AFTER get_model_loader swaps in DSV41RunaiModelStreamerLoader for the
+       V4.1 target only; it inherits construction, loading and postprocessing.
+  Upstream PR or issue: not filed (forked from sgl-project/sglang-torchtpu#1744).
+  Remove when: the core loader accepts a model-owned checkpoint tensor filter.
 """
 
 from __future__ import annotations
@@ -30,6 +39,22 @@ def _pool_hooks():
     )
 
 
+def select_tpu_dsv41_loader(result, load_config, model_config=None):
+    from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
+
+    config = getattr(model_config, "hf_config", None)
+    if (
+        type(result) is not RunaiModelStreamerLoader
+        or getattr(config, "model_type", None) != "deepseek_v41"
+        or getattr(model_config, "is_draft_model", False)
+        or load_config.draft_model_idx is not None
+    ):
+        return result
+    from sglang_tpu.models.deepseek_v41.loader import DSV41RunaiModelStreamerLoader
+
+    return DSV41RunaiModelStreamerLoader(load_config, model_config)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -40,4 +65,9 @@ def hook_specs():
         (f"{kvc}._build_dsv4_kv_pool", build_pool, HookType.AROUND),
         (f"{cfg}._get_bytes_per_swa_token", swa_bytes, HookType.AROUND),
         (f"{cfg}._get_bytes_per_full_token", full_bytes, HookType.AROUND),
+        (
+            "sglang.srt.model_loader.loader.get_model_loader",
+            select_tpu_dsv41_loader,
+            HookType.AFTER,
+        ),
     ]
