@@ -28,12 +28,13 @@ intermediate never leaves VMEM.
 """
 
 import functools
-import re
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from sglang_tpu.pallas_export import get_tpu_generation
 
 _FP8_MAX = 448.0
 
@@ -44,13 +45,6 @@ _FP8_MAX = 448.0
 SHARED_EXPERT_TUNING = {
     (7, 288, 5120, 2304): (256, 1024, 3, 2, 32, 56 * 1024**2),
 }
-
-
-def get_tpu_version() -> int:
-    """The numeric version of JAX's first device, or -1 if it is not a TPU."""
-    kind = jax.devices()[0].device_kind
-    match = re.match(r"^TPU[^\d]*(\d+)", kind)
-    return -1 if match is None else int(match.group(1))
 
 
 def _get_max_min(target_dtype):
@@ -124,7 +118,7 @@ def is_supported(
         and w2.dtype == jnp.float8_e4m3fn
         and s13.dtype == jnp.float32
         and s2.dtype == jnp.float32
-        and (get_tpu_version(), t, k, inter) in SHARED_EXPERT_TUNING
+        and (get_tpu_generation(), t, k, inter) in SHARED_EXPERT_TUNING
     )
 
 
@@ -339,7 +333,7 @@ def fused_shared_expert(
     t, k = x.shape
     inter = w2.shape[0]
     if tuning is None:
-        tuning = SHARED_EXPERT_TUNING[(get_tpu_version(), t, k, inter)]
+        tuning = SHARED_EXPERT_TUNING[(get_tpu_generation(), t, k, inter)]
     width, down_width, depth, split, quant_rows, vmem_budget = tuning
     if inter % width or k % down_width or inter % split or k % split:
         raise ValueError(f"{tuning=} does not tile {inter=} / {k=}")

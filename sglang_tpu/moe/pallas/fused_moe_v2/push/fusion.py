@@ -14,8 +14,6 @@ reason; a count above the largest bucket is a prefill-sized call and falls
 back silently.
 """
 
-import re
-
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -23,6 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu._logging import get_logger
+from sglang_tpu.pallas_export import get_tpu_generation
 
 logger = get_logger(__name__)
 
@@ -34,20 +33,14 @@ MEASURED_TPU_VERSION = 7
 _reported: set[tuple[str, str]] = set()
 
 
-def get_tpu_version() -> int:
-    """The numeric version of JAX's first device, or -1 if it is not a TPU."""
-    kind = jax.devices()[0].device_kind
-    match = re.match(r"^TPU[^\d]*(\d+)", kind)
-    return -1 if match is None else int(match.group(1))
-
-
 def admit(region: str, problem: str | None, *, tokens: int, buckets: frozenset) -> bool:
     """Whether ``region`` takes its fused path.
 
     ``problem`` names a violated layout contract; ``tokens`` is checked
-    against ``buckets``. Interpret and CPU runs always take the native path.
+    against ``buckets``. An untargeted CPU/GPU run takes the native path;
+    CPU TPU export may fuse.
     """
-    if jax.default_backend() != "tpu":
+    if get_tpu_generation() < 0:
         return False
     if problem is None and tokens not in buckets:
         if tokens > max(buckets):
@@ -68,9 +61,9 @@ def first_problem(*checks: tuple[bool, str]) -> str | None:
 
 def tpu_version_problem(version: int = MEASURED_TPU_VERSION) -> str | None:
     """Buckets were measured on one TPU generation; others keep native paths."""
-    if jax.default_backend() != "tpu":
-        return None  # `admit` reports the backend itself, silently
-    actual = get_tpu_version()
+    actual = get_tpu_generation()
+    if actual < 0:
+        return None  # `admit` rejects an untargeted CPU/GPU silently.
     return None if actual == version else f"TPU v{actual} (measured on v{version})"
 
 

@@ -71,13 +71,20 @@ from sglang_tpu.moe.pallas.fused_moe_v2.host import (
     weight_form,
     weight_format_of_dtype,
 )
-from sglang_tpu.moe.pallas.fused_moe_v2.kernel import combine_step_tokens, rowquant_fp8
+from sglang_tpu.moe.pallas.fused_moe_v2.kernel import (
+    build_combine_kernel,
+    combine_step_tokens,
+    rowquant_fp8,
+)
 from sglang_tpu.moe.pallas.fused_moe_v2.layer import (
     SCORING_FNS,
     _apply_scoring_fn,
     _combine_arrivals,
+    _exchange_layout,
+    _pack_routing_exchange,
     _relabel_expert_ids_to_mesh_order,
     _row_routes,
+    _to_slots,
     _unpack_routing_exchange,
     _unpermute_load_to_ep_rank_order,
 )
@@ -90,10 +97,7 @@ from sglang_tpu.moe.pallas.fused_moe_v2.push.host import (
     routing_pairs_from_tables,
     run_tables,
 )
-from sglang_tpu.moe.pallas.fused_moe_v2.push.kernel import (
-    build_combine_fs_kernel,
-    build_push_moe_kernel,
-)
+from sglang_tpu.moe.pallas.fused_moe_v2.push.kernel import build_push_moe_kernel
 from sglang_tpu.moe.pallas.fused_moe_v2.push.plan_kernel import (
     build_exchange_rows_tables,
     build_push_tables,
@@ -123,44 +127,17 @@ def _warn_sc_prepush_clamped(n_pre, g_local):
     )
 
 
-# The routing payload is padded to whole lane blocks: an unaligned payload
-# (e.g. 192 experts) is lowered as an all-reduce, ~3x slower than the
-# all-gather an aligned one gets.
-EXCHANGE_WIDTH_ALIGN = 128
 # light_prepush applies from this many local slots up: the heavy experts it
 # takes off the pre-push need visits to arrive in (at DP16 the 9-slot kernel
 # lost ~20 us a call with it while the 25-slot kernel held its time).
 LIGHT_PREPUSH_MIN_SLOTS = 16
 
 
-def _exchange_layout(t_local, topk, e_total, quantized):
-    """(scale offset, count offset, width) of the flat routing payload: v2's
-    layout with the width padded to EXCHANGE_WIDTH_ALIGN."""
-    idx = align_up(t_local * topk, HIDDEN_LANE_BLOCK)
-    scale = align_up(t_local, HIDDEN_LANE_BLOCK) if quantized else 0
-    return idx, idx + scale, align_up(idx + scale + e_total, EXCHANGE_WIDTH_ALIGN)
-
-
-def _pack_routing_exchange(pairs, scale_bits, counts, layout):
-    """The flat i32 payload: pairs [t*K], row-scale bits [t], counts [E],
-    zero-padded to the layout's width."""
-    scale_at, count_at, width = layout
-    parts = [pairs, jnp.zeros((scale_at - pairs.size,), jnp.int32)]
-    if scale_bits is not None:
-        parts += [
-            scale_bits,
-            jnp.zeros((count_at - scale_at - scale_bits.size,), jnp.int32),
-        ]
-    parts.append(counts)
-    parts.append(jnp.zeros((width - count_at - counts.size,), jnp.int32))
-    return jnp.concatenate([p for p in parts if p.size])
-
-
 def _combine_arrivals_fs(
     arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
 ):
     """v2's `_combine_arrivals`, with the arrival-scale lookup done inside the
-    combine kernel (see kernel._build_combine_fs_kernel) where that kernel
+    combine kernel (see kernel._build_combine_kernel) where that kernel
     applies; v2's XLA epilogue everywhere else."""
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
@@ -173,7 +150,8 @@ def _combine_arrivals_fs(
     # Neither position is ever negative.
     rows = jnp.minimum(pos, recv_rows - 1)
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
-    combine = build_combine_fs_kernel(
+    combine = build_combine_kernel(
+        fuse_scales=True,
         t_local=t_local,
         topk=topk,
         hidden=lane_blocks * lanes,
@@ -182,40 +160,6 @@ def _combine_arrivals_fs(
         out_dtype=out_dtype,
     )
     return combine(arrivals, arrival_scales, scl, topk_weights, rows)
-
-
-def _to_slots(topk_idx, expert_slot, row_base, *, onehot=False):
-    """Selected global ids [rows, K] -> slots under an [experts, R] table.
-
-    Row r's selection of e takes replica (row_base + r) mod (replicas of e),
-    so a replicated expert's rows split evenly over its copies within every
-    step. Positions are kept, so the k combine terms keep their order.
-
-    `onehot` reads the selected expert's table row through one one-hot
-    matmul instead of two gathers: XLA offloads a small gather to the
-    SparseCore and the TensorCore waits for it, while this is one small dot.
-    Same values: each output is one table entry (< 2**24) times 1.0 at
-    HIGHEST precision.
-    """
-    experts, replicas = expert_slot.shape
-    n_rep = jnp.sum(expert_slot >= 0, axis=1, dtype=jnp.int32)
-    e = jnp.clip(topk_idx, 0, experts - 1)
-    token = row_base + lax.broadcasted_iota(jnp.int32, topk_idx.shape, 0)
-    if not onehot:
-        replica = lax.rem(token, jnp.take(n_rep, e, axis=0))
-        flat = e * replicas + replica
-        return jnp.take(expert_slot.reshape(-1), flat, axis=0)
-    hit = (e.reshape(-1, 1) == jnp.arange(experts, dtype=jnp.int32)).astype(jnp.float32)
-    rows = jnp.concatenate([n_rep[:, None], expert_slot], axis=1).astype(jnp.float32)
-    picked = jnp.dot(hit, rows, precision=lax.Precision.HIGHEST).astype(jnp.int32)
-    replica = lax.rem(token.reshape(-1), picked[:, 0])
-    slot = jnp.sum(
-        jnp.where(
-            replica[:, None] == jnp.arange(replicas, dtype=jnp.int32), picked[:, 1:], 0
-        ),
-        axis=1,
-    )
-    return slot.reshape(topk_idx.shape).astype(jnp.int32)
 
 
 def _repeat_bits(bits, repeats):
@@ -343,11 +287,11 @@ def fused_ep_moe_push(
     lets the scale-slab scatter run under the in-op shared expert (1: not
     held behind it; 2: nor behind the SparseCore pre-push).
     `fused_ep_moe_v2(dispatch="push")` forwards them from its
-    `push_options`; the serving caller picks them.
+    `push_options`; the model caller picks them explicitly.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
-    replicated, optional) are the expert-layout operands dynamic EPLB
-    (vLLM-TorchTPU #2523) passes. With `expert_slot`, the weights' expert axis is in
+    replicated, optional) describe static placement and its routed-row counts.
+    This kernel does not choose or update a layout. With `expert_slot`, the weights' expert axis is in
     physical slot order (e_total slots over the mesh) while gating and
     score_bias stay per logical expert: selection runs on logical ids, then
     each selected id e maps to slot expert_slot[e, (global row) mod

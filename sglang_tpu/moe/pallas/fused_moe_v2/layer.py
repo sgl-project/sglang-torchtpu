@@ -276,22 +276,40 @@ def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total):
     return pairs, scale_bits, counts
 
 
-def _to_slots(topk_idx, expert_slot, row_base):
+def _to_slots(topk_idx, expert_slot, row_base, *, onehot=False):
     """Selected global ids [rows, K] -> slots under an [experts, R] table.
 
     Row r's selection of e takes replica (row_base + r) mod (replicas of e),
     so a replicated expert's rows split evenly over its copies within every
     step. Positions are kept, so the k combine terms keep their order.
+
+    `onehot` reads the selected expert's table row through one one-hot
+    matmul instead of two gathers: XLA offloads a small gather to the
+    SparseCore and the TensorCore waits for it, while this is one small dot.
+    Same values: each output is one table entry (< 2**24) times 1.0 at
+    HIGHEST precision.
     """
+    experts, replicas = expert_slot.shape
     n_rep = jnp.sum(expert_slot >= 0, axis=1, dtype=jnp.int32)
-    e = jnp.clip(topk_idx, 0, expert_slot.shape[0] - 1)
+    e = jnp.clip(topk_idx, 0, experts - 1)
     token = row_base + lax.broadcasted_iota(jnp.int32, topk_idx.shape, 0)
-    # TODO(Wenqin): Modulo replica selection suits flat all-to-all fabrics
-    # (e.g., NVLink), but on TPU it ignores ICI topology and local-rank
-    # locality; explore topology-aware replica routing later.
-    replica = lax.rem(token, jnp.take(n_rep, e, axis=0))
-    flat = e * expert_slot.shape[1] + replica
-    return jnp.take(expert_slot.reshape(-1), flat, axis=0)
+    # Replica selection balances token rows, not ICI distance or local-rank
+    # locality; placement remains the caller's responsibility.
+    if not onehot:
+        replica = lax.rem(token, jnp.take(n_rep, e, axis=0))
+        flat = e * replicas + replica
+        return jnp.take(expert_slot.reshape(-1), flat, axis=0)
+    hit = (e.reshape(-1, 1) == jnp.arange(experts, dtype=jnp.int32)).astype(jnp.float32)
+    rows = jnp.concatenate([n_rep[:, None], expert_slot], axis=1).astype(jnp.float32)
+    picked = jnp.dot(hit, rows, precision=lax.Precision.HIGHEST).astype(jnp.int32)
+    replica = lax.rem(token.reshape(-1), picked[:, 0])
+    slot = jnp.sum(
+        jnp.where(
+            replica[:, None] == jnp.arange(replicas, dtype=jnp.int32), picked[:, 1:], 0
+        ),
+        axis=1,
+    )
+    return slot.reshape(topk_idx.shape).astype(jnp.int32)
 
 
 def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
@@ -524,6 +542,9 @@ def fused_ep_moe_v2(
     shared_expert (w13, s13, w2, s2), replicated per-channel FP8, with
     shared_limit computes the layer's shared expert inside the op
     (sglang_tpu/fp8_swiglu_mlp.py); the result is then returned last.
+    Parameters are explicit: this kernel does not read process environment
+    variables or choose the model's expert layout. See README.md for the
+    model-side placement, masking, accumulator and shared-output contract.
     Push's fused routing metadata was measured only for (topk, experts, ep,
     tile_m) == push.routing.ROUTING_GEOMETRY on v7 at the per-shard token
     counts in push.fusion.ROUTING_TOKENS; every other shape builds the same

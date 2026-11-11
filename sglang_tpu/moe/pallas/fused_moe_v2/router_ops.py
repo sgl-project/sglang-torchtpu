@@ -32,12 +32,12 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu._logging import get_logger
 from sglang_tpu.moe.pallas.fused_moe_v2.tuned_block_sizes import (
     NORMALIZED_ROUTER_BLOCK_ROWS,
 )
+from sglang_tpu.pallas_export import get_tpu_info_or_none
 
 logger = get_logger(__name__)
 
@@ -67,10 +67,12 @@ def normalized_router_block_rows(
         or not has_bias
         or has_hash
         or gate.dtype not in (jnp.bfloat16, jnp.float32)
-        or jax.default_backend() != "tpu"
     ):
         return None
-    key = (pltpu.get_tpu_info().chip_version, *gate.shape, topk)
+    info = get_tpu_info_or_none()
+    if info is None:
+        return None
+    key = (info.chip_version, *gate.shape, topk)
     block_rows = NORMALIZED_ROUTER_BLOCK_ROWS.get(key)
     if block_rows is None:
         _warn_no_normalized_tile(key)

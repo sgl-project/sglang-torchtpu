@@ -38,6 +38,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.moe.pallas.fused_moe_v2 import router_ops
 
@@ -356,8 +357,8 @@ def test_packed_top6_normalizes_unbiased_weights(case):
         {"has_bias": False},
         {"has_hash": True},
         {"dtype": jnp.float16},
-        {"backend": "cpu"},
-        {"chip": router_ops.pltpu.ChipVersion.TPU_V6E},
+        {"chip": None},
+        {"chip": pltpu.ChipVersion.TPU_V6E},
     ],
 )
 @pytest.mark.cpu_test
@@ -375,15 +376,17 @@ def test_normalized_router_only_uses_measured_envelope(monkeypatch, change):
         has_bias=True,
         has_hash=False,
         dtype=jnp.bfloat16,
-        backend="tpu",
-        chip=router_ops.pltpu.ChipVersion.TPU_7X,
+        chip=pltpu.ChipVersion.TPU_7X,
     )
     config.update(change)
-    monkeypatch.setattr(router_ops.jax, "default_backend", lambda: config["backend"])
     monkeypatch.setattr(
-        router_ops.pltpu,
-        "get_tpu_info",
-        lambda: SimpleNamespace(chip_version=config["chip"]),
+        router_ops,
+        "get_tpu_info_or_none",
+        lambda: (
+            None
+            if config["chip"] is None
+            else SimpleNamespace(chip_version=config["chip"])
+        ),
     )
     monkeypatch.setattr(router_ops, "logger", Mock())
     gate = jax.ShapeDtypeStruct((config["rows"], config["experts"]), config["dtype"])
@@ -396,6 +399,25 @@ def test_normalized_router_only_uses_measured_envelope(monkeypatch, change):
         has_hash=config["has_hash"],
     )
     assert tile == (None if change else 288)
+
+
+@pytest.mark.cpu_test
+def test_normalized_router_uses_cpu_export_target(monkeypatch):
+    from sglang_tpu import pallas_export
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    gate = jax.ShapeDtypeStruct((288, 384), jnp.float32)
+    kwargs = dict(
+        topk=6,
+        scoring_fn="sqrtsoftplus",
+        renormalize=True,
+        has_bias=True,
+        has_hash=False,
+    )
+    for target, expected in (("TPU7x", 288), ("TPU v6 lite", None)):
+        monkeypatch.setattr(pallas_export, "get_pallas_tpu_device_kind", lambda: target)
+        with pallas_export.tpu_info_for_cpu_export():
+            assert router_ops.normalized_router_block_rows(gate, **kwargs) == expected
 
 
 @pytest.mark.parametrize("topk,block_rows", [(3, 288), (6, 32)])
@@ -428,14 +450,12 @@ def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(
 ):
     """Exercise production wiring without running experts or TPU collectives."""
     import functools
-    from unittest.mock import Mock, patch
+    from unittest.mock import Mock
 
     from sglang_tpu.moe.pallas.fused_moe_v2 import host, kernel, layer
 
-    info = router_ops.pltpu.get_tpu_info_for_chip(
-        router_ops.pltpu.ChipVersion.TPU_7X, 1
-    )
-    monkeypatch.setattr(router_ops.pltpu, "get_tpu_info", lambda: info)
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
     monkeypatch.setattr(kernel, "logger", Mock())
     monkeypatch.setattr(
         layer,
@@ -489,8 +509,7 @@ def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(
         selected_tiles = []
 
         def production_tile(gate, **kwargs):
-            with patch.object(router_ops.jax, "default_backend", return_value="tpu"):
-                tile = router_ops.normalized_router_block_rows(gate, **kwargs)
+            tile = router_ops.normalized_router_block_rows(gate, **kwargs)
             selected_tiles.append(tile)
             return tile
 
@@ -565,10 +584,7 @@ def test_packed_top6_tpu_lowering_matches_numpy():
     """Run the normalized selector through Mosaic on one supported device."""
     if jax.default_backend() != "tpu":
         pytest.skip("requires a TPU7x device")
-    if (
-        router_ops.pltpu.get_tpu_info().chip_version
-        != router_ops.pltpu.ChipVersion.TPU_7X
-    ):
+    if pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X:
         pytest.skip("normalized selector is calibrated on TPU7x")
     rng = np.random.default_rng(42)
     raw = rng.random((288, 384), dtype=np.float32)

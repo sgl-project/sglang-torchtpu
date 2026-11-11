@@ -58,17 +58,31 @@ def _abstract(tokens=288, hidden=HIDDEN, inter=INTER):
 @pytest.mark.parametrize("tokens,expected", [(288, True), (240, False), (2048, False)])
 @pytest.mark.parametrize("generation", [-1, 6, 7])
 def test_envelope(monkeypatch, tokens, expected, generation):
-    monkeypatch.setattr(se, "get_tpu_version", lambda: generation)
+    monkeypatch.setattr(se, "get_tpu_generation", lambda: generation)
     assert se.is_supported(*_abstract(tokens)) is (expected and generation == 7)
 
 
 @pytest.mark.cpu_test
 def test_envelope_rejects_other_dims(monkeypatch):
-    monkeypatch.setattr(se, "get_tpu_version", lambda: 7)
+    monkeypatch.setattr(se, "get_tpu_generation", lambda: 7)
     assert not se.is_supported(*_abstract(inter=2560))
     x, w13, s13, w2, s2 = _abstract()
     blockwise = jax.ShapeDtypeStruct((1, 40, 1, 2 * INTER), jnp.float32)
     assert not se.is_supported(x, w13, blockwise, w2, s2)
+
+
+@pytest.mark.cpu_test
+def test_shared_expert_fuses_during_cpu_export(monkeypatch):
+    from sglang_tpu import pallas_export
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    monkeypatch.setattr(pallas_export, "get_pallas_tpu_device_kind", lambda: "TPU7x")
+    with pallas_export.tpu_info_for_cpu_export():
+        assert se.is_supported(*_abstract())
+        graph = str(
+            jax.make_jaxpr(lambda *a: se.fp8_swiglu_mlp(*a, limit=LIMIT))(*_abstract())
+        )
+        assert "fused_shared_expert_fp8" in graph
 
 
 def _weights(seed):
@@ -105,7 +119,7 @@ _AS_SERVED = {"xla_allow_excess_precision": False}
     ],
 )
 def test_fused_shared_expert_is_bitwise_equal(tokens, pattern, seed):
-    if jax.default_backend() != "tpu" or se.get_tpu_version() != 7:
+    if jax.default_backend() != "tpu" or se.get_tpu_generation() != 7:
         pytest.skip("the fused shared expert is measured on TPU v7 only")
     graph = str(
         jax.make_jaxpr(lambda *a: se.fp8_swiglu_mlp(*a, limit=LIMIT))(

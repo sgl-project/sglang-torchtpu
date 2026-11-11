@@ -589,3 +589,53 @@ def test_push_options_are_the_push_layers_own_keywords():
     push = set(inspect.signature(fused_ep_moe_push).parameters)
     v2 = set(inspect.signature(fused_ep_moe_v2).parameters)
     assert set(PUSH_OPTIONS) == push - v2
+
+
+@pytest.mark.parametrize("fuse_scales", [False, True])
+def test_combine_preserves_weighted_sum_with_or_without_scale_lookup(
+    monkeypatch, fuse_scales
+):
+    """Both scalar-prefetch layouts preserve k-order and read the mirror by scl."""
+    import functools
+
+    from sglang_tpu.moe.pallas.fused_moe_v2 import kernel
+
+    monkeypatch.setattr(
+        kernel.pl,
+        "pallas_call",
+        functools.partial(kernel.pl.pallas_call, interpret=True),
+    )
+    monkeypatch.setattr(host, "vmem_limit", lambda: 64 * 1024**2)
+    rng = np.random.default_rng(2102)
+    tokens, topk, hidden, recv_rows = 256, 4, 128, 512
+    # Dyadic coefficients and small integer rows make every sum exactly f32,
+    # avoiding CPU interpret's FMA rounding versus separately evaluated ops.
+    arrivals = jnp.asarray(
+        rng.integers(-16, 17, size=(recv_rows, 1, hidden)), jnp.float8_e4m3fn
+    )
+    scales = jnp.asarray(rng.integers(1, 33, size=(8, 128)), jnp.float32) / 16
+    positions = jnp.asarray(rng.integers(0, recv_rows, size=(tokens, topk)), jnp.int32)
+    mirror = jnp.asarray(rng.integers(0, scales.size, size=(tokens, topk)), jnp.int32)
+    weights = jnp.asarray(rng.integers(0, 17, size=(tokens, topk)), jnp.float32) / 16
+    weights = weights.at[::7].set(0)  # Includes masked/padded rows.
+    coefficients = scales.reshape(-1)[mirror] * weights
+    combine = kernel._build_combine_kernel(
+        t_local=tokens,
+        topk=topk,
+        hidden=hidden,
+        lane_blocks=1,
+        wire_dtype=arrivals.dtype,
+        out_dtype=jnp.bfloat16,
+        fuse_scales=fuse_scales,
+    )
+    got = (
+        combine(arrivals, scales, mirror, weights, positions)
+        if fuse_scales
+        else combine(arrivals, coefficients, positions)
+    )
+    terms = [
+        arrivals[positions[:, k]].astype(jnp.float32) * coefficients[:, k, None, None]
+        for k in range(topk)
+    ]
+    want = sum(terms).reshape(tokens, hidden).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))

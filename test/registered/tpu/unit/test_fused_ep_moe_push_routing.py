@@ -71,8 +71,7 @@ def tpu_v7(monkeypatch):
         routing.host, "shard_transport_tables_in_blocks", stop("fallback")
     )
     monkeypatch.setattr(routing, "fuse_function", stop("fused"))
-    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
-    monkeypatch.setattr(fusion, "get_tpu_version", lambda: 7)
+    monkeypatch.setattr(fusion, "get_tpu_generation", lambda: 7)
 
 
 @pytest.mark.parametrize("tokens", [96, 192, 256, 288, 384])
@@ -111,8 +110,17 @@ def test_dtype_guards(field):
     assert not supported(**{field: (bad,) * 4 if field == "runs" else bad})
 
 
-@pytest.mark.parametrize("backend,version", [("cpu", 7), ("gpu", 7), ("tpu", 6)])
-def test_backend_guards(monkeypatch, backend, version):
-    monkeypatch.setattr(jax, "default_backend", lambda: backend)
-    monkeypatch.setattr(fusion, "get_tpu_version", lambda: version)
+@pytest.mark.parametrize("version", [-1, 6])
+def test_backend_guards(monkeypatch, version):
+    monkeypatch.setattr(fusion, "get_tpu_generation", lambda: version)
     assert not supported()
+
+
+def test_routing_fuses_during_cpu_export(monkeypatch):
+    from sglang_tpu import pallas_export
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    monkeypatch.setattr(fusion, "get_tpu_generation", pallas_export.get_tpu_generation)
+    monkeypatch.setattr(pallas_export, "get_pallas_tpu_device_kind", lambda: "TPU7x")
+    with pallas_export.tpu_info_for_cpu_export():
+        assert supported()
