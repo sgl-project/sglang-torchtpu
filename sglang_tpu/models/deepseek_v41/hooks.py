@@ -24,6 +24,16 @@ select_tpu_dsv41_loader
        V4.1 target only; it inherits construction, loading and postprocessing.
   Upstream PR or issue: not filed (forked from sgl-project/sglang-torchtpu#1744).
   Remove when: the core loader accepts a model-owned checkpoint tensor filter.
+
+load_tpu_dsv41_engram_rows
+  Why: EngramEmbedding._load_rows slices its TP row range out of the full
+       ~100 GB table, so the loader must hand it the whole table. The V4.1
+       loader reads only this rank's rows (one contiguous range, concurrent
+       pread), which the original would slice a second time.
+  How: AROUND EngramEmbedding._load_rows; tensors tagged with ROW_START_ATTR
+       are copied as-is after a row-range check, others take the original path.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: EngramEmbedding accepts a pre-sliced row range.
 """
 
 from __future__ import annotations
@@ -55,6 +65,12 @@ def select_tpu_dsv41_loader(result, load_config, model_config=None):
     return DSV41RunaiModelStreamerLoader(load_config, model_config)
 
 
+def load_tpu_dsv41_engram_rows(original, embedding, param, loaded_weight):
+    from sglang_tpu.models.deepseek_v41.ep_local_expert_reader import load_local_rows
+
+    return load_local_rows(original, embedding, param, loaded_weight)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -69,5 +85,10 @@ def hook_specs():
             "sglang.srt.model_loader.loader.get_model_loader",
             select_tpu_dsv41_loader,
             HookType.AFTER,
+        ),
+        (
+            "sglang.srt.layers.engram.EngramEmbedding._load_rows",
+            load_tpu_dsv41_engram_rows,
+            HookType.AROUND,
         ),
     ]

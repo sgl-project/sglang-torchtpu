@@ -1,10 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""EP-local routed-expert read plan for the DSV4.1 RunAI loader."""
+"""EP-local reads for the DSV4.1 loader: the expert plan and Engram row ranges."""
+
+import json
+import struct
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.models.deepseek_v41.loader import plan_expert_reads
+from sglang_tpu.models.deepseek_v41.ep_local_expert_reader import (
+    ROW_START_ATTR,
+    load_local_rows,
+    plan_expert_reads,
+    read_row_ranges,
+    tp_row_range,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -49,21 +60,58 @@ def test_rejects_indivisible_ep():
         )
 
 
-def test_mapped_safetensors_matches_safetensors_reader(tmp_path):
-    """The Engram tables bypass RunAI through a hand-written header parser;
-    a wrong offset or dtype map would load shifted or reinterpreted rows."""
-    torch = pytest.importorskip("torch")
-    safetensors_torch = pytest.importorskip("safetensors.torch")
-    from sglang_tpu.models.deepseek_v41.loader import mapped_safetensors
+def _write_safetensors(path, tensors):
+    header, blobs, offset = {}, [], 0
+    for name, t in tensors.items():
+        raw = t.contiguous().view(torch.uint8).flatten().numpy().tobytes()
+        dtype = {torch.bfloat16: "BF16", torch.float32: "F32"}[t.dtype]
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(t.shape),
+            "data_offsets": [offset, offset + len(raw)],
+        }
+        blobs.append(raw)
+        offset += len(raw)
+    encoded = json.dumps(header).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(encoded)) + encoded + b"".join(blobs))
 
-    tensors = {
-        "a": torch.arange(24, dtype=torch.float32).reshape(4, 6),
-        "layers.1.engram.embed.weight": torch.randn(8, 16).to(torch.float8_e4m3fn),
-        "layers.1.engram.embed.scale": torch.ones(8, 1).to(torch.float8_e8m0fnu),
+
+@pytest.mark.parametrize("tp_size", [1, 3, 8])
+def test_row_ranges_equal_table_slices(tmp_path, monkeypatch, tp_size):
+    """Each rank's pread range must be exactly its EngramEmbedding rows, also
+    when rows do not divide evenly and the range spans many read chunks."""
+    from sglang_tpu.models.deepseek_v41 import ep_local_expert_reader as reader
+
+    monkeypatch.setattr(reader, "_READ_CHUNK_BYTES", 96)
+    tables = {
+        "layers.1.engram.embed.weight": torch.randn(101, 16).bfloat16(),
+        "layers.1.engram.embed.scale": torch.randn(101, 3),
+        "other": torch.randn(5, 7),
     }
     path = tmp_path / "shard.safetensors"
-    safetensors_torch.save_file(tensors, str(path))
-    got = dict(mapped_safetensors(str(path), set(tensors)))
-    for name, ref in tensors.items():
-        assert got[name].dtype == ref.dtype and got[name].shape == ref.shape
-        assert torch.equal(got[name].view(torch.uint8), ref.view(torch.uint8))
+    _write_safetensors(path, tables)
+    names = {"layers.1.engram.embed.weight", "layers.1.engram.embed.scale"}
+    for rank in range(tp_size):
+        got = dict(read_row_ranges(str(path), names, rank, tp_size))
+        lo, hi = tp_row_range(101, rank, tp_size)
+        for name in names:
+            assert torch.equal(got[name], tables[name][lo:hi])
+            assert getattr(got[name], ROW_START_ATTR) == lo
+
+
+def test_preread_rows_skip_the_original_slice_and_check_the_range():
+    full = torch.arange(40.0).view(10, 4)
+    calls = []
+    embedding = SimpleNamespace(row_start=5, rows=5, _shared=True, host_table=None)
+    param = torch.nn.Parameter(torch.zeros(10, 4), requires_grad=False)
+    rows = full[5:].clone()
+    setattr(rows, ROW_START_ATTR, 5)
+    load_local_rows(lambda *a: calls.append(a), embedding, param, rows)
+    assert torch.equal(param.data[5:], full[5:]) and not calls
+    load_local_rows(lambda *a: calls.append(a), embedding, param, full)
+    assert len(calls) == 1  # untagged tensors take the original path
+    wrong = full[:5].clone()
+    setattr(wrong, ROW_START_ATTR, 0)
+    with pytest.raises(ValueError, match="do not match"):
+        load_local_rows(lambda *a: None, embedding, param, wrong)
