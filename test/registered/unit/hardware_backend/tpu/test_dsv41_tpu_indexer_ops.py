@@ -6,27 +6,40 @@ The fakes are what torch.compile traces; a fake whose shape drifts from the
 exported JAX function only fails at TPU run time, so both are compared here.
 """
 
+import importlib.util
 import os
 import sys
 from unittest.mock import patch
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu import pallas_export
-from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
-    PackedFP8Layout,
-    read_fp8_records,
-)
-from sglang_tpu.models.deepseek_v41.ops import indexer
+from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_tpu_ci(
+    est_time=30,
+    suite="stage-a-test-tpu-unit",
+    chips=1,
+    labels=["singlehost", "deepseek-v4.1-flash", "accuracy", "compile"],
+)
+
+_HAS_JAX = importlib.util.find_spec("jax") is not None
+pytestmark = pytest.mark.skipif(not _HAS_JAX, reason="requires JAX")
+
+if _HAS_JAX:
+    import jax
+    import jax.numpy as jnp
+
+    from sglang_tpu import pallas_export
+    from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
+        PackedFP8Layout,
+        read_fp8_records,
+    )
+    from sglang_tpu.models.deepseek_v41.ops import indexer
 
 FULL_PAGE = 256
 
