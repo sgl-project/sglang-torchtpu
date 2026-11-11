@@ -62,6 +62,16 @@ tpu_dsv41_engram_gate
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TorchTPU implements aten::copysign or engram_gate avoids it.
 
+tpu_dsv41_engram_hash_ids
+  Why: compute_engram_hash_ids multiplies by 63-bit multipliers in int64; TPU
+       lowering rejects 64-bit integer vectors ("Unsupported conversion from
+       vmreg/vreg to U64") when the decoder graph is compiled.
+  How: AROUND compute_engram_hash_ids keeps the original on CUDA; elsewhere
+       runs ops/engram.py, the uint32-pair hash adapted from the vllm-torchtpu
+       epic, on int32 tables staged at load (bit-exact, int32 row ids).
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: TPU lowers 64-bit integer arithmetic.
+
 trace_tpu_env_default
   Why: EnvField._resolve_default calls callable(self.default) for lazily
        computed defaults (e.g. SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)),
@@ -71,6 +81,15 @@ trace_tpu_env_default
        defaults depend only on the platform, fixed before any model is traced.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: callable env defaults are resolved at import or are traceable.
+tpu_dsv41_engram_hash_ids
+  Why: compute_engram_hash_ids multiplies, XORs and reduces 63-bit hashes in
+       int64; TPU lowering fails on the 64-bit vector values ("Unsupported
+       conversion from vmreg/vreg to U64").
+  How: AROUND compute_engram_hash_ids keeps the original on CUDA; elsewhere
+       runs ops.engram.engram_hash_ids, the same integers on uint32 pairs
+       (vllm-torchtpu epic engram_hash), returning int32 row ids.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: TPU lowers 64-bit integer vector arithmetic.
 """
 
 from __future__ import annotations
@@ -179,6 +198,26 @@ def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value)
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
 
 
+def tpu_dsv41_engram_hash_ids(original, tokens, blocked, pad_id, *tables):
+    if tokens.is_cuda:
+        return original(tokens, blocked, pad_id, *tables)
+    from sglang_tpu.models.deepseek_v41.ops.engram import engram_hash_ids
+
+    return engram_hash_ids(tokens, blocked, pad_id, *tables)
+
+
+def tpu_dsv41_engram_hash_ids(
+    original, tokens, blocked, pad_id, token_map, multipliers, primes, offsets
+):
+    if tokens.is_cuda:
+        return original(
+            tokens, blocked, pad_id, token_map, multipliers, primes, offsets
+        )
+    from sglang_tpu.models.deepseek_v41.ops.engram import engram_hash_ids
+
+    return engram_hash_ids(tokens, blocked, pad_id)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -215,8 +254,18 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
+            "sglang.srt.layers.engram.compute_engram_hash_ids",
+            tpu_dsv41_engram_hash_ids,
+            HookType.AROUND,
+        ),
+        (
             "sglang.srt.layers.engram.engram_gate",
             tpu_dsv41_engram_gate,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.engram.compute_engram_hash_ids",
+            tpu_dsv41_engram_hash_ids,
             HookType.AROUND,
         ),
     ]
