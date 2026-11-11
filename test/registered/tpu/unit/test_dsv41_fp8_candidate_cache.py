@@ -11,7 +11,7 @@ import sys
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
-    est_time=500,
+    est_time=100,
     suite="stage-a-test-tpu-unit",
     chips=1,
     labels=["singlehost", "deepseek-v4.1-flash", "accuracy", "compile"],
@@ -152,17 +152,20 @@ def test_candidate_gather(banks_count, page_size, fragments):
     out = np.asarray(out).reshape(3, fragments // 16, 33, 128)
     # Only valid fragments of live groups are defined; skipped tiles and
     # ignored fragments are left uninitialized by the gather.
-    for i, physical in enumerate(ids[0]):
-        if physical < 0:
-            continue
-        page, fragment = divmod(int(physical), page_size // 8)
-        base = layout.page_offset + page * layout.page_stride
-        for field in range(33):
-            start = base * 128 + field * page_size + fragment * 8
-            np.testing.assert_array_equal(
-                out[0, i // 16, field, i % 16 * 8 : (i % 16 + 1) * 8],
-                raw.reshape(-1)[start : start + 8],
-            )
+    valid = np.flatnonzero(ids[0] >= 0)
+    pages, frags = np.divmod(ids[0, valid], page_size // 8)
+    bases = layout.page_offset + pages * layout.page_stride
+    starts = (
+        bases[:, None] * 128 + np.arange(33)[None, :] * page_size + frags[:, None] * 8
+    )
+    expected = raw.reshape(-1)[starts[..., None] + np.arange(8)]
+    got = (
+        out[0]
+        .reshape(fragments // 16, 33, 16, 8)
+        .swapaxes(1, 2)
+        .reshape(fragments, 33, 8)[valid]
+    )
+    np.testing.assert_array_equal(got, expected)
 
 
 if __name__ == "__main__":

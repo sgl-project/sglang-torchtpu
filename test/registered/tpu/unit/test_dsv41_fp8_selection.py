@@ -269,22 +269,23 @@ def _reference_scores(f):
     layout, width = f["layout"], f["width"]
     position = np.arange(width)
     scores = np.full((f["owners"].size, width), -np.inf, np.float32)
+    all_keys = np.asarray(
+        jax.jit(lambda b, r: read_fp8_records(b, r, layout))(
+            f["banks"], jnp.arange(layout.pages * layout.page_size, dtype=jnp.int32)
+        ),
+        np.float32,
+    )
+    q_host = np.asarray(f["q"], np.float32)
+    weights_host = np.asarray(f["weights"], np.float32)
     for group in range(f["pages"].shape[0]):
         rows = np.flatnonzero(f["owners"] == group)
         records = (
             f["pages"][group, position // layout.page_size] * layout.page_size
             + position % layout.page_size
         )
-        keys = read_fp8_records(f["banks"], jnp.asarray(records), layout)
-        logits = jnp.einsum(
-            "qhd,kd->qhk",
-            f["q"][rows].astype(jnp.float32),
-            keys.astype(jnp.float32),
-            precision=jax.lax.Precision.HIGHEST,
-        )
-        dense = np.asarray(
-            (jnp.maximum(logits, 0) * f["weights"][rows][..., None]).sum(1)
-        )
+        keys = all_keys[records]
+        logits = np.einsum("qhd,kd->qhk", q_host[rows], keys)
+        dense = (np.maximum(logits, 0) * weights_host[rows][..., None]).sum(1)
         visible = position[None] < f["lengths"][rows][:, None]
         scores[rows] = np.where(visible, dense, -np.inf)
     return scores

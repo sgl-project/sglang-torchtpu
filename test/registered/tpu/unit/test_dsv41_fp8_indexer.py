@@ -7,7 +7,7 @@ import sys
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
-    est_time=600,
+    est_time=120,
     suite="stage-a-test-tpu-unit",
     chips=1,
     labels=["singlehost", "deepseek-v4.1-flash", "accuracy", "compile"],
@@ -159,20 +159,30 @@ def test_fp8_scorer_shapes(tokens, groups, width, page_size, record_property):
     mask = np.arange(width)[None, :] < np.asarray(lengths)[:, None]
     np.testing.assert_array_equal(np.isneginf(actual_host), ~mask)
     sampled = np.unique(np.linspace(0, tokens - 1, min(tokens, 12), dtype=int))
+    table_host = np.asarray(table)
+    q8_host = np.asarray(q8, np.float32)
+    qs_host = np.asarray(qs, np.float32)
+    weights_host = np.asarray(weights, np.float32)
+    all_decoded = np.asarray(
+        jax.jit(lambda b, r: read_fp8_records(b, r, layout))(
+            banks, jnp.arange(layout.pages * page_size, dtype=jnp.int32)
+        ),
+        np.float32,
+    )
     errors = []
     for row in sampled:
         visible = int(lengths[row])
         if not visible:
             continue
         request = int(np.searchsorted(np.asarray(offsets)[1:], row, side="right"))
-        slots = (
-            table[request, jnp.arange(visible) // page_size] * page_size
-            + jnp.arange(visible) % page_size
-        )
-        decoded = read_fp8_records(banks, slots, layout).astype(jnp.float32)
-        query = q8[row].astype(jnp.float32) * qs[row, :, None]
-        reference = (jnp.maximum(query @ decoded.T, 0) * weights[row, :, None]).sum(0)
-        ref = np.asarray(reference).astype(np.float64)
+        pos = np.arange(visible)
+        slots = table_host[request, pos // page_size] * page_size + pos % page_size
+        decoded = all_decoded[slots]
+        query = q8_host[row] * qs_host[row, :, None]
+        reference = (
+            np.maximum(query @ decoded.T, 0) * weights_host[row, :, None]
+        ).sum(0)
+        ref = reference.astype(np.float64)
         got = actual_host[row, :visible].astype(np.float64)
         diff = np.sum((got - ref) ** 2) / max(np.sum(got**2 + ref**2), 1e-20)
         errors.append(diff)
