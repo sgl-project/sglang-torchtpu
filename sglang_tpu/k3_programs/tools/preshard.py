@@ -39,6 +39,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -68,6 +69,12 @@ def add_arguments(parser) -> None:
     )
     model.add_argument(
         "--in-flight", type=int, default=4, help="ranks converted concurrently per host"
+    )
+    model.add_argument(
+        "--upload",
+        default="",
+        help="copy each finished file to DIR (e.g. a gcsfuse path) and drop the local "
+        "copy: a host then holds a few files a rank, not its whole pre-shard",
     )
     prefill = sub.add_parser("prefill", help="the Kimi-K3 prefill projection cache")
     prefill.add_argument("--checkpoint", required=True, help="the Kimi-K3 checkpoint")
@@ -144,8 +151,33 @@ def expert_values(checkpoint, rank: int, layer: int) -> dict[str, np.ndarray]:
     }
 
 
-def convert_rank(load, checkpoint, rank: int, output: Path, log) -> dict:
-    """Write one rank's files; returns its index."""
+class Uploader:
+    """Copies finished files to ``directory`` (same relative path) in the
+    background and removes the local copies."""
+
+    def __init__(self, directory: str, output: Path, threads: int = 4) -> None:
+        self.directory, self.output = Path(directory), output
+        self.pool = ThreadPoolExecutor(threads)
+        self.futures = []
+
+    def _copy(self, path: Path) -> None:
+        target = self.directory / path.relative_to(self.output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+        path.unlink()
+
+    def put(self, path: Path) -> None:
+        self.futures.append(self.pool.submit(self._copy, path))
+
+    def wait(self) -> None:
+        for future in self.futures:
+            future.result()
+        self.pool.shutdown()
+
+
+def convert_rank(load, checkpoint, rank: int, output: Path, log, upload: Uploader | None = None) -> dict:
+    """Write one rank's files; returns its index. With ``upload`` each file
+    goes out (and its local copy away) as soon as it is complete."""
     shapes = load.selected_local_shapes(
         LAYERS, checkpoint.config.dim, vocab=checkpoint.config.vocab,
         dsa=checkpoint.config.dsa,
@@ -194,6 +226,8 @@ def convert_rank(load, checkpoint, rank: int, output: Path, log) -> dict:
         f"rank {rank}: dense families written ({offset / 1e9:.1f} GB) "
         f"after {time.perf_counter() - started:.0f} s"
     )
+    if upload is not None:
+        upload.put(rank_dir / "dense.bin")
 
     expert_layers = LAYERS - 1
     ranges = {
@@ -223,6 +257,9 @@ def convert_rank(load, checkpoint, rank: int, output: Path, log) -> dict:
                     k for k, (lo, hi) in enumerate(ranges[name]) if lo <= position < hi
                 )
                 handles[name][k].write(array.tobytes())
+                if upload is not None and len(files[name]) > 1 and position == ranges[name][k][1] - 1:
+                    handles[name][k].close()  # this layer range is complete
+                    upload.put(rank_dir / files[name][k])
             if layer % 8 == 0 or layer == LAYERS - 1:
                 log(
                     f"rank {rank}: expert layer {layer}/{LAYERS - 1} "
@@ -236,6 +273,11 @@ def convert_rank(load, checkpoint, rank: int, output: Path, log) -> dict:
             "dtype": np.dtype(EXPERT_DTYPES[name]).name,
         }
     (rank_dir / "index.json").write_text(json.dumps(index, indent=1))
+    if upload is not None:
+        for name in EXPERT_FAMILIES:
+            if len(files[name]) == 1:
+                upload.put(rank_dir / files[name][0])
+        upload.put(rank_dir / "index.json")
     log(f"rank {rank}: done in {time.perf_counter() - started:.0f} s")
     return index
 
@@ -265,13 +307,19 @@ def write_k3(args, log) -> None:
                 indent=1,
             )
         )
+    upload = Uploader(args.upload, output) if getattr(args, "upload", "") else None
+    if upload is not None and (output / "layout.json").exists():
+        upload.put(output / "layout.json")
     started = time.perf_counter()
     with ThreadPoolExecutor(max(1, args.in_flight)) as pool:
         list(
             pool.map(
-                lambda rank: convert_rank(load, checkpoint, rank, output, log), ranks
+                lambda rank: convert_rank(load, checkpoint, rank, output, log, upload), ranks
             )
         )
+    if upload is not None:
+        upload.wait()
+        log(f"ranks {ranks} uploaded to {args.upload}")
     log(f"ranks {ranks} converted in {time.perf_counter() - started:.0f} s")
 
 
