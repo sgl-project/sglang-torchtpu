@@ -82,8 +82,13 @@ def _rotate_reference(projected, cache, positions):
     return result.astype(BF16)
 
 
-@jax.jit
-def _dense_tpu_reference(qr, weight, scale, cache, positions):
+def _dense_tpu_reference(
+    qr: jax.Array,
+    weight: jax.Array,
+    scale: jax.Array,
+    cache: jax.Array,
+    positions: jax.Array,
+) -> jax.Array:
     """Epic's dense arithmetic; no Pallas, lane helpers, or fused op calls."""
     values = qr.astype(jnp.float32)
     maximum = jnp.max(jnp.abs(values), axis=1, keepdims=True)
@@ -190,17 +195,27 @@ class TestQBRopeTPU(CustomTestCase):
         super().setUpClass()
         import torch_tpu  # noqa: F401
 
+        from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
         ops.register_ops()
+        # Export dense HLO on CPU, execute through TorchTPU. A direct JAX TPU
+        # client conflicts with the CPU-only JAX initialized by CSA2 tests in
+        # the same process; this reference does not need that second client.
+        reference = cpu_export_jax_op(
+            "sglang_tpu_test::dsv41_qb_rope_dense_reference", _dense_tpu_reference
+        )
+
+        @reference.register_fake
+        def fake_reference(qr, weight, scale, cache, positions):
+            return qr.new_empty((qr.shape[0], weight.shape[1] // HEAD_DIM, HEAD_DIM))
+
+        cls.reference_op = staticmethod(reference)
 
     def _check(self, tokens, rank=128, heads=8, compiled=False):
         from sglang_tpu.fp8_linear import apply_tpu_fp8_linear
 
         arrays = _inputs(tokens, rank, heads)
         inputs = tuple(_tensor(value, "tpu") for value in arrays)
-        # Export stays on CPU; explicitly place the independent dense oracle on
-        # TPU so it observes the same FP8 midpoint and dot rounding semantics.
-        reference_device = jax.devices("tpu")[0]
-        reference_inputs = tuple(jax.device_put(x, reference_device) for x in arrays)
         projected = apply_tpu_fp8_linear(*inputs[:3]).cpu().float().numpy()
         projected = projected.reshape(tokens, heads, HEAD_DIM)
         run = ops.qb_rope
@@ -211,11 +226,7 @@ class TestQBRopeTPU(CustomTestCase):
             if replay:
                 arrays = (*arrays[:-1], arrays[-1][::-1].copy())
                 inputs = (*inputs[:-1], _tensor(arrays[-1], "tpu"))
-                reference_inputs = (
-                    *reference_inputs[:-1],
-                    jax.device_put(arrays[-1], reference_device),
-                )
-            expected = np.asarray(_dense_tpu_reference(*reference_inputs), np.float32)
+            expected = self.reference_op(*inputs).cpu().float().numpy()
             generic_expected = _rotate_reference(
                 projected, arrays[3], arrays[4]
             ).astype(np.float32)
