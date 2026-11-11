@@ -48,8 +48,13 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
     [r, m, ..., m] (draft_block_width rows) and never runs EXTEND.
     """
 
+    # Set by precompile_draft from the drafter, which owns the block geometry.
+    _draft_block_width: int | None = None
+
     @property
     def draft_block_width(self) -> int:
+        if self._draft_block_width is not None:
+            return self._draft_block_width
         model = self.model_runner.model
         if not isinstance(model, DFlashDraftModel):
             raise TypeError(f"Expected a DFlashDraftModel draft, got {type(model)}.")
@@ -73,10 +78,12 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         draft_attn_backend: AttentionBackend,
         *,
         kv_writer: Callable[..., torch.Tensor],
+        block_width: int,
     ) -> None:
         """Compile the draft block forward and the draft KV writer."""
         if not self.is_draft_worker:
             raise ValueError("precompile_draft runs on the draft runner only.")
+        self._draft_block_width = block_width
         if self.b_bucketer is None:
             raise ValueError("b_bucketer must be initialized before precompile_draft.")
         start = time.perf_counter()
