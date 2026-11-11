@@ -41,6 +41,11 @@ from sglang_tpu.attention.pallas.util import (
     get_tpu_version,
     next_power_of_2,
 )
+from sglang_tpu.envs import envs as _tpu_envs
+
+# head_dim is padded to this before it becomes the KV cache's minor (lane) axis; must match
+# TpuFusedMHATokenToKVPool.HEAD_DIM_ALIGNMENT. 128 keeps every shape as upstream.
+KV_HEAD_DIM_ALIGN = _tpu_envs.SGLANG_TPU_KV_HEAD_DIM_ALIGN.get()
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 # The kernel's softmax runs in base 2: logits, m and sinks are scaled by log2(e).
@@ -251,7 +256,7 @@ def get_vmem_estimate_bytes(
     bkv_stride = cdiv(actual_num_kv_heads * 2, kv_packing)
     if has_bank_conflicts(bkv_stride):
         bkv_stride += 1
-    head_dim = align_to(actual_head_dim, 128)
+    head_dim = align_to(actual_head_dim, KV_HEAD_DIM_ALIGN)
 
     total_bits = (
         # bkv_x2_ref
@@ -305,7 +310,7 @@ def get_kv_cache_shape(
         page_size,
         align_to(actual_num_kv_heads * 2, kv_packing) // kv_packing,
         kv_packing,
-        align_to(actual_head_dim, 128),
+        align_to(actual_head_dim, KV_HEAD_DIM_ALIGN),
     )
 
 
@@ -372,6 +377,7 @@ def _ragged_paged_attention_kernel_loop(
     bkv_csz,  # bkv compute size
     case: RpaCase = RpaCase.MIXED,
     skip_kv_mask: bool = False,
+    pad_lane_rowsum: bool = False,
     sliding_window_chunk_skip: bool = True,
     debug_mode: bool = False,
 ):
@@ -392,6 +398,9 @@ def _ragged_paged_attention_kernel_loop(
         q_packing,
         head_dim,
     ) = q_hbm_ref.shape
+    # With pad_lane_rowsum, V's last (padding) lane holds ones, so P @ V also
+    # sums P and the running sum l lives in that lane of acc (scaled by v_scale).
+    rowsum_lane = head_dim - 1 if pad_lane_rowsum else None
     (
         total_num_pages,
         page_size,
@@ -407,7 +416,7 @@ def _ragged_paged_attention_kernel_loop(
     assert o_hbm_ref.dtype == q_dtype
     assert get_dtype_packing(q_dtype) == q_packing
     assert get_dtype_packing(kv_dtype) == kv_packing
-    assert head_dim % 128 == 0
+    assert head_dim % KV_HEAD_DIM_ALIGN == 0
     assert bkv_sz % page_size == 0
     assert bkv_sz % bkv_csz == 0, f"bkv_sz={bkv_sz} not divisible by bkv_csz={bkv_csz}"
     bkv_p = bkv_sz // page_size
@@ -532,10 +541,11 @@ def _ragged_paged_attention_kernel_loop(
         m_ref[...] = m_curr.astype(out_dtype)
         p = jnp.exp2(s - broadcast_minor(m_curr, s.shape))
 
-        p_rowsum = jnp.sum(p, axis=1, keepdims=True)
         exp_m_diff = jnp.exp2(m_prev - m_curr)
-        l_prev = l_ref[...].astype(jnp.float32)
-        l_ref[...] = (exp_m_diff * l_prev + p_rowsum).astype(out_dtype)
+        if rowsum_lane is None:
+            p_rowsum = jnp.sum(p, axis=1, keepdims=True)
+            l_prev = l_ref[...].astype(jnp.float32)
+            l_ref[...] = (exp_m_diff * l_prev + p_rowsum).astype(out_dtype)
 
         return p, v, exp_m_diff
 
@@ -556,6 +566,9 @@ def _ragged_paged_attention_kernel_loop(
         # casting first halves the matmul pushes and the spilled P tile.
         if v.dtype == jnp.bfloat16:
             p = p.astype(jnp.bfloat16)
+        if rowsum_lane is not None:
+            lane = lax.broadcasted_iota(jnp.int32, v.shape, 1)
+            v = jnp.where(lane == rowsum_lane, jnp.ones_like(v), v)
         pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
         if v_scale is not None:
             pv *= v_scale
@@ -795,6 +808,10 @@ def _ragged_paged_attention_kernel_loop(
         assert get_dtype_packing(ref.dtype) == 1
         assert len(ref.shape) == 2
         r, l = ref.shape  # noqa
+        if l < 128:  # KV_HEAD_DIM_ALIGN 64: one token row per load, nothing to fold
+            assert step == 1
+            vec = ref[pl.ds(start, sz)]
+            return pltpu.bitcast(vec, dtype) if dtype is not None else vec
         assert l % 128 == 0
         folds = l // 128
         ref = ref.reshape(r * folds, 128)
@@ -815,6 +832,10 @@ def _ragged_paged_attention_kernel_loop(
         assert ref.shape == val.shape
         assert len(ref.shape) == 2
         r, l = ref.shape  # noqa
+        if l < 128:
+            assert step == 1
+            ref[pl.ds(start, sz)] = val
+            return
         assert l % 128 == 0
         folds = l // 128
         ref = ref.reshape(r * folds, 128)
@@ -869,6 +890,8 @@ def _ragged_paged_attention_kernel_loop(
         if src.shape == shape:
             return src
         assert src.shape[:-1] == shape[:-1]
+        if shape[-1] < src.shape[-1]:  # lane-replicated stats onto a 64-lane head_dim
+            return src[..., : shape[-1]]
         assert src.shape[-1] % 128 == 0
         target_minor = align_to(shape[-1], src.shape[-1])
         return jnp.concatenate(
@@ -933,6 +956,12 @@ def _ragged_paged_attention_kernel_loop(
                 # (pretend we've already seen a virtual token with logit = sink_value).
                 m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
                 l_ref[...] = jnp.full_like(l_ref, 1.0)
+                if rowsum_lane is not None:
+                    lane = lax.broadcasted_iota(jnp.int32, acc_ref.shape, 2)
+                    l_init = 1.0 if v_scale is None else v_scale
+                    acc_ref[...] = jnp.where(lane == rowsum_lane, l_init, 0.0).astype(
+                        acc_ref.dtype
+                    )
                 for kv_head_idx in range(actual_num_kv_heads):
                     sinks = attention_sink_ref[
                         kv_head_idx
@@ -1174,7 +1203,13 @@ def _ragged_paged_attention_kernel_loop(
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
-            l = broadcast_minor(l_ref[...], acc.shape)  # noqa
+            if rowsum_lane is None:
+                l = broadcast_minor(l_ref[...], acc.shape)  # noqa
+            else:
+                l_lane = acc[..., rowsum_lane : rowsum_lane + 1]
+                if v_scale is not None:
+                    l_lane = l_lane / v_scale
+                l = jnp.broadcast_to(l_lane, acc.shape)  # noqa
             out = (
                 acc * pltpu.reciprocal(l, approx=True)
                 if (l.dtype == jnp.float32 and o_hbm_ref.dtype != jnp.float32)
@@ -1252,7 +1287,7 @@ def merge_kv(
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
     num_kv_heads_x2 = align_to(actual_num_kv_heads_x2, kv_packing)
 
-    head_dim = align_to(actual_head_dim, 128)
+    head_dim = align_to(actual_head_dim, KV_HEAD_DIM_ALIGN)
     kv = jnp.pad(
         jnp.concat([k, v], axis=-1).reshape(
             max_num_tokens, actual_num_kv_heads_x2, actual_head_dim
@@ -1284,7 +1319,7 @@ def prepare_inputs(
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
-    head_dim = align_to(actual_head_dim, 128)
+    head_dim = align_to(actual_head_dim, KV_HEAD_DIM_ALIGN)
     q = (
         jnp.pad(
             q.reshape(
@@ -1365,7 +1400,7 @@ def prepare_kv_cache_fused(
         actual_head_dim,
     ) = kv_cache_fused.shape
     # assert actual_num_kv_heads_interleaved_per_packing % 2 == 0
-    head_dim = align_to(actual_head_dim, 128)
+    head_dim = align_to(actual_head_dim, KV_HEAD_DIM_ALIGN)
 
     kv_cache_fused_processed = jnp.pad(
         kv_cache_fused,
@@ -1617,7 +1652,7 @@ def get_default_block_sizes(
 
     kv_packing = get_dtype_packing(kv_dtype)
     num_kv_heads_x2 = next_power_of_2(align_to(actual_num_kv_heads * 2, kv_packing))
-    head_dim = align_to(head_dim, 128)
+    head_dim = align_to(head_dim, KV_HEAD_DIM_ALIGN)
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     num_q_heads_per_kv_head = next_power_of_2(actual_num_q_heads_per_kv_head)
 
@@ -1798,6 +1833,7 @@ def get_vmem_limit():
         "vmem_limit_bytes",
         "out_dtype",
         "skip_kv_mask",
+        "pad_lane_rowsum",
         "disable_semaphore_checks",
         "debug_mode",
         "_sliding_window_chunk_skip",
@@ -1834,6 +1870,7 @@ def ragged_paged_attention(
     vmem_limit_bytes: int | None = None,
     out_dtype=None,
     skip_kv_mask: bool = False,
+    pad_lane_rowsum: bool = False,
     disable_semaphore_checks: bool = True,
     debug_mode: bool = False,
     # Private: False restores computing KV chunks left of the sliding window.
@@ -1875,6 +1912,9 @@ def ragged_paged_attention(
       p_block_sizes: block sizes for prefill.
       m_block_sizes: block sizes for mixed.
       vmem_limit_bytes: vmem limit for the pallas kernel.
+      pad_lane_rowsum: compute the softmax row sum on the MXU through a ones
+        column in V's last padding lane. No-op when head_dim is already a
+        multiple of 128.
       debug_mode: if true, skip DMAs and flash attention.
 
     Returns:
@@ -2086,6 +2126,7 @@ def ragged_paged_attention(
                 bkv_csz=bkv_csz,
                 case=case,
                 skip_kv_mask=skip_kv_mask,
+                pad_lane_rowsum=pad_lane_rowsum and actual_head_dim < head_dim,
                 sliding_window_chunk_skip=_sliding_window_chunk_skip,
                 debug_mode=debug_mode,
             ),

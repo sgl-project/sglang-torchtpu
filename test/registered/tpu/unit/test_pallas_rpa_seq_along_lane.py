@@ -417,7 +417,14 @@ class TestKernelBlockSizes(CustomTestCase):
     GEOMETRIES = ((16, 2, 64, 2), (64, 8, 64, 8), (8, 1, 64, None), (4, 1, 128, None))
 
     def _block_sizes(
-        self, *, page_size, kv_layout, dtype_kv, geometry, vmem_limit_bytes=1 << 26
+        self,
+        *,
+        page_size,
+        kv_layout,
+        dtype_kv,
+        geometry,
+        vmem_limit_bytes=1 << 26,
+        f32_carries=False,
     ):
         import jax.numpy as jnp
 
@@ -445,6 +452,7 @@ class TestKernelBlockSizes(CustomTestCase):
                 skip_kv_write=cp_group_size is not None,
                 return_lse=cp_group_size is not None,
                 cp_group_size=cp_group_size,
+                f32_carries=f32_carries,
             )
             return wrapper.calculate_block_sizes(model, serve, vmem_limit_bytes)
 
@@ -498,6 +506,64 @@ class TestKernelBlockSizes(CustomTestCase):
             self.assertGreater(prefill.bq_sz, 1, f"{vmem_mib} MiB")
             shrunk += prefill.bq_sz < 256
         self.assertGreater(shrunk, 0)  # some budget must exercise the shrinking
+
+    def test_never_single_buffers(self):
+        """A single-buffered lookahead ref skips the pipeline prologue and hangs;
+        a budget that 2 buffers cannot fit must raise instead."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        raised = 0
+        for vmem_mib in range(20, 64, 2):
+            for geometry in self.GEOMETRIES:
+                try:
+                    block_sizes = self._block_sizes(
+                        page_size=256,
+                        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+                        dtype_kv=jnp.float8_e4m3fn,
+                        geometry=geometry,
+                        vmem_limit_bytes=vmem_mib << 20,
+                        f32_carries=True,
+                    )
+                except ValueError:
+                    raised += 1
+                    continue
+                for blocks in block_sizes:
+                    self.assertGreaterEqual(blocks.n_buffer, 2, (vmem_mib, geometry))
+        self.assertGreater(raised, 0)  # some budget must be too small
+
+    def test_attention_sink_prefill_shrinks_the_q_block(self):
+        """gpt-oss under attention CP (64q/8kv per rank, fp8, sinks): a 256 q block
+        takes 65.2 MiB even with 2 buffers, so the q block shrinks to 128 and keeps
+        3 buffers (39.2 MiB with a 512 k block)."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        model = configs.ModelConfigs(
+            num_q_heads=64,
+            num_kv_heads=8,
+            head_dim=64,
+            mask_value=float("-inf"),
+            has_attention_sink=True,
+        )
+        with tpu_info_for_cpu_export():
+            serve = configs.ServingConfigs(
+                num_seqs=32,
+                num_page_indices=32 * 32,
+                total_q_tokens=512,
+                dtype_q=jnp.bfloat16,
+                dtype_kv=jnp.float8_e4m3fn,
+                dtype_out=jnp.bfloat16,
+                page_size=256,
+                f32_carries=True,
+            )
+            _, prefill = wrapper.calculate_block_sizes(model, serve, 1 << 26)
+        self.assertEqual(
+            (prefill.bq_sz, prefill.bkv_sz, prefill.n_buffer), (128, 512, 3)
+        )
 
     def test_explicit_partial_page_k_block_is_refused(self):
         """An explicit k block must cover whole pages too when the call reads
@@ -663,6 +729,198 @@ class TestScheduleSizeBound(CustomTestCase):
     def test_short_context_keeps_the_default(self):
         cfg, _, _ = self._cfg(num_seqs=32, context=1 << 17, total_q_tokens=4096)
         self.assertEqual(cfg.max_schedule_size_multiplier, 16)
+
+
+class TestMeasuredTiles(CustomTestCase):
+    """Tiles the f32-carry search (SGLANG_TPU_RPA_F32_CARRIES) picks where tpu7x
+    compiles were measured: each compiles, the next larger one does not, and none
+    drops below 2 buffers."""
+
+    def _block_sizes(
+        self,
+        *,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        dtype_kv,
+        kv_layout,
+        num_seqs,
+        pages_per_seq,
+        total_q_tokens,
+        sliding_window=None,
+        has_attention_sink=False,
+        **serve_flags,
+    ):
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        model = configs.ModelConfigs(
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            mask_value=float("-inf"),
+            sliding_window=sliding_window,
+            has_attention_sink=has_attention_sink,
+        )
+        with tpu_info_for_cpu_export():
+            serve = configs.ServingConfigs(
+                num_seqs=num_seqs,
+                num_page_indices=num_seqs * pages_per_seq,
+                total_q_tokens=total_q_tokens,
+                dtype_q=jnp.bfloat16,
+                dtype_kv=dtype_kv,
+                dtype_out=jnp.bfloat16,
+                page_size=256,
+                kv_layout=kv_layout,
+                skip_pad_q_group=256,
+                f32_carries=True,
+                **serve_flags,
+            )
+            decode, prefill = wrapper.calculate_block_sizes(model, serve, 1 << 26)
+        for blocks in (decode, prefill):
+            self.assertGreaterEqual(blocks.n_buffer, 2)
+        return decode, prefill
+
+    # The RPA flags agentic.py sets for Muse.
+    MUSE_FLAGS = dict(
+        exp2_softmax=True, ones_v=True, transposed=True, skip_full_tile_mask=True
+    )
+
+    @staticmethod
+    def _tile(blocks):
+        return (
+            blocks.bq_sz,
+            blocks.bq_c_sz,
+            blocks.bkv_sz,
+            blocks.batch_size,
+            blocks.n_buffer,
+        )
+
+    def test_muse_pp8_tp1_prefill(self):
+        """128q/16kv fp8 transposed: 256 q blocks overflow with 3 buffers (67.6
+        MiB); 128 x 512 takes 40.0 MiB, 128 x 256 37.5 MiB under a window."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        kw = dict(
+            num_q_heads=128,
+            num_kv_heads=16,
+            head_dim=64,
+            dtype_kv=jnp.float8_e4m3fn,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            num_seqs=4,
+            pages_per_seq=123,
+            total_q_tokens=4352,
+            **self.MUSE_FLAGS,
+        )
+        decode, prefill = self._block_sizes(**kw)
+        self.assertEqual(self._tile(prefill), (128, 16, 512, 1, 3))
+        self.assertEqual(self._tile(decode), (1, 1, 512, 8, 3))
+        _, windowed = self._block_sizes(sliding_window=2048, **kw)
+        self.assertEqual(self._tile(windowed), (128, 16, 256, 1, 3))
+
+    def test_gpt_oss_pcp_prefill(self):
+        """64q/8kv fp8 with sinks: a 256 q block overflows even with 2 buffers
+        (65.2 MiB); 128 x 512 takes 39.2 MiB."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        kw = dict(
+            num_q_heads=64,
+            num_kv_heads=8,
+            head_dim=64,
+            dtype_kv=jnp.float8_e4m3fn,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            num_seqs=33,
+            pages_per_seq=26,
+            total_q_tokens=768,
+            has_attention_sink=True,
+        )
+        decode, prefill = self._block_sizes(**kw)
+        self.assertEqual(self._tile(prefill), (128, 16, 512, 1, 3))
+        # 768-key decode blocks take 59.9 MiB.
+        self.assertEqual(self._tile(decode), (1, 1, 512, 8, 3))
+        _, windowed = self._block_sizes(sliding_window=128, **kw)
+        self.assertEqual(self._tile(windowed), (128, 16, 256, 1, 3))
+
+    def test_single_row_bf16_call(self):
+        """16q/8kv bf16, one sequence of 9 pages (the batched-RPA kernel test):
+        the 768 square mixed tile took 65.4 MiB; 512 x 512 takes 39.5 MiB. With
+        8 query tokens the q block stays at the 256 MXU width."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        decode, prefill = self._block_sizes(
+            num_q_heads=16,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_kv=jnp.bfloat16,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            num_seqs=1,
+            pages_per_seq=9,
+            total_q_tokens=8,
+        )
+        self.assertEqual(self._tile(prefill), (256, 64, 256, 1, 3))
+        self.assertEqual(self._tile(decode), (1, 1, 512, 8, 3))
+        _, long_chunk = self._block_sizes(
+            num_q_heads=16,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_kv=jnp.bfloat16,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            num_seqs=1,
+            pages_per_seq=9,
+            total_q_tokens=4352,
+        )
+        self.assertEqual(self._tile(long_chunk), (512, 64, 512, 1, 3))
+
+    def test_muse_tp8_target_verify(self):
+        """16q/2kv fp8 transposed without no_max, 64 query tokens (Muse TP8
+        target verify): the old 1536 square tile took 86.2 MiB, its running max
+        spilling; 64 tokens keep the q block at 256 (11.2 MiB with 512 keys). A
+        4352-token chunk grows to 1024 x 1024."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        kw = dict(
+            num_q_heads=16,
+            num_kv_heads=2,
+            head_dim=64,
+            dtype_kv=jnp.float8_e4m3fn,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            num_seqs=8,
+            pages_per_seq=130,
+            **self.MUSE_FLAGS,
+        )
+        _, verify = self._block_sizes(total_q_tokens=64, **kw)
+        self.assertEqual(self._tile(verify), (256, 32, 512, 1, 3))
+        _, chunk = self._block_sizes(total_q_tokens=4352, **kw)
+        self.assertEqual(self._tile(chunk), (1024, 32, 1024, 1, 3))
+
+    def test_packed_fp8_decode_counts_the_unpacked_k_copy(self):
+        """8q/1kv fp8 head-along-sublane decode unpacks K to bf16: 4864 keys over 8
+        lanes took 67.9 MiB."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        decode, _ = self._block_sizes(
+            num_q_heads=8,
+            num_kv_heads=1,
+            head_dim=128,
+            dtype_kv=jnp.float8_e4m3fn,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            num_seqs=4,
+            pages_per_seq=123,
+            total_q_tokens=4352,
+        )
+        self.assertEqual(self._tile(decode), (1, 1, 4096, 8, 3))
 
 
 if __name__ == "__main__":

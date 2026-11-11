@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _pad_last_axis,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.expert_loading import _wait_for
 from sglang_tpu.fp8_moe import (
     _clear_replaced_param,
@@ -115,6 +116,31 @@ def _to_gmm_v2_scale_layout(
     later ``contiguous()`` call alone cannot guarantee independent storage.
     """
     return _own_storage(scale.to(dtype).unsqueeze(-1).permute(0, 2, 3, 1).contiguous())
+
+
+def _expert_global_scales(
+    w13_global_scale: torch.Tensor | None,
+    w2_global_scale: torch.Tensor | None,
+    *,
+    num_experts: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-expert globals as f32 ``(E, 2)`` gate/up and ``(E,)``, ones where absent.
+
+    Built by computing ops: a view of a parameter bound into a compiled graph is
+    rebuilt from its base on every call (torch-tpu 0.2).
+    """
+    ones = torch.ones(num_experts, 1, dtype=torch.float32, device=device)
+    if w13_global_scale is None:
+        w13 = torch.cat([ones, ones], dim=1)
+    else:
+        g = w13_global_scale.float().reshape(num_experts, -1)
+        w13 = torch.cat([g[:, :1], g[:, -1:]], dim=1)
+    if w2_global_scale is None:
+        w2 = ones.reshape(num_experts) * 1.0
+    else:
+        w2 = w2_global_scale.float().reshape(num_experts) * 1.0
+    return w13, w2
 
 
 def _fold_w13_global_scale(
@@ -263,17 +289,27 @@ def prepare_tpu_nvfp4_moe_weights(
 
         prepare_tpu_fused_rs_post_expert_norm(layer)
         prepare_fused_moe_rs(layer)
-    else:
-        from sglang_tpu.envs import envs as tpu_envs
+    elif tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.get():
+        scale_dtype = torch.float32
 
-        if tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.get():
-            scale_dtype = torch.float32
+    w13_global_scale = getattr(layer, "w13_weight_scale_2", None)
+    w2_global_scale = getattr(layer, "w2_weight_scale_2", None)
+    e4m3_scales = use_fused_rs and tpu_envs.SGLANG_TPU_NVFP4_E4M3_SCALES.get()
+    w13_gs = w2_gs = None
+    if e4m3_scales:
+        # The block scales stay e4m3 as stored; the kernels apply the globals.
+        w13_gs, w2_gs = _expert_global_scales(
+            None if w13_global_scale is None else w13_global_scale.data,
+            None if w2_global_scale is None else w2_global_scale.data,
+            num_experts=_E,
+            device=w13.device,
+        )
+        scale_dtype = torch.float8_e4m3fn
 
     # W13: fold global scale, pad gate/up halves, and rebind before touching W2
     # so single-device PP stages do not hold both layers' temporaries at once.
     w13_s = layer.w13_weight_scale.data.float()
-    w13_global_scale = getattr(layer, "w13_weight_scale_2", None)
-    if w13_global_scale is not None:
+    if w13_global_scale is not None and not e4m3_scales:
         w13_s = _fold_w13_global_scale(w13_s, w13_global_scale.data)
     w13_w = _pad_gate_up_halves_axis1(w13, intermediate, pad_n)
     w13_s = _pad_gate_up_halves_axis1(w13_s, intermediate, pad_n)
@@ -302,8 +338,7 @@ def prepare_tpu_nvfp4_moe_weights(
     # W2: pad packed-K and scale blocks to match, then transpose so N = hidden.
     w2 = layer.w2_weight.data  # (E, H, I/2) uint8
     w2_s = layer.w2_weight_scale.data.float()
-    w2_global_scale = getattr(layer, "w2_weight_scale_2", None)
-    if w2_global_scale is not None:
+    if w2_global_scale is not None and not e4m3_scales:
         w2_s *= w2_global_scale.data.float()[:, None, None]
     pad_k_packed = pad_n // PACKING
     pad_k_blocks = pad_n // group_size
@@ -325,6 +360,8 @@ def prepare_tpu_nvfp4_moe_weights(
     _free_replaced_storage(old_w2, layer.w2_weight.data)
     _free_replaced_storage(old_w2_scale, layer.w2_weight_scale.data)
     del old_w2, old_w2_scale, w2_w, w2_scale
+    layer.register_buffer("_tpu_w13_global_scale", w13_gs, persistent=False)
+    layer.register_buffer("_tpu_w2_global_scale", w2_gs, persistent=False)
 
     for name in _UNUSED_NVFP4_MOE_PARAMS:
         _clear_replaced_param(layer, name)
@@ -441,6 +478,8 @@ def apply_tpu_nvfp4_moe(
                 keep_token_shard=keep_output_shard,
                 expert_tp=expert_tp,
                 oneshot_rank=getattr(layer, "_tpu_oneshot_rank", None),
+                w1_global_scale=layer._tpu_w13_global_scale,
+                w2_global_scale=layer._tpu_w2_global_scale,
             )
             outputs.append(output[:output_rows])
         return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))

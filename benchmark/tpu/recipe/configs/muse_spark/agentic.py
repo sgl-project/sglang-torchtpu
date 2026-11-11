@@ -134,6 +134,7 @@ _FP8_1M_KV: dict[str, dict] = {
         "SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS": "512",
         "SGLANG_TPU_MK_SAL_FP8_DOT": "1",
         # Batched RPA prefill attention (SEQ_ALONG_LANE only).
+        "SGLANG_TPU_RPA_F32_CARRIES": "1",
         "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
         "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
         "SGLANG_TPU_RPA_ONES_V": "1",
