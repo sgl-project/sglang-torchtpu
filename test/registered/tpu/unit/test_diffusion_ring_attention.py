@@ -289,6 +289,89 @@ class TestRingAttentionInterpret(unittest.TestCase):
         np.testing.assert_array_equal(outs[True][:, :, 1], outs[False][:, :, 1])
 
 
+@unittest.skipUnless(_has_jax(), "jax not installed")
+class TestShort2DRingInterpret(unittest.TestCase):
+    def test_short_2d_ring_matches_fp32_reference(self):
+        """Short-shard 2D ring in interpret mode against an fp32 reference, per head.
+
+        Ulysses 2 runs inside each rank pair and a ppermute ring across pairs.
+        Ring 4 runs the first and last flash steps; ring 8 adds the resume
+        steps in between. Batch 2, GQA 4:2 and a ragged 195-row shard.
+        """
+        import jax
+
+        cpu_devices = jax.devices("cpu")
+        if len(cpu_devices) < 8:
+            _rerun_with_8_cpu_devices(self)
+            return
+
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+        from sglang_tpu.multimodal_gen import tpu_splash_attn
+
+        # The flash kernel has no cross-device DMA, so the generic interpreter
+        # suffices; TPU interpret mode syncs devices per kernel, which
+        # deadlocks against the ppermutes between ring 8's resume steps.
+        interpret_call = functools.partial(pl.pallas_call, interpret=True)
+        tpu_info = SimpleNamespace(vmem_capacity_bytes=64 * 2**20)
+        rng = np.random.default_rng(0)
+        batch, shard_len, head_dim = 2, 195, 128
+        scale = head_dim**-0.5
+        axis_names = ("batch", "ring", "uly")
+        spec = PartitionSpec(*axis_names)
+
+        for ring_size in (4, 8):
+            seq_len = ring_size * shard_len
+            shapes = [(batch, seq_len, heads, head_dim) for heads in (4, 2, 2)]
+            q_bf16, k_bf16, v_bf16 = (
+                jnp.asarray(rng.standard_normal(shape, dtype=np.float32), jnp.bfloat16)
+                for shape in shapes
+            )
+            ref = _fp32_attention_reference(q_bf16, k_bf16, v_bf16, scale)
+            mesh = Mesh(
+                np.asarray(cpu_devices[:ring_size]).reshape(1, ring_size // 2, 2),
+                axis_names,
+            )
+
+            def _put(x, ring_size=ring_size, mesh=mesh):
+                # Rank 2 * ring_index + uly_index holds that sequence block.
+                heads = x.shape[2]
+                blocks = x.reshape(batch, ring_size, shard_len, heads, head_dim)
+                blocks = jnp.swapaxes(blocks, 0, 1).reshape(
+                    1, ring_size // 2, 2, batch, shard_len, heads, head_dim
+                )
+                return jax.device_put(blocks, NamedSharding(mesh, spec))
+
+            with (
+                patch.object(pl, "pallas_call", interpret_call),
+                patch.object(pltpu, "get_tpu_info", return_value=tpu_info),
+            ):
+                fn = jax.jit(
+                    jax.shard_map(
+                        functools.partial(
+                            tpu_splash_attn._short_2d_ring_sharded, scale=scale
+                        ),
+                        mesh=mesh,
+                        in_specs=(spec, spec, spec),
+                        out_specs=spec,
+                        check_vma=False,
+                    )
+                )
+                out = np.asarray(
+                    fn(_put(q_bf16), _put(k_bf16), _put(v_bf16)), dtype=np.float32
+                )
+            out = np.swapaxes(
+                out.reshape(ring_size, batch, shard_len, 4, head_dim), 0, 1
+            ).reshape(batch, seq_len, 4, head_dim)
+            _assert_per_head_close(self, out, ref, 4e-3, f"ring={ring_size}")
+
+
 @unittest.skipUnless(_has_tpu_v7x_pair(), "requires TPU v7x with >= 2 TensorCores")
 class TestRingAttentionOnDevice(unittest.TestCase):
     def test_sharded_ring_matches_fp32_reference(self):

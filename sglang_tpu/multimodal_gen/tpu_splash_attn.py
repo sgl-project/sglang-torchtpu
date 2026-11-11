@@ -1106,6 +1106,18 @@ def _get_ring_op(
         return op
 
 
+def _ranks_pair_on_chip() -> bool:
+    """Whether ranks 2k and 2k + 1 are the two TensorCores of one chip.
+
+    True on tpu7x, where get_pallas_mesh maps torch rank r and r ^ 1 to one
+    chip's TensorCore pair (sglang_tpu/k3_megakernel/config.py); the short-2D
+    ring puts its Ulysses all_to_all on those pairs.
+    """
+    from sglang_tpu.attention.pallas.util import get_tpu_version
+
+    return get_tpu_version() == 7
+
+
 def _short_2d_ring_sharded(q, k, v, *, scale: float):
     """Run intra-chip Ulysses=2 + bulk-ppermute ring attention on short shards."""
     import jax
@@ -1323,7 +1335,12 @@ class TpuSplashAttentionImpl(SDPAImpl):
                     process_group=replica_pg,
                     replica_lead=replica_lead,
                 )
-                if inner_size == 1 and ring_size >= 4 and ring_size % 2 == 0:
+                if (
+                    inner_size == 1
+                    and ring_size >= 4
+                    and ring_size % 2 == 0
+                    and _ranks_pair_on_chip()
+                ):
                     self._short_2d_ring_op = _get_short_2d_ring_op(
                         outer_size,
                         ring_size,
