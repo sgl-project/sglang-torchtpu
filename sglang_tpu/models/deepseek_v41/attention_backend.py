@@ -78,7 +78,7 @@ def rope_reference(
     ``rope_dim`` features as interleaved (even, odd) complex pairs, in fp32."""
     rope_dim = table.shape[-1]
     half = rope_dim // 2
-    rows = table[positions.long()].float()
+    rows = table[positions].float()
     cos, sin = rows[:, :half], rows[:, half:]
     if inverse:
         sin = -sin
@@ -129,11 +129,11 @@ class DSV41TPUForwardMetadata:
     query_start_loc: torch.Tensor
     # [T] int32 batch row of each token, -1 for padding; the indexer's requests.
     token_rows: torch.Tensor
-    # [T] int64 req_pool_idx of each token (core token_req_indices), 0 for padding.
+    # [T] int32 req_pool_idx of each token (core token_req_indices), 0 for padding.
     token_req_pool: torch.Tensor
     # [T] bool: a real token with a cache slot.
     valid: torch.Tensor
-    # [T] int64 scheduler full_loc.
+    # [T] int32 scheduler full_loc; TPU lowering rejects 64-bit integer vectors.
     out_cache_loc: torch.Tensor
     # [B, C] int32 full page ids, C = ceil(context_len / 256); also main KV pages.
     full_pages: torch.Tensor
@@ -290,9 +290,9 @@ def build_forward_metadata(
         positions=put(positions.to(torch.int32)),
         query_start_loc=put(query_start_loc.to(torch.int32)),
         token_rows=put(token_rows.to(torch.int32)),
-        token_req_pool=put(token_req_pool),
+        token_req_pool=put(token_req_pool.to(torch.int32)),
         valid=put(valid),
-        out_cache_loc=put(out_cache_loc),
+        out_cache_loc=put(out_cache_loc.to(torch.int32)),
         full_pages=put(full_pages.to(torch.int32)),
         swa_pages=put(swa_pages.to(torch.int32)),
         swa_minimum=put(torch.zeros(bs, dtype=torch.int32)),
@@ -518,7 +518,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
         records = metadata.low_ratio[ratio].out_loc
         kv, score = compressor.project(x)
         if ratio == 1:
-            pooled, group_pos = kv, metadata.positions.long()
+            pooled, group_pos = kv, metadata.positions
         else:
             pooled, group_pos = self._pool_pairs(
                 layer=layer, kv=kv, score=score, metadata=metadata
@@ -553,7 +553,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             DeepseekV4AttnBackend,
         )
 
-        pos = metadata.positions.long()
+        pos = metadata.positions
         # Reads only self.token_to_kv_pool.get_attention_compress_states.
         partner_kv, partner_score = DeepseekV4AttnBackend._low_ratio_pair_partners(
             self,

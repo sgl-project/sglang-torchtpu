@@ -72,15 +72,18 @@ tpu_dsv41_engram_hash_ids
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TPU lowers 64-bit integer arithmetic.
 
-tpu_dsv41_int32_input_ids
-  Why: with a vision tower, DeepseekV4ForCausalLM.forward compares int64
-       input_ids against MM_PAD_SHIFT_VALUE and the model compares them with
-       image_token_id inside the fused Engram torch.where; TPU lowering fails
-       on the 64-bit compare ("Unsupported conversion from vmreg/vreg to U64").
-  How: AROUND DeepseekV4ForCausalLM.forward casts V4.1 input_ids to int32 on
-       non-CUDA devices; token ids and multimodal pad ids fit in int32.
+tpu_dsv41_int32_graph_inputs
+  Why: the compiled V4.1 forward takes input_ids, positions and
+       req_pool_indices as int64 graph inputs; the image-token torch.where,
+       the Engram hasher and the ratio-2 pair state split them into 64-bit
+       halves, which TPU lowering rejects ("Unsupported conversion from
+       vmreg/vreg to U64"). A cast inside the forward still leaves the
+       int64 parameter in the graph.
+  How: AROUND CompiledForwardShim._forward casts them to int32 before the
+       compiled call for V4.1 on non-CUDA devices and restores the batch
+       fields afterwards; token ids, positions and pool rows fit in int32.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
-  Remove when: TPU lowers 64-bit integer compares.
+  Remove when: the TPU batch builder produces int32 index tensors.
 
 tpu_dsv41_torch_hash_ids
   Why: EngramHasher._torch_hash_ids (the non-CUDA hash path) widens ids,
@@ -309,15 +312,38 @@ def tpu_dsv41_torch_hash_ids(
     return hash_ids, tokens
 
 
-def tpu_dsv41_int32_input_ids(original, model, input_ids, *args, **kwargs):
-    """AROUND DeepseekV4ForCausalLM.forward: V4.1 token ids fit in int32."""
-    if (
-        not input_ids.is_cuda
-        and input_ids.dtype == torch.int64
-        and model.config.model_type == "deepseek_v41"
-    ):
-        input_ids = input_ids.to(torch.int32)
-    return original(model, input_ids, *args, **kwargs)
+_INT32_BATCH_FIELDS = ("input_ids", "positions", "req_pool_indices")
+
+
+def _int32(t):
+    if isinstance(t, torch.Tensor) and t.dtype == torch.int64 and not t.is_cuda:
+        return t.to(torch.int32)
+    return t
+
+
+def tpu_dsv41_int32_graph_inputs(
+    original, shim, fn, input_ids, positions, forward_batch, *args, **kwargs
+):
+    """AROUND CompiledForwardShim._forward: V4.1 index tensors enter as int32."""
+    config = shim.policy.model_runner.model_config.hf_config
+    if config.model_type != "deepseek_v41":
+        return original(shim, fn, input_ids, positions, forward_batch, *args, **kwargs)
+    saved = {name: getattr(forward_batch, name) for name in _INT32_BATCH_FIELDS}
+    for name, value in saved.items():
+        setattr(forward_batch, name, _int32(value))
+    try:
+        return original(
+            shim,
+            fn,
+            _int32(input_ids),
+            _int32(positions),
+            forward_batch,
+            *args,
+            **kwargs,
+        )
+    finally:
+        for name, value in saved.items():
+            setattr(forward_batch, name, value)
 
 
 def tpu_dsv41_engram_owned_rows(original, embedding, indices):
@@ -388,8 +414,8 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
-            "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.forward",
-            tpu_dsv41_int32_input_ids,
+            "sglang_tpu.compilation.compiled_forward_shim.CompiledForwardShim._forward",
+            tpu_dsv41_int32_graph_inputs,
             HookType.AROUND,
         ),
         (
