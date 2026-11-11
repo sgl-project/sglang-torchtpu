@@ -19,6 +19,7 @@ from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     support_torch_compile,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase, enter_scope
@@ -939,6 +940,47 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         worker._prepare_draft_forward_batch(batch, refresh_dp_metadata=True)
 
         self.assertEqual(events, ["spec", "dp", "metadata", "ready"])
+
+
+class TestTorchCompileBundleTracer(CustomTestCase):
+    """The scheduler saves and loads torch.compile bundles only under Dynamo."""
+
+    def _init_all_cuda_graphs(self, tracer, *, save=None, load=None):
+        from sglang.srt.compilation import torch_compile_bundle
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(
+                tpu_compile_tracer=tracer,
+                unsafe_save_torch_compile_bundle=save,
+                unsafe_load_torch_compile_bundle=load,
+            ),
+            tp_worker=MagicMock(),
+            draft_worker=None,
+            attn_dp_enabled=True,
+        )
+        with (
+            patch.object(torch_compile_bundle, "set_fresh_compiler_cache") as fresh,
+            patch.object(torch_compile_bundle, "load") as loads,
+            patch.object(torch_compile_bundle, "save") as saves,
+            patch("torch.distributed.get_rank", return_value=0),
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(False),
+        ):
+            Scheduler.init_all_cuda_graphs(scheduler)
+        scheduler.tp_worker.init_cuda_graphs.assert_called_once_with()
+        return fresh.call_count, loads.call_count, saves.call_count
+
+    def test_direct_tracer_skips_bundles(self):
+        for flags in (dict(save="/tmp/b"), dict(load="/tmp/b")):
+            with self.subTest(**flags):
+                self.assertEqual(
+                    self._init_all_cuda_graphs("direct", **flags), (0, 0, 0)
+                )
+
+    def test_dynamo_tracer_keeps_bundles(self):
+        self.assertEqual(self._init_all_cuda_graphs("dynamo", save="/tmp/b"), (1, 0, 1))
+        self.assertEqual(self._init_all_cuda_graphs("dynamo", load="/tmp/b"), (1, 1, 0))
+        self.assertEqual(self._init_all_cuda_graphs("dynamo"), (0, 0, 0))
 
 
 if __name__ == "__main__":

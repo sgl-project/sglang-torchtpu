@@ -605,12 +605,12 @@ class ExecGraph(msgspec.Struct):
     ] = False
     unsafe_save_torch_compile_bundle: A[
         Optional[str],
-        "Directory in which to save per-rank torch.compile bundles after warmup. "
-        "Leave both bundle flags unset to use torch.compile normally.",
+        "Directory to save per-rank compilation artifacts after warmup. "
+        "Leave both bundle flags unset to compile normally.",
     ] = None
     unsafe_load_torch_compile_bundle: A[
         Optional[str],
-        "Directory from which to load per-rank torch.compile bundles. It is the "
+        "Directory from which to load per-rank compilation artifacts. It is the "
         "user's responsibility to ensure the bundle is used "
         "by an SGLang server with the same setup as the one in which it was saved. "
         "Only load bundles from trusted sources because compiler artifacts may "

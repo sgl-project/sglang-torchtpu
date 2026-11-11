@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.overrides import (
     record_foreign_defaults,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
@@ -210,13 +211,6 @@ def handle_tpu_compile_tracer(server_args: Any):
                 "--tpu-compile-tracer direct does not support speculative "
                 f"algorithm {cfg.speculative_algorithm}"
             )
-    if (
-        cfg.unsafe_save_torch_compile_bundle is not None
-        or cfg.unsafe_load_torch_compile_bundle is not None
-    ):
-        raise ValueError(
-            "--tpu-compile-tracer direct does not support torch.compile bundles"
-        )
 
 
 def handle_unsafe_torch_compile_bundle(server_args: Any):
@@ -234,4 +228,30 @@ def handle_unsafe_torch_compile_bundle(server_args: Any):
         raise ValueError("torch.compile bundles are currently supported only on TPU")
     assert cfg.enable_torch_compile, (
         "torch.compile bundles require --enable-torch-compile"
+    )
+    # Under the direct tracer the flags select the warmup queue's executable
+    # store, and the scheduler only opens that queue with async compiles.
+    if (
+        cfg.tpu_compile_tracer == "direct"
+        and not envs.SGLANG_DIRECT_COMPILE_ASYNC.get()
+    ):
+        raise ValueError(
+            "torch.compile bundles under --tpu-compile-tracer direct need "
+            "SGLANG_DIRECT_COMPILE_ASYNC=1"
+        )
+
+
+def torch_compile_bundle_dirs(config: Any) -> tuple[str | None, str | None]:
+    """The torch.compile bundle directories to save to and load from, given
+    the server args or the runtime context's graph config.
+
+    None under ``--tpu-compile-tracer direct``: Dynamo isn't involved there,
+    and the bundle flags select the platform's direct_compile executable
+    store instead.
+    """
+    if config.tpu_compile_tracer == "direct":
+        return None, None
+    return (
+        config.unsafe_save_torch_compile_bundle,
+        config.unsafe_load_torch_compile_bundle,
     )

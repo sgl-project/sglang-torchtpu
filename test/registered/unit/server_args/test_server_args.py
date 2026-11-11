@@ -60,7 +60,10 @@ from sglang.srt.arg_groups.parallel_hook import (
     handle_data_parallelism,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
-from sglang.srt.arg_groups.platform_hook import handle_tpu_compile_tracer
+from sglang.srt.arg_groups.platform_hook import (
+    handle_tpu_compile_tracer,
+    handle_unsafe_torch_compile_bundle,
+)
 from sglang.srt.arg_groups.serving_hook import (
     handle_crash_dump_env,
     handle_deprecated_args,
@@ -2702,7 +2705,6 @@ class TestTpuCompileTracer(unittest.TestCase):
         cases = (
             ({"device": "cuda"}, "supported only on TPU"),
             ({"speculative_algorithm": "EAGLE"}, "does not support.*EAGLE"),
-            ({"unsafe_save_torch_compile_bundle": "/tmp/bundle"}, "bundles"),
         )
         for overrides, error in cases:
             with (
@@ -2713,6 +2715,42 @@ class TestTpuCompileTracer(unittest.TestCase):
                 config.update(overrides)
                 args = ServerArgs(model_path="dummy", **config)
                 handle_tpu_compile_tracer(args)
+
+    def test_direct_accepts_one_torch_compile_bundle_flag(self):
+        # Under the direct tracer the flag selects the direct_compile
+        # executable store.
+        config = {
+            "device": "tpu",
+            "tpu_compile_tracer": "direct",
+            "enable_torch_compile": True,
+        }
+        for flag in (
+            "unsafe_save_torch_compile_bundle",
+            "unsafe_load_torch_compile_bundle",
+        ):
+            with self.subTest(flag=flag):
+                args = ServerArgs(model_path="dummy", **config, **{flag: "/tmp/b"})
+                handle_tpu_compile_tracer(args)
+                handle_unsafe_torch_compile_bundle(args)
+        args = ServerArgs(
+            model_path="dummy",
+            **config,
+            unsafe_save_torch_compile_bundle="/tmp/b",
+            unsafe_load_torch_compile_bundle="/tmp/b",
+        )
+        handle_tpu_compile_tracer(args)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            handle_unsafe_torch_compile_bundle(args)
+        # The store lives on the scheduler's warmup queue, which needs async
+        # compiles; without them the flag would do nothing.
+        args = ServerArgs(
+            model_path="dummy", **config, unsafe_load_torch_compile_bundle="/tmp/b"
+        )
+        with (
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(False),
+            self.assertRaisesRegex(ValueError, "SGLANG_DIRECT_COMPILE_ASYNC=1"),
+        ):
+            handle_unsafe_torch_compile_bundle(args)
 
 
 class TestTpuBatchLimitsUnderAttentionDp(CustomTestCase):

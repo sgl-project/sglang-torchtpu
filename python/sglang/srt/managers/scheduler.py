@@ -70,6 +70,7 @@ try:
     )
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
+from sglang.srt.arg_groups.platform_hook import torch_compile_bundle_dirs
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.configs.model_config import (
@@ -1112,8 +1113,7 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Initialize graph and compilation runners for all workers."""
-        save_bundle_dir = self.server_args.unsafe_save_torch_compile_bundle
-        load_bundle_dir = self.server_args.unsafe_load_torch_compile_bundle
+        save_bundle_dir, load_bundle_dir = torch_compile_bundle_dirs(self.server_args)
         bundle_dir = save_bundle_dir or load_bundle_dir
         if bundle_dir is not None:
             self._torch_compile_cache = torch_compile_bundle.set_fresh_compiler_cache()

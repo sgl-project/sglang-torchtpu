@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
+from sglang.srt.arg_groups.platform_hook import torch_compile_bundle_dirs
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
@@ -105,8 +106,7 @@ class SchedulerInternalStateController:
             state["torch_compile_aot_autograd_graphs"] = counters["aot_autograd"][
                 "total"
             ]
-        save_bundle = server_args.unsafe_save_torch_compile_bundle
-        load_bundle = server_args.unsafe_load_torch_compile_bundle
+        save_bundle, load_bundle = torch_compile_bundle_dirs(server_args)
         if save_bundle is not None or load_bundle is not None:
             counters = torch._dynamo.utils.counters
             state["torch_compile_bundle_dynamo_graphs"] = counters["stats"][
