@@ -782,8 +782,11 @@ def ragged_paged_attention(
         cu_q_lens: [max_num_seqs + 1]. Cumulative sum of each sequence's query
             length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
             b=cu_q_lens[i+1] represents q/k/v of sequence i.
-        distribution: [3]. Cumulative sum of number of decode, prefill, and mixed
-            sequences. distribution[2] represents total number of sequences.
+        distribution: [3]. Cumulative sum of the number of mixed, prefill and
+            decode sequences: mixed (extend) sequences first, [0, distribution[0]),
+            decode sequences last, [distribution[1], distribution[2]);
+            distribution[2] is the total. Decode-only is [0, 0, n], extend-only
+            [n, n, n].
         attention_sink: [num_q_heads]. Per-head sink logit, treated as one extra
             key with a zero value for every query (same semantics as RPA v3).
         sm_scale: Softmax scale value.
