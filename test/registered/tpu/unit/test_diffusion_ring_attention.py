@@ -3,10 +3,11 @@
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=45, suite="stage-a-test-tpu-unit", chips=1)
 
 import functools
 import importlib.util
+import math
 import os
 import subprocess
 import sys
@@ -38,9 +39,7 @@ def _has_tpu_v7x_pair() -> bool:
     )
 
 
-def _fp32_attention_reference(
-    q_bf16, k_bf16, v_bf16, scale: float
-) -> np.ndarray:
+def _fp32_attention_reference(q_bf16, k_bf16, v_bf16, scale: float) -> np.ndarray:
     qf = np.asarray(q_bf16, dtype=np.float32).transpose(0, 2, 1, 3)
     rep = q_bf16.shape[2] // k_bf16.shape[2]
     kf = np.repeat(np.asarray(k_bf16, dtype=np.float32), rep, axis=2).transpose(
@@ -140,44 +139,77 @@ class TestRingFixedMOperands(unittest.TestCase):
     def test_constant_row0_and_gate_eligibility(self):
         import jax.numpy as jnp
 
-        qn = jnp.array([5.0, 12.0, 10.65], dtype=jnp.float32)
+        qn = jnp.array([5.0, 12.0, 9.5], dtype=jnp.float32)
         kn = jnp.array([10.0, 10.0, 10.0], dtype=jnp.float32)
         mk = np.asarray(diffusion_ring_attention.ring_fixed_m_operands(qn, kn))
         self.assertEqual(mk.shape, (2, 3))
-        np.testing.assert_allclose(mk[0], [106.0, 106.0, 106.0])
+        np.testing.assert_allclose(mk[0], [95.0, 95.0, 95.0])
         np.testing.assert_allclose(mk[1], [1.0, 0.0, 1.0])
+
+    def test_fixed_m_window_keeps_pv_normal(self):
+        """Admitted heads keep every exp2 argument in [-102, 88].
+
+        Below -102, p * v with |v| < 2**-24 is subnormal, which TPU flushes to
+        zero: the output shrinks while l keeps the term. Above 88, l and o can
+        overflow float32 when summed over ~2**17 keys.
+        """
+        bound = diffusion_ring_attention.FIXED_M_RING_SAFE_BOUND
+        recenter = diffusion_ring_attention.FIXED_M_RECENTER
+        m = math.floor(bound) - recenter
+        self.assertLessEqual(bound - m, recenter + 1.0)
+        self.assertGreaterEqual(-bound - m, -102.0)
+
+
+def _assert_per_head_close(test, out, ref, tol, label):
+    test.assertTrue(np.all(np.isfinite(out)), label)
+    for head in range(ref.shape[2]):
+        err = np.linalg.norm(out[:, :, head] - ref[:, :, head])
+        rel_l2 = float(err / np.linalg.norm(ref[:, :, head]))
+        test.assertLess(rel_l2, tol, f"{label} head {head}")
+
+
+def _rerun_with_8_cpu_devices(test: unittest.TestCase) -> None:
+    """Run ``test`` in a subprocess with 8 host CPU devices.
+
+    Another test initialized JAX's CPU backend before XLA_FLAGS took effect.
+    """
+    xla_flags = " ".join(
+        tok
+        for tok in os.environ.get("XLA_FLAGS", "").split()
+        if not tok.startswith("--xla_force_host_platform_device_count=")
+    )
+    env = {
+        **os.environ,
+        "JAX_PLATFORMS": "cpu",
+        "XLA_FLAGS": f"{xla_flags} --xla_force_host_platform_device_count=8".strip(),
+    }
+    test_name = f"{type(test).__name__}.{test._testMethodName}"
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), test_name],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    test.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
 
 
 @unittest.skipUnless(_has_jax(), "jax not installed")
 class TestRingAttentionInterpret(unittest.TestCase):
     def test_ring4_interpret_multiblock_matches_fp32_reference(self):
+        """Ring 4 in Pallas interpret mode against an fp32 reference, per head.
+
+        ring_size=4 separates upstream from downstream. shard_len=310 with
+        bq=256, q_sub=256 and bkv=128 runs 3 KV blocks with a ragged tail, 2 Q
+        passes and the n_q == 1 hybrid last body. GQA 2:1: head 0 is gated to
+        fixed-m; head 1's query is 9x its key, so its base-2 logits (~147)
+        would overflow exp2 if it were gated to fixed-m.
+        """
         import jax
 
         cpu_devices = jax.devices("cpu")
         if len(cpu_devices) < 4:
-            # Another test initialized JAX's CPU backend before XLA_FLAGS took effect.
-            xla_flags = " ".join(
-                tok
-                for tok in os.environ.get("XLA_FLAGS", "").split()
-                if not tok.startswith("--xla_force_host_platform_device_count=")
-            )
-            env = {
-                **os.environ,
-                "JAX_PLATFORMS": "cpu",
-                "XLA_FLAGS": f"{xla_flags} --xla_force_host_platform_device_count=8".strip(),
-            }
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    os.path.abspath(__file__),
-                    "TestRingAttentionInterpret.test_ring4_interpret_multiblock_matches_fp32_reference",
-                ],
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+            _rerun_with_8_cpu_devices(self)
             return
 
         import jax.numpy as jnp
@@ -185,14 +217,9 @@ class TestRingAttentionInterpret(unittest.TestCase):
         from jax.experimental.pallas import tpu as pltpu
         from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-        # ring_size=4 separates upstream from downstream; shard_len=310 with
-        # bq=256, q_sub=256, bkv=128 exercises 3 KV blocks (_run_full + per-block
-        # _reload_own + ragged KV tail), 2 Q passes, n_q == 1 hybrid last body,
-        # batch=2, and GQA 4:2 with mixed fixed-m / online heads.
         rng = np.random.default_rng(0)
         ring_size = 4
         shard_len = 310
-        batch = 2
         seq_len = ring_size * shard_len
         head_dim = 128
         scale = head_dim**-0.5
@@ -203,10 +230,10 @@ class TestRingAttentionInterpret(unittest.TestCase):
             "block_q_sub": 256,
         }
 
-        q_np = rng.standard_normal((batch, seq_len, 4, head_dim), dtype=np.float32)
-        q_np[:, :, 3, :] *= 8.0
-        k_np = rng.standard_normal((batch, seq_len, 2, head_dim), dtype=np.float32)
-        v_np = rng.standard_normal((batch, seq_len, 2, head_dim), dtype=np.float32)
+        k_np = rng.standard_normal((1, seq_len, 1, head_dim), dtype=np.float32)
+        v_np = rng.standard_normal((1, seq_len, 1, head_dim), dtype=np.float32)
+        q_np = rng.standard_normal((1, seq_len, 2, head_dim), dtype=np.float32)
+        q_np[:, :, 1, :] = 9.0 * k_np[:, :, 0, :]
 
         q_bf16 = jnp.asarray(q_np, dtype=jnp.bfloat16)
         k_bf16 = jnp.asarray(k_np, dtype=jnp.bfloat16)
@@ -214,31 +241,121 @@ class TestRingAttentionInterpret(unittest.TestCase):
         ref = _fp32_attention_reference(q_bf16, k_bf16, v_bf16, scale)
 
         axis_names = ("batch", "ring", "uly")
-        mesh = Mesh(np.asarray(cpu_devices[:ring_size]).reshape(1, ring_size, 1), axis_names)
+        mesh = Mesh(
+            np.asarray(cpu_devices[:ring_size]).reshape(1, ring_size, 1), axis_names
+        )
         spec = PartitionSpec(*axis_names)
         sharding = NamedSharding(mesh, spec)
 
-        def _put(x, heads: int):
-            reshaped = jnp.swapaxes(
-                x.reshape(batch, ring_size, shard_len, heads, head_dim), 0, 1
-            )
-            return jax.device_put(reshaped[None, :, None, :, :, :, :], sharding)
+        def _put(x):
+            reshaped = x.reshape(ring_size, shard_len, x.shape[2], head_dim)
+            return jax.device_put(reshaped[None, :, None, None], sharding)
 
-        q_in, k_in, v_in = _put(q_bf16, 4), _put(k_bf16, 2), _put(v_bf16, 2)
-
+        outs = {}
         for use_fixed_m in (True, False):
-            with self.subTest(use_fixed_m=use_fixed_m):
-                pltpu.reset_tpu_interpret_mode_state()
+            pltpu.reset_tpu_interpret_mode_state()
+            # Both launches run the same DMA schedule; race-check one of them.
+            interpret = pltpu.InterpretParams(detect_races=use_fixed_m)
+            fn = jax.jit(
+                jax.shard_map(
+                    functools.partial(
+                        diffusion_ring_attention.ring_attention_sharded,
+                        ring_axis="ring",
+                        axis_names=axis_names,
+                        scale=scale,
+                        use_fixed_m=use_fixed_m,
+                        pinned=pinned,
+                        interpret=interpret,
+                    ),
+                    mesh=mesh,
+                    in_specs=(spec, spec, spec),
+                    out_specs=spec,
+                    check_vma=False,
+                )
+            )
+            out = np.asarray(fn(_put(q_bf16), _put(k_bf16), _put(v_bf16)))
+            outs[use_fixed_m] = out.astype(np.float32).reshape(1, seq_len, 2, head_dim)
+            if use_fixed_m:
+                self.assertFalse(
+                    ipc.races is not None and ipc.races.races_found,
+                    "Pallas interpret detected a DMA or semaphore race",
+                )
+
+        for use_fixed_m, out in outs.items():
+            _assert_per_head_close(self, out, ref, 4e-3, f"fixed_m={use_fixed_m}")
+        # Head 0 takes the fixed-m body only when fixed-m is on; head 1 takes
+        # the online body in both launches.
+        self.assertFalse(np.array_equal(outs[True][:, :, 0], outs[False][:, :, 0]))
+        np.testing.assert_array_equal(outs[True][:, :, 1], outs[False][:, :, 1])
+
+
+@unittest.skipUnless(_has_jax(), "jax not installed")
+class TestShort2DRingInterpret(unittest.TestCase):
+    def test_short_2d_ring_matches_fp32_reference(self):
+        """Short-shard 2D ring in interpret mode against an fp32 reference, per head.
+
+        Ulysses 2 runs inside each rank pair and a ppermute ring across pairs.
+        Ring 4 runs the first and last flash steps; ring 8 adds the resume
+        steps in between. Batch 2, GQA 4:2 and a ragged 195-row shard.
+        """
+        import jax
+
+        cpu_devices = jax.devices("cpu")
+        if len(cpu_devices) < 8:
+            _rerun_with_8_cpu_devices(self)
+            return
+
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+        from sglang_tpu.multimodal_gen import tpu_splash_attn
+
+        # The flash kernel has no cross-device DMA, so the generic interpreter
+        # suffices; TPU interpret mode syncs devices per kernel, which
+        # deadlocks against the ppermutes between ring 8's resume steps.
+        interpret_call = functools.partial(pl.pallas_call, interpret=True)
+        tpu_info = SimpleNamespace(vmem_capacity_bytes=64 * 2**20)
+        rng = np.random.default_rng(0)
+        batch, shard_len, head_dim = 2, 195, 128
+        scale = head_dim**-0.5
+        axis_names = ("batch", "ring", "uly")
+        spec = PartitionSpec(*axis_names)
+
+        for ring_size in (4, 8):
+            seq_len = ring_size * shard_len
+            shapes = [(batch, seq_len, heads, head_dim) for heads in (4, 2, 2)]
+            q_bf16, k_bf16, v_bf16 = (
+                jnp.asarray(rng.standard_normal(shape, dtype=np.float32), jnp.bfloat16)
+                for shape in shapes
+            )
+            ref = _fp32_attention_reference(q_bf16, k_bf16, v_bf16, scale)
+            mesh = Mesh(
+                np.asarray(cpu_devices[:ring_size]).reshape(1, ring_size // 2, 2),
+                axis_names,
+            )
+
+            def _put(x, ring_size=ring_size, mesh=mesh):
+                # Rank 2 * ring_index + uly_index holds that sequence block.
+                heads = x.shape[2]
+                blocks = x.reshape(batch, ring_size, shard_len, heads, head_dim)
+                blocks = jnp.swapaxes(blocks, 0, 1).reshape(
+                    1, ring_size // 2, 2, batch, shard_len, heads, head_dim
+                )
+                return jax.device_put(blocks, NamedSharding(mesh, spec))
+
+            with (
+                patch.object(pl, "pallas_call", interpret_call),
+                patch.object(pltpu, "get_tpu_info", return_value=tpu_info),
+            ):
                 fn = jax.jit(
                     jax.shard_map(
                         functools.partial(
-                            diffusion_ring_attention.ring_attention_sharded,
-                            ring_axis="ring",
-                            axis_names=axis_names,
-                            scale=scale,
-                            use_fixed_m=use_fixed_m,
-                            pinned=pinned,
-                            interpret=pltpu.InterpretParams(detect_races=True),
+                            tpu_splash_attn._short_2d_ring_sharded, scale=scale
                         ),
                         mesh=mesh,
                         in_specs=(spec, spec, spec),
@@ -246,19 +363,13 @@ class TestRingAttentionInterpret(unittest.TestCase):
                         check_vma=False,
                     )
                 )
-                out_sharded = np.asarray(fn(q_in, k_in, v_in), dtype=np.float32)[
-                    0, :, 0
-                ]
-                out = np.swapaxes(out_sharded, 0, 1).reshape(
-                    batch, seq_len, 4, head_dim
+                out = np.asarray(
+                    fn(_put(q_bf16), _put(k_bf16), _put(v_bf16)), dtype=np.float32
                 )
-                self.assertFalse(
-                    ipc.races is not None and ipc.races.races_found,
-                    "Pallas interpret detected a DMA or semaphore race",
-                )
-                self.assertTrue(np.all(np.isfinite(out)))
-                rel_l2 = float(np.linalg.norm(out - ref) / np.linalg.norm(ref))
-                self.assertLess(rel_l2, 7e-3)
+            out = np.swapaxes(
+                out.reshape(ring_size, batch, shard_len, 4, head_dim), 0, 1
+            ).reshape(batch, seq_len, 4, head_dim)
+            _assert_per_head_close(self, out, ref, 4e-3, f"ring={ring_size}")
 
 
 @unittest.skipUnless(_has_tpu_v7x_pair(), "requires TPU v7x with >= 2 TensorCores")
@@ -330,9 +441,7 @@ class TestRingAttentionOnDevice(unittest.TestCase):
                 out = np.asarray(fn(q_in, k_in, v_in), dtype=np.float32)[
                     0, :, 0, 0
                 ].reshape(1, seq_len, 4, head_dim)
-                self.assertTrue(np.all(np.isfinite(out)))
-                rel_l2 = float(np.linalg.norm(out - ref) / np.linalg.norm(ref))
-                self.assertLess(rel_l2, 7e-3)
+                _assert_per_head_close(self, out, ref, 4e-3, f"fixed_m={use_fixed_m}")
 
 
 class TestRingMeshSpec(unittest.TestCase):
@@ -386,9 +495,7 @@ class TestRingMeshSpec(unittest.TestCase):
             self._check_spec(8, [5, 7], replica_ranks=[4, 5, 6, 7]), (1, 2, 2)
         )
         # Ring ranks outside the replica group are rejected.
-        self.assertIsNone(
-            self._check_spec(8, [0, 1, 2, 3], replica_ranks=[4, 5, 6, 7])
-        )
+        self.assertIsNone(self._check_spec(8, [0, 1, 2, 3], replica_ranks=[4, 5, 6, 7]))
 
     def test_non_grid_or_trivial_returns_none(self):
         from sglang_tpu.multimodal_gen import tpu_splash_attn
@@ -412,11 +519,12 @@ class TestRingAttentionDispatch(unittest.TestCase):
     def test_env_switch_disables_ring_kernel(self):
         from unittest.mock import patch
 
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.multimodal_gen import tpu_splash_attn
         from sglang_tpu.multimodal_gen.tpu_splash_attn import TpuSplashAttentionImpl
 
         with (
-            patch.dict(os.environ, {"SGLANG_TPU_ENABLE_DIFFUSION_RING_KERNEL": "0"}),
+            tpu_envs.SGLANG_TPU_ENABLE_DIFFUSION_RING_KERNEL.override(False),
             patch.object(tpu_splash_attn, "_check_splash_available", return_value=True),
             patch.object(tpu_splash_attn, "_register_ops", side_effect=lambda: None),
             patch.object(tpu_splash_attn, "_FLASH_OP", object()),
