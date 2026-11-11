@@ -453,7 +453,28 @@ class RpaConfigs:
     @property
     def max_schedule_size_multiplier(self) -> int:
         # By default, setting an upper bound of ~5x the SMEM capacity on schedule.
-        return self.serve.max_schedule_size_multiplier
+        # Grown to the static step bound: a long prefill padded to many rows (whose
+        # page table shrinks max_steps_ub) needs more steps than 16 SMEM chunks, and
+        # the schedule kernel flushes chunks past the HBM buffer end without a check.
+        return max(
+            self.serve.max_schedule_size_multiplier,
+            -(-(self.static_max_steps + 1) // self.max_steps_ub),
+        )
+
+    @property
+    def static_max_steps(self) -> int:
+        """Upper bound on schedule steps for any input of these static shapes."""
+        num_k = -(
+            -(self.serve.pages_per_seq * self.serve.page_size) // self.block.bkv_sz
+        )
+        if self.mode == RpaCase.DECODE:
+            steps = self.serve.num_seqs * num_k
+        else:
+            num_q = (
+                -(-self.serve.total_q_tokens // self.block.bq_sz) + self.serve.num_seqs
+            )
+            steps = num_q * num_k
+        return -(-steps // self.block.batch_size)
 
     def validate_inputs(
         self,
