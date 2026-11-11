@@ -104,18 +104,19 @@ class TpuEnvs:
     # not only pooled DSA. Not bit-exact with the per-query kernel (summation
     # order); False keeps it.
     SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL = EnvBool(False)
-    # DSA indexer token split for prefill (EXTEND / MIXED batches of at least
-    # _MIN_TOKENS tokens; the minimum is also 32 rows per rank): every
-    # attention-TP rank stores the index keys of all tokens but scores and
-    # top-k-selects only its contiguous slice of ceil(T / attn_tp) query rows
-    # (rounded up to 8); an int32 all-reduce over the attention-TP group puts
-    # the [T, topk] rows together (attention_pallas_mla_sparse.py). Same rows
-    # bit for bit; attention is unchanged. _MAX_ROWS caps the rows per rank
-    # (the all-reduce buffer is [attn_tp, rows, topk] int32 per DSA layer);
-    # larger batches keep the replicated path, as do decode and verify.
-    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT = EnvBool(False)
+    # DSA indexer token split, always on with attention TP > 1: prefill
+    # (EXTEND / MIXED) batches of at least this many tokens (and at least 32
+    # rows per rank) have every attention-TP rank store the index keys of all
+    # tokens but score and top-k-select only its contiguous slice of
+    # ceil(T / attn_tp) query rows (rounded up to 8); an int32 all-reduce over
+    # the attention-TP group puts the [T, topk] rows together
+    # (attention_pallas_mla_sparse.py). Same rows bit for bit; attention is
+    # unchanged. The pooled (kpool) indexer (GLM-5.3-Flash) splits the same
+    # way, and the ranks exchange their rows' picked pools ([T, topk // kpool])
+    # and expand them to tokens afterwards. No cap on the rows per rank (the
+    # all-reduce buffer, [attn_tp, rows, topk] int32 per DSA layer, grows with
+    # the chunk); decode and verify keep the replicated path.
     SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MIN_TOKENS = EnvInt(1024)
-    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MAX_ROWS = EnvInt(512)
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
@@ -426,6 +427,10 @@ class TpuEnvs:
     # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
     # device on Kimi-K2.6). vmem-fp8 always uses f32.
     SGLANG_TPU_INT4_MOE_FP32_SCALES = EnvBool(False)
+    # Store NVFP4 MoE group scales as f32 instead of bf16 on the non-fused-RS
+    # gmm_v2 path (e.g. PP with TP=1) so gmm_v2 uses Mosaic 32-bit zero-stride
+    # scale loads instead of VPU broadcast expansion.
+    SGLANG_TPU_NVFP4_MOE_FP32_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)

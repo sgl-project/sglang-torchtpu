@@ -1,4 +1,4 @@
-"""DSA indexer token split (SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT), host-side logic without a TPU.
+"""DSA indexer token split (always on with attention TP > 1), host-side logic without a TPU.
 
 The windowed indexer kernel is checked bit for bit against the unsplit one on
 TPU in test/registered/tpu/unit/test_dsa_index_topk.py. These cover the rest:
@@ -21,7 +21,6 @@ from sglang_tpu.attention_pallas_mla_sparse import (
     TpuPallasSparseMlaAttnBackend,
     _assemble_split_rows,
 )
-from sglang_tpu.envs import envs as tpu_envs
 
 
 def _split_rows(num_tokens, tp):
@@ -81,19 +80,17 @@ class TestSplitRows(CustomTestCase):
         backend.forward_metadata = SimpleNamespace(decode_query_size=decode_query_size)
         return backend
 
-    def _rows(self, backend, num_tokens, extend=True, max_rows=512):
+    def _rows(self, backend, num_tokens, extend=True):
         batch = SimpleNamespace(forward_mode=_Mode(extend))
-        with tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MAX_ROWS.override(max_rows):
-            return backend._indexer_split_rows(batch, num_tokens)
+        return backend._indexer_split_rows(batch, num_tokens)
 
     def test_prefill_buckets(self):
         # The 93L TP32 run: 4096 -> 128 rows per rank, 1024 -> 32.
         self.assertEqual(self._rows(self._backend(32), 4096), 128)
         self.assertEqual(self._rows(self._backend(32), 1024), 32)
-        # 13L TP8: 4096 -> 512 rows per rank, within the default cap.
+        # 13L TP8: 4096 -> 512 rows per rank; no cap, so 8192 -> 1024.
         self.assertEqual(self._rows(self._backend(8), 4096), 512)
-        self.assertEqual(self._rows(self._backend(8), 8192), 0)  # 1024 > cap
-        self.assertEqual(self._rows(self._backend(8), 4096, max_rows=128), 0)
+        self.assertEqual(self._rows(self._backend(8), 8192), 1024)
 
     def test_unsplit_batches(self):
         backend = self._backend(32)
