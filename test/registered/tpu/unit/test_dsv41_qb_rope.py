@@ -10,7 +10,12 @@ cross-product of large shapes. No model weights, server, or mesh is needed.
 The arithmetic and 1e-2 absolute/relative tolerances follow the epic source
 at vllm-torchtpu dc1cd126e, tests/kernels/attention_preprocessing/test_qb_rope.py
 and src/vllm_torchtpu/kernels/attention_preprocessing/reference.py. This test
-uses NumPy/ml_dtypes instead of importing that reference or kernel helpers.
+implements dense JAX arithmetic independently of kernel helpers, executed on
+TPU, plus the real generic TorchTPU linear followed by NumPy complex RoPE.
+The CPU NumPy oracle checks algebraic boundaries, not bitwise TPU matmul:
+XLA reciprocal lowering can change FP8 midpoint codes, and TPU dot rounding
+can cross the BF16 projection boundary. Neither tolerance is relaxed for these
+platform effects; both TPU references use the original 1e-2 tolerances.
 """
 
 import importlib.util
@@ -20,6 +25,7 @@ import unittest
 # TorchTPU owns the device; JAX exports custom calls on CPU, as in CSA2 tests.
 os.environ["JAX_PLATFORMS"] = "cpu"
 
+import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -59,17 +65,45 @@ def _reference(qr, weight, scale, cache, positions):
     product = encoded.astype(np.float32) @ weight.astype(np.float32)
     projected = (product * row_scale * scale[None, :]).astype(BF16)
     projected = projected.reshape(len(qr), -1, HEAD_DIM)
+    return _rotate_reference(projected, cache, positions)
+
+
+def _rotate_reference(projected, cache, positions):
     result = projected.astype(np.float32)
     rows = cache[np.clip(positions, 0, len(cache) - 1)]
     # Complex multiplication makes the forward sign and adjacent-pair layout
     # independent of the kernel's lane-XOR/sign-folded coefficient machinery.
-    tail = result[..., -ROPE_DIM:].reshape(len(qr), -1, ROPE_DIM // 2, 2)
+    tail = result[..., -ROPE_DIM:].reshape(len(projected), -1, ROPE_DIM // 2, 2)
     z = tail[..., 0].astype(np.float64) + 1j * tail[..., 1]
     rotation = rows[:, :32].astype(np.float64) + 1j * rows[:, 32:]
     rotated = z * rotation[:, None, :]
     result[..., -ROPE_DIM::2] = rotated.real
     result[..., -ROPE_DIM + 1 :: 2] = rotated.imag
     return result.astype(BF16)
+
+
+@jax.jit
+def _dense_tpu_reference(qr, weight, scale, cache, positions):
+    """Epic's dense arithmetic; no Pallas, lane helpers, or fused op calls."""
+    values = qr.astype(jnp.float32)
+    maximum = jnp.max(jnp.abs(values), axis=1, keepdims=True)
+    row_scale = jnp.where(maximum == 0, 1.0, maximum / 448.0)
+    encoded = jnp.clip(values / row_scale, -448.0, 448.0).astype(jnp.float8_e4m3fn)
+    product = jax.lax.dot_general(
+        encoded,
+        weight,
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    projected = (product * row_scale * scale).astype(jnp.bfloat16)
+    projected = projected.reshape(qr.shape[0], -1, HEAD_DIM)
+    rows = cache[jnp.clip(positions, 0, cache.shape[0] - 1)]
+    tail = projected[..., -ROPE_DIM:].astype(jnp.float32)
+    partner = jnp.stack((-tail[..., 1::2], tail[..., ::2]), axis=-1).reshape(tail.shape)
+    cosine = jnp.repeat(rows[:, :32], 2, axis=1)[:, None, :]
+    sine = jnp.repeat(rows[:, 32:], 2, axis=1)[:, None, :]
+    rotated = (tail * cosine + partner * sine).astype(jnp.bfloat16)
+    return jnp.concatenate((projected[..., :-ROPE_DIM], rotated), axis=-1)
 
 
 def _inputs(tokens, rank=128, heads=8):
@@ -159,9 +193,16 @@ class TestQBRopeTPU(CustomTestCase):
         ops.register_ops()
 
     def _check(self, tokens, rank=128, heads=8, compiled=False):
+        from sglang_tpu.fp8_linear import apply_tpu_fp8_linear
+
         arrays = _inputs(tokens, rank, heads)
-        expected = _reference(*arrays).astype(np.float32)
         inputs = tuple(_tensor(value, "tpu") for value in arrays)
+        # Export stays on CPU; explicitly place the independent dense oracle on
+        # TPU so it observes the same FP8 midpoint and dot rounding semantics.
+        reference_device = jax.devices("tpu")[0]
+        reference_inputs = tuple(jax.device_put(x, reference_device) for x in arrays)
+        projected = apply_tpu_fp8_linear(*inputs[:3]).cpu().float().numpy()
+        projected = projected.reshape(tokens, heads, HEAD_DIM)
         run = ops.qb_rope
         if compiled:
             run = torch.compile(run, backend="tpu", fullgraph=True, dynamic=False)
@@ -170,12 +211,20 @@ class TestQBRopeTPU(CustomTestCase):
             if replay:
                 arrays = (*arrays[:-1], arrays[-1][::-1].copy())
                 inputs = (*inputs[:-1], _tensor(arrays[-1], "tpu"))
-                expected = _reference(*arrays).astype(np.float32)
+                reference_inputs = (
+                    *reference_inputs[:-1],
+                    jax.device_put(arrays[-1], reference_device),
+                )
+            expected = np.asarray(_dense_tpu_reference(*reference_inputs), np.float32)
+            generic_expected = _rotate_reference(
+                projected, arrays[3], arrays[4]
+            ).astype(np.float32)
             output = run(*inputs)
             self.assertEqual(tuple(output.shape), (tokens, heads, HEAD_DIM))
             self.assertEqual(output.dtype, torch.bfloat16)
             actual = output.cpu().float().numpy()
             np.testing.assert_allclose(actual, expected, atol=1e-2, rtol=1e-2)
+            np.testing.assert_allclose(actual, generic_expected, atol=1e-2, rtol=1e-2)
             if tokens > 1:
                 np.testing.assert_array_equal(actual[0], 0)
             # Near-zero elements cannot hide a globally incorrect projection.
