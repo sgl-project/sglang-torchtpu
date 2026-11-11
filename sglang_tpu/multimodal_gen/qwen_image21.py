@@ -72,7 +72,10 @@ def pad_layout(layout: dict, alignment: int, device) -> dict:
     extra = -prefix_len % alignment
     # Padded rows take text row 0 and the identity rotation; no real query reads them.
     prefix_rope = torch.cat(
-        (layout["prefix_rope"], layout["prefix_rope"].new_ones(extra, *layout["prefix_rope"].shape[1:]))
+        (
+            layout["prefix_rope"],
+            layout["prefix_rope"].new_ones(extra, *layout["prefix_rope"].shape[1:]),
+        )
     )
     target_len = layout["target_rope"].shape[0]
     out = dict(layout)
@@ -204,7 +207,9 @@ def dit_forward(
     if extra:
         hidden_states = F.pad(hidden_states, (0, 0, 0, extra))
         layouts = [
-            dict(layout, target_rope=F.pad(layout["target_rope"], (0, 0, 0, 0, 0, extra)))
+            dict(
+                layout, target_rope=F.pad(layout["target_rope"], (0, 0, 0, 0, 0, extra))
+            )
             for layout in layouts
         ]
     output = _STOCK_DIT_FORWARD(
@@ -239,8 +244,12 @@ def _dit_call(self, *args, **kwargs):
         extra = -packed.shape[1] % PROMPT_TOKEN_ALIGNMENT
         if extra:
             packed = F.pad(packed, (0, 0, 0, extra))
-        kwargs["encoder_hidden_states"] = [packed] if isinstance(states, list) else packed
-        kwargs["layouts"] = [dict(layout, encoder_seq_len=packed.shape[1]) for layout in layouts]
+        kwargs["encoder_hidden_states"] = (
+            [packed] if isinstance(states, list) else packed
+        )
+        kwargs["layouts"] = [
+            dict(layout, encoder_seq_len=packed.shape[1]) for layout in layouts
+        ]
     return torch.nn.Module.__call__(self, *args, **kwargs)
 
 
@@ -265,7 +274,14 @@ def attention_forward(self, x, ropes, prefixes, layouts, caches):
 
 
 def block_forward(
-    self, hidden_states, modulation, prefix_states, prefix_modulation, layouts, ropes, caches
+    self,
+    hidden_states,
+    modulation,
+    prefix_states,
+    prefix_modulation,
+    layouts,
+    ropes,
+    caches,
 ):
     """``QwenImage21TransformerBlock.forward`` on caches already sliced to this layer.
 
@@ -275,7 +291,9 @@ def block_forward(
     """
     scale1, gate1, scale2, gate2 = modulation
     prefixes = [
-        dit.apply_modulation(state["hidden_states"], self.img_norm1, prefix_modulation[0])
+        dit.apply_modulation(
+            state["hidden_states"], self.img_norm1, prefix_modulation[0]
+        )
         if not cache
         else None
         for state, cache in zip(prefix_states, caches, strict=True)
@@ -306,11 +324,25 @@ def block_forward(
 
 
 def _block_call(
-    self, hidden_states, modulation, prefix_states, prefix_modulation, layouts, ropes, caches
+    self,
+    hidden_states,
+    modulation,
+    prefix_states,
+    prefix_modulation,
+    layouts,
+    ropes,
+    caches,
 ):
     caches = [cache[self._layer_id] for cache in caches]
     return torch.nn.Module.__call__(
-        self, hidden_states, modulation, prefix_states, prefix_modulation, layouts, ropes, caches
+        self,
+        hidden_states,
+        modulation,
+        prefix_states,
+        prefix_modulation,
+        layouts,
+        ropes,
+        caches,
     )
 
 

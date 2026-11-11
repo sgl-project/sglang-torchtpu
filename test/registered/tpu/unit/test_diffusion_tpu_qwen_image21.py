@@ -143,7 +143,9 @@ class TestQwenImage21Layout(_TestBase):
         self.assertEqual(padded["target_keys"].tolist(), [0, 16])
         self.assertFalse(padded["text_only"])
         self.assertEqual(padded["segments"], stock["segments"])
-        self.assertTrue(torch.equal(padded["text_indices"][:prefix_len], stock["text_indices"]))
+        self.assertTrue(
+            torch.equal(padded["text_indices"][:prefix_len], stock["text_indices"])
+        )
         self.assertTrue((padded["text_indices"][prefix_len:] == 0).all())
         cos, sin = padded["prefix_rope"][:, 0, ::2], padded["prefix_rope"][:, 1, ::2]
         self.assertTrue(torch.equal(cos[:prefix_len], stock["prefix_rope"].real))
@@ -200,7 +202,9 @@ class TestQwenImage21Denoise(_TestBase):
             # The first request also settles a lazily resolved kernel-dispatch
             # global (sglang.kernels.fused_op), which recompiles one graph once.
             for text_len in (5, 5, 37, 120):
-                layout = stage.build_layout(_slots(text_len, False), [_TARGET], _AXES, "cpu")
+                layout = stage.build_layout(
+                    _slots(text_len, False), [_TARGET], _AXES, "cpu"
+                )
                 _denoise(model, layout, text_len, False)
                 counts.append(len(graphs))
         # One prefill and one cached graph serve both blocks (not one per
@@ -223,7 +227,9 @@ class TestQwenImage21WholeModelCompile(_TestBase):
             # The TPU default (no --regional-compile) compiles the whole DiT.
             model.compile(backend=counting_backend, dynamic=False)
             for text_len in (5, 5, 37, 120):
-                layout = stage.build_layout(_slots(text_len, False), [_TARGET], _AXES, "cpu")
+                layout = stage.build_layout(
+                    _slots(text_len, False), [_TARGET], _AXES, "cpu"
+                )
                 _denoise(model, layout, text_len, False)
                 counts.append(len(graphs))
         self.assertEqual(counts[2:], [counts[1]] * 2)
@@ -293,7 +299,9 @@ class TestQwenImage21KernelAttention(_TestBase):
         usp = SimpleNamespace(skip_sequence_parallel=True, attn_impl=impl)
         gen = torch.Generator().manual_seed(0)
         for prefix_len, target_len in ((37, 2048), (500, 4096)):
-            q, k, v = (torch.randn(1, target_len, 2, 128, generator=gen) for _ in range(3))
+            q, k, v = (
+                torch.randn(1, target_len, 2, 128, generator=gen) for _ in range(3)
+            )
             kp, vp = (torch.randn(1, 512, 2, 128, generator=gen) for _ in range(2))
             layout = {
                 "prefix_keys": torch.tensor([0, prefix_len], dtype=torch.int32),
@@ -302,10 +310,14 @@ class TestQwenImage21KernelAttention(_TestBase):
             to_tpu = lambda t: t.bfloat16().to("tpu")  # noqa: E731
             q_heads = to_tpu(q).transpose(1, 2)
             self.assertTrue(
-                qwen_image21._uses_kernel(impl, q_heads, to_tpu(kp).transpose(1, 2), to_tpu(k).transpose(1, 2))
+                qwen_image21._uses_kernel(
+                    impl, q_heads, to_tpu(kp).transpose(1, 2), to_tpu(k).transpose(1, 2)
+                )
             )
             got = qwen_image21._target_attention(
-                usp, *map(to_tpu, (q, k, v, kp, vp)), {n: t.to("tpu") for n, t in layout.items()}
+                usp,
+                *map(to_tpu, (q, k, v, kp, vp)),
+                {n: t.to("tpu") for n, t in layout.items()},
             ).cpu()
             keys = torch.cat((kp[:, :prefix_len], k), 1)
             values = torch.cat((vp[:, :prefix_len], v), 1)
