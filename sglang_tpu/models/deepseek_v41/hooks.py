@@ -45,6 +45,14 @@ trace_tpu_platform_fact
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: PlatformContext is Dynamo-traceable or V4.1 forward reads
        platform facts outside the compiled region.
+tpu_dsv41_hc_combine
+  Why: the shifted-mHC forward (DeepseekV4DecoderLayer._hc_combine and the
+       model's final hc_head) calls the Triton hc_combine with no device
+       guard; Dynamo cannot trace a Triton launch on TPU.
+  How: AROUND sglang.kernels.ops.layernorm.mhc.hc_combine computes the same
+       fp32 weighted sum of the hc_mult copies in torch for non-CUDA tensors.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: hc_combine dispatches on device like the other mHC kernels.
 """
 
 from __future__ import annotations
@@ -102,6 +110,15 @@ def trace_tpu_platform_fact(original, platform, name):
     return _resolve_platform_fact(name)
 
 
+def tpu_dsv41_hc_combine(original, x_flat, pre, hc, out_dtype):
+    """y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h], accumulated in fp32."""
+    if x_flat.is_cuda:
+        return original(x_flat, pre, hc, out_dtype)
+    m = x_flat.shape[0]
+    copies = x_flat.reshape(m, hc, -1).float()
+    return (pre.float().unsqueeze(-1) * copies).sum(1).to(out_dtype)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -125,6 +142,11 @@ def hook_specs():
         (
             "sglang.srt.runtime_context.PlatformContext.__getattr__",
             trace_tpu_platform_fact,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.kernels.ops.layernorm.mhc.hc_combine",
+            tpu_dsv41_hc_combine,
             HookType.AROUND,
         ),
     ]
