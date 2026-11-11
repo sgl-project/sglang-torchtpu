@@ -14,7 +14,7 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: tests/kernels/fused_moe/test_fused_ep_moe_v2_tables.py
-# Revision: bdb38700dd25959c029c7d77f00cee91ccd3a0bc
+# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 """The routing-table identities the fused EP MoE kernel derives rather than ships.
 
 `shard_transport_tables_in_blocks` returns three tables that are the same array

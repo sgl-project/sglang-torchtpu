@@ -1,6 +1,6 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/fused_moe/v2/__init__.py
-# Revision: bdb38700dd25959c029c7d77f00cee91ccd3a0bc
+# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
