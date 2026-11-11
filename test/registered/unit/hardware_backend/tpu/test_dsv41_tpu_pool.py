@@ -360,6 +360,18 @@ class TestDSV41TPUPoolRejects(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
             _make_pool(self, layer_num=20, start_layer=20, end_layer=40)
 
+    def test_target_layers_before_mtp_entries_are_not_a_stage(self):
+        """Regression: V4.1 Flash lists 43 compress ratios (40 target + 3 MTP);
+        the target pool (layer_num=40, layers [0, 40)) was rejected as a PP stage."""
+        pool = _make_pool(
+            self,
+            compression_ratios=RATIOS + [0, 0, 0],
+            layer_num=len(RATIOS),
+            start_layer=0,
+            end_layer=len(RATIOS),
+        )
+        self.assertEqual(len(pool.layer_mapping), len(RATIOS) + 3)
+
     def test_hisparse(self):
         with self.assertRaisesRegex(ValueError, "HiSparse"):
             _make_pool(self, enable_hisparse=True)
