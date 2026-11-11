@@ -1086,6 +1086,22 @@ class MqaAttentionBase(nn.Module):
                 yield
 
 
+class MQAInputPreparation(NamedTuple):
+    """Complete early preparation for the single-stream MQA path.
+
+    ``q_lora`` is normalized, unquantized input for the indexer; ``q`` has
+    completed projection, head normalization and RoPE. ``kv`` is normalized,
+    rotated attention input, or None when the backend already stored it.
+    The backend owns any cache writes and must honor the supplied output
+    buffers, just as the ordinary preparation path does. Returning None from
+    ``prepare_mqa_input`` instead selects ordinary preparation for this call.
+    """
+
+    q_lora: torch.Tensor
+    q: torch.Tensor
+    kv: Optional[torch.Tensor]
+
+
 class MQALayer(MqaAttentionBase):
     is_dsv41: bool = False
 
@@ -1807,7 +1823,25 @@ class MQALayer(MqaAttentionBase):
         k_rope_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
-        if self.fuse_wqa_wkv:
+        prepared: Optional[MQAInputPreparation] = None
+        from sglang.srt.platforms import current_platform
+
+        if current_platform.is_out_of_tree():
+            prepare_input = getattr(attn_backend, "prepare_mqa_input", None)
+            if prepare_input is not None:
+                prepared = prepare_input(
+                    self,
+                    x_linear,
+                    positions,
+                    forward_batch,
+                    q_out=q_out,
+                    q_rope_out=q_rope_out,
+                    k_nope_out=k_nope_out,
+                    k_rope_out=k_rope_out,
+                )
+        if prepared is not None:
+            qkv_a = None
+        elif self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
@@ -1865,7 +1899,9 @@ class MQALayer(MqaAttentionBase):
             unified and (is_decode or fuse_verify or fuse_prefill)
         ) or (not unified and self.use_fused_qk_norm_rope)
 
-        if do_fused_qk_norm_rope:
+        if prepared is not None:
+            q_lora, q, kv = prepared
+        elif do_fused_qk_norm_rope:
             if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,

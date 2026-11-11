@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.models.deepseek_v4 import MQAInputPreparation, MQALayer
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -95,6 +96,27 @@ class AttentionBackend(ABC):
     # that never set it cannot serve the unified pool, which the server-args
     # allow-list enforces.
     kv_index_translator = None
+
+    def prepare_mqa_input(
+        self,
+        layer: MQALayer,
+        x_linear: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        q_out: Optional[torch.Tensor] = None,
+        q_rope_out: Optional[torch.Tensor] = None,
+        k_nope_out: Optional[torch.Tensor] = None,
+        k_rope_out: Optional[torch.Tensor] = None,
+    ) -> Optional[MQAInputPreparation]:
+        """Optionally prepare single-stream MQA before any input projection.
+
+        Only consulted on out-of-tree platforms. Return None to retain the
+        ordinary path; otherwise satisfy ``MQAInputPreparation`` including
+        output buffers and cache ownership. Compressor/indexer work remains
+        with the caller. Other preparation paths do not consult this hook.
+        """
+        return None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
