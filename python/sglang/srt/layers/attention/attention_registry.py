@@ -239,7 +239,6 @@ def create_flashmla_backend(runner):
 
 @register_attention_backend("fa3")
 def create_flashattention_v3_backend(runner):
-
     major, minor = get_device_capability()
     if not _is_musa:
         assert (major == 8 and not runner.use_mla_backend) or major == 9, (
@@ -526,7 +525,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     ShortConvAttnBackend,
                 )
 
-                linear_attn_backend = ShortConvAttnBackend(runner)
+                if get_platform().is_out_of_tree():
+                    linear_attn_backend = get_platform().get_short_conv_backend_cls()(
+                        runner
+                    )
+                else:
+                    linear_attn_backend = ShortConvAttnBackend(runner)
                 hybrid_backend_cls = ShortConvHybridAttnBackend
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)

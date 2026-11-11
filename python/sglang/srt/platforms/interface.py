@@ -166,6 +166,26 @@ class SRTPlatform(DeviceMixin):
 
         return MambaPool
 
+    def get_short_conv_backend_cls(self) -> type:
+        """Return the state-metadata sidecar for short-convolution hybrids."""
+        from sglang.srt.layers.attention.linear.short_conv_backend import (
+            ShortConvAttnBackend,
+        )
+
+        return ShortConvAttnBackend
+
+    def get_short_conv_kernel(self) -> Optional[Callable[..., Any]]:
+        """Optional causal depthwise-convolution implementation.
+
+        Called with ``(x, weight, bias, metadata, forward_mode)``: ``x`` is
+        token-major ``[tokens, channels]``, ``weight`` is ``[channels, width]``,
+        and ``metadata`` comes from this platform's short-conv sidecar. The
+        callable returns an output shaped and typed like ``x`` and updates the
+        per-layer history in ``metadata.layer_cache``. None keeps the model's
+        existing kernels.
+        """
+        return None
+
     def create_weight_update_receiver(
         self, backend: str, *, tp_rank: int
     ) -> Optional[WeightUpdateReceiver]:
