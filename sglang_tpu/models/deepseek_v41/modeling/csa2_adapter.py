@@ -1,14 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TP1 CSA2 bridges, retaining stage-scoped gathered KV ownership."""
+"""Preserved, unsupported legacy TP1 CSA2 modeling bridges.
+
+This snapshot's allocator binds private BF16 SWA pages. Epic dc1cd126e instead
+publishes adjacent-token packed SWA into shared flat INT32 [rows,128] physical
+owners. A dtype view cannot reconcile those layouts. Migrating this snapshot
+requires its allocator, binding and attention callsites to move together; do not
+route it into the active SGLang ``attention_backend`` / ``ops`` implementation.
+Imports remain available for inspection, but legacy CSA2 invocation fails before
+registering device ops or mutating a cache.
+"""
 
 import functools
 import math
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import jax
 import jax.numpy as jnp
 import torch
-from vllm_torchtpu import envs
 
 from sglang_tpu.models.deepseek_v41.kernels import output_projection
 from sglang_tpu.models.deepseek_v41.kernels.attention_preprocessing import rope_gather
@@ -22,13 +30,23 @@ from sglang_tpu.models.deepseek_v41.kernels.csa2.pipeline import (
     csa2_gather_chunk_size,
     csa2_pipeline,
 )
-from sglang_tpu.models.deepseek_v41.kernels.paged_swa import write_swa_pages
 from sglang_tpu.models.deepseek_v41.kernels.v4.o_projection import wo_a_projection
 
 if TYPE_CHECKING:
     from .cache import PagedCacheRows
 
 _ops: dict[str, Any] = {}
+
+
+def _unsupported_legacy_swa() -> NoReturn:
+    raise NotImplementedError(
+        "Legacy optimized modeling CSA2 is unsupported: its allocator/bind_kv_cache "
+        "still supplies private BF16 SWA pages, but epic dc1cd126e requires shared "
+        "flat INT32 [rows,128] physical owners with adjacent-token packing and "
+        "matching page stride/offset. Migrate allocation, binding and attention "
+        "callsites together; this snapshot is not connected to the active SGLang "
+        "attention_backend + ops backend."
+    )
 
 
 def _publish_main(
@@ -57,7 +75,7 @@ def _publish_main_banked(
 
 
 def _publish_swa(raw: jax.Array, records: jax.Array, values: jax.Array) -> jax.Array:
-    return write_swa_pages(raw, records, values)
+    _unsupported_legacy_swa()
 
 
 def _publish_swa_banked(
@@ -66,10 +84,12 @@ def _publish_swa_banked(
     records: jax.Array,
     values: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    return write_swa_pages((raw, high), records, values)
+    _unsupported_legacy_swa()
 
 
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
+    from vllm_torchtpu import envs
+
     # Q/K already carry RoPE; CSA2 consumes this small inverse-rotation table.
     table = rope_gather.by_row_blocks(
         lambda rows: cos_sin[rows],
@@ -176,6 +196,8 @@ def _gather_attend(
     non_causal: bool,
     bq: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    from vllm_torchtpu import envs
+
     records, counts = prepare_main_records(
         selected,
         pages,
@@ -224,6 +246,8 @@ def _metadata(
     row_offset: int,
     non_causal: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    from vllm_torchtpu import envs
+
     return prepare_swa_metadata(
         table,
         starts,
@@ -254,14 +278,7 @@ def _prepare_publish_swa(
     minimum: jax.Array,
     values: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    from sglang_tpu.models.deepseek_v41.kernels.decode_preparation import (
-        swa_prepare_publish,
-    )
-
-    owner, metadata, bounds, records = swa_prepare_publish(
-        (raw,), table, starts, positions, minimum, values
-    )
-    return owner, metadata, bounds, records
+    _unsupported_legacy_swa()
 
 
 def _prepare_publish_swa_banked(
@@ -273,14 +290,7 @@ def _prepare_publish_swa_banked(
     minimum: jax.Array,
     values: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    from sglang_tpu.models.deepseek_v41.kernels.decode_preparation import (
-        swa_prepare_publish,
-    )
-
-    owner, upper, metadata, bounds, records = swa_prepare_publish(
-        (raw, high), table, starts, positions, minimum, values
-    )
-    return owner, upper, metadata, bounds, records
+    _unsupported_legacy_swa()
 
 
 def _fake_prepare_publish_swa(raw, table, starts, positions, minimum, values):
@@ -338,6 +348,7 @@ def _manual_bridge(function, mesh, tensor_args, out_specs):
 
 
 def initialize_csa2_ops() -> None:
+    _unsupported_legacy_swa()
     if _ops:
         return
     from jax.sharding import PartitionSpec as P
@@ -480,6 +491,7 @@ def publish_main(
 def publish_swa(
     cache: "PagedCacheRows", records: torch.Tensor, values: torch.Tensor
 ) -> None:
+    _unsupported_legacy_swa()
     if cache.raw_hi is None:
         cache.raw.copy_(_ops["publish_swa"](cache.raw, records.int(), values))
     else:
@@ -507,6 +519,7 @@ def attention(
     scale: float,
     non_causal: bool,
 ) -> torch.Tensor:
+    _unsupported_legacy_swa()
     from . import attention_kernels
 
     if not q.shape[0]:
@@ -619,6 +632,7 @@ def prepare_swa(
     cache: "PagedCacheRows",
     non_causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _unsupported_legacy_swa()
     return _ops["metadata"](
         table.int(),
         starts.int(),
@@ -639,7 +653,8 @@ def prepare_publish_swa(
     cache: "PagedCacheRows",
     values: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Publish value-ready native pages while creating the shared metadata."""
+    """Legacy BF16-page publication requires a coordinated owner migration."""
+    _unsupported_legacy_swa()
     args = (table.int(), starts.int(), positions.int(), minimum.int(), values)
     if cache.raw_hi is None:
         raw, metadata, bounds, records = _ops["prepare_publish_swa"](cache.raw, *args)
