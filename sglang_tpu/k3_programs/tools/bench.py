@@ -45,6 +45,11 @@ def add_arguments(parser, profile: bool = False) -> None:
         help="also one mixed batch, rows by context: e.g. 1152x4,131072x4",
     )
     decode.add_argument("--steps", type=int, default=40)
+    decode.add_argument(
+        "--no-index",
+        action="store_true",
+        help="Kimi-K3.1: decode without the DSA index pools (the K3 attention on its weights)",
+    )
     decode.add_argument("--repeats", type=int, default=3)
     decode.add_argument("--temperature", type=float, default=0.0)
     decode.add_argument(
@@ -193,7 +198,7 @@ def run_decode(args, records: harness.Records) -> None:
 
     # Kimi-K3.1 (the indexer's families pre-sharded): index-key pools too.
     ops.load_weights()  # once; the decoder's bind reuses them
-    index = all(name in ops.weights for name in dsa_decode.FAMILIES)
+    index = all(name in ops.weights for name in dsa_decode.FAMILIES) and not args.no_index
     pools = k3.Pools(blocks, pages, 1, pattern=True, index=index)
 
     # Serving's DSpark schedule: seven drafts through batch four, three
