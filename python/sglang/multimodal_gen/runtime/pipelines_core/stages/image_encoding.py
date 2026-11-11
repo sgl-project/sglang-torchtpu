@@ -189,6 +189,23 @@ class ImageEncodingStage(PipelineStage):
 
         return postprocess_funcs[0](outputs, image_inputs)
 
+    def _text_encoder_position_ids(self, inputs, device):
+        """Text encoder positions from the processor's host tensors, or None.
+
+        The encoder would otherwise derive them on the device (an int64
+        cumsum and boolean indexing).
+        """
+        model = getattr(self.text_encoder, "model", None)
+        if self.image_encoder or not hasattr(model, "get_rope_index"):
+            return None
+        position_ids, _ = model.get_rope_index(
+            inputs["input_ids"],
+            inputs.get("image_grid_thw"),
+            inputs.get("video_grid_thw"),
+            attention_mask=inputs.get("attention_mask"),
+        )
+        return position_ids.to(device)
+
     @staticmethod
     def _split_text_conditioning_output(output):
         if isinstance(output, TextConditioningOutput):
@@ -263,7 +280,10 @@ class ImageEncodingStage(PipelineStage):
 
             image_inputs = self.image_processor(
                 images=prompt_images, return_tensors="pt", **cur_kwargs
-            ).to(cuda_device)
+            )
+            # before the upload: BatchFeature.to moves its tensors in place
+            position_ids = self._text_encoder_position_ids(image_inputs, cuda_device)
+            image_inputs = image_inputs.to(cuda_device)
 
             if self.image_encoder:
                 # if an image encoder is provided
@@ -307,7 +327,11 @@ class ImageEncodingStage(PipelineStage):
                         images=prompt_images,
                         return_tensors="pt",
                         **neg_image_processor_kwargs,
-                    ).to(cuda_device)
+                    )
+                    neg_position_ids = self._text_encoder_position_ids(
+                        neg_image_inputs, cuda_device
+                    )
+                    neg_image_inputs = neg_image_inputs.to(cuda_device)
 
                 with self.use_declared_component(
                     component_name="text_encoder",
@@ -337,6 +361,7 @@ class ImageEncodingStage(PipelineStage):
                         outputs = self.text_encoder(
                             input_ids=image_inputs.input_ids,
                             attention_mask=image_inputs.attention_mask,
+                            position_ids=position_ids,
                             pixel_values=image_inputs.pixel_values,
                             image_grid_thw=image_inputs.image_grid_thw,
                             output_hidden_states=True,
@@ -346,6 +371,7 @@ class ImageEncodingStage(PipelineStage):
                             neg_outputs = self.text_encoder(
                                 input_ids=neg_image_inputs.input_ids,
                                 attention_mask=neg_image_inputs.attention_mask,
+                                position_ids=neg_position_ids,
                                 pixel_values=neg_image_inputs.pixel_values,
                                 image_grid_thw=neg_image_inputs.image_grid_thw,
                                 output_hidden_states=True,

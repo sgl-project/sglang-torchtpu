@@ -113,6 +113,7 @@ def make_text_config(output_type="tensor"):
         is_flux_v1=lambda: False,
         tokenize_prompt=tokenize,
         get_text_encoder_attention_mask=lambda inputs, _: inputs["attention_mask"],
+        get_text_encoder_position_ids=lambda inputs, _: None,
         get_text_encoder_pooler_output=lambda outputs, _: outputs.pooler_output,
         build_text_conditioning_mask=lambda inputs, mask, embeds, _: mask.bool(),
         seq_lens_from_text_conditioning_mask=lambda mask: mask.sum(-1).tolist(),
