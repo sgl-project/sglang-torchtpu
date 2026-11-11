@@ -19,6 +19,13 @@ class RemappedHistoryHasher(engram.EngramHasher):
         return torch.tensor([1, 1], dtype=torch.int64, device=device)
 
 
+class UnblockedLookbackHasher(engram.EngramHasher):
+    def prepare_lookback_blocked(self, mask):
+        # Deliberately remove barriers so bypassing the external seam changes
+        # observable hashes, not merely a mock invocation count.
+        return torch.zeros_like(mask)
+
+
 class TestEngramExtendRows(CustomTestCase):
     @staticmethod
     def hasher(hasher_cls=engram.EngramHasher):
@@ -74,6 +81,39 @@ class TestEngramExtendRows(CustomTestCase):
                     model.history,
                     torch.tensor(committed, dtype=torch.int32).reshape(-1, 1),
                 )
+
+    def test_image_barriers_use_external_preparer_without_changing_commit(self):
+        for oot, expected in ((False, [5, 12, 0, 0]), (True, [3, 12, 0, 0])):
+            with self.subTest(out_of_tree=oot):
+                model = self.hasher(UnblockedLookbackHasher)
+                model.image_token_id = 3
+                platform = types.SimpleNamespace(is_out_of_tree=lambda oot=oot: oot)
+                with patch.object(engram, "current_platform", platform):
+                    result = model(torch.tensor([5, 6, 0, 0]), self.batch())
+                # History [3] is an image: native mode blocks that predecessor;
+                # the deliberately unblocked external mapping retains it.
+                torch.testing.assert_close(result[:, 0, 0], torch.tensor(expected))
+                torch.testing.assert_close(
+                    model.history, torch.tensor([[6], [9], [6]], dtype=torch.int32)
+                )
+
+    def test_default_lookback_preparer_prefix_barriers_and_empty_rows(self):
+        model = self.hasher()
+        for width in (1, 2, 4, 8):
+            masks = torch.tensor(
+                [
+                    [bool(bits & (1 << i)) for i in range(width)]
+                    for bits in range(1 << width)
+                ],
+                dtype=torch.bool,
+            )
+            expected = torch.tensor(
+                [[any(row[: i + 1]) for i in range(width)] for row in masks.tolist()],
+                dtype=torch.bool,
+            )
+            torch.testing.assert_close(model.prepare_lookback_blocked(masks), expected)
+            empty = torch.empty((0, width), dtype=torch.bool)
+            torch.testing.assert_close(model.prepare_lookback_blocked(empty), empty)
 
     def test_default_preparer_zero_length_boundaries_and_unknown_total(self):
         model = self.hasher()

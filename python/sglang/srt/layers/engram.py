@@ -289,6 +289,16 @@ class EngramHasher(nn.Module):
             torch.arange(bs, device=device), lens, output_size=output_size
         )
 
+    def prepare_lookback_blocked(self, mask: torch.Tensor) -> torch.Tensor:
+        """Inclusive boolean prefix OR along the lookback axis for a backend.
+
+        ``mask`` combines sequence-start and image-token barriers. Return a
+        boolean tensor of the same shape: once a barrier is encountered, all
+        older predecessors are blocked. The native cumulative-max path remains
+        the default; no cumulative indices are part of this contract.
+        """
+        return mask.to(torch.int32).cummax(-1).values.bool()
+
     def forward(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -459,12 +469,17 @@ class EngramHasher(nn.Module):
                 tokens >= MM_PAD_SHIFT_VALUE, self.image_token_id
             )
             # Once a lookback hits an image, every older predecessor is PAD.
-            blocked = (
-                (blocked | (tokens == self.image_token_id))
-                .to(torch.int32)
-                .cummax(-1)
-                .values.bool()
-            )
+            if current_platform.is_out_of_tree():
+                blocked = self.prepare_lookback_blocked(
+                    blocked | (tokens == self.image_token_id)
+                )
+            else:
+                blocked = (
+                    (blocked | (tokens == self.image_token_id))
+                    .to(torch.int32)
+                    .cummax(-1)
+                    .values.bool()
+                )
         hash_ids = compute_engram_hash_ids(
             tokens,
             blocked,
