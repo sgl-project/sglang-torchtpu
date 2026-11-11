@@ -42,8 +42,6 @@ class TestFusedMoeRsOp(CustomTestCase):
             tensor((256, 8), torch.int32),
             tensor((1,)),
             tensor((2,), torch.int32),
-            None,  # w1_global_scale
-            None,  # w2_global_scale
             8,
             "silu",
             False,

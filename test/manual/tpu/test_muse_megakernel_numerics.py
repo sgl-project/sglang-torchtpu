@@ -593,7 +593,6 @@ class _Runner:
         mk.chunk_pages = ops._CHUNK_PAGES
         mk.kv_packed = True
         mk.expert_groups = ()
-        mk.scale_fp8 = False
         mk.moe_mode = "ep" if _EP else "tp"
         mk._ops = {}
         self.mk = mk

@@ -2,7 +2,6 @@
 
 import dataclasses
 import functools
-import os
 from typing import Any, Callable, Tuple
 
 import jax
@@ -333,13 +332,8 @@ def inner_kernel(
             rhs_scale = tiled_rhs_ref.get_scale()
             if rhs_scale.ndim == 2:
                 # Compact [num_quant_blocks, n] tile (fused-RS 3D scale layout).
-                scale = rhs_scale[b_id : b_id + 1, start_n:end_n]
-            else:
-                scale = rhs_scale[..., b_id, :, start_n:end_n]
-            # e4m3 block scales (NVFP4 with separate globals) widen on use.
-            if scale.dtype == jnp.float8_e4m3fn:
-                scale = scale.astype(jnp.float32)
-            return scale
+                return rhs_scale[b_id : b_id + 1, start_n:end_n]
+            return rhs_scale[..., b_id, :, start_n:end_n]
 
         def _online_quantize(block, axis, quant_dtype):
             if jnp.issubdtype(quant_dtype, jnp.floating):
@@ -423,13 +417,6 @@ def inner_kernel(
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_tile_n = tiled_rhs.shape[-1]
-            # Experts the Muse megakernel permuted (SGLANG_TPU_MUSE_MK_KPERM): row 16 i + j of
-            # each 256-row K block takes block-16 scale row j of that block.
-            kperm = (
-                os.environ.get("MUSE_PF_MOE_KPERM", "0") == "1"
-                and cfgs.rhs_cfgs.has_scale
-                and rhs_qbs == 16
-            )
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
@@ -442,33 +429,7 @@ def inner_kernel(
                     block_lhs = tiled_lhs[:, start_k:end_k]
                     block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
-                    if kperm and (
-                        apply_rhs_scale_after_matmul or (end_k - start_k) % 256
-                    ):
-                        raise NotImplementedError(
-                            "MUSE_PF_MOE_KPERM (KPERM-layout NVFP4 experts) needs "
-                            "256-multiple K steps with scales folded before the matmul; "
-                            f"got K step {end_k - start_k}, tile_k {cfgs.tiles.tile_k}, "
-                            f"lhs block {q_block_size}. Unset SGLANG_TPU_MUSE_MK_KPERM."
-                        )
-                    if kperm:
-                        w_bf16 = block_rhs.astype(jnp.bfloat16)
-                        parts = []
-                        for kb in range((end_k - start_k) // 256):
-                            b0 = (start_k + kb * 256) // 16
-                            rhs_scale = tiled_rhs_ref.get_scale()
-                            if rhs_scale.ndim == 2:
-                                sb = rhs_scale[b0 : b0 + 16, start_n:end_n]
-                            else:
-                                sb = rhs_scale[..., b0 : b0 + 16, 0, start_n:end_n]
-                            parts.append(
-                                w_bf16[kb * 256 : (kb + 1) * 256]
-                                * jnp.tile(sb.astype(jnp.bfloat16), (16, 1))
-                            )
-                        block_rhs_for_quant = (
-                            parts[0] if len(parts) == 1 else jnp.concatenate(parts, 0)
-                        )
-                    elif cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
+                    if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
                         scaled_rhs_slices = []
                         rhs_k_start = start_k
                         while rhs_k_start < end_k:

@@ -45,9 +45,7 @@ def _megakernel(**flags):
         max_position=262144,
         chunk_pages=4,
         kv_packed=flags.get("kv_packed", True),
-        scale_fp8=False,
         expert_groups=flags.get("expert_groups", ()),
-        kperm=flags.get("kperm", True),
         moe_mode="tp",
     )
 
@@ -128,7 +126,7 @@ class TestMuseMegakernelConfig(CustomTestCase):
                     K.scratch_vmem_bytes(cfg), ops._OPT_BASE_VMEM_BUDGET
                 )
 
-    def test_wave5_expert_split_swa_and_kperm0_bd_all(self):
+    def test_wave5_expert_split_swa_and_bd_all(self):
         groups = ops.expert_groups_of(_KINDS, 15)
         cfg_24 = _config(_megakernel(expert_groups=groups), 8, 3, **_FP8_SAL)
         self.assertEqual(cfg_24.expert_split, 0)
@@ -137,14 +135,10 @@ class TestMuseMegakernelConfig(CustomTestCase):
         self.assertTrue(cfg_24.attn_skip_idle_streams and cfg_24.attn_col_mask)
         cfg_32 = _config(_megakernel(expert_groups=groups), 4, 8, **_FP8_SAL)
         self.assertEqual(cfg_32.expert_split, 4)
-        self.assertEqual(cfg_32.compact_rows, 4)
-        self.assertEqual(cfg_32.compact_arms, (1, 2, 4))
-        self.assertTrue(cfg_32.ex_w2_stage)
-        self.assertFalse(cfg_32.ex_bd_all)
-        cfg_32_kperm0 = _config(
-            _megakernel(expert_groups=groups, kperm=False), 4, 8, **_FP8_SAL
-        )
-        self.assertTrue(cfg_32_kperm0.ex_bd_all)
+        self.assertEqual(cfg_32.compact_rows, 8)
+        self.assertEqual(cfg_32.compact_arms, (1, 2, 4, 8))
+        self.assertFalse(cfg_32.ex_w2_stage)
+        self.assertTrue(cfg_32.ex_bd_all)
 
     def test_row_tiled_steps(self):
         # Steps past 32 rows run the row-tiled program: rows a multiple of the row tile,

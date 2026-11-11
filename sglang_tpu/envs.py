@@ -547,9 +547,6 @@ class TpuEnvs:
     # pages_swa windows DMA'd into SMEM instead of the whole table: "auto" (when the two page
     # tables exceed the SMEM budget), "1" or "0" (forced, e.g. to A/B the two paths)
     SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE = EnvStr("auto")
-    # Fused-RS NVFP4 experts keep the checkpoint's e4m3 block scales and apply the
-    # per-expert global scales after each dot: half the scale bytes of folded bf16.
-    SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
     # Megakernel attention on fp8 SEQ_ALONG_LANE pools: feed K (and V) to the MXU as fp8
     # instead of widening each chunk to bf16 on the VPU first. 0 = off, 1 = K only, 2 = K and V
     # (exact). With the 2026-10-27 megakernel, 2 saves 0.09 / 0.20 / 0.40 ms per q = 1 step at
@@ -568,9 +565,6 @@ class TpuEnvs:
     # Muse megakernel Wave 1-4 optimizations (hoisted SAL refill, stack2 QK/PV, all-VMEM
     # collective/expert scratch on row-tiled steps, 2D PairColl collectives, vectorized routing).
     SGLANG_TPU_MUSE_MK_OPT = EnvBool(True)
-    # Offline block-256 (16, 16)^T pre-shuffling of fp4 expert slabs + wpool/scales for
-    # zero-shuffle NVFP4 dequant in the decode megakernel (and prefill MoE via MUSE_PF_MOE_KPERM).
-    SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
     # Decode megakernel (TP): fp4 experts requantized to one scale per this many K rows (0 off,
     # 64 / 128 / 256); the expert dots push raw e2m1 codes to the MXU (MKConfig.qblock).
     SGLANG_TPU_MUSE_MK_QBLOCK = EnvInt(0)

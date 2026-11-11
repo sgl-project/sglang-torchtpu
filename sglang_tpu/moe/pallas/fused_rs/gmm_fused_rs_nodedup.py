@@ -1652,12 +1652,12 @@ def gmm_v2_fused_rs(
         rhs1_quant_block_size = recover_quant_block_size(size_k1, w1s_shape[1])
         rhs2_quant_block_size = recover_quant_block_size(size_k2, w2s_shape[1])
         quant_block_size = rhs1_quant_block_size
-        # Scales stay in their stored dtype when it is bf16, fp32 or e4m3: the matmul
+        # Scales stay in their stored dtype when it is bf16 or fp32: the matmul
         # casts each tile slice, while a full-tensor cast here would re-copy
         # every expert's scales on each call (group-16 scales are large).
         scale_dtype = (
             w1_scale.dtype
-            if w1_scale.dtype in (jnp.bfloat16, jnp.float32, jnp.float8_e4m3fn)
+            if w1_scale.dtype in (jnp.bfloat16, jnp.float32)
             else jnp.dtype(jnp.float32)
         )
         w1_scale = w1_scale.astype(scale_dtype)

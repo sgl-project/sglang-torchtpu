@@ -543,8 +543,6 @@ def fused_moe_func_rs(
     group_offset_input: jax.Array | None = None,
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
-    w1_global_scale: jax.Array | None = None,
-    w2_global_scale: jax.Array | None = None,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel (gmm_fused_rs).
 
@@ -604,8 +602,6 @@ def fused_moe_func_rs(
         topk=topk,
         mesh=mesh,
         post_expert_norm_weight=post_expert_norm_weight,
-        w1_global_scale=w1_global_scale,
-        w2_global_scale=w2_global_scale,
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
     )
