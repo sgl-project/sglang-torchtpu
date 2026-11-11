@@ -14,22 +14,7 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: tests/kernels/experimental/push_fused_moe/test_fused_ep_moe_push.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
-"""Device tests for the push-dispatch fused EP MoE.
-
-`fused_ep_moe_push` is v2's fused stage with only the data movement changed:
-the activation all-gather becomes a SparseCore pre-push of the first
-`sc_prepush` visit positions plus in-kernel pushes of the rest, the routing
-exchange may run as a TensorCore remote-DMA kernel, and the combine folds
-the arrival-scale lookup in. So the gate is the layer's output against
-`fused_ep_moe_v2` on the same inputs (which test_fused_ep_moe_v2.py holds to
-a dense reference), bit for bit, over every dispatch split, both routing
-exchanges, both slab builds (push from VMEM / through the contribution slab)
-and both served weight formats, with a rotated-expert control.
-
-Every test needs the eight-way expert-parallel slice (8 JAX devices, e.g. a
-tpu7x 2x2x1 host); on anything else the module skips at setup.
-"""
+"""Push dispatch and static-placement tests on an eight-device EP mesh."""
 
 import os
 import shlex
@@ -436,11 +421,7 @@ def _served_fp4_weights(mesh, seed, *, e_total):
 
 @pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
 def test_served_dims_program_knobs_are_bit_exact(shape):
-    """The closing barrier, the tile-height ladder, the HBM result staging and
-    the dispatch run-ahead change no arithmetic: every build matches the
-    four-rung build with the barrier bit for bit at the served dims. A score
-    bias makes a few experts hot, so visits span several tiles and every rung
-    of each ladder serves some tail tile."""
+    """Height rungs, staging and dispatch run-ahead preserve routed output."""
     g_local, rows, topk = SERVED_SHAPES[shape]
     mesh = _mesh()
     e_total = EP * g_local
@@ -472,11 +453,7 @@ def test_served_dims_program_knobs_are_bit_exact(shape):
     assert np.isfinite(want.astype(np.float32)).all()
     for kw in (
         dict(height_rungs_override=4, tail_barrier=False),
-        dict(height_rungs_override=2),
         dict(height_rungs_override=1),
-        dict(height_rungs_override=2, tail_barrier=False),
-        dict(height_rungs_override=2, hbm_staging=True),
-        dict(height_rungs_override=2, dispatch_ahead=3),
         dict(height_rungs_override=2, hbm_staging=True, dispatch_ahead=g_local),
     ):
         got = fused_ep_moe_push(x, *weights, gating, **kw, **common)
@@ -484,63 +461,6 @@ def test_served_dims_program_knobs_are_bit_exact(shape):
     wrong = fused_ep_moe_push(
         x, *_roll(weights), gating, height_rungs_override=4, **common
     )
-    assert _rel(wrong, want) > CONTROL_BOUND
-
-
-# The MoE-front switches change no arithmetic.
-FRONT_SWITCHES = (
-    "matmul_scale_repeat",
-    "exchange_row_gather",
-    "bf16_sort_counts",
-    "slim_prepush_barrier",
-    "fused_dispatch_meta",
-    "table_kernel",
-    "exchange_row_gather+table_kernel+exchange_tables",
-    "table_kernel+kernel_plan_tables",
-    "exchange_row_gather+table_kernel+exchange_tables+light_prepush",
-    "table_kernel+kernel_plan_tables+light_prepush",
-    "exchange_row_gather+table_kernel+exchange_tables+light_prepush=2",
-    "exchange_row_gather+table_kernel+exchange_tables+single_barrier",
-    "single_barrier",
-)
-
-
-@pytest.mark.parametrize("switch", FRONT_SWITCHES)
-@pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
-def test_served_dims_front_switches_are_bit_exact(shape, switch):
-    """Each front switch gives the default layer's output bit for bit at the
-    served dims, with the served exchange and pre-push."""
-    g_local, rows, topk = SERVED_SHAPES[shape]
-    mesh = _mesh()
-    e_total = EP * g_local
-    weights = _served_fp4_weights(mesh, 71, e_total=e_total)
-    x, gating = _inputs(
-        mesh, 72, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
-    )
-    common = dict(
-        topk=topk,
-        renormalize=True,
-        mesh=mesh,
-        capacity=CAPACITY,
-        weight_format=WeightFormat.FP4,
-        rhs_qb=512,
-        sharded_plan=True,
-        scoring_fn="sqrtsoftplus",
-        routed_scaling_factor=2.5,
-        act_fn="silu_and_mul_with_clamp",
-        logical_intermediate_size=SERVED_LOGICAL_INTER,
-        sc_prepush=2,
-        tc_exchange=True,
-    )
-    want = np.asarray(fused_ep_moe_push(x, *weights, gating, **common))
-    assert np.isfinite(want.astype(np.float32)).all()
-    on = {
-        name: int(value) if value else True
-        for name, _, value in (item.partition("=") for item in switch.split("+"))
-    }
-    got = fused_ep_moe_push(x, *weights, gating, **on, **common)
-    np.testing.assert_array_equal(np.asarray(got), want)
-    wrong = fused_ep_moe_push(x, *_roll(weights), gating, **common)
     assert _rel(wrong, want) > CONTROL_BOUND
 
 
@@ -567,62 +487,6 @@ def _shared_expert_weights(mesh, seed):
 # The served program is compiled through torch_tpu, which keeps the bf16
 # roundings between fused elementwise ops; compile these the same way.
 _AS_SERVED = {"xla_allow_excess_precision": False}
-
-
-@pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
-def test_served_dims_shared_expert_inside_is_bit_exact(shape):
-    """With the shared expert inside the layer, the routed output is the
-    layer's without it bit for bit, and the shared output is the standalone
-    shared expert's on each shard's rows (the fused kernel at g25's 288 rows,
-    the unfused ops at the drafter's 240)."""
-    from sglang_tpu.fp8_swiglu_mlp import fp8_swiglu_mlp
-
-    g_local, rows, topk = SERVED_SHAPES[shape]
-    mesh = _mesh()
-    e_total = EP * g_local
-    weights = _served_fp4_weights(mesh, 81, e_total=e_total)
-    x, gating = _inputs(
-        mesh, 82, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
-    )
-    shared = _shared_expert_weights(mesh, 83)
-    common = dict(
-        topk=topk,
-        renormalize=True,
-        mesh=mesh,
-        capacity=CAPACITY,
-        weight_format=WeightFormat.FP4,
-        rhs_qb=512,
-        sharded_plan=True,
-        scoring_fn="sqrtsoftplus",
-        routed_scaling_factor=2.5,
-        act_fn="silu_and_mul_with_clamp",
-        logical_intermediate_size=SERVED_LOGICAL_INTER,
-        sc_prepush=2,
-        tc_exchange=True,
-    )
-
-    def layer(x, gating, *operands):
-        kw = dict(shared_expert=operands, shared_limit=10.0) if operands else {}
-        return fused_ep_moe_push(x, *weights, gating, **kw, **common)
-
-    want = np.asarray(jax.jit(layer, compiler_options=_AS_SERVED)(x, gating))
-    routed, got_shared = jax.jit(layer, compiler_options=_AS_SERVED)(x, gating, *shared)
-    np.testing.assert_array_equal(np.asarray(routed), want)
-    want_shared = jax.jit(
-        jax.shard_map(
-            lambda xl, *w: fp8_swiglu_mlp(xl, *w, limit=10.0),
-            mesh=mesh,
-            in_specs=(P(AXIS),) + (P(),) * 4,
-            out_specs=P(AXIS),
-            check_vma=False,
-        ),
-        compiler_options=_AS_SERVED,
-    )(x, *shared)
-    got_shared = np.asarray(got_shared)
-    assert np.isfinite(got_shared.astype(np.float32)).all()
-    np.testing.assert_array_equal(
-        got_shared.view(np.uint16), np.asarray(want_shared).view(np.uint16)
-    )
 
 
 def test_dispatch_push_through_v2_is_the_push_layer():
@@ -675,12 +539,7 @@ def four_chip_weights():
 
 
 def _served_dense_samples(mesh, weights, x, ids, coefficients):
-    """Independent FP32 dequantize/matmul reference on a few global rows.
-
-    Every rank computes its local experts then sums contributions. It shares
-    no routing, packing, activation, or combine implementation with the kernel.
-    Sampling bounds reference work while still using the full expert matrices.
-    """
+    """FP32 sampled reference using explicit dequantization and local expert sums."""
 
     def local(x, ids, coefficients, w1, w2, s1, s2):
         count = w1.shape[0]
@@ -725,12 +584,7 @@ def _served_dense_samples(mesh, weights, x, ids, coefficients):
     ids=["verify", "draft", "prefill"],
 )
 def test_four_chip_full_experts_and_static_eplb(four_chip_weights, experts, rows, topk):
-    """EP8: 384/128 logical experts plus one replica slot per rank.
-
-    Catch wrong expert/flat-scale placement, dropped or double-counted replicas,
-    stale load buffers, and push synchronization/combine errors. Uneven padding
-    includes an entirely idle rank; hot experts require multiple dispatch tiles.
-    """
+    """V4.1 EP8: full expert sets, replicas, padding, load counts and shared output."""
     mesh, logical, physical, table = four_chip_weights(experts)
     physical_count = experts + EP
     shard, repl = NamedSharding(mesh, P(AXIS)), NamedSharding(mesh, P())

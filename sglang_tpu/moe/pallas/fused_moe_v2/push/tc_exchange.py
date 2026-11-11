@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/experimental/push_fused_moe/tc_exchange.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,27 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Routing-exchange all-gather as a TensorCore Pallas remote-DMA kernel.
+"""Routing all-gather and optional row gather using TensorCore remote DMA.
 
-`tc_exchange=True` replaces the layer's routing-exchange
-`lax.all_gather` (the i32 [ep, W] gather of the packed routing), which XLA
-offloads to the SparseCore and serializes behind other SparseCore work, with
-one small TensorCore kernel: every shard writes its row into row `me` of
-every peer's output (one remote DMA each, its own row locally), then waits
-for the ep - 1 incoming rows. Bit-exact with
-`lax.all_gather(packed, axis, tiled=True)`. Details:
-
-* the shard's rank arrives as data (scalar prefetch), never `lax.axis_index`;
-* whole-tile slabs only: a row is [R, 128] i32 with R a multiple of 8 on an
-  untiled leading axis, so each DMA moves complete (8, 128) tiles (a
-  partial-tile remote DMA has crashed a slice);
-* a two-phase entry barrier (barrier semaphore, then a scoped REGULAR
-  semaphore), so every peer is inside this call -- output allocated, the
-  previous call's exchange consumed -- before any row lands; with
-  `single_barrier` only the first phase (see _double_barrier);
-* its own collective id: the TensorCore MoE kernel uses 0 and the SparseCore
-  kernels 1.
-"""
+Two cores split the peer set. Rows use padded HBM slabs; all copies complete
+before return. Collective ID 2 is separate from MoE (0) and SparseCore (1)."""
 
 import functools
 import threading

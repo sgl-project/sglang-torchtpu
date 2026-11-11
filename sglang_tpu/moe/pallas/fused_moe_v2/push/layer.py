@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/experimental/push_fused_moe/layer.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,27 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Serving layer of the push-dispatch fused EP MoE.
-
-`fused_ep_moe_push` is v2's `fused_ep_moe_v2` (fused stage) with the fp8
-activation all-gather replaced by push dispatch:
-
-1. every shard sorts its own quantized rows by global expert while the
-   routing exchange (an all-gather of the packed top-k, row scales and
-   per-expert counts, as in v2) is in flight;
-2. from the exchanged counts it builds the dispatch segment table -- one
-   entry per (destination, expert) run of its rows, in each destination's
-   expert visit order;
-3. a SparseCore kernel pushes the runs of the first `sc_prepush` visit
-   positions into every destination's expert slab before the TensorCore
-   kernel starts, overlapped with the routing plan;
-4. the TensorCore kernel pushes the remaining visit positions itself, one
-   position ahead of its own compute, then computes and combines exactly
-   like v2.
-
-Only data movement changes; the plan, the FFN and the combine arithmetic are
-v2's.
-"""
+"""Push routed activations into expert slabs and combine their outputs."""
 
 import functools
 import threading
@@ -248,65 +227,31 @@ def fused_ep_moe_push(
     shared_expert=None,
     shared_limit=None,
 ):
-    """Run one MoE layer through the push-dispatch fused EP kernel.
+    """Push implementation of fused_ep_moe_v2's fused stage.
 
-    Same operands, contract and result as v2's `fused_ep_moe_v2` on its
-    fused stage (see its docstring); `preprocess_topology` is accepted for
-    call compatibility and unused, since no activation all-gather exists.
+    Operands, placement and return values follow fused_ep_moe_v2.
+    preprocess_topology is accepted for compatibility and ignored.
 
-    `sc_prepush` is how many destination visit positions the SparseCore
-    pushes before the TensorCore kernel: at least 1 (a smaller value raises),
-    and a value above the experts per shard is clamped to it with a warning.
-    `tc_exchange` runs the routing exchange as a TensorCore remote-DMA kernel
-    instead of XLA's all-gather. `height_rungs_override` is the tile-height
-    ladder's rung count (0 = the default; see kernel.tile_height_rungs).
-    `tail_barrier=False` drops the kernel's closing all-pairs barrier (see
-    kernel._build_push_moe_kernel), `onehot_slots` maps the layout's
-    slots without gathers (see `_to_slots`), `hbm_staging` ships result
-    tiles through the HBM contribution slab and `dispatch_ahead` is how many
-    visit positions the TensorCore's dispatch pushes run ahead of its compute
-    (see the kernel), `matmul_scale_repeat` builds the scale slab's per-pair
-    activation scales with `_repeat_bits` instead of jnp.repeat, and
-    `exchange_row_gather` (with `tc_exchange`) has the routing-exchange kernel
-    also copy the expert-sorted activation rows, while it waits on its peers,
-    instead of a TensorCore gather after it, `bf16_sort_counts` finds the
-    expert-sorted token order with two single-pass bf16 matmuls
-    (host._sorted_tokens_by_count), and `slim_prepush_barrier` keeps the run
-    tables out of the pre-push barrier, and `fused_dispatch_meta` builds the
-    pre-push counts, this shard's visit list and the kernel's remote-row
-    count with the dispatch segments (host.push_dispatch_tables) instead of
-    decoding them back out of them, and `table_kernel`
-    builds the dispatch and shard tables in one TensorCore kernel
-    (plan_kernel.build_push_tables) -- inside the routing-exchange kernel,
-    while its row copies finish, with `exchange_tables`; with
-    `kernel_plan_tables` the plan's small tables come from that kernel too
-    (host.routing_pairs_from_tables); `light_prepush` (1 or 2) gives the
-    SparseCore pre-push the lightest experts and orders the rest
-    (plan_kernel._tables); `single_barrier` opens the expert kernel and the
-    routing exchange with one barrier phase, not two; `early_scale_scatter`
-    lets the scale-slab scatter run under the in-op shared expert (1: not
-    held behind it; 2: nor behind the SparseCore pre-push).
-    `fused_ep_moe_v2(dispatch="push")` forwards them from its
-    `push_options`; the model caller picks them explicitly.
+    Dispatch and scheduling options:
+    - sc_prepush: initial visit positions pushed by SparseCore (>=1,
+      clamped to local experts); dispatch_ahead: TensorCore run-ahead.
+    - tc_exchange: remote-DMA routing exchange; exchange_row_gather also
+      gathers sorted activations and requires tc_exchange.
+    - height_rungs_override: tile ladder size (0 selects the default);
+      tail_barrier, single_barrier and slim_prepush_barrier control barriers.
+    - hbm_staging: stage result tiles in the HBM contribution slab.
+    - onehot_slots, matmul_scale_repeat and bf16_sort_counts replace index
+      operations with equivalent one-hot/matmul forms.
+    - fused_dispatch_meta: build dispatch counts with the segments;
+      table_kernel: fuse table construction; exchange_tables runs it inside
+      the exchange; kernel_plan_tables also supplies routing-plan tables.
+    - light_prepush (1 or 2): visit light experts first.
+    - early_scale_scatter: release scale scatter before the shared expert
+      (1), or before both the shared expert and SparseCore pre-push (2).
 
-    `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
-    replicated, optional) describe static placement and its routed-row counts.
-    This kernel does not choose or update a layout. With `expert_slot`, the weights' expert axis is in
-    physical slot order (e_total slots over the mesh) while gating and
-    score_bias stay per logical expert: selection runs on logical ids, then
-    each selected id e maps to slot expert_slot[e, (global row) mod
-    (copies of e)] (`_to_slots`), so a replicated expert's rows split evenly
-    over its copies. With `expert_load`, the layer returns (output,
-    expert_load + this step's routed rows per physical slot); the counts are
-    the routing exchange's, identical on every shard. Without either, the
-    program is unchanged.
-
-    `shared_expert` (w13, s13, w2, s2), replicated, is the layer's per-channel
-    FP8 shared expert (`sglang_tpu/fp8_swiglu_mlp.py`
-    with `shared_limit`). It is computed on this shard's rows after the
-    SparseCore pre-push is issued and before the expert kernel, so it runs
-    while the pre-push is in flight; the layer then also returns it, last.
-    """
+    The optional replicated FP8 shared_expert runs while pre-push is in
+    flight; its output is returned separately, last. The caller owns the
+    static expert layout and load accumulator."""
     del preprocess_topology
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)

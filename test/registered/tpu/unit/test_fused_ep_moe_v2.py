@@ -14,7 +14,6 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: tests/kernels/fused_moe/test_fused_ep_moe_v2.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 """Device tests for the fused expert-parallel MoE kernel, in pure JAX.
 
 ``fused_ep_moe_v2`` is the whole MoE layer: it routes, quantizes, dispatches

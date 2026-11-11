@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/experimental/push_fused_moe/sc_dispatch.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,16 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SparseCore pre-push of the push-dispatch fused EP MoE.
+"""SparseCore pre-push into the aliased expert slab.
 
-Before the TensorCore MoE kernel starts, a two-core SparseCore kernel pushes
-this shard's routed rows of the first destination visit positions -- the
-(destination, expert) segments of host.push_dispatch_segments -- straight
-into every destination's expert slab (this kernel's output, which the
-TensorCore kernel then takes as its aliased dispatch slab), and waits for
-every row that lands on this shard. The TensorCore kernel can therefore
-compute its first experts with no dispatch wait.
-"""
+Waits for incoming rows before the TensorCore expert kernel consumes them."""
 
 import jax
 import jax.numpy as jnp

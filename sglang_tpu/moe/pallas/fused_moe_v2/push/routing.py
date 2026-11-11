@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/experimental/push_fused_moe/routing.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 # SPDX-License-Identifier: Apache-2.0
 """Decode routing inputs, retaining the native slab and SparseCore boundaries."""
 

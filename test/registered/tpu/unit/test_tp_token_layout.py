@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: tests/kernels/fused_moe/test_tp_token_layout.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 """SPMD token-replica layout contract, including noncontiguous TP groups.
 
 Runs on an eight-device CPU mesh with

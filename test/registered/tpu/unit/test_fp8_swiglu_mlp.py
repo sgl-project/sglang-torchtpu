@@ -14,7 +14,6 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: tests/kernels/test_fused_shared_expert.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 """Fused FP8 shared expert: dispatch envelope and bitwise parity with the
 unfused ops (two quantized matmuls around the clamped SiLU-and-mul).
 

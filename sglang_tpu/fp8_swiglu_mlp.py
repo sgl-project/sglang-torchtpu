@@ -2,7 +2,6 @@
 # Source: src/vllm_torchtpu/kernels/quantized_matmul/shared_expert.py, with
 # xla_quantized_matmul from util.py and SHARED_EXPERT_TUNING from
 # tuned_block_sizes.py in the same directory.
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

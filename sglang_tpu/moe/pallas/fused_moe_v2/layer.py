@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/fused_moe/v2/layer.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -216,25 +215,10 @@ def _combine_arrivals(
 
 
 def _exchange_layout(t_local, topk, e_total, quantized):
-    """(scale offset, count offset, width) of the flat routing payload.
+    """Lane-aligned (scale offset, count offset, payload width) in int32 words.
 
-    ONE all-gather carries everything the other shards need to know about
-    this shard's tokens: the selections, the row scales the wire quantized
-    them by, and the per-expert pair counts the routing plan exchanges. The
-    plan's own count collective disappears into this one, and the selections
-    arrive already flat -- the pair grid the plan reads is a reshape of the
-    gathered payload rather than a [T, topk] array whose 10 live lanes sit in
-    a 128-lane tile.
-
-    Section starts and total width are aligned to ``HIDDEN_LANE_BLOCK`` so
-    every unpack slice is a view and the SparseCore-offloaded all-gather
-    operates on lane-aligned rows even when ``e_total`` includes spare slots
-    that are not a multiple of 128: an expert layout with spare slots (392 or
-    416 physical experts) was the first odd count, and the unaligned gather
-    failed XLA's offload-collective config builder at compile time
-    (offload_collective_config_builder.h:236). Padding the tail keeps every
-    existing width exactly as it was.
-    """
+    The payload carries selected IDs, optional activation scales and expert counts
+    in one all-gather. Tail padding keeps spare-slot layouts lane-aligned."""
     idx = align_up(t_local * topk, HIDDEN_LANE_BLOCK)
     scale = align_up(t_local, HIDDEN_LANE_BLOCK) if quantized else 0
     return idx, idx + scale, align_up(idx + scale + e_total, HIDDEN_LANE_BLOCK)
@@ -436,120 +420,38 @@ def fused_ep_moe_v2(
     shared_expert=None,
     shared_limit=None,
 ):
-    """Run one MoE layer through the fused expert-parallel kernel.
+    """Run fused EP MoE with all-gather or push dispatch.
 
-    x [tokens, hidden], w1 [experts, hidden, 2 * inter], w2 [experts,
-    inter, hidden] and gating [tokens, experts], all sharded over the mesh
-    axis. Returns [tokens, hidden], sharded like x.
+    Inputs: x [T, H], gating [T, E_logical], w1 [E_physical, H, 2I],
+    w2 [E_physical, I, H], sharded on the EP mesh axis. Returns [T, H].
+    FP8/INT8 scales are per output channel; FP4 scales are per contraction
+    block (rhs_qb), either grouped by expert or row-padded flat tables using
+    host.fp4_scale_rows. BF16 requires both scales to be None.
+    Optional w1_bias/w2_bias are [E_physical, 1, 2I/H].
 
-    weight_format names one of the kernel's accepted weight forms and
-    decides everything that follows from it. w1_scale and w2_scale are per
-    output channel for the per-channel forms (fp8 e4m3, int8), [experts,
-    2 * inter] and [experts, hidden], and per contraction block for fp4
-    e2m1, [experts, blocks, 2 * inter] and [experts, blocks, hidden]; on an
-    unquantized weight (bf16) there are no scales and both must be None.
-    The fp4 tables may instead come row-padded and flat, [experts * rows,
-    2 * inter] and [experts * rows, hidden] with rows from
-    host.fp4_scale_rows(K, rhs_qb, padded=True), which reads the same values
-    and keeps a per-call relayout of the tables out of the program.
-    Both are taken in the kernel's own operand layout, so a table shaped
-    for a loader rather than for the kernel is refused. The token rows are
-    quantized to fp8 only where the format's matmuls take fp8 rows: an
-    unquantized weight gets unquantized activations, with no quantize and
-    dequantize pair inserted around a model that never asked for one.
+    score_bias ([E_logical] replicated or [T, E_logical] sharded) affects
+    selection only. hash_topk_ids [T, topk] replaces selection, while routing
+    weights still come from gating. act_fn selects a fused activation.
+    block must divide local routing pairs; ragged_stride must cover the
+    no-drop bound. sharded_plan changes plan construction only.
 
-    w1_bias [experts, 1, 2 * inter] and w2_bias [experts, 1, hidden] are
-    optional and independent. The gate and up halves are added to the first
-    matmul's post-scale accumulator before the activation; the down bias is
-    added to the second matmul's post-scale row before it is quantized for
-    the wire. Under expert parallelism the second matmul is sharded on the
-    expert axis rather than on its contraction, so a routed row's whole down
-    projection is produced on one shard and the bias enters it exactly once;
-    the combine then weights it by that row's router weight, which is the
-    per-selected-expert weighting the sum wants.
+    token_replica_groups splits duplicate token rows within TP groups and
+    restores their order afterward. mesh_ep_ranks maps mesh indices to EP
+    ranks without reordering the full gating tensor.
 
-    block and ragged_stride default to the values this function derives;
-    an explicitly passed one still has to divide tokens // ep * topk and to
-    reach the no-drop bound respectively. act_fn selects the fused FFN
-    activation from the kernel's ACT_FNS and is a build-time constant.
+    stage="route" returns local (q, weights, payload); stage="compute"
+    consumes routed=(q_g, weights, payload). gather_positions maps mesh
+    indices to blocks of q_g. stage="fused" performs the complete layer.
 
-    sharded_plan computes the same kernel operands from the two complementary
-    1/ep slices their consumers read, plus one small expert-count all-gather.
-    It changes routing-plan construction only, never the core kernel.
+    expert_slot [E_logical, R] maps logical IDs to physical weight slots;
+    replicas are selected by global row modulo replica count. expert_load
+    [E_physical] returns (output, old_load + step_counts), for fused stage
+    only. Weights and scales must already be in physical-slot order.
 
-    token_replica_groups lists ordered groups of device-mesh indices whose
-    x and gating rows are identical (for example, a TP group). Each member
-    routes and computes a disjoint slice, then gathers the combined outputs
-    within its group to restore the input row order. Expert sharding stays
-    unchanged. None means singleton groups with no token replication.
-
-    mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
-    order relabels only the selected expert ids after top-k, keeping the full
-    router-logit tensor in its original order.
-
-    stage splits the layer at the activation all-gather so the caller can do
-    that gather itself, outside this program and in another device order.
-    "fused" (the default) is the whole layer. "route" returns (q, weights,
-    payload), each sharded on the mesh axis: this shard's wire rows [rows,
-    hidden // 128, 128], its router weights [rows, topk] f32 and its
-    routing payload [1, width] i32, where rows is replica_wire_rows(...) and
-    width the exchange width at that many rows -- padded past what the layer
-    uses so a caller can size them without the layer's own layout rules.
-    "compute" takes the same operands as
-    "fused" plus routed = (q_g, weights, payload), where q_g is every
-    shard's q concatenated on axis 0, and returns what "fused" returns.
-    gather_positions[i] is the block of q_g holding mesh index i's rows;
-    None means mesh order.
-
-    hash_topk_ids [tokens, topk] i32 replaces the router's selection with
-    expert ids the caller already chose -- DeepSeek-V4's bottom layers look
-    theirs up in a static table indexed by token id rather than scoring the
-    gate. The gate logits are still required and still scored: the selection
-    comes from the table but the WEIGHTS are the scores at the selected ids,
-    which is what the reference hash router does. Everything downstream of
-    selection -- renormalization, the routed scale, the empty-row mask,
-    dispatch, the matmuls and the combine -- is the top-k path unchanged.
-
-    score_bias is [experts] f32, replicated, or [tokens, experts] f32 sharded
-    like gating when the bias differs per token. Either way it shifts only
-    the selection.
-
-    expert_slot [experts, R] i32, replicated, places the experts: the
-    weights' expert axis is in SLOT order, and row e lists the slots holding
-    global expert e, padded with -1 past its last replica. A token's
-    selection of e goes to replica (global token row) mod (replicas of e), so
-    a replicated expert's rows split evenly over its copies. The gating and
-    score_bias stay [.., experts] while the weights have ep * slots-per-shard
-    rows. Selection -- top-k or the hash table, its ties, its weights and the
-    order of the k slots -- runs on global ids exactly as without it; only the
-    selected ids are mapped to slots before dispatch. Each token therefore
-    gets the same experts and the same arithmetic, on whichever shard holds
-    them. None is the identity: slot e holds expert e.
-
-    expert_load [e_total] i32, replicated, is a routed-row accumulator: with
-    it the layer returns (output, expert_load + this step's rows per physical
-    slot), the counts every shard already holds from the routing exchange.
-    The caller donates the operand and writes the result back (fused stage
-    only). None leaves the program as it is.
-
-    dispatch picks how routed rows reach their experts' shards.
-    "all_gather" (the default) all-gathers the quantized activations.
-    "push" sends each shard's routed rows straight into the destination
-    expert slabs (push/layer.py); the routing plan, FFN and combine are this
-    layer's, and the push tests hold its output bit-identical to this one.
-    Push runs the fused stage only. push_options holds its knobs (the names
-    in push.PUSH_OPTIONS, defaults in push.layer.fused_ep_moe_push).
-    shared_expert (w13, s13, w2, s2), replicated per-channel FP8, with
-    shared_limit computes the layer's shared expert inside the op
-    (sglang_tpu/fp8_swiglu_mlp.py); the result is then returned last.
-    Parameters are explicit: this kernel does not read process environment
-    variables or choose the model's expert layout. See README.md for the
-    model-side placement, masking, accumulator and shared-output contract.
-    Push's fused routing metadata was measured only for (topk, experts, ep,
-    tile_m) == push.routing.ROUTING_GEOMETRY on v7 at the per-shard token
-    counts in push.fusion.ROUTING_TOKENS; every other shape builds the same
-    tables unfused. Like this path, push needs tokens % ep == 0.
-    """
+    dispatch="push" supports the fused stage only and takes explicit
+    push_options from push.PUSH_OPTIONS. Optional replicated FP8
+    shared_expert=(w13, s13, w2, s2) appends a separate shared output.
+    See README.md for placement, padding and caller-owned state contracts."""
     push_kw = _check_dispatch(
         dispatch,
         push_options=push_options,

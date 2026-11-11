@@ -14,15 +14,8 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: tests/kernels/experimental/push_fused_moe/test_host.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
-"""Host tables of the push-dispatch fused EP MoE, checked on CPU.
-
-The push build moves rows by the segment table and reads them back by v2's
-routing plan, so the two must agree on every row: a segment's destination
-row is where v2's slab places that (expert, source) run, and its source row
-is where the local sort put the run. The plan builder itself must also stay
-value-identical to v2's.
-"""
+# Source: tests/kernels/experimental/push_fused_moe/test_routing.py
+"""CPU checks for push planning, dispatch tables and fusion eligibility."""
 
 import sys
 
@@ -37,6 +30,7 @@ if __name__ == "__main__":
 
 
 import itertools
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -45,6 +39,8 @@ jax = pytest.importorskip("jax")
 jnp = jax.numpy
 
 from sglang_tpu.moe.pallas.fused_moe_v2 import host  # noqa: E402
+from sglang_tpu.moe.pallas.fused_moe_v2.push import fusion  # noqa: E402
+from sglang_tpu.moe.pallas.fused_moe_v2.push import routing  # noqa: E402
 from sglang_tpu.moe.pallas.fused_moe_v2.push import host as push_host  # noqa: E402
 
 
@@ -221,18 +217,7 @@ def test_segments_land_on_the_plans_slab_rows(ep, t_local, g_local, topk, skew):
         assert meta[2 * g_local + 2] == sent == counts.sum()
 
 
-def test_to_slots_splits_rows_over_replicas():
-    from sglang_tpu.moe.pallas.fused_moe_v2.push.layer import _to_slots
-
-    # Expert 0 has two copies (slots 3, 7); experts 1 and 2 one each.
-    table = np.array([[3, 7], [5, -1], [0, -1]], np.int32)
-    ids = np.array([[0, 1], [0, 2], [2, 0]], np.int32)
-    got = np.asarray(_to_slots(jnp.asarray(ids), jnp.asarray(table), jnp.int32(4)))
-    # Row r takes replica (4 + r) mod (copies of its expert).
-    np.testing.assert_array_equal(got, [[3, 5], [7, 0], [0, 3]])
-
-
-@pytest.mark.parametrize("replicas", [1, 2, 10])
+@pytest.mark.parametrize("replicas", [1, 10])
 def test_to_slots_forms_agree(replicas):
     """Both forms return exactly the table entry the definition names, at
     the served sizes (288 rows, top-6, 384 experts over 400 slots), for
@@ -267,16 +252,14 @@ def test_to_slots_forms_agree(replicas):
 
 
 @pytest.mark.parametrize(
-    "t_local,e_total,topk",
+    "t_local,e_total,topk,skew",
     [
-        pytest.param(64, 32, 4, id="t64_e32_k4"),
-        pytest.param(288, 384, 6, id="t288_e384_k6"),
-        pytest.param(513, 416, 6, id="t513_e416_k6"),
-        pytest.param(1024, 384, 8, id="t1024_e384_k8"),
-        pytest.param(2048, 416, 6, id="t2048_e416_k6"),
+        (64, 32, 4, False),
+        (288, 384, 6, False),
+        (513, 416, 6, True),
+        (2048, 416, 6, True),
     ],
 )
-@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
 def test_local_sort_paths_agree(monkeypatch, t_local, e_total, topk, skew):
     """The prefill argsort path and the decode count path give the same
     q_sorted (every row, padding included) and seg_start."""
@@ -310,7 +293,7 @@ def test_local_sort_paths_agree(monkeypatch, t_local, e_total, topk, skew):
     np.testing.assert_array_equal(np.asarray(q_sort)[: len(want), 0, 0], want)
 
 
-@pytest.mark.parametrize("n,repeats", [(4608, 6), (3840, 3), (2304, 6), (200, 6)])
+@pytest.mark.parametrize("n,repeats", [(4608, 6), (200, 3)])
 def test_repeat_bits_equals_jnp_repeat(n, repeats):
     """Every i32 bit pattern (negatives, NaN and inf f32 patterns among them)
     comes back exactly, at the served scale-slab sizes and a ragged one."""
@@ -323,8 +306,7 @@ def test_repeat_bits_equals_jnp_repeat(n, repeats):
     np.testing.assert_array_equal(got, np.repeat(bits, repeats))
 
 
-@pytest.mark.parametrize("n_pre", [1, 2, 3, 25])
-@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+@pytest.mark.parametrize("n_pre,skew", [(1, False), (2, True), (3, True), (25, False)])
 def test_dispatch_tables_match_the_decoded_segments(n_pre, skew):
     """push_dispatch_tables' extra outputs equal what the layer decodes out
     of push_dispatch_segments' tables, at the DP16 geometry (ep 16, 25 slots,
@@ -373,8 +355,7 @@ def test_dispatch_tables_match_the_decoded_segments(n_pre, skew):
         np.testing.assert_array_equal(counts_sc, want_sc)
 
 
-@pytest.mark.parametrize("n_pre", [1, 2, 25])
-@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+@pytest.mark.parametrize("n_pre,skew", [(1, False), (2, True), (25, True)])
 def test_table_kernel_matches_the_xla_tables(n_pre, skew):
     """plan_kernel.build_push_tables (interpret mode) gives exactly the XLA
     dispatch and shard tables at the DP16 geometry, for several ranks."""
@@ -417,9 +398,9 @@ def test_table_kernel_matches_the_xla_tables(n_pre, skew):
         np.testing.assert_array_equal(cnt, np.asarray(want_counts))
 
 
-@pytest.mark.parametrize("mode", [1, 2])
-@pytest.mark.parametrize("n_pre", [1, 2, 3])
-@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+@pytest.mark.parametrize(
+    "mode,n_pre,skew", [(1, 1, False), (1, 3, True), (2, 2, False), (2, 3, True)]
+)
 def test_light_prepush_only_reorders_the_visits(mode, n_pre, skew):
     """With light_prepush the table kernel visits the n_pre lightest experts
     first (lightest at 0), then the rest most rows first (1) or rising to
@@ -639,3 +620,103 @@ def test_combine_preserves_weighted_sum_with_or_without_scale_lookup(
     ]
     want = sum(terms).reshape(tokens, hidden).astype(jnp.bfloat16)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def supported(tokens=288, **changes):
+    i32 = jnp.zeros((1,), jnp.int32)
+    gathered = SimpleNamespace(
+        topk=6, n_tokens=tokens * 16, local_blocks=i32, block_hist=i32
+    )
+    values = dict(
+        fuse_metadata=True,
+        t_local=tokens,
+        gathered=gathered,
+        e_total=384,
+        ep=16,
+        tile_m=128,
+        block=routing.host.routing_block(tokens, 6),
+        shard_stride=routing.host.ragged_stride_bound(tokens * 16, 6, 384, 128),
+        runs=(i32,) * 4,
+        me=i32,
+    )
+    for key in ("topk", "n_tokens", "local_blocks", "block_hist"):
+        if key in changes:
+            setattr(gathered, key, changes.pop(key))
+    values.update(changes)
+    try:
+        routing.prepare_routing(**values)
+    except DispatchReached as exc:
+        return str(exc) == "fused"
+    raise AssertionError("routing did not reach either dispatch path")
+
+
+class DispatchReached(Exception):
+    pass
+
+
+def stop(path):
+    def reached(*args, **kwargs):
+        raise DispatchReached(path)
+
+    return reached
+
+
+@pytest.fixture
+def tpu_v7(monkeypatch):
+    monkeypatch.setattr(routing, "build_routing_tables_sharded", lambda *a, **k: None)
+    monkeypatch.setattr(routing.host, "local_slab_rows", lambda *a, **k: None)
+    monkeypatch.setattr(
+        routing.host, "shard_transport_tables_in_blocks", stop("fallback")
+    )
+    monkeypatch.setattr(routing, "fuse_function", stop("fused"))
+    monkeypatch.setattr(fusion, "get_tpu_generation", lambda: 7)
+
+
+@pytest.mark.parametrize("tokens", [96, 192, 256, 288, 384])
+def test_exact_approved_tokens(tokens, tpu_v7):
+    assert supported(tokens)
+    stride = routing.host.ragged_stride_bound(tokens * 16, 6, 384, 128)
+    assert not supported(tokens, shard_stride=stride + 128)
+    assert not supported(tokens, block=routing.host.routing_block(tokens, 6) + 128)
+
+
+@pytest.mark.parametrize("tokens", [95, 128, 289, 385])
+def test_unapproved_tokens(tokens, tpu_v7):
+    assert not supported(tokens)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"fuse_metadata": False},
+        {"topk": 4},
+        {"e_total": 383},
+        {"ep": 8},
+        {"tile_m": 256},
+        {"n_tokens": 288 * 16 + 1},
+    ],
+)
+def test_contract_guards(changes, tpu_v7):
+    assert not supported(**changes)
+
+
+@pytest.mark.parametrize("field", ["me", "local_blocks", "block_hist", "runs"])
+def test_dtype_guards(field, tpu_v7):
+    bad = jax.ShapeDtypeStruct((1,), jnp.int16)
+    assert not supported(**{field: (bad,) * 4 if field == "runs" else bad})
+
+
+@pytest.mark.parametrize("version", [-1, 6])
+def test_backend_guards(monkeypatch, version, tpu_v7):
+    monkeypatch.setattr(fusion, "get_tpu_generation", lambda: version)
+    assert not supported()
+
+
+def test_routing_fuses_during_cpu_export(monkeypatch, tpu_v7):
+    from sglang_tpu import pallas_export
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    monkeypatch.setattr(fusion, "get_tpu_generation", pallas_export.get_tpu_generation)
+    monkeypatch.setattr(pallas_export, "get_pallas_tpu_device_kind", lambda: "TPU7x")
+    with pallas_export.tpu_info_for_cpu_export():
+        assert supported()

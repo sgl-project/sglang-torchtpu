@@ -1,8 +1,9 @@
 # Fused EP MoE v2: model integration
 
 This package ports the common MoE kernels from vllm-torchtpu `epic/dsv41`
-at `ef2599d3d4342f41d2ad223b266e126299862b53`. Models, including the separate
-DeepSeek V4.1 package, call one entry point:
+at `ef2599d3d4342f41d2ad223b266e126299862b53`, including the shared-expert
+kernel and related tests. File headers retain their upstream source paths.
+Models, including the separate DeepSeek V4.1 package, call one entry point:
 
 ```python
 from sglang_tpu.moe.pallas.fused_moe_v2 import WeightFormat, fused_ep_moe_v2

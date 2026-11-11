@@ -1,18 +1,7 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/experimental/decode_preparation.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 # SPDX-License-Identifier: Apache-2.0
-"""Admission and Pallas-boundary helpers for the push build's fused metadata.
-
-The part of vLLM-TorchTPU's DeepSeek-V4.1 decode_preparation module that
-push/routing.py uses, without the model's other regions or its process-wide
-fusion mode (this module always behaves as its AUTO mode). A region takes its
-fused path only where `admit` finds its layout contract met, its token count
-a measured bucket and the backend a TPU of the measured generation; anywhere
-else the caller's general path runs. A decode-sized miss is logged once per
-reason; a count above the largest bucket is a prefill-sized call and falls
-back silently.
-"""
+"""Admission and Pallas helpers for optional push routing fusion."""
 
 import jax
 import jax.numpy as jnp
@@ -34,12 +23,7 @@ _reported: set[tuple[str, str]] = set()
 
 
 def admit(region: str, problem: str | None, *, tokens: int, buckets: frozenset) -> bool:
-    """Whether ``region`` takes its fused path.
-
-    ``problem`` names a violated layout contract; ``tokens`` is checked
-    against ``buckets``. An untargeted CPU/GPU run takes the native path;
-    CPU TPU export may fuse.
-    """
+    """Use fusion for a supported TPU target, layout and measured token bucket."""
     if get_tpu_generation() < 0:
         return False
     if problem is None and tokens not in buckets:

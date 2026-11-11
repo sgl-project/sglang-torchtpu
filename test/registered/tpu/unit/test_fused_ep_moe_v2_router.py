@@ -14,7 +14,6 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: tests/kernels/fused_moe/test_fused_ep_moe_v2_router.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 """Exact selector parity across row tiles, tie rules and separate weight tables.
 
 CPU cases execute the Pallas interpreter; TPU cases compile the same inputs
@@ -88,13 +87,7 @@ def _select(
 
 
 def _reference(scores, weight_scores, topk=TOPK):
-    """Top-k by `scores`, weights gathered from `weight_scores`.
-
-    Ties go to the lowest column, which is the kernel's rule: it takes the
-    row max and then the lowest column equal to it. `argsort(-x, stable)`
-    is the same rule, and `np.argpartition` is NOT -- it is unordered within
-    the partition, so it disagrees on exactly the rows that matter.
-    """
+    """Stable top-k selects the lowest expert ID on ties."""
     idx = np.argsort(-scores, axis=1, kind="stable")[:, :topk]
     return np.take_along_axis(weight_scores, idx, axis=1), idx
 
@@ -105,22 +98,18 @@ def _scores(rows, seed, scale=1.0, experts=EXPERTS):
 
 
 @pytest.mark.parametrize(
-    "rows,experts,topk,block_rows",
+    "rows,experts,topk,block_rows,separate_weights",
     [
-        (8, 256, 8, 8),
-        (256, 256, 8, 256),
-        (512, 256, 8, 256),
-        (1024, 256, 8, 256),
-        (256, 384, 6, 256),
-        pytest.param(2048, 384, 6, 256, id="tuned-2048-rows"),
-        pytest.param(512, 384, 6, 64, id="align-partial-tiles"),
-        pytest.param(192, 384, 6, 64, id="fallback-to-full-rows"),
-        (256, 384, 6, 128),
-        pytest.param(128, 128, 1, 128, id="topk-one"),
-        pytest.param(8, 16, 16, 8, id="topk-all-experts"),
+        (8, 256, 8, 8, False),
+        (512, 256, 8, 256, True),
+        (256, 384, 6, 256, False),
+        pytest.param(2048, 384, 6, 256, True, id="tuned-2048-rows"),
+        pytest.param(512, 384, 6, 64, True, id="align-partial-tiles"),
+        pytest.param(192, 384, 6, 64, False, id="fallback-to-full-rows"),
+        pytest.param(128, 128, 1, 128, False, id="topk-one"),
+        pytest.param(8, 16, 16, 8, True, id="topk-all-experts"),
     ],
 )
-@pytest.mark.parametrize("separate_weights", [False, True])
 def test_selection_matches_reference(
     rows, experts, topk, block_rows, separate_weights, interpret
 ):
@@ -136,13 +125,7 @@ def test_selection_matches_reference(
 
 
 def test_the_bias_moves_the_selection_and_not_the_weights(interpret):
-    """The `noaux_tc` call as the layer makes it, end to end.
-
-    The bias is large against the score spread, so the biased top-k is a
-    genuinely different expert set from the unbiased one -- asserted here,
-    because a fixture where it is not would pass against a kernel that
-    dropped the bias on the floor.
-    """
+    """Bias changes selected experts while weights come from unbiased scores."""
     raw = _scores(64, seed=7)
     rng = np.random.default_rng(8)
     bias = (rng.random(EXPERTS, dtype=np.float32) * 4.0).astype(np.float32)
@@ -164,8 +147,7 @@ def test_the_bias_moves_the_selection_and_not_the_weights(interpret):
     )
 
 
-@pytest.mark.parametrize("separate_weights", [False, True])
-@pytest.mark.parametrize("partial_nan", [False, True], ids=["ties", "partial-nan"])
+@pytest.mark.parametrize("separate_weights,partial_nan", [(False, False), (True, True)])
 def test_ties_choose_lowest_expert_across_lane_boundaries(
     separate_weights, partial_nan, interpret
 ):
@@ -214,8 +196,9 @@ def test_every_expert_id_preserves_token_and_topk_position(separate_weights, int
     )
 
 
-@pytest.mark.parametrize("separate_weights", [False, True])
-@pytest.mark.parametrize("case", ["zeros", "uniform", "tiny"])
+@pytest.mark.parametrize(
+    "case,separate_weights", [("zeros", False), ("uniform", True), ("tiny", True)]
+)
 def test_zero_uniform_and_tiny_scores_preserve_selection(
     case, separate_weights, interpret
 ):

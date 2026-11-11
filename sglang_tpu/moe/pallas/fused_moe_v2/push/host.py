@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/experimental/push_fused_moe/host.py
-# Revision: ef2599d3d4342f41d2ad223b266e126299862b53
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,12 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host-side tables of the push-dispatch fused EP MoE.
-
-Everything the push build shares with v2 is imported from
-fused_moe_v2/host.py; this module holds only the dispatch tables and
-the sharded routing plan that reuses the dispatch's run tables.
-"""
+"""Push dispatch tables and a routing plan that reuses their run counts."""
 
 import jax
 import jax.numpy as jnp
