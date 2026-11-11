@@ -26,11 +26,14 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.dsv4.dsv4_memory_pool import (  # noqa: F401
     _COS_SIN_CACHE,
+    ROPE_DIM,
+    ROPE_LANES,
     get_or_build_cos_sin_cache,
 )
 
 # Native lane count; the roped channels are the tail of the last lane block.
 LANE = 128
+assert LANE == ROPE_LANES
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -130,6 +133,33 @@ def _lane_gather(operand: jax.Array, indices: jax.Array) -> jax.Array:
         unique_indices=False,
         mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
     )
+
+
+def cos_sin_rows(cos_sin_cache: jax.Array, positions: jax.Array) -> jax.Array:
+    """``[T, rotary_dim]`` ``[cos, sin]`` rows of a plain ``[max_pos, rotary_dim]``
+    table or of a lane-packed one (see ``get_or_build_rope_lane_table``)."""
+    if cos_sin_cache.shape[-1] != LANE:
+        return cos_sin_cache[positions]
+    rows = cos_sin_cache[positions // 2]
+    return jnp.where(
+        (positions % 2 == 1)[:, None], rows[:, ROPE_DIM:], rows[:, :ROPE_DIM]
+    )
+
+
+def _kernel_cos_sin(
+    positions: jax.Array, cos_sin_cache: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """The ``(positions, table)`` pair the kernels' per-token row DMA reads.
+
+    A lane-packed table is gathered to the batch's rows here, in XLA, and the
+    kernel reads row ``i`` for token ``i``: a Pallas operand must be row-major,
+    so passing the whole table would make XLA relayout it whenever its stored
+    layout differs. A plain table is passed through unchanged.
+    """
+    if cos_sin_cache.shape[-1] != LANE:
+        return positions, cos_sin_cache
+    rows = cos_sin_rows(cos_sin_cache, positions)
+    return jnp.arange(positions.shape[0], dtype=positions.dtype), rows
 
 
 def _cos_sin_lanes(
@@ -417,6 +447,7 @@ def _rope_call(
         raise ValueError(f"x must be rank 2 or 3, got {x.shape}")
     assert positions.ndim == 1 and positions.shape[0] == x.shape[0]
     assert cos_sin_cache.ndim == 2
+    positions, cos_sin_cache = _kernel_cos_sin(positions, cos_sin_cache)
 
     num_tokens = x.shape[0]
     head_dim = x.shape[-1]
@@ -497,7 +528,7 @@ def _rope_call(
 def rope(
     x: jax.Array,  # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
     positions: jax.Array,  # [num_tokens] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] or lane-packed f32
     *,
     inverse: bool = False,
     name: str = "rope",
@@ -521,7 +552,7 @@ def rope(
 def qnorm_rope(
     x: jax.Array,  # [num_tokens, num_heads, head_dim] | [num_tokens, head_dim]
     positions: jax.Array,  # [num_tokens] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] or lane-packed f32
     *,
     eps: float = 1e-6,
     inverse: bool = False,
@@ -531,6 +562,7 @@ def qnorm_rope(
     assert x.ndim == 3
     assert positions.ndim == 1 and positions.shape[0] == x.shape[0]
     assert cos_sin_cache.ndim == 2
+    positions, cos_sin_cache = _kernel_cos_sin(positions, cos_sin_cache)
 
     num_tokens = x.shape[0]
     head_dim = x.shape[-1]
@@ -579,7 +611,7 @@ def qnorm_rope(
 def rope_quant(
     x: jax.Array,  # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
     positions: jax.Array,  # [num_tokens] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] or lane-packed f32
     *,
     inverse: bool = False,
     quant_dtype: jnp.dtype = jnp.float8_e4m3fn,

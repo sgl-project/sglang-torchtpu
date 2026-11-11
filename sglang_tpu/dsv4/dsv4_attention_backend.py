@@ -46,6 +46,7 @@ from sglang_tpu.dsv4.dsv4_indexer import (
 from sglang_tpu.dsv4.dsv4_memory_pool import (
     DSV4TPUTokenToKVPool,
     get_or_build_cos_sin_cache,
+    get_or_build_rope_lane_table,
 )
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
@@ -74,6 +75,11 @@ _attn_hca_custom_op = None
 # =============================================================================
 # 1. Pallas RoPE & Fused QNorm+RoPE Custom Ops
 # =============================================================================
+
+
+def _freqs_key(freqs_cis: torch.Tensor) -> tuple[int, torch.device]:
+    """The key dsv4_memory_pool caches a freqs_cis' cos/sin tables under."""
+    return (id(freqs_cis), freqs_cis.device)
 
 
 def _register_rope_op():
@@ -156,7 +162,7 @@ def apply_tpu_dsv4_rope(
     if x.shape[0] == 0:
         return x
     cos_sin_cache = (
-        get_or_build_cos_sin_cache(freqs_cis_or_cos_sin)
+        get_or_build_rope_lane_table(freqs_cis_or_cos_sin)
         if freqs_cis_or_cos_sin.is_complex()
         else freqs_cis_or_cos_sin
     )
@@ -249,7 +255,7 @@ def apply_tpu_dsv4_qnorm_rope(
     if q.shape[0] == 0:
         return q
     cos_sin_cache = (
-        get_or_build_cos_sin_cache(freqs_cis_or_cos_sin)
+        get_or_build_rope_lane_table(freqs_cis_or_cos_sin)
         if freqs_cis_or_cos_sin.is_complex()
         else freqs_cis_or_cos_sin
     )
@@ -877,6 +883,8 @@ class DSV4TPUAttnBackend(
         model = self.model_runner.model
         if model is None:
             return
+        # freqs_cis whose plain table a compressor or indexer kernel holds.
+        plain_freqs: set[tuple[int, torch.device]] = set()
         for module in model.modules():
             if (
                 hasattr(module, "wkv_gate")
@@ -884,6 +892,7 @@ class DSV4TPUAttnBackend(
                 and hasattr(module, "norm")
                 and hasattr(module, "freqs_cis")
             ):
+                plain_freqs.add(_freqs_key(module.freqs_cis))
                 ensure_tpu_compressor_caches(module)
             if (
                 hasattr(module, "wq_b")
@@ -891,6 +900,7 @@ class DSV4TPUAttnBackend(
                 and hasattr(module, "compressor")
                 and hasattr(module, "freqs_cis")
             ):
+                plain_freqs.add(_freqs_key(module.freqs_cis))
                 ensure_tpu_indexer_caches(module)
             if hasattr(module, "_local_attn_sink") and hasattr(
                 module, "_kernel_num_heads"
@@ -900,7 +910,15 @@ class DSV4TPUAttnBackend(
             if hasattr(module, "freqs_cis"):
                 freqs_cis = module.freqs_cis
                 if isinstance(freqs_cis, torch.Tensor) and freqs_cis.is_complex():
-                    cos_sin = get_or_build_cos_sin_cache(freqs_cis)
+                    # RoPE users take the lane-packed table: torch_tpu stores a
+                    # [max_pos, 64] one transposed, which costs a full-table
+                    # relayout per Pallas call. A freqs_cis shared with a
+                    # compressor/indexer (plain V4) keeps its plain table for
+                    # every user, so no second 256 MB table is built.
+                    if _freqs_key(freqs_cis) in plain_freqs:
+                        cos_sin = get_or_build_cos_sin_cache(freqs_cis)
+                    else:
+                        cos_sin = get_or_build_rope_lane_table(freqs_cis)
                     if isinstance(module, torch.nn.Module) and (
                         "freqs_cis" in module._buffers
                     ):

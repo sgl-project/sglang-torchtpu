@@ -81,6 +81,52 @@ def get_or_build_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
     return cos_sin
 
 
+# Lane-packed RoPE tables, keyed like `_COS_SIN_CACHE`.
+_ROPE_LANE_TABLE: Dict[Tuple[int, torch.device], torch.Tensor] = {}
+ROPE_LANES = 128
+ROPE_DIM = ROPE_LANES // 2  # DeepSeek-V4 rope_head_dim: two positions per row
+
+
+def get_or_build_rope_lane_table(freqs_cis: torch.Tensor) -> torch.Tensor:
+    """The ``[cos, sin]`` table of ``get_or_build_cos_sin_cache`` with two
+    positions per 128-lane row: ``[ceil(max_pos / 2), 128]`` float32, row ``r``
+    holding positions ``2r`` and ``2r + 1``.
+
+    torch_tpu stores the ``[1M, 64]`` table dim-0-minor (``{0,1:T(8,128)}``; a
+    row-major one would pad 64 lanes to 128), and XLA relayouts all 256 MB of
+    it before every Pallas call that takes it, since kernel operands are
+    row-major. A 128-wide row needs no padding, so this table stays row-major,
+    and the RoPE kernels get only the batch's rows (``rope.cos_sin_rows``).
+    The values are bitwise those of the ``[max_pos, 64]`` table.
+
+    Built on the host and uploaded as its own buffer: a device-side
+    ``reshape(...).clone()`` stays a strided view of the dim-0-minor ``[1M, 64]``
+    tensor in torch_tpu, and every use then re-runs that relayout eagerly
+    (``execute_as_strided``, 2 x 0.62 ms per decode iteration on v7x).
+    """
+    key = (id(freqs_cis), freqs_cis.device)
+    cached = _ROPE_LANE_TABLE.get(key)
+    if cached is not None:
+        return cached
+    real_imag = torch.view_as_real(freqs_cis.detach().cpu()).to(torch.float32)
+    assert 2 * real_imag.shape[-2] == ROPE_DIM, tuple(freqs_cis.shape)
+    cos_sin = torch.cat([real_imag[..., 0], real_imag[..., 1]], dim=-1)
+    if cos_sin.shape[0] % 2:
+        cos_sin = torch.nn.functional.pad(cos_sin, (0, 0, 0, 1))
+    table = cos_sin.reshape(-1, ROPE_LANES).clone().to(freqs_cis.device)
+    _ROPE_LANE_TABLE[key] = table
+    return table
+
+
+def lookup_cos_sin(table: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    """``[T, rotary_dim]`` ``[cos, sin]`` rows of a lane-packed or plain table."""
+    positions = positions.long()
+    if table.shape[-1] != ROPE_LANES:
+        return table[positions]
+    rows = table[positions // 2].view(-1, 2, ROPE_DIM)
+    return rows[torch.arange(rows.shape[0], device=rows.device), positions % 2]
+
+
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
