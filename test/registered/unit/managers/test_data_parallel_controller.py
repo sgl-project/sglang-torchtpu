@@ -14,7 +14,7 @@ is exercised as the real method, no mock. The refresh-throttle tests inject
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec.structs
 
@@ -510,6 +510,25 @@ class TestPrefixAwareScheduler(CustomTestCase):
         ctl._active_workers = [1, 3]
         ctl.prefix_aware_scheduler(_req(input_ids=_prompt(1, 4)))
         ctl.workers[1].send_pyobj.assert_called_once()
+
+    def test_selector_derives_block_size_capacity_and_log_interval(self):
+        ctl = _make_controller(4)
+        ctl.max_dp_size = 4
+        ctl.max_total_num_tokens = 1000
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_schedule",
+                return_value=SimpleNamespace(page_size=64),
+            ),
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_observability",
+                return_value=SimpleNamespace(decode_log_interval=40),
+            ),
+        ):
+            sel = ctl._make_prefix_selector()
+        self.assertEqual(sel.index.block_size, 64, "one index block per radix page")
+        self.assertEqual(sel.index.capacity_blocks, 4 * 1000 // 64)
+        self.assertEqual(sel.log_interval, 40)
 
     def test_method_parses_from_server_arg(self):
         self.assertEqual(

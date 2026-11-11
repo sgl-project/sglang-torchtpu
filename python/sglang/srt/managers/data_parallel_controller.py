@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_observability,
     get_parallel,
+    get_schedule,
     get_serving,
     publish,
 )
@@ -800,14 +801,13 @@ class DataParallelController:
         sock_send(self.workers[target_worker], req)
 
     def _make_prefix_selector(self) -> PrefixAwareSelector:
-        block_size = envs.SGLANG_DP_PREFIX_ROUTING_BLOCK_SIZE.get()
-        capacity_tokens = envs.SGLANG_DP_PREFIX_ROUTING_CAPACITY_TOKENS.get()
-        if capacity_tokens <= 0:
-            # A rank's radix cache holds at most its KV pool (plus the HiCache
-            # host tier). Tracking more than it holds only keeps stale
-            # affinities, which still route a session to one rank; tracking less
-            # drops live ones. Err on the large side.
-            capacity_tokens = 4 * self.max_total_num_tokens
+        # One index block per radix page: a rank only reuses whole pages.
+        block_size = max(1, int(get_schedule().page_size or 1))
+        # A rank's radix cache holds at most its KV pool (plus the HiCache host
+        # tier). Tracking more than it holds only keeps stale affinities, which
+        # still route a session to one rank; tracking less drops live ones. Err
+        # on the large side.
+        capacity_tokens = 4 * self.max_total_num_tokens
         selector = PrefixAwareSelector(
             num_ranks=self.max_dp_size,
             block_size=block_size,
@@ -815,7 +815,8 @@ class DataParallelController:
             cache_threshold=envs.SGLANG_DP_PREFIX_ROUTING_CACHE_THRESHOLD.get(),
             balance_abs_threshold=envs.SGLANG_DP_PREFIX_ROUTING_BALANCE_ABS_THRESHOLD.get(),
             balance_rel_threshold=envs.SGLANG_DP_PREFIX_ROUTING_BALANCE_REL_THRESHOLD.get(),
-            log_interval=envs.SGLANG_DP_PREFIX_ROUTING_LOG_INTERVAL.get(),
+            # Stats line every decode_log_interval routed requests.
+            log_interval=get_observability().decode_log_interval,
         )
         logger.info(
             "Prefix-aware DP routing: block_size=%d, capacity=%d tokens/rank, "
