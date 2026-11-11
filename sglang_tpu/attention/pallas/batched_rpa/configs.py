@@ -134,8 +134,6 @@ class ServingConfigs:
     return_lse: bool = False
     cp_group_size: int | None = None
     attention_scope: AttentionScope = AttentionScope.FULL
-    # Weightless per-head RMS norm of the output rows at this eps (Muse Spark).
-    out_head_norm_eps: float | None = None
 
     def __post_init__(self):
         if self.cache_only and self.attention_scope == AttentionScope.FULL:

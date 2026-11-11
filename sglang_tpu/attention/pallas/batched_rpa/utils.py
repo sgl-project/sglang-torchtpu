@@ -158,11 +158,3 @@ def has_bank_conflicts(stride: int, distance=24, num_banks=32) -> bool:
             return True
         banks.add(bank)
     return False
-
-
-def head_norm(out: jax.Array, axis: int, head_dim: int, eps: float) -> jax.Array:
-    """Weightless RMS norm over a head's head_dim values along axis (zero padding adds
-    nothing), of out as rounded to its dtype."""
-    x = out.astype(jnp.float32)
-    ms = jnp.sum(x * x, axis=axis, keepdims=True) / head_dim
-    return (x * jax.lax.rsqrt(ms + eps)).astype(out.dtype)

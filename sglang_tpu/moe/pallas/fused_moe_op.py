@@ -194,7 +194,7 @@ def _lookup_tile_info(
     """
     import jax.numpy as jnp
 
-    from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, num_scale_blocks
+    from sglang_tpu.moe.pallas.gmm_v2 import TileSizes
     from sglang_tpu.moe.pallas.tuned_block_sizes import (
         get_tuned_block_sizes,
     )
@@ -204,7 +204,7 @@ def _lookup_tile_info(
     # Packed FP4 stores 2 codes/byte along K, so real K = stored K * 2.
     _k = _k_raw * 2 if packed_fp4 else _k_raw
     assert _k == k, f"gmm_v2 lhs/rhs k mismatch: {k=} vs {_k=}"
-    quant_block_size = k if rhs_scale is None else k // num_scale_blocks(rhs_scale)
+    quant_block_size = k if rhs_scale is None else k // rhs_scale.shape[1]
     rhs_dtype = "float4_e2m1fn" if packed_fp4 else str(jnp.dtype(rhs.dtype).name)
     tiles = get_tuned_block_sizes(
         m=int(m),

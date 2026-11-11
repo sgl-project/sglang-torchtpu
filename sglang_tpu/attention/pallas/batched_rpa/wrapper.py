@@ -607,7 +607,6 @@ def calculate_block_sizes(
         "cp_group_size",
         "attention_scope",
         "rpa_cases",
-        "out_head_norm_eps",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -647,7 +646,6 @@ def ragged_paged_attention(
     kv_lens_global: jax.Array | None = None,
     attention_scope: configs.AttentionScope | int = configs.AttentionScope.FULL,
     rpa_cases: tuple[configs.RpaCase, ...] | configs.RpaCase | None = None,
-    out_head_norm_eps: float | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -718,8 +716,6 @@ def ragged_paged_attention(
             global lengths and this rank's stripe table).
         rpa_cases: Which of the DECODE / MIXED launches to run (both when
             None); a case whose ``distribution`` range is empty can be skipped.
-        out_head_norm_eps: Applies a weightless per-head RMS norm at this eps to
-            the output rows (None: off).
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -781,8 +777,6 @@ def ragged_paged_attention(
     if cache_only:
         attention_scope = configs.AttentionScope.CACHE_ONLY
 
-    if out_head_norm_eps is not None and out_head_norm_eps < 0:
-        raise ValueError(f"Expected {out_head_norm_eps=} >= 0.")
     serve_cfgs = configs.ServingConfigs(
         num_seqs=max_num_seqs,
         num_page_indices=num_page_indices,
@@ -801,7 +795,6 @@ def ragged_paged_attention(
         return_lse=return_lse,
         cp_group_size=cp_group_size,
         attention_scope=attention_scope,
-        out_head_norm_eps=out_head_norm_eps,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(
