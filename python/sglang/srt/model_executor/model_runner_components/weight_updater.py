@@ -387,7 +387,10 @@ class WeightUpdater:
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        infered_device = torch.accelerator.current_device_index()
+        if torch.device(self.device).type == "cpu" or not torch.accelerator.is_available():
+            infered_device = "cpu"
+        else:
+            infered_device = torch.accelerator.current_device_index()
 
         # The payload lists one entry per deployment TP rank. An
         # attention-owning draft records its narrowed rank at init, so read the
