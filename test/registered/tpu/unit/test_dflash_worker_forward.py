@@ -263,6 +263,12 @@ def _create_dflash_worker_for_tpu(
     worker._out_tokens_bufs = []
     worker._new_seq_lens_bufs = []
     worker._draft_sampler = None
+    # Adaptive verify width off (SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY unset).
+    worker._adaptive_verify_rules = []
+    worker._verify_cols = {}
+    worker._verify_tokens_bufs = {}
+    worker._narrow_block_spec_infos = {}
+    worker._verify_width_ct = {}
 
     class _MockEmbed(nn.Module):
         def forward(self, ids):
