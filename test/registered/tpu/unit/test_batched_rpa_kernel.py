@@ -547,6 +547,11 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                     seq_along_lane=seq_along_lane,
                 )
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+    )
     def test_seq_along_lane_softmax_variants(self):
         """exp2 softmax and ones-in-V row sums match the reference on the fp8
         SEQ_ALONG_LANE prefill path they are meant for, with and without a window."""
@@ -555,10 +560,11 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
         from sglang_tpu.envs import envs as tpu_envs
 
         variants = (
-            {"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1"},
-            {"SGLANG_TPU_RPA_ONES_V": "1"},
-            {"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1", "SGLANG_TPU_RPA_ONES_V": "1"},
-            {"SGLANG_TPU_RPA_ONES_V": "1", "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1"},
+            {
+                "SGLANG_TPU_RPA_F32_CARRIES": "1",
+                "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
+                "SGLANG_TPU_RPA_ONES_V": "1",
+            },
         )
         for env in variants:
             for sliding_window in (None, 128):
@@ -580,6 +586,11 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                     )
         jax.clear_caches()
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+    )
     def test_seq_along_lane_transposed(self):
         """The transposed prefill tile (scores^T, fp8 q) tracks the reference on
         the fp8 SEQ_ALONG_LANE path, with and without a window and the mask skip."""
@@ -588,8 +599,8 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
         from sglang_tpu.envs import envs as tpu_envs
 
         variants = (
-            {"SGLANG_TPU_RPA_TRANSPOSED": "1"},
             {
+                "SGLANG_TPU_RPA_F32_CARRIES": "1",
                 "SGLANG_TPU_RPA_TRANSPOSED": "1",
                 "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
             },

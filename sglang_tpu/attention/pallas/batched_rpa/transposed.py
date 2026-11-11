@@ -201,7 +201,7 @@ def tile(
         for kv_head in range(cfgs.model.num_kv_heads):
             acc = acc_ref[kv_head]  # [acc rows, rows]
             l = acc[hd : hd + 1]
-            o_t = acc[:hd] * pl.reciprocal(l, approx=True)
+            o_t = acc[:hd] * pltpu.reciprocal(l, approx=True)
             if cfgs.serve.out_head_norm_eps is not None:
                 o_t = utils.head_norm(
                     o_t.astype(cfgs.serve.dtype_out),

@@ -134,6 +134,9 @@ class ServingConfigs:
     return_lse: bool = False
     cp_group_size: int | None = None
     attention_scope: AttentionScope = AttentionScope.FULL
+    # f32 m / l / acc carries and the tile search refit for them
+    # (SGLANG_TPU_RPA_F32_CARRIES). Off keeps carries in dtype_out and main's search.
+    f32_carries: bool = False
     # Prefill tiles whose every key precedes every query (and lies inside the
     # sliding window) run without the mask, and a power-of-two sm_scale is folded
     # into q; both are exact.

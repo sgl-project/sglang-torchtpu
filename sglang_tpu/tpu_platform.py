@@ -351,6 +351,17 @@ def _pin_fused_moe_tensorcore_gather(reason: str) -> None:
     tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.set(False)
 
 
+def _pin_moe_gather_permute_for_static_fp8(parts: frozenset[str]) -> None:
+    """Kimi-K3 static fp8 moe_front / latent_up: keep the fused MoE's permute off
+    the one-hot matmul where the combine runs on the SparseCore. That pairing
+    gave wrong tokens there (DSpark verifying four requests, 32 tokens), while
+    either path end to end was right."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if parts & {"moe_front", "latent_up"}:
+        tpu_envs.SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE.set(True)
+
+
 def _mha_kv_pool_cls(backend: str | None) -> type:
     """The MHA KV pool class ``backend`` allocates.
 
@@ -1039,21 +1050,15 @@ class TpuSRTPlatform(SRTPlatform):
             with_phase,
         )
         from sglang_tpu.hooks.dsv4 import register_tpu_dsv4_resolution_hooks
-        from sglang_tpu.kimi_k3 import check_static_fp8_spec_batch, static_fp8_parts
+        from sglang_tpu.kimi_k3 import static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
 
         register_tpu_dsv4_resolution_hooks()
 
         # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
         # weights have loaded (its binder runs post-load).
-        parts = static_fp8_parts()
+        _pin_moe_gather_permute_for_static_fp8(static_fp8_parts())
         cfg = resolving_view(server_args)
-        if "latent_up" in parts:
-            check_static_fp8_spec_batch(
-                parts,
-                speculative_algorithm=cfg.speculative_algorithm,
-                max_running_requests=cfg.max_running_requests,
-            )
         if cfg.enable_page_major_kv_layout:
             raise ValueError(
                 "--enable-page-major-kv-layout is a CUDA-only layout flag and is "

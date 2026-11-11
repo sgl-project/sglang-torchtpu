@@ -66,7 +66,7 @@ from fastapi.routing import APIRoute
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX, HEALTH_CHECK_TIMEOUT
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -200,7 +200,6 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 # Global constants
-HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
 
 
@@ -704,12 +703,12 @@ async def ready() -> Response:
 def _retrieve_health_probe_outcome(task: asyncio.Task) -> None:
     """Consume the outcome of a health probe task that nobody awaits.
 
-    health_generate decides from last_receive_tstamp and only requests
-    cancellation of its probe. The cancel can lose a race with the probe's own
-    wait_for timeout in _stream_one_response: the task then finishes with the
-    client-disconnect ValueError (the handler has already returned) instead of
-    CancelledError, and asyncio logs "Task exception was never retrieved" when
-    the task is garbage-collected.
+    health_generate decides from the completion acknowledgement and only
+    requests cancellation of its probe. The cancel can lose a race with the
+    probe's own wait_for timeout in _stream_one_response: the task then
+    finishes with the client-disconnect ValueError (the handler has already
+    returned) instead of CancelledError, and asyncio logs "Task exception was
+    never retrieved" when the task is garbage-collected.
     """
     if task.cancelled():
         return
@@ -721,11 +720,13 @@ def _retrieve_health_probe_outcome(task: asyncio.Task) -> None:
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
-    """
-    Check the health of the inference server by sending a special request to generate one token.
+    """Report 200 only after the engine completes inference for this probe.
 
-    If the server is running something, this request will be ignored, so it creates zero overhead.
-    If the server is not running anything, this request will be run, so we know whether the server is healthy.
+    The scheduler registers the probe and acknowledges it, by rid, after a
+    batch with real work finishes: a chunk or step of running traffic when
+    busy (no extra forward), or the probe's own tiny forward when idle. HTTP
+    liveness, control replies, aborts and errors prove nothing, so a stalled
+    model keeps failing until it completes work again.
     """
 
     if _global_state.tokenizer_manager.gracefully_exit:
@@ -748,7 +749,11 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
-    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
+    disaggregation_mode = get_disagg().disaggregation_mode
+    # A decode engine finishes a 1-token probe at the prebuilt fake-handoff
+    # stage without a forward; the second token forces a real decode step.
+    max_new_tokens = 2 if disaggregation_mode == DisaggregationMode.DECODE.value else 1
+    sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0.0}
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
     # collide and crash the shared DetokenizerManager decode_status).
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
@@ -760,7 +765,7 @@ async def health_generate(request: Request) -> Response:
             sampling_params=sampling_params,
             log_metrics=False,
         )
-        if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
+        if disaggregation_mode != DisaggregationMode.NULL.value:
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
     else:
@@ -772,35 +777,38 @@ async def health_generate(request: Request) -> Response:
         async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
             break
 
+    # Registered before dispatch so the acknowledgement cannot arrive first.
+    probe = _global_state.tokenizer_manager.register_health_probe(rid)
+    tic = time.time()
     task = asyncio.create_task(gen())
     # A done callback, not an await: if the cancel below loses its race, the
     # task runs until the next SGLANG_REQUEST_STATE_WAIT_TIMEOUT tick, and
     # awaiting it would add that to the probe's latency.
     task.add_done_callback(_retrieve_health_probe_outcome)
 
-    # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
-    tic = time.time()
-    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-        await asyncio.sleep(1)
-        if _global_state.tokenizer_manager.last_receive_tstamp > tic:
-            task.cancel()
-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
-            return Response(status_code=200)
-
-    task.cancel()
-    tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
-    last_receive_time = time.strftime(
-        "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
-    )
-    logger.error(
-        f"Health check failed. Server couldn't get a response from detokenizer for last "
-        f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
-        f"last_heartbeat time: {last_receive_time}"
-    )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
-    return Response(status_code=503)
+    try:
+        await asyncio.wait_for(probe.event.wait(), HEALTH_CHECK_TIMEOUT)
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+        return Response(status_code=200)
+    except asyncio.TimeoutError:
+        tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
+        last_receive_time = time.strftime(
+            "%H:%M:%S",
+            time.localtime(_global_state.tokenizer_manager.last_receive_tstamp),
+        )
+        logger.error(
+            f"Health check failed. No batch completed inference for probe {rid} within "
+            f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
+            f"last completion per dp_rank (incarnation, seq): "
+            f"{_global_state.tokenizer_manager.health_progress}. "
+            f"last message from scheduler/detokenizer: {last_receive_time}"
+        )
+        _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+        return Response(status_code=503)
+    finally:
+        task.cancel()
+        _global_state.tokenizer_manager.discard_health_probe(rid)
+        _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
 
 
 @app.get("/get_model_info")

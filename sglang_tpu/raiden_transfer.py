@@ -16,8 +16,11 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Literal, Optional
 
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.utils.network import get_free_port
+from sglang_tpu.disaggregation.raiden.common import PORTS_PER_RANK
 from sglang_tpu.envs import envs
 from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, page_major_tensors
 
@@ -25,6 +28,14 @@ if TYPE_CHECKING:
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 logger = logging.getLogger(__name__)
+
+HostTransferStatus = Literal["sent", "received", "failed"]
+
+
+def _transfer_parallelism() -> int:
+    """Streams per native transfer: the connector's setting, so a host pool
+    opens the same connections per rank pair as the device-engine transfers."""
+    return envs.SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM.get()
 
 
 class RaidenFutureEvent:
@@ -92,6 +103,40 @@ class RaidenFutureEvent:
         return None
 
 
+# Above every rank's Raiden KV port block on the node (PORTS_PER_RANK ports
+# per worker, well under 64 workers).
+HOST_POOL_CONTROL_PORT_OFFSET = PORTS_PER_RANK * 64
+# A rank's full KV pool, and the sliding-window pool of a hybrid model.
+HOST_POOLS_PER_RANK = 2
+_host_pools_built = 0
+
+
+def host_control_port_candidates():
+    """Ports for a host pool's control server: a deterministic one per TP rank
+    and host pool above the Raiden KV ports first, then free ephemeral ports.
+
+    A port found free by ``get_free_port`` is bound only later, by the native
+    constructor, and the kernel can hand it to an outgoing connection in
+    between: two of fifteen engine starts in one day failed that way. The
+    native server does not refuse a port another manager of this process
+    already serves, so two pools offered the same port both bind it and a
+    peer's reads reach either manager (seen live on a hybrid model: every
+    push failed, "pull already started" or "block not registered").
+    """
+    global _host_pools_built
+    index, _host_pools_built = _host_pools_built, _host_pools_built + 1
+    if index < HOST_POOLS_PER_RANK:
+        rank = get_tensor_model_parallel_rank()
+        yield (
+            envs.SGLANG_RAIDEN_KV_PORT.get()
+            + HOST_POOL_CONTROL_PORT_OFFSET
+            + rank * HOST_POOLS_PER_RANK
+            + index
+        )
+    for _ in range(2):
+        yield get_free_port()
+
+
 class RaidenKVTransfer:
     """Owns a raiden ``KVCacheManager`` over a TPU pool's page-major tensors and
     issues page-granular D2H / H2D transfers.
@@ -106,7 +151,7 @@ class RaidenKVTransfer:
         device_pool: TpuFusedMHATokenToKVPool,
         num_host_pages: int,
         draft_pools: tuple = (),
-    ):
+    ) -> None:
         from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
         self.device_pool = device_pool
@@ -130,13 +175,44 @@ class RaidenKVTransfer:
         # thread until every per-layer copy has been submitted. The manager
         # reads it in its constructor.
         os.environ["RAIDEN_ENABLE_ASYNC_DISPATCH"] = "1"
-        # Local offload has no control plane; port 0 opens no control listener.
-        self._mgr = KVCacheManager(
-            self._device_tensors,
-            local_control_port=0,
-            host_blocks_to_allocate=num_host_pages,
-            unsafe_skip_buffer_lock=True,
-        )
+        self._host_transfers: dict[str, HostTransferStatus | None] = {}
+
+        def build(control_port: int):
+            return KVCacheManager(
+                self._device_tensors,
+                local_control_port=control_port,
+                host_blocks_to_allocate=num_host_pages,
+                parallelism=_transfer_parallelism(),
+                timeout_s=float(envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.get()),
+                unsafe_skip_buffer_lock=True,
+            )
+
+        # The Python host-pool constructor treats zero as cache-only. Victim
+        # transfers need a positive control port on the existing HiCache pool;
+        # allocating another manager would serve different host memory.
+        self._host_control_port = 0
+        if not envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get():
+            self._mgr = build(0)
+        else:
+            tried: List[int] = []
+            for port in host_control_port_candidates():
+                try:
+                    self._mgr = build(port)
+                except RuntimeError as error:
+                    # The native constructor binds the port; another socket may
+                    # have taken it since it was picked.
+                    if "Failed to bind" not in str(error):
+                        raise
+                    tried.append(port)
+                    logger.warning("host pool control port %d is taken", port)
+                    continue
+                self._host_control_port = port
+                break
+            else:
+                raise RuntimeError(
+                    "no free port for the host pool's control server "
+                    f"(tried {tried}); check what listens on them"
+                )
         logger.info(
             "Raiden KV transfer ready: %d tensors, %d host pages, %.2f MiB per page",
             self.layer_num,
@@ -183,3 +259,72 @@ class RaidenKVTransfer:
             return NOOP_EVENT
         fut = self._mgr.h2d(host_page_ids, device_page_ids, num_pages or [1] * n)
         return RaidenFutureEvent(fut)
+
+    def host_control_address(self, local_ip: str) -> str:
+        """Reachable pull-serve endpoint, distinct from the block data port."""
+        host = f"[{local_ip}]" if ":" in local_ip else local_ip
+        return f"{host}:{self._host_control_port}"
+
+    def register_read(self, req_id: str, uuid: int, block_ids: list[int]) -> None:
+        """Keep the host source pages pinned until ``poll_transfer`` reports
+        terminal."""
+        if req_id in self._host_transfers:
+            raise ValueError(f"Raiden transfer request already tracked: {req_id}")
+        self._mgr.register_read(req_id, uuid, list(block_ids), source="host")
+        # Another request's poll may have cached this registration's report
+        # while the native call released the GIL on the control listener.
+        self._host_transfers.setdefault(req_id, None)
+
+    def start_read(
+        self,
+        req_id: str,
+        uuid: int,
+        remote_endpoint: str | list[dict[str, Any]],
+        remote_block_ids: list[int],
+        local_block_ids: list[int],
+    ) -> None:
+        """Pull a peer's registered host pages into the host pages
+        ``local_block_ids``; no H2D copy follows."""
+        if req_id in self._host_transfers:
+            raise ValueError(f"Raiden transfer request already tracked: {req_id}")
+        self._mgr.start_read(
+            req_id,
+            uuid,
+            remote_endpoint,
+            list(remote_block_ids),
+            list(local_block_ids),
+            parallelism=_transfer_parallelism(),
+            destination="host",
+        )
+        self._host_transfers.setdefault(req_id, None)
+
+    def poll_transfer(self, req_id: str) -> HostTransferStatus | None:
+        """One owner drains native reports and retains every request's result.
+
+        Native terminal reports arrive only after session work has drained.
+        A caller's own deadline never authorizes releasing its source pin or
+        destination allocation while this method still returns None.
+        """
+        if self._host_transfers[req_id] is None:
+            reports = self._mgr.poll_stats_with_details()
+            statuses: tuple[HostTransferStatus, ...] = ("sent", "received", "failed")
+            for status, transfers in zip(
+                statuses, (reports.sent, reports.received, reports.failed)
+            ):
+                for transfer in transfers:
+                    self._host_transfers[transfer.req_id] = status
+                    if status == "failed":
+                        logger.warning(
+                            "Raiden host transfer %s failed (%s, %s): %s",
+                            transfer.req_id,
+                            transfer.code,
+                            transfer.phase,
+                            transfer.reason,
+                        )
+        return self._host_transfers[req_id]
+
+    def forget_transfer(self, req_id: str) -> None:
+        """Drop bookkeeping only after the native session has drained."""
+        if self._host_transfers[req_id] is None:
+            raise RuntimeError(f"Cannot forget active Raiden transfer: {req_id}")
+        del self._host_transfers[req_id]

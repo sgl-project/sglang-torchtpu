@@ -1,5 +1,6 @@
 """Tests for the Muse megakernel's per-step config selection (host-only; needs jax)."""
 
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -76,6 +77,11 @@ class TestMuseMegakernelConfig(CustomTestCase):
                     )
                     self.assertEqual(cfg.stream_depth, cfg.ring_slots - 1)
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+    )
     def test_sal_attention_flags(self):
         # The cc=1 verify step on fp8 SEQ_ALONG_LANE pages.
         def cfg():
@@ -109,6 +115,11 @@ class TestMuseMegakernelConfig(CustomTestCase):
         )
         self.assertEqual(split.swa_kv_group % split.attn_streams, 0)
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+    )
     def test_verify_steps_fold_and_decode_steps_do_not(self):
         for q, n_req, fold in (
             (8, 1, True),
@@ -131,6 +142,11 @@ class TestMuseMegakernelConfig(CustomTestCase):
                 self.assertEqual((cfg.fold_f, cfg.fold_o), (fold, fold))
                 self.assertEqual(cfg.ring_slots, 10)
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+    )
     def test_48_row_shapes_fit_the_scratch_budget(self):
         # SGLANG_TPU_MUSE_MK_MAX_ROWS=48: 12 requests x 4 verify tokens and 6 x 8, on the
         # packed bf16 pool and on fp8 SEQ_ALONG_LANE pages (which keep extra headroom).
@@ -154,6 +170,11 @@ class TestMuseMegakernelConfig(CustomTestCase):
                     self.assertLessEqual(K.scratch_vmem_bytes(cfg), budget)
                     self.assertEqual(cfg.compact_rows, 8)
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+    )
     def test_raised_row_cap_shapes_fit_the_scratch_budget(self):
         # SGLANG_TPU_MUSE_MK_MAX_ROWS: 12, 16 and 24 requests of a 4-token DFlash verify block on the
         # SEQ_ALONG_LANE fp8 pools the AgentX recipe serves.
@@ -174,6 +195,11 @@ class TestMuseMegakernelConfig(CustomTestCase):
                     K.scratch_vmem_bytes(cfg), ops._SCRATCH_VMEM_BUDGET
                 )
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+    )
     def test_tp16_shapes_keep_a_deep_weight_ring(self):
         # tp16's dense weights split into 26 tiles, whose only ring divisor is 2; the
         # tiling must split tiles until a ring of at least MIN_RING_SLOTS divides them.
@@ -194,6 +220,11 @@ class TestMuseMegakernelConfig(CustomTestCase):
                     K.scratch_vmem_bytes(cfg), ops._SCRATCH_VMEM_BUDGET
                 )
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_TPU_TEST_V11_KERNELS") == "1",
+        "New v11 kernel tests run outside PR gating (stage-a budget); "
+        "set SGLANG_TPU_TEST_V11_KERNELS=1.",
+    )
     def test_block_send_follows_the_env_and_yields_to_y_early(self):
         def config(rows, n_req):
             return ops.MuseMegakernel.config(

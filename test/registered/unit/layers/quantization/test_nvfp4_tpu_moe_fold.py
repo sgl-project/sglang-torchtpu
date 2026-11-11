@@ -275,6 +275,45 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertEqual(layer.w13_weight_scale.dtype, torch.bfloat16)
         self.assertEqual(layer.w2_weight_scale.dtype, torch.bfloat16)
 
+    def test_nvfp4_moe_fp32_scales_env_promotes_gmm_v2_only(self):
+        from sglang_tpu import fp4_moe
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.override(True):
+            gmm_layer = _make_block512_layer(group_size=16)
+            fp4_moe.prepare_tpu_nvfp4_moe_weights(
+                gmm_layer,
+                group_size=16,
+                scale_dtype=torch.bfloat16,
+                use_fused_rs=False,
+            )
+            self.assertEqual(gmm_layer.w13_weight_scale.dtype, torch.float32)
+            self.assertEqual(gmm_layer.w2_weight_scale.dtype, torch.float32)
+
+            rs_layer = _make_block512_layer(group_size=16)
+            with (
+                mock.patch(
+                    "sglang_tpu.moe.pallas.fused_moe_rs_op.prepare_fused_moe_rs"
+                ),
+                mock.patch.object(
+                    fp4_moe,
+                    "prepare_tpu_fused_rs_post_expert_norm",
+                ),
+                mock.patch.object(
+                    fp4_moe,
+                    "_materialize_packed_fp4",
+                    side_effect=lambda x: x,
+                ),
+            ):
+                fp4_moe.prepare_tpu_nvfp4_moe_weights(
+                    rs_layer,
+                    group_size=16,
+                    scale_dtype=torch.bfloat16,
+                    use_fused_rs=True,
+                )
+            self.assertEqual(rs_layer.w13_weight_scale.dtype, torch.bfloat16)
+            self.assertEqual(rs_layer.w2_weight_scale.dtype, torch.bfloat16)
+
     def test_folds_non_unit_global_scales(self):
         from sglang_tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
@@ -625,6 +664,9 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
+        # process_weights registers the E4M3 expert globals; None while the flag is off.
+        layer.register_buffer("_tpu_w13_global_scale", None, persistent=False)
+        layer.register_buffer("_tpu_w2_global_scale", None, persistent=False)
         layer.moe_ep_size = 1
         from sglang_tpu.moe.pallas import fused_moe_rs_op
 
@@ -674,6 +716,9 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 layer = _make_block512_layer(include_unused_params=False)
                 layer._tpu_fused_rs_has_post_expert_norm = False
                 layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
+                # process_weights registers the E4M3 expert globals; None while the flag is off.
+                layer.register_buffer("_tpu_w13_global_scale", None, persistent=False)
+                layer.register_buffer("_tpu_w2_global_scale", None, persistent=False)
                 layer.moe_ep_size = 1
                 fused_moe_rs_gather = mock.Mock(
                     side_effect=lambda **kwargs: kwargs["hidden_states"]
@@ -738,6 +783,9 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
+        # process_weights registers the E4M3 expert globals; None while the flag is off.
+        layer.register_buffer("_tpu_w13_global_scale", None, persistent=False)
+        layer.register_buffer("_tpu_w2_global_scale", None, persistent=False)
         layer.moe_ep_size = 2
 
         # Model rank 0's output is the first partition of each kernel result.

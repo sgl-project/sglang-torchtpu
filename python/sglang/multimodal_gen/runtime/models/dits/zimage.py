@@ -774,6 +774,11 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = [is_zimage_layer]
+    _compile_conditions = [is_zimage_layer]
+    # SP ranks feed each layer equal-length shards produced by the embedder
+    # (storage offset 0), with RoPE positions and masks as data, so all ranks
+    # compile the same layer program.
+    _compile_regions_spmd_safe = True
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = (
         ZImageDitConfig().arch_config.reverse_param_names_mapping

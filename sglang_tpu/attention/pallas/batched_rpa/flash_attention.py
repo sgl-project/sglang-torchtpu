@@ -85,10 +85,7 @@ def flash_attention_qk_softmax(
 
     if not fold_sm_scale:
         qk *= score_scale
-    # A unit K scale is the identity; skip the multiply.
-    if cfgs.serve.scale_k is not None and not (
-        isinstance(cfgs.serve.scale_k, (int, float)) and cfgs.serve.scale_k == 1
-    ):
+    if cfgs.serve.scale_k is not None:
         qk *= cfgs.serve.scale_k
     if cfgs.serve.scale_q is not None:
         qk *= cfgs.serve.scale_q

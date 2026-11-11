@@ -244,6 +244,7 @@ def config_for(conc, *, draft_model_path=None, simulate_acceptance=True):
             # Prefill attention and layers: full key tiles skip the mask, fp8
             # tiles computed transposed, the residual stream token-sharded over
             # the TP group, expert column shards gathered along the column dim.
+            "SGLANG_TPU_RPA_F32_CARRIES": "1",
             "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
             "SGLANG_TPU_RPA_TRANSPOSED": "1",
             "SGLANG_TPU_MUSE_PREFILL_SP": "1",

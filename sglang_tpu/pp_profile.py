@@ -6,7 +6,8 @@ from contextlib import contextmanager
 import torch
 
 from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.pp_wave import num_relayed_aux_slots
 
 
@@ -105,8 +106,12 @@ def set_profile_inputs(policy, batch, args, kwargs, tokens, prefix):
         # this chunk's token count and the model config dtype: serving always
         # delivers the full buffer and the shim trims it to the padded bucket,
         # so a chunk-sized proxy here would trace a row count serving never
-        # repeats.
-        rows = max_extend_tokens(context_len=runner.model_config.context_len)
+        # repeats. The buffered hand-off delivers whole tensors at the
+        # padded bucket itself, so profile those.
+        if tpu_envs.SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF.get():
+            rows = policy.forward_rows(ForwardMode.EXTEND, tokens, 1, None)
+        else:
+            rows = max_extend_tokens(context_len=runner.model_config.context_len)
 
         transfer_dtype = getattr(runner.model, "pp_transfer_dtype", runner.dtype)
 

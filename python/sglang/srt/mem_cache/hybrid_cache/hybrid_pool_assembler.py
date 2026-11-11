@@ -2247,7 +2247,8 @@ _STRATEGIES: list[StackStrategy] = [
 def register_stack_strategy(strategy: StackStrategy) -> None:
     """Prepend a strategy so downstream forks can plug in (kvcache, components)
     combinations not in the built-in list."""
-    _STRATEGIES.insert(0, strategy)
+    if strategy not in _STRATEGIES:
+        _STRATEGIES.insert(0, strategy)
 
 
 def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrategy:
