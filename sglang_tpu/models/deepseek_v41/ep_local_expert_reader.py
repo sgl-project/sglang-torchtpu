@@ -111,7 +111,30 @@ def tp_row_range(num_rows: int, tp_rank: int, tp_size: int) -> tuple[int, int]:
 
 
 def _read_range(path: str, offset: int, out: torch.Tensor) -> None:
-    """Fill uint8 ``out`` from ``path[offset:]`` with concurrent 64 MB preads."""
+    """Fill uint8 ``out`` from ``path[offset:]`` in 64 MB ranges.
+
+    RunAI's FileStreamer (native workers, many ranges in flight) when installed;
+    Python preads were measured at ~3.6 MB/s per rank on the GCS FUSE mount.
+    """
+    try:
+        from runai_model_streamer.file_streamer import FileChunks, FileStreamer
+    except ImportError:
+        _pread_range(path, offset, out)
+        return
+    starts = list(range(0, out.numel(), _READ_CHUNK_BYTES))
+    sizes = [min(_READ_CHUNK_BYTES, out.numel() - s) for s in starts]
+    with FileStreamer() as streamer:
+        streamer.stream_files(
+            [FileChunks(0, path, [offset + s for s in starts], sizes)],
+            memory_limit=8 * _READ_CHUNK_BYTES,
+        )
+        for _, index, chunk in streamer.get_chunks():
+            start = starts[index]
+            out[start : start + sizes[index]].copy_(chunk.view(-1))
+
+
+def _pread_range(path: str, offset: int, out: torch.Tensor) -> None:
+    """Concurrent 64 MB preads (fallback without RunAI)."""
     view = memoryview(out.numpy())
     fd = os.open(path, os.O_RDONLY)
     try:
