@@ -114,7 +114,9 @@ class TpuBlockDraftWorker(TpuDraftWorker):
 
     def precompile_draft(self) -> None:
         self._compile_policy().precompile_draft(
-            self.model_runner.attn_backend, kv_writer=self._write_draft_kv_eager
+            self.model_runner.attn_backend,
+            kv_writer=self._write_draft_kv_eager,
+            block_width=self.block_width,
         )
 
     def write_draft_kv(
