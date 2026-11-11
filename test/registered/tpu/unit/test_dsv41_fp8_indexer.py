@@ -179,9 +179,9 @@ def test_fp8_scorer_shapes(tokens, groups, width, page_size, record_property):
         slots = table_host[request, pos // page_size] * page_size + pos % page_size
         decoded = all_decoded[slots]
         query = q8_host[row] * qs_host[row, :, None]
-        reference = (
-            np.maximum(query @ decoded.T, 0) * weights_host[row, :, None]
-        ).sum(0)
+        reference = (np.maximum(query @ decoded.T, 0) * weights_host[row, :, None]).sum(
+            0
+        )
         ref = reference.astype(np.float64)
         got = actual_host[row, :visible].astype(np.float64)
         diff = np.sum((got - ref) ** 2) / max(np.sum(got**2 + ref**2), 1e-20)
