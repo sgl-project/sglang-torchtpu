@@ -255,6 +255,20 @@ class IndexSelect:
                 page_start = page_start + seq_count
         refs["page_starts"][self.batch // self.S] = page_start
         refs["chunk_starts"][self.batch] = chunk_start
+
+        # Each key-chunk step's (row, chunk): the count passes and the step
+        # activity read them instead of searching chunk_starts every step.
+        def fill(b, carry):
+            first = refs["chunk_starts"][b]
+
+            def one(j, carry):
+                refs["step_row"][first + j] = b
+                refs["step_local"][first + j] = j
+                return carry
+
+            return jax.lax.fori_loop(0, refs["chunk_starts"][b + 1] - first, one, carry)
+
+        jax.lax.fori_loop(0, self.batch, fill, 0)
         refs["state"][...] = state
 
     # ------------------------------------------------------------------ scoring
@@ -402,7 +416,7 @@ class IndexSelect:
     def _chunk_copy(self, step):
         from jax.experimental.pallas import tpu as pltpu
 
-        row, local = _locate(self.refs["chunk_starts"], step, self.batch)
+        row, local = self.refs["step_row"][step], self.refs["step_local"][step]
         start = jnp.minimum(local * self.chunk, self.key_rows - self.chunk)
         pltpu.make_async_copy(self.refs["keys"].at[row, pl_ds(start, self.chunk)],
                               self.refs["key_buf"].at[step % self.key_slots],
@@ -431,7 +445,7 @@ class IndexSelect:
         zeros = tuple(jnp.zeros((8, LANES), jnp.int32) for _ in range(CANDIDATES))
 
         def step_fn(step, accs):
-            row, local = _locate(refs["chunk_starts"], step, self.batch)
+            row, local = refs["step_row"][step], refs["step_local"][step]
             self._wait_chunk(step)
             pl_when(step + self.key_slots - 1 < total)(lambda: self._chunk_copy(step + self.key_slots - 1))
             start = jnp.minimum(local * chunk, self.key_rows - chunk)
@@ -484,14 +498,23 @@ class IndexSelect:
         pltpu.make_async_copy(others, others, refs["exchange_sems"].at[1, parity]).wait()
         return jnp.sum(refs["exchange"][parity], axis=0)  # [COUNT_ROWS, LANES]
 
+    def _row_scalars(self, state_row, name):
+        """Lanes ``0 .. B - 1`` of state row ``state_row`` into SMEM
+        ``refs[name]`` (one read per row a round, not per chunk step)."""
+        vector = self.refs["state"][state_row:state_row + 1]
+        for b in range(self.batch):
+            self.refs[name][b] = _row_scalar(vector, b)
+
     def select(self):
         """The rounds; ``tau`` / ``p_tie`` per row into SMEM."""
         refs, topk = self.refs, self.topk
         cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
         parity = 0
         for shift in KEY_SHIFTS:
+            self._row_scalars(_PREFIX, "row_prefix")
+
             def key_test(row, shift=shift):
-                prefix = _row_scalar(refs["state"][_PREFIX:_PREFIX + 1], row)
+                prefix = refs["row_prefix"][row]
                 return lambda key, position, j: key >= ((prefix + _i32((j + 1) << shift)) ^ INT_MIN)
 
             total = self._all_reduce(self._count(key_test), parity)
@@ -513,10 +536,13 @@ class IndexSelect:
         @pl_when(jnp.sum(tie.astype(jnp.int32)) > 0)
         def ties():
             nonlocal_parity = parity
+            self._row_scalars(_PREFIX, "row_prefix")
             for shift in POSITION_SHIFTS:
+                self._row_scalars(_POSITION, "row_position")
+
                 def position_test(row, shift=shift):
-                    tau = _row_scalar(refs["state"][_PREFIX:_PREFIX + 1], row) ^ INT_MIN
-                    prefix = _row_scalar(refs["state"][_POSITION:_POSITION + 1], row)
+                    tau = refs["row_prefix"][row] ^ INT_MIN
+                    prefix = refs["row_position"][row]
                     return lambda key, position, j: (key == tau) & (position < prefix + ((j + 1) << shift))
 
                 total = self._all_reduce(self._count(position_test), nonlocal_parity)
@@ -557,7 +583,7 @@ def _step_activity(self, span_rows: int, active_ref, steps: int):
     lane = jax.lax.broadcasted_iota(jnp.int32, (span_rows, LANES), 1)
 
     def step_fn(step, carry):
-        row, local = _locate(refs["chunk_starts"], step, self.batch)
+        row, local = refs["step_row"][step], refs["step_local"][step]
         self._wait_chunk(step)
         pl_when(step + self.key_slots - 1 < total)(lambda: self._chunk_copy(step + self.key_slots - 1))
         start = jnp.minimum(local * chunk, self.key_rows - chunk)
@@ -621,6 +647,10 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         "counts": pltpu.SMEM((batch,), jnp.int32),
         "page_starts": pltpu.SMEM((batch + 1,), jnp.int32),
         "chunk_starts": pltpu.SMEM((batch + 1,), jnp.int32),
+        "step_row": pltpu.SMEM((batch * -(-key_rows // min(CHUNK_ROWS, key_rows)),), jnp.int32),
+        "step_local": pltpu.SMEM((batch * -(-key_rows // min(CHUNK_ROWS, key_rows)),), jnp.int32),
+        "row_prefix": pltpu.SMEM((batch,), jnp.int32),
+        "row_position": pltpu.SMEM((batch,), jnp.int32),
     }
 
 
