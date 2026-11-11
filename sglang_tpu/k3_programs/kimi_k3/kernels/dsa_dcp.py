@@ -439,10 +439,13 @@ class IndexSelect:
 
             @pl_when(last)
             def column():
-                counts = refs["local"][...]
-                for j in range(CANDIDATES):
-                    counts = jnp.where((cand == j) & (lane16 == row), jnp.sum(accs[j]), counts)
-                refs["local"][...] = counts
+                # Sublane sums stacked into one [16, LANES] block, then a single
+                # lane reduction (not a full reduction per candidate).
+                partial = jnp.concatenate(
+                    [jnp.sum(a, axis=0, keepdims=True) for a in accs]
+                    + [jnp.zeros((COUNT_ROWS - CANDIDATES, LANES), jnp.int32)], axis=0)  # [16, LANES]
+                total = jnp.sum(partial, axis=1, keepdims=True)  # [16, 1]
+                refs["local"][...] = jnp.where(lane16 == row, total, refs["local"][...])
 
             return tuple(accs)
 

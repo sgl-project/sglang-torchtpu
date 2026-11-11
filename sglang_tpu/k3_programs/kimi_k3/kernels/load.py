@@ -559,6 +559,10 @@ def selected_local_shapes(layers=93, hidden=7168, *, vocab=163840, dsa=False):
             d_wk=(m, hidden, 128),
             d_wproj=(m, hidden, 128),
             d_knorm=(m, 2, 128),
+            # The decode's (rank_loader.decode_indexer_families): 16 / 32-row
+            # blocks per 128 hidden lanes, whole 512-row chunks.
+            d_wks=(m, -(-(hidden // 128 * 16) // 512) * 512, 128),
+            d_wpt=(m, -(-(hidden // 128 * 32) // 512) * 512, 128),
         )
     return shapes
 

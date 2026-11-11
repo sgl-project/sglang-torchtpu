@@ -269,12 +269,28 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
     for key, value in _budgeted(jobs):
         if key == "dense":
             families = split_kda_projection(value)
+            if "d_wk" in families:
+                families.update(decode_indexer_families(families, rank))
             if attention_dp > 1:
                 families.update(attention_dp_families(families, presharded, rank, layers, attention_dp))
             for name, family in families.items():
                 yield "decode", name, family
         else:
             yield "decode", key, value
+
+
+def decode_indexer_families(families: dict, rank: int) -> dict:
+    """Kimi-K3.1's decode indexer weights from the pre-shard's, in place of
+    ``d_wk`` / ``d_wproj`` (popped from ``families``; the prefill reads them
+    itself): ``d_wks`` (``dsa_decode.key_weight``: the rank's index-key dims
+    over DCP32, the rank holding index head ``rank``'s ``d_wqb``) and
+    ``d_wpt`` (``dsa_decode.gate_weight``, every rank)."""
+    from sglang_tpu.k3_programs.kimi_k3.kernels.dsa_decode import gate_weight, key_weight
+
+    wk, wproj = families.pop("d_wk"), families.pop("d_wproj")
+    layers = range(wk.shape[0])
+    return {"d_wks": np.stack([key_weight(wk[i], rank % 32, 32) for i in layers]),
+            "d_wpt": np.stack([gate_weight(wproj[i]) for i in layers])}
 
 
 def attention_dp_families(families: dict, presharded, rank: int, layers: int, dp: int) -> dict:
