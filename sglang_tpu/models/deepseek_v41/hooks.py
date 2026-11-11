@@ -54,6 +54,14 @@ tpu_dsv41_hc_combine
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: hc_combine dispatches on device like the other mHC kernels.
 
+tpu_dsv41_engram_gate
+  Why: the torch fallback of sglang.srt.layers.engram.engram_gate uses
+       torch.copysign, which TorchTPU does not implement (aten::copysign.out).
+  How: AROUND engram_gate keeps the original on CUDA; elsewhere computes the
+       same gate with torch.where(dot >= 0, |dot|', -|dot|') for the sign.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: TorchTPU implements aten::copysign or engram_gate avoids it.
+
 trace_tpu_env_default
   Why: EnvField._resolve_default calls callable(self.default) for lazily
        computed defaults (e.g. SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)),
@@ -153,6 +161,24 @@ def tpu_dsv41_hc_combine(original, x_flat, pre, hc, out_dtype):
     return (pre.float().unsqueeze(-1) * copies).sum(1).to(out_dtype)
 
 
+def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value):
+    """engram_gate without torch.copysign (no TorchTPU kernel)."""
+    if x.is_cuda:
+        return original(x, kv, q_weight, k_weight, eps, clamp_value)
+    hc_mult, dim = x.shape[-2:]
+    key, value = kv.split([hc_mult * dim, dim], dim=-1)
+    key = key.float().unflatten(-1, (hc_mult, dim))
+    weight = q_weight.float() * k_weight.float()
+    h = x.float()
+    rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(
+        key.square().mean(-1) + eps
+    )
+    dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
+    magnitude = dot.abs().clamp_min(clamp_value).sqrt()
+    gate = torch.sigmoid(torch.where(dot >= 0, magnitude, -magnitude))
+    return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -186,6 +212,11 @@ def hook_specs():
         (
             "sglang.kernels.ops.layernorm.mhc.hc_combine",
             tpu_dsv41_hc_combine,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.engram.engram_gate",
+            tpu_dsv41_engram_gate,
             HookType.AROUND,
         ),
     ]
