@@ -382,7 +382,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
 
     @staticmethod
     def _register_ops():
-        # Registration must precede torch.compile tracing.
+        # Registration must precede torch.compile tracing, including the shared
+        # RoPE used by generic Q/KV preparation and the ratio-2 compressor.
+        from sglang_tpu.dsv4.dsv4_attention_backend import _register_rope_op
         from sglang_tpu.models.deepseek_v41.ops import (
             compressor,
             csa2,
@@ -391,6 +393,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             qa_preprocess,
         )
 
+        _register_rope_op()
         csa2.register_csa2_ops()
         indexer.register_indexer_ops()
         preprocess.register_ops()
