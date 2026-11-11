@@ -40,9 +40,10 @@ LOG2E = 1.4426950408889634
 TOL_ROW, TOL_MEAN = 3e-2, 1e-2
 TOL_KV = 1e-6  # the chunk's fp8 K/V in the pool: exactly the kernel's k, v rounded
 TOL_QKV = 1e-2  # attention inputs: bf16 roundings of nearly equal f32 values
-# The served kernels against this f32 reference: RPA's bf16 tile ATTN_ERR off (outputs that
-# nearly cancel before the head norm); gmm_v2's W8A8 (fp8 layers) 3.6-4.3%, NVFP4 W4A16 0.45%. The port itself
-# is checked exactly: the stage's attention and slot outputs equal the served calls' bits.
+# The served kernels against this f32 reference: RPA's bf16 tile 1.1% off (outputs that
+# nearly cancel before the head norm); gmm_v2's W8A8 (fp8 layers) 3.6-4.3%, NVFP4 W4A16
+# 0.45%. The port itself is checked exactly: the stage's attention and slot outputs equal
+# the served calls' bits.
 TOL_ATTN = 3e-2
 TOL_EXPERTS = {
     "fp4": 1e-2,
