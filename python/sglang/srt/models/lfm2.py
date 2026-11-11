@@ -49,7 +49,8 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -315,8 +316,8 @@ class Lfm2ShortConv(nn.Module):
 
         register_shortconv_verify_buffers(self)
         self._short_conv_kernel = (
-            get_platform().get_short_conv_kernel()
-            if get_platform().is_out_of_tree()
+            current_platform.get_short_conv_kernel()
+            if current_platform.is_out_of_tree()
             else None
         )
 

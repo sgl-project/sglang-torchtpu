@@ -18,6 +18,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -525,8 +526,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     ShortConvAttnBackend,
                 )
 
-                if get_platform().is_out_of_tree():
-                    linear_attn_backend = get_platform().get_short_conv_backend_cls()(
+                if current_platform.is_out_of_tree():
+                    linear_attn_backend = current_platform.get_short_conv_backend_cls()(
                         runner
                     )
                 else:
