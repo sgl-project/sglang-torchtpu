@@ -163,13 +163,14 @@ DEFAULT_CASES = tuple(c for c in CASES if not CASES[c].opt_in)
 # default run; "expert_group=N" restacks the expert operands instead of an MKConfig field and
 # "repeat" reruns the default (run-to-run determinism). vec_route=False is not listed: its
 # outputs differ from vec_route=True by ~1 bf16 ulp in the expert branch (both match the
-# reference equally well); pass --exact vec_route=False to see it.
+# reference equally well); pass --exact vec_route=False to see it. coll_order='ring' runs on a
+# few-row step: the folds of 16+ row steps need xor peers (MKConfig.validate).
 DEFAULT_EXACT = (
+    ("fused_c1q1_s", "coll_order='ring'"),
     ("fused_c2q8_s", "repeat"),
     ("fused_c2q8_s", "y_block_send=False"),
     ("fused_c2q8_s", "o_rs_streamed=False"),
     ("fused_c2q8_s", "o_rs_rotate=False"),
-    ("fused_c2q8_s", "coll_order='ring'"),
     ("fused_c2q8_s", "expert_group=2"),
     ("salfp8_c2q8_s", "y_block_send=False"),
     ("salfp8_c2q8_s", "o_rs_streamed=False"),
@@ -573,6 +574,7 @@ class _Runner:
         self.n_layers, self.global_layers = n_layers, global_layers
         self.kinds = _kinds(n_layers)
         self.overrides: dict = {}
+        self.last_cfg = None
         runner = self
 
         class _Fake:
@@ -701,6 +703,7 @@ class _Runner:
     ):
         """(hidden [rows, H] bf16, aux [rows, L * H] bf16, the MKConfig used); kv updated in place."""
         self.overrides = dict(overrides)
+        self.last_cfg = None
         experts = self.experts(expert_group)
         d = self.device
         meta = torch.tensor([st.n_live, self.rank], dtype=torch.int32, device=d)
@@ -723,6 +726,9 @@ class _Runner:
             )
 
         torch._dynamo.reset()
+        # torch_tpu keys its executable cache on the graph, not on the kernel config the op picks
+        # while tracing: an override step would replay the previous step's executable
+        torch.tpu._clear_cache()
         compiled = torch.compile(run, fullgraph=True, dynamic=False)
         hid, aux = compiled(
             meta,
@@ -734,6 +740,10 @@ class _Runner:
             experts,
             kv,
         )
+        if self.last_cfg is None:
+            raise RuntimeError(
+                "the step ran a cached executable: the op was not traced"
+            )
         return hid.cpu(), aux.cpu(), self.last_cfg
 
     def new_kv(self, case: Case, st: StepInputs, kv: list) -> torch.Tensor:
