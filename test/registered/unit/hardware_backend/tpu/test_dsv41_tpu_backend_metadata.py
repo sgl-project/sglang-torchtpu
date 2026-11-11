@@ -15,6 +15,7 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from torch import nn
@@ -31,6 +32,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.models.deepseek_v41.attention_backend import (
     SELECTION_WIDTH,
     DSV41TPUAttnBackend,
+    _check_supported,
     apply_rope,
 )
 
@@ -64,8 +66,11 @@ def _full_loc(slot: int, position: int) -> int:
     return FULL_PAGES[slot][position // 256] * 256 + position % 256
 
 
-def _make_backend(pool, low_ratios=(1, 2)) -> DSV41TPUAttnBackend:
+def _make_backend(
+    pool, low_ratios=(1, 2), is_dspark_draft=False
+) -> DSV41TPUAttnBackend:
     backend = object.__new__(DSV41TPUAttnBackend)
+    backend.is_dspark_draft = is_dspark_draft
     backend.device = torch.device("cpu")
     backend.req_to_token = _req_to_token()
     backend.token_to_kv_pool = pool
@@ -109,6 +114,25 @@ def _decode_batch():
             [_full_loc(1, 511), _full_loc(2, 4), 0, 0], dtype=torch.int64
         ),
         req_pool_indices=torch.tensor([1, 2, 0, 0], dtype=torch.int64),
+        extend_seq_lens=None,
+        extend_seq_lens_cpu=None,
+    )
+
+
+def _verify_batch():
+    """Target verify of 4 rows per request: slot 1 spans its page boundary
+    (254..257), slot 2 covers 4..7; one bucket-padding request."""
+    positions = list(range(254, 258)) + list(range(4, 8)) + [0] * 4
+    out_cache_loc = [_full_loc(1, p) for p in range(254, 258)]
+    out_cache_loc += [_full_loc(2, p) for p in range(4, 8)] + [0] * 4
+    return SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        batch_size=3,
+        _tpu_real_b=2,
+        spec_info=SimpleNamespace(draft_token_num=4),
+        positions=torch.tensor(positions, dtype=torch.int64),
+        out_cache_loc=torch.tensor(out_cache_loc, dtype=torch.int64),
+        req_pool_indices=torch.tensor([1, 2, 0], dtype=torch.int64),
         extend_seq_lens=None,
         extend_seq_lens_cpu=None,
     )
@@ -220,6 +244,26 @@ class TestDSV41TPUBackendMetadata(CustomTestCase):
         self.assertEqual(meta.valid.tolist(), [True, False, False, False])
         self.assertEqual(meta.token_rows.tolist(), [0, -1, -1, -1])
         self.assertEqual(meta.low_ratio[1].out_loc.tolist(), [1535, -1, -1, -1])
+
+    def test_target_verify_rows_per_request(self):
+        """A verify batch carries no extend_seq_lens; its request rows come from
+        spec_info.draft_token_num, and every row is causal like chunked prefill."""
+        meta = self._metadata(_verify_batch())
+        self.assertEqual(meta.query_start_loc.tolist(), [0, 4, 8, 8])
+        self.assertEqual(meta.token_rows.tolist(), [0] * 4 + [1] * 4 + [-1] * 4)
+        self.assertEqual(meta.valid.tolist(), [True] * 8 + [False] * 4)
+        self.assertEqual(
+            meta.low_ratio[1].lengths.tolist(),
+            [255, 256, 257, 258, 5, 6, 7, 8, 0, 0, 0, 0],
+        )
+        self.assertEqual(
+            meta.low_ratio[2].lengths.tolist(),
+            [127, 128, 128, 129, 2, 3, 3, 4, 0, 0, 0, 0],
+        )
+        expected = []
+        for slot, positions in ((1, range(254, 258)), (2, range(4, 8))):
+            expected += [_full_loc(slot, p) // 2 if p % 2 else -1 for p in positions]
+        self.assertEqual(meta.low_ratio[2].out_loc.tolist(), expected + [-1] * 4)
 
     def test_rope_matches_core_rope_tail(self):
         freqs = precompute_freqs_cis(64, 1024, 65536, 160000, 16.0, 32, 1)
@@ -506,7 +550,10 @@ class _CSA2Stub:
         self.swa_records = None
         self.main = "unset"
 
-    def swa_metadata(self, swa_table, query_start_loc, positions, minimum):
+    def swa_metadata(
+        self, swa_table, query_start_loc, positions, minimum, non_causal=False
+    ):
+        self.non_causal = non_causal
         meta = torch.zeros(swa_table.shape[0], 4, dtype=torch.int32)
         bounds = torch.zeros(swa_table.shape[0], 2, dtype=torch.int32)
         # Every row nonnegative, so the backend's padding mask is what drops rows.
@@ -532,6 +579,7 @@ class _CSA2Stub:
     ):
         self.main = main
         self.sink = sink
+        self.swa_bounds = swa_bounds
         return torch.ones_like(q)
 
 
@@ -626,6 +674,59 @@ class TestDSV41BackendWiring(CustomTestCase):
 
         backend.forward(q, kv, kv, layer, batch, compress_ratio=0, attn_sink=None)
         self.assertIsNone(stub.main)
+
+    def test_draft_block_attends_non_causal(self):
+        """The DSpark draft runs its verify-shaped block non-causally; the target's
+        verify keeps causal visibility and must not receive bounds."""
+        layer = SimpleNamespace(layer_id=3, scaling=0.04, v_head_dim=HEAD_DIM)
+        q = torch.randn(12, 8, HEAD_DIM).to(torch.bfloat16)
+        kv = torch.randn(12, HEAD_DIM).to(torch.bfloat16)
+        for is_draft in (True, False):
+            backend = self._backend()
+            backend.is_dspark_draft = is_draft
+            backend.rope_tables[3] = torch.zeros(1024, 64)
+            batch = _verify_batch()
+            backend.forward(q, kv, kv, layer, batch, compress_ratio=0, attn_sink=None)
+            stub = backend.csa2_ops
+            self.assertEqual(stub.non_causal, is_draft)
+            self.assertEqual(stub.swa_bounds is not None, is_draft)
+
+
+class TestDSV41SpeculationGate(CustomTestCase):
+    def _check(self, algorithm):
+        config = SimpleNamespace(
+            compress_ratios=[0, 1, 2],
+            index_source_layer_ids=[1, 2],
+            sliding_window=128,
+            head_dim=512,
+        )
+        parallel = SimpleNamespace(
+            pp_size=1, attn_cp_size=1, attn_dcp_size=1, attn_tp_size=1
+        )
+        features = SimpleNamespace(
+            enable_encoder_swa_bounded_replay=False,
+            enable_decoder_swa_bounded_replay=False,
+        )
+        with (
+            mock.patch(
+                "sglang.srt.runtime_context.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm=algorithm),
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_parallel", return_value=parallel
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_exec",
+                return_value=SimpleNamespace(features=features),
+            ),
+        ):
+            _check_supported(config)
+
+    def test_only_dspark_speculation_is_served(self):
+        self._check(None)
+        self._check("DSPARK")
+        with self.assertRaises(NotImplementedError):
+            self._check("EAGLE")
 
 
 if __name__ == "__main__":
