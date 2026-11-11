@@ -825,9 +825,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.seq_lens.record_stream(
-            torch.accelerator.current_stream(self.device)
-        )
+        if torch.device(self.device).type != "cpu":
+            batch.seq_lens.record_stream(torch.accelerator.current_stream(self.device))
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens

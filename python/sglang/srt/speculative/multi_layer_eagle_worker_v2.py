@@ -820,9 +820,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             )
 
         if self.plan_stream:
-            torch.accelerator.current_stream(self.device).wait_stream(
-                self.plan_stream
-            )
+            torch.accelerator.current_stream(self.device).wait_stream(self.plan_stream)
 
         self._apply_deferred_mamba_init_to_draft_pools(forward_batch)
         self._fill_boundary_kv_front_and_update_stash(
