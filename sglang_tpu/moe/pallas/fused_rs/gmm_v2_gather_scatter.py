@@ -11,7 +11,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.envs import envs
 from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, recover_quant_block_size
 
 # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 that causes
@@ -19,7 +19,7 @@ from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, recover_quant_block_size
 # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
 # (likely 0.0.48).
 _LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = (
-    tpu_envs.SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE.get()
+    envs.SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE.get()
 )
 
 
@@ -289,12 +289,11 @@ def inner_kernel(
 
     Args:
         tiled_lhs_ref: Contains value lhs[m_start:m_end, k_start:k_end]
-        tiled_rhs_ref: Contains value rhs[g_id, k_start:k_end, n_start:n_end].
-          where g_id is the group associated with lhs[m_start:m_end, :]
+        tiled_rhs_ref: Contains value rhs[g_id, k_start:k_end, n_start:n_end]. where
+            g_id is the group associated with lhs[m_start:m_end, :]
         tiled_out_ref: Contains value out[m_start:m_end, n_start:n_end]
-        partial_out_ref: Contains last size_lhs_sublane rows of the previous
-          output. Will be initialized to zero if this is first tile for grid[n_id,
-          :, :].
+        partial_out_ref: Contains last size_lhs_sublane rows of the previous output.
+            Will be initialized to zero if this is first tile for grid[n_id, :, :].
         acc_ref: Reference to the accumulator.
         metadata_ref: Reference to the metadata.
         cfgs: GmmConfigs.
@@ -308,37 +307,17 @@ def inner_kernel(
     # LHS quant dtype before matmul so their per-block scales are not dropped.
     _resolved_gm_id = pl.program_id(0) if _gm_id is None else _gm_id
 
-    def _to_bf16(w):
-        # e2m1 values are exact in e4m3; fp4 -> fp8 -> bf16 takes fewer VPU ops than the
-        # direct widen (bit-identical).
-        if fp4_via_fp8 and w.dtype == jnp.float4_e2m1fn:
-            w = w.astype(jnp.float8_e4m3fn)
-        return w.astype(jnp.bfloat16)
-
-    fp4_via_fp8 = tpu_envs.SGLANG_TPU_FP4_DEQUANT_VIA_FP8.get()
-
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
-        mxu_size = pltpu.get_tpu_info().mxu_column_size
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
-        packing = cfgs.rhs_cfgs.packing
         tiled_rhs = tiled_rhs_ref.get_weight()
-        if packing > 1:
-            tiled_rhs = pltpu.bitcast(tiled_rhs, cfgs.rhs_cfgs.quant_dtype)
-        rhs_tile_n = tiled_rhs.shape[-1]
 
         num_quant_blocks_per_tile_k = cfgs.num_quant_blocks_per_tile_k
 
-        def _load_scale_16(b0, start_n, end_n):
-            rhs_scale = tiled_rhs_ref.get_scale()
-            if rhs_scale.ndim == 2:
-                scale = rhs_scale[b0 : b0 + 16, start_n:end_n]
-            else:
-                scale = rhs_scale[..., b0 : b0 + 16, 0, start_n:end_n]
-            if scale.dtype == jnp.float8_e4m3fn:
-                scale = scale.astype(jnp.float32)
-            return scale
+        # When rhs is packed (quantized dtype packed into uint32), unpack it
+        # back to the original dtype using pltpu.bitcast which operates on K
+        # axis. This expands the K dimension back to tile_k.
+        if cfgs.rhs_cfgs.packing > 1:
+            tiled_rhs = pltpu.bitcast(tiled_rhs, cfgs.rhs_cfgs.quant_dtype)
 
         def _valid_m_mask(shape):
             gm_id = _resolved_gm_id
@@ -387,6 +366,7 @@ def inner_kernel(
                 )
             return block_q, block_scale
 
+        valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
         if is_last_k_step and valid_k != 0:
             mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
             tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
@@ -396,7 +376,9 @@ def inner_kernel(
         if cfgs.rhs_cfgs.quant_dtype is None:
             # Unquantized RHS matmul path.
             acc_list = []
+            mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+            rhs_tile_n = tiled_rhs.shape[-1]
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
@@ -439,41 +421,54 @@ def inner_kernel(
             # inner loop which can be used to pipeline subsequent VPU or VST ops with
             # MXU ops for the next [tile_m, mxu_size].
             acc_list = []
-            moe_kperm = os.environ.get("MUSE_PF_MOE_KPERM", "0") == "1"
+            mxu_size = pltpu.get_tpu_info().mxu_column_size
+            rhs_tile_n = tiled_rhs.shape[-1]
+            # Experts the Muse megakernel permuted (SGLANG_TPU_MUSE_MK_KPERM): row 16 i + j of
+            # each 256-row K block takes block-16 scale row j of that block.
+            kperm = (
+                os.environ.get("MUSE_PF_MOE_KPERM", "0") == "1"
+                and cfgs.rhs_cfgs.has_scale
+                and rhs_qbs == 16
+            )
+            for start_n in range(0, rhs_tile_n, mxu_size):
+                end_n = min(rhs_tile_n, start_n + mxu_size)
+                col_size = end_n - start_n
 
-            def _quant_col_step(block_lhs, start_k, end_k, start_n, end_n):
-                # KPERM weights read through the 16-contiguous-K scale arms are silently wrong.
-                if (
-                    moe_kperm
-                    and cfgs.rhs_cfgs.has_scale
-                    and rhs_qbs == 16
-                    and (apply_rhs_scale_after_matmul or (end_k - start_k) % 256)
-                ):
-                    raise NotImplementedError(
-                        "MUSE_PF_MOE_KPERM (KPERM-layout NVFP4 experts) needs 256-multiple "
-                        f"K steps with scales folded before the matmul; got K step "
-                        f"{end_k - start_k}, tile_k {cfgs.tiles.tile_k}, lhs block "
-                        f"{q_block_size}. Check MUSE_FUSED_RS_W4A16_KBLOCK or unset "
-                        "SGLANG_TPU_MUSE_MK_KPERM."
-                    )
-                block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
-                if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
-                    if moe_kperm and rhs_qbs == 16 and (end_k - start_k) % 256 == 0:
-                        w_bf16 = _to_bf16(block_rhs)
+                acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size), dtype=acc_ref.dtype)
+
+                for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
+                    end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
+
+                    block_lhs = tiled_lhs[:, start_k:end_k]
+                    block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
+
+                    if kperm and (
+                        apply_rhs_scale_after_matmul or (end_k - start_k) % 256
+                    ):
+                        raise NotImplementedError(
+                            "MUSE_PF_MOE_KPERM (KPERM-layout NVFP4 experts) needs "
+                            "256-multiple K steps with scales folded before the matmul; "
+                            f"got K step {end_k - start_k}, tile_k {cfgs.tiles.tile_k}, "
+                            f"lhs block {q_block_size}. Unset SGLANG_TPU_MUSE_MK_KPERM."
+                        )
+                    if kperm:
+                        w_bf16 = block_rhs.astype(jnp.bfloat16)
                         parts = []
                         for kb in range((end_k - start_k) // 256):
                             b0 = (start_k + kb * 256) // 16
-                            sb = _load_scale_16(b0, start_n, end_n).astype(jnp.bfloat16)
-                            base_r = kb * 256
+                            rhs_scale = tiled_rhs_ref.get_scale()
+                            if rhs_scale.ndim == 2:
+                                sb = rhs_scale[b0 : b0 + 16, start_n:end_n]
+                            else:
+                                sb = rhs_scale[..., b0 : b0 + 16, 0, start_n:end_n]
                             parts.append(
-                                w_bf16[base_r : base_r + 256] * jnp.tile(sb, (16, 1))
+                                w_bf16[kb * 256 : (kb + 1) * 256]
+                                * jnp.tile(sb.astype(jnp.bfloat16), (16, 1))
                             )
                         block_rhs_for_quant = (
-                            parts[0]
-                            if len(parts) == 1
-                            else jnp.concatenate(parts, axis=0)
+                            parts[0] if len(parts) == 1 else jnp.concatenate(parts, 0)
                         )
-                    else:
+                    elif cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
                         scaled_rhs_slices = []
                         rhs_k_start = start_k
                         while rhs_k_start < end_k:
@@ -483,140 +478,52 @@ def inner_kernel(
                             local_k_end = rhs_k_end - start_k
                             rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
                             block_rhs_slice = block_rhs[local_k_start:local_k_end]
-                            scaled_rhs_slice = _to_bf16(
-                                block_rhs_slice
+                            scaled_rhs_slice = block_rhs_slice.astype(
+                                jnp.bfloat16
                             ) * rhs_scale_slice.astype(jnp.bfloat16)
                             scaled_rhs_slices.append(scaled_rhs_slice)
                             rhs_k_start = rhs_k_end
                         block_rhs_for_quant = jnp.concatenate(scaled_rhs_slices, axis=0)
-                else:
-                    block_rhs_for_quant = _to_bf16(block_rhs)
-
-                if fp8_activation_quant:
-                    block_lhs_for_matmul, lhs_scale = _online_quantize(
-                        block_lhs, axis=1, quant_dtype=cfgs.lhs_cfgs.quant_dtype
-                    )
-                    if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
-                        # Fold small RHS scale blocks into RHS first, then
-                        # requantize to the activation quant dtype so
-                        # matmul uses fp8 x fp8.
-                        block_rhs_for_matmul, rhs_online_scale = _online_quantize(
-                            block_rhs_for_quant,
-                            axis=0,
-                            quant_dtype=cfgs.lhs_cfgs.quant_dtype,
-                        )
                     else:
-                        block_rhs_for_matmul = block_rhs
-                        rhs_online_scale = None
-                else:
-                    block_lhs_for_matmul = block_lhs.astype(jnp.bfloat16)
-                    block_rhs_for_matmul = block_rhs_for_quant
+                        block_rhs_for_quant = block_rhs.astype(jnp.bfloat16)
 
-                block_acc = jnp.matmul(
-                    block_lhs_for_matmul,
-                    block_rhs_for_matmul,
-                    preferred_element_type=jnp.float32,
-                ).astype(acc_ref.dtype)
-
-                if fp8_activation_quant:
-                    block_acc *= lhs_scale.astype(acc_ref.dtype)
-                    if rhs_online_scale is not None:
-                        block_acc *= rhs_online_scale.astype(acc_ref.dtype)
-
-                if apply_rhs_scale_after_matmul:
-                    b_id = start_k // rhs_qbs
-                    rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
-                    block_acc *= rhs_scale_slice.astype(acc_ref.dtype)
-
-                return block_acc
-
-            if (
-                scatter_mode
-                and len(tiled_out_ref.shape) == 3
-                and is_first_k_step
-                and is_last_k_step
-                and cfgs.fuse_act is None
-                and not cfgs.rhs_cfgs.has_bias
-            ):
-                sls_out = pltpu.get_tpu_info().get_sublane_tiling(tiled_out_ref.dtype)
-                cols_per_grp = sls_out * num_lanes
-                if rhs_tile_n % cols_per_grp == 0 and cols_per_grp % mxu_size == 0:
-                    mask_col = _valid_m_mask((cfgs.tiles.tile_m, mxu_size))
-                    has_gs = cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None
-                    _gid = (
-                        metadata_ref.gm_id_to_group_id[_resolved_gm_id] if has_gs else 0
-                    )
-                    gs_2 = gs_gate_ref[_gid].astype(acc_ref.dtype) if has_gs else None
-                    share_lhs = os.environ.get("MUSE_FUSED_RS_DIRECT_STAGE", "2") == "2"
-                    n_grp = cols_per_grp // mxu_size
-                    for g_col in range(0, rhs_tile_n, cols_per_grp):
-                        if share_lhs:
-                            accs = [
-                                jnp.zeros(
-                                    (cfgs.tiles.tile_m, mxu_size), dtype=acc_ref.dtype
-                                )
-                                for _ in range(n_grp)
-                            ]
-                            for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
-                                end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-                                block_lhs = tiled_lhs[:, start_k:end_k]
-                                for c in range(n_grp):
-                                    sn = g_col + c * mxu_size
-                                    accs[c] += _quant_col_step(
-                                        block_lhs, start_k, end_k, sn, sn + mxu_size
-                                    )
-                            grp_outs = []
-                            for acc_n in accs:
-                                if gs_2 is not None:
-                                    acc_n *= gs_2
-                                grp_outs.append(
-                                    jnp.where(mask_col, acc_n, 0).astype(
-                                        tiled_out_ref.dtype
-                                    )
-                                )
+                    if fp8_activation_quant:
+                        block_lhs_for_matmul, lhs_scale = _online_quantize(
+                            block_lhs, axis=1, quant_dtype=cfgs.lhs_cfgs.quant_dtype
+                        )
+                        if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
+                            # Fold small RHS scale blocks into RHS first, then
+                            # requantize to the activation quant dtype so
+                            # matmul uses fp8 x fp8.
+                            block_rhs_for_matmul, rhs_online_scale = _online_quantize(
+                                block_rhs_for_quant,
+                                axis=0,
+                                quant_dtype=cfgs.lhs_cfgs.quant_dtype,
+                            )
                         else:
-                            grp_outs = []
-                            for start_n in range(g_col, g_col + cols_per_grp, mxu_size):
-                                acc_n = jnp.zeros(
-                                    (cfgs.tiles.tile_m, mxu_size), dtype=acc_ref.dtype
-                                )
-                                for start_k in range(
-                                    0, cfgs.tiles.tile_k, q_block_size
-                                ):
-                                    end_k = min(
-                                        cfgs.tiles.tile_k, start_k + q_block_size
-                                    )
-                                    block_lhs = tiled_lhs[:, start_k:end_k]
-                                    acc_n += _quant_col_step(
-                                        block_lhs,
-                                        start_k,
-                                        end_k,
-                                        start_n,
-                                        start_n + mxu_size,
-                                    )
-                                if gs_2 is not None:
-                                    acc_n *= gs_2
-                                grp_outs.append(
-                                    jnp.where(mask_col, acc_n, 0).astype(
-                                        tiled_out_ref.dtype
-                                    )
-                                )
-                        g_blk = g_col // num_lanes
-                        tiled_out_ref[:, pl.ds(g_blk, sls_out), :] = jnp.concatenate(
-                            grp_outs, axis=1
-                        ).reshape(cfgs.tiles.tile_m, sls_out, num_lanes)
-                    return
+                            block_rhs_for_matmul = block_rhs
+                            rhs_online_scale = None
+                    else:
+                        block_lhs_for_matmul = block_lhs.astype(jnp.bfloat16)
+                        block_rhs_for_matmul = block_rhs_for_quant
 
-            for start_n in range(0, rhs_tile_n, mxu_size):
-                end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
+                    block_acc = jnp.matmul(
+                        block_lhs_for_matmul,
+                        block_rhs_for_matmul,
+                        preferred_element_type=jnp.float32,
+                    ).astype(acc_ref.dtype)
 
-                acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size), dtype=acc_ref.dtype)
+                    if fp8_activation_quant:
+                        block_acc *= lhs_scale.astype(acc_ref.dtype)
+                        if rhs_online_scale is not None:
+                            block_acc *= rhs_online_scale.astype(acc_ref.dtype)
 
-                for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
-                    end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-                    block_lhs = tiled_lhs[:, start_k:end_k]
-                    acc_n += _quant_col_step(block_lhs, start_k, end_k, start_n, end_n)
+                    if apply_rhs_scale_after_matmul:
+                        b_id = start_k // rhs_qbs
+                        rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
+                        block_acc *= rhs_scale_slice.astype(acc_ref.dtype)
+
+                    acc_n += block_acc
 
                 acc_list.append(acc_n)
             acc = jnp.concatenate(acc_list, axis=1)
@@ -659,9 +566,7 @@ def inner_kernel(
                 # No 3D reshape needed — avoids VMEM tiling mismatch with DMA.
                 # No partial_out needed — each scatter tile is independent.
                 acc_masked = jnp.where(mask, acc, 0)
-                tiled_out_ref[...] = acc_masked.astype(tiled_out_ref.dtype).reshape(
-                    tiled_out_ref.shape
-                )
+                tiled_out_ref[...] = acc_masked.astype(tiled_out_ref.dtype)
             else:
                 acc_masked = jnp.where(mask, acc, 0).reshape(tiled_out_ref.shape)
 
@@ -729,22 +634,19 @@ def inner_kernel(
     is_first_k_step = k_id == 0
     is_last_k_step = k_id == (num_k - 1)
 
-    if isinstance(is_first_k_step, bool) and isinstance(is_last_k_step, bool):
-        _matmul(is_first_k_step=is_first_k_step, is_last_k_step=is_last_k_step)
-    else:
-        lax.cond(
-            is_first_k_step,
-            lambda: lax.cond(
-                is_last_k_step,
-                matmul_first_last,
-                matmul_first,
-            ),
-            lambda: lax.cond(
-                is_last_k_step,
-                matmul_last,
-                matmul,
-            ),
-        )
+    lax.cond(
+        is_first_k_step,
+        lambda: lax.cond(
+            is_last_k_step,
+            matmul_first_last,
+            matmul_first,
+        ),
+        lambda: lax.cond(
+            is_last_k_step,
+            matmul_last,
+            matmul,
+        ),
+    )
 
 
 @jax.named_scope("fill_metadata")
@@ -765,8 +667,8 @@ def fill_metadata(
     Args:
         lhs_group_sizes_ref: The group sizes of lhs.
         group_offset_ref: Offset of the first group to process.
-        metadata_ref: Metadata that is used to determine the group id and m
-          offsets for each gmm tile.
+        metadata_ref: Metadata that is used to determine the group id and m offsets
+            for each gmm tile.
         cfgs: GmmConfigs.
 
     Returns:
@@ -922,10 +824,8 @@ def zero_out_start_3d(
     zero_src_ref: jax.Array,  # [tile_rows, size_n // num_lanes, num_lanes]
     semaphore_ref: jax.Array,  # [1]
 ):
-    """Zero out ALL output rows via DMA.
-
-    Required for DMA scatter where output positions are non-contiguous
-    (scattered).
+    """Zero out ALL output rows via DMA. Required for DMA scatter where output
+    positions are non-contiguous (scattered).
 
     Reuses an existing 3D VMEM scratch (e.g. scatter_staging_ref) as the zero
     source — no dedicated zero_ref allocation needed. The caller must ensure
@@ -1044,10 +944,7 @@ def kernel_main(
         rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.out_size_n :], rhs_ref)
         rhs_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
         _, rhs_spec_orig = in_specs
-        in_specs = (
-            in_specs[0],
-            FusedWeightsRef(gate=rhs_spec_orig, up=rhs_spec_orig),
-        )
+        in_specs = (in_specs[0], FusedWeightsRef(gate=rhs_spec_orig, up=rhs_spec_orig))
 
     if cfgs.zero_init:
         zero_size = zero_out_start(
@@ -1091,21 +988,12 @@ def _can_dma_rows(size, dtype):
 
 @jax.named_scope("dma_gather_gm_start")
 def dma_gather_gm_start(
-    src_ref,
-    dst_ref,
-    indices_ref,
-    sem_ref,
-    gm_id,
-    metadata_ref,
-    divisor: int = 1,
-    unroll: int = 1,
+    src_ref, dst_ref, indices_ref, sem_ref, gm_id, metadata_ref, divisor: int = 1
 ):
     """Start gathering rows for a specific gm tile via DMA.
 
     src_ref and dst_ref must be 3D: (rows, k // num_lanes, num_lanes).
     No reshape — reshape on refs breaks dynamic pl.ds offsets.
-
-    `unroll`: rows issued per loop iteration (the remainder runs one by one).
 
     `divisor`: optional integer divisor applied to indices_ref values before
     use. Set > 1 when indices_ref contains packed values (e.g.,
@@ -1129,20 +1017,7 @@ def dma_gather_gm_start(
         ).start()
         return _
 
-    num_rows = m_end - m_start
-    if unroll == 1:
-        lax.fori_loop(0, num_rows, _gather_body, 0)
-        return
-
-    # `unroll` rows per iteration (fewer loop branches per row), then the tail.
-    def _block(b, _):
-        for u in range(unroll):
-            _gather_body(b * unroll + u, None)
-        return _
-
-    num_blocks = num_rows // unroll
-    lax.fori_loop(0, num_blocks, _block, 0)
-    lax.fori_loop(num_blocks * unroll, num_rows, _gather_body, 0)
+    lax.fori_loop(0, m_end - m_start, _gather_body, 0)
 
 
 @jax.named_scope("dma_gather_gm_wait")
@@ -1530,10 +1405,7 @@ def kernel_main_gather(
         rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.out_size_n :], rhs_ref)
         rhs_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
         _, rhs_spec_orig = in_specs
-        in_specs = (
-            in_specs[0],
-            FusedWeightsRef(gate=rhs_spec_orig, up=rhs_spec_orig),
-        )
+        in_specs = (in_specs[0], FusedWeightsRef(gate=rhs_spec_orig, up=rhs_spec_orig))
 
     # For gather, LHS is gathered via DMA scratch, not via pipeline.
     _, rhs_in_spec = in_specs
@@ -1643,10 +1515,7 @@ def kernel_main_scatter(
         rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.out_size_n :], rhs_ref)
         rhs_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
         _, rhs_spec_orig = in_specs
-        in_specs = (
-            in_specs[0],
-            FusedWeightsRef(gate=rhs_spec_orig, up=rhs_spec_orig),
-        )
+        in_specs = (in_specs[0], FusedWeightsRef(gate=rhs_spec_orig, up=rhs_spec_orig))
 
     # Zero-init the 3D HBM output before the pipeline starts.
     # Blocking: start + wait completes before any scatter DMAs.
@@ -1816,8 +1685,7 @@ def validate_inputs(
         size_m,
         size_k,
     ), (
-        f"lhs.shape={lhs.shape} expected=({size_m}, {size_k}),"
-        f" rhs.shape={rhs.shape}, group_sizes.shape={group_sizes.shape}"
+        f"lhs.shape={lhs.shape} expected=({size_m}, {size_k}), rhs.shape={rhs.shape}, group_sizes.shape={group_sizes.shape}"
     )
     assert rhs.shape == (size_group, size_k_raw, size_n)
     if rhs_bias is not None:
@@ -2050,11 +1918,9 @@ def gmm_v2(
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
     rhs_global_scale: jax.Array | None = None,  # tiny per-expert global scale
     group_offset: jax.Array | None = None,  # int32[1]
-    lhs_indices: (jax.Array | None) = None,  # optional gather indices for LHS rows
-    output_indices: (
-        jax.Array | None
-    ) = None,  # optional scatter indices for output rows
-    topk_weights: (jax.Array | None) = None,  # optional per-row weights for scatter-add
+    lhs_indices: jax.Array | None = None,  # optional gather indices for LHS rows
+    output_indices: jax.Array | None = None,  # optional scatter indices for output rows
+    topk_weights: jax.Array | None = None,  # optional per-row weights for scatter-add
     *,
     tile_info: TileSizes | TileFn = calculate_tiling,
     vmem_limit_bytes: int | None = None,
@@ -2082,33 +1948,37 @@ def gmm_v2(
     topk dimension, outputting directly to (output_size, N).
 
     Args:
-        lhs: LHS matrix of shape [size_m, size_k]. When lhs_indices is set, this
-          is the ungathered source and rows are gathered inside the kernel.
+        lhs: LHS matrix of shape [size_m, size_k]. When lhs_indices is set,
+            this is the ungathered source and rows are gathered inside the
+            kernel.
         rhs: RHS matrix of shape [size_group, size_k, size_n].
         group_sizes: Group sizes for LHS rows of shape [size_lhs_group,].
-        rhs_scale: Optional per-block scale of shape [size_group, num_blocks, 1,
-          out_size].
+        rhs_scale: Optional per-block scale of shape
+            [size_group, num_blocks, 1, out_size].
         rhs_bias: Optional bias of shape [size_group, 1, out_size].
         group_offset: Optional group offset of shape [1,]. Used with expert
-          parallelism where group_sizes covers all experts but only a subset is
-          processed on this shard.
-        lhs_indices: Optional int32[size_m] gather indices. When set, the kernel
-          gathers lhs[lhs_indices] via DMA (if aligned) or JAX fallback.
-        output_indices: Optional int32[size_m] scatter indices. When set, output
-          rows are scattered to output_indices positions in a buffer of size
-          output_size. Uses DMA scatter (if aligned) or JAX fallback.
+            parallelism where group_sizes covers all experts but only a
+            subset is processed on this shard.
+        lhs_indices: Optional int32[size_m] gather indices. When set, the
+            kernel gathers lhs[lhs_indices] via DMA (if aligned) or JAX
+            fallback.
+        output_indices: Optional int32[size_m] scatter indices. When set,
+            output rows are scattered to output_indices positions in a
+            buffer of size output_size. Uses DMA scatter (if aligned) or
+            JAX fallback.
         topk_weights: Optional float[size_m] per-row weights for weighted
-          scatter-add. When set along with output_indices, the scatter fuses topk
-          weighting and reduce_sum.
+            scatter-add. When set along with output_indices, the scatter
+            fuses topk weighting and reduce_sum.
         tile_info: Tile sizes or tiling function.
         vmem_limit_bytes: Optional VMEM limit in bytes.
         precision: Unused. Exists for compatibility reasons.
         preferred_element_type: Optional output dtype.
         acc_dtype: Optional accumulator dtype.
         maybe_quantize_lhs: Quantize LHS if True and RHS is quantized.
-        zero_initialize: Whether to zero-initialize unvisited output elements.
-        output_size: Required when output_indices is set. Total number of rows in
-          the scatter output buffer.
+        zero_initialize: Whether to zero-initialize unvisited output
+            elements.
+        output_size: Required when output_indices is set. Total number of
+            rows in the scatter output buffer.
         fuse_act: Optional activation fusion ("silu", "gelu", etc.).
 
     Returns:
@@ -2132,9 +2002,9 @@ def gmm_v2(
                 f"fp4 (float4_e2m1fn) gmm_v2 with K={_k} is not supported: "
                 f"K must be a multiple of {_nl * _sls} "
                 f"(num_lanes={_nl} * sublane_tiling={_sls}). "
-                "This combination triggers a known libtpu/Pallas "
-                "miscompilation under shard_map. "
-                "Use ep_backend='gmm_ep_fused' or 'gmm_ep_fused_v2' instead."
+                f"This combination triggers a known libtpu/Pallas "
+                f"miscompilation under shard_map. "
+                f"Use ep_backend='gmm_ep_fused' or 'gmm_ep_fused_v2' instead."
             )
 
     # Determine if kernel-level DMA fusion is possible for gather/scatter.
@@ -2377,15 +2247,7 @@ def gmm_v2(
             name=get_scope_name(dims, tiles) + "-gather",
             cost_estimate=get_cost_estimate(cfgs),
             metadata=get_metadata(cfgs),
-        )(
-            group_sizes,
-            group_offset,
-            lhs_indices,
-            _gs_gate,
-            _gs_up,
-            lhs_3d,
-            rhs_weights,
-        )
+        )(group_sizes, group_offset, lhs_indices, _gs_gate, _gs_up, lhs_3d, rhs_weights)
         result = result[:, : cfgs.out_size_n]
 
     elif _use_dma_scatter and _can_dma_rows(aligned_n, cfgs.out_dtype):
@@ -2876,9 +2738,7 @@ def kernel_main_fused(
         else:
             pltpu.make_async_copy(
                 src_ref=w1_packed.at[
-                    expert_id,
-                    pl.ds(k_id * pk1, pk1),
-                    pl.ds(n_id * w1_dma_n, w1_dma_n),
+                    expert_id, pl.ds(k_id * pk1, pk1), pl.ds(n_id * w1_dma_n, w1_dma_n)
                 ],
                 dst_ref=w1_buf_ref.at[buf_id],
                 sem=w1_sem_ref.at[buf_id],
@@ -3026,9 +2886,7 @@ def kernel_main_fused(
         inner_kernel(
             lhs_data,
             WeightsRef(
-                weight=w2_tile,
-                scale=w2_sc,
-                bias=w2_bias_buf_ref if has_bias else None,
+                weight=w2_tile, scale=w2_sc, bias=w2_bias_buf_ref if has_bias else None
             ),
             tiled_out_2x_ref.at[sem_id, :, pl.ds(n_id * tile_n2, tile_n2)],
             partial_out2_ref,
@@ -3607,10 +3465,10 @@ def gmm_v2_fused(
 
     if tile_k1 < size_k1 or tile_k2 < size_k2:
         print(
-            "[GMM v2 fused] WARNING: K-tiling enabled: "
+            f"[GMM v2 fused] WARNING: K-tiling enabled: "
             f"tile_k1={tile_k1}/{size_k1} tile_k2={tile_k2}/{size_k2}. "
-            "K-tiling in the fused kernel may cause numerical "
-            "accuracy issues.",
+            f"K-tiling in the fused kernel may cause numerical "
+            f"accuracy issues.",
             flush=True,
         )
 
@@ -3785,8 +3643,7 @@ def gmm_v2_fused(
         # columns) and output gather (aligned_n2 columns). Sized to
         # max(padded_k1, aligned_n2) to handle both correctly.
         pltpu.VMEM(
-            (2, tile_m, max(padded_k1, aligned_n2) // num_lanes, num_lanes),
-            out_dtype,
+            (2, tile_m, max(padded_k1, aligned_n2) // num_lanes, num_lanes), out_dtype
         ),
         # gmm1_out_ref — GMM1 output (N1/2 with fuse_act)
         pltpu.VMEM((tile_m, size_n1 // 2 if act_fn else size_n1), jnp.float32),
@@ -3805,8 +3662,7 @@ def gmm_v2_fused(
         pltpu.VMEM((size_lhs_sublane, tile_n2), jnp.float32),
         # shared_acc_ref — time-shared between GMM1 and GMM2
         pltpu.VMEM(
-            (tile_m, max(tile_n1 * 2 if act_fn else tile_n1, tile_n2)),
-            jnp.float32,
+            (tile_m, max(tile_n1 * 2 if act_fn else tile_n1, tile_n2)), jnp.float32
         ),
         # gather_sem_ref
         pltpu.SemaphoreType.DMA((2,)),
