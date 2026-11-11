@@ -556,5 +556,30 @@ class TestExtendContextRealBatch(CustomTestCase):
             ExtendContext().rows(batch, tail=3, rows=8)
 
 
+class TestOverrideSignatures(CustomTestCase):
+    """TpuSpecWorker calls its overridable steps by keyword (extend with
+    pp_proxy_tensors, _build_verify_batch with spec_info); an override that
+    drops one fails with a TypeError on the first request. Every method the V4.1
+    DSpark worker overrides must accept every parameter the base method takes."""
+
+    def test_overrides_accept_the_base_parameters(self):
+        import inspect
+
+        from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+
+        missing = {}
+        for name, method in vars(TpuDsv41DsparkWorker).items():
+            base = getattr(TpuSpecWorker, name, None)
+            if name == "__init__" or not callable(method) or not callable(base):
+                continue
+            params = inspect.signature(method).parameters
+            if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+                continue
+            lost = set(inspect.signature(base).parameters) - set(params)
+            if lost:
+                missing[name] = sorted(lost)
+        self.assertEqual(missing, {})
+
+
 if __name__ == "__main__":
     unittest.main()

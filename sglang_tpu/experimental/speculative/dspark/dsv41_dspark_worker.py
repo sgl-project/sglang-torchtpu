@@ -34,7 +34,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    PPProxyTensors,
+)
 from sglang.srt.models.dspark import run_markov_block
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import ServerArgs
@@ -43,6 +46,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.dsv41.dspark import RING, DSV41DSparkDrafter
@@ -445,6 +449,7 @@ class TpuDsv41DsparkWorker(TpuSpecWorker):
         verify_tokens: torch.Tensor,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        spec_info: SpecInput,
     ):
         # Under DP attention every rank runs the verify at the shared bucket, so
         # every rank's MLP-sync count must be that bucket (see dp_verify_counts).
@@ -464,6 +469,7 @@ class TpuDsv41DsparkWorker(TpuSpecWorker):
                 verify_tokens=verify_tokens,
                 rows=rows,
                 verify_input=verify_input,
+                spec_info=spec_info,
             )
 
     def _forward_idle_step(
@@ -493,7 +499,15 @@ class TpuDsv41DsparkWorker(TpuSpecWorker):
 
     # ---- extend ---------------------------------------------------------------
 
-    def extend(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def extend(
+        self, batch: ScheduleBatch, *, pp_proxy_tensors: PPProxyTensors | None = None
+    ) -> GenerationBatchResult:
+        # TpuSpecWorker.forward_batch_generation passes pp_proxy_tensors to every
+        # spec worker's extend; the in-target V4.1 drafter has no PP support.
+        if pp_proxy_tensors is not None:
+            raise NotImplementedError(
+                "V4.1 DSpark does not support pipeline parallelism."
+            )
         result = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
