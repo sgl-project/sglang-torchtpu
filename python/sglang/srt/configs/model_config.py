@@ -2494,6 +2494,21 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     return base_scaling * mscale * mscale
 
 
+def _is_all_sliding_dflash2_draft(
+    model_architectures: List[str],
+    hf_text_config: Optional[PretrainedConfig],
+) -> bool:
+    """A DFlash2 draft whose every layer is sliding-window attention (its layer_types)."""
+    if "DFlash2DraftModel" not in model_architectures or hf_text_config is None:
+        return False
+    layer_types = getattr(hf_text_config, "layer_types", None)
+    return (
+        bool(layer_types)
+        and len(layer_types) == hf_text_config.num_hidden_layers
+        and all(t == "sliding_attention" for t in layer_types)
+    )
+
+
 def is_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
@@ -2529,6 +2544,10 @@ def is_hybrid_swa_model(
             and not getattr(hf_text_config, "sliding_window", 0)
         ):
             return False
+        return True
+    # An all-sliding-window DFlash2 draft keeps its KV in the target's
+    # sliding-window pool; its config does not declare is_hybrid_swa itself.
+    if _is_all_sliding_dflash2_draft(model_architectures, hf_text_config):
         return True
     # Also recognize models that explicitly opt-in via their HF text config,
     # so custom hybrid-SWA architectures don't need to be added to the allowlist.
@@ -2643,6 +2662,14 @@ def get_hybrid_layer_ids(
     elif "UnlimitedOCRForCausalLM" in model_architectures:
         swa_attention_layer_ids = list(range(num_hidden_layers))
         full_attention_layer_ids = []
+    elif _is_all_sliding_dflash2_draft(model_architectures, hf_text_config):
+        layer_types = hf_text_config.layer_types
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
     elif getattr(hf_text_config, "hybrid_layer_pattern", None) is not None:
         # Generic fallback for custom hybrid SWA models that opt in via
         # hf_text_config.is_hybrid_swa and expose a hybrid_layer_pattern

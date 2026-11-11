@@ -2424,7 +2424,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
-    ) -> None:
+    ) -> torch.Tensor | None:
         """Materialize target context features into the draft TPU KV buffer.
 
         Args:
@@ -2471,7 +2471,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         f" commit_lens={tuple(commit_lens.shape)}."
                     )
                 if bs == 0:
-                    return
+                    return None
 
             dflash_write_draft_kv(
                 draft_model=self.draft_model,
@@ -2483,6 +2483,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens=commit_lens,
                 max_num_reqs=int(self.model_runner.req_to_token_pool.size),
             )
+            return kv_pool.kv_buffer[-1][:1, :1].to(torch.float32).sum(dim=(1, 2, 3, 4))
 
     def _append_target_hidden_to_draft_kv_by_loc_prepare_inputs(
         self,
