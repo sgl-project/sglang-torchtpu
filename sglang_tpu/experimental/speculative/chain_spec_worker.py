@@ -37,6 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.runtime_context import get_disagg, get_spec, process_model_config
 from sglang.srt.server_args import ServerArgs
@@ -383,6 +384,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         forward_batch.return_logprob = False
         self._set_draft_prefill_dp_counts(forward_batch, padded_tokens=padded_tokens)
         with drafter.draft_context(), torch.no_grad():
+            _match_draft_scope_num_token_non_padded(forward_batch)
             if mm_input_embeds is not None:
                 assert mm_input_embeds.shape[0] == padded_tokens
                 # Embeds in hand keep the draft off its mm_inputs path, whose
@@ -547,6 +549,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
             forward_batch, padded_tokens=target_hidden.shape[0]
         )
         with self._chain_draft_worker.draft_context(), torch.no_grad():
+            _match_draft_scope_num_token_non_padded(forward_batch)
             self._draft_runner.forward(forward_batch)
 
     def _idle_prompt_seed_capture(
@@ -870,6 +873,21 @@ def _chunked_tail(batch: ScheduleBatch) -> tuple[int | None, int | None]:
         if req is batch.chunked_req:
             return i, int(next_prompt_token)
     return None, None
+
+
+def _match_draft_scope_num_token_non_padded(forward_batch: ForwardBatch) -> None:
+    """Drop the non-padded token count when the draft scope does not carry one.
+
+    ForwardBatch.init_new runs in the target's scope, where MoE EP (or the DP
+    gather) enables num_token_non_padded. An attention-owning draft scope
+    (attention DP) narrows MoE EP to one, so precompile builds its draft batches
+    without the count and the compiled draft forward guards on it being None.
+    Call inside the draft scope, before the forward.
+    """
+    if enable_num_token_non_padded():
+        return
+    forward_batch.global_num_token_non_padded = None
+    forward_batch.num_token_non_padded = None
 
 
 def _draft_logits_and_hidden(
