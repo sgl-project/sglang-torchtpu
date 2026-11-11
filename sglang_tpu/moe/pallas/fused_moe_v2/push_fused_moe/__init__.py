@@ -23,7 +23,7 @@ Callers go through `fused_ep_moe_v2`; `fused_ep_moe_push` is exported for the
 package's own tests.
 """
 
-from sglang_tpu.moe.pallas.fused_moe_v2.push.layer import fused_ep_moe_push
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.layer import fused_ep_moe_push
 
 # The keyword arguments `fused_ep_moe_push` takes beyond v2's operands, which
 # `fused_ep_moe_v2(dispatch="push", push_options=...)` forwards. Everything

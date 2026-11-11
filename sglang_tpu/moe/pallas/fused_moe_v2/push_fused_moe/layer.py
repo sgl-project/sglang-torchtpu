@@ -67,7 +67,7 @@ from sglang_tpu.moe.pallas.fused_moe_v2.layer import (
     _unpack_routing_exchange,
     _unpermute_load_to_ep_rank_order,
 )
-from sglang_tpu.moe.pallas.fused_moe_v2.push.host import (
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.host import (
     build_routing_tables_sharded,
     local_sort_activations,
     local_sort_tokens,
@@ -76,16 +76,18 @@ from sglang_tpu.moe.pallas.fused_moe_v2.push.host import (
     routing_pairs_from_tables,
     run_tables,
 )
-from sglang_tpu.moe.pallas.fused_moe_v2.push.kernel import build_push_moe_kernel
-from sglang_tpu.moe.pallas.fused_moe_v2.push.plan_kernel import (
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.kernel import (
+    build_push_moe_kernel,
+)
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.plan_kernel import (
     build_exchange_rows_tables,
     build_push_tables,
 )
-from sglang_tpu.moe.pallas.fused_moe_v2.push.routing import prepare_routing
-from sglang_tpu.moe.pallas.fused_moe_v2.push.sc_dispatch import (
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.routing import prepare_routing
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.sc_dispatch import (
     sc_dispatch_chunk_2core,
 )
-from sglang_tpu.moe.pallas.fused_moe_v2.push.tc_exchange import (
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.tc_exchange import (
     build_tc_exchange_all_gather,
     build_tc_exchange_all_gather_rows,
 )

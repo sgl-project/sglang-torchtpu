@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 
 from sglang_tpu.moe.pallas.fused_moe_v2 import host
-from sglang_tpu.moe.pallas.fused_moe_v2.push.fusion import (
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.fusion import (
     ROUTING_TOKENS,
     admit,
     first_problem,
@@ -18,7 +18,7 @@ from sglang_tpu.moe.pallas.fused_moe_v2.push.fusion import (
     prefix_sum,
     tpu_version_problem,
 )
-from sglang_tpu.moe.pallas.fused_moe_v2.push.host import (
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.host import (
     build_routing_tables_sharded,
 )
 

@@ -38,9 +38,11 @@ jax = pytest.importorskip("jax")
 jnp = jax.numpy
 
 from sglang_tpu.moe.pallas.fused_moe_v2 import host, layer  # noqa: E402
-from sglang_tpu.moe.pallas.fused_moe_v2.push import fusion  # noqa: E402
-from sglang_tpu.moe.pallas.fused_moe_v2.push import routing  # noqa: E402
-from sglang_tpu.moe.pallas.fused_moe_v2.push import host as push_host  # noqa: E402
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import fusion  # noqa: E402
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import routing  # noqa: E402
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import (  # noqa: E402
+    host as push_host,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -565,7 +567,10 @@ def test_push_option_inventory_matches_the_public_wrapper():
     """A new push keyword must be forwarded or exposed as an explicit option."""
     from inspect import signature
 
-    from sglang_tpu.moe.pallas.fused_moe_v2.push import PUSH_OPTIONS, fused_ep_moe_push
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import (
+        PUSH_OPTIONS,
+        fused_ep_moe_push,
+    )
 
     options = signature(fused_ep_moe_push).parameters.keys()
     forwarded = signature(layer.fused_ep_moe_v2).parameters.keys()

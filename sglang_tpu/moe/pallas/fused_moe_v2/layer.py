@@ -372,7 +372,7 @@ def _check_dispatch(
     if stage != "fused" or routed is not None or gather_positions is not None:
         raise ValueError('dispatch="push" runs the fused stage only')
     # Imported here: the push package imports this module.
-    from sglang_tpu.moe.pallas.fused_moe_v2.push import PUSH_OPTIONS
+    from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import PUSH_OPTIONS
 
     options = dict(push_options or {})
     unknown = sorted(set(options) - set(PUSH_OPTIONS))
@@ -449,7 +449,7 @@ def fused_ep_moe_v2(
     only. Weights and scales must already be in physical-slot order.
 
     dispatch="push" supports the fused stage only and takes explicit
-    push_options from push.PUSH_OPTIONS. Optional replicated FP8
+    push_options from push_fused_moe.PUSH_OPTIONS. Optional replicated FP8
     shared_expert=(w13, s13, w2, s2) appends a separate shared output.
     See README.md for placement, padding and caller-owned state contracts."""
     push_kw = _check_dispatch(
@@ -462,7 +462,7 @@ def fused_ep_moe_v2(
         gather_positions=gather_positions,
     )
     if push_kw is not None:
-        from sglang_tpu.moe.pallas.fused_moe_v2.push import fused_ep_moe_push
+        from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import fused_ep_moe_push
 
         return fused_ep_moe_push(
             x,

@@ -55,7 +55,7 @@ separately from CPU table tests and TPU-target export.
 
 `all_gather` remains the default. `push` sends routed activations directly to
 their destination slots and accepts only the fused stage. The names in
-`push.PUSH_OPTIONS` are passed through `push_options`; defaults are the kernel
+`push_fused_moe.PUSH_OPTIONS` are passed through `push_options`; defaults are the kernel
 function's defaults, not vLLM's environment defaults. In particular, enabling
 `exchange_row_gather` requires `tc_exchange`. Model configuration should choose
 the options explicitly after measuring its shapes. No environment variables
@@ -80,15 +80,15 @@ runs and unmeasured targets/shapes retain the general implementations.
 
 ## Module boundaries
 
-`push/host.py` builds dispatch segments and sorted rows; `plan_kernel.py`
+`push_fused_moe/host.py` builds dispatch segments and sorted rows; `plan_kernel.py`
 optionally fuses table construction; `sc_dispatch.py` performs SparseCore
 pre-push; `tc_exchange.py` performs the optional TensorCore routing exchange.
 These implement different communication steps and are not copies of v2's
-activation all-gather. `push/kernel.py` and `push/layer.py` retain push's
+activation all-gather. `push_fused_moe/kernel.py` and `push_fused_moe/layer.py` retain push's
 distinct buffer lifetime and scheduling logic, while reusing v2's FFN math,
 wire epilogue, payload format, slot mapping and combine builder.
 
-`push/routing.py` and its small `fusion.py` helpers isolate the measured
+`push_fused_moe/routing.py` and its small `fusion.py` helpers isolate the measured
 metadata fusion without importing a V4.1 model module. The upstream unused
 `presort.py` is intentionally not ported. The dense shared-expert kernel lives
 in `sglang_tpu/fp8_swiglu_mlp.py` so it can also be used outside MoE.

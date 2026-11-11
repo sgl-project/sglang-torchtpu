@@ -32,7 +32,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.moe.pallas.fused_moe_v2.host import ROWBLK, ROWBLK_SHIFT, pow2_shift
-from sglang_tpu.moe.pallas.fused_moe_v2.push import tc_exchange as tx
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import tc_exchange as tx
 
 LANES = 128
 

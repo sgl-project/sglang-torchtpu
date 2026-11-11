@@ -55,7 +55,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sglang_tpu.moe.pallas.fused_moe_v2 import AXIS, WeightFormat, fused_ep_moe_v2
-from sglang_tpu.moe.pallas.fused_moe_v2.push import fused_ep_moe_push
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import fused_ep_moe_push
 
 pytestmark = pytest.mark.multichip
 
