@@ -56,7 +56,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_observability,
     get_parallel,
-    get_schedule,
     get_serving,
     publish,
 )
@@ -734,6 +733,9 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        # From the scheduler, not get_schedule(): the dp_controller role may
+        # not read the schedule namespace (ROLE_NAMESPACE_SETS).
+        self.page_size = scheduler_info[0]["page_size"]
         self.startup_time = aggregate_scheduler_startup_times(
             info.get("startup_time") for info in scheduler_info
         )
@@ -802,7 +804,7 @@ class DataParallelController:
 
     def _make_prefix_selector(self) -> PrefixAwareSelector:
         # One index block per radix page: a rank only reuses whole pages.
-        block_size = max(1, int(get_schedule().page_size or 1))
+        block_size = max(1, int(self.page_size or 1))
         # A rank's radix cache holds at most its KV pool (plus the HiCache host
         # tier). Tracking more than it holds only keeps stale affinities, which
         # still route a session to one rank; tracking less drops live ones. Err

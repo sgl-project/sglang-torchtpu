@@ -515,20 +515,37 @@ class TestPrefixAwareScheduler(CustomTestCase):
         ctl = _make_controller(4)
         ctl.max_dp_size = 4
         ctl.max_total_num_tokens = 1000
-        with (
-            patch(
-                "sglang.srt.managers.data_parallel_controller.get_schedule",
-                return_value=SimpleNamespace(page_size=64),
-            ),
-            patch(
-                "sglang.srt.managers.data_parallel_controller.get_observability",
-                return_value=SimpleNamespace(decode_log_interval=40),
-            ),
+        ctl.page_size = 64
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.get_observability",
+            return_value=SimpleNamespace(decode_log_interval=40),
         ):
             sel = ctl._make_prefix_selector()
         self.assertEqual(sel.index.block_size, 64, "one index block per radix page")
         self.assertEqual(sel.index.capacity_blocks, 4 * 1000 // 64)
         self.assertEqual(sel.log_interval, 40)
+
+    def test_selector_builds_within_dp_controller_namespaces(self):
+        """Under SGLANG_ROLE_NAMESPACES=enforce the controller may only read its
+        audited namespaces; building the selector runs during its startup, so an
+        out-of-set read (e.g. `schedule`) would abort the server."""
+        import sglang.srt.runtime_context as rc
+
+        override = rc.get_context().override_server_args(
+            attn_dp_size=4, load_balance_method="prefix_aware"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        ctl = _make_controller(4)
+        ctl.max_dp_size = 4
+        ctl.max_total_num_tokens = 1000
+        ctl.page_size = 128
+        with (
+            patch.object(rc, "_ROLE_NS_MODE", "enforce"),
+            patch.object(rc._CONTEXT, "_publish_role", "dp_controller"),
+        ):
+            sel = ctl._make_prefix_selector()
+        self.assertEqual(sel.index.block_size, 128)
 
     def test_method_parses_from_server_arg(self):
         self.assertEqual(

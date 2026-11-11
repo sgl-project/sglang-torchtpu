@@ -68,6 +68,11 @@ class PrefixAffinityIndex:
 
     def block_keys(self, input_ids: Sequence[int]) -> list[int]:
         """Chained keys of the prompt's full blocks; a partial tail is ignored."""
+        # TODO: keys cover input_ids only, which fits text-only workloads such as
+        # AgentX. The radix cache also keys on per-image pad values (applied in
+        # the scheduler, after this point), extra_key, cache_salt and lora_id.
+        # Seed the chain with those, or route requests with mm_inputs by load,
+        # before enabling prefix_aware for multimodal or multi-LoRA serving.
         bs = self.block_size
         keys = []
         key = 0
