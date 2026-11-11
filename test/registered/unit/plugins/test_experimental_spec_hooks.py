@@ -1754,6 +1754,42 @@ class TestExperimentalSpecHooks(CustomTestCase):
                     worker.init_cuda_graphs()
                 self.assertEqual(calls, expected)
 
+    def test_registered_block_draft_worker_overrides_only_matching_targets(self):
+        """A registered drafter serves only targets it matches, the first match
+        wins, and unmatched targets keep the built-in drafter of their algorithm."""
+        from sglang_tpu.experimental.speculative import block_spec_worker as bsw
+
+        algorithm = SpeculativeAlgorithm.DSPARK
+        built_in = MagicMock(return_value="built-in")
+        custom = MagicMock(return_value="custom")
+        shadowed = MagicMock(return_value="shadowed")
+        with (
+            patch.dict(bsw._DRAFT_WORKER_OVERRIDES, clear=True),
+            patch.dict(bsw._DRAFT_WORKER_CLS, {algorithm: built_in}),
+        ):
+            bsw.register_block_draft_worker(
+                algorithm=algorithm,
+                matches=lambda runner: runner == "v41",
+                factory=custom,
+            )
+            bsw.register_block_draft_worker(
+                algorithm=algorithm, matches=lambda runner: True, factory=shadowed
+            )
+            self.assertEqual(
+                bsw._create_draft_worker(algorithm=algorithm, target_runner="v41"),
+                "custom",
+            )
+            shadowed.assert_not_called()
+            self.assertEqual(
+                bsw._create_draft_worker(algorithm=algorithm, target_runner="other"),
+                "shadowed",
+            )
+            bsw._DRAFT_WORKER_OVERRIDES[algorithm].pop()
+            self.assertEqual(
+                bsw._create_draft_worker(algorithm=algorithm, target_runner="other"),
+                "built-in",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
