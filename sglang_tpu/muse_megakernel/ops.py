@@ -280,6 +280,12 @@ class MuseMegakernel(torch.nn.Module):
     def from_model(cls, model) -> "MuseMegakernel":
         from sglang.srt.runtime_context import get_parallel
 
+        for env in ("SGLANG_TPU_MUSE_MK_KPERM", "SGLANG_TPU_NVFP4_E4M3_SCALES"):
+            # kernel-level only (anvil / numerics): serving weight load has no such layout
+            if get_bool_env_var(env):
+                raise NotImplementedError(
+                    f"{env}: not supported by the Muse megakernel"
+                )
         parallel = get_parallel()
         moe_mode = resolve_moe_mode(parallel.moe_ep_size)
         if moe_mode == "ep":
@@ -320,12 +326,6 @@ class MuseMegakernel(torch.nn.Module):
                 "SGLANG_TPU_MUSE_MK_QBLOCK: serving weight load does not requantize the "
                 "experts yet (anvil / numerics only)"
             )
-        for env in ("SGLANG_TPU_MUSE_MK_KPERM", "SGLANG_TPU_NVFP4_E4M3_SCALES"):
-            # kernel-level only (anvil / numerics): serving weight load has no such layout
-            if get_bool_env_var(env):
-                raise NotImplementedError(
-                    f"{env}: not supported by the Muse megakernel"
-                )
         for layer in decoder.layers:
             attn, moe = layer.self_attn, layer.mlp
             if layer.post_attention_layernorm.weight is not None:
