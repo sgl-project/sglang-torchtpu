@@ -146,6 +146,141 @@ class TestQBPostquantBinding(CustomTestCase):
         self.assertIsNone(layer._dsv41_qb)
 
 
+class TestQBBackendIntegration(CustomTestCase):
+    def test_backend_normalizes_before_fused_dispatch_and_preserves_output_owner(self):
+        """Binding changes Q dispatch, not normalized indexer rows or KV/RoPE."""
+        from sglang_tpu.models.deepseek_v41.attention_backend import (
+            DSV41TPUAttnBackend,
+            rope_reference,
+        )
+
+        layer = _layer()
+        layer.layer_id = 3
+        layer.q_norm = nn.RMSNorm(128, eps=0, dtype=torch.bfloat16)
+        layer.kv_norm = nn.Identity()
+        # Only one active K row keeps the CPU reference small and exact.
+        weight = torch.zeros((128, 4096))
+        weight[0] = 1
+        layer.wq_b.weight = nn.Parameter(weight.to(torch.float8_e4m3fn), False)
+        layer.wq_b.weight_scale = torch.arange(4096, dtype=torch.float32) / 4096 + 1
+        angles = torch.arange(4, dtype=torch.float32)[:, None] * torch.full(
+            (1, 32), 0.3
+        )
+        layer.freqs_cis = torch.cat((angles.cos(), angles.sin()), -1)
+        model = _model(layer)
+        self.assertEqual(preprocess.bind_model_preprocessing(model), 1)
+        backend = DSV41TPUAttnBackend.__new__(DSV41TPUAttnBackend)
+        backend.rope_tables = {}
+        raw_q = (
+            torch.arange(1, 257, dtype=torch.float32).reshape(2, 128).to(torch.bfloat16)
+        )
+        expected_normalized = (
+            raw_q.float() * raw_q.float().square().mean(-1, keepdim=True).rsqrt()
+        ).to(torch.bfloat16)
+        positions = torch.tensor([3, 1], dtype=torch.int64)
+        kv = torch.arange(1024, dtype=torch.float32).reshape(2, 512).to(torch.bfloat16)
+        qkv_a = torch.cat((raw_q, kv), -1)
+        output_owner = torch.full((2, 8, 512), -7, dtype=torch.bfloat16)
+        seen_rows = []
+
+        def fused_reference(rows, canonical_weight, scale, table, token_positions):
+            seen_rows.append(rows)
+            projected = (rows.float() @ canonical_weight.float()) * scale
+            return rope_reference(
+                projected.to(torch.bfloat16).view(2, 8, 512), token_positions, table
+            )
+
+        # Fused dispatch must never evaluate the generic linear. Its numerical
+        # replacement is only the hardware boundary; backend/norm/RoPE are real.
+        with (
+            mock.patch.object(ops, "qb_rope", side_effect=fused_reference),
+            mock.patch.object(
+                layer.wq_b, "forward", side_effect=AssertionError("generic Q-B")
+            ),
+        ):
+            normalized, result, result_kv = backend.prepare_mqa_qkv(
+                layer, torch.empty(2, 1), raw_q, qkv_a, positions, output_owner
+            )
+        expected_projected = (
+            (expected_normalized[:, :1].float() * layer.wq_b.weight_scale)
+            .to(torch.bfloat16)
+            .view(2, 8, 512)
+        )
+        expected_q = rope_reference(expected_projected, positions, layer.freqs_cis)
+        torch.testing.assert_close(normalized, expected_normalized, rtol=0, atol=0)
+        self.assertIs(normalized, seen_rows[0])
+        self.assertIs(result, output_owner)
+        torch.testing.assert_close(result, expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(
+            result_kv, rope_reference(kv, positions, layer.freqs_cis), rtol=0, atol=0
+        )
+        torch.testing.assert_close(backend.rope_tables[3], layer.freqs_cis)
+
+        # A distinct value-bearing generic projection detects an accidental
+        # unconditional fused dispatch after the adapter is removed.
+        layer._dsv41_qb = None
+        generic_columns = torch.arange(4096, dtype=torch.float32)[None, :] / 1024 + 5
+
+        def generic_projection(rows):
+            return (generic_columns + rows[:, :1].float()).to(torch.bfloat16), None
+
+        with (
+            mock.patch.object(layer.wq_b, "forward", side_effect=generic_projection),
+            mock.patch.object(
+                ops, "qb_rope", side_effect=AssertionError("fused fallback")
+            ),
+        ):
+            fallback_rows, fallback_q, fallback_kv = backend.prepare_mqa_qkv(
+                layer, torch.empty(2, 1), raw_q, qkv_a, positions
+            )
+        expected_generic = (
+            (generic_columns + expected_normalized[:, :1].float())
+            .to(torch.bfloat16)
+            .view(2, 8, 512)
+        )
+        torch.testing.assert_close(fallback_rows, normalized, rtol=0, atol=0)
+        torch.testing.assert_close(
+            fallback_q,
+            rope_reference(expected_generic, positions, layer.freqs_cis),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(fallback_kv, result_kv, rtol=0, atol=0)
+        self.assertFalse(torch.equal(fallback_q, result))
+
+    def test_loader_binds_the_model_returned_after_quant_postprocessing(self):
+        """Binding before the parent canonicalizes weights loses fused Q-B."""
+        from sglang_tpu.models.deepseek_v41.loader import (
+            DSV41RunaiModelStreamerLoader,
+            RunaiModelStreamerLoader,
+        )
+
+        layer = _layer()
+        model = _model(layer)
+        canonical_weight = layer.wq_b.weight
+        layer.wq_b.weight = nn.Parameter(torch.zeros(4096, 128), False)
+        layer.wq_b.weight_block_size = [128, 128]
+
+        def postprocess(*, model_config, device_config):
+            layer.wq_b.weight = canonical_weight
+            layer.wq_b.weight_block_size = None
+            return model
+
+        loader = DSV41RunaiModelStreamerLoader.__new__(DSV41RunaiModelStreamerLoader)
+        with mock.patch.object(
+            RunaiModelStreamerLoader, "load_model", side_effect=postprocess
+        ):
+            result = loader.load_model(model_config=object(), device_config=object())
+        self.assertIs(result, model)
+        self.assertIs(result.attention._dsv41_qb.weight, canonical_weight)
+        torch.testing.assert_close(
+            result.attention._dsv41_qb.scale,
+            layer.wq_b.weight_scale.flatten(),
+            rtol=0,
+            atol=0,
+        )
+
+
 class TestQBBridgeContracts(CustomTestCase):
     @staticmethod
     def _inputs(tokens, device="meta"):
