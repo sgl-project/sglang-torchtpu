@@ -94,6 +94,8 @@ def test_prompt_conditioning_uses_training_template_and_pre_norm(prompt, image_c
     processor.tokenizer.convert_tokens_to_ids.return_value = 99
     processor.apply_chat_template.return_value = [[1]]
     encoder = Mock(return_value=SimpleNamespace(hidden_states=(hidden,)))
+    positions = torch.arange(6).view(1, 1, -1).expand(3, 1, -1)
+    encoder.model.get_rope_index.return_value = (positions, None)
     stage = QwenImage21EncodingStage(encoder, processor, None, None)
     stage.use_declared_component = Mock(return_value=nullcontext(encoder))
     images = [Image.new("RGBA", (2, 1), (12, 34, 56, 0)) for _ in range(image_count)]
@@ -102,6 +104,11 @@ def test_prompt_conditioning_uses_training_template_and_pre_norm(prompt, image_c
     actual, slots = stage.encode_prompt(prompt, images, "cpu")
     torch.testing.assert_close(actual, hidden[0, [1, 2, 4]])
     assert slots.tolist() == [False, True, False]
+    # Positions come from the processor's host tensors and reach the encoder.
+    (ids, *_), rope_kwargs = encoder.model.get_rope_index.call_args
+    assert ids.device.type == "cpu"
+    assert torch.equal(rope_kwargs["attention_mask"], inputs["attention_mask"])
+    torch.testing.assert_close(encoder.call_args.kwargs["position_ids"], positions)
     encoder.model.language_model.norm.assert_not_called()
     assert encoder.model.visual.fp32_position_interpolation is False
     assert encoder.model.visual.rotary_pos_emb.recompute_on_device_change is True
@@ -129,7 +136,11 @@ class ConditioningTestEncoder(EncoderTensorParallelMixin, torch.nn.Module):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones((), device=device))
         self.model = SimpleNamespace(
-            visual=SimpleNamespace(rotary_pos_emb=SimpleNamespace())
+            visual=SimpleNamespace(rotary_pos_emb=SimpleNamespace()),
+            get_rope_index=lambda input_ids, *args, **kwargs: (
+                torch.arange(input_ids.shape[1]).view(1, 1, -1).expand(3, 1, -1),
+                None,
+            ),
         )
         self.calls = 0
 
