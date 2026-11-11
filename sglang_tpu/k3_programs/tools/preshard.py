@@ -37,6 +37,7 @@ existing pre-shard.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -69,6 +70,11 @@ def add_arguments(parser) -> None:
     )
     model.add_argument(
         "--in-flight", type=int, default=4, help="ranks converted concurrently per host"
+    )
+    model.add_argument(
+        "--skip-complete",
+        action="store_true",
+        help="with --upload: skip ranks whose index.json there lists only files that exist",
     )
     model.add_argument(
         "--upload",
@@ -163,8 +169,32 @@ class Uploader:
     def _copy(self, path: Path) -> None:
         target = self.directory / path.relative_to(self.output)
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(path, target)
+        for attempt in range(5):
+            try:
+                if attempt:  # gcsfuse: an object written through another mount is a stale handle here
+                    with contextlib.suppress(FileNotFoundError):
+                        target.unlink()
+                shutil.copyfile(path, target)
+                break
+            except OSError as error:
+                if error.errno != errno.ESTALE or attempt == 4:
+                    raise
+                time.sleep(1 + 2 * attempt)
         path.unlink()
+
+    def complete(self, rank: int) -> bool:
+        """Whether rank ``rank`` is already there: its index.json lists only
+        files that exist (an interrupted copy leaves no object)."""
+        rank_dir = self.directory / f"rank{rank:02d}"
+        try:
+            index = json.loads((rank_dir / "index.json").read_text())
+        except (OSError, ValueError):
+            return False
+        names = {"dense.bin"}
+        for family in index.get("families", {}).values():
+            names.update(family.get("files", [family.get("file", "dense.bin")]))
+        return index.get("rank") == rank and all((rank_dir / n).is_file() for n in names) and \
+            all(family in index["families"] for family in EXPERT_FAMILIES)
 
     def put(self, path: Path) -> None:
         self.futures.append(self.pool.submit(self._copy, path))
@@ -308,6 +338,10 @@ def write_k3(args, log) -> None:
             )
         )
     upload = Uploader(args.upload, output) if getattr(args, "upload", "") else None
+    if upload is not None and getattr(args, "skip_complete", False):
+        done = [r for r in ranks if upload.complete(r)]
+        ranks = [r for r in ranks if r not in done]
+        log(f"ranks {done} already in {args.upload}; converting {ranks}")
     if upload is not None and (output / "layout.json").exists():
         upload.put(output / "layout.json")
     started = time.perf_counter()
