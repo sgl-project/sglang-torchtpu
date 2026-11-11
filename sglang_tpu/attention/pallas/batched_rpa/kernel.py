@@ -189,7 +189,7 @@ def calculate_and_store_out(
         ):
             result = lax.div(batch_acc, batch_l)
         else:
-            result = batch_acc * pl.reciprocal(batch_l, approx=True)
+            result = batch_acc * pltpu.reciprocal(batch_l, approx=True)
         out = result.astype(cfgs.serve.dtype_out)
         if cfgs.serve.out_head_norm_eps is not None:
             out = utils.head_norm(
@@ -919,7 +919,7 @@ def rpa_kernel(
                 flat_smem = jax.tree_util.tree_leaves(schedule_ref)
                 dma_list = []
                 for h, s in zip(flat_hbm, flat_smem):
-                    if h.memory_space == pltpu.HBM:
+                    if jax.typeof(h).memory_space == pltpu.HBM:
                         element_size = s.shape[0] // cfgs.max_steps_ub
                         read_size = element_size * (num_steps + prefix_steps)
                         read_size = utils.align_to(read_size, 1024)

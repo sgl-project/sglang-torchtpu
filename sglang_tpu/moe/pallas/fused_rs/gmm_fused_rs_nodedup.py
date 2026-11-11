@@ -621,16 +621,16 @@ def kernel_main_fused_rs(
     def sync_barrier_signal():
         barrier_sem = pltpu.get_barrier_semaphore()
         for i in range(ep_size):
-            pltpu.semaphore_signal(
+            pl.semaphore_signal(
                 barrier_sem,
                 device_id={ep_axis_name: jnp.int32(i)},
-                device_id_type=pltpu.DeviceIdType.MESH,
+                device_id_type=pl.DeviceIdType.MESH,
             )
 
     @jax.named_scope("sync_barrier_wait")
     def sync_barrier_wait():
         barrier_sem = pltpu.get_barrier_semaphore()
-        pltpu.semaphore_wait(barrier_sem, ep_size)
+        pl.semaphore_wait(barrier_sem, ep_size)
 
     def sync_barrier():
         sync_barrier_signal()
@@ -1109,7 +1109,7 @@ def kernel_main_fused_rs(
                     send_sem=send_sems_ref.at[stg_id],
                     recv_sem=pair_recv_sem_ref.at[ring_slot],
                     device_id={ep_axis_name: sibling},
-                    device_id_type=pltpu.DeviceIdType.MESH,
+                    device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
             off = off + jnp.where(has, b, 0)
@@ -1146,7 +1146,7 @@ def kernel_main_fused_rs(
                     send_sem=send_sem,
                     recv_sem=recv_sem,
                     device_id={ep_axis_name: d},
-                    device_id_type=pltpu.DeviceIdType.MESH,
+                    device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
             n = n + has.astype(jnp.int32)
@@ -1214,10 +1214,10 @@ def kernel_main_fused_rs(
                 _row_window(run_len, _add)
 
         src_chip = (my_chip - relay_s + num_chips) % num_chips
-        pltpu.semaphore_signal(
+        pl.semaphore_signal(
             relay_credit_ref.at[relay_dir],
             device_id={ep_axis_name: 2 * src_chip + my_id % 2},
-            device_id_type=pltpu.DeviceIdType.MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         owner = 2 * ((my_chip + k) % num_chips) + my_id % 2
         block = jnp.where(relay_dir == 0, 3, 2)
@@ -1299,7 +1299,7 @@ def kernel_main_fused_rs(
                             send_sem=send_sems_ref.at[stg],
                             recv_sem=recv_sem_ref.at[0],
                             device_id={ep_axis_name: d},
-                            device_id_type=pltpu.DeviceIdType.MESH,
+                            device_id_type=pl.DeviceIdType.MESH,
                         ).start()
 
                     n = n + has.astype(jnp.int32)
@@ -1379,10 +1379,10 @@ def kernel_main_fused_rs(
                         + pair_ring_ref[ring_slot].astype(jnp.float32)
                     ).astype(pair_sum_ref.dtype)
         if "pairnosend" not in _ABLATE:
-            pltpu.semaphore_signal(
+            pl.semaphore_signal(
                 pair_credit_ref.at[0],
                 device_id={ep_axis_name: sibling},
-                device_id_type=pltpu.DeviceIdType.MESH,
+                device_id_type=pl.DeviceIdType.MESH,
             )
         if "pairnowrite" in _ABLATE:
             return
@@ -1425,7 +1425,7 @@ def kernel_main_fused_rs(
                         send_sem=send_sems_ref.at[stg],
                         recv_sem=recv_sem_ref.at[0],
                         device_id={ep_axis_name: d},
-                        device_id_type=pltpu.DeviceIdType.MESH,
+                        device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
                 @pl.when(jnp.logical_and(has, forward))
@@ -1438,7 +1438,7 @@ def kernel_main_fused_rs(
                         send_sem=send_sems_ref.at[stg],
                         recv_sem=recv_sem_ref.at[0],
                         device_id={ep_axis_name: d},
-                        device_id_type=pltpu.DeviceIdType.MESH,
+                        device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
                 off = off + jnp.where((run_len & b) != 0, b, 0)
@@ -1842,7 +1842,7 @@ def kernel_main_fused_rs(
                                 send_sem=send_sems_ref.at[stg_id],
                                 recv_sem=recv_sem_ref.at[0],
                                 device_id={ep_axis_name: target_device_id},
-                                device_id_type=pltpu.DeviceIdType.MESH,
+                                device_id_type=pl.DeviceIdType.MESH,
                             ).start()
                             if fp8_direct_write:
                                 pltpu.make_async_remote_copy(
@@ -1853,7 +1853,7 @@ def kernel_main_fused_rs(
                                     send_sem=scale_send_sems_ref.at[stg_id],
                                     recv_sem=scale_recv_sem_ref.at[0],
                                     device_id={ep_axis_name: target_device_id},
-                                    device_id_type=pltpu.DeviceIdType.MESH,
+                                    device_id_type=pl.DeviceIdType.MESH,
                                 ).start()
 
                         @pl.when(is_local)
@@ -1887,7 +1887,7 @@ def kernel_main_fused_rs(
                                 send_sem=send_sems_ref.at[stg_id],
                                 recv_sem=recv_sem_ref.at[0],
                                 device_id={ep_axis_name: target_device_id},
-                                device_id_type=pltpu.DeviceIdType.MESH,
+                                device_id_type=pl.DeviceIdType.MESH,
                             ).start()
 
                         @pl.when(is_local)

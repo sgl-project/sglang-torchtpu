@@ -1211,7 +1211,7 @@ def _ragged_paged_attention_kernel_loop(
                     l_lane = l_lane / v_scale
                 l = jnp.broadcast_to(l_lane, acc.shape)  # noqa
             out = (
-                acc * pl.reciprocal(l, approx=True)
+                acc * pltpu.reciprocal(l, approx=True)
                 if (l.dtype == jnp.float32 and o_hbm_ref.dtype != jnp.float32)
                 else lax.div(acc, l)
             ).astype(o_hbm_ref.dtype)
