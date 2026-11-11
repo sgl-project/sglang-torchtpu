@@ -3,7 +3,8 @@
 
 import json
 import struct
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -14,7 +15,6 @@ from sglang_tpu.models.deepseek_v41.ep_local_expert_reader import (
     load_local_rows,
     plan_expert_reads,
     read_row_ranges,
-    tp_row_range,
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -77,10 +77,59 @@ def _write_safetensors(path, tensors):
         f.write(struct.pack("<Q", len(encoded)) + encoded + b"".join(blobs))
 
 
+class _FakeFileStreamer:
+    """RunAI FileStreamer stand-in: reads each requested range with plain file
+    I/O and returns the ranges in reverse order, as native workers may."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def stream_files(self, requests, memory_limit=None):
+        self.requests = requests
+
+    def get_chunks(self):
+        for request in self.requests:
+            with open(request.path, "rb") as f:
+                chunks = []
+                for index, (offset, size) in enumerate(
+                    zip(request.offsets, request.sizes)
+                ):
+                    f.seek(offset)
+                    data = bytearray(f.read(size))
+                    chunks.append(
+                        (request.id, index, torch.frombuffer(data, dtype=torch.uint8))
+                    )
+            yield from reversed(chunks)
+
+
+@pytest.fixture
+def fake_runai(monkeypatch):
+    module = ModuleType("runai_model_streamer.file_streamer")
+    module.FileStreamer = _FakeFileStreamer
+    module.FileChunks = lambda id, path, offsets, sizes: SimpleNamespace(
+        id=id, path=path, offsets=offsets, sizes=sizes
+    )
+    monkeypatch.setitem(
+        sys.modules, "runai_model_streamer", ModuleType("runai_model_streamer")
+    )
+    monkeypatch.setitem(sys.modules, "runai_model_streamer.file_streamer", module)
+
+
+# Rows per rank for a 101-row table, written out so the oracle does not reuse
+# tp_row_range: floor splits, uneven when 101 does not divide.
+_ROWS_PER_RANK = {1: [101], 3: [33, 34, 34], 8: [12, 13, 12, 13, 13, 12, 13, 13]}
+
+
 @pytest.mark.parametrize("tp_size", [1, 3, 8])
-def test_row_ranges_equal_table_slices(tmp_path, monkeypatch, tp_size):
-    """Each rank's pread range must be exactly its EngramEmbedding rows, also
-    when rows do not divide evenly and the range spans many read chunks."""
+def test_rank_row_ranges_partition_each_table(
+    tmp_path, monkeypatch, fake_runai, tp_size
+):
+    """Each rank reads only its rows: concatenated over ranks they rebuild every
+    table exactly once, also when 101 rows do not divide and a range spans many
+    out-of-order read chunks."""
     from sglang_tpu.models.deepseek_v41 import ep_local_expert_reader as reader
 
     monkeypatch.setattr(reader, "_READ_CHUNK_BYTES", 96)
@@ -92,12 +141,15 @@ def test_row_ranges_equal_table_slices(tmp_path, monkeypatch, tp_size):
     path = tmp_path / "shard.safetensors"
     _write_safetensors(path, tables)
     names = {"layers.1.engram.embed.weight", "layers.1.engram.embed.scale"}
-    for rank in range(tp_size):
-        got = dict(read_row_ranges(str(path), names, rank, tp_size))
-        lo, hi = tp_row_range(101, rank, tp_size)
-        for name in names:
-            assert torch.equal(got[name], tables[name][lo:hi])
-            assert getattr(got[name], ROW_START_ATTR) == lo
+    per_rank = [
+        dict(read_row_ranges(str(path), names, r, tp_size)) for r in range(tp_size)
+    ]
+    for name in names:
+        parts = [got[name] for got in per_rank]
+        assert [p.shape[0] for p in parts] == _ROWS_PER_RANK[tp_size]
+        starts = [getattr(p, ROW_START_ATTR) for p in parts]
+        assert starts == [sum(_ROWS_PER_RANK[tp_size][:r]) for r in range(tp_size)]
+        assert torch.equal(torch.cat(parts), tables[name])
 
 
 def test_preread_rows_skip_the_original_slice_and_check_the_range():
@@ -115,3 +167,7 @@ def test_preread_rows_skip_the_original_slice_and_check_the_range():
     setattr(wrong, ROW_START_ATTR, 0)
     with pytest.raises(ValueError, match="do not match"):
         load_local_rows(lambda *a: None, embedding, param, wrong)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))

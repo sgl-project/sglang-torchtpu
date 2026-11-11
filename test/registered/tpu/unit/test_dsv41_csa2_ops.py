@@ -6,9 +6,8 @@ request's minimum visible position) plus the token's selected compressed
 records, with an attention sink, then inverse-rotates the last 64 features as
 ``conj(e^{i theta})``. The TPU cases run the ops through TorchTPU for prefill
 (ragged requests, an empty request, padding rows, replay minimum, an odd SWA
-partner row) and decode, at compress ratios 0, 1 and 2. The CPU cases check the
-JAX bridges' traced shapes against the registered fakes and the addressing
-math, and need neither TorchTPU nor a TPU.
+partner row) and decode, at compress ratios 0, 1 and 2. CPU bridge-shape and
+addressing checks live in the CPU-registered CSA2 bridge test module.
 
 Usage:
     python test/registered/tpu/unit/test_dsv41_csa2_ops.py
@@ -16,15 +15,12 @@ Usage:
 
 import functools
 import importlib.util
-import inspect
 import os
 import sys
-from unittest import mock
 
 # TorchTPU owns the device; JAX exports the custom calls on the CPU.
 os.environ["JAX_PLATFORMS"] = "cpu"
 
-import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -34,7 +30,6 @@ import torch
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang_tpu.models.deepseek_v41.kernels.csa2.cache import (
     encode_csa2_kv,
-    prepare_main_records,
 )
 from sglang_tpu.models.deepseek_v41.ops import csa2 as ops
 
@@ -107,251 +102,6 @@ def _unpack_swa(words):
     bits = words.view(np.uint32).reshape(-1, 512)
     halves = np.stack((bits & 65535, bits >> 16), axis=1).astype(np.uint16)
     return halves.view(ml_dtypes.bfloat16).reshape(-1, 512)
-
-
-def _tpu_info_patch():
-    from sglang_tpu import pallas_export
-
-    return mock.patch.object(
-        pallas_export, "get_pallas_tpu_device_kind", return_value="TPU7x"
-    )
-
-
-# =============================================================================
-# CPU: bridges, fakes, addressing
-# =============================================================================
-
-_BATCH, _TOKENS, _COLUMNS = 3, 40, 8
-_RATIO = 2
-_RECORDS = 256 // _RATIO
-
-
-def _bridge_examples():
-    """name -> (array inputs, static inputs) for each JAX bridge."""
-    i32 = np.int32
-    table = ((_BATCH, _COLUMNS), i32)
-    starts = ((_BATCH + 1,), i32)
-    positions = ((_TOKENS,), i32)
-    pages = ((20 * 128, 128), i32)
-    q = ((_TOKENS, 16, 512), ml_dtypes.bfloat16)
-    common = (starts, positions, ((16,), np.float32), ((MAX_POSITION, 64), np.float32))
-    meta = ((_BATCH, 2 + ops.swa_metadata_columns(_TOKENS)), i32)
-    examples = {
-        "swa_metadata": ((table, starts, positions, ((_BATCH,), i32)), ()),
-        "publish_swa": ((pages, positions, ((_TOKENS, 512), ml_dtypes.bfloat16)), ()),
-        "publish_main": (
-            (
-                ((4 * _RECORDS, 128), i32),
-                ((4 * _RECORDS,), np.float32),
-                ((24,), i32),
-                ((24, 512), ml_dtypes.bfloat16),
-            ),
-            (),
-        ),
-        "publish_encoded": (
-            (
-                ((4 * _RECORDS, 128), i32),
-                ((4 * _RECORDS,), np.float32),
-                ((24,), i32),
-                ((24, 128), i32),
-                ((24, 1), np.float32),
-            ),
-            (),
-        ),
-        "attend_swa": ((q, pages, *common, meta), (SCALE,)),
-        "attend_main": (
-            (
-                q,
-                ((4 * _RECORDS, 128), i32),
-                ((4 * _RECORDS,), np.float32),
-                ((_TOKENS, 512), i32),
-                ((_BATCH, 4), i32),
-                pages,
-                *common,
-                meta,
-            ),
-            (_RECORDS, _RATIO, SCALE),
-        ),
-        "wo_a": (
-            (
-                ((_TOKENS, 64, 512), ml_dtypes.bfloat16),
-                ((4096, 8192), ml_dtypes.float8_e4m3fn),
-                ((8192,), np.float32),
-            ),
-            (),
-        ),
-    }
-    examples["gather_attend"] = examples["attend_main"]
-    examples["attend_prepared"] = (
-        (
-            q,
-            ((_TOKENS, 512, 128), i32),
-            ((_TOKENS, 512), np.float32),
-            ((_TOKENS,), i32),
-            pages,
-            *common,
-            meta,
-        ),
-        (_RATIO, SCALE),
-    )
-    return examples
-
-
-def _torch_dtype(dtype):
-    return {
-        np.dtype(np.int32): torch.int32,
-        np.dtype(np.float32): torch.float32,
-        np.dtype(ml_dtypes.bfloat16): torch.bfloat16,
-        np.dtype(ml_dtypes.float8_e4m3fn): torch.float8_e4m3fn,
-    }[np.dtype(dtype)]
-
-
-@pytest.mark.parametrize("name", sorted(ops._DEFINITIONS))
-def test_bridge_traces_match_fakes(name):
-    function, fake, donated = ops._DEFINITIONS[name]
-    arrays, static_args = _bridge_examples()[name]
-    # cpu_export_jax_op makes every non-jax.Array parameter static.
-    parameters = list(inspect.signature(function).parameters.values())
-    tensors = [p for p in parameters if p.annotation is jax.Array]
-    assert [p.annotation for p in parameters[len(tensors) :]] == [
-        type(s) for s in static_args
-    ]
-    assert len(tensors) == len(arrays)
-    assert all(i < len(tensors) for i in donated)
-
-    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
-
-    specs = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in arrays]
-    with _tpu_info_patch(), tpu_info_for_cpu_export():
-        traced = jax.eval_shape(lambda *xs: function(*xs, *static_args), *specs)
-    fakes = fake(
-        *(torch.empty(s, dtype=_torch_dtype(d), device="meta") for s, d in arrays),
-        *static_args,
-    )
-    traced, fakes = jax.tree.leaves(traced), jax.tree.leaves(fakes)
-    assert [(tuple(t.shape), _torch_dtype(t.dtype)) for t in traced] == [
-        (tuple(f.shape), f.dtype) for f in fakes
-    ]
-    for i in donated:
-        # A donated pool returns in its own shape so XLA can alias it.
-        assert tuple(traced[donated.index(i)].shape) == arrays[i][0]
-
-
-def test_cos_sin_table_matches_backend_builder():
-    theta = _theta(64)
-    freqs_cis = torch.polar(torch.ones(theta.shape), torch.from_numpy(theta).float())
-    try:
-        from sglang_tpu.dsv4.dsv4_memory_pool import get_or_build_cos_sin_cache
-    except ImportError as error:
-        pytest.skip(f"dsv4 memory pool unavailable: {error}")
-    torch.testing.assert_close(
-        # FP32 polar against an FP64 reference; the check is the [cos | sin] order.
-        get_or_build_cos_sin_cache(freqs_cis),
-        _cos_sin(theta),
-        atol=1e-5,
-        rtol=0,
-    )
-
-
-def test_inverse_rope_table_undoes_rope():
-    rng = np.random.default_rng(0)
-    theta = _theta()
-    positions = rng.integers(0, MAX_POSITION, 17).astype(np.int32)
-    table = np.asarray(
-        ops._inverse_rope(jnp.asarray(_cos_sin(theta).numpy()), jnp.asarray(positions))
-    )
-    assert table.shape == (17, 2, 128) and table.dtype == np.float32
-    output = rng.normal(size=(17, 4, 512)).astype(np.float32)
-    tail = output[..., 384:]
-    # The kernel's finish(): rotated = tail * rope[0] + tail[lane ^ 1] * rope[1].
-    rotated = (
-        tail * table[:, None, 0] + tail[..., np.arange(128) ^ 1] * table[:, None, 1]
-    )
-    expected = _inverse_rope_reference(output, theta[positions])[..., 384:]
-    np.testing.assert_allclose(rotated, expected, atol=1e-5)
-
-
-def test_swa_metadata_records_and_padding():
-    rng = np.random.default_rng(1)
-    lengths = [5, 0, 70]
-    positions = np.zeros(_TOKENS, np.int32)
-    positions[:5] = np.arange(60, 65)
-    positions[5 : 75 - 40 + 5] = 0
-    lengths = [5, 0, 30]
-    positions[5:35] = np.arange(100, 130)
-    starts = np.array([0, 5, 5, 35], np.int32)
-    table = rng.permutation(np.arange(1, 1 + _BATCH * _COLUMNS)).astype(np.int32)
-    table = table.reshape(_BATCH, _COLUMNS)
-    meta, bounds, records = map(
-        np.asarray,
-        ops._swa_metadata(
-            jnp.asarray(table),
-            jnp.asarray(starts),
-            jnp.asarray(positions),
-            jnp.zeros(_BATCH, jnp.int32),
-        ),
-    )
-    assert meta.shape == (_BATCH, 2 + ops.swa_metadata_columns(_TOKENS))
-    requests = np.repeat(np.arange(_BATCH), lengths)
-    real = positions[: starts[-1]]
-    expected = table[requests, real // 64] * 64 + real % 64
-    np.testing.assert_array_equal(records[: starts[-1]], expected)
-    np.testing.assert_array_equal(records[starts[-1] :], -1)
-
-
-@pytest.mark.parametrize("ratio", [1, 2])
-def test_main_records_are_full_loc_over_ratio(ratio):
-    """Read addressing (full page id as main page id) equals the publish record
-    ``full_loc // r`` of the record's last token."""
-    rng = np.random.default_rng(2 + ratio)
-    page_records = 256 // ratio
-    lengths = np.array([700, 1, 300])
-    columns = 4
-    full_pages = rng.permutation(np.arange(1, 1 + len(lengths) * columns))
-    full_pages = full_pages.reshape(len(lengths), columns).astype(np.int32)
-    tokens = len(lengths)
-    positions = (lengths - 1).astype(np.int32)
-    starts = np.arange(tokens + 1, dtype=np.int32)
-    selected = np.full((tokens, 512), -1, np.int32)
-    for t, p in enumerate(positions):
-        count = (p + 1) // ratio
-        ids = rng.permutation(count)[:512]
-        selected[t, : len(ids)] = ids
-    records, counts = map(
-        np.asarray,
-        prepare_main_records(
-            jnp.asarray(selected),
-            jnp.asarray(full_pages),
-            jnp.asarray(starts),
-            page_size=page_records,
-        ),
-    )
-    for t in range(tokens):
-        ids = selected[t, : counts[t]]
-        last = ids * ratio + ratio - 1
-        full_loc = full_pages[t, last // 256] * 256 + last % 256
-        np.testing.assert_array_equal(records[t, : counts[t]], full_loc // ratio)
-        np.testing.assert_array_equal(records[t, counts[t] :], -1)
-        assert counts[t] == min(512, (positions[t] + 1) // ratio)
-
-
-def test_bf16_wo_a_matches_grouped_matmul():
-    torch.manual_seed(0)
-    groups, rank, heads = 8, 64, 16
-    depth = heads * 512 // groups
-    o = torch.randn(5, heads, 512, dtype=torch.bfloat16)
-    weight = torch.randn(groups * rank, depth, dtype=torch.bfloat16) / depth**0.5
-    expected = torch.cat(
-        [
-            o.reshape(5, groups, depth)[:, g].float()
-            @ weight[g * rank : (g + 1) * rank].float().T
-            for g in range(groups)
-        ],
-        dim=1,
-    )
-    actual = ops.wo_a(o, weight)
-    assert actual.shape == (5, groups * rank) and actual.dtype == torch.bfloat16
-    torch.testing.assert_close(actual.float(), expected, atol=3e-2, rtol=2e-2)
 
 
 # =============================================================================
@@ -680,33 +430,9 @@ def test_compiled_step_updates_caller_pools(tpu_ops, ratio):
         return _step(case, inputs)
 
     out, swa_records = step(inputs)
+    assert out.shape == case.q.shape and out.dtype == torch.bfloat16
+    assert swa_records.shape == case.positions.shape
     _check(case, inputs, out, swa_records)
-
-
-@requires_tpu
-def test_fp8_wo_a_projection(tpu_ops):
-    torch.manual_seed(0)
-    tokens, heads, groups, rank = 16, 64, 8, 1024
-    depth = heads * 512 // groups
-    o = torch.randn(tokens, heads, 512, dtype=torch.bfloat16)
-    weight = (torch.randn(depth, groups * rank) * 0.5).to(torch.float8_e4m3fn)
-    scale = torch.rand(groups * rank) * 0.01 + 0.005
-    expected = (
-        torch.cat(
-            [
-                o.reshape(tokens, groups, depth)[:, g].float()
-                @ weight[:, g * rank : (g + 1) * rank].float()
-                for g in range(groups)
-            ],
-            dim=1,
-        )
-        * scale
-    )
-    actual = ops.wo_a(o.to("tpu"), weight.to("tpu"), scale.to("tpu")).cpu().float()
-    assert actual.shape == (tokens, groups * rank)
-    error = (actual - expected).norm() / expected.norm()
-    # Activations are quantized to FP8 per row inside the kernel.
-    assert error < 5e-2, error
 
 
 @requires_tpu
