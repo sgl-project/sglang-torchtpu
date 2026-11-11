@@ -475,6 +475,8 @@ class FutureMap:
             return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
+        # record_stream only guards the device caching allocator across streams;
+        # CPU has no streams, and torch.accelerator rejects a CPU device.
         if not _is_tpu and torch.device(self.device).type != "cpu":
             indices.record_stream(torch.accelerator.current_stream(self.device))
         if self.need_topk:
