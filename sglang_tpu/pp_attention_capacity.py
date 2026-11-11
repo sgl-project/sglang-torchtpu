@@ -29,6 +29,7 @@ def _capacity_for_shape(
     from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
         calculate_block_sizes,
     )
+    from sglang_tpu.envs import envs
     from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
     with tpu_info_for_cpu_export():
@@ -47,6 +48,7 @@ def _capacity_for_shape(
             dtype_kv=jnp.dtype(dtype_kv),
             dtype_out=jnp.dtype(dtype_q),
             kv_layout=layout,
+            f32_carries=envs.SGLANG_TPU_RPA_F32_CARRIES.get(),
         )
         vmem = pltpu.get_tpu_info().vmem_capacity_bytes
         decode, mixed = calculate_block_sizes(model, serve, vmem)
