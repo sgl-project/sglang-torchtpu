@@ -106,7 +106,10 @@ def test_eager_warmup_joins_before_releasing_destinations(monkeypatch, fail):
 
     stream = SimpleNamespace(synchronize=synchronize)
     monkeypatch.setattr(
-        torch, "tpu", SimpleNamespace(current_stream=lambda: stream), raising=False
+        torch.accelerator,
+        "current_stream",
+        lambda *args, **kwargs: stream,
+        raising=False,
     )
 
     def warmup():

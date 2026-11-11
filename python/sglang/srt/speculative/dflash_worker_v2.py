@@ -2783,10 +2783,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
         # produced on another stream.
-        if not _is_tpu:
-            batch.seq_lens.record_stream(
-                torch.accelerator.current_stream(self.device)
-            )
+        if not _is_tpu and torch.device(self.device).type != "cpu":
+            batch.seq_lens.record_stream(torch.accelerator.current_stream(self.device))
 
         bs = len(batch.seq_lens)
         device = self.device
