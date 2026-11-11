@@ -92,6 +92,16 @@ tpu_dsv41_torch_hash_ids
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TPU lowers 64-bit integer arithmetic.
 
+tpu_dsv41_engram_owned_rows
+  Why: EngramEmbedding._owned_rows dequantizes with scale.float() on the
+       float8_e8m0fnu scales; TPU lowering of that conversion fails in the
+       Engram lookup fusion ("Unsupported conversion from vmreg/vreg to U64").
+  How: AROUND _owned_rows for the device-table, non-CUDA path gathers the raw
+       bytes and builds the power of two as (byte << 23) bitcast to fp32, as
+       the vllm-torchtpu epic engram_hbm.dequant and #1743 do.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: TPU lowers float8_e8m0fnu to float32.
+
 trace_tpu_env_default
   Why: EnvField._resolve_default calls callable(self.default) for lazily
        computed defaults (e.g. SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)),
@@ -296,6 +306,21 @@ def tpu_dsv41_int32_input_ids(original, model, input_ids, *args, **kwargs):
     return original(model, input_ids, *args, **kwargs)
 
 
+def tpu_dsv41_engram_owned_rows(original, embedding, indices):
+    """_owned_rows with an integer e8m0 dequant; bytes 0 and 255 aside, exact."""
+    if indices.is_cuda or embedding.host_table is not None or embedding.rows == 0:
+        return original(embedding, indices)
+    local = indices - embedding.row_start
+    owned = (local >= 0) & (local < embedding.rows)
+    local = local.masked_fill(~owned, 0)
+    raw = embedding.weight.view(torch.uint8)[local].view(torch.float8_e4m3fn)
+    scale = embedding.scale.view(torch.uint8)[local].to(torch.int32)
+    power = (scale << 23).view(torch.float32)
+    rows = raw.float().unflatten(-1, (scale.shape[-1], -1))
+    values = (rows * power.unsqueeze(-1)).flatten(-2)
+    return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -349,6 +374,11 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.EngramHasher._torch_hash_ids",
             tpu_dsv41_torch_hash_ids,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.engram.EngramEmbedding._owned_rows",
+            tpu_dsv41_engram_owned_rows,
             HookType.AROUND,
         ),
     ]
