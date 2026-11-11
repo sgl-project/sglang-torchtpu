@@ -47,7 +47,6 @@ from sglang_tpu.models.deepseek_v41.kernels.csa2.pipeline import (
     csa2_pipeline,
 )
 from sglang_tpu.models.deepseek_v41.kernels.paged_swa import write_swa_pages
-from sglang_tpu.models.deepseek_v41.kernels.v4.o_projection import wo_a_projection
 
 SWA_PAGE_SIZE = 64
 SWA_WINDOW = 128
@@ -195,10 +194,6 @@ def _attend_main(
     return output
 
 
-def _wo_a(x: jax.Array, weight: jax.Array, scale: jax.Array) -> jax.Array:
-    return wo_a_projection(x, weight, scale, None)
-
-
 # =============================================================================
 # Fakes (shape functions for torch.compile / FakeTensorMode)
 # =============================================================================
@@ -230,10 +225,6 @@ def _fake_attend(q, *args):
     return torch.empty_like(q)
 
 
-def _fake_wo_a(x, weight, scale):
-    return x.new_empty((x.shape[0], weight.shape[1]))
-
-
 # name -> (JAX function, fake, donated argument positions)
 _DEFINITIONS = {
     "swa_metadata": (_swa_metadata, _fake_swa_metadata, ()),
@@ -241,7 +232,6 @@ _DEFINITIONS = {
     "publish_main": (_publish_main, _fake_publish_main, (0, 1)),
     "attend_swa": (_attend_swa, _fake_attend, ()),
     "attend_main": (_attend_main, _fake_attend, ()),
-    "wo_a": (_wo_a, _fake_wo_a, ()),
 }
 
 
@@ -381,31 +371,3 @@ def attention(
         int(compress_ratio),
         float(scale),
     )
-
-
-def wo_a(
-    o: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor | None = None
-) -> torch.Tensor:
-    """Grouped ``wo_a``: ``o`` [T, H, 512] (inverse-rotated) -> [T, G * R].
-
-    - BF16 ``weight`` [G * R, D] (the core checkpoint layout on TPU, where
-      ``wo_a`` is dequantized at load), D = H * 512 / G: plain torch,
-      ``einsum("tgd,grd->tgr")`` as the core model's BF16 path.
-    - FP8 ``weight`` [D, G * R] with FP32 per-column ``scale`` [G * R]: the
-      ``wo_a_projection`` kernel (activations quantized to FP8 per row).
-    """
-    tokens = o.shape[0]
-    if weight.dtype == torch.float8_e4m3fn:
-        if scale is None or weight.dim() != 2:
-            raise ValueError("FP8 wo_a needs a [D, G*R] weight and [G*R] scale")
-        return _op("wo_a")(
-            o.reshape(tokens, -1, HEAD_DIM), weight, scale.float().reshape(-1)
-        )
-    depth = weight.shape[1]
-    groups = o.shape[1] * HEAD_DIM // depth
-    out = torch.einsum(
-        "tgd,grd->tgr",
-        o.reshape(tokens, groups, depth),
-        weight.view(groups, -1, depth),
-    )
-    return out.reshape(tokens, -1)
