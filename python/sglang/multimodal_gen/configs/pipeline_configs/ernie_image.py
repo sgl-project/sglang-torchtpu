@@ -29,9 +29,13 @@ def ernie_image_postprocess_text(outputs, _text_inputs, hidden_layer_index=-2):
     the true per-request lengths instead of the tokenizer's padded length.
     """
     hidden_states = outputs.hidden_states[hidden_layer_index]
-    prompt_mask = _text_inputs.attention_mask.to(hidden_states.device).bool()
+    # Host row indices, not a device boolean mask.
+    prompt_mask = _text_inputs.attention_mask.bool().cpu()
     split_hidden_states = [
-        hidden_states[idx][prompt_mask[idx]] for idx in range(hidden_states.shape[0])
+        hidden_states[idx].index_select(
+            0, row.nonzero(as_tuple=True)[0].to(hidden_states.device)
+        )
+        for idx, row in enumerate(prompt_mask)
     ]
     return pad_text_embeddings_with_mask(split_hidden_states)
 
