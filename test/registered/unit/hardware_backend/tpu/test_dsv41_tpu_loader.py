@@ -47,3 +47,23 @@ def test_rejects_indivisible_ep():
         plan_expert_reads(
             _weight_map(), num_layers=2, num_experts=8, ep_size=3, ep_rank=0
         )
+
+
+def test_mapped_safetensors_matches_safetensors_reader(tmp_path):
+    """The Engram tables bypass RunAI through a hand-written header parser;
+    a wrong offset or dtype map would load shifted or reinterpreted rows."""
+    torch = pytest.importorskip("torch")
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    from sglang_tpu.models.deepseek_v41.loader import mapped_safetensors
+
+    tensors = {
+        "a": torch.arange(24, dtype=torch.float32).reshape(4, 6),
+        "layers.1.engram.embed.weight": torch.randn(8, 16).to(torch.float8_e4m3fn),
+        "layers.1.engram.embed.scale": torch.ones(8, 1).to(torch.float8_e8m0fnu),
+    }
+    path = tmp_path / "shard.safetensors"
+    safetensors_torch.save_file(tensors, str(path))
+    got = dict(mapped_safetensors(str(path), set(tensors)))
+    for name, ref in tensors.items():
+        assert got[name].dtype == ref.dtype and got[name].shape == ref.shape
+        assert torch.equal(got[name].view(torch.uint8), ref.view(torch.uint8))
