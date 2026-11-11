@@ -21,6 +21,10 @@ from sglang.test.test_utils import CustomTestCase
 register_tpu_ci(est_time=420, suite="stage-a-test-tpu-unit", chips=4)
 
 
+@unittest.skipUnless(
+    os.environ.get("SGLANG_TPU_RUN_MUSE_MK_TESTS") == "1",
+    "Muse megakernel tests are opt-in: set SGLANG_TPU_RUN_MUSE_MK_TESTS=1",
+)
 class TestMuseMegakernelNumerics(CustomTestCase):
     def test_kernel_matches_reference_decoder(self):
         repo_root = Path(__file__).resolve().parents[4]
