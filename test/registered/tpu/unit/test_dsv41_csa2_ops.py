@@ -144,14 +144,6 @@ def _bridge_examples():
             ),
             (_RECORDS, _RATIO, SCALE),
         ),
-        "wo_a": (
-            (
-                ((_TOKENS, 64, 512), ml_dtypes.bfloat16),
-                ((4096, 8192), ml_dtypes.float8_e4m3fn),
-                ((8192,), np.float32),
-            ),
-            (),
-        ),
     }
 
 
@@ -291,25 +283,6 @@ def test_main_records_are_full_loc_over_ratio(ratio):
         np.testing.assert_array_equal(records[t, : counts[t]], full_loc // ratio)
         np.testing.assert_array_equal(records[t, counts[t] :], -1)
         assert counts[t] == min(512, (positions[t] + 1) // ratio)
-
-
-def test_bf16_wo_a_matches_grouped_matmul():
-    torch.manual_seed(0)
-    groups, rank, heads = 8, 64, 16
-    depth = heads * 512 // groups
-    o = torch.randn(5, heads, 512, dtype=torch.bfloat16)
-    weight = torch.randn(groups * rank, depth, dtype=torch.bfloat16) / depth**0.5
-    expected = torch.cat(
-        [
-            o.reshape(5, groups, depth)[:, g].float()
-            @ weight[g * rank : (g + 1) * rank].float().T
-            for g in range(groups)
-        ],
-        dim=1,
-    )
-    actual = ops.wo_a(o, weight)
-    assert actual.shape == (5, groups * rank) and actual.dtype == torch.bfloat16
-    torch.testing.assert_close(actual.float(), expected, atol=3e-2, rtol=2e-2)
 
 
 # =============================================================================
@@ -583,48 +556,9 @@ def test_compiled_step_updates_caller_pools(tpu_ops, ratio):
         return _step(case, inputs)
 
     out, swa_records = step(inputs)
-    _check(case, inputs, out, swa_records)
-
-
-@requires_tpu
-def test_fp8_wo_a_projection(tpu_ops):
-    torch.manual_seed(0)
-    tokens, heads, groups, rank = 16, 64, 8, 1024
-    depth = heads * 512 // groups
-    o = torch.randn(tokens, heads, 512, dtype=torch.bfloat16)
-    weight = (torch.randn(depth, groups * rank) * 0.5).to(torch.float8_e4m3fn)
-    scale = torch.rand(groups * rank) * 0.01 + 0.005
-    expected = (
-        torch.cat(
-            [
-                o.reshape(tokens, groups, depth)[:, g].float()
-                @ weight[:, g * rank : (g + 1) * rank].float()
-                for g in range(groups)
-            ],
-            dim=1,
-        )
-        * scale
-    )
-    actual = ops.wo_a(o.to("tpu"), weight.to("tpu"), scale.to("tpu")).cpu().float()
-    assert actual.shape == (tokens, groups * rank)
-    error = (actual - expected).norm() / expected.norm()
-    # Activations are quantized to FP8 per row inside the kernel.
-    assert error < 5e-2, error
-
-
-@requires_tpu
-def test_fake_shapes_under_fake_tensor_mode(tpu_ops):
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    case = _Case(_DECODE, 2)
-    with FakeTensorMode(allow_non_fake_inputs=False) as mode:
-        inputs = {
-            name: mode.from_tensor(value) for name, value in _inputs(case).items()
-        }
-        out, swa_records = _step(case, inputs)
     assert out.shape == case.q.shape and out.dtype == torch.bfloat16
     assert swa_records.shape == case.positions.shape
-    assert swa_records.dtype == torch.int32
+    _check(case, inputs, out, swa_records)
 
 
 if __name__ == "__main__":

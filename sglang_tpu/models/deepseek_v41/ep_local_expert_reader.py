@@ -12,10 +12,8 @@ The read plan follows sgl-project/sglang-torchtpu#1744 (e0a43ce363).
 
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass
 from time import perf_counter
@@ -34,7 +32,6 @@ _ENGRAM_TABLE = re.compile(r"^layers\.(0|[1-9]\d*)\.engram\.embed\.(weight|scale
 ROW_START_ATTR = "_sglang_dsv41_row_start"
 
 _READ_CHUNK_BYTES = 64 * 1024 * 1024
-_READ_THREADS = int(os.environ.get("SGLANG_TPU_DSV41_ROW_READ_THREADS", "16"))
 
 _SAFETENSORS_DTYPES = {
     "F8_E4M3": torch.float8_e4m3fn,
@@ -111,16 +108,11 @@ def tp_row_range(num_rows: int, tp_rank: int, tp_size: int) -> tuple[int, int]:
 
 
 def _read_range(path: str, offset: int, out: torch.Tensor) -> None:
-    """Fill uint8 ``out`` from ``path[offset:]`` in 64 MB ranges.
+    """Fill uint8 ``out`` from ``path[offset:]`` in 64 MB ranges with RunAI's
+    FileStreamer (native workers, many ranges in flight); Python preads were
+    measured at ~3.6 MB/s per rank on the GCS FUSE mount."""
+    from runai_model_streamer.file_streamer import FileChunks, FileStreamer
 
-    RunAI's FileStreamer (native workers, many ranges in flight) when installed;
-    Python preads were measured at ~3.6 MB/s per rank on the GCS FUSE mount.
-    """
-    try:
-        from runai_model_streamer.file_streamer import FileChunks, FileStreamer
-    except ImportError:
-        _pread_range(path, offset, out)
-        return
     starts = list(range(0, out.numel(), _READ_CHUNK_BYTES))
     sizes = [min(_READ_CHUNK_BYTES, out.numel() - s) for s in starts]
     with FileStreamer() as streamer:
@@ -131,27 +123,6 @@ def _read_range(path: str, offset: int, out: torch.Tensor) -> None:
         for _, index, chunk in streamer.get_chunks():
             start = starts[index]
             out[start : start + sizes[index]].copy_(chunk.view(-1))
-
-
-def _pread_range(path: str, offset: int, out: torch.Tensor) -> None:
-    """Concurrent 64 MB preads (fallback without RunAI)."""
-    view = memoryview(out.numpy())
-    fd = os.open(path, os.O_RDONLY)
-    try:
-
-        def read(start: int) -> None:
-            end = min(start + _READ_CHUNK_BYTES, len(view))
-            pos = start
-            while pos < end:
-                n = os.preadv(fd, [view[pos:end]], offset + pos)
-                if n <= 0:
-                    raise IOError(f"{path} ended at byte {offset + pos}")
-                pos += n
-
-        with concurrent.futures.ThreadPoolExecutor(_READ_THREADS) as pool:
-            list(pool.map(read, range(0, len(view), _READ_CHUNK_BYTES)))
-    finally:
-        os.close(fd)
 
 
 def read_row_ranges(

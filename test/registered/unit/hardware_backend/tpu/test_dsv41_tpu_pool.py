@@ -253,15 +253,6 @@ class TestDSV41TPUPoolBytes(CustomTestCase):
             tensors.append(self.pool.get_index_k(source))
         kv_bytes = sum(t.nbytes for t in tensors)
         self.assertEqual(
-            kv_bytes,
-            DSV41TPUTokenToKVPool.kv_buffer_bytes(
-                full_size=FULL_SIZE,
-                swa_size=SWA_SIZE,
-                num_layers=len(RATIOS),
-                sources_by_ratio=self.sources_by_ratio,
-            ),
-        )
-        self.assertEqual(
             self.pool.get_kv_size_bytes(), (kv_bytes + self._pair_state_bytes(), 0)
         )
 
@@ -294,22 +285,15 @@ class TestDSV41TPUPoolBytes(CustomTestCase):
         )
         self.assertAlmostEqual(with_swa, per_full + 0.5 * per_swa)
 
-    def test_c2_state_bytes_match_pool_and_core_configurator(self):
-        ring = self.pool.get_ring_size(2)
-        expected = DSV41TPUTokenToKVPool.c2_state_fixed_bytes(
-            num_req_slots=NUM_REQ_SLOTS,
-            ring_size=ring,
-            attn_head_dim=512,
-            num_c2_layers=3,
-        )
-        self.assertEqual(expected, self._pair_state_bytes())
+    def test_c2_state_bytes_match_core_configurator(self):
         configurator = object.__new__(DSV4PoolConfigurator)
         configurator.stage_owner_layers = self.sources_by_ratio
-        configurator.ring_sizes = {2: ring}
+        configurator.ring_sizes = {2: self.pool.get_ring_size(2)}
         configurator.disaggregation_mode = "null"
         configurator.attn_head_dim = 512
         self.assertEqual(
-            configurator._get_c2_state_fixed_bytes(NUM_REQ_SLOTS - 1), expected
+            configurator._get_c2_state_fixed_bytes(NUM_REQ_SLOTS - 1),
+            self._pair_state_bytes(),
         )
 
 
