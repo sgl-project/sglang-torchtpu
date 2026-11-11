@@ -503,13 +503,53 @@ class IndexSelect:
         jax.lax.fori_loop(0, total, step_fn, zeros)
         return refs["local"][...]
 
+    def _packing(self):
+        """``(k, rows)``: a round sends its counts packed ``k`` candidates a
+        sublane (candidate ``j``, row ``b`` at lane ``(j % k) B + b`` of
+        sublane ``j // k``), ``rows`` sublanes in all (one at B8, the full
+        ``COUNT_ROWS`` from 128 rows)."""
+        k = max(1, LANES // self.batch)
+        return k, -(-COUNT_ROWS // k)
+
+    def _pack(self, local):
+        """``[COUNT_ROWS, LANES]`` counts (sublane: candidate, lane: row) ->
+        ``[rows, LANES]`` (``_packing``)."""
+        k, rows = self._packing()
+        if k == 1:
+            return local
+        lane = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
+        out = []
+        for s in range(rows):
+            row = jnp.zeros((1, LANES), jnp.int32)
+            for i in range(k):
+                j = s * k + i
+                if j < COUNT_ROWS:
+                    moved = pltpu_roll(local[j:j + 1], i * self.batch)
+                    row = jnp.where((lane >= i * self.batch) & (lane < (i + 1) * self.batch), moved, row)
+            out.append(row)
+        return jnp.concatenate(out, axis=0) if rows > 1 else out[0]
+
+    def _unpack(self, packed):
+        """The inverse of ``_pack`` (lanes ``>= B`` zero)."""
+        k, rows = self._packing()
+        if k == 1:
+            return packed
+        lane = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
+        out = []
+        for j in range(COUNT_ROWS):
+            s, i = divmod(j, k)
+            moved = pltpu_roll(packed[s:s + 1], (LANES - i * self.batch) % LANES)
+            out.append(jnp.where(lane < self.batch, moved, 0))
+        return jnp.concatenate(out, axis=0)
+
     def _sent(self, parity):
         """Wait for this rank's copies out of exchange slot ``parity`` (sent
         two rounds earlier: a round waits only for what it receives)."""
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
 
-        others = self.refs["exchange"].at[parity, pl.ds(0, self.group - 1)]
+        _, rows = self._packing()
+        others = self.refs["exchange"].at[parity, pl.ds(0, self.group - 1), pl.ds(0, rows)]
         pltpu.make_async_copy(others, others, self.refs["exchange_sems"].at[0, parity]).wait()
 
     def _all_reduce(self, local, parity, pending=False):
@@ -519,20 +559,22 @@ class IndexSelect:
         from jax.experimental.pallas import tpu as pltpu
 
         refs, group, member = self.refs, self.group, self.member
+        _, rows = self._packing()
         if pending:
             self._sent(parity)
-        refs["exchange"][parity, member] = local
+        mine = refs["exchange"].at[parity, member, pl.ds(0, rows)]
+        mine[...] = self._pack(local)
         for peer in range(group):
             @pl.when(peer != member)
             def send(peer=peer):
                 pltpu.make_async_remote_copy(
-                    refs["exchange"].at[parity, member], refs["exchange"].at[parity, member],
-                    refs["exchange_sems"].at[0, parity], refs["exchange_sems"].at[1, parity],
+                    mine, mine, refs["exchange_sems"].at[0, parity], refs["exchange_sems"].at[1, parity],
                     device_id=(self.base + peer,), device_id_type=pl.DeviceIdType.MESH,
                 ).start()
-        others = refs["exchange"].at[parity, pl.ds(0, group - 1)]
+        others = refs["exchange"].at[parity, pl.ds(0, group - 1), pl.ds(0, rows)]
         pltpu.make_async_copy(others, others, refs["exchange_sems"].at[1, parity]).wait()
-        return jnp.sum(refs["exchange"][parity], axis=0)  # [COUNT_ROWS, LANES]
+        total = jnp.sum(refs["exchange"][parity, :, pl.ds(0, rows)], axis=0)  # [rows, LANES]
+        return self._unpack(total)  # [COUNT_ROWS, LANES]
 
     def _row_scalars(self, state_row, name):
         """Lanes ``0 .. B - 1`` of state row ``state_row`` into SMEM
@@ -668,6 +710,15 @@ def _step_activity(self, span_rows: int, active_ref, steps: int):
 
 
 IndexSelect.step_activity = _step_activity
+
+
+def pltpu_roll(x, shift):
+    """``x`` rotated right by ``shift`` lanes (``jnp.roll`` semantics on the last axis)."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    if shift % x.shape[-1] == 0:
+        return x
+    return pltpu.roll(x, shift, x.ndim - 1)
 
 
 def pl_when(condition):
