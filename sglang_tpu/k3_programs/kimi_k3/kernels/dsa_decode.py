@@ -262,16 +262,18 @@ class DecodeIndexer:
             out = p if out is None else out + p
         return out
 
-    def _key_part_and_gate(self, x, block):
-        """This member's key dims ``x @ wk[:, dims]`` (f32 ``[B, block]``) and
-        every head gate transposed, ``(x @ weights_proj)^T`` (f32 ``[32, B]``),
+    def _key_part(self, x, block):
+        """This member's key dims ``x @ wk[:, dims]`` (f32 ``[B, block]``),
         streamed after wq_b."""
         q_lora, width = self.weights["d_wqb"].shape
-        first = q_lora // CHUNK * (width // DIM)
-        part = self._blocked_product(x, first, block)
-        gate_t = self._blocked_product(x, first + self.weights["d_wks"].shape[0] // CHUNK, HEADS,
-                                       transposed=True)
-        return part, gate_t
+        return self._blocked_product(x, q_lora // CHUNK * (width // DIM), block)
+
+    def _gate(self, x):
+        """Every head gate transposed, ``(x @ weights_proj)^T`` (f32 ``[32,
+        B]``), streamed after d_wks (while the gather is in flight)."""
+        q_lora, width = self.weights["d_wqb"].shape
+        first = q_lora // CHUNK * (width // DIM) + self.weights["d_wks"].shape[0] // CHUNK
+        return self._blocked_product(x, first, HEADS, transposed=True)
 
     def selection(self, cache, position_ref, hidden, query_latent, parity) -> mla_dcp.DcpSelection:
         """``hidden`` [B, hidden] and ``query_latent`` [B, 1536] (normalized,
@@ -293,8 +295,7 @@ class DecodeIndexer:
         self._knorm().wait()
         x = hidden.astype(jnp.bfloat16)
         dims, block = DIM // group, key_block(group)
-        part, gate_t = self._key_part_and_gate(x, block)
-        part = part.astype(jnp.bfloat16)  # [B, block] BF16 linear outputs
+        part = self._key_part(x, block).astype(jnp.bfloat16)  # [B, block] BF16 linear outputs
         k = jax.lax.broadcasted_iota(jnp.int32, (block, LANES), 0)
         lane_of = jax.lax.broadcasted_iota(jnp.int32, (block, LANES), 1)
         place = ((k < dims) & (lane_of == member * dims + k)).astype(jnp.bfloat16)
@@ -308,7 +309,9 @@ class DecodeIndexer:
                     device_id=(base + peer,), device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
-        # 2. The rows' new keys (records): the slabs' sum; the head gates.
+        # 2. The head gates while the gather is in flight; the rows' new keys
+        # (records): the slabs' sum.
+        gate_t = self._gate(x)
         others = gather.at[pl.ds(0, group - 1)]
         pltpu.make_async_copy(others, others, gather_sems.at[0]).wait()
         pltpu.make_async_copy(others, others, gather_sems.at[1]).wait()
