@@ -490,11 +490,24 @@ class IndexSelect:
         jax.lax.fori_loop(0, total, step_fn, zeros)
         return refs["local"][...]
 
-    def _all_reduce(self, local, parity):
+    def _sent(self, parity):
+        """Wait for this rank's copies out of exchange slot ``parity`` (sent
+        two rounds earlier: a round waits only for what it receives)."""
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        others = self.refs["exchange"].at[parity, pl.ds(0, self.group - 1)]
+        pltpu.make_async_copy(others, others, self.refs["exchange_sems"].at[0, parity]).wait()
+
+    def _all_reduce(self, local, parity, pending=False):
+        """The counts summed over the group (``pending``: this slot's sends of
+        two rounds earlier are still out; wait for them before rewriting it)."""
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
 
         refs, group, member = self.refs, self.group, self.member
+        if pending:
+            self._sent(parity)
         refs["exchange"][parity, member] = local
         for peer in range(group):
             @pl.when(peer != member)
@@ -505,7 +518,6 @@ class IndexSelect:
                     device_id=(self.base + peer,), device_id_type=pl.DeviceIdType.MESH,
                 ).start()
         others = refs["exchange"].at[parity, pl.ds(0, group - 1)]
-        pltpu.make_async_copy(others, others, refs["exchange_sems"].at[0, parity]).wait()
         pltpu.make_async_copy(others, others, refs["exchange_sems"].at[1, parity]).wait()
         return jnp.sum(refs["exchange"][parity], axis=0)  # [COUNT_ROWS, LANES]
 
@@ -528,7 +540,7 @@ class IndexSelect:
                 prefix = refs["row_prefix"][row]
                 return lambda key, position, j: key >= ((prefix + _i32((j + 1) << shift)) ^ INT_MIN)
 
-            total = self._all_reduce(self._count(key_test, first=round_ == 0), parity)
+            total = self._all_reduce(self._count(key_test, first=round_ == 0), parity, pending=round_ >= 2)
             parity ^= 1
             ge = ((total >= topk) & (cand < CANDIDATES)).astype(jnp.int32)
             digit = jnp.sum(ge, axis=0, keepdims=True)  # [1, LANES]
@@ -544,7 +556,14 @@ class IndexSelect:
         tie = active & (state[_LOWER:_LOWER + 1] > topk)  # more tied keys than the rest of the top-k
         state[_POSITION:_POSITION + 1] = jnp.zeros((1, LANES), jnp.int32)
 
-        @pl_when(jnp.sum(tie.astype(jnp.int32)) > 0)
+        any_tie = jnp.sum(tie.astype(jnp.int32)) > 0
+
+        @pl_when(jnp.logical_not(any_tie))
+        def drain():  # the last two key rounds' sends
+            self._sent(0)
+            self._sent(1)
+
+        @pl_when(any_tie)
         def ties():
             nonlocal_parity = parity
             self._row_scalars(_PREFIX, "row_prefix")
@@ -556,12 +575,14 @@ class IndexSelect:
                     prefix = refs["row_position"][row]
                     return lambda key, position, j: (key == tau) & (position < prefix + ((j + 1) << shift))
 
-                total = self._all_reduce(self._count(position_test), nonlocal_parity)
+                total = self._all_reduce(self._count(position_test), nonlocal_parity, pending=True)
                 nonlocal_parity ^= 1
                 need = topk - refs["state"][_UPPER:_UPPER + 1]
                 below = ((total < need) & (cand < CANDIDATES)).astype(jnp.int32)
                 digit = jnp.sum(below, axis=0, keepdims=True)
                 refs["state"][_POSITION:_POSITION + 1] = refs["state"][_POSITION:_POSITION + 1] + (digit << shift)
+            self._sent(0)  # the last two tie rounds' sends
+            self._sent(1)
 
         state = refs["state"]
         tau = jnp.where(active, state[_PREFIX:_PREFIX + 1] ^ INT_MIN, INT_MIN)
