@@ -98,7 +98,11 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReq,
     RoomFailed,
 )
-from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang_tpu.disaggregation.raiden.state import (
+    DecodeState,
+    PrefillState,
+    ReshardStaging,
+)
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
 from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
@@ -497,6 +501,116 @@ class RaidenKVManager(
             f"{prefill_attn_tp}: each decode rank needs {decode_heads} heads per "
             f"page, got {prefill_heads}."
         )
+
+    # ----- reshard staging --------------------------------------------------
+    # Staged writers land in extra decode pages from the token allocator; the
+    # decode merges them in before the request runs. Allocation
+    # (send_metadata) and release (clear) happen at scheduler points every
+    # attention-TP rank reaches in the same order, keeping allocators identical.
+
+    def attach_token_allocator(self, allocator: Any) -> None:
+        """Hand the decode's token-to-KV allocator to the manager, for reshard
+        staging pages. Installed by sglang_tpu.patches on DecodePreallocQueue."""
+        self._token_allocator = allocator
+
+    @property
+    def _staging_allocator(self) -> Any:
+        return getattr(self, "_token_allocator", None)
+
+    def _alloc_reshard_staging(self, n_pages: int, n_swa_pages: int):
+        """Allocate ``n_pages`` full (and ``n_swa_pages`` SWA) staging pages."""
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+        def page_ids(token_indices) -> List[int]:
+            # Whole-page allocations: every page_size-th token names one page.
+            return [int(p) for p in (token_indices[::page_size] // page_size).tolist()]
+
+        def no_pages(n: int, what: str) -> RuntimeError:
+            pool = f"{what} " if what else ""
+            return RuntimeError(
+                f"Raiden reshard needs {n} free {pool}KV pages to stage writers "
+                "that share a decode pack, and the decode has fewer"
+            )
+
+        allocator = self._staging_allocator
+        page_size = int(self.kv_args.page_size)
+        if (
+            isinstance(allocator, SWATokenToKVPoolAllocator)
+            and type(allocator).alloc is SWATokenToKVPoolAllocator.alloc
+        ):
+            # The hybrid SWA allocator only allocates whole requests; staging needs
+            # plain pages from each pool, with no full->SWA mapping since the
+            # decode addresses both.
+            full_alloc = allocator.full_attn_allocator
+            swa_alloc = allocator.swa_attn_allocator
+            full = full_alloc.alloc(n_pages * page_size)
+            if full is None:
+                raise no_pages(n_pages, "full-attention")
+            frees = [(full_alloc, full)]
+            swa_pages: List[int] = []
+            if n_swa_pages:
+                swa = swa_alloc.alloc(n_swa_pages * page_size)
+                if swa is None:
+                    full_alloc.free(full)
+                    raise no_pages(n_swa_pages, "sliding-window")
+                frees.append((swa_alloc, swa))
+                swa_pages = page_ids(swa)
+            return ReshardStaging(
+                pages=page_ids(full), swa_pages=swa_pages, frees=frees
+            )
+        indices = allocator.alloc(n_pages * page_size)
+        if indices is None:
+            raise no_pages(n_pages, "")
+        full = indices
+        if hasattr(allocator, "translate_kv_indices_for_transfer"):
+            full = allocator.translate_kv_indices_for_transfer(indices)
+        swa_pages = []
+        if n_swa_pages:
+            if not hasattr(allocator, "translate_swa_indices_for_transfer"):
+                allocator.free(indices)
+                raise RuntimeError(
+                    "Raiden reshard needs sliding-window staging pages, but the decode allocator has no sliding-window pool"
+                )
+            swa_pages = page_ids(allocator.translate_swa_indices_for_transfer(indices))
+            swa_pages = swa_pages[-n_swa_pages:]
+        return ReshardStaging(
+            pages=page_ids(full), swa_pages=swa_pages, frees=[(allocator, indices)]
+        )
+
+    def _free_reshard_staging(self, room: int) -> None:
+        with self._state_lock:
+            staging = (
+                self._decode.reshard_staging.pop(room, None)
+                if self._decode is not None
+                else None
+            )
+        if isinstance(staging, ReshardStaging):
+            for allocator, indices in staging.frees:
+                allocator.free(indices)
+
+    def merge_reshard_staging(self, room: int) -> None:
+        """Merge staged K/V slots into destination pages before notifying receiver completion."""
+        from sglang_tpu.disaggregation.raiden.reshard_merge import (
+            merge_staged_pages,
+        )
+
+        with self._state_lock:
+            staging = self._decode.reshard_staging.get(room)
+            meta = self._decode.reshard_meta.get(room)
+            if staging is None:
+                return
+            if meta is None:
+                raise RuntimeError(f"Raiden reshard room {room} lost its metadata")
+            pools = [(False, self._kv_caches, meta["local_blocks"], staging.pages)]
+            swa_blocks = meta.get("local_swa_blocks")
+            if self._swa_kv_caches and swa_blocks:
+                pools.append((True, self._swa_kv_caches, swa_blocks, staging.swa_pages))
+            src_attn_tp = meta["src_attn_tp"]
+        for swa, bufs, real_pages, staging_pages in pools:
+            geometry = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=swa)
+            # The receive plans were built for decode_rank=self.attn_tp_rank.
+            merges = geometry.merge_spec(self.attn_tp_rank)
+            merge_staged_pages(bufs, list(real_pages), staging_pages, merges)
 
     # ----- engine lifecycle -------------------------------------------------
 
@@ -1482,6 +1596,9 @@ class RaidenKVManager(
         if self._pipeline is not None:
             self._pipeline.clear(room)
         self._drop_room_state(room, clear_failure_record=True)
+        # The framework releases the room's own pages at this same point, so
+        # its staging pages go back to the allocator with them.
+        self._free_reshard_staging(room)
 
     def _drop_room_state(
         self, room: int, *, clear_failure_record: bool = False

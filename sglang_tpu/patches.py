@@ -9,6 +9,7 @@ All patches are idempotent.
 
 from __future__ import annotations
 
+import functools
 import importlib
 import os
 from collections.abc import Sequence
@@ -1036,6 +1037,25 @@ def _patch_scheduler_reject_unservable_requests() -> None:
     Scheduler._add_request_to_queue = _add_request_to_queue
 
 
+def _patch_raiden_reshard_staging_allocator() -> None:
+    """Attach the decode token allocator to RaidenKVManager for staging page allocations."""
+    from sglang.srt.disaggregation.decode import DecodePreallocQueue
+
+    original = DecodePreallocQueue._init_kv_manager
+    if getattr(original, "_tpu_reshard_staging_allocator", False):
+        return
+
+    @functools.wraps(original)
+    def _init_kv_manager(self):
+        kv_manager = original(self)
+        if hasattr(kv_manager, "attach_token_allocator"):
+            kv_manager.attach_token_allocator(self.token_to_kv_pool_allocator)
+        return kv_manager
+
+    _init_kv_manager._tpu_reshard_staging_allocator = True
+    DecodePreallocQueue._init_kv_manager = _init_kv_manager
+
+
 def apply_tpu_patches() -> None:
     """Install process-local TorchTPU runtime patches.
 
@@ -1056,7 +1076,11 @@ def apply_tpu_patches() -> None:
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
+
     _install_hybrid_linear_hicache()
+
+    _patch_raiden_reshard_staging_allocator()
+
     _patch_hicache_write_back_copy_ahead()
     _patch_hicache_async_ready_counts()
     _patch_pd_decode_async_prefill_info()
