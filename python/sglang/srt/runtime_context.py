@@ -35,6 +35,7 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import msgspec
+from torch.compiler import assume_constant_result
 
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
@@ -1795,6 +1796,16 @@ _PLATFORM_VALUES: Dict[str, str] = {
 }
 
 
+@assume_constant_result
+def _native_platform_fact(probe: str) -> Any:
+    # Only machine facts are constant, never the scoped overrides below.
+    # Some probes wrap functools.partial in lru_cache, which Dynamo cannot
+    # inline; evaluate their existing cached result at specialization time.
+    from sglang.srt.utils import common as _common
+
+    return getattr(_common, probe)()
+
+
 class PlatformContext:
     """The machine's own facts, with one place to override them.
 
@@ -1815,12 +1826,11 @@ class PlatformContext:
             raise AttributeError(
                 f"unknown platform fact {name!r}; known: {', '.join(known)}"
             )
-        overrides = object.__getattribute__(self, "_overrides")
+        # Read the real slot normally so Dynamo can trace platform decisions.
+        overrides = self._overrides
         if name in overrides:
             return overrides[name]
-        from sglang.srt.utils import common as _common
-
-        return getattr(_common, probe)()
+        return _native_platform_fact(probe)
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError(
