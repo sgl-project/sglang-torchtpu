@@ -4,9 +4,8 @@
 ``MuseMegakernel.from_model`` runs once after weight loading, before the KV pool is sized. It
 builds the stacked K-major copies the kernels stream (attention, pooler and unpooler in fp8,
 the router in bf16) and collects the per-layer expert references sglang already owns. ``forward``
-replaces the decoder for decode and DFlash target-verify batches and, with
-SGLANG_TPU_MUSE_MK_PREFILL, for extend batches (the prefill program, prefill.py); other batches
-keep the native path. The LM head, logits and sampling stay in sglang.
+replaces the decoder for decode and DFlash target-verify batches; other batches keep the native
+path. The LM head, logits and sampling stay in sglang.
 
 A decode / verify step runs as one jitted program per device: the megakernel (collective, reads
 the KV pools) and then ``kv_write_call`` (local, scatters this step's K/V rows into the pools in
@@ -214,8 +213,8 @@ def _stack_expert_groups(
     parameters immediately, viewed as ``float4_e2m1fn_x2`` on CPU before upload, and
     synchronized as pure leaf PJRT buffers. Avoids TorchTPU 0.2 lazy ``torch.stack``
     concatenation cascades and ``as_strided`` re-materialization of bound fp4 views;
-    both ``muse_prefill`` and native ``FusedMoE`` receive whole stacks and index their
-    layer inside Pallas via ``group_offset[1]``.
+    native FusedMoE receives whole stacks and indexes its layer inside Pallas via
+    group_offset[1].
     """
     if not groups and not kperm:
         return experts
@@ -294,8 +293,8 @@ def _stack_expert_groups(
 
 
 class MuseMegakernel(torch.nn.Module):
-    """Holds the kernels' weights and one compiled op per step shape (decode / verify:
-    rows, rows per request, capture; prefill: rows, capture)."""
+    """Holds the kernels' weights and one compiled op per step shape (rows, rows per
+    request, capture)."""
 
     def __init__(
         self,
@@ -315,7 +314,7 @@ class MuseMegakernel(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.geo = geo
-        # ep: whole experts per rank in the experts list (ep_mk); prefill shares the layout
+        # ep: whole experts per rank in the experts list (ep_mk)
         self.moe_mode: MoeMode = moe_mode
         self.kinds = kinds
         self.tp_size = tp_size
@@ -332,12 +331,6 @@ class MuseMegakernel(torch.nn.Module):
             )
             > 1
         )
-        self.prefill = tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL.get()
-        if self.prefill and scale_fp8:
-            raise NotImplementedError(
-                "the Muse prefill program reads bf16 NVFP4 block scales "
-                "(unset SGLANG_TPU_NVFP4_E4M3_SCALES)"
-            )
         # Buffers so --tpu-compile-tracer direct lifts them as graph inputs; the expert
         # entries alias FusedMoE parameters.
         for name in K.WEIGHT_NAMES:
@@ -360,13 +353,13 @@ class MuseMegakernel(torch.nn.Module):
         parallel = get_parallel()
         moe_mode = resolve_moe_mode(parallel.moe_ep_size)
         if moe_mode == "ep":
-            # the EP layout (ep_mk megakernel, EP prefill MoE) has no serving weight load
+            # the EP layout (ep_mk megakernel) has no serving weight load
             raise NotImplementedError(
                 "SGLANG_TPU_MUSE_MOE_MODE=ep: the Muse EP megakernel is not wired for "
                 "serving: it needs replicated pre/post_expert_proj (ColumnParallel under "
                 "EP), experts in ep_mk's layout "
                 "(kperm rows, chunk_cols-interleaved gate/up, which the native fused-RS MoE "
-                "and the prefill program also read) and, with SGLANG_TPU_EP_QBLOCK, "
+                "also reads) and, with SGLANG_TPU_EP_QBLOCK, "
                 "block-requantized scales shared with them"
             )
         if not (
@@ -397,7 +390,7 @@ class MuseMegakernel(torch.nn.Module):
             for layer in decoder.layers
         )
         if tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get():
-            # prefill and the native MoE share these expert weights at block 16
+            # the native MoE shares these expert weights at block 16
             raise NotImplementedError(
                 "SGLANG_TPU_MUSE_MK_QBLOCK: serving weight load does not requantize the "
                 "experts yet (anvil / numerics only)"
@@ -539,8 +532,6 @@ class MuseMegakernel(torch.nn.Module):
         torch.accelerator.synchronize()
         _INSTANCE[:] = [mk]
         _register_op()
-        if mk.prefill:
-            _register_prefill_op()
         return mk
 
     def share_dense_weights(self, decoder) -> int:
@@ -993,58 +984,12 @@ class MuseMegakernel(torch.nn.Module):
             self._ops[(cfg, arm)] = _build_callable(cfg, self.tp_size, arm)
         return self._ops[(cfg, arm)]
 
-    def prefill_config(self, *, rows: int, capture: tuple):
-        from sglang_tpu.muse_megakernel import prefill as PF
-
-        g = self.geo
-        return PF.PFConfig(
-            hidden=g.hidden,
-            head_dim=g.head_dim,
-            q_heads=g.q_heads,
-            kv_heads=g.kv_heads,
-            n_layers=g.n_layers,
-            n_experts=g.n_experts,
-            top_k=g.top_k,
-            expert_hidden=g.expert_hidden,
-            tp=self.tp_size,
-            rms_eps=g.rms_eps,
-            post_eps=g.post_eps,
-            scale_query_by=g.scale_query_by,
-            attn_scale=g.attn_scale,
-            router_mult=g.router_mult,
-            route_scale=g.route_scale,
-            router_eps=g.router_eps,
-            window=g.window,
-            global_layers=g.global_layers,
-            capture_layers=capture,
-            rows=rows,
-            # Tuning only: the fused kernels' row tiles (larger ones overflow VMEM).
-            attn_out_tile=int(os.environ.get("MUSE_PF_ATTN_OUT_TILE", "64")),
-            post_moe_tile=int(os.environ.get("MUSE_PF_POST_MOE_TILE", "128")),
-            fp8_gather=tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER.get(),
-            expert_groups=self.expert_groups,
-            moe_mode=self.moe_mode,
-        )
-
-    def prefill_callable_for(self, cfg):
-        if cfg not in self._ops:
-            self._ops[cfg] = _build_prefill_callable(cfg, self.tp_size)
-        return self._ops[cfg]
-
     # ------------------------------------------------------------------ forward
     def handles(self, forward_batch, num_tokens: int) -> bool:
         mode = forward_batch.forward_mode
         if mode.is_decode() or mode.is_target_verify():
             return step_rows(num_tokens, self.tp_size, self.moe_mode) <= self.max_rows
-        if not (self.prefill and mode.is_extend()):
-            return False
-        # token buckets (tpu_compile_tokens) must tile the prefill kernels
-        if num_tokens % _PREFILL_ROW_ALIGN:
-            raise ValueError(
-                f"{num_tokens}-token extend step: the Muse prefill program needs "
-                f"multiples of {_PREFILL_ROW_ALIGN} (tpu_compile_tokens)"
-            )
-        return True
+        return False
 
     def forward(
         self,
@@ -1064,7 +1009,9 @@ class MuseMegakernel(torch.nn.Module):
         md = backend.forward_metadata
         mode = forward_batch.forward_mode
         if not (mode.is_decode() or mode.is_target_verify()):
-            return self._forward_prefill(embeds, positions, backend, capture)
+            raise ValueError(
+                f"the Muse megakernel runs decode / verify steps, got {mode}"
+            )
         page_indices = md.page_indices
         swa_page_indices = (
             md.swa_page_indices if md.swa_page_indices is not None else page_indices
@@ -1102,55 +1049,11 @@ class MuseMegakernel(torch.nn.Module):
         )
         return hidden[:T], (aux[:T] if capture else None)
 
-    def _forward_prefill(
-        self, embeds: torch.Tensor, positions: torch.Tensor, backend, capture: tuple
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        md = backend.forward_metadata
-        pool = backend.token_to_kv_pool
-        pools = (
-            (pool.full_kv_pool, pool.swa_kv_pool)
-            if isinstance(pool, SWAKVPool)
-            else (pool,)
-        )
-        for p in pools:
-            if (
-                type(p) is not TpuSeqAlongLaneKVPool
-                or p.store_dtype != torch.float8_e4m3fn
-            ):
-                raise NotImplementedError(
-                    f"the Muse prefill program reads fp8 SEQ_ALONG_LANE pools, got "
-                    f"{type(p).__name__} ({p.store_dtype})"
-                )
-        page_indices = md.page_indices
-        swa_page_indices = (
-            md.swa_page_indices if md.swa_page_indices is not None else page_indices
-        )
-        meta = torch.cat([md.active_num_tokens.reshape(1).to(torch.int32), self.rank_t])
-        kv = [pool.get_fused_kv_buffer(i) for i in range(self.geo.n_layers)]
-        weights = [getattr(self, f"w_{n}") for n in K.WEIGHT_NAMES]
-        experts = [getattr(self, f"expert_{i}") for i in range(self.n_expert_refs)]
-        hidden, aux = torch.ops.sglang_tpu_pallas.muse_prefill(
-            meta,
-            positions.to(torch.int32),
-            md.kv_lens.to(torch.int32),
-            md.cu_q_lens.to(torch.int32),
-            md.distribution.to(torch.int32),
-            page_indices,
-            swa_page_indices,
-            embeds.to(torch.bfloat16),
-            weights,
-            experts,
-            kv,
-            list(capture),
-        )
-        return hidden, (aux if capture else None)
-
 
 # The op implementation runs outside the traced region and needs the prepared weights'
 # geometry; one model per process.
 _INSTANCE: list = []
 _REGISTERED: list = []
-_REGISTERED_PREFILL: list = []
 
 
 def _register_op() -> None:
@@ -1203,51 +1106,6 @@ def _register_op() -> None:
     _REGISTERED.append(True)
 
 
-def _register_prefill_op() -> None:
-    """The extend-step op: the row count and capture select (and cache) the program."""
-    if _REGISTERED_PREFILL:
-        return
-
-    @torch.library.custom_op(
-        f"{_OP_NS}::muse_prefill", mutates_args=("kv",), device_types=["tpu"]
-    )
-    def op(
-        meta: torch.Tensor,
-        pos: torch.Tensor,
-        kv_lens: torch.Tensor,
-        cu_q: torch.Tensor,
-        dist: torch.Tensor,
-        pf: torch.Tensor,
-        psw: torch.Tensor,
-        emb: torch.Tensor,
-        weights: list[torch.Tensor],
-        experts: list[torch.Tensor],
-        kv: list[torch.Tensor],
-        capture: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
-
-        mk = _INSTANCE[0]
-        cfg = mk.prefill_config(rows=emb.shape[0], capture=tuple(capture))
-        callable_ = mk.prefill_callable_for(cfg)
-        with tpu_info_for_cpu_export():
-            outs = callable_(
-                meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights, *experts, *kv
-            )
-        return outs[0], outs[1]
-
-    @op.register_fake
-    def _(meta, pos, kv_lens, cu_q, dist, pf, psw, emb, weights, experts, kv, capture):
-        aux_w = len(capture) * emb.shape[1] if capture else K.LANE
-        return emb.new_empty((emb.shape[0], emb.shape[1])), emb.new_empty(
-            (emb.shape[0], aux_w)
-        )
-
-    _REGISTERED_PREFILL.append(True)
-
-
-# prefill.post_moe_call tiles 128 rows as 16 rows of each of the 8 ranks' blocks
-_PREFILL_ROW_ALIGN = 128
 # Mosaic's temporaries come on top of the declared scratch and grow with rows per request
 # (verify attention): 24 rows of 6 compile at 46.8 MiB declared, 32 rows of 8 overflowed the
 # 60 MiB limit at 48.7 MiB (~11.5 MiB of temporaries).
@@ -1434,28 +1292,5 @@ def _build_callable(cfg: K.MKConfig, tp: int, ep: str | None = None):
         cfg.row_tile,
         cfg.ring_slots,
         cfg.fold_f or cfg.fold_o,
-    )
-    return callable_
-
-
-def _build_prefill_callable(cfg, tp: int):
-    """The prefill program (prefill.build_forward) over the TP mesh; it updates the pools."""
-    from sglang_tpu.muse_megakernel import prefill as PF
-
-    L = cfg.n_layers
-    n_args = 8 + len(K.WEIGHT_NAMES) + K.n_expert_refs(cfg) + L
-    callable_ = _export_program(
-        PF.build_forward(cfg),
-        tp=tp,
-        n_args=n_args,
-        kv0=n_args - L,
-        n_out=2 + L,
-        tag=f"muse_prefill_r{cfg.rows}_c{len(cfg.capture_layers)}",
-    )
-    logger.info(
-        "Muse prefill program built: rows=%d capture=%s fp8_gather=%s",
-        cfg.rows,
-        cfg.capture_layers,
-        cfg.fp8_gather,
     )
     return callable_
