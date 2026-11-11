@@ -294,7 +294,8 @@ class TestKVFreeFence(CustomTestCase):
     def test_install_allows_only_spec_algorithms_whose_result_copy_follows_kv(self):
         """copy_done covers a KV write only if a copied tensor is computed after
         it; EAGLE's draft extend writes KV after every result tensor but topk,
-        and DFLASH, DSPARK and NGRAM write KV after all of them."""
+        DFLASH's draft KV append after all but draft_kv_write_tail, and DSPARK
+        and NGRAM after all of them."""
         allowed = [
             (SpeculativeAlgorithm.NONE, False),
             (SpeculativeAlgorithm.FROZEN_KV_MTP, False),
@@ -302,10 +303,11 @@ class TestKVFreeFence(CustomTestCase):
             (SpeculativeAlgorithm.EAGLE, True),
             (SpeculativeAlgorithm.EAGLE3, True),
             (SpeculativeAlgorithm.STANDALONE, True),
+            (SpeculativeAlgorithm.DFLASH, True),
         ]
         rejected = [
             (SpeculativeAlgorithm.EAGLE, False),
-            (SpeculativeAlgorithm.DFLASH, True),
+            (SpeculativeAlgorithm.DFLASH, False),
             (SpeculativeAlgorithm.DSPARK, True),
             (SpeculativeAlgorithm.NGRAM, True),
             (CustomSpecAlgo("PLUGIN", factory=lambda server_args: None), True),
