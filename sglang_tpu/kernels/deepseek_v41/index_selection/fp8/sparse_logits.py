@@ -66,8 +66,8 @@ def _kernel(
 ):
     q, weights, pool = inputs
     queries, keys, scores, counts, read_sem, write_sem, q_sem = scratch
-    # JAX 0.10.2 has no pltpu.annotate(no_store=...). Keep the same refs:
-    # weights are read-only and keys are explicitly managed by the DMA ring.
+    keys = pltpu.annotate(keys, no_store=True)
+    weights = pltpu.annotate(weights, no_store=True)
     tokens, heads, dim = weights.shape[0], weights.shape[1], q.shape[-1]
     q_tile, mxu, sublanes = config.query_tile, info.mxu_column_size, info.num_sublanes
     pairs = PACKED_FP8_PREPARED_PAIRS

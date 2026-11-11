@@ -113,7 +113,7 @@ def streamindex_topk_ref(
             q_abs_pos = (S_total - T_seq) + t_idx
 
             for s_idx in range(S_valid):
-                if s_idx * comp_ratio > q_abs_pos:
+                if (s_idx + 1) * comp_ratio > q_abs_pos + 1:
                     continue
 
                 score = 0.0
@@ -516,26 +516,19 @@ def test_streamindex_topk_quantized():
                 lane_idx = s % 4
                 cache_kv[p, w_idx, lane_idx] = record
 
-    # Compute expected top-k using exact dequantized keys
-    seq_kv = np.concatenate([dequantized_kv[p] for p in range(num_pages)], axis=0)
-
-    naive_scores = np.full((T_seq, max(S_valid, k)), -np.inf, dtype=np.float32)
-
-    for t_idx in range(T_seq):
-        for s_idx in range(S_valid):
-            score = 0.0
-            for h in range(H_I):
-                h_kv = h // (H_I // H_KV)
-                inner = np.dot(q[t_idx, h], seq_kv[s_idx, h_kv])
-                score += max(0.0, inner) * weights[t_idx, h]
-            naive_scores[t_idx, s_idx] = score
-
-    expected_topk = np.argsort(-naive_scores, axis=-1)[:, :k]
-    for t_idx in range(T_seq):
-        for i in range(k):
-            idx = expected_topk[t_idx, i]
-            if naive_scores[t_idx, idx] == -np.inf:
-                expected_topk[t_idx, i] = -1
+    expected_topk = streamindex_topk_ref(
+        q=q,
+        weights=weights,
+        kv=dequantized_kv,
+        block_table=np.arange(num_pages, dtype=np.int32)[None, :],
+        T_list=[T_seq],
+        S_list=[S_seq],
+        cu_q_lens=np.array([0, T_seq], dtype=np.int32),
+        k=k,
+        comp_ratio=comp_ratio,
+        H_I=H_I,
+        H_KV=H_KV,
+    )
 
     # Pallas parameters
     actual_topk = streamindex_topk(
@@ -628,7 +621,7 @@ def _ee_inputs(q_lens, seq_lens, seed):
     }
 
 
-def _ee_both_paths(q_lens, seq_lens, k, seed=11):
+def _ee_both_paths(q_lens, seq_lens, k, seed=11, compression_ratio=1):
     """Run the same batch with the flag off and on."""
     inputs = _ee_inputs(q_lens, seq_lens, seed)
 
@@ -637,7 +630,7 @@ def _ee_both_paths(q_lens, seq_lens, k, seed=11):
             streamindex_topk(
                 **{name: jnp.asarray(value) for name, value in inputs.items()},
                 k=k,
-                compression_ratio=1,
+                compression_ratio=compression_ratio,
                 num_kv_pages_per_block=_EE_BKV_P,
                 num_queries_per_block=_EE_BQ_SZ,
                 enable_early_exit=enable_early_exit,
@@ -647,16 +640,20 @@ def _ee_both_paths(q_lens, seq_lens, k, seed=11):
     return run(False), run(True)
 
 
-def _ee_visible_counts(q_lens, seq_lens):
+def _ee_visible_counts(q_lens, seq_lens, compression_ratio=1):
     """Causally visible compressed positions per query token.
 
-    At ``compression_ratio=1`` the queries are the tail of their sequence, so
-    query ``i`` of a sequence of length ``S`` sits at absolute position
-    ``S - q_len + i`` and sees every position up to and including it.
+    Compressed position ``s`` covers raw tokens ``[s*r, (s+1)*r)``. A query at
+    position ``pos`` sees only complete groups ``(s+1)*r <= pos + 1``, i.e.
+    ``(pos + 1) // r`` compressed positions.
     """
     counts = []
     for q_len, seq_len in zip(q_lens, seq_lens):
-        counts.extend(seq_len - q_len + i + 1 for i in range(q_len))
+        kv_len = seq_len // compression_ratio
+        counts.extend(
+            min(kv_len, (seq_len - q_len + i + 1) // compression_ratio)
+            for i in range(q_len)
+        )
     return counts
 
 
@@ -683,13 +680,15 @@ def _ee_assert_same_selection(early, baseline):
         )
 
 
-def _ee_assert_every_visible_position(actual, q_lens, seq_lens, k):
+def _ee_assert_every_visible_position(actual, q_lens, seq_lens, k, compression_ratio=1):
     """With the whole batch under k the answer is exact, not a ranking.
 
     Every visible position wins, so the expected index set is closed-form and
     the check does not depend on score arithmetic at all.
     """
-    for token, n_visible in enumerate(_ee_visible_counts(q_lens, seq_lens)):
+    for token, n_visible in enumerate(
+        _ee_visible_counts(q_lens, seq_lens, compression_ratio)
+    ):
         assert n_visible <= k, "test setup: sequence is not short"
         row = actual[token]
         np.testing.assert_array_equal(
@@ -771,6 +770,26 @@ def test_streamindex_topk_early_exit_keeps_causal_mask():
     # positions 60..63, so they keep 61..64 positions respectively.
     kept = [int(np.count_nonzero(row >= 0)) for row in early]
     assert kept == [61, 62, 63, 64], kept
+
+
+def test_streamindex_topk_sees_only_complete_groups():
+    """At compression_ratio > 1 a query cannot see the group it falls inside.
+
+    Compressed position s covers tokens [s*r, (s+1)*r). A query at token_pos
+    has not yet seen tokens (token_pos, (s+1)*r) of its own group, so that
+    group is only visible to the last token in it (token_pos % r == r - 1).
+    Query tokens at positions 0..7 with r=4 must see [0, 0, 0, 1, 1, 1, 1, 2]
+    compressed positions on both the scoring path and the early-exit path.
+    """
+    q_lens, seq_lens, k, r = (8,), (8,), 16, 4
+    baseline, early = _ee_both_paths(q_lens, seq_lens, k, compression_ratio=r)
+
+    _ee_assert_every_visible_position(
+        baseline, q_lens, seq_lens, k, compression_ratio=r
+    )
+    _ee_assert_every_visible_position(early, q_lens, seq_lens, k, compression_ratio=r)
+    kept = [int(np.count_nonzero(row >= 0)) for row in baseline]
+    assert kept == [0, 0, 0, 1, 1, 1, 1, 2], kept
 
 
 def test_pallas_smem_oom_when_unclamped(monkeypatch):
@@ -1477,3 +1496,32 @@ class TestChunkedPipelining:
         assert "_scheduling_group_id" not in hlo, (
             "an indivisible chunk_tokens emitted more than one chunk; the"
             " fallback that the cases above rely on has changed")
+
+
+@pytest.mark.parametrize("kv_layout", [_HAS, _SAL])
+def test_static_verify_segment_matches_mixed_pass(kv_layout):
+    """A `[0, d)` decode + `[d, v)` uniform-verify + `[v, n)` prefill batch
+    produces the same top-k whether `[d, v)` runs on the static-q_len pass
+    (`uniform_q_len=q_verify`) or falls into the dynamic mixed pass."""
+    # 5 decodes (4 batched + 1 remainder), 3 four-token verify requests, 1 prefill.
+    T_list = (1, 1, 1, 1, 1, 4, 4, 4, 15)
+    S_list = (512,) * len(T_list)
+    page_size, H_I, D, k, comp_ratio, bq_sz, bkv_p = 128, 4, 128, 128, 1, 8, 2
+
+    inputs = _chunk_inputs(T_list, _fragmented_pages(len(T_list)), page_size, H_I, D)
+    base = _chunk_call_kwargs(
+        inputs, T_list, S_list, k, comp_ratio, bq_sz, bkv_p, kv_layout, None
+    )
+
+    via_mixed = np.array(
+        streamindex_topk(**{**base, "distribution": (5, 5, 9), "uniform_q_len": None})
+    )
+    via_verify = np.array(
+        streamindex_topk(**{**base, "distribution": (5, 8, 9), "uniform_q_len": 4})
+    )
+
+    _verify_padding_at_end(via_verify)
+    np.testing.assert_array_equal(
+        np.sort(via_verify, axis=-1),
+        np.sort(via_mixed, axis=-1),
+    )
