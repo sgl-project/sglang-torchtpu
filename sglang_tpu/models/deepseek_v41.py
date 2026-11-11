@@ -7,6 +7,7 @@ Checkpoint names and the core loader remain unchanged.
 """
 
 import functools
+import logging
 
 import torch
 from torch import nn
@@ -33,6 +34,7 @@ from sglang.srt.models.deepseek_v4 import (
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import add_prefix
+from sglang_tpu.dsv41.dspark import dspark_enabled
 from sglang_tpu.dsv41.mhc import (
     ShiftedCarry,
     ShiftedMhc,
@@ -41,6 +43,8 @@ from sglang_tpu.dsv41.mhc import (
 )
 from sglang_tpu.dsv41.moe import DSV41MoE
 from sglang_tpu.engram import _MM_PAD_SHIFT_VALUE
+
+logger = logging.getLogger(__name__)
 
 
 class DSV41Attention(MqaAttentionBase):
@@ -135,7 +139,7 @@ class DSV41Layer(nn.Module):
                 config, layer_id, layout, quant_config, add_prefix("engram", prefix)
             )
 
-    def forward(self, residual, carry, input_ids, positions, forward_batch):
+    def forward(self, residual, carry, input_ids, positions, forward_batch, aux=None):
         if self.engram is not None:
             previous_pre = carry.pre if carry is not None else None
             if carry is not None:
@@ -159,6 +163,10 @@ class DSV41Layer(nn.Module):
             post, comb, value, pre = self.attn_mhc.start(residual)
         else:
             residual, post, comb, value, pre = self.attn_mhc.advance(carry)
+        if aux is not None:
+            # DSpark reads the hc-mean of this layer's attention input stream
+            # (core DeepseekV4Model._forward_layers_hc_pre_from_prev).
+            aux.append(residual.mean(dim=1))
         output = self.self_attn(positions, self.input_layernorm(value), forward_batch)
         attention = ShiftedCarry(output, residual, post, comb, pre)
         residual, post, comb, value, pre = self.ffn_mhc.advance(attention)
@@ -242,12 +250,22 @@ class DSV41Model(nn.Module):
             else:
                 embedded = input_embeds
             residual = embedded[:, None, :].expand(-1, self.hc_mult, -1).contiguous()
+        capture = self.dspark_layers_to_capture
+        aux = [] if capture else None
         for layer in self.layers[start:stop]:
-            carry = layer(residual, carry, input_ids, positions, forward_batch)
+            carry = layer(
+                residual,
+                carry,
+                input_ids,
+                positions,
+                forward_batch,
+                aux if capture and layer.layer_id in capture else None,
+            )
         # No host Engram boundary follows the final layer. Keep its mHC commit,
         # combine and norm in this same device graph instead of compiling a
         # separate tail for every prefill/decode shape.
-        return self.finish(carry) if stop == self.end_layer else carry
+        result = self.finish(carry) if stop == self.end_layer else carry
+        return result if aux is None else (result, tuple(aux))
 
     def finish(self, carry):
         residual = self.layers[-1].ffn_mhc.commit(carry)
@@ -265,6 +283,7 @@ class DSV41Model(nn.Module):
         from torch_tpu._internal.sync.sync import synchronize
 
         carry = None
+        captured = [] if self.dspark_layers_to_capture else None
         for start, segment in zip(self.segment_starts, self.segments):
             layer = self.layers[start]
             if layer.engram is not None:
@@ -274,9 +293,12 @@ class DSV41Model(nn.Module):
                     layer.engram.layer_hash_index, input_ids.shape[0]
                 )
             carry = segment(carry, input_ids, positions, forward_batch, input_embeds)
+            if captured is not None:
+                carry, aux = carry
+                captured.extend(aux)
             # Submit this segment before host lookup for the next Engram layer.
             # Its output tensors carry the device dependency into that segment.
-            synchronize(list(carry), wait=False)
+            synchronize(list(carry) + (captured or []), wait=False)
             if layer.engram is not None and self.host_engram is not None:
                 self.host_engram.finish_segment(
                     layer.engram.layer_hash_index,
@@ -285,7 +307,8 @@ class DSV41Model(nn.Module):
                 )
         if self.host_engram is not None:
             self.host_engram.finish_forward(input_ids.shape[0])
-        return carry
+        # Core DeepseekV4ForCausalLM.forward unpacks (hidden, pre), aux.
+        return carry if captured is None else (carry, captured)
 
 
 class DeepseekV4ForCausalLM(CoreCausalLM):
@@ -323,6 +346,17 @@ class DeepseekV4ForCausalLM(CoreCausalLM):
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+        # The bundled DSpark drafter runs on this runner (no draft ModelRunner).
+        self.dspark = None
+        if dspark_enabled(config):
+            from sglang_tpu.dsv41.dspark import DSV41DSparkDrafter
+
+            self.dspark = DSV41DSparkDrafter(
+                config, quant_config, add_prefix("dspark", prefix)
+            )
+            self.dspark.attach(
+                embed_tokens=self.model.embed_tokens, lm_head=self.lm_head
+            )
         self.start_layer, self.end_layer = self.model.start_layer, self.model.end_layer
         self._mhc_prewarmed_at_load = True
         get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
@@ -330,12 +364,49 @@ class DeepseekV4ForCausalLM(CoreCausalLM):
 
         support_torch_compile(self, policy=DSV41CompilePolicy)
 
+    def set_dspark_layers_to_capture(self, layer_ids):
+        if self.dspark is None:
+            raise ValueError("DSPARK needs the checkpoint's bundled V4.1 drafter")
+        if tuple(layer_ids) != self.dspark.target_layer_ids:
+            raise ValueError(
+                f"DSpark capture layers {list(layer_ids)} differ from the drafter's "
+                f"{list(self.dspark.target_layer_ids)}"
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = tuple(layer_ids)
+
+    def load_weights(self, weights, is_nextn=False):
+        if self.dspark is None or is_nextn:
+            return super().load_weights(weights, is_nextn=is_nextn)
+        drafter, loaded = self.dspark, set()
+
+        def target_weights():
+            # Core load_weights skips mtp.*; the drafter loads them as they stream.
+            for name, tensor in weights:
+                if name.startswith("mtp."):
+                    loaded.update(
+                        "dspark." + n for n in drafter.load_weights([(name, tensor)])
+                    )
+                else:
+                    yield name, tensor
+
+        result = super().load_weights(target_weights(), is_nextn=is_nextn)
+        missing = {"dspark." + n for n, _ in drafter.named_parameters()} - loaded
+        if missing:
+            logger.error(
+                "DSpark drafter tensors missing from the checkpoint: %s",
+                sorted(missing),
+            )
+        return result
+
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if is_nextn:
             raise NotImplementedError("MTP is outside the initial V4.1 validation")
         # Ordinary FP8 postprocessing prepares wo_a's channelwise weight and
         # scale after this loader hook, as for the other SGLang dense linears.
         pack_layer_weights(self.model.layers)
+        if self.dspark is not None:
+            pack_layer_weights(self.dspark.stages)
 
     def wants_prefill_autotune(self):
         return False

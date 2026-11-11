@@ -990,6 +990,65 @@ class TestExperimentalSpecHooks(CustomTestCase):
         with self.assertRaises(_Stop):
             init(dp_attention=True)
 
+    def test_in_target_drafter_starts_under_dp_attention(self):
+        """V4.1 DSpark's drafter lives inside the target (draft_worker None) and
+        drafts through the target lm_head: under DP attention, startup checks that
+        head instead of dereferencing a draft worker, and there is no draft KV pool
+        for the scheduler's retraction backup."""
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+        from sglang_tpu.experimental.speculative import base_spec_worker
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        class _Stop(Exception):
+            pass
+
+        def init(lm_head):
+            model = SimpleNamespace(lm_head=lm_head)
+            runner = SimpleNamespace(
+                sampler=_tpu_sampler(), model=model, model_config=None
+            )
+            worker = object.__new__(TpuBlockSpecWorker)
+            with (
+                patch.object(
+                    base_spec_worker,
+                    "get_parallel",
+                    return_value=SimpleNamespace(pp_size=1, attn_tp_size=1),
+                ),
+                patch.object(base_spec_worker, "get_dp_tp_group", return_value=None),
+                patch.object(base_spec_worker, "SpecTpSync", lambda group: None),
+                patch.object(
+                    base_spec_worker, "is_dp_attention_enabled", return_value=True
+                ),
+                patch.object(
+                    base_spec_worker,
+                    "get_spec",
+                    return_value=SimpleNamespace(speculative_skip_dp_mlp_sync=False),
+                ),
+                patch.object(TpuBlockSpecWorker, "verify_top_k_width", lambda self: 0),
+                # Stop right after the lm_head group check.
+                patch.object(base_spec_worker, "mambaish_config", side_effect=_Stop),
+            ):
+                base_spec_worker.TpuSpecWorker.__init__(
+                    worker,
+                    SimpleNamespace(model_runner=runner, device="cpu"),
+                    None,
+                    3,
+                )
+
+        with self.assertRaises(_Stop):
+            init(lm_head=torch.nn.Linear(2, 2))
+        # The check still runs, on the target head: one sharded over the full TP group fails.
+        full_tp_head = object.__new__(VocabParallelEmbedding)
+        full_tp_head.enable_tp, full_tp_head.tp_size = True, 8
+        with self.assertRaisesRegex(ValueError, "--enable-dp-lm-head"):
+            init(lm_head=full_tp_head)
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._draft_worker = None
+        self.assertEqual(worker.retraction_draft_kv_pools, ())
+
     def test_idle_dp_rank_mirrors_the_whole_step(self):
         """An idle DP rank runs the active step's forwards and syncs in order (the
         greedy draft, verify, commit) on all-padding rows; a skipped one leaves

@@ -17,6 +17,16 @@ from sglang_tpu.dsv41.quantization import prepare_expert_matrix
 logger = logging.getLogger(__name__)
 
 
+def _ep_op_name(topk, renormalize, scoring, routed_scale, is_hash, logical_inter):
+    """One custom op per static routing configuration: a second geometry (the
+    DSpark drafter's 128 experts, top-3) must not reuse the target's op name."""
+    scale = f"{float(routed_scale):g}".replace(".", "p").replace("-", "m")
+    return (
+        f"sglang_tpu_pallas::dsv41_fused_ep_{int(is_hash)}_k{topk}_i{logical_inter}"
+        f"_r{int(renormalize)}_{scoring}_s{scale}"
+    )
+
+
 @cache
 def _build_ep_op(
     ep_size, topk, renormalize, scoring, routed_scale, is_hash, logical_inter
@@ -72,7 +82,7 @@ def _build_ep_op(
     # Correction bias is indexed by global expert id and is replicated.
     spec = P("ep")
     op = cpu_export_jax_op(
-        f"sglang_tpu_pallas::dsv41_fused_ep_{int(is_hash)}",
+        _ep_op_name(topk, renormalize, scoring, routed_scale, is_hash, logical_inter),
         call,
         mesh=mesh,
         input_partition_specs=(spec,) * 7 + ((spec,) if is_hash else (P(),)),
@@ -80,6 +90,20 @@ def _build_ep_op(
     )
     op.register_fake(lambda x, *_: torch.empty_like(x))
     return op
+
+
+def moe_token_rows(tokens: int) -> int:
+    """Token rows the fused EP op can lower: a multiple of 8 or a power of two.
+
+    Its top-k selector tiles rows by the largest power of two dividing the
+    count, and a block row count below 8 must equal the whole array. Decode
+    buckets (1/2/4/8/16) and prefill token buckets already qualify; speculative
+    verify (6 rows per request) and DSpark draft blocks (5 per request) round
+    up to the next multiple of 8 (raw 6 or 5 rows fail Mosaic lowering).
+    """
+    if tokens % 8 == 0 or tokens & (tokens - 1) == 0:
+        return tokens
+    return -(-tokens // 8) * 8
 
 
 class _ExpertQuantMethod:
@@ -234,7 +258,15 @@ class DSV41MoE(nn.Module):
             if self.is_hash
             else self.gate.e_score_correction_bias
         )
+        tokens = x.shape[0]
+        rows = moe_token_rows(tokens)
         padded_x = F.pad(x, (0, -x.shape[-1] % 512))
+        if rows != tokens:
+            padded_x = F.pad(padded_x, (0, 0, 0, rows - tokens))
+            # Extra rows are dead: -inf gating routes them nowhere.
+            gating = F.pad(gating, (0, 0, 0, rows - tokens), value=float("-inf"))
+            if self.is_hash:
+                route = F.pad(route, (0, 0, 0, rows - tokens))
         routed = self.ep_op(
             padded_x,
             expert.w13_weight,
@@ -244,7 +276,7 @@ class DSV41MoE(nn.Module):
             gating,
             self.ep_rank,
             route,
-        )[:, : x.shape[-1]]
+        )[:tokens, : x.shape[-1]]
         return (routed + self.shared_experts(x)).masked_fill(~valid[:, None], 0)
 
     def get_moe_weights(self):

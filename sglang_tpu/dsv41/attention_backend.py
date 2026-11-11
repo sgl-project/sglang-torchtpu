@@ -65,6 +65,20 @@ def pair_compress(kv, score, req, positions, valid, state, ring_size):
     return pooled
 
 
+def verify_token_rows(bs: int, rows_per_request: int) -> torch.Tensor:
+    """Request row of each TARGET_VERIFY token: bs requests x rows_per_request.
+
+    The spec worker lays verify rows out request-major at the batch bucket, so
+    every request owns the same number of consecutive rows (bonus + drafts).
+    Positions inside a request are consecutive, so pair_compress pairs in-batch
+    neighbours, and the C2 ring (sized >= 2 + drafts under speculation) keeps
+    each verify row's slot distinct from the last accepted position's.
+    """
+    return torch.repeat_interleave(
+        torch.arange(bs, dtype=torch.int32), int(rows_per_request)
+    )
+
+
 def compressor_project(compressor, x):
     # Both C1 and C2 keep their checkpoint projection weights in FP32.
     kv = F.linear(x.float(), compressor.wkv.weight)
@@ -91,8 +105,11 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
             for name in ("pp_size", "attn_cp_size", "attn_dcp_size", "attn_tp_size")
         ):
             raise NotImplementedError("V4.1 CSA2 requires attention TP1, PP1/CP1/DCP1")
-        if get_spec().speculative_algorithm is not None:
-            raise NotImplementedError("V4.1 initial validation does not enable MTP")
+        algorithm = get_spec().speculative_algorithm
+        if algorithm is not None and str(
+            getattr(algorithm, "name", algorithm)
+        ).upper() != ("DSPARK"):
+            raise NotImplementedError("V4.1 serves only DSPARK speculative decoding")
         features = get_exec().features
         if (
             features.enable_encoder_swa_bounded_replay
@@ -131,9 +148,12 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
         bs, tokens = forward_batch.batch_size, forward_batch.input_ids.shape[0]
         if not bs:
             return
-        if forward_batch.forward_mode.is_decode_or_idle():
+        mode = forward_batch.forward_mode
+        if mode.is_decode_or_idle():
             rows = torch.arange(bs, dtype=torch.int32)
-        elif forward_batch.forward_mode.is_extend_without_speculative():
+        elif mode.is_target_verify():
+            rows = verify_token_rows(bs, forward_batch.spec_info.draft_token_num)
+        elif mode.is_extend_without_speculative():
             lengths = torch.as_tensor(
                 forward_batch.extend_seq_lens_cpu, dtype=torch.int32
             )
@@ -143,9 +163,7 @@ class DSV41TPUAttnBackend(DSV4TPUAttnBackend):
                 torch.arange(bs, dtype=torch.int32), lengths[:bs]
             )
         else:
-            raise NotImplementedError(
-                "V4.1 supports prefill and decode in this validation"
-            )
+            raise NotImplementedError(f"V4.1 does not support forward mode {mode}")
         if rows.numel() < tokens:
             rows = torch.nn.functional.pad(rows, (0, tokens - rows.numel()), value=-1)
         metadata.token_rows = rows[:tokens].to(self.device)

@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 _EXPERT = re.compile(
     r"^layers\.(0|[1-9]\d*)\.ffn\.experts\.(0|[1-9]\d*)\.w[123]\.(weight|scale)$"
 )
+_DRAFT_EXPERT = re.compile(
+    r"^mtp\.(0|[1-9]\d*)\.ffn\.experts\.(0|[1-9]\d*)\.w[123]\.(weight|scale)$"
+)
 _ENGRAM_EMBED = re.compile(r"^layers\.(0|[1-9]\d*)\.engram\.embed\.(weight|scale)$")
 
 _SAFETENSORS_DTYPES = {
@@ -313,13 +316,16 @@ def plan_expert_reads(
     num_experts: int,
     ep_size: int,
     ep_rank: int,
+    draft_experts: int = 0,
 ) -> ExpertReadPlan:
     """Keep local routed experts and all replicated/host-table parameters.
 
     This is a payload filter, not a filter on the already-materialized iterator.
     Host Engram tensors must stay: the current shared table loader has every TP
-    rank fill its own row range of each checkpoint tensor. MTP is not loaded by
-    the target model. Unknown names are retained rather than silently dropped.
+    rank fill its own row range of each checkpoint tensor. ``mtp.*`` (the
+    bundled DSpark drafter) is read only when ``draft_experts`` gives its routed
+    expert count, again keeping this rank's experts only. Unknown names are
+    retained rather than silently dropped.
     """
     if num_layers <= 0 or num_experts <= 0:
         raise ValueError("Layer and expert counts must be positive")
@@ -329,8 +335,21 @@ def plan_expert_reads(
     lo, hi = ep_rank * local_count, (ep_rank + 1) * local_count
     selected = set()
     expert_count = local_expert_count = 0
+    draft_local = draft_experts // ep_size if draft_experts else 0
+    if draft_experts and draft_experts % ep_size:
+        raise ValueError("Draft expert count must divide EP size")
     for name in weight_map:
         if name.startswith("mtp."):
+            if not draft_experts:
+                continue
+            match = _DRAFT_EXPERT.fullmatch(name)
+            if match is not None:
+                expert = int(match[2])
+                if expert >= draft_experts:
+                    raise ValueError(f"Draft expert outside configured model: {name}")
+                if not ep_rank * draft_local <= expert < (ep_rank + 1) * draft_local:
+                    continue
+            selected.add(name)
             continue
         match = _EXPERT.fullmatch(name)
         if match is not None:
@@ -404,12 +423,20 @@ class DSV41RunaiModelStreamerLoader(RunaiModelStreamerLoader):
             (Path(metadata_dir) / "model.safetensors.index.json").read_text()
         )
         parallel = get_parallel()
+        from sglang_tpu.dsv41.dspark import dspark_config_of, dspark_enabled
+
+        draft_experts = (
+            dspark_config_of(config)["n_routed_experts"]
+            if dspark_enabled(config)
+            else 0
+        )
         plan = plan_expert_reads(
             index["weight_map"],
             num_layers=config.num_hidden_layers,
             num_experts=config.n_routed_experts,
             ep_size=parallel.moe_ep_size,
             ep_rank=parallel.moe_ep_rank,
+            draft_experts=draft_experts,
         )
         files = [path for path in files if path.rsplit("/", 1)[-1] in plan.shard_names]
         if len(files) != len(plan.shard_names):
