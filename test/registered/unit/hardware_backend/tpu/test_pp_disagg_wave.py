@@ -214,6 +214,9 @@ def run_loop(
         enable_dsa_prefill_context_parallel=False,
     )
     with (
+        # The PP loop fences on torch.accelerator.current_stream(); CPU CI has
+        # no accelerator, so stub it like the mocked device_module events.
+        patch.object(torch.accelerator, "current_stream"),
         patch.object(scheduler_pp_mixin, "_is_tpu", use_wave),
         patch.object(scheduler_pp_mixin, "get_parallel", return_value=parallel),
         patch.object(
