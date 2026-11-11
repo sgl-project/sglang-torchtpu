@@ -111,7 +111,7 @@ def persistent_scratch(batch, group=32):
 def scoped_scratch(batch, *, hidden, index_block_shape, key_rows, page_tokens, sequence_rows=1, page_plan=None):
     """The MLA region's indexer scratch: ``{name: spec}`` (``bind`` order).
     ``page_plan``: the DCP attention's ``mla_dcp.page_plan`` (span, buffers)."""
-    select = dsa_dcp.select_scratch(batch, index_block_shape, key_rows)
+    select = dsa_dcp.select_scratch(batch, index_block_shape, key_rows, sequence_rows=sequence_rows)
     for name in ("exchange", "exchange_sems"):
         select.pop(name)
     key_buf, key_sems = mla_dcp.selection_scratch(
@@ -296,9 +296,10 @@ class DecodeIndexer:
         def query(row):  # [32, 128] FP8 query heads of a row (traced or not)
             return s["q8"][row]
 
+        S = self.sequence_rows
         select.plan()
         select.in_flight(query, s["w_t"], s["new_k8"])
-        select.score(query, s["w_t"])
+        select.score(query, s["w_t"], lambda first: s["q8"][pl.ds(first, S)].reshape(S * HEADS, DIM))
         select.select()
         span_rows = s["attend_keys"].shape[2]
         steps = self.keys.shape[1] // span_rows
