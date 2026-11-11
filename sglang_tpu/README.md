@@ -40,6 +40,15 @@ Open: sparse attention (DSA) models run in mode A only. Mode B refuses them at
 pool construction (`TpuOOTPlatform.get_dsa_kv_pool_cls`), because the OOT DSA
 builder does not say which layers run their own indexer.
 
+The LFM2 causal ShortConv implementation is wired through the OOT platform
+interfaces in mode B only (`SGLANG_PLATFORM=tpu_oot`). Mode A still selects the
+in-tree ShortConv sidecar, which expects stacked GPU-layout state. The mode-B
+implementation includes packed/chunked prefill, decode, padding and per-request
+state updates, including lifting the state and metadata into `direct_compile`.
+It currently requires `--disable-radix-cache` and no speculative decoding;
+ZAYA1 and the separate LFM2-MoE ShortConv implementation are outside this wiring.
+Full-model TPU generation validation and registered coverage remain pending.
+
 Different arm, same outcome for every configuration that runs:
 
 - `--prefill-only-disable-kv-cache`: the pool-family check refuses OOT pools,

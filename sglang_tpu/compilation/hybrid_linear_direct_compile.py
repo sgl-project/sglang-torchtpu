@@ -1,4 +1,4 @@
-"""direct_compile inputs for hybrid full + linear attention (GDN/KDA) models.
+"""direct_compile inputs for hybrid attention + recurrent/ShortConv models.
 
 HybridLinearAttnBackend has no forward_metadata of its own and the linear state
 lives outside the KV pool, so both children's metadata and the TpuMambaPool
@@ -27,6 +27,10 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang_tpu.attention_gdn_pallas import GdnTracedMetadata, TpuGDNAttnBackend
+from sglang_tpu.attention_short_conv import (
+    ShortConvTracedMetadata,
+    TpuShortConvAttnBackend,
+)
 from sglang_tpu.mamba_pool import TpuMambaPool
 
 
@@ -51,7 +55,7 @@ class HybridLinearKVPoolState:
 def hybrid_linear_kv_pool_state(
     *, kv_pool: HybridLinearKVPool, req_to_token_pool: ReqToTokenPool
 ) -> HybridLinearKVPoolState:
-    # The GDN layers read state through the request pool, so lift that one.
+    # Recurrent and ShortConv layers read state through the request pool.
     assert isinstance(req_to_token_pool, HybridReqToTokenPool)
     mamba_pool = req_to_token_pool.mamba_pool
     assert isinstance(mamba_pool, TpuMambaPool), type(mamba_pool)
@@ -61,7 +65,12 @@ def hybrid_linear_kv_pool_state(
 
 
 def has_linear_attention(model: nn.Module) -> bool:
-    return any(isinstance(module, RadixLinearAttention) for module in model.modules())
+    from sglang.srt.models.lfm2 import Lfm2ShortConv
+
+    return any(
+        isinstance(module, (RadixLinearAttention, Lfm2ShortConv))
+        for module in model.modules()
+    )
 
 
 def _conv_weight_owners(
@@ -101,9 +110,13 @@ def bind_traced_conv_weights(model: nn.Module) -> Iterator[None]:
             attn.conv_weights = view
 
 
-def _linear_backend(backend: HybridLinearAttnBackend) -> TpuGDNAttnBackend:
+def _linear_backend(
+    backend: HybridLinearAttnBackend,
+) -> TpuGDNAttnBackend | TpuShortConvAttnBackend:
     linear = backend.linear_attn_backend
-    assert isinstance(linear, TpuGDNAttnBackend), type(linear)
+    assert isinstance(linear, (TpuGDNAttnBackend, TpuShortConvAttnBackend)), type(
+        linear
+    )
     return linear
 
 
@@ -127,7 +140,7 @@ def bind_traced_attention_metadata(
             yield
         return
     full_metadata, linear_metadata = metadata
-    assert isinstance(linear_metadata, GdnTracedMetadata)
+    assert isinstance(linear_metadata, (GdnTracedMetadata, ShortConvTracedMetadata))
     with (
         backend.full_attn_backend.bind_forward_metadata(full_metadata, forward_mode),
         _linear_backend(backend).bind_traced_metadata(linear_metadata),
