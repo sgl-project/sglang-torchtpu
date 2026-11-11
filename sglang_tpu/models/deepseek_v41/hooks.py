@@ -123,15 +123,24 @@ def trace_tpu_platform_fact(original, platform, name):
 @torch._dynamo.assume_constant_result
 def _resolve_env_default(name: str):
     from sglang.srt.environ import envs
+    from sglang_tpu.envs import envs as tpu_envs
 
-    default = getattr(envs, name).default
-    return default() if callable(default) else default
+    # Class-level lookup: Envs instances refuse bare field access, and an
+    # EnvField refuses bool(), so test membership explicitly.
+    for owner in (type(envs), type(tpu_envs)):
+        for cls in owner.__mro__:
+            if name in vars(cls):
+                default = vars(cls)[name].default
+                return default() if callable(default) else default
+    raise AttributeError(f"unknown env field {name}")
 
 
 def trace_tpu_env_default(original, field):
     """AROUND EnvField._resolve_default: env defaults are fixed per process, so
-    Dynamo bakes them into the graph instead of tracing callable(default)."""
-    del original
+    under Dynamo they are baked into the graph instead of tracing
+    callable(default); eager reads take the original path."""
+    if not torch.compiler.is_compiling():
+        return original(field)
     return _resolve_env_default(field.name)
 
 
