@@ -168,6 +168,32 @@ def _assert_per_head_close(test, out, ref, tol, label):
         test.assertLess(rel_l2, tol, f"{label} head {head}")
 
 
+def _rerun_with_8_cpu_devices(test: unittest.TestCase) -> None:
+    """Run ``test`` in a subprocess with 8 host CPU devices.
+
+    Another test initialized JAX's CPU backend before XLA_FLAGS took effect.
+    """
+    xla_flags = " ".join(
+        tok
+        for tok in os.environ.get("XLA_FLAGS", "").split()
+        if not tok.startswith("--xla_force_host_platform_device_count=")
+    )
+    env = {
+        **os.environ,
+        "JAX_PLATFORMS": "cpu",
+        "XLA_FLAGS": f"{xla_flags} --xla_force_host_platform_device_count=8".strip(),
+    }
+    test_name = f"{type(test).__name__}.{test._testMethodName}"
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), test_name],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    test.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+
+
 @unittest.skipUnless(_has_jax(), "jax not installed")
 class TestRingAttentionInterpret(unittest.TestCase):
     def test_ring4_interpret_multiblock_matches_fp32_reference(self):
@@ -183,29 +209,7 @@ class TestRingAttentionInterpret(unittest.TestCase):
 
         cpu_devices = jax.devices("cpu")
         if len(cpu_devices) < 4:
-            # Another test initialized JAX's CPU backend before XLA_FLAGS took effect.
-            xla_flags = " ".join(
-                tok
-                for tok in os.environ.get("XLA_FLAGS", "").split()
-                if not tok.startswith("--xla_force_host_platform_device_count=")
-            )
-            env = {
-                **os.environ,
-                "JAX_PLATFORMS": "cpu",
-                "XLA_FLAGS": f"{xla_flags} --xla_force_host_platform_device_count=8".strip(),
-            }
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    os.path.abspath(__file__),
-                    "TestRingAttentionInterpret.test_ring4_interpret_multiblock_matches_fp32_reference",
-                ],
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+            _rerun_with_8_cpu_devices(self)
             return
 
         import jax.numpy as jnp
