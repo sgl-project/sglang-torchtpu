@@ -53,6 +53,16 @@ tpu_dsv41_hc_combine
        fp32 weighted sum of the hc_mult copies in torch for non-CUDA tensors.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: hc_combine dispatches on device like the other mHC kernels.
+
+trace_tpu_env_default
+  Why: EnvField._resolve_default calls callable(self.default) for lazily
+       computed defaults (e.g. SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)),
+       which Dynamo cannot trace; the V4.1 MoE DP path reads it in the forward.
+  How: AROUND EnvField._resolve_default resolves the default through a
+       torch._dynamo.assume_constant_result helper keyed by the env name;
+       defaults depend only on the platform, fixed before any model is traced.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: callable env defaults are resolved at import or are traceable.
 """
 
 from __future__ import annotations
@@ -110,6 +120,21 @@ def trace_tpu_platform_fact(original, platform, name):
     return _resolve_platform_fact(name)
 
 
+@torch._dynamo.assume_constant_result
+def _resolve_env_default(name: str):
+    from sglang.srt.environ import envs
+
+    default = getattr(envs, name).default
+    return default() if callable(default) else default
+
+
+def trace_tpu_env_default(original, field):
+    """AROUND EnvField._resolve_default: env defaults are fixed per process, so
+    Dynamo bakes them into the graph instead of tracing callable(default)."""
+    del original
+    return _resolve_env_default(field.name)
+
+
 def tpu_dsv41_hc_combine(original, x_flat, pre, hc, out_dtype):
     """y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h], accumulated in fp32."""
     if x_flat.is_cuda:
@@ -142,6 +167,11 @@ def hook_specs():
         (
             "sglang.srt.runtime_context.PlatformContext.__getattr__",
             trace_tpu_platform_fact,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.environ.EnvField._resolve_default",
+            trace_tpu_env_default,
             HookType.AROUND,
         ),
         (
