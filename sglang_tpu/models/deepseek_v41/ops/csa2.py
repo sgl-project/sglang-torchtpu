@@ -8,7 +8,9 @@ value; the caller writes it back with ``pool.copy_(result)``.
 
 Layouts (``memory_pool.DSV41TPUTokenToKVPool``):
 
-- SWA pages: BF16 ``[pages, 64, 512]``, page 0 null. The SWA table
+- SWA owner: INT32 ``[pages * 128, 128]``, page 0 null. Adjacent BF16
+  token pairs occupy four word rows. Page views are made inside JAX only,
+  never as Torch views of donated allocations. The SWA table
   ``[B, C]`` holds, in column ``j``, the 64-token SWA page of request
   positions ``[64 j, 64 j + 64)`` (``swa_loc // 64``).
 - Main KV: INT32 words ``[R, 128]`` (packed FP8, byte ``g`` of lane ``l`` is
@@ -46,7 +48,10 @@ from sglang_tpu.models.deepseek_v41.kernels.csa2.pipeline import (
     csa2_gather_chunk_size,
     csa2_pipeline,
 )
-from sglang_tpu.models.deepseek_v41.kernels.paged_swa import write_swa_pages
+from sglang_tpu.models.deepseek_v41.kernels.paged_swa import (
+    swa_word_pages,
+    write_swa_word_pool,
+)
 from sglang_tpu.models.deepseek_v41.kernels.v4.o_projection import wo_a_projection
 
 SWA_PAGE_SIZE = 64
@@ -82,7 +87,7 @@ def _swa_metadata(
 
 
 def _publish_swa(pages: jax.Array, records: jax.Array, kv: jax.Array) -> jax.Array:
-    return write_swa_pages(pages, records, kv)
+    return write_swa_word_pool(pages, records, kv, page_size=SWA_PAGE_SIZE)
 
 
 def _publish_main(
@@ -134,7 +139,7 @@ def _attend_swa(
         q,
         None,
         None,
-        swa,
+        swa_word_pages(swa, SWA_PAGE_SIZE),
         starts,
         positions,
         sink.astype(jnp.float32),
@@ -143,6 +148,56 @@ def _attend_swa(
         scale=scale,
         bq=_bq(q.shape[0]),
     )
+
+
+def _gather_attend(
+    q: jax.Array,
+    words: jax.Array,
+    scales: jax.Array,
+    selected: jax.Array,
+    main_pages: jax.Array,
+    swa: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    cos_sin: jax.Array,
+    metadata: jax.Array,
+    main_page_records: int,
+    compress_ratio: int,
+    scale: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """SWA attention plus reusable gathered words, scales and valid counts."""
+    # As the epic caller: ids at or past the token's compressed length are
+    # invalid. Selections must still form a valid prefix per row.
+    lengths = (positions + 1) // compress_ratio
+    selected = jnp.where(selected < lengths[:, None], selected, -1)
+    records, counts = prepare_main_records(
+        selected,
+        main_pages,
+        starts,
+        page_size=main_page_records,
+        onehot_requests=True,
+    )
+    output, gathered_words, gathered_scales = csa2_pipeline(
+        q,
+        words,
+        scales,
+        records,
+        swa_word_pages(swa, SWA_PAGE_SIZE),
+        starts,
+        positions,
+        sink.astype(jnp.float32),
+        _inverse_rope(cos_sin, positions),
+        metadata,
+        None,
+        counts,
+        chunk_size=csa2_gather_chunk_size(q.shape[0]),
+        bq=_bq(q.shape[0]),
+        scale=scale,
+        compress_ratio=compress_ratio,
+        deep_gather=True,
+    )
+    return output, gathered_words, gathered_scales, counts
 
 
 def _attend_main(
@@ -161,38 +216,54 @@ def _attend_main(
     compress_ratio: int,
     scale: float,
 ) -> jax.Array:
-    """SWA window plus the selected compressed records of each token."""
-    # As the epic caller: ids at or past the token's compressed length are
-    # invalid. Selections must still form a valid prefix per row.
-    lengths = (positions + 1) // compress_ratio
-    selected = jnp.where(selected < lengths[:, None], selected, -1)
-    records, counts = prepare_main_records(
-        selected,
-        main_pages,
-        starts,
-        page_size=main_page_records,
-        onehot_requests=True,
-    )
-    output, _, _ = csa2_pipeline(
+    # Keep the original output-only bridge for existing callers.
+    return _gather_attend(
         q,
         words,
         scales,
-        records,
+        selected,
+        main_pages,
         swa,
+        starts,
+        positions,
+        sink,
+        cos_sin,
+        metadata,
+        main_page_records,
+        compress_ratio,
+        scale,
+    )[0]
+
+
+def _attend_prepared(
+    q: jax.Array,
+    words: jax.Array,
+    scales: jax.Array,
+    counts: jax.Array,
+    swa: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    cos_sin: jax.Array,
+    metadata: jax.Array,
+    compress_ratio: int,
+    scale: float,
+) -> jax.Array:
+    return csa2(
+        q,
+        words,
+        scales,
+        swa_word_pages(swa, SWA_PAGE_SIZE),
         starts,
         positions,
         sink.astype(jnp.float32),
         _inverse_rope(cos_sin, positions),
-        metadata,
-        None,
-        counts,
-        chunk_size=csa2_gather_chunk_size(q.shape[0]),
-        bq=_bq(q.shape[0]),
+        swa_metadata=metadata,
+        main_lengths=counts,
         scale=scale,
         compress_ratio=compress_ratio,
-        deep_gather=True,
+        bq=_bq(q.shape[0]),
     )
-    return output
 
 
 def _wo_a(x: jax.Array, weight: jax.Array, scale: jax.Array) -> jax.Array:
@@ -230,6 +301,15 @@ def _fake_attend(q, *args):
     return torch.empty_like(q)
 
 
+def _fake_gather_attend(q, words, scales, *args):
+    return (
+        torch.empty_like(q),
+        words.new_empty((q.shape[0], MAX_SELECTED, 128)),
+        scales.new_empty((q.shape[0], MAX_SELECTED)),
+        words.new_empty((q.shape[0],)),
+    )
+
+
 def _fake_wo_a(x, weight, scale):
     return x.new_empty((x.shape[0], weight.shape[1]))
 
@@ -241,6 +321,8 @@ _DEFINITIONS = {
     "publish_main": (_publish_main, _fake_publish_main, (0, 1)),
     "attend_swa": (_attend_swa, _fake_attend, ()),
     "attend_main": (_attend_main, _fake_attend, ()),
+    "gather_attend": (_gather_attend, _fake_gather_attend, ()),
+    "attend_prepared": (_attend_prepared, _fake_attend, ()),
     "wo_a": (_wo_a, _fake_wo_a, ()),
 }
 
@@ -339,6 +421,8 @@ def attention(
     main: (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int] | None
     ) = None,
+    *,
+    gathered: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """CSA2 attention; returns ``[T, H, 512]`` BF16 with inverse RoPE applied.
 
@@ -361,6 +445,22 @@ def attention(
         raise ValueError(f"cos_sin must be [max_position, {ROPE_DIM}]")
     cos_sin = cos_sin.float()
     common = (_i32(query_start_loc), _i32(positions), sink.float(), cos_sin)
+    if gathered is not None:
+        if main is not None:
+            raise ValueError("main and gathered are mutually exclusive")
+        return attend_prepared(
+            q,
+            swa_pages,
+            swa_meta,
+            None,
+            query_start_loc,
+            positions,
+            sink,
+            cos_sin,
+            compress_ratio,
+            scale,
+            gathered,
+        )
     if main is None:
         return _op("attend_swa")(q, swa_pages, *common, _i32(swa_meta), float(scale))
     if not compress_ratio:
@@ -378,6 +478,98 @@ def attention(
         *common,
         _i32(swa_meta),
         int(main_page_records),
+        int(compress_ratio),
+        float(scale),
+    )
+
+
+def gather_attend(
+    q: torch.Tensor,
+    swa_pages: torch.Tensor,
+    swa_meta: torch.Tensor,
+    swa_bounds: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    sink: torch.Tensor,
+    cos_sin: torch.Tensor,
+    compress_ratio: int,
+    scale: float,
+    main: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Attention plus query-local INT32 [T,512,128] words, FP32 [T,512]
+    scales and INT32 [T] valid counts. Read-only outputs may be reused only
+    while the source pool and selected ids remain unchanged in this forward.
+    """
+    del swa_bounds
+    if compress_ratio <= 0:
+        raise ValueError("main KV requires a positive compress_ratio")
+    if cos_sin.dim() != 2 or cos_sin.shape[1] != ROPE_DIM:
+        raise ValueError(f"cos_sin must be [max_position, {ROPE_DIM}]")
+    words, scales, selected, pages, page_records = main
+    if selected.shape != (q.shape[0], MAX_SELECTED):
+        raise ValueError(f"gather_attend requires [T, {MAX_SELECTED}] selected ids")
+    if not q.shape[0]:
+        return _fake_gather_attend(q, words, scales)
+    return _op("gather_attend")(
+        q,
+        words,
+        scales,
+        _i32(selected),
+        _i32(pages),
+        swa_pages,
+        _i32(query_start_loc),
+        _i32(positions),
+        sink.float(),
+        cos_sin.float(),
+        _i32(swa_meta),
+        int(page_records),
+        int(compress_ratio),
+        float(scale),
+    )
+
+
+def attend_prepared(
+    q: torch.Tensor,
+    swa_pages: torch.Tensor,
+    swa_meta: torch.Tensor,
+    swa_bounds: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    sink: torch.Tensor,
+    cos_sin: torch.Tensor,
+    compress_ratio: int,
+    scale: float,
+    gathered: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Attend to a gathered payload with its exact prepared valid counts.
+
+    SWA, Q, sink and RoPE remain layer-local; none are cached with main KV.
+    """
+    del swa_bounds
+    if compress_ratio <= 0:
+        raise ValueError("gathered KV requires a positive compress_ratio")
+    if cos_sin.dim() != 2 or cos_sin.shape[1] != ROPE_DIM:
+        raise ValueError(f"cos_sin must be [max_position, {ROPE_DIM}]")
+    words, scales, counts = gathered
+    if (
+        words.shape != (q.shape[0], MAX_SELECTED, 128)
+        or scales.shape != (q.shape[0], MAX_SELECTED)
+        or counts.shape != (q.shape[0],)
+    ):
+        raise ValueError("invalid gathered KV shapes")
+    if not q.shape[0]:
+        return torch.empty_like(q)
+    return _op("attend_prepared")(
+        q,
+        words,
+        scales,
+        _i32(counts),
+        swa_pages,
+        _i32(query_start_loc),
+        _i32(positions),
+        sink.float(),
+        cos_sin.float(),
+        _i32(swa_meta),
         int(compress_ratio),
         float(scale),
     )

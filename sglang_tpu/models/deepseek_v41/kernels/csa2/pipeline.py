@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Source: vllm-torchtpu epic dc1cd126e71c2248f3fbf2bef0d8d24e1e3768d7
 """Overlap independent SparseCore gathers and TensorCore CSA2 query chunks."""
 
 import functools
@@ -122,7 +123,9 @@ def csa2_pipeline(
         elif end < q.shape[0]:
             # Otherwise the scheduler can gather chunk 1 before chunk 0 and
             # wait for both before starting the first attention invocation.
-            current, next_ids = jax.lax.optimization_barrier((current, next_ids))
+            # Gating on q too keeps gather 1 beside attention 0: issued any
+            # earlier, it competes with the Q projection for HBM bandwidth.
+            current, next_ids, q = jax.lax.optimization_barrier((current, next_ids, q))
         following = (
             gather_csa2_kv_sc(words, scales, next_ids, deep=deep_gather)
             if end < q.shape[0]

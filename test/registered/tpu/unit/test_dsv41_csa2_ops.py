@@ -91,6 +91,24 @@ def _decode_main(words, scales):
     return values.view(ml_dtypes.float8_e4m3fn).astype(np.float32) * scales[:, None]
 
 
+def _pack_swa(tokens):
+    """BF16 [P,64,512] -> flat INT32 [P*128,128] owner.
+
+    Word feature f holds token 2k's BF16 bits in low16 and token 2k+1's
+    bits in high16; each pair's 512 features span four consecutive word rows.
+    This is not a contiguous BF16-to-INT32 view (which would pair features).
+    """
+    bits = tokens.view(np.uint16).reshape(-1, 2, 512).astype(np.uint32)
+    return (bits[:, 0] | (bits[:, 1] << 16)).view(np.int32).reshape(-1, 128)
+
+
+def _unpack_swa(words):
+    """Flat INT32 word owner -> logical BF16 [P*64,512] token rows."""
+    bits = words.view(np.uint32).reshape(-1, 512)
+    halves = np.stack((bits & 65535, bits >> 16), axis=1).astype(np.uint16)
+    return halves.view(ml_dtypes.bfloat16).reshape(-1, 512)
+
+
 def _tpu_info_patch():
     from sglang_tpu import pallas_export
 
@@ -114,11 +132,11 @@ def _bridge_examples():
     table = ((_BATCH, _COLUMNS), i32)
     starts = ((_BATCH + 1,), i32)
     positions = ((_TOKENS,), i32)
-    pages = ((20, 64, 512), ml_dtypes.bfloat16)
+    pages = ((20 * 128, 128), i32)
     q = ((_TOKENS, 16, 512), ml_dtypes.bfloat16)
     common = (starts, positions, ((16,), np.float32), ((MAX_POSITION, 64), np.float32))
     meta = ((_BATCH, 2 + ops.swa_metadata_columns(_TOKENS)), i32)
-    return {
+    examples = {
         "swa_metadata": ((table, starts, positions, ((_BATCH,), i32)), ()),
         "publish_swa": ((pages, positions, ((_TOKENS, 512), ml_dtypes.bfloat16)), ()),
         "publish_main": (
@@ -153,6 +171,20 @@ def _bridge_examples():
             (),
         ),
     }
+    examples["gather_attend"] = examples["attend_main"]
+    examples["attend_prepared"] = (
+        (
+            q,
+            ((_TOKENS, 512, 128), i32),
+            ((_TOKENS, 512), np.float32),
+            ((_TOKENS,), i32),
+            pages,
+            *common,
+            meta,
+        ),
+        (_RATIO, SCALE),
+    )
+    return examples
 
 
 def _torch_dtype(dtype):
@@ -495,7 +527,7 @@ def _inputs(case):
         "starts": case.starts,
         "positions": case.positions,
         "minimum": case.minimum,
-        "swa_pages": case.swa_pages,
+        "swa_pages": _pack_swa(case.swa_pages),
         "new_kv": case.new_kv,
         "q": case.q,
         "sink": case.sink,
@@ -516,7 +548,10 @@ def _inputs(case):
 def _check(case, inputs, out, swa_records):
     rows = case.starts[-1]
     records = _host(swa_records)
-    pages = _host(inputs["swa_pages"]).reshape(-1, 512)
+    owner = _host(inputs["swa_pages"])
+    assert owner.shape == (case.swa_pages.shape[0] * 128, 128)
+    assert owner.dtype == np.int32
+    pages = _unpack_swa(owner)
     expected_records = np.array(
         [case.swa_table[b, p // 64] * 64 + p % 64 for _, b, p in case._rows()]
     )
@@ -524,14 +559,9 @@ def _check(case, inputs, out, swa_records):
     np.testing.assert_array_equal(records[rows:], -1)
     # New rows landed; history rows, including odd-partner halves, survived.
     np.testing.assert_array_equal(pages[expected_records], case.new_kv[:rows])
-    np.testing.assert_array_equal(
-        pages.reshape(case.swa_pages.shape),
-        np.where(
-            np.isin(np.arange(pages.shape[0]), expected_records)[:, None],
-            pages,
-            case.swa_pages.reshape(-1, 512),
-        ).reshape(case.swa_pages.shape),
-    )
+    expected_pages = case.swa_pages.copy()
+    expected_pages.reshape(-1, 512)[expected_records] = case.new_kv[:rows]
+    np.testing.assert_array_equal(owner, _pack_swa(expected_pages))
     words = scales = None
     if case.ratio:
         words, scales = _host(inputs["words"]), _host(inputs["scales"])
@@ -570,6 +600,28 @@ def test_attention_matches_dense_reference(tpu_ops, phase, ratio):
     inputs = _inputs(case)
     out, swa_records = _step(case, inputs)
     _check(case, inputs, out, swa_records)
+
+
+@requires_tpu
+def test_swa_publication_preserves_paired_neighbors(tpu_ops):
+    """Updating either token half must preserve its nonzero adjacent neighbor.
+
+    Unsorted records also update both halves of one pair in the same call;
+    null-page, negative and out-of-capacity records must not alter any word.
+    """
+    rng = np.random.default_rng(21)
+    before = rng.normal(size=(3, 64, 512)).astype(ml_dtypes.bfloat16)
+    records = np.array([65, 68, 67, 64, -1, 0, 63, 192], np.int32)
+    values = rng.normal(size=(len(records), 512)).astype(ml_dtypes.bfloat16)
+    expected = before.copy()
+    # 64/65 share a pair; 67 and 68 leave opposite-parity neighbors 66/69.
+    expected.reshape(-1, 512)[records[:4]] = values[:4]
+    owner = _device(_pack_swa(before))
+    owner.copy_(ops.publish_swa(owner, _device(records), _device(values)))
+    actual = _host(owner)
+    assert actual.shape == (3 * 128, 128) and actual.dtype == np.int32
+    np.testing.assert_array_equal(actual, _pack_swa(expected))
+    np.testing.assert_array_equal(_unpack_swa(actual), expected.reshape(-1, 512))
 
 
 @requires_tpu

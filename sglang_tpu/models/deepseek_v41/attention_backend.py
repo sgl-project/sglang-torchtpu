@@ -117,6 +117,14 @@ class LowRatioMetadata(NamedTuple):
     index_pages: torch.Tensor
 
 
+class GatheredMainGroup(NamedTuple):
+    source_layer_id: int
+    selected: torch.Tensor
+    # Ratio and physical main-page geometry; no device scalar reads for keys.
+    layout: tuple[int, int]
+    payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
 # A dataclass like DSV4TPUForwardMetadata: layers set fields on it inside the
 # compiled forward, where msgspec.Struct mutation is untested.
 @dataclass
@@ -152,6 +160,9 @@ class DSV41TPUForwardMetadata:
     selected: Dict[int, torch.Tensor] = field(default_factory=dict)
     # Candidate blocks published by config.candidate_source_layer_id.
     candidates: Optional[torch.Tensor] = None
+    # One live gathered group, never a per-layer collection of large payloads.
+    # A new metadata instance at every forward releases the previous step's KV.
+    gathered_main: GatheredMainGroup | None = None
 
 
 def _as_cpu_int64(values, length: int) -> torch.Tensor:
@@ -372,10 +383,11 @@ class DSV41TPUAttnBackend(AttentionBackend):
     @staticmethod
     def _register_ops():
         # Registration must precede torch.compile tracing.
-        from sglang_tpu.models.deepseek_v41.ops import csa2, indexer
+        from sglang_tpu.models.deepseek_v41.ops import csa2, indexer, preprocess
 
         csa2.register_csa2_ops()
         indexer.register_indexer_ops()
+        preprocess.register_ops()
         return csa2, indexer
 
     def _prewarm_model_caches(self) -> None:
@@ -461,10 +473,18 @@ class DSV41TPUAttnBackend(AttentionBackend):
         if layer.layer_id not in self.rope_tables:
             self.rope_tables[layer.layer_id] = rope_table(layer.freqs_cis)
         q_lora = layer.q_norm(q_lora)
-        q, _ = layer.wq_b(q_lora)
-        q = apply_rope(
-            q.view(-1, layer.n_local_heads, layer.head_dim), positions, layer.freqs_cis
-        )
+        qb = getattr(layer, "_dsv41_qb", None)
+        if qb is not None:
+            from sglang_tpu.models.deepseek_v41.ops.preprocess import qb_rope
+
+            q = qb_rope(
+                q_lora, qb.weight, qb.scale, self.rope_tables[layer.layer_id], positions
+            )
+        else:
+            q, _ = layer.wq_b(q_lora)
+            q = apply_rope(
+                q.view(-1, layer.n_local_heads, layer.head_dim), positions, layer.freqs_cis
+            )
         if qkv_a is not None:
             kv = qkv_a[..., layer.q_lora_rank :]
         else:
@@ -532,6 +552,11 @@ class DSV41TPUAttnBackend(AttentionBackend):
             )
 
         latent = apply_rope(latent, group_pos, layer.freqs_cis)
+        group = metadata.gathered_main
+        if group is not None and group.source_layer_id == pool.source_layer_of(
+            layer.layer_id
+        ):
+            metadata.gathered_main = None
         words, scales = pool.get_main_kv(layer.layer_id)
         new_words, new_scales = self.csa2_ops.publish_main(
             words, scales, records, latent
@@ -613,6 +638,15 @@ class DSV41TPUAttnBackend(AttentionBackend):
             selected = F.pad(
                 selected, (0, SELECTION_WIDTH - selected.shape[1]), value=-1
             )
+        # Selections are newly published tensors, not mutated in place. Identity
+        # comparison keeps the cache key on the host without reading tensor data.
+        group = metadata.gathered_main
+        if (
+            group is not None
+            and group.layout[0] == ratio
+            and group.selected is not selected
+        ):
+            metadata.gathered_main = None
         metadata.selected[ratio] = selected
 
     # ------------------------------------------------------------------ #
@@ -684,23 +718,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             sink = torch.zeros(q.shape[1], dtype=torch.float32, device=q.device)
         else:
             sink = attn_sink[: q.shape[1]].float().contiguous()
-        main = None
-        if compress_ratio:
-            selected = metadata.selected.get(compress_ratio)
-            if selected is None:
-                raise RuntimeError(
-                    f"layer {layer_id} (ratio {compress_ratio}) attends before its "
-                    "index source selected"
-                )
-            words, scales = pool.get_main_kv(layer_id)
-            main = (
-                words,
-                scales,
-                selected,
-                metadata.full_pages,
-                pool.main_page_records(layer_id),
-            )
-        out = self.csa2_ops.attention(
+        common = (
             q.contiguous(),
             swa,
             metadata.swa_meta,
@@ -711,6 +729,37 @@ class DSV41TPUAttnBackend(AttentionBackend):
             self.rope_tables[layer_id],
             compress_ratio,
             float(layer.scaling),
-            main=main,
         )
+        if compress_ratio:
+            selected = metadata.selected.get(compress_ratio)
+            if selected is None:
+                raise RuntimeError(
+                    f"layer {layer_id} (ratio {compress_ratio}) attends before its "
+                    "index source selected"
+                )
+            source = pool.source_layer_of(layer_id)
+            layout = (compress_ratio, pool.main_page_records(layer_id))
+            group = metadata.gathered_main
+            if (
+                group is not None
+                and group.source_layer_id == source
+                and group.selected is selected
+                and group.layout == layout
+            ):
+                out = self.csa2_ops.attend_prepared(*common, gathered=group.payload)
+            else:
+                # Drop the old owner before allocating a replacement. Only one
+                # source/selection group survives between layer invocations.
+                metadata.gathered_main = None
+                group = None
+                words, scales = pool.get_main_kv(layer_id)
+                main = (words, scales, selected, metadata.full_pages, layout[1])
+                out, gw, gs, counts = self.csa2_ops.gather_attend(*common, main=main)
+                metadata.gathered_main = GatheredMainGroup(
+                    source, selected, layout, (gw, gs, counts)
+                )
+        else:
+            # Ratio-0 attention never creates or consumes gathered main KV.
+            out = self.csa2_ops.attention(*common)
+
         return out.masked_fill(~metadata.valid[:, None, None], 0)

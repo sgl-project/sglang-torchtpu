@@ -5,7 +5,9 @@ Keeps the core DeepSeekV4TokenToKVPool control plane (full and SWA allocators,
 full_to_swa_index_mapping, kv_source layer sharing, ratio-2 pair state) and swaps
 only the physical buffers for the shapes the V4.1 Pallas kernels read:
 
-- SWA, every layer: bf16 [ceil((swa_size + 256) / 64), 64, 512]; page = swa_loc // 64.
+- SWA, every layer: int32 [ceil((swa_size + 256) / 64) * 128, 128];
+  two word rows per BF16 token, page = swa_loc // 64. Flat base owners are
+  reshaped to physical pages only inside JAX, preserving TorchTPU donation.
 - Main KV, kv_source layers: FP8 latent words int32 [R, 128] + fp32 scales [R];
   record = full_loc // r, R = ceil((full_size + 256) / 256) * (256 // r), so a main
   page holds 256 // r records and its id is the full page id.
@@ -84,7 +86,11 @@ def uses_dsv41_pool(compress_ratios: Sequence[int]) -> bool:
 
 
 class DSV41TPUSWAKVPool(DeepSeekV4SingleKVPool):
-    """Per-layer bf16 SWA pages [num_pages, 64, 512]."""
+    """Per-layer flat SWA word owners [num_pages * 128, 128].
+
+    Matches epic/dsv41 dc1cd126e's paired-token BF16 packing. The logical
+    allocator and byte budget are unchanged; the JAX bridge forms page views.
+    """
 
     def __init__(
         self,
@@ -111,9 +117,12 @@ class DSV41TPUSWAKVPool(DeepSeekV4SingleKVPool):
 
     def _create_buffers(self) -> None:
         self.kv_cache_total_dim = SWA_BYTES_PER_TOKEN
-        shape = (self.num_pages, self.page_size, LATENT_DIM)
+        # A pair of 512-feature BF16 tokens occupies four INT32[128]
+        # rows. Keep the owner flat: passing a Torch view to a donated op
+        # would prevent TorchTPU from safely aliasing the original allocation.
+        shape = (self.num_pages * self.page_size * 2, WORD_LANES)
         self.kv_buffer = [
-            _zeros_kv_buffer(shape, torch.bfloat16, self.device)
+            _zeros_kv_buffer(shape, torch.int32, self.device)
             for _ in range(self.layer_num)
         ]
 
@@ -496,7 +505,7 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     # ------------------------------------------------------------------ #
 
     def get_swa_pages(self, layer_id: int) -> torch.Tensor:
-        """bf16 [num_swa_pages64, 64, 512]."""
+        """Base INT32 [num_swa_pages64 * 128, 128] owner (not a page view)."""
         self.wait_layer_transfer(layer_id)
         return self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
 

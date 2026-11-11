@@ -30,6 +30,18 @@ class DSV41RunaiModelStreamerLoader(RunaiModelStreamerLoader):
         super().__init__(load_config)
         self._primary_model_config = model_config
 
+    def load_model(self, *, model_config, device_config):
+        # Quant-method postprocessing establishes canonical TPU FP8 [K,N]
+        # weights. Binding earlier (model.post_load_weights) sees checkpoint
+        # block scales instead, and would silently miss the fused QB path.
+        model = super().load_model(
+            model_config=model_config, device_config=device_config
+        )
+        from sglang_tpu.models.deepseek_v41.preprocess import bind_model_preprocessing
+
+        bind_model_preprocessing(model)
+        return model
+
     def _get_weights_iterator(self, source):
         config = getattr(source.model_config, "hf_config", None)
         if (

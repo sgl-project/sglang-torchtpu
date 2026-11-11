@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU unit tests for the DeepSeek-V4.1 TPU KV pool.
 
-Guards the physical geometry the V4.1 Pallas kernels read (SWA bf16 pages of 64,
+Guards the physical geometry the V4.1 Pallas kernels read (SWA word pages of 64,
 FP8 main-KV records, packed FP8 indexer pages of 128), kv_source layer sharing,
 that every allocatable full / SWA location addresses a valid record or page, the
 byte budget against what is allocated, and the ratio-2 pair-state slot reset.
@@ -95,8 +95,8 @@ class TestDSV41TPUPoolGeometry(CustomTestCase):
     def test_swa_pages_every_layer(self):
         bufs = [self.pool.get_swa_pages(layer) for layer in range(len(RATIOS))]
         for buf in bufs:
-            self.assertEqual(buf.dtype, torch.bfloat16)
-            self.assertEqual(tuple(buf.shape), (EXPECTED_SWA_PAGES, 64, 512))
+            self.assertEqual(buf.dtype, torch.int32)
+            self.assertEqual(tuple(buf.shape), (EXPECTED_SWA_PAGES * 128, 128))
             self.assertIsNone(buf._base)
         self.assertEqual(len({buf.data_ptr() for buf in bufs}), len(RATIOS))
         self.assertEqual(self.pool.swa_kv_pool.page_size, 64)
@@ -226,8 +226,12 @@ class TestDSV41TPUPoolAddressing(CustomTestCase):
         swa_page = swa_loc // 64
         for layer in (0, 2, 39):
             pages = self.pool.get_swa_pages(layer)
-            self.assertLess(swa_page, pages.shape[0])
-            pages[swa_page, swa_loc % 64] = 1.0
+            self.assertLess(swa_page, pages.shape[0] // 128)
+            # A token pair owns four word rows, including the highest
+            # feature row. Both token halves must address the same pair.
+            last_word_row = (swa_loc // 2) * 4 + 3
+            self.assertLess(last_word_row, pages.shape[0])
+            pages[last_word_row] = 1
         # Page 0 holds only the reserved logical page, so it stays the null page.
         self.assertGreaterEqual(
             int(self.allocator.swa_attn_allocator.free_pages.min()), 1

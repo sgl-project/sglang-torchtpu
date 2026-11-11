@@ -282,6 +282,9 @@ class _PairPool:
     def get_attention_compress_states(self, layer_id):
         return self.state
 
+    def source_layer_of(self, layer_id):
+        return 2
+
     def get_main_kv(self, layer_id):
         return self.words, self.scales
 
@@ -415,6 +418,8 @@ class TestDSV41Ratio2AcrossChunks(CustomTestCase):
         backend = _make_backend(pool, low_ratios=(1,))
         backend.csa2_ops = ops
         batch = _prefill_batch()
+        backend.init_forward_metadata(batch)
+        backend.forward_metadata.gathered_main = SimpleNamespace(source_layer_id=2)
         x = torch.randn(16, HIDDEN).to(torch.bfloat16)
         backend.forward_low_ratio_sources(
             layer=layer,
@@ -423,6 +428,7 @@ class TestDSV41Ratio2AcrossChunks(CustomTestCase):
             positions=batch.positions,
             forward_batch=batch,
         )
+        self.assertIsNone(backend.forward_metadata.gathered_main)
         self.assertEqual(ops.main_writes, batch.out_cache_loc[:15].tolist())
         latent = compressor.finish(compressor.project(x[3:4])[0])
         expected = rope_tail(latent, layer.freqs_cis[batch.positions[3:4]], 64)
@@ -516,6 +522,19 @@ class _CSA2Stub:
         self.swa_records = records.clone()
         return pages.clone()
 
+    def gather_attend(self, *args, main):
+        out = self.attention(*args, main=main)
+        q = args[0]
+        return (
+            out,
+            q.new_zeros((q.shape[0], 512, 128)),
+            q.new_zeros((q.shape[0], 512)),
+            torch.zeros(q.shape[0], dtype=torch.int32),
+        )
+
+    def attend_prepared(self, *args, gathered):
+        return self.attention(*args)
+
     def attention(
         self,
         q,
@@ -535,16 +554,103 @@ class _CSA2Stub:
         return torch.ones_like(q)
 
 
+class _PayloadCSA2Stub(_CSA2Stub):
+    """Boundary reference: gathered rows are immutable snapshots, not pool aliases."""
+
+    def __init__(self):
+        super().__init__()
+        self.gathers = 0
+        self.reuses = 0
+
+    def gather_attend(self, *args, main):
+        self.gathers += 1
+        words, scales, selected, _, _ = main
+        live = selected >= 0
+        payload = words[selected.clamp_min(0).long(), :1].clone()
+        payload = payload.masked_fill(~live[..., None], 0)
+        counts = live.sum(-1).to(torch.int32)
+        gathered = (payload, scales[selected.clamp_min(0).long()].clone(), counts)
+        return self._result(args[0], gathered), *gathered
+
+    def _result(self, q, gathered):
+        words, _, counts = gathered
+        return q + words.sum((1, 2))[:, None, None] + counts[:, None, None]
+
+    def attend_prepared(self, *args, gathered):
+        self.reuses += 1
+        return self._result(args[0], gathered)
+
+
 class TestDSV41BackendWiring(CustomTestCase):
     def _backend(self):
         pool = _PairPool()
-        pool.swa = torch.zeros(4, 64, HEAD_DIM, dtype=torch.bfloat16)
+        pool.swa = torch.zeros(4 * 128, 128, dtype=torch.int32)
         pool.get_swa_pages = lambda layer_id: pool.swa
         pool.main_page_records = lambda layer_id: 256
         backend = _make_backend(pool)
         backend.indexer_ops = _IndexerStub()
         backend.csa2_ops = _CSA2Stub()
         return backend
+
+    def test_gathered_payload_reuse_and_invalidation(self):
+        """Shared-source layers consume snapshots; source/selection/layout/step
+        changes must not silently reuse stale payloads. Q remains layer-local.
+        """
+        backend = self._backend()
+        ops = _PayloadCSA2Stub()
+        backend.csa2_ops = ops
+        pool = backend.token_to_kv_pool
+        batch = _decode_batch()
+        backend.init_forward_metadata(batch)
+        meta = backend.forward_metadata
+        selected = torch.full((4, 512), -1, dtype=torch.int32)
+        selected[:, :2] = torch.tensor([1, 2])
+        meta.selected[1] = selected
+        pool.words[1:3] = 3
+        layer = SimpleNamespace(layer_id=3, scaling=0.04, v_head_dim=HEAD_DIM)
+        backend.rope_tables[3] = torch.zeros(1024, 64)
+        backend.rope_tables[4] = torch.zeros(1024, 64)
+        q = torch.zeros(4, 8, HEAD_DIM)
+        kv = torch.zeros(4, HEAD_DIM)
+
+        def attend(value=0, ratio=1):
+            return backend.forward(
+                q + value, kv, kv, layer, batch, compress_ratio=ratio
+            )
+
+        def check(out, expected):
+            torch.testing.assert_close(out[:2], torch.full_like(out[:2], expected))
+            self.assertTrue(torch.all(out[2:] == 0))
+
+        check(attend(), 8)  # two records of value 3, plus exact count 2
+        owner = meta.gathered_main
+        pool.words[1:3] = 9  # snapshot must not alias its source pool
+        layer.layer_id = 4  # same pool source, distinct attention/Q
+        check(attend(1), 9)
+        self.assertIs(meta.gathered_main, owner)
+        self.assertEqual((ops.gathers, ops.reuses), (1, 1))
+        check(attend(ratio=0), 1)
+        self.assertIs(meta.gathered_main, owner)
+
+        # Equal values in a new selection still require a fresh gather.
+        meta.selected[1] = selected.clone()
+        check(attend(), 20)
+        self.assertEqual(ops.gathers, 2)
+        pool.source_layer_of = lambda layer_id: 4
+        pool.words[1:3] = 11
+        check(attend(), 24)
+        self.assertEqual(ops.gathers, 3)
+        pool.main_page_records = lambda layer_id: 128
+        pool.words[1:3] = 12
+        check(attend(), 26)
+        self.assertEqual(ops.gathers, 4)
+
+        backend.init_forward_metadata(batch)
+        self.assertIsNone(backend.forward_metadata.gathered_main)
+        backend.forward_metadata.selected[1] = selected
+        pool.words[1:3] = 13
+        check(attend(), 28)
+        self.assertEqual(ops.gathers, 5)
 
     def test_candidate_publish_and_consume(self):
         backend = self._backend()
