@@ -21,8 +21,6 @@ def _capacity_for_shape(
     dtype_q,
     dtype_kv,
     layout,
-    no_max=False,
-    transposed=False,
 ):
     import jax.numpy as jnp
     from jax.experimental.pallas import tpu as pltpu
@@ -49,8 +47,6 @@ def _capacity_for_shape(
             dtype_kv=jnp.dtype(dtype_kv),
             dtype_out=jnp.dtype(dtype_q),
             kv_layout=layout,
-            no_max=no_max,
-            transposed=transposed,
         )
         vmem = pltpu.get_tpu_info().vmem_capacity_bytes
         decode, mixed = calculate_block_sizes(model, serve, vmem)
@@ -77,12 +73,9 @@ def capacity_for_batch(
     runner, backend, *, mode, num_seqs, total_q_tokens, attn_tp_size=1
 ):
     """Use the kernel's actual padded batch shape, dtype, layout and tile choice."""
-    from sglang_tpu.attention.pallas.batched_rpa import configs
     from sglang_tpu.attention_pallas_rpa_batched import kv_layout
-    from sglang_tpu.envs import envs as tpu_envs
 
     config = runner.model_config
-    layout = kv_layout()
     return _capacity_for_shape(
         mode,
         config.get_num_attention_heads(attn_tp_size),
@@ -94,13 +87,7 @@ def capacity_for_batch(
         backend.page_size,
         str(config.dtype).removeprefix("torch."),
         str(runner.token_to_kv_pool.dtype).removeprefix("torch."),
-        layout,
-        no_max=tpu_envs.SGLANG_TPU_RPA_NO_MAX.get(),
-        transposed=(
-            tpu_envs.SGLANG_TPU_RPA_TRANSPOSED.get()
-            and layout == configs.KVLayout.SEQ_ALONG_LANE
-            and config.head_dim <= 64
-        ),
+        kv_layout(),
     )
 
 

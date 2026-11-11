@@ -154,8 +154,6 @@ class TestAccuracyRecipes(unittest.TestCase):
         "recipe/configs/gpt_oss_120b/accuracy_gpqa.py",
         "recipe/configs/gpt_oss_120b/accuracy_gsm8k.py",
         "recipe/configs/gpt_oss_120b/accuracy_mmlupro.py",
-        "recipe/configs/muse_spark/agentx_c1.py",
-        "recipe/configs/muse_spark/agentx_c22.py",
     )
 
     def test_multihost_rank_resolves_from_jobset_topology(self):

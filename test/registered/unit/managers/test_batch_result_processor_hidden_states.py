@@ -234,7 +234,6 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                     spec_info=None,
                     prefill_stats=None,
                     dp_cooperation_info=None,
-                    mix_verify_tails=0,
                 )
                 result = SimpleNamespace(
                     copy_done=None,
@@ -289,7 +288,6 @@ class TestPrefillSkippedOutput(CustomTestCase):
             spec_info=None,
             prefill_stats=None,
             dp_cooperation_info=None,
-            mix_verify_tails=0,
         )
         result = SimpleNamespace(
             copy_done=None,

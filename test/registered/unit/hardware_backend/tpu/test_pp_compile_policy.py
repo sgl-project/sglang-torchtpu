@@ -261,7 +261,6 @@ class TestLogitsProcessorGating(CustomTestCase):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             batch_size=4,
             logits_output_mode=LogitsOutputMode.DISTRIBUTED_TOP_K,
-            mix_verify_width=1,
         )
         key = policy._direct_compile_specialization_key(
             None, torch.zeros(64), None, forward_batch

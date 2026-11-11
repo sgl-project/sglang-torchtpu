@@ -21,9 +21,6 @@ from sglang_tpu.disaggregation.raiden.reshard_schedule import (
 # index on the lane axis, so one kv-head is a single contiguous run of a page.
 # A block-major bundle (rank 6) holds every layer of a page in one row:
 #   [num_blocks, layer_num, page_size, kv_heads_packed, kv_packing, head_dim]
-# The SEQ_ALONG_LANE pool is rank 5 like the fused one, so it is named by its pool
-# (RaidenKVCacheGroups.seq_along_lane), never by rank:
-#   [num_blocks, 2 * kv_heads, head_dim // kv_packing, kv_packing, page_size]
 _FUSED_KV_RANK = 5
 _HEAD_MAJOR_KV_RANK = 4
 _BLOCK_MAJOR_KV_RANK = 6
@@ -51,40 +48,10 @@ def is_draft_pool(tag: str) -> bool:
     return pool_kind(tag).startswith("draft.")
 
 
-def is_hidden_pool(tag: str) -> bool:
-    return pool_kind(tag).startswith("pdhid.")
-
-
-def pool_is_seq_along_lane(tag: str, seq_along_lane: bool) -> bool:
-    """Whether pool tag holds SEQ_ALONG_LANE pages; the PD hidden pool is always
-    fused (pd_hidden_pool.py)."""
-    return seq_along_lane and not is_hidden_pool(tag)
-
-
-def seq_along_lane_head_run_bytes(tensor: Any) -> int:
-    """Bytes of one kv-head's K and V rows across a SEQ_ALONG_LANE page; head h is
-    axis-1 rows 2h and 2h + 1, so a range of heads is one contiguous run."""
-    if _kv_rank(tensor) != _FUSED_KV_RANK:
-        raise ValueError(
-            f"A SEQ_ALONG_LANE KV page tensor is rank 5, got {tuple(tensor.shape)}"
-        )
-    _, rows, hd_words, packing, page_size = (int(n) for n in tensor.shape)
-    # Host staging pads the token (lane) axis to whole 128-lane tiles; the pool's
-    # block_stride_bytes is unpadded, so other page sizes would misplace pages.
-    if page_size % 128:
-        raise ValueError(
-            "Raiden pipeline transfer of SEQ_ALONG_LANE KV needs a page size that "
-            f"is a multiple of 128, got {page_size}"
-        )
-    if rows % 2:
-        raise ValueError(f"SEQ_ALONG_LANE KV axis 1 holds K/V pairs, got {rows} rows")
-    return 2 * hd_words * packing * page_size * tensor.element_size()
-
-
-def _producer_tensor_kv_heads(tensor: Any, *, seq_along_lane: bool) -> int:
+def _producer_tensor_kv_heads(tensor: Any) -> int:
     """KV head count of a TP=1 producer page tensor when the pool omitted head_num."""
     rank = _kv_rank(tensor)
-    if rank == _HEAD_MAJOR_KV_RANK or seq_along_lane:
+    if rank == _HEAD_MAJOR_KV_RANK:
         return int(tensor.shape[1]) // 2
     if rank == _FUSED_KV_RANK:
         return int(tensor.shape[2]) * int(tensor.shape[3]) // 2
@@ -130,18 +97,15 @@ def head_slice_spans(
     dst_attn_tp: int,
     total_kv_heads: int,
     *,
-    seq_along_lane: bool,
     draft_total_kv_heads: int | None = None,
     draft_swa_total_kv_heads: int | None = None,
 ) -> list[Any]:
     """Describe each destination rank's kv-head slice of every locally owned
-    page: one strided span per page and rank, routed to that rank only.
-    seq_along_lane says the target and draft pools are TpuSeqAlongLaneKVPool."""
+    page: one strided span per page and rank, routed to that rank only."""
     result = []
     for pool, tensor in zip(pools, tensors):
         tag = pool["tag"]
         blocks = swa if is_swa_pool(tag) else full
-        sal = pool_is_seq_along_lane(tag, seq_along_lane)
         if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
             raise ValueError(
                 "A block-major KV bundle moves whole page rows; a "
@@ -159,29 +123,18 @@ def head_slice_spans(
             pool_kv_heads = (
                 int(draft_heads)
                 if draft_heads is not None
-                else _producer_tensor_kv_heads(tensor, seq_along_lane=sal)
+                else _producer_tensor_kv_heads(tensor)
             )
         else:
             pool_kv_heads = total_kv_heads
-        if sal or _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
-            if sal:
-                run = seq_along_lane_head_run_bytes(tensor)
-            else:
-                run = 2 * int(tensor.shape[2]) * int(tensor.shape[3])
-                run *= tensor.element_size()
-            # A TP=1 producer holds every head; anything else slices garbage.
-            if int(tensor.shape[1]) != 2 * pool_kv_heads:
-                raise ValueError(
-                    f"Raiden pipeline pool {tag} of shape {tuple(tensor.shape)} "
-                    f"does not hold all {pool_kv_heads} kv-heads"
-                )
+        if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             result.append(
-                _head_run_slice_spans(
+                _head_major_slice_spans(
                     pool=pool,
+                    tensor=tensor,
                     blocks=blocks,
                     dst_attn_tp=dst_attn_tp,
                     total_kv_heads=pool_kv_heads,
-                    head_run_bytes=run,
                 )
             )
             continue
@@ -227,23 +180,17 @@ def head_slice_spans(
     return result
 
 
-def _head_run_slice_spans(
-    *,
-    pool: dict,
-    blocks: list[int],
-    dst_attn_tp: int,
-    total_kv_heads: int,
-    head_run_bytes: int,
+def _head_major_slice_spans(
+    *, pool: dict, tensor: Any, blocks: list[int], dst_attn_tp: int, total_kv_heads: int
 ) -> Any:
-    """Per-rank kv-head slices of head-major pages (rank-4 RPA-seq, SEQ_ALONG_LANE):
-    one span per page and rank.
+    """Per-rank kv-head slices of rank-4 RPA-seq pages: one span per page and rank.
 
-    num_heads heads from head are the contiguous bytes
-    [head * run, (head + num_heads) * run) of a page; the destination page
-    stores only that rank's heads. Packing rides head_dim, so FP8 takes any
-    head count per rank.
+    ``num_heads`` heads from ``head`` are the contiguous bytes
+    ``[head * run, (head + num_heads) * run)`` of a page, with
+    ``run = 2 * head_dim_lanes * page_size * element_size``; the destination
+    page stores only that rank's heads.
     """
-    run = head_run_bytes
+    run = 2 * int(tensor.shape[2]) * int(tensor.shape[3]) * tensor.element_size()
     spans = []
     for rank in range(dst_attn_tp):
         src_head, num_heads, dst_head, _, dst_heads_per_rank = head_slice_params(
@@ -330,7 +277,6 @@ def part_spans(
     dst_attn_tp: int,
     total_kv_heads: int,
     *,
-    seq_along_lane: bool,
     draft_total_kv_heads: int | None = None,
     draft_swa_total_kv_heads: int | None = None,
     with_swa: bool,
@@ -353,7 +299,6 @@ def part_spans(
         swa,
         dst_attn_tp,
         total_kv_heads,
-        seq_along_lane=seq_along_lane,
         draft_total_kv_heads=draft_total_kv_heads,
         draft_swa_total_kv_heads=draft_swa_total_kv_heads,
     )

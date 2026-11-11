@@ -105,7 +105,6 @@ def bundle_groups(full=(1, 3), swa=(0, 3), pages=64):
         num_draft_full=0,
         num_hidden_full=0,
         num_draft_swa=0,
-        seq_along_lane=False,
     )
 
 
@@ -118,7 +117,6 @@ def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer, draft_full=()):
         num_draft_full=len(draft_full),
         num_hidden_full=0,
         num_draft_swa=0,
-        seq_along_lane=False,
     )
 
 
@@ -137,7 +135,6 @@ def sent(expires=None, registered=True):
 
 def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=0):
     pipe = PipelineTransfer.__new__(PipelineTransfer)
-    pipe.seq_along_lane = False
     pipe.manager = SimpleNamespace(
         _state_lock=threading.Lock(),
         _aborted={},
@@ -340,9 +337,7 @@ class TestLayerPools(unittest.TestCase):
     def test_head_slice_spans_route_one_slice_per_rank(self):
         layers = groups(full=(6,), swa=(7,), buffer=Bf16Buffer)
         pools = pool_manifest(layers)
-        spans = head_slice_spans(
-            pools, layers.full + layers.swa, [20, 21], [30], 8, 8, seq_along_lane=False
-        )
+        spans = head_slice_spans(pools, layers.full + layers.swa, [20, 21], [30], 8, 8)
         self.assertEqual([len(entry.spans) for entry in spans], [16, 8])
         self.assertEqual(
             [entry.declared_bytes for entry in spans], [2 * 524288, 524288]
@@ -373,13 +368,7 @@ class TestLayerPools(unittest.TestCase):
         three 262144-byte pages reach a TP8 decode as 1572864 bytes."""
         layers = groups(full=(6,), swa=(), buffer=Bf16FourHeadBuffer)
         (entry,) = head_slice_spans(
-            pool_manifest(layers),
-            layers.full,
-            [20, 21, 22],
-            [],
-            8,
-            4,
-            seq_along_lane=False,
+            pool_manifest(layers), layers.full, [20, 21, 22], [], 8, 4
         )
         self.assertEqual(entry.declared_bytes, 1572864)
         self.assertEqual(
@@ -402,7 +391,7 @@ class TestLayerPools(unittest.TestCase):
         heads_per_rank = 8 // 4
         rank_bytes = heads_per_rank * 2 * head_dim * tensor.element_size()
         (entry,) = head_slice_spans(
-            pool_manifest(layers), layers.full, [20, 21], [], 4, 8, seq_along_lane=False
+            pool_manifest(layers), layers.full, [20, 21], [], 4, 8
         )
         self.assertEqual(len(entry.spans), 8)
         for span in entry.spans:
@@ -423,9 +412,7 @@ class TestLayerPools(unittest.TestCase):
     def test_partial_fp8_head_packs_are_rejected(self):
         layers = groups(full=(6,), swa=(), buffer=Fp8Buffer)
         with self.assertRaisesRegex(ValueError, "Partial FP8"):
-            head_slice_spans(
-                pool_manifest(layers), layers.full, [20], [], 8, 8, seq_along_lane=False
-            )
+            head_slice_spans(pool_manifest(layers), layers.full, [20], [], 8, 8)
 
     def test_fingerprint_ignores_the_per_rank_head_count(self):
         getter = lambda tensor: ((4, 3, 2, 1, 0), ((8, 128),), 8)
@@ -434,18 +421,10 @@ class TestLayerPools(unittest.TestCase):
         consumer.full[0].shape = (64, 128, 1, 2, 128)
         self.assertEqual(
             layout_fingerprint(
-                pool_manifest(producer),
-                producer.full,
-                getter,
-                ships_pd_hidden=False,
-                seq_along_lane=False,
+                pool_manifest(producer), producer.full, getter, ships_pd_hidden=False
             ),
             layout_fingerprint(
-                pool_manifest(consumer),
-                consumer.full,
-                getter,
-                ships_pd_hidden=False,
-                seq_along_lane=False,
+                pool_manifest(consumer), consumer.full, getter, ships_pd_hidden=False
             ),
         )
 
@@ -455,34 +434,21 @@ class TestLayerPools(unittest.TestCase):
         getter = lambda tensor: ((4, 3, 2, 1, 0), ((8, 128),), 8)
         self.assertEqual(
             layout_fingerprint(
-                pool_manifest(full),
-                full.full,
-                getter,
-                ships_pd_hidden=False,
-                seq_along_lane=False,
+                pool_manifest(full), full.full, getter, ships_pd_hidden=False
             ),
             layout_fingerprint(
-                pool_manifest(stage),
-                stage.full,
-                getter,
-                ships_pd_hidden=False,
-                seq_along_lane=False,
+                pool_manifest(stage), stage.full, getter, ships_pd_hidden=False
             ),
         )
         self.assertNotEqual(
             layout_fingerprint(
-                pool_manifest(full),
-                full.full,
-                getter,
-                ships_pd_hidden=False,
-                seq_along_lane=False,
+                pool_manifest(full), full.full, getter, ships_pd_hidden=False
             ),
             layout_fingerprint(
                 pool_manifest(stage),
                 stage.full,
                 lambda tensor: ((4, 3, 2, 1, 0), ((4, 128),), 8),
                 ships_pd_hidden=False,
-                seq_along_lane=False,
             ),
         )
 
@@ -495,18 +461,10 @@ class TestLayerPools(unittest.TestCase):
         decode = groups(full=(0, 1, 2), swa=(), draft_full=(0,))
         self.assertEqual(
             layout_fingerprint(
-                pool_manifest(stage),
-                stage.full,
-                getter,
-                ships_pd_hidden=False,
-                seq_along_lane=False,
+                pool_manifest(stage), stage.full, getter, ships_pd_hidden=False
             ),
             layout_fingerprint(
-                pool_manifest(decode),
-                decode.full,
-                getter,
-                ships_pd_hidden=False,
-                seq_along_lane=False,
+                pool_manifest(decode), decode.full, getter, ships_pd_hidden=False
             ),
         )
 
@@ -550,11 +508,7 @@ class TestBlockMajorBundlePools(unittest.TestCase):
 
         def fingerprint(layers, getter):
             return layout_fingerprint(
-                pool_manifest(layers),
-                layers.full,
-                getter,
-                ships_pd_hidden=False,
-                seq_along_lane=False,
+                pool_manifest(layers), layers.full, getter, ships_pd_hidden=False
             )
 
         five = fingerprint(bundle_groups(full=(1, 5), swa=()), self.BUNDLE_LAYOUT)
@@ -566,9 +520,7 @@ class TestBlockMajorBundlePools(unittest.TestCase):
     def test_bundle_rejects_tensor_parallel_consumers(self):
         layers = bundle_groups(swa=())
         with self.assertRaisesRegex(ValueError, "block-major"):
-            head_slice_spans(
-                pool_manifest(layers), layers.full, [20], [], 8, 8, seq_along_lane=False
-            )
+            head_slice_spans(pool_manifest(layers), layers.full, [20], [], 8, 8)
 
     def test_legacy_mirrors_size_a_bundle_as_its_row(self):
         layers = bundle_groups(swa=())
@@ -730,17 +682,11 @@ class TestPipelineLifetimes(unittest.TestCase):
         self.assertTrue(pipe.finalize_send(7, None))
         pipe.client.register_request_blocks.assert_not_called()
         request = [MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31003"]
-        pipe.on_message(
-            request
-            + [b'{"attn_tp_size": 8, "attn_tp_rank": 3, "seq_along_lane": false}']
-        )
+        pipe.on_message(request + [b'{"attn_tp_size": 8, "attn_tp_rank": 3}'])
         spans = pipe.client.register_request_blocks.call_args.kwargs["pool_spans"]
         self.assertEqual([len(entry.spans) for entry in spans], [16, 8])
         request[2] = b"tcp://decode:31000"
-        pipe.on_message(
-            request
-            + [b'{"attn_tp_size": 8, "attn_tp_rank": 0, "seq_along_lane": false}']
-        )
+        pipe.on_message(request + [b'{"attn_tp_size": 8, "attn_tp_rank": 0}'])
         pipe.client.register_request_blocks.assert_called_once()
         self.assertEqual(
             [call.args[0] for call in pipe._send.call_args_list],
@@ -773,9 +719,7 @@ class TestPipelineLifetimes(unittest.TestCase):
                     )
                 pipe.manager._prefill.send_blocks[7] = [20, 21]
                 pipe.replies[7] = {
-                    f"tcp://decode:{port}": dict(
-                        attn_tp_size=width, seq_along_lane=False
-                    )
+                    f"tcp://decode:{port}": dict(attn_tp_size=width)
                     for port, width in enumerate(widths)
                 }
                 self.assertFalse(pipe.finalize_send(7, None))
@@ -795,7 +739,7 @@ class TestPipelineLifetimes(unittest.TestCase):
             pipe.manager._state_lock.locked()
         )
         request = [MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31000"]
-        consumer = b'{"attn_tp_size": 1, "attn_tp_rank": 0, "seq_along_lane": false}'
+        consumer = b'{"attn_tp_size": 1, "attn_tp_rank": 0}'
         pipe.manager._prefill.send_blocks[7] = [20, 21]
         pipe.finalize_send(7, None)
         pipe.on_message(request + [consumer])
@@ -812,7 +756,7 @@ class TestPipelineLifetimes(unittest.TestCase):
         pipe = transfer(producer=True)
         pipe.manager._aborted[7] = time.time()
         pipe.manager._send_multipart_locked = Mock()
-        consumer = b'{"attn_tp_size": 1, "attn_tp_rank": 0, "seq_along_lane": false}'
+        consumer = b'{"attn_tp_size": 1, "attn_tp_rank": 0}'
         pipe.on_message(
             [MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31000", consumer]
         )
@@ -1295,7 +1239,6 @@ class TestDraftPoolGroups(unittest.TestCase):
             num_draft_full=1,
             num_hidden_full=1,
             num_draft_swa=0,
-            seq_along_lane=False,
         )
         pools = pool_manifest(layers)
         self.assertEqual(
@@ -1304,7 +1247,7 @@ class TestDraftPoolGroups(unittest.TestCase):
         for kwargs in ({"draft_total_kv_heads": 8}, {}):
             with self.subTest(kwargs=kwargs):
                 fa_entry, draft_entry, pdhid_entry = head_slice_spans(
-                    pools, layers.full, [20], [], 8, 16, **kwargs, seq_along_lane=False
+                    pools, layers.full, [20], [], 8, 16, **kwargs
                 )
                 for entry in (fa_entry, pdhid_entry):
                     for span in entry.spans:
@@ -1362,7 +1305,7 @@ class TestDraftPoolGroups(unittest.TestCase):
             hold_undeclared=False,
         )
         pipe.swa.client = swa_client
-        pipe.replies[7] = {0: {"attn_tp_size": 8, "seq_along_lane": False}}
+        pipe.replies[7] = {0: {"attn_tp_size": 8}}
         self.assertTrue(
             pipe._register_blocks(
                 7, req_id="7", uuid=7, full=[20], swa=[30], with_swa=True

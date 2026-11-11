@@ -170,12 +170,11 @@ class TreeComponent(ABC):
 
     def _refresh_session_partition(self, node: UnifiedTreeNode) -> None:
         ct = self.component_type
-        # Only partitioned lists move a node; a plain LRU keeps its recency.
         lru = self.tree_core.lru_lists[ct]
-        if lru.mid is not None and lru.in_list(node):
+        if lru.in_list(node):
             lru.reset_node_mru(node)
         host_lru = self.tree_core.host_lru_lists[ct]
-        if host_lru.mid is not None and host_lru.in_list(node):
+        if host_lru.in_list(node):
             host_lru.reset_node_mru(node)
 
     def _find_reusable_session_leaf(
@@ -284,13 +283,7 @@ class TreeComponent(ABC):
         for session_id in tuple(cd.session_ids or ()):
             leaves = self._session_leaves.get(session_id)
             assert leaves is not None and node in leaves
-            # session_release_evicted_leaf: an evicted leaf ends the coverage instead of
-            # receding it, so a session that stopped advancing stops protecting its path.
-            fallback = (
-                None
-                if getattr(self.tree_core, "session_release_evicted_leaf", False)
-                else self._find_reusable_session_leaf(node.parent)
-            )
+            fallback = self._find_reusable_session_leaf(node.parent)
             if fallback is not None and fallback in self._session_leaves.get(
                 session_id, ()
             ):

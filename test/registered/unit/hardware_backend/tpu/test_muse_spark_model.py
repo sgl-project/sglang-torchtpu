@@ -208,8 +208,6 @@ def _build_stub_text_stage(
         residual_gate_temperature=1.0,
     )
     stage.pp_group = SimpleNamespace(is_first_rank=is_first, is_last_rank=is_last)
-    stage.tp_size = 1
-    stage.prefill_sp_min_tokens = None
     stage.layers_to_capture = []
     stage._capture_slots_by_layer = {}
     stage.start_layer = start_layer
@@ -254,7 +252,7 @@ def _build_stub_text_stage(
         torch.nn.init.normal_(layer.post_feedforward_residual_gate.gate, std=0.5)
         layer.post_feedforward_residual_gate.precompute_coefficients()
 
-        def _fwd(positions, stream, forward_batch, sequence_parallel, lyr=layer):
+        def _fwd(positions, stream, forward_batch, lyr=layer):
             attn_in = lyr.input_layernorm(stream).to(torch.bfloat16)
             stream = lyr.post_attention_residual_gate(
                 stream,
@@ -475,8 +473,6 @@ class TestMuseSparkPipelineParallel(CustomTestCase):
             fake_parallel = SimpleNamespace(
                 pp_rank=pp_rank,
                 pp_size=8,
-                tp_rank=0,
-                tp_size=1,
                 pp_group=SimpleNamespace(
                     world_size=8,
                     rank_in_group=pp_rank,

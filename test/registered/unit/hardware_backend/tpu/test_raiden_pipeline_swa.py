@@ -189,7 +189,6 @@ class Domain:
 def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
     """A PipelineTransfer with its window link, built like __init__ would."""
     t = object.__new__(pl.PipelineTransfer)
-    t.seq_along_lane = False
     producer = mode == PREFILL
     mgr = harness.Manager(mode, rank if producer else 0, pp_size, world.bus, name)
     mgr.attn_tp_size, mgr.attn_tp_rank = (1, 0) if producer else (tp_size, rank)
@@ -209,7 +208,6 @@ def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
         num_draft_full=0,
         num_hidden_full=0,
         num_draft_swa=0,
-        seq_along_lane=False,
     )
     side = "p" if producer else "d"
     t.manager = mgr
@@ -424,7 +422,6 @@ def test_split_manifest_rebases_storage_indices():
         num_draft_full=0,
         num_hidden_full=0,
         num_draft_swa=0,
-        seq_along_lane=False,
     )
     full, swa = ps.split_manifest(pl.pool_manifest(groups))
     assert [(p["tag"], p["storage_index"], p["num_blocks"]) for p in full] == [
@@ -1122,7 +1119,6 @@ def hybrid_groups():
         num_draft_full=0,
         num_hidden_full=0,
         num_draft_swa=0,
-        seq_along_lane=False,
     )
 
 
@@ -1202,7 +1198,6 @@ def test_full_attention_only_stage_is_unchanged():
         num_draft_full=0,
         num_hidden_full=0,
         num_draft_swa=0,
-        seq_along_lane=False,
     )
     r = _initialize(groups)
     (engine,) = r.engines
@@ -1214,7 +1209,6 @@ def test_full_attention_only_stage_is_unchanged():
 @pytest.mark.parametrize("local_swa", [True, False])
 def test_workers_must_agree_with_rank_zero_on_the_window_engine(local_swa):
     pipe = object.__new__(pl.PipelineTransfer)
-    pipe.seq_along_lane = False
     pipe.rank = 1
     pipe.manager = SimpleNamespace(
         pp_size=2, attn_tp_size=1, local_ip="10.0.0.2", _control_port=31004

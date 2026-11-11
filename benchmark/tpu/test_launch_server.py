@@ -196,34 +196,19 @@ class TestRuntimeEnvironment(unittest.TestCase):
         """A PP prefill must run without the megakernel (the model rejects it under PP)."""
         from benchmark.tpu.recipe.configs.muse_spark.agentic import get_config
 
-        prefill, decode = (get_config(32, mode=m) for m in ("prefill", "decode"))
-        self.assertEqual(prefill["server_args"]["pp_size"], 8)
-        self.assertEqual(prefill["server_args"]["tp_size"], 1)
-        self.assertEqual(decode["server_args"]["max_running_requests"], 32)
+        prefill, decode = (get_config(24, mode=m) for m in ("prefill", "decode"))
+        self.assertEqual(prefill["server_args"]["pp_size"], 2)
         for config in (prefill, decode):
             # A rank != 0 in a one-host group makes launch_server start nothing.
             self.assertEqual(config["runtime_env"]["SGLANG_LAUNCHER_RANK"], "0")
         self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "0")
         self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MEGAKERNEL"], "1")
-        self.assertEqual(decode["runtime_env"]["SGLANG_TPU_MUSE_MK_MAX_ROWS"], "256")
-        for config in (prefill, decode):
-            self.assertEqual(config["server_args"]["kv_cache_dtype"], "fp8_e4m3")
-            env = config["runtime_env"]
-            self.assertEqual(env["SGLANG_TPU_PD_DECODE_DRAFT_PREFILL"], "1")
-            self.assertEqual(env["SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"], "1")
-            self.assertNotIn("SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY", env)
-        self.assertEqual(prefill["runtime_env"]["SGLANG_TPU_MUSE_PREFILL_SP"], "0")
         self.assertEqual(decode["runtime_env"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")
-        # HiCache on a decode needs its radix tree; without it the decode refuses to start.
-        self.assertTrue(
-            decode["server_args"]["disaggregation_decode_enable_radix_cache"]
-        )
         for config, mode in ((prefill, "prefill"), (decode, "decode")):
             self.assertEqual(config["server_args"]["disaggregation_mode"], mode)
         self.assertNotIn("disaggregation_mode", get_config(24)["server_args"])
-        for concurrency, mode in ((24, "router"), (24, "decode")):
-            with self.assertRaises(ValueError):
-                get_config(concurrency, mode=mode)
+        with self.assertRaises(ValueError):
+            get_config(24, mode="router")
 
 
 if __name__ == "__main__":

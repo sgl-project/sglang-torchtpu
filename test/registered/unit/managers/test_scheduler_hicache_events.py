@@ -112,8 +112,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.assertIsNone(plan.batch_to_run)
         s.get_new_batch_prefill.assert_not_called()
         self.assertEqual(
-            self.calls.mock_calls,
-            [call.drain(), call.retry(), call.defer(self.running_batch)],
+            self.calls.mock_calls, [call.drain(), call.retry(), call.defer()]
         )
 
     def test_pp_prefill_drains_before_admission(self):

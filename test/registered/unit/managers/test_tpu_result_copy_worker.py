@@ -9,7 +9,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftInput
@@ -181,39 +180,11 @@ def test_worker_preserves_context_and_serializes_copies(monkeypatch):
     assert contexts == []
 
 
-def _eagle_draft_input(tail):
-    return EagleDraftInput(topk_index=tail)
-
-
-def _dflash_draft_input(tail):
-    draft_input = make_draft_input_v2(
-        bonus_tokens=torch.zeros(1, dtype=torch.int64),
-        new_seq_lens=torch.ones(1, dtype=torch.int64),
-    )
-    draft_input.draft_kv_write_tail = tail
-    return draft_input
-
-
-def _host_padded_draft_input(tail):
-    # The experimental worker's commit writes draft KV; kv_fence_tail reads it.
-    draft_input = HostPaddedBlockDraftInput(
-        bonus_tokens=torch.zeros(1), new_seq_lens=torch.zeros(1)
-    )
-    draft_input.kv_fence_tail = tail
-    return draft_input
-
-
-@pytest.mark.parametrize(
-    "make_draft_input",
-    [_eagle_draft_input, _dflash_draft_input, _host_padded_draft_input],
-)
+@pytest.mark.parametrize("host_padded", [False, True])
 @pytest.mark.parametrize("copy_draft_tail", [True, False])
-def test_copy_done_covers_spec_draft_extend(
-    monkeypatch, copy_draft_tail, make_draft_input
-):
-    """EAGLE draft-extend, the DFLASH draft KV append and the experimental
-    worker's commit write draft KV after the verify outputs are produced, so
-    under the KV free fence copy_done must also wait for one of their outputs;
+def test_copy_done_covers_spec_draft_extend(monkeypatch, copy_draft_tail, host_padded):
+    """Draft-extend writes draft KV after the verify outputs are produced, so
+    under the KV free fence copy_done must also wait for one of its outputs;
     otherwise the extra copy would only delay result processing."""
     device_module = SimpleNamespace(
         Stream=Mock(),
@@ -229,15 +200,21 @@ def test_copy_done_covers_spec_draft_extend(
     issued = []
     draft_tail = object()
     # An independent output, as the tail producers return (not a view of a pool).
-    device_tail = Mock(_base=None)
-    device_tail.to.side_effect = lambda *args, **kwargs: (
+    topk_index = Mock(_base=None)
+    topk_index.to.side_effect = lambda *args, **kwargs: (
         issued.append("draft") or draft_tail
     )
     event = Mock()
     event.record.side_effect = lambda: issued.append("record")
-    result = SimpleNamespace(
-        copy_done=event, next_draft_input=make_draft_input(device_tail)
-    )
+    if host_padded:
+        # The experimental worker's commit writes draft KV; kv_fence_tail reads it.
+        draft_input = HostPaddedBlockDraftInput(
+            bonus_tokens=torch.zeros(1), new_seq_lens=torch.zeros(1)
+        )
+        draft_input.kv_fence_tail = topk_index
+    else:
+        draft_input = EagleDraftInput(topk_index=topk_index)
+    result = SimpleNamespace(copy_done=event, next_draft_input=draft_input)
     result.copy_to_cpu = lambda *args: (
         issued.append("copy"),
         result.copy_done.record(),

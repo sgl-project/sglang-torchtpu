@@ -760,7 +760,6 @@ def _patch_future_map_direct_handoff() -> None:
     from sglang_tpu.overlap_utils_tpu import (
         flush_direct_handoff_tpu,
         publish_tpu,
-        resolve_mixed_spec_tails_tpu,
         stash_tpu,
     )
 
@@ -787,8 +786,7 @@ def _patch_future_map_direct_handoff() -> None:
     def resolve_mixed_spec_tails(self, batch):
         # The mixed input resolve reads output_tokens_buf right after this.
         flush_direct_handoff_tpu(self)
-        if not resolve_mixed_spec_tails_tpu(self, batch):
-            orig_resolve_mixed_spec_tails(self, batch)
+        orig_resolve_mixed_spec_tails(self, batch)
 
     FutureMap.stash = stash
     FutureMap.publish = publish

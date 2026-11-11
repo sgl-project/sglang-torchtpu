@@ -304,11 +304,6 @@ def get_raiden_kv_caches(
     draft_swa_kv_head_num: Optional[int] = None
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
-        if _is_seq_along_lane_pool(draft_pool) != seq_along_lane:
-            raise NotImplementedError(
-                "Raiden moves draft KV in the target's page layout; the draft and "
-                "target pools differ on SEQ_ALONG_LANE"
-            )
         num_draft_full, num_draft_swa = len(draft_groups.full), len(draft_groups.swa)
         full.extend(draft_groups.full)
         swa.extend(draft_groups.swa)
@@ -318,6 +313,7 @@ def get_raiden_kv_caches(
         swa_draft_pool = getattr(draft_pool, "swa_kv_pool", draft_pool)
         draft_kv_head_num = getattr(full_draft_pool, "head_num", None)
         draft_swa_kv_head_num = getattr(swa_draft_pool, "head_num", None)
+        seq_along_lane = seq_along_lane or _is_seq_along_lane_pool(draft_pool)
 
     if hidden_pool is not None:
         full.append(hidden_pool.buffer)

@@ -245,11 +245,7 @@ class TestDirectHandoff(CustomTestCase):
         with patch.object(FutureMap, "resolve_mixed_spec_tails", read_tails):
             with tpu_future_map():
                 fm.resolve_mixed_spec_tails(
-                    SimpleNamespace(
-                        mix_running_indices=indices,
-                        mix_verify_tails=0,
-                        mix_tail_spec_info=None,
-                    )
+                    SimpleNamespace(mix_running_indices=indices)
                 )
         torch.testing.assert_close(seen[0], payload.bonus_tokens)
         self.assertIsNone(fm.tpu_direct_handoff)

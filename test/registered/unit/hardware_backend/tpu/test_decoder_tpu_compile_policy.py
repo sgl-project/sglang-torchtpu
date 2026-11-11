@@ -739,7 +739,6 @@ class TestLogitsOutputMode(_PolicyTestCase):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             batch_size=64,
             logits_output_mode=LogitsOutputMode.DISTRIBUTED_TOP_K,
-            mix_verify_width=1,
         )
         candidate_key = policy._direct_compile_specialization_key(
             None, torch.arange(64), None, forward_batch
@@ -761,7 +760,6 @@ class TestLogitsOutputMode(_PolicyTestCase):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             batch_size=64,
             logits_output_mode=LogitsOutputMode.DISTRIBUTED_TOP_K,
-            mix_verify_width=1,
         )
         candidate_key = policy._direct_compile_specialization_key(
             None, torch.arange(64), None, forward_batch
@@ -869,7 +867,6 @@ class TestDecoderOutputUnpadding(CustomTestCase):
             _tpu_real_q=3,
             _tpu_real_b=2,
             batch_size=4,
-            mix_verify_width=1,
             input_ids=torch.arange(6),
             positions=torch.arange(6),
         )

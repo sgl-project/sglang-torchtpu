@@ -22,7 +22,6 @@ from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaAttnBackend,
     PallasForwardMetadata,
     RpaKernelSpec,
-    _resolve_decode_query_size,
 )
 from sglang_tpu.cp_forward import get_tpu_cp_layout
 from sglang_tpu.envs import envs
@@ -93,92 +92,28 @@ def _invoke_batched_kernel(
     # cu_kv_lens is not consumed by the batched kernel.
     # It builds its schedule inline and has no per-mode dispatch to skip, so
     # the argument the shared shell passes for kernels that do is
-    # discarded here.
-    del cu_kv_lens
-
-    def run(kv_cache, dist, prefill_block_sizes=None):
-        return jax_rpa(
-            queries,
-            keys,
-            values,
-            kv_cache,
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            dist,
-            attention_sink=attention_sink,
-            sm_scale=sm_scale,
-            sliding_window=sliding_window,
-            soft_cap=soft_cap,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            use_causal_mask=True,
-            # The kernel owns the KV write; the backend never writes out of band.
-            skip_kv_update=False,
-            kv_layout=kv_layout(),
-            prefill_block_sizes=prefill_block_sizes,
-        )
-
-    if decode_query_size == 1:
-        return run(kv_cache_fused, distribution)
-    # The DECODE range [0, distribution[0]) holds the width-wide sequences (a verify
-    # batch, or a mixed-verify extend's tails, ordered first). The kernel's DECODE pass
-    # takes one row per sequence, so they run as MIXED with verify-sized q blocks; the
-    # remaining sequences then run as MIXED with the prefill blocks.
-    import jax.numpy as jnp
-
-    verify_dist = jnp.zeros_like(distribution).at[2].set(distribution[0])
-    rest_dist = distribution.at[0].set(0)
-    rows = jnp.arange(queries.shape[0])
-    verify_rows = rows < cu_q_lens[distribution[0]]
-    if envs.SGLANG_TPU_MIXED_VERIFY_TAILS_LAST.get():
-        # A mixed-verify extend kept in batch order arrives as [0, p, n]: the tails are
-        # sequences [p, n), the verify pass's MIXED range, and the prefill pass takes
-        # [0, p). A decode-ordered [k, k, n] (k >= 1) keeps the split above.
-        tails_last = distribution[0] == 0
-        verify_dist = jnp.where(tails_last, rest_dist, verify_dist)
-        rest_dist = jnp.where(
-            tails_last,
-            jnp.zeros_like(distribution).at[2].set(distribution[1]),
-            rest_dist,
-        )
-        verify_rows = jnp.where(
-            tails_last,
-            (rows >= cu_q_lens[distribution[1]]) & (rows < cu_q_lens[distribution[2]]),
-            verify_rows,
-        )
-    out_verify, kv_cache_fused = run(
+    # discarded here. The base never widens decode for this kernel
+    # (``supports_decode_query_size`` is off), so the width is always 1.
+    del cu_kv_lens, decode_query_size
+    return jax_rpa(
+        queries,
+        keys,
+        values,
         kv_cache_fused,
-        verify_dist,
-        _verify_blocks(
-            decode_query_size=decode_query_size, sliding_window=sliding_window
-        ),
-    )
-    out_rest, kv_cache_fused = run(kv_cache_fused, rest_dist)
-    return jnp.where(verify_rows[:, None, None], out_verify, out_rest), kv_cache_fused
-
-
-# k block for verify-as-MIXED, measured on v7 at head_dim 64, 2 KV heads, fp8, 16-32 x 8 rows
-# at 150K: 4096 beats 2048 by 10% and 8192 is no better; SWA layers stop at the window.
-_VERIFY_BKV = 4096
-
-
-def _verify_blocks(*, decode_query_size: int, sliding_window: int | None):
-    """MIXED-mode blocks for width-wide verify sequences: a q block of that width (the
-    default block search sizes q blocks for prefill chunks)."""
-    from sglang_tpu.attention.pallas.batched_rpa import configs
-
-    page = _MIN_PAGE_SIZE
-    bkv = _VERIFY_BKV
-    if sliding_window:
-        bkv = min(bkv, max(page, -(-sliding_window // page) * page))
-    # One lane: more lanes help at 16 sequences (-8%) but are 9x slower at 32.
-    return configs.BlockSizes(
-        bq_sz=decode_query_size,
-        bq_c_sz=decode_query_size,
-        bkv_sz=bkv,
-        batch_size=1,
-        n_buffer=3,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        attention_sink=attention_sink,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        use_causal_mask=True,
+        # The kernel owns the KV write; the backend never writes out of band.
+        skip_kv_update=False,
+        kv_layout=kv_layout(),
     )
 
 
@@ -189,10 +124,7 @@ def _verify_blocks(*, decode_query_size: int, sliding_window: int | None):
 _MIN_PAGE_SIZE = 256
 
 RPA_BATCHED_SPEC = RpaKernelSpec(
-    # Compiled kernels are cached by op name and static args, not by what the body read
-    # from the environment, so the tails-last split gets its own op.
-    op_name="sglang_tpu_pallas::ragged_paged_attention_batched"
-    + ("_tails_last" if envs.SGLANG_TPU_MIXED_VERIFY_TAILS_LAST.get() else ""),
+    op_name="sglang_tpu_pallas::ragged_paged_attention_batched",
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
     supports_attention_sink=True,
@@ -209,21 +141,9 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
 
     def __init__(self, model_runner, speculative_step_id=0):
         super().__init__(model_runner, speculative_step_id)
-        from sglang.srt.managers.schedule_batch import mixed_tail_width
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
-        if (
-            envs.SGLANG_TPU_RPA_BATCHED_VERIFY_BLOCKS.get()
-            or mixed_tail_width(model_runner.spec_algorithm) > 1
-        ):
-            # Verify batches (and mixed-verify tails) then reach the kernel as
-            # uniform-width DECODE, which _invoke_batched_kernel runs as MIXED with
-            # verify-sized blocks.
-            self.decode_query_size = _resolve_decode_query_size(
-                supports_decode_query_size=True,
-                spec_enabled=not model_runner.spec_algorithm.is_none(),
-            )
         self._pp_schedule_runner = model_runner if parallel.pp_size > 1 else None
         self._cp_schedule_runner = model_runner if parallel.attn_cp_size > 1 else None
 
