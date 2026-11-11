@@ -1,5 +1,5 @@
 """Numerics of the PP prefill stage (sglang_tpu.muse_megakernel.prefill_pp: its fused kernels
-around the batched RPA prefill attention, with the serving env) on one TPU device, against a
+around the batched RPA prefill attention) on one TPU device, against a
 plain-jnp reference of each layer (f32, HIGHEST precision dots, bf16 queries, the kernels' bf16 /
 fp8 rounding points).
 
@@ -20,7 +20,6 @@ product (fp8 rows) in the reference.
 """
 
 import math
-import os
 import sys
 
 import jax
@@ -30,23 +29,6 @@ import numpy as np
 from sglang_tpu.muse_megakernel import prefill_pp as PP
 from sglang_tpu.muse_megakernel.prefill_pp import moe as PP_MOE
 from sglang_tpu.muse_megakernel.prefill_pp.config import fp4_qblock, fp4_qblock_a8
-
-# the batched RPA prefill attention as the P/D prefill serves it (read when the stage is traced);
-# MUSE_PP_TEST_RPA_TRANSPOSED=0 runs the standard tile (bf16 queries) as a control
-TRANSPOSED = os.environ.get("MUSE_PP_TEST_RPA_TRANSPOSED", "1")
-os.environ.update({
-    "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "1", "SGLANG_TPU_RPA_SKIP_PAD_Q": "1",
-    "SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP": "256", "SGLANG_TPU_RPA_NO_MAX": "1",
-    "SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS": "1e-05", "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
-    "SGLANG_TPU_RPA_TRANSPOSED": TRANSPOSED,
-})  # fmt: skip
-if (
-    TRANSPOSED == "1"
-):  # the standard tile overflows VMEM at these blocks; its own search picks
-    os.environ.update({
-        "SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS": "256:32:768:2",
-        "SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS": "128:512",
-    })  # fmt: skip
 
 HIGH = jax.lax.Precision.HIGHEST
 T, CTX = 512, 2560
@@ -58,9 +40,8 @@ LOG2E = 1.4426950408889634
 TOL_ROW, TOL_MEAN = 3e-2, 1e-2
 TOL_KV = 1e-6  # the chunk's fp8 K/V in the pool: exactly the kernel's k, v rounded
 TOL_QKV = 1e-2  # attention inputs: bf16 roundings of nearly equal f32 values
-# The served kernels against this f32 reference: RPA's standard bf16 tile alone is 1.6% off
-# (bf16 P without a running max, outputs that nearly cancel before the head norm), the fp8-q
-# transposed tile 2.2%; gmm_v2's W8A8 (fp8 layers) 3.6-4.3%, NVFP4 W4A16 0.45%. The port itself
+# The served kernels against this f32 reference: RPA's bf16 tile ATTN_ERR off (outputs that
+# nearly cancel before the head norm); gmm_v2's W8A8 (fp8 layers) 3.6-4.3%, NVFP4 W4A16 0.45%. The port itself
 # is checked exactly: the stage's attention and slot outputs equal the served calls' bits.
 TOL_ATTN = 3e-2
 TOL_EXPERTS = {
@@ -296,13 +277,8 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None, qkv_in=None, o_in=None)
     q_out, k_out, v_out = _bf(q), _bf(k), _bf(v)
     if qkv_in is not None:
         q, k, v = (a.astype(jnp.float32) for a in qkv_in)
-    # the served transposed RPA tile: fp8 Q^T of the bf16 q times sm_scale * log2(e), base-2
-    # logits; K/V reach the pool as fp8 of the bf16 values the stage hands it
-    f8max = float(jnp.finfo(jnp.float8_e4m3fn).max)
-    q8 = _bf(q) * (c.attn_scale * LOG2E)
-    if TRANSPOSED == "1":
-        q8 = jnp.clip(q8, -f8max, f8max).astype(jnp.float8_e4m3fn).astype(jnp.float32)
-    q8 = q8.reshape(T, nkv, nqh // nkv, 64)
+    # base-2 logits of the bf16 q; K/V reach the pool as fp8 of the bf16 values the stage hands it
+    q8 = (_bf(q) * (c.attn_scale * LOG2E)).reshape(T, nkv, nqh // nkv, 64)
     k8 = _bf(k).astype(jnp.float8_e4m3fn).astype(jnp.float32).reshape(T, nkv, 64)
     v8 = _bf(v).astype(jnp.float8_e4m3fn).astype(jnp.float32).reshape(T, nkv, 64)
     ck, cv = pool_tokens(pool, table, CTX)
@@ -316,12 +292,6 @@ def ref_attn(c, w, l, x, pool, table, rope, ids_in=None, qkv_in=None, o_in=None)
     def heads_out(qg):
         sc = jnp.einsum("thgd,nhd->thgn", qg, keys, precision=HIGH)
         sc = jnp.where(live[:, None, None, :], sc, -jnp.inf)
-        if TRANSPOSED == "1":
-            # the served tile: no running max (NO_MAX), l from the bf16 P (ones rows in V^T)
-            pr = _bf(jnp.exp2(sc))
-            return jnp.einsum("thgn,nhd->thgd", pr, vals, precision=HIGH) / pr.sum(
-                -1, keepdims=True
-            )
         pr = jnp.exp2(sc - sc.max(-1, keepdims=True))
         return jnp.einsum("thgn,nhd->thgd", _bf(pr), vals, precision=HIGH) / pr.sum(
             -1, keepdims=True
@@ -359,7 +329,7 @@ def served_attention(c, is_global, q, k, v, pool, table):
         pool, jnp.array([CTX + T], jnp.int32), table, jnp.array([0, T], jnp.int32),
         jnp.array([1, 1, 1], jnp.int32), sm_scale=c.head_dim**-0.5,
         sliding_window=None if is_global else c.window, k_scale=1.0, v_scale=1.0,
-        kv_layout=configs.KVLayout.SEQ_ALONG_LANE, out_head_norm_eps=-1.0,
+        kv_layout=configs.KVLayout.SEQ_ALONG_LANE, out_head_norm_eps=c.rms_eps,
     )  # fmt: skip
     return o.reshape(T, c.q_dim)
 
