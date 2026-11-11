@@ -1768,6 +1768,10 @@ class KimiPrefiller:
         program, writer, ring = self.program, self._writer, self.ring
         assert writer is not None
         pools, mla = tuple(writer.raw_pools), writer.mla_pools()
+        # Kimi-K3.1: each MLA op also takes its layers' index pools, and the
+        # latents carry the index keys in lanes 576:704 (run_packed).
+        index = writer.index_pools()
+        lanes = 576 + (128 if index else 0)
         calls, ring_writes = [], set()
 
         def i32(*shape):
@@ -1794,7 +1798,7 @@ class KimiPrefiller:
             conv = torch.empty(
                 (1, KDA_LAYERS, count, 3, 3, 3, 128), dtype=torch.bfloat16
             )
-            latents = torch.empty((1, MLA_LAYERS, window, 576), dtype=torch.bfloat16)
+            latents = torch.empty((1, MLA_LAYERS, window, lanes), dtype=torch.bfloat16)
             state = (stream, blocks, recurrent, conv, recurrent, conv, latents)
             extent, segments = i32(1), i32(5 * count)
             tail = (i32(1, 1 + self.cp_capacity // self.page_tokens), i32(1, 2 * count))
@@ -1807,6 +1811,7 @@ class KimiPrefiller:
                     recurrent,
                     conv,
                     mla[0],
+                    *index[:1],
                     *tail,
                     *program._flat("io", "common", "kda", "mla", "moe"),
                 ),
@@ -1821,6 +1826,7 @@ class KimiPrefiller:
                     segments,
                     mla[1],
                     mla[2],
+                    *index[1:3],
                     *tail,
                     *program._flat("common", "kda", "mla", "moe", expert_bank=1),
                 ),
@@ -1835,6 +1841,7 @@ class KimiPrefiller:
                     extent,
                     segments,
                     mla[MLA_LAYERS - 1],
+                    *index[MLA_LAYERS - 1:],
                     *tail,
                     *program._flat("io", "common", "mla", "moe", expert_bank=12),
                 ),
