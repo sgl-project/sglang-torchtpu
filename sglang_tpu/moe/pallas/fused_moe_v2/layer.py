@@ -346,6 +346,38 @@ AGQ_MIN_LOCAL_TOKENS = 1024
 _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
 
+# How routed rows reach their experts' shards; see fused_ep_moe_v2.
+DISPATCHES = ("all_gather", "push")
+
+
+def _check_dispatch(
+    dispatch,
+    *,
+    push_options,
+    shared_expert,
+    shared_limit,
+    stage,
+    routed,
+    gather_positions,
+):
+    """The push knobs to forward, after refusing what the dispatch cannot run."""
+    if dispatch not in DISPATCHES:
+        raise ValueError(f"dispatch must be one of {DISPATCHES}; got {dispatch!r}")
+    if dispatch == "all_gather":
+        if push_options or shared_expert is not None or shared_limit is not None:
+            raise ValueError('push_options and the shared expert need dispatch="push"')
+        return None
+    if stage != "fused" or routed is not None or gather_positions is not None:
+        raise ValueError('dispatch="push" runs the fused stage only')
+    # Imported here: the push package imports this module.
+    from sglang_tpu.moe.pallas.fused_moe_v2.push import PUSH_OPTIONS
+
+    options = dict(push_options or {})
+    unknown = sorted(set(options) - set(PUSH_OPTIONS))
+    if unknown:
+        raise ValueError(f"unknown push_options {unknown}; known: {PUSH_OPTIONS}")
+    return options
+
 
 def fused_ep_moe_v2(
     x,
@@ -381,6 +413,10 @@ def fused_ep_moe_v2(
     routed=None,
     gather_positions=None,
     preprocess_topology: PreprocessTopology | None = None,
+    dispatch="all_gather",
+    push_options=None,
+    shared_expert=None,
+    shared_limit=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -477,7 +513,68 @@ def fused_ep_moe_v2(
     slot), the counts every shard already holds from the routing exchange.
     The caller donates the operand and writes the result back (fused stage
     only). None leaves the program as it is.
+
+    dispatch picks how routed rows reach their experts' shards.
+    "all_gather" (the default) all-gathers the quantized activations.
+    "push" sends each shard's routed rows straight into the destination
+    expert slabs (push/layer.py); the routing plan, FFN and combine are this
+    layer's, and the push tests hold its output bit-identical to this one.
+    Push runs the fused stage only. push_options holds its knobs (the names
+    in push.PUSH_OPTIONS, defaults in push.layer.fused_ep_moe_push).
+    shared_expert (w13, s13, w2, s2), replicated per-channel FP8, with
+    shared_limit computes the layer's shared expert inside the op
+    (sglang_tpu/fp8_swiglu_mlp.py); the result is then returned last.
+    Push's fused routing metadata was measured only for (topk, experts, ep,
+    tile_m) == push.routing.ROUTING_GEOMETRY on v7 at the per-shard token
+    counts in push.fusion.ROUTING_TOKENS; every other shape builds the same
+    tables unfused. Like this path, push needs tokens % ep == 0.
     """
+    push_kw = _check_dispatch(
+        dispatch,
+        push_options=push_options,
+        shared_expert=shared_expert,
+        shared_limit=shared_limit,
+        stage=stage,
+        routed=routed,
+        gather_positions=gather_positions,
+    )
+    if push_kw is not None:
+        from sglang_tpu.moe.pallas.fused_moe_v2.push import fused_ep_moe_push
+
+        return fused_ep_moe_push(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            w1_bias,
+            w2_bias,
+            topk=topk,
+            renormalize=renormalize,
+            mesh=mesh,
+            capacity=capacity,
+            block=block,
+            ragged_stride=ragged_stride,
+            weight_format=weight_format,
+            rhs_qb=rhs_qb,
+            act_fn=act_fn,
+            rank=rank,
+            mesh_ep_ranks=mesh_ep_ranks,
+            sharded_plan=sharded_plan,
+            scoring_fn=scoring_fn,
+            score_bias=score_bias,
+            hash_topk_ids=hash_topk_ids,
+            routed_scaling_factor=routed_scaling_factor,
+            token_replica_groups=token_replica_groups,
+            logical_intermediate_size=logical_intermediate_size,
+            preprocess_topology=preprocess_topology,
+            expert_slot=expert_slot,
+            expert_load=expert_load,
+            shared_expert=shared_expert,
+            shared_limit=shared_limit,
+            **push_kw,
+        )
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
     # The weights themselves, against the format they were named as. This
