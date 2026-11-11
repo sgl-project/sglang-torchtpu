@@ -94,6 +94,13 @@ class SWAComponent(TreeComponent):
             else 0
         )
         self.cap_text = _cap_text_mode()
+        # Each of these demotions keeps a first-visit media window live
+        # (see ``_media_window``).
+        self._keeps_media_window = (
+            self._evict_stale_windows_first
+            or self.demotes_final_windows
+            or self.cap_media_anchors > 0
+        )
         self.sliding_window_size = params.sliding_window_size
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
@@ -983,9 +990,7 @@ class SWAComponent(TreeComponent):
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )
-        if (
-            self.demotes_final_windows or self.cap_media_anchors
-        ) and req.swa_stale_window_floor is None:
+        if self._keeps_media_window and req.swa_stale_window_floor is None:
             req.swa_stale_window_floor = req.kv.cache_protected_len
             req.swa_media_end = _media_end(req)
 
@@ -1177,10 +1182,7 @@ class SWAComponent(TreeComponent):
         request's media needs live: the one ending at the page-floored media
         end. Only a first visit (the media lies past the request's floor) owns
         it; otherwise an earlier request already left it in the tree."""
-        if (
-            not (self.demotes_final_windows or self.cap_media_anchors)
-            or req.swa_media_end is None
-        ):
+        if not self._keeps_media_window or req.swa_media_end is None:
             return None
         boundary = req.swa_media_end // self.cache.page_size * self.cache.page_size
         floor = req.swa_stale_window_floor

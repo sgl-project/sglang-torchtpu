@@ -704,6 +704,8 @@ class Envs:
     SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS = EnvBool(False)
     # Move the stale SWA windows behind a request's sliding window (chunk boundaries,
     # earlier turns) to the SWA LRU eviction end, ahead of shared windows and prefix tails.
+    # On a first visit of the request's media, the window ending at the page-floored
+    # media end stays put.
     SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST = EnvBool(False)
     # When a request finishes, move its unshared final SWA windows (its private
     # tail, after it drops its tree lock) to the SWA LRU eviction end. On a first

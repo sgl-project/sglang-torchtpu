@@ -1224,12 +1224,12 @@ class Req(ReqDllmMixin):
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
         # Matched prefix length at this request's first radix insert, set only
-        # under SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS or
-        # SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS: final-window demotion stops here, and
-        # media past it is a first visit.
+        # under SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST,
+        # SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS or SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS:
+        # final-window demotion stops here, and media past it is a first visit.
         self.swa_stale_window_floor: Optional[int] = None
         # End (exclusive) of the last multimodal item's tokens, read at the first
-        # radix insert (SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS); None for text.
+        # radix insert under the same flags; None for text.
         self.swa_media_end: Optional[int] = None
         # CAP media anchor taken for this request (SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS).
         self.swa_media_anchored: bool = False
