@@ -339,19 +339,32 @@ class IndexSelect:
             w_cols = [self._w_col(w_t_ref, first_row + r) for r in range(S)]
             limits = [self.position_ref[first_row + r] + 1 for r in range(S)]
             first = (local * self.group + self.owner) * T  # the page's first position
-            for sp in range(self.subpages):
+
+            def subpage_keys(sp):
                 raw = refs["page_buf"][slot, pl_ds(sp * INDEX_SUBPAGE_ROWS, 32)]  # [32, 4, 128] u8
-                k8 = jax.lax.bitcast_convert_type(raw.reshape(INDEX_SUBPAGE_TOKENS, 128), jnp.float8_e4m3fn)
+                return jax.lax.bitcast_convert_type(raw.reshape(INDEX_SUBPAGE_TOKENS, 128), jnp.float8_e4m3fn)
+
+            def subpage_scale(sp):
+                return _pow2(refs["page_buf"][slot, sp * INDEX_SUBPAGE_ROWS + 32].astype(jnp.int32)[0:1])
+
+            # Up to two rows a sequence: one product over the whole page (a
+            # [32, 128] x [128, 128] product per subpage is all MXU latency);
+            # from four, a subpage at a time (the page's logits outgrow the vregs).
+            parts = [tuple(range(self.subpages))] if S <= 2 else [(sp,) for sp in range(self.subpages)]
+            for part in parts:
+                k8 = jnp.concatenate([subpage_keys(sp) for sp in part], axis=0) if len(part) > 1 \
+                    else subpage_keys(part[0])
                 logits = jax.lax.dot_general(q, k8, (((1,), (1,)), ((), ())),
-                                             preferred_element_type=jnp.float32)  # [S * 32 heads, 128 tokens]
-                exp = refs["page_buf"][slot, sp * INDEX_SUBPAGE_ROWS + 32].astype(jnp.int32)[0:1]  # [1, 128]
-                scale = _pow2(exp)
-                position = first + sp * INDEX_SUBPAGE_TOKENS + lane_row
+                                             preferred_element_type=jnp.float32)  # [S * 32 heads, tokens]
+                scales = [subpage_scale(sp) for sp in part]
                 for r in range(S):
                     heads = logits[r * 32:(r + 1) * 32]
-                    score = jnp.sum(jnp.maximum(heads, 0.0) * w_cols[r], axis=0, keepdims=True)  # [1, 128]
-                    key = jnp.where(position < limits[r], _monotone(score * scale), INT_MIN)
-                    refs["stage"][stage, r, pl_ds(sp, 1), :] = key
+                    score = jnp.sum(jnp.maximum(heads, 0.0) * w_cols[r], axis=0, keepdims=True)  # [1, tokens]
+                    for i, sp in enumerate(part):
+                        position = first + sp * INDEX_SUBPAGE_TOKENS + lane_row
+                        piece = score[:, i * INDEX_SUBPAGE_TOKENS:(i + 1) * INDEX_SUBPAGE_TOKENS]
+                        key = jnp.where(position < limits[r], _monotone(piece * scales[i]), INT_MIN)
+                        refs["stage"][stage, r, pl_ds(sp, 1), :] = key
             for r in range(S):
                 self._patch_in_flight(first_row + r, stage, first, r)
             self._stage_copy(stage, first_row, local).start()
