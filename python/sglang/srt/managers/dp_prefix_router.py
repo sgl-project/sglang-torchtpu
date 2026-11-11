@@ -34,11 +34,25 @@ two load guards borrowed from sgl-model-gateway's cache-aware policy:
   ``balance_abs_threshold`` requests *and* by more than
   ``balance_rel_threshold`` times is not a candidate;
 - a match shorter than ``cache_threshold`` of the prompt goes to the
-  least-loaded candidate instead.
+  least-loaded candidate instead, unless it ends exactly where a prompt
+  previously routed to that rank ended.
 
-The second guard keeps a system prompt shared by every session from pulling all
-new sessions to the first rank that cached it. Once each rank has cached the
-shared part, equal matches tie-break on load.
+The ratio guard keeps a system prompt shared by every session from pulling all
+new sessions to the first rank that cached it, as long as the shared part is
+under ``cache_threshold`` of the prompt. A longer shared part passes it: new
+sessions then pack onto the ranks holding it until the overload guard trips,
+and each one that spills elsewhere copies the shared part to another rank.
+Once every rank holds it, equal matches tie-break on load.
+
+The exemption keeps a session on its rank when the turn adds more than the
+history the index knows about. The index records routed prompts only, never
+generated tokens, so a turn that appends a long reply or tool result matches
+just the previous prompt, though the rank's radix cache holds the reply too.
+
+TODO: the router can't tell a prefix every session shares (cheap to replicate,
+worth spreading) from one session's history (worth keeping on its rank). A
+per-key successor count would tell them apart; a score of queue delay plus
+uncached prefill would replace both thresholds.
 """
 
 from __future__ import annotations
@@ -61,8 +75,9 @@ class PrefixAffinityIndex:
             raise ValueError(f"capacity_blocks must be positive, got {capacity_blocks}")
         self.block_size = block_size
         self.capacity_blocks = capacity_blocks
-        # Per rank: block key -> None, oldest first.
-        self._blocks: list[OrderedDict[int, None]] = [
+        # Per rank: block key -> whether a routed prompt ended there, oldest
+        # first.
+        self._blocks: list[OrderedDict[int, bool]] = [
             OrderedDict() for _ in range(num_ranks)
         ]
 
@@ -102,13 +117,16 @@ class PrefixAffinityIndex:
         holds block ``i`` also holds blocks ``0..i-1``.
         """
         blocks = self._blocks[rank]
-        for key in reversed(keys):
-            if key in blocks:
-                blocks.move_to_end(key)
-            else:
-                blocks[key] = None
+        last = len(keys) - 1
+        for i in range(last, -1, -1):
+            key = keys[i]
+            blocks[key] = blocks.pop(key, False) or i == last
         while len(blocks) > self.capacity_blocks:
             blocks.popitem(last=False)
+
+    def ends_prompt(self, rank: int, keys: Sequence[int], num_matched: int) -> bool:
+        """Whether a prompt routed to ``rank`` ended at matched block ``num_matched``."""
+        return num_matched > 0 and self._blocks[rank].get(keys[num_matched - 1], False)
 
     def num_blocks(self, rank: int) -> int:
         return len(self._blocks[rank])
@@ -174,8 +192,12 @@ class PrefixAwareSelector:
 
         best = max(candidates, key=lambda r: (matched[r], -loads[r]))
         matched_tokens = matched[best] * self.index.block_size
-        by_prefix = matched[best] > 0 and matched_tokens >= self.cache_threshold * len(
-            input_ids
+        # A match that ends where an earlier prompt to this rank ended is that
+        # session's history, which the rank caches together with the reply the
+        # index never saw; the ratio only guards matches ending mid-prompt.
+        by_prefix = matched[best] > 0 and (
+            matched_tokens >= self.cache_threshold * len(input_ids)
+            or self.index.ends_prompt(best, keys, matched[best])
         )
         if not by_prefix:
             best = min(candidates, key=lambda r: (loads[r], -matched[r]))

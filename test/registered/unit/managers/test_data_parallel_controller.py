@@ -448,6 +448,42 @@ class TestPrefixAwareSelector(CustomTestCase):
             ranks.append(r)
         self.assertEqual(sorted(ranks), [0, 1, 2, 3])
 
+    def test_long_reply_keeps_the_session_on_its_rank(self):
+        sel = _selector()
+        turn1 = _prompt(1, 4)
+        self.assertEqual(sel.select(turn1, [0, 0, 0, 0], [0, 1, 2, 3]), 0)
+        # Turn 1 + an 8-block reply/tool result the index never saw: 4 of 12
+        # blocks match, under the 0.5 ratio, but the match ends where turn 1 did.
+        turn2 = turn1 + _prompt(2, 8)
+        self.assertEqual(sel.select(turn2, [1, 0, 0, 0], [0, 1, 2, 3]), 0)
+
+    def test_match_ending_mid_prompt_still_needs_the_ratio(self):
+        sel = _selector()
+        turn1 = _prompt(1, 4)
+        self.assertEqual(sel.select(turn1, [0, 0, 0, 0], [0, 1, 2, 3]), 0)
+        # Shares only turn 1's first 2 blocks: 2 of 10 match, no prompt ended there.
+        other = turn1[:8] + _prompt(2, 8)
+        self.assertEqual(sel.select(other, [1, 0, 0, 0], [0, 1, 2, 3]), 1)
+
+    def test_long_shared_prefix_packs_until_the_overload_guard(self):
+        """Known limit: a shared prefix over cache_threshold of the prompt pulls
+        new sessions to the ranks holding it until they are overloaded."""
+        sel = _selector(num_ranks=8)
+        system = _prompt(0, 6)
+        loads = [0] * 8
+        for s in range(16):
+            # 6 shared blocks of 8: over the 0.5 cache threshold.
+            r = sel.select(system + _prompt(1 + s, 2), loads, list(range(8)))
+            loads[r] += 1
+        self.assertEqual(loads, [5, 5, 5, 1, 0, 0, 0, 0])
+        # Once every rank holds the shared part, equal matches go by load.
+        for r in range(8):
+            sel.index.insert(r, sel.index.block_keys(system))
+        for s in range(16, 32):
+            r = sel.select(system + _prompt(1 + s, 2), loads, list(range(8)))
+            loads[r] += 1
+        self.assertEqual(loads, [5, 5, 5, 4, 4, 3, 3, 3])
+
     def test_overloaded_rank_loses_its_prefix_matches(self):
         sel = _selector(balance_abs_threshold=2, balance_rel_threshold=1.5)
         turn1 = _prompt(1, 4)
