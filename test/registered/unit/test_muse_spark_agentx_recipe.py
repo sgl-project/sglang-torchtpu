@@ -127,12 +127,15 @@ class TestAgentxRecipes(unittest.TestCase):
         # The slow tail: 1 / (p90 ITL), between 1 / 0.1 and 1 / 0.05.
         self.assertAlmostEqual(summary["p90_interactivity"], 1 / (0.05 + 0.9 * 0.05))
 
-    def test_eval_mode_keeps_spec_recompile_and_clears_torch_logs(self):
+    def test_eval_mode_freezes_spec_compile_and_clears_torch_logs(self):
         plan = plan_launch(
             agentx.config_for(1, simulate_acceptance=False),
             inherited={"TORCH_LOGS": "+recompiles"},
         )
-        self.assertEqual(plan.env["SGLANG_TPU_ALLOW_SPEC_RECOMPILE"], "1")
+        self.assertEqual(plan.env["SGLANG_TPU_ALLOW_SPEC_RECOMPILE"], "0")
+        self.assertEqual(plan.env["SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"], "0")
+        self.assertEqual(plan.env["SGLANG_TPU_HOST_PADDING_NO_D2H"], "0")
+        self.assertNotIn("SGLANG_TPU_MUSE_ROPE_ROLL", plan.env)
         self.assertNotIn("TORCH_LOGS", plan.env)
 
 
@@ -193,6 +196,7 @@ COMMON_ENV = {
     "SGLANG_TPU_DECODE_SKIP_GUARD_EVAL": "1",
     "SGLANG_TPU_DFLASH_FP8_DRAFT": "1",
     "SGLANG_TPU_DYNAMO_PARAMS_AS_GRAPH_ATTRS": "2",
+    "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "0",
     "SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER": "1",
     "SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING": "1",
     "SGLANG_TPU_FP4_DEQUANT_VIA_FP8": "1",
@@ -210,6 +214,7 @@ COMMON_ENV = {
     "SGLANG_TPU_FUSED_RS_STAGING_SLOTS": "10",
     "SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG": "1",
     "SGLANG_TPU_HICACHE_TRIM_BEFORE_ALLOC": "1",
+    "SGLANG_TPU_HOST_PADDING_NO_D2H": "0",
     "SGLANG_TPU_KV_PACK_HEADS": "1",
     "SGLANG_TPU_MK_FOLD_ATTN_SCALE": "1",
     "SGLANG_TPU_MK_SAL_FP8_DOT": "2",
@@ -222,7 +227,6 @@ COMMON_ENV = {
     "SGLANG_TPU_MUSE_MK_LARGE_STEP_ATTN_PIPE": "1",
     "SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS": "512",
     "SGLANG_TPU_MUSE_PREFILL_SP": "1",
-    "SGLANG_TPU_MUSE_ROPE_ROLL": "1",
     "SGLANG_TPU_MUSE_SHARED_DENSE": "1",
     "SGLANG_TPU_OVERLAP_PROFILE": "1",
     "SGLANG_TPU_PRELOAD_TELEMETRY_STUB": "1",

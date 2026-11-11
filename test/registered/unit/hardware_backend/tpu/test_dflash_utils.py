@@ -1224,5 +1224,48 @@ def test_draft_full_verify_buckets_and_adaptive_precompile_shapes():
     assert policy._draft_full_verify_buckets(worker) == [1, 2, 4, 8]
 
 
+def test_append_target_hidden_to_draft_kv_by_loc_tpu_returns_fence_tail():
+    import sglang_tpu.dflash_draft_kv_write as kv_write_mod
+
+    worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
+    worker._draft_kv_is_swa = True
+    kv_buf = torch.ones((2, 4, 2, 1, 128), dtype=torch.bfloat16)
+    swa_pool = SimpleNamespace(kv_buffer=[kv_buf])
+    worker.draft_model_runner = SimpleNamespace(
+        token_to_kv_pool=SimpleNamespace(swa_kv_pool=swa_pool)
+    )
+    worker.model_runner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(size=16),
+        device=torch.device("cpu"),
+    )
+    worker.draft_model = SimpleNamespace(project_target_hidden=lambda h: h)
+
+    called = []
+
+    def _fake_write(**kwargs):
+        called.append(kwargs)
+
+    with patch.object(kv_write_mod, "dflash_write_draft_kv", _fake_write):
+        tail = worker.append_target_hidden_to_draft_kv_by_loc_tpu(
+            target_hidden=torch.zeros((3, 8), dtype=torch.bfloat16),
+            cache_loc=torch.tensor([1, 2, 3], dtype=torch.int64),
+            positions=torch.tensor([0, 1, 2], dtype=torch.int64),
+        )
+        assert isinstance(tail, torch.Tensor)
+        assert tail.dtype == torch.float32
+        assert tail.shape == (1,)
+        assert tail._base is None
+        assert len(called) == 1 and called[0]["kv_pool"] is swa_pool
+
+        empty_tail = worker.append_target_hidden_to_draft_kv_by_loc_tpu(
+            target_hidden=torch.zeros((0, 8), dtype=torch.bfloat16),
+            cache_loc=torch.zeros((0,), dtype=torch.int64),
+            positions=torch.zeros((0,), dtype=torch.int64),
+            cache_loc_2d=torch.zeros((0, 4), dtype=torch.int64),
+            commit_lens=torch.zeros((0,), dtype=torch.int32),
+        )
+        assert empty_tail is None
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

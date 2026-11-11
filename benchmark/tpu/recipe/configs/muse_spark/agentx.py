@@ -281,11 +281,17 @@ def config_for(
             "SGLANG_TPU_SPLIT_EXEC_DIRECT_CALL": "1",
             "SGLANG_TPU_DYNAMO_PARAMS_AS_GRAPH_ATTRS": "2",
             "SGLANG_TPU_DECODE_SKIP_GUARD_EVAL": "1",
-            # Muse shared dense MLP / RoPE roll and RPA softmax/ones_v kernel fastpaths.
+            # Freeze spec compilation once warmup finishes (also covers --eval).
+            "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "0",
+            # Pin core DFlashWorkerV2 for single-host AgentX (supports
+            # real-draft-token simulation, adaptive verify, and FutureMap
+            # overlap; agentic P/D overrides ENABLE_EXPERIMENTAL_SPEC_WORKER=1).
+            "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "0",
+            "SGLANG_TPU_HOST_PADDING_NO_D2H": "0",
+            # Muse shared dense MLP and RPA softmax/ones_v kernel fastpaths.
             "SGLANG_TPU_MUSE_SHARED_DENSE": "1",
             "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
             "SGLANG_TPU_RPA_ONES_V": "1",
-            "SGLANG_TPU_MUSE_ROPE_ROLL": "1",
         }
     )
     if large:
@@ -315,7 +321,6 @@ def config_for(
     if simulate_acceptance:
         env.update(
             {
-                "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "0",
                 "SGLANG_SIMULATE_ACC_LEN": GOLDEN_AL[verify - 1],
                 "SGLANG_SIMULATE_ACC_METHOD": "match-expected",
                 "SGLANG_SIMULATE_ACC_TOKEN_MODE": "real-draft-token",
