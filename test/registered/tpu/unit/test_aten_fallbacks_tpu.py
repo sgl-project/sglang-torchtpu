@@ -38,6 +38,60 @@ class TestAtenFallbacksTpu(CustomTestCase):
         got = torch.logaddexp(a.to("tpu"), b.to("tpu")).cpu()
         torch.testing.assert_close(got, torch.logaddexp(a, b), rtol=1e-5, atol=1e-5)
 
+    def test_copysign_fullgraph_signed_zeros_and_nan(self):
+        from sglang_tpu.patches import _register_tpu_compile_backend
+
+        _register_tpu_compile_backend()
+
+        def forward(a, b):
+            result = torch.copysign(a, b)
+            out = torch.empty_like(result)
+            torch.copysign(a, b, out=out)
+            return result, out
+
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                a = torch.tensor(
+                    [
+                        0.0,
+                        -0.0,
+                        1.0,
+                        -1.0,
+                        float("inf"),
+                        -float("inf"),
+                        float("nan"),
+                        -float("nan"),
+                    ],
+                    dtype=dtype,
+                ).reshape(2, 4)
+                b = torch.tensor([-0.0, 0.0, -float("nan"), float("nan")], dtype=dtype)
+                expected = torch.copysign(a, b)
+                compiled = torch.compile(
+                    forward, backend="tpu", fullgraph=True, dynamic=False
+                )
+                for _ in range(2):
+                    for result in compiled(a.to("tpu"), b.to("tpu")):
+                        got = result.cpu()
+                        torch.testing.assert_close(
+                            got, expected, atol=0, rtol=0, equal_nan=True
+                        )
+                        torch.testing.assert_close(
+                            torch.signbit(got),
+                            torch.signbit(expected),
+                            atol=0,
+                            rtol=0,
+                        )
+
+    def test_copysign_out_promotion(self):
+        # Promote before abs: abs(min_int32) would overflow in its input dtype.
+        a = torch.tensor([torch.iinfo(torch.int32).min, 0, 1], dtype=torch.int32)
+        b = torch.tensor([-0.0, 1.0, -1.0], dtype=torch.float32)
+        expected = torch.copysign(a, b)
+        out = torch.empty(0, dtype=torch.float32, device="tpu")
+        result = torch.copysign(a.to("tpu"), b.to("tpu"), out=out)
+        self.assertIs(result, out)
+        torch.testing.assert_close(result.cpu(), expected, atol=0, rtol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

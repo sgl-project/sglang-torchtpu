@@ -356,6 +356,29 @@ def _register_aten_fallbacks() -> None:
         gap = torch.where(self == other, torch.zeros_like(peak), -(self - other).abs())
         return peak + torch.log1p(torch.exp(gap))
 
+    # Why: Engram's signed-sqrt gate exports aten::copysign.out, which the
+    # pinned torch_tpu runtime does not implement (PR #2101 integration).
+    # How: retain signbit, including -0 and signed NaNs, with device-only ops;
+    # promote before abs so integral minima cannot overflow. out controls only
+    # the final cast, matching ATen's result-type calculation.
+    # Upstream tracking: https://github.com/sgl-project/sglang-torchtpu/pull/2101
+    # Remove when: torch_tpu provides native aten::copysign.out lowering.
+    @torch.library.register_kernel("aten::copysign.out", "PrivateUse1")
+    def _copysign_out(self, other, *, out):
+        dtype = torch.result_type(self, other)
+        if dtype.is_complex:
+            raise RuntimeError("copysign does not support complex tensors")
+        if not dtype.is_floating_point:
+            dtype = torch.get_default_dtype()
+        if not torch.can_cast(dtype, out.dtype):
+            raise RuntimeError(f"copysign result type {dtype} cannot cast to {out.dtype}")
+        magnitude = self.to(dtype).abs()
+        result = torch.where(torch.signbit(other), -magnitude, magnitude)
+        if out.shape != result.shape:
+            out.resize_(result.shape)
+        out.copy_(result)
+        return out
+
     # aten::upsample_bicubic2d -- no TPU kernel; run the CPU kernel and copy
     # back. Vision towers use it to resize position embeddings per image grid
     # (MoonViT's Learnable2DInterpPosEmb in Kimi-VL), so inputs are small (tens
@@ -372,7 +395,7 @@ def _register_aten_fallbacks() -> None:
 
     logger.info(
         "Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, "
-        "masked_scatter_, logaddexp, upsample_bicubic2d"
+        "masked_scatter_, logaddexp, copysign.out, upsample_bicubic2d"
     )
 
 
