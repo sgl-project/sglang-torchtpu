@@ -129,6 +129,7 @@ def ring_slots(batch: int) -> tuple[int, int]:
     """(page ring, key ring) depths of a ``batch``-row selection."""
     return (PAGE_SLOTS, KEY_SLOTS) if batch < WIDE_BATCH else (min(PAGE_SLOTS, 3), min(KEY_SLOTS, 4))
 COUNT_ROWS = 16  # candidate sublanes of the count exchange
+BINS = 16  # a round's digit values (DIGIT_BITS = 4)
 _PREFIX, _UPPER, _LOWER, _POSITION, _LIMIT = range(5)  # state rows (lanes: batch rows)
 
 
@@ -464,12 +465,16 @@ class IndexSelect:
         (else each still holds its chunk, step ``s`` in slot ``s``)."""
         return True if first else self.refs["chunk_starts"][self.batch] > self.key_slots
 
-    def _count(self, thresholds_of, first=False):
+    def _count(self, digits_of, prefix=False, first=False):
         """This rank's counts ``[COUNT_ROWS, LANES]`` (sublane ``j``: candidate
-        ``j + 1``, lane ``b``: row ``b``) of its keys passing
-        ``thresholds_of(row)``'s tests: a callable ``(row) -> test(key, position,
-        j)`` for ``j < CANDIDATES`` (``first``: the selection's first pass)."""
+        ``j + 1``, lane ``b``: row ``b``) from a 16-bin histogram of its keys'
+        digits: ``digits_of(row)`` is ``(key, position, valid) -> (digit,
+        counted)``, ``digit`` in ``0 .. 15``. A key round's candidate ``j``
+        counts the digits above ``j``; a tie round's (``prefix``) the digits up
+        to ``j`` (``first``: the selection's first pass). One digit a key, not
+        a compare per candidate."""
         refs, chunk = self.refs, self.chunk
+        assert chunk // 8 <= 15, "a step adds at most chunk // 8 to a 4-bit field"
         total = refs["chunk_starts"][self.batch]
         load = self._loads(first)
         refs["local"][...] = jnp.zeros((COUNT_ROWS, LANES), jnp.int32)
@@ -477,19 +482,20 @@ class IndexSelect:
             pl_when(load & (step < total))(lambda step=step: self._chunk_copy(step))
         sub8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 0)
         lane8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 1)
-        cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
         lane16 = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 1)
-        zeros = tuple(jnp.zeros((8, LANES), jnp.int32) for _ in range(CANDIDATES))
+        zeros = tuple(jnp.zeros((8, LANES), jnp.int32) for _ in range(BINS))
 
-        def step_fn(step, accs):
+        def step_fn(step, bins):
             row, local = refs["step_row"][step], refs["step_local"][step]
             pl_when(load)(lambda: self._wait_chunk(step))
             pl_when(load & (step + self.key_slots - 1 < total))(lambda: self._chunk_copy(step + self.key_slots - 1))
             start = jnp.minimum(local * chunk, self.key_rows - chunk)
             rows_valid = refs["counts"][row] * self.subpages
-            accs = tuple(jnp.where(local == 0, 0, a) for a in accs)
-            test = thresholds_of(row)
-            accs = list(accs)
+            bins = [jnp.where(local == 0, 0, a) for a in bins]
+            digits = digits_of(row)
+            # The step's histogram in two accumulators of eight 4-bit fields
+            # (bins 0-7, 8-15), then added to the row's bins.
+            low = high = jnp.zeros((8, LANES), jnp.int32)
             for v in range(chunk // 8):
                 key = refs["key_buf"][step % self.key_slots, pl_ds(v * 8, 8), :]
                 key_row = start + v * 8 + sub8
@@ -497,21 +503,31 @@ class IndexSelect:
                 page = key_row // self.subpages
                 position = ((page * self.group + self.owner) * self.T
                             + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS + lane8)
-                for j in range(CANDIDATES):
-                    accs[j] = accs[j] + (valid & test(key, position, j)).astype(jnp.int32)
+                digit, counted = digits(key, position, valid)
+                one = jnp.where(counted, jnp.left_shift(jnp.ones_like(digit), (digit & 7) << 2), 0)
+                upper = digit >= 8
+                low = low + jnp.where(upper, 0, one)
+                high = high + jnp.where(upper, one, 0)
+            bins = [bins[i] + (jax.lax.shift_right_logical(low if i < 8 else high, 4 * (i % 8)) & 15)
+                    for i in range(BINS)]
             last = local == (rows_valid + chunk - 1) // chunk - 1
 
             @pl_when(last)
             def column():
-                # Sublane sums stacked into one [16, LANES] block, then a single
-                # lane reduction (not a full reduction per candidate).
+                # Bin sums -> candidate counts (suffix or prefix sums), stacked
+                # into one [16, LANES] block, then a single lane reduction.
+                sums = [jnp.sum(a, axis=0, keepdims=True) for a in bins]  # [1, LANES] each
+                counts, running = [None] * CANDIDATES, None
+                for j in (range(CANDIDATES) if prefix else range(CANDIDATES - 1, -1, -1)):
+                    term = sums[j] if prefix else sums[j + 1]
+                    running = term if running is None else running + term
+                    counts[j] = running
                 partial = jnp.concatenate(
-                    [jnp.sum(a, axis=0, keepdims=True) for a in accs]
-                    + [jnp.zeros((COUNT_ROWS - CANDIDATES, LANES), jnp.int32)], axis=0)  # [16, LANES]
+                    counts + [jnp.zeros((COUNT_ROWS - CANDIDATES, LANES), jnp.int32)], axis=0)  # [16, LANES]
                 total = jnp.sum(partial, axis=1, keepdims=True)  # [16, 1]
                 refs["local"][...] = jnp.where(lane16 == row, total, refs["local"][...])
 
-            return tuple(accs)
+            return tuple(bins)
 
         jax.lax.fori_loop(0, total, step_fn, zeros)
         return refs["local"][...]
@@ -604,11 +620,22 @@ class IndexSelect:
         for round_, shift in enumerate(KEY_SHIFTS):
             self._row_scalars(_PREFIX, "row_prefix")
 
-            def key_test(row, shift=shift):
-                prefix = refs["row_prefix"][row]
-                return lambda key, position, j: key >= ((prefix + _i32((j + 1) << shift)) ^ INT_MIN)
+            def key_digits(row, shift=shift):
+                # Candidate j's threshold is base + (j + 1) << shift: a key's digit is
+                # floor((key - base) >> shift), 15 for all above the round's range.
+                base = refs["row_prefix"][row] ^ INT_MIN
 
-            total = self._all_reduce(self._count(key_test, first=round_ == 0), parity, pending=round_ >= 2)
+                def digits(key, position, valid):
+                    diff = key - base  # wraps only from 2^31 above base: far above the range
+                    if shift:
+                        digit = jnp.minimum(jax.lax.shift_right_logical(diff, shift), 15)
+                    else:
+                        digit = jnp.where(diff < 0, 15, jnp.minimum(diff, 15))
+                    return digit, valid & (key >= base)
+
+                return digits
+
+            total = self._all_reduce(self._count(key_digits, first=round_ == 0), parity, pending=round_ >= 2)
             parity ^= 1
             ge = ((total >= topk) & (cand < CANDIDATES)).astype(jnp.int32)
             digit = jnp.sum(ge, axis=0, keepdims=True)  # [1, LANES]
@@ -638,12 +665,14 @@ class IndexSelect:
             for shift in POSITION_SHIFTS:
                 self._row_scalars(_POSITION, "row_position")
 
-                def position_test(row, shift=shift):
+                def position_digits(row, shift=shift):
+                    # Candidate j: tied keys at positions below floor + (j + 1) << shift.
                     tau = refs["row_prefix"][row] ^ INT_MIN
-                    prefix = refs["row_position"][row]
-                    return lambda key, position, j: (key == tau) & (position < prefix + ((j + 1) << shift))
+                    floor = refs["row_position"][row]
+                    return lambda key, position, valid: (
+                        jnp.clip((position - floor) >> shift, 0, 15), valid & (key == tau))
 
-                total = self._all_reduce(self._count(position_test), nonlocal_parity, pending=True)
+                total = self._all_reduce(self._count(position_digits, prefix=True), nonlocal_parity, pending=True)
                 nonlocal_parity ^= 1
                 need = topk - refs["state"][_UPPER:_UPPER + 1]
                 below = ((total < need) & (cand < CANDIDATES)).astype(jnp.int32)
