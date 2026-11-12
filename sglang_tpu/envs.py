@@ -527,11 +527,11 @@ class TpuEnvs:
     SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM = EnvBool(False)
 
     # Diffusion ring attention
-    # Run sequence-parallel ring attention with the Pallas ICI-DMA kernel; off
-    # keeps the K/V all-gather ring (multimodal_gen/tpu_splash_attn.py).
+    # Run ring attention on the Pallas paths (ICI-DMA kernel, short-shard 2D ring);
+    # off keeps the K/V all-gather ring (multimodal_gen/tpu_splash_attn.py).
     SGLANG_TPU_ENABLE_DIFFUSION_RING_KERNEL = EnvBool(True)
-    # Give heads whose logit bound allows it the fixed-m softmax instead of the
-    # online one (multimodal_gen/diffusion_ring_attention.py).
+    # Use the fixed-m softmax on heads whose logit bound allows it,
+    # the online one elsewhere (multimodal_gen/diffusion_ring_attention.py).
     SGLANG_TPU_ENABLE_DIFFUSION_RING_FIXED_M = EnvBool(True)
 
     @classmethod

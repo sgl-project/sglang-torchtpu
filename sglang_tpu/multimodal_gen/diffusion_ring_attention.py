@@ -185,7 +185,6 @@ _BKV_LADDER = (
 
 
 def _untuned_bkv_candidates(shard_len: int, r0_full: int) -> list[int]:
-    """KV block sizes to try: the ladder plus lane-aligned shard_len / n splits."""
     max_bkv = 4096 if shard_len >= 7500 else 6144
     bkv_ladder = tuple(b for b in _BKV_LADDER if b <= max_bkv)
     bkv_aligned = {-(-(-(-shard_len // n)) // _LANE) * _LANE for n in range(1, 20)}
@@ -199,7 +198,6 @@ def _untuned_bkv_candidates(shard_len: int, r0_full: int) -> list[int]:
 def _tile_score(
     shard_len: int, n_passes: int, bq: int, bkv: int, bkvc: int, qs: int
 ) -> float:
-    """Padding overhead plus per-block costs; lower is better."""
     n_kv = -(-shard_len // bkv)
     kv_pad_ratio = (n_kv * bkv) / shard_len
     q_pad_ratio = (n_passes * bq) / shard_len
@@ -215,7 +213,6 @@ def _tile_score(
 def _untuned_tiles_for_q_block(
     shard_len: int, target_q: int, bq: int, bkv_cands: list[int], fixed_m: bool
 ):
-    """Yield the (bkv, bkv_compute, q_sub) candidates for one block_q."""
     qs_cap = (3840 if target_q >= 7500 else 4096) if fixed_m else 3840
     max_qs = min(qs_cap, max(_LANE, (bq // 2) // _LANE * _LANE))
     min_qs = min(1536, max(_LANE, (bq // 8) // _LANE * _LANE))
@@ -241,7 +238,6 @@ def _best_untuned_tile(
     fixed_m: bool,
     head_dim: int,
 ) -> tuple[int, int, int, int] | None:
-    """Lowest-score tile that fits the VMEM budget with n_passes query blocks."""
     vmem_budget = int(0.94 * _V7X_VMEM_CAP_BYTES)
     target_q = -(-shard_len // n_passes)
     r0 = -(-target_q // _LANE) * _LANE
@@ -485,8 +481,6 @@ def _neighbor(
 
 
 class _KernelRefs(NamedTuple):
-    """Kernel operands and scratch buffers, in pallas_call order."""
-
     mk: Any
     q: Any
     k_hbm: Any
@@ -504,8 +498,6 @@ class _KernelRefs(NamedTuple):
 
 
 class _KernelConfig(NamedTuple):
-    """Static kernel parameters bound with functools.partial."""
-
     mask_value: float
     grid_width: int
     ring_size: int
@@ -524,8 +516,6 @@ class _KernelConfig(NamedTuple):
 
 
 class _GridStep(NamedTuple):
-    """Traced grid position: KV head, buffer slot and ring-hop flags."""
-
     h: Any
     j: Any
     r: Any
@@ -621,11 +611,8 @@ def _remote_push(refs: _KernelRefs, step: _GridStep, src_slot, dst_slot):
 
 
 def _kv_dma_prologue(refs: _KernelRefs, cfg: _KernelConfig, step: _GridStep) -> None:
-    """Wait for this hop's KV block and start the next one (1-credit double buffer).
-
-    Hop r > 0 computes on the block upstream pushed during hop r - 1; the last
-    hop of a KV block instead prefetches the next local block from HBM.
-    """
+    # Hop r > 0 computes on the block upstream pushed during hop r - 1; the last hop of a
+    # KV block prefetches the next local block from HBM instead (1-credit double buffer).
     import jax.numpy as jnp
     from jax import lax
     from jax.experimental import pallas as pl
@@ -715,13 +702,9 @@ def _for_each_q_chunk(refs: _KernelRefs, cfg: _KernelConfig, fn) -> None:
 
 
 def _two_body_last(cfg: _KernelConfig) -> bool:
-    """Whether fixed-m heads get their own body for the last KV block.
-
-    Only with a single KV block. Otherwise the last block runs the online body
-    for every head, and fixed-m heads resume from m pinned at the fixed value:
-    one compiled body less keeps the program inside tpu7x's instruction memory
-    (about 64K bundles), past which the kernel runs far slower.
-    """
+    # Fixed-m heads get their own last-KV-block body only with a single KV block. Otherwise
+    # they resume in the online body from m pinned at the fixed value: one compiled body less
+    # keeps the program inside tpu7x's ~64K-bundle instruction memory, past which it runs far slower.
     return cfg.grid_width == 1
 
 
@@ -798,7 +781,6 @@ def _fixed_inner(cfg: _KernelConfig, qk, v_chunk, m_fix, l_prev, o_prev):
 def _accumulate_kv_rows(
     refs: _KernelRefs, cfg: _KernelConfig, step: _GridStep, offset, length, fixed
 ) -> None:
-    """Fold KV rows [offset, offset + length) of this hop's slot into the accumulators."""
     import jax.numpy as jnp
     from jax import lax
     from jax.experimental import pallas as pl
@@ -850,7 +832,7 @@ def _run_full(refs: _KernelRefs, cfg: _KernelConfig, step: _GridStep, fixed) -> 
 
 
 def _run_tail(refs: _KernelRefs, cfg: _KernelConfig, step: _GridStep, fixed) -> None:
-    """Last KV block: only the real rows of the shard (the rest is padding)."""
+    # Only the real rows of the last KV block; the rest is padding.
     from jax import lax
 
     def body(kv_compute_index, _):
@@ -881,7 +863,6 @@ def _run_tail(refs: _KernelRefs, cfg: _KernelConfig, step: _GridStep, fixed) -> 
 def _accumulate_hop(
     refs: _KernelRefs, cfg: _KernelConfig, step: _GridStep, is_fixed
 ) -> None:
-    """Dispatch this hop's block to the fixed-m or online body, full or tail."""
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
 
@@ -968,7 +949,6 @@ def _ring_grid_spec(
     kv_dtype: tuple[Any, Any],
     single_buffered_q: bool,
 ):
-    """Q/Out blocks per (b, h, i), K/V left in HBM for the manual DMA ring, and scratch."""
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu

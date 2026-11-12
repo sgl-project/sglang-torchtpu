@@ -1107,14 +1107,10 @@ def _get_ring_op(
 
 
 def _ranks_pair_on_chip() -> bool:
-    """Whether ranks 2k and 2k + 1 are the two TensorCores of one chip.
-
-    True on tpu7x, where get_pallas_mesh maps torch rank r and r ^ 1 to one
-    chip's TensorCore pair (sglang_tpu/k3_megakernel/config.py); the short-2D
-    ring puts its Ulysses all_to_all on those pairs.
-    """
     from sglang_tpu.attention.pallas.util import get_tpu_version
 
+    # get_pallas_mesh puts ranks r, r ^ 1 on one tpu7x chip (k3_megakernel/config.py);
+    # short-2D runs its Ulysses all_to_all over those pairs.
     return get_tpu_version() == 7
 
 
