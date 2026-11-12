@@ -20,11 +20,13 @@ import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs as sgl_envs
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.pool_configurator import (
     MemoryPoolConfig,
     MemoryPoolConfigurator,
@@ -1481,10 +1483,20 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         needed_pages = self._page_ids_needed(need_f, need_s)
         short = needed_pages - self._free_page_count()
         if short > 0:
+            internal_swa = min(
+                _cdiv(short, self._swa_groups) * ps,
+                _internal_swa_tail_tokens(tree_cache),
+            )
+            if internal_swa > 0:
+                tree_cache.evict_for_alloc(
+                    EvictParams(num_tokens=0, swa_num_tokens=internal_swa)
+                )
+                short = needed_pages - self._free_page_count()
+        if short > 0:
             tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=short * ps, swa_num_tokens=0)
             )
-        short = needed_pages - self._free_page_count()
+            short = needed_pages - self._free_page_count()
         if short > 0:
             tree_cache.evict_for_alloc(
                 EvictParams(
@@ -1829,6 +1841,49 @@ def maybe_build_unified_kv_pool(
     )
 
 
+def _internal_swa_tail_tokens(tree_cache) -> int:
+    """Count unlocked non-leaf SWA tokens ahead of D-leaves at the SWA LRU tail."""
+    tree_core = getattr(tree_cache, "tree_core", None)
+    lru = getattr(tree_core, "lru_lists", {}).get(ComponentType.SWA)
+    leaves = getattr(tree_core, "evictable_device_leaves", None)
+    if lru is None or leaves is None:
+        return 0
+    swa_free_leaf_cutoff = min(
+        (
+            n.last_access_time
+            for n in leaves
+            if n.component_data[ComponentType.SWA].value is None
+        ),
+        default=float("inf"),
+    )
+    tokens = 0
+    node = lru.get_lru_no_lock()
+    while node is not None and node not in leaves:
+        prev = lru.get_prev_no_lock(node)
+        demoted = lru.skips_host_backup(node) or (
+            prev is not None and prev.last_access_time < node.last_access_time
+        )
+        if not demoted and node.last_access_time > swa_free_leaf_cutoff:
+            break
+        val = node.component_data[ComponentType.SWA].value
+        if val is not None:
+            tokens += len(val)
+        node = prev
+    return tokens
+
+
+def enable_unified_swa_cache_defaults() -> None:
+    """Enable lifecycle-aware SWA lock shrinking and stale-window demotion unless explicitly set."""
+    for field, val in (
+        (sgl_envs.SGLANG_OPT_SWA_CAP, True),
+        (sgl_envs.SGLANG_OPT_SWA_CAP_TEXT, "keep_prompt_end"),
+        (sgl_envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST, True),
+        (sgl_envs.SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS, True),
+    ):
+        if not field.is_set():
+            field.set(val)
+
+
 def maybe_build_unified_kv_pool_allocator(
     kvc,
     *,
@@ -1840,6 +1895,7 @@ def maybe_build_unified_kv_pool_allocator(
     """Build ``TpuUnifiedSWATokenToKVPoolAllocator`` for ``kvc`` when unified KV pool is enabled, else ``None``."""
     if not unified_kv_pool_enabled(kvc):
         return None
+    enable_unified_swa_cache_defaults()
     return TpuUnifiedSWATokenToKVPoolAllocator(
         sizes.full_max_total_num_tokens,
         page_size=get_schedule().page_size,
