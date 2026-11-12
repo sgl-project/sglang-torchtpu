@@ -323,6 +323,9 @@ def _tpu_deepseek_v4_env_adjustments(server_args: Any, previous) -> None:
     envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
     envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.set(False)
     envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.set(True)
+    # The DSpark draft gathers full-vocab logits through gather_and_crop_vocab;
+    # the TP-sharded Markov path returns local logits and uses NCCL/NVLink gathers.
+    envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.set(False)
 
 
 def register_tpu_dsv4_resolution_hooks() -> None:
