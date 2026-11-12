@@ -26,6 +26,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
+from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.runtime_context import get_context
@@ -573,6 +574,126 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         self.assertEqual(scheduler._deferred_chunked_sender_aborts, [])
         scheduler.run_batch.assert_not_called()
         scheduler.process_batch_result.assert_not_called()
+
+
+class _WaitingReq:
+    pass
+
+
+class _ParkingAdder:
+    """A PrefillAdder whose memory budget parks the continuation, as the
+    hybrid-SWA budget does when the next chunk does not fit, and admits every
+    waiting request."""
+
+    def __init__(self, *args, **kwargs):
+        self.can_run_list = []
+        self.new_chunked_req = None
+        self.preempt_list = []
+        self.host_load_indices = []
+        self.rem_chunk_tokens = 64
+        self.chunked_req_limit = None
+
+    def add_chunked_req(self, req):
+        return req
+
+    def add_one_req(self, req, **kwargs):
+        req.extend_range = Range(0, len(req.origin_input_ids))
+        self.can_run_list.append(req)
+        return AddReqResult.CONTINUE
+
+
+class TestParkedContinuationLeavesBatchUntouched(CustomTestCase):
+    """A continuation the budget parks is not in the batch, so the batch must
+    not count, carry or wait for it: a leaked middle-chunk count makes its real
+    last chunk look like a middle chunk, and the request is never finished."""
+
+    def _scheduler(self, chunked_req, waiting):
+        enter_scope(self, published_topology())
+        s = Scheduler.__new__(Scheduler)
+        s.grammar_manager = MagicMock(
+            has_waiting_grammars=MagicMock(return_value=False)
+        )
+        s.enable_priority_preemption = False
+        s.is_hybrid_swa = True
+        s.chunked_req = chunked_req
+        s.waiting_queue = list(waiting)
+        s.min_free_slots_delayer = None
+        s.get_num_allocatable_reqs = MagicMock(return_value=8)
+        s.policy = MagicMock()
+        s.processed_tokens_counter = 0
+        s.chunked_prefill_size = 64
+        s.dynamic_chunk_sizer = None
+        s.tp_worker = MagicMock()
+        s.tp_worker.model_runner.prefill_aware_swa = False
+        s._tpu_pp_chunk_cost = None
+        s.page_size = 1
+        s.tree_cache = MagicMock()
+        s.token_to_kv_pool_allocator = MagicMock()
+        s.new_token_ratio_tracker = MagicMock()
+        s.max_prefill_tokens = 64
+        s.is_mixed_chunk = False
+        s.priority_scheduling_preemption_threshold = 10
+        s.max_prefill_bs = 8
+        s.max_running_requests = 8
+        s.dllm_config = None
+        s.enable_lora = False
+        s.req_to_token_pool = SimpleNamespace()
+        s.disaggregation_mode = DisaggregationMode.PREFILL
+        s.req_to_token_pool.available_size = lambda: 8
+        s.enable_hicache_storage = False
+        s.enable_lmcache = False
+        s.enable_hierarchical_cache = False
+        s.enable_unified_cache_external_linker = False
+        s.truncation_align_size = None
+        s.model_config = MagicMock()
+        s.enable_overlap = True
+        s.spec_algorithm = MagicMock()
+        s.enable_priority_scheduling = False
+        s.load_inquirer = MagicMock()
+        return s
+
+    def _waiting_req(self, rid):
+        # Hashable, like Req: the scheduler keeps admitted requests in a set.
+        req = _WaitingReq()
+        req.rid = rid
+        req.origin_input_ids = [1, 2, 3]
+        req.token_indices_to_pool = None
+        req.beam_group = None
+        req.init_next_round_input = lambda tree_cache: None
+        return req
+
+    def test_parked_continuation_is_not_counted_or_carried(self):
+        continuation = _make_req(
+            req_pool_idx=1,
+            fill_ids=list(range(32)),
+            prefix_indices=torch.arange(8),
+            extend_input_len=8,
+            fill_len=16,
+        )
+        continuation.init_next_round_input = lambda: None
+        waiting = self._waiting_req("short")
+        s = self._scheduler(continuation, [waiting])
+        running_batch = SimpleNamespace(reqs=[], batch_is_full=False)
+
+        with (
+            patch("sglang.srt.managers.scheduler.PrefillAdder", _ParkingAdder),
+            patch("sglang.srt.managers.scheduler.ScheduleBatch") as batch_cls,
+            patch("sglang.srt.managers.scheduler.PrefillStats"),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            new_batch, _ = Scheduler._get_new_batch_prefill_raw(
+                s, prefill_delayer_single_pass=None, running_batch=running_batch
+            )
+
+        self.assertIs(new_batch, batch_cls.init_new.return_value)
+        self.assertEqual(batch_cls.init_new.call_args.args[0], [waiting])
+        # The parked continuation stays queued for the next pass.
+        self.assertIs(s.chunked_req, continuation)
+        self.assertEqual(continuation.inflight_middle_chunks, 0)
+        self.assertIsNone(batch_cls.init_new.call_args.kwargs["chunked_req"])
+        # The one request in the batch finishes its prompt here.
+        self.assertTrue(new_batch.contains_last_prefill_chunk)
+        s.load_inquirer._get_num_pending_tokens.assert_called_once_with(chunk_deduct=0)
 
 
 class TestDynamicFirstChunkCap(CustomTestCase):
