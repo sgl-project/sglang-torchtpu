@@ -46,8 +46,10 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
         max_requests=args.max_running_requests,
     )
     mk.radix_snapshots = not args.disable_radix_cache
-    if tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL_PRECOMPILE.get():
-        mk.precompile()
+    # The buckets of the server's warm-up batch sizes compile now, with the warm-up.
+    from sglang.srt.runtime_context import get_exec
+
+    mk.precompile(get_exec().graph.tpu_compile_bs or [1])
     model._tpu_glm_flash_mk = mk
     _KERNELS.append(mk)
     compiled = model.forward

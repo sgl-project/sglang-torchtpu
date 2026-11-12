@@ -196,9 +196,6 @@ class TpuEnvs:
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(None)
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_ROWS = EnvInt(32)
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_CALL_ROWS = EnvInt(32)
-    # Run every request bucket once at startup so its program compiles before
-    # serving; the 32-row bucket compiles for ~17 min at its first step otherwise.
-    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_PRECOMPILE = EnvBool(False)
     # Experimental: the kpool indexer's StreamIndex page table stays in HBM with
     # one row per sequence in SMEM, so a context past ~262k fits the 1 MiB SMEM.
     SGLANG_TPU_GLM_FLASH_PAGE_TABLE_HBM = EnvBool(False)

@@ -367,13 +367,17 @@ class GlmFlashMegakernel:
                     **self._step_input_tables(),
                 )
 
-    def precompile(self) -> None:
-        """Run every bucket once on zero inputs so its program compiles now; serving
-        compiles a bucket at its first real step otherwise. Nothing is live at startup,
-        so the rows the calls write (page 0, state slot 0) are harmless."""
+    def precompile(self, batch_sizes) -> None:
+        """Run the bucket of each warm-up batch size once on zero inputs, so its program
+        compiles with the rest of the server's warm-up and not at its first step (the
+        32-row bucket takes ~15 min). Nothing is live at startup, so the rows the calls
+        write (page 0, state slot 0) are harmless."""
         device = self.k_scales.device
         Q, pps = self.Q, self.pages_per_seq
-        for b in sorted(self.cfgs):
+        buckets = sorted(
+            {self._bucket(min(n, self.call_req)) for n in batch_sizes if n >= 1}
+        )
+        for b in buckets:
             t0 = time.perf_counter()
             with torch.no_grad():
                 zeros = lambda *shape, dtype=torch.int64: torch.zeros(
