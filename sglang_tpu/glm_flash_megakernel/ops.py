@@ -404,8 +404,8 @@ class GlmFlashMegakernel:
         count = torch.tensor([src.shape[0]], dtype=torch.int32, device=src.device)
         compiled_state_copy()(
             self._mamba._copy_states(),
-            self._pad(src, bucket),
-            self._pad(dst, bucket),
+            _pad(src, bucket),
+            _pad(dst, bucket),
             count,
         )
 
