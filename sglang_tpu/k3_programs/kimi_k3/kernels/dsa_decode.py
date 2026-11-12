@@ -50,15 +50,13 @@ CHUNK = 512  # rows of a streamed weight chunk (wq_b's contraction rows, d_wks /
 
 def ring(batch: int = 1) -> int:
     """Chunk slots of the weight stream: ``KernelConfig.dsa_weight_ring`` up to 8
-    rows, at most 6 up to 16, else 3 (the wider verifies' decode VMEM is full)."""
+    rows, else 3 (the wider verifies' decode VMEM is full)."""
     from sglang_tpu.k3_programs.kimi_k3.config import active
 
     config = active()
-    if config is None or batch > 16:
+    if config is None or batch > 8:
         return 3
-    return max(
-        2, config.dsa_weight_ring if batch <= 8 else min(config.dsa_weight_ring, 6)
-    )
+    return max(2, config.dsa_weight_ring)
 
 
 LANES = dsa_dcp.LANES

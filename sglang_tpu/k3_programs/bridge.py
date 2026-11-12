@@ -77,6 +77,16 @@ def kernel_mesh(axis: str, world_size: int | None = None) -> tuple[Mesh, int]:
     return _MESH[axis]
 
 
+def _tracing_grid_context():
+    """The Pallas kernel being traced, if any (jax < 0.12: an attribute of the
+    tracing env; jax >= 0.12: a config context value)."""
+    env = pallas_core._pallas_tracing_env
+    if hasattr(env, "grid_context"):
+        return env.grid_context
+    context = getattr(pallas_core, "_grid_context", None)
+    return None if context is None else context.value
+
+
 @contextlib.contextmanager
 def spmd_safe_axis_index():
     """Route XLA-level ``jax.lax.axis_index`` through Pallas while active.
@@ -95,7 +105,7 @@ def spmd_safe_axis_index():
         # ``VectorSubcoreMesh`` traces through ``mpmd_map``, which sets neither).
         names = axis_name if isinstance(axis_name, tuple) else (axis_name,)
         if (
-            pallas_core._pallas_tracing_env.grid_context is not None
+            _tracing_grid_context() is not None
             or pallas_core.current_grid_env() is not None
             or not all(name in _MESH for name in names)
         ):

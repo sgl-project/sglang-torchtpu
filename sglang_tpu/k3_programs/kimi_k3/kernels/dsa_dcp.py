@@ -148,7 +148,7 @@ CHUNK_ROWS = (
 WIDE_CHUNK_BATCH = 64  # below that many rows the count passes read 8 rows a step
 WIDE_CHUNK_ROWS = 128  # below WIDE_CHUNK_MAX_BATCH rows: a long-context row's keys in one step a round
 WIDE_CHUNK_MAX_BATCH = (
-    16  # from 16 rows the decode VMEM is full (the gather finish, weight ring)
+    32  # the 32-row verify's decode VMEM has no room for the wide chunks
 )
 # DMA ring depths: a page or chunk step computes little, so several copies stay
 # in flight (one HBM -> VMEM copy is ~0.9 us; a ring of two waits on each).
@@ -203,7 +203,9 @@ _PREFIX, _UPPER, _LOWER, _POSITION, _LIMIT = range(5)  # state rows (lanes: batc
 # holds at most GATHER_SLOTS keys over the group, each rank sends its keys in the
 # bin (with their positions) and every rank finishes the rounds on them locally.
 GATHER_SLOTS = 16
-GATHER_MAX_BATCH = 16  # its exchange buffer is group x rows x 128 words of VMEM
+GATHER_MAX_BATCH = (
+    8  # the 16-row verify's decode VMEM has no room for its exchange buffer
+)
 GATHER_FROM_ROUND = 3  # the last key round before the first check (16 bits resolved)
 
 

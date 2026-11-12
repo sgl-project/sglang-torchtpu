@@ -115,12 +115,14 @@ def page_plan(
     stage twice the span, see ``staged_folds``). Verifies above four rows:
     half the span, twice the buffers (4 at B64 and attention DP's B32), 3/4
     chunked. ``dsa`` (Kimi-K3.1's selection): verifies keep at most four
-    buffers (its own per-step buffers take the VMEM)."""
+    buffers, three from 32 rows (its own per-step buffers take the VMEM)."""
     if dsa and sequence_rows > 1:
         plan = page_plan(
             batch, heads, sequence_rows, cache_dtype, force_chunks=force_chunks
         )
-        return {**plan, "buffers": min(plan["buffers"], BUFFERS)}
+        # The 32-row verify's decode VMEM fits three steps in flight beside the
+        # indexer's buffers.
+        return {**plan, "buffers": min(plan["buffers"], BUFFERS if batch < 32 else 3)}
     if batch <= 4:
         return {"span": SPAN, "buffers": BUFFERS}
     if sequence_rows == 1:
