@@ -131,6 +131,16 @@ WIDE_BATCH = 64  # from this many rows: rings of 3 and 4 (the decode's VMEM plan
 ACTIVITY_MIN_STEPS = 16
 
 
+def _scope(name):
+    """A named phase scope for XProf (KernelConfig.phase_scopes), else nothing."""
+    import contextlib
+
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    config = active()
+    return jax.named_scope(name) if config is not None and config.phase_scopes else contextlib.nullcontext()
+
+
 def chunk_rows(batch: int) -> int:
     """Key rows a counting step reads (a step's overhead outweighs its rows; the
     wider chunk's ring needs VMEM the widest batches lack)."""
@@ -1087,3 +1097,19 @@ def select_call(q8, w_t, new_k8, pool, tables, positions, new_exp, *, pages: int
         compiler_params=pltpu.CompilerParams(has_side_effects=True),
         interpret=interpret,
     )(positions, new_exp, tables, q8, w_t, new_k8, pool)
+
+
+def _scoped(name, fn):
+    @functools.wraps(fn)
+    def inner(*args, **kwargs):
+        with _scope(name):
+            return fn(*args, **kwargs)
+
+    return inner
+
+
+# XProf phase scopes (KernelConfig.phase_scopes): the selection's parts.
+for _name, _method in (("d0_plan", "plan"), ("d0_in_flight", "in_flight"), ("d1_score", "score"),
+                       ("d2_count", "_count"), ("d3_exchange", "_all_reduce"), ("d4_select", "select"),
+                       ("d6_activity", "step_activity")):
+    setattr(IndexSelect, _method, _scoped(_name, getattr(IndexSelect, _method)))

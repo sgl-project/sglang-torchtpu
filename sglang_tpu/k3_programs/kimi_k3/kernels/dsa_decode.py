@@ -283,6 +283,10 @@ class DecodeIndexer:
     def selection(self, cache, position_ref, hidden, query_latent, parity) -> mla_dcp.DcpSelection:
         """``hidden`` [B, hidden] and ``query_latent`` [B, 1536] (normalized,
         BF16) values; ``cache`` the layer's ``mla_dcp.DcpCache``."""
+        with dsa_dcp._scope("d_indexer"):
+            return self._selection(cache, position_ref, hidden, query_latent, parity)
+
+    def _selection(self, cache, position_ref, hidden, query_latent, parity) -> mla_dcp.DcpSelection:
         s, batch = self.scoped, hidden.shape[0]
         group = cache.group
         per = HEADS // group
@@ -375,3 +379,7 @@ class DecodeIndexer:
         record_copy.wait()
         return mla_dcp.DcpSelection(self.keys, s["tau"], s["p_tie"], s["own"],
                                     s["attend_keys"], s["attend_key_sems"], active=s["active"], steps=steps)
+
+
+for _name, _method in (("d5_query", "_query"), ("d5_key", "_key_part"), ("d5_gate", "_gate")):
+    setattr(DecodeIndexer, _method, dsa_dcp._scoped(_name, getattr(DecodeIndexer, _method)))
