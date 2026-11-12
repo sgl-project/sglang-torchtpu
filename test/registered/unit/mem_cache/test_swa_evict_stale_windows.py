@@ -509,11 +509,17 @@ class TestSWADemoteFinalWindows(unittest.TestCase):
     def _media_hit_after_dead_tails(self, *, stage1: bool, stage2: bool) -> int:
         return self._media_hit(self._world(stage1=stage1, stage2=stage2))
 
-    def _media_hit(self, w: PrefillWorld) -> int:
-        """First visit of a media prefix, then newer unrelated requests; keep only
-        a few windows of SWA; a sibling (same media, new text) matches."""
+    def _media_hit(self, w: PrefillWorld, *, retract: bool = False) -> int:
+        """First visit of a media prefix (retracted once if ``retract``), then newer
+        unrelated requests; keep only a few windows of SWA; a sibling (same media,
+        new text) matches."""
         media = _tokens(1, self.MEDIA)
-        w.prefill(media + _tokens(2, self.TAIL), self.CHUNK, media=(64, self.MEDIA))
+        w.prefill(
+            media + _tokens(2, self.TAIL),
+            self.CHUNK,
+            media=(64, self.MEDIA),
+            retract=retract,
+        )
         for k in range(6):
             w.prefill(_tokens(50 + k, self.MEDIA + self.TAIL), self.CHUNK)
         keep = 4 * (WINDOW + 1)
@@ -537,46 +543,17 @@ class TestSWADemoteFinalWindows(unittest.TestCase):
             self._media_hit_after_dead_tails(stage1=True, stage2=True), self.MEDIA
         )
 
-    def test_stage1_alone_leaves_dead_tails_ahead_of_the_media_window(self):
-        """Stage 1 keeps the media window out of its demotion, but newer requests'
-        dead tails still outlive it in LRU order; stage 2 demotes them."""
+    def test_stage1_alone_demotes_the_media_window(self):
+        """Stage 1 treats the first-visit media window as stale; stage 2 exempts it."""
         self.assertLess(
             self._media_hit_after_dead_tails(stage1=True, stage2=False), self.MEDIA
         )
 
-    def _newest_media_hit(self, *, retract: bool) -> int:
-        """Six older requests, then the first visit of a media prefix (retracted
-        once if ``retract``); keep 8 windows of SWA; a sibling matches."""
-        w = self._world(stage1=True, stage2=False)
-        for k in range(6):
-            w.prefill(_tokens(50 + k, self.MEDIA + self.TAIL), self.CHUNK)
-        media = _tokens(1, self.MEDIA)
-        w.prefill(
-            media + _tokens(2, self.TAIL),
-            self.CHUNK,
-            media=(64, self.MEDIA),
-            retract=retract,
-        )
-        keep = 8 * (WINDOW + 1)
-        w.cache.evict(
-            EvictParams(
-                num_tokens=0, swa_num_tokens=w.cache.swa_evictable_size() - keep
-            )
-        )
-        hit = len(w.match(media + _tokens(3, 200)).device_indices)
-        w.cache.sanity_check()
-        return hit
-
-    def test_stage1_keeps_the_newest_first_visit_media_window(self):
-        """Stage 1 demotes each insert's stale windows; the first visit of a media
-        prefix, inserted last, would put its media-end window at the eviction end,
-        ahead of every older request's windows."""
-        self.assertEqual(self._newest_media_hit(retract=False), self.MEDIA)
-
-    def test_stage1_keeps_the_media_window_across_retraction(self):
+    def test_media_window_survives_retraction(self):
         """A retracted first visit re-prefills on top of its own cached prompt; its
-        media window must stay out of stage 1's demotion there too."""
-        self.assertEqual(self._newest_media_hit(retract=True), self.MEDIA)
+        media window stays exempt from stage 2 there too."""
+        w = self._world(stage1=False, stage2=True)
+        self.assertEqual(self._media_hit(w, retract=True), self.MEDIA)
 
     def test_revisit_is_not_first_visit(self):
         """A request whose floor already covers the media has no media window to keep."""
