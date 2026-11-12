@@ -375,7 +375,8 @@ class TestDSV41Ratio2AcrossChunks(CustomTestCase):
             for odd in range(1, n, 2):
                 pair = slice(odd - 1, odd + 1)
                 pooled = layer.compressor.pool_pairs(kv[pair][None], score[pair][None])
-                latent = layer.compressor.finish(pooled)
+                # FP32 through RMSNorm, one BF16 rounding (vllm save_compress_norm).
+                latent = layer.compressor.norm(pooled.float()).to(torch.bfloat16)
                 freqs = layer.freqs_cis[torch.tensor([odd - 1])]
                 record = _full_loc(slot, odd) // 2
                 expected_records.append(record)
@@ -424,7 +425,9 @@ class TestDSV41Ratio2AcrossChunks(CustomTestCase):
             forward_batch=batch,
         )
         self.assertEqual(ops.main_writes, batch.out_cache_loc[:15].tolist())
-        latent = compressor.finish(compressor.project(x[3:4])[0])
+        # FP32 projection and norm, one BF16 rounding (vllm-torchtpu compressor).
+        kv = torch.mm(x[3:4].float(), compressor.wkv.weight.float().t())
+        latent = compressor.norm(kv).to(torch.bfloat16)
         expected = rope_tail(latent, layer.freqs_cis[batch.positions[3:4]], 64)
         torch.testing.assert_close(
             pool.words[int(batch.out_cache_loc[3])], expected[0].float()
