@@ -1827,5 +1827,8 @@ for _name, _method in (
     ("d3_exchange", "_all_reduce"),
     ("d4_select", "select"),
     ("d6_activity", "step_activity"),
+    ("d7_extract", "_extract"),
+    ("d7_gather", "_exchange_candidates"),
+    ("d7_finish", "_gather_finish"),
 ):
     setattr(IndexSelect, _method, _scoped(_name, getattr(IndexSelect, _method)))
