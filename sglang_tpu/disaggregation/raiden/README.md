@@ -100,8 +100,10 @@ go on a third engine with `max_blocks=1`. Each side maps its request's
 decode may use different checkpoint widths. The state row rides the `BLOCKS`
 reply and is read as `state:<room>` alongside the whole read (or the closing
 read of a chunked transfer); a full prefix hit still moves it, since state
-cannot be rebuilt from cached KV. Push-resharding and pipeline transfer raise
-`NotImplementedError` for these models.
+cannot be rebuilt from cached KV. Push-resharding raises `NotImplementedError`
+for these models; the pipeline transfer moves their state from a
+tensor-parallel prefill to an attention-DP decode only (see
+"Tensor-parallel prefill to attention-DP decode").
 
 ## Scope (v1)
 
@@ -112,14 +114,14 @@ chunk-cache mode.
 Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
 push-resharding path above. Needs `tpu_sync` built against the same `torch_tpu`
 as this fork (tpu-sync `build.sh`). Not covered: MLA under push-resharding,
-NSA, Mamba/GDN/KDA under push-resharding or pipeline transfer, speculative draft
-KV, decode prefix-cache reuse, `dst_tp > src_tp`.
+NSA, Mamba/GDN/KDA under push-resharding or between pipeline stages, speculative
+draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 
 ## Tunables (env)
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `SGLANG_RAIDEN_PIPELINE_TRANSFER` | `0` | named layer pools for a PP producer and a DP, TP, or matching-PP consumer; set to `1` on a decode that is not itself a pipeline |
+| `SGLANG_RAIDEN_PIPELINE_TRANSFER` | `0` | named layer pools for a PP producer and a DP, TP, or matching-PP consumer; set to `1` on a decode that is not itself a pipeline. Set to `1` on both a tensor-parallel prefill and its attention-DP decode to move a split sparse-MLA pool and KDA state between them |
 | `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 6*node_worker_rank` over every PP/CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`, GDN state engine control/data = `+4`/`+5`) |
 | `SGLANG_RAIDEN_HOST_POOL_GB` | `64` | host staging budget in GiB per node, split across local ranks. Each rank sizes all of its engines together (see below). Each engine gets at least one slot; when one max-length transfer does not fit, it still gets one slot, over the budget, and logs a warning with both sizes |
 | `SGLANG_TPU_RAIDEN_STAGING_LAYERS` | `8` | host layer buffers across the full-attention and SWA engines, split by their layer counts with at least one each (`8` gives Muse Spark 2 + 6). `0` keeps full mirrors, which asymmetric TP needs on prefill and decode |
@@ -225,6 +227,37 @@ the closing transfer and of each stage group move as a twin native transfer
 only once its twin has. By default the closing transfer and its twin move after
 the prefill finishes. Full-attention and window page lists remain independent,
 and a cached decode prefix is clipped from each layer's transfer.
+
+### Tensor-parallel prefill to attention-DP decode
+
+The same transfer serves a tensor-parallel prefill of a model whose KV pages
+have no kv-head axis, so that every attention-TP rank holds each page whole:
+the split sparse-MLA pool of GLM-5.3-Flash (`TpuSplitMLATokenToKVPool`), with
+its KDA state. Set `SGLANG_RAIDEN_PIPELINE_TRANSFER=1` on both engines; the
+prefill uses `--tp-size 8` and the decode
+`--tp-size 8 --dp-size 8 --enable-dp-attention --enable-dp-lm-head`. Without
+the variable a tensor-parallel prefill keeps the pull and push paths above.
+
+- Pools are named by what the pool calls its buffers and by model layer:
+  `mla.nope.lN`, `mla.rope.lN`, `dsa.idx.lN`, `dsa.raw.lN`, and `draft.` before
+  those of a separate draft pool. Pages move whole. The prefill's ranks stripe
+  them: page `i` of a request moves from rank `i % tp`, so the ranks' spans
+  cover each page once and a decode worker receives one transfer from all of
+  them. A rank with no page of a short request registers nothing in the store
+  and settles with its state.
+- The KDA state tensors go on the second engine as `gdn.conv.lN` and
+  `gdn.ssm.lN` (control port `+4`, as on the pull path) and move as the twin
+  transfer `state:<id>`. A prefill rank holds its heads' share of a request's
+  state row and the decode worker the full-width row, so each rank's spans
+  place its share of each independently sharded sub-block (query, key and
+  value of a conv row, repeated per tap; the heads of a recurrent row) where
+  `compute_mamba_state_slice_blocks` puts it. The bytes move by offset between
+  tensors of different widths, so a worker refuses at startup a state tensor
+  whose device layout does not keep a row's bytes in row-major order.
+- A tensor-parallel decode, per-head KV on a tensor-parallel prefill, and the
+  three overlap modes below are refused at startup. A decode that already
+  holds every page of a request (a prefix cache) fails the request, since the
+  state does not move without the pages.
 
 With `SGLANG_TPU_USE_BLOCK_MAJOR_KV=1` a worker holds one bundle per attention
 group, every layer of a page in one row, and registers it as a single pool

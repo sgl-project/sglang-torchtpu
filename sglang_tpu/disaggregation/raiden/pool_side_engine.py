@@ -4,19 +4,22 @@ tpu-sync's KVCacheManager requires every storage it wraps to hold the same
 number of blocks, because they share one block-id space. A pool family whose
 block count differs from the full-attention pages' therefore fails at startup
 in one engine with them. As the non-pipeline Raiden path does, each worker
-wraps such a family in a second engine instead. The sliding window is the one
-family today: a hybrid pool's sliding-window layers hold far fewer pages than
-its full-attention layers.
+wraps such a family in a second engine instead. There are two families, and a
+worker carries one at most: the sliding window, a hybrid pool's sliding-window
+layers, which hold far fewer pages than its full-attention layers; and
+linear-attention (GDN/KDA) state, one row per request.
 
 Terms used here and at the call sites in pool_transfer.py:
 
-- family (Family; SwaFamily): what the second engine carries, and how its
-  blocks are sized, sliced into spans, placed on the destination and announced.
+- family (Family; SwaFamily, StateFamily): what the second engine carries, and
+  how its blocks are sized, sliced into spans, placed on the destination and
+  announced.
 - link (SideLink): one worker's second engine, with its controller, its work
   unit and the state of its twins.
-- twin: the native transfer ``swa:<req_id>`` that moves the family's blocks
-  (the window pages) of a closing transfer or a stage group between the second
-  engines; early parts carry none and have no twin. A stage registers the twin
+- twin: the native transfer ``swa:<req_id>`` or ``state:<req_id>`` that moves
+  the family's blocks (the window pages, the state row) of a closing transfer
+  or a stage group between the second engines; early parts carry none and have
+  no twin. A stage registers the twin
   together with the transfer's full-attention pages and announces both in one
   READY; decode rank 0 coordinates the twin on threads of its own,
   concurrently with the full-attention transfer.
@@ -53,11 +56,14 @@ from sglang_tpu.disaggregation.raiden.host_pool import slot_host_bytes
 from sglang_tpu.disaggregation.raiden.pool_spans import (
     _derived_uuid,
     _new_transfer_state,
+    is_state_pool,
     is_swa_pool,
     parse_req_id,
     part_destination_blocks,
     part_spans,
     stage_req_id,
+    state_destination,
+    state_shard_spans,
 )
 
 logger = logging.getLogger(__name__)
@@ -175,9 +181,70 @@ class SwaFamily(Family):
         )
 
 
+class StateFamily(Family):
+    """Linear-attention (GDN/KDA) state: one row per request in every state
+    tensor. An attention-TP rank holds its heads' share of the row, so the
+    twin gathers the producer ranks' shares into the decode's full-width row."""
+
+    name = "state"
+    label = "linear-attention state"
+    cargo = "linear-attention state"
+    twin_prefix = "state:"
+    store_name = "pipeline-state"
+    port_offset = 4
+    count_key = "state"
+    controller_key = "state_controller"
+    unit_key = "state_unit"
+    remedy = "serve the model with the prefill's attention TP on the decode"
+    agreement = "serve the same model on both"
+    no_side_block = "the decode holds no row for the producer's linear-attention state"
+    no_full_page = (
+        "the decode already holds every KV page of the request, and its "
+        "linear-attention state does not move without them; run the decode "
+        "without a prefix cache"
+    )
+
+    @staticmethod
+    def owns(tag: str) -> bool:
+        return is_state_pool(tag)
+
+    @staticmethod
+    def tensors(groups) -> list[Any]:
+        return list(groups.state)
+
+    @staticmethod
+    def max_blocks(manager) -> int:
+        return manager._state_max_blocks
+
+    @staticmethod
+    def sent_blocks(manager, room: int) -> list[int]:
+        return list(manager._prefill.send_state_rows.get(room, []))
+
+    @staticmethod
+    def spans(transfer, link, blocks: list[int], dst_attn_tp: int) -> list[Any]:
+        """Spans of ``blocks``, the request's state row on the producer: this
+        rank's head shard of the full-width row."""
+        manager = transfer.manager
+        if dst_attn_tp != 1:
+            raise ValueError(
+                "Raiden pipeline transfer moves linear-attention state to an "
+                f"attention-TP 1 consumer only; got attention TP {dst_attn_tp}"
+            )
+        return state_shard_spans(
+            link.pools, blocks, rank=manager.attn_tp_rank, workers=manager.attn_tp_size
+        )
+
+    @staticmethod
+    def destination(link, blocks: list[int], count: int, only_tags=None) -> dict:
+        """Destination rows of a twin of ``count`` source rows among the
+        decode's state rows ``blocks``."""
+        return state_destination(link.pools, blocks[:count])
+
+
 SWA = SwaFamily()
+STATE = StateFamily()
 # Every family a second engine can carry; a worker's pools belong to one at most.
-FAMILIES = (SWA,)
+FAMILIES = (SWA, STATE)
 
 
 def family_of(pools: list[dict]):
@@ -518,6 +585,17 @@ def register_twin(
         raise
     link.registered.add(req_id)
     link.book.expect(req_id, True)
+
+
+def settle_half(transfer, req_id: str) -> bool:
+    """Report the full-attention half of ``req_id`` as sent, for a producer
+    with no page in it: its engine reports none. False when the transfer has
+    no twin registered, so nothing is left to settle."""
+    link = transfer.side
+    if link is None or req_id not in link.registered:
+        return False
+    link.book.feed(req_id, "fa", "sent")
+    return True
 
 
 def complete_twin(transfer, req_id: str) -> None:

@@ -243,7 +243,11 @@ class RaidenReceiverMixin:
     ) -> None:
         if self._pipeline is not None:
             self._pipeline.register_decode(
-                room, local_blocks, local_swa_blocks, aux_index, bootstrap_infos
+                room,
+                local_blocks,
+                local_state_rows if self._pipeline.moves_state else local_swa_blocks,
+                aux_index,
+                bootstrap_infos,
             )
             return
         if len(bootstrap_infos) != 1:
