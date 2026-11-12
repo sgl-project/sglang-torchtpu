@@ -970,8 +970,6 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 cross_attn_key_value=key_value,
             )
 
-        self.cnt += 1
-
         # SP: all-gather current tokens before output
         if sequence_shard_enabled:
             current_tokens = hidden_states[:, -local_seq_len:, :].contiguous()

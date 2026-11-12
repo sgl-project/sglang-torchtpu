@@ -2027,7 +2027,7 @@ class _SwaStrategy(StackStrategy):
         )
 
 
-class MambaSwaStrategy(StackStrategy):
+class _MambaSwaStrategy(StackStrategy):
     # A platform whose KV or state layout the built-in host pools cannot read
     # overrides these.
     kv_host_pool_fn: Optional[Callable[..., Any]] = None
@@ -2300,7 +2300,7 @@ _STRATEGIES: list[StackStrategy] = [
     _DeepSeekV4Strategy(),
     MambaStrategy(),
     _SwaStrategy(),
-    MambaSwaStrategy(),
+    _MambaSwaStrategy(),
     _DsaStrategy(),
     _MiniMaxSparseStrategy(),
     _PlainKvStrategy(),
@@ -2310,7 +2310,8 @@ _STRATEGIES: list[StackStrategy] = [
 def register_stack_strategy(strategy: StackStrategy) -> None:
     """Prepend a strategy so downstream forks can plug in (kvcache, components)
     combinations not in the built-in list."""
-    _STRATEGIES.insert(0, strategy)
+    if strategy not in _STRATEGIES:
+        _STRATEGIES.insert(0, strategy)
 
 
 def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrategy:

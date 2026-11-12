@@ -19,7 +19,6 @@ request's slot before its extend, which then resumes from it.
 
 from typing import TYPE_CHECKING, Optional
 
-
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -307,7 +306,9 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         # [seqs * hist, dim], oldest row first per sequence.
         old = read_state_rows(state, slots).reshape(num_seqs, hist, dim).float()
         # where, not a multiply: a recycled slot's stale rows must not leak NaN/Inf.
-        old = torch.where(has_state[:, None, None], old, torch.zeros_like(old)).reshape(num_seqs * hist, dim)
+        old = torch.where(has_state[:, None, None], old, torch.zeros_like(old)).reshape(
+            num_seqs * hist, dim
+        )
         xf = x.float()
 
         def lag_weight(lag, dyn_rows=None):
@@ -315,26 +316,39 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
                 return weight.reshape(dim, -1)[:, kernel_size - 1 - lag].float()[None]
             head_dim = dim // dyn.shape[1]
             d = dyn if dyn_rows is None else dyn.index_select(0, dyn_rows)
-            return weight[lag].float()[None] + d[:, :, lag].float().repeat_interleave(head_dim, dim=1)
+            return weight[lag].float()[None] + d[:, :, lag].float().repeat_interleave(
+                head_dim, dim=1
+            )
 
         # In-forward taps as shifted reads of x; the first `hist` rows of each sequence take
         # their older taps from the state, added below as [seqs * hist] rows instead of a
         # [tokens] gather per lag.
-        scale = (kernel_size * (2 if dyn is not None else 1) + int(use_residual)) ** -0.5
+        scale = (
+            kernel_size * (2 if dyn is not None else 1) + int(use_residual)
+        ) ** -0.5
         taps_kernel = dyn is None and supports_sconv_taps(num_tokens, kernel_size)
         if taps_kernel:
             w_lag = weight.reshape(dim, kernel_size).flip(1).t().float().contiguous()
-            y = sconv_taps_tpu(x, pos[:, None], w_lag, use_residual=use_residual, scale=scale)
+            y = sconv_taps_tpu(
+                x, pos[:, None], w_lag, use_residual=use_residual, scale=scale
+            )
         else:
             acc = xf if use_residual else torch.zeros_like(xf)
             for lag in range(kernel_size):
                 past = xf
                 if lag:
                     shifted = torch.cat((xf.new_zeros(lag, dim), xf))[:num_tokens]
-                    past = torch.where((pos >= lag)[:, None], shifted, torch.zeros_like(shifted))
+                    past = torch.where(
+                        (pos >= lag)[:, None], shifted, torch.zeros_like(shifted)
+                    )
                 acc = acc + lag_weight(lag) * past
         head_pos = torch.arange(hist, device=x.device, dtype=torch.int32)
-        head_rows = (qsl[:-1, None] + head_pos[None]).clamp(0, num_tokens - 1).reshape(-1).long()
+        head_rows = (
+            (qsl[:-1, None] + head_pos[None])
+            .clamp(0, num_tokens - 1)
+            .reshape(-1)
+            .long()
+        )
         head_live = (head_pos[None] < q_lens[:, None]).reshape(-1)
         old_seq = old.reshape(num_seqs, hist, dim)
         corr = torch.zeros(num_seqs * hist, dim, device=x.device, dtype=torch.float32)
@@ -343,7 +357,9 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
             src = (hist - lag + head_pos).clamp(0, hist - 1)
             taps = old_seq.index_select(1, src.long()).reshape(num_seqs * hist, dim)
             use = (head_pos < lag).repeat(num_seqs)
-            corr = corr + torch.where(use[:, None], lag_weight(lag, head_rows) * taps, torch.zeros_like(taps))
+            corr = corr + torch.where(
+                use[:, None], lag_weight(lag, head_rows) * taps, torch.zeros_like(taps)
+            )
         corr = torch.where(head_live[:, None], corr, torch.zeros_like(corr))
         if taps_kernel:
             # The state taps land on the kernel's bf16 output: one extra rounding on <= hist rows per sequence.
@@ -351,15 +367,29 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         else:
             y = (acc.index_add(0, head_rows, corr) * scale).to(x.dtype)
         # New state: the last `hist` inputs of [old state rows, this forward's rows].
-        offs = q_lens[:, None] - hist + torch.arange(hist, device=x.device, dtype=torch.int32)[None]
+        offs = (
+            q_lens[:, None]
+            - hist
+            + torch.arange(hist, device=x.device, dtype=torch.int32)[None]
+        )
         x_rows = (qsl[:-1, None] + offs).clamp(0, num_tokens - 1).reshape(-1).long()
         state_rows = (
-            torch.arange(num_seqs, device=x.device, dtype=torch.int32)[:, None] * hist + (hist + offs).clamp(0, hist - 1)
-        ).reshape(-1).long()
-        new = torch.where(
-            (offs >= 0).reshape(-1)[:, None], x.index_select(0, x_rows).float(), old.index_select(0, state_rows)
+            (
+                torch.arange(num_seqs, device=x.device, dtype=torch.int32)[:, None]
+                * hist
+                + (hist + offs).clamp(0, hist - 1)
+            )
+            .reshape(-1)
+            .long()
         )
-        self._write_state(state, slots, new.reshape(num_seqs, hist * dim), extra=snapshot)
+        new = torch.where(
+            (offs >= 0).reshape(-1)[:, None],
+            x.index_select(0, x_rows).float(),
+            old.index_select(0, state_rows),
+        )
+        self._write_state(
+            state, slots, new.reshape(num_seqs, hist * dim), extra=snapshot
+        )
         return y
 
     def _xla_sconv_decode(self, x, *, state, weight, dyn, use_residual):
@@ -369,7 +399,9 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         hist = kernel_size - 1
         slots = self._state_indices.clamp(0, state.shape[0] - 1).long()
         old = read_state_rows(state, slots).reshape(num_seqs, hist, dim).float()
-        old = torch.where((self._seq_lens[:num_seqs] > 1)[:, None, None], old, torch.zeros_like(old))
+        old = torch.where(
+            (self._seq_lens[:num_seqs] > 1)[:, None, None], old, torch.zeros_like(old)
+        )
         # [seqs, K, dim], oldest first; the new token is the last tap.
         window = torch.cat((old, x.float()[:, None]), dim=1)
         if dyn is None:
@@ -377,13 +409,19 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         else:
             # Lag-major (lag 0 = current token) -> window order.
             head_dim = dim // dyn.shape[1]
-            lagged = weight.float()[None] + dyn.float().permute(0, 2, 1).repeat_interleave(head_dim, dim=2)
+            lagged = weight.float()[None] + dyn.float().permute(
+                0, 2, 1
+            ).repeat_interleave(head_dim, dim=2)
             w = lagged.flip(1)
         acc = (window * w).sum(1)
         if use_residual:
             acc = acc + x.float()
-        self._write_decode_state(state, slots, window[:, 1:].reshape(num_seqs, hist * dim))
-        scale = (kernel_size * (2 if dyn is not None else 1) + int(use_residual)) ** -0.5
+        self._write_decode_state(
+            state, slots, window[:, 1:].reshape(num_seqs, hist * dim)
+        )
+        scale = (
+            kernel_size * (2 if dyn is not None else 1) + int(use_residual)
+        ) ** -0.5
         return (acc * scale).to(x.dtype)
 
     def _xla_sconv_verify(self, x, *, state, weight, dyn, use_residual):
@@ -403,12 +441,16 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         # [seqs, hist + width, dim], oldest first; a verify always continues a request.
         seq = torch.cat((old, x.float().view(num_seqs, width, dim)), dim=1)
         # [seqs, width, K, dim]: the conv window ending at each verify position.
-        windows = torch.stack([seq[:, tap : tap + width] for tap in range(kernel_size)], dim=2)
+        windows = torch.stack(
+            [seq[:, tap : tap + width] for tap in range(kernel_size)], dim=2
+        )
         if dyn is None:
             w = weight.reshape(dim, kernel_size).float().T[None, None]
         else:
             head_dim = dim // dyn.shape[1]
-            lagged = weight.float()[None] + dyn.float().permute(0, 2, 1).repeat_interleave(head_dim, dim=2)
+            lagged = weight.float()[None] + dyn.float().permute(
+                0, 2, 1
+            ).repeat_interleave(head_dim, dim=2)
             w = lagged.flip(1).view(num_seqs, width, kernel_size, dim)
         acc = (windows * w).sum(2).reshape(num_seqs * width, dim)
         if use_residual:
@@ -419,7 +461,9 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         rows = (bases[:, None] + steps[None]).reshape(-1)
         live = (self._state_indices[:num_seqs] >= 0).repeat_interleave(width)
         self._write_state(state, rows, checkpoints, live=live)
-        scale = (kernel_size * (2 if dyn is not None else 1) + int(use_residual)) ** -0.5
+        scale = (
+            kernel_size * (2 if dyn is not None else 1) + int(use_residual)
+        ) ** -0.5
         return (acc * scale).to(x.dtype)
 
     def _write_decode_state(self, state, slots, new):
@@ -440,7 +484,12 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
         if extra is not None:
             rows, windows, extra_live = extra
             slots = torch.cat((slots.long(), rows.long()))
-            new = torch.cat((new.reshape(new.shape[0], -1), windows.reshape(windows.shape[0], -1).to(new.dtype)))
+            new = torch.cat(
+                (
+                    new.reshape(new.shape[0], -1),
+                    windows.reshape(windows.shape[0], -1).to(new.dtype),
+                )
+            )
             live = torch.cat((live, extra_live))
         write_state_rows(state, slots, new, live)
 
@@ -449,7 +498,6 @@ class TpuInklingSconvBackend(TpuGDNAttnBackend):
 
     def forward_extend(self, *args, **kwargs):
         raise NotImplementedError("Inkling sconv streams run through run_sconv")
-
 
 
 class TpuInklingHybridAttnBackend(HybridLinearAttnBackend):

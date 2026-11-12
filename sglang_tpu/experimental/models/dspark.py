@@ -5,7 +5,7 @@ import torch
 
 def sample_draft_tokens(
     self, hidden_states: torch.Tensor, input_ids: torch.Tensor
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, None]:
     """Greedy markov draft chain [bs, gamma], traced into the TPU draft graph."""
     # Anchor drafts forward [r, m x (gamma - 1)] and read every row; the rest
     # forward [r, m x gamma] and drop the anchor row.
@@ -21,4 +21,4 @@ def sample_draft_tokens(
         sampler=lambda step_logits, step_idx: torch.argmax(step_logits, dim=-1),
         collect_corrected=False,
     )
-    return draft_tokens
+    return draft_tokens, None

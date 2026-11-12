@@ -305,6 +305,29 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
             force_ids=ids,
         )
 
+    def test_non_lane_aligned_hidden_with_padded_weights_matches_reference(self):
+        """Exercises pre-gather activation K-padding and post-sum K-slicing
+        when model hidden_size (192) is narrower than the 128-lane-padded
+        weight width (256) and m (19) is padded to a sublane multiple (20).
+        """
+        m, k, k_padded, n, g, topk = 19, 192, 256, 128, 4, 4
+        hidden, w1, w2, w_tk, ids = _make_inputs(m, k, n, g, topk, seed=6)
+        w1_pad = jnp.pad(w1, ((0, 0), (0, k_padded - k), (0, 0)))
+        w2_pad = jnp.pad(w2, ((0, 0), (0, 0), (0, k_padded - k)))
+
+        out = jax.block_until_ready(
+            _call_production_kernel(
+                hidden, w1_pad, w2_pad, w_tk, ids, activation="silu"
+            )
+        )
+        ref = _jax_reference_moe(hidden, w1, w2, w_tk, ids, "silu")
+
+        out32 = jnp.asarray(out).astype(jnp.float32)
+        ref32 = ref.astype(jnp.float32)
+        self.assertEqual(out32.shape, (m, k))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(out32))))
+        self.assertLess(float(jnp.max(jnp.abs(out32 - ref32))), 5e-2)
+
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
 class TestFusedMoEJaxKernelGuards(unittest.TestCase):

@@ -122,6 +122,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     to_chw_uint8,
 )
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -390,17 +391,21 @@ class KimiK3MLP(nn.Module):
 
 
 def merged_moe_all_reduce(
-    latent: torch.Tensor, shared: torch.Tensor
+    latent: torch.Tensor, shared: torch.Tensor, norm: Optional[nn.Module] = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """TP all-reduce of the routed latent and the shared-expert output with
-    one collective (SGLANG_K3_MERGE_MOE_ALLREDUCE). The default concatenates
+    one collective (SGLANG_K3_MERGE_MOE_ALLREDUCE), then ``norm`` (the routed
+    latent norm, if any) on the reduced latent. The default concatenates
     them; a platform may replace this function with a multi-tensor collective
-    that avoids the concat / split copies."""
+    that avoids the concat / split copies (and may fuse the norm)."""
     latent_dim = latent.shape[-1]
     reduced = tensor_model_parallel_all_reduce(
         torch.cat([latent, shared.to(latent.dtype)], dim=-1)
     )
-    return reduced[:, :latent_dim], reduced[:, latent_dim:]
+    latent, shared = reduced[:, :latent_dim], reduced[:, latent_dim:]
+    if norm is not None:
+        latent = norm(latent)
+    return latent, shared
 
 
 def _add3(
@@ -1305,9 +1310,8 @@ class KimiK3MoE(nn.Module):
                 and self._routed_needs_reduce
             ):
                 latent, shared_output = merged_moe_all_reduce(
-                    expert_output, shared_output
+                    expert_output, shared_output, self.routed_expert_norm
                 )
-                latent = self._latent_norm(latent)
                 shared_reduced = True
             else:
                 latent = self._reduce_latent(expert_output)
@@ -1620,6 +1624,10 @@ class KimiK3DeltaAttention(nn.Module):
         self.all_reduce_fusion = all_reduce_fusion
         # Static-scale fp8 fused_qkvg_proj, bound post-load by the TPU plugin.
         self._static_fp8_qkvg = None
+        # Optional scheduling fence (x, beta, forget_gate) -> same values, bound
+        # post-load by a platform so the [q, k, v, g] GEMV starts after the
+        # small gate GEMVs.
+        self._qkvg_order_after = None
         # Side stream for the [f_a|b] + f_b tiny GEMVs: they read only
         # hidden_states, so they overlap the wide [q,k,v,g] GEMM on the main
         # stream (graphed decode/verify only; SM bound as the MLA gate stream).
@@ -2227,19 +2235,26 @@ class KimiK3DeltaAttention(nn.Module):
                 )
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
+                # The small gate GEMVs read only hidden_states; computing them
+                # first lets them fill the wide GEMV's weight-load wait.
+                beta = self.b_proj(hidden_states)[0]
+                f_a = self.f_a_proj(hidden_states)[0]
+                forget_gate = f_a if defer_f_b else self.f_b_proj(f_a)[0]
+                qkvg_in = hidden_states
+                if self._qkvg_order_after is not None:
+                    qkvg_in, beta, forget_gate = self._qkvg_order_after(
+                        hidden_states, beta, forget_gate
+                    )
                 if self._static_fp8_qkvg is not None:
-                    fused_states = self._static_fp8_qkvg(hidden_states)
+                    fused_states = self._static_fp8_qkvg(qkvg_in)
                 else:
-                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                    fused_states, _ = self.fused_qkvg_proj(qkvg_in)
                 qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 if _is_tpu:
                     # The TPU KDA op reads q/k/v as the leading columns of the
                     # fused [q, k, v, g] output (attn.fused_qkvg); a split view
                     # would be copied whole at the op boundary.
                     qkv = fused_states
-                beta = self.b_proj(hidden_states)[0]
-                f_a = self.f_a_proj(hidden_states)[0]
-                forget_gate = f_a if defer_f_b else self.f_b_proj(f_a)[0]
         else:
             fused_states = self.fused_qkvbfg_a_proj(hidden_states)
             qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
@@ -2812,6 +2827,10 @@ class KimiK3DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+        # Kimi-K3.1 DSA layers also return their top-k rows; every layer runs
+        # its own indexer, so none are carried to the next layer.
+        if isinstance(result, tuple):
+            result = result[0]
 
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
@@ -3611,8 +3630,30 @@ class KimiK3LinearForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        self._check_dsa_indexer_loaded(loaded_params)
         self.post_load_weights()
         return loaded_params
+
+    def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
+        if self.config.dsa_config is None:
+            return
+        expected = {
+            name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
+        }
+        num_dsa_layers = sum(
+            self.config.is_dsa_layer(i)
+            for i in range(self.model.start_layer, self.model.end_layer)
+        )
+        assert num_dsa_layers > 0 or not expected
+        assert len(expected) == 5 * num_dsa_layers, (
+            f"Kimi-K3.1: built {len(expected)} DSA indexer params, expected "
+            f"5 per DSA layer x {num_dsa_layers} layers."
+        )
+        missing = sorted(expected - loaded_params)
+        assert not missing, (
+            f"Kimi-K3.1: {len(missing)} DSA indexer params were not loaded, "
+            f"e.g. {missing[:4]}"
+        )
 
     def post_load_weights(self):
         # Also invoked by loader post-load hooks (DummyModelLoader,
@@ -3749,6 +3790,8 @@ class KimiK3LinearForCausalLM(nn.Module):
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
+
+        current_platform.process_model_after_loading(self)
 
 
 class KimiK3ForConditionalGeneration(nn.Module):
@@ -4264,4 +4307,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
 
 
-EntryClass = [KimiK3ForConditionalGeneration, KimiK3LinearForCausalLM]
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    pass
+
+
+EntryClass = [
+    KimiK3ForConditionalGeneration,
+    KimiK31ForConditionalGeneration,
+    KimiK3LinearForCausalLM,
+]

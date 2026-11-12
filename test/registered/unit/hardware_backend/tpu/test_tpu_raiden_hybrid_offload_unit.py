@@ -828,6 +828,36 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
             ),
         )
 
+    def test_mla_offload_needs_a_hybrid_model_dma_engine_and_split_pool(self):
+        from sglang_tpu import tpu_platform
+
+        cases = (
+            ("raiden", "pallas_tpu_mla_sparse", (), True, None),
+            ("raiden", "pallas_tpu_mla_sparse", (), False, "MLA model"),
+            ("torch_tpu", "pallas_tpu_mla_sparse", (), True, "MLA model"),
+            ("raiden", "pallas_tpu_mla", (), True, "MLA model"),
+            ("raiden", "pallas_tpu_mla_sparse", ("pallas_tpu_mla",), True, "MLA model"),
+        )
+        for io_backend, backend, others, hybrid_linear, error in cases:
+            with self.subTest(
+                io_backend=io_backend,
+                backend=backend,
+                others=others,
+                hybrid_linear=hybrid_linear,
+            ):
+                call = lambda: tpu_platform.validate_kv_offload_pools(
+                    io_backend=io_backend,
+                    attention_backend=backend,
+                    attention_backends=others,
+                    use_mla=True,
+                    hybrid_linear=hybrid_linear,
+                )
+                if error is None:
+                    call()
+                else:
+                    with self.assertRaisesRegex(ValueError, error):
+                        call()
+
 
 class TestPackedDraftPlan(CustomTestCase):
     """A block draft over a hybrid SWA + state target packs onto the target pages
@@ -891,6 +921,53 @@ class TestRecurrentStateGate(CustomTestCase):
         counter.set_consumer(0)
         counter.wait_until(3)
         event.synchronize.assert_called_once()
+
+    def test_layer_wait_is_skipped_inside_a_compiled_forward(self):
+        """In-graph KV accessors must not read the counter; the forward waited
+        before entering the graph."""
+        from sglang_tpu.tpu_dma_hybrid_cache_controller import BatchGateCounter
+
+        counter = BatchGateCounter()
+        event = MagicMock()
+        counter.set_event(0, event)
+        counter.set_consumer(0)
+        with patch("torch.compiler.is_compiling", return_value=True):
+            counter.wait_until(3)
+        event.synchronize.assert_not_called()
+
+    def test_backend_state_read_never_touches_the_transfer_counter(self):
+        """The compiled forward reads state through _layer_state; consulting the
+        offload counter there guards the graph on it, so registering the counter
+        after warmup recompiles every graph at serve time."""
+        from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
+
+        class _Pool:
+            mamba_map = {7: 2}
+            mamba_pool = SimpleNamespace(mamba2_layer_cache=lambda i: ("state", i))
+
+            @property
+            def layer_transfer_counter(self):
+                raise AssertionError("read the HiCache counter")
+
+        backend = object.__new__(TpuGDNAttnBackend)
+        backend.req_to_token_pool = _Pool()
+        self.assertEqual(backend._layer_state(7), ("state", 2))
+
+    def test_rpa_kv_read_never_touches_the_transfer_counter(self):
+        """The RPA backend reads a hybrid model's full-attention KV inside the
+        compiled forward; consulting the offload counter there guards the graph."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang_tpu.attention_pallas_rpa_base import _fused_kv_operands
+
+        class _Pool(HybridLinearKVPool):
+            @property
+            def layer_transfer_counter(self):
+                raise AssertionError("read the HiCache counter")
+
+        pool = object.__new__(_Pool)
+        pool.full_attention_layer_id_mapping = {7: 2}
+        pool.full_kv_pool = SimpleNamespace(get_fused_kv_buffer=lambda i: ("kv", i))
+        self.assertEqual(_fused_kv_operands(pool, 7), (("kv", 2), None))
 
 
 class TestDraftSidecar(CustomTestCase):
@@ -971,9 +1048,9 @@ class TestDraftCounterRegistration(CustomTestCase):
 
 
 class TestKVFreeFenceCoverage(CustomTestCase):
-    def test_state_slot_load_does_not_sync_the_device(self):
-        """State slots load through device-queue-ordered torch copies, which land
-        after any in-flight forward that still writes a freed slot: no device sync."""
+    def test_state_slot_load_waits_for_in_flight_forwards(self):
+        """A freed Mamba state slot is not held by the KV free fence, so a load
+        into one must wait until no in-flight forward can still write it."""
         ctrl = _make_controller()
         mamba = _FakeEntry(PoolName.MAMBA, _FakeHostPool(page_size=1), object())
         ctrl.mem_pool_host.entries.append(mamba)
@@ -994,9 +1071,13 @@ class TestKVFreeFenceCoverage(CustomTestCase):
         )
         ctrl.load_queue.append(op)
         ctrl.start_loading()
-        ctrl.kv_free_fence.wait_for_in_flight.assert_not_called()
+        ctrl.kv_free_fence.wait_for_in_flight.assert_called_once()
         self.assertEqual(len(mamba.host_pool.loads), 1)
 
+    def test_pool_outside_the_offload_set_is_rejected(self):
+        indexer = _FakeEntry(PoolName.INDEXER, _FakeHostPool(), MagicMock())
+        with self.assertRaises(NotImplementedError):
+            _make_controller().register_host_pool_entry(indexer)
 
     def test_load_inside_forward_write_target_is_rejected(self):
         """A raiden load inside forward_write_target() could be given a page an

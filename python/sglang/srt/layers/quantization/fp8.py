@@ -30,11 +30,11 @@ from sglang.srt.layers.amx_utils import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
-from sglang.srt.layers.moe.tpu_moe_utils import tpu_moe_activation
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.tpu_moe_utils import tpu_moe_activation
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_moe_a2a_backend,
@@ -1092,17 +1092,25 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        if self.block_quant:
-            self.process_weights_after_loading_block_quant(layer)
-            if _is_tpu and not self.use_mxfp8:
-                from sglang_tpu.fp8_linear import (
-                    prepare_tpu_fp8_linear_weights,
-                )
+        if _is_tpu and not self.use_mxfp8:
+            from sglang_tpu.fp8_linear import (
+                prepare_tpu_fp8_linear_weights,
+                prepare_tpu_online_fp8_linear_weights,
+            )
 
+            if self.block_quant:
+                self.process_weights_after_loading_block_quant(layer)
                 prepare_tpu_fp8_linear_weights(
                     layer,
                     weight_block_size=self.quant_config.weight_block_size,
                 )
+                return
+            if not self.is_checkpoint_fp8_serialized:
+                prepare_tpu_online_fp8_linear_weights(layer)
+                return
+
+        if self.block_quant:
+            self.process_weights_after_loading_block_quant(layer)
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -2928,6 +2936,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif (
             moe_runner_backend.is_pallas_tpu()
             or moe_runner_backend.is_pallas_tpu_fused_rs()
+            or moe_runner_backend.is_pallas_tpu_fused_decode()
         ) and not _is_tpu:
             raise ValueError(f"{moe_runner_backend.value} is only available on TPU")
 

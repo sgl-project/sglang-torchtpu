@@ -28,7 +28,6 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sglang_tpu.envs import envs as tpu_envs
-
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     _select_fused_rs_block_sizes,
 )
@@ -216,6 +215,7 @@ def moe_gmm_local_rs_nodedup(
     sp_enabled: bool = True,
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
+    fp4_w4a16: bool = False,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -223,10 +223,18 @@ def moe_gmm_local_rs_nodedup(
     then applies topk weights and reduces over the top_k dim post-kernel.
     """
     num_tokens = hidden_states_local.shape[0]
-    hidden_size = w2.shape[-1]
+    # Rank-4 weights stack layers (Muse megakernel expert groups): group_offset[1] picks one.
+    if w1.ndim == 4 and group_offset.shape[0] < 2:
+        raise ValueError(
+            f"stacked (rank-4) expert weights need group_offset = [expert_offset, layer], "
+            f"got shape {group_offset.shape}"
+        )
+    w1_shape = w1.shape[1:] if w1.ndim == 4 else w1.shape
+    w2_shape = w2.shape[1:] if w2.ndim == 4 else w2.shape
+    hidden_size = w2_shape[-1]
     chunk_size = num_tokens // ep_size
-    num_experts = w1.shape[0] * ep_size  # global num_experts
-    num_local_experts = w1.shape[0]
+    num_experts = w1_shape[0] * ep_size  # global num_experts
+    num_local_experts = w1_shape[0]
     # Experts are assigned in contiguous, equal-sized blocks by logical rank.
     # Derive the rank from the offset already needed for routing instead of
     # carrying a second scalar through every compiled MoE call.
@@ -300,10 +308,10 @@ def moe_gmm_local_rs_nodedup(
     # leaking ``gather_sem`` on kernel exit.
     block_sizes = _select_fused_rs_block_sizes(
         size_m=size_m,
-        size_k1=w1.shape[1],
-        size_n1=w1.shape[2],
-        size_k2=w2.shape[1],
-        size_n2=w2.shape[2],
+        size_k1=w1_shape[1],
+        size_n1=w1_shape[2],
+        size_k2=w2_shape[1],
+        size_n2=w2_shape[2],
         size_group=num_local_experts,
         size_lhs_group=group_sizes.shape[0],
         ep_size=ep_size,
@@ -320,7 +328,7 @@ def moe_gmm_local_rs_nodedup(
         # entry here and can pick a different tile_m than the kernel -> the
         # max_num_gm undercount / gather_sem leak described above.
         quant_block_size=(
-            recover_quant_block_size(w1.shape[1], w1_scale.shape[1])
+            recover_quant_block_size(w1_shape[1], w1_scale.shape[w1.ndim - 2])
             if w1_scale is not None
             else None
         ),
@@ -397,6 +405,7 @@ def moe_gmm_local_rs_nodedup(
         staging_slots=tpu_envs.SGLANG_TPU_FUSED_RS_STAGING_SLOTS.get(),
         pair_exchange=pair_exchange,
         ep_run_write=ep_run_write,
+        fp4_w4a16=fp4_w4a16,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -516,6 +525,7 @@ def expert_parallel_gmm_rs(
     w2_global_scale: jax.Array | None = None,
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
+    fp4_w4a16: bool = False,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel.
 
@@ -546,7 +556,11 @@ def expert_parallel_gmm_rs(
         P(combine_partition_axes(MLP_DATA, expert_axis), None) if sp_enabled else P()
     )
     topk_i_spec = P(MLP_DATA, None) if sp_enabled else P()
-    num_experts = w1.shape[0]
+    if w1.ndim == 4 and group_offset_input is None:
+        raise ValueError(
+            "stacked (rank-4) expert weights need group_offset_input = [expert_offset, layer]"
+        )
+    num_experts = w1.shape[1] if w1.ndim == 4 else w1.shape[0]
     num_experts_per_shard = num_experts // ep_size
     group_offset = (
         group_offset_input
@@ -582,6 +596,7 @@ def expert_parallel_gmm_rs(
             sp_enabled=sp_enabled,
             fp8_direct_write=fp8_direct_write,
             expert_tp=expert_tp,
+            fp4_w4a16=fp4_w4a16,
         ),
         mesh=mesh,
         in_specs=(
@@ -637,6 +652,7 @@ def expert_parallel_gmm_rs(
         "scoring_fn",
         "fp8_direct_write",
         "expert_tp",
+        "fp4_w4a16",
     ),
     compiler_options={
         # "xla_enable_transpose_trace": True,
@@ -664,6 +680,7 @@ def fused_moe_func_rs(
     expert_tp: bool = False,
     w1_global_scale: jax.Array | None = None,
     w2_global_scale: jax.Array | None = None,
+    fp4_w4a16: bool = False,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel (gmm_fused_rs).
 
@@ -683,7 +700,9 @@ def fused_moe_func_rs(
     This replaces the standard EP pattern of psum (after kernel).
     """
     num_tokens, hidden_size = hidden_states.shape
-    global_num_experts, padded_hidden_size, _ = w1.shape
+    global_num_experts, padded_hidden_size, _ = (
+        w1.shape[1:] if w1.ndim == 4 else w1.shape
+    )
     dtype = hidden_states.dtype
 
     assert (num_tokens * topk) % 16 == 0
@@ -725,6 +744,7 @@ def fused_moe_func_rs(
         w2_global_scale=w2_global_scale,
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
+        fp4_w4a16=fp4_w4a16,
     )
 
     return result[:num_tokens, :hidden_size]

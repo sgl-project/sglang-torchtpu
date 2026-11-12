@@ -615,8 +615,6 @@ class Envs:
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
-    SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
-    SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
@@ -680,6 +678,11 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    # Opt-in, overlap decode without speculative decoding: penalize the token a
+    # request decoding alone would penalize at each step, whatever the host has
+    # processed so far, and give a request prefilled again after a retraction
+    # that penalty history back (ScheduleBatch._uses_deterministic_penalty_tokens).
+    SGLANG_DETERMINISTIC_PENALTY_TOKENS = EnvBool(False)
 
     # ===================================================================
     # Radix and sparse KV caches
@@ -694,16 +697,49 @@ class Envs:
     # Hybrid-SWA unified cache: insert a mid-prefill chunk only if it reaches a
     # multiple of this many tokens (0: every chunk); each insert pins an SWA window.
     SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE = EnvInt(0)
-    # Move the stale SWA windows a chunked request leaves behind its sliding window
-    # to the SWA LRU eviction end, ahead of shared windows and prefix tails.
+    # Hybrid-SWA unified cache: while a request is in prefill, free none of its
+    # own SWA at a chunk insert, so every chunk stays SWA-live in the tree. A
+    # chunk longer than window + page (4096-token chunks) then keeps the match
+    # points of window-sized chunks instead of only its last window.
+    SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS = EnvBool(False)
+    # Move the stale SWA windows behind a request's sliding window (chunk boundaries,
+    # earlier turns) to the SWA LRU eviction end, ahead of shared windows and prefix tails.
     SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST = EnvBool(False)
+    # When a request finishes, move its unshared final SWA windows (its private
+    # tail, after it drops its tree lock) to the SWA LRU eviction end. On a first
+    # visit of the request's media, the window ending at the page-floored media
+    # end stays put, here and under SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST.
+    SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS = EnvBool(False)
+    # CAP (SWA right-sizing): every SGLANG_OPT_SWA_CAP_INTERVAL decode batches,
+    # shrink a running request's SWA tree lock page by page to the prompt pages
+    # its sliding window still reads ([seqlen - 1 - window, seqlen)), move the
+    # released pages to the SWA LRU eviction end, and run the out-of-window
+    # eviction at the same interval.
+    SGLANG_OPT_SWA_CAP = EnvBool(False)
+    SGLANG_OPT_SWA_CAP_INTERVAL = EnvInt(32)
+    # CAP media anchor: keep up to this many first-visit media-boundary windows
+    # (the window ending at the page-floored media end) SWA-locked by the cache,
+    # least recently used released first; 0 disables. Anchors yield to memory
+    # pressure: a prefill pass that admits nothing for lack of memory (a request
+    # refused with NO_TOKEN, or a chunked request's next chunk parked) releases
+    # one, and a decode step that does not fit releases them before retracting.
+    # On a PD decode server, a preallocation pass that has reserved nothing
+    # releases them until its next request fits.
+    SGLANG_OPT_SWA_CAP_MEDIA_ANCHORS = EnvInt(0)
+    # CAP for requests without media (they have no media anchor, and their reuse
+    # is an exact repeat of the whole prompt, which needs the prompt-end window):
+    # "release" (the CAP behaviour above), "skip" (keep the prompt-end window
+    # lock until the release-leaf-lock path drops it) or "keep_prompt_end"
+    # (release the lock but leave the prompt-end window in LRU order).
+    SGLANG_OPT_SWA_CAP_TEXT = EnvStr("release")
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
     # - C128 or other unsupported components.
     # - Custom component overrides.
-    # - SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST on an SWA cache.
+    # - SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST,
+    #   SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS or SGLANG_OPT_SWA_CAP on an SWA cache.
     # - Non-Linux platforms.
     # - Unsupported PyTorch versions.
     # - Devices other than CPU or CUDA.
@@ -729,6 +765,13 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Bound on the per-iteration transfer-status all_reduce across attention
+    # TP/CP ranks; the CPU group's own timeout is hours. Matches the decode
+    # waiting timeout so no new deadline is introduced. <= 0 disables.
+    SGLANG_DISAGGREGATION_POLL_ALLREDUCE_TIMEOUT = EnvFloat(300.0)
+    # Verify ranks poll the same number of requests before reducing their
+    # status; a mismatch completes on the shortest rank and hangs the rest.
+    SGLANG_DISAGGREGATION_POLL_CHECK_COUNT = EnvBool(True)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
@@ -744,39 +787,6 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
-    # Raiden: a DP or TP decode receives KV from a pipeline-parallel prefill.
-    SGLANG_RAIDEN_PIPELINE_TRANSFER = EnvBool(False)
-    # Raiden: stage each transfer (and reshard plan) in its own host-pool pages
-    # instead of fixed max-length slots; asymmetric attention TP needs it.
-    SGLANG_RAIDEN_DYNAMIC_HOST_STAGING = EnvBoolWithAlias(
-        True, deprecated_name="TPU_RAIDEN_DYNAMIC_HOST_STAGING"
-    )
-    # Raiden: a decode starts a room's next read as soon as the prefill
-    # announces it; 0 starts reads only on the next scheduler poll.
-    SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(True)
-    # Raiden: deadline of each KV chunk transfer, not of the whole request; the
-    # closing read counts as a chunk, and a non-chunked transfer is one chunk.
-    # Counted from registration on the prefill and from start_read on the
-    # decode. Set the same on both.
-    SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S = EnvFloatWithAlias(
-        60.0, deprecated_name="SGLANG_RAIDEN_TIMEOUT_S"
-    )
-    # Pipeline prefill: move pages final before the prefill ends (cached prefix,
-    # finished chunks) as early transfers of at least PART_PAGES pages each.
-    SGLANG_RAIDEN_PIPELINE_EARLY_PARTS = EnvBool(False)
-    SGLANG_RAIDEN_PIPELINE_PART_PAGES = EnvInt(16)
-    # Pipeline prefill: each group of STAGE_GROUP consecutive stages moves its
-    # layers once its forwards of the final chunk complete, before sampling.
-    SGLANG_RAIDEN_PIPELINE_STAGE_PARTS = EnvBool(False)
-    SGLANG_RAIDEN_PIPELINE_STAGE_GROUP = EnvInt(1)
-    # Decode: threads coordinating pipeline transfers, one client each.
-    SGLANG_RAIDEN_PIPELINE_COORD_WORKERS = EnvInt(1)
-    # Pipeline prefill: each stage registers its share of the closing transfer
-    # at the final chunk's launch, the last stage once its tokens are copied.
-    SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE = EnvBool(False)
-    SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
-    )
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -1407,6 +1417,11 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+    # Keep the repetition-penalty state at a power-of-two row count, so its
+    # [rows, vocab] filter and merge gathers have one shape per row-bucket pair
+    # instead of one per exact (old, new) batch-size pair. Helps backends that
+    # compile per input shape. Live rows keep their exact values.
+    SGLANG_BUCKETED_PENALTY_ROWS = EnvBool(False)
 
     # ===================================================================
     # Deterministic inference and all-reduce
@@ -1458,6 +1473,9 @@ class Envs:
     # Shard the DFLASH draft's context projection (K * hidden -> hidden) across TP by its
     # input dim instead of replicating it; same math plus one all-reduce.
     SGLANG_DFLASH_ROW_PARALLEL_FC = EnvBool(False)
+    # Shard it by its output dim instead and all-gather the projected rows: no extra
+    # reduction. Not bitwise vs the replicated fc (K summation order, bf16 output rounding).
+    SGLANG_DFLASH_COLUMN_PARALLEL_FC = EnvBool(False)
     # DFlash2 conv on flat [tokens, hidden] rows, the per-group deltas widened to channels
     # by one exact 0/1 matmul per sublayer; needs groups to be a multiple of 128.
     SGLANG_DFLASH_CONV_MATMUL_EXPAND = EnvBool(False)
@@ -1505,6 +1523,10 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # "incremental": drop finished requests' multimodal features a few at a
+    # time before device-result waits instead of all at once when they finish
+    # (scheduler_components/mm_feature_releaser.py). Outputs are unchanged.
+    SGLANG_ASYNC_MM_FEATURE_RELEASE = EnvStr("")
 
     # ===================================================================
     # Multimodal CUDA IPC transport
@@ -1555,6 +1577,11 @@ class Envs:
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
+    # Run wrap_shm_features (shared-memory create, fallocate and the pixel copy)
+    # on a pool of SGLANG_SHM_WRAP_THREADS threads instead of the tokenizer event
+    # loop, so large multimodal features do not stall request intake.
+    SGLANG_SHM_WRAP_OFF_LOOP = EnvBool(False)
+    SGLANG_SHM_WRAP_THREADS = EnvInt(4)
 
     # ===================================================================
     # Encoder pipeline and disaggregation
@@ -1571,6 +1598,10 @@ class Envs:
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
     SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
     SGLANG_ENCODER_MM_LOAD_WORKERS = EnvInt(4)
+    # Scheduler ticks a ready multimodal request may wait for pending batch-mates
+    # while decode runs, so they prefill together; 0 releases each on arrival.
+    # Trades TTFT for fewer decode interruptions; 4 covers one encoder batch's sends.
+    SGLANG_ENCODER_RECEIVER_COALESCE_TICKS = EnvInt(0)
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
@@ -1937,17 +1968,6 @@ class Envs:
     # Restore device MM scatter instead of host placement.
     # https://github.com/sgl-project/sglang-torchtpu/issues/741
     SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)
-    SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
-    # Also attribute eager compiles to sglang source lines. ~9 us per eager op.
-    SGLANG_TPU_CHECK_RECOMPILATION_SITES = EnvBool(False)
-    SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
-    # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
-    # is not free for anyone else: the compiled extend must return every prefill
-    # row (CaptureHiddenMode.FULL), and capture_hidden_mode is part of the
-    # graph's guard, so the mode is a property of the warmed variant rather than
-    # of the request. Off keeps the extend graph and the serving path exactly as
-    # they are today, and a request asking for prompt logprobs is rejected.
-    SGLANG_TPU_ENABLE_PROMPT_LOGPROB = EnvBool(False)
 
     # Build the RoPE cos/sin cache at the served context length instead of the
     # checkpoint's max_position_embeddings: Qwen3.5 declares 262144 positions
@@ -1956,90 +1976,17 @@ class Envs:
     # structural, so the VL wrappers undo the slice in _restore_full_rope_cache
     # (the config cannot tell -- the text checkpoint carries mrope_section too).
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
-    # Preserve FP32 expert scales and apply GMM partial scales in FP32.
-    SGLANG_TPU_FP8_MOE_FP32_SCALES = EnvBool(False)
     # INT4 MoE kernel mode. Unset: W4A16 group dots. "vmem-bf16": dequantize in
     # VMEM, one bf16 dot per tile. "vmem-fp8": fp8 weight tiles and activations.
     SGLANG_TPU_INT4_MOE_MODE = EnvStr(None)
-    # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
-    # device on Kimi-K2.6). vmem-fp8 always uses f32.
-    SGLANG_TPU_INT4_MOE_FP32_SCALES = EnvBool(False)
-    SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
-    SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
-    SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
     SGLANG_TPU_REQ_TO_TOKEN_ON_HOST = EnvBool(True)
-    # Reuse uploaded attention metadata across forwards; applies to all TPU batches.
-    SGLANG_TPU_ENABLE_ATTN_METADATA_CACHE = EnvBool(True)
-    # Read extend query lengths from a complete host mirror instead of the device.
-    SGLANG_TPU_ENABLE_HOST_QUERY_LENS = EnvBool(True)
-    # Opt-in runtime KV-tile promotion for compatible prefill backends.
-    # Backends snapshot this flag at initialization; tile hints are tensor inputs.
-    SGLANG_TPU_WORKLOAD_AWARE_KV_TILES = EnvBool(False)
-    SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
-    # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
-    # Deployments can override this cutoff after measuring their topology.
-    SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = EnvInt(64)
-    # Filter top-k/top-p/min-p with the sort-free binary-search cutoff instead
-    # of the full-vocabulary torch sort. Disable to A/B the sampled
-    # distribution against the reference path.
-    SGLANG_TPU_ENABLE_BSEARCH_SAMPLING = EnvBool(True)
 
-    # Vision-encoder precompile ladder. Unset uses the computed square-grid
-    # ladder; set-but-empty disables precompile entirely.
-    SGLANG_TPU_VIT_PRECOMPILE_SIZES = EnvTuple(tuple())
-    SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES = EnvInt(4900)
-    # Override the computed ladder's rung count, trading compiles against
-    # padding waste. Unset leaves each encoder on the count it picked.
-    SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS = EnvInt(None)
-    # MoE: offload the gather in permute and unpermute to SparseCore.
-    SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
-    # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
-    # 0 = SparseCore always. Measured crossover is 1024 (Kimi, R1, Qwen3-480B).
-    SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
-    # MoE: use onehot dense matmul for small permute and unpermute/combine
-    # paths instead of gather. When set to 0, this is disabled. When set
-    # to a positive integer, this is the threshold for tokens per rank below
-    # which the dense matmul path is taken. Suggset to start with 1024 or 2048
-    # and tune from there. Below it, batches of up to 2048 routed rows also
-    # take the sort-free dense rank route, and one-token batches the
-    # route-meta kernel.
-    SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
-    # Turn off EP-local expert reads (models that opt in read only their EP
-    # rank's routed experts with --weight-loader-disable-mmap).
-    SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
-    # xprof scope per task. Values <= 0 trace all chips or SparseCores.
-    SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
-    SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
-    # xprof python tracer. Off by default: it dominates host busy time.
-    SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
-    # raiden KV-offload backend
-    # Seconds a raiden DMA may stay pending, from each blocking wait or, when
-    # polled, from issue. Past it the scheduler exits with TimeoutError, so keep
-    # it far above a healthy transfer.
-    SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.
     SGLANG_TPU_ENABLE_CONTIGUOUS_FLOAT_LOGITS = EnvBool(True)
-    # Read the RPA KV cache in the SEQ_ALONG_LANE layout (token index on the
-    # lane axis) instead of the token-major fused one. num_kv_heads*2 is
-    # unpadded there, so at one KV head per rank and fp8 KV it is 256 bytes per
-    # token against 512, which is what lets long context and large batches fit.
-    # Opt-in: it changes the KV pool's buffer shape.
-    SGLANG_TPU_USE_SEQ_ALONG_LANE_KV = EnvBool(False)
-    # Pin the RPA prefill/MIXED k-block instead of deriving it from the VMEM
-    # budget. Escape hatch for a shape or a chip where that derivation is
-    # wrong: too large and the kernel fails to allocate at startup, too small
-    # and the step runs more blocks than it needs. Rounded up to a page
-    # multiple. Unset (None) means the wrapper's own search decides.
-    SGLANG_TPU_FORCE_RPA_PREFILL_BKV = EnvInt(None)
     # Enable prefill and decode co-location on the same single- or multi-host
     # TPU slice by assigning half the chips to prefill and half to decode.
     # This is intended primarily for development and is not for production use.
     SGLANG_TPU_PD_COLOCATED = EnvBool(False)
-    # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 causing performance
-    # regression in fused MoE with reduce scatter.
-    # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
-    # (likely 0.0.48).
-    SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)

@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""FP8 fused reduce-scatter MoE path for TPU.
+"""BF16 and FP8 MoE on the fused reduce-scatter kernel for TPU.
 
-Routes the FP8 MoE through the in-tree SGLang-owned fused-RS kernel
-(`fused_moe_rs_gather`) instead of `fused_moe_call` + a separate all-reduce.
-Load-time `prepare_fp8_fused_rs` validates the supported runtime layout and
-caches physical-device ordering.
+`fused_moe_rs_gather` runs the MoE and its reduction in one kernel, in place of
+`fused_moe_call` plus a separate all-reduce. `prepare_fp8_fused_rs` validates the
+runtime layout at load and caches physical-device ordering.
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ import os
 
 import torch
 
-from sglang_tpu.moe.activation import pallas_moe_activation
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang_tpu.fused_rs_sequence_parallel import (
     get_tpu_fused_rs_post_expert_norm_weight,
@@ -22,6 +20,7 @@ from sglang_tpu.fused_rs_sequence_parallel import (
     prepare_fused_moe_sequence_parallel_input,
     prepare_tpu_fused_rs_post_expert_norm,
 )
+from sglang_tpu.moe.activation import pallas_moe_activation
 
 # Expert IDs cross the f32 routing psum in fused_rs/fused_moe.py exactly up to 2**24.
 _FUSED_RS_MAX_EXPERTS = 1 << 24
@@ -142,7 +141,7 @@ def fp8_fused_rs_unsupported_reason(
 
 
 def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
-    """Eager, load-time prep for the FP8 fused-RS path. Returns True if enabled."""
+    """Prepare BF16 or FP8 fused-RS weights. Returns True if enabled."""
     has_post_expert_norm = has_tpu_fused_rs_post_expert_norm(layer)
     prepare_tpu_fused_rs_post_expert_norm(layer)
     return _prepare_fp8_fused_rs(
@@ -202,7 +201,7 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
     from sglang_tpu.moe.pallas.fused_moe_rs_op import prepare_fused_moe_rs
 
     prepare_fused_moe_rs(layer)
-    if expert_tp:
+    if expert_tp and layer.w13_weight.dtype == torch.float8_e4m3fn:
         _replicate_channelwise_fused_rs_scales(layer)
     return True
 
@@ -293,8 +292,13 @@ def _apply_fp8_fused_rs(
         if post_expert_norm_weight is not None
         else x.new_zeros((1,))
     )
-    w1_scale = layer.w13_weight_scale_inv if block_quantized else layer.w13_weight_scale
-    w2_scale = layer.w2_weight_scale_inv if block_quantized else layer.w2_weight_scale
+    w1_scale = w2_scale = None
+    if block_quantized:
+        w1_scale = layer.w13_weight_scale_inv
+        w2_scale = layer.w2_weight_scale_inv
+    elif layer.w13_weight.dtype == torch.float8_e4m3fn:
+        w1_scale = layer.w13_weight_scale
+        w2_scale = layer.w2_weight_scale
 
     result = fused_moe_rs_gather(
         hidden_states=x,

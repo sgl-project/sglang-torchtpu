@@ -37,24 +37,34 @@ from sglang.srt.models.dspark import (
 def _mix_rmsnorm(targets, alpha, weight, eps):
     """RMSNorm(sum_t alpha[t] * targets[:, t]) for targets [rows, taps, hidden]."""
     mixed = (targets.float() * alpha.float()[None, :, None]).sum(1)
-    out = mixed * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + eps) * weight.float()
+    out = (
+        mixed
+        * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + eps)
+        * weight.float()
+    )
     return out.to(targets.dtype)
 
 
 @compiled_op()
-def seed_f_rnn(f_rnn_buf, alpha, norm_weight, target_hidden, rows, req_pool_indices, live, *, eps):
+def seed_f_rnn(
+    f_rnn_buf, alpha, norm_weight, target_hidden, rows, req_pool_indices, live, *, eps
+):
     """f_rnn_buf with each live request's row replaced by its target features at ``rows``.
 
     target_hidden [tokens, K * H]; rows, req_pool_indices, live [n]. Dense one-hot write:
     padded entries share an index, and a compiled duplicate-index scatter is nondeterministic.
     """
     hidden = f_rnn_buf.shape[1]
-    features = target_hidden.index_select(0, rows.long()).view(rows.shape[0], -1, hidden)
+    features = target_hidden.index_select(0, rows.long()).view(
+        rows.shape[0], -1, hidden
+    )
     features = _mix_rmsnorm(features, alpha, norm_weight, eps)
     slots = torch.arange(f_rnn_buf.shape[0], device=features.device)
     onehot = (req_pool_indices.long()[:, None] == slots[None]) & live[:, None]
     scattered = torch.einsum("nr,nh->rh", onehot.float(), features.float())
-    return torch.where(onehot.any(0)[:, None], scattered, f_rnn_buf.float()).to(f_rnn_buf.dtype)
+    return torch.where(onehot.any(0)[:, None], scattered, f_rnn_buf.float()).to(
+        f_rnn_buf.dtype
+    )
 
 
 class Inkling2MTPHead(nn.Module):
@@ -102,7 +112,9 @@ class Inkling2MTPHead(nn.Module):
         return state, torch.tanh(out_raw)
 
     def _step_logits(self, base, latent):
-        bias = torch.addmm(self._fold_bias, latent.to(self._fold_weight.dtype), self._fold_weight.T)
+        bias = torch.addmm(
+            self._fold_bias, latent.to(self._fold_weight.dtype), self._fold_weight.T
+        )
         logits = base + self._gather_logits(bias)
         if self.final_logit_softcapping:
             cap = self.final_logit_softcapping
@@ -121,13 +133,17 @@ class Inkling2MTPHead(nn.Module):
     ):
         """Drafts [bs, gamma] (and their logits) from base logits [bs, gamma, V]."""
         bs = hidden_states.shape[0]
-        f_rnn = (self._staged_f_rnn if f_rnn is None else f_rnn)[:bs].to(hidden_states.dtype)
+        f_rnn = (self._staged_f_rnn if f_rnn is None else f_rnn)[:bs].to(
+            hidden_states.dtype
+        )
         state = hidden_states.new_zeros(bs, self.markov_rank)
         prev_tokens = first_prev_tokens
         tokens, corrected = [], []
         for step in range(base_logits.shape[1]):
             previous = self.get_prev_embeddings(prev_tokens).to(hidden_states.dtype)
-            state, latent = self._rnn_step(state, previous, hidden_states[:, step, :], f_rnn)
+            state, latent = self._rnn_step(
+                state, previous, hidden_states[:, step, :], f_rnn
+            )
             logits = self._step_logits(base_logits[:, step, :], latent)
             prev_tokens = sampler(logits, step)
             tokens.append(prev_tokens)
@@ -142,7 +158,9 @@ class Inkling2MTPHead(nn.Module):
 class Inkling2MTPAttention(DFlashAttention):
     """DFlash attention plus the context-only K/V projection the KV writer uses."""
 
-    def __init__(self, config, layer_id: int, quant_config=None, prefix: str = "") -> None:
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
         super().__init__(config, layer_id, quant_config=quant_config, prefix=prefix)
         self.kv_proj_ctx = QKVParallelLinear(
             hidden_size=int(config.hidden_size),
@@ -167,7 +185,9 @@ class Inkling2MTPDecoderLayer(DFlashDecoderLayer):
 
     def __init__(self, config, layer_id: int, **kwargs) -> None:
         super().__init__(config, layer_id, **kwargs)
-        self.dflare_norm = RMSNorm(int(config.hidden_size), eps=float(config.rms_norm_eps))
+        self.dflare_norm = RMSNorm(
+            int(config.hidden_size), eps=float(config.rms_norm_eps)
+        )
 
 
 class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
@@ -183,7 +203,9 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
         # is BF16 (load_weights checks every tensor), so it is built unquantized.
         del quant_config
         if config.q_bias or config.o_bias:
-            raise ValueError("Inkling2 MTP does not support attention projection biases")
+            raise ValueError(
+                "Inkling2 MTP does not support attention projection biases"
+            )
         # DSparkDraftMixin builds a stock markov head; this draft brings its own.
         DFlashDraftModel.__init__(self, config, quant_config=None, prefix=prefix)
         hidden, eps = config.hidden_size, config.rms_norm_eps
@@ -197,15 +219,22 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
         self.lm_head = None
         self.confidence_head = None
         self._fused_kv_write_cache = None
-        self.markov_head = Inkling2MTPHead(config.padded_vocab_size, config.markov_rank, hidden, eps)
+        self.markov_head = Inkling2MTPHead(
+            config.padded_vocab_size, config.markov_rank, hidden, eps
+        )
         self.markov_head.final_logit_softcapping = config.final_logit_softcapping
         self.markov_head.unpadded_vocab_size = config.unpadded_vocab_size
         self.fuse_weight = nn.Parameter(
-            torch.zeros(self.num_stages + 1, self.num_context_features), requires_grad=False
+            torch.zeros(self.num_stages + 1, self.num_context_features),
+            requires_grad=False,
         )
         self.mask_embed = nn.Parameter(torch.zeros(hidden), requires_grad=False)
         # softmax(fuse_weight), filled after loading.
-        self.register_buffer("fuse_alpha", torch.zeros(self.num_stages + 1, self.num_context_features), persistent=False)
+        self.register_buffer(
+            "fuse_alpha",
+            torch.zeros(self.num_stages + 1, self.num_context_features),
+            persistent=False,
+        )
         # Per request pool row: the recurrent seed f_rnn, written after extend and verify.
         # A buffer so direct_compile lifts it as a graph input (the forward only reads it).
         self.register_buffer("f_rnn_buf", None, persistent=False)
@@ -228,7 +257,9 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
 
     def _gather_logits(self, logits):
         # Real vocab only, like the target's logits: sampled acceptance pairs the two.
-        return gather_and_crop_vocab(logits, self.lm_head)[..., : self.markov_head.unpadded_vocab_size]
+        return gather_and_crop_vocab(logits, self.lm_head)[
+            ..., : self.markov_head.unpadded_vocab_size
+        ]
 
     def compute_base_logits(self, hidden):
         if self.logits_mup_width_multiplier:
@@ -244,13 +275,19 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
         return hidden.reshape(-1, hidden.shape[-1])
 
     def allocate_f_rnn(self, num_req_rows: int) -> None:
-        self.f_rnn_buf = self.mask_embed.new_zeros(num_req_rows, self.config.hidden_size)
+        self.f_rnn_buf = self.mask_embed.new_zeros(
+            num_req_rows, self.config.hidden_size
+        )
 
     def _mix_norm(self, targets, row, norm):
-        return _mix_rmsnorm(targets, self.fuse_alpha[row], norm.weight, norm.variance_epsilon)
+        return _mix_rmsnorm(
+            targets, self.fuse_alpha[row], norm.weight, norm.variance_epsilon
+        )
 
     def _split_targets(self, target_hidden):
-        return target_hidden.view(target_hidden.shape[0], self.num_context_features, self.config.hidden_size)
+        return target_hidden.view(
+            target_hidden.shape[0], self.num_context_features, self.config.hidden_size
+        )
 
     @torch.no_grad()
     def store_f_rnn(self, *, target_hidden, rows, req_pool_indices, live):
@@ -276,7 +313,12 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             0, forward_batch.req_pool_indices.view(-1)[:bs].long()
         )
         return DFlashDraftModel.forward(
-            self, input_ids, positions, forward_batch, input_embeds=self.forward_embed(input_ids), **kwargs
+            self,
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=self.forward_embed(input_ids),
+            **kwargs,
         )
 
     def sample_draft_tokens_tpu(self, hidden_states, input_ids):
@@ -298,8 +340,12 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
         return target_hidden
 
     def prepare_context_hidden_for_kv(self, layer, ctx_hidden):
-        layer_id = next(i for i, candidate in enumerate(self.layers) if candidate is layer)
-        context = self._mix_norm(self._split_targets(ctx_hidden), layer_id, layer.dflare_norm)
+        layer_id = next(
+            i for i, candidate in enumerate(self.layers) if candidate is layer
+        )
+        context = self._mix_norm(
+            self._split_targets(ctx_hidden), layer_id, layer.dflare_norm
+        )
         return context.to(layer.self_attn.kv_proj_ctx.weight.dtype)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -325,10 +371,14 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
                     name, shard = name.replace(source, destination), shard_id
                     break
             if name not in params:
-                raise ValueError(f"Unrecognized MTP checkpoint tensor: {checkpoint_name}")
+                raise ValueError(
+                    f"Unrecognized MTP checkpoint tensor: {checkpoint_name}"
+                )
             param = params[name]
             if weight.dtype != torch.bfloat16 or param.dtype != weight.dtype:
-                raise ValueError(f"{checkpoint_name}: MTP requires BF16 parameters and checkpoint weights")
+                raise ValueError(
+                    f"{checkpoint_name}: MTP requires BF16 parameters and checkpoint weights"
+                )
             loader = getattr(param, "weight_loader", default_weight_loader)
             if shard is None:
                 loader(param, weight)
@@ -338,7 +388,13 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             loaded.add(name)
         missing = set(params) - loaded
         for name, pieces in shards.items():
-            expected = {"q", "k", "v"} if ".qkv_proj." in name else {"k", "v"} if ".kv_proj_ctx." in name else {0, 1}
+            expected = (
+                {"q", "k", "v"}
+                if ".qkv_proj." in name
+                else {"k", "v"}
+                if ".kv_proj_ctx." in name
+                else {0, 1}
+            )
             if pieces != expected:
                 missing.add(f"{name} shards {sorted(expected - pieces)}")
         if missing:

@@ -406,8 +406,11 @@ class HiCacheFile(HiCacheStorage):
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
-        if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
-            os.makedirs(self.file_path)
+        # Create on every rank, not just tp_rank 0: in multi-host deployments
+        # rank 0 lives on a different node, so its makedirs() never creates the
+        # directory on this host and every set() here fails with ENOENT.
+        if not os.path.exists(self.file_path):
+            os.makedirs(self.file_path, exist_ok=True)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
         # Metadata cache positive lookup toggle & TTL

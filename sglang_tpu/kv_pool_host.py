@@ -26,23 +26,45 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import sys
 import threading
 from collections import deque
-from typing import TYPE_CHECKING, List, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import numpy as np
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.hicache_auto_size import register_sizeable_pool
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HostPoolGroup,
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    StackBuildResult,
+    StackStrategy,
+    build_pool_entry,
+    register_stack_strategy,
+)
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
-from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+from sglang.srt.mem_cache.pool_host.base import (
+    host_memory_budget_bytes,
+    sync_fixed_hicache_size,
+)
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import next_power_of_2
 from sglang_tpu.tpu_dma_hicache import (
     NOOP_EVENT,
     TransferEvent,
     create_tpu_dma_kv_transfer,
+    is_tpu_dma_hicache_backend,
     page_major_tensors,
 )
+from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
 if TYPE_CHECKING:
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -122,6 +144,16 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             allocator_type=allocator_type,
             pool_label=pool_label,
         )
+        self.storage_format_tag = self._storage_format_tag()
+
+    def _storage_format_tag(self) -> str:
+        """Storage-key tag for everything that fixes a page's bytes on this
+        pool: the device layout with its packing, the store dtype and the page
+        dims. A page written under another tag is a miss, never wrong KV. The
+        fp8 scales are per-layer model constants, keyed by the model name."""
+        shape_tag = "x".join(str(d) for d in self._device_page_shape())
+        dtype_tag = str(self.dtype).removeprefix("torch.")
+        return f"tpu-{self.device_pool.kv_layout_tag()}-{dtype_tag}-{shape_tag}"
 
     def _device_page_shape(self) -> tuple:
         """Per-page dims of the device's fused KV tensor, layout and all."""
@@ -305,22 +337,31 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             return
         self.backup_copy_d2h(staged, host_indices)
 
-    # -- L3 storage hooks (not supported in the 2-tier TPU phase) -------- #
+    # -- L3 storage seams ------------------------------------------------ #
+    # The host buffer is page-major, so one page's all-layer KV is the
+    # contiguous row kv_buffer[page_id] of shape (layer_num, *device_page_shape).
+    # Storage backends move that row as one opaque flat blob; the interior keeps
+    # the device's packed layout and is never interpreted on the host.
+
+    def _page_id(self, index) -> int:
+        # Callers pass the first token slot of a page; drop any sub-page
+        # offset, consistent with _to_page_ids.
+        return int(index) // self.page_size
+
+    def _page_dims(self) -> tuple:
+        return tuple(self.kv_buffer.shape[1:])  # (layer_num, *device_page_shape)
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        raise NotImplementedError(
-            "L3 storage is not supported by the TPU fused host pool yet."
-        )
+        data_page = self.kv_buffer[self._page_id(index)]
+        return data_page.flatten() if flat else data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        raise NotImplementedError(
-            "L3 storage is not supported by the TPU fused host pool yet."
-        )
+        return torch.zeros(
+            self._page_dims(), dtype=self.dtype, device=self.device
+        ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        raise NotImplementedError(
-            "L3 storage is not supported by the TPU fused host pool yet."
-        )
+        self.kv_buffer[self._page_id(index)] = data_page.reshape(self._page_dims())
 
 
 class TpuDMAHostKVPool(HostKVCache):
@@ -396,7 +437,9 @@ class TpuDMAHostKVPool(HostKVCache):
 
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
-            self.size = int(host_size * 1e9 // self.size_per_token)
+            self.size = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.size_per_token), host_size
+            )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align the pool up to a whole number of pages.
@@ -652,6 +695,9 @@ class TpuDMAMambaPoolHost(TpuDMAHostKVPool):
     ``TpuMambaPool`` keeps one ``[state_slots, ...]`` tensor per layer and state
     kind, so a slot is one row of each. Slots move through ``StateSlotTransfer``,
     not the DMA engine: the state tensors do not keep their device buffers.
+    MERGE-REVIEW: public main copies these slots with the DMA engine (one-row
+    pages, written in place); the torch path stays until the hybrid forwards here
+    stop rebinding state tensors.
     """
 
     def __init__(
@@ -689,3 +735,469 @@ def tpu_dma_mamba_pool_host_cls(io_backend: str) -> type[TpuDMAMambaPoolHost]:
         (TpuDMAMambaPoolHost,),
         {"io_backend": io_backend},
     )
+
+
+@dataclass
+class _UnifiedHostSide:
+    pages_per_logical: int
+    live_pages: set[int] = field(default_factory=set)
+
+
+class _SharedUnifiedDMAHostState:
+    """Shared host page arena and single DMA engine for ``TpuUnifiedSWAKVPool``."""
+
+    def __init__(
+        self,
+        *,
+        io_backend: str,
+        unified_pool: TpuUnifiedSWAKVPool,
+        host_to_device_ratio: float,
+        host_size: float,
+        page_size: int,
+    ):
+        self.io_backend = io_backend
+        self.page_size = page_size
+        self.num_swa_groups = unified_pool.layout.num_swa_groups
+        backing = unified_pool.kv_pool
+        self.bytes_per_page = sum(buf[0].nbytes for buf in backing.page_buffers())
+        if self.bytes_per_page % page_size != 0:
+            raise ValueError(
+                f"Unified host page bytes ({self.bytes_per_page}) must be "
+                f"divisible by page_size ({page_size})."
+            )
+        self.full_size_per_token = self.bytes_per_page // page_size
+
+        if host_size > 0:
+            tokens = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.full_size_per_token), host_size
+            )
+        else:
+            tokens = int(unified_pool.size * host_to_device_ratio)
+        self.page_num = tokens // page_size + 1
+        if self.page_num < self.num_swa_groups:
+            raise ValueError(
+                f"Unified host KV pool ({self.page_num} physical pages) must fit "
+                f"at least one SWA page ({self.num_swa_groups} physical pages)."
+            )
+
+        full_tokens = self.page_num * page_size
+        if full_tokens <= unified_pool.size:
+            logger.warning(
+                "HiCache unified host pool (%d tokens) is smaller than the device "
+                "pool (%d tokens); L2 cache effectiveness is reduced. "
+                "Consider increasing --hicache-ratio (or --hicache-size) for "
+                "higher L2 cache hit rate.",
+                full_tokens,
+                unified_pool.size,
+            )
+
+        requested_bytes = self.page_num * self.bytes_per_page
+        available_bytes = host_memory_budget_bytes(requested_bytes)
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory available. Requesting "
+                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                f"size of the hierarchical cache."
+            )
+        logger.info(
+            "Allocating unified (%s) hierarchical KV host pool: %d physical pages "
+            "(%d full-equiv tokens), %.2f GB host memory.",
+            io_backend,
+            self.page_num,
+            full_tokens,
+            requested_bytes / 1e9,
+        )
+
+        self.transfer = create_tpu_dma_kv_transfer(io_backend, backing, self.page_num)
+        self.lock = threading.RLock()
+        self.free_pages: deque[int] = deque(range(self.page_num))
+        self.swa_group_pages = torch.zeros(
+            (max(0, self.num_swa_groups - 1), self.page_num), dtype=torch.int32
+        )
+        self.sides: dict[str, _UnifiedHostSide] = {}
+        self.users = 0
+        self.destroyed = False
+
+    def register_side(self, label: str, pages_per_logical: int) -> None:
+        with self.lock:
+            self.sides[label] = _UnifiedHostSide(pages_per_logical=pages_per_logical)
+            self.users += 1
+
+    def release(self) -> None:
+        with self.lock:
+            self.users = max(0, self.users - 1)
+            if self.users > 0 or self.destroyed:
+                return
+            self.destroyed = True
+            destroy_fn = getattr(self.transfer, "destroy", None)
+        if destroy_fn is not None:
+            destroy_fn()
+
+    def acquire_layout(self) -> None:
+        return None
+
+    def release_layout(self, finish_event=None, transfer_key=None) -> None:
+        return None
+
+    def free_bytes(self) -> int:
+        with self.lock:
+            return len(self.free_pages) * self.bytes_per_page
+
+    def available_tokens(self, label: str) -> int:
+        with self.lock:
+            pages = len(self.free_pages) // self.sides[label].pages_per_logical
+            return pages * self.page_size
+
+    def live_tokens(self, label: str) -> int:
+        with self.lock:
+            return len(self.sides[label].live_pages) * self.page_size
+
+    def _required_physical_pages(
+        self, requests: Sequence[tuple[str, int]]
+    ) -> tuple[list[int], int]:
+        logical_counts: list[int] = []
+        total_phys = 0
+        for label, need_size in requests:
+            assert need_size >= 0 and need_size % self.page_size == 0, (
+                f"host alloc size must be a non-negative multiple of page_size, got {need_size}"
+            )
+            num_logical = need_size // self.page_size
+            logical_counts.append(num_logical)
+            total_phys += num_logical * self.sides[label].pages_per_logical
+        return logical_counts, total_phys
+
+    def can_fit_many_then(
+        self,
+        requests: Sequence[tuple[str, int]],
+        following_requests: Sequence[tuple[str, int]],
+        *,
+        empty: bool = False,
+    ) -> bool:
+        with self.lock:
+            _, first_phys = self._required_physical_pages(requests)
+            _, next_phys = self._required_physical_pages(following_requests)
+            avail = self.page_num if empty else len(self.free_pages)
+            return first_phys + next_phys <= avail
+
+    def alloc_many(
+        self, requests: Sequence[tuple[str, int]]
+    ) -> Optional[list[torch.Tensor]]:
+        with self.lock:
+            logical_counts, total_phys = self._required_physical_pages(requests)
+            if total_phys > len(self.free_pages):
+                return None
+            offsets = torch.arange(self.page_size, dtype=torch.int64)
+            out: list[torch.Tensor] = []
+            for (label, _), num_logical in zip(requests, logical_counts, strict=True):
+                if num_logical == 0:
+                    out.append(torch.empty(0, dtype=torch.int64))
+                    continue
+                side = self.sides[label]
+                primaries = [self.free_pages.popleft() for _ in range(num_logical)]
+                if side.pages_per_logical > 1:
+                    extra = side.pages_per_logical - 1
+                    companions = [
+                        self.free_pages.popleft() for _ in range(num_logical * extra)
+                    ]
+                    comp_tensor = (
+                        torch.tensor(companions, dtype=torch.int32)
+                        .reshape(num_logical, extra)
+                        .T
+                    )
+                    self.swa_group_pages[:, primaries] = comp_tensor
+                side.live_pages.update(primaries)
+                page_ids = torch.tensor(primaries, dtype=torch.int64)
+                out.append((page_ids[:, None] * self.page_size + offsets).reshape(-1))
+            return out
+
+    def alloc(self, label: str, need_size: int) -> Optional[torch.Tensor]:
+        res = self.alloc_many(((label, need_size),))
+        return None if res is None else res[0]
+
+    def free(self, label: str, indices: torch.Tensor) -> int:
+        if indices.numel() == 0:
+            return 0
+        page_ids = torch.unique(indices.cpu() // self.page_size).tolist()
+        with self.lock:
+            side = self.sides[label]
+            for pid in page_ids:
+                side.live_pages.remove(pid)
+                self.free_pages.append(pid)
+                if side.pages_per_logical > 1:
+                    self.free_pages.extend(self.swa_group_pages[:, pid].tolist())
+                    self.swa_group_pages[:, pid] = 0
+        return len(indices)
+
+    def clear(self, label: str) -> None:
+        with self.lock:
+            side = self.sides[label]
+            for pid in sorted(side.live_pages):
+                self.free_pages.append(pid)
+                if side.pages_per_logical > 1:
+                    self.free_pages.extend(self.swa_group_pages[:, pid].tolist())
+                    self.swa_group_pages[:, pid] = 0
+            side.live_pages.clear()
+            if all(not s.live_pages for s in self.sides.values()):
+                self.free_pages = deque(range(self.page_num))
+
+
+class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
+    """Full- or SWA-side host KV endpoint sharing one TPU DMA host page arena."""
+
+    def __init__(
+        self,
+        unified_pool: TpuUnifiedSWAKVPool,
+        state: _SharedUnifiedDMAHostState,
+        *,
+        is_swa: bool,
+        pool_label: str,
+    ):
+        self.io_backend = state.io_backend
+        self.device_pool = unified_pool
+        self.draft_pools = ()
+        self._unified_pool = unified_pool
+        self._is_swa = is_swa
+        self._pages_per_logical = unified_pool.layout.num_swa_groups if is_swa else 1
+        self.pool_label = pool_label
+        self.page_size = state.page_size
+        self.layout = TPU_DMA_LAYOUT
+        self.pin_memory = False
+        self.device = "cpu"
+        self.dtype = unified_pool.kv_pool.store_dtype
+        self.start_layer = 0
+        self.layer_num = (
+            unified_pool.swa.num_layers if is_swa else unified_pool.full.num_layers
+        )
+        self.end_layer = self.layer_num
+
+        state.register_side(pool_label, self._pages_per_logical)
+        self._state = state
+        self.transfer = state.transfer
+        self.lock = state.lock
+        self.size_per_token = state.full_size_per_token * self._pages_per_logical
+        self.page_num = state.page_num // self._pages_per_logical
+        self.size = self.page_num * self.page_size
+        self._released = False
+
+    def get_size_per_token(self) -> int:
+        return self.size_per_token
+
+    @classmethod
+    def build_pair(
+        cls,
+        unified_pool: TpuUnifiedSWAKVPool,
+        *,
+        io_backend: str,
+        host_to_device_ratio: float,
+        host_size: float,
+        page_size: int,
+    ) -> tuple[TpuDMAUnifiedHostKVPool, TpuDMAUnifiedHostKVPool]:
+        state = _SharedUnifiedDMAHostState(
+            io_backend=io_backend,
+            unified_pool=unified_pool,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+        )
+        return (
+            cls(unified_pool, state, is_swa=False, pool_label="full"),
+            cls(unified_pool, state, is_swa=True, pool_label="swa"),
+        )
+
+    @property
+    def shared_allocation_domain(self) -> _SharedUnifiedDMAHostState:
+        return self._state
+
+    def live_tokens(self) -> int:
+        return self._state.live_tokens(self.pool_label)
+
+    def available_size(self) -> int:
+        return self._state.available_tokens(self.pool_label)
+
+    def clear(self) -> None:
+        self._state.clear(self.pool_label)
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        return self._state.alloc(self.pool_label, need_size)
+
+    def free(self, indices: torch.Tensor) -> int:
+        return self._state.free(self.pool_label, indices)
+
+    def destroy(self) -> None:
+        if not self._released:
+            self._released = True
+            self._state.release()
+        super().destroy()
+
+    def _expand_pages(
+        self, token_indices: torch.Tensor, group_pages: Optional[torch.Tensor]
+    ) -> List[int]:
+        primaries = (token_indices[:: self.page_size].cpu() // self.page_size).to(
+            torch.long
+        )
+        if not self._is_swa or group_pages is None or group_pages.shape[0] == 0:
+            return primaries.tolist()
+        companions = group_pages[:, primaries].to(torch.long)
+        expanded = torch.cat([primaries.unsqueeze(0), companions], dim=0)
+        return expanded.T.reshape(-1).tolist()
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ) -> TransferEvent:
+        if host_indices.numel() == 0 or device_indices.numel() == 0:
+            return NOOP_EVENT
+        device_pages = self._expand_pages(
+            device_indices, self._unified_pool.swa_group_pages
+        )
+        host_pages = self._expand_pages(host_indices, self._state.swa_group_pages)
+        return self.transfer.backup(device_pages, host_pages)
+
+    def load_all_layer(
+        self, device_pool, host_indices, device_indices
+    ) -> TransferEvent:
+        if host_indices.numel() == 0 or device_indices.numel() == 0:
+            return NOOP_EVENT
+        host_pages = self._expand_pages(host_indices, self._state.swa_group_pages)
+        device_pages = self._expand_pages(
+            device_indices, self._unified_pool.swa_group_pages
+        )
+        return self.transfer.load(host_pages, device_pages)
+
+
+def _unified_swa_layer_mappings(
+    kvcache: TpuUnifiedSWAKVPool,
+) -> tuple[dict[int, int], dict[int, int]]:
+    full = {
+        gid - kvcache.start_layer: lid
+        for gid, (lid, is_swa) in kvcache.layers_mapping.items()
+        if not is_swa
+    }
+    swa = {
+        gid - kvcache.start_layer: lid
+        for gid, (lid, is_swa) in kvcache.layers_mapping.items()
+        if is_swa
+    }
+    return full, swa
+
+
+def _evict_swa_for_device_alloc(cache, required_size: int) -> None:
+    available_size = cache.token_to_kv_pool_allocator.swa_available_size()
+    shortfall = max(0, required_size - available_size)
+    if shortfall > 0:
+        cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
+
+
+class _TpuUnifiedSwaStrategy(StackStrategy):
+    def matches(self, kvcache, components) -> bool:
+        pd_hicache = sys.modules.get("sglang_tpu.pd_decode_swa_hicache")
+        if pd_hicache is not None and pd_hicache.is_building_full_only_host_cache():
+            return False
+        return isinstance(kvcache, TpuUnifiedSWAKVPool) and components == {
+            ComponentType.FULL,
+            ComponentType.SWA,
+        }
+
+    def build(
+        self,
+        *,
+        cache,
+        kvcache,
+        params,
+        server_args,
+        load_cache_event,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
+    ):
+        if params.mtp_draft_device_pools:
+            raise NotImplementedError(
+                "MTP draft KV offload is not supported on TpuUnifiedSWAKVPool."
+            )
+        if storage_backend is not None:
+            raise ValueError(
+                "TpuUnifiedSWAKVPool does not support L3 storage "
+                f"(--hicache-storage-backend={storage_backend!r})."
+            )
+        memory = get_memory()
+        if not is_tpu_dma_hicache_backend(memory.hicache_io_backend):
+            raise ValueError(
+                "TpuUnifiedSWAKVPool with --enable-hierarchical-cache requires "
+                "a TPU DMA --hicache-io-backend (e.g. 'raiden'), got "
+                f"{memory.hicache_io_backend!r}."
+            )
+        full_layer_mapping, swa_layer_mapping = _unified_swa_layer_mappings(kvcache)
+        transfer_layer_id_max = (
+            max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
+        )
+        kv_host_pool, swa_host_pool = TpuDMAUnifiedHostKVPool.build_pair(
+            kvcache,
+            io_backend=memory.hicache_io_backend,
+            host_to_device_ratio=memory.hicache_ratio,
+            host_size=memory.hicache_size,
+            page_size=params.page_size,
+        )
+        swa_alloc = params.token_to_kv_pool_allocator.swa_attn_allocator
+        host_pool_group = HostPoolGroup(
+            [
+                build_pool_entry(
+                    name=PoolName.KV,
+                    host_pool=kv_host_pool,
+                    device_pool=kvcache,
+                    layer_mapping=full_layer_mapping,
+                    transfer_layer_id_max=transfer_layer_id_max,
+                    is_anchor=True,
+                    host_evict_fn=lambda n: cache.evict_host(n, ComponentType.FULL),
+                ),
+                build_pool_entry(
+                    name=PoolName.SWA,
+                    host_pool=swa_host_pool,
+                    device_pool=kvcache,
+                    layer_mapping=swa_layer_mapping,
+                    transfer_layer_id_max=transfer_layer_id_max,
+                    host_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+                    device_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
+                    device_alloc_fn=swa_alloc.alloc,
+                    device_free_fn=swa_alloc.free,
+                ),
+            ]
+        )
+        cache_controller = HybridCacheController.create_for_backend(
+            params.token_to_kv_pool_allocator,
+            host_pool_group,
+            params.page_size,
+            params.tp_cache_group,
+            load_cache_event=load_cache_event,
+            attn_cp_group=params.attn_cp_cache_group,
+            attn_tp_group=params.attn_tp_cache_group,
+            pp_group=params.pp_cache_group,
+            write_policy=memory.hicache_write_policy,
+            io_backend=memory.hicache_io_backend,
+            storage_backend=storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            transfer_layer_id_max=transfer_layer_id_max,
+            enable_storage_metrics=enable_storage_metrics,
+            host_memory_mode=memory.hicache_host_memory_mode,
+        )
+        return StackBuildResult(
+            host_pool_group=host_pool_group,
+            cache_controller=cache_controller,
+            component_host_pools={
+                ComponentType.FULL: kv_host_pool,
+                ComponentType.SWA: swa_host_pool,
+            },
+            pools_desc="Full + SWA (TPU Unified)",
+        )
+
+
+_TPU_UNIFIED_SWA_STRATEGY = _TpuUnifiedSwaStrategy()
+
+
+def register_unified_hicache_strategy() -> None:
+    """Register the TPU unified Full+SWA HiCache stack strategy and sizing entry."""
+    register_sizeable_pool(TpuUnifiedSWAKVPool)
+    register_stack_strategy(_TPU_UNIFIED_SWA_STRATEGY)

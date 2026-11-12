@@ -17,10 +17,15 @@ from __future__ import annotations
 import logging
 from typing import Iterable, NamedTuple, Optional
 
-
 import torch
 from torch import nn
 
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary.ops import (
+    _dp_scatter_step,
+    dp_gather,
+    to_dp_local,
+)
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -28,16 +33,14 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.layers.layer_boundary.ops import _dp_scatter_step, dp_gather, to_dp_local
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers import mm_utils
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers import mm_utils
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -79,7 +82,9 @@ def _rms(x: torch.Tensor, eps: float) -> torch.Tensor:
 class Inkling2RMSNorm(nn.Module):
     """RMSNorm with an optional learned scale before normalization."""
 
-    def __init__(self, hidden_size, eps, *, pre_affine=False, affine=True, out_dtype=None):
+    def __init__(
+        self, hidden_size, eps, *, pre_affine=False, affine=True, out_dtype=None
+    ):
         super().__init__()
         self.eps = eps
         self.out_dtype = out_dtype
@@ -110,7 +115,9 @@ def _l2_clip(x, threshold, scale=None, tau=None):
 
 
 def _log_scaling_tau(positions, n_floor, alpha):
-    return 1.0 + alpha * torch.log(torch.clamp((positions + 1).float() / n_floor, min=1.0))
+    return 1.0 + alpha * torch.log(
+        torch.clamp((positions + 1).float() / n_floor, min=1.0)
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -123,7 +130,9 @@ def _inv_rms(x: torch.Tensor) -> torch.Tensor:
     return torch.rsqrt(x.float().square().mean(dim=-1) + _ATTN_RES_EPS)
 
 
-def _block_attn_res(blocks, block_inv_rms, partial, queries, *, normalize_values, addend=None):
+def _block_attn_res(
+    blocks, block_inv_rms, partial, queries, *, normalize_values, addend=None
+):
     """Attention over residual sources at each token; one output per query row.
 
     ``block_inv_rms`` holds the cached inverse RMS of the leading ``blocks`` (it may be shorter;
@@ -137,7 +146,9 @@ def _block_attn_res(blocks, block_inv_rms, partial, queries, *, normalize_values
     inv = [*block_inv_rms, *(_inv_rms(s) for s in sources[len(block_inv_rms) :])]
     q = queries.float().T * partial.shape[-1] ** -0.5
     # [T, Q, n] logits: one small matmul per source.
-    logits = torch.stack([(s.float() @ q) * r[:, None] for s, r in zip(sources, inv)], dim=-1)
+    logits = torch.stack(
+        [(s.float() @ q) * r[:, None] for s, r in zip(sources, inv)], dim=-1
+    )
     probs = torch.softmax(logits, dim=-1)
     out = None
     for i, (s, r) in enumerate(zip(sources, inv)):
@@ -169,7 +180,10 @@ class Inkling2AttnRes(nn.Module):
         )
         self.output_query = nn.Parameter(torch.zeros(h), requires_grad=False)
         # The kernel implements the RMSNorm without a pre-affine scale.
-        self.use_pallas = envs.SGLANG_TPU_INKLING2_ATTN_RES_PALLAS.get() and not config.pre_norm_pre_affine
+        self.use_pallas = (
+            envs.SGLANG_TPU_INKLING2_ATTN_RES_PALLAS.get()
+            and not config.pre_norm_pre_affine
+        )
         if self.use_pallas:
             register_inkling2_attn_res_op()
 
@@ -205,11 +219,15 @@ class _AttnResState:
                 value = _rms(value, _ATTN_RES_EPS)
             count = 1 if layer_idx in self.attn_res.local_layer_ids else 3
             return (value,) * count
-        return self._mix(self.blocks, self.partial, self.attn_res.attn_queries[layer_idx - 1])
+        return self._mix(
+            self.blocks, self.partial, self.attn_res.attn_queries[layer_idx - 1]
+        )
 
     def _mix_normed(self, sources, addend, query, norms):
         """Normed bf16 sub-layer inputs from the Pallas kernel, or None when it does not apply."""
-        if not self.attn_res.use_pallas or not supports_attn_res_norm(self.partial.shape[0], len(sources)):
+        if not self.attn_res.use_pallas or not supports_attn_res_norm(
+            self.partial.shape[0], len(sources)
+        ):
             return None
         queries = query.float().reshape(len(norms), -1) * self.partial.shape[-1] ** -0.5
         weights = torch.stack([norm.weight.float() for norm in norms])
@@ -230,14 +248,22 @@ class _AttnResState:
             out = self._mix_normed([*self.blocks, self.partial], None, query, norms)
             if out is not None:
                 return out
-        return tuple(norm(stream) for norm, stream in zip(norms, self.attention_input(layer_idx)))
+        return tuple(
+            norm(stream) for norm, stream in zip(norms, self.attention_input(layer_idx))
+        )
 
-    def mlp_input_normed(self, layer_idx: int, attn_output: torch.Tensor, norm) -> torch.Tensor:
+    def mlp_input_normed(
+        self, layer_idx: int, attn_output: torch.Tensor, norm
+    ) -> torch.Tensor:
         query = self.attn_res.mlp_queries[layer_idx]
         if self.attn_res.is_block_boundary(layer_idx):
-            out = self._mix_normed([*self.blocks, self.partial, attn_output], None, query, (norm,))
+            out = self._mix_normed(
+                [*self.blocks, self.partial, attn_output], None, query, (norm,)
+            )
         else:
-            out = self._mix_normed([*self.blocks, self.partial], attn_output, query, (norm,))
+            out = self._mix_normed(
+                [*self.blocks, self.partial], attn_output, query, (norm,)
+            )
         if out is not None:
             return out[0]
         return norm(self.mlp_input(layer_idx, attn_output))
@@ -246,13 +272,17 @@ class _AttnResState:
         query = self.attn_res.mlp_queries[layer_idx]
         if self.attn_res.is_block_boundary(layer_idx):
             return self._mix([*self.blocks, self.partial], attn_output, query)[0]
-        return self._mix(self.blocks, self.partial, query, addend=attn_output.float())[0]
+        return self._mix(self.blocks, self.partial, query, addend=attn_output.float())[
+            0
+        ]
 
     def finalize_layer(self, layer_idx, attn_output, mlp_output) -> None:
         if self.attn_res.is_block_boundary(layer_idx):
             self.blocks.append(self.partial)
             self.block_inv_rms.append(_inv_rms(self.partial))
-            self.partial = (attn_output.float() + mlp_output.float()).to(attn_output.dtype)
+            self.partial = (attn_output.float() + mlp_output.float()).to(
+                attn_output.dtype
+            )
         else:
             self.partial = (
                 self.partial.float() + attn_output.float() + mlp_output.float()
@@ -274,22 +304,39 @@ class Inkling2ShortConv(ConvStateModule):
     ones load ``static_w`` [W, D] (lag order) and ``weight_proj`` [heads*W, H].
     """
 
-    def __init__(self, *, dim, kernel_size, stream, layer_id, shard, n_heads=1, dynamic_input_size=None):
+    def __init__(
+        self,
+        *,
+        dim,
+        kernel_size,
+        stream,
+        layer_id,
+        shard,
+        n_heads=1,
+        dynamic_input_size=None,
+    ):
         super().__init__()
         self.dim, self.kernel_size = dim, kernel_size
         self.stream, self.layer_id = stream, layer_id
-        self.shard = shard  # (tp_rank, tp_size) of the channel dim, (0, 1) when replicated
+        self.shard = (
+            shard  # (tp_rank, tp_size) of the channel dim, (0, 1) when replicated
+        )
         self.n_heads = n_heads
         self.is_dynamic = dynamic_input_size is not None
         if self.is_dynamic:
-            self.static_w = nn.Parameter(torch.empty(kernel_size, dim), requires_grad=False)
+            self.static_w = nn.Parameter(
+                torch.empty(kernel_size, dim), requires_grad=False
+            )
             self.weight_proj = nn.Parameter(
-                torch.empty(n_heads * kernel_size, dynamic_input_size), requires_grad=False
+                torch.empty(n_heads * kernel_size, dynamic_input_size),
+                requires_grad=False,
             )
             self.static_w.weight_loader = self._load_cols
             self.weight_proj.weight_loader = self._load_rows
         else:
-            self.weight = nn.Parameter(torch.empty(dim, 1, kernel_size), requires_grad=False)
+            self.weight = nn.Parameter(
+                torch.empty(dim, 1, kernel_size), requires_grad=False
+            )
             self.weight.weight_loader = self._load_rows
 
     def _load_rows(self, param, loaded):
@@ -311,7 +358,9 @@ class Inkling2ShortConv(ConvStateModule):
             return backend.run_sconv(
                 x, layer_id=self.layer_id, stream=int(self.stream), weight=self.weight
             )
-        dyn = torch.nn.functional.linear(dynamic_input.to(x.dtype), self.weight_proj.to(x.dtype))
+        dyn = torch.nn.functional.linear(
+            dynamic_input.to(x.dtype), self.weight_proj.to(x.dtype)
+        )
         return backend.run_sconv(
             x,
             layer_id=self.layer_id,
@@ -333,12 +382,18 @@ class AttentionSources(NamedTuple):
 
 
 class Inkling2Attention(nn.Module):
-    def __init__(self, config: Inkling2ModelConfig, layer_id: int, is_local: bool, prefix: str):
+    def __init__(
+        self, config: Inkling2ModelConfig, layer_id: int, is_local: bool, prefix: str
+    ):
         super().__init__()
         parallel = get_parallel()
         self.tp_rank, self.tp_size = parallel.attn_tp_rank, parallel.attn_tp_size
-        heads = config.swa_num_attention_heads if is_local else config.num_attention_heads
-        kv_heads = config.swa_num_key_value_heads if is_local else config.num_key_value_heads
+        heads = (
+            config.swa_num_attention_heads if is_local else config.num_attention_heads
+        )
+        kv_heads = (
+            config.swa_num_key_value_heads if is_local else config.num_key_value_heads
+        )
         self.head_dim = config.swa_head_dim if is_local else config.head_dim
         if heads % self.tp_size or kv_heads % self.tp_size:
             raise ValueError("Attention TP must divide the query and KV head counts")
@@ -346,8 +401,14 @@ class Inkling2Attention(nn.Module):
         self.d_rel = config.d_rel
         self.is_local = is_local
         self.scaling = self.head_dim**-0.5
-        self.qk_clip, self.rel_clip = config.qk_l2_clip_threshold, config.rel_l2_clip_threshold
-        self.tau_floor, self.tau_alpha = config.log_scaling_n_floor, config.log_scaling_alpha
+        self.qk_clip, self.rel_clip = (
+            config.qk_l2_clip_threshold,
+            config.rel_l2_clip_threshold,
+        )
+        self.tau_floor, self.tau_alpha = (
+            config.log_scaling_n_floor,
+            config.log_scaling_alpha,
+        )
         self.split_sizes = [
             self.heads * self.head_dim,
             self.kv_heads * self.head_dim,
@@ -387,7 +448,9 @@ class Inkling2Attention(nn.Module):
         self.q_l2_clip.scale = self._head_param(self.heads, self.head_dim)
         self.rel_l2_clip = nn.Module()
         self.rel_l2_clip.scale = self._head_param(self.heads, self.d_rel)
-        self.v_norm_eps = config.rms_norm_eps if config.use_value_norm_no_gamma else None
+        self.v_norm_eps = (
+            config.rms_norm_eps if config.use_value_norm_no_gamma else None
+        )
         conv = dict(
             dim=self.kv_heads * self.head_dim,
             kernel_size=config.sconv_kernel_size,
@@ -434,18 +497,34 @@ class Inkling2Attention(nn.Module):
         q, _, _, r, gate, sink = q_proj
         return q, k_proj[1], v_proj[2], r, gate, sink
 
-    def forward(self, sources: AttentionSources, positions, forward_batch: ForwardBatch):
+    def forward(
+        self, sources: AttentionSources, positions, forward_batch: ForwardBatch
+    ):
         q, k, v, r, gate, sink = self._project_sources(sources)
         tokens = q.shape[0]
         k = self.k_sconv(k, None if self.is_local else sources.k)
         v = self.v_sconv(v, None if self.is_local else sources.v)
-        tau = None if self.is_local else _log_scaling_tau(positions, self.tau_floor, self.tau_alpha)
-        q = _l2_clip(q.view(tokens, self.heads, self.head_dim), self.qk_clip, self.q_l2_clip.scale, tau)
+        tau = (
+            None
+            if self.is_local
+            else _log_scaling_tau(positions, self.tau_floor, self.tau_alpha)
+        )
+        q = _l2_clip(
+            q.view(tokens, self.heads, self.head_dim),
+            self.qk_clip,
+            self.q_l2_clip.scale,
+            tau,
+        )
         k = _l2_clip(k.view(tokens, self.kv_heads, self.head_dim), self.qk_clip)
         v = v.view(tokens, self.kv_heads, self.head_dim)
         if self.v_norm_eps is not None:
             v = _rms(v, self.v_norm_eps).to(q.dtype)
-        r = _l2_clip(r.view(tokens, self.heads, self.d_rel), self.rel_clip, self.rel_l2_clip.scale, tau)
+        r = _l2_clip(
+            r.view(tokens, self.heads, self.d_rel),
+            self.rel_clip,
+            self.rel_l2_clip.scale,
+            tau,
+        )
         out = self.attn(
             q.reshape(tokens, -1),
             k.reshape(tokens, -1),
@@ -467,10 +546,14 @@ class Inkling2Attention(nn.Module):
 
 
 class Inkling2MoE(nn.Module):
-    def __init__(self, config: Inkling2ModelConfig, layer_id: int, quant_config, prefix: str):
+    def __init__(
+        self, config: Inkling2ModelConfig, layer_id: int, quant_config, prefix: str
+    ):
         super().__init__()
         if config.n_shared_experts:
-            raise NotImplementedError("Inkling2 shared experts are not served on TPU yet")
+            raise NotImplementedError(
+                "Inkling2 shared experts are not served on TPU yet"
+            )
         self.num_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
         self.route_scale = config.route_scale
@@ -486,7 +569,9 @@ class Inkling2MoE(nn.Module):
         )
         # A buffer (graph input) keeps the rank out of the traced graph.
         self.register_buffer(
-            "_route_rank", torch.tensor([get_parallel().attn_tp_rank], dtype=torch.int32), persistent=False
+            "_route_rank",
+            torch.tensor([get_parallel().attn_tp_rank], dtype=torch.int32),
+            persistent=False,
         )
         self.experts = FusedMoE(
             num_experts=self.num_experts,
@@ -513,14 +598,20 @@ class Inkling2MoE(nn.Module):
         ).sum(dim=-1)
         weights = topk_scores / topk_scores.sum(dim=-1, keepdim=True) * self.route_scale
         return StandardTopKOutput(
-            topk_weights=weights, topk_ids=topk_ids.to(torch.int32), router_logits=logits
+            topk_weights=weights,
+            topk_ids=topk_ids.to(torch.int32),
+            router_logits=logits,
         )
 
     def _route_sharded(self, x: torch.Tensor) -> StandardTopKOutput:
         """_route on this rank's 1/tp of the rows, gathered: routing is per row, so bit-identical."""
         group = get_parallel().attn_tp_group
         rows = x.shape[0] // group.world_size
-        mine = x.view(group.world_size, rows, x.shape[-1]).index_select(0, self._route_rank).squeeze(0)
+        mine = (
+            x.view(group.world_size, rows, x.shape[-1])
+            .index_select(0, self._route_rank)
+            .squeeze(0)
+        )
         topk = self._route(mine)
         return StandardTopKOutput(
             topk_weights=group.all_gather(topk.topk_weights, dim=0),
@@ -528,7 +619,9 @@ class Inkling2MoE(nn.Module):
             router_logits=None,
         )
 
-    def forward(self, x: torch.Tensor, num_token_non_padded: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, num_token_non_padded: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         tp = get_parallel().attn_tp_size
         if tp > 1 and x.shape[0] >= _SHARDED_ROUTE_MIN_TOKENS and x.shape[0] % tp == 0:
             topk = self._route_sharded(x)
@@ -536,7 +629,9 @@ class Inkling2MoE(nn.Module):
             topk = self._route(x)
         if num_token_non_padded is not None:
             # Bucket-padding rows hold stale values; under EP they must not reach the experts.
-            pad = (torch.arange(x.shape[0], device=x.device) >= num_token_non_padded)[:, None]
+            pad = (torch.arange(x.shape[0], device=x.device) >= num_token_non_padded)[
+                :, None
+            ]
             topk = StandardTopKOutput(
                 topk_weights=topk.topk_weights.masked_fill(pad, 0.0),
                 topk_ids=topk.topk_ids.masked_fill(pad, -1),
@@ -551,20 +646,37 @@ class Inkling2MoE(nn.Module):
 
 
 class Inkling2DecoderLayer(nn.Module):
-    def __init__(self, config: Inkling2ModelConfig, layer_id: int, quant_config, prefix: str):
+    def __init__(
+        self, config: Inkling2ModelConfig, layer_id: int, quant_config, prefix: str
+    ):
         super().__init__()
         self.layer_id = layer_id
         self.is_local = layer_id in config.local_layer_ids
         eps, pre = config.rms_norm_eps, config.pre_norm_pre_affine
-        self.attn = Inkling2Attention(config, layer_id, self.is_local, add_prefix("attn", prefix))
-        self.mlp = Inkling2MoE(config, layer_id, quant_config, add_prefix("mlp", prefix))
-        norm = lambda: Inkling2RMSNorm(config.hidden_size, eps, pre_affine=pre, out_dtype=torch.bfloat16)
+        self.attn = Inkling2Attention(
+            config, layer_id, self.is_local, add_prefix("attn", prefix)
+        )
+        self.mlp = Inkling2MoE(
+            config, layer_id, quant_config, add_prefix("mlp", prefix)
+        )
+        norm = lambda: Inkling2RMSNorm(
+            config.hidden_size, eps, pre_affine=pre, out_dtype=torch.bfloat16
+        )
         if self.is_local:
             self.attn_norm = norm()
         else:
-            self.q_input_norm, self.k_input_norm, self.v_input_norm = norm(), norm(), norm()
+            self.q_input_norm, self.k_input_norm, self.v_input_norm = (
+                norm(),
+                norm(),
+                norm(),
+            )
         self.mlp_norm = norm()
-        full = dict(dim=config.hidden_size, kernel_size=config.sconv_kernel_size, layer_id=layer_id, shard=(0, 1))
+        full = dict(
+            dim=config.hidden_size,
+            kernel_size=config.sconv_kernel_size,
+            layer_id=layer_id,
+            shard=(0, 1),
+        )
         self.attn_sconv = Inkling2ShortConv(stream=SconvType.ATTN, **full)
         self.mlp_sconv = Inkling2ShortConv(stream=SconvType.MLP, **full)
 
@@ -575,7 +687,8 @@ class Inkling2DecoderLayer(nn.Module):
         else:
             sources = AttentionSources(
                 *state.attention_input_normed(
-                    self.layer_id, (self.q_input_norm, self.k_input_norm, self.v_input_norm)
+                    self.layer_id,
+                    (self.q_input_norm, self.k_input_norm, self.v_input_norm),
                 )
             )
         attention = self.attn_sconv(self.attn(sources, positions, forward_batch))
@@ -583,7 +696,11 @@ class Inkling2DecoderLayer(nn.Module):
         if is_dp_attention_enabled():
             # Experts run on every DP group's tokens; sconv state is per request, so scatter back first.
             # Gathered padding rows are zero, so no pad mask (the local count would mask other groups).
-            moe_out = to_dp_local(_dp_scatter_step, forward_batch, self.mlp(dp_gather(mlp_input, forward_batch), None))
+            moe_out = to_dp_local(
+                _dp_scatter_step,
+                forward_batch,
+                self.mlp(dp_gather(mlp_input, forward_batch), None),
+            )
         else:
             moe_out = self.mlp(mlp_input, forward_batch.num_token_non_padded)
         mlp = self.mlp_sconv(moe_out)
@@ -603,7 +720,9 @@ class Inkling2TextModel(nn.Module):
         self.embed_norm = Inkling2RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.layers = nn.ModuleList(
             [
-                Inkling2DecoderLayer(config, i, quant_config, add_prefix(f"layers.{i}", prefix))
+                Inkling2DecoderLayer(
+                    config, i, quant_config, add_prefix(f"layers.{i}", prefix)
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -676,7 +795,9 @@ class _Decoder(nn.Module):
         return self._owner.get_input_embeddings()
 
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
-        return self._owner._forward_text(input_ids, positions, forward_batch, input_embeds)
+        return self._owner._forward_text(
+            input_ids, positions, forward_batch, input_embeds
+        )
 
 
 class Inkling2ForConditionalGeneration(nn.Module):
@@ -689,10 +810,14 @@ class Inkling2ForConditionalGeneration(nn.Module):
 
     def __init__(self, config: Inkling2MMConfig, quant_config=None, prefix: str = ""):
         super().__init__()
-        if quant_config is not None and not isinstance(quant_config, TpuInkling2QuantConfig):
+        if quant_config is not None and not isinstance(
+            quant_config, TpuInkling2QuantConfig
+        ):
             raise ValueError("Inkling2 requires its checkpoint precision metadata")
         if get_parallel().pp_group.world_size != 1:
-            raise ValueError("Inkling2 attention residuals do not support pipeline parallelism")
+            raise ValueError(
+                "Inkling2 attention residuals do not support pipeline parallelism"
+            )
         text = config.text_config
         self.config, self.text_config, self.quant_config = config, text, quant_config
         self.llm = Inkling2TextModel(text, quant_config, add_prefix("llm", prefix))
@@ -714,7 +839,9 @@ class Inkling2ForConditionalGeneration(nn.Module):
         if self.vision_enabled:
             if config.vision_config is None:
                 raise ValueError("Inkling2 image inputs require vision_config")
-            from sglang.srt.compilation.support_torch_compile import support_torch_compile
+            from sglang.srt.compilation.support_torch_compile import (
+                support_torch_compile,
+            )
             from sglang_tpu.compilation.decoder_compile_policy import (
                 Qwen3VLDecoderTpuCompilePolicy,
             )
@@ -726,7 +853,9 @@ class Inkling2ForConditionalGeneration(nn.Module):
                 config.vision_config, text.hidden_size, add_prefix("visual", prefix)
             )
             self.language_model = _Decoder(self)
-            support_torch_compile(self.language_model, policy=Qwen3VLDecoderTpuCompilePolicy)
+            support_torch_compile(
+                self.language_model, policy=Qwen3VLDecoderTpuCompilePolicy
+            )
             support_torch_compile(self.visual, policy=Inkling2VisionCompilePolicy)
 
     def get_input_embeddings(self) -> nn.Module:
@@ -753,15 +882,26 @@ class Inkling2ForConditionalGeneration(nn.Module):
             )
         self.llm.layers_to_capture = list(layer_ids[:-1])
 
-    def _forward_text(self, input_ids, positions, forward_batch: ForwardBatch, input_embeds=None):
+    def _forward_text(
+        self, input_ids, positions, forward_batch: ForwardBatch, input_embeds=None
+    ):
         hidden = self.llm(input_ids, positions, forward_batch, input_embeds)
         aux = None
         if self.capture_aux_hidden_states:
             hidden, aux = hidden
-        return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch, aux)
+        return self.logits_processor(
+            input_ids, hidden, self.lm_head, forward_batch, aux
+        )
 
     @torch.no_grad()
-    def forward(self, input_ids, positions, forward_batch: ForwardBatch, input_embeds=None, **kwargs):
+    def forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch: ForwardBatch,
+        input_embeds=None,
+        **kwargs,
+    ):
         if not self.vision_enabled:
             return self._forward_text(input_ids, positions, forward_batch, input_embeds)
         if (
@@ -813,8 +953,10 @@ class Inkling2ForConditionalGeneration(nn.Module):
         return PaddedEmbedding(tuple(spans))
 
     def pad_input_ids(self, input_ids, mm_inputs):
-        return mm_utils.MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
-            input_ids, mm_inputs
+        return (
+            mm_utils.MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+                input_ids, mm_inputs
+            )
         )
 
     # ------------------------------------------------------------------ #
@@ -828,7 +970,9 @@ class Inkling2ForConditionalGeneration(nn.Module):
         for checkpoint_name, tensor in weights:
             if checkpoint_name.startswith("model.visual."):
                 if self.visual is not None:
-                    self._load_vision(params, checkpoint_name[len("model."):], tensor, loaded)
+                    self._load_vision(
+                        params, checkpoint_name[len("model.") :], tensor, loaded
+                    )
                 continue
             name = _param_name(checkpoint_name)
             if name is None or _beyond_layers(name, num_layers):
@@ -844,16 +988,22 @@ class Inkling2ForConditionalGeneration(nn.Module):
                     continue
                 param = params.get(name)
                 if param is None:
-                    raise ValueError(f"Unrecognized checkpoint tensor: {checkpoint_name}")
+                    raise ValueError(
+                        f"Unrecognized checkpoint tensor: {checkpoint_name}"
+                    )
                 getattr(param, "weight_loader", default_weight_loader)(param, tensor)
             loaded.add(name)
         missing = sorted(
             n for n in params if n not in loaded and not _is_derived_param(n)
         )
         if missing:
-            raise RuntimeError(f"Inkling2 checkpoint is missing {len(missing)} tensors, e.g. {missing[:5]}")
+            raise RuntimeError(
+                f"Inkling2 checkpoint is missing {len(missing)} tensors, e.g. {missing[:5]}"
+            )
         for module in self.modules():
-            if isinstance(module, Inkling2Attention) and len(module.split_sizes) > len(_QKVR_PROJECTIONS):
+            if isinstance(module, Inkling2Attention) and len(module.split_sizes) > len(
+                _QKVR_PROJECTIONS
+            ):
                 # The alignment pad shard has no checkpoint tensor; left as torch.empty it holds NaN/Inf.
                 module.qkvr.weight.data[-module.split_sizes[-1] :].zero_()
 
@@ -875,11 +1025,15 @@ class Inkling2ForConditionalGeneration(nn.Module):
     def _load_experts(self, params, name, tensor, loaded) -> None:
         """Stacked [E, ...] expert tensors -> this rank's FusedMoE parameters."""
         prefix = name.split(".mlp.experts.", 1)[0] + ".mlp.experts."
-        leaf = name[len(prefix):]
-        precision = self.quant_config.expert_precision(prefix) if self.quant_config else "bf16"
+        leaf = name[len(prefix) :]
+        precision = (
+            self.quant_config.expert_precision(prefix) if self.quant_config else "bf16"
+        )
         # Narrow to this rank's experts first: the conversions below then touch 1/EP of the stack.
         tensor = _ep_slice(tensor, self.text_config.n_routed_experts)
-        if precision == "fp8_block":  # stored ready to use: FP8 weights and their block scales
+        if (
+            precision == "fp8_block"
+        ):  # stored ready to use: FP8 weights and their block scales
             _copy_expert_slice(params[name], tensor)
             loaded.add(name)
             return
@@ -899,7 +1053,10 @@ class Inkling2ForConditionalGeneration(nn.Module):
             scale = self._pending.get(prefix + weight_leaf + "_scale")
             if weight is None or scale is None:
                 return
-            del self._pending[prefix + weight_leaf], self._pending[prefix + weight_leaf + "_scale"]
+            del (
+                self._pending[prefix + weight_leaf],
+                self._pending[prefix + weight_leaf + "_scale"],
+            )
             leaf, tensor = weight_leaf, _dequant_mxfp8(weight, scale)
         target = prefix + leaf
         if leaf.startswith("w13"):
@@ -937,18 +1094,23 @@ class Inkling2ForConditionalGeneration(nn.Module):
         """(weight leaf, BF16 [E, N, K]) once weight, block scale, amax and denominator arrived."""
         weight_leaf = leaf.split("_weight", 1)[0] + "_weight"
         self._pending[prefix + leaf] = tensor
-        parts = [prefix + weight_leaf + s for s in ("", "_scale", "_amax", "_outer_scale_denominator")]
+        parts = [
+            prefix + weight_leaf + s
+            for s in ("", "_scale", "_amax", "_outer_scale_denominator")
+        ]
         if any(p not in self._pending for p in parts):
             return None
         weight, scale, amax, den = (self._pending.pop(p) for p in parts)
-        return weight_leaf, _dequant_nvfp4(weight, scale, amax.float() / den.float().reshape(-1)[0])
+        return weight_leaf, _dequant_nvfp4(
+            weight, scale, amax.float() / den.float().reshape(-1)[0]
+        )
 
 
 def _param_name(checkpoint_name: str) -> Optional[str]:
     """Model parameter for a checkpoint tensor, None for the vision tower."""
     if not checkpoint_name.startswith("model.llm."):
         return None
-    name = "llm." + checkpoint_name[len("model.llm."):]
+    name = "llm." + checkpoint_name[len("model.llm.") :]
     if name == "llm.unembed.weight":
         return "lm_head.weight"
     name = name.replace("llm.embed.weight", "llm.embed_tokens.weight")
@@ -969,7 +1131,12 @@ def _beyond_layers(name: str, num_layers: int) -> bool:
 
 def _is_derived_param(name: str) -> bool:
     """Parameters the checkpoint does not carry: pads, unused input scales, online FP8 scales."""
-    return name.endswith(("_input_scale", "_weight_scale_inv", "_weight_scale_2", "_weight_scale")) and ".experts." in name
+    return (
+        name.endswith(
+            ("_input_scale", "_weight_scale_inv", "_weight_scale_2", "_weight_scale")
+        )
+        and ".experts." in name
+    )
 
 
 def _quant_block_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -977,7 +1144,10 @@ def _quant_block_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     bn, bk = FP8_BLOCK
     e, n, k = w.shape
     blocks = w.float().reshape(e, n // bn, bn, k // bk, bk)
-    scale = blocks.abs().amax(dim=(2, 4)).clamp(min=1e-12) / torch.finfo(torch.float8_e4m3fn).max
+    scale = (
+        blocks.abs().amax(dim=(2, 4)).clamp(min=1e-12)
+        / torch.finfo(torch.float8_e4m3fn).max
+    )
     q = (blocks / scale[:, :, None, :, None]).to(torch.float8_e4m3fn)
     return q.reshape(e, n, k), scale
 
@@ -994,7 +1164,24 @@ def _dequant_mxfp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return w.flatten(-2).to(torch.bfloat16)
 
 
-_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+_E2M1 = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
 
 
 def _dequant_nvfp4(
@@ -1023,7 +1210,9 @@ def _copy_expert_slice(param: torch.Tensor, tensor: torch.Tensor) -> None:
         count = tensor.shape[0] // parallel.moe_ep_size
         tensor = tensor.narrow(0, parallel.moe_ep_rank * count, count)
     if tuple(tensor.shape) != tuple(param.shape):
-        raise RuntimeError(f"Expert tensor shape {tuple(tensor.shape)} vs parameter {tuple(param.shape)}")
+        raise RuntimeError(
+            f"Expert tensor shape {tuple(tensor.shape)} vs parameter {tuple(param.shape)}"
+        )
     param.data.copy_(tensor.to(param.dtype))
 
 

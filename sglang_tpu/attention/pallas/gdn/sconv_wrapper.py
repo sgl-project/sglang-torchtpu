@@ -349,7 +349,8 @@ def _call_kernel(
         if dyn is not None:
             dyn = pltpu.with_memory_space_constraint(dyn, pltpu.HBM)
     out_shape = tuple(
-        pltpu.HBM(shape=a.shape, dtype=a.dtype) if pin else a for a in (out_struct, state)
+        pltpu.HBM(shape=a.shape, dtype=a.dtype) if pin else a
+        for a in (out_struct, state)
     )
     return pl.pallas_call(
         functools.partial(outer_kernel, cfg=cfg, metadata_layout=metadata_layout),

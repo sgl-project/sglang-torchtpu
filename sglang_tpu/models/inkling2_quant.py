@@ -46,7 +46,9 @@ class TpuInkling2QuantConfig(Inkling2QuantConfig):
             is_checkpoint_fp8_serialized=True, weight_block_size=list(FP8_BLOCK)
         )
         # Set by inkling2_convert_fp8: the NVFP4/MXFP8 experts were already stored as block FP8.
-        self.experts_prequantized = config.get("tpu_expert_format", {}).get("format") == "fp8_e4m3_block"
+        self.experts_prequantized = (
+            config.get("tpu_expert_format", {}).get("format") == "fp8_e4m3_block"
+        )
         self.nvfp4_packed = tpu_envs.SGLANG_TPU_INKLING2_NVFP4_EXPERTS.get()
         if self.nvfp4_packed:
             from sglang.srt.layers.quantization.modelopt_quant import (

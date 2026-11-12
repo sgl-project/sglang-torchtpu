@@ -31,7 +31,9 @@ def _make_block512_layer(
     include_unused_params: bool = True, group_size: int = BLOCK_SIZE
 ) -> torch.nn.Module:
     layer = torch.nn.Module()
-    layer.moe_runner_config = types.SimpleNamespace(is_gated=True, activation="silu")
+    layer.moe_runner_config = types.SimpleNamespace(
+        is_gated=True, activation="silu", routed_scaling_factor=None
+    )
     # Masked routing slots are spread over all experts by apply_tpu_nvfp4_moe.
     layer.num_experts = EXPERTS
     layer.register_parameter(
@@ -223,6 +225,48 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 self.assertIsNone(layer._parameters["w13_weight_scale_2"])
                 self.assertIsNone(layer._parameters["w2_weight_scale_2"])
 
+    def test_prepare_waits_for_w13_before_formatting_w2(self):
+        from sglang_tpu import fp4_moe
+
+        layer = _make_block512_layer(group_size=16)
+        raw_w2_storage = layer.w2_weight.data.untyped_storage()
+        seen_calls = []
+
+        def _record_wait(*tensors):
+            seen_calls.append(
+                (
+                    [tuple(t.shape) for t in tensors],
+                    raw_w2_storage.nbytes(),
+                )
+            )
+
+        with mock.patch.object(fp4_moe, "_wait_for", side_effect=_record_wait):
+            fp4_moe.prepare_tpu_nvfp4_moe_weights(
+                layer,
+                group_size=16,
+                use_fused_rs=False,
+            )
+
+        self.assertEqual(len(seen_calls), 2)
+        w13_shapes, w2_bytes_during_w13 = seen_calls[0]
+        w2_shapes, _ = seen_calls[1]
+        self.assertEqual(
+            w13_shapes,
+            [
+                (EXPERTS, HIDDEN_SIZE // 2, 2 * INTERMEDIATE_SIZE),
+                (EXPERTS, HIDDEN_SIZE // 16, 1, 2 * INTERMEDIATE_SIZE),
+            ],
+        )
+        self.assertGreater(w2_bytes_during_w13, 0)
+        self.assertEqual(
+            w2_shapes,
+            [
+                (EXPERTS, INTERMEDIATE_SIZE // 2, HIDDEN_SIZE),
+                (EXPERTS, INTERMEDIATE_SIZE // 16, 1, HIDDEN_SIZE),
+            ],
+        )
+        self.assertEqual(raw_w2_storage.nbytes(), 0)
+
     def test_scale_storage_dtype(self):
         from sglang_tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
@@ -232,6 +276,45 @@ class TestNvfp4Block512Contract(CustomTestCase):
         prepare_tpu_nvfp4_moe_weights(layer, scale_dtype=torch.bfloat16)
         self.assertEqual(layer.w13_weight_scale.dtype, torch.bfloat16)
         self.assertEqual(layer.w2_weight_scale.dtype, torch.bfloat16)
+
+    def test_nvfp4_moe_fp32_scales_env_promotes_gmm_v2_only(self):
+        from sglang_tpu import fp4_moe
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.override(True):
+            gmm_layer = _make_block512_layer(group_size=16)
+            fp4_moe.prepare_tpu_nvfp4_moe_weights(
+                gmm_layer,
+                group_size=16,
+                scale_dtype=torch.bfloat16,
+                use_fused_rs=False,
+            )
+            self.assertEqual(gmm_layer.w13_weight_scale.dtype, torch.float32)
+            self.assertEqual(gmm_layer.w2_weight_scale.dtype, torch.float32)
+
+            rs_layer = _make_block512_layer(group_size=16)
+            with (
+                mock.patch(
+                    "sglang_tpu.moe.pallas.fused_moe_rs_op.prepare_fused_moe_rs"
+                ),
+                mock.patch.object(
+                    fp4_moe,
+                    "prepare_tpu_fused_rs_post_expert_norm",
+                ),
+                mock.patch.object(
+                    fp4_moe,
+                    "_materialize_packed_fp4",
+                    side_effect=lambda x: x,
+                ),
+            ):
+                fp4_moe.prepare_tpu_nvfp4_moe_weights(
+                    rs_layer,
+                    group_size=16,
+                    scale_dtype=torch.bfloat16,
+                    use_fused_rs=True,
+                )
+            self.assertEqual(rs_layer.w13_weight_scale.dtype, torch.bfloat16)
+            self.assertEqual(rs_layer.w2_weight_scale.dtype, torch.bfloat16)
 
     def test_folds_non_unit_global_scales(self):
         from sglang_tpu.fp4_moe import (
@@ -297,13 +380,23 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 return_value=a2a_backend,
             ),
         ):
-            for group_size in SUPPORTED_BLOCK_SIZES:
-                with self.subTest(group_size=group_size):
-                    self.assertTrue(
-                        can_use_tpu_nvfp4_fused_rs(
-                            layer, group_size=group_size, no_combine=False
+            for activation in ("silu", "silu_and_mul_clamp", "swigluoai"):
+                layer.moe_runner_config.activation = activation
+                for group_size in SUPPORTED_BLOCK_SIZES:
+                    with self.subTest(activation=activation, group_size=group_size):
+                        self.assertTrue(
+                            can_use_tpu_nvfp4_fused_rs(
+                                layer, group_size=group_size, no_combine=False
+                            )
                         )
-                    )
+                        layer.supports_tpu_fused_rs_post_expert_norm = True
+                        self.assertTrue(
+                            can_use_tpu_nvfp4_fused_rs(
+                                layer, group_size=group_size, no_combine=True
+                            )
+                        )
+                        del layer.supports_tpu_fused_rs_post_expert_norm
+            layer.moe_runner_config.activation = "silu"
             layer.moe_ep_size = 2
             self.assertFalse(
                 can_use_tpu_nvfp4_fused_rs(
@@ -404,6 +497,14 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 ),
                 [],
             )
+            layer.moe_runner_config.activation = "gelu"
+            self.assertEqual(
+                unmet_tpu_nvfp4_fused_rs_requirements(
+                    layer, group_size=BLOCK_SIZE, no_combine=False
+                ),
+                ["silu or clamped SwiGLU activation"],
+            )
+            layer.moe_runner_config.activation = "silu"
             self.assertEqual(
                 unmet_tpu_nvfp4_fused_rs_requirements(
                     layer, group_size=BLOCK_SIZE, no_combine=True
@@ -1402,10 +1503,14 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         self.assertTrue(prepared["use_fused_rs"])
 
     def test_explicit_legacy_pallas_backend_disables_fused_rs(self):
-        _, resolved, prepared, _ = self._run_gate(backend="pallas_tpu")
+        from sglang.srt.layers.quantization import modelopt_quant
+
+        with mock.patch.object(modelopt_quant.logger, "warning_once") as warn_mock:
+            _, resolved, prepared, _ = self._run_gate(backend="pallas_tpu")
 
         self.assertFalse(resolved)
         self.assertFalse(prepared["use_fused_rs"])
+        warn_mock.assert_not_called()
 
     def test_gate_still_declines_an_unsupported_layout(self):
         # EP 2 inside a world of 4 is the mixed TP/EP shape the requirement
@@ -1416,18 +1521,43 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         self.assertFalse(prepared["use_fused_rs"])
 
     def test_sub512_auto_backend_falls_back_to_stock_pallas(self):
+        from sglang.srt.layers.quantization import modelopt_quant
+
+        warn_fn = getattr(
+            modelopt_quant.logger.warning_once,
+            "__func__",
+            modelopt_quant.logger.warning_once,
+        )
         for group_size in (16, 32, 64, 128, 256):
             for ep_size, world_size in ((1, 1), (2, 4)):
                 with self.subTest(
                     group_size=group_size, ep_size=ep_size, world_size=world_size
                 ):
-                    _, resolved, prepared, _ = self._run_gate(
-                        ep_size=ep_size,
-                        world_size=world_size,
-                        group_size=group_size,
-                    )
+                    if hasattr(warn_fn, "cache_clear"):
+                        warn_fn.cache_clear()
+                    with self.assertLogs(
+                        modelopt_quant.logger, level="WARNING"
+                    ) as captured:
+                        _, resolved, prepared, _ = self._run_gate(
+                            ep_size=ep_size,
+                            world_size=world_size,
+                            group_size=group_size,
+                        )
+                        # Subsequent layers with the same unmet requirements
+                        # should not spam duplicate startup warnings.
+                        self._run_gate(
+                            ep_size=ep_size,
+                            world_size=world_size,
+                            group_size=group_size,
+                        )
                     self.assertFalse(resolved)
                     self.assertFalse(prepared["use_fused_rs"])
+                    self.assertEqual(len(captured.output), 1)
+                    self.assertIn("falling back to stock gmm_v2", captured.output[0])
+                    self.assertIn(
+                        "moe_ep_size == tp_size == world_size > 1",
+                        captured.output[0],
+                    )
 
     def test_explicit_pallas_backend_fails_closed(self):
         for group_size in (16, 512):

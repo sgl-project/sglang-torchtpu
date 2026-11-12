@@ -12,7 +12,12 @@ import torch
 
 from sglang.test.test_utils import CustomTestCase
 
-E, EP, N, K = 8, 4, 256, 256  # w13 rows N = 2 * intermediate (interleaved gate/up); N, K: whole FP8 blocks
+E, EP, N, K = (
+    8,
+    4,
+    256,
+    256,
+)  # w13 rows N = 2 * intermediate (interleaved gate/up); N, K: whole FP8 blocks
 
 
 def _model(precision, ep_rank):
@@ -24,7 +29,11 @@ def _model(precision, ep_rank):
         _pending={},
     )
     for fn in ("_load_experts", "_load_packed_nvfp4", "_take_nvfp4"):
-        setattr(self, fn, types.MethodType(getattr(m.Inkling2ForConditionalGeneration, fn), self))
+        setattr(
+            self,
+            fn,
+            types.MethodType(getattr(m.Inkling2ForConditionalGeneration, fn), self),
+        )
     parallel = types.SimpleNamespace(moe_ep_size=EP, moe_ep_rank=ep_rank)
     return m, self, mock.patch.object(m, "get_parallel", return_value=parallel)
 
@@ -40,20 +49,33 @@ class TestInkling2ExpertLoad(CustomTestCase):
             m, model, patch = _model("mxfp8", rank)
             local = E // EP
             params = {
-                self.prefix + "w13_weight": torch.empty(local, N, K, dtype=torch.float8_e4m3fn),
+                self.prefix + "w13_weight": torch.empty(
+                    local, N, K, dtype=torch.float8_e4m3fn
+                ),
                 self.prefix + "w13_weight_scale_inv": torch.empty(
                     local, N // m.FP8_BLOCK[0], K // m.FP8_BLOCK[1]
                 ),
             }
             loaded = set()
             with patch:
-                model._load_experts(params, self.prefix + "w13_weight_scale", scale, loaded)
+                model._load_experts(
+                    params, self.prefix + "w13_weight_scale", scale, loaded
+                )
                 model._load_experts(params, self.prefix + "w13_weight", weight, loaded)
                 full = m._deinterleave_gate_up(m._dequant_mxfp8(weight, scale))
-                want_w, want_s = m._quant_block_fp8(full[rank * local : (rank + 1) * local])
+                want_w, want_s = m._quant_block_fp8(
+                    full[rank * local : (rank + 1) * local]
+                )
             self.assertEqual(loaded, set(params))
-            self.assertTrue(torch.equal(params[self.prefix + "w13_weight"].view(torch.uint8), want_w.view(torch.uint8)))
-            self.assertTrue(torch.equal(params[self.prefix + "w13_weight_scale_inv"], want_s))
+            self.assertTrue(
+                torch.equal(
+                    params[self.prefix + "w13_weight"].view(torch.uint8),
+                    want_w.view(torch.uint8),
+                )
+            )
+            self.assertTrue(
+                torch.equal(params[self.prefix + "w13_weight_scale_inv"], want_s)
+            )
             self.assertEqual(model._pending, {})
 
     def test_packed_nvfp4_matches_slice_of_full(self):
@@ -65,18 +87,34 @@ class TestInkling2ExpertLoad(CustomTestCase):
             m, model, patch = _model("nvfp4_packed", rank)
             local = E // EP
             params = {
-                self.prefix + "w13_weight": torch.empty(local, N, K // 2, dtype=torch.uint8),
+                self.prefix + "w13_weight": torch.empty(
+                    local, N, K // 2, dtype=torch.uint8
+                ),
                 self.prefix + "w13_weight_scale_2": torch.empty(local, 2),
             }
             loaded = set()
             with patch:
                 model._load_experts(params, self.prefix + "w13_weight", weight, loaded)
-                model._load_experts(params, self.prefix + "w13_weight_amax", amax, loaded)
-                model._load_experts(params, self.prefix + "w13_weight_outer_scale_denominator", den, loaded)
-                want = m._deinterleave_gate_up(weight)[rank * local : (rank + 1) * local]
+                model._load_experts(
+                    params, self.prefix + "w13_weight_amax", amax, loaded
+                )
+                model._load_experts(
+                    params,
+                    self.prefix + "w13_weight_outer_scale_denominator",
+                    den,
+                    loaded,
+                )
+                want = m._deinterleave_gate_up(weight)[
+                    rank * local : (rank + 1) * local
+                ]
             sl = slice(rank * local, (rank + 1) * local)
             self.assertTrue(torch.equal(params[self.prefix + "w13_weight"], want))
-            self.assertTrue(torch.equal(params[self.prefix + "w13_weight_scale_2"], (amax[sl] / 2688.0)[:, None].expand(-1, 2)))
+            self.assertTrue(
+                torch.equal(
+                    params[self.prefix + "w13_weight_scale_2"],
+                    (amax[sl] / 2688.0)[:, None].expand(-1, 2),
+                )
+            )
 
 
 if __name__ == "__main__":

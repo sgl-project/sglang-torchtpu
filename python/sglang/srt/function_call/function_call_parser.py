@@ -248,7 +248,9 @@ class FunctionCallParser:
 
         get_structure_info = self.detector.structure_info()
         tools = self.tools
-        if isinstance(tool_choice, ToolChoice):  # a named choice admits only that function
+        if isinstance(
+            tool_choice, ToolChoice
+        ):  # a named choice admits only that function
             tools = [t for t in tools if t.function.name == tool_choice.function.name]
         for tool in tools:
             function = tool.function

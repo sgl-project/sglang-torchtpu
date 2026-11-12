@@ -18,17 +18,37 @@ import numpy as np
 from sglang.test.test_utils import CustomTestCase
 
 try:
-    import jax
     import jax.numpy as jnp
 
-    from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import fp4_blockdiag_matmul
+    from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
+        fp4_blockdiag_matmul,
+    )
 
     _HAS_JAX = True
 except Exception:  # pragma: no cover - depends on JAX availability
     _HAS_JAX = False
 
 GROUP = 16
-E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+E2M1 = np.array(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ]
+)
 
 
 def _reference(lhs, codes, scales):
@@ -45,7 +65,8 @@ class TestFp4BlockdiagMatmul(CustomTestCase):
         code_idx = rng.integers(0, 16, size=(size_k, size_n))
         codes = jnp.asarray(E2M1[code_idx], dtype=jnp.float32).astype(jnp.float4_e2m1fn)
         scales = jnp.asarray(
-            2.0 ** rng.integers(-6, 3, size=(size_k // GROUP, size_n)), dtype=scale_dtype
+            2.0 ** rng.integers(-6, 3, size=(size_k // GROUP, size_n)),
+            dtype=scale_dtype,
         )
         got = fp4_blockdiag_matmul(lhs, codes, scales, group=GROUP, kc=kc)
         want = _reference(

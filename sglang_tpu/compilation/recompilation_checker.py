@@ -27,8 +27,8 @@ from torch.utils import _pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
-from sglang.srt.environ import envs
 from sglang_tpu._logging import get_logger
+from sglang_tpu.envs import envs
 
 logger = get_logger(__name__)
 

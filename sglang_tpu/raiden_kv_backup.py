@@ -16,10 +16,11 @@ exclusively and row offsets are preserved by the page-aligned allocator.
 from __future__ import annotations
 
 import logging
-import os
 from typing import List, Optional, Tuple
 
 import torch
+
+from sglang_tpu.envs import envs
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +155,7 @@ def backup_pool_pages(env_gb: float, page_host_bytes: int) -> int:
 
 def maybe_build_backup(device_pool) -> Optional[RaidenKVBackup]:
     """The pool's retraction backup, when the operator budgeted one."""
-    gb = float(os.environ.get("SGLANG_RAIDEN_RETRACT_HOST_GB", "0") or 0)
+    gb = envs.SGLANG_RAIDEN_RETRACT_HOST_GB.get()
     if gb <= 0:
         return None
     page_bytes = 0

@@ -9,7 +9,9 @@ so each rank stays near its startup peak.
 handshake, including for offline Engine and Rust launches. It also wraps
 ``Scheduler.handle_freeze_gc`` to release pages created by subsequent warmup,
 clear export records and JAX caches, collect garbage before freezing GC,
-and return freed heap pages.
+and return freed heap pages. With HiCache enabled, model-worker initialization
+releases compiler state before the host KV pools are allocated; final cleanup
+still releases anything allocated later in startup.
 
 A release goes through every allocator loaded in the process (tcmalloc,
 glibc) because the one serving ``malloc`` cannot be detected reliably, and
@@ -35,7 +37,10 @@ from torch.compiler._cache import CacheArtifactManager
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.page_cache import release_startup_page_cache
+from sglang_tpu.page_cache import (
+    release_startup_page_cache,
+    start_checkpoint_page_cache_release,
+)
 
 logger = get_logger(__name__)
 
@@ -202,8 +207,10 @@ def _release_cpu_backend() -> bool:
     return True
 
 
-def _before_freeze() -> None:
-    release_startup_page_cache()
+def _before_freeze(*, synchronize: bool, include_checkpoints: bool = False) -> None:
+    release_startup_page_cache(
+        include_checkpoints=include_checkpoints, synchronize=synchronize
+    )
     if tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.get():
         import jax
 
@@ -221,6 +228,15 @@ def _after_freeze() -> None:
     _start_periodic(tpu_envs.SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC.get())
 
 
+def release_before_hicache() -> None:
+    """Release compilation memory before allocating this rank's host pool."""
+    _before_freeze(include_checkpoints=True, synchronize=True)
+    if tpu_envs.SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED.get():
+        trim_host_heap("before HiCache")
+    if get_parallel().pp_size == 1:
+        get_parallel().world_group.barrier()
+
+
 def install(scheduler_cls: Optional[type] = None) -> None:
     """Release file caches at scheduler startup and trim after GC freeze."""
     if scheduler_cls is None:
@@ -231,25 +247,47 @@ def install(scheduler_cls: Optional[type] = None) -> None:
     if getattr(orig, "_tpu_host_heap_trim", False):
         return
 
+    init_graphs = scheduler_cls.init_all_cuda_graphs
+    init_worker = scheduler_cls.init_model_worker
+
+    def init_all_cuda_graphs(self, *args, **kwargs):
+        start_checkpoint_page_cache_release()
+        return init_graphs(self, *args, **kwargs)
+
+    def init_model_worker(self, *args, **kwargs):
+        result = init_worker(self, *args, **kwargs)
+        if self.enable_hierarchical_cache:
+            release_before_hicache()
+        return result
+
     orig_get_init_info = scheduler_cls.get_init_info
 
     def get_init_info(self, *args, **kwargs):
         # Engine and Rust callers need no explicit freeze request for startup
         # file cleanup. All ranks reach this handshake before serving requests.
-        release_startup_page_cache()
+        # HiCache initialization already completed checkpoint eviction.
+        release_startup_page_cache(
+            include_checkpoints=not self.enable_hierarchical_cache
+        )
         get_parallel().world_group.barrier()
         return orig_get_init_info(self, *args, **kwargs)
 
     def handle_freeze_gc(self, *args, **kwargs):
-        _before_freeze()
+        # PP stages dispatch the freeze in different loop iterations (the wave
+        # sends PD consensus a round ahead), so a world barrier here deadlocks.
+        synchronize = get_parallel().pp_size == 1
+        _before_freeze(synchronize=synchronize)
         result = orig(self, *args, **kwargs)
         _after_freeze()
-        # A scheduler reply must cover cleanup on every rank, including PP stages.
-        get_parallel().world_group.barrier()
+        if synchronize:
+            # The scheduler reply covers cleanup on every rank.
+            get_parallel().world_group.barrier()
         if int(os.environ["LOCAL_RANK"]) == 0:
             log_startup_memory()
         return result
 
     handle_freeze_gc._tpu_host_heap_trim = True
+    scheduler_cls.init_all_cuda_graphs = init_all_cuda_graphs
     scheduler_cls.get_init_info = get_init_info
+    scheduler_cls.init_model_worker = init_model_worker
     scheduler_cls.handle_freeze_gc = handle_freeze_gc

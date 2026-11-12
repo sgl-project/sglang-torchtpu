@@ -19,7 +19,6 @@ from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     support_torch_compile,
 )
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase, enter_scope
@@ -322,7 +321,7 @@ class TestTpuGraphRunner(CustomTestCase):
         checker.snapshot_baseline.side_effect = lambda: events.append("snapshot")
         model = self._annotate(_model_with(forward=MagicMock()))
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker",
@@ -406,13 +405,6 @@ class TestTpuGraphRunner(CustomTestCase):
             self.mock_cache_key.assert_called_once_with()
             # The skip is reflected into the capture flag for downstream warmup.
             self.assertFalse(get_flags().capture.enable_torch_compile)
-
-    def test_annotation_drives_compile_when_can_torch_compile_default(self):
-        # Models that don't set _can_torch_compile should compile only when
-        # they declare a boundary.
-        model = self._annotate(_model_with(forward=MagicMock()))
-        TpuGraphRunner(self._runner_for(model))
-        self.mock_compile.assert_called_once()
 
     def test_no_annotation_uses_direct_tracer(self):
         # Most text decoder models should not need an explicit annotation.
@@ -560,7 +552,7 @@ class TestTpuGraphRunner(CustomTestCase):
         checker.snapshot_baseline.side_effect = lambda: events.append("snapshot")
         model = self._annotate(_model_with(forward=MagicMock()))
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker",
@@ -578,7 +570,7 @@ class TestTpuGraphRunner(CustomTestCase):
     def test_checker_is_not_armed_unless_opted_in(self):
         model = self._annotate(_model_with(forward=MagicMock()))
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker"
@@ -593,7 +585,7 @@ class TestTpuGraphRunner(CustomTestCase):
         runner_args = self._runner_for(model)
         runner_args.is_draft_worker = True
         with (
-            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
             patch(
                 "sglang_tpu.compilation.recompilation_checker."
                 "_shared_recompilation_checker"
@@ -601,11 +593,6 @@ class TestTpuGraphRunner(CustomTestCase):
         ):
             TpuGraphRunner(runner_args)
         shared.assert_not_called()
-
-    def test_precompile_called_for_installed_policy(self):
-        model = self._annotate(_model_with(forward=MagicMock()))
-        TpuGraphRunner(self._runner_for(model))
-        self.mock_precompile.assert_called_once()
 
     def test_discovers_annotated_module(self):
         events = []

@@ -21,6 +21,7 @@ from sglang.test.ci.ci_register import (
     collect_tests,
 )
 from sglang.test.ci.ci_utils import derive_timeout_per_file, run_unittest_files
+from sglang.test.ci.execution_budget import run_with_execution_budget
 
 # Defensive fallback in case sglang is loaded from an external environment missing TPU
 if not hasattr(HWBackend, "TPU"):
@@ -237,7 +238,6 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-gpt-oss-120b-c64",
         "nightly-tpu-perf-gpt-oss-120b-eagle3-c64",
         "nightly-tpu-perf-gpt-oss-120b-dflash-c64",
-        "nightly-tpu-perf-gpt-oss-20b",
         "nightly-tpu-perf-deepseek-r1-0528",
         "nightly-tpu-perf-deepseek-v3-1",
         "nightly-tpu-perf-kimi-k26",
@@ -246,7 +246,6 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-qwen3-5-397b",
         "nightly-tpu-perf-glm-5-3-flash-mtp-mk",
         # One suite per quality eval so each gets an independent TPU slice.
-        "nightly-tpu-accuracy-gpt-oss-20b",
         "nightly-tpu-accuracy-gemma4-31b-aime",
         "nightly-tpu-accuracy-gemma4-31b-gpqa",
         "nightly-tpu-accuracy-gemma4-31b-mmmupro",
@@ -345,6 +344,19 @@ def registered_test_files() -> List[str]:
         # registered tests, and must not be executed as one.
         if os.path.basename(f) not in ("conftest.py", "__init__.py")
     ]
+
+
+def fails_on_all_skipped(hw: HWBackend, suites: List[str]) -> bool:
+    """Whether a file whose tests all skip fails the run instead of passing.
+
+    On for the TPU per-commit suites: while the CI pods pinned JAX to CPU,
+    kernel tests gated on jax.devices() skipped every case and reported green
+    (#413). Other backends keep the old behavior until someone
+    checks their suites for files that skip on purpose.
+    """
+    return hw == HWBackend.TPU and any(
+        suite in PER_COMMIT_SUITES[HWBackend.TPU] for suite in suites
+    )
 
 
 def validate_all_suites(all_tests: List[CIRegistry]):
@@ -516,6 +528,7 @@ def run_a_suite(args):
         )
 
     pretty_print_tests(args, ci_tests, skipped_tests)
+    fail_on_all_skipped = fails_on_all_skipped(hw, suites)
 
     # None hands the per-file budget over to est_time (see run_unittest_files).
     timeout = None if args.timeout_from_est_time else args.timeout_per_file
@@ -535,6 +548,7 @@ def run_a_suite(args):
             timeout_per_file=timeout,
             derive_timeout=derive_timeout_per_file,
             continue_on_error=args.continue_on_error,
+            fail_on_all_skipped=fail_on_all_skipped,
         )
         # Handed to run_unittest_files so the suite still ends with one
         # TIMINGS block covering every file; the est_time model and the
@@ -557,6 +571,7 @@ def run_a_suite(args):
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
         fork_worker_batch_size=args.fork_worker_batch_size,
+        fail_on_all_skipped=fail_on_all_skipped,
     )
     return rest if pinned_ok else -1
 
@@ -608,6 +623,12 @@ def main():
             "Derive each file's time limit from its own est_time instead of "
             "the flat --timeout-per-file, for suites mixing fast and slow tests."
         ),
+    )
+    parser.add_argument(
+        "--execution-budget-minutes",
+        type=float,
+        default=0,
+        help="Fail after the whole suite finishes if its execution exceeds this budget. 0 disables the check.",
     )
     parser.add_argument(
         "--continue-on-error",
@@ -693,7 +714,9 @@ def main():
                 f"but got {args.auto_partition_id}"
             )
 
-    exit_code = run_a_suite(args)
+    exit_code = run_with_execution_budget(
+        lambda: run_a_suite(args), args.execution_budget_minutes
+    )
     sys.exit(exit_code)
 
 

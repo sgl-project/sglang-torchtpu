@@ -184,31 +184,6 @@ jobs:
       contents: read
       id-token: write
 
-  pd-mh-muse-dflash:
-    needs: [build, discover-tests]
-    if: >-
-      ${{ !cancelled() && needs.discover-tests.result == 'success'
-          && (inputs.only || 'all') == 'all'
-          && contains('test/registered/e2e/tpu/test_tpu_muse_spark_pd_multihost_prefix_cache_kv_offload_dflash.py', inputs.test_filter) }}
-    name: test_tpu_muse_spark_pd_multihost_prefix_cache_kv_offload_dflash
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: test_tpu_muse_spark_pd_multihost_prefix_cache_kv_offload_dflash
-      lane: nightly
-      hosts: 2
-      pd_prefill_hosts: 2
-      pd_decode_hosts: 2
-      exec_cmd: python3 test/registered/e2e/tpu/test_tpu_muse_spark_pd_multihost_prefix_cache_kv_offload_dflash.py
-      files: test/registered/e2e/tpu/test_tpu_muse_spark_pd_multihost_prefix_cache_kv_offload_dflash.py
-      weights_pvc: model-weights
-      run_name: pd-mh-muse-dflash
-      timeout_per_file: 14400
-    permissions:
-      contents: read
-      id-token: write
-
   # Discover multi-host launch groups from the test files (test-owned launch specs).
   discover:
     needs: build

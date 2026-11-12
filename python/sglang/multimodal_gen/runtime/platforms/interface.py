@@ -52,6 +52,10 @@ class AttentionBackendEnum(enum.Enum):
     CUBE_SPARSE_ATTN = enum.auto()
     FP8_FA_SM120 = enum.auto()
     NO_ATTENTION = enum.auto()
+    # An out-of-tree platform's own backend: the platform names it
+    # (Platform.get_oot_attn_backend_name) and resolves its class. Appended so
+    # earlier members keep their auto() values.
+    OOT = enum.auto()
 
     def __str__(self):
         return self.name.lower()
@@ -143,13 +147,39 @@ class Platform:
         """Apply defaults before argument normalization and validation."""
         pass
 
+    def supports_teacache_with_torch_compile(self) -> bool:
+        """Whether TeaCache may run under --enable-torch-compile.
+
+        TeaCache updates module state every denoising step; a backend that
+        recompiles on that (rather than graph-breaking cheaply) says False and
+        requests drop TeaCache with a warning.
+        """
+        return True
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the backend used to compile diffusion modules."""
         return self.simple_compile_backend
 
+    def prepare_spmd_region_wrapper(self) -> Callable | None:
+        """Decorator for --regional-compile regions that every rank runs with the
+        same graph (the model sets ``_compile_regions_spmd_safe``). The regions
+        should trace as one graph each. May configure process-wide compile
+        state the wrapper needs (e.g. a cache-key tag), so it must be
+        idempotent: compile_matching_submodules calls it once per compiled
+        model."""
+        return None
+
     def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
         """Return backend-specific options for a diffusion module."""
         return None
+
+    def configure_compile_cache(self) -> None:
+        """Configure torch.compile caching for this worker.
+
+        Called once per worker after distributed initialization, before any
+        compilation.
+        """
+        pass
 
     def get_dispatch_key_name(self) -> str:
         """Return the behavioral dispatch key used by :class:`CustomOp`.
@@ -269,7 +299,6 @@ class Platform:
         return self.is_rocm()
 
     @classmethod
-    @lru_cache(maxsize=1)
     def is_amp_supported(cls) -> bool:
         return True
 
@@ -289,6 +318,18 @@ class Platform:
     @classmethod
     def supports_device_tensor_pickle(cls) -> bool:
         return True
+
+    @classmethod
+    def supports_safetensors_device_load(cls) -> bool:
+        """Whether safetensors can open tensors directly on this platform's device."""
+        return True
+
+    @classmethod
+    def prefers_head_slab_output_exchange(cls) -> bool:
+        """Whether the Ulysses output all-to-all sends a heads-major attention
+        output as per-head slabs instead of relayouting it to sequence-major
+        first. Both give bit-identical values."""
+        return False
 
     @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
@@ -319,6 +360,27 @@ class Platform:
     ) -> str:
         """Get the attention backend class of a device."""
         return ""
+
+    @classmethod
+    def get_oot_attn_backend_name(cls) -> str | None:
+        """The ``--attention-backend`` name of this platform's own backend
+        (``AttentionBackendEnum.OOT``), or None when it has none."""
+        return None
+
+    @classmethod
+    def oot_attn_backend_serves(
+        cls, supported_attention_backends: set[AttentionBackendEnum]
+    ) -> bool:
+        """Whether automatic selection may give the OOT backend to a layer that
+        lists only ``supported_attention_backends``."""
+        return False
+
+    @classmethod
+    def get_ring_capable_attention_backends(cls) -> tuple[str, ...] | None:
+        """``--attention-backend`` names that run ring attention on this
+        platform, the first being the ``--ring-degree`` default; None keeps the
+        core list."""
+        return None
 
     @classmethod
     def get_device_capability(
@@ -516,6 +578,11 @@ class Platform:
         return CpuArchEnum.UNSPECIFIED
 
     @classmethod
+    def supports_vae_torch_compile(cls) -> bool:
+        """Whether ``--enable-torch-compile`` also compiles the VAE decode."""
+        return True
+
+    @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
         """Whether automatic DiT layerwise offload is enabled on this platform."""
         return True
@@ -534,6 +601,24 @@ class Platform:
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Apply platform-specific optimizations to VAE after loading."""
         return vae
+
+    @classmethod
+    def drain_device_queue_after_request(cls) -> bool:
+        """Whether every rank drains its device queue when a request finishes.
+
+        For platforms where queued collectives can otherwise reach into the
+        next request, so a host-to-device copy there waits on a peer.
+        """
+        return False
+
+    @classmethod
+    def fusion_barrier(cls, x: torch.Tensor) -> torch.Tensor:
+        """Pass ``x`` through a point the graph compiler may not fuse across.
+
+        The values are unchanged; platforms without such a primitive return
+        ``x`` itself.
+        """
+        return x
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)

@@ -11,15 +11,14 @@ from __future__ import annotations
 
 import torch
 
-from sglang_tpu.moe.activation import pallas_moe_activation
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _pad_gate_up_halves_axis1,
     _pad_last_axis,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.expert_loading import _wait_for
 from sglang_tpu.fp8_moe import (
     _clear_replaced_param,
     _free_replaced_storage,
@@ -31,6 +30,8 @@ from sglang_tpu.fused_rs_sequence_parallel import (
     prepare_fused_moe_sequence_parallel_input,
     prepare_tpu_fused_rs_post_expert_norm,
 )
+from sglang_tpu.moe.activation import pallas_moe_activation
+from sglang_tpu.moe.ep_rank import mask_tpu_moe_non_local_experts, traced_moe_ep_rank
 from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
 # Block-512 matches the original FP8 activation quantization block. Both stock
@@ -46,6 +47,15 @@ PACKING = 2  # two FP4 codes per uint8 byte
 # weights and repeat kernel setup inside the same compiled graph. Calls above
 # 8K remain deterministically chunked.
 _FUSED_RS_MAX_TOKENS_PER_CALL = 8192
+
+
+def mark_qblock_layout(layer: torch.nn.Module, block: int) -> None:
+    layer.__dict__["_tpu_nvfp4_qblock"] = block
+
+
+def qblock_layout(layer: torch.nn.Module) -> int:
+    """K rows per bf16 scale of experts requantized after load (0: as loaded)."""
+    return layer.__dict__.get("_tpu_nvfp4_qblock", 0)
 
 
 def _transpose_packed_fp4(matrix: torch.Tensor) -> torch.Tensor:
@@ -194,8 +204,11 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         ("attn_dp_size == 1", parallel.attn_dp_size == 1),
         ("gated MoE", runner_config.is_gated),
         (
-            "silu or situ activation",
-            runner_config.activation in ("silu", "silu_and_mul_clamp", "situ"),
+            "silu or clamped SwiGLU activation",
+            # The fused GMM also implements canonical clamped SwiGLU
+            # (swigluoai, as in GPT-OSS) and SiTU, so such layers can use fused-RS.
+            runner_config.activation
+            in ("silu", "silu_and_mul_clamp", "swigluoai", "situ"),
         ),
         (
             "router weight not applied on input",
@@ -303,6 +316,8 @@ def prepare_tpu_nvfp4_moe_weights(
 
         prepare_tpu_fused_rs_post_expert_norm(layer)
         prepare_fused_moe_rs(layer)
+    elif tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.get():
+        scale_dtype = torch.float32
 
     # W13: fold global scale, pad gate/up halves, and rebind before touching W2
     # so single-device PP stages do not hold both layers' temporaries at once.
@@ -324,10 +339,7 @@ def prepare_tpu_nvfp4_moe_weights(
         w13_w = w13_w.permute(0, 2, 1).contiguous()
         w13_scale = _to_gmm_v2_scale_layout(w13_s, scale_dtype)  # (E, H/G, 1, 2*I_pad)
     del w13_s
-    if w13_w.device.type == "tpu":
-        from torch_tpu._internal.sync.sync import synchronize
-
-        synchronize([w13_w, w13_scale], wait=True)
+    _wait_for(w13_w, w13_scale)
     old_w13 = layer.w13_weight.data
     old_w13_scale = layer.w13_weight_scale.data
     copy_or_rebind_param(layer, "w13_weight", w13_w)
@@ -353,10 +365,7 @@ def prepare_tpu_nvfp4_moe_weights(
         w2_w = w2_w.permute(0, 2, 1).contiguous()
         w2_scale = _to_gmm_v2_scale_layout(w2_s, scale_dtype)  # (E, I_pad/G, 1, H)
     del w2_s
-    if w2_w.device.type == "tpu":
-        from torch_tpu._internal.sync.sync import synchronize
-
-        synchronize([w2_w, w2_scale], wait=True)
+    _wait_for(w2_w, w2_scale)
     old_w2 = layer.w2_weight.data
     old_w2_scale = layer.w2_weight_scale.data
     copy_or_rebind_param(layer, "w2_weight", w2_w)
@@ -397,6 +406,12 @@ def apply_tpu_nvfp4_moe(
             raise ValueError("TPU clamped MoE requires silu activation")
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
     activation = pallas_moe_activation(activation, layer)
+
+    qblock = qblock_layout(layer)
+    if qblock and not use_fused_rs:
+        raise RuntimeError(
+            f"NVFP4 experts requantized to block {qblock} run only on the fused-RS MoE"
+        )
 
     if use_fused_rs:
         from sglang_tpu.moe.pallas.fused_moe_rs_op import (
@@ -461,6 +476,17 @@ def apply_tpu_nvfp4_moe(
             partition_count, rows_per_partition, topk_ids.shape[-1]
         )
 
+        # Stacked expert slabs of the Muse megakernel (SGLANG_TPU_MUSE_MK_EXPERT_GROUP).
+        buffers = layer._buffers
+        stacked = "_stacked_w13_weight" in buffers
+        w1 = buffers["_stacked_w13_weight"] if stacked else layer.w13_weight
+        w2 = buffers["_stacked_w2_weight"] if stacked else layer.w2_weight
+        w1_scale = (
+            buffers["_stacked_w13_weight_scale"] if stacked else layer.w13_weight_scale
+        )
+        w2_scale = (
+            buffers["_stacked_w2_weight_scale"] if stacked else layer.w2_weight_scale
+        )
         outputs = []
         for token_start in range(0, rows_per_partition, rows_per_call):
             token_end = min(token_start + rows_per_call, rows_per_partition)
@@ -471,10 +497,10 @@ def apply_tpu_nvfp4_moe(
 
             output = fused_moe_rs_gather(
                 hidden_states=chunk_hidden,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
+                w1=w1,
+                w2=w2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
                 topk_weights=chunk_weights,
                 topk_ids=chunk_ids,
                 post_expert_norm_weight=post_expert_norm_weight,
@@ -491,6 +517,7 @@ def apply_tpu_nvfp4_moe(
                 oneshot_rank=getattr(layer, "_tpu_oneshot_rank", None),
                 w1_global_scale=layer._tpu_w13_global_scale,
                 w2_global_scale=layer._tpu_w2_global_scale,
+                fp4_w4a16=bool(qblock),
             )
             outputs.append(output[:output_rows])
         return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))
@@ -505,6 +532,7 @@ def apply_tpu_nvfp4_moe(
         topk_ids,
         layer.num_local_experts,
         layer.moe_ep_rank,
+        traced_ep_rank=traced_moe_ep_rank(),
     )
 
     output = fused_moe_call(

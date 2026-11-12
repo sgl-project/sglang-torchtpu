@@ -25,6 +25,9 @@ tpu_oot = "sglang_tpu:activate"
 [project.entry-points."sglang.srt.plugins"]
 tpu_oot_hooks = "sglang_tpu.hooks:register"
 
+[project.entry-points."sglang.multimodal_gen.platforms"]
+tpu_oot = "sglang_tpu.multimodal_gen:activate"
+
 [tool.setuptools.packages.find]
 include = ["sglang_tpu*"]
 

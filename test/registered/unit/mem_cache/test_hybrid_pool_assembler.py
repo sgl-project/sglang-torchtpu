@@ -20,12 +20,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     MambaStrategy,
-    MambaSwaStrategy,
     StackBuildResult,
     _check_declared_pools_present,
     _DsaStrategy,
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
+    _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
     _SwaStrategy,
@@ -139,7 +139,7 @@ class TestHybridStageLayerMappings(CustomTestCase):
                 {"full": {3: 0}, "swa": {0: 2, 1: 0, 2: 1}},
             ),
             (
-                MambaSwaStrategy,
+                _MambaSwaStrategy,
                 "build_hybrid_mamba_swa_stack",
                 {"full": {3: 0}, "swa": {0: 2, 1: 0, 2: 1}, "mamba": {0: 1, 3: 0}},
             ),

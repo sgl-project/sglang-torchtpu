@@ -76,6 +76,9 @@ class BucketState(NamedTuple):
       need_top_k: Some request restricts top_k; the target is filtered for it.
       need_top_p: Some request restricts top_p; the target is filtered for it.
       need_min_p: Some request restricts min_p; the target is filtered for it.
+      target_candidates: Every sampled row filters the target to top_k <=
+        spec_ops.TARGET_CANDIDATES and nothing else, so acceptance can run on
+        the target's top candidates instead of the whole vocabulary.
     """
 
     key: torch.Tensor
@@ -88,6 +91,7 @@ class BucketState(NamedTuple):
     need_top_k: bool = False
     need_top_p: bool = False
     need_min_p: bool = False
+    target_candidates: bool = False
 
     @property
     def need_filters(self) -> bool:
@@ -131,12 +135,15 @@ class DraftResult(NamedTuple):
         verified (DSpark budget). Equals N when no pruning applies.
       verify_tokens: Optional flat [pbs * (N + 1)] [r, d_1, ..., d_N] rows when
         the draft already built them; verify concatenates them otherwise.
+      draft_candidates: Optional (ids, logits), [pbs, N, K] each, when q is
+        supported on K candidates per draft; draft_logits is None then.
     """
 
     draft_tokens: torch.Tensor
     draft_logits: torch.Tensor | None
     num_verify_drafts: torch.Tensor
     verify_tokens: torch.Tensor | None = None
+    draft_candidates: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class AcceptResult(NamedTuple):
@@ -194,7 +201,10 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     Attributes:
       verify_cache_candidates: [pbs, 2 * capacity] device int64 KV slots of
         [base, base + 2 * capacity); active verify rows are picked without a D2H sync.
-      committed_lens: [pbs] device int64 committed base.
+        None when the algorithm does not need token-slot addressing.
+      verify_cache_candidates_cpu: [bs, 2 * capacity] host copy of the live rows,
+        which a hybrid-SWA draft maps to its SWA slots; None with no token slots.
+      committed_lens: [pbs] device int64 committed base, or None with no token slots.
       req_pool_indices: [pbs] device pool rows. 0 (reserved) marks padded rows
         in all three device fields.
       req_pool_indices_cpu: [pbs] host pool rows for host-built metadata.
@@ -204,8 +214,9 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         first overlap relay.
     """
 
-    verify_cache_candidates: torch.Tensor
-    committed_lens: torch.Tensor
+    verify_cache_candidates: torch.Tensor | None
+    verify_cache_candidates_cpu: torch.Tensor | None
+    committed_lens: torch.Tensor | None
     req_pool_indices: torch.Tensor
     req_pool_indices_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
@@ -232,12 +243,16 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         candidates = draft_input.tpu_verify_cache_candidates
         committed_lens = draft_input.tpu_committed_lens
         req_pool_indices = draft_input.tpu_req_pool_indices
-        if candidates is None or committed_lens is None or req_pool_indices is None:
+        if (
+            (draft_input.needs_verify_cache_locs and candidates is None)
+            or committed_lens is None
+            or req_pool_indices is None
+        ):
             raise NotImplementedError(
                 "TpuSpecWorker needs the verify window (overlap schedule, "
-                "host-resident req_to_token, no logprob/LoRA)."
+                "host-resident req_to_token, supported request features, no LoRA)."
             )
-        verify_window_rows = candidates.shape[1] // 2
+        verify_window_rows = draft_input.tpu_verify_window_rows
         if not 0 < num_verify_rows <= verify_window_rows:
             raise ValueError("Active verification width exceeds the reserved KV window")
         req_pool_indices_cpu = batch.req_pool_indices_cpu
@@ -257,9 +272,24 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
         # The plan stays on host until the forward fixes its bucket;
         # 0 is the reserved row and slot.
         return cls(
-            verify_cache_candidates=padded_h2d(candidates, padded_bs, batch.device),
-            committed_lens=padded_h2d(committed_lens, padded_bs, batch.device),
-            req_pool_indices=padded_h2d(req_pool_indices, padded_bs, batch.device),
+            verify_cache_candidates=(
+                padded_h2d(candidates, padded_bs, batch.device)
+                if draft_input.needs_verify_cache_locs
+                else None
+            ),
+            verify_cache_candidates_cpu=candidates,
+            committed_lens=(
+                padded_h2d(committed_lens, padded_bs, batch.device)
+                if draft_input.needs_verify_cache_locs
+                else None
+            ),
+            # The scheduler already owns device pool rows. Only padding needs
+            # another upload; exact buckets can reuse them across decode steps.
+            req_pool_indices=(
+                batch.req_pool_indices
+                if batch.req_pool_indices.shape[0] == padded_bs
+                else padded_h2d(req_pool_indices, padded_bs, batch.device)
+            ),
             req_pool_indices_cpu=pad_rows(req_pool_indices_cpu, padded_bs),
             seq_lens_cpu=seq_lens_cpu,
             host_len_slack=(
@@ -271,7 +301,9 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
                 None
                 if swa_translate is None
                 else padded_h2d(
-                    swa_translate(candidates).to(candidates.dtype), padded_bs, batch.device
+                    swa_translate(candidates).to(candidates.dtype),
+                    padded_bs,
+                    batch.device,
                 )
             ),
         )
@@ -294,6 +326,9 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
             verify_cache_candidates=torch.zeros(
                 (padded_bs, 2 * verify_window_rows), dtype=torch.int64
             ).to(device, non_blocking=True),
+            verify_cache_candidates_cpu=torch.zeros(
+                (0, 2 * verify_window_rows), dtype=torch.int64
+            ),
             committed_lens=zeros.to(device, non_blocking=True),
             req_pool_indices=zeros.to(device, non_blocking=True),
             req_pool_indices_cpu=zeros,

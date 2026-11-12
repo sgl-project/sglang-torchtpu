@@ -10,8 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.environ import envs
-from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.envs import envs
 from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, recover_quant_block_size
 
 # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 that causes
@@ -363,7 +362,7 @@ def inner_kernel(
             w = w.astype(jnp.float8_e4m3fn)
         return w.astype(jnp.bfloat16)
 
-    fp4_via_fp8 = tpu_envs.SGLANG_TPU_FP4_DEQUANT_VIA_FP8.get()
+    fp4_via_fp8 = envs.SGLANG_TPU_FP4_DEQUANT_VIA_FP8.get()
 
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
@@ -471,7 +470,7 @@ def inner_kernel(
             apply_rhs_scale_after_matmul = cfgs.rhs_cfgs.has_scale and (
                 rhs_scale_matches_lhs_block
             )
-            blockdiag_rows = tpu_envs.SGLANG_TPU_FUSED_RS_BLOCKDIAG_ROWS.get()
+            blockdiag_rows = envs.SGLANG_TPU_FUSED_RS_BLOCKDIAG_ROWS.get()
             use_blockdiag = (
                 0 < cfgs.tiles.tile_m <= blockdiag_rows
                 and not fp8_activation_quant
@@ -488,7 +487,7 @@ def inner_kernel(
                     tiled_rhs,
                     rhs_scale,
                     group=rhs_qbs,
-                    kc=tpu_envs.SGLANG_TPU_FUSED_RS_BLOCKDIAG_KC.get(),
+                    kc=envs.SGLANG_TPU_FUSED_RS_BLOCKDIAG_KC.get(),
                 ).astype(acc_ref.dtype)
 
             else:
@@ -505,7 +504,9 @@ def inner_kernel(
                     end_n = min(rhs_tile_n, start_n + mxu_size)
                     col_size = end_n - start_n
 
-                    acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size), dtype=acc_ref.dtype)
+                    acc_n = jnp.zeros(
+                        (cfgs.tiles.tile_m, col_size), dtype=acc_ref.dtype
+                    )
 
                     for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                         end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
@@ -528,7 +529,9 @@ def inner_kernel(
                                 ) * rhs_scale_slice.astype(jnp.bfloat16)
                                 scaled_rhs_slices.append(scaled_rhs_slice)
                                 rhs_k_start = rhs_k_end
-                            block_rhs_for_quant = jnp.concatenate(scaled_rhs_slices, axis=0)
+                            block_rhs_for_quant = jnp.concatenate(
+                                scaled_rhs_slices, axis=0
+                            )
                         else:
                             block_rhs_for_quant = _to_bf16(block_rhs)
 
@@ -536,14 +539,19 @@ def inner_kernel(
                             block_lhs_for_matmul, lhs_scale = _online_quantize(
                                 block_lhs, axis=1, quant_dtype=cfgs.lhs_cfgs.quant_dtype
                             )
-                            if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
+                            if (
+                                cfgs.rhs_cfgs.has_scale
+                                and not apply_rhs_scale_after_matmul
+                            ):
                                 # Fold small RHS scale blocks into RHS first, then
                                 # requantize to the activation quant dtype so
                                 # matmul uses fp8 x fp8.
-                                block_rhs_for_matmul, rhs_online_scale = _online_quantize(
-                                    block_rhs_for_quant,
-                                    axis=0,
-                                    quant_dtype=cfgs.lhs_cfgs.quant_dtype,
+                                block_rhs_for_matmul, rhs_online_scale = (
+                                    _online_quantize(
+                                        block_rhs_for_quant,
+                                        axis=0,
+                                        quant_dtype=cfgs.lhs_cfgs.quant_dtype,
+                                    )
                                 )
                             else:
                                 block_rhs_for_matmul = block_rhs

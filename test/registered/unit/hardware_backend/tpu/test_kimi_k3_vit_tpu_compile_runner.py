@@ -15,15 +15,18 @@ projector:
   tower and projector in fp32 on the CPU.
 """
 
+import math
+import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.envs import envs
 from sglang_tpu.graph_runner.kimi_k3_vit_tpu_compile_runner import (
     KimiK3VitTpuCompileRunner,
     merge_window_order,
@@ -179,14 +182,72 @@ class TestKimiK3VitRunner(CustomTestCase):
         self.assertIsNone(runner.run_images(pixels, [(2, 4, 4)]))
         self.assertIsNone(runner.run_images(pixels[:24], [(1, 4, 6)]))
 
+    def test_attention_is_the_registered_tpu_backend(self):
+        from sglang.srt.layers.attention import vision
+        from sglang_tpu.attention.vision_splash import VisionTpuSplashAttention
+        from sglang_tpu.tpu_platform import _register_attention_backends
+
+        # The splash switch picks the "tpu" entry; off keeps the flash op.
+        flag = envs.SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION
+        for enabled, expected in (
+            (False, vision.VisionTpuAttention),
+            (True, VisionTpuSplashAttention),
+        ):
+            with (
+                self.subTest(enabled=enabled),
+                flag.override(enabled),
+                patch.dict(vision.QKV_BACKEND_IMPL, {"tpu": vision.VisionTpuAttention}),
+            ):
+                _register_attention_backends()
+                self.assertIs(vision.QKV_BACKEND_IMPL["tpu"], expected)
+
+        # The runner builds whatever that entry holds (the TPU classes need a
+        # device, so a CPU stand-in takes the slot here).
+        tower, _, _ = _model()
+        with patch.dict(vision.QKV_BACKEND_IMPL, {"tpu": _SegmentSdpa}):
+            runner = KimiK3VitTpuCompileRunner(tower.encoder)
+        self.assertEqual(len(runner.attention), len(tower.encoder.blocks))
+        self.assertTrue(all(type(a) is _SegmentSdpa for a in runner.attention))
+
     def test_buckets_align_to_the_merger(self):
         with envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1024):
             self.assertEqual(patch_buckets(), [g * g for g in range(14, 33, 2)])
         with envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("256, 36"):
             self.assertEqual(patch_buckets(), [36, 256])
+        with envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override(""):
+            self.assertEqual(patch_buckets(), [])
         with envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("25"):
             with self.assertRaisesRegex(ValueError, "divisible by 4"):
                 patch_buckets()
+
+    def test_default_buckets_follow_the_splash_switch(self):
+        # Without splash: the generic ladder up to the default 4900-patch cap.
+        flash = [g * g for g in range(14, 71, 2)]
+        splash = [1024, 2304, 4096, 9216, 16384, 33856, 66564]
+        sizes = envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
+        max_patches = envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES
+        with patch.dict(os.environ):
+            sizes.clear()
+            max_patches.clear()
+            for enabled, want in ((False, flash), (True, splash)):
+                with (
+                    self.subTest(splash=enabled),
+                    envs.SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION.override(enabled),
+                ):
+                    buckets = patch_buckets()
+                    self.assertEqual(buckets, want)
+                    # Even-sided squares, so every bucket holds whole 2x2 windows.
+                    self.assertTrue(all(math.isqrt(b) % 2 == 0 for b in buckets))
+                    self.assertTrue(all(math.isqrt(b) ** 2 == b for b in buckets))
+                    # Either env still wins over the default.
+                    with max_patches.override(1024):
+                        self.assertEqual(
+                            patch_buckets(), [g * g for g in range(14, 33, 2)]
+                        )
+                    with sizes.override("256"), max_patches.override(1024):
+                        self.assertEqual(patch_buckets(), [256])
+            # The splash ladder covers the processor's 65536-patch cap.
+            self.assertGreaterEqual(splash[-1], 65536)
 
 
 @unittest.skipUnless(

@@ -11,19 +11,27 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
-from sglang_tpu.hooks.attn_residual import (
-    aggregate,
-    aggregate_fused_add,
-    prepare_attn_residual_kernel,
-    register_attn_residual_ops,
+from sglang_tpu.hooks.all_gather_via_all_reduce import (
+    gather_and_crop_vocab,
+    gather_attn_tp_logits,
+    wrap_logits_gatherer,
 )
+from sglang_tpu.hooks.attn_residual import register_attn_residual_ops
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
-from sglang_tpu.hooks.cpu_pinning import pin_scheduler_main_thread
+from sglang_tpu.hooks.cpu_pinning import bind_rank_cpu_set, pin_scheduler_main_thread
+from sglang_tpu.hooks.dflash_mla import (
+    dflash_mla_head_dims,
+    select_dflash_mla_attention,
+)
 from sglang_tpu.hooks.draft_kv_pool import (
     draft_cell_size_per_token,
     draft_mha_pool_class,
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
+from sglang_tpu.hooks.dsv4 import hook_specs as dsv4_hooks
+from sglang_tpu.hooks.dsv4 import (
+    register_tpu_dsv4_resolution_hooks,
+)
 from sglang_tpu.hooks.encoder import (
     bootstrap_encoder_worker,
     encode_indices_within_patch_budget,
@@ -31,30 +39,30 @@ from sglang_tpu.hooks.encoder import (
     reject_encoder_dp,
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
-from sglang_tpu.hooks.glm_flash_megakernel import (
-    drop_freed_glm_flash_megakernel_request,
-    route_glm_flash_megakernel,
-)
+from sglang_tpu.hooks.glm_flash_megakernel import route_glm_flash_megakernel
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
+from sglang_tpu.hooks.inkling2 import inkling2_attn_backend, inkling2_swa_kv_pool
 from sglang_tpu.hooks.k3_megakernel import (
     attach_k3_megakernel,
     k3_megakernel_forward,
     load_k3_non_layer_weights,
     prepare_k3_capture_kernels,
     skip_k3_decoder_layers,
+    skip_k31_indexer_load_check,
 )
-from sglang_tpu.hooks.inkling2 import inkling2_attn_backend, inkling2_swa_kv_pool
 from sglang_tpu.hooks.kda_weights import (
     bind_glm5_next_kda_weights,
     rehome_kimi_k3_kda_weights,
 )
+from sglang_tpu.hooks.kimi_k3_latent_up import kimi_k3_latent_up_tail_add3
 from sglang_tpu.hooks.kimi_k3_vision import (
     attach_k3_vision_runner,
     bind_k3_vision_runner,
     encode_with_k3_vision_runner,
     pass_through_projected_features,
 )
+from sglang_tpu.hooks.logprob_grid import hook_specs as logprob_grid_hooks
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
     hc_post,
@@ -67,19 +75,26 @@ from sglang_tpu.hooks.moe_topk import (
     biased_topk,
     register_router_topk,
 )
+from sglang_tpu.hooks.padded_logits_sampling import (
+    hook_specs as padded_logits_sampling_hooks,
+)
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
+from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
-from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
 from sglang_tpu.hooks.swa_miss_metrics import hook_specs as swa_miss_metrics_hooks
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
 from sglang_tpu.hooks.twolevel_allreduce import (
     merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
 )
+from sglang_tpu.hooks.twolevel_allreduce import (
+    row_parallel_linear_forward as twolevel_row_parallel_linear_forward,
+)
+from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +109,8 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_hybrid_swa_kv_pool",
         inkling2_swa_kv_pool,
+        "sglang.srt.utils.common.set_gpu_proc_affinity",
+        bind_rank_cpu_set,
         HookType.AROUND,
     ),
     (
@@ -168,13 +185,13 @@ HOOKS: list[tuple] = [
     ),
     (
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
-        prepare_attn_residual_kernel,
+        attach_k3_megakernel,
         HookType.AFTER,
     ),
     (
-        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
-        attach_k3_megakernel,
-        HookType.AFTER,
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM._check_dsa_indexer_loaded",
+        skip_k31_indexer_load_check,
+        HookType.AROUND,
     ),
     (
         "sglang.srt.models.kimi_k3.KimiK3LinearModel.forward",
@@ -204,16 +221,6 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.kimi_k3_vl.KimiK3MultiModalProjector.forward",
         pass_through_projected_features,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.layers.attn_residual._aggregate",
-        aggregate,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.layers.attn_residual._aggregate_fused_add",
-        aggregate_fused_add,
         HookType.AROUND,
     ),
     (
@@ -248,11 +255,6 @@ HOOKS: list[tuple] = [
         HookType.AFTER,
     ),
     (
-        "sglang.srt.mem_cache.memory_pool.ReqToTokenPool.free_rows",
-        drop_freed_glm_flash_megakernel_request,
-        HookType.BEFORE,
-    ),
-    (
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",
         hc_pre,
         HookType.AROUND,
@@ -273,8 +275,33 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
+        "sglang.srt.layers.logits_processor.LogitsProcessor.__init__",
+        wrap_logits_gatherer,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.layers.logits_processor.LogitsProcessor._gather_attn_tp_logits",
+        gather_attn_tp_logits,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.dspark.gather_and_crop_vocab",
+        gather_and_crop_vocab,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.models.kimi_k3.merged_moe_all_reduce",
         twolevel_merged_moe_all_reduce,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3._add3",
+        kimi_k3_latent_up_tail_add3,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.layers.linear.RowParallelLinear.forward",
+        twolevel_row_parallel_linear_forward,
         HookType.AROUND,
     ),
     (
@@ -293,13 +320,13 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
-        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
-        bind_kimi_k3_static_fp8,
-        HookType.AFTER,
-    ),
-    (
         "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._tpu_mha_pool_class",
         draft_mha_pool_class,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._profile_available_bytes",
+        reserve_pp_buffered_handoff,
         HookType.AROUND,
     ),
     (
@@ -313,11 +340,23 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
+        "sglang.srt.models.dflash.DFlashDecoderLayer.__init__",
+        select_dflash_mla_attention,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.configs.model_config.ModelConfig._derive_model_shapes",
+        dflash_mla_head_dims,
+        HookType.AFTER,
+    ),
+    (
         "sglang.srt.speculative.spec_tp_sync.SpecTpSync.sync",
         broadcast_undeferred,
         HookType.AROUND,
     ),
 ]
+
+HOOKS.extend(dsv4_hooks())
 
 HOOKS.extend(host_padding_hooks())
 
@@ -326,6 +365,10 @@ HOOKS.extend(hicache_swa_metrics_hooks())
 HOOKS.extend(swa_miss_metrics_hooks())
 
 HOOKS.extend(hook_specs())
+
+HOOKS.extend(padded_logits_sampling_hooks())
+
+HOOKS.extend(logprob_grid_hooks())
 
 _registered = False
 
@@ -354,6 +397,8 @@ def register() -> None:
     )
 
     register_muse_spark_processor()
+    register_tpu_dsv4_resolution_hooks()
+    register_unified_hicache_strategy()
 
     from sglang.srt.plugins.hook_registry import HookRegistry
 

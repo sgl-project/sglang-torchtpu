@@ -33,13 +33,21 @@ logger = logging.getLogger(__name__)
 # byte counts the ratio is derived from.
 _ALLOCATION_SLACK_FRACTION = 0.05
 
-_SIZEABLE_POOLS = (
+_SIZEABLE_POOLS: tuple[type, ...] = (
     MHATokenToKVPool,
     MLATokenToKVPool,
     SWAKVPool,
     HybridLinearKVPool,
     MiniMaxSparseKVPool,
 )
+
+
+def register_sizeable_pool(pool_cls: type) -> None:
+    """Register a device KV pool class so downstream backends can opt into
+    HiCache auto-sizing without editing the built-in tuple."""
+    global _SIZEABLE_POOLS
+    if pool_cls not in _SIZEABLE_POOLS:
+        _SIZEABLE_POOLS = (*_SIZEABLE_POOLS, pool_cls)
 
 
 def _pool_bytes(pool) -> int:

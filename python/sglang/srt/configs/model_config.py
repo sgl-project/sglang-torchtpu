@@ -206,6 +206,9 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
+            "KimiK31ForConditionalGeneration",
+            "KimiLinearForCausalLM",
+            "KimiK3LinearForCausalLM",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -222,6 +225,7 @@ def is_glm_moe_dsa(config) -> bool:
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
     )
 
@@ -1326,6 +1330,7 @@ class ModelConfig:
             "KimiLinearForCausalLM" in self.hf_config.architectures
             or "KimiK3LinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+            or "KimiK31ForConditionalGeneration" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
             self.head_dim = 72
@@ -2369,6 +2374,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "Qwen4ExpForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
 ]
 

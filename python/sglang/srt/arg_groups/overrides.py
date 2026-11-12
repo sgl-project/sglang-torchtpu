@@ -348,6 +348,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
         "BailingMoeV3VLForConditionalGeneration",
@@ -403,6 +404,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
@@ -1392,7 +1394,8 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     """Resolve MoE backend defaults and validate platform constraints."""
     moe_runner_backend = view.moe_runner_backend
     if (
-        moe_runner_backend in ("pallas_tpu", "pallas_tpu_fused_rs")
+        moe_runner_backend
+        in ("pallas_tpu", "pallas_tpu_fused_rs", "pallas_tpu_fused_decode")
         and view.device != "tpu"
     ):
         raise ValueError(

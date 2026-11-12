@@ -95,7 +95,7 @@ of the migration. The TPU Plugin Scoreboard workflow publishes both daily.
 
 ## Hooks
 
-`hooks.register` is declared by both distributions (`tpu_hooks` in `python/`,
+`core_hooks.register` is declared by both distributions (`tpu_hooks` in `python/`,
 `tpu_oot_hooks` here): `SGLANG_PLATFORM=tpu` skips every general plugin of
 `sglang-tpu`, so mode A needs its own entry point. `register()` runs once per
 process and only on TPU, since every host installs the plugin.
@@ -110,6 +110,65 @@ CI picks the mode per lane (`render_jobset.py --platform`, the `platform`
 input of `_tpu-test.yml`), so each test runs in one mode only: the PR gate
 (stage-a, stage-b) and the single-host nightly (`nightly-tpu-4-v7`) run mode B;
 the multi-host, P/D, accuracy, perf, combo and external lanes stay on mode A.
+
+## P/D KV offload from prefill DRAM to decode DRAM
+
+Prefill stays the primary prefix cache. Before host pressure discards a cold
+cached branch, prefill pushes its full-attention KV from its own DRAM into the
+DRAM of the decode that served the branch. When the branch returns and misses
+on prefill, prefill recalls it from decode DRAM into its own DRAM, and normal
+admission loads it into HBM. No HBM page and no staging slot is used on either
+role, and both HiCache write policies are supported. The decode keeps pushed
+branches only; it does not cache its own generation requests.
+
+Enable HiCache on both roles with `--enable-hierarchical-cache
+--hicache-io-backend raiden` and decode radix caching with
+`--disaggregation-decode-enable-radix-cache`, then set one switch on both
+roles:
+
+```bash
+SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM=1
+```
+
+Unsupported settings are refused, never run without the offload. An engine
+stops at start, naming the setting, with: a GDN/Mamba model, the unified KV
+pool, pipeline parallelism (`--pp-size` above 1) or the Raiden pipeline
+transfer, context or data parallelism,
+speculative decoding, `--sleep-on-idle`, a transfer or HiCache I/O backend
+other than raiden, an
+L3 storage backend, HiCache or the radix cache off, the Rust radix tree, or a
+tpu-sync build without the host-to-host read API
+([google/tpu-sync@32568d35](https://github.com/google/tpu-sync/commit/32568d35)
+or later). A pair fails its requests with the reason when the switch is on for
+one role only or when the roles differ in attention-TP size (resharding).
+
+On a hybrid sliding-window model (GPT-OSS) the offload also moves the last
+sliding window of each branch, through an SWA host pool on both roles. The
+pool is sized as upstream sizes a hybrid host stack, by `--hicache-ratio` or
+a `--hicache-size` split by device bytes, and the model needs `--page-size`
+above 1. Such a model resumes at a length only with the window
+that ends there, and a branch carries one window, at its end: a prompt that
+extends an offloaded branch recalls it, a prompt that shares only its beginning
+does not. Under `write_back` a branch is offloaded once, whole, so requests
+that share a prefix and then diverge get no recall from decode DRAM; the
+prefill's own host tier still serves them while it holds the prefix, since it
+keeps upstream's window of every evicted node. Under `write_through` a growing
+branch is offloaded at successive lengths and they recall from decode DRAM too.
+
+A decode whose DRAM is full declines a push; that is back-pressure, counted in
+the `[victim-push]` log line. A prefill starts pushes only while it has a
+request queued or running, so an engine left alone settles its transfers (a
+declined or unanswered push within 60 s) and goes idle. A cache flush is
+refused while transfers are in flight and can be retried. The Raiden socket I/O
+timeouts default to disabled and the native session deadline does not interrupt
+a blocked TCP operation: without them, a peer host that vanishes mid-transfer
+without closing its connections keeps this engine's pages pinned and the engine
+non-idle. Set them on both roles (either role sends KV):
+
+```bash
+export TPU_RAIDEN_PREFILL_{HANDSHAKE_ACK_READ,FINAL_ACK_READ,PAYLOAD_READ,HANDSHAKE_WRITE,PAYLOAD_WRITE}_TIMEOUT_S=60
+export TPU_RAIDEN_DECODE_{HANDSHAKE_READ,PAYLOAD_READ,ACK_WRITE,PAYLOAD_WRITE}_TIMEOUT_S=60
+```
 
 ## Muse Spark multimodal
 
@@ -135,13 +194,17 @@ and release startup file-cache pages. This also covers direct `Engine` and Rust
 launches without a `/freeze_gc` request. Each host scans its files once per cleanup
 pass; all ranks finish before the handshake returns.
 
-The existing `/freeze_gc` request repeats file-cache release to cover files used
-or created by subsequent warmup, clears JAX tracing caches, then collects garbage, freezes GC and trims freed
-host heap pages. Python HTTP startup waits for this second pass before reporting
-readiness. Direct `Engine` callers can also call `freeze_gc()` after their own
-warmup. Keeping cleanup in this lifecycle ensures temporary objects are collected
-before `gc.freeze()` retains the remaining objects. Explicit `/freeze_gc` calls
-also run the cleanup hooks.
+The existing `/freeze_gc` request repeats compiler-artifact cleanup to cover files
+used or created by subsequent warmup, then clears export records and JAX caches,
+collects garbage, freezes GC and trims freed host heap pages. Checkpoint eviction
+is completed by scheduler readiness and is not repeated during this pass. Python
+HTTP startup waits for this second pass before reporting readiness. Direct
+`Engine` callers can also call `freeze_gc()` after their own warmup. Keeping cleanup
+in this lifecycle ensures temporary objects are collected before `gc.freeze()`
+retains the remaining objects. Explicit `/freeze_gc` calls also run the cleanup
+hooks. Under PP the stages dispatch the freeze in different loop iterations, so
+each rank cleans up without a world barrier: only the lock-guarded native compiler
+cache is removed, and the reply does not wait for the other stages.
 
 Attention DP with shared MLP scheduling requires global control broadcasts:
 `--enable-dp-attention-local-control-broadcast` and elastic EP scaling are rejected
@@ -154,12 +217,13 @@ cache pages. Both releases default on. The compiler cache namespace comes from
 `TORCH_TPU_TIER2_COMPILATION_CACHE` (legacy:
 `TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE`); empty or unset selects `default`,
 and `disabled` skips it. Other namespaces are untouched. Disk-backed files are
-advised with `POSIX_FADV_DONTNEED` and remain on disk; tmpfs/ramfs are skipped.
+advised with `POSIX_FADV_DONTNEED` and remain on disk. Disposable native, AOT and
+JAX compiler files on tmpfs/ramfs are removed; lock files and directories remain.
 Advice is not a measurement of resident memory freed.
 
-Checkpoint pages remain eligible for kernel reclaim during startup, but explicit
-eviction starts at the scheduler-ready handshake. This can increase peak host
-memory relative to evicting immediately after weight loading. Reusing files
+After serial weight loading, checkpoint eviction runs in the background during
+graph warmup and is joined before scheduler readiness. Overlapped weight loading
+uses synchronous eviction at readiness, after all readers finish. Reusing files
 after cleanup can require storage reads. After freeze cleanup, one rank per host
 logs cgroup `memory.current` in bytes; this diagnostic does not gate readiness.
 
@@ -168,6 +232,29 @@ need retracing. `SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED=0` skips export-rec
 clearing, JAX cache clearing, CPU-backend release, garbage collection before
 freezing and startup heap trimming. File-cache release retains its separate
 opt-outs.
+
+## Pipeline stage hand-off
+
+Pipeline stages hand activations on in lockstep by default (`pp_wave.py`): one
+collective-permute that every device launches in the same order, so each round
+lasts as long as the slowest forward in flight and the pipeline drains with
+zero launches.
+
+- `SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF=1` selects the buffered hand-off
+  (`pp_buffered.py`). Each stage sends a forward's output to the same column of
+  the next stage with a point-to-point send as soon as the forward is launched,
+  so a stage waits only for its own input.
+- `SGLANG_TPU_PP_BUFFERED_SEND_DEPTH` (default `2`) caps the forwards a stage
+  queues for sending before it blocks.
+- Needs torch_tpu 0.2.0 and libtpu 0.0.50 or later; a start-up self-test checks
+  the routing and the bytes and fails fast otherwise.
+- HBM: a device holds up to `8 + SGLANG_TPU_PP_BUFFERED_SEND_DEPTH` hand-off
+  buffers of the largest token bucket x hidden size (plus the aux capture slots
+  under Eagle3 or DFlash) in the model dtype, about 94 MiB each for GPT-OSS-120B
+  at 16384 rows, and one zero residual per bucket. The KV budget reserves this
+  worst case, and each stage checks at start-up that it fits next to the KV
+  cache, failing with the size it needs if not.
+- Not supported with DP attention or prefill context parallelism.
 
 ## Fixed-cohort benchmark gate
 
@@ -184,3 +271,45 @@ opt-outs.
 - Requires DP1/attention-DP1/CP1/PP1, device-resident decoder KV, and capacity for
   the full batch. Mixed cohorts, retraction, invalid completion, or timeout fail
   the benchmark. `SGLANG_TPU_BENCHMARK_TIMEOUT_SEC` defaults to `600`.
+
+## Diffusion (multimodal_gen)
+
+`multimodal_gen/` holds the diffusion TPU code. The `tpu_oot` entry point of
+`sglang.multimodal_gen.platforms` selects `multimodal_gen.platform.TpuOOTPlatform`
+whenever `torch.tpu` is registered; `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu`
+selects the fork's built-in TPU platform instead. `TpuOOTPlatform` subclasses that
+built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
+
+- `--attention-backend tpu_splash_attn`, the `AttentionBackendEnum.OOT` backend.
+- torch.compile with the `tpu` backend and static shapes; compile-cache tags for
+  the rank assignment and the kernel inputs; TeaCache dropped and the VAE left
+  eager under compile; `--offload-during-compile` off.
+- Regional-compile regions of a model marked SPMD-safe (Wan, Z-Image) keep their
+  collectives in one program (torch_tpu's `spmd_safe`, with its own cache tag);
+  `fusion_barrier` is XLA's optimization barrier; every rank drains its device
+  queue at the end of each request.
+- Checkpoints read on the host, then moved (safetensors cannot open `tpu:N`);
+  the Ulysses output all-to-all exchanges heads-major outputs in head slabs.
+- `--ring-degree` (non-causal, by K/V all-gather) on the splash backend, its
+  default under ring; an automatic selection may give it to any layer that takes
+  `torch_sdpa`. The built-in platform has no ring-capable backend.
+- Runtime patches applied at worker init (`multimodal_gen/worker.py`), with
+  the debt header: `rope.py` (RoPE without stride-2 lane access); worker init
+  also registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
+  `logaddexp`).
+
+Gates that take the OOT arm, with the same outcome as the built-in platform:
+
+- `CustomOp` dispatch: the dispatch key is `tpu`, so ops reach `forward_tpu`
+  where they define it and `forward_native` otherwise.
+- `get_torch_library_dispatch_key()`: `PrivateUse1` instead of `CUDA`; its only
+  caller registers the CUDA flash-attention op, which TPU never selects.
+- `get_all_to_all_communicator_cls()`: answered explicitly with the base
+  communicator the built-in platform uses.
+
+Gates whose OOT arm differs from the built-in platform:
+
+- `build_torch_compile_kwargs()`: the OOT arm compiles with `get_compile_backend()`
+  (`tpu`) and drops the mode; the built-in arm passes the mode to the default
+  backend (inductor). Worker init turns off dynamo's automatic dynamic shapes,
+  as `dynamic=False` would.

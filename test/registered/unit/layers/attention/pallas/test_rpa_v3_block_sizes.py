@@ -225,9 +225,17 @@ class TestTpu7xFp8SingleKvDecodeBlocks(CustomTestCase):
         under 16 sequences, a context below one 8192-row block and a 4-head
         group keep the general heuristic."""
         cases = [
-            (dict(page_size=512, pages_per_seq=2048, decode_query_size=1), (1, 8192, 1, 8192)),
             (
-                dict(page_size=512, pages_per_seq=2048, decode_query_size=8, sliding_window=1024),
+                dict(page_size=512, pages_per_seq=2048, decode_query_size=1),
+                (1, 8192, 1, 8192),
+            ),
+            (
+                dict(
+                    page_size=512,
+                    pages_per_seq=2048,
+                    decode_query_size=8,
+                    sliding_window=1024,
+                ),
                 (8, 1024, 8, 1024),
             ),
             (
@@ -240,9 +248,17 @@ class TestTpu7xFp8SingleKvDecodeBlocks(CustomTestCase):
                 ),
                 (1, 1024, 1, 1024),
             ),
-            (dict(page_size=128, pages_per_seq=32, decode_query_size=8), (8, 4096, 8, 4096)),
             (
-                dict(page_size=512, pages_per_seq=2048, decode_query_size=8, num_q_heads=4),
+                dict(page_size=128, pages_per_seq=32, decode_query_size=8),
+                (8, 4096, 8, 4096),
+            ),
+            (
+                dict(
+                    page_size=512,
+                    pages_per_seq=2048,
+                    decode_query_size=8,
+                    num_q_heads=4,
+                ),
                 None,
             ),
         ]

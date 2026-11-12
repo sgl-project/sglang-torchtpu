@@ -19,7 +19,12 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from sglang_tpu.models.inkling2 import _deinterleave_gate_up, _dequant_mxfp8, _dequant_nvfp4, _quant_block_fp8
+from sglang_tpu.models.inkling2 import (
+    _deinterleave_gate_up,
+    _dequant_mxfp8,
+    _dequant_nvfp4,
+    _quant_block_fp8,
+)
 
 EXPERTS = ".mlp.experts."
 CHUNK = 32  # experts per dequant step; a whole NVFP4 layer at once needs ~100 GB of temporaries
@@ -32,7 +37,9 @@ def layer_of(name):
 class Source:
     def __init__(self, src):
         self.src = src
-        self.weight_map = json.load(open(f"{src}/model.safetensors.index.json"))["weight_map"]
+        self.weight_map = json.load(open(f"{src}/model.safetensors.index.json"))[
+            "weight_map"
+        ]
         self.handles = {}
 
     def get(self, name):
@@ -47,7 +54,10 @@ def convert_expert(src, prefix, w, precision):
     base = f"{prefix}{w}_weight"
     if precision == "nvfp4":
         weight, scale = src.get(base), src.get(base + "_scale")
-        gscale = src.get(base + "_amax").float() / src.get(base + "_outer_scale_denominator").float().reshape(-1)[0]
+        gscale = (
+            src.get(base + "_amax").float()
+            / src.get(base + "_outer_scale_denominator").float().reshape(-1)[0]
+        )
         dequant = lambda s: _dequant_nvfp4(weight[s], scale[s], gscale[s])
     else:
         weight, scale = src.get(base), src.get(base + "_scale")
@@ -64,9 +74,18 @@ def convert_expert(src, prefix, w, precision):
 
 
 def precision_of(quant, prefix):
-    groups = {g["compute_dtype"]: set(g["tensors"]) for g in quant["model"]["parameter_groups"]}
+    groups = {
+        g["compute_dtype"]: set(g["tensors"])
+        for g in quant["model"]["parameter_groups"]
+    }
     w13 = prefix + "w13_weight"
-    return "nvfp4" if w13 in groups.get("nvfp4", ()) else "mxfp8" if w13 in groups.get("mxfp8", ()) else None
+    return (
+        "nvfp4"
+        if w13 in groups.get("nvfp4", ())
+        else "mxfp8"
+        if w13 in groups.get("mxfp8", ())
+        else None
+    )
 
 
 def convert_layers(src, dst, lo, hi, quant):
@@ -81,10 +100,17 @@ def convert_layers(src, dst, lo, hi, quant):
         tensors = {}
         for w in ("w13", "w2"):
             q, s = convert_expert(src, prefix, w, precision)
-            tensors[f"{prefix}{w}_weight"], tensors[f"{prefix}{w}_weight_scale_inv"] = q, s
+            tensors[f"{prefix}{w}_weight"], tensors[f"{prefix}{w}_weight_scale_inv"] = (
+                q,
+                s,
+            )
         save_file(tensors, out + ".tmp")
-        os.replace(out + ".tmp", out)  # a crash never leaves a half-written shard that looks done
-        print(f"layer {layer}: {precision} -> fp8 in {time.time() - t0:.0f}s", flush=True)
+        os.replace(
+            out + ".tmp", out
+        )  # a crash never leaves a half-written shard that looks done
+        print(
+            f"layer {layer}: {precision} -> fp8 in {time.time() - t0:.0f}s", flush=True
+        )
 
 
 def copy_rest(src, dst):
@@ -101,11 +127,23 @@ def finalize(src_dir, dst, quant):
         if f.endswith(".safetensors") and not f.startswith("mtp"):
             with safe_open(f"{dst}/{f}", framework="pt") as h:
                 weight_map.update({n: f for n in h.keys()})
-    json.dump({"metadata": {}, "weight_map": weight_map}, open(f"{dst}/model.safetensors.index.json", "w"), indent=1)
-    quant["tpu_expert_format"] = {"format": "fp8_e4m3_block", "block": [128, 128], "w13": "gate_up"}
+    json.dump(
+        {"metadata": {}, "weight_map": weight_map},
+        open(f"{dst}/model.safetensors.index.json", "w"),
+        indent=1,
+    )
+    quant["tpu_expert_format"] = {
+        "format": "fp8_e4m3_block",
+        "block": [128, 128],
+        "w13": "gate_up",
+    }
     json.dump(quant, open(f"{dst}/hf_quant_config.json", "w"))
     for f in os.listdir(src_dir):
-        if f.endswith(".safetensors") and not f.startswith("mtp") or f in ("model.safetensors.index.json", "hf_quant_config.json"):
+        if (
+            f.endswith(".safetensors")
+            and not f.startswith("mtp")
+            or f in ("model.safetensors.index.json", "hf_quant_config.json")
+        ):
             continue
         p = f"{src_dir}/{f}"
         (shutil.copytree if os.path.isdir(p) else shutil.copy2)(p, f"{dst}/{f}")
@@ -117,7 +155,9 @@ def main():
     ap.add_argument("src")
     ap.add_argument("dst")
     ap.add_argument("--layers", help="inclusive range, e.g. 0-23")
-    ap.add_argument("--rest", action="store_true", help="also write the non-expert tensors")
+    ap.add_argument(
+        "--rest", action="store_true", help="also write the non-expert tensors"
+    )
     ap.add_argument("--finalize", action="store_true")
     a = ap.parse_args()
     os.makedirs(a.dst, exist_ok=True)

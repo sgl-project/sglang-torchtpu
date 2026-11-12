@@ -4,7 +4,7 @@
 """TPU FP8 dense linear helpers."""
 
 import logging
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, Optional
 
 import torch
 from torch.nn import Module
@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 _SMALL_M_OP: Callable | None = None
 _STATIC_FP8_GEMV_OP: Callable | None = None
+# The same GEMV for a weight that is already in VMEM (static_fp8_gemv_with_weight).
+_STATIC_FP8_GEMV_VW_OP: Callable | None = None
 # Plain bool, not a None check on the op: Dynamo traces the eligibility check.
 _STATIC_FP8_GEMV_READY = False
 
@@ -143,21 +145,36 @@ def _requantize_tpu_block_fp8_to_channelwise(
         )
     weight_dequant = torch.cat(dequantized_shards, dim=0)
 
-    dtype_max = torch.finfo(weight.dtype).max
-    weight_scale = torch.clamp(
-        weight_dequant.abs().amax(dim=1, keepdim=True) / dtype_max,
-        min=1e-12,
-    )
-    weight = torch.clamp(
-        weight_dequant / weight_scale,
-        min=-dtype_max,
-        max=dtype_max,
-    ).to(weight.dtype)
-
-    layer.weight = Parameter(weight.t().contiguous(), requires_grad=False)
-    layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+    _set_channelwise_fp8_weight(layer, weight_dequant, weight.dtype)
     _clear_replaced_param(layer, "weight_scale_inv")
     layer.weight_block_size = None
+
+
+def _set_channelwise_fp8_weight(
+    layer: Module, weight: torch.Tensor, dtype: torch.dtype
+) -> None:
+    """Quantize an ``[N, K]`` weight with one scale per output row onto ``layer``.
+
+    Stores ``layer.weight`` as a contiguous ``[K, N]`` fp8 tensor and
+    ``layer.weight_scale`` as ``[N, 1]`` float32, the layout
+    ``apply_tpu_fp8_linear`` reads. A row's scale depends only on that row,
+    so rows replicated across TP ranks quantize to the same bytes on every
+    rank (#1767).
+    """
+    dtype_max = torch.finfo(dtype).max
+    weight_f32 = weight.to(torch.float32)
+    weight_scale = torch.clamp(
+        weight_f32.abs().amax(dim=1, keepdim=True) / dtype_max,
+        min=1e-12,
+    )
+    qweight = torch.clamp(
+        weight_f32 / weight_scale,
+        min=-dtype_max,
+        max=dtype_max,
+    ).to(dtype)
+
+    layer.weight = Parameter(qweight.t().contiguous(), requires_grad=False)
+    layer.weight_scale = Parameter(weight_scale, requires_grad=False)
     layer.input_scale = None
 
 
@@ -193,6 +210,18 @@ def prepare_tpu_fp8_linear_weights(
         _requantize_tpu_block_fp8_to_channelwise(layer, weight_block_size)
     else:
         layer.weight_block_size = list(weight_block_size)
+
+
+def prepare_tpu_online_fp8_linear_weights(
+    layer: Module, *, dtype: torch.dtype = torch.float8_e4m3fn
+) -> None:
+    """Post-load fp8 quantization of an unquantized TPU dense linear layer.
+
+    Used for online fp8 (``--quantization fp8`` on a bf16 checkpoint). Uses
+    per-row scales instead of one per-tensor scale over the rank's shard, so
+    TP-replicated kv heads stay byte-identical across ranks (#1767).
+    """
+    _set_channelwise_fp8_weight(layer, layer.weight.data, dtype)
 
 
 def register_tpu_block_fp8_linear() -> None:
@@ -473,7 +502,7 @@ def register_static_fp8_gemv_op() -> None:
     """Register the static fp8 Pallas GEMV when enabled; must run before
     torch.compile traces the model (the Kimi-K3 static fp8 binder calls it
     post-load). Left unregistered, every call keeps the XLA fp8 dot."""
-    global _STATIC_FP8_GEMV_OP, _STATIC_FP8_GEMV_READY
+    global _STATIC_FP8_GEMV_OP, _STATIC_FP8_GEMV_VW_OP, _STATIC_FP8_GEMV_READY
     if not tpu_envs.SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV.get():
         return
     if _STATIC_FP8_GEMV_OP is None:
@@ -494,7 +523,35 @@ def register_static_fp8_gemv_op() -> None:
         op = cpu_export_jax_op("sglang_tpu_pallas::static_fp8_gemv", _op)
         op.register_fake(_fake)
         _STATIC_FP8_GEMV_OP = op
+
+        def _op_vw(
+            x: jax.Array, w: jax.Array, out_scale: jax.Array, inv_x: jax.Array
+        ) -> jax.Array:
+            return _static_fp8_gemv.static_fp8_gemv_jax(
+                x,
+                w,
+                out_scale,
+                inv_x,
+                _static_fp8_gemv.block_k(x.shape[1], w.shape[1]),
+                vmem_weight=True,
+            )
+
+        op_vw = cpu_export_jax_op("sglang_tpu_pallas::static_fp8_gemv_vw", _op_vw)
+        op_vw.register_fake(_fake)
+        _STATIC_FP8_GEMV_VW_OP = op_vw
     _STATIC_FP8_GEMV_READY = True
+
+
+def static_fp8_gemv_with_weight(
+    x: torch.Tensor, w: StaticFp8Weight, weight: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """``w``'s Pallas GEMV reading ``weight`` (a copy of ``w.weight``, e.g.
+    already prefetched into VMEM) instead of ``w.weight``; None when the Pallas
+    GEMV does not apply to ``x``."""
+    if not _static_fp8_gemv_eligible(x, w) or weight.shape != w.weight.shape:
+        return None
+    out = _STATIC_FP8_GEMV_VW_OP(x, weight, w.out_scale, w.inv_x)
+    return out[:, : w.n_out] if w.n_out else out
 
 
 def static_fp8_gemv_enabled() -> bool:

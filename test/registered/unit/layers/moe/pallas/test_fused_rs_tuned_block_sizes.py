@@ -53,7 +53,6 @@ class TestFusedRsTunedBlockSizes(unittest.TestCase):
             (128, 4096, 4096, 4096, 4096, 2, 1),
         )
 
-
     def test_h4608_ep8_decode_rows_get_half_n_double_buffered_tiles(self):
         """Decode / MTP verify calls (<= 512 tokens) stream every touched expert's
         weights; half-N double-buffered tiles overlap that DMA with the GEMM.
@@ -64,15 +63,19 @@ class TestFusedRsTunedBlockSizes(unittest.TestCase):
                 "k-4608_n-5120_g-48_lhs_quant_rhs_bs-16"
                 "+k-2560_n-6144_g-48_lhs_quant_rhs_bs-16",
                 (32, 4608, 1280, 2560, 2304, 2, 2),
-                {8192: (128, 4608, 2560, 2560, 4608, 1, 1),
-                 65536: (256, 4608, 2560, 2560, 4608, 1, 1)},
+                {
+                    8192: (128, 4608, 2560, 2560, 4608, 1, 1),
+                    65536: (256, 4608, 2560, 2560, 4608, 1, 1),
+                },
             ),
             "lhs_bfloat16_rhs_float8_e4m3fn": (
                 "k-4608_n-4608_g-48_lhs_quant_rhs_bs-4608"
                 "+k-2304_n-6144_g-48_lhs_quant_rhs_bs-4608",
                 (32, 4608, 1152, 2304, 2304, 2, 2),
-                {8192: (128, 4608, 2304, 2304, 4608, 1, 1),
-                 65536: (256, 4608, 2304, 2304, 4608, 1, 1)},
+                {
+                    8192: (128, 4608, 2304, 2304, 4608, 1, 1),
+                    65536: (256, 4608, 2304, 2304, 4608, 1, 1),
+                },
             ),
         }
         for dtype_key, (shape_key, decode, prefill) in cases.items():
@@ -83,6 +86,7 @@ class TestFusedRsTunedBlockSizes(unittest.TestCase):
             for rows, tile in prefill.items():
                 with self.subTest(dtype=dtype_key, rows=rows):
                     self.assertEqual(table[f"{rows}_{act}"], tile)
+
 
 if __name__ == "__main__":
     unittest.main()

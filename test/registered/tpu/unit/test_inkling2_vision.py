@@ -96,7 +96,9 @@ class TestInkling2Vision(CustomTestCase):
         reference_vision._renormalize = lambda x, mean, std: (
             2.0 * (x * std.to(x.dtype) + mean.to(x.dtype)) - 1.0
         )
-        cls.reference = reference_vision.Inkling2VisionEncoder(VISION_CONFIG, TEXT_HIDDEN)
+        cls.reference = reference_vision.Inkling2VisionEncoder(
+            VISION_CONFIG, TEXT_HIDDEN
+        )
         for param in cls.reference.parameters():
             param.data.normal_(0, 0.02)
         for name, param in cls.reference.named_parameters():
@@ -104,7 +106,9 @@ class TestInkling2Vision(CustomTestCase):
                 param.data.fill_(0.5)
             elif name.endswith(("ln_1.weight", "ln_2.weight", "ln_pre.weight")):
                 param.data.fill_(1.0)
-            elif ".self_attn.q_proj.weight" in name or ".self_attn.k_proj.weight" in name:
+            elif (
+                ".self_attn.q_proj.weight" in name or ".self_attn.k_proj.weight" in name
+            ):
                 # Peaked attention, so a wrong RoPE convention shows up in the output.
                 param.data.mul_(10.0)
         # Build on device in bf16 as the model loader does; Module.to() would
@@ -119,8 +123,15 @@ class TestInkling2Vision(CustomTestCase):
         _copy_reference_weights(cls.reference, cls.encoder)
         num_patches = sum(h * w for h, w in GRID)
         cls.patches = (
-            torch.rand((num_patches, 1, 40, 40, 3)).mul(2.5).sub(1.8).to(torch.bfloat16)
-        ).expand(-1, 2, -1, -1, -1).contiguous()
+            (
+                torch.rand((num_patches, 1, 40, 40, 3))
+                .mul(2.5)
+                .sub(1.8)
+                .to(torch.bfloat16)
+            )
+            .expand(-1, 2, -1, -1, -1)
+            .contiguous()
+        )
         cls.expected = cls.reference(
             cls.patches, torch.tensor([[1, h, w] for h, w in GRID], dtype=torch.int64)
         ).float()
@@ -159,7 +170,9 @@ class TestInkling2Vision(CustomTestCase):
         self.assertGreater(float(cosine.min()), 0.99)
 
     def test_batched_images_match_reference_eagerly(self):
-        self._assert_matches(self._encode(GRID, self.patches, self.encoder.forward), self.expected)
+        self._assert_matches(
+            self._encode(GRID, self.patches, self.encoder.forward), self.expected
+        )
 
     def test_each_image_alone_matches_its_batched_rows(self):
         """Attention segments keep images apart: an image's rows do not depend on
@@ -167,7 +180,9 @@ class TestInkling2Vision(CustomTestCase):
         offset = 0
         for h, w in GRID:
             n = h * w
-            alone = self._encode([(h, w)], self.patches[offset : offset + n], self.encoder.forward)
+            alone = self._encode(
+                [(h, w)], self.patches[offset : offset + n], self.encoder.forward
+            )
             self._assert_matches(alone, self.expected[offset : offset + n])
             offset += n
 
@@ -176,7 +191,10 @@ class TestInkling2Vision(CustomTestCase):
 
         _register_tpu_compile_backend()
         compiled = torch.compile(
-            torch.no_grad()(self.encoder.forward), backend="tpu", fullgraph=True, dynamic=False
+            torch.no_grad()(self.encoder.forward),
+            backend="tpu",
+            fullgraph=True,
+            dynamic=False,
         )
         self._assert_matches(self._encode(GRID, self.patches, compiled), self.expected)
 

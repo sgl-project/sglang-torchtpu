@@ -123,9 +123,7 @@ def write_state_rows(
         from sglang_tpu.mamba_state_rows import state_row_write_op
 
         state.copy_(
-            state_row_write_op()(
-                state, rows.to(torch.int32), live.to(torch.int32), new
-            )
+            state_row_write_op()(state, rows.to(torch.int32), live.to(torch.int32), new)
         )
         return
     # Dead rows rewrite the null slot with its own value, keeping the scatter deterministic.

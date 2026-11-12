@@ -1293,7 +1293,7 @@ def _ragged_paged_attention_kernel_loop(
                     l_lane = l_lane / v_scale
                 l = jnp.broadcast_to(l_lane, acc.shape)  # noqa
             out = (
-                acc * pl.reciprocal(l, approx=True)
+                acc * pltpu.reciprocal(l, approx=True)
                 if (l.dtype == jnp.float32 and o_hbm_ref.dtype != jnp.float32)
                 else lax.div(acc, l)
             ).astype(o_hbm_ref.dtype)
@@ -1657,9 +1657,13 @@ def static_validate_inputs(
         if rel_r.shape[:2] != q.shape[:2] or rel_r.shape[2] != rel_proj.shape[0]:
             raise ValueError(f"Mismatched {rel_r.shape=}, {rel_proj.shape=}.")
         if rel_proj.shape[1] % 128 != 0:
-            raise ValueError(f"{rel_proj.shape[1]=} (extent) must be a multiple of 128.")
+            raise ValueError(
+                f"{rel_proj.shape[1]=} (extent) must be a multiple of 128."
+            )
         if soft_cap is not None or xai_temperature_len is not None:
-            raise ValueError("rel bias does not compose with soft_cap or xai temperature.")
+            raise ValueError(
+                "rel bias does not compose with soft_cap or xai temperature."
+            )
         for name, block_sizes in (
             ("decode", d_block_sizes),
             ("prefill", p_block_sizes),
@@ -2121,7 +2125,9 @@ def ragged_paged_attention(
 
     if use_rel_lanes:
         # Pad the query to a 128-lane head before appending the rel lanes.
-        q = jnp.pad(q, ((0, 0), (0, 0), (0, align_to(actual_head_dim, 128) - actual_head_dim)))
+        q = jnp.pad(
+            q, ((0, 0), (0, 0), (0, align_to(actual_head_dim, 128) - actual_head_dim))
+        )
         q = pack_rel_lanes(q, rel_r, token_sink)
     q, kv, attention_sink = prepare_inputs(q, k, v, attention_sink)
     kv_cache_fused_processed = prepare_kv_cache_fused(kv_cache_fused)
@@ -2206,20 +2212,18 @@ def ragged_paged_attention(
                 if rel_extent is not None
                 else None
             ),  # rel_table
-            (
-                pl.BlockSpec(memory_space=pltpu.HBM) if use_rel_lanes else None
-            ),  # o_init
+            (pl.BlockSpec(memory_space=pltpu.HBM) if use_rel_lanes else None),  # o_init
         ]
         rel_window = None
         rel_table = None
         if rel_extent is not None:
-            rel_window = rel_window_width(
-                bkv_csz=rel_sub_tile(bkv_csz), bq_csz=bq_csz
-            )
+            rel_window = rel_window_width(bkv_csz=rel_sub_tile(bkv_csz), bq_csz=bq_csz)
             # The bias is added to the base-2 logits, so it carries the same
             # log2(e) as s_scale; under soft_cap it is scaled after tanh instead.
             rel_table = build_rel_window_table(
-                rel_proj if soft_cap is not None else rel_proj.astype(jnp.float32) * LOG2E,
+                rel_proj
+                if soft_cap is not None
+                else rel_proj.astype(jnp.float32) * LOG2E,
                 window=rel_window,
             )
 

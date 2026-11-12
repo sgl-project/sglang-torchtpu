@@ -224,6 +224,66 @@ class TestFfnExit(CustomTestCase):
                 self.forward_batch, stream=ResidualStream(), summed_by_compute=True
             )
 
+    def test_an_ffn_summed_by_compute_only_scatters_back_under_attention_dp(self):
+        """Under attention DP an output summed by compute (every rank holds
+        every token's sum) takes the plain scatter back to this rank's tokens,
+        not the reduce-scatter that would sum it again."""
+        step = MagicMock()
+        communicator = make_communicator(
+            fuse=True,
+            reduce_scatter=False,
+            reduce_scatter_step=step,
+            scatters_to_local_tokens=True,
+        )
+        # The real check: a reduce-scatter step would mean a second sum.
+        del communicator.output._sum_in_reduce_scatter
+        with communicator.output.ffn_exit(
+            self.forward_batch, stream=ResidualStream(), summed_by_compute=True
+        ) as ffn_exit:
+            hidden_states = self.hidden_states * 2
+        hidden_states, _ = finish_exit(ffn_exit, hidden_states, self.residual)
+
+        self.assertNotIsInstance(hidden_states, UnreducedOutput)
+        communicator.output._complete_now.assert_called_once()
+        kwargs = communicator.output._complete_now.call_args.kwargs
+        self.assertFalse(kwargs["owes_sum"])
+        # No reduce-scatter step: _complete_now falls back to the plain scatter.
+        self.assertIsNone(kwargs["dp_step"])
+        communicator.output._defers_sum.assert_not_called()
+        step.assert_not_called()
+
+    def test_complete_now_scatters_an_output_summed_by_compute_back(self):
+        """Completing an output summed by compute under attention DP copies
+        this rank's rows out of the summed output, without summing."""
+        steps = ordinary_steps(
+            OutputContract(Layout(frozenset()), group=SumGroup.MOE_OUTPUT),
+            returns_over_dp=True,
+        )
+        summed = torch.arange(8.0).reshape(4, 2)
+        local = torch.empty(2, 2)
+        with (
+            patch_communicator("_dp_scatter_group", return_value="group"),
+            patch_communicator("get_local_dp_buffer", return_value=local),
+            patch_communicator(
+                "dp_scatter",
+                side_effect=lambda out, full, fb: out.copy_(full[2:]),
+            ),
+            patch_communicator("sum_output") as sum_output,
+        ):
+            hidden_states, residual = stub_plan().output._complete_now(
+                summed,
+                None,
+                forward_batch=self.forward_batch,
+                dp_step=None,
+                steps=steps,
+                output_move=None,
+                owes_sum=False,
+            )
+        sum_output.assert_not_called()
+        self.assertIs(hidden_states, local)
+        torch.testing.assert_close(hidden_states, summed[2:])
+        self.assertIsNone(residual)
+
     def test_complete_now_skips_the_sum_for_an_ffn_summed_by_compute(self):
         """The operation-scheduled (TBO) path completes now without summing."""
         communicator = make_communicator(fuse=False, reduce_scatter=False)

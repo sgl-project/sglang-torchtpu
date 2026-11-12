@@ -216,6 +216,74 @@ def _compiled(fn, *, draft_model: nn.Module, kv_pool: object, **static_args: int
     )
 
 
+def _new_pool(*, head_num: int, head_dim: int, layer_num: int, v_head_dim=None):
+    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+    return TpuFusedMHATokenToKVPool(
+        size=NUM_PAGES * PAGE_SIZE,
+        page_size=PAGE_SIZE,
+        dtype=DTYPE,
+        head_num=head_num,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        layer_num=layer_num,
+        device=DEVICE,
+        enable_memory_saver=False,
+    )
+
+
+def _write_both(
+    *,
+    draft_model: nn.Module,
+    ref_fn,
+    make_pool,
+    hidden: int,
+    cache_loc: torch.Tensor,
+    positions: torch.Tensor,
+    cache_loc_2d: torch.Tensor | None = None,
+    commit_lens: torch.Tensor | None = None,
+):
+    """Write the same inputs through the fused path and ref_fn.
+
+    Args:
+      draft_model: Stub draft model both paths read.
+      ref_fn: Per-layer reference; takes only the flat per-token slots.
+      make_pool: Builds an empty pool for draft_model.
+      hidden: Context hidden size.
+
+    Returns:
+      Tuple of (fused buffers, reference buffers), each a list of per-layer
+      CPU float32 copies.
+    """
+    from sglang_tpu.dflash_draft_kv_write import dflash_write_draft_kv
+
+    ctx_hidden = torch.randn(
+        (int(cache_loc.shape[0]), hidden), dtype=DTYPE, device=DEVICE
+    )
+    fused_pool, ref_pool = make_pool(), make_pool()
+    _compiled(
+        dflash_write_draft_kv,
+        draft_model=draft_model,
+        kv_pool=fused_pool,
+        max_num_reqs=MAX_NUM_REQS,
+    )(
+        ctx_hidden=ctx_hidden,
+        ctx_positions=positions,
+        ctx_cache_loc=cache_loc,
+        cache_loc_2d=cache_loc_2d,
+        commit_lens=commit_lens,
+    )
+    _compiled(ref_fn, draft_model=draft_model, kv_pool=ref_pool)(
+        ctx_hidden=ctx_hidden, ctx_positions=positions, ctx_cache_loc=cache_loc
+    )
+    torch.accelerator.synchronize()
+    to_cpu = lambda pool: [  # noqa: E731
+        pool.get_fused_kv_buffer(i).to("cpu", torch.float32)
+        for i in range(len(draft_model.layers))
+    ]
+    return to_cpu(fused_pool), to_cpu(ref_pool)
+
+
 @unittest.skipIf(_skip_if_no_tpu(), "requires torch_tpu")
 class TestDflashDraftKvWrite(CustomTestCase):
     @classmethod
@@ -240,59 +308,18 @@ class TestDflashDraftKvWrite(CustomTestCase):
         cls.draft_model = _StubDraftModel(rope).to(DEVICE)
 
     def _make_pool(self):
-        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        return _new_pool(head_num=KV_HEADS, head_dim=HEAD_DIM, layer_num=LAYERS)
 
-        return TpuFusedMHATokenToKVPool(
-            size=NUM_PAGES * PAGE_SIZE,
-            page_size=PAGE_SIZE,
-            dtype=DTYPE,
-            head_num=KV_HEADS,
-            head_dim=HEAD_DIM,
-            layer_num=LAYERS,
-            device=DEVICE,
-            enable_memory_saver=False,
-        )
+    def _run_both(self, **kwargs):
+        from sglang_tpu.dflash_draft_kv_write import dflash_write_draft_kv_ref
 
-    def _run_both(self, *, cache_loc, positions, cache_loc_2d=None, commit_lens=None):
-        """Write the same inputs through the fused path and the reference.
-
-        Returns:
-          Tuple of (fused buffers, reference buffers), each a list of per-layer
-          CPU float32 copies.
-        """
-        from sglang_tpu.dflash_draft_kv_write import (
-            dflash_write_draft_kv,
-            dflash_write_draft_kv_ref,
-        )
-
-        num_tokens = int(cache_loc.shape[0])
-        ctx_hidden = torch.randn((num_tokens, HIDDEN), dtype=DTYPE, device=DEVICE)
-        fused_pool, ref_pool = self._make_pool(), self._make_pool()
-
-        _compiled(
-            dflash_write_draft_kv,
+        return _write_both(
             draft_model=self.draft_model,
-            kv_pool=fused_pool,
-            max_num_reqs=MAX_NUM_REQS,
-        )(
-            ctx_hidden=ctx_hidden,
-            ctx_positions=positions,
-            ctx_cache_loc=cache_loc,
-            cache_loc_2d=cache_loc_2d,
-            commit_lens=commit_lens,
+            ref_fn=dflash_write_draft_kv_ref,
+            make_pool=self._make_pool,
+            hidden=HIDDEN,
+            **kwargs,
         )
-        _compiled(
-            dflash_write_draft_kv_ref, draft_model=self.draft_model, kv_pool=ref_pool
-        )(
-            ctx_hidden=ctx_hidden,
-            ctx_positions=positions,
-            ctx_cache_loc=cache_loc,
-        )
-        torch.accelerator.synchronize()
-        to_cpu = lambda pool: [  # noqa: E731
-            pool.get_fused_kv_buffer(i).to("cpu", torch.float32) for i in range(LAYERS)
-        ]
-        return to_cpu(fused_pool), to_cpu(ref_pool)
 
     def _assert_layers_match(self, fused, ref, *, ignore_slot_0=False):
         for layer in range(LAYERS):
@@ -367,7 +394,9 @@ class TestDflashDraftKvWrite(CustomTestCase):
 
         pools = [
             self._make_hybrid_pool(
-                swa_layer_ids=swa_layer_ids, full_layer_ids=full_layer_ids, mapping=mapping
+                swa_layer_ids=swa_layer_ids,
+                full_layer_ids=full_layer_ids,
+                mapping=mapping,
             )
             for _ in range(2)
         ]
@@ -387,7 +416,9 @@ class TestDflashDraftKvWrite(CustomTestCase):
             swa_cache_loc=swa_loc,
             swa_cache_loc_2d=None,
         )
-        _compiled(dflash_write_draft_kv_ref, draft_model=self.draft_model, kv_pool=pools[1])(
+        _compiled(
+            dflash_write_draft_kv_ref, draft_model=self.draft_model, kv_pool=pools[1]
+        )(
             ctx_hidden=ctx_hidden,
             ctx_positions=positions,
             ctx_cache_loc=cache_loc,
@@ -510,6 +541,122 @@ class TestDflashDraftKvWrite(CustomTestCase):
             print(
                 f"{name:>14} {num_tokens:>7} {timings['fused']:>8.3f}m"
                 f" {timings['ref']:>8.3f}m {timings['ref'] / timings['fused']:>7.2f}x"
+            )
+
+
+# Kimi-K3.1 DFlash draft at TP32: MLA draft layers served as MHA over the
+# expanded latent (sglang_tpu.models.dflash_mla), 96 heads -> 3 per rank,
+# K = [k_nope 128 | k_pe 64], V 128, deepseek yarn rope on the 64 rope dims.
+# Two layers and a small hidden: only the per-rank head geometry shapes the write.
+MLA_LAYERS = 2
+MLA_HEADS = 3
+MLA_NOPE, MLA_ROPE, MLA_V = 128, 64, 128
+MLA_HIDDEN = 256
+MLA_ROPE_SCALING = {
+    "rope_type": "deepseek_yarn",
+    "factor": 32.0,
+    "beta_fast": 32,
+    "beta_slow": 1,
+    "mscale": 1.0,
+    "mscale_all_dim": 1.0,
+    "original_max_position_embeddings": 32768,
+}
+
+
+def _stub_mla_attention(rotary_emb: nn.Module) -> nn.Module:
+    """A DFlashMLAAttention with plain linear K/V projections (no parallel linears)."""
+    from sglang_tpu.models.dflash_mla import DFlashMLAAttention
+
+    class _StubMlaAttention(DFlashMLAAttention):
+        def __init__(self) -> None:
+            nn.Module.__init__(self)
+            self.num_heads = self.num_kv_heads = MLA_HEADS
+            self.qk_nope_head_dim, self.qk_rope_head_dim = MLA_NOPE, MLA_ROPE
+            self.head_dim, self.v_head_dim = MLA_NOPE + MLA_ROPE, MLA_V
+            self.rotary_emb = rotary_emb
+            self.kv_weight = nn.Parameter(
+                torch.randn(MLA_HEADS * (MLA_NOPE + MLA_V), MLA_HIDDEN, dtype=DTYPE)
+                / MLA_HIDDEN**0.5
+            )
+            self.pe_weight = nn.Parameter(
+                torch.randn(MLA_ROPE, MLA_HIDDEN, dtype=DTYPE) / MLA_HIDDEN**0.5
+            )
+
+        def _project_kv(self, hidden_states: torch.Tensor):
+            kv = F.linear(hidden_states, self.kv_weight).view(
+                -1, MLA_HEADS, MLA_NOPE + MLA_V
+            )
+            k_nope, v = kv.split([MLA_NOPE, MLA_V], dim=-1)
+            return k_nope, F.linear(hidden_states, self.pe_weight).unsqueeze(1), v
+
+    return _StubMlaAttention()
+
+
+def _mla_write_ref(*, draft_model, kv_pool, ctx_hidden, ctx_positions, ctx_cache_loc):
+    """Per-layer MLA reference: rotate k_pe in the projection, scatter K/V per layer."""
+    from sglang_tpu.dflash_draft_kv_write import _scatter_layer_kv
+
+    for layer_idx, layer in enumerate(draft_model.layers):
+        attn = layer.self_attn
+        k, v = attn.project_context_kv_rotated(ctx_positions, ctx_hidden)
+        _scatter_layer_kv(
+            kv_pool=kv_pool, layer_idx=layer_idx, loc=ctx_cache_loc, k=k, v=v
+        )
+
+
+@unittest.skipIf(_skip_if_no_tpu(), "requires torch_tpu")
+class TestDflashMlaDraftKvWrite(CustomTestCase):
+    """The fused write of an MLA draft (pre-rotated K, identity rotation in the
+    kernel, V padded to K's width) matches the per-layer reference."""
+
+    @classmethod
+    def setUpClass(cls):
+        from sglang.srt.layers.rotary_embedding import get_rope
+        from sglang.srt.runtime_context import publish
+        from sglang.srt.server_args import ServerArgs
+
+        publish(ServerArgs(model_path="dummy"), role="test")
+        torch.manual_seed(1)
+        rope = get_rope(
+            MLA_ROPE,
+            rotary_dim=MLA_ROPE,
+            max_position=MAX_POSITION,
+            base=50000,
+            rope_scaling=MLA_ROPE_SCALING,
+            is_neox_style=False,
+            dtype=DTYPE,
+        )
+        rope.cos_sin_cache = rope.cos_sin_cache.to(DEVICE)
+        model = nn.Module()
+        model.layers = nn.ModuleList(nn.Module() for _ in range(MLA_LAYERS))
+        for layer in model.layers:
+            layer.self_attn = _stub_mla_attention(rope)
+        model.prepare_context_hidden_for_kv = lambda layer, ctx_hidden: ctx_hidden
+        cls.draft_model = model.to(DEVICE)
+
+    def test_extend_resumes_mid_page(self):
+        num_tokens = 300
+        fused, ref = _write_both(
+            draft_model=self.draft_model,
+            ref_fn=_mla_write_ref,
+            make_pool=lambda: _new_pool(
+                head_num=MLA_HEADS,
+                head_dim=MLA_NOPE + MLA_ROPE,
+                v_head_dim=MLA_V,
+                layer_num=MLA_LAYERS,
+            ),
+            hidden=MLA_HIDDEN,
+            cache_loc=_extend_cache_loc(head_offset=91, num_tokens=num_tokens),
+            # Past original_max_position_embeddings: k_pe comes from the
+            # interpolated yarn regime.
+            positions=torch.arange(
+                40000, 40000 + num_tokens, dtype=torch.int64, device=DEVICE
+            ),
+        )
+        for layer in range(MLA_LAYERS):
+            # Same K/V values and the same bf16 cast: the identity rotation is exact.
+            torch.testing.assert_close(
+                fused[layer], ref[layer], atol=0, rtol=0, msg=f"L{layer}"
             )
 
 

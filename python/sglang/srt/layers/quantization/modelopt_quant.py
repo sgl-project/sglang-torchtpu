@@ -3487,6 +3487,12 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 "--moe-runner-backend pallas_tpu_fused_rs cannot honor this "
                 "TPU NVFP4 layer. Unmet requirements: " + ", ".join(unmet_requirements)
             )
+        else:
+            logger.warning_once(
+                "TPU Pallas NVFP4 fused-RS MoE backend disabled under auto "
+                "(falling back to stock gmm_v2). Unmet requirements: %s",
+                ", ".join(unmet_requirements),
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from sglang_tpu.fp4_moe import (

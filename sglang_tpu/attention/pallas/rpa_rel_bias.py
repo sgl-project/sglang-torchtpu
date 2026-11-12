@@ -92,7 +92,11 @@ def pack_rel_lanes(
 
 def _store_folded(ref, val, *, start=0, stride=None):
     """ref rows start, start + stride, ... (all rows if stride is None) = val."""
-    rows = pl.ds(start, val.shape[0]) if stride is None else pl.ds(start, val.shape[0], stride=stride)
+    rows = (
+        pl.ds(start, val.shape[0])
+        if stride is None
+        else pl.ds(start, val.shape[0], stride=stride)
+    )
     for f in range(val.shape[1] // 128):
         ref[f, rows, :] = val[:, f * 128 : (f + 1) * 128]
 

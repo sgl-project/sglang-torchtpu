@@ -35,7 +35,9 @@ class _Backend(TpuInklingSconvBackend):
 
     def run(self, x, weight, *, lens, seq_lens, slots, track=None, decode=False):
         """One forward of packed x; track is (track slot, end offset in the request)."""
-        qsl = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32)
+        qsl = torch.tensor(
+            [0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32
+        )
         self._query_start_loc = qsl
         self._seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
         self._state_indices = torch.tensor(slots, dtype=torch.int32)
@@ -43,7 +45,10 @@ class _Backend(TpuInklingSconvBackend):
         track = track or [(0, -1)] * len(lens)
         self._track_indices = torch.tensor([t[0] for t in track], dtype=torch.int32)
         self._track_end = torch.tensor(
-            [-1 if end < 0 else qsl[i].item() + end for i, (_, end) in enumerate(track)],
+            [
+                -1 if end < 0 else qsl[i].item() + end
+                for i, (_, end) in enumerate(track)
+            ],
             dtype=torch.int32,
         )
         with envs.SGLANG_TPU_ENABLE_INKLING_SCONV_PALLAS.override(False):

@@ -259,6 +259,79 @@ class TestTpuFusedHostPool(CustomTestCase):
             self, dev, host, [2, 5, 8], host_indices=reused, free=False
         )
 
+    def test_host_page_file_roundtrip_reload(self):
+        # L3 path: device -> host -> HiCacheFile -> (host wiped) -> host ->
+        # device. The file holds the host row as an opaque blob, so this is
+        # the proof that the DEVICE layout survives a trip through disk, not
+        # just the host copy.
+        import os
+        import tempfile
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.hicache_storage import (
+            HiCacheFile,
+            HiCacheStorageConfig,
+        )
+
+        dev, host = _make_pools()
+        dev_pages = [3, 1, 6]
+        orig = _seed_pages(dev, dev_pages)
+        page_size = dev.page_size
+        device_indices = torch.cat(
+            [
+                torch.arange(pid * page_size, (pid + 1) * page_size, device=DEV)
+                for pid in dev_pages
+            ]
+        )
+        host_indices = host.alloc(len(device_indices))
+        self.assertIsNotNone(host_indices)
+        host.backup_from_device_all_layer(
+            dev, host_indices, device_indices, "torch_tpu"
+        )
+
+        config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="unit/tpu-kv-offload",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ, {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": ""}
+            ):
+                storage = HiCacheFile(config, file_path=tmp)
+            keys = [f"page-{i}" for i in range(len(dev_pages))]
+            # Backup to storage exactly as _generic_page_set does.
+            for i, key in enumerate(keys):
+                self.assertTrue(
+                    storage.set(key, host.get_data_page(host_indices[i * page_size]))
+                )
+            page_bytes = host.kv_buffer[0].numel() * host.kv_buffer.element_size()
+            for f in os.listdir(tmp):
+                self.assertEqual(os.path.getsize(os.path.join(tmp, f)), page_bytes)
+
+            # Lose both tiers, then prefetch exactly as _generic_page_get does.
+            host.kv_buffer.zero_()
+            for layer in range(dev.layer_num):
+                dev.kv_buffer[layer][dev_pages] = 0
+            for i, key in enumerate(keys):
+                page = storage.get(key, host.get_dummy_flat_data_page())
+                self.assertIsNotNone(page)
+                host.set_from_flat_data_page(host_indices[i * page_size], page)
+
+        host.load_to_device_all(dev, host_indices, device_indices, "torch_tpu")
+        for layer in range(dev.layer_num):
+            self.assertTrue(
+                torch.equal(dev.kv_buffer[layer][dev_pages].cpu(), orig[layer])
+            )
+        host.free(host_indices)
+
 
 @unittest.skipUnless(_has_tpu_via_torch(), _TORCH_TPU_SKIP_REASON)
 class TestTpuSeqAlongLaneCpuCopy(CustomTestCase):

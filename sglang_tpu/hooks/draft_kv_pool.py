@@ -62,10 +62,7 @@ def draft_cell_size_per_token(
         from sglang.srt.platforms import current_platform
 
         pool_cls = current_platform.get_mha_kv_pool_cls()
-    if (
-        not issubclass(pool_cls, TpuFusedMHATokenToKVPool)
-        or draft_num_layers <= 0
-    ):
+    if not issubclass(pool_cls, TpuFusedMHATokenToKVPool) or draft_num_layers <= 0:
         return generic
     per_layer = pool_cls.kv_bytes_per_token_per_layer(
         num_kv_heads=draft_model_config.get_num_kv_heads(tp_size),

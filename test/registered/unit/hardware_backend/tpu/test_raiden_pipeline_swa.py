@@ -206,6 +206,7 @@ def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
         full_layer_ids=full_ids,
         swa_layer_ids=swa_ids,
         num_draft_full=0,
+        num_hidden_full=0,
         num_draft_swa=0,
     )
     side = "p" if producer else "d"
@@ -419,6 +420,7 @@ def test_split_manifest_rebases_storage_indices():
         full_layer_ids=[1, 5],
         swa_layer_ids=[3],
         num_draft_full=0,
+        num_hidden_full=0,
         num_draft_swa=0,
     )
     full, swa = ps.split_manifest(pl.pool_manifest(groups))
@@ -440,6 +442,7 @@ def test_split_manifest_puts_draft_window_layers_on_the_window_engine():
         full_layer_ids=[1, 0],
         swa_layer_ids=[3, 1],
         num_draft_full=1,
+        num_hidden_full=0,
         num_draft_swa=1,
     )
     full, swa = ps.split_manifest(pl.pool_manifest(groups))
@@ -1004,6 +1007,7 @@ def _initialize(groups, *, bounded_staging=True, real_budget=False):
         _max_request_blocks=lambda: 64,
         _swa_max_request_blocks=lambda: 3,
         _slot_ceiling=lambda: 64,
+        _bounded_staging=False,
     )
 
     def num_slots(tensors, max_blocks, engines=1, **budget):
@@ -1023,6 +1027,7 @@ def _initialize(groups, *, bounded_staging=True, real_budget=False):
         return 4 if max_blocks == 3 else 6
 
     manager._num_slots = num_slots
+    manager._rank_budget_bytes = lambda: RaidenKVManager._rank_budget_bytes(manager)
 
     class Engine:
         def __init__(self, **kwargs):
@@ -1112,6 +1117,7 @@ def hybrid_groups():
         full_layer_ids=[3],
         swa_layer_ids=[0, 1, 2],
         num_draft_full=0,
+        num_hidden_full=0,
         num_draft_swa=0,
     )
 
@@ -1190,6 +1196,7 @@ def test_full_attention_only_stage_is_unchanged():
         full_layer_ids=[3],
         swa_layer_ids=[],
         num_draft_full=0,
+        num_hidden_full=0,
         num_draft_swa=0,
     )
     r = _initialize(groups)

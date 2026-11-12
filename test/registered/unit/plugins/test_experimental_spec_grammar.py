@@ -103,6 +103,10 @@ class TestExperimentalSpecGrammar(CustomTestCase):
         worker.device = "cpu"
         worker._simulate_acc_len = 0
         worker._tp_sync = MagicMock()
+        worker._verify_top_k_width = None
+        worker._rank_check_interval = 0
+        worker._rng_step = torch.zeros((1,), dtype=torch.int64)
+        worker._block_verification = False
         grammar = _grammar()
         # bs 1 at bucket 2: drafts [b, x] after r = a.
         draft = DraftResult(
@@ -129,7 +133,10 @@ class TestExperimentalSpecGrammar(CustomTestCase):
             patch.object(
                 worker,
                 "_forward_target_verify",
-                return_value=SimpleNamespace(next_token_logits=target_logits),
+                return_value=SimpleNamespace(
+                    next_token_logits=target_logits,
+                    has_next_token_global_top_k=False,
+                ),
             ),
         ):
             _, accept = worker.verify(
@@ -157,9 +164,14 @@ class TestExperimentalSpecGrammar(CustomTestCase):
         logits = torch.zeros((2, 4))
         logits[0, 1] = float("-inf")
         drafts = torch.tensor([[1]])
+        rng_step = torch.zeros((1,), dtype=torch.int64)
+
+        def zero_uniforms(step, stream, shape):
+            return torch.zeros(shape)
+
         # threshold_acc 0 accepts any draft the target can produce.
         with (
-            patch("torch.rand_like", torch.zeros_like),
+            patch.object(spec_ops, "hash_uniforms", zero_uniforms),
             patch.object(spec_ops, "tpu_filter_probs", lambda probs, *a, **k: probs),
         ):
             num_correct, bonus = accept_drafts_target_only(
@@ -172,10 +184,11 @@ class TestExperimentalSpecGrammar(CustomTestCase):
                 torch.zeros(1),
                 1.0,
                 0.0,
+                rng_step,
             )
         self.assertEqual(num_correct.tolist(), [0])
         self.assertNotEqual(bonus.tolist(), [1])
-        with patch("torch.rand_like", torch.zeros_like):
+        with patch.object(spec_ops, "hash_uniforms", zero_uniforms):
             num_correct, bonus = accept_drafts_sampled(
                 logits,
                 drafts,
@@ -183,6 +196,7 @@ class TestExperimentalSpecGrammar(CustomTestCase):
                 torch.zeros((1, 1, 4)),
                 torch.ones(1),
                 torch.full((1,), 4, dtype=torch.int32),
+                rng_step,
             )
         self.assertEqual(num_correct.tolist(), [0])
         self.assertNotEqual(bonus.tolist(), [1])
@@ -194,11 +208,17 @@ class TestExperimentalSpecGrammar(CustomTestCase):
             return_logprob=False,
             has_grammar=True,
             reqs=[SimpleNamespace(lora_id=None)],
+            spec_algorithm=SimpleNamespace(
+                create_worker=lambda _: SimpleNamespace(supports_grammar=True)
+            ),
         )
-        with patch.object(
-            draft_info,
-            "get_spec",
-            return_value=SimpleNamespace(speculative_draft_window_size=None),
+        with (
+            patch.object(
+                draft_info,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_draft_window_size=None),
+            ),
+            patch.object(draft_info, "get_server_args", return_value=None),
         ):
             self.assertTrue(draft_info._verify_window_eligible(batch))
 

@@ -71,9 +71,7 @@ def state_row_write_op():
                 input_output_aliases={3: 0},
             )(rows, live, new, pool)
 
-    op = pallas.jax_op(
-        "sglang::tpu_state_row_write", write_rows, donate_argnums=(0,)
-    )
+    op = pallas.jax_op("sglang::tpu_state_row_write", write_rows, donate_argnums=(0,))
 
     @op.register_fake
     def fake(pool, rows, live, new):
@@ -134,9 +132,7 @@ def state_row_read_op():
                 input_output_aliases={1: 0},
             )(rows, pool)
 
-    op = pallas.jax_op(
-        "sglang::tpu_state_row_read", read_rows, donate_argnums=(0,)
-    )
+    op = pallas.jax_op("sglang::tpu_state_row_read", read_rows, donate_argnums=(0,))
 
     @op.register_fake
     def fake(pool, rows):

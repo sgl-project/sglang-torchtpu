@@ -14,7 +14,10 @@ from typing import ClassVar
 from PIL import Image
 
 from sglang.srt.models.registry import ModelRegistry
-from sglang.tml.multimodal.image_processing import Inkling2ImageProcessor, _load_image_bytes
+from sglang.tml.multimodal.image_processing import (
+    Inkling2ImageProcessor,
+    _load_image_bytes,
+)
 from sglang.tml.processor import Inkling2MultimodalProcessor
 from sglang_tpu.models.inkling2 import Inkling2ForConditionalGeneration
 from sglang_tpu.models.inkling2_vision import ROW_BUCKETS
@@ -28,14 +31,19 @@ logger = logging.getLogger(__name__)
 MAX_IMAGE_PATCHES = (ROW_BUCKETS[-1] - 1) // 4
 
 
-def fit_image_size(width: int, height: int, patch: int, max_patches: int) -> tuple[int, int]:
+def fit_image_size(
+    width: int, height: int, patch: int, max_patches: int
+) -> tuple[int, int]:
     """Largest same-aspect size whose patch grid fits ``max_patches``; unchanged if it already fits."""
     cols, rows = math.ceil(width / patch), math.ceil(height / patch)
     if cols * rows <= max_patches:
         return width, height
     scale = math.sqrt(max_patches / (cols * rows))
     while True:
-        width, height = max(1, math.floor(width * scale)), max(1, math.floor(height * scale))
+        width, height = (
+            max(1, math.floor(width * scale)),
+            max(1, math.floor(height * scale)),
+        )
         if math.ceil(width / patch) * math.ceil(height / patch) <= max_patches:
             return width, height
         scale = 0.98
@@ -51,15 +59,22 @@ class RowCappedImageProcessor(Inkling2ImageProcessor):
             data = _load_image_bytes(image)
             with Image.open(io.BytesIO(data)) as decoded:
                 width, height = decoded.size
-                fitted = fit_image_size(width, height, self.patch_size, self.max_patches)
+                fitted = fit_image_size(
+                    width, height, self.patch_size, self.max_patches
+                )
                 if fitted != (width, height):
                     logger.warning(
                         "Inkling2 image %dx%d exceeds %d patches; downscaled to %dx%d",
-                        width, height, self.max_patches, *fitted,
+                        width,
+                        height,
+                        self.max_patches,
+                        *fitted,
                     )
                     # PIL Lanczos here; the reference resize needs numba, absent on TPU hosts.
                     buf = io.BytesIO()
-                    decoded.convert("RGBA").resize(fitted, Image.LANCZOS).save(buf, format="PNG")
+                    decoded.convert("RGBA").resize(fitted, Image.LANCZOS).save(
+                        buf, format="PNG"
+                    )
                     image = buf.getvalue()
         return super()._encode(image, image_token_id, expected_size, virtual_size)
 

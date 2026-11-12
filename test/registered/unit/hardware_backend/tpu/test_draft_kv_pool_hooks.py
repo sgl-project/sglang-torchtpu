@@ -110,9 +110,7 @@ class TestDraftCellSizeHook(CustomTestCase):
             "sglang.srt.platforms.current_platform.get_mha_kv_pool_cls",
             return_value=TpuFusedMHATokenToKVPool,
         ):
-            self.assertEqual(
-                self._cell_size(None, self._config()), 2 * 2 * 128 * 5 * 2
-            )
+            self.assertEqual(self._cell_size(None, self._config()), 2 * 2 * 128 * 5 * 2)
 
 
 if __name__ == "__main__":

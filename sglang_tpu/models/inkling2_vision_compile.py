@@ -46,7 +46,10 @@ class Inkling2VisionCompilePolicy(CompilePolicy):
                 bucket=bucket,
             )
             pixels = torch.zeros(
-                bucket, 3 * encoder.patch_size**2, dtype=param.dtype, device=param.device
+                bucket,
+                3 * encoder.patch_size**2,
+                dtype=param.dtype,
+                device=param.device,
             )
             args = (pixels, *(t.to(param.device) for t in meta))
             with torch.no_grad():

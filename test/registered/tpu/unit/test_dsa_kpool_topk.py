@@ -11,6 +11,7 @@ Pallas kernel, so this needs a TPU.
 import os
 import sys
 import unittest
+from functools import partial
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
@@ -25,6 +26,7 @@ import numpy as np
 
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention.pallas import dsa_kpool_topk as kp
+from sglang_tpu.attention.pallas.kpool_compress import compress_and_store
 
 # The kernel needs whole 128-token pages; TOPK keeps 16 of up to 128 pools.
 D, HEADS, KPOOL, PAGE, PAGES_PER_SEQ, TOPK = 128, 8, 4, 128, 4, 64
@@ -92,7 +94,7 @@ class TestKpoolIndexerStep(CustomTestCase):
         )
         raw = jnp.zeros((NUM_PAGES, PAGE, 2 * D), jnp.bfloat16)
         pooled = jnp.zeros(
-            (NUM_PAGES, PAGE // 4, 4, kp.pooled_record_bytes(D)), jnp.uint8
+            (NUM_PAGES, PAGE // 16, 4, kp.pooled_record_bytes(D)), jnp.uint8
         )
         # Request r owns pages 1 + r * PAGES_PER_SEQ ...
         page_indices = jnp.asarray(
@@ -171,7 +173,7 @@ class TestKpoolIndexerStep(CustomTestCase):
             f(tokens, HEADS, dtype=jnp.float32),
             f(KPOOL, D, dtype=jnp.float32),
             jnp.zeros((pages + 1, PAGE, 2 * D), jnp.bfloat16),
-            jnp.zeros((pages + 1, PAGE // 4, 4, kp.pooled_record_bytes(D)), jnp.uint8),
+            jnp.zeros((pages + 1, PAGE // 16, 4, kp.pooled_record_bytes(D)), jnp.uint8),
             jnp.asarray([context], jnp.int32),
             jnp.asarray(1 + np.arange(pages), jnp.int32),
             jnp.asarray([0, tokens], jnp.int32),
@@ -191,6 +193,222 @@ class TestKpoolIndexerStep(CustomTestCase):
             finally:
                 kp._MAX_UNCHUNKED_SCORE_BYTES = default
         np.testing.assert_array_equal(outs[1], outs[0])
+
+    def test_token_split_matches_unsplit(self):
+        # The DSA indexer token split on one device: every rank's window
+        # (R = ceil(T / tp) rounded up to 8 rows, as the backend splits) picks
+        # pools; put together in rank order and expanded, they must be the
+        # unsplit rows bit for bit. Two 4096-token prefill chunks (the second
+        # scores against the first's pools), one and two requests, with
+        # padding rows in the bucket.
+        tokens, topk, width = 4096, 2048, 2176
+        rng = np.random.default_rng(2)
+
+        def f(*shape, dtype=jnp.bfloat16):
+            return jnp.asarray(rng.standard_normal(shape), jnp.float32).astype(dtype)
+
+        def run(args, **kw):
+            return jax.jit(
+                lambda *a: kp.kpool_indexer_step(
+                    *a,
+                    weight_scale=1.0,
+                    topk=topk,
+                    kpool=KPOOL,
+                    out_width=width,
+                    **kw,
+                )
+            )(*args)
+
+        for new in ((tokens,), (2500, 1000)):
+            num_seqs = len(new)
+            pages_per_seq = 2 * tokens // PAGE
+            pages = jnp.asarray(1 + np.arange(num_seqs * pages_per_seq), jnp.int32)
+            raw = jnp.zeros((num_seqs * pages_per_seq + 1, PAGE, 2 * D), jnp.bfloat16)
+            pooled = jnp.zeros(
+                (
+                    num_seqs * pages_per_seq + 1,
+                    PAGE // 16,
+                    4,
+                    kp.pooled_record_bytes(D),
+                ),
+                jnp.uint8,
+            )
+            cu = jnp.asarray(np.concatenate([[0], np.cumsum(new)]), jnp.int32)
+            dist = jnp.asarray([0, 0, num_seqs], jnp.int32)
+            for chunk in range(2):
+                kv_lens = jnp.asarray([(chunk + 1) * n for n in new], jnp.int32)
+                args = [
+                    f(tokens, HEADS, D),
+                    f(tokens, D),
+                    f(tokens, D),
+                    f(tokens, HEADS, dtype=jnp.float32),
+                    f(KPOOL, D, dtype=jnp.float32),
+                    raw,
+                    pooled,
+                    kv_lens,
+                    pages,
+                    cu,
+                    dist,
+                ]
+                full, raw_next, pooled_next = run(args)
+                full = np.asarray(full)
+                for tp in (8, 4):
+                    rows = -(-tokens // tp)
+                    rows = -(-rows // 8) * 8
+                    with self.subTest(new=new, chunk=chunk, tp=tp):
+                        slices = []
+                        for rank in range(tp):
+                            picked, raw_r, pooled_r = run(
+                                args,
+                                row_start=jnp.asarray([rank * rows], jnp.int32),
+                                row_count=rows,
+                            )
+                            self.assertEqual(picked.shape, (rows, topk // KPOOL))
+                            # Every rank stores the same caches as unsplit.
+                            np.testing.assert_array_equal(
+                                np.asarray(pooled_r), np.asarray(pooled_next)
+                            )
+                            slices.append(np.asarray(picked))
+                        picked = np.concatenate(slices)
+                        np.testing.assert_array_equal(picked[tokens:], -1)
+                        split = kp.kpool_expand_rows(
+                            jnp.asarray(picked[:tokens]),
+                            kv_lens,
+                            cu,
+                            dist,
+                            topk=topk,
+                            kpool=KPOOL,
+                            out_width=width,
+                        )
+                        np.testing.assert_array_equal(np.asarray(split), full)
+                # Padding rows of the bucket select nothing.
+                self.assertTrue((full[sum(new) :] == -1).all())
+                raw, pooled = raw_next, pooled_next
+
+
+def _scatter_pools(raw, old, ape, lens, pages, cu, distribution, tokens):
+    """The generic gather/compress/scatter pooling that the fused writer replaces."""
+    req, pos, valid = kp._token_rows(lens, cu, distribution, tokens)
+    closing = valid & (pos % KPOOL == KPOOL - 1)
+    member = jnp.maximum(pos[:, None] - 3 + jnp.arange(KPOOL)[None, :], 0)
+    loc = {
+        "page_indices": pages,
+        "num_seqs": lens.shape[0],
+        "page_size": raw.shape[1],
+        "num_pages": raw.shape[0],
+    }
+    page, slot = kp._page_slot(
+        jnp.broadcast_to(req[:, None], member.shape),
+        member,
+        valid=jnp.broadcast_to(closing[:, None], member.shape),
+        **loc,
+    )
+    rows = raw[jnp.minimum(page, raw.shape[0] - 1), slot]
+    pooled = kp.compress_pools(rows[..., :D], rows[..., D:], ape)
+    records = kp._pool_records(pooled, kp.pooled_record_bytes(D))
+    page, slot = kp._page_slot(req, member[:, 0], valid=closing, **loc)
+    record = slot // KPOOL
+    return old.at[page, record // 4, record % 4].set(records, mode="drop")
+
+
+class TestFusedPooling(CustomTestCase):
+    def test_writes_the_same_cache_bytes_as_the_generic_scatter(self):
+        # (name, start, new tokens per request, token bucket, mode); page edges
+        # sit at p-1/p and 4p-1/4p for page size p.
+        def cases(p):
+            return [
+                # 128 new tokens per request: the streaming schedule.
+                ("full_pages", [0, 0], [p, p], 2 * p, "random"),
+                ("raw_page_boundary", [p - 4, 4 * p - 4], [12, 8], 32, "random"),
+                (
+                    "fourth_page_boundary",
+                    [4 * p - 8, 4 * p - 4],
+                    [20, 12],
+                    32,
+                    "random",
+                ),
+                ("decode_close", [3, p + 3], [1, 1], 32, "random"),
+                ("partial_quad", [4, p + 4], [8, 8], 32, "random"),
+                ("inactive_request", [3, 0], [1, 0], 32, "random"),
+                ("nonfinite", [0, 0], [16, 16], 32, "nonfinite"),
+                # Two requests write distinct records of one physical quad.
+                ("shared_quad", [0, 4], [4, 4], 32, "shared"),
+                ("decode_shared_quad", [3, 7], [1, 1], 32, "shared"),
+                ("verify_page_boundary", [p - 1, 4 * p - 1], [6, 6], 32, "random"),
+                ("verify_mixed_q", [p - 3, 4 * p - 1], [3, 9], 32, "random"),
+            ]
+
+        ref = jax.jit(_scatter_pools, static_argnums=(7,))
+        for page_size in (64, 128, 256):
+            for i, (name, start, new, tokens, mode) in enumerate(cases(page_size)):
+                with self.subTest(name=name, page_size=page_size):
+                    rng = np.random.default_rng(1024 + i)
+                    raw = rng.normal(size=(17, page_size, 2 * D)).astype(np.float32)
+                    old = rng.integers(
+                        0, 256, (17, page_size // 16, 4, 2 * D), dtype=np.uint8
+                    )
+                    pages = rng.permutation(np.arange(1, 17)).astype(np.int32)
+                    if mode == "shared":
+                        pages[8] = pages[0]
+                    elif mode == "nonfinite":
+                        raw[pages[0], 0, 0] = np.nan
+                        raw[pages[0], 4, 0] = np.inf
+                        raw[pages[0], 8, 0] = -np.inf
+                    active = 1 if new[1] == 0 else 2
+                    args = (
+                        jnp.asarray(raw, jnp.bfloat16),
+                        jnp.asarray(old),
+                        jnp.asarray(rng.normal(size=(KPOOL, D)), jnp.float32),
+                        jnp.asarray(np.array(start) + np.array(new), jnp.int32),
+                        jnp.asarray(pages),
+                        jnp.asarray([0, new[0], sum(new)], jnp.int32),
+                        jnp.asarray([0, 0, active], jnp.int32),
+                        tokens,
+                    )
+                    expected = np.asarray(ref(*args))
+                    # The token-bucket bound and the exact per-request bound can
+                    # pick different schedules; both must write the same bytes,
+                    # including untouched records and record padding.
+                    for bound in (None, max(new)):
+                        fused = jax.jit(
+                            partial(compress_and_store, max_query_length=bound),
+                            static_argnums=(7,),
+                        )
+                        np.testing.assert_array_equal(
+                            np.asarray(fused(*args)), expected
+                        )
+
+    def test_extending_a_shared_prefix_leaves_its_pages_untouched(self):
+        """A request that extends a radix-cached prefix must not write the pooled
+        records of the prefix's pages: other requests read them on later hits."""
+        page_size, shared = 128, 4
+        start = shared * page_size
+        # 48 new tokens take the short schedule, 512 the streaming one.
+        for new in (48, 512):
+            rng = np.random.default_rng(new)
+            raw = rng.normal(size=(17, page_size, 2 * D)).astype(np.float32)
+            old = rng.integers(0, 256, (17, page_size // 16, 4, 2 * D), dtype=np.uint8)
+            # The request's first `shared` pages hold the cached prefix.
+            pages = rng.permutation(np.arange(1, 17)).astype(np.int32)
+            args = (
+                jnp.asarray(raw, jnp.bfloat16),
+                jnp.asarray(old),
+                jnp.asarray(rng.normal(size=(KPOOL, D)), jnp.float32),
+                jnp.asarray([start + new, 0], jnp.int32),
+                jnp.asarray(pages),
+                jnp.asarray([0, new, new], jnp.int32),
+                jnp.asarray([0, 0, 1], jnp.int32),
+                new,
+            )
+            for name, writer in (
+                ("generic", _scatter_pools),
+                ("fused", compress_and_store),
+            ):
+                with self.subTest(new=new, writer=name):
+                    out = np.asarray(jax.jit(writer, static_argnums=(7,))(*args))
+                    prefix, own = pages[:shared], pages[shared]
+                    np.testing.assert_array_equal(out[prefix], old[prefix])
+                    self.assertFalse(np.array_equal(out[own], old[own]))
 
 
 if __name__ == "__main__":

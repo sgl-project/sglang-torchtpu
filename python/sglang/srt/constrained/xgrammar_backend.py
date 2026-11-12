@@ -72,7 +72,9 @@ def _apply_token_bitmask_plain(logits: torch.Tensor, vocab_mask: torch.Tensor) -
     rows, vocab = logits.shape[0], logits.shape[-1]
     shifts = torch.arange(32, device=vocab_mask.device, dtype=vocab_mask.dtype)
     allowed = ((vocab_mask[:rows, :, None] >> shifts) & 1).bool().flatten(1)
-    if allowed.shape[1] < vocab:  # tokens past the bitmask (vocab padding) are never allowed
+    if (
+        allowed.shape[1] < vocab
+    ):  # tokens past the bitmask (vocab padding) are never allowed
         allowed = torch.nn.functional.pad(allowed, (0, vocab - allowed.shape[1]))
     logits.masked_fill_(~allowed[:, :vocab], float("-inf"))
 

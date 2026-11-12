@@ -216,8 +216,7 @@ def _resolve_dflash_aux_hidden_state(
         # Window layers are charged on the SWA side by the hybrid sizer.
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
-            draft_num_layers=int(draft_num_layers)
-            - config.dflash_draft_swa_num_layers,
+            draft_num_layers=int(draft_num_layers) - config.dflash_draft_swa_num_layers,
         )
         if config.dflash_draft_cell_size_per_token is not None:
             config.dflash_draft_kv_geometry = (

@@ -13,7 +13,6 @@ each bucket compiles once.
 from __future__ import annotations
 
 import functools
-import math
 
 import torch
 import torch.nn.functional as F
@@ -34,7 +33,9 @@ def row_bucket(rows: int) -> int:
     for bucket in ROW_BUCKETS:
         if rows <= bucket:
             return bucket
-    raise ValueError(f"Inkling2 image needs {rows} vision rows; maximum is {ROW_BUCKETS[-1]}")
+    raise ValueError(
+        f"Inkling2 image needs {rows} vision rows; maximum is {ROW_BUCKETS[-1]}"
+    )
 
 
 def _apply_rope(query, key, frequencies, x_shape=None):
@@ -45,14 +46,18 @@ def _apply_rope(query, key, frequencies, x_shape=None):
     def rotate(value):
         pairs = value.float().reshape(*value.shape[:-1], -1, 2)
         even, odd = pairs.unbind(dim=-1)
-        rotated = torch.stack((even * cosine - odd * sine, even * sine + odd * cosine), dim=-1)
+        rotated = torch.stack(
+            (even * cosine - odd * sine, even * sine + odd * cosine), dim=-1
+        )
         return rotated.flatten(-2).to(value.dtype)
 
     return rotate(query), rotate(key)
 
 
 class Inkling2VisionLayer(nn.Module):
-    def __init__(self, width: int, heads: int, mlp_ratio: float, eps: float, prefix: str):
+    def __init__(
+        self, width: int, heads: int, mlp_ratio: float, eps: float, prefix: str
+    ):
         super().__init__()
         head_dim = width // heads
         self.ln_1 = nn.LayerNorm(width, eps=eps)
@@ -103,7 +108,9 @@ class Inkling2VisionLayer(nn.Module):
 class Inkling2VisionEncoderTpu(nn.Module):
     """Submodule names mirror the checkpoint's ``model.visual.*`` tensors."""
 
-    def __init__(self, vision_config: dict, text_hidden_size: int, prefix: str = "visual"):
+    def __init__(
+        self, vision_config: dict, text_hidden_size: int, prefix: str = "visual"
+    ):
         super().__init__()
         cfg = vision_config
         width, heads = int(cfg["hidden_size"]), int(cfg["num_attention_heads"])
@@ -126,7 +133,9 @@ class Inkling2VisionEncoderTpu(nn.Module):
             torch.empty(self.posemb_grid_size**2, width)
         )
         self.backbone.embeddings.class_embedding = nn.Parameter(torch.empty(width))
-        self.backbone.embeddings.cls_position_embedding = nn.Parameter(torch.empty(width))
+        self.backbone.embeddings.cls_position_embedding = nn.Parameter(
+            torch.empty(width)
+        )
         self.backbone.ln_pre = nn.LayerNorm(width, eps=float(cfg["layer_norm_eps"]))
         self.backbone.layers = nn.ModuleList(
             Inkling2VisionLayer(
@@ -176,7 +185,14 @@ def _interp_weights(indices: torch.Tensor, target: int, size: int) -> torch.Tens
 
 
 @functools.lru_cache(maxsize=256)
-def vision_metadata(grid: tuple[tuple[int, int], ...], *, merge: int, head_dim: int, posemb_grid: int, bucket: int):
+def vision_metadata(
+    grid: tuple[tuple[int, int], ...],
+    *,
+    merge: int,
+    head_dim: int,
+    posemb_grid: int,
+    bucket: int,
+):
     """Host-side per-bucket inputs for a batch of images with merged grids (h, w)."""
     rows = sum(h * w * merge * merge + 1 for h, w in grid)
     if rows > bucket:
@@ -187,7 +203,9 @@ def vision_metadata(grid: tuple[tuple[int, int], ...], *, merge: int, head_dim: 
     angles = torch.zeros(bucket, head_dim // 2)
     segments = torch.full((bucket,), len(grid), dtype=torch.int32)
     merge_order = []
-    frequencies = 1.0 / (10000 ** (torch.arange(0, head_dim, 4, dtype=torch.float32) / head_dim))
+    frequencies = 1.0 / (
+        10000 ** (torch.arange(0, head_dim, 4, dtype=torch.float32) / head_dim)
+    )
     offset = 0
     for image, (h, w) in enumerate(grid):
         height, width = h * merge, w * merge
@@ -198,7 +216,10 @@ def vision_metadata(grid: tuple[tuple[int, int], ...], *, merge: int, head_dim: 
         wy[start : start + count] = _interp_weights(y, height, posemb_grid)
         wx[start : start + count] = _interp_weights(x, width, posemb_grid)
         angles[start : start + count] = torch.cat(
-            ((x + 1).float()[:, None] * frequencies, (y + 1).float()[:, None] * frequencies),
+            (
+                (x + 1).float()[:, None] * frequencies,
+                (y + 1).float()[:, None] * frequencies,
+            ),
             dim=-1,
         )
         cls_mask[offset] = 1
@@ -207,7 +228,9 @@ def vision_metadata(grid: tuple[tuple[int, int], ...], *, merge: int, head_dim: 
             for ww in range(w):
                 for dy in range(merge):
                     for dx in range(merge):
-                        merge_order.append(start + (hh * merge + dy) * width + ww * merge + dx)
+                        merge_order.append(
+                            start + (hh * merge + dy) * width + ww * merge + dx
+                        )
         offset = start + count
     merged_bucket = bucket // (merge * merge)
     merge_order += [bucket - 1] * (merged_bucket * merge * merge - len(merge_order))
@@ -221,13 +244,23 @@ def vision_metadata(grid: tuple[tuple[int, int], ...], *, merge: int, head_dim: 
     )
 
 
-def prepare_vision_input(patches: torch.Tensor, grid: list[tuple[int, int]], *, patch_size: int, merge: int, head_dim: int, posemb_grid: int):
+def prepare_vision_input(
+    patches: torch.Tensor,
+    grid: list[tuple[int, int]],
+    *,
+    patch_size: int,
+    merge: int,
+    head_dim: int,
+    posemb_grid: int,
+):
     """Host preprocessing of the processor's [N, T, 40, 40, 3] bf16 patches into one bucket.
 
     Returns the encoder's positional inputs and the merged-token count.
     """
     if patches.device.type != "cpu":
-        raise ValueError("Inkling2 vision preprocessing keeps image patches on the host")
+        raise ValueError(
+            "Inkling2 vision preprocessing keeps image patches on the host"
+        )
     mean = torch.tensor(_CLIP_MEAN, dtype=torch.float32).reshape(1, 1, 1, 1, 3)
     std = torch.tensor(_CLIP_STD, dtype=torch.float32).reshape(1, 1, 1, 1, 3)
     # Reference: renormalize in the patch dtype, average the temporal copies, NCHW.
@@ -236,13 +269,19 @@ def prepare_vision_input(patches: torch.Tensor, grid: list[tuple[int, int]], *, 
     rows = []
     for image, (h, w) in zip(x.split([h * w for h, w in grid]), grid):
         native = image.reshape(h, w, 3, merge, patch_size, merge, patch_size)
-        native = native.permute(0, 3, 1, 5, 4, 6, 2).reshape(-1, patch_size * patch_size * 3)
+        native = native.permute(0, 3, 1, 5, 4, 6, 2).reshape(
+            -1, patch_size * patch_size * 3
+        )
         rows.append(native.new_zeros((1, native.shape[1])))
         rows.append(native)
     pixels = torch.cat(rows)
     bucket = row_bucket(pixels.shape[0])
     pixels = F.pad(pixels, (0, 0, 0, bucket - pixels.shape[0]))
     meta = vision_metadata(
-        tuple(grid), merge=merge, head_dim=head_dim, posemb_grid=posemb_grid, bucket=bucket
+        tuple(grid),
+        merge=merge,
+        head_dim=head_dim,
+        posemb_grid=posemb_grid,
+        bucket=bucket,
     )
     return (pixels, *meta), sum(h * w for h, w in grid)

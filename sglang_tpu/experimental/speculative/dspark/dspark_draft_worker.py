@@ -24,7 +24,9 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang_tpu.experimental.compilation.block_compile_policy import block_draft_width
 from sglang_tpu.experimental.speculative.block_draft_worker import (
+    DraftLattice,
     DraftSampler,
+    SampledDrafts,
     TpuBlockDraftWorker,
     target_input_embedding,
 )
@@ -67,11 +69,20 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
             target_hf_text_config=target_model_config.hf_text_config,
         )
 
-    def alloc_memory_pool(self, memory_pool_config=None, req_to_token_pool=None, token_to_kv_pool_allocator=None) -> None:
-        super().alloc_memory_pool(memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator)
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ) -> None:
+        super().alloc_memory_pool(
+            memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator
+        )
         if self._recurrent_draft is not None:
             # One recurrent seed per request pool row.
-            self._recurrent_draft.allocate_f_rnn(req_to_token_pool.req_to_token.shape[0])
+            self._recurrent_draft.allocate_f_rnn(
+                req_to_token_pool.req_to_token.shape[0]
+            )
 
     def seed_recurrent_context(
         self,
@@ -115,9 +126,11 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
         *,
         block_hidden: torch.Tensor,
         bonus_tokens: torch.Tensor,
+        draft_lattice: DraftLattice | None,
         sampler: DraftSampler,
         req_pool_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> SampledDrafts:
+        del draft_lattice
         # Anchor drafts read all gamma rows; the rest drop the anchor row, so
         # draft_hidden[:, j - 1] predicts d_j at position n + j.
         bs = block_hidden.shape[0]
@@ -135,7 +148,7 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
             f_rnn = self._recurrent_draft.f_rnn_buf.index_select(
                 0, req_pool_indices.view(-1)[:bs].long()
             )
-        return draft_model.markov_head.sample_block(
+        draft_tokens, draft_logits = draft_model.markov_head.sample_block(
             base_logits.view(bs, self.num_drafts, -1),
             first_prev_tokens=bonus_tokens,
             hidden_states=draft_hidden,
@@ -143,6 +156,7 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
             collect_corrected=True,
             f_rnn=f_rnn,
         )
+        return SampledDrafts(draft_tokens, draft_logits, None)
 
 
 def _attach_target_vocab(

@@ -7,8 +7,8 @@ tensors. TPU keeps per-layer kernel-layout tensors (and, for sparse MLA, several
 page buffers per layer), which only a DMA engine copies as they are. This
 strategy, registered ahead of the built-in ones, builds the same pool entries
 with TPU DMA host pools and ``TpuDMAHybridCacheController``. A hybrid SWA model
-with mamba-pool state (Inkling2's conv streams) gets the same over its KV + SWA +
-state stack, with a speculative draft's KV packed onto the KV and SWA pages.
+with mamba-pool state gets the same over its KV + SWA + state stack, with a
+speculative draft's KV packed onto the KV and SWA pages.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class TpuDmaMambaStrategy(hybrid_pool_assembler.MambaStrategy):
         return _dma_mamba_host_pool(mamba_pool=mamba_pool, host_size=host_size)
 
 
-class TpuDmaMambaSwaStrategy(hybrid_pool_assembler.MambaSwaStrategy):
+class TpuDmaMambaSwaStrategy(hybrid_pool_assembler._MambaSwaStrategy):
     """KV + SWA + state host stack of an ``SWAKVPool`` model, under a DMA
     ``--hicache-io-backend``; every TPU mamba pool is a ``TpuMambaPool``."""
 

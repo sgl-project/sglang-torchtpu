@@ -93,8 +93,7 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                         platform_cls().validate_mamba_prefix_cache(view)
 
     def test_kda_models_write_checkpoints(self):
-        """KDA runs the GDN kernel with the same snapshot plan; GLM-5.3-Flash waits
-        for the per-page kpool layout this branch lacks."""
+        """KDA runs the GDN kernel with the same snapshot plan; its MLA draft does not."""
         glm_text = SimpleNamespace()
         cases = (
             (SimpleNamespace(hf_config=KimiLinearConfig(), is_draft_model=False), True),
@@ -107,7 +106,7 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                     ),
                     is_draft_model=False,
                 ),
-                False,
+                True,
             ),
             (
                 SimpleNamespace(

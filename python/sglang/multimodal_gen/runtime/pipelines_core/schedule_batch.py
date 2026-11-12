@@ -266,7 +266,8 @@ class Req:
                 f"'{type(self).__name__}' object has no attribute '{name}'"
             )
 
-        sampling_params = object.__getattribute__(self, "sampling_params")
+        # __dict__ rather than object.__getattribute__, which dynamo cannot trace.
+        sampling_params = self.__dict__.get("sampling_params")
         if sampling_params is not None and hasattr(sampling_params, name):
             return getattr(sampling_params, name)
 

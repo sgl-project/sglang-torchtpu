@@ -13,5 +13,7 @@ def pallas_moe_activation(activation: str, layer: torch.nn.Module) -> str:
     config = layer.moe_runner_config
     if config.gemm1_alpha is None:
         raise ValueError("SiTU MoE requires gemm1_alpha (SiTU beta).")
-    linear_beta = "none" if config.gemm1_clamp_limit is None else config.gemm1_clamp_limit
+    linear_beta = (
+        "none" if config.gemm1_clamp_limit is None else config.gemm1_clamp_limit
+    )
     return f"situ:{config.gemm1_alpha}:{linear_beta}"

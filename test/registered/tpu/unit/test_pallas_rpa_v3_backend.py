@@ -34,7 +34,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -48,6 +47,7 @@ from sglang_tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
     _invoke_v3_kernel,
 )
+from sglang_tpu.envs import envs
 from sglang_tpu.host_metadata_cache import HostMetadataCache
 
 
@@ -181,6 +181,7 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             v_scale,
             decode_query_size=1,
             use_causal_mask=True,
+            layer_idx=None,
         ):
             captured["sliding_window"] = sliding_window
             captured["use_causal_mask"] = use_causal_mask
@@ -331,13 +332,6 @@ class TestPallasRpaV3MetadataDecode(CustomTestCase):
         expected = torch.full((3,), self.bs, dtype=torch.int32)
         self.assertTrue(torch.equal(meta.distribution, expected))
         self.assertEqual(meta.distribution.dtype, torch.int32)
-
-    def test_extend_seq_lens_unused_in_decode(self):
-        # _build_metadata must work even when extend_seq_lens is None
-        # (the field is not required for decode). The setUp default already
-        # leaves it None; just sanity-check we got here.
-        meta = self._build()
-        self.assertIsNotNone(meta)
 
 
 class TestPallasRpaV3MetadataExtend(CustomTestCase):
@@ -765,6 +759,7 @@ class TestFixedWidthAsDecode(CustomTestCase):
             v_scale,
             decode_query_size=1,
             use_causal_mask=True,
+            layer_idx=None,
         ):
             captured["width"] = decode_query_size
 

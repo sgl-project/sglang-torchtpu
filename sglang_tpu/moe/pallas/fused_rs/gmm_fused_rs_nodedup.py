@@ -25,7 +25,6 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.envs import envs as tpu_envs
-
 from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
     Dimensions,
     FusedDims,
@@ -606,16 +605,16 @@ def kernel_main_fused_rs(
     def sync_barrier_signal():
         barrier_sem = pltpu.get_barrier_semaphore()
         for i in range(ep_size):
-            pltpu.semaphore_signal(
+            pl.semaphore_signal(
                 barrier_sem,
                 device_id={ep_axis_name: jnp.int32(i)},
-                device_id_type=pltpu.DeviceIdType.MESH,
+                device_id_type=pl.DeviceIdType.MESH,
             )
 
     @jax.named_scope("sync_barrier_wait")
     def sync_barrier_wait():
         barrier_sem = pltpu.get_barrier_semaphore()
-        pltpu.semaphore_wait(barrier_sem, ep_size)
+        pl.semaphore_wait(barrier_sem, ep_size)
 
     def sync_barrier():
         sync_barrier_signal()
@@ -742,6 +741,15 @@ def kernel_main_fused_rs(
         w2_packed = w2_ref.bitcast(jnp.uint32)
     else:
         w2_packed = w2_ref
+    if w1_ref.ndim == 4:
+        # Stacked layers (Muse megakernel expert groups): group_offset[1] is the layer.
+        _layer_idx = group_offset_ref[1]
+        w1_packed = w1_packed.at[_layer_idx]
+        w2_packed = w2_packed.at[_layer_idx]
+        if w1_scale_ref is not None:
+            w1_scale_ref = w1_scale_ref.at[_layer_idx]
+        if w2_scale_ref is not None:
+            w2_scale_ref = w2_scale_ref.at[_layer_idx]
 
     num_k1 = dims.size_k1 // tile_k1
     num_k2 = dims.size_k2 // tile_k2
@@ -965,7 +973,9 @@ def kernel_main_fused_rs(
             cfgs2, tiles=dataclasses.replace(cfgs2.tiles, tile_m=m_rows)
         )
         if m_rows < dims.size_lhs_sublane:
-            lhs_data = intermediate_ref[0, pl.ds(0, m_rows), pl.ds(k_id * tile_k2, tile_k2)]
+            lhs_data = intermediate_ref[
+                0, pl.ds(0, m_rows), pl.ds(k_id * tile_k2, tile_k2)
+            ]
         else:
             lhs_data = intermediate_ref[
                 pl.ds(0, m_rows // dims.size_lhs_sublane),
@@ -1028,7 +1038,9 @@ def kernel_main_fused_rs(
     # them slow every tile (NVFP4 EP8 microbench: buckets 16/32/64/128 -> 16/128 took the
     # 8192-token call from 7.7 to 5.5 ms and 64 tokens from 1.8 to 0.7 ms). Default: the
     # sublane bucket, the block-diagonal bucket when enabled, and the full tile.
-    M_BUCKETS = sorted({b for b in (_blockdiag_rows, _sls_b, tile_m) if 0 < b <= tile_m})
+    M_BUCKETS = sorted(
+        {b for b in (_blockdiag_rows, _sls_b, tile_m) if 0 < b <= tile_m}
+    )
     # fp4-only gate. Bucketing materializes a separate f32 matmul accumulator
     # (~0.7MB) per lax.switch branch. That headroom only exists with fp4 weights
     # (0.5 B/param); fp8 (1 B) / bf16 (2 B) weight buffers are 2-4x larger and, on
@@ -1041,6 +1053,7 @@ def kernel_main_fused_rs(
         keep = {int(b) for b in only.split(",") if b}
         M_BUCKETS = [b for b in M_BUCKETS if b in keep or b == tile_m]
     _USE_BUCKETS = len(M_BUCKETS) > 1 and _weight_is_fp4
+
     # --- Main padded gm loop ---
     @jax.named_scope("wait_staging_slot_writes")
     def wait_staging_slot_writes(slot):
@@ -1641,7 +1654,7 @@ def kernel_main_fused_rs(
                                 send_sem=send_sems_ref.at[stg_id],
                                 recv_sem=recv_sem_ref.at[0],
                                 device_id={ep_axis_name: target_device_id},
-                                device_id_type=pltpu.DeviceIdType.MESH,
+                                device_id_type=pl.DeviceIdType.MESH,
                             ).start()
                             if fp8_direct_write:
                                 pltpu.make_async_remote_copy(
@@ -1652,7 +1665,7 @@ def kernel_main_fused_rs(
                                     send_sem=scale_send_sems_ref.at[stg_id],
                                     recv_sem=scale_recv_sem_ref.at[0],
                                     device_id={ep_axis_name: target_device_id},
-                                    device_id_type=pltpu.DeviceIdType.MESH,
+                                    device_id_type=pl.DeviceIdType.MESH,
                                 ).start()
 
                         @pl.when(is_local)
@@ -1686,7 +1699,7 @@ def kernel_main_fused_rs(
                                 send_sem=send_sems_ref.at[stg_id],
                                 recv_sem=recv_sem_ref.at[0],
                                 device_id={ep_axis_name: target_device_id},
-                                device_id_type=pltpu.DeviceIdType.MESH,
+                                device_id_type=pl.DeviceIdType.MESH,
                             ).start()
 
                         @pl.when(is_local)
@@ -2068,6 +2081,7 @@ def _ep_run_write_metadata(
         "staging_slots",
         "pair_exchange",
         "ep_run_write",
+        "fp4_w4a16",
     ],
 )
 def gmm_v2_fused_rs(
@@ -2104,6 +2118,7 @@ def gmm_v2_fused_rs(
     staging_slots: int = 3,
     pair_exchange: bool = False,
     ep_run_write: bool = False,
+    fp4_w4a16: bool = False,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -2118,12 +2133,15 @@ def gmm_v2_fused_rs(
     ``tiled_output``: return the bf16 result in the kernel's own
     (rows, size_n2 // 128, 128) layout when N2 is unpadded, so a row-split
     reduction can read it without a relayout copy.
+    ``fp4_w4a16``: block-256 fp4 experts take bf16 rows, each block's scale applied
+    after its dot (requantized NVFP4), instead of fp8-quantized rows.
 
     Output: (chunk_size * top_k, size_n2) per chip — raw expert contributions.
     Post-kernel reduction applies topk_weights and sums over top_k dim.
     """
-    size_group, size_k1, size_n1 = w1.shape
-    _, size_k2, size_n2 = w2.shape
+    stacked = w1.ndim == 4
+    size_group, size_k1, size_n1 = w1.shape[1:] if stacked else w1.shape
+    _, size_k2, size_n2 = w2.shape[1:] if stacked else w2.shape
     size_m = lhs_indices.shape[0]
     chunk_size = output_size // ep_size
     # Rows the kernel indexes; tile selection keeps the global size_m to match
@@ -2133,8 +2151,10 @@ def gmm_v2_fused_rs(
     is_quantized = w1_scale is not None
     if is_quantized:
         assert w2_scale is not None
-        rhs1_quant_block_size = recover_quant_block_size(size_k1, w1_scale.shape[1])
-        rhs2_quant_block_size = recover_quant_block_size(size_k2, w2_scale.shape[1])
+        w1s_shape = w1_scale.shape[1:] if stacked else w1_scale.shape
+        w2s_shape = w2_scale.shape[1:] if stacked else w2_scale.shape
+        rhs1_quant_block_size = recover_quant_block_size(size_k1, w1s_shape[1])
+        rhs2_quant_block_size = recover_quant_block_size(size_k2, w2s_shape[1])
         quant_block_size = rhs1_quant_block_size
         # Scales stay in their stored dtype when it is bf16 or fp32: the matmul
         # casts each tile slice, while a full-tensor cast here would re-copy
@@ -2146,12 +2166,12 @@ def gmm_v2_fused_rs(
         )
         w1_scale = w1_scale.astype(scale_dtype)
         w2_scale = w2_scale.astype(scale_dtype)
-        if w1_scale.ndim != w2_scale.ndim or w1_scale.ndim not in (3, 4):
+        if len(w1s_shape) != len(w2s_shape) or len(w1s_shape) not in (3, 4):
             raise ValueError(
                 "fused-RS scales must both be [E, K_blocks, N] or "
                 f"[E, K_blocks, 1, N], got {w1_scale.shape} and {w2_scale.shape}"
             )
-        scale_has_unit_dim = w1_scale.ndim == 4
+        scale_has_unit_dim = len(w1s_shape) == 4
     else:
         rhs1_quant_block_size = size_k1
         rhs2_quant_block_size = size_k2
@@ -2261,16 +2281,18 @@ def gmm_v2_fused_rs(
         hidden_states = jnp.pad(hidden_states, ((0, 0), (0, k_pad)))
 
     # Pad N1 (and propagate to K2 since GMM2's K is GMM1's intermediate size).
+    lead_pads = ((0, 0),) if stacked else ()
+    s_axis = 2 if stacked else 1
     if aligned_n1 != size_n1:
         n1_pad = aligned_n1 - size_n1
-        w1 = jnp.pad(w1, ((0, 0), (0, 0), (0, n1_pad)))
+        w1 = jnp.pad(w1, lead_pads + ((0, 0), (0, 0), (0, n1_pad)))
         if is_quantized:
             w1_scale = jnp.pad(
                 w1_scale, ((0, 0),) * (w1_scale.ndim - 1) + ((0, n1_pad),)
             )
         new_k2 = aligned_n1 // 2
         if new_k2 != size_k2:
-            w2 = jnp.pad(w2, ((0, 0), (0, new_k2 - size_k2), (0, 0)))
+            w2 = jnp.pad(w2, lead_pads + ((0, 0), (0, new_k2 - size_k2), (0, 0)))
             size_k2 = new_k2
         size_n1 = aligned_n1
 
@@ -2284,31 +2306,31 @@ def gmm_v2_fused_rs(
     if is_quantized:
         nqb1 = -(-tile_k1 // rhs1_quant_block_size)
         total_scale_blocks1 = (size_k1 // tile_k1) * nqb1
-        if w1_scale.shape[1] < total_scale_blocks1:
+        if w1_scale.shape[s_axis] < total_scale_blocks1:
             w1_scale = jnp.concatenate(
                 [
                     w1_scale,
                     jnp.repeat(
-                        w1_scale[:, -1:],
-                        total_scale_blocks1 - w1_scale.shape[1],
-                        axis=1,
+                        w1_scale[:, :, -1:] if stacked else w1_scale[:, -1:],
+                        total_scale_blocks1 - w1_scale.shape[s_axis],
+                        axis=s_axis,
                     ),
                 ],
-                axis=1,
+                axis=s_axis,
             )
         nqb2 = -(-tile_k2 // rhs2_quant_block_size)
         total_scale_blocks2 = (size_k2 // tile_k2) * nqb2
-        if w2_scale.shape[1] < total_scale_blocks2:
+        if w2_scale.shape[s_axis] < total_scale_blocks2:
             w2_scale = jnp.concatenate(
                 [
                     w2_scale,
                     jnp.repeat(
-                        w2_scale[:, -1:],
-                        total_scale_blocks2 - w2_scale.shape[1],
-                        axis=1,
+                        w2_scale[:, :, -1:] if stacked else w2_scale[:, -1:],
+                        total_scale_blocks2 - w2_scale.shape[s_axis],
+                        axis=s_axis,
                     ),
                 ],
-                axis=1,
+                axis=s_axis,
             )
     else:
         total_scale_blocks1 = 0
@@ -2364,6 +2386,18 @@ def gmm_v2_fused_rs(
         and jnp.dtype(w1.dtype) == jnp.float4_e2m1fn
         and tpu_envs.SGLANG_TPU_FUSED_RS_FP4_W4A8.get()
     )
+    if fp4_w4a16 and not (
+        is_quantized
+        and jnp.dtype(w1.dtype) == jnp.dtype(w2.dtype) == jnp.float4_e2m1fn
+        and rhs1_quant_block_size == lhs1_quant_block_size == 256
+        and rhs2_quant_block_size == lhs2_quant_block_size == 256
+    ):
+        raise ValueError(
+            "fp4_w4a16 takes block-256 fp4 experts; got "
+            f"{w1.dtype} / {w2.dtype}, rhs blocks {rhs1_quant_block_size} / "
+            f"{rhs2_quant_block_size}, lhs blocks {lhs1_quant_block_size} / "
+            f"{lhs2_quant_block_size}"
+        )
 
     cfgs1 = GmmConfigs(
         dims=Dimensions(
@@ -2379,6 +2413,7 @@ def gmm_v2_fused_rs(
             quant_dtype=(
                 jnp.float8_e4m3fn.dtype
                 if is_quantized
+                and not fp4_w4a16
                 and (
                     _force_w4a8
                     or get_maybe_quantize_lhs(
@@ -2419,6 +2454,7 @@ def gmm_v2_fused_rs(
             quant_dtype=(
                 jnp.float8_e4m3fn.dtype
                 if is_quantized
+                and not fp4_w4a16
                 and (
                     _force_w4a8
                     or get_maybe_quantize_lhs(

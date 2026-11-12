@@ -334,6 +334,9 @@ class CompiledFunction:
 
     def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
         queue = current_warmup_queue()
+        if queue is not None and queue.verify and not self._spmd_safe:
+            # Verification compares shared model graphs and never runs these helpers.
+            return PendingCall(lambda: None)
         if self._spmd_safe and queue is not None and queue.spmd_compiler is not None:
             # Snapshot reused containers while retaining their local tensor buffers.
             args, kwargs = tree_util.tree_map(lambda value: value, (args, kwargs))
@@ -344,8 +347,12 @@ class CompiledFunction:
         self, *args: Any, async_compile: bool = False, **kwargs: Any
     ) -> PendingCall:
         """Compile without executing; shared input binding completes at queue join."""
-        queue = current_warmup_queue() if self._spmd_safe else None
-        shared = queue is not None and queue.spmd_compiler is not None
+        queue = current_warmup_queue()
+        if queue is not None and queue.verify and not self._spmd_safe:
+            return PendingCall(lambda: None)
+        shared = (
+            self._spmd_safe and queue is not None and queue.spmd_compiler is not None
+        )
         # Shared compilation validates real input layouts on every rank.
         if async_compile and not shared:
             tensors = [
@@ -357,7 +364,7 @@ class CompiledFunction:
                 # Submit eager input preparation without waiting for buffers.
                 # Symbolic arguments keep layout queries from blocking compilation.
                 synchronize(tensors, wait=False)
-                args, kwargs = tree_util.tree_map(
+                args, placeholders = tree_util.tree_map(
                     lambda value: (
                         tpu_torch_compile.placeholder_like(value)
                         if _is_tpu_tensor(value)
@@ -365,6 +372,8 @@ class CompiledFunction:
                     ),
                     (args, kwargs),
                 )
+                # tree_map sorts dict keys; keep the caller's keyword order.
+                kwargs = {name: placeholders[name] for name in kwargs}
         artifact = self._get_artifact(args, kwargs, async_compile=async_compile)
         return PendingCall(artifact.wait_for_compile)
 
@@ -414,6 +423,7 @@ class CompiledFunction:
             )
             if spmd_compiler is not None:
                 spmd_compiler.enqueue(graph)
+            trace_start = time.perf_counter()
             artifact = self._compile(
                 args,
                 kwargs,
@@ -421,6 +431,12 @@ class CompiledFunction:
                 spmd_compiler=spmd_compiler,
                 graph=graph,
             )
+            if (
+                spmd_compiler is not None
+                and not spmd_compiler.verify_spmd_safe
+                and spmd_compiler.submissions[graph].owner == spmd_compiler.rank
+            ):
+                spmd_compiler.record_trace(graph, time.perf_counter() - trace_start)
             self.cache[key] = artifact
         return artifact
 
@@ -804,9 +820,9 @@ class CompiledFunction:
                         result_tensors,
                         graph_inputs,
                         argument_layouts=argument_layouts,
-                        donated_inputs=donated_inputs,
                         interface=interface,
                         graph=graph,
+                        donated_inputs=donated_inputs,
                     )
             logger.info(
                 "[direct_compile] native async submission %.3fs",

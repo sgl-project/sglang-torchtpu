@@ -27,7 +27,15 @@ MIN_TOKENS = 512
 _VMEM_LIMIT = 56 * 1024 * 1024
 
 
-def _kernel(*refs, n: int, nq: int, has_addend: bool, normalize: bool, eps_res: float, eps_norm: float):
+def _kernel(
+    *refs,
+    n: int,
+    nq: int,
+    has_addend: bool,
+    normalize: bool,
+    eps_res: float,
+    eps_norm: float,
+):
     src_refs = refs[:n]
     pos = n
     add_ref = refs[pos] if has_addend else None
@@ -47,13 +55,17 @@ def _kernel(*refs, n: int, nq: int, has_addend: bool, normalize: bool, eps_res: 
         r = jax.lax.rsqrt(jnp.mean(v * v, axis=-1, keepdims=True) + eps_res)
         inv.append(r)
         for q in range(nq):
-            logits[q].append(jnp.sum(v * queries[q : q + 1, :], axis=-1, keepdims=True) * r)
+            logits[q].append(
+                jnp.sum(v * queries[q : q + 1, :], axis=-1, keepdims=True) * r
+            )
     probs = []
     for q in range(nq):
         m = functools.reduce(jnp.maximum, logits[q])
         exps = [jnp.exp(lg - m) for lg in logits[q]]
         total = functools.reduce(jnp.add, exps)
-        probs.append([e / total * r if normalize else e / total for e, r in zip(exps, inv)])
+        probs.append(
+            [e / total * r if normalize else e / total for e, r in zip(exps, inv)]
+        )
     accs = [None] * nq
     for j in range(n):
         v = load(j)
@@ -91,7 +103,13 @@ def attn_res_norm_jax(
     vec_spec = pl.BlockSpec((nq, hidden), lambda i: (0, 0))
     return pl.pallas_call(
         functools.partial(
-            _kernel, n=n, nq=nq, has_addend=has_addend, normalize=normalize, eps_res=eps_res, eps_norm=eps_norm
+            _kernel,
+            n=n,
+            nq=nq,
+            has_addend=has_addend,
+            normalize=normalize,
+            eps_res=eps_res,
+            eps_norm=eps_norm,
         ),
         out_shape=jax.ShapeDtypeStruct((nq, tokens, hidden), jnp.bfloat16),
         grid=(tokens // tile,),
@@ -135,9 +153,17 @@ def register_inkling2_attn_res_op():
             eps_res: float,
             eps_norm: float,
         ) -> jax.Array:
-            sources = [s for s in (s0, s1, s2, s3, s4, s5, s6, s7, s8, s9) if s is not None]
+            sources = [
+                s for s in (s0, s1, s2, s3, s4, s5, s6, s7, s8, s9) if s is not None
+            ]
             return attn_res_norm_jax(
-                sources, addend, queries, norm_weights, normalize=normalize, eps_res=eps_res, eps_norm=eps_norm
+                sources,
+                addend,
+                queries,
+                norm_weights,
+                normalize=normalize,
+                eps_res=eps_res,
+                eps_norm=eps_norm,
             )
 
         _OP = cpu_export_jax_op("sglang_tpu_pallas::inkling2_attn_res_norm", _op)
@@ -145,7 +171,11 @@ def register_inkling2_attn_res_op():
 
 
 def supports_attn_res_norm(tokens: int, num_sources: int) -> bool:
-    return tokens >= MIN_TOKENS and tokens % _TILE_TOKENS == 0 and num_sources <= MAX_SOURCES
+    return (
+        tokens >= MIN_TOKENS
+        and tokens % _TILE_TOKENS == 0
+        and num_sources <= MAX_SOURCES
+    )
 
 
 def attn_res_norm_tpu(

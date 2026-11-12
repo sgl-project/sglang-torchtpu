@@ -65,7 +65,9 @@ class TestEpRunWriteMetadata(CustomTestCase):
             group_offset = group_offset.reshape(-1)
             sizes = jnp.asarray(group_sizes)
             local_start = jnp.sum(
-                jnp.where(jnp.arange(EXPERTS, dtype=jnp.int32) < group_offset[0], sizes, 0)
+                jnp.where(
+                    jnp.arange(EXPERTS, dtype=jnp.int32) < group_offset[0], sizes, 0
+                )
             )
             gs = _precompute_fused_rs_metadata(
                 sizes,
@@ -95,7 +97,9 @@ class TestEpRunWriteMetadata(CustomTestCase):
 
         offsets = jnp.arange(EP, dtype=jnp.int32)[:, None] * LOCAL_E
         fn = jax.jit(
-            jax.shard_map(body, mesh=mesh, in_specs=P("ep"), out_specs=P("ep"), check_vma=False)
+            jax.shard_map(
+                body, mesh=mesh, in_specs=P("ep"), out_specs=P("ep"), check_vma=False
+            )
         )
         meta = np.asarray(fn(jax.device_put(offsets, NamedSharding(mesh, P("ep")))))
         return meta, num_slots
@@ -134,7 +138,9 @@ class TestEpRunWriteMetadata(CustomTestCase):
             np.testing.assert_array_equal(
                 written[d], np.flatnonzero(lhs_indices // CHUNK == d)
             )
-            self.assertEqual(int(meta[d][2]), int(pieces_to[:, d].sum() - pieces_to[d, d]))
+            self.assertEqual(
+                int(meta[d][2]), int(pieces_to[:, d].sum() - pieces_to[d, d])
+            )
         return pieces_to
 
     def test_random_routings(self):

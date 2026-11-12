@@ -26,6 +26,7 @@ class TestHiddenStateServerMode(CustomTestCase):
         manager.allow_auto_truncate = False
         manager.validate_total_tokens = False
         manager.is_generation = True
+        manager.model_config = SimpleNamespace(vocab_size=128)
         manager.server_args = SimpleNamespace(enable_custom_logit_processor=False)
         manager._validate_token_ids_logprob = Mock()
         return manager
