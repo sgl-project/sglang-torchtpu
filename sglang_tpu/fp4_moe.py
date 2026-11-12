@@ -168,8 +168,10 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         ("attn_dp_size == 1", parallel.attn_dp_size == 1),
         ("gated MoE", runner_config.is_gated),
         (
-            "silu activation",
-            runner_config.activation in ("silu", "silu_and_mul_clamp"),
+            "silu or clamped SwiGLU activation",
+            # The fused GMM also implements canonical clamped SwiGLU
+            # (swigluoai, as in GPT-OSS), so such layers can use fused-RS.
+            runner_config.activation in ("silu", "silu_and_mul_clamp", "swigluoai"),
         ),
         (
             "router weight not applied on input",
