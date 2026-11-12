@@ -48,12 +48,15 @@ FP8_MAX = 448.0
 CHUNK = 512  # rows of a streamed weight chunk (wq_b's contraction rows, d_wks / d_wpt blocks)
 
 
-def ring() -> int:
-    """Chunk slots of the weight stream (``KernelConfig.dsa_weight_ring``)."""
+def ring(batch: int = 1) -> int:
+    """Chunk slots of the weight stream: ``KernelConfig.dsa_weight_ring`` up to 8
+    rows, at most 6 up to 16, else 3 (the wider verifies' decode VMEM is full)."""
     from sglang_tpu.k3_programs.kimi_k3.config import active
 
     config = active()
-    return max(2, config.dsa_weight_ring) if config is not None else 3
+    if config is None or batch > 16:
+        return 3
+    return max(2, config.dsa_weight_ring if batch <= 8 else min(config.dsa_weight_ring, 6))
 LANES = dsa_dcp.LANES
 RECORD_SHAPE = (2, LANES)  # key bytes | UE8M0 byte in lane 0 (int32 lanes)
 
@@ -165,8 +168,8 @@ def scoped_scratch(batch, *, hidden, index_block_shape, key_rows, page_tokens, s
     if hidden % CHUNK:
         raise ValueError(f"hidden size {hidden} is not a multiple of {CHUNK}")
     return {
-        "weight_ring": pltpu.VMEM((ring(), CHUNK, DIM), jnp.bfloat16),  # wq_b, then wk / weights_proj chunks
-        "ring_sems": pltpu.SemaphoreType.DMA((ring(),)),
+        "weight_ring": pltpu.VMEM((ring(batch), CHUNK, DIM), jnp.bfloat16),  # wq_b, then wk / weights_proj chunks
+        "ring_sems": pltpu.SemaphoreType.DMA((ring(batch),)),
         "knorm": pltpu.VMEM((2, DIM), jnp.bfloat16),
         "knorm_sem": pltpu.SemaphoreType.DMA((1,)),
         "q8": pltpu.VMEM((batch, HEADS, DIM), jnp.float8_e4m3fn),

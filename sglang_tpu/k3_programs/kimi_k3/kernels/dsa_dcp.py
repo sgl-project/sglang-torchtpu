@@ -116,8 +116,9 @@ POSITION_BITS = 24
 KEY_SHIFTS = tuple(range(32 - DIGIT_BITS, -1, -DIGIT_BITS))  # 8 rounds
 POSITION_SHIFTS = tuple(range(POSITION_BITS - DIGIT_BITS, -1, -DIGIT_BITS))  # 6 rounds (ties only)
 CHUNK_ROWS = 64  # key rows (of 128 tokens) a counting step reads (from WIDE_CHUNK_BATCH rows)
-WIDE_CHUNK_BATCH = 64
-WIDE_CHUNK_ROWS = 128  # below that many rows: a long-context row's keys in one step a round
+WIDE_CHUNK_BATCH = 64  # below that many rows the count passes read 8 rows a step
+WIDE_CHUNK_ROWS = 128  # below WIDE_CHUNK_MAX_BATCH rows: a long-context row's keys in one step a round
+WIDE_CHUNK_MAX_BATCH = 16  # from 16 rows the decode VMEM is full (the gather finish, weight ring)
 # DMA ring depths: a page or chunk step computes little, so several copies stay
 # in flight (one HBM -> VMEM copy is ~0.9 us; a ring of two waits on each).
 PAGE_SLOTS = 4  # index pages (scoring)
@@ -144,7 +145,7 @@ def _scope(name):
 def chunk_rows(batch: int) -> int:
     """Key rows a counting step reads (a step's overhead outweighs its rows; the
     wider chunk's ring needs VMEM the widest batches lack)."""
-    return WIDE_CHUNK_ROWS if batch < WIDE_CHUNK_BATCH else CHUNK_ROWS
+    return WIDE_CHUNK_ROWS if batch < WIDE_CHUNK_MAX_BATCH else CHUNK_ROWS
 
 
 def ring_slots(batch: int) -> tuple[int, int]:
@@ -153,6 +154,26 @@ def ring_slots(batch: int) -> tuple[int, int]:
 COUNT_ROWS = 16  # candidate sublanes of the count exchange
 BINS = 16  # a round's digit values (DIGIT_BITS = 4)
 _PREFIX, _UPPER, _LOWER, _POSITION, _LIMIT = range(5)  # state rows (lanes: batch rows)
+# Gather finish (KernelConfig.dsa_gather_finish): once every row's threshold bin
+# holds at most GATHER_SLOTS keys over the group, each rank sends its keys in the
+# bin (with their positions) and every rank finishes the rounds on them locally.
+GATHER_SLOTS = 16
+GATHER_MAX_BATCH = 16  # its exchange buffer is group x rows x 128 words of VMEM
+GATHER_FROM_ROUND = 3  # the last key round before the first check (16 bits resolved)
+
+
+def gather_finish(batch: int) -> bool:
+    """Whether a ``batch``-row selection uses the gather finish."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    config = active()
+    return bool(config is not None and config.dsa_gather_finish and batch <= GATHER_MAX_BATCH)
+
+
+def gather_rows(batch: int) -> int:
+    """Sublanes of a rank's candidates: row ``b``'s keys at sublane ``b``, lanes
+    ``0 .. GATHER_SLOTS - 1``, their positions at lanes ``GATHER_SLOTS ..``."""
+    return -(-batch // 8) * 8
 
 
 def key_rows_for(pages: int, page_tokens: int, span: int = 1) -> int:
@@ -283,6 +304,7 @@ class IndexSelect:
             refs["chunk_starts"][b] = chunk_start
             chunk_start = chunk_start + (count * self.subpages + self.chunk - 1) // self.chunk
             state = jnp.where((lane == b) & (sub == _LIMIT), limit, state)
+            state = jnp.where((lane == b) & (sub == _LOWER), INT_MAX, state)  # no bin yet
             # Scoring steps go by sequence (its rows share their pages): its
             # longest row's page count.
             seq_count = count if b % self.S == 0 else jnp.maximum(seq_count, count)
@@ -802,76 +824,299 @@ class IndexSelect:
         for b in range(self.batch):
             self.refs[name][b] = _row_scalar(vector, b)
 
-    def select(self):
-        """The rounds; ``tau`` / ``p_tie`` per row into SMEM."""
-        refs, topk = self.refs, self.topk
-        cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
-        parity = 0
-        for round_, shift in enumerate(KEY_SHIFTS):
-            self._row_scalars(_PREFIX, "row_prefix")
-
-            def key_digits(params, key, position, valid, shift=shift):
-                # Candidate j's threshold is base + (j + 1) << shift: a key's digit is
-                # floor((key - base) >> shift), 15 for all above the round's range.
-                (base,) = params
-                diff = key - base  # wraps only from 2^31 above base: far above the range
+    def _key_digits(self, shift):
+        """A key round's ``digits`` (see ``_count``): candidate ``j``'s threshold is
+        ``base + (j + 1) << shift``; a key's digit is ``(key - base) >> shift``, 15 for
+        all above the round's range (``shift`` may be traced)."""
+        def key_digits(params, key, position, valid):
+            (base,) = params
+            diff = key - base  # wraps only from 2^31 above base: far above the range
+            if isinstance(shift, int):
                 if shift:
                     digit = jnp.minimum(jax.lax.shift_right_logical(diff, shift), 15)
                 else:
                     digit = jnp.where(diff < 0, 15, jnp.minimum(diff, 15))
-                return digit, valid & (key >= base)
+            else:
+                q = jax.lax.shift_right_logical(diff, shift)
+                digit = jnp.where(q < 0, 15, jnp.minimum(q, 15))
+            return digit, valid & (key >= base)
 
-            counts = self._count(lambda row: (refs["row_prefix"][row] ^ INT_MIN,), key_digits,
-                                 first=round_ == 0)
-            total = self._all_reduce(counts, parity, pending=round_ >= 2)
-            parity ^= 1
-            ge = ((total >= topk) & (cand < CANDIDATES)).astype(jnp.int32)
-            digit = jnp.sum(ge, axis=0, keepdims=True)  # [1, LANES]
-            upper = jnp.sum(jnp.where(cand == digit, total, 0), axis=0, keepdims=True)
-            lower = jnp.sum(jnp.where(cand == digit - 1, total, 0), axis=0, keepdims=True)
-            state = refs["state"]
-            state[_PREFIX:_PREFIX + 1] = state[_PREFIX:_PREFIX + 1] + (digit << shift)  # wraps: unsigned bits
-            state[_UPPER:_UPPER + 1] = jnp.where(digit < CANDIDATES, upper, state[_UPPER:_UPPER + 1])
-            state[_LOWER:_LOWER + 1] = jnp.where(digit >= 1, lower, state[_LOWER:_LOWER + 1])
+        return key_digits
+
+    def _key_update(self, total, shift):
+        """Extend every row's prefix by the round's digit: the largest candidate
+        whose count still reaches ``topk`` (``total`` [COUNT_ROWS, LANES])."""
+        refs, topk = self.refs, self.topk
+        cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
+        ge = ((total >= topk) & (cand < CANDIDATES)).astype(jnp.int32)
+        digit = jnp.sum(ge, axis=0, keepdims=True)  # [1, LANES]
+        upper = jnp.sum(jnp.where(cand == digit, total, 0), axis=0, keepdims=True)
+        lower = jnp.sum(jnp.where(cand == digit - 1, total, 0), axis=0, keepdims=True)
         state = refs["state"]
+        state[_PREFIX:_PREFIX + 1] = state[_PREFIX:_PREFIX + 1] + (digit << shift)  # wraps: unsigned bits
+        state[_UPPER:_UPPER + 1] = jnp.where(digit < CANDIDATES, upper, state[_UPPER:_UPPER + 1])
+        state[_LOWER:_LOWER + 1] = jnp.where(digit >= 1, lower, state[_LOWER:_LOWER + 1])
+
+    def _tie_update(self, total, shift):
+        """Extend every row's tie position floor by the round's digit."""
+        refs, topk = self.refs, self.topk
+        cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
+        need = topk - refs["state"][_UPPER:_UPPER + 1]
+        below = ((total < need) & (cand < CANDIDATES)).astype(jnp.int32)
+        digit = jnp.sum(below, axis=0, keepdims=True)
+        refs["state"][_POSITION:_POSITION + 1] = refs["state"][_POSITION:_POSITION + 1] + (digit << shift)
+
+    def _key_round(self, shift, parity, pending, first):
+        """One distributed key round (``shift`` / ``parity`` may be traced)."""
+        refs = self.refs
+        self._row_scalars(_PREFIX, "row_prefix")
+        counts = self._count(lambda row: (refs["row_prefix"][row] ^ INT_MIN,), self._key_digits(shift),
+                             first=first)
+        total = self._all_reduce(counts, parity, pending=pending)
+        self._key_update(total, shift)
+
+    def _active_rows(self):
+        state = self.refs["state"]
         lane = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
-        active = (state[_LIMIT:_LIMIT + 1] > topk) & (lane < self.batch)
-        tie = active & (state[_LOWER:_LOWER + 1] > topk)  # more tied keys than the rest of the top-k
-        state[_POSITION:_POSITION + 1] = jnp.zeros((1, LANES), jnp.int32)
+        return (state[_LIMIT:_LIMIT + 1] > self.topk) & (lane < self.batch)
 
-        any_tie = jnp.sum(tie.astype(jnp.int32)) > 0
+    def _small(self):
+        """Whether every active row's threshold bin holds at most
+        ``GATHER_SLOTS`` keys over the group (the same on every rank)."""
+        state = self.refs["state"]
+        population = state[_LOWER:_LOWER + 1] - state[_UPPER:_UPPER + 1]
+        return jnp.max(jnp.where(self._active_rows(), population, 0)) <= GATHER_SLOTS
 
-        @pl_when(jnp.logical_not(any_tie))
-        def drain():  # the last two key rounds' sends
-            self._sent(0)
-            self._sent(1)
+    def _extract(self, bits):
+        """This rank's keys in each row's bin ``[lo, lo + 2^bits)`` (``lo`` the
+        row's prefix) with their positions: row ``b`` of ``refs["cand"]`` holds
+        its keys at lanes ``0 ..`` and their positions at ``GATHER_SLOTS ..``
+        (-1: none), ``refs["cand_n"][b]`` their count."""
+        from jax.experimental import pallas as pl
 
-        @pl_when(any_tie)
-        def ties():
-            nonlocal_parity = parity
+        refs, chunk = self.refs, self.chunk
+        cand = refs["cand"]
+        cand_lane = jax.lax.broadcasted_iota(jnp.int32, cand.shape, 1)
+        cand[...] = jnp.where(cand_lane >= GATHER_SLOTS, -1, INT_MIN)
+        for b in range(self.batch):
+            refs["cand_n"][b] = 0
+        total = refs["chunk_starts"][self.batch]
+        for step in range(self.key_slots - 1):
+            pl_when(step < total)(lambda step=step: self._chunk_copy(step))
+        sub8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 0)
+        lane8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 1)
+        flat8 = sub8 * LANES + lane8
+        lane1 = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
+
+        def step_fn(step, carry):
+            row, local = refs["step_row"][step], refs["step_local"][step]
+            self._wait_chunk(step)
+            pl_when(step + self.key_slots - 1 < total)(lambda: self._chunk_copy(step + self.key_slots - 1))
+            start = jnp.minimum(local * chunk, self.key_rows - chunk)
+            rows_valid = refs["counts"][row] * self.subpages
+            lo = refs["row_prefix"][row] ^ INT_MIN
+
+            def vreg(v, carry):
+                key = refs["key_buf"][step % self.key_slots, pl_ds(pl.multiple_of(v * 8, 8), 8), :]
+                key_row = start + v * 8 + sub8
+                valid = (key_row >= local * chunk) & (key_row < rows_valid)
+                hit = valid & (key >= lo) & (jax.lax.shift_right_logical(key - lo, bits) == 0)
+                n = jnp.sum(hit.astype(jnp.int32))
+
+                @pl_when(n > 0)
+                def take():
+                    page = key_row // self.subpages
+                    position = ((page * self.group + self.owner) * self.T
+                                + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS + lane8)
+
+                    def one(i, mask):
+                        idx = jnp.min(jnp.where(mask != 0, flat8, 1 << 20))
+                        at = flat8 == idx
+                        k = jnp.sum(jnp.where(at, key, 0))
+                        p = jnp.sum(jnp.where(at, position, 0))
+                        c = refs["cand_n"][row]
+
+                        @pl_when(c < GATHER_SLOTS)
+                        def put():
+                            cur = cand[pl_ds(row, 1), :]
+                            cur = jnp.where(lane1 == c, k, cur)
+                            cand[pl_ds(row, 1), :] = jnp.where(lane1 == GATHER_SLOTS + c, p, cur)
+
+                        refs["cand_n"][row] = c + 1
+                        return jnp.where(at, 0, mask)
+
+                    jax.lax.fori_loop(0, n, one, hit.astype(jnp.int32))
+
+                return carry
+
+            first_v = (local * chunk - start) // 8
+            end_v = (jnp.minimum(rows_valid, (local + 1) * chunk) - start + 7) // 8
+            jax.lax.fori_loop(first_v, jnp.maximum(end_v, first_v), vreg, 0)
+            return carry
+
+        jax.lax.fori_loop(0, total, step_fn, 0)
+
+    def _exchange_candidates(self):
+        """Every rank's candidates (slot ``m``: member ``m``'s ``refs["cand"]``)."""
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        refs, group, member = self.refs, self.group, self.member
+        gather, sems = refs["gather"], refs["gather_sems"]
+        for peer in range(group):
+            @pl.when(peer != member)
+            def send(peer=peer):
+                pltpu.make_async_remote_copy(
+                    refs["cand"], gather.at[member], sems.at[0], sems.at[1],
+                    device_id=(self.base + peer,), device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+        gather[member] = refs["cand"][...]
+        others = gather.at[pl.ds(0, group - 1)]
+        pltpu.make_async_copy(others, others, sems.at[1]).wait()
+        pltpu.make_async_copy(others, others, sems.at[0]).wait()
+
+    def _slot_values(self, value_of):
+        """``[rows, LANES]`` with row ``b``'s sublane ``value_of(b)`` (an SMEM scalar)."""
+        rows = self.refs["cand"].shape[0]
+        sub = jax.lax.broadcasted_iota(jnp.int32, (rows, LANES), 0)
+        out = jnp.zeros((rows, LANES), jnp.int32)
+        for b in range(self.batch):
+            out = jnp.where(sub == b, value_of(b), out)
+        return out
+
+    def _slot_counts(self, digit, above):
+        """``[COUNT_ROWS, LANES]`` (sublane ``j``: candidate ``j + 1``, lane ``b``:
+        row ``b``) from the gathered candidates' digits ``[group, rows, LANES]``
+        (-1: not counted): digits above ``j`` (key rounds) or up to ``j`` (tie
+        rounds)."""
+        rows = digit.shape[1]
+        columns = []
+        for j in range(CANDIDATES):
+            hit = (digit > j) if above else ((digit >= 0) & (digit <= j))
+            columns.append(jnp.sum(jnp.sum(hit.astype(jnp.int32), axis=0), axis=1, keepdims=True))  # [rows, 1]
+        table = jnp.concatenate(columns + [jnp.zeros((rows, LANES - CANDIDATES), jnp.int32)], axis=1)
+        table = jnp.concatenate([table, jnp.zeros((LANES - rows, LANES), jnp.int32)], axis=0)  # [LANES, LANES]
+        return table.T[:COUNT_ROWS]
+
+    def _gather_finish(self, first_round):
+        """Rounds ``first_round ..`` (traced) and the tie rounds on the gathered
+        candidates, every rank alike; then the count slots' last sends."""
+        refs = self.refs
+        self._row_scalars(_PREFIX, "row_prefix")
+        self._extract(32 - DIGIT_BITS * first_round)
+        self._exchange_candidates()
+        rows = refs["cand"].shape[0]
+        lane = jax.lax.broadcasted_iota(jnp.int32, (refs["gather"].shape[0], rows, LANES), 2)
+
+        def slots():
+            gathered = refs["gather"][...]
+            keys = gathered
+            positions = pltpu_roll(gathered, LANES - GATHER_SLOTS)  # position lanes onto their keys
+            return keys, positions, (lane < GATHER_SLOTS) & (positions >= 0)
+
+        # Keys above the gathered bin (on every rank): with the candidates at or
+        # above a threshold, a round's counts are the distributed round's.
+        cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
+        above = jnp.where(cand < CANDIDATES, refs["state"][_UPPER:_UPPER + 1], 0)
+
+        def local_round(i, carry):
+            shift = 32 - DIGIT_BITS * (i + 1)
+            keys, _, valid = slots()
             self._row_scalars(_PREFIX, "row_prefix")
+            base = self._slot_values(lambda b: refs["row_prefix"][b] ^ INT_MIN)
+            q = jax.lax.shift_right_logical(keys - base, shift)
+            digit = jnp.where(q < 0, 15, jnp.minimum(q, 15))
+            counted = valid & (keys >= base)
+            self._key_update(self._slot_counts(jnp.where(counted, digit, -1), True) + above, shift)
+            return carry
+
+        jax.lax.fori_loop(first_round, len(KEY_SHIFTS), local_round, 0)
+        state = refs["state"]
+        state[_POSITION:_POSITION + 1] = jnp.zeros((1, LANES), jnp.int32)
+        tie = self._active_rows() & (state[_LOWER:_LOWER + 1] > self.topk)
+
+        @pl_when(jnp.sum(tie.astype(jnp.int32)) > 0)
+        def local_ties():
+            keys, positions, valid = slots()
+            self._row_scalars(_PREFIX, "row_prefix")
+            tied = valid & (keys == self._slot_values(lambda b: refs["row_prefix"][b] ^ INT_MIN))
             for shift in POSITION_SHIFTS:
                 self._row_scalars(_POSITION, "row_position")
+                floor = self._slot_values(lambda b: refs["row_position"][b])
+                digit = jnp.clip((positions - floor) >> shift, 0, 15)
+                self._tie_update(self._slot_counts(jnp.where(tied, digit, -1), False), shift)
 
-                def position_digits(params, key, position, valid, shift=shift):
-                    # Candidate j: tied keys at positions below floor + (j + 1) << shift.
-                    tau, floor = params
-                    return jnp.clip((position - floor) >> shift, 0, 15), valid & (key == tau)
+        refs["sel_done"][0] = 1
+        self._sent(0)  # the count rounds' last two sends
+        self._sent(1)
 
-                counts = self._count(lambda row: (refs["row_prefix"][row] ^ INT_MIN, refs["row_position"][row]),
-                                     position_digits, prefix=True)
-                total = self._all_reduce(counts, nonlocal_parity, pending=True)
-                nonlocal_parity ^= 1
-                need = topk - refs["state"][_UPPER:_UPPER + 1]
-                below = ((total < need) & (cand < CANDIDATES)).astype(jnp.int32)
-                digit = jnp.sum(below, axis=0, keepdims=True)
-                refs["state"][_POSITION:_POSITION + 1] = refs["state"][_POSITION:_POSITION + 1] + (digit << shift)
-            self._sent(0)  # the last two tie rounds' sends
-            self._sent(1)
+    def select(self):
+        """The rounds; ``tau`` / ``p_tie`` per row into SMEM."""
+        refs, topk = self.refs, self.topk
+        cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
+        gather = gather_finish(self.batch)
+        if gather:
+            refs["sel_done"][0] = 0
+        static_rounds = GATHER_FROM_ROUND + 1 if gather else len(KEY_SHIFTS)
+        parity = 0
+        for round_, shift in enumerate(KEY_SHIFTS[:static_rounds]):
+            self._key_round(shift, parity, round_ >= 2, round_ == 0)
+            parity ^= 1
+        if gather:
+            # Later rounds as a loop: before each, the gather finish once every
+            # row's bin is small (then the rest are skipped).
+            def later(i, carry):
+                round_ = static_rounds + i
+                pl_when((refs["sel_done"][0] == 0) & self._small())(lambda: self._gather_finish(round_))
+                pl_when(refs["sel_done"][0] == 0)(
+                    lambda: self._key_round(32 - DIGIT_BITS * (round_ + 1), round_ % 2, True, False))
+                return carry
+
+            jax.lax.fori_loop(0, len(KEY_SHIFTS) - static_rounds, later, 0)
+            parity = len(KEY_SHIFTS) % 2
+
+        def distributed_finish():
+            state = refs["state"]
+            tie = self._active_rows() & (state[_LOWER:_LOWER + 1] > topk)  # more tied keys than the rest
+            state[_POSITION:_POSITION + 1] = jnp.zeros((1, LANES), jnp.int32)
+            any_tie = jnp.sum(tie.astype(jnp.int32)) > 0
+
+            @pl_when(jnp.logical_not(any_tie))
+            def drain():  # the last two key rounds' sends
+                self._sent(0)
+                self._sent(1)
+
+            @pl_when(any_tie)
+            def ties():
+                tie_parity = parity
+                self._row_scalars(_PREFIX, "row_prefix")
+                for shift in POSITION_SHIFTS:
+                    self._row_scalars(_POSITION, "row_position")
+
+                    def position_digits(params, key, position, valid, shift=shift):
+                        # Candidate j: tied keys at positions below floor + (j + 1) << shift.
+                        tau, floor = params
+                        return jnp.clip((position - floor) >> shift, 0, 15), valid & (key == tau)
+
+                    counts = self._count(lambda row: (refs["row_prefix"][row] ^ INT_MIN, refs["row_position"][row]),
+                                         position_digits, prefix=True)
+                    total = self._all_reduce(counts, tie_parity, pending=True)
+                    tie_parity ^= 1
+                    self._tie_update(total, shift)
+                self._sent(0)  # the last two tie rounds' sends
+                self._sent(1)
+
+        if gather:
+            pl_when(refs["sel_done"][0] == 0)(distributed_finish)
+        else:
+            distributed_finish()
 
         state = refs["state"]
+        active = self._active_rows()
+        tie = active & (state[_LOWER:_LOWER + 1] > topk)
         tau = jnp.where(active, state[_PREFIX:_PREFIX + 1] ^ INT_MIN, INT_MIN)
         p_tie = jnp.where(active, jnp.where(tie, state[_POSITION:_POSITION + 1], INT_MAX), -1)
+        del cand
         for b in range(self.batch):
             tau_b, p_tie_b = _row_scalar(tau, b), _row_scalar(p_tie, b)
             refs["tau"][b] = tau_b
@@ -995,6 +1240,22 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         "row_prefix": pltpu.SMEM((batch,), jnp.int32),
         "row_position": pltpu.SMEM((batch,), jnp.int32),
         **(_group_scratch(batch, key_rows) if batch < WIDE_CHUNK_BATCH else {}),
+        **(_gather_scratch(batch, group) if gather_finish(batch) else {}),
+    }
+
+
+def _gather_scratch(batch, group):
+    """The gather finish's buffers: this rank's candidates, every rank's (by
+    member) and their copies' semaphores (sends, receives)."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    rows = gather_rows(batch)
+    return {
+        "cand": pltpu.VMEM((rows, LANES), jnp.int32),
+        "gather": pltpu.VMEM((group, rows, LANES), jnp.int32),
+        "gather_sems": pltpu.SemaphoreType.DMA((2,)),
+        "cand_n": pltpu.SMEM((batch,), jnp.int32),
+        "sel_done": pltpu.SMEM((1,), jnp.int32),
     }
 
 

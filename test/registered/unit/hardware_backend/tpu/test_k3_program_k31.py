@@ -403,6 +403,59 @@ class TestIndexSelect(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+class TestIndexSelectGatherFinish(CustomTestCase):
+    """``KernelConfig.dsa_gather_finish``: once every row's threshold bin is
+    small the ranks gather its keys and finish the rounds locally -- the same
+    thresholds as the distributed rounds, with and without position ties."""
+
+    @staticmethod
+    def script():
+        import textwrap
+
+        script = textwrap.dedent(TestIndexSelect.SCRIPT)
+        script = script.replace(
+            "from sglang_tpu.k3_programs.kimi_k3 import dsa\n",
+            "from sglang_tpu.k3_programs.kimi_k3 import config as kc\n"
+            "kc.install(kc.KernelConfig(dsa_gather_finish=True))\n"
+            "from sglang_tpu.k3_programs.kimi_k3 import dsa\n")
+        script = script.replace(
+            "from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp\n",
+            "from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp\n"
+            "from jax.experimental import pallas as pl\n"
+            "_finish = dsa_dcp.IndexSelect._gather_finish\n"
+            "def _traced(self, first_round):\n"
+            "    pl.debug_print('GATHER at round {}', first_round)\n"
+            "    return _finish(self, first_round)\n"
+            "dsa_dcp.IndexSelect._gather_finish = _traced\n")
+        script = script.replace("def case(firsts, S, topk, ties, seed):",
+                                "def case(firsts, S, topk, ties, seed, distinct=5):")
+        script = script.replace("rng.standard_normal((5, 128)).astype(np.float32)[rng.integers(0, 5, L)]",
+                                "rng.standard_normal((distinct, 128)).astype(np.float32)[rng.integers(0, distinct, L)]")
+        tail = script[script.index("case([300, 2500], 1, 256, False, 0)"):]
+        return script.replace(tail, "\n".join([
+            "case([300, 2500], 1, 256, False, 0)",
+            "assert case([2600, 3100], 2, 256, True, 2, distinct=350) > 0  # ties inside the gathered bin",
+            "case([3500], 4, 512, False, 3)",
+            'print("OK")', ""]))
+
+    def test_gather_finish_matches_the_reference(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", self.script()],
+            capture_output=True, text=True, env=env, timeout=1500,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
+        self.assertGreaterEqual(result.stdout.count("GATHER at round"), 3 * 4, result.stdout[-2000:])
+
+
 class TestSelectedAttention(CustomTestCase):
     """The DCP attention with a DSA selection (``mla_dcp.DcpSelection``) in
     Pallas interpret mode on a 4-rank group: each row attends exactly its

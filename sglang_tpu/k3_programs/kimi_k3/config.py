@@ -76,9 +76,13 @@ class KernelConfig:
     # indexer, sparse MLA kernels) instead of every earlier token.
     prefill_sparse: bool = False
     # Kimi-K3.1 decode indexer: slots of its weight stream (wq_b / wk /
-    # weights_proj, nine 128 KB chunks a layer); ten issues every chunk when
-    # the MLA layer starts.
+    # weights_proj, nine 128 KB chunks a layer; batches up to 16 rows); ten
+    # issues every chunk when the MLA layer starts.
     dsa_weight_ring: int = 3
+    # Kimi-K3.1 decode selection: once every row's threshold bin holds at most
+    # 16 keys over the DCP group, gather them and finish the rounds locally
+    # (batches up to 16 rows).
+    dsa_gather_finish: bool = False
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
