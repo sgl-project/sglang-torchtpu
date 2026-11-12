@@ -31,11 +31,23 @@ revision that produced it.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 from sglang_tpu.k3_programs.tools import bench, check, harness, k3, preshard
+
+
+def _has_indexer(presharded) -> bool:
+    """Whether ``presharded`` is Kimi-K3.1's (rank 0 lists the DSA families):
+    its DSA decode reads an FP8 cache."""
+    try:
+        index = json.loads((Path(presharded) / "rank00" / "index.json").read_text())
+        return "d_wk" in index["families"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 LLO_FLAGS = (
     "--xla_jf_dump_to={dir} --xla_jf_dump_llo_text=true "
@@ -160,6 +172,8 @@ def main(argv: list[str]) -> int:
 
         coverage = LineCoverage(args.coverage)
         coverage.start()  # before the kernels import: their module-level lines count
+    if args.kv_cache_dtype == "auto" and _has_indexer(args.presharded):
+        args.kv_cache_dtype = "fp8_e4m3"  # as the server serves Kimi-K3.1
     k3.configure_cache(args.kv_cache_dtype)
     config = kernel_config(args.set)  # before any kernel module is imported
     harness.log(

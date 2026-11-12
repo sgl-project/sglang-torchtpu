@@ -251,6 +251,11 @@ class DecodeIndexer:
         B]``) for a blocked weight (``_blocked``) whose chunks start at stream
         index ``first``: one ``128``-deep product per hidden block."""
         per_chunk = CHUNK // block
+        rows = x.shape[0]
+        if transposed and rows == 1:
+            # Mosaic lowers ``W x^T`` with one row of x as a broadcast that fails
+            # verification (bf16 operand, f32 result): use eight rows, keep the first.
+            x = jnp.concatenate([x, jnp.zeros((7, x.shape[1]), x.dtype)], axis=0)
         out = chunk = None
         for c in range(x.shape[1] // DIM):
             if c % per_chunk == 0:
@@ -260,7 +265,7 @@ class DecodeIndexer:
             lhs, rhs = (w, xc) if transposed else (xc, w)
             p = jax.lax.dot_general(lhs, rhs, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
             out = p if out is None else out + p
-        return out
+        return out[:, :rows] if transposed else out
 
     def _key_part(self, x, block):
         """This member's key dims ``x @ wk[:, dims]`` (f32 ``[B, block]``),
