@@ -121,6 +121,7 @@ WIDE_CHUNK_ROWS = 128  # below that many rows: a long-context row's keys in one 
 # DMA ring depths: a page or chunk step computes little, so several copies stay
 # in flight (one HBM -> VMEM copy is ~0.9 us; a ring of two waits on each).
 PAGE_SLOTS = 4  # index pages (scoring)
+PAGE_SPLIT = 1  # copies an index page is fetched in (its subpages; > 1: more DMAs in flight)
 KEY_SLOTS = 8  # key chunks (counting, step activity)
 WIDE_BATCH = 64  # from this many rows: rings of 3 and 4 (the decode's VMEM plan)
 # A row holds topk / group selected tokens a rank (64 over DCP32): with at most
@@ -366,11 +367,16 @@ class IndexSelect:
         seq, local = self.refs["page_seq"][step], self.refs["page_local"][step]
         slot = step % self.page_slots
         block = self._block(seq * self.S, local)
+        rows = self.refs["page_buf"].shape[1] // PAGE_SPLIT
         for index, pool in enumerate(self.pools):
             @pl_when(self.layer == index if len(self.pools) > 1 else True)
             def start(pool=pool):
-                pltpu.make_async_copy(pool.at[block], self.refs["page_buf"].at[slot],
-                                      self.refs["page_sems"].at[slot]).start()
+                for part in range(PAGE_SPLIT):  # one wait covers every part's bytes
+                    at = pl_ds(part * rows, rows)
+                    pltpu.make_async_copy(pool.at[block] if PAGE_SPLIT == 1 else pool.at[block, at],
+                                          self.refs["page_buf"].at[slot] if PAGE_SPLIT == 1
+                                          else self.refs["page_buf"].at[slot, at],
+                                          self.refs["page_sems"].at[slot]).start()
 
     def _wait_page(self, step):
         from jax.experimental.pallas import tpu as pltpu
