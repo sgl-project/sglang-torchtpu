@@ -387,9 +387,31 @@ class LongCatImagePipelineConfig(ImagePipelineConfig):
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds[0]
 
+    def shard_latents_for_sp(self, batch, latents):
+        # Padding tokens would join the unmasked attention, and the T2I unpack
+        # takes exactly the latent grid, so the tokens must split evenly.
+        sp_world_size = get_sp_world_size()
+        if not batch.enable_sequence_shard and latents.shape[1] % sp_world_size:
+            raise ValueError(
+                f"LongCat-Image's {latents.shape[1]} latent tokens do not split "
+                f"evenly over {sp_world_size} sequence-parallel ranks; pick a "
+                f"size with (height // 16) * (width // 16) divisible by "
+                f"{sp_world_size}."
+            )
+        return super().shard_latents_for_sp(batch, latents)
+
+    def _maybe_shard_pos_ids_for_sp(self, batch, pos_ids):
+        # RoPE ids must be sharded exactly like their latents, so reuse the same
+        # helper. It reads the SP group, which only exists under model parallelism.
+        if not model_parallel_is_initialized() or get_sp_world_size() == 1:
+            return pos_ids
+        sharded, _ = self.shard_latents_for_sp(batch, pos_ids.unsqueeze(0))
+        return sharded.squeeze(0)
+
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         # txt_ids depend only on the prompt length (fixed at TOKENIZER_MAX_LENGTH);
-        # img_ids are the latent position ids set by LatentPreparationStage.
+        # img_ids are the latent position ids set by LatentPreparationStage,
+        # sharded like the latents under SP.
         # image_rotary_emb is NOT precomputed — the DiT computes it on the fly from
         # txt_ids + img_ids (matching diffusers' transformer, which calls
         # self.pos_embed internally).
@@ -398,7 +420,7 @@ class LongCatImagePipelineConfig(ImagePipelineConfig):
             "txt_ids": _prepare_pos_ids(
                 modality_id=0, token_type="text", start=(0, 0), num_token=num_token
             ).to(device),
-            "img_ids": batch.latent_ids,
+            "img_ids": self._maybe_shard_pos_ids_for_sp(batch, batch.latent_ids),
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -407,7 +429,7 @@ class LongCatImagePipelineConfig(ImagePipelineConfig):
             "txt_ids": _prepare_pos_ids(
                 modality_id=0, token_type="text", start=(0, 0), num_token=num_token
             ).to(device),
-            "img_ids": batch.latent_ids,
+            "img_ids": self._maybe_shard_pos_ids_for_sp(batch, batch.latent_ids),
         }
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
@@ -535,14 +557,6 @@ class LongCatImageEditPipelineConfig(LongCatImagePipelineConfig):
                 pad = latents[:, -1:].expand(-1, sp_world_size - remainder, -1)
                 latents = torch.cat([latents, pad], dim=1)
         return super().shard_latents_for_sp(batch, latents)
-
-    def _maybe_shard_pos_ids_for_sp(self, batch, pos_ids):
-        # RoPE ids must be sharded exactly like their latents, so reuse the same
-        # helper. It reads the SP group, which only exists under model parallelism.
-        if not model_parallel_is_initialized() or get_sp_world_size() == 1:
-            return pos_ids
-        sharded, _ = self.shard_latents_for_sp(batch, pos_ids.unsqueeze(0))
-        return sharded.squeeze(0)
 
     def _edit_img_ids(self, batch, num_token, device):
         """Position ids for [noisy | reference] packed latent tokens.
