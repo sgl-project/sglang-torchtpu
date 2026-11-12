@@ -1105,7 +1105,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker.device = "cpu"
         forwarded = []
         worker._draft_runner = SimpleNamespace(forward=forwarded.append)
-        worker._chain_draft_worker = SimpleNamespace(draft_context=ExitStack)
+        worker._chain_draft_worker = SimpleNamespace(
+            draft_context=ExitStack, dsa_seed_topk_width=None
+        )
         idle_batch = SimpleNamespace(global_num_tokens_cpu=[780, 0])
         target_hidden = torch.zeros((8192, 4))
         with patch.object(

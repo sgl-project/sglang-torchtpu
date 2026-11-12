@@ -1237,6 +1237,90 @@ class TestChainDsaIndexShare(CustomTestCase):
         self.assertEqual(
             _capture_layout(warm_extend["spec_info"]), _capture_layout(served_extend)
         )
+        # An idle DP rank runs the same warmed prompt program as its peers.
+        served_idle = self._idle_prefill(seed_table=self._seed_table(), cap=cap)
+        self.assertEqual(
+            _capture_layout(warm_extend["spec_info"]),
+            _capture_layout(served_idle.spec_info),
+        )
+
+    def _idle_prefill(
+        self, *, seed_table, cap, tokens: int = 8, draft_context=None, init_new=None
+    ):
+        """TpuChainSpecWorker._forward_idle_draft_prefill; returns the batch it forwards."""
+        worker = object.__new__(TpuChainSpecWorker)
+        worker.device = "cpu"
+        drafter = self._drafter(seed_table)
+        if draft_context is not None:
+            drafter.draft_context = draft_context
+        worker._chain_draft_worker = drafter
+        worker._compile_policy = lambda: SimpleNamespace(
+            _extend_compile_cap=lambda: cap
+        )
+        served = []
+        worker._draft_runner = SimpleNamespace(forward=served.append)
+        if init_new is None:
+            init_new = lambda *args, **kwargs: SimpleNamespace(  # noqa: E731
+                forward_mode=ForwardMode.IDLE, global_num_tokens_cpu=[0, tokens]
+            )
+        with patch.object(chain_spec_worker.ForwardBatch, "init_new", init_new):
+            worker._forward_idle_draft_prefill(
+                SimpleNamespace(extend_lens=None),
+                target_hidden=torch.zeros((tokens, self.HIDDEN)),
+            )
+        (forward_batch,) = served
+        return forward_batch
+
+    def test_draft_prompt_batches_are_built_in_the_draft_scope(self):
+        """Under DP attention the draft scope narrows EP to one, and init_new reads
+        it to leave num_token_non_padded unset, as the warmed program has it. Built
+        outside the scope, both prompt passes guard-miss under fail_on_recompile."""
+        in_scope = []
+
+        @contextlib.contextmanager
+        def draft_context():
+            in_scope.append(True)
+            try:
+                yield
+            finally:
+                in_scope.pop()
+
+        built_in_scope = []
+
+        def init_new(*args, **kwargs):
+            built_in_scope.append(bool(in_scope))
+            return SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND, global_num_tokens_cpu=None
+            )
+
+        self._idle_prefill(
+            seed_table=None, cap=4, draft_context=draft_context, init_new=init_new
+        )
+        worker = object.__new__(TpuChainSpecWorker)
+        worker.device = "cpu"
+        drafter = self._drafter(None)
+        drafter.draft_context = draft_context
+        worker._chain_draft_worker = drafter
+        worker._compile_policy = lambda: SimpleNamespace(_extend_compile_cap=lambda: 4)
+        worker._draft_prompt_ids = lambda batch, **_: None
+        tail = torch.zeros((4, self.HIDDEN))
+        worker._draft_runner = SimpleNamespace(
+            forward=lambda forward_batch: SimpleNamespace(
+                logits_output=SimpleNamespace(
+                    next_token_logits=tail, hidden_states=tail
+                )
+            )
+        )
+        with patch.object(chain_spec_worker.ForwardBatch, "init_new", init_new):
+            worker._extend_draft(
+                SimpleNamespace(
+                    extend_lens=[8], req_pool_indices_cpu=torch.tensor([1])
+                ),
+                target_hidden=torch.zeros((8, 1)),
+                bucket_tokens=None,
+                mm_input_embeds=None,
+            )
+        self.assertEqual(built_in_scope, [True, True])
 
 
 if __name__ == "__main__":
