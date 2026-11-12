@@ -132,7 +132,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             routed_experts_start_len=request.routed_experts_start_len,
             return_prompt_token_ids=request.return_token_ids,
             rid=request.rid,
-            session_id=request.session_id,
+            session_id=self.extract_session_id(request, raw_request),
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
             priority=request.priority,
