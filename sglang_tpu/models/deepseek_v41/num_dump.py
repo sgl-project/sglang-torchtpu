@@ -19,6 +19,8 @@ POINTS = (
     "embed_in",
     "embed_calls",
     "embed_out",
+    "embed_ref",
+    "embed_clone",
     "hash_ids",
     "attn_in",
     "attn_out",
@@ -94,6 +96,10 @@ def embed_forward(original, embed, input_):
     if calls is not None:
         calls[0, 0].add_(1.0)
     _put("embed_out", 0, out)
+    # Same ids gathered again in-graph straight from the weight, and a clone of
+    # the output: tells a miscompiled gather from a bad dump copy.
+    _put("embed_ref", 0, embed.weight.index_select(0, input_.reshape(-1).long()))
+    _put("embed_clone", 0, out.clone())
     return out
 
 
