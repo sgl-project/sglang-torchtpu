@@ -367,7 +367,17 @@ class IndexSelect:
             pl_when(step + self.page_slots - 1 < total)(lambda: self._page_copy(step + self.page_slots - 1))
             pl_when(step >= 2)(lambda: self._stage_copy(stage).wait())
             q = query_rows(first_row)  # [S * 32, 128] fp8
-            w_cols = [self._w_col(w_t_ref, first_row + r) for r in range(S)]
+            if S > 1:
+                # The rows' head weights, lane-broadcast once a sequence (its
+                # first page) rather than reduced out of w_t every page.
+                @pl_when(local == 0)
+                def _():
+                    for r in range(S):
+                        refs["w_rows"][r] = jnp.broadcast_to(self._w_col(w_t_ref, first_row + r), (32, LANES))
+
+                w_cols = [refs["w_rows"][r] for r in range(S)]
+            else:
+                w_cols = [self._w_col(w_t_ref, first_row)]
             limits = [self.position_ref[first_row + r] + 1 for r in range(S)]
             first = (local * self.group + self.owner) * T  # the page's first position
 
@@ -390,7 +400,10 @@ class IndexSelect:
                 scales = [subpage_scale(sp) for sp in part]
                 for r in range(S):
                     heads = logits[r * 32:(r + 1) * 32]
-                    score = jnp.sum(jnp.maximum(heads, 0.0) * w_cols[r], axis=0, keepdims=True)  # [1, tokens]
+                    w = w_cols[r]
+                    if S > 1 and heads.shape[1] > LANES:  # whole-page product: the lanes repeat
+                        w = jnp.concatenate([w] * (heads.shape[1] // LANES), axis=1)
+                    score = jnp.sum(jnp.maximum(heads, 0.0) * w, axis=0, keepdims=True)  # [1, tokens]
                     for i, sp in enumerate(part):
                         position = first + sp * INDEX_SUBPAGE_TOKENS + lane_row
                         piece = score[:, i * INDEX_SUBPAGE_TOKENS:(i + 1) * INDEX_SUBPAGE_TOKENS]
@@ -754,6 +767,7 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         "local": vmem((COUNT_ROWS, LANES), jnp.int32),
         "state": vmem((8, LANES), jnp.int32),
         "in_flight": vmem((batch, LANES), jnp.int32),
+        "w_rows": vmem((sequence_rows, 32, LANES), jnp.float32),
         "counts": pltpu.SMEM((batch,), jnp.int32),
         "page_starts": pltpu.SMEM((batch + 1,), jnp.int32),
         "chunk_starts": pltpu.SMEM((batch + 1,), jnp.int32),
