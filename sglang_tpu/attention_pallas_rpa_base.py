@@ -874,8 +874,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         width = self.decode_query_size
         if width == 1:
             return 1
-        # batches built outside the scheduler may not carry mix_verify_width
-        mix_width = getattr(forward_batch, "mix_verify_width", 1)
+        mix_width = forward_batch.mix_verify_width
         if mix_width > 1:
             # A mixed-verify extend runs its width-wide sequences on the DECODE range.
             return width if mix_width == width else 1
@@ -962,9 +961,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         decode_query_size = self._forward_decode_query_size(forward_batch)
         # A mixed-verify extend splits its sequences across the DECODE and MIXED
         # ranges; the host builder orders them and sets the distribution.
-        mixed_verify = (
-            getattr(forward_batch, "mix_verify_width", 1) > 1 and decode_query_size > 1
-        )
+        mixed_verify = forward_batch.mix_verify_width > 1 and decode_query_size > 1
         is_decode = not mixed_verify and (
             forward_batch.forward_mode.is_decode() or decode_query_size > 1
         )
@@ -1221,9 +1218,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             query_width = 1
 
         seq_order = row_perm = row_unperm = None
-        mixed_verify = (
-            getattr(forward_batch, "mix_verify_width", 1) > 1 and decode_query_size > 1
-        )
+        mixed_verify = forward_batch.mix_verify_width > 1 and decode_query_size > 1
         if mixed_verify and envs.SGLANG_TPU_MIXED_VERIFY_TAILS_LAST.get():
             # The tails already end the batch: keep its order and pass [0, prefill
             # sequences, live]; the kernel runs the tails as the verify pass's MIXED range.

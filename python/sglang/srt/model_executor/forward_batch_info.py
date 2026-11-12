@@ -1074,11 +1074,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
-            # batches built outside the scheduler may not carry mix_verify_tails
             mix_verify_width=(
                 int(batch.extend_lens[-1])
-                if getattr(batch, "mix_verify_tails", 0)
-                and batch.forward_mode.is_mixed()
+                if batch.mix_verify_tails and batch.forward_mode.is_mixed()
                 else 1
             ),
             spec_algorithm=batch.spec_algorithm,

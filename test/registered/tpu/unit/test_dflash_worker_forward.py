@@ -455,6 +455,7 @@ def _make_schedule_batch(
     return SimpleNamespace(
         device=seq_lens.device,
         forward_mode=forward_mode,
+        mix_verify_tails=0,
         is_extend_in_batch=(forward_mode == ForwardMode.EXTEND),
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens_cpu,

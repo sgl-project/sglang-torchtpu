@@ -125,6 +125,7 @@ def _make_forward_batch(
         req_pool_indices=req_pool_indices,
         req_pool_indices_cpu=req_pool_indices.clone(),
         forward_mode=forward_mode,
+        mix_verify_width=1,
         extend_seq_lens=extend_seq_lens,
         spec_info=None,
         seq_lens_cpu=seq_lens.clone(),
