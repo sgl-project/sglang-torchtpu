@@ -90,10 +90,14 @@ def spmd_safe_axis_index():
     def axis_index(axis_name):
         # A Pallas kernel body is being traced (``tracing_grid_env`` sets
         # ``grid_context``; ``core_map`` kernels too) or lowered/interpreted
-        # (``grid_env`` pushes the stack).
+        # (``grid_env`` pushes the stack), or the axes are a kernel mesh's
+        # rather than a program mesh's (``pl.kernel`` over a SparseCore
+        # ``VectorSubcoreMesh`` traces through ``mpmd_map``, which sets neither).
+        names = axis_name if isinstance(axis_name, tuple) else (axis_name,)
         if (
             pallas_core._pallas_tracing_env.grid_context is not None
             or pallas_core.current_grid_env() is not None
+            or not all(name in _MESH for name in names)
         ):
             return _STOCK_AXIS_INDEX(axis_name)
 
