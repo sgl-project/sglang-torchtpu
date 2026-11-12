@@ -1,5 +1,6 @@
 """CPU checks of which router top-k calls the TPU hooks hand to the kernel."""
 
+import importlib.util
 import unittest
 from unittest import mock
 
@@ -101,11 +102,109 @@ class TestRouterTopkHooks(CustomTestCase):
         with (
             tpu_envs.SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL.override(False),
             mock.patch.object(rt, "_OP_READY", False),
+            mock.patch.object(rt, "_ROWMAX_OP_READY", False),
             mock.patch.object(rt, "_build_op") as build,
+            mock.patch.object(rt, "_build_rowmax_op") as build_rowmax,
         ):
             rt.register_router_topk_op()
             self.assertFalse(rt._OP_READY)
+            self.assertFalse(rt._ROWMAX_OP_READY)
         build.assert_not_called()
+        build_rowmax.assert_not_called()
+
+
+class TestStableTopkHooks(CustomTestCase):
+    def setUp(self):
+        self.rowmax_out = ("rowmax_w", "rowmax_ids")
+        self.original = mock.Mock(return_value=("sort_w", "sort_ids"))
+        patches = [
+            mock.patch.object(rt, "_ROWMAX_OP", [lambda *a: self.rowmax_out]),
+            mock.patch.object(rt, "_ROWMAX_OP_READY", True),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _meta_values(rows: int, experts: int, dtype=torch.float32) -> torch.Tensor:
+        return torch.empty((rows, experts), dtype=dtype, device="meta")
+
+    def test_hook_is_registered(self):
+        from sglang.srt.plugins.hook_registry import HookType
+        from sglang_tpu.hooks import HOOKS
+        from sglang_tpu.hooks.moe_topk import stable_topk
+
+        self.assertIn(
+            ("sglang.srt.layers.moe.topk._stable_topk", stable_topk, HookType.AROUND),
+            HOOKS,
+        )
+
+    def test_eligible_shapes_route_to_rowmax_kernel(self):
+        for rows in (8, 64, 512, 4096, 10240):
+            with self.subTest(rows=rows):
+                self.original.reset_mock()
+                got = rt.stable_topk_around(
+                    self.original, self._meta_values(rows, 512), 10
+                )
+                self.assertEqual(got, self.rowmax_out)
+                self.original.assert_not_called()
+
+    def test_ineligible_inputs_keep_sort(self):
+        cases = {
+            "cpu tensor": (torch.zeros(64, 512, dtype=torch.float32), 10),
+            "bfloat16 values": (self._meta_values(64, 512, dtype=torch.bfloat16), 10),
+            "rows below 8": (self._meta_values(4, 512), 10),
+            "rows over 512 not divisible by 512 (513)": (
+                self._meta_values(513, 512),
+                10,
+            ),
+            "rows over 512 not divisible by 512 (768)": (
+                self._meta_values(768, 512),
+                10,
+            ),
+            "experts not aligned to 128": (self._meta_values(16, 100), 10),
+        }
+        for name, (values, topk) in cases.items():
+            with self.subTest(name):
+                self.original.reset_mock()
+                self.assertEqual(
+                    rt.stable_topk_around(self.original, values, topk),
+                    ("sort_w", "sort_ids"),
+                )
+                self.original.assert_called_once_with(values, topk)
+
+        with mock.patch.object(rt, "_ROWMAX_OP_READY", False):
+            values = self._meta_values(64, 512)
+            self.original.reset_mock()
+            self.assertEqual(
+                rt.stable_topk_around(self.original, values, 10),
+                ("sort_w", "sort_ids"),
+            )
+            self.original.assert_called_once_with(values, 10)
+
+    @unittest.skipUnless(importlib.util.find_spec("jax") is not None, "Requires JAX")
+    def test_rowmax_select_jax_matches_reference_and_ties(self):
+        import jax.numpy as jnp
+        import numpy as np
+
+        from sglang_tpu.kernels.router_topk import rowmax_select_jax
+
+        rng = np.random.default_rng(7)
+        for rows, experts, topk in ((8, 512, 10), (16, 256, 8), (512, 512, 10)):
+            scores_np = rng.standard_normal((rows, experts), dtype=np.float32)
+            # Force exact ties in row 0 across non-contiguous expert indices.
+            scores_np[0, :64] = 0.0
+            scores_np[0, 17] = 5.0
+            scores_np[0, 103] = 5.0
+            scores_np[0, experts // 2 + 17] = 5.0
+            scores_np[0, 5] = 2.0
+            got_w, got_ids = rowmax_select_jax(
+                jnp.asarray(scores_np), topk=topk, interpret=True
+            )
+            order = np.argsort(-scores_np, axis=-1, kind="stable")[:, :topk]
+            want_w = np.take_along_axis(scores_np, order, axis=-1)
+            np.testing.assert_array_equal(np.asarray(got_ids), order)
+            np.testing.assert_allclose(np.asarray(got_w), want_w, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

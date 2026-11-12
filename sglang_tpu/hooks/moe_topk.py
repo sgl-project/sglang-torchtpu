@@ -37,3 +37,9 @@ def biased_grouped_topk(original, *args, **kwargs):
     from sglang_tpu.moe.router_topk_tpu import biased_grouped_topk_around
 
     return biased_grouped_topk_around(original, *args, **kwargs)
+
+
+def stable_topk(original, *args, **kwargs):
+    from sglang_tpu.moe.router_topk_tpu import stable_topk_around
+
+    return stable_topk_around(original, *args, **kwargs)

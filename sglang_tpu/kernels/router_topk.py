@@ -188,3 +188,49 @@ def router_topk_jax(
         interpret=interpret,
         name=f"router_topk_{k}_of_{experts}",
     )(logits, bias.reshape(experts).astype(jnp.float32))
+
+
+_ROWMAX_NEG = -3.0e38
+_ROWMAX_MAX_BLOCK_ROWS = 512
+
+
+def _rowmax_select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
+    """One block of rows: top ``topk`` by repeated max-and-mask (ties pick lowest id)."""
+    import jax
+    import jax.numpy as jnp
+
+    x = jnp.where(x_ref[...] > _ROWMAX_NEG, x_ref[...], _ROWMAX_NEG)
+    masked = jnp.finfo(x.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    for j in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
+        w_ref[:, j] = m[:, 0]
+        i_ref[:, j] = idx.astype(jnp.int32)
+        x = jnp.where(iota == idx[:, None], masked, x)
+    w_ref[...] = jnp.where(w_ref[:, :1] <= _ROWMAX_NEG, jnp.nan, w_ref[...])
+
+
+def rowmax_select_jax(scores, topk: int, interpret: bool = False):
+    """Sort-free top-k over ``[rows, experts]`` f32 scores, returning (f32, i32)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+
+    rows, n = scores.shape
+    block = min(_ROWMAX_MAX_BLOCK_ROWS, rows)
+    return pl.pallas_call(
+        functools.partial(_rowmax_select_kernel, topk=topk, n=n),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[pl.BlockSpec((block, n), lambda i: (i, 0))],
+        out_specs=[
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, topk), jnp.float32),
+            jax.ShapeDtypeStruct((rows, topk), jnp.int32),
+        ],
+        interpret=interpret,
+        name=f"router_rowmax_topk_{topk}_of_{n}",
+    )(scores)
