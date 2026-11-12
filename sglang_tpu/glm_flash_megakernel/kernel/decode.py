@@ -69,6 +69,13 @@ class KernelConfig:
     table_pages: int | None = None
     n_layers: int | None = None
     attn_tile: int = 512
+    # Pooled-record tiles in flight during the indexer scan (rec_slots - 1 prefetched).
+    rec_slots: int = 2
+    # Selected pools fetched per attention group; attention reads only selected pools.
+    gather_slots: int = 128
+    # Context parallel DSA: each chip scans, selects and attends the tiles whose index is
+    # its rank modulo tp; the top-k threshold and the attention partials merge across chips.
+    context_parallel: bool = False
     fp8_kda: bool = True
     # Static layer indices: the period loop body spills ~36 MiB of VMEM at 32 rows.
     unroll_periods: bool = False
@@ -249,6 +256,33 @@ def _flags(cfg: KernelConfig):
     return (cfg.fp8_kda, cfg.ch_experts, cfg.km_cols, cfg.km_slots, cfg.km_issue)
 
 
+
+# Pools per score row: the selection mask is (Q, rows, POOL_ROW), one lane per pool.
+POOL_ROW = 128
+MK_ABL = os.environ.get("MK_ABL", "")  # trace-time ablation knobs (debug only)
+
+
+def score_rows(n_rows, tp, cfg):
+    """Score / mask rows held per chip: every row, or under context parallel the chip's
+    share plus two top-k chunks of slack (the share starts inside a chunk)."""
+    if not cfg.context_parallel or "allown" in MK_ABL or "bigrc" in MK_ABL:
+        return n_rows
+    ch = min(n_rows, 64)
+    return min(n_rows, ((n_rows + tp - 1) // tp + 7) // 8 * 8 + 2 * ch)
+
+# Rows of the nope pool one gathered block holds (an 8-row u32 tile: DMAs into VMEM
+# slices must be tile-aligned), so a block holds BLOCK_ROWS // kpool pools.
+BLOCK_ROWS = 16
+
+
+def gather_dims(spec, cfg: KernelConfig):
+    """(slots per group, rows per group, max groups) of the selected-pool gather."""
+    gs = cfg.gather_slots
+    n_slots = cfg.n_query * spec.index_select_k + 1  # + the forced tail pool
+    ng = (n_slots + gs - 1) // gs + 1
+    return gs, gs * BLOCK_ROWS, ng
+
+
 def scratch_shapes(spec, layout, cfg: KernelConfig):
     FP8_KDA, CH_EXPERTS, KM_TILE, KM_SLOTS, KM_PF = _flags(cfg)
     tp = layout.tp
@@ -290,20 +324,27 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         ),
         pltpu.VMEM((S, 1, 2 * moesh) if CH_EXPERTS else (1, 1, 128), F32),
         pltpu.VMEM((S, 1, H) if CH_EXPERTS else (1, 1, 128), F32),
-        # A request's KDA state lands in st / cv3; each query's state is then
-        # checkpointed from the stq / cvq pair: the delta rule cannot be undone.
-        pltpu.VMEM((hkda, dh, dh), F32),
-        pltpu.VMEM((2, hkda, dh, dh), F32),
+        # A request's KDA state lands in st / cv3 (st, stq: views of the arena); each
+        # query's state is then checkpointed from stq / cvq: the delta rule cannot be undone.
         # Conv state in the pool's channels-last [K-1, 1, C] form.
         pltpu.VMEM((k1, 1, 3 * qsh), F32),
         pltpu.VMEM((2, k1, 1, 3 * qsh), F32),
-        # One attention tile of nope word rows, and its pooled records.
-        pltpu.VMEM((2, TK, PL.NOPE_BYTES // PL.WORD_BYTES), u32),
-        pltpu.VMEM((2, PT // PL.WORD_BYTES, PL.record_bytes(idh)), u32),
+        # One group of gathered nope word rows, and one tile of pooled records.
+        pltpu.VMEM((arena_rows(spec, layout, cfg), 128), F32),
+        pltpu.VMEM((cfg.rec_slots, PT // PL.WORD_BYTES, PL.record_bytes(idh)), u32),
         pltpu.VMEM((32, 2 * idh), BF16),
-        pltpu.VMEM((Q, L // TK, PT), F32),
+        # Scores / selection mask: one row per 128 pools, whatever the scan tile.
+        pltpu.VMEM((Q, score_rows(L // (kp * POOL_ROW), tp, cfg), POOL_ROW), F32),
+        # Context parallel: the selection mask kept apart from the scores, and one
+        # [rows, H/tp] block staged for the cross-chip exchanges.
+        pltpu.VMEM(
+            (Q, score_rows(L // (kp * POOL_ROW), tp, cfg), POOL_ROW)
+            if cfg.context_parallel
+            else (1, 8, 128),
+            F32,
+        ),
+        pltpu.VMEM((R, H // layout.tp), F32),
         pltpu.VMEM((nh * (qk + vd), kvl), BF16),
-        pltpu.VMEM((2 * qsh, dh), BF16),
         pltpu.VMEM((1, qsh), F32),
         pltpu.VMEM((1, 3 * qsh + H), F32),
         pltpu.VMEM((spec.linear_conv_kernel_dim, 1, 3 * qsh), BF16),
@@ -344,13 +385,49 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         pltpu.SemaphoreType.DMA((KM_SLOTS,)),
         pltpu.SemaphoreType.DMA((S,)),
         pltpu.SemaphoreType.DMA((S,)),
-        pltpu.SemaphoreType.DMA((8,)),
+        pltpu.SemaphoreType.DMA((6 + max(2, cfg.rec_slots),)),
         pltpu.SemaphoreType.DMA((8,)),
         pltpu.SemaphoreType.DMA((8 * S,)),
         pltpu.SemaphoreType.DMA((2, 2)),
         pltpu.SemaphoreType.DMA((2, S)),
         pltpu.SemaphoreType.DMA((2, 2)),
+        # Selected pools per group as (pool << 4 | query bits); the SMEM copy addresses the DMAs.
+        pltpu.VMEM((gather_dims(spec, cfg)[2], 128), jnp.int32),
+        pltpu.SMEM((gather_dims(spec, cfg)[2], 128), jnp.int32),
+        pltpu.SemaphoreType.DMA((1,)),
+        # Context parallel exchange pads, one slot per peer and parity: every chip's absorbed
+        # queries for all heads (bf16, once per layer), the selected scores (f32), and the
+        # attention partials addressed to each head owner (f32: acc rows, then m and l rows).
+        pltpu.VMEM((1, tp, B * nh * Q, kvl) if cfg.context_parallel else (1, 1, 16, 128), BF16),
+        pltpu.VMEM((2, tp, 8, hsh) if cfg.context_parallel else (1, 1, 8, 128), F32),
+        pltpu.VMEM((2, tp, cp_att_rows(nh, Q), kvl) if cfg.context_parallel else (1, 1, 8, 128), F32),
+        # Staged partials, block d in columns [d * kvl, (d + 1) * kvl): a remote DMA takes a
+        # column slice of a 2-D source, not a leading index of a 3-D one.
+        pltpu.VMEM((cp_att_rows(nh, Q), tp * kvl) if cfg.context_parallel else (8, 128), F32),
+        pltpu.VMEM((B * nh * Q, kvl) if cfg.context_parallel else (16, 128), BF16),
+        pltpu.VMEM((8, hsh) if cfg.context_parallel else (8, 128), F32),
+        pltpu.SemaphoreType.DMA((3, 2, 3)),
+        # One round counter per pad: parity must alternate between consecutive rounds on
+        # a pad, and a loop body traced once cannot alternate a static parity.
+        pltpu.SMEM((3,), jnp.int32),
     ]
+
+
+def arena_rows(spec, layout, cfg):
+    """f32 [rows, 128] shared by phases that never overlap: the DSA gathered-pool
+    blocks, or the KDA state copies (stq, st) and the f/g gate weights (fgb)."""
+    tp = layout.tp
+    hkda, dh = spec.linear_num_heads // tp, spec.linear_head_dim
+    qsh = spec.kda_qkv_dim // tp
+    if dh != 128 or (2 * qsh * dh * 2) % (128 * 4):
+        raise ValueError("arena views need linear_head_dim == 128")
+    kda = 3 * hkda * dh + (2 * qsh * dh * 2) // (128 * 4)
+    return max(2 * gather_dims(spec, cfg)[1], kda)
+
+
+def cp_att_rows(nh, q):
+    """Rows of one attention-partials block: nh * q accumulator rows, then m and l rows."""
+    return (nh * q + 2 + 7) // 8 * 8
 
 
 def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
@@ -441,16 +518,15 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         r8d,
         egsr,
         edsr,
-        st,
-        stq,
         cv3,
         cvq,
-        kvw,
+        arena,
         rkw,
         rawb,
         scr,
+        mskb,
+        xrow,
         kvb,
-        fgb,
         dtv,
         ksc,
         cwv,
@@ -492,9 +568,29 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         sslab,
         s8s,
         sck,
+        gidx,
+        gsm,
+        gsem,
+        cpq,
+        cpsc,
+        cpatt,
+        cpsrc,
+        cpqsrc,
+        cpscsrc,
+        cpsem,
+        cpctr,
     ):
         me = jax.lax.axis_index(AXIS)
         sm, smf = _Half(sm2), _Half(smf2)
+        # Phase-exclusive views of the arena: DSA gathers into kvw; KDA keeps its state in
+        # stq / st and its gate weights in fgb. Every DMA into them is waited in its phase.
+        kvw = arena.bitcast(jnp.uint32).reshape(2, gather_dims(spec, cfg)[1], 128)
+        stq = arena.at[pl.ds(0, 2 * hkda * dh)].reshape(2, hkda, dh, dh)
+        st = arena.at[pl.ds(2 * hkda * dh, hkda * dh)].reshape(hkda, dh, dh)
+        fgb = arena.at[pl.ds(3 * hkda * dh, qsh)].bitcast(BF16)
+        if cfg.context_parallel:
+            for i in range(3):
+                cpctr[i] = jnp.int32(0)  # SMEM scratch starts undefined
 
         SLAB1 = cfg.single_slab
 
@@ -586,6 +682,31 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 rs_send(par, 0, H, cps)
                 agsrc[...] = rs_finish(par, cps).astype(BF16)
                 return ag_round(par, agsrc).astype(F32)[: rows.shape[0]]
+
+        def cp_exchange(src_of, dst, pad):
+            """One round on CP pad `pad`: src_of(d) lands in dst[par, me] on chip d; -> par.
+            A peer is at most one round ahead on a pad, so two parities suffice."""
+            n = cpctr[pad]
+            par = jax.lax.rem(n, dst.shape[0])  # pads with one slot never alternate
+            cpctr[pad] = n + 1
+            cps = []
+            for d in range(tp):
+                src = src_of(d)
+                local = pltpu.make_async_copy(src, dst.at[par, me], cpsem.at[pad, par, 0])
+                remote = pltpu.make_async_remote_copy(
+                    src_ref=src,
+                    dst_ref=dst.at[par, me],
+                    send_sem=cpsem.at[pad, par, 1],
+                    recv_sem=cpsem.at[pad, par, 2],
+                    device_id=d,
+                )
+                pl.when(me == d)(local.start)
+                pl.when(me != d)(remote.start)
+                cps.append((d, local, remote))
+            for d, local, remote in cps:
+                pl.when(me == d)(local.wait)
+                pl.when(me != d)(remote.wait)
+            return par
 
         S = cfg.slots if cfg.ring else 1
         PF = cfg.prefetch if cfg.ring else 0
@@ -923,9 +1044,15 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     scale=ksc[:, 3 * qsh :] if FP8_KDA else None,
                 )
 
-        TK = cfg.attn_tile
-        PT = TK // kp
+        TK = cfg.attn_tile  # tokens per indexer scan tile
+        PT = TK // kp  # pooled records per scan tile
         NT = Lcap // TK
+        PR = POOL_ROW
+        TKR = PR * kp  # tokens per score row
+        NR = Lcap // TKR
+        if TK % TKR:
+            raise ValueError(f"attn_tile={TK} must be a multiple of {TKR}")
+        MR = TK // TKR  # score rows per scan tile
         TPG = TK // ps  # pages per attention tile
         if Q + kp + 15 > 32:
             raise ValueError(f"n_query={Q}: the pools closed this step span > 32 rows")
@@ -1002,12 +1129,33 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             # Read kv_b per head from the ref: a whole-block f32 value is an 8 MiB spill.
             scaling = qk**-0.5 * ks
             pcol = jax.lax.broadcasted_iota(jnp.int32, (PT, 1), 0)
-            gidx = jax.lax.broadcasted_iota(
-                jnp.int32, (NT, PT), 0
-            ) * PT + jax.lax.broadcasted_iota(jnp.int32, (NT, PT), 1)
-            pool_end = (gidx + 1) * kp - 1
-            tok = jax.lax.broadcasted_iota(jnp.int32, (1, TK), 1)
-            lane = jax.lax.broadcasted_iota(jnp.int32, (1, PT), 1)
+            lane = jax.lax.broadcasted_iota(jnp.int32, (1, PR), 1)
+            CP = cfg.context_parallel
+            msk = mskb if CP else scr  # selection masks (in place of the scores when not CP)
+            # Context parallel: chip me owns the contiguous score rows [r_lo, r_hi), a
+            # multiple of the top-k chunk, so every sweep covers 1/tp of the context.
+            RCH = min(NR, 64)  # top-k chunk; ownership bounds are masked inside the chunk
+            own = [jnp.int32(0), jnp.int32(NR)]  # [r_lo, r_hi), set per request by own_rows_for
+            # scr / msk hold rows [base, base + LR): the chunk-aligned start of the share.
+            LR = score_rows(NR, tp, cfg)
+            base = [jnp.int32(0)]
+
+            def own_rows_for(n_rows):
+                """CP: chip me owns rows [me * RC, me * RC + RC) of the request's n_rows,
+                RC = n_rows / tp rounded up to the 8-row compaction block."""
+                if CP:
+                    RC = ((n_rows + tp - 1) // tp + 7) // 8 * 8
+                    if "bigrc" in MK_ABL:  # ablation: chip 0 owns every row
+                        RC = NR
+                    own[0] = me * RC
+                    own[1] = jnp.minimum(own[0] + RC, n_rows)
+                    if "allown" in MK_ABL:  # ablation: every chip owns every row
+                        own[0] = jnp.int32(0)
+                        own[1] = n_rows
+                    base[0] = own[0] // RCH * RCH
+
+            own_row = (lambda r: (r >= own[0]) & (r < own[1])) if CP else (lambda r: True)
+            own_rows = (lambda: (own[0], own[1])) if CP else (lambda: None)
 
             def page(b, pg):
                 return PL.page_of(tab_ref, b, pg, PPS)
@@ -1066,18 +1214,231 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         ).start(),
                     )
 
-            def kv_fetch(b, t, slot):
-                for i in range(TPG):
-                    pg = page(b, t * TPG + i)
-                    PL.dispatch(
-                        d_i,
-                        n_dsa,
-                        lambda d, i=i, pg=pg: pltpu.make_async_copy(
-                            PL.nope_page(p_nope[d], pg, ps),
-                            kvw.at[slot, pl.ds(i * ps, ps)],
-                            sgrp.at[4 + slot],
-                        ).start(),
+            GS, GR, NG = gather_dims(spec, cfg)
+            BR = BLOCK_ROWS
+            PPB = BR // kp  # pools per gathered block
+            PPP = ps // kp  # pools per page
+            TB = min(8, NR)  # score rows compacted per step: one (8, PR) vreg
+            if BR % kp or NR % TB:
+                raise ValueError(f"kpool {kp} must divide {BR} and {TB} must divide {NR} rows")
+            if GS != PR:
+                raise ValueError(f"gather_slots must be {PR}, got {GS}")
+            sub = jax.lax.broadcasted_iota(jnp.int32, (TB, 1), 0)
+            lane8 = jax.lax.broadcasted_iota(jnp.int32, (TB, PR), 1)
+            glane = jax.lax.broadcasted_iota(jnp.int32, (1, GR), 1)
+            i32 = jnp.int32
+            CAND = 16  # selected pools placed per round; a round straddles at most one group
+
+            def compact(p, nts):
+                """Selected pools of every query, in pool order, into gidx / gsm as
+                (pool << 4 | query bits); returns their count."""
+                c_tail = p // kp
+
+                def rows(k):
+                    return pl.ds(pl.multiple_of(k * TB - base[0], TB), TB)
+
+                def block(k, carry):
+                    cur, nxt, base, g = carry
+                    t0 = k * TB
+                    qb = jnp.zeros((TB, PR), i32)
+                    for q in range(Q):
+                        qb = qb | ((msk[q, rows(k), :] > 0.5).astype(i32) << q)
+                    pid = (t0 + sub) * PR + lane8
+                    sel = (qb != 0) & ((t0 + sub) < nts)
+                    if spec.index_kpool_always_select_tail:
+                        # The open tail pool holds tokens before p that every query attends;
+                        # context parallel: only the chip owning p's tile gathers it.
+                        sel = sel | ((pid == c_tail) & (p % kp > 0) & own_row(p // TKR))
+                    s32 = sel.astype(i32)
+                    pre = s32
+                    for sh in (1, 2, 4, 8, 16, 32, 64):
+                        pre = pre + jnp.where(lane8 >= sh, pltpu.roll(pre, sh, 1), 0)
+                    rs = jnp.broadcast_to(pre[:, PR - 1 : PR], (TB, PR))
+                    rp = rs
+                    for sh in (1, 2, 4):
+                        if sh < TB:
+                            rp = rp + jnp.where(sub >= sh, pltpu.roll(rp, sh, 0), 0)
+                    rank = pre - s32 + rp - rs  # block-local order of each selected pool
+                    n_blk = jnp.sum(s32)
+                    val = (pid << 4) | qb
+
+                    def more(st):
+                        return st[2] < n_blk
+
+                    def place(st):
+                        cur, nxt, done, base, g = st
+                        for j in range(CAND):
+                            hit = sel & (rank == done + j)
+                            v = jnp.sum(jnp.where(hit, val, 0))
+                            s_rel = base + done + j - g * GS
+                            cur = jnp.where(lane == s_rel, v, cur)
+                            nxt = jnp.where(lane == s_rel - GS, v, nxt)
+                        done = jnp.minimum(done + CAND, n_blk)
+                        # Flush a filled group; CAND slots never pass a second boundary.
+                        full = base + done >= (g + 1) * GS
+
+                        @pl.when(full)
+                        def _():
+                            gidx[pl.ds(g, 1), :] = cur
+
+                        cur = jnp.where(full, nxt, cur)
+                        nxt = jnp.where(full, jnp.zeros_like(nxt), nxt)
+                        g = jnp.where(full, g + 1, g)
+                        return cur, nxt, done, base, g
+
+                    cur, nxt, _, base, g = jax.lax.while_loop(
+                        more, place, (cur, nxt, jnp.int32(0), base, g)
                     )
+                    return cur, nxt, base + n_blk, g
+
+                zrow = jnp.zeros((1, GS), i32)
+                k_lo = own[0] // TB
+                k_hi = jnp.maximum(k_lo, jnp.minimum((nts + TB - 1) // TB, (own[1] + TB - 1) // TB))
+                cur, _, n_sel, g = jax.lax.fori_loop(
+                    k_lo, k_hi, block, (zrow, zrow, jnp.int32(0), jnp.int32(0))
+                )
+                gidx[pl.ds(g, 1), :] = cur
+                cp = pltpu.make_async_copy(gidx, gsm, gsem.at[0])
+                cp.start()
+                cp.wait()
+                return n_sel
+
+            UNSEL = -1e30  # exact in bf16, so the exchange carries it unchanged
+
+            def compact_scores(q, n_rows):
+                """Query q's selected scores (own rows), in pool order, as one [1, hsh] row;
+                unfilled lanes hold UNSEL (scores are finite and far above it)."""
+                NGRP = hsh // PR  # 128-lane groups in the row
+                if hsh % PR or selk > hsh:
+                    raise ValueError(f"H/tp={hsh} must hold {selk} scores in 128-lane groups")
+
+                def rows(k):
+                    return pl.ds(pl.multiple_of(k * TB - base[0], TB), TB)
+
+                def block(k, carry):
+                    grp, base = carry
+                    t0 = k * TB
+                    sel = (msk[q, rows(k), :] > 0.5) & ((t0 + sub) < n_rows)
+                    val = scr[q, rows(k), :]
+                    s32 = sel.astype(i32)
+                    pre = s32
+                    for sh in (1, 2, 4, 8, 16, 32, 64):
+                        pre = pre + jnp.where(lane8 >= sh, pltpu.roll(pre, sh, 1), 0)
+                    rs = jnp.broadcast_to(pre[:, PR - 1 : PR], (TB, PR))
+                    rp = rs
+                    for sh in (1, 2, 4):
+                        if sh < TB:
+                            rp = rp + jnp.where(sub >= sh, pltpu.roll(rp, sh, 0), 0)
+                    rank = pre - s32 + rp - rs
+                    n_blk = jnp.sum(s32)
+
+                    def more(st):
+                        return st[1] < n_blk
+
+                    def place(st):
+                        grp, done, base = st
+                        grp = list(grp)
+                        for j in range(CAND):
+                            hit = sel & (rank == done + j)
+                            v = jnp.sum(jnp.where(hit, val, 0.0))
+                            s_abs = base + done + j
+                            gi, li = s_abs // PR, s_abs % PR
+                            for gg in range(NGRP):
+                                grp[gg] = jnp.where((lane == li) & (gi == gg), v, grp[gg])
+                        return tuple(grp), jnp.minimum(done + CAND, n_blk), base
+
+                    grp, _, base = jax.lax.while_loop(more, place, (grp, jnp.int32(0), base))
+                    return grp, base + n_blk
+
+                init = tuple(jnp.full((1, PR), UNSEL, F32) for _ in range(NGRP))
+                k_lo = own[0] // TB
+                k_hi = jnp.maximum(k_lo, jnp.minimum((n_rows + TB - 1) // TB, (own[1] + TB - 1) // TB))
+                grp, _ = jax.lax.fori_loop(k_lo, k_hi, block, (init, jnp.int32(0)))
+                return jnp.concatenate(list(grp), axis=1)
+
+            def merge_topk(b, p, n_rows):
+                """Context parallel: exchange every chip's selected scores, find the global
+                top-k threshold per query, and rewrite this chip's mask to its share."""
+                lane_h = jax.lax.broadcasted_iota(jnp.int32, (1, H), 1)
+                for q in range(Q):
+                    cpscsrc[pl.ds(q, 1), :] = compact_scores(q, n_rows)
+                par = cp_exchange(lambda d: cpscsrc, cpsc, 1)
+                los, his, needs = [], [], []
+                for q in range(Q):
+                    # [1, H]: chip c's selected scores at lanes c*hsh.
+                    gq = jnp.concatenate(
+                        [cpsc[par, d, pl.ds(q, 1), :] for d in range(tp)], axis=1
+                    )
+                    valid = gq > 0.5 * UNSEL
+                    want = jnp.minimum(jnp.sum(valid.astype(i32)), selk)
+                    lo = jnp.min(jnp.where(valid, gq, jnp.inf)) - 1.0
+                    hi_ = jnp.max(gq) + 1.0
+
+                    def cnt(t):
+                        return jnp.sum((gq > t).astype(i32))
+
+                    def more(st):
+                        i, lo, hi_, c_lo, c_hi = st
+                        return (i < 40) & (c_lo != want)
+
+                    def step_(st):
+                        i, lo, hi_, c_lo, c_hi = st
+                        mid = 0.5 * (lo + hi_)
+                        c = cnt(mid)
+                        up = c >= want
+                        return (
+                            i + 1,
+                            jnp.where(up, mid, lo),
+                            jnp.where(up, hi_, mid),
+                            jnp.where(up, c, c_lo),
+                            jnp.where(up, c_hi, c),
+                        )
+
+                    _, lo, hi_, c_lo, c_hi = jax.lax.while_loop(
+                        more, step_, (jnp.int32(0), lo, hi_, cnt(lo), cnt(hi_))
+                    )
+                    exact = c_lo == want
+                    hi_ = jnp.where(exact, lo, hi_)
+                    need = jnp.where(exact, 0, want - c_hi)
+                    tie = (gq > lo) & ~(gq > hi_)
+                    chip = lane_h // hsh
+                    before = jnp.sum((tie & (chip < me)).astype(i32))
+                    mine = jnp.sum((tie & (chip == me)).astype(i32))
+                    quota = jnp.clip(need - before, 0, mine)
+                    los.append(lo)
+                    his.append(hi_)
+                    needs.append(quota)
+
+                def stack(vs):
+                    return jnp.stack([jnp.reshape(v, (1, 1)) for v in vs], axis=0)
+
+                K.topk_write(
+                    scr, msk, lo=stack(los), hi=stack(his), need=stack(needs),
+                    n_tiles=n_rows, chunk_tiles=RCH, rows=own_rows(), within=True,
+                    base=base[0],
+                )
+
+            def gather_group(b, g, slot, n_sel):
+                """DMA the group's selected pools (8-row blocks) into kvw[slot]; slots past
+                the count refetch the group's first pool so the byte-counted wait matches."""
+                fill = gsm[g, 0] >> 4
+
+                def issue(d):
+                    def one(s, c):
+                        v = gsm[g, s] >> 4
+                        pid = jnp.where(g * GS + s < n_sel, v, fill)
+                        pg = page(b, pid // PPP)
+                        off = pl.multiple_of(((pid % PPP) // PPB) * BR, BR)
+                        pltpu.make_async_copy(
+                            PL.nope_page(p_nope[d], pg, ps).at[pl.ds(off, BR)],
+                            kvw.at[slot, pl.ds(pl.multiple_of(s * BR, BR), BR)],
+                            sgrp.at[4 + slot],
+                        ).start()
+                        return c
+
+                    jax.lax.fori_loop(0, GS, one, 0)
+
+                PL.dispatch(d_i, n_dsa, issue)
 
             def select(b, r0, p, last, fp0, fresh, keys):
                 """Top-k pool mask of each query into `scr`, scoring the pooled records."""
@@ -1090,15 +1451,23 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     hw_blk = jnp.where(
                         hcol // hi == hrow, jnp.tile(hw_q, (1, Q)), 0.0
                     ).astype(F32)
-                rec_fetch(b, 0, 0)
+                RS = cfg.rec_slots
+                # Context parallel: this chip scans the tiles of its row range; j indexes them.
+                if CP and MR != 1:
+                    raise ValueError("context_parallel needs attn_tile == kpool * 128")
+                t_of = (lambda j: own[0] + j) if CP else (lambda j: j)
+                n_scan = jnp.maximum(0, jnp.minimum(nts, own[1]) - own[0]) if CP else nts
+                for j in range(RS - 1):
+                    pl.when(j < n_scan)(lambda j=j: rec_fetch(b, t_of(j), j))
 
-                def score_tile(t, c):
-                    slot = jax.lax.rem(t, 2)
+                def score_tile(j, c):
+                    t = t_of(j)
+                    slot = jax.lax.rem(j, RS)
                     PL.wait_dma(rkw.at[slot], sgrp.at[6 + slot])
 
-                    @pl.when(t + 1 < nts)
+                    @pl.when(j + RS - 1 < n_scan)
                     def _():
-                        rec_fetch(b, t + 1, 1 - slot)
+                        rec_fetch(b, t_of(j + RS - 1), jax.lax.rem(j + RS - 1, RS))
 
                     pk = PL.unpack_records(rkw[slot], idh)
                     for i in range(Q):
@@ -1107,65 +1476,88 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         )
                     if Q > 1:
                         sc = K.indexer_scores(iq_cat, hw_blk, pk, idh**-0.5)
-                        scr[:, pl.ds(t, 1), :] = sc.reshape(Q, 1, PT)
                     else:
-                        scr[0, pl.ds(t, 1), :] = K.indexer_scores(
-                            iq_cat, hw_q, pk, idh**-0.5
-                        )
+                        sc = K.indexer_scores(iq_cat, hw_q, pk, idh**-0.5)
+                    r0 = pl.multiple_of(t * MR, MR) if MR > 1 else t - base[0]
+                    scr[:, pl.ds(r0, MR), :] = sc.reshape(Q, MR, PR)
                     return c
 
                 with _scope("dsa_scores"):
-                    jax.lax.fori_loop(0, nts, score_tile, 0)
-                eligs = [pool_end <= p + qi for qi in range(Q)]
-                if Q == 1:
-                    chosen = K.select_top_k_mask_2d(
-                        jnp.where(eligs[0], scr[0], -jnp.inf), selk
-                    )[None]
-                else:
-                    chosen = K.select_top_k_mask_3d(
-                        jnp.where(jnp.stack(eligs), scr[...], -jnp.inf), selk
-                    )
-                scr[...] = chosen.astype(F32)  # the scores are not needed again
+                    jax.lax.fori_loop(0, n_scan, score_tile, 0)
+                # Chunked over the score scratch: whole-context values spill ~30 MiB at 1M.
+                n_rows = last // TKR + 1
+                lo, hi_, need = K.topk_bisect(
+                    scr, k=selk, p=p, kp=kp, n_tiles=n_rows, chunk_tiles=RCH, rows=own_rows(),
+                    base=base[0],
+                )
+                K.topk_write(
+                    scr, msk, lo=lo, hi=hi_, need=need, n_tiles=n_rows, chunk_tiles=RCH,
+                    rows=own_rows(), base=base[0],
+                )
+                if CP and "notopk" not in MK_ABL:
+                    with _scope("dsa_merge_topk"):
+                        merge_topk(b, p, n_rows)
 
-            def allowed_rows(p, tok_ids, t, before=None):
-                """[Q, width] f32 0/1 token mask of each query over tile `t` (or the new
-                rows when t is None); one-row bool masks do not concatenate."""
+            def allowed_new(p, tok_ids):
+                """[Q, 16] f32 0/1 mask of each query over the step's own new rows."""
                 rows = []
                 for qi in range(Q):
                     p_q = p + qi
-                    if t is None:
-                        sel = jnp.zeros(tok_ids.shape, jnp.bool_)
-                        for i in range(Q):
-                            ti, ci = (p + i) // TK, ((p + i) % TK) // kp
-                            hit = (
-                                jnp.sum(
-                                    jnp.where(lane == ci, scr[qi, pl.ds(ti, 1), :], 0.0)
+                    sel = jnp.zeros(tok_ids.shape, jnp.bool_)
+                    for i in range(Q):
+                        ti, ci = (p + i) // TKR, ((p + i) % TKR) // kp
+                        hit = (
+                            jnp.sum(
+                                jnp.where(
+                                    lane == ci,
+                                    msk[qi, pl.ds(jnp.clip(ti - base[0], 0, LR - 1), 1), :],
+                                    0.0,
                                 )
-                                > 0.5
                             )
-                            sel = sel | ((tok_ids == p + i) & hit)
-                    else:
-                        # Repeating a bool lowers to an i1 transpose; repeat the f32 and compare.
-                        sel = jnp.repeat(scr[qi, pl.ds(t, 1), :], kp, axis=1) > 0.5
+                            > 0.5
+                        ) & own_row(ti)  # the mask row is current only on its owner
+                        sel = sel | ((tok_ids == p + i) & hit)
                     if spec.index_kpool_always_select_tail:
                         tail_count = jax.lax.rem(p_q + 1, kp)
                         tail_lo = p_q + 1 - tail_count
                         sel = sel | ((tok_ids >= tail_lo) & (tail_count > 0))
-                    sel = sel & (tok_ids <= p_q)
-                    if before is not None:
-                        sel = sel & before
+                    sel = sel & (tok_ids <= p_q) & own_row(tok_ids // TKR)
                     rows.append(jnp.where(sel, 1.0, 0.0).astype(F32))
                 return jnp.concatenate(rows, axis=0) if Q > 1 else rows[0]
 
-            def heads(mask_rows):
-                """[Q, width] 0/1 -> bool [nh * Q, width] in the (head, query) row order."""
-                return jnp.tile(mask_rows, (nh, 1)) > 0.5
+            def allowed_group(p, g, n_sel):
+                """[Q, GR] f32 0/1 mask over group g's gathered rows: a row counts for query
+                q when its pool was selected by q (or is q's open tail) and it is before p."""
+                v = gidx[pl.ds(g, 1), :]
+                pid = jnp.repeat(v >> 4, BR, axis=1)
+                qb = jnp.repeat(v & 15, BR, axis=1)
+                i_r = glane % BR
+                tok = (pid // PPB) * BR + i_r
+                in_pool = (i_r // kp) == (pid % PPB)
+                valid = (g * GS + glane // BR) < n_sel
+                rows = []
+                for qi in range(Q):
+                    p_q = p + qi
+                    sel = ((qb >> qi) & 1) > 0
+                    if spec.index_kpool_always_select_tail:
+                        tail_count = jax.lax.rem(p_q + 1, kp)
+                        tail_lo = p_q + 1 - tail_count
+                        sel = sel | ((tok >= tail_lo) & (tail_count > 0))
+                    sel = sel & in_pool & valid & (tok < p)
+                    rows.append(jnp.where(sel, 1.0, 0.0).astype(F32))
+                return jnp.concatenate(rows, axis=0) if Q > 1 else rows[0]
 
-            def attend(b, r0, p):
-                """Online softmax over the request's pool tiles, then its own new rows."""
-                nta = (p + TK - 1) // TK
+            nha = tp * nh if CP else nh  # heads attended per chip: all of them under CP
+            nhQ = nh * Q
+
+            def heads(mask_rows):
+                """[Q, width] 0/1 -> bool [nha * Q, width] in the (head, query) row order."""
+                return jnp.tile(mask_rows, (nha, 1)) > 0.5
+
+            def q_absorbed(b):
+                """Request b's queries through kv_b: [nh * Q, kvl] rows h * Q + qi."""
                 qrows = qallb[b, pl.ds(0, Q), :]
-                q_abs = jnp.concatenate(
+                return jnp.concatenate(
                     [
                         dot(
                             qrows[:, h * qk : (h + 1) * qk],
@@ -1176,9 +1568,42 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     ],
                     axis=0,
                 )
-                q_bf = q_abs.astype(BF16)  # rows h * Q + qi
 
-                pl.when(nta > 0)(lambda: kv_fetch(b, 0, 0))
+            qpar = [0]
+
+            def share_queries():
+                """CP: every chip's absorbed queries for all requests, one round per layer."""
+                cpqsrc[...] = jnp.concatenate(
+                    [q_absorbed(b) for b in range(B)], axis=0
+                ).astype(BF16)
+                rowi = jax.lax.broadcasted_iota(jnp.int32, cpqsrc.shape, 0) // 8
+                if "patq" in MK_ABL:  # debug: stamp me * 10 + 100 * layer + row / 8
+                    cpqsrc[...] = (me * 10 + 100 * d_i + rowi).astype(F32).astype(BF16)
+                if "patqs" in MK_ABL:  # debug: small identical-per-block stamp (no overflow)
+                    cpqsrc[...] = ((me * 10 + rowi).astype(F32) * 0.001).astype(BF16)
+                qpar[0] = cp_exchange(lambda d: cpqsrc, cpq, 0)
+                if "chkq" in MK_ABL:  # debug: per-slot max |received - stamp| -> new-KV row 0
+                    lane_ = jax.lax.broadcasted_iota(jnp.int32, (1, PR), 1)
+                    out = jnp.zeros((1, PR), F32)
+                    for d in range(tp):
+                        exp_ = (d * 10 + 100 * d_i + rowi).astype(F32)
+                        diff = jnp.max(jnp.abs(cpq[qpar[0], d].astype(F32) - exp_))
+                        out = jnp.where(lane_ == d, diff, out)
+                    o_nkv[d_i, pl.ds(0, 1), pl.ds(0, PR)] = out.astype(BF16)
+
+            def attend(b, r0, p, n_sel):
+                """Online softmax over the request's selected pools, then its own new rows."""
+                n_groups = (n_sel + GS - 1) // GS
+                if CP:
+                    # Rows d * nhQ + h * Q + qi: chip d's heads, from the layer's exchange.
+                    r_b = pl.multiple_of(b * nhQ, nhQ)
+                    q_bf = jnp.concatenate(
+                        [cpq[qpar[0], d, pl.ds(r_b, nhQ), :] for d in range(tp)], axis=0
+                    )
+                else:
+                    q_bf = q_absorbed(b).astype(BF16)  # rows h * Q + qi
+
+                pl.when(n_groups > 0)(lambda: gather_group(b, 0, 0, n_sel))
 
                 def step(carry, kvt_b, allowed):
                     m_o, l_o, a_o = carry
@@ -1192,32 +1617,32 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     a_n = alpha * a_o + dot(pr, kvt_b, ((1,), (0,)))
                     return m_n, l_n, a_n
 
-                def attend_tile(t, carry):
-                    slot = jax.lax.rem(t, 2)
+                def attend_group(g, carry):
+                    slot = jax.lax.rem(g, 2)
                     PL.wait_dma(kvw.at[slot], sgrp.at[4 + slot])
 
-                    @pl.when(t + 1 < nta)
+                    @pl.when(g + 1 < n_groups)
                     def _():
-                        kv_fetch(b, t + 1, 1 - slot)
+                        gather_group(b, g + 1, 1 - slot, n_sel)
 
                     kvt_b = PL.unpack_nope(kvw[slot])
-                    tids = tok + t * TK
-                    # Rows at or past p hold stale draft tokens; the step's own rows follow.
-                    allowed = allowed_rows(p, tids, t, before=tids < p)
-                    return step(carry, kvt_b, heads(allowed))
+                    return step(carry, kvt_b, heads(allowed_group(p, g, n_sel)))
 
                 init = (
-                    jnp.full((nh * Q, 1), -jnp.inf, F32),
-                    jnp.zeros((nh * Q, 1), F32),
-                    jnp.zeros((nh * Q, kvl), F32),
+                    jnp.full((nha * Q, 1), -jnp.inf, F32),
+                    jnp.zeros((nha * Q, 1), F32),
+                    jnp.zeros((nha * Q, kvl), F32),
                 )
                 with _scope("dsa_attend"):
-                    carry = jax.lax.fori_loop(0, nta, attend_tile, init)
+                    carry = jax.lax.fori_loop(0, n_groups, attend_group, init)
                 # The new rows as one 16-row block (a one-row MXU operand does not lower);
                 # the pad rows are zero and masked.
                 new_tok = p + jax.lax.broadcasted_iota(jnp.int32, (1, 16), 1)
-                allowed = allowed_rows(p, new_tok, None)
-                _, l_f, a_f = step(carry, nkvb[b], heads(allowed))
+                allowed = allowed_new(p, new_tok)  # under CP: the rows in own tiles
+                m_f, l_f, a_f = step(carry, nkvb[b], heads(allowed))
+                if CP:
+                    with _scope("dsa_merge_attn"):
+                        l_f, a_f = merge_attn(b, m_f, l_f, a_f, n_sel)
                 outs = []
                 for h in range(nh):
                     lat = a_f[h * Q : (h + 1) * Q] / (l_f[h * Q : (h + 1) * Q] + 1e-30)
@@ -1225,16 +1650,153 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     outs.append(dot(lat, w_vc, ((1,), (1,))) * ks)
                 out = jnp.concatenate(outs, axis=1).astype(BF16)
                 attb[b] = jnp.pad(out, ((0, 16 - Q), (0, 0)))
+                if "dumpatt" in MK_ABL:  # debug: request 0's attention rows -> its new-KV rows
+                    @pl.when(b == 0)
+                    def _():
+                        o_nkv[d_i, pl.ds(0, Q), pl.ds(0, kvl)] = out[:, :kvl]
+
+            def merge_attn(b, m_f, l_f, a_f, n_sel=None):
+                """Context parallel: send each head owner its (acc, m, l) partials over this
+                chip's context share; merge the eight partials of own heads here -> (den, num)."""
+                AR = cp_att_rows(nh, Q)
+                rr = jax.lax.broadcasted_iota(jnp.int32, (nhQ, PR), 0)
+                ll = jax.lax.broadcasted_iota(jnp.int32, (nhQ, PR), 1)
+                zpad = jnp.zeros((1, kvl - PR), F32)
+
+                def as_row(col):  # [nhQ, 1] -> [1, kvl], value i at lane i
+                    r = jnp.sum(jnp.where(ll == rr, col, 0.0), axis=0, keepdims=True)
+                    return jnp.concatenate([r, zpad], axis=1)
+
+                def as_col(row):  # [1, PR] lanes -> [nhQ, 1]
+                    return jnp.sum(
+                        jnp.where(ll == rr, jnp.broadcast_to(row, (nhQ, PR)), 0.0),
+                        axis=1,
+                        keepdims=True,
+                    )
+
+                zrows = jnp.zeros((6, kvl), F32)
+                for c in range(tp):
+                    rows = slice(c * nhQ, (c + 1) * nhQ)
+                    cols = pl.ds(c * kvl, kvl)
+                    cpsrc[pl.ds(0, nhQ), cols] = a_f[rows]
+                    # m and l as one full 8-row tile store (rows nhQ, nhQ + 1, then zeros).
+                    cpsrc[pl.ds(nhQ, 8), cols] = jnp.concatenate(
+                        [as_row(m_f[rows]), as_row(l_f[rows]), zrows], axis=0
+                    )
+                if "noxchg" in MK_ABL:  # ablation: own heads' rows, no exchange (exact only
+                    # when this chip owns the whole context, e.g. with the bigrc knob)
+                    pick = [jnp.where(me == c, 1.0, 0.0) for c in range(tp)]
+                    den = sum(l_f[c * nhQ : (c + 1) * nhQ] * pick[c] for c in range(tp))
+                    num = sum(a_f[c * nhQ : (c + 1) * nhQ] * pick[c] for c in range(tp))
+                    return den, num
+                if "chksel" in MK_ABL:  # debug: carry n_sel in row nhQ + 2, lane 0 of every block
+                    for c in range(tp):
+                        cpsrc[pl.ds(nhQ + 2, 1), pl.ds(c * kvl, kvl)] = jnp.full(
+                            (1, kvl), 1.0, F32
+                        ) * n_sel.astype(F32)
+                if "patxall" in MK_ABL:  # debug: stamp every row of block c: me*10 + c + row/8
+                    rowa = jax.lax.broadcasted_iota(jnp.int32, (AR, kvl), 0) // 8
+                    for c in range(tp):
+                        cpsrc[:, pl.ds(c * kvl, kvl)] = (me * 10 + c + rowa).astype(F32)
+                if "patx" in MK_ABL:  # debug: stamp block c's m row with me * 10 + c
+                    for c in range(tp):
+                        cpsrc[pl.ds(nhQ, 8), pl.ds(c * kvl, kvl)] = jnp.full(
+                            (8, kvl), 1.0, F32
+                        ) * (me * 10 + c + 100 * d_i).astype(F32)  # + layer
+                par = cp_exchange(lambda d: cpsrc.at[:, pl.ds(d * kvl, kvl)], cpatt, 2)
+                if "dumpx" in MK_ABL:  # debug: received m rows of request 0 -> its new-KV rows
+                    @pl.when(b == 0)
+                    def _():
+                        for d in range(tp):
+                            o_nkv[d_i, pl.ds(d // 2, 1), pl.ds((d % 2) * PR, PR)] = cpatt[
+                                par, d, pl.ds(nhQ, 1), pl.ds(0, PR)
+                            ].astype(BF16)
+                if "chksel" in MK_ABL:  # debug: n_sel and l[row 0] per slot as 3-bit digits
+                    # (fp8 on the pool path holds only integers <= 16 exactly): lanes
+                    # 4d..4d+3 = n_sel digits, 32+4d.. = l digits, 64+4d.. = l row 1.
+                    lane_ = jax.lax.broadcasted_iota(jnp.int32, (1, PR), 1)
+                    out = jnp.zeros((1, PR), F32)
+
+                    def digits(v, base):
+                        iv = v.astype(jnp.int32)
+                        o = out
+                        for k in range(4):
+                            dig = ((iv >> (9 - 3 * k)) & 7).astype(F32)
+                            o = jnp.where(lane_ == base + k, dig, o)
+                        return o
+
+                    for d in range(tp):
+                        ns = jnp.sum(jnp.where(lane_ == 0, cpatt[par, d, pl.ds(nhQ + 2, 1), pl.ds(0, PR)], 0.0))
+                        l0 = jnp.sum(jnp.where(lane_ == 0, cpatt[par, d, pl.ds(nhQ + 1, 1), pl.ds(0, PR)], 0.0))
+                        l1 = jnp.sum(jnp.where(lane_ == 1, cpatt[par, d, pl.ds(nhQ + 1, 1), pl.ds(0, PR)], 0.0))
+                        out = digits(ns, 4 * d)
+                        out = digits(l0, 32 + 4 * d)
+                        out = digits(l1, 64 + 4 * d)
+                    @pl.when(b == 0)
+                    def _():
+                        o_nkv[d_i, pl.ds(0, 1), pl.ds(0, PR)] = out.astype(BF16)
+                if "chkxall" in MK_ABL:  # debug: per-slot max |slot d - stamp(d, me)| -> row 0
+                    lane_ = jax.lax.broadcasted_iota(jnp.int32, (1, PR), 1)
+                    rowa = jax.lax.broadcasted_iota(jnp.int32, (AR, kvl), 0) // 8
+                    out = jnp.zeros((1, PR), F32)
+                    for d in range(tp):
+                        exp_ = (d * 10 + me + rowa).astype(F32)
+                        out = jnp.where(lane_ == d, jnp.max(jnp.abs(cpatt[par, d] - exp_)), out)
+                    @pl.when(b == 0)
+                    def _():
+                        o_nkv[d_i, pl.ds(0, 1), pl.ds(0, PR)] = out.astype(BF16)
+                if "chkatt" in MK_ABL:  # debug: per-slot max |slot d - own slot| -> new-KV row 0
+                    lane_ = jax.lax.broadcasted_iota(jnp.int32, (1, PR), 1)
+                    out = jnp.zeros((1, PR), F32)
+                    mine = [jnp.where(me == c, 1.0, 0.0) for c in range(tp)]
+                    own_acc = sum(cpatt[par, c, pl.ds(0, nhQ), :] * mine[c] for c in range(tp))
+                    own_ml = sum(cpatt[par, c, pl.ds(nhQ, 2), :] * mine[c] for c in range(tp))
+                    for d in range(tp):
+                        da = jnp.max(jnp.abs(cpatt[par, d, pl.ds(0, nhQ), :] - own_acc))
+                        ml = jnp.abs(cpatt[par, d, pl.ds(nhQ, 2), :] - own_ml)
+                        ml = jnp.where(jnp.isfinite(ml), ml, 0.0)
+                        out = jnp.where(lane_ == d, da, out)
+                        out = jnp.where(lane_ == 8 + d, jnp.max(ml[0:1]), out)
+                        out = jnp.where(lane_ == 16 + d, jnp.max(ml[1:2]), out)
+                    @pl.when(b == 0)
+                    def _():
+                        o_nkv[d_i, pl.ds(0, 1), pl.ds(0, PR)] = out.astype(BF16)
+                if "dumpq" in MK_ABL:  # debug: received query slots (row 0) -> new-KV rows
+                    @pl.when(b == 0)
+                    def _():
+                        for d in range(tp):
+                            o_nkv[d_i, pl.ds(d // 2, 1), pl.ds((d % 2) * PR, PR)] = cpq[
+                                qpar[0], d, pl.ds(0, 1), pl.ds(0, PR)
+                            ]
+                ms = [as_col(cpatt[par, d, pl.ds(nhQ, 1), pl.ds(0, PR)]) for d in range(tp)]
+                ls = [as_col(cpatt[par, d, pl.ds(nhQ + 1, 1), pl.ds(0, PR)]) for d in range(tp)]
+                M = ms[0]
+                for d in range(1, tp):
+                    M = jnp.maximum(M, ms[d])
+                shift = jnp.where(jnp.isfinite(M), M, 0.0)
+                den = jnp.zeros((nhQ, 1), F32)
+                num = jnp.zeros((nhQ, kvl), F32)
+                for d in range(tp):
+                    w = jnp.exp(ms[d] - shift)
+                    den = den + w * ls[d]
+                    num = num + w * cpatt[par, d, pl.ds(0, nhQ), :]
+                return den, num
 
             def per_req(b, carry):
                 r0 = pl.multiple_of(b * Q, Q)
                 p = pos_ref[b]
                 last = p + Q - 1
+                own_rows_for(last // TKR + 1)
                 fp0, fresh, keys = fresh_pool_keys(b, r0, p, last)
                 select(b, r0, p, last, fp0, fresh, keys)
-                attend(b, r0, p)
+                with _scope("dsa_compact"):
+                    n_sel = compact(p, last // TKR + 1)
+                attend(b, r0, p, n_sel)
                 return carry
 
+            if CP:
+                with _scope("dsa_share_q"):
+                    share_queries()
             jax.lax.fori_loop(0, B, per_req, 0)
             with _scope("dsa_o"):
                 o_off = w_qakv_n + w_qb_n

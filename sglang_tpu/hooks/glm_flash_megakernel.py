@@ -46,6 +46,8 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
         max_requests=args.max_running_requests,
     )
     mk.radix_snapshots = not args.disable_radix_cache
+    if tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL_PRECOMPILE.get():
+        mk.precompile()
     model._tpu_glm_flash_mk = mk
     _KERNELS.append(mk)
     compiled = model.forward

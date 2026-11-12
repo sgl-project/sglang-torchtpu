@@ -11,6 +11,7 @@ serving's own verify commit and radix snapshots apply unchanged.
 from __future__ import annotations
 
 import logging
+import time
 
 import torch
 
@@ -160,11 +161,22 @@ class GlmFlashMegakernel:
         # would only be compiled (one Pallas kernel each), never run.
         if max_requests is not None:
             self.call_req = max(1, min(self.call_req, max_requests))
-        km_tile = 512 if self.max_req * n_query == 1 else 256
+        # Dense-weight tile: 512 for a one-row kernel; 128 once a 32-row bucket exists (its
+        # VMEM; measured free at 16 rows: 19.33 vs 19.25 ms per 4-layer call at 1M).
+        km_tile = (
+            512
+            if self.max_req * n_query == 1
+            else (128 if self.call_req * n_query > 16 else 256)
+        )
 
         def cfg_for(b):
             # Larger steps trade DMA ring depth for the VMEM their row-scaled buffers need.
+            # Measured at tp8 / 1M (tpu7x, 64 MiB): 16 rows overflow by 1.2 MiB with a
+            # 4-slot expert ring and fit with 3; 8 rows fit with 4; 32 rows need the lean form.
+            # Context parallel adds ~5 MiB: 16 rows then also need the 3-slot dense ring and
+            # one slab (67.75 MiB with both at 4 / 2).
             big = b * n_query > 16
+            mid = b * n_query == 16
             return D.KernelConfig(
                 max_len=max_len,
                 n_query=n_query,
@@ -173,12 +185,13 @@ class GlmFlashMegakernel:
                 table_pages=table_pages,
                 embed_2d=True,
                 km_tile=km_tile,
-                slots=3 if big else 4,
-                prefetch=1 if big else 2,
-                km_slots=3 if big else 4,
-                km_issue=1 if big else 2,
+                slots=3 if (big or mid) else 4,
+                prefetch=1 if (big or mid) else 2,
+                km_slots=2 if big else 3 if mid else 4,
+                km_issue=1 if (big or mid) else 2,
                 unroll_periods=big,
-                single_slab=big,
+                single_slab=big or mid,
+                context_parallel=True,  # DSA phase split by score rows across the tp chips
             )
 
         self.cfgs = {b: cfg_for(b) for b in _buckets(self.call_req)}
@@ -353,6 +366,49 @@ class GlmFlashMegakernel:
                     pages_per_seq=self.pages_per_seq,
                     **self._step_input_tables(),
                 )
+
+    def precompile(self) -> None:
+        """Run every bucket once on zero inputs so its program compiles now; serving
+        compiles a bucket at its first real step otherwise. Nothing is live at startup,
+        so the rows the calls write (page 0, state slot 0) are harmless."""
+        device = self.k_scales.device
+        Q, pps = self.Q, self.pages_per_seq
+        for b in sorted(self.cfgs):
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                zeros = lambda *shape, dtype=torch.int64: torch.zeros(
+                    shape, dtype=dtype, device=device
+                )
+                tok, pos, tab, srow, ckrow = _step_inputs_op(
+                    zeros(b * Q),
+                    zeros(b * Q),
+                    zeros(b * pps, dtype=torch.int32),
+                    zeros(b),
+                    q=Q,
+                    bucket=b,
+                    pages_per_seq=pps,
+                    **self._step_input_tables(),
+                )
+                inputs = (
+                    tok,
+                    pos,
+                    self._meta[b],
+                    tab,
+                    srow,
+                    ckrow,
+                    self.k_scales,
+                    self.init_streams[b],
+                )
+                out = self.calls[b](
+                    *inputs, *self.weights, *self.pool_list, *self.experts
+                )
+                out[0][:1].cpu()  # materialize: the compile and the run happen here
+            logger.info(
+                "GLM-Flash megakernel: bucket %d x %d rows compiled in %.0f s",
+                b,
+                Q,
+                time.perf_counter() - t0,
+            )
 
     def _step_inputs(
         self, input_ids, positions, forward_batch, b0: int, n: int, bucket: int
