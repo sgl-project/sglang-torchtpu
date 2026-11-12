@@ -990,6 +990,85 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         self.assertFalse(tm.rid_to_state)
 
 
+class TestParallelSamplingBootstrapRooms(CustomTestCase):
+    """Parallel sampling in PD disaggregation (issue #1147).
+
+    Every request reaching the prefill/decode schedulers must carry its own
+    bootstrap room, and the prefix-caching request (max_new_tokens=0) must not
+    be sent in PD mode.
+    """
+
+    def _run(self, disaggregation_mode, **req_kwargs):
+        tm = _make_tm_for_generate(self)
+        tm.disaggregation_mode = disaggregation_mode
+
+        async def tokenize(obj):
+            tokenized = MagicMock()
+            tokenized.mm_inputs = None
+            tokenized.sampling_params = MagicMock(max_new_tokens=16)
+            tokenized.bootstrap_host = obj.bootstrap_host
+            tokenized.bootstrap_port = obj.bootstrap_port
+            tokenized.bootstrap_room = obj.bootstrap_room
+            return tokenized
+
+        sent = []
+
+        async def send(tokenized_obj):
+            sent.append(tokenized_obj)
+
+        async def wait(obj, request=None):
+            yield {"text": "", "meta_info": {"id": obj.rid}}
+
+        tm._tokenize_one_request = tokenize
+        tm._send_one_request = send
+        tm._wait_one_response = wait
+
+        async def drive():
+            return await tm.generate_request(GenerateReqInput(**req_kwargs)).__anext__()
+
+        outputs = asyncio.run(drive())
+        return sent, outputs
+
+    def test_pd_single_prompt_gets_one_room_per_sample(self):
+        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                sent, outputs = self._run(
+                    mode,
+                    text="hello",
+                    sampling_params={"n": 2},
+                    bootstrap_host="prefill",
+                    bootstrap_port=8998,
+                    bootstrap_room=1000,
+                )
+                self.assertEqual(len(outputs), 2)
+                # No prefix-caching request: only the two samples are sent.
+                self.assertEqual(len(sent), 2)
+                self.assertEqual([t.bootstrap_room for t in sent], [1000, 1001])
+                self.assertTrue(all(t.bootstrap_host == "prefill" for t in sent))
+
+    def test_pd_batch_gets_one_room_per_sample(self):
+        sent, outputs = self._run(
+            DisaggregationMode.DECODE,
+            text=["hello", "world"],
+            sampling_params={"n": 2},
+            bootstrap_host=["prefill", "prefill"],
+            bootstrap_port=[8998, 8998],
+            bootstrap_room=[1000, 2000],
+        )
+        self.assertEqual(len(outputs), 4)
+        # Sent prompt by prompt: both samples of "hello", then of "world".
+        self.assertEqual([t.bootstrap_room for t in sent], [1000, 1001, 2000, 2001])
+
+    def test_non_pd_still_caches_prefix(self):
+        sent, outputs = self._run(
+            DisaggregationMode.NULL, text="hello", sampling_params={"n": 2}
+        )
+        self.assertEqual(len(outputs), 2)
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[0].sampling_params.max_new_tokens, 0)
+        self.assertTrue(all(t.bootstrap_room is None for t in sent))
+
+
 class TestWaitOneResponseAfterStateFreed(CustomTestCase):
     """A waiter built before its request finishes must still deliver the output.
 

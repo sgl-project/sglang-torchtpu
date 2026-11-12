@@ -701,6 +701,42 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
+    def test_parallel_sampling_assigns_distinct_bootstrap_rooms(self):
+        """Each parallel sample needs its own PD bootstrap room (issue #1147)."""
+        single = GenerateReqInput(
+            text="Hello",
+            sampling_params={"n": 3},
+            bootstrap_host="prefill",
+            bootstrap_port=8998,
+            bootstrap_room=100,
+        )
+        single.normalize_batch_and_arguments()
+        self.assertEqual([single[i].bootstrap_room for i in range(3)], [100, 101, 102])
+
+        # Sample k of prompt i sits at index k * batch_size + i.
+        batch = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params={"n": 2},
+            bootstrap_host=["prefill", "prefill"],
+            bootstrap_port=[8998, 8998],
+            bootstrap_room=[100, 200],
+        )
+        batch.normalize_batch_and_arguments()
+        self.assertEqual(batch.text, ["Hello", "World", "Hello", "World"])
+        self.assertEqual(batch.bootstrap_room, [100, 200, 101, 201])
+        self.assertEqual(batch.bootstrap_host, ["prefill"] * 4)
+
+    def test_parallel_sampling_bootstrap_room_wraps_at_int63(self):
+        req = GenerateReqInput(
+            text="Hello",
+            sampling_params={"n": 2},
+            bootstrap_host="prefill",
+            bootstrap_port=8998,
+            bootstrap_room=2**63 - 1,
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.bootstrap_room, [2**63 - 1, 0])
+
     def test_parallel_sampling_preserves_reasoning_controls(self):
         single = GenerateReqInput(
             text="Hello",

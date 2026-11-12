@@ -905,9 +905,18 @@ class GenerateReqInput:
         if self.bootstrap_room is None:
             self.bootstrap_room = [None] * num
         elif not isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = [self.bootstrap_room + i for i in range(num)]
+            self.bootstrap_room = [
+                (self.bootstrap_room + i) % (2**63) for i in range(num)
+            ]
         elif isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
+            # Each parallel sample needs its own room: the room keys the KV transfer
+            # state on both the prefill and decode engines. Sample k of prompt i is at
+            # index k * batch_size + i, matching how the inputs are expanded.
+            self.bootstrap_room = [
+                (room + k) % (2**63) if room is not None else None
+                for k in range(self.parallel_sample_num)
+                for room in self.bootstrap_room
+            ]
 
         # Normalize bootstrap_pair_key
         if self.bootstrap_pair_key is None:
