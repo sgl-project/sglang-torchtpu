@@ -46,7 +46,14 @@ WEIGHT_SCALE = DIM**-0.5  # the indexer's softmax scale on the head weights
 HEAD_GATE_SCALE = float(np.float32(ml_dtypes.bfloat16(HEADS**-0.5)))
 FP8_MAX = 448.0
 CHUNK = 512  # rows of a streamed weight chunk (wq_b's contraction rows, d_wks / d_wpt blocks)
-RING = 3  # chunk slots of the weight stream
+
+
+def ring() -> int:
+    """Chunk slots of the weight stream (``KernelConfig.dsa_weight_ring``)."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    config = active()
+    return max(2, config.dsa_weight_ring) if config is not None else 3
 LANES = dsa_dcp.LANES
 RECORD_SHAPE = (2, LANES)  # key bytes | UE8M0 byte in lane 0 (int32 lanes)
 
@@ -158,8 +165,8 @@ def scoped_scratch(batch, *, hidden, index_block_shape, key_rows, page_tokens, s
     if hidden % CHUNK:
         raise ValueError(f"hidden size {hidden} is not a multiple of {CHUNK}")
     return {
-        "weight_ring": pltpu.VMEM((RING, CHUNK, DIM), jnp.bfloat16),  # wq_b, then wk / weights_proj chunks
-        "ring_sems": pltpu.SemaphoreType.DMA((RING,)),
+        "weight_ring": pltpu.VMEM((ring(), CHUNK, DIM), jnp.bfloat16),  # wq_b, then wk / weights_proj chunks
+        "ring_sems": pltpu.SemaphoreType.DMA((ring(),)),
         "knorm": pltpu.VMEM((2, DIM), jnp.bfloat16),
         "knorm_sem": pltpu.SemaphoreType.DMA((1,)),
         "q8": pltpu.VMEM((batch, HEADS, DIM), jnp.float8_e4m3fn),
@@ -211,7 +218,7 @@ class DecodeIndexer:
 
     def _stream(self, index):
         name, chunk, head = self._plan()[index]
-        slot = index % RING
+        slot = index % self.scoped["weight_ring"].shape[0]
         return pltpu.make_async_copy(
             self.weights[name].at[pl.ds(chunk * CHUNK, CHUNK), pl.ds(head * DIM, DIM)],
             self.scoped["weight_ring"].at[slot], self.scoped["ring_sems"].at[slot])
@@ -221,17 +228,18 @@ class DecodeIndexer:
 
     def start(self):
         """Start the layer's indexer weight copies (as early as possible):
-        the key norm and the stream's first ``RING - 1`` chunks."""
+        the key norm and the stream's first ``ring - 1`` chunks."""
         self._knorm().start()
-        for index in range(RING - 1):
+        for index in range(min(self.scoped["weight_ring"].shape[0] - 1, len(self._plan()))):
             self._stream(index).start()
 
     def _take(self, index):
         """Chunk ``index`` of the stream (its slot's value), the next refill started."""
-        if index + RING - 1 < len(self._plan()):
-            self._stream(index + RING - 1).start()
+        slots = self.scoped["weight_ring"].shape[0]
+        if index + slots - 1 < len(self._plan()):
+            self._stream(index + slots - 1).start()
         self._stream(index).wait()
-        return self.scoped["weight_ring"][index % RING]
+        return self.scoped["weight_ring"][index % slots]
 
     def _query(self, query_latent):
         """``query_latent @ wq_b`` (this rank's index heads, f32 ``[B, 128 per]``)."""
