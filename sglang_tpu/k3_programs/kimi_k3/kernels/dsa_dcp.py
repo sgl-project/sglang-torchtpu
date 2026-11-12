@@ -122,6 +122,7 @@ WIDE_CHUNK_ROWS = 128  # below that many rows: a long-context row's keys in one 
 # in flight (one HBM -> VMEM copy is ~0.9 us; a ring of two waits on each).
 PAGE_SLOTS = 4  # index pages (scoring)
 PAGE_SPLIT = 1  # copies an index page is fetched in (its subpages; > 1: more DMAs in flight)
+SCORE_TILE_VREGS = 32  # f32 logits vregs one scoring product may produce (fewer, larger products)
 KEY_SLOTS = 8  # key chunks (counting, step activity)
 WIDE_BATCH = 64  # from this many rows: rings of 3 and 4 (the decode's VMEM plan)
 # A row holds topk / group selected tokens a rank (64 over DCP32): with at most
@@ -439,10 +440,12 @@ class IndexSelect:
             def subpage_scale(sp):
                 return _pow2(refs["page_buf"][slot, sp * INDEX_SUBPAGE_ROWS + 32].astype(jnp.int32)[0:1])
 
-            # Up to two rows a sequence: one product over the whole page (a
-            # [32, 128] x [128, 128] product per subpage is all MXU latency);
-            # from four, a subpage at a time (the page's logits outgrow the vregs).
-            parts = [tuple(range(self.subpages))] if S <= 2 else [(sp,) for sp in range(self.subpages)]
+            # A product per as many subpages as keep its logits ([S * 32, tokens]
+            # f32) within 32 vregs: each product is mostly MXU latency, so fewer
+            # and larger ones -- the whole page up to two rows a sequence, two
+            # subpages at four, one at eight.
+            per = max(1, min(self.subpages, SCORE_TILE_VREGS * 1024 // (S * 32 * INDEX_SUBPAGE_TOKENS)))
+            parts = [tuple(range(i, min(i + per, self.subpages))) for i in range(0, self.subpages, per)]
             for part in parts:
                 k8 = jnp.concatenate([subpage_keys(sp) for sp in part], axis=0) if len(part) > 1 \
                     else subpage_keys(part[0])
