@@ -56,7 +56,8 @@ def minimax_h3_scoped_encode_rng(seed: int, device: torch.device | None = None):
         and device.type == current_platform.device_type
     ):
         device_module = torch.get_device_module(device)
-        if device_module.is_available():
+        # device.type is the current platform's accelerator (checked above).
+        if torch.accelerator.is_available():
             devices = [device]
             device_type = current_platform.device_type
     fork_rng_context = (

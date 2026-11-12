@@ -471,7 +471,7 @@ def test_warmup_records_use_and_transition_peaks(monkeypatch):
         max_memory_allocated=lambda: 7,
         memory_allocated=lambda: 2,
     )
-    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(torch, "get_device_module", lambda *_: device_module)
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
 
     use = ComponentUse("denoise", "transformer")
@@ -518,7 +518,7 @@ def test_warmup_skips_memory_tracking_for_unsupported_pipeline(monkeypatch):
         is_available=lambda: True,
         reset_peak_memory_stats=Mock(),
     )
-    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(torch, "get_device_module", lambda *_: device_module)
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
 
     stage = _Stage()
@@ -546,7 +546,7 @@ def test_warmup_records_full_weight_transition_without_preparing(monkeypatch):
         max_memory_allocated=lambda: 7,
         memory_allocated=lambda: 2,
     )
-    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(torch, "get_device_module", lambda *_: device_module)
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
 
     stage = _Stage()
@@ -584,7 +584,7 @@ def test_warmup_records_same_component_dtype_prepare_as_transition(monkeypatch):
         max_memory_allocated=lambda: 7,
         memory_allocated=lambda: 2,
     )
-    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(torch, "get_device_module", lambda *_: device_module)
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
 
     first = ComponentUse("stage", "transformer", target_dtype=torch.float16)
@@ -621,7 +621,7 @@ def test_warmup_attributes_prefetch_peak_to_prefetched_component(monkeypatch):
         max_memory_allocated=lambda: 7,
         memory_allocated=lambda: 2,
     )
-    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(torch, "get_device_module", lambda *_: device_module)
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
 
     encoder_use = ComponentUse("encode", "text_encoder")
@@ -670,7 +670,7 @@ def test_warmup_splits_sequential_component_transition(monkeypatch):
         max_memory_allocated=lambda: 7,
         memory_allocated=lambda: 2,
     )
-    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(torch, "get_device_module", lambda *_: device_module)
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
 
     first = ComponentUse("stage", "text_encoder")

@@ -1089,7 +1089,7 @@ class LayerwiseOffloadManager:
         # never flips back, so disable_offload/enable_offload can toggle
         # `enabled` without losing track of which managers can be re-armed.
         self._configured = False
-        self.enabled = bool(enabled and torch.get_device_module().is_available())
+        self.enabled = bool(enabled and torch.accelerator.is_available())
         if not self.enabled:
             return
         self.device = (
