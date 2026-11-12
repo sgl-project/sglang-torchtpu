@@ -104,6 +104,7 @@ def bundle_groups(full=(1, 3), swa=(0, 3), pages=64):
         swa_layer_ids=[swa[0]] if swa else [],
         num_draft_full=0,
         num_hidden_full=0,
+        page_formats={},
         num_draft_swa=0,
     )
 
@@ -116,6 +117,7 @@ def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer, draft_full=()):
         swa_layer_ids=list(swa),
         num_draft_full=len(draft_full),
         num_hidden_full=0,
+        page_formats={},
         num_draft_swa=0,
     )
 
@@ -1238,6 +1240,7 @@ class TestDraftPoolGroups(unittest.TestCase):
             swa_layer_ids=[],
             num_draft_full=1,
             num_hidden_full=1,
+            page_formats={},
             num_draft_swa=0,
         )
         pools = pool_manifest(layers)
@@ -1289,6 +1292,7 @@ class TestDraftPoolGroups(unittest.TestCase):
             swa_layer_ids=[55, 1],
             num_draft_full=1,
             num_hidden_full=0,
+            page_formats={},
             num_draft_swa=1,
         )
         pipe.pools, swa_pools = pp_swa.split_manifest(pool_manifest(layers))

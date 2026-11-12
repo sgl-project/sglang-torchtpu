@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
 
@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.network import NetworkAddress
+from sglang_tpu.disaggregation.raiden import pp_mxint8
 from sglang_tpu.disaggregation.raiden.pp_common import _BLOCK_MAJOR_KV_RANK
 from sglang_tpu.disaggregation.raiden.serde import (
     BLOCK_MAJOR_KV_LAYOUT,
@@ -105,6 +106,8 @@ class RaidenKVCacheGroups:
     unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
     # True when any KV pool uses the 5D token-minor SEQ_ALONG_LANE layout.
     seq_along_lane: bool = False
+    # MXINT8 page formats by pool kind (fa, swa, draft.fa, draft.swa).
+    page_formats: Dict[str, pp_mxint8.Mxint8PageFormat] = field(default_factory=dict)
 
 
 def _is_seq_along_lane_pool(pool: Optional[KVCache]) -> bool:
@@ -121,6 +124,25 @@ def _is_seq_along_lane_pool(pool: Optional[KVCache]) -> bool:
     if isinstance(pool, HybridLinearKVPool):
         return isinstance(getattr(pool, "full_kv_pool", None), TpuSeqAlongLaneKVPool)
     return False
+
+
+def _mxint8_page_formats(
+    pool: KVCache, *, prefix: str = ""
+) -> Dict[str, pp_mxint8.Mxint8PageFormat]:
+    """MXINT8 page formats of a pool's full-attention and sliding-window pages;
+    a hybrid pool's sub-pools can differ in layout."""
+    if isinstance(pool, SWAKVPool):
+        sub_pools = (("fa", pool.full_kv_pool), ("swa", pool.swa_kv_pool))
+    elif isinstance(pool, HybridLinearKVPool):
+        sub_pools = (("fa", pool.full_kv_pool),)
+    else:
+        sub_pools = (("fa", pool), ("swa", pool))
+    formats = {}
+    for kind, sub_pool in sub_pools:
+        fmt = pp_mxint8.page_format(sub_pool)
+        if fmt is not None:
+            formats[prefix + kind] = fmt
+    return formats
 
 
 def _assert_root_buffers(name: str, buffers: Sequence[torch.Tensor]) -> None:
@@ -299,6 +321,7 @@ def get_raiden_kv_caches(
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
     seq_along_lane = _is_seq_along_lane_pool(pool)
+    page_formats = _mxint8_page_formats(pool)
     num_draft_full = num_draft_swa = num_hidden_full = 0
     draft_kv_head_num: Optional[int] = None
     draft_swa_kv_head_num: Optional[int] = None
@@ -314,6 +337,7 @@ def get_raiden_kv_caches(
         draft_kv_head_num = getattr(full_draft_pool, "head_num", None)
         draft_swa_kv_head_num = getattr(swa_draft_pool, "head_num", None)
         seq_along_lane = seq_along_lane or _is_seq_along_lane_pool(draft_pool)
+        page_formats.update(_mxint8_page_formats(draft_pool, prefix="draft."))
 
     if hidden_pool is not None:
         full.append(hidden_pool.buffer)
@@ -368,4 +392,5 @@ def get_raiden_kv_caches(
         write_state_meta=write_state_meta,
         unified_swa_pool=groups.unified_swa_pool,
         seq_along_lane=seq_along_lane,
+        page_formats=page_formats,
     )

@@ -170,6 +170,7 @@ class TestRaidenCarriesHiddenNotDraftKv(CustomTestCase):
             full_layer_ids=[0],
             num_draft_full=0,
             num_hidden_full=0,
+            page_formats={},
             swa=[],
             swa_layer_ids=[],
             num_draft_swa=0,
