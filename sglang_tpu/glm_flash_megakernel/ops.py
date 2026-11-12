@@ -161,13 +161,10 @@ class GlmFlashMegakernel:
         # would only be compiled (one Pallas kernel each), never run.
         if max_requests is not None:
             self.call_req = max(1, min(self.call_req, max_requests))
-        # Dense-weight tile: 512 for a one-row kernel; 128 once a 32-row bucket exists (its
-        # VMEM; measured free at 16 rows: 19.33 vs 19.25 ms per 4-layer call at 1M).
-        km_tile = (
-            512
-            if self.max_req * n_query == 1
-            else (128 if self.call_req * n_query > 16 else 256)
-        )
+        # Dense-weight tile: 512 for a one-row kernel, else 256. 128-column tiles give wrong
+        # results below 32 rows (GSM8K 0.44 at one request; 1.4-1.8 rel at 4-16 rows in the
+        # harness, 2026-11-12), so the 32-row bucket that needs them is not built by default.
+        km_tile = 512 if self.max_req * n_query == 1 else 256
 
         def cfg_for(b):
             # Larger steps trade DMA ring depth for the VMEM their row-scaled buffers need.
