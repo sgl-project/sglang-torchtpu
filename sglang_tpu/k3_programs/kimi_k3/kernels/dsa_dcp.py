@@ -1158,46 +1158,35 @@ class IndexSelect:
         """This rank's keys in each row's bin ``[lo, lo + 2^bits)`` (``lo`` the
         row's prefix) with their positions: row ``b`` of ``refs["cand"]`` holds
         its keys at lanes ``0 ..`` and their positions at ``GATHER_SLOTS ..``
-        (-1: none), ``refs["cand_n"][b]`` their count."""
+        (-1: none), ``refs["cand_n"][b]`` their count. Grouped selections whose
+        chunks stayed resident (``_count_groups``) scan them in place; others
+        copy each row's chunks through the key ring."""
         from jax.experimental import pallas as pl
 
-        refs, chunk = self.refs, self.chunk
-        cand = refs["cand"]
+        refs, cand = self.refs, self.refs["cand"]
         cand_lane = jax.lax.broadcasted_iota(jnp.int32, cand.shape, 1)
         cand[...] = jnp.where(cand_lane >= GATHER_SLOTS, -1, INT_MIN)
         for b in range(self.batch):
             refs["cand_n"][b] = 0
-        total = refs["chunk_starts"][self.batch]
-        for step in range(self.key_slots - 1):
-            pl_when(step < total)(lambda step=step: self._chunk_copy(step))
         sub8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 0)
         lane8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 1)
         flat8 = sub8 * LANES + lane8
         lane1 = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
 
-        def step_fn(step, carry):
-            row, local = refs["step_row"][step], refs["step_local"][step]
-            self._wait_chunk(step)
-            pl_when(step + self.key_slots - 1 < total)(
-                lambda: self._chunk_copy(step + self.key_slots - 1)
-            )
-            start = jnp.minimum(local * chunk, self.key_rows - chunk)
+        def scan(row, key_at, chunk, local, start):
+            """Row ``row``'s keys of chunk ``local`` (``key_at(v)``: its vreg
+            ``v``, key rows ``start + 8 v ..``) into the candidates."""
             rows_valid = refs["counts"][row] * self.subpages
             lo = refs["row_prefix"][row] ^ INT_MIN
 
             def hits(v):
-                key = refs["key_buf"][
-                    step % self.key_slots, pl_ds(pl.multiple_of(v * 8, 8), 8), :
-                ]
+                key = key_at(v)
                 key_row = start + v * 8 + sub8
                 valid = (key_row >= local * chunk) & (key_row < rows_valid)
-                return (
-                    key,
-                    key_row,
-                    valid
-                    & (key >= lo)
-                    & (jax.lax.shift_right_logical(key - lo, bits) == 0),
+                in_bin = (key >= lo) & (
+                    jax.lax.shift_right_logical(key - lo, bits) == 0
                 )
+                return key, key_row, valid & in_bin
 
             def vreg(v, carry):
                 key, key_row, hit = hits(v)
@@ -1251,9 +1240,63 @@ class IndexSelect:
             def rescan():
                 jax.lax.fori_loop(first_v, end_v, vreg, 0)
 
-            return carry
+        def through_ring():
+            chunk, total = self.chunk, refs["chunk_starts"][self.batch]
+            for step in range(self.key_slots - 1):
+                pl_when(step < total)(lambda step=step: self._chunk_copy(step))
 
-        jax.lax.fori_loop(0, total, step_fn, 0)
+            def step_fn(step, carry):
+                row, local = refs["step_row"][step], refs["step_local"][step]
+                self._wait_chunk(step)
+                pl_when(step + self.key_slots - 1 < total)(
+                    lambda: self._chunk_copy(step + self.key_slots - 1)
+                )
+                start = jnp.minimum(local * chunk, self.key_rows - chunk)
+                slot = step % self.key_slots
+                scan(
+                    row,
+                    lambda v: refs["key_buf"][
+                        slot, pl_ds(pl.multiple_of(v * 8, 8), 8), :
+                    ],
+                    chunk,
+                    local,
+                    start,
+                )
+                return carry
+
+            jax.lax.fori_loop(0, total, step_fn, 0)
+
+        if not self.grouped:
+            through_ring()
+            return
+        gchunk, total = self.gchunk, refs["gstep_starts"][self.groups]
+
+        def resident():
+            def step_fn(step, carry):
+                g, local = refs["gstep_group"][step], refs["gstep_local"][step]
+                start = jnp.minimum(local * gchunk, self.key_rows - gchunk)
+                slot = refs["group_buf"].at[step % 2]
+                for r in range(self.group_rows):
+                    row = jnp.minimum(8 * g + r, self.batch - 1)
+
+                    @pl_when(8 * g + r < self.batch)
+                    def one_row(r=r, row=row):
+                        scan(
+                            row,
+                            lambda v: slot[
+                                pl_ds(pl.multiple_of(r * gchunk + v * 8, 8), 8), :
+                            ],
+                            gchunk,
+                            local,
+                            start,
+                        )
+
+                return carry
+
+            jax.lax.fori_loop(0, total, step_fn, 0)
+
+        pl_when(total <= 2)(resident)
+        pl_when(total > 2)(through_ring)
 
     def _exchange_candidates(self):
         """Every rank's candidates (slot ``m``: member ``m``'s ``refs["cand"]``)."""
@@ -1306,11 +1349,17 @@ class IndexSelect:
         upper = jnp.zeros(
             (rows, 1), jnp.int32
         )  # the keys above the bin, a row a sublane
+        limit = jnp.zeros((rows, 1), jnp.int32)
         for b in range(self.batch):
             upper = jnp.where(
                 sub == b, _row_scalar(state[_UPPER : _UPPER + 1], b), upper
             )
+            limit = jnp.where(
+                sub == b, _row_scalar(state[_LIMIT : _LIMIT + 1], b), limit
+            )
         need = topk - upper
+        # The active rows' largest need (at most GATHER_SLOTS: their bins hold that many).
+        picks = jnp.clip(jnp.max(jnp.where(limit > topk, need, 0)), 0, GATHER_SLOTS)
 
         def pick(
             i, carry
@@ -1337,7 +1386,7 @@ class IndexSelect:
 
         zero = jnp.zeros((rows, 1), jnp.int32)
         _, tau, ptie = jax.lax.fori_loop(
-            0, GATHER_SLOTS, pick, (live.astype(jnp.int32), zero, zero)
+            0, picks, pick, (live.astype(jnp.int32), zero, zero)
         )
         above = jnp.sum(
             jnp.sum((live & (keys > tau[None])).astype(jnp.int32), axis=0),
