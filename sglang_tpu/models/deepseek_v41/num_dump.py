@@ -15,10 +15,19 @@ import torch
 
 ENABLED = os.environ.get("SGLANG_TPU_DSV41_DUMP") == "1"
 LAYERS = (0, 1, 2)
-POINTS = ("attn_in", "attn_out", "engram_in", "engram_out", "moe_in", "moe_out")
+POINTS = (
+    "hash_ids",
+    "attn_in",
+    "attn_out",
+    "engram_in",
+    "engram_out",
+    "moe_in",
+    "moe_out",
+)
 _ROWS, _COLS = 128, 20480
 _BUF: dict = {}
 _COUNT = [0]
+_HASHER: list = []
 _OUT = "/tmp/dsv41_dump"
 
 
@@ -55,6 +64,15 @@ def engram_forward(original, engram, x, *args, **kwargs):
     return out
 
 
+def hasher_forward(original, hasher, input_ids, forward_batch, *args, **kwargs):
+    if not _HASHER:
+        _HASHER.append(hasher)
+    out = original(hasher, input_ids, forward_batch, *args, **kwargs)
+    # Same slot for every layer key 0; hash ids are [T, n_layers, cols].
+    _put("hash_ids", 0, out)
+    return out
+
+
 def moe_forward(original, moe, hidden_states, *args, **kwargs):
     _put("moe_in", moe.layer_id, hidden_states)
     out = original(moe, hidden_states, *args, **kwargs)
@@ -80,6 +98,11 @@ def after_forward(forward_batch) -> None:
         "extend_seq_lens_cpu": getattr(forward_batch, "extend_seq_lens_cpu", None),
         "seq_lens": forward_batch.seq_lens.cpu(),
     }
+    if _HASHER and _HASHER[0].history is not None:
+        # Eager read after the compiled forward: did its history commit land?
+        req = forward_batch.req_pool_indices.to(torch.int64)
+        rec["history_after"] = _HASHER[0].history[req].cpu()
+        rec["req_pool_indices"] = forward_batch.req_pool_indices.cpu()
     t = min(int(forward_batch.input_ids.shape[0]), _ROWS)
     for layer in LAYERS:
         for p in POINTS:
@@ -95,7 +118,20 @@ def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
     return [
-        ("sglang.srt.models.deepseek_v4.MQALayer.forward", attn_forward, HookType.AROUND),
+        (
+            "sglang.srt.models.deepseek_v4.MQALayer.forward",
+            attn_forward,
+            HookType.AROUND,
+        ),
         ("sglang.srt.layers.engram.Engram.forward", engram_forward, HookType.AROUND),
-        ("sglang.srt.models.deepseek_v2.DeepseekV2MoE.forward", moe_forward, HookType.AROUND),
+        (
+            "sglang.srt.models.deepseek_v2.DeepseekV2MoE.forward",
+            moe_forward,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.engram.EngramHasher.forward",
+            hasher_forward,
+            HookType.AROUND,
+        ),
     ]
