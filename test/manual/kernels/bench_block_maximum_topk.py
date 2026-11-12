@@ -5,11 +5,10 @@ Run from the repository root with JAX TPU installed::
     PYTHONPATH=. python test/manual/kernels/bench_block_maximum_topk.py
 
 No Torch/SGLang runtime imports. Timings measure selectors only, not scoring or
-serving. The standalone NumPy oracle is loaded by path to avoid runtime imports.
+serving. A small independent NumPy oracle below checks exact output membership.
 """
 
 import argparse
-import importlib.util
 import json
 import platform
 import subprocess
@@ -23,6 +22,55 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.kernels.deepseek_v41.index_selection import block_topk as new
 from sglang_tpu.kernels.deepseek_v41.index_selection import streaming_topk as old
+
+
+def exact_topk(scores, lengths, k):
+    """Independent full sort: descending FP32 keys (+0 > -0), then low IDs."""
+    result = np.full((len(scores), k), -1, np.int32)
+    for row, length in enumerate(np.clip(lengths, 0, scores.shape[1])):
+        values = scores[row, :length]
+        ids = np.flatnonzero(values > -np.inf)
+        # Numeric ordering handles infinities; the extra key distinguishes zeros.
+        order = np.lexsort((ids, np.signbit(values[ids]), -values[ids]))[:k]
+        selected = np.sort(ids[order])
+        result[row, : len(selected)] = selected
+    return result
+
+
+def published_blocks(scores, lengths, count, block_size):
+    """Sort block maxima independently, reserving a slot for the newest block."""
+    result = np.full((len(scores), count), -1, np.int32)
+    for row, length in enumerate(np.clip(lengths, 0, scores.shape[1])):
+        if not length or not count:
+            continue
+        visible = scores[row, :length]
+        maxima = []
+        for start in range(0, int(length), block_size):
+            values = visible[start : start + block_size]
+            maxima.append(max(values, key=lambda x: (float(x), not np.signbit(x))))
+        newest = len(maxima) - 1
+        maxima[newest] = -np.inf
+        others = exact_topk(np.asarray([maxima], np.float32), [len(maxima)], count - 1)[
+            0
+        ]
+        selected = np.sort(np.append(others[others >= 0], newest))
+        result[row, : len(selected)] = selected
+    return result
+
+
+def benchmark_inputs(rows, width, k):
+    rng = np.random.default_rng(20261112)
+    scores = rng.normal(size=(rows, width)).astype(np.float32)
+    # Empty/short rows, clipped lengths, ties, signed zeros and infinity.
+    lengths = np.resize(
+        np.array([-7, 0, 1, k - 1, k, k + 1, width, width + 7], np.int32), rows
+    )
+    scores[6::8] = 1
+    scores[7::8] = -0.0
+    scores[7::8, 1::2] = 0.0
+    scores[6::8, ::7] = np.inf
+    scores[np.arange(width)[None, :] >= np.clip(lengths, 0, width)[:, None]] = -np.inf
+    return scores, lengths
 
 
 def emit(**record):
@@ -66,11 +114,6 @@ def main():
     if jax.default_backend() != "tpu":
         parser.error("requires native TPU JAX; CPU is not a numerical substitute")
     root = Path(__file__).resolve().parents[3]
-    spec = importlib.util.spec_from_file_location(
-        "block_topk_oracle", root / "python/sglang/test/kernels/block_topk.py"
-    )
-    oracle = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(oracle)
     receipt_path = root / "block-topk-source-receipt.json"
     if receipt_path.exists():
         source_receipt = json.loads(receipt_path.read_text())
@@ -103,15 +146,10 @@ def main():
         if not new.is_supported(**shape, publish=args.publish):
             emit(kind="unsupported", **shape, publish=args.publish)
             continue
-        base_scores, base_lengths = oracle.adversarial_scores(
-            width, args.k, args.block_size
-        )
-        # Cycle independent adversarial rows for smaller/larger requested batches.
-        owners = np.arange(args.rows) % len(base_scores)
-        scores, lengths = base_scores[owners].copy(), base_lengths[owners].copy()
+        scores, lengths = benchmark_inputs(args.rows, width, args.k)
         inputs = (jnp.asarray(scores), jnp.asarray(lengths))
         jax.block_until_ready(inputs)
-        expected = oracle.exact_topk(scores, lengths, args.k)
+        expected = exact_topk(scores, lengths, args.k)
         blocks = new.default_blocks(
             args.k, info.sparse_core.num_lanes, bool(args.publish)
         )
@@ -136,7 +174,7 @@ def main():
             selected, published = selected
             np.testing.assert_array_equal(
                 np.asarray(published),
-                oracle.published_blocks(scores, lengths, args.publish, args.block_size),
+                published_blocks(scores, lengths, args.publish, args.block_size),
             )
         np.testing.assert_array_equal(np.asarray(selected), expected)
         emit(

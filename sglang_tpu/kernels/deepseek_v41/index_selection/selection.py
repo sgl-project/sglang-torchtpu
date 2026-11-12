@@ -24,7 +24,11 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import xla_metadata
 
-from sglang_tpu.kernels.deepseek_v41.index_selection import publication, streaming_topk
+from sglang_tpu.kernels.deepseek_v41.index_selection import (
+    block_topk,
+    publication,
+    streaming_topk,
+)
 from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import PackedFP8Layout
 from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
     PreparedCandidates,
@@ -654,7 +658,18 @@ def _select_fp8_indexer_jax(
         dtype=jnp.int32,
     )
     query_offsets = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(counts)))
-    stream_select = (
+    # Block screening uses contiguous dense score columns, never compressed
+    # candidate slots. Keep chunked prefill and ordered compatibility paths on
+    # their existing implementations. Geometry 8 is independent of candidate
+    # publication geometry; the latter retains its existing scorer/selector.
+    block_select = (
+        unordered
+        and not candidate_filter
+        and prefill_chunk_rows is None
+        and topk <= width
+        and block_topk.is_supported(rows, capacity, topk, 8)
+    )
+    stream_select = block_select or (
         unordered
         and not candidate_filter
         and streaming_topk.is_supported(
@@ -669,12 +684,24 @@ def _select_fp8_indexer_jax(
         and prefill_chunk_rows is None
         and supports_candidate_publication(block_size)
     )
-    select_topk = functools.partial(
-        streaming_topk.streaming_topk,
-        k=topk,
-        exclude_neg_inf=True,
-        reconstruct_threshold=topk_reconstruction_threshold(topk),
-    )
+
+    def select_topk(scores, *, valid_lengths, scheduling_group_id=None):
+        if block_select:
+            return block_topk.block_topk(
+                scores,
+                valid_lengths,
+                k=topk,
+                block_size=8,
+                scheduling_group_id=scheduling_group_id,
+            )
+        return streaming_topk.streaming_topk(
+            scores,
+            valid_lengths=valid_lengths,
+            k=topk,
+            exclude_neg_inf=True,
+            reconstruct_threshold=topk_reconstruction_threshold(topk),
+            scheduling_group_id=scheduling_group_id,
+        )
 
     def block(start, rows, inputs, *, score_only=False, group=None):
         shared_inputs = score_only and prefill_chunk_rows is None

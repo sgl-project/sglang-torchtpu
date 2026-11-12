@@ -25,6 +25,7 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from sglang_tpu.pallas_export import is_tpu_target
 from sglang_tpu.kernels.deepseek_v41.index_selection._radix import Radix
 from sglang_tpu.kernels.deepseek_v41.index_selection.streaming_topk import (
     RADIX_BUCKETS,
@@ -83,7 +84,7 @@ def is_supported(
     rows: int, width: int, k: int, block_size: int, *, publish: int = 0
 ) -> bool:
     """Lane-aligned shapes whose block maxima fit SparseCore VMEM."""
-    if jax.default_backend() != "tpu":
+    if not is_tpu_target():
         return False
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
@@ -123,7 +124,8 @@ def block_topk(
     NaNs are unsupported. Equal FP32 ordered-bit keys prefer lower logical
     IDs; +0 ranks above -0. Positive infinity is supported. Publication uses
     a distinct internal sentinel to force the newest block even at +inf ties.
-    This primitive is not activated in the public FP8 selection pipeline yet.
+    Dense unfiltered FP8 selection uses the token-only path when eligible;
+    publication and candidate-filtered selection retain their existing paths.
 
     Args:
         scores: FP32 [rows, width]; keys at or past a row's length are -inf.

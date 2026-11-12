@@ -21,6 +21,19 @@ def argnums(function: Callable, *names: str) -> tuple[int, ...]:
     return tuple(parameters.index(name) for name in names)
 
 
+def is_tpu_target() -> bool:
+    """Whether tracing targets TPU, including scoped CPU-hosted TPU export.
+
+    JAX's target metadata observes an abstract mesh for cross-compilation and
+    the physical metadata installed by ``tpu_info_for_cpu_export``. Unlike
+    ``jax.default_backend()``, this does not confuse the host with the target.
+    Plain CPU tracing remains false; no backend switch or extra global state.
+    """
+    from jax._src import tpu_info
+
+    return tpu_info.is_tpu_device()
+
+
 def get_torch_tpu_device_kind() -> str:
     """Return physical TPU hardware metadata."""
     from torch_tpu._internal.utils.hardware import get_tpu_device_name
