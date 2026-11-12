@@ -118,7 +118,7 @@ class DiffusionTransferManager:
         if stream is not None:
             d2h_event = torch.get_device_module().Event()
             d2h_event.record(stream)
-        elif torch.get_device_module().is_available():
+        elif torch.accelerator.is_available():
             d2h_event = torch.get_device_module().Event()
             d2h_event.record(torch.get_device_module().current_stream())
 
@@ -169,7 +169,7 @@ class DiffusionTransferManager:
         if stream is not None:
             load_event = torch.get_device_module().Event()
             load_event.record(stream)
-        elif torch.get_device_module().is_available():
+        elif torch.accelerator.is_available():
             load_event = torch.get_device_module().Event()
             load_event.record(torch.get_device_module().current_stream())
 

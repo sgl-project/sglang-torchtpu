@@ -515,7 +515,8 @@ def test_sensenova_u1_randn_fallback_preserves_device_rng(monkeypatch):
 
     device = torch.device(device_type, 0)
     device_module = torch.get_device_module(device)
-    if not device_module.is_available():
+    # device_type comes from current_platform, i.e. the current accelerator.
+    if not torch.accelerator.is_available():
         pytest.skip(f"{device_type} is not available")
 
     _force_generator_fallback(monkeypatch, device_type)

@@ -97,7 +97,7 @@ def _torch_cleanup() -> None:
     try:
         import torch
 
-        if torch.get_device_module().is_available():
+        if torch.accelerator.is_available():
             torch.get_device_module().synchronize()
             torch.get_device_module().empty_cache()
     except Exception:

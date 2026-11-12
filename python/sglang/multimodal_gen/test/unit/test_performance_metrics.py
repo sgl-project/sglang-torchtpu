@@ -634,7 +634,7 @@ def test_worker_releases_the_probe_pool_before_the_next_request(monkeypatch):
     calls = []
     fake_device = SimpleNamespace(empty_cache=lambda: calls.append("empty_cache"))
     monkeypatch.setattr(
-        gpu_worker_module.torch, "get_device_module", lambda: fake_device
+        gpu_worker_module.torch, "get_device_module", lambda *_: fake_device
     )
     monkeypatch.setattr(type(current_platform), "is_cpu", lambda self: False)
     monkeypatch.setattr(type(current_platform), "is_mps", lambda self: False)
@@ -661,7 +661,7 @@ def test_worker_keeps_the_pool_when_no_probe_ran(monkeypatch):
     calls = []
     fake_device = SimpleNamespace(empty_cache=lambda: calls.append("empty_cache"))
     monkeypatch.setattr(
-        gpu_worker_module.torch, "get_device_module", lambda: fake_device
+        gpu_worker_module.torch, "get_device_module", lambda *_: fake_device
     )
     worker = GPUWorker.__new__(GPUWorker)
     worker._release_warmup_pool_before_serving = False

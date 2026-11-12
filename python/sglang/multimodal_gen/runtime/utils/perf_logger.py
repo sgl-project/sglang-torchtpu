@@ -213,7 +213,7 @@ _host_anon_sampler = _HostAnonSampler()
 
 
 def capture_memory_snapshot() -> MemorySnapshot:
-    if not torch.get_device_module().is_available():
+    if not torch.accelerator.is_available():
         return MemorySnapshot(
             allocated_mb=0.0,
             reserved_mb=0.0,
@@ -326,7 +326,7 @@ class StageProfiler:
         """
         if (
             os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-            and torch.get_device_module().is_available()
+            and torch.accelerator.is_available()
         ):
             torch.get_device_module().synchronize()
 
@@ -389,7 +389,7 @@ class StageProfiler:
                 self.metrics.record_stage(self.stage_name, execution_time_s)
 
             # capture memory snapshot after stage if requested
-            if self.capture_memory and torch.get_device_module().is_available():
+            if self.capture_memory and torch.accelerator.is_available():
                 snapshot = capture_memory_snapshot()
                 self.metrics.record_memory_snapshot(
                     f"after_{self.stage_name}", snapshot

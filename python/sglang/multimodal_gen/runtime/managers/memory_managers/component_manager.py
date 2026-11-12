@@ -225,7 +225,7 @@ class ComponentResidencyManager:
             self.state.batch_is_warmup
             and self.server_args.pipeline_config.supports_auto_residency
             and current_platform.is_cuda()
-            and torch.get_device_module().is_available()
+            and torch.accelerator.is_available()
         )
         self._warmup_phase_key = None
         self._warmup_phase_components = ()
@@ -704,7 +704,7 @@ class ComponentResidencyManager:
         self._track_warmup_memory = False
         if (
             current_platform.device_shares_host_memory()
-            and torch.get_device_module().is_available()
+            and torch.accelerator.is_available()
         ):
             # One pool: every byte the caching allocator keeps reserved between
             # requests is page cache the next request's streamed encoder cannot use.
@@ -1008,7 +1008,7 @@ class ComponentResidencyManager:
         )
         if not (should_empty_component_cache or released_layerwise_storage):
             return
-        if not torch.get_device_module().is_available():
+        if not torch.accelerator.is_available():
             return
         torch.get_device_module().empty_cache()
 
