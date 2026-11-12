@@ -222,7 +222,32 @@ def _register(
         or None,
         configure_callable=export_cache.hook(_keyed_on_kernel_config(export_key)),
     )
-    return op if len(runs) == len(in_specs) else _RunOp(op, runs)
+    return _sync_debug(name, op if len(runs) == len(in_specs) else _RunOp(op, runs))
+
+
+def _sync_debug(name: str, op: Any) -> Any:
+    """``K3_SYNC_OPS=1`` (debugging): every call's outputs are read back at
+    once, so an op that fails (e.g. on a donated input) raises at its own call
+    and logs its name. Precompilation calls ``_unsynced`` (placeholders)."""
+    import os
+
+    if os.environ.get("K3_SYNC_OPS") != "1":
+        return op
+
+    def call(*args):
+        out = op(*args)
+        for index, tensor in enumerate(out if isinstance(out, (tuple, list)) else (out,)):
+            if isinstance(tensor, torch.Tensor):
+                try:
+                    materialize(tensor)
+                except Exception as exc:
+                    logger.error("K3_SYNC_OPS: %s output %d failed: %s", name, index, exc)
+                    raise
+        return out
+
+    call._unsynced = op
+    call._init_fn = getattr(op, "_init_fn", None)
+    return call
 
 
 def register_op(

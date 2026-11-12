@@ -53,7 +53,7 @@ def compile_ops(calls: Iterable[CompileCall]) -> None:
                 finish()
             inputs = tuple(tpu_torch_compile.placeholder_like(t) for t in call.operands)
             with execution_mode.set_eager_mode(compile_fx_graph_mode()):
-                outputs = call.op(*inputs)
+                outputs = getattr(call.op, "_unsynced", call.op)(*inputs)
             with custom_compiler_options(call.options):
                 handle = tpu_torch_compile.async_traverse_and_compile(
                     list(outputs), list(inputs), fast_compile=True

@@ -244,7 +244,7 @@ def prepare_distributed(calls: Sequence[Any]) -> None:
                 continue
             inputs = tuple(tpu_torch_compile.placeholder_like(t) for t in call.operands)
             with execution_mode.set_eager_mode(compile_fx_graph_mode()):
-                call.op(*inputs)
+                getattr(call.op, "_unsynced", call.op)(*inputs)
     except Exception as exc:
         failure = exc
     torch.distributed.all_gather_object(
