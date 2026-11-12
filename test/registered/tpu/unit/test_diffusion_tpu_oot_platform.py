@@ -146,8 +146,9 @@ class TestCompileDefaults(CustomTestCase):
             PipelineConfig,
         )
         from sglang.multimodal_gen.runtime.platforms import current_platform
+        from sglang_tpu.multimodal_gen import lingbot_video_moe
 
-        def server_args(**kwargs):
+        def server_args(model_path="/fake", **kwargs):
             # ServerArgs.__post_init__ applies the platform defaults.
             with (
                 patch.object(
@@ -158,16 +159,21 @@ class TestCompileDefaults(CustomTestCase):
                     "apply_server_args_defaults",
                     TpuOOTPlatform().apply_server_args_defaults,
                 ),
+                patch.object(lingbot_video_moe, "install") as lingbot_install,
             ):
-                return server_args_module.ServerArgs.from_kwargs(
-                    model_path="/fake", **kwargs
+                args = server_args_module.ServerArgs.from_kwargs(
+                    model_path=model_path, **kwargs
                 )
+            # LingBot-Video-MoE requests take its sampling defaults in this process.
+            self.assertEqual(lingbot_install.call_count, "lingbot" in model_path)
+            return args
 
         self.assertFalse(server_args().offload_during_compile)
         # An explicit request is overridden: the warmup offload crashes on TPU.
         self.assertFalse(
             server_args(offload_during_compile=True).offload_during_compile
         )
+        server_args(model_path="/models/lingbot-video-moe-30b-a3b")
 
     def test_teacache_and_vae_decode_stay_out_of_compile(self):
         # What the core does with each False: TestPlatformCompileGates.
@@ -293,15 +299,17 @@ class TestWorkerRuntimePatches(CustomTestCase):
         # Ring attention merges replicated-token partials with logaddexp, which
         # torch_tpu has no kernel for (test_aten_fallbacks_tpu checks the kernel).
         from sglang_tpu import patches
-        from sglang_tpu.multimodal_gen import rope, worker
+        from sglang_tpu.multimodal_gen import lingbot_video_moe, rope, worker
 
         with (
             patch.object(patches, "_register_aten_fallbacks") as aten_fallbacks,
             patch.object(rope, "install") as rope_install,
+            patch.object(lingbot_video_moe, "install") as lingbot_install,
         ):
             worker.install_runtime_patches()
         aten_fallbacks.assert_called_once_with()
         rope_install.assert_called_once_with()
+        lingbot_install.assert_called_once_with()
 
 
 if __name__ == "__main__":

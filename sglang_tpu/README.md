@@ -294,7 +294,10 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   default under ring; an automatic selection may give it to any layer that takes
   `torch_sdpa`. The built-in platform has no ring-capable backend.
 - Runtime patches applied at worker init (`multimodal_gen/worker.py`), with
-  the debt header: `rope.py` (RoPE without stride-2 lane access); worker init
+  the debt header: `rope.py` (RoPE without stride-2 lane access) and
+  `lingbot_video_moe.py` (LingBot-Video-MoE: experts on the Pallas fused MoE, a
+  joint sequence in 512-token buckets sharded across Ulysses ranks, the
+  requested frame count; the server process installs it for LingBot models); worker init
   also registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
   `logaddexp`).
 
