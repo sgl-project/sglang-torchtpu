@@ -1,0 +1,51 @@
+# DeepSeek-V4.1-Flash on one tpu7x 2x2x1 host (attention DP8, EP8), dispatch only.
+# Builds the image at `ref` (a branch, tag or full commit SHA), boots the default
+# launch (benchmark/tpu/recipe/configs/deepseek_v41_flash.py) and runs one mode:
+#   gh workflow run dsv41-flash-test-tpu.yml -f ref=<sha> [-f mode=smoke|gsm8k]
+# Weights: /weights/DeepSeek-V4.1-Flash on the shared model-weights claim.
+name: DeepSeek-V4.1-Flash Test (TPU)
+run-name: "DeepSeek-V4.1-Flash Test (TPU) ${{ inputs.mode }} @ ${{ inputs.ref }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref or full commit SHA to test"
+        required: false
+        default: main
+      mode:
+        description: "smoke: boot + 17*23 check; gsm8k: boot + full GSM8K"
+        required: false
+        default: smoke
+        type: choice
+        options: [smoke, gsm8k]
+
+concurrency:
+  group: tpu-dsv41-flash-${{ inputs.ref }}-${{ inputs.mode }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref }}
+    permissions:
+      contents: read
+      id-token: write
+
+  dsv41-flash:
+    needs: build
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref }}
+      image: ${{ needs.build.outputs.digest }}
+      display_name: test_tpu_deepseek_v41_flash_singlehost_${{ inputs.mode }}
+      lane: nightly
+      hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_deepseek_v41_flash_singlehost.py TestDeepSeekV41Flash.test_${{ inputs.mode }} -v
+      files: test/registered/tpu/e2e/test_tpu_deepseek_v41_flash_singlehost.py
+      weights_pvc: model-weights
+      run_name: dsv41-flash-${{ inputs.mode }}
+    permissions:
+      contents: read
+      id-token: write
