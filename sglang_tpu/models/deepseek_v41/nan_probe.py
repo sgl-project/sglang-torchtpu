@@ -66,7 +66,9 @@ def after_forward(forward_batch, out) -> None:
     hits = torch.nonzero(_BUF.cpu()).flatten().tolist()
     logits = getattr(out, "next_token_logits", None)
     logits_nan = (
-        bool(torch.isnan(logits).any().item()) if isinstance(logits, torch.Tensor) else None
+        bool(torch.isnan(logits).any().item())
+        if isinstance(logits, torch.Tensor)
+        else None
     )
     named = [f"{_KINDS[h // _MAX_LAYERS]}{h % _MAX_LAYERS}" for h in hits]
     logger.info(
@@ -85,7 +87,15 @@ def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
     return [
-        ("sglang.srt.models.deepseek_v4.MQALayer.forward", attn_forward, HookType.AROUND),
+        (
+            "sglang.srt.models.deepseek_v4.MQALayer.forward",
+            attn_forward,
+            HookType.AROUND,
+        ),
         ("sglang.srt.layers.engram.Engram.forward", engram_forward, HookType.AROUND),
-        ("sglang.srt.models.deepseek_v2.DeepseekV2MoE.forward", moe_forward, HookType.AROUND),
+        (
+            "sglang.srt.models.deepseek_v2.DeepseekV2MoE.forward",
+            moe_forward,
+            HookType.AROUND,
+        ),
     ]
