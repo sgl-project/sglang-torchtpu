@@ -47,7 +47,14 @@ implementation includes packed/chunked prefill, decode, padding and per-request
 state updates, including lifting the state and metadata into `direct_compile`.
 It currently requires `--disable-radix-cache` and no speculative decoding;
 ZAYA1 and the separate LFM2-MoE ShortConv implementation are outside this wiring.
-Full-model TPU generation validation and registered coverage remain pending.
+Manual full-model validation completed on one TPU v5e chip with BF16 weights
+and KV cache, TP=1, single-request concurrency, and `torch.compile` disabled.
+GSM8K accuracy was 72.00% on 200 examples (`max_tokens=1536`), with no request
+errors and a 1.50% truncation rate. Serving benchmarks measured 22.08 and 22.93
+output tokens/s for 128/128 and 1024/128 input/output tokens, respectively
+(median of three runs of 32 requests after warmup).
+Compiled full-model execution and registered full-model E2E coverage remain
+pending.
 
 Different arm, same outcome for every configuration that runs:
 
