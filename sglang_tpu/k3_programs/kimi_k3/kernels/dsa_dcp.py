@@ -222,6 +222,12 @@ def _row_scalar(vector, row):
     return jnp.sum(jnp.where(lane == row, vector, 0))
 
 
+def _row_scalar_col(column, row):
+    """Sublane ``row`` of a ``[rows, 1]`` int32 column as a scalar."""
+    sub = jax.lax.broadcasted_iota(jnp.int32, column.shape, 0)
+    return jnp.sum(jnp.where(sub == row, column, 0))
+
+
 def _locate(starts_ref, step, batch):
     """``(row, step - starts[row])`` with ``row`` the last with ``starts[row] <= step``."""
     row = jnp.int32(0)
@@ -919,11 +925,14 @@ class IndexSelect:
             rows_valid = refs["counts"][row] * self.subpages
             lo = refs["row_prefix"][row] ^ INT_MIN
 
-            def vreg(v, carry):
+            def hits(v):
                 key = refs["key_buf"][step % self.key_slots, pl_ds(pl.multiple_of(v * 8, 8), 8), :]
                 key_row = start + v * 8 + sub8
                 valid = (key_row >= local * chunk) & (key_row < rows_valid)
-                hit = valid & (key >= lo) & (jax.lax.shift_right_logical(key - lo, bits) == 0)
+                return key, key_row, valid & (key >= lo) & (jax.lax.shift_right_logical(key - lo, bits) == 0)
+
+            def vreg(v, carry):
+                key, key_row, hit = hits(v)
                 n = jnp.sum(hit.astype(jnp.int32))
 
                 @pl_when(n > 0)
@@ -953,8 +962,16 @@ class IndexSelect:
                 return carry
 
             first_v = (local * chunk - start) // 8
-            end_v = (jnp.minimum(rows_valid, (local + 1) * chunk) - start + 7) // 8
-            jax.lax.fori_loop(first_v, jnp.maximum(end_v, first_v), vreg, 0)
+            end_v = jnp.maximum((jnp.minimum(rows_valid, (local + 1) * chunk) - start + 7) // 8, first_v)
+            # Bin keys are rare (at most GATHER_SLOTS a row over the group): one
+            # reduction for the chunk, a per-vreg pass only when it holds any.
+            any_hit = jax.lax.fori_loop(first_v, end_v, lambda v, acc: acc + hits(v)[2].astype(jnp.int32),
+                                        jnp.zeros((8, LANES), jnp.int32))
+
+            @pl_when(jnp.sum(any_hit) > 0)
+            def rescan():
+                jax.lax.fori_loop(first_v, end_v, vreg, 0)
+
             return carry
 
         jax.lax.fori_loop(0, total, step_fn, 0)
@@ -978,77 +995,58 @@ class IndexSelect:
         pltpu.make_async_copy(others, others, sems.at[1]).wait()
         pltpu.make_async_copy(others, others, sems.at[0]).wait()
 
-    def _slot_values(self, value_of):
-        """``[rows, LANES]`` with row ``b``'s sublane ``value_of(b)`` (an SMEM scalar)."""
-        rows = self.refs["cand"].shape[0]
-        sub = jax.lax.broadcasted_iota(jnp.int32, (rows, LANES), 0)
-        out = jnp.zeros((rows, LANES), jnp.int32)
-        for b in range(self.batch):
-            out = jnp.where(sub == b, value_of(b), out)
-        return out
-
-    def _slot_counts(self, digit, above):
-        """``[COUNT_ROWS, LANES]`` (sublane ``j``: candidate ``j + 1``, lane ``b``:
-        row ``b``) from the gathered candidates' digits ``[group, rows, LANES]``
-        (-1: not counted): digits above ``j`` (key rounds) or up to ``j`` (tie
-        rounds)."""
-        rows = digit.shape[1]
-        columns = []
-        for j in range(CANDIDATES):
-            hit = (digit > j) if above else ((digit >= 0) & (digit <= j))
-            columns.append(jnp.sum(jnp.sum(hit.astype(jnp.int32), axis=0), axis=1, keepdims=True))  # [rows, 1]
-        table = jnp.concatenate(columns + [jnp.zeros((rows, LANES - CANDIDATES), jnp.int32)], axis=1)
-        table = jnp.concatenate([table, jnp.zeros((LANES - rows, LANES), jnp.int32)], axis=0)  # [LANES, LANES]
-        return table.T[:COUNT_ROWS]
-
     def _gather_finish(self, first_round):
-        """Rounds ``first_round ..`` (traced) and the tie rounds on the gathered
-        candidates, every rank alike; then the count slots' last sends."""
-        refs = self.refs
+        """The thresholds from the gathered candidates, every rank alike: per
+        row, the ``need``-th of its candidates (``need = topk - UPPER``, the
+        keys above the bin) in key order, ties by position (lowest first); then
+        the count slots' last sends. ``first_round`` (traced): the first key
+        round not taken (the bin is ``32 - 4 first_round`` bits wide)."""
+        refs, topk = self.refs, self.topk
         self._row_scalars(_PREFIX, "row_prefix")
         self._extract(32 - DIGIT_BITS * first_round)
         self._exchange_candidates()
         rows = refs["cand"].shape[0]
-        lane = jax.lax.broadcasted_iota(jnp.int32, (self.group, rows, LANES), 2)
-
-        def slots():
-            gathered = refs["gather"][:self.group]  # the buffer may have room for a larger group
-            keys = gathered
-            positions = pltpu_roll(gathered, LANES - GATHER_SLOTS)  # position lanes onto their keys
-            return keys, positions, (lane < GATHER_SLOTS) & (positions >= 0)
-
-        # Keys above the gathered bin (on every rank): with the candidates at or
-        # above a threshold, a round's counts are the distributed round's.
-        cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
-        above = jnp.where(cand < CANDIDATES, refs["state"][_UPPER:_UPPER + 1], 0)
-
-        def local_round(i, carry):
-            shift = 32 - DIGIT_BITS * (i + 1)
-            keys, _, valid = slots()
-            self._row_scalars(_PREFIX, "row_prefix")
-            base = self._slot_values(lambda b: refs["row_prefix"][b] ^ INT_MIN)
-            q = jax.lax.shift_right_logical(keys - base, shift)
-            digit = jnp.where(q < 0, 15, jnp.minimum(q, 15))
-            counted = valid & (keys >= base)
-            self._key_update(self._slot_counts(jnp.where(counted, digit, -1), True) + above, shift)
-            return carry
-
-        jax.lax.fori_loop(first_round, len(KEY_SHIFTS), local_round, 0)
+        gathered = refs["gather"][:self.group]  # the buffer may have room for a larger group
+        lane = jax.lax.broadcasted_iota(jnp.int32, gathered.shape, 2)
+        keys = gathered
+        positions = pltpu_roll(gathered, LANES - GATHER_SLOTS)  # position lanes onto their keys
+        live = (lane < GATHER_SLOTS) & (positions >= 0)
         state = refs["state"]
-        state[_POSITION:_POSITION + 1] = jnp.zeros((1, LANES), jnp.int32)
-        tie = self._active_rows() & (state[_LOWER:_LOWER + 1] > self.topk)
+        sub = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0)
+        lane1 = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
+        upper = jnp.zeros((rows, 1), jnp.int32)  # the keys above the bin, a row a sublane
+        for b in range(self.batch):
+            upper = jnp.where(sub == b, _row_scalar(state[_UPPER:_UPPER + 1], b), upper)
+        need = topk - upper
 
-        @pl_when(jnp.sum(tie.astype(jnp.int32)) > 0)
-        def local_ties():
-            keys, positions, valid = slots()
-            self._row_scalars(_PREFIX, "row_prefix")
-            tied = valid & (keys == self._slot_values(lambda b: refs["row_prefix"][b] ^ INT_MIN))
-            for shift in POSITION_SHIFTS:
-                self._row_scalars(_POSITION, "row_position")
-                floor = self._slot_values(lambda b: refs["row_position"][b])
-                digit = jnp.clip((positions - floor) >> shift, 0, 15)
-                self._tie_update(self._slot_counts(jnp.where(tied, digit, -1), False), shift)
+        def pick(i, carry):  # the rows' (i + 1)-th candidates in key order, ties by position
+            left, tau, ptie = carry  # left: int32 mask of the candidates not taken yet
+            key_max = jnp.max(jnp.max(jnp.where(left != 0, keys, INT_MIN), axis=0), axis=1, keepdims=True)
+            top = (left != 0) & (keys == key_max[None])
+            pos_min = jnp.min(jnp.min(jnp.where(top, positions, INT_MAX), axis=0), axis=1, keepdims=True)
+            taken = top & (positions == pos_min[None])
+            nth = i + 1 == need
+            return jnp.where(taken, 0, left), jnp.where(nth, key_max, tau), jnp.where(nth, pos_min, ptie)
 
+        zero = jnp.zeros((rows, 1), jnp.int32)
+        _, tau, ptie = jax.lax.fori_loop(0, GATHER_SLOTS, pick, (live.astype(jnp.int32), zero, zero))
+        above = jnp.sum(jnp.sum((live & (keys > tau[None])).astype(jnp.int32), axis=0), axis=1, keepdims=True)
+        at_or_above = jnp.sum(jnp.sum((live & (keys >= tau[None])).astype(jnp.int32), axis=0), axis=1,
+                              keepdims=True)
+        # Rows on sublanes -> the state's lanes (the distributed rounds' state:
+        # prefix = tau, UPPER / LOWER the keys above / at or above it).
+        prefix, upper_n, lower_n, position = (state[_PREFIX:_PREFIX + 1], state[_UPPER:_UPPER + 1],
+                                              state[_LOWER:_LOWER + 1], jnp.zeros((1, LANES), jnp.int32))
+        for b in range(self.batch):
+            at = lane1 == b
+            prefix = jnp.where(at, _row_scalar_col(tau, b) ^ INT_MIN, prefix)
+            upper_n = jnp.where(at, _row_scalar_col(upper + above, b), upper_n)
+            lower_n = jnp.where(at, _row_scalar_col(upper + at_or_above, b), lower_n)
+            position = jnp.where(at, _row_scalar_col(ptie, b), position)
+        state[_PREFIX:_PREFIX + 1] = prefix
+        state[_UPPER:_UPPER + 1] = upper_n
+        state[_LOWER:_LOWER + 1] = lower_n
+        state[_POSITION:_POSITION + 1] = position
         refs["sel_done"][0] = 1
         self._sent(0)  # the count rounds' last two sends
         self._sent(1)
