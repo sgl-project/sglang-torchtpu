@@ -114,6 +114,10 @@ tpu_dsv41_hasher_forward
   How: AROUND EngramHasher.forward on non-CUDA extend computes the rows in
        int32 as a compare-sum against request ends and hashes every padded row
        (no guard on the host lengths), then commits history for real rows only.
+       Extend and decode commit history as history.copy_(history.index_put(..)),
+       the functional-update-then-copy_ form vllm-torchtpu uses for its Engram
+       slot cache; the in-place index_put of the original is not written back
+       from the compiled TPU graph, so decode read all-zero predecessors.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TPU lowers 64-bit integer arithmetic.
 
@@ -333,11 +337,12 @@ def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
     against each request's end (requests are contiguous in extend_start_loc).
     """
     num_tokens = input_ids.shape[0]
-    if (
-        input_ids.is_cuda
-        or num_tokens == 0
-        or not forward_batch.forward_mode.is_extend()
-    ):
+    mode = forward_batch.forward_mode
+    if input_ids.is_cuda or num_tokens == 0:
+        return original(hasher, input_ids, forward_batch)
+    if mode.is_decode():
+        return _tpu_hasher_decode(hasher, input_ids, forward_batch)
+    if not mode.is_extend():
         return original(hasher, input_ids, forward_batch)
     from sglang.kernels.ops.embeddings.engram_hash import MODE_EXTEND
 
@@ -376,9 +381,43 @@ def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
         commit_rows = torch.where(
             out_loc[commit_last] == 0, hasher.pad_row, commit_rows
         )
-    hasher.history[commit_rows] = (
-        tokens[commit_last][:, : n - 1].flip(-1).to(hasher.history.dtype)
+    _commit_history(hasher, commit_rows, tokens[commit_last][:, : n - 1].flip(-1))
+    return hash_ids
+
+
+def _commit_history(hasher, rows, values):
+    """Write history rows the way vllm-torchtpu writes its Engram slot cache:
+    a functional update copied back into the resident tensor
+    (``cache.copy_(_write_op(cache, slots, values))``). An in-place index_put
+    on the plain attribute inside the compiled graph is not written back on
+    TPU, so decode read all-zero predecessors. Padding rows go to pad_row."""
+    history = hasher.history
+    rows = rows.to(torch.int64)
+    history.copy_(history.index_put((rows,), values.to(history.dtype)))
+
+
+def _tpu_hasher_decode(hasher, input_ids, forward_batch):
+    """EngramHasher.forward decode on TPU: same hash and commit as the
+    original torch path, with the history write from ``_commit_history``."""
+    from sglang.kernels.ops.embeddings.engram_hash import MODE_DECODE
+
+    n = hasher.max_ngram_size
+    req_slots = forward_batch.req_pool_indices
+    hash_ids, tokens = hasher._torch_hash_ids(
+        input_ids,
+        forward_batch.positions,
+        MODE_DECODE,
+        hasher.history[req_slots.to(torch.int64)],
+        input_ids.shape[0],
+        1,
+        None,
+        None,
     )
+    rows = req_slots.to(torch.int32)
+    out_loc = forward_batch.out_cache_loc
+    if out_loc is not None:
+        rows = torch.where(out_loc == 0, hasher.pad_row, rows)
+    _commit_history(hasher, rows, tokens[:, : n - 1].flip(-1))
     return hash_ids
 
 
