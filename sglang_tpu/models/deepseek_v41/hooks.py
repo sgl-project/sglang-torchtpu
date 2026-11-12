@@ -5,8 +5,8 @@ Pool and loader hooks pass V4 (no ratio-1/2 layers, model_type != deepseek_v41)
 through to ``original``. The Engram row hook supports the shared Hasher's
 packed-sequence metadata on TPU, including V4 users of that same contract.
 Hooks are appended after sglang_tpu/hooks/dsv4.py so shared targets are wrapped
-on the outside. Row-hook registration requires the neutral prepare_extend_rows
-seam carried with this adaptation.
+on the outside. Hasher-hook registrations require the neutral prepare_extend_rows
+and prepare_lookback_blocked seams carried with this adaptation.
 
 build_tpu_dsv41_kv_pool, get_tpu_dsv41_bytes_per_swa_token,
 get_tpu_dsv41_bytes_per_full_token
@@ -56,6 +56,19 @@ prepare_tpu_dsv41_lookback_blocked
   Upstream PR or issue: sgl-project/sglang-torchtpu#2101;
        google-pytorch/torch_tpu#2898 tracks the scan-emitter workaround.
   Remove when: native boolean-prefix lowering is correct with the workaround.
+
+barrier_tpu_dsv41_engram_output
+  Why: libtpu 0.0.50 cannot choose a tiled BF16 image-select fusion window when
+       both adjacent HC parameter-generation DAGs remain connected.
+  How: AROUND Engram.forward preserves its lookup/collective/empty handling,
+       then fences only nonempty compiled TPU outputs with the public barrier.
+       The exact closed-HC reproducer fails without this identity operation and
+       compiles with it; image selection and BF16 rounding remain unchanged.
+  Upstream PR or issue: sgl-project/sglang-torchtpu#2101; reproduced under the
+       deployed pins requiring the scan-emitter workaround tracked in
+       google-pytorch/torch_tpu#2898 (a separate compiler issue).
+  Remove when: the original closed-HC reproducer compiles correctly under the
+       deployed TorchTPU/libtpu pins without the output barrier.
 """
 
 from __future__ import annotations
@@ -124,6 +137,19 @@ def prepare_tpu_dsv41_lookback_blocked(original, hasher, mask):
     return result
 
 
+def barrier_tpu_dsv41_engram_output(original, engram, *args, **kwargs):
+    import torch
+
+    result = original(engram, *args, **kwargs)
+    if (
+        result.device.type == "tpu"
+        and torch.compiler.is_compiling()
+        and result.numel() != 0
+    ):
+        return torch.tpu.ops.optimization_barrier([result])[0]
+    return result
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -152,6 +178,11 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.EngramHasher.prepare_lookback_blocked",
             prepare_tpu_dsv41_lookback_blocked,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.engram.Engram.forward",
+            barrier_tpu_dsv41_engram_output,
             HookType.AROUND,
         ),
     ]
