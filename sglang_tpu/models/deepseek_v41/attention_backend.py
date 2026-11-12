@@ -15,7 +15,8 @@ page table ``req_to_token[req, ::256] // 256``, the SWA page table through
 ``full_to_swa_index_mapping`` at 64-token pages, ``c1/c2_out_loc = full_loc // r``
 on group-completing tokens (core ``_low_ratio_compression_metadata``) and the
 indexer page table from core ``expand_index_page_table``. The ratio-2 compressor
-reuses core ``_low_ratio_pair_partners`` on the pool's request-scoped pair state.
+ports core ``_low_ratio_pair_partners`` on the pool's request-scoped pair state,
+with the ring write as a functional update copied back (as the Engram history fix).
 
 Padding tokens (``out_cache_loc == 0`` or past the batch's real tokens) never write
 a cache (record -1) and produce zeros.
@@ -544,14 +545,19 @@ class DSV41TPUAttnBackend(AttentionBackend):
         ratio = layer.compress_ratio
         compressor = layer.compressor
         records = metadata.low_ratio[ratio].out_loc
-        kv, score = compressor.project(x)
         if ratio == 1:
+            # Core's ratio-1 projection is the BF16 nn.Linear; accumulate in FP32
+            # as the vllm-torchtpu compressor does (torch.mm on FP32 operands).
+            kv = torch.mm(x.float(), compressor.wkv.weight.float().t())
             pooled, group_pos = kv, metadata.positions
         else:
+            kv, score = compressor.project(x)  # FP32 (linear_bf16_fp32)
             pooled, group_pos = self._pool_pairs(
                 layer=layer, kv=kv, score=score, metadata=metadata
             )
-        latent = compressor.finish(pooled)
+        # Core finish() rounds to BF16 before RMSNorm; keep FP32 through the norm
+        # and round once afterwards, like vllm-torchtpu save_compress_norm.
+        latent = compressor.norm(pooled.float()).to(torch.bfloat16)
 
         # Index keys come from the pre-RoPE latent.
         indexer = layer.indexer
@@ -577,14 +583,8 @@ class DSV41TPUAttnBackend(AttentionBackend):
     def _pool_pairs(self, *, layer, kv, score, metadata):
         """Each odd token pools with its even partner, read from this batch or from
         the request's pair-state ring; the group position is the even token."""
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
-        )
-
         pos = metadata.positions
-        # Reads only self.token_to_kv_pool.get_attention_compress_states.
-        partner_kv, partner_score = DeepseekV4AttnBackend._low_ratio_pair_partners(
-            self,
+        partner_kv, partner_score = self._pair_partners(
             layer_id=layer.layer_id,
             kv=kv,
             score=score,
@@ -597,6 +597,57 @@ class DSV41TPUAttnBackend(AttentionBackend):
             torch.stack([partner_score, score], dim=1),
         )
         return pooled, torch.where(pos % 2 == 1, pos - 1, pos)
+
+    def _pair_partners(self, *, layer_id, kv, score, req, pos, pad):
+        """Core ``_low_ratio_pair_partners`` with the ring write as a functional
+        update copied back into the pool buffer.
+
+        Core writes ``kv_score_buffer[state_loc] = value`` in place; inside the
+        compiled TPU graph that indexed assignment is the pattern the Engram
+        history fix found not written back (84c46f2eaf), which would leave an
+        odd token pooling with a stale partner. Reads all precede the write."""
+        state = self.token_to_kv_pool.get_attention_compress_states(layer_id)
+        ring = state.ring_size
+        num_tokens = pos.shape[0]
+        if not num_tokens:
+            return kv, score
+
+        read_pos = (pos - 1).masked_fill(pad, -1)
+        carried = state.get_state_by_state_loc(
+            state.translate_from_req_position_to_state_loc(req, read_pos)
+        )
+        in_batch = torch.zeros_like(pad)
+        in_batch[1:] = (
+            (req[1:] == req[:-1]) & (pos[1:] == pos[:-1] + 1) & ~pad[1:] & ~pad[:-1]
+        )
+        partner_kv = torch.where(in_batch[:, None], torch.roll(kv, 1, 0), carried.kv)
+        partner_score = torch.where(
+            in_batch[:, None], torch.roll(score, 1, 0), carried.score
+        )
+
+        # Keep only a request's last ring_size rows so each write hits a distinct
+        # live slot; dropped and padding rows land on the scratch row -1.
+        keep = ~pad
+        if num_tokens > ring:
+            keep[:-ring] &= (req[:-ring] != req[ring:]) | pad[ring:]
+        write_pos = pos.masked_fill(~keep, -1)
+        slots = state.translate_from_req_position_to_state_loc(req, write_pos)
+        buffer = state.kv_score_buffer.kv_score
+        slots = torch.where(slots < 0, buffer.shape[0] - 1, slots).to(torch.int64)
+        values = torch.cat([kv, score], dim=-1).to(buffer.dtype)
+        updated = buffer.index_put((slots,), values)
+        # Row -1 reads as an empty partner: kv 0, score -inf (core clear()).
+        half = buffer.shape[-1] // 2
+        empty = torch.cat(
+            [
+                buffer.new_zeros(1, half),
+                buffer.new_full((1, half), float("-inf")),
+            ],
+            dim=-1,
+        )
+        updated = torch.cat([updated[:-1], empty], dim=0)
+        buffer.copy_(updated)
+        return partner_kv, partner_score
 
     def _select(self, *, layer, x, q_lora, metadata) -> None:
         """Indexer query (core wq_b, head weights; RoPE on the last 64 dims), then
