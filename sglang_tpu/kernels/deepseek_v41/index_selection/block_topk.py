@@ -25,12 +25,12 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-from sglang_tpu.pallas_export import is_tpu_target
 from sglang_tpu.kernels.deepseek_v41.index_selection._radix import Radix
 from sglang_tpu.kernels.deepseek_v41.index_selection.streaming_topk import (
     RADIX_BUCKETS,
     _ordered_bits,
 )
+from sglang_tpu.pallas_export import is_tpu_target
 
 
 def default_blocks(k: int, lanes: int, forced: bool = True) -> int:
