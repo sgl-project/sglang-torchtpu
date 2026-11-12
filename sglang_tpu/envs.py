@@ -568,6 +568,9 @@ class TpuEnvs:
     # Decode megakernel (TP): fp4 experts requantized to one scale per this many K rows (0 off,
     # 64 / 128 / 256); the expert dots push raw e2m1 codes to the MXU (MKConfig.qblock).
     SGLANG_TPU_MUSE_MK_QBLOCK = EnvInt(0)
+    # Kernel-level weight layouts (anvil / numerics only); serving raises on them.
+    SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
+    SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

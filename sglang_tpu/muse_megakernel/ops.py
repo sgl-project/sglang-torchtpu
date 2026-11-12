@@ -23,7 +23,6 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.utils import get_bool_env_var
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import (
     TpuFusedMHATokenToKVPool,
@@ -280,11 +279,14 @@ class MuseMegakernel(torch.nn.Module):
     def from_model(cls, model) -> "MuseMegakernel":
         from sglang.srt.runtime_context import get_parallel
 
-        for env in ("SGLANG_TPU_MUSE_MK_KPERM", "SGLANG_TPU_NVFP4_E4M3_SCALES"):
+        for env in (
+            tpu_envs.SGLANG_TPU_MUSE_MK_KPERM,
+            tpu_envs.SGLANG_TPU_NVFP4_E4M3_SCALES,
+        ):
             # kernel-level only (anvil / numerics): serving weight load has no such layout
-            if get_bool_env_var(env):
+            if env.get():
                 raise NotImplementedError(
-                    f"{env}: not supported by the Muse megakernel"
+                    f"{env.name}: not supported by the Muse megakernel"
                 )
         parallel = get_parallel()
         moe_mode = resolve_moe_mode(parallel.moe_ep_size)
