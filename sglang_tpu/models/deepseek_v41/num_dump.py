@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Diagnostic only (not for merge): dump layer 0-2 activations for vLLM comparison.
+
+Enabled by SGLANG_TPU_DSV41_DUMP=1. Inside the compiled forward each hook point
+copies its tensor into a preallocated fp32 device buffer (no graph break).
+After a forward, if /tmp/dsv41_dump_on exists, the buffers plus the batch's
+input_ids/positions are saved to /tmp/dsv41_dump/<n>_<mode>_r<rank>.pt.
+"""
+
+from __future__ import annotations
+
+import os
+
+import torch
+
+ENABLED = os.environ.get("SGLANG_TPU_DSV41_DUMP") == "1"
+LAYERS = (0, 1, 2)
+POINTS = ("attn_in", "attn_out", "engram_in", "engram_out", "moe_in", "moe_out")
+_ROWS, _COLS = 128, 20480
+_BUF: dict = {}
+_COUNT = [0]
+_OUT = "/tmp/dsv41_dump"
+
+
+def _ensure(device):
+    if not _BUF:
+        for layer in LAYERS:
+            for p in POINTS:
+                _BUF[(p, layer)] = torch.zeros(_ROWS, _COLS, device=device)
+    return _BUF
+
+
+def _put(point, layer, x):
+    key = (point, layer)
+    if key not in _BUF or not isinstance(x, torch.Tensor) or x.dim() == 0:
+        return
+    t = x.shape[0]
+    flat = x.reshape(t, -1)
+    rows, cols = min(t, _ROWS), min(flat.shape[1], _COLS)
+    _BUF[key][:rows, :cols].copy_(flat[:rows, :cols].float())
+
+
+def attn_forward(original, layer, x, *args, **kwargs):
+    _put("attn_in", layer.layer_id, x)
+    out = original(layer, x, *args, **kwargs)
+    _put("attn_out", layer.layer_id, out)
+    return out
+
+
+def engram_forward(original, engram, x, *args, **kwargs):
+    # Keyed by Engram index (0 = first Engram layer), not decoder layer.
+    _put("engram_in", engram.layer_hash_index, x)
+    out = original(engram, x, *args, **kwargs)
+    _put("engram_out", engram.layer_hash_index, out)
+    return out
+
+
+def moe_forward(original, moe, hidden_states, *args, **kwargs):
+    _put("moe_in", moe.layer_id, hidden_states)
+    out = original(moe, hidden_states, *args, **kwargs)
+    _put("moe_out", moe.layer_id, out)
+    return out
+
+
+def before_forward(device) -> None:
+    _ensure(device)
+
+
+def after_forward(forward_batch) -> None:
+    if not _BUF or not os.path.exists("/tmp/dsv41_dump_on"):
+        return
+    from sglang.srt.runtime_context import get_parallel
+
+    os.makedirs(_OUT, exist_ok=True)
+    rank = get_parallel().tp_rank
+    rec = {
+        "mode": forward_batch.forward_mode.name,
+        "input_ids": forward_batch.input_ids.cpu(),
+        "positions": forward_batch.positions.cpu(),
+        "extend_seq_lens_cpu": getattr(forward_batch, "extend_seq_lens_cpu", None),
+        "seq_lens": forward_batch.seq_lens.cpu(),
+    }
+    t = min(int(forward_batch.input_ids.shape[0]), _ROWS)
+    for layer in LAYERS:
+        for p in POINTS:
+            rec[f"{p}{layer}"] = _BUF[(p, layer)][:t].cpu()
+    n = _COUNT[0]
+    _COUNT[0] += 1
+    torch.save(rec, f"{_OUT}/{n:04d}_{rec['mode']}_r{rank}.pt")
+
+
+def hook_specs():
+    if not ENABLED:
+        return []
+    from sglang.srt.plugins.hook_registry import HookType
+
+    return [
+        ("sglang.srt.models.deepseek_v4.MQALayer.forward", attn_forward, HookType.AROUND),
+        ("sglang.srt.layers.engram.Engram.forward", engram_forward, HookType.AROUND),
+        ("sglang.srt.models.deepseek_v2.DeepseekV2MoE.forward", moe_forward, HookType.AROUND),
+    ]
