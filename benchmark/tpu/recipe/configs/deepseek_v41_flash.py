@@ -38,12 +38,14 @@ CONFIG["server_args"].update(
         "max_total_tokens": 262144,
         # 128 running requests per worker.
         "max_running_requests": 1024,
-        # 8192 prefill tokens per worker per step.
-        "chunked_prefill_size": 65536,
-        "max_prefill_tokens": 8192,
+        # 4096 prefill tokens per worker per step, the largest token bucket.
+        "chunked_prefill_size": 32768,
+        "max_prefill_tokens": 4096,
         "mem_fraction_static": 0.85,
         "enable_torch_compile": True,
-        "tpu_compile_tokens": [2048, 4096, 8192],
+        # TODO(JamesBrianD): add 8192 once its EXTEND graph fits; at bs 128 it
+        # needs 95.44 GB of HLO temporaries against 94.74 GB HBM at compile time.
+        "tpu_compile_tokens": [2048, 4096],
         # The smallest decode bucket stays above 1: the bs=1 decode graph
         # returns NaN logits after the first token (cause not located; the
         # CSA2 kernel alone matches the dense reference at batch 1).
