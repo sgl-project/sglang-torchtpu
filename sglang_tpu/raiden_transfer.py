@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Any, List, Literal
+from typing import TYPE_CHECKING, Any, List, Literal, Optional
 
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.utils.network import get_free_port
@@ -221,9 +221,15 @@ class RaidenKVTransfer:
         )
 
     def backup(
-        self, device_page_ids: List[int], host_page_ids: List[int]
+        self,
+        device_page_ids: List[int],
+        host_page_ids: List[int],
+        num_pages: Optional[List[int]] = None,
     ) -> RaidenFutureEvent:
         """Device->host (D2H): stage device pages into raiden's host pool.
+
+        Segment ``i`` copies ``num_pages[i]`` consecutive pages (default one)
+        from ``device_page_ids[i]`` to ``host_page_ids[i]``.
 
         No device sync precedes the DMA: raiden's D2H reads HBM on a separate
         hardware path that is not ordered against TC compute. Under overlap
@@ -236,18 +242,22 @@ class RaidenKVTransfer:
         # raiden reads an empty page list as the whole layer buffer.
         if n == 0:
             return NOOP_EVENT
-        fut = self._mgr.d2h(device_page_ids, host_page_ids, [1] * n)
+        fut = self._mgr.d2h(device_page_ids, host_page_ids, num_pages or [1] * n)
         return RaidenFutureEvent(fut)
 
     def load(
-        self, host_page_ids: List[int], device_page_ids: List[int]
+        self,
+        host_page_ids: List[int],
+        device_page_ids: List[int],
+        num_pages: Optional[List[int]] = None,
     ) -> RaidenFutureEvent:
-        """Host->device (H2D): load host pages back into the fused KV buffer."""
+        """Host->device (H2D): load host pages back into the fused KV buffer,
+        segmented as in ``backup``."""
         n = len(host_page_ids)
         assert n == len(device_page_ids)
         if n == 0:
             return NOOP_EVENT
-        fut = self._mgr.h2d(host_page_ids, device_page_ids, [1] * n)
+        fut = self._mgr.h2d(host_page_ids, device_page_ids, num_pages or [1] * n)
         return RaidenFutureEvent(fut)
 
     def host_control_address(self, local_ip: str) -> str:

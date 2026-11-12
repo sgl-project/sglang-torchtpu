@@ -28,6 +28,7 @@ def _batch(mode, seq_lens, extend_lens=None, spec_info=None):
     bs = seq_lens.shape[0]
     return SimpleNamespace(
         forward_mode=mode,
+        mix_verify_width=1,
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens.clone(),
         req_pool_indices=torch.arange(bs, dtype=torch.int64),

@@ -26,7 +26,9 @@ class TestResolvedPipelineGuard(CustomTestCase):
             patch.object(BaseTpuPallasRpaAttnBackend, "__init__", return_value=None),
         ):
             self.assertEqual(raw.pp_size, 1)
-            runner = NS(server_args=raw)
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            runner = NS(server_args=raw, spec_algorithm=SpeculativeAlgorithm.NONE)
             backend = TpuPallasRpaBatchedAttnBackend(runner)
             self.assertIs(backend._pp_schedule_runner, runner)
             get_context().override("test.single_stage", pp_size=1)

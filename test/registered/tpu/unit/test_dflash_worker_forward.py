@@ -230,6 +230,8 @@ def _create_dflash_worker_for_tpu(
     worker._draft_block_end_buf = None
     worker._draft_extend_seq_lens_buf = None
     worker._draft_seq_lens_cpu_buf = None
+    worker._draft_kv_is_swa = False
+    worker._verify_swa_block_selector = None
     worker._draft_block_spec_info = DFlashVerifyInput(
         draft_token=torch.empty((0,), dtype=torch.long, device=dev),
         positions=torch.empty((0,), dtype=torch.int64, device=dev),
@@ -261,6 +263,12 @@ def _create_dflash_worker_for_tpu(
     worker._out_tokens_bufs = []
     worker._new_seq_lens_bufs = []
     worker._draft_sampler = None
+    # Adaptive verify width off (SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY unset).
+    worker._adaptive_verify_rules = []
+    worker._verify_cols = {}
+    worker._verify_tokens_bufs = {}
+    worker._narrow_block_spec_infos = {}
+    worker._verify_width_ct = {}
 
     class _MockEmbed(nn.Module):
         def forward(self, ids):
@@ -447,6 +455,7 @@ def _make_schedule_batch(
     return SimpleNamespace(
         device=seq_lens.device,
         forward_mode=forward_mode,
+        mix_verify_tails=0,
         is_extend_in_batch=(forward_mode == ForwardMode.EXTEND),
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens_cpu,

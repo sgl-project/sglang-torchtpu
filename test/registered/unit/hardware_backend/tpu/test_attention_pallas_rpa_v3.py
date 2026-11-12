@@ -125,6 +125,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             req_pool_indices=torch.tensor([0], dtype=torch.int64),
             req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
             forward_mode=forward_mode,
+            mix_verify_width=1,
             extend_seq_lens=None,
             extend_seq_lens_cpu=None,
             spec_info=spec_info,
@@ -141,6 +142,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             req_pool_indices=req_pool_indices,
             req_pool_indices_cpu=req_pool_indices.clone(),
             forward_mode=ForwardMode.DECODE,
+            mix_verify_width=1,
             extend_seq_lens=None,
             spec_info=None,
         )
@@ -255,6 +257,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             seq_lens_cpu=torch.tensor([10, 20]),
             req_pool_indices_cpu=torch.tensor([0, 0]),
             forward_mode=ForwardMode.EXTEND,
+            mix_verify_width=1,
             extend_seq_lens=torch.tensor([2, 3]),
             extend_seq_lens_cpu=None,
             spec_info=None,
@@ -337,6 +340,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             req_pool_indices=torch.tensor([0], dtype=torch.int64),
             req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
             forward_mode=ForwardMode.DECODE,
+            mix_verify_width=1,
             extend_seq_lens=None,
             spec_info=None,
         )
@@ -350,6 +354,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             req_pool_indices=torch.empty(0, dtype=torch.int64),
             req_pool_indices_cpu=torch.empty(0, dtype=torch.int64),
             forward_mode=ForwardMode.DECODE,
+            mix_verify_width=1,
             extend_seq_lens=None,
             spec_info=None,
         )
@@ -363,6 +368,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             req_pool_indices=torch.empty(0, dtype=torch.int64),
             req_pool_indices_cpu=torch.empty(0, dtype=torch.int64),
             forward_mode=ForwardMode.DECODE,
+            mix_verify_width=1,
             extend_seq_lens=None,
             spec_info=None,
         )

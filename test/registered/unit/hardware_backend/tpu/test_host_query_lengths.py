@@ -69,6 +69,7 @@ def test_eagle_refresh_requires_complete_host_query_shape_without_readback(
         extend_seq_lens=device_lengths,
         extend_seq_lens_cpu=mirror,
         forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        mix_verify_width=1,
         spec_info=SimpleNamespace(
             spec_input_type=SpecInputType.EAGLE_DRAFT_EXTEND,
             num_tokens_per_req=4,
@@ -221,6 +222,7 @@ def test_other_extend_paths_use_complete_mirror_or_device_lengths(
     backend = _bare_backend()
     batch = SimpleNamespace(
         forward_mode=mode,
+        mix_verify_width=1,
         spec_info=(
             None
             if spec_type is None
@@ -262,6 +264,7 @@ def test_eagle_query_producer_precedes_idle_normalization(idle):
         seq_lens=torch.full((bs,), 64),
         seq_lens_cpu=None,
         forward_mode=ForwardMode.IDLE if idle else ForwardMode.DECODE,
+        mix_verify_width=1,
         model_config=SimpleNamespace(vocab_size=100),
     )
     forward = SimpleNamespace(
@@ -269,6 +272,7 @@ def test_eagle_query_producer_precedes_idle_normalization(idle):
         seq_lens_cpu=None,
         extend_seq_lens_cpu=None,
         forward_mode=ForwardMode.IDLE if idle else ForwardMode.DRAFT_EXTEND_V2,
+        mix_verify_width=1,
         mark_forward_metadata_ready=lambda: None,
     )
 
