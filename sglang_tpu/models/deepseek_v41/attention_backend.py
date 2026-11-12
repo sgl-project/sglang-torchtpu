@@ -355,6 +355,17 @@ class DSV41TPUAttnBackend(AttentionBackend):
         model_config = model_runner.model_config
         config = model_config.hf_text_config
         _check_supported(config)
+        if (
+            getattr(model_runner.server_args, "enable_torch_compile", False)
+            and getattr(model_runner.server_args, "tpu_compile_tracer", None)
+            == "direct"
+        ):
+            # The direct tracer reads the KV pool through get_state(), which
+            # DSV41TPUTokenToKVPool does not implement.
+            raise NotImplementedError(
+                "DeepSeek-V4.1 TPU attention does not support "
+                "--tpu-compile-tracer direct yet; use the default dynamo tracer"
+            )
         self.model_runner = model_runner
         self.device = model_runner.device
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
