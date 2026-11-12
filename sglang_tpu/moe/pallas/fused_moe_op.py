@@ -129,6 +129,47 @@ def _valid_rows_mask(row_start, row_end, unsort_idx):
     return (row_start <= unsort_idx) & (unsort_idx < row_end)
 
 
+_COUNTING_SORT_BLOCK = 512
+
+
+def _counting_sort_positions(sort_keys, num_buckets: int):
+    """Stable block counting sort returning ``(unsort_idx, bucket_counts)``.
+
+    Computes each slot's stable destination index and per-bucket histogram via
+    one triangular BF16/FP32 MXU contraction per 512-row block, avoiding a
+    second full-length comparison ``argsort`` and separate ``one_hot`` sum.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    n_rows = sort_keys.shape[0]
+    block = min(_COUNTING_SORT_BLOCK, n_rows)
+    if num_buckets > block:
+        return None, None
+    pad = -n_rows % block
+    if pad:
+        sort_keys = jnp.pad(sort_keys, (0, pad), constant_values=num_buckets - 1)
+    onehot = jax.nn.one_hot(
+        sort_keys.reshape(-1, block), num_buckets, dtype=jnp.bfloat16
+    )
+    lower = jnp.concatenate(
+        [
+            jnp.ones((1, block), jnp.bfloat16),
+            jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1),
+        ],
+        axis=0,
+    )
+    both = jnp.einsum("ij,bje->bie", lower, onehot, preferred_element_type=jnp.float32)
+    hist = both[:, 0, :]
+    rank = both[:, 1:, :]
+    counts = hist.sum(axis=0)
+    base = (jnp.cumsum(hist, axis=0) - hist) + (jnp.cumsum(counts) - counts)
+    pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
+    if pad:
+        counts = counts.at[-1].add(-pad)
+    return pos.reshape(-1)[:n_rows].astype(jnp.int32), counts.astype(jnp.int32)
+
+
 def _drop_invalid_slots(
     hidden_states: "jax.Array",
     topk_ids: "jax.Array",
@@ -693,7 +734,19 @@ def _fused_moe_jax(
     # in place of the sort/one-hot glue.
     single_token = use_dense_permute and use_dense_unpermute and m_orig == 1
 
+    use_ep_local_prefix = (
+        bool(tpu_envs.SGLANG_TPU_FUSED_MOE_EP_COUNTING_SORT.get())
+        and use_group_offset
+        and bool(use_sc_gather)
+        and not single_token
+        and not use_dense_permute
+        and not use_dense_unpermute
+        and not no_combine
+    )
     row_start = row_end = None
+    ep_valid_mask = None
+    ep_valid_count = None
+    unsort_idx = None
     if single_token:
         from sglang_tpu.moe.pallas.route_meta import single_token_route_meta
 
@@ -706,6 +759,34 @@ def _fused_moe_jax(
             offset=expert_group_offset if use_group_offset else 0,
             num_experts=num_experts,
         )
+    elif use_ep_local_prefix:
+        local_ids = topk_ids_flat - expert_group_offset
+        ep_valid_mask = (local_ids >= 0) & (local_ids < num_experts)
+        sort_keys = jnp.where(ep_valid_mask, local_ids, num_experts)
+        unsort_idx, bucket_counts = _counting_sort_positions(sort_keys, num_experts + 1)
+        token_bits = max(1, (m - 1).bit_length())
+        packable = (num_experts + 1).bit_length() + token_bits < 31
+        if unsort_idx is not None and packable:
+            group_sizes = bucket_counts[:num_experts]
+            token_indices_flat = jnp.arange(m, dtype=jnp.int32).repeat(topk)
+            packed = jax.lax.sort(
+                jnp.left_shift(sort_keys, token_bits) | token_indices_flat,
+                is_stable=False,
+            )
+            sorted_token_ids = jnp.bitwise_and(packed, (1 << token_bits) - 1)
+        else:
+            argsort_idx = jnp.argsort(sort_keys)
+            unsort_idx = jnp.argsort(argsort_idx)
+            sorted_token_ids = (argsort_idx // topk).astype(jnp.int32)
+            if bucket_counts is not None:
+                group_sizes = bucket_counts[:num_experts]
+            else:
+                safe_local_ids = jnp.where(ep_valid_mask, local_ids, 0)
+                group_sizes = (
+                    jax.nn.one_hot(safe_local_ids, num_experts, dtype=jnp.int32)
+                    * ep_valid_mask[:, None].astype(jnp.int32)
+                ).sum(axis=0)
+        ep_valid_count = group_sizes.sum(dtype=jnp.int32)
     else:
         # argsort is stable enough on TPU for our usage; the gmm kernel
         # only cares about contiguous expert runs.
@@ -739,7 +820,11 @@ def _fused_moe_jax(
 
         n_sorted = sorted_token_ids.shape[0]
         gather_start = jnp.array([0], dtype=jnp.int32)
-        gather_end = jnp.array([n_sorted], dtype=jnp.int32)
+        gather_end = (
+            ep_valid_count.reshape(1)
+            if use_ep_local_prefix
+            else jnp.array([n_sorted], dtype=jnp.int32)
+        )
         x_sorted = ragged_gather_v2(
             hidden_states,
             sorted_token_ids,
@@ -835,7 +920,7 @@ def _fused_moe_jax(
             "is unsupported: pad weights AND scales jointly at load time."
         )
 
-    if single_token:
+    if single_token or use_ep_local_prefix:
         group_offset = None
     else:
         route_num_experts = global_num_experts if use_group_offset else num_experts
@@ -961,7 +1046,8 @@ def _fused_moe_jax(
         return combined[:m_orig].astype(out_dtype)
 
     # TODO (Qinghan): check performance against scatter
-    unsort_idx = jnp.argsort(argsort_idx)
+    if unsort_idx is None:
+        unsort_idx = jnp.argsort(argsort_idx)
     if use_sc_gather:
         if not no_combine:
             # Fused gather + weighted top-k sum.
@@ -973,11 +1059,57 @@ def _fused_moe_jax(
             )
 
             if use_group_offset:
+                valid_mask = (
+                    ep_valid_mask
+                    if use_ep_local_prefix
+                    else _valid_rows_mask(row_start, row_end, unsort_idx)
+                )
+                use_v3 = (
+                    int(tpu_envs.SGLANG_TPU_RAGGED_GATHER_REDUCE_VERSION.get()) == 3
+                )
+                if use_v3:
+                    try:
+                        from jax.experimental.pallas import tpu as pltpu
+
+                        from sglang_tpu.moe.pallas.sparse_core.ragged_gather_reduce_v3 import (
+                            ragged_gather_reduce as ragged_gather_reduce_v3,
+                        )
+                        from sglang_tpu.moe.pallas.sparse_core.ragged_gather_reduce_v3 import (
+                            token_block_alignment,
+                        )
+
+                        tpu_info = pltpu.get_tpu_info()
+                        sc_info = tpu_info.sparse_core if tpu_info is not None else None
+                        if (
+                            sc_info is not None
+                            and sc_info.num_lanes == 16
+                            and gmm2_out.dtype == jnp.bfloat16
+                            and gmm2_out.shape[0] <= (1 << 20)
+                            and gmm2_out.shape[-1] % tpu_info.num_lanes == 0
+                            and gmm2_out.size * 4 >= tpu_info.vmem_capacity_bytes * 0.6
+                        ):
+                            alignment = token_block_alignment(
+                                gmm2_out.shape[-1], tpu_info
+                            )
+                            padded_m = -(-m // alignment) * alignment
+                            if m >= alignment and padded_m * 2 <= m * 3:
+                                combined = ragged_gather_reduce_v3(
+                                    gmm2_out,
+                                    unsort_idx.astype(jnp.int32),
+                                    topk_weights.reshape(-1),
+                                    valid_mask,
+                                    topk,
+                                )
+                                return combined[:m_orig].astype(out_dtype)
+                    except Exception as exc:
+                        logger.warning(
+                            "ragged_gather_reduce_v3 fallback to v2: %s", exc
+                        )
                 combined = ragged_gather_reduce(
                     gmm2_out,
                     unsort_idx.astype(jnp.int32),
                     topk_weights.reshape(-1),
-                    _valid_rows_mask(row_start, row_end, unsort_idx),
+                    valid_mask,
                     topk,
                 )
             else:
