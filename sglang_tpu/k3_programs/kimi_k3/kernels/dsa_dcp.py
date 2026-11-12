@@ -242,6 +242,13 @@ class IndexSelect:
         self.key_rows = refs["keys"].shape[1]  # >= pages * subpages, whole vregs
         self.page_slots, self.key_slots = refs["page_buf"].shape[0], refs["key_buf"].shape[0]
         self.chunk = refs["key_buf"].shape[1]  # select_scratch: min(chunk_rows(batch), key_rows)
+        # Below WIDE_CHUNK_BATCH rows the count passes read 8 rows a step (select_scratch).
+        self.grouped = "group_buf" in refs
+        self.groups = -(-batch // 8)
+        self.gchunk = refs["group_buf"].shape[1] // 8 if self.grouped else 0
+        self.group_rows = min(8, batch)  # rows a group holds (batches: 1, 2, 4 or multiples of 8)
+        if self.grouped and batch > 8 and batch % 8:
+            raise ValueError("grouped index selection: batch <= 8 or a multiple of 8")
         if batch > LANES or self.key_rows % 8 or batch % sequence_rows:
             raise ValueError("index selection: batch <= 128, key rows in whole vregs, whole sequences")
 
@@ -254,10 +261,12 @@ class IndexSelect:
         lane = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 1)
         sub = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 0)
         seq_count = jnp.int32(0)
+        counts = []
         for b in range(self.batch):
             limit = self.position_ref[b] + 1
             needed = (limit + T - 1) // T
             count = jnp.maximum(needed - self.owner + group - 1, 0) // group
+            counts.append(count)
             refs["counts"][b] = count
             refs["chunk_starts"][b] = chunk_start
             chunk_start = chunk_start + (count * self.subpages + self.chunk - 1) // self.chunk
@@ -297,6 +306,31 @@ class IndexSelect:
             return jax.lax.fori_loop(0, refs["page_starts"][seq + 1] - first, one, carry)
 
         jax.lax.fori_loop(0, self.batch // self.S, fill_pages, 0)
+        if self.grouped:
+            # Grouped counting: each step reads a chunk of 8 rows' keys (its
+            # group's longest row sets the chunk count).
+            gstart = jnp.int32(0)
+            for g in range(self.groups):
+                rows = counts[8 * g:8 * g + 8]
+                longest = rows[0]
+                for c in rows[1:]:
+                    longest = jnp.maximum(longest, c)
+                refs["group_rows"][g] = longest * self.subpages
+                refs["gstep_starts"][g] = gstart
+                gstart = gstart + (longest * self.subpages + self.gchunk - 1) // self.gchunk
+            refs["gstep_starts"][self.groups] = gstart
+
+            def fill_groups(g, carry):
+                first = refs["gstep_starts"][g]
+
+                def one(j, carry):
+                    refs["gstep_group"][first + j] = g
+                    refs["gstep_local"][first + j] = j
+                    return carry
+
+                return jax.lax.fori_loop(0, refs["gstep_starts"][g + 1] - first, one, carry)
+
+            jax.lax.fori_loop(0, self.groups, fill_groups, 0)
         refs["state"][...] = state
 
     # ------------------------------------------------------------------ scoring
@@ -475,14 +509,17 @@ class IndexSelect:
         (else each still holds its chunk, step ``s`` in slot ``s``)."""
         return True if first else self.refs["chunk_starts"][self.batch] > self.key_slots
 
-    def _count(self, digits_of, prefix=False, first=False):
+    def _count(self, params_of, digits, prefix=False, first=False):
         """This rank's counts ``[COUNT_ROWS, LANES]`` (sublane ``j``: candidate
         ``j + 1``, lane ``b``: row ``b``) from a 16-bin histogram of its keys'
-        digits: ``digits_of(row)`` is ``(key, position, valid) -> (digit,
-        counted)``, ``digit`` in ``0 .. 15``. A key round's candidate ``j``
-        counts the digits above ``j``; a tie round's (``prefix``) the digits up
-        to ``j`` (``first``: the selection's first pass). One digit a key, not
-        a compare per candidate."""
+        digits: ``digits(params, key, position, valid) -> (digit, counted)``,
+        ``digit`` in ``0 .. 15``, ``params = params_of(row)`` the row's SMEM
+        scalars (``[8, 1]`` columns of 8 rows' scalars in a grouped pass). A
+        key round's candidate ``j`` counts the digits above ``j``; a tie
+        round's (``prefix``) the digits up to ``j`` (``first``: the
+        selection's first pass). One digit a key, not a compare per candidate."""
+        if self.grouped:
+            return self._count_groups(params_of, digits, prefix)
         from jax.experimental import pallas as pl
 
         refs, chunk = self.refs, self.chunk
@@ -504,7 +541,7 @@ class IndexSelect:
             start = jnp.minimum(local * chunk, self.key_rows - chunk)
             rows_valid = refs["counts"][row] * self.subpages
             bins = [jnp.where(local == 0, 0, a) for a in bins]
-            digits = digits_of(row)
+            params = params_of(row)
             # The step's histogram in two accumulators of eight 4-bit fields
             # (bins 0-7, 8-15; a field holds up to 15): the first 8 vregs
             # unrolled (they overlap the step's fixed work), the rest -- only
@@ -517,7 +554,7 @@ class IndexSelect:
                 page = key_row // self.subpages
                 position = ((page * self.group + self.owner) * self.T
                             + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS + lane8)
-                digit, counted = digits(key, position, valid)
+                digit, counted = digits(params, key, position, valid)
                 one = jnp.where(counted, jnp.left_shift(jnp.ones_like(digit), (digit & 7) << 2), 0)
                 upper = digit >= 8
                 return low + jnp.where(upper, 0, one), high + jnp.where(upper, one, 0)
@@ -551,6 +588,115 @@ class IndexSelect:
                     counts + [jnp.zeros((COUNT_ROWS - CANDIDATES, LANES), jnp.int32)], axis=0)  # [16, LANES]
                 total = jnp.sum(partial, axis=1, keepdims=True)  # [16, 1]
                 refs["local"][...] = jnp.where(lane16 == row, total, refs["local"][...])
+
+            return tuple(bins)
+
+        jax.lax.fori_loop(0, total, step_fn, zeros)
+        return refs["local"][...]
+
+    def _group_copy(self, step):
+        """Group step ``step``'s chunk of its rows' keys into slot ``step % 2``
+        (row ``r`` at slot rows ``[r * chunk, (r + 1) * chunk)``)."""
+        from jax.experimental.pallas import tpu as pltpu
+
+        refs, chunk = self.refs, self.gchunk
+        g, local = refs["gstep_group"][step], refs["gstep_local"][step]
+        start = jnp.minimum(local * chunk, self.key_rows - chunk)
+        for r in range(self.group_rows):
+            pltpu.make_async_copy(refs["keys"].at[8 * g + r, pl_ds(start, chunk)],
+                                  refs["group_buf"].at[step % 2, pl_ds(r * chunk, chunk)],
+                                  refs["group_sems"].at[step % 2]).start()
+
+    def _group_wait(self, step):
+        """All of the step's row copies (one wait for their bytes)."""
+        from jax.experimental.pallas import tpu as pltpu
+
+        buf = self.refs["group_buf"].at[step % 2, pl_ds(0, self.group_rows * self.gchunk)]
+        pltpu.make_async_copy(buf, buf, self.refs["group_sems"].at[step % 2]).wait()
+
+    def _count_groups(self, params_of, digits, prefix):
+        """``_count`` reading 8 rows a step: a vreg holds one key row of each of
+        the group's rows (rows on sublanes), so a round is ~key rows / 8 steps
+        per group instead of a step per row and chunk, and the rows' counts
+        are 16 lane sums at the group's end."""
+        from jax.experimental import pallas as pl
+
+        refs, chunk, batch = self.refs, self.gchunk, self.batch
+        total = refs["gstep_starts"][self.groups]
+        refs["local"][...] = jnp.zeros((COUNT_ROWS, LANES), jnp.int32)
+        pl_when(total > 0)(lambda: self._group_copy(0))
+        col = jax.lax.broadcasted_iota(jnp.int32, (8, 1), 0)
+        sub8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 0)
+        lane8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 1)
+        zeros = tuple(jnp.zeros((8, LANES), jnp.int32) for _ in range(BINS))
+
+        def column(values):
+            """8 row scalars -> an ``[8, 1]`` column (row ``r`` at sublane ``r``)."""
+            out = jnp.zeros((8, 1), values[0].dtype)
+            for r, value in enumerate(values):
+                out = jnp.where(col == r, value, out)
+            return out
+
+        def unpack(bins, low, high):
+            return [bins[i] + (jax.lax.shift_right_logical(low if i < 8 else high, 4 * (i % 8)) & 15)
+                    for i in range(BINS)]
+
+        def step_fn(step, bins):
+            g, local = refs["gstep_group"][step], refs["gstep_local"][step]
+            self._group_wait(step)
+            pl_when(step + 1 < total)(lambda: self._group_copy(step + 1))
+            start = jnp.minimum(local * chunk, self.key_rows - chunk)
+            bins = [jnp.where(local == 0, 0, a) for a in bins]
+            rows = [jnp.minimum(8 * g + r, batch - 1) for r in range(8)]
+            limit = column([jnp.where(8 * g + r < batch, refs["counts"][rows[r]] * self.subpages, 0)
+                            for r in range(8)])  # [8, 1] each row's valid key rows
+            params = tuple(jnp.broadcast_to(column(list(p)), (8, LANES))
+                           for p in zip(*(params_of(row) for row in rows)))
+            limit = jnp.broadcast_to(limit, (8, LANES))
+            first_row = local * chunk - start  # the chunk's first new key row in the slot
+            end_row = jnp.minimum(refs["group_rows"][g], (local + 1) * chunk) - start
+            slot = refs["group_buf"].at[step % 2]
+
+            # Blocks of 8 key rows holding the group's keys; a key row of the 8
+            # rows is one strided load (rows on sublanes). Two accumulators of
+            # eight 4-bit fields (bins 0-7, 8-15), unpacked a block at a time.
+            def block(b, bins):
+                low = high = jnp.zeros((8, LANES), jnp.int32)
+                for i in range(8):
+                    k = pl.multiple_of(b * 8, 8) + i
+                    key = slot[pl.ds(k, 8, stride=chunk), :]  # [8 rows, 128]
+                    key_row = start + k
+                    valid = (k >= first_row) & (key_row < limit)
+                    page = key_row // self.subpages
+                    position = ((page * self.group + self.owner) * self.T
+                                + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS + lane8)
+                    digit, counted = digits(params, key, position, valid)
+                    one = jnp.where(counted, jnp.left_shift(jnp.ones_like(digit), (digit & 7) << 2), 0)
+                    upper = digit >= 8
+                    low = low + jnp.where(upper, 0, one)
+                    high = high + jnp.where(upper, one, 0)
+                return tuple(unpack(bins, low, high))
+
+            bins = list(jax.lax.fori_loop(first_row // 8, jnp.clip((end_row + 7) // 8, 0, chunk // 8),
+                                          block, tuple(bins)))
+            last = local == (refs["group_rows"][g] + chunk - 1) // chunk - 1
+
+            @pl_when(last)
+            def finish():
+                # Each bin's lane sums: a column of the rows' counts; candidate
+                # counts as suffix (key rounds) or prefix (tie rounds) sums; each
+                # column then to lanes 8 g .. 8 g + 7 of its candidate's sublane.
+                sums = [jnp.sum(a, axis=1, keepdims=True) for a in bins]  # [8, 1] each
+                counts, running = [None] * CANDIDATES, None
+                for j in (range(CANDIDATES) if prefix else range(CANDIDATES - 1, -1, -1)):
+                    term = sums[j] if prefix else sums[j + 1]
+                    running = term if running is None else running + term
+                    counts[j] = running
+                place = lane8 == 8 * g + sub8
+                rows_out = [jnp.sum(jnp.where(place, c, 0), axis=0, keepdims=True) for c in counts]
+                partial = jnp.concatenate(
+                    rows_out + [jnp.zeros((COUNT_ROWS - CANDIDATES, LANES), jnp.int32)], axis=0)
+                refs["local"][...] = refs["local"][...] + partial
 
             return tuple(bins)
 
@@ -645,22 +791,20 @@ class IndexSelect:
         for round_, shift in enumerate(KEY_SHIFTS):
             self._row_scalars(_PREFIX, "row_prefix")
 
-            def key_digits(row, shift=shift):
+            def key_digits(params, key, position, valid, shift=shift):
                 # Candidate j's threshold is base + (j + 1) << shift: a key's digit is
                 # floor((key - base) >> shift), 15 for all above the round's range.
-                base = refs["row_prefix"][row] ^ INT_MIN
+                (base,) = params
+                diff = key - base  # wraps only from 2^31 above base: far above the range
+                if shift:
+                    digit = jnp.minimum(jax.lax.shift_right_logical(diff, shift), 15)
+                else:
+                    digit = jnp.where(diff < 0, 15, jnp.minimum(diff, 15))
+                return digit, valid & (key >= base)
 
-                def digits(key, position, valid):
-                    diff = key - base  # wraps only from 2^31 above base: far above the range
-                    if shift:
-                        digit = jnp.minimum(jax.lax.shift_right_logical(diff, shift), 15)
-                    else:
-                        digit = jnp.where(diff < 0, 15, jnp.minimum(diff, 15))
-                    return digit, valid & (key >= base)
-
-                return digits
-
-            total = self._all_reduce(self._count(key_digits, first=round_ == 0), parity, pending=round_ >= 2)
+            counts = self._count(lambda row: (refs["row_prefix"][row] ^ INT_MIN,), key_digits,
+                                 first=round_ == 0)
+            total = self._all_reduce(counts, parity, pending=round_ >= 2)
             parity ^= 1
             ge = ((total >= topk) & (cand < CANDIDATES)).astype(jnp.int32)
             digit = jnp.sum(ge, axis=0, keepdims=True)  # [1, LANES]
@@ -690,14 +834,14 @@ class IndexSelect:
             for shift in POSITION_SHIFTS:
                 self._row_scalars(_POSITION, "row_position")
 
-                def position_digits(row, shift=shift):
+                def position_digits(params, key, position, valid, shift=shift):
                     # Candidate j: tied keys at positions below floor + (j + 1) << shift.
-                    tau = refs["row_prefix"][row] ^ INT_MIN
-                    floor = refs["row_position"][row]
-                    return lambda key, position, valid: (
-                        jnp.clip((position - floor) >> shift, 0, 15), valid & (key == tau))
+                    tau, floor = params
+                    return jnp.clip((position - floor) >> shift, 0, 15), valid & (key == tau)
 
-                total = self._all_reduce(self._count(position_digits, prefix=True), nonlocal_parity, pending=True)
+                counts = self._count(lambda row: (refs["row_prefix"][row] ^ INT_MIN, refs["row_position"][row]),
+                                     position_digits, prefix=True)
+                total = self._all_reduce(counts, nonlocal_parity, pending=True)
                 nonlocal_parity ^= 1
                 need = topk - refs["state"][_UPPER:_UPPER + 1]
                 below = ((total < need) & (cand < CANDIDATES)).astype(jnp.int32)
@@ -831,6 +975,23 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         "page_local": pltpu.SMEM((batch * -(-key_rows * LANES // (subpages * INDEX_SUBPAGE_TOKENS)),), jnp.int32),
         "row_prefix": pltpu.SMEM((batch,), jnp.int32),
         "row_position": pltpu.SMEM((batch,), jnp.int32),
+        **(_group_scratch(batch, key_rows) if batch < WIDE_CHUNK_BATCH else {}),
+    }
+
+
+def _group_scratch(batch, key_rows):
+    """The grouped count passes' buffers (``IndexSelect._count_groups``): two
+    slots of 8 rows' key chunks and the group steps' SMEM tables."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    groups, chunk = -(-batch // 8), min(chunk_rows(batch), key_rows)
+    return {
+        "group_buf": pltpu.VMEM((2, 8 * chunk, LANES), jnp.int32),  # row r's chunk at r * chunk
+        "group_sems": pltpu.SemaphoreType.DMA((2,)),
+        "group_rows": pltpu.SMEM((groups,), jnp.int32),
+        "gstep_starts": pltpu.SMEM((groups + 1,), jnp.int32),
+        "gstep_group": pltpu.SMEM((groups * -(-key_rows // chunk),), jnp.int32),
+        "gstep_local": pltpu.SMEM((groups * -(-key_rows // chunk),), jnp.int32),
     }
 
 
