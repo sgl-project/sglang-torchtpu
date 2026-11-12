@@ -1006,10 +1006,10 @@ class IndexSelect:
         self._extract(32 - DIGIT_BITS * first_round)
         self._exchange_candidates()
         rows = refs["cand"].shape[0]
-        lane = jax.lax.broadcasted_iota(jnp.int32, (refs["gather"].shape[0], rows, LANES), 2)
+        lane = jax.lax.broadcasted_iota(jnp.int32, (self.group, rows, LANES), 2)
 
         def slots():
-            gathered = refs["gather"][...]
+            gathered = refs["gather"][:self.group]  # the buffer may have room for a larger group
             keys = gathered
             positions = pltpu_roll(gathered, LANES - GATHER_SLOTS)  # position lanes onto their keys
             return keys, positions, (lane < GATHER_SLOTS) & (positions >= 0)
