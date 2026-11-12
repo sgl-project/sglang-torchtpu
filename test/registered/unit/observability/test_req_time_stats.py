@@ -45,6 +45,43 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
         self.assertEqual(hop2.prefill_finished_time, 0.0)
         self.assertAlmostEqual(hop2.wait_queue_entry_time, 123.456 - 9.0)
 
+    def test_tracing_enabled_without_metrics_serializes_timing_fields(self):
+        src = rts.SchedulerReqTimeStats()
+        src.enable_metrics = False
+        src.trace_ctx = mock.MagicMock()
+        src.trace_ctx.tracing_enable = True
+        src.wait_queue_entry_time = 100.0
+        src.forward_entry_time = 100.2
+        src.prefill_finished_time = 0.0
+        src.decode_prebuilt_finish_time = 100.5
+        src.queue_duration_s = 0.2
+
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_000.0):
+            blob = pickle.dumps(src)
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_002.0):
+            hop1 = pickle.loads(blob)
+            blob2 = pickle.dumps(hop1)
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_005.0):
+            dst = pickle.loads(blob2)
+
+        self.assertTrue(dst.has_timing_data)
+        self.assertEqual(dst.prefill_finished_time, 0.0)
+        self.assertAlmostEqual(dst.decode_prebuilt_finish_time, 100.5 - 5.0)
+        self.assertAlmostEqual(dst.get_queueing_time(), 0.2)
+
+    def test_disabled_metrics_and_tracing_two_hop_round_trip(self):
+        src = rts.SchedulerReqTimeStats()
+        src.enable_metrics = False
+        src.wait_queue_entry_time = 100.0
+
+        blob = pickle.dumps(src)
+        hop1 = pickle.loads(blob)
+        blob2 = pickle.dumps(hop1)
+        dst = pickle.loads(blob2)
+
+        self.assertFalse(dst.has_timing_data)
+        self.assertEqual(dst.wait_queue_entry_time, 0.0)
+
 
 class TestOutputMetaInfo(CustomTestCase):
     def test_first_token_latency_requires_valid_timestamps(self):
@@ -132,6 +169,108 @@ class TestConvertToGenAiSpanAttrs(CustomTestCase):
             attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE], 0.9
         )
 
+    def test_with_scheduler_time_stats_unified_mode(self):
+        stats = self._stats_after_first_token()
+        stats.finished_time = 2.0
+        sched = rts.SchedulerReqTimeStats(disagg_mode=rts.DisaggregationMode.NULL)
+        sched.has_timing_data = True
+        sched.queue_duration_s = 0.15
+        sched.forward_entry_time = 1.25
+        sched.prefill_finished_time = 1.50
+
+        attrs = stats.convert_to_gen_ai_span_attrs(sched)
+        self.assertAlmostEqual(attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE], 0.15)
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL], 0.25
+        )
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE], 0.50
+        )
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE], 0.75
+        )
+
+    def test_with_scheduler_time_stats_disagg_prefill_mode(self):
+        stats = rts.APIServerReqTimeStats(disagg_mode=rts.DisaggregationMode.PREFILL)
+        stats.created_time = 1.0
+        stats.api_server_dispatch_finish_time = 1.05
+        stats.first_token_time = 1.40
+        # On a prefill engine, finished_time is stamped after KV transfer finishes.
+        stats.finished_time = 1.60
+
+        sched = rts.SchedulerReqTimeStats(disagg_mode=rts.DisaggregationMode.PREFILL)
+        sched.has_timing_data = True
+        sched.queue_duration_s = 0.10
+        sched.forward_entry_time = 1.15
+        sched.prefill_finished_time = 1.40
+
+        attrs = stats.convert_to_gen_ai_span_attrs(sched)
+        self.assertAlmostEqual(attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE], 0.10)
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL], 0.25
+        )
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE], 0.0
+        )
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE], 0.25
+        )
+
+    def test_with_scheduler_time_stats_disagg_decode_mode(self):
+        stats = rts.APIServerReqTimeStats(disagg_mode=rts.DisaggregationMode.DECODE)
+        stats.created_time = 1.0
+        stats.api_server_dispatch_finish_time = 1.05
+        stats.first_token_time = 1.50
+        stats.finished_time = 2.30
+
+        sched = rts.SchedulerReqTimeStats(disagg_mode=rts.DisaggregationMode.DECODE)
+        sched.has_timing_data = True
+        sched.queue_duration_s = 0.12
+        sched.forward_entry_time = 1.45
+        sched.decode_prebuilt_finish_time = 1.50
+
+        attrs = stats.convert_to_gen_ai_span_attrs(sched)
+        self.assertAlmostEqual(attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE], 0.12)
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL], 0.0
+        )
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE], 0.80
+        )
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE], 0.80
+        )
+
+    def test_aborted_before_forward_omits_model_compute_attrs(self):
+        for mode in (
+            rts.DisaggregationMode.NULL,
+            rts.DisaggregationMode.PREFILL,
+            rts.DisaggregationMode.DECODE,
+        ):
+            with self.subTest(mode=mode):
+                stats = rts.APIServerReqTimeStats(disagg_mode=mode)
+                stats.created_time = 1.0
+                stats.api_server_dispatch_finish_time = 1.05
+                stats.finished_time = 1.20
+
+                sched = rts.SchedulerReqTimeStats(disagg_mode=mode)
+                sched.has_timing_data = True
+                sched.queue_duration_s = 0.08
+
+                attrs = stats.convert_to_gen_ai_span_attrs(sched)
+                self.assertAlmostEqual(
+                    attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE], 0.08
+                )
+                self.assertNotIn(
+                    SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL, attrs
+                )
+                self.assertNotIn(
+                    SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE, attrs
+                )
+                self.assertNotIn(
+                    SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE, attrs
+                )
+
 
 class TestSetFinishedTimeSpanAttrs(CustomTestCase):
     def _tracing_stats(self) -> rts.APIServerReqTimeStats:
@@ -171,6 +310,37 @@ class TestSetFinishedTimeSpanAttrs(CustomTestCase):
             attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL], 0.4
         )
 
+    def test_merges_scheduler_time_stats_into_trace_req_finish(self):
+        stats = self._tracing_stats()
+        stats.disagg_mode = rts.DisaggregationMode.DECODE
+        stats.created_time = 1.0
+        stats.api_server_dispatch_finish_time = 1.05
+        stats.first_token_time = 1.50
+
+        sched = rts.SchedulerReqTimeStats(disagg_mode=rts.DisaggregationMode.DECODE)
+        sched.has_timing_data = True
+        sched.queue_duration_s = 0.12
+        sched.forward_entry_time = 1.45
+        sched.decode_prebuilt_finish_time = 1.50
+
+        stats.set_finished_time(
+            ts=2.30,
+            span_attrs={"gen_ai.request.id": "rid-1"},
+            scheduler_time_stats=sched,
+        )
+
+        attrs = stats.trace_ctx.trace_req_finish.call_args.kwargs["attrs"]
+        self.assertAlmostEqual(attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE], 0.12)
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL], 0.0
+        )
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE], 0.80
+        )
+        self.assertAlmostEqual(
+            attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE], 0.80
+        )
+
     def test_caller_attrs_not_mutated(self):
         stats = self._tracing_stats()
         stats.created_time = 1.0
@@ -179,6 +349,18 @@ class TestSetFinishedTimeSpanAttrs(CustomTestCase):
         stats.set_finished_time(ts=2.0, span_attrs=caller_attrs)
 
         self.assertEqual(caller_attrs, {"gen_ai.request.id": "rid-1"})
+
+    def test_health_check_rid_skips_trace_ctx_initialization(self):
+        stats = rts.APIServerReqTimeStats()
+        with (
+            mock.patch.object(rts, "TraceReqContext") as mock_sync_ctx,
+            mock.patch.object(rts, "TraceReqContextAsync") as mock_async_ctx,
+        ):
+            stats.init_trace_ctx("HEALTH_CHECK_abcdef1234", bootstrap_room=None)
+            mock_sync_ctx.assert_not_called()
+            mock_async_ctx.assert_not_called()
+        self.assertIsInstance(stats.trace_ctx, rts.TraceNullContext)
+        self.assertFalse(stats.trace_ctx.tracing_enable)
 
 
 class TestQueueTimeAcrossRetraction(CustomTestCase):
