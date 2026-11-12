@@ -589,6 +589,107 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
         ta.free(held)
         ta.free(ext2)
 
+    def test_internal_swa_evicted_before_full_leaves_and_swa_defaults(self):
+        from array import array
+
+        from sglang.srt.environ import envs as sgl_envs
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        fields = (
+            sgl_envs.SGLANG_OPT_SWA_CAP,
+            sgl_envs.SGLANG_OPT_SWA_CAP_TEXT,
+            sgl_envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST,
+            sgl_envs.SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS,
+        )
+        saved = [(f, f.is_set(), f.get()) for f in fields]
+        try:
+            for f in fields:
+                f.clear()
+            sgl_envs.SGLANG_OPT_SWA_CAP_TEXT.set("skip")
+            ukp.enable_unified_swa_cache_defaults()
+            self.assertTrue(sgl_envs.SGLANG_OPT_SWA_CAP.get())
+            self.assertEqual(sgl_envs.SGLANG_OPT_SWA_CAP_TEXT.get(), "skip")
+            self.assertTrue(sgl_envs.SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST.get())
+            self.assertTrue(sgl_envs.SGLANG_OPT_SWA_DEMOTE_FINAL_WINDOWS.get())
+
+            # 24 shared physical pages (page_size=8, M_T=3 -> 1 Full + 3 SWA = 4 phys/page).
+            ta, rp = self._build_target(24, 3)
+            dp = self._attach(ta, rp, window=8)
+            cache = UnifiedRadixCache(
+                params=CacheInitParams(
+                    req_to_token_pool=rp,
+                    token_to_kv_pool_allocator=ta,
+                    page_size=8,
+                    disable=False,
+                    sliding_window_size=8,
+                    tree_components=(ComponentType.FULL, ComponentType.SWA),
+                    eviction_policy="lru",
+                )
+            )
+            neg1 = torch.tensor([-1])
+
+            def _alloc_and_insert(toks, prev_len=0, prefix_idx=None):
+                ext = len(toks) - prev_len
+                p_t = torch.tensor([prev_len])
+                s_t = torch.tensor([len(toks)])
+                last = neg1 if prefix_idx is None else prefix_idx[-1:]
+                new_idx = ta.alloc_extend(p_t, p_t, s_t, s_t, last, ext)
+                self.assertIsNotNone(new_idx)
+                full_idx = (
+                    new_idx
+                    if prefix_idx is None
+                    else torch.cat([prefix_idx.to(new_idx.dtype), new_idx])
+                )
+                res = cache.insert(
+                    InsertParams(
+                        key=RadixKey(array("q", toks), None),
+                        value=full_idx.to(torch.int64),
+                        prev_prefix_len=prev_len,
+                    )
+                )
+                cache.components[ComponentType.SWA]._demote_stale_windows(
+                    last_node=cache.tree_core.node_by_id(res.last_device_node)
+                )
+                return full_idx
+
+            # Session A: 16 tokens (2 pages -> 8 phys pages). Oldest D-leaf!
+            toks_a = list(range(100, 116))
+            _alloc_and_insert(toks_a)
+            # Session B: chunk 1 (16 tokens -> 8 phys), then chunk 2 (16 tokens -> 8 phys; 0 free).
+            toks_b = list(range(200, 232))
+            idx_b1 = _alloc_and_insert(toks_b[:16])
+            _alloc_and_insert(toks_b, prev_len=16, prefix_idx=idx_b1)
+            self.assertEqual(ta._free_page_count(), 0)
+
+            # Reclaim 8 Full + 8 SWA tokens (4 phys pages). Must tombstone Session B's
+            # stale internal [0..16) SWA window (freeing 6 phys pages + 2 draft SWA pages)
+            # instead of deleting Session A's older D-leaf!
+            self.assertTrue(ta.evict_to_free_tokens(cache, 8))
+            self.assertEqual(ta._free_page_count(), 6)
+            self.assertEqual(dp.size_swa // 8, 6)
+            hit_a = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", toks_a + [999]), None))
+            )
+            hit_b = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", toks_b + [999]), None))
+            )
+            self.assertEqual(len(hit_a.device_indices), 16)
+            self.assertEqual(len(hit_b.device_indices), 32)
+            cache.sanity_check()
+        finally:
+            for f, was_set, val in saved:
+                if was_set:
+                    f.set(val)
+                else:
+                    f.clear()
+
 
 if __name__ == "__main__":
     unittest.main()
