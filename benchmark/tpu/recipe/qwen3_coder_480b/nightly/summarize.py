@@ -54,7 +54,9 @@ from typing import Dict, List, Optional
 
 # 3: legs[].metrics is now bench_serving's record verbatim; computed fields moved
 #    to legs[].derived (2 reshaped and renamed keys inside metrics).
-SCHEMA_VERSION = 3
+# 4: additive -- legs[].server_histograms, legs[].decode (P/D decode engine),
+#    and legs[].derived.{by_context,long_session_rounds,per_request_layout}.
+SCHEMA_VERSION = 4
 
 # Leg tag: concurrency x number of long-context sessions.
 _LEG_RE = re.compile(r"^c(?P<bs>\d+)-long(?P<long>\d+)$")
@@ -176,6 +178,7 @@ def _collect_legs(run_root: str, mode: str) -> List[Dict]:
         metrics = _read_last_jsonl(f"{base}.jsonl")
         meta = _read_json(f"{base}.meta.json") or {}
         delta = _read_json(f"{base}.metrics.delta.json") or {}
+        decode_delta = _read_json(f"{base}.decode.metrics.delta.json")
         leg: Dict = {
             "tag": tag,
             "mode": mode,
@@ -186,9 +189,22 @@ def _collect_legs(run_root: str, mode: str) -> List[Dict]:
             "server_info": meta.get("server_info", {}),
             "feature_counters": delta.get("counters", {}),
             "feature_derived": delta.get("derived", {}),
+            # Per-leg server histogram deltas (see metrics_probe._HISTOGRAMS):
+            # {family: {series: {count, sum, mean, p50, p90, p99, ...}}}. In P/D
+            # this is the prefill engine, which owns the KV transfer histograms.
+            "server_histograms": delta.get("histograms", {}),
             "warnings": delta.get("warnings", []),
             "log": f"{mode}/{tag}.bench.log",
         }
+        if decode_delta is not None:
+            # P/D decode engine, kept apart so its warnings do not change the
+            # meaning of the leg's own `warnings`.
+            leg["decode"] = {
+                "counters": decode_delta.get("counters", {}),
+                "derived": decode_delta.get("derived", {}),
+                "server_histograms": decode_delta.get("histograms", {}),
+                "warnings": decode_delta.get("warnings", []),
+            }
         if metrics:
             # bench_serving's record, keys unchanged -- see the FORMAT CONTRACT in
             # the module docstring. Only the bulk per-request arrays are dropped
@@ -201,7 +217,7 @@ def _collect_legs(run_root: str, mode: str) -> List[Dict]:
                 "reason": "per-request arrays; megabytes per leg",
                 "available_in": f"{mode}/{tag}.jsonl",
             }
-            leg["derived"] = _derive(metrics, leg["feature_counters"])
+            leg["derived"] = _derive(metrics, leg["feature_counters"], leg["config"])
         else:
             leg["metrics"] = None
             leg["metrics_omitted"] = None
@@ -210,7 +226,7 @@ def _collect_legs(run_root: str, mode: str) -> List[Dict]:
     return legs
 
 
-def _derive(metrics: Dict, counters: Dict) -> Dict:
+def _derive(metrics: Dict, counters: Dict, config: Optional[Dict] = None) -> Dict:
     """Values this script computes. Kept strictly out of `metrics` so that stays
     byte-compatible with a plain bench_serving result."""
     derived: Dict = {
@@ -239,7 +255,209 @@ def _derive(metrics: Dict, counters: Dict) -> Dict:
             prompt_tokens + (metrics.get("total_output_tokens") or 0)
         ) / duration
         derived["input_source"] = "server:prompt_tokens_total"
+
+    rows = _request_rows(metrics)
+    if rows:
+        layout = _session_layout(len(rows), config or {})
+        derived["per_request_layout"] = layout["status"]
+        if _input_lens_vary(rows, layout):
+            derived["by_context"] = _by_context(rows)
+        else:
+            derived["by_context_unavailable"] = (
+                "input_lens repeat across a session's rounds, so they are the "
+                "dataset row's estimate, not the server's per-round prompt length"
+            )
+        if layout["status"] == "ok" and layout["num_long"] > 0:
+            derived["long_session_rounds"] = _long_session_rounds(rows, layout)
     return derived
+
+
+# Upper bounds (prompt tokens) of the per-context buckets.
+_CONTEXT_EDGES = (8192, 16384, 32768, 65536, 98304, 131072, 262144, 524288, 1048576)
+
+
+def _percentile(values: List[float], q: float) -> Optional[float]:
+    """Linear-interpolated percentile (numpy's default), q in [0, 100]."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    pos = (len(ordered) - 1) * q / 100.0
+    low = int(pos)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (pos - low)
+
+
+def _mean(values: List[float]) -> Optional[float]:
+    return sum(values) / len(values) if values else None
+
+
+def _request_rows(metrics: Dict) -> List[Dict]:
+    """bench_serving's parallel per-request arrays as one dict per request.
+
+    Present only with --output-details. ``input_lens`` is the server-reported
+    prompt length of that request (bench_serving's _record_server_prompt_len),
+    i.e. the full accumulated context of that round. Empty if the arrays are
+    missing or disagree in length.
+    """
+    ttfts = metrics.get("ttfts")
+    if not isinstance(ttfts, list) or not ttfts:
+        return []
+    n = len(ttfts)
+    input_lens = metrics.get("input_lens") or []
+    output_lens = metrics.get("output_lens") or []
+    itls = metrics.get("itls") or []
+    errors = metrics.get("errors") or [""] * n
+    cached = metrics.get("cached_tokens")
+    if any(len(a) != n for a in (input_lens, output_lens, itls, errors)):
+        return []
+    if cached is not None and len(cached) != n:
+        cached = None
+    rows = []
+    for i in range(n):
+        itl = [x * 1000.0 for x in (itls[i] or []) if isinstance(x, (int, float))]
+        rows.append(
+            {
+                "ok": not errors[i],
+                "input": input_lens[i] or 0,
+                "output": output_lens[i] or 0,
+                "ttft_ms": (ttfts[i] or 0.0) * 1000.0,
+                "itl_ms": itl,
+                "cached": None if cached is None else (cached[i] or 0),
+            }
+        )
+    return rows
+
+
+def _as_int(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _session_layout(num_rows: int, config: Dict) -> Dict:
+    """Map flat request index -> (session, round).
+
+    bench_serving replays sessions in trace order (the long sessions first)
+    and emits one output per round, failed rounds included. The round counts
+    come from the leg's meta (bench_leg.sh mirrors the generator's arithmetic);
+    if they do not account for exactly ``num_rows`` outputs, the mapping is
+    reported unavailable rather than guessed.
+    """
+    num_long = _as_int(config.get("num_long_sessions"))
+    num_sessions = _as_int(config.get("num_sessions"))
+    long_rounds = _as_int(config.get("rounds_per_long_session"))
+    normal_rounds = _as_int(config.get("rounds_per_normal_session"))
+    layout = {
+        "num_long": num_long or 0,
+        "long_rounds": long_rounds or 0,
+        "normal_rounds": normal_rounds or 0,
+        "num_sessions": num_sessions or 0,
+    }
+    if None in (num_long, num_sessions, long_rounds, normal_rounds):
+        layout["status"] = "unavailable:no-round-counts-in-meta"
+        return layout
+    expected = num_long * long_rounds + (num_sessions - num_long) * normal_rounds
+    if expected != num_rows:
+        layout["status"] = f"unavailable:expected-{expected}-outputs-got-{num_rows}"
+        return layout
+    layout["status"] = "ok"
+    return layout
+
+
+def _input_lens_vary(rows: List[Dict], layout: Dict) -> bool:
+    """False if input_lens look like the dataset row's single estimate.
+
+    Every round re-sends the history, so a session's server-reported prompt
+    length strictly grows. If the first multi-round session reports one value
+    for all its rounds, bench_serving fell back to the row estimate (the
+    server sent no usage block) and bucketing by it would be wrong. Unknown
+    layouts pass: there is nothing to check against.
+    """
+    if layout.get("status") != "ok":
+        return True
+    if layout["num_long"] > 0 and layout["long_rounds"] > 1:
+        first = rows[: layout["long_rounds"]]
+    elif layout["normal_rounds"] > 1:
+        start = layout["num_long"] * layout["long_rounds"]
+        first = rows[start : start + layout["normal_rounds"]]
+    else:
+        return True
+    lens = [r["input"] for r in first if r["ok"]]
+    return len(set(lens)) > 1 or len(lens) < 2
+
+
+def _by_context(rows: List[Dict]) -> List[Dict]:
+    """Latency and cache reuse per prompt-length bucket (successful requests).
+
+    TTFT here is the client's: in P/D it includes prefill queueing, prefill,
+    the P->D KV transfer and decode admission. The server_histograms split it.
+    """
+    buckets: Dict[int, List[Dict]] = {}
+    for row in rows:
+        if not row["ok"] or row["input"] <= 0:
+            continue
+        edge = next((e for e in _CONTEXT_EDGES if row["input"] <= e), 0)
+        buckets.setdefault(edge, []).append(row)
+    out = []
+    for edge in sorted(buckets, key=lambda e: e or float("inf")):
+        group = buckets[edge]
+        ttft = [r["ttft_ms"] for r in group]
+        itl = [x for r in group for x in r["itl_ms"]]
+        record = {
+            "ctx_le": edge or None,  # None: above the largest edge
+            "requests": len(group),
+            "input_tokens_mean": _mean([r["input"] for r in group]),
+            "ttft_ms_p50": _percentile(ttft, 50),
+            "ttft_ms_p90": _percentile(ttft, 90),
+            "ttft_ms_p99": _percentile(ttft, 99),
+            "ttft_ms_max": max(ttft),
+            "itl_ms_p50": _percentile(itl, 50),
+            "itl_ms_p99": _percentile(itl, 99),
+            "itl_ms_mean": _mean(itl),
+        }
+        if all(r["cached"] is not None for r in group):
+            total_in = sum(r["input"] for r in group)
+            total_cached = sum(r["cached"] for r in group)
+            record["cached_fraction"] = total_cached / total_in if total_in else None
+            record["uncached_tokens_mean"] = (total_in - total_cached) / len(group)
+        out.append(record)
+    return out
+
+
+def _long_session_rounds(rows: List[Dict], layout: Dict) -> List[Dict]:
+    """Turn-by-turn view of the long sessions: what each round cost as the
+    context grows. Aggregated across the leg's long sessions (they share the
+    same shape); failed rounds are counted, not averaged."""
+    out = []
+    num_long, rounds = layout["num_long"], layout["long_rounds"]
+    for r in range(rounds):
+        group = [rows[s * rounds + r] for s in range(num_long)]
+        ok = [row for row in group if row["ok"]]
+        record: Dict = {
+            "round": r + 1,
+            "sessions": len(group),
+            "failed": len(group) - len(ok),
+        }
+        if ok:
+            ttft = [row["ttft_ms"] for row in ok]
+            itl_means = [_mean(row["itl_ms"]) for row in ok if row["itl_ms"]]
+            record.update(
+                {
+                    "input_tokens_mean": _mean([row["input"] for row in ok]),
+                    "output_tokens_mean": _mean([row["output"] for row in ok]),
+                    "ttft_ms_mean": _mean(ttft),
+                    "ttft_ms_max": max(ttft),
+                    "itl_ms_mean": _mean(itl_means),
+                }
+            )
+            if all(row["cached"] is not None for row in ok):
+                record["cached_tokens_mean"] = _mean([row["cached"] for row in ok])
+                record["uncached_tokens_mean"] = _mean(
+                    [row["input"] - row["cached"] for row in ok]
+                )
+        out.append(record)
+    return out
 
 
 def _fmt(value, spec: str = ".1f", dash: str = "-") -> str:
@@ -249,6 +467,182 @@ def _fmt(value, spec: str = ".1f", dash: str = "-") -> str:
         return format(float(value), spec)
     except (TypeError, ValueError):
         return str(value)
+
+
+def _hist(histograms: Dict, family: str, series: str = "all") -> Dict:
+    return ((histograms or {}).get(family) or {}).get(series) or {}
+
+
+# The prefill's wait for its KV transfer AFTER its forward: the stage starts
+# when the request enters the transfer queue and (on TPU raiden) ends at the
+# transfer's finish. This is the transfer time a request is actually exposed
+# to, unlike sglang:kv_transfer_latency_ms (see _markdown_server_breakdown).
+_EXPOSED_TRANSFER_STAGE = "prefill_transfer_kv_cache"
+
+# (column header, engine, stage) for the server-side stage table. Prefill
+# stages are on the prefill engine (or a colocated server); decode_* stages
+# exist only on a P/D decode engine.
+_STAGE_COLUMNS = (
+    ("prefill wait", "prefill", "prefill_waiting"),
+    ("prefill fwd", "prefill", "prefill_forward"),
+    ("decode bootstrap", "decode", "decode_bootstrap"),
+    ("decode wait", "decode", "decode_waiting"),
+    ("decode xfer", "decode", "decode_transferred"),
+)
+
+
+def _markdown_server_breakdown(legs: List[Dict]) -> List[str]:
+    """Where a request's time went, server side: KV transfer distribution and
+    mean per-stage latency. Rendered only when some leg has the histograms.
+
+    sglang:kv_transfer_latency_ms is a transfer WINDOW: it runs from the
+    first KV send to the transfer's finish. With cached-prefix early send (on
+    by default) the first send goes out before the prefill forward, so on a
+    prefix hit the window includes the forward and tracks prefill time, not
+    the link. The exposed column is the part left after the forward."""
+    stage_family = "sglang:per_stage_req_latency_seconds"
+    rows = []
+    any_transfer = False
+    for leg in legs:
+        prefill_h = leg.get("server_histograms") or {}
+        decode_h = (leg.get("decode") or {}).get("server_histograms") or {}
+        if not prefill_h and not decode_h:
+            continue
+        latency = _hist(prefill_h, "sglang:kv_transfer_latency_ms")
+        size = _hist(prefill_h, "sglang:kv_transfer_total_mb")
+        speed = _hist(prefill_h, "sglang:kv_transfer_speed_gb_s")
+        any_transfer = any_transfer or bool(latency)
+        exposed_s = _hist(prefill_h, stage_family, _EXPOSED_TRANSFER_STAGE).get("mean")
+        stage_cells = []
+        for _, engine, stage in _STAGE_COLUMNS:
+            source = decode_h if engine == "decode" else prefill_h
+            mean_s = _hist(source, stage_family, stage).get("mean")
+            stage_cells.append(_fmt(None if mean_s is None else mean_s * 1000, ".0f"))
+        queue = _hist(prefill_h, "sglang:queue_time_seconds").get("mean")
+        # Each TP rank observes its own shard of every transfer.
+        ranks = max(1, int(latency.get("label_sets") or 1))
+        transfers = latency.get("count")
+        request_gb = size.get("mean")
+        rows.append(
+            f"| {leg['mode']} | {leg['concurrency']} | {leg['num_long_sessions']} "
+            f"| {_fmt(None if transfers is None else transfers / ranks, '.0f')} "
+            f"| {_fmt(latency.get('mean'), '.0f')}/{_fmt(latency.get('p50'), '.0f')}"
+            f"/{_fmt(latency.get('p99'), '.0f')} "
+            f"| {_fmt(None if exposed_s is None else exposed_s * 1000, '.0f')} "
+            f"| {_fmt(None if request_gb is None else request_gb * ranks / 1024, '.2f')} "
+            f"| {_fmt(speed.get('mean'), '.2f')} "
+            f"| {_fmt(None if queue is None else queue * 1000, '.0f')} "
+            f"| " + " | ".join(stage_cells) + " |"
+        )
+    if not rows:
+        return []
+    out = [
+        "### Server-side breakdown",
+        "",
+        "| mode | conc | long reqs | KV xfers | xfer window ms mean/p50/p99 "
+        "| exposed xfer ms | xfer GB/req mean | window GB/s/rank mean | queue ms | "
+        + " | ".join(f"{name} ms" for name, _, _ in _STAGE_COLUMNS)
+        + " |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|" + "---:|" * len(_STAGE_COLUMNS),
+        *rows,
+        "",
+        "_Per-leg deltas of the servers' Prometheus histograms; p50/p99 are "
+        "bucket-interpolated. KV transfer and prefill stages come from the "
+        "prefill engine, decode stages from the decode engine; stage columns "
+        "are means. Each TP rank sends its own KV shard: xfer ms and GB/s are "
+        "per rank shard, KV xfers and GB/req are per request._",
+        "",
+        "_xfer window = first KV send to transfer done (`kv_transfer_latency_ms`). "
+        "The cached prefix is sent before the prefill forward, so on prefix hits "
+        "the window includes the forward, and window GB/s understates the link. "
+        "exposed xfer = the prefill's wait for the transfer after its forward "
+        "(`prefill_transfer_kv_cache` stage): the transfer time a request "
+        "actually pays._",
+        "",
+    ]
+    if not any_transfer:
+        out.insert(-1, "_No KV transfers were observed (not a P/D run)._")
+    return out
+
+
+def _markdown_by_context(legs: List[Dict]) -> List[str]:
+    """TTFT/ITL by prompt length for the legs that reach long context."""
+    blocks = []
+    for leg in legs:
+        if leg["num_long_sessions"] <= 0:
+            continue
+        by_ctx = (leg.get("derived") or {}).get("by_context")
+        if not by_ctx:
+            continue
+        blocks.append(f"<details><summary>{leg['mode']}/{leg['tag']}</summary>")
+        blocks.append("")
+        blocks.append(
+            "| ctx ≤ | reqs | input mean | cached | uncached mean | "
+            "TTFT p50/p90/p99 ms | ITL p50/p99 ms |"
+        )
+        blocks.append("|---:|---:|---:|---:|---:|---:|---:|")
+        for b in by_ctx:
+            cached = b.get("cached_fraction")
+            blocks.append(
+                f"| {b['ctx_le'] if b['ctx_le'] else 'more'} | {b['requests']} "
+                f"| {_fmt(b['input_tokens_mean'], '.0f')} "
+                f"| {(f'{cached:.1%}' if cached is not None else '-')} "
+                f"| {_fmt(b.get('uncached_tokens_mean'), '.0f')} "
+                f"| {_fmt(b['ttft_ms_p50'], '.0f')}/{_fmt(b['ttft_ms_p90'], '.0f')}"
+                f"/{_fmt(b['ttft_ms_p99'], '.0f')} "
+                f"| {_fmt(b['itl_ms_p50'], '.1f')}/{_fmt(b['itl_ms_p99'], '.1f')} |"
+            )
+        blocks.append("")
+        blocks.append("</details>")
+        blocks.append("")
+    if not blocks:
+        return []
+    return [
+        "### Latency by context length",
+        "",
+        "_Client-side, successful requests bucketed by their server-reported "
+        "prompt length._",
+        "",
+        *blocks,
+    ]
+
+
+def _markdown_long_rounds(legs: List[Dict]) -> List[str]:
+    """Turn-by-turn cost of the long sessions as their context grows."""
+    blocks = []
+    for leg in legs:
+        rounds = (leg.get("derived") or {}).get("long_session_rounds")
+        if not rounds:
+            continue
+        blocks.append(f"<details><summary>{leg['mode']}/{leg['tag']}</summary>")
+        blocks.append("")
+        blocks.append(
+            "| round | ctx in (mean) | cached (mean) | uncached (mean) | "
+            "TTFT mean/max ms | ITL mean ms | failed |"
+        )
+        blocks.append("|---:|---:|---:|---:|---:|---:|---:|")
+        for r in rounds:
+            blocks.append(
+                f"| {r['round']} | {_fmt(r.get('input_tokens_mean'), '.0f')} "
+                f"| {_fmt(r.get('cached_tokens_mean'), '.0f')} "
+                f"| {_fmt(r.get('uncached_tokens_mean'), '.0f')} "
+                f"| {_fmt(r.get('ttft_ms_mean'), '.0f')}/"
+                f"{_fmt(r.get('ttft_ms_max'), '.0f')} "
+                f"| {_fmt(r.get('itl_ms_mean'), '.1f')} | {r['failed']} |"
+            )
+        blocks.append("")
+        blocks.append("</details>")
+        blocks.append("")
+    if not blocks:
+        return []
+    return [
+        "### Long sessions, turn by turn",
+        "",
+        "_Each row averages the leg's long sessions at that round; they run "
+        "concurrently with the normal sessions, so this is the cost under load._",
+        "",
+        *blocks,
+    ]
 
 
 def _markdown(summary: Dict) -> str:
@@ -283,7 +677,7 @@ def _markdown(summary: Dict) -> str:
     )
     if shape.get("long_ramp_is_time_boxed"):
         lines.append(
-            f"- :warning: the 1M sessions ramped at "
+            f"- :warning: the long sessions ramped at "
             f"{shape['long_ramp_tokens']} tok/round instead of "
             f"{shape['turn_input_tokens']} (time-boxed run)."
         )
@@ -327,6 +721,9 @@ def _markdown(summary: Dict) -> str:
         "input tokens for a multi-turn replay._"
     )
     lines.append("")
+    lines += _markdown_server_breakdown(summary["legs"])
+    lines += _markdown_by_context(summary["legs"])
+    lines += _markdown_long_rounds(summary["legs"])
 
     flagged = [
         leg
