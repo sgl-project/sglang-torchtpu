@@ -728,9 +728,9 @@ class TestDirectCompile(CustomTestCase):
                             compiler, "execute", wraps=compiler.execute
                         ) as execute,
                         patch.object(
-                            compiler,
+                            torch.tpu,
                             "get_device_layout_if_materialized",
-                            wraps=compiler.get_device_layout_if_materialized,
+                            wraps=torch.tpu.get_device_layout_if_materialized,
                         ) as layout,
                     ):
                         with collect_warmups():
@@ -834,7 +834,7 @@ class TestDirectCompile(CustomTestCase):
 
         def execute_with_layout_check(executable, inputs):
             input_layouts = [
-                compiler.get_device_layout_if_materialized(tensor) for tensor in inputs
+                torch.tpu.get_device_layout_if_materialized(tensor) for tensor in inputs
             ]
             self.assertTrue(all(layout is not None for layout in input_layouts))
             # Inspect the real executable before launching it: a silently ignored
@@ -854,7 +854,7 @@ class TestDirectCompile(CustomTestCase):
                 with LayoutContext(TpuLayout(minor_to_major=values_order)):
                     values = values_cpu.to("tpu")
                 for tensor, order in ((cache, cache_order), (values, values_order)):
-                    layout = compiler.get_device_layout_if_materialized(tensor)
+                    layout = torch.tpu.get_device_layout_if_materialized(tensor)
                     self.assertIsNotNone(layout)
                     self.assertEqual(layout[0], order)
                 model = torch.nn.Module()

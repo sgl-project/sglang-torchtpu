@@ -584,7 +584,7 @@ class RaidenPoolTransfer:
 
     def _plan_full_mirrors(self, *, slots: int, parameters) -> StagingPlan:
         """Bound legacy full host mirrors by this rank's share of the host budget."""
-        from torch_tpu._internal.compile import tpu_torch_compile
+        import torch
 
         manager = self.manager
         if os.environ.get("RAIDEN_SHM_KEY"):
@@ -599,7 +599,7 @@ class RaidenPoolTransfer:
         initial_slot_bytes = legacy_slot_host_bytes(
             self.tensors,
             self.max_blocks,
-            tpu_torch_compile.get_device_layout_if_materialized,
+            torch.tpu.get_device_layout_if_materialized,
         )
         local_ranks = ranks_per_node(
             manager.attn_tp_size,
@@ -658,13 +658,13 @@ class RaidenPoolTransfer:
     ) -> str:
         """Register the named layer pools natively and this worker's unit with
         the controller; returns the layout fingerprint peers must match."""
-        from torch_tpu._internal.compile import tpu_torch_compile
+        import torch
 
         engine.register_pools(pools, **staging_options)
         fingerprint = layout_fingerprint(
             pools,
             tensors,
-            tpu_torch_compile.get_device_layout_if_materialized,
+            torch.tpu.get_device_layout_if_materialized,
             ships_pd_hidden=_ships_pd_hidden(),
         )
         client.register_work_unit(

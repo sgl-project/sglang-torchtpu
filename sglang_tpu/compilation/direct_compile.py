@@ -594,11 +594,7 @@ class CompiledFunction:
                     for tensor in selected:
                         layout = None
                         if tensor.device.type == "tpu":
-                            layout = (
-                                tpu_torch_compile.get_device_layout_if_materialized(
-                                    tensor
-                                )
-                            )
+                            layout = torch.tpu.get_device_layout_if_materialized(tensor)
                         layouts.append(layout[0] if layout is not None else [])
                     local_specs = _tensor_specs(selected)
                     if local_specs != owner_interface.input_specs:
@@ -776,7 +772,7 @@ class CompiledFunction:
         for tensor in flat_inputs:
             layout = None
             if tensor.device.type == "tpu":
-                layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
+                layout = torch.tpu.get_device_layout_if_materialized(tensor)
             argument_layouts.append(layout[0] if layout is not None else [])
         if rng_device is not None:
             argument_layouts.append([])
