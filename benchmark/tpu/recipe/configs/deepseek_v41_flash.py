@@ -32,19 +32,23 @@ CONFIG["server_args"].update(
         # The pool keeps CSA2 FP8 main KV internally.
         "kv_cache_dtype": "bfloat16",
         "context_length": 9472,
-        "max_total_tokens": 16384,
-        "max_running_requests": 8,
-        "chunked_prefill_size": 8192,
+        # Under attention DP the pool, the compile grid and the chunk size are
+        # per DP worker; max_running_requests and chunked_prefill_size are
+        # global and divided by attn_dp_size (8).
+        "max_total_tokens": 262144,
+        # 128 running requests per worker.
+        "max_running_requests": 1024,
+        # 8192 prefill tokens per worker per step.
+        "chunked_prefill_size": 65536,
         "max_prefill_tokens": 8192,
         "mem_fraction_static": 0.85,
         "enable_torch_compile": True,
-        "tpu_compile_tokens": [128, 256, 512, 1024],
-        # Decode pads to bs 8, as vllm-torchtpu's MIN_NUM_SEQS = 8 does: the
-        # bs=1 decode graph returns NaN logits after the first token. The cause
-        # is not located yet; the CSA2 kernel alone matches the dense reference
-        # at batch 1 (fixed-tile and padded layouts), so it is not the kernel.
-        "tpu_compile_bs": [8],
-        "torch_compile_max_bs": 8,
+        "tpu_compile_tokens": [2048, 4096, 8192],
+        # The smallest decode bucket stays above 1: the bs=1 decode graph
+        # returns NaN logits after the first token (cause not located; the
+        # CSA2 kernel alone matches the dense reference at batch 1).
+        "tpu_compile_bs": [32, 64, 128],
+        "torch_compile_max_bs": 128,
         "disable_radix_cache": True,
         "random_seed": 1234,
         "watchdog_timeout": 3600,
