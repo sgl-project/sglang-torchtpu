@@ -58,6 +58,7 @@ import torch
 from torch_tpu._internal.pallas import jax_op
 
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.pallas_export import physical_tpu_mesh_for_cpu_export
 
 if TYPE_CHECKING:
     import jax
@@ -1082,29 +1083,31 @@ def _build_fused_moe_op():
         expert_group_offset_tensor: Optional[jax.Array] = None,
         gather_permute_with_sc_combine: int = 0,
     ) -> jax.Array:
-        return _fused_moe_jax(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            w1_scale,
-            w2_scale,
-            w1_bias,
-            w2_bias,
-            topk,
-            activation,
-            no_combine,
-            global_num_experts,
-            expert_group_offset,
-            use_sc_gather,
-            w_quant_bits,
-            permute_dense_threshold,
-            w1_channel_scale,
-            w2_channel_scale,
-            expert_group_offset_tensor,
-            gather_permute_with_sc_combine,
-        )
+        # JAX remains on CPU: TorchTPU owns the physical TPU/PJRT client.
+        with physical_tpu_mesh_for_cpu_export():
+            return _fused_moe_jax(
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                w1_scale,
+                w2_scale,
+                w1_bias,
+                w2_bias,
+                topk,
+                activation,
+                no_combine,
+                global_num_experts,
+                expert_group_offset,
+                use_sc_gather,
+                w_quant_bits,
+                permute_dense_threshold,
+                w1_channel_scale,
+                w2_channel_scale,
+                expert_group_offset_tensor,
+                gather_permute_with_sc_combine,
+            )
 
     custom_op = jax_op(op_name, _wrapped)
 

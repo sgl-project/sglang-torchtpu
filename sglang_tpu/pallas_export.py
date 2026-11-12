@@ -35,6 +35,33 @@ def get_pallas_tpu_device_kind() -> str:
 
 
 @contextmanager
+def physical_tpu_mesh_for_cpu_export():
+    """Target a single TPU worker during CPU-hosted Pallas tracing.
+
+    TorchTPU owns PJRT and supplies the physical chip identity; asking JAX to
+    discover TPU devices would create a second client. AbstractMesh supplies
+    hardware facts in a thread-local scope without changing the JAX backend or
+    patching Pallas globals. Each plugin worker targets one logical TensorCore.
+    Existing TPU meshes and native non-CPU JAX execution retain their metadata.
+    """
+    import jax
+    from jax.sharding import AbstractDevice, use_abstract_mesh
+
+    current = jax.sharding.get_abstract_mesh()
+    if (
+        current.abstract_device is not None
+        and current.abstract_device.platform == "tpu"
+    ) or jax.default_backend() != "cpu":
+        yield
+        return
+    mesh = current.update(
+        abstract_device=AbstractDevice(get_pallas_tpu_device_kind(), 1, "tpu")
+    )
+    with use_abstract_mesh(mesh):
+        yield
+
+
+@contextmanager
 def tpu_info_for_cpu_export():
     """Ensure Pallas kernels receive physical TPU7x hardware metadata during export."""
     from jax._src import tpu_info as core_tpu_info
