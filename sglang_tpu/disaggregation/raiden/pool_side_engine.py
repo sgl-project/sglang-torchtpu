@@ -31,7 +31,7 @@ worker ids the controller dispatches to. tpu-sync serves the first controller
 and the first engine's worker service from process-wide servers; the window
 store and engines each get a private one (private_native_servers).
 
-Functions run under PipelineTransfer.lock unless they say otherwise.
+Functions run under PoolTransfer.lock unless they say otherwise.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from sglang_tpu.disaggregation.raiden.host_pool import slot_host_bytes
-from sglang_tpu.disaggregation.raiden.pp_common import (
+from sglang_tpu.disaggregation.raiden.pool_spans import (
     _derived_uuid,
     _new_transfer_state,
     is_swa_pool,

@@ -17,7 +17,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.network import NetworkAddress
-from sglang_tpu.disaggregation.raiden.pp_common import _BLOCK_MAJOR_KV_RANK
+from sglang_tpu.disaggregation.raiden.pool_spans import _BLOCK_MAJOR_KV_RANK
 from sglang_tpu.disaggregation.raiden.serde import (
     BLOCK_MAJOR_KV_LAYOUT,
     PER_LAYER_KV_LAYOUT,

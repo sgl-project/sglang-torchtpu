@@ -20,8 +20,13 @@ from sglang_tpu.disaggregation.raiden.host_pool import (
     node_worker_rank,
     ranks_per_node,
 )
-from sglang_tpu.disaggregation.raiden.pipeline import (
-    PipelineTransfer,
+from sglang_tpu.disaggregation.raiden.pool_spans import (
+    head_slice_spans,
+    is_swa_pool,
+    source_spans,
+)
+from sglang_tpu.disaggregation.raiden.pool_transfer import (
+    PoolTransfer,
     Receive,
     destination_blocks,
     layout_fingerprint,
@@ -30,11 +35,6 @@ from sglang_tpu.disaggregation.raiden.pipeline import (
     materialized_storage_layout,
     pool_manifest,
     warn_if_staging_exceeds_premapped,
-)
-from sglang_tpu.disaggregation.raiden.pp_common import (
-    head_slice_spans,
-    is_swa_pool,
-    source_spans,
 )
 from sglang_tpu.disaggregation.raiden.serde import MessageTag, RoomFailed
 
@@ -134,7 +134,7 @@ def sent(expires=None, registered=True):
 
 
 def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=0):
-    pipe = PipelineTransfer.__new__(PipelineTransfer)
+    pipe = PoolTransfer.__new__(PoolTransfer)
     pipe.manager = SimpleNamespace(
         _state_lock=threading.Lock(),
         _aborted={},
@@ -596,7 +596,7 @@ class TestLegacyPoolBudget(unittest.TestCase):
 
     def test_staging_above_the_premapped_buffer_warns(self):
         with self.assertLogs(
-            "sglang_tpu.disaggregation.raiden.pipeline", level="WARNING"
+            "sglang_tpu.disaggregation.raiden.pool_transfer", level="WARNING"
         ) as logs:
             self.assertTrue(
                 warn_if_staging_exceeds_premapped(
@@ -820,7 +820,9 @@ class TestPipelineLifetimes(unittest.TestCase):
         request = receive()
         request.ranks, request.aux_index = set(range(8)), 5
         pipe.receives[7] = request
-        with patch("sglang_tpu.disaggregation.raiden.pipeline.write_aux_blob") as write:
+        with patch(
+            "sglang_tpu.disaggregation.raiden.pool_transfer.write_aux_blob"
+        ) as write:
             for rank in (7, 0):
                 meta = receive(rank=rank).sources[rank]
                 pipe.on_message(
@@ -1049,7 +1051,7 @@ class TestPipelineInitialization(unittest.TestCase):
     def test_legacy_host_budget_uses_resolved_node_count(self):
         get_context().override("test.multihost", nnodes=2)
         with patch(
-            "sglang_tpu.disaggregation.raiden.pipeline.ranks_per_node",
+            "sglang_tpu.disaggregation.raiden.pool_transfer.ranks_per_node",
             wraps=ranks_per_node,
         ) as local_ranks:
             self._initialize(legacy=True)
@@ -1145,7 +1147,7 @@ class TestPipelineInitialization(unittest.TestCase):
             ),
         }
         with patch.dict(sys.modules, native):
-            pipe = PipelineTransfer(manager, buffers)
+            pipe = PoolTransfer(manager, buffers)
         expected = ["engine", "pools", "layout", "work_unit"]
         if legacy:
             expected = ["materialize", "layout"] + expected
@@ -1276,7 +1278,7 @@ class TestDraftPoolGroups(unittest.TestCase):
                 )
 
     def test_pipeline_register_blocks_passes_draft_kv_heads_to_full_and_swa_pools(self):
-        from sglang_tpu.disaggregation.raiden import pp_swa
+        from sglang_tpu.disaggregation.raiden import pool_side_engine
 
         pipe = transfer(producer=True, pp_size=8, pp_rank=7)
         pipe.manager.kv_args.total_kv_head_num = 16
@@ -1291,10 +1293,10 @@ class TestDraftPoolGroups(unittest.TestCase):
             num_hidden_full=0,
             num_draft_swa=1,
         )
-        pipe.pools, swa_pools = pp_swa.split_manifest(pool_manifest(layers))
+        pipe.pools, swa_pools = pool_side_engine.split_manifest(pool_manifest(layers))
         pipe.tensors = list(layers.full)
         swa_client = Mock()
-        pipe.swa = pp_swa.SwaLink(
+        pipe.swa = pool_side_engine.SwaLink(
             pools=swa_pools,
             tensors=list(layers.swa),
             controller="decode-swa:30001",
