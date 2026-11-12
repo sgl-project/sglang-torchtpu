@@ -191,6 +191,19 @@ and the admission budget. `weekly-update-tpu-est-time.yml` keeps it (and a
 `timeout_per_file` that mirrors it) at p90 × 1.25 of the nightlies' passing runs; the
 upstream est_time bot has no TPU data.
 
+PR unit and E2E suites also check actual execution against a 40-minute budget
+after their tests finish. This fails the gate when a suite is too slow, without
+interrupting tests. One monotonic timer covers the suite's parallel and serial
+phases, including model loading and precompilation. Queueing and pod startup
+happen before this timer starts.
+
+Set the repository Actions variable `TPU_PR_GATE_BUDGET_MINUTES` to override
+the default 40-minute budget for both PR lanes. Other callers keep this check
+disabled unless they pass the reusable workflow's `execution_budget_minutes`
+input. Locally, use `test/run_suite.py --execution-budget-minutes 40`; `0` keeps
+the existing behavior without an execution-budget check. Per-file timeouts and
+the JobSet deadlines above remain separate safeguards.
+
 **Weights.** Jobs that need models mount a read-only PVC at `/weights`. The key
 `model-weights` maps to the claim named in `weights.yaml` (today the Filestore claim
 `model-weights-filestore`). JAX's compile cache is a gcsfuse mount of

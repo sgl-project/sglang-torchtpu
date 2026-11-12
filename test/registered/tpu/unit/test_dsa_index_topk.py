@@ -34,7 +34,7 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
 # Standalone raw-JAX kernel test, not a TorchTPU runtime process: select the
 # physical backend before the first JAX import below.
@@ -223,7 +223,7 @@ def _run(
 
 
 def _run_token_split(step, tp, segments="all", topk=_TOPK):
-    """SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT on one device: run every rank's
+    """The DSA indexer token split on one device: run every rank's
     window (rows [r * R, (r + 1) * R), R = ceil(T / tp) rounded up to 8, as
     the backend does) and concatenate them in rank order, as the backend's
     all-reduce does."""

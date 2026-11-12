@@ -6,6 +6,7 @@ compare its token shard with a distributed sum of the stock BF16 MoE kernel
 using weights dequantized from the exact same FP4 codes and block scales.
 """
 
+import argparse
 import gc
 import os
 import types
@@ -44,10 +45,13 @@ def _make_local_nvfp4_layer(
     intermediate_size: int,
     rank: int,
     block_size: int,
+    activation: str = "silu",
 ) -> torch.nn.Module:
     generator = torch.Generator().manual_seed(1000 + rank)
     layer = torch.nn.Module()
-    layer.moe_runner_config = types.SimpleNamespace(is_gated=True, activation="silu")
+    layer.moe_runner_config = types.SimpleNamespace(
+        is_gated=True, activation=activation
+    )
     layer.w13_weight = torch.nn.Parameter(
         torch.randint(
             0,
@@ -137,11 +141,12 @@ def _make_inputs(
     hidden_size: int,
     global_experts: int,
     topk: int,
+    input_scale: float = 0.01,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator().manual_seed(2000 + tokens)
-    hidden_states = (torch.randn(tokens, hidden_size, generator=generator) * 0.01).to(
-        torch.bfloat16
-    )
+    hidden_states = (
+        torch.randn(tokens, hidden_size, generator=generator) * input_scale
+    ).to(torch.bfloat16)
     token_ids = torch.arange(tokens, dtype=torch.int32)[:, None]
     slots = torch.arange(topk, dtype=torch.int32)[None, :]
     topk_ids = (token_ids * topk + slots * 31) % global_experts
@@ -157,6 +162,7 @@ def _make_fused_rs_kernel(
     no_post_norm: torch.Tensor,
     group_offset: torch.Tensor,
     topk: int,
+    activation: str = "silu",
 ):
     w1 = layer.w13_weight
     w2 = layer.w2_weight
@@ -175,7 +181,7 @@ def _make_fused_rs_kernel(
             post_expert_norm_weight=no_post_norm,
             group_offset=group_offset,
             topk=topk,
-            activation="silu",
+            activation=activation,
             has_post_expert_norm=False,
             fp8_direct_write=False,
         )
@@ -184,6 +190,19 @@ def _make_fused_rs_kernel(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--activation", choices=("silu", "swigluoai"), default="silu")
+    parser.add_argument(
+        "--block-sizes",
+        type=int,
+        nargs="+",
+        choices=SUPPORTED_BLOCK_SIZES,
+        default=SUPPORTED_BLOCK_SIZES,
+    )
+    parser.add_argument("--tokens", type=int, nargs="+", default=(1, 16, 64, 256))
+    # Scale 4 exercises the canonical +/-7 clamps with these random weights.
+    parser.add_argument("--input-scale", type=float, default=0.01)
+    args = parser.parse_args()
     dist.init_process_group(backend="tpu_dist")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -195,6 +214,7 @@ def main() -> None:
     )
     from sglang_tpu.moe.pallas import fused_moe_rs_op
     from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
     global_experts = 256
     local_experts = global_experts // world_size
@@ -209,13 +229,17 @@ def main() -> None:
     )
     no_post_norm = torch.zeros(1, dtype=torch.bfloat16, device=device)
 
-    for block_size in SUPPORTED_BLOCK_SIZES:
+    # Register the custom op and discover its mesh before Dynamo tracing.
+    fused_moe_rs_op._build_fused_moe_rs_op()
+
+    for block_size in args.block_sizes:
         layer = _make_local_nvfp4_layer(
             local_experts,
             hidden_size,
             intermediate_size,
             rank,
             block_size,
+            activation=args.activation,
         )
         reference_w1, reference_w2 = _make_bf16_reference_weights(layer, block_size)
         reference_w1 = reference_w1.to(device)
@@ -241,13 +265,14 @@ def main() -> None:
                 no_post_norm,
                 group_offset,
                 topk,
+                activation=args.activation,
             ),
             fullgraph=True,
             dynamic=False,
         )
-        for tokens in (1, 16, 64, 256):
+        for tokens in args.tokens:
             hidden_states, topk_ids, topk_weights = _make_inputs(
-                tokens, hidden_size, global_experts, topk
+                tokens, hidden_size, global_experts, topk, args.input_scale
             )
             padded_tokens = fused_moe_rs_op.fused_moe_rs_padded_tokens(
                 tokens, topk, world_size
@@ -266,28 +291,31 @@ def main() -> None:
             hidden_device = hidden_states.to(device)
             topk_weights_device = topk_weights.to(device)
             topk_ids_device = topk_ids.to(device)
-            reference = fused_moe_call(
-                hidden_states=hidden_device,
-                w1=reference_w1,
-                w2=reference_w2,
-                topk_weights=topk_weights_device,
-                topk_ids=topk_ids_device,
-                topk=topk,
-                activation="silu",
-                global_num_experts=global_experts,
-                expert_group_offset=rank * local_experts,
-            )
+            # JAX traces on CPU; export the stock reference for the physical TPU.
+            with tpu_info_for_cpu_export():
+                reference = fused_moe_call(
+                    hidden_states=hidden_device,
+                    w1=reference_w1,
+                    w2=reference_w2,
+                    topk_weights=topk_weights_device,
+                    topk_ids=topk_ids_device,
+                    topk=topk,
+                    activation=args.activation,
+                    global_num_experts=global_experts,
+                    expert_group_offset=rank * local_experts,
+                )
             dist.all_reduce(reference, op=dist.ReduceOp.SUM)
             shard_tokens = padded_tokens // world_size
             expected = reference[rank * shard_tokens : (rank + 1) * shard_tokens].cpu()
 
             previous = None
             for iteration in range(2):
-                actual = compiled(
-                    hidden_device[:tokens],
-                    topk_weights_device[:tokens],
-                    topk_ids_device[:tokens],
-                ).cpu()
+                with tpu_info_for_cpu_export():
+                    actual = compiled(
+                        hidden_device[:tokens],
+                        topk_weights_device[:tokens],
+                        topk_ids_device[:tokens],
+                    ).cpu()
                 if not torch.isfinite(actual).all().item():
                     raise AssertionError(
                         f"non-finite output for block={block_size}, tokens={tokens}"
@@ -332,6 +360,7 @@ def main() -> None:
                 print(
                     "NVFP4_FUSED_RS_EXECUTE_PASS "
                     f"rank={rank} physical_id={physical_id} block={block_size} "
+                    f"activation={args.activation} input_scale={args.input_scale} "
                     f"tokens={tokens} iteration={iteration} "
                     f"shape={tuple(actual.shape)} checksum={checksum:.6f} "
                     f"rel_mean={rel_mean:.6f} cos={cos:.6f}",

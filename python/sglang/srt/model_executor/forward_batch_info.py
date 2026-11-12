@@ -1391,12 +1391,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         None means tracking is skipped for this forward:
         no mask, or a prefill CUDA-graph replay without mamba_track_seqlens.
         Masked-off rows hold garbage.
+
+        Decode rows that MAX_LEN DP padding runs as 1-token extends
+        (prepare_mlp_sync_batch) keep their decode track plan: the mask marks
+        rows whose post-token length lands on the track grid, and the decode
+        result path records that snapshot as taken. The whole row is covered;
+        its prefix (seq_len - 1) is off the chunk grid, so the floor below
+        would wrongly round it to 0.
         """
-        if (
-            self.mamba_track_mask is None
-            or self.mamba_track_seqlens is None
-            or self.extend_prefix_lens is None
-        ):
+        if self.mamba_track_mask is None:
+            return None
+        original_mode = getattr(self, "_original_forward_mode", None)
+        if original_mode is not None and original_mode.is_decode():
+            return self.extend_seq_lens
+        if self.mamba_track_seqlens is None or self.extend_prefix_lens is None:
             return None
 
         chunk_size = mamba_cache_chunk_size()

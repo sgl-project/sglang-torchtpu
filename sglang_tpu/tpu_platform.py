@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Optional, Type
 
 import torch
@@ -19,13 +19,21 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.utils import LazyImport
+from sglang_tpu import shared_slice
 from sglang_tpu._logging import get_logger
+from sglang_tpu.dp_replicas import (
+    ReplicaSession,
+    get_replica_session,
+    prepare_host_session,
+    validate_dp_replicas,
+)
 from sglang_tpu.tpu_dma_hicache import (
     is_tpu_dma_hicache_backend,
     tpu_dma_hicache_backends,
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.server_args import ServerArgs
 
@@ -35,6 +43,9 @@ logger = get_logger(__name__)
 # Platform discovery runs before worker bootstrap configures torch_tpu.
 rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
 traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
+_ReplicaGroupCoordinator = LazyImport(
+    "sglang_tpu.replica_group", "ReplicaGroupCoordinator"
+)
 # The resolving view imports the platform registry, which is still discovering us.
 _resolving_view = LazyImport("sglang.srt.arg_groups.overrides", "resolving_view")
 
@@ -159,6 +170,10 @@ def _check_block_major_supported(server_args) -> None:
             "SGLANG_TPU_USE_BLOCK_MAJOR_KV supports KV offload over the raiden "
             "HiCache backend only; got --hicache-io-backend "
             f"{cfg.hicache_io_backend!r}."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV does not support --enable-unified-memory."
         )
     if mambaish_config(model_config_of(server_args)) is not None:
         raise ValueError(
@@ -334,6 +349,17 @@ def _pin_fused_moe_tensorcore_gather(reason: str) -> None:
             f"{reason} gathers the fused-MoE rows on the TensorCore."
         )
     tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.set(False)
+
+
+def _pin_moe_gather_permute_for_static_fp8(parts: frozenset[str]) -> None:
+    """Kimi-K3 static fp8 moe_front / latent_up: keep the fused MoE's permute off
+    the one-hot matmul where the combine runs on the SparseCore. That pairing
+    gave wrong tokens there (DSpark verifying four requests, 32 tokens), while
+    either path end to end was right."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if parts & {"moe_front", "latent_up"}:
+        tpu_envs.SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE.set(True)
 
 
 def _mha_kv_pool_cls(backend: str | None) -> type:
@@ -651,6 +677,20 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
         return
     declare_resolution(
         server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="fp8_e4m3"
+    )
+
+
+def _resolve_unified_kv_pool(server_args) -> None:
+    """Resolve ``--enable-unified-memory`` on TPU without enabling CUDA unified memory."""
+    from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+    from sglang_tpu.unified_kv_pool import UNIFIED_KV_POOL_RESOLUTION_SOURCE
+
+    if not resolving_view(server_args).enable_unified_memory:
+        return
+    declare_resolution(
+        server_args,
+        UNIFIED_KV_POOL_RESOLUTION_SOURCE,
+        enable_unified_memory=False,
     )
 
 
@@ -1020,20 +1060,19 @@ class TpuSRTPlatform(SRTPlatform):
             with_phase,
         )
         from sglang_tpu.hooks.dsv4 import register_tpu_dsv4_resolution_hooks
-        from sglang_tpu.kimi_k3 import check_static_fp8_spec_batch, static_fp8_parts
+        from sglang_tpu.kimi_k3 import static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
 
         register_tpu_dsv4_resolution_hooks()
 
         # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
         # weights have loaded (its binder runs post-load).
-        parts = static_fp8_parts()
+        _pin_moe_gather_permute_for_static_fp8(static_fp8_parts())
         cfg = resolving_view(server_args)
-        if "latent_up" in parts:
-            check_static_fp8_spec_batch(
-                parts,
-                speculative_algorithm=cfg.speculative_algorithm,
-                max_running_requests=cfg.max_running_requests,
+        if cfg.enable_page_major_kv_layout:
+            raise ValueError(
+                "--enable-page-major-kv-layout is a CUDA-only layout flag and is "
+                "not supported on TPU."
             )
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
@@ -1057,7 +1096,13 @@ class TpuSRTPlatform(SRTPlatform):
         # the libtpu/env overrides now so actors inherit them before importing
         # torch_tpu.
         # One device per scheduler process across all pipeline stages.
-        _prepare_tpu_env(cfg.tp_size * cfg.pp_size, setup_slicebuilder=not cfg.use_ray)
+        if cfg.dp_size > 1:
+            validate_dp_replicas(cfg)
+            prepare_host_session(cfg.dp_size, cfg.tp_size)
+        _prepare_tpu_env(
+            cfg.dp_size * cfg.tp_size * cfg.pp_size,
+            setup_slicebuilder=not cfg.use_ray,
+        )
 
         from sglang_tpu.env_override import (
             apply_decode_cp_sparse_core_override,
@@ -1217,6 +1262,7 @@ class TpuSRTPlatform(SRTPlatform):
         _apply_kv_cache_dtype_default(server_args)
         if _uses_block_major_kv():
             _check_block_major_supported(server_args)
+        _resolve_unified_kv_pool(server_args)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
@@ -1438,6 +1484,50 @@ class TpuSRTPlatform(SRTPlatform):
 
         return TpuPagedTokenToKVPoolAllocator
 
+    def unified_kv_pool_enabled(self, kvc) -> bool:
+        from sglang_tpu.unified_kv_pool import unified_kv_pool_enabled
+
+        return unified_kv_pool_enabled(kvc)
+
+    def create_memory_pool_configurator(self, kvc):
+        from sglang_tpu.unified_kv_pool import maybe_create_unified_pool_configurator
+
+        return maybe_create_unified_pool_configurator(kvc)
+
+    def build_swa_kv_pool(
+        self,
+        kvc,
+        *,
+        full_max_total_num_tokens: int | None,
+        swa_max_total_num_tokens: int | None,
+    ):
+        from sglang_tpu.unified_kv_pool import maybe_build_unified_kv_pool
+
+        return maybe_build_unified_kv_pool(
+            kvc,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+        )
+
+    def build_swa_kv_pool_allocator(
+        self,
+        kvc,
+        *,
+        sizes,
+        token_to_kv_pool,
+        req_to_token_pool,
+        need_sort: bool,
+    ):
+        from sglang_tpu.unified_kv_pool import maybe_build_unified_kv_pool_allocator
+
+        return maybe_build_unified_kv_pool_allocator(
+            kvc,
+            sizes=sizes,
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token_pool=req_to_token_pool,
+            need_sort=need_sort,
+        )
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
 
@@ -1555,85 +1645,120 @@ class TpuSRTPlatform(SRTPlatform):
     # Initialization
     # ------------------------------------------------------------------
 
+    _dp_replica_session: Optional[ReplicaSession] = None
+
+    def prepare_worker(
+        self, server_args, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
+    ) -> None:
+        cfg = _resolving_view(server_args)
+        if cfg.dp_size <= 1:
+            return
+        validate_dp_replicas(cfg)
+        if dp_rank is None or not 0 <= dp_rank < cfg.dp_size:
+            raise ValueError(f"Invalid TPU engine DP rank: {dp_rank}")
+        self._dp_replica_session = ReplicaSession(
+            dp_rank,
+            cfg.dp_size,
+            cfg.tp_size,
+            cfg.ep_size,
+            dp_rank * cfg.tp_size + tp_rank,
+            cfg.dist_timeout or 7200,
+        )
+        # The session rank chooses the physical device. Engine-local co-location
+        # binding would put every replica on the first engine's devices.
+        os.environ.pop("SGLANG_TPU_PD_COLOCATED", None)
+        os.environ.pop("TPU_VISIBLE_DEVICES", None)
+
+    def get_group_coordinator_cls(self) -> Type[GroupCoordinator]:
+        if get_replica_session() is not None:
+            return _ReplicaGroupCoordinator._load()
+        return super().get_group_coordinator_cls()
+
     def init_backend(self) -> None:
         if getattr(self, "_backend_initialized", False):
             return
 
-        world_size = os.environ.get("WORLD_SIZE")
-        if world_size is None:
-            raise RuntimeError(
-                "TorchTPU backend initialization requires worker WORLD_SIZE. "
-                "Initialize it from the scheduler worker bootstrap."
+        session = self._dp_replica_session
+        context = session.initialize() if session is not None else nullcontext()
+        with context:
+            world_size = os.environ.get("WORLD_SIZE")
+            if world_size is None:
+                raise RuntimeError(
+                    "TorchTPU backend initialization requires worker WORLD_SIZE. "
+                    "Initialize it from the scheduler worker bootstrap."
+                )
+            shared = shared_slice.spec()
+            if shared is not None:
+                if session is not None:
+                    raise ValueError(
+                        "TPU engine DP cannot share a slice with a trainer"
+                    )
+                # libtpu builds the whole slice, trainer included, from these
+                job = shared_slice.enter_slice_env(shared)
+                world_size = os.environ["WORLD_SIZE"]
+
+            # Keep c10d_functional collectives inside the compiled graph. torch_tpu
+            # defaults to materializing collective tensors by forcing graph breaks, which
+            # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
+            # disables that guardrail for SPMD TP graphs.
+            os.environ.setdefault(
+                "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
             )
-        from sglang_tpu import shared_slice
+            # Allow legacy torch.tpu device APIs (e.g. set_device, is_available,
+            # synchronize) called by SGLang's generic runtime bootstrap.
+            os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
 
-        shared = shared_slice.spec()
-        if shared is not None:
-            # libtpu builds the whole slice, trainer included, from these
-            job = shared_slice.enter_slice_env(shared)
-            world_size = os.environ["WORLD_SIZE"]
+            # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
+            # read by libtpu at init, so it MUST be set before `import torch_tpu`.
+            os.environ.setdefault(
+                "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
+            )
+            premapped_bytes = int(os.environ["TPU_PREMAPPED_BUFFER_SIZE"])
+            # Log the effective size so it's in hand when debugging KV-offload OOMs.
+            logger.info(
+                "libtpu premapped host staging pool: %.2f GiB "
+                "(TPU_PREMAPPED_BUFFER_SIZE=%d); raise it if KV-offload H2D OOMs.",
+                premapped_bytes / (1024 * 1024 * 1024),
+                premapped_bytes,
+            )
 
-        # Keep c10d_functional collectives inside the compiled graph. torch_tpu
-        # defaults to materializing collective tensors by forcing graph breaks, which
-        # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
-        # disables that guardrail for SPMD TP graphs.
-        os.environ.setdefault(
-            "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
-        )
-        # Allow legacy torch.tpu device APIs (e.g. set_device, is_available,
-        # synchronize) called by SGLang's generic runtime bootstrap.
-        os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
+            from sglang_tpu.patches import (
+                _prepare_tpu_env,
+                apply_tpu_patches,
+            )
 
-        # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
-        # read by libtpu at init, so it MUST be set before `import torch_tpu`.
-        os.environ.setdefault(
-            "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
-        )
-        premapped_bytes = int(os.environ["TPU_PREMAPPED_BUFFER_SIZE"])
-        # Log the effective size so it's in hand when debugging KV-offload OOMs.
-        logger.info(
-            "libtpu premapped host staging pool: %.2f GiB "
-            "(TPU_PREMAPPED_BUFFER_SIZE=%d); raise it if KV-offload H2D OOMs.",
-            premapped_bytes / (1024 * 1024 * 1024),
-            premapped_bytes,
-        )
+            # WORLD_SIZE is authoritative only inside a scheduler worker. Validate
+            # the inherited launch environment here; any TorchTPU-dependent
+            # topology discovery is therefore confined to the worker.
+            _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
 
-        from sglang_tpu.patches import (
-            _prepare_tpu_env,
-            apply_tpu_patches,
-        )
+            from sglang_tpu.compile_cache import (
+                add_tpu_kernel_inputs_to_compile_cache_key,
+            )
 
-        # WORLD_SIZE is authoritative only inside a scheduler worker. Validate
-        # the inherited launch environment here; any TorchTPU-dependent
-        # topology discovery is therefore confined to the worker.
-        _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
+            # After _prepare_tpu_env: the key must see the final LIBTPU_INIT_ARGS.
+            add_tpu_kernel_inputs_to_compile_cache_key()
 
-        from sglang_tpu.compile_cache import (
-            add_tpu_kernel_inputs_to_compile_cache_key,
-        )
+            import torch_tpu  # noqa: F401
 
-        # After _prepare_tpu_env: the key must see the final LIBTPU_INIT_ARGS.
-        add_tpu_kernel_inputs_to_compile_cache_key()
+            apply_tpu_patches()
+            # Resolve after worker setup, before Dynamo can trace either helper.
+            rank_slice._load()
+            traced_rank._load()
+            _register_attention_backends()
+            from sglang_tpu.envs import envs as tpu_envs
 
-        import torch_tpu  # noqa: F401
+            if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():
+                from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
 
-        apply_tpu_patches()
-        # Resolve after worker setup, before Dynamo can trace either helper.
-        rank_slice._load()
-        traced_rank._load()
-        _register_attention_backends()
-        from sglang_tpu.envs import envs as tpu_envs
-
-        if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():
-            from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
-
-            register_fp8_linear_small_m_op()
-        if shared is not None:
-            shared_slice.join(shared, job)
-        # Set before registering: importing the model registry imports model_runner,
-        # which calls init_backend again on the OOT path.
-        self._backend_initialized = True
-        _register_models()
+                register_fp8_linear_small_m_op()
+            if shared is not None:
+                shared_slice.join(shared, job)
+            # Set before registering: importing the model registry imports model_runner,
+            # which calls init_backend again on the OOT path.
+            self._backend_initialized = True
+            _register_models()
+        self._dp_replica_session = None
 
     def on_warmup_complete(self) -> None:
         """Freeze torch.compile so serving-time recompiles raise."""

@@ -20,6 +20,7 @@ from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
@@ -183,6 +184,37 @@ class SRTPlatform(DeviceMixin):
         """Return the paged allocator class for this platform."""
         raise NotImplementedError
 
+    def unified_kv_pool_enabled(self, kvc) -> bool:
+        """Whether ``kvc`` builds this platform's unified KV pool, whose
+        full-attention and sliding-window layers share pages."""
+        return False
+
+    def create_memory_pool_configurator(self, kvc):
+        """Return a platform-specific ``MemoryPoolConfigurator`` for ``kvc``, or ``None``."""
+        return None
+
+    def build_swa_kv_pool(
+        self,
+        kvc,
+        *,
+        full_max_total_num_tokens: int | None,
+        swa_max_total_num_tokens: int | None,
+    ):
+        """Build a platform-specific hybrid SWA KV pool for ``kvc``, or ``None``."""
+        return None
+
+    def build_swa_kv_pool_allocator(
+        self,
+        kvc,
+        *,
+        sizes,
+        token_to_kv_pool,
+        req_to_token_pool,
+        need_sort: bool,
+    ):
+        """Build a platform-specific hybrid SWA KV pool allocator for ``kvc``, or ``None``."""
+        return None
+
     def get_zigzag_cp_strategy_cls(self) -> type:
         """Return the zigzag prefill context-parallel strategy class."""
         from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
@@ -324,6 +356,19 @@ class SRTPlatform(DeviceMixin):
         bind kernel-specific weights here. It can run more than once per model
         (from ``load_weights``, a multimodal wrapper or a weight update), so
         implementations must be idempotent."""
+        pass
+
+    def get_group_coordinator_cls(self) -> Type[GroupCoordinator]:
+        """Coordinator used for WORLD and model-parallel groups."""
+        # parallel_state imports the platform registry during initialization.
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        return GroupCoordinator
+
+    def prepare_worker(
+        self, server_args, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
+    ) -> None:
+        """Configure this worker's backend coordinates before device initialization."""
         pass
 
     def on_warmup_complete(self) -> None:

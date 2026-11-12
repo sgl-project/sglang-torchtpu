@@ -35,6 +35,7 @@ from sglang_tpu.attention.pallas.kpool_compress import (
     supports_page_size,
 )
 from sglang_tpu.dsv4.streamindex_topk import KVLayout, streamindex_topk
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +46,11 @@ _LANE_BYTES = 128
 _TOKENS_PER_ROW = 4
 # Upstream act_quant / the kpool writer floor the absolute max before scaling.
 _AMAX_FLOOR = 1e-4
-# Pools per StreamIndex KV block for its (decode, prefill, mixed) passes;
-# not tuned for GLM.
-_NUM_POOLS_PER_BLOCK = 256
+# Pools per StreamIndex KV block for its (decode, prefill, mixed) passes. The kernel's
+# per-step schedule is a scalar-prefetch (SMEM) operand of seqs x query blocks x KV
+# blocks entries: at a 1M context with 8-page blocks it is 513 KB for 16 sequences and
+# the mixed pass fails to compile; 32-page blocks keep it under 128 KB.
+_NUM_POOLS_PER_BLOCK = 1024
 _NUM_QUERIES_PER_BLOCK = (1, 128, 128)
 # Query rows per scoring chunk: the kernel's score buffer is rows x positions.
 _CHUNK_TOKENS = 2048
@@ -168,10 +171,22 @@ def kpool_indexer_step(
     out_width: int = 0,
     decode_query_size: int = 1,
     max_query_length: int | None = None,
+    row_start: jax.Array | None = None,  # i32[1]; first scored row (token split)
+    row_count: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Returns (topk_indices i32[num_tokens, max(out_width, topk + kpool - 1)],
     raw_cache, pooled_cache). Rows list sequence-relative token positions: the
-    selected pools' tokens, then the tail, then -1."""
+    selected pools' tokens, then the tail, then -1.
+
+    ``row_count`` > 0 (with ``row_start``) is the DSA indexer token split
+    (attention_pallas_mla_sparse.py): every token's raw key is stored and
+    every closing pool compressed, as without it, but only query rows
+    ``[row_start, row_start + row_count)`` are scored, and the first output is
+    those rows' picked pools, ``i32[row_count, topk // kpool]`` (chosen pools
+    first, then -1; rows past the batch are all -1), not token rows. The caller
+    puts the ranks' slices together and expands them with
+    ``kpool_expand_rows``; each row then equals the same row of an unsplit call.
+    """
     num_tokens, n_heads, d = query.shape
     num_pages, page_size, _ = raw_cache.shape
     _, tokens_per_row, record_bytes = pooled_cache.shape[1:]
@@ -273,8 +288,11 @@ def kpool_indexer_step(
     q_fp8, q_scale, _ = quantize_ue8m0(query)
     w = head_weights.astype(jnp.float32) * q_scale[..., 0] * weight_scale  # [T, H]
     n_pick = topk // kpool
+    # A token split window scores few rows; the kernel takes no row chunks
+    # with a window.
     chunked = (
-        num_tokens > _CHUNK_TOKENS
+        not row_count
+        and num_tokens > _CHUNK_TOKENS
         and num_tokens % _CHUNK_TOKENS == 0
         and num_tokens * pool_pages * pool_page_size * 4 > _MAX_UNCHUNKED_SCORE_BYTES
     )
@@ -296,10 +314,34 @@ def kpool_indexer_step(
         decode_query_size=decode_query_size,
         enable_early_exit=False,
         kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+        # GLM-5.3-Flash only; the DeepSeek-V4.1 indexer keeps the prefetched table.
+        page_table_in_hbm=tpu_envs.SGLANG_TPU_GLM_FLASH_PAGE_TABLE_HBM.get(),
         chunk_tokens=_CHUNK_TOKENS if chunked else None,
         overlap_chunks=False,
-    )  # i32[T, n_pick], chosen pools first, then -1
+        **(
+            dict(row_start=row_start.reshape(()), row_count=row_count)
+            if row_count
+            else {}
+        ),
+    )  # i32[T or row_count, n_pick], chosen pools first, then -1
+    if row_count:
+        return picked, raw_cache, pooled_cache
+    out = expand_picked(picked, pos, valid, topk=topk, kpool=kpool, out_width=out_width)
+    return out, raw_cache, pooled_cache
 
+
+def expand_picked(
+    picked: jax.Array,  # i32[num_tokens, topk // kpool]; chosen pools, then -1
+    pos: jax.Array,  # i32[num_tokens]; each token's position in its sequence
+    valid: jax.Array,  # bool[num_tokens]; real tokens
+    *,
+    topk: int,
+    kpool: int,
+    out_width: int = 0,
+) -> jax.Array:
+    """Token rows from picked pools: each pool's ``kpool`` tokens, then the
+    open pool's tokens (the tail), then -1. ``i32[num_tokens, width]``."""
+    num_tokens, n_pick = picked.shape
     pool_len = (pos + 1) // kpool
     picked_ok = picked >= 0
     tokens = picked[:, :, None] * kpool + jnp.arange(kpool, dtype=jnp.int32)
@@ -318,5 +360,22 @@ def kpool_indexer_step(
     )
     hist = jnp.pad(tokens, ((0, 0), (0, width - topk)), constant_values=-1)
     out = jnp.where(col < hist_len[:, None], hist, tail)
-    out = jnp.where(valid[:, None], out, -1).astype(jnp.int32)
-    return out, raw_cache, pooled_cache
+    return jnp.where(valid[:, None], out, -1).astype(jnp.int32)
+
+
+def kpool_expand_rows(
+    picked: jax.Array,  # i32[num_tokens, topk // kpool], all ranks' slices
+    kv_lens: jax.Array,  # i32[max_num_seqs]; already counts this step's tokens
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    *,
+    topk: int,
+    kpool: int,
+    out_width: int = 0,
+) -> jax.Array:
+    """The token rows of ``kpool_indexer_step`` from the pools its token split
+    picked, put together over the ranks (``row_count``)."""
+    _, pos, valid = _token_rows(kv_lens, cu_q_lens, distribution, picked.shape[0])
+    return expand_picked(
+        picked, pos, valid, topk=topk, kpool=kpool, out_width=out_width
+    )

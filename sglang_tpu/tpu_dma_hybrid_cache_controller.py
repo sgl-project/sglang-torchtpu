@@ -80,6 +80,10 @@ class TpuDMAHybridCacheController(HybridCacheController):
     # The pools this controller offloads (a subclass whose host pools copy
     # other state, e.g. the K3 programs' KDA checkpoints, widens it).
     offloaded_pools: frozenset = _KV_PAGE_POOLS | _STATE_SLOT_POOLS
+    # This engine's end of the prefill DRAM offload's extension to decode
+    # DRAM, set once the P/D manager exists; None without it. See
+    # disaggregation/decode_dram_offload/dram_offload_hooks.py.
+    decode_dram_extension: Optional[Any] = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
