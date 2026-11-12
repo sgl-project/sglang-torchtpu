@@ -64,12 +64,13 @@ def ep_mk_config(c: MKConfig) -> MKConfig:
     """The step's MKConfig for the EP kernel: replicated pool / unpool stream outside the
     dense ring (refitted to the tiles left); no folds into the router or the next qkvg (the
     FFN section runs on own rows and ends in a row all-gather); the TP expert section's VMEM
-    y buffers go unused (pad_y in HBM); no single-row collectives (the hook's o-proj
-    replaces them at every row count)."""
+    y buffers go unused (pad_y in HBM); no single-row collectives or paired o-proj
+    reduce-scatter (the hook's o-proj replaces them at every row count)."""
     c = msgspec.structs.replace(
         c,
         dense_skip=("wpool", "wunpool"),
         single_row_coll=False,
+        pair_o_rs=False,
         fold_o=False,
         fold_f=False,
         tiled_vmem_y=0,
