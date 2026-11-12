@@ -466,10 +466,12 @@ def tpu_dsv41_int32_graph_inputs(
         forward_batch.engram_history = _padded_history(
             hasher, forward_batch.engram_history, forward_batch.req_pool_indices
         )
-    from sglang_tpu.models.deepseek_v41 import nan_probe
+    from sglang_tpu.models.deepseek_v41 import nan_probe, num_dump
 
     if nan_probe.ENABLED:
         nan_probe.before_forward(forward_batch.input_ids.device)
+    if num_dump.ENABLED:
+        num_dump.before_forward(forward_batch.input_ids.device)
     try:
         out = original(
             shim,
@@ -482,6 +484,8 @@ def tpu_dsv41_int32_graph_inputs(
         )
         if nan_probe.ENABLED:
             nan_probe.after_forward(forward_batch, out)
+        if num_dump.ENABLED:
+            num_dump.after_forward(forward_batch)
         return out
     finally:
         for name, value in saved.items():
@@ -505,7 +509,7 @@ def tpu_dsv41_engram_owned_rows(original, embedding, indices):
 
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
-    from sglang_tpu.models.deepseek_v41 import nan_probe
+    from sglang_tpu.models.deepseek_v41 import nan_probe, num_dump
 
     kvc = "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator"
     cfg = "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator"
@@ -576,4 +580,4 @@ def hook_specs():
             tpu_dsv41_engram_owned_rows,
             HookType.AROUND,
         ),
-    ] + nan_probe.hook_specs()
+    ] + nan_probe.hook_specs() + num_dump.hook_specs()
