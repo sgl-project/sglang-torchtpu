@@ -315,15 +315,17 @@ def tpu_dsv41_torch_hash_ids(
     blocked = positions.to(i32).unsqueeze(-1) < shifts
     if num_real < num_tokens:
         blocked[num_real:] = True
+    sentinel = (tokens < 0) | (tokens >= MM_PAD_SHIFT_VALUE)
     if hasher.image_token_id is not None:
         tokens = tokens.masked_fill(tokens >= MM_PAD_SHIFT_VALUE, hasher.image_token_id)
-        # Cumulative OR over the n columns, unrolled: cummax lowers to a loop
-        # with a 64-bit counter.
-        stop = blocked | (tokens == hasher.image_token_id)
-        cols = [stop[:, 0]]
-        for k in range(1, n):
-            cols.append(cols[-1] | stop[:, k])
-        blocked = torch.stack(cols, dim=-1)
+        sentinel = sentinel | (tokens == hasher.image_token_id)
+    # Cumulative OR over the n columns, unrolled: cummax lowers to a loop
+    # with a 64-bit counter.
+    stop = blocked | sentinel
+    cols = [stop[:, 0]]
+    for k in range(1, n):
+        cols.append(cols[-1] | stop[:, k])
+    blocked = torch.stack(cols, dim=-1)
     hash_ids = compute_engram_hash_ids(
         tokens,
         blocked,

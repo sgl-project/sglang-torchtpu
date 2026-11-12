@@ -75,6 +75,29 @@ def _visible_ids(lengths: jax.Array, count: int) -> jax.Array:
     return jnp.where(ids < lengths[:, None], ids, -1)
 
 
+def _mask_pages_past_rows(
+    index_pages: jax.Array,
+    requests: jax.Array,
+    lengths: jax.Array,
+    page_size: int,
+) -> jax.Array:
+    """Invalidate storage pages at or past each page-table row's longest query.
+
+    Columns past a request's context hold leftover req_to_token entries: 0 in a
+    never-used row, so every one names page 0 (or pages 0 and 1 for ratio 1).
+    Those keys already score -inf by length; -1 lets the dense scorer spread
+    masked reads instead of queueing hundreds of DMAs of page 0 per K tile.
+    """
+    count = index_pages.shape[0]
+    live = (requests >= 0) & (requests < count)
+    # A [tokens, rows] TensorCore comparison; a segment max would lower to a
+    # SparseCore scatter.
+    owner = live[:, None] & (requests[:, None] == jnp.arange(count, dtype=jnp.int32))
+    row_keys = jnp.max(jnp.where(owner, lengths[:, None], 0), axis=0, initial=0)
+    starts = jnp.arange(index_pages.shape[1], dtype=jnp.int32) * page_size
+    return jnp.where(starts[None, :] < row_keys[:, None], index_pages, -1)
+
+
 def _select(
     q: jax.Array,
     weights: jax.Array,
@@ -113,10 +136,11 @@ def _select(
 
     def scored():
         q8, q_scales, _ = quantize_index_rows(q)
+        masked_pages = _mask_pages_past_rows(index_pages, requests, lengths, page_size)
         selected, published = select_fp8_indexer_jax(
             q8,
             (index_k,),
-            index_pages,
+            masked_pages,
             weights.astype(jnp.float32) * q_scales,
             lengths,
             candidates,

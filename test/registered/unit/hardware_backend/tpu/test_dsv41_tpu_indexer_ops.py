@@ -125,5 +125,35 @@ def test_write_lands_records_on_contract_pages(ratio):
     assert not np.asarray(written[: (2 if ratio == 1 else 1) * 33]).any()
 
 
+def test_mask_pages_past_rows_invalidates_trailing_and_idle_columns():
+    index_pages = jnp.array(
+        [
+            [6, 7, 10, 11, 0, 1, 0, 1],
+            [4, 5, 0, 1, 0, 1, 0, 1],
+            [0, 1, 0, 1, 0, 1, 0, 1],
+        ],
+        dtype=jnp.int32,
+    )
+    requests = jnp.array([0, 0, 1, -1], dtype=jnp.int32)
+    # Row 0 max visible length = 300 -> ceil(300/128) = 3 pages (cols 0..2 kept)
+    # Row 1 max visible length = 128 -> ceil(128/128) = 1 page  (col 0 kept)
+    # Row 2 has no live queries -> all -1
+    lengths = jnp.array([250, 300, 128, 999], dtype=jnp.int32)
+    masked = np.asarray(
+        indexer._mask_pages_past_rows(index_pages, requests, lengths, 128)
+    )
+    np.testing.assert_array_equal(
+        masked,
+        np.array(
+            [
+                [6, 7, 10, -1, -1, -1, -1, -1],
+                [4, -1, -1, -1, -1, -1, -1, -1],
+                [-1, -1, -1, -1, -1, -1, -1, -1],
+            ],
+            dtype=np.int32,
+        ),
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
