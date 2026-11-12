@@ -1,11 +1,11 @@
 """Refuse settings the KV offload to decode DRAM does not support.
 
-The offload moves full-attention KV between the two roles' HiCache host pools,
-rank to rank. Anything it cannot move or agree on is refused here with the
-setting to change, at engine start on either role, before the transfer manager
-is built. A pair whose engines disagree fails its requests instead (the raiden
-channel, ``raiden/dram_offload_channel.py``). Nothing degrades to "no offload"
-silently.
+The offload moves full-attention KV (and a hybrid sliding-window model's last
+window) between the two roles' HiCache host pools, rank to rank. Anything it
+cannot move or agree on is refused here with the setting to change, at engine
+start on either role, before the transfer manager is built. A pair whose
+engines disagree fails its requests instead (the raiden channel,
+``raiden/dram_offload_channel.py``). Nothing degrades to "no offload" silently.
 """
 
 from __future__ import annotations
@@ -54,6 +54,14 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
     server_args = scheduler.server_args
     model_config = scheduler.model_config
     tree_cache = scheduler.tree_cache
+    python_tree = isinstance(tree_cache, UnifiedRadixCache) and isinstance(
+        tree_cache.tree_core, UnifiedTreeCore
+    )
+    # The pool configurator picks the hybrid pools by these predicates
+    # (mem_cache/kv_cache_configurator.py), so they name exactly the engines
+    # whose transfer manager would hold sliding-window or recurrent-state
+    # tensors besides the full-attention KV.
+    hybrid_swa = model_config.is_hybrid_swa
     requirements = [
         (
             server_args.disaggregation_transfer_backend == "raiden",
@@ -96,8 +104,7 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
             "the unified KV pool (--enable-unified-memory) is not supported",
         ),
         (
-            isinstance(tree_cache, UnifiedRadixCache)
-            and isinstance(tree_cache.tree_core, UnifiedTreeCore),
+            python_tree,
             "the Python unified radix tree is required (the Rust tree core is not supported)",
         ),
         (
@@ -122,19 +129,24 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
             scheduler.spec_algorithm.is_none(),
             "speculative decoding is not supported",
         ),
-        # The pool configurator picks the hybrid pools by these two predicates
-        # (mem_cache/kv_cache_configurator.py), so they name exactly the
-        # engines whose transfer manager would hold recurrent-state or
-        # sliding-window tensors besides the full-attention KV.
         (
             mambaish_config(model_config) is None,
             "models with recurrent state (GDN/Mamba) are not supported",
         ),
         (
-            not (model_config.is_hybrid_swa or model_config.is_hybrid_swa_compress),
-            "hybrid sliding-window models are not supported: only "
-            "full-attention KV is offloaded, and such a model cannot resume "
-            "from it without its window",
+            # Their compressor state rings travel with neither page set.
+            not model_config.is_hybrid_swa_compress,
+            "hybrid sliding-window models with compressed window state are "
+            "not supported",
+        ),
+        (
+            not hybrid_swa or int(server_args.page_size) > 1,
+            "a hybrid sliding-window model needs --page-size > 1",
+        ),
+        (
+            not hybrid_swa or not python_tree or tree_cache.tree_core.has_swa_host_pool,
+            "a hybrid sliding-window model needs a host tier of SWA windows, "
+            "which this cache was built without",
         ),
     ]
     problems = [reason for ok, reason in requirements if not ok]
