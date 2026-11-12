@@ -102,13 +102,13 @@ _PADDED_TOKENS = {_PREFILL: 144, _DECODE: 8}
 class _Case:
     """Pools, step inputs and the dense reference for one batch."""
 
-    def __init__(self, requests, ratio, seed=0):
+    def __init__(self, requests, ratio, seed=0, tokens=None):
         rng = np.random.default_rng(seed)
         self.ratio = ratio
         self.theta = _theta()
         self.requests = requests
         lengths = [p + n for p, n, _ in requests]
-        tokens = _PADDED_TOKENS[requests]
+        tokens = _PADDED_TOKENS[requests] if tokens is None else tokens
         counts = [n for _, n, _ in requests]
         self.starts = np.r_[0, np.cumsum(counts)].astype(np.int32)
         self.positions = np.zeros(tokens, np.int32)
@@ -342,6 +342,31 @@ def tpu_ops():
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
 def test_attention_matches_dense_reference(tpu_ops, phase, ratio):
     case = _Case(_PREFILL if phase == "prefill" else _DECODE, ratio, seed=ratio)
+    inputs = _inputs(case)
+    out, swa_records = _step(case, inputs)
+    _check(case, inputs, out, swa_records)
+
+
+# One decode request on its own: at tokens == 1 the kernel's bq is 1, so
+# ``batch == 1 and tokens % bq == 0`` takes CSA2's fixed-tile path. The served
+# --tpu-compile-bs 1 decode graph (one request per DP rank) produced NaN from
+# the second token on; vllm-torchtpu pads to MIN_NUM_SEQS = 8 requests and never
+# reaches this path. The two padded layouts run the general tile builder on the
+# same request: 8 rows (8 % 6 != 0), and the bs-8 bucket with 7 empty requests.
+_ONE = ((700, 1, 0),)
+_SINGLE_DECODE = {
+    "one_token_fixed_tiles": (_ONE, 1),
+    "padded_rows": (_ONE, 8),
+    "padded_requests": (_ONE + ((50, 0, 0),) * 7, 8),
+}
+
+
+@requires_tpu
+@pytest.mark.parametrize("ratio", [0, 1, 2])
+@pytest.mark.parametrize("layout", sorted(_SINGLE_DECODE))
+def test_single_request_decode_matches_dense_reference(tpu_ops, layout, ratio):
+    requests, tokens = _SINGLE_DECODE[layout]
+    case = _Case(requests, ratio, seed=20 + ratio, tokens=tokens)
     inputs = _inputs(case)
     out, swa_records = _step(case, inputs)
     _check(case, inputs, out, swa_records)
