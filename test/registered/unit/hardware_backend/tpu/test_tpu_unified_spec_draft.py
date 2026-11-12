@@ -196,13 +196,23 @@ class TestDraftCoPricingAndValidation(unittest.TestCase):
                     t_mc, algo=algo, draft_mc=d_mc, runners=runners, ps=ps, dt=dt
                 )
                 conf = ukp.TpuUnifiedSWAPoolConfigurator(kvc)
-                self.assertEqual(conf._align_pages, 24 if ds else 8)
+                self.assertEqual(conf._align_pages, 8)
                 n_tok = conf.calculate_pool_sizes(
                     budget, page_size=ps
                 ).full_max_total_num_tokens
                 self.assertEqual((n_tok // ps) % conf._align_pages, 0)
                 n_pg = n_tok // ps + 1
-                d_pg = ((n_tok // ps) // 3 + 1) if ds else 0
+                d_pg = (
+                    ukp._compute_draft_swa_pages(
+                        n_tok // ps,
+                        page_size=ps,
+                        num_swa_groups=3,
+                        sliding_window_size=kvc.sliding_window_size,
+                    )
+                    + 1
+                    if ds
+                    else 0
+                )
                 self.assertLessEqual(
                     n_pg * conf._page_bytes + d_pg * conf._draft_swa_page_bytes, budget
                 )
@@ -231,7 +241,7 @@ class TestDraftCoPricingAndValidation(unittest.TestCase):
                         )
                         cs = ukp.TpuUnifiedSWAPoolConfigurator(ks)
                         self.assertEqual(
-                            (cs._full_per_token, cs._align_pages), (512, 24)
+                            (cs._full_per_token, cs._align_pages), (512, 8)
                         )
         finally:
             tpu_envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.clear()
@@ -404,10 +414,10 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
         return dp
 
     def test_sidecar_lifecycle_fence_and_block_draft_scatter(self):
-        ta, rp = self._build_target(24, 3)
+        ta, rp = self._build_target(32, 3)
         dp = self._attach(ta, rp)
         sc = ta.draft_swa_sidecar
-        self.assertEqual((dp.size, dp.size_swa), (192, 64))
+        self.assertEqual((dp.size, dp.size_swa), (256, 64))
 
         fence = install_kv_free_fence(
             ta,
@@ -450,7 +460,7 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
         ta.free(rp.req_to_token[0, :25])
         ta.free(ext2)
         self.assertEqual(
-            (sc.allocator.available_size() // 8, ta.full_available_size()), (8, 192)
+            (sc.allocator.available_size() // 8, ta.full_available_size()), (8, 256)
         )
 
         bw = object.__new__(TpuDflashDraftWorker)
@@ -494,11 +504,90 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
             self._attach(ta, rp).full_to_swa_index_mapping,
         )
         ta1, rp1 = self._build_target(16, 1)
-        self.assertIs(
-            self._attach(ta1, rp1, window=16).full_to_swa_index_mapping,
-            ta1.full_to_swa_index_mapping,
+        dp1 = self._attach(ta1, rp1, window=16)
+        self.assertEqual((dp1.size, dp1.size_swa), (128, 64))
+        self.assertIsNotNone(ta1.draft_swa_sidecar)
+        z0, neg1, s16 = torch.tensor([0]), torch.tensor([-1]), torch.tensor([16])
+        ext1 = ta1.alloc_extend(z0, z0, s16, s16, neg1, 16)
+        self.assertTrue(8 <= int(dp1.translate_loc_from_full_to_swa(ext1).max()) < 72)
+        ta1.free(ext1)
+
+    def test_hicache_window_sizing_and_sidecar_capacity_eviction(self):
+        # HiCache ON: 4 * B * w_win + 2 * w_chunk (clamped by N_phys // (1 + M_T)).
+        with get_context().override_server_args(
+            enable_hierarchical_cache=True,
+            max_running_requests=4,
+            speculative_num_draft_tokens=8,
+            chunked_prefill_size=4096,
+            page_size=256,
+        ):
+            with get_parallel().override(attn_dp_size=1):
+                pages = ukp._compute_draft_swa_pages(
+                    10000,
+                    page_size=256,
+                    num_swa_groups=3,
+                    sliding_window_size=2048,
+                )
+                # w_win = ceil((2048 + 8 + 256) / 256) = 10; w_chunk = 16 -> 4*4*10 + 32 = 192.
+                self.assertEqual(pages, 192)
+                self.assertEqual(
+                    ukp._compute_draft_swa_pages(
+                        400, page_size=256, num_swa_groups=3, sliding_window_size=2048
+                    ),
+                    96,
+                )
+
+        # Sidecar smaller than shared SWA capacity gates swa_available_size / can_reserve
+        # and triggers SWA eviction via evict_to_free_tokens.
+        ta, rp = self._build_target(32, 1)  # 32 shared pages, M_T = 1
+        dp = SWAKVPool(
+            size=256,
+            size_swa=16,  # 2 compact draft SWA pages
+            page_size=8,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=64,
+            swa_attention_layer_ids=[0],
+            full_attention_layer_ids=[],
+            device="cpu",
+            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
         )
-        self.assertIsNone(ta1.draft_swa_sidecar)
+        dk = types.SimpleNamespace(
+            is_draft_worker=True,
+            is_hybrid_swa=True,
+            sliding_window_size=8,
+            layer_info=types.SimpleNamespace(
+                full_attention_layer_ids=[], swa_attention_layer_ids=[0]
+            ),
+            model_config=types.SimpleNamespace(sliding_window_size=None),
+        )
+        ta.attach_draft_kv_pool(dk, dp)
+        self.assertEqual(ta.swa_available_size(), 16)
+        z0, neg1, s16 = torch.tensor([0]), torch.tensor([-1]), torch.tensor([16])
+        held = ta.alloc_extend(z0, z0, s16, s16, neg1, 16)
+        self.assertEqual((ta.swa_available_size(), ta.full_available_size()), (0, 224))
+        self.assertFalse(ta.new_pages_available(1, 1))
+        self.assertFalse(ta.can_reserve(8, 8))
+        self.assertTrue(ta.can_reserve(8, 8, swa_evictable_tokens=8))
+        self.assertIsNone(
+            ta.alloc_extend(z0, z0, torch.tensor([8]), torch.tensor([8]), neg1, 8)
+        )
+
+        evicted = []
+        fake_tree = types.SimpleNamespace(
+            supports_prefix_sharing=lambda: True,
+            evict_for_alloc=lambda p: (
+                evicted.append((p.num_tokens, p.swa_num_tokens)),
+                ta.free_swa(held[:8]),
+            ),
+        )
+        ta.evict_to_free_tokens(fake_tree, 8)
+        self.assertEqual(evicted, [(0, 8)])
+        self.assertEqual(ta.swa_available_size(), 8)
+        ext2 = ta.alloc_extend(z0, z0, torch.tensor([8]), torch.tensor([8]), neg1, 8)
+        self.assertIsNotNone(ext2)
+        ta.free(held)
+        ta.free(ext2)
 
 
 if __name__ == "__main__":

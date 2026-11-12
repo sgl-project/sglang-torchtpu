@@ -959,9 +959,12 @@ class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
         )
 
     def available_size(self) -> int:
-        return (
+        avail = (
             self._page_store.num_free_pages() // self._pages_per_id
         ) * self.page_size
+        if self._sidecar is not None:
+            avail = min(avail, self._sidecar.allocator.available_size())
+        return avail
 
     def allocated_count(self) -> int:
         return (self.allocated_pages // self._pages_per_id) * self.page_size
@@ -978,15 +981,22 @@ class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
     def _count_taken_pages(self, take, *args, **kwargs):
         free_before = self._page_store.num_free_pages()
         out = take(*args, **kwargs)
-        if self._group_pages is not None:
+        if self._group_pages is not None or self._sidecar is not None:
             self._take_group_pages()
         self.allocated_pages += free_before - self._page_store.num_free_pages()
         return out
 
     def _ensure_free_pages(self, num_pages: int) -> bool:
-        if self._group_pages is None:
+        if (
+            self._sidecar is not None
+            and self._sidecar.allocator.available_size() < num_pages * self.page_size
+        ):
+            return False
+        if self._group_pages is None and self._sidecar is None:
             return super()._ensure_free_pages(num_pages)
         ok = super()._ensure_free_pages(num_pages * self._pages_per_id)
+        if ok and self._sidecar is not None:
+            ok = self._sidecar.allocator._ensure_free_pages(num_pages)
         self._free_pages_before_take = self.free_pages if ok else None
         return ok
 
@@ -999,11 +1009,12 @@ class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
         if num_taken == 0:
             return
         primary = before[:num_taken]
-        num_extra = self._group_pages.shape[0] * num_taken
-        extra = self.free_pages[:num_extra]
-        self._mark_handed_out(extra)
-        self._group_pages[:, primary.long()] = extra.view(-1, num_taken)
-        self.free_pages = self.free_pages[num_extra:]
+        if self._group_pages is not None:
+            num_extra = self._group_pages.shape[0] * num_taken
+            extra = self.free_pages[:num_extra]
+            self._mark_handed_out(extra)
+            self._group_pages[:, primary.long()] = extra.view(-1, num_taken)
+            self.free_pages = self.free_pages[num_extra:]
         if self._sidecar is not None:
             self._sidecar.bind_target_pages(primary)
 
@@ -1014,12 +1025,13 @@ class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
                 p.reshape(-1).to(device="cpu", dtype=torch.int32) for p in page_ids
             )
         )
-        if self._group_pages is not None and page_ids:
+        if (self._group_pages is not None or self._sidecar is not None) and page_ids:
             ids = torch.cat([p.to(torch.int64) for p in page_ids])
             if ids.numel() > 0:
                 if self._sidecar is not None:
                     self._sidecar.release_target_pages(ids)
-                page_ids = (*page_ids, self._group_pages[:, ids].reshape(-1))
+                if self._group_pages is not None:
+                    page_ids = (*page_ids, self._group_pages[:, ids].reshape(-1))
         total_released = sum(ids.numel() for ids in page_ids)
         if total_released == 0:
             return
@@ -1131,13 +1143,19 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return self._free_page_count() * self.page_size
 
     def swa_available_size(self) -> int:
-        return (self._free_page_count() // self._swa_groups) * self.page_size
+        avail = (self._free_page_count() // self._swa_groups) * self.page_size
+        if self._draft_swa_sidecar is not None:
+            avail = min(avail, self._draft_swa_sidecar.allocator.available_size())
+        return avail
 
     def conserve_full_available_size(self) -> int:
         return self._size_full - self.full_attn_allocator.allocated_count()
 
     def conserve_swa_available_size(self) -> int:
-        return self._size_swa - self.swa_attn_allocator.allocated_count()
+        avail = self._size_swa - self.swa_attn_allocator.allocated_count()
+        if self._draft_swa_sidecar is not None:
+            avail = min(avail, self._draft_swa_sidecar.allocator.available_size())
+        return avail
 
     _conserve_full_available_size = conserve_full_available_size
     _conserve_swa_available_size = conserve_swa_available_size
@@ -1165,9 +1183,16 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
     def new_pages_available(self, num_full_pages: int, num_swa_pages: int) -> bool:
+        if min(num_full_pages, num_swa_pages) < 0:
+            return False
+        if (
+            self._draft_swa_sidecar is not None
+            and num_swa_pages * self.page_size
+            > self._draft_swa_sidecar.allocator.available_size()
+        ):
+            return False
         return (
-            min(num_full_pages, num_swa_pages) >= 0
-            and self._page_ids_needed(num_full_pages, num_swa_pages)
+            self._page_ids_needed(num_full_pages, num_swa_pages)
             <= self._free_page_count()
         )
 
@@ -1260,18 +1285,27 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self._validate_draft_swa_window(draft_kvc)
         if not getattr(draft_kvc.layer_info, "swa_attention_layer_ids", None):
             return full_tokens, full_tokens, full_tokens
-        if self._swa_groups == 1:
-            return full_tokens, full_tokens, full_tokens
-        align_tokens = self.page_size * 8
-        raw_swa = (full_tokens // self._swa_groups // self.page_size) * self.page_size
-        swa_tokens = max(align_tokens, (raw_swa // align_tokens) * align_tokens)
-        return full_tokens, full_tokens, min(full_tokens, swa_tokens)
+        draft_swa_pages = _compute_draft_swa_pages(
+            full_tokens // self.page_size,
+            page_size=self.page_size,
+            num_swa_groups=self._swa_groups,
+            sliding_window_size=(
+                self._target_sliding_window_size
+                if self._target_sliding_window_size is not None
+                else self._target_cfg_sliding_window
+            ),
+        )
+        swa_tokens = min(full_tokens, draft_swa_pages * self.page_size)
+        return full_tokens, full_tokens, swa_tokens
 
     def attach_draft_kv_pool(self, draft_kvc, draft_pool) -> None:
         if not getattr(draft_kvc, "is_hybrid_swa", False):
             return
         self._validate_draft_swa_window(draft_kvc)
-        if getattr(draft_pool, "swa_layer_nums", 0) == 0 or self._swa_groups == 1:
+        if (
+            getattr(draft_pool, "swa_layer_nums", 0) == 0
+            or draft_pool.size_swa >= self.size_full
+        ):
             draft_pool.register_mapping(self.full_to_swa_index_mapping)
             return
         if self._draft_swa_sidecar is None:
@@ -1343,28 +1377,39 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     ) -> bool:
         if full_tokens < 0 or swa_tokens < 0:
             return False
+        ps = self.page_size
+        sidecar = self._draft_swa_sidecar
+        swa_cap_tokens = (
+            min(self.size_swa, sidecar.num_draft_pages * ps)
+            if sidecar is not None
+            else self.size_swa
+        )
         if require_token_slack and (
-            full_tokens >= self.size_full or swa_tokens >= self.size_swa
+            full_tokens >= self.size_full or swa_tokens >= swa_cap_tokens
         ):
             return False
-        ps = self.page_size
-        need = self._page_ids_needed(
-            (math.ceil(full_tokens) + ps - 1) // ps,
-            (math.ceil(swa_tokens) + ps - 1) // ps,
-        )
+        f_pages = (math.ceil(full_tokens) + ps - 1) // ps
+        s_pages = (math.ceil(swa_tokens) + ps - 1) // ps
+        need = self._page_ids_needed(f_pages, s_pages)
         if empty_pool:
+            if sidecar is not None and s_pages > sidecar.num_draft_pages:
+                return False
             return need <= self.size_full // ps
-        free = self._free_page_count()
-        if need <= free:
-            return True
         ms = self._swa_groups
-        max_f = min(
-            self.full_attn_allocator.allocated_pages,
-            max(0, int(full_evictable_tokens)) // ps,
-        )
         max_s = min(
             self.swa_attn_allocator.allocated_pages // ms,
             max(0, int(swa_evictable_tokens)) // ps,
+        )
+        if sidecar is not None:
+            sc_free = sidecar.allocator.available_size() // ps
+            if s_pages > sc_free and s_pages > sc_free + max_s:
+                return False
+        free = self._free_page_count()
+        if need <= free:
+            return True
+        max_f = min(
+            self.full_attn_allocator.allocated_pages,
+            max(0, int(full_evictable_tokens)) // ps,
         )
         return need <= free + self._page_ids_needed(max_f, max_s)
 
@@ -1415,6 +1460,13 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             _cdiv(max(0, int(num_tokens)), ps),
             _cdiv(max(0, int(req_swa)), ps),
         )
+        if self._draft_swa_sidecar is not None:
+            sc_free = self._draft_swa_sidecar.allocator.available_size() // ps
+            sc_short = need_s - sc_free
+            if sc_short > 0:
+                tree_cache.evict_for_alloc(
+                    EvictParams(num_tokens=0, swa_num_tokens=sc_short * ps)
+                )
         needed_pages = self._page_ids_needed(need_f, need_s)
         short = needed_pages - self._free_page_count()
         if short > 0:
@@ -1524,13 +1576,83 @@ def resolve_unified_draft_kv_pricing(kvc) -> DraftKVPricing:
     return DraftKVPricing(full_per_token=total_layers * full_bpt)
 
 
+_DRAFT_SWA_HICACHE_WINDOW_MULT = 4
+_DRAFT_SWA_HICACHE_CHUNK_MULT = 2
+
+
+def _draft_swa_runtime_budget() -> Tuple[bool, int, int, int]:
+    """Return ``(enable_hicache, per_worker_mrr, spec_draft_tokens, chunked_prefill_size)``."""
+    from sglang_tpu.compilation.compiled_forward_shim import DEFAULT_TPU_COMPILE_MAX_BS
+
+    try:
+        enable_hicache = bool(get_memory().enable_hierarchical_cache)
+        sched = get_schedule()
+        dp = max(int(get_parallel().attn_dp_size or 1), 1)
+        mrr = getattr(sched, "max_running_requests", None)
+        per_worker_mrr = (
+            max(int(mrr) // dp, 1) if mrr is not None else DEFAULT_TPU_COMPILE_MAX_BS
+        )
+        chunk_tokens = max(int(getattr(sched, "chunked_prefill_size", 0) or 0), 0)
+        spec_ctx = get_spec()
+        draft_tokens = max(
+            int(
+                getattr(spec_ctx, "speculative_num_draft_tokens", 0)
+                or getattr(spec_ctx, "speculative_dflash_block_size", 0)
+                or 0
+            ),
+            0,
+        )
+        return enable_hicache, per_worker_mrr, draft_tokens, chunk_tokens
+    except ValueError:
+        return False, DEFAULT_TPU_COMPILE_MAX_BS, 0, 0
+
+
+def _compute_draft_swa_pages(
+    total_target_pages: int,
+    *,
+    page_size: int,
+    num_swa_groups: int,
+    sliding_window_size: Optional[int],
+) -> int:
+    """Compute compact SWA draft page count for ``total_target_pages`` unified pages.
+
+    Device-only uses the lossless bound ``floor(N_phys / (1 + M_T))`` so SWA leaf
+    eviction never cascade-deletes cached Full prefixes. With HiCache enabled,
+    cold SWA leaf windows spill to host RAM, so device HBM only needs
+    ``4 * B * w_win + 2 * w_chunk`` pages (clamped by the lossless bound).
+    """
+    if total_target_pages <= 0:
+        return 0
+    raw_ceil = max(1, total_target_pages // (1 + num_swa_groups))
+    ceil_pages = (raw_ceil // 8) * 8 if raw_ceil >= 8 else raw_ceil
+    enable_hicache, per_worker_mrr, draft_tokens, chunk_tokens = (
+        _draft_swa_runtime_budget()
+    )
+    if not enable_hicache or sliding_window_size is None:
+        return ceil_pages
+    w_win = _cdiv(int(sliding_window_size) + draft_tokens + page_size, page_size)
+    w_chunk = _cdiv(chunk_tokens, page_size)
+    working_pages = (
+        _DRAFT_SWA_HICACHE_WINDOW_MULT * per_worker_mrr * w_win
+        + _DRAFT_SWA_HICACHE_CHUNK_MULT * w_chunk
+    )
+    aligned_working = _cdiv(max(8, working_pages), 8) * 8
+    return min(aligned_working, ceil_pages)
+
+
 class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
     """Sizes the Logical-to-Physical unified Full+SWA KV pool from ``G = L_full``."""
 
     def __init__(self, kvc):
         _raise_if_unsupported(kvc)
         layout = _kvc_unified_layout(kvc)
-        self._sliding_window_size = kvc.sliding_window_size
+        self._sliding_window_size = (
+            kvc.sliding_window_size
+            if kvc.sliding_window_size is not None
+            else getattr(
+                getattr(kvc, "model_config", None), "sliding_window_size", None
+            )
+        )
         self._num_swa_groups = layout.num_swa_groups
         self._full_layers_num = layout.num_shared_buffers
         self._full_per_token = self._compute_full_per_token(kvc, layout)
@@ -1543,11 +1665,7 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
         )
         self._draft_swa_page_bytes = ps * self._draft_swa_per_token
         self._reserved_bytes = self._page_bytes + self._draft_swa_page_bytes
-        self._align_pages = (
-            8 * self._num_swa_groups
-            if (self._draft_swa_per_token > 0 and self._num_swa_groups > 1)
-            else 8
-        )
+        self._align_pages = 8
 
     @staticmethod
     def _compute_full_per_token(kvc, layout: UnifiedPageLayout) -> int:
@@ -1582,19 +1700,35 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> int:
         """Compute aligned physical page count directly from free HBM quota and Full layers."""
+        from bisect import bisect_right
+
         usable = max(0, available_bytes - self._reserved_bytes)
         base_page_bytes = page_size * (
             self._full_per_token * self._full_layers_num + self._draft_full_per_token
         )
+        if base_page_bytes <= 0:
+            return 0
         draft_swa_page_bytes = page_size * self._draft_swa_per_token
-        if draft_swa_page_bytes > 0 and self._num_swa_groups > 1:
-            unit_bytes = 8 * (
-                self._num_swa_groups * base_page_bytes + draft_swa_page_bytes
+        if draft_swa_page_bytes <= 0:
+            return (
+                (usable // base_page_bytes) // self._align_pages
+            ) * self._align_pages
+
+        def unit_cost(units: int) -> int:
+            if units <= 0:
+                return 0
+            n_phys = units * self._align_pages
+            d_pages = _compute_draft_swa_pages(
+                n_phys,
+                page_size=page_size,
+                num_swa_groups=self._num_swa_groups,
+                sliding_window_size=self._sliding_window_size,
             )
-            return (usable // unit_bytes) * self._align_pages if unit_bytes > 0 else 0
-        page_bytes = base_page_bytes + draft_swa_page_bytes
-        raw_pages = usable // page_bytes if page_bytes > 0 else 0
-        return (raw_pages // self._align_pages) * self._align_pages
+            return n_phys * base_page_bytes + d_pages * draft_swa_page_bytes
+
+        max_units = usable // base_page_bytes // self._align_pages
+        best_units = bisect_right(range(max_units + 1), usable, key=unit_cost) - 1
+        return max(best_units, 0) * self._align_pages
 
     def max_request_tokens(self, shared_tokens: int, page_size: int) -> int:
         """Return the maximum single-request context length that fits in ``shared_tokens``
