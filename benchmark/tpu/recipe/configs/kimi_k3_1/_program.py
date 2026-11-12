@@ -27,4 +27,14 @@ def apply(config: dict) -> dict:
     env["SGLANG_TPU_K3_PROGRAM_PRESHARDED"] = os.environ.get(
         "SGLANG_TPU_K3_PROGRAM_PRESHARDED", "/presharded-k31"
     )
+    if "prefill_sparse=1" in (env.get("SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG") or ""):
+        sparse_prefill_memory(config)
+    return config
+
+
+def sparse_prefill_memory(config: dict) -> dict:
+    """The sparse prefill's largest window program reserves ~8.9 GiB of HBM
+    scratch (dense: ~1.3 GiB less): a smaller KV budget leaves it room."""
+    args = config["server_args"]
+    args["mem_fraction_static"] = min(args.get("mem_fraction_static", 0.92), 0.90)
     return config
