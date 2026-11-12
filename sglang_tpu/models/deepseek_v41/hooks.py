@@ -352,7 +352,9 @@ def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
     num_real = num_tokens
     ends = starts + lens
     t = torch.arange(num_real, device=input_ids.device, dtype=i32)
-    row = (t.unsqueeze(-1) >= ends.unsqueeze(0)).sum(-1).clamp(max=bs - 1).to(i32)
+    # Bucket-padding requests have zero length (end 0) and must not count.
+    passed = (t.unsqueeze(-1) >= ends.unsqueeze(0)) & (lens > 0).unsqueeze(0)
+    row = passed.sum(-1).clamp(max=bs - 1).to(i32)
     if forward_batch.engram_history is not None:
         history = forward_batch.engram_history
     else:
