@@ -39,7 +39,7 @@ from sglang_tpu.compilation.recompilation_checker import (
 from sglang_tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
 )
-from sglang_tpu.dflash_utils_tpu import build_dflash_draft_block
+from sglang_tpu.dflash_utils_tpu import build_dflash_draft_block, pad_tensor_on_host
 from sglang_tpu.envs import envs as tpu_envs
 
 logger = get_logger(__name__)
@@ -325,7 +325,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         return tuple(t[:logical_bs] if t is not None else None for t in results)
 
     def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
-        """Skip the output trim while a deferred verify still needs padded rows."""
+        """Skip the output trim while a deferred verify or extend KV write needs padded rows."""
         spec_info = forward_batch.spec_info
         if (
             forward_batch.forward_mode.is_target_verify()
@@ -339,7 +339,20 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             if real_q is not None and real_b is not None:
                 _restore_forward_batch_inputs(forward_batch, real_q, real_b)
             return outputs
-        return super().finalize_forward_batch(outputs, forward_batch)
+        keep_extend_hidden_padded = (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            and getattr(forward_batch, "capture_hidden_mode", None)
+            == CaptureHiddenMode.FULL
+            and getattr(forward_batch, "mix_verify_width", 1) <= 1
+            and not getattr(forward_batch, "return_hidden_states_before_norm", False)
+            and getattr(getattr(self, "_dflash_worker", None), "lilicorr", None) is None
+            and isinstance(getattr(outputs, "hidden_states", None), torch.Tensor)
+        )
+        padded_hidden = outputs.hidden_states if keep_extend_hidden_padded else None
+        outputs = super().finalize_forward_batch(outputs, forward_batch)
+        if padded_hidden is not None:
+            outputs.hidden_states = padded_hidden
+        return outputs
 
     def _ensure_block_embedder(
         self, dflash_worker: DFlashWorkerV2 | None = None
@@ -439,10 +452,26 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         # Fixed dtypes: warmup compiled exactly these, and guard skipping after warmup
         # would not catch a dtype change.
         return self._compiled_draft_block(
-            bonus_tokens=bonus_tokens.to(torch.long),
-            prefix_lens=prefix_lens.to(torch.long),
-            candidates=candidates.to(torch.long),
-            committed_lens=committed_lens.to(torch.long),
+            bonus_tokens=(
+                bonus_tokens
+                if bonus_tokens.dtype == torch.long
+                else bonus_tokens.to(torch.long)
+            ),
+            prefix_lens=(
+                prefix_lens
+                if prefix_lens.dtype == torch.long
+                else prefix_lens.to(torch.long)
+            ),
+            candidates=(
+                candidates
+                if candidates.dtype == torch.long
+                else candidates.to(torch.long)
+            ),
+            committed_lens=(
+                committed_lens
+                if committed_lens.dtype == torch.long
+                else committed_lens.to(torch.long)
+            ),
             block_pos_offsets=block_pos_offsets,
         )
 
@@ -564,8 +593,14 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         if pad_num_tokens > num_tokens:
             pad_count = pad_num_tokens - num_tokens
             target_hidden = torch.nn.functional.pad(target_hidden, (0, 0, 0, pad_count))
-            positions = torch.nn.functional.pad(positions, (0, pad_count))
-            cache_loc = torch.nn.functional.pad(cache_loc, (0, pad_count))
+            if positions.device.type == "tpu":
+                positions = pad_tensor_on_host(positions, pad_num_tokens)
+            else:
+                positions = torch.nn.functional.pad(positions, (0, pad_count))
+            if cache_loc.device.type == "tpu":
+                cache_loc = pad_tensor_on_host(cache_loc, pad_num_tokens)
+            else:
+                cache_loc = torch.nn.functional.pad(cache_loc, (0, pad_count))
         return target_hidden, cache_loc, positions, None, None
 
     def append_target_hidden_to_draft_kv_by_loc_tpu(
@@ -597,6 +632,17 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             cache_loc_2d,
             commit_lens,
         ) = padded
+
+        # Fixed dtypes: warmup compiles int64 locations/positions (and int32
+        # commit_lens), whereas dense-only models pass int32 cache_loc.
+        if cache_loc.dtype != torch.int64:
+            cache_loc = cache_loc.to(torch.int64)
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+        if cache_loc_2d is not None and cache_loc_2d.dtype != torch.int64:
+            cache_loc_2d = cache_loc_2d.to(torch.int64)
+        if commit_lens is not None and commit_lens.dtype != torch.int32:
+            commit_lens = commit_lens.to(torch.int32)
 
         with torch.no_grad():
             if self._compiled_kv_appender is None:
@@ -790,7 +836,6 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         target_hidden_size = self.dflash_target_hidden_size
         device = self.model_runner.device
         dtype = self.model_runner.dtype
-        cache_loc_dtype = self._dummy_out_cache_loc_dtype(ForwardMode.TARGET_VERIFY)
         logger.info(
             "[spec compile policy] %s DRAFT APPEND KV (VERIFY): %d shapes (bs=%s, draft_token_num=%d)",
             self.algo_label,
@@ -804,10 +849,10 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             target_hidden = torch.zeros(
                 (num_tokens, target_hidden_size), dtype=dtype, device=device
             )
-            cache_loc = torch.zeros((num_tokens,), dtype=cache_loc_dtype, device=device)
+            cache_loc = torch.zeros((num_tokens,), dtype=torch.int64, device=device)
             positions = torch.zeros((num_tokens,), dtype=torch.int64, device=device)
             cache_loc_2d = torch.zeros(
-                (bs, draft_token_num), dtype=cache_loc_dtype, device=device
+                (bs, draft_token_num), dtype=torch.int64, device=device
             )
             commit_lens = torch.zeros((bs,), dtype=torch.int32, device=device)
             self.append_target_hidden_to_draft_kv_by_loc_tpu(
@@ -839,14 +884,14 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         target_hidden_size = self.dflash_target_hidden_size
         device = self.model_runner.device
         dtype = self.model_runner.dtype
-        # Extend feeds batch.out_cache_loc straight from the live KV allocator.
-        cache_loc_dtype = self._dummy_out_cache_loc_dtype(ForwardMode.EXTEND)
 
+        # append_target_hidden_to_draft_kv_by_loc_tpu normalizes cache_loc to
+        # int64 before entering _compiled_kv_appender.
         def run(num_tokens: int) -> str:
             target_hidden = torch.zeros(
                 (num_tokens, target_hidden_size), dtype=dtype, device=device
             )
-            cache_loc = torch.zeros((num_tokens,), dtype=cache_loc_dtype, device=device)
+            cache_loc = torch.zeros((num_tokens,), dtype=torch.int64, device=device)
             positions = torch.zeros((num_tokens,), dtype=torch.int64, device=device)
             self.append_target_hidden_to_draft_kv_by_loc_tpu(
                 target_hidden=target_hidden,

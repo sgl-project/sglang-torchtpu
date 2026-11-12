@@ -104,10 +104,40 @@ from sglang_tpu.dflash_utils_tpu import (
     build_tpu_draft_extend_metadata,
     dflash_verify_argmax_torch,
     dflash_verify_bookkeeping_torch,
+    pad_tensor_on_host,
 )
 
 _is_npu = is_npu()
 _is_tpu = is_tpu()
+
+
+def _build_cpu_extend_positions(
+    prefix_lens: List[int] | torch.Tensor,
+    extend_lens: List[int] | torch.Tensor,
+    padded_num_tokens: int,
+) -> torch.Tensor:
+    """Build int64 prompt token positions on CPU, zero-padded to padded_num_tokens."""
+    prefix_list = (
+        prefix_lens.tolist()
+        if isinstance(prefix_lens, torch.Tensor)
+        else [int(x) for x in prefix_lens]
+    )
+    extend_list = (
+        extend_lens.tolist()
+        if isinstance(extend_lens, torch.Tensor)
+        else [int(x) for x in extend_lens]
+    )
+    total_real_tokens = sum(extend_list)
+    output_num_tokens = max(int(padded_num_tokens), total_real_tokens)
+    positions_cpu = torch.zeros(output_num_tokens, dtype=torch.int64, device="cpu")
+    offset = 0
+    for prefix_len, extend_len in zip(prefix_list, extend_list):
+        if extend_len > 0:
+            positions_cpu[offset : offset + extend_len] = torch.arange(
+                prefix_len, prefix_len + extend_len, dtype=torch.int64
+            )
+            offset += extend_len
+    return positions_cpu
 
 
 if TYPE_CHECKING:
@@ -598,6 +628,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
         )
+        self._num_token_non_padded_cache: dict[int, torch.Tensor] = {}
         self._draft_greedy_gathered_max_buf: torch.Tensor | None = None
         self._draft_greedy_gathered_ids_buf: torch.Tensor | None = None
         self._draft_greedy_gather_cap: int = 0
@@ -1076,6 +1107,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             b_bucketer = self.model_runner.compile_policy.b_bucketer
             return int(b_bucketer.next_bucket(int(bs)))
         return int(bs)
+
+    def _get_num_token_non_padded_tensor(self, num_tokens: int) -> torch.Tensor:
+        key = int(num_tokens)
+        cached = self._num_token_non_padded_cache.get(key)
+        if cached is None:
+            cached = torch.tensor(key, dtype=torch.int32, device=self.device)
+            self._num_token_non_padded_cache[key] = cached
+        return cached
 
     def ensure_embed_module(self) -> torch.nn.Module:
         """Resolve and cache the embedding module used to embed drafted blocks."""
@@ -2695,27 +2734,43 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
-
             if batch.out_cache_loc is None:
                 raise RuntimeError(
                     "DFLASH prefill expected out_cache_loc, but got None."
                 )
-            positions, _ = compute_position(
-                self.model_runner.prefill_attention_backend_str,
-                draft_seq_lens,
-                ctx_lens,
-                int(sum(batch.extend_lens)),
-            )
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=target_hidden,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-                extend_lens=ctx_lens,
-            )
+            if device.type == "tpu" and self.lilicorr is None:
+                padded_num_tokens = int(target_hidden.shape[0])
+                positions = _build_cpu_extend_positions(
+                    batch.prefix_lens, batch.extend_lens, padded_num_tokens
+                ).to(device, non_blocking=True)
+                extend_cache_loc = pad_tensor_on_host(
+                    batch.out_cache_loc, padded_num_tokens
+                )
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=target_hidden,
+                    cache_loc=extend_cache_loc,
+                    positions=positions,
+                    extend_lens=None,
+                )
+            else:
+                ctx_lens = torch.tensor(
+                    batch.extend_lens, dtype=torch.int32, device=device
+                )
+                draft_seq_lens = torch.tensor(
+                    batch.prefix_lens, dtype=torch.int32, device=device
+                )
+                positions, _ = compute_position(
+                    self.model_runner.prefill_attention_backend_str,
+                    draft_seq_lens,
+                    ctx_lens,
+                    int(sum(batch.extend_lens)),
+                )
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=target_hidden,
+                    cache_loc=batch.out_cache_loc,
+                    positions=positions,
+                    extend_lens=ctx_lens,
+                )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -2992,7 +3047,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             **extend_split,
             num_token_non_padded=(
-                torch.tensor(bs * block_size, dtype=torch.int32, device=device)
+                self._get_num_token_non_padded_tensor(bs * block_size)
                 if enable_num_token_non_padded()
                 else None
             ),
