@@ -677,18 +677,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         ctx = _resolve_full_loop_context(batch)
 
-        if not (
-            current_platform.is_cuda()
-            or current_platform.is_hip()
-            or current_platform.is_cpu()
-            or current_platform.is_mps()
-            or current_platform.is_npu()
-            or current_platform.is_xpu()
-        ):
-            raise RuntimeError(
-                "MiniMax H3 full-loop denoise requires CPU, CUDA, ROCm, MPS, XPU, or Ascend NPU"
-            )
-
+        # The full loop uses native Torch operations on the selected platform.
         device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
