@@ -1,0 +1,20 @@
+{
+  "want": {
+    "torch_tpu": "0.2.1.dev20261028201649",
+    "tpu-sync-torch": "0.0.1.dev20261031081414",
+    "libtpu": "0.0.50",
+    "torch": "2.11.0",
+    "torchvision": "0.26.0",
+    "jax": "0.11.2",
+    "jaxlib": "0.11.2"
+  },
+  "got": {
+    "torch_tpu": "0.2.1.dev20261028201649",
+    "tpu-sync-torch": "0.0.1.dev20261031081414",
+    "libtpu": "0.0.50",
+    "torch": "2.11.0+cpu",
+    "torchvision": "0.26.0+cpu",
+    "jax": "0.11.2",
+    "jaxlib": "0.11.2"
+  }
+}
