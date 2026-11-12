@@ -122,6 +122,29 @@ def make_dflash_verify_bookkeeping_args(
     )
 
 
+def make_dflash_simulated_verify_bookkeeping_args(
+    context: SpecOpWarmupContext,
+) -> tuple[torch.Tensor, ...]:
+    return (
+        torch.zeros(
+            (context.physical_bs, context.num_verify_tokens),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.zeros(
+            (context.physical_bs, context.num_verify_tokens),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.zeros(
+            (context.physical_bs,),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.ones((1,), dtype=torch.int32, device=context.device),
+    )
+
+
 def make_dflash_verify_cache_locs_args(
     context: SpecOpWarmupContext,
 ) -> tuple[torch.Tensor | int, ...]:

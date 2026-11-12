@@ -21,6 +21,7 @@ from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.kernels.distributed_topk import SUPPORTED_WORLD_SIZES
 from sglang_tpu.spec_op_warmup import (
+    make_dflash_simulated_verify_bookkeeping_args,
     make_dflash_verify_argmax_args,
     make_dflash_verify_bookkeeping_args,
     make_dflash_verify_cache_locs_args,
@@ -211,6 +212,54 @@ def dflash_verify_bookkeeping_torch(
     bonus_mask = col_idx == accept_len_2d
     bonus = torch.where(
         bonus_mask,
+        target_predict,
+        torch.zeros_like(target_predict),
+    ).sum(dim=1)
+
+    draft_tokens = torch.zeros_like(candidates)
+    if block_size > 1:
+        draft_tokens[:, :-1] = candidates[:, 1:]
+    out_tokens = torch.where(
+        col_idx < accept_len_2d,
+        draft_tokens,
+        torch.where(
+            col_idx == accept_len_2d,
+            target_predict,
+            torch.zeros_like(candidates),
+        ),
+    ).to(torch.int64)
+
+    return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
+
+
+@compiled_op(warmup=make_dflash_simulated_verify_bookkeeping_args)
+def dflash_simulated_verify_bookkeeping_torch(
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    forced_commit_len_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused DFlash simulated-acceptance bookkeeping on TPU (`real-draft-token`).
+
+    Avoids host-syncing or running 8 eager overwrite ops per step when
+    `SGLANG_SIMULATE_ACC_LEN` is enabled on TPU.
+    """
+    bs, block_size = candidates.shape
+    device = candidates.device
+
+    forced_commit_scalar = (
+        forced_commit_len_tensor.reshape(1).clamp(1, block_size).to(torch.int32)
+    )
+    commit_lens = (
+        torch.zeros((bs,), dtype=torch.int32, device=device) + forced_commit_scalar
+    )
+    accept_len = commit_lens - 1
+    new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+
+    col_idx = torch.arange(block_size, device=device).unsqueeze(0)
+    accept_len_2d = accept_len.to(torch.int64).unsqueeze(1)
+    bonus = torch.where(
+        col_idx == accept_len_2d,
         target_predict,
         torch.zeros_like(target_predict),
     ).sum(dim=1)
