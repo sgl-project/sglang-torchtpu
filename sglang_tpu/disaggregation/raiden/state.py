@@ -20,6 +20,7 @@ class PrefillState:
     # The pages of send_blocks, for the repeated-page check.
     send_block_set: Dict[int, Set[int]] = field(default_factory=dict)
     send_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
+    send_draft_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
     # Committed state row/pages of the room, on the state engine.
     send_state_rows: Dict[int, List[int]] = field(default_factory=dict)
     send_state_meta: Dict[int, bytes] = field(default_factory=dict)
@@ -77,13 +78,16 @@ class DecodeState:
     # Local and remote page ids, endpoints, and aux slots, keyed by room.
     local_blocks: Dict[int, List[int]] = field(default_factory=dict)
     local_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
+    local_draft_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
     local_state_rows: Dict[int, List[int]] = field(default_factory=dict)
     decode_aux_index: Dict[int, int] = field(default_factory=dict)
     remote_blocks: Dict[int, List[int]] = field(default_factory=dict)
     remote_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
+    remote_draft_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
     remote_state_rows: Dict[int, List[int]] = field(default_factory=dict)
     remote_endpoint: Dict[int, str] = field(default_factory=dict)
     remote_swa_endpoint: Dict[int, str] = field(default_factory=dict)
+    remote_draft_endpoint: Dict[int, str] = field(default_factory=dict)
     remote_state_endpoint: Dict[int, str] = field(default_factory=dict)
 
     # Announcement time by read id; expired reads must never be issued.

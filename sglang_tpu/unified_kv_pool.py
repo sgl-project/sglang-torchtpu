@@ -418,10 +418,6 @@ def _unsupported_reason(kvc) -> Optional[str]:
         ),
         (dflash_reason is not None, dflash_reason or ""),
         (
-            not spec_algo.is_none() and disagg_mode != "null",
-            "does not yet support speculative draft KV caches with PD disaggregation.",
-        ),
-        (
             draft_mc is not None
             and not (
                 isinstance(draft_pool_cls, type)
