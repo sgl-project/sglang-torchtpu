@@ -171,7 +171,9 @@ runtime_env.update(
             "1:32:3,33:128:0" if ATTENTION_DP == 2 else "1:1:7,2:16:3,17:64:0",
         ),
         "SGLANG_TPU_K3_PROGRAM_ATTENTION_DP": str(ATTENTION_DP),
-        "SGLANG_TPU_K3_PROGRAM_DP_ROW_SHARE": os.environ.get("K3_PROGRAM_DP_ROW_SHARE", "0.5"),
+        "SGLANG_TPU_K3_PROGRAM_DP_ROW_SHARE": os.environ.get(
+            "K3_PROGRAM_DP_ROW_SHARE", "0.5"
+        ),
         # Overlap scheduling: the decode program's next step launches while
         # the scheduler processes the last one's tokens.
         "SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP": os.environ.get("K3_PROGRAM_OVERLAP", "1"),

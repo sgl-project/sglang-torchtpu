@@ -19,7 +19,9 @@ def apply(config: dict) -> dict:
     env = config["runtime_env"]
     if env.get("SGLANG_TPU_K3_PROGRAM_ATTENTION_DP", "1") != "1":
         # The DSA indexer gathers its 32 query heads over a DCP32 group.
-        raise ValueError("Kimi-K3.1 on the K3 programs decodes with attention DP1 (DCP32)")
+        raise ValueError(
+            "Kimi-K3.1 on the K3 programs decodes with attention DP1 (DCP32)"
+        )
     env["SGLANG_TPU_K3_PROGRAM_DRAFT"] = DRAFT
     env["SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS"] = os.environ.get(
         "K3_PROGRAM_SIMULATE_ACC_LENGTHS", ACC_LENGTHS

@@ -34,7 +34,9 @@ logger = init_logger(__name__)
 # (entering layer 12 b), the first op's tap (3), and each pair p's input,
 # middle and tap (8p + 4, 8p + 8, 8p + 10; 92 the final layer's input).
 PAIRS = 11
-STREAM_LAYERS = frozenset({3, 4 + 8 * PAIRS} | {8 * p + d for p in range(PAIRS) for d in (4, 8, 10)})
+STREAM_LAYERS = frozenset(
+    {3, 4 + 8 * PAIRS} | {8 * p + d for p in range(PAIRS) for d in (4, 8, 10)}
+)
 
 
 def stream_source(layer: int) -> str:
@@ -43,7 +45,9 @@ def stream_source(layer: int) -> str:
         return "block"
     if layer in STREAM_LAYERS:
         return "entering"
-    raise NotImplementedError(f"the K3 prefill keeps no residual stream entering layer {layer}")
+    raise NotImplementedError(
+        f"the K3 prefill keeps no residual stream entering layer {layer}"
+    )
 
 
 class PrefillDraftLatents:
@@ -171,16 +175,23 @@ class PrefillDraftLatents:
             import jax
             import jax.numpy as jnp
 
-            taps, (context_proj, kv_a, kv_norm, context_norm, rope, positions, inverse) = (
-                args[: len(kept)], args[len(kept):])
+            (
+                taps,
+                (context_proj, kv_a, kv_norm, context_norm, rope, positions, inverse),
+            ) = (args[: len(kept)], args[len(kept) :])
             rank = jax.lax.axis_index(axis)
             local = blocks.shape[2]
             own = jnp.maximum(
                 jax.lax.dynamic_slice_in_dim(positions, rank * local, local), 0
             )
             streams = {layer: tap[0] for layer, tap in zip(kept, taps)}
-            streams.update({layer: blocks[0, layer // 12] for layer in c.aux_layers
-                            if stream_source(layer) == "block"})
+            streams.update(
+                {
+                    layer: blocks[0, layer // 12]
+                    for layer in c.aux_layers
+                    if stream_source(layer) == "block"
+                }
+            )
             features = jnp.concatenate(
                 [streams[layer] for layer in c.aux_layers], axis=-1
             )  # [local, 35840]
@@ -225,7 +236,12 @@ class PrefillDraftLatents:
         return self._ops[key]
 
     def latents(
-        self, window: int, blocks, entering: dict, positions: np.ndarray, order: np.ndarray
+        self,
+        window: int,
+        blocks,
+        entering: dict,
+        positions: np.ndarray,
+        order: np.ndarray,
     ):
         """The window's draft latents ``[1, layers, W, 576]`` (window order, every
         rank): ``positions`` the window rows' positions in window order (-1:
@@ -233,8 +249,11 @@ class PrefillDraftLatents:
         inverse = np.argsort(order).astype(np.int32)
         (latents,) = self._latents_op(window)(
             blocks,
-            *(entering[layer] for layer in self.config.aux_layers
-              if stream_source(layer) == "entering"),
+            *(
+                entering[layer]
+                for layer in self.config.aux_layers
+                if stream_source(layer) == "entering"
+            ),
             *(
                 self.weights[n]
                 for n in ("context_proj", "kv_a", "kv_norm", "context_norm", "rope")

@@ -85,7 +85,9 @@ class Config:
             }
             for name, expected in supported.items():
                 if dsa.get(name, expected) != expected:
-                    raise ValueError(f"Unsupported K3.1 DSA setting {name}={dsa.get(name)!r}")
+                    raise ValueError(
+                        f"Unsupported K3.1 DSA setting {name}={dsa.get(name)!r}"
+                    )
             if sorted(dsa["dsa_layers"]) != full:
                 raise ValueError("K3.1 DSA must index every full-attention (MLA) layer")
         return cls(
@@ -159,7 +161,9 @@ def kda_step(qkv, raw_gate, beta, output_gate, conv, state, w, c):
     prediction = jnp.einsum("hk,hkv->hv", k, state, precision=jax.lax.Precision.HIGHEST)
     delta = jax.nn.sigmoid(beta.astype(jnp.float32))[:, None] * (v - prediction)
     state += k[..., None] * delta[:, None, :]
-    out = jnp.einsum("hk,hkv->hv", q, state, precision=jax.lax.Precision.HIGHEST).astype(qkv.dtype)
+    out = jnp.einsum(
+        "hk,hkv->hv", q, state, precision=jax.lax.Precision.HIGHEST
+    ).astype(qkv.dtype)
     out = rms(out, w["out_norm"], c.eps) * sigmoid(output_gate)
     return out, history[1:], state
 
@@ -167,7 +171,9 @@ def kda_step(qkv, raw_gate, beta, output_gate, conv, state, w, c):
 def unpack_mxfp4(packed, scales):
     """[K/8,N] u32 low-nibble-first storage, [K/32,N] E8M0 scales."""
     shifts = jnp.arange(8, dtype=jnp.uint32) * 4
-    codes = ((packed[:, None, :] >> shifts[None, :, None]) & 15).reshape(-1, packed.shape[-1])
+    codes = ((packed[:, None, :] >> shifts[None, :, None]) & 15).reshape(
+        -1, packed.shape[-1]
+    )
     magnitudes = jnp.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], jnp.float32)
     values = magnitudes[codes & 7] * jnp.where(codes & 8, -1, 1)
     scale = jax.lax.bitcast_convert_type(scales.astype(jnp.uint32) << 23, jnp.float32)

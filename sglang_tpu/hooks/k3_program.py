@@ -409,7 +409,9 @@ def k3_program_dp_prealloc(original, queue: Any, req: Any, *args, **kwargs):
     return kv_loc
 
 
-def k3_program_dp_transfer_rows(original, queue: Any, decode_req: Any, kv_indices, page_size):
+def k3_program_dp_transfer_rows(
+    original, queue: Any, decode_req: Any, kv_indices, page_size
+):
     """AROUND DecodePreallocQueue._transfer_page_indices."""
     pages = original(queue, decode_req, kv_indices, page_size)
     allocator = _dp_allocator(queue)
@@ -462,7 +464,9 @@ def dp_group_room(running, waiting, group_of, cap: int):
     return take, held
 
 
-def k3_program_dp_group_cap(original, scheduler: Any, running_batch: Any, *args, **kwargs):
+def k3_program_dp_group_cap(
+    original, scheduler: Any, running_batch: Any, *args, **kwargs
+):
     """AROUND SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch: a
     P/D DP2 decode starts a transferred request only while its group has
     room (half the running requests), as groups are fixed at prealloc."""
@@ -474,7 +478,10 @@ def k3_program_dp_group_cap(original, scheduler: Any, running_batch: Any, *args,
     cap = -(-int(scheduler.max_running_requests) // 2)
     running = list(getattr(running_batch, "reqs", None) or ())
     take, held = dp_group_room(
-        running, list(scheduler.waiting_queue), lambda r: allocator.request_group.get(r.rid), cap
+        running,
+        list(scheduler.waiting_queue),
+        lambda r: allocator.request_group.get(r.rid),
+        cap,
     )
     if not held:
         return original(scheduler, running_batch, *args, **kwargs)
@@ -507,7 +514,9 @@ def k3_program_hicache_layout(original, server_args: Any, *args, **kwargs):
             f"not {cfg.hicache_io_backend!r}"
         )
     if cfg.hicache_mem_layout != "page_first_fused":
-        raise ValueError("K3_PROGRAM's host tier needs --hicache-mem-layout page_first_fused")
+        raise ValueError(
+            "K3_PROGRAM's host tier needs --hicache-mem-layout page_first_fused"
+        )
     if cfg.hicache_storage_backend is not None:
         raise ValueError("K3_PROGRAM's host tier has no L3 storage path")
     return None

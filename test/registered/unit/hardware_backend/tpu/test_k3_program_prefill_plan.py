@@ -19,8 +19,8 @@ if "torch_tpu" not in sys.modules:
         "torch_tpu._internal.pallas.pallas",
     ):
         sys.modules.setdefault(name, types.ModuleType(name))
-    sys.modules["torch_tpu._internal.pallas.pallas"].__getattr__ = (
-        lambda attr: mock.MagicMock(name=attr)
+    sys.modules["torch_tpu._internal.pallas.pallas"].__getattr__ = lambda attr: (
+        mock.MagicMock(name=attr)
     )
 
 from sglang_tpu.k3_programs.kimi_k3.prefill import plan_pieces, skips_step  # noqa: E402
@@ -34,10 +34,14 @@ LARGEST = 8192
 
 class TestSkipsStep(CustomTestCase):
     def test_a_step_inside_a_block_that_the_rest_fits_folds(self):
-        self.assertTrue(skips_step(BLOCK, BLOCK + 3000, BLOCK + 3100, BLOCK, LARGEST, BLOCK))
+        self.assertTrue(
+            skips_step(BLOCK, BLOCK + 3000, BLOCK + 3100, BLOCK, LARGEST, BLOCK)
+        )
 
     def test_the_final_step_and_a_completed_block_never_fold(self):
-        self.assertFalse(skips_step(BLOCK, BLOCK + 3100, BLOCK + 3100, BLOCK, LARGEST, BLOCK))
+        self.assertFalse(
+            skips_step(BLOCK, BLOCK + 3100, BLOCK + 3100, BLOCK, LARGEST, BLOCK)
+        )
         self.assertFalse(skips_step(0, BLOCK, BLOCK + 300, 0, LARGEST, BLOCK, ALIGN))
 
     def test_a_tail_cut_folds_even_when_the_rest_exceeds_a_window(self):
@@ -47,13 +51,18 @@ class TestSkipsStep(CustomTestCase):
         self.assertFalse(skips_step(start, cut, prompt, start, LARGEST, BLOCK))
         self.assertTrue(skips_step(start, cut, prompt, start, LARGEST, BLOCK, ALIGN))
         # An earlier stop is not a tail cut: still no fold past one window.
-        self.assertFalse(skips_step(start, cut - ALIGN, prompt, start, LARGEST, BLOCK, ALIGN))
+        self.assertFalse(
+            skips_step(start, cut - ALIGN, prompt, start, LARGEST, BLOCK, ALIGN)
+        )
 
     def test_the_folded_rest_keeps_its_one_checkpoint(self):
         start, prompt = BLOCK, BLOCK + 10_100
         cut = prompt // ALIGN * ALIGN
         pieces = plan_pieces(0, start, prompt, [cut], LARGEST, ALIGN)
-        self.assertEqual([(p.start, p.end) for p in pieces], [(start, start + LARGEST), (start + LARGEST, prompt)])
+        self.assertEqual(
+            [(p.start, p.end) for p in pieces],
+            [(start, start + LARGEST), (start + LARGEST, prompt)],
+        )
         self.assertEqual([p.stop for p in pieces], [None, cut])
 
 

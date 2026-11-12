@@ -54,7 +54,10 @@ def _colocated_dp_share() -> float:
     from sglang_tpu.envs import envs as tpu_envs
     from sglang_tpu.k3_programs.sglang_program import COLOCATED, server_role
 
-    if tpu_envs.SGLANG_TPU_K3_PROGRAM_ATTENTION_DP.get() != 2 or server_role() != COLOCATED:
+    if (
+        tpu_envs.SGLANG_TPU_K3_PROGRAM_ATTENTION_DP.get() != 2
+        or server_role() != COLOCATED
+    ):
         return 0.0
     return float(tpu_envs.SGLANG_TPU_K3_PROGRAM_DP_ROW_SHARE.get())
 

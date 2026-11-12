@@ -164,7 +164,9 @@ def index_block(cache, pattern: bool):
         return torch.zeros((1, *shape), dtype=torch.uint8)
     subpages = cache.tokens_per_block // layout.INDEX_SUBPAGE_TOKENS
     rng = np.random.default_rng(1)
-    keys = (rng.standard_normal((subpages, 32, 4, 128)) * 0.5).astype(ml_dtypes.float8_e4m3fn)
+    keys = (rng.standard_normal((subpages, 32, 4, 128)) * 0.5).astype(
+        ml_dtypes.float8_e4m3fn
+    )
     rows = np.zeros((subpages, layout.INDEX_SUBPAGE_ROWS, 4, 128), np.uint8)
     rows[:, :32] = keys.view(np.uint8)
     rows[:, 32, 0] = 127  # 2^0

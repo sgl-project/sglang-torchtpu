@@ -210,10 +210,8 @@ def block_copier(prefiller):
 def _role_steps(role, program, config, pool):
     """``role``'s steps: its program bound to the unified pools, every op
     compiled."""
-    from sglang_tpu.k3_programs.sglang_worker import DecodeSteps, PrefillSteps
-
     from sglang_tpu.k3_programs import sglang_dp
-    from sglang_tpu.k3_programs.sglang_worker import dp_pages
+    from sglang_tpu.k3_programs.sglang_worker import DecodeSteps, PrefillSteps, dp_pages
 
     plan = pool.plan
     # Attention DP2 (decode only): table entries are DCP16 blocks.
@@ -275,7 +273,9 @@ def _role_steps(role, program, config, pool):
             from sglang_tpu.k3_programs import sglang_worker
 
             steps.dp = None
-            steps.colo = sglang_dp.ColoRows(plan.num_blocks, plan.dp_row_base, plan.dp_rows)
+            steps.colo = sglang_dp.ColoRows(
+                plan.num_blocks, plan.dp_row_base, plan.dp_rows
+            )
             sglang_worker._COLO_STEPS.append(steps)
     return steps
 

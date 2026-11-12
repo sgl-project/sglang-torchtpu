@@ -22,7 +22,10 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from sglang_tpu.k3_programs.kimi_k3.layout import INDEX_SUBPAGE_ROWS, INDEX_SUBPAGE_TOKENS
+from sglang_tpu.k3_programs.kimi_k3.layout import (
+    INDEX_SUBPAGE_ROWS,
+    INDEX_SUBPAGE_TOKENS,
+)
 
 HEAD_DIM = 128
 RECORD = HEAD_DIM + 1  # key bytes, then the scale byte
@@ -42,7 +45,9 @@ def key_records(keys: jax.Array) -> jax.Array:
     (fp8 E4M3 bytes at the UE8M0 scale, then ``exponent + 127``), as
     ``kimi_k3/dsa.quantize_fp8``."""
     x = keys.astype(jnp.float32)
-    bits = jax.lax.bitcast_convert_type(jnp.max(jnp.abs(x), axis=-1, keepdims=True), jnp.int32)
+    bits = jax.lax.bitcast_convert_type(
+        jnp.max(jnp.abs(x), axis=-1, keepdims=True), jnp.int32
+    )
     biased = bits >> 23
     exp = biased - (127 + 8) + ((bits & 0x7FFFFF) > 0x600000).astype(jnp.int32)
     exp = jnp.where(biased == 0, jnp.where(bits == 0, 0, -126), exp)
@@ -53,8 +58,17 @@ def key_records(keys: jax.Array) -> jax.Array:
     return jnp.concatenate([key_bytes, (exp + 127).astype(jnp.uint8)], axis=-1)
 
 
-def commit_index_rows(index_pools, records, block_tables, positions, *, group=32,
-                      owner_table=None, page_tokens=None, global_pages=False):
+def commit_index_rows(
+    index_pools,
+    records,
+    block_tables,
+    positions,
+    *,
+    group=32,
+    owner_table=None,
+    page_tokens=None,
+    global_pages=False,
+):
     """Write each row's new index-key records into the DSA index pools on the
     rank that owns its position (XLA level, inside ``shard_map`` over ``tp``):
     MLA layer ``m``'s record ``records[b, m]`` (uint8 ``[129]``) of the token
@@ -77,8 +91,12 @@ def commit_index_rows(index_pools, records, block_tables, positions, *, group=32
     (key_row, sublane), (scale_row, lane) = record_place(pos % page_tokens)
     for m, pool in enumerate(pools):
         target = jnp.where(owned, blocks, pool.shape[0])
-        pool = pool.at[target, key_row, sublane, :].set(records[:, m, :HEAD_DIM], mode="drop")
-        pools[m] = pool.at[target, scale_row, 0, lane].set(records[:, m, HEAD_DIM], mode="drop")
+        pool = pool.at[target, key_row, sublane, :].set(
+            records[:, m, :HEAD_DIM], mode="drop"
+        )
+        pools[m] = pool.at[target, scale_row, 0, lane].set(
+            records[:, m, HEAD_DIM], mode="drop"
+        )
     return tuple(pools)
 
 
@@ -89,10 +107,14 @@ def index_rows(keys: jax.Array, pages: int) -> jax.Array:
     records = key_records(keys)  # [W, 129]
     subpages = keys.shape[0] // pages // INDEX_SUBPAGE_TOKENS
     key_rows = records[:, :HEAD_DIM].reshape(pages, subpages, 32, 4, HEAD_DIM)
-    scale_rows = jnp.zeros((pages, subpages, 1, 4, HEAD_DIM), jnp.uint8).at[:, :, 0, 0, :].set(
-        records[:, HEAD_DIM].reshape(pages, subpages, INDEX_SUBPAGE_TOKENS))
+    scale_rows = (
+        jnp.zeros((pages, subpages, 1, 4, HEAD_DIM), jnp.uint8)
+        .at[:, :, 0, 0, :]
+        .set(records[:, HEAD_DIM].reshape(pages, subpages, INDEX_SUBPAGE_TOKENS))
+    )
     return jnp.concatenate((key_rows, scale_rows), axis=2).reshape(
-        pages, subpages * INDEX_SUBPAGE_ROWS, 4, HEAD_DIM)
+        pages, subpages * INDEX_SUBPAGE_ROWS, 4, HEAD_DIM
+    )
 
 
 def read_records(pool_row: jax.Array, tokens: int) -> tuple[jax.Array, jax.Array]:
@@ -101,7 +123,10 @@ def read_records(pool_row: jax.Array, tokens: int) -> tuple[jax.Array, jax.Array
     subpages = tokens // INDEX_SUBPAGE_TOKENS
     rows = pool_row.reshape(subpages, INDEX_SUBPAGE_ROWS, 4, HEAD_DIM)
     keys = rows[:, :32].reshape(subpages * INDEX_SUBPAGE_TOKENS, HEAD_DIM)
-    exps = rows[:, 32, 0].reshape(subpages * INDEX_SUBPAGE_TOKENS, 1).astype(jnp.int32) - 127
+    exps = (
+        rows[:, 32, 0].reshape(subpages * INDEX_SUBPAGE_TOKENS, 1).astype(jnp.int32)
+        - 127
+    )
     values = jax.lax.bitcast_convert_type(keys, jnp.float8_e4m3fn).astype(jnp.float32)
     return values, exps
 
@@ -114,16 +139,26 @@ DIGIT_BITS = 4
 CANDIDATES = (1 << DIGIT_BITS) - 1  # thresholds counted per round
 POSITION_BITS = 24
 KEY_SHIFTS = tuple(range(32 - DIGIT_BITS, -1, -DIGIT_BITS))  # 8 rounds
-POSITION_SHIFTS = tuple(range(POSITION_BITS - DIGIT_BITS, -1, -DIGIT_BITS))  # 6 rounds (ties only)
-CHUNK_ROWS = 64  # key rows (of 128 tokens) a counting step reads (from WIDE_CHUNK_BATCH rows)
+POSITION_SHIFTS = tuple(
+    range(POSITION_BITS - DIGIT_BITS, -1, -DIGIT_BITS)
+)  # 6 rounds (ties only)
+CHUNK_ROWS = (
+    64  # key rows (of 128 tokens) a counting step reads (from WIDE_CHUNK_BATCH rows)
+)
 WIDE_CHUNK_BATCH = 64  # below that many rows the count passes read 8 rows a step
 WIDE_CHUNK_ROWS = 128  # below WIDE_CHUNK_MAX_BATCH rows: a long-context row's keys in one step a round
-WIDE_CHUNK_MAX_BATCH = 16  # from 16 rows the decode VMEM is full (the gather finish, weight ring)
+WIDE_CHUNK_MAX_BATCH = (
+    16  # from 16 rows the decode VMEM is full (the gather finish, weight ring)
+)
 # DMA ring depths: a page or chunk step computes little, so several copies stay
 # in flight (one HBM -> VMEM copy is ~0.9 us; a ring of two waits on each).
 PAGE_SLOTS = 4  # index pages (scoring)
-PAGE_SPLIT = 1  # copies an index page is fetched in (its subpages; > 1: more DMAs in flight)
-SCORE_TILE_VREGS = 32  # f32 logits vregs one scoring product may produce (fewer, larger products)
+PAGE_SPLIT = (
+    1  # copies an index page is fetched in (its subpages; > 1: more DMAs in flight)
+)
+SCORE_TILE_VREGS = (
+    32  # f32 logits vregs one scoring product may produce (fewer, larger products)
+)
 KEY_SLOTS = 8  # key chunks (counting, step activity)
 WIDE_BATCH = 64  # from this many rows: rings of 3 and 4 (the decode's VMEM plan)
 # A row holds topk / group selected tokens a rank (64 over DCP32): with at most
@@ -139,7 +174,11 @@ def _scope(name):
     from sglang_tpu.k3_programs.kimi_k3.config import active
 
     config = active()
-    return jax.named_scope(name) if config is not None and config.phase_scopes else contextlib.nullcontext()
+    return (
+        jax.named_scope(name)
+        if config is not None and config.phase_scopes
+        else contextlib.nullcontext()
+    )
 
 
 def chunk_rows(batch: int) -> int:
@@ -150,7 +189,13 @@ def chunk_rows(batch: int) -> int:
 
 def ring_slots(batch: int) -> tuple[int, int]:
     """(page ring, key ring) depths of a ``batch``-row selection."""
-    return (PAGE_SLOTS, KEY_SLOTS) if batch < WIDE_BATCH else (min(PAGE_SLOTS, 3), min(KEY_SLOTS, 4))
+    return (
+        (PAGE_SLOTS, KEY_SLOTS)
+        if batch < WIDE_BATCH
+        else (min(PAGE_SLOTS, 3), min(KEY_SLOTS, 4))
+    )
+
+
 COUNT_ROWS = 16  # candidate sublanes of the count exchange
 BINS = 16  # a round's digit values (DIGIT_BITS = 4)
 _PREFIX, _UPPER, _LOWER, _POSITION, _LIMIT = range(5)  # state rows (lanes: batch rows)
@@ -167,7 +212,9 @@ def gather_finish(batch: int) -> bool:
     from sglang_tpu.k3_programs.kimi_k3.config import active
 
     config = active()
-    return bool(config is not None and config.dsa_gather_finish and batch <= GATHER_MAX_BATCH)
+    return bool(
+        config is not None and config.dsa_gather_finish and batch <= GATHER_MAX_BATCH
+    )
 
 
 def gather_rows(batch: int) -> int:
@@ -270,26 +317,74 @@ class IndexSelect:
     rank computes the in-flight keys alike: ``in_flight``).
     """
 
-    def __init__(self, *, pools, layer, table_ref, pages, page_tokens, group, owner, member, base,
-                 position_ref, new_exp_ref, batch, topk, refs, sequence_rows=1, global_pages=False,
-                 table_row=None):
-        self.pools, self.layer, self.table_ref, self.pages = tuple(pools), layer, table_ref, pages
-        self.T, self.group, self.owner, self.member, self.base = page_tokens, group, owner, member, base
-        self.position_ref, self.new_exp_ref, self.batch, self.topk = position_ref, new_exp_ref, batch, topk
-        self.refs, self.S, self.global_pages, self.table_row = refs, sequence_rows, global_pages, table_row
+    def __init__(
+        self,
+        *,
+        pools,
+        layer,
+        table_ref,
+        pages,
+        page_tokens,
+        group,
+        owner,
+        member,
+        base,
+        position_ref,
+        new_exp_ref,
+        batch,
+        topk,
+        refs,
+        sequence_rows=1,
+        global_pages=False,
+        table_row=None,
+    ):
+        self.pools, self.layer, self.table_ref, self.pages = (
+            tuple(pools),
+            layer,
+            table_ref,
+            pages,
+        )
+        self.T, self.group, self.owner, self.member, self.base = (
+            page_tokens,
+            group,
+            owner,
+            member,
+            base,
+        )
+        self.position_ref, self.new_exp_ref, self.batch, self.topk = (
+            position_ref,
+            new_exp_ref,
+            batch,
+            topk,
+        )
+        self.refs, self.S, self.global_pages, self.table_row = (
+            refs,
+            sequence_rows,
+            global_pages,
+            table_row,
+        )
         self.subpages = page_tokens // INDEX_SUBPAGE_TOKENS
         self.key_rows = refs["keys"].shape[1]  # >= pages * subpages, whole vregs
-        self.page_slots, self.key_slots = refs["page_buf"].shape[0], refs["key_buf"].shape[0]
-        self.chunk = refs["key_buf"].shape[1]  # select_scratch: min(chunk_rows(batch), key_rows)
+        self.page_slots, self.key_slots = (
+            refs["page_buf"].shape[0],
+            refs["key_buf"].shape[0],
+        )
+        self.chunk = refs["key_buf"].shape[
+            1
+        ]  # select_scratch: min(chunk_rows(batch), key_rows)
         # Below WIDE_CHUNK_BATCH rows the count passes read 8 rows a step (select_scratch).
         self.grouped = "group_buf" in refs
         self.groups = -(-batch // 8)
         self.gchunk = refs["group_buf"].shape[1] // 8 if self.grouped else 0
-        self.group_rows = min(8, batch)  # rows a group holds (batches: 1, 2, 4 or multiples of 8)
+        self.group_rows = min(
+            8, batch
+        )  # rows a group holds (batches: 1, 2, 4 or multiples of 8)
         if self.grouped and batch > 8 and batch % 8:
             raise ValueError("grouped index selection: batch <= 8 or a multiple of 8")
         if batch > LANES or self.key_rows % 8 or batch % sequence_rows:
-            raise ValueError("index selection: batch <= 128, key rows in whole vregs, whole sequences")
+            raise ValueError(
+                "index selection: batch <= 128, key rows in whole vregs, whole sequences"
+            )
 
     # ------------------------------------------------------------------ plan
     def plan(self):
@@ -308,9 +403,13 @@ class IndexSelect:
             counts.append(count)
             refs["counts"][b] = count
             refs["chunk_starts"][b] = chunk_start
-            chunk_start = chunk_start + (count * self.subpages + self.chunk - 1) // self.chunk
+            chunk_start = (
+                chunk_start + (count * self.subpages + self.chunk - 1) // self.chunk
+            )
             state = jnp.where((lane == b) & (sub == _LIMIT), limit, state)
-            state = jnp.where((lane == b) & (sub == _LOWER), INT_MAX, state)  # no bin yet
+            state = jnp.where(
+                (lane == b) & (sub == _LOWER), INT_MAX, state
+            )  # no bin yet
             # Scoring steps go by sequence (its rows share their pages): its
             # longest row's page count.
             seq_count = count if b % self.S == 0 else jnp.maximum(seq_count, count)
@@ -343,7 +442,9 @@ class IndexSelect:
                 refs["page_local"][first + j] = j
                 return carry
 
-            return jax.lax.fori_loop(0, refs["page_starts"][seq + 1] - first, one, carry)
+            return jax.lax.fori_loop(
+                0, refs["page_starts"][seq + 1] - first, one, carry
+            )
 
         jax.lax.fori_loop(0, self.batch // self.S, fill_pages, 0)
         if self.grouped:
@@ -351,13 +452,15 @@ class IndexSelect:
             # group's longest row sets the chunk count).
             gstart = jnp.int32(0)
             for g in range(self.groups):
-                rows = counts[8 * g:8 * g + 8]
+                rows = counts[8 * g : 8 * g + 8]
                 longest = rows[0]
                 for c in rows[1:]:
                     longest = jnp.maximum(longest, c)
                 refs["group_rows"][g] = longest * self.subpages
                 refs["gstep_starts"][g] = gstart
-                gstart = gstart + (longest * self.subpages + self.gchunk - 1) // self.gchunk
+                gstart = (
+                    gstart + (longest * self.subpages + self.gchunk - 1) // self.gchunk
+                )
             refs["gstep_starts"][self.groups] = gstart
 
             def fill_groups(g, carry):
@@ -368,7 +471,9 @@ class IndexSelect:
                     refs["gstep_local"][first + j] = j
                     return carry
 
-                return jax.lax.fori_loop(0, refs["gstep_starts"][g + 1] - first, one, carry)
+                return jax.lax.fori_loop(
+                    0, refs["gstep_starts"][g + 1] - first, one, carry
+                )
 
             jax.lax.fori_loop(0, self.groups, fill_groups, 0)
         refs["state"][...] = state
@@ -376,7 +481,9 @@ class IndexSelect:
     # ------------------------------------------------------------------ scoring
     def _w_col(self, w_t_ref, row):
         lane = jax.lax.broadcasted_iota(jnp.int32, w_t_ref.shape, 1)
-        return jnp.sum(jnp.where(lane == row, w_t_ref[...], 0.0), axis=1, keepdims=True)  # [32, 1]
+        return jnp.sum(
+            jnp.where(lane == row, w_t_ref[...], 0.0), axis=1, keepdims=True
+        )  # [32, 1]
 
     def in_flight(self, query, w_t_ref, new_k8_ref):
         """``refs["in_flight"][b, n]``: the key of row ``b``'s sequence's
@@ -389,10 +496,14 @@ class IndexSelect:
             w_col = self._w_col(w_t_ref, b)
             keys = jnp.full((1, LANES), INT_MIN, jnp.int32)
             for n in range(r + 1):
-                key = record_key(q32, new_k8_ref[first + n:first + n + 1, :], w_col,
-                                 self.new_exp_ref[first + n])
+                key = record_key(
+                    q32,
+                    new_k8_ref[first + n : first + n + 1, :],
+                    w_col,
+                    self.new_exp_ref[first + n],
+                )
                 keys = jnp.where(lane == n, key, keys)
-            self.refs["in_flight"][b:b + 1, :] = keys
+            self.refs["in_flight"][b : b + 1, :] = keys
 
     def _block(self, row, local):
         entry = local * self.group + self.member if self.global_pages else local
@@ -408,28 +519,37 @@ class IndexSelect:
         block = self._block(seq * self.S, local)
         rows = self.refs["page_buf"].shape[1] // PAGE_SPLIT
         for index, pool in enumerate(self.pools):
+
             @pl_when(self.layer == index if len(self.pools) > 1 else True)
             def start(pool=pool):
                 for part in range(PAGE_SPLIT):  # one wait covers every part's bytes
                     at = pl_ds(part * rows, rows)
-                    pltpu.make_async_copy(pool.at[block] if PAGE_SPLIT == 1 else pool.at[block, at],
-                                          self.refs["page_buf"].at[slot] if PAGE_SPLIT == 1
-                                          else self.refs["page_buf"].at[slot, at],
-                                          self.refs["page_sems"].at[slot]).start()
+                    pltpu.make_async_copy(
+                        pool.at[block] if PAGE_SPLIT == 1 else pool.at[block, at],
+                        self.refs["page_buf"].at[slot]
+                        if PAGE_SPLIT == 1
+                        else self.refs["page_buf"].at[slot, at],
+                        self.refs["page_sems"].at[slot],
+                    ).start()
 
     def _wait_page(self, step):
         from jax.experimental.pallas import tpu as pltpu
 
         buf = self.refs["page_buf"].at[step % self.page_slots]
-        pltpu.make_async_copy(buf, buf, self.refs["page_sems"].at[step % self.page_slots]).wait()
+        pltpu.make_async_copy(
+            buf, buf, self.refs["page_sems"].at[step % self.page_slots]
+        ).wait()
 
     def _stage_copy(self, slot, row=0, local=0):
         from jax.experimental.pallas import tpu as pltpu
 
         return pltpu.make_async_copy(
             self.refs["stage"].at[slot],
-            self.refs["keys"].at[pl_ds(row, self.S), pl_ds(local * self.subpages, self.subpages)],
-            self.refs["stage_sems"].at[slot])
+            self.refs["keys"].at[
+                pl_ds(row, self.S), pl_ds(local * self.subpages, self.subpages)
+            ],
+            self.refs["stage_sems"].at[slot],
+        )
 
     def score(self, query, w_t_ref, query_rows=None):
         """``query(row)``: the row's fp8 ``[32, 128]`` index query heads
@@ -442,8 +562,12 @@ class IndexSelect:
         refs, T, S = self.refs, self.T, self.S
         sequences = self.batch // S
         if query_rows is None:
-            query_rows = lambda first: (jnp.concatenate([query(first + r) for r in range(S)], axis=0)
-                                        if S > 1 else query(first))
+
+            def query_rows(first):
+                if S > 1:
+                    return jnp.concatenate([query(first + r) for r in range(S)], axis=0)
+                return query(first)
+
         total = refs["page_starts"][sequences]
         for step in range(self.page_slots - 1):
             pl_when(step < total)(lambda step=step: self._page_copy(step))
@@ -454,7 +578,9 @@ class IndexSelect:
             first_row = seq * S
             slot, stage = step % self.page_slots, step % 2
             self._wait_page(step)
-            pl_when(step + self.page_slots - 1 < total)(lambda: self._page_copy(step + self.page_slots - 1))
+            pl_when(step + self.page_slots - 1 < total)(
+                lambda: self._page_copy(step + self.page_slots - 1)
+            )
             pl_when(step >= 2)(lambda: self._stage_copy(stage).wait())
             q = query_rows(first_row)  # [S * 32, 128] fp8
             if S > 1:
@@ -463,7 +589,9 @@ class IndexSelect:
                 @pl_when(local == 0)
                 def _():
                     for r in range(S):
-                        refs["w_rows"][r] = jnp.broadcast_to(self._w_col(w_t_ref, first_row + r), (32, LANES))
+                        refs["w_rows"][r] = jnp.broadcast_to(
+                            self._w_col(w_t_ref, first_row + r), (32, LANES)
+                        )
 
                 w_cols = [refs["w_rows"][r] for r in range(S)]
             else:
@@ -472,34 +600,63 @@ class IndexSelect:
             first = (local * self.group + self.owner) * T  # the page's first position
 
             def subpage_keys(sp):
-                raw = refs["page_buf"][slot, pl_ds(sp * INDEX_SUBPAGE_ROWS, 32)]  # [32, 4, 128] u8
-                return jax.lax.bitcast_convert_type(raw.reshape(INDEX_SUBPAGE_TOKENS, 128), jnp.float8_e4m3fn)
+                raw = refs["page_buf"][
+                    slot, pl_ds(sp * INDEX_SUBPAGE_ROWS, 32)
+                ]  # [32, 4, 128] u8
+                return jax.lax.bitcast_convert_type(
+                    raw.reshape(INDEX_SUBPAGE_TOKENS, 128), jnp.float8_e4m3fn
+                )
 
             def subpage_scale(sp):
-                return _pow2(refs["page_buf"][slot, sp * INDEX_SUBPAGE_ROWS + 32].astype(jnp.int32)[0:1])
+                return _pow2(
+                    refs["page_buf"][slot, sp * INDEX_SUBPAGE_ROWS + 32].astype(
+                        jnp.int32
+                    )[0:1]
+                )
 
             # A product per as many subpages as keep its logits ([S * 32, tokens]
             # f32) within 32 vregs: each product is mostly MXU latency, so fewer
             # and larger ones -- the whole page up to two rows a sequence, two
             # subpages at four, one at eight.
-            per = max(1, min(self.subpages, SCORE_TILE_VREGS * 1024 // (S * 32 * INDEX_SUBPAGE_TOKENS)))
-            parts = [tuple(range(i, min(i + per, self.subpages))) for i in range(0, self.subpages, per)]
+            per = max(
+                1,
+                min(
+                    self.subpages,
+                    SCORE_TILE_VREGS * 1024 // (S * 32 * INDEX_SUBPAGE_TOKENS),
+                ),
+            )
+            parts = [
+                tuple(range(i, min(i + per, self.subpages)))
+                for i in range(0, self.subpages, per)
+            ]
             for part in parts:
-                k8 = jnp.concatenate([subpage_keys(sp) for sp in part], axis=0) if len(part) > 1 \
+                k8 = (
+                    jnp.concatenate([subpage_keys(sp) for sp in part], axis=0)
+                    if len(part) > 1
                     else subpage_keys(part[0])
-                logits = jax.lax.dot_general(q, k8, (((1,), (1,)), ((), ())),
-                                             preferred_element_type=jnp.float32)  # [S * 32 heads, tokens]
+                )
+                logits = jax.lax.dot_general(
+                    q, k8, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+                )  # [S * 32 heads, tokens]
                 scales = [subpage_scale(sp) for sp in part]
                 for r in range(S):
-                    heads = logits[r * 32:(r + 1) * 32]
+                    heads = logits[r * 32 : (r + 1) * 32]
                     w = w_cols[r]
-                    if S > 1 and heads.shape[1] > LANES:  # whole-page product: the lanes repeat
+                    if (
+                        S > 1 and heads.shape[1] > LANES
+                    ):  # whole-page product: the lanes repeat
                         w = jnp.concatenate([w] * (heads.shape[1] // LANES), axis=1)
-                    score = jnp.sum(jnp.maximum(heads, 0.0) * w, axis=0, keepdims=True)  # [1, tokens]
+                    score = jnp.sum(
+                        jnp.maximum(heads, 0.0) * w, axis=0, keepdims=True
+                    )  # [1, tokens]
                     for i, sp in enumerate(part):
                         position = first + sp * INDEX_SUBPAGE_TOKENS + lane_row
-                        piece = score[:, i * INDEX_SUBPAGE_TOKENS:(i + 1) * INDEX_SUBPAGE_TOKENS]
-                        key = jnp.where(position < limits[r], _monotone(piece * scales[i]), INT_MIN)
+                        piece = score[
+                            :, i * INDEX_SUBPAGE_TOKENS : (i + 1) * INDEX_SUBPAGE_TOKENS
+                        ]
+                        key = jnp.where(
+                            position < limits[r], _monotone(piece * scales[i]), INT_MIN
+                        )
                         refs["stage"][stage, r, pl_ds(sp, 1), :] = key
             for r in range(S):
                 self._patch_in_flight(first_row + r, stage, first, r)
@@ -508,7 +665,9 @@ class IndexSelect:
 
         jax.lax.fori_loop(0, total, page_step, 0)
         for back in (1, 2):
-            pl_when(total >= back)(lambda back=back: self._stage_copy((total - back) % 2).wait())
+            pl_when(total >= back)(
+                lambda back=back: self._stage_copy((total - back) % 2).wait()
+            )
 
     def _patch_in_flight(self, row, stage, first, stage_row=0):
         """Keys of the row's sequence's in-flight tokens (up to its own) that
@@ -532,7 +691,10 @@ class IndexSelect:
                     offset = position - lo
                     at = pl_ds(offset // INDEX_SUBPAGE_TOKENS, 1)
                     refs["stage"][stage, stage_row, at, :] = jnp.where(
-                        lane_row == offset % INDEX_SUBPAGE_TOKENS, key, refs["stage"][stage, stage_row, at, :])
+                        lane_row == offset % INDEX_SUBPAGE_TOKENS,
+                        key,
+                        refs["stage"][stage, stage_row, at, :],
+                    )
 
     # ------------------------------------------------------------------ selection
     def _chunk_copy(self, step):
@@ -540,15 +702,19 @@ class IndexSelect:
 
         row, local = self.refs["step_row"][step], self.refs["step_local"][step]
         start = jnp.minimum(local * self.chunk, self.key_rows - self.chunk)
-        pltpu.make_async_copy(self.refs["keys"].at[row, pl_ds(start, self.chunk)],
-                              self.refs["key_buf"].at[step % self.key_slots],
-                              self.refs["key_sems"].at[step % self.key_slots]).start()
+        pltpu.make_async_copy(
+            self.refs["keys"].at[row, pl_ds(start, self.chunk)],
+            self.refs["key_buf"].at[step % self.key_slots],
+            self.refs["key_sems"].at[step % self.key_slots],
+        ).start()
 
     def _wait_chunk(self, step):
         from jax.experimental.pallas import tpu as pltpu
 
         buf = self.refs["key_buf"].at[step % self.key_slots]
-        pltpu.make_async_copy(buf, buf, self.refs["key_sems"].at[step % self.key_slots]).wait()
+        pltpu.make_async_copy(
+            buf, buf, self.refs["key_sems"].at[step % self.key_slots]
+        ).wait()
 
     def _loads(self, first):
         """Whether a key pass copies its chunks: always the selection's first
@@ -570,7 +736,9 @@ class IndexSelect:
         from jax.experimental import pallas as pl
 
         refs, chunk = self.refs, self.chunk
-        assert chunk // 8 <= 16, "8 unrolled vregs, then at most 8 a loop (a 4-bit field each)"
+        assert chunk // 8 <= 16, (
+            "8 unrolled vregs, then at most 8 a loop (a 4-bit field each)"
+        )
         total = refs["chunk_starts"][self.batch]
         load = self._loads(first)
         refs["local"][...] = jnp.zeros((COUNT_ROWS, LANES), jnp.int32)
@@ -584,31 +752,47 @@ class IndexSelect:
         def step_fn(step, bins):
             row, local = refs["step_row"][step], refs["step_local"][step]
             pl_when(load)(lambda: self._wait_chunk(step))
-            pl_when(load & (step + self.key_slots - 1 < total))(lambda: self._chunk_copy(step + self.key_slots - 1))
+            pl_when(load & (step + self.key_slots - 1 < total))(
+                lambda: self._chunk_copy(step + self.key_slots - 1)
+            )
             start = jnp.minimum(local * chunk, self.key_rows - chunk)
             rows_valid = refs["counts"][row] * self.subpages
             bins = [jnp.where(local == 0, 0, a) for a in bins]
             params = params_of(row)
+
             # The step's histogram in two accumulators of eight 4-bit fields
             # (bins 0-7, 8-15; a field holds up to 15): the first 8 vregs
             # unrolled (they overlap the step's fixed work), the rest -- only
             # those holding the row's keys -- one a loop iteration.
             def vreg(v, carry):
                 low, high = carry
-                key = refs["key_buf"][step % self.key_slots, pl_ds(pl.multiple_of(v * 8, 8), 8), :]
+                key = refs["key_buf"][
+                    step % self.key_slots, pl_ds(pl.multiple_of(v * 8, 8), 8), :
+                ]
                 key_row = start + v * 8 + sub8
                 valid = (key_row >= local * chunk) & (key_row < rows_valid)
                 page = key_row // self.subpages
-                position = ((page * self.group + self.owner) * self.T
-                            + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS + lane8)
+                position = (
+                    (page * self.group + self.owner) * self.T
+                    + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS
+                    + lane8
+                )
                 digit, counted = digits(params, key, position, valid)
-                one = jnp.where(counted, jnp.left_shift(jnp.ones_like(digit), (digit & 7) << 2), 0)
+                one = jnp.where(
+                    counted, jnp.left_shift(jnp.ones_like(digit), (digit & 7) << 2), 0
+                )
                 upper = digit >= 8
                 return low + jnp.where(upper, 0, one), high + jnp.where(upper, one, 0)
 
             def unpack(bins, low, high):
-                return [bins[i] + (jax.lax.shift_right_logical(low if i < 8 else high, 4 * (i % 8)) & 15)
-                        for i in range(BINS)]
+                return [
+                    bins[i]
+                    + (
+                        jax.lax.shift_right_logical(low if i < 8 else high, 4 * (i % 8))
+                        & 15
+                    )
+                    for i in range(BINS)
+                ]
 
             zero8 = jnp.zeros((8, LANES), jnp.int32)
             carry = (zero8, zero8)
@@ -617,7 +801,9 @@ class IndexSelect:
             bins = unpack(bins, *carry)
             if chunk // 8 > 8:
                 end_v = (jnp.minimum(rows_valid, (local + 1) * chunk) - start + 7) // 8
-                carry = jax.lax.fori_loop(8, jnp.clip(end_v, 8, chunk // 8), vreg, (zero8, zero8))
+                carry = jax.lax.fori_loop(
+                    8, jnp.clip(end_v, 8, chunk // 8), vreg, (zero8, zero8)
+                )
                 bins = unpack(bins, *carry)
             last = local == (rows_valid + chunk - 1) // chunk - 1
 
@@ -625,14 +811,18 @@ class IndexSelect:
             def column():
                 # Bin sums -> candidate counts (suffix or prefix sums), stacked
                 # into one [16, LANES] block, then a single lane reduction.
-                sums = [jnp.sum(a, axis=0, keepdims=True) for a in bins]  # [1, LANES] each
+                sums = [
+                    jnp.sum(a, axis=0, keepdims=True) for a in bins
+                ]  # [1, LANES] each
                 counts, running = [None] * CANDIDATES, None
-                for j in (range(CANDIDATES) if prefix else range(CANDIDATES - 1, -1, -1)):
+                for j in range(CANDIDATES) if prefix else range(CANDIDATES - 1, -1, -1):
                     term = sums[j] if prefix else sums[j + 1]
                     running = term if running is None else running + term
                     counts[j] = running
                 partial = jnp.concatenate(
-                    counts + [jnp.zeros((COUNT_ROWS - CANDIDATES, LANES), jnp.int32)], axis=0)  # [16, LANES]
+                    counts + [jnp.zeros((COUNT_ROWS - CANDIDATES, LANES), jnp.int32)],
+                    axis=0,
+                )  # [16, LANES]
                 total = jnp.sum(partial, axis=1, keepdims=True)  # [16, 1]
                 refs["local"][...] = jnp.where(lane16 == row, total, refs["local"][...])
 
@@ -650,15 +840,19 @@ class IndexSelect:
         g, local = refs["gstep_group"][step], refs["gstep_local"][step]
         start = jnp.minimum(local * chunk, self.key_rows - chunk)
         for r in range(self.group_rows):
-            pltpu.make_async_copy(refs["keys"].at[8 * g + r, pl_ds(start, chunk)],
-                                  refs["group_buf"].at[step % 2, pl_ds(r * chunk, chunk)],
-                                  refs["group_sems"].at[step % 2]).start()
+            pltpu.make_async_copy(
+                refs["keys"].at[8 * g + r, pl_ds(start, chunk)],
+                refs["group_buf"].at[step % 2, pl_ds(r * chunk, chunk)],
+                refs["group_sems"].at[step % 2],
+            ).start()
 
     def _group_wait(self, step):
         """All of the step's row copies (one wait for their bytes)."""
         from jax.experimental.pallas import tpu as pltpu
 
-        buf = self.refs["group_buf"].at[step % 2, pl_ds(0, self.group_rows * self.gchunk)]
+        buf = self.refs["group_buf"].at[
+            step % 2, pl_ds(0, self.group_rows * self.gchunk)
+        ]
         pltpu.make_async_copy(buf, buf, self.refs["group_sems"].at[step % 2]).wait()
 
     def _count_groups(self, params_of, digits, prefix, first=True):
@@ -688,8 +882,14 @@ class IndexSelect:
             return out
 
         def unpack(bins, low, high):
-            return [bins[i] + (jax.lax.shift_right_logical(low if i < 8 else high, 4 * (i % 8)) & 15)
-                    for i in range(BINS)]
+            return [
+                bins[i]
+                + (
+                    jax.lax.shift_right_logical(low if i < 8 else high, 4 * (i % 8))
+                    & 15
+                )
+                for i in range(BINS)
+            ]
 
         def step_fn(step, bins):
             g, local = refs["gstep_group"][step], refs["gstep_local"][step]
@@ -698,12 +898,22 @@ class IndexSelect:
             start = jnp.minimum(local * chunk, self.key_rows - chunk)
             bins = [jnp.where(local == 0, 0, a) for a in bins]
             rows = [jnp.minimum(8 * g + r, batch - 1) for r in range(8)]
-            limit = column([jnp.where(8 * g + r < batch, refs["counts"][rows[r]] * self.subpages, 0)
-                            for r in range(8)])  # [8, 1] each row's valid key rows
-            params = tuple(jnp.broadcast_to(column(list(p)), (8, LANES))
-                           for p in zip(*(params_of(row) for row in rows)))
+            limit = column(
+                [
+                    jnp.where(
+                        8 * g + r < batch, refs["counts"][rows[r]] * self.subpages, 0
+                    )
+                    for r in range(8)
+                ]
+            )  # [8, 1] each row's valid key rows
+            params = tuple(
+                jnp.broadcast_to(column(list(p)), (8, LANES))
+                for p in zip(*(params_of(row) for row in rows))
+            )
             limit = jnp.broadcast_to(limit, (8, LANES))
-            first_row = local * chunk - start  # the chunk's first new key row in the slot
+            first_row = (
+                local * chunk - start
+            )  # the chunk's first new key row in the slot
             end_row = jnp.minimum(refs["group_rows"][g], (local + 1) * chunk) - start
             slot = refs["group_buf"].at[step % 2]
 
@@ -718,17 +928,30 @@ class IndexSelect:
                     key_row = start + k
                     valid = (k >= first_row) & (key_row < limit)
                     page = key_row // self.subpages
-                    position = ((page * self.group + self.owner) * self.T
-                                + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS + lane8)
+                    position = (
+                        (page * self.group + self.owner) * self.T
+                        + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS
+                        + lane8
+                    )
                     digit, counted = digits(params, key, position, valid)
-                    one = jnp.where(counted, jnp.left_shift(jnp.ones_like(digit), (digit & 7) << 2), 0)
+                    one = jnp.where(
+                        counted,
+                        jnp.left_shift(jnp.ones_like(digit), (digit & 7) << 2),
+                        0,
+                    )
                     upper = digit >= 8
                     low = low + jnp.where(upper, 0, one)
                     high = high + jnp.where(upper, one, 0)
                 return tuple(unpack(bins, low, high))
 
-            bins = list(jax.lax.fori_loop(first_row // 8, jnp.clip((end_row + 7) // 8, 0, chunk // 8),
-                                          block, tuple(bins)))
+            bins = list(
+                jax.lax.fori_loop(
+                    first_row // 8,
+                    jnp.clip((end_row + 7) // 8, 0, chunk // 8),
+                    block,
+                    tuple(bins),
+                )
+            )
             last = local == (refs["group_rows"][g] + chunk - 1) // chunk - 1
 
             @pl_when(last)
@@ -738,14 +961,19 @@ class IndexSelect:
                 # column then to lanes 8 g .. 8 g + 7 of its candidate's sublane.
                 sums = [jnp.sum(a, axis=1, keepdims=True) for a in bins]  # [8, 1] each
                 counts, running = [None] * CANDIDATES, None
-                for j in (range(CANDIDATES) if prefix else range(CANDIDATES - 1, -1, -1)):
+                for j in range(CANDIDATES) if prefix else range(CANDIDATES - 1, -1, -1):
                     term = sums[j] if prefix else sums[j + 1]
                     running = term if running is None else running + term
                     counts[j] = running
                 place = lane8 == 8 * g + sub8
-                rows_out = [jnp.sum(jnp.where(place, c, 0), axis=0, keepdims=True) for c in counts]
+                rows_out = [
+                    jnp.sum(jnp.where(place, c, 0), axis=0, keepdims=True)
+                    for c in counts
+                ]
                 partial = jnp.concatenate(
-                    rows_out + [jnp.zeros((COUNT_ROWS - CANDIDATES, LANES), jnp.int32)], axis=0)
+                    rows_out + [jnp.zeros((COUNT_ROWS - CANDIDATES, LANES), jnp.int32)],
+                    axis=0,
+                )
                 refs["local"][...] = refs["local"][...] + partial
 
             return tuple(bins)
@@ -774,8 +1002,12 @@ class IndexSelect:
             for i in range(k):
                 j = s * k + i
                 if j < COUNT_ROWS:
-                    moved = pltpu_roll(local[j:j + 1], i * self.batch)
-                    row = jnp.where((lane >= i * self.batch) & (lane < (i + 1) * self.batch), moved, row)
+                    moved = pltpu_roll(local[j : j + 1], i * self.batch)
+                    row = jnp.where(
+                        (lane >= i * self.batch) & (lane < (i + 1) * self.batch),
+                        moved,
+                        row,
+                    )
             out.append(row)
         return jnp.concatenate(out, axis=0) if rows > 1 else out[0]
 
@@ -788,7 +1020,7 @@ class IndexSelect:
         out = []
         for j in range(COUNT_ROWS):
             s, i = divmod(j, k)
-            moved = pltpu_roll(packed[s:s + 1], (LANES - i * self.batch) % LANES)
+            moved = pltpu_roll(packed[s : s + 1], (LANES - i * self.batch) % LANES)
             out.append(jnp.where(lane < self.batch, moved, 0))
         return jnp.concatenate(out, axis=0)
 
@@ -799,8 +1031,12 @@ class IndexSelect:
         from jax.experimental.pallas import tpu as pltpu
 
         _, rows = self._packing()
-        others = self.refs["exchange"].at[parity, pl.ds(0, self.group - 1), pl.ds(0, rows)]
-        pltpu.make_async_copy(others, others, self.refs["exchange_sems"].at[0, parity]).wait()
+        others = self.refs["exchange"].at[
+            parity, pl.ds(0, self.group - 1), pl.ds(0, rows)
+        ]
+        pltpu.make_async_copy(
+            others, others, self.refs["exchange_sems"].at[0, parity]
+        ).wait()
 
     def _all_reduce(self, local, parity, pending=False):
         """The counts summed over the group (``pending``: this slot's sends of
@@ -815,21 +1051,31 @@ class IndexSelect:
         mine = refs["exchange"].at[parity, member, pl.ds(0, rows)]
         mine[...] = self._pack(local)
         for peer in range(group):
+
             @pl.when(peer != member)
             def send(peer=peer):
                 pltpu.make_async_remote_copy(
-                    mine, mine, refs["exchange_sems"].at[0, parity], refs["exchange_sems"].at[1, parity],
-                    device_id=(self.base + peer,), device_id_type=pl.DeviceIdType.MESH,
+                    mine,
+                    mine,
+                    refs["exchange_sems"].at[0, parity],
+                    refs["exchange_sems"].at[1, parity],
+                    device_id=(self.base + peer,),
+                    device_id_type=pl.DeviceIdType.MESH,
                 ).start()
+
         others = refs["exchange"].at[parity, pl.ds(0, group - 1), pl.ds(0, rows)]
-        pltpu.make_async_copy(others, others, refs["exchange_sems"].at[1, parity]).wait()
-        total = jnp.sum(refs["exchange"][parity, :, pl.ds(0, rows)], axis=0)  # [rows, LANES]
+        pltpu.make_async_copy(
+            others, others, refs["exchange_sems"].at[1, parity]
+        ).wait()
+        total = jnp.sum(
+            refs["exchange"][parity, :, pl.ds(0, rows)], axis=0
+        )  # [rows, LANES]
         return self._unpack(total)  # [COUNT_ROWS, LANES]
 
     def _row_scalars(self, state_row, name):
         """Lanes ``0 .. B - 1`` of state row ``state_row`` into SMEM
         ``refs[name]`` (one read per row a round, not per chunk step)."""
-        vector = self.refs["state"][state_row:state_row + 1]
+        vector = self.refs["state"][state_row : state_row + 1]
         for b in range(self.batch):
             self.refs[name][b] = _row_scalar(vector, b)
 
@@ -837,6 +1083,7 @@ class IndexSelect:
         """A key round's ``digits`` (see ``_count``): candidate ``j``'s threshold is
         ``base + (j + 1) << shift``; a key's digit is ``(key - base) >> shift``, 15 for
         all above the round's range (``shift`` may be traced)."""
+
         def key_digits(params, key, position, valid):
             (base,) = params
             diff = key - base  # wraps only from 2^31 above base: far above the range
@@ -862,38 +1109,49 @@ class IndexSelect:
         upper = jnp.sum(jnp.where(cand == digit, total, 0), axis=0, keepdims=True)
         lower = jnp.sum(jnp.where(cand == digit - 1, total, 0), axis=0, keepdims=True)
         state = refs["state"]
-        state[_PREFIX:_PREFIX + 1] = state[_PREFIX:_PREFIX + 1] + (digit << shift)  # wraps: unsigned bits
-        state[_UPPER:_UPPER + 1] = jnp.where(digit < CANDIDATES, upper, state[_UPPER:_UPPER + 1])
-        state[_LOWER:_LOWER + 1] = jnp.where(digit >= 1, lower, state[_LOWER:_LOWER + 1])
+        state[_PREFIX : _PREFIX + 1] = state[_PREFIX : _PREFIX + 1] + (
+            digit << shift
+        )  # wraps: unsigned bits
+        state[_UPPER : _UPPER + 1] = jnp.where(
+            digit < CANDIDATES, upper, state[_UPPER : _UPPER + 1]
+        )
+        state[_LOWER : _LOWER + 1] = jnp.where(
+            digit >= 1, lower, state[_LOWER : _LOWER + 1]
+        )
 
     def _tie_update(self, total, shift):
         """Extend every row's tie position floor by the round's digit."""
         refs, topk = self.refs, self.topk
         cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
-        need = topk - refs["state"][_UPPER:_UPPER + 1]
+        need = topk - refs["state"][_UPPER : _UPPER + 1]
         below = ((total < need) & (cand < CANDIDATES)).astype(jnp.int32)
         digit = jnp.sum(below, axis=0, keepdims=True)
-        refs["state"][_POSITION:_POSITION + 1] = refs["state"][_POSITION:_POSITION + 1] + (digit << shift)
+        refs["state"][_POSITION : _POSITION + 1] = refs["state"][
+            _POSITION : _POSITION + 1
+        ] + (digit << shift)
 
     def _key_round(self, shift, parity, pending, first):
         """One distributed key round (``shift`` / ``parity`` may be traced)."""
         refs = self.refs
         self._row_scalars(_PREFIX, "row_prefix")
-        counts = self._count(lambda row: (refs["row_prefix"][row] ^ INT_MIN,), self._key_digits(shift),
-                             first=first)
+        counts = self._count(
+            lambda row: (refs["row_prefix"][row] ^ INT_MIN,),
+            self._key_digits(shift),
+            first=first,
+        )
         total = self._all_reduce(counts, parity, pending=pending)
         self._key_update(total, shift)
 
     def _active_rows(self):
         state = self.refs["state"]
         lane = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
-        return (state[_LIMIT:_LIMIT + 1] > self.topk) & (lane < self.batch)
+        return (state[_LIMIT : _LIMIT + 1] > self.topk) & (lane < self.batch)
 
     def _small(self):
         """Whether every active row's threshold bin holds at most
         ``GATHER_SLOTS`` keys over the group (the same on every rank)."""
         state = self.refs["state"]
-        population = state[_LOWER:_LOWER + 1] - state[_UPPER:_UPPER + 1]
+        population = state[_LOWER : _LOWER + 1] - state[_UPPER : _UPPER + 1]
         return jnp.max(jnp.where(self._active_rows(), population, 0)) <= GATHER_SLOTS
 
     def _extract(self, bits):
@@ -920,16 +1178,26 @@ class IndexSelect:
         def step_fn(step, carry):
             row, local = refs["step_row"][step], refs["step_local"][step]
             self._wait_chunk(step)
-            pl_when(step + self.key_slots - 1 < total)(lambda: self._chunk_copy(step + self.key_slots - 1))
+            pl_when(step + self.key_slots - 1 < total)(
+                lambda: self._chunk_copy(step + self.key_slots - 1)
+            )
             start = jnp.minimum(local * chunk, self.key_rows - chunk)
             rows_valid = refs["counts"][row] * self.subpages
             lo = refs["row_prefix"][row] ^ INT_MIN
 
             def hits(v):
-                key = refs["key_buf"][step % self.key_slots, pl_ds(pl.multiple_of(v * 8, 8), 8), :]
+                key = refs["key_buf"][
+                    step % self.key_slots, pl_ds(pl.multiple_of(v * 8, 8), 8), :
+                ]
                 key_row = start + v * 8 + sub8
                 valid = (key_row >= local * chunk) & (key_row < rows_valid)
-                return key, key_row, valid & (key >= lo) & (jax.lax.shift_right_logical(key - lo, bits) == 0)
+                return (
+                    key,
+                    key_row,
+                    valid
+                    & (key >= lo)
+                    & (jax.lax.shift_right_logical(key - lo, bits) == 0),
+                )
 
             def vreg(v, carry):
                 key, key_row, hit = hits(v)
@@ -938,8 +1206,11 @@ class IndexSelect:
                 @pl_when(n > 0)
                 def take():
                     page = key_row // self.subpages
-                    position = ((page * self.group + self.owner) * self.T
-                                + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS + lane8)
+                    position = (
+                        (page * self.group + self.owner) * self.T
+                        + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS
+                        + lane8
+                    )
 
                     def one(i, mask):
                         idx = jnp.min(jnp.where(mask != 0, flat8, 1 << 20))
@@ -952,7 +1223,9 @@ class IndexSelect:
                         def put():
                             cur = cand[pl_ds(row, 1), :]
                             cur = jnp.where(lane1 == c, k, cur)
-                            cand[pl_ds(row, 1), :] = jnp.where(lane1 == GATHER_SLOTS + c, p, cur)
+                            cand[pl_ds(row, 1), :] = jnp.where(
+                                lane1 == GATHER_SLOTS + c, p, cur
+                            )
 
                         refs["cand_n"][row] = c + 1
                         return jnp.where(at, 0, mask)
@@ -962,11 +1235,17 @@ class IndexSelect:
                 return carry
 
             first_v = (local * chunk - start) // 8
-            end_v = jnp.maximum((jnp.minimum(rows_valid, (local + 1) * chunk) - start + 7) // 8, first_v)
+            end_v = jnp.maximum(
+                (jnp.minimum(rows_valid, (local + 1) * chunk) - start + 7) // 8, first_v
+            )
             # Bin keys are rare (at most GATHER_SLOTS a row over the group): one
             # reduction for the chunk, a per-vreg pass only when it holds any.
-            any_hit = jax.lax.fori_loop(first_v, end_v, lambda v, acc: acc + hits(v)[2].astype(jnp.int32),
-                                        jnp.zeros((8, LANES), jnp.int32))
+            any_hit = jax.lax.fori_loop(
+                first_v,
+                end_v,
+                lambda v, acc: acc + hits(v)[2].astype(jnp.int32),
+                jnp.zeros((8, LANES), jnp.int32),
+            )
 
             @pl_when(jnp.sum(any_hit) > 0)
             def rescan():
@@ -984,12 +1263,18 @@ class IndexSelect:
         refs, group, member = self.refs, self.group, self.member
         gather, sems = refs["gather"], refs["gather_sems"]
         for peer in range(group):
+
             @pl.when(peer != member)
             def send(peer=peer):
                 pltpu.make_async_remote_copy(
-                    refs["cand"], gather.at[member], sems.at[0], sems.at[1],
-                    device_id=(self.base + peer,), device_id_type=pl.DeviceIdType.MESH,
+                    refs["cand"],
+                    gather.at[member],
+                    sems.at[0],
+                    sems.at[1],
+                    device_id=(self.base + peer,),
+                    device_id_type=pl.DeviceIdType.MESH,
                 ).start()
+
         gather[member] = refs["cand"][...]
         others = gather.at[pl.ds(0, group - 1)]
         pltpu.make_async_copy(others, others, sems.at[1]).wait()
@@ -1006,47 +1291,82 @@ class IndexSelect:
         self._extract(32 - DIGIT_BITS * first_round)
         self._exchange_candidates()
         rows = refs["cand"].shape[0]
-        gathered = refs["gather"][:self.group]  # the buffer may have room for a larger group
+        gathered = refs["gather"][
+            : self.group
+        ]  # the buffer may have room for a larger group
         lane = jax.lax.broadcasted_iota(jnp.int32, gathered.shape, 2)
         keys = gathered
-        positions = pltpu_roll(gathered, LANES - GATHER_SLOTS)  # position lanes onto their keys
+        positions = pltpu_roll(
+            gathered, LANES - GATHER_SLOTS
+        )  # position lanes onto their keys
         live = (lane < GATHER_SLOTS) & (positions >= 0)
         state = refs["state"]
         sub = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0)
         lane1 = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
-        upper = jnp.zeros((rows, 1), jnp.int32)  # the keys above the bin, a row a sublane
+        upper = jnp.zeros(
+            (rows, 1), jnp.int32
+        )  # the keys above the bin, a row a sublane
         for b in range(self.batch):
-            upper = jnp.where(sub == b, _row_scalar(state[_UPPER:_UPPER + 1], b), upper)
+            upper = jnp.where(
+                sub == b, _row_scalar(state[_UPPER : _UPPER + 1], b), upper
+            )
         need = topk - upper
 
-        def pick(i, carry):  # the rows' (i + 1)-th candidates in key order, ties by position
+        def pick(
+            i, carry
+        ):  # the rows' (i + 1)-th candidates in key order, ties by position
             left, tau, ptie = carry  # left: int32 mask of the candidates not taken yet
-            key_max = jnp.max(jnp.max(jnp.where(left != 0, keys, INT_MIN), axis=0), axis=1, keepdims=True)
+            key_max = jnp.max(
+                jnp.max(jnp.where(left != 0, keys, INT_MIN), axis=0),
+                axis=1,
+                keepdims=True,
+            )
             top = (left != 0) & (keys == key_max[None])
-            pos_min = jnp.min(jnp.min(jnp.where(top, positions, INT_MAX), axis=0), axis=1, keepdims=True)
+            pos_min = jnp.min(
+                jnp.min(jnp.where(top, positions, INT_MAX), axis=0),
+                axis=1,
+                keepdims=True,
+            )
             taken = top & (positions == pos_min[None])
             nth = i + 1 == need
-            return jnp.where(taken, 0, left), jnp.where(nth, key_max, tau), jnp.where(nth, pos_min, ptie)
+            return (
+                jnp.where(taken, 0, left),
+                jnp.where(nth, key_max, tau),
+                jnp.where(nth, pos_min, ptie),
+            )
 
         zero = jnp.zeros((rows, 1), jnp.int32)
-        _, tau, ptie = jax.lax.fori_loop(0, GATHER_SLOTS, pick, (live.astype(jnp.int32), zero, zero))
-        above = jnp.sum(jnp.sum((live & (keys > tau[None])).astype(jnp.int32), axis=0), axis=1, keepdims=True)
-        at_or_above = jnp.sum(jnp.sum((live & (keys >= tau[None])).astype(jnp.int32), axis=0), axis=1,
-                              keepdims=True)
+        _, tau, ptie = jax.lax.fori_loop(
+            0, GATHER_SLOTS, pick, (live.astype(jnp.int32), zero, zero)
+        )
+        above = jnp.sum(
+            jnp.sum((live & (keys > tau[None])).astype(jnp.int32), axis=0),
+            axis=1,
+            keepdims=True,
+        )
+        at_or_above = jnp.sum(
+            jnp.sum((live & (keys >= tau[None])).astype(jnp.int32), axis=0),
+            axis=1,
+            keepdims=True,
+        )
         # Rows on sublanes -> the state's lanes (the distributed rounds' state:
         # prefix = tau, UPPER / LOWER the keys above / at or above it).
-        prefix, upper_n, lower_n, position = (state[_PREFIX:_PREFIX + 1], state[_UPPER:_UPPER + 1],
-                                              state[_LOWER:_LOWER + 1], jnp.zeros((1, LANES), jnp.int32))
+        prefix, upper_n, lower_n, position = (
+            state[_PREFIX : _PREFIX + 1],
+            state[_UPPER : _UPPER + 1],
+            state[_LOWER : _LOWER + 1],
+            jnp.zeros((1, LANES), jnp.int32),
+        )
         for b in range(self.batch):
             at = lane1 == b
             prefix = jnp.where(at, _row_scalar_col(tau, b) ^ INT_MIN, prefix)
             upper_n = jnp.where(at, _row_scalar_col(upper + above, b), upper_n)
             lower_n = jnp.where(at, _row_scalar_col(upper + at_or_above, b), lower_n)
             position = jnp.where(at, _row_scalar_col(ptie, b), position)
-        state[_PREFIX:_PREFIX + 1] = prefix
-        state[_UPPER:_UPPER + 1] = upper_n
-        state[_LOWER:_LOWER + 1] = lower_n
-        state[_POSITION:_POSITION + 1] = position
+        state[_PREFIX : _PREFIX + 1] = prefix
+        state[_UPPER : _UPPER + 1] = upper_n
+        state[_LOWER : _LOWER + 1] = lower_n
+        state[_POSITION : _POSITION + 1] = position
         refs["sel_done"][0] = 1
         self._sent(0)  # the count rounds' last two sends
         self._sent(1)
@@ -1068,9 +1388,14 @@ class IndexSelect:
             # row's bin is small (then the rest are skipped).
             def later(i, carry):
                 round_ = static_rounds + i
-                pl_when((refs["sel_done"][0] == 0) & self._small())(lambda: self._gather_finish(round_))
+                pl_when((refs["sel_done"][0] == 0) & self._small())(
+                    lambda: self._gather_finish(round_)
+                )
                 pl_when(refs["sel_done"][0] == 0)(
-                    lambda: self._key_round(32 - DIGIT_BITS * (round_ + 1), round_ % 2, True, False))
+                    lambda: self._key_round(
+                        32 - DIGIT_BITS * (round_ + 1), round_ % 2, True, False
+                    )
+                )
                 return carry
 
             jax.lax.fori_loop(0, len(KEY_SHIFTS) - static_rounds, later, 0)
@@ -1078,8 +1403,10 @@ class IndexSelect:
 
         def distributed_finish():
             state = refs["state"]
-            tie = self._active_rows() & (state[_LOWER:_LOWER + 1] > topk)  # more tied keys than the rest
-            state[_POSITION:_POSITION + 1] = jnp.zeros((1, LANES), jnp.int32)
+            tie = self._active_rows() & (
+                state[_LOWER : _LOWER + 1] > topk
+            )  # more tied keys than the rest
+            state[_POSITION : _POSITION + 1] = jnp.zeros((1, LANES), jnp.int32)
             any_tie = jnp.sum(tie.astype(jnp.int32)) > 0
 
             @pl_when(jnp.logical_not(any_tie))
@@ -1097,10 +1424,18 @@ class IndexSelect:
                     def position_digits(params, key, position, valid, shift=shift):
                         # Candidate j: tied keys at positions below floor + (j + 1) << shift.
                         tau, floor = params
-                        return jnp.clip((position - floor) >> shift, 0, 15), valid & (key == tau)
+                        return jnp.clip((position - floor) >> shift, 0, 15), valid & (
+                            key == tau
+                        )
 
-                    counts = self._count(lambda row: (refs["row_prefix"][row] ^ INT_MIN, refs["row_position"][row]),
-                                         position_digits, prefix=True)
+                    counts = self._count(
+                        lambda row: (
+                            refs["row_prefix"][row] ^ INT_MIN,
+                            refs["row_position"][row],
+                        ),
+                        position_digits,
+                        prefix=True,
+                    )
                     total = self._all_reduce(counts, tie_parity, pending=True)
                     tie_parity ^= 1
                     self._tie_update(total, shift)
@@ -1114,16 +1449,20 @@ class IndexSelect:
 
         state = refs["state"]
         active = self._active_rows()
-        tie = active & (state[_LOWER:_LOWER + 1] > topk)
-        tau = jnp.where(active, state[_PREFIX:_PREFIX + 1] ^ INT_MIN, INT_MIN)
-        p_tie = jnp.where(active, jnp.where(tie, state[_POSITION:_POSITION + 1], INT_MAX), -1)
+        tie = active & (state[_LOWER : _LOWER + 1] > topk)
+        tau = jnp.where(active, state[_PREFIX : _PREFIX + 1] ^ INT_MIN, INT_MIN)
+        p_tie = jnp.where(
+            active, jnp.where(tie, state[_POSITION : _POSITION + 1], INT_MAX), -1
+        )
         del cand
         for b in range(self.batch):
             tau_b, p_tie_b = _row_scalar(tau, b), _row_scalar(p_tie, b)
             refs["tau"][b] = tau_b
             refs["p_tie"][b] = p_tie_b
-            own_key = _row_scalar(refs["in_flight"][b:b + 1, :], b % self.S)
-            refs["own"][b] = selected(own_key, self.position_ref[b], tau_b, p_tie_b).astype(jnp.int32)
+            own_key = _row_scalar(refs["in_flight"][b : b + 1, :], b % self.S)
+            refs["own"][b] = selected(
+                own_key, self.position_ref[b], tau_b, p_tie_b
+            ).astype(jnp.int32)
 
 
 def _step_activity(self, span_rows: int, active_ref, steps: int):
@@ -1162,24 +1501,34 @@ def _step_activity(self, span_rows: int, active_ref, steps: int):
         def step_fn(step, carry):
             row, local = refs["step_row"][step], refs["step_local"][step]
             pl_when(load)(lambda: self._wait_chunk(step))
-            pl_when(load & (step + self.key_slots - 1 < total))(lambda: self._chunk_copy(step + self.key_slots - 1))
+            pl_when(load & (step + self.key_slots - 1 < total))(
+                lambda: self._chunk_copy(step + self.key_slots - 1)
+            )
             start = jnp.minimum(local * chunk, self.key_rows - chunk)
             rows_valid = refs["counts"][row] * self.subpages
             tau, p_tie = refs["tau"][row], refs["p_tie"][row]
             target = row - row % self.S if self.S > 1 else row
             for v in range(chunk // span_rows):
-                key = refs["key_buf"][step % self.key_slots, pl_ds(v * span_rows, span_rows), :]
+                key = refs["key_buf"][
+                    step % self.key_slots, pl_ds(v * span_rows, span_rows), :
+                ]
                 key_row = start + v * span_rows + sub
                 valid = (key_row >= local * chunk) & (key_row < rows_valid)
                 page = key_row // self.subpages
-                position = ((page * self.group + self.owner) * self.T
-                            + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS + lane)
-                hit = jnp.sum((valid & selected(key, position, tau, p_tie)).astype(jnp.int32))
+                position = (
+                    (page * self.group + self.owner) * self.T
+                    + (key_row % self.subpages) * INDEX_SUBPAGE_TOKENS
+                    + lane
+                )
+                hit = jnp.sum(
+                    (valid & selected(key, position, tau, p_tie)).astype(jnp.int32)
+                )
                 index = target * steps + (start + v * span_rows) // span_rows
 
                 @pl_when(hit > 0)
                 def mark(index=index):
                     active_ref[index] = jnp.int32(1)
+
             return carry
 
         jax.lax.fori_loop(0, total, step_fn, 0)
@@ -1223,7 +1572,9 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         "page_sems": pltpu.SemaphoreType.DMA((page_slots,)),
         "stage": vmem((2, sequence_rows, subpages, LANES), jnp.int32),
         "stage_sems": pltpu.SemaphoreType.DMA((2,)),
-        "key_buf": vmem((key_slots, min(chunk_rows(batch), key_rows), LANES), jnp.int32),
+        "key_buf": vmem(
+            (key_slots, min(chunk_rows(batch), key_rows), LANES), jnp.int32
+        ),
         "key_sems": pltpu.SemaphoreType.DMA((key_slots,)),
         "exchange": vmem((2, group, COUNT_ROWS, LANES), jnp.int32),
         "exchange_sems": pltpu.SemaphoreType.DMA((2, 2)),
@@ -1234,10 +1585,20 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         "counts": pltpu.SMEM((batch,), jnp.int32),
         "page_starts": pltpu.SMEM((batch + 1,), jnp.int32),
         "chunk_starts": pltpu.SMEM((batch + 1,), jnp.int32),
-        "step_row": pltpu.SMEM((batch * -(-key_rows // min(chunk_rows(batch), key_rows)),), jnp.int32),
-        "step_local": pltpu.SMEM((batch * -(-key_rows // min(chunk_rows(batch), key_rows)),), jnp.int32),
-        "page_seq": pltpu.SMEM((batch * -(-key_rows * LANES // (subpages * INDEX_SUBPAGE_TOKENS)),), jnp.int32),
-        "page_local": pltpu.SMEM((batch * -(-key_rows * LANES // (subpages * INDEX_SUBPAGE_TOKENS)),), jnp.int32),
+        "step_row": pltpu.SMEM(
+            (batch * -(-key_rows // min(chunk_rows(batch), key_rows)),), jnp.int32
+        ),
+        "step_local": pltpu.SMEM(
+            (batch * -(-key_rows // min(chunk_rows(batch), key_rows)),), jnp.int32
+        ),
+        "page_seq": pltpu.SMEM(
+            (batch * -(-key_rows * LANES // (subpages * INDEX_SUBPAGE_TOKENS)),),
+            jnp.int32,
+        ),
+        "page_local": pltpu.SMEM(
+            (batch * -(-key_rows * LANES // (subpages * INDEX_SUBPAGE_TOKENS)),),
+            jnp.int32,
+        ),
         "row_prefix": pltpu.SMEM((batch,), jnp.int32),
         "row_position": pltpu.SMEM((batch,), jnp.int32),
         **(_group_scratch(batch, key_rows) if batch < WIDE_CHUNK_BATCH else {}),
@@ -1267,7 +1628,9 @@ def _group_scratch(batch, key_rows):
 
     groups, chunk = -(-batch // 8), min(chunk_rows(batch), key_rows)
     return {
-        "group_buf": pltpu.VMEM((2, 8 * chunk, LANES), jnp.int32),  # row r's chunk at r * chunk
+        "group_buf": pltpu.VMEM(
+            (2, 8 * chunk, LANES), jnp.int32
+        ),  # row r's chunk at r * chunk
         "group_sems": pltpu.SemaphoreType.DMA((2,)),
         "group_rows": pltpu.SMEM((groups,), jnp.int32),
         "gstep_starts": pltpu.SMEM((groups + 1,), jnp.int32),
@@ -1276,9 +1639,23 @@ def _group_scratch(batch, key_rows):
     }
 
 
-def dsa_select(q8, w, pool, tables, positions, new_k8, new_exp, *, topk: int = 2048, group: int = 32,
-               max_local_pages: int, sequence_rows: int = 1, owner_table=None, interpret=None,
-               axis: str = "tp"):
+def dsa_select(
+    q8,
+    w,
+    pool,
+    tables,
+    positions,
+    new_k8,
+    new_exp,
+    *,
+    topk: int = 2048,
+    group: int = 32,
+    max_local_pages: int,
+    sequence_rows: int = 1,
+    owner_table=None,
+    interpret=None,
+    axis: str = "tp",
+):
     """``IndexSelect`` as its own kernel (per rank, inside ``shard_map`` over
     ``axis``): ``(tau i32 [B], p_tie i32 [B], own i32 [B], keys i32 [B,
     key_rows_for(max_local_pages, T), 128])``.
@@ -1290,15 +1667,48 @@ def dsa_select(q8, w, pool, tables, positions, new_k8, new_exp, *, topk: int = 2
     positions, ``new_k8`` ``[B, 128]`` / ``new_exp`` i32 ``[B]`` the rows'
     own tokens' key records (fp8 values, UE8M0 bytes)."""
     batch = q8.shape[0]
-    w_t = jnp.zeros((w.shape[1], LANES), jnp.float32).at[:, :batch].set(w.astype(jnp.float32).T)
-    return select_call(q8.astype(jnp.float8_e4m3fn), w_t, new_k8.astype(jnp.float32), pool, tables.reshape(-1),
-                       positions, new_exp, pages=tables.shape[1], topk=topk, group=group,
-                       max_local_pages=max_local_pages, sequence_rows=sequence_rows, owner_table=owner_table,
-                       interpret=interpret, axis=axis)
+    w_t = (
+        jnp.zeros((w.shape[1], LANES), jnp.float32)
+        .at[:, :batch]
+        .set(w.astype(jnp.float32).T)
+    )
+    return select_call(
+        q8.astype(jnp.float8_e4m3fn),
+        w_t,
+        new_k8.astype(jnp.float32),
+        pool,
+        tables.reshape(-1),
+        positions,
+        new_exp,
+        pages=tables.shape[1],
+        topk=topk,
+        group=group,
+        max_local_pages=max_local_pages,
+        sequence_rows=sequence_rows,
+        owner_table=owner_table,
+        interpret=interpret,
+        axis=axis,
+    )
 
 
-def select_call(q8, w_t, new_k8, pool, tables, positions, new_exp, *, pages: int, topk: int, group: int,
-                max_local_pages: int, sequence_rows: int = 1, owner_table=None, interpret=None, axis: str = "tp"):
+def select_call(
+    q8,
+    w_t,
+    new_k8,
+    pool,
+    tables,
+    positions,
+    new_exp,
+    *,
+    pages: int,
+    topk: int,
+    group: int,
+    max_local_pages: int,
+    sequence_rows: int = 1,
+    owner_table=None,
+    interpret=None,
+    axis: str = "tp",
+):
     """``dsa_select``'s kernel on prepared inputs: ``q8`` fp8, ``w_t`` f32
     ``[32, 128]`` (column ``b``: row ``b``'s head weights), ``new_k8`` f32,
     ``tables`` flat ``[B * pages]``."""
@@ -1315,20 +1725,58 @@ def select_call(q8, w_t, new_k8, pool, tables, positions, new_exp, *, pages: int
     scratch = select_scratch(batch, block_shape, key_rows, group, sequence_rows)
     names = list(scratch)
 
-    def kernel(positions_ref, exp_ref, tables_ref, q8_ref, w_t_ref, new_k8_ref, pool_ref,
-               tau_ref, ptie_ref, own_ref, keys_ref, *scratch_refs):
+    def kernel(
+        positions_ref,
+        exp_ref,
+        tables_ref,
+        q8_ref,
+        w_t_ref,
+        new_k8_ref,
+        pool_ref,
+        tau_ref,
+        ptie_ref,
+        own_ref,
+        keys_ref,
+        *scratch_refs,
+    ):
         rank = jax.lax.axis_index(axis)
         member = rank % group
-        owner = member if owner_table is None else mla_dcp.owner_index(owner_table) % group
-        refs = dict(zip(names, scratch_refs), keys=keys_ref, tau=tau_ref, p_tie=ptie_ref, own=own_ref)
+        owner = (
+            member if owner_table is None else mla_dcp.owner_index(owner_table) % group
+        )
+        refs = dict(
+            zip(names, scratch_refs),
+            keys=keys_ref,
+            tau=tau_ref,
+            p_tie=ptie_ref,
+            own=own_ref,
+        )
         select = IndexSelect(
-            pools=(pool_ref,), layer=0, table_ref=tables_ref, pages=pages, page_tokens=page_tokens,
-            group=group, owner=owner, member=member, base=rank - member, position_ref=positions_ref,
-            new_exp_ref=exp_ref, batch=batch, topk=topk, refs=refs, sequence_rows=sequence_rows)
+            pools=(pool_ref,),
+            layer=0,
+            table_ref=tables_ref,
+            pages=pages,
+            page_tokens=page_tokens,
+            group=group,
+            owner=owner,
+            member=member,
+            base=rank - member,
+            position_ref=positions_ref,
+            new_exp_ref=exp_ref,
+            batch=batch,
+            topk=topk,
+            refs=refs,
+            sequence_rows=sequence_rows,
+        )
         select.plan()
         select.in_flight(lambda row: q8_ref[row], w_t_ref, new_k8_ref)
-        select.score(lambda row: q8_ref[row], w_t_ref,
-                     lambda first: q8_ref[pl.ds(first, sequence_rows)].reshape(sequence_rows * 32, 128))
+        select.score(
+            lambda row: q8_ref[row],
+            w_t_ref,
+            lambda first: q8_ref[pl.ds(first, sequence_rows)].reshape(
+                sequence_rows * 32, 128
+            ),
+        )
         select.select()
 
     vmem = pltpu.VMEM if hasattr(pltpu, "VMEM") else pltpu.MemorySpace.VMEM
@@ -1371,7 +1819,13 @@ def _scoped(name, fn):
 
 
 # XProf phase scopes (KernelConfig.phase_scopes): the selection's parts.
-for _name, _method in (("d0_plan", "plan"), ("d0_in_flight", "in_flight"), ("d1_score", "score"),
-                       ("d2_count", "_count"), ("d3_exchange", "_all_reduce"), ("d4_select", "select"),
-                       ("d6_activity", "step_activity")):
+for _name, _method in (
+    ("d0_plan", "plan"),
+    ("d0_in_flight", "in_flight"),
+    ("d1_score", "score"),
+    ("d2_count", "_count"),
+    ("d3_exchange", "_all_reduce"),
+    ("d4_select", "select"),
+    ("d6_activity", "step_activity"),
+):
     setattr(IndexSelect, _method, _scoped(_name, getattr(IndexSelect, _method)))

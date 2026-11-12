@@ -36,7 +36,9 @@ from sglang_tpu.k3_programs.kimi_k3.kernels.decode_megakernel import (
 def latent_rows_from_handoff(new_keys):
     """``[batch, M, 640]`` latent rows from a DCP decoder's handoff (packed in
     new-key rows 0..2, see ``decode_megakernel.mla``)."""
-    return jnp.concatenate((new_keys[:, :, 0], new_keys[:, :, 1], new_keys[:, :, 2, :128]), axis=-1)
+    return jnp.concatenate(
+        (new_keys[:, :, 0], new_keys[:, :, 1], new_keys[:, :, 2, :128]), axis=-1
+    )
 
 
 def _commit_latent_rows_fused(pools, rows, positions, blocks, owned, pool_map):
@@ -53,7 +55,7 @@ def _commit_latent_rows_fused(pools, rows, positions, blocks, owned, pool_map):
     count = len(pools)
 
     def kernel(meta, values, *refs):
-        outputs = refs[count:2 * count]
+        outputs = refs[count : 2 * count]
         tiles, semaphores = refs[-2:]
 
         @pl.loop(0, batch)
@@ -73,49 +75,79 @@ def _commit_latent_rows_fused(pools, rows, positions, blocks, owned, pool_map):
 
                     @pl.when(valid)
                     def read(layer=layer, index=index, target=target):
-                        tpu.make_async_copy(outputs[index].at[target, pl.ds(first, 8)],
-                                            tiles.at[layer], semaphores.at[layer]).start()
+                        tpu.make_async_copy(
+                            outputs[index].at[target, pl.ds(first, 8)],
+                            tiles.at[layer],
+                            semaphores.at[layer],
+                        ).start()
 
                 for layer, index in enumerate(pool_map):
                     target, valid = normalized_block(index)
 
                     @pl.when(valid)
                     def update(layer=layer, index=index, target=target):
-                        copy = tpu.make_async_copy(outputs[index].at[target, pl.ds(first, 8)],
-                                                   tiles.at[layer], semaphores.at[layer])
+                        copy = tpu.make_async_copy(
+                            outputs[index].at[target, pl.ds(first, 8)],
+                            tiles.at[layer],
+                            semaphores.at[layer],
+                        )
                         copy.wait()
-                        token = (packing * jax.lax.broadcasted_iota(jnp.int32, (8, packing, 640), 0)
-                                 + jax.lax.broadcasted_iota(jnp.int32, (8, packing, 640), 1))
-                        tiles[layer] = jnp.where(token == position % tile_tokens,
-                                                values[row, layer][None, None, :], tiles[layer])
-                        tpu.make_async_copy(tiles.at[layer],
-                                            outputs[index].at[target, pl.ds(first, 8)],
-                                            semaphores.at[layer]).start()
+                        token = packing * jax.lax.broadcasted_iota(
+                            jnp.int32, (8, packing, 640), 0
+                        ) + jax.lax.broadcasted_iota(jnp.int32, (8, packing, 640), 1)
+                        tiles[layer] = jnp.where(
+                            token == position % tile_tokens,
+                            values[row, layer][None, None, :],
+                            tiles[layer],
+                        )
+                        tpu.make_async_copy(
+                            tiles.at[layer],
+                            outputs[index].at[target, pl.ds(first, 8)],
+                            semaphores.at[layer],
+                        ).start()
 
                 for layer, index in enumerate(pool_map):
                     target, valid = normalized_block(index)
 
                     @pl.when(valid)
                     def retire(layer=layer, index=index, target=target):
-                        tpu.make_async_copy(tiles.at[layer],
-                                            outputs[index].at[target, pl.ds(first, 8)],
-                                            semaphores.at[layer]).wait()
+                        tpu.make_async_copy(
+                            tiles.at[layer],
+                            outputs[index].at[target, pl.ds(first, 8)],
+                            semaphores.at[layer],
+                        ).wait()
 
-    return tuple(pl.pallas_call(
-        kernel, out_shape=tuple(jax.ShapeDtypeStruct(p.shape, p.dtype) for p in pools),
-        grid_spec=tpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            in_specs=(pl.BlockSpec(memory_space=tpu.VMEM),)
-                     + (pl.BlockSpec(memory_space=tpu.HBM),) * count,
-            out_specs=(pl.BlockSpec(memory_space=tpu.HBM),) * count,
-            scratch_shapes=(tpu.VMEM((layers, 8, packing, 640), dtype),
-                            tpu.SemaphoreType.DMA((layers,)))),
-        input_output_aliases={2 + i: i for i in range(count)},
-        name='kimi_commit_unified_pools')(metadata, rows.astype(dtype), *pools))
+    return tuple(
+        pl.pallas_call(
+            kernel,
+            out_shape=tuple(jax.ShapeDtypeStruct(p.shape, p.dtype) for p in pools),
+            grid_spec=tpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1,
+                in_specs=(pl.BlockSpec(memory_space=tpu.VMEM),)
+                + (pl.BlockSpec(memory_space=tpu.HBM),) * count,
+                out_specs=(pl.BlockSpec(memory_space=tpu.HBM),) * count,
+                scratch_shapes=(
+                    tpu.VMEM((layers, 8, packing, 640), dtype),
+                    tpu.SemaphoreType.DMA((layers,)),
+                ),
+            ),
+            input_output_aliases={2 + i: i for i in range(count)},
+            name="kimi_commit_unified_pools",
+        )(metadata, rows.astype(dtype), *pools)
+    )
 
 
-def commit_latent_rows(pools, rows, block_tables, positions, pool_map, *, group=mla_dcp.GROUP,
-                       owner_table=None, global_pages=None):
+def commit_latent_rows(
+    pools,
+    rows,
+    block_tables,
+    positions,
+    pool_map,
+    *,
+    group=mla_dcp.GROUP,
+    owner_table=None,
+    global_pages=None,
+):
     """Write each row's new latent into vLLM's unified pools on the rank that
     owns its position (XLA level, inside ``shard_map`` over ``tp``): MLA layer
     ``m``'s row at position ``p`` lands in ``pools[pool_map[m]]`` at token
@@ -129,32 +161,47 @@ def commit_latent_rows(pools, rows, block_tables, positions, pool_map, *, group=
     pools = list(pools)
     packing = pools[0].shape[-2]
     page_tokens = pools[0].shape[-3] * packing
-    pages = positions[:rows.shape[0]] // page_tokens
+    pages = positions[: rows.shape[0]] // page_tokens
     owned = pages % group == member
     # Local tables hold one entry per ``group`` global pages.
-    blocks = block_tables[jnp.arange(rows.shape[0]), pages if global_pages else pages // group]
+    blocks = block_tables[
+        jnp.arange(rows.shape[0]), pages if global_pages else pages // group
+    ]
     # One fused commit for all MLA layers; the generic scatter below handles
     # other layouts and repeated pool maps (ordered by layer, not token).
-    if (_config().fused_cache_commit
-            and rows.shape[0] in (1, 2, 4, 8, 16, 32, 48, 64)
-            and rows.shape[1:] == (len(pool_map), 640)
-            and 0 < len(pool_map) <= MLA_LAYERS and len(set(pool_map)) == len(pool_map)
-            and all(0 <= index < len(pools) for index in pool_map)
-            and all(pool.shape[0] > 0 and pool.shape[1:] == (128, packing, 640)
-                    and pool.dtype == pools[0].dtype for pool in pools)):
-        return _commit_latent_rows_fused(pools, rows, positions, blocks, owned, pool_map)
-    pairs = positions[:rows.shape[0]] % page_tokens // packing
-    halves = positions[:rows.shape[0]] % packing
+    if (
+        _config().fused_cache_commit
+        and rows.shape[0] in (1, 2, 4, 8, 16, 32, 48, 64)
+        and rows.shape[1:] == (len(pool_map), 640)
+        and 0 < len(pool_map) <= MLA_LAYERS
+        and len(set(pool_map)) == len(pool_map)
+        and all(0 <= index < len(pools) for index in pool_map)
+        and all(
+            pool.shape[0] > 0
+            and pool.shape[1:] == (128, packing, 640)
+            and pool.dtype == pools[0].dtype
+            for pool in pools
+        )
+    ):
+        return _commit_latent_rows_fused(
+            pools, rows, positions, blocks, owned, pool_map
+        )
+    pairs = positions[: rows.shape[0]] % page_tokens // packing
+    halves = positions[: rows.shape[0]] % packing
     # One scatter per pool for all rows; rows this rank does not own point
     # past the pool and are dropped.
     for layer, index in enumerate(pool_map):
         pool = pools[index]
         targets = jnp.where(owned, blocks, pool.shape[0])
-        pools[index] = pool.at[targets, pairs, halves].set(rows[:, layer].astype(pool.dtype), mode="drop")
+        pools[index] = pool.at[targets, pairs, halves].set(
+            rows[:, layer].astype(pool.dtype), mode="drop"
+        )
     return tuple(pools)
 
 
-def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, source_rows=None):
+def _commit_kda_states(
+    conv_slots, recurrent_slots, conv, recurrent, slots, source_rows=None
+):
     """Copy complete KDA rows back without XLA's per-row scatter loop.
 
     Row writes finish in input order, including repeated null-slot indices.
@@ -168,14 +215,28 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
 
     def body(indices, *args):
         sources, args = (args[0], args[1:]) if selected else (None, args)
-        (old_conv, old_state, new_conv, new_state, out_conv, out_state,
-         conv_buffer, state_buffer, semaphores) = args
+        (
+            old_conv,
+            old_state,
+            new_conv,
+            new_state,
+            out_conv,
+            out_state,
+            conv_buffer,
+            state_buffer,
+            semaphores,
+        ) = args
+
         @pl.loop(0, batch)
         def row(i):
             source = sources[i] if sources is not None else i
             reads = (
-                tpu.make_async_copy(new_conv.at[pl.ds(source, 1)], conv_buffer, semaphores.at[0]),
-                tpu.make_async_copy(new_state.at[pl.ds(source, 1)], state_buffer, semaphores.at[1]),
+                tpu.make_async_copy(
+                    new_conv.at[pl.ds(source, 1)], conv_buffer, semaphores.at[0]
+                ),
+                tpu.make_async_copy(
+                    new_state.at[pl.ds(source, 1)], state_buffer, semaphores.at[1]
+                ),
             )
             for item in reads:
                 item.start()
@@ -183,8 +244,12 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
                 item.wait()
             target = indices[i]
             writes = (
-                tpu.make_async_copy(conv_buffer, out_conv.at[pl.ds(target, 1)], semaphores.at[0]),
-                tpu.make_async_copy(state_buffer, out_state.at[pl.ds(target, 1)], semaphores.at[1]),
+                tpu.make_async_copy(
+                    conv_buffer, out_conv.at[pl.ds(target, 1)], semaphores.at[0]
+                ),
+                tpu.make_async_copy(
+                    state_buffer, out_state.at[pl.ds(target, 1)], semaphores.at[1]
+                ),
             )
             for item in writes:
                 item.start()
@@ -194,8 +259,10 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
     return pl.pallas_call(
         body,
         name="kda_selected_state_commit" if selected else "kda_state_commit",
-        out_shape=(jax.ShapeDtypeStruct(conv_slots.shape, conv_slots.dtype),
-                   jax.ShapeDtypeStruct(recurrent_slots.shape, recurrent_slots.dtype)),
+        out_shape=(
+            jax.ShapeDtypeStruct(conv_slots.shape, conv_slots.dtype),
+            jax.ShapeDtypeStruct(recurrent_slots.shape, recurrent_slots.dtype),
+        ),
         input_output_aliases={prefetch: 0, prefetch + 1: 1},
         grid_spec=tpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=prefetch,
@@ -207,11 +274,34 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
                 tpu.SemaphoreType.DMA((2,)),
             ),
         ),
-    )(slots, *((source_rows,) if selected else ()), conv_slots, recurrent_slots, conv, recurrent)
+    )(
+        slots,
+        *((source_rows,) if selected else ()),
+        conv_slots,
+        recurrent_slots,
+        conv,
+        recurrent,
+    )
 
-def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, block_tables,
-                 slots, *, batch_size, dcp_pool_map, dcp_owner_table=None, state_row=None,
-                 defer_kda_commit=False, dsa_pools=0, **decode_options):
+
+def decode_paged(
+    weights,
+    conv_slots,
+    recurrent_slots,
+    pool,
+    tokens,
+    positions,
+    block_tables,
+    slots,
+    *,
+    batch_size,
+    dcp_pool_map,
+    dcp_owner_table=None,
+    state_row=None,
+    defer_kda_commit=False,
+    dsa_pools=0,
+    **decode_options,
+):
     """One decode step on this rank (inside a ``tp`` shard_map).
 
     ``conv_slots [S, 69, 3, 3, 3, 128]`` / ``recurrent_slots [S, 69, 3, 128,
@@ -235,7 +325,11 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
     tokens from them and every row's new index keys are committed beside its
     latents (returned in ``pool``'s order).
     """
-    if tokens.shape != (batch_size,) or positions.shape != (batch_size,) or slots.shape != (batch_size,):
+    if (
+        tokens.shape != (batch_size,)
+        or positions.shape != (batch_size,)
+        or slots.shape != (batch_size,)
+    ):
         raise ValueError("tokens, positions and slots must have one entry per row")
     dp = decode_options.get("attention_dp", 1)
     group_rows = None
@@ -249,7 +343,11 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         per_pair = batch_size // dp // owners
         data_group = jax.lax.axis_index("tp") // (32 // dp)
         row = jnp.arange(batch_size // dp)
-        group_rows = row // per_pair * (batch_size // owners) + data_group * per_pair + row % per_pair
+        group_rows = (
+            row // per_pair * (batch_size // owners)
+            + data_group * per_pair
+            + row % per_pair
+        )
         group_slots = conv_slots.shape[0] // dp
         local = slots[group_rows]
         local = jnp.where(local == 0, 0, local - data_group * (group_slots - 1))
@@ -257,8 +355,12 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
     # The stack reads the input KDA states from their slots itself where it
     # can (DP1 above four rows or a selected verify row; DP2 at B2..B128).
     # DP2 indices already include each held head shard's bank offset.
-    in_place = ((state_row is not None or batch_size > 4) and dp == 1
-                or dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96, 128))
+    in_place = (
+        (state_row is not None or batch_size > 4)
+        and dp == 1
+        or dp == 2
+        and batch_size in (2, 4, 8, 16, 32, 64, 96, 128)
+    )
     if in_place:
         conv, recurrent = conv_slots, recurrent_slots
     else:
@@ -268,10 +370,20 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
     if dsa_pools:
         pools, index_pools = pools[:-dsa_pools], pools[-dsa_pools:]
     result = decode_local(
-        weights, (conv, recurrent, *pools), tokens, positions, batch_size=batch_size,
-        block_tables=block_tables, dcp_pool_map=dcp_pool_map, dcp_owner_table=dcp_owner_table,
-        state_row=state_row, state_slots=state_index if in_place else None,
-        live_rows=slots != 0, index_pools=index_pools, **decode_options)
+        weights,
+        (conv, recurrent, *pools),
+        tokens,
+        positions,
+        batch_size=batch_size,
+        block_tables=block_tables,
+        dcp_pool_map=dcp_pool_map,
+        dcp_owner_table=dcp_owner_table,
+        state_row=state_row,
+        state_slots=state_index if in_place else None,
+        live_rows=slots != 0,
+        index_pools=index_pools,
+        **decode_options,
+    )
     aux = None
     if decode_options.get("aux_hidden_layers"):
         logits, aux, (conv, recurrent, new_keys, new_values, *records) = result
@@ -285,7 +397,8 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         conv_slots, recurrent_slots = conv, recurrent
     elif batch_size > 16 and dp in (1, 2):
         conv_slots, recurrent_slots = _commit_kda_states(
-            conv_slots, recurrent_slots, conv, recurrent, state_index)
+            conv_slots, recurrent_slots, conv, recurrent, state_index
+        )
     else:
         conv_slots = conv_slots.at[state_index].set(conv)
         recurrent_slots = recurrent_slots.at[state_index].set(recurrent)
@@ -293,17 +406,34 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
     if group_rows is not None:
         # The handoff holds the group's rows first; only their owners commit.
         latents, block_tables, positions = (
-            latents[: group_rows.shape[0]], block_tables[group_rows], positions[group_rows])
-    pool = commit_latent_rows(pools, latents, block_tables, positions,
-                              dcp_pool_map, owner_table=dcp_owner_table)
+            latents[: group_rows.shape[0]],
+            block_tables[group_rows],
+            positions[group_rows],
+        )
+    pool = commit_latent_rows(
+        pools,
+        latents,
+        block_tables,
+        positions,
+        dcp_pool_map,
+        owner_table=dcp_owner_table,
+    )
     if index_pools is not None:
         from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
 
         (records,) = records  # [batch, 24, 2, 128] int32: key bytes | UE8M0 byte
-        records = jnp.concatenate((records[:, :, 0, :], records[:, :, 1, :1]), axis=-1).astype(jnp.uint8)
+        records = jnp.concatenate(
+            (records[:, :, 0, :], records[:, :, 1, :1]), axis=-1
+        ).astype(jnp.uint8)
         index_pools = dsa_dcp.commit_index_rows(
-            index_pools, records, block_tables, positions, group=32, owner_table=dcp_owner_table,
-            global_pages=mla_dcp.GLOBAL_PAGES)
+            index_pools,
+            records,
+            block_tables,
+            positions,
+            group=32,
+            owner_table=dcp_owner_table,
+            global_pages=mla_dcp.GLOBAL_PAGES,
+        )
         pool = (*pool, *index_pools)
     if aux is not None:
         return logits[0], aux, conv_slots, recurrent_slots, pool

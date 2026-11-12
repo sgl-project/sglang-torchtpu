@@ -10,10 +10,9 @@ import numpy as np
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.k3_programs.kimi_k3.kernels import Config
-from sglang_tpu.k3_programs.kimi_k3.kernels import load
+from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=150, suite="base-a-test-cpu")
+register_cpu_ci(est_time=420, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -83,7 +82,9 @@ class TestK31Config(CustomTestCase):
         self.assertFalse(k3.dsa)
         k31 = _config(DSA)
         self.assertTrue(k31.dsa)
-        self.assertEqual((k31.index_topk, k31.index_heads, k31.index_dim), (2048, 32, 128))
+        self.assertEqual(
+            (k31.index_topk, k31.index_heads, k31.index_dim), (2048, 32, 128)
+        )
         self.assertEqual(k31.without_dsa(), Config())
 
     def test_unsupported_dsa_settings_are_refused(self):
@@ -131,13 +132,17 @@ class TestIndexerFamilies(CustomTestCase):
                 np.testing.assert_array_equal(
                     wqb, self.raw["wq_b"][rank * 128 : (rank + 1) * 128].T
                 )
-                np.testing.assert_array_equal(self.ckpt.dense("d_wk", 3, rank), self.raw["wk"].T)
+                np.testing.assert_array_equal(
+                    self.ckpt.dense("d_wk", 3, rank), self.raw["wk"].T
+                )
                 proj = self.ckpt.dense("d_wproj", 3, rank)
                 self.assertEqual(proj.shape, (7168, 128))
                 np.testing.assert_array_equal(proj[:, :32], self.raw["weights_proj"].T)
                 self.assertFalse(proj[:, 32:].any())
                 norm = self.ckpt.dense("d_knorm", 3, rank).astype(np.float32)
-                np.testing.assert_allclose(norm[0], self.raw["k_norm.weight"], rtol=1e-2)
+                np.testing.assert_allclose(
+                    norm[0], self.raw["k_norm.weight"], rtol=1e-2
+                )
                 np.testing.assert_allclose(norm[1], self.raw["k_norm.bias"], rtol=1e-2)
 
     def test_shapes_and_layers(self):
@@ -175,10 +180,13 @@ class TestDsaReference(CustomTestCase):
         q, w = dsa.index_query(rng.standard_normal(32 * 128), rng.standard_normal(32))
         keys, kexp = dsa.quantize_fp8(rng.standard_normal((50, 128)))
         s = dsa.scores(q, w, keys, kexp)
-        ref = np.array([
-            sum(max(float(keys[n] @ q[h]), 0.0) * w[h] for h in range(32)) * 2.0 ** kexp[n, 0]
-            for n in range(50)
-        ])
+        ref = np.array(
+            [
+                sum(max(float(keys[n] @ q[h]), 0.0) * w[h] for h in range(32))
+                * 2.0 ** kexp[n, 0]
+                for n in range(50)
+            ]
+        )
         np.testing.assert_allclose(s, ref, rtol=1e-4)
 
     def test_distributed_topk_matches_the_global_selection(self):
@@ -233,8 +241,12 @@ class TestIndexPools(CustomTestCase):
         with model:
             state = sglang_pools.K3StatePool(size=4, mamba_layer_ids=KDA, device="cpu")
             kv = sglang_pools.K3UnifiedKVPool(
-                size=6 * 16384, page_size=16384, dtype=torch.float8_e4m3fn,
-                layer_num=len(MLA), device="cpu", index_head_dim=128,
+                size=6 * 16384,
+                page_size=16384,
+                dtype=torch.float8_e4m3fn,
+                layer_num=len(MLA),
+                device="cpu",
+                index_head_dim=128,
             )
         self.assertEqual(len(kv.index_pools), len(MLA))
         self.assertEqual(
@@ -245,15 +257,20 @@ class TestIndexPools(CustomTestCase):
         ptrs, lens, items = kv.get_contiguous_buf_infos()
         ids = kv.get_kv_layer_ids()
         self.assertEqual(len(ptrs), len(ids))
-        self.assertEqual(set(items[-len(MLA):]), {4 * 33 * 4 * 128})
-        self.assertEqual(ids[-len(MLA):], list(range(NUM_LAYERS + 5, NUM_LAYERS + 5 + len(MLA))))
+        self.assertEqual(set(items[-len(MLA) :]), {4 * 33 * 4 * 128})
+        self.assertEqual(
+            ids[-len(MLA) :], list(range(NUM_LAYERS + 5, NUM_LAYERS + 5 + len(MLA)))
+        )
         self.assertEqual(len(set(ids)), len(ids))
         # Kimi-K3 builds none.
         with model:
             sglang_pools.K3StatePool(size=4, mamba_layer_ids=KDA, device="cpu")
             k3 = sglang_pools.K3UnifiedKVPool(
-                size=6 * 16384, page_size=16384, dtype=torch.float8_e4m3fn,
-                layer_num=len(MLA), device="cpu",
+                size=6 * 16384,
+                page_size=16384,
+                dtype=torch.float8_e4m3fn,
+                layer_num=len(MLA),
+                device="cpu",
             )
         self.assertEqual(k3.index_pools, [])
         self.assertEqual(len(k3.get_kv_layer_ids()), len(MLA) + 5)
@@ -282,10 +299,17 @@ class TestIndexCommit(CustomTestCase):
         for b in range(len(positions)):
             tables[b] = np.arange(1, 5) + 4 * b
         for member in range(group):
-            pools = tuple(jnp.zeros((blocks * 4, 4 * 33, 4, 128), jnp.uint8) for _ in range(layers))
+            pools = tuple(
+                jnp.zeros((blocks * 4, 4 * 33, 4, 128), jnp.uint8)
+                for _ in range(layers)
+            )
             with mock.patch.object(mla_dcp, "owner_index", return_value=member):
                 pools = dsa_dcp.commit_index_rows(
-                    pools, records, jnp.asarray(tables), jnp.asarray(positions), group=group
+                    pools,
+                    records,
+                    jnp.asarray(tables),
+                    jnp.asarray(positions),
+                    group=group,
                 )
             for b, p in enumerate(positions):
                 page = p // tokens
@@ -398,7 +422,10 @@ class TestIndexSelect(CustomTestCase):
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
         result = subprocess.run(
             [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
-            capture_output=True, text=True, env=env, timeout=900,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,
         )
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
@@ -417,7 +444,8 @@ class TestIndexSelectGatherFinish(CustomTestCase):
             "from sglang_tpu.k3_programs.kimi_k3 import dsa\n",
             "from sglang_tpu.k3_programs.kimi_k3 import config as kc\n"
             "kc.install(kc.KernelConfig(dsa_gather_finish=True))\n"
-            "from sglang_tpu.k3_programs.kimi_k3 import dsa\n")
+            "from sglang_tpu.k3_programs.kimi_k3 import dsa\n",
+        )
         script = script.replace(
             "from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp\n",
             "from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp\n"
@@ -426,17 +454,29 @@ class TestIndexSelectGatherFinish(CustomTestCase):
             "def _traced(self, first_round):\n"
             "    pl.debug_print('GATHER at round {}', first_round)\n"
             "    return _finish(self, first_round)\n"
-            "dsa_dcp.IndexSelect._gather_finish = _traced\n")
-        script = script.replace("def case(firsts, S, topk, ties, seed):",
-                                "def case(firsts, S, topk, ties, seed, distinct=5):")
-        script = script.replace("rng.standard_normal((5, 128)).astype(np.float32)[rng.integers(0, 5, L)]",
-                                "rng.standard_normal((distinct, 128)).astype(np.float32)[rng.integers(0, distinct, L)]")
-        tail = script[script.index("case([300, 2500], 1, 256, False, 0)"):]
-        return script.replace(tail, "\n".join([
-            "case([300, 2500], 1, 256, False, 0)",
-            "assert case([2600, 3100], 2, 256, True, 2, distinct=350) > 0  # ties inside the gathered bin",
-            "case([3500], 4, 512, False, 3)",
-            'print("OK")', ""]))
+            "dsa_dcp.IndexSelect._gather_finish = _traced\n",
+        )
+        script = script.replace(
+            "def case(firsts, S, topk, ties, seed):",
+            "def case(firsts, S, topk, ties, seed, distinct=5):",
+        )
+        script = script.replace(
+            "rng.standard_normal((5, 128)).astype(np.float32)[rng.integers(0, 5, L)]",
+            "rng.standard_normal((distinct, 128)).astype(np.float32)[rng.integers(0, distinct, L)]",
+        )
+        tail = script[script.index("case([300, 2500], 1, 256, False, 0)") :]
+        return script.replace(
+            tail,
+            "\n".join(
+                [
+                    "case([300, 2500], 1, 256, False, 0)",
+                    "assert case([2600, 3100], 2, 256, True, 2, distinct=350) > 0  # ties inside the gathered bin",
+                    "case([3500], 4, 512, False, 3)",
+                    'print("OK")',
+                    "",
+                ]
+            ),
+        )
 
     def test_gather_finish_matches_the_reference(self):
         import os
@@ -450,10 +490,15 @@ class TestIndexSelectGatherFinish(CustomTestCase):
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
         result = subprocess.run(
             [sys.executable, "-c", self.script()],
-            capture_output=True, text=True, env=env, timeout=1500,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1500,
         )
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
-        self.assertGreaterEqual(result.stdout.count("GATHER at round"), 3 * 4, result.stdout[-2000:])
+        self.assertGreaterEqual(
+            result.stdout.count("GATHER at round"), 3 * 4, result.stdout[-2000:]
+        )
 
 
 class TestSelectedAttention(CustomTestCase):
@@ -643,7 +688,10 @@ class TestSelectedAttention(CustomTestCase):
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
         result = subprocess.run(
             [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
-            capture_output=True, text=True, env=env, timeout=900,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,
         )
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
@@ -662,18 +710,27 @@ class TestPrefillIndexRows(CustomTestCase):
         rng = np.random.default_rng(5)
         tokens, pages = 512, 3
         keys = rng.standard_normal((tokens * pages, 128)).astype(np.float32)
-        rows = np.asarray(dsa_dcp.index_rows(jnp.asarray(keys).astype(jnp.bfloat16), pages))
+        rows = np.asarray(
+            dsa_dcp.index_rows(jnp.asarray(keys).astype(jnp.bfloat16), pages)
+        )
         self.assertEqual(rows.shape, (pages, 4 * 33, 4, 128))
         # The same keys, token by token, into blocks 1..3 of one rank's pool
         # (a table whose entry e is global page e: every page on this rank).
-        records = dsa_dcp.key_records(jnp.asarray(keys).astype(jnp.bfloat16))[:, None, :]
+        records = dsa_dcp.key_records(jnp.asarray(keys).astype(jnp.bfloat16))[
+            :, None, :
+        ]
         positions = np.arange(tokens * pages, dtype=np.int32)
         tables = np.tile(np.arange(1, pages + 1, dtype=np.int32), (len(positions), 1))
         pool = (jnp.zeros((pages + 1, 4 * 33, 4, 128), jnp.uint8),)
         with mock.patch.object(mla_dcp, "owner_index", return_value=0):
             (pool,) = dsa_dcp.commit_index_rows(
-                pool, records, jnp.asarray(tables), jnp.asarray(positions), group=1,
-                global_pages=True)
+                pool,
+                records,
+                jnp.asarray(tables),
+                jnp.asarray(positions),
+                group=1,
+                global_pages=True,
+            )
         np.testing.assert_array_equal(np.asarray(pool)[1:], rows)
 
 
@@ -696,19 +753,28 @@ class TestDecodeIndexer(CustomTestCase):
 
         if not hasattr(pltpu, "InterpretParams"):
             self.skipTest("Pallas TPU interpret mode unavailable")
-        for case in ({"S": "1", "TOPK": "128", "POS": "700,2100"},
-                     {"S": "4", "TOPK": "200", "POS": "1500,3000"},
-                     {"S": "4", "TOPK": "200", "POS": "1500,3000", "ACTIVITY_MIN_STEPS": "16"},
-                     {"S": "4", "TOPK": "200", "POS": "1500,3000", "GATHER": "1"}):
+        for case in (
+            {"S": "1", "TOPK": "128", "POS": "700,2100"},
+            {"S": "4", "TOPK": "200", "POS": "1500,3000"},
+            {"S": "4", "TOPK": "200", "POS": "1500,3000", "ACTIVITY_MIN_STEPS": "16"},
+            {"S": "4", "TOPK": "200", "POS": "1500,3000", "GATHER": "1"},
+        ):
             with self.subTest(**case):
                 env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), **case)
                 result = subprocess.run(
-                    [sys.executable, "-c", self.SCRIPT], capture_output=True, text=True, env=env,
+                    [sys.executable, "-c", self.SCRIPT],
+                    capture_output=True,
+                    text=True,
+                    env=env,
                     timeout=900,
                 )
-                self.assertIn("OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:])
+                self.assertIn(
+                    "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+                )
                 if case.get("GATHER"):  # the gather finish ran (on every rank)
-                    self.assertGreaterEqual(result.stdout.count("GATHER at round"), 4, result.stdout[-2000:])
+                    self.assertGreaterEqual(
+                        result.stdout.count("GATHER at round"), 4, result.stdout[-2000:]
+                    )
 
 
 class TestManyOperandOps(CustomTestCase):
@@ -749,14 +815,18 @@ print("OK")
 """
 
     def test_operand_runs(self):
-        from sglang_tpu.k3_programs import bridge
         from jax.sharding import PartitionSpec as P
 
+        from sglang_tpu.k3_programs import bridge
+
         specs = (P("x"),) * 3 + (P(),)
-        self.assertEqual(bridge._operand_runs(specs, (1,)), [(0, 1), (1, 2), (2, 3), (3, 4)])
+        self.assertEqual(
+            bridge._operand_runs(specs, (1,)), [(0, 1), (1, 2), (2, 3), (3, 4)]
+        )
         many = (P("x"),) * 70 + (P(),)
         self.assertEqual(
-            bridge._operand_runs(many, tuple(range(40, 70))), [(0, 40), (40, 70), (70, 71)]
+            bridge._operand_runs(many, tuple(range(40, 70))),
+            [(0, 40), (40, 70), (70, 71)],
         )
 
     def test_registers_and_traces_with_flat_operands(self):
@@ -764,11 +834,19 @@ print("OK")
         import subprocess
         import sys
 
-        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), JAX_PLATFORMS="cpu")
-        result = subprocess.run(
-            [sys.executable, "-c", self.SCRIPT], capture_output=True, text=True, env=env, timeout=600
+        env = dict(
+            os.environ, PYTHONPATH=os.pathsep.join(sys.path), JAX_PLATFORMS="cpu"
         )
-        self.assertIn("OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:])
+        result = subprocess.run(
+            [sys.executable, "-c", self.SCRIPT],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=600,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
 
 
 class TestK31Draft(CustomTestCase):
@@ -778,16 +856,36 @@ class TestK31Draft(CustomTestCase):
     the reference attention's block rows see only earlier block rows."""
 
     CONFIG = {
-        "model_type": "k3_dspark", "hidden_size": 7168, "num_hidden_layers": 5,
-        "num_attention_heads": 96, "q_lora_rank": 1536, "kv_lora_rank": 512,
-        "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
-        "intermediate_size": 14336, "vocab_size": 163840, "rms_norm_eps": 1e-5,
-        "target_layer_ids": [75, 79, 83, 87, 91], "mask_token_id": 163839, "markov_rank": 512,
-        "block_size": 7, "rope_interleave": True, "full_attention_causal": True,
+        "model_type": "k3_dspark",
+        "hidden_size": 7168,
+        "num_hidden_layers": 5,
+        "num_attention_heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "intermediate_size": 14336,
+        "vocab_size": 163840,
+        "rms_norm_eps": 1e-5,
+        "target_layer_ids": [75, 79, 83, 87, 91],
+        "mask_token_id": 163839,
+        "markov_rank": 512,
+        "block_size": 7,
+        "rope_interleave": True,
+        "full_attention_causal": True,
         "dflash_config": {"causal": True},
-        "rope_parameters": {"rope_type": "yarn", "rope_theta": 1000000.0, "factor": 32.0,
-                            "original_max_position_embeddings": 32768, "beta_fast": 32, "beta_slow": 1,
-                            "mscale": 1.0, "mscale_all_dim": 0.0, "attn_factor": 0.7426255848312643},
+        "rope_parameters": {
+            "rope_type": "yarn",
+            "rope_theta": 1000000.0,
+            "factor": 32.0,
+            "original_max_position_embeddings": 32768,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 1.0,
+            "mscale_all_dim": 0.0,
+            "attn_factor": 0.7426255848312643,
+        },
     }
 
     def test_config_and_causal_reference(self):
@@ -800,21 +898,48 @@ class TestK31Draft(CustomTestCase):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "config.json").write_text(json.dumps(self.CONFIG))
             c = mla.MlaDraftConfig.from_checkpoint(Path(d))
-        self.assertEqual((c.heads_per_rank, c.causal, c.markov_rank, c.mask_token), (3, True, 512, 163839))
+        self.assertEqual(
+            (c.heads_per_rank, c.causal, c.markov_rank, c.mask_token),
+            (3, True, 512, 163839),
+        )
         self.assertEqual(c.aux_layers, (76, 80, 84, 88, 92))
         self.assertAlmostEqual(mla.rope_mscale(c), 1.0, places=6)
         self.assertAlmostEqual(c.softmax_scale, 192**-0.5, places=9)
-        small = dataclasses.replace(c, hidden=256, heads=4, q_lora=128, kv_lora=64, nope=32, rope=16,
-                                    v_head=32, intermediate=128, vocab=512, layers=1)
+        small = dataclasses.replace(
+            c,
+            hidden=256,
+            heads=4,
+            q_lora=128,
+            kv_lora=64,
+            nope=32,
+            rope=16,
+            v_head=32,
+            intermediate=128,
+            vocab=512,
+            layers=1,
+        )
         rng = np.random.default_rng(0)
-        w = {k: jnp.asarray(rng.standard_normal(s).astype(np.float32) * 0.05)
-             for k, s in mla.weight_shapes(small).items()}
+        w = {
+            k: jnp.asarray(rng.standard_normal(s).astype(np.float32) * 0.05)
+            for k, s in mla.weight_shapes(small).items()
+        }
         h = jnp.asarray(rng.standard_normal((4, small.hidden)).astype(np.float32))
-        positions, context = jnp.arange(10, 14), jnp.asarray(rng.standard_normal((6, small.latent)).astype(np.float32))
+        positions, context = (
+            jnp.arange(10, 14),
+            jnp.asarray(rng.standard_normal((6, small.latent)).astype(np.float32)),
+        )
         valid = jnp.ones((6,), bool)
         causal = mla.reference_attention(w, small, 0, h, positions, context, valid)
-        full = mla.reference_attention(w, dataclasses.replace(small, causal=False), 0, h, positions, context, valid)
-        alone = mla.reference_attention(w, small, 0, h[:1], positions[:1], context, valid)
-        np.testing.assert_allclose(causal[-1], full[-1], atol=1e-5)  # the last row sees every block row
-        np.testing.assert_allclose(causal[0], alone[0], atol=1e-5)  # the first sees only itself
+        full = mla.reference_attention(
+            w, dataclasses.replace(small, causal=False), 0, h, positions, context, valid
+        )
+        alone = mla.reference_attention(
+            w, small, 0, h[:1], positions[:1], context, valid
+        )
+        np.testing.assert_allclose(
+            causal[-1], full[-1], atol=1e-5
+        )  # the last row sees every block row
+        np.testing.assert_allclose(
+            causal[0], alone[0], atol=1e-5
+        )  # the first sees only itself
         self.assertFalse(np.allclose(causal[0], full[0], atol=1e-5))

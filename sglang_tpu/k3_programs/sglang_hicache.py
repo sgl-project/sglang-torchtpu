@@ -149,7 +149,12 @@ class K3HostStatePool:
     storage_format_tag = None
 
     def __init__(
-        self, device_pool: Any, transfer: Any, num_slots: int, block_base: int, block_bytes: int
+        self,
+        device_pool: Any,
+        transfer: Any,
+        num_slots: int,
+        block_base: int,
+        block_bytes: int,
     ) -> None:
         self.device_pool = device_pool
         self.transfer = transfer
@@ -202,7 +207,9 @@ class K3HostStatePool:
             for g in range(KDA_PER_POOL)
         ]
 
-    def backup_from_device_all_layer(self, device_pool, host_indices, device_indices, io_backend):
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
         return self.transfer.backup(
             self._device_rows(device_indices), self._host_blocks(host_indices)
         )
@@ -213,7 +220,9 @@ class K3HostStatePool:
         )
 
     def load_to_device_per_layer(self, *args, **kwargs) -> None:
-        raise NotImplementedError("K3 host checkpoints load all pools at once (load_all_layer)")
+        raise NotImplementedError(
+            "K3 host checkpoints load all pools at once (load_all_layer)"
+        )
 
     def get_data_page(self, index, flat: bool = True):
         raise NotImplementedError("K3 host tier: no L3 storage")
@@ -286,11 +295,15 @@ class K3Strategy(StackStrategy):
             )
         transfer = create_tpu_dma_kv_transfer(memory.hicache_io_backend, view, blocks)
         kv_host = K3HostKVPool(kv_pool, view, transfer, pages, params.page_size)
-        state_host = K3HostStatePool(state_pool, transfer, slots, pages, view.block_bytes)
+        state_host = K3HostStatePool(
+            state_pool, transfer, slots, pages, view.block_bytes
+        )
         full_mapping = _stage_local_layer_mapping(
             kvcache.full_attention_layer_id_mapping, kvcache.start_layer
         )
-        mamba_mapping = _stage_local_layer_mapping(req_pool.mamba_map, kvcache.start_layer)
+        mamba_mapping = _stage_local_layer_mapping(
+            req_pool.mamba_map, kvcache.start_layer
+        )
         transfer_layer_id_max = max(full_mapping.keys() | mamba_mapping.keys()) + 1
         allocator = req_pool.mamba_allocator
         group = HostPoolGroup(

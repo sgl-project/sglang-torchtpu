@@ -22,7 +22,6 @@ from sglang_tpu.allocator_tpu import (
 )
 from sglang_tpu.k3_programs import sglang_dp as dp
 
-
 _ACTIVE: list = []
 
 
@@ -38,7 +37,9 @@ class K3DpPagedAllocator(TpuPagedTokenToKVPoolAllocator):
         super().clear()
         if self.num_pages % dp.GROUPS:
             # An odd last page stays out of both regions.
-            self.free_pages = self.free_pages[self.free_pages <= self.num_pages // 2 * 2]
+            self.free_pages = self.free_pages[
+                self.free_pages <= self.num_pages // 2 * 2
+            ]
             self.page_is_free[self.num_pages] = False
         self.group_requests = [0] * dp.GROUPS
         self.request_group: dict[str, int] = {}
@@ -138,17 +139,24 @@ class K3DpPagedAllocator(TpuPagedTokenToKVPoolAllocator):
         page = int(last_loc) // self.page_size if int(last_loc) >= 0 else 0
         if page >= 1:
             return self.group_of_page(page)
-        return self.pending_group if self.pending_group is not None else self.pick_group()
+        return (
+            self.pending_group if self.pending_group is not None else self.pick_group()
+        )
 
     pending_group: int | None = None
 
     def alloc(self, need_size: int):
         assert need_size % self.page_size == 0
-        group = self.pending_group if self.pending_group is not None else self.pick_group()
+        group = (
+            self.pending_group if self.pending_group is not None else self.pick_group()
+        )
         pages = self._take(group, need_size // self.page_size)
         if pages is None:
             return None
-        out = (pages[:, None] * self.page_size + torch.arange(self.page_size, dtype=torch.int32)).reshape(-1)
+        out = (
+            pages[:, None] * self.page_size
+            + torch.arange(self.page_size, dtype=torch.int32)
+        ).reshape(-1)
         return out.to(self.device, non_blocking=True)
 
     def alloc_extend(
@@ -165,11 +173,13 @@ class K3DpPagedAllocator(TpuPagedTokenToKVPoolAllocator):
     ):
         last = last_loc.cpu()
         per_request = [
-            int(get_num_new_pages(
-                seq_lens=seq_lens_cpu[i : i + 1],
-                page_size=self.page_size,
-                prefix_lens=prefix_lens_cpu[i : i + 1],
-            ))
+            int(
+                get_num_new_pages(
+                    seq_lens=seq_lens_cpu[i : i + 1],
+                    page_size=self.page_size,
+                    prefix_lens=prefix_lens_cpu[i : i + 1],
+                )
+            )
             for i in range(len(seq_lens_cpu))
         ]
         taken: list[torch.Tensor] = []
@@ -180,13 +190,24 @@ class K3DpPagedAllocator(TpuPagedTokenToKVPoolAllocator):
                     self.free_landing(got)
                 return None
             taken.append(pages)
-        free_pages_cpu = torch.cat(taken) if taken else torch.empty((0,), dtype=torch.int32)
+        free_pages_cpu = (
+            torch.cat(taken) if taken else torch.empty((0,), dtype=torch.int32)
+        )
         if out_indices_cpu is None:
             out_indices_cpu = torch.empty((extend_num_tokens,), dtype=torch.int32)
         alloc_extend_vectorized_cpu(
-            prefix_lens_cpu, seq_lens_cpu, last, free_pages_cpu, out_indices_cpu, self.page_size
+            prefix_lens_cpu,
+            seq_lens_cpu,
+            last,
+            free_pages_cpu,
+            out_indices_cpu,
+            self.page_size,
         )
-        out = out_indices_cpu if return_host else out_indices_cpu.to(self.device, non_blocking=True)
+        out = (
+            out_indices_cpu
+            if return_host
+            else out_indices_cpu.to(self.device, non_blocking=True)
+        )
         return out.int()
 
     def alloc_decode(

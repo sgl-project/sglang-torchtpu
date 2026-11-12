@@ -122,8 +122,9 @@ class TestSharedExperts(CustomTestCase):
     def test_only_at_equal_expert_parallelism(self):
         for ep, decode_ep in ((16, 8), (8, 16), (32, 32)):
             with self.subTest(ep=ep, decode_ep=decode_ep):
-                with _config(ep, decode_ep), self.assertRaisesRegex(
-                    ValueError, f"not {ep} and {decode_ep}"
+                with (
+                    _config(ep, decode_ep),
+                    self.assertRaisesRegex(ValueError, f"not {ep} and {decode_ep}"),
                 ):
                     colocated.share_experts(self.prefiller, self.decoder)
 

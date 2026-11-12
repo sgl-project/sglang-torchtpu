@@ -36,7 +36,10 @@ class _PaddedBf16Rows(pool_alias.Reinterpret):
         rows, width = self.shape
         backing_rows = math.prod(shape) // width
         assert len(self.shape) == 2 and width % 128 == 0 and 1 <= rows <= backing_rows
-        assert backing_rows * width == math.prod(shape) and backing_rows % 16 == 0, (shape, self.shape)
+        assert backing_rows * width == math.prod(shape) and backing_rows % 16 == 0, (
+            shape,
+            self.shape,
+        )
 
 
 # Named phase scopes for XProf custom-call tracing (KernelConfig.phase_scopes=True).
@@ -61,12 +64,15 @@ def _phase_end(scope):
 
 def _scoped(name):
     """Decorator form of _phase for pl.when bodies."""
+
     def wrap(function):
         @functools.wraps(function)
         def scoped(*args, **kwargs):
             with _phase(name):
                 return function(*args, **kwargs)
+
         return scoped
+
     return wrap
 
 
@@ -118,12 +124,10 @@ def _attention_scores(queries, keys):
 def _gated_activation(gate, value):
     """Kimi K3 shared/routed expert activation, rounded to BF16."""
     return (
-        4
-        * jnp.tanh(gate / 4)
-        * jax.nn.sigmoid(gate)
-        * 25
-        * jnp.tanh(value / 25)
+        4 * jnp.tanh(gate / 4) * jax.nn.sigmoid(gate) * 25 * jnp.tanh(value / 25)
     ).astype(jnp.bfloat16)
+
+
 def _route_hidden_states(
     hidden_states,
     routing_projection_vmem,
@@ -165,9 +169,7 @@ def _route_hidden_states(
     # hold stale bytes, so zero their scores.
     column = jax.lax.broadcasted_iota(jnp.int32, local_scores.shape, 1)
     local_scores = jnp.where((router_lane == 0) | (column < 384), local_scores, 0.0)
-    score_half = routing_scores_vmem.at[
-        :, pl.ds(router_lane * 512, 512)
-    ]
+    score_half = routing_scores_vmem.at[:, pl.ds(router_lane * 512, 512)]
     score_half[...] = local_scores
     if after_scores is not None:
         after_scores()  # the router projection is consumed
@@ -189,12 +191,8 @@ def _route_hidden_states(
     routing_scores_vmem[:, :expert_count] = (
         uncorrected_probabilities + routing_bias_ref[...]
     )
-    selected_experts = jnp.zeros(
-        (batch_size, selected_expert_count), jnp.int32
-    )
-    selected_probabilities = jnp.zeros(
-        (batch_size, selected_expert_count), jnp.float32
-    )
+    selected_experts = jnp.zeros((batch_size, selected_expert_count), jnp.int32)
+    selected_probabilities = jnp.zeros((batch_size, selected_expert_count), jnp.float32)
     local_route_counts = jnp.zeros((batch_size,), jnp.int32)
     probability_totals = jnp.zeros((batch_size,), jnp.float32)
     expert_ids = jnp.arange(expert_count)[None, :]
@@ -202,9 +200,9 @@ def _route_hidden_states(
     # Only top-k rank is sequential. Every score reduction and ownership
     # operation carries the leading batch dimension with no per-row control.
     for selection in range(selected_expert_count):
-        winners = jnp.argmax(
-            routing_scores_vmem[:, :expert_count], axis=1
-        ).astype(jnp.int32)
+        winners = jnp.argmax(routing_scores_vmem[:, :expert_count], axis=1).astype(
+            jnp.int32
+        )
         winner_mask = expert_ids == winners[:, None]
         probabilities = jnp.sum(
             jnp.where(winner_mask, uncorrected_probabilities, 0), axis=1
@@ -215,15 +213,11 @@ def _route_hidden_states(
         )
 
         counts_before_selection = local_route_counts
-        owned_locally = (
-            winners // local_expert_count
-            == rank // expert_tensor_parallel
-        )
+        owned_locally = winners // local_expert_count == rank // expert_tensor_parallel
         if live_rows is not None:
             owned_locally &= live_rows
-        destination_mask = (
-            owned_locally[:, None]
-            & (route_slots == counts_before_selection[:, None])
+        destination_mask = owned_locally[:, None] & (
+            route_slots == counts_before_selection[:, None]
         )
         selected_experts = jnp.where(
             destination_mask,
@@ -235,9 +229,7 @@ def _route_hidden_states(
             probabilities[:, None],
             selected_probabilities,
         )
-        local_route_counts = (
-            counts_before_selection + owned_locally.astype(jnp.int32)
-        )
+        local_route_counts = counts_before_selection + owned_locally.astype(jnp.int32)
         on_local_selection(
             winners, owned_locally, counts_before_selection, selected_experts
         )
@@ -247,7 +239,9 @@ def _route_hidden_states(
         selected_experts,
         selected_probabilities,
         local_route_counts,
-        probability_totals if live_rows is None else jnp.where(live_rows, probability_totals, 1.0),
+        probability_totals
+        if live_rows is None
+        else jnp.where(live_rows, probability_totals, 1.0),
     )
 
 
@@ -288,7 +282,9 @@ def _route_owned_rows(
         raise ValueError("Sharded routing needs one row block per local rank pair")
 
     router_lane = rank % 2
-    local_scores = _dot(owned_hidden_ref[...], routing_projection_vmem[0]).reshape(rows, 512)
+    local_scores = _dot(owned_hidden_ref[...], routing_projection_vmem[0]).reshape(
+        rows, 512
+    )
     # Lane 1's last 128 router columns are padding; in the shared arena they
     # hold stale bytes, so zero their scores.
     column = jax.lax.broadcasted_iota(jnp.int32, local_scores.shape, 1)
@@ -298,8 +294,12 @@ def _route_owned_rows(
     if after_scores is not None:
         after_scores()  # the router projection is consumed
     copy = tpu.make_async_remote_copy(
-        score_half, score_half, send_semaphores.at[1], receive_semaphores.at[1],
-        device_id=(rank ^ 1,), device_id_type=pl.DeviceIdType.MESH,
+        score_half,
+        score_half,
+        send_semaphores.at[1],
+        receive_semaphores.at[1],
+        device_id=(rank ^ 1,),
+        device_id_type=pl.DeviceIdType.MESH,
     )
     copy.start()
     copy.wait()
@@ -313,7 +313,9 @@ def _route_owned_rows(
     for selection in range(selected_expert_count):
         winners = jnp.argmax(scores[...], axis=1).astype(jnp.int32)
         winner_mask = expert_ids == winners[:, None]
-        probabilities = jnp.sum(jnp.where(winner_mask, uncorrected_probabilities, 0), axis=1)
+        probabilities = jnp.sum(
+            jnp.where(winner_mask, uncorrected_probabilities, 0), axis=1
+        )
         probability_totals += probabilities
         scores[...] = jnp.where(winner_mask, -jnp.inf, scores[...])
         winners_by_slot.append(winners)
@@ -333,6 +335,7 @@ def _route_owned_rows(
         axis=1,
     )
     for owner in range(4):
+
         @pl.when(pair == owner)
         def gather_selections(owner=owner):
             destination = selections_vmem.at[pl.ds(owner * rows, rows)]
@@ -340,9 +343,12 @@ def _route_owned_rows(
             copies = []
             for offset in range(3, 0, -1):
                 copy = tpu.make_async_remote_copy(
-                    selection_source_vmem, destination,
-                    send_semaphores.at[1 + offset], receive_semaphores.at[1 + offset],
-                    device_id=(rank ^ (2 * offset),), device_id_type=pl.DeviceIdType.MESH,
+                    selection_source_vmem,
+                    destination,
+                    send_semaphores.at[1 + offset],
+                    receive_semaphores.at[1 + offset],
+                    device_id=(rank ^ (2 * offset),),
+                    device_id_type=pl.DeviceIdType.MESH,
                 )
                 copy.start()
                 copies.append(copy)
@@ -373,12 +379,16 @@ def _route_owned_rows(
             destination_mask, probabilities[:, None], selected_probabilities
         )
         local_route_counts = counts_before_selection + owned_locally.astype(jnp.int32)
-        on_local_selection(winners, owned_locally, counts_before_selection, selected_experts)
+        on_local_selection(
+            winners, owned_locally, counts_before_selection, selected_experts
+        )
     return (
         selected_experts,
         selected_probabilities,
         local_route_counts,
-        gathered[:, 2 * k] if live_rows is None else jnp.where(live_rows, gathered[:, 2 * k], 1.0),
+        gathered[:, 2 * k]
+        if live_rows is None
+        else jnp.where(live_rows, gathered[:, 2 * k], 1.0),
     )
 
 
@@ -429,9 +439,9 @@ def _start_initial_expert_weight_copies(
             )
             has_expert = jnp.any(rows_with_routes)
             expert = jnp.where(has_expert, minimum_expert, 0).astype(jnp.int32)
-            consumed = (
-                rows_with_routes & (current_experts == expert)
-            )[:, None] & current_slot_mask
+            consumed = (rows_with_routes & (current_experts == expert))[
+                :, None
+            ] & current_slot_mask
         return expert, consumed, has_expert
 
     for slot in range(slot_count):
@@ -442,6 +452,8 @@ def _start_initial_expert_weight_copies(
             _start_async_copies(copy_expert(expert, slot))
 
         processed |= consumed
+
+
 def _quantized_expert_dot(
     source,
     packed,
@@ -488,8 +500,8 @@ def _quantized_expert_dot(
                 (((1,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )[: activation.shape[0]]
-            accumulator[...] += (
-                partial * scales[scale_block : scale_block + 1].astype(jnp.float32)
+            accumulator[...] += partial * scales[scale_block : scale_block + 1].astype(
+                jnp.float32
             )
         return
 
@@ -508,21 +520,19 @@ def _quantized_expert_dot(
             ).astype(jnp.float8_e4m3fn)
         else:
             values = tpu.bitcast(
-                packed[
-                    pl.ds(pl.multiple_of(start // 8, 8), size // 8), :
-                ],
+                packed[pl.ds(pl.multiple_of(start // 8, 8), size // 8), :],
                 jnp.float4_e2m1fn,
             ).astype(jnp.float8_e4m3fn)
         if static_tiles:
-            exponents = scales[...][
-                start // 32 : (start + size) // 32, :
-            ].astype(jnp.uint32)
+            exponents = scales[...][start // 32 : (start + size) // 32, :].astype(
+                jnp.uint32
+            )
         elif split_small_contraction:
             # The full 24-row view is aligned even though the second static
             # 512-wide tile begins halfway through a 32-row VMEM tile.
-            exponents = scales[...][
-                start // 32 : (start + size) // 32, :
-            ].astype(jnp.uint32)
+            exponents = scales[...][start // 32 : (start + size) // 32, :].astype(
+                jnp.uint32
+            )
         else:
             exponents = scales[
                 pl.ds(pl.multiple_of(start // 32, 32), size // 32), :
@@ -544,8 +554,7 @@ def _quantized_expert_dot(
             for offset in range(0, size, dot_tile):
                 width = min(dot_tile, size - offset)
                 mask = (
-                    jnp.arange(width // 32)[:, None]
-                    == jnp.arange(width)[None, :] // 32
+                    jnp.arange(width // 32)[:, None] == jnp.arange(width)[None, :] // 32
                 )
                 left = jnp.where(
                     mask[None],
@@ -564,20 +573,22 @@ def _quantized_expert_dot(
             accumulator[...] += jnp.sum(partial * scale[None], axis=1)
             return
         scale_block_mask = (
-            jnp.arange(size // 32)[:, None]
-            == jnp.arange(size)[None, :] // 32
+            jnp.arange(size // 32)[:, None] == jnp.arange(size)[None, :] // 32
         )
         if split_small_contraction and activation.shape[0] == 1:
             # One row: keep the scale blocks in sublanes instead of padding a
             # [blocks, 1, N] partial. Add them sequentially, the order of the
             # major-axis sum below, so both shapes round identically.
             left = jnp.where(scale_block_mask, activation, jnp.bfloat16(0))
-            scaled = jax.lax.dot_general(
-                left,
-                values,
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            ) * scale
+            scaled = (
+                jax.lax.dot_general(
+                    left,
+                    values,
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                * scale
+            )
             total = scaled[0:1]
             for block in range(1, size // 32):
                 total = total + scaled[block : block + 1]
@@ -594,9 +605,7 @@ def _quantized_expert_dot(
                 (((2,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )
-            accumulator[...] += jnp.sum(
-                partial * scale[:, None, :], axis=0
-            )
+            accumulator[...] += jnp.sum(partial * scale[:, None, :], axis=0)
         else:
             left = jnp.where(
                 scale_block_mask[None], activation[:, None, :], jnp.bfloat16(0)
@@ -616,6 +625,7 @@ def _quantized_expert_dot(
         for start in range(0, contraction_size, block_size):
             tile(start, block_size)
     else:
+
         @pl.loop(0, contraction_size // block_size)
         def full_tile(index):
             tile(index * block_size, block_size)
@@ -673,12 +683,8 @@ def _paired_expert_gate_up(
             )
             scales = jnp.concatenate(
                 (
-                    gate_up_scale_vmem[
-                        first_slot, scale_block : scale_block + 1, :
-                    ],
-                    gate_up_scale_vmem[
-                        second_slot, scale_block : scale_block + 1, :
-                    ],
+                    gate_up_scale_vmem[first_slot, scale_block : scale_block + 1, :],
+                    gate_up_scale_vmem[second_slot, scale_block : scale_block + 1, :],
                 ),
                 axis=1,
             ).astype(jnp.float32)
@@ -691,9 +697,7 @@ def _paired_expert_gate_up(
                         activation,
                         second_source[
                             :,
-                            pl.ds(
-                                pl.multiple_of(start, 128), scale_block_size
-                            ),
+                            pl.ds(pl.multiple_of(start, 128), scale_block_size),
                         ].astype(jnp.bfloat16),
                     ),
                     axis=0,
@@ -713,26 +717,16 @@ def _paired_expert_gate_up(
     def tile(start, size):
         packed = jnp.concatenate(
             (
-                gate_up_vmem[
-                    first_slot, pl.ds(start // 8, size // 8), :
-                ],
-                gate_up_vmem[
-                    second_slot, pl.ds(start // 8, size // 8), :
-                ],
+                gate_up_vmem[first_slot, pl.ds(start // 8, size // 8), :],
+                gate_up_vmem[second_slot, pl.ds(start // 8, size // 8), :],
             ),
             axis=1,
         )
-        values = tpu.bitcast(packed, jnp.float4_e2m1fn).astype(
-            jnp.float8_e4m3fn
-        )
+        values = tpu.bitcast(packed, jnp.float4_e2m1fn).astype(jnp.float8_e4m3fn)
         exponents = jnp.concatenate(
             (
-                gate_up_scale_vmem[
-                    first_slot, pl.ds(start // 32, size // 32), :
-                ],
-                gate_up_scale_vmem[
-                    second_slot, pl.ds(start // 32, size // 32), :
-                ],
+                gate_up_scale_vmem[first_slot, pl.ds(start // 32, size // 32), :],
+                gate_up_scale_vmem[second_slot, pl.ds(start // 32, size // 32), :],
             ),
             axis=1,
         ).astype(jnp.uint32)
@@ -747,8 +741,7 @@ def _paired_expert_gate_up(
                 axis=0,
             )
         scale_block_mask = (
-            jnp.arange(size // 32)[:, None]
-            == jnp.arange(size)[None, :] // 32
+            jnp.arange(size // 32)[:, None] == jnp.arange(size)[None, :] // 32
         )
         left = jnp.where(
             scale_block_mask[None], activation[:, None, :], jnp.bfloat16(0)
@@ -759,19 +752,23 @@ def _paired_expert_gate_up(
             columns = values.shape[1] // 2
             for half in range(2):
                 partial = jax.lax.dot_general(
-                    left[half * rows:half * rows + active],
-                    values[:, half * columns:(half + 1) * columns],
+                    left[half * rows : half * rows + active],
+                    values[:, half * columns : (half + 1) * columns],
                     (((2,), (0,)), ((), ())),
                     preferred_element_type=jnp.float32,
                 )
                 result = jnp.sum(
-                    partial * scale[None, :, half * columns:(half + 1) * columns], axis=1
+                    partial * scale[None, :, half * columns : (half + 1) * columns],
+                    axis=1,
                 )
                 accumulator[
-                    half * rows:(half + 1) * rows,
-                    half * columns:(half + 1) * columns,
-                ] += (result if active_capacity is None else
-                      jnp.pad(result, ((0, rows - active), (0, 0))))
+                    half * rows : (half + 1) * rows,
+                    half * columns : (half + 1) * columns,
+                ] += (
+                    result
+                    if active_capacity is None
+                    else jnp.pad(result, ((0, rows - active), (0, 0)))
+                )
         else:
             partial = jax.lax.dot_general(
                 left,
@@ -787,7 +784,9 @@ def _paired_expert_gate_up(
         tile(start, min(tile_size, contraction_size - start))
 
 
-def _paired_order_expert_gate_up(source, packed, scales, accumulator, contraction_size, tile_size):
+def _paired_order_expert_gate_up(
+    source, packed, scales, accumulator, contraction_size, tile_size
+):
     """Project one expert in the paired gate/up's FP32 accumulation order.
 
     Pair membership changes when null routes disappear. Tail and overflow
@@ -797,24 +796,28 @@ def _paired_order_expert_gate_up(source, packed, scales, accumulator, contractio
     accumulator[...] = jnp.zeros(accumulator.shape, jnp.float32)
     for start in range(0, contraction_size, tile_size):
         size = min(tile_size, contraction_size - start)
-        values = tpu.bitcast(packed[pl.ds(start // 8, size // 8), :],
-                             jnp.float4_e2m1fn).astype(jnp.float8_e4m3fn)
+        values = tpu.bitcast(
+            packed[pl.ds(start // 8, size // 8), :], jnp.float4_e2m1fn
+        ).astype(jnp.float8_e4m3fn)
         exponents = scales[pl.ds(start // 32, size // 32), :].astype(jnp.uint32)
         scale = jax.lax.bitcast_convert_type(exponents << 23, jnp.float32)
         activation = source[:, pl.ds(start, size)].astype(jnp.bfloat16)
         mask = jnp.arange(size // 32)[:, None] == jnp.arange(size)[None, :] // 32
         left = jnp.where(mask[None], activation[:, None, :], jnp.bfloat16(0))
-        partial = jax.lax.dot_general(left, values, (((2,), (0,)), ((), ())),
-                                      preferred_element_type=jnp.float32)
+        partial = jax.lax.dot_general(
+            left, values, (((2,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        )
         accumulator[...] += jnp.sum(partial * scale[None], axis=1)
 
 
 def _dot_scoped(function, name_of):
     """Profiling: trace each routed-expert product as its own e_dot_* phase."""
+
     @functools.wraps(function)
     def scoped(*args, **kwargs):
         with _phase(name_of(*args, **kwargs)):
             return function(*args, **kwargs)
+
     return scoped
 
 
@@ -825,7 +828,9 @@ if PHASE_SCOPES:
             "e_dot_fp8" if packed.dtype == jnp.float8_e4m3fn else "e_dot_mxfp4"
         ),
     )
-    _paired_expert_gate_up = _dot_scoped(_paired_expert_gate_up, lambda *args, **kwargs: "e_dot_pair")
+    _paired_expert_gate_up = _dot_scoped(
+        _paired_expert_gate_up, lambda *args, **kwargs: "e_dot_pair"
+    )
 
 
 def _run_routed_expert_stream(
@@ -864,24 +869,36 @@ def _run_routed_expert_stream(
     # the unsplit scale reduction tree. KernelConfig.mxfp4_dot_tile overrides
     # the per-batch default (0: unsplit dots).
     dot_tile = (
-        MXFP4_DOT_TILE if MXFP4_DOT_TILE is not None
-        else 1024 if batch_size == 96
-        else 512 if batch_size in (1, 2, 4, 8, 16, 32, 48, 64, 128) else 0
+        MXFP4_DOT_TILE
+        if MXFP4_DOT_TILE is not None
+        else 1024
+        if batch_size == 96
+        else 512
+        if batch_size in (1, 2, 4, 8, 16, 32, 48, 64, 128)
+        else 0
     )
     # Aligned block staging avoids a separate source-slice branch for every
     # batch row. On by default at B16-B128; KernelConfig.singleton_block
     # and stage_blocks override it.
     singleton_block = (
-        SINGLETON_BLOCK if SINGLETON_BLOCK is not None
+        SINGLETON_BLOCK
+        if SINGLETON_BLOCK is not None
         else batch_size in (16, 32, 48, 64, 80, 96, 128)
     )
     stage_blocks = (
-        STAGE_BLOCKS if STAGE_BLOCKS is not None
+        STAGE_BLOCKS
+        if STAGE_BLOCKS is not None
         else batch_size in (16, 32, 48, 64, 80, 96, 128)
     )
-    def expert_dot(source, packed, scales, accumulator, contraction_size, output_size, **options):
-        if (batch_size > 1 and contraction_size == expert_input_size
-                and packed.dtype == jnp.uint32):
+
+    def expert_dot(
+        source, packed, scales, accumulator, contraction_size, output_size, **options
+    ):
+        if (
+            batch_size > 1
+            and contraction_size == expert_input_size
+            and packed.dtype == jnp.uint32
+        ):
             # A live expert may switch between a pair and the unpaired tail
             # as other rows enter or leave. Match the paired gate's scale
             # reduction tree, including its final partial tile.
@@ -889,29 +906,35 @@ def _run_routed_expert_stream(
                 source, packed, scales, accumulator, contraction_size, MXFP4_PAIR_TILE
             )
         return _quantized_expert_dot(
-            source, packed, scales, accumulator, contraction_size, output_size,
-            dot_tile=dot_tile, **options,
+            source,
+            packed,
+            scales,
+            accumulator,
+            contraction_size,
+            output_size,
+            dot_tile=dot_tile,
+            **options,
         )
+
     if PHASE_SCOPES:
         # Profiling: time spent waiting for expert weights (e_wait).
         unscoped_copy_expert = copy_expert
 
         def copy_expert(expert, slot, **options):
             copies = unscoped_copy_expert(expert, slot, **options)
-            return SimpleNamespace(**{
-                name: None if copy is None else _ScopedWait(copy)
-                for name, copy in vars(copies).items()
-            })
+            return SimpleNamespace(
+                **{
+                    name: None if copy is None else _ScopedWait(copy)
+                    for name, copy in vars(copies).items()
+                }
+            )
+
     route_slots = jnp.arange(selected_expert_count)[None, :]
-    processed_routes_vmem[...] = jnp.zeros(
-        processed_routes_vmem.shape, jnp.int32
-    )
+    processed_routes_vmem[...] = jnp.zeros(processed_routes_vmem.shape, jnp.int32)
     expert_output[...] = jnp.zeros(expert_output.shape, jnp.float32)
 
     def next_expert(processed):
-        pending = (
-            route_slots < local_route_counts[:, None]
-        ) & ~processed
+        pending = (route_slots < local_route_counts[:, None]) & ~processed
         if group_pending_routes:
             minimum_expert = jnp.min(
                 jnp.where(
@@ -950,14 +973,22 @@ def _run_routed_expert_stream(
         consumed = active_rows[:, None] & current_slot_mask
         return expert, active_rows, current_slot_mask, consumed, has_expert
 
-    def finish_expert(active_rows, current_slot_mask, copies, column, slot, output_weights=None):
-        gate_up = gate_up_accumulator[
-            :, (pl.ds(pl.multiple_of(column, 128), 2 * expert_width)
-                if share_full_finish else slice(column, column + 2 * expert_width))
-        ].astype(jnp.bfloat16).astype(jnp.float32)
-        middle = _gated_activation(
-            gate_up[:, :expert_width], gate_up[:, expert_width:]
+    def finish_expert(
+        active_rows, current_slot_mask, copies, column, slot, output_weights=None
+    ):
+        gate_up = (
+            gate_up_accumulator[
+                :,
+                (
+                    pl.ds(pl.multiple_of(column, 128), 2 * expert_width)
+                    if share_full_finish
+                    else slice(column, column + 2 * expert_width)
+                ),
+            ]
+            .astype(jnp.bfloat16)
+            .astype(jnp.float32)
         )
+        middle = _gated_activation(gate_up[:, :expert_width], gate_up[:, expert_width:])
         gate_up_accumulator[:, :expert_width] = middle.astype(jnp.float32)
         copies.down.wait()
         copies.down_scales.wait()
@@ -973,19 +1004,20 @@ def _run_routed_expert_stream(
             block_major=batch_size >= 8,
         )
         if output_weights is None:
-            route_probabilities = jnp.sum(
-                jnp.where(
-                    current_slot_mask,
-                    selected_probabilities,
-                    jnp.float32(0),
-                ),
-                axis=1,
-            ) / probability_totals
+            route_probabilities = (
+                jnp.sum(
+                    jnp.where(
+                        current_slot_mask,
+                        selected_probabilities,
+                        jnp.float32(0),
+                    ),
+                    axis=1,
+                )
+                / probability_totals
+            )
             output_weights = jnp.where(active_rows, route_probabilities, jnp.float32(0))
         expert_output[:, :expert_output_size] += (
-            down_accumulator[...]
-            .astype(jnp.bfloat16)
-            .astype(jnp.float32)
+            down_accumulator[...].astype(jnp.bfloat16).astype(jnp.float32)
             * output_weights[:, None]
         )
 
@@ -998,22 +1030,22 @@ def _run_routed_expert_stream(
         slot,
     ):
         """Finish one expert whose route is active for exactly one batch row."""
-        gate_up = gate_up_accumulator[
-            compact_row : compact_row + 1,
-            column : column + 2 * expert_width,
-        ].astype(jnp.bfloat16).astype(jnp.float32)
-        middle = _gated_activation(
-            gate_up[:, :expert_width], gate_up[:, expert_width:]
+        gate_up = (
+            gate_up_accumulator[
+                compact_row : compact_row + 1,
+                column : column + 2 * expert_width,
+            ]
+            .astype(jnp.bfloat16)
+            .astype(jnp.float32)
         )
-        gate_up_accumulator[
-            compact_row : compact_row + 1, :expert_width
-        ] = middle.astype(jnp.float32)
+        middle = _gated_activation(gate_up[:, :expert_width], gate_up[:, expert_width:])
+        gate_up_accumulator[compact_row : compact_row + 1, :expert_width] = (
+            middle.astype(jnp.float32)
+        )
         copies.down.wait()
         copies.down_scales.wait()
         expert_dot(
-            gate_up_accumulator.at[
-                compact_row : compact_row + 1, :expert_width
-            ],
+            gate_up_accumulator.at[compact_row : compact_row + 1, :expert_width],
             expert_down_vmem.at[slot],
             expert_down_scale_vmem.at[slot],
             down_accumulator.at[:1],
@@ -1023,19 +1055,18 @@ def _run_routed_expert_stream(
             # paths so a singleton row rounds the same as in a group.
             block_major=True,
         )
-        route_probabilities = jnp.sum(
-            jnp.where(
-                current_slot_mask,
-                selected_probabilities,
-                jnp.float32(0),
-            ),
-            axis=1,
-        ) / probability_totals
-        singleton_output = (
-            down_accumulator[:1]
-            .astype(jnp.bfloat16)
-            .astype(jnp.float32)
+        route_probabilities = (
+            jnp.sum(
+                jnp.where(
+                    current_slot_mask,
+                    selected_probabilities,
+                    jnp.float32(0),
+                ),
+                axis=1,
+            )
+            / probability_totals
         )
+        singleton_output = down_accumulator[:1].astype(jnp.bfloat16).astype(jnp.float32)
         row = jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
         probability = jnp.sum(
             jnp.where(active_rows, route_probabilities, jnp.float32(0))
@@ -1055,20 +1086,24 @@ def _run_routed_expert_stream(
         if singleton_block and batch_size % 16 == 0:
             active_index = jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
             block = source[
-                pl.ds(pl.multiple_of(active_index // 16 * 16, 16), 16), :expert_input_size
+                pl.ds(pl.multiple_of(active_index // 16 * 16, 16), 16),
+                :expert_input_size,
             ].astype(jnp.float32)
-            within = jax.lax.broadcasted_iota(jnp.int32, block.shape, 0) == active_index % 16
+            within = (
+                jax.lax.broadcasted_iota(jnp.int32, block.shape, 0) == active_index % 16
+            )
             destination[...] = jnp.sum(
                 jnp.where(within, block, 0.0), axis=0, keepdims=True
             ).astype(destination.dtype)
             return
         active_index = jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
         for row in range(batch_size):
+
             @pl.when(active_index == row)
             def copy_indexed_row(row=row):
-                destination[...] = source[
-                    row : row + 1, :expert_input_size
-                ].astype(destination.dtype)
+                destination[...] = source[row : row + 1, :expert_input_size].astype(
+                    destination.dtype
+                )
 
     def row_bitmask_words(active_rows):
         """The active rows as scalar bit words (32 rows per word)."""
@@ -1087,8 +1122,11 @@ def _run_routed_expert_stream(
         count_dtype = jnp.float32 if reuse_row_plan else jnp.int32
         index = jnp.arange(batch_size)
         return jnp.sum(
-            jnp.where(index[None, :] < index[:, None],
-                      active_rows[None, :].astype(count_dtype), 0),
+            jnp.where(
+                index[None, :] < index[:, None],
+                active_rows[None, :].astype(count_dtype),
+                0,
+            ),
             axis=1,
         ).astype(jnp.int32)
 
@@ -1101,7 +1139,10 @@ def _run_routed_expert_stream(
             before[None, :] == offset + jnp.arange(compact_capacity)[:, None]
         )
         indices = jnp.sum(
-            jnp.where(selected, jnp.arange(batch_size).astype(jnp.float32)[None, :], 0.0), axis=1
+            jnp.where(
+                selected, jnp.arange(batch_size).astype(jnp.float32)[None, :], 0.0
+            ),
+            axis=1,
         ).astype(jnp.int32)
         return indices, jnp.any(selected, axis=1)
 
@@ -1119,6 +1160,7 @@ def _run_routed_expert_stream(
         destination[...] = jnp.zeros(destination.shape, destination.dtype)
 
         if batch_size == 32:
+
             @pl.loop(0, batch_size // 16)
             def stage_block(block):
                 in_block = valid & (indices // 16 == block)
@@ -1133,11 +1175,15 @@ def _run_routed_expert_stream(
                         (compact_capacity, expert_input_size),
                     )
                     selected_rows = jnp.take_along_axis(
-                        rows, gather_indices, axis=0, mode="promise_in_bounds",
+                        rows,
+                        gather_indices,
+                        axis=0,
+                        mode="promise_in_bounds",
                     ).astype(jnp.float32)
                     destination[...] = jnp.where(
                         in_block[:, None], selected_rows, destination[...]
                     )
+
             return
 
         # Each gather stays inside one native 16-row BF16 tile. Matching
@@ -1145,15 +1191,21 @@ def _run_routed_expert_stream(
         @pl.loop(0, jnp.sum(valid.astype(jnp.float32)).astype(jnp.int32))
         def copy_row(position):
             index = jnp.sum(
-                jnp.where(jnp.arange(compact_capacity) == position,
-                          indices.astype(jnp.float32), 0.0)
+                jnp.where(
+                    jnp.arange(compact_capacity) == position,
+                    indices.astype(jnp.float32),
+                    0.0,
+                )
             ).astype(jnp.int32)
             rows = source[
                 pl.ds(pl.multiple_of(index // 16 * 16, 16), 16), :expert_input_size
             ]
             gather_indices = jnp.full((1, expert_input_size), index % 16, jnp.int16)
             selected_row = jnp.take_along_axis(
-                rows, gather_indices, axis=0, mode="promise_in_bounds",
+                rows,
+                gather_indices,
+                axis=0,
+                mode="promise_in_bounds",
             ).astype(jnp.float32)
             destination[pl.ds(position, 1), :] = selected_row
 
@@ -1168,22 +1220,27 @@ def _run_routed_expert_stream(
         destination[...] = jnp.zeros(destination.shape, destination.dtype)
         if stage_blocks and batch_size == 16:
             # B16 stages rows with a scalar scan over the row bitmask.
-            word, = row_bitmask_words(active_rows)
+            (word,) = row_bitmask_words(active_rows)
 
             def stage_block(block, position):
                 first = pl.multiple_of(block * 16, 16)
                 bits = (word >> (block * 16)) & 65535
+
                 def stage_nonempty(position):
                     for row in range(16):
                         bit = (bits >> row) & 1
-                        take = (bit != 0) & (position >= offset) & (position < offset + compact_capacity)
+                        take = (
+                            (bit != 0)
+                            & (position >= offset)
+                            & (position < offset + compact_capacity)
+                        )
 
                         @pl.when(take)
                         def copy_block_row(row=row, position=position):
                             rows = source[pl.ds(first, 16), :expert_input_size]
-                            destination[pl.ds(position - offset, 1), :] = (
-                                rows[row : row + 1].astype(jnp.float32)
-                            )
+                            destination[pl.ds(position - offset, 1), :] = rows[
+                                row : row + 1
+                            ].astype(jnp.float32)
 
                         position = position + bit
                     return position
@@ -1199,20 +1256,27 @@ def _run_routed_expert_stream(
             @pl.loop(0, batch_size // 16)
             def stage_block(block):
                 first = pl.multiple_of(block * 16, 16)
-                bits = jnp.sum(jnp.where(index // 16 == block, active << (index % 16), 0))
+                bits = jnp.sum(
+                    jnp.where(index // 16 == block, active << (index % 16), 0)
+                )
                 position = jnp.sum(jnp.where(index < block * 16, active, 0))
                 for row in range(16):
                     bit = (bits >> row) & 1
-                    take = (bit != 0) & (position >= offset) & (position < offset + compact_capacity)
+                    take = (
+                        (bit != 0)
+                        & (position >= offset)
+                        & (position < offset + compact_capacity)
+                    )
 
                     @pl.when(take)
                     def copy_block_row(row=row, position=position):
                         rows = source[pl.ds(first, 16), :expert_input_size]
-                        destination[pl.ds(position - offset, 1), :] = (
-                            rows[row : row + 1].astype(jnp.float32)
-                        )
+                        destination[pl.ds(position - offset, 1), :] = rows[
+                            row : row + 1
+                        ].astype(jnp.float32)
 
                     position = position + bit
+
             return
         words = row_bitmask_words(active_rows)
         position = jnp.int32(0)
@@ -1221,7 +1285,11 @@ def _run_routed_expert_stream(
             if isinstance(offset, int) and offset == 0:  # static first pass
                 take = bit != 0
             else:
-                take = (bit != 0) & (position >= offset) & (position < offset + compact_capacity)
+                take = (
+                    (bit != 0)
+                    & (position >= offset)
+                    & (position < offset + compact_capacity)
+                )
 
             @pl.when(take)
             def copy_active_row(row=row, position=position):
@@ -1232,15 +1300,20 @@ def _run_routed_expert_stream(
             position = position + bit
 
     def compact_route_data(active_rows, current_slot_mask, offset=0, row_plan=None):
-        route_probabilities = jnp.sum(
-            jnp.where(current_slot_mask, selected_probabilities, jnp.float32(0)),
-            axis=1,
-        ) / probability_totals
+        route_probabilities = (
+            jnp.sum(
+                jnp.where(current_slot_mask, selected_probabilities, jnp.float32(0)),
+                axis=1,
+            )
+            / probability_totals
+        )
         if reuse_row_plan:
             if row_plan is None:
                 row_plan = compact_row_plan(active_rows, offset)
             indices, valid = row_plan
-            selected = (jnp.arange(batch_size)[:, None] == indices[None, :]) & valid[None, :]
+            selected = (jnp.arange(batch_size)[:, None] == indices[None, :]) & valid[
+                None, :
+            ]
             selector = selected.astype(jnp.bfloat16)
             in_pass = jnp.any(selected, axis=1)
         else:
@@ -1249,24 +1322,42 @@ def _run_routed_expert_stream(
                 (before[:, None] - offset == jnp.arange(compact_capacity)[None, :])
                 & active_rows[:, None]
             ).astype(jnp.bfloat16)
-            in_pass = active_rows & (before >= offset) & (before < offset + compact_capacity)
+            in_pass = (
+                active_rows & (before >= offset) & (before < offset + compact_capacity)
+            )
         return selector, jnp.where(in_pass, route_probabilities, jnp.float32(0))
 
     def finish_compact_expert(
-        active_rows, current_slot_mask, copies, first_row, column, slot,
-        offset=0, wait_down=True, route_data=None,
+        active_rows,
+        current_slot_mask,
+        copies,
+        first_row,
+        column,
+        slot,
+        offset=0,
+        wait_down=True,
+        route_data=None,
     ):
         """Finish one expert whose active rows offset .. offset + C - 1 sit
         compacted in accumulator rows [first_row, first_row + C)."""
-        rows = (pl.ds(pl.multiple_of(first_row, 8), compact_capacity) if share_compact_finish
-                else slice(first_row, first_row + compact_capacity))
-        gate_up = gate_up_accumulator[
-            rows, (pl.ds(pl.multiple_of(column, 128), 2 * expert_width)
-                   if share_compact_finish else slice(column, column + 2 * expert_width))
-        ].astype(jnp.bfloat16).astype(jnp.float32)
-        middle = _gated_activation(
-            gate_up[:, :expert_width], gate_up[:, expert_width:]
+        rows = (
+            pl.ds(pl.multiple_of(first_row, 8), compact_capacity)
+            if share_compact_finish
+            else slice(first_row, first_row + compact_capacity)
         )
+        gate_up = (
+            gate_up_accumulator[
+                rows,
+                (
+                    pl.ds(pl.multiple_of(column, 128), 2 * expert_width)
+                    if share_compact_finish
+                    else slice(column, column + 2 * expert_width)
+                ),
+            ]
+            .astype(jnp.bfloat16)
+            .astype(jnp.float32)
+        )
+        middle = _gated_activation(gate_up[:, :expert_width], gate_up[:, expert_width:])
         gate_up_accumulator[rows, :expert_width] = middle.astype(jnp.float32)
         if wait_down:
             copies.down.wait()
@@ -1289,7 +1380,6 @@ def _run_routed_expert_stream(
         )
         expert_output[:, :expert_output_size] += selected * output_weights[:, None]
 
-
     compact_overflow = _use_compact_overflow(
         batch_size, expert_gate_up_vmem.dtype, group_pending_routes=group_pending_routes
     )
@@ -1300,13 +1390,17 @@ def _run_routed_expert_stream(
         compact_overflow and down_accumulator.shape[0] < batch_size
     )
     share_compact_finish = (
-        SHARED_EXPERT_FINISHERS and batch_size in (16, 32, 48, 64, 80, 96, 128) and compact_capacity == 8
+        SHARED_EXPERT_FINISHERS
+        and batch_size in (16, 32, 48, 64, 80, 96, 128)
+        and compact_capacity == 8
         and (not compact_only or compact_overflow)
         and expert_gate_up_vmem.dtype == jnp.uint32
     )
     share_full_finish = share_compact_finish and not compact_only
 
-    def run_expert_in_passes(active_rows, current_slot_mask, copies, row_count, slot, paired_gate=False):
+    def run_expert_in_passes(
+        active_rows, current_slot_mask, copies, row_count, slot, paired_gate=False
+    ):
         """One expert with more than C rows, C rows per pass."""
         copies.gate_up.wait()
         copies.gate_up_scales.wait()
@@ -1314,10 +1408,15 @@ def _run_routed_expert_stream(
         copies.down_scales.wait()
 
         before = compact_row_positions(active_rows) if reuse_row_plan else None
+
         @pl.loop(0, (row_count + compact_capacity - 1) // compact_capacity)
         def run_pass(index):
             offset = index * compact_capacity
-            row_plan = compact_row_plan(active_rows, offset, before) if reuse_row_plan else None
+            row_plan = (
+                compact_row_plan(active_rows, offset, before)
+                if reuse_row_plan
+                else None
+            )
             stage_compact_rows(active_rows, first_compact_source_vmem, offset, row_plan)
             if paired_gate:
                 _paired_order_expert_gate_up(
@@ -1325,7 +1424,8 @@ def _run_routed_expert_stream(
                     expert_gate_up_vmem.at[slot],
                     expert_gate_up_scale_vmem.at[slot],
                     gate_up_accumulator.at[:compact_capacity, : 2 * expert_width],
-                    expert_input_size, MXFP4_PAIR_TILE,
+                    expert_input_size,
+                    MXFP4_PAIR_TILE,
                 )
             else:
                 expert_dot(
@@ -1339,23 +1439,31 @@ def _run_routed_expert_stream(
             # Every pass owns its rows; finish it before reusing the compact
             # accumulator. Weight completions are consumed once, above.
             finish_compact_expert(
-                active_rows, current_slot_mask, copies, 0, 0, slot,
-                offset=offset, wait_down=False,
-                route_data=compact_route_data(active_rows, current_slot_mask, offset, row_plan),
+                active_rows,
+                current_slot_mask,
+                copies,
+                0,
+                0,
+                slot,
+                offset=offset,
+                wait_down=False,
+                route_data=compact_route_data(
+                    active_rows, current_slot_mask, offset, row_plan
+                ),
             )
 
     valid_routes = route_slots < local_route_counts[:, None]
-    routes_are_shared = (not group_pending_routes) & jnp.all(
-        local_route_counts == local_route_counts[0]
-    ) & jnp.all(
-        ~valid_routes
-        | (selected_experts == selected_experts[0:1])
+    routes_are_shared = (
+        (not group_pending_routes)
+        & jnp.all(local_route_counts == local_route_counts[0])
+        & jnp.all(~valid_routes | (selected_experts == selected_experts[0:1]))
     )
 
     @pl.when(routes_are_shared & (not compact_only))
     def run_shared_routes():
         if compact_only:
             return
+
         def shared_expert_at(index):
             return jnp.sum(
                 jnp.where(
@@ -1376,29 +1484,25 @@ def _run_routed_expert_stream(
             )
 
         def wait_for_gate_up(index, slot):
-            copies = copy_expert(
-                shared_expert_at(index), slot, down=False
-            )
+            copies = copy_expert(shared_expert_at(index), slot, down=False)
             copies.gate_up.wait()
             copies.gate_up_scales.wait()
 
         def wait_for_down(index, slot):
-            copies = copy_expert(
-                shared_expert_at(index), slot, gate_up=False
-            )
+            copies = copy_expert(shared_expert_at(index), slot, gate_up=False)
             copies.down.wait()
             copies.down_scales.wait()
 
         def finish_shared_expert(index, slot, column):
-            gate_up = gate_up_accumulator[
-                :, column : column + 2 * expert_width
-            ].astype(jnp.bfloat16).astype(jnp.float32)
+            gate_up = (
+                gate_up_accumulator[:, column : column + 2 * expert_width]
+                .astype(jnp.bfloat16)
+                .astype(jnp.float32)
+            )
             middle = _gated_activation(
                 gate_up[:, :expert_width], gate_up[:, expert_width:]
             )
-            gate_up_accumulator[:, :expert_width] = middle.astype(
-                jnp.float32
-            )
+            gate_up_accumulator[:, :expert_width] = middle.astype(jnp.float32)
             wait_for_down(index, slot)
             expert_dot(
                 gate_up_accumulator.at[:, :expert_width],
@@ -1409,21 +1513,17 @@ def _run_routed_expert_stream(
                 expert_output_size,
                 block_major=batch_size >= 8,
             )
-            route_weights = (
-                shared_probabilities_at(index) / probability_totals
-            )[:, None]
+            route_weights = (shared_probabilities_at(index) / probability_totals)[
+                :, None
+            ]
             expert_output[:, :expert_output_size] += (
-                down_accumulator[...]
-                .astype(jnp.bfloat16)
-                .astype(jnp.float32)
+                down_accumulator[...].astype(jnp.bfloat16).astype(jnp.float32)
                 * route_weights
             )
 
             @pl.when(index + 4 < local_route_counts[0])
             def refill_expert():
-                _start_async_copies(
-                    copy_expert(shared_expert_at(index + 4), slot)
-                )
+                _start_async_copies(copy_expert(shared_expert_at(index + 4), slot))
 
         @pl.loop(0, local_route_counts[0] // 2)
         def run_shared_pair(pair):
@@ -1442,9 +1542,7 @@ def _run_routed_expert_stream(
                 expert_input_size,
             )
             finish_shared_expert(first, first_slot, 0)
-            finish_shared_expert(
-                first + 1, second_slot, 2 * expert_width
-            )
+            finish_shared_expert(first + 1, second_slot, 2 * expert_width)
 
         @pl.when(local_route_counts[0] % 2 == 1)
         def run_shared_tail():
@@ -1469,7 +1567,10 @@ def _run_routed_expert_stream(
         for route_slot in range(selected_expert_count):
             used |= jnp.any(
                 valid_routes[:, route_slot : route_slot + 1]
-                & (selected_experts[:, route_slot : route_slot + 1] == jnp.arange(128)[None, :]),
+                & (
+                    selected_experts[:, route_slot : route_slot + 1]
+                    == jnp.arange(128)[None, :]
+                ),
                 axis=0,
                 keepdims=True,
             )
@@ -1483,10 +1584,10 @@ def _run_routed_expert_stream(
     def run_divergent_routes():
         # Reuse the choices already made for the next four-slot prefetch.
         # Other batch/routing combinations use the selector loop.
-        carry_routes = (
-            (batch_size in (2, 4) and not group_pending_routes)
-            or (batch_size in (8, 16, 32, 48, 64, 96, 128) and group_pending_routes)
+        carry_routes = (batch_size in (2, 4) and not group_pending_routes) or (
+            batch_size in (8, 16, 32, 48, 64, 96, 128) and group_pending_routes
         )
+
         def pack(choice):
             return tuple(value.astype(jnp.int32) for value in choice)
 
@@ -1499,372 +1600,487 @@ def _run_routed_expert_stream(
             initial_second = next_expert(initial_processed | initial_first[3])
 
         def run_next_expert_pair(iteration, carry=None):
-          if progress is not None:
-            progress(iteration)
-          with _phase("e_iteration"):
-            select_scope = _phase_start("e_select")
-            processed = processed_routes_vmem[:, :selected_expert_count] != 0
-            (
-                first_expert,
-                first_rows,
-                first_slot_mask,
-                first_consumed,
-                has_first,
-            ) = unpack(carry[0]) if carry_routes else next_expert(processed)
-            (
-                second_expert,
-                second_rows,
-                second_slot_mask,
-                second_consumed,
-                has_second,
-            ) = unpack(carry[1]) if carry_routes else next_expert(processed | first_consumed)
-            processed_after_pair = processed | first_consumed | second_consumed
-            (
-                third_expert,
-                third_rows,
-                third_slot_mask,
-                third_consumed,
-                has_third,
-            ) = next_expert(processed_after_pair)
-            (
-                fourth_expert,
-                fourth_rows,
-                fourth_slot_mask,
-                fourth_consumed,
-                has_fourth,
-            ) = next_expert(processed_after_pair | third_consumed)
-
-            current_base_slot = (iteration % 2) * 2
-            next_base_slot = ((iteration + 1) % 2) * 2
-            first_copies = copy_expert(first_expert, current_base_slot)
-            second_copies = copy_expert(second_expert, current_base_slot + 1)
-            third_copies = copy_expert(third_expert, next_base_slot)
-            fourth_copies = copy_expert(fourth_expert, next_base_slot + 1)
-
-            should_prefetch_third = has_third & (iteration != 0)
-            should_prefetch_fourth = has_fourth & (iteration != 0)
-
-            @pl.when(should_prefetch_third)
-            def prefetch_third():
-                _start_async_copies(third_copies)
-
-            @pl.when(should_prefetch_fourth)
-            def prefetch_fourth():
-                _start_async_copies(fourth_copies)
-
-            _phase_end(select_scope)
-
-            def execute_full_pair():
-                first_copies.gate_up.wait()
-                first_copies.gate_up_scales.wait()
-                second_copies.gate_up.wait()
-                second_copies.gate_up_scales.wait()
-                _paired_expert_gate_up(
-                    source,
-                    expert_gate_up_vmem,
-                    expert_gate_up_scale_vmem,
-                    gate_up_accumulator,
-                    current_base_slot,
-                    current_base_slot + 1,
-                    expert_input_size,
+            if progress is not None:
+                progress(iteration)
+            with _phase("e_iteration"):
+                select_scope = _phase_start("e_select")
+                processed = processed_routes_vmem[:, :selected_expert_count] != 0
+                (
+                    first_expert,
+                    first_rows,
+                    first_slot_mask,
+                    first_consumed,
+                    has_first,
+                ) = unpack(carry[0]) if carry_routes else next_expert(processed)
+                (
+                    second_expert,
+                    second_rows,
+                    second_slot_mask,
+                    second_consumed,
+                    has_second,
+                ) = (
+                    unpack(carry[1])
+                    if carry_routes
+                    else next_expert(processed | first_consumed)
                 )
-                if not share_full_finish:
-                    finish_expert(
-                        first_rows,
-                        first_slot_mask,
-                        first_copies,
-                        0,
-                        current_base_slot,
-                    )
-                    finish_expert(
-                        second_rows,
-                        second_slot_mask,
-                        second_copies,
-                        2 * expert_width,
-                        current_base_slot + 1,
-                    )
+                processed_after_pair = processed | first_consumed | second_consumed
+                (
+                    third_expert,
+                    third_rows,
+                    third_slot_mask,
+                    third_consumed,
+                    has_third,
+                ) = next_expert(processed_after_pair)
+                (
+                    fourth_expert,
+                    fourth_rows,
+                    fourth_slot_mask,
+                    fourth_consumed,
+                    has_fourth,
+                ) = next_expert(processed_after_pair | third_consumed)
 
-            def execute_full_tail():
-                first_copies.gate_up.wait()
-                first_copies.gate_up_scales.wait()
-                expert_dot(
-                    source,
-                    expert_gate_up_vmem.at[current_base_slot],
-                    expert_gate_up_scale_vmem.at[current_base_slot],
-                    gate_up_accumulator.at[:, : 2 * expert_width],
-                    expert_input_size,
-                    2 * expert_width,
-                )
-                if not share_full_finish:
-                    finish_expert(
-                        first_rows,
-                        first_slot_mask,
-                        first_copies,
-                        0,
-                        current_base_slot,
-                    )
+                current_base_slot = (iteration % 2) * 2
+                next_base_slot = ((iteration + 1) % 2) * 2
+                first_copies = copy_expert(first_expert, current_base_slot)
+                second_copies = copy_expert(second_expert, current_base_slot + 1)
+                third_copies = copy_expert(third_expert, next_base_slot)
+                fourth_copies = copy_expert(fourth_expert, next_base_slot + 1)
 
-            # From B8, staging a singleton route's one active row is cheaper
-            # than a full padded MXU tile. At B2/B4 the selection overhead
-            # offsets the saved padded work.
-            if batch_size >= 8:
-                first_row_count = jnp.sum(first_rows.astype(jnp.int32))
-                second_row_count = jnp.sum(second_rows.astype(jnp.int32))
-                compact_pair = (
-                    has_first
-                    & has_second
-                    & (first_row_count == 1)
-                    & (second_row_count == 1)
-                )
+                should_prefetch_third = has_third & (iteration != 0)
+                should_prefetch_fourth = has_fourth & (iteration != 0)
 
-                first_plan = compact_row_plan(first_rows) if reuse_row_plan else None
-                second_plan = compact_row_plan(second_rows) if reuse_row_plan else None
+                @pl.when(should_prefetch_third)
+                def prefetch_third():
+                    _start_async_copies(third_copies)
 
-                @pl.when(compact_pair)
-                @_scoped("e_single_pair")
-                def execute_compact_pair():
+                @pl.when(should_prefetch_fourth)
+                def prefetch_fourth():
+                    _start_async_copies(fourth_copies)
+
+                _phase_end(select_scope)
+
+                def execute_full_pair():
                     first_copies.gate_up.wait()
                     first_copies.gate_up_scales.wait()
                     second_copies.gate_up.wait()
                     second_copies.gate_up_scales.wait()
-                    stage_singleton_source(
-                        first_rows, first_single_source
-                    )
-                    stage_singleton_source(
-                        second_rows, second_single_source
-                    )
                     _paired_expert_gate_up(
-                        first_single_source,
+                        source,
                         expert_gate_up_vmem,
                         expert_gate_up_scale_vmem,
-                        gate_up_accumulator.at[:2],
+                        gate_up_accumulator,
                         current_base_slot,
                         current_base_slot + 1,
                         expert_input_size,
-                        second_source=second_single_source,
                     )
-                    finish_singleton_expert(
-                        first_rows,
-                        first_slot_mask,
-                        first_copies,
-                        0,
-                        0,
-                        current_base_slot,
-                    )
-                    finish_singleton_expert(
-                        second_rows,
-                        second_slot_mask,
-                        second_copies,
-                        1,
+                    if not share_full_finish:
+                        finish_expert(
+                            first_rows,
+                            first_slot_mask,
+                            first_copies,
+                            0,
+                            current_base_slot,
+                        )
+                        finish_expert(
+                            second_rows,
+                            second_slot_mask,
+                            second_copies,
+                            2 * expert_width,
+                            current_base_slot + 1,
+                        )
+
+                def execute_full_tail():
+                    first_copies.gate_up.wait()
+                    first_copies.gate_up_scales.wait()
+                    expert_dot(
+                        source,
+                        expert_gate_up_vmem.at[current_base_slot],
+                        expert_gate_up_scale_vmem.at[current_base_slot],
+                        gate_up_accumulator.at[:, : 2 * expert_width],
+                        expert_input_size,
                         2 * expert_width,
-                        current_base_slot + 1,
+                    )
+                    if not share_full_finish:
+                        finish_expert(
+                            first_rows,
+                            first_slot_mask,
+                            first_copies,
+                            0,
+                            current_base_slot,
+                        )
+
+                # From B8, staging a singleton route's one active row is cheaper
+                # than a full padded MXU tile. At B2/B4 the selection overhead
+                # offsets the saved padded work.
+                if batch_size >= 8:
+                    first_row_count = jnp.sum(first_rows.astype(jnp.int32))
+                    second_row_count = jnp.sum(second_rows.astype(jnp.int32))
+                    compact_pair = (
+                        has_first
+                        & has_second
+                        & (first_row_count == 1)
+                        & (second_row_count == 1)
                     )
 
-                if compact_capacity > 1:
-                    multi_pair = (
-                        has_first & has_second & ~compact_pair
-                        & (first_row_count <= compact_capacity)
-                        & (second_row_count <= compact_capacity)
+                    first_plan = (
+                        compact_row_plan(first_rows) if reuse_row_plan else None
+                    )
+                    second_plan = (
+                        compact_row_plan(second_rows) if reuse_row_plan else None
                     )
 
-                    @pl.when(multi_pair)
-                    @_scoped("e_multi_pair")
-                    def execute_compact_multi_pair():
+                    @pl.when(compact_pair)
+                    @_scoped("e_single_pair")
+                    def execute_compact_pair():
                         first_copies.gate_up.wait()
                         first_copies.gate_up_scales.wait()
                         second_copies.gate_up.wait()
                         second_copies.gate_up_scales.wait()
-                        stage_compact_rows(first_rows, first_compact_source_vmem, row_plan=first_plan)
-                        stage_compact_rows(second_rows, second_compact_source_vmem, row_plan=second_plan)
-                        def project_pair(capacity=None):
-                            _paired_expert_gate_up(
+                        stage_singleton_source(first_rows, first_single_source)
+                        stage_singleton_source(second_rows, second_single_source)
+                        _paired_expert_gate_up(
+                            first_single_source,
+                            expert_gate_up_vmem,
+                            expert_gate_up_scale_vmem,
+                            gate_up_accumulator.at[:2],
+                            current_base_slot,
+                            current_base_slot + 1,
+                            expert_input_size,
+                            second_source=second_single_source,
+                        )
+                        finish_singleton_expert(
+                            first_rows,
+                            first_slot_mask,
+                            first_copies,
+                            0,
+                            0,
+                            current_base_slot,
+                        )
+                        finish_singleton_expert(
+                            second_rows,
+                            second_slot_mask,
+                            second_copies,
+                            1,
+                            2 * expert_width,
+                            current_base_slot + 1,
+                        )
+
+                    if compact_capacity > 1:
+                        multi_pair = (
+                            has_first
+                            & has_second
+                            & ~compact_pair
+                            & (first_row_count <= compact_capacity)
+                            & (second_row_count <= compact_capacity)
+                        )
+
+                        @pl.when(multi_pair)
+                        @_scoped("e_multi_pair")
+                        def execute_compact_multi_pair():
+                            first_copies.gate_up.wait()
+                            first_copies.gate_up_scales.wait()
+                            second_copies.gate_up.wait()
+                            second_copies.gate_up_scales.wait()
+                            stage_compact_rows(
+                                first_rows,
                                 first_compact_source_vmem,
-                                expert_gate_up_vmem,
-                                expert_gate_up_scale_vmem,
-                                gate_up_accumulator.at[:2 * compact_capacity],
-                                current_base_slot,
-                                current_base_slot + 1,
-                                expert_input_size,
-                                second_source=second_compact_source_vmem,
-                                active_capacity=capacity,
+                                row_plan=first_plan,
+                            )
+                            stage_compact_rows(
+                                second_rows,
+                                second_compact_source_vmem,
+                                row_plan=second_plan,
                             )
 
-                        if share_compact_finish:
-                            # Keep native eight-row staging and finishers. Narrow only the register
-                            # operands of gate/up, preserving its scale and FP32 reduction order.
-                            largest = jnp.maximum(first_row_count, second_row_count)
-                            previous = 1
-                            for capacity in (2, 4, 8):
-                                @pl.when((largest > previous) & (largest <= capacity))
-                                @_scoped(f"e_capacity_{capacity}")
-                                def execute_capacity(capacity=capacity):
-                                    project_pair(capacity)
-                                previous = capacity
-                        else:
-                            project_pair()
-                            finish_compact_expert(
-                                first_rows, first_slot_mask, first_copies,
-                                0, 0, current_base_slot,
-                            )
-                            finish_compact_expert(
-                                second_rows, second_slot_mask, second_copies,
-                                compact_capacity, 2 * expert_width, current_base_slot + 1,
-                            )
-                else:
-                    multi_pair = jnp.bool_(False)
+                            def project_pair(capacity=None):
+                                _paired_expert_gate_up(
+                                    first_compact_source_vmem,
+                                    expert_gate_up_vmem,
+                                    expert_gate_up_scale_vmem,
+                                    gate_up_accumulator.at[: 2 * compact_capacity],
+                                    current_base_slot,
+                                    current_base_slot + 1,
+                                    expert_input_size,
+                                    second_source=second_compact_source_vmem,
+                                    active_capacity=capacity,
+                                )
 
-                @pl.when(has_first & has_second & ~compact_pair & ~multi_pair)
-                @_scoped("e_pass_pair")
-                def execute_noncompact_pair():
-                    if compact_only:
-                        run_expert_in_passes(
-                            first_rows, first_slot_mask, first_copies,
-                            first_row_count, current_base_slot,
-                            paired_gate=compact_overflow,
-                        )
-                        run_expert_in_passes(
-                            second_rows, second_slot_mask, second_copies,
-                            second_row_count, current_base_slot + 1,
-                            paired_gate=compact_overflow,
-                        )
+                            if share_compact_finish:
+                                # Keep native eight-row staging and finishers. Narrow only the register
+                                # operands of gate/up, preserving its scale and FP32 reduction order.
+                                largest = jnp.maximum(first_row_count, second_row_count)
+                                previous = 1
+                                for capacity in (2, 4, 8):
+
+                                    @pl.when(
+                                        (largest > previous) & (largest <= capacity)
+                                    )
+                                    @_scoped(f"e_capacity_{capacity}")
+                                    def execute_capacity(capacity=capacity):
+                                        project_pair(capacity)
+
+                                    previous = capacity
+                            else:
+                                project_pair()
+                                finish_compact_expert(
+                                    first_rows,
+                                    first_slot_mask,
+                                    first_copies,
+                                    0,
+                                    0,
+                                    current_base_slot,
+                                )
+                                finish_compact_expert(
+                                    second_rows,
+                                    second_slot_mask,
+                                    second_copies,
+                                    compact_capacity,
+                                    2 * expert_width,
+                                    current_base_slot + 1,
+                                )
                     else:
-                        execute_full_pair()
+                        multi_pair = jnp.bool_(False)
 
-                compact_tail = (
-                    has_first & ~has_second & (first_row_count == 1)
-                )
+                    @pl.when(has_first & has_second & ~compact_pair & ~multi_pair)
+                    @_scoped("e_pass_pair")
+                    def execute_noncompact_pair():
+                        if compact_only:
+                            run_expert_in_passes(
+                                first_rows,
+                                first_slot_mask,
+                                first_copies,
+                                first_row_count,
+                                current_base_slot,
+                                paired_gate=compact_overflow,
+                            )
+                            run_expert_in_passes(
+                                second_rows,
+                                second_slot_mask,
+                                second_copies,
+                                second_row_count,
+                                current_base_slot + 1,
+                                paired_gate=compact_overflow,
+                            )
+                        else:
+                            execute_full_pair()
 
-                @pl.when(compact_tail)
-                @_scoped("e_single_tail")
-                def execute_compact_tail():
-                    first_copies.gate_up.wait()
-                    first_copies.gate_up_scales.wait()
-                    stage_singleton_source(
-                        first_rows, first_single_source
-                    )
-                    expert_dot(
-                        first_single_source,
-                        expert_gate_up_vmem.at[current_base_slot],
-                        expert_gate_up_scale_vmem.at[current_base_slot],
-                        gate_up_accumulator.at[:1, : 2 * expert_width],
-                        expert_input_size,
-                        2 * expert_width,
-                    )
-                    finish_singleton_expert(
-                        first_rows,
-                        first_slot_mask,
-                        first_copies,
-                        0,
-                        0,
-                        current_base_slot,
-                    )
+                    compact_tail = has_first & ~has_second & (first_row_count == 1)
 
-                if compact_capacity > 1:
-                    multi_tail = (
-                        has_first & ~has_second & (first_row_count != 1)
-                        & (first_row_count <= compact_capacity)
-                    )
-
-                    @pl.when(multi_tail)
-                    def execute_compact_multi_tail():
+                    @pl.when(compact_tail)
+                    @_scoped("e_single_tail")
+                    def execute_compact_tail():
                         first_copies.gate_up.wait()
                         first_copies.gate_up_scales.wait()
-                        stage_compact_rows(first_rows, first_compact_source_vmem, row_plan=first_plan)
+                        stage_singleton_source(first_rows, first_single_source)
                         expert_dot(
-                            first_compact_source_vmem,
+                            first_single_source,
                             expert_gate_up_vmem.at[current_base_slot],
                             expert_gate_up_scale_vmem.at[current_base_slot],
-                            gate_up_accumulator.at[:compact_capacity, : 2 * expert_width],
+                            gate_up_accumulator.at[:1, : 2 * expert_width],
                             expert_input_size,
                             2 * expert_width,
                         )
-                        if not share_compact_finish:
-                            finish_compact_expert(
-                                first_rows, first_slot_mask, first_copies,
-                                0, 0, current_base_slot,
-                            )
-                else:
-                    multi_tail = jnp.bool_(False)
-
-                @pl.when(
-                    has_first
-                    & ~has_second
-                    & (first_row_count != 1)
-                    & ~multi_tail
-                )
-                def execute_noncompact_tail():
-                    if compact_only:
-                        run_expert_in_passes(
-                            first_rows, first_slot_mask, first_copies,
-                            first_row_count, current_base_slot,
+                        finish_singleton_expert(
+                            first_rows,
+                            first_slot_mask,
+                            first_copies,
+                            0,
+                            0,
+                            current_base_slot,
                         )
+
+                    if compact_capacity > 1:
+                        multi_tail = (
+                            has_first
+                            & ~has_second
+                            & (first_row_count != 1)
+                            & (first_row_count <= compact_capacity)
+                        )
+
+                        @pl.when(multi_tail)
+                        def execute_compact_multi_tail():
+                            first_copies.gate_up.wait()
+                            first_copies.gate_up_scales.wait()
+                            stage_compact_rows(
+                                first_rows,
+                                first_compact_source_vmem,
+                                row_plan=first_plan,
+                            )
+                            expert_dot(
+                                first_compact_source_vmem,
+                                expert_gate_up_vmem.at[current_base_slot],
+                                expert_gate_up_scale_vmem.at[current_base_slot],
+                                gate_up_accumulator.at[
+                                    :compact_capacity, : 2 * expert_width
+                                ],
+                                expert_input_size,
+                                2 * expert_width,
+                            )
+                            if not share_compact_finish:
+                                finish_compact_expert(
+                                    first_rows,
+                                    first_slot_mask,
+                                    first_copies,
+                                    0,
+                                    0,
+                                    current_base_slot,
+                                )
                     else:
-                        execute_full_tail()
-                if share_full_finish:
-                    @pl.when(has_first & ~compact_pair & ~multi_pair & ~compact_tail & ~multi_tail)
-                    @_scoped("e_pass_finish")
-                    def execute_full_finish():
-                        def route_weights(rows, mask):
-                            probability = jnp.sum(jnp.where(mask, selected_probabilities, jnp.float32(0)), axis=1) / probability_totals
-                            return jnp.where(rows, probability, jnp.float32(0))
-                        first_weights = route_weights(first_rows, first_slot_mask)
-                        second_weights = route_weights(second_rows, second_slot_mask)
-                        @pl.loop(0, jnp.where(has_second, 2, 1))
-                        def selected_expert(index):
-                            first = index == 0
-                            output_weights = jnp.where(first, first_weights, second_weights)
-                            expert = jnp.where(first, first_expert, second_expert)
-                            slot = current_base_slot + index
-                            copies = copy_expert(expert, slot)
-                            finish_expert(None, None, copies, index * 2 * expert_width, slot, output_weights)
-                if share_compact_finish:
-                    @pl.when(multi_pair | multi_tail)
-                    @_scoped("e_multi_finish")
-                    def execute_compact_finish():
-                        first_selector, first_weights = compact_route_data(first_rows, first_slot_mask, row_plan=first_plan)
-                        second_selector, second_weights = compact_route_data(second_rows, second_slot_mask, row_plan=second_plan)
-                        def finish_selected():
+                        multi_tail = jnp.bool_(False)
+
+                    @pl.when(
+                        has_first & ~has_second & (first_row_count != 1) & ~multi_tail
+                    )
+                    def execute_noncompact_tail():
+                        if compact_only:
+                            run_expert_in_passes(
+                                first_rows,
+                                first_slot_mask,
+                                first_copies,
+                                first_row_count,
+                                current_base_slot,
+                            )
+                        else:
+                            execute_full_tail()
+
+                    if share_full_finish:
+
+                        @pl.when(
+                            has_first
+                            & ~compact_pair
+                            & ~multi_pair
+                            & ~compact_tail
+                            & ~multi_tail
+                        )
+                        @_scoped("e_pass_finish")
+                        def execute_full_finish():
+                            def route_weights(rows, mask):
+                                probability = (
+                                    jnp.sum(
+                                        jnp.where(
+                                            mask, selected_probabilities, jnp.float32(0)
+                                        ),
+                                        axis=1,
+                                    )
+                                    / probability_totals
+                                )
+                                return jnp.where(rows, probability, jnp.float32(0))
+
+                            first_weights = route_weights(first_rows, first_slot_mask)
+                            second_weights = route_weights(
+                                second_rows, second_slot_mask
+                            )
+
                             @pl.loop(0, jnp.where(has_second, 2, 1))
                             def selected_expert(index):
                                 first = index == 0
-                                selector = jnp.where(first, first_selector, second_selector)
-                                output_weights = jnp.where(first, first_weights, second_weights)
+                                output_weights = jnp.where(
+                                    first, first_weights, second_weights
+                                )
                                 expert = jnp.where(first, first_expert, second_expert)
                                 slot = current_base_slot + index
                                 copies = copy_expert(expert, slot)
-                                finish_compact_expert(None, None, copies, index * compact_capacity,
-                                                      index * 2 * expert_width, slot,
-                                                      route_data=(selector, output_weights))
-                        finish_selected()
-            else:
-                @pl.when(has_first & has_second)
-                def execute_pair():
-                    execute_full_pair()
+                                finish_expert(
+                                    None,
+                                    None,
+                                    copies,
+                                    index * 2 * expert_width,
+                                    slot,
+                                    output_weights,
+                                )
 
-                @pl.when(has_first & ~has_second)
-                def execute_tail():
-                    execute_full_tail()
+                    if share_compact_finish:
 
-            processed_routes_vmem[:, :selected_expert_count] = jnp.where(
-                first_consumed | second_consumed,
-                jnp.int32(1),
-                processed_routes_vmem[:, :selected_expert_count],
-            )
-            if carry_routes:
-                return (
-                    pack((third_expert, third_rows, third_slot_mask, third_consumed, has_third)),
-                    pack((fourth_expert, fourth_rows, fourth_slot_mask, fourth_consumed, has_fourth)),
+                        @pl.when(multi_pair | multi_tail)
+                        @_scoped("e_multi_finish")
+                        def execute_compact_finish():
+                            first_selector, first_weights = compact_route_data(
+                                first_rows, first_slot_mask, row_plan=first_plan
+                            )
+                            second_selector, second_weights = compact_route_data(
+                                second_rows, second_slot_mask, row_plan=second_plan
+                            )
+
+                            def finish_selected():
+                                @pl.loop(0, jnp.where(has_second, 2, 1))
+                                def selected_expert(index):
+                                    first = index == 0
+                                    selector = jnp.where(
+                                        first, first_selector, second_selector
+                                    )
+                                    output_weights = jnp.where(
+                                        first, first_weights, second_weights
+                                    )
+                                    expert = jnp.where(
+                                        first, first_expert, second_expert
+                                    )
+                                    slot = current_base_slot + index
+                                    copies = copy_expert(expert, slot)
+                                    finish_compact_expert(
+                                        None,
+                                        None,
+                                        copies,
+                                        index * compact_capacity,
+                                        index * 2 * expert_width,
+                                        slot,
+                                        route_data=(selector, output_weights),
+                                    )
+
+                            finish_selected()
+                else:
+
+                    @pl.when(has_first & has_second)
+                    def execute_pair():
+                        execute_full_pair()
+
+                    @pl.when(has_first & ~has_second)
+                    def execute_tail():
+                        execute_full_tail()
+
+                processed_routes_vmem[:, :selected_expert_count] = jnp.where(
+                    first_consumed | second_consumed,
+                    jnp.int32(1),
+                    processed_routes_vmem[:, :selected_expert_count],
                 )
+                if carry_routes:
+                    return (
+                        pack(
+                            (
+                                third_expert,
+                                third_rows,
+                                third_slot_mask,
+                                third_consumed,
+                                has_third,
+                            )
+                        ),
+                        pack(
+                            (
+                                fourth_expert,
+                                fourth_rows,
+                                fourth_slot_mask,
+                                fourth_consumed,
+                                has_fourth,
+                            )
+                        ),
+                    )
 
         if carry_routes:
-            jax.lax.fori_loop(0, pair_count, run_next_expert_pair, (pack(initial_first), pack(initial_second)))
+            jax.lax.fori_loop(
+                0,
+                pair_count,
+                run_next_expert_pair,
+                (pack(initial_first), pack(initial_second)),
+            )
         else:
+
             @pl.loop(0, pair_count)
             def run_original_expert_pair(iteration):
                 run_next_expert_pair(iteration)
 
 
-def projection_staging_scratch(batch_size: int, attention_dp: int = 1) -> tuple[Any, ...]:
+def projection_staging_scratch(
+    batch_size: int, attention_dp: int = 1
+) -> tuple[Any, ...]:
     """Above B32: send/receive staging of the attention projection's four
     per-pair payloads ([2, 4 * payload, 128] BF16)."""
     if batch_size <= 32:
@@ -1880,7 +2096,9 @@ def routed_send_scratch(batch_size: int) -> tuple[Any, ...]:
     return (tpu.VMEM((8 * 14 * -(-batch_size // 8), 128), jnp.float32),)
 
 
-def communication_scratch(batch_size: int = 1, attention_dp: int = 1) -> tuple[Any, ...]:
+def communication_scratch(
+    batch_size: int = 1, attention_dp: int = 1
+) -> tuple[Any, ...]:
     """Shared for the entire fused stack, including the reduction sequence."""
     # FP32 transport rows per token: 28 for shared outputs and attention
     # projections, 14 for routed outputs, in separate buffers. Above B8 only
@@ -1901,7 +2119,9 @@ def communication_scratch(batch_size: int = 1, attention_dp: int = 1) -> tuple[A
         # the sequence-parallel gather's flattened wires (B/4 rows an owner).
         wide_reduction_rows = max(wide_reduction_rows, 7 * batch_size)
     # The eight-lane routed reduce-scatter pads the batch to whole tokens per lane.
-    padded_tokens = 8 * -(-batch_size // 8) if batch_size in (6, *SCATTER_BATCHES) else batch_size
+    padded_tokens = (
+        8 * -(-batch_size // 8) if batch_size in (6, *SCATTER_BATCHES) else batch_size
+    )
     expert_reduction_rows = max(32, 14 * padded_tokens)
     expert_host_rows = expert_reduction_rows
     if batch_size > 32:
@@ -1911,9 +2131,20 @@ def communication_scratch(batch_size: int = 1, attention_dp: int = 1) -> tuple[A
         expert_host_rows = max(expert_reduction_rows, 8 * batch_size)
     # Whole 8-row FP32 tiles: padded strides make the reductions' ref reshapes
     # fail to compile ("reshape on a non-contiguous memref").
-    wide_reduction_rows, expert_reduction_rows, host_reduction_rows, expert_host_rows = (
+    (
+        wide_reduction_rows,
+        expert_reduction_rows,
+        host_reduction_rows,
+        expert_host_rows,
+    ) = (
         -(-rows // 8) * 8
-        for rows in (wide_reduction_rows, expert_reduction_rows, host_reduction_rows, expert_host_rows))
+        for rows in (
+            wide_reduction_rows,
+            expert_reduction_rows,
+            host_reduction_rows,
+            expert_host_rows,
+        )
+    )
     return (
         tpu.VMEM((8, wide_reduction_rows, 128), jnp.float32),
         tpu.VMEM((8, expert_reduction_rows, 128), jnp.float32),
@@ -1921,11 +2152,20 @@ def communication_scratch(batch_size: int = 1, attention_dp: int = 1) -> tuple[A
         tpu.VMEM((4, expert_host_rows, 128), jnp.float32),
         # Attention's group-gather features of every held shard, in native
         # 16-row backing (active rows via _bf16_rows_view).
-        tpu.VMEM((max(16, -(-batch_size // 16) * 16), 1024 * attention_dp), jnp.bfloat16),
+        tpu.VMEM(
+            (max(16, -(-batch_size // 16) * 16), 1024 * attention_dp), jnp.bfloat16
+        ),
         # Above B32 (always token-scattered) attention writes only each
         # pair's batch / 4 rows here.
         tpu.VMEM(
-            (max(16, -(-(batch_size // 4 if batch_size >= 64 else batch_size) // 16) * 16), 7168),
+            (
+                max(
+                    16,
+                    -(-(batch_size // 4 if batch_size >= 64 else batch_size) // 16)
+                    * 16,
+                ),
+                7168,
+            ),
             jnp.bfloat16,
         ),
         tpu.SemaphoreType.DMA((16,)),
@@ -1943,7 +2183,9 @@ TensorLike = jax_typing.ArrayLike | jax.ShapeDtypeStruct
 class AttentionCommunicationWorkspace:
     """Collective transport storage shared by attention and MoE layers."""
 
-    shared_local_reduction_vmem: Any  # [8, rows, 128] FP32; rows: see communication_scratch
+    shared_local_reduction_vmem: (
+        Any  # [8, rows, 128] FP32; rows: see communication_scratch
+    )
     expert_local_reduction_vmem: Any  # [8, rows, 128] FP32
     shared_host_reduction_vmem: Any  # [4, rows, 128] FP32
     expert_host_reduction_vmem: Any  # [4, rows, 128] FP32
@@ -2092,9 +2334,7 @@ class MixtureOfExpertsWeights:
             )
             copy.wait() if wait else copy.start()
 
-    def start_routing_projection_copy(
-        self, *, initialize_padding: bool = True
-    ) -> None:
+    def start_routing_projection_copy(self, *, initialize_padding: bool = True) -> None:
         self._copy_routing_projection(
             wait=False,
             initialize_padding=initialize_padding,
@@ -2118,8 +2358,13 @@ class MixtureOfExpertsWeights:
         gate_up: bool = True,
         down: bool = True,
     ) -> SimpleNamespace:
-        if self.expert_gate_up_projection_vmem.shape[-1] < self.expert_gate_up_projection.shape[-1]:
-            return self.make_half_expert_copies(expert, slot, gate_up=gate_up, down=down)
+        if (
+            self.expert_gate_up_projection_vmem.shape[-1]
+            < self.expert_gate_up_projection.shape[-1]
+        ):
+            return self.make_half_expert_copies(
+                expert, slot, gate_up=gate_up, down=down
+            )
         return SimpleNamespace(
             gate_up=(
                 tpu.make_async_copy(
@@ -2162,18 +2407,29 @@ class MixtureOfExpertsWeights:
     def make_half_expert_copies(self, expert, slot, *, gate_up=True, down=True):
         """Virtual expert ``expert``'s copies (see HALF_EXPERT_LOCAL_COUNT)."""
         whole, half = expert // 2, expert % 2
-        width = self.expert_gate_up_projection_vmem.shape[-1] // 2  # TP4 gate (= up) width
+        width = (
+            self.expert_gate_up_projection_vmem.shape[-1] // 2
+        )  # TP4 gate (= up) width
         gate_width = self.expert_gate_up_projection.shape[-1] // 2  # TP2 gate width
 
         def columns(source, destination, semaphore):
-            return _CopyGroup(*(
-                tpu.make_async_copy(
-                    source.at[whole, :, pl.ds(pl.multiple_of(part * gate_width + half * width, 128), width)],
-                    destination.at[slot, :, pl.ds(part * width, width)],
-                    semaphore,
+            return _CopyGroup(
+                *(
+                    tpu.make_async_copy(
+                        source.at[
+                            whole,
+                            :,
+                            pl.ds(
+                                pl.multiple_of(part * gate_width + half * width, 128),
+                                width,
+                            ),
+                        ],
+                        destination.at[slot, :, pl.ds(part * width, width)],
+                        semaphore,
+                    )
+                    for part in range(2)  # gate, up
                 )
-                for part in range(2)  # gate, up
-            ))
+            )
 
         def rows(source, destination, semaphore):
             count = destination.shape[-2]
@@ -2185,14 +2441,34 @@ class MixtureOfExpertsWeights:
 
         semaphores = self.expert_copy_semaphores
         return SimpleNamespace(
-            gate_up=columns(self.expert_gate_up_projection, self.expert_gate_up_projection_vmem,
-                            semaphores.at[slot, 0]) if gate_up else None,
-            gate_up_scales=columns(self.expert_gate_up_scales, self.expert_gate_up_scales_vmem,
-                                   semaphores.at[slot, 1]) if gate_up else None,
-            down=rows(self.expert_down_projection, self.expert_down_projection_vmem,
-                      semaphores.at[slot, 2]) if down else None,
-            down_scales=rows(self.expert_down_scales, self.expert_down_scales_vmem,
-                             semaphores.at[slot, 3]) if down else None,
+            gate_up=columns(
+                self.expert_gate_up_projection,
+                self.expert_gate_up_projection_vmem,
+                semaphores.at[slot, 0],
+            )
+            if gate_up
+            else None,
+            gate_up_scales=columns(
+                self.expert_gate_up_scales,
+                self.expert_gate_up_scales_vmem,
+                semaphores.at[slot, 1],
+            )
+            if gate_up
+            else None,
+            down=rows(
+                self.expert_down_projection,
+                self.expert_down_projection_vmem,
+                semaphores.at[slot, 2],
+            )
+            if down
+            else None,
+            down_scales=rows(
+                self.expert_down_scales,
+                self.expert_down_scales_vmem,
+                semaphores.at[slot, 3],
+            )
+            if down
+            else None,
         )
 
 
@@ -2208,7 +2484,9 @@ class MixtureOfExpertsWorkspace:
     routing_scores_vmem: Any  # [batch_size, 1024]
     shared_outputs_vmem: Any  # [batch_size, hidden_size]
     routed_outputs_vmem: Any  # [batch_size, padded_latent_size]
-    gate_up_accumulator_vmem: Any  # [rows, 4 * expert_width]; rows: _expert_accumulator_rows
+    gate_up_accumulator_vmem: (
+        Any  # [rows, 4 * expert_width]; rows: _expert_accumulator_rows
+    )
     down_accumulator_vmem: Any  # [rows, expert_output_size]
     processed_routes_vmem: Any  # [batch_size, 128]
     first_compact_source_vmem: Any  # [max(1, _compact_rows), expert_input_size]
@@ -2242,9 +2520,11 @@ def _consume_completed_routed_chunks(
     for first in range(0, batch_size, chunk_rows):
         first_lane = first // tokens_per_lane
         for source_lane in range(first_lane, first_lane + lanes_per_chunk):
+
             @pl.when(lane != source_lane)
             def wait(source_lane=source_lane):
                 wait_for_peer(lane ^ source_lane)
+
         consume(first, chunk_rows, first_lane, lanes_per_chunk)
 
 
@@ -2298,9 +2578,7 @@ def moe(
         weights.expert_gate_up_projection_vmem.shape[-1]
         < weights.expert_gate_up_projection.shape[-1]
     )
-    down_is_reblocked_fp8 = (
-        weights.expert_down_projection.dtype == jnp.float8_e4m3fn
-    )
+    down_is_reblocked_fp8 = weights.expert_down_projection.dtype == jnp.float8_e4m3fn
     expert_width = (
         weights.expert_down_projection.shape[1]
         if down_is_reblocked_fp8
@@ -2316,17 +2594,24 @@ def moe(
     # The HBM experts' width; half experts run at half of it.
     stored_width = expert_width
     if half_experts:
-        if expert_tensor_parallel != 2 or weights.expert_gate_up_projection.dtype != jnp.uint32:
+        if (
+            expert_tensor_parallel != 2
+            or weights.expert_gate_up_projection.dtype != jnp.uint32
+        ):
             raise ValueError("Half experts need EP16/TP2 MXFP4 experts")
         expert_width //= 2
     route_columns = (2 if half_experts else 1) * selected_expert_count
 
     if not 1 <= batch_size <= MAX_BATCH:
         raise ValueError(f"MoE supports 1 to {MAX_BATCH} rows")
-    if token_scatter_output and batch_size not in SCATTER_BATCHES and not (
-        batch_size in (2, 4) and token_scatter_owners == 1
+    if (
+        token_scatter_output
+        and batch_size not in SCATTER_BATCHES
+        and not (batch_size in (2, 4) and token_scatter_owners == 1)
     ):
-        raise ValueError("MoE token-scattered output requires batch size 8 or 16, or B2/B4 to one owner")
+        raise ValueError(
+            "MoE token-scattered output requires batch size 8 or 16, or B2/B4 to one owner"
+        )
     if routed_reduce_scatter and batch_size not in (6, *SCATTER_BATCHES):
         raise ValueError("MoE routed reduce-scatter requires batch size 6, 8 or 16")
     if token_pipeline and (
@@ -2336,7 +2621,9 @@ def moe(
         or token_scatter_owners != 4
         or expert_tensor_parallel != 4
     ):
-        raise ValueError("MoE token pipeline needs B32/B64, EP8/TP4 and pair-owned routed reduce-scatter")
+        raise ValueError(
+            "MoE token pipeline needs B32/B64, EP8/TP4 and pair-owned routed reduce-scatter"
+        )
     if weights.expert_gate_up_projection.dtype not in (
         jnp.uint32,
         jnp.float8_e4m3fn,
@@ -2356,11 +2643,10 @@ def moe(
         or latent_size > 8192
     ):
         raise ValueError("Unsupported MoE tile dimensions")
-    if (
-        weights.latent_input_projection.shape != (hidden_size, 128)
-        or weights.latent_output_projection.shape
-        != (expert_output_size, 1024)
-    ):
+    if weights.latent_input_projection.shape != (
+        hidden_size,
+        128,
+    ) or weights.latent_output_projection.shape != (expert_output_size, 1024):
         raise ValueError("Latent projections require padded TP32 shards")
     if (
         expert_count * expert_tensor_parallel != 32 * local_expert_count
@@ -2414,7 +2700,8 @@ def moe(
         raise ValueError("MoE output has the wrong shape for its communication mode")
 
     accumulator_rows = _expert_accumulator_rows(
-        batch_size, weights.expert_gate_up_projection.dtype,
+        batch_size,
+        weights.expert_gate_up_projection.dtype,
         group_pending_routes=group_pending_expert_routes,
     )
     expected_workspace_shapes = (
@@ -2464,6 +2751,7 @@ def moe(
         raise ValueError("MoE latent-gather workspace must match the batch size")
     if weights.routing_projection_vmem.shape != (1, hidden_size, 512):
         raise ValueError("MoE routing projection workspace has the wrong shape")
+
     def slot_shape(stored, axis):
         shape = list(stored.shape[1:])
         if half_experts:
@@ -2471,10 +2759,22 @@ def moe(
         return (expert_prefetch_slot_count, *shape)
 
     expert_workspace_shapes = (
-        (weights.expert_gate_up_projection_vmem.shape, slot_shape(weights.expert_gate_up_projection, 1)),
-        (weights.expert_gate_up_scales_vmem.shape, slot_shape(weights.expert_gate_up_scales, 1)),
-        (weights.expert_down_projection_vmem.shape, slot_shape(weights.expert_down_projection, 0)),
-        (weights.expert_down_scales_vmem.shape, slot_shape(weights.expert_down_scales, 0)),
+        (
+            weights.expert_gate_up_projection_vmem.shape,
+            slot_shape(weights.expert_gate_up_projection, 1),
+        ),
+        (
+            weights.expert_gate_up_scales_vmem.shape,
+            slot_shape(weights.expert_gate_up_scales, 1),
+        ),
+        (
+            weights.expert_down_projection_vmem.shape,
+            slot_shape(weights.expert_down_projection, 0),
+        ),
+        (
+            weights.expert_down_scales_vmem.shape,
+            slot_shape(weights.expert_down_scales, 0),
+        ),
     )
     if any(actual != expected for actual, expected in expert_workspace_shapes):
         raise ValueError("MoE expert weight workspace has an invalid shape")
@@ -2492,8 +2792,12 @@ def moe(
     shared_sharded = shared_outputs_vmem.shape[1] < hidden_size
     # The pooled shared-down weight stays resident in region B until the
     # MoE tail, so the shards are projected when the reduce-scatter starts.
-    shared_down_weights = prepare_weights_vmem[2] if prepare_weights_vmem is not None else None
-    assert not shared_sharded or shared_down_weights is not None, "shared shards need pooled weights"
+    shared_down_weights = (
+        prepare_weights_vmem[2] if prepare_weights_vmem is not None else None
+    )
+    assert not shared_sharded or shared_down_weights is not None, (
+        "shared shards need pooled weights"
+    )
     gate_up_accumulator_vmem = workspace.gate_up_accumulator_vmem
     down_accumulator_vmem = workspace.down_accumulator_vmem
     processed_routes_vmem = workspace.processed_routes_vmem
@@ -2506,18 +2810,10 @@ def moe(
     output_receive_semaphores = workspace.output_receive_semaphores
     latent_send_semaphores = workspace.latent_send_semaphores
     latent_receive_semaphores = workspace.latent_receive_semaphores
-    shared_local_reduction_vmem = (
-        communication_workspace.shared_local_reduction_vmem
-    )
-    expert_local_reduction_vmem = (
-        communication_workspace.expert_local_reduction_vmem
-    )
-    shared_host_reduction_vmem = (
-        communication_workspace.shared_host_reduction_vmem
-    )
-    expert_host_reduction_vmem = (
-        communication_workspace.expert_host_reduction_vmem
-    )
+    shared_local_reduction_vmem = communication_workspace.shared_local_reduction_vmem
+    expert_local_reduction_vmem = communication_workspace.expert_local_reduction_vmem
+    shared_host_reduction_vmem = communication_workspace.shared_host_reduction_vmem
+    expert_host_reduction_vmem = communication_workspace.expert_host_reduction_vmem
     routed_send_vmem = communication_workspace.routed_send_vmem
     send_semaphores = communication_workspace.send_semaphores
     receive_semaphores = communication_workspace.receive_semaphores
@@ -2560,9 +2856,7 @@ def moe(
 
     def wait_for_latent_gather():
         view = latent_vmem.at[:, : 31 * 128]
-        tpu.make_async_copy(
-            view, view, latent_send_semaphores.at[latent_slot]
-        ).wait()
+        tpu.make_async_copy(view, view, latent_send_semaphores.at[latent_slot]).wait()
         tpu.make_async_copy(
             view, view, latent_receive_semaphores.at[latent_slot]
         ).wait()
@@ -2573,9 +2867,37 @@ def moe(
             hidden, latent_input_projection_vmem[...]
         ).astype(jnp.bfloat16)
         for offset in (
-            31, 30, 29, 27, 23, 15, 28, 26, 25, 22, 21, 19,
-            14, 13, 11, 7, 24, 20, 18, 17, 12, 10, 9, 6, 5, 3,
-            16, 8, 4, 2, 1,
+            31,
+            30,
+            29,
+            27,
+            23,
+            15,
+            28,
+            26,
+            25,
+            22,
+            21,
+            19,
+            14,
+            13,
+            11,
+            7,
+            24,
+            20,
+            18,
+            17,
+            12,
+            10,
+            9,
+            6,
+            5,
+            3,
+            16,
+            8,
+            4,
+            2,
+            1,
         ):
             latent_copy(offset).start()
 
@@ -2628,9 +2950,7 @@ def moe(
                 return
             del unused_selected_experts
             nonlocal shared_route_prefix, prefetched_expert_count
-            shared_route_prefix *= jnp.all(winners == winners[0]).astype(
-                jnp.int32
-            )
+            shared_route_prefix *= jnp.all(winners == winners[0]).astype(jnp.int32)
             halves = 2 if half_experts else 1
             should_prefetch = (
                 shared_route_prefix
@@ -2659,14 +2979,20 @@ def moe(
 
         def prepare_shared_compute():
             if shared_gate_up_stream is not None:
-                shared_gate_up = shared_gate_up_stream.dot(
-                    hidden, communication_workspace.reduction_phase[0] >= 0
-                ).astype(jnp.bfloat16).astype(jnp.float32)
+                shared_gate_up = (
+                    shared_gate_up_stream.dot(
+                        hidden, communication_workspace.reduction_phase[0] >= 0
+                    )
+                    .astype(jnp.bfloat16)
+                    .astype(jnp.float32)
+                )
             else:
                 dense_copies.gate_up.wait()
-                shared_gate_up = _dot(
-                    hidden, shared_gate_up_projection_vmem[...]
-                ).astype(jnp.bfloat16).astype(jnp.float32)
+                shared_gate_up = (
+                    _dot(hidden, shared_gate_up_projection_vmem[...])
+                    .astype(jnp.bfloat16)
+                    .astype(jnp.float32)
+                )
             middle = _gated_activation(
                 shared_gate_up[:, :shared_width],
                 shared_gate_up[:, shared_width:],
@@ -2692,50 +3018,50 @@ def moe(
                 )
 
         with _phase("p3_route"):
-          (
-            selected_experts,
-            selected_probabilities,
-            local_route_counts,
-            selected_probability_totals,
-          ) = (
-            _route_owned_rows(
-                owned_hidden_ref,
-                batch_size,
-                weights.routing_projection_vmem,
-                weights.routing_bias,
-                workspace.routing_scores_vmem,
-                workspace.selection_source_vmem,
-                workspace.selections_vmem,
-                send_semaphores,
-                receive_semaphores,
-                selected_expert_count=selected_expert_count,
-                local_expert_count=local_expert_count,
-                expert_tensor_parallel=expert_tensor_parallel,
-                on_local_selection=prefetch_shared_route_prefix,
-                after_selection=overlap_routing_with_latent_gather,
-                after_scores=after_routing_scores,
-                live_rows=live_rows,
+            (
+                selected_experts,
+                selected_probabilities,
+                local_route_counts,
+                selected_probability_totals,
+            ) = (
+                _route_owned_rows(
+                    owned_hidden_ref,
+                    batch_size,
+                    weights.routing_projection_vmem,
+                    weights.routing_bias,
+                    workspace.routing_scores_vmem,
+                    workspace.selection_source_vmem,
+                    workspace.selections_vmem,
+                    send_semaphores,
+                    receive_semaphores,
+                    selected_expert_count=selected_expert_count,
+                    local_expert_count=local_expert_count,
+                    expert_tensor_parallel=expert_tensor_parallel,
+                    on_local_selection=prefetch_shared_route_prefix,
+                    after_selection=overlap_routing_with_latent_gather,
+                    after_scores=after_routing_scores,
+                    live_rows=live_rows,
+                )
+                if owned_hidden_ref is not None
+                else _route_hidden_states(
+                    hidden,
+                    weights.routing_projection_vmem,
+                    weights.routing_bias,
+                    workspace.routing_scores_vmem,
+                    send_semaphores.at[0],
+                    receive_semaphores.at[0],
+                    selected_expert_count=selected_expert_count,
+                    local_expert_count=local_expert_count,
+                    expert_tensor_parallel=expert_tensor_parallel,
+                    on_local_selection=prefetch_shared_route_prefix,
+                    after_selection=overlap_routing_with_latent_gather,
+                    after_scores=after_routing_scores,
+                    after_score_send=(
+                        overlap_router_score_exchange if overlap_router_latent else None
+                    ),
+                    live_rows=live_rows,
+                )
             )
-            if owned_hidden_ref is not None
-            else _route_hidden_states(
-                hidden,
-                weights.routing_projection_vmem,
-                weights.routing_bias,
-                workspace.routing_scores_vmem,
-                send_semaphores.at[0],
-                receive_semaphores.at[0],
-                selected_expert_count=selected_expert_count,
-                local_expert_count=local_expert_count,
-                expert_tensor_parallel=expert_tensor_parallel,
-                on_local_selection=prefetch_shared_route_prefix,
-                after_selection=overlap_routing_with_latent_gather,
-                after_scores=after_routing_scores,
-                after_score_send=(
-                    overlap_router_score_exchange if overlap_router_latent else None
-                ),
-                live_rows=live_rows,
-            )
-        )
         if half_experts:
             # Each owned route runs as its two half experts, in order.
             selected_experts = jnp.stack(
@@ -2837,9 +3163,7 @@ def moe(
     def encode_shared(value, destination):
         transport_batch_size = value.shape[0]
         packed = tpu.bitcast(
-            value.reshape(transport_batch_size * shared_rows, 128).astype(
-                jnp.bfloat16
-            ),
+            value.reshape(transport_batch_size * shared_rows, 128).astype(jnp.bfloat16),
             jnp.uint32,
         )
         destination[: transport_batch_size * shared_payload, :] = (
@@ -2851,16 +3175,14 @@ def moe(
         decoded = tpu.bitcast(
             jax.lax.bitcast_convert_type(value, jnp.uint32), jnp.bfloat16
         ).astype(jnp.float32)
-        return jnp.sum(decoded, axis=0).reshape(
-            transport_batch_size, shared_rows * 128
-        )
+        return jnp.sum(decoded, axis=0).reshape(transport_batch_size, shared_rows * 128)
 
     def encode_shared_shard(value, destination):
         transport_batch_size = value.shape[0]
         packed = tpu.bitcast(
-            value.reshape(
-                transport_batch_size * shared_shard_rows, 128
-            ).astype(jnp.bfloat16),
+            value.reshape(transport_batch_size * shared_shard_rows, 128).astype(
+                jnp.bfloat16
+            ),
             jnp.uint32,
         )
         destination[: transport_batch_size * shared_shard_payload, :] = (
@@ -2893,9 +3215,7 @@ def moe(
         values = tpu.bitcast(
             jax.lax.bitcast_convert_type(value, jnp.uint32), jnp.bfloat16
         ).astype(jnp.float32)
-        return jnp.sum(values, axis=0).reshape(
-            transport_batch_size, expert_output_size
-        )
+        return jnp.sum(values, axis=0).reshape(transport_batch_size, expert_output_size)
 
     def decode_gathered_experts(value):
         values = tpu.bitcast(
@@ -2978,9 +3298,7 @@ def moe(
         return routed_send_storage().reshape(8, lane_payload, 128).at[target_lane]
 
     def expert_shard_receive_view(source_lane):
-        return expert_local_reduction_vmem.at[
-            source_lane, :lane_payload, :
-        ]
+        return expert_local_reduction_vmem.at[source_lane, :lane_payload, :]
 
     def expert_shard_copy(offset):
         source_lane = rank % 8
@@ -3012,9 +3330,7 @@ def moe(
                 (batch_size * shared_shard_payload, 128),
                 jnp.float32,
             )
-            shared_shard_receive_view(lane)[...] = (
-                shared_shard_send_view(lane)[...]
-            )
+            shared_shard_receive_view(lane)[...] = shared_shard_send_view(lane)[...]
             for offset in range(7, 0, -1):
                 shared_shard_copy(offset).start()
 
@@ -3033,18 +3349,14 @@ def moe(
             for offset in range(7, 0, -1):
                 shared_shard_copy(offset).wait()
             encode_shared_shard(
-                decode_shared_shard(
-                    shared_local_reduction_vmem[:, :payload, :]
-                ),
+                decode_shared_shard(shared_local_reduction_vmem[:, :payload, :]),
                 shared_host_reduction_vmem.at[rank // 8],
             )
         else:
             for offset in range(7, 0, -1):
                 shared_copy(payload, offset).wait()
             encode_shared(
-                decode_shared(
-                    shared_local_reduction_vmem[:, :payload, :]
-                ),
+                decode_shared(shared_local_reduction_vmem[:, :payload, :]),
                 shared_host_reduction_vmem.at[rank // 8],
             )
         for offset in range(3, 0, -1):
@@ -3064,9 +3376,7 @@ def moe(
                     else reduced_shared_outputs.at[
                         :, pl.ds(lane * shared_shard_width, shared_shard_width)
                     ]
-                )[...] = decode_shared_shard(
-                    shared_host_reduction_vmem[:, :payload, :]
-                )
+                )[...] = decode_shared_shard(shared_host_reduction_vmem[:, :payload, :])
         else:
             reduced_shared_outputs[...] = decode_shared(
                 shared_host_reduction_vmem[:, :payload, :]
@@ -3083,7 +3393,10 @@ def moe(
         )
         expert_transport_payload = transport_batch_size * expert_payload
         assert shared_transport_payload <= shared_local_reduction_vmem.shape[1]
-        assert reduce_scatter_routed_output or expert_transport_payload <= expert_local_reduction_vmem.shape[1]
+        assert (
+            reduce_scatter_routed_output
+            or expert_transport_payload <= expert_local_reduction_vmem.shape[1]
+        )
         assert routed_send_vmem is None or reduce_scatter_routed_output
 
         latent_output_copy.start()
@@ -3124,9 +3437,7 @@ def moe(
             owned_shard = expert_shard_send_view(lane)[...]
             expert_shard_receive_view(lane)[...] = owned_shard
             encode_expert(
-                decode_expert(
-                    expert_local_reduction_vmem[:, :lane_payload, :]
-                ),
+                decode_expert(expert_local_reduction_vmem[:, :lane_payload, :]),
                 expert_host_reduction_vmem.at[rank // 8],
             )
             _phase_end(t3)
@@ -3171,22 +3482,28 @@ def moe(
                     # vectors, not feature fragments. Same BF16 rounding point
                     # and token order as the unpipelined gather.
                     packed = expert_local_reduction_vmem[
-                        first_lane:first_lane + lane_count, :lane_payload, :
+                        first_lane : first_lane + lane_count, :lane_payload, :
                     ]
-                    values = tpu.bitcast(
-                        jax.lax.bitcast_convert_type(packed, jnp.uint32),
-                        jnp.bfloat16,
-                    ).astype(jnp.float32).reshape(rows, expert_output_size)
-                    reduced_expert_outputs[
-                        pl.ds(first, rows), :expert_output_size
-                    ] = values
+                    values = (
+                        tpu.bitcast(
+                            jax.lax.bitcast_convert_type(packed, jnp.uint32),
+                            jnp.bfloat16,
+                        )
+                        .astype(jnp.float32)
+                        .reshape(rows, expert_output_size)
+                    )
+                    reduced_expert_outputs[pl.ds(first, rows), :expert_output_size] = (
+                        values
+                    )
                     consume_routed_chunk(first, rows)
 
                 _consume_completed_routed_chunks(
                     batch_size=batch_size,
                     tokens_per_lane=tokens_per_lane,
                     lane=lane,
-                    wait_for_peer=lambda offset: expert_copy(lane_payload, offset).wait(),
+                    wait_for_peer=lambda offset: expert_copy(
+                        lane_payload, offset
+                    ).wait(),
                     consume=consume,
                 )
                 _phase_end(t5)
@@ -3210,15 +3527,11 @@ def moe(
         for offset in range(7, 0, -1):
             expert_copy(expert_transport_payload, offset).wait()
         encode_expert(
-            decode_expert(
-                expert_local_reduction_vmem[:, :expert_transport_payload, :]
-            ),
+            decode_expert(expert_local_reduction_vmem[:, :expert_transport_payload, :]),
             expert_host_reduction_vmem.at[rank // 8],
         )
         for offset in range(3, 0, -1):
-            expert_copy(
-                expert_transport_payload, offset, True
-            ).start()
+            expert_copy(expert_transport_payload, offset, True).start()
         for offset in range(3, 0, -1):
             expert_copy(expert_transport_payload, offset, True).wait()
         reduced_expert_outputs[...] = jnp.zeros(
@@ -3228,11 +3541,8 @@ def moe(
             expert_host_reduction_vmem[:, :expert_transport_payload, :]
         )
 
-        finish_shared_host_reduction(
-            shared_transport_payload, reduced_shared_outputs
-        )
+        finish_shared_host_reduction(shared_transport_payload, reduced_shared_outputs)
         reduction_phase[0] += 2
-
 
     if shared_sharded:
         assert reduce_scatter_shared_output
@@ -3243,9 +3553,12 @@ def moe(
         begin_shared_reduction(shared_outputs_vmem[...])
     if overlap_latent_gather:
         wait_for_latent_gather()
+
     def run_with_shared_progress(progress_state):
         progress_state[0] = 0
-        payload = batch_size * (shared_shard_payload if reduce_scatter_shared_output else shared_payload)
+        payload = batch_size * (
+            shared_shard_payload if reduce_scatter_shared_output else shared_payload
+        )
         # Seven copies, each with its own send/receive semaphore. DMA counters
         # count 32-byte units; both ends must be complete before reusing sources.
         expected = payload * 128 * 4 // 32
@@ -3255,8 +3568,14 @@ def moe(
             def try_progress():
                 ready = jnp.bool_(True)
                 for peer in range(7):
-                    ready = ready & (pl.semaphore_read(shared_send_semaphores.at[peer]) >= expected)
-                    ready = ready & (pl.semaphore_read(shared_receive_semaphores.at[peer]) >= expected)
+                    ready = ready & (
+                        pl.semaphore_read(shared_send_semaphores.at[peer]) >= expected
+                    )
+                    ready = ready & (
+                        pl.semaphore_read(shared_receive_semaphores.at[peer])
+                        >= expected
+                    )
+
                 @pl.when(ready)
                 def advance():
                     with _phase("t2_shared_local_polled"):
@@ -3265,28 +3584,29 @@ def moe(
 
         with _phase("p4_experts"):
             _run_routed_expert_stream(
-            latent_vmem,
-            selected_experts_vmem[:, :route_columns],
-            selected_probabilities_vmem[:, :route_columns],
-            local_route_counts_vmem[:, 0],
-            probability_totals_vmem[:, 0],
-            expert_gate_up_vmem,
-            expert_gate_up_scale_vmem,
-            expert_down_vmem,
-            expert_down_scale_vmem,
-            routed_outputs_vmem,
-            gate_up_accumulator_vmem,
-            down_accumulator_vmem,
-            processed_routes_vmem,
-            first_compact_source_vmem,
-            second_compact_source_vmem,
-            copy_expert,
-            expert_input_size=expert_input_size,
-            expert_width=expert_width,
-            expert_output_size=expert_output_size,
-            group_pending_routes=group_pending_expert_routes,
-            progress=poll_shared,
+                latent_vmem,
+                selected_experts_vmem[:, :route_columns],
+                selected_probabilities_vmem[:, :route_columns],
+                local_route_counts_vmem[:, 0],
+                probability_totals_vmem[:, 0],
+                expert_gate_up_vmem,
+                expert_gate_up_scale_vmem,
+                expert_down_vmem,
+                expert_down_scale_vmem,
+                routed_outputs_vmem,
+                gate_up_accumulator_vmem,
+                down_accumulator_vmem,
+                processed_routes_vmem,
+                first_compact_source_vmem,
+                second_compact_source_vmem,
+                copy_expert,
+                expert_input_size=expert_input_size,
+                expert_width=expert_width,
+                expert_output_size=expert_output_size,
+                group_pending_routes=group_pending_expert_routes,
+                progress=poll_shared,
             )
+
         @pl.when(progress_state[0] == 0)
         def drain_shared():
             with _phase("t2_shared_local_drain"):
@@ -3294,37 +3614,41 @@ def moe(
             progress_state[0] = 1
 
     if overlap_shared_reduction:
-        pl.run_scoped(run_with_shared_progress, progress_state=tpu.SMEM((1,), jnp.int32))
+        pl.run_scoped(
+            run_with_shared_progress, progress_state=tpu.SMEM((1,), jnp.int32)
+        )
     else:
         with _phase("p4_experts"):
             _run_routed_expert_stream(
-            latent_vmem,
-            selected_experts_vmem[:, :route_columns],
-            selected_probabilities_vmem[:, :route_columns],
-            local_route_counts_vmem[:, 0],
-            probability_totals_vmem[:, 0],
-            expert_gate_up_vmem,
-            expert_gate_up_scale_vmem,
-            expert_down_vmem,
-            expert_down_scale_vmem,
-            routed_outputs_vmem,
-            gate_up_accumulator_vmem,
-            down_accumulator_vmem,
-            processed_routes_vmem,
-            first_compact_source_vmem,
-            second_compact_source_vmem,
-            copy_expert,
-            expert_input_size=expert_input_size,
-            expert_width=expert_width,
-            expert_output_size=expert_output_size,
-            group_pending_routes=group_pending_expert_routes,
-            progress=None,
+                latent_vmem,
+                selected_experts_vmem[:, :route_columns],
+                selected_probabilities_vmem[:, :route_columns],
+                local_route_counts_vmem[:, 0],
+                probability_totals_vmem[:, 0],
+                expert_gate_up_vmem,
+                expert_gate_up_scale_vmem,
+                expert_down_vmem,
+                expert_down_scale_vmem,
+                routed_outputs_vmem,
+                gate_up_accumulator_vmem,
+                down_accumulator_vmem,
+                processed_routes_vmem,
+                first_compact_source_vmem,
+                second_compact_source_vmem,
+                copy_expert,
+                expert_input_size=expert_input_size,
+                expert_width=expert_width,
+                expert_output_size=expert_output_size,
+                group_pending_routes=group_pending_expert_routes,
+                progress=None,
             )
 
     def consume_routed_chunk(first, rows):
         with _phase("t7_pipeline_latent_up"):
             row_slice = pl.ds(first, rows)
-            routed = routed_outputs_vmem[row_slice].astype(jnp.bfloat16).astype(jnp.float32)
+            routed = (
+                routed_outputs_vmem[row_slice].astype(jnp.bfloat16).astype(jnp.float32)
+            )
             normalized = (
                 routed
                 * jax.lax.rsqrt(
@@ -3343,9 +3667,7 @@ def moe(
                 + (
                     shared_outputs_vmem[row_slice]
                     if shared_sharded
-                    else shared_outputs_vmem[
-                        row_slice, pl.ds((rank % 8) * 1024, 1024)
-                    ]
+                    else shared_outputs_vmem[row_slice, pl.ds((rank % 8) * 1024, 1024)]
                 )
             ).astype(jnp.bfloat16)
             # Expert input latents are dead after the expert stream. This
@@ -3365,8 +3687,7 @@ def moe(
         normalized = (
             routed
             * jax.lax.rsqrt(
-                jnp.sum(routed * routed, axis=1, keepdims=True)
-                / latent_feature_count
+                jnp.sum(routed * routed, axis=1, keepdims=True) / latent_feature_count
                 + epsilon
             )
             * weights.latent_normalization[...]
@@ -3405,9 +3726,7 @@ def moe(
             row_start = target_pair * tokens_per_pair
             send[target_pair] = local_output[
                 row_start : row_start + tokens_per_pair
-            ].reshape(
-                payload_rows, 128
-            )
+            ].reshape(payload_rows, 128)
         receive[lane] = send[pair]
         copies = []
         for offset in range(7, 0, -1):
@@ -3427,9 +3746,7 @@ def moe(
             copy.wait()
 
         for source_lane in range(7):
-            block = receive[source_lane].reshape(
-                tokens_per_pair, 1024
-            )
+            block = receive[source_lane].reshape(tokens_per_pair, 1024)
             output_ref[:, pl.ds(source_lane * 1024, 1024)] = block
     else:
         output_vmem[:, pl.ds((rank % 8) * 1024, 1024)] = local_output
@@ -3439,9 +3756,9 @@ def moe(
             output_receive_semaphores,
             reduction_phase[0] % 2,
         )
-        output_ref[...] = output_vmem[
-            :batch_size, :hidden_size
-        ].astype(hidden_ref.dtype)
+        output_ref[...] = output_vmem[:batch_size, :hidden_size].astype(
+            hidden_ref.dtype
+        )
     _phase_end(t8)
     reduction_phase[0] += 1
 
@@ -3461,12 +3778,11 @@ STREAMED_WEIGHTS = {
     "m_qa": ("columns", 16),
     "shared_gu": ("columns", 20),
 }
-WEIGHT_STREAMS = {
-    name: tuple(value)
-    for name, value in _config().weight_streams
-}
+WEIGHT_STREAMS = {name: tuple(value) for name, value in _config().weight_streams}
 if set(WEIGHT_STREAMS) - set(STREAMED_WEIGHTS):
-    raise ValueError(f"KernelConfig.weight_streams names unknown weights {sorted(set(WEIGHT_STREAMS) - set(STREAMED_WEIGHTS))}")
+    raise ValueError(
+        f"KernelConfig.weight_streams names unknown weights {sorted(set(WEIGHT_STREAMS) - set(STREAMED_WEIGHTS))}"
+    )
 
 
 # Rings deeper than four slots (attention DP's small batches) signal from
@@ -3563,7 +3879,11 @@ def _dp_dcp_weight_streams(dp: int, group_rows: int) -> dict[str, tuple[int, int
         depths = (13, 12)
     else:
         depths = {16: (10, 9), 32: (7, 7)}.get(group_rows, (4, 4))
-    streams = {"k_projection": (13 * dp, depths[0]), "m_qa": (12, depths[1]), "m_kb": (dp, dp)}
+    streams = {
+        "k_projection": (13 * dp, depths[0]),
+        "m_qa": (12, depths[1]),
+        "m_kb": (dp, dp),
+    }
     if dp == 2 and group_rows == 1:
         streams.update(m_qb=(dp, dp), m_gate=(dp, dp))
     return streams
@@ -3583,6 +3903,7 @@ def _attention_projection_streams(dp: int, schedule: str) -> dict[str, tuple[int
     if dp not in (2, 4):
         raise ValueError("Projection schedule experiments require attention DP2/DP4")
     return {name: (dp, 2) for name in ("m_qb", "m_kb")}
+
 
 def attention_dp_shape(name, shape, dp):
     """The per-rank ``[layers, ...]`` shape of ``name`` under attention DP."""
@@ -3616,7 +3937,9 @@ def to_attention_dp(weights, mesh, dp):
             # order is independent of the physical DP group owning this rank.
             parts = (value,) + tuple(
                 jax.lax.ppermute(
-                    value, "tp", perm=[(rank, rank ^ (offset * group)) for rank in range(32)]
+                    value,
+                    "tp",
+                    perm=[(rank, rank ^ (offset * group)) for rank in range(32)],
                 )
                 for offset in range(1, dp)
             )
@@ -3625,14 +3948,18 @@ def to_attention_dp(weights, mesh, dp):
             for shard in range(dp):
                 part = parts[0]
                 for offset in range(1, dp):
-                    part = jnp.where((data_group ^ offset) == shard, parts[offset], part)
+                    part = jnp.where(
+                        (data_group ^ offset) == shard, parts[offset], part
+                    )
                 ordered.append(part)
             if kind == "stack":
                 return jnp.stack(ordered, axis=1)[None]
             return jnp.concatenate(ordered, axis=1 + axis)[None]
 
         return jax.jit(
-            jax.shard_map(local, mesh=mesh, in_specs=P("tp"), out_specs=P("tp"), check_vma=False)
+            jax.shard_map(
+                local, mesh=mesh, in_specs=P("tp"), out_specs=P("tp"), check_vma=False
+            )
         )
 
     return {
@@ -3657,7 +3984,9 @@ def _chunk_sizes(extent: int, chunks: int, unit: int) -> tuple[int, ...]:
     """Split ``extent`` into ``chunks`` whole ``unit`` blocks, larger first."""
     blocks, remainder = divmod(extent // unit, chunks)
     if extent % unit or not 1 <= chunks <= extent // unit:
-        raise ValueError(f"Cannot split {extent} into {chunks} chunks of whole {unit}-blocks")
+        raise ValueError(
+            f"Cannot split {extent} into {chunks} chunks of whole {unit}-blocks"
+        )
     return tuple(unit * (blocks + (index < remainder)) for index in range(chunks))
 
 
@@ -3679,11 +4008,28 @@ class ChunkedWeightStream:
     compiler's MXU accumulation split depends on the shape).
     """
 
-    def __init__(self, source, full, semaphores, *, axis, sizes, depth, base=0,
-                 pool=None, offset=None, order=None):
+    def __init__(
+        self,
+        source,
+        full,
+        semaphores,
+        *,
+        axis,
+        sizes,
+        depth,
+        base=0,
+        pool=None,
+        offset=None,
+        order=None,
+    ):
         if axis not in ("columns", "rows"):
             raise ValueError("Stream axis must be 'columns' or 'rows'")
-        self.axis, self.sizes, self.depth, self.chunks = axis, tuple(sizes), depth, len(sizes)
+        self.axis, self.sizes, self.depth, self.chunks = (
+            axis,
+            tuple(sizes),
+            depth,
+            len(sizes),
+        )
         extent = source.shape[1 if axis == "columns" else 0]
         if sum(self.sizes) != extent:
             raise ValueError("Chunk sizes must cover the streamed axis")
@@ -3692,20 +4038,28 @@ class ChunkedWeightStream:
         if order is not None and len(set(self.sizes)) != 1:
             raise ValueError("A reordered stream needs equal chunk sizes")
         self.source, self.full, self.semaphores, self.base, self.order = (
-            source, full, semaphores, base, order,
+            source,
+            full,
+            semaphores,
+            base,
+            order,
         )
         self.slots = None
         if depth < self.chunks:
             if pool is None:
                 raise ValueError("A ring stream needs its weight's pool range")
             size = max(self.sizes)
-            shape = (full.shape[0], size) if axis == "columns" else (size, full.shape[1])
+            shape = (
+                (full.shape[0], size) if axis == "columns" else (size, full.shape[1])
+            )
             slot_bytes = pool_alias.storage_size(shape, full.dtype)
             if depth * slot_bytes > pool_alias.storage_size(full.shape, full.dtype):
                 raise ValueError("Ring slots exceed the weight's pool range")
             self.slots = tuple(
                 pool_alias.view(
-                    pool.at[pl.ds((offset + slot * slot_bytes) // 128, slot_bytes // 128), :],
+                    pool.at[
+                        pl.ds((offset + slot * slot_bytes) // 128, slot_bytes // 128), :
+                    ],
                     shape,
                     full.dtype,
                 )
@@ -3736,9 +4090,13 @@ class ChunkedWeightStream:
 
     def _copy(self, position):
         start, size = self._extent(position)
-        source = self.source if self.chunks == 1 else self._part(self.source, start, size)
+        source = (
+            self.source if self.chunks == 1 else self._part(self.source, start, size)
+        )
         return tpu.make_async_copy(
-            source, self.view(position), self.semaphores.at[self.base + position % self.depth]
+            source,
+            self.view(position),
+            self.semaphores.at[self.base + position % self.depth],
         )
 
     def start(self):
@@ -3750,7 +4108,9 @@ class ChunkedWeightStream:
 
     def wait_all(self):
         if self.slots is not None:
-            raise ValueError("Only a stream with a slot per chunk can wait for all chunks")
+            raise ValueError(
+                "Only a stream with a slot per chunk can wait for all chunks"
+            )
         for position in range(self.chunks):
             self.wait(position)
 
@@ -3759,6 +4119,7 @@ class ChunkedWeightStream:
         condition that keeps the refill in its own region, after the loads of
         the chunk it overwrites."""
         if position + self.depth < self.chunks:
+
             @pl.when(guard)
             def refill():
                 self._copy(position + self.depth).start()
@@ -3799,10 +4160,27 @@ class KdaStateStream:
     subsequent verifier rows are produced by the recurrence before use.
     """
 
-    def __init__(self, history_hbm, state_hbm, history_output_hbm, state_output_hbm,
-                 history_buffers, state_buffers, read_semaphores, write_semaphores, *, chunk, chunks, slots=None, sequence_rows=1):
+    def __init__(
+        self,
+        history_hbm,
+        state_hbm,
+        history_output_hbm,
+        state_output_hbm,
+        history_buffers,
+        state_buffers,
+        read_semaphores,
+        write_semaphores,
+        *,
+        chunk,
+        chunks,
+        slots=None,
+        sequence_rows=1,
+    ):
         self.history_hbm, self.state_hbm = history_hbm, state_hbm
-        self.history_output_hbm, self.state_output_hbm = history_output_hbm, state_output_hbm
+        self.history_output_hbm, self.state_output_hbm = (
+            history_output_hbm,
+            state_output_hbm,
+        )
         self.history_buffers, self.state_buffers = history_buffers, state_buffers
         self.read_semaphores, self.write_semaphores = read_semaphores, write_semaphores
         self.chunk, self.chunks = chunk, chunks
@@ -3811,35 +4189,53 @@ class KdaStateStream:
         self.pending_writes = []
         self.buffer_count = history_buffers.shape[0]
         self.four_buffers = self.buffer_count == 4
-        assert not self.four_buffers or (self.chunks == 4 and self.chunk == 8 and not KDA_STAGED)
+        assert not self.four_buffers or (
+            self.chunks == 4 and self.chunk == 8 and not KDA_STAGED
+        )
 
     def _reads(self, index):
         rows, slot = pl.ds(index * self.chunk, self.chunk), index % self.buffer_count
         if self.slots is not None:
             return tuple(
-                tpu.make_async_copy(source.at[pl.ds(self.slots[index * self.chunk + row], 1)],
-                                    buffer.at[slot, pl.ds(row, 1)],
-                                    self.read_semaphores.at[slot, kind])
-                for kind, (source, buffer) in enumerate((
-                    (self.history_hbm, self.history_buffers),
-                    (self.state_hbm, self.state_buffers),
-                ))
+                tpu.make_async_copy(
+                    source.at[pl.ds(self.slots[index * self.chunk + row], 1)],
+                    buffer.at[slot, pl.ds(row, 1)],
+                    self.read_semaphores.at[slot, kind],
+                )
+                for kind, (source, buffer) in enumerate(
+                    (
+                        (self.history_hbm, self.history_buffers),
+                        (self.state_hbm, self.state_buffers),
+                    )
+                )
                 for row in range(0, self.chunk, self.sequence_rows)
             )
         return (
-            tpu.make_async_copy(self.history_hbm.at[rows], self.history_buffers.at[slot],
-                                self.read_semaphores.at[slot, 0]),
-            tpu.make_async_copy(self.state_hbm.at[rows], self.state_buffers.at[slot],
-                                self.read_semaphores.at[slot, 1]),
+            tpu.make_async_copy(
+                self.history_hbm.at[rows],
+                self.history_buffers.at[slot],
+                self.read_semaphores.at[slot, 0],
+            ),
+            tpu.make_async_copy(
+                self.state_hbm.at[rows],
+                self.state_buffers.at[slot],
+                self.read_semaphores.at[slot, 1],
+            ),
         )
 
     def _writes(self, index):
         rows, slot = pl.ds(index * self.chunk, self.chunk), index % self.buffer_count
         return (
-            tpu.make_async_copy(self.history_buffers.at[slot], self.history_output_hbm.at[rows],
-                                self.write_semaphores.at[slot, 0]),
-            tpu.make_async_copy(self.state_buffers.at[slot], self.state_output_hbm.at[rows],
-                                self.write_semaphores.at[slot, 1]),
+            tpu.make_async_copy(
+                self.history_buffers.at[slot],
+                self.history_output_hbm.at[rows],
+                self.write_semaphores.at[slot, 0],
+            ),
+            tpu.make_async_copy(
+                self.state_buffers.at[slot],
+                self.state_output_hbm.at[rows],
+                self.write_semaphores.at[slot, 1],
+            ),
         )
 
     def prime(self):
@@ -4063,9 +4459,11 @@ def kda(
         raise ValueError("Per-shard KDA calls must take attended_out")
     batch_size, hidden_size = hidden_ref.shape
     head_count, channels_per_head = 3, 128
-    state_batch = (convolution_history_ref.shape[0]
-                   if state_stream is not None and state_stream.slots is not None
-                   else batch_size)
+    state_batch = (
+        convolution_history_ref.shape[0]
+        if state_stream is not None and state_stream.slots is not None
+        else batch_size
+    )
     state_shape = (
         state_batch,
         head_count,
@@ -4097,15 +4495,25 @@ def kda(
     # every state-stream region. DP1 stages only with KernelConfig.kda_staged.
     staged = (
         (stage_projections or (KDA_STAGED and shard_index is None))
-        and batch_size > 8 and sequence_rows == 1
+        and batch_size > 8
+        and sequence_rows == 1
     )
-    projection_width = 1664 if shard_index is not None else weights.input_projection.shape[1]
+    projection_width = (
+        1664 if shard_index is not None else weights.input_projection.shape[1]
+    )
     rolled = staged and state_stream is not None
-    row_chunk = state_stream.chunk if state_stream is not None else _kda_row_chunk(batch_size)
+    row_chunk = (
+        state_stream.chunk if state_stream is not None else _kda_row_chunk(batch_size)
+    )
     chunk_count = batch_size // row_chunk
 
-    def run(reduction_vmem, attended_vmem=None, projected_vmem=None, gate_vmem=None,
-            output_gate_vmem=None):
+    def run(
+        reduction_vmem,
+        attended_vmem=None,
+        projected_vmem=None,
+        gate_vmem=None,
+        output_gate_vmem=None,
+    ):
         kda_scope = [_phase_start("q3_kda_projections")]
         weight_copies = weights.make_projection_copies()
         if not weights_are_prefetched:
@@ -4143,7 +4551,9 @@ def kda(
                 .reshape(chunk_count, row_chunk, -1)
             )
         elif staged:
-            gate_vmem[...] = _dot(gate_features, feature_gate_vmem[...]).astype(jnp.bfloat16)
+            gate_vmem[...] = _dot(gate_features, feature_gate_vmem[...]).astype(
+                jnp.bfloat16
+            )
         else:
             raw_recurrent_gate = _dot(gate_features, feature_gate_vmem[...])
             if traced_shard:
@@ -4153,8 +4563,7 @@ def kda(
                     raw_recurrent_gate[:, attention_width:],
                 )
             raw_recurrent_gate = (
-                raw_recurrent_gate
-                .astype(jnp.bfloat16)
+                raw_recurrent_gate.astype(jnp.bfloat16)
                 .reshape(batch_size, head_count, channels_per_head)
                 .astype(jnp.float32)
             )
@@ -4169,10 +4578,14 @@ def kda(
                 communication_workspace.reduction_phase[0] >= 0,
             ).astype(jnp.bfloat16)
         elif "input" in streams:
-            projected = streams["input"].dot(
-                hidden_ref[...],
-                communication_workspace.reduction_phase[0] >= 0,
-            ).astype(jnp.bfloat16)
+            projected = (
+                streams["input"]
+                .dot(
+                    hidden_ref[...],
+                    communication_workspace.reduction_phase[0] >= 0,
+                )
+                .astype(jnp.bfloat16)
+            )
         else:
             weight_copies.input.wait()
             projected = _dot(
@@ -4180,7 +4593,9 @@ def kda(
             ).astype(jnp.bfloat16)
         if rolled:
             projected_vmem[...] = projected.reshape(chunk_count, row_chunk, -1)
-            output_gate_vmem[...] = projected[:, 3 * attention_width : 4 * attention_width]
+            output_gate_vmem[...] = projected[
+                :, 3 * attention_width : 4 * attention_width
+            ]
             del projected
 
             queries_keys_values = _RowFunction(
@@ -4189,18 +4604,25 @@ def kda(
                 )
             )
             update_rate = _RowFunction(
-                lambda index: projected_vmem[index][
-                    :, 4 * attention_width : 4 * attention_width + head_count
-                ].reshape(row_chunk, head_count, 1).astype(jnp.float32)
+                lambda index: (
+                    projected_vmem[index][
+                        :, 4 * attention_width : 4 * attention_width + head_count
+                    ]
+                    .reshape(row_chunk, head_count, 1)
+                    .astype(jnp.float32)
+                )
             )
             decay = _RowFunction(
-                lambda index: decay_lower_bound * jax.nn.sigmoid(
-                    jnp.exp(weights.exp_log_decay_rate[...])[None]
-                    * (
-                        gate_vmem[index]
-                        .reshape(row_chunk, head_count, channels_per_head)
-                        .astype(jnp.float32)
-                        + weights.time_step_bias[...][None]
+                lambda index: (
+                    decay_lower_bound
+                    * jax.nn.sigmoid(
+                        jnp.exp(weights.exp_log_decay_rate[...])[None]
+                        * (
+                            gate_vmem[index]
+                            .reshape(row_chunk, head_count, channels_per_head)
+                            .astype(jnp.float32)
+                            + weights.time_step_bias[...][None]
+                        )
                     )
                 )
             )
@@ -4219,18 +4641,25 @@ def kda(
                 )
             )
             update_rate = _RowFunction(
-                lambda rows: projected_vmem[
-                    rows, 4 * attention_width : 4 * attention_width + head_count
-                ].reshape(chunk_rows(rows), head_count, 1).astype(jnp.float32)
+                lambda rows: (
+                    projected_vmem[
+                        rows, 4 * attention_width : 4 * attention_width + head_count
+                    ]
+                    .reshape(chunk_rows(rows), head_count, 1)
+                    .astype(jnp.float32)
+                )
             )
             decay = _RowFunction(
-                lambda rows: decay_lower_bound * jax.nn.sigmoid(
-                    jnp.exp(weights.exp_log_decay_rate[...])[None]
-                    * (
-                        gate_vmem[rows]
-                        .reshape(chunk_rows(rows), head_count, channels_per_head)
-                        .astype(jnp.float32)
-                        + weights.time_step_bias[...][None]
+                lambda rows: (
+                    decay_lower_bound
+                    * jax.nn.sigmoid(
+                        jnp.exp(weights.exp_log_decay_rate[...])[None]
+                        * (
+                            gate_vmem[rows]
+                            .reshape(chunk_rows(rows), head_count, channels_per_head)
+                            .astype(jnp.float32)
+                            + weights.time_step_bias[...][None]
+                        )
                     )
                 )
             )
@@ -4256,6 +4685,7 @@ def kda(
                 * (raw_recurrent_gate + weights.time_step_bias[...][None])
             )
         if sequence_rows == 1:
+
             def recurrence(rows, history_ref=None, state_ref=None):
                 # ``history_ref``/``state_ref``: a streamed chunk's buffers
                 # (updated in place), else the whole-batch state refs.
@@ -4289,12 +4719,18 @@ def kda(
                 key *= jax.lax.rsqrt(jnp.sum(key * key, axis=-1, keepdims=True) + 1e-6)
                 next_recurrent_state = recurrent_state * jnp.exp(decay[rows])[..., None]
                 predicted_value = jnp.sum(key[..., None] * next_recurrent_state, axis=2)
-                state_update = jax.nn.sigmoid(update_rate[rows]) * (value - predicted_value)
+                state_update = jax.nn.sigmoid(update_rate[rows]) * (
+                    value - predicted_value
+                )
                 next_recurrent_state += key[..., None] * state_update[..., None, :]
                 attended_rows = jnp.sum(query[..., None] * next_recurrent_state, axis=2)
                 if history_ref is None:
-                    updated_convolution_history_ref[rows, :, :, :head_count] = convolution_window[:, 1:]
-                    updated_recurrent_state_ref[rows] = next_recurrent_state.astype(updated_recurrent_state_ref.dtype)
+                    updated_convolution_history_ref[rows, :, :, :head_count] = (
+                        convolution_window[:, 1:]
+                    )
+                    updated_recurrent_state_ref[rows] = next_recurrent_state.astype(
+                        updated_recurrent_state_ref.dtype
+                    )
                 else:
                     history_ref[:, :, :, :head_count] = convolution_window[:, 1:]
                     state_ref[...] = next_recurrent_state.astype(state_ref.dtype)
@@ -4320,16 +4756,19 @@ def kda(
                 # chunk's state is live.
                 chunk = row_chunk
                 if rolled:
+
                     @pl.loop(0, chunk_count)
                     def run_rolled_chunk(index):
                         history_chunk, state_chunk = state_stream.acquire_rolled(index)
-                        attended_vmem[pl.ds(pl.multiple_of(index * chunk, chunk), chunk)] = (
-                            recurrence(index, history_chunk, state_chunk)
-                        )
+                        attended_vmem[
+                            pl.ds(pl.multiple_of(index * chunk, chunk), chunk)
+                        ] = recurrence(index, history_chunk, state_chunk)
                         state_stream.release_rolled(index)
 
                     state_stream.finish_rolled()
-                for index, first in (() if rolled else enumerate(range(0, batch_size, chunk))):
+                for index, first in (
+                    () if rolled else enumerate(range(0, batch_size, chunk))
+                ):
                     # A runtime condition (never false) so the chunk is its own region.
                     @pl.when(communication_workspace.reduction_phase[0] >= 0)
                     def run_chunk(index=index, first=first):
@@ -4343,6 +4782,7 @@ def kda(
                                 slice(first, first + chunk), history_chunk, state_chunk
                             )
                             state_stream.release(index)
+
                 if state_stream is not None and not rolled and batch_size != 32:
                     state_stream.finish()
                 attended = attended_vmem[...]
@@ -4354,7 +4794,8 @@ def kda(
                 ``history`` and recurrent ``state``; ``store(offset, history,
                 state)`` writes row ``first + offset``'s post-states."""
                 window = jnp.concatenate(
-                    (history, queries_keys_values[first : first + sequence_rows]), axis=0
+                    (history, queries_keys_values[first : first + sequence_rows]),
+                    axis=0,
                 )
                 state = state.astype(jnp.float32)
                 rows = []
@@ -4396,8 +4837,11 @@ def kda(
             if state_stream is None:
                 attended_rows = []
                 for first in range(0, batch_size, sequence_rows):
+
                     def store(offset, history, state, first=first):
-                        updated_convolution_history_ref[first + offset, :, :, :head_count] = history
+                        updated_convolution_history_ref[
+                            first + offset, :, :, :head_count
+                        ] = history
                         updated_recurrent_state_ref[first + offset] = state
 
                     attended_rows += run_sequence(
@@ -4422,8 +4866,11 @@ def kda(
                         history_chunk, state_chunk = state_stream.acquire(index)
                         rows = []
                         for local in range(0, chunk, sequence_rows):
+
                             def store(offset, history, state, local=local):
-                                history_chunk[local + offset, :, :, :head_count] = history
+                                history_chunk[local + offset, :, :, :head_count] = (
+                                    history
+                                )
                                 state_chunk[local + offset] = state
 
                             rows += run_sequence(
@@ -4432,8 +4879,11 @@ def kda(
                                 state_chunk[local],
                                 store,
                             )
-                        attended_vmem[base : base + chunk] = jnp.concatenate(rows, axis=0)
+                        attended_vmem[base : base + chunk] = jnp.concatenate(
+                            rows, axis=0
+                        )
                         state_stream.release(index)
+
                 if batch_size != 32:  # B32 drains after the output work (below)
                     state_stream.finish()
                 attended = attended_vmem[...]
@@ -4449,15 +4899,16 @@ def kda(
             else weights.output_normalization[0]
         )
         if rolled:
-            output_gate = output_gate_vmem[...].reshape(batch_size, head_count, channels_per_head)
+            output_gate = output_gate_vmem[...].reshape(
+                batch_size, head_count, channels_per_head
+            )
         elif staged:
             output_gate = projected_vmem[
                 :, 3 * attention_width : 4 * attention_width
             ].reshape(batch_size, head_count, channels_per_head)
-        attended = (
-            (attended * normalization).astype(jnp.bfloat16)
-            * jax.nn.sigmoid(output_gate.astype(jnp.float32)).astype(jnp.bfloat16)
-        )
+        attended = (attended * normalization).astype(jnp.bfloat16) * jax.nn.sigmoid(
+            output_gate.astype(jnp.float32)
+        ).astype(jnp.bfloat16)
         if on_state_updated is not None:
             on_state_updated()
         _phase_end(kda_scope.pop())
@@ -4472,24 +4923,24 @@ def kda(
             output_stream.wait_all()
             output_stream = None
         with _phase("p2_attn_project_reduce"):
-          _project_attention_2d(
-            attended.reshape(batch_size, attention_width),
-            weights.output_projection_vmem,
-            output_ref,
-            reduction_vmem,
-            communication_workspace.shared_local_reduction_vmem,
-            communication_workspace.shared_host_reduction_vmem,
-            communication_workspace.attention_features_vmem,
-            communication_workspace.attention_output_vmem,
-            communication_workspace.send_semaphores,
-            communication_workspace.receive_semaphores,
-            communication_workspace.reduction_phase,
-            _dot,
-            token_scatter_output=token_scatter_output,
-            weight_stream=output_stream,
-            staging=communication_workspace.projection_staging_vmem,
-            gather_wire=communication_workspace.attention_gather_vmem,
-        )
+            _project_attention_2d(
+                attended.reshape(batch_size, attention_width),
+                weights.output_projection_vmem,
+                output_ref,
+                reduction_vmem,
+                communication_workspace.shared_local_reduction_vmem,
+                communication_workspace.shared_host_reduction_vmem,
+                communication_workspace.attention_features_vmem,
+                communication_workspace.attention_output_vmem,
+                communication_workspace.send_semaphores,
+                communication_workspace.receive_semaphores,
+                communication_workspace.reduction_phase,
+                _dot,
+                token_scatter_output=token_scatter_output,
+                weight_stream=output_stream,
+                staging=communication_workspace.projection_staging_vmem,
+                gather_wire=communication_workspace.attention_gather_vmem,
+            )
 
     pl.run_scoped(
         run,
@@ -4502,7 +4953,10 @@ def kda(
         *(
             (
                 tpu.VMEM((chunk_count, row_chunk, projection_width), jnp.bfloat16),
-                tpu.VMEM((chunk_count, row_chunk, head_count * channels_per_head), jnp.bfloat16),
+                tpu.VMEM(
+                    (chunk_count, row_chunk, head_count * channels_per_head),
+                    jnp.bfloat16,
+                ),
                 tpu.VMEM((batch_size, head_count * channels_per_head), jnp.bfloat16),
             )
             if rolled
@@ -4643,7 +5097,9 @@ def mla(
     reads start once the selection is known.
     """
     batch_size, hidden_size = hidden_ref.shape
-    context_length = dcp[0].page_tokens * dcp[0].pages * (1 if dcp[0].global_pages else dcp[0].group)
+    context_length = (
+        dcp[0].page_tokens * dcp[0].pages * (1 if dcp[0].global_pages else dcp[0].group)
+    )
     if not 1 <= batch_size <= MAX_BATCH:
         raise ValueError(f"MLA supports 1 to {MAX_BATCH} batch rows")
     if output_ref.shape != hidden_ref.shape:
@@ -4724,23 +5180,33 @@ def mla(
 
     def make_attention(selection=None):
         attention = mla_dcp.DcpAttention(
-            *dcp, position_ref, batch_size, sequence_rows=sequence_rows, skip=dcp_skip,
+            *dcp,
+            position_ref,
+            batch_size,
+            sequence_rows=sequence_rows,
+            skip=dcp_skip,
             cache_verify_rows=sequence_rows > 1 and dcp[0].dtype == jnp.float8_e4m3fn,
-            selection=selection)
+            selection=selection,
+        )
         attention.prime()
         return attention
 
     dcp_attention = make_attention() if dsa is None else None
 
     if "query_down" in streams:
-        query_latent = streams["query_down"].dot(
-            hidden_ref[...], communication_workspace.reduction_phase[0] >= 0
-        ).astype(jnp.bfloat16).astype(jnp.float32)
+        query_latent = (
+            streams["query_down"]
+            .dot(hidden_ref[...], communication_workspace.reduction_phase[0] >= 0)
+            .astype(jnp.bfloat16)
+            .astype(jnp.float32)
+        )
     else:
         weight_copies.query_down.wait()
-        query_latent = _dot(
-            hidden_ref[...], weights.query_down_projection_vmem[...]
-        ).astype(jnp.bfloat16).astype(jnp.float32)
+        query_latent = (
+            _dot(hidden_ref[...], weights.query_down_projection_vmem[...])
+            .astype(jnp.bfloat16)
+            .astype(jnp.float32)
+        )
     if output_projection_after_query_down:
         # The pool views are reinterpret casts, so the compiler need not see
         # that this copy aliases the q-down loads above; a region (on a runtime
@@ -4748,11 +5214,11 @@ def mla(
         @pl.when(communication_workspace.reduction_phase[0] >= 0)
         def start_output_projection_copy():
             start_copy("output")
+
     query_latent = (
         query_latent
         * jax.lax.rsqrt(
-            jnp.mean(query_latent * query_latent, axis=1, keepdims=True)
-            + epsilon
+            jnp.mean(query_latent * query_latent, axis=1, keepdims=True) + epsilon
         )
         * weights.query_normalization[...]
     ).astype(jnp.bfloat16)
@@ -4774,13 +5240,19 @@ def mla(
         )
         * weights.key_value_normalization[...]
     ).astype(jnp.bfloat16)
-    workspace.query_vmem[...] = projection("query_up", query_latent).astype(
-        jnp.bfloat16
-    ).reshape(batch_size, 3, 256)
+    workspace.query_vmem[...] = (
+        projection("query_up", query_latent)
+        .astype(jnp.bfloat16)
+        .reshape(batch_size, 3, 256)
+    )
 
     # The new token's latent row, handed out for the owner's commit.
     new_latent = jnp.concatenate(
-        (key_value_latent, compressed[:, 512:576], jnp.zeros((batch_size, 64), jnp.bfloat16)),
+        (
+            key_value_latent,
+            compressed[:, 512:576],
+            jnp.zeros((batch_size, 64), jnp.bfloat16),
+        ),
         axis=1,
     )
     new_key_ref[:, 0] = new_latent[:, :256]
@@ -4790,20 +5262,17 @@ def mla(
     )
     new_value_ref[:, :3] = jnp.zeros((batch_size, 3, 128), jnp.bfloat16)
     if dsa is not None:
-        dcp_attention = make_attention(dsa.selection(
-            dcp[0], position_ref, hidden_ref[...], query_latent, dcp[0].layer % 2))
+        dcp_attention = make_attention(
+            dsa.selection(
+                dcp[0], position_ref, hidden_ref[...], query_latent, dcp[0].layer % 2
+            )
+        )
 
     _phase_end(mla_scope.pop())
     mla_scope.append(_phase_start("q7_mla_attend"))
-    workspace.maximum_vmem[...] = jnp.full(
-        (batch_size, 3, 1), -jnp.inf, jnp.float32
-    )
-    workspace.denominator_vmem[...] = jnp.zeros(
-        (batch_size, 3, 1), jnp.float32
-    )
-    workspace.accumulator_vmem[...] = jnp.zeros(
-        (batch_size, 3, 128), jnp.float32
-    )
+    workspace.maximum_vmem[...] = jnp.full((batch_size, 3, 1), -jnp.inf, jnp.float32)
+    workspace.denominator_vmem[...] = jnp.zeros((batch_size, 3, 1), jnp.float32)
+    workspace.accumulator_vmem[...] = jnp.zeros((batch_size, 3, 128), jnp.float32)
 
     def attend_dcp():
         """DCP attention: W_UK absorbed into this rank's queries (score scale
@@ -4822,14 +5291,22 @@ def mla(
         absorbed = []
         for head in range(3):
             latent_query = jax.lax.dot_general(
-                query[:, head, :128], up[:, head * 256 : head * 256 + 128],
-                (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32,
+                query[:, head, :128],
+                up[:, head * 256 : head * 256 + 128],
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
             )
-            absorbed.append(jnp.concatenate(
-                (latent_query, query[:, head, 128:192].astype(jnp.float32),
-                 jnp.zeros((batch_size, 64), jnp.float32)),
-                axis=1,
-            ) * scale)
+            absorbed.append(
+                jnp.concatenate(
+                    (
+                        latent_query,
+                        query[:, head, 128:192].astype(jnp.float32),
+                        jnp.zeros((batch_size, 64), jnp.float32),
+                    ),
+                    axis=1,
+                )
+                * scale
+            )
 
         def output_gate():
             workspace.output_gate_values_vmem[...] = projection(
@@ -4837,7 +5314,9 @@ def mla(
             ).astype(jnp.bfloat16)
 
         merged = dcp_attention.attend(
-            jnp.stack(absorbed, axis=1), new_latent.astype(jnp.float32), dcp[0].layer % 2,
+            jnp.stack(absorbed, axis=1),
+            new_latent.astype(jnp.float32),
+            dcp[0].layer % 2,
             between=output_gate,
         )
         outputs = []
@@ -4846,11 +5325,17 @@ def mla(
             latent = merged[:, head]
             high = latent.astype(jnp.bfloat16)
             low = (latent - high.astype(jnp.float32)).astype(jnp.bfloat16)
-            outputs.append(sum(
-                jax.lax.dot_general(part, value_up, (((1,), (0,)), ((), ())),
-                                    preferred_element_type=jnp.float32)
-                for part in (high, low)
-            ))
+            outputs.append(
+                sum(
+                    jax.lax.dot_general(
+                        part,
+                        value_up,
+                        (((1,), (0,)), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )
+                    for part in (high, low)
+                )
+            )
         workspace.accumulator_vmem[...] = jnp.stack(outputs, axis=1)
         workspace.denominator_vmem[...] = jnp.ones((batch_size, 3, 1), jnp.float32)
 
@@ -4858,13 +5343,10 @@ def mla(
     attend_dcp()
 
     attention = (
-        (workspace.accumulator_vmem[...] / workspace.denominator_vmem[...])
-        .reshape(batch_size, 384)
-        .astype(jnp.bfloat16)
-        * jax.nn.sigmoid(
-            workspace.output_gate_values_vmem[...].astype(jnp.float32)
-        ).astype(jnp.bfloat16)
-    )
+        workspace.accumulator_vmem[...] / workspace.denominator_vmem[...]
+    ).reshape(batch_size, 384).astype(jnp.bfloat16) * jax.nn.sigmoid(
+        workspace.output_gate_values_vmem[...].astype(jnp.float32)
+    ).astype(jnp.bfloat16)
     _phase_end(mla_scope.pop())
     output_stream = streams.get("output")
     if output_stream is None:
@@ -4875,24 +5357,24 @@ def mla(
 
     def project_output(reduction_vmem):
         with _phase("p2_attn_project_reduce"):
-          _project_attention_2d(
-            attention,
-            weights.output_projection_vmem,
-            output_ref,
-            reduction_vmem,
-            communication_workspace.shared_local_reduction_vmem,
-            communication_workspace.shared_host_reduction_vmem,
-            communication_workspace.attention_features_vmem,
-            communication_workspace.attention_output_vmem,
-            communication_workspace.send_semaphores,
-            communication_workspace.receive_semaphores,
-            communication_workspace.reduction_phase,
-            _dot,
-            token_scatter_output=token_scatter_output,
-            weight_stream=output_stream,
-            staging=communication_workspace.projection_staging_vmem,
-            gather_wire=communication_workspace.attention_gather_vmem,
-        )
+            _project_attention_2d(
+                attention,
+                weights.output_projection_vmem,
+                output_ref,
+                reduction_vmem,
+                communication_workspace.shared_local_reduction_vmem,
+                communication_workspace.shared_host_reduction_vmem,
+                communication_workspace.attention_features_vmem,
+                communication_workspace.attention_output_vmem,
+                communication_workspace.send_semaphores,
+                communication_workspace.receive_semaphores,
+                communication_workspace.reduction_phase,
+                _dot,
+                token_scatter_output=token_scatter_output,
+                weight_stream=output_stream,
+                staging=communication_workspace.projection_staging_vmem,
+                gather_wire=communication_workspace.attention_gather_vmem,
+            )
 
     pl.run_scoped(
         project_output,
@@ -4930,7 +5412,9 @@ def mla_dcp_shards(
     shards = attended_out.shape[0]
     up_stream = streams["key_value_up"]
     if up_stream.slots is not None or up_stream.chunks != shards:
-        raise ValueError("DCP attention DP needs every shard's key-value-up columns resident")
+        raise ValueError(
+            "DCP attention DP needs every shard's key-value-up columns resident"
+        )
     weight_copies = weights.make_projection_copies()
     guard = communication_workspace.reduction_phase[0] >= 0
 
@@ -4942,8 +5426,14 @@ def mla_dcp_shards(
 
     for name in ("query_up", "key_value_up", "output_gate"):
         start_copy(name)
-    dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, rows, skip=_config().dcp_skip, heads=3 * shards,
-                                         sequence_rows=sequence_rows)
+    dcp_attention = mla_dcp.DcpAttention(
+        *dcp,
+        position_ref,
+        rows,
+        skip=_config().dcp_skip,
+        heads=3 * shards,
+        sequence_rows=sequence_rows,
+    )
     dcp_attention.prime()
     scope = _phase_start("q6_mla_projections")
     if "query_down" in streams:
@@ -4960,52 +5450,78 @@ def mla_dcp_shards(
 
     query_latent = (
         query_latent
-        * jax.lax.rsqrt(jnp.mean(query_latent * query_latent, axis=1, keepdims=True) + epsilon)
+        * jax.lax.rsqrt(
+            jnp.mean(query_latent * query_latent, axis=1, keepdims=True) + epsilon
+        )
         * weights.query_normalization[...]
     ).astype(jnp.bfloat16)
     weight_copies.key_value_down.wait()
-    compressed = _dot(hidden_ref[...], weights.key_value_down_projection_vmem[...]).astype(jnp.bfloat16)
+    compressed = _dot(
+        hidden_ref[...], weights.key_value_down_projection_vmem[...]
+    ).astype(jnp.bfloat16)
     key_value_latent = compressed[:, :512].astype(jnp.float32)
     key_value_latent = (
         key_value_latent
-        * jax.lax.rsqrt(jnp.mean(key_value_latent * key_value_latent, axis=1, keepdims=True) + epsilon)
+        * jax.lax.rsqrt(
+            jnp.mean(key_value_latent * key_value_latent, axis=1, keepdims=True)
+            + epsilon
+        )
         * weights.key_value_normalization[...]
     ).astype(jnp.bfloat16)
     new_latent = jnp.concatenate(
-        (key_value_latent, compressed[:, 512:576], jnp.zeros((rows, 64), jnp.bfloat16)), axis=1
+        (key_value_latent, compressed[:, 512:576], jnp.zeros((rows, 64), jnp.bfloat16)),
+        axis=1,
     )
     new_key_ref[:, 0] = new_latent[:, :256]
     new_key_ref[:, 1] = new_latent[:, 256:512]
-    new_key_ref[:, 2] = jnp.concatenate((new_latent[:, 512:], jnp.zeros((rows, 128), jnp.bfloat16)), axis=1)
+    new_key_ref[:, 2] = jnp.concatenate(
+        (new_latent[:, 512:], jnp.zeros((rows, 128), jnp.bfloat16)), axis=1
+    )
     new_value_ref[:, :3] = jnp.zeros((rows, 3, 128), jnp.bfloat16)
     up_stream.wait_all()
     scale = 192**-0.5
     absorbed = []
     for shard in range(shards):
-        query = _shard_dot(streams["query_up"], query_latent, shard, guard).astype(
-            jnp.bfloat16
-        ).reshape(rows, 3, 256)
-        up = up_stream.view(shard)  # [512, 768]: head h's key columns h*256 : +128, value +128 : +256
+        query = (
+            _shard_dot(streams["query_up"], query_latent, shard, guard)
+            .astype(jnp.bfloat16)
+            .reshape(rows, 3, 256)
+        )
+        up = up_stream.view(
+            shard
+        )  # [512, 768]: head h's key columns h*256 : +128, value +128 : +256
         for head in range(3):
             latent_query = jax.lax.dot_general(
-                query[:, head, :128], up[:, head * 256 : head * 256 + 128],
-                (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32,
+                query[:, head, :128],
+                up[:, head * 256 : head * 256 + 128],
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
             )
-            absorbed.append(jnp.concatenate(
-                (latent_query, query[:, head, 128:192].astype(jnp.float32), jnp.zeros((rows, 64), jnp.float32)),
-                axis=1,
-            ) * scale)
+            absorbed.append(
+                jnp.concatenate(
+                    (
+                        latent_query,
+                        query[:, head, 128:192].astype(jnp.float32),
+                        jnp.zeros((rows, 64), jnp.float32),
+                    ),
+                    axis=1,
+                )
+                * scale
+            )
     _phase_end(scope)
     scope = _phase_start("q7_mla_attend")
 
     def output_gates():
         for shard in range(shards):
-            attended_out[shard] = _shard_dot(streams["output_gate"], hidden_ref[...], shard, guard).astype(
-                jnp.bfloat16
-            )
+            attended_out[shard] = _shard_dot(
+                streams["output_gate"], hidden_ref[...], shard, guard
+            ).astype(jnp.bfloat16)
 
     merged = dcp_attention.attend(
-        jnp.stack(absorbed, axis=1), new_latent.astype(jnp.float32), dcp[0].layer % 2, between=output_gates
+        jnp.stack(absorbed, axis=1),
+        new_latent.astype(jnp.float32),
+        dcp[0].layer % 2,
+        between=output_gates,
     )
     for shard in range(shards):
         up = up_stream.view(shard)
@@ -5014,14 +5530,20 @@ def mla_dcp_shards(
             latent = merged[:, 3 * shard + head]
             high = latent.astype(jnp.bfloat16)
             low = (latent - high.astype(jnp.float32)).astype(jnp.bfloat16)
-            outputs.append(sum(
-                jax.lax.dot_general(part, up[:, head * 256 + 128 : head * 256 + 256],
-                                    (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
-                for part in (high, low)
-            ))
-        attended_out[shard] = jnp.stack(outputs, axis=1).reshape(rows, 384).astype(jnp.bfloat16) * jax.nn.sigmoid(
-            attended_out[shard].astype(jnp.float32)
-        ).astype(jnp.bfloat16)
+            outputs.append(
+                sum(
+                    jax.lax.dot_general(
+                        part,
+                        up[:, head * 256 + 128 : head * 256 + 256],
+                        (((1,), (0,)), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )
+                    for part in (high, low)
+                )
+            )
+        attended_out[shard] = jnp.stack(outputs, axis=1).reshape(rows, 384).astype(
+            jnp.bfloat16
+        ) * jax.nn.sigmoid(attended_out[shard].astype(jnp.float32)).astype(jnp.bfloat16)
     _phase_end(scope)
 
 
@@ -5033,46 +5555,75 @@ B4_ATTENTION_GATHER = _config().b4_attention_gather
 
 
 def _project_attention_2d(
-    attended, weight, out, comm, local, host_reduction, feature_backing,
+    attended,
+    weight,
+    out,
+    comm,
+    local,
+    host_reduction,
+    feature_backing,
     output_backing,
-    sends, recvs, phase, dot, *, token_scatter_output=False, weight_stream=None,
-    staging=None, gather_wire=None,
+    sends,
+    recvs,
+    phase,
+    dot,
+    *,
+    token_scatter_output=False,
+    weight_stream=None,
+    staging=None,
+    gather_wire=None,
 ):
     """``weight_stream`` (optional) is a row ChunkedWeightStream of ``weight``
     whose positions 0 and 1 are this rank's and its pair peer's feature rows."""
-    rank=jax.lax.axis_index('tp');slot=phase[0]%2
-    batch_size=attended.shape[0]
+    rank = jax.lax.axis_index("tp")
+    slot = phase[0] % 2
+    batch_size = attended.shape[0]
     ordered_full_output = (
         B4_ATTENTION_GATHER and batch_size == 4 and not token_scatter_output
     )
-    width=attended.shape[-1];g=weight.shape[0]//width
-    assert g==2
-    assert 1 <= batch_size <= MAX_BATCH and out.shape[0]==batch_size and comm.shape[0]==batch_size
-    h=out.shape[-1];half=h//g;nr=32//g
-    def compute(features,output):
-        view=features.at[:,pl.ds((rank%g)*width,width)]
+    width = attended.shape[-1]
+    g = weight.shape[0] // width
+    assert g == 2
+    assert (
+        1 <= batch_size <= MAX_BATCH
+        and out.shape[0] == batch_size
+        and comm.shape[0] == batch_size
+    )
+    h = out.shape[-1]
+    half = h // g
+    nr = 32 // g
+
+    def compute(features, output):
+        view = features.at[:, pl.ds((rank % g) * width, width)]
         view[...] = attended
-        for offset in range(g-1,0,-1):
-            tpu.make_async_remote_copy(view,view,sends.at[10+slot],recvs.at[10+slot],device_id=(rank^offset,),device_id_type=pl.DeviceIdType.MESH).start()
-        comm[...] = jnp.zeros(comm.shape,jnp.float32)
+        for offset in range(g - 1, 0, -1):
+            tpu.make_async_remote_copy(
+                view,
+                view,
+                sends.at[10 + slot],
+                recvs.at[10 + slot],
+                device_id=(rank ^ offset,),
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+        comm[...] = jnp.zeros(comm.shape, jnp.float32)
         if weight_stream is None:
-            own_weight = weight[pl.ds((rank%2)*width,width),:]
+            own_weight = weight[pl.ds((rank % 2) * width, width), :]
         else:
             weight_stream.wait(0)
             own_weight = weight_stream.view(0)[...]
-        comm[:,:half] = dot(attended,own_weight)
+        comm[:, :half] = dot(attended, own_weight)
         if weight_stream is not None:
             weight_stream.release(0, phase[0] >= 0)
-        count=features.at[:,: (g-1)*width]
-        tpu.make_async_copy(count,count,sends.at[10+slot]).wait()
-        tpu.make_async_copy(count,count,recvs.at[10+slot]).wait()
-        peer_lane=(rank%2)^1
+        count = features.at[:, : (g - 1) * width]
+        tpu.make_async_copy(count, count, sends.at[10 + slot]).wait()
+        tpu.make_async_copy(count, count, recvs.at[10 + slot]).wait()
+        peer_lane = (rank % 2) ^ 1
         if weight_stream is None:
-            peer_weight = weight[pl.ds(peer_lane*width,width),:]
+            peer_weight = weight[pl.ds(peer_lane * width, width), :]
         else:
             weight_stream.wait(1)
             peer_weight = weight_stream.view(1)[...]
-        comm[:,:half] += dot(features[:,pl.ds(peer_lane*width,width)],peer_weight)
+        comm[:, :half] += dot(features[:, pl.ds(peer_lane * width, width)], peer_weight)
         if token_scatter_output or ordered_full_output:
             assert batch_size in (4, *SCATTER_BATCHES)
             tokens_per_pair = batch_size // 4
@@ -5085,20 +5636,30 @@ def _project_attention_2d(
             # Keep each asynchronous role in a distinct physical lane. This
             # prevents the compiler from reusing aliased transformed refs
             # before every remote send has retired.
-            assert staging is not None or 2 * local.shape[1] >= 4 * payload_rows, "wide reduction rows too small for the payloads"
-            local_send = (local.at[0].bitcast(jnp.bfloat16) if staging is None else staging.at[0]).at[
-                pl.ds(0, 4 * payload_rows), :
-            ].reshape(4, payload_rows, 128)
-            local_receive = (local.at[1].bitcast(jnp.bfloat16) if staging is None else staging.at[1]).at[
-                pl.ds(0, 4 * payload_rows), :
-            ].reshape(
-                4, payload_rows, 128
+            assert staging is not None or 2 * local.shape[1] >= 4 * payload_rows, (
+                "wide reduction rows too small for the payloads"
+            )
+            local_send = (
+                (
+                    local.at[0].bitcast(jnp.bfloat16)
+                    if staging is None
+                    else staging.at[0]
+                )
+                .at[pl.ds(0, 4 * payload_rows), :]
+                .reshape(4, payload_rows, 128)
+            )
+            local_receive = (
+                (
+                    local.at[1].bitcast(jnp.bfloat16)
+                    if staging is None
+                    else staging.at[1]
+                )
+                .at[pl.ds(0, 4 * payload_rows), :]
+                .reshape(4, payload_rows, 128)
             )
             # ``output`` is backed by a native 16-row allocation; only the
             # rows owned by this local pair are live during the reduction.
-            owned_output = _bf16_rows_view(
-                output_backing, tokens_per_pair, h
-            )
+            owned_output = _bf16_rows_view(output_backing, tokens_per_pair, h)
             for target_pair in range(4):
                 if tokens_per_pair == 1:
                     partial = comm[target_pair, :half][None, :]
@@ -5107,9 +5668,9 @@ def _project_attention_2d(
                         pl.ds(target_pair * tokens_per_pair, tokens_per_pair),
                         :half,
                     ]
-                local_send[target_pair] = partial.astype(
-                    jnp.bfloat16
-                ).reshape(payload_rows, 128)
+                local_send[target_pair] = partial.astype(jnp.bfloat16).reshape(
+                    payload_rows, 128
+                )
             local_receive[pair] = local_send[pair]
             local_copies = []
             for offset in range(3, 0, -1):
@@ -5137,9 +5698,7 @@ def _project_attention_2d(
                 ]
                 host_receive[host] = local_receive[...].reshape(host_wire_rows, 128)
             else:
-                local_sum = jnp.sum(
-                    local_receive[...].astype(jnp.float32), axis=0
-                )
+                local_sum = jnp.sum(local_receive[...].astype(jnp.float32), axis=0)
                 # The caller supplies the four-lane FP32 host workspace
                 # used by MoE after attention.
                 host_receive = host_reduction.at[:, pl.ds(0, payload_rows), :]
@@ -5161,20 +5720,16 @@ def _project_attention_2d(
                 copy.wait()
 
             if ordered_full_output:
-                rank_partials = host_receive[...].reshape(
-                    16, payload_rows, 128
-                ).astype(jnp.float32)
+                rank_partials = (
+                    host_receive[...].reshape(16, payload_rows, 128).astype(jnp.float32)
+                )
                 reduced_half = jnp.sum(rank_partials, axis=0).astype(jnp.bfloat16)
             else:
-                reduced_half = jnp.sum(host_receive[...], axis=0).astype(
-                    jnp.bfloat16
-                )
-            pair_send = local.at[2].bitcast(jnp.bfloat16).at[
-                pl.ds(0, payload_rows), :
-            ]
-            pair_receive = local.at[3].bitcast(jnp.bfloat16).at[
-                pl.ds(0, payload_rows), :
-            ]
+                reduced_half = jnp.sum(host_receive[...], axis=0).astype(jnp.bfloat16)
+            pair_send = local.at[2].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]
+            pair_receive = (
+                local.at[3].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]
+            )
             pair_send[...] = reduced_half
             pair_copy = tpu.make_async_remote_copy(
                 pair_send,
@@ -5188,12 +5743,8 @@ def _project_attention_2d(
             pair_copy.wait()
             sent_half = pair_send[...].reshape(tokens_per_pair, half)
             received_half = pair_receive[...].reshape(tokens_per_pair, half)
-            owned_output[:, :half] = jnp.where(
-                parity == 0, sent_half, received_half
-            )
-            owned_output[:, half:] = jnp.where(
-                parity == 0, received_half, sent_half
-            )
+            owned_output[:, :half] = jnp.where(parity == 0, sent_half, received_half)
+            owned_output[:, half:] = jnp.where(parity == 0, received_half, sent_half)
             if ordered_full_output:
                 # Full-batch rows for residual mixing and MoE; the packets are
                 # private since peers may be a phase apart.
@@ -5202,41 +5753,85 @@ def _project_attention_2d(
                     owned_output, out, sends, recvs, gather_wire, owners=4
                 )
         else:
-            rows=((half+255)//256)*2;payload=rows//2
-            batched_payload=batch_size*payload
-            receive=local.reshape(nr,local.shape[1]*8//nr,128)
-            assert batched_payload<=receive.shape[1]
-            bits=tpu.bitcast(comm[:,:rows*128].reshape(batch_size*rows,128).astype(jnp.bfloat16),jnp.uint32)
-            receive[rank//g,:batched_payload,:] = jax.lax.bitcast_convert_type(bits,jnp.float32)
-            view=receive.at[rank//g,:batched_payload,:]
-            for offset in range(nr-1,0,-1):
-                tpu.make_async_remote_copy(view,view,sends.at[14+slot],recvs.at[14+slot],device_id=(rank^(g*offset),),device_id_type=pl.DeviceIdType.MESH).start()
-            count=receive.at[:nr-1,:batched_payload,:]
-            tpu.make_async_copy(count,count,sends.at[14+slot]).wait()
-            tpu.make_async_copy(count,count,recvs.at[14+slot]).wait()
-            values=tpu.bitcast(jax.lax.bitcast_convert_type(receive[:,:batched_payload,:],jnp.uint32),jnp.bfloat16).astype(jnp.float32)
-            comm[:,:rows*128] = jnp.sum(values,axis=0).reshape(batch_size,rows*128)
-            view=output.at[:,pl.ds((rank%g)*half,half)]
-            view[...] = comm[:,:half].astype(jnp.bfloat16)
-            for offset in range(g-1,0,-1):
-                tpu.make_async_remote_copy(view,view,sends.at[12+slot],recvs.at[12+slot],device_id=(rank^offset,),device_id_type=pl.DeviceIdType.MESH).start()
-            count=output.at[:,: (g-1)*half]
-            tpu.make_async_copy(count,count,sends.at[12+slot]).wait()
-            tpu.make_async_copy(count,count,recvs.at[12+slot]).wait()
+            rows = ((half + 255) // 256) * 2
+            payload = rows // 2
+            batched_payload = batch_size * payload
+            receive = local.reshape(nr, local.shape[1] * 8 // nr, 128)
+            assert batched_payload <= receive.shape[1]
+            bits = tpu.bitcast(
+                comm[:, : rows * 128]
+                .reshape(batch_size * rows, 128)
+                .astype(jnp.bfloat16),
+                jnp.uint32,
+            )
+            receive[rank // g, :batched_payload, :] = jax.lax.bitcast_convert_type(
+                bits, jnp.float32
+            )
+            view = receive.at[rank // g, :batched_payload, :]
+            for offset in range(nr - 1, 0, -1):
+                tpu.make_async_remote_copy(
+                    view,
+                    view,
+                    sends.at[14 + slot],
+                    recvs.at[14 + slot],
+                    device_id=(rank ^ (g * offset),),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+            count = receive.at[: nr - 1, :batched_payload, :]
+            tpu.make_async_copy(count, count, sends.at[14 + slot]).wait()
+            tpu.make_async_copy(count, count, recvs.at[14 + slot]).wait()
+            values = tpu.bitcast(
+                jax.lax.bitcast_convert_type(
+                    receive[:, :batched_payload, :], jnp.uint32
+                ),
+                jnp.bfloat16,
+            ).astype(jnp.float32)
+            comm[:, : rows * 128] = jnp.sum(values, axis=0).reshape(
+                batch_size, rows * 128
+            )
+            view = output.at[:, pl.ds((rank % g) * half, half)]
+            view[...] = comm[:, :half].astype(jnp.bfloat16)
+            for offset in range(g - 1, 0, -1):
+                tpu.make_async_remote_copy(
+                    view,
+                    view,
+                    sends.at[12 + slot],
+                    recvs.at[12 + slot],
+                    device_id=(rank ^ offset,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+            count = output.at[:, : (g - 1) * half]
+            tpu.make_async_copy(count, count, sends.at[12 + slot]).wait()
+            tpu.make_async_copy(count, count, recvs.at[12 + slot]).wait()
             out[...] = output[...]
-        phase[0]+=1
+        phase[0] += 1
+
     # Persistent addresses cannot alias preceding MoE temporaries on a slow peer.
     # Reserve 16x1024 BF16 for features and 16x7168 for outputs, including
     # native row padding. Total physical storage is exactly 256 KiB.
-    assert g*width<=1024 and h==7168
-    feature_store=_bf16_rows_view(feature_backing,batch_size,1024)
-    output_store=_bf16_rows_view(output_backing,batch_size,7168)
-    compute(feature_store.at[:,:g*width],output_store)
+    assert g * width <= 1024 and h == 7168
+    feature_store = _bf16_rows_view(feature_backing, batch_size, 1024)
+    output_store = _bf16_rows_view(output_backing, batch_size, 7168)
+    compute(feature_store.at[:, : g * width], output_store)
+
 
 def _project_attention_dp(
-    attended, weight, out, comm, local, host_reduction, feature_backing,
-    sends, recvs, phase, dot, *, weight_stream=None, staging=None,
-    keep_dp_rows=False, owners=4,
+    attended,
+    weight,
+    out,
+    comm,
+    local,
+    host_reduction,
+    feature_backing,
+    sends,
+    recvs,
+    phase,
+    dot,
+    *,
+    weight_stream=None,
+    staging=None,
+    keep_dp_rows=False,
+    owners=4,
 ):
     """Project DP2/TP16 or DP4/TP8 attention back to MoE row ownership.
 
@@ -5275,8 +5870,12 @@ def _project_attention_dp(
         view = features.at[:, pl.ds(shard * 2 * width + lane * width, width)]
         view[...] = attended[shard]
         tpu.make_async_remote_copy(
-            view, view, sends.at[10 + slot], recvs.at[10 + slot],
-            device_id=(rank ^ 1,), device_id_type=pl.DeviceIdType.MESH,
+            view,
+            view,
+            sends.at[10 + slot],
+            recvs.at[10 + slot],
+            device_id=(rank ^ 1,),
+            device_id_type=pl.DeviceIdType.MESH,
         ).start()
     comm[...] = jnp.zeros(comm.shape, jnp.float32)
     for shard in range(shards):
@@ -5301,17 +5900,25 @@ def _project_attention_dp(
         host_slots = host_reduction.bitcast(jnp.bfloat16)
 
         def pair_partials(source_host):
-            return host_slots.at[source_host].at[pl.ds(0, 4 * payload_rows), :].reshape(
-                4, payload_rows, 128
+            return (
+                host_slots.at[source_host]
+                .at[pl.ds(0, 4 * payload_rows), :]
+                .reshape(4, payload_rows, 128)
             )
 
         own_partial = pair_partials(host).at[pair]
-        own_partial[...] = comm[:, :half].astype(jnp.bfloat16).reshape(payload_rows, 128)
+        own_partial[...] = (
+            comm[:, :half].astype(jnp.bfloat16).reshape(payload_rows, 128)
+        )
         copies = []
         for offset in range(15, 0, -1):
             copy = tpu.make_async_remote_copy(
-                own_partial, own_partial, sends.at[12], recvs.at[12],
-                device_id=(rank ^ (2 * offset),), device_id_type=pl.DeviceIdType.MESH,
+                own_partial,
+                own_partial,
+                sends.at[12],
+                recvs.at[12],
+                device_id=(rank ^ (2 * offset),),
+                device_id_type=pl.DeviceIdType.MESH,
             )
             copy.start()
             copies.append(copy)
@@ -5322,30 +5929,45 @@ def _project_attention_dp(
             for source_host in range(4)
         ]
         reduced_half = jnp.concatenate(
-            [host_sums[2 * group] + host_sums[2 * group + 1] for group in range(2)], axis=0,
+            [host_sums[2 * group] + host_sums[2 * group + 1] for group in range(2)],
+            axis=0,
         ).astype(jnp.bfloat16)
         payload_rows *= 2
         rows_per_pair *= 2
     else:
         # Reduce-scatter the group's rows: pair q of each local host owns rows
         # q * r .. q * r + r - 1.
-        local_send = (local.at[0].bitcast(jnp.bfloat16) if staging is None else staging.at[0]).at[
-            pl.ds(0, 4 * payload_rows), :
-        ].reshape(4, payload_rows, 128)
-        local_receive = (local.at[1].bitcast(jnp.bfloat16) if staging is None else staging.at[1]).at[
-            pl.ds(0, 4 * payload_rows), :
-        ].reshape(4, payload_rows, 128)
+        local_send = (
+            (local.at[0].bitcast(jnp.bfloat16) if staging is None else staging.at[0])
+            .at[pl.ds(0, 4 * payload_rows), :]
+            .reshape(4, payload_rows, 128)
+        )
+        local_receive = (
+            (local.at[1].bitcast(jnp.bfloat16) if staging is None else staging.at[1])
+            .at[pl.ds(0, 4 * payload_rows), :]
+            .reshape(4, payload_rows, 128)
+        )
         for target_pair in range(4):
-            local_send[target_pair] = comm[
-                pl.ds(target_pair * rows_per_pair if owners == 4 else 0, rows_per_pair), :half
-            ].astype(jnp.bfloat16).reshape(payload_rows, 128)
+            local_send[target_pair] = (
+                comm[
+                    pl.ds(
+                        target_pair * rows_per_pair if owners == 4 else 0, rows_per_pair
+                    ),
+                    :half,
+                ]
+                .astype(jnp.bfloat16)
+                .reshape(payload_rows, 128)
+            )
         local_receive[pair] = local_send[pair]
         copies = []
         for offset in range(3, 0, -1):
             copy = tpu.make_async_remote_copy(
-                local_send.at[pair ^ offset], local_receive.at[pair],
-                sends.at[offset - 1], recvs.at[offset - 1],
-                device_id=(rank ^ (2 * offset),), device_id_type=pl.DeviceIdType.MESH,
+                local_send.at[pair ^ offset],
+                local_receive.at[pair],
+                sends.at[offset - 1],
+                recvs.at[offset - 1],
+                device_id=(rank ^ (2 * offset),),
+                device_id_type=pl.DeviceIdType.MESH,
             )
             copy.start()
             copies.append(copy)
@@ -5359,8 +5981,12 @@ def _project_attention_dp(
             host_receive[host % 2] = local_sum
             host_view = host_receive.at[host % 2]
             copy = tpu.make_async_remote_copy(
-                host_view, host_view, sends.at[3], recvs.at[3],
-                device_id=(rank ^ 8,), device_id_type=pl.DeviceIdType.MESH,
+                host_view,
+                host_view,
+                sends.at[3],
+                recvs.at[3],
+                device_id=(rank ^ 8,),
+                device_id_type=pl.DeviceIdType.MESH,
             )
             copy.start()
             copy.wait()
@@ -5373,15 +5999,22 @@ def _project_attention_dp(
     pair_receive = local.at[3].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]
     pair_send[...] = reduced_half
     copy = tpu.make_async_remote_copy(
-        pair_send, pair_receive, sends.at[6], recvs.at[6],
-        device_id=(rank ^ 1,), device_id_type=pl.DeviceIdType.MESH,
+        pair_send,
+        pair_receive,
+        sends.at[6],
+        recvs.at[6],
+        device_id=(rank ^ 1,),
+        device_id_type=pl.DeviceIdType.MESH,
     )
     copy.start()
     copy.wait()
     sent = pair_send[...].reshape(rows_per_pair, half)
     received_half = pair_receive[...].reshape(rows_per_pair, half)
     row = jnp.concatenate(
-        (jnp.where(lane == 0, sent, received_half), jnp.where(lane == 0, received_half, sent)),
+        (
+            jnp.where(lane == 0, sent, received_half),
+            jnp.where(lane == 0, received_half, sent),
+        ),
         axis=1,
     )
 
@@ -5411,12 +6044,16 @@ def _gather_attention_dp_rows(row, out, local, sends, recvs, shards):
     group_send[...] = row.reshape(group_payload, 128)
     group_receives, group_copies = [], []
     for offset in range(1, shards):
-        received_group = local.at[4 + offset].bitcast(jnp.bfloat16).at[
-            pl.ds(0, group_payload), :
-        ]
+        received_group = (
+            local.at[4 + offset].bitcast(jnp.bfloat16).at[pl.ds(0, group_payload), :]
+        )
         copy = tpu.make_async_remote_copy(
-            group_send, received_group, sends.at[6 + offset], recvs.at[6 + offset],
-            device_id=(rank ^ (group_size * offset),), device_id_type=pl.DeviceIdType.MESH,
+            group_send,
+            received_group,
+            sends.at[6 + offset],
+            recvs.at[6 + offset],
+            device_id=(rank ^ (group_size * offset),),
+            device_id_type=pl.DeviceIdType.MESH,
         )
         copy.start()
         group_receives.append(received_group)
@@ -5431,7 +6068,9 @@ def _gather_attention_dp_rows(row, out, local, sends, recvs, shards):
                 received_group[...].reshape(rows_per_pair, hidden),
                 group_row,
             )
-        out[target_group * rows_per_pair : (target_group + 1) * rows_per_pair, :] = group_row
+        out[target_group * rows_per_pair : (target_group + 1) * rows_per_pair, :] = (
+            group_row
+        )
 
 
 def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
@@ -5462,7 +6101,10 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
     def send(source, o, k, semaphore):
         # Peer (o, k) sees this rank at the same relative position.
         copy = tpu.make_async_remote_copy(
-            source, wire(o, k), sends.at[semaphore], recvs.at[semaphore],
+            source,
+            wire(o, k),
+            sends.at[semaphore],
+            recvs.at[semaphore],
             device_id=(rank ^ (group_size * o) ^ (2 * k),),
             device_id_type=pl.DeviceIdType.MESH,
         )
@@ -5472,8 +6114,12 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
     wire(0, 0)[...] = row.reshape(payload, 128)
     if rows <= 2:
         # Short wires (DP2 B8/B16) go to every peer directly: one hop.
-        direct = [send(wire(0, 0), o, k, 7 if o == 0 else 8)
-                  for o in range(shards) for k in range(4) if o or k]
+        direct = [
+            send(wire(0, 0), o, k, 7 if o == 0 else 8)
+            for o in range(shards)
+            for k in range(4)
+            if o or k
+        ]
         for copy in direct:
             copy.wait()
     else:
@@ -5485,10 +6131,16 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
         forwarded = []
         for o in range(1, shards):
             for k in range(1, 4):
-                forwarded.append(tpu.make_async_remote_copy(
-                    wire(o, 0), wire(o, k), sends.at[9], recvs.at[9],
-                    device_id=(rank ^ (2 * k),), device_id_type=pl.DeviceIdType.MESH,
-                ))
+                forwarded.append(
+                    tpu.make_async_remote_copy(
+                        wire(o, 0),
+                        wire(o, k),
+                        sends.at[9],
+                        recvs.at[9],
+                        device_id=(rank ^ (2 * k),),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                )
                 forwarded[-1].start()
         for copy in group_copies:
             copy.wait_send()
@@ -5498,20 +6150,31 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
         for p in range(4):
             slot = base + 4 * (group ^ d) + (pair ^ p)
             first = (p * shards + d) * rows
-            out[first : first + rows, :] = wires[slot, pl.ds(0, payload)].reshape(rows, hidden)
-        owned_out[d * rows : (d + 1) * rows, :] = (
-            wires[base + 4 * (group ^ d), pl.ds(0, payload)].reshape(rows, hidden)
+            out[first : first + rows, :] = wires[slot, pl.ds(0, payload)].reshape(
+                rows, hidden
+            )
+        owned_out[d * rows : (d + 1) * rows, :] = wires[
+            base + 4 * (group ^ d), pl.ds(0, payload)
+        ].reshape(rows, hidden)
+
+
+def _gather_latent_host(x, sends, recvs):
+    rank = jax.lax.axis_index("tp")
+    view = x.at[:, pl.ds((rank % 8) * 512, 512)]
+    copies = []
+    for offset in range(7, 0, -1):
+        cp = tpu.make_async_remote_copy(
+            view,
+            view,
+            sends.at[offset - 1],
+            recvs.at[offset - 1],
+            device_id=(rank ^ offset,),
+            device_id_type=pl.DeviceIdType.MESH,
         )
-
-
-def _gather_latent_host(x,sends,recvs):
-    rank=jax.lax.axis_index('tp')
-    view=x.at[:,pl.ds((rank%8)*512,512)]
-    copies=[]
-    for offset in range(7,0,-1):
-        cp=tpu.make_async_remote_copy(view,view,sends.at[offset-1],recvs.at[offset-1],device_id=(rank^offset,),device_id_type=pl.DeviceIdType.MESH)
-        cp.start();copies.append(cp)
-    for cp in copies:cp.wait()
+        cp.start()
+        copies.append(cp)
+    for cp in copies:
+        cp.wait()
 
 
 def _router_copy(weight, buffer, sems, wait, *, initialize_padding=True):
@@ -5674,17 +6337,25 @@ def _gather_sp8_local_rows(row, out, local, sends, recvs):
     copies = []
     for offset in range(7, 0, -1):
         copy = tpu.make_async_remote_copy(
-            source, source, sends.at[offset - 1], recvs.at[offset - 1],
-            device_id=(rank ^ offset,), device_id_type=pl.DeviceIdType.MESH,
+            source,
+            source,
+            sends.at[offset - 1],
+            recvs.at[offset - 1],
+            device_id=(rank ^ offset,),
+            device_id_type=pl.DeviceIdType.MESH,
         )
         copy.start()
         copies.append(copy)
     for copy in copies:
         copy.wait()
     for pair in range(4):
-        out[pair * 16:(pair + 1) * 16] = jnp.concatenate(
-            (wires[2 * pair].reshape(rows, hidden),
-             wires[2 * pair + 1].reshape(rows, hidden)), axis=0)
+        out[pair * 16 : (pair + 1) * 16] = jnp.concatenate(
+            (
+                wires[2 * pair].reshape(rows, hidden),
+                wires[2 * pair + 1].reshape(rows, hidden),
+            ),
+            axis=0,
+        )
 
 
 def _gather_sp8_dp_moe_rows(row, owned_out, out, local, sends, recvs):
@@ -5709,8 +6380,12 @@ def _gather_sp8_dp_moe_rows(row, owned_out, out, local, sends, recvs):
 
     def send(source, o, k, semaphore, *, local_only=False):
         copy = tpu.make_async_remote_copy(
-            source, wire(o, k), sends.at[semaphore], recvs.at[semaphore],
-            device_id=(rank ^ (0 if local_only else 16 * o) ^ k,), device_id_type=pl.DeviceIdType.MESH,
+            source,
+            wire(o, k),
+            sends.at[semaphore],
+            recvs.at[semaphore],
+            device_id=(rank ^ (0 if local_only else 16 * o) ^ k,),
+            device_id_type=pl.DeviceIdType.MESH,
         )
         copy.start()
         return copy
@@ -5728,16 +6403,19 @@ def _gather_sp8_dp_moe_rows(row, owned_out, out, local, sends, recvs):
             even = wire(group ^ d, owner ^ (2 * p))[...].reshape(rows, hidden)
             odd = wire(group ^ d, owner ^ (2 * p + 1))[...].reshape(rows, hidden)
             first = (2 * p + d) * 16
-            out[first:first + 16] = jnp.concatenate((even, odd), axis=0)
+            out[first : first + 16] = jnp.concatenate((even, odd), axis=0)
         own = wire(group ^ d, 0)[...].reshape(rows, hidden)
         peer = wire(group ^ d, 1)[...].reshape(rows, hidden)
-        owned_out[d * 16:(d + 1) * 16] = jnp.where(
-            owner % 2 == 0, jnp.concatenate((own, peer), axis=0),
-            jnp.concatenate((peer, own), axis=0))
+        owned_out[d * 16 : (d + 1) * 16] = jnp.where(
+            owner % 2 == 0,
+            jnp.concatenate((own, peer), axis=0),
+            jnp.concatenate((peer, own), axis=0),
+        )
 
 
-def _gather_local_pair_rows(source, destination, sends, recvs, scratch=None, owners=4,
-                            *, packed=False):
+def _gather_local_pair_rows(
+    source, destination, sends, recvs, scratch=None, owners=4, *, packed=False
+):
     """All-gather the token shards of the ``owners`` local row owners.
 
     Owner o (4: the local rank pairs; 8: the local ranks) holds rows
@@ -5756,9 +6434,9 @@ def _gather_local_pair_rows(source, destination, sends, recvs, scratch=None, own
     if packed or rows_per_owner == 1 or rows_per_owner & (rows_per_owner - 1):
         assert scratch is not None
         payload_rows = rows_per_owner * source.shape[1] // 128
-        source_wire = scratch.at[owner].bitcast(jnp.bfloat16).at[
-            pl.ds(0, payload_rows), :
-        ]
+        source_wire = (
+            scratch.at[owner].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]
+        )
         source_wire[...] = source[...].reshape(payload_rows, 128)
         copies = []
         for offset in range(owners - 1, 0, -1):
@@ -5779,18 +6457,20 @@ def _gather_local_pair_rows(source, destination, sends, recvs, scratch=None, own
             for source_owner in range(owners)
         )
         if rows_per_owner == 1:
-            destination[...] = jnp.stack(tuple(wire.reshape(source.shape[1]) for wire in wires))
+            destination[...] = jnp.stack(
+                tuple(wire.reshape(source.shape[1]) for wire in wires)
+            )
         else:
             destination[...] = jnp.concatenate(
-                tuple(wire.reshape(rows_per_owner, source.shape[1]) for wire in wires), axis=0
+                tuple(wire.reshape(rows_per_owner, source.shape[1]) for wire in wires),
+                axis=0,
             )
         return
     for owner_index in range(owners):
+
         @pl.when(owner == owner_index)
         def gather_owner(owner_index=owner_index):
-            row_slice = pl.ds(
-                owner_index * rows_per_owner, rows_per_owner
-            )
+            row_slice = pl.ds(owner_index * rows_per_owner, rows_per_owner)
             destination[row_slice] = source[...]
             copies = []
             for offset in range(owners - 1, 0, -1):
@@ -5836,7 +6516,10 @@ KDA = (
 MLA = ("m_qa", "m_ka", "m_qb", "m_kb", "m_gate", "m_o", "m_qnorm", "m_knorm")
 NORMS = ("attn_res", "mlp_res", "attn_norm", "ffn_norm")
 EPILOGUE = ("output_res", "final_norm")
-DENSE = ("dense_gu", "dense_down")  # layer 0's MLP, used when the stack includes layer 0
+DENSE = (
+    "dense_gu",
+    "dense_down",
+)  # layer 0's MLP, used when the stack includes layer 0
 NAMES = MOE + KDA + MLA + NORMS
 
 
@@ -5904,9 +6587,6 @@ def local_shapes(
     return result
 
 
-
-
-
 def _residual_mixture_row(
     block_values,
     prefix_value,
@@ -5917,6 +6597,7 @@ def _residual_mixture_row(
     relaxed_reduction_order=False,
 ):
     """Compute one row of the learned residual mixture."""
+
     def normalized_scores(values):
         scores = jnp.sum(values * folded[...], axis=1, keepdims=True)
         return scores * jax.lax.rsqrt(
@@ -5952,16 +6633,13 @@ def _residual_mixture_row(
         )
 
     residual_indices = jax.lax.broadcasted_iota(jnp.int32, (9, 1), 0)
-    active = (residual_indices < active_block_count) | (
-        residual_indices == 8
-    )
-    probabilities = jax.nn.softmax(
-        jnp.where(active, scores, -jnp.inf), axis=0
-    )
+    active = (residual_indices < active_block_count) | (residual_indices == 8)
+    probabilities = jax.nn.softmax(jnp.where(active, scores, -jnp.inf), axis=0)
     if relaxed_reduction_order:
-        mixed = jnp.sum(
-            block_values * probabilities[:8], axis=0, keepdims=True
-        ) + prefix_value * probabilities[8:9]
+        mixed = (
+            jnp.sum(block_values * probabilities[:8], axis=0, keepdims=True)
+            + prefix_value * probabilities[8:9]
+        )
     else:
         mixed = jnp.sum(values * probabilities, axis=0, keepdims=True)
     return mixed.astype(jnp.bfloat16)
@@ -6008,7 +6686,9 @@ STAGE_BLOCKS = _config().stage_blocks
 # 128; 0 = unsplit); split tiles keep the scale-reduction order.
 MXFP4_DOT_TILE = _config().mxfp4_dot_tile
 if MXFP4_DOT_TILE is not None and (MXFP4_DOT_TILE < 0 or MXFP4_DOT_TILE % 128):
-    raise ValueError("KernelConfig.mxfp4_dot_tile must be zero or a positive multiple of 128")
+    raise ValueError(
+        "KernelConfig.mxfp4_dot_tile must be zero or a positive multiple of 128"
+    )
 MXFP4_BLOCK = _config().mxfp4_block
 MXFP4_PAIR_TILE = _config().mxfp4_pair_tile
 # KernelConfig.mxfp4_static_tile=T: unroll the single-expert MXFP4 product over
@@ -6018,8 +6698,7 @@ MXFP4_STATIC_TILE = _config().mxfp4_static_tile
 
 # B16 runs routed experts on compact 8-row tiles (MXFP4 only).
 B16_COMPACT_EXPERTS = (
-    _config().b16_compact_experts
-    and _config().expert_gate_up == "mxfp4"
+    _config().b16_compact_experts and _config().expert_gate_up == "mxfp4"
 )
 
 
@@ -6068,28 +6747,46 @@ def _shared_shards(batch_size):
 
 def _use_compact_overflow(batch_size, gate_up_dtype, *, group_pending_routes):
     return (
-        COMPACT_OVERFLOW and not COMPACT_ONLY and SHARED_EXPERT_FINISHERS
-        and (batch_size in (32, 48, 64, 80, 96, 128) or (batch_size == 16 and B16_COMPACT_EXPERTS))
+        COMPACT_OVERFLOW
+        and not COMPACT_ONLY
+        and SHARED_EXPERT_FINISHERS
+        and (
+            batch_size in (32, 48, 64, 80, 96, 128)
+            or (batch_size == 16 and B16_COMPACT_EXPERTS)
+        )
         and COMPACT_ROWS == 8
-        and gate_up_dtype == jnp.uint32 and group_pending_routes
+        and gate_up_dtype == jnp.uint32
+        and group_pending_routes
     )
 
 
-def _expert_accumulator_rows(batch_size, gate_up_dtype=None, *, group_pending_routes=False):
+def _expert_accumulator_rows(
+    batch_size, gate_up_dtype=None, *, group_pending_routes=False
+):
     """(gate/up, down) accumulator rows: the batch, or only the compact tiles."""
     capacity = _compact_rows(batch_size)
-    if capacity and (COMPACT_ONLY or _use_compact_overflow(
-        batch_size, gate_up_dtype, group_pending_routes=group_pending_routes
-    )):
+    if capacity and (
+        COMPACT_ONLY
+        or _use_compact_overflow(
+            batch_size, gate_up_dtype, group_pending_routes=group_pending_routes
+        )
+    ):
         return 2 * capacity, capacity
     return batch_size, batch_size
+
+
 MOE_PREPARE_WEIGHTS = ("latent_down", "shared_gu", "shared_down")
 MLA_EXTRA_WEIGHTS = ("m_qb", "m_kb", "m_gate")
 
 
 def _pool_layout(
-    local_weights, *, alias_expert_scales: bool, pooled: bool,
-    managed: bool = False, dense_bytes: int = 0, arena_extra: int = 0,
+    local_weights,
+    *,
+    alias_expert_scales: bool,
+    pooled: bool,
+    managed: bool = False,
+    dense_bytes: int = 0,
+    arena_extra: int = 0,
 ):
     """Byte offsets of every view in the projection/expert pool.
 
@@ -6101,6 +6798,7 @@ def _pool_layout(
     latent-down and shared-expert weights during routing, and latent-up in the
     MoE tail (which overlaps the next layer's attention prefetch into A).
     """
+
     def storage(name, experts=False):
         value = local_weights[name]
         shape = (4, *value.shape[1:]) if experts else value.shape
@@ -6130,7 +6828,9 @@ def _pool_layout(
     if managed:
         # Region A is the arena the manager places the router, attention
         # projections, expert slots and dense slabs in.
-        region_b = -(-max(expert_bytes, layout["attention_bytes"], dense_bytes) // 4096) * 4096
+        region_b = (
+            -(-max(expert_bytes, layout["attention_bytes"], dense_bytes) // 4096) * 4096
+        )
         region_b += arena_extra
         layout["arena_bytes"] = region_b
     end = region_b
@@ -6144,7 +6844,9 @@ def _pool_layout(
         end = max(end, offset)
     layout["m_o"] = 0
     if storage("m_o") > storage("m_qa"):
-        raise ValueError("The MLA output projection must fit over the q-down projection")
+        raise ValueError(
+            "The MLA output projection must fit over the q-down projection"
+        )
     layout["pool_bytes"] = end
     return layout
 
@@ -6190,12 +6892,16 @@ def _vmem_budget(persistent, regions, *, limit=None, spill_reserve=None):
         size = _vmem_bytes(spec)
         persistent_bytes += size
         if size >= 64 * 1024:
-            lines.append(f"  {mib(size)}  {name} {tuple(spec.shape)} {jnp.dtype(spec.dtype).name}")
+            lines.append(
+                f"  {mib(size)}  {name} {tuple(spec.shape)} {jnp.dtype(spec.dtype).name}"
+            )
     lines.append(f"  {mib(persistent_bytes)}  total (entries under 64 KiB included)")
     peaks = {}
     for region, (held, nested) in regions.items():
         held_bytes = sum(_vmem_bytes(spec) for _, spec in held)
-        nested_bytes = [sum(_vmem_bytes(spec) for _, spec in alternative) for alternative in nested]
+        nested_bytes = [
+            sum(_vmem_bytes(spec) for _, spec in alternative) for alternative in nested
+        ]
         peaks[region] = held_bytes + max(nested_bytes, default=0)
         lines.append(f"scoped region {region}: peak {mib(peaks[region]).strip()} MiB")
         for name, spec in held:
@@ -6203,7 +6909,9 @@ def _vmem_budget(persistent, regions, *, limit=None, spill_reserve=None):
                 lines.append(f"  {mib(_vmem_bytes(spec))}  {name}")
         for alternative, size in zip(nested, nested_bytes):
             if size:
-                lines.append(f"  {mib(size)}  nested: {', '.join(name for name, _ in alternative)}")
+                lines.append(
+                    f"  {mib(size)}  nested: {', '.join(name for name, _ in alternative)}"
+                )
     worst = max(peaks, key=peaks.get) if peaks else None
     peak = persistent_bytes + (peaks[worst] if worst else 0)
     lines.append(
@@ -6235,7 +6943,10 @@ def _mla_scoped_scratch(
         *(
             ()
             if POOLED_WEIGHTS
-            else (tpu.VMEM(local_weights[name].shape, local_weights[name].dtype) for name in MLA[2:6])
+            else (
+                tpu.VMEM(local_weights[name].shape, local_weights[name].dtype)
+                for name in MLA[2:6]
+            )
         ),
         *cache,
         tpu.VMEM((batch_size, 3, 256), jnp.bfloat16),
@@ -6247,9 +6958,16 @@ def _mla_scoped_scratch(
         tpu.VMEM((batch_size, 3, 128), jnp.float32),
         # The DCP page buffers by batch (mla_dcp.page_plan; DcpAttention
         # reads the span and the buffers from the shape).
-        *mla_dcp.scoped_scratch(batch_size, heads=dcp_heads,
-                                cache_dtype=dcp_dtype, page_tokens=dcp_page_tokens, sequence_rows=sequence_rows,
-                                **mla_dcp.page_plan(batch_size, dcp_heads, sequence_rows, dcp_dtype, dsa=dsa)),
+        *mla_dcp.scoped_scratch(
+            batch_size,
+            heads=dcp_heads,
+            cache_dtype=dcp_dtype,
+            page_tokens=dcp_page_tokens,
+            sequence_rows=sequence_rows,
+            **mla_dcp.page_plan(
+                batch_size, dcp_heads, sequence_rows, dcp_dtype, dsa=dsa
+            ),
+        ),
     )
 
 
@@ -6275,9 +6993,19 @@ def _moe_scoped_scratch(
     accumulator_rows = _expert_accumulator_rows(
         batch_size, gate_up.dtype, group_pending_routes=group_pending_routes
     )
-    scale_scratch = () if alias_expert_scales else (
-        tpu.VMEM((4, *local_weights["expert_gus"].shape[1:]), local_weights["expert_gus"].dtype),
-        tpu.VMEM((4, *local_weights["expert_ds"].shape[1:]), local_weights["expert_ds"].dtype),
+    scale_scratch = (
+        ()
+        if alias_expert_scales
+        else (
+            tpu.VMEM(
+                (4, *local_weights["expert_gus"].shape[1:]),
+                local_weights["expert_gus"].dtype,
+            ),
+            tpu.VMEM(
+                (4, *local_weights["expert_ds"].shape[1:]),
+                local_weights["expert_ds"].dtype,
+            ),
+        )
     )
     owners = token_scatter_owners
     output_shape = (
@@ -6289,7 +7017,11 @@ def _moe_scoped_scratch(
         *(
             ()
             if POOLED_WEIGHTS
-            else (tpu.VMEM(local_weights["latent_up"].shape, local_weights["latent_up"].dtype),)
+            else (
+                tpu.VMEM(
+                    local_weights["latent_up"].shape, local_weights["latent_up"].dtype
+                ),
+            )
         ),
         tpu.SemaphoreType.DMA,
         tpu.SemaphoreType.DMA((4, 4)),
@@ -6299,7 +7031,9 @@ def _moe_scoped_scratch(
         tpu.VMEM((batch_size, 128), jnp.int32),
         tpu.VMEM((batch_size, 128), jnp.float32),
         tpu.VMEM((batch_size, 1024), jnp.float32),
-        tpu.VMEM((batch_size, 1024 if _shared_shards(batch_size) else 7168), jnp.float32),
+        tpu.VMEM(
+            (batch_size, 1024 if _shared_shards(batch_size) else 7168), jnp.float32
+        ),
         tpu.VMEM((batch_size, latent_size), jnp.float32),
         tpu.VMEM((accumulator_rows[0], 4 * expert_width), jnp.float32),
         tpu.VMEM((accumulator_rows[1], expert_output_size), jnp.float32),
@@ -6407,31 +7141,49 @@ def stack(
     ``state_row`` or ``batch_size`` > 4 with DP1, or B2..B128 with DP2.
     """
     if not 1 <= batch_size <= MAX_BATCH:
-        raise ValueError(f"The fused decoder stack supports batch sizes from 1 to {MAX_BATCH}")
+        raise ValueError(
+            f"The fused decoder stack supports batch sizes from 1 to {MAX_BATCH}"
+        )
     # Kimi-K3.1: the DSA indexer on every MLA layer (``index_pools``: the
     # layers' index-key pools; ``weights`` holds the indexer families).
     dsa = index_pools is not None
     dsa_names = dsa_decode.FAMILIES if dsa else ()
     layer_names = NAMES + dsa_names
-    if dsa and (len(index_pools) != MLA_LAYERS or any(name not in weights for name in dsa_names)):
-        raise ValueError("The DSA indexer takes an index pool per MLA layer and its weight families")
+    if dsa and (
+        len(index_pools) != MLA_LAYERS or any(name not in weights for name in dsa_names)
+    ):
+        raise ValueError(
+            "The DSA indexer takes an index pool per MLA layer and its weight families"
+        )
     if dsa and (attention_dp != 1 or mla_dcp.GROUP != 32):
         raise ValueError("The DSA indexer runs with DCP32 and no attention DP")
     if include_layer_zero and any(name not in weights for name in DENSE):
         raise ValueError("include_layer_zero needs the dense MLP weights")
     select_state_row = state_row is not None
     if block_tables is None or dcp_pool_map is None:
-        raise ValueError("The stack takes block_tables and dcp_pool_map (vLLM's unified pools)")
+        raise ValueError(
+            "The stack takes block_tables and dcp_pool_map (vLLM's unified pools)"
+        )
     pool_map = tuple(dcp_pool_map)
     if len(dcp_pool_map) != MLA_LAYERS or len(states) != 2 + 1 + max(dcp_pool_map):
-        raise ValueError("The stack takes (conv, recurrent, *pools) and a pool per MLA layer")
+        raise ValueError(
+            "The stack takes (conv, recurrent, *pools) and a pool per MLA layer"
+        )
     from sglang_tpu.k3_programs.kimi_k3.layout import cache_layout
+
     layout = cache_layout(str(states[2].dtype))
-    if any(pool.shape[1:] != layout.block_shape or pool.dtype != states[2].dtype for pool in states[2:]):
-        raise ValueError(f"unified pools must match {layout.block_shape} {layout.dtype}")
+    if any(
+        pool.shape[1:] != layout.block_shape or pool.dtype != states[2].dtype
+        for pool in states[2:]
+    ):
+        raise ValueError(
+            f"unified pools must match {layout.block_shape} {layout.dtype}"
+        )
     if block_tables.shape[0] != batch_size or block_tables.ndim != 2:
         raise ValueError("block_tables must be [batch_size, pages]")
-    if attention_dp != 1 and not (mla_dcp.GROUP * attention_dp == 32 and attention_dp_ownership):
+    if attention_dp != 1 and not (
+        mla_dcp.GROUP * attention_dp == 32 and attention_dp_ownership
+    ):
         raise ValueError(
             "Attention DP needs DCP over each DP group (KernelConfig.dcp_group = 32 / dp) "
             "and DP row ownership"
@@ -6471,12 +7223,17 @@ def stack(
         raise ValueError("MLA cache batch tile size must be within the batch")
     if batch_size % mla_cache_batch_tile_size:
         raise ValueError("MLA cache batch tile size must divide the batch")
-    if attention_token_scatter and batch_size not in (4, *SCATTER_BATCHES) and not (
-        attention_dp > 1 and batch_size == 2
+    if (
+        attention_token_scatter
+        and batch_size not in (4, *SCATTER_BATCHES)
+        and not (attention_dp > 1 and batch_size == 2)
     ):
-        raise ValueError("Attention token scatter requires batch size 4, 8 or 16, or attention DP's B2")
+        raise ValueError(
+            "Attention token scatter requires batch size 4, 8 or 16, or attention DP's B2"
+        )
     if moe_token_scatter_output and not (
-        attention_token_scatter and (batch_size in SCATTER_BATCHES or sequence_parallel_size < 4)
+        attention_token_scatter
+        and (batch_size in SCATTER_BATCHES or sequence_parallel_size < 4)
     ):
         raise ValueError(
             "MoE token-scattered output requires B8 attention token scatter"
@@ -6491,11 +7248,17 @@ def stack(
     # Rows of each local row owner of attention DP's layout (a rank pair, or
     # at DP2 B2/B4 every rank: all rows).
     tokens_per_pair = (
-        batch_size // (sp_owners if attention_dp > 1 else 4) if attention_token_scatter else 0
+        batch_size // (sp_owners if attention_dp > 1 else 4)
+        if attention_token_scatter
+        else 0
     )
     if sp_owners not in (1, 4, 8):
-        raise ValueError("sequence_parallel_size must be 1 (attention DP2 B2/B4), 4 (rank pairs) or 8 (ranks)")
-    if sp_owners == 1 and not (attention_dp == 2 and attention_dp_ownership and batch_size in (2, 4)):
+        raise ValueError(
+            "sequence_parallel_size must be 1 (attention DP2 B2/B4), 4 (rank pairs) or 8 (ranks)"
+        )
+    if sp_owners == 1 and not (
+        attention_dp == 2 and attention_dp_ownership and batch_size in (2, 4)
+    ):
         raise ValueError("One row owner is attention DP2's B2/B4 layout")
     if sp_owners == 8 and not (
         attention_token_scatter and batch_size % 8 == 0 and attention_dp == 1
@@ -6531,7 +7294,9 @@ def stack(
         or batch_size not in (32, 48, 64, 80, 96)
         and not (attention_dp == 2 and batch_size in (2, 4, 8, 16, 128))
     ):
-        raise ValueError("DP row ownership requires attention DP2 at B2..B128 or DP4 at B32/B64/B96")
+        raise ValueError(
+            "DP row ownership requires attention DP2 at B2..B128 or DP4 at B32/B64/B96"
+        )
     if moe_token_pipeline and (
         attention_dp not in (2, 4)
         or batch_size not in (32, 48, 64, 80, 96)
@@ -6539,7 +7304,9 @@ def stack(
         or not moe_token_scatter_output
         or sp_owners != 4
     ):
-        raise ValueError("MoE token pipeline requires attention DP2/DP4 at B32/B64 with pair-owned routed reduce-scatter")
+        raise ValueError(
+            "MoE token pipeline requires attention DP2/DP4 at B32/B64 with pair-owned routed reduce-scatter"
+        )
     if dp_moe_gather not in ("staged", "split"):
         raise ValueError("dp_moe_gather must be staged or split")
     if dp_moe_gather == "split" and not attention_dp_ownership:
@@ -6556,13 +7323,20 @@ def stack(
     # or with one owner every row.
     dp_held_rows = batch_size if sp_owners == 1 else group_rows_per_pair
     default_streams = (
-        {**DCP_B32_WEIGHT_STREAMS, **(DCP_B32_DECODE_RINGS if sequence_rows == 1 else {})}
-        if (batch_size in (32, 48, 64, 80, 96) and attention_dp == 1
-            and not _config().weight_streams)
+        {
+            **DCP_B32_WEIGHT_STREAMS,
+            **(DCP_B32_DECODE_RINGS if sequence_rows == 1 else {}),
+        }
+        if (
+            batch_size in (32, 48, 64, 80, 96)
+            and attention_dp == 1
+            and not _config().weight_streams
+        )
         else {}
     )
     projection_streams = _attention_projection_streams(
-        attention_dp, attention_projection_schedule,
+        attention_dp,
+        attention_projection_schedule,
     )
     conflicts = projection_streams.keys() & WEIGHT_STREAMS.keys()
     if conflicts:
@@ -6575,7 +7349,9 @@ def stack(
     kda_shard_swap = attention_dp_ownership and sp_owners == 1
     stream_config = {
         **DP_WEIGHT_STREAMS.get(attention_dp, {}),
-        **(_dp_dcp_weight_streams(attention_dp, group_rows) if attention_dp > 1 else {}),
+        **(
+            _dp_dcp_weight_streams(attention_dp, group_rows) if attention_dp > 1 else {}
+        ),
         **({"k_projection": (attention_dp, 1)} if kda_shard_swap else {}),
         **default_streams,
         **WEIGHT_STREAMS,
@@ -6591,12 +7367,17 @@ def stack(
     blocks_owned = batch_size > 16
     # Above B16 with token-scattered attention and MoE outputs, the
     # whole-batch attention and mixture outputs are never written.
-    compact_outputs = batch_size > 16 and attention_token_scatter and moe_token_scatter_output
+    compact_outputs = (
+        batch_size > 16 and attention_token_scatter and moe_token_scatter_output
+    )
     # DP row ownership: a rank's residual stream (prefix and snapshots) is
     # only its own group_rows_per_pair rows, held from row 0.
     block_rows_held = (
-        dp_held_rows if attention_dp_ownership
-        else owned_rows if blocks_owned else batch_size
+        dp_held_rows
+        if attention_dp_ownership
+        else owned_rows
+        if blocks_owned
+        else batch_size
     )
     # One copy of each per-owner row region with a traced owner index (program
     # size O(1) in the owner count). BF16 row slices at a traced offset must be
@@ -6611,16 +7392,23 @@ def stack(
         attention_dp == 1 or attention_schedule != "legacy"
     )
     if blocks_block_major and not sequence_parallel_pre_attention:
-        raise ValueError("Above eight rows the decoder needs sequence-parallel pre-attention")
+        raise ValueError(
+            "Above eight rows the decoder needs sequence-parallel pre-attention"
+        )
     persist_kda_state = batch_size <= 4 and attention_dp == 1
     # Above B16 the KDA state streams through row-chunk buffers.
     stream_kda_state = batch_size > 16
     kda_row_chunk = _kda_row_chunk(batch_size, attention_dp)
     slot_reads = state_slots is not None
     if slot_reads and not (
-            attention_dp == 1 and (select_state_row or not persist_kda_state)
-            or attention_dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96, 128)):
-        raise ValueError("state_slots needs DP1 with state_row or batch > 4, or DP2 at B2..B128")
+        attention_dp == 1
+        and (select_state_row or not persist_kda_state)
+        or attention_dp == 2
+        and batch_size in (2, 4, 8, 16, 32, 64, 96, 128)
+    ):
+        raise ValueError(
+            "state_slots needs DP1 with state_row or batch > 4, or DP2 at B2..B128"
+        )
     overlap_kda_state_reads = batch_size in (6, *SCATTER_BATCHES) or attention_dp > 1
     overlap_kda_state_writes = batch_size in (6, *SCATTER_BATCHES) or attention_dp > 1
 
@@ -6634,11 +7422,18 @@ def stack(
     if local_weights["expert_gu"].shape[0] == HALF_EXPERT_LOCAL_COUNT:
         # EP16/TP2 experts as 112 TP4-shaped half experts: only the VMEM
         # slot shapes derive from these.
-        for name, axis in (("expert_gu", 2), ("expert_gus", 2), ("expert_down", 1), ("expert_ds", 1)):
+        for name, axis in (
+            ("expert_gu", 2),
+            ("expert_gus", 2),
+            ("expert_down", 1),
+            ("expert_ds", 1),
+        ):
             dims = list(local_weights[name].shape)
             dims[0] *= 2
             dims[axis] //= 2
-            local_weights[name] = jax.ShapeDtypeStruct(tuple(dims), local_weights[name].dtype)
+            local_weights[name] = jax.ShapeDtypeStruct(
+                tuple(dims), local_weights[name].dtype
+            )
 
     def pooled_shape(name):
         """Pool footprint of a layer weight: a ring stream's slot region
@@ -6651,7 +7446,10 @@ def stack(
             return shape
         axis = 1 if STREAMED_WEIGHTS[name][0] == "columns" else 0
         largest = _chunk_sizes(shape[axis], chunks, 128 if axis == 1 else 16)[0]
-        return tuple(depth * largest if index == axis else size for index, size in enumerate(shape))
+        return tuple(
+            depth * largest if index == axis else size
+            for index, size in enumerate(shape)
+        )
 
     pool_weights = {
         name: jax.ShapeDtypeStruct(pooled_shape(name), value.dtype)
@@ -6671,14 +7469,27 @@ def stack(
     dsa_key_rows = 0
     if dsa:
         page_tokens = states[2].shape[-3] * states[2].shape[-2]
-        plan = mla_dcp.page_plan(batch_size, 3, sequence_rows, states[2].dtype, dsa=True)
-        key_buf = mla_dcp.selection_scratch(batch_size, page_tokens=page_tokens, sequence_rows=sequence_rows,
-                                            cache_dtype=states[2].dtype, **plan)[0]
+        plan = mla_dcp.page_plan(
+            batch_size, 3, sequence_rows, states[2].dtype, dsa=True
+        )
+        key_buf = mla_dcp.selection_scratch(
+            batch_size,
+            page_tokens=page_tokens,
+            sequence_rows=sequence_rows,
+            cache_dtype=states[2].dtype,
+            **plan,
+        )[0]
         span = key_buf.shape[2] * 128 // page_tokens
         dsa_key_rows = dsa_dcp.key_rows_for(paged_pages, page_tokens, span)
         dsa_scoped = dsa_decode.scoped_scratch(
-            batch_size, hidden=prefix.shape[-1], index_block_shape=tuple(index_pools[0].shape[1:]),
-            key_rows=dsa_key_rows, page_tokens=page_tokens, sequence_rows=sequence_rows, page_plan=plan)
+            batch_size,
+            hidden=prefix.shape[-1],
+            index_block_shape=tuple(index_pools[0].shape[1:]),
+            key_rows=dsa_key_rows,
+            page_tokens=page_tokens,
+            sequence_rows=sequence_rows,
+            page_plan=plan,
+        )
         mla_scoped_scratch = (*mla_scoped_scratch, *dsa_scoped.values())
     moe_scoped_scratch = _moe_scoped_scratch(
         local_weights,
@@ -6692,6 +7503,7 @@ def stack(
             and residual_reduction_order == "relaxed"
         ),
     )
+
     def body(position_ref, state_row_ref, *refs):
         table_ref, *refs = refs
         slots_ref = None
@@ -6710,7 +7522,11 @@ def stack(
         ]
         dense_start = len(layer_names) + len(EPILOGUE)
         dense_refs = dict(
-            zip(dense_names, refs[dense_start : dense_start + len(dense_names)], strict=True)
+            zip(
+                dense_names,
+                refs[dense_start : dense_start + len(dense_names)],
+                strict=True,
+            )
         )
         state_start = dense_start + len(dense_names)
         state_count = len(states)
@@ -6719,14 +7535,17 @@ def stack(
         pool_ref = tuple(raw_pool_refs[index] for index in pool_map)
         index_pool_refs = ()
         if dsa:
-            index_pool_refs = tuple(refs[state_start + state_count : state_start + state_count + MLA_LAYERS])
+            index_pool_refs = tuple(
+                refs[state_start + state_count : state_start + state_count + MLA_LAYERS]
+            )
             state_count += MLA_LAYERS  # the index pools follow the states
         output_count = 9 if dsa else 7
         output_refs = refs[state_start + state_count : state_start + state_count + 7]
         records_output_ref = keys_output_ref = None
         if dsa:
             records_output_ref, keys_output_ref = refs[
-                state_start + state_count + 7 : state_start + state_count + 9]
+                state_start + state_count + 7 : state_start + state_count + 9
+            ]
         (
             output_ref,
             blocks_output_ref,
@@ -6808,7 +7627,9 @@ def stack(
 
         def kda_state_source(ref, state_index):
             if select_state_row:
-                row = slots_ref[selected_state_row] if slot_reads else selected_state_row
+                row = (
+                    slots_ref[selected_state_row] if slot_reads else selected_state_row
+                )
                 return ref.at[pl.ds(row, 1), state_index]
             return ref.at[:, state_index]
 
@@ -6816,11 +7637,21 @@ def stack(
             """The copies of a layer's input KDA states into ``vmem``: one,
             or one per row from its slot (``state_slots``)."""
             if not slot_reads or select_state_row:
-                return (tpu.make_async_copy(kda_state_source(ref, state_index),
-                                            kda_state_destination(vmem), semaphore), )
-            return tuple(tpu.make_async_copy(ref.at[pl.ds(slots_ref[b], 1), state_index],
-                                             vmem.at[pl.ds(b, 1)], semaphore)
-                         for b in range(batch_size))
+                return (
+                    tpu.make_async_copy(
+                        kda_state_source(ref, state_index),
+                        kda_state_destination(vmem),
+                        semaphore,
+                    ),
+                )
+            return tuple(
+                tpu.make_async_copy(
+                    ref.at[pl.ds(slots_ref[b], 1), state_index],
+                    vmem.at[pl.ds(b, 1)],
+                    semaphore,
+                )
+                for b in range(batch_size)
+            )
 
         def kda_state_destination(vmem):
             return vmem.at[pl.ds(0, 1)] if select_state_row else vmem
@@ -6877,7 +7708,11 @@ def stack(
         # With the arena manager, where each layer's weights land (and when
         # their copies start) follows from the order of requests and releases.
         pool = (
-            VmemPool(projection_expert_pool_vmem, pool_layout["arena_bytes"], report=_config().pool_report)
+            VmemPool(
+                projection_expert_pool_vmem,
+                pool_layout["arena_bytes"],
+                report=_config().pool_report,
+            )
             if pool_managed
             else None
         )
@@ -6910,6 +7745,7 @@ def stack(
                 index=index,
                 predicate=predicate,
             )
+
         auxiliary_vmem = (
             convolution_filter_vmem,
             exp_log_decay_rate_vmem,
@@ -6934,8 +7770,11 @@ def stack(
             for row in range(group_rows):
                 pair_index, within = divmod(row, group_rows_per_pair)
                 group_positions_smem[row] = position_ref[
-                    tokens_per_pair * pair_index + data_group * group_rows_per_pair + within
+                    tokens_per_pair * pair_index
+                    + data_group * group_rows_per_pair
+                    + within
                 ]
+
         def for_dp_owned_rows(run):
             """``run(first)`` with this rank's first batch row (static per
             row owner and DP group)."""
@@ -6946,6 +7785,7 @@ def stack(
             pair, group = (rank % 8) // (8 // sp_owners), rank // (32 // attention_dp)
             for owner in range(sp_owners):
                 for data_group in range(attention_dp):
+
                     @pl.when((pair == owner) & (group == data_group))
                     def owned_region(owner=owner, data_group=data_group):
                         run(owner * tokens_per_pair + data_group * group_rows_per_pair)
@@ -6958,35 +7798,46 @@ def stack(
             copy.start()
             copy.wait()
             if attention_dp_ownership:
+
                 def take_owned_rows(first):
                     prefix_vmem[:dp_held_rows] = staged[first : first + dp_held_rows]
 
                 for_dp_owned_rows(take_owned_rows)
 
         if attention_dp_ownership:
-            pl.run_scoped(load_prefix, tpu.VMEM(prefix_ref.shape, prefix_ref.dtype),
-                          tpu.SemaphoreType.DMA)
+            pl.run_scoped(
+                load_prefix,
+                tpu.VMEM(prefix_ref.shape, prefix_ref.dtype),
+                tpu.SemaphoreType.DMA,
+            )
         else:
-            pl.run_scoped(functools.partial(load_prefix, prefix_vmem), tpu.SemaphoreType.DMA)
+            pl.run_scoped(
+                functools.partial(load_prefix, prefix_vmem), tpu.SemaphoreType.DMA
+            )
         blocks_vmem[...] = jnp.zeros(blocks_vmem.shape, blocks_vmem.dtype)
+
         def initialize_blocks(embedding_ref):
             if attention_dp_ownership:
+
                 def initialize_owned_blocks(first):
                     for local in range(dp_held_rows):
-                        blocks_vmem[local // 2, pl.ds((local % 2) * 8, 1)] = embedding_ref[
-                            pl.ds(first + local, 1)
-                        ].astype(jnp.bfloat16)
+                        blocks_vmem[local // 2, pl.ds((local % 2) * 8, 1)] = (
+                            embedding_ref[pl.ds(first + local, 1)].astype(jnp.bfloat16)
+                        )
 
                 for_dp_owned_rows(initialize_owned_blocks)
             elif blocks_owned:
                 owner_of_rank = (jax.lax.axis_index("tp") % 8) // (8 // sp_owners)
                 for owner_index in range(sp_owners):
+
                     @pl.when(owner_of_rank == owner_index)
                     def initialize_owned_blocks(owner_index=owner_index):
                         for local in range(owned_rows):
-                            blocks_vmem[local // 2, pl.ds((local % 2) * 8, 1)] = embedding_ref[
-                                pl.ds(owner_index * owned_rows + local, 1)
-                            ].astype(jnp.bfloat16)
+                            blocks_vmem[local // 2, pl.ds((local % 2) * 8, 1)] = (
+                                embedding_ref[
+                                    pl.ds(owner_index * owned_rows + local, 1)
+                                ].astype(jnp.bfloat16)
+                            )
             elif blocks_block_major:
                 for row in range(batch_size):
                     blocks_vmem[row // 2, pl.ds((row % 2) * 8, 1)] = embedding_ref[
@@ -7005,8 +7856,12 @@ def stack(
         # That layer seeds snapshot zero from prefix before any later read.
         # Keep all snapshot slots zero-initialized so masked arithmetic stays
         # finite; only omit the redundant embedding DMA and row insertion.
-        if not (include_layer_zero and attention_dp == 2
-                and batch_size in (64, 128) and sequence_rows == 1):
+        if not (
+            include_layer_zero
+            and attention_dp == 2
+            and batch_size in (64, 128)
+            and sequence_rows == 1
+        ):
             pl.run_scoped(
                 staged_blocks,
                 tpu.VMEM(embedding_ref.shape, embedding_ref.dtype),
@@ -7049,9 +7904,7 @@ def stack(
                 active_block_count,
                 batch_size=batch_size,
                 epsilon=eps,
-                relaxed_reduction_order=(
-                    residual_reduction_order == "relaxed"
-                ),
+                relaxed_reduction_order=(residual_reduction_order == "relaxed"),
             )
 
         def store_mixed_rows(compute_row, destination):
@@ -7076,31 +7929,42 @@ def stack(
             value = destination[...].astype(jnp.float32)
             destination[...] = (
                 value
-                * jax.lax.rsqrt(
-                    jnp.mean(value * value, axis=1, keepdims=True) + eps
-                )
+                * jax.lax.rsqrt(jnp.mean(value * value, axis=1, keepdims=True) + eps)
                 * scale[...]
             ).astype(jnp.bfloat16)
 
-        dp_owned_vmem = _bf16_rows_view(
-            communication_workspace.attention_output_vmem,
-            dp_held_rows,
-            hidden_size,
-        ) if attention_dp_ownership else None
+        dp_owned_vmem = (
+            _bf16_rows_view(
+                communication_workspace.attention_output_vmem,
+                dp_held_rows,
+                hidden_size,
+            )
+            if attention_dp_ownership
+            else None
+        )
 
-        sp8_residual = (attention_dp_ownership and attention_dp == 2
-                        and batch_size == 128 and sequence_rows == 1)
+        sp8_residual = (
+            attention_dp_ownership
+            and attention_dp == 2
+            and batch_size == 128
+            and sequence_rows == 1
+        )
         # Expert/projection ABIs retain their existing pair ownership. Only
         # mixture rows and the following gathers use eight independent owners.
         sp8_rows_vmem = dp_owned_vmem if sp8_residual else None
 
         def sp8_owned_value():
             value = sp8_rows_vmem[...]
-            return jnp.where(jax.lax.axis_index("tp") % 2 == 0,
-                             value[:8], value[8:16])
+            return jnp.where(jax.lax.axis_index("tp") % 2 == 0, value[:8], value[8:16])
 
-        def mix_dp_rows(folded, active_blocks, *, layer_index,
-                        attention_output=False, start_block=False):
+        def mix_dp_rows(
+            folded,
+            active_blocks,
+            *,
+            layer_index,
+            attention_output=False,
+            start_block=False,
+        ):
             rows = slice(0, dp_held_rows)
             if attention_output:
                 prefix_vmem[rows] = jnp.where(
@@ -7124,9 +7988,11 @@ def stack(
                 # rather than reading undefined scratch on the first layer.
                 sp8_rows_vmem[...] = jnp.zeros((16, hidden_size), jnp.bfloat16)
                 for lane in range(2):
+
                     @pl.when(jax.lax.axis_index("tp") % 2 == lane)
                     def mix_half(lane=lane):
                         for local_row in range(8):
+
                             @pl.when(communication_workspace.reduction_phase[0] >= 0)
                             def store_row(local_row=local_row):
                                 row = lane * 8 + local_row
@@ -7134,15 +8000,23 @@ def stack(
                                 # avoiding an unsupported nested half-row view.
                                 sp8_rows_vmem[pl.ds(row, 1)] = mix_row(row)
             else:
-                store_mixed_rows(mix_row, normalized_vmem if start_block and kda_shard_swap else dp_owned_vmem)
+                store_mixed_rows(
+                    mix_row,
+                    normalized_vmem
+                    if start_block and kda_shard_swap
+                    else dp_owned_vmem,
+                )
             if start_block:
+
                 @pl.when(layer_index % 12 == 0)
                 def snapshot():
                     for row in range(dp_held_rows):
                         half = blocks_vmem.at[row // 2, pl.ds((row % 2) * 8, 8)]
                         mask = jax.lax.broadcasted_iota(jnp.int32, half.shape, 0)
                         half[...] = jnp.where(
-                            mask == layer_index // 12, prefix_vmem[row : row + 1], half[...],
+                            mask == layer_index // 12,
+                            prefix_vmem[row : row + 1],
+                            half[...],
                         )
 
         def normalize_dp_rows(scale, *, split=False):
@@ -7158,6 +8032,7 @@ def stack(
             # (owned_rows_vmem is free until the following gather).
             group = jax.lax.axis_index("tp") // (32 // attention_dp)
             for data_group in range(attention_dp):
+
                 @pl.when(group == data_group)
                 def stage_native_rows(data_group=data_group):
                     first = data_group * group_rows_per_pair
@@ -7169,13 +8044,17 @@ def stack(
                     if tail:
                         parts.append(jnp.zeros((tail, hidden_size), jnp.bfloat16))
                     owned_rows_vmem[...] = jnp.concatenate(tuple(parts), axis=0)
+
             normalize(owned_rows_vmem, scale)
             native_rows = owned_rows_vmem[...]
             for data_group in range(attention_dp):
+
                 @pl.when(group == data_group)
                 def select_normalized_rows(data_group=data_group):
                     first = data_group * group_rows_per_pair
-                    dp_owned_vmem[...] = native_rows[first:first + group_rows_per_pair]
+                    dp_owned_vmem[...] = native_rows[
+                        first : first + group_rows_per_pair
+                    ]
 
         def swap_kda_projections(stream):
             """DP2 B2/B4's shard swap: this rank projects its own group's held
@@ -7186,10 +8065,14 @@ def stack(
             after the exchange, of the other shard's (order 1)."""
             rank = jax.lax.axis_index("tp")
             group = rank // (32 // attention_dp)
-            projected = stream.dot(normalized_vmem[...], communication_workspace.reduction_phase[0] >= 0)
+            projected = stream.dot(
+                normalized_vmem[...], communication_workspace.reduction_phase[0] >= 0
+            )
             projected = projected.astype(jnp.bfloat16)
             own = jnp.where(group == 0, projected[:group_rows], projected[group_rows:])
-            other = jnp.where(group == 0, projected[group_rows:], projected[:group_rows])
+            other = jnp.where(
+                group == 0, projected[group_rows:], projected[:group_rows]
+            )
             used = group_rows * projected.shape[1] // 128
             # The BF16 view of the FP32 lanes slices in row pairs: pad B2's
             # 13-row payload.
@@ -7199,13 +8082,17 @@ def stack(
             receive = local.at[5].bitcast(jnp.bfloat16).at[pl.ds(0, payload), :]
             wire = other.reshape(used, 128)
             if payload != used:
-                wire = jnp.concatenate([wire, jnp.zeros((payload - used, 128), jnp.bfloat16)])
+                wire = jnp.concatenate(
+                    [wire, jnp.zeros((payload - used, 128), jnp.bfloat16)]
+                )
             send[...] = wire
             copy = tpu.make_async_remote_copy(
-                send, receive,
+                send,
+                receive,
                 communication_workspace.send_semaphores.at[14],
                 communication_workspace.receive_semaphores.at[14],
-                device_id=(rank ^ (32 // attention_dp),), device_id_type=pl.DeviceIdType.MESH,
+                device_id=(rank ^ (32 // attention_dp),),
+                device_id_type=pl.DeviceIdType.MESH,
             )
             copy.start()
 
@@ -7220,10 +8107,13 @@ def stack(
         def gather_dp_rows(destination, *, split=False):
             if split:
                 _gather_sp8_dp_moe_rows(
-                    sp8_owned_value(), owned_rows_vmem, destination,
+                    sp8_owned_value(),
+                    owned_rows_vmem,
+                    destination,
                     communication_workspace.shared_local_reduction_vmem,
                     communication_workspace.send_semaphores,
-                    communication_workspace.receive_semaphores)
+                    communication_workspace.receive_semaphores,
+                )
                 return
             # Restore the router's owned input as well as the complete MoE
             # input. No arithmetic occurs after normalization. Scratch lanes
@@ -7233,7 +8123,9 @@ def stack(
                 return
             if dp_moe_gather == "split":
                 _gather_dp_moe_rows(
-                    dp_owned_vmem[...], owned_rows_vmem, destination,
+                    dp_owned_vmem[...],
+                    owned_rows_vmem,
+                    destination,
                     communication_workspace.shared_local_reduction_vmem,
                     communication_workspace.send_semaphores,
                     communication_workspace.receive_semaphores,
@@ -7242,7 +8134,8 @@ def stack(
                 return
             with _phase("t10a_dp_normalized_gather"):
                 _gather_attention_dp_rows(
-                    dp_owned_vmem[...], owned_rows_vmem,
+                    dp_owned_vmem[...],
+                    owned_rows_vmem,
                     communication_workspace.shared_local_reduction_vmem,
                     communication_workspace.send_semaphores,
                     communication_workspace.receive_semaphores,
@@ -7250,7 +8143,8 @@ def stack(
                 )
             with _phase("t10b_moe_local_gather"):
                 _gather_local_pair_rows(
-                    owned_rows_vmem, destination,
+                    owned_rows_vmem,
+                    destination,
                     communication_workspace.send_semaphores,
                     communication_workspace.receive_semaphores,
                     communication_workspace.shared_local_reduction_vmem,
@@ -7290,7 +8184,9 @@ def stack(
                 # Output projections stream in rank-pair feature-row halves,
                 # own rows first: per shard, all own halves before the peer's.
                 if chunks != 2 * attention_dp:
-                    raise ValueError(f"{name} streams as its {2 * attention_dp} pair halves")
+                    raise ValueError(
+                        f"{name} streams as its {2 * attention_dp} pair halves"
+                    )
                 lane = jax.lax.axis_index("tp") % 2
                 order = lambda position: (  # noqa: E731
                     (position % attention_dp) * 2 + (lane ^ (position // attention_dp))
@@ -7300,14 +8196,26 @@ def stack(
             if axis == "columns" and attention_dp > 1:
                 # Chunks never straddle two held shards.
                 if chunks % attention_dp:
-                    raise ValueError(f"{name}: chunks must be a multiple of the attention DP degree")
-                sizes = _chunk_sizes(extent // attention_dp, chunks // attention_dp, unit) * attention_dp
+                    raise ValueError(
+                        f"{name}: chunks must be a multiple of the attention DP degree"
+                    )
+                sizes = (
+                    _chunk_sizes(extent // attention_dp, chunks // attention_dp, unit)
+                    * attention_dp
+                )
             else:
                 sizes = _chunk_sizes(extent, chunks, unit)
             stream = ChunkedWeightStream(
-                source, full, stream_semaphores, axis=axis, sizes=sizes,
-                depth=depth, base=base, order=order,
-                pool=None if offset is None else projection_expert_pool_vmem, offset=offset,
+                source,
+                full,
+                stream_semaphores,
+                axis=axis,
+                sizes=sizes,
+                depth=depth,
+                base=base,
+                order=order,
+                pool=None if offset is None else projection_expert_pool_vmem,
+                offset=offset,
             )
             stream.shards = attention_dp
             return stream
@@ -7346,7 +8254,9 @@ def stack(
             """MLA's q-down projection (at the attention weights' ``base``) as a
             column stream, if configured."""
             return weight_stream(
-                "m_qa", layer_weights["m_qa"].at[state_index], attention_views(base)[1][0],
+                "m_qa",
+                layer_weights["m_qa"].at[state_index],
+                attention_views(base)[1][0],
                 offset=base if POOLED_WEIGHTS else None,
             )
 
@@ -7358,21 +8268,35 @@ def stack(
                 width = source.shape[1] // attention_dp
                 group = jax.lax.axis_index("tp") // (32 // attention_dp)
                 input_stream = ChunkedWeightStream(
-                    source.at[:, pl.ds(pl.multiple_of(group * width, 128), width)], kda_views[1],
-                    stream_semaphores, axis="columns", sizes=(width,), depth=1,
+                    source.at[:, pl.ds(pl.multiple_of(group * width, 128), width)],
+                    kda_views[1],
+                    stream_semaphores,
+                    axis="columns",
+                    sizes=(width,),
+                    depth=1,
                 )
             else:
                 input_stream = weight_stream(
-                    "k_projection", source, kda_views[1], offset=base + storage("k_gate"),
+                    "k_projection",
+                    source,
+                    kda_views[1],
+                    offset=base + storage("k_gate"),
                 )
             streams = {
                 "input": input_stream,
                 "output": weight_stream(
-                    "k_o", layer_weights["k_o"].at[state_index], kda_views[3],
-                    offset=base + storage("k_gate") + storage("k_projection") + storage("k_fb"),
+                    "k_o",
+                    layer_weights["k_o"].at[state_index],
+                    kda_views[3],
+                    offset=base
+                    + storage("k_gate")
+                    + storage("k_projection")
+                    + storage("k_fb"),
                 ),
             }
-            return {key: stream for key, stream in streams.items() if stream is not None}
+            return {
+                key: stream for key, stream in streams.items() if stream is not None
+            }
 
         def prefetch_attention(index, base=0):
             kda_projection_vmem, mla_projection_vmem = attention_views(base)
@@ -7423,9 +8347,7 @@ def stack(
             @pl.when((index % 4 != 3) & (index != 92))
             def prefetch_kda_auxiliary():
                 state_index = index - index // 4
-                sources = tuple(
-                    layer_weights[name].at[state_index] for name in KDA[4:]
-                )
+                sources = tuple(layer_weights[name].at[state_index] for name in KDA[4:])
                 destinations = list(auxiliary_vmem[: len(sources)])
                 if persist_kda_state:
                     sources += (
@@ -7484,6 +8406,7 @@ def stack(
             # Layer 0 has no router; layer 1's is prefetched after the dense
             # MLP.
             if not pool_managed:
+
                 @pl.when(jax.lax.axis_index("tp") % 2 == 1)
                 def initialize_router_padding():
                     router_vmem[0, :, 384:] = jnp.zeros(
@@ -7497,7 +8420,9 @@ def stack(
         else:
             prefetch_attention(jnp.int32(first_layer))
         prefetch_auxiliary(jnp.int32(first_layer))
-        prefetch_metadata(jnp.int32(first_layer), mixture_metadata=not include_layer_zero)
+        prefetch_metadata(
+            jnp.int32(first_layer), mixture_metadata=not include_layer_zero
+        )
         if pool is not None and not include_layer_zero:
             request_router(jnp.int32(1))
 
@@ -7549,25 +8474,30 @@ def stack(
                     destination,
                     norm_semaphores.at[index],
                 )
-                for index, (name, destination) in enumerate((
-                    ("attn_res", attention_residual_vmem),
-                    ("mlp_res", mlp_residual_vmem),
-                    ("attn_norm", attention_norm_vmem),
-                    ("ffn_norm", ffn_norm_vmem),
-                ))
+                for index, (name, destination) in enumerate(
+                    (
+                        ("attn_res", attention_residual_vmem),
+                        ("mlp_res", mlp_residual_vmem),
+                        ("attn_norm", attention_norm_vmem),
+                        ("ffn_norm", ffn_norm_vmem),
+                    )
+                )
             ]
             norm_copies[0].wait()
             norm_copies[2].wait()
             layer_scope = [_phase_start("q1_pre_mix")]
             if attention_dp_ownership:
                 mix_dp_rows(
-                    attention_residual_vmem, (layer_index - 1) // 12 + 1,
-                    layer_index=layer_index, start_block=True,
+                    attention_residual_vmem,
+                    (layer_index - 1) // 12 + 1,
+                    layer_index=layer_index,
+                    start_block=True,
                 )
             elif sequence_parallel_pre_attention:
                 rank = jax.lax.axis_index("tp")
                 pair = (rank % 8) // (8 // sp_owners)
                 for owner_pair in owner_indices(pair):
+
                     @owner_when(pair, owner_pair)
                     def prepare_owned_attention_rows():
                         row_offset = owner_pair * owned_rows
@@ -7588,21 +8518,30 @@ def stack(
 
                         store_mixed_rows(mix_row, owned_rows_vmem)
 
-                        @pl.when((layer_index % 12 == 0) if blocks_block_major else False)
+                        @pl.when(
+                            (layer_index % 12 == 0) if blocks_block_major else False
+                        )
                         def start_owned_residual_block_major():
                             for local_row in range(owned_rows):
                                 global_row = row_offset + local_row
-                                row = owner_block_row(global_row, local_row) % block_rows_held
+                                row = (
+                                    owner_block_row(global_row, local_row)
+                                    % block_rows_held
+                                )
                                 half = blocks_vmem.at[row // 2, pl.ds((row % 2) * 8, 8)]
                                 block_mask = (
                                     jax.lax.broadcasted_iota(jnp.int32, half.shape, 0)
                                     == layer_index // 12
                                 )
                                 half[...] = jnp.where(
-                                    block_mask, owner_prefix_row(global_row, row_slice, local_row), half[...]
+                                    block_mask,
+                                    owner_prefix_row(global_row, row_slice, local_row),
+                                    half[...],
                                 )
 
-                        @pl.when(False if blocks_block_major else (layer_index % 12 == 0))
+                        @pl.when(
+                            False if blocks_block_major else (layer_index % 12 == 0)
+                        )
                         def start_owned_residual_block():
                             block_mask = (
                                 jax.lax.broadcasted_iota(
@@ -7614,9 +8553,7 @@ def stack(
                             )
                             blocks_vmem[row_slice] = jnp.where(
                                 block_mask,
-                                prefix_vmem[row_slice][
-                                    :, None, :
-                                ].astype(jnp.float32),
+                                prefix_vmem[row_slice][:, None, :].astype(jnp.float32),
                                 blocks_vmem[row_slice],
                             )
             else:
@@ -7629,9 +8566,7 @@ def stack(
                 @pl.when(layer_index % 12 == 0)
                 def start_residual_block():
                     block_mask = (
-                        jax.lax.broadcasted_iota(
-                            jnp.int32, blocks_vmem.shape, 1
-                        )
+                        jax.lax.broadcasted_iota(jnp.int32, blocks_vmem.shape, 1)
                         == layer_index // 12
                     )
                     blocks_vmem[...] = jnp.where(
@@ -7656,17 +8591,21 @@ def stack(
                 with _phase("t0_dp_group_gather"):
                     if sp8_residual:
                         _gather_sp8_local_rows(
-                            sp8_owned_value(), group_input_vmem,
+                            sp8_owned_value(),
+                            group_input_vmem,
                             communication_workspace.shared_local_reduction_vmem,
                             communication_workspace.send_semaphores,
-                            communication_workspace.receive_semaphores)
+                            communication_workspace.receive_semaphores,
+                        )
                     else:
                         _gather_local_pair_rows(
-                            dp_owned_vmem, group_input_vmem,
+                            dp_owned_vmem,
+                            group_input_vmem,
                             communication_workspace.send_semaphores,
                             communication_workspace.receive_semaphores,
                             communication_workspace.shared_local_reduction_vmem,
-                            packed=True)
+                            packed=True,
+                        )
             elif sequence_parallel_pre_attention and attention_dp > 1:
                 # The group's attention input: each local pair contributes its
                 # owned row 2p + d.
@@ -7677,7 +8616,9 @@ def stack(
                     owned = owned_rows_vmem[...]
                     selected = owned[0:1]
                     for group in range(1, attention_dp):
-                        selected = jnp.where(data_group == group, owned[group : group + 1], selected)
+                        selected = jnp.where(
+                            data_group == group, owned[group : group + 1], selected
+                        )
                     group_input_vmem[0:1] = selected
                     _gather_local_pair_rows(
                         group_input_vmem.at[pl.ds(0, 1)],
@@ -7688,11 +8629,13 @@ def stack(
                     )
                 elif "gather" not in DEBUG_SKIP:
                     for group in range(attention_dp):
+
                         @pl.when(data_group == group)
                         def gather_group_rows(group=group):
                             _gather_local_pair_rows(
                                 owned_rows_vmem.at[
-                                    group * group_rows_per_pair : (group + 1) * group_rows_per_pair
+                                    group * group_rows_per_pair : (group + 1)
+                                    * group_rows_per_pair
                                 ],
                                 group_input_vmem,
                                 communication_workspace.send_semaphores,
@@ -7703,6 +8646,7 @@ def stack(
                                 # view so its DMA byte count/layout is explicit.
                                 packed=group_rows_per_pair == 8,
                             )
+
                 _phase_end(t0)
             elif sequence_parallel_pre_attention:
                 normalize(owned_rows_vmem, attention_norm_vmem)
@@ -7748,9 +8692,7 @@ def stack(
                 for copy in pending:
                     copy.wait()
 
-                def execute(
-                    history_vmem, state_vmem, state_semaphores, state_reads=()
-                ):
+                def execute(history_vmem, state_vmem, state_semaphores, state_reads=()):
                     state_writes = (
                         tpu.make_async_copy(
                             history_vmem,
@@ -7774,12 +8716,18 @@ def stack(
 
                     if attention_dp > 1:
                         streams = kda_streams(state_index, attention_base)
-                        swapped = swap_kda_projections(streams["input"]) if kda_shard_swap else None
+                        swapped = (
+                            swap_kda_projections(streams["input"])
+                            if kda_shard_swap
+                            else None
+                        )
                         for order in range(attention_dp):
                             shard = order
                             if kda_shard_swap:
                                 # The swap runs this rank's own shard first.
-                                own_shard = jax.lax.axis_index("tp") // (32 // attention_dp)
+                                own_shard = jax.lax.axis_index("tp") // (
+                                    32 // attention_dp
+                                )
                                 shard = (own_shard + order) % attention_dp
                             rows = pl.ds(shard * group_rows, group_rows)
                             kda(
@@ -7797,7 +8745,10 @@ def stack(
                                     layer_weights["k_o"].at[state_index],
                                     kda_projection_vmem[3],
                                     # Per-shard filter, decay and time-step bias; shared norm.
-                                    *(auxiliary_vmem[index].at[shard] for index in range(3)),
+                                    *(
+                                        auxiliary_vmem[index].at[shard]
+                                        for index in range(3)
+                                    ),
                                     auxiliary_vmem[3],
                                     pool_semaphores,
                                 ),
@@ -7814,7 +8765,8 @@ def stack(
                                 ),
                                 on_state_updated=(
                                     start_state_writes
-                                    if overlap_kda_state_writes and order == attention_dp - 1
+                                    if overlap_kda_state_writes
+                                    and order == attention_dp - 1
                                     else None
                                 ),
                                 sequence_rows=sequence_rows,
@@ -7822,12 +8774,17 @@ def stack(
                                 shard_index=shard,
                                 attended_out=dp_attended_vmem.at[shard],
                                 gate_features_vmem=dp_compressed_vmem,
-                                stage_projections=attention_schedule in ("auto", "overlap"),
-                                projected_rows=None if swapped is None else swapped(order),
+                                stage_projections=attention_schedule
+                                in ("auto", "overlap"),
+                                projected_rows=None
+                                if swapped is None
+                                else swapped(order),
                                 first_call=order == 0,
                             )
                         release_kda_inputs()
-                        project_attention_dp(kda_projection_vmem[3], streams.get("output"))
+                        project_attention_dp(
+                            kda_projection_vmem[3], streams.get("output")
+                        )
                     else:
                         kda(
                             normalized_vmem,
@@ -7898,7 +8855,13 @@ def stack(
                         auxiliary_semaphores,
                     )
                 elif stream_kda_state:
-                    def execute_streamed_dp(history_buffers, state_buffers, read_semaphores, write_semaphores):
+
+                    def execute_streamed_dp(
+                        history_buffers,
+                        state_buffers,
+                        read_semaphores,
+                        write_semaphores,
+                    ):
                         streams = kda_streams(state_index, attention_base)
                         chunks_per_shard = group_rows // kda_row_chunk
                         shared_state_stream = None
@@ -7971,7 +8934,10 @@ def stack(
                                     kda_projection_vmem[2],
                                     layer_weights["k_o"].at[state_index],
                                     kda_projection_vmem[3],
-                                    *(auxiliary_vmem[index].at[shard] for index in range(3)),
+                                    *(
+                                        auxiliary_vmem[index].at[shard]
+                                        for index in range(3)
+                                    ),
                                     auxiliary_vmem[3],
                                     pool_semaphores,
                                 ),
@@ -7986,23 +8952,34 @@ def stack(
                                 shard_index=shard,
                                 attended_out=dp_attended_vmem.at[shard],
                                 gate_features_vmem=dp_compressed_vmem,
-                                stage_projections=attention_schedule in ("auto", "overlap"),
+                                stage_projections=attention_schedule
+                                in ("auto", "overlap"),
                                 state_stream=state_stream,
                             )
                         if shared_state_stream is not None:
                             # All KDA consumers have finished. The final three
                             # writes are the only outstanding DMAs: every read
                             # was acquired and earlier writes drained at reuse.
-                            if (attention_schedule in ("auto", "overlap")
-                                    and group_rows > 8 and "kda" not in DEBUG_SKIP):
+                            if (
+                                attention_schedule in ("auto", "overlap")
+                                and group_rows > 8
+                                and "kda" not in DEBUG_SKIP
+                            ):
                                 shared_state_stream.finish_rolled()
                             else:
                                 shared_state_stream.finish()
                         if "project" not in DEBUG_SKIP:
                             release_kda_inputs()
-                            project_attention_dp(kda_projection_vmem[3], streams.get("output"))
+                            project_attention_dp(
+                                kda_projection_vmem[3], streams.get("output")
+                            )
 
-                    def execute_streamed(history_buffers, state_buffers, read_semaphores, write_semaphores):
+                    def execute_streamed(
+                        history_buffers,
+                        state_buffers,
+                        read_semaphores,
+                        write_semaphores,
+                    ):
                         state_stream = KdaStateStream(
                             convolution_ref.at[:, state_index],
                             recurrent_ref.at[:, state_index],
@@ -8047,19 +9024,40 @@ def stack(
                             state_stream=state_stream,
                         )
 
-                    state_buffer_count = 4 if batch_size == 32 and attention_dp == 1 and not KDA_STAGED else 3
+                    state_buffer_count = (
+                        4
+                        if batch_size == 32 and attention_dp == 1 and not KDA_STAGED
+                        else 3
+                    )
                     pl.run_scoped(
                         execute_streamed_dp if attention_dp > 1 else execute_streamed,
-                        tpu.VMEM((state_buffer_count, kda_row_chunk, *states[0].shape[2:]), states[0].dtype),
-                        tpu.VMEM((state_buffer_count, kda_row_chunk, *states[1].shape[2:]), states[1].dtype),
+                        tpu.VMEM(
+                            (state_buffer_count, kda_row_chunk, *states[0].shape[2:]),
+                            states[0].dtype,
+                        ),
+                        tpu.VMEM(
+                            (state_buffer_count, kda_row_chunk, *states[1].shape[2:]),
+                            states[1].dtype,
+                        ),
                         tpu.SemaphoreType.DMA((state_buffer_count, 2)),
                         tpu.SemaphoreType.DMA((state_buffer_count, 2)),
                     )
                 else:
+
                     def execute_scoped(history_vmem, state_vmem, state_semaphores):
                         state_copies = (
-                            *kda_state_reads(convolution_ref, history_vmem, state_semaphores.at[0], state_index),
-                            *kda_state_reads(recurrent_ref, state_vmem, state_semaphores.at[1], state_index),
+                            *kda_state_reads(
+                                convolution_ref,
+                                history_vmem,
+                                state_semaphores.at[0],
+                                state_index,
+                            ),
+                            *kda_state_reads(
+                                recurrent_ref,
+                                state_vmem,
+                                state_semaphores.at[1],
+                                state_index,
+                            ),
                         )
                         for copy in state_copies:
                             copy.start()
@@ -8072,12 +9070,8 @@ def stack(
 
                     pl.run_scoped(
                         execute_scoped,
-                        tpu.VMEM(
-                            (batch_size, *states[0].shape[2:]), states[0].dtype
-                        ),
-                        tpu.VMEM(
-                            (batch_size, *states[1].shape[2:]), states[1].dtype
-                        ),
+                        tpu.VMEM((batch_size, *states[0].shape[2:]), states[0].dtype),
+                        tpu.VMEM((batch_size, *states[1].shape[2:]), states[1].dtype),
                         tpu.SemaphoreType.DMA((2,)),
                     )
 
@@ -8093,21 +9087,38 @@ def stack(
                 dp_output = None
                 if attention_dp > 1:
                     output_view = pool_view("m_o", base=attention_base)
-                    dp_output = (output_view, weight_stream(
-                        "m_o", layer_weights["m_o"].at[state_index], output_view,
-                        offset=pool_layout["m_o"] + attention_base,
-                    ))
+                    dp_output = (
+                        output_view,
+                        weight_stream(
+                            "m_o",
+                            layer_weights["m_o"].at[state_index],
+                            output_view,
+                            offset=pool_layout["m_o"] + attention_base,
+                        ),
+                    )
 
                 def compute(new_key_vmem, new_value_vmem, *workspace):
                     indexer = None
                     if dsa:
-                        workspace, dsa_refs = workspace[: -len(dsa_scoped)], workspace[-len(dsa_scoped) :]
+                        workspace, dsa_refs = (
+                            workspace[: -len(dsa_scoped)],
+                            workspace[-len(dsa_scoped) :],
+                        )
                         indexer = dsa_decode.DecodeIndexer(
-                            weights={name: layer_weights[name].at[state_index] for name in dsa_names},
-                            pools=index_pool_refs, layer=state_index, keys=keys_output_ref,
-                            records_out=records_output_ref, persistent=dsa_persistent,
-                            scoped=dict(zip(dsa_scoped, dsa_refs, strict=True)), topk=dsa_topk, eps=eps,
-                            sequence_rows=sequence_rows)
+                            weights={
+                                name: layer_weights[name].at[state_index]
+                                for name in dsa_names
+                            },
+                            pools=index_pool_refs,
+                            layer=state_index,
+                            keys=keys_output_ref,
+                            records_out=records_output_ref,
+                            persistent=dsa_persistent,
+                            scoped=dict(zip(dsa_scoped, dsa_refs, strict=True)),
+                            topk=dsa_topk,
+                            eps=eps,
+                            sequence_rows=sequence_rows,
+                        )
                     count = len(mla_dcp.SCOPED_NAMES)
                     workspace, dcp_scoped = workspace[:-count], workspace[-count:]
                     metadata_copies = (
@@ -8140,12 +9151,15 @@ def stack(
                             strict=True,
                         )
                         if (
-                            stream := dp_output[1] if dp_output and name == "m_o" else weight_stream(
+                            stream := dp_output[1]
+                            if dp_output and name == "m_o"
+                            else weight_stream(
                                 name,
                                 layer_weights[name].at[state_index],
                                 view,
                                 offset=(
-                                    pool_layout[name] + (attention_base if name == "m_o" else 0)
+                                    pool_layout[name]
+                                    + (attention_base if name == "m_o" else 0)
                                     if POOLED_WEIGHTS
                                     else None
                                 ),
@@ -8153,7 +9167,9 @@ def stack(
                         )
                         is not None
                     }
-                    query_down_stream = query_down_weight_stream(state_index, attention_base)
+                    query_down_stream = query_down_weight_stream(
+                        state_index, attention_base
+                    )
                     if query_down_stream is not None:
                         mla_streams["query_down"] = query_down_stream
                     mla_options = dict(
@@ -8191,8 +9207,11 @@ def stack(
 
                         def group_table_row(row):
                             # Group row p is the batch row its positions came from.
-                            return (row // group_rows_per_pair * tokens_per_pair
-                                    + data_group * group_rows_per_pair + row % group_rows_per_pair)
+                            return (
+                                row // group_rows_per_pair * tokens_per_pair
+                                + data_group * group_rows_per_pair
+                                + row % group_rows_per_pair
+                            )
 
                         group_handoff = pl.ds(0, group_rows)
                         mla_dcp_shards(
@@ -8205,10 +9224,19 @@ def stack(
                             streams=mla_streams,
                             communication_workspace=communication_workspace,
                             dcp=(
-                                mla_dcp.DcpCache(pool_ref, table_ref, paged_pages, state_index,
-                                                 owner=(None if dcp_owner_table is None
-                                                        else mla_dcp.owner_index(dcp_owner_table) % mla_dcp.GROUP),
-                                                 table_row=group_table_row),
+                                mla_dcp.DcpCache(
+                                    pool_ref,
+                                    table_ref,
+                                    paged_pages,
+                                    state_index,
+                                    owner=(
+                                        None
+                                        if dcp_owner_table is None
+                                        else mla_dcp.owner_index(dcp_owner_table)
+                                        % mla_dcp.GROUP
+                                    ),
+                                    table_row=group_table_row,
+                                ),
                                 mla_dcp.DcpWorkspace(*dcp_persistent, *dcp_scoped),
                             ),
                             epsilon=eps,
@@ -8222,9 +9250,17 @@ def stack(
                             new_key_vmem,
                             new_value_vmem,
                             dcp=(
-                                mla_dcp.DcpCache(pool_ref, table_ref, paged_pages, state_index,
-                                                 owner=(None if dcp_owner_table is None
-                                                        else mla_dcp.owner_index(dcp_owner_table))),
+                                mla_dcp.DcpCache(
+                                    pool_ref,
+                                    table_ref,
+                                    paged_pages,
+                                    state_index,
+                                    owner=(
+                                        None
+                                        if dcp_owner_table is None
+                                        else mla_dcp.owner_index(dcp_owner_table)
+                                    ),
+                                ),
                                 mla_dcp.DcpWorkspace(*dcp_persistent, *dcp_scoped),
                             ),
                             dsa=indexer,
@@ -8232,14 +9268,19 @@ def stack(
                         )
 
                     commit_scope = _phase_start("q8_mla_commit")
+
                     # The pool stays read-only: hand this layer's new rows out.
                     def hand_out_rows(semaphores):
                         copies = (
                             tpu.make_async_copy(
-                                new_key_vmem, key_output_ref.at[:, state_index], semaphores.at[0]
+                                new_key_vmem,
+                                key_output_ref.at[:, state_index],
+                                semaphores.at[0],
                             ),
                             tpu.make_async_copy(
-                                new_value_vmem, value_output_ref.at[:, state_index], semaphores.at[1]
+                                new_value_vmem,
+                                value_output_ref.at[:, state_index],
+                                semaphores.at[1],
                             ),
                         )
                         for copy in copies:
@@ -8277,6 +9318,7 @@ def stack(
                         def consume():
                             run()
                             pool.release("attention")
+
                         return consume
 
                     # KDA frees its consumed prefix before the output projection;
@@ -8294,7 +9336,9 @@ def stack(
                         run_latent_attention,
                         run_delta_attention,
                     )
-            if pool is not None and not (attention_dp > 1 and attention_schedule == "overlap"):
+            if pool is not None and not (
+                attention_dp > 1 and attention_schedule == "overlap"
+            ):
                 pool.release("attention")
             post_scope = _phase_start("q9_post_mix")
             with _phase("q9a_post_norm_wait"):
@@ -8303,8 +9347,10 @@ def stack(
             if attention_dp_ownership:
                 with _phase("q9b_post_rows"):
                     mix_dp_rows(
-                        mlp_residual_vmem, layer_index // 12 + 1,
-                        layer_index=layer_index, attention_output=True,
+                        mlp_residual_vmem,
+                        layer_index // 12 + 1,
+                        layer_index=layer_index,
+                        attention_output=True,
                     )
                 normalize_dp_rows(ffn_norm_vmem, split=sp8_residual)
                 _phase_end(post_scope)
@@ -8329,20 +9375,22 @@ def stack(
                 if owned_rows == 1:
                     prefix_values = prefix_vmem[...]
                 for owner_pair in owner_indices(pair):
+
                     @owner_when(pair, owner_pair)
                     def prepare_owned_rows(owner_pair=owner_pair):
                         attention_rows = (
                             owned_attention_vmem
                             if pair_split == 1
                             else owned_attention_vmem.at[
-                                pl.ds(owner_start((owner_pair % pair_split) * owned_rows), owned_rows)
+                                pl.ds(
+                                    owner_start((owner_pair % pair_split) * owned_rows),
+                                    owned_rows,
+                                )
                             ]
                         )
                         row_offset = owner_pair * owned_rows
                         if owned_rows == 1:
-                            prefix_rows = prefix_values[
-                                owner_pair : owner_pair + 1
-                            ]
+                            prefix_rows = prefix_values[owner_pair : owner_pair + 1]
                         else:
                             row_slice = pl.ds(owner_start(row_offset), owned_rows)
                             prefix_rows = prefix_vmem[row_slice]
@@ -8362,6 +9410,7 @@ def stack(
                             )
                         else:
                             prefix_vmem[row_slice] = updated_prefix
+
                         def mix_row(local_row):
                             global_row = row_offset + local_row
                             return _residual_mixture_row(
@@ -8370,7 +9419,9 @@ def stack(
                                     updated_prefix[local_row : local_row + 1]
                                     if owned_rows <= 2
                                     # stored above; re-read inside the row region
-                                    else owner_prefix_row(global_row, row_slice, local_row)
+                                    else owner_prefix_row(
+                                        global_row, row_slice, local_row
+                                    )
                                 ),
                                 mlp_residual_vmem,
                                 layer_index // 12 + 1,
@@ -8382,6 +9433,7 @@ def stack(
 
                         with _phase("q9b_post_rows"):
                             store_mixed_rows(mix_row, owned_normalized_vmem)
+
                 normalize(owned_normalized_vmem, ffn_norm_vmem)
                 _phase_end(post_scope)
                 t10 = _phase_start("t10_moe_input_gather")
@@ -8412,6 +9464,7 @@ def stack(
 
             def after_experts():
                 if persist_kda_state:
+
                     @pl.when((layer_index % 4 != 3) & (layer_index != 92))
                     def drain_state_writes():
                         state_index = layer_index - layer_index // 4
@@ -8484,11 +9537,15 @@ def stack(
                 layer_router_vmem, layer_expert_vmem = router_vmem, expert_views()
                 after_routing_scores = None
                 if pool is not None:
-                    layer_router_vmem = arena_router(pool.acquire("router"))  # moe waits
+                    layer_router_vmem = arena_router(
+                        pool.acquire("router")
+                    )  # moe waits
                     # The expert slots may overlap the router: its scores are
                     # computed before the first expert copy starts.
                     layer_expert_vmem = expert_views(
-                        pool.allocate("experts", expert_pool_bytes, replaces=("router",))
+                        pool.allocate(
+                            "experts", expert_pool_bytes, replaces=("router",)
+                        )
                     )
 
                     def after_routing_scores():
@@ -8496,7 +9553,9 @@ def stack(
                         pool.acquire("experts")
 
                 if alias_expert_scales:
-                    gate_up_vmem, gate_up_scales_vmem, down_vmem, down_scales_vmem = layer_expert_vmem
+                    gate_up_vmem, gate_up_scales_vmem, down_vmem, down_scales_vmem = (
+                        layer_expert_vmem
+                    )
                     workspace_resources = resources[3:]
                 else:
                     gate_up_vmem, down_vmem = layer_expert_vmem
@@ -8541,8 +9600,14 @@ def stack(
                     ),
                     after_experts=after_experts,
                     after_routing_scores=after_routing_scores,
-                    overlap_router_latent=(attention_dp == 2 and batch_size == 128 and sequence_rows == 1),
-                    overlap_shared_reduction=(attention_dp == 2 and batch_size in (64, 128) and sequence_rows == 1),
+                    overlap_router_latent=(
+                        attention_dp == 2 and batch_size == 128 and sequence_rows == 1
+                    ),
+                    overlap_shared_reduction=(
+                        attention_dp == 2
+                        and batch_size in (64, 128)
+                        and sequence_rows == 1
+                    ),
                     token_scatter_output=moe_token_scatter_output,
                     routed_reduce_scatter=moe_routed_reduce_scatter,
                     token_pipeline=moe_token_pipeline,
@@ -8582,10 +9647,15 @@ def stack(
                 assert gu_ref.shape == (gu_blocks * k_block, gu_width)
                 assert down_ref.shape == (down_blocks * down_block, hidden_size)
                 assert gu_width == 2 * down_blocks * down_block
-                slab_rows = max(
-                    pool_alias.storage_size((k_block, gu_width), gu_ref.dtype),
-                    pool_alias.storage_size((down_block, hidden_size), down_ref.dtype),
-                ) // 128
+                slab_rows = (
+                    max(
+                        pool_alias.storage_size((k_block, gu_width), gu_ref.dtype),
+                        pool_alias.storage_size(
+                            (down_block, hidden_size), down_ref.dtype
+                        ),
+                    )
+                    // 128
+                )
                 slabs = dense_slabs
                 assert slabs * slab_rows <= projection_expert_pool_vmem.shape[0]
                 total = gu_blocks + down_blocks
@@ -8597,7 +9667,11 @@ def stack(
                 def slab(index, shape, dtype):
                     return pool_alias.view(
                         projection_expert_pool_vmem.at[
-                            pl.ds(slab_base + index * slab_rows, pool_alias.storage_size(shape, dtype) // 128), :
+                            pl.ds(
+                                slab_base + index * slab_rows,
+                                pool_alias.storage_size(shape, dtype) // 128,
+                            ),
+                            :,
                         ],
                         shape,
                         dtype,
@@ -8640,7 +9714,9 @@ def stack(
                                 else:
                                     projection_vmem[...] += part
                             else:
-                                projection = part if projection is None else projection + part
+                                projection = (
+                                    part if projection is None else projection + part
+                                )
                             if k == gu_blocks - 1:
                                 if projection_vmem is not None:
                                     projection = projection_vmem[...]
@@ -8651,7 +9727,9 @@ def stack(
                                     projection[:, half:].astype(jnp.bfloat16),
                                 )
                                 if projection_vmem is not None:
-                                    projection_vmem[:, :half] = activation.astype(jnp.float32)
+                                    projection_vmem[:, :half] = activation.astype(
+                                        jnp.float32
+                                    )
                         else:
                             r = k - gu_blocks
                             if projection_vmem is not None:
@@ -8659,7 +9737,9 @@ def stack(
                                     :, r * down_block : (r + 1) * down_block
                                 ].astype(activation.dtype)
                             else:
-                                activation_block = activation[:, r * down_block : (r + 1) * down_block]
+                                activation_block = activation[
+                                    :, r * down_block : (r + 1) * down_block
+                                ]
                             part = _dot(
                                 activation_block,
                                 slab(s, (down_block, hidden_size), down_ref.dtype)[...],
@@ -8670,7 +9750,9 @@ def stack(
                                 else:
                                     accumulator_vmem[...] += part
                             else:
-                                accumulator = part if accumulator is None else accumulator + part
+                                accumulator = (
+                                    part if accumulator is None else accumulator + part
+                                )
                         if k + slabs < total:
                             block_copy(k + slabs).start()
                     return accumulator
@@ -8690,6 +9772,7 @@ def stack(
                 if pool is not None:
                     pool.release("dense")
                 after_experts()
+
                 def reduce_half(first):
                     if first:
                         # Both halves reuse the transport buffers; a peer may
@@ -8703,32 +9786,47 @@ def stack(
                         communication_workspace.receive_semaphores,
                     )
 
-                if (moe_token_scatter_output and attention_dp == 2
-                        and sp_owners == 4 and batch_size in (64, 128) and sequence_rows == 1):
-                    _dense_scatter_rows(accumulator,owned_rows_vmem,
-                        communication_workspace.shared_local_reduction_vmem,
-                        communication_workspace.shared_host_reduction_vmem,
-                        communication_workspace.send_semaphores,
-                        communication_workspace.receive_semaphores,sp_owners)
-                else:
-                    reduced = jnp.concatenate(
-                        [reduce_half(first) for first in range(0, batch_size, 8)],
-                        axis=0,
-                    ) if batch_size > 8 else _all_reduce_rows(
+                if (
+                    moe_token_scatter_output
+                    and attention_dp == 2
+                    and sp_owners == 4
+                    and batch_size in (64, 128)
+                    and sequence_rows == 1
+                ):
+                    _dense_scatter_rows(
                         accumulator,
+                        owned_rows_vmem,
                         communication_workspace.shared_local_reduction_vmem,
                         communication_workspace.shared_host_reduction_vmem,
                         communication_workspace.send_semaphores,
                         communication_workspace.receive_semaphores,
+                        sp_owners,
+                    )
+                else:
+                    reduced = (
+                        jnp.concatenate(
+                            [reduce_half(first) for first in range(0, batch_size, 8)],
+                            axis=0,
+                        )
+                        if batch_size > 8
+                        else _all_reduce_rows(
+                            accumulator,
+                            communication_workspace.shared_local_reduction_vmem,
+                            communication_workspace.shared_host_reduction_vmem,
+                            communication_workspace.send_semaphores,
+                            communication_workspace.receive_semaphores,
+                        )
                     )
                     if moe_token_scatter_output:
                         rank = jax.lax.axis_index("tp")
                         pair = (rank % 8) // (8 // sp_owners)
                         for owner_pair in range(sp_owners):
+
                             @pl.when(pair == owner_pair)
                             def store_owned_dense_rows():
                                 owned_rows_vmem[...] = reduced[
-                                    owner_pair * owned_rows : (owner_pair + 1) * owned_rows
+                                    owner_pair * owned_rows : (owner_pair + 1)
+                                    * owned_rows
                                 ].astype(jnp.bfloat16)
                     else:
                         mixture_vmem[...] = reduced.astype(jnp.bfloat16)
@@ -8751,7 +9849,9 @@ def stack(
                 for data_group in range(1, attention_dp if sp_owners > 1 else 1):
                     first = data_group * group_rows_per_pair
                     mixture = jnp.where(
-                        group == data_group, owned_rows_vmem[first : first + group_rows_per_pair], mixture
+                        group == data_group,
+                        owned_rows_vmem[first : first + group_rows_per_pair],
+                        mixture,
                     )
                 finished = (prefix_vmem[:dp_held_rows] + mixture).astype(jnp.bfloat16)
                 prefix_vmem[:dp_held_rows] = finished
@@ -8768,21 +9868,18 @@ def stack(
                     if not moe_token_scatter_output:
                         mixture_values = mixture_vmem[...]
                 for owner_pair in owner_indices(pair):
+
                     @owner_when(pair, owner_pair)
                     def finish_owned_rows():
                         row_offset = owner_pair * owned_rows
                         if owned_rows == 1:
                             finished_prefix = (
-                                prefix_values[
-                                    owner_pair : owner_pair + 1
-                                ]
+                                prefix_values[owner_pair : owner_pair + 1]
                                 + (
                                     # The MoE delivered this owner's row.
                                     scattered_mixture
                                     if moe_token_scatter_output
-                                    else mixture_values[
-                                        owner_pair : owner_pair + 1
-                                    ]
+                                    else mixture_values[owner_pair : owner_pair + 1]
                                 )
                             ).astype(jnp.bfloat16)
                         else:
@@ -8795,14 +9892,16 @@ def stack(
                                     else mixture_vmem[row_slice]
                                 )
                             ).astype(jnp.bfloat16)
-                        owned_prefix_vmem[:, : hidden_size // 2] = (
-                            finished_prefix[:, : hidden_size // 2]
-                        )
-                        owned_prefix_vmem[:, hidden_size // 2 :] = (
-                            finished_prefix[:, hidden_size // 2 :]
-                        )
+                        owned_prefix_vmem[:, : hidden_size // 2] = finished_prefix[
+                            :, : hidden_size // 2
+                        ]
+                        owned_prefix_vmem[:, hidden_size // 2 :] = finished_prefix[
+                            :, hidden_size // 2 :
+                        ]
+
                 if sequence_parallel_pre_attention:
                     for owner_pair in owner_indices(pair):
+
                         @owner_when(pair, owner_pair)
                         def store_owned_prefix_rows():
                             row_offset = owner_pair * owned_rows
@@ -8857,17 +9956,23 @@ def stack(
 
             if attention_dp_ownership:
                 final_block_count = (layers - 1) // 12 + 1
+
                 def mix_row(row):
                     values = jnp.concatenate(
-                        (block_rows(row, final_block_count), prefix_vmem[row : row + 1]),
+                        (
+                            block_rows(row, final_block_count),
+                            prefix_vmem[row : row + 1],
+                        ),
                         axis=0,
                     ).astype(jnp.float32)
                     scores = jnp.sum(values * attention_residual_vmem[0], axis=1)
                     scores *= jax.lax.rsqrt(jnp.mean(values * values, axis=1) + eps)
                     return jnp.sum(
                         jax.nn.softmax(scores)[:, None] * values,
-                        axis=0, keepdims=True,
+                        axis=0,
+                        keepdims=True,
                     ).astype(jnp.bfloat16)
+
                 store_mixed_rows(mix_row, dp_owned_vmem)
                 normalize_dp_rows(attention_norm_vmem)
                 gather_dp_rows(normalized_vmem)
@@ -8876,6 +9981,7 @@ def stack(
                 pair = (rank % 8) // (8 // sp_owners)
                 final_block_count = (layers - 1) // 12 + 1
                 for owner_pair in owner_indices(pair):
+
                     @owner_when(pair, owner_pair)
                     def finish_owned_decoder_rows():
                         row_offset = owner_pair * owned_rows
@@ -8885,7 +9991,10 @@ def stack(
                             global_row = row_offset + local_row
                             values = jnp.concatenate(
                                 (
-                                    block_rows(owner_block_row(global_row, local_row), final_block_count),
+                                    block_rows(
+                                        owner_block_row(global_row, local_row),
+                                        final_block_count,
+                                    ),
                                     owner_prefix_row(global_row, row_slice, local_row),
                                 ),
                                 axis=0,
@@ -8903,6 +10012,7 @@ def stack(
                             ).astype(jnp.bfloat16)
 
                         store_mixed_rows(mix_row, owned_rows_vmem)
+
                 normalize(owned_rows_vmem, attention_norm_vmem)
                 _gather_local_pair_rows(
                     owned_rows_vmem,
@@ -8912,16 +10022,16 @@ def stack(
                     communication_workspace.shared_local_reduction_vmem,
                     owners=sp_owners,
                 )
+
             def store_output(semaphore):
                 copy = tpu.make_async_copy(normalized_vmem, output_ref, semaphore)
                 copy.start()
                 copy.wait()
 
             pl.run_scoped(store_output, tpu.SemaphoreType.DMA)
-            blocks_output_ref[...] = jnp.zeros(
-                blocks_output_ref.shape, jnp.uint8
-            )
+            blocks_output_ref[...] = jnp.zeros(blocks_output_ref.shape, jnp.uint8)
         else:
+
             def store_output(semaphore):
                 copy = tpu.make_async_copy(prefix_vmem, output_ref, semaphore)
                 copy.start()
@@ -8947,17 +10057,19 @@ def stack(
     state_output_shapes = (
         jax.ShapeDtypeStruct((batch_size, *states[0].shape[1:]), states[0].dtype),
         jax.ShapeDtypeStruct((batch_size, *states[1].shape[1:]), states[1].dtype),
-        jax.ShapeDtypeStruct((batch_size, MLA_LAYERS, cache_handoff_head_count, 256), jnp.bfloat16),
-        jax.ShapeDtypeStruct((batch_size, MLA_LAYERS, cache_handoff_head_count, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct(
+            (batch_size, MLA_LAYERS, cache_handoff_head_count, 256), jnp.bfloat16
+        ),
+        jax.ShapeDtypeStruct(
+            (batch_size, MLA_LAYERS, cache_handoff_head_count, 128), jnp.bfloat16
+        ),
     )
     output_shapes = (
         shape(prefix),
         (
             jax.ShapeDtypeStruct((8, 128), jnp.uint8)
             if sequence_parallel_pre_attention
-            else jax.ShapeDtypeStruct(
-                (batch_size, 8, hidden_size), jnp.bfloat16
-            )
+            else jax.ShapeDtypeStruct((batch_size, 8, hidden_size), jnp.bfloat16)
         ),
         *state_output_shapes,
         jax.ShapeDtypeStruct(
@@ -8967,8 +10079,12 @@ def stack(
             (
                 # Each row's new index-key record per MLA layer (the commit's),
                 # and the selection's keys scratch (unused by the caller).
-                jax.ShapeDtypeStruct((batch_size, MLA_LAYERS, *dsa_decode.RECORD_SHAPE), jnp.int32),
-                jax.ShapeDtypeStruct((batch_size, dsa_key_rows, dsa_dcp.LANES), jnp.int32),
+                jax.ShapeDtypeStruct(
+                    (batch_size, MLA_LAYERS, *dsa_decode.RECORD_SHAPE), jnp.int32
+                ),
+                jax.ShapeDtypeStruct(
+                    (batch_size, dsa_key_rows, dsa_dcp.LANES), jnp.int32
+                ),
             )
             if dsa
             else ()
@@ -8989,22 +10105,29 @@ def stack(
     dense_slabs = 4 if batch_size <= 64 else 3
     dense_slab_bytes = (
         max(
-            pool_alias.storage_size((1024, weights["dense_gu"].shape[1]), weights["dense_gu"].dtype),
+            pool_alias.storage_size(
+                (1024, weights["dense_gu"].shape[1]), weights["dense_gu"].dtype
+            ),
             pool_alias.storage_size((384, hidden_size), weights["dense_down"].dtype),
         )
         if include_layer_zero
         else 0
     )
     pool_layout = _pool_layout(
-        pool_weights, alias_expert_scales=alias_expert_scales, pooled=POOLED_WEIGHTS,
-        managed=pool_managed, dense_bytes=dense_slabs * dense_slab_bytes,
+        pool_weights,
+        alias_expert_scales=alias_expert_scales,
+        pooled=POOLED_WEIGHTS,
+        managed=pool_managed,
+        dense_bytes=dense_slabs * dense_slab_bytes,
     )
     pool_bytes = pool_layout["pool_bytes"]
     if _config().vmem_report:
+
         def _mib(name, experts=False):
             value = pool_weights[name]
             shape = (4, *value.shape[1:]) if experts else value.shape
             return pool_alias.storage_size(shape, value.dtype) / 2**20
+
         region_a = {
             "kda": sum(_mib(n) for n in KDA[:4]),
             "mla": sum(_mib(n) for n in MLA[:2]),
@@ -9015,17 +10138,33 @@ def stack(
             "moe_prepare": sum(_mib(n) for n in MOE_PREPARE_WEIGHTS),
             "latent_up": _mib("latent_up"),
         }
-        print("pool region A (MiB):", {k: round(v, 2) for k, v in region_a.items()}, flush=True)
+        print(
+            "pool region A (MiB):",
+            {k: round(v, 2) for k, v in region_a.items()},
+            flush=True,
+        )
         if pool_managed:
-            print(f"arena (managed region A): {pool_layout['arena_bytes'] / 2**20:.2f} MiB, "
-                  f"attention {pool_layout['attention_bytes'] / 2**20:.2f}, dense slabs "
-                  f"{dense_slabs * dense_slab_bytes / 2**20:.2f}", flush=True)
-        print("pool region B (MiB):", {k: round(v, 2) for k, v in region_b.items()},
-              {n: round(_mib(n), 2) for n in (*MLA_EXTRA_WEIGHTS, *MOE_PREPARE_WEIGHTS, "latent_up")}, flush=True)
+            print(
+                f"arena (managed region A): {pool_layout['arena_bytes'] / 2**20:.2f} MiB, "
+                f"attention {pool_layout['attention_bytes'] / 2**20:.2f}, dense slabs "
+                f"{dense_slabs * dense_slab_bytes / 2**20:.2f}",
+                flush=True,
+            )
+        print(
+            "pool region B (MiB):",
+            {k: round(v, 2) for k, v in region_b.items()},
+            {
+                n: round(_mib(n), 2)
+                for n in (*MLA_EXTRA_WEIGHTS, *MOE_PREPARE_WEIGHTS, "latent_up")
+            },
+            flush=True,
+        )
     assert pool_bytes >= expert_pool_bytes and pool_bytes % 128 == 0
     scratch = (
         tpu.VMEM(
-            (-(-block_rows_held // 16) * 16, hidden_size) if attention_dp_ownership else prefix.shape,
+            (-(-block_rows_held // 16) * 16, hidden_size)
+            if attention_dp_ownership
+            else prefix.shape,
             jnp.bfloat16,
         ),
         # Residual snapshots are exact BF16 values. Up to B8: FP32
@@ -9033,14 +10172,19 @@ def stack(
         # owned rows miscompiles across loop iterations). Above B8 or with DP
         # row ownership: BF16, two rows per native (16, 128) tile.
         tpu.VMEM(
-            (-(-block_rows_held // 2), 16, hidden_size) if blocks_block_major else (batch_size, 8, hidden_size),
+            (-(-block_rows_held // 2), 16, hidden_size)
+            if blocks_block_major
+            else (batch_size, 8, hidden_size),
             jnp.bfloat16 if blocks_block_major else jnp.float32,
         ),
         tpu.VMEM(prefix.shape, jnp.bfloat16),
         *(
             (tpu.VMEM((16, 128), jnp.bfloat16), tpu.VMEM((16, 128), jnp.bfloat16))
             if compact_outputs
-            else (tpu.VMEM(prefix.shape, jnp.bfloat16), tpu.VMEM(prefix.shape, jnp.bfloat16))
+            else (
+                tpu.VMEM(prefix.shape, jnp.bfloat16),
+                tpu.VMEM(prefix.shape, jnp.bfloat16),
+            )
         ),
         *(tpu.VMEM((1, hidden_size), weights[name].dtype) for name in NORMS),
         # With the router in the arena this persistent slot is a stub.
@@ -9049,7 +10193,10 @@ def stack(
         tpu.VMEM((pool_bytes // 128, 128), jnp.uint8),
         tpu.SemaphoreType.DMA((6,)),
         tpu.SemaphoreType.DMA((4,)),
-        *(tpu.VMEM(local_weights[name].shape, local_weights[name].dtype) for name in KDA[4:]),
+        *(
+            tpu.VMEM(local_weights[name].shape, local_weights[name].dtype)
+            for name in KDA[4:]
+        ),
         *(
             (
                 tpu.VMEM((batch_size, *states[0].shape[2:]), states[0].dtype),
@@ -9068,9 +10215,7 @@ def stack(
         ),
         tpu.SemaphoreType.DMA((2, 4)),
         tpu.VMEM(
-            (owned_rows, hidden_size)
-            if attention_token_scatter
-            else (1,),
+            (owned_rows, hidden_size) if attention_token_scatter else (1,),
             jnp.bfloat16,
         ),
         tpu.SemaphoreType.DMA((1,)),
@@ -9091,8 +10236,12 @@ def stack(
             else ()
         ),
         # DCP: buffers group peers' remote copies land in.
-        *mla_dcp.persistent_scratch(group_rows, heads=3 * attention_dp,
-                                    cache_dtype=states[2].dtype, sequence_rows=sequence_rows),
+        *mla_dcp.persistent_scratch(
+            group_rows,
+            heads=3 * attention_dp,
+            cache_dtype=states[2].dtype,
+            sequence_rows=sequence_rows,
+        ),
         *(dsa_decode.persistent_scratch(batch_size) if dsa else ()),
         *communication_scratch(batch_size, attention_dp)[:-1],
         tpu.VMEM((batch_size, 4096), jnp.bfloat16),
@@ -9100,8 +10249,7 @@ def stack(
         *routed_send_scratch(batch_size),
         # Four 7168-element BF16 wires, padded to 64 BF16 transport rows.
         # Private storage (see B4_ATTENTION_GATHER).
-        *((tpu.VMEM((4, 32, 128), jnp.float32),)
-          if b4_attention_gather else ()),
+        *((tpu.VMEM((4, 32, 128), jnp.float32),) if b4_attention_gather else ()),
         # Diagnostic: vmem_pad_kb reserves unused VMEM to probe headroom.
         *(
             (tpu.VMEM((_config().vmem_pad_kb * 2, 128), jnp.float32),)
@@ -9110,22 +10258,53 @@ def stack(
         ),
     )
     scratch_names = (
-        "prefix", "blocks", "normalized", "attention", "mixture", *NORMS,
-        "router", "router_semaphores", "projection_expert_pool", "pool_semaphores",
-        "norm_semaphores", *KDA[4:], "kda_history", "kda_state", "auxiliary_semaphores",
-        "m_qnorm", "m_knorm", "router_bias", "latent_norm", "metadata_semaphores",
-        "owned_rows", "aux_semaphore", "dense_semaphores", "stream_semaphores",
+        "prefix",
+        "blocks",
+        "normalized",
+        "attention",
+        "mixture",
+        *NORMS,
+        "router",
+        "router_semaphores",
+        "projection_expert_pool",
+        "pool_semaphores",
+        "norm_semaphores",
+        *KDA[4:],
+        "kda_history",
+        "kda_state",
+        "auxiliary_semaphores",
+        "m_qnorm",
+        "m_knorm",
+        "router_bias",
+        "latent_norm",
+        "metadata_semaphores",
+        "owned_rows",
+        "aux_semaphore",
+        "dense_semaphores",
+        "stream_semaphores",
         *(
-            ("dp_group_input", "dp_attended", "dp_group_positions", "dp_query_latent", "dp_compressed")
+            (
+                "dp_group_input",
+                "dp_attended",
+                "dp_group_positions",
+                "dp_query_latent",
+                "dp_compressed",
+            )
             if attention_dp > 1
             else ()
         ),
         *mla_dcp.PERSISTENT_NAMES,
         *(dsa_decode.PERSISTENT_NAMES if dsa else ()),
         "shared_local_reduction",
-        "expert_local_reduction", "shared_host_reduction", "expert_host_reduction",
-        "attention_features", "attention_output", "send_semaphores",
-        "receive_semaphores", "reduction_phase", "latent_gather",
+        "expert_local_reduction",
+        "shared_host_reduction",
+        "expert_host_reduction",
+        "attention_features",
+        "attention_output",
+        "send_semaphores",
+        "receive_semaphores",
+        "reduction_phase",
+        "latent_gather",
         *(("projection_staging", "routed_send") if batch_size > 32 else ()),
         *(("attention_gather",) if b4_attention_gather else ()),
         "headroom_pad",
@@ -9137,20 +10316,34 @@ def stack(
     # Attention DP projects the group's rows (after the MLA workspace).
     projection_reduction = (
         "output-projection reduction",
-        tpu.VMEM((group_rows, 8192), jnp.float32) if attention_dp > 1
+        tpu.VMEM((group_rows, 8192), jnp.float32)
+        if attention_dp > 1
         else tpu.VMEM((batch_size, 3584 if batch_size > 32 else 8192), jnp.float32),
     )
     regions = {
         "MLA": (
             [
-                ("new-key handoff", tpu.VMEM((batch_size, cache_handoff_head_count, 256), jnp.bfloat16)),
-                ("new-value handoff", tpu.VMEM((batch_size, cache_handoff_head_count, 128), jnp.bfloat16)),
+                (
+                    "new-key handoff",
+                    tpu.VMEM((batch_size, cache_handoff_head_count, 256), jnp.bfloat16),
+                ),
+                (
+                    "new-value handoff",
+                    tpu.VMEM((batch_size, cache_handoff_head_count, 128), jnp.bfloat16),
+                ),
                 *zip(
                     (
                         *(() if POOLED_WEIGHTS else MLA[2:6]),
-                        "key cache tiles", "value cache tiles", "cache semaphores",
-                        "query", "output gate values", "new key", "new value",
-                        "softmax maximum", "softmax denominator", "accumulator",
+                        "key cache tiles",
+                        "value cache tiles",
+                        "cache semaphores",
+                        "query",
+                        "output gate values",
+                        "new key",
+                        "new value",
+                        "softmax maximum",
+                        "softmax denominator",
+                        "accumulator",
                         *mla_dcp.SCOPED_NAMES,
                         *(f"dsa {name}" for name in dsa_scoped),
                     ),
@@ -9168,48 +10361,104 @@ def stack(
             []
             if persist_kda_state
             else [
-                ("kda history chunks", tpu.VMEM((3, kda_row_chunk, *states[0].shape[2:]), states[0].dtype)),
-                ("kda state chunks", tpu.VMEM((3, kda_row_chunk, *states[1].shape[2:]), states[1].dtype)),
+                (
+                    "kda history chunks",
+                    tpu.VMEM((3, kda_row_chunk, *states[0].shape[2:]), states[0].dtype),
+                ),
+                (
+                    "kda state chunks",
+                    tpu.VMEM((3, kda_row_chunk, *states[1].shape[2:]), states[1].dtype),
+                ),
             ]
             if stream_kda_state
             else [
-                ("kda history", tpu.VMEM((batch_size, *states[0].shape[2:]), states[0].dtype)),
-                ("kda state", tpu.VMEM((batch_size, *states[1].shape[2:]), states[1].dtype)),
+                (
+                    "kda history",
+                    tpu.VMEM((batch_size, *states[0].shape[2:]), states[0].dtype),
+                ),
+                (
+                    "kda state",
+                    tpu.VMEM((batch_size, *states[1].shape[2:]), states[1].dtype),
+                ),
             ],
-            [[
-                projection_reduction,
-                *(
-                    (
-                        ("DP staged projection", tpu.VMEM((group_rows // kda_row_chunk, kda_row_chunk, 1664), jnp.bfloat16)),
-                        ("DP staged recurrence gate", tpu.VMEM((group_rows // kda_row_chunk, kda_row_chunk, 384), jnp.bfloat16)),
-                        ("DP staged output gate", tpu.VMEM((group_rows, 384), jnp.bfloat16)),
-                    )
-                    if attention_dp > 1 and attention_schedule in ("auto", "overlap") and group_rows > 8
-                    else ()
-                ),
-                *(
-                    (("chunked attended", tpu.VMEM((batch_size, 3, 128), jnp.float32)),)
-                    if batch_size > 8
-                    else ()
-                ),
-            ]],
+            [
+                [
+                    projection_reduction,
+                    *(
+                        (
+                            (
+                                "DP staged projection",
+                                tpu.VMEM(
+                                    (group_rows // kda_row_chunk, kda_row_chunk, 1664),
+                                    jnp.bfloat16,
+                                ),
+                            ),
+                            (
+                                "DP staged recurrence gate",
+                                tpu.VMEM(
+                                    (group_rows // kda_row_chunk, kda_row_chunk, 384),
+                                    jnp.bfloat16,
+                                ),
+                            ),
+                            (
+                                "DP staged output gate",
+                                tpu.VMEM((group_rows, 384), jnp.bfloat16),
+                            ),
+                        )
+                        if attention_dp > 1
+                        and attention_schedule in ("auto", "overlap")
+                        and group_rows > 8
+                        else ()
+                    ),
+                    *(
+                        (
+                            (
+                                "chunked attended",
+                                tpu.VMEM((batch_size, 3, 128), jnp.float32),
+                            ),
+                        )
+                        if batch_size > 8
+                        else ()
+                    ),
+                ]
+            ],
         ),
         "MoE": (
             list(
                 zip(
                     (
                         *(() if POOLED_WEIGHTS else ("latent_up",)),
-                        "latent-up semaphore", "expert semaphores",
-                        *(() if alias_expert_scales else ("gate/up scale slots", "down scale slots")),
-                        "selected experts", "selected probabilities", "local route counts",
-                        "probability totals", "routing scores", "shared outputs",
-                        "routed outputs", "gate/up accumulator", "down accumulator",
-                        "processed routes", "compact source 1", "compact source 2",
-                        "shared send semaphores", "shared receive semaphores",
-                        "output transport", "output send semaphores",
-                        "output receive semaphores", "latent send semaphores",
+                        "latent-up semaphore",
+                        "expert semaphores",
+                        *(
+                            ()
+                            if alias_expert_scales
+                            else ("gate/up scale slots", "down scale slots")
+                        ),
+                        "selected experts",
+                        "selected probabilities",
+                        "local route counts",
+                        "probability totals",
+                        "routing scores",
+                        "shared outputs",
+                        "routed outputs",
+                        "gate/up accumulator",
+                        "down accumulator",
+                        "processed routes",
+                        "compact source 1",
+                        "compact source 2",
+                        "shared send semaphores",
+                        "shared receive semaphores",
+                        "output transport",
+                        "output send semaphores",
+                        "output receive semaphores",
+                        "latent send semaphores",
                         "latent receive semaphores",
-                        *(("routing selection source", "routing selections") if shard_routing else ()),
+                        *(
+                            ("routing selection source", "routing selections")
+                            if shard_routing
+                            else ()
+                        ),
                     ),
                     moe_scoped_scratch,
                     strict=True,
@@ -9217,16 +10466,24 @@ def stack(
             ),
             []
             if POOLED_WEIGHTS
-            else [[
-                (name, tpu.VMEM(local_weights[name].shape, local_weights[name].dtype))
-                for name in MOE_PREPARE_WEIGHTS
-            ]],
+            else [
+                [
+                    (
+                        name,
+                        tpu.VMEM(local_weights[name].shape, local_weights[name].dtype),
+                    )
+                    for name in MOE_PREPARE_WEIGHTS
+                ]
+            ],
         ),
     }
     if include_layer_zero and batch_size > 8:
         regions["dense layer 0"] = (
             [
-                ("gate/up accumulator", tpu.VMEM((batch_size, weights["dense_gu"].shape[1]), jnp.float32)),
+                (
+                    "gate/up accumulator",
+                    tpu.VMEM((batch_size, weights["dense_gu"].shape[1]), jnp.float32),
+                ),
                 ("down accumulator", tpu.VMEM((batch_size, hidden_size), jnp.float32)),
             ],
             [],
@@ -9241,13 +10498,19 @@ def stack(
             (1, hidden_size, 512), jnp.dtype(jnp.bfloat16)
         )
         shortfall = max(0, -(-(demand - pool_layout["arena_bytes"]) // 4096) * 4096)
-        available = (VMEM_LIMIT_BYTES - VMEM_SPILL_RESERVE_BYTES - vmem_peak) // 4096 * 4096
+        available = (
+            (VMEM_LIMIT_BYTES - VMEM_SPILL_RESERVE_BYTES - vmem_peak) // 4096 * 4096
+        )
         # B128's register spills exceed the reserve: its arena does not grow.
         spare = shortfall if shortfall <= available and batch_size < 128 else 0
         if spare > 0:
             pool_layout = _pool_layout(
-                pool_weights, alias_expert_scales=alias_expert_scales, pooled=POOLED_WEIGHTS,
-                managed=True, dense_bytes=dense_slabs * dense_slab_bytes, arena_extra=spare,
+                pool_weights,
+                alias_expert_scales=alias_expert_scales,
+                pooled=POOLED_WEIGHTS,
+                managed=True,
+                dense_bytes=dense_slabs * dense_slab_bytes,
+                arena_extra=spare,
             )
             pool_bytes = pool_layout["pool_bytes"]
             pool_spec = tpu.VMEM((pool_bytes // 128, 128), jnp.uint8)
@@ -9259,11 +10522,16 @@ def stack(
             ]
             vmem_report, vmem_peak = _vmem_budget(persistent, regions)
         if _config().vmem_report:
-            print(f"arena with spare VMEM: {pool_layout['arena_bytes'] / 2**20:.2f} MiB", flush=True)
+            print(
+                f"arena with spare VMEM: {pool_layout['arena_bytes'] / 2**20:.2f} MiB",
+                flush=True,
+            )
     if _config().vmem_report:
         print(f"VMEM plan, batch {batch_size}:\n{vmem_report}", flush=True)
     if vmem_peak > VMEM_LIMIT_BYTES:
-        raise ValueError(f"The decoder's static VMEM plan exceeds the limit:\n{vmem_report}")
+        raise ValueError(
+            f"The decoder's static VMEM plan exceeds the limit:\n{vmem_report}"
+        )
     if vmem_peak + VMEM_SPILL_RESERVE_BYTES > VMEM_LIMIT_BYTES:
         import warnings
 
@@ -9278,9 +10546,7 @@ def stack(
         input_output_aliases={},
         grid_spec=tpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3 + int(slot_reads) + int(live_rows is not None),
-            in_specs=[
-                pl.BlockSpec(memory_space=tpu.HBM) for _ in range(len(args))
-            ],
+            in_specs=[pl.BlockSpec(memory_space=tpu.HBM) for _ in range(len(args))],
             out_specs=[
                 pl.BlockSpec(memory_space=tpu.HBM),
                 pl.BlockSpec(memory_space=tpu.VMEM),
@@ -9293,18 +10559,28 @@ def stack(
             vmem_limit_bytes=_config().vmem_limit_mb * 1024**2,
             disable_bounds_checks=not _config().bounds_checks,
             shape_invariant_numerics=True,
-            **({"internal_scratch_in_bytes": _config().internal_scratch_kb * 1024} if _config().internal_scratch_kb else {}),
+            **(
+                {"internal_scratch_in_bytes": _config().internal_scratch_kb * 1024}
+                if _config().internal_scratch_kb
+                else {}
+            ),
         ),
     )(
         positions,
         state_row_scalar,
         jnp.asarray(block_tables, jnp.int32).reshape(-1),
-        *((jnp.asarray(state_slots, jnp.int32).reshape(batch_size),) if slot_reads else ()),
-        *((jnp.asarray(live_rows, jnp.int32).reshape(batch_size),) if live_rows is not None else ()),
+        *(
+            (jnp.asarray(state_slots, jnp.int32).reshape(batch_size),)
+            if slot_reads
+            else ()
+        ),
+        *(
+            (jnp.asarray(live_rows, jnp.int32).reshape(batch_size),)
+            if live_rows is not None
+            else ()
+        ),
         *args,
     )
-
-
 
 
 def decode_local(
@@ -9378,7 +10654,9 @@ def decode_local(
         # path at the ULP level.
         batched_decoder_boundaries = batch_size in SCATTER_BATCHES or attention_dp > 1
     if not 1 <= batch_size <= MAX_BATCH:
-        raise ValueError(f"The native decoder supports batch sizes from 1 to {MAX_BATCH}")
+        raise ValueError(
+            f"The native decoder supports batch sizes from 1 to {MAX_BATCH}"
+        )
     aux_hidden_layers = tuple(aux_hidden_layers)
 
     rank = jax.lax.axis_index("tp")
@@ -9386,9 +10664,7 @@ def decode_local(
 
     if batched_decoder_boundaries:
         local_ids = tokens - rank * vocabulary
-        local_embeddings = weights["embedding"][
-            jnp.clip(local_ids, 0, vocabulary - 1)
-        ]
+        local_embeddings = weights["embedding"][jnp.clip(local_ids, 0, vocabulary - 1)]
         embedding = kimi.tp_sum(
             jnp.where(
                 ((local_ids >= 0) & (local_ids < vocabulary))[:, None],
@@ -9401,9 +10677,9 @@ def decode_local(
         # Per-row embedding gather and TP sum (see batched_decoder_boundaries).
         def prepare_first_layer_row(_, token):
             local_id = token - rank * vocabulary
-            embedding_row = weights["embedding"][
-                jnp.clip(local_id, 0, vocabulary - 1)
-            ][None]
+            embedding_row = weights["embedding"][jnp.clip(local_id, 0, vocabulary - 1)][
+                None
+            ]
             embedding_row = kimi.tp_sum(
                 jnp.where(
                     (local_id >= 0) & (local_id < vocabulary),
@@ -9413,9 +10689,7 @@ def decode_local(
             ).astype(jnp.bfloat16)
             return (), embedding_row[0]
 
-        _, embedding = jax.lax.scan(
-            prepare_first_layer_row, (), tokens
-        )
+        _, embedding = jax.lax.scan(prepare_first_layer_row, (), tokens)
     if state_row is not None and sequence_rows != batch_size:
         raise ValueError("state_row needs one sequence per tile")
     # Layer zero runs inside the fused stack and starts from the embedding.
@@ -9431,57 +10705,54 @@ def decode_local(
         new_values,
         aux_hidden,
         *dsa_outputs,
-    ) = (
-        stack(
-            prefix,
-            embedding,
-            weights,
-            (
-                convolution_states,
-                recurrent_states,
-                *cache_states,
-            ),
-            positions,
-            batch_size=batch_size,
-            layers=layers,
-            eps=eps,
-            residual_reduction_order=residual_reduction_order,
-            mla_cache_batch_tile_size=mla_cache_batch_tile_size,
-            alias_expert_scales=alias_expert_scales,
-            attention_token_scatter=attention_token_scatter,
-            moe_token_scatter_output=moe_token_scatter_output,
-            moe_routed_reduce_scatter=moe_routed_reduce_scatter,
-            sequence_parallel_pre_attention=sequence_parallel_pre_attention,
-            gate_first_kda_projection=gate_first_kda_projection,
-            sequence_rows=sequence_rows,
-            aux_hidden_layers=aux_hidden_layers,
-            aux_capture=aux_capture,
-            include_layer_zero=True,
-            state_row=state_row,
-            attention_dp=attention_dp,
-            attention_schedule=attention_schedule,
-            attention_state_pipeline=attention_state_pipeline,
-            attention_dp_ownership=attention_dp_ownership,
-            attention_projection_schedule=attention_projection_schedule,
-            moe_token_pipeline=moe_token_pipeline,
-            dp_moe_gather=dp_moe_gather,
-            mla_commit_tile_size=mla_commit_tile_size,
-            sequence_parallel_size=sequence_parallel_size,
-            block_tables=block_tables,
-            dcp_pool_map=dcp_pool_map,
-            dcp_owner_table=dcp_owner_table,
-            state_slots=state_slots,
-            live_rows=live_rows,
-            index_pools=index_pools,
-            dsa_topk=dsa_topk,
-        )
+    ) = stack(
+        prefix,
+        embedding,
+        weights,
+        (
+            convolution_states,
+            recurrent_states,
+            *cache_states,
+        ),
+        positions,
+        batch_size=batch_size,
+        layers=layers,
+        eps=eps,
+        residual_reduction_order=residual_reduction_order,
+        mla_cache_batch_tile_size=mla_cache_batch_tile_size,
+        alias_expert_scales=alias_expert_scales,
+        attention_token_scatter=attention_token_scatter,
+        moe_token_scatter_output=moe_token_scatter_output,
+        moe_routed_reduce_scatter=moe_routed_reduce_scatter,
+        sequence_parallel_pre_attention=sequence_parallel_pre_attention,
+        gate_first_kda_projection=gate_first_kda_projection,
+        sequence_rows=sequence_rows,
+        aux_hidden_layers=aux_hidden_layers,
+        aux_capture=aux_capture,
+        include_layer_zero=True,
+        state_row=state_row,
+        attention_dp=attention_dp,
+        attention_schedule=attention_schedule,
+        attention_state_pipeline=attention_state_pipeline,
+        attention_dp_ownership=attention_dp_ownership,
+        attention_projection_schedule=attention_projection_schedule,
+        moe_token_pipeline=moe_token_pipeline,
+        dp_moe_gather=dp_moe_gather,
+        mla_commit_tile_size=mla_commit_tile_size,
+        sequence_parallel_size=sequence_parallel_size,
+        block_tables=block_tables,
+        dcp_pool_map=dcp_pool_map,
+        dcp_owner_table=dcp_owner_table,
+        state_slots=state_slots,
+        live_rows=live_rows,
+        index_pools=index_pools,
+        dsa_topk=dsa_topk,
     )
 
     if sequence_parallel_pre_attention and batched_decoder_boundaries:
-        logits = jnp.dot(
-            prefix, weights["lm_head"], preferred_element_type=jnp.float32
-        )
+        logits = jnp.dot(prefix, weights["lm_head"], preferred_element_type=jnp.float32)
     elif sequence_parallel_pre_attention:
+
         def project_decoder_row(_, hidden_row):
             logits_row = jnp.dot(
                 hidden_row[None],

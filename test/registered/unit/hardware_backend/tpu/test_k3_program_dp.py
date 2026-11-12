@@ -38,7 +38,9 @@ class TestDpPages(CustomTestCase):
             pages.table_row([2, 6], seq_len=dp.PAGE_TOKENS + 1, width=6)
 
 
-def _golden(seq_len, group, decode_pages, landing, prefill_rows, num_blocks=24, pages=16):
+def _golden(
+    seq_len, group, decode_pages, landing, prefill_rows, num_blocks=24, pages=16
+):
     """Place a sequence's chunks DCP32 on the prefill, transfer each decode
     rank's rows, swap, and read every chunk back through the DCP16 table."""
     plan = dp.DpPages(pages=pages, num_blocks=num_blocks)
@@ -59,7 +61,9 @@ def _golden(seq_len, group, decode_pages, landing, prefill_rows, num_blocks=24, 
     other = 1 - group
     for q in range(dp.GROUP_RANKS):
         for src, dst in zip(sources, destinations):
-            decode[group * dp.GROUP_RANKS + q, dst] = decode[other * dp.GROUP_RANKS + q, src]
+            decode[group * dp.GROUP_RANKS + q, dst] = decode[
+                other * dp.GROUP_RANKS + q, src
+            ]
     width = -(-seq_len // dp.GROUP_BLOCK_TOKENS) + 2
     table = plan.table_row(decode_pages, seq_len, width)
     for k in range(chunks):
@@ -67,7 +71,9 @@ def _golden(seq_len, group, decode_pages, landing, prefill_rows, num_blocks=24, 
         ident = int(table[b])
         assert ident // num_blocks == group, (k, ident)
         got = decode[group * dp.GROUP_RANKS + q, ident % num_blocks]
-        assert got == k, f"chunk {k}: group rank {q} block {b} row {ident % num_blocks} holds {got}"
+        assert got == k, (
+            f"chunk {k}: group rank {q} block {b} row {ident % num_blocks} holds {got}"
+        )
     for rank in range(RANKS):
         assert decode[rank, num_blocks - 1] == 10_000 + rank
 
@@ -148,7 +154,9 @@ class TestColocatedDp(CustomTestCase):
                 _apply_job(pools, job)
                 rows.extend("r", pages, total)
                 table = rows.table_row("r", total, width=16)
-                self.assertTrue(all(int(i) // self.N == group for i in table[table > 0]))
+                self.assertTrue(
+                    all(int(i) // self.N == group for i in table[table > 0])
+                )
 
                 def entry(k):  # DCP16 on the group: member k % 16, block k // 16
                     rank = group * dp.GROUP_RANKS + k % dp.GROUP_RANKS
@@ -159,11 +167,15 @@ class TestColocatedDp(CustomTestCase):
                     self.assertEqual(pools[rank].get(row), ("P", k), (k, rank, row))
                 for k in range(prompt // chunk, -(-total // chunk)):  # decode writes
                     rank, row = entry(k)
-                    pools[rank][row] = ("D", k) if k >= -(-prompt // chunk) else ("P", k)
+                    pools[rank][row] = (
+                        ("D", k) if k >= -(-prompt // chunk) else ("P", k)
+                    )
                 _apply_job(pools, rows.release("r"))
                 for k in range(-(-total // chunk)):  # the next prefill's DCP32 reads
                     kind = "P" if k < -(-prompt // chunk) else "D"
-                    self.assertEqual(pools[k % RANKS].get(pages[k // RANKS]), (kind, k), k)
+                    self.assertEqual(
+                        pools[k % RANKS].get(pages[k // RANKS]), (kind, k), k
+                    )
 
     def test_rows_groups_and_reuse(self):
         rows = self._rows(rows=4)
@@ -192,12 +204,23 @@ class TestDpGroupCap(CustomTestCase):
 
         from sglang_tpu.hooks.k3_program import dp_group_room
 
-        groups = {"r0": 0, "r1": 0, "r2": 1, "w0": 0, "w1": 1, "w2": 0, "w3": 1, "w4": None}
+        groups = {
+            "r0": 0,
+            "r1": 0,
+            "r2": 1,
+            "w0": 0,
+            "w1": 1,
+            "w2": 0,
+            "w3": 1,
+            "w4": None,
+        }
         req = {rid: SimpleNamespace(rid=rid) for rid in groups}
         running = [req[r] for r in ("r0", "r1", "r2")]
         waiting = [req[r] for r in ("w0", "w1", "w2", "w3", "w4")]
         take, held = dp_group_room(running, waiting, lambda r: groups[r.rid], cap=2)
-        self.assertEqual([r.rid for r in take], ["w1", "w4"])  # group 0 full; group 1 one more
+        self.assertEqual(
+            [r.rid for r in take], ["w1", "w4"]
+        )  # group 0 full; group 1 one more
         self.assertEqual([r.rid for r in held], ["w0", "w2", "w3"])
 
 
@@ -259,7 +282,9 @@ class TestDpAllocator(CustomTestCase):
         self._extend(alloc, 4 * self.PAGE)  # group 0 full
         self.assertEqual(alloc.free_in_group(0), 0)
         self.assertEqual(alloc.available_size(), 0)  # the fuller group bounds both
-        idle = self._allocator(pages=9)  # an odd last page: idle availability is all of it
+        idle = self._allocator(
+            pages=9
+        )  # an odd last page: idle availability is all of it
         self.assertEqual(idle.available_size(), 9 * self.PAGE)
         landing = alloc.alloc_landing(1, 2)
         self.assertEqual({alloc.group_of_page(int(p)) for p in landing}, {1})
@@ -322,7 +347,11 @@ class TestSwapOp(CustomTestCase):
         )
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
         result = subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=600
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=600,
         )
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
@@ -331,21 +360,27 @@ class TestDpHooks(CustomTestCase):
     PAGE = 16
 
     def setUp(self):
-        import torch
         from types import SimpleNamespace
+
+        import torch
 
         from sglang_tpu.k3_programs.sglang_dp_alloc import K3DpPagedAllocator
 
         self.kvcache = SimpleNamespace(plan=SimpleNamespace(num_blocks=40))
         self.alloc = K3DpPagedAllocator(
-            size=16 * self.PAGE, page_size=self.PAGE, dtype=torch.bfloat16,
-            device="cpu", kvcache=self.kvcache, need_sort=True,
+            size=16 * self.PAGE,
+            page_size=self.PAGE,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=self.kvcache,
+            need_sort=True,
         )
         self.queue = SimpleNamespace(token_to_kv_pool_allocator=self.alloc, tp_rank=0)
 
     def _prealloc(self, rid, tokens):
-        import torch
         from types import SimpleNamespace
+
+        import torch
 
         from sglang_tpu.hooks import k3_program as hooks
 
@@ -353,43 +388,61 @@ class TestDpHooks(CustomTestCase):
 
         def original(queue, req, *args, **kwargs):
             return self.alloc.alloc_extend(
-                prefix_lens=torch.tensor([0]), prefix_lens_cpu=torch.tensor([0]),
-                seq_lens=torch.tensor([tokens]), seq_lens_cpu=torch.tensor([tokens]),
-                last_loc=torch.tensor([-1]), extend_num_tokens=tokens,
+                prefix_lens=torch.tensor([0]),
+                prefix_lens_cpu=torch.tensor([0]),
+                seq_lens=torch.tensor([tokens]),
+                seq_lens_cpu=torch.tensor([tokens]),
+                last_loc=torch.tensor([-1]),
+                extend_num_tokens=tokens,
             )
 
         kv = hooks.k3_program_dp_prealloc(original, self.queue, req)
         return req, kv
 
     def test_a_prefix_hit_stays_in_its_group(self):
-        import torch
         from types import SimpleNamespace
+
+        import torch
 
         from sglang_tpu.hooks import k3_program as hooks
 
         first, kv = self._prealloc("a", 2 * self.PAGE)
         prefix_group = self.alloc.group_of_page(int(kv[0]) // self.PAGE)
-        self.alloc.assign("other", 1 - prefix_group)  # balance would pick the prefix's group anyway
+        self.alloc.assign(
+            "other", 1 - prefix_group
+        )  # balance would pick the prefix's group anyway
         self.alloc.assign("other2", 1 - prefix_group)  # now it would not
         req = SimpleNamespace(rid="b")
         prefix = kv[: self.PAGE]
 
         def original(queue, req, *args, **kwargs):
             return self.alloc.alloc_extend(
-                prefix_lens=torch.tensor([self.PAGE]), prefix_lens_cpu=torch.tensor([self.PAGE]),
-                seq_lens=torch.tensor([3 * self.PAGE]), seq_lens_cpu=torch.tensor([3 * self.PAGE]),
-                last_loc=torch.tensor([int(prefix[-1])]), extend_num_tokens=2 * self.PAGE,
+                prefix_lens=torch.tensor([self.PAGE]),
+                prefix_lens_cpu=torch.tensor([self.PAGE]),
+                seq_lens=torch.tensor([3 * self.PAGE]),
+                seq_lens_cpu=torch.tensor([3 * self.PAGE]),
+                last_loc=torch.tensor([int(prefix[-1])]),
+                extend_num_tokens=2 * self.PAGE,
             )
 
-        out = hooks.k3_program_dp_prealloc(original, self.queue, req, prefix, self.PAGE, self.PAGE)
+        out = hooks.k3_program_dp_prealloc(
+            original, self.queue, req, prefix, self.PAGE, self.PAGE
+        )
         self.assertEqual(self.alloc.request_group["b"], prefix_group)
-        self.assertEqual({self.alloc.group_of_page(int(x) // self.PAGE) for x in out.tolist()}, {prefix_group})
+        self.assertEqual(
+            {self.alloc.group_of_page(int(x) // self.PAGE) for x in out.tolist()},
+            {prefix_group},
+        )
         self.assertEqual(len(req._k3_dp_landing), 1)  # the two suffix pages only
-        self.assertEqual({self.alloc.group_of_page(int(p)) for p in req._k3_dp_landing}, {1 - prefix_group})
+        self.assertEqual(
+            {self.alloc.group_of_page(int(p)) for p in req._k3_dp_landing},
+            {1 - prefix_group},
+        )
 
     def test_prealloc_transfer_rows_and_release(self):
-        import numpy as np
         from types import SimpleNamespace
+
+        import numpy as np
 
         from sglang_tpu.hooks import k3_program as hooks
         from sglang_tpu.k3_programs import sglang_dp as dp
@@ -406,7 +459,10 @@ class TestDpHooks(CustomTestCase):
             self.queue.tp_rank = rank
             rows = hooks.k3_program_dp_transfer_rows(
                 lambda q, d, k, p: np.asarray(pages, np.int32),
-                self.queue, SimpleNamespace(req=req), None, self.PAGE,
+                self.queue,
+                SimpleNamespace(req=req),
+                None,
+                self.PAGE,
             )
             self.assertEqual(rows.tolist(), layout.transfer_rows(rank, pages, landing))
         self.assertEqual(req._k3_dp_transfer, (pages, landing))
@@ -420,9 +476,10 @@ class TestDpHooks(CustomTestCase):
         """Prealloc, transfer rows, the swap's landing release, core's page
         free and the release hook: availability is whole again (staged pages
         count: the leak check reads it)."""
+        from types import SimpleNamespace
+
         import numpy as np
         import torch
-        from types import SimpleNamespace
 
         from sglang_tpu.hooks import k3_program as hooks
 
@@ -431,10 +488,15 @@ class TestDpHooks(CustomTestCase):
         pages = sorted({int(x) // self.PAGE for x in kv.tolist()})
         hooks.k3_program_dp_transfer_rows(
             lambda q, d, k, p: np.asarray(pages, np.int32),
-            self.queue, SimpleNamespace(req=req), None, self.PAGE,
+            self.queue,
+            SimpleNamespace(req=req),
+            None,
+            self.PAGE,
         )
         self.assertLess(self.alloc.available_size(), full)
-        self.alloc.free_landing(torch.as_tensor(np.asarray(req._k3_dp_transfer[1], np.int32)))
+        self.alloc.free_landing(
+            torch.as_tensor(np.asarray(req._k3_dp_transfer[1], np.int32))
+        )
         req._k3_dp_transfer = (req._k3_dp_transfer[0], ())
         self.alloc.free(kv)
         hooks.k3_program_dp_release(None, req)
@@ -443,7 +505,9 @@ class TestDpHooks(CustomTestCase):
     def test_admission_reserves_landing_pages(self):
         from sglang_tpu.hooks import k3_program as hooks
 
-        need = hooks.k3_program_dp_admission(lambda q, **k: 3 * self.PAGE, self.queue, fill_len=48, prefix_len=0)
+        need = hooks.k3_program_dp_admission(
+            lambda q, **k: 3 * self.PAGE, self.queue, fill_len=48, prefix_len=0
+        )
         self.assertEqual(need, 3 * self.PAGE + 2 * self.PAGE)
 
 

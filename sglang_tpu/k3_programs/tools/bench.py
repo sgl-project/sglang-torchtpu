@@ -198,7 +198,9 @@ def run_decode(args, records: harness.Records) -> None:
 
     # Kimi-K3.1 (the indexer's families pre-sharded): index-key pools too.
     ops.load_weights()  # once; the decoder's bind reuses them
-    index = all(name in ops.weights for name in dsa_decode.FAMILIES) and not args.no_index
+    index = (
+        all(name in ops.weights for name in dsa_decode.FAMILIES) and not args.no_index
+    )
     pools = k3.Pools(blocks, pages, 1, pattern=True, index=index)
 
     # Serving's DSpark schedule: seven drafts through batch four, three

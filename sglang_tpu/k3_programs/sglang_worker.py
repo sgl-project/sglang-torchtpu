@@ -241,9 +241,13 @@ def dp_pages(plan) -> "sglang_dp.DpPages | None":
     if active().attention_dp == 1:
         return None
     if active().attention_dp != sglang_dp.GROUPS:
-        raise ValueError(f"K3 decode: attention DP{active().attention_dp} is unsupported (DP2 only)")
+        raise ValueError(
+            f"K3 decode: attention DP{active().attention_dp} is unsupported (DP2 only)"
+        )
     if plan.layout.tokens_per_block != sglang_dp.CHUNK_TOKENS:
-        raise ValueError("K3 decode: attention DP2 runs with the fp8 KV cache (512 tokens a row)")
+        raise ValueError(
+            "K3 decode: attention DP2 runs with the fp8 KV cache (512 tokens a row)"
+        )
     return sglang_dp.DpPages(plan.kv_blocks // 2 * 2, plan.num_blocks)
 
 
@@ -446,7 +450,11 @@ class DecodeSteps:
                     *bridge.kda_table_rows(slot, self.plan),
                 )
                 transfer = getattr(req, "_k3_dp_transfer", None)
-                if req.rid not in self._live and transfer is not None and len(transfer[1]):
+                if (
+                    req.rid not in self._live
+                    and transfer is not None
+                    and len(transfer[1])
+                ):
                     swaps.append((req, transfer))
             requests.append(
                 sglang_step.request_input(
@@ -479,7 +487,9 @@ class DecodeSteps:
         from sglang_tpu.k3_programs import sglang_dp_alloc
 
         if self.swap is None:
-            raise RuntimeError("K3 decode: DP2 transfers landed rows but no swap op is bound")
+            raise RuntimeError(
+                "K3 decode: DP2 transfers landed rows but no swap op is bound"
+            )
         jobs = []
         for _, (pages, landing) in swaps:
             sources, destinations = self.dp.swap_rows(pages, landing)

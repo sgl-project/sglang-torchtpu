@@ -66,7 +66,12 @@ class TestUnifiedPoolClasses(CustomTestCase):
             with mock.patch.object(sglang_pools.K3StatePool, "dsa", True):
                 self.assertEqual(
                     sglang_pools.K3StatePool.cache_bytes_per_request(None),
-                    3 * ((len(MLA) + 5) * BLOCK + len(MLA) * bridge.index_block_bytes(sglang_pools.cache_layout("auto"))),
+                    3
+                    * (
+                        (len(MLA) + 5) * BLOCK
+                        + len(MLA)
+                        * bridge.index_block_bytes(sglang_pools.cache_layout("auto"))
+                    ),
                 )
         # The program binds the pools the KV pool allocated.
         raw, *_ = pools.bind_raw_pools(kv.caches)
@@ -358,7 +363,9 @@ class TestConfiguratorHook(CustomTestCase):
         k31 = SimpleNamespace(_cell_size=27_648)
         kvc = SimpleNamespace(
             model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(text_config=SimpleNamespace(dsa_config={"index_topk": 2048}))
+                hf_config=SimpleNamespace(
+                    text_config=SimpleNamespace(dsa_config={"index_topk": 2048})
+                )
             )
         )
         with (

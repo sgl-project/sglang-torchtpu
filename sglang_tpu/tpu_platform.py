@@ -716,7 +716,9 @@ def _validate_dsa(server_args) -> None:
         return
     # K3_PROGRAM serves the attention and the DSA indexer in its own programs
     # (sglang_tpu/k3_programs): neither sglang's sparse backend nor its tracer runs.
-    k3_program = str(getattr(cfg, "speculative_algorithm", "") or "").upper() == "K3_PROGRAM"
+    k3_program = (
+        str(getattr(cfg, "speculative_algorithm", "") or "").upper() == "K3_PROGRAM"
+    )
     if not k3_program and cfg.attention_backend != "pallas_tpu_mla_sparse":
         raise ValueError(
             "Sparse attention (DSA) on TPU needs --attention-backend "

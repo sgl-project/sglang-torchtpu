@@ -20,11 +20,11 @@ from typing import Any
 
 import jax
 import torch
-from sglang_tpu.k3_programs._support.torch_tpu_compat import compile_fx_graph_mode
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
-from sglang_tpu.k3_programs._support.sharded_jax_op import _placeholder
 from sglang_tpu.k3_programs._support.logger import init_logger
+from sglang_tpu.k3_programs._support.sharded_jax_op import _placeholder
+from sglang_tpu.k3_programs._support.torch_tpu_compat import compile_fx_graph_mode
 
 logger = init_logger(__name__)
 
@@ -80,7 +80,9 @@ class _ExportCache:
                 signature.append(("static", repr(arg)))
             elif arg is None:
                 signature.append(None)
-            elif isinstance(arg, (list, tuple)):  # a Tensor[] argument (bridge._operand_runs)
+            elif isinstance(
+                arg, (list, tuple)
+            ):  # a Tensor[] argument (bridge._operand_runs)
                 signature.append(tuple((tuple(t.shape), str(t.dtype)) for t in arg))
             else:
                 signature.append((tuple(arg.shape), str(arg.dtype)))

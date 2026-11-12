@@ -31,9 +31,25 @@ from sglang_tpu.k3_programs.kimi_k3.config import active as _config
 
 CHUNK = 64 << 20
 EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
-PREFILL_COMMON = ("attn_res", "attn_norm", "mlp_res", "ffn_norm", "dense_gu", "dense_down")
+PREFILL_COMMON = (
+    "attn_res",
+    "attn_norm",
+    "mlp_res",
+    "ffn_norm",
+    "dense_gu",
+    "dense_down",
+)
 PREFILL_IO = ("embedding", "lm_head", "output_res", "final_norm")
-PREFILL_KDA = ("k_gate", "k_fb", "k_projection", "k_conv", "k_a_log", "k_dt", "k_norm", "k_o")
+PREFILL_KDA = (
+    "k_gate",
+    "k_fb",
+    "k_projection",
+    "k_conv",
+    "k_a_log",
+    "k_dt",
+    "k_norm",
+    "k_o",
+)
 PREFILL_MLA = ("m_qa", "m_qb", "m_ka", "m_kb", "m_gate", "m_qnorm", "m_knorm", "m_o")
 PREFILL_MOE_DENSE = ("router", "router_bias", "latent_norm")
 
@@ -41,6 +57,7 @@ PREFILL_MOE_DENSE = ("router", "router_bias", "latent_norm")
 def _dtype(name: str) -> np.dtype:
     if name == "bfloat16":
         import ml_dtypes
+
         return np.dtype(ml_dtypes.bfloat16)
     return np.dtype(name)
 
@@ -54,13 +71,15 @@ def _read_range(path: Path, offset: int, view: memoryview) -> None:
         handle.seek(offset)
         position = 0
         while position < len(view):
-            count = handle.readinto(view[position:position + CHUNK])
+            count = handle.readinto(view[position : position + CHUNK])
             if not count:
                 raise EOFError(f"{path}: short read at {offset + position}")
             position += count
 
 
-def read_into(path: Path, offset: int, out: np.ndarray, streams: int | None = None) -> np.ndarray:
+def read_into(
+    path: Path, offset: int, out: np.ndarray, streams: int | None = None
+) -> np.ndarray:
     """Fill ``out`` (C-contiguous) from ``path`` at ``offset``: ``streams``
     handles (default ``KernelConfig.read_streams``), each reading its own contiguous
     part sequentially. Network storage throughput scales with handles, not
@@ -72,14 +91,18 @@ def read_into(path: Path, offset: int, out: np.ndarray, streams: int | None = No
         return out
     step = -(-len(view) // streams)
     step = -(-step // CHUNK) * CHUNK
-    parts = [(start, view[start:start + step]) for start in range(0, len(view), step)]
+    parts = [(start, view[start : start + step]) for start in range(0, len(view), step)]
     with ThreadPoolExecutor(len(parts)) as pool:
         list(pool.map(lambda part: _read_range(path, offset + part[0], part[1]), parts))
     return out
 
 
 def read_array(path: Path, offset: int, shape, dtype) -> np.ndarray:
-    return read_into(path, offset, np.empty(tuple(shape), _dtype(dtype) if isinstance(dtype, str) else dtype))
+    return read_into(
+        path,
+        offset,
+        np.empty(tuple(shape), _dtype(dtype) if isinstance(dtype, str) else dtype),
+    )
 
 
 class RankDir:
@@ -96,25 +119,38 @@ class RankDir:
         return self.families[name]
 
     def dense_names(self):
-        return [name for name, spec in self.families.items() if spec.get("file") == "dense.bin"]
+        return [
+            name
+            for name, spec in self.families.items()
+            if spec.get("file") == "dense.bin"
+        ]
 
     def read_dense(self, name) -> np.ndarray:
         spec = self.families[name]
-        return read_array(self.path / "dense.bin", spec["offset"], spec["shape"], spec["dtype"])
+        return read_array(
+            self.path / "dense.bin", spec["offset"], spec["shape"], spec["dtype"]
+        )
 
     def read_dense_all(self) -> dict[str, np.ndarray]:
         """Every dense family in one sequential pass over ``dense.bin``."""
         spec_of = {name: self.families[name] for name in self.dense_names()}
         order = sorted(spec_of, key=lambda n: spec_of[n]["offset"])
-        end = max(spec_of[n]["offset"] + int(np.prod(spec_of[n]["shape"])) * _dtype(spec_of[n]["dtype"]).itemsize
-                  for n in order)
+        end = max(
+            spec_of[n]["offset"]
+            + int(np.prod(spec_of[n]["shape"])) * _dtype(spec_of[n]["dtype"]).itemsize
+            for n in order
+        )
         raw = read_into(self.path / "dense.bin", 0, np.empty(end, np.uint8))
         result = {}
         for name in order:
             spec = spec_of[name]
             dtype = _dtype(spec["dtype"])
             count = int(np.prod(spec["shape"]))
-            result[name] = raw[spec["offset"]:spec["offset"] + count * dtype.itemsize].view(dtype).reshape(spec["shape"])
+            result[name] = (
+                raw[spec["offset"] : spec["offset"] + count * dtype.itemsize]
+                .view(dtype)
+                .reshape(spec["shape"])
+            )
         return result
 
     def expert_parts(self, name):
@@ -125,9 +161,15 @@ class RankDir:
         dtype = _dtype(spec["dtype"])
         per_layer = int(np.prod(shape[1:])) * dtype.itemsize
         count = len(spec["files"])
-        for index, (filename, (lo, hi)) in enumerate(zip(spec["files"], spec["layer_ranges"])):
+        for index, (filename, (lo, hi)) in enumerate(
+            zip(spec["files"], spec["layer_ranges"])
+        ):
+
             def reader(filename=filename, lo=lo, hi=hi):
-                return read_into(self.path / filename, 0, np.empty((hi - lo, *shape[1:]), dtype))
+                return read_into(
+                    self.path / filename, 0, np.empty((hi - lo, *shape[1:]), dtype)
+                )
+
             yield f"{name}@{index}/{count}", (hi - lo) * per_layer, reader
 
     def regrouped_expert_parts(self, name, quarter_dirs, part, parts):
@@ -141,18 +183,34 @@ class RankDir:
         dtype = _dtype(spec["dtype"])
         experts = shape[1] // parts
         count = len(spec["files"])
-        nbytes = int(np.prod((experts,) + shape[2:])) * dtype.itemsize * len(quarter_dirs)
-        for index, (filename, (lo, hi)) in enumerate(zip(spec["files"], spec["layer_ranges"])):
+        nbytes = (
+            int(np.prod((experts,) + shape[2:])) * dtype.itemsize * len(quarter_dirs)
+        )
+        for index, (filename, (lo, hi)) in enumerate(
+            zip(spec["files"], spec["layer_ranges"])
+        ):
+
             def reader(filename=filename, lo=lo, hi=hi):
                 quarters = []
                 for rank_dir in quarter_dirs:
-                    array = np.memmap(rank_dir.path / filename, dtype, "r", shape=(hi - lo, *shape[1:]))
-                    quarters.append(np.array(array[:, part * experts:(part + 1) * experts]))
+                    array = np.memmap(
+                        rank_dir.path / filename,
+                        dtype,
+                        "r",
+                        shape=(hi - lo, *shape[1:]),
+                    )
+                    quarters.append(
+                        np.array(array[:, part * experts : (part + 1) * experts])
+                    )
                 if name in ("expert_gu", "expert_gus"):
                     half = shape[-1] // 2
-                    return np.concatenate([q[..., :half] for q in quarters]
-                                          + [q[..., half:] for q in quarters], axis=-1)
+                    return np.concatenate(
+                        [q[..., :half] for q in quarters]
+                        + [q[..., half:] for q in quarters],
+                        axis=-1,
+                    )
                 return np.concatenate(quarters, axis=2)
+
             yield f"{name}@{index}/{count}", (hi - lo) * nbytes, reader
 
     def read_expert_family(self, name) -> np.ndarray:
@@ -162,8 +220,14 @@ class RankDir:
         dtype = _dtype(spec["dtype"])
         out = np.empty(shape, dtype)
         with ThreadPoolExecutor(len(spec["files"])) as pool:
-            list(pool.map(lambda item: read_into(self.path / item[0], 0, out[item[1][0]:item[1][1]]),
-                          zip(spec["files"], spec["layer_ranges"])))
+            list(
+                pool.map(
+                    lambda item: read_into(
+                        self.path / item[0], 0, out[item[1][0] : item[1][1]]
+                    ),
+                    zip(spec["files"], spec["layer_ranges"]),
+                )
+            )
         return out
 
 
@@ -173,7 +237,8 @@ def split_kda_projection(families: dict) -> dict:
     if combined is not None and combined.shape[-1] == 1792 and "k_gate" not in families:
         families["k_gate"] = np.ascontiguousarray(combined[..., 1152:1280])
         families["k_projection"] = np.ascontiguousarray(
-            np.concatenate((combined[..., :1152], combined[..., 1280:]), axis=-1))
+            np.concatenate((combined[..., :1152], combined[..., 1280:]), axis=-1)
+        )
     return families
 
 
@@ -215,14 +280,19 @@ def _budgeted(jobs, *, budget: int = INFLIGHT_BYTES, workers: int = 8):
 
 def _dense_bytes(rank_dir: RankDir) -> int:
     specs = [rank_dir.families[n] for n in rank_dir.dense_names()]
-    return max(s["offset"] + int(np.prod(s["shape"])) * _dtype(s["dtype"]).itemsize for s in specs)
+    return max(
+        s["offset"] + int(np.prod(s["shape"])) * _dtype(s["dtype"]).itemsize
+        for s in specs
+    )
 
 
 def _family_bytes(spec) -> int:
     return int(np.prod(spec["shape"])) * _dtype(spec["dtype"]).itemsize
 
 
-def _experts_at(presharded, rank: int, layers: int, rank_dir: RankDir, ep: int, split: bool):
+def _experts_at(
+    presharded, rank: int, layers: int, rank_dir: RankDir, ep: int, split: bool
+):
     """``rank``'s expert-family read jobs at expert parallelism ``ep``: its own
     EP8/TP4 shards, or (16, 32) regrouped from its EP8 group's quarters on the
     same host -- 16: 56 experts, half the intermediate (TP2 within the chip);
@@ -235,8 +305,13 @@ def _experts_at(presharded, rank: int, layers: int, rank_dir: RankDir, ep: int, 
     else:
         quarters, part, parts = (2 * (rank % 2), 2 * (rank % 2) + 1), (rank // 2) % 2, 2
     quarter_dirs = [RankDir(presharded, group + q, layers) for q in quarters]
-    return [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
-            for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, part, parts)]
+    return [
+        job
+        for name in sorted(
+            EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n))
+        )
+        for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, part, parts)
+    ]
 
 
 def _expert_jobs(rank_dir: RankDir, split: bool):
@@ -246,11 +321,21 @@ def _expert_jobs(rank_dir: RankDir, split: bool):
         if split:
             yield from rank_dir.expert_parts(name)
         else:
-            yield name, _family_bytes(rank_dir.spec(name)), lambda n=name: rank_dir.read_expert_family(n)
+            yield (
+                name,
+                _family_bytes(rank_dir.spec(name)),
+                lambda n=name: rank_dir.read_expert_family(n),
+            )
 
 
-def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: bool = False,
-                     attention_dp: int = 1) -> Iterator[tuple[str, str, np.ndarray]]:
+def iter_decode_rank(
+    presharded,
+    rank: int,
+    *,
+    layers: int = 93,
+    split_experts: bool = False,
+    attention_dp: int = 1,
+) -> Iterator[tuple[str, str, np.ndarray]]:
     """The decode megakernel's weights for ``rank`` (MXFP4 experts as stored).
 
     Yields ``("decode", name, array)``: the four packed expert families
@@ -263,7 +348,14 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
     """
     rank_dir = RankDir(presharded, rank, layers)
     jobs = list(
-        _experts_at(presharded, rank, layers, rank_dir, _config().decode_expert_parallel, split_experts)
+        _experts_at(
+            presharded,
+            rank,
+            layers,
+            rank_dir,
+            _config().decode_expert_parallel,
+            split_experts,
+        )
     )
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for key, value in _budgeted(jobs):
@@ -272,7 +364,11 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
             if "d_wk" in families:
                 families.update(decode_indexer_families(families, rank))
             if attention_dp > 1:
-                families.update(attention_dp_families(families, presharded, rank, layers, attention_dp))
+                families.update(
+                    attention_dp_families(
+                        families, presharded, rank, layers, attention_dp
+                    )
+                )
             for name, family in families.items():
                 yield "decode", name, family
         else:
@@ -285,15 +381,22 @@ def decode_indexer_families(families: dict, rank: int) -> dict:
     itself): ``d_wks`` (``dsa_decode.key_weight``: the rank's index-key dims
     over DCP32, the rank holding index head ``rank``'s ``d_wqb``) and
     ``d_wpt`` (``dsa_decode.gate_weight``, every rank)."""
-    from sglang_tpu.k3_programs.kimi_k3.kernels.dsa_decode import gate_weight, key_weight
+    from sglang_tpu.k3_programs.kimi_k3.kernels.dsa_decode import (
+        gate_weight,
+        key_weight,
+    )
 
     wk, wproj = families.pop("d_wk"), families.pop("d_wproj")
     layers = range(wk.shape[0])
-    return {"d_wks": np.stack([key_weight(wk[i], rank % 32, 32) for i in layers]),
-            "d_wpt": np.stack([gate_weight(wproj[i]) for i in layers])}
+    return {
+        "d_wks": np.stack([key_weight(wk[i], rank % 32, 32) for i in layers]),
+        "d_wpt": np.stack([gate_weight(wproj[i]) for i in layers]),
+    }
 
 
-def attention_dp_families(families: dict, presharded, rank: int, layers: int, dp: int) -> dict:
+def attention_dp_families(
+    families: dict, presharded, rank: int, layers: int, dp: int
+) -> dict:
     """Attention DP's head-sharded families for ``rank``: its TP32 shards
     ``rank % (32 / dp) + k * (32 / dp)`` in order ``k``, concatenated or
     stacked as ``decode_megakernel.to_attention_dp`` lays them out, the other
@@ -311,7 +414,9 @@ def attention_dp_families(families: dict, presharded, rank: int, layers: int, dp
             continue
         peer = RankDir(presharded, source, layers)
         names = [name for name in ATTENTION_DP_WEIGHTS if name in peer.families]
-        shards.append(split_kda_projection({name: peer.read_dense(name) for name in names}))
+        shards.append(
+            split_kda_projection({name: peer.read_dense(name) for name in names})
+        )
     held = {}
     for name, (kind, axis) in ATTENTION_DP_WEIGHTS.items():
         parts = [shard[name] for shard in shards]
@@ -322,7 +427,9 @@ def attention_dp_families(families: dict, presharded, rank: int, layers: int, dp
     return held
 
 
-def _sequence_parallel_output(own: np.ndarray, peer_dir: RankDir, name: str, rank: int) -> np.ndarray:
+def _sequence_parallel_output(
+    own: np.ndarray, peer_dir: RankDir, name: str, rank: int
+) -> np.ndarray:
     """Prefill TP32 output projection from the chip pair's decode shards."""
     pair, part = divmod(rank, 2)
     rows = slice(part * 384, (part + 1) * 384)
@@ -331,8 +438,14 @@ def _sequence_parallel_output(own: np.ndarray, peer_dir: RankDir, name: str, ran
     return np.ascontiguousarray(np.concatenate([h[:, rows] for h in halves], axis=-1))
 
 
-def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 93,
-                      split_experts: bool = False) -> Iterator[tuple[str, str, np.ndarray]]:
+def iter_prefill_rank(
+    presharded,
+    projection_cache,
+    rank: int,
+    *,
+    layers: int = 93,
+    split_experts: bool = False,
+) -> Iterator[tuple[str, str, np.ndarray]]:
     """The prefill stack's weights for ``rank``.
 
     Yields ``(group, name, array)`` with ``group`` in io/common/kda/mla/moe
@@ -354,15 +467,28 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
 
     def cached(name):
         spec = layout["families"][name]
-        return (int(np.prod(spec["shape"])) * _dtype(spec["dtype"]).itemsize,
-                lambda: projection(name))
+        return (
+            int(np.prod(spec["shape"])) * _dtype(spec["dtype"]).itemsize,
+            lambda: projection(name),
+        )
 
     jobs: list[tuple] = list(
-        _experts_at(presharded, rank, layers, rank_dir, _config().prefill_expert_parallel, split_experts)
+        _experts_at(
+            presharded,
+            rank,
+            layers,
+            rank_dir,
+            _config().prefill_expert_parallel,
+            split_experts,
+        )
     )
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
-    for name, source in (("latent_down", "latent_down"), ("latent_up", "latent_up"),
-                         ("shared_gu", f"shared_gu_{parity}"), ("shared_down", f"shared_down_{parity}")):
+    for name, source in (
+        ("latent_down", "latent_down"),
+        ("latent_up", "latent_up"),
+        ("shared_gu", f"shared_gu_{parity}"),
+        ("shared_down", f"shared_down_{parity}"),
+    ):
         nbytes, fn = cached(source)
         jobs.append((name, nbytes, fn))
     for key, value in _budgeted(jobs):
@@ -385,7 +511,12 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
             if name == "m_o":
                 family = _sequence_parallel_output(family, peer_dir, "m_o", rank)
             yield "mla", name, family
-        for name in ("d_wk", "d_knorm", "d_wqb", "d_wproj"):  # Kimi-K3.1's indexer (index keys, sparse prefill)
+        for name in (
+            "d_wk",
+            "d_knorm",
+            "d_wqb",
+            "d_wproj",
+        ):  # Kimi-K3.1's indexer (index keys, sparse prefill)
             if name in families:
                 yield "mla", name, families[name]
         for name in PREFILL_MOE_DENSE:
@@ -402,7 +533,11 @@ def to_device(mesh, iterator_for_rank, *, axis=None, ranks_in_flight: int = 8):
 
     axis = axis or mesh.axis_names[0]
     devices = list(mesh.devices.flat)
-    local = [rank for rank, device in enumerate(devices) if device.process_index == jax.process_index()]
+    local = [
+        rank
+        for rank, device in enumerate(devices)
+        if device.process_index == jax.process_index()
+    ]
     per_rank: dict[int, dict] = {}
     lock = threading.Lock()
 
@@ -423,8 +558,10 @@ def to_device(mesh, iterator_for_rank, *, axis=None, ranks_in_flight: int = 8):
     return {
         group: {
             name: jax.make_array_from_single_device_arrays(
-                (len(devices), *sample[group][name].shape[1:]), sharding,
-                [per_rank[rank][group][name] for rank in local])
+                (len(devices), *sample[group][name].shape[1:]),
+                sharding,
+                [per_rank[rank][group][name] for rank in local],
+            )
             for name in names
         }
         for group, names in sample.items()

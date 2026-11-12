@@ -29,7 +29,10 @@ import jax
 import jax.numpy as jnp
 
 from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_decode
-from sglang_tpu.k3_programs.kimi_k3.layout import INDEX_SUBPAGE_ROWS, INDEX_SUBPAGE_TOKENS
+from sglang_tpu.k3_programs.kimi_k3.layout import (
+    INDEX_SUBPAGE_ROWS,
+    INDEX_SUBPAGE_TOKENS,
+)
 
 RANKS = 32  # the prefill's k3_sp mesh
 HEADS = 3  # MLA heads a rank attends
@@ -63,26 +66,48 @@ def _sequence_layout(segments, *, count, tokens, capacity, page_tokens):
     """``(kv_lens, page_indices, cu_q_lens)`` of the window's sequences over the
     scratch caches: arena page ``i`` is scratch page ``i``, window page ``w``
     scratch page ``capacity / page + w``."""
-    offsets, lengths = segments[:count], segments[count:2 * count]
-    bases, prefixes = segments[3 * count:4 * count], segments[4 * count:5 * count]
+    offsets, lengths = segments[:count], segments[count : 2 * count]
+    bases, prefixes = segments[3 * count : 4 * count], segments[4 * count : 5 * count]
     arena_pages = capacity // page_tokens
     pages_per_seq = arena_pages + tokens // page_tokens
     # A sequence's query rows run to the next sequence's offset (padding rows
     # after its tokens come last, so no real row sees them).
     ends = jnp.concatenate([offsets[1:], jnp.asarray([tokens], jnp.int32)])
-    ends = jnp.where(jnp.arange(count) < count - 1, ends, jnp.maximum(offsets + lengths, ends))
+    ends = jnp.where(
+        jnp.arange(count) < count - 1, ends, jnp.maximum(offsets + lengths, ends)
+    )
     q_lens = jnp.where(lengths > 0, ends - offsets, 0)
-    cu_q_lens = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(q_lens)]).astype(jnp.int32)
+    cu_q_lens = jnp.concatenate(
+        [jnp.zeros((1,), jnp.int32), jnp.cumsum(q_lens)]
+    ).astype(jnp.int32)
     kv_lens = (prefixes + q_lens).astype(jnp.int32)
     index = jnp.arange(pages_per_seq)[None, :]
     prefix_pages = (prefixes // page_tokens)[:, None]
-    page = jnp.where(index < prefix_pages, (bases // page_tokens)[:, None] + index,
-                     arena_pages + (offsets // page_tokens)[:, None] + index - prefix_pages)
+    page = jnp.where(
+        index < prefix_pages,
+        (bases // page_tokens)[:, None] + index,
+        arena_pages + (offsets // page_tokens)[:, None] + index - prefix_pages,
+    )
     return kv_lens, page.reshape(-1).astype(jnp.int32), cu_q_lens
 
 
-def sparse_mla(query, latent, index_key, q_latent, hidden, weights, arena_tokens, index_rows,
-               segments, *, count, capacity, page_tokens, axis, topk=2048):
+def sparse_mla(
+    query,
+    latent,
+    index_key,
+    q_latent,
+    hidden,
+    weights,
+    arena_tokens,
+    index_rows,
+    segments,
+    *,
+    count,
+    capacity,
+    page_tokens,
+    axis,
+    topk=2048,
+):
     """This rank's three heads' DSA attention over a packed window.
 
     ``query`` ``[3, T, 256]`` bf16 (nope 128 | rope 64 | 0, unscaled),
@@ -106,7 +131,8 @@ def sparse_mla(query, latent, index_key, q_latent, hidden, weights, arena_tokens
     num_pages = arena_pages + tokens // page_tokens
     distribution = jnp.asarray([0, 0, count], jnp.int32)
     kv_lens, page_indices, cu_q_lens = _sequence_layout(
-        segments, count=count, tokens=tokens, capacity=capacity, page_tokens=page_tokens)
+        segments, count=count, tokens=tokens, capacity=capacity, page_tokens=page_tokens
+    )
 
     # 1. Scratch caches with every sequence's prefix (one pseudo-sequence over
     # the arena pages); the kernels store the window rows themselves.
@@ -117,41 +143,100 @@ def sparse_mla(query, latent, index_key, q_latent, hidden, weights, arena_tokens
     cache_nope = jnp.zeros(nope_spec.shape, nope_spec.jax_dtype)
     cache_rope = jnp.zeros(rope_spec.shape, rope_spec.jax_dtype)
     cache_nope, cache_rope = kv_cache_utils.update_sparse_mla_kv_cache(
-        cache_nope, cache_rope, arena_tokens[:, :LATENT], arena_tokens[:, LATENT:LATENT + ROPE],
-        whole, identity, span, nope_spec=nope_spec, rope_spec=rope_spec)
-    cache_k = jnp.zeros(dit.index_key_cache_shape(num_pages, page_tokens, INDEX_DIM), jnp.uint8)
+        cache_nope,
+        cache_rope,
+        arena_tokens[:, :LATENT],
+        arena_tokens[:, LATENT : LATENT + ROPE],
+        whole,
+        identity,
+        span,
+        nope_spec=nope_spec,
+        rope_spec=rope_spec,
+    )
+    cache_k = jnp.zeros(
+        dit.index_key_cache_shape(num_pages, page_tokens, INDEX_DIM), jnp.uint8
+    )
     prefix_key, prefix_scale = index_records(index_rows)
-    cache_k = dit._store_keys(cache_k, prefix_key, prefix_scale, whole, identity, span,
-                              jnp.asarray([0, 0, 1], jnp.int32))
+    cache_k = dit._store_keys(
+        cache_k,
+        prefix_key,
+        prefix_scale,
+        whole,
+        identity,
+        span,
+        jnp.asarray([0, 0, 1], jnp.int32),
+    )
 
     # 2. Token-split indexer: this rank's rows with all 32 heads.
-    own = jnp.dot(q_latent.astype(jnp.bfloat16), weights["index_query_projection"],
-                  preferred_element_type=jnp.float32).astype(jnp.bfloat16)  # [T, 128]: head ``rank``
-    heads = jax.lax.all_to_all(own.reshape(ranks, rows, INDEX_DIM), axis, 0, 0)  # [32 heads, rows, 128]
+    own = jnp.dot(
+        q_latent.astype(jnp.bfloat16),
+        weights["index_query_projection"],
+        preferred_element_type=jnp.float32,
+    ).astype(jnp.bfloat16)  # [T, 128]: head ``rank``
+    heads = jax.lax.all_to_all(
+        own.reshape(ranks, rows, INDEX_DIM), axis, 0, 0
+    )  # [32 heads, rows, 128]
     first = rank * rows
-    gate = jnp.dot(jax.lax.dynamic_slice_in_dim(hidden, first, rows).astype(jnp.bfloat16),
-                   weights["index_gate_projection"], preferred_element_type=jnp.float32)
-    gate = dsa_decode._bf16(dsa_decode._bf16(gate[:, :INDEX_HEADS]) * dsa_decode.HEAD_GATE_SCALE)
+    gate = jnp.dot(
+        jax.lax.dynamic_slice_in_dim(hidden, first, rows).astype(jnp.bfloat16),
+        weights["index_gate_projection"],
+        preferred_element_type=jnp.float32,
+    )
+    gate = dsa_decode._bf16(
+        dsa_decode._bf16(gate[:, :INDEX_HEADS]) * dsa_decode.HEAD_GATE_SCALE
+    )
     query_rows = jnp.zeros((tokens, INDEX_HEADS, INDEX_DIM), jnp.float32)
     query_rows = jax.lax.dynamic_update_slice_in_dim(
-        query_rows, jnp.transpose(heads, (1, 0, 2)).astype(jnp.float32), first, 0)
+        query_rows, jnp.transpose(heads, (1, 0, 2)).astype(jnp.float32), first, 0
+    )
     gate_rows = jax.lax.dynamic_update_slice_in_dim(
-        jnp.zeros((tokens, INDEX_HEADS), jnp.float32), gate, first, 0)
+        jnp.zeros((tokens, INDEX_HEADS), jnp.float32), gate, first, 0
+    )
     selected, _ = dit.dsa_indexer_step(
-        query_rows, index_key.astype(jnp.float32), gate_rows, cache_k, kv_lens, page_indices, cu_q_lens,
-        distribution, jnp.reshape(first, (1,)).astype(jnp.int32), weight_scale=dsa_decode.WEIGHT_SCALE,
-        topk=topk, segments="all", key_store="xla", row_count=rows)  # [rows, topk]
+        query_rows,
+        index_key.astype(jnp.float32),
+        gate_rows,
+        cache_k,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        jnp.reshape(first, (1,)).astype(jnp.int32),
+        weight_scale=dsa_decode.WEIGHT_SCALE,
+        topk=topk,
+        segments="all",
+        key_store="xla",
+        row_count=rows,
+    )  # [rows, topk]
     selected = jax.lax.all_gather(selected, axis, tiled=True)  # [T, topk]
 
     # 3. Sparse MLA over each row's top-k (absorbed queries, latent outputs).
     up = weights["key_value_up_projection"]  # [512, 3 x (128 key | 128 value)]
-    w_uk = jnp.stack([up[:, h * 256:h * 256 + 128] for h in range(HEADS)])  # [3, 512, 128]
-    w_uv = jnp.stack([up[:, h * 256 + 128:h * 256 + 256] for h in range(HEADS)])  # [3, 512, 128]
-    ql_nope = jnp.einsum("htn,hln->htl", query[:, :, :128].astype(jnp.float32),
-                         w_uk.astype(jnp.float32)).astype(jnp.bfloat16)
-    q_pe = query[:, :, 128:128 + ROPE].astype(jnp.bfloat16)
+    w_uk = jnp.stack(
+        [up[:, h * 256 : h * 256 + 128] for h in range(HEADS)]
+    )  # [3, 512, 128]
+    w_uv = jnp.stack(
+        [up[:, h * 256 + 128 : h * 256 + 256] for h in range(HEADS)]
+    )  # [3, 512, 128]
+    ql_nope = jnp.einsum(
+        "htn,hln->htl", query[:, :, :128].astype(jnp.float32), w_uk.astype(jnp.float32)
+    ).astype(jnp.bfloat16)
+    q_pe = query[:, :, 128 : 128 + ROPE].astype(jnp.bfloat16)
     out, _, _ = msf.sparse_mla_prefill_fused_tokens(
-        ql_nope, q_pe, latent[:, :LATENT].astype(jnp.float8_e4m3fn),
-        latent[:, LATENT:LATENT + ROPE].astype(jnp.float8_e4m3fn), cache_nope, cache_rope, kv_lens,
-        page_indices, cu_q_lens, distribution, selected, sm_scale=SM_SCALE, k_scale=1.0)
-    return jnp.einsum("htl,hlv->htv", out.astype(jnp.float32), w_uv.astype(jnp.float32)).astype(jnp.bfloat16)
+        ql_nope,
+        q_pe,
+        latent[:, :LATENT].astype(jnp.float8_e4m3fn),
+        latent[:, LATENT : LATENT + ROPE].astype(jnp.float8_e4m3fn),
+        cache_nope,
+        cache_rope,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        selected,
+        sm_scale=SM_SCALE,
+        k_scale=1.0,
+    )
+    return jnp.einsum(
+        "htl,hlv->htv", out.astype(jnp.float32), w_uv.astype(jnp.float32)
+    ).astype(jnp.bfloat16)

@@ -58,7 +58,9 @@ def quantize_fp8(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return scaled.astype(ml_dtypes.float8_e4m3fn).astype(np.float32), exp
 
 
-def layer_norm(x: np.ndarray, weight: np.ndarray, bias: np.ndarray, eps: float) -> np.ndarray:
+def layer_norm(
+    x: np.ndarray, weight: np.ndarray, bias: np.ndarray, eps: float
+) -> np.ndarray:
     x = np.asarray(x, np.float32)
     mean = x.mean(-1, keepdims=True)
     var = (x * x).mean(-1, keepdims=True) - mean * mean
@@ -74,7 +76,9 @@ def index_query(q: np.ndarray, gate: np.ndarray) -> tuple[np.ndarray, np.ndarray
     return q8, w.astype(np.float32)
 
 
-def scores(q8: np.ndarray, w: np.ndarray, k8: np.ndarray, k_exp: np.ndarray) -> np.ndarray:
+def scores(
+    q8: np.ndarray, w: np.ndarray, k8: np.ndarray, k_exp: np.ndarray
+) -> np.ndarray:
     """Index scores of keys ``k8`` f32 [N, 128] (exponents [N, 1])."""
     logits = np.maximum(k8 @ q8.T, 0.0)  # [N, 32]
     return (logits @ w) * np.exp2(k_exp[:, 0].astype(np.float32))
@@ -123,7 +127,13 @@ def distributed_topk(
         hist = np.zeros(1 << span, np.int64)
         for k in ukeys:  # per rank, then summed: the all-reduce
             inside = (k & np.uint64(hi_mask)) == np.uint64(prefix)
-            np.add.at(hist, ((k[inside] >> np.uint64(shift)) & np.uint64((1 << span) - 1)).astype(np.int64), 1)
+            np.add.at(
+                hist,
+                ((k[inside] >> np.uint64(shift)) & np.uint64((1 << span) - 1)).astype(
+                    np.int64
+                ),
+                1,
+            )
         rounds += 1
         running = 0
         for digit in range((1 << span) - 1, -1, -1):
@@ -132,7 +142,9 @@ def distributed_topk(
                 need -= running
                 break
             running += hist[digit]
-    tau = np.uint64(prefix)  # the threshold key; ``need`` of the keys == tau are selected
+    tau = np.uint64(
+        prefix
+    )  # the threshold key; ``need`` of the keys == tau are selected
     tied = sum(int(np.sum(k == tau)) for k in ukeys)
     if tied == need:
         return [k >= tau for k in ukeys], rounds

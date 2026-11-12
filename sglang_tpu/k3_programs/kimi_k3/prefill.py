@@ -355,7 +355,9 @@ class PrefillProgram:
         if "d_wk" in self.weights.get("mla", {}):
             # Kimi-K3.1: the DSA indexer's key projection and norm feed the
             # window's index keys.
-            self.names["mla"] = tuple(self.names["mla"]) + tuple(self._kernels.DSA_FAMILIES)
+            self.names["mla"] = tuple(self.names["mla"]) + tuple(
+                self._kernels.DSA_FAMILIES
+            )
         for group, names in self.names.items():
             missing = [n for n in names if n not in self.weights.get(group, {})]
             if missing:
@@ -464,17 +466,21 @@ class PrefillProgram:
             return (sharded,) * (pools * (2 if dsa else 1) + 2)
 
         def split(args, pools: int):
-            index = tuple(args[pools:2 * pools]) if dsa else ()
-            rest = args[2 * pools:] if dsa else args[pools:]
-            return kernels.CpPrefix(tuple(args[:pools]), rest[0], rest[1], index), rest[2:]
+            index = tuple(args[pools : 2 * pools]) if dsa else ()
+            rest = args[2 * pools :] if dsa else args[pools:]
+            return kernels.CpPrefix(tuple(args[:pools]), rest[0], rest[1], index), rest[
+                2:
+            ]
 
         def run_first(tokens, length, segments, rec, hist, *args):
             arena, args = split(args, 1)
             w, _ = self._unflat(args, "io", *weight_groups)
             hidden = embedding(tokens, w["io"]["embedding"], length)
             # Kimi-K3.1: the index keys ride in lanes 576:704.
-            latents = zeros((MLA_LAYERS, window, 576 + (128 if "d_wk" in self.names["mla"] else 0)),
-                            jnp.bfloat16)
+            latents = zeros(
+                (MLA_LAYERS, window, 576 + (128 if "d_wk" in self.names["mla"] else 0)),
+                jnp.bfloat16,
+            )
             rec_at = zeros((KDA_LAYERS, count, 3, 128, 128), jnp.float32)
             hist_at = zeros((KDA_LAYERS, count, 3, 3, 3, 128), jnp.bfloat16)
             prefix, blocks, kda_state, mla_state, tap = first(
@@ -696,7 +702,7 @@ class PrefillProgram:
                 segments,
                 pools[2 * p + 1],
                 pools[2 * p + 2],
-                *index_pools[2 * p + 1:2 * p + 3],
+                *index_pools[2 * p + 1 : 2 * p + 3],
                 *tail,
                 *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
             )
@@ -713,7 +719,7 @@ class PrefillProgram:
             extent,
             segments,
             pools[MLA_LAYERS - 1],
-            *index_pools[MLA_LAYERS - 1:],
+            *index_pools[MLA_LAYERS - 1 :],
             *tail,
             *self._flat("io", "common", "mla", "moe", expert_bank=12),
         )
@@ -994,6 +1000,7 @@ class PoolWriter:
                         jax.lax.ppermute(x, AXIS, perm)
                         for x in (recurrent, conv, recurrent_at, conv_at)
                     )
+
                 def write_page(p, pool, rows):
                     return jax.lax.dynamic_update_index_in_dim(
                         pool,
@@ -1010,13 +1017,18 @@ class PoolWriter:
                         .reshape(pages, *self.layout.block_shape)
                     )
                     raws[index] = jax.lax.fori_loop(
-                        0, pages, functools.partial(write_page, rows=rows), raws[index])
+                        0, pages, functools.partial(write_page, rows=rows), raws[index]
+                    )
                     if index_raw:
                         from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
 
                         rows = dsa_dcp.index_rows(latents[m][:, 576:704], pages)
                         raws[index_raw[m]] = jax.lax.fori_loop(
-                            0, pages, functools.partial(write_page, rows=rows), raws[index_raw[m]])
+                            0,
+                            pages,
+                            functools.partial(write_page, rows=rows),
+                            raws[index_raw[m]],
+                        )
                 # Checkpoints first (a sequence without one aims it at the null block).
                 raws = self._write_kda(raws, recurrent_at, conv_at, blocks_at, count)
                 raws = self._write_kda(raws, recurrent, conv, kda_blocks, count)
@@ -1334,7 +1346,12 @@ class KimiPrefiller:
             caches, self.config.kv_cache_dtype
         )
         self._writer = PoolWriter(
-            self.program.mesh, self.rank, raw_pools, mla_raw, kda_raw, self._state_perm,
+            self.program.mesh,
+            self.rank,
+            raw_pools,
+            mla_raw,
+            kda_raw,
+            self._state_perm,
             # Kimi-K3.1: the DSA index-key pools (sglang_program sets them).
             index_pools=list(getattr(self, "index_pools", ())),
         )
@@ -1363,7 +1380,9 @@ class KimiPrefiller:
 
         # Layers read from the blocks (multiples of 12) need no stream kept.
         return tuple(
-            layer for layer in self.draft_latents.config.aux_layers if stream_source(layer) == "entering"
+            layer
+            for layer in self.draft_latents.config.aux_layers
+            if stream_source(layer) == "entering"
         )
 
     def _zeros(self) -> torch.Tensor:
@@ -1863,7 +1882,7 @@ class KimiPrefiller:
                     extent,
                     segments,
                     mla[MLA_LAYERS - 1],
-                    *index[MLA_LAYERS - 1:],
+                    *index[MLA_LAYERS - 1 :],
                     *tail,
                     *program._flat("io", "common", "mla", "moe", expert_bank=12),
                 ),

@@ -30,7 +30,14 @@ SHARED_EXPERT_PARALLEL = (8, 16)
 # ~230 more unified blocks.
 SHARED_DENSE = {
     "io": ("embedding", "lm_head", "output_res", "final_norm"),
-    "common": ("attn_res", "attn_norm", "mlp_res", "ffn_norm", "dense_gu", "dense_down"),
+    "common": (
+        "attn_res",
+        "attn_norm",
+        "mlp_res",
+        "ffn_norm",
+        "dense_gu",
+        "dense_down",
+    ),
     "kda": ("k_gate", "k_fb", "k_projection", "k_conv", "k_a_log", "k_dt", "k_norm"),
     "mla": ("m_qa", "m_qb", "m_ka", "m_kb", "m_gate", "m_qnorm", "m_knorm"),
     "moe": ("router", "router_bias", "latent_norm"),
@@ -45,7 +52,9 @@ def shared_dense() -> dict[str, tuple[str, ...]]:
 
     if getattr(active(), "attention_dp", 1) == 1:
         return SHARED_DENSE
-    from sglang_tpu.k3_programs.kimi_k3.kernels.decode_megakernel import ATTENTION_DP_WEIGHTS
+    from sglang_tpu.k3_programs.kimi_k3.kernels.decode_megakernel import (
+        ATTENTION_DP_WEIGHTS,
+    )
 
     return {
         group: tuple(n for n in names if n not in ATTENTION_DP_WEIGHTS)

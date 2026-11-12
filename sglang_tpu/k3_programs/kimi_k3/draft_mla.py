@@ -485,7 +485,9 @@ class MlaDsparkDraft:
         than two heads a rank (Kimi-K3.1's: VMEM)."""
         return MAX_ROWS if self.config.heads_per_rank <= 2 else MAX_ROWS // 2
 
-    def parts(self, requests: int, dp: int = 1, rows_per: int = 8) -> list[tuple[int, ...]]:
+    def parts(
+        self, requests: int, dp: int = 1, rows_per: int = 8
+    ) -> list[tuple[int, ...]]:
         """The verify's requests each fused call drafts: at most
         ``max_rows // rows_per``; under attention DP (``dp``) as many of each group's
         (group ``g``'s are the verify's ``g``-th share), group-major as the
@@ -662,7 +664,9 @@ class MlaDsparkDraft:
             )
         from sglang_tpu.k3_programs.kimi_k3.program import draft_rows
 
-        drafted = sorted({(requests, draft_rows(rows)) for requests, rows in spec_shapes})
+        drafted = sorted(
+            {(requests, draft_rows(rows)) for requests, rows in spec_shapes}
+        )
         for requests, spec_rows in drafted:
             rows = requests * spec_rows
             for index in self.parts(requests, self.attention_dp, spec_rows):

@@ -193,8 +193,11 @@ class Uploader:
         names = {"dense.bin"}
         for family in index.get("families", {}).values():
             names.update(family.get("files", [family.get("file", "dense.bin")]))
-        return index.get("rank") == rank and all((rank_dir / n).is_file() for n in names) and \
-            all(family in index["families"] for family in EXPERT_FAMILIES)
+        return (
+            index.get("rank") == rank
+            and all((rank_dir / n).is_file() for n in names)
+            and all(family in index["families"] for family in EXPERT_FAMILIES)
+        )
 
     def put(self, path: Path) -> None:
         self.futures.append(self.pool.submit(self._copy, path))
@@ -205,11 +208,15 @@ class Uploader:
         self.pool.shutdown()
 
 
-def convert_rank(load, checkpoint, rank: int, output: Path, log, upload: Uploader | None = None) -> dict:
+def convert_rank(
+    load, checkpoint, rank: int, output: Path, log, upload: Uploader | None = None
+) -> dict:
     """Write one rank's files; returns its index. With ``upload`` each file
     goes out (and its local copy away) as soon as it is complete."""
     shapes = load.selected_local_shapes(
-        LAYERS, checkpoint.config.dim, vocab=checkpoint.config.vocab,
+        LAYERS,
+        checkpoint.config.dim,
+        vocab=checkpoint.config.vocab,
         dsa=checkpoint.config.dsa,
     )
     rank_dir = output / f"rank{rank:02d}"
@@ -287,7 +294,11 @@ def convert_rank(load, checkpoint, rank: int, output: Path, log, upload: Uploade
                     k for k, (lo, hi) in enumerate(ranges[name]) if lo <= position < hi
                 )
                 handles[name][k].write(array.tobytes())
-                if upload is not None and len(files[name]) > 1 and position == ranges[name][k][1] - 1:
+                if (
+                    upload is not None
+                    and len(files[name]) > 1
+                    and position == ranges[name][k][1] - 1
+                ):
                     handles[name][k].close()  # this layer range is complete
                     upload.put(rank_dir / files[name][k])
             if layer % 8 == 0 or layer == LAYERS - 1:
@@ -348,7 +359,8 @@ def write_k3(args, log) -> None:
     with ThreadPoolExecutor(max(1, args.in_flight)) as pool:
         list(
             pool.map(
-                lambda rank: convert_rank(load, checkpoint, rank, output, log, upload), ranks
+                lambda rank: convert_rank(load, checkpoint, rank, output, log, upload),
+                ranks,
             )
         )
     if upload is not None:
@@ -360,9 +372,7 @@ def write_k3(args, log) -> None:
 def _mla_module():
     import importlib
 
-    return importlib.import_module(
-        "sglang_tpu.k3_programs.kimi_k3.kernels.dspark_mla"
-    )
+    return importlib.import_module("sglang_tpu.k3_programs.kimi_k3.kernels.dspark_mla")
 
 
 def prefill_projection_values(load, checkpoint, layer: int) -> dict[str, np.ndarray]:
@@ -493,7 +503,9 @@ def verify(args, log) -> bool:
     rank_dir = Path(args.against) / f"rank{args.rank:02d}"
     families = json.loads((rank_dir / "index.json").read_text())["families"]
     shapes = load.selected_local_shapes(
-        LAYERS, checkpoint.config.dim, vocab=checkpoint.config.vocab,
+        LAYERS,
+        checkpoint.config.dim,
+        vocab=checkpoint.config.vocab,
         dsa=checkpoint.config.dsa,
     )
     # Older pre-shards store k_projection with the gate columns inside (the

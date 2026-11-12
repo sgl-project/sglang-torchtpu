@@ -49,6 +49,7 @@ def _has_indexer(presharded) -> bool:
     except (OSError, ValueError, KeyError, TypeError):
         return False
 
+
 LLO_FLAGS = (
     "--xla_jf_dump_to={dir} --xla_jf_dump_llo_text=true "
     "--xla_jf_dump_llo_pass_label_regex=(vliw-packed-bundles|final_bundles) "

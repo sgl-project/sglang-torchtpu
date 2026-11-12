@@ -42,7 +42,9 @@ def load_tokenizer(directory):
     config = json.loads((directory / "tokenizer_config.json").read_text())
     source = ast.parse((directory / "tokenization_kimi.py").read_text())
     cls = next(
-        n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "TikTokenTokenizer"
+        n
+        for n in source.body
+        if isinstance(n, ast.ClassDef) and n.name == "TikTokenTokenizer"
     )
     assignment = next(
         n
@@ -64,7 +66,8 @@ def load_tokenizer(directory):
     ranks = {
         base64.b64decode(token): int(rank)
         for token, rank in (
-            line.split() for line in (directory / "tiktoken.model").read_bytes().splitlines()
+            line.split()
+            for line in (directory / "tiktoken.model").read_bytes().splitlines()
         )
     }
     added = config["added_tokens_decoder"]
@@ -73,7 +76,10 @@ def load_tokenizer(directory):
         for i in range(len(ranks), len(ranks) + 256)
     }
     return tiktoken.Encoding(
-        name="kimi-k3-checkpoint", pat_str=pattern, mergeable_ranks=ranks, special_tokens=special
+        name="kimi-k3-checkpoint",
+        pat_str=pattern,
+        mergeable_ranks=ranks,
+        special_tokens=special,
     )
 
 
@@ -89,18 +95,21 @@ class Checkpoint:
         self.path = Path(path)
         self.config = Config.from_checkpoint(path)
         if self.config.without_dsa() != Config() or (
-            self.config.dsa and (self.config.index_heads, self.config.index_dim) != (32, 128)
+            self.config.dsa
+            and (self.config.index_heads, self.config.index_dim) != (32, 128)
         ):
             raise ValueError(
                 "This loader requires the full 93-layer/896-expert K3 (or K3.1: plus a "
                 "32 x 128 DSA indexer) contract"
             )
-        self.index = json.loads((self.path / "model.safetensors.index.json").read_text())[
-            "weight_map"
-        ]
+        self.index = json.loads(
+            (self.path / "model.safetensors.index.json").read_text()
+        )["weight_map"]
         missing = [f for f in set(self.index.values()) if not (self.path / f).is_file()]
         if missing:
-            raise FileNotFoundError(f"Checkpoint is missing {len(missing)} tensor shards")
+            raise FileNotFoundError(
+                f"Checkpoint is missing {len(missing)} tensor shards"
+            )
 
         self._layouts = {}
 
@@ -139,7 +148,10 @@ class Checkpoint:
         out = {}
         for filename, file_keys in by_file.items():
             header, base = self._layout(filename)
-            spans = sorted((header[k]["data_offsets"][0], header[k]["data_offsets"][1], k) for k in file_keys)
+            spans = sorted(
+                (header[k]["data_offsets"][0], header[k]["data_offsets"][1], k)
+                for k in file_keys
+            )
             ranges = []
             for start, end, key in spans:
                 if ranges and start - ranges[-1][1] <= self.COALESCE_GAP:
@@ -155,7 +167,9 @@ class Checkpoint:
                 try:
                     pieces = []
                     for offset in range(start, end, self.CHUNK):
-                        pieces.append(os.pread(fd, min(self.CHUNK, end - offset), base + offset))
+                        pieces.append(
+                            os.pread(fd, min(self.CHUNK, end - offset), base + offset)
+                        )
                 finally:
                     os.close(fd)
                 return b"".join(pieces)
@@ -167,7 +181,11 @@ class Checkpoint:
                 for key in range_keys:
                     meta = header[key]
                     a, b = meta["data_offsets"]
-                    out[key] = buffer[a - start:b - start].view(self._DTYPES[meta["dtype"]]).reshape(meta["shape"])
+                    out[key] = (
+                        buffer[a - start : b - start]
+                        .view(self._DTYPES[meta["dtype"]])
+                        .reshape(meta["shape"])
+                    )
         return out
 
     @staticmethod
@@ -179,10 +197,12 @@ class Checkpoint:
         width = 3072 // parts
         if down:
             return (
-                packed[:, part * width // 2:(part + 1) * width // 2],
-                scale[:, part * width // 32:(part + 1) * width // 32],
+                packed[:, part * width // 2 : (part + 1) * width // 2],
+                scale[:, part * width // 32 : (part + 1) * width // 32],
             )
-        return packed[part * width:(part + 1) * width], scale[part * width:(part + 1) * width]
+        return packed[part * width : (part + 1) * width], scale[
+            part * width : (part + 1) * width
+        ]
 
     # E8M0 scale bytes: 255 is NaN (rejected); 0 encodes 2^-127, which the
     # kernels decode as exactly zero (bitcast of ``e << 23``). Kimi-K3.1 stores
@@ -208,7 +228,11 @@ class Checkpoint:
             weights, scales = [], []
             for name in ("w1", "w3"):
                 packed, scale = self._expert_parts(
-                    tensors[prefix + name + ".weight_packed"], tensors[prefix + name + ".weight_scale"], False, part, parts
+                    tensors[prefix + name + ".weight_packed"],
+                    tensors[prefix + name + ".weight_scale"],
+                    False,
+                    part,
+                    parts,
                 )
                 if scale.dtype != np.uint8 or np.any(scale == 255):  # E8M0 255 is NaN
                     raise ValueError(f"{prefix}{name}: expected finite E8M0 scales")
@@ -217,7 +241,11 @@ class Checkpoint:
             gate_up.append(np.concatenate(weights, axis=1))
             gate_up_scales.append(np.concatenate(scales, axis=1))
             packed, scale = self._expert_parts(
-                tensors[prefix + "w2.weight_packed"], tensors[prefix + "w2.weight_scale"], True, part, parts
+                tensors[prefix + "w2.weight_packed"],
+                tensors[prefix + "w2.weight_scale"],
+                True,
+                part,
+                parts,
             )
             if scale.dtype != np.uint8 or np.any(scale == 255):  # E8M0 255 is NaN
                 raise ValueError(f"{prefix}w2: expected finite E8M0 scales")
@@ -262,10 +290,16 @@ class Checkpoint:
         try:
             pieces = []
             for chunk_start in range(0, length, self.CHUNK):
-                pieces.append(os.pread(fd, min(self.CHUNK, length - chunk_start), offset + chunk_start))
+                pieces.append(
+                    os.pread(
+                        fd, min(self.CHUNK, length - chunk_start), offset + chunk_start
+                    )
+                )
         finally:
             os.close(fd)
-        value = np.frombuffer(b"".join(pieces), dtype).reshape([r1 - r0, *shape[1:]] if shape else [])
+        value = np.frombuffer(b"".join(pieces), dtype).reshape(
+            [r1 - r0, *shape[1:]] if shape else []
+        )
         return value[rest] if rest else value
 
     def expert(self, layer, expert, down=False, part=None, parts=2):
@@ -322,9 +356,9 @@ class Checkpoint:
 
         def folded(stem, global_output=False):
             pre = PREFIX if global_output else base
-            return self.read(pre + stem + "_norm.weight").astype(np.float32) * self.read(
-                pre + stem + "_proj.weight"
-            ).astype(np.float32)
+            return self.read(pre + stem + "_norm.weight").astype(
+                np.float32
+            ) * self.read(pre + stem + "_proj.weight").astype(np.float32)
 
         if name in ("embedding", "lm_head"):
             key = (
@@ -342,7 +376,11 @@ class Checkpoint:
             return folded("self_attention_res" if name == "attn_res" else "mlp_res")
         if name in ("attn_norm", "ffn_norm"):
             return read(
-                ("input_layernorm" if name == "attn_norm" else "post_attention_layernorm")
+                (
+                    "input_layernorm"
+                    if name == "attn_norm"
+                    else "post_attention_layernorm"
+                )
                 + ".weight"
             )[None]
         if name in ("dense_gu", "shared_gu"):
@@ -355,7 +393,8 @@ class Checkpoint:
             return np.concatenate(
                 [
                     np.pad(
-                        matrix(stem + "." + p + "_proj", selection), ((0, 0), (0, padded - real))
+                        matrix(stem + "." + p + "_proj", selection),
+                        ((0, 0), (0, padded - real)),
                     )
                     for p in ("gate", "up")
                 ],
@@ -368,7 +407,10 @@ class Checkpoint:
                 else ("block_sparse_moe.shared_experts", 192, 256)
             )
             return np.pad(
-                matrix(stem + ".down_proj", contraction=slice(rank * real, (rank + 1) * real)),
+                matrix(
+                    stem + ".down_proj",
+                    contraction=slice(rank * real, (rank + 1) * real),
+                ),
                 ((0, padded - real), (0, 0)),
             )
         if name == "router":
@@ -377,7 +419,9 @@ class Checkpoint:
             return read("block_sparse_moe.gate.e_score_correction_bias")[None]
         if name == "latent_norm":
             return np.pad(
-                read("block_sparse_moe.routed_expert_norm.weight").astype(np.float32)[None],
+                read("block_sparse_moe.routed_expert_norm.weight").astype(np.float32)[
+                    None
+                ],
                 ((0, 0), (0, 512)),
             )
         if name in ("latent_down", "latent_up"):
@@ -408,9 +452,10 @@ class Checkpoint:
         if name == "k_conv":
             return np.stack(
                 [
-                    read("self_attn." + p + "_conv1d.weight", (rows, slice(None), slice(None)))[
-                        :, 0
-                    ].T.reshape(4, 3, 128)
+                    read(
+                        "self_attn." + p + "_conv1d.weight",
+                        (rows, slice(None), slice(None)),
+                    )[:, 0].T.reshape(4, 3, 128)
                     for p in ("q", "k", "v")
                 ],
                 axis=1,
@@ -427,14 +472,18 @@ class Checkpoint:
             return np.pad(matrix("self_attn.kv_a_proj_with_mqa"), ((0, 0), (0, 64)))
         if name == "m_qb":
             value = matrix("self_attn.q_b_proj", slice(rank * 576, (rank + 1) * 576))
-            return np.pad(value.reshape(1536, 3, 192), ((0, 0), (0, 0), (0, 64))).reshape(1536, 768)
+            return np.pad(
+                value.reshape(1536, 3, 192), ((0, 0), (0, 0), (0, 64))
+            ).reshape(1536, 768)
         if name == "m_kb":
             return matrix("self_attn.kv_b_proj", slice(rank * 768, (rank + 1) * 768))
         if name == "m_gate":
             return matrix("self_attn.g_proj", rows)
         if name in ("m_qnorm", "m_knorm"):
             return read(
-                "self_attn." + ("q_a" if name == "m_qnorm" else "kv_a") + "_layernorm.weight"
+                "self_attn."
+                + ("q_a" if name == "m_qnorm" else "kv_a")
+                + "_layernorm.weight"
             )[None]
         # Kimi-K3.1 DSA indexer (one per MLA layer). The query projection is
         # head-sharded (rank r: index head r, gathered over the ranks); the key
@@ -474,7 +523,10 @@ class Checkpoint:
             pair, half = divmod(rank, 2)
             value = self.read(
                 base + "self_attn.o_proj.weight",
-                (slice(half * hidden // 2, (half + 1) * hidden // 2), slice(pair * 768, (pair + 1) * 768)),
+                (
+                    slice(half * hidden // 2, (half + 1) * hidden // 2),
+                    slice(pair * 768, (pair + 1) * 768),
+                ),
             )
             return value.T.copy()
         if name == "latent_up":
@@ -491,7 +543,8 @@ class Checkpoint:
             return np.concatenate(
                 [
                     self.read(
-                        base + f"block_sparse_moe.shared_experts.{p}_proj.weight", (rows, slice(None))
+                        base + f"block_sparse_moe.shared_experts.{p}_proj.weight",
+                        (rows, slice(None)),
                     ).T
                     for p in ("gate", "up")
                 ],
@@ -569,12 +622,30 @@ def selected_local_shapes(layers=93, hidden=7168, *, vocab=163840, dsa=False):
 
 def _family_layers(config, name, layers):
     """Checkpoint layer ids stored along a family's leading axis (None: not per layer)."""
-    kda = {"k_gate", "k_projection", "k_fb", "k_o", "k_conv", "k_a_log", "k_dt", "k_norm"}
+    kda = {
+        "k_gate",
+        "k_projection",
+        "k_fb",
+        "k_o",
+        "k_conv",
+        "k_a_log",
+        "k_dt",
+        "k_norm",
+    }
     mla = {"m_qa", "m_ka", "m_qb", "m_kb", "m_gate", "m_o", "m_qnorm", "m_knorm"}
     mla |= {"d_wqb", "d_wk", "d_wproj", "d_knorm"}
     moe = {
-        "router", "router_bias", "latent_down", "latent_up", "latent_norm",
-        "shared_gu", "shared_down", "expert_gu", "expert_gus", "expert_down", "expert_ds",
+        "router",
+        "router_bias",
+        "latent_down",
+        "latent_up",
+        "latent_norm",
+        "shared_gu",
+        "shared_down",
+        "expert_gu",
+        "expert_gus",
+        "expert_down",
+        "expert_ds",
     }
     norms = {"attn_res", "mlp_res", "attn_norm", "ffn_norm"}
     if name in kda:
@@ -598,14 +669,22 @@ def _reblock_one(packed, scales, block_size):
         output_size,
     ).astype(jnp.int32)
     common_exponents = jnp.max(exponents, axis=1) - 6
-    coarse_scales = jnp.exp2(common_exponents.astype(jnp.float32) - 127).astype(jnp.bfloat16)
+    coarse_scales = jnp.exp2(common_exponents.astype(jnp.float32) - 127).astype(
+        jnp.bfloat16
+    )
     encoded = (
-        values.reshape(contraction_size // block_size, block_size, output_size).astype(jnp.float32)
+        values.reshape(contraction_size // block_size, block_size, output_size).astype(
+            jnp.float32
+        )
         / coarse_scales.astype(jnp.float32)[:, None, :]
     ).astype(jnp.float8_e4m3fn)
-    restored = (
-        encoded.astype(jnp.bfloat16) * coarse_scales[:, None, :]
-    ).reshape(contraction_size, output_size)
+    restored = (encoded.astype(jnp.bfloat16) * coarse_scales[:, None, :]).reshape(
+        contraction_size, output_size
+    )
     restored_bits = jax.lax.bitcast_convert_type(restored, jnp.uint16)
     value_bits = jax.lax.bitcast_convert_type(values, jnp.uint16)
-    return encoded.reshape(values.shape), coarse_scales, jnp.all(restored_bits == value_bits)
+    return (
+        encoded.reshape(values.shape),
+        coarse_scales,
+        jnp.all(restored_bits == value_bits),
+    )

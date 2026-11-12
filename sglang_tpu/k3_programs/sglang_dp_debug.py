@@ -77,7 +77,12 @@ def install() -> None:
         _POOL["ptr"] = pool.data_ptr()
         logger.warning(
             "K3DBG bind rank=%d pos=%d num_blocks=%d kv_blocks=%d shape=%s ptr=%x",
-            _rank(), _position(), plan.num_blocks, plan.kv_blocks, tuple(pool.shape), pool.data_ptr(),
+            _rank(),
+            _position(),
+            plan.num_blocks,
+            plan.kv_blocks,
+            tuple(pool.shape),
+            pool.data_ptr(),
         )
 
     sglang_pools.K3StatePool.bind = bind_debug
@@ -90,15 +95,24 @@ def install() -> None:
             pool = _mla0(caches)
             logger.warning(
                 "K3DBG P rank=%d pos=%d room=%s last=%s pages=%s sums=%s state=%s",
-                _rank(), _position(), self.bootstrap_room, getattr(self, "_last_chunk", None),
-                [int(p) for p in kv_indices], row_sums(pool, kv_indices),
-                None if state_indices is None else np.asarray(state_indices).reshape(-1).tolist()[:4],
+                _rank(),
+                _position(),
+                self.bootstrap_room,
+                getattr(self, "_last_chunk", None),
+                [int(p) for p in kv_indices],
+                row_sums(pool, kv_indices),
+                None
+                if state_indices is None
+                else np.asarray(state_indices).reshape(-1).tolist()[:4],
             )
             if state_indices is not None:
                 slot = int(np.asarray(state_indices).reshape(-1)[0])
                 logger.warning(
                     "K3DBG P-state rank=%d room=%s slot=%d kda0=%s",
-                    _rank(), self.bootstrap_room, slot, _kda0_sum(slot),
+                    _rank(),
+                    self.bootstrap_room,
+                    slot,
+                    _kda0_sum(slot),
                 )
         return send(self, kv_indices, state_indices, num_kv_tokens)
 
@@ -114,19 +128,34 @@ def install() -> None:
             for req, (pages, landing) in swaps:
                 rows = [r for p in pages for r in self.dp.rows(int(p))]
                 lrows = [r for p in landing for r in self.dp.rows(int(p))]
-                before[req.rid] = (rows, row_sums(pool, rows), lrows, row_sums(pool, lrows))
+                before[req.rid] = (
+                    rows,
+                    row_sums(pool, rows),
+                    lrows,
+                    row_sums(pool, lrows),
+                )
                 logger.warning(
                     "K3DBG D-pre rank=%d pos=%d room=%s rid=%s group=%d pages=%s landing=%s "
                     "rows=%s sums=%s lrows=%s lsums=%s ptr=%x bound=%x slot=%s",
-                    _rank(), _position(), getattr(req, "bootstrap_room", None), req.rid,
-                    self.dp.group(int(pages[0])), list(pages), list(landing),
-                    rows, before[req.rid][1], lrows, before[req.rid][3],
-                    pool.data_ptr(), _POOL.get("ptr", 0),
+                    _rank(),
+                    _position(),
+                    getattr(req, "bootstrap_room", None),
+                    req.rid,
+                    self.dp.group(int(pages[0])),
+                    list(pages),
+                    list(landing),
+                    rows,
+                    before[req.rid][1],
+                    lrows,
+                    before[req.rid][3],
+                    pool.data_ptr(),
+                    _POOL.get("ptr", 0),
                     int(req.kv.mamba_pool_idx.reshape(-1)[0]),
                 )
                 logger.warning(
                     "K3DBG D-state rank=%d room=%s kda0=%s",
-                    _rank(), getattr(req, "bootstrap_room", None),
+                    _rank(),
+                    getattr(req, "bootstrap_room", None),
                     _kda0_sum(int(req.kv.mamba_pool_idx.reshape(-1)[0])),
                 )
         swap(self, swaps)
@@ -135,7 +164,11 @@ def install() -> None:
                 rows, _, lrows, _ = before[req.rid]
                 logger.warning(
                     "K3DBG D-post rank=%d pos=%d rid=%s sums=%s lsums=%s ptr=%x",
-                    _rank(), _position(), req.rid, row_sums(pool, rows), row_sums(pool, lrows),
+                    _rank(),
+                    _position(),
+                    req.rid,
+                    row_sums(pool, rows),
+                    row_sums(pool, lrows),
                     pool.data_ptr(),
                 )
 

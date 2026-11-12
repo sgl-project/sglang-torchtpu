@@ -40,8 +40,13 @@ class RowEngine:
     built = []
 
     def __init__(self, device_pool, num_host_pages):
-        self.pools = [device_pool.get_fused_kv_buffer(i) for i in range(device_pool.layer_num)]
-        self.host = [torch.zeros((num_host_pages, *p.shape[1:]), dtype=p.dtype) for p in self.pools]
+        self.pools = [
+            device_pool.get_fused_kv_buffer(i) for i in range(device_pool.layer_num)
+        ]
+        self.host = [
+            torch.zeros((num_host_pages, *p.shape[1:]), dtype=p.dtype)
+            for p in self.pools
+        ]
         self.calls = []
         RowEngine.built.append(self)
 
@@ -54,7 +59,9 @@ class RowEngine:
     def load(self, host_pages, device_pages):
         self.calls.append(("load", list(host_pages), list(device_pages)))
         for pool, host in zip(self.pools, self.host):
-            pool.index_copy_(0, torch.tensor(device_pages), host[torch.tensor(host_pages)])
+            pool.index_copy_(
+                0, torch.tensor(device_pages), host[torch.tensor(host_pages)]
+            )
         return NOOP_EVENT
 
 
@@ -69,7 +76,11 @@ def _pools(slots=4, pages=10):
     ):
         state = sglang_pools.K3StatePool(size=slots, mamba_layer_ids=KDA, device="cpu")
         kv = sglang_pools.K3UnifiedKVPool(
-            size=pages * STEP, page_size=STEP, dtype=torch.bfloat16, layer_num=len(MLA), device="cpu"
+            size=pages * STEP,
+            page_size=STEP,
+            dtype=torch.bfloat16,
+            layer_num=len(MLA),
+            device="cpu",
         )
     for i, pool in enumerate(kv.raw_pools()):
         pool.copy_(torch.randn(pool.shape).to(pool.dtype) + i)
@@ -86,7 +97,9 @@ class TestHostPools(CustomTestCase):
         self.view = hicache.K3PoolView(self.kv.raw_pools(), STEP, "cpu")
         self.engine = RowEngine(self.view, 8 + 3 * 2)
         self.kv_host = hicache.K3HostKVPool(self.kv, self.view, self.engine, 8, STEP)
-        self.state_host = hicache.K3HostStatePool(self.state, self.engine, 2, 8, self.view.block_bytes)
+        self.state_host = hicache.K3HostStatePool(
+            self.state, self.engine, 2, 8, self.view.block_bytes
+        )
 
     def test_view_and_sizes(self):
         self.assertEqual(self.view.layer_num, len(MLA) + bridge.DSPARK_DRAFT_LAYERS)
@@ -101,7 +114,9 @@ class TestHostPools(CustomTestCase):
     def test_kv_pages_round_trip_in_every_pool(self):
         before = [p[[3, 5]].clone() for p in self.kv.raw_pools()]
         host = self.kv_host.alloc(2 * STEP)
-        self.kv_host.backup_from_device_all_layer(self.kv, host, _tokens([3, 5]), ENGINE)
+        self.kv_host.backup_from_device_all_layer(
+            self.kv, host, _tokens([3, 5]), ENGINE
+        )
         for pool in self.kv.raw_pools():
             pool[[3, 5]] = 0
         self.kv_host.load_all_layer(self.kv, host, _tokens([6, 7]))
@@ -116,7 +131,9 @@ class TestHostPools(CustomTestCase):
         rows = [plan.state_row(2) + g for g in range(3)]
         before = [p[rows].clone() for p in self.kv.raw_pools()]
         host = self.state_host.alloc(1)
-        self.state_host.backup_from_device_all_layer(self.state, host, torch.tensor([2]), ENGINE)
+        self.state_host.backup_from_device_all_layer(
+            self.state, host, torch.tensor([2]), ENGINE
+        )
         self.assertEqual(self.engine.calls[-1], ("backup", rows, [8, 9, 10]))
         # Loaded into another slot, as a prefix hit's copy into a request's slot.
         self.state_host.load_all_layer(self.state, host, torch.tensor([[3]]))
@@ -132,7 +149,9 @@ class TestStrategyAndController(CustomTestCase):
     def _kvcache(self, kv):
         cache = HybridLinearKVPool.__new__(HybridLinearKVPool)
         cache.full_kv_pool = kv
-        cache.full_attention_layer_id_mapping = {layer: m for m, layer in enumerate(MLA)}
+        cache.full_attention_layer_id_mapping = {
+            layer: m for m, layer in enumerate(MLA)
+        }
         cache.start_layer = 0
         return cache
 
@@ -142,7 +161,9 @@ class TestStrategyAndController(CustomTestCase):
         components = {ComponentType.FULL, ComponentType.MAMBA}
         hicache.install()
         hicache.install()  # idempotent
-        self.assertIsInstance(assembler._select_strategy(kvcache, components), hicache.K3Strategy)
+        self.assertIsInstance(
+            assembler._select_strategy(kvcache, components), hicache.K3Strategy
+        )
         other = HybridLinearKVPool.__new__(HybridLinearKVPool)
         other.full_kv_pool = object()
         self.assertNotIsInstance(
@@ -191,7 +212,10 @@ class TestStrategyAndController(CustomTestCase):
             tpu_envs.SGLANG_TPU_K3_PROGRAM_HICACHE_CHECKPOINTS.override(3),
         ):
             result = hicache.K3Strategy().build(
-                cache=SimpleNamespace(), kvcache=kvcache, params=params, server_args=None,
+                cache=SimpleNamespace(),
+                kvcache=kvcache,
+                params=params,
+                server_args=None,
                 load_cache_event=None,
             )
         (engine,) = RowEngine.built
@@ -203,12 +227,15 @@ class TestStrategyAndController(CustomTestCase):
         kv_host = result.component_host_pools[ComponentType.FULL]
         state_host = result.component_host_pools[ComponentType.MAMBA]
         self.assertEqual(kv_host.page_num, 2 * kv.plan.kv_blocks)
-        self.assertEqual((state_host.size, state_host.block_base), (3, kv_host.page_num))
+        self.assertEqual(
+            (state_host.size, state_host.block_base), (3, kv_host.page_num)
+        )
         self.assertEqual(engine.host[0].shape[0], kv_host.page_num + 3 * 3)
         self.assertIs(kv_host.transfer, state_host.transfer)
         self.assertIsInstance(result.cache_controller, hicache.K3HybridCacheController)
         self.assertEqual(
-            {e.name for e in result.host_pool_group.entries}, {PoolName.KV, PoolName.MAMBA}
+            {e.name for e in result.host_pool_group.entries},
+            {PoolName.KV, PoolName.MAMBA},
         )
         self.assertIsInstance(kv.layer_transfer_counter, BatchDoneCounter)
 
@@ -231,7 +258,9 @@ class TestStrategyAndController(CustomTestCase):
             pool[[3, 5]] = 0
             pool[rows] = 0
         restore = PoolTransfer(
-            name=PoolName.MAMBA, host_indices=backup.host_indices, device_indices=torch.tensor([3])
+            name=PoolName.MAMBA,
+            host_indices=backup.host_indices,
+            device_indices=torch.tensor([3]),
         )
         device = controller.load(host, extra_pools=[restore])
         self.assertEqual(device.tolist(), _tokens([6, 7]).tolist())
@@ -270,15 +299,27 @@ class _StubPrefill:
 
     def step(self, step_input):
         self.order.append("step")
-        return StepOutput(torch.full((len(step_input.requests), 1), 50, dtype=torch.int32))
+        return StepOutput(
+            torch.full((len(step_input.requests), 1), 50, dtype=torch.int32)
+        )
 
 
 def _req(rid, prompt, pool_idx, slot):
     return SimpleNamespace(
-        rid=rid, grammar=None, is_retracted=False, finished=lambda: False,
-        origin_input_ids=list(range(prompt)), output_ids=[],
-        sampling_params=SimpleNamespace(temperature=1.0, top_p=1.0, top_k=1, sampling_seed=None),
-        kv=SimpleNamespace(kv_committed_len=0, req_pool_idx=pool_idx, mamba_pool_idx=torch.tensor([slot])),
+        rid=rid,
+        grammar=None,
+        is_retracted=False,
+        finished=lambda: False,
+        origin_input_ids=list(range(prompt)),
+        output_ids=[],
+        sampling_params=SimpleNamespace(
+            temperature=1.0, top_p=1.0, top_k=1, sampling_seed=None
+        ),
+        kv=SimpleNamespace(
+            kv_committed_len=0,
+            req_pool_idx=pool_idx,
+            mamba_pool_idx=torch.tensor([slot]),
+        ),
     )
 
 
@@ -295,7 +336,8 @@ class TestWorkerWaitsForReloads(CustomTestCase):
             model_runner=None,
             hicache_layer_transfer_counter=counter,
             get_memory_pool=lambda: (
-                SimpleNamespace(req_to_token=r2t, mamba_pool=state_pool), None
+                SimpleNamespace(req_to_token=r2t, mamba_pool=state_pool),
+                None,
             ),
         )
         worker.K3ProgramWorker.build_steps = lambda target_worker: worker.PrefillSteps(

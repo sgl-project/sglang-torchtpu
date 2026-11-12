@@ -452,7 +452,9 @@ def _latent_gather_steps(
     seed.wait()
 
 
-def _latent_ready_init(tables, payload, output, send, recv, stores, state, meta, *, rank):
+def _latent_ready_init(
+    tables, payload, output, send, recv, stores, state, meta, *, rank
+):
     """Seed twelve independently progressing streams of the 8K latent gather.
 
     Cache neighbor IDs and owner row offsets in SMEM once. Each stream tracks
@@ -467,11 +469,20 @@ def _latent_ready_init(tables, payload, output, send, recv, stores, state, meta,
         meta[directed * 34 + 1] = tables[family, 1, (position - direction) & 31]
 
         @pl.loop(0, 32)
-        def owners(step, *, family=family, position=position, direction=direction, directed=directed):
+        def owners(
+            step,
+            *,
+            family=family,
+            position=position,
+            direction=direction,
+            directed=directed,
+        ):
             owner = tables[family, 1, (position - direction * step) & 31]
             meta[directed * 34 + 2 + step] = owner * rows
 
-    pltpu.make_async_copy(payload, output.at[pl.ds(rank * rows, rows), :, :], stores).start()
+    pltpu.make_async_copy(
+        payload, output.at[pl.ds(rank * rows, rows), :, :], stores
+    ).start()
     state[0] = 12
     begin = 0
     for stream in range(12):
@@ -513,7 +524,15 @@ def _latent_ready_progress(
             step = state[1 + stream]
 
             @pl.when(state[13 + stream] == 0)
-            def receive(*, step=step, stream=stream, units=units, base=base, start=start, size=size):
+            def receive(
+                *,
+                step=step,
+                stream=stream,
+                units=units,
+                base=base,
+                start=start,
+                size=size,
+            ):
                 bank = (step - 1) & 1
                 ready = (pl.semaphore_read(send.at[stream]) >= units) & (
                     pl.semaphore_read(recv.at[bank, stream]) >= units
@@ -521,7 +540,9 @@ def _latent_ready_progress(
 
                 @pl.when(ready)
                 def consume():
-                    incoming = output.at[pl.ds(meta[base + 2 + step] + start, size), :, :]
+                    incoming = output.at[
+                        pl.ds(meta[base + 2 + step] + start, size), :, :
+                    ]
                     # wait_send only consumes its completion count; the HBM view
                     # has the same logical transfer size as the initial VMEM source.
                     transfer = pltpu.make_async_remote_copy(
@@ -538,7 +559,10 @@ def _latent_ready_progress(
                     @pl.when(step < 30)
                     def credit():
                         pl.semaphore_signal(
-                            credits.at[stream], 1, device_id=meta[base + 1], device_id_type=pl.DeviceIdType.LOGICAL
+                            credits.at[stream],
+                            1,
+                            device_id=meta[base + 1],
+                            device_id_type=pl.DeviceIdType.LOGICAL,
                         )
 
                     state[13 + stream] = jnp.where(step == 31, 2, 1)
@@ -576,7 +600,9 @@ def _latent_ready_progress(
             return i + 1
 
         jax.lax.while_loop(lambda i: state[0] != 0, body, jnp.int32(0))
-        pltpu.make_async_copy(payload, output.at[pl.ds(rank * rows, rows), :, :], stores).wait()
+        pltpu.make_async_copy(
+            payload, output.at[pl.ds(rank * rows, rows), :, :], stores
+        ).wait()
     else:
 
         @pl.when(state[0] != 0)
@@ -768,25 +794,44 @@ def _prologue(
         )
         if rows == 256:
             latent_tick = 0
+
             def latent_progress(*, drain=False):
                 nonlocal latent_tick
                 if latent_tick == 0:
-                    _latent_ready_init(tables, s["latent_payload"], latent_hbm,
-                        s["latent_send_sems"], s["latent_recv_sems"], s["latent_stores"],
-                        s["latent_state"], s["latent_meta"], rank=rank)
+                    _latent_ready_init(
+                        tables,
+                        s["latent_payload"],
+                        latent_hbm,
+                        s["latent_send_sems"],
+                        s["latent_recv_sems"],
+                        s["latent_stores"],
+                        s["latent_state"],
+                        s["latent_meta"],
+                        rank=rank,
+                    )
                 else:
-                    _latent_ready_progress(s["latent_payload"], latent_hbm,
-                        s["latent_send_sems"], s["latent_recv_sems"], s["latent_credits"],
-                        s["latent_stores"], s["latent_state"], s["latent_meta"], rank=rank,
-                        drain=drain)
+                    _latent_ready_progress(
+                        s["latent_payload"],
+                        latent_hbm,
+                        s["latent_send_sems"],
+                        s["latent_recv_sems"],
+                        s["latent_credits"],
+                        s["latent_stores"],
+                        s["latent_state"],
+                        s["latent_meta"],
+                        rank=rank,
+                        drain=drain,
+                    )
                 latent_tick += 1
         else:
+
             def latent_progress(*, drain=False):
                 if drain:
                     for _ in latent_steps:
                         pass
                 else:
                     next(latent_steps, None)
+
         peer_input.wait_send()
         peer_input.wait_recv()
 
@@ -1052,9 +1097,19 @@ def _routed_experts(
             family, direction = directed // 2, -1 if directed % 2 == 0 else 1
             position = tables[family, 0, rank]
             ring_meta[directed * 34] = tables[family, 1, (position + direction) & 31]
-            ring_meta[directed * 34 + 1] = tables[family, 1, (position - direction) & 31]
+            ring_meta[directed * 34 + 1] = tables[
+                family, 1, (position - direction) & 31
+            ]
+
             @pl.loop(0, 32)
-            def hop(step, *, family=family, position=position, direction=direction, directed=directed):
+            def hop(
+                step,
+                *,
+                family=family,
+                position=position,
+                direction=direction,
+                directed=directed,
+            ):
                 owner_mesh = tables[family, 1, (position - direction * (step + 1)) & 31]
                 owner = tables[family, 2, owner_mesh]
                 ring_meta[directed * 34 + 2 + step] = owner * localrows
@@ -1075,9 +1130,22 @@ def _routed_experts(
         # poll; longer loops alternate six-stream groups to bound polling cost.
         def advance(stop, block, subtotal_vmem, *, drain=False, poll_round=0):
             _ready_reduce(
-                tables, subtotal_vmem, out.at[:, pl.ds(block * tn, tn)],
-                sends, receives, credits, stores, payload, rx,
-                streams=regions, buffers=2, state=state, ring_meta=ring_meta, drain=drain, poll_round=poll_round, sparse_poll=(ng >= 72),
+                tables,
+                subtotal_vmem,
+                out.at[:, pl.ds(block * tn, tn)],
+                sends,
+                receives,
+                credits,
+                stores,
+                payload,
+                rx,
+                streams=regions,
+                buffers=2,
+                state=state,
+                ring_meta=ring_meta,
+                drain=drain,
+                poll_round=poll_round,
+                sparse_poll=(ng >= 72),
             )
 
         def emit_subtotals(subtotal_vmem):
@@ -1144,7 +1212,12 @@ def _routed_experts(
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
 
             if not first:
-                advance(jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem, poll_round=g)
+                advance(
+                    jnp.minimum(32, (g + 1) * 32 // ng),
+                    n - 1,
+                    subtotal_vmem,
+                    poll_round=g,
+                )
             current = packed.at[g % 2]
             previous = packed.at[(g + 1) % 2]
             previous_g = jnp.maximum(g - 1, 0)
@@ -1475,16 +1548,20 @@ def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
         panel_width = min(columns, width - first)
         if panel_local:
             panel_rhs = _column_rhs(rhs, first, panel_width)
-            panel_weights = panel_rhs.get_weight().astype(cfgs.lhs_cfgs.dtype).reshape(
-                cfgs.num_quant_blocks_per_tile_k, block, panel_width
+            panel_weights = (
+                panel_rhs.get_weight()
+                .astype(cfgs.lhs_cfgs.dtype)
+                .reshape(cfgs.num_quant_blocks_per_tile_k, block, panel_width)
             )
-            scales = panel_rhs.get_scale(replicate_size=block).astype(cfgs.lhs_cfgs.dtype)
+            scales = panel_rhs.get_scale(replicate_size=block).astype(
+                cfgs.lhs_cfgs.dtype
+            )
             panel_weights = (panel_weights * scales).reshape(
                 cfgs.tiles.tile_k, panel_width
             )
         else:
             assert weights is not None
-            panel_weights = weights[:, first:first + panel_width]
+            panel_weights = weights[:, first : first + panel_width]
         accumulator = jnp.zeros((bucket_rows, panel_width), cfgs.acc_dtype)
         product = jnp.matmul(
             activations, panel_weights, preferred_element_type=jnp.float32
@@ -1738,22 +1815,30 @@ def _ready_reduce(
         peers = [(ring_meta[d * 34],) for d in range(6)]
         sem = pltpu.get_barrier_semaphore()
         for peer in peers:
-            pl.semaphore_signal(sem, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH)
+            pl.semaphore_signal(
+                sem, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH
+            )
         pl.semaphore_wait(sem, len(peers))
 
         @functools.partial(pl.run_scoped, ready=pltpu.SemaphoreType.REGULAR)
         def initialized(ready):
             for peer in peers:
-                pl.semaphore_signal(ready, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH)
+                pl.semaphore_signal(
+                    ready, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH
+                )
             pl.semaphore_wait(ready, len(peers))
 
         for stream, region in enumerate(streams):
             begin, size, col_begin, width = region
             base = (stream % 6) * 34
             rows, cols = pl.ds(begin, size), pl.ds(col_begin, width)
-            source_rows = pl.ds(pl.multiple_of(ring_meta[base + 2], o_ref.shape[0]) + begin, size)
+            source_rows = pl.ds(
+                pl.multiple_of(ring_meta[base + 2], o_ref.shape[0]) + begin, size
+            )
             target = (ring_meta[base],)
-            payload.at[rows, cols][...] = x_ref.at[source_rows, cols][...].astype(payload.dtype)
+            payload.at[rows, cols][...] = x_ref.at[source_rows, cols][...].astype(
+                payload.dtype
+            )
             remote(stream, rows, cols, target, jnp.int32(0)).start()
             state[1 + stream] = 1
             state[1 + count + stream] = 0
@@ -1771,7 +1856,15 @@ def _ready_reduce(
 
             @pl.when(state[1 + count + stream] == 0)
             def receive(
-                *, step=step, stream=stream, units=units, base=base, rows=rows, cols=cols, begin=begin, size=size
+                *,
+                step=step,
+                stream=stream,
+                units=units,
+                base=base,
+                rows=rows,
+                cols=cols,
+                begin=begin,
+                size=size,
             ):
                 bank = (step - 1) & 1
                 ready = (pl.semaphore_read(send_sems.at[stream]) >= units) & (
@@ -1782,18 +1875,28 @@ def _ready_reduce(
                 def reduce():
                     target = (ring_meta[base],)
                     remote(stream, rows, cols, target, bank).wait()
-                    source_rows = pl.ds(pl.multiple_of(ring_meta[base + 2 + step], o_ref.shape[0]) + begin, size)
+                    source_rows = pl.ds(
+                        pl.multiple_of(ring_meta[base + 2 + step], o_ref.shape[0])
+                        + begin,
+                        size,
+                    )
                     payload.at[rows, cols][...] = (
-                        x_ref.at[source_rows, cols][...].astype(payload.dtype) + received.at[bank, rows, cols][...]
+                        x_ref.at[source_rows, cols][...].astype(payload.dtype)
+                        + received.at[bank, rows, cols][...]
                     )
                     pl.semaphore_signal(
-                        credits.at[stream], 1, device_id=(ring_meta[base + 1],), device_id_type=pl.DeviceIdType.MESH
+                        credits.at[stream],
+                        1,
+                        device_id=(ring_meta[base + 1],),
+                        device_id_type=pl.DeviceIdType.MESH,
                     )
                     state[1 + count + stream] = jnp.where(step == 31, 2, 1)
 
             @pl.when(state[1 + count + stream] == 1)
             def forward(*, step=step, stream=stream, rows=rows, cols=cols, base=base):
-                available = (step < buffers) | (pl.semaphore_read(credits.at[stream]) >= 1)
+                available = (step < buffers) | (
+                    pl.semaphore_read(credits.at[stream]) >= 1
+                )
 
                 @pl.when(available)
                 def send():
@@ -2003,10 +2106,13 @@ def _layer_kernel(
 
         def prepare(ids_v, probs_v):
             indices = pltpu.make_async_copy(
-                ids_v.at[: capacity // 128, :], s["ids"], s["index_sem"])
+                ids_v.at[: capacity // 128, :], s["ids"], s["index_sem"]
+            )
+
             def metadata_ready():
                 indices.start()
                 probability_copy(probs_v).start()
+
             _prologue(
                 tables,
                 control,

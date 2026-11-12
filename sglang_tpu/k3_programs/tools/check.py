@@ -99,7 +99,9 @@ def add_arguments(parser) -> None:
         default=None,
         help="the DSpark speculator checkpoint: compare the prefill's rings too",
     )
-    from sglang_tpu.k3_programs.tools.check_mla import add_arguments as add_mla_arguments
+    from sglang_tpu.k3_programs.tools.check_mla import (
+        add_arguments as add_mla_arguments,
+    )
 
     add_mla_arguments(sub)
     greedy = sub.add_parser(

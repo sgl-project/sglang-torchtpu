@@ -36,9 +36,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 
-from sglang_tpu.k3_programs._support.sharded_jax_op import sharded_jax_op
-from sglang_tpu.k3_programs._support.logger import init_logger
 from sglang_tpu.k3_programs import export_cache
+from sglang_tpu.k3_programs._support.logger import init_logger
+from sglang_tpu.k3_programs._support.sharded_jax_op import sharded_jax_op
 from sglang_tpu.k3_programs.config import get_active_kernel_config
 
 logger = init_logger(__name__)
@@ -138,7 +138,9 @@ def _keyed_on_kernel_config(export_key: str | None) -> str | None:
 TORCH_OP_ARGS = 64
 
 
-def _operand_runs(in_specs: tuple, donate_argnums: tuple[int, ...]) -> list[tuple[int, int]]:
+def _operand_runs(
+    in_specs: tuple, donate_argnums: tuple[int, ...]
+) -> list[tuple[int, int]]:
     """The operands' ``[start, end)`` runs, one per op argument.
 
     Up to ``TORCH_OP_ARGS`` operands, one run each. Past it (Kimi-K3.1's steps
@@ -236,12 +238,16 @@ def _sync_debug(name: str, op: Any) -> Any:
 
     def call(*args):
         out = op(*args)
-        for index, tensor in enumerate(out if isinstance(out, (tuple, list)) else (out,)):
+        for index, tensor in enumerate(
+            out if isinstance(out, (tuple, list)) else (out,)
+        ):
             if isinstance(tensor, torch.Tensor):
                 try:
                     materialize(tensor)
                 except Exception as exc:
-                    logger.error("K3_SYNC_OPS: %s output %d failed: %s", name, index, exc)
+                    logger.error(
+                        "K3_SYNC_OPS: %s output %d failed: %s", name, index, exc
+                    )
                     raise
         return out
 

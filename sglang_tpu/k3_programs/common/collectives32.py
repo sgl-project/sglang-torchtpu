@@ -11,5 +11,7 @@ def barrier():
     rank = jax.lax.axis_index("tp")
     sem = tpu.get_barrier_semaphore()
     for offset in range(1, 32):
-        pl.semaphore_signal(sem, 1, device_id=(rank ^ offset,), device_id_type=pl.DeviceIdType.MESH)
+        pl.semaphore_signal(
+            sem, 1, device_id=(rank ^ offset,), device_id_type=pl.DeviceIdType.MESH
+        )
     pl.semaphore_wait(sem, 31)

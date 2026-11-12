@@ -55,7 +55,9 @@ if ROLE == "decode":
     RUNNING = int(os.environ.get("K3_PROGRAM_DECODE_RUNNING", RUNNING))
 # Attention DP2 on the decode (k3_programs/sglang_dp.py): two DCP16 groups,
 # three drafts up to 32 requests (16 a group).
-ATTENTION_DP = int(os.environ.get("K3_PROGRAM_ATTENTION_DP", "1")) if ROLE == "decode" else 1
+ATTENTION_DP = (
+    int(os.environ.get("K3_PROGRAM_ATTENTION_DP", "1")) if ROLE == "decode" else 1
+)
 # A prefill chunk is one page: every full chunk ends on a KDA checkpoint the
 # prefix cache keeps (the programs' windows split it as they need).
 PREFILL_CHUNK = PAGE_SIZE
@@ -162,8 +164,8 @@ else:
             ),
             hicache_size=HICACHE_GB,
         )
-        CONFIG["runtime_env"]["SGLANG_TPU_K3_PROGRAM_HICACHE_CHECKPOINTS"] = os.environ.get(
-            "K3_PROGRAM_HICACHE_CHECKPOINTS", "512"
+        CONFIG["runtime_env"]["SGLANG_TPU_K3_PROGRAM_HICACHE_CHECKPOINTS"] = (
+            os.environ.get("K3_PROGRAM_HICACHE_CHECKPOINTS", "512")
         )
 runtime_env = CONFIG["runtime_env"]
 # The sglang decoder kernels' switches: the program replaces the decoder.

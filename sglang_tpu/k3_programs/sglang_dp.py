@@ -84,7 +84,9 @@ class DpPages:
         0-padded to ``width``."""
         used = -(-seq_len // GROUP_BLOCK_TOKENS)
         if used > width:
-            raise ValueError(f"{seq_len} tokens need {used} blocks; the table holds {width}")
+            raise ValueError(
+                f"{seq_len} tokens need {used} blocks; the table holds {width}"
+            )
         if -(-used // GROUPS) > len(pages):
             raise ValueError(f"{len(pages)} pages do not cover {seq_len} tokens")
         groups = {self.group(int(p)) for p in pages[: -(-used // GROUPS)]}
@@ -140,9 +142,10 @@ def check_rank_order(ranks: Sequence[int] | None) -> None:
     ranks = tuple(range(world)) if ranks is None else tuple(ranks)
     for p in range(world):
         partner = (p + GROUP_RANKS) % world
-        if ranks[p] // GROUP_RANKS != p // GROUP_RANKS or ranks[partner] != (
-            ranks[p] + GROUP_RANKS
-        ) % world:
+        if (
+            ranks[p] // GROUP_RANKS != p // GROUP_RANKS
+            or ranks[partner] != (ranks[p] + GROUP_RANKS) % world
+        ):
             raise RuntimeError(
                 f"K3 decode DP2: TP ranks by mesh position {list(ranks)} do not "
                 "keep the DP groups and swap partners"
@@ -174,7 +177,9 @@ class ColoRows:
 
     def __init__(self, num_blocks: int, base: int, rows: int) -> None:
         if rows < 1:
-            raise ValueError("colocated DP2 needs reserved B rows (UnifiedPoolPlan.dp_rows)")
+            raise ValueError(
+                "colocated DP2 needs reserved B rows (UnifiedPoolPlan.dp_rows)"
+            )
         self.num_blocks = int(num_blocks)
         self._free = [list(range(base + rows - 1, base - 1, -1)) for _ in range(GROUPS)]
         self.group: dict[str, int] = {}
@@ -222,7 +227,9 @@ class ColoRows:
         pages = [int(p) for p in pages]
         held = self._pages[rid]
         if pages[: len(held)] != held[: len(pages)]:
-            raise RuntimeError(f"K3 decode DP2: request {rid}'s pages changed: {held} -> {pages}")
+            raise RuntimeError(
+                f"K3 decode DP2: request {rid}'s pages changed: {held} -> {pages}"
+            )
         if len(pages) > len(held):
             self._b[rid] += self._take(self.group[rid], len(pages) - len(held))
             self._pages[rid] = pages
@@ -234,7 +241,9 @@ class ColoRows:
         which a step may write, as without DP)."""
         used = -(-int(seq_len) // GROUP_BLOCK_TOKENS)
         if used > width:
-            raise ValueError(f"{seq_len} tokens need {used} blocks; the table holds {width}")
+            raise ValueError(
+                f"{seq_len} tokens need {used} blocks; the table holds {width}"
+            )
         group, pages, b = self.group[rid], self._pages[rid], self._b[rid]
         base = group * self.num_blocks
         ids = []
@@ -308,7 +317,10 @@ def swap_body(axis: str = "tp"):
     import jax
     import jax.numpy as jnp
 
-    perm = [(r, (r + GROUP_RANKS) % (GROUPS * GROUP_RANKS)) for r in range(GROUPS * GROUP_RANKS)]
+    perm = [
+        (r, (r + GROUP_RANKS) % (GROUPS * GROUP_RANKS))
+        for r in range(GROUPS * GROUP_RANKS)
+    ]
 
     def body(sources, destinations, groups, *pools):
         mine = jax.lax.axis_index(axis) // GROUP_RANKS
@@ -319,7 +331,9 @@ def swap_body(axis: str = "tp"):
             sent = words[sources]
             got = jax.lax.ppermute(sent, axis, perm)
             mask = write.reshape((-1,) + (1,) * (sent.ndim - 1))
-            words = words.at[destinations].set(jnp.where(mask, got, words[destinations]))
+            words = words.at[destinations].set(
+                jnp.where(mask, got, words[destinations])
+            )
             out.append(words.view(pool.dtype) if words.dtype != pool.dtype else words)
         return tuple(out)
 
@@ -368,7 +382,9 @@ def make_swapper(program):
     def swap(jobs) -> None:
         for sources, destinations, groups in swap_operands(jobs):
             op = op_for(len(sources))
-            operands = [torch.from_numpy(a).to("tpu") for a in (sources, destinations, groups)]
+            operands = [
+                torch.from_numpy(a).to("tpu") for a in (sources, destinations, groups)
+            ]
             for pool in pools():
                 (fresh,) = op(*operands, pool)
                 if fresh is not pool:

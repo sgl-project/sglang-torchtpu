@@ -56,7 +56,11 @@ def ring(batch: int = 1) -> int:
     config = active()
     if config is None or batch > 16:
         return 3
-    return max(2, config.dsa_weight_ring if batch <= 8 else min(config.dsa_weight_ring, 6))
+    return max(
+        2, config.dsa_weight_ring if batch <= 8 else min(config.dsa_weight_ring, 6)
+    )
+
+
 LANES = dsa_dcp.LANES
 RECORD_SHAPE = (2, LANES)  # key bytes | UE8M0 byte in lane 0 (int32 lanes)
 
@@ -81,7 +85,7 @@ def _blocked(w):
     rows, hidden = w.shape
     blocks = w.reshape(rows, hidden // DIM, DIM).transpose(1, 0, 2).reshape(-1, DIM)
     out = np.zeros((-(-blocks.shape[0] // CHUNK) * CHUNK, DIM), ml_dtypes.bfloat16)
-    out[:blocks.shape[0]] = blocks.astype(ml_dtypes.bfloat16)
+    out[: blocks.shape[0]] = blocks.astype(ml_dtypes.bfloat16)
     return out
 
 
@@ -90,7 +94,7 @@ def key_weight(wk, member: int, group: int) -> np.ndarray:
     columns of ``wk`` ``[H, 128]`` as the rows of a ``key_block`` block."""
     dims = DIM // group
     w = np.zeros((key_block(group), wk.shape[0]), np.float32)
-    w[:dims] = np.asarray(wk, np.float32)[:, member * dims:(member + 1) * dims].T
+    w[:dims] = np.asarray(wk, np.float32)[:, member * dims : (member + 1) * dims].T
     return _blocked(w)
 
 
@@ -105,7 +109,7 @@ def _halving_sum(v):
     n = v.shape[-1]
     while n > 1:
         n //= 2
-        v = v[:, :n] + v[:, n:2 * n]
+        v = v[:, :n] + v[:, n : 2 * n]
     return v
 
 
@@ -138,8 +142,12 @@ def quantize(x):
 
 
 # ------------------------------------------------------------------ scratch
-PERSISTENT_NAMES = ("dsa query gather", "dsa query gather semaphores", "dsa count exchange",
-                    "dsa count exchange semaphores")
+PERSISTENT_NAMES = (
+    "dsa query gather",
+    "dsa query gather semaphores",
+    "dsa count exchange",
+    "dsa count exchange semaphores",
+)
 
 
 def persistent_scratch(batch, group=32):
@@ -156,19 +164,36 @@ def persistent_scratch(batch, group=32):
     )
 
 
-def scoped_scratch(batch, *, hidden, index_block_shape, key_rows, page_tokens, sequence_rows=1, page_plan=None):
+def scoped_scratch(
+    batch,
+    *,
+    hidden,
+    index_block_shape,
+    key_rows,
+    page_tokens,
+    sequence_rows=1,
+    page_plan=None,
+):
     """The MLA region's indexer scratch: ``{name: spec}`` (``bind`` order).
     ``page_plan``: the DCP attention's ``mla_dcp.page_plan`` (span, buffers)."""
-    select = dsa_dcp.select_scratch(batch, index_block_shape, key_rows, sequence_rows=sequence_rows)
+    select = dsa_dcp.select_scratch(
+        batch, index_block_shape, key_rows, sequence_rows=sequence_rows
+    )
     for name in ("exchange", "exchange_sems"):
         select.pop(name)
     key_buf, key_sems = mla_dcp.selection_scratch(
-        batch, page_tokens=page_tokens, sequence_rows=sequence_rows,
-        cache_dtype=jnp.float8_e4m3fn, **(page_plan or {}))
+        batch,
+        page_tokens=page_tokens,
+        sequence_rows=sequence_rows,
+        cache_dtype=jnp.float8_e4m3fn,
+        **(page_plan or {}),
+    )
     if hidden % CHUNK:
         raise ValueError(f"hidden size {hidden} is not a multiple of {CHUNK}")
     return {
-        "weight_ring": pltpu.VMEM((ring(batch), CHUNK, DIM), jnp.bfloat16),  # wq_b, then wk / weights_proj chunks
+        "weight_ring": pltpu.VMEM(
+            (ring(batch), CHUNK, DIM), jnp.bfloat16
+        ),  # wq_b, then wk / weights_proj chunks
         "ring_sems": pltpu.SemaphoreType.DMA((ring(batch),)),
         "knorm": pltpu.VMEM((2, DIM), jnp.bfloat16),
         "knorm_sem": pltpu.SemaphoreType.DMA((1,)),
@@ -215,25 +240,37 @@ class DecodeIndexer:
         order (wq_b's ``[CHUNK, 128]`` blocks head by head, then d_wks's and
         d_wpt's chunks)."""
         q_lora, width = self.weights["d_wqb"].shape
-        return ([("d_wqb", c, h) for h in range(width // DIM) for c in range(q_lora // CHUNK)]
-                + [(name, c, 0) for name in ("d_wks", "d_wpt")
-                   for c in range(self.weights[name].shape[0] // CHUNK)])
+        return [
+            ("d_wqb", c, h) for h in range(width // DIM) for c in range(q_lora // CHUNK)
+        ] + [
+            (name, c, 0)
+            for name in ("d_wks", "d_wpt")
+            for c in range(self.weights[name].shape[0] // CHUNK)
+        ]
 
     def _stream(self, index):
         name, chunk, head = self._plan()[index]
         slot = index % self.scoped["weight_ring"].shape[0]
         return pltpu.make_async_copy(
             self.weights[name].at[pl.ds(chunk * CHUNK, CHUNK), pl.ds(head * DIM, DIM)],
-            self.scoped["weight_ring"].at[slot], self.scoped["ring_sems"].at[slot])
+            self.scoped["weight_ring"].at[slot],
+            self.scoped["ring_sems"].at[slot],
+        )
 
     def _knorm(self):
-        return pltpu.make_async_copy(self.weights["d_knorm"], self.scoped["knorm"], self.scoped["knorm_sem"].at[0])
+        return pltpu.make_async_copy(
+            self.weights["d_knorm"],
+            self.scoped["knorm"],
+            self.scoped["knorm_sem"].at[0],
+        )
 
     def start(self):
         """Start the layer's indexer weight copies (as early as possible):
         the key norm and the stream's first ``ring - 1`` chunks."""
         self._knorm().start()
-        for index in range(min(self.scoped["weight_ring"].shape[0] - 1, len(self._plan()))):
+        for index in range(
+            min(self.scoped["weight_ring"].shape[0] - 1, len(self._plan()))
+        ):
             self._stream(index).start()
 
     def _take(self, index):
@@ -251,8 +288,11 @@ class DecodeIndexer:
         for h in range(width // DIM):
             q = None
             for c in range(chunks):
-                part = jnp.dot(query_latent[:, c * CHUNK:(c + 1) * CHUNK], self._take(h * chunks + c),
-                               preferred_element_type=jnp.float32)
+                part = jnp.dot(
+                    query_latent[:, c * CHUNK : (c + 1) * CHUNK],
+                    self._take(h * chunks + c),
+                    preferred_element_type=jnp.float32,
+                )
                 q = part if q is None else q + part
             heads.append(q)
         return heads[0] if len(heads) == 1 else jnp.concatenate(heads, axis=1)
@@ -271,10 +311,14 @@ class DecodeIndexer:
         for c in range(x.shape[1] // DIM):
             if c % per_chunk == 0:
                 chunk = self._take(first + c // per_chunk)  # [CHUNK, 128]
-            w = chunk[(c % per_chunk) * block:(c % per_chunk + 1) * block]  # [block, 128]
-            xc = x[:, c * DIM:(c + 1) * DIM]
+            w = chunk[
+                (c % per_chunk) * block : (c % per_chunk + 1) * block
+            ]  # [block, 128]
+            xc = x[:, c * DIM : (c + 1) * DIM]
             lhs, rhs = (w, xc) if transposed else (xc, w)
-            p = jax.lax.dot_general(lhs, rhs, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+            p = jax.lax.dot_general(
+                lhs, rhs, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+            )
             out = p if out is None else out + p
         return out[:, :rows] if transposed else out
 
@@ -288,16 +332,22 @@ class DecodeIndexer:
         """Every head gate transposed, ``(x @ weights_proj)^T`` (f32 ``[32,
         B]``), streamed after d_wks (while the gather is in flight)."""
         q_lora, width = self.weights["d_wqb"].shape
-        first = q_lora // CHUNK * (width // DIM) + self.weights["d_wks"].shape[0] // CHUNK
+        first = (
+            q_lora // CHUNK * (width // DIM) + self.weights["d_wks"].shape[0] // CHUNK
+        )
         return self._blocked_product(x, first, HEADS, transposed=True)
 
-    def selection(self, cache, position_ref, hidden, query_latent, parity) -> mla_dcp.DcpSelection:
+    def selection(
+        self, cache, position_ref, hidden, query_latent, parity
+    ) -> mla_dcp.DcpSelection:
         """``hidden`` [B, hidden] and ``query_latent`` [B, 1536] (normalized,
         BF16) values; ``cache`` the layer's ``mla_dcp.DcpCache``."""
         with dsa_dcp._scope("d_indexer"):
             return self._selection(cache, position_ref, hidden, query_latent, parity)
 
-    def _selection(self, cache, position_ref, hidden, query_latent, parity) -> mla_dcp.DcpSelection:
+    def _selection(
+        self, cache, position_ref, hidden, query_latent, parity
+    ) -> mla_dcp.DcpSelection:
         s, batch = self.scoped, hidden.shape[0]
         group = cache.group
         per = HEADS // group
@@ -311,22 +361,33 @@ class DecodeIndexer:
 
         # 1. This rank's index heads, key dims and gate heads of every row, out to
         # every peer's slot (the key / gate parts each in their own slab lanes).
-        q_own = self._query(query_latent.astype(jnp.bfloat16)).astype(jnp.bfloat16)  # [B, 128 per]
+        q_own = self._query(query_latent.astype(jnp.bfloat16)).astype(
+            jnp.bfloat16
+        )  # [B, 128 per]
         self._knorm().wait()
         x = hidden.astype(jnp.bfloat16)
         dims, block = DIM // group, key_block(group)
-        part = self._key_part(x, block).astype(jnp.bfloat16)  # [B, block] BF16 linear outputs
+        part = self._key_part(x, block).astype(
+            jnp.bfloat16
+        )  # [B, block] BF16 linear outputs
         k = jax.lax.broadcasted_iota(jnp.int32, (block, LANES), 0)
         lane_of = jax.lax.broadcasted_iota(jnp.int32, (block, LANES), 1)
         place = ((k < dims) & (lane_of == member * dims + k)).astype(jnp.bfloat16)
-        slab = jnp.dot(part, place, preferred_element_type=jnp.float32).astype(jnp.bfloat16)  # exact: one term
+        slab = jnp.dot(part, place, preferred_element_type=jnp.float32).astype(
+            jnp.bfloat16
+        )  # exact: one term
         gather[member] = jnp.concatenate([q_own, slab], axis=1)
         for peer in range(group):
+
             @pl.when(peer != member)
             def send(peer=peer):
                 pltpu.make_async_remote_copy(
-                    gather.at[member], gather.at[member], gather_sems.at[0], gather_sems.at[1],
-                    device_id=(base + peer,), device_id_type=pl.DeviceIdType.MESH,
+                    gather.at[member],
+                    gather.at[member],
+                    gather_sems.at[0],
+                    gather_sems.at[1],
+                    device_id=(base + peer,),
+                    device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
         # 2. The head gates while the gather is in flight; the rows' new keys
@@ -336,7 +397,9 @@ class DecodeIndexer:
         pltpu.make_async_copy(others, others, gather_sems.at[0]).wait()
         pltpu.make_async_copy(others, others, gather_sems.at[1]).wait()
         heads_width = DIM * per
-        key_raw = jnp.sum(gather[:, :, heads_width:heads_width + LANES].astype(jnp.float32), axis=0)  # [B, 128]
+        key_raw = jnp.sum(
+            gather[:, :, heads_width : heads_width + LANES].astype(jnp.float32), axis=0
+        )  # [B, 128]
         norm = s["knorm"][...].astype(jnp.float32)
         key = _bf16(layer_norm(key_raw, norm[0:1], norm[1:2], self.eps))
         values, exp = quantize(key)
@@ -350,47 +413,98 @@ class DecodeIndexer:
             s["new_exp"][b] = jnp.sum(jnp.where(row == b, exp + 127, 0))
         gate_t = _bf16(_bf16(gate_t) * HEAD_GATE_SCALE)  # [32 heads, B]
         if batch < LANES:
-            gate_t = jnp.concatenate([gate_t, jnp.zeros((HEADS, LANES - batch), jnp.float32)], axis=1)
-        record_copy = pltpu.make_async_copy(s["records"], self.records_out.at[:, self.layer],
-                                            s["record_sem"].at[0])
+            gate_t = jnp.concatenate(
+                [gate_t, jnp.zeros((HEADS, LANES - batch), jnp.float32)], axis=1
+            )
+        record_copy = pltpu.make_async_copy(
+            s["records"], self.records_out.at[:, self.layer], s["record_sem"].at[0]
+        )
         record_copy.start()
 
         # 3. Every row's 32 query heads: FP8 at their scales; the head weights.
         head_lane = jax.lax.broadcasted_iota(jnp.int32, (HEADS, LANES), 1)
         w_t = jnp.zeros((HEADS, LANES), jnp.float32)
         for b in range(batch):
-            heads = gather[:, pl.ds(b, 1), 0:heads_width].reshape(HEADS, DIM).astype(jnp.float32)  # head d per + h
+            heads = (
+                gather[:, pl.ds(b, 1), 0:heads_width]
+                .reshape(HEADS, DIM)
+                .astype(jnp.float32)
+            )  # head d per + h
             q8, q_exp = quantize(heads)
             s["q8"][b] = q8
-            column = jnp.sum(jnp.where(head_lane == b, gate_t, 0.0), axis=1, keepdims=True)  # [32, 1]
+            column = jnp.sum(
+                jnp.where(head_lane == b, gate_t, 0.0), axis=1, keepdims=True
+            )  # [32, 1]
             w_t = jnp.where(head_lane == b, column * _pow2(q_exp) * WEIGHT_SCALE, w_t)
         s["w_t"][...] = w_t
 
         # 4. The selection.
-        refs = {name: s[name] for name in dsa_dcp.select_scratch(1, (33, 4, 128), 8) if name in s}
-        refs.update(exchange=exchange, exchange_sems=exchange_sems, keys=self.keys,
-                    tau=s["tau"], p_tie=s["p_tie"], own=s["own"])
+        refs = {
+            name: s[name]
+            for name in dsa_dcp.select_scratch(1, (33, 4, 128), 8)
+            if name in s
+        }
+        refs.update(
+            exchange=exchange,
+            exchange_sems=exchange_sems,
+            keys=self.keys,
+            tau=s["tau"],
+            p_tie=s["p_tie"],
+            own=s["own"],
+        )
         select = dsa_dcp.IndexSelect(
-            pools=self.pools, layer=self.layer, table_ref=cache.table_ref, pages=cache.pages,
-            page_tokens=cache.page_tokens, group=group, owner=owner, member=member, base=base,
-            position_ref=position_ref, new_exp_ref=s["new_exp"], batch=batch, topk=self.topk,
-            refs=refs, sequence_rows=self.sequence_rows, global_pages=cache.global_pages,
-            table_row=cache.table_row)
+            pools=self.pools,
+            layer=self.layer,
+            table_ref=cache.table_ref,
+            pages=cache.pages,
+            page_tokens=cache.page_tokens,
+            group=group,
+            owner=owner,
+            member=member,
+            base=base,
+            position_ref=position_ref,
+            new_exp_ref=s["new_exp"],
+            batch=batch,
+            topk=self.topk,
+            refs=refs,
+            sequence_rows=self.sequence_rows,
+            global_pages=cache.global_pages,
+            table_row=cache.table_row,
+        )
+
         def query(row):  # [32, 128] FP8 query heads of a row (traced or not)
             return s["q8"][row]
 
         S = self.sequence_rows
         select.plan()
         select.in_flight(query, s["w_t"], s["new_k8"])
-        select.score(query, s["w_t"], lambda first: s["q8"][pl.ds(first, S)].reshape(S * HEADS, DIM))
+        select.score(
+            query,
+            s["w_t"],
+            lambda first: s["q8"][pl.ds(first, S)].reshape(S * HEADS, DIM),
+        )
         select.select()
         span_rows = s["attend_keys"].shape[2]
         steps = self.keys.shape[1] // span_rows
         select.step_activity(span_rows, s["active"], steps)
         record_copy.wait()
-        return mla_dcp.DcpSelection(self.keys, s["tau"], s["p_tie"], s["own"],
-                                    s["attend_keys"], s["attend_key_sems"], active=s["active"], steps=steps)
+        return mla_dcp.DcpSelection(
+            self.keys,
+            s["tau"],
+            s["p_tie"],
+            s["own"],
+            s["attend_keys"],
+            s["attend_key_sems"],
+            active=s["active"],
+            steps=steps,
+        )
 
 
-for _name, _method in (("d5_query", "_query"), ("d5_key", "_key_part"), ("d5_gate", "_gate")):
-    setattr(DecodeIndexer, _method, dsa_dcp._scoped(_name, getattr(DecodeIndexer, _method)))
+for _name, _method in (
+    ("d5_query", "_query"),
+    ("d5_key", "_key_part"),
+    ("d5_gate", "_gate"),
+):
+    setattr(
+        DecodeIndexer, _method, dsa_dcp._scoped(_name, getattr(DecodeIndexer, _method))
+    )

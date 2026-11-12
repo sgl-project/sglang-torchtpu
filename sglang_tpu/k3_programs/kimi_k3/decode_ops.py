@@ -263,7 +263,10 @@ class DecodeOps:
             raise RuntimeError(
                 "K3 decode: bind the unified pools before building the step ops"
             )
-        self.unified_pools, self.pool_map = list(pools) + list(index_pools), tuple(int(i) for i in pool_map)
+        self.unified_pools, self.pool_map = (
+            list(pools) + list(index_pools),
+            tuple(int(i) for i in pool_map),
+        )
         self.dsa_pools = len(index_pools)
         self.owner_table = (
             None if owner_table is None else tuple(int(i) for i in owner_table)
@@ -499,7 +502,9 @@ class DecodeOps:
     def _compiler_options(rows: int) -> dict[str, str]:
         config = kernel_config.active()
         dp_rows = rows in (2, 4) and config.attention_dp > 1
-        if (rows in (8, 16, 24, 32, 48, 64, 80, 96, 128) or dp_rows) and config.decode_no_hlo_calls:
+        if (
+            rows in (8, 16, 24, 32, 48, 64, 80, 96, 128) or dp_rows
+        ) and config.decode_no_hlo_calls:
             return {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
         return {}
 

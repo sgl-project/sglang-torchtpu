@@ -43,7 +43,9 @@ ALIGN = 4096
 class _Entry:
     name: str
     nbytes: int
-    start: object = None  # start(offset, index) emits the DMA starts; None for allocate()
+    start: object = (
+        None  # start(offset, index) emits the DMA starts; None for allocate()
+    )
     index: object = None  # the loop index the load was requested for
     predicate: object = None  # traced bool guarding the starts, or None
     offset: int | None = None
@@ -112,7 +114,9 @@ class VmemPool:
         """Queue the load ``start(offset, index)`` of ``nbytes``; issue it if it fits."""
         self._check_open(name)
         if _aligned(nbytes) > self.capacity:
-            raise PoolError(f"{name}: {nbytes} bytes exceed the {self.capacity}-byte arena")
+            raise PoolError(
+                f"{name}: {nbytes} bytes exceed the {self.capacity}-byte arena"
+            )
         entry = _Entry(name, nbytes, start, index, predicate)
         self.entries[name] = entry
         self.queue.append(name)
@@ -129,7 +133,9 @@ class VmemPool:
         offset = self._fit(nbytes, ignore=replaces)
         if offset is None:
             raise PoolError(f"allocate({name}): {self._describe(nbytes)}")
-        entry = _Entry(name, nbytes, offset=offset, state="allocated", replaces=tuple(replaces))
+        entry = _Entry(
+            name, nbytes, offset=offset, state="allocated", replaces=tuple(replaces)
+        )
         self.entries[name] = entry
         self._log("allocate", entry)
         return offset
@@ -217,7 +223,9 @@ class VmemPool:
 
     def _restore(self, snapshot):
         entries, queue = snapshot
-        self.entries = {name: dataclasses.replace(entry) for name, entry in entries.items()}
+        self.entries = {
+            name: dataclasses.replace(entry) for name, entry in entries.items()
+        }
         self.queue = list(queue)
 
     def cond(self, predicate, true_function, false_function):
@@ -235,7 +243,9 @@ class VmemPool:
 
             return traced
 
-        jax.lax.cond(predicate, branch(true_function, "true"), branch(false_function, "false"))
+        jax.lax.cond(
+            predicate, branch(true_function, "true"), branch(false_function, "false")
+        )
         (_, first, snapshot), (_, second, _) = ends
         if first != second:
             raise PoolError(
@@ -246,6 +256,7 @@ class VmemPool:
 
     def when(self, predicate):
         """``pl.when`` decorator; the guarded code must not change the arena."""
+
         def decorator(function):
             before = self.signature()
 
@@ -264,6 +275,7 @@ class VmemPool:
         """``pl.loop`` decorator; the body must end in the state it began in.
         Loads carried in from the previous iteration run unconditionally
         (the iteration exists), so their predicates are dropped."""
+
         def decorator(body):
             entry_signature = self.signature()
 
@@ -299,7 +311,11 @@ class VmemPool:
         self.phase = self.phase.rpartition("/")[0]
 
     def _log(self, op, entry):
-        used = sum(_aligned(other.nbytes) for other in self.entries.values() if other.offset is not None)
+        used = sum(
+            _aligned(other.nbytes)
+            for other in self.entries.values()
+            if other.offset is not None
+        )
         event = (self.phase, op, entry.name, entry.offset, entry.nbytes, used)
         self.events.append(event)
 
@@ -323,7 +339,9 @@ class VmemPool:
 
     def _live(self, name):
         if self.finished and name in self.entries:
-            raise PoolError(f"{name}: requested in the last loop iteration, never issued")
+            raise PoolError(
+                f"{name}: requested in the last loop iteration, never issued"
+            )
         if name not in self.entries:
             raise PoolError(f"{name} is not live")
         return self.entries[name]

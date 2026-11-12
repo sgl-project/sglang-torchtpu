@@ -99,7 +99,9 @@ class TestColocatedDpSteps(CustomTestCase):
         for k, p in enumerate((3, 6, 9)):
             r2t[1, k * page : (k + 1) * page] = np.arange(p * page, (p + 1) * page)
         base = plan.dp_row_base
-        req = _req("a", prompt=page + 5, output=[7], committed=page + 5, pool_idx=1, slot=2)
+        req = _req(
+            "a", prompt=page + 5, output=[7], committed=page + 5, pool_idx=1, slot=2
+        )
         steps.step([req], r2t[:, ::page])
         self.assertEqual(jobs, [[([3, 6], [base, base + 1], 0)]])
         (row,) = program.inputs[-1].requests
@@ -344,7 +346,9 @@ class TestPrefillWait(CustomTestCase):
         self.assertFalse(hooks.prefill_wait_defers(idle, 3))
         self.assertEqual(idle._k3_prefill_wait_rounds, 0)
         # A chunked prompt in progress waits like a queued one.
-        self.assertTrue(hooks.prefill_wait_defers(self._scheduler(True, 0, chunked=True), 3))
+        self.assertTrue(
+            hooks.prefill_wait_defers(self._scheduler(True, 0, chunked=True), 3)
+        )
 
     def test_hook_falls_back_to_the_interval(self):
         from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -353,9 +357,13 @@ class TestPrefillWait(CustomTestCase):
         original = mock.Mock(return_value=False)
         with mock.patch.object(hooks, "k3_program_active", return_value=True):
             with tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS.override(0):
-                self.assertFalse(hooks.k3_program_prefill_wait(original, self._scheduler(True, 1)))
+                self.assertFalse(
+                    hooks.k3_program_prefill_wait(original, self._scheduler(True, 1))
+                )
             with tpu_envs.SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS.override(2):
-                self.assertTrue(hooks.k3_program_prefill_wait(original, self._scheduler(True, 1)))
+                self.assertTrue(
+                    hooks.k3_program_prefill_wait(original, self._scheduler(True, 1))
+                )
                 prefill = self._scheduler(True, 1, mode=DisaggregationMode.PREFILL)
                 self.assertFalse(hooks.k3_program_prefill_wait(original, prefill))
         self.assertEqual(original.call_count, 2)
@@ -423,7 +431,9 @@ class TestNoSpecStateReserve(CustomTestCase):
             return rest - 1
 
         with mock.patch.object(hooks, "k3_program_active", return_value=True):
-            self.assertEqual(hooks.k3_program_no_spec_state_reserve(handle, configurator, 10), 9)
+            self.assertEqual(
+                hooks.k3_program_no_spec_state_reserve(handle, configurator, 10), 9
+            )
         self.assertEqual(seen, [SpeculativeAlgorithm.NONE])
         self.assertEqual(configurator.spec_algorithm, "K3_PROGRAM")
         with mock.patch.object(hooks, "k3_program_active", return_value=False):

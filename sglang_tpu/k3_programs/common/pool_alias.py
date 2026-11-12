@@ -5,6 +5,7 @@
 Importing patches JAX's private ``jax._src.pallas.mosaic.lowering._reshape_memref``
 so a :class:`Reinterpret` transform lowers to a ``tpu.reinterpret_cast`` with an
 explicit tiled layout; other reshapes keep the stock lowering."""
+
 import dataclasses
 import math
 
@@ -20,7 +21,9 @@ from jax._src.state import types
 class Reinterpret(types.ReshapeTransform):
     pass
 
+
 _original = lowering._reshape_memref
+
 
 def _lower(ref, transform, aval, block_shape):
     if not isinstance(transform, Reinterpret):
@@ -39,13 +42,26 @@ def _lower(ref, transform, aval, block_shape):
         strides.insert(0, stride)
         stride *= dimension
     inner = f"({packing},1)" if packing > 1 else ""
-    layout = ir.Attribute.parse(f"#tpu.tiled<({rows},128){inner},[{",".join(map(str, strides))}]>")
-    result_type = ir.MemRefType.get(transform.shape, original_type.element_type, layout=layout, memory_space=original_type.memory_space)
+    layout = ir.Attribute.parse(
+        f"#tpu.tiled<({rows},128){inner},[{','.join(map(str, strides))}]>"
+    )
+    result_type = ir.MemRefType.get(
+        transform.shape,
+        original_type.element_type,
+        layout=layout,
+        memory_space=original_type.memory_space,
+    )
     alias = tpu.reinterpret_cast(result_type, ref)
-    erased = ir.MemRefType.get(transform.shape, original_type.element_type, memory_space=original_type.memory_space)
+    erased = ir.MemRefType.get(
+        transform.shape,
+        original_type.element_type,
+        memory_space=original_type.memory_space,
+    )
     return tpu.erase_memref_layout(erased, alias), transform.shape
 
+
 lowering._reshape_memref = _lower
+
 
 def storage_size(shape, dtype):
     bits = dtype.itemsize * 8
@@ -53,6 +69,7 @@ def storage_size(shape, dtype):
     rows = 8 * packing
     row_tiles = (shape[-2] + rows - 1) // rows
     return math.prod(shape[:-2]) * row_tiles * (shape[-1] // 128) * 4096
+
 
 def view(ref, shape, dtype):
     ref = ref.bitcast(dtype)
