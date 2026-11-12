@@ -134,6 +134,27 @@ def test_startup_discovers_files_only_on_the_host_leader(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "enabled,mode,rank",
+    [(False, "serial", 0), (True, "overlap", 0), (True, "serial", 1)],
+)
+def test_checkpoint_overlap_skip_preserves_collective_order(
+    monkeypatch, enabled, mode, rank
+):
+    group = Mock()
+    monkeypatch.setenv("LOCAL_RANK", str(rank))
+    with (
+        get_context().override_server_args(startup_weight_load_mode=mode),
+        get_parallel().override(world_group=group),
+        tpu_envs.SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE.override(enabled),
+        patch.object(page_cache.os, "posix_fadvise") as advise,
+    ):
+        page_cache.start_checkpoint_page_cache_release()
+    group.barrier.assert_called_once_with()
+    advise.assert_not_called()
+    assert page_cache._checkpoint_release is None
+
+
+@pytest.mark.parametrize(
     "env_name",
     ["TORCH_TPU_TIER2_COMPILATION_CACHE", "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"],
 )

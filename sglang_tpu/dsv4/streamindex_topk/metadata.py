@@ -101,6 +101,12 @@ class MetadataRef:
         return self.batch_tile_idx
 
 
+# Schedule array length: a multiple of _STEP_ALIGN with at least _STEP_SLACK
+# entries past the largest possible step count.
+_STEP_ALIGN = 128
+_STEP_SLACK = 16
+
+
 def next_power_of_2(x):
     assert x > 0
     return 1 << (x - 1).bit_length()
@@ -176,19 +182,11 @@ def compute_batched_seq_metadata(
         req_max_steps = num_chunks * per_chunk_bq * max_bkv
     else:
         req_max_steps = total_max_bq * max_bkv
-    req_max_steps = pl.cdiv(req_max_steps, 1024) * 1024
-
-    max_steps = max(1024, req_max_steps)
+    # Built on the TensorCore per pass and per indexer layer, so keep it short;
+    # the slack covers the pipeline's lookahead reads past the last real step.
+    max_steps = pl.cdiv(req_max_steps + _STEP_SLACK, _STEP_ALIGN) * _STEP_ALIGN
 
     is_empty_pass = jnp.greater_equal(start_seq_idx, end_seq_idx)
-
-    def _empty_schedule():
-        return MetadataRef.create(
-            num_steps=jnp.zeros((num_chunks,), dtype=jnp.int32),
-            batch_tile_idx=jnp.zeros((max_steps,), dtype=jnp.int32),
-            bq_idx=jnp.zeros((max_steps,), dtype=jnp.int32),
-            bkv_idx=jnp.zeros((max_steps,), dtype=jnp.int32),
-        )
 
     def _compute_schedule():
         all_steps = jnp.arange(max_steps, dtype=jnp.int32)
@@ -254,17 +252,31 @@ def compute_batched_seq_metadata(
         seg_num_steps = num_bq.reshape(-1) * seg_num_bkv
         seg_start_step_id = jnp.cumulative_sum(seg_num_steps, include_initial=True)
 
-        is_step_in_seg = (all_steps[None, :] >= seg_start_step_id[:-1, None]) & (
-            all_steps[None, :] < seg_start_step_id[1:, None]
-        )
+        # Each step takes the value of the segment it falls in. Segments own
+        # contiguous, increasing step ranges, so scatter each segment's change at
+        # its first step and prefix-sum over the steps: O(segments + steps), not
+        # an O(segments * steps) ownership mask. A TPU scatter costs the same at
+        # any size, so one scatter carries (num_bkv, seq_tile, parity) packed
+        # linearly; parity flips at every non-empty segment, marking its first step.
+        seg_parity = jnp.cumulative_sum((seg_num_steps > 0).astype(jnp.int32)) & 1
+        tile_mult = 2 * max_seq_tiles
+        seg_packed = seg_num_bkv * tile_mult + seg_seq_tiles * 2 + seg_parity
+        change = seg_packed - jnp.pad(seg_packed[:-1], (1, 0))
+        packed = jnp.zeros((max_steps,), jnp.int32)
+        packed = packed.at[seg_start_step_id[:-1]].add(change, mode="drop")
+        live_step = all_steps < seg_start_step_id[-1]
+        packed = jnp.where(live_step, jnp.cumsum(packed), 0)
 
-        repeat_seq_tiles = jnp.sum(seg_seq_tiles[:, None] * is_step_in_seg, axis=0)
-        batch_tile_idx = repeat_seq_tiles * seq_batch_size
-        start_step_id_repeat = jnp.sum(
-            seg_start_step_id[:-1, None] * is_step_in_seg, axis=0
-        )
-        tile_step_id = all_steps - start_step_id_repeat
-        nbkv_per_step_id = jnp.sum(seg_num_bkv[:, None] * is_step_in_seg, axis=0)
+        parity = packed & 1
+        is_first = (all_steps == 0) | (parity != jnp.pad(parity[:-1], (1, 0)))
+        first_step = jax.lax.cummax(jnp.where(is_first, all_steps, 0))
+        first_step = jnp.where(live_step, first_step, 0)
+        batch_tile_idx = packed // 2 % max_seq_tiles * seq_batch_size
+        # Local step index within the segment's sequence tile.
+        tile_step_id = all_steps - first_step
+        # KV blocks per step for the step's segment; row = tile_step_id // width,
+        # col = tile_step_id % width. jnp.maximum(1, ...) guards inactive steps.
+        nbkv_per_step_id = packed // tile_mult
 
         bq_idx = jnp.maximum(0, tile_step_id // jnp.maximum(1, nbkv_per_step_id))
         bkv_idx = jnp.maximum(0, tile_step_id % jnp.maximum(1, nbkv_per_step_id))
@@ -280,7 +292,20 @@ def compute_batched_seq_metadata(
             bkv_idx=bkv_idx,
         )
 
-    return jax.lax.cond(is_empty_pass, _empty_schedule, _compute_schedule)
+    # Select, not lax.cond: a cond-free schedule lets XLA share it between
+    # layers that run the same pass. An empty pass gets all zeros.
+    sched = _compute_schedule()
+    return MetadataRef.create(
+        *(
+            jnp.where(is_empty_pass, jnp.zeros_like(x), x)
+            for x in (
+                sched.num_steps,
+                sched.batch_tile_idx,
+                sched.bq_idx,
+                sched.bkv_idx,
+            )
+        )
+    )
 
 
 def compute_metadata(

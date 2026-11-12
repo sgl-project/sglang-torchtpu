@@ -2205,7 +2205,9 @@ class TestDerivedWidths(_IsolatedOverrides):
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
-            mock_world_group.return_value = Mock(device_group=Mock(), local_rank=0)
+            mock_world_group.return_value = Mock(
+                device_group=Mock(), local_rank=0, world_size=world_size
+            )
             parallel_state.initialize_model_parallel()
         self.addCleanup(parallel_state.destroy_model_parallel)
 

@@ -68,31 +68,37 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_p2p_is_unsupported(self):
         self.assertFalse(TpuPlatform.supports_distributed_p2p())
 
-    def test_spatial_shard_decode_is_refused_without_p2p(self):
+    def test_auto_spatial_decode_without_p2p_only_for_opted_in_vaes(self):
         from sglang.multimodal_gen.configs.models.vaes import base as vae_base
+        from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
+            LTXVideoVAEConfig,
+        )
         from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
 
-        platform = MagicMock()
-        platform.supports_distributed_p2p.return_value = False
-        with patch.object(vae_base, "current_platform", platform):
-            self.assertFalse(
-                vae_base.should_use_spatial_shard_parallel_decode(
-                    WanVAEConfig(), world_size=2
+        explicit = LTXVideoVAEConfig()
+        explicit.parallel_decode_mode = "spatial_shard"
+        cases = (
+            # Halos travel by all-gather where the VAE opts in.
+            (False, WanVAEConfig(), True),
+            (False, LTXVideoVAEConfig(), False),
+            (False, explicit, True),
+            (True, LTXVideoVAEConfig(), True),
+        )
+        for p2p, config, expected in cases:
+            platform = MagicMock()
+            platform.supports_distributed_p2p.return_value = p2p
+            with (
+                self.subTest(
+                    p2p=p2p, vae=type(config).__name__, mode=config.parallel_decode_mode
+                ),
+                patch.object(vae_base, "current_platform", platform),
+            ):
+                self.assertEqual(
+                    vae_base.should_use_spatial_shard_parallel_decode(
+                        config, world_size=2
+                    ),
+                    expected,
                 )
-            )
-
-    def test_spatial_shard_decode_survives_where_p2p_works(self):
-        from sglang.multimodal_gen.configs.models.vaes import base as vae_base
-        from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
-
-        platform = MagicMock()
-        platform.supports_distributed_p2p.return_value = True
-        with patch.object(vae_base, "current_platform", platform):
-            self.assertTrue(
-                vae_base.should_use_spatial_shard_parallel_decode(
-                    WanVAEConfig(), world_size=2
-                )
-            )
 
     def test_platform_defaults_leave_other_backends_alone(self):
         from sglang.multimodal_gen.runtime.platforms.interface import Platform

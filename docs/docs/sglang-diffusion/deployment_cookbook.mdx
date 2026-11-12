@@ -142,7 +142,7 @@ sglang generate \
 
 Existing per-component CPU-offload and layerwise flags remain supported. Canonical selectors override matching legacy settings only; unmatched legacy settings and automatic defaults remain effective. See [Component Residency](/docs/sglang-diffusion/api/cli#component-residency) for the complete precedence rules.
 
-When `torch.compile` is enabled, `--offload-during-compile` stays on by default. During compile warmup it temporarily offloads the DiT and evicts resident non-DiT components so `max-autotune` fits on tighter-memory GPUs, then restores the configured serving residency before real traffic.
+When `torch.compile` is enabled, `--offload-during-compile` stays on by default (off on TPU). During compile warmup it temporarily offloads the DiT and evicts resident non-DiT components so `max-autotune` fits on tighter-memory GPUs, then restores the configured serving residency before real traffic.
 
 Breakable CUDA graph is a separate manual opt-in for supported image pipelines. If you enable `--enable-breakable-cuda-graph`, declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 

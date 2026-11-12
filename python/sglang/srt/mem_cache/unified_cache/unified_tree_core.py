@@ -133,6 +133,12 @@ class UnifiedTreeNode:
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
+        # Offset in key where generated output starts, as the inserting request
+        # saw it; a later insert that reads the node as prompt moves or clears it.
+        # None if the node holds only prompt tokens.
+        self.output_offset: Optional[int] = None
+        # output_offset as stamped when the node was created; never re-read.
+        self.created_output_offset: Optional[int] = None
         # T-LRU only (0 under other policies): tokens root -> self, and the
         # branch's high-water depth, which survives tail trimming.
         self._tlru_cached_prefix_len = 0
@@ -225,6 +231,9 @@ class UnifiedLRUList:
         self.head.lru_next[self._pt] = self.tail
         self.tail.lru_prev[self._pt] = self.head
         self.cache: dict[int, UnifiedTreeNode] = {}
+        # Ids reset_node_lru moved with skip_host_backup, and nodes inserted after
+        # one (a split's prefix half); any other move clears them.
+        self._skip_host_backup: set[int] = set()
         # Session partition: [head .. mid) holds session-referenced nodes and
         # (mid .. tail] unreferenced ones, so evictions directly walks (tail -> head).
         self._is_referenced = is_referenced
@@ -253,6 +262,7 @@ class UnifiedLRUList:
             self._add_node_after(self.mid, node)
 
     def _remove_node(self, node: UnifiedTreeNode):
+        self._skip_host_backup.discard(node.id)
         pt = self._pt
         node.lru_prev[pt].lru_next[pt] = node.lru_next[pt]
         node.lru_next[pt].lru_prev[pt] = node.lru_prev[pt]
@@ -270,6 +280,8 @@ class UnifiedLRUList:
         assert node.id not in self.cache
         self.cache[node.id] = node
         self._add_node_after(prev_node, node)
+        if prev_node.id in self._skip_host_backup:
+            self._skip_host_backup.add(node.id)
 
     def remove_node(self, node: UnifiedTreeNode):
         assert node.id in self.cache
@@ -281,13 +293,24 @@ class UnifiedLRUList:
         self._remove_node(node)
         self._add_node(node)
 
-    def reset_node_lru(self, node: UnifiedTreeNode) -> None:
-        """Make ``node`` the next eviction victim; session-referenced nodes stay put."""
+    def reset_node_lru(
+        self, node: UnifiedTreeNode, *, skip_host_backup: bool = False
+    ) -> None:
+        """Make ``node`` the next eviction victim; session-referenced nodes stay put.
+        With ``skip_host_backup``, ``skips_host_backup`` reports the node until a move
+        other than this one; a demotion without it keeps an earlier mark, and a node
+        ``insert_after`` places after it gets the mark too."""
         assert node.id in self.cache
         if self._is_referenced is not None and self._is_referenced(node):
             return
+        skip_host_backup = skip_host_backup or node.id in self._skip_host_backup
         self._remove_node(node)
         self._add_node_after(self.tail.lru_prev[self._pt], node)
+        if skip_host_backup:
+            self._skip_host_backup.add(node.id)
+
+    def skips_host_backup(self, node: UnifiedTreeNode) -> bool:
+        return node.id in self._skip_host_backup
 
     def cursor_begin(self):
         if self.cursor.lru_prev[self._pt] is not None:
@@ -1313,6 +1336,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if action is not None:
                 step_actions.append(action)
         node.priority = max(node.priority, state.priority)
+        if node.output_offset is not None:
+            # This insert reads the node's tokens as prompt up to its own output.
+            output_start = state.params.output_start
+            prompt_end = (
+                len(node.key)
+                if output_start is None
+                else output_start - state.total_prefix_length
+            )
+            if prompt_end >= len(node.key):
+                node.output_offset = None
+            else:
+                node.output_offset = max(node.output_offset, prompt_end)
 
         if node.evicted:
             self._unevict_node_on_insert(
@@ -1402,6 +1437,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 session_id=state.params.session_id,
                 rotation_base=state.params.rotation_base,
             )
+            output_start = state.params.output_start
+            if output_start is not None and output_start < (
+                state.total_prefix_length + len(state.key)
+            ):
+                offset = max(0, output_start - state.total_prefix_length)
+                state.target_node.output_offset = offset
+                state.target_node.created_output_offset = offset
             state.is_new_leaf = True
         else:
             state.target_node = state.node
@@ -1494,6 +1536,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The rotation base is constant along a chain (position-page P keeps
         # owner (b + P) % N on both sides of the split).
         new_node.rotation_base = child.rotation_base
+        for attr in ("output_offset", "created_output_offset"):
+            offset = getattr(child, attr)
+            if offset is None:
+                continue
+            if split_len <= offset:
+                setattr(child, attr, offset - split_len)
+            else:
+                setattr(new_node, attr, offset)
+                setattr(child, attr, 0)
 
         child.parent = new_node
         child.key = child.key[split_len:]

@@ -3,8 +3,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-import requests
-
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.http_server import (
@@ -89,17 +87,7 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(kwargs["ssl"])
 
 
-class _FreezeOk:
-    def raise_for_status(self):
-        return None
-
-
-class _FreezeServerError:
-    def raise_for_status(self):
-        raise requests.exceptions.HTTPError("500")
-
-
-class TestFreezeGcAfterWarmup(unittest.TestCase):
+class TestFreezeGcAfterWarmup(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.server_args = enter_scope(
             self,
@@ -107,56 +95,78 @@ class TestFreezeGcAfterWarmup(unittest.TestCase):
                 host="127.0.0.1", port=30000, skip_server_warmup=True, api_key="k"
             ),
         )
-        self.calls = []
-        enter_scope(self, patch.object(http_server.time, "sleep"))
+        self.manager = SimpleNamespace(server_status=None, freeze_gc=AsyncMock())
         enter_scope(
             self,
             patch.object(
                 http_server,
                 "_global_state",
                 http_server._GlobalState(
-                    tokenizer_manager=SimpleNamespace(server_status=None),
+                    tokenizer_manager=self.manager,
                     template_manager=None,
                     scheduler_info={},
                 ),
             ),
         )
 
-    def _post(self, outcomes):
-        outcomes = list(outcomes)
-
-        def post(url, **kwargs):
-            self.calls.append((url, kwargs))
-            outcome = outcomes.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-
-        return patch.object(http_server.requests, "post", post)
-
-    def test_skip_server_warmup_freezes_once_the_server_listens(self):
-        """With --skip-server-warmup, /freeze_gc can run before the HTTP server
-        listens; the heap must still be frozen before the server reports ready."""
-        refused = requests.exceptions.ConnectionError("Connection refused")
+    async def test_skip_warmup_waits_for_cleanup_on_serving_loop(self):
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        finish = asyncio.Event()
         ready = []
-        with self._post([refused, refused, refused, _FreezeOk()]):
-            http_server._wait_and_warmup(
-                self.server_args, launch_callback=lambda: ready.append(len(self.calls))
+
+        async def cleanup():
+            self.assertIs(asyncio.get_running_loop(), loop)
+            started.set()
+            await finish.wait()
+
+        self.manager.freeze_gc.side_effect = cleanup
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                http_server._wait_and_warmup,
+                self.server_args,
+                launch_callback=lambda: ready.append(True),
+                event_loop=loop,
             )
-        self.assertEqual(len(self.calls), 4)
-        self.assertEqual(ready, [4])
+        )
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            self.assertEqual(ready, [])
+            self.assertIsNone(self.manager.server_status)
+        finally:
+            finish.set()
+            await asyncio.wait_for(task, timeout=5)
+        self.manager.freeze_gc.assert_awaited_once()
+        self.assertEqual(ready, [True])
+        self.assertEqual(self.manager.server_status, http_server.ServerStatus.Up)
 
-    def test_cleanup_failure_does_not_publish_readiness(self):
+    async def test_cleanup_failure_does_not_publish_readiness(self):
+        self.manager.freeze_gc.side_effect = RuntimeError("cleanup failed")
         ready = []
-        with self._post([_FreezeServerError()]):
-            with self.assertRaises(requests.exceptions.HTTPError):
-                http_server._wait_and_warmup(
-                    self.server_args, launch_callback=lambda: ready.append(True)
-                )
+        with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+            await asyncio.to_thread(
+                http_server._wait_and_warmup,
+                self.server_args,
+                launch_callback=lambda: ready.append(True),
+                event_loop=asyncio.get_running_loop(),
+            )
         self.assertEqual(ready, [])
-        self.assertIsNone(http_server._global_state.tokenizer_manager.server_status)
+        self.assertIsNone(self.manager.server_status)
 
-    def test_failed_pd_warmup_does_not_publish_readiness(self):
+    async def test_rust_server_keeps_its_own_readiness(self):
+        ready = []
+        with http_server.envs.SGLANG_RUST_SERVER.override(True):
+            await asyncio.to_thread(
+                http_server._wait_and_warmup,
+                self.server_args,
+                launch_callback=lambda: ready.append(True),
+                event_loop=asyncio.get_running_loop(),
+            )
+        self.manager.freeze_gc.assert_not_called()
+        self.assertEqual(ready, [True])
+        self.assertIsNone(self.manager.server_status)
+
+    async def test_failed_pd_warmup_does_not_publish_readiness(self):
         for mode in ("prefill", "decode"):
             with self.subTest(mode=mode):
                 manager = http_server._global_state.tokenizer_manager
@@ -184,49 +194,20 @@ class TestFreezeGcAfterWarmup(unittest.TestCase):
                         return_value=[200, 503],
                     ) as warmup,
                     patch.object(http_server, "kill_process_tree") as shutdown,
-                    self._post([]),
                 ):
-                    http_server._wait_and_warmup(
-                        self.server_args, launch_callback=ready
+                    await asyncio.to_thread(
+                        http_server._wait_and_warmup,
+                        self.server_args,
+                        launch_callback=ready,
+                        event_loop=asyncio.get_running_loop(),
                     )
                 warmup.assert_awaited_once()
                 shutdown.assert_called_once_with(http_server.os.getpid())
-                self.assertEqual(self.calls, [])
+                self.manager.freeze_gc.assert_not_called()
                 ready.assert_not_called()
                 self.assertEqual(
                     manager.server_status, http_server.ServerStatus.Starting
                 )
-
-    def test_rust_server_does_not_call_the_python_freeze_endpoint(self):
-        ready = []
-        with http_server.envs.SGLANG_RUST_SERVER.override(True), self._post([]):
-            http_server._wait_and_warmup(
-                self.server_args, launch_callback=lambda: ready.append(True)
-            )
-        self.assertEqual(self.calls, [])
-        self.assertEqual(ready, [True])
-
-    def test_retry_is_bounded(self):
-        refused = requests.exceptions.ConnectionError("Connection refused")
-        with (
-            patch.object(http_server.time, "monotonic", side_effect=[0, 0, 31]),
-            self._post([refused] * 3),
-        ):
-            with self.assertRaises(requests.exceptions.ConnectionError):
-                http_server._freeze_gc_after_server_warmup(self.server_args)
-        self.assertEqual(len(self.calls), 2)
-
-    def test_http_and_ssl_errors_are_not_retried(self):
-        for error in (
-            _FreezeServerError(),
-            requests.exceptions.SSLError("bad certificate"),
-        ):
-            with self.subTest(error=type(error).__name__):
-                self.calls.clear()
-                with self._post([error, _FreezeOk()]):
-                    with self.assertRaises(requests.exceptions.RequestException):
-                        http_server._freeze_gc_after_server_warmup(self.server_args)
-                self.assertEqual(len(self.calls), 1)
 
 
 class TestFreezeCompletion(unittest.IsolatedAsyncioTestCase):

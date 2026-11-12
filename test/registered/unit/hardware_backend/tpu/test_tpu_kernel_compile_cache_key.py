@@ -68,7 +68,7 @@ class TestKernelInputsDigest(CustomTestCase):
         enter_scope(self, tpu_envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.override(False))
         enter_scope(self, envs.SGLANG_TPU_INT4_MOE_MODE.override(None))
         enter_scope(self, tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False))
-        self.versions = {"jax": "0.10.2", "jaxlib": "0.10.2", "libtpu": "0.0.47"}
+        self.versions = {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50"}
         enter_scope(
             self,
             patch.object(
@@ -170,6 +170,9 @@ class TestKernelInputsDigest(CustomTestCase):
     def test_env_knobs_that_change_no_program_stay_out_of_the_digest(self):
         # The recompile monitor is read in a hashed file but is not keyed.
         with tpu_envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True):
+            self.assertEqual(self.digest(), self.base)
+        # The buffered PP hand-off's send queue depth is read in pp_scheduler.py.
+        with tpu_envs.SGLANG_TPU_PP_BUFFERED_SEND_DEPTH.override(5):
             self.assertEqual(self.digest(), self.base)
 
     def test_unkeyed_env_knobs_are_all_read_by_the_kernel_sources(self):
@@ -405,7 +408,8 @@ class TestKernelSourcesAreHashed(CustomTestCase):
             any(_is_kernel_source(path) for path in _PACKAGE_ROOT.rglob("*.py")),
             "the kernel API detector matched nothing in sglang_tpu",
         )
-        # multimodal_gen has its own TPU runtime and does not use this key;
+        # multimodal_gen's TPU kernels live in sglang_tpu/multimodal_gen, whose
+        # workers use this key; its own tree runs JAX only in a benchmark.
         # sglang/test holds test helpers (e.g. Pallas mesh mocks), not kernels.
         excluded = (_SGLANG_ROOT / "multimodal_gen", _SGLANG_ROOT / "test")
         outside = [

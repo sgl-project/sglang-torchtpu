@@ -762,6 +762,15 @@ class DFlashDraftModel(nn.Module):
                 quant_config=quant_config if self.quantizable else None,
                 prefix=fc_prefix,
             )
+        elif envs.SGLANG_DFLASH_COLUMN_PARALLEL_FC.get():
+            self.fc = ColumnParallelLinear(
+                self.num_context_features * hidden_size,
+                hidden_size,
+                bias=False,
+                gather_output=True,
+                quant_config=quant_config if self.quantizable else None,
+                prefix=fc_prefix,
+            )
         elif self.quantizable:
             self.fc = ReplicatedLinear(
                 self.num_context_features * hidden_size,
@@ -1019,10 +1028,12 @@ class DFlashDraftModel(nn.Module):
                             and tuple(loaded_weight.shape) == tuple(param.shape)
                         )
                     else:
-                        # A row-parallel fc holds a shard; the checkpoint holds the whole matrix.
+                        # A row/column-parallel fc holds a shard; the checkpoint holds the whole matrix.
                         expected_shape = (
                             (int(self.config.hidden_size), self._fc_in_features())
-                            if isinstance(self.fc, RowParallelLinear)
+                            if isinstance(
+                                self.fc, (RowParallelLinear, ColumnParallelLinear)
+                            )
                             else tuple(param.shape)
                         )
                         loaded_shape = tuple(loaded_weight.shape)

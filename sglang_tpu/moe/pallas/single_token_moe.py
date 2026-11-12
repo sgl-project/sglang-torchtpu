@@ -28,6 +28,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.kernels.vmem_limit import scoped_limit
+
 # One token, padded to a full sublane tile.
 _ROWS = 8
 # Intermediate tile widths, largest first; whole 768-wide expert slices
@@ -267,7 +269,17 @@ def single_token_moe(
                 pltpu.VMEM((k, 8, 128), jnp.float32),
             ],
         ),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=_VMEM_LIMIT),
+        compiler_params=pltpu.CompilerParams(
+            # _tile_n's own working-set estimate (with its headroom), not the
+            # 48 MiB cap it was checked against (kernels/vmem_limit.py).
+            vmem_limit_bytes=scoped_limit(
+                _VMEM_LIMIT,
+                _vmem_bytes(k_dim, tn, h_out, jnp.dtype(w1_scale.dtype).itemsize)
+                + _VMEM_HEADROOM,
+                ratio=1.0,
+                margin=2 * 1024 * 1024,
+            )
+        ),
         name=f"single_token_moe_e{num_experts}_n{n}",
     )(
         local_ids,

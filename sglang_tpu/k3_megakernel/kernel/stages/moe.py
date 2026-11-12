@@ -230,6 +230,7 @@ class MoeStage:
         up_tree: bool = False,
         single_rows: bool = True,
         down_dequant: bool = True,
+        down_scale_rows: int = 0,
         debug: frozenset = frozenset(),
     ):
         """``gather_bf16``: the router-score, latent and output gathers travel as bf16 (their
@@ -283,6 +284,10 @@ class MoeStage:
         self.single_rows = single_rows
         # Grouped rows, several picking rows: the down dot as one M=R pass on scale-applied bf16 weights.
         self.down_dequant = down_dequant
+        # Rows per expert of the expert_down_scale family as stored in HBM (0: lane_inter / 32);
+        # the ring slots match so each expert is one whole-slot DMA (see expert._scale_rows).
+        self.down_scale_rows = down_scale_rows or layout.lane_inter // 32
+        assert self.down_scale_rows >= layout.lane_inter // 32, down_scale_rows
         self.debug = debug
         assert ring % 2 == 0 or not pair_down, ring
         self.relax = relax
@@ -349,7 +354,7 @@ class MoeStage:
             pltpu.VMEM((self.ring, d.latent, 2 * li), jnp.float8_e4m3fn),
             pltpu.VMEM((self.ring, 1, 2 * li), jnp.float32),
             pltpu.VMEM((self.ring, li // 2, d.latent), jnp.uint8),
-            pltpu.VMEM((self.ring, li // 32, d.latent), jnp.uint8),
+            pltpu.VMEM((self.ring, self.down_scale_rows, d.latent), jnp.uint8),
             pltpu.SemaphoreType.DMA((self.ring, 4)),
             pltpu.VMEM((r, d.latent), jnp.float32),  # gathered latent (bf16 values)
             pltpu.VMEM((r, d.latent), jnp.float32),  # routed accumulator

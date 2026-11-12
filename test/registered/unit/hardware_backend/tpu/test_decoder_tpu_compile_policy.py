@@ -1386,6 +1386,18 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             deepstack_key, policy._direct_compile_specialization_key(None, **kwargs)
         )
 
+    def test_text_only_extend_warms_only_the_text_ids_graphs(self):
+        model_runner = _model_runner()
+        model_runner.model.get_image_feature = MagicMock()
+        model_runner.model.get_input_embeddings = MagicMock()
+        model_runner.model.num_deepstack_embeddings = 0
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+        self.assertEqual(policy._extend_serving_variants(), ("text_only", "text_ids"))
+        with tpu_envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.override(True):
+            self.assertEqual(policy._extend_serving_variants(), ("text_ids",))
+
     def test_text_ids_warmup_uses_the_positional_serving_convention(self):
         """A multimodal model still serves text-only requests.
 

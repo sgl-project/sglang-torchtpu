@@ -4,7 +4,7 @@ Why: filter/merge and H2D staging must be intercepted before device operations,
 not repaired afterward. All non-experimental calls delegate unchanged.
 kimi_spec_defaults: core refuses speculation for Kimi hybrid (KDA) targets on
 TPU and otherwise pins GPU verify/draft backends; the experimental worker
-serves DSPARK on the TPU KDA checkpoint verify, so it skips both.
+serves DSPARK and DFLASH on the TPU KDA checkpoint verify, so it skips both.
 materialize_future_map: the live FutureMap's lazy torch.empty buffers would fuse
 into their first store, compiling at whatever shape the first batch has.
 budget_pd_hidden_pool: the KV budget does not know the PD hidden pool built after
@@ -286,14 +286,6 @@ def stage_prefill_tokens(original, batch):
     return batch.prefill_input_ids_cpu
 
 
-def extend_metadata_device(original, batch, device):
-    from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
-
-    if is_host_padded(batch.sampling_info):
-        return "cpu"
-    return original(batch, device)
-
-
 def alloc_extend(
     original,
     tree_cache,
@@ -413,7 +405,10 @@ def kimi_spec_defaults(original, server_args):
     from sglang_tpu.experimental import experimental_spec_enabled
 
     cfg = resolving_view(server_args)
-    if cfg.speculative_algorithm == "DSPARK" and experimental_spec_enabled():
+    if (
+        cfg.speculative_algorithm in ("DSPARK", "DFLASH")
+        and experimental_spec_enabled()
+    ):
         return None
     return original(server_args)
 
@@ -545,11 +540,6 @@ def hook_specs():
         (
             "sglang.srt.managers.overlap_utils._stage_prefill_tokens",
             stage_prefill_tokens,
-            HookType.AROUND,
-        ),
-        (
-            "sglang.srt.model_executor.forward_batch_info._extend_metadata_device",
-            extend_metadata_device,
             HookType.AROUND,
         ),
         (

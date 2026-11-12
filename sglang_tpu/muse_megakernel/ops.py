@@ -1,18 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Muse Spark decode megakernel: weight preparation, the torch op, and the forward hook.
+"""Muse Spark megakernels: weight preparation, the torch ops, and the forward hook.
 
 ``MuseMegakernel.from_model`` runs once after weight loading, before the KV pool is sized. It
-builds the stacked K-major copies the kernel streams (attention, pooler and unpooler in fp8,
+builds the stacked K-major copies the kernels stream (attention, pooler and unpooler in fp8,
 the router in bf16) and collects the per-layer expert references sglang already owns. ``forward``
-replaces the decoder for decode and DFlash target-verify batches; prefill keeps the native
+replaces the decoder for decode and DFlash target-verify batches; other batches keep the native
 path. The LM head, logits and sampling stay in sglang.
 
-The step runs as one jitted program per device: the megakernel (collective, reads the KV
-pools) and then ``kv_write_call`` (local, scatters this step's K/V rows into the pools in
-place).
+A decode / verify step runs as one jitted program per device: the megakernel (collective, reads
+the KV pools) and then ``kv_write_call`` (local, scatters this step's K/V rows into the pools in
+place). Steps of more than BASE_STEP_MAX_ROWS rows run the megakernel's row-tiled program.
 """
 
 import logging
+import math
 
 import jax
 import msgspec
@@ -21,18 +22,54 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, kv_pack_heads
+from sglang_tpu.envs import dev_int
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.kv_pool import (
+    TpuFusedMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
+    kv_pack_heads,
+)
 from sglang_tpu.muse_megakernel import kernel as K
+from sglang_tpu.muse_megakernel.ep_mk.kernel import ep_arm, ep_megakernel_call
+from sglang_tpu.muse_megakernel.mk import trace as mk_trace
+from sglang_tpu.muse_megakernel.moe_mode import MoeMode, resolve_moe_mode
 
 logger = logging.getLogger(__name__)
 
+# Profiling only: in-kernel region names for xprof (mk/trace.py's _TRACE / _TRACE_INNER).
+mk_trace._TRACE = tpu_envs.SGLANG_TPU_MK_TRACE_REGIONS.get() >= 1
+mk_trace._TRACE_INNER = tpu_envs.SGLANG_TPU_MK_TRACE_REGIONS.get() >= 2
+
 _OP_NS = "sglang_tpu_pallas"
-# Larger steps run the native decoder: 32 rows (cc=8 with 4 DFlash drafts) is the
-# largest batch measured faster on the megakernel.
-_MAX_ROWS = 32
 # KV pages per attention chunk: 4 beats 2 on long-context verify steps and is neutral
 # at short context; 8+ costs VMEM the expert ring needs.
 _CHUNK_PAGES = 4
+# Software-pipelined attention, chunks per loop iteration (measured at 500k context): the ring
+# holds two iterations in use plus refills in flight, which need >= one iteration of slots
+# (32 fp8 SAL chunks; 16 bf16 SAL or fused ones).
+_ATTN_STREAMS = {"fused": 4, "sal": 4, "sal_fp8": 8}
+# fused: a 16-chunk ring (4 MiB); a deeper one costs dense-ring slots
+_FUSED_KV_GROUP = 8
+# Larger steps run the row-tiled program: the base program keeps the residual stream, the
+# collective pads and the expert outputs in VMEM, so its scratch grows with rows (at 128 rows
+# no ring fits the budget).
+BASE_STEP_MAX_ROWS = 32
+# Row-tiled steps: rows per pass, and the padding unit of their rows.
+_ROW_TILE = 16
+
+
+def _row_tile() -> int:
+    return dev_int(tpu_envs.SGLANG_TPU_MUSE_MK_DEV_ROW_TILE, _ROW_TILE)
+
+
+def step_rows(n_tokens: int, tp: int, moe_mode: MoeMode) -> int:
+    """Padded rows of a step: a multiple of the TP size; row-tiled steps (every EP step) also
+    of the row tile (each device then owns rows / tp rows of the expert reduce-scatter and u
+    all-gather)."""
+    rows = _round_up(n_tokens, tp)
+    if rows > BASE_STEP_MAX_ROWS or moe_mode == "ep":
+        rows = _round_up(n_tokens, math.lcm(_row_tile(), tp))
+    return rows
 
 
 def _k_major(weight: torch.Tensor) -> torch.Tensor:
@@ -106,8 +143,89 @@ def _expert_refs(experts, kind: str) -> list[torch.Tensor]:
     return [experts.w13_weight, s13, experts.w2_weight, s2]
 
 
+def expert_groups_of(kinds: tuple, size: int) -> tuple:
+    """[lo, hi) runs of at most ``size`` consecutive fp4 layers (() when size is 0)."""
+    if size <= 0:
+        return ()
+    fp4 = [l for l, k in enumerate(kinds) if k == "fp4"]
+    return tuple(
+        (fp4[i], fp4[min(i + size, len(fp4)) - 1] + 1) for i in range(0, len(fp4), size)
+    )
+
+
+_EXPERT_PARAMS = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+
+
+def _stack_expert_groups(decoder, experts: list, groups: tuple) -> list:
+    """Per-layer expert refs (4 per layer) -> refs in kernel unit order.
+
+    Each group's slabs are staged on CPU while freeing the replaced per-layer TPU
+    parameters immediately, viewed as ``float4_e2m1fn_x2`` on CPU before upload, and
+    synchronized as pure leaf PJRT buffers. Avoids TorchTPU 0.2 lazy ``torch.stack``
+    concatenation cascades and ``as_strided`` re-materialization of bound fp4 views;
+    native FusedMoE receives whole stacks and indexes its layer inside Pallas via
+    group_offset[1].
+    """
+    if not groups:
+        return experts
+    from sglang_tpu.fp8_moe import _clear_replaced_param
+
+    per_layer = [experts[4 * l : 4 * l + 4] for l in range(len(decoder.layers))]
+    experts.clear()
+    stacked = {}
+    for lo, hi in groups:
+        slabs = []
+        for j, name in enumerate(_EXPERT_PARAMS):
+            first = per_layer[lo][j]
+            device = first.device
+            dtype = first.dtype
+            raw = dtype == torch.float4_e2m1fn_x2
+            elem_shape = first.view(torch.uint8).shape if raw else first.shape
+            cpu_slab = torch.empty(
+                (hi - lo, *elem_shape),
+                dtype=torch.uint8 if raw else dtype,
+                device="cpu",
+            )
+            for k, li in enumerate(range(lo, hi)):
+                src = per_layer[li][j]
+                cpu_slab[k].copy_((src.view(torch.uint8) if raw else src).to("cpu"))
+                per_layer[li][j] = None
+                _clear_replaced_param(decoder.layers[li].mlp.experts, name)
+            st = (cpu_slab.view(dtype) if raw else cpu_slab).to(device=device)
+            del cpu_slab
+            torch.accelerator.synchronize()
+            for k, li in enumerate(range(lo, hi)):
+                exp_mod = decoder.layers[li].mlp.experts
+                exp_mod.register_buffer(f"_stacked_{name}", st, persistent=False)
+                if j == 0:
+                    old_go = exp_mod._buffers.get("_tpu_fused_rs_group_offset")
+                    if old_go is None:
+                        raise RuntimeError(
+                            f"layer {li}: stacked experts need the fused-RS group_offset set first"
+                        )
+                    go0 = int(old_go.reshape(-1)[0].item())
+                    exp_mod.register_buffer(
+                        "_tpu_fused_rs_group_offset",
+                        torch.tensor([go0, k], dtype=torch.int32, device=device),
+                        persistent=False,
+                    )
+            slabs.append(st)
+        stacked[lo] = slabs
+    out, l = [], 0
+    starts = dict(groups)
+    while l < len(decoder.layers):
+        if l in starts:
+            out.extend(stacked[l])
+            l = starts[l]
+        else:
+            out.extend(per_layer[l])
+            l += 1
+    return out
+
+
 class MuseMegakernel(torch.nn.Module):
-    """Holds the kernel's weights and one compiled op per (rows, rows per request, capture)."""
+    """Holds the kernels' weights and one compiled op per step shape (rows, rows per
+    request, capture)."""
 
     def __init__(
         self,
@@ -120,13 +238,18 @@ class MuseMegakernel(torch.nn.Module):
         tp_rank: int,
         max_rows: int,
         max_position: int,
+        expert_groups: tuple = (),
+        moe_mode: MoeMode,
     ) -> None:
         super().__init__()
         self.geo = geo
+        # ep: whole experts per rank in the experts list (ep_mk)
+        self.moe_mode: MoeMode = moe_mode
         self.kinds = kinds
         self.tp_size = tp_size
         self.max_rows = max_rows
         self.max_position = max_position
+        self.expert_groups = expert_groups
         self.chunk_pages = _CHUNK_PAGES
         # the pools' layout: SGLANG_TPU_KV_PACK_HEADS stores the rank's heads in one row
         self.kv_packed = (
@@ -151,16 +274,37 @@ class MuseMegakernel(torch.nn.Module):
 
     # ------------------------------------------------------------------ preparation
     @classmethod
-    def from_model(cls, model, *, max_rows: int = _MAX_ROWS) -> "MuseMegakernel":
+    def from_model(cls, model) -> "MuseMegakernel":
         from sglang.srt.runtime_context import get_parallel
 
+        for env in (
+            tpu_envs.SGLANG_TPU_MUSE_MK_KPERM,
+            tpu_envs.SGLANG_TPU_NVFP4_E4M3_SCALES,
+        ):
+            # kernel-level only (anvil / numerics): serving weight load has no such layout
+            if env.get():
+                raise NotImplementedError(
+                    f"{env.name}: not supported by the Muse megakernel"
+                )
         parallel = get_parallel()
+        moe_mode = resolve_moe_mode(parallel.moe_ep_size)
+        if moe_mode == "ep":
+            # the EP layout (ep_mk megakernel) has no serving weight load
+            raise NotImplementedError(
+                "SGLANG_TPU_MUSE_MOE_MODE=ep: the Muse EP megakernel is not wired for "
+                "serving: it needs replicated pre/post_expert_proj (ColumnParallel under "
+                "EP), experts in ep_mk's layout "
+                "(kperm rows, chunk_cols-interleaved gate/up, which the native fused-RS MoE "
+                "also reads) and, with SGLANG_TPU_EP_QBLOCK, "
+                "block-requantized scales shared with them"
+            )
         if not (
             parallel.moe_ep_size == 1
             and parallel.moe_tp_size == parallel.tp_size == parallel.attn_tp_size
         ):
             raise NotImplementedError(
-                "the Muse megakernel needs expert TP across the whole TP group"
+                "SGLANG_TPU_MUSE_MOE_MODE=tp: the Muse megakernel needs expert TP across "
+                "the whole TP group (EP size 1)"
             )
         # Remote DMA over one host's devices only; rows are padded to the TP size.
         if parallel.tp_size not in (1, 8):
@@ -176,6 +320,12 @@ class MuseMegakernel(torch.nn.Module):
         device = decoder.norm.weight.device
         qkvg, wo, wpool, wunpool, wrouter, smalls = [], [], [], [], [], []
         experts, kinds = [], []
+        if tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get():
+            # the native MoE shares these expert weights at block 16
+            raise NotImplementedError(
+                "SGLANG_TPU_MUSE_MK_QBLOCK: serving weight load does not requantize the "
+                "experts yet (anvil / numerics only)"
+            )
         for layer in decoder.layers:
             attn, moe = layer.self_attn, layer.mlp
             if layer.post_attention_layernorm.weight is not None:
@@ -227,6 +377,10 @@ class MuseMegakernel(torch.nn.Module):
             kind = _expert_kind(moe.experts)
             kinds.append(kind)
             experts.extend(_expert_refs(moe.experts, kind))
+        expert_groups = expert_groups_of(
+            tuple(kinds), tpu_envs.SGLANG_TPU_MUSE_MK_EXPERT_GROUP.get()
+        )
+        experts = _stack_expert_groups(decoder, experts, expert_groups)
         rope = decoder.rotary_emb
         rope_tab = torch.cat(
             [
@@ -267,14 +421,16 @@ class MuseMegakernel(torch.nn.Module):
             kinds=tuple(kinds),
             tp_size=parallel.tp_size,
             tp_rank=parallel.tp_rank,
-            max_rows=max_rows,
+            max_rows=tpu_envs.SGLANG_TPU_MUSE_MK_MAX_ROWS.get(),
             max_position=rope_tab.shape[0],
+            expert_groups=expert_groups,
+            moe_mode=moe_mode,
         )
+        torch.accelerator.synchronize()
         _INSTANCE[:] = [mk]
         _register_op()
         return mk
 
-    # ------------------------------------------------------------------ op building
     def config(
         self,
         *,
@@ -284,8 +440,39 @@ class MuseMegakernel(torch.nn.Module):
         n_page_entries: int,
         page_size: int,
         capture: tuple,
+        kv_sal: bool = False,
+        kv_sal_fp8: bool = False,
     ) -> K.MKConfig:
         g = self.geo
+        opt = tpu_envs.SGLANG_TPU_MUSE_MK_OPT.get()
+        fold_env = tpu_envs.SGLANG_TPU_MUSE_MK_FOLD.get()
+        # the EP layout runs the row-tiled program at every size (ep_mk.config.ep_arm)
+        tiled = rows > BASE_STEP_MAX_ROWS or self.moe_mode == "ep"
+        # few-row steps (decode) gather their rows in one round and have nothing to fold
+        fold_base = fold_env and n_req * q > 2 and not tiled
+        unshifted = (
+            1.02 * g.scale_query_by * g.head_dim * g.attn_scale <= K.UNSHIFTED_MAX
+        )
+        chunk_pages = 2 * g.inter_local // page_size if kv_sal else self.chunk_pages
+        env_swa_tok = tpu_envs.SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS.get()
+        swa_chunk_pages = (
+            (env_swa_tok // page_size if env_swa_tok > 0 else (2 if opt else 0))
+            if kv_sal
+            else 0
+        )
+        if swa_chunk_pages >= chunk_pages:
+            swa_chunk_pages = 0
+        attn_opt = 0
+        if opt:
+            attn_opt = (
+                5
+                if (
+                    tiled
+                    and rows > 64
+                    and self.max_position >= _ATTN_HOIST_GLOBAL_MIN_POS
+                )
+                else 3
+            )
         cfg = K.MKConfig(
             hidden=g.hidden,
             head_dim=g.head_dim,
@@ -315,33 +502,315 @@ class MuseMegakernel(torch.nn.Module):
             rows_per_req=q,
             n_req=n_req,
             capture_layers=capture,
-            compact_rows=4 if rows <= _COMPACT4_MAX_ROWS else 8,
-            chunk_pages=self.chunk_pages,
-            kv_packed=self.kv_packed,
-        )
-        # Deepest expert prefetch, then largest dense ring (2.25 MiB slots), whose declared
-        # scratch leaves VMEM headroom for Mosaic temporaries; rows-scaled scratch grows ~0.24 MiB/row.
-        for depth, cap in _DEPTH_RING_PREFERENCE:
-            cand = msgspec.structs.replace(cfg, expert_depth=depth)
-            slots = K.fit_ring_slots(cand, cap=cap)
-            cand = msgspec.structs.replace(
-                cand, ring_slots=slots, stream_depth=slots - 1
+            fold_f=fold_base,
+            fold_o=fold_base,
+            compact_rows=4 if (opt or rows <= _COMPACT4_MAX_ROWS) else 8,
+            topk_iter=rows > 8,
+            # SAL chunks are one expert w13 slot row of tokens (the ring is a view of those slots)
+            chunk_pages=chunk_pages,
+            swa_chunk_pages=swa_chunk_pages,
+            swa_window_table=_swa_window_table(kv_sal, n_page_entries),
+            kv_packed=self.kv_packed and not kv_sal,
+            kv_sal=kv_sal,
+            kv_sal_fp8=kv_sal_fp8,
+            # fp8 cached K (1) and V (2) straight into the MXU in mixed bf16 x fp8 dots
+            sal_fp8_dot=tpu_envs.SGLANG_TPU_MK_SAL_FP8_DOT.get()
+            if kv_sal and kv_sal_fp8
+            else 0,
+            expert_groups=self.expert_groups,
+            # q and k are RMS-normalized per head: the score bound allows exp without a max
+            attn_unshifted=unshifted,
+            attn_exp2=unshifted,
+            attn_pipe=unshifted and (self.kv_packed or kv_sal),
+            attn_streams=_ATTN_STREAMS[
+                ("sal_fp8" if kv_sal_fp8 else "sal") if kv_sal else "fused"
+            ],
+            attn_skip_idle_streams=opt
+            or tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE.get(),
+            attn_col_mask=bool(swa_chunk_pages)
+            and (opt or tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_COL_MASK.get()),
+            fold_attn_scale=(opt or tpu_envs.SGLANG_TPU_MK_FOLD_ATTN_SCALE.get())
+            and math.frexp(g.attn_scale)[0] == 0.5,
+            kv_group=_FUSED_KV_GROUP,
+            row_tile=_row_tile() if tiled else 0,
+            ex_opt=opt,
+            qblock=tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get(),
+            ex_via_fp8=opt,
+            bd_n_tile=1024 if opt else 0,
+            vec_dequant_kperm=opt,
+            attn_carry=2 if opt else 0,
+            alias_tiled_temps=opt and tiled,
+            combine_loop=opt and tiled,
+            untiled_max_rows=48 if opt else 128,
+            y_quant=1 if (opt and tiled) else 0,
+            alias_oy=tiled,
+            alias_p=tiled,
+            xfull_packed=False,
+            attn_opt=attn_opt,
+            tiled_vmem_y=2 if (opt and tiled) else 0,
+            tiled_o_rot=opt and tiled,
+            tiled_fold=opt and tiled and fold_env,
+            pair_ag=1 if (opt and tiled) else 0,
+            tiled_pair_y=dev_int(
+                tpu_envs.SGLANG_TPU_MUSE_MK_DEV_TILED_PAIR_Y,
+                _default_tiled_pair_y(rows),
             )
-            if K.scratch_vmem_bytes(cand) <= _SCRATCH_VMEM_BUDGET:
-                return cand
+            if (opt and tiled)
+            else 0,
+            pair_o_rs=opt and tiled,
+            alias_oag_f=opt and tiled,
+            sal_kv_split=opt and kv_sal and kv_sal_fp8,
+            attn_head_fp8=1 if (opt and kv_sal and kv_sal_fp8) else 0,
+            topk_xpose=opt and rows >= 64,
+            pair_y_stream=opt and tiled and rows > 64,
+            ex_gs_smem=False,
+            ex_w2_stage=opt and tiled,
+            # fp8 x fp8 expert LHS loses accuracy at R >= 256 (8K cc=64 verify).
+            ex_lhs_fp8=1 if (opt and (tiled or rows >= 32) and rows <= 128) else 0,
+            expert_chunk=dev_int(
+                tpu_envs.SGLANG_TPU_MUSE_MK_DEV_EXPERT_CHUNK,
+                64 if (opt and tiled and rows > 128) else 32,
+            ),
+        )
+        n_units = len(K.expert_units(cfg))
+        ex_split = (
+            4
+            if (opt and rows >= _EXPERT_SPLIT_MIN_ROWS and n_units <= _ARMS5_MAX_UNITS)
+            else 0
+        )
+        use_c8 = tiled or not cfg.ex_w2_stage
+        cfg = msgspec.structs.replace(
+            cfg,
+            expert_split=ex_split,
+            compact_arms=_compact_arms(
+                rows, n_units, opt=opt, expert_split=ex_split, use_c8=use_c8
+            ),
+            compact_rows=(
+                8
+                if (opt and ex_split > 0 and use_c8)
+                else (
+                    4
+                    if (opt and n_units <= _ARMS5_MAX_UNITS)
+                    or (not opt and rows <= _COMPACT4_MAX_ROWS)
+                    else 8
+                )
+            ),
+            ex_issue_pairs=n_units <= _ARMS5_MAX_UNITS
+            and (rows <= _COMPACT4_MAX_ROWS or (opt and not tiled)),
+            ex_bd_all=opt and not tiled,
+        )
+        if cfg.tiled_fold and tiled:
+            do_fold = n_req * q > 2 and not (
+                cfg.single_row_coll and n_req * q <= cfg.few_rows_max
+            )
+            cfg = msgspec.structs.replace(
+                cfg,
+                tiled_vmem_pads=True,
+                fold_o=do_fold,
+                fold_f=do_fold,
+            )
+        if tiled:
+            # Row-tiled plans at 128-192 rows of 8 need 60.1-60.9 MiB with LLO temporaries;
+            # scoped VMEM may go to the 62 MiB v7x limit, as the aliased base plan does.
+            cfg = msgspec.structs.replace(cfg, vmem_limit_bytes=_OPT_ALIASED_VMEM_LIMIT)
+            vys = (
+                (cfg.tiled_vmem_y, 1) if cfg.tiled_vmem_y >= 2 else (cfg.tiled_vmem_y,)
+            )
+            plans = []
+            for vy in vys:
+                c_vy = (
+                    msgspec.structs.replace(cfg, tiled_vmem_y=vy)
+                    if vy != cfg.tiled_vmem_y
+                    else cfg
+                )
+                b_vy = (
+                    _TILED_VY2_VMEM_BUDGET
+                    if vy >= 2
+                    else (
+                        (
+                            _TILED_VPADS_SMALL_VMEM_BUDGET
+                            if rows <= 128
+                            else _TILED_VPADS_VMEM_BUDGET
+                        )
+                        if cfg.tiled_vmem_pads
+                        else _SCRATCH_VMEM_BUDGET
+                    )
+                )
+                plans.append((c_vy, b_vy, _TILED_DEPTH_RING_PREFERENCE, vy != vys[-1]))
+            # QBLOCK, past the VMEM-Y plans above: under tile_loops the LLO temporaries stay
+            # small, so VMEM Y reaches 208 rows of 8 and streamed Y keeps the VMEM pads and pair
+            # collectives up to 256 (q8 cc21 at 32k: 41.4 ms on plain streamed Y, 34.7 ms).
+            if cfg.qblock and cfg.tiled_vmem_pads:
+                loops_budget = (
+                    dev_int(
+                        tpu_envs.SGLANG_TPU_MUSE_MK_DEV_TILE_LOOPS_BUDGET_MIB,
+                        _TILE_LOOPS_VMEM_BUDGET // 2**20,
+                    )
+                    * 2**20
+                )
+                # rings of <= 3 slots leave the folds no stream depth (K.fold_fits)
+                c_tl = msgspec.structs.replace(
+                    cfg, fold_o=False, fold_f=False, tile_loops=True
+                )
+                vy1 = msgspec.structs.replace(c_tl, tiled_vmem_y=1)
+                vy0 = msgspec.structs.replace(
+                    c_tl,
+                    tiled_vmem_y=0,
+                    tiled_pair_y=0,
+                    y_block_send=False,
+                    attn_streams=min(cfg.attn_streams, 4),
+                    pair_o_rs=False,
+                )
+                plans += [
+                    (vy1, loops_budget, _TILE_LOOPS_RING_PREFERENCE[:1], False),
+                    (
+                        msgspec.structs.replace(vy1, vmem_trim=True),
+                        loops_budget,
+                        _TILE_LOOPS_RING_PREFERENCE,
+                        False,
+                    ),
+                    (vy0, loops_budget, _TILE_LOOPS_RING_PREFERENCE, False),
+                ]
+            # The y_block_send VMEM-Y alternative fails the numerics test at 192 rows of 8
+            # (layer 4, global attention + fp8 experts: rows off by 25.6% against the CPU
+            # reference; the VMEM-Y and streamed-Y plans pass): off unless asked for.
+            if (
+                cfg.tiled_vmem_y >= 1
+                and cfg.alias_oag_f
+                and dev_int(tpu_envs.SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN, 0)
+            ):
+                plans.append(
+                    (
+                        msgspec.structs.replace(
+                            cfg,
+                            tiled_vmem_y=1,
+                            tiled_vmem_pads=False,
+                            tiled_o_rot=False,
+                            fold_o=False,
+                            fold_f=False,
+                            pair_ag=0,
+                            pair_o_rs=False,
+                            tiled_pair_y=0,
+                            y_block_send=True,
+                            attn_streams=min(cfg.attn_streams, 4),
+                        ),
+                        _TILED_VY2_VMEM_BUDGET,
+                        _TILED_DEPTH_RING_PREFERENCE,
+                        True,
+                    )
+                )
+            plans.append(
+                (
+                    msgspec.structs.replace(
+                        cfg,
+                        tiled_vmem_y=0,
+                        tiled_vmem_pads=False,
+                        tiled_o_rot=False,
+                        fold_o=False,
+                        fold_f=False,
+                        pair_ag=0,
+                        pair_o_rs=False,
+                        tiled_pair_y=0,
+                        y_block_send=False,
+                        attn_streams=min(cfg.attn_streams, 4),
+                    ),
+                    _OPT_BASE_VMEM_BUDGET,
+                    _TILED_DEPTH_RING_PREFERENCE,
+                    False,
+                )
+            )
+        elif opt:
+            # Prefer unaliased base scratch when the full 10-slot folded ring already
+            # fits in 48 MiB (<=16 rows, or 24 rows at q <= 4); enable VMEM pad/ysend
+            # aliasing + packed xfull when needed to keep the 10-slot ring (24 rows at
+            # q >= 5 and 32 rows).
+            plans = [
+                (cfg, _SCRATCH_VMEM_BUDGET, ((3, 11),), False),
+                (
+                    msgspec.structs.replace(
+                        cfg,
+                        alias_oy=True,
+                        alias_p=True,
+                        xfull_packed=True,
+                        vmem_limit_bytes=_OPT_ALIASED_VMEM_LIMIT,
+                    ),
+                    _OPT_BASE_VMEM_BUDGET,
+                    _DEPTH_RING_PREFERENCE,
+                    False,
+                ),
+            ]
+        else:
+            plans = [(cfg, _SCRATCH_VMEM_BUDGET, _DEPTH_RING_PREFERENCE, False)]
+        for base_cfg, budget, prefs, step_down_vy in plans:
+            for depth, cap in prefs:
+                if step_down_vy and (depth < 3 or cap < 5):
+                    break
+                cand = msgspec.structs.replace(base_cfg, expert_depth=depth)
+                slots = K.fit_ring_slots(cand, cap=cap)
+                if (
+                    tiled
+                    and base_cfg.tiled_vmem_y >= 1
+                    and not base_cfg.tile_loops
+                    and slots
+                    <= dev_int(
+                        tpu_envs.SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS,
+                        _TILED_VY_MIN_SLOTS,
+                    )
+                ):
+                    continue
+                # A VMEM-Y plan that only fits with expert depth 1 hides too little expert DMA
+                # behind long attention: cc24 x q8 took 127 ms at 512k, slower than cc28 on the
+                # streamed-Y plan (125 ms), which gives cc24 110 ms.
+                if (
+                    tiled
+                    and base_cfg.tiled_vmem_y >= 1
+                    and depth
+                    < dev_int(
+                        tpu_envs.SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH,
+                        _TILED_VY_MIN_DEPTH,
+                    )
+                ):
+                    continue
+                cand = msgspec.structs.replace(
+                    cand, ring_slots=slots, stream_depth=slots - 1
+                )
+                if K.scratch_vmem_bytes(cand) <= budget:
+                    if (cand.fold_f or cand.fold_o) and not K.fold_fits(cand):
+                        cand = msgspec.structs.replace(cand, fold_f=False, fold_o=False)
+                    # QBLOCK: the chosen plan's VMEM-pads passes run as loops (bit-identical)
+                    if cand.qblock and cand.row_tile and cand.tiled_vmem_pads:
+                        pipe = (
+                            cand.combine_loop
+                            and cand.rows > 64
+                            and not (cand.fold_o or cand.fold_f)
+                        )
+                        cand = msgspec.structs.replace(
+                            cand,
+                            tile_loops=True,
+                            pipe_ag=pipe,
+                            trim_sems=cand.trim_sems and not pipe,
+                        )
+                    return cand
         raise ValueError(
             f"no Muse megakernel ring fits the VMEM budget at {rows} rows of {q}"
         )
 
     def check_kv_pools(self, pool) -> None:
-        """Raise unless the KV pools have the layout the kernel reads: bf16 fused pools,
-        heads packed exactly when the kernel was built for packed heads."""
+        """Raise unless the KV pools have a layout the kernel reads: bf16 or fp8 SEQ_ALONG_LANE
+        pools, or bf16 fused pools with heads packed exactly when the kernel was built for it."""
         pools = (
             (pool.full_kv_pool, pool.swa_kv_pool)
             if isinstance(pool, SWAKVPool)
             else (pool,)
         )
         for p in pools:
+            if type(p) is TpuSeqAlongLaneKVPool:
+                if p.store_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+                    raise NotImplementedError(
+                        f"the Muse megakernel reads bf16 or fp8 SEQ_ALONG_LANE pools, got "
+                        f"{p.store_dtype}"
+                    )
+                continue
             if (
                 type(p) is not TpuFusedMHATokenToKVPool
                 or p.store_dtype != torch.bfloat16
@@ -357,16 +826,17 @@ class MuseMegakernel(torch.nn.Module):
                 )
 
     def callable_for(self, cfg: K.MKConfig):
-        if cfg not in self._ops:
-            self._ops[cfg] = _build_callable(cfg, self.tp_size)
-        return self._ops[cfg]
+        arm = ep_arm(cfg.rows) if self.moe_mode == "ep" else None
+        if (cfg, arm) not in self._ops:
+            self._ops[(cfg, arm)] = _build_callable(cfg, self.tp_size, arm)
+        return self._ops[(cfg, arm)]
 
     # ------------------------------------------------------------------ forward
     def handles(self, forward_batch, num_tokens: int) -> bool:
         mode = forward_batch.forward_mode
-        if not (mode.is_decode() or mode.is_target_verify()):
-            return False
-        return _round_up(num_tokens, self.tp_size) <= self.max_rows
+        if mode.is_decode() or mode.is_target_verify():
+            return step_rows(num_tokens, self.tp_size, self.moe_mode) <= self.max_rows
+        return False
 
     def forward(
         self,
@@ -384,6 +854,11 @@ class MuseMegakernel(torch.nn.Module):
 
         backend = get_attn_backend()
         md = backend.forward_metadata
+        mode = forward_batch.forward_mode
+        if not (mode.is_decode() or mode.is_target_verify()):
+            raise ValueError(
+                f"the Muse megakernel runs decode / verify steps, got {mode}"
+            )
         page_indices = md.page_indices
         swa_page_indices = (
             md.swa_page_indices if md.swa_page_indices is not None else page_indices
@@ -392,7 +867,7 @@ class MuseMegakernel(torch.nn.Module):
         T = embeds.shape[0]
         if T % n_req:
             raise ValueError(f"{T} rows do not split evenly over {n_req} requests")
-        rows = _round_up(T, self.tp_size)
+        rows = step_rows(T, self.tp_size, self.moe_mode)
         pad = rows - T
         emb = embeds.to(torch.bfloat16)
         pos = positions.to(torch.int32)
@@ -452,13 +927,16 @@ def _register_op() -> None:
         from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
         mk = _INSTANCE[0]
+        kv_sal = is_sal_pool_shape(tuple(kv[0].shape), mk.geo)
         cfg = mk.config(
             rows=emb.shape[0],
             q=rows_per_req,
             n_req=n_req,
             n_page_entries=pf.shape[0],
-            page_size=kv[0].shape[1],
+            page_size=kv[0].shape[-1] if kv_sal else kv[0].shape[1],
             capture=tuple(capture),
+            kv_sal=kv_sal,
+            kv_sal_fp8=kv_sal and kv[0].dtype == torch.float8_e4m3fn,
         )
         callable_ = mk.callable_for(cfg)
         with tpu_info_for_cpu_export():
@@ -479,29 +957,160 @@ def _register_op() -> None:
 # (verify attention): 24 rows of 6 compile at 46.8 MiB declared, 32 rows of 8 overflowed the
 # 60 MiB limit at 48.7 MiB (~11.5 MiB of temporaries).
 _SCRATCH_VMEM_BUDGET = 48 * 2**20
-_DEPTH_RING_PREFERENCE = ((3, 11), (3, 4), (1, 4))
+_OPT_BASE_VMEM_BUDGET = 50 * 2**20
+# 32 rows of 8 at that budget needed 60.25 MiB with temporaries; scoped VMEM may go to the
+# 62 MiB v7x limit, so the aliased plan takes it rather than a smaller ring.
+_OPT_ALIASED_VMEM_LIMIT = 62 * 2**20
+# On libtpu 0.0.50 (2026-10-07), row-tiled LLO temporaries add ~10.5-11.0 MiB on top of
+# declared scratch; capping row-tiled budgets at 50 MiB keeps total scoped VMEM <= 60.5 MiB
+# under the 62 MiB v7x limit across rows=48..128 without LLO retry thrashing.
+_TILED_VPADS_VMEM_BUDGET = 50 * 2**20
+# 128 rows of 8 (P/D decode cc16): the depth-3, 5-slot VMEM-Y plan declares 48.28 MiB, but its
+# LLO temporaries take scoped VMEM to 62.08 MiB, over the 62 MiB limit. Under 48 MiB the
+# planner takes the depth-3, 3-slot plan (43.53 MiB): 42.3/67.1 ms at 16k/512k (anvil).
+_TILED_VPADS_SMALL_VMEM_BUDGET = 48 * 2**20
+_TILED_VY2_VMEM_BUDGET = 50 * 2**20
+_ATTN_HOIST_GLOBAL_MIN_POS = 262144
+# Past this, pages_swa stays in HBM and each step reads only the requests' windows of it.
+# Whole tables that still fit SMEM are slow: at 1M context q8 cc20/cc24 (640/768 KiB) ran
+# 10.8-16.9x slower than with the window table (bit-identical outputs); cc4-cc12 (<=384
+# KiB) cost 0-1.1% with it (anvil A/B, device time).
+_SMEM_PAGE_TABLES_BUDGET = 512 * 2**10
+# A VMEM-Y row-tiled plan squeezed to a 2-slot ring has no prefetch room, and its LLO spill
+# slots overflow VMEM (cc28 x q8: 49.5 MiB scratch + 16.2 MiB spills > 63.9 MiB); the
+# streamed-Y plan fits there with a 6-slot ring.
+_TILED_VY_MIN_SLOTS = 2
+# The VMEM-Y plans' shallowest expert prefetch; shallower ones yield to the streamed-Y plan.
+_TILED_VY_MIN_DEPTH = 3
+
+
+def _swa_window_table(kv_sal: bool, n_page_entries: int) -> bool:
+    mode = tpu_envs.SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE.get()
+    if mode not in ("auto", "0", "1"):
+        raise ValueError(f"SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE={mode!r}: auto, 0 or 1")
+    if mode == "auto":
+        return kv_sal and 2 * 4 * n_page_entries > _SMEM_PAGE_TABLES_BUDGET
+    return mode == "1"
+
+
+# (expert depth, ring cap): the ring is the largest divisor of the 30 dense tiles per layer up
+# to the cap (10, 6, 5, then 3). The folds need a stream depth of at least 3 (K.fold_fits), so
+# 5 slots or more.
+_DEPTH_RING_PREFERENCE = ((3, 11), (3, 6), (3, 5), (3, 4), (1, 4))
+# Row-tiled steps: deepest expert prefetch, then the largest dense ring that fits.
+_TILED_DEPTH_RING_PREFERENCE = tuple((d, s) for d in (3, 1) for s in range(11, 1, -1))
+# tile_loops plans: depth 3, a 3- or 2-slot ring. Their temporaries are small (256 rows of 8,
+# streamed Y: 58.76 MiB declared, 62.50 MiB scoped), but a 6-slot ring overflows the LLO's
+# VMEM (176 rows: 56.13 MiB declared, 78.93 MiB used).
+_TILE_LOOPS_RING_PREFERENCE = ((3, 4), (3, 2))
+_TILE_LOOPS_VMEM_BUDGET = 58 * 2**20
 # Measured device step (real geometry, random routing): the 8-row block-diag variant is
-# slower than the 4-row one at 8-24 rows and faster only at 48.
+# slower than the 4-row one at 8-24 rows and faster once expert_split >= 32 rows.
 _COMPACT4_MAX_ROWS = 24
+_EXPERT_SPLIT_MIN_ROWS = 32
+
+
+# Expert operand units (one leaf each in the expert-DMA layer walks) up to which the expert
+# loop still fits the instruction memory with a fifth expert variant or paired DMA issue:
+# stacked groups of 15 (6 units) fit, per-layer operands (62 units) swap overlays.
+_ARMS5_MAX_UNITS = 8
+
+
+def _compact_arms(
+    rows: int,
+    n_units: int,
+    *,
+    opt: bool = True,
+    expert_split: int = 0,
+    use_c8: bool = True,
+) -> tuple:
+    """Compact expert row buckets, one code variant each (the full path is one more); a sixth
+    variant overflows the instruction memory into overlay swaps."""
+    if n_units > _ARMS5_MAX_UNITS:
+        return ()
+    if opt:
+        if rows <= 8:
+            return (1, 2, 3, 4)
+        return (1, 2, 4, 8) if (expert_split > 0 and use_c8) else (1, 2, 4)
+    if rows > _COMPACT4_MAX_ROWS:
+        return ()
+    return (1, 2, 3, 4) if rows <= 8 else (1, 2, 3, 5)
+
+
+def _default_tiled_pair_y(rows: int) -> int:
+    if rows < 64:
+        return 0
+    return 1 if rows < 80 else 2
+
+
+def is_sal_pool_shape(shape: tuple, geo) -> bool:
+    """SEQ_ALONG_LANE blocks are [pages, 2 * kv_heads, head_dim // pk, pk, page_size]; fused
+    pools are [pages, page_size, heads, 2, lanes]."""
+    return (
+        len(shape) == 5
+        and shape[1] == 2 * geo.kv_heads
+        and shape[2] * shape[3] == geo.head_dim
+        and shape[4] % K.LANE == 0
+    )
 
 
 def _round_up(n: int, m: int) -> int:
     return -(-n // m) * m
 
 
-def _build_callable(cfg: K.MKConfig, tp: int):
-    """The megakernel + KV scatter as one jitted ``shard_map`` program over the TP mesh."""
+def _export_program(body, *, tp: int, n_args: int, kv0: int, n_out: int, tag: str):
+    """``body`` (per-device, KV pools from argument ``kv0`` on, returned after ``n_out - L``
+    outputs) as one jitted ``shard_map`` program over the TP mesh, exported for torch with
+    the pools donated and aliased."""
     from torch_tpu._internal.pallas import pallas as pallas_impl
 
     from sglang_tpu.oneshot_collectives import _get_mesh
     from sglang_tpu.pallas_jax_op import _CpuExportJaxCallable
 
+    mesh = _get_mesh(tp)
+    n_kv = n_args - kv0
+    sharded = jax.shard_map(
+        body,
+        mesh=mesh,
+        in_specs=(P("model"),) * n_args,
+        out_specs=(P("model"),) * n_out,
+        check_vma=False,
+    )
+
+    def fn(*xs: jax.Array) -> tuple:
+        return tuple(sharded(*xs))
+
+    donate = tuple(range(kv0, n_args))
+    out_shardings = tuple(NamedSharding(mesh, P("model")) for _ in range(n_out))
+    jit_fn = jax.jit(
+        fn, donate_argnums=donate, keep_unused=True, out_shardings=out_shardings
+    )
+    trace_key = pallas_impl._get_kernel_invocation_key(
+        f"{tag}_{id(fn)}", [], {"donate": donate}
+    )
+    callable_ = _CpuExportJaxCallable(
+        name=f"jax_{tag}",
+        jit_fn=jit_fn,
+        trace_key=trace_key,
+        mesh=mesh,
+        input_partition_specs=(P("model"),) * n_args,
+        static_argnums=(),
+        donate_argnums=donate,
+        input_output_aliases={kv0 + i: n_out - n_kv + i for i in range(n_kv)},
+    )
+    callable_.sglang_output_shardings = out_shardings
+    return callable_
+
+
+def _build_callable(cfg: K.MKConfig, tp: int, ep: str | None = None):
+    """The megakernel + KV scatter as one jitted ``shard_map`` program over the TP mesh; with
+    ep (an ep_arm), that arm of the EP megakernel (ep_mk: whole experts per rank)."""
     L = cfg.n_layers
     nw = len(K.WEIGHT_NAMES)
-    n_args = 5 + nw + 4 * L + L
-    kv0 = 5 + nw + 4 * L
-    mesh = _get_mesh(tp)
-    mk = K.megakernel_call(cfg)
+    ne = K.n_expert_refs(cfg)
+    n_args = 5 + nw + ne + L
+    kv0 = 5 + nw + ne
+    mk = ep_megakernel_call(cfg, arm=ep) if ep else K.megakernel_call(cfg)
     kvw = K.kv_write_call(cfg)
 
     def body(*xs):
@@ -509,50 +1118,26 @@ def _build_callable(cfg: K.MKConfig, tp: int):
         pools = kvw(*xs[:4], newkv, *xs[kv0:])
         return (hid, aux, *pools)
 
-    sharded = jax.shard_map(
-        body,
-        mesh=mesh,
-        in_specs=(P("model"),) * n_args,
-        out_specs=(P("model"),) * (2 + L),
-        check_vma=False,
-    )
-
-    def fn(
-        meta: jax.Array,
-        pos: jax.Array,
-        pf: jax.Array,
-        psw: jax.Array,
-        emb: jax.Array,
-        *rest: jax.Array,
-    ) -> tuple:
-        return tuple(sharded(meta, pos, pf, psw, emb, *rest))
-
-    donate = tuple(range(kv0, n_args))
-    out_shardings = tuple(NamedSharding(mesh, P("model")) for _ in range(2 + L))
-    jit_fn = jax.jit(
-        fn, donate_argnums=donate, keep_unused=True, out_shardings=out_shardings
-    )
     tag = f"r{cfg.rows}_q{cfg.rows_per_req}_n{cfg.n_req}_c{len(cfg.capture_layers)}_p{cfg.pages_per_seq}"
-    trace_key = pallas_impl._get_kernel_invocation_key(
-        f"muse_megakernel_{tag}_{id(fn)}", [], {"donate": donate}
+    callable_ = _export_program(
+        body,
+        tp=tp,
+        n_args=n_args,
+        kv0=kv0,
+        n_out=2 + L,
+        tag=f"muse_{f'ep_{ep}_' if ep else ''}megakernel_{tag}",
     )
-    callable_ = _CpuExportJaxCallable(
-        name=f"jax_muse_megakernel_{tag}",
-        jit_fn=jit_fn,
-        trace_key=trace_key,
-        mesh=mesh,
-        input_partition_specs=(P("model"),) * n_args,
-        static_argnums=(),
-        donate_argnums=donate,
-        input_output_aliases={kv0 + i: 2 + i for i in range(L)},
-    )
-    callable_.sglang_output_shardings = out_shardings
     logger.info(
-        "Muse megakernel built: rows=%d q=%d requests=%d capture=%s pages/seq=%d",
+        "Muse megakernel built: ep=%s rows=%d q=%d requests=%d capture=%s pages/seq=%d "
+        "row_tile=%d ring=%d folds=%s",
+        ep,
         cfg.rows,
         cfg.rows_per_req,
         cfg.n_req,
         cfg.capture_layers,
         cfg.pages_per_seq,
+        cfg.row_tile,
+        cfg.ring_slots,
+        cfg.fold_f or cfg.fold_o,
     )
     return callable_

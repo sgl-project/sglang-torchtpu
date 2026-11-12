@@ -8,6 +8,10 @@ these; so can you.
 here are legacy and leave as their tests move (see
 [Legacy shell recipes](#legacy-shell-recipes)).
 
+Diffusion (`sglang.multimodal_gen`) servers are not recipes here: the launcher
+starts `sglang.launch_server` only. Their launch scripts live in
+[`../diffusion/`](../diffusion/README.md).
+
 ## Running one
 
 From the repo root:

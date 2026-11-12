@@ -213,7 +213,10 @@ def handle_shared_experts_tp(server_args: Any):
             "--shared-experts-tp-size requires a Kimi-K3 model configuration."
         )
     model_arch = model_config_of(server_args).hf_config.architectures[0]
-    if model_arch != "KimiK3ForConditionalGeneration":
+    if model_arch not in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+    ):
         raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
     if cfg.moe_a2a_backend not in (
         "deepep",
@@ -254,11 +257,17 @@ def handle_decode_context_parallelism(server_args: Any):
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
             raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
-        if cfg.dcp_comm_backend not in ("a2a", "fi_a2a"):
+        if (
+            cfg.dcp_comm_backend
+            not in (
+                "a2a",
+                "fi_a2a",
+            )
+            and not current_platform.dcp_replicates_q_heads()
+        ):
             raise ValueError(
-                "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
-                "communication backend (it removes the head-dim Q all-gather); "
-                f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
+                "--dcp-replicate-q-proj is not supported with "
+                f"--dcp-comm-backend={cfg.dcp_comm_backend} on this platform."
             )
 
 

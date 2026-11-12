@@ -5,11 +5,55 @@ import unittest
 from benchmark.tpu.launch_server import (
     LaunchConfig,
     load_recipe,
+    plan_launch,
     resolve_server,
 )
 
 
 class TestRuntimeEnvironment(unittest.TestCase):
+    def test_nightly_checks_final_extra_args_before_enabling_prefetch(self):
+        for extra_args, enabled in (
+            (["--base-gpu-id", "4"], False),
+            (["--use-ray"], False),
+            (["--weight-loader-disable-mmap"], False),
+            (["--weight-loader-drop-cache-after-load"], True),
+        ):
+            with self.subTest(extra_args=extra_args):
+                plan = plan_launch(
+                    {
+                        "server_args": {"model_path": "checkpoint", "tp_size": 8},
+                        "extra_args": extra_args,
+                    },
+                    {"CI_WEIGHT_LOADER_PREFETCH": "1"},
+                )
+                self.assertEqual(
+                    "--weight-loader-prefetch-checkpoints" in plan.command, enabled
+                )
+                if enabled:
+                    self.assertNotIn(
+                        "--weight-loader-drop-cache-after-load", plan.command
+                    )
+                    self.assertFalse(
+                        plan.config.server_args["weight_loader_drop_cache_after_load"]
+                    )
+                else:
+                    self.assertNotIn("LOCAL_SIZE", plan.env)
+
+    def test_recipe_mmap_opt_out_keeps_the_launch_unchanged(self):
+        plan = plan_launch(
+            {
+                "server_args": {
+                    "model_path": "checkpoint",
+                    "tp_size": 8,
+                    "weight_loader_disable_mmap": True,
+                }
+            },
+            {"CI_WEIGHT_LOADER_PREFETCH": "1"},
+        )
+        self.assertNotIn("--weight-loader-prefetch-checkpoints", plan.command)
+        self.assertIn("--weight-loader-disable-mmap", plan.command)
+        self.assertNotIn("LOCAL_SIZE", plan.env)
+
     def config(self, **runtime_envs):
         return LaunchConfig(
             {
@@ -48,6 +92,15 @@ class TestRuntimeEnvironment(unittest.TestCase):
         self.assertEqual(env["TPU_TOPOLOGY"], "4x2x1")
         self.assertEqual(env["TPU_WORKER_HOSTNAMES"], "host0,host1")
         self.assertEqual(resolved.server_args["dist_init_addr"], "host0:10011")
+
+    def test_ci_prefetch_reaches_the_server_command_and_metadata(self):
+        plan = plan_launch(
+            {"server_args": self.config().server_args},
+            inherited={"CI_WEIGHT_LOADER_PREFETCH": "1"},
+        )
+        self.assertIn("--weight-loader-prefetch-checkpoints", plan.command)
+        self.assertEqual(plan.env["LOCAL_SIZE"], "8")
+        self.assertTrue(plan.config.server_args["weight_loader_prefetch_checkpoints"])
 
     def test_cache_defaults_follow_resolved_model_and_home(self):
         _, env = resolve_server(

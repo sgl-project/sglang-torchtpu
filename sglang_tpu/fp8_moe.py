@@ -598,14 +598,4 @@ def apply_tpu_fp8_moe(
         global_num_experts=global_num_experts,
         expert_group_offset=expert_group_offset,
     )
-    # Same contract as the unquantized runner: the standard dispatcher leaves
-    # routed_scaling_factor to the runner, and per-expert output (the caller
-    # combines on its own terms) stays unscaled.
-    routed_scaling_factor = layer.moe_runner_config.routed_scaling_factor
-    if (
-        not no_combine
-        and routed_scaling_factor is not None
-        and routed_scaling_factor != 1.0
-    ):
-        output = output * routed_scaling_factor
     return StandardCombineInput(hidden_states=output)
