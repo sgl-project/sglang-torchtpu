@@ -256,7 +256,6 @@ def _flags(cfg: KernelConfig):
     return (cfg.fp8_kda, cfg.ch_experts, cfg.km_cols, cfg.km_slots, cfg.km_issue)
 
 
-
 # Pools per score row: the selection mask is (Q, rows, POOL_ROW), one lane per pool.
 POOL_ROW = 128
 MK_ABL = os.environ.get("MK_ABL", "")  # trace-time ablation knobs (debug only)
@@ -269,6 +268,7 @@ def score_rows(n_rows, tp, cfg):
         return n_rows
     ch = min(n_rows, 64)
     return min(n_rows, ((n_rows + tp - 1) // tp + 7) // 8 * 8 + 2 * ch)
+
 
 # Rows of the nope pool one gathered block holds (an 8-row u32 tile: DMAs into VMEM
 # slices must be tile-aligned), so a block holds BLOCK_ROWS // kpool pools.
@@ -398,12 +398,21 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         # Context parallel exchange pads, one slot per peer and parity: every chip's absorbed
         # queries for all heads (bf16, once per layer), the selected scores (f32), and the
         # attention partials addressed to each head owner (f32: acc rows, then m and l rows).
-        pltpu.VMEM((1, tp, B * nh * Q, kvl) if cfg.context_parallel else (1, 1, 16, 128), BF16),
+        pltpu.VMEM(
+            (1, tp, B * nh * Q, kvl) if cfg.context_parallel else (1, 1, 16, 128), BF16
+        ),
         pltpu.VMEM((2, tp, 8, hsh) if cfg.context_parallel else (1, 1, 8, 128), F32),
-        pltpu.VMEM((2, tp, cp_att_rows(nh, Q), kvl) if cfg.context_parallel else (1, 1, 8, 128), F32),
+        pltpu.VMEM(
+            (2, tp, cp_att_rows(nh, Q), kvl)
+            if cfg.context_parallel
+            else (1, 1, 8, 128),
+            F32,
+        ),
         # Staged partials, block d in columns [d * kvl, (d + 1) * kvl): a remote DMA takes a
         # column slice of a 2-D source, not a leading index of a 3-D one.
-        pltpu.VMEM((cp_att_rows(nh, Q), tp * kvl) if cfg.context_parallel else (8, 128), F32),
+        pltpu.VMEM(
+            (cp_att_rows(nh, Q), tp * kvl) if cfg.context_parallel else (8, 128), F32
+        ),
         pltpu.VMEM((B * nh * Q, kvl) if cfg.context_parallel else (16, 128), BF16),
         pltpu.VMEM((8, hsh) if cfg.context_parallel else (8, 128), F32),
         pltpu.SemaphoreType.DMA((3, 2, 3)),
@@ -692,7 +701,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             cps = []
             for d in range(tp):
                 src = src_of(d)
-                local = pltpu.make_async_copy(src, dst.at[par, me], cpsem.at[pad, par, 0])
+                local = pltpu.make_async_copy(
+                    src, dst.at[par, me], cpsem.at[pad, par, 0]
+                )
                 remote = pltpu.make_async_remote_copy(
                     src_ref=src,
                     dst_ref=dst.at[par, me],
@@ -1131,11 +1142,18 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             pcol = jax.lax.broadcasted_iota(jnp.int32, (PT, 1), 0)
             lane = jax.lax.broadcasted_iota(jnp.int32, (1, PR), 1)
             CP = cfg.context_parallel
-            msk = mskb if CP else scr  # selection masks (in place of the scores when not CP)
+            msk = (
+                mskb if CP else scr
+            )  # selection masks (in place of the scores when not CP)
             # Context parallel: chip me owns the contiguous score rows [r_lo, r_hi), a
             # multiple of the top-k chunk, so every sweep covers 1/tp of the context.
-            RCH = min(NR, 64)  # top-k chunk; ownership bounds are masked inside the chunk
-            own = [jnp.int32(0), jnp.int32(NR)]  # [r_lo, r_hi), set per request by own_rows_for
+            RCH = min(
+                NR, 64
+            )  # top-k chunk; ownership bounds are masked inside the chunk
+            own = [
+                jnp.int32(0),
+                jnp.int32(NR),
+            ]  # [r_lo, r_hi), set per request by own_rows_for
             # scr / msk hold rows [base, base + LR): the chunk-aligned start of the share.
             LR = score_rows(NR, tp, cfg)
             base = [jnp.int32(0)]
@@ -1154,7 +1172,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         own[1] = n_rows
                     base[0] = own[0] // RCH * RCH
 
-            own_row = (lambda r: (r >= own[0]) & (r < own[1])) if CP else (lambda r: True)
+            own_row = (
+                (lambda r: (r >= own[0]) & (r < own[1])) if CP else (lambda r: True)
+            )
             own_rows = (lambda: (own[0], own[1])) if CP else (lambda: None)
 
             def page(b, pg):
@@ -1220,7 +1240,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             PPP = ps // kp  # pools per page
             TB = min(8, NR)  # score rows compacted per step: one (8, PR) vreg
             if BR % kp or NR % TB:
-                raise ValueError(f"kpool {kp} must divide {BR} and {TB} must divide {NR} rows")
+                raise ValueError(
+                    f"kpool {kp} must divide {BR} and {TB} must divide {NR} rows"
+                )
             if GS != PR:
                 raise ValueError(f"gather_slots must be {PR}, got {GS}")
             sub = jax.lax.broadcasted_iota(jnp.int32, (TB, 1), 0)
@@ -1258,7 +1280,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     for sh in (1, 2, 4):
                         if sh < TB:
                             rp = rp + jnp.where(sub >= sh, pltpu.roll(rp, sh, 0), 0)
-                    rank = pre - s32 + rp - rs  # block-local order of each selected pool
+                    rank = (
+                        pre - s32 + rp - rs
+                    )  # block-local order of each selected pool
                     n_blk = jnp.sum(s32)
                     val = (pid << 4) | qb
 
@@ -1293,7 +1317,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
                 zrow = jnp.zeros((1, GS), i32)
                 k_lo = own[0] // TB
-                k_hi = jnp.maximum(k_lo, jnp.minimum((nts + TB - 1) // TB, (own[1] + TB - 1) // TB))
+                k_hi = jnp.maximum(
+                    k_lo, jnp.minimum((nts + TB - 1) // TB, (own[1] + TB - 1) // TB)
+                )
                 cur, _, n_sel, g = jax.lax.fori_loop(
                     k_lo, k_hi, block, (zrow, zrow, jnp.int32(0), jnp.int32(0))
                 )
@@ -1310,7 +1336,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 unfilled lanes hold UNSEL (scores are finite and far above it)."""
                 NGRP = hsh // PR  # 128-lane groups in the row
                 if hsh % PR or selk > hsh:
-                    raise ValueError(f"H/tp={hsh} must hold {selk} scores in 128-lane groups")
+                    raise ValueError(
+                        f"H/tp={hsh} must hold {selk} scores in 128-lane groups"
+                    )
 
                 def rows(k):
                     return pl.ds(pl.multiple_of(k * TB - base[0], TB), TB)
@@ -1344,15 +1372,21 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                             s_abs = base + done + j
                             gi, li = s_abs // PR, s_abs % PR
                             for gg in range(NGRP):
-                                grp[gg] = jnp.where((lane == li) & (gi == gg), v, grp[gg])
+                                grp[gg] = jnp.where(
+                                    (lane == li) & (gi == gg), v, grp[gg]
+                                )
                         return tuple(grp), jnp.minimum(done + CAND, n_blk), base
 
-                    grp, _, base = jax.lax.while_loop(more, place, (grp, jnp.int32(0), base))
+                    grp, _, base = jax.lax.while_loop(
+                        more, place, (grp, jnp.int32(0), base)
+                    )
                     return grp, base + n_blk
 
                 init = tuple(jnp.full((1, PR), UNSEL, F32) for _ in range(NGRP))
                 k_lo = own[0] // TB
-                k_hi = jnp.maximum(k_lo, jnp.minimum((n_rows + TB - 1) // TB, (own[1] + TB - 1) // TB))
+                k_hi = jnp.maximum(
+                    k_lo, jnp.minimum((n_rows + TB - 1) // TB, (own[1] + TB - 1) // TB)
+                )
                 grp, _ = jax.lax.fori_loop(k_lo, k_hi, block, (init, jnp.int32(0)))
                 return jnp.concatenate(list(grp), axis=1)
 
@@ -1413,8 +1447,15 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     return jnp.stack([jnp.reshape(v, (1, 1)) for v in vs], axis=0)
 
                 K.topk_write(
-                    scr, msk, lo=stack(los), hi=stack(his), need=stack(needs),
-                    n_tiles=n_rows, chunk_tiles=RCH, rows=own_rows(), within=True,
+                    scr,
+                    msk,
+                    lo=stack(los),
+                    hi=stack(his),
+                    need=stack(needs),
+                    n_tiles=n_rows,
+                    chunk_tiles=RCH,
+                    rows=own_rows(),
+                    within=True,
                     base=base[0],
                 )
 
@@ -1456,7 +1497,9 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 if CP and MR != 1:
                     raise ValueError("context_parallel needs attn_tile == kpool * 128")
                 t_of = (lambda j: own[0] + j) if CP else (lambda j: j)
-                n_scan = jnp.maximum(0, jnp.minimum(nts, own[1]) - own[0]) if CP else nts
+                n_scan = (
+                    jnp.maximum(0, jnp.minimum(nts, own[1]) - own[0]) if CP else nts
+                )
                 for j in range(RS - 1):
                     pl.when(j < n_scan)(lambda j=j: rec_fetch(b, t_of(j), j))
 
@@ -1487,12 +1530,25 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 # Chunked over the score scratch: whole-context values spill ~30 MiB at 1M.
                 n_rows = last // TKR + 1
                 lo, hi_, need = K.topk_bisect(
-                    scr, k=selk, p=p, kp=kp, n_tiles=n_rows, chunk_tiles=RCH, rows=own_rows(),
+                    scr,
+                    k=selk,
+                    p=p,
+                    kp=kp,
+                    n_tiles=n_rows,
+                    chunk_tiles=RCH,
+                    rows=own_rows(),
                     base=base[0],
                 )
                 K.topk_write(
-                    scr, msk, lo=lo, hi=hi_, need=need, n_tiles=n_rows, chunk_tiles=RCH,
-                    rows=own_rows(), base=base[0],
+                    scr,
+                    msk,
+                    lo=lo,
+                    hi=hi_,
+                    need=need,
+                    n_tiles=n_rows,
+                    chunk_tiles=RCH,
+                    rows=own_rows(),
+                    base=base[0],
                 )
                 if CP and "notopk" not in MK_ABL:
                     with _scope("dsa_merge_topk"):
@@ -1510,7 +1566,11 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                             jnp.sum(
                                 jnp.where(
                                     lane == ci,
-                                    msk[qi, pl.ds(jnp.clip(ti - base[0], 0, LR - 1), 1), :],
+                                    msk[
+                                        qi,
+                                        pl.ds(jnp.clip(ti - base[0], 0, LR - 1), 1),
+                                        :,
+                                    ],
                                     0.0,
                                 )
                             )
@@ -1579,10 +1639,14 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 rowi = jax.lax.broadcasted_iota(jnp.int32, cpqsrc.shape, 0) // 8
                 if "patq" in MK_ABL:  # debug: stamp me * 10 + 100 * layer + row / 8
                     cpqsrc[...] = (me * 10 + 100 * d_i + rowi).astype(F32).astype(BF16)
-                if "patqs" in MK_ABL:  # debug: small identical-per-block stamp (no overflow)
+                if (
+                    "patqs" in MK_ABL
+                ):  # debug: small identical-per-block stamp (no overflow)
                     cpqsrc[...] = ((me * 10 + rowi).astype(F32) * 0.001).astype(BF16)
                 qpar[0] = cp_exchange(lambda d: cpqsrc, cpq, 0)
-                if "chkq" in MK_ABL:  # debug: per-slot max |received - stamp| -> new-KV row 0
+                if (
+                    "chkq" in MK_ABL
+                ):  # debug: per-slot max |received - stamp| -> new-KV row 0
                     lane_ = jax.lax.broadcasted_iota(jnp.int32, (1, PR), 1)
                     out = jnp.zeros((1, PR), F32)
                     for d in range(tp):
@@ -1650,7 +1714,10 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     outs.append(dot(lat, w_vc, ((1,), (1,))) * ks)
                 out = jnp.concatenate(outs, axis=1).astype(BF16)
                 attb[b] = jnp.pad(out, ((0, 16 - Q), (0, 0)))
-                if "dumpatt" in MK_ABL:  # debug: request 0's attention rows -> its new-KV rows
+                if (
+                    "dumpatt" in MK_ABL
+                ):  # debug: request 0's attention rows -> its new-KV rows
+
                     @pl.when(b == 0)
                     def _():
                         o_nkv[d_i, pl.ds(0, Q), pl.ds(0, kvl)] = out[:, :kvl]
@@ -1683,18 +1750,24 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                     cpsrc[pl.ds(nhQ, 8), cols] = jnp.concatenate(
                         [as_row(m_f[rows]), as_row(l_f[rows]), zrows], axis=0
                     )
-                if "noxchg" in MK_ABL:  # ablation: own heads' rows, no exchange (exact only
+                if (
+                    "noxchg" in MK_ABL
+                ):  # ablation: own heads' rows, no exchange (exact only
                     # when this chip owns the whole context, e.g. with the bigrc knob)
                     pick = [jnp.where(me == c, 1.0, 0.0) for c in range(tp)]
                     den = sum(l_f[c * nhQ : (c + 1) * nhQ] * pick[c] for c in range(tp))
                     num = sum(a_f[c * nhQ : (c + 1) * nhQ] * pick[c] for c in range(tp))
                     return den, num
-                if "chksel" in MK_ABL:  # debug: carry n_sel in row nhQ + 2, lane 0 of every block
+                if (
+                    "chksel" in MK_ABL
+                ):  # debug: carry n_sel in row nhQ + 2, lane 0 of every block
                     for c in range(tp):
                         cpsrc[pl.ds(nhQ + 2, 1), pl.ds(c * kvl, kvl)] = jnp.full(
                             (1, kvl), 1.0, F32
                         ) * n_sel.astype(F32)
-                if "patxall" in MK_ABL:  # debug: stamp every row of block c: me*10 + c + row/8
+                if (
+                    "patxall" in MK_ABL
+                ):  # debug: stamp every row of block c: me*10 + c + row/8
                     rowa = jax.lax.broadcasted_iota(jnp.int32, (AR, kvl), 0) // 8
                     for c in range(tp):
                         cpsrc[:, pl.ds(c * kvl, kvl)] = (me * 10 + c + rowa).astype(F32)
@@ -1704,14 +1777,20 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                             (8, kvl), 1.0, F32
                         ) * (me * 10 + c + 100 * d_i).astype(F32)  # + layer
                 par = cp_exchange(lambda d: cpsrc.at[:, pl.ds(d * kvl, kvl)], cpatt, 2)
-                if "dumpx" in MK_ABL:  # debug: received m rows of request 0 -> its new-KV rows
+                if (
+                    "dumpx" in MK_ABL
+                ):  # debug: received m rows of request 0 -> its new-KV rows
+
                     @pl.when(b == 0)
                     def _():
                         for d in range(tp):
-                            o_nkv[d_i, pl.ds(d // 2, 1), pl.ds((d % 2) * PR, PR)] = cpatt[
-                                par, d, pl.ds(nhQ, 1), pl.ds(0, PR)
-                            ].astype(BF16)
-                if "chksel" in MK_ABL:  # debug: n_sel and l[row 0] per slot as 3-bit digits
+                            o_nkv[d_i, pl.ds(d // 2, 1), pl.ds((d % 2) * PR, PR)] = (
+                                cpatt[par, d, pl.ds(nhQ, 1), pl.ds(0, PR)].astype(BF16)
+                            )
+
+                if (
+                    "chksel" in MK_ABL
+                ):  # debug: n_sel and l[row 0] per slot as 3-bit digits
                     # (fp8 on the pool path holds only integers <= 16 exactly): lanes
                     # 4d..4d+3 = n_sel digits, 32+4d.. = l digits, 64+4d.. = l row 1.
                     lane_ = jax.lax.broadcasted_iota(jnp.int32, (1, PR), 1)
@@ -1726,31 +1805,63 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         return o
 
                     for d in range(tp):
-                        ns = jnp.sum(jnp.where(lane_ == 0, cpatt[par, d, pl.ds(nhQ + 2, 1), pl.ds(0, PR)], 0.0))
-                        l0 = jnp.sum(jnp.where(lane_ == 0, cpatt[par, d, pl.ds(nhQ + 1, 1), pl.ds(0, PR)], 0.0))
-                        l1 = jnp.sum(jnp.where(lane_ == 1, cpatt[par, d, pl.ds(nhQ + 1, 1), pl.ds(0, PR)], 0.0))
+                        ns = jnp.sum(
+                            jnp.where(
+                                lane_ == 0,
+                                cpatt[par, d, pl.ds(nhQ + 2, 1), pl.ds(0, PR)],
+                                0.0,
+                            )
+                        )
+                        l0 = jnp.sum(
+                            jnp.where(
+                                lane_ == 0,
+                                cpatt[par, d, pl.ds(nhQ + 1, 1), pl.ds(0, PR)],
+                                0.0,
+                            )
+                        )
+                        l1 = jnp.sum(
+                            jnp.where(
+                                lane_ == 1,
+                                cpatt[par, d, pl.ds(nhQ + 1, 1), pl.ds(0, PR)],
+                                0.0,
+                            )
+                        )
                         out = digits(ns, 4 * d)
                         out = digits(l0, 32 + 4 * d)
                         out = digits(l1, 64 + 4 * d)
+
                     @pl.when(b == 0)
                     def _():
                         o_nkv[d_i, pl.ds(0, 1), pl.ds(0, PR)] = out.astype(BF16)
-                if "chkxall" in MK_ABL:  # debug: per-slot max |slot d - stamp(d, me)| -> row 0
+
+                if (
+                    "chkxall" in MK_ABL
+                ):  # debug: per-slot max |slot d - stamp(d, me)| -> row 0
                     lane_ = jax.lax.broadcasted_iota(jnp.int32, (1, PR), 1)
                     rowa = jax.lax.broadcasted_iota(jnp.int32, (AR, kvl), 0) // 8
                     out = jnp.zeros((1, PR), F32)
                     for d in range(tp):
                         exp_ = (d * 10 + me + rowa).astype(F32)
-                        out = jnp.where(lane_ == d, jnp.max(jnp.abs(cpatt[par, d] - exp_)), out)
+                        out = jnp.where(
+                            lane_ == d, jnp.max(jnp.abs(cpatt[par, d] - exp_)), out
+                        )
+
                     @pl.when(b == 0)
                     def _():
                         o_nkv[d_i, pl.ds(0, 1), pl.ds(0, PR)] = out.astype(BF16)
-                if "chkatt" in MK_ABL:  # debug: per-slot max |slot d - own slot| -> new-KV row 0
+
+                if (
+                    "chkatt" in MK_ABL
+                ):  # debug: per-slot max |slot d - own slot| -> new-KV row 0
                     lane_ = jax.lax.broadcasted_iota(jnp.int32, (1, PR), 1)
                     out = jnp.zeros((1, PR), F32)
                     mine = [jnp.where(me == c, 1.0, 0.0) for c in range(tp)]
-                    own_acc = sum(cpatt[par, c, pl.ds(0, nhQ), :] * mine[c] for c in range(tp))
-                    own_ml = sum(cpatt[par, c, pl.ds(nhQ, 2), :] * mine[c] for c in range(tp))
+                    own_acc = sum(
+                        cpatt[par, c, pl.ds(0, nhQ), :] * mine[c] for c in range(tp)
+                    )
+                    own_ml = sum(
+                        cpatt[par, c, pl.ds(nhQ, 2), :] * mine[c] for c in range(tp)
+                    )
                     for d in range(tp):
                         da = jnp.max(jnp.abs(cpatt[par, d, pl.ds(0, nhQ), :] - own_acc))
                         ml = jnp.abs(cpatt[par, d, pl.ds(nhQ, 2), :] - own_ml)
@@ -1758,18 +1869,30 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                         out = jnp.where(lane_ == d, da, out)
                         out = jnp.where(lane_ == 8 + d, jnp.max(ml[0:1]), out)
                         out = jnp.where(lane_ == 16 + d, jnp.max(ml[1:2]), out)
+
                     @pl.when(b == 0)
                     def _():
                         o_nkv[d_i, pl.ds(0, 1), pl.ds(0, PR)] = out.astype(BF16)
-                if "dumpq" in MK_ABL:  # debug: received query slots (row 0) -> new-KV rows
+
+                if (
+                    "dumpq" in MK_ABL
+                ):  # debug: received query slots (row 0) -> new-KV rows
+
                     @pl.when(b == 0)
                     def _():
                         for d in range(tp):
                             o_nkv[d_i, pl.ds(d // 2, 1), pl.ds((d % 2) * PR, PR)] = cpq[
                                 qpar[0], d, pl.ds(0, 1), pl.ds(0, PR)
                             ]
-                ms = [as_col(cpatt[par, d, pl.ds(nhQ, 1), pl.ds(0, PR)]) for d in range(tp)]
-                ls = [as_col(cpatt[par, d, pl.ds(nhQ + 1, 1), pl.ds(0, PR)]) for d in range(tp)]
+
+                ms = [
+                    as_col(cpatt[par, d, pl.ds(nhQ, 1), pl.ds(0, PR)])
+                    for d in range(tp)
+                ]
+                ls = [
+                    as_col(cpatt[par, d, pl.ds(nhQ + 1, 1), pl.ds(0, PR)])
+                    for d in range(tp)
+                ]
                 M = ms[0]
                 for d in range(1, tp):
                     M = jnp.maximum(M, ms[d])

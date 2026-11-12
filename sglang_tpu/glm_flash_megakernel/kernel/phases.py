@@ -267,7 +267,17 @@ def select_top_k_mask_3d(scores, k, *, score_iters=40, index_iters=24):
 
 
 def topk_bisect(
-    scr, *, k, p, kp, n_tiles, chunk_tiles, owner=None, rows=None, score_iters=40, base=0
+    scr,
+    *,
+    k,
+    p,
+    kp,
+    n_tiles,
+    chunk_tiles,
+    owner=None,
+    rows=None,
+    score_iters=40,
+    base=0,
 ):
     """Threshold search for the top-k of each query over the [Q, T, P] score ref,
     chunk_tiles tiles at a time; pass 1 writes -inf over ineligible and stale pools.
@@ -446,10 +456,17 @@ def select_top_k_mask_ref(
     """Top-k mask of each query, replacing the scores in `scr` in place."""
     del index_iters
     lo, hi, need = topk_bisect(
-        scr, k=k, p=p, kp=kp, n_tiles=n_tiles, chunk_tiles=chunk_tiles,
+        scr,
+        k=k,
+        p=p,
+        kp=kp,
+        n_tiles=n_tiles,
+        chunk_tiles=chunk_tiles,
         score_iters=score_iters,
     )
-    topk_write(scr, scr, lo=lo, hi=hi, need=need, n_tiles=n_tiles, chunk_tiles=chunk_tiles)
+    topk_write(
+        scr, scr, lo=lo, hi=hi, need=need, n_tiles=n_tiles, chunk_tiles=chunk_tiles
+    )
 
 
 def sinkhorn_step(c, hc_eps):
