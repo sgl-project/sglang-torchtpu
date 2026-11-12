@@ -84,8 +84,15 @@ tpu_dsv41_int32_graph_inputs
        fields afterwards; token ids, positions and pool rows fit in int32.
        An extend without scheduler-supplied engram_history gets the rows the
        hasher would gather, so the graph never guards on engram_history being None.
+       With attention DP the token embedding is looked up eagerly here and
+       passed in as input_embeds (input_ids still go in for Engram and MoE
+       routing), as vllm-torchtpu #1848 does: inside the TP1/DP8 compiled
+       graph the unsharded BF16 embedding gather returns wrong rows, while the
+       same lookup outside the graph is exact. Warmup takes this path too, so
+       precompiled and serving graphs share one signature.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
-  Remove when: the TPU batch builder produces int32 index tensors.
+  Remove when: the TPU batch builder produces int32 index tensors and the
+       in-graph embedding gather is fixed in torch_tpu.
 
 tpu_dsv41_torch_hash_ids
   Why: EngramHasher._torch_hash_ids (the non-CUDA hash path) widens ids,
@@ -459,7 +466,22 @@ def tpu_dsv41_int32_graph_inputs(
     pin_history = hasher is not None and forward_batch.forward_mode.is_extend()
     if pin_history:
         names = (*names, "engram_history")
+    from sglang.srt.runtime_context import get_parallel
+
+    embed_outside = (
+        forward_batch.input_embeds is None
+        and isinstance(input_ids, torch.Tensor)
+        and not input_ids.is_cuda
+        and not torch.compiler.is_compiling()
+        and get_parallel().attn_dp_size > 1
+    )
+    if embed_outside:
+        names = (*names, "input_embeds")
     saved = {name: getattr(forward_batch, name) for name in names}
+    if embed_outside:
+        embed_tokens = shim.policy.model_runner.model.get_input_embeddings()
+        with torch.no_grad():
+            forward_batch.input_embeds = embed_tokens(input_ids)
     for name in _INT32_BATCH_FIELDS:
         setattr(forward_batch, name, _int32(saved[name]))
     if pin_history:
