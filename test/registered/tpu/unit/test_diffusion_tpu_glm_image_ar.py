@@ -12,7 +12,8 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.multimodal_gen import glm_image_ar
 
-register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
+# Nightly: the stage-a unit suite is at its time budget.
+register_tpu_ci(est_time=30, suite="nightly-tpu-4-v7", nightly=True)
 
 IMAGE_START, IMAGE_END, IMAGE_TOKEN = 290, 291, 292
 
