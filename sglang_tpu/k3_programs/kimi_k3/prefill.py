@@ -539,19 +539,35 @@ class PrefillProgram:
             )
             return (prefix, blocks, *kda_state, *mla_state, middle, tap)
 
+        group_specs = (
+            state_specs
+            + (replicated,) * 3
+            + prefix_specs(2)
+            + (sharded,) * self._count(*weight_groups)
+        )
+        # then the streams between its two groups and entering its last
+        # group's third layer
+        group_out = state_specs + (sharded,) * 2
         ops["group"] = register_global_op(
             self._op_name(f"{name}_group8", window),
             mesh,
             run_group,
-            state_specs
-            + (replicated,) * 3
-            + prefix_specs(2)
-            + (sharded,) * self._count(*weight_groups),
-            # then the streams between its two groups and entering its last
-            # group's third layer
-            state_specs + (sharded,) * 2,
+            group_specs,
+            group_out,
             donate_argnums=tuple(range(7)),
             export_key=self._export_key(f"{name}_group", window),
+        )
+        # A pair whose input stream the MLA draft reads (run_packed's ``keep``):
+        # the stream stays alive (not donated) instead of being cloned -- a
+        # clone does not outlive the donation of the buffer it copies.
+        ops["group_keep"] = register_global_op(
+            self._op_name(f"{name}_group8_keep", window),
+            mesh,
+            run_group,
+            group_specs,
+            group_out,
+            donate_argnums=tuple(range(1, 7)),
+            export_key=self._export_key(f"{name}_group_keep", window),
         )
 
         def run_final(prefix, blocks, latents, length, segments, *args):
@@ -670,9 +686,10 @@ class PrefillProgram:
         middle = tap90 = None
         entering = {3: tap3}
         for p, pair in enumerate(self._pairs):
-            if 8 * p + 4 in keep:  # the group op donates its input
-                entering[8 * p + 4] = state[0].clone()
-            *state, middle, tap90 = ops["group"](
+            kept = 8 * p + 4 in keep  # the draft reads this pair's input stream
+            if kept:
+                entering[8 * p + 4] = state[0]
+            *state, middle, tap90 = ops["group_keep" if kept else "group"](
                 *state,
                 extent,
                 pair,
@@ -1342,7 +1359,12 @@ class KimiPrefiller:
         """Residual streams the MLA draft's aux layers need kept (pair inputs)."""
         if self.draft_latents is None:
             return ()
-        return tuple(self.draft_latents.config.aux_layers)
+        from sglang_tpu.k3_programs.kimi_k3.draft_mla_prefill import stream_source
+
+        # Layers read from the blocks (multiples of 12) need no stream kept.
+        return tuple(
+            layer for layer in self.draft_latents.config.aux_layers if stream_source(layer) == "entering"
+        )
 
     def _zeros(self) -> torch.Tensor:
         if self._zero_logits is None:
@@ -1768,6 +1790,7 @@ class KimiPrefiller:
         program, writer, ring = self.program, self._writer, self.ring
         assert writer is not None
         pools, mla = tuple(writer.raw_pools), writer.mla_pools()
+        keep = self._draft_keep()
         # Kimi-K3.1: each MLA op also takes its layers' index pools, and the
         # latents carry the index keys in lanes 576:704 (run_packed).
         index = writer.index_pools()
@@ -1817,21 +1840,20 @@ class KimiPrefiller:
                 ),
                 priority=window,
             )
-            add(
-                ops["group"],
-                (
-                    *state,
-                    extent,
-                    i32(1),
-                    segments,
-                    mla[1],
-                    mla[2],
-                    *index[1:3],
-                    *tail,
-                    *program._flat("common", "kda", "mla", "moe", expert_bank=1),
-                ),
-                priority=window,
+            group_operands = (
+                *state,
+                extent,
+                i32(1),
+                segments,
+                mla[1],
+                mla[2],
+                *index[1:3],
+                *tail,
+                *program._flat("common", "kda", "mla", "moe", expert_bank=1),
             )
+            add(ops["group"], group_operands, priority=window)
+            if any(8 * p + 4 in keep for p in range(len(program._pairs))):
+                add(ops["group_keep"], group_operands, priority=window)
             add(
                 ops["final"],
                 (
