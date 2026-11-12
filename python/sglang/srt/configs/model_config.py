@@ -482,6 +482,7 @@ class ModelConfig:
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
+        model_config_parser_kwargs: Optional[dict] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -504,7 +505,7 @@ class ModelConfig:
         self._maybe_pull_model_for_runai(self.model_path)
         self._maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
-        kwargs = {}
+        kwargs = dict(model_config_parser_kwargs or {})
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
         # get_config() is cached. ModelConfig mutates hf_config for draft-model

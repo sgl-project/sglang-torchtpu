@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 
 class ModelConfigParserBase(ABC):
+    def server_args_kwargs(self, server_args) -> dict:
+        """Options needed by both early config probes and ModelConfig construction."""
+        return {}
+
     @abstractmethod
     def parse(
         self,
@@ -60,3 +64,9 @@ def get_model_config_parser(name: str) -> ModelConfigParserBase:
             f"Registered: {sorted(_MODEL_CONFIG_PARSER_REGISTRY)}"
         )
     return _MODEL_CONFIG_PARSER_REGISTRY[name]()
+
+
+def model_config_parser_kwargs(name: str, server_args) -> dict:
+    if name == "auto":
+        return {}
+    return get_model_config_parser(name).server_args_kwargs(server_args)
