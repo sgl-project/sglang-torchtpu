@@ -17,6 +17,8 @@ the latents).
 
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
@@ -113,7 +115,9 @@ CANDIDATES = (1 << DIGIT_BITS) - 1  # thresholds counted per round
 POSITION_BITS = 24
 KEY_SHIFTS = tuple(range(32 - DIGIT_BITS, -1, -DIGIT_BITS))  # 8 rounds
 POSITION_SHIFTS = tuple(range(POSITION_BITS - DIGIT_BITS, -1, -DIGIT_BITS))  # 6 rounds (ties only)
-CHUNK_ROWS = 64  # key rows (of 128 tokens) a counting step reads
+CHUNK_ROWS = 64  # key rows (of 128 tokens) a counting step reads (from WIDE_CHUNK_BATCH rows)
+WIDE_CHUNK_BATCH = 64
+WIDE_CHUNK_ROWS = 128  # below that many rows: a long-context row's keys in one step a round
 # DMA ring depths: a page or chunk step computes little, so several copies stay
 # in flight (one HBM -> VMEM copy is ~0.9 us; a ring of two waits on each).
 PAGE_SLOTS = 4  # index pages (scoring)
@@ -123,6 +127,12 @@ WIDE_BATCH = 64  # from this many rows: rings of 3 and 4 (the decode's VMEM plan
 # this many local attention steps per row nearly every step holds one, so the
 # step activity marks them all instead of scanning the keys.
 ACTIVITY_MIN_STEPS = 16
+
+
+def chunk_rows(batch: int) -> int:
+    """Key rows a counting step reads (a step's overhead outweighs its rows; the
+    wider chunk's ring needs VMEM the widest batches lack)."""
+    return WIDE_CHUNK_ROWS if batch < WIDE_CHUNK_BATCH else CHUNK_ROWS
 
 
 def ring_slots(batch: int) -> tuple[int, int]:
@@ -231,7 +241,7 @@ class IndexSelect:
         self.subpages = page_tokens // INDEX_SUBPAGE_TOKENS
         self.key_rows = refs["keys"].shape[1]  # >= pages * subpages, whole vregs
         self.page_slots, self.key_slots = refs["page_buf"].shape[0], refs["key_buf"].shape[0]
-        self.chunk = min(CHUNK_ROWS, self.key_rows)
+        self.chunk = refs["key_buf"].shape[1]  # select_scratch: min(chunk_rows(batch), key_rows)
         if batch > LANES or self.key_rows % 8 or batch % sequence_rows:
             raise ValueError("index selection: batch <= 128, key rows in whole vregs, whole sequences")
 
@@ -473,8 +483,10 @@ class IndexSelect:
         counts the digits above ``j``; a tie round's (``prefix``) the digits up
         to ``j`` (``first``: the selection's first pass). One digit a key, not
         a compare per candidate."""
+        from jax.experimental import pallas as pl
+
         refs, chunk = self.refs, self.chunk
-        assert chunk // 8 <= 15, "a step adds at most chunk // 8 to a 4-bit field"
+        assert chunk // 8 <= 16, "8 unrolled vregs, then at most 8 a loop (a 4-bit field each)"
         total = refs["chunk_starts"][self.batch]
         load = self._loads(first)
         refs["local"][...] = jnp.zeros((COUNT_ROWS, LANES), jnp.int32)
@@ -494,10 +506,12 @@ class IndexSelect:
             bins = [jnp.where(local == 0, 0, a) for a in bins]
             digits = digits_of(row)
             # The step's histogram in two accumulators of eight 4-bit fields
-            # (bins 0-7, 8-15), then added to the row's bins.
-            low = high = jnp.zeros((8, LANES), jnp.int32)
-            for v in range(chunk // 8):
-                key = refs["key_buf"][step % self.key_slots, pl_ds(v * 8, 8), :]
+            # (bins 0-7, 8-15; a field holds up to 15): the first 8 vregs
+            # unrolled (they overlap the step's fixed work), the rest -- only
+            # those holding the row's keys -- one a loop iteration.
+            def vreg(v, carry):
+                low, high = carry
+                key = refs["key_buf"][step % self.key_slots, pl_ds(pl.multiple_of(v * 8, 8), 8), :]
                 key_row = start + v * 8 + sub8
                 valid = (key_row >= local * chunk) & (key_row < rows_valid)
                 page = key_row // self.subpages
@@ -506,10 +520,21 @@ class IndexSelect:
                 digit, counted = digits(key, position, valid)
                 one = jnp.where(counted, jnp.left_shift(jnp.ones_like(digit), (digit & 7) << 2), 0)
                 upper = digit >= 8
-                low = low + jnp.where(upper, 0, one)
-                high = high + jnp.where(upper, one, 0)
-            bins = [bins[i] + (jax.lax.shift_right_logical(low if i < 8 else high, 4 * (i % 8)) & 15)
-                    for i in range(BINS)]
+                return low + jnp.where(upper, 0, one), high + jnp.where(upper, one, 0)
+
+            def unpack(bins, low, high):
+                return [bins[i] + (jax.lax.shift_right_logical(low if i < 8 else high, 4 * (i % 8)) & 15)
+                        for i in range(BINS)]
+
+            zero8 = jnp.zeros((8, LANES), jnp.int32)
+            carry = (zero8, zero8)
+            for v in range(min(8, chunk // 8)):
+                carry = vreg(v, carry)
+            bins = unpack(bins, *carry)
+            if chunk // 8 > 8:
+                end_v = (jnp.minimum(rows_valid, (local + 1) * chunk) - start + 7) // 8
+                carry = jax.lax.fori_loop(8, jnp.clip(end_v, 8, chunk // 8), vreg, (zero8, zero8))
+                bins = unpack(bins, *carry)
             last = local == (rows_valid + chunk - 1) // chunk - 1
 
             @pl_when(last)
@@ -789,7 +814,7 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         "page_sems": pltpu.SemaphoreType.DMA((page_slots,)),
         "stage": vmem((2, sequence_rows, subpages, LANES), jnp.int32),
         "stage_sems": pltpu.SemaphoreType.DMA((2,)),
-        "key_buf": vmem((key_slots, min(CHUNK_ROWS, key_rows), LANES), jnp.int32),
+        "key_buf": vmem((key_slots, min(chunk_rows(batch), key_rows), LANES), jnp.int32),
         "key_sems": pltpu.SemaphoreType.DMA((key_slots,)),
         "exchange": vmem((2, group, COUNT_ROWS, LANES), jnp.int32),
         "exchange_sems": pltpu.SemaphoreType.DMA((2, 2)),
@@ -800,8 +825,8 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         "counts": pltpu.SMEM((batch,), jnp.int32),
         "page_starts": pltpu.SMEM((batch + 1,), jnp.int32),
         "chunk_starts": pltpu.SMEM((batch + 1,), jnp.int32),
-        "step_row": pltpu.SMEM((batch * -(-key_rows // min(CHUNK_ROWS, key_rows)),), jnp.int32),
-        "step_local": pltpu.SMEM((batch * -(-key_rows // min(CHUNK_ROWS, key_rows)),), jnp.int32),
+        "step_row": pltpu.SMEM((batch * -(-key_rows // min(chunk_rows(batch), key_rows)),), jnp.int32),
+        "step_local": pltpu.SMEM((batch * -(-key_rows // min(chunk_rows(batch), key_rows)),), jnp.int32),
         "page_seq": pltpu.SMEM((batch * -(-key_rows * LANES // (subpages * INDEX_SUBPAGE_TOKENS)),), jnp.int32),
         "page_local": pltpu.SMEM((batch * -(-key_rows * LANES // (subpages * INDEX_SUBPAGE_TOKENS)),), jnp.int32),
         "row_prefix": pltpu.SMEM((batch,), jnp.int32),
