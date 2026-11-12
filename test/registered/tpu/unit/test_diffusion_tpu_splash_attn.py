@@ -74,10 +74,11 @@ def _inputs(
     kv_heads=None,
     q_gain=1.0,
     negative_scores=False,
+    head_dim=128,
 ):
     gen = torch.Generator().manual_seed(q_seq * 7919 + kv_seq)
-    shape_q = (batch, heads, q_seq, 128)
-    shape_kv = (batch, kv_heads or heads, kv_seq, 128)
+    shape_q = (batch, heads, q_seq, head_dim)
+    shape_kv = (batch, kv_heads or heads, kv_seq, head_dim)
     q = torch.randn(shape_q, generator=gen) * q_gain
     k = torch.randn(shape_kv, generator=gen)
     v = torch.randn(shape_kv, generator=gen)
@@ -194,6 +195,10 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
     def test_custom_single_kv_block(self):
         # One KV block: the first, last and only grid step coincide.
         self._check(1, 2, 2048, 2048, expect="flash")
+
+    def test_custom_head_dim_256(self):
+        # Ideogram 4's heads: 4608 = 2 * 2048 + 512.
+        self._check(1, 3, 4608, 4608, expect="flash", head_dim=256, scale=256**-0.5)
 
     def test_custom_softmax_scale(self):
         # A scale other than head_dim ** -0.5, which equals the default.
@@ -393,6 +398,22 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
                 self.assertFalse(torch.isnan(out).any().item())
                 self.assertFalse(torch.isnan(carry[1].to("cpu")).any().item())
                 self.assertLess((out - want).abs().max().item(), 2e-2)
+
+    def test_ring_step_at_head_dim_256(self):
+        tsa = self._kernels()
+        scale = 256**-0.5
+        q_seq, kv_seq, real = 4608, 4608, 4130
+        with _ring_spy(tsa) as ring:
+            q, k, v = _inputs(1, 3, q_seq, kv_seq, head_dim=256)
+            k[:, :, real:], v[:, :, real:] = float("nan"), float("nan")
+            want = _reference(q, k[:, :, :real], v[:, :, :real], scale, False)
+            out, _ = tsa.tpu_ring_attention_step(
+                q.to("tpu"), k.to("tpu"), v.to("tpu"), _kv_info(0, real), None, scale
+            )
+        self.assertEqual(ring.call_count, 1)
+        out = out.to("cpu").float()
+        self.assertFalse(torch.isnan(out).any().item())
+        self.assertLess((out - want).abs().max().item(), 2e-2)
 
     def test_ring_step_resumes_an_earlier_partial(self):
         # Two key halves, the second step resuming the first, equal attention
@@ -797,6 +818,15 @@ class TestTpuSplashDispatch(CustomTestCase):
             )
             self.assertEqual(
                 reason((1, 4, 4608, 64), (1, 4, 4608, 64)), "head_dim=64/64"
+            )
+            # head_dim 256: the flash kernel only.
+            self.assertIsNone(reason((1, 4, 4608, 256), (1, 4, 4608, 256)))
+            self.assertEqual(
+                reason((1, 4, 4608, 256), (1, 4, 4608, 256), is_causal=True),
+                "head_dim=256/256",
+            )
+            self.assertEqual(
+                reason((1, 4, 200, 256), (1, 4, 700, 256)), "head_dim=256/256"
             )
             self.assertEqual(reason((1, 3, 4608, 128), (1, 2, 4608, 128)), "heads=3/2")
             self.assertEqual(

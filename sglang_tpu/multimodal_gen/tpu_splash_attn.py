@@ -718,7 +718,11 @@ def _sdpa_fallback_reason(
         return "short"
     if is_causal and q_seq != kv_seq:
         return "ragged causal"
-    if query.shape[-1] != 128 or key.shape[-1] != 128 or value.shape[-1] != 128:
+    head_dims = {query.shape[-1], key.shape[-1], value.shape[-1]}
+    # The flash kernel (non-causal, 512+ keys) is validated at head_dim 128
+    # and 256 (Ideogram 4); make_splash_mha at 128.
+    supported = {128, 256} if _use_custom_kernel(q_seq, kv_seq, is_causal) else {128}
+    if len(head_dims) != 1 or not head_dims <= supported:
         return f"head_dim={query.shape[-1]}/{value.shape[-1]}"
     if query.shape[1] % key.shape[1] != 0:
         return f"heads={query.shape[1]}/{key.shape[1]}"
