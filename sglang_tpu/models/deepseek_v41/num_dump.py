@@ -16,6 +16,8 @@ import torch
 ENABLED = os.environ.get("SGLANG_TPU_DSV41_DUMP") == "1"
 LAYERS = (0, 1, 2)
 POINTS = (
+    "embed_in",
+    "embed_calls",
     "embed_out",
     "hash_ids",
     "attn_in",
@@ -85,6 +87,12 @@ def moe_forward(original, moe, hidden_states, *args, **kwargs):
 
 def embed_forward(original, embed, input_):
     out = original(embed, input_)
+    # The ids this call really embedded (DP/SP layouts may reorder rows), and a
+    # per-forward call counter: a second call would overwrite embed_out.
+    _put("embed_in", 0, input_.reshape(-1, 1))
+    calls = _BUF.get(("embed_calls", 0))
+    if calls is not None:
+        calls[0, 0].add_(1.0)
     _put("embed_out", 0, out)
     return out
 
