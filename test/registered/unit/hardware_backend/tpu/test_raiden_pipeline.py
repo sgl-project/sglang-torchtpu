@@ -123,7 +123,7 @@ def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer, draft_full=()):
 def sent(expires=None, registered=True):
     return dict(
         full=[20, 21],
-        swa=[30],
+        side=[30],
         aux=b"",
         expires=time.monotonic() + 120 if expires is None else expires,
         registered=registered,
@@ -180,6 +180,7 @@ def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=
     pipe.client_type = Mock(return_value=Mock())
     pipe.controller = "decode:30001"
     pipe.rank = pp_rank * attn_tp_size + attn_tp_rank
+    pipe.workers = pp_size * attn_tp_size
     pipe.unit_fields = dict(
         job_name="sglang",
         job_replica_id="decode:30001",
@@ -222,7 +223,7 @@ def receive(rank=0, pp_size=8, full=(20, 21), swa=(30,)):
     )
     return Receive(
         full=list(full),
-        swa=list(swa),
+        side=list(swa),
         aux_index=None,
         ranks={rank},
         sources={rank: metadata},
@@ -1296,7 +1297,8 @@ class TestDraftPoolGroups(unittest.TestCase):
         pipe.pools, swa_pools = pool_side_engine.split_manifest(pool_manifest(layers))
         pipe.tensors = list(layers.full)
         swa_client = Mock()
-        pipe.swa = pool_side_engine.SwaLink(
+        pipe.side = pool_side_engine.SideLink(
+            family=pool_side_engine.SWA,
             pools=swa_pools,
             tensors=list(layers.swa),
             controller="decode-swa:30001",
@@ -1306,11 +1308,11 @@ class TestDraftPoolGroups(unittest.TestCase):
             slots=4,
             hold_undeclared=False,
         )
-        pipe.swa.client = swa_client
+        pipe.side.client = swa_client
         pipe.replies[7] = {0: {"attn_tp_size": 8}}
         self.assertTrue(
             pipe._register_blocks(
-                7, req_id="7", uuid=7, full=[20], swa=[30], with_swa=True
+                7, req_id="7", uuid=7, full=[20], side=[30], with_side=True
             )
         )
         full_spans = pipe.client.register_request_blocks.call_args.kwargs["pool_spans"]
