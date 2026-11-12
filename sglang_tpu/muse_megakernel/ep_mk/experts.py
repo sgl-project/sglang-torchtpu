@@ -4,7 +4,6 @@ the block-diagonal fp8 dot (exact; VPU work grows with the slots), a busier one 
 each weight block to bf16 once for all its rows. NVFP4 weights and x come in kperm order so a
 dequantized vreg takes its block scales without a broadcast."""
 
-import os
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -14,6 +13,8 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.envs import dev_int
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel.mk.consts import FP4_GROUP, FP4_PACK
 from sglang_tpu.muse_megakernel.mk.dots import _fp4_blockdiag_dot, _fp8_dot
 
@@ -120,7 +121,7 @@ def qblock() -> int:
     """SGLANG_TPU_EP_QBLOCK in QB_SIZES: fp4 experts requantized to one scale per that many K
     rows of the kernel's (kperm) order, scale slabs [K / block, N]; each dot takes raw codes
     and one scale row."""
-    b = int(os.environ.get("SGLANG_TPU_EP_QBLOCK", "0"))
+    b = tpu_envs.SGLANG_TPU_EP_QBLOCK.get()
     if b not in (0, *QB_SIZES):
         raise ValueError(f"SGLANG_TPU_EP_QBLOCK={b}: 0 or one of {QB_SIZES}")
     return b
@@ -256,7 +257,7 @@ def _fp8_arm(R: int, x_rows: Callable, acc, w: ChunkRefs, He: int, CI: int) -> N
 
 def bd_arms() -> tuple[int, ...]:
     """The block-diagonal arms' rows: BD_ARMS, or up to SGLANG_TPU_EP_BD_MAX (A/B)."""
-    top = int(os.environ.get("SGLANG_TPU_EP_BD_MAX", str(BD_ARMS[-1])))
+    top = dev_int(tpu_envs.SGLANG_TPU_EP_BD_MAX, BD_ARMS[-1])
     return tuple(A for A in (2, 4, 8, 16) if A <= top)
 
 
@@ -300,9 +301,7 @@ def chunk_compute(
         arms = [lambda R=R: _fp8_arm(R, x_rows, acc, w, He, CI) for R in sizes]
         bounds = sizes[:-1]
         names = [f"f8_{R}" for R in sizes]
-    if (
-        int(os.environ.get("SGLANG_TPU_EP_TRACE", "0")) >= 2
-    ):  # each arm a region (xprof)
+    if tpu_envs.SGLANG_TPU_EP_TRACE.get() >= 2:  # each arm a region (xprof)
         arms = [lambda f=f, m=m: _named(f"ep_arm_{m}", f) for f, m in zip(arms, names)]
     jax.lax.switch(sum((n > b).astype(jnp.int32) for b in bounds), arms)
 

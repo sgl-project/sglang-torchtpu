@@ -89,8 +89,8 @@ def _kernel(
     buffers, semaphores = scratch
     queries, keys, scores, counts, pages = buffers[:5]
     read_sem, write_sem, q_sem, page_sem = semaphores[:4]
-    # JAX 0.10.2 has no pltpu.annotate(no_store=...). Keep the same refs:
-    # weights are read-only and keys are explicitly managed by the DMA ring.
+    weights = pltpu.annotate(weights, no_store=True)
+    keys = pltpu.annotate(keys, no_store=True)
     tokens, heads, dim = q.shape
     begin = query_start[()]
     end = begin + out.shape[0]

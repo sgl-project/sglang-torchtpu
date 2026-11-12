@@ -2,7 +2,6 @@
 """The EP plan of one row-tiled step: each rank's own rows (R / tp), 32 whole experts per
 rank, the two ragged all-to-alls' buffers and the scratch the FFN section adds."""
 
-import os
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -11,6 +10,8 @@ import msgspec
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.envs import dev_int
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel.ep_mk.experts import BD_KC, item_sizes, scale_group
 from sglang_tpu.muse_megakernel.mk.config import MKConfig
 from sglang_tpu.muse_megakernel.mk.consts import LANE
@@ -85,14 +86,12 @@ def ep_mk_config(c: MKConfig) -> MKConfig:
 def ep_arm(rows: int) -> str:
     """The EP execution arm of a step of rows rows: SGLANG_TPU_MUSE_MK_EP_ARM (auto | a2a |
     gather); auto takes a2a from SGLANG_TPU_MUSE_MK_EP_MIN_ROWS rows up. Read at trace time."""
-    arm = os.environ.get("SGLANG_TPU_MUSE_MK_EP_ARM", "auto")
+    arm = tpu_envs.SGLANG_TPU_MUSE_MK_EP_ARM.get()
     if arm not in ("auto", *ARMS):
         raise ValueError(f"SGLANG_TPU_MUSE_MK_EP_ARM={arm!r}: auto, a2a or gather")
     if arm != "auto":
         return arm
-    lo = int(
-        os.environ.get("SGLANG_TPU_MUSE_MK_EP_MIN_ROWS", str(DEFAULT_A2A_MIN_ROWS))
-    )
+    lo = dev_int(tpu_envs.SGLANG_TPU_MUSE_MK_EP_MIN_ROWS, DEFAULT_A2A_MIN_ROWS)
     if lo < MIN_ROWS:
         raise ValueError(
             f"SGLANG_TPU_MUSE_MK_EP_MIN_ROWS={lo}: the a2a arm needs >= {MIN_ROWS} rows"

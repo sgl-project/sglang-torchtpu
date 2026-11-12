@@ -12,7 +12,6 @@ count exchange, no ragged all-to-all). Per layer:
 The dense matmuls read only this rank's columns of the replicated wpool / wunpool.
 """
 
-import os
 from collections.abc import Callable
 
 import jax
@@ -20,6 +19,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.envs import dev_int
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel.ep_mk import route
 from sglang_tpu.muse_megakernel.ep_mk.config import (
     EPPlan,
@@ -176,9 +177,7 @@ PAIR_AG_MIN_ROWS = 48
 def _pair_ag(c: MKConfig) -> bool:
     """All-gathers relay through the partner core (4 chips x 2 cores: half the ICI bytes);
     SGLANG_TPU_EP_GATHER_PAIR_MIN_ROWS overrides the row bound (A/B, read at trace time)."""
-    lo = int(
-        os.environ.get("SGLANG_TPU_EP_GATHER_PAIR_MIN_ROWS", str(PAIR_AG_MIN_ROWS))
-    )
+    lo = dev_int(tpu_envs.SGLANG_TPU_EP_GATHER_PAIR_MIN_ROWS, PAIR_AG_MIN_ROWS)
     return c.tp == 8 and c.rows >= lo
 
 

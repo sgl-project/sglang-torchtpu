@@ -70,15 +70,18 @@ class RankLockstep:
 
 
 def alloc_host_pages_agreed(
-    *, lockstep: RankLockstep, pool: Any, num_tokens: int
-) -> Optional[Any]:
-    """``num_tokens`` host pages of ``pool`` on every rank, or None on every
-    rank: a rank that got pages frees them when another rank did not."""
-    indices = pool.alloc(num_tokens)
-    if lockstep.all(indices is not None):
+    *, lockstep: RankLockstep, pools: Sequence[Tuple[Any, int]]
+) -> Optional[List[Any]]:
+    """For each (pool, num_tokens): its host pages, None for zero tokens; on
+    every rank, or None on every rank once any rank missed an allocation, in
+    which case a rank that got pages frees them."""
+    indices = [pool.alloc(tokens) if tokens else None for pool, tokens in pools]
+    got = all(i is not None for (_, tokens), i in zip(pools, indices) if tokens)
+    if lockstep.all(got):
         return indices
-    if indices is not None:
-        pool.free(indices)
+    for (pool, _), i in zip(pools, indices):
+        if i is not None:
+            pool.free(i)
     return None
 
 
@@ -92,6 +95,10 @@ class DramOffloadWorkerContext(msgspec.Struct, frozen=True):
     # The raiden channel to the peer role (raiden/dram_offload_channel.py).
     channel: Any
     lockstep: RankLockstep
+    # Hybrid sliding-window models: the host pool of SWA windows and the
+    # window in tokens, rounded up to whole pages. None and 0 on other models.
+    swa_host_pool: Any = None
+    window_tokens: int = 0
 
 
 def push_manifest(tokens, extra_key, cache_salt, *geometry):
