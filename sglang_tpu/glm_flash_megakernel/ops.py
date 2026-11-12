@@ -94,6 +94,9 @@ def require_expert_tp(ep_size: int) -> None:
         )
 
 
+_MAX_ROWS = 16
+
+
 def _buckets(max_req: int) -> list[int]:
     """Request-count buckets 1, 2, 4, ... up to max_req."""
     out, b = [], 1
@@ -153,6 +156,16 @@ class GlmFlashMegakernel:
         max_len = -(-max_len // D.KernelConfig.attn_tile) * D.KernelConfig.attn_tile
         self.max_len = max_len
         self.pages_per_seq = table_pages
+        # 16 rows is the largest bucket that fits tpu7x's 64 MiB VMEM with 256-column
+        # dense tiles (128-column tiles are wrong below 32 rows, 2026-11-12); a recipe's
+        # larger cap does not build an unusable bucket, steps past it run on the model.
+        if max_rows > _MAX_ROWS:
+            logger.info(
+                "GLM-Flash megakernel: max rows %d capped at %d (VMEM)",
+                max_rows,
+                _MAX_ROWS,
+            )
+            max_rows = _MAX_ROWS
         self.max_req = max(1, max_rows // n_query)
         # Requests per kernel call; a larger batch is split into calls of this size.
         call_rows = max_rows if call_rows is None else min(call_rows, max_rows)
