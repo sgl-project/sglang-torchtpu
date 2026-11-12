@@ -16,6 +16,7 @@ import torch
 ENABLED = os.environ.get("SGLANG_TPU_DSV41_DUMP") == "1"
 LAYERS = (0, 1, 2)
 POINTS = (
+    "embed_out",
     "hash_ids",
     "attn_in",
     "attn_out",
@@ -28,6 +29,7 @@ _ROWS, _COLS = 128, 20480
 _BUF: dict = {}
 _COUNT = [0]
 _HASHER: list = []
+_SHAPES: dict = {}
 _OUT = "/tmp/dsv41_dump"
 
 
@@ -44,6 +46,7 @@ def _put(point, layer, x):
     if key not in _BUF or not isinstance(x, torch.Tensor) or x.dim() == 0:
         return
     t = x.shape[0]
+    _SHAPES[key] = tuple(x.shape)
     flat = x.reshape(t, -1)
     rows, cols = min(t, _ROWS), min(flat.shape[1], _COLS)
     _BUF[key][:rows, :cols].copy_(flat[:rows, :cols].float())
@@ -80,8 +83,18 @@ def moe_forward(original, moe, hidden_states, *args, **kwargs):
     return out
 
 
+def embed_forward(original, embed, input_):
+    out = original(embed, input_)
+    _put("embed_out", 0, out)
+    return out
+
+
 def before_forward(device) -> None:
-    _ensure(device)
+    # Zero every slot so a point not reached this forward reads 0, not the
+    # previous forward's rows.
+    for buf in _ensure(device).values():
+        buf.zero_()
+    _SHAPES.clear()
 
 
 def after_forward(forward_batch) -> None:
@@ -103,6 +116,7 @@ def after_forward(forward_batch) -> None:
         req = forward_batch.req_pool_indices.to(torch.int64)
         rec["history_after"] = _HASHER[0].history[req].cpu()
         rec["req_pool_indices"] = forward_batch.req_pool_indices.cpu()
+    rec["shapes"] = {f"{p}{layer}": s for (p, layer), s in _SHAPES.items()}
     t = min(int(forward_batch.input_ids.shape[0]), _ROWS)
     for layer in LAYERS:
         for p in POINTS:
@@ -118,6 +132,11 @@ def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
     return [
+        (
+            "sglang.srt.layers.vocab_parallel_embedding.VocabParallelEmbedding.forward",
+            embed_forward,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.models.deepseek_v4.MQALayer.forward",
             attn_forward,
