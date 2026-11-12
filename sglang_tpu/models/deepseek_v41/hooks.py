@@ -82,6 +82,8 @@ tpu_dsv41_int32_graph_inputs
   How: AROUND CompiledForwardShim._forward casts them to int32 before the
        compiled call for V4.1 on non-CUDA devices and restores the batch
        fields afterwards; token ids, positions and pool rows fit in int32.
+       An extend without scheduler-supplied engram_history gets the rows the
+       hasher would gather, so the graph never guards on engram_history being None.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: the TPU batch builder produces int32 index tensors.
 
@@ -110,8 +112,8 @@ tpu_dsv41_hasher_forward
        with repeat_interleave over int64 lengths, which lowers to a while loop
        on 64-bit counters that TPU lowering rejects.
   How: AROUND EngramHasher.forward on non-CUDA extend computes the rows in
-       int32 as a compare-sum against request ends, then hashes and commits
-       history exactly as the original.
+       int32 as a compare-sum against request ends and hashes every padded row
+       (no guard on the host lengths), then commits history for real rows only.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TPU lowers 64-bit integer arithmetic.
 
@@ -345,8 +347,9 @@ def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
     bs = req_slots.shape[0]
     lens = forward_batch.extend_seq_lens.to(i32)
     starts = forward_batch.extend_start_loc.to(i32)
-    lens_cpu = forward_batch.extend_seq_lens_cpu
-    num_real = sum(lens_cpu) if lens_cpu is not None else int(lens.sum())
+    # Hash every padded row: rows are independent and only real rows commit,
+    # so the graph never specializes on the host lengths (extend_seq_lens_cpu).
+    num_real = num_tokens
     ends = starts + lens
     t = torch.arange(num_real, device=input_ids.device, dtype=i32)
     row = (t.unsqueeze(-1) >= ends.unsqueeze(0)).sum(-1).clamp(max=bs - 1).to(i32)
@@ -393,9 +396,24 @@ def tpu_dsv41_int32_graph_inputs(
     config = shim.policy.model_runner.model_config.hf_config
     if config.model_type != "deepseek_v41":
         return original(shim, fn, input_ids, positions, forward_batch, *args, **kwargs)
-    saved = {name: getattr(forward_batch, name) for name in _INT32_BATCH_FIELDS}
-    for name, value in saved.items():
-        setattr(forward_batch, name, _int32(value))
+    names = _INT32_BATCH_FIELDS
+    hasher = shim.policy.model_runner.model.model.engram_hasher
+    pin_history = (
+        hasher is not None
+        and forward_batch.forward_mode.is_extend()
+        and forward_batch.engram_history is None
+    )
+    if pin_history:
+        names = (*names, "engram_history")
+    saved = {name: getattr(forward_batch, name) for name in names}
+    for name in _INT32_BATCH_FIELDS:
+        setattr(forward_batch, name, _int32(saved[name]))
+    if pin_history:
+        # The hasher reads history[req_pool_indices] when the scheduler gave no
+        # rows; gathering it here keeps one graph (no None-vs-tensor guard).
+        forward_batch.engram_history = hasher.history[
+            forward_batch.req_pool_indices.to(torch.int64)
+        ]
     try:
         return original(
             shim,
