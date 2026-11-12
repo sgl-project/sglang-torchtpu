@@ -389,6 +389,23 @@ def _int32(t):
     return t
 
 
+def _padded_history(hasher, history, req_pool_indices):
+    """[bucket bs, n - 1] extend history, so the graph sees one shape and type.
+
+    The scheduler's rows cover the real requests only (or are absent, when the
+    hasher reads history[req_pool_indices]); bucket-padding requests extend
+    no tokens, so their rows are never committed and their hashes are dropped.
+    """
+    rows = req_pool_indices.shape[0]
+    if history is None:
+        return hasher.history[req_pool_indices.to(torch.int64)]
+    if history.shape[0] < rows:
+        history = torch.cat(
+            [history, history.new_zeros(rows - history.shape[0], history.shape[1])]
+        )
+    return history
+
+
 def tpu_dsv41_int32_graph_inputs(
     original, shim, fn, input_ids, positions, forward_batch, *args, **kwargs
 ):
@@ -398,22 +415,16 @@ def tpu_dsv41_int32_graph_inputs(
         return original(shim, fn, input_ids, positions, forward_batch, *args, **kwargs)
     names = _INT32_BATCH_FIELDS
     hasher = shim.policy.model_runner.model.model.engram_hasher
-    pin_history = (
-        hasher is not None
-        and forward_batch.forward_mode.is_extend()
-        and forward_batch.engram_history is None
-    )
+    pin_history = hasher is not None and forward_batch.forward_mode.is_extend()
     if pin_history:
         names = (*names, "engram_history")
     saved = {name: getattr(forward_batch, name) for name in names}
     for name in _INT32_BATCH_FIELDS:
         setattr(forward_batch, name, _int32(saved[name]))
     if pin_history:
-        # The hasher reads history[req_pool_indices] when the scheduler gave no
-        # rows; gathering it here keeps one graph (no None-vs-tensor guard).
-        forward_batch.engram_history = hasher.history[
-            forward_batch.req_pool_indices.to(torch.int64)
-        ]
+        forward_batch.engram_history = _padded_history(
+            hasher, forward_batch.engram_history, forward_batch.req_pool_indices
+        )
     try:
         return original(
             shim,
