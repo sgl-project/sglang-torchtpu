@@ -20,13 +20,13 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
-from sglang_tpu.disaggregation.raiden import pp_swa
+from sglang_tpu.disaggregation.raiden import pool_side_engine
 from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
     ranks_per_node,
 )
 from sglang_tpu.disaggregation.raiden.pipeline_final_chunks import FinalChunks
-from sglang_tpu.disaggregation.raiden.pp_common import (
+from sglang_tpu.disaggregation.raiden.pool_spans import (
     _BLOCK_MAJOR_KV_RANK,
     _HEAD_MAJOR_KV_RANK,
     _kv_rank,
@@ -325,7 +325,7 @@ class Receive(msgspec.Struct):
     # Staging reservations held: the room for the closing transfer,
     # (room, "p", index) per early part and (room, "g", group) per group.
     admitted_keys: set = set()
-    # Window twins (pp_swa) of the closing transfer, key (), and of each
+    # Window twins (pool_side_engine) of the closing transfer, key (), and of each
     # stage group, key ("g", group): _new_transfer_state() and their
     # coordinate arguments. A twin is staged with its full-attention transfer.
     twins: dict[tuple, dict] = {}
@@ -339,13 +339,13 @@ class StagingPlan(msgspec.Struct, frozen=True):
     native_slot_bytes: int = 0
 
 
-class PipelineTransfer:
+class PoolTransfer:
     """One named-pool engine per worker, sharing its pipeline's reshard
     controller; a hybrid pool's sliding-window layers get a second engine
-    (pp_swa)."""
+    (pool_side_engine)."""
 
     # The window link, when sliding-window layers have their own engine.
-    swa: pp_swa.SwaLink | None = None
+    swa: pool_side_engine.SwaLink | None = None
     draft_kv_heads: int | None = None
     draft_swa_kv_heads: int | None = None
 
@@ -361,10 +361,10 @@ class PipelineTransfer:
         self.draft_kv_heads = getattr(groups, "draft_kv_head_num", None)
         self.draft_swa_kv_heads = getattr(groups, "draft_swa_kv_head_num", None)
         # A hybrid pool's sliding-window layers get an engine of their own.
-        self.pools, swa_pools = pp_swa.split_manifest(pool_manifest(groups))
+        self.pools, swa_pools = pool_side_engine.split_manifest(pool_manifest(groups))
         self.tensors = list(groups.full)
         if swa_pools:
-            pp_swa.require_bounded_staging()
+            pool_side_engine.require_bounded_staging()
         # One worker per pipeline stage or attention-TP rank. Rank 0 hosts the
         # shared controller and, on a tensor-parallel decode, plans every
         # transfer for all ranks.
@@ -409,7 +409,7 @@ class PipelineTransfer:
         swa_slots = swa_blocks = reserved = 0
         if swa_pools:
             # The window engine stages the window pages; this one, full pages.
-            swa_slots, swa_blocks, reserved = pp_swa.plan_slots(
+            swa_slots, swa_blocks, reserved = pool_side_engine.plan_slots(
                 manager, list(groups.swa), self.tensors, self.max_blocks
             )
         staging = self._plan_staging(reserved_bytes=reserved)
@@ -433,7 +433,7 @@ class PipelineTransfer:
             staging_options=staging.options,
         )
         if swa_pools:
-            self.swa = pp_swa.build(
+            self.swa = pool_side_engine.build(
                 self,
                 pools=swa_pools,
                 tensors=list(groups.swa),
@@ -538,7 +538,7 @@ class PipelineTransfer:
             self.store = store("pipeline")
             addresses = store_addresses(self.store)
             if swa:
-                with pp_swa.private_native_servers():
+                with pool_side_engine.private_native_servers():
                     self.swa_store = store("pipeline-swa")
                 addresses += store_addresses(self.swa_store)
         if manager.pp_size > 1:
@@ -553,7 +553,7 @@ class PipelineTransfer:
                 f"layers but rank 0 has {'none' if swa else 'some'}; with hybrid "
                 "SWA memory every pipeline stage needs sliding-window layers, so "
                 "pick a stage layout that gives each stage some, or "
-                f"{pp_swa.DISABLE_HYBRID_SWA}"
+                f"{pool_side_engine.DISABLE_HYBRID_SWA}"
             )
         return addresses[0], addresses[1], (addresses[2:] if swa else None)
 
@@ -795,7 +795,7 @@ class PipelineTransfer:
                 pool_spans=spans,
             )
             if with_swa:
-                pp_swa.register_twin(
+                pool_side_engine.register_twin(
                     self, req_id=req_id, uuid=uuid, swa=swa, dst_attn_tp=dst_attn_tp
                 )
         except Exception as error:
@@ -952,7 +952,7 @@ class PipelineTransfer:
             full=len(entry["full"]) - entry["start"],
             swa=len(entry["swa"]),
             parts=entry["parts"],
-            **pp_swa.source_fields(self),
+            **pool_side_engine.source_fields(self),
         )
         self._announce(room, entry, payload, b"", "replied")
         if entry["aux"] is not None:
@@ -998,7 +998,7 @@ class PipelineTransfer:
         aborted = room in self.manager._aborted
         if not (aborted or expired or room in self.failed):
             return False
-        if not pp_swa.cancel_unclaimed(
+        if not pool_side_engine.cancel_unclaimed(
             self, req_id, uuid, registered=item["registered"]
         ):
             return False
@@ -1171,7 +1171,7 @@ class PipelineTransfer:
             swa=len(item["swa"]),
             start=item["start"],
             parts=item["parts"],
-            **pp_swa.source_fields(self),
+            **pool_side_engine.source_fields(self),
         )
         self._announce(room, item, payload, item["aux"], "replied")
 
@@ -1259,7 +1259,7 @@ class PipelineTransfer:
                     "in the same KV layout (SGLANG_TPU_USE_BLOCK_MAJOR_KV)"
                 )
             if meta.get("part") is None:
-                pp_swa.check_agreement(self, meta)
+                pool_side_engine.check_agreement(self, meta)
             if meta.get("stage"):
                 request.stage[rank] = meta
             elif meta.get("part") is not None:
@@ -1321,12 +1321,12 @@ class PipelineTransfer:
             if set(request.sources) != request.ranks:
                 return False
             if request.accepted or request.future is not None:
-                pp_swa.resume_twin(self, request, key=())
+                pool_side_engine.resume_twin(self, request, key=())
                 return True
             if time.monotonic() < request.next_attempt:
                 return False
             sources, args, twin = self._plan_closing(room, request)
-            reason = pp_swa.unplaceable(args, twin)
+            reason = pool_side_engine.unplaceable(args, twin)
             if reason is not None:
                 self._fail_room_held(room, reason)
                 return False
@@ -1347,7 +1347,7 @@ class PipelineTransfer:
                 return False
             mgr.update_status(room, KVPoll.Transferring)
             ranks = list(range(int(sources[0]["pp_size"])))
-            pp_swa.start_twin(
+            pool_side_engine.start_twin(
                 self, room, request, key=(), twin=twin, metas=sources, ranks=ranks
             )
             if mgr.attn_tp_rank != 0:
@@ -1394,7 +1394,7 @@ class PipelineTransfer:
             count=source_full,
             source_swa_count=source_swa,
         )
-        twin = pp_swa.twin_destination(self, request, swa_count=source_swa)
+        twin = pool_side_engine.twin_destination(self, request, swa_count=source_swa)
         if twin is not None and not (
             args["transfer_pool_tags"] or twin["transfer_pool_tags"]
         ):
@@ -1523,7 +1523,7 @@ class PipelineTransfer:
                 continue  # a stage of this group is still computing
             state = request.groups.setdefault(group, _new_transfer_state())
             if state["accepted"] or state["future"] is not None:
-                pp_swa.resume_twin(self, request, key=("g", group))
+                pool_side_engine.resume_twin(self, request, key=("g", group))
                 continue
             if state["done"]:
                 # Rank 0 started it for this attention-TP rank, and it landed.
@@ -1547,17 +1547,17 @@ class PipelineTransfer:
                 source_swa_count=swa_count,
                 only_tags=group_tags,
             )
-            twin = pp_swa.twin_destination(
+            twin = pool_side_engine.twin_destination(
                 self, request, swa_count=swa_count, only_tags=group_tags
             )
-            reason = pp_swa.unplaceable(args, twin)
+            reason = pool_side_engine.unplaceable(args, twin)
             if reason is not None:
                 self._fail_room_held(room, f"group {group}: {reason}")
                 return False
             if not self._admit(room, request, ("g", group), window=twin is not None):
                 return False
             metas = sorted(metas, key=lambda m: int(m["rank"]))
-            pp_swa.start_twin(
+            pool_side_engine.start_twin(
                 self,
                 room,
                 request,
@@ -1622,11 +1622,13 @@ class PipelineTransfer:
         # An unregistered room has nothing native to claim or release.
         registered = self.sent[room]["registered"]
         if registered and release["pp_size"] == 1:
-            if not pp_swa.cancel_unclaimed(self, str(room), room, registered=True):
+            if not pool_side_engine.cancel_unclaimed(
+                self, str(room), room, registered=True
+            ):
                 return
         elif registered:
             try:
-                pp_swa.complete_twin(self, str(room))
+                pool_side_engine.complete_twin(self, str(room))
                 self.client.complete_request_blocks(str(room), room, self.unit)
             except RuntimeError as error:
                 if _EARLY_COMPLETION not in str(error):
@@ -1680,7 +1682,7 @@ class PipelineTransfer:
                 self.client.complete_request_blocks(
                     stage_req_id(room, group), stage_uuid(room, group), self.unit
                 )
-                pp_swa.complete_twin(self, stage_req_id(room, group))
+                pool_side_engine.complete_twin(self, stage_req_id(room, group))
             return
         request = self.receives.get(room)
         if request is not None:
@@ -1723,7 +1725,7 @@ class PipelineTransfer:
         if retry is None:
             request.accepted = True
         elif retry:
-            if not pp_swa.twin_live(request, key=()):
+            if not pool_side_engine.twin_live(request, key=()):
                 self._release_admission(room, request)
             request.next_attempt = time.monotonic() + 0.05
 
@@ -1737,7 +1739,7 @@ class PipelineTransfer:
         if retry is None:
             state["accepted"] = True
         elif retry:
-            if key is not None and not pp_swa.twin_live(request, key=key):
+            if key is not None and not pool_side_engine.twin_live(request, key=key):
                 self._release_admission(room, request, key)
             state["next_attempt"] = time.monotonic() + 0.05
 
@@ -1782,7 +1784,7 @@ class PipelineTransfer:
         with self.lock:
             status = mgr._poll_engine_status(name="pipeline", engine=self.engine)
             if self.swa is not None:
-                status = pp_swa.merge(
+                status = pool_side_engine.merge(
                     self,
                     status,
                     mgr._poll_engine_status(
@@ -1845,14 +1847,14 @@ class PipelineTransfer:
         for room in (self.done_send | self.failed) - self.retired:
             if room in self.sent:
                 self.client.complete_request_blocks(str(room), room, self.unit)
-                pp_swa.complete_twin(self, str(room))
+                pool_side_engine.complete_twin(self, str(room))
             self.retired.add(room)
         for room, item in self.sent.items():
             self._try_release(room)
             if room in self.done_send | self.failed:
                 continue
             if room in mgr._aborted or time.monotonic() >= item["expires"]:
-                if pp_swa.cancel_unclaimed(
+                if pool_side_engine.cancel_unclaimed(
                     self, str(room), room, registered=item["registered"]
                 ):
                     if room in self.release_requests and room not in mgr._aborted:
@@ -1872,7 +1874,7 @@ class PipelineTransfer:
                     request,
                     state,
                     key=None,
-                    req_id=pp_swa.twin_id(room, key),
+                    req_id=pool_side_engine.twin_id(room, key),
                 )
         for group, state in request.groups.items():
             if state["future"] is not None and state["future"].done():
@@ -1947,4 +1949,4 @@ class PipelineTransfer:
         self.retired.discard(room)
         self.cleared.discard(room)
         self.admission.forget(room)
-        pp_swa.forget(self, room)
+        pool_side_engine.forget(self, room)

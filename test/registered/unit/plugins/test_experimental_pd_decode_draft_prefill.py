@@ -20,7 +20,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden import common as raiden_common
-from sglang_tpu.disaggregation.raiden import pipeline as raiden_pipeline
+from sglang_tpu.disaggregation.raiden import pool_transfer as raiden_pipeline
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental import runs_draft_prompt_pass
 from sglang_tpu.experimental.speculative import pd_draft_prefill, pd_hidden_pool
