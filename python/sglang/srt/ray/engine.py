@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import logging
 import threading
@@ -36,6 +37,7 @@ from sglang.srt.entrypoints.engine import (
 from sglang.srt.environ import envs
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.runtime_context import (
+    get_context,
     get_device,
     get_parallel,
 )
@@ -257,7 +259,6 @@ def _create_scheduler_actor(
         dist_init_addr: Distributed init address (tcp://rank0_node_ip:nccl_port).
     """
     return SchedulerActor.options(
-        num_cpus=0,
         **_actor_options(server_args),
         name=(
             f"sglang_scheduler_node{rank0_node_ip}"
@@ -277,6 +278,23 @@ def _create_scheduler_actor(
         dp_rank=dp_rank,
         dist_init_addr=dist_init_addr,
     )
+
+
+def _actor_server_args(server_args: ServerArgs) -> ServerArgs:
+    """Return a shallow copy of ``server_args`` with its own declaration stash.
+
+    ``Engine._launch_subprocesses`` publishes ``server_args`` in the driver
+    process before calling ``_launch_scheduler_processes``. ``declare_resolution``
+    refuses the published instance (whose bags are already projected), whereas
+    the Ray launcher needs to declare cluster-discovered fields (``nnodes``,
+    TPU slice env, ``dist_init_addr``) on the record handed to scheduler
+    actors, ``tpu_actor_runtime_env``, and ``PortArgs.init_new``.
+    """
+    actor_args = copy.copy(server_args)
+    stash = getattr(server_args, "_resolved_overrides", None)
+    if stash is not None:
+        actor_args._resolved_overrides = list(stash)
+    return actor_args
 
 
 class RayEngine(Engine):
@@ -320,8 +338,10 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
-        # nnodes can still move below (TPU auto-detect). The actors get the replaced
-        # record, the driver's bag does not, so read this local from here on.
+        # nnodes can still move below (TPU auto-detect). Copy server_args so
+        # cluster-discovered declarations travel to actors without mutating the
+        # driver's already-published ServerArgs instance.
+        server_args = _actor_server_args(server_args)
         nnodes = get_parallel().nnodes
 
         # TPU + Ray: honor the configured nnodes, discovering the pre-ordered host
@@ -368,9 +388,10 @@ class RayEngine(Engine):
                     detected,
                     nnodes,
                 )
-                server_args = server_args.replace_resolved(
-                    "ray.tpu_nnodes_autodetect", nnodes=nnodes
+                declare_resolution(
+                    server_args, "ray.tpu_nnodes_autodetect", nnodes=nnodes
                 )
+                get_context().override("ray.tpu_nnodes_autodetect", nnodes=nnodes)
                 # Run the (tp_size * pp_size) % nnodes check that
                 # check_server_args deferred for nnodes=0. A non-divisor
                 # under-provisions the placement group and the launch hangs
@@ -404,7 +425,8 @@ class RayEngine(Engine):
                 single_host_env = compute_single_host_tpu_env(
                     get_parallel().tp_size * get_parallel().pp_size
                 )
-                server_args = server_args.replace_resolved(
+                declare_resolution(
+                    server_args,
                     "ray.tpu_single_host_env",
                     # Force TPU_WORKER_HOSTNAMES="" into every actor. On a
                     # multi-host GKE slice each pod inherits the slice-wide
@@ -424,7 +446,8 @@ class RayEngine(Engine):
                     # Multihost: stash the physically-ordered (TPU_WORKER_ID) host
                     # list. Actors rebuild the slicebuilder deterministically from it
                     # (see _prepare_tpu_env), so the port list is identical everywhere.
-                    server_args = server_args.replace_resolved(
+                    declare_resolution(
+                        server_args,
                         "ray.tpu_worker_hostnames",
                         tpu_worker_hostnames=tpu_worker_hostnames,
                     )
@@ -630,16 +653,15 @@ class RayEngine(Engine):
             f"tp_size={parallel.tp_size}, pp_size={parallel.pp_size}"
         )
 
-        # Declared on the record itself so `PortArgs.init_new()` can compute
-        # TCP addresses (required for the DP attention path). No copy: this
-        # process does not publish here, and every other reader of the field
-        # goes through the bags its own process projects.
+        # Declared on a copy of the record so `PortArgs.init_new()` can compute
+        # TCP addresses (required for the DP attention path) even when the
+        # caller handed in the driver's already-published ServerArgs instance.
+        dp_server_args = _actor_server_args(server_args)
         declare_resolution(
-            server_args,
+            dp_server_args,
             "ray.dp_controller",
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
-        dp_server_args = server_args
         # Create the DP controller in-process. This blocks until all actors
         # are initialized and their event loops have started.
         controller = RayDataParallelController(

@@ -482,5 +482,91 @@ class TestRedactEnvForLog(CustomTestCase):
         self.assertEqual(redact_env_for_log({}), "")
 
 
+class TestPublishedServerArgsAndActorLaunch(CustomTestCase):
+    """Regression coverage for Ray TPU launch after ServerArgs.replace_resolved removal:
+    - Engine._launch_subprocesses publishes server_args before _launch_scheduler_processes,
+      so cluster-discovered declarations must go onto _actor_server_args(server_args)
+      rather than mutating the published record or calling removed replace_resolved.
+    - tpu_actor_runtime_env must read through resolving_view(server_args) so
+      declarations in _resolved_overrides (not raw ServerArgs fields) reach runtime_env.
+    - _create_scheduler_actor must not pass duplicate num_cpus=0 alongside **_actor_options.
+    """
+
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_declared_tpu_env_on_published_server_args_reaches_runtime_env(self):
+        from sglang.srt.arg_groups.overrides import (
+            declare_resolution,
+            resolution_result,
+        )
+        from sglang.srt.ray.engine import _actor_server_args
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(model_path="dummy", device="tpu", use_ray=True)
+        publish(server_args, role="tokenizer")
+
+        actor_args = _actor_server_args(server_args)
+        declare_resolution(
+            actor_args,
+            "ray.tpu_worker_hostnames",
+            tpu_worker_hostnames="10.0.0.1,10.0.0.2",
+        )
+        declare_resolution(
+            actor_args,
+            "ray.tpu_nnodes_autodetect",
+            nnodes=2,
+        )
+
+        # Raw field stays untouched; resolving_view / tpu_actor_runtime_env sees the declaration.
+        self.assertIsNone(actor_args.tpu_worker_hostnames)
+        self.assertEqual(resolution_result(actor_args, "nnodes"), 2)
+        self.assertEqual(
+            tpu_actor_runtime_env(actor_args),
+            {
+                "runtime_env": {
+                    "env_vars": {"TPU_WORKER_HOSTNAMES": "10.0.0.1,10.0.0.2"}
+                }
+            },
+        )
+        # Published driver record's stash is not mutated.
+        self.assertIsNone(resolution_result(server_args, "tpu_worker_hostnames"))
+
+    def test_create_scheduler_actor_does_not_duplicate_num_cpus(self):
+        from sglang.srt.ray import engine as ray_engine
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(model_path="dummy", device="tpu", use_ray=True)
+        publish(server_args, role="tokenizer")
+
+        fake_pg = SimpleNamespace(id=b"\x01" * 16)
+        captured_options = {}
+
+        def fake_options(**kwargs):
+            captured_options.update(kwargs)
+            return SimpleNamespace(remote=lambda **rkwargs: "actor_handle")
+
+        with mock.patch.object(
+            ray_engine.SchedulerActor, "options", side_effect=fake_options
+        ):
+            handle = ray_engine._create_scheduler_actor(
+                pg=fake_pg,
+                bundle_idx=0,
+                gpu_id=0,
+                server_args=server_args,
+                port_args=SimpleNamespace(nccl_port=29500),
+                tp_rank=0,
+                pp_rank=0,
+                dp_rank=0,
+                dist_init_addr="10.0.0.1:29500",
+                rank0_node_ip="10.0.0.1",
+            )
+        self.assertEqual(handle, "actor_handle")
+        self.assertEqual(captured_options["num_cpus"], 0)
+        self.assertEqual(captured_options["resources"], {"TPU": 1})
+
+
 if __name__ == "__main__":
     unittest.main()
