@@ -560,7 +560,7 @@ class IndexSelect:
         round's (``prefix``) the digits up to ``j`` (``first``: the
         selection's first pass). One digit a key, not a compare per candidate."""
         if self.grouped:
-            return self._count_groups(params_of, digits, prefix)
+            return self._count_groups(params_of, digits, prefix, first)
         from jax.experimental import pallas as pl
 
         refs, chunk = self.refs, self.chunk
@@ -655,17 +655,20 @@ class IndexSelect:
         buf = self.refs["group_buf"].at[step % 2, pl_ds(0, self.group_rows * self.gchunk)]
         pltpu.make_async_copy(buf, buf, self.refs["group_sems"].at[step % 2]).wait()
 
-    def _count_groups(self, params_of, digits, prefix):
+    def _count_groups(self, params_of, digits, prefix, first=True):
         """``_count`` reading 8 rows a step: a vreg holds one key row of each of
         the group's rows (rows on sublanes), so a round is ~key rows / 8 steps
         per group instead of a step per row and chunk, and the rows' counts
-        are 16 lane sums at the group's end."""
+        are 16 lane sums at the group's end. When the selection's group steps
+        fit the buffer's two slots, later passes read the chunks the first
+        pass copied (step ``s`` stays in slot ``s``)."""
         from jax.experimental import pallas as pl
 
         refs, chunk, batch = self.refs, self.gchunk, self.batch
         total = refs["gstep_starts"][self.groups]
         refs["local"][...] = jnp.zeros((COUNT_ROWS, LANES), jnp.int32)
-        pl_when(total > 0)(lambda: self._group_copy(0))
+        load = True if first else total > 2
+        pl_when(load & (total > 0))(lambda: self._group_copy(0))
         col = jax.lax.broadcasted_iota(jnp.int32, (8, 1), 0)
         sub8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 0)
         lane8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 1)
@@ -684,8 +687,8 @@ class IndexSelect:
 
         def step_fn(step, bins):
             g, local = refs["gstep_group"][step], refs["gstep_local"][step]
-            self._group_wait(step)
-            pl_when(step + 1 < total)(lambda: self._group_copy(step + 1))
+            pl_when(load)(lambda: self._group_wait(step))
+            pl_when(load & (step + 1 < total))(lambda: self._group_copy(step + 1))
             start = jnp.minimum(local * chunk, self.key_rows - chunk)
             bins = [jnp.where(local == 0, 0, a) for a in bins]
             rows = [jnp.minimum(8 * g + r, batch - 1) for r in range(8)]
