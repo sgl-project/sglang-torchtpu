@@ -371,11 +371,16 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self.max_context_len = int(model_config.context_len)
         self.page_size = FULL_PAGE_TOKENS
         self.index_topk = int(config.index_topk)
-        self.low_ratios = tuple(r for r in LOW_RATIOS if r in config.compress_ratios)
         self.forward_metadata: Optional[DSV41TPUForwardMetadata] = None
         # The DSpark draft runs TARGET_VERIFY as one non-causal block per request.
         self.is_dspark_draft = (
             model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark()
+        )
+        # The draft carries the target config, but its stages are all ratio 0.
+        self.low_ratios = (
+            ()
+            if self.is_dspark_draft
+            else tuple(r for r in LOW_RATIOS if r in config.compress_ratios)
         )
         # layer_id -> fp32 [cos | sin] table; forward only sees the RadixAttention.
         self.rope_tables: Dict[int, torch.Tensor] = {}
