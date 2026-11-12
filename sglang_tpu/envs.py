@@ -565,8 +565,9 @@ class TpuEnvs:
     # Muse megakernel Wave 1-4 optimizations (hoisted SAL refill, stack2 QK/PV, all-VMEM
     # collective/expert scratch on row-tiled steps, 2D PairColl collectives, vectorized routing).
     SGLANG_TPU_MUSE_MK_OPT = EnvBool(True)
-    # Decode megakernel (TP): fp4 experts requantized to one scale per this many K rows (0 off,
-    # 64 / 128 / 256); the expert dots push raw e2m1 codes to the MXU (MKConfig.qblock).
+    # Decode megakernel (TP): fp4 experts requantized at load to one bf16 scale per this many K
+    # rows (0 off, 256), shared with the native fused-RS MoE (W4A16); the expert dots push raw
+    # e2m1 codes to the MXU (MKConfig.qblock).
     SGLANG_TPU_MUSE_MK_QBLOCK = EnvInt(0)
     # Kernel-level weight layouts (anvil / numerics only); serving raises on them.
     SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)

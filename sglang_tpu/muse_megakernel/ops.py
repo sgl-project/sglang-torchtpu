@@ -31,6 +31,7 @@ from sglang_tpu.kv_pool import (
 )
 from sglang_tpu.muse_megakernel import kernel as K
 from sglang_tpu.muse_megakernel.ep_mk.kernel import ep_arm, ep_megakernel_call
+from sglang_tpu.muse_megakernel.expert_requant import requant_tpu_nvfp4_experts
 from sglang_tpu.muse_megakernel.mk import trace as mk_trace
 from sglang_tpu.muse_megakernel.moe_mode import MoeMode, resolve_moe_mode
 
@@ -320,12 +321,14 @@ class MuseMegakernel(torch.nn.Module):
         device = decoder.norm.weight.device
         qkvg, wo, wpool, wunpool, wrouter, smalls = [], [], [], [], [], []
         experts, kinds = [], []
-        if tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get():
-            # the native MoE shares these expert weights at block 16
-            raise NotImplementedError(
-                "SGLANG_TPU_MUSE_MK_QBLOCK: serving weight load does not requantize the "
-                "experts yet (anvil / numerics only)"
-            )
+        qblock = tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get()
+        if qblock:
+            # One copy, before stacking: the native fused-RS MoE (extend, large steps) reads it too.
+            for layer in decoder.layers:
+                if _expert_kind(layer.mlp.experts) == "fp4":
+                    requant_tpu_nvfp4_experts(layer.mlp.experts, qblock)
+            torch.accelerator.synchronize()
+            logger.info("Muse megakernel: fp4 experts requantized to block %d", qblock)
         for layer in decoder.layers:
             attn, moe = layer.self_attn, layer.mlp
             if layer.post_attention_layernorm.weight is not None:
