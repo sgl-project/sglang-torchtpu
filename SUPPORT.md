@@ -110,7 +110,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | FLUX.2-klein-4B (diffusion) | bf16 | 1 chip; 1 host (Ulysses 4) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | Z-Image-Turbo (diffusion) | bf16 | 1 chip; 1 host (Ulysses 8, 30 heads padded to 32) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | LTX-2 (diffusion) | bf16 | 1 host (CFG 2 x Ulysses 4) | **Experimental** | Video and audio. Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
-| Anima (diffusion) | bf16 | 1 chip; 1 host (CFG 2 x Ulysses 4) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
+| Anima (diffusion) | bf16 | 1 chip; 1 host (Ulysses 8) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | Llama, Qwen3 dense (other sizes), Qwen3-MoE (other sizes), Kimi-Linear | — | — | **Experimental** | Generic TPU path with no model-specific test. |
 
 ## Features
