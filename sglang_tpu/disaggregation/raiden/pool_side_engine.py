@@ -1,21 +1,25 @@
-"""Sliding-window KV of a pipeline transfer through a second native engine.
+"""A second pool family of a pool transfer through a second native engine.
 
 tpu-sync's KVCacheManager requires every storage it wraps to hold the same
-number of blocks, because they share one block-id space. A hybrid pool's
-sliding-window layers hold far fewer pages than its full-attention layers, so
-one engine over both fails at startup. As the non-pipeline Raiden path does,
-each worker wraps its sliding-window layers in a second engine instead.
+number of blocks, because they share one block-id space. A pool family whose
+block count differs from the full-attention pages' therefore fails at startup
+in one engine with them. As the non-pipeline Raiden path does, each worker
+wraps such a family in a second engine instead. The sliding window is the one
+family today: a hybrid pool's sliding-window layers hold far fewer pages than
+its full-attention layers.
 
-Terms used here and at the call sites in pipeline.py:
+Terms used here and at the call sites in pool_transfer.py:
 
-- link (SwaLink): one worker's sliding-window engine, with its controller,
-  its work unit and the state of its twins.
-- twin: the native transfer ``swa:<req_id>`` that moves the window pages of a
-  closing transfer or a stage group between the window engines; early parts
-  carry no window pages and have no twin. A stage registers the twin together
-  with the transfer's full-attention pages and announces both in one READY;
-  decode rank 0 coordinates the twin on threads of its own, concurrently
-  with the full-attention transfer.
+- family (Family; SwaFamily): what the second engine carries, and how its
+  blocks are sized, sliced into spans, placed on the destination and announced.
+- link (SideLink): one worker's second engine, with its controller, its work
+  unit and the state of its twins.
+- twin: the native transfer ``swa:<req_id>`` that moves the family's blocks
+  (the window pages) of a closing transfer or a stage group between the second
+  engines; early parts carry none and have no twin. A stage registers the twin
+  together with the transfer's full-attention pages and announces both in one
+  READY; decode rank 0 coordinates the twin on threads of its own,
+  concurrently with the full-attention transfer.
 - half: either transfer of such a pair, the full-attention one or its twin.
 - book (TwinBook): reports a transfer settled only once both of its halves
   settled natively, and as failed if either failed, so neither side releases
@@ -25,10 +29,10 @@ Terms used here and at the call sites in pipeline.py:
   on another rank before that rank has read the READYs that say whether a
   twin follows; the book holds such a landing until the rank declares.
 
-The window engines register their work units with a second reshard store on
+The second engines register their work units with a second reshard store on
 rank 0: a separate controller, so they keep transfer ranks from zero and the
 worker ids the controller dispatches to. tpu-sync serves the first controller
-and the first engine's worker service from process-wide servers; the window
+and the first engine's worker service from process-wide servers; the second
 store and engines each get a private one (private_native_servers).
 
 Functions run under PoolTransfer.lock unless they say otherwise.
@@ -58,10 +62,135 @@ from sglang_tpu.disaggregation.raiden.pool_spans import (
 
 logger = logging.getLogger(__name__)
 
-TWIN_PREFIX = "swa:"
 _PRIVATE_WORKER_ENV = "RAIDEN_DISABLE_SINGLETON_WORKER"
 # How to run without the window engine: one KV pool, one block count.
 DISABLE_HYBRID_SWA = "run prefill and decode with --disable-hybrid-swa-memory"
+
+
+def _key_req_id(room: int, key: tuple) -> str:
+    """The id of the transfer a twin belongs to: key () is the closing
+    transfer, ("g", group) a stage group."""
+    return stage_req_id(room, key[1]) if key else str(room)
+
+
+class Family:
+    """What a second engine carries: the pools of one kind of block. A family
+    says how its blocks are sized, sliced into spans, placed on the
+    destination and announced."""
+
+    # The family's half in a TwinBook, and what it is and moves in messages.
+    name: str
+    label: str
+    cargo: str
+    # Native id prefix of a twin, the data name of the family's reshard store
+    # and the rank's reserved control port for its engine (conn.py).
+    twin_prefix: str
+    store_name: str
+    port_offset: int
+    # READY metadata keys: a transfer's block count in this family, and the
+    # controller and work unit of the announcing worker's second engine.
+    count_key: str
+    controller_key: str
+    unit_key: str
+    # How to run without this family's engine, and how to make both roles agree.
+    remedy: str
+    agreement: str
+    # Why a transfer and its twin cannot both be placed on a decode.
+    no_side_block: str
+    no_full_page: str
+
+    def twin_req_id(self, req_id: str) -> str:
+        return self.twin_prefix + req_id
+
+    def twin_uuid(self, req_id: str) -> int:
+        return _derived_uuid(self.twin_req_id(req_id))
+
+    def twin_id(self, room: int, key: tuple) -> str:
+        """The native id of the twin of transfer ``key`` of the room."""
+        return self.twin_req_id(_key_req_id(room, key))
+
+
+class SwaFamily(Family):
+    """The sliding window: a hybrid pool's sliding-window layers, whose pools
+    hold the attention window's pages only."""
+
+    name = "swa"
+    label = "sliding-window"
+    cargo = "sliding-window KV"
+    twin_prefix = "swa:"
+    store_name = "pipeline-swa"
+    port_offset = 2
+    count_key = "swa"
+    controller_key = "swa_controller"
+    unit_key = "swa_unit"
+    remedy = DISABLE_HYBRID_SWA
+    agreement = f"use hybrid SWA memory on both, or {DISABLE_HYBRID_SWA}"
+    no_side_block = "the decode holds no page for the producer's sliding window"
+    no_full_page = "the decode holds no full-attention page for a window twin"
+
+    @staticmethod
+    def owns(tag: str) -> bool:
+        return is_swa_pool(tag)
+
+    @staticmethod
+    def tensors(groups) -> list[Any]:
+        return list(groups.swa)
+
+    @staticmethod
+    def max_blocks(manager) -> int:
+        return manager._swa_max_request_blocks()
+
+    @staticmethod
+    def sent_blocks(manager, room: int) -> list[int]:
+        """The producer's blocks of the room on the second engine."""
+        return list(manager._prefill.send_swa_blocks.get(room, []))
+
+    @staticmethod
+    def spans(transfer, link, blocks: list[int], dst_attn_tp: int) -> list[Any]:
+        """Spans of ``blocks``, a transfer's window pages on the producer."""
+        return part_spans(
+            link.pools,
+            link.tensors,
+            [],
+            blocks,
+            dst_attn_tp,
+            int(transfer.manager.kv_args.total_kv_head_num),
+            draft_total_kv_heads=transfer.draft_kv_heads,
+            draft_swa_total_kv_heads=transfer.draft_swa_kv_heads,
+            with_swa=True,
+        )
+
+    @staticmethod
+    def destination(link, blocks: list[int], count: int, only_tags=None) -> dict:
+        """Destination pages of a twin of ``count`` source blocks among the
+        decode's window pages ``blocks``."""
+        return part_destination_blocks(
+            link.pools,
+            [],
+            blocks,
+            start=0,
+            count=0,
+            source_swa_count=count,
+            only_tags=only_tags,
+        )
+
+
+SWA = SwaFamily()
+# Every family a second engine can carry; a worker's pools belong to one at most.
+FAMILIES = (SWA,)
+
+
+def family_of(pools: list[dict]):
+    """The family the second engine's ``pools`` belong to, or None without any."""
+    families = {
+        family for pool in pools for family in FAMILIES if family.owns(pool["tag"])
+    }
+    if len(families) > 1:
+        raise NotImplementedError(
+            "Raiden pipeline transfer runs one second engine per worker, but the "
+            f"pools need {sorted(family.label for family in families)}"
+        )
+    return families.pop() if families else None
 
 
 @contextlib.contextmanager
@@ -91,53 +220,38 @@ def private_native_servers():
             os.environ[_PRIVATE_WORKER_ENV] = previous
 
 
-def twin_req_id(req_id: str) -> str:
-    return TWIN_PREFIX + req_id
-
-
-def twin_uuid(req_id: str) -> int:
-    return _derived_uuid(twin_req_id(req_id))
-
-
-def _key_req_id(room: int, key: tuple) -> str:
-    """The id of the transfer a twin belongs to: key () is the closing
-    transfer, ("g", group) a stage group."""
-    return stage_req_id(room, key[1]) if key else str(room)
-
-
-def twin_id(room: int, key: tuple) -> str:
-    """The native id of the twin of transfer ``key`` of the room."""
-    return twin_req_id(_key_req_id(room, key))
-
-
 def split_manifest(pools: list[dict]) -> tuple[list[dict], list[dict]]:
-    """The full-attention and sliding-window pools of one manifest, each with
-    storage indices local to the engine that wraps it."""
-    full = [dict(pool) for pool in pools if not is_swa_pool(pool["tag"])]
-    swa = [dict(pool) for pool in pools if is_swa_pool(pool["tag"])]
-    for kind in (full, swa):
+    """The full-attention pools of one manifest and the pools of its second
+    engine, each with storage indices local to the engine that wraps it."""
+
+    def side(pool: dict) -> bool:
+        return any(family.owns(pool["tag"]) for family in FAMILIES)
+
+    full = [dict(pool) for pool in pools if not side(pool)]
+    second = [dict(pool) for pool in pools if side(pool)]
+    for kind in (full, second):
         for index, pool in enumerate(kind):
             pool["storage_index"] = index
-    return full, swa
+    return full, second
 
 
 def _may_have_twin(req_id: str) -> bool:
-    """Closing transfers and stage groups carry window pages; early parts never."""
+    """Closing transfers and stage groups can have a twin; early parts never."""
     return ".p" not in req_id
 
 
 class TwinBook:
     """Pairs each transfer with its twin before either is reported.
 
-    ``kind`` is the native list a half settled in: "sent", "received" or
-    "failed". A transfer without a twin passes straight through, except that a
-    decode (``hold_undeclared``) holds a closing or stage-group half until
-    expect() says whether a twin follows.
+    ``half`` is "fa" or the family's name, and ``kind`` the native list the
+    half settled in: "sent", "received" or "failed". A transfer without a twin
+    passes straight through, except that a decode (``hold_undeclared``) holds
+    a closing or stage-group half until expect() says whether a twin follows.
     """
 
     def __init__(self, *, hold_undeclared: bool):
         self._hold_undeclared = hold_undeclared
-        # req_id -> dict(twin=bool | None, fa=kind | None, swa=kind | None)
+        # req_id -> dict(twin=bool | None, fa=kind | None, side=kind | None)
         self._halves: dict[str, dict] = {}
         self._ready: list[tuple[str, str]] = []
 
@@ -152,6 +266,7 @@ class TwinBook:
                 self._ready.append((req_id, kind))
                 return
         entry = self._entry(req_id)
+        half = "fa" if half == "fa" else "side"
         if entry[half] is None:
             entry[half] = kind
         self._settle(req_id, entry)
@@ -169,24 +284,25 @@ class TwinBook:
             del self._halves[req_id]
 
     def _entry(self, req_id: str) -> dict:
-        return self._halves.setdefault(req_id, dict(twin=None, fa=None, swa=None))
+        return self._halves.setdefault(req_id, dict(twin=None, fa=None, side=None))
 
     def _settle(self, req_id: str, entry: dict) -> None:
         if entry["twin"] is None or entry["fa"] is None:
             return
-        if entry["twin"] and entry["swa"] is None:
+        if entry["twin"] and entry["side"] is None:
             return
         del self._halves[req_id]
-        failed = entry["fa"] == "failed" or entry["swa"] == "failed"
+        failed = entry["fa"] == "failed" or entry["side"] == "failed"
         self._ready.append((req_id, "failed" if failed else entry["fa"]))
 
 
-class SwaLink:
-    """One worker's sliding-window engine, its work unit and its twins."""
+class SideLink:
+    """One worker's second engine, its work unit and its twins."""
 
     def __init__(
         self,
         *,
+        family: Family,
         pools: list[dict],
         tensors: list[Any],
         controller: str,
@@ -196,6 +312,7 @@ class SwaLink:
         slots: int,
         hold_undeclared: bool,
     ):
+        self.family = family
         self.pools = pools
         self.tensors = tensors
         self.controller = controller
@@ -224,28 +341,32 @@ class SwaLink:
 # ----- construction ------------------------------------------------------
 
 
-def require_bounded_staging() -> None:
+def require_bounded_staging(family: Family) -> None:
     """Refuse, before any engine is built, a tpu-sync whose engines cannot
-    stage per-pool block counts, which the window engine needs."""
+    stage per-pool block counts, which the second engine needs."""
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
     parameters = inspect.signature(KVCacheManager.register_pools).parameters
     if not {"staging_leases", "staging_blocks_per_pool"} <= parameters.keys():
         raise RuntimeError(
-            "The Raiden pipeline transfer moves sliding-window KV through a "
+            f"The Raiden pipeline transfer moves {family.cargo} through a "
             "second engine, which needs a tpu-sync with bounded pool staging; "
-            f"upgrade tpu-sync or {DISABLE_HYBRID_SWA}"
+            f"upgrade tpu-sync or {family.remedy}"
         )
 
 
 def plan_slots(
-    manager, tensors: list[Any], full_tensors: list[Any], full_max_blocks: int
+    manager,
+    family: Family,
+    tensors: list[Any],
+    full_tensors: list[Any],
+    full_max_blocks: int,
 ) -> tuple[int, int, int]:
-    """(slots, max_blocks, host bytes) of a worker's window engine. A twin and
+    """(slots, max_blocks, host bytes) of a worker's second engine. A twin and
     its transfer take a slot on each engine, so it gets one slot per pair the
     rank's staging budget affords, and the full-attention engine plans with
     the rest."""
-    max_blocks = manager._swa_max_request_blocks()
+    max_blocks = family.max_blocks(manager)
     slots = manager._num_slots(
         tensors,
         max_blocks,
@@ -257,19 +378,21 @@ def plan_slots(
 def build(
     transfer,
     *,
+    family: Family,
     pools: list[dict],
     tensors: list[Any],
     addresses: tuple[str, str],
     slots: int,
     max_blocks: int,
-) -> SwaLink:
-    """The window link of a worker whose full-attention engine is up:
+) -> SideLink:
+    """The second-engine link of a worker whose full-attention engine is up:
     started, with its pools and work unit registered."""
     from tpu_sync.api.torch.reshard_client import ReshardClient
 
     controller, dispatch = addresses
     unit_fields = transfer.unit_fields | {"job_replica_id": controller}
-    link = SwaLink(
+    link = SideLink(
+        family=family,
         pools=pools,
         tensors=tensors,
         controller=controller,
@@ -288,16 +411,16 @@ def build(
     if not transfer.producer:
         link.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=transfer.coord_workers,
-            thread_name_prefix="raiden-pipeline-swa",
+            thread_name_prefix=f"raiden-pipeline-{family.name}",
         )
     with private_native_servers():
-        # The rank's reserved sliding-window control port (conn.py).
+        # The rank's reserved control port for this family (conn.py).
         link.engine = transfer._start_engine(
             tensors=tensors,
             max_blocks=max_blocks,
             slots=slots,
             dispatch=dispatch,
-            port_offset=2,
+            port_offset=family.port_offset,
         )
     fingerprint = transfer._register_pools(
         engine=link.engine,
@@ -310,8 +433,9 @@ def build(
         ),
     )
     logger.info(
-        "Raiden pipeline sliding-window engine ready: rank=%d slots=%d "
+        "Raiden pipeline %s engine ready: rank=%d slots=%d "
         "max_blocks=%d pools=%d controller=%s layout_fingerprint=%s",
+        family.label,
         transfer.rank,
         slots,
         max_blocks,
@@ -323,60 +447,72 @@ def build(
 
 
 def check_agreement(transfer, meta: dict) -> None:
-    """A READY from a producer whose window layout differs from this decode's."""
-    if ("swa_unit" in meta) != (transfer.swa is not None):
+    """A READY from a producer whose second engine differs from this decode's."""
+    announced = next((f for f in FAMILIES if f.unit_key in meta), None)
+    local = None if transfer.side is None else transfer.side.family
+    if announced is not local:
+        family = announced or local
         raise ValueError(
-            "Raiden pipeline producer and decode disagree on the sliding-window "
-            f"engine: use hybrid SWA memory on both, or {DISABLE_HYBRID_SWA}"
+            f"Raiden pipeline producer and decode disagree on the {family.label} "
+            f"engine: {family.agreement}"
         )
 
 
 def source_fields(transfer) -> dict:
-    link = transfer.swa
+    link = transfer.side
     if link is None:
         return {}
-    return dict(swa_controller=link.controller, swa_unit=link.unit_fields)
+    family = link.family
+    return {family.controller_key: link.controller, family.unit_key: link.unit_fields}
+
+
+def _family(transfer):
+    """The family of a worker's second engine; without one, the window's."""
+    return SWA if transfer.side is None else transfer.side.family
+
+
+def count_key(transfer) -> str:
+    """READY metadata key of a transfer's block count on the second engine; a
+    worker without one still announces the window's, as zero."""
+    return _family(transfer).count_key
+
+
+def sent_blocks(transfer, room: int) -> list[int]:
+    """The producer's blocks of the room on the second engine."""
+    return _family(transfer).sent_blocks(transfer.manager, room)
 
 
 # ----- producer ----------------------------------------------------------
 
 
 def register_twin(
-    transfer, *, req_id: str, uuid: int, swa: list[int], dst_attn_tp: int
+    transfer, *, req_id: str, uuid: int, blocks: list[int], dst_attn_tp: int
 ) -> None:
-    """Register the window pages of ``req_id``, if any, as its twin. A twin
-    that cannot register cancels the transfer's own registration, which
-    nothing has claimed yet, and raises."""
-    link = transfer.swa
-    if link is None or not swa:
+    """Register the second engine's ``blocks`` of ``req_id``, if any, as its
+    twin. A twin that cannot register cancels the transfer's own registration,
+    which nothing has claimed yet, and raises."""
+    link = transfer.side
+    if link is None or not blocks:
         return
+    family = link.family
     try:
         link.client.register_request_blocks(
-            req_id=twin_req_id(req_id),
-            uuid=twin_uuid(req_id),
+            req_id=family.twin_req_id(req_id),
+            uuid=family.twin_uuid(req_id),
             unit=link.unit,
-            block_ids=list(swa),
-            pool_spans=part_spans(
-                link.pools,
-                link.tensors,
-                [],
-                swa,
-                dst_attn_tp,
-                int(transfer.manager.kv_args.total_kv_head_num),
-                draft_total_kv_heads=transfer.draft_kv_heads,
-                draft_swa_total_kv_heads=transfer.draft_swa_kv_heads,
-                with_swa=True,
-            ),
+            block_ids=list(blocks),
+            pool_spans=family.spans(transfer, link, blocks, dst_attn_tp),
         )
     except Exception:
         try:
             transfer.client.cancel_request_blocks_if_unclaimed(req_id, uuid)
         except Exception as error:
             logger.error(
-                "Raiden pipeline rank%d: cancelling %s after its window twin failed "
+                "Raiden pipeline rank%d: cancelling %s after its %s twin failed "
                 "to register also failed: %s",
                 transfer.rank,
                 req_id,
+                family.label,
                 error,
             )
         raise
@@ -387,11 +523,11 @@ def register_twin(
 def complete_twin(transfer, req_id: str) -> None:
     """complete_request_blocks for the twin of ``req_id``, if it has one
     registered; the twin counts as registered until the call succeeds."""
-    link = transfer.swa
+    link = transfer.side
     if link is None or req_id not in link.registered:
         return
     link.client.complete_request_blocks(
-        twin_req_id(req_id), twin_uuid(req_id), link.unit
+        link.family.twin_req_id(req_id), link.family.twin_uuid(req_id), link.unit
     )
     link.registered.discard(req_id)
 
@@ -401,14 +537,15 @@ def cancel_unclaimed(transfer, req_id: str, uuid: int, *, registered: bool) -> b
     once neither can be claimed any more. Each unclaimed half is cancelled
     even when the other is claimed; a claimed half settles natively, and the
     pair then settles as failed."""
-    link = transfer.swa
+    link = transfer.side
     twin_claimed = False
     if link is not None and req_id in link.registered:
+        family = link.family
         if link.client.cancel_request_blocks_if_unclaimed(
-            twin_req_id(req_id), twin_uuid(req_id)
+            family.twin_req_id(req_id), family.twin_uuid(req_id)
         ):
             link.registered.discard(req_id)
-            link.book.feed(req_id, "swa", "failed")
+            link.book.feed(req_id, family.name, "failed")
         else:
             twin_claimed = True
     cancelled = not registered or transfer.client.cancel_request_blocks_if_unclaimed(
@@ -422,19 +559,20 @@ def cancel_unclaimed(transfer, req_id: str, uuid: int, *, registered: bool) -> b
 # ----- native completion -------------------------------------------------
 
 
-def merge(transfer, status, swa_status) -> tuple[list, list, list] | None:
+def merge(transfer, status, side_status) -> tuple[list, list, list] | None:
     """Both engines' settled transfers as the pipeline's: each one reported
     once its twin settled too."""
-    link = transfer.swa
+    link = transfer.side
+    family = link.family
     mgr = transfer.manager
-    for halves, half in ((status, "fa"), (swa_status, "swa")):
+    for halves, half in ((status, "fa"), (side_status, family.name)):
         if halves is None:
             continue
         for kind, settled in zip(("sent", "received", "failed"), halves):
             for t in settled:
                 req_id = mgr._norm_req_id(t.req_id)
-                if half == "swa":
-                    req_id = req_id.removeprefix(TWIN_PREFIX)
+                if half != "fa":
+                    req_id = req_id.removeprefix(family.twin_prefix)
                     if not transfer.producer:
                         _twin_settled(transfer, req_id)
                 link.book.feed(req_id, half, kind)
@@ -447,7 +585,7 @@ def merge(transfer, status, swa_status) -> tuple[list, list, list] | None:
 def _twin_settled(transfer, req_id: str) -> None:
     """Decode: the twin of ``req_id`` settled natively on this rank, so no
     push of it can land any more."""
-    transfer.swa.settled.add(req_id)
+    transfer.side.settled.add(req_id)
     room, key = parse_req_id(req_id)
     request = transfer.receives.get(room)
     state = None if request is None else request.twins.get(_twin_key(key))
@@ -464,32 +602,25 @@ def _twin_key(key) -> tuple:
 # ----- decode ------------------------------------------------------------
 
 
-def twin_destination(
-    transfer, request, *, swa_count: int, only_tags=None
-) -> dict | None:
-    """Destination blocks of a transfer's twin: None when it has none."""
-    if transfer.swa is None or not swa_count:
+def twin_destination(transfer, request, *, count: int, only_tags=None) -> dict | None:
+    """Destination blocks of a transfer's twin of ``count`` source blocks: None
+    when it has none."""
+    link = transfer.side
+    if link is None or not count:
         return None
-    return part_destination_blocks(
-        transfer.swa.pools,
-        [],
-        request.swa,
-        start=0,
-        count=0,
-        source_swa_count=swa_count,
-        only_tags=only_tags,
-    )
+    return link.family.destination(link, request.side, count, only_tags)
 
 
-def unplaceable(args: dict, twin: dict | None) -> str | None:
+def unplaceable(transfer, args: dict, twin: dict | None) -> str | None:
     """Why a transfer and its twin cannot both move, or None. The producer
     registered both halves, so the decode must claim both."""
     if twin is None:
         return None
+    family = transfer.side.family
     if not twin["transfer_pool_tags"]:
-        return "the decode holds no page for the producer's sliding window"
+        return family.no_side_block
     if not args["transfer_pool_tags"]:
-        return "the decode holds no full-attention page for a window twin"
+        return family.no_full_page
     return None
 
 
@@ -515,13 +646,14 @@ def start_twin(
     ranks: list[int],
 ) -> None:
     """Declare whether the transfer ``key`` of the room has a twin and start
-    it: rank 0 coordinates it on the window threads; another attention-TP
+    it: rank 0 coordinates it on the link's threads; another attention-TP
     rank waits for its engine to report the landing. ``metas`` are the READY
     metadata of the transfer's stages by rank, ``ranks`` the source transfer
     ranks it names, as for its full-attention transfer."""
-    link = transfer.swa
+    link = transfer.side
     if link is None:
         return
+    family = link.family
     link.book.expect(_key_req_id(room, key), twin is not None)
     if twin is None:
         return
@@ -534,19 +666,21 @@ def start_twin(
         return
     if state["accepted"] or state["future"] is not None or state["done"]:
         return
-    controllers = {meta["swa_controller"] for meta in metas}
+    controllers = {meta[family.controller_key] for meta in metas}
     if len(controllers) != 1:
-        raise ValueError("Raiden pipeline sources disagree on the window controller")
+        raise ValueError(
+            f"Raiden pipeline sources disagree on the {family.label} controller"
+        )
     controller = controllers.pop()
     req_id = _key_req_id(room, key)
     state["kwargs"] = dict(
         src_units=[
-            SimpleNamespace(**(metas[0]["swa_unit"] | {"data_replica_idx": rank}))
+            SimpleNamespace(**(metas[0][family.unit_key] | {"data_replica_idx": rank}))
             for rank in ranks
         ],
         dst_units=link.dst_units,
-        req_id=twin_req_id(req_id),
-        uuid=twin_uuid(req_id),
+        req_id=family.twin_req_id(req_id),
+        uuid=family.twin_uuid(req_id),
         use_block_chunks=True,
         is_sender=True,
         dst_mem_type=transfer.hbm_mem_type,
@@ -575,7 +709,7 @@ def resume_twin(transfer, request, *, key: tuple) -> None:
 
 def _submit(transfer, state: dict) -> None:
     kwargs = state["kwargs"]
-    state["future"] = transfer.swa.executor.submit(
+    state["future"] = transfer.side.executor.submit(
         transfer._coordinate, kwargs["src_controller_address"], **kwargs
     )
 
@@ -584,7 +718,7 @@ def _submit(transfer, state: dict) -> None:
 
 
 def forget(transfer, room: int) -> None:
-    link = transfer.swa
+    link = transfer.side
     if link is None:
         return
     link.book.forget(room)

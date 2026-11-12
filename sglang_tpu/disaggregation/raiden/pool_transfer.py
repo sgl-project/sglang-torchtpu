@@ -304,7 +304,8 @@ def warn_if_staging_exceeds_premapped(staging_bytes: int, premapped_bytes: int) 
 
 class Receive(msgspec.Struct):
     full: list[int]
-    swa: list[int]
+    # The decode's blocks on the second engine (pool_side_engine), if any.
+    side: list[int]
     aux_index: int | None
     ranks: set[int]
     sources: dict[int, dict]
@@ -325,7 +326,7 @@ class Receive(msgspec.Struct):
     # Staging reservations held: the room for the closing transfer,
     # (room, "p", index) per early part and (room, "g", group) per group.
     admitted_keys: set = set()
-    # Window twins (pool_side_engine) of the closing transfer, key (), and of each
+    # Twins (pool_side_engine) of the closing transfer, key (), and of each
     # stage group, key ("g", group): _new_transfer_state() and their
     # coordinate arguments. A twin is staged with its full-attention transfer.
     twins: dict[tuple, dict] = {}
@@ -341,11 +342,11 @@ class StagingPlan(msgspec.Struct, frozen=True):
 
 class PoolTransfer:
     """One named-pool engine per worker, sharing its pipeline's reshard
-    controller; a hybrid pool's sliding-window layers get a second engine
-    (pool_side_engine)."""
+    controller; a pool family with another block count, such as a hybrid
+    pool's sliding-window layers, gets a second engine (pool_side_engine)."""
 
-    # The window link, when sliding-window layers have their own engine.
-    swa: pool_side_engine.SwaLink | None = None
+    # The second engine's link, when a pool family has an engine of its own.
+    side: pool_side_engine.SideLink | None = None
     draft_kv_heads: int | None = None
     draft_swa_kv_heads: int | None = None
 
@@ -360,11 +361,12 @@ class PoolTransfer:
         self.lock = threading.RLock()
         self.draft_kv_heads = getattr(groups, "draft_kv_head_num", None)
         self.draft_swa_kv_heads = getattr(groups, "draft_swa_kv_head_num", None)
-        # A hybrid pool's sliding-window layers get an engine of their own.
-        self.pools, swa_pools = pool_side_engine.split_manifest(pool_manifest(groups))
+        # A pool family with another block count gets an engine of its own.
+        self.pools, side_pools = pool_side_engine.split_manifest(pool_manifest(groups))
+        family = pool_side_engine.family_of(side_pools)
         self.tensors = list(groups.full)
-        if swa_pools:
-            pool_side_engine.require_bounded_staging()
+        if family is not None:
+            pool_side_engine.require_bounded_staging(family)
         # One worker per pipeline stage or attention-TP rank. Rank 0 hosts the
         # shared controller and, on a tensor-parallel decode, plans every
         # transfer for all ranks.
@@ -385,7 +387,7 @@ class PoolTransfer:
         self.done_recv = set()
         self.failed = set()
         self.retired = set()
-        self.controller, dispatch, swa_addresses = self._rendezvous(swa=bool(swa_pools))
+        self.controller, dispatch, side_addresses = self._rendezvous(side=family)
         self.client = ReshardClient(self.controller)
         self.unit_fields = dict(
             job_name="sglang",
@@ -406,17 +408,17 @@ class PoolTransfer:
             for rank in range(manager.attn_tp_size)
         ]
         self.max_blocks = manager._max_request_blocks()
-        swa_slots = swa_blocks = reserved = 0
-        if swa_pools:
-            # The window engine stages the window pages; this one, full pages.
-            swa_slots, swa_blocks, reserved = pool_side_engine.plan_slots(
-                manager, list(groups.swa), self.tensors, self.max_blocks
+        side_slots = side_blocks = reserved = 0
+        if family is not None:
+            # The second engine stages its family's blocks; this one, full pages.
+            side_slots, side_blocks, reserved = pool_side_engine.plan_slots(
+                manager, family, family.tensors(groups), self.tensors, self.max_blocks
             )
         staging = self._plan_staging(reserved_bytes=reserved)
-        # A twin's window pages are admitted with its full-attention transfer.
+        # A twin's blocks are admitted with its full-attention transfer.
         self.admission = StagingAdmission(
             staging.slots * self.max_blocks,
-            swa_slots * swa_blocks if swa_pools else None,
+            side_slots * side_blocks if family is not None else None,
         )
         self.engine = self._start_engine(
             tensors=self.tensors,
@@ -432,14 +434,15 @@ class PoolTransfer:
             tensors=self.tensors,
             staging_options=staging.options,
         )
-        if swa_pools:
-            self.swa = pool_side_engine.build(
+        if family is not None:
+            self.side = pool_side_engine.build(
                 self,
-                pools=swa_pools,
-                tensors=list(groups.swa),
-                addresses=swa_addresses,
-                slots=swa_slots,
-                max_blocks=swa_blocks,
+                family=family,
+                pools=side_pools,
+                tensors=family.tensors(groups),
+                addresses=side_addresses,
+                slots=side_slots,
+                max_blocks=side_blocks,
             )
         self._log_ready(staging=staging, fingerprint=fingerprint)
 
@@ -504,15 +507,15 @@ class PoolTransfer:
                 "Raiden pipeline transfer requires tpu-sync PP pool-resharding support"
             )
 
-    def _rendezvous(self, *, swa: bool) -> tuple[str, str, tuple[str, str] | None]:
+    def _rendezvous(self, *, side) -> tuple[str, str, tuple[str, str] | None]:
         """Host the shared reshard controller on rank 0 and hand every worker its
-        (reshard service, Raiden controller) addresses, plus the window store's
-        when sliding-window layers have their own engine (``swa``)."""
+        (reshard service, Raiden controller) addresses, plus the second store's
+        when a pool family has its own engine (``side``, the family or None)."""
         from tpu_sync.api.torch.reshard_store import RaidenId, ReshardStore
 
         manager = self.manager
         self.store = None
-        self.swa_store = None
+        self.side_store = None
         addresses = None
         if self.rank == 0:
 
@@ -537,30 +540,31 @@ class PoolTransfer:
 
             self.store = store("pipeline")
             addresses = store_addresses(self.store)
-            if swa:
+            if side is not None:
                 with pool_side_engine.private_native_servers():
-                    self.swa_store = store("pipeline-swa")
-                addresses += store_addresses(self.swa_store)
+                    self.side_store = store(side.store_name)
+                addresses += store_addresses(self.side_store)
         if manager.pp_size > 1:
             addresses = get_parallel().pp_group.broadcast_object(addresses, src=0)
         if manager.attn_tp_size > 1:
             addresses = get_parallel().attn_tp_group.broadcast_object(addresses, src=0)
         # Rank 0 decides from its own layers; every worker must agree with it.
-        if swa != (len(addresses) == 4):
+        local = side is not None
+        if local != (len(addresses) == 4):
             raise ValueError(
                 "Raiden pipeline workers disagree on the sliding-window engine: "
-                f"rank {self.rank} has {'' if swa else 'no '}sliding-window "
-                f"layers but rank 0 has {'none' if swa else 'some'}; with hybrid "
+                f"rank {self.rank} has {'' if local else 'no '}sliding-window "
+                f"layers but rank 0 has {'none' if local else 'some'}; with hybrid "
                 "SWA memory every pipeline stage needs sliding-window layers, so "
                 "pick a stage layout that gives each stage some, or "
                 f"{pool_side_engine.DISABLE_HYBRID_SWA}"
             )
-        return addresses[0], addresses[1], (addresses[2:] if swa else None)
+        return addresses[0], addresses[1], (addresses[2:] if local else None)
 
     def _plan_staging(self, *, reserved_bytes: int) -> StagingPlan:
         """Stage through bounded per-pool leases when the installed Raiden
         supports them, and through checked full mirrors otherwise;
-        ``reserved_bytes`` of the budget belong to the window engine."""
+        ``reserved_bytes`` of the budget belong to the second engine."""
         from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
         slots = self.manager._num_slots(
@@ -768,24 +772,24 @@ class PoolTransfer:
         req_id: str,
         uuid: int,
         full: list[int],
-        swa: list[int],
-        with_swa: bool,
+        side: list[int],
+        with_side: bool,
     ) -> bool:
         """Register one transfer's pages, sliced for the consumer's attention
-        TP, and its window twin; a registration that cannot be made fails the
-        room."""
+        TP, and with ``with_side`` its twin over the second engine's blocks
+        ``side``; a registration that cannot be made fails the room."""
         try:
             dst_attn_tp = self._dst_attn_tp(room)
             spans = part_spans(
                 self.pools,
                 self.tensors,
                 full,
-                swa,
+                side,
                 dst_attn_tp,
                 int(self.manager.kv_args.total_kv_head_num),
                 draft_total_kv_heads=self.draft_kv_heads,
                 draft_swa_total_kv_heads=self.draft_swa_kv_heads,
-                with_swa=with_swa,
+                with_swa=with_side,
             )
             self.client.register_request_blocks(
                 req_id=req_id,
@@ -794,9 +798,9 @@ class PoolTransfer:
                 block_ids=full,
                 pool_spans=spans,
             )
-            if with_swa:
+            if with_side:
                 pool_side_engine.register_twin(
-                    self, req_id=req_id, uuid=uuid, swa=swa, dst_attn_tp=dst_attn_tp
+                    self, req_id=req_id, uuid=uuid, blocks=side, dst_attn_tp=dst_attn_tp
                 )
         except Exception as error:
             self._fail_room(
@@ -805,14 +809,22 @@ class PoolTransfer:
             return False
         return True
 
+    def _worker_fields(self) -> dict:
+        """This worker among its engine's: its transfer rank and their count
+        (a pipeline stage's rank is its pipeline rank)."""
+        return dict(rank=self.rank, workers=self.workers, pp_size=self.manager.pp_size)
+
+    @staticmethod
+    def _source_workers(meta: dict) -> int:
+        """Workers of the engine that sent READY metadata ``meta``."""
+        return int(meta.get("workers", meta["pp_size"]))
+
     def _source_metadata(self, **fields) -> bytes:
-        mgr = self.manager
         return json.dumps(
             dict(
                 controller=self.controller,
                 unit=self.unit_fields,
-                rank=mgr.pp_rank,
-                pp_size=mgr.pp_size,
+                **self._worker_fields(),
                 pool_tags=self._pool_tags(),
                 **fields,
             )
@@ -821,7 +833,7 @@ class PoolTransfer:
     def _pool_tags(self) -> list[str]:
         """Every layer tag of this worker, on either engine."""
         tags = [pool["tag"] for pool in self.pools]
-        return tags + (self.swa.tags if self.swa is not None else [])
+        return tags + (self.side.tags if self.side is not None else [])
 
     def _announce(self, room, item: dict, payload: bytes, aux: bytes, key: str) -> None:
         """Send a PIPELINE_READY frame to every consumer not yet told."""
@@ -842,8 +854,8 @@ class PoolTransfer:
                 req_id=part_req_id(room, part["index"]),
                 uuid=part_uuid(room, part["index"]),
                 full=part["full"],
-                swa=[],
-                with_swa=False,
+                side=[],
+                with_side=False,
             ):
                 return
             part["registered"] = True
@@ -866,9 +878,9 @@ class PoolTransfer:
         return self.fence_executor.submit(probe.cpu)
 
     def stage_ready(
-        self, room: int, full: list[int], swa: list[int], fence: Any
+        self, room: int, full: list[int], side: list[int], fence: Any
     ) -> None:
-        """This stage launched the room's final chunk: full/swa are its page
+        """This stage launched the room's final chunk: full/side are its page
         ids here and fence the make_fence() future of that forward."""
         if not self.stage_parts:
             return
@@ -877,7 +889,7 @@ class PoolTransfer:
         with self.lock:
             if mgr.is_aborted(room) or room in self.stage or room in self.failed:
                 return
-            self.stage[room] = self._new_stage_entry(full, swa, fence)
+            self.stage[room] = self._new_stage_entry(full, side, fence)
             self._advance_stage(room)
 
     def advance_stages(self) -> None:
@@ -891,10 +903,10 @@ class PoolTransfer:
                 if not entry["ready"] and room not in self.failed:
                     self._advance_stage(room)
 
-    def _new_stage_entry(self, full, swa, fence) -> dict:
+    def _new_stage_entry(self, full, side, fence) -> dict:
         return dict(
             full=[int(b) for b in full],
-            swa=[int(b) for b in swa],
+            side=[int(b) for b in side],
             fence=fence,
             ready=False,
             registered=False,
@@ -939,8 +951,8 @@ class PoolTransfer:
                 req_id=stage_req_id(room, group),
                 uuid=stage_uuid(room, group),
                 full=full,
-                swa=entry["swa"],
-                with_swa=True,
+                side=entry["side"],
+                with_side=True,
             ):
                 return
             entry["registered"] = True
@@ -950,15 +962,13 @@ class PoolTransfer:
             group_ranks=group_ranks(group, self.stage_group_size, mgr.pp_size),
             start=entry["start"],
             full=len(entry["full"]) - entry["start"],
-            swa=len(entry["swa"]),
             parts=entry["parts"],
+            **{pool_side_engine.count_key(self): len(entry["side"])},
             **pool_side_engine.source_fields(self),
         )
         self._announce(room, entry, payload, b"", "replied")
         if entry["aux"] is not None:
-            aux_meta = json.dumps(
-                dict(rank=mgr.pp_rank, pp_size=mgr.pp_size, aux_only=True)
-            ).encode()
+            aux_meta = json.dumps(dict(**self._worker_fields(), aux_only=True)).encode()
             self._announce(room, entry, aux_meta, entry["aux"], "aux_replied")
 
     def _early_settled(self, room) -> bool:
@@ -1009,9 +1019,10 @@ class PoolTransfer:
 
     # ----- producer: closing transfer --------------------------------------
 
-    def _closing_entry(self, room, full: list[int], swa: list[int], aux: bytes):
+    def _closing_entry(self, room, full: list[int], side: list[int], aux: bytes):
         """The room's closing transfer: the pages its early parts left, the
-        window and the first-token metadata. Hold the manager's state lock."""
+        second engine's blocks (``side``) and the first-token metadata. Hold
+        the manager's state lock."""
         state = self.early.get(room)
         start = state["offered"] if state else 0
         if full and start >= len(full):
@@ -1024,7 +1035,7 @@ class PoolTransfer:
             full=full[start:],
             start=start,
             parts=len(state["parts"]) if state else 0,
-            swa=swa,
+            side=side,
             aux=aux,
             expires=time.monotonic() + self.manager._timeout_s,
             registered=False,
@@ -1032,7 +1043,7 @@ class PoolTransfer:
         )
 
     def close_early(
-        self, room: int, full: list[int], swa: list[int], aux: bytes = b""
+        self, room: int, full: list[int], side: list[int], aux: bytes = b""
     ) -> None:
         """SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE: register and announce this
         stage's share of the closing transfer before its result point. Its
@@ -1046,7 +1057,7 @@ class PoolTransfer:
                 if room in mgr._aborted or room in self.sent or room in self.failed:
                     return
                 self.sent[room] = self._closing_entry(
-                    room, [int(b) for b in full], [int(b) for b in swa], aux
+                    room, [int(b) for b in full], [int(b) for b in side], aux
                 )
             self._reply(room)
 
@@ -1060,7 +1071,7 @@ class PoolTransfer:
                 if room in mgr._aborted:
                     return False
                 full = list(mgr._prefill.send_blocks.get(room, []))
-                swa = list(mgr._prefill.send_swa_blocks.get(room, []))
+                side = pool_side_engine.sent_blocks(self, room)
                 aux = (
                     b""
                     if aux_index is None
@@ -1072,7 +1083,7 @@ class PoolTransfer:
                     entry = self.stage.get(room)
                     if entry is None:
                         entry = self.stage[room] = self._new_stage_entry(
-                            full, swa, None
+                            full, side, None
                         )
                     # The forward has certainly completed at the result point.
                     entry["fence"] = None
@@ -1081,19 +1092,19 @@ class PoolTransfer:
                     # Closed early: check its pages, and give a last-stage share
                     # sent without first-token metadata the result point's.
                     item = self.sent[room]
-                    if item["full"] != full[item["start"] :] or item["swa"] != swa:
+                    if item["full"] != full[item["start"] :] or item["side"] != side:
                         mismatch = (
                             f"the pages registered before the result point "
-                            f"({len(item['full'])} full, {len(item['swa'])} window) "
+                            f"({len(item['full'])} full, {len(item['side'])} window) "
                             f"differ from the result point's "
-                            f"({len(full) - item['start']}, {len(swa)})"
+                            f"({len(full) - item['start']}, {len(side)})"
                         )
                         self._abort_room(room, mismatch)
                     elif not item["aux"] and aux and mgr.pp_rank == mgr.pp_size - 1:
                         item["aux"] = aux
                         late_aux = True
                 else:
-                    self.sent[room] = self._closing_entry(room, full, swa, aux)
+                    self.sent[room] = self._closing_entry(room, full, side, aux)
                 mgr.update_status(room, KVPoll.Transferring)
             if mismatch is not None:
                 for endpoint in self.replies.get(room, {}):
@@ -1126,7 +1137,7 @@ class PoolTransfer:
         the room's closing share; later ones get it with the share."""
         item = self.sent[room]
         mgr = self.manager
-        meta = json.dumps(dict(rank=mgr.pp_rank, pp_size=mgr.pp_size, aux_only=True))
+        meta = json.dumps(dict(**self._worker_fields(), aux_only=True))
         for endpoint in item["replied"]:
             self._send(
                 endpoint,
@@ -1160,24 +1171,24 @@ class PoolTransfer:
                 req_id=str(room),
                 uuid=room,
                 full=item["full"],
-                swa=item["swa"],
-                with_swa=True,
+                side=item["side"],
+                with_side=True,
             ):
                 self.retired.add(room)
                 return
             item["registered"] = True
         payload = self._source_metadata(
             full=len(item["full"]),
-            swa=len(item["swa"]),
             start=item["start"],
             parts=item["parts"],
+            **{pool_side_engine.count_key(self): len(item["side"])},
             **pool_side_engine.source_fields(self),
         )
         self._announce(room, item, payload, item["aux"], "replied")
 
     # ----- consumer --------------------------------------------------------
 
-    def register_decode(self, room, full, swa, aux_index, infos):
+    def register_decode(self, room, full, side, aux_index, infos):
         self._validate_room(room)
         mgr = self.manager
         ranks = {int(info["pp_rank"]) for info in infos}
@@ -1188,7 +1199,7 @@ class PoolTransfer:
         with self.lock:
             self.receives[room] = Receive(
                 full=list(full),
-                swa=list(swa),
+                side=list(side),
                 aux_index=aux_index,
                 ranks=ranks,
                 sources={},
@@ -1243,7 +1254,8 @@ class PoolTransfer:
             if rank not in request.ranks:
                 raise ValueError(f"Unexpected pipeline source rank {rank}")
             pp_size = int(meta["pp_size"])
-            expected = set(range(pp_size)) if mgr.pp_size == 1 else {mgr.pp_rank}
+            workers = self._source_workers(meta)
+            expected = set(range(workers)) if mgr.pp_size == 1 else {mgr.pp_rank}
             if request.ranks != expected or mgr.pp_size not in (1, pp_size):
                 raise ValueError(
                     "Raiden decode must use DP or the same pipeline stage count"
@@ -1269,9 +1281,9 @@ class PoolTransfer:
                 part["sources"][rank] = meta
             else:
                 request.sources[rank] = meta
-                # A DP/TP decode hears every stage; only the last one holds the
-                # sampled token and the draft hidden states.
-                if mgr.pp_size > 1 or rank == pp_size - 1:
+                # A DP/TP decode hears every worker; of a pipeline's, only the
+                # last one holds the sampled token and the draft hidden states.
+                if mgr.pp_size > 1 or rank == workers - 1:
                     self._write_aux(request, msg[3])
 
     def _write_aux(self, request, blob: bytes) -> None:
@@ -1326,7 +1338,7 @@ class PoolTransfer:
             if time.monotonic() < request.next_attempt:
                 return False
             sources, args, twin = self._plan_closing(room, request)
-            reason = pool_side_engine.unplaceable(args, twin)
+            reason = pool_side_engine.unplaceable(self, args, twin)
             if reason is not None:
                 self._fail_room_held(room, reason)
                 return False
@@ -1343,10 +1355,10 @@ class PoolTransfer:
                         )
                 self.done_recv.add(room)
                 return True
-            if not self._admit(room, request, window=twin is not None):
+            if not self._admit(room, request, twin=twin is not None):
                 return False
             mgr.update_status(room, KVPoll.Transferring)
-            ranks = list(range(int(sources[0]["pp_size"])))
+            ranks = list(range(self._source_workers(sources[0])))
             pool_side_engine.start_twin(
                 self, room, request, key=(), twin=twin, metas=sources, ranks=ranks
             )
@@ -1366,10 +1378,11 @@ class PoolTransfer:
         sources = [request.sources[rank] for rank in sorted(request.ranks)]
         addresses = {source["controller"] for source in sources}
         # A producer without early parts leaves out start and parts.
+        side_key = pool_side_engine.count_key(self)
         geometries = {
             (
                 source["full"],
-                source["swa"],
+                source[side_key],
                 source.get("start", 0),
                 source.get("parts", 0),
             )
@@ -1379,7 +1392,7 @@ class PoolTransfer:
             raise ValueError(
                 "Raiden pipeline sources disagree on request geometry or controller"
             )
-        source_full, source_swa, start, parts = geometries.pop()
+        source_full, source_side, start, parts = geometries.pop()
         request.expected_parts = parts
         if set(request.parts) != set(range(parts)):
             raise ValueError(
@@ -1389,12 +1402,12 @@ class PoolTransfer:
         args = part_destination_blocks(
             self.pools,
             request.full,
-            request.swa,
+            request.side,
             start=start,
             count=source_full,
-            source_swa_count=source_swa,
+            source_swa_count=source_side,
         )
-        twin = pool_side_engine.twin_destination(self, request, swa_count=source_swa)
+        twin = pool_side_engine.twin_destination(self, request, count=source_side)
         if twin is not None and not (
             args["transfer_pool_tags"] or twin["transfer_pool_tags"]
         ):
@@ -1424,16 +1437,16 @@ class PoolTransfer:
             **args,
         )
 
-    def _admit(self, room, request, key: tuple = (), *, window: bool = False) -> bool:
+    def _admit(self, room, request, key: tuple = (), *, twin: bool = False) -> bool:
         """Reserve host staging for one native transfer of the room and, with
-        ``window``, for its twin on the window engine. Raiden seats every
+        ``twin``, for its twin on the second engine. Raiden seats every
         transfer in its own staging slot, so a room moving early parts or
         several stage groups holds one reservation per transfer."""
         key = (room, *key) if key else room
         if key in request.admitted_keys:
             return True
-        window_pages = self.swa.max_blocks if window else 0
-        if not self.admission.admit(key, self.max_blocks, window_pages):
+        twin_blocks = self.side.max_blocks if twin else 0
+        if not self.admission.admit(key, self.max_blocks, twin_blocks):
             return False
         request.admitted_keys.add(key)
         return True
@@ -1485,13 +1498,13 @@ class PoolTransfer:
                 continue
             part["future"] = self._submit_pull(
                 sources,
-                range(int(sources[0]["pp_size"])),
+                range(self._source_workers(sources[0])),
                 req_id=part_req_id(room, index),
                 uuid=part_uuid(room, index),
                 args=part_destination_blocks(
                     self.pools,
                     request.full,
-                    request.swa,
+                    request.side,
                     start=start,
                     count=count,
                     source_swa_count=None,
@@ -1531,30 +1544,31 @@ class PoolTransfer:
                 continue
             if time.monotonic() < state["next_attempt"]:
                 continue
+            side_key = pool_side_engine.count_key(self)
             geometries = {
-                (int(m["start"]), int(m["full"]), int(m["swa"])) for m in metas
+                (int(m["start"]), int(m["full"]), int(m[side_key])) for m in metas
             }
             if len(geometries) != 1:
                 raise ValueError("Raiden pipeline stages of a group disagree on pages")
-            start, count, swa_count = geometries.pop()
+            start, count, side_count = geometries.pop()
             group_tags = set().union(*(set(m["pool_tags"]) for m in metas))
             args = part_destination_blocks(
                 self.pools,
                 request.full,
-                request.swa,
+                request.side,
                 start=start,
                 count=count,
-                source_swa_count=swa_count,
+                source_swa_count=side_count,
                 only_tags=group_tags,
             )
             twin = pool_side_engine.twin_destination(
-                self, request, swa_count=swa_count, only_tags=group_tags
+                self, request, count=side_count, only_tags=group_tags
             )
-            reason = pool_side_engine.unplaceable(args, twin)
+            reason = pool_side_engine.unplaceable(self, args, twin)
             if reason is not None:
                 self._fail_room_held(room, f"group {group}: {reason}")
                 return False
-            if not self._admit(room, request, ("g", group), window=twin is not None):
+            if not self._admit(room, request, ("g", group), twin=twin is not None):
                 return False
             metas = sorted(metas, key=lambda m: int(m["rank"]))
             pool_side_engine.start_twin(
@@ -1783,12 +1797,12 @@ class PoolTransfer:
         mgr = self.manager
         with self.lock:
             status = mgr._poll_engine_status(name="pipeline", engine=self.engine)
-            if self.swa is not None:
+            if self.side is not None:
                 status = pool_side_engine.merge(
                     self,
                     status,
                     mgr._poll_engine_status(
-                        name="pipeline-swa", engine=self.swa.engine
+                        name=self.side.family.store_name, engine=self.side.engine
                     ),
                 )
             if status is not None:
@@ -1874,7 +1888,7 @@ class PoolTransfer:
                     request,
                     state,
                     key=None,
-                    req_id=pool_side_engine.twin_id(room, key),
+                    req_id=self.side.family.twin_id(room, key),
                 )
         for group, state in request.groups.items():
             if state["future"] is not None and state["future"].done():
