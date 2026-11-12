@@ -87,6 +87,25 @@ def profile_points(
     return points
 
 
+def stage_min_samples(
+    reports: list[tuple[int, list[tuple[int, int, float]]]],
+) -> list[list[tuple[int, int, float]]]:
+    """One sample list per pipeline stage from every rank's (stage, samples):
+    the fastest rank of a stage per point. The ranks of a stage meet in its
+    collectives, so a rank that launches late makes the others wait; the
+    shortest time is the step's own device time."""
+    stages: dict[int, dict[tuple[int, int], float]] = {}
+    for stage, samples in reports:
+        timed = stages.setdefault(stage, {})
+        for tokens, prefix, ms in samples:
+            key = (int(tokens), int(prefix))
+            timed[key] = min(timed.get(key, math.inf), float(ms))
+    return [
+        [(tokens, prefix, ms) for (tokens, prefix), ms in sorted(timed.items())]
+        for _, timed in sorted(stages.items())
+    ]
+
+
 @dataclass
 class StepCostModel:
     """Per-stage step time in ms as a function of the step's shape."""
