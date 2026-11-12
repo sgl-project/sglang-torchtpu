@@ -569,6 +569,33 @@ class TpuEnvs:
     # rows (0 off, 256), shared with the native fused-RS MoE (W4A16); the expert dots push raw
     # e2m1 codes to the MXU (MKConfig.qblock).
     SGLANG_TPU_MUSE_MK_QBLOCK = EnvInt(0)
+    # Kernel-level weight layouts (anvil / numerics only); serving raises on them.
+    SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
+    SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
+    # Kernel-sweep knobs (anvil --env), read here so the compile cache keys them; unset = the
+    # tuned default (dev_int). Muse megakernel tile / plan knobs (ops.py).
+    SGLANG_TPU_MUSE_MK_DEV_ROW_TILE = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_PAIR_Y = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_EXPERT_CHUNK = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILE_LOOPS_BUDGET_MIB = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH = EnvInt(None)
+    # EP megakernel arm: auto | a2a | gather; auto takes a2a from EP_MIN_ROWS rows up.
+    SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("auto")
+    SGLANG_TPU_MUSE_MK_EP_MIN_ROWS = EnvInt(None)
+    # EP fp4 experts requantized to one scale per this many K rows (0 off).
+    SGLANG_TPU_EP_QBLOCK = EnvInt(0)
+    # Largest EP block-diagonal arm in rows (ep_mk/experts.BD_ARMS).
+    SGLANG_TPU_EP_BD_MAX = EnvInt(None)
+    # Rows from which EP all-gathers relay through the partner core (gather.PAIR_AG_MIN_ROWS).
+    SGLANG_TPU_EP_GATHER_PAIR_MIN_ROWS = EnvInt(None)
+    # EP megakernel without Pallas bounds checks.
+    SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
+    # Timing only (wrong results): comma-separated EP phases every rank skips (ep_mk/layer.py).
+    SGLANG_TPU_EP_DEV_SKIP = EnvStr("")
+    # EP in-kernel xprof regions: 1 per phase, 2 per expert chunk / arm too.
+    SGLANG_TPU_EP_TRACE = EnvInt(0)
 
     @classmethod
     def names(cls) -> list[str]:
@@ -579,3 +606,9 @@ class TpuEnvs:
 
 envs = TpuEnvs()
 EnvField._allow_set_name = False
+
+
+def dev_int(field: EnvInt, default: int) -> int:
+    """A kernel-sweep knob: its value if set, else the tuned default."""
+    value = field.get()
+    return default if value is None else value

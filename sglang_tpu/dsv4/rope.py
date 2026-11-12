@@ -189,8 +189,9 @@ def _rope_body(
 ) -> None:
     """Process one ``(tile_n, [num_heads,] LANE)`` chunk.
 
-    Without ``quant_dtype`` the rotation is written back into ``x_ref`` in place.
-    With it, the rotated chunk is quantized along the lanes and written to the
+    Without ``quant_dtype`` the whole rotated chunk (NoPE lanes pass through via
+    the identity rotation) is written to the single ``out_ref``. With it, the
+    rotated chunk is quantized along the lanes and written to the
     ``(q_ref, scale_ref)`` outputs instead.
     """
     x = x_ref[...].astype(jnp.float32)
@@ -203,7 +204,8 @@ def _rope_body(
     y = x * cos + rotated * sin
 
     if quant_dtype is None:
-        x_ref[...] = y.astype(out_dtype)
+        (out_ref,) = out_refs
+        out_ref[...] = y.astype(out_dtype)
         return
 
     q_ref, scale_ref = out_refs
@@ -255,14 +257,18 @@ def _kernel(
     )
 
     if quant_dtype is None:
-        del x_hbm_ref  # aliased to the output; read/written through the latter.
+        # ``out`` is aliased onto ``x`` in HBM (as in qnorm_rope), but the VMEM
+        # windows stay separate: input(2) + output(2). Do not merge them into one
+        # ``input_output(..., buffer_count=2)`` window: on JAX < 0.12 the pipeline
+        # prefetches tile i+1 into the slot whose writeback of tile i-1 is only
+        # awaited at the end of the step, so from the third tile on the prefetch
+        # can overwrite rows the output DMA has not read yet.
         (out_hbm_ref,) = out_hbm_refs
-        x_ref_args = (out_hbm_ref,)
-        out_ref_args = ()
-        out_specs = []
-        # input_output since we only update the last rope_dim channels in place.
-        x_alloc = pltpu.BufferedRef.input_output(x_spec, out_dtype, buffer_count=2)
-        out_allocs = ()
+        x_ref_args = (x_hbm_ref,)
+        out_ref_args = (out_hbm_ref,)
+        out_specs = [x_spec]
+        x_alloc = pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2)
+        out_allocs = (pltpu.BufferedRef.output(x_spec, out_dtype, buffer_count=2),)
     else:
         q_hbm_ref, scale_hbm_ref = out_hbm_refs
         x_ref_args = (x_hbm_ref,)

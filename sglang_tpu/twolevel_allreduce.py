@@ -86,15 +86,15 @@ def _comm(world: int, local: int, split_barrier: bool, scratch):
         # Every peer must have entered the kernel (its VMEM buffers exist)
         # before anyone writes into them.
         for p in local_peers:
-            pltpu.semaphore_signal(barrier, m, device_id=(p,), device_id_type=mesh_id)
+            pl.semaphore_signal(barrier, m, device_id=(p,), device_id_type=mesh_id)
         for p in remote_peers:
-            pltpu.semaphore_signal(barrier, 1, device_id=(p,), device_id_type=mesh_id)
+            pl.semaphore_signal(barrier, 1, device_id=(p,), device_id_type=mesh_id)
 
     def wait():
         if split:
-            pltpu.semaphore_wait(barrier, local_wait)
+            pl.semaphore_wait(barrier, local_wait)
         else:
-            pltpu.semaphore_wait(barrier, local_wait + nr)
+            pl.semaphore_wait(barrier, local_wait + nr)
 
     def exchange(src, gather, slot, peers, send_sem, recv_sem):
         copies = []
@@ -126,11 +126,11 @@ def _comm(world: int, local: int, split_barrier: bool, scratch):
         if groups > 1:
             if split:
                 lax.while_loop(
-                    lambda c: lax.rem(pltpu.semaphore_read(barrier), m) != nr,
+                    lambda c: lax.rem(pl.semaphore_read(barrier), m) != nr,
                     lambda c: c + 1,
                     jnp.int32(0),
                 )
-                pltpu.semaphore_wait(barrier, nr)
+                pl.semaphore_wait(barrier, nr)
             exchange(part, gather2, grp, remote_peers, s2, r2)
             return jnp.sum(gather2[...].astype(jnp.float32), axis=0)
         return part[...].astype(jnp.float32)

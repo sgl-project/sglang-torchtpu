@@ -51,13 +51,13 @@ all-gather.
 
 import functools
 import math
-import os
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel.mk.coll import (  # noqa: F401
     _Coll,
 )
@@ -6488,7 +6488,7 @@ def megakernel_call(cfg: MKConfig, axis: str = "model", ep: EPHook | None = None
                 vmem_limit_bytes=cfg.vmem_limit_bytes,
                 collective_id=_COLLECTIVE_ID if cfg.tp > 1 else None,
                 disable_bounds_checks=ep is not None
-                and os.environ.get("SGLANG_TPU_EP_NO_BOUNDS") == "1",
+                and tpu_envs.SGLANG_TPU_EP_NO_BOUNDS.get(),
             ),
             name=f"muse_{'ep_' if ep else ''}megakernel_r{cfg.rows}_q{cfg.rows_per_req}",
         )

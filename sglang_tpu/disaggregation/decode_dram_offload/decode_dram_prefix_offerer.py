@@ -5,6 +5,7 @@ turn, and keep it pinned until the prefill's read settled.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any, Dict, List
 
 import torch.distributed as dist
@@ -20,6 +21,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
 from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
     DramOffloadWorkerContext,
 )
+from sglang_tpu.pd_decode_swa_hicache import swa_window_restore
 
 
 class DecodeDramPrefixOfferer:
@@ -45,17 +47,25 @@ class DecodeDramPrefixOfferer:
         key = prefix_radix_key(
             req=req, num_tokens=offer_limit(req=req, page_size=ctx.page_size)
         )
-        # Matching can split radix nodes but never starts a load-back.
-        match = ctx.cache.match_prefix(MatchPrefixParams(key=key))
-        # The deepest matched prefix whose full KV is whole in host RAM.
-        node, pages = deepest_host_backed_path(
-            ctx.cache, ctx.host_pool, match.best_match_node
+        # Matching can split radix nodes but never starts a load-back. On a
+        # hybrid model it counts the windows in host RAM for this match only.
+        with swa_window_restore() if ctx.window_tokens else contextlib.nullcontext():
+            match = ctx.cache.match_prefix(MatchPrefixParams(key=key))
+        # The deepest matched prefix whose full KV, and window, is whole in
+        # host RAM.
+        node, pages, swa_pages = deepest_host_backed_path(
+            ctx.cache,
+            ctx.host_pool,
+            match.best_match_node,
+            swa_host_pool=ctx.swa_host_pool,
+            window_tokens=ctx.window_tokens,
+            page_size=ctx.page_size,
         )
-        if not ctx.lockstep.agree([len(pages or ())]) or not pages:
+        if not ctx.lockstep.agree([len(pages or ()), len(swa_pages)]) or not pages:
             return
         # The prefill reads pages of every node of the path.
         self.offers[req.bootstrap_room] = lock_host_path(ctx.cache, node)
-        ctx.channel.offer_resident_prefix(req.bootstrap_room, pages)
+        ctx.channel.offer_resident_prefix(req.bootstrap_room, pages, swa_pages)
 
     def settle_offers(self) -> None:
         """Close the offers of departed requests and unpin those whose read

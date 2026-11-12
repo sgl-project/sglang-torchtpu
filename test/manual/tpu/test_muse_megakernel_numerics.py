@@ -1361,6 +1361,9 @@ def main() -> None:
         raise RuntimeError(f"needs {TP} processes, got {dist.get_world_size()}")
     torch.set_num_threads(max(1, (os.cpu_count() or 8) // TP))
     torch._dynamo.config.cache_size_limit = 256
+    # The AOTAutograd key misses the kernel config the op picks while tracing: a persistent
+    # entry (TORCHINDUCTOR_CACHE_DIR, /tmp/torchinductor_* by default) replays without tracing
+    torch.compiler.config.force_disable_caches = True
     from sglang_tpu.muse_megakernel import kernel as K
     from sglang_tpu.muse_megakernel import ops
 

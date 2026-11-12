@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from array import array
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import msgspec
 import torch.distributed as dist
@@ -44,8 +44,10 @@ _MAX_UNAGREED_ROUNDS = 8
 class _DramLanding(msgspec.Struct):
     push: Any
     indices: Any
-    # The native read into ``indices``; None where it could not start.
-    read_id: Optional[str] = None
+    # Host pages reserved for the window of a hybrid model.
+    swa_indices: Any = None
+    # The native reads that started, into ``indices`` and ``swa_indices``.
+    read_ids: List[str] = msgspec.field(default_factory=list)
     # A rank's read did not start: the pages wait for the reads that did,
     # then are freed.
     failed: bool = False
@@ -59,6 +61,8 @@ class DecodeDramVictimReceiver:
         self._cache = ctx.cache
         self._page_size = ctx.page_size
         self._host_pool = ctx.host_pool
+        self._swa_host_pool = ctx.swa_host_pool
+        self._window_tokens = ctx.window_tokens
         self._lockstep = ctx.lockstep
         self._iterations = 0
         self._rounds = 0
@@ -111,7 +115,11 @@ class DecodeDramVictimReceiver:
             (
                 *key,
                 *push_manifest(
-                    push.tokens, push.extra_key, push.cache_salt, len(push.blocks)
+                    push.tokens,
+                    push.extra_key,
+                    push.cache_salt,
+                    len(push.blocks),
+                    len(push.swa_blocks),
                 ),
             ): key
             for key, push in received.items()
@@ -137,34 +145,79 @@ class DecodeDramVictimReceiver:
         )
 
     def _reserve_host_pages_and_read(self, key: Tuple[str, int], push: Any) -> bool:
+        """Reserve host pages for the push's full KV and, on a hybrid model,
+        its window, then start the native reads into them."""
         num_tokens = len(push.tokens)
-        pool = self._host_pool
-        # The manifest agreement made the push's tokens and blocks the same on
-        # every rank; the most host room any rank is short of is evicted.
-        short = self._lockstep.max(max(0, num_tokens - pool.available_size()))
+        swa_tokens = len(push.swa_blocks) * self._page_size
+        self._make_host_room(num_tokens, swa_tokens)
+        allocated = alloc_host_pages_agreed(
+            lockstep=self._lockstep,
+            pools=[(self._host_pool, num_tokens), (self._swa_host_pool, swa_tokens)],
+        )
+        if allocated is None:
+            return False
+        indices, swa_indices = allocated
+        landing = _DramLanding(push=push, indices=indices, swa_indices=swa_indices)
+        started = (not push.blocks or self._start_full_read(landing)) and (
+            not push.swa_blocks or self._start_window_read(landing)
+        )
+        # A rank whose read started cannot release its live destination, so
+        # all ranks keep their allocations until the started reads settle.
+        landing.failed = not self._lockstep.all(started)
+        self._landings[key] = landing
+        self.stats["granted"] += 1
+        return True
+
+    def _make_host_room(self, num_tokens: int, swa_tokens: int) -> None:
+        """Evict until every rank has room for the push in each host pool. The
+        manifest agreement made the push's tokens and blocks the same on every
+        rank; one collective finds the most room any rank is short of."""
+        pool, swa_pool = self._host_pool, self._swa_host_pool
+        short, swa_short = self._lockstep.reduce(
+            [
+                [
+                    max(0, num_tokens - pool.available_size()),
+                    max(0, swa_tokens - swa_pool.available_size()) if swa_tokens else 0,
+                ]
+            ],
+            dist.ReduceOp.MAX,
+        )[0]
         if short:
             self._cache.evict_host(short, ComponentType.FULL)
-        indices = alloc_host_pages_agreed(
-            lockstep=self._lockstep, pool=pool, num_tokens=num_tokens
-        )
-        if indices is None:
-            return False
-        landing = _DramLanding(push=push, indices=indices)
+        if swa_short:
+            self._cache.evict_host(swa_short, ComponentType.SWA)
+
+    def _start_full_read(self, landing: _DramLanding) -> bool:
+        """Read the pushed full pages into the landing's full pages."""
+        push = landing.push
         read_id = victim_transfer_id(push.prefill, push.seq)
-        if self._channel.start_host_read(
+        started = self._channel.start_host_read(
             read_id,
             push.uuid,
             push.address,
             list(push.blocks),
-            host_page_ids(self._host_pool, indices),
-        ):
-            landing.read_id = read_id
-        # A rank whose read started cannot release its live destination, so
-        # all ranks keep their allocations until the started reads settle.
-        landing.failed = not self._lockstep.all(landing.read_id is not None)
-        self._landings[key] = landing
-        self.stats["granted"] += 1
-        return True
+            host_page_ids(self._host_pool, landing.indices),
+        )
+        if started:
+            landing.read_ids.append(read_id)
+        return started
+
+    def _start_window_read(self, landing: _DramLanding) -> bool:
+        """Read the pushed window pages into the landing's SWA pages; the
+        prefill registered them under the push's UUID on its SWA pool."""
+        push = landing.push
+        read_id = victim_transfer_id(push.prefill, push.seq, swa=True)
+        started = self._channel.start_host_read(
+            read_id,
+            push.uuid,
+            push.swa_address,
+            list(push.swa_blocks),
+            host_page_ids(self._swa_host_pool, landing.swa_indices),
+            swa=True,
+        )
+        if started:
+            landing.read_ids.append(read_id)
+        return started
 
     def finish_agreed_landings(self) -> None:
         """Insert, or free, the landings whose read settled on every rank, and
@@ -176,11 +229,7 @@ class DecodeDramVictimReceiver:
         rows = []
         for key in keys:
             landing = self._landings[key]
-            received = (
-                False
-                if landing.read_id is None
-                else self._channel.poll_host_read(landing.read_id)
-            )
+            received = self._channel.poll_host_reads(landing.read_ids)
             rows.append(
                 [
                     int(received is not None),
@@ -192,15 +241,19 @@ class DecodeDramVictimReceiver:
             if not settled:
                 continue
             landing = self._landings.pop(key)
-            if landing.read_id is not None:
-                self._channel.forget_host_read(landing.read_id)
+            self._channel.forget_host_reads(landing.read_ids)
             if received:
                 stored = self._insert_host_only_branch(landing)
             else:
-                self._host_pool.free(landing.indices)
+                self._free_landing(landing)
                 self.stats["failed"] += 1
                 stored = False
             self._ack_prefill(landing.push, stored=stored)
+
+    def _free_landing(self, landing: _DramLanding) -> None:
+        self._host_pool.free(landing.indices)
+        if landing.swa_indices is not None:
+            self._swa_host_pool.free(landing.swa_indices)
 
     def _insert_host_only_branch(self, landing: _DramLanding) -> bool:
         push = landing.push
@@ -213,6 +266,7 @@ class DecodeDramVictimReceiver:
             ),
             landing.indices,
             self._page_size,
+            swa_indices=landing.swa_indices,
         )
         if inserted is None:
             self.stats["dropped"] += 1

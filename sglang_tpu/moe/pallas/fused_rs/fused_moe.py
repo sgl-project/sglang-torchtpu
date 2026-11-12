@@ -171,6 +171,11 @@ def moe_gmm_local_rs_nodedup(
     """
     num_tokens = hidden_states_local.shape[0]
     # Rank-4 weights stack layers (Muse megakernel expert groups): group_offset[1] picks one.
+    if w1.ndim == 4 and group_offset.shape[0] < 2:
+        raise ValueError(
+            f"stacked (rank-4) expert weights need group_offset = [expert_offset, layer], "
+            f"got shape {group_offset.shape}"
+        )
     w1_shape = w1.shape[1:] if w1.ndim == 4 else w1.shape
     w2_shape = w2.shape[1:] if w2.ndim == 4 else w2.shape
     hidden_size = w2_shape[-1]
@@ -430,6 +435,10 @@ def expert_parallel_gmm_rs(
         P(combine_partition_axes(MLP_DATA, expert_axis), None) if sp_enabled else P()
     )
     topk_i_spec = P(MLP_DATA, None) if sp_enabled else P()
+    if w1.ndim == 4 and group_offset_input is None:
+        raise ValueError(
+            "stacked (rank-4) expert weights need group_offset_input = [expert_offset, layer]"
+        )
     num_experts = w1.shape[1] if w1.ndim == 4 else w1.shape[0]
     num_experts_per_shard = num_experts // ep_size
     group_offset = (
