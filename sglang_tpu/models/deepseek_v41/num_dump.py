@@ -31,6 +31,9 @@ POINTS = (
 )
 _ROWS, _COLS = 128, 20480
 _BUF: dict = {}
+# Exact-shape buffers written with a whole-tensor copy_ (no slice of a wider
+# buffer): [rows, 4] per-row stats computed in-graph, and [rows, 5120] embedding.
+_EXACT: dict = {}
 _COUNT = [0]
 _HASHER: list = []
 _SHAPES: dict = {}
@@ -38,6 +41,9 @@ _OUT = "/tmp/dsv41_dump"
 
 
 def _ensure(device):
+    if not _EXACT:
+        _EXACT["embed_stats"] = torch.zeros(_ROWS, 4, device=device)
+        _EXACT["embed_exact"] = torch.zeros(_ROWS, 5120, device=device)
     if not _BUF:
         for layer in LAYERS:
             for p in POINTS:
@@ -100,6 +106,19 @@ def embed_forward(original, embed, input_):
     # the output: tells a miscompiled gather from a bad dump copy.
     _put("embed_ref", 0, embed.weight.index_select(0, input_.reshape(-1).long()))
     _put("embed_clone", 0, out.clone())
+    if _EXACT:
+        # In-graph check that needs no wide-buffer slice: cosine of each row
+        # against weight[id], and the row norms, padded to _ROWS rows.
+        o = out.reshape(out.shape[0], -1).float()
+        w = embed.weight.index_select(0, input_.reshape(-1).long()).float()
+        cos = (o * w).sum(-1) / (o.norm(dim=-1) * w.norm(dim=-1) + 1e-12)
+        stats = torch.stack(
+            [cos, o.norm(dim=-1), w.norm(dim=-1), input_.reshape(-1).float()], -1
+        )
+        pad = _ROWS - stats.shape[0]
+        if pad >= 0 and o.shape[1] == 5120:
+            _EXACT["embed_stats"].copy_(torch.nn.functional.pad(stats, (0, 0, 0, pad)))
+            _EXACT["embed_exact"].copy_(torch.nn.functional.pad(o, (0, 0, 0, pad)))
     return out
 
 
@@ -107,6 +126,8 @@ def before_forward(device) -> None:
     # Zero every slot so a point not reached this forward reads 0, not the
     # previous forward's rows.
     for buf in _ensure(device).values():
+        buf.zero_()
+    for buf in _EXACT.values():
         buf.zero_()
     _SHAPES.clear()
 
@@ -135,6 +156,8 @@ def after_forward(forward_batch) -> None:
     for layer in LAYERS:
         for p in POINTS:
             rec[f"{p}{layer}"] = _BUF[(p, layer)][:t].cpu()
+    for name, buf in _EXACT.items():
+        rec[name] = buf[:t].cpu()
     n = _COUNT[0]
     _COUNT[0] += 1
     torch.save(rec, f"{_OUT}/{n:04d}_{rec['mode']}_r{rank}.pt")
