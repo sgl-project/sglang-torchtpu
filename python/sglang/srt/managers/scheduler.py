@@ -470,6 +470,9 @@ class Scheduler(
     kv_free_fence: Optional["KVFreeFence"] = None
     # Draft KV pools cpu_tensor retraction backs up with the target KV.
     retraction_draft_kv_pools: tuple = ()
+    _tpu_prefill_drain_interval: int = 0
+    _tpu_drain_step_counter: int = 0
+    _tpu_drain_prefill: bool = False
 
     def __init__(
         self,
@@ -1393,6 +1396,9 @@ class Scheduler(
 
         self._tpu_pp_chunk_cost = None
         self._tpu_pp_cached_prefix = {}
+        self._tpu_prefill_drain_interval = 0
+        self._tpu_drain_step_counter = 0
+        self._tpu_drain_prefill = False
         if current_platform.is_tpu() and get_parallel().pp_size > 1:
             from sglang_tpu.pp_chunk_scheduler import (
                 profile_and_install_cost_model,
@@ -1420,7 +1426,35 @@ class Scheduler(
         if sizer.profile_and_fit():
             self.dynamic_chunk_sizer = sizer
 
-    def _should_defer_prefill(self) -> bool:
+    def _should_defer_prefill(
+        self, running_batch: Optional[ScheduleBatch] = None
+    ) -> bool:
+        if self._tpu_prefill_drain_interval > 0:
+            if self._tpu_drain_step_counter % self._tpu_prefill_drain_interval == 0:
+                self._tpu_drain_prefill = True
+            # Never interrupt an in-progress multi-chunk prefill request.
+            if self.chunked_req is not None:
+                return False
+            # If this rank has no running decode requests and the cluster is either
+            # starting from idle or already running EXTEND on a peer rank, join the wave.
+            if (
+                running_batch is not None
+                and running_batch.is_empty()
+                and (
+                    not self.require_mlp_sync
+                    or self.last_batch is None
+                    or self.last_batch.is_extend_in_batch
+                )
+            ):
+                self._tpu_drain_prefill = True
+                return False
+            if self._tpu_drain_prefill:
+                if len(self.waiting_queue) == 0:
+                    self._tpu_drain_prefill = False
+                    return True
+                return False
+            return True
+
         if self._prefill_decode_interval_remaining == 0:
             return False
 
@@ -4059,12 +4093,21 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
-        elif self._should_defer_prefill():
+        elif self._should_defer_prefill(running_batch):
             new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+            if (
+                self._tpu_prefill_drain_interval > 0
+                and self._tpu_drain_prefill
+                and new_batch is None
+                and self.chunked_req is None
+            ):
+                # Close drain when local KV/Mamba/running-slot capacity cannot admit
+                # any waiting request, preventing an out-of-turn EXTEND mid-decode.
+                self._tpu_drain_prefill = False
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -4105,6 +4148,12 @@ class Scheduler(
             )
         ret = converted
         self._arm_prefill_decode_interval(ret)
+        if self._tpu_prefill_drain_interval > 0:
+            if ret is None:
+                self._tpu_drain_step_counter = 0
+                self._tpu_drain_prefill = False
+            else:
+                self._tpu_drain_step_counter += 1
 
         # Handle ngram embedding
         ret = self.ngram_embedding_manager.prepare_for_forward(

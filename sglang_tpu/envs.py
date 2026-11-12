@@ -294,6 +294,12 @@ class TpuEnvs:
     # larger batches use gmm_v2.
     SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS = EnvInt(256)
 
+    # Synchronized full-queue prefill drain interval (in active scheduler steps) for
+    # TPU DP attention. When > 0, all DP ranks open prefill drain together every N
+    # steps, drain waiting_queue without interrupting multi-chunk requests, and defer
+    # new prefills during the N-step pure decode window. 0 disables.
+    SGLANG_TPU_PREFILL_DRAIN_INTERVAL = EnvInt(0)
+
     # DSA indexer, decode-sized batches: quantize and store the index keys with
     # one Pallas kernel (attention/pallas/dsa_key_store.py, same bytes as the
     # XLA path); False keeps the XLA whole-row scatter for every batch.
