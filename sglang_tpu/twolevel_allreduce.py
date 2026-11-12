@@ -39,6 +39,7 @@ _COLLECTIVE_ID = 1
 _OPS: dict = {}
 # Plain bool, not dict truthiness: Dynamo traces the eligibility checks.
 _READY = False
+_TWOSHOT_WORLD = 0
 # Set (while Dynamo traces / Python runs the decode forward) when a tagged
 # attention o_proj skipped its all-reduce so that the following attention-residual
 # aggregation runs it fused (all_reduce_attn_res); consumed by that aggregation.
@@ -452,11 +453,13 @@ def _build(world: int, local: int, n: int, split_barrier: bool = False, norm=Fal
 VALIDATED_TOPOLOGIES = frozenset({(4, 8), (1, 8)})
 
 
-def _check_ranks_agree(enabled: bool) -> None:
+def _check_ranks_agree(
+    enabled: bool,
+    env_name: str = "SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE",
+) -> None:
     """Every rank must take the same path: if one host missed the switch, its
-    ranks would stay on XLA's all-reduce while the others wait in the Pallas
-    barrier, and the first single-token decode would hang. Fail at startup
-    instead."""
+    ranks would stay on XLA's collective while the others wait in the Pallas
+    barrier, and the first collective call would hang. Fail at startup instead."""
     import torch.distributed as dist
 
     from sglang.srt.distributed.parallel_state import get_world_group
@@ -469,16 +472,16 @@ def _check_ranks_agree(enabled: bool) -> None:
     if len(set(seen)) > 1:
         on = [rank for rank, flag in enumerate(seen) if flag]
         raise RuntimeError(
-            "SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE must be set the same on every "
-            f"rank; it is on for ranks {on} only."
+            f"{env_name} must be set the same on every rank; it is on for ranks {on} only."
         )
-    # The barrier protocol (signal weights) must match too.
-    split = bool(tpu_envs.SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER.get())
-    dist.all_gather_object(seen, split, group=world_group.cpu_group)
-    if len(set(seen)) > 1:
-        raise RuntimeError(
-            f"SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER differs between ranks: {seen}"
-        )
+    if env_name == "SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE":
+        # The barrier protocol (signal weights) must match too.
+        split = bool(tpu_envs.SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER.get())
+        dist.all_gather_object(seen, split, group=world_group.cpu_group)
+        if len(set(seen)) > 1:
+            raise RuntimeError(
+                f"SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER differs between ranks: {seen}"
+            )
 
 
 def register(world: int, local: int) -> None:
@@ -498,6 +501,66 @@ def register(world: int, local: int) -> None:
 def register_from_parallel_state() -> None:
     """Called from TpuPlatform.prepare_model_parallel_groups (every rank, after
     the groups exist, before the first collective)."""
+    twoshot_enabled = bool(tpu_envs.SGLANG_TPU_ENABLE_TWOSHOT_ALLREDUCE.get())
+    _check_ranks_agree(twoshot_enabled, "SGLANG_TPU_ENABLE_TWOSHOT_ALLREDUCE")
+    if twoshot_enabled:
+        import torch.distributed as dist
+
+        from sglang.srt.distributed.parallel_state import (
+            get_tensor_model_parallel_world_size,
+        )
+        from sglang.srt.runtime_context import get_server_args
+
+        world = get_tensor_model_parallel_world_size()
+        server_args = get_server_args()
+        if world > 1 and world == dist.get_world_size() and server_args.nnodes == 1:
+            from sglang_tpu.twoshot_all_reduce import (
+                TWOSHOT_ALL_REDUCE_MAX_BYTES,
+                get_twoshot_all_reduce_op,
+            )
+
+            get_twoshot_all_reduce_op(world)
+            global _TWOSHOT_WORLD
+            _TWOSHOT_WORLD = world
+            logger.info(
+                "Two-shot Pallas all-reduce on: TP %d (<= %d bytes).",
+                world,
+                TWOSHOT_ALL_REDUCE_MAX_BYTES,
+            )
+        else:
+            logger.info(
+                "Two-shot Pallas all-reduce off: TP=%d world=%d nnodes=%d.",
+                world,
+                dist.get_world_size(),
+                server_args.nnodes,
+            )
+
+    rdma_ag_enabled = bool(tpu_envs.SGLANG_TPU_ENABLE_RDMA_ALL_GATHER.get())
+    _check_ranks_agree(rdma_ag_enabled, "SGLANG_TPU_ENABLE_RDMA_ALL_GATHER")
+    if rdma_ag_enabled:
+        import torch.distributed as dist
+
+        from sglang.srt.distributed.parallel_state import (
+            get_tensor_model_parallel_world_size,
+        )
+        from sglang.srt.runtime_context import get_server_args
+
+        world = dist.get_world_size()
+        tp_world = get_tensor_model_parallel_world_size()
+        server_args = get_server_args()
+        if world > 1 and tp_world == world and server_args.nnodes == 1:
+            from sglang_tpu.rdma_all_gather import register_rdma_all_gather
+
+            register_rdma_all_gather(world)
+            logger.info("Direct Pallas RDMA all-gather registered: world=%d.", world)
+        else:
+            logger.info(
+                "Direct Pallas RDMA all-gather off: tp=%d world=%d nnodes=%d.",
+                tp_world,
+                world,
+                server_args.nnodes,
+            )
+
     enabled = tpu_envs.SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE.get()
     _check_ranks_agree(enabled)
     if not enabled:
@@ -561,13 +624,34 @@ def eligible(t: torch.Tensor) -> bool:
     )
 
 
+def eligible_twoshot(t: torch.Tensor, world_size: int) -> bool:
+    from sglang_tpu.twoshot_all_reduce import TWOSHOT_ALL_REDUCE_MAX_BYTES
+
+    return (
+        t.dim() == 2
+        and t.dtype == torch.bfloat16
+        and 0 < t.numel() * 2 <= TWOSHOT_ALL_REDUCE_MAX_BYTES
+        and t.shape[1] % (128 * world_size) == 0
+    )
+
+
 def all_reduce_around(original, group, input_: torch.Tensor) -> torch.Tensor:
     """AROUND hook for ``GroupCoordinator.all_reduce``."""
     from sglang.srt.distributed.parallel_state import get_tp_group
 
-    if not (_READY and group is get_tp_group() and eligible(input_)):
-        return original(group, input_)
-    return _OPS[1](input_)
+    if _READY and group is get_tp_group() and eligible(input_):
+        return _OPS[1](input_)
+    if _TWOSHOT_WORLD > 1 and eligible_twoshot(input_, _TWOSHOT_WORLD):
+        from sglang.srt.runtime_context import get_parallel
+
+        par = get_parallel()
+        if group is get_tp_group() or (
+            par.attn_tp_size == _TWOSHOT_WORLD and group is par.attn_tp_group
+        ):
+            from sglang_tpu.twoshot_all_reduce import twoshot_all_reduce_tensor
+
+            return twoshot_all_reduce_tensor(input_, _TWOSHOT_WORLD)
+    return original(group, input_)
 
 
 def _fusable_norm(norm, latent: torch.Tensor) -> bool:

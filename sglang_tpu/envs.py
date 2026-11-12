@@ -293,6 +293,14 @@ class TpuEnvs:
     # runs with the fused MoE decode kernel (`sglang_tpu/moe/pallas/fused_moe_decode`);
     # larger batches use gmm_v2.
     SGLANG_TPU_FUSED_MOE_DECODE_MAX_TOKENS = EnvInt(256)
+    # Route eligible 2D bf16 TP all-reduces (at most 256 KiB, e.g. BS at most
+    # 32 at H=4096) through the two-shot Pallas VMEM remote-DMA all-reduce
+    # kernel via GroupCoordinator.all_reduce.
+    SGLANG_TPU_ENABLE_TWOSHOT_ALLREDUCE = EnvBool(False)
+    # Route Dynamo-traced world-wide all_gather_into_tensor calls through a direct
+    # Pallas VMEM-to-HBM remote-DMA all-gather ordered by PyTorch rank instead
+    # of XLA's reg_all_gather_into_tensor.
+    SGLANG_TPU_ENABLE_RDMA_ALL_GATHER = EnvBool(False)
 
     # DSA indexer, decode-sized batches: quantize and store the index keys with
     # one Pallas kernel (attention/pallas/dsa_key_store.py, same bytes as the

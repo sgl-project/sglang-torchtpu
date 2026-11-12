@@ -82,6 +82,9 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
+from sglang_tpu.hooks.rdma_all_gather import (
+    all_gather_into_tensor as rdma_all_gather_into_tensor,
+)
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
@@ -264,6 +267,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce",
         twolevel_all_reduce,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather_into_tensor",
+        rdma_all_gather_into_tensor,
         HookType.AROUND,
     ),
     (

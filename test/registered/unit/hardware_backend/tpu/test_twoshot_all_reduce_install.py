@@ -100,5 +100,24 @@ def test_forward_goes_two_shot_for_decode_payloads_only(monkeypatch):
     assert calls == [8]
 
 
+def test_twoshot_all_reduce_tensor_ensures_own_storage(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        twoshot_all_reduce,
+        "get_twoshot_all_reduce_op",
+        lambda world_size: (
+            lambda t: (
+                seen.append((t.storage_offset(), t.untyped_storage().nbytes()))
+                or t + world_size
+            )
+        ),
+    )
+    backing = torch.arange(32, dtype=torch.bfloat16).reshape(4, 8)
+    view = backing[1:3]
+    out = twoshot_all_reduce.twoshot_all_reduce_tensor(view, world_size=8)
+    assert torch.equal(out, view + 8)
+    assert seen == [(0, view.numel() * view.element_size())]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
