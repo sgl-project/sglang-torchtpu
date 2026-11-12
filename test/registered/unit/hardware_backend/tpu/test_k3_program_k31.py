@@ -461,11 +461,16 @@ class TestSelectedAttention(CustomTestCase):
                 offset = local_page * self.page_tokens + position % self.page_tokens
                 self.ws.pages[slot] = jnp.where(tokens(x) == offset, latent.astype(x.dtype)[None, None, :], x)
 
+        def _zero_slot(self, slot):
+            x = self.ws.pages[slot]
+            self.ws.pages[slot] = jnp.zeros(x.shape, x.dtype)
+
         mla_dcp.DcpAttention._pages = _pages
         mla_dcp.DcpAttention._clean_step = _clean_step
+        mla_dcp.DcpAttention._zero_slot = _zero_slot
         mla_dcp.DcpAttention._cache_verify_row = _cache_verify_row
 
-        def case(firsts, S, topk, seed, grouped=False, activity="exact"):
+        def case(firsts, S, topk, seed, grouped=False, activity="exact", poison=False):
             mla_dcp._grouped_spec = ((lambda b, g, h, rows: rows in (4, 8) and b % 4 == 0) if grouped
                                      else (lambda *a: False))
             rng = np.random.default_rng(seed)
@@ -522,6 +527,8 @@ class TestSelectedAttention(CustomTestCase):
                                            active=act_r, steps=steps)
                 att = mla_dcp.DcpAttention(cache, ws, pos, B, selection=sel, sequence_rows=S,
                                            cache_verify_rows=S > 1)
+                if poison:  # another scoped region's bytes: NaN where no step loads a page
+                    ws.pages[...] = jnp.full(ws.pages.shape, jnp.nan, ws.pages.dtype)
                 att.prime()
                 out_r[...] = att.attend(q_r[...], new_r[...], 0)
 
@@ -566,6 +573,7 @@ class TestSelectedAttention(CustomTestCase):
         case([1500, 3000], 4, 200, 1, grouped=True)
         case([2047, 600, 64, 3000], 2, 128, 2)
         case([700, 5000], 1, 64, 3, activity="none")
+        case([700, 9000], 1, 8, 4, poison=True)  # skipped steps on never-loaded slots stay finite
         print("OK")
     """
 

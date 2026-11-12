@@ -551,9 +551,24 @@ class DcpAttention:
     def _wait_step(self, step):
         if self.selection is not None and self.selection.active is not None:
             row, local_step, _ = self._locate(step)
-            pl.when(self._active(row, local_step))(lambda: self._wait_copies(step))
+            active = self._active(row, local_step)
+            pl.when(active)(lambda: self._wait_copies(step))
+            # A skipped step loads nothing and its P.V still reads the slot (with
+            # zero weights): a slot's first use in the layer may hold another scoped
+            # region's bytes, which can read as NaN. Later uses hold loaded pages.
+            pl.when(jnp.logical_not(active) & (step < self.buffers))(
+                lambda: self._zero_slot(step % self.buffers))
             return
         self._wait_copies(step)
+
+    def _zero_slot(self, slot):
+        """Page slot ``slot`` zeroed (as 32-bit rows, a tile at a time)."""
+        words = (self.ws.pages.bitcast(jnp.uint32).at[slot] if self.native
+                 else self.ws.pages.bitcast(jnp.uint32).at[slot].reshape(self.span * self.page_rows, LANES))
+
+        @pl.loop(0, words.shape[0] // 8)
+        def _(t):
+            words[pl.ds(pl.multiple_of(t * 8, 8), 8), :] = jnp.zeros((8, words.shape[1]), jnp.uint32)
 
     def _wait_copies(self, step):
         slot = step % self.buffers
