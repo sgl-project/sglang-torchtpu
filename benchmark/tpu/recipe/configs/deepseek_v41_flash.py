@@ -39,7 +39,10 @@ CONFIG["server_args"].update(
         "mem_fraction_static": 0.85,
         "enable_torch_compile": True,
         "tpu_compile_tokens": [128, 256, 512, 1024],
-        "tpu_compile_bs": [1, 8],
+        # Decode pads to bs 8, as vllm-torchtpu's MIN_NUM_SEQS = 8 does: the
+        # bs=1 decode graph returns NaN logits (CSA2's batch == 1 fixed-tile
+        # path is unvalidated there and here).
+        "tpu_compile_bs": [8],
         "torch_compile_max_bs": 8,
         "disable_radix_cache": True,
         "random_seed": 1234,
