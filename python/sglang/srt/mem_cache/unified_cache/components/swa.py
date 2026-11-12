@@ -971,6 +971,18 @@ class SWAComponent(TreeComponent):
                 break
             cur = cur.parent
 
+    def _should_demote_stale_windows(self, req: Req) -> bool:
+        # Normal Python text requests demote their obsolete prefill windows.
+        # Explicit retention policies keep their existing ordering and opt-ins.
+        return self._evict_stale_windows_first or (
+            self.cache._tree_core_backend == "python"
+            and req.multimodal_inputs is None
+            and not self.cache.enable_session_radix_cache
+            and not self.demotes_final_windows
+            and not self.cap_enabled
+            and not envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS.get()
+        )
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -1060,7 +1072,7 @@ class SWAComponent(TreeComponent):
             self._free_out_of_window_slots(req, forward_key_len - 1)
 
         if (
-            self._evict_stale_windows_first
+            self._should_demote_stale_windows(req)
             and insert_result is not None
             and insert_result.last_device_node is not None
         ):
