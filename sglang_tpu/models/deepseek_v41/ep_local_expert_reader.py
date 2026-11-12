@@ -12,11 +12,12 @@ The read plan follows sgl-project/sglang-torchtpu#1744 (e0a43ce363).
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import re
 from dataclasses import dataclass
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Iterator, Mapping
 
 import torch
@@ -32,6 +33,8 @@ _ENGRAM_TABLE = re.compile(r"^layers\.(0|[1-9]\d*)\.engram\.embed\.(weight|scale
 ROW_START_ATTR = "_sglang_dsv41_row_start"
 
 _READ_CHUNK_BYTES = 64 * 1024 * 1024
+_GCS_WORKERS = 16
+_GCS_RETRIES = 3
 
 _SAFETENSORS_DTYPES = {
     "F8_E4M3": torch.float8_e4m3fn,
@@ -107,6 +110,86 @@ def tp_row_range(num_rows: int, tp_rank: int, tp_size: int) -> tuple[int, int]:
     return num_rows * tp_rank // tp_size, num_rows * (tp_rank + 1) // tp_size
 
 
+def is_gcs_uri(path: str) -> bool:
+    return str(path).lower().startswith("gs://")
+
+
+def _open_gcs_blob(uri: str):
+    import requests.adapters
+    from google.cloud import storage
+
+    bucket_name, _, blob_name = uri[5:].partition("/")
+    blob_name = blob_name.lstrip("/")
+    if not bucket_name or not blob_name:
+        raise ValueError(f"Invalid GCS URI: {uri!r}")
+    client = storage.Client()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=_GCS_WORKERS * 2,
+        pool_maxsize=_GCS_WORKERS * 2,
+    )
+    client._http.mount("https://", adapter)
+    client._http.mount("http://", adapter)
+    return client.bucket(bucket_name).blob(blob_name)
+
+
+def _gcs_download_range(blob, start: int, length: int, name: str, uri: str) -> bytes:
+    if length == 0:
+        return b""
+    last_err: Exception | None = None
+    for attempt in range(_GCS_RETRIES):
+        try:
+            data = blob.download_as_bytes(
+                start=start, end=start + length - 1, raw_download=True
+            )
+            if len(data) != length:
+                raise EOFError(
+                    f"Short GCS range read for {name}: expected {length}B, "
+                    f"got {len(data)}B from {uri}"
+                )
+            return data
+        except Exception as exc:
+            last_err = exc
+            if attempt + 1 < _GCS_RETRIES:
+                sleep(0.5 * (attempt + 1))
+    assert last_err is not None
+    raise last_err
+
+
+def read_gcs_text(uri: str) -> str:
+    """Download a small GCS object (e.g. safetensors index JSON) as UTF-8 text."""
+    return _open_gcs_blob(uri).download_as_bytes(raw_download=True).decode("utf-8")
+
+
+def _read_gcs_range(
+    blob, file_start: int, out: torch.Tensor, name: str, uri: str
+) -> None:
+    """Fill uint8 ``out`` from a GCS blob via parallel 64 MB HTTP range reads."""
+    nbytes = out.numel()
+    if nbytes == 0:
+        return
+    mv = memoryview(out.numpy())
+    spans = [
+        (pos, min(_READ_CHUNK_BYTES, nbytes - pos))
+        for pos in range(0, nbytes, _READ_CHUNK_BYTES)
+    ]
+
+    def _read_span(span: tuple[int, int]) -> None:
+        rel, length = span
+        mv[rel : rel + length] = _gcs_download_range(
+            blob, file_start + rel, length, name, uri
+        )
+
+    if len(spans) <= 1:
+        for span in spans:
+            _read_span(span)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_GCS_WORKERS, len(spans))
+        ) as pool:
+            for _ in pool.map(_read_span, spans):
+                pass
+
+
 def _read_range(path: str, offset: int, out: torch.Tensor) -> None:
     """Fill uint8 ``out`` from ``path[offset:]`` in 64 MB ranges with RunAI's
     FileStreamer (native workers, many ranges in flight); Python preads were
@@ -131,9 +214,19 @@ def read_row_ranges(
     """Yield this TP rank's rows of each 2-D tensor in ``names``, tagged with
     ``ROW_START_ATTR``. Rows are contiguous in safetensors, so each table is one
     byte range."""
-    with open(path, "rb") as f:
-        header_len = int.from_bytes(f.read(8), "little")
-        header = json.loads(f.read(header_len))
+    use_gcs = is_gcs_uri(path)
+    blob = _open_gcs_blob(path) if use_gcs else None
+    if use_gcs:
+        header_len = int.from_bytes(
+            _gcs_download_range(blob, 0, 8, "__header_len__", path), "little"
+        )
+        header = json.loads(
+            _gcs_download_range(blob, 8, header_len, "__header__", path)
+        )
+    else:
+        with open(path, "rb") as f:
+            header_len = int.from_bytes(f.read(8), "little")
+            header = json.loads(f.read(header_len))
     data_base = 8 + header_len
     for name in sorted(names):
         meta = header[name]
@@ -144,7 +237,10 @@ def read_row_ranges(
         lo, hi = tp_row_range(num_rows, tp_rank, tp_size)
         out = torch.empty((hi - lo) * row_bytes, dtype=torch.uint8)
         t0 = perf_counter()
-        _read_range(path, data_base + start + lo * row_bytes, out)
+        if use_gcs:
+            _read_gcs_range(blob, data_base + start + lo * row_bytes, out, name, path)
+        else:
+            _read_range(path, data_base + start + lo * row_bytes, out)
         logger.info(
             "V4.1 %s rows [%d, %d): %.2f GB in %.1f s",
             name,

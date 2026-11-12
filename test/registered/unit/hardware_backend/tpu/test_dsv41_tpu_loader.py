@@ -152,6 +152,38 @@ def test_rank_row_ranges_partition_each_table(
         assert torch.equal(torch.cat(parts), tables[name])
 
 
+def test_gcs_row_ranges_partition_each_table(tmp_path, monkeypatch):
+    """gs:// URIs read only this TP rank's byte range via parallel range requests."""
+    from sglang_tpu.models.deepseek_v41 import ep_local_expert_reader as reader
+
+    monkeypatch.setattr(reader, "_READ_CHUNK_BYTES", 96)
+    tables = {
+        "layers.1.engram.embed.weight": torch.randn(101, 16).bfloat16(),
+        "layers.1.engram.embed.scale": torch.randn(101, 3),
+        "other": torch.randn(5, 7),
+    }
+    path = tmp_path / "shard.safetensors"
+    _write_safetensors(path, tables)
+    payload = path.read_bytes()
+
+    class _FakeBlob:
+        def download_as_bytes(self, start=None, end=None, raw_download=True):
+            if start is None and end is None:
+                return payload
+            return payload[start : end + 1]
+
+    monkeypatch.setattr(reader, "_open_gcs_blob", lambda uri: _FakeBlob())
+    names = {"layers.1.engram.embed.weight", "layers.1.engram.embed.scale"}
+    uri = "gs://fake-bucket/dsv41/shard.safetensors"
+    per_rank = [dict(read_row_ranges(uri, names, r, 8)) for r in range(8)]
+    for name in names:
+        parts = [got[name] for got in per_rank]
+        assert [p.shape[0] for p in parts] == _ROWS_PER_RANK[8]
+        starts = [getattr(p, ROW_START_ATTR) for p in parts]
+        assert starts == [sum(_ROWS_PER_RANK[8][:r]) for r in range(8)]
+        assert torch.equal(torch.cat(parts), tables[name])
+
+
 def test_preread_rows_skip_the_original_slice_and_check_the_range():
     full = torch.arange(40.0).view(10, 4)
     calls = []

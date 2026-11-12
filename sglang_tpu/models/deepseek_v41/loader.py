@@ -17,7 +17,9 @@ from time import perf_counter
 from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
 from sglang_tpu.models.deepseek_v41.ep_local_expert_reader import (
     EpLocalExpertReader,
+    is_gcs_uri,
     plan_expert_reads,
+    read_gcs_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,7 +55,7 @@ class DSV41RunaiModelStreamerLoader(RunaiModelStreamerLoader):
 
         from sglang.srt.model_loader.weight_utils import RUNAI_STREAMER_TENSOR_ATTR
         from sglang.srt.runtime_context import get_parallel
-        from sglang.srt.utils.runai_utils import is_runai_obj_uri
+        from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
         if (
             "tensor_names"
@@ -64,12 +66,23 @@ class DSV41RunaiModelStreamerLoader(RunaiModelStreamerLoader):
             )
         folder, files = self._prepare_weights(source.model_or_path, source.revision)
         if is_runai_obj_uri(folder):
-            raise ValueError(
-                "V4.1 EP-local reads need a local or mounted checkpoint path"
+            if not is_gcs_uri(folder):
+                raise ValueError(
+                    "V4.1 EP-local reads need a local, mounted, or gs:// checkpoint path"
+                )
+            index_path = (
+                Path(ObjectStorageModel.get_path(folder))
+                / "model.safetensors.index.json"
             )
-        weight_map = json.loads(
-            (Path(folder) / "model.safetensors.index.json").read_text()
-        )["weight_map"]
+            if index_path.is_file():
+                weight_map = json.loads(index_path.read_text())["weight_map"]
+            else:
+                index_uri = f"{folder.rstrip('/')}/model.safetensors.index.json"
+                weight_map = json.loads(read_gcs_text(index_uri))["weight_map"]
+        else:
+            weight_map = json.loads(
+                (Path(folder) / "model.safetensors.index.json").read_text()
+            )["weight_map"]
         parallel = get_parallel()
         plan = plan_expert_reads(
             weight_map,
