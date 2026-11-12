@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import next_power_of_2
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_dma_hicache import (
     NOOP_EVENT,
     TransferEvent,
@@ -690,6 +691,8 @@ def tpu_dma_mamba_pool_host_cls(io_backend: str) -> type[TpuDMAMambaPoolHost]:
 @dataclass
 class _UnifiedHostSide:
     pages_per_logical: int
+    reclaim_priority: int = 0
+    max_share: Optional[float] = None
     live_pages: set[int] = field(default_factory=set)
 
 
@@ -773,9 +776,20 @@ class _SharedUnifiedDMAHostState:
         self.users = 0
         self.destroyed = False
 
-    def register_side(self, label: str, pages_per_logical: int) -> None:
+    def register_side(
+        self,
+        label: str,
+        pages_per_logical: int,
+        *,
+        reclaim_priority: int = 0,
+        max_share: Optional[float] = None,
+    ) -> None:
         with self.lock:
-            self.sides[label] = _UnifiedHostSide(pages_per_logical=pages_per_logical)
+            self.sides[label] = _UnifiedHostSide(
+                pages_per_logical=pages_per_logical,
+                reclaim_priority=reclaim_priority,
+                max_share=max_share,
+            )
             self.users += 1
 
     def release(self) -> None:
@@ -794,9 +808,17 @@ class _SharedUnifiedDMAHostState:
     def release_layout(self, finish_event=None, transfer_key=None) -> None:
         return None
 
+    def total_bytes(self) -> int:
+        return self.page_num * self.bytes_per_page
+
     def free_bytes(self) -> int:
         with self.lock:
             return len(self.free_pages) * self.bytes_per_page
+
+    def used_bytes(self, label: str) -> int:
+        with self.lock:
+            side = self.sides[label]
+            return len(side.live_pages) * side.pages_per_logical * self.bytes_per_page
 
     def available_tokens(self, label: str) -> int:
         with self.lock:
@@ -943,7 +965,15 @@ class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
         )
         self.end_layer = self.layer_num
 
-        state.register_side(pool_label, self._pages_per_logical)
+        swa_share = (
+            tpu_envs.SGLANG_TPU_UNIFIED_HICACHE_SWA_SHARE.get() if is_swa else 0.0
+        )
+        state.register_side(
+            pool_label,
+            self._pages_per_logical,
+            reclaim_priority=1 if swa_share > 0.0 else 0,
+            max_share=swa_share if 0.0 < swa_share < 1.0 else None,
+        )
         self._state = state
         self.transfer = state.transfer
         self.lock = state.lock

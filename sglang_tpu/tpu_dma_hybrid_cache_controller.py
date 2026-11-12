@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
 )
+from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang_tpu.kv_free_fence import (
     KVFreeFence,
     assert_not_forward_write_target,
@@ -174,6 +175,100 @@ class TpuDMAHybridCacheController(HybridCacheController):
             if transfer.device_indices is not None:
                 transfer.device_indices = transfer.device_indices.cpu()
         return device_indices
+
+    # ----- unified shared-host reclaim ----------------------------------------
+
+    @staticmethod
+    def _bytes_to_aligned_tokens(pool: Any, byte_count: int) -> int:
+        raw_tokens = (byte_count + pool.size_per_token - 1) // pool.size_per_token
+        return (raw_tokens + pool.page_size - 1) // pool.page_size * pool.page_size
+
+    def _alloc_shared_host_requests_with_reclaim(
+        self, requests: list[tuple[PoolName, int]]
+    ) -> Optional[list[torch.Tensor]]:
+        from sglang_tpu.kv_pool_host import _SharedUnifiedDMAHostState
+
+        entries = [self.mem_pool_host.entry_map[name] for name, _ in requests]
+        domain = entries[0].host_pool.shared_allocation_domain
+        if not isinstance(domain, _SharedUnifiedDMAHostState):
+            return super()._alloc_shared_host_requests_with_reclaim(requests)
+        if any(
+            entry.host_pool.shared_allocation_domain is not domain for entry in entries
+        ):
+            raise ValueError("Host pools do not share one allocation domain.")
+        domain_requests = [
+            (entry.host_pool.pool_label, need_size)
+            for entry, (_, need_size) in zip(entries, requests, strict=True)
+        ]
+
+        allocated = domain.alloc_many(domain_requests)
+        if allocated is not None:
+            return allocated
+
+        pools = [entry.host_pool for entry in entries]
+        requested_bytes = sum(
+            need_size * pool.size_per_token
+            for pool, (_, need_size) in zip(pools, requests, strict=True)
+        )
+        requested_names = list(dict.fromkeys(name for name, _ in reversed(requests)))
+        candidates = [self.mem_pool_host.entry_map[name] for name in requested_names]
+        candidates.extend(
+            entry
+            for entry in self.mem_pool_host.entries
+            if entry.name not in requested_names
+            and uses_shared_host_layout(entry.host_pool)
+            and entry.host_pool.shared_allocation_domain is domain
+        )
+        candidates.sort(
+            key=lambda entry: domain.sides[entry.host_pool.pool_label].reclaim_priority
+        )
+
+        total_bytes = domain.total_bytes()
+        capped_entries = [
+            (entry, int(side.max_share * total_bytes))
+            for entry in candidates
+            if entry.host_evict_fn is not None
+            and (side := domain.sides[entry.host_pool.pool_label]).max_share is not None
+        ]
+
+        while True:
+            made_progress = False
+            for entry, cap_bytes in capped_entries:
+                pool = entry.host_pool
+                excess_bytes = domain.used_bytes(pool.pool_label) - cap_bytes
+                if excess_bytes <= 0:
+                    continue
+                shortfall_bytes = min(
+                    excess_bytes,
+                    max(
+                        pool.page_size * pool.size_per_token,
+                        requested_bytes - domain.free_bytes(),
+                    ),
+                )
+                tokens = self._bytes_to_aligned_tokens(pool, shortfall_bytes)
+                if entry.host_evict_fn(tokens) <= 0:
+                    continue
+                made_progress = True
+                allocated = domain.alloc_many(domain_requests)
+                if allocated is not None:
+                    return allocated
+            for entry in candidates:
+                if entry.host_evict_fn is None:
+                    continue
+                pool = entry.host_pool
+                shortfall_bytes = max(
+                    pool.page_size * pool.size_per_token,
+                    requested_bytes - domain.free_bytes(),
+                )
+                tokens = self._bytes_to_aligned_tokens(pool, shortfall_bytes)
+                if entry.host_evict_fn(tokens) <= 0:
+                    continue
+                made_progress = True
+                allocated = domain.alloc_many(domain_requests)
+                if allocated is not None:
+                    return allocated
+            if not made_progress:
+                return None
 
     # ----- transfers ----------------------------------------------------------
 

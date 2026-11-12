@@ -704,6 +704,199 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
         ta.free(prefill)
         cache.sanity_check()
 
+    def test_internal_swa_eviction_and_shared_host_reclaim_policy(self):
+        from array import array
+
+        from sglang.srt.managers.cache_controller import BatchDoneCounter
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.hicache_storage import PoolName as PN
+        from sglang.srt.mem_cache.hicache_storage import PoolTransfer as PT
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
+        from sglang.srt.mem_cache.pool_host.group import HostPoolGroup
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang_tpu import kv_pool_host as kph
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.tpu_dma_hybrid_cache_controller import (
+            TpuDMAHybridCacheController,
+        )
+
+        # 1. Internal-SWA device eviction ahead of older Full D-leaves.
+        ta, rp = self._build_target(24, 3)
+        dp = self._attach(ta, rp, window=8)
+        cache = UnifiedRadixCache(
+            params=CacheInitParams(
+                req_to_token_pool=rp,
+                token_to_kv_pool_allocator=ta,
+                page_size=8,
+                disable=False,
+                sliding_window_size=8,
+                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                eviction_policy="lru",
+                tree_core_backend="python",
+            )
+        )
+        neg1 = torch.tensor([-1])
+
+        def _alloc_and_insert(toks, prev_len=0, prefix_idx=None):
+            ext = len(toks) - prev_len
+            p_t = torch.tensor([prev_len])
+            s_t = torch.tensor([len(toks)])
+            last = neg1 if prefix_idx is None else prefix_idx[-1:]
+            new_idx = ta.alloc_extend(p_t, p_t, s_t, s_t, last, ext)
+            self.assertIsNotNone(new_idx)
+            full_idx = (
+                new_idx
+                if prefix_idx is None
+                else torch.cat([prefix_idx.to(new_idx.dtype), new_idx])
+            )
+            res = cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", toks), None),
+                    value=full_idx.to(torch.int64),
+                    prev_prefix_len=prev_len,
+                )
+            )
+            cache.components[ComponentType.SWA]._demote_stale_windows(
+                last_node=cache.tree_core.node_by_id(res.last_device_node)
+            )
+            return full_idx
+
+        toks_a = list(range(100, 116))
+        _alloc_and_insert(toks_a)
+        toks_b = list(range(200, 232))
+        idx_b1 = _alloc_and_insert(toks_b[:16])
+        _alloc_and_insert(toks_b, prev_len=16, prefix_idx=idx_b1)
+        self.assertEqual(ta._free_page_count(), 0)
+
+        self.assertTrue(ta.evict_to_free_tokens(cache, 8))
+        self.assertEqual(ta._free_page_count(), 6)
+        self.assertEqual(dp.size_swa // 8, 6)
+        hit_a = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", toks_a + [999]), None))
+        )
+        hit_b = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", toks_b + [999]), None))
+        )
+        self.assertEqual(len(hit_a.device_indices), 16)
+        self.assertEqual(len(hit_b.device_indices), 32)
+        cache.sanity_check()
+
+        # 2. TPU unified shared-host reclaim policy (_UnifiedHostSide + TpuDMAHybridCacheController).
+        ta_h, _ = self._build_target(10, 3)  # page_size=8, M_T=3
+        tp_h = ta_h.get_kvcache()
+        fm, sm = kph._unified_swa_layer_mappings(tp_h)
+        mx = max(fm.keys() | sm.keys()) + 1
+
+        def _make_stack(share: float):
+            evict_calls: list[tuple[str, int]] = []
+            held_full: list[torch.Tensor] = []
+            held_swa: list[torch.Tensor] = []
+            with (
+                tpu_envs.SGLANG_TPU_UNIFIED_HICACHE_SWA_SHARE.override(share),
+                patch.object(
+                    kph,
+                    "create_tpu_dma_kv_transfer",
+                    side_effect=lambda *_, **__: types.SimpleNamespace(
+                        destroy=lambda: None
+                    ),
+                ),
+                patch.object(kph, "host_memory_budget_bytes", return_value=1 << 40),
+            ):
+                kv_h, swa_h = kph.TpuDMAUnifiedHostKVPool.build_pair(
+                    tp_h,
+                    io_backend="raiden",
+                    host_to_device_ratio=2.0,  # 21 physical pages
+                    host_size=0.0,
+                    page_size=8,
+                )
+
+            def _evict_full(tokens: int) -> int:
+                evict_calls.append(("full", tokens))
+                freed = 0
+                while freed < tokens and held_full:
+                    freed += kv_h.free(held_full.pop(0))
+                return freed
+
+            def _evict_swa(tokens: int) -> int:
+                evict_calls.append(("swa", tokens))
+                freed = 0
+                while freed < tokens and held_swa:
+                    freed += swa_h.free(held_swa.pop(0))
+                return freed
+
+            c = object.__new__(TpuDMAHybridCacheController)
+            c.mem_pool_host = HostPoolGroup(
+                [
+                    hpa.build_pool_entry(
+                        name=PN.KV,
+                        host_pool=kv_h,
+                        device_pool=tp_h,
+                        layer_mapping=fm,
+                        transfer_layer_id_max=mx,
+                        is_anchor=True,
+                        host_evict_fn=_evict_full,
+                    ),
+                    hpa.build_pool_entry(
+                        name=PN.SWA,
+                        host_pool=swa_h,
+                        device_pool=tp_h,
+                        layer_mapping=sm,
+                        transfer_layer_id_max=mx,
+                        host_evict_fn=_evict_swa,
+                    ),
+                ]
+            )
+            c.page_size = 8
+            c.layer_done_counter = BatchDoneCounter()
+            return c, kv_h, swa_h, evict_calls, held_full, held_swa
+
+        ctrl, kv_h, swa_h, evict_calls, held_full, held_swa = _make_stack(0.3)
+        domain = kv_h.shared_allocation_domain
+        self.assertEqual(domain.total_bytes(), 21 * domain.bytes_per_page)
+
+        # Case A (c16 + large incoming SWA request): 15 Full + 2 SWA (6/21 = 28.6% <= 30%).
+        # Even when incoming SWA is 2 pages (resident + req = 12/21 > 30%), resident SWA is
+        # <= 30%, so Full KV reclaims first without flushing resident SWA windows.
+        for _ in range(15):
+            held_full.append(kv_h.alloc(8))
+        for _ in range(2):
+            held_swa.append(swa_h.alloc(8))
+        self.assertEqual(domain.free_bytes(), 0)
+        res_a = ctrl.allocate_shared_host_transfers(
+            torch.arange(8), [PT(name=PN.SWA, device_indices=torch.arange(16))]
+        )
+        self.assertIsNotNone(res_a)
+        self.assertEqual(evict_calls, [("full", 56)])
+        held_full.append(res_a[0])
+        held_swa.append(res_a[1][0].host_indices)
+
+        # Case B (c22 + resident excess trim): SWA now holds 4 SWA pages (12/21 = 57.1% > 30%;
+        # cap = int(0.3 * 21) = 6 phys pages -> 2 excess SWA pages = 16 SWA tokens).
+        # Requesting 7 Full pages (56 tokens) trims ONLY the 16 excess SWA tokens first, then
+        # falls through in the same pass to Full for the remaining 1 page.
+        evict_calls.clear()
+        res_b = ctrl.allocate_shared_host_transfers(torch.arange(56))
+        self.assertIsNotNone(res_b)
+        self.assertEqual(evict_calls, [("swa", 16), ("full", 8)])
+        held_full.append(res_b[0])
+
+        # Case C (opt-out <= 0.0): restores legacy reversed(requests) SWA-first order.
+        ctrl_l, kv_l, swa_l, calls_l, full_l, swa_list_l = _make_stack(0.0)
+        for _ in range(18):
+            full_l.append(kv_l.alloc(8))
+        swa_list_l.append(swa_l.alloc(8))
+        res_c = ctrl_l.allocate_shared_host_transfers(
+            torch.arange(8), [PT(name=PN.SWA, device_indices=torch.arange(8))]
+        )
+        self.assertIsNotNone(res_c)
+        self.assertEqual(calls_l[0][0], "swa")
+
 
 if __name__ == "__main__":
     unittest.main()
