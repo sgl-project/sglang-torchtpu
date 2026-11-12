@@ -10,7 +10,6 @@ aligned window around them (window_rows); only own rows are written or sent.
 """
 
 import contextlib
-import os
 from collections.abc import Callable
 from typing import Any
 
@@ -19,6 +18,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel.ep_mk import a2a, attn, route
 from sglang_tpu.muse_megakernel.ep_mk.config import (
     DN_TN,
@@ -49,7 +49,7 @@ def _phase(name: str, level: int = 1):
     """A named in-kernel region per phase with SGLANG_TPU_EP_TRACE >= level at trace time
     (xprof shows them with libtpu's --xla_enable_custom_call_region_trace=true); level 2:
     per expert chunk too."""
-    if int(os.environ.get("SGLANG_TPU_EP_TRACE", "0")) >= level:
+    if tpu_envs.SGLANG_TPU_EP_TRACE.get() >= level:
         return jax.named_scope(f"ep_{name}")
     return contextlib.nullcontext()
 
@@ -75,7 +75,7 @@ def _dev_skip(phase: str) -> bool:
     wdma (the expert weight streams after the first ring fill: the math reruns those slots),
     pool, unpool (their weight streams), a2a (counts, both all-to-alls: no slot moves).
     Read at trace time: a warm compile process imports this module before a sweep's env."""
-    return phase in os.environ.get("SGLANG_TPU_EP_DEV_SKIP", "").split(",")
+    return phase in tpu_envs.SGLANG_TPU_EP_DEV_SKIP.get().split(",")
 
 
 class EPExperts:

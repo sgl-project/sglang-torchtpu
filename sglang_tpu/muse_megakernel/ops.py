@@ -14,7 +14,6 @@ place). Steps of more than BASE_STEP_MAX_ROWS rows run the megakernel's row-tile
 
 import logging
 import math
-import os
 
 import jax
 import msgspec
@@ -23,6 +22,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang_tpu.envs import dev_int
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import (
     TpuFusedMHATokenToKVPool,
@@ -58,13 +58,8 @@ BASE_STEP_MAX_ROWS = 32
 _ROW_TILE = 16
 
 
-def _dev_int(name: str, default: int) -> int:
-    """A tuning knob for kernel sweeps (anvil --env); unset means the tuned default."""
-    return int(os.environ.get(name, default))
-
-
 def _row_tile() -> int:
-    return _dev_int("SGLANG_TPU_MUSE_MK_DEV_ROW_TILE", _ROW_TILE)
+    return dev_int(tpu_envs.SGLANG_TPU_MUSE_MK_DEV_ROW_TILE, _ROW_TILE)
 
 
 def step_rows(n_tokens: int, tp: int, moe_mode: MoeMode) -> int:
@@ -203,14 +198,17 @@ def _stack_expert_groups(decoder, experts: list, groups: tuple) -> list:
                 exp_mod = decoder.layers[li].mlp.experts
                 exp_mod.register_buffer(f"_stacked_{name}", st, persistent=False)
                 if j == 0:
-                    old_go = getattr(exp_mod, "_tpu_fused_rs_group_offset", None)
-                    if old_go is not None:
-                        go0 = int(old_go.reshape(-1)[0].item())
-                        exp_mod.register_buffer(
-                            "_tpu_fused_rs_group_offset",
-                            torch.tensor([go0, k], dtype=torch.int32, device=device),
-                            persistent=False,
+                    old_go = exp_mod._buffers.get("_tpu_fused_rs_group_offset")
+                    if old_go is None:
+                        raise RuntimeError(
+                            f"layer {li}: stacked experts need the fused-RS group_offset set first"
                         )
+                    go0 = int(old_go.reshape(-1)[0].item())
+                    exp_mod.register_buffer(
+                        "_tpu_fused_rs_group_offset",
+                        torch.tensor([go0, k], dtype=torch.int32, device=device),
+                        persistent=False,
+                    )
             slabs.append(st)
         stacked[lo] = slabs
     out, l = [], 0
@@ -553,8 +551,9 @@ class MuseMegakernel(torch.nn.Module):
             tiled_o_rot=opt and tiled,
             tiled_fold=opt and tiled and fold_env,
             pair_ag=1 if (opt and tiled) else 0,
-            tiled_pair_y=_dev_int(
-                "SGLANG_TPU_MUSE_MK_DEV_TILED_PAIR_Y", _default_tiled_pair_y(rows)
+            tiled_pair_y=dev_int(
+                tpu_envs.SGLANG_TPU_MUSE_MK_DEV_TILED_PAIR_Y,
+                _default_tiled_pair_y(rows),
             )
             if (opt and tiled)
             else 0,
@@ -568,8 +567,8 @@ class MuseMegakernel(torch.nn.Module):
             ex_w2_stage=opt and tiled,
             # fp8 x fp8 expert LHS loses accuracy at R >= 256 (8K cc=64 verify).
             ex_lhs_fp8=1 if (opt and (tiled or rows >= 32) and rows <= 128) else 0,
-            expert_chunk=_dev_int(
-                "SGLANG_TPU_MUSE_MK_DEV_EXPERT_CHUNK",
+            expert_chunk=dev_int(
+                tpu_envs.SGLANG_TPU_MUSE_MK_DEV_EXPERT_CHUNK,
                 64 if (opt and tiled and rows > 128) else 32,
             ),
         )
@@ -643,8 +642,8 @@ class MuseMegakernel(torch.nn.Module):
             # collectives up to 256 (q8 cc21 at 32k: 41.4 ms on plain streamed Y, 34.7 ms).
             if cfg.qblock and cfg.tiled_vmem_pads:
                 loops_budget = (
-                    _dev_int(
-                        "SGLANG_TPU_MUSE_MK_DEV_TILE_LOOPS_BUDGET_MIB",
+                    dev_int(
+                        tpu_envs.SGLANG_TPU_MUSE_MK_DEV_TILE_LOOPS_BUDGET_MIB,
                         _TILE_LOOPS_VMEM_BUDGET // 2**20,
                     )
                     * 2**20
@@ -678,7 +677,7 @@ class MuseMegakernel(torch.nn.Module):
             if (
                 cfg.tiled_vmem_y >= 1
                 and cfg.alias_oag_f
-                and _dev_int("SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN", 0)
+                and dev_int(tpu_envs.SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN, 0)
             ):
                 plans.append(
                     (
@@ -753,8 +752,9 @@ class MuseMegakernel(torch.nn.Module):
                     and base_cfg.tiled_vmem_y >= 1
                     and not base_cfg.tile_loops
                     and slots
-                    <= _dev_int(
-                        "SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS", _TILED_VY_MIN_SLOTS
+                    <= dev_int(
+                        tpu_envs.SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS,
+                        _TILED_VY_MIN_SLOTS,
                     )
                 ):
                     continue
@@ -765,8 +765,9 @@ class MuseMegakernel(torch.nn.Module):
                     tiled
                     and base_cfg.tiled_vmem_y >= 1
                     and depth
-                    < _dev_int(
-                        "SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH", _TILED_VY_MIN_DEPTH
+                    < dev_int(
+                        tpu_envs.SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH,
+                        _TILED_VY_MIN_DEPTH,
                     )
                 ):
                     continue

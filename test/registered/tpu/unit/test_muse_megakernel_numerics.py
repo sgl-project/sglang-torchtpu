@@ -18,12 +18,7 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(
-    est_time=420,
-    suite="stage-a-test-tpu-unit",
-    chips=4,
-    disabled="Muse megakernel numerics are opt-in; run by hand",
-)
+register_tpu_ci(est_time=420, suite="nightly-tpu-4-v7", nightly=True, chips=4)
 
 
 class TestMuseMegakernelNumerics(CustomTestCase):
