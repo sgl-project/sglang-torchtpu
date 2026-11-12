@@ -1,4 +1,6 @@
-"""Layer-addressed Raiden transfers from a pipeline to DP, TP, or matching PP stages."""
+"""Layer-addressed Raiden transfers from a pipeline to DP, TP, or matching PP
+stages, and from a tensor-parallel prefill whose attention-TP ranks each hold
+every KV page (a split sparse-MLA pool) to an attention-DP decode."""
 
 from __future__ import annotations
 
@@ -32,6 +34,8 @@ from sglang_tpu.disaggregation.raiden.pool_spans import (
     _kv_rank,
     _new_transfer_state,
     group_ranks,
+    is_replicated_pool,
+    is_state_pool,
     is_swa_pool,
     parse_req_id,
     part_destination_blocks,
@@ -58,67 +62,135 @@ _MISSING_REGISTRATION = "Missing producer block registration"
 _EARLY_COMPLETION = "Only an empty producer registration may complete before"
 
 
-def pool_manifest(groups: Any) -> list[dict]:
-    """Name each local full-attention or sliding-window tensor by model layer.
+def _pool(tag: str, tensor, *, index: int, region: str) -> dict:
+    """One pool over a whole ``[num_blocks, ...]`` tensor, its block a row."""
+    size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
+    return dict(
+        tag=tag,
+        storage_index=index,
+        base_offset_bytes=0,
+        block_stride_bytes=size,
+        num_blocks=int(tensor.shape[0]),
+        dtype_tag=str(tensor.dtype).removeprefix("torch."),
+        regions=[
+            dict(
+                name=region,
+                offset_bytes=0,
+                stride_bytes=size,
+                unit_bytes=size,
+                num_units=1,
+            )
+        ],
+    )
 
-    A block-major bundle is one pool whose block is the whole row,
-    ``<kind>.l<first>+<count>``; it pairs only with a bundle of the same layers.
+
+def pool_manifest(groups: Any, attn_tp_size: int = 1) -> list[dict]:
+    """Name each local KV page tensor and state tensor by kind and model layer.
+
+    A tensor of per-head attention KV is ``fa`` or ``swa``; a pool that names
+    its own buffers (``groups.full_kinds``) keeps those names. A block-major
+    bundle is one pool whose block is the whole row,
+    ``<kind>.l<first>+<count>``; it pairs only with a bundle of the same
+    layers. The state pools (state_pools) follow the KV pools.
     """
     pools = []
-    for kind, tensors, layer_ids, num_draft, num_hidden in (
+    per_head = []
+    full_kinds = list(getattr(groups, "full_kinds", ()))
+    for kind, tensors, layer_ids, num_draft, num_hidden, kinds in (
         (
             "fa",
             groups.full,
             groups.full_layer_ids,
             groups.num_draft_full,
             groups.num_hidden_full,
+            full_kinds,
         ),
-        ("swa", groups.swa, groups.swa_layer_ids, groups.num_draft_swa, 0),
+        ("swa", groups.swa, groups.swa_layer_ids, groups.num_draft_swa, 0, []),
     ):
         if len(tensors) != len(layer_ids):
             raise ValueError(f"Raiden {kind} pools need one global layer ID per tensor")
         num_target = len(tensors) - num_draft - num_hidden
         for index, (tensor, layer) in enumerate(zip(tensors, layer_ids)):
+            base = (kinds[index] if kinds else "") or kind
             # Draft layer IDs restart at 0, so they need their own namespace; the
             # PD hidden rows have their own page geometry, hence their own class.
             if index < num_target:
-                tag_kind = kind
+                tag_kind = base
             elif index < num_target + num_draft:
-                tag_kind = f"draft.{kind}"
+                tag_kind = f"draft.{base}"
             else:
-                tag_kind = f"pdhid.{kind}"
+                tag_kind = f"pdhid.{base}"
             tag = f"{tag_kind}.l{int(layer)}"
-            if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
-                tag += f"+{int(tensor.shape[1])}"
-            size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
-            pools.append(
-                dict(
-                    tag=tag,
-                    storage_index=len(pools),
-                    base_offset_bytes=0,
-                    block_stride_bytes=size,
-                    num_blocks=int(tensor.shape[0]),
-                    dtype_tag=str(tensor.dtype).removeprefix("torch."),
-                    regions=[
-                        dict(
-                            name="kv",
-                            offset_bytes=0,
-                            stride_bytes=size,
-                            unit_bytes=size,
-                            num_units=1,
-                        )
-                    ],
-                )
-            )
+            if not is_replicated_pool(tag):
+                per_head.append(tensor)
+                if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
+                    tag += f"+{int(tensor.shape[1])}"
+            pools.append(_pool(tag, tensor, index=len(pools), region="kv"))
     if not groups.full:
         raise ValueError(
             "Raiden pipeline transfer needs full-attention KV in every stage"
         )
-    if len({_kv_rank(tensor) for tensor in [*groups.full, *groups.swa]}) != 1:
+    if len({_kv_rank(tensor) for tensor in per_head}) > 1:
         raise ValueError("Raiden pipeline KV layers must share one page layout")
+    pools += state_pools(groups, attn_tp_size, first_index=len(pools))
     tags = [pool["tag"] for pool in pools]
     if len(tags) != len(set(tags)):
         raise ValueError("Raiden pipeline transfer requires distinct global layer IDs")
+    return pools
+
+
+def state_pools(groups: Any, attn_tp_size: int, *, first_index: int = 0) -> list[dict]:
+    """One pool per linear-attention state tensor, ``gdn.<kind>.l<layer>``, its
+    block a request's row.
+
+    Each carries ``shard``, which tpu-sync does not read: the row is ``outer``
+    repeats of ``dim`` units of ``unit_bytes`` along the head-sharded axis,
+    ``full_dim`` units over all of the attention-TP group, in sub-blocks of
+    ``groups`` units that are sharded one by one.
+    """
+    tensors = list(getattr(groups, "state", ()))
+    shards = list(getattr(groups, "state_shards", ()))
+    if tensors and len(shards) != len(tensors):
+        raise NotImplementedError(
+            "Raiden pipeline transfer needs the attention-TP shard layout of "
+            "every state tensor, which only GDN (linear-attention) state gives"
+        )
+    pools = []
+    seen: dict[tuple, int] = {}
+    for tensor, shard in zip(tensors, shards):
+        if shard.axis is None:
+            raise NotImplementedError(
+                "Raiden pipeline transfer does not move state that every "
+                "attention-TP rank holds whole"
+            )
+        row = [int(n) for n in tensor.shape[1:]]
+        dim = row[shard.axis]
+        if shard.groups is not None and sum(shard.groups) != dim * attn_tp_size:
+            raise ValueError(
+                f"Raiden pipeline transfer: {shard.kind} state of layer "
+                f"{shard.layer_id} holds {dim} of the {sum(shard.groups)} units "
+                f"of its sub-blocks {shard.groups} on each of {attn_tp_size} "
+                "attention-TP ranks, so they do not shard evenly"
+            )
+        # A layer's second conv tensor is conv1, and so on.
+        nth = seen[shard.kind, shard.layer_id] = (
+            seen.get((shard.kind, shard.layer_id), -1) + 1
+        )
+        kind = f"{shard.kind}{nth or ''}"
+        pool = _pool(
+            f"gdn.{kind}.l{shard.layer_id}",
+            tensor,
+            index=first_index + len(pools),
+            region="state",
+        )
+        pool["shard"] = dict(
+            dim=dim,
+            full_dim=dim * attn_tp_size,
+            unit_bytes=math.prod(row[shard.axis + 1 :]) * tensor.element_size(),
+            outer=math.prod(row[: shard.axis]),
+            groups=None if shard.groups is None else list(shard.groups),
+        )
+        pools.append(pool)
     return pools
 
 
@@ -142,8 +214,10 @@ def layout_fingerprint(
 ) -> str:
     """Compare per-class page geometry and materialized layout across layer
     subsets; the per-rank head count is left out so a tensor-parallel consumer
-    matches its producer. ships_pd_hidden makes both ends agree on
-    SGLANG_TPU_PD_DECODE_DRAFT_PREFILL, which the skipped pdhid pools cannot."""
+    matches its producer, and a state row counts at its full width so a
+    tensor-parallel producer matches its consumer. ships_pd_hidden makes both
+    ends agree on SGLANG_TPU_PD_DECODE_DRAFT_PREFILL, which the skipped pdhid
+    pools cannot."""
     classes = {}
     schema = "sglang-fused-kv-v2"
     for pool, tensor in zip(pools, tensors):
@@ -155,7 +229,18 @@ def layout_fingerprint(
         if layout is None:
             raise ValueError("Raiden pipeline KV must have a materialized TPU layout")
         major, tiles, bits = layout
-        if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
+        if is_state_pool(pool["tag"]):
+            schema = "sglang-gdn-state-v1"
+            kind = pool_kind(pool["tag"])
+            signature = _state_signature(pool, tensor, major, tiles)
+            if classes.setdefault(kind, signature) != signature:
+                raise ValueError(f"Raiden {kind} layers have differing row layouts")
+            continue
+        if is_replicated_pool(pool["tag"]):
+            # No axis is per rank: both ends hold the same page.
+            schema = "sglang-split-mla-kv-v1"
+            page_shape = [int(n) for n in tensor.shape[1:]]
+        elif _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             # Axis 1, the per-rank 2 * kv_heads, is left out.
             schema = "sglang-rpa-seq-kv-v1"
             page_shape = [int(tensor.shape[2]), int(tensor.shape[3])]
@@ -177,8 +262,11 @@ def layout_fingerprint(
             element_bits=int(bits or tensor.element_size() * 8),
         )
         # A draft page matches its target class, so a stage without the draft
-        # fingerprints like one with it.
-        kind = pool_kind(pool["tag"]).removeprefix("draft.")
+        # fingerprints like one with it. A pool that names its own buffers is
+        # the same on both ends, draft and all.
+        kind = pool_kind(pool["tag"])
+        if not is_replicated_pool(pool["tag"]):
+            kind = kind.removeprefix("draft.")
         if kind in classes and classes[kind] != signature:
             raise ValueError(f"Raiden {kind} layers have differing page layouts")
         classes[kind] = signature
@@ -187,6 +275,42 @@ def layout_fingerprint(
         fields["pd_hidden"] = True
     value = json.dumps(fields, sort_keys=True)
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _state_signature(pool: dict, tensor, major, tiles) -> dict:
+    """What both ends of a state transfer must share: the full-width row.
+
+    The row's bytes move by byte offset between tensors of different widths,
+    so they must be the row's elements in row-major order on both ends, which
+    no shared layout tag can say. That holds when the device keeps the axes in
+    their natural order and its one tile either is a single row high or spans
+    the last axis, without padding either of the two last axes.
+    """
+    rank = len(tensor.shape)
+    natural = [int(n) for n in major] == list(range(rank - 1, -1, -1))
+    tiles = [[int(n) for n in tile] for tile in tiles]
+    rows, width = int(tensor.shape[-2]), int(tensor.shape[-1])
+    if not (
+        natural
+        and len(tiles) == 1
+        and len(tiles[0]) == 2
+        and rows % tiles[0][0] == 0
+        and width % tiles[0][1] == 0
+        and (tiles[0][0] == 1 or tiles[0][1] == width)
+    ):
+        raise ValueError(
+            f"Raiden pipeline transfer: the device layout of state pool "
+            f"{pool['tag']} {list(tensor.shape)} (minor_to_major "
+            f"{[int(n) for n in major]}, tiles {tiles}) does not keep a row's "
+            "bytes in row-major order, so attention-TP head shards cannot be "
+            "placed by byte offset"
+        )
+    shard = pool["shard"]
+    return dict(
+        row=[shard["outer"], shard["full_dim"], shard["unit_bytes"]],
+        groups=shard["groups"],
+        dtype=pool["dtype_tag"],
+    )
 
 
 def _ships_pd_hidden() -> bool:
@@ -347,6 +471,9 @@ class PoolTransfer:
 
     # The second engine's link, when a pool family has an engine of its own.
     side: pool_side_engine.SideLink | None = None
+    # (rank, workers) on a tensor-parallel producer: its ranks all hold every
+    # page, and page i of a transfer moves from rank i % workers.
+    stripe: tuple[int, int] | None = None
     draft_kv_heads: int | None = None
     draft_swa_kv_heads: int | None = None
 
@@ -362,8 +489,11 @@ class PoolTransfer:
         self.draft_kv_heads = getattr(groups, "draft_kv_head_num", None)
         self.draft_swa_kv_heads = getattr(groups, "draft_swa_kv_head_num", None)
         # A pool family with another block count gets an engine of its own.
-        self.pools, side_pools = pool_side_engine.split_manifest(pool_manifest(groups))
+        self.pools, side_pools = pool_side_engine.split_manifest(
+            pool_manifest(groups, manager.attn_tp_size)
+        )
         family = pool_side_engine.family_of(side_pools)
+        self._check_pools(family)
         self.tensors = list(groups.full)
         if family is not None:
             pool_side_engine.require_bounded_staging(family)
@@ -372,6 +502,8 @@ class PoolTransfer:
         # transfer for all ranks.
         self.rank = manager.pp_rank * manager.attn_tp_size + manager.attn_tp_rank
         self.workers = manager.pp_size * manager.attn_tp_size
+        if self.producer and manager.attn_tp_size > 1:
+            self.stripe = (self.rank, self.workers)
         self.client_type = ReshardClient
         self._init_overlap_state()
         self.executor = concurrent.futures.ThreadPoolExecutor(
@@ -464,6 +596,15 @@ class PoolTransfer:
                 "closing transfer, which stage groups replace; unset "
                 "SGLANG_RAIDEN_PIPELINE_STAGE_PARTS"
             )
+        if self.stripe is not None and (
+            self.early_parts or self.stage_parts or self.early_close
+        ):
+            raise ValueError(
+                "SGLANG_RAIDEN_PIPELINE_EARLY_PARTS, SGLANG_RAIDEN_PIPELINE_STAGE_PARTS "
+                "and SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE overlap the transfer with a "
+                "pipeline-parallel prefill only; unset them on a tensor-parallel "
+                "prefill"
+            )
         if self.early_close and get_parallel().pp_async_batch_depth < 1:
             raise ValueError(
                 "SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE needs --pp-async-batch-depth 1: "
@@ -489,15 +630,15 @@ class PoolTransfer:
         manager = self.manager
         if manager.attn_cp_size != 1:
             raise ValueError("Raiden pipeline transfer requires attention CP=1")
-        if self.producer and (manager.attn_tp_size != 1 or manager.pp_size <= 1):
+        if self.producer and manager.attn_tp_size == 1 and manager.pp_size <= 1:
             raise ValueError(
                 "Raiden pipeline transfer requires a pipeline producer with "
-                "attention TP=1"
+                "attention TP=1, or a tensor-parallel one"
             )
         if manager.attn_tp_size != 1 and manager.pp_size != 1:
             raise ValueError(
-                "Raiden pipeline transfer takes attention TP>1 only on a decode "
-                "without pipeline stages"
+                "Raiden pipeline transfer takes attention TP>1 only without "
+                "pipeline stages"
             )
         if (
             "wire_pool_indices"
@@ -505,6 +646,34 @@ class PoolTransfer:
         ):
             raise RuntimeError(
                 "Raiden pipeline transfer requires tpu-sync PP pool-resharding support"
+            )
+
+    def _check_pools(self, family) -> None:
+        """Reject pools a tensor-parallel worker cannot move. It holds its
+        heads' share of per-head KV and of linear-attention state, and the
+        whole of every other page."""
+        manager = self.manager
+        if manager.attn_tp_size == 1:
+            return
+        state = family is pool_side_engine.STATE
+        per_head = [
+            pool["tag"] for pool in self.pools if not is_replicated_pool(pool["tag"])
+        ]
+        if not self.producer:
+            if state or len(per_head) != len(self.pools):
+                raise NotImplementedError(
+                    "Raiden pipeline transfer moves linear-attention state and "
+                    "KV pages without a kv-head axis to an attention-TP 1 decode "
+                    "only: run the decode with attention DP "
+                    "(--enable-dp-attention), or with the prefill's attention TP "
+                    f"and without {envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
+                )
+        elif per_head:
+            raise NotImplementedError(
+                "Raiden pipeline transfer moves from a tensor-parallel prefill "
+                "only KV pages every attention-TP rank holds whole, but "
+                f"{per_head[0]} is per-head KV; unset "
+                f"{envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name} on the prefill."
             )
 
     def _rendezvous(self, *, side) -> tuple[str, str, tuple[str, str] | None]:
@@ -786,11 +955,16 @@ class PoolTransfer:
                 full,
                 side,
                 dst_attn_tp,
-                int(self.manager.kv_args.total_kv_head_num),
+                self._total_kv_heads(),
                 draft_total_kv_heads=self.draft_kv_heads,
                 draft_swa_total_kv_heads=self.draft_swa_kv_heads,
                 with_swa=with_side,
+                stripe=self.stripe,
             )
+            if not self._owns_pages(full):
+                # A share without a page registers nothing: the controller
+                # then plans no transfer from this worker.
+                full, spans = [], []
             self.client.register_request_blocks(
                 req_id=req_id,
                 uuid=uuid,
@@ -808,6 +982,23 @@ class PoolTransfer:
             )
             return False
         return True
+
+    @property
+    def moves_state(self) -> bool:
+        """Whether the second engine carries linear-attention state, so a
+        request's blocks there are its state rows."""
+        return self.side is not None and self.side.family is pool_side_engine.STATE
+
+    def _total_kv_heads(self) -> int:
+        """KV heads of the model, for slicing per-head KV by attention-TP
+        rank; a pool without a kv-head axis leaves it unset."""
+        return int(getattr(self.manager.kv_args, "total_kv_head_num", 0) or 0)
+
+    def _owns_pages(self, full: list[int]) -> bool:
+        """Whether this worker moves any of a transfer's pages ``full``: a
+        tensor-parallel producer's rank owns none of a transfer shorter than
+        its rank."""
+        return self.stripe is None or len(full) > self.stripe[0]
 
     def _worker_fields(self) -> dict:
         """This worker among its engine's: its transfer rank and their count
@@ -1177,6 +1368,10 @@ class PoolTransfer:
                 self.retired.add(room)
                 return
             item["registered"] = True
+            if not self._owns_pages(item["full"]):
+                # No engine reports a transfer this worker has no page of.
+                if not pool_side_engine.settle_half(self, str(room)):
+                    self.done_send.add(room)
         payload = self._source_metadata(
             full=len(item["full"]),
             start=item["start"],
@@ -1191,11 +1386,19 @@ class PoolTransfer:
     def register_decode(self, room, full, side, aux_index, infos):
         self._validate_room(room)
         mgr = self.manager
-        ranks = {int(info["pp_rank"]) for info in infos}
-        if len(ranks) != len(infos):
-            raise ValueError(
-                "Raiden pipeline sources must have distinct pipeline ranks"
-            )
+        endpoints = tuple(
+            NetworkAddress(info["rank_ip"], int(info["rank_port"])).to_tcp()
+            for info in infos
+        )
+        # A pipeline stage hears its own stage. A DP or TP decode hears every
+        # worker of the producer, its stages or its attention-TP ranks, and the
+        # bootstrap names each of them once.
+        if mgr.pp_size > 1:
+            ranks = {int(info["pp_rank"]) for info in infos}
+        else:
+            ranks = set(range(len(infos)))
+        if len(ranks) != len(infos) or len(set(endpoints)) != len(infos):
+            raise ValueError("Raiden pipeline sources must be distinct workers")
         with self.lock:
             self.receives[room] = Receive(
                 full=list(full),
@@ -1204,10 +1407,7 @@ class PoolTransfer:
                 ranks=ranks,
                 sources={},
                 deadline=time.monotonic() + mgr._timeout_s,
-                endpoints=tuple(
-                    NetworkAddress(info["rank_ip"], int(info["rank_port"])).to_tcp()
-                    for info in infos
-                ),
+                endpoints=endpoints,
             )
         endpoint = NetworkAddress(mgr.local_ip, mgr.rank_port).to_tcp()
         consumer = json.dumps(
@@ -1860,7 +2060,10 @@ class PoolTransfer:
                 self.done_send.add(room)
         for room in (self.done_send | self.failed) - self.retired:
             if room in self.sent:
-                self.client.complete_request_blocks(str(room), room, self.unit)
+                # An empty registration is left to the controller: completing
+                # it could come before the decode claims the transfer.
+                if self._owns_pages(self.sent[room]["full"]):
+                    self.client.complete_request_blocks(str(room), room, self.unit)
                 pool_side_engine.complete_twin(self, str(room))
             self.retired.add(room)
         for room, item in self.sent.items():

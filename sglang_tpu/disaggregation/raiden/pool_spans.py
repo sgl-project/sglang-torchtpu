@@ -1,4 +1,4 @@
-"""Pieces of the Raiden pipeline transfer shared with its sliding-window engine:
+"""Pieces of the Raiden pipeline transfer shared with its second engine:
 native transfer ids, per-layer byte spans, destination pages, and the decode
 state of one native transfer."""
 
@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import hashlib
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Optional, Sequence
 
+from sglang.srt.disaggregation.utils import compute_mamba_state_slice_blocks
 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
     ReshardGeometry,
     head_bytes,
@@ -36,6 +37,14 @@ def _kv_rank(tensor) -> int:
     return rank
 
 
+# Pool kinds whose pages have no kv-head axis, so every attention-TP rank holds
+# the whole page: the latent and indexer caches of a split sparse-MLA pool
+# (TpuSplitMLATokenToKVPool.transfer_page_entries).
+_REPLICATED_KINDS = frozenset({"mla.nope", "mla.rope", "dsa.idx", "dsa.raw"})
+# Kind prefix of linear-attention (GDN/KDA) state pools: "gdn.conv", "gdn.ssm".
+_STATE_KIND_PREFIX = "gdn."
+
+
 def pool_kind(tag: str) -> str:
     return tag.rsplit(".l", 1)[0]
 
@@ -48,6 +57,28 @@ def is_draft_pool(tag: str) -> bool:
     return pool_kind(tag).startswith("draft.")
 
 
+def is_replicated_pool(tag: str) -> bool:
+    return pool_kind(tag).removeprefix("draft.") in _REPLICATED_KINDS
+
+
+def is_state_pool(tag: str) -> bool:
+    return pool_kind(tag).startswith(_STATE_KIND_PREFIX)
+
+
+class StateShard(NamedTuple):
+    """How one linear-attention state tensor, ``[rows, ...]``, is head-sharded
+    over attention TP (MambaPool._iter_transfer_state_entries)."""
+
+    # "conv" or "ssm".
+    kind: str
+    layer_id: int
+    # The head-sharded axis of a row; None for state every rank holds whole.
+    axis: Optional[int]
+    # Full extents of the sub-blocks of that axis that are sharded one by one
+    # (a conv row is [query | key | value]); None when it is sharded as a whole.
+    groups: Optional[list[int]] = None
+
+
 def _producer_tensor_kv_heads(tensor: Any) -> int:
     """KV head count of a TP=1 producer page tensor when the pool omitted head_num."""
     rank = _kv_rank(tensor)
@@ -58,8 +89,20 @@ def _producer_tensor_kv_heads(tensor: Any) -> int:
     raise ValueError("Block-major KV bundles do not slice kv-heads")
 
 
-def source_spans(pools: Sequence[dict], full: list[int], swa: list[int]) -> list[Any]:
-    """Describe whole pages in destination byte space for each locally owned layer."""
+def source_spans(
+    pools: Sequence[dict],
+    full: list[int],
+    swa: list[int],
+    *,
+    stripe: tuple[int, int] | None = None,
+) -> list[Any]:
+    """Describe whole pages in destination byte space for each locally owned layer.
+
+    ``stripe`` is (rank, workers) on a producer whose workers all hold every
+    page: page ``i`` of the transfer moves from worker ``i % workers``, so the
+    workers' spans together cover each page once.
+    """
+    rank, workers = stripe or (0, 1)
     result = []
     for pool in pools:
         blocks = swa if is_swa_pool(pool["tag"]) else full
@@ -76,17 +119,82 @@ def source_spans(pools: Sequence[dict], full: list[int], swa: list[int]) -> list
                 count=1,
             )
             for index in range(len(blocks))
+            if index % workers == rank
         ]
         result.append(
             SimpleNamespace(
                 tag=pool["tag"],
                 block_ids=list(blocks),
-                declared_bytes=len(blocks) * stride,
+                declared_bytes=len(spans) * stride,
                 dst_space_version=1,
                 spans=spans,
             )
         )
     return result
+
+
+def state_shard_spans(
+    pools: Sequence[dict], rows: list[int], *, rank: int, workers: int
+) -> list[Any]:
+    """Describe a request's state row as one head shard of the full-width row.
+
+    The producer's ``workers`` attention-TP ranks each hold their heads' share
+    of a row; an attention-TP 1 destination row holds every head. Each pool's
+    ``shard`` (pool_transfer.state_pools) gives the row geometry, and
+    compute_mamba_state_slice_blocks, which the other transfer backends
+    follow too, says where rank ``rank``'s share of each sub-block goes: one
+    span per sub-block, repeated over the rows before the sharded axis (the
+    taps of a conv row). The spans are page-indexed: offsets inside the one
+    destination row.
+    """
+    result = []
+    for pool in pools:
+        shard = pool["shard"]
+        dim, unit, outer = shard["dim"], shard["unit_bytes"], shard["outer"]
+        blocks = compute_mamba_state_slice_blocks(
+            src_dim=dim,
+            dst_dim=dim * workers,
+            src_attn_tp_size=workers,
+            dst_attn_tp_size=1,
+            dst_tp_rank_in_group=0,
+            local_tp_rank_in_group=rank,
+            conv_shard_groups=shard["groups"],
+        )
+        result.append(
+            SimpleNamespace(
+                tag=pool["tag"],
+                block_ids=list(rows),
+                declared_bytes=len(rows) * outer * dim * unit,
+                dst_space_version=0,
+                spans=[
+                    SimpleNamespace(
+                        src_block_ordinal=ordinal,
+                        src_offset_bytes=src * unit,
+                        dst_block_index=ordinal,
+                        dst_offset_bytes=dst * unit,
+                        size_bytes=size * unit,
+                        src_stride_bytes=dim * unit if outer > 1 else 0,
+                        dst_stride_bytes=dim * workers * unit if outer > 1 else 0,
+                        count=outer,
+                    )
+                    for ordinal in range(len(rows))
+                    for src, dst, size in blocks
+                ],
+            )
+        )
+    return result
+
+
+def state_destination(pools: Sequence[dict], rows: list[int]) -> dict:
+    """Destination rows of a state transfer: every state pool lands in the
+    request's rows, whole."""
+    tags = [pool["tag"] for pool in pools] if rows else []
+    return dict(
+        transfer_pool_tags=tags,
+        dst_device_block_ids=list(rows) * len(tags),
+        dst_block_counts=[len(rows)] * len(tags),
+        dst_skip_bytes=[0] * len(tags),
+    )
 
 
 def head_slice_spans(
@@ -280,9 +388,10 @@ def part_spans(
     draft_total_kv_heads: int | None = None,
     draft_swa_total_kv_heads: int | None = None,
     with_swa: bool,
+    stripe: tuple[int, int] | None = None,
 ) -> list[Any]:
     """Spans of one transfer over the full-attention pools and, when with_swa,
-    the sliding-window pools."""
+    the sliding-window pools; ``stripe`` as for source_spans."""
     keep = [
         index
         for index, pool in enumerate(pools)
@@ -291,7 +400,13 @@ def part_spans(
     pools = [pools[i] for i in keep]
     tensors = [tensors[i] for i in keep]
     if dst_attn_tp == 1:
-        return source_spans(pools, full, swa)
+        return source_spans(pools, full, swa, stripe=stripe)
+    if stripe is not None or any(is_replicated_pool(pool["tag"]) for pool in pools):
+        raise ValueError(
+            "Raiden pipeline transfer moves pages without a kv-head axis, and "
+            "pages from a tensor-parallel producer, to an attention-TP 1 "
+            f"consumer only; got attention TP {dst_attn_tp}"
+        )
     return head_slice_spans(
         pools,
         tensors,

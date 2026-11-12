@@ -11,6 +11,9 @@ and front them with the P/D router (``sglang_router.launch_router
 request's sparse-MLA pages (target and MTP layers) and its KDA conv /
 recurrent state; the aux blob carries the draft's hidden seed.
 
+pd_tp8_dp8.py and pd_dp8_dp8.py serve the decode, and the second the prefill
+too, with attention DP: eight workers of attention TP 1 on the same host.
+
 The prefill does not ship the draft's shared DSA top-k, so the draft runs its
 indexer on every step (index_share_for_mtp_iteration off). Neither engine keeps
 a prefix cache.
@@ -52,7 +55,25 @@ _args.update(
 _SERVER["runtime_env"]["SGLANG_TPU_CHECK_RECOMPILATION"] = "1"
 
 GROUP = deepcopy(PD_SINGLEHOST_GROUP)
-PREFILL_CONFIG, DECODE_CONFIG = pd_singlehost_role_configs(_SERVER)
-# The split MLA pools (target and draft) and the KDA state pool have no host
-# copy, so decode retraction cannot back a request up; it aborts it instead.
-DECODE_CONFIG["server_args"]["disaggregation_decode_retraction_backup"] = "none"
+# Attention DP over the host's eight chips. The MTP draft shares the target's
+# lm_head and runs in a worker's attention-TP group, so the head follows it.
+_ATTN_DP = {"dp_size": 8, "enable_dp_attention": True, "enable_dp_lm_head": True}
+
+
+def roles(*, prefill_dp: bool = False, decode_dp: bool = False):
+    """(PREFILL_CONFIG, DECODE_CONFIG), each tp8 or with attention DP."""
+    prefill, decode = pd_singlehost_role_configs(_SERVER)
+    # The split MLA pools (target and draft) and the KDA state pool have no host
+    # copy, so decode retraction cannot back a request up; it aborts it instead.
+    decode["server_args"]["disaggregation_decode_retraction_backup"] = "none"
+    for role, attn_dp in ((prefill, prefill_dp), (decode, decode_dp)):
+        if attn_dp:
+            role["server_args"].update(_ATTN_DP)
+    if prefill_dp != decode_dp:
+        # Attention TP differs, so the request moves as a pool transfer.
+        for role in (prefill, decode):
+            role["runtime_env"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"] = "1"
+    return prefill, decode
+
+
+PREFILL_CONFIG, DECODE_CONFIG = roles()

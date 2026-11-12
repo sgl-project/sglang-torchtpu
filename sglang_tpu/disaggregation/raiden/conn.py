@@ -231,10 +231,14 @@ class RaidenKVManager(
         self.swa_raiden_endpoint: Optional[str] = None
         self._pipeline = None
         # Pipeline stages always transfer by named layer pools; a DP or TP
-        # decode opts in to consume from a pipeline prefill.
+        # decode opts in to consume from a pipeline prefill, and a
+        # tensor-parallel prefill with its decode to transfer that way too.
         self._pipeline_enabled = self.pp_size > 1 or (
-            disaggregation_mode == DisaggregationMode.DECODE
-            and tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+            tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+            and (
+                disaggregation_mode == DisaggregationMode.DECODE
+                or self.attn_tp_size > 1
+            )
         )
         self._pipeline_init_lock = threading.Lock()
         self._pipeline_messages = []
@@ -485,11 +489,14 @@ class RaidenKVManager(
                     "(--enable-unified-memory); disable pipeline parallelism and "
                     f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
                 )
-            if self._state_kv_caches:
+            if self._state_kv_caches and (
+                self.pp_size > 1 or not kv_caches.state_shards
+            ):
                 raise NotImplementedError(
-                    "Raiden pipeline transfer does not move GDN (linear-attention) "
-                    "state yet; serve hybrid linear-attention models without "
-                    "pipeline parallelism or "
+                    "Raiden pipeline transfer moves GDN (linear-attention) state "
+                    "only from a tensor-parallel prefill to an attention-DP "
+                    "decode; serve other state, and hybrid linear-attention "
+                    "models on a pipeline, without pipeline parallelism or "
                     f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
                 )
             from sglang_tpu.disaggregation.raiden.pool_transfer import PoolTransfer
@@ -1265,7 +1272,9 @@ class RaidenKVManager(
         try:
             if not self._pipeline_enabled:
                 raise ValueError(
-                    "Raiden pipeline transfer requires a pipeline-parallel prefill"
+                    "Raiden pipeline transfer requires a pipeline-parallel prefill, "
+                    "or a tensor-parallel one with "
+                    f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}"
                 )
             with self._pipeline_init_lock:
                 if self._pipeline is None:
@@ -1316,7 +1325,9 @@ class RaidenKVManager(
         self, state_indices: Optional[List]
     ) -> List[int]:
         """The committed state row/pages of the request's state slot."""
-        if self._state_engine is None:
+        if self._state_engine is None and not (
+            self._pipeline is not None and self._pipeline.moves_state
+        ):
             return []
         try:
             index = self.kv_args.state_types.index(self._state_type)

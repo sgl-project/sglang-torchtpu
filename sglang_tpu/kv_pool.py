@@ -1441,24 +1441,32 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             buf for buf in optional if buf is not None
         ]
 
-    def transfer_page_buffers(self) -> list[tuple[int, torch.Tensor]]:
-        """``(layer_id, buffer)`` for every buffer a P/D transfer moves.
+    def transfer_page_entries(self) -> list[tuple[str, int, torch.Tensor]]:
+        """``(kind, layer_id, buffer)`` for every buffer a P/D transfer moves.
 
-        Grouped by kind: every layer's NoPE, then RoPE, index keys and raw
-        key|gate. A model without RoPE dims (``qk_rope_head_dim == 0``) only
-        writes zeros to its RoPE buffer, so the buffer stays behind: the
+        Grouped by kind: every layer's NoPE (``mla.nope``), then RoPE
+        (``mla.rope``), index keys (``dsa.idx``) and raw key|gate
+        (``dsa.raw``). A model without RoPE dims (``qk_rope_head_dim == 0``)
+        only writes zeros to its RoPE buffer, so the buffer stays behind: the
         receiver's starts zeroed too.
         """
-        kinds = [self.nope_buffer]
+        kinds = [("mla.nope", self.nope_buffer)]
         if self.qk_rope_head_dim > 0:
-            kinds.append(self.rope_buffer)
-        kinds += [self.index_key_buffer, self.kpool_raw_buffer]
+            kinds.append(("mla.rope", self.rope_buffer))
+        kinds += [
+            ("dsa.idx", self.index_key_buffer),
+            ("dsa.raw", self.kpool_raw_buffer),
+        ]
         return [
-            (self.start_layer + i, buf)
-            for kind in kinds
-            for i, buf in enumerate(kind)
+            (kind, self.start_layer + i, buf)
+            for kind, buffers in kinds
+            for i, buf in enumerate(buffers)
             if buf is not None
         ]
+
+    def transfer_page_buffers(self) -> list[tuple[int, torch.Tensor]]:
+        """``(layer_id, buffer)`` of transfer_page_entries, in its order."""
+        return [(layer, buf) for _, layer, buf in self.transfer_page_entries()]
 
     def get_nope_cache(self, layer_id: int) -> torch.Tensor:
         return self.nope_buffer[layer_id - self.start_layer]

@@ -25,6 +25,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
 
+import dataclasses
 import os
 import sys
 import threading
@@ -48,6 +49,7 @@ from sglang_tpu.disaggregation.raiden.common import (
 )
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
+from sglang_tpu.disaggregation.raiden.pool_spans import StateShard
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -59,7 +61,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
 )
-from sglang_tpu.mamba_pool import TpuMambaPool
+from sglang_tpu.mamba_pool import TpuMambaPool, TpuPerLayerState
 
 
 def _polled(sent=(), received=(), failed=(), completed_ns=None):
@@ -1003,6 +1005,11 @@ class TestRaidenStateTransfer(RaidenStateTestCase):
         )
         with self.assertRaisesRegex(NotImplementedError, "GDN"):
             decode.set_kv_caches(groups)
+        # State that says how it shards still does not move between stages.
+        decode.pp_size = 2
+        groups = dataclasses.replace(groups, state_shards=[StateShard("ssm", 0, 0)])
+        with self.assertRaisesRegex(NotImplementedError, "GDN"):
+            decode.set_kv_caches(groups)
 
 
 class TestRaidenStateEngine(RaidenRendezvousTestCase):
@@ -1130,11 +1137,17 @@ class TestRaidenStateGroups(CustomTestCase):
         pool.mamba_pool = mamba_pool
         return pool, kv
 
-    def test_linear_attention_pool_contributes_its_state(self):
+    def _mamba_pool(self, conv, temporal, *, checkpoint_width):
         mamba = TpuMambaPool.__new__(TpuMambaPool)
-        mamba.checkpoint_width = 3
+        mamba.checkpoint_width = checkpoint_width
+        mamba.mamba_cache = TpuPerLayerState(conv=[[conv]], temporal=[temporal])
+        mamba.mamba_layer_ids = [5]
+        mamba.conv_shard_groups = [2, 1, 1]
+        return mamba
+
+    def test_linear_attention_pool_contributes_its_state(self):
         state = [torch.zeros(12, 2, 1, 4), torch.zeros(12, 4, 2, 2)]
-        mamba.get_state = lambda: state
+        mamba = self._mamba_pool(*state, checkpoint_width=3)
         pool, kv = self._hybrid_pool(mamba_pool=mamba)
 
         groups = get_raiden_kv_caches(pool)
@@ -1143,6 +1156,12 @@ class TestRaidenStateGroups(CustomTestCase):
         self.assertEqual(groups.full_layer_ids, [3, 7])
         self.assertEqual(groups.state, state)
         self.assertEqual(groups.committed_state_row(2), 2)
+        # A conv row shards its last axis sub-block by sub-block, a recurrent
+        # row its heads.
+        self.assertEqual(
+            groups.state_shards,
+            [StateShard("conv", 5, 2, [2, 1, 1]), StateShard("ssm", 5, 0, None)],
+        )
 
     def test_non_tpu_mamba_pool_contributes_no_state(self):
         pool, _ = self._hybrid_pool(mamba_pool=object())
@@ -1153,9 +1172,9 @@ class TestRaidenStateGroups(CustomTestCase):
         self.assertIsNone(groups.committed_state_row)
 
     def test_state_tensors_must_share_one_row_count(self):
-        mamba = TpuMambaPool.__new__(TpuMambaPool)
-        mamba.checkpoint_width = 1
-        mamba.get_state = lambda: [torch.zeros(4, 2), torch.zeros(5, 2)]
+        mamba = self._mamba_pool(
+            torch.zeros(4, 2, 1, 4), torch.zeros(5, 4, 2, 2), checkpoint_width=1
+        )
         pool, _ = self._hybrid_pool(mamba_pool=mamba)
 
         with self.assertRaisesRegex(RuntimeError, "uniform GDN state"):

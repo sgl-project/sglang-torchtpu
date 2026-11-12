@@ -332,7 +332,8 @@ class TpuEnvs:
     # Pinned-host budget for retraction backup. 0 keeps the row-copy path.
     SGLANG_RAIDEN_RETRACT_HOST_GB = EnvFloat(0.0)
 
-    # Raiden: a DP or TP decode receives KV from a pipeline-parallel prefill.
+    # Raiden: a DP or TP decode receives KV from a pipeline-parallel prefill;
+    # on both engines, a tensor-parallel prefill feeds an attention-DP decode.
     SGLANG_RAIDEN_PIPELINE_TRANSFER = EnvBool(False)
     # Raiden: stage each transfer (and reshard plan) in its own host-pool pages
     # instead of fixed max-length slots; asymmetric attention TP needs it.

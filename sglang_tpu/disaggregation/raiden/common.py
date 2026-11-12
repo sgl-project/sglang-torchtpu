@@ -17,7 +17,10 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.network import NetworkAddress
-from sglang_tpu.disaggregation.raiden.pool_spans import _BLOCK_MAJOR_KV_RANK
+from sglang_tpu.disaggregation.raiden.pool_spans import (
+    _BLOCK_MAJOR_KV_RANK,
+    StateShard,
+)
 from sglang_tpu.disaggregation.raiden.serde import (
     BLOCK_MAJOR_KV_LAYOUT,
     PER_LAYER_KV_LAYOUT,
@@ -83,6 +86,10 @@ class RaidenKVCacheGroups:
     # One global layer ID per tensor; a block-major bundle is named by its first.
     full_layer_ids: List[int] = field(default_factory=list)
     swa_layer_ids: List[int] = field(default_factory=list)
+    # Pool kind per full tensor when they are not all per-head attention KV:
+    # "" for per-head KV, else what a split sparse-MLA pool names its buffer
+    # (TpuSplitMLATokenToKVPool.transfer_page_entries).
+    full_kinds: List[str] = field(default_factory=list)
     # Trailing tensors of full / swa that belong to a separate draft pool.
     num_draft_full: int = 0
     num_draft_swa: int = 0
@@ -96,6 +103,8 @@ class RaidenKVCacheGroups:
     state: List[torch.Tensor] = field(default_factory=list)
     state_type: StateType = StateType.MAMBA
     state_max_blocks: int = 1
+    # How each GDN/Mamba state tensor is head-sharded over attention TP.
+    state_shards: List[StateShard] = field(default_factory=list)
     # Maps a request's mamba slot to the state row a transfer moves.
     committed_state_row: Optional[Callable[[int], int]] = None
     # Optional host-side metadata pack/unpack hooks accompanying state_blocks.
@@ -227,10 +236,10 @@ def get_raiden_kv_caches(
         is_hybrid = isinstance(current_pool, HybridLinearKVPool)
         split_pool = current_pool.full_kv_pool if is_hybrid else current_pool
         if isinstance(split_pool, TpuSplitMLATokenToKVPool):
-            entries = split_pool.transfer_page_buffers()
-            split_buffers = [buf for _, buf in entries]
+            entries = split_pool.transfer_page_entries()
+            split_buffers = [buf for _, _, buf in entries]
             _assert_root_buffers("split MLA KV", split_buffers)
-            split_ids = [layer for layer, _ in entries]
+            split_ids = [layer for _, layer, _ in entries]
             if is_hybrid:
                 # The hybrid pool's split pool is dense over its full layers.
                 mapping = current_pool.full_attention_layer_id_mapping
@@ -241,6 +250,7 @@ def get_raiden_kv_caches(
                 swa=[],
                 full_layer_ids=split_ids,
                 swa_layer_ids=[],
+                full_kinds=[kind for kind, _, _ in entries],
             )
 
         layers_mapping = getattr(current_pool, "layers_mapping", None)
@@ -298,6 +308,7 @@ def get_raiden_kv_caches(
     groups = group_one(pool)
     full, swa = list(groups.full), list(groups.swa)
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
+    full_kinds = list(groups.full_kinds) or [""] * len(full)
     seq_along_lane = _is_seq_along_lane_pool(pool)
     num_draft_full = num_draft_swa = num_hidden_full = 0
     draft_kv_head_num: Optional[int] = None
@@ -309,6 +320,7 @@ def get_raiden_kv_caches(
         swa.extend(draft_groups.swa)
         full_ids.extend(draft_groups.full_layer_ids)
         swa_ids.extend(draft_groups.swa_layer_ids)
+        full_kinds.extend(draft_groups.full_kinds or [""] * num_draft_full)
         full_draft_pool = getattr(draft_pool, "full_kv_pool", draft_pool)
         swa_draft_pool = getattr(draft_pool, "swa_kv_pool", draft_pool)
         draft_kv_head_num = getattr(full_draft_pool, "head_num", None)
@@ -318,11 +330,13 @@ def get_raiden_kv_caches(
     if hidden_pool is not None:
         full.append(hidden_pool.buffer)
         full_ids.append(0)
+        full_kinds.append("")
         num_hidden_full = 1
 
     state: List[torch.Tensor] = []
     state_type = StateType.MAMBA
     state_max_blocks = 1
+    state_shards: List[StateShard] = []
     committed_state_row = None
     read_state_meta = None
     write_state_meta = None
@@ -342,6 +356,20 @@ def get_raiden_kv_caches(
     ):
         state = pool.mamba_pool.get_state()
         committed_state_row = pool.mamba_pool.committed_row
+        # In get_state order: both walk the conv kinds, then the recurrent state.
+        state_shards = [
+            StateShard(
+                kind="conv" if name == "conv" else "ssm",
+                layer_id=int(layer_id),
+                axis=axis,
+                groups=groups,
+            )
+            for (name, _, axis, layer_id), groups in zip(
+                pool.mamba_pool._iter_transfer_state_entries(),
+                pool.mamba_pool.get_state_conv_shard_groups(),
+                strict=True,
+            )
+        ]
 
     for name, group in (("full KV", full), ("SWA KV", swa), ("GDN state", state)):
         block_counts = {int(buf.shape[0]) for buf in group}
@@ -355,6 +383,7 @@ def get_raiden_kv_caches(
         swa=swa,
         full_layer_ids=full_ids,
         swa_layer_ids=swa_ids,
+        full_kinds=full_kinds if any(full_kinds) else [],
         num_draft_full=num_draft_full,
         num_draft_swa=num_draft_swa,
         draft_kv_head_num=draft_kv_head_num,
@@ -363,6 +392,7 @@ def get_raiden_kv_caches(
         state=state,
         state_type=state_type,
         state_max_blocks=state_max_blocks,
+        state_shards=state_shards,
         committed_state_row=committed_state_row,
         read_state_meta=read_state_meta,
         write_state_meta=write_state_meta,
