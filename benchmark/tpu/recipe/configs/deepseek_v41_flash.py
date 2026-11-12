@@ -40,8 +40,9 @@ CONFIG["server_args"].update(
         "enable_torch_compile": True,
         "tpu_compile_tokens": [128, 256, 512, 1024],
         # Decode pads to bs 8, as vllm-torchtpu's MIN_NUM_SEQS = 8 does: the
-        # bs=1 decode graph returns NaN logits (CSA2's batch == 1 fixed-tile
-        # path is unvalidated there and here).
+        # bs=1 decode graph returns NaN logits after the first token. The cause
+        # is not located yet; the CSA2 kernel alone matches the dense reference
+        # at batch 1 (fixed-tile and padded layouts), so it is not the kernel.
         "tpu_compile_bs": [8],
         "torch_compile_max_bs": 8,
         "disable_radix_cache": True,
