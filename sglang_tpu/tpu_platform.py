@@ -1393,7 +1393,7 @@ class TpuSRTPlatform(SRTPlatform):
         return TpuShortConvAttnBackend
 
     def get_short_conv_kernel(self):
-        from sglang_tpu.short_conv import short_conv
+        from sglang_tpu.attention_short_conv import short_conv
 
         return short_conv
 

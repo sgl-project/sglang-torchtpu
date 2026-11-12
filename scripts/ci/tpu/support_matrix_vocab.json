@@ -13,6 +13,9 @@
     "multihost": "Multi-host"
   },
   "models": {
+    "lfm2": {
+      "name": "LiquidAI LFM2"
+    },
     "muse-spark-open-816b-a42b": {
       "name": "Muse Spark Open 816B-A42B NVFP4"
     },
@@ -93,6 +96,7 @@
     "infra": "infra"
   },
   "features": {
+    "short-conv": "Causal short convolution",
     "spec": "Speculative decoding",
     "eagle3": "EAGLE3",
     "dflash": "DFlash",
