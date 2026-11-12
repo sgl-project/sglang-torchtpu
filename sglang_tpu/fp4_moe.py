@@ -413,6 +413,17 @@ def apply_tpu_nvfp4_moe(
             partition_count, rows_per_partition, topk_ids.shape[-1]
         )
 
+        # Stacked expert slabs of the Muse megakernel (SGLANG_TPU_MUSE_MK_EXPERT_GROUP).
+        buffers = layer._buffers
+        stacked = "_stacked_w13_weight" in buffers
+        w1 = buffers["_stacked_w13_weight"] if stacked else layer.w13_weight
+        w2 = buffers["_stacked_w2_weight"] if stacked else layer.w2_weight
+        w1_scale = (
+            buffers["_stacked_w13_weight_scale"] if stacked else layer.w13_weight_scale
+        )
+        w2_scale = (
+            buffers["_stacked_w2_weight_scale"] if stacked else layer.w2_weight_scale
+        )
         outputs = []
         for token_start in range(0, rows_per_partition, rows_per_call):
             token_end = min(token_start + rows_per_call, rows_per_partition)
@@ -423,10 +434,10 @@ def apply_tpu_nvfp4_moe(
 
             output = fused_moe_rs_gather(
                 hidden_states=chunk_hidden,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
+                w1=w1,
+                w2=w2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
                 topk_weights=chunk_weights,
                 topk_ids=chunk_ids,
                 post_expert_norm_weight=post_expert_norm_weight,

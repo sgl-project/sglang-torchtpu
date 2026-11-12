@@ -712,6 +712,15 @@ def kernel_main_fused_rs(
         w2_packed = w2_ref.bitcast(jnp.uint32)
     else:
         w2_packed = w2_ref
+    if w1_ref.ndim == 4:
+        # Stacked layers (Muse megakernel expert groups): group_offset[1] is the layer.
+        _layer_idx = group_offset_ref[1]
+        w1_packed = w1_packed.at[_layer_idx]
+        w2_packed = w2_packed.at[_layer_idx]
+        if w1_scale_ref is not None:
+            w1_scale_ref = w1_scale_ref.at[_layer_idx]
+        if w2_scale_ref is not None:
+            w2_scale_ref = w2_scale_ref.at[_layer_idx]
 
     num_k1 = dims.size_k1 // tile_k1
     num_k2 = dims.size_k2 // tile_k2
@@ -1629,16 +1638,19 @@ def gmm_v2_fused_rs(
     Output: (chunk_size * top_k, size_n2) per chip — raw expert contributions.
     Post-kernel reduction applies topk_weights and sums over top_k dim.
     """
-    size_group, size_k1, size_n1 = w1.shape
-    _, size_k2, size_n2 = w2.shape
+    stacked = w1.ndim == 4
+    size_group, size_k1, size_n1 = w1.shape[1:] if stacked else w1.shape
+    _, size_k2, size_n2 = w2.shape[1:] if stacked else w2.shape
     size_m = lhs_indices.shape[0]
     chunk_size = output_size // ep_size
 
     is_quantized = w1_scale is not None
     if is_quantized:
         assert w2_scale is not None
-        rhs1_quant_block_size = recover_quant_block_size(size_k1, w1_scale.shape[1])
-        rhs2_quant_block_size = recover_quant_block_size(size_k2, w2_scale.shape[1])
+        w1s_shape = w1_scale.shape[1:] if stacked else w1_scale.shape
+        w2s_shape = w2_scale.shape[1:] if stacked else w2_scale.shape
+        rhs1_quant_block_size = recover_quant_block_size(size_k1, w1s_shape[1])
+        rhs2_quant_block_size = recover_quant_block_size(size_k2, w2s_shape[1])
         quant_block_size = rhs1_quant_block_size
         # Scales stay in their stored dtype when it is bf16 or fp32: the matmul
         # casts each tile slice, while a full-tensor cast here would re-copy
@@ -1650,12 +1662,12 @@ def gmm_v2_fused_rs(
         )
         w1_scale = w1_scale.astype(scale_dtype)
         w2_scale = w2_scale.astype(scale_dtype)
-        if w1_scale.ndim != w2_scale.ndim or w1_scale.ndim not in (3, 4):
+        if len(w1s_shape) != len(w2s_shape) or len(w1s_shape) not in (3, 4):
             raise ValueError(
                 "fused-RS scales must both be [E, K_blocks, N] or "
                 f"[E, K_blocks, 1, N], got {w1_scale.shape} and {w2_scale.shape}"
             )
-        scale_has_unit_dim = w1_scale.ndim == 4
+        scale_has_unit_dim = len(w1s_shape) == 4
     else:
         rhs1_quant_block_size = size_k1
         rhs2_quant_block_size = size_k2
@@ -1765,16 +1777,18 @@ def gmm_v2_fused_rs(
         hidden_states = jnp.pad(hidden_states, ((0, 0), (0, k_pad)))
 
     # Pad N1 (and propagate to K2 since GMM2's K is GMM1's intermediate size).
+    lead_pads = ((0, 0),) if stacked else ()
+    s_axis = 2 if stacked else 1
     if aligned_n1 != size_n1:
         n1_pad = aligned_n1 - size_n1
-        w1 = jnp.pad(w1, ((0, 0), (0, 0), (0, n1_pad)))
+        w1 = jnp.pad(w1, lead_pads + ((0, 0), (0, 0), (0, n1_pad)))
         if is_quantized:
             w1_scale = jnp.pad(
                 w1_scale, ((0, 0),) * (w1_scale.ndim - 1) + ((0, n1_pad),)
             )
         new_k2 = aligned_n1 // 2
         if new_k2 != size_k2:
-            w2 = jnp.pad(w2, ((0, 0), (0, new_k2 - size_k2), (0, 0)))
+            w2 = jnp.pad(w2, lead_pads + ((0, 0), (0, new_k2 - size_k2), (0, 0)))
             size_k2 = new_k2
         size_n1 = aligned_n1
 
@@ -1788,31 +1802,31 @@ def gmm_v2_fused_rs(
     if is_quantized:
         nqb1 = -(-tile_k1 // rhs1_quant_block_size)
         total_scale_blocks1 = (size_k1 // tile_k1) * nqb1
-        if w1_scale.shape[1] < total_scale_blocks1:
+        if w1_scale.shape[s_axis] < total_scale_blocks1:
             w1_scale = jnp.concatenate(
                 [
                     w1_scale,
                     jnp.repeat(
-                        w1_scale[:, -1:],
-                        total_scale_blocks1 - w1_scale.shape[1],
-                        axis=1,
+                        w1_scale[:, :, -1:] if stacked else w1_scale[:, -1:],
+                        total_scale_blocks1 - w1_scale.shape[s_axis],
+                        axis=s_axis,
                     ),
                 ],
-                axis=1,
+                axis=s_axis,
             )
         nqb2 = -(-tile_k2 // rhs2_quant_block_size)
         total_scale_blocks2 = (size_k2 // tile_k2) * nqb2
-        if w2_scale.shape[1] < total_scale_blocks2:
+        if w2_scale.shape[s_axis] < total_scale_blocks2:
             w2_scale = jnp.concatenate(
                 [
                     w2_scale,
                     jnp.repeat(
-                        w2_scale[:, -1:],
-                        total_scale_blocks2 - w2_scale.shape[1],
-                        axis=1,
+                        w2_scale[:, :, -1:] if stacked else w2_scale[:, -1:],
+                        total_scale_blocks2 - w2_scale.shape[s_axis],
+                        axis=s_axis,
                     ),
                 ],
-                axis=1,
+                axis=s_axis,
             )
     else:
         total_scale_blocks1 = 0
