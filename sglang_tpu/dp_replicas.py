@@ -20,7 +20,6 @@ import torch.distributed as dist
 from sglang.utils import LazyImport
 
 logger = logging.getLogger(__name__)
-_BARRIER_FLAG = "--xla_jf_emit_global_barrier_at_start"
 _active_session: ReplicaSession | None = None
 
 # Platform discovery can reach this module while envs or srt.utils is importing.
@@ -60,12 +59,9 @@ def prepare_host_session(dp_size: int, tp_size: int) -> None:
             f"TORCH_TPU_SLICEBUILDER_ADDRESSES lists {len(addresses.split(','))}; "
             "unset it to pick ports"
         )
-    flags = os.environ.get("LIBTPU_INIT_ARGS", "").split()
-    configured = [flag for flag in flags if flag.split("=", 1)[0] == _BARRIER_FLAG]
-    if any(flag != f"{_BARRIER_FLAG}=false" for flag in configured):
-        raise ValueError(f"Independent TPU replicas require {_BARRIER_FLAG}=false")
-    if not configured:
-        os.environ["LIBTPU_INIT_ARGS"] = " ".join([*flags, f"{_BARRIER_FLAG}=false"])
+    # Keep libtpu's global barrier at program start: with
+    # --xla_jf_emit_global_barrier_at_start=false, a replica's collective that overlaps
+    # another group's collective can halt the SparseCore or return wrong values.
     # Pick these once in the parent; all spawned workers inherit the same ports.
     for name in ("TORCH_TPU_INTERNAL_HANDSHAKE_PORT", "SGLANG_TPU_DP_SESSION_PORT"):
         if name not in os.environ:
