@@ -466,6 +466,9 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    # The soft watchdog starts before disaggregation initialization.
+    _decode_queue_watchdog_active: bool = False
+    _decode_queue_watchdog_counter: int = 0
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     kv_free_fence: Optional["KVFreeFence"] = None
     # Draft KV pools cpu_tensor retraction backs up with the target KV.

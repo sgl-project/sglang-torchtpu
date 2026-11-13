@@ -521,6 +521,12 @@ def create_scheduler_watchdog(
     def dump_info() -> str:
         if scheduler.is_initializing:
             return ""
+        if scheduler._decode_queue_watchdog_active:
+            return (
+                "Scheduler stalled while polling decode queues before batch formation."
+            )
+        if scheduler.cur_batch_for_debug is None:
+            return "Scheduler has no active model batch."
         _, messages = scheduler.invariant_checker._check_all_pools(
             scheduler.pool_stats_observer.get_pool_stats(),
         )
@@ -531,9 +537,13 @@ def create_scheduler_watchdog(
 
     return WatchdogRaw(
         debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
+        get_counter=lambda: (
+            scheduler.forward_ct + scheduler._decode_queue_watchdog_counter
+        ),
         is_active=lambda: (
-            scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
+            scheduler.is_initializing
+            or scheduler.cur_batch_for_debug is not None
+            or scheduler._decode_queue_watchdog_active
         ),
         watchdog_timeout=watchdog_timeout,
         soft=soft,
