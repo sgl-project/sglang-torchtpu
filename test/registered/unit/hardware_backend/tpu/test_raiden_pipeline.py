@@ -26,7 +26,7 @@ from sglang_tpu.disaggregation.raiden.pool_spans import (
     source_spans,
 )
 from sglang_tpu.disaggregation.raiden.pool_transfer import (
-    PoolTransfer,
+    RaidenPoolTransfer,
     Receive,
     destination_blocks,
     layout_fingerprint,
@@ -134,7 +134,7 @@ def sent(expires=None, registered=True):
 
 
 def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=0):
-    pipe = PoolTransfer.__new__(PoolTransfer)
+    pipe = RaidenPoolTransfer.__new__(RaidenPoolTransfer)
     pipe.manager = SimpleNamespace(
         _state_lock=threading.Lock(),
         _aborted={},
@@ -1148,7 +1148,7 @@ class TestPipelineInitialization(unittest.TestCase):
             ),
         }
         with patch.dict(sys.modules, native):
-            pipe = PoolTransfer(manager, buffers)
+            pipe = RaidenPoolTransfer(manager, buffers)
         expected = ["engine", "pools", "layout", "work_unit"]
         if legacy:
             expected = ["materialize", "layout"] + expected

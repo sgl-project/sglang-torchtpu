@@ -492,9 +492,11 @@ class RaidenKVManager(
                     "pipeline parallelism or "
                     f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
                 )
-            from sglang_tpu.disaggregation.raiden.pool_transfer import PoolTransfer
+            from sglang_tpu.disaggregation.raiden.pool_transfer import (
+                RaidenPoolTransfer,
+            )
 
-            pipeline = PoolTransfer(self, kv_caches)
+            pipeline = RaidenPoolTransfer(self, kv_caches)
             self._engine = pipeline.engine
             self.raiden_endpoint = pipeline.controller
             self.chunked_transfer = False

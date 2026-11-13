@@ -187,8 +187,8 @@ class Domain:
 
 
 def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
-    """A PoolTransfer with its window link, built like __init__ would."""
-    t = object.__new__(pl.PoolTransfer)
+    """A RaidenPoolTransfer with its window link, built like __init__ would."""
+    t = object.__new__(pl.RaidenPoolTransfer)
     producer = mode == PREFILL
     mgr = harness.Manager(mode, rank if producer else 0, pp_size, world.bus, name)
     mgr.attn_tp_size, mgr.attn_tp_rank = (1, 0) if producer else (tp_size, rank)
@@ -985,7 +985,7 @@ class Buffer:
 
 
 def _initialize(groups, *, bounded_staging=True, real_budget=False):
-    """PoolTransfer(...) over fake tpu-sync natives; the result records
+    """RaidenPoolTransfer(...) over fake tpu-sync natives; the result records
     the engines, stores, work units and slot plans it made. Slot counts come
     from RaidenKVManager's host budget with ``real_budget``, else fixed."""
     r = SimpleNamespace(pipe=None, error=None, engines=[], stores=[], units=[])
@@ -1102,7 +1102,7 @@ def _initialize(groups, *, bounded_staging=True, real_budget=False):
     }
     with patch.dict(sys.modules, native):
         try:
-            r.pipe = pl.PoolTransfer(manager, groups)
+            r.pipe = pl.RaidenPoolTransfer(manager, groups)
         except Exception as error:
             r.error = error
     for pipe in (r.pipe, getattr(r.pipe, "side", None)):
@@ -1209,7 +1209,7 @@ def test_full_attention_only_stage_is_unchanged():
 
 @pytest.mark.parametrize("local_swa", [True, False])
 def test_workers_must_agree_with_rank_zero_on_the_window_engine(local_swa):
-    pipe = object.__new__(pl.PoolTransfer)
+    pipe = object.__new__(pl.RaidenPoolTransfer)
     pipe.rank = 1
     pipe.manager = SimpleNamespace(
         pp_size=2, attn_tp_size=1, local_ip="10.0.0.2", _control_port=31004

@@ -340,7 +340,7 @@ class StagingPlan(msgspec.Struct, frozen=True):
     native_slot_bytes: int = 0
 
 
-class PoolTransfer:
+class RaidenPoolTransfer:
     """One named-pool engine per worker, sharing its pipeline's reshard
     controller; a pool family with another block count, such as a hybrid
     pool's sliding-window layers, gets a second engine (pool_side_engine)."""

@@ -35,7 +35,7 @@ worker ids the controller dispatches to. tpu-sync serves the first controller
 and the first engine's worker service from process-wide servers; the second
 store and engines each get a private one (private_native_servers).
 
-Functions run under PoolTransfer.lock unless they say otherwise.
+Functions run under RaidenPoolTransfer.lock unless they say otherwise.
 """
 
 from __future__ import annotations
