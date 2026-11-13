@@ -869,7 +869,9 @@ class MuseMegakernel(torch.nn.Module):
             post_moe_tile=int(os.environ.get("MUSE_PF_POST_MOE_TILE", "128")),
             fp8_gather=tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER.get(),
             expert_groups=self.expert_groups,
-            fp4_w4a16=bool(tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get()),
+            w4a16_layers=tuple(i for i, k in enumerate(self.kinds) if k == "fp4")
+            if tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get()
+            else (),
         )
 
     def prefill_callable_for(self, cfg):

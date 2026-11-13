@@ -46,8 +46,8 @@ class PFConfig(msgspec.Struct, frozen=True, kw_only=True):
     fp8_gather: bool = False
     # [lo, hi) stacked expert slab groups (shared with the decode megakernel)
     expert_groups: tuple = ()
-    # block-256 requantized fp4 experts (SGLANG_TPU_MUSE_MK_QBLOCK): bf16 expert LHS (W4A16)
-    fp4_w4a16: bool = False
+    # layers with block-256 requantized fp4 experts (SGLANG_TPU_MUSE_MK_QBLOCK): W4A16 MoE
+    w4a16_layers: tuple = ()
 
     @property
     def q_dim(self) -> int:
@@ -206,7 +206,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 # Tuning: e4m3 row writes (half the output / ICI bytes, adds a
                 # rounding of the per-slice partial rows).
                 fp8_direct_write=os.environ.get("MUSE_PF_MOE_FP8_WRITE", "0") == "1",
-                fp4_w4a16=c.fp4_w4a16,
+                fp4_w4a16=l in c.w4a16_layers,
             )
             nxt = l + 1 if l + 1 < L else None
             x, q, kvs, gate = post_moe[c.use_rope(nxt) if nxt is not None else None](
