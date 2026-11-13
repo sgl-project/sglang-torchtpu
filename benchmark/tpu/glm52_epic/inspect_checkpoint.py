@@ -61,7 +61,7 @@ def inspect(root: Path) -> dict:
             kind = "scalar"
         else:
             kind = "other_or_block"
-        policy[(suffix, kind)] += 1
+        policy[(suffix, kind, len(shape))] += 1
         scales.append({"name": name, **meta, "weight_shape": weight["shape"] if weight else None,
                        "classification": kind})
     return {
@@ -75,7 +75,7 @@ def inspect(root: Path) -> dict:
             "qk_rope_head_dim", "index_head_dim", "index_topk", "index_kpool")},
         "tensor_count": len(tensors), "missing_index_tensors": missing,
         "wrong_index_shard": wrong_shard,
-        "scale_summary": [{"suffix": key[0], "kind": key[1], "count": value}
+        "scale_summary": [{"suffix": key[0], "kind": key[1], "scale_rank": key[2], "count": value}
                           for key, value in sorted(policy.items())],
         "scales": scales,
         "loader_compatibility": "UNVERIFIED: compare recorded scale ABI against consumer allocation/loading",
