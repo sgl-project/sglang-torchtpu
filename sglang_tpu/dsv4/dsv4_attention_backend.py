@@ -896,6 +896,14 @@ class DSV4TPUAttnBackend(
                 module, "_kernel_num_heads"
             ):
                 module._local_attn_sink(module._kernel_num_heads(1))
+            # accepts_mxfp8_swizzled_input() caches its answer on the module.
+            # Compute it here, before torch.compile: setting that attribute
+            # inside the first compiled forward leaves a stale guard on the
+            # first compiled shape, so a later call with that shape recompiles
+            # and fails under the `fail_on_recompile` stance.
+            accepts_swizzled = getattr(module, "accepts_mxfp8_swizzled_input", None)
+            if callable(accepts_swizzled):
+                accepts_swizzled()
         for module in model.modules():
             if hasattr(module, "freqs_cis"):
                 freqs_cis = module.freqs_cis
