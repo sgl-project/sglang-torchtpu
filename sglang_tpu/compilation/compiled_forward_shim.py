@@ -14,6 +14,7 @@ import inspect
 import time
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -90,6 +91,8 @@ _BS_FIELDS = (
     "extend_prefix_lens",
     "extend_start_loc",
     "encoder_lens",
+    "cp_last_rows",
+    "cp_last_owner_mask",
     *_MAMBA_TRACK_FIELDS,
 )
 
@@ -673,6 +676,120 @@ def _pad_forward_batch_inputs(
         )
         real_q_out, real_b_out = real_q, real_b
 
+    from sglang.srt.layers.cp.utils import is_cp_active
+
+    if is_cp_active(forward_batch):
+        meta = forward_batch.attn_cp_metadata
+        forward_batch.cp_last_rows = getattr(meta, "cp_last_rows", None)
+        forward_batch.cp_last_owner_mask = getattr(meta, "cp_last_owner_mask", None)
+        if (
+            forward_batch.cp_last_rows is not None
+            and forward_batch.cp_last_rows.shape[0] < pad_b
+        ):
+            forward_batch.cp_last_rows = _zero_pad_dim0(
+                forward_batch.cp_last_rows, pad_b
+            )
+        if (
+            forward_batch.cp_last_owner_mask is not None
+            and forward_batch.cp_last_owner_mask.shape[0] < pad_b
+        ):
+            forward_batch.cp_last_owner_mask = _zero_pad_dim0(
+                forward_batch.cp_last_owner_mask, pad_b
+            )
+        forward_batch.gather_reorder_index = getattr(meta, "gather_reorder_index", None)
+        if getattr(meta, "gather_rank", None) is not None:
+            # The in-graph K/V all-gather sees `pad_t` rows per rank (every
+            # token field is padded to the bucket below), not the 16-aligned
+            # `meta.stride` the host index was built for. Rebuild it for the
+            # real row count, or rows owned by rank >= 1 land on rank 0's
+            # padding (zero K/V for 1 - 1/cp of the prompt).
+            from sglang.srt.layers.cp.padding import gather_reorder_index_for
+
+            forward_batch.gather_reorder_index = gather_reorder_index_for(
+                meta, pad_t, forward_batch.input_ids.device
+            )
+        elif forward_batch.gather_reorder_index is not None:
+            from sglang.srt.runtime_context import get_parallel
+
+            cp_size = get_parallel().attn_cp_size
+            target_gather_len = pad_t * cp_size
+            curr_len = forward_batch.gather_reorder_index.shape[0]
+            if curr_len < target_gather_len:
+                forward_batch.gather_reorder_index = F.pad(
+                    forward_batch.gather_reorder_index,
+                    (0, target_gather_len - curr_len),
+                    value=0,
+                )
+            elif curr_len > target_gather_len:
+                forward_batch.gather_reorder_index = forward_batch.gather_reorder_index[
+                    :target_gather_len
+                ]
+        forward_batch.direct_reorder_index = getattr(meta, "direct_reorder_index", None)
+        forward_batch.cp_new_kv_page_indices = None
+        if getattr(meta, "new_kv_page_rank", None) is not None and getattr(
+            meta, "layout_page", 0
+        ):
+            # Page table of the rank-major all-gathered K/V: rank r's block
+            # starts at row r * pad_t; page p of request b is at
+            # (rank, row) from the layout. One row per virtual sequence (head
+            # and tail chunk of a request share its table), padded to pad_b
+            # requests and cp * pad_t / page pages (the gather buffer's size).
+            from sglang.srt.runtime_context import get_parallel
+
+            cp_size = get_parallel().attn_cp_size
+            page = int(meta.layout_page)
+            width = (cp_size * pad_t) // page
+            n_req = meta.new_kv_page_rank.shape[0]
+            table = np.zeros((pad_b, width), dtype=np.int32)
+            cols = min(width, meta.new_kv_page_rank.shape[1])
+            if n_req and cols:
+                idx = (
+                    meta.new_kv_page_rank[:, :cols].astype(np.int64) * pad_t
+                    + meta.new_kv_page_row[:, :cols]
+                ) // page
+                table[: min(n_req, pad_b), :cols] = idx[:pad_b]
+            table = np.repeat(table, 2, axis=0)  # virtual seqs 2b, 2b+1
+            forward_batch.cp_new_kv_page_indices = torch.from_numpy(
+                np.ascontiguousarray(table.reshape(-1))
+            ).to(forward_batch.input_ids.device)
+        local_rows = getattr(meta, "local_rows", None)
+        if local_rows is not None:
+            if local_rows.shape[0] < pad_t:
+                local_rows = F.pad(
+                    local_rows, (0, pad_t - local_rows.shape[0]), value=0
+                )
+            elif local_rows.shape[0] > pad_t:
+                local_rows = local_rows[:pad_t]
+            meta.local_rows = local_rows
+
+            device = forward_batch.input_ids.device
+            if local_rows.device != device:
+                local_rows = local_rows.to(device)
+
+            forward_batch.cp_local_rows = local_rows
+            if getattr(forward_batch, "positions", None) is not None:
+                forward_batch.positions = forward_batch.positions.index_select(
+                    0, local_rows
+                )
+            if getattr(forward_batch, "out_cache_loc", None) is not None and isinstance(
+                forward_batch.out_cache_loc, torch.Tensor
+            ):
+                loc_len = forward_batch.out_cache_loc.shape[0]
+                if loc_len > 0:
+                    clamped_rows = torch.clamp(local_rows, 0, loc_len - 1)
+                    forward_batch.out_cache_loc = (
+                        forward_batch.out_cache_loc.index_select(0, clamped_rows)
+                    )
+            if getattr(forward_batch, "input_embeds", None) is not None and isinstance(
+                forward_batch.input_embeds, torch.Tensor
+            ):
+                emb_len = forward_batch.input_embeds.shape[0]
+                if emb_len > 0:
+                    clamped_rows = torch.clamp(local_rows, 0, emb_len - 1)
+                    forward_batch.input_embeds = (
+                        forward_batch.input_embeds.index_select(0, clamped_rows)
+                    )
+
     _pad_batch_fields(
         forward_batch,
         pad_t=pad_t,
@@ -758,8 +875,18 @@ def _pad_token_fields(forward_batch: Any, pad_t: int, is_draft_extend_v2: bool) 
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
         dim = _TOKEN_FIELD_DIM.get(field, 0)
-        if isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
-            val = _pad_tensor(val, pad_t, dim=dim)
+        target_len = pad_t
+        if (
+            field == "input_ids"
+            and getattr(forward_batch, "cp_local_rows", None) is not None
+        ):
+            # Global ids for the whole CP group's rows (see cp_local_rows):
+            # cp * local bucket, the shape the CP warmup family traces.
+            from sglang.srt.runtime_context import get_parallel
+
+            target_len = pad_t * get_parallel().attn_cp_size
+        if isinstance(val, torch.Tensor) and val.shape[dim] < target_len:
+            val = _pad_tensor(val, target_len, dim=dim)
             setattr(forward_batch, field, val)
 
     if is_draft_extend_v2:

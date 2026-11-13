@@ -502,6 +502,15 @@ class TpuEnvs:
     # and the step runs more blocks than it needs. Rounded up to a page
     # multiple. Unset (None) means the wrapper's own search decides.
     SGLANG_TPU_FORCE_RPA_PREFILL_BKV = EnvInt(None)
+    SGLANG_TPU_FORCE_RPA_PREFILL_BQ = EnvInt(None)
+    SGLANG_TPU_FORCE_RPA_RING_BKV = EnvInt(None)
+    SGLANG_TPU_FORCE_RPA_RING_BQ = EnvInt(None)
+    SGLANG_TPU_RPA_COMPUTE_TILE_THRESHOLD = EnvInt(None)
+
+    # Prefill Context Parallelism (PCP)
+    SGLANG_TPU_PCP_REPLICATED_PREFILL = EnvBool(True)
+    SGLANG_TPU_PCP_POOL_ALIGN = EnvBool(True)
+    SGLANG_TPU_CP_PAGE_LAYOUT = EnvBool(True)
     # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 causing performance
     # regression in fused MoE with reduce scatter.
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47

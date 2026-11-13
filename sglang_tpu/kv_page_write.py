@@ -86,6 +86,66 @@ def get_write_pages_op():
     return _OP
 
 
+_READ_OP_NAME = "sglang_tpu::kv_read_pages"
+_READ_OP = None
+
+
+def read_pages(block_ids, kv, *, interpret: bool = False):
+    """Return ``pages`` with ``pages[i] = kv[block_ids[i]]`` (the gather twin of
+    ``write_pages``; XLA's gather of an fp8 pool is lowered poorly)."""
+    import jax
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    block = (None, *kv.shape[1:])
+    zeros = (0,) * (kv.ndim - 1)
+    n = block_ids.shape[0]
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=1,
+        grid=(n,),
+        in_specs=[pl.BlockSpec(block, lambda i, ids: (ids[i], *zeros))],
+        out_specs=pl.BlockSpec(block, lambda i, ids: (i, *zeros)),
+    )
+
+    def _k(block_ids_ref, kv_ref, out_ref):
+        del block_ids_ref
+        out_ref[...] = kv_ref[...]
+
+    return pl.pallas_call(
+        _k,
+        grid_spec=grid_spec,
+        out_shape=jax.ShapeDtypeStruct((n, *kv.shape[1:]), kv.dtype),
+        interpret=interpret,
+    )(block_ids, kv)
+
+
+def get_read_pages_op():
+    """Torch custom op ``kv_read_pages(block_ids, kv) -> pages``."""
+    global _READ_OP
+    if _READ_OP is not None:
+        return _READ_OP
+
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        read_pages, name="jax_kv_read_pages", warn_deprecated=False
+    )
+
+    @torch.library.custom_op(_READ_OP_NAME, mutates_args=(), device_types=["tpu"])
+    def kv_read_pages(block_ids: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        with tpu_info_for_cpu_export():
+            return jax_kernel(block_ids, kv)
+
+    @kv_read_pages.register_fake
+    def _(block_ids: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        return kv.new_empty((block_ids.shape[0], *kv.shape[1:]))
+
+    _READ_OP = kv_read_pages
+    return _READ_OP
+
+
 def write_pages_torch(block_ids: torch.Tensor, pages: torch.Tensor, kv: torch.Tensor):
     """``kv[block_ids[i]] = pages[i]`` in place, via the kernel on TPU."""
     if kv.device.type == "tpu":

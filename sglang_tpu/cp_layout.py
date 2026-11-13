@@ -228,6 +228,19 @@ def warmup_request_lengths(
     per rank); ``local_rows / 2`` units are spread over at most ``max_reqs``
     requests as evenly as possible.
     """
+    from sglang.srt.layers.cp.zigzag import _TPU_LAYOUT
+
+    page = int(_TPU_LAYOUT.get("page_align") or 0)
+    unit = 2 * cp_size * page if page else 2 * cp_size
+    per_rank_unit = 2 * page if page else 2
+    if page and local_rows % per_rank_unit == 0:
+        units = local_rows // per_rank_unit
+        num_reqs = max(1, min(max_reqs, units))
+        while units % num_reqs != 0 and num_reqs > 1:
+            num_reqs -= 1
+        base, rem = divmod(units, num_reqs)
+        return [unit * (base + 1 if i < rem else base) for i in range(num_reqs)]
+
     if local_rows < 2 or local_rows % 2:
         raise ValueError(
             f"a context-parallel warmup needs an even local token bucket of at "
