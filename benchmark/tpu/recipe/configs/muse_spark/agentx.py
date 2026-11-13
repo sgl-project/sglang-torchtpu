@@ -47,6 +47,9 @@ PROFILES = {
     16: (16, 4, 64, None),
     22: (16, 4, 64, None),
     # Not swept; kept for reruns.
+    # c22 with ~20% more running requests and clients (76 verify rows pad to an 80-row step).
+    26: (19, 4, 64, None),
+    # Not swept; kept for reruns.
     2: (2, 8, 128, "4:4"),
     4: (2, 8, 128, "4:4"),
     3: (1, 8, 128, None),
@@ -63,7 +66,7 @@ DEFAULT_PROFILE = (16, 8, 64, "3:4")
 
 # conc: host pool GB per rank (None: hicache_ratio), for points served by the
 # experimental spec worker (fixed simulated draft tokens, no adaptive width).
-EXP_WORKER_HICACHE_GB = {1: None, 7: None, 9: None, 10: None, 16: 72, 22: 72}
+EXP_WORKER_HICACHE_GB = {1: None, 7: None, 9: None, 10: None, 16: 72, 22: 72, 26: 72}
 
 # The AgentX golden acceptance length of Muse Spark's DFlash2 draft (thinking on),
 # by draft tokens per verify (the verify width minus the current token).
@@ -112,9 +115,9 @@ def compile_bs(running, verify, adaptive):
     """Batch buckets: 1, the request cap, and every count whose verify step fills
     the megakernel's 8-row tiles exactly (above 8 requests only multiples of 4);
     other counts pad up to the next bucket."""
-    if running == 16 and (adaptive or verify == 4):
+    if running in (16, 19) and (adaptive or verify == 4):
         # 9-11 decoding requests get their own programs instead of padding to 12.
-        return [*range(1, 13), 16]
+        return sorted({*range(1, 13), 16, running})
     if verify == 4 and running <= 12:
         # Every count, as the adaptive points compiled: odd counts would pad a request.
         return list(range(1, running + 1))
