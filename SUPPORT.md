@@ -44,6 +44,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip, 1 host | Experimental |
 | Wan2.2-T2V-A14B, Wan2.2-I2V-A14B (diffusion) | bf16 | 1 host | Experimental |
 | FLUX.2-klein-4B (diffusion) | bf16 | 1 chip, 1 host | Experimental |
+| FLUX.2-dev (diffusion) | bf16 | 1 host | Experimental |
 | Z-Image-Turbo (diffusion) | bf16 | 1 chip, 1 host | Experimental |
 | LTX-2 (diffusion) | bf16 | 1 host | Experimental |
 
@@ -107,6 +108,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip; 1 host (CFG 2 x Ulysses 2 x ring 2); multi-host collectives | **Experimental** | Diffusion engine with Pallas splash attention (the default under `--ring-degree`) and per-block torch.compile; spatial-parallel VAE decode. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | Wan2.2-T2V-A14B, Wan2.2-I2V-A14B (diffusion) | bf16 | 1 host (CFG 2 x Ulysses 2 x ring 2) | **Experimental** | As TI2V-5B, with both experts resident. |
 | FLUX.2-klein-4B (diffusion) | bf16 | 1 chip; 1 host (Ulysses 4) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
+| FLUX.2-dev (diffusion) | bf16 | 1 host (Ulysses 8) | **Experimental** | Pallas splash attention, torch.compile, DiT resident, Mistral3 text encoder folded over the cores. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | Z-Image-Turbo (diffusion) | bf16 | 1 chip; 1 host (Ulysses 8, 30 heads padded to 32) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | LTX-2 (diffusion) | bf16 | 1 host (CFG 2 x Ulysses 4) | **Experimental** | Video and audio. Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | Llama, Qwen3 dense (other sizes), Qwen3-MoE (other sizes), Kimi-Linear | — | — | **Experimental** | Generic TPU path with no model-specific test. |
