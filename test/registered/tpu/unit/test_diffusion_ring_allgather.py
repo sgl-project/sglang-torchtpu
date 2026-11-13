@@ -116,8 +116,18 @@ class TestAllGatherRingOnDevice(unittest.TestCase):
     REL_L2_BOUND = 1e-2
 
     def setUp(self):
-        if not tpu_splash_attn._check_splash_available():
-            self.skipTest("Pallas kernels unavailable (needs TPU v7x and jax)")
+        from torch_tpu._internal.utils.hardware import get_tpu_device_name
+
+        # torch_tpu's PCI name for the chip ("TPU v7"), the raw name the backend
+        # maps to a Pallas device kind. Read without the backend's detection, a
+        # broken detection on TPU7x fails instead of skipping.
+        chip = get_tpu_device_name()
+        if "7" not in chip:
+            self.skipTest(f"Pallas kernels are TPU7x-only, this chip is {chip!r}")
+        self.assertTrue(
+            tpu_splash_attn._check_splash_available(),
+            f"{chip}: Pallas kernels unavailable (cause in the logged warning)",
+        )
         tpu_splash_attn._register_ops()
         self.impl = TpuSplashAttentionImpl(
             num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5

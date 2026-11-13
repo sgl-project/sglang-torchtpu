@@ -7,9 +7,10 @@ sequence-parallel query shard), stock ``make_splash_mha`` for causal shapes,
 short query shards and fewer than 512 aligned keys (including zero-padded KV,
 whose padded keys must not take softmax weight), and the SDPA fallback.
 
-The numeric tests need the Pallas kernels (TPU v7x, torch_tpu, jax) and are
-skipped otherwise; each asserts which path ran, so a lane without the kernels
-cannot pass by comparing SDPA with SDPA.
+The numeric tests skip on chips other than TPU7x, as torch_tpu names the chip
+from PCI; on TPU7x the Pallas kernels must be available. Each asserts which
+path ran, so a lane without the kernels cannot pass by comparing SDPA with
+SDPA.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -115,11 +116,25 @@ _PATH_CALLS = {"flash": (1, 0), "splash": (0, 1), "sdpa": (0, 0)}
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
 class TestTpuSplashAttentionNumerics(CustomTestCase):
     def _kernels(self):
-        """The backend module with its ops registered; skips without them."""
+        """The backend module with its ops registered; skips off TPU7x.
+
+        The chip is torch_tpu's PCI name ("TPU v7"; "7" also matches a
+        respelling such as "TPU v7x"), the raw name the backend maps to a
+        Pallas device kind. Read without the backend's jax imports and mapping,
+        a broken detection on TPU7x fails, not skips.
+        """
+        from torch_tpu._internal.utils.hardware import get_tpu_device_name
+
         from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
 
-        if not tsa._check_splash_available():
-            self.skipTest("Pallas kernels unavailable (needs TPU v7x and jax)")
+        chip = get_tpu_device_name()
+        if "7" not in chip:
+            self.skipTest(f"Pallas kernels are TPU7x-only, this chip is {chip!r}")
+        self.assertTrue(
+            tsa._check_splash_available(),
+            f"{chip}: Pallas kernels unavailable, tpu_splash_attn would run SDPA "
+            "(cause in the logged warning)",
+        )
         tsa._register_ops()
         return tsa
 
@@ -158,7 +173,11 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         self._assert_accurate(got.to("cpu"), q, k, v, scale, is_causal)
 
     def _assert_accurate(self, got, q, k, v, scale, is_causal):
-        """``got`` against float32 attention, within twice bf16 SDPA's error."""
+        """``got`` against float32 attention: rel-L2 < 1e-2, max abs < 2e-2.
+
+        The bounds are fixed, so only the kernel decides the verdict; torch_tpu
+        bf16 SDPA's error on the same inputs is reported for comparison.
+        """
         if k.shape[1] != q.shape[1]:
             k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
             v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
@@ -177,10 +196,9 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
             f"max abs {err:.3e} (sdpa {sdpa_err:.3e})"
         )
         # Relative L2 over the whole output: a padded key taking softmax weight
-        # stays under a max-abs bound but moves rel-L2 by ~1e-1. bf16 inputs
-        # bound the achievable accuracy, so allow twice bf16 SDPA's error.
-        self.assertLess(rel, max(1e-2, 2 * sdpa_rel), "rel-L2")
-        self.assertLess(err, max(2e-2, 2 * sdpa_err), "max abs")
+        # stays under a max-abs bound but moves rel-L2 by ~1e-1.
+        self.assertLess(rel, 1e-2, f"rel-L2 (bf16 SDPA {sdpa_rel:.3e})")
+        self.assertLess(err, 2e-2, f"max abs (bf16 SDPA {sdpa_err:.3e})")
 
     # Custom kernel: non-causal, q_seq >= 256, kv_seq >= 512.
     def test_custom_two_blocks_and_a_ragged_tail(self):
