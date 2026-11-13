@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     LRURefreshPhase,
     PreparePrefetchResult,
     TreeComponent,
+    get_and_increase_time_counter,
     next_component_uuid,
 )
 
@@ -983,6 +984,8 @@ class SWAComponent(TreeComponent):
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )
+        if self._evict_stale_windows_first and req.swa_insert_epoch is None:
+            req.swa_insert_epoch = get_and_increase_time_counter()
         if (
             self.demotes_final_windows or self.cap_media_anchors
         ) and req.swa_stale_window_floor is None:
@@ -1064,8 +1067,10 @@ class SWAComponent(TreeComponent):
             and insert_result is not None
             and insert_result.last_device_node is not None
         ):
+            assert req.swa_insert_epoch is not None, "insert without prepare"
             self._demote_stale_windows(
                 last_node=self.tree_core.node_by_id(insert_result.last_device_node),
+                epoch=req.swa_insert_epoch,
                 exempt=self._media_window(req),
             )
 
@@ -1078,15 +1083,26 @@ class SWAComponent(TreeComponent):
                 req, self.tree_core.node_by_id(insert_result.last_device_node)
             )
 
-    # An insert leaves live SWA behind the request's sliding window: one window at each
-    # chunk boundary, and the earlier turns' windows once a new turn extends a
-    # conversation. The request can no longer free them; move those on its path to the
-    # SWA LRU end. A path node overlapping ``exempt`` (the first-visit media window,
-    # see ``_media_window``) stays put.
+    # A request reads SWA KV only where its cache match ends, so a live window is worth
+    # keeping while a later request may resume at its end. After an insert, judge each
+    # node on the request's path that lies behind its sliding window:
+    # - A node the request created (after ``epoch``, its first insert), such as a chunk
+    #   boundary window: nothing has resumed there yet, so it keeps its LRU place.
+    # - A node that existed before the request, which then continued past it, such as
+    #   an earlier turn of its conversation: the path has moved on, so it goes to the
+    #   SWA LRU end.
+    # - A fork, a node another sequence continues from: requests resume at its end, so
+    #   the nodes within a window of that end keep their place. Above that window they
+    #   are passed by every sequence through the fork, and the walk goes on. A dropped
+    #   reply beside the path (``_abandoned_output_chain``) is no fork, and goes to the
+    #   SWA LRU end too.
+    # A path node overlapping ``exempt`` (the first-visit media window, see
+    # ``_media_window``) stays put.
     def _demote_stale_windows(
         self,
         *,
         last_node: UnifiedTreeNode,
+        epoch: float,
         exempt: Optional[tuple[int, int]] = None,
     ) -> None:
         root = self.tree_core.root_node
@@ -1102,28 +1118,29 @@ class SWAComponent(TreeComponent):
         window_bound = self.sliding_window_size + self.tree_core.page_size
         end = depth
         child = None
+        # Nodes ending past this position hold the window of the request's end or of
+        # the nearest fork below.
+        protect_from = depth - window_bound
         for n in path:
+            start = end - len(n.key)
             num_others = len(n.children) - (child is not None)
             abandoned: list[UnifiedTreeNode] = []
-            if num_others:
-                # Above a branch point the path is shared: another sequence's window
-                # may need these nodes. The exception is one abandoned output, such
-                # as a reply the client did not send back in its next turn.
-                if num_others > 1:
-                    break
+            if num_others == 1:
                 other = next(c for c in n.children.values() if c is not child)
                 abandoned = self._abandoned_output_chain(other, child)
-                if not abandoned:
-                    break
-            if depth - end >= window_bound and not _overlaps(
-                end - len(n.key), end, exempt
+            if num_others and not abandoned:
+                protect_from = end - window_bound
+            if (
+                end <= protect_from
+                and n.creation_time < epoch
+                and not _overlaps(start, end, exempt)
             ):
                 self._demote_swa(n)
             # Demoted last, tail last, so the output goes before the window above it.
             for x in abandoned:
                 self._demote_swa(x)
             child = n
-            end -= len(n.key)
+            end = start
 
     def _abandoned_output_chain(
         self, head: UnifiedTreeNode, path_child: Optional[UnifiedTreeNode]
