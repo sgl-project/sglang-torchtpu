@@ -65,6 +65,16 @@ rank mesh, loaded scale shapes, cache budget, compile shapes and active kernels.
 Use identical fixed token inputs from the reference, not independently tokenized
 random text. Isolate compile/warmup, steady prefill device time and client TTFT.
 
+## Global vs local chunk contract
+
+With attention-DP16, native argument resolution divides the supplied
+`chunked_prefill_size` by 16. The candidate therefore supplies **32768 global**
+for **2048 per rank**. Compile token buckets are per-rank literals: `[2048]`.
+`max_prefill_tokens=32768` is separate and is not divided by that hook.
+The earlier candidate supplied 2048 globally, which resolved to 128 locally but
+padded compute to bucket2048; do not use that setup as the matched W-P baseline.
+On-device effective buckets and workload equivalence still require verification.
+
 ## CPU test runtime selection
 
 `SGLANG_PLATFORM=cpu` is NOT a valid platform plugin in this checkout. For CPU
