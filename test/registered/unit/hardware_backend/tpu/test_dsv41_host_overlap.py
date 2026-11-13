@@ -186,7 +186,7 @@ def _table(rows, dim=64, seed=1):
 
 
 def _coordinator(
-    *, image_token_id=None, raw_transfer_mod=None, layout_mod=None, sync_fn=None
+    *, image_token_id=None, batch_transfer_mod=None, layout_mod=None, sync_fn=None
 ):
     tables = _tables()
     hasher = SimpleNamespace(
@@ -218,7 +218,7 @@ def _coordinator(
             hasher,
             embeddings,
             "cpu",
-            raw_transfer_mod=raw_transfer_mod,
+            batch_transfer_mod=batch_transfer_mod,
             layout_mod=layout_mod,
             sync_fn=sync_fn,
         ),
@@ -366,52 +366,48 @@ def test_hash_on_host_and_coordinator_block_sentinel_and_image_tokens():
     coordinator.clear_step()
 
 
-class _FakeRawHostBuffer:
-    def __init__(self, size_bytes: int):
-        self._buf = np.zeros(size_bytes, dtype=np.uint8)
-        self.size_bytes = size_bytes
-        self.data_ptr = int(self._buf.ctypes.data)
-
-
 def _fake_transport(*, tile=128, corrupt_d2h=False, defer_h2d=False):
     pending_copies = []
     synced = []
     events = []
 
-    class FakeTransfer:
-        def __init__(self, device_tensor, host_buffer, unsafe_skip_buffer_lock=False):
-            self.device_tensor = device_tensor
-            self.host_buffer = host_buffer
-            self.unsafe_skip_buffer_lock = unsafe_skip_buffer_lock
+    def _phys_bytes(t: torch.Tensor) -> int:
+        return (-(-t.numel() // tile) * tile) * 4
 
-        def d2h(self):
-            arr = self.host_buffer._buf.view(np.int32)
-            n = self.device_tensor.numel()
-            arr[:n] = self.device_tensor.numpy()
-            if corrupt_d2h and n:
-                arr[0] ^= 1
+    def batch_transfer_d2h_sync(src_arrs, dst_arrs):
+        assert len(src_arrs) == len(dst_arrs) == 1
+        src, dst = src_arrs[0], dst_arrs[0]
+        assert dst.device.type == "cpu" and dst.is_contiguous()
+        assert dst.nbytes >= _phys_bytes(src)
+        n = src.numel()
+        dst[:n].copy_(src)
+        if corrupt_d2h and n:
+            dst[0] ^= 1
 
-        def h2d_async(self):
-            events.append("h2d_async")
-            arr = self.host_buffer._buf.view(np.int32)
-            n = self.device_tensor.numel()
-            snapshot = arr[:n].copy()
-            done = [False]
+    def batch_transfer_h2d(src_arrs, dst_arrs):
+        assert len(src_arrs) == len(dst_arrs) == 1
+        src, dst = src_arrs[0], dst_arrs[0]
+        assert src.device.type == "cpu" and src.is_contiguous()
+        assert src.nbytes >= _phys_bytes(dst)
+        events.append("h2d_async")
+        n = dst.numel()
+        snapshot = src[:n].clone()
+        done = [False]
 
-            def apply():
-                if not done[0]:
-                    self.device_tensor.copy_(torch.from_numpy(snapshot))
-                    done[0] = True
+        def apply():
+            if not done[0]:
+                dst.copy_(snapshot)
+                done[0] = True
 
-            if not defer_h2d:
-                apply()
-            else:
-                pending_copies.append(apply)
-            return SimpleNamespace(wait=apply)
+        if not defer_h2d:
+            apply()
+        else:
+            pending_copies.append(apply)
+        return SimpleNamespace(wait=apply)
 
-    raw_mod = SimpleNamespace(
-        RawHostBuffer=_FakeRawHostBuffer,
-        PreparedTorchRawTransfer=FakeTransfer,
+    bt_mod = SimpleNamespace(
+        batch_transfer_d2h_sync=batch_transfer_d2h_sync,
+        batch_transfer_h2d=batch_transfer_h2d,
     )
     layout_mod = SimpleNamespace(
         get_device_layout_if_materialized=lambda t: ([0], [[tile]], 32)
@@ -421,24 +417,26 @@ def _fake_transport(*, tile=128, corrupt_d2h=False, defer_h2d=False):
         events.append(("sync", wait))
         synced.append((list(tensors), wait))
 
-    return raw_mod, layout_mod, sync_fn, pending_copies, synced, events
+    return bt_mod, layout_mod, sync_fn, pending_copies, synced, events
 
 
 def test_prepared_engram_upload_dma_lifecycle_and_slot_ping_pong():
-    bad_raw, layout_mod, sync_fn, _, _, _ = _fake_transport(corrupt_d2h=True)
+    bad_bt, layout_mod, sync_fn, _, _, _ = _fake_transport(corrupt_d2h=True)
     with pytest.raises(RuntimeError, match="layout validation failed"):
         PreparedEngramUpload(
-            16, "cpu", raw_transfer_mod=bad_raw, layout_mod=layout_mod, sync_fn=sync_fn
+            16, "cpu", batch_transfer_mod=bad_bt, layout_mod=layout_mod, sync_fn=sync_fn
         )
 
-    raw_mod, layout_mod, sync_fn, _, synced, _ = _fake_transport(
+    bt_mod, layout_mod, sync_fn, _, synced, _ = _fake_transport(
         tile=128, defer_h2d=True
     )
     upload = PreparedEngramUpload(
-        10, "cpu", raw_transfer_mod=raw_mod, layout_mod=layout_mod, sync_fn=sync_fn
+        10, "cpu", batch_transfer_mod=bt_mod, layout_mod=layout_mod, sync_fn=sync_fn
     )
-    # Physical allocation rounds 10 words up to the 128-word tile (512 bytes).
-    assert upload.host_buffer.size_bytes == 128 * 4
+    # Physical allocation rounds 10 words up to the 128-word tile (512 bytes),
+    # and host_words is a zero-copy prefix view over host_buffer.
+    assert upload.host_buffer.nbytes == 128 * 4
+    assert upload.host_words.data_ptr() == upload.host_buffer.data_ptr()
     upload.acquire().copy_(torch.arange(10, dtype=torch.int32))
     upload.start()
     assert not torch.equal(upload.device, torch.arange(10, dtype=torch.int32))
@@ -457,9 +455,9 @@ def test_prepared_engram_upload_dma_lifecycle_and_slot_ping_pong():
     upload.wait()
 
     # Coordinator double-buffers (2 slots per layer/bucket) across steps 1/2/3.
-    raw_mod, layout_mod, sync_fn, _, synced, _ = _fake_transport(defer_h2d=True)
+    bt_mod, layout_mod, sync_fn, _, synced, _ = _fake_transport(defer_h2d=True)
     coordinator, _, _ = _coordinator(
-        raw_transfer_mod=raw_mod, layout_mod=layout_mod, sync_fn=sync_fn
+        batch_transfer_mod=bt_mod, layout_mod=layout_mod, sync_fn=sync_fn
     )
     req1 = _request([1, 2, 3, 4])
     coordinator.prepare(_batch([req1], starts=[0], lengths=[4]))
@@ -501,9 +499,9 @@ def test_prepared_engram_upload_dma_lifecycle_and_slot_ping_pong():
 
 
 def test_coordinator_prefetches_next_chunk_and_handles_prefetch_miss():
-    raw_mod, layout_mod, sync_fn, _, _, _ = _fake_transport(defer_h2d=True)
+    bt_mod, layout_mod, sync_fn, _, _, _ = _fake_transport(defer_h2d=True)
     coordinator, embeddings, _ = _coordinator(
-        raw_transfer_mod=raw_mod, layout_mod=layout_mod, sync_fn=sync_fn
+        batch_transfer_mod=bt_mod, layout_mod=layout_mod, sync_fn=sync_fn
     )
     prompt = [1, 2, 3, 4, 5, 6, 7, 0, 2, 4, 6, 1]
     req = _request(prompt)
@@ -579,9 +577,9 @@ class _FakeLogitsOutput:
 
 
 def test_hooks_end_to_end_overlap_fallback_idle_and_pending_call():
-    raw_mod, layout_mod, sync_fn, _, synced, events = _fake_transport(defer_h2d=True)
+    bt_mod, layout_mod, sync_fn, _, synced, events = _fake_transport(defer_h2d=True)
     coordinator, embeddings, hasher = _coordinator(
-        raw_transfer_mod=raw_mod, layout_mod=layout_mod, sync_fn=sync_fn
+        batch_transfer_mod=bt_mod, layout_mod=layout_mod, sync_fn=sync_fn
     )
     hasher.token_map = hasher.token_map.cpu()
 
