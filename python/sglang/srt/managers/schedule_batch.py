@@ -2005,8 +2005,8 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
-        self.swa_stale_window_floor = None
-        self.swa_media_end = None
+        # swa_stale_window_floor and swa_media_end, set at the first radix insert,
+        # survive retraction: the re-prefill extends the same tokens.
         self.swa_media_anchored = False
         self.swa_branching_seqlen = None
         self.extend_range = None
