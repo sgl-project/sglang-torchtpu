@@ -1,0 +1,39 @@
+name: glm52-night-20261113-loader-rank1
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: gke-tpu-train-us-central1-1-prod
+config: '{"purpose":"CPU-only loader ABI checks, corrected CPU platform selection","source_commit":"396701fd7590f817cdbc2a58d298d618beb1c867"}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    device_type: cpu
+    image: lmsysorg/sglang:v0.1.0-tpu
+    resources:
+      cpu_request: "4"
+      cpu_limit: "4"
+      memory_request: 16Gi
+      memory_limit: 16Gi
+    envs:
+      SGLANG_USE_CPU_ENGINE: "1"
+      PYTHONUNBUFFERED: "1"
+    sources:
+      - name: sglang-torchtpu
+        type: git
+        repo: https://github.com/sgl-project/sglang-torchtpu.git
+        ref: epic/glm52-channelwise-port-20261113
+        commit: 396701fd7590f817cdbc2a58d298d618beb1c867
+        path: /workspace/sglang-torchtpu
+    command: |
+      set -eu
+      ulimit -c 0
+      unset SGLANG_PLATFORM
+      cd /workspace/sglang-torchtpu
+      git rev-parse HEAD
+      python3 -c 'import importlib.metadata,json; print(json.dumps({k:importlib.metadata.version(k) for k in ["torch","jax","jaxlib"]}))'
+      export PYTHONPATH=/workspace/sglang-torchtpu:/workspace/sglang-torchtpu/python
+      set +e
+      timeout 900 python3 test/registered/unit/hardware_backend/tpu/test_glm52_channelwise_fp8.py
+      rc=$?
+      echo TEST_EXIT_CODE=$rc
+      if [ "$rc" -ne 0 ]; then timeout 600 tail -f /dev/null; fi
+      exit "$rc"

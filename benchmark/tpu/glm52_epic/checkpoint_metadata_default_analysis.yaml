@@ -1,0 +1,29 @@
+schema_version: 1
+exp_id: exp-2gq0zsmhs0
+spec:
+  name: glm52-checkpoint-abi-default-runtime
+  command: /bin/sh "$FALCON_SCRIPT_PATH"
+  script_content: |
+    set -eu
+    python3 - <<'PY'
+    import json, os, pathlib, shutil
+    root=pathlib.Path(os.environ['ARTIFACT_LOCAL_DIR'])
+    out=pathlib.Path(os.environ['RESULT_LOCAL_DIR'])
+    out.mkdir(parents=True,exist_ok=True)
+    p=root/'checkpoint-inspection.json'
+    if not p.exists():
+        (out/'inventory.json').write_text(json.dumps([str(x.relative_to(root)) for x in root.rglob('*')][:100]))
+    else:
+        shutil.copyfile(p,out/'checkpoint-inspection.json')
+        d=json.loads(p.read_text())
+        (out/'inventory.json').write_text(json.dumps({'keys':list(d),'first_scale':d.get('scales',[])[:3]},indent=2))
+    PY
+  outputs:
+    - path: checkpoint-inspection.json
+      type: json
+      required: false
+    - path: inventory.json
+      type: json
+      required: true
+  resources:
+    memory_limit: 1Gi
