@@ -64,8 +64,13 @@ _OPS_LOCK = Lock()
 # =============================================================================
 
 
-def _swa_metadata(
-    table: jax.Array, starts: jax.Array, positions: jax.Array, minimum: jax.Array
+def _swa_metadata_for(
+    table: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    minimum: jax.Array,
+    *,
+    non_causal: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     return prepare_swa_metadata(
         table,
@@ -75,9 +80,21 @@ def _swa_metadata(
         page_size=SWA_PAGE_SIZE,
         page_stride=SWA_PAGE_SIZE,
         row_offset=0,
-        non_causal=False,
+        non_causal=non_causal,
         onehot_requests=True,
     )
+
+
+def _swa_metadata(
+    table: jax.Array, starts: jax.Array, positions: jax.Array, minimum: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return _swa_metadata_for(table, starts, positions, minimum, non_causal=False)
+
+
+def _swa_metadata_non_causal(
+    table: jax.Array, starts: jax.Array, positions: jax.Array, minimum: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return _swa_metadata_for(table, starts, positions, minimum, non_causal=True)
 
 
 def _publish_swa(pages: jax.Array, records: jax.Array, kv: jax.Array) -> jax.Array:
@@ -139,6 +156,34 @@ def _attend_swa(
         sink.astype(jnp.float32),
         _inverse_rope(cos_sin, positions),
         swa_metadata=metadata,
+        scale=scale,
+        bq=_bq(q.shape[0]),
+    )
+
+
+def _attend_swa_non_causal(
+    q: jax.Array,
+    swa: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    cos_sin: jax.Array,
+    metadata: jax.Array,
+    bounds: jax.Array,
+    scale: float,
+) -> jax.Array:
+    """Ratio-0 block layers: every query of a request sees [bounds[r, 0], bounds[r, 1])."""
+    return csa2(
+        q,
+        None,
+        None,
+        swa,
+        starts,
+        positions,
+        sink.astype(jnp.float32),
+        _inverse_rope(cos_sin, positions),
+        swa_metadata=metadata,
+        swa_bounds=bounds,
         scale=scale,
         bq=_bq(q.shape[0]),
     )
@@ -228,9 +273,11 @@ def _fake_attend(q, *args):
 # name -> (JAX function, fake, donated argument positions)
 _DEFINITIONS = {
     "swa_metadata": (_swa_metadata, _fake_swa_metadata, ()),
+    "swa_metadata_non_causal": (_swa_metadata_non_causal, _fake_swa_metadata, ()),
     "publish_swa": (_publish_swa, _fake_publish_swa, (0,)),
     "publish_main": (_publish_main, _fake_publish_main, (0, 1)),
     "attend_swa": (_attend_swa, _fake_attend, ()),
+    "attend_swa_non_causal": (_attend_swa_non_causal, _fake_attend, ()),
     "attend_main": (_attend_main, _fake_attend, ()),
 }
 
@@ -273,6 +320,7 @@ def swa_metadata(
     query_start_loc: torch.Tensor,
     positions: torch.Tensor,
     minimum: torch.Tensor,
+    non_causal: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-step SWA metadata, shared by every layer.
 
@@ -282,12 +330,13 @@ def swa_metadata(
     replay/window state says otherwise).
 
     Returns ``meta`` [B, 2 + swa_metadata_columns(T)] i32, ``bounds`` [B, 2]
-    i32 (noncausal only, unused here) and ``swa_write_records`` [T] i32
-    (``swa_loc`` of each token; -1 on padding rows).
+    i32 and ``swa_write_records`` [T] i32 (``swa_loc`` of each token; -1 on
+    padding rows). ``bounds`` is meaningful only with ``non_causal``: the
+    block [first - 128, first + count) of each request, with at most 64
+    queries per request.
     """
-    return _op("swa_metadata")(
-        _i32(swa_table), _i32(query_start_loc), _i32(positions), _i32(minimum)
-    )
+    op = _op("swa_metadata_non_causal" if non_causal else "swa_metadata")
+    return op(_i32(swa_table), _i32(query_start_loc), _i32(positions), _i32(minimum))
 
 
 def publish_swa(
@@ -335,8 +384,10 @@ def attention(
     ``q`` [T, H, 512] BF16 RoPE'd (H a multiple of 8 in [8, 128]); ``sink``
     [H] FP32; ``cos_sin`` see the module docstring. Visibility is causal: the
     last 128 positions of the request (from ``swa_meta``'s minimum) plus, with
-    ``main``, the selected compressed records. ``swa_bounds`` is accepted for
-    the noncausal (DSpark) contract and ignored. Padding rows return zeros.
+    ``main``, the selected compressed records. With ``swa_bounds`` ([B, 2] i32
+    from ``swa_metadata(non_causal=True)``) every query of a request instead
+    sees its whole block window; this is ratio 0 only (no ``main``). Padding
+    rows return zeros.
 
     ``main`` = ``(words, scales, selected, main_pages, main_page_records)``:
     ``selected`` [T, <=512] i32 logical compressed ids, -1 padded, valid
@@ -344,13 +395,18 @@ def attention(
     full page ids; ``main_page_records`` = 256 // compress_ratio. ``None``
     (ratio 0) attends the SWA window alone.
     """
-    del swa_bounds
     if not q.shape[0]:
         return torch.empty_like(q)
     if cos_sin.dim() != 2 or cos_sin.shape[1] != ROPE_DIM:
         raise ValueError(f"cos_sin must be [max_position, {ROPE_DIM}]")
+    if swa_bounds is not None and main is not None:
+        raise ValueError("non-causal SWA bounds serve ratio-0 layers without main KV")
     cos_sin = cos_sin.float()
     common = (_i32(query_start_loc), _i32(positions), sink.float(), cos_sin)
+    if swa_bounds is not None:
+        return _op("attend_swa_non_causal")(
+            q, swa_pages, *common, _i32(swa_meta), _i32(swa_bounds), float(scale)
+        )
     if main is None:
         return _op("attend_swa")(q, swa_pages, *common, _i32(swa_meta), float(scale))
     if not compress_ratio:

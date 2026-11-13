@@ -176,7 +176,13 @@ def _request_token_counts(forward_batch: ForwardBatch, bs: int) -> torch.Tensor:
     if mode.is_decode():
         counts[:real_bs] = 1
         return counts
-    if mode.is_extend() and not mode.is_target_verify():
+    if mode.is_target_verify():
+        # extend_seq_lens is not set on verify batches; every request has the same width.
+        spec_info = forward_batch.spec_info
+        assert spec_info is not None, "a verify batch carries spec_info"
+        counts[:real_bs] = int(spec_info.draft_token_num)
+        return counts
+    if mode.is_extend():
         lens = forward_batch.extend_seq_lens_cpu
         if lens is None:
             lens = forward_batch.extend_seq_lens
@@ -184,7 +190,7 @@ def _request_token_counts(forward_batch: ForwardBatch, bs: int) -> torch.Tensor:
         counts[:real_bs] = _as_cpu_int64(lens, bs)[:real_bs]
         return counts
     raise NotImplementedError(
-        f"DeepSeek-V4.1 TPU attention serves extend and decode, not {mode.name}"
+        f"DeepSeek-V4.1 TPU attention serves extend, decode and target verify, not {mode.name}"
     )
 
 
@@ -319,8 +325,11 @@ def _check_supported(config) -> None:
                 f"DeepSeek-V4.1 TPU attention needs {name} == 1 "
                 "(attention TP1 per DP rank)"
             )
-    if get_spec().speculative_algorithm is not None:
-        raise NotImplementedError("DeepSeek-V4.1 TPU attention does not run MTP yet")
+    algorithm = get_spec().speculative_algorithm
+    if algorithm is not None and str(algorithm).upper() != "DSPARK":
+        raise NotImplementedError(
+            f"DeepSeek-V4.1 TPU attention serves DSPARK speculation only, not {algorithm}"
+        )
     features = get_exec().features
     if (
         features.enable_encoder_swa_bounded_replay
@@ -374,8 +383,17 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self.max_context_len = int(model_config.context_len)
         self.page_size = FULL_PAGE_TOKENS
         self.index_topk = int(config.index_topk)
-        self.low_ratios = tuple(r for r in LOW_RATIOS if r in config.compress_ratios)
         self.forward_metadata: Optional[DSV41TPUForwardMetadata] = None
+        # The DSpark draft runs TARGET_VERIFY as one non-causal block per request.
+        self.is_dspark_draft = (
+            model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark()
+        )
+        # The draft carries the target config, but its stages are all ratio 0.
+        self.low_ratios = (
+            ()
+            if self.is_dspark_draft
+            else tuple(r for r in LOW_RATIOS if r in config.compress_ratios)
+        )
         # layer_id -> fp32 [cos | sin] table; forward only sees the RadixAttention.
         self.rope_tables: Dict[int, torch.Tensor] = {}
         self.csa2_ops, self.indexer_ops = self._register_ops()
@@ -735,8 +753,11 @@ class DSV41TPUAttnBackend(AttentionBackend):
             metadata.query_start_loc,
             metadata.positions,
             metadata.swa_minimum,
+            non_causal=self.is_dspark_draft,
         )
-        metadata.swa_meta, metadata.swa_bounds = meta, bounds
+        # Bounds are passed to attention only for the non-causal draft block.
+        metadata.swa_meta = meta
+        metadata.swa_bounds = bounds if self.is_dspark_draft else None
         metadata.swa_write_records = records.masked_fill(~metadata.valid, -1)
 
     def _attention(

@@ -1754,6 +1754,60 @@ class TestExperimentalSpecHooks(CustomTestCase):
                     worker.init_cuda_graphs()
                 self.assertEqual(calls, expected)
 
+    def test_registered_block_draft_worker_overrides_only_matching_targets(self):
+        """A registered drafter serves only targets it matches, the first match
+        wins, and unmatched targets keep the built-in drafter of their algorithm."""
+        from sglang_tpu.experimental.speculative import block_spec_worker as bsw
+
+        algorithm = SpeculativeAlgorithm.DSPARK
+        built_in = MagicMock(return_value="built-in")
+        custom = MagicMock(return_value="custom")
+        shadowed = MagicMock(return_value="shadowed")
+        with (
+            patch.dict(bsw._DRAFT_WORKER_OVERRIDES, clear=True),
+            patch.dict(bsw._DRAFT_WORKER_CLS, {algorithm: built_in}),
+        ):
+            bsw.register_block_draft_worker(
+                algorithm=algorithm,
+                matches=lambda runner: runner == "v41",
+                factory=custom,
+            )
+            bsw.register_block_draft_worker(
+                algorithm=algorithm, matches=lambda runner: True, factory=shadowed
+            )
+            self.assertEqual(
+                bsw._create_draft_worker(algorithm=algorithm, target_runner="v41"),
+                "custom",
+            )
+            shadowed.assert_not_called()
+            self.assertEqual(
+                bsw._create_draft_worker(algorithm=algorithm, target_runner="other"),
+                "shadowed",
+            )
+            bsw._DRAFT_WORKER_OVERRIDES[algorithm].pop()
+            self.assertEqual(
+                bsw._create_draft_worker(algorithm=algorithm, target_runner="other"),
+                "built-in",
+            )
+
+    def test_block_policy_reads_the_width_the_drafter_published(self):
+        """A draft that is not a dense DFlash-family model (a plain nn.Module such
+        as the V4.1 MoE draft) gets its block width from the drafter; without one
+        the policy still refuses it instead of guessing."""
+        from torch import nn
+
+        from sglang_tpu.experimental.compilation.block_compile_policy import (
+            TpuBlockSpecDecodeCompilePolicyMixin,
+        )
+
+        policy = object.__new__(TpuBlockSpecDecodeCompilePolicyMixin)
+        policy.model_runner = SimpleNamespace(model=nn.Module())
+        policy.draft_token_num = 6
+        with self.assertRaises(TypeError):
+            policy.draft_block_width
+        policy._draft_block_width = 5
+        self.assertEqual(policy.draft_block_width, 5)
+
 
 if __name__ == "__main__":
     unittest.main()
