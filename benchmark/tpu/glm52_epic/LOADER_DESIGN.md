@@ -1,8 +1,10 @@
 # Private channelwise checkpoint compatibility: proposed implementation
 
-Status: design only. Actual mounted checkpoint headers have not been inspected;
-no loader support or TPU correctness is claimed. Source converter evidence is
-not a substitute for checking the exact checkpoint used by the experiment.
+Status: actual full headers inspected via exp-2gq0zsmhs0 / an-iis65psswb.
+All 59044 serialized scales are rank1 [N], not [N,1]. The original rank2
+assumption and synthetic CPU validation were insufficient and are superseded
+by real_scale_abi.json. Loader/test correction is in progress; no TPU correctness
+is claimed.
 
 ## Gating and placement
 
@@ -18,14 +20,14 @@ change Flash block-to-channel conversion or introduce a misleading fake block
 size to make loaders accept per-channel scales.
 
 Header gate: each opted-in matrix is 2D E4M3 [N,K] with paired FP32
-`weight_scale_inv[N,1]`; validate ignored/excluded layers and actual model
+`weight_scale_inv[N]`; validate ignored/excluded layers and actual model
 architecture. Scale is a multiplier (W=Q*S), not a reciprocal. Unsupported
 quantized embeddings/head or intentionally unquantized Indexer projections
 must fail explicitly rather than load FP8 bytes as BF16 without scales.
 
 ## Dense
 
-Allocate canonical `weight_scale_inv` as output-channel scale [N_local,1], with
+Allocate canonical `weight_scale_inv` as output-channel scale [N_local], with
 output_dim=0 and NO input_dim. Preserve normal weight allocation/metadata. The
 legacy loader selected for a plugin method can partition column rows and
 merged gate/up offsets while replicating channel scales for row-parallel K
@@ -47,13 +49,13 @@ per-channel quantization.
 
 ## MoE
 
-Replace scalar scales with canonical inv channel scales [E,2I_local,1] and
-[E,H,1], using existing CHANNEL scale loader attrs, not BLOCK. Gate/up scales
+Replace scalar scales with canonical inv channel scales [E,2I_local] and
+[E,H], using existing CHANNEL scale loader attrs, not BLOCK. Gate/up scales
 partition output I by MoE TP and pack at their destination offsets; down scales
 replicate because down weights partition K. Preserve EP global-to-local mapping,
 weight_loader attrs and staged expert loading semantics.
 
-Post-load squeeze trailing scale dim and call existing TPU preparation with
+Post-load preserve the [E,N] scales and call existing TPU preparation with
 block_quant=False. It transposes weights and formats scales for gmm_v2. Bypass
 parent scalar FP8 preparation: that path merges gate/up maxima and requantizes.
 Existing helper may round scales to BF16 unless its existing FP32-scales flag is
