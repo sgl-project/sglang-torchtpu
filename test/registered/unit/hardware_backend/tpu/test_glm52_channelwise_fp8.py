@@ -17,6 +17,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.runtime_context import get_context
@@ -154,12 +156,15 @@ class TestGlm52Fp8Packing(CustomTestCase):
         self.assertEqual(layer.logical_widths, [2, 3])
 
         checkpoint = torch.arange(-7, 8, dtype=torch.float32).reshape(5, 3)
-        scales = torch.tensor([[0.5], [2.0], [4.0], [0.25], [8.0]])
+        # Actual checkpoint scales are rank-one [N], not [N, 1].
+        scales = torch.tensor([0.5, 2.0, 4.0, 0.25, 8.0])
+        self.assertEqual(layer.weight_scale_inv.shape, (5,))
         layer.weight.data.copy_(checkpoint.to(torch.float8_e4m3fn))
-        # Row-parallel loading must replicate the entire channel scale vector.
-        layer.weight_scale_inv.load_row_parallel_weight(scales)
+        # Exercise the real legacy loader used by this new quant method.
+        topology = SimpleNamespace(tp_rank=1, tp_size=2, use_presharded_weights=False)
+        RowParallelLinear.weight_loader(topology, layer.weight_scale_inv, scales)
         x = torch.tensor([[1.0, -2.0, 3.0], [-1.0, 0.5, 2.0]])
-        expected = torch.nn.functional.linear(x, checkpoint * scales)
+        expected = torch.nn.functional.linear(x, checkpoint * scales[:, None])
         method.process_weights_after_loading(layer)
 
         self.assertEqual(layer.weight.shape, (3, 5))
@@ -172,6 +177,53 @@ class TestGlm52Fp8Packing(CustomTestCase):
             x @ (layer.weight.float() * layer.weight_scale_inv.flatten()), expected
         )
 
+    def test_legacy_dense_loaders_shard_weights_but_replicate_row_scales(self):
+        """Rank-one checkpoint scales shard only with output channels at TP=2."""
+        checkpoint = torch.arange(60).reshape(10, 6).float()
+        scales = torch.arange(1, 11).float()
+        for rank in (0, 1):
+            for column_parallel in (True, False):
+                with self.subTest(rank=rank, column_parallel=column_parallel):
+                    layer = torch.nn.Module()
+                    method = Glm52ChannelwiseFp8LinearMethod(_config())
+                    topology = SimpleNamespace(
+                        tp_rank=rank, tp_size=2, use_presharded_weights=False
+                    )
+                    loader_cls = (
+                        ColumnParallelLinear if column_parallel else RowParallelLinear
+                    )
+                    loader = loader_cls.weight_loader.__get__(topology)
+                    method.create_weights(
+                        layer,
+                        input_size_per_partition=6 if column_parallel else 3,
+                        output_partition_sizes=[5 if column_parallel else 10],
+                        input_size=6,
+                        output_size=10,
+                        params_dtype=torch.bfloat16,
+                        weight_loader=loader,
+                    )
+                    layer.weight.weight_loader(
+                        layer.weight, checkpoint.to(torch.float8_e4m3fn)
+                    )
+                    layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, scales)
+                    expected_weight = (
+                        checkpoint[rank * 5 : (rank + 1) * 5]
+                        if column_parallel
+                        else checkpoint[:, rank * 3 : (rank + 1) * 3]
+                    ).to(torch.float8_e4m3fn).float()
+                    expected_scale = (
+                        scales[rank * 5 : (rank + 1) * 5]
+                        if column_parallel
+                        else scales
+                    )
+                    torch.testing.assert_close(layer.weight.float(), expected_weight)
+                    torch.testing.assert_close(layer.weight_scale_inv, expected_scale)
+                    method.process_weights_after_loading(layer)
+                    torch.testing.assert_close(
+                        layer.weight.float() * layer.weight_scale_inv,
+                        (expected_weight * expected_scale[:, None]).t(),
+                    )
+
     def test_dense_rejects_stale_alias_and_nonchannel_scale_before_transpose(self):
         for stale_alias in (True, False):
             with self.subTest(stale_alias=stale_alias):
@@ -182,7 +234,7 @@ class TestGlm52Fp8Packing(CustomTestCase):
                     )
                     message = "early kv_b scale alias"
                 else:
-                    layer.weight_scale_inv.data = torch.ones(5)
+                    layer.weight_scale_inv.data = torch.ones(5, 1)
                     message = "dense scales must have shape"
                 with self.assertRaisesRegex(ValueError, message):
                     method.process_weights_after_loading(layer)
@@ -193,8 +245,16 @@ class TestGlm52Fp8Packing(CustomTestCase):
         # runner/kernel is constructed; is_gated is the allocation input only.
         with get_context().override_server_args(tp_size=1, pp_size=1):
             method = Glm52ChannelwiseFp8MoEMethod(_config())
-            layer = torch.nn.Module()
+            # Bypass only the distributed runner constructor, not loader logic.
+            layer = FusedMoE.__new__(FusedMoE)
+            torch.nn.Module.__init__(layer)
             layer.moe_runner_config = SimpleNamespace(is_gated=True)
+            layer.quant_method = method
+            layer.moe_tp_rank = 0
+            layer.moe_tp_size = 1
+            layer.use_padded_loading = False
+            layer.use_presharded_weights = False
+            layer.use_triton_kernels = False
             loader = object()
             method.create_weights(
                 layer, 2, 4, 3, torch.bfloat16, weight_loader=loader
@@ -205,16 +265,33 @@ class TestGlm52Fp8Packing(CustomTestCase):
                 scale = getattr(layer, f"{stem}_weight_scale_inv")
                 self.assertEqual(weight.shape, shape)
                 self.assertEqual(weight.dtype, torch.float8_e4m3fn)
-                self.assertEqual(scale.shape, (*shape[:2], 1))
+                self.assertEqual(scale.shape, shape[:2])
                 self.assertEqual(scale.quant_method, "channel")
                 self.assertIs(scale.weight_loader, loader)
                 self.assertFalse(hasattr(layer, f"{stem}_weight_scale"))
                 values = (torch.arange(weight.numel()).reshape(shape) % 13 - 6).float()
                 # Powers of two stay exact in both bf16/fp32 formatter policies.
-                scales = 2.0 ** torch.arange(shape[0] * shape[1]).reshape(*shape[:2], 1)
+                scales = 2.0 ** torch.arange(shape[0] * shape[1]).reshape(shape[:2])
                 weight.data.copy_(values.to(weight.dtype))
-                scale.data.copy_(scales)
-                expected[stem] = (values * scales).transpose(1, 2).contiguous()
+                # Feed actual checkpoint [N] tensors through the existing CHANNEL
+                # loader: separate gate/up shards concatenate into w13; w2
+                # replicates output-channel scales rather than slicing K.
+                for expert in range(2):
+                    if stem == "w13":
+                        for shard_id, shard_scale in zip(
+                            ("w1", "w3"), scales[expert].chunk(2)
+                        ):
+                            layer._load_per_channel_weight_scale(
+                                scale.data[expert], 0, shard_id, shard_scale
+                            )
+                    else:
+                        layer._load_per_channel_weight_scale(
+                            scale.data[expert], 1, "w2", scales[expert]
+                        )
+                torch.testing.assert_close(scale, scales)
+                expected[stem] = (
+                    (values * scales[:, :, None]).transpose(1, 2).contiguous()
+                )
 
             method.process_weights_after_loading(layer)
 
