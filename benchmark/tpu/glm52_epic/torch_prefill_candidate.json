@@ -20,6 +20,7 @@
     "chunked_prefill_size": 32768,
     "max_prefill_tokens": 32768,
     "max_running_requests": 32,
+    "max_total_tokens": 147456,
     "mem_fraction_static": 0.93,
     "enable_torch_compile": true,
     "torch_compile_max_bs": 32,
