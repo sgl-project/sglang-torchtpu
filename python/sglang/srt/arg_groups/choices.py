@@ -132,7 +132,6 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
     "nixl",
     "ascend",
-    "tpu",
     "raiden",
     "fake",
     "mori",

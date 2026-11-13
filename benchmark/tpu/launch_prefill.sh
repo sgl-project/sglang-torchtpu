@@ -14,7 +14,6 @@
 #   SGLANG_HOST_IP=<pod ip>          # default: auto from `hostname -i`
 #   # Multi-node TP (only if ONE engine spans multiple pods; default 1 pod/16 chips):
 #   NNODES=1  NODE_RANK=0  DIST_INIT_ADDR=<node0_ip>:<port>
-#   # KV-transfer optimization knobs (default on): SGLANG_TPU_KV_CHANNELS, _ASYNC, _STATS_EVERY
 #   EXTRA_ARGS="..."                 # any extra launch_server flags
 set -u
 
@@ -29,8 +28,8 @@ BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8998}
 PYTHON=${PYTHON:-python3}
 HOST=0.0.0.0
 
-# Advertise this pod's cluster IP for the bootstrap server + KV ZMQ sockets;
-# the decode pod must be able to reach it. (hostname -i may list several; take 1.)
+# Advertise this pod's cluster IP for the bootstrap server + raiden KV control
+# sockets; the decode pod must be able to reach it. (hostname -i may list several; take 1.)
 export SGLANG_HOST_IP=${SGLANG_HOST_IP:-$(hostname -i | awk '{print $1}')}
 
 # Multi-node tensor parallelism — only needed when a single engine spans more
@@ -59,7 +58,7 @@ export TPU_COMPILE_BS=${TPU_COMPILE_BS:-}
 export TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-}
 export EXTRA_ARGS="--ep-size $EP_SIZE \
     --disaggregation-mode prefill \
-    --disaggregation-transfer-backend tpu \
+    --disaggregation-transfer-backend raiden \
     --disaggregation-bootstrap-port $BOOTSTRAP_PORT \
     $MN_ARGS ${EXTRA_ARGS:-}"
 

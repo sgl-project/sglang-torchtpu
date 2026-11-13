@@ -56,7 +56,7 @@ export TPU_COMPILE_BS=${TPU_COMPILE_BS:-}
 export TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-}
 export EXTRA_ARGS="--ep-size $EP_SIZE \
     --disaggregation-mode decode \
-    --disaggregation-transfer-backend tpu \
+    --disaggregation-transfer-backend raiden \
     $MN_ARGS ${EXTRA_ARGS:-}"
 
 exec "$HERE/launch_server.sh"

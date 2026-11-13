@@ -68,16 +68,12 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         # Serving-time recompile monitor.
         "SGLANG_TPU_CHECK_RECOMPILATION",
         "SGLANG_TPU_CHECK_RECOMPILATION_SITES",
-        # PD KV transfer and its tracing, on the host.
-        "SGLANG_DEBUG_TPU_KV_STATS_EVERY",
+        # PD KV transfer, on the host.
         "SGLANG_RAIDEN_DYNAMIC_HOST_STAGING",
         "SGLANG_RAIDEN_HOST_POOL_GB",
         "SGLANG_TPU_RAIDEN_STAGING_LAYERS",
         "SGLANG_RAIDEN_LISTENER_START_READ",
         "SGLANG_RAIDEN_PIPELINE_TRANSFER",
-        "SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING",
-        "SGLANG_TPU_KV_ASYNC",
-        "SGLANG_TPU_KV_CHANNELS",
         # PP chunk scheduling; the token buckets it picks are graph shapes.
         "SGLANG_TPU_PP_CHUNK_SLACK",
         "SGLANG_TPU_PP_DYNAMIC_CHUNKS",
