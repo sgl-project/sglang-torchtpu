@@ -1559,6 +1559,25 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                     f"variant={variant}, logits={logits_output_mode.name}) "
                     f"in {elapsed:.1f}s{hbm_str}"
                 )
+        # Model code may cache values on modules the first time it runs (for
+        # example `self._x = ...` behind a getattr check). That first run is
+        # the trace of the first compile item, so its graph is guarded on the
+        # attribute being absent and goes stale right away. Serving traffic of
+        # that shape would then recompile and fail under `fail_on_recompile`.
+        # Trace the first item once more, while recompiles are still allowed,
+        # so a guard-valid graph exists for it.
+        if compile_items:
+            num_tokens, bs, mode, variant, logits_output_mode = compile_items[0]
+            warmup = self._run_one(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=mode,
+                variant=variant,
+                logits_output_mode=logits_output_mode,
+                capture_hidden_mode=extend_capture_hidden_mode,
+            )
+            if warmup is not None:
+                pending.append(warmup)
         return pending
 
     def _precompile_decode(self) -> list[PendingCall]:
