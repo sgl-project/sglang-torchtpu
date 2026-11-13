@@ -201,6 +201,9 @@ class MiniLoadBalancer:
         try:
             return await operation(*args, **kwargs)
         except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as error:
+            # Covers a refused connect too, which the stream-break probe in
+            # stream_results never sees.
+            self.request_health_probe(engine)
             if self.affinity_policy is None:
                 raise
             self.affinity_policy.loads.mark_unreachable(engine)
@@ -287,9 +290,9 @@ class MiniLoadBalancer:
                         url: probe for url, probe in probes.items() if not probe.done()
                     }
                     for url in self._registered_urls():
-                        if url not in probes:
-                            probes[url] = asyncio.create_task(
-                                self._probe_health(session, url)
+                        if not self._probe_in_flight(url):
+                            probes[url] = self._health_probes()[url] = (
+                                asyncio.create_task(self._probe_health(session, url))
                             )
                     await asyncio.sleep(self.health_poll_interval_secs)
             finally:
@@ -316,16 +319,26 @@ class MiniLoadBalancer:
         stops sending it traffic within one probe rather than one poll
         interval. The probe decides, not the break: a transient error on a
         healthy backend leaves it routable. No-op when health checks are off
-        or a requested probe of `url` is still in flight.
+        or a probe of `url` (requested or periodic) is still in flight.
         """
         if getattr(self, "health_poll_interval_secs", None) is None:
             return
-        # Kept in __dict__ so instances built without __init__ work too.
-        requested = self.__dict__.setdefault("_probes_requested", {})
-        probe = requested.get(url)
-        if probe is not None and not probe.done():
+        if self._probe_in_flight(url):
             return
-        requested[url] = _spawn_background(self._probe_once(url))
+        self._health_probes()[url] = _spawn_background(self._probe_once(url))
+
+    def _health_probes(self) -> Dict[str, asyncio.Task]:
+        """The latest probe task of each backend, periodic or requested.
+
+        Shared by both so one backend never has two probes in flight, and a
+        slower, older verdict cannot overwrite a newer one.
+        """
+        # Kept in __dict__ so instances built without __init__ work too.
+        return self.__dict__.setdefault("_health_probe_by_url", {})
+
+    def _probe_in_flight(self, url: str) -> bool:
+        probe = self._health_probes().get(url)
+        return probe is not None and not probe.done()
 
     async def _probe_once(self, url: str) -> None:
         timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT_SECS)

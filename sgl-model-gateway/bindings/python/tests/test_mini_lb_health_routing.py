@@ -6,6 +6,7 @@ import logging
 import math
 import socket
 
+import aiohttp
 import pytest
 from aiohttp import web
 from sglang_router import mini_lb
@@ -456,6 +457,57 @@ def test_requested_probes_of_one_backend_do_not_pile_up():
         await asyncio.gather(*list(mini_lb._background_tasks))
 
         assert backends.probes[hung] == 1
+
+    _run(test)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("first", ["periodic", "requested"])
+def test_periodic_and_requested_probes_of_one_backend_do_not_overlap(first):
+    async def test(backends, prefill_urls, decode_urls):
+        hung = decode_urls[0]
+        backends.hung.add(hung)
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=0.01)
+        if first == "requested":
+            load_balancer.request_health_probe(hung)
+            await backends.probe_started[hung].wait()
+        polling = load_balancer.start_health_polling()
+        try:
+            await backends.probe_started[hung].wait()
+            if first == "periodic":
+                load_balancer.request_health_probe(hung)
+            # Several poll intervals pass while the first probe hangs.
+            await asyncio.sleep(0.1)
+            assert backends.probes[hung] == 1
+        finally:
+            polling.cancel()
+            await asyncio.gather(polling, return_exceptions=True)
+            backends.release.set()
+            await asyncio.gather(*list(mini_lb._background_tasks))
+
+    _run(test)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("policy", ["random", "session_affinity"])
+def test_refused_connect_requests_a_probe_of_that_backend(policy):
+    async def test(backends, prefill_urls, decode_urls):
+        dead = _refused_url()
+        load_balancer = _lb(
+            prefill_urls,
+            [decode_urls[0], dead],
+            policy,
+            health_check_interval_secs=600,
+        )
+
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises(aiohttp.ClientConnectionError):
+                await load_balancer._engine_request(
+                    dead, session.get, f"{dead}/generate"
+                )
+        await _wait_for(lambda: dead in load_balancer._health.unhealthy)
+
+        assert _selected(load_balancer) == (set(prefill_urls), {decode_urls[0]})
 
     _run(test)
 

@@ -263,6 +263,9 @@ def _affinity_lb(prefill, decode):
             prefill_urls=[(prefill, 8998)],
             decode_urls=[decode],
             request_timeout_secs=1,
+            # These tests check request sessions only; a failed request would
+            # otherwise also open a health probe session.
+            disable_health_check=True,
         )
     )
 
