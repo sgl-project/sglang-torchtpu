@@ -1,0 +1,16 @@
+{
+  "experiment": "exp-h1cttjx0ai",
+  "status": "pending",
+  "latest_condition": {
+    "type": "ResourceReady",
+    "status": "False",
+    "reason": "QuotaPending",
+    "message": "waiting for Kueue quota reservation",
+    "last_transition_time": "2026-11-13T17:24:48.352833909Z"
+  },
+  "policy": "wait on original submission; no quota changes, no other owners leases, no duplicate accelerator requests",
+  "physical_chips": 8,
+  "hosts": 2,
+  "model_started": false,
+  "performance_result": null
+}
