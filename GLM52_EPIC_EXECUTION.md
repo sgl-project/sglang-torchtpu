@@ -51,4 +51,7 @@
 - Admission currently reports four more TPU chips needed and a CPU flavor topology warning; keep the submitted experiment, do not duplicate or modify others' resources.
 - Immediate next task: validate private checkpoint config/tensor scale shapes before Torch load. `--tpu-fp8-runtime channelwise` converts block checkpoint scales at runtime; it is NOT proof that the preconverted private channelwise checkpoint ABI is supported. Keep any loader compatibility fix separate from kernel changes.
 - Native Torch launcher supports two hosts with explicit nnodes/rank/dist address and TP16; attention DP uses `--attn-dp-size`. Build a GLM5.2-only recipe rather than reuse Flash flags.
+- Metadata inspector added and checked against a synthetic FP8+per-output-channel safetensors header fixture; Python compile and git diff checks passed. This does not validate the real checkpoint.
+- Native launcher candidate dry-run passed for both node ranks using TEST-NET rendezvous addresses; no TPU/model loading was performed. Candidate config is explicitly marked unvalidated in the benchmark README.
+- Changes through `107e03b28f` touch only this ledger and `benchmark/tpu/glm52_epic/`; no Flash or production runtime paths changed.
 - This ledger is updated with actual evidence as the work proceeds.
