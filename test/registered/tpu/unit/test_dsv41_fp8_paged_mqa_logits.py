@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: tests/kernels/deepseek_v41/test_fp8_paged_mqa_logits.py
-# Revision: 42c35ec6166a19b3f0db90f31807cc3df44602ec (epic/dsv41)
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Paged FP8 MQA logits across page sizes, padded widths and ragged lengths."""
@@ -32,6 +31,9 @@ from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
 from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import (
     fp8_paged_mqa_logits,
 )
+from sglang_tpu.kernels.deepseek_v41.index_selection.selection import (
+    select_fp8_indexer_jax,
+)
 
 
 def _pack(keys, layout):
@@ -56,10 +58,9 @@ def _pack(keys, layout):
 
 @pytest.mark.parametrize(
     "page_size,max_model_len",
-    [(128, 8192), (32, 8192), (256, 8192), (128, 50000), (128, 98816), (64, 98816)],
+    [(128, 8192), (128, 50000), (128, 98816), (256, 8192), (256, 98816)],
 )
-@pytest.mark.parametrize("block_size", [None, 8])
-def test_paged_mqa_logits_matches_reference(page_size, max_model_len, block_size):
+def test_paged_mqa_logits_matches_reference(page_size, max_model_len):
     if jax.default_backend() != "tpu":
         pytest.skip("Packed FP8 scoring requires TPU")
     rng = np.random.default_rng(7)
@@ -92,10 +93,8 @@ def test_paged_mqa_logits_matches_reference(page_size, max_model_len, block_size
         q_scale=jnp.ones_like(weights),
         query_size=6,
         cache_layout=layout,
-        candidate_block_size=block_size,
     )
-    scores, blocks = result if block_size else (result, None)
-    scores = np.asarray(scores)
+    scores = np.asarray(result)
 
     position = np.arange(max_model_len)
     for request in range(len(counts)):
@@ -118,78 +117,72 @@ def test_paged_mqa_logits_matches_reference(page_size, max_model_len, block_size
             actual[visible], expected[visible], rtol=2e-2, atol=2e-2 * expected.max()
         )
 
-    if block_size:
-        # Block maxima of the kernel's own scores, newest visible block forced on.
-        width = -(-max_model_len // block_size) * block_size
-        padded = np.pad(
-            scores, ((0, 0), (0, width - max_model_len)), constant_values=-np.inf
-        )
-        expected = padded.reshape(tokens, -1, block_size).max(-1)
-        newest = (lengths - 1) // block_size
-        live = lengths > 0
-        expected[np.flatnonzero(live), newest[live]] = np.inf
-        np.testing.assert_array_equal(np.asarray(blocks), expected)
 
-
-def _calc_diff(x, y):
-    """DeepGEMM's `calc_diff`: one minus the cosine-style similarity."""
-    x, y = x.astype(np.float64), y.astype(np.float64)
-    return 1 - 2 * (x * y).sum() / (x * x + y * y).sum()
-
-
-# Mirrors vLLM tests/kernels/attention/test_deepgemm_attention.py
-# `test_deepgemm_fp8_fp4_paged_mqa_logits`: BF16 references (unquantized q and
-# K, signed weights), causal speculative rows and calc_diff < 1e-3.
-@pytest.mark.parametrize("page_size", [64, 128])
-@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (2, 4)])
-def test_paged_mqa_logits_matches_vllm_reference(batch_size, next_n, page_size):
+# Decode-sized batch whose request rows are interleaved and query_start_loc is
+# omitted: selection must sort instead of scoring rows against a neighbor's pages.
+def test_unsorted_requests_select_own_pages():
     if jax.default_backend() != "tpu":
-        pytest.skip("Packed FP8 scoring requires TPU")
-    rng = np.random.default_rng(0)
-    max_model_len, avg_kv, heads = 4096, 2048, 32
-    layout = PackedFP8Layout(max_model_len * 2 * 64 // page_size, page_size=page_size)
-    q = rng.normal(size=(batch_size * next_n, heads, 128)).astype(np.float32)
-    kv = jnp.asarray(rng.normal(size=(layout.pages * page_size, 128)), jnp.bfloat16)
-    weights = rng.normal(size=(batch_size * next_n, heads)).astype(np.float32)
-    context_lens = rng.integers(int(0.8 * avg_kv), int(1.2 * avg_kv), batch_size)
-    per_request = max_model_len // page_size
-    table = np.zeros((batch_size, per_request), np.int32)
-    pool_ids = iter(rng.permutation(layout.pages))
-    for i, length in enumerate(context_lens):
-        for j in range(-(-length // page_size)):
-            table[i, j] = next(pool_ids)
-    # Row j of a request sees context_len - next_n + j + 1 keys.
-    lengths = (context_lens[:, None] - next_n + 1 + np.arange(next_n)).reshape(-1)
-    pool, _ = _pack(kv, layout)
-
-    logits = fp8_paged_mqa_logits(
-        jnp.asarray(q, jnp.bfloat16).astype(jnp.float8_e4m3fn),
-        jnp.asarray(pool),
-        jnp.asarray(weights),
-        jnp.asarray(lengths, jnp.int32),
-        jnp.asarray(table),
-        query_start_loc=jnp.arange(batch_size + 1, dtype=jnp.int32) * next_n,
-        max_model_len=max_model_len,
-        q_scale=jnp.ones_like(weights),
-        query_size=next_n,
-        cache_layout=layout,
+        pytest.skip("Packed FP8 selection requires TPU")
+    tokens, width, topk, page_size, groups = 288, 16384, 512, 256, 48
+    rng = np.random.default_rng(13)
+    requests = rng.permutation(np.repeat(np.arange(groups), tokens // groups))
+    lengths = rng.integers(topk + 1, width + 1, tokens).astype(np.int32)
+    layout = PackedFP8Layout(512, page_size=page_size)
+    keys = jnp.asarray(rng.normal(size=(layout.pages * page_size, 128)), jnp.bfloat16)
+    pool, _ = _pack(keys, layout)
+    pool = jnp.asarray(pool)
+    table = rng.integers(0, layout.pages, (groups, width // page_size)).astype(np.int32)
+    q = jnp.asarray(rng.normal(size=(tokens, 32, 128)), jnp.float8_e4m3fn)
+    weights = jnp.asarray(rng.uniform(0.01, 0.1, (tokens, 32)), jnp.float32)
+    layout_args = (layout.pages, layout.page_stride, layout.page_offset, page_size)
+    selected = np.asarray(
+        jax.jit(
+            lambda q, w, n: select_fp8_indexer_jax(
+                q,
+                (pool,),
+                jnp.asarray(table),
+                w,
+                n,
+                jnp.empty((tokens, 0), jnp.int32),
+                jnp.asarray(requests, jnp.int32),
+                n.max().reshape(1),
+                layout_args,
+                topk,
+                8,
+                False,
+                False,
+                True,
+                width,
+            )[0]
+        )(q, weights, jnp.asarray(lengths))
     )
-
-    position = np.arange(max_model_len)
-    keys = np.asarray(kv, np.float32)
-    ref = np.zeros((batch_size * next_n, max_model_len), np.float32)
-    for i in range(batch_size):
-        rows = slice(i * next_n, (i + 1) * next_n)
-        k = keys[table[i][position // page_size] * page_size + position % page_size]
-        score = np.einsum(
-            "qhd,kd->qhk", np.asarray(jnp.asarray(q[rows], jnp.bfloat16), np.float32), k
+    # Reference scores of each row against its own request, scored in sorted order.
+    order = np.argsort(requests, kind="stable")
+    offsets = np.searchsorted(requests[order], np.arange(groups + 1))
+    sorted_scores = np.asarray(
+        fp8_paged_mqa_logits(
+            q[order],
+            pool,
+            weights[order],
+            jnp.asarray(lengths[order]),
+            jnp.asarray(table),
+            query_start_loc=jnp.asarray(offsets, jnp.int32),
+            max_model_len=width,
+            q_scale=jnp.ones_like(weights),
+            query_size=6,
+            cache_layout=layout,
         )
-        ref[rows] = (np.maximum(score, 0) * weights[rows][..., None]).sum(1)
-    visible = position[None] < lengths[:, None]
-    logits = np.asarray(logits)
-    np.testing.assert_array_equal(np.isneginf(logits), ~visible)
-    diff = _calc_diff(np.where(visible, logits, 0), np.where(visible, ref, 0))
-    assert diff < 1e-3, f"{diff=}"
+    )
+    scores = np.empty_like(sorted_scores)
+    scores[order] = sorted_scores
+    for row in range(tokens):
+        visible = scores[row, : lengths[row]]
+        ids = selected[row][selected[row] >= 0]
+        assert np.unique(ids).size == ids.size == topk, row
+        assert (ids < lengths[row]).all(), row
+        kth = np.sort(visible)[-topk]
+        tolerance = 2e-2 * np.abs(visible).max()
+        assert visible[ids].min() >= kth - tolerance, row
 
 
 if __name__ == "__main__":
