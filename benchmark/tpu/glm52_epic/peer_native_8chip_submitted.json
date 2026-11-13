@@ -1,0 +1,86 @@
+{
+  "name": "glm52-peer-native-8chip-20261114",
+  "exp_type": "TRAINING",
+  "artifact_type": "GCS",
+  "cluster_name": "gke-tpu-train-us-central1-1-prod",
+  "config": "{\"status\": \"SUBMITTED_STARTUP_SMOKE\", \"scope\": \"native startup and one token-ID smoke only; not performance\", \"peer_experiment\": \"exp-bsvzoblh0d\", \"peer_artifact\": \"art-un2n55pm4e\", \"peer_setup_sha256\": \"e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00\", \"bootstrap_sha256\": \"5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3\", \"source_commit\": \"b75d137fba5d2b45719c15d5c99a3367378de1cf\", \"local_review_head\": \"dd312270841887966b5480be2f451f6c19de1496\", \"base_image_identity\": \"mutable peer base tag plus explicit hashed bootstrap/wheel provenance; not immutable runtime image\", \"prepared_wheelhouse\": \"gs://tpu-for-training-falcon-logs/experiments/exp-8tku39alke/artifacts/art-hakzf5m8u1/glm53-prepared/wheelhouse\", \"rendezvous\": \"requires shared writable ARTIFACT_LOCAL_DIR and unique GLM52_RENDEZVOUS_ID; ordered rank0/rank1 atomic JSON; 300s timeout\", \"timeout\": \"9600s work + 45s cleanup hard bound; runner 7195s with own native-child cleanup\", \"render_required\": \"commit reviewed benchmark runner gate then pin SOURCE_SHA and SOURCE_COMMIT identically; allocation ID unique; no submission performed\", \"cluster_policy\": \"2h max-running-time; bootstrap plus startup may be terminated by policy\"}",
+  "role_to_task_spec": {
+    "worker": {
+      "replica": 2,
+      "device_type": "v7x",
+      "device_count": 8,
+      "device_topo": "2x2x2",
+      "image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+      "shared_memory_size": "256Gi",
+      "envs": {
+        "SOURCE_REPO": "https://github.com/sgl-project/sglang-torchtpu.git",
+        "TORCH_TPU_WHEEL": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+        "TORCH_TPU_WHEEL_SHA256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82",
+        "SOURCE_SHA": "b75d137fba5d2b45719c15d5c99a3367378de1cf",
+        "SOURCE_COMMIT": "b75d137fba5d2b45719c15d5c99a3367378de1cf",
+        "GLM52_IMAGE": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+        "GLM52_BOOTSTRAP_SHA256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3",
+        "GLM52_PEER_SETUP_SHA256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00",
+        "GLM52_RENDEZVOUS_ID": "e4529222e329437ebb7095c38d514958",
+        "TPU_TOPOLOGY": "2x2x2",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "sources": [
+        {
+          "name": "sglang-torchtpu",
+          "type": "git",
+          "repo": "https://github.com/sgl-project/sglang-torchtpu.git",
+          "ref": "epic/glm52-channelwise-port-20261113",
+          "commit": "b75d137fba5d2b45719c15d5c99a3367378de1cf",
+          "path": "/workspace/sglang-torchtpu"
+        }
+      ],
+      "mounts": [
+        {
+          "name": "torch-tpu-wheel",
+          "type": "gcs",
+          "bucket": "tpu-for-training-falcon-logs",
+          "prefix": "experiments/exp-h8vu1379oa/artifacts/art-6jnw46ypty/wheels/cp312-linux-x86_64",
+          "mount_path": "/wheels/torch-tpu",
+          "read_only": true,
+          "mount_options": [
+            "implicit-dirs"
+          ]
+        },
+        {
+          "name": "prepared",
+          "type": "gcs",
+          "bucket": "tpu-for-training-falcon-logs",
+          "prefix": "experiments/exp-8tku39alke/artifacts/art-hakzf5m8u1/glm53-prepared",
+          "mount_path": "/prepared",
+          "read_only": true,
+          "mount_options": [
+            "implicit-dirs"
+          ]
+        },
+        {
+          "name": "glm52-channelwise-model",
+          "type": "gcs",
+          "bucket": "inference-model-storage-poc-tpu-hns",
+          "prefix": "GLM5.2-fp8-channel-wise",
+          "mount_path": "/models/GLM5.2-fp8-channel-wise",
+          "read_only": true,
+          "mount_options": [
+            "implicit-dirs",
+            "metadata-cache:ttl-secs:-1",
+            "metadata-cache:stat-cache-max-size-mb:-1",
+            "metadata-cache:type-cache-max-size-mb:-1",
+            "file-system:kernel-list-cache-ttl-secs:-1",
+            "read:enable-buffered-read:true",
+            "read:block-size-mb:32",
+            "read:max-blocks-per-handle:64",
+            "read:global-max-blocks:2048",
+            "read_ahead_kb=1024"
+          ]
+        }
+      ],
+      "command": "set -eu\nulimit -c 0\nmkdir -p /tmp/tpu_logs/tmp\npython3 - <<'BOOTSTRAP_PAYLOAD'\nimport base64, hashlib\nfrom pathlib import Path\npayload = base64.b64decode('IyEvdXNyL2Jpbi9lbnYgYmFzaAojIFVOU1VCTUlUVEVEIGJlbmNobWFyay1vbmx5IGFkYXB0ZXIgb2Ygc3VjY2Vzc2Z1bCBleHAtYnN2em9ibGgwZCdzIHNldHVwX2Vudi5zaC4KIyBQZWVyIGV4dHJhY3RlZCBzY3JpcHQgU0hBMjU2IGlzIHJlY29yZGVkIGluIHRoZSBtYW5pZmVzdC9wcm92ZW5hbmNlOyBubyBnaWFudCBidW5kbGUuCiMgSW5zdGFsbHMgT05MWSBpbiBhIGZyZXNoIGxvY2FsIHZlbnY7IG5ldmVyIGNoYW5nZXMgcHJvZHVjdGlvbiBpbWFnZXMgb3IgbW9kZWwgbW91bnRzLgojIENhbGxlciBtdXN0IGJvdW5kIHRoZSBjb21wbGV0ZSBib290c3RyYXArcnVubmVyIHdpdGggR05VIHRpbWVvdXQgKG1hbmlmZXN0OiA5NjAwcykuCnNldCAtZXVvIHBpcGVmYWlsCnVsaW1pdCAtYyAwCjogIiR7U09VUkNFX1JFUE86P30iICIke1NPVVJDRV9TSEE6P30iICIke1RPUkNIX1RQVV9XSEVFTDo/fSIgIiR7VE9SQ0hfVFBVX1dIRUVMX1NIQTI1Njo/fSIKOiAiJHtBUlRJRkFDVF9MT0NBTF9ESVI6P211c3QgYmUgc2hhcmVkIGJldHdlZW4gdGhlIHR3byBob3N0c30iICIke0dMTTUyX1JFTkRFWlZPVVNfSUQ6P3VuaXF1ZSBwZXIgYWxsb2NhdGlvbn0iCjogIiR7R0xNNTJfSU1BR0U6P30iICIke0dMTTUyX0JPT1RTVFJBUF9TSEEyNTY6P30iICIke0dMTTUyX1BFRVJfU0VUVVBfU0hBMjU2Oj99IgpbWyAiJFNPVVJDRV9TSEEiID1+IF5bMC05YS1mXXs0MH0kICYmICIkR0xNNTJfQk9PVFNUUkFQX1NIQTI1NiIgPX4gXlswLTlhLWZdezY0fSQgXV0KW1sgIiRUT1JDSF9UUFVfV0hFRUxfU0hBMjU2IiA9PSA2ZTEyODE2ZTkyZjlhNWQ5NjQ5MzU4NTQxZjMzMmYwNjU4M2NjZGZlZTViNmE3NDQzNGRiZjIxNDE3NTdmZDgyIF1dCltbICIkR0xNNTJfSU1BR0UiID09IHVzLWRvY2tlci5wa2cuZGV2L2Nsb3VkLXRwdS1pbWFnZXMvamF4LWFpLWltYWdlL3RwdTpqYXgwLjkuMC1yZXYxIF1dCltbICIke0ZBTENPTl9XT1JMRF9TSVpFOi19IiA9PSAyICYmICIke0ZBTENPTl9SQU5LOi19IiA9fiBeWzAxXSQgXV0KW1sgIiR7VFBVX1RPUE9MT0dZOi19IiA9PSAyeDJ4MiBdXQpbWyAiJEdMTTUyX1JFTkRFWlZPVVNfSUQiID1+IF5bQS1aYS16MC05Xy1dKyQgXV0KZXhwb3J0IFRNUERJUj0vdG1wL3RwdV9sb2dzL3RtcCBQSVBfQ0FDSEVfRElSPS90bXAvdHB1X2xvZ3MvcGlwLWNhY2hlIFBZVEhPTlVOQlVGRkVSRUQ9MSBQWVRIT05OT1VTRVJTSVRFPTEKZXhwb3J0IFBZVEhPTkRPTlRXUklURUJZVEVDT0RFPTEgWExBX1BZVEhPTl9DTElFTlRfUFJFQUxMT0NBVEU9ZmFsc2UKIyBEbyBub3QgY29uY2VhbCBpbnB1dCB0b3BvbG9neSBvdmVycmlkZXM6IHJ1bm5lciBtdXN0IHJlamVjdCB0aGVtLgpST09UPSQobWt0ZW1wIC1kIC90bXAvZ2xtNTItcGVlci1yYW5rIiRGQUxDT05fUkFOSyIuWFhYWFhYKQpleHBvcnQgU1JDPSIkUk9PVC9zcmMiIFZFTlY9IiRST09UL3ZlbnYiCmV4cG9ydCBBUlQ9IiRBUlRJRkFDVF9MT0NBTF9ESVIvcGVlci1ib290c3RyYXAvcmFuay0kRkFMQ09OX1JBTksiCm1rZGlyIC1wICIkQVJUIiAiJFRNUERJUiIKZXhlYyA+ID4odGVlIC1hICIkQVJUL2RyaXZlci5sb2ciKSAyPiYxCnByaW50ZiAnJXMgICVzXG4nICIkR0xNNTJfQk9PVFNUUkFQX1NIQTI1NiIgIiQwIiB8IHNoYTI1NnN1bSAtYyAtCnJlc3RvcmVfcHlwcm9qZWN0KCkgewogICAgaWYgW1sgLWYgIiRST09UL3B5cHJvamVjdC5vcmlnaW5hbCIgJiYgLWQgIiRTUkMvLmdpdCIgXV07IHRoZW4KICAgICAgICBjcCAiJFJPT1QvcHlwcm9qZWN0Lm9yaWdpbmFsIiAiJFNSQy9weXRob24vcHlwcm9qZWN0LnRvbWwiCiAgICBmaQp9CnRyYXAgcmVzdG9yZV9weXByb2plY3QgRVhJVAojIEV4YWN0IHBlZXIgY2xvbmUgcHJvY2VkdXJlOiBubyBicmFuY2ggZmFsbGJhY2ssIGxvY2FsIHNvdXJjZSBtdXRhdGlvbiwgb3IgcmVtb3RlIHN1Ym1pdC4KZ2l0IGluaXQgLXEgIiRTUkMiCmdpdCAtQyAiJFNSQyIgcmVtb3RlIGFkZCBvcmlnaW4gIiRTT1VSQ0VfUkVQTyIKZ2l0IC1DICIkU1JDIiBmZXRjaCAtcSAtLWRlcHRoPTEgb3JpZ2luICIkU09VUkNFX1NIQSIKZ2l0IC1DICIkU1JDIiBjaGVja291dCAtcSAtLWRldGFjaCBGRVRDSF9IRUFECltbICIkKGdpdCAtQyAiJFNSQyIgcmV2LXBhcnNlIEhFQUQpIiA9PSAiJFNPVVJDRV9TSEEiIF1dCmdpdCAtQyAiJFNSQyIgbG9nIC0xIC0tZm9ybWF0PSclSCAlcycgPiAiJEFSVC9zb3VyY2UudHh0IgpjcCAiJFNSQy9weXRob24vcHlwcm9qZWN0LnRvbWwiICIkUk9PVC9weXByb2plY3Qub3JpZ2luYWwiCmNwICIkU1JDL3B5dGhvbi9weXByb2plY3RfdHB1LnRvbWwiICIkU1JDL3B5dGhvbi9weXByb2plY3QudG9tbCIKcHl0aG9uMyAtYyAnaW1wb3J0IHN5czsgYXNzZXJ0IHN5cy52ZXJzaW9uX2luZm9bOjJdID09ICgzLCAxMiksIHN5cy52ZXJzaW9uJwpweXRob24zIC1tIHZlbnYgIiRWRU5WIgpleHBvcnQgUEFUSD0iJFZFTlYvYmluOiRQQVRIIgpweXRob24gLW0gcGlwIGluc3RhbGwgLXEgLS11cGdyYWRlIHBpcCBzZXR1cHRvb2xzIHNldHVwdG9vbHMtc2NtIHdoZWVsID4gIiRBUlQvcGlwLWJhc2UubG9nIiAyPiYxCldIRUVMPS93aGVlbHMvdG9yY2gtdHB1LyRUT1JDSF9UUFVfV0hFRUwKcHJpbnRmICclcyAgJXNcbicgIiRUT1JDSF9UUFVfV0hFRUxfU0hBMjU2IiAiJFdIRUVMIiB8IHNoYTI1NnN1bSAtYyAtID4gIiRBUlQvdG9yY2gtdHB1LXNoYS50eHQiCiMgUHJlc2VydmUgdGhlIHNvdXJjZSdzIGZ1bGwgZGVwZW5kZW5jeSBwaW5zLCBzdWJzdGl0dXRpbmcgb25seSB0aGUgdmVyaWZpZWQgcHJpdmF0ZSB3aGVlbC4KcHl0aG9uIC0gIiRTUkMvcHl0aG9uL3B5cHJvamVjdF90cHUudG9tbCIgIiRXSEVFTCIgPiAiJFJPT1QvcmVxLnR4dCIgPDwnUFknCmltcG9ydCBwYXRobGliLCByZSwgc3lzLCB0b21sbGliCnByb2plY3QgPSB0b21sbGliLmxvYWRzKHBhdGhsaWIuUGF0aChzeXMuYXJndlsxXSkucmVhZF90ZXh0KCkpWydwcm9qZWN0J10KZm9yIGRlcCBpbiBwcm9qZWN0WydkZXBlbmRlbmNpZXMnXToKICAgIGlmIHJlLm1hdGNoKHIndG9yY2hbXy1ddHB1XGInLCBkZXApOgogICAgICAgIHBpbiA9IGRlcC5zcGxpdCgnPT0nKVsxXQogICAgICAgIGFzc2VydCBmJy17cGlufS0nIGluIHBhdGhsaWIuUGF0aChzeXMuYXJndlsyXSkubmFtZSwgKGRlcCwgc3lzLmFyZ3ZbMl0pCiAgICAgICAgcHJpbnQoc3lzLmFyZ3ZbMl0pCiAgICBlbHNlOgogICAgICAgIHByaW50KGRlcCkKUFkKIyBQZWVyIHByZXBhcmVkIGFydGlmYWN0IHN1cHBsaWVzIGZpbmQtbGlua3MsIG5vdCBhbiBhc3NlcnRpb24gb2Ygb2ZmbGluZSBkZXBlbmRlbmN5IGNsb3N1cmUuCnRlc3QgLWQgL3ByZXBhcmVkL3doZWVsaG91c2UKcHl0aG9uIC1tIHBpcCBpbnN0YWxsIC0tZmluZC1saW5rcz0vcHJlcGFyZWQvd2hlZWxob3VzZSAtLWV4dHJhLWluZGV4LXVybCBodHRwczovL2Rvd25sb2FkLnB5dG9yY2gub3JnL3dobC9jcHUgXAogICAgLXIgIiRST09UL3JlcS50eHQiID4gIiRBUlQvcGlwLXJlcS5sb2ciIDI+JjEKcHl0aG9uIC1tIHBpcCBpbnN0YWxsIC0tbm8tZGVwcyAtLW5vLWJ1aWxkLWlzb2xhdGlvbiAtZSAiJFNSQy9weXRob24iIC1lICIkU1JDIiA+ICIkQVJUL3BpcC1lZGl0YWJsZS5sb2ciIDI+JjEKIyBFZGl0YWJsZSBtZXRhZGF0YSBpcyBpbnN0YWxsZWQ7IHJlc3RvcmUgdGhlIE9SSUdJTkFMIHRyYWNrZWQgZmlsZSBiZWZvcmUgcnVubmVyIGNsZWFuIGNoZWNrLgpyZXN0b3JlX3B5cHJvamVjdApbWyAteiAiJChnaXQgLUMgIiRTUkMiIHN0YXR1cyAtLXBvcmNlbGFpbiAtLXVudHJhY2tlZC1maWxlcz1ubykiIF1dCnB5dGhvbiAtbSBwaXAgZnJlZXplID4gIiRBUlQvcGlwLWZyZWV6ZS50eHQiCiMgU2FtZSBwZWVyIHByZXJlcXVpc2l0ZTogamF4LWFpIGJhc2UgbGFja3MgbGliaWJ2ZXJicyBmb3IgdHB1LXN5bmMgcmF3IHRyYW5zZmVyLgppZiAhIGxkY29uZmlnIC1wIHwgYXdrICcvbGliaWJ2ZXJicy5zby4xLyB7Zm91bmQ9MX0gRU5EIHtleGl0ICFmb3VuZH0nOyB0aGVuCiAgICBhcHQtZ2V0IHVwZGF0ZSAtcXEgPiAiJEFSVC9hcHQubG9nIiAyPiYxCiAgICBhcHQtZ2V0IGluc3RhbGwgLXkgLXFxIGxpYmlidmVyYnMxIGxpYnJkbWFjbTEgPj4gIiRBUlQvYXB0LmxvZyIgMj4mMQpmaQpleHBvcnQgVFBVX0xJQlJBUllfUEFUSApUUFVfTElCUkFSWV9QQVRIPSQocHl0aG9uIC1jICdpbXBvcnQgbGlidHB1OyBwcmludChsaWJ0cHUuZ2V0X2xpYnJhcnlfcGF0aCgpKScpCmV4cG9ydCBTT1VSQ0VfQ09NTUlUPSIkU09VUkNFX1NIQSIKZXhwb3J0IEdMTTUyX0JPT1RTVFJBUF9QUk9WRU5BTkNFPSIkQVJUL2Jvb3RzdHJhcC1wcm92ZW5hbmNlLmpzb24iCnB5dGhvbiAtIDw8J1BZJwppbXBvcnQgaGFzaGxpYiwgaW1wb3J0bGliLm1ldGFkYXRhIGFzIG0sIGpzb24sIG9zCmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aAppbXBvcnQgdG9tbGxpYgpwaW5zID0ge30KZm9yIGRlcCBpbiB0b21sbGliLmxvYWRzKChQYXRoKG9zLmVudmlyb25bJ1NSQyddKS8ncHl0aG9uL3B5cHJvamVjdF90cHUudG9tbCcpLnJlYWRfdGV4dCgpKVsncHJvamVjdCddWydkZXBlbmRlbmNpZXMnXToKICAgIG5hbWUsIF8sIHZlcnNpb24gPSBkZXAucGFydGl0aW9uKCc9PScpCiAgICBpZiBuYW1lIGluICgndG9yY2hfdHB1JywgJ3RvcmNoJywgJ3RvcmNodmlzaW9uJywgJ2pheCcsICdqYXhsaWInLCAnbGlidHB1JywgJ3RwdS1zeW5jLXRvcmNoJyk6CiAgICAgICAgcGluc1tuYW1lXSA9IHZlcnNpb24KdmVyc2lvbnMgPSB7bmFtZTogbS52ZXJzaW9uKG5hbWUpIGZvciBuYW1lIGluIHBpbnN9CmFzc2VydCBhbGwodmVyc2lvbnNbbl0uc3BsaXQoJysnKVswXSA9PSB2IGZvciBuLCB2IGluIHBpbnMuaXRlbXMoKSksIChwaW5zLCB2ZXJzaW9ucykKcCA9IGRpY3Qoc2NoZW1hX3ZlcnNpb249MSwgc2NvcGU9J2JlbmNobWFyay1vbmx5IGJvb3RzdHJhcCBpZGVudGl0eTsgYmFzZSB0YWcgTk9UIGltbXV0YWJsZSBpbWFnZSBpZGVudGl0eScsCiAgICAgICAgIHBlZXJfZXhwZXJpbWVudD0nZXhwLWJzdnpvYmxoMGQnLCBwZWVyX3Rhc2tfc3RhdHVzPSdzdWNjZWVkZWQnLAogICAgICAgICBwZWVyX3NldHVwX3NoYTI1Nj1vcy5lbnZpcm9uWydHTE01Ml9QRUVSX1NFVFVQX1NIQTI1NiddLAogICAgICAgICBib290c3RyYXBfc2hhMjU2PW9zLmVudmlyb25bJ0dMTTUyX0JPT1RTVFJBUF9TSEEyNTYnXSwgYmFzZV9pbWFnZT1vcy5lbnZpcm9uWydHTE01Ml9JTUFHRSddLAogICAgICAgICBzb3VyY2VfcmVwbz1vcy5lbnZpcm9uWydTT1VSQ0VfUkVQTyddLCBzb3VyY2VfY29tbWl0PW9zLmVudmlyb25bJ1NPVVJDRV9TSEEnXSwKICAgICAgICAgd2hlZWw9b3MuZW52aXJvblsnVE9SQ0hfVFBVX1dIRUVMJ10sIHdoZWVsX3NoYTI1Nj1vcy5lbnZpcm9uWydUT1JDSF9UUFVfV0hFRUxfU0hBMjU2J10sCiAgICAgICAgIHdoZWVsX3BhdGg9Jy93aGVlbHMvdG9yY2gtdHB1Lycrb3MuZW52aXJvblsnVE9SQ0hfVFBVX1dIRUVMJ10sCiAgICAgICAgIHByZXBhcmVkX3doZWVsaG91c2U9Jy9wcmVwYXJlZC93aGVlbGhvdXNlJywgd2FudD1waW5zLCBnb3Q9dmVyc2lvbnMsCiAgICAgICAgIGNhbmRpZGF0ZV9zaGEyNTY9aGFzaGxpYi5zaGEyNTYoKFBhdGgob3MuZW52aXJvblsnU1JDJ10pLydiZW5jaG1hcmsvdHB1L2dsbTUyX2VwaWMvdG9yY2hfcHJlZmlsbF9jYW5kaWRhdGUuanNvbicpLnJlYWRfYnl0ZXMoKSkuaGV4ZGlnZXN0KCkpClBhdGgob3MuZW52aXJvblsnR0xNNTJfQk9PVFNUUkFQX1BST1ZFTkFOQ0UnXSkud3JpdGVfdGV4dChqc29uLmR1bXBzKHAsIGluZGVudD0yKSsnXG4nKQpwcmludChqc29uLmR1bXBzKHAsIHNvcnRfa2V5cz1UcnVlKSwgZmx1c2g9VHJ1ZSkKUFkKIyBTaGFyZWQgYXJ0aWZhY3QgcmVuZGV6dm91czogYXRvbWljIHJhbmsgSlNPTiByZWNvcmRzLCBleHBsaWNpdGx5IG9yZGVyZWQgYnkgRmFsY29uIHJhbmsuCiMgQSB1bmlxdWUgYWxsb2NhdGlvbiBJRCBwcmV2ZW50cyBhbiBvbGQgam9iJ3MgcmVjb3JkcyBmcm9tIGJlY29taW5nIG5ldyBwZWVyIGFkZHJlc3Nlcy4KZXhwb3J0IFRQVV9XT1JLRVJfSE9TVE5BTUVTClRQVV9XT1JLRVJfSE9TVE5BTUVTPSQocHl0aG9uIC0gPDwnUFknCmltcG9ydCBpcGFkZHJlc3MsIGpzb24sIG9zLCBzb2NrZXQsIHRpbWUKZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCnJhbmsgPSBpbnQob3MuZW52aXJvblsnRkFMQ09OX1JBTksnXSkKcm9vdCA9IFBhdGgob3MuZW52aXJvblsnQVJUSUZBQ1RfTE9DQUxfRElSJ10pLydwZWVyLXJlbmRlenZvdXMnL29zLmVudmlyb25bJ0dMTTUyX1JFTkRFWlZPVVNfSUQnXQpyb290Lm1rZGlyKHBhcmVudHM9VHJ1ZSwgZXhpc3Rfb2s9VHJ1ZSkKaG9zdG5hbWUgPSBzb2NrZXQuZ2V0aG9zdG5hbWUoKQppcHMgPSBzb3J0ZWQoe2FbNF1bMF0gZm9yIGEgaW4gc29ja2V0LmdldGFkZHJpbmZvKGhvc3RuYW1lLCBOb25lLCBzb2NrZXQuQUZfSU5FVCkKICAgICAgICAgICAgICBpZiBub3QgaXBhZGRyZXNzLmlwX2FkZHJlc3MoYVs0XVswXSkuaXNfbG9vcGJhY2t9KQphc3NlcnQgaXBzLCBmJ25vIHJvdXRhYmxlIElQdjQgZm9yIHtob3N0bmFtZX0nCnJlY29yZCA9IGRpY3QocmFuaz1yYW5rLCBob3N0bmFtZT1ob3N0bmFtZSwgaXA9aXBzWzBdLCBpcHM9aXBzLAogICAgICAgICAgICAgIHNvdXJjZV9jb21taXQ9b3MuZW52aXJvblsnU09VUkNFX1NIQSddLCBib290c3RyYXBfc2hhMjU2PW9zLmVudmlyb25bJ0dMTTUyX0JPT1RTVFJBUF9TSEEyNTYnXSwKICAgICAgICAgICAgICByZW5kZXp2b3VzX2lkPW9zLmVudmlyb25bJ0dMTTUyX1JFTkRFWlZPVVNfSUQnXSkKdGFyZ2V0ID0gcm9vdC9mJ3Jhbmt7cmFua30uanNvbicKdG1wID0gcm9vdC9mJy5yYW5re3Jhbmt9LXtvcy5nZXRwaWQoKX0udG1wJwp0bXAud3JpdGVfdGV4dChqc29uLmR1bXBzKHJlY29yZCkrJ1xuJykKb3MucmVwbGFjZSh0bXAsIHRhcmdldCkKZGVhZGxpbmUgPSB0aW1lLm1vbm90b25pYygpKzMwMAp3aGlsZSBUcnVlOgogICAgdHJ5OgogICAgICAgIHBlZXJzID0gW2pzb24ubG9hZHMoKHJvb3QvZidyYW5re2l9Lmpzb24nKS5yZWFkX3RleHQoKSkgZm9yIGkgaW4gcmFuZ2UoMildCiAgICAgICAgZm9yIGksIHBlZXIgaW4gZW51bWVyYXRlKHBlZXJzKToKICAgICAgICAgICAgYXNzZXJ0IHBlZXJbJ3JhbmsnXSA9PSBpCiAgICAgICAgICAgIGZvciBrZXkgaW4gKCdzb3VyY2VfY29tbWl0JywgJ2Jvb3RzdHJhcF9zaGEyNTYnLCAncmVuZGV6dm91c19pZCcpOgogICAgICAgICAgICAgICAgYXNzZXJ0IHBlZXJba2V5XSA9PSByZWNvcmRba2V5XSwgKGtleSwgcGVlcikKICAgICAgICAgICAgYXNzZXJ0IG5vdCBpcGFkZHJlc3MuaXBfYWRkcmVzcyhwZWVyWydpcCddKS5pc19sb29wYmFjawogICAgICAgIGFzc2VydCBwZWVyc1swXVsnaXAnXSAhPSBwZWVyc1sxXVsnaXAnXSwgcGVlcnMKICAgICAgICBhc3NlcnQgcGVlcnNbMF1bJ2hvc3RuYW1lJ10gIT0gcGVlcnNbMV1bJ2hvc3RuYW1lJ10sIHBlZXJzCiAgICAgICAgUGF0aChvcy5lbnZpcm9uWydBUlQnXSwgJ29yZGVyZWQtaG9zdHMuanNvbicpLndyaXRlX3RleHQoanNvbi5kdW1wcyhwZWVycywgaW5kZW50PTIpKydcbicpCiAgICAgICAgcHJpbnQoJywnLmpvaW4ocGVlclsnaXAnXSBmb3IgcGVlciBpbiBwZWVycykpCiAgICAgICAgYnJlYWsKICAgIGV4Y2VwdCAoRmlsZU5vdEZvdW5kRXJyb3IsIGpzb24uSlNPTkRlY29kZUVycm9yKToKICAgICAgICBpZiB0aW1lLm1vbm90b25pYygpID49IGRlYWRsaW5lOgogICAgICAgICAgICByYWlzZSBUaW1lb3V0RXJyb3IoJ3R3by1ob3N0IHNoYXJlZCBBUlRJRkFDVF9MT0NBTF9ESVIgcmVuZGV6dm91cyBleGNlZWRlZCAzMDBzJykKICAgICAgICB0aW1lLnNsZWVwKDEpClBZCikKY2QgIiRTUkMiCiMgR2F0ZSBpbnRlbnRpb25hbGx5IHJlbWFpbnMgc3RyaWN0IGluIHRoZSBleGlzdGluZyBydW5uZXIuIERvIG5vdCBpbnZlbnQgYW4gaW1hZ2UgZGlnZXN0LgojIFBhcmVudCBtdXN0IGV4cGxpY2l0bHkgYXBwcm92ZSBiZW5jaG1hcmsgcHJvdmVuYW5jZSBhY2NlcHRhbmNlIGJlZm9yZSB0aGlzIGNhbiBydW4gb24gdGhlIHRhZy4KUlVOTkVSPSR7R0xNNTJfUlVOTkVSX1BBVEg6LSRTUkMvYmVuY2htYXJrL3RwdS9nbG01Ml9lcGljL3RvcmNoXzhjaGlwX3J1bm5lci5zaH0KZXhlYyB0aW1lb3V0IC0tc2lnbmFsPVRFUk0gLS1raWxsLWFmdGVyPTVzIDcxOTVzIGJhc2ggIiRSVU5ORVIiCg==')\nassert hashlib.sha256(payload).hexdigest() == '5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3'\nPath('/tmp/tpu_logs/peer_bootstrap_8chip.sh').write_bytes(payload)\nBOOTSTRAP_PAYLOAD\nexec timeout --signal=TERM --kill-after=45s 9600s bash /tmp/tpu_logs/peer_bootstrap_8chip.sh\n"
+    }
+  }
+}

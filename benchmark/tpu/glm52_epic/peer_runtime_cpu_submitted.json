@@ -1,0 +1,51 @@
+{
+  "name": "glm52-peer-artifact-runtime-20261114",
+  "exp_type": "TRAINING",
+  "artifact_type": "GCS",
+  "cluster_name": "gke-tpu-train-us-central1-1-prod",
+  "role_to_task_spec": {
+    "worker": {
+      "replica": 1,
+      "device_type": "cpu",
+      "image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+      "resources": {
+        "cpu_request": "8",
+        "cpu_limit": "8",
+        "memory_request": "32Gi",
+        "memory_limit": "32Gi"
+      },
+      "envs": {
+        "SOURCE_REPO": "https://github.com/sgl-project/sglang-torchtpu.git",
+        "TORCH_TPU_WHEEL": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+        "TORCH_TPU_WHEEL_SHA256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82",
+        "SOURCE_SHA": "dd312270841887966b5480be2f451f6c19de1496",
+        "SGLANG_PLATFORM_MODE": "tpu"
+      },
+      "mounts": [
+        {
+          "name": "torch-tpu-wheel",
+          "type": "gcs",
+          "bucket": "tpu-for-training-falcon-logs",
+          "prefix": "experiments/exp-h8vu1379oa/artifacts/art-6jnw46ypty/wheels/cp312-linux-x86_64",
+          "mount_path": "/wheels/torch-tpu",
+          "read_only": true,
+          "mount_options": [
+            "implicit-dirs"
+          ]
+        },
+        {
+          "name": "prepared",
+          "type": "gcs",
+          "bucket": "tpu-for-training-falcon-logs",
+          "prefix": "experiments/exp-8tku39alke/artifacts/art-hakzf5m8u1/glm53-prepared",
+          "mount_path": "/prepared",
+          "read_only": true,
+          "mount_options": [
+            "implicit-dirs"
+          ]
+        }
+      ],
+      "command": "set -eu\nulimit -c 0\nmkdir -p /tmp/bootstrap\nprintf %s IyEvdXNyL2Jpbi9lbnYgYmFzaAojIFBvZC1zaWRlOiBmZXRjaCBTT1VSQ0VfU0hBIGZyb20gU09VUkNFX1JFUE8gYW5kIGluc3RhbGwgdGhlIFRQVSBzdGFjayBwaW5uZWQgYnkgcHl0aG9uL3B5cHJvamVjdF90cHUudG9tbAojIGludG8gYSBmcmVzaCB2ZW52LiBTb3VyY2VkIGJ5IHRoZSBlbnRyeSBzY3JpcHRzOyBleHBvcnRzIFNSQywgVkVOViwgQVJUIGFuZCB0aGUgaGVscGVycyBtYXJrL2RpZS4KIyBJbnB1dHMgKHdvcmtlciBlbnZzKTogU09VUkNFX1JFUE8sIFNPVVJDRV9TSEEsIFRPUkNIX1RQVV9XSEVFTCwgVE9SQ0hfVFBVX1dIRUVMX1NIQTI1Ni4KIyBzaGVsbGNoZWNrIHNoZWxsPWJhc2gKc2V0IC11byBwaXBlZmFpbAp1bGltaXQgLWMgMApleHBvcnQgVE1QRElSPS90bXAvdHB1X2xvZ3MvdG1wIFBJUF9DQUNIRV9ESVI9L3RtcC90cHVfbG9ncy9waXAtY2FjaGUgUFlUSE9OVU5CVUZGRVJFRD0xIFBZVEhPTk5PVVNFUlNJVEU9MQpleHBvcnQgWExBX1BZVEhPTl9DTElFTlRfUFJFQUxMT0NBVEU9ZmFsc2UKdW5zZXQgSkFYX1BMQVRGT1JNUyBUUFVfVklTSUJMRV9DSElQUwpBUlQ9JHtBUlRJRkFDVF9MT0NBTF9ESVI6LS90bXAvYXJ0aWZhY3R9OyBta2RpciAtcCAiJEFSVCIgIiRUTVBESVIiClJPT1Q9L3RtcC90cHVfbG9ncy9lMmU7IFNSQz0kUk9PVC9zcmM7IFZFTlY9JFJPT1QvdmVudjsgbWtkaXIgLXAgIiRST09UIgptYXJrKCkgeyBlY2hvICJFMkVfJCoiOyBlY2hvICIkKGRhdGUgLXUgKyVGVCVUWikgJCoiID4+ICIkQVJUL3N0YWdlcy50eHQiOyB9CmRpZSgpIHsgbWFyayAiRkFUQUwgJCoiOyBleGl0IDE7IH0KZXhlYyA+ID4odGVlIC1hICIkQVJUL2RyaXZlci5sb2ciKSAyPiYxCgo6ICIke1NPVVJDRV9TSEE6P1NPVVJDRV9TSEEgdW5zZXR9IiAiJHtTT1VSQ0VfUkVQTzo/fSIgIiR7VE9SQ0hfVFBVX1dIRUVMOj99IiAiJHtUT1JDSF9UUFVfV0hFRUxfU0hBMjU2Oj99IgoKbWFyayBTT1VSQ0UgIiRTT1VSQ0VfU0hBIgpnaXQgaW5pdCAtcSAiJFNSQyIgJiYgZ2l0IC1DICIkU1JDIiByZW1vdGUgYWRkIG9yaWdpbiAiJFNPVVJDRV9SRVBPIgpnaXQgLUMgIiRTUkMiIGZldGNoIC1xIC0tZGVwdGg9MSBvcmlnaW4gIiRTT1VSQ0VfU0hBIiAmJiBnaXQgLUMgIiRTUkMiIGNoZWNrb3V0IC1xIC0tZGV0YWNoIEZFVENIX0hFQUQgfHwgZGllIGZldGNoCnRlc3QgIiQoZ2l0IC1DICIkU1JDIiByZXYtcGFyc2UgSEVBRCkiID0gIiRTT1VSQ0VfU0hBIiB8fCBkaWUgIkhFQUQgbWlzbWF0Y2giCmdpdCAtQyAiJFNSQyIgbG9nIC0xIC0tZm9ybWF0PSclSCAlcycgPiAiJEFSVC9zb3VyY2UudHh0IgpjcCAiJFNSQy9weXRob24vcHlwcm9qZWN0X3RwdS50b21sIiAiJFNSQy9weXRob24vcHlwcm9qZWN0LnRvbWwiCgptYXJrIElOU1RBTEwKcHl0aG9uMyAtYyAnaW1wb3J0IHN5czsgYXNzZXJ0IHN5cy52ZXJzaW9uX2luZm9bOjJdID09ICgzLCAxMiksIHN5cy52ZXJzaW9uJyB8fCBkaWUgImltYWdlIHB5dGhvbiBpcyBub3QgMy4xMiAod2hlZWwgaXMgY3AzMTIpIgpweXRob24zIC1tIHZlbnYgIiRWRU5WIiAmJiBleHBvcnQgUEFUSD0iJFZFTlYvYmluOiRQQVRIIgpweXRob24gLW0gcGlwIGluc3RhbGwgLXEgLS11cGdyYWRlIHBpcCBzZXR1cHRvb2xzIHNldHVwdG9vbHMtc2NtIHdoZWVsID4gIiRBUlQvcGlwLWJhc2UubG9nIiAyPiYxIHx8IGRpZSBwaXAtYmFzZQojIHRvcmNoX3RwdTogdGhlIHBvZCBzZXJ2aWNlIGFjY291bnQgZ2V0cyA0MDMgZnJvbSB0aGUgcHJpdmF0ZSByZWdpc3RyeSwgc28gdGhlIHBpbm5lZCB3aGVlbCBpcyBtb3VudGVkIGZyb20KIyBhIHN0YWdlZCBGYWxjb24gYXJ0aWZhY3QuIFJlZnVzZSBhbnl0aGluZyBidXQgdGhlIGV4YWN0IHBpbi4KV0hFRUw9L3doZWVscy90b3JjaC10cHUvJFRPUkNIX1RQVV9XSEVFTAplY2hvICIkVE9SQ0hfVFBVX1dIRUVMX1NIQTI1NiAgJFdIRUVMIiB8IHNoYTI1NnN1bSAtYyAtID4gIiRBUlQvdG9yY2gtdHB1LXNoYS50eHQiIDI+JjEgfHwgZGllICJ0b3JjaF90cHUgd2hlZWwgc2hhIgpQSU49JChweXRob24gLSAiJFNSQy9weXRob24vcHlwcm9qZWN0LnRvbWwiIDw8J1BZJwppbXBvcnQgcmUsIHN5cywgdG9tbGxpYgpkZXBzID0gdG9tbGxpYi5sb2FkKG9wZW4oc3lzLmFyZ3ZbMV0sICJyYiIpKVsicHJvamVjdCJdWyJkZXBlbmRlbmNpZXMiXQpwcmludChuZXh0KGQgZm9yIGQgaW4gZGVwcyBpZiByZS5tYXRjaChyInRvcmNoW18tXXRwdVxiIiwgZCkpLnNwbGl0KCI9PSIpWzFdKQpQWQopCmNhc2UgIiRUT1JDSF9UUFVfV0hFRUwiIGluICoiLSRQSU4tIiopIDs7ICopIGRpZSAid2hlZWwgJFRPUkNIX1RQVV9XSEVFTCBkb2VzIG5vdCBtYXRjaCBweXByb2plY3QgcGluICRQSU4iOzsgZXNhYwpweXRob24gLSAiJFNSQy9weXRob24vcHlwcm9qZWN0LnRvbWwiICIkV0hFRUwiICIke0VYVFJBX1BJUDotfSIgPiAiJFJPT1QvcmVxLnR4dCIgPDwnUFknCmltcG9ydCByZSwgc3lzLCB0b21sbGliCnByb2ogPSB0b21sbGliLmxvYWQob3BlbihzeXMuYXJndlsxXSwgInJiIikpWyJwcm9qZWN0Il0KZm9yIGQgaW4gcHJvalsiZGVwZW5kZW5jaWVzIl06CiAgICBwcmludChzeXMuYXJndlsyXSBpZiByZS5tYXRjaChyInRvcmNoW18tXXRwdVxiIiwgZCkgZWxzZSBkKQojIFRlc3QgcnVubmVyIGRlcHMgb25seTsgdGhlIGZ1bGwgYHRlc3RgIGV4dHJhIChsbS1ldmFsLCBwZWZ0LCBzZW50ZW5jZV90cmFuc2Zvcm1lcnMpIGlzIG5vdCBuZWVkZWQgZm9yIGtlcm5lbCB0ZXN0cy4KZm9yIGQgaW4gWyJweXRlc3QiLCAiZXhwZWN0dGVzdCIsICJzeW1weSJdICsgc3lzLmFyZ3ZbM10uc3BsaXQoKToKICAgIHByaW50KGQpClBZCkZJTkQ9KCk7IFsgLWQgL3ByZXBhcmVkL3doZWVsaG91c2UgXSAmJiBGSU5EPSgtLWZpbmQtbGlua3M9L3ByZXBhcmVkL3doZWVsaG91c2UpCnB5dGhvbiAtbSBwaXAgaW5zdGFsbCAiJHtGSU5EW0BdfSIgLS1leHRyYS1pbmRleC11cmwgaHR0cHM6Ly9kb3dubG9hZC5weXRvcmNoLm9yZy93aGwvY3B1IFwKICAtciAiJFJPT1QvcmVxLnR4dCIgPiAiJEFSVC9waXAtcmVxLmxvZyIgMj4mMSB8fCB7IHRhaWwgLTUwICIkQVJUL3BpcC1yZXEubG9nIjsgZGllIHJlcXVpcmVtZW50czsgfQpweXRob24gLW0gcGlwIGluc3RhbGwgLS1uby1kZXBzIC0tbm8tYnVpbGQtaXNvbGF0aW9uIC1lICIkU1JDL3B5dGhvbiIgLWUgIiRTUkMiID4gIiRBUlQvcGlwLWVkaXRhYmxlLmxvZyIgMj4mMSB8fCBkaWUgZWRpdGFibGUKcHl0aG9uIC1tIHBpcCBmcmVlemUgPiAiJEFSVC9waXAtZnJlZXplLnR4dCIKIyB0cHUtc3luYydzIHJhdyB0cmFuc2ZlciBsaW5rcyBsaWJpYnZlcmJzOyB0aGUgamF4LWFpLWltYWdlIGJhc2UgbGFja3MgaXQuCmxkY29uZmlnIC1wIHwgZ3JlcCAtcSBsaWJpYnZlcmJzLnNvLjEgfHwgeyBhcHQtZ2V0IHVwZGF0ZSAtcXEgJiYgYXB0LWdldCBpbnN0YWxsIC15IC1xcSBsaWJpYnZlcmJzMSBsaWJyZG1hY20xOyB9ID4gIiRBUlQvYXB0LmxvZyIgMj4mMQpleHBvcnQgVFBVX0xJQlJBUllfUEFUSDsgVFBVX0xJQlJBUllfUEFUSD0kKHB5dGhvbiAtYyAnaW1wb3J0IGxpYnRwdTsgcHJpbnQobGlidHB1LmdldF9saWJyYXJ5X3BhdGgoKSknKQpweXRob24gLSAiJFNSQy9weXRob24vcHlwcm9qZWN0LnRvbWwiICIkQVJUL3J1bnRpbWUuanNvbiIgPDwnUFknIHx8IGRpZSAicnVudGltZSBwaW5zIgppbXBvcnQgaW1wb3J0bGliLm1ldGFkYXRhIGFzIG0sIGpzb24sIHJlLCBzeXMsIHRvbWxsaWIKZGVwcyA9IHRvbWxsaWIubG9hZChvcGVuKHN5cy5hcmd2WzFdLCAicmIiKSlbInByb2plY3QiXVsiZGVwZW5kZW5jaWVzIl0Kd2FudCA9IHt9CmZvciBkIGluIGRlcHM6CiAgICBuYW1lLCBfLCB2ZXIgPSBkLnBhcnRpdGlvbigiPT0iKQogICAgaWYgbmFtZSBpbiAoInRvcmNoX3RwdSIsICJ0b3JjaCIsICJ0b3JjaHZpc2lvbiIsICJqYXgiLCAiamF4bGliIiwgImxpYnRwdSIsICJ0cHUtc3luYy10b3JjaCIpOgogICAgICAgIHdhbnRbbmFtZV0gPSB2ZXIKZ290ID0ge246IG0udmVyc2lvbihuKSBmb3IgbiBpbiB3YW50fQpiYWQgPSB7bjogKGdvdFtuXSwgdikgZm9yIG4sIHYgaW4gd2FudC5pdGVtcygpIGlmIGdvdFtuXS5zcGxpdCgiKyIpWzBdICE9IHZ9Cmpzb24uZHVtcCh7IndhbnQiOiB3YW50LCAiZ290IjogZ290fSwgb3BlbihzeXMuYXJndlsyXSwgInciKSwgaW5kZW50PTIpCnByaW50KCJSVU5USU1FIiwganNvbi5kdW1wcyhnb3QpKQphc3NlcnQgbm90IGJhZCwgYmFkClBZCmV4cG9ydCBTR0xBTkdfUExBVEZPUk09JHtTR0xBTkdfUExBVEZPUk1fTU9ERTotdHB1X29vdH0KbWFyayBFTlZfUkVBRFkK | base64 -d > /tmp/bootstrap/setup.sh\nbash <<'BASH'\nset -e\nsource /tmp/bootstrap/setup.sh\ncd \"$SRC\"\nunset SGLANG_PLATFORM\nexport SGLANG_USE_CPU_ENGINE=1 PYTHONPATH=\"$SRC:$SRC/python\"\npython test/registered/unit/hardware_backend/tpu/test_glm52_channelwise_fp8.py\necho GLM52_PEER_RUNTIME_CPU_PASS\nBASH\n"
+    }
+  }
+}

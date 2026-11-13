@@ -1,0 +1,35 @@
+{
+  "cpu": {
+    "ok": true,
+    "workflow": "",
+    "command": "exp submit",
+    "ids": {
+      "artifact_id": "art-oxwfsxmg4o",
+      "exp_id": "exp-ldtcncqheb",
+      "job_id": "job-agr4bx4216",
+      "status": "PENDING"
+    },
+    "uris": {
+      "artifact_uri": "gs://tpu-for-training-falcon-logs/experiments/exp-ldtcncqheb/artifacts/art-oxwfsxmg4o/"
+    },
+    "warnings": [],
+    "error": null
+  },
+  "native8chip": {
+    "ok": true,
+    "workflow": "",
+    "command": "exp submit",
+    "ids": {
+      "artifact_id": "art-mbi5l0me0d",
+      "exp_id": "exp-h1cttjx0ai",
+      "job_id": "job-i2b3qy1k7k",
+      "status": "PENDING"
+    },
+    "uris": {
+      "artifact_uri": "gs://tpu-for-training-falcon-logs/experiments/exp-h1cttjx0ai/artifacts/art-mbi5l0me0d/"
+    },
+    "warnings": [],
+    "error": null
+  },
+  "scope": "actual submitted bootstrap+loader verification and two-host startup smoke; no performance result yet"
+}
