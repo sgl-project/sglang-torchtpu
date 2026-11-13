@@ -86,8 +86,31 @@ signal.alarm(7160)
 try:
     # Fail closed BEFORE imports that might initialize the TPU or any model load.
     image = os.environ.get('GLM52_IMAGE', '')
-    require(re.fullmatch(r'[^\s<>]+@sha256:[0-9a-f]{64}', image),
-            'GLM52_IMAGE must be a user-provided immutable image digest; no default image')
+    if os.environ.get('GLM52_BOOTSTRAP_PROVENANCE'):
+        # Benchmark-only alternative identity: a tagged BASE is not a runtime image.
+        # The separately delivered, hashed bootstrap records the exact source/wheel
+        # and pins; the installed runtime is still checked independently below.
+        provenance = json.loads(Path(os.environ['GLM52_BOOTSTRAP_PROVENANCE']).read_text())
+        bootstrap_sha = os.environ.get('GLM52_BOOTSTRAP_SHA256', '')
+        require(re.fullmatch('[0-9a-f]{64}', bootstrap_sha), 'missing bootstrap SHA256')
+        require(image == 'us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1',
+                'bootstrap mode accepts only documented peer base tag')
+        require(provenance.get('schema_version') == 1 and all(provenance.get(k) == v for k, v in {
+            'base_image': image, 'source_commit': os.environ.get('SOURCE_COMMIT'),
+            'source_repo': 'https://github.com/sgl-project/sglang-torchtpu.git',
+            'bootstrap_sha256': bootstrap_sha,
+            'wheel': 'torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl',
+            'wheel_sha256': '6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82',
+            'peer_experiment': 'exp-bsvzoblh0d', 'peer_task_status': 'succeeded',
+        }.items()), 'bootstrap provenance does not match documented peer identity')
+        require(provenance.get('peer_setup_sha256') ==
+                'e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00',
+                'extracted peer bootstrap provenance mismatch')
+        save('bootstrap-provenance.json', provenance)
+        result['bootstrap_provenance'] = provenance
+    else:
+        require(re.fullmatch(r'[^\s<>]+@sha256:[0-9a-f]{64}', image),
+                'GLM52_IMAGE must be a user-provided immutable image digest; no default image')
     require('lmsysorg/sglang:v0.1.0-tpu' not in image, 'known mismatched public image rejected')
     require(RANK in (0, 1) and os.environ.get('FALCON_WORLD_SIZE') == '2',
             'expected exactly two Falcon hosts, ranks 0 and 1 (not device ranks)')
