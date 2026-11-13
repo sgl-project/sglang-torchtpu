@@ -1,0 +1,26 @@
+name: glm52-night-20261113-runtime-wheel-probe
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: gke-tpu-train-us-central1-1-prod
+config: '{"purpose":"CPU-only current pinned TPU wheel availability, no accelerator allocation"}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    device_type: cpu
+    image: lmsysorg/sglang:v0.1.0-tpu
+    resources:
+      cpu_request: "2"
+      cpu_limit: "2"
+      memory_request: 4Gi
+      memory_limit: 4Gi
+    command: |
+      set -eu
+      ulimit -c 0
+      mkdir -p /tmp/tpu_logs/wheels /tmp/tpu_logs/tmp
+      export TMPDIR=/tmp/tpu_logs/tmp PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache
+      timeout 300 python3 -m pip download --no-deps --dest /tmp/tpu_logs/wheels --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ torch_tpu==0.2.1.dev20261028201649 tpu-sync-torch==0.0.1.dev20261031081414
+      python3 - <<'PY'
+      import hashlib,json,pathlib
+      x=[{'name':p.name,'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for p in pathlib.Path('/tmp/tpu_logs/wheels').glob('*.whl')]
+      print('PINNED_WHEEL_PROBE',json.dumps(x),flush=True)
+      PY
