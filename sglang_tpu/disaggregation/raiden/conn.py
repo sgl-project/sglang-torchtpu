@@ -87,7 +87,6 @@ from sglang_tpu.disaggregation.raiden.receiver import (
 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
     KVLayoutGeometry,
     ReshardGeometry,
-    swa_geometry_kv_heads,
 )
 from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender, RaidenSenderMixin
 from sglang_tpu.disaggregation.raiden.serde import (
@@ -417,10 +416,19 @@ class RaidenKVManager(
                 f"{dst_attn_tp} on decode. Run both at equal attention TP or "
                 "unset SGLANG_TPU_USE_BLOCK_MAJOR_KV on both."
             )
-        is_seq_along_lane = self._seq_along_lane or isinstance(
-            getattr(self._unified_swa_pool, "kv_pool", None), TpuSeqAlongLaneKVPool
+        # A regular SEQ_ALONG_LANE pool reshards at unequal TP: KVLayoutGeometry
+        # moves each head as one whole per-head run (byte replays over real pool
+        # pages in test_tpu_reshard_layout.py). A SEQ_ALONG_LANE pool inside
+        # TpuUnifiedSWAKVPool has no such replay, so it stays refused here,
+        # whether get_raiden_kv_caches flagged it or only its type shows it.
+        unified_seq_along_lane = self._unified_swa_pool is not None and (
+            self._seq_along_lane
+            or isinstance(
+                getattr(self._unified_swa_pool, "kv_pool", None),
+                TpuSeqAlongLaneKVPool,
+            )
         )
-        if (len(tensor.shape) != _FUSED_KV_RANK or is_seq_along_lane) and (
+        if (len(tensor.shape) != _FUSED_KV_RANK or unified_seq_along_lane) and (
             src_attn_tp != dst_attn_tp or len(tensor.shape) < _FUSED_KV_RANK
         ):
             raise ValueError(
@@ -449,22 +457,8 @@ class RaidenKVManager(
             seq_along_lane=self._seq_along_lane,
             page_size=int(self.kv_args.page_size) if self._seq_along_lane else None,
         )
-        if not self._seq_along_lane:
-            return ReshardGeometry.from_layout(
-                src_attn_tp, dst_attn_tp, layout, total_kv_heads
-            )
-        # TODO(#829-P1a-HND): SEQ_ALONG_LANE keeps the legacy unit, and at fp8
-        # the SWA count that unit needs.
-        if swa:
-            total_kv_heads = swa_geometry_kv_heads(
-                int(self.kv_args.total_kv_head_num),
-                total_kv_heads,
-                layout.kv_packing,
-                src_attn_tp,
-                dst_attn_tp,
-            )
-        return ReshardGeometry(
-            src_attn_tp, dst_attn_tp, layout.legacy_row_bytes, total_kv_heads
+        return ReshardGeometry.from_layout(
+            src_attn_tp, dst_attn_tp, layout, total_kv_heads
         )
 
     def _reshard_layers(self, swa: bool) -> List[Tuple[tuple, int, int]]:
