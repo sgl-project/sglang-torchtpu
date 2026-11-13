@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `lingbot_video_moe.sh` | `robbyant/lingbot-video-moe-30b-a3b` | 8 | Ulysses 8, serial CFG |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +39,7 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| LingBot-Video-MoE 30B-A3B | T2V 480x480, 81 frames, 40 steps, CFG 6 | 8 | 12.0 s | 0.268 s | 0.87 s | 61.0 GB |
 
 
 ## Example requests
@@ -61,6 +63,15 @@ LTX-2 (`ltx2.sh`):
 curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
   "prompt": "A fluffy golden dog sits centered in frame against a soft pastel background, looking into the camera",
   "size": "1280x720", "num_frames": 121, "num_inference_steps": 40, "guidance_scale": 4.0, "seed": 42
+}'
+```
+
+LingBot-Video-MoE (`lingbot_video_moe.sh`), prompt as the structured JSON caption of `docs/cookbook/diffusion/LingBot-Video`:
+
+```bash
+curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
+  "prompt": "{\"comprehensive_description\":{\"scene_content_description\":\"A small silver robot arm on a white table slowly reaches toward a red cube. The background is a softly lit laboratory wall.\",\"camera_movement_description\":\"The camera is static at eye level in a medium shot.\"},\"camera_info\":{\"color\":\"Neutral\",\"frame_size\":\"Medium\",\"shot_type_angle\":\"Eye level\",\"lens_size\":\"Medium\",\"composition\":\"Center\",\"lighting\":\"Soft light\",\"lighting_type\":\"Artificial light\"},\"world_knowledge\":[],\"prominent_elements\":[{\"name\":\"robot arm\",\"description\":\"A small silver robot arm with a two-finger gripper.\",\"actions\":[{\"timestamp\":\"[0.0s - 1.0s]\",\"action\":\"reaches toward the red cube\"}],\"location\":\"center of the frame\",\"relative_size\":\"dominant\",\"shape_and_color\":\"articulated silver metal arm\",\"texture\":\"brushed metal\",\"appearance_details\":\"two-finger gripper and visible joints\",\"relationship\":\"reaching toward the red cube on the table\",\"orientation\":\"upright, base on the table\",\"pose\":\"reaching\"}]}",
+  "size": "480x480", "num_frames": 81, "fps": 16, "num_inference_steps": 40, "guidance_scale": 6.0, "seed": 42
 }'
 ```
 

@@ -151,6 +151,12 @@ class TpuOOTPlatform(TpuPlatform):
                 "warmup cannot layerwise-offload the DiT); disabling it."
             )
         server_args.offload_during_compile = False
+        # This process sizes requests and the warmup, and runs no worker init.
+        # The registry detects LingBot-Video-MoE by this name in the path.
+        if "lingbot-video-moe" in (server_args.model_path or "").lower():
+            from sglang_tpu.multimodal_gen import lingbot_video_moe
+
+            lingbot_video_moe.install()
 
     def supports_teacache_with_torch_compile(self) -> bool:
         # Every TeaCache state update is a full XLA recompile under the
