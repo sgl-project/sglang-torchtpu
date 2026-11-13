@@ -462,21 +462,17 @@ def test_requested_probes_of_one_backend_do_not_pile_up():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("first", ["periodic", "requested"])
-def test_periodic_and_requested_probes_of_one_backend_do_not_overlap(first):
+def test_poller_does_not_overlap_a_requested_probe():
     async def test(backends, prefill_urls, decode_urls):
         hung = decode_urls[0]
         backends.hung.add(hung)
         load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=0.01)
-        if first == "requested":
-            load_balancer.request_health_probe(hung)
-            await backends.probe_started[hung].wait()
+
+        load_balancer.request_health_probe(hung)
+        await backends.probe_started[hung].wait()
         polling = load_balancer.start_health_polling()
         try:
-            await backends.probe_started[hung].wait()
-            if first == "periodic":
-                load_balancer.request_health_probe(hung)
-            # Several poll intervals pass while the first probe hangs.
+            # Several poll intervals pass while the requested probe hangs.
             await asyncio.sleep(0.1)
             assert backends.probes[hung] == 1
         finally:
@@ -484,6 +480,62 @@ def test_periodic_and_requested_probes_of_one_backend_do_not_overlap(first):
             await asyncio.gather(polling, return_exceptions=True)
             backends.release.set()
             await asyncio.gather(*list(mini_lb._background_tasks))
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_requested_probe_supersedes_a_periodic_probe_in_flight():
+    # The periodic probe may have been answered before the backend broke, so
+    # its verdict must not land; the requested probe's does.
+    async def test(backends, prefill_urls, decode_urls):
+        broken = decode_urls[0]
+        backends.hung.add(broken)
+        # The poller probes once at start, then not again during the test.
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=600)
+        polling = load_balancer.start_health_polling()
+        try:
+            await backends.probe_started[broken].wait()
+            backends.probe_started[broken].clear()
+            backends.hung.discard(broken)
+            backends.status[broken] = 503
+
+            load_balancer.request_health_probe(broken)
+            await _wait_for(lambda: broken in load_balancer._health.unhealthy)
+            # The periodic probe would now answer 200; it was cancelled, so
+            # that stale answer cannot flip the verdict back.
+            backends.status[broken] = 200
+            backends.release.set()
+            await asyncio.sleep(0.05)
+            assert broken in load_balancer._health.unhealthy
+            assert backends.probes[broken] == 2
+        finally:
+            polling.cancel()
+            await asyncio.gather(polling, return_exceptions=True)
+            await asyncio.gather(*list(mini_lb._background_tasks))
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_reregistered_backend_is_probed_while_its_old_probe_hangs():
+    async def test(backends, prefill_urls, decode_urls):
+        healthy, sick = decode_urls
+        backends.hung.add(sick)
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=0.01)
+        polling = load_balancer.start_health_polling()
+        try:
+            await backends.probe_started[sick].wait()
+            load_balancer.remove_worker(sick)
+            backends.hung.discard(sick)
+            backends.status[sick] = 503
+            load_balancer.add_worker(sick, "decode")
+
+            await _wait_for(lambda: sick in load_balancer._health.unhealthy)
+            assert _selected(load_balancer)[1] == {healthy}
+        finally:
+            polling.cancel()
+            await asyncio.gather(polling, return_exceptions=True)
 
     _run(test)
 

@@ -291,9 +291,10 @@ class MiniLoadBalancer:
                     }
                     for url in self._registered_urls():
                         if not self._probe_in_flight(url):
-                            probes[url] = self._health_probes()[url] = (
-                                asyncio.create_task(self._probe_health(session, url))
+                            probes[url] = asyncio.create_task(
+                                self._probe_health(session, url)
                             )
+                            self._health_probes()[url] = (probes[url], False)
                     await asyncio.sleep(self.health_poll_interval_secs)
             finally:
                 for probe in probes.values():
@@ -315,30 +316,38 @@ class MiniLoadBalancer:
     def request_health_probe(self, url: str) -> None:
         """Probe `url` now instead of at the next poll.
 
-        Called when a backend breaks in the middle of a request, so routing
-        stops sending it traffic within one probe rather than one poll
-        interval. The probe decides, not the break: a transient error on a
-        healthy backend leaves it routable. No-op when health checks are off
-        or a probe of `url` (requested or periodic) is still in flight.
+        Called when a request to a backend fails or breaks mid-stream, so
+        routing stops sending it traffic within one probe rather than one
+        poll interval. The probe decides, not the failure: a transient error
+        on a healthy backend leaves it routable. A periodic probe still in
+        flight is cancelled, since it may have been answered before the
+        failure; a requested one still in flight already covers it. No-op
+        when health checks are off.
         """
         if getattr(self, "health_poll_interval_secs", None) is None:
             return
-        if self._probe_in_flight(url):
-            return
-        self._health_probes()[url] = _spawn_background(self._probe_once(url))
+        probes = self._health_probes()
+        if url in probes:
+            probe, requested = probes[url]
+            if not probe.done():
+                if requested:
+                    return
+                probe.cancel()
+        probes[url] = (_spawn_background(self._probe_once(url)), True)
 
-    def _health_probes(self) -> Dict[str, asyncio.Task]:
-        """The latest probe task of each backend, periodic or requested.
+    def _health_probes(self) -> Dict[str, Tuple[asyncio.Task, bool]]:
+        """Each backend's latest probe task, and whether it was requested.
 
-        Shared by both so one backend never has two probes in flight, and a
-        slower, older verdict cannot overwrite a newer one.
+        Periodic and requested probes share it, so one backend has at most
+        one probe in flight and an older verdict cannot land after a newer
+        one.
         """
         # Kept in __dict__ so instances built without __init__ work too.
         return self.__dict__.setdefault("_health_probe_by_url", {})
 
     def _probe_in_flight(self, url: str) -> bool:
-        probe = self._health_probes().get(url)
-        return probe is not None and not probe.done()
+        entry = self._health_probes().get(url)
+        return entry is not None and not entry[0].done()
 
     async def _probe_once(self, url: str) -> None:
         timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT_SECS)
@@ -401,6 +410,11 @@ class MiniLoadBalancer:
     def _forget_health(self, worker_url) -> None:
         """Treat `worker_url` as not probed yet."""
         self._health.forget(worker_url)
+        # Its verdict would be dropped as stale anyway; cancelling it lets a
+        # re-registered backend be probed without waiting for the old probe.
+        entry = self._health_probes().pop(worker_url, None)
+        if entry is not None:
+            entry[0].cancel()
 
     async def _ensure_dp_sizes(self):
         if self.prefill_dp_size is not None:
