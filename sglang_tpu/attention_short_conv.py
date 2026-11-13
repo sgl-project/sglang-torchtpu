@@ -94,7 +94,7 @@ class TpuShortConvAttnBackend(MambaAttnBackendBase):
             query_start_loc = self._decode_query_start_loc.get(batch_size)
             if query_start_loc is None:
                 query_start_loc = torch.arange(
-                    batch_size + 1, dtype=torch.int64, device=device
+                    batch_size + 1, dtype=torch.int32, device=device
                 )
                 self._decode_query_start_loc[batch_size] = query_start_loc
             self._metadata = ShortConvTracedMetadata(slots, query_start_loc)
@@ -102,17 +102,20 @@ class TpuShortConvAttnBackend(MambaAttnBackendBase):
             # Padded extend_start_loc rows are zero, not cumulative. Build
             # monotonic boundaries from lengths so zero-length requests and
             # trailing token padding do not change real request boundaries.
+            # Build token offsets in the Pallas index dtype:
+            # int64 cumsum aborts in libtpu with the server's non-associative
+            # scan emitter, before the kernel bridge can cast its inputs.
             query_start_loc = torch.cat(
                 (
-                    torch.zeros(1, dtype=torch.int64, device=device),
-                    torch.cumsum(forward_batch.extend_seq_lens, 0, dtype=torch.int64),
+                    torch.zeros(1, dtype=torch.int32, device=device),
+                    torch.cumsum(forward_batch.extend_seq_lens, 0, dtype=torch.int32),
                 )
             )
             positions = torch.arange(
-                forward_batch.input_ids.shape[0], dtype=torch.int64, device=device
+                forward_batch.input_ids.shape[0], dtype=torch.int32, device=device
             )
             request_indices = torch.searchsorted(
-                query_start_loc[1:].contiguous(), positions, right=True
+                query_start_loc[1:].contiguous(), positions, right=True, out_int32=True
             )
             valid_tokens = positions < query_start_loc[-1]
             request_indices = torch.where(valid_tokens, request_indices, 0)

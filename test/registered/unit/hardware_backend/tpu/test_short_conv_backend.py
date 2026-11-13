@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ShortConv request-to-state mapping and graph metadata lifecycle on CPU."""
+"""ShortConv request-to-state mapping and graph metadata lifecycle."""
 
+import importlib.util
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 
@@ -11,7 +14,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     ShortConvHybridAttnBackend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_short_conv import TpuShortConvAttnBackend, short_conv
 from sglang_tpu.compilation.hybrid_linear_direct_compile import (
@@ -20,17 +23,25 @@ from sglang_tpu.compilation.hybrid_linear_direct_compile import (
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_tpu_ci(
+    est_time=30,
+    suite="stage-a-test-tpu-unit",
+    chips=1,
+    labels=["singlehost", "lfm2", "short-conv"],
+)
 
 
-def _backend():
+def _backend(device="cpu"):
     # Keep the actual backend methods; only the runner and pool allocation are
     # omitted. Request rows -> virtual slots -> physical state rows are distinct.
     backend = TpuShortConvAttnBackend.__new__(TpuShortConvAttnBackend)
-    request_to_virtual = torch.tensor([0, 2, 1, 3])
-    virtual_to_physical = torch.tensor([4, 3, 1, 2])
+    request_to_virtual = torch.tensor([0, 2, 1, 3], device=device)
+    virtual_to_physical = torch.tensor([4, 3, 1, 2], device=device)
     layers = [
-        SimpleNamespace(conv=[torch.arange(30).reshape(5, 2, 1, 3).float()]),
-        SimpleNamespace(conv=[torch.full((5, 2, 1, 3), 100.0)]),
+        SimpleNamespace(
+            conv=[torch.arange(30, device=device).reshape(5, 2, 1, 3).float()]
+        ),
+        SimpleNamespace(conv=[torch.full((5, 2, 1, 3), 100.0, device=device)]),
     ]
     backend.req_to_token_pool = SimpleNamespace(
         get_mamba_indices=lambda rows: request_to_virtual[rows],
@@ -153,6 +164,64 @@ class TestShortConvBackend(CustomTestCase):
                 self.assertRaisesRegex(NotImplementedError, "speculation"),
             ):
                 backend.init_forward_metadata(SimpleNamespace(forward_mode=mode))
+
+
+def _check_tpu_metadata():
+    backend = _backend("tpu")
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        req_pool_indices=torch.tensor([2, 3, 1, -1, 0], device="tpu"),
+        input_ids=torch.zeros(256, dtype=torch.int64, device="tpu"),
+        extend_seq_lens=torch.tensor([128, 0, 65, 3, 0], device="tpu"),
+        extend_prefix_lens=torch.tensor([0, 7, 9, 0, 0], device="tpu"),
+    )
+    backend.init_forward_metadata(batch)
+    metadata = backend.traced_metadata()
+    for actual, expected in (
+        (metadata.cache_indices, [3, 2, 1, 0, 0]),
+        (metadata.query_start_loc, [0, 128, 128, 193, 196, 196]),
+        (metadata.token_request_indices, [0] * 128 + [2] * 65 + [3] * 3 + [0] * 60),
+    ):
+        torch.testing.assert_close(
+            actual.cpu(), torch.tensor(expected), check_dtype=False
+        )
+    torch.testing.assert_close(
+        metadata.valid_tokens.cpu(), torch.tensor([True] * 196 + [False] * 60)
+    )
+    torch.testing.assert_close(
+        metadata.has_initial_state.cpu(),
+        torch.tensor([False, True, True, False, False]),
+    )
+    batch.forward_mode = ForwardMode.DECODE
+    batch.req_pool_indices = torch.tensor([1, 2, -1, 0], device="tpu")
+    backend.init_forward_metadata_out_graph(batch)
+    metadata = backend.traced_metadata()
+    torch.testing.assert_close(
+        metadata.cache_indices.cpu(), torch.tensor([1, 3, 0, 0]), check_dtype=False
+    )
+    torch.testing.assert_close(
+        metadata.query_start_loc.cpu(), torch.arange(5), check_dtype=False
+    )
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "requires torch_tpu")
+class TestShortConvBackendTPU(CustomTestCase):
+    def test_metadata_with_server_compiler_flags(self):
+        # libtpu reads its flags when torch_tpu loads. A fresh process applies
+        # the real server overrides first and contains the former SIGABRT.
+        code = (
+            "from sglang_tpu.env_override import apply_tpu_env_overrides; "
+            "apply_tpu_env_overrides(); "
+            "import runpy, sys; "
+            "runpy.run_path(sys.argv[1])['_check_tpu_metadata']()"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code, __file__],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
