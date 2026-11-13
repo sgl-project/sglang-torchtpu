@@ -83,3 +83,10 @@
 - JAX terminal log ended with `GLM52_FALCON_DELIVERY_OK`, kernel lookup audit zero misses, and graceful shutdown. Persistent-cache serialization warning for the 53.6GB compiler metadata was nonfatal; it did not invalidate this run.
 - Torch baseline remains unmeasured: public PyPI probe confirms exact nightly `torch_tpu==0.2.1.dev20261028201649` is not published; private package index returned401 earlier. The fail-closed startup runner and 9/9 CPU loader suite are evidence only, not TPU performance.
 - This ledger is updated with actual evidence as the work proceeds.
+
+## Peer-task runtime recovery (2026-11-14 Asia/Shanghai)
+
+- User directed using other Falcon sglang-torchtpu task configs. Successful exp-bsvzoblh0d uses exact pinned wheel from Falcon artifact with SHA256 verification plus preparedwheelhouse/publicsources. This supersedes private-index-only blocker; no credentials required.
+- CPU exact runtime/bootstrap+9test task exp-ldtcncqheb/art-oxwfsxmg4o submitted, current pending queueposition1. Eightphysicalchip/twohost startup+one-token task exp-h1cttjx0ai/art-mbi5l0me0d submitted at exact sourceb75d137fba; current QuotaPending. No duplicate TPU submits/noquota changes/nootherleases modified.
+- JAX sample-count prose corrected:8qualifiedintervals across2waves, not4total; rawJSON already correct.
+- Matched Torch full-DP cadence metadata is NOT available from existing10scalarDPgather. Benchmark-only perrank observer/client preparation proceeds independently; no cross-rank clock subtraction or guessed globalbid will be labeled JAX-equivalent.
