@@ -1,0 +1,10 @@
+{
+  "source_repo": "https://github.com/sgl-project/sglang-jax.git",
+  "source_sha": "3695225808f0293cae422ea7adf55eddacadd43d",
+  "source_path": "benchmark/glm52/datasets/longbench-v2/longbench-code-c64-p49152-e12288.npy",
+  "bytes": 15728768,
+  "sha256": "9a393227fb7104feef12440dba1d104dc1c2c6a5a54fc956d9225000b1e25c53",
+  "prepared_requests_sha256": "14c2e6a4cde81c5b805f6e2e464022cdd27ef6fbb46c1a60fcccc76078c81f79",
+  "request_count": 32,
+  "preparation": "actual torch_cache_hit_client.py prepare completed on frozen file; no HTTPrequests sent"
+}
