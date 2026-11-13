@@ -351,6 +351,10 @@ class TestGlm52Fp8Packing(CustomTestCase):
         scales = torch.tensor([0.25, 2.0, 0.5, 4.0, 1.0, 0.125])
         attention = torch.nn.Module()
         attention.kv_b_proj = projection
+        # The TPU reader also binds this projection into the MHA consumer before
+        # absorption. Keep the real binding path when torch_tpu is importable.
+        attention.attn_mha = torch.nn.Module()
+        attention.attn_mha.kv_b_proj = None
         attention.qk_nope_head_dim = 2
         attention.v_head_dim = 1
         attention.w_kc = None
