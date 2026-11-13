@@ -118,6 +118,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     accept_sampled_step,
     accept_target_only_step,
     accept_top_k_candidates_step,
+    apply_verify_penalties,
     build_verify_tokens,
     finalize_accept,
     live_result_rows,
@@ -193,9 +194,9 @@ class TpuSpecWorker(BaseSpecWorker):
 
     supports_logprobs = False
     supports_grammar = False
-    # Opt in only when verification applies the scheduler's additive snapshot
-    # at the padded batch size. Live penalizer state is still unsupported.
-    supports_additive_penalties = False
+    # verify() applies the scheduler's additive and scaling penalty snapshots to
+    # the verify rows. A subclass that replaces verify without them must opt out.
+    supports_penalties = True
 
     def __init__(
         self,
@@ -422,6 +423,8 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_pd_hidden()
         if not self._sampled_drafts and get_disagg().disaggregation_mode != "prefill":
             self._warmup_target_only_accept()
+        if self.supports_penalties and get_disagg().disaggregation_mode != "prefill":
+            self._warmup_verify_penalties()
         # A PD prefill server never verifies, so its mamba pool has no checkpoints.
         if (
             self._target_has_linear_attn
@@ -699,6 +702,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens=verify_tokens,
             rows=rows,
         )
+        penalties = self._verify_penalties(batch, draft_result.draft_tokens.shape[0])
         logits_output = self._forward_target_verify(
             batch=batch,
             bucket_state=bucket.state,
@@ -706,8 +710,14 @@ class TpuSpecWorker(BaseSpecWorker):
             rows=rows,
             verify_input=verify_input,
             spec_info=spec_info,
-            logits_output_mode=self._verify_logits_output_mode(bucket, draft_result),
+            logits_output_mode=self._verify_logits_output_mode(
+                bucket, draft_result, penalized=penalties is not None
+            ),
         )
+        if penalties is not None:
+            logits_output.next_token_logits = apply_verify_penalties(
+                logits_output.next_token_logits, *penalties, self.num_verify_rows
+            )
         accept = self._accept(bucket, draft_result, logits_output)
         self._check_rank_agreement(accept)
         return logits_output, accept
@@ -735,11 +745,29 @@ class TpuSpecWorker(BaseSpecWorker):
                 f"{[g.tolist() for g in gathered]}"
             )
 
+    def _verify_penalties(
+        self, batch: ScheduleBatch, padded_bs: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None] | None:
+        """The (additive, scaling) penalty snapshot at padded_bs, or None without penalties."""
+        sampling_info = batch.sampling_info
+        if sampling_info is None:
+            return None
+        orchestrator = sampling_info.penalizer_orchestrator
+        if orchestrator is not None and orchestrator.is_required:
+            # Without the overlap scheduler, the forward gets the live penalizer
+            # rather than the snapshot copy_for_forward takes.
+            sampling_info.update_penalties()
+        penalties = sampling_info.device_penalties(padded_bs)
+        return None if all(p is None for p in penalties) else penalties
+
     def _verify_logits_output_mode(
-        self, bucket: BucketState, draft_result: DraftResult
+        self, bucket: BucketState, draft_result: DraftResult, *, penalized: bool = False
     ) -> LogitsOutputMode:
         """DISTRIBUTED_TOP_K when the accept reads only the target's top-k (greedy or candidates)."""
         if self._verify_top_k_width is None:
+            return LogitsOutputMode.FULL_VOCAB
+        if penalized:
+            # Penalties can reorder the top-k, so they apply to every logit first.
             return LogitsOutputMode.FULL_VOCAB
         # A simulated accept reads no logits; keep serving's mode so the benchmark
         # pays the same logits traffic as production.
@@ -1221,6 +1249,37 @@ class TpuSpecWorker(BaseSpecWorker):
                     torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
                     self._rng_step,
                 )
+
+    def _warmup_verify_penalties(self) -> None:
+        """apply_verify_penalties per verify width and batch bucket.
+
+        Core snapshots an additive tensor beside the scaling one for any penalty;
+        the padded penalizer hook leaves only the scaling one.
+        """
+        vocab_size = self.target_worker.model_runner.model_config.vocab_size
+
+        def penalty(padded_bs: int, fill: float) -> torch.Tensor:
+            return torch.full(
+                (padded_bs, vocab_size), fill, dtype=torch.float32, device=self.device
+            )
+
+        with torch.no_grad():
+            for width, padded_bs in itertools.product(
+                self.verify_widths(), self._b_bucketer().buckets
+            ):
+                logits = torch.zeros(
+                    (padded_bs * width, vocab_size),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                for additive, scaling in ((True, True), (False, True), (True, False)):
+                    warmup_compiled_op(
+                        apply_verify_penalties,
+                        logits,
+                        penalty(padded_bs, 0.0) if additive else None,
+                        penalty(padded_bs, 1.0) if scaling else None,
+                        width,
+                    )
 
     def sync_target_tokens(self, next_token_ids: torch.Tensor) -> torch.Tensor:
         """extend()'s sync of the target's sampled tokens."""
@@ -1801,14 +1860,12 @@ class TpuSpecWorker(BaseSpecWorker):
         sampling_info = batch.sampling_info
         if sampling_info is None:
             return
-        # Their per-request device state is not bucket-padded, so filter/merge
+        # Its per-request device state is not bucket-padded, so filter/merge
         # would compile per batch-size pair.
-        if (
-            sampling_info.logit_bias is not None
-            or (
-                sampling_info.acc_additive_penalties is not None
-                and not self.supports_additive_penalties
-            )
+        if sampling_info.logit_bias is not None:
+            raise NotImplementedError("TpuSpecWorker does not support logit_bias.")
+        if not self.supports_penalties and (
+            sampling_info.acc_additive_penalties is not None
             or sampling_info.acc_scaling_penalties is not None
             or (
                 sampling_info.penalizer_orchestrator is not None
@@ -1816,7 +1873,7 @@ class TpuSpecWorker(BaseSpecWorker):
             )
         ):
             raise NotImplementedError(
-                "TpuSpecWorker does not support penalties or logit_bias."
+                f"{type(self).__name__} does not apply penalties in verify."
             )
         # The sort-based target filter keeps different boundary ties than the
         # verify filter, so filtered sampling needs the sort-free path on both.
