@@ -1,4 +1,4 @@
-"""Framing and validation shared by TPU disaggregation transports."""
+"""Framing and validation for the TPU disaggregation transport's control messages."""
 
 from __future__ import annotations
 

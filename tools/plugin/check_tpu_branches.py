@@ -41,7 +41,6 @@ SHIM_PATHS = (
     "python/sglang/srt/hardware_backend/tpu/",
     "python/sglang/srt/layers/attention/pallas/",
     "python/sglang/srt/layers/moe/pallas/",
-    "python/sglang/srt/disaggregation/tpu/",
     "python/sglang/srt/disaggregation/raiden/",
     "python/sglang/srt/model_executor/tpu_graph_runner.py",
 )

@@ -93,7 +93,7 @@
     "python/sglang/srt/compilation/compiled_op.py": 3,
     "python/sglang/srt/disaggregation/decode.py": 1,
     "python/sglang/srt/disaggregation/prefill.py": 2,
-    "python/sglang/srt/disaggregation/utils.py": 2,
+    "python/sglang/srt/disaggregation/utils.py": 1,
     "python/sglang/srt/entrypoints/engine.py": 2,
     "python/sglang/srt/layers/attention/attention_registry.py": 6,
     "python/sglang/srt/layers/attention/vision.py": 1,

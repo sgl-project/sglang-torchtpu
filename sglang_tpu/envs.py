@@ -382,14 +382,6 @@ class TpuEnvs:
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
 
-    # TPU PD KV transfer (disaggregation/tpu/conn.py)
-    # Transfers between logged latency summaries; 0 disables.
-    SGLANG_DEBUG_TPU_KV_STATS_EVERY = EnvInt(100)
-    # Issue the prefill D2H asynchronously; 0 keeps the synchronous batched D2H.
-    SGLANG_TPU_KV_ASYNC = EnvBool(True)
-    # Parallel PUSH streams per transfer on each TP rank; values below 1 mean 1.
-    SGLANG_TPU_KV_CHANNELS = EnvInt(2)
-
     # Multi-host node normalization (node_normalization.py)
     # Discovery store port; unset uses the --dist-init-addr port plus one.
     SGLANG_TPU_TOPOLOGY_BOOTSTRAP_PORT = EnvInt(None)
@@ -397,11 +389,6 @@ class TpuEnvs:
     # Pipeline-parallel prefill chunking
     SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
     SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
-
-    # PD disaggregation tracing
-    SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
-    )
 
     # Compilation, kernels, sampling and profiling
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)

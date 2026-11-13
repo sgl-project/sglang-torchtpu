@@ -8,11 +8,6 @@ sidecar, and what gets registered with the engine -- with the engine faked, so
 they need no TPU and no tpu_raiden. The on-device transfer itself is covered by
 ``test/manual/tpu/test_tpu_raiden_roundtrip_ondevice.py``.
 
-The companion file ``test_disagg_tpu_transfer.py`` covers the ZMQ (tpu)
-connector, which raiden is replacing. The two share very little: that one drives
-a push protocol whose frames carry the KV bytes, this one a pull handshake whose
-frames only carry block ids.
-
 Deliberately not duplicated here, because they already have dedicated tests:
 reshard geometry and placement (``test/manual/kv_transfer/test_reshard_schedule``),
 the byte-level wire helpers (``test_raiden_serde``), and host staging admission
