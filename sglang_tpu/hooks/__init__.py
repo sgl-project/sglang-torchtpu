@@ -109,6 +109,9 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_hybrid_swa_kv_pool",
         inkling2_swa_kv_pool,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.utils.common.set_gpu_proc_affinity",
         bind_rank_cpu_set,
         HookType.AROUND,
