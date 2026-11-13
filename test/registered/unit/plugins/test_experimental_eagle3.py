@@ -155,7 +155,7 @@ class TestExperimentalEagle3(CustomTestCase):
 
         expected = {((bs, 8), width) for bs in (1, 2) for width in (2, 4)}
         with (
-            patch.object(torch, "tpu", create=True) as tpu,
+            patch.object(torch.accelerator, "current_stream") as stream,
             patch.object(
                 base_spec_worker, "max_speculative_num_draft_tokens", return_value=4
             ),
@@ -178,8 +178,8 @@ class TestExperimentalEagle3(CustomTestCase):
             idle = TpuSpecVerifyInput.idle(
                 verify_window_rows=worker.verify_window_rows, padded_bs=2, device="cpu"
             )
-        tpu.current_stream.assert_called_once_with()
-        tpu.current_stream.return_value.synchronize.assert_called_once_with()
+        stream.assert_called_once_with()
+        stream.return_value.synchronize.assert_called_once_with()
         self.assertEqual(idle.verify_cache_candidates.shape, (2, 8))
         self.assertEqual(
             set(drafts), {(bs, width) for bs in (1, 2) for width in (2, 4)}
@@ -766,13 +766,13 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         buckets = SimpleNamespace(next_bucket=lambda bs: 1 << (bs - 1).bit_length())
         with (
-            patch.object(torch, "tpu", create=True) as tpu,
+            patch.object(torch.accelerator, "current_stream") as stream,
             patch.object(TpuChainSpecWorker, "_compile_policy", return_value=policy),
             patch.object(TpuChainSpecWorker, "_b_bucketer", return_value=buckets),
         ):
             worker._warmup_extend_sampling()
-        tpu.current_stream.assert_called_once_with()
-        tpu.current_stream.return_value.synchronize.assert_called_once_with()
+        stream.assert_called_once_with()
+        stream.return_value.synchronize.assert_called_once_with()
         self.assertEqual({shape for shape, _ in sampled}, {(1,), (2,), (4,)})
         self.assertEqual(
             broadcast,
