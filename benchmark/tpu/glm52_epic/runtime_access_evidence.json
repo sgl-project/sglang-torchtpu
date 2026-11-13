@@ -1,0 +1,18 @@
+{
+  "checked_release": "tpu-v0.1.0",
+  "release_source": "00ef120c1e30bf34ef0d48a99f00c5d9ea693f85",
+  "public_image": "lmsysorg/sglang:v0.1.0-tpu",
+  "release_digest": "sha256:290b7e1078e64bf5e8de9a83ba5cd02193258b9043fcefc2d6d4564b222805ae",
+  "observed_cpu_exp": "exp-nh7bghd5dt",
+  "observed_versions": {
+    "torch": "2.11.0+cpu",
+    "jax": "0.10.2",
+    "jaxlib": "0.10.2"
+  },
+  "required_jax_jaxlib": "0.11.2",
+  "private_image_probe": "exp-9dwxb55hll ImagePullBackOff",
+  "pinned_wheel_probe": "exp-lw6e0evey6 HTTP401 on private index; no credentials injected",
+  "release_ci_last_success": "39309797892 2026-10-19",
+  "recent_release_ci": "last three prod builds2026-11-04 failed; no newer successful published image confirmed",
+  "decision": "no incompatible public runtime silently substituted for current-stack TPU validation"
+}
