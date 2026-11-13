@@ -245,6 +245,26 @@ try:
                 'current native /generate must return one output token ID')
         result.update(health_status=200, generate_status=code, output_ids=ids, request_success_count=1)
         check_child()
+        # Opt-in only: prepared requests must reference frozen data + its manifest
+        # available locally (e.g. supplemental exact JAX source /workspace/sglang-jax).
+        # No observer is required/enabled here; no claim of matched JAX cadence.
+        diagnostic_requests = os.environ.get('GLM52_DIAGNOSTIC_REQUESTS', '')
+        if diagnostic_requests:
+            client_out = OUT / 'client'
+            client_out.mkdir(parents=True, exist_ok=True)
+            require(Path(diagnostic_requests).is_file(), 'diagnostic requests not mounted locally')
+            run([sys.executable, 'benchmark/tpu/glm52_epic/torch_cache_hit_client.py',
+                 'run', '--requests', diagnostic_requests,
+                 '--base-url', 'http://127.0.0.1:30000',
+                 '--allow-unmatched-admission', '--exclusive-server',
+                 '--timeout', str(remaining(3600)),
+                 '--output', str(client_out / 'result.json')], 'client/client.log', 7000)
+            diagnostic = json.loads((client_out / 'result.json').read_text())
+            require(diagnostic.get('status') == 'http_diagnostic_validated_UNMATCHED',
+                    'client did not validate HTTP diagnostic')
+            check_child()
+            result['http_diagnostic_status'] = diagnostic['status']
+            state['http_diagnostic_pass'] = True
         state['status'] = 'SUCCEEDED'
         while not state['peer_ack']:
             check_child()
@@ -260,11 +280,16 @@ try:
                     check_child()
                     request('http://'+hosts[0]+':31001/ack', {})
                     result['rank0_smoke_acknowledged'] = True
+                    if remote.get('http_diagnostic_pass'):
+                        state['http_diagnostic_pass'] = True
                     break
             except (OSError, urllib.error.URLError):
                 pass
             time.sleep(1)
-    result['status'] = 'SUCCEEDED'
+    result['status'] = ('SMOKE_AND_HTTP_DIAGNOSTIC_PASS' if state.get('http_diagnostic_pass')
+                        else 'SUCCEEDED')
+    if state.get('http_diagnostic_pass'):
+        result['scope'] = 'smoke and UNMATCHED HTTP diagnostic; NOT JAX cadence'
 except BaseException as error:
     state['status'] = 'FAILED'
     result['error'] = f'{type(error).__name__}: {error}'
@@ -321,5 +346,5 @@ finally:
                 sys.stdout.buffer.write(chunk)
         sys.stdout.buffer.flush()
         print(f'===== END WHOLE SERVER LOG rank={RANK} =====', flush=True)
-sys.exit(0 if result['status'] == 'SUCCEEDED' else 1)
+sys.exit(0 if result['status'] in ('SUCCEEDED', 'SMOKE_AND_HTTP_DIAGNOSTIC_PASS') else 1)
 PY
