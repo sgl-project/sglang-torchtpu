@@ -50,6 +50,7 @@ from sglang_tpu.hooks.k3_megakernel import (
     skip_k3_decoder_layers,
     skip_k31_indexer_load_check,
 )
+from sglang_tpu.hooks.k3_program import hook_specs as k3_program_hooks
 from sglang_tpu.hooks.kda_weights import (
     bind_glm5_next_kda_weights,
     rehome_kimi_k3_kda_weights,
@@ -358,6 +359,8 @@ HOOKS.extend(swa_miss_metrics_hooks())
 
 HOOKS.extend(hook_specs())
 
+HOOKS.extend(k3_program_hooks())
+
 HOOKS.extend(padded_logits_sampling_hooks())
 
 HOOKS.extend(logprob_grid_hooks())
@@ -391,6 +394,11 @@ def register() -> None:
     register_muse_spark_processor()
     register_tpu_dsv4_resolution_hooks()
     register_unified_hicache_strategy()
+
+    # Before server arguments name it: --speculative-algorithm K3_PROGRAM.
+    from sglang_tpu.k3_programs.sglang_worker import register as register_k3_program
+
+    register_k3_program()
 
     from sglang.srt.plugins.hook_registry import HookRegistry
 

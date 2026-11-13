@@ -236,6 +236,62 @@ class TpuEnvs:
     # Dev only: with the megakernel on, keep sglang's decoder layers (and its prefill path) for
     # A/B comparisons; the default lets the kernel own the decoder weights.
     SGLANG_TPU_K3_MEGAKERNEL_KEEP_SGLANG_WEIGHTS = EnvBool(False)
+    # Kimi-K3 programs (--speculative-algorithm K3_PROGRAM, sglang_tpu/k3_programs):
+    # the pre-sharded weights directory (python -m sglang_tpu.k3_programs.tools
+    # preshard k3 --output DIR), required.
+    SGLANG_TPU_K3_PROGRAM_PRESHARDED = EnvStr(None)
+    # Synthetic DSpark acceptance per draft width, "drafts:mean length,..." (bonus
+    # token included; InferenceX pins "7:3.78,3:2.87" for Kimi-K3). Empty
+    # verifies for real.
+    SGLANG_TPU_K3_PROGRAM_SIMULATE_ACC_LENGTHS = EnvStr("")
+    # Kernel config overrides for the programs, "FIELD=VALUE;..." (fields of
+    # sglang_tpu/k3_programs/kimi_k3/config.py KernelConfig, e.g.
+    # "moe_reduce_dtype=bfloat16;prefill_expert_parallel=32"). Empty: the defaults.
+    SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG = EnvStr("")
+    # Prefix tails on the K3_PROGRAM prefill (sglang_tpu/k3_programs/sglang_tails.py):
+    # prompt ends kept past their last full page, so a later prompt's radix match
+    # continues inside the page. Each holds a KV block and a KDA state slot.
+    SGLANG_TPU_K3_PROGRAM_PREFIX_TAILS = EnvInt(0)
+    # The decode program's DSpark schedule, "min:max:drafts,..." per batch size
+    # (drafts 7 or 3 through batch 8, 3 through 16). Empty: 7 through four
+    # requests, 3 through eight.
+    SGLANG_TPU_K3_PROGRAM_SPEC_SCHEDULE = EnvStr("")
+    # The DSpark draft checkpoint the programs use (the MLA draft,
+    # Inferact/Kimi-K3-DSpark; directory or Hugging Face id). Given here rather
+    # than as --speculative-draft-model-path, which sglang opens with
+    # transformers (model type k3_dspark is not one of its architectures).
+    SGLANG_TPU_K3_PROGRAM_DRAFT = EnvStr(None)
+    # Kill-switch for the deferred-write guard (k3_programs/sglang_deferred.py):
+    # torch_tpu writes the scheduler leaves between steps are otherwise compiled
+    # into the program's next op, one executable per mix.
+    SGLANG_TPU_K3_PROGRAM_DISABLE_DEFERRED_GUARD = EnvBool(False)
+    # Overlap scheduling on the K3_PROGRAM decode role: the program's next
+    # step launches while the scheduler processes the last one's tokens (as
+    # vLLM's async scheduling runs it).
+    SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP = EnvBool(False)
+    # Prefix cache on the K3_PROGRAM P/D decode (KV pages only,
+    # k3_programs/sglang_decode_cache.py): a session's next turn transfers only
+    # the pages past the decode's local prefix hit.
+    SGLANG_TPU_K3_PROGRAM_ENABLE_DECODE_PREFIX_CACHE = EnvBool(False)
+    # Colocated K3_PROGRAM engines: the share of the engine's time prefill
+    # batches may take while requests decode (each prefill batch defers the
+    # next by decode rounds sized from its tokens and the running batch,
+    # sglang_worker.prefill_deferral_rounds). 0: --prefill-decode-interval's
+    # fixed count.
+    SGLANG_TPU_K3_PROGRAM_PREFILL_SHARE = EnvFloat(0.0)
+    # Colocated K3_PROGRAM engines: while requests decode, a waiting prefill
+    # waits up to this many scheduler rounds in a row (each prefill batch
+    # stops every decoding request; rounds keep TP ranks in step). 0: off.
+    SGLANG_TPU_K3_PROGRAM_PREFILL_WAIT_ROUNDS = EnvInt(0)
+    # K3_PROGRAM decode program: attention data parallelism (1, or 2: two
+    # DCP16 groups, k3_programs/sglang_dp.py). A P/D server sets it on the
+    # decode only; a colocated server's decode program takes it.
+    SGLANG_TPU_K3_PROGRAM_ATTENTION_DP = EnvInt(1)
+    # Colocated attention DP2: B rows reserved per KV page (sglang_dp.ColoRows).
+    SGLANG_TPU_K3_PROGRAM_DP_ROW_SHARE = EnvFloat(0.5)
+    # K3_PROGRAM host tier (k3_programs/sglang_hicache.py): KDA checkpoints the
+    # host holds beside its KV pages (three host blocks each).
+    SGLANG_TPU_K3_PROGRAM_HICACHE_CHECKPOINTS = EnvInt(512)
 
     # Host padding is unconditional; this routes speculative batches to the
     # experimental spec worker, which keeps their metadata on the host as well.

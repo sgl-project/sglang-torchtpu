@@ -1336,7 +1336,10 @@ class RaidenKVManager(
                 raise RuntimeError(
                     f"Raiden GDN state transfer expects one mamba slot, got {slots}"
                 )
-            return [self._committed_state_row(slots[0])]
+            # A slot's state is state_max_blocks consecutive rows from its
+            # committed row (one for GDN, three for the Kimi-K3 programs).
+            first = self._committed_state_row(slots[0])
+            return list(range(first, first + self._state_engine_max_blocks))
         expected = self._state_engine_max_blocks
         if len(slots) != expected:
             raise RuntimeError(

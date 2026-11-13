@@ -49,8 +49,10 @@ _KV_PAGE_POOLS = frozenset(
 _STATE_SLOT_POOLS = frozenset((PoolName.MAMBA,))
 
 
-def _check_kv_page_pool(name: PoolName) -> None:
-    if name not in _KV_PAGE_POOLS | _STATE_SLOT_POOLS:
+def _check_kv_page_pool(
+    name: PoolName, pools: frozenset = _KV_PAGE_POOLS | _STATE_SLOT_POOLS
+) -> None:
+    if name not in pools:
         raise NotImplementedError(
             f"The TPU hybrid HiCache path does not offload the {name.value} pool."
         )
@@ -75,6 +77,9 @@ class TpuDMAHybridCacheController(HybridCacheController):
 
     # Set by the scheduler for the tree's controller; see fence_hicache_backups.
     kv_free_fence: Optional[KVFreeFence] = None
+    # The pools this controller offloads (a subclass whose host pools copy
+    # other state, e.g. the K3 programs' KDA checkpoints, widens it).
+    offloaded_pools: frozenset = _KV_PAGE_POOLS | _STATE_SLOT_POOLS
     # This engine's end of the prefill DRAM offload's extension to decode
     # DRAM, set once the P/D manager exists; None without it. See
     # disaggregation/decode_dram_offload/dram_offload_hooks.py.
@@ -83,7 +88,7 @@ class TpuDMAHybridCacheController(HybridCacheController):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         for entry in self.mem_pool_host.entries:
-            _check_kv_page_pool(entry.name)
+            _check_kv_page_pool(entry.name, self.offloaded_pools)
         # The engine gates the whole forward at once (no per-layer device streams).
         # Swap the per-layer LayerDoneCounter for a BatchDoneCounter and
         # re-register it on the device pool wrapper (SWAKVPool holds the
@@ -116,7 +121,7 @@ class TpuDMAHybridCacheController(HybridCacheController):
     # ----- sidecar registration ----------------------------------------------
 
     def register_host_pool_entry(self, entry) -> None:
-        _check_kv_page_pool(entry.name)
+        _check_kv_page_pool(entry.name, self.offloaded_pools)
         super().register_host_pool_entry(entry)
         # Draft sidecar KV is consumed by the draft model's forward, whose
         # CompiledForwardShim gates on the draft pool's own transfer counter.
