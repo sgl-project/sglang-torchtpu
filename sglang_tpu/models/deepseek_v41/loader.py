@@ -15,6 +15,7 @@ import torch
 from sglang_tpu.ep_weight_shard import EPLocalRunaiModelStreamerLoader
 from sglang_tpu.models.deepseek_v41.engram_row_reader import (
     is_engram_table,
+    is_gcs_uri,
     iter_row_tables,
 )
 
@@ -44,9 +45,12 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
         from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
         tables = frozenset(name for name in kept if is_engram_table(name))
-        if any(is_runai_obj_uri(shard_of[name]) for name in tables):
+        if any(
+            is_runai_obj_uri(shard_of[name]) and not is_gcs_uri(shard_of[name])
+            for name in tables
+        ):
             raise ValueError(
-                "V4.1 Engram row reads need a local or mounted checkpoint path"
+                "V4.1 Engram row reads need a local, mounted, or gs:// checkpoint path"
             )
         streamed = frozenset(
             name
