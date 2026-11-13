@@ -1,0 +1,38 @@
+{
+  "schema": "glm52-checkpoint-inspection-v1",
+  "checkpoint": "/models/GLM5.2-fp8-channel-wise",
+  "config_sha256": "0735624bbd5666283a1f135c59ff4c15e8b51c56fc50e022181525253f29463b",
+  "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+  "architectures": [
+    "GlmMoeDsaForCausalLM"
+  ],
+  "quantization_config": {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "weight_block_size": null
+  },
+  "model_dimensions": {
+    "hidden_size": 6144,
+    "num_hidden_layers": 78,
+    "n_routed_experts": 256,
+    "moe_intermediate_size": 2048,
+    "qk_rope_head_dim": 64,
+    "index_head_dim": 128,
+    "index_topk": 2048,
+    "index_kpool": null
+  },
+  "tensor_count": 118629,
+  "missing_index_tensors": [],
+  "wrong_index_shard": [],
+  "scale_summary": [
+    {
+      "suffix": ".weight_scale_inv",
+      "kind": "output_channel_2d_weight",
+      "count": 59044
+    }
+  ],
+  "loader_compatibility": "UNVERIFIED: compare recorded scale ABI against consumer allocation/loading",
+  "source_exp": "exp-2gq0zsmhs0",
+  "device_validation": "NOT_RUN"
+}
