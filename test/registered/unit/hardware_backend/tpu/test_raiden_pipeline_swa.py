@@ -1076,15 +1076,6 @@ def _initialize(groups, *, bounded_staging=True, real_budget=False):
         )
 
     native = {
-        "torch_tpu._internal.compile": SimpleNamespace(
-            tpu_torch_compile=SimpleNamespace(
-                get_device_layout_if_materialized=lambda t: (
-                    (3, 2, 1, 0),
-                    ((8, 128),),
-                    8,
-                )
-            )
-        ),
         "tpu_sync.api.torch.kv_cache_manager": SimpleNamespace(KVCacheManager=Engine),
         "tpu_sync.api.torch.reshard_client": SimpleNamespace(ReshardClient=client),
         "tpu_sync.api.torch.reshard_store": SimpleNamespace(
@@ -1099,7 +1090,14 @@ def _initialize(groups, *, bounded_staging=True, real_budget=False):
             )
         ),
     }
-    with patch.dict(sys.modules, native):
+    # CPU CI has no torch_tpu, so torch.tpu may not exist; create it.
+    fake_tpu = SimpleNamespace(
+        get_device_layout_if_materialized=lambda t: ((3, 2, 1, 0), ((8, 128),), 8)
+    )
+    with (
+        patch.dict(sys.modules, native),
+        patch.object(torch, "tpu", fake_tpu, create=True),
+    ):
         try:
             r.pipe = pl.PipelineTransfer(manager, groups)
         except Exception as error:

@@ -14,7 +14,6 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from torch_tpu._internal.compile import tpu_torch_compile as tc
 from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
 from torch_tpu._internal.distributed import tpu_distributed  # noqa: F401
 from torch_tpu._internal.utils import hardware
@@ -359,7 +358,7 @@ def _run_worker(mode: str) -> None:
         order = [0, 1] if mode == "layout" and rank == 1 else [1, 0]
         with LayoutContext(TpuLayout(minor_to_major=order)):
             value = torch.ones((128, 128)).to("tpu")
-        observed = tc.get_device_layout_if_materialized(value)
+        observed = torch.tpu.get_device_layout_if_materialized(value)
         assert observed is not None and observed[0] == order, observed
         constant = (
             rank // size + 1

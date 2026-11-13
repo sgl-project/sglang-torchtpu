@@ -10,6 +10,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -1115,11 +1117,6 @@ class TestPipelineInitialization(unittest.TestCase):
         )
         native = {
             "torch_tpu._internal.sync.sync": SimpleNamespace(synchronize=synchronize),
-            "torch_tpu._internal.compile": SimpleNamespace(
-                tpu_torch_compile=SimpleNamespace(
-                    get_device_layout_if_materialized=layout
-                )
-            ),
             "tpu_sync.api.torch.kv_cache_manager": SimpleNamespace(
                 KVCacheManager=engine
             ),
@@ -1144,7 +1141,12 @@ class TestPipelineInitialization(unittest.TestCase):
                 )
             ),
         }
-        with patch.dict(sys.modules, native):
+        # CPU CI has no torch_tpu, so torch.tpu may not exist; create it.
+        fake_tpu = SimpleNamespace(get_device_layout_if_materialized=layout)
+        with (
+            patch.dict(sys.modules, native),
+            patch.object(torch, "tpu", fake_tpu, create=True),
+        ):
             pipe = PipelineTransfer(manager, buffers)
         expected = ["engine", "pools", "layout", "work_unit"]
         if legacy:
