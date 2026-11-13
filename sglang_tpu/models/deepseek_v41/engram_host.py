@@ -79,9 +79,9 @@ def dequant_staged(
 ) -> torch.Tensor:
     """Rows ``local_ids`` of the staged bytes as bf16 [*local_ids.shape, dim].
 
-    The integer e8m0 dequant of tpu_dsv41_engram_owned_rows: the power of two
-    is (byte << 23) bitcast to fp32, exact for bytes 1..254 (byte 0 gives 0
-    instead of 2**-127; byte 255 never appears in a real table).
+    Integer e8m0 dequant: the power of two is (byte << 23) bitcast to fp32,
+    exact for bytes 1..254 (byte 0 gives 0 instead of 2**-127; byte 255 never
+    appears in a real table).
     """
     rows = raw[local_ids].view(torch.float8_e4m3fn).float()
     scales = scale[local_ids].to(torch.int32)

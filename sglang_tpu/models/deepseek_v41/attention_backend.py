@@ -402,10 +402,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
     def _register_ops():
         # Registration must precede torch.compile tracing.
         from sglang_tpu.dsv4.dsv4_attention_backend import _register_rope_op
-        from sglang_tpu.models.deepseek_v41.ops import csa2, engram, indexer
+        from sglang_tpu.models.deepseek_v41.ops import csa2, indexer
 
         _register_rope_op()  # apply_rope's Pallas RoPE op
-        engram.register_engram_ops()
         csa2.register_csa2_ops()
         indexer.register_indexer_ops()
         return csa2, indexer
@@ -416,11 +415,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
         model = self.model_runner.model
         if model is None:
             return
-        from sglang_tpu.models.deepseek_v41.ops.engram import prepare_hash_tables
-
         for module in model.modules():
-            if type(module).__name__ == "EngramHasher":
-                prepare_hash_tables(module)
             freqs = module._buffers.get("freqs_cis")
             if freqs is None:
                 continue

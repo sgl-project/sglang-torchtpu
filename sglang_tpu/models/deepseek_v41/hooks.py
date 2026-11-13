@@ -62,16 +62,6 @@ tpu_dsv41_engram_gate
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TorchTPU implements aten::copysign or engram_gate avoids it.
 
-tpu_dsv41_engram_hash_ids
-  Why: compute_engram_hash_ids multiplies by 63-bit multipliers in int64; TPU
-       lowering rejects 64-bit integer vectors ("Unsupported conversion from
-       vmreg/vreg to U64") when the decoder graph is compiled.
-  How: AROUND compute_engram_hash_ids keeps the original on CUDA; elsewhere
-       runs ops/engram.py, the uint32-pair hash adapted from the vllm-torchtpu
-       epic, on int32 tables staged at load (bit-exact, int32 row ids).
-  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
-  Remove when: TPU lowers 64-bit integer arithmetic.
-
 tpu_dsv41_int32_graph_inputs
   Why: the compiled V4.1 forward takes input_ids, positions and
        req_pool_indices as int64 graph inputs; the image-token torch.where,
@@ -82,8 +72,8 @@ tpu_dsv41_int32_graph_inputs
   How: AROUND CompiledForwardShim._forward casts them to int32 before the
        compiled call for V4.1 on non-CUDA devices and restores the batch
        fields afterwards; token ids, positions and pool rows fit in int32.
-       An extend without scheduler-supplied engram_history gets the rows the
-       hasher would gather, so the graph never guards on engram_history being None.
+       Engram rows are hashed and gathered here on the host (engram_host), so
+       the graph takes staged rows instead of hashing and looking up tables.
        With attention DP the token embedding is looked up eagerly here and
        passed in as input_embeds (input_ids still go in for Engram and MoE
        routing), as vllm-torchtpu #1848 does: inside the TP1/DP8 compiled
@@ -94,39 +84,21 @@ tpu_dsv41_int32_graph_inputs
   Remove when: the TPU batch builder produces int32 index tensors and the
        in-graph embedding gather is fixed in torch_tpu.
 
-tpu_dsv41_torch_hash_ids
-  Why: EngramHasher._torch_hash_ids (the non-CUDA hash path) widens ids,
-       history and positions to int64 before building the predecessor table,
-       so 64-bit compares and gathers reach TPU lowering.
-  How: AROUND _torch_hash_ids builds the same table in int32 on non-CUDA
-       devices and calls compute_engram_hash_ids (itself hooked to the 32-bit
-       op); token ids, positions and MM_PAD_SHIFT_VALUE fit in int32.
-  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
-  Remove when: TPU lowers 64-bit integer arithmetic.
-
-tpu_dsv41_engram_owned_rows
-  Why: EngramEmbedding._owned_rows dequantizes with scale.float() on the
-       float8_e8m0fnu scales; TPU lowering of that conversion fails in the
-       Engram lookup fusion ("Unsupported conversion from vmreg/vreg to U64").
-  How: AROUND _owned_rows for the device-table, non-CUDA path gathers the raw
-       bytes and builds the power of two as (byte << 23) bitcast to fp32, as
-       the vllm-torchtpu epic engram_hbm.dequant and #1743 do.
-  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
-  Remove when: TPU lowers float8_e8m0fnu to float32.
-
+tpu_dsv41_engram_embed_init, tpu_dsv41_engram_embed_forward,
 tpu_dsv41_hasher_forward
-  Why: the extend path of EngramHasher.forward builds per-token request rows
-       with repeat_interleave over int64 lengths, which lowers to a while loop
-       on 64-bit counters that TPU lowering rejects.
-  How: AROUND EngramHasher.forward on non-CUDA extend computes the rows in
-       int32 as a compare-sum against request ends and hashes every padded row
-       (no guard on the host lengths), then commits history for real rows only.
-       Extend and decode commit history as history.copy_(history.index_put(..)),
-       the functional-update-then-copy_ form vllm-torchtpu uses for its Engram
-       slot cache; the in-place index_put of the original is not written back
-       from the compiled TPU graph, so decode read all-zero predecessors.
+  Why: TPU serves Engram only from one host table per node shared by the DP
+       ranks (SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1, layout "shared"); the
+       in-graph lookup of HBM tables returned wrong outputs under attention DP
+       and its offloaded gather halted a SparseCore. _HostTable pins its
+       mapping with cudaHostRegister, and the core lookup reads it from a GPU.
+  How: AROUND EngramEmbedding.__init__ rejects any other placement on TPU and
+       builds the table with cudaHostRegister stubbed out. The shim hook
+       (tpu_dsv41_int32_graph_inputs) hashes on the host and stages raw rows;
+       inside the graph EngramHasher.forward returns the staged row ids and
+       EngramEmbedding.forward dequantizes the staged rows.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
-  Remove when: TPU lowers 64-bit integer arithmetic.
+  Remove when: the device can read host tables, or the in-graph HBM lookup
+       is correct under attention DP.
 
 trace_tpu_env_default
   Why: EnvField._resolve_default calls callable(self.default) for lazily
@@ -259,176 +231,11 @@ def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value)
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
 
 
-def tpu_dsv41_engram_hash_ids(
-    original, tokens, blocked, pad_id, token_map, multipliers, primes, offsets
-):
-    if tokens.is_cuda or tokens.device.type == "cpu":
-        return original(
-            tokens, blocked, pad_id, token_map, multipliers, primes, offsets
-        )
-    from sglang_tpu.models.deepseek_v41.ops.engram import engram_hash_ids
-
-    return engram_hash_ids(tokens, blocked, pad_id)
-
-
-def tpu_dsv41_torch_hash_ids(
-    original, hasher, input_ids, positions, kmode, history, num_real, block, row, starts
-):
-    """EngramHasher._torch_hash_ids with an int32 predecessor table on TPU.
-
-    The original widens ids, history and positions to int64 before hashing;
-    token ids, positions and the multimodal pad shift all fit in int32.
-    """
-    if input_ids.is_cuda or input_ids.device.type == "cpu":
-        return original(
-            hasher, input_ids, positions, kmode, history, num_real, block, row, starts
-        )
-    from sglang.kernels.ops.embeddings.engram_hash import MODE_DECODE, MODE_VERIFY
-    from sglang.srt.layers.engram import compute_engram_hash_ids
-    from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
-
-    i32 = torch.int32
-    n = hasher.max_ngram_size
-    num_tokens = input_ids.shape[0]
-    device = input_ids.device
-    input_ids = input_ids.to(i32)
-    shifts = torch.arange(n, device=device, dtype=i32)
-    if kmode == MODE_DECODE:
-        tokens = torch.cat([input_ids.unsqueeze(-1), history.to(i32).flip(-1)], dim=-1)
-    else:
-        t = torch.arange(num_real, device=device, dtype=i32)
-        if kmode == MODE_VERIFY:
-            row = t // block
-            offset = t - row * block
-        else:
-            row = row.to(i32)
-            offset = t - starts.to(i32)[row]
-        from_batch = shifts.unsqueeze(0) <= offset.unsqueeze(-1)
-        in_batch = input_ids[(t.unsqueeze(-1) - shifts).clamp_min(0)]
-        hist_col = (n - 2 - (shifts.unsqueeze(0) - offset.unsqueeze(-1) - 1)).clamp(
-            0, n - 2
-        )
-        from_hist = history.to(i32)[row].gather(1, hist_col.to(torch.int64))
-        tokens = torch.where(from_batch, in_batch, from_hist)
-    if num_real < num_tokens:
-        tokens = torch.cat([tokens, tokens.new_zeros(num_tokens - num_real, n)])
-    blocked = positions.to(i32).unsqueeze(-1) < shifts
-    if num_real < num_tokens:
-        blocked[num_real:] = True
-    if hasher.image_token_id is not None:
-        tokens = tokens.masked_fill(tokens >= MM_PAD_SHIFT_VALUE, hasher.image_token_id)
-        # Cumulative OR over the n columns, unrolled: cummax lowers to a loop
-        # with a 64-bit counter.
-        stop = blocked | (tokens == hasher.image_token_id)
-        cols = [stop[:, 0]]
-        for k in range(1, n):
-            cols.append(cols[-1] | stop[:, k])
-        blocked = torch.stack(cols, dim=-1)
-    hash_ids = compute_engram_hash_ids(
-        tokens,
-        blocked,
-        hasher.pad_id,
-        hasher.token_map,
-        hasher.multipliers,
-        hasher.primes,
-        hasher.offsets,
-    )
-    return hash_ids, tokens
-
-
 def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
-    """EngramHasher.forward for TPU extend with int32 request rows.
-
-    The original builds token rows with repeat_interleave over int64 lengths,
-    which lowers to a loop of 64-bit counters; rows here are a compare-sum
-    against each request's end (requests are contiguous in extend_start_loc).
-    """
+    """AROUND EngramHasher.forward: in the TPU graph, the host-staged row ids."""
     if forward_batch.tpu_engram_local_ids is not None:
-        # Hashed and looked up on the host (engram_host); the graph reads staged rows.
         return forward_batch.tpu_engram_local_ids
-    num_tokens = input_ids.shape[0]
-    mode = forward_batch.forward_mode
-    if input_ids.is_cuda or input_ids.device.type == "cpu" or num_tokens == 0:
-        return original(hasher, input_ids, forward_batch)
-    if mode.is_decode():
-        return _tpu_hasher_decode(hasher, input_ids, forward_batch)
-    if not mode.is_extend():
-        return original(hasher, input_ids, forward_batch)
-    from sglang.kernels.ops.embeddings.engram_hash import MODE_EXTEND
-
-    i32 = torch.int32
-    n = hasher.max_ngram_size
-    req_slots = forward_batch.req_pool_indices
-    bs = req_slots.shape[0]
-    lens = forward_batch.extend_seq_lens.to(i32)
-    starts = forward_batch.extend_start_loc.to(i32)
-    # Hash every padded row: rows are independent and only real rows commit,
-    # so the graph never specializes on the host lengths (extend_seq_lens_cpu).
-    num_real = num_tokens
-    ends = starts + lens
-    t = torch.arange(num_real, device=input_ids.device, dtype=i32)
-    # Bucket-padding requests have zero length (end 0) and must not count.
-    passed = (t.unsqueeze(-1) >= ends.unsqueeze(0)) & (lens > 0).unsqueeze(0)
-    row = passed.sum(-1).clamp(max=bs - 1).to(i32)
-    if forward_batch.engram_history is not None:
-        history = forward_batch.engram_history
-    else:
-        history = hasher.history[req_slots]
-    hash_ids, tokens = hasher._torch_hash_ids(
-        input_ids,
-        forward_batch.positions,
-        MODE_EXTEND,
-        history,
-        num_real,
-        1,
-        row,
-        starts,
-    )
-    commit_rows = torch.where(lens > 0, req_slots.to(i32), hasher.pad_row)
-    commit_last = (ends - 1).clamp(0, num_tokens - 1)
-    out_loc = forward_batch.out_cache_loc
-    if out_loc is not None:
-        commit_rows = torch.where(
-            out_loc[commit_last] == 0, hasher.pad_row, commit_rows
-        )
-    _commit_history(hasher, commit_rows, tokens[commit_last][:, : n - 1].flip(-1))
-    return hash_ids
-
-
-def _commit_history(hasher, rows, values):
-    """Write history rows the way vllm-torchtpu writes its Engram slot cache:
-    a functional update copied back into the resident tensor
-    (``cache.copy_(_write_op(cache, slots, values))``). An in-place index_put
-    on the plain attribute inside the compiled graph is not written back on
-    TPU, so decode read all-zero predecessors. Padding rows go to pad_row."""
-    history = hasher.history
-    rows = rows.to(torch.int64)
-    history.copy_(history.index_put((rows,), values.to(history.dtype)))
-
-
-def _tpu_hasher_decode(hasher, input_ids, forward_batch):
-    """EngramHasher.forward decode on TPU: same hash and commit as the
-    original torch path, with the history write from ``_commit_history``."""
-    from sglang.kernels.ops.embeddings.engram_hash import MODE_DECODE
-
-    n = hasher.max_ngram_size
-    req_slots = forward_batch.req_pool_indices
-    hash_ids, tokens = hasher._torch_hash_ids(
-        input_ids,
-        forward_batch.positions,
-        MODE_DECODE,
-        hasher.history[req_slots.to(torch.int64)],
-        input_ids.shape[0],
-        1,
-        None,
-        None,
-    )
-    rows = req_slots.to(torch.int32)
-    out_loc = forward_batch.out_cache_loc
-    if out_loc is not None:
-        rows = torch.where(out_loc == 0, hasher.pad_row, rows)
-    _commit_history(hasher, rows, tokens[:, : n - 1].flip(-1))
-    return hash_ids
+    return original(hasher, input_ids, forward_batch)
 
 
 _INT32_BATCH_FIELDS = ("input_ids", "positions", "req_pool_indices")
@@ -438,23 +245,6 @@ def _int32(t):
     if isinstance(t, torch.Tensor) and t.dtype == torch.int64 and not t.is_cuda:
         return t.to(torch.int32)
     return t
-
-
-def _padded_history(hasher, history, req_pool_indices):
-    """[bucket bs, n - 1] extend history, so the graph sees one shape and type.
-
-    The scheduler's rows cover the real requests only (or are absent, when the
-    hasher reads history[req_pool_indices]); bucket-padding requests extend
-    no tokens, so their rows are never committed and their hashes are dropped.
-    """
-    rows = req_pool_indices.shape[0]
-    if history is None:
-        return hasher.history[req_pool_indices.to(torch.int64)]
-    if history.shape[0] < rows:
-        history = torch.cat(
-            [history, history.new_zeros(rows - history.shape[0], history.shape[1])]
-        )
-    return history
 
 
 def tpu_dsv41_int32_graph_inputs(
@@ -474,14 +264,6 @@ def tpu_dsv41_int32_graph_inputs(
         host_tables = engram_host.shared_host_tables(model)
     if host_tables:
         names = (*names, "tpu_engram_local_ids", "tpu_engram_staged")
-    # Host tables hash on the host, so the graph never reads the history.
-    pin_history = (
-        hasher is not None
-        and not host_tables
-        and forward_batch.forward_mode.is_extend()
-    )
-    if pin_history:
-        names = (*names, "engram_history")
     from sglang.srt.runtime_context import get_parallel
 
     embed_outside = (
@@ -502,10 +284,6 @@ def tpu_dsv41_int32_graph_inputs(
             forward_batch.input_embeds = embed_tokens(input_ids)
     for name in _INT32_BATCH_FIELDS:
         setattr(forward_batch, name, _int32(saved[name]))
-    if pin_history:
-        forward_batch.engram_history = _padded_history(
-            hasher, forward_batch.engram_history, forward_batch.req_pool_indices
-        )
     try:
         return original(
             shim,
@@ -519,21 +297,6 @@ def tpu_dsv41_int32_graph_inputs(
     finally:
         for name, value in saved.items():
             setattr(forward_batch, name, value)
-
-
-def tpu_dsv41_engram_owned_rows(original, embedding, indices):
-    """_owned_rows with an integer e8m0 dequant; bytes 0 and 255 aside, exact."""
-    if indices.is_cuda or embedding.host_table is not None or embedding.rows == 0:
-        return original(embedding, indices)
-    local = indices - embedding.row_start
-    owned = (local >= 0) & (local < embedding.rows)
-    local = local.masked_fill(~owned, 0)
-    raw = embedding.weight.view(torch.uint8)[local].view(torch.float8_e4m3fn)
-    scale = embedding.scale.view(torch.uint8)[local].to(torch.int32)
-    power = (scale << 23).view(torch.float32)
-    rows = raw.float().unflatten(-1, (scale.shape[-1], -1))
-    values = (rows * power.unsqueeze(-1)).flatten(-2)
-    return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
 
 
 def _stage_host_engram(hasher, tables, input_ids, forward_batch) -> None:
@@ -557,6 +320,17 @@ def tpu_dsv41_engram_embed_init(original, embedding, *args, **kwargs):
     """AROUND EngramEmbedding.__init__: build host tables without the CUDA pin."""
     if torch.cuda.is_available():
         return original(embedding, *args, **kwargs)
+    from sglang.srt.environ import envs
+
+    if not (
+        envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
+        and envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get() == "shared"
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 Engram on TPU needs the shared host table: set "
+            "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 and "
+            "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=shared"
+        )
     from sglang_tpu.models.deepseek_v41.engram_host import without_cuda_host_register
 
     with without_cuda_host_register():
@@ -622,11 +396,6 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
-            "sglang.srt.layers.engram.compute_engram_hash_ids",
-            tpu_dsv41_engram_hash_ids,
-            HookType.AROUND,
-        ),
-        (
             "sglang.srt.layers.engram.engram_gate",
             tpu_dsv41_engram_gate,
             HookType.AROUND,
@@ -639,16 +408,6 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.EngramHasher.forward",
             tpu_dsv41_hasher_forward,
-            HookType.AROUND,
-        ),
-        (
-            "sglang.srt.layers.engram.EngramHasher._torch_hash_ids",
-            tpu_dsv41_torch_hash_ids,
-            HookType.AROUND,
-        ),
-        (
-            "sglang.srt.layers.engram.EngramEmbedding._owned_rows",
-            tpu_dsv41_engram_owned_rows,
             HookType.AROUND,
         ),
         (
