@@ -19,7 +19,8 @@ CONFIG = deepcopy(_BASE)
 CONFIG["server_args"].update(
     {
         "model_path": MODEL_PATH,
-        "served_model_name": "deepseek-v4.1-flash",
+        # The name requests carry and the dashboard keys on; model_path is a mount.
+        "served_model_name": "deepseek-ai/DeepSeek-V4.1-Flash",
         "trust_remote_code": True,
         # EP-local expert reads (sglang_tpu/models/deepseek_v41/loader.py).
         "load_format": "runai_streamer",
@@ -36,21 +37,23 @@ CONFIG["server_args"].update(
         # per DP worker; max_running_requests and chunked_prefill_size are
         # global and divided by attn_dp_size (8).
         "max_total_tokens": 262144,
-        # 128 running requests per worker.
-        "max_running_requests": 1024,
+        # 64 running requests per worker: the largest decode bucket, which is
+        # also the batch dimension every EXTEND graph is compiled at under DP.
+        "max_running_requests": 512,
         # 4096 prefill tokens per worker per step, the largest token bucket.
         "chunked_prefill_size": 32768,
         "max_prefill_tokens": 4096,
         "mem_fraction_static": 0.85,
         "enable_torch_compile": True,
+        # 512/1024 keep short prompts off the 2048 graph.
         # TODO(JamesBrianD): add 8192 once its EXTEND graph fits; at bs 128 it
         # needs 95.44 GB of HLO temporaries against 94.74 GB HBM at compile time.
-        "tpu_compile_tokens": [2048, 4096],
+        "tpu_compile_tokens": [512, 1024, 2048, 4096],
         # The smallest decode bucket stays above 1: the bs=1 decode graph
         # returns NaN logits after the first token (cause not located; the
         # CSA2 kernel alone matches the dense reference at batch 1).
-        "tpu_compile_bs": [32, 64, 128],
-        "torch_compile_max_bs": 128,
+        "tpu_compile_bs": [8, 16, 32, 64],
+        "torch_compile_max_bs": 64,
         "disable_radix_cache": True,
         "random_seed": 1234,
         "watchdog_timeout": 3600,
@@ -76,7 +79,10 @@ CONFIG["runtime_env"].update(
         "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "shared",
         # XLA's SparseCore gather offload halted a SparseCore in the 512-token
-        # extend graph (libtpu 0.0.50); drop once that is fixed.
-        "LIBTPU_INIT_ARGS": "--xla_tpu_offload_gather_to_sparsecore=false",
+        # extend graph (libtpu 0.0.50); drop once that is fixed. P-state 7 pins
+        # the clock, as the vllm-torchtpu DSV4.1 launchers do.
+        "LIBTPU_INIT_ARGS": (
+            "--xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_dvfs_p_state=7"
+        ),
     }
 )
