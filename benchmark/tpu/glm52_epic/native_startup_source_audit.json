@@ -1,0 +1,16 @@
+{
+  "source": "b75d137fba5d2b45719c15d5c99a3367378de1cf",
+  "experiment": "exp-h1cttjx0ai",
+  "type": "source audit, not hardware validation",
+  "findings": [],
+  "verified_nonissues": [
+    "native generate returns output_ids without OpenAI-specific return_output_ids flag",
+    "bootstrap restores original pyproject before tracked source clean check",
+    "peer address JSON assembled by Falcon rank and normalized native physical coordinates",
+    "nnodes2 NODE_RANK and DIST_INIT_ADDR consumed by native launch_server",
+    "leader forwarding preserves input rank0 HTTP after physical rank normalization",
+    "global chunk32768 divided attnDP16 to local2048 compile bucket",
+    "modeA SGLANG_PLATFORM=tpu required for DSA sparse pool"
+  ],
+  "pending": "actual TPU admission, lowering, capacity, load and generation"
+}

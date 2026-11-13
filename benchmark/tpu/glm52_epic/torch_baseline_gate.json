@@ -1,6 +1,6 @@
 {
-  "status": "PEER_ARTIFACT_BOOTSTRAP_SUBMITTED",
-  "reason": "Previous index-only blocker superseded: successful peer exp-bsvzoblh0d mounts exact hash-verified wheel from Falcon artifact; verification exp-ldtcncqheb submitted", 
+  "status": "EXACT_RUNTIME_VERIFIED_TPU_ADMISSION_PENDING",
+  "reason": "exp-ldtcncqheb SUCCEEDED with exact runtime and nine real loader tests; native eight-chip exp-h1cttjx0ai waits Kueue quota", 
   "required_runtime": "torch_tpu==0.2.1.dev20261028201649",
   "public_probe": {
     "exp_id": "exp-39bjc3ngd8",
@@ -9,7 +9,7 @@
   },
   "private_probe": "earlier Falcon experiment exp-lw6e0evey6 returned HTTP401 then pip EOF",
   "runner": "torch_8chip_runner.sh",
-  "runner_scope": "bounded native startup + one-token smoke only until pinned image/peer hostnames are supplied",
+  "runner_scope": "submitted bounded native startup and one-token smoke, artifact wheel bootstrap and ordered two-host rendezvous; optional later HTTP diagnostic is not JAX-equivalent",
   "performance_result": null,
-  "next_action": "collect exact runtime probe, then use peer artifact bootstrap and ordered two-host rendezvous; no private index credentials required"
+  "next_action": "follow original exp-h1cttjx0ai admission and startup; after smoke acceptance run prepared frozen-input diagnostic; no private credentials or duplicate accelerator submission"
 }
