@@ -11,6 +11,10 @@ import os
 MODEL = "moonshotai/Kimi-K3.1-Pro"
 DRAFT = "Inferact/Kimi-K3.1-Pro-DSpark-preview"
 ACC_LENGTHS = "7:3.69,3:2.88,1:1.82"
+# The decode indexer selects every key at or above the top-2048 threshold's
+# 20-bit bin (five 4-bit rounds over the DCP group): the top-2048 and the bin's
+# other keys, three exchange rounds fewer than the exact threshold.
+SELECT_ROUNDS = "dsa_select_rounds=5"
 
 
 def apply(config: dict) -> dict:
@@ -29,6 +33,11 @@ def apply(config: dict) -> dict:
     env["SGLANG_TPU_K3_PROGRAM_PRESHARDED"] = os.environ.get(
         "SGLANG_TPU_K3_PROGRAM_PRESHARDED", "/presharded-k31"
     )
+    kernel = env.get("SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG") or ""
+    if "dsa_select_rounds=" not in kernel:
+        env["SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG"] = ";".join(
+            filter(None, [kernel, SELECT_ROUNDS])
+        )
     if "prefill_sparse=1" in (env.get("SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG") or ""):
         sparse_prefill_memory(config)
     return config
