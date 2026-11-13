@@ -14,8 +14,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.envs import envs
-
 from .cache import PAGE_RECORDS, PAGE_ROWS, PackedFP8Layout
 from .common import (
     QueryTile,
@@ -27,6 +25,10 @@ from .common import (
     _weighted_selector,
 )
 from .tuned import PACKED_FP8_MQA_CONFIG, paged_mqa_key_tile, paged_mqa_query_tile
+
+# MXU fragments issued ahead of the one being reduced; measured on v7 (8 beats
+# the tuned table's 10), whose depth still keys the fragment schedule below.
+_ISSUE_DEPTH = 8
 
 
 def _encode_page_table(page_ids, layout, first_bank_rows):
@@ -465,12 +467,8 @@ def fp8_paged_mqa_logits(
         )
     tile, config = paged_mqa_query_tile(query_size, heads), PACKED_FP8_MQA_CONFIG
     key_tile = paged_mqa_key_tile(max_model_len, layout.page_size, config.key_tile)
-    depth = envs.SGLANG_TPU_DSV41_INDEXER_ISSUE_DEPTH.get()
     config = replace(
-        config,
-        query_tile=tile,
-        key_tile=key_tile,
-        issue_depth=depth or config.issue_depth,
+        config, query_tile=tile, key_tile=key_tile, issue_depth=_ISSUE_DEPTH
     )
     width = pl.cdiv(max_model_len, key_tile) * key_tile
     if tokens == 0 or width == 0:
