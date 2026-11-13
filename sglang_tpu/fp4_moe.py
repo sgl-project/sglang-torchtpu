@@ -74,6 +74,15 @@ def check_native_kperm_layout(layer: torch.nn.Module, *, use_fused_rs: bool) -> 
         )
 
 
+def mark_qblock_layout(layer: torch.nn.Module, block: int) -> None:
+    layer.__dict__["_tpu_nvfp4_qblock"] = block
+
+
+def qblock_layout(layer: torch.nn.Module) -> int:
+    """K rows per bf16 scale of experts requantized after load (0: as loaded)."""
+    return layer.__dict__.get("_tpu_nvfp4_qblock", 0)
+
+
 def _transpose_packed_fp4(matrix: torch.Tensor) -> torch.Tensor:
     """Transpose ``(E, M, K/2)`` packed FP4 into ``(E, K, M/2)`` bytes."""
     if matrix.dtype != torch.uint8 or matrix.ndim != 3:
@@ -418,6 +427,11 @@ def apply_tpu_nvfp4_moe(
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
 
     check_native_kperm_layout(layer, use_fused_rs=use_fused_rs)
+    qblock = qblock_layout(layer)
+    if qblock and not use_fused_rs:
+        raise RuntimeError(
+            f"NVFP4 experts requantized to block {qblock} run only on the fused-RS MoE"
+        )
 
     if use_fused_rs:
         from sglang_tpu.moe.pallas.fused_moe_rs_op import (
@@ -515,6 +529,7 @@ def apply_tpu_nvfp4_moe(
                 keep_token_shard=keep_output_shard,
                 expert_tp=expert_tp,
                 oneshot_rank=getattr(layer, "_tpu_oneshot_rank", None),
+                fp4_w4a16=bool(qblock),
                 w1_global_scale=layer._tpu_w13_global_scale,
                 w2_global_scale=layer._tpu_w2_global_scale,
             )

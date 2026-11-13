@@ -250,6 +250,7 @@ def moe_gmm_local_rs_nodedup(
     sp_enabled: bool = True,
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
+    fp4_w4a16: bool = False,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -449,6 +450,7 @@ def moe_gmm_local_rs_nodedup(
         top_k=kernel_topk,
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
+        fp4_w4a16=fp4_w4a16,
         local_rows=local_rows,
         tiled_output=tiled_output,
         row_loop_unroll=tpu_envs.SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL.get(),
@@ -575,6 +577,7 @@ def expert_parallel_gmm_rs(
     w2_global_scale: jax.Array | None = None,
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
+    fp4_w4a16: bool = False,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel.
 
@@ -641,6 +644,7 @@ def expert_parallel_gmm_rs(
             sp_enabled=sp_enabled,
             fp8_direct_write=fp8_direct_write,
             expert_tp=expert_tp,
+            fp4_w4a16=fp4_w4a16,
         ),
         mesh=mesh,
         in_specs=(
@@ -696,6 +700,7 @@ def expert_parallel_gmm_rs(
         "scoring_fn",
         "fp8_direct_write",
         "expert_tp",
+        "fp4_w4a16",
     ),
     compiler_options={
         # "xla_enable_transpose_trace": True,
@@ -721,6 +726,7 @@ def fused_moe_func_rs(
     group_offset_input: jax.Array | None = None,
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
+    fp4_w4a16: bool = False,
     w1_global_scale: jax.Array | None = None,
     w2_global_scale: jax.Array | None = None,
 ) -> jax.Array:
@@ -786,6 +792,7 @@ def fused_moe_func_rs(
         w2_global_scale=w2_global_scale,
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
+        fp4_w4a16=fp4_w4a16,
     )
 
     return result[:num_tokens, :hidden_size]

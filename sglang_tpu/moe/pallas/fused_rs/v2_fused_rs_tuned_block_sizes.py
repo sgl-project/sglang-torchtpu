@@ -548,6 +548,19 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
                 "k-4096_n-512_g-256_lhs_quant_rhs_bs-16"
                 "+k-256_n-4096_g-256_lhs_quant_rhs_bs-16"
             ): _local_rows_m(_H4096_I4096_EXPERT_TP16_LOCAL_ROWS),
+            # Block-256 requantized experts (SGLANG_TPU_MUSE_MK_QBLOCK=256) run the same
+            # expert-TP shapes W4A16; without these they fall back to tile_m 64.
+            (
+                "k-4096_n-1024_g-256_lhs_quant_rhs_bs-256"
+                "+k-512_n-4096_g-256_lhs_quant_rhs_bs-256"
+            ): {
+                **_all_m(_H4096_I4096_EXPERT_TP8),
+                **_local_rows_m(_H4096_I4096_EXPERT_TP8_LOCAL_ROWS),
+            },
+            (
+                "k-4096_n-512_g-256_lhs_quant_rhs_bs-256"
+                "+k-256_n-4096_g-256_lhs_quant_rhs_bs-256"
+            ): _local_rows_m(_H4096_I4096_EXPERT_TP16_LOCAL_ROWS),
             # H4096-I4096: H=4096, I=4096, E=256, EP=8 → g=32
             # Small M: full tiles (1,1). Large M (≥32768): smaller tiles
             # with W2 caching (2,2) for better pipelining.
