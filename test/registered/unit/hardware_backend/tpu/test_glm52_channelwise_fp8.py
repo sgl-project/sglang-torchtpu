@@ -1,0 +1,231 @@
+"""CPU checkpoint-ABI tests; no TPU device, kernel execution, or model download.
+
+Guard the explicit opt-in (ordinary/Flash FP8 must remain upstream), channel
+rather than reciprocal/block scale semantics, and checkpoint parameter names.
+The existing TPU MoE formatter is exercised on real CPU tensors as well.
+"""
+
+import copy
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.runtime_context import get_context
+from sglang_tpu.glm52_channelwise_fp8 import (
+    Glm52ChannelwiseFp8Config,
+    Glm52ChannelwiseFp8LinearMethod,
+    Glm52ChannelwiseFp8MoEMethod,
+    TpuFp8Config,
+)
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def _metadata(**overrides):
+    return {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "weight_block_size": None,
+        "tpu_checkpoint_layout": "glm52_channelwise_fp8",
+        "hf_config": SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"]),
+        **overrides,
+    }
+
+
+def _config():
+    # Allocation tests isolate checkpoint packing from the factory's runtime gate.
+    return Glm52ChannelwiseFp8Config.from_fp8_config(_metadata())
+
+
+def _dense():
+    layer = torch.nn.Module()
+    method = Glm52ChannelwiseFp8LinearMethod(_config())
+    method.create_weights(
+        layer,
+        input_size_per_partition=3,
+        output_partition_sizes=[2, 3],
+        input_size=3,
+        output_size=5,
+        params_dtype=torch.bfloat16,
+    )
+    return layer, method
+
+
+class TestGlm52Fp8OptIn(CustomTestCase):
+    def test_ordinary_scalar_and_block_fp8_do_not_consult_runtime(self):
+        # A broad "weight_block_size is None" predicate silently captures Flash.
+        # Fail at the runtime boundary even if another test published a context.
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_model",
+                side_effect=AssertionError("ordinary FP8 consulted model runtime"),
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_exec",
+                side_effect=AssertionError("ordinary FP8 consulted execution runtime"),
+            ),
+        ):
+            for block_size in (None, [128, 128]):
+                for layout in ({}, {"tpu_checkpoint_layout": None}):
+                    with self.subTest(block_size=block_size, layout=layout):
+                        metadata = {
+                            "quant_method": "fp8",
+                            "activation_scheme": "dynamic",
+                            "weight_block_size": block_size,
+                            "hf_config": SimpleNamespace(
+                                architectures=["Glm4MoeForCausalLM"]
+                            ),
+                            **layout,
+                        }
+                        config = TpuFp8Config.from_config(metadata)
+                        self.assertIs(type(config), Fp8Config)
+                        self.assertEqual(config.weight_block_size, block_size)
+                        self.assertTrue(config.is_checkpoint_fp8_serialized)
+
+    def test_explicit_layout_rejects_incompatible_checkpoint_metadata(self):
+        cases = (
+            ({"tpu_checkpoint_layout": "channelwise"}, "Unknown TPU FP8"),
+            ({"hf_config": None}, "requires GlmMoeDsaForCausalLM"),
+            (
+                {"hf_config": SimpleNamespace(architectures=["Glm4MoeForCausalLM"])},
+                "requires GlmMoeDsaForCausalLM",
+            ),
+            ({"quant_method": "mxfp8"}, "requires serialized fp8"),
+            ({"activation_scheme": "static"}, "requires serialized fp8"),
+            ({"fmt": "e5m2"}, "requires serialized fp8"),
+            ({"weight_block_size": [128, 128]}, "requires serialized fp8"),
+            ({"scale_fmt": "ue8m0"}, "requires serialized fp8"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    TpuFp8Config.from_config(_metadata(**overrides))
+
+    def test_opt_in_preserves_upstream_parsing_and_enforces_loader_contract(self):
+        metadata = _metadata(
+            ignored_layers=["model.layers.0.mlp"],
+            packed_modules_mapping={"gate_up_proj": ["gate_proj", "up_proj"]},
+        )
+        original = copy.deepcopy(metadata)
+        with get_context().override_server_args(load_format="safetensors"):
+            config = TpuFp8Config.from_config(metadata)
+        self.assertIs(type(config), Glm52ChannelwiseFp8Config)
+        self.assertTrue(config.is_checkpoint_fp8_serialized)
+        self.assertEqual(config.activation_scheme, "dynamic")
+        self.assertIsNone(config.weight_block_size)
+        self.assertEqual(config.ignored_layers, ["layers.0.mlp", "model.layers.0.mlp"])
+        self.assertEqual(config.packed_modules_mapping, metadata["packed_modules_mapping"])
+        self.assertEqual(metadata, original)
+        for runtime, message in (
+            ({"load_format": "dummy"}, "default checkpoint loader"),
+            ({"load_format": "auto", "cpu_offload_gb": 1}, "CPU offloading"),
+        ):
+            with self.subTest(runtime=runtime):
+                with get_context().override_server_args(**runtime):
+                    with self.assertRaisesRegex(ValueError, message):
+                        TpuFp8Config.from_config(metadata)
+
+
+class TestGlm52Fp8Packing(CustomTestCase):
+    def test_dense_channel_scales_have_one_checkpoint_name_and_reconstruct(self):
+        layer, method = _dense()
+        self.assertIsInstance(layer.weight, ModelWeightParameter)
+        self.assertIsInstance(layer.weight_scale_inv, ChannelQuantScaleParameter)
+        self.assertEqual((layer.weight.input_dim, layer.weight.output_dim), (1, 0))
+        self.assertEqual(layer.weight_scale_inv.output_dim, 0)
+        self.assertFalse(hasattr(layer.weight_scale_inv, "input_dim"))
+        self.assertIs(layer.weight_scale, layer.weight_scale_inv)
+        self.assertEqual(set(dict(layer.named_parameters())), {"weight", "weight_scale_inv"})
+        self.assertEqual(set(layer.state_dict()), {"weight", "weight_scale_inv"})
+        self.assertEqual(layer.logical_widths, [2, 3])
+
+        checkpoint = torch.arange(-7, 8, dtype=torch.float32).reshape(5, 3)
+        scales = torch.tensor([[0.5], [2.0], [4.0], [0.25], [8.0]])
+        layer.weight.data.copy_(checkpoint.to(torch.float8_e4m3fn))
+        # Row-parallel loading must replicate the entire channel scale vector.
+        layer.weight_scale_inv.load_row_parallel_weight(scales)
+        x = torch.tensor([[1.0, -2.0, 3.0], [-1.0, 0.5, 2.0]])
+        expected = torch.nn.functional.linear(x, checkpoint * scales)
+        method.process_weights_after_loading(layer)
+
+        self.assertEqual(layer.weight.shape, (3, 5))
+        self.assertEqual(layer.weight.dtype, torch.float8_e4m3fn)
+        self.assertTrue(layer.weight.is_contiguous())
+        self.assertFalse(layer.weight.requires_grad)
+        self.assertIs(layer.weight_scale, layer.weight_scale_inv)
+        self.assertEqual(set(layer.state_dict()), {"weight", "weight_scale_inv"})
+        torch.testing.assert_close(
+            x @ (layer.weight.float() * layer.weight_scale_inv.flatten()), expected
+        )
+
+    def test_dense_rejects_stale_alias_and_nonchannel_scale_before_transpose(self):
+        for stale_alias in (True, False):
+            with self.subTest(stale_alias=stale_alias):
+                layer, method = _dense()
+                if stale_alias:
+                    layer.weight_scale_inv = torch.nn.Parameter(
+                        layer.weight_scale_inv.detach().clone(), requires_grad=False
+                    )
+                    message = "early kv_b scale alias"
+                else:
+                    layer.weight_scale_inv.data = torch.ones(5)
+                    message = "dense scales must have shape"
+                with self.assertRaisesRegex(ValueError, message):
+                    method.process_weights_after_loading(layer)
+                self.assertEqual(layer.weight.shape, (5, 3))
+
+    def test_moe_channel_metadata_survives_real_runtime_formatting(self):
+        # Real upstream allocation plus real TPU formatter, all on CPU. No MoE
+        # runner/kernel is constructed; is_gated is the allocation input only.
+        with get_context().override_server_args(tp_size=1, pp_size=1):
+            method = Glm52ChannelwiseFp8MoEMethod(_config())
+            layer = torch.nn.Module()
+            layer.moe_runner_config = SimpleNamespace(is_gated=True)
+            loader = object()
+            method.create_weights(
+                layer, 2, 4, 3, torch.bfloat16, weight_loader=loader
+            )
+            expected = {}
+            for stem, shape in (("w13", (2, 6, 4)), ("w2", (2, 4, 3))):
+                weight = getattr(layer, f"{stem}_weight")
+                scale = getattr(layer, f"{stem}_weight_scale_inv")
+                self.assertEqual(weight.shape, shape)
+                self.assertEqual(weight.dtype, torch.float8_e4m3fn)
+                self.assertEqual(scale.shape, (*shape[:2], 1))
+                self.assertEqual(scale.quant_method, "channel")
+                self.assertIs(scale.weight_loader, loader)
+                self.assertFalse(hasattr(layer, f"{stem}_weight_scale"))
+                values = (torch.arange(weight.numel()).reshape(shape) % 13 - 6).float()
+                # Powers of two stay exact in both bf16/fp32 formatter policies.
+                scales = 2.0 ** torch.arange(shape[0] * shape[1]).reshape(*shape[:2], 1)
+                weight.data.copy_(values.to(weight.dtype))
+                scale.data.copy_(scales)
+                expected[stem] = (values * scales).transpose(1, 2).contiguous()
+
+            method.process_weights_after_loading(layer)
+
+        for stem, reference in expected.items():
+            weight = getattr(layer, f"{stem}_weight")
+            scale = getattr(layer, f"{stem}_weight_scale")
+            self.assertEqual(scale.shape, (2, 1, 1, reference.shape[-1]))
+            self.assertIs(scale.weight_loader, loader)
+            self.assertEqual(scale.quant_method, "channel")
+            self.assertTrue(weight.is_contiguous())
+            torch.testing.assert_close(
+                weight.float() * scale.float().reshape(2, 1, -1), reference
+            )
+        self.assertIsNone(layer.weight_block_size)
+
+
+if __name__ == "__main__":
+    unittest.main()
