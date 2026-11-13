@@ -46,6 +46,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | FLUX.2-klein-4B (diffusion) | bf16 | 1 chip, 1 host | Experimental |
 | Z-Image-Turbo (diffusion) | bf16 | 1 chip, 1 host | Experimental |
 | LTX-2 (diffusion) | bf16 | 1 host | Experimental |
+| Ideogram 4 (diffusion) | fp8 weights, bf16 compute | 1 host | Experimental |
 
 ### Features
 
@@ -70,7 +71,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | Runtime | torch.compile with the TPU backend, compile bundles, direct tracer, overlap scheduling | Supported |
 | Runtime | Out-of-tree plugin mode, zero-recompile serving check | Experimental |
 | Multimodal | Vision-language models (Qwen3-VL, Qwen3.5-VL, Kimi MoonViT, Gemma 4 vision) | Supported |
-| Generation | Diffusion (Wan2.2, FLUX.2-klein, Z-Image-Turbo, LTX-2) | Experimental |
+| Generation | Diffusion (Wan2.2, FLUX.2-klein, Z-Image-Turbo, LTX-2, Ideogram 4) | Experimental |
 | Serving | Prompt and input logprobs | Supported |
 | Serving | Structured output, function calling | Experimental |
 
@@ -109,6 +110,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | FLUX.2-klein-4B (diffusion) | bf16 | 1 chip; 1 host (Ulysses 4) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | Z-Image-Turbo (diffusion) | bf16 | 1 chip; 1 host (Ulysses 8, 30 heads padded to 32) | **Experimental** | Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | LTX-2 (diffusion) | bf16 | 1 host (CFG 2 x Ulysses 4) | **Experimental** | Video and audio. Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
+| Ideogram 4 (diffusion) | fp8 weights, bf16 compute | 1 host (Ulysses 8, 18 heads padded to 24) | **Experimental** | Text-to-image; packed rows in 512-row buckets, FP8 weights dequantized once. Pallas splash attention, torch.compile. Launch script in [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | Llama, Qwen3 dense (other sizes), Qwen3-MoE (other sizes), Kimi-Linear | — | — | **Experimental** | Generic TPU path with no model-specific test. |
 
 ## Features
@@ -187,7 +189,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Feature | Single-host | Multi-host | Tier | Notes |
 | --- | --- | --- | --- | --- |
 | Vision-language (Qwen3-VL, Qwen3.5-VL, Kimi MoonViT, Gemma 4 vision) | Nightly (Qwen3-VL, Qwen3.5) | Nightly (Qwen3-VL PD) | **Supported** | Compiled vision encoders with shape buckets; host-side embedding scatter by default. |
-| Diffusion (Wan2.2, FLUX.2-klein, Z-Image-Turbo, LTX-2) | Nightly (ext; Wan2.2-TI2V-5B on 1 core, SDPA) | Nightly (ext, collectives) | **Experimental** | Pallas splash attention (`--attention-backend tpu_splash_attn`; the default under `--ring-degree`, SDPA otherwise), torch.compile with the `tpu` backend, Ulysses and K/V all-gather ring sequence parallelism, spatial-parallel Wan VAE decode. Launch scripts and tpu7x numbers: [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
+| Diffusion (Wan2.2, FLUX.2-klein, Z-Image-Turbo, LTX-2, Ideogram 4) | Nightly (ext; Wan2.2-TI2V-5B on 1 core, SDPA) | Nightly (ext, collectives) | **Experimental** | Pallas splash attention (`--attention-backend tpu_splash_attn`; the default under `--ring-degree`, SDPA otherwise), torch.compile with the `tpu` backend, Ulysses and K/V all-gather ring sequence parallelism, spatial-parallel Wan VAE decode. Launch scripts and tpu7x numbers: [benchmark/tpu/diffusion](benchmark/tpu/diffusion/README.md). |
 | Prompt and input logprobs | CI (0.6B) | — | **Supported** | Env-gated. Not under DP attention or PP. |
 | Structured output / grammar | — | — | **Experimental** | Works through the eager sampler path; excluded from the spec-decode fast path. No TPU test yet. |
 | Function calling | — | — | **Experimental** | Same as structured output. |

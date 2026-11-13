@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `ideogram4.sh` | `ideogram-ai/ideogram-4-fp8` | 8 | Ulysses 8 (18 heads, padded to 24); conditional and unconditional DiTs in turn |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +39,9 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| Ideogram 4 (FP8) | T2I 1024x1024, 20 steps, guidance 7 | 8 | 1.9 s | 0.073 s | 0.09 s | 50.2 GB |
+| Ideogram 4 (FP8) | T2I 1536x1024, 20 steps, guidance 7 | 8 | 2.6 s | 0.103 s | 0.14 s | 56.7 GB |
+| Ideogram 4 (FP8) | T2I 2048x2048, 20 steps, guidance 7 | 8 | 6.2 s | 0.283 s | 0.36 s | 85.6 GB |
 
 
 ## Example requests
@@ -48,6 +52,15 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 curl -s -X POST http://localhost:30000/v1/images/generations -H "Content-Type: application/json" -d '{
   "prompt": "A cinematic portrait of a red panda astronaut floating in space, highly detailed",
   "size": "1024x1024", "num_inference_steps": 9, "guidance_scale": 0.0, "seed": 42, "response_format": "b64_json"
+}' | python3 -c 'import base64, json, sys; open("out.png", "wb").write(base64.b64decode(json.load(sys.stdin)["data"][0]["b64_json"]))'
+```
+
+Ideogram 4 (`ideogram4.sh`) takes its prompt as a structured JSON caption, the format of Ideogram's prompting guide:
+
+```bash
+curl -s -X POST http://localhost:30000/v1/images/generations -H "Content-Type: application/json" -d '{
+  "prompt": "{\"high_level_description\":\"A hand-painted wooden sign outside a small coffee shop that reads \\\"OPEN 7AM - 3PM, FRESH CROISSANTS\\\" in soft morning light.\",\"style_description\":{\"aesthetics\":\"warm, inviting, rustic\",\"lighting\":\"soft golden morning sunlight from the left\",\"photo\":\"eye-level, 50mm lens, shallow depth of field\",\"medium\":\"photograph\",\"color_palette\":[\"#8B5A2B\",\"#F5E6C8\",\"#B5523B\",\"#4F7942\",\"#2F2F2F\"]},\"compositional_deconstruction\":{\"background\":\"A red brick wall of a small cafe with a window, potted plants on the sidewalk.\",\"elements\":[{\"type\":\"obj\",\"bbox\":[150,200,850,800],\"desc\":\"A hand-painted wooden sign hanging from a black iron bracket.\"},{\"type\":\"text\",\"bbox\":[300,260,480,740],\"text\":\"OPEN 7AM - 3PM\",\"desc\":\"Cream hand-painted serif lettering on the sign.\"},{\"type\":\"text\",\"bbox\":[520,260,700,740],\"text\":\"FRESH CROISSANTS\",\"desc\":\"Smaller cream hand-painted lettering below.\"},{\"type\":\"obj\",\"bbox\":[700,50,1000,300],\"desc\":\"Terracotta pots with green plants on the pavement.\"}]}}",
+  "size": "1024x1024", "seed": 42, "response_format": "b64_json"
 }' | python3 -c 'import base64, json, sys; open("out.png", "wb").write(base64.b64decode(json.load(sys.stdin)["data"][0]["b64_json"]))'
 ```
 
