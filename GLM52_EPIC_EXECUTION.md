@@ -47,5 +47,8 @@
 
 - Epic worktree created from latest fetched main.
 - JAX reference submitted; terminal status and metrics pending.
-- Torch baseline runner still under audit; no kernel changes made.
+- Torch baseline runner audit completed; no kernel changes made. Latest main documents full GLM DSA experimental and sparse pool mode-A only. Eight-chip two-host support is not established by existing Flash tests.
+- Admission currently reports four more TPU chips needed and a CPU flavor topology warning; keep the submitted experiment, do not duplicate or modify others' resources.
+- Immediate next task: validate private checkpoint config/tensor scale shapes before Torch load. `--tpu-fp8-runtime channelwise` converts block checkpoint scales at runtime; it is NOT proof that the preconverted private channelwise checkpoint ABI is supported. Keep any loader compatibility fix separate from kernel changes.
+- Native Torch launcher supports two hosts with explicit nnodes/rank/dist address and TP16; attention DP uses `--attn-dp-size`. Build a GLM5.2-only recipe rather than reuse Flash flags.
 - This ledger is updated with actual evidence as the work proceeds.
