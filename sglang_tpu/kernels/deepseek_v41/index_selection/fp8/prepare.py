@@ -9,6 +9,10 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+# Decode token counts whose fused write was measured on TPU v7 to match the
+# native writer bitwise; other counts take the native path.
+_MEASURED_TOKENS = frozenset({128, 256, 288, 384, 512})
+
 
 def supports_sorted_fp8(
     banks: tuple[jax.Array, ...],
@@ -16,36 +20,23 @@ def supports_sorted_fp8(
     keys: jax.Array,
     page_size: int,
 ) -> bool:
-    from sglang_tpu.kernels.deepseek_v41.decode_preparation import (
-        INDEXER_TOKENS,
-        admit,
-        first_problem,
-    )
-
-    if keys.ndim != 2:
-        return admit("indexer_fp8", f"keys are {keys.ndim}-D")
-    problem = first_problem(
-        (
-            keys.shape[1] == 128 and keys.dtype == jnp.bfloat16,
-            f"keys {keys.dtype}{list(keys.shape)}, kernel bf16[T,128]",
-        ),
-        (
-            records.shape == (keys.shape[0],) and records.dtype == jnp.int32,
-            f"records {records.dtype}{list(records.shape)} for {keys.shape[0]} keys",
-        ),
+    return (
+        jax.default_backend() == "tpu"
+        and keys.ndim == 2
+        and keys.shape[0] in _MEASURED_TOKENS
+        and keys.shape[1] == 128
+        and keys.dtype == jnp.bfloat16
+        and records.shape == (keys.shape[0],)
+        and records.dtype == jnp.int32
         # 128-record pages (block-outer layouts at --block-size 256) make each
         # page one owner row wide; the write is bitwise the native writer's.
-        (page_size in (128, 256), f"index page size {page_size}, kernel 128/256"),
-        (
-            len(banks) == 2
-            and all(
-                bank.ndim == 2 and bank.shape[1] == 128 and bank.dtype == jnp.int32
-                for bank in banks
-            ),
-            "index cache is not two int32[*,128] banks",
-        ),
+        and page_size in (128, 256)
+        and len(banks) == 2
+        and all(
+            bank.ndim == 2 and bank.shape[1] == 128 and bank.dtype == jnp.int32
+            for bank in banks
+        )
     )
-    return admit("indexer_fp8", problem, tokens=keys.shape[0], buckets=INDEXER_TOKENS)
 
 
 def prepare_sorted_fp8(
