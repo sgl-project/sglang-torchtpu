@@ -157,8 +157,11 @@ try:
             require(os.environ[key] == value, f'{key} conflicts with two-host Falcon mapping')
     for key in ('TPU_VISIBLE_CHIPS', 'FORCE_SINGLE_HOST', 'SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE'):
         require(not os.environ.get(key), f'{key} is incompatible with full native slice')
-    devices = sorted(glob.glob('/dev/accel[0-9]*'))
-    require(len(devices) == 4, f'expected four physical TPU chip nodes on each host, got {devices}')
+    # TPU runtimes may expose VFIO rather than legacy /dev/accelN nodes.
+    # Device-file counts are not a physical topology API; native coordinate
+    # discovery below must succeed before the server can initialize its mesh.
+    devices = sorted(glob.glob('/dev/accel[0-9]*') + glob.glob('/dev/accel/accel[0-9]*')
+                     + glob.glob('/dev/vfio/[0-9]*'))
     os.environ.update(NODE_RANK=str(RANK), RANK0_HOST=hosts[0], DIST_INIT_ADDR=hosts[0]+':10011',
         TPU_WORKER_ID=str(RANK), TORCH_TPU_TOPOLOGY='2,2,2,2', TORCH_TPU_DEVICES_PER_HOST='8',
         TORCH_TPU_BASE_PORT='8070', SGLANG_PLATFORM='tpu', SGLANG_USE_RAY='0',
