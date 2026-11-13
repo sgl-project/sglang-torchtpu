@@ -518,7 +518,8 @@ class RaidenReceiverMixin:
         between polls would otherwise leave every later announcement queued
         until it outwaits the transfer deadline.
         """
-        if not self.chunked_transfer or self._pipeline is not None:
+        # Pipeline transfer leaves chunked_transfer False.
+        if not self.chunked_transfer:
             return
         if not self._try_drain_engine():
             return

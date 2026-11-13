@@ -405,6 +405,62 @@ class TestListenerSweep(unittest.TestCase):
         self.assertEqual(_started(mgr._engine), [f"{ROOM}#0"])
         mgr._engine.poll_stats_with_details.assert_not_called()
 
+    def test_sweep_stands_down_while_the_scheduler_drains(self):
+        """A scheduler that keeps draining never meets the sweep on the drain
+        lock; the sweep resumes once the scheduler stops."""
+        mgr = _decode_manager(hybrid=False, chunked=True, listener=True)
+        mgr._message_handlers = {}
+        mgr.server_socket = _FakeServerSocket()
+        pollers = []
+        mgr._engine.poll_stats_with_details.side_effect = lambda: (
+            pollers.append(threading.current_thread()) or _polled()
+        )
+
+        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.05, create=True):
+            listener = self._start_listener(mgr)
+            # Scheduler polls every 10 ms for ten sweep intervals.
+            stop_draining = time.monotonic() + 0.5
+            while time.monotonic() < stop_draining:
+                mgr._drain_engine()
+                time.sleep(0.01)
+            self.assertNotIn(listener, pollers)
+            deadline = time.monotonic() + 1.0
+            while listener not in pollers and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertIn(listener, pollers)
+
+    def test_scheduler_drain_waits_out_one_listener_drain(self):
+        """A scheduler that polls while the sweep drains waits for that one
+        drain, then sees the read it settled."""
+        mgr = _decode_manager(hybrid=False, chunked=True, listener=True)
+        mgr._message_handlers = {}
+        mgr.server_socket = _FakeServerSocket()
+        recv = _receiver(mgr)
+        in_poll, resume = threading.Event(), threading.Event()
+
+        def listener_poll():
+            in_poll.set()
+            resume.wait(5)
+            return _polled(received=[str(ROOM)])
+
+        mgr._engine.poll_stats_with_details.side_effect = listener_poll
+        mgr._on_blocks(_blocks(hybrid=False))
+        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True):
+            self._start_listener(mgr)
+            self.assertTrue(in_poll.wait(5))
+            mgr._engine.poll_stats_with_details.side_effect = None
+            results = []
+            scheduler = threading.Thread(target=lambda: results.append(recv.poll()))
+            scheduler.start()
+            scheduler.join(0.1)
+            self.assertTrue(scheduler.is_alive(), "scheduler skipped the lock")
+            resume.set()
+            scheduler.join(1.0)
+
+        self.assertFalse(scheduler.is_alive(), "scheduler stalled past one drain")
+        self.assertEqual(results, [KVPoll.Success])
+
     def test_raising_sweep_keeps_listener_dispatching(self):
         mgr = _decode_manager(hybrid=False, chunked=True, listener=True)
         mgr._message_handlers = {Chunk.TAG: mgr._on_chunk}
@@ -462,9 +518,10 @@ class TestListenerSweep(unittest.TestCase):
     def test_prefill_pipeline_and_non_chunked_managers_do_not_sweep_reads(self):
         for kind in ("prefill", "non_chunked", "pipeline"):
             with self.subTest(kind=kind):
+                # set_kv_caches leaves chunked_transfer False under pipeline.
                 mgr = _decode_manager(
                     hybrid=False,
-                    chunked=(kind != "non_chunked"),
+                    chunked=(kind == "prefill"),
                     listener=True,
                 )
                 if kind == "prefill":

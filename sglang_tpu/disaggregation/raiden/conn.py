@@ -188,6 +188,9 @@ class RaidenKVManager(
     _bounded_staging = False
     _listener_start_read = False
     _stop_listener: Optional[threading.Event] = None
+    # time.monotonic() of the scheduler's latest drain; the listener sweep
+    # stands down while the scheduler drains on its own.
+    _last_scheduler_drain = float("-inf")
     # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
     kv_layout: str = PER_LAYER_KV_LAYOUT
     # Shared-buffer Full+SWA pool when --enable-unified-memory is active.
@@ -885,6 +888,7 @@ class RaidenKVManager(
         """
         if self.dram_offload_channel is not None:
             self.dram_offload_channel.drain_host_reads()
+        self._last_scheduler_drain = time.monotonic()
         with self._drain_lock:
             self._drain_engine_serialized()
 
@@ -1272,7 +1276,14 @@ class RaidenKVManager(
                 except Exception as e:
                     logger.error("RaidenKVManager message handling error: %s", e)
             if sweeps and time.monotonic() >= next_sweep:
-                next_sweep = time.monotonic() + _LISTENER_SWEEP_INTERVAL_S
+                now = time.monotonic()
+                next_sweep = now + _LISTENER_SWEEP_INTERVAL_S
+                # A scheduler that drained within the interval polls every
+                # room itself; only a stalled one needs the sweep. So only a
+                # scheduler idle for a whole interval can find the sweep
+                # holding the drain lock, and it then waits out one drain.
+                if now - self._last_scheduler_drain < _LISTENER_SWEEP_INTERVAL_S:
+                    continue
                 try:
                     self._sweep_pulls()
                 except Exception as e:
