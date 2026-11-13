@@ -124,7 +124,9 @@ class TestGlm52Fp8OptIn(CustomTestCase):
         self.assertEqual(config.activation_scheme, "dynamic")
         self.assertIsNone(config.weight_block_size)
         self.assertEqual(config.ignored_layers, ["layers.0.mlp", "model.layers.0.mlp"])
-        self.assertEqual(config.packed_modules_mapping, metadata["packed_modules_mapping"])
+        self.assertEqual(
+            config.packed_modules_mapping, metadata["packed_modules_mapping"]
+        )
         self.assertEqual(metadata, original)
         for runtime, message in (
             ({"load_format": "dummy"}, "default checkpoint loader"),
@@ -145,7 +147,9 @@ class TestGlm52Fp8Packing(CustomTestCase):
         self.assertEqual(layer.weight_scale_inv.output_dim, 0)
         self.assertFalse(hasattr(layer.weight_scale_inv, "input_dim"))
         self.assertIs(layer.weight_scale, layer.weight_scale_inv)
-        self.assertEqual(set(dict(layer.named_parameters())), {"weight", "weight_scale_inv"})
+        self.assertEqual(
+            set(dict(layer.named_parameters())), {"weight", "weight_scale_inv"}
+        )
         self.assertEqual(set(layer.state_dict()), {"weight", "weight_scale_inv"})
         self.assertEqual(layer.logical_widths, [2, 3])
 
