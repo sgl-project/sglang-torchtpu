@@ -646,6 +646,13 @@ class PipelineConfig:
         """
         return text_inputs.get("attention_mask")
 
+    def get_text_encoder_position_ids(
+        self, text_inputs: dict, encoder_index: int
+    ) -> "torch.Tensor | None":
+        """Return position ids for the given text encoder from the host
+        tokenizer outputs, or None to let the encoder derive them."""
+        return None
+
     def build_text_conditioning_mask(
         self,
         text_inputs: dict,

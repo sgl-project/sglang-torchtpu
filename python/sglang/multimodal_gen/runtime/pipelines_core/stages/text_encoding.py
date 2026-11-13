@@ -613,6 +613,12 @@ class TextEncodingStage(ConditionEncodingStage):
             )
 
             def encode_conditioning():
+                # before the upload: BatchEncoding.to moves its tensors in place
+                position_ids = (
+                    server_args.pipeline_config.get_text_encoder_position_ids(
+                        host_inputs, i
+                    )
+                )
                 text_inputs = host_inputs.to(target_device, non_blocking=True)
 
                 input_ids = text_inputs["input_ids"]
@@ -627,6 +633,10 @@ class TextEncodingStage(ConditionEncodingStage):
                 }
                 if attention_mask is not None:
                     encoder_forward_kwargs["attention_mask"] = attention_mask
+                if position_ids is not None:
+                    encoder_forward_kwargs["position_ids"] = position_ids.to(
+                        target_device
+                    )
                 if "use_cache" in inspect.signature(text_encoder.forward).parameters:
                     encoder_forward_kwargs["use_cache"] = False
                 self._begin_text_encoder_use(i)
