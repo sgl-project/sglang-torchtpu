@@ -38,17 +38,18 @@ Usage:
 
 from __future__ import annotations
 
+import itertools
 import math
 import unittest
+
+import numpy as np
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.ci.gate_matrix import sweep
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas.gdn import compute_gdn, config, wrapper
 
 register_tpu_ci(est_time=300, suite="stage-a-test-tpu-unit", chips=1)
-# The reachable-tile sweep is ~45% of this file. The gate walks one head split;
-# the nightly walks every served one.
-register_tpu_ci(est_time=450, suite="nightly-tpu-4-v7", nightly=True)
 
 
 def _has_jax() -> bool:
@@ -78,7 +79,6 @@ if _has_jax():
 
     import jax
     import jax.numpy as jnp
-    import numpy as np
 
 
 def _l2_normalize(x, eps: float = 1e-6):
@@ -1370,195 +1370,185 @@ class TestGDNAttentionV3(CustomTestCase):
 
     def test_every_reachable_tile_matches_reference(self):
         """Every reachable (T, C) tile pair across served GDN heads matches reference."""
-        from sglang_tpu.attention.pallas.gdn import config, wrapper
 
         d_k = d_v = 128
         kernel_size = 4
-        for n_kq, n_v in sweep(_SERVED_GDN_HEADS, ((8, 32),)):
-            for state_dtype in (jnp.bfloat16, jnp.float32):
-                for window in (1, 4):
-                    for batch in _reachable_tile_batches(
-                        n_kq,
-                        n_v,
-                        state_dtype,
-                        window,
-                        config.AttentionMode.GDN,
-                    ):
-                        max_reqs = batch["max_reqs"]
-                        lengths = batch["lengths"]
-                        q_loc = jnp.array(batch["q_loc"], dtype=jnp.int32)
-                        distribution = jnp.array(batch["distribution"], dtype=jnp.int32)
-                        num_tokens = int(q_loc[-1])
-                        num_spec_tokens = window - 1
-                        with self.subTest(
+
+        for (n_kq, n_v), state_dtype, window in itertools.product(
+            sweep(_SERVED_GDN_HEADS, ((8, 32),)),
+            (jnp.bfloat16, jnp.float32),
+            (1, 4),
+        ):
+            for batch in _reachable_tile_batches(
+                n_kq,
+                n_v,
+                state_dtype,
+                window,
+                config.AttentionMode.GDN,
+            ):
+                max_reqs = batch["max_reqs"]
+                lengths = batch["lengths"]
+                q_loc = jnp.array(batch["q_loc"], dtype=jnp.int32)
+                distribution = jnp.array(batch["distribution"], dtype=jnp.int32)
+                num_tokens = int(q_loc[-1])
+                num_spec_tokens = window - 1
+                with self.subTest(
+                    n_v=n_v,
+                    state_dtype=str(state_dtype),
+                    window=window,
+                    max_reqs=max_reqs,
+                    tokens=num_tokens,
+                ):
+                    w_sz = num_spec_tokens + 1
+                    state_indices = jnp.array(
+                        [1 + i * w_sz for i in range(max_reqs)],
+                        dtype=jnp.int32,
+                    )
+                    num_blocks = 1 + max_reqs * w_sz
+                    dim = 2 * n_kq * d_k + n_v * d_v
+                    rngs = iter(
+                        jax.random.split(jax.random.key(max_reqs + num_tokens), 10)
+                    )
+                    qkv = jax.random.normal(
+                        next(rngs),
+                        (num_tokens, dim),
+                        dtype=jnp.bfloat16,
+                    )
+                    b = jax.random.normal(
+                        next(rngs),
+                        (num_tokens, n_v),
+                        dtype=jnp.bfloat16,
+                    )
+                    a = jax.random.normal(
+                        next(rngs),
+                        (num_tokens, n_v),
+                        dtype=jnp.bfloat16,
+                    )
+                    conv_state = jnp.zeros(
+                        (num_blocks, kernel_size - 1, dim),
+                        dtype=jnp.bfloat16,
+                    )
+                    rec_state = jnp.zeros(
+                        (num_blocks, n_v, d_k, d_v), dtype=state_dtype
+                    )
+                    conv_weight = jax.random.normal(
+                        next(rngs),
+                        (dim, 1, kernel_size),
+                        dtype=jnp.bfloat16,
+                    )
+                    conv_bias = jax.random.normal(
+                        next(rngs), (dim,), dtype=jnp.bfloat16
+                    )
+                    a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+                    dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+                    seq_lens = jnp.array(lengths, dtype=jnp.int32)
+                    kwargs = {
+                        "qkv": qkv,
+                        "b": b,
+                        "a": a,
+                        "conv_state": conv_state,
+                        "recurrent_state": rec_state,
+                        "conv_weight": conv_weight,
+                        "conv_bias": conv_bias,
+                        "a_log": a_log,
+                        "dt_bias": dt_bias,
+                        "query_start_loc": q_loc,
+                        "state_indices": state_indices,
+                        "distribution": distribution,
+                        "seq_lens": seq_lens,
+                        "n_kq": n_kq,
+                        "n_v": n_v,
+                        "d_k": d_k,
+                        "d_v": d_v,
+                        "kernel_size": kernel_size,
+                    }
+                    num_valid_seqs = int(distribution[2])
+                    if num_spec_tokens > 0:
+                        read_offsets = jnp.zeros(max_reqs, dtype=jnp.int32)
+                        num_spec_seqs = int(distribution[0])
+                        (ref_conv, ref_rec), ref_out = gdn_attention_spec_ref(
+                            qkv=qkv,
+                            b=b,
+                            a=a,
+                            conv_state=conv_state,
+                            recurrent_state=rec_state,
+                            conv_weight=conv_weight,
+                            conv_bias=conv_bias,
+                            a_log=a_log,
+                            dt_bias=dt_bias,
+                            query_start_loc=q_loc,
+                            state_indices=state_indices,
+                            read_offsets=read_offsets,
+                            num_spec_seqs=num_spec_seqs,
+                            seq_lens=seq_lens,
+                            n_kq=n_kq,
                             n_v=n_v,
-                            state_dtype=str(state_dtype),
-                            window=window,
-                            max_reqs=max_reqs,
-                            tokens=num_tokens,
-                        ):
-                            w_sz = num_spec_tokens + 1
-                            state_indices = jnp.array(
-                                [1 + i * w_sz for i in range(max_reqs)],
-                                dtype=jnp.int32,
-                            )
-                            num_blocks = 1 + max_reqs * w_sz
-                            dim = 2 * n_kq * d_k + n_v * d_v
-                            rngs = iter(
-                                jax.random.split(
-                                    jax.random.key(max_reqs + num_tokens), 10
-                                )
-                            )
-                            qkv = jax.random.normal(
-                                next(rngs),
-                                (num_tokens, dim),
-                                dtype=jnp.bfloat16,
-                            )
-                            b = jax.random.normal(
-                                next(rngs),
-                                (num_tokens, n_v),
-                                dtype=jnp.bfloat16,
-                            )
-                            a = jax.random.normal(
-                                next(rngs),
-                                (num_tokens, n_v),
-                                dtype=jnp.bfloat16,
-                            )
-                            conv_state = jnp.zeros(
-                                (num_blocks, kernel_size - 1, dim),
-                                dtype=jnp.bfloat16,
-                            )
-                            rec_state = jnp.zeros(
-                                (num_blocks, n_v, d_k, d_v), dtype=state_dtype
-                            )
-                            conv_weight = jax.random.normal(
-                                next(rngs),
-                                (dim, 1, kernel_size),
-                                dtype=jnp.bfloat16,
-                            )
-                            conv_bias = jax.random.normal(
-                                next(rngs), (dim,), dtype=jnp.bfloat16
-                            )
-                            a_log = jax.random.normal(
-                                next(rngs), (n_v,), dtype=jnp.float32
-                            )
-                            dt_bias = jax.random.normal(
-                                next(rngs), (n_v,), dtype=jnp.float32
-                            )
-                            seq_lens = jnp.array(lengths, dtype=jnp.int32)
-                            kwargs = dict(
-                                qkv=qkv,
-                                b=b,
-                                a=a,
-                                conv_state=conv_state,
-                                recurrent_state=rec_state,
+                            d_k=d_k,
+                            d_v=d_v,
+                            kernel_size=kernel_size,
+                        )
+                        if num_valid_seqs > num_spec_seqs:
+                            spec_end = int(q_loc[num_spec_seqs])
+                            (ref_conv, ref_rec), prefill_out = _gdn_attention_ref(
+                                qkv=qkv[spec_end:],
+                                b=b[spec_end:],
+                                a=a[spec_end:],
+                                conv_state=ref_conv,
+                                recurrent_state=ref_rec,
                                 conv_weight=conv_weight,
                                 conv_bias=conv_bias,
                                 a_log=a_log,
                                 dt_bias=dt_bias,
-                                query_start_loc=q_loc,
-                                state_indices=state_indices,
-                                distribution=distribution,
-                                seq_lens=seq_lens,
+                                query_start_loc=q_loc[num_spec_seqs:]
+                                - q_loc[num_spec_seqs],
+                                state_indices=state_indices[num_spec_seqs:],
+                                distribution=jnp.array(
+                                    [0, 0, num_valid_seqs - num_spec_seqs],
+                                    dtype=jnp.int32,
+                                ),
+                                seq_lens=seq_lens[num_spec_seqs:],
                                 n_kq=n_kq,
                                 n_v=n_v,
                                 d_k=d_k,
                                 d_v=d_v,
                                 kernel_size=kernel_size,
                             )
-                            num_valid_seqs = int(distribution[2])
-                            if num_spec_tokens > 0:
-                                read_offsets = jnp.zeros(max_reqs, dtype=jnp.int32)
-                                num_spec_seqs = int(distribution[0])
-                                (ref_conv, ref_rec), ref_out = gdn_attention_spec_ref(
-                                    qkv=qkv,
-                                    b=b,
-                                    a=a,
-                                    conv_state=conv_state,
-                                    recurrent_state=rec_state,
-                                    conv_weight=conv_weight,
-                                    conv_bias=conv_bias,
-                                    a_log=a_log,
-                                    dt_bias=dt_bias,
-                                    query_start_loc=q_loc,
-                                    state_indices=state_indices,
-                                    read_offsets=read_offsets,
-                                    num_spec_seqs=num_spec_seqs,
-                                    seq_lens=seq_lens,
-                                    n_kq=n_kq,
-                                    n_v=n_v,
-                                    d_k=d_k,
-                                    d_v=d_v,
-                                    kernel_size=kernel_size,
-                                )
-                                if num_valid_seqs > num_spec_seqs:
-                                    spec_end = int(q_loc[num_spec_seqs])
-                                    (ref_conv, ref_rec), prefill_out = (
-                                        _gdn_attention_ref(
-                                            qkv=qkv[spec_end:],
-                                            b=b[spec_end:],
-                                            a=a[spec_end:],
-                                            conv_state=ref_conv,
-                                            recurrent_state=ref_rec,
-                                            conv_weight=conv_weight,
-                                            conv_bias=conv_bias,
-                                            a_log=a_log,
-                                            dt_bias=dt_bias,
-                                            query_start_loc=q_loc[num_spec_seqs:]
-                                            - q_loc[num_spec_seqs],
-                                            state_indices=state_indices[num_spec_seqs:],
-                                            distribution=jnp.array(
-                                                [0, 0, num_valid_seqs - num_spec_seqs],
-                                                dtype=jnp.int32,
-                                            ),
-                                            seq_lens=seq_lens[num_spec_seqs:],
-                                            n_kq=n_kq,
-                                            n_v=n_v,
-                                            d_k=d_k,
-                                            d_v=d_v,
-                                            kernel_size=kernel_size,
-                                        )
-                                    )
-                                    ref_out = ref_out.at[spec_end:].set(prefill_out)
-                            else:
-                                (ref_conv, ref_rec), ref_out = _gdn_attention_ref(
-                                    **kwargs
-                                )
-                            call_kwargs = dict(
-                                kwargs,
-                                conv_state=conv_state.copy(),
-                                recurrent_state=rec_state.copy(),
-                                batched_only=batch.get("batched_only", False),
-                                prefill_only=batch.get("prefill_only", False),
-                            )
-                            if num_spec_tokens > 0:
-                                call_kwargs["read_offsets"] = read_offsets
-                                call_kwargs["num_spec_tokens"] = num_spec_tokens
-                            (got_conv, got_rec), got_out = wrapper.fused_conv1d_gdn(
-                                **call_kwargs
-                            )
-                            np.testing.assert_allclose(
-                                got_out, ref_out, rtol=3e-2, atol=3e-2
-                            )
-                            active_slots = _active_state_slots(
-                                state_indices=state_indices,
-                                distribution=distribution,
-                                lengths=lengths,
-                                num_valid_seqs=num_valid_seqs,
-                                num_spec_tokens=num_spec_tokens,
-                            )
-                            np.testing.assert_allclose(
-                                got_conv[active_slots],
-                                ref_conv[active_slots],
-                                rtol=3e-2,
-                                atol=3e-2,
-                            )
-                            np.testing.assert_allclose(
-                                got_rec[active_slots],
-                                ref_rec[active_slots],
-                                rtol=3e-2,
-                                atol=3e-2,
-                            )
+                            ref_out = ref_out.at[spec_end:].set(prefill_out)
+                    else:
+                        (ref_conv, ref_rec), ref_out = _gdn_attention_ref(**kwargs)
+                    call_kwargs = dict(
+                        kwargs,
+                        conv_state=conv_state.copy(),
+                        recurrent_state=rec_state.copy(),
+                        batched_only=batch.get("batched_only", False),
+                        prefill_only=batch.get("prefill_only", False),
+                    )
+                    if num_spec_tokens > 0:
+                        call_kwargs["read_offsets"] = read_offsets
+                        call_kwargs["num_spec_tokens"] = num_spec_tokens
+                    (got_conv, got_rec), got_out = wrapper.fused_conv1d_gdn(
+                        **call_kwargs
+                    )
+                    np.testing.assert_allclose(got_out, ref_out, rtol=3e-2, atol=3e-2)
+                    active_slots = _active_state_slots(
+                        state_indices=state_indices,
+                        distribution=distribution,
+                        lengths=lengths,
+                        num_valid_seqs=num_valid_seqs,
+                        num_spec_tokens=num_spec_tokens,
+                    )
+                    np.testing.assert_allclose(
+                        got_conv[active_slots],
+                        ref_conv[active_slots],
+                        rtol=3e-2,
+                        atol=3e-2,
+                    )
+                    np.testing.assert_allclose(
+                        got_rec[active_slots],
+                        ref_rec[active_slots],
+                        rtol=3e-2,
+                        atol=3e-2,
+                    )
 
 
 class TestGDNTileSelection(CustomTestCase):
@@ -2148,8 +2138,184 @@ class TestGDNTileSelection(CustomTestCase):
 
         self._with_tpu7x_mesh(_check)
 
+    def _verify_recurrent_gdn_window(
+        self, w_sz: int, comp_dt: jnp.dtype, tol: float
+    ) -> None:
+        """Verify single window configuration for recurrent GDN."""
+        cfg = config.GDNConfig(
+            mode=config.GDNMode.BATCHED,
+            dtypes=config.Dtypes(
+                act_in=jnp.dtype(comp_dt),
+                act_out=jnp.dtype(comp_dt),
+                compute=jnp.dtype(comp_dt),
+                recurrent_state=jnp.dtype(jnp.float32),
+                conv_state=jnp.dtype(jnp.float32),
+            ),
+            batch_size=8 * w_sz,
+            dim_size=1536,
+            kernel_size=4,
+            tile_size=8,
+            num_kq_heads=2,
+            num_v_heads=8,
+            kq_head_dim=128,
+            v_head_dim=128,
+            num_buffers=2,
+            window_size=w_sz,
+            attention_mode=config.AttentionMode.GDN,
+        )
+        real_sizes = jnp.array(
+            [w_sz, max(1, w_sz - 1), w_sz, 1, w_sz, w_sz, 0, w_sz],
+            dtype=jnp.int32,
+        )
+        q_c = jax.random.normal(jax.random.key(42), (8, 2, w_sz, 1, 128), dtype=comp_dt)
+        k_c = jax.random.normal(jax.random.key(43), (8, 2, w_sz, 1, 128), dtype=comp_dt)
+        v_c = jax.random.normal(jax.random.key(44), (8, 8, w_sz, 1, 128), dtype=comp_dt)
+        b_c = jax.random.normal(jax.random.key(45), (8, 1, w_sz, 1, 128), dtype=comp_dt)
+        a_c = jax.random.normal(jax.random.key(46), (8, 1, w_sz, 1, 128), dtype=comp_dt)
+        s_prev = jax.random.normal(
+            jax.random.key(47), (8, 8, 128, 128), dtype=jnp.float32
+        )
+        a_log = jax.random.normal(jax.random.key(48), (128,), dtype=jnp.float32)
+        dt_bias = jax.random.normal(jax.random.key(49), (128,), dtype=jnp.float32)
 
-@unittest.skipIf(not _has_jax(), "Requires JAX")
+        with jax.default_matmul_precision("highest"):
+            out, state = compute_gdn.recurrent_gdn(
+                real_sizes,
+                q_c,
+                k_c,
+                v_c,
+                b_c,
+                a_c,
+                s_prev,
+                a_log,
+                dt_bias,
+                cfg,
+            )
+            mask_dt = compute_gdn.get_mask_dtype(cfg.dtypes.compute)
+            iota = jax.lax.broadcasted_iota(mask_dt, (8, 1, w_sz, 1, 1), 2)
+            mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1).astype(mask_dt)
+            q_m = compute_gdn.l2_norm(jnp.where(mask, q_c.astype(comp_dt), 0)) * (
+                128**-0.5
+            )
+            k_m = compute_gdn.l2_norm(jnp.where(mask, k_c.astype(comp_dt), 0))
+            k_t = compute_gdn.fused_transpose_broadcast(k_m, src_dim=4, dst_dim=3)
+            v_m = jnp.where(mask, v_c.astype(comp_dt), 0)
+            beta_m = compute_gdn.fused_transpose_broadcast(
+                jnp.where(mask, jax.nn.sigmoid(b_c.astype(comp_dt)), 0),
+                src_dim=4,
+                dst_dim=1,
+            )[:, :8]
+            g_m = compute_gdn.fused_transpose_broadcast(
+                jnp.exp(
+                    jnp.where(
+                        mask,
+                        -jnp.exp(a_log.reshape(1, 1, 1, 1, -1).astype(comp_dt))
+                        * jax.nn.softplus(
+                            a_c.astype(comp_dt)
+                            + dt_bias.reshape(1, 1, 1, 1, -1).astype(comp_dt)
+                        ),
+                        0,
+                    )
+                ),
+                src_dim=4,
+                dst_dim=1,
+            )[:, :8]
+            ref_outs, ref_states = [], []
+            for s_i in range(8):
+                st = s_prev[s_i]
+                o_seq, s_seq = [], []
+                for c_i in range(w_sz):
+                    qc = jnp.repeat(q_m[s_i, :, c_i], 4, axis=0)
+                    kc = jnp.repeat(k_m[s_i, :, c_i], 4, axis=0)
+                    kt = jnp.repeat(k_t[s_i, :, c_i], 4, axis=0)
+                    st_u = st * g_m[s_i, :, c_i]
+                    vu = jax.lax.dot(
+                        kc,
+                        st_u,
+                        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                        preferred_element_type=jnp.float32,
+                    ).astype(comp_dt)
+                    vn = beta_m[s_i, :, c_i] * (v_m[s_i, :, c_i] - vu)
+                    st = st_u + kt * vn
+                    out_tok = jax.lax.dot(
+                        qc,
+                        st,
+                        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                        preferred_element_type=jnp.float32,
+                    ).astype(comp_dt)
+                    o_seq.append(out_tok[:, 0, :])
+                    s_seq.append(st)
+                ref_outs.append(jnp.stack(o_seq, axis=0))
+                ref_states.append(jnp.stack(s_seq, axis=0))
+            ref_out = jnp.stack(ref_outs, axis=0)
+            ref_state = jnp.stack(ref_states, axis=0)
+
+        np.testing.assert_allclose(
+            np.asarray(out, np.float32),
+            np.asarray(ref_out, np.float32),
+            rtol=tol,
+            atol=tol,
+        )
+        np.testing.assert_allclose(
+            np.asarray(state, np.float32),
+            np.asarray(ref_state, np.float32),
+            rtol=tol,
+            atol=tol,
+        )
+        np.testing.assert_allclose(np.asarray(out[6], np.float32), 0.0, atol=tol)
+        np.testing.assert_allclose(
+            np.asarray(state[6], np.float32),
+            np.repeat(np.asarray(s_prev[6:7], np.float32), w_sz, axis=0),
+            rtol=tol,
+            atol=tol,
+        )
+        window_four = 4
+        if w_sz == window_four:
+            np.testing.assert_allclose(
+                np.asarray(state[1, 3], np.float32),
+                np.asarray(state[1, 2], np.float32),
+                rtol=tol,
+                atol=tol,
+            )
+            np.testing.assert_allclose(
+                np.asarray(state[3, 3], np.float32),
+                np.asarray(state[3, 0], np.float32),
+                rtol=tol,
+                atol=tol,
+            )
+
+            hlo_text = str(
+                jax.jit(lambda *a, c=cfg: compute_gdn.recurrent_gdn(*a, c))
+                .lower(
+                    real_sizes,
+                    q_c,
+                    k_c,
+                    v_c,
+                    b_c,
+                    a_c,
+                    s_prev,
+                    a_log,
+                    dt_bias,
+                )
+                .compiler_ir(dialect="stablehlo")
+            )
+            self.assertIn("batching_dims = [0] x [0]", hlo_text)
+            self.assertNotIn("batching_dims = [0, 1]", hlo_text)
+
+    def test_recurrent_gdn_batched_multi_token_window_with_ragged_masks(
+        self,
+    ) -> None:
+        """Batched recurrent_gdn matches explicit reference.
+
+        Matches explicit per-sequence 2-dot reference across W=1, 4 and
+        ragged real_sizes.
+        """
+        self.assertFalse(hasattr(compute_gdn, "recurrent_gdn_per_seq"))
+        for w_sz in (1, 4):
+            for comp_dt, tol in ((jnp.float32, 1e-4), (jnp.bfloat16, 2e-2)):
+                self._verify_recurrent_gdn_window(w_sz, comp_dt, tol)
+
+
 class TestGDNStatePipelineRace(CustomTestCase):
     """CPU interpret-mode vector-clock race detection on the state pipeline."""
 
