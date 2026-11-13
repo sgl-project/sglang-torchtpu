@@ -592,10 +592,12 @@ class ExecGraph(msgspec.Struct):
         "Enable debug mode for torch compile",
     ] = False
     tpu_compile_tracer: A[
-        Literal["dynamo", "direct"],
+        Optional[Literal["dynamo", "direct"]],
         "Select the TPU compilation tracer. Dynamo provides guards and broader "
-        "input support; direct lowers through TorchTPU with less compilation overhead.",
-    ] = "dynamo"
+        "input support; direct lowers through TorchTPU with less compilation overhead. "
+        "Unset resolves to dynamo, or to direct for the models whose TPU port "
+        "requires it (see the TPU platform defaults).",
+    ] = None
     use_spmd_compile: A[
         bool,
         Arg(

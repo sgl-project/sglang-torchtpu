@@ -40,6 +40,46 @@ def get_maybe_quantize_lhs(
     return True
 
 
+def fp4_blockdiag_matmul(lhs, rhs_e2m1, scales, *, group: int, kc: int):
+    """``lhs [A, K]`` @ (e2m1 ``rhs [K, N]`` x block scales ``[K // group, N]``) -> f32 ``[A, N]``.
+
+    The e2m1 codes feed the MXU as e4m3 (exact) at the fp8 weight-push rate. Row
+    ``a * G + g`` of a chunk's LHS is row ``a`` masked to scale group ``g``, so each
+    group's product lands in its own result row and its scale multiplies the
+    ``[A * G, N]`` result instead of the ``[K, N]`` weights. Exact in f32 up to summation
+    order. For tiles of a few rows, where the MXU is weight-push bound and extra LHS
+    rows are free while per-element weight dequant is not.
+    """
+    num_rows, size_k = lhs.shape
+    kc = min(size_k, kc)
+    groups = kc // group
+    rows = num_rows * groups
+    diag = (
+        lax.broadcasted_iota(jnp.int32, (rows, kc), 0) % groups
+        == lax.broadcasted_iota(jnp.int32, (rows, kc), 1) // group
+    )
+    acc = None
+    for c0 in range(0, size_k, kc):
+        xs = lhs[:, c0 : c0 + kc].astype(jnp.bfloat16)
+        expanded = jnp.where(
+            diag,
+            jnp.broadcast_to(xs[:, None, :], (num_rows, groups, kc)).reshape(rows, kc),
+            0,
+        ).astype(jnp.bfloat16)
+        w = rhs_e2m1[c0 : c0 + kc].astype(jnp.float8_e4m3fn)
+        res = jnp.dot(expanded, w, preferred_element_type=jnp.float32)
+        s = scales[c0 // group : c0 // group + groups].astype(jnp.float32)
+        part = res * (jnp.concatenate([s] * num_rows, axis=0) if num_rows > 1 else s)
+        acc = part if acc is None else acc + part
+    return jnp.concatenate(
+        [
+            jnp.sum(acc[a * groups : (a + 1) * groups], axis=0, keepdims=True)
+            for a in range(num_rows)
+        ],
+        axis=0,
+    )
+
+
 # Util.
 def align_to(x, a):
     return pl.cdiv(x, a) * a
@@ -162,6 +202,15 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None) -> jax.Array:
             acc_gate = jnp.clip(acc_gate, max=limit)
             acc_up = jnp.clip(acc_up, min=-limit, max=limit)
             return (acc_gate * jax.nn.sigmoid(alpha * acc_gate)) * (acc_up + 1)
+        case str() if fuse_act.startswith("situ:"):
+            # Same SiTU as gmm_v2.situ_and_mul: "situ:{beta}:{linear_beta|none}".
+            _, beta_str, linear_beta_str = fuse_act.split(":")
+            beta = float(beta_str)
+            gate_act = beta * jnp.tanh(acc_gate / beta) * jax.nn.sigmoid(acc_gate)
+            if linear_beta_str != "none":
+                linear_beta = float(linear_beta_str)
+                acc_up = linear_beta * jnp.tanh(acc_up / linear_beta)
+            return gate_act * acc_up
         case _:
             raise NotImplementedError(f"Unsupported fuse_act: {fuse_act}")
 
@@ -306,6 +355,15 @@ def inner_kernel(
     # LHS quant dtype before matmul so their per-block scales are not dropped.
     _resolved_gm_id = pl.program_id(0) if _gm_id is None else _gm_id
 
+    def _to_bf16(w):
+        # e2m1 values are exact in e4m3; fp4 -> fp8 -> bf16 takes fewer VPU ops than the
+        # direct widen (bit-identical).
+        if fp4_via_fp8 and w.dtype == jnp.float4_e2m1fn:
+            w = w.astype(jnp.float8_e4m3fn)
+        return w.astype(jnp.bfloat16)
+
+    fp4_via_fp8 = envs.SGLANG_TPU_FP4_DEQUANT_VIA_FP8.get()
+
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
         tiled_rhs = tiled_rhs_ref.get_weight()
@@ -332,8 +390,13 @@ def inner_kernel(
             rhs_scale = tiled_rhs_ref.get_scale()
             if rhs_scale.ndim == 2:
                 # Compact [num_quant_blocks, n] tile (fused-RS 3D scale layout).
-                return rhs_scale[b_id : b_id + 1, start_n:end_n]
-            return rhs_scale[..., b_id, :, start_n:end_n]
+                scale = rhs_scale[b_id : b_id + 1, start_n:end_n]
+            else:
+                scale = rhs_scale[..., b_id, :, start_n:end_n]
+            # e4m3 block scales (NVFP4 with separate globals) widen on use.
+            if scale.dtype == jnp.float8_e4m3fn:
+                scale = scale.astype(jnp.float32)
+            return scale
 
         def _online_quantize(block, axis, quant_dtype):
             if jnp.issubdtype(quant_dtype, jnp.floating):
@@ -407,87 +470,116 @@ def inner_kernel(
             apply_rhs_scale_after_matmul = cfgs.rhs_cfgs.has_scale and (
                 rhs_scale_matches_lhs_block
             )
+            blockdiag_rows = envs.SGLANG_TPU_FUSED_RS_BLOCKDIAG_ROWS.get()
+            use_blockdiag = (
+                0 < cfgs.tiles.tile_m <= blockdiag_rows
+                and not fp8_activation_quant
+                and cfgs.rhs_cfgs.has_scale
+                and not apply_rhs_scale_after_matmul
+                and jnp.dtype(cfgs.rhs_cfgs.quant_dtype) == jnp.float4_e2m1fn
+            )
+            if use_blockdiag:
+                rhs_scale = tiled_rhs_ref.get_scale()[...]
+                # compact [blocks, n] or [blocks, 1, n]
+                rhs_scale = rhs_scale.reshape(-1, rhs_scale.shape[-1])
+                acc = fp4_blockdiag_matmul(
+                    tiled_lhs,
+                    tiled_rhs,
+                    rhs_scale,
+                    group=rhs_qbs,
+                    kc=envs.SGLANG_TPU_FUSED_RS_BLOCKDIAG_KC.get(),
+                ).astype(acc_ref.dtype)
 
-            # Without n outer loop, result of quantized matmul becomes available only
-            # at the last iteration of the loop. This means [tile_m, tile_n] value
-            # needs to be stored until the last iteration. By adding n outer loop,
-            # result of [tile_m, mxu_size] becomes available at the end of every k
-            # inner loop which can be used to pipeline subsequent VPU or VST ops with
-            # MXU ops for the next [tile_m, mxu_size].
-            acc_list = []
-            mxu_size = pltpu.get_tpu_info().mxu_column_size
-            rhs_tile_n = tiled_rhs.shape[-1]
-            for start_n in range(0, rhs_tile_n, mxu_size):
-                end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
+            else:
+                # Without n outer loop, result of quantized matmul becomes available only
+                # at the last iteration of the loop. This means [tile_m, tile_n] value
+                # needs to be stored until the last iteration. By adding n outer loop,
+                # result of [tile_m, mxu_size] becomes available at the end of every k
+                # inner loop which can be used to pipeline subsequent VPU or VST ops with
+                # MXU ops for the next [tile_m, mxu_size].
+                acc_list = []
+                mxu_size = pltpu.get_tpu_info().mxu_column_size
+                rhs_tile_n = tiled_rhs.shape[-1]
+                for start_n in range(0, rhs_tile_n, mxu_size):
+                    end_n = min(rhs_tile_n, start_n + mxu_size)
+                    col_size = end_n - start_n
 
-                acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size), dtype=acc_ref.dtype)
+                    acc_n = jnp.zeros(
+                        (cfgs.tiles.tile_m, col_size), dtype=acc_ref.dtype
+                    )
 
-                for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
-                    end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
+                    for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
+                        end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
 
-                    block_lhs = tiled_lhs[:, start_k:end_k]
-                    block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
+                        block_lhs = tiled_lhs[:, start_k:end_k]
+                        block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
-                    if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
-                        scaled_rhs_slices = []
-                        rhs_k_start = start_k
-                        while rhs_k_start < end_k:
-                            b_id = rhs_k_start // rhs_qbs
-                            rhs_k_end = min((b_id + 1) * rhs_qbs, end_k)
-                            local_k_start = rhs_k_start - start_k
-                            local_k_end = rhs_k_end - start_k
-                            rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
-                            block_rhs_slice = block_rhs[local_k_start:local_k_end]
-                            scaled_rhs_slice = block_rhs_slice.astype(
-                                jnp.bfloat16
-                            ) * rhs_scale_slice.astype(jnp.bfloat16)
-                            scaled_rhs_slices.append(scaled_rhs_slice)
-                            rhs_k_start = rhs_k_end
-                        block_rhs_for_quant = jnp.concatenate(scaled_rhs_slices, axis=0)
-                    else:
-                        block_rhs_for_quant = block_rhs.astype(jnp.bfloat16)
-
-                    if fp8_activation_quant:
-                        block_lhs_for_matmul, lhs_scale = _online_quantize(
-                            block_lhs, axis=1, quant_dtype=cfgs.lhs_cfgs.quant_dtype
-                        )
                         if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
-                            # Fold small RHS scale blocks into RHS first, then
-                            # requantize to the activation quant dtype so
-                            # matmul uses fp8 x fp8.
-                            block_rhs_for_matmul, rhs_online_scale = _online_quantize(
-                                block_rhs_for_quant,
-                                axis=0,
-                                quant_dtype=cfgs.lhs_cfgs.quant_dtype,
+                            scaled_rhs_slices = []
+                            rhs_k_start = start_k
+                            while rhs_k_start < end_k:
+                                b_id = rhs_k_start // rhs_qbs
+                                rhs_k_end = min((b_id + 1) * rhs_qbs, end_k)
+                                local_k_start = rhs_k_start - start_k
+                                local_k_end = rhs_k_end - start_k
+                                rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
+                                block_rhs_slice = block_rhs[local_k_start:local_k_end]
+                                scaled_rhs_slice = _to_bf16(
+                                    block_rhs_slice
+                                ) * rhs_scale_slice.astype(jnp.bfloat16)
+                                scaled_rhs_slices.append(scaled_rhs_slice)
+                                rhs_k_start = rhs_k_end
+                            block_rhs_for_quant = jnp.concatenate(
+                                scaled_rhs_slices, axis=0
                             )
                         else:
-                            block_rhs_for_matmul = block_rhs
-                            rhs_online_scale = None
-                    else:
-                        block_lhs_for_matmul = block_lhs.astype(jnp.bfloat16)
-                        block_rhs_for_matmul = block_rhs_for_quant
+                            block_rhs_for_quant = _to_bf16(block_rhs)
 
-                    block_acc = jnp.matmul(
-                        block_lhs_for_matmul,
-                        block_rhs_for_matmul,
-                        preferred_element_type=jnp.float32,
-                    ).astype(acc_ref.dtype)
+                        if fp8_activation_quant:
+                            block_lhs_for_matmul, lhs_scale = _online_quantize(
+                                block_lhs, axis=1, quant_dtype=cfgs.lhs_cfgs.quant_dtype
+                            )
+                            if (
+                                cfgs.rhs_cfgs.has_scale
+                                and not apply_rhs_scale_after_matmul
+                            ):
+                                # Fold small RHS scale blocks into RHS first, then
+                                # requantize to the activation quant dtype so
+                                # matmul uses fp8 x fp8.
+                                block_rhs_for_matmul, rhs_online_scale = (
+                                    _online_quantize(
+                                        block_rhs_for_quant,
+                                        axis=0,
+                                        quant_dtype=cfgs.lhs_cfgs.quant_dtype,
+                                    )
+                                )
+                            else:
+                                block_rhs_for_matmul = block_rhs
+                                rhs_online_scale = None
+                        else:
+                            block_lhs_for_matmul = block_lhs.astype(jnp.bfloat16)
+                            block_rhs_for_matmul = block_rhs_for_quant
 
-                    if fp8_activation_quant:
-                        block_acc *= lhs_scale.astype(acc_ref.dtype)
-                        if rhs_online_scale is not None:
-                            block_acc *= rhs_online_scale.astype(acc_ref.dtype)
+                        block_acc = jnp.matmul(
+                            block_lhs_for_matmul,
+                            block_rhs_for_matmul,
+                            preferred_element_type=jnp.float32,
+                        ).astype(acc_ref.dtype)
 
-                    if apply_rhs_scale_after_matmul:
-                        b_id = start_k // rhs_qbs
-                        rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
-                        block_acc *= rhs_scale_slice.astype(acc_ref.dtype)
+                        if fp8_activation_quant:
+                            block_acc *= lhs_scale.astype(acc_ref.dtype)
+                            if rhs_online_scale is not None:
+                                block_acc *= rhs_online_scale.astype(acc_ref.dtype)
 
-                    acc_n += block_acc
+                        if apply_rhs_scale_after_matmul:
+                            b_id = start_k // rhs_qbs
+                            rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
+                            block_acc *= rhs_scale_slice.astype(acc_ref.dtype)
 
-                acc_list.append(acc_n)
-            acc = jnp.concatenate(acc_list, axis=1)
+                        acc_n += block_acc
+
+                    acc_list.append(acc_n)
+                acc = jnp.concatenate(acc_list, axis=1)
 
         if not is_first_k_step:
             acc += acc_ref[...]
@@ -949,12 +1041,21 @@ def _can_dma_rows(size, dtype):
 
 @jax.named_scope("dma_gather_gm_start")
 def dma_gather_gm_start(
-    src_ref, dst_ref, indices_ref, sem_ref, gm_id, metadata_ref, divisor: int = 1
+    src_ref,
+    dst_ref,
+    indices_ref,
+    sem_ref,
+    gm_id,
+    metadata_ref,
+    divisor: int = 1,
+    unroll: int = 1,
 ):
     """Start gathering rows for a specific gm tile via DMA.
 
     src_ref and dst_ref must be 3D: (rows, k // num_lanes, num_lanes).
     No reshape — reshape on refs breaks dynamic pl.ds offsets.
+
+    `unroll`: rows issued per loop iteration (the remainder runs one by one).
 
     `divisor`: optional integer divisor applied to indices_ref values before
     use. Set > 1 when indices_ref contains packed values (e.g.,
@@ -978,7 +1079,20 @@ def dma_gather_gm_start(
         ).start()
         return _
 
-    lax.fori_loop(0, m_end - m_start, _gather_body, 0)
+    num_rows = m_end - m_start
+    if unroll == 1:
+        lax.fori_loop(0, num_rows, _gather_body, 0)
+        return
+
+    # `unroll` rows per iteration (fewer loop branches per row), then the tail.
+    def _block(b, _):
+        for u in range(unroll):
+            _gather_body(b * unroll + u, None)
+        return _
+
+    num_blocks = num_rows // unroll
+    lax.fori_loop(0, num_blocks, _block, 0)
+    lax.fori_loop(num_blocks * unroll, num_rows, _gather_body, 0)
 
 
 @jax.named_scope("dma_gather_gm_wait")

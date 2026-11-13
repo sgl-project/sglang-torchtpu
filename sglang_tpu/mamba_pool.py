@@ -40,6 +40,7 @@ import msgspec
 import torch
 
 from sglang.srt.compilation.compiled_op import compiled_op
+from sglang.srt.configs.inkling import InklingConvStateShape
 from sglang.srt.configs.mamba_utils import (
     BaseLinearStateParams,
     KimiLinearStateShape,
@@ -99,6 +100,39 @@ def checkpoint_snapshot_pairs(
     return src, dst, valid.sum(dtype=torch.int32).reshape(1)
 
 
+def read_state_rows(state: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    """``state[rows]`` for in-range ``rows``, without touching the rest of the pool."""
+    if state.device.type != "tpu":
+        return state.index_select(0, rows.long())
+    from sglang_tpu.mamba_state_rows import state_row_read_op
+
+    pool, out = state_row_read_op()(state, rows.to(torch.int32))
+    state.copy_(pool)
+    return out
+
+
+def write_state_rows(
+    state: torch.Tensor, rows: torch.Tensor, new: torch.Tensor, live: torch.Tensor
+) -> None:
+    """Write ``new`` [len(rows), ...] into ``rows`` of ``state`` in place, skipping dead rows.
+
+    Live rows must be distinct. On TPU the rows are DMAed into the donated pool:
+    an XLA scatter relayouts the whole pool per call, scaling with the slot count.
+    """
+    new = new.reshape(rows.shape[0], *state.shape[1:]).to(state.dtype)
+    if state.device.type == "tpu":
+        from sglang_tpu.mamba_state_rows import state_row_write_op
+
+        state.copy_(
+            state_row_write_op()(state, rows.to(torch.int32), live.to(torch.int32), new)
+        )
+        return
+    # Dead rows rewrite the null slot with its own value, keeping the scatter deterministic.
+    rows = torch.where(live, rows, 0).long()
+    live = live.view(-1, *([1] * (state.dim() - 1)))
+    state.index_copy_(0, rows, torch.where(live, new, state[:1]))
+
+
 class TpuPerLayerState(msgspec.Struct, frozen=True):
     """GDN state held as one independent tensor per layer.
 
@@ -113,13 +147,13 @@ class TpuPerLayerState(msgspec.Struct, frozen=True):
     """
 
     conv: List[List[torch.Tensor]]  # [state_kind][layer]
-    temporal: List[torch.Tensor]  # [layer]
+    temporal: List[torch.Tensor]  # [layer]; empty for conv-only models
 
     def at_layer_idx(self, layer: int) -> "MambaPool.State":
         # A list index, not a tensor slice: the result owns its storage.
         return MambaPool.State(
             conv=[per_layer[layer] for per_layer in self.conv],
-            temporal=self.temporal[layer],
+            temporal=self.temporal[layer] if self.temporal else None,
         )
 
     def mem_usage_bytes(self) -> int:
@@ -182,9 +216,10 @@ class TpuMambaPool(MambaPool):
                 "Page-major envelope mamba layout is CUDA-only; not supported on TPU."
             )
 
-        # (conv_dim, K-1) per conv kind; Kimi already stores (K-1, conv_dim).
+        # (conv_dim, K-1) per conv kind; Kimi and Inkling store (K-1, conv_dim).
         conv_state_shapes = cache_params.shape.conv
-        if isinstance(cache_params.shape, KimiLinearStateShape):
+        conv_rows_first = (KimiLinearStateShape, InklingConvStateShape)
+        if isinstance(cache_params.shape, conv_rows_first):
             conv_state_shapes = [(dim, km1) for km1, dim in conv_state_shapes]
         # temporal (GPU layout): (num_v_heads, head_dim=d_v, state_size=d_k)
         n_v, d_v, d_k = cache_params.shape.temporal
@@ -192,7 +227,12 @@ class TpuMambaPool(MambaPool):
         num_mamba_layers = len(mamba_layer_ids)
         # Read by the inherited P/D state-registration helpers.
         self.mamba_layer_ids = list(mamba_layer_ids)
-        self.conv_shard_groups = cache_params.shape.conv_shard_groups
+        # Inkling's conv streams are not sharded in groups; its shape has no such field.
+        self.conv_shard_groups = (
+            None
+            if isinstance(cache_params.shape, InklingConvStateShape)
+            else cache_params.shape.conv_shard_groups
+        )
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -251,13 +291,14 @@ class TpuMambaPool(MambaPool):
 
         # recurrent: kernel-native [state_slots, n_v, d_k, d_v] per layer
         # (GPU stores [..., n_v, d_v, d_k]; we swap the trailing two axes).
+        # A conv-only model (temporal (0, 0, 0)) keeps no recurrent state.
         temporal_state = [
             torch.zeros(
                 (state_slots, n_v, d_k, d_v),
                 dtype=ssm_dtype,
                 device=device,
             )
-            for _ in range(num_mamba_layers)
+            for _ in range(num_mamba_layers if n_v * d_v * d_k else 0)
         ]
 
         self.mamba_cache = TpuPerLayerState(conv=conv_state, temporal=temporal_state)
@@ -269,7 +310,7 @@ class TpuMambaPool(MambaPool):
             num_mamba_layers,
             list(conv_state[0][0].shape),
             "" if len(conv_state) == 1 else f" x{len(conv_state)}",
-            list(temporal_state[0].shape),
+            list(temporal_state[0].shape) if temporal_state else None,
             self.mem_usage,
         )
 
@@ -416,7 +457,8 @@ class TpuMambaPool(MambaPool):
         """Install a list laid out like get_state."""
         num_layers = self.num_mamba_layers
         num_kinds = len(self.mamba_cache.conv)
-        assert len(state) == (num_kinds + 1) * num_layers, len(state)
+        num_temporal = len(self.mamba_cache.temporal)
+        assert len(state) == num_kinds * num_layers + num_temporal, len(state)
         self.mamba_cache = TpuPerLayerState(
             conv=[
                 state[kind * num_layers : (kind + 1) * num_layers]
@@ -515,6 +557,8 @@ class TpuMambaPool(MambaPool):
         for conv in self.mamba_cache.conv:
             for tensor, layer_id in zip(conv, self.mamba_layer_ids, strict=True):
                 yield "conv", tensor, 2, layer_id
+        if not self.mamba_cache.temporal:
+            return
         for tensor, layer_id in zip(
             self.mamba_cache.temporal, self.mamba_layer_ids, strict=True
         ):

@@ -27,8 +27,11 @@ def causal_conv1d(
     conv_weight: jax.Array,  # [prev_kernel_size, 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     cfg: config.GDNConfig,
+    dyn: jax.Array | None = None,  # [seq, chunk, 1, kernel_size * dim_size]
 ) -> tuple[jax.Array, jax.Array]:
     """Perform causal Conv1D. Returns Conv1D output and convolution states.
+
+    With `dyn`, token c's tap k weighs `conv_weight[k] + dyn[:, c, :, k * dim_size:]`.
 
     States are [seq, window_size, prev_kernel_size, q, dim_size]: checkpoint
     w holds the last prev_kernel_size inputs ending at token
@@ -47,7 +50,11 @@ def causal_conv1d(
         start_idx = 1 + end_idx - cfg.kernel_size
         for k in range(cfg.kernel_size):
             lhs_curr = lhs[:, start_idx + k]
-            out += lhs_curr * conv_weight[k : k + 1]
+            weight = conv_weight[k : k + 1]
+            if dyn is not None:
+                lanes = slice(k * cfg.dim_size, (k + 1) * cfg.dim_size)
+                weight = weight + dyn[:, c_idx, :, lanes]
+            out += lhs_curr * weight
 
         if conv_bias is not None:
             out += conv_bias.reshape(1, 1, -1)

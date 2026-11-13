@@ -240,7 +240,8 @@ def direct_compile(
 
     `kv_pool` exposes every KV-cache Tensor through `get_state`; all of
     them are assumed to be mutated during inference and are copied back
-    after execution. Explicit function inputs must be immutable.
+    after execution. Their input buffers are donated (see
+    `_donated_kv_pool_inputs`). Explicit function inputs must be immutable.
 
     Common problems/assumptions:
 
@@ -780,6 +781,9 @@ class CompiledFunction:
             argument_layouts.append(layout[0] if layout is not None else [])
         if rng_device is not None:
             argument_layouts.append([])
+        donated_inputs = _donated_kv_pool_inputs(
+            flat_inputs, len(model_inputs), len(kv_pool_inputs)
+        )
         callbacks = tuple(entry.callback for entry in inserted_callbacks)
         if spmd_compiler is not None and not spmd_compiler.verify_spmd_safe:
             factories = tuple(entry.callback_factory for entry in inserted_callbacks)
@@ -801,9 +805,6 @@ class CompiledFunction:
             )
         pending_compile = None
         executable = None
-        donated_inputs = list(
-            range(len(model_inputs), len(model_inputs) + len(kv_pool_inputs))
-        )
         start = time.perf_counter()
         if async_compile:
             with dynamo_timed("direct_compile_async_submit"):
@@ -854,6 +855,30 @@ class CompiledFunction:
             pending_compile=pending_compile,
             rng_device=rng_device,
         )
+
+
+def _donated_kv_pool_inputs(
+    inputs: Sequence[torch.Tensor], start: int, count: int
+) -> list[int]:
+    """Argument indices of the KV-pool inputs to donate.
+
+    A pool tensor takes its output buffer after each call, so donating lets XLA
+    update it in place instead of copying the whole tensor every call. Views and
+    tensors whose storage another input also reads keep their buffers.
+    """
+
+    def storage_key(tensor: torch.Tensor) -> int:
+        return id(tensor._base if tensor._base is not None else tensor)
+
+    uses: dict[int, int] = {}
+    for tensor in inputs:
+        key = storage_key(tensor)
+        uses[key] = uses.get(key, 0) + 1
+    return [
+        index
+        for index in range(start, start + count)
+        if inputs[index]._base is None and uses[storage_key(inputs[index])] == 1
+    ]
 
 
 def _tensor_specs(tensors: Sequence[torch.Tensor]) -> tuple[InputSpec, ...]:

@@ -127,6 +127,22 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                         platform_cls().supports_mamba_prefix_cache(model), expected
                     )
 
+    def test_inkling2_writes_checkpoints_other_conv_models_do_not(self):
+        """Inkling2's sconv backend writes the snapshot plan; another mamba2-family
+        model has no TPU backend that does, so its radix cache must stay rejected."""
+        from sglang.srt.configs import NemotronHConfig
+        from sglang.tml.config import Inkling2MMConfig
+
+        cases = ((Inkling2MMConfig(), True), (NemotronHConfig(), False))
+        for hf_config, expected in cases:
+            model = SimpleNamespace(hf_config=hf_config, is_draft_model=False)
+            for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
+                name = platform_cls.__name__
+                with self.subTest(platform=name, model=type(hf_config).__name__):
+                    self.assertEqual(
+                        platform_cls().supports_mamba_prefix_cache(model), expected
+                    )
+
     def test_state_offload_needs_a_dma_io_backend(self):
         """Only a DMA engine moves TPU's per-layer kernel-layout states to host."""
         for io_backend, rejects in (("raiden", False), ("torch_tpu", True)):

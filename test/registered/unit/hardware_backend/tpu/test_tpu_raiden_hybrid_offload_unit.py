@@ -632,6 +632,181 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
         # Transfer layer 4 (after layers 0-3) is the draft, host layer 2.
         self.assertEqual(kv_entry.layer_mapper(4), 2)
 
+    def test_swa_state_strategy_takes_swa_pools_with_state_under_a_dma_engine(self):
+        """A hybrid SWA model with mamba-pool state (Inkling2) has an SWAKVPool and
+        three components; the built-in stack would read its states with the CUDA
+        MambaPoolHost, so the TPU stack must win exactly there."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang_tpu.hybrid_linear_hicache import TpuDmaMambaSwaStrategy
+
+        swa = object.__new__(SWAKVPool)
+        hybrid = object.__new__(HybridLinearKVPool)
+        full, swa_c, mamba = ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA
+        cases = (
+            ("raiden", swa, {full, swa_c, mamba}, True),
+            ("torch_tpu", swa, {full, swa_c, mamba}, False),
+            ("raiden", swa, {full, swa_c}, False),
+            ("raiden", hybrid, {full, swa_c, mamba}, False),
+        )
+        for io_backend, kvcache, components, expected in cases:
+            with (
+                self.subTest(io_backend=io_backend, kvcache=type(kvcache).__name__),
+                patch(
+                    "sglang_tpu.hybrid_linear_hicache.get_memory",
+                    return_value=SimpleNamespace(hicache_io_backend=io_backend),
+                ),
+            ):
+                self.assertEqual(
+                    TpuDmaMambaSwaStrategy().matches(kvcache, components), expected
+                )
+
+    @staticmethod
+    def _swa_state_stack_fixture(drafts):
+        from sglang_tpu import hybrid_linear_hicache
+
+        memory = SimpleNamespace(
+            hicache_io_backend="raiden",
+            hicache_size=0,
+            hicache_ratio=2,
+            hicache_mem_layout="page_first_fused",
+            hicache_write_policy="write_through",
+            hicache_host_memory_mode=None,
+            enable_unified_memory=False,
+        )
+        kvcache = SimpleNamespace(
+            start_layer=0,
+            layers_mapping={0: (0, False), 1: (0, True), 2: (1, True)},
+            full_kv_pool=SimpleNamespace(layer_num=1, size=1024),
+            swa_kv_pool=SimpleNamespace(layer_num=2, size=256),
+        )
+        allocator = SimpleNamespace(alloc=MagicMock(), free=MagicMock())
+        params = SimpleNamespace(
+            mtp_draft_device_pools=drafts,
+            req_to_token_pool=SimpleNamespace(
+                mamba_pool=object(), mamba_map={0: 0, 1: 1}, mamba_allocator=allocator
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(swa_attn_allocator=allocator),
+            tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        host_cls = MagicMock(side_effect=lambda *a, **kw: MagicMock(kw=kw))
+        patches = (
+            patch.object(hybrid_linear_hicache, "get_memory", return_value=memory),
+            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            patch(
+                "sglang_tpu.kv_pool_host.tpu_dma_host_kv_pool_cls",
+                return_value=host_cls,
+            ),
+            patch(
+                "sglang_tpu.kv_pool_host.tpu_dma_mamba_pool_host_cls",
+                return_value=MagicMock(return_value=MagicMock(name="state_host")),
+            ),
+            patch.object(
+                hybrid_linear_hicache.TpuDmaMambaSwaStrategy, "cache_controller_cls"
+            ),
+        )
+
+        def build():
+            return hybrid_linear_hicache.TpuDmaMambaSwaStrategy().build(
+                cache=SimpleNamespace(page_size=128),
+                kvcache=kvcache,
+                params=params,
+                server_args=None,
+                load_cache_event=None,
+            )
+
+        return patches, build, kvcache
+
+    def test_swa_state_strategy_builds_dma_state_pool_and_controller(self):
+        from contextlib import ExitStack
+
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        patches, build, _ = self._swa_state_stack_fixture(())
+        with ExitStack() as stack:
+            mocks = [stack.enter_context(p) for p in patches]
+            result = build()
+        self.assertIs(result.cache_controller, mocks[-1].return_value)
+        self.assertIs(
+            result.component_host_pools[ComponentType.MAMBA],
+            mocks[3].return_value.return_value,
+        )
+        self.assertEqual(
+            set(result.host_pool_group.entry_map),
+            {PoolName.KV, PoolName.SWA, PoolName.MAMBA},
+        )
+        for name, label in ((PoolName.KV, "full"), (PoolName.SWA, "swa")):
+            entry = result.host_pool_group.entry_map[name]
+            self.assertEqual(entry.packed_draft_device_pools, ())
+            self.assertEqual(entry.host_pool.kw["pool_label"], label)
+            self.assertEqual(entry.host_pool.kw["mtp_draft_device_pools"], ())
+
+    def test_swa_state_strategy_packs_a_hybrid_draft_on_kv_and_swa_pages(self):
+        """A DSPARK draft whose window layers live in its own SWA sub-pool (slots
+        translated through the target's mapping) rides both target host pools, so a
+        host hit restores the draft KV of the prefix with the target's."""
+        from contextlib import ExitStack
+
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        draft = object.__new__(SWAKVPool)
+        draft.full_kv_pool = SimpleNamespace(layer_num=1, size=1024)
+        draft.swa_kv_pool = SimpleNamespace(layer_num=2, size=256)
+        patches, build, kvcache = self._swa_state_stack_fixture((draft,))
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            result = build()
+        kv_entry = result.host_pool_group.entry_map[PoolName.KV]
+        swa_entry = result.host_pool_group.entry_map[PoolName.SWA]
+        self.assertEqual(kv_entry.packed_draft_device_pools, (draft.full_kv_pool,))
+        self.assertEqual(swa_entry.packed_draft_device_pools, (draft.swa_kv_pool,))
+        self.assertEqual(
+            kv_entry.host_pool.kw["mtp_draft_device_pools"], (draft.full_kv_pool,)
+        )
+        self.assertEqual(
+            swa_entry.host_pool.kw["mtp_draft_device_pools"], (draft.swa_kv_pool,)
+        )
+        # Transfer layer 3 (after target layers 0-2) is the draft, after each pool.
+        self.assertEqual(kv_entry.layer_mapper(3), kvcache.full_kv_pool.layer_num)
+        self.assertEqual(swa_entry.layer_mapper(3), kvcache.swa_kv_pool.layer_num)
+
+    def test_swa_state_strategy_rejects_a_draft_swa_pool_off_the_target_slots(self):
+        from contextlib import ExitStack
+
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        draft = object.__new__(SWAKVPool)
+        draft.full_kv_pool = SimpleNamespace(layer_num=1, size=1024)
+        draft.swa_kv_pool = SimpleNamespace(layer_num=2, size=1024)
+        patches, build, _ = self._swa_state_stack_fixture((draft,))
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            with self.assertRaisesRegex(NotImplementedError, "sized like the target"):
+                build()
+
+    def test_swa_state_strategy_drops_empty_draft_sub_pools(self):
+        from contextlib import ExitStack
+
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        draft = object.__new__(SWAKVPool)
+        draft.full_kv_pool = SimpleNamespace(layer_num=0, size=1024)
+        draft.swa_kv_pool = SimpleNamespace(layer_num=2, size=256)
+        patches, build, _ = self._swa_state_stack_fixture((draft,))
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            result = build()
+        entries = result.host_pool_group.entry_map
+        self.assertEqual(entries[PoolName.KV].packed_draft_device_pools, ())
+        self.assertEqual(
+            entries[PoolName.SWA].packed_draft_device_pools, (draft.swa_kv_pool,)
+        )
+
     def test_split_pool_host_sizing_matches_its_allocation(self):
         """A host page holds every DSA buffer of the page, so host bytes per token
         must equal what the device pool allocates per token."""
@@ -682,6 +857,57 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
                 else:
                     with self.assertRaisesRegex(ValueError, error):
                         call()
+
+
+class TestPackedDraftPlan(CustomTestCase):
+    """A block draft over a hybrid SWA + state target packs onto the target pages
+    instead of the sidecar path, which carries only the draft's SWA layers."""
+
+    @staticmethod
+    def _runner(*, mamba=True):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        return SimpleNamespace(
+            token_to_kv_pool=object.__new__(SWAKVPool),
+            req_to_token_pool=SimpleNamespace(mamba_pool=object() if mamba else None),
+            mtp_draft_device_pools=(),
+        )
+
+    def _plan(self, runner, base_plan, io_backend="raiden"):
+        from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+        from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+
+        class _Worker(TpuSpecWorker):
+            pass
+
+        _Worker.__abstractmethods__ = frozenset()
+        worker = object.__new__(_Worker)
+        worker._target_worker = SimpleNamespace(model_runner=runner)
+        with (
+            patch.object(
+                BaseSpecWorker, "_build_hicache_draft_plan", return_value=base_plan
+            ),
+            patch(
+                "sglang_tpu.hybrid_linear_hicache.get_memory",
+                return_value=SimpleNamespace(hicache_io_backend=io_backend),
+            ),
+        ):
+            return worker._build_hicache_draft_plan()
+
+    def test_hybrid_draft_over_swa_state_target_is_packed(self):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.speculative.base_spec_worker import (
+            HiCacheDraftMode,
+            HiCacheDraftPlan,
+        )
+
+        draft = object.__new__(SWAKVPool)
+        sidecar = HiCacheDraftPlan(HiCacheDraftMode.SIDECAR, (draft,))
+        runner = self._runner()
+        plan = self._plan(runner, sidecar)
+        self.assertEqual(plan.mode, HiCacheDraftMode.PACKED)
+        self.assertEqual(plan.device_pools, (draft,))
+        self.assertEqual(runner.mtp_draft_device_pools, (draft,))
 
 
 class TestRecurrentStateGate(CustomTestCase):
@@ -906,6 +1132,63 @@ class TestDraftSidecarPlatformHook(CustomTestCase):
         fake_platform.get_mha_kv_pool_host_cls.assert_called_once_with(pool)
         self.assertIsInstance(host_pool, _RecordingPool)
         self.assertEqual(built["kwargs"]["pool_label"], "draft")
+
+
+class TestStateSlotOffload(CustomTestCase):
+    """Compiled forwards rebind the state tensors to new device buffers, so state
+    slots move through the tensors live at transfer time, every stream of a slot."""
+
+    DIMS = (4, 4, 2, 8)
+
+    def _pool(self):
+        from sglang.srt.configs.inkling import (
+            InklingConvCacheParams,
+            InklingConvStateShape,
+        )
+        from sglang_tpu.mamba_pool import TpuMambaPool
+
+        cp = InklingConvCacheParams(
+            shape=InklingConvStateShape(
+                conv=[(3, d) for d in self.DIMS], temporal=(0, 0, 0)
+            ),
+            layers=[0, 1],
+        )
+        return TpuMambaPool(
+            size=6,
+            spec_state_size=2,
+            cache_params=cp,
+            mamba_layer_ids=[0, 1],
+            device="cpu",
+        )
+
+    @staticmethod
+    def _rebind(pool):
+        pool.set_state([t.clone() for t in pool.get_state()])
+
+    def test_round_trip_reads_and_writes_the_live_tensors(self):
+        from sglang_tpu.kv_pool_host import StateSlotTransfer, TpuDMAMambaPoolHost
+
+        pool = self._pool()
+        host = TpuDMAMambaPoolHost(pool, 2.0, 0)
+        self.assertIsInstance(host.transfer, StateSlotTransfer)
+        # Rebound after the host pool bound its transfer, as by a serving forward.
+        self._rebind(pool)
+        for i, t in enumerate(pool.get_state()):
+            for slot in (1, 2, 3):
+                t[slot].fill_(100 * slot + i)
+        host_slots = host.alloc(3)
+        host.backup_from_device_all_layer(
+            pool, host_slots, torch.tensor([3, 1, 2]), "raiden"
+        ).synchronize()
+        self._rebind(pool)
+        for t in pool.get_state():
+            t.zero_()
+        host.load_all_layer(pool, host_slots, torch.tensor([6, 4, 5])).synchronize()
+        for i, t in enumerate(pool.get_state()):
+            for src, dst in ((3, 6), (1, 4), (2, 5)):
+                self.assertTrue(torch.all(t[dst] == 100 * src + i), (i, dst))
+            for untouched in (0, 1, 2, 3):
+                self.assertTrue(torch.all(t[untouched] == 0), (i, untouched))
 
 
 class TestDispatch(CustomTestCase):

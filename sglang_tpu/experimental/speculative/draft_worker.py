@@ -28,6 +28,9 @@ class TpuDraftWorker(ABC):
     """
 
     num_drafts: int
+    # True: one fused full-attention pool for every draft layer; sliding-window
+    # layers keep every token and apply their window as an attention mask.
+    requires_full_kv_pool = False
 
     def __init__(self, target_runner: ModelRunner) -> None:
         self._target_runner = target_runner
@@ -42,6 +45,10 @@ class TpuDraftWorker(ABC):
             # The draft runs at absolute target positions.
             context_length=target_runner.model_config.context_len,
         )
+        if self.requires_full_kv_pool:
+            model_config.is_hybrid_swa = False
+            model_config.swa_attention_layer_ids = None
+            model_config.full_attention_layer_ids = None
         # FIXME(junyanxu): ModelRunner requires gpu_id / nccl_port, which TPU never reads;
         # drop the placeholders once core makes them optional.
         with self.draft_context():

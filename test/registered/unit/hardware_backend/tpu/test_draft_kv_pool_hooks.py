@@ -96,12 +96,21 @@ class TestDraftCellSizeHook(CustomTestCase):
             2 * 256 * 5 * 2,
         )
 
-    def test_non_fused_or_unresolved_backend_keeps_generic(self):
-        for backend in (None, "pallas_tpu_flash"):
-            with self.subTest(backend=backend):
-                self.assertEqual(
-                    self._cell_size(backend, self._config()), 2 * 128 * 5 * 2
-                )
+    def test_non_fused_backend_keeps_generic(self):
+        self.assertEqual(
+            self._cell_size("pallas_tpu_flash", self._config()), 2 * 128 * 5 * 2
+        )
+
+    def test_unresolved_backend_prices_the_target_pool(self):
+        """With no draft backend the draft allocates the target's pool class;
+        pricing the generic layout undercounted a fused fp8 pool by 2x."""
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        with patch(
+            "sglang.srt.platforms.current_platform.get_mha_kv_pool_cls",
+            return_value=TpuFusedMHATokenToKVPool,
+        ):
+            self.assertEqual(self._cell_size(None, self._config()), 2 * 2 * 128 * 5 * 2)
 
 
 if __name__ == "__main__":

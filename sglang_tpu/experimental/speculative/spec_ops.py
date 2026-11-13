@@ -110,6 +110,7 @@ def select_verify_rows(
     committed_lens: torch.Tensor,
     seq_lens: torch.Tensor,
     num_rows: int | None = None,
+    swa_verify_cache_candidates: torch.Tensor | None = None,
 ) -> VerifyRows:
     """Select active rows; the worker warms its capacity/width combinations."""
     if num_rows is None:
@@ -119,11 +120,20 @@ def select_verify_rows(
     )
     offsets = torch.arange(num_rows, device=seq_lens.device, dtype=seq_lens.dtype)
     positions = seq_lens[:, None] + offsets
+    swa_cache_locs = None
+    if swa_verify_cache_candidates is not None:
+        swa_cache_locs = select_dflash_verify_cache_locs_tpu(
+            swa_verify_cache_candidates, seq_lens, committed_lens, num_rows
+        )
     return VerifyRows(
         positions=positions,
         cache_locs=cache_locs,
         flat_positions=positions.reshape(-1),
         flat_cache_locs=cache_locs.reshape(-1),
+        swa_cache_locs=swa_cache_locs,
+        swa_flat_cache_locs=None
+        if swa_cache_locs is None
+        else swa_cache_locs.reshape(-1),
     )
 
 
@@ -376,8 +386,8 @@ def _accept_drafts_rejection_sampling(
     p_draft = torch.where(vocab_onehot, p[:, :n], 0).sum(-1)
     q_draft = torch.where(vocab_onehot, q, 0).sum(-1)
     u = hash_uniforms(rng_step, _STREAM_ACCEPT, tuple(p_draft.shape))
-    # u <= p / q without dividing by q.
-    sample_ok = (u * q_draft <= p_draft) & verify_mask
+    # u <= p / q without dividing by q; p = 0 (a grammar-masked draft) never passes.
+    sample_ok = (u * q_draft <= p_draft) & (p_draft > 0) & verify_mask
     sample_num_correct = _leading_true(sample_ok)
 
     p_at = pick(p, sample_num_correct)
@@ -595,8 +605,10 @@ def accept_drafts_target_only(
     p_draft = torch.where(draft_tokens[..., None] == vocab, p[:, :n], 0).sum(-1)
     u = hash_uniforms(rng_step, _STREAM_ACCEPT, tuple(p_draft.shape))
     sample_ok = (
-        (u * threshold_acc <= p_draft) | (p_draft >= threshold_single)
-    ) & verify_mask
+        ((u * threshold_acc <= p_draft) | (p_draft >= threshold_single))
+        & (p_draft > 0)
+        & verify_mask
+    )
     sample_num_correct = _leading_true(sample_ok)
 
     p_at = pick(p, sample_num_correct)
@@ -615,6 +627,20 @@ def accept_drafts_target_only(
         torch.where(greedy, greedy_num_correct, sample_num_correct),
         torch.where(greedy, greedy_bonus, sample_bonus),
     )
+
+
+@compiled_op()
+def apply_grammar_bitmask(
+    target_logits: torch.Tensor, bitmask: torch.Tensor
+) -> torch.Tensor:
+    """target_logits [rows, V] with -inf where the packed int32 bitmask [rows, ceil(V / 32)] bit is 0.
+
+    The owning worker warms it per (batch bucket, verify width).
+    """
+    vocab = target_logits.shape[-1]
+    shifts = torch.arange(32, device=bitmask.device, dtype=bitmask.dtype)
+    allowed = ((bitmask[:, :, None] >> shifts) & 1).bool().flatten(1)[:, :vocab]
+    return target_logits.masked_fill(~allowed, float("-inf"))
 
 
 @compiled_op(warmup=lambda ctx: _finalize_warmup_args(ctx))
@@ -961,3 +987,17 @@ def _exponential_race(weights: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
     """argmax(w / E), E = -log(u) ~ Exp(1), for uniforms u shaped like weights."""
     noise = torch.log(u.clamp_min(torch.finfo(torch.float32).tiny)).neg_()
     return torch.argmax(weights / noise, dim=-1)
+
+
+@compiled_op(
+    warmup=lambda ctx: (
+        torch.zeros((ctx.physical_bs,), dtype=torch.int32, device=ctx.device),
+        ctx.num_verify_tokens,
+    )
+)
+def verify_last_rows(
+    accept_lens: torch.Tensor, width: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flat verify row of each request's last committed token, and whether it committed any."""
+    base = torch.arange(accept_lens.shape[0], device=accept_lens.device) * width
+    return base + (accept_lens - 1).clamp(min=0), accept_lens > 0

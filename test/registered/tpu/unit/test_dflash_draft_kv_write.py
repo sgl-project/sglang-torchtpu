@@ -349,6 +349,89 @@ class TestDflashDraftKvWrite(CustomTestCase):
             *self._run_both(cache_loc=cache_loc, positions=positions)
         )
 
+    def _make_hybrid_pool(self, *, swa_layer_ids, full_layer_ids, mapping):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        pool = SWAKVPool(
+            size=NUM_PAGES * PAGE_SIZE,
+            size_swa=NUM_PAGES * PAGE_SIZE // 2,
+            page_size=PAGE_SIZE,
+            dtype=DTYPE,
+            head_num=KV_HEADS,
+            head_dim=HEAD_DIM,
+            swa_attention_layer_ids=swa_layer_ids,
+            full_attention_layer_ids=full_layer_ids,
+            device=DEVICE,
+            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+            enable_memory_saver=False,
+        )
+        pool.register_mapping(mapping)
+        return pool
+
+    def test_hybrid_pool_routes_window_layers_to_the_swa_pool(self):
+        """Window layers of a hybrid draft land in the SWA sub-pool at the
+        translated slots; the global layers stay in the full pool."""
+        from sglang_tpu.dflash_draft_kv_write import (
+            dflash_write_draft_kv,
+            dflash_write_draft_kv_ref,
+            translate_draft_swa_locs,
+        )
+
+        swa_layer_ids, full_layer_ids = [0, 1, 3, 4, 5, 6], [2, 7]
+        num_tokens = 300
+        cache_loc = _extend_cache_loc(head_offset=91, num_tokens=num_tokens)
+        positions = torch.arange(num_tokens, dtype=torch.int64, device=DEVICE)
+        # Page-granular full-to-SWA map, as the SWA allocator keeps it: full page p
+        # lives in SWA page (p * 11 + 3) % (NUM_PAGES // 2); -1 sentinel last.
+        full_pages = torch.arange(NUM_PAGES)
+        swa_pages = (full_pages * 11 + 3) % (NUM_PAGES // 2)
+        mapping = (
+            swa_pages[:, None] * PAGE_SIZE + torch.arange(PAGE_SIZE)[None, :]
+        ).reshape(-1)
+        mapping = torch.cat([mapping, torch.tensor([-1])]).to(torch.int64)
+        ctx_hidden = torch.randn((num_tokens, HIDDEN), dtype=DTYPE, device=DEVICE)
+
+        pools = [
+            self._make_hybrid_pool(
+                swa_layer_ids=swa_layer_ids,
+                full_layer_ids=full_layer_ids,
+                mapping=mapping,
+            )
+            for _ in range(2)
+        ]
+        swa_loc, _ = translate_draft_swa_locs(pools[0], cache_loc.cpu(), None)
+        swa_loc = swa_loc.to(DEVICE)
+        _compiled(
+            dflash_write_draft_kv,
+            draft_model=self.draft_model,
+            kv_pool=pools[0],
+            max_num_reqs=MAX_NUM_REQS,
+        )(
+            ctx_hidden=ctx_hidden,
+            ctx_positions=positions,
+            ctx_cache_loc=cache_loc,
+            cache_loc_2d=None,
+            commit_lens=None,
+            swa_cache_loc=swa_loc,
+            swa_cache_loc_2d=None,
+        )
+        _compiled(
+            dflash_write_draft_kv_ref, draft_model=self.draft_model, kv_pool=pools[1]
+        )(
+            ctx_hidden=ctx_hidden,
+            ctx_positions=positions,
+            ctx_cache_loc=cache_loc,
+            swa_cache_loc=swa_loc,
+        )
+        torch.accelerator.synchronize()
+        for layer in range(LAYERS):
+            idx, is_swa = pools[0].layers_mapping[layer]
+            sub = lambda pool: pool.swa_kv_pool if is_swa else pool.full_kv_pool  # noqa: E731
+            got = sub(pools[0]).get_fused_kv_buffer(idx).to("cpu", torch.float32)
+            want = sub(pools[1]).get_fused_kv_buffer(idx).to("cpu", torch.float32)
+            torch.testing.assert_close(got, want, atol=3e-2, rtol=3e-2, msg=f"L{layer}")
+
     def test_verify_leaves_uncommitted_slots_untouched(self):
         """The fused path skips uncommitted tokens; the reference dumps them on slot 0.
 

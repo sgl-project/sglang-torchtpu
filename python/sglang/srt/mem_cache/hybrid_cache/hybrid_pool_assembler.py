@@ -1281,6 +1281,31 @@ def build_hybrid_mamba_stack(
     return host_pool_group, cache_controller
 
 
+def _split_packed_swa_drafts(
+    drafts: tuple[Any, ...], swa_kv_pool: Any
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Packed draft sub-pools that ride (target full pages, target SWA pages)."""
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    full, swa = [], []
+    for pool in drafts:
+        if not isinstance(pool, SWAKVPool):
+            full.append(pool)
+            continue
+        # Draft window layers must address the target's SWA slots to share its pages.
+        if pool.swa_kv_pool.size != swa_kv_pool.size:
+            raise NotImplementedError(
+                "A packed hybrid draft needs its SWA pool sized like the target's "
+                f"({pool.swa_kv_pool.size} vs {swa_kv_pool.size} tokens)."
+            )
+        full.append(pool.full_kv_pool)
+        swa.append(pool.swa_kv_pool)
+    return (
+        tuple(p for p in full if p.layer_num > 0),
+        tuple(p for p in swa if p.layer_num > 0),
+    )
+
+
 def build_hybrid_mamba_swa_stack(
     *,
     params: CacheInitParams,
@@ -1305,6 +1330,9 @@ def build_hybrid_mamba_swa_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    kv_host_pool_fn: Optional[Callable[..., Any]] = None,
+    mamba_host_pool_fn: Optional[Callable[..., Any]] = None,
+    cache_controller_cls: type = HybridCacheController,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_id_max = (
         max(
@@ -1314,6 +1342,9 @@ def build_hybrid_mamba_swa_stack(
         )
         + 1
     )
+    full_drafts, swa_drafts = _split_packed_swa_drafts(
+        params.mtp_draft_device_pools, swa_kv_pool
+    )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
@@ -1321,42 +1352,69 @@ def build_hybrid_mamba_swa_stack(
         kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
         )
-    kv_host_pool = build_kv_host_pool(
-        kv_pool=full_kv_pool,
-        page_size=page_size,
-        use_mla=False,
-        host_size=kv_host_size,
-        pool_label="full",
-    )
-    swa_host_pool = build_kv_host_pool(
-        kv_pool=swa_kv_pool,
-        page_size=page_size,
-        use_mla=False,
-        host_size=swa_host_size,
-        pool_label="swa",
-    )
-    mamba_host_pool = MambaPoolHost(
-        mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(),
-        layout=get_memory().hicache_mem_layout,
-    )
+
+    def kv_host(kv_pool, host_size, drafts, pool_label):
+        if kv_host_pool_fn is None:
+            return build_kv_host_pool(
+                kv_pool=kv_pool,
+                page_size=page_size,
+                use_mla=False,
+                host_size=host_size,
+                mtp_draft_device_pools=drafts,
+                pool_label=pool_label,
+            )
+        return kv_host_pool_fn(
+            kv_pool=kv_pool,
+            page_size=page_size,
+            host_size=host_size,
+            mtp_draft_device_pools=drafts,
+            pool_label=pool_label,
+        )
+
+    kv_host_pool = kv_host(full_kv_pool, kv_host_size, full_drafts, "full")
+    swa_host_pool = kv_host(swa_kv_pool, swa_host_size, swa_drafts, "swa")
+    if full_drafts:
+        full_layer_mapping = with_packed_draft_layer_mapping(
+            full_layer_mapping,
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=full_kv_pool.layer_num,
+            draft_layer_num=len(full_drafts),
+        )
+    if swa_drafts:
+        swa_layer_mapping = with_packed_draft_layer_mapping(
+            swa_layer_mapping,
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=swa_kv_pool.layer_num,
+            draft_layer_num=len(swa_drafts),
+        )
+    if mamba_host_pool_fn is None:
+        mamba_host_pool = MambaPoolHost(
+            mamba_pool,
+            get_memory().hicache_ratio,
+            mamba_host_size,
+            allocator_type=_get_allocator_type(),
+            layout=get_memory().hicache_mem_layout,
+        )
+    else:
+        mamba_host_pool = mamba_host_pool_fn(
+            mamba_pool=mamba_pool, host_size=mamba_host_size
+        )
     entries = [
         build_pool_entry(
             name=PoolName.KV,
             host_pool=kv_host_pool,
             device_pool=full_kv_pool,
             layer_mapping=full_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max,
+            transfer_layer_id_max=transfer_layer_id_max + len(full_drafts),
             is_anchor=True,
+            packed_draft_device_pools=full_drafts,
         ),
         build_pool_entry(
             name=PoolName.SWA,
             host_pool=swa_host_pool,
             device_pool=swa_kv_pool,
             layer_mapping=swa_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max,
+            transfer_layer_id_max=transfer_layer_id_max + len(swa_drafts),
             host_evict_fn=host_swa_evict_fn,
             device_evict_fn=device_swa_evict_fn,
             **_swa_allocation_callbacks(
@@ -1368,6 +1426,7 @@ def build_hybrid_mamba_swa_stack(
                 if get_memory().enable_unified_memory
                 else None,
             ),
+            packed_draft_device_pools=swa_drafts,
         ),
         build_pool_entry(
             name=PoolName.MAMBA,
@@ -1382,7 +1441,7 @@ def build_hybrid_mamba_swa_stack(
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
+    cache_controller = cache_controller_cls(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         page_size,
@@ -1969,6 +2028,12 @@ class _SwaStrategy(StackStrategy):
 
 
 class _MambaSwaStrategy(StackStrategy):
+    # A platform whose KV or state layout the built-in host pools cannot read
+    # overrides these.
+    kv_host_pool_fn: Optional[Callable[..., Any]] = None
+    mamba_host_pool_fn: Optional[Callable[..., Any]] = None
+    cache_controller_cls: type = HybridCacheController
+
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -2023,6 +2088,9 @@ class _MambaSwaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            kv_host_pool_fn=self.kv_host_pool_fn,
+            mamba_host_pool_fn=self.mamba_host_pool_fn,
+            cache_controller_cls=self.cache_controller_cls,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,

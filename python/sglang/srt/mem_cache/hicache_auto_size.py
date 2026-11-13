@@ -61,10 +61,14 @@ def _pool_bytes(pool) -> int:
     return sum(sizes) if isinstance(sizes, tuple) else sizes
 
 
-def _draft_bytes(target, draft) -> int:
+def _draft_bytes(target, draft, *, packed: bool) -> int:
     if isinstance(draft, BaseSWAKVPool):
-        # Match sidecar construction: only SWA drafts follow target SWA slots.
-        target, draft = target.swa_kv_pool, draft.swa_kv_pool
+        # A sidecar follows target SWA slots only; a packed draft also rides full pages.
+        swa = _draft_bytes(target.swa_kv_pool, draft.swa_kv_pool, packed=packed)
+        if not packed or not isinstance(target, BaseSWAKVPool):
+            return swa
+        full = _draft_bytes(target.full_kv_pool, draft.full_kv_pool, packed=packed)
+        return swa + full
     # A sidecar has one host slot per target slot, however few slots the draft has.
     return _pool_bytes(draft) * target.size // draft.size
 
@@ -82,10 +86,10 @@ def _estimate_hicache_bytes(
     total = _pool_bytes(pool)
     if isinstance(params.req_to_token_pool, HybridReqToTokenPool):
         total += _pool_bytes(params.req_to_token_pool.mamba_pool)
-    drafts = params.mtp_draft_device_pools
+    drafts, packed = params.mtp_draft_device_pools, True
     if draft_plan is not None and draft_plan.mode == "sidecar":
-        drafts = draft_plan.device_pools
-    return total + sum(_draft_bytes(pool, draft) for draft in drafts)
+        drafts, packed = draft_plan.device_pools, False
+    return total + sum(_draft_bytes(pool, draft, packed=packed) for draft in drafts)
 
 
 @contextmanager

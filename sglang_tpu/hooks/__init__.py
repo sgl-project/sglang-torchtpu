@@ -42,6 +42,7 @@ from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import route_glm_flash_megakernel
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
+from sglang_tpu.hooks.inkling2 import inkling2_attn_backend, inkling2_swa_kv_pool
 from sglang_tpu.hooks.k3_megakernel import (
     attach_k3_megakernel,
     k3_megakernel_forward,
@@ -100,6 +101,16 @@ logger = logging.getLogger(__name__)
 # (target, hook, hook_type) triples.
 
 HOOKS: list[tuple] = [
+    (
+        "sglang.srt.layers.attention.attention_registry.attn_backend_wrapper",
+        inkling2_attn_backend,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_hybrid_swa_kv_pool",
+        inkling2_swa_kv_pool,
+        HookType.AROUND,
+    ),
     (
         "sglang.srt.utils.common.set_gpu_proc_affinity",
         bind_rank_cpu_set,

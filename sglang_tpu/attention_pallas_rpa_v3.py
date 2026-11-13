@@ -56,6 +56,9 @@ def _invoke_v3_kernel(
     v_scale,
     decode_query_size=1,
     use_causal_mask=True,
+    rel_r=None,
+    rel_proj=None,
+    token_sink=None,
 ):
     return jax_rpa(
         queries,
@@ -69,6 +72,9 @@ def _invoke_v3_kernel(
         distribution,
         None,  # custom_mask
         attention_sink,
+        rel_r,
+        rel_proj,
+        token_sink,
         causal=1 if use_causal_mask else 0,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
@@ -87,6 +93,7 @@ RPA_V3_SPEC = RpaKernelSpec(
     uses_cu_kv_lens=True,
     is_batched=False,
     supports_decode_query_size=True,
+    supports_rel_bias=True,
 )
 
 

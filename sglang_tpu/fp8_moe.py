@@ -24,6 +24,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import print_warning_once
 from sglang_tpu.envs import envs
+from sglang_tpu.moe.activation import pallas_moe_activation
 
 
 def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
@@ -584,6 +585,7 @@ def apply_tpu_fp8_moe(
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
+    activation = pallas_moe_activation(activation, layer)
     output = fused_moe_call(
         hidden_states=x,
         w1=layer.w13_weight,

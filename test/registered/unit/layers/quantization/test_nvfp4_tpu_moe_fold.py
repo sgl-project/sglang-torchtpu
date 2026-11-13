@@ -34,6 +34,8 @@ def _make_block512_layer(
     layer.moe_runner_config = types.SimpleNamespace(
         is_gated=True, activation="silu", routed_scaling_factor=None
     )
+    # Masked routing slots are spread over all experts by apply_tpu_nvfp4_moe.
+    layer.num_experts = EXPERTS
     layer.register_parameter(
         "w13_weight",
         torch.nn.Parameter(
@@ -682,6 +684,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
+        layer._tpu_w13_global_scale = layer._tpu_w2_global_scale = None
         layer.moe_ep_size = 1
         from sglang_tpu.moe.pallas import fused_moe_rs_op
 
@@ -707,7 +710,8 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertFalse(call["fp8_direct_write"])
         self.assertFalse(call["has_post_expert_norm"])
         self.assertNotIn("collective_id", call)
-        self.assertEqual(call["topk_ids"][1, 1].item(), 0)
+        # A masked slot becomes a real expert id with weight 0 (spread, not expert 0).
+        self.assertTrue(0 <= call["topk_ids"][1, 1].item() < EXPERTS)
         self.assertEqual(call["topk_weights"][1, 1].item(), 0)
         self.assertEqual(tuple(result.hidden_states.shape), (3, HIDDEN_SIZE))
 
@@ -731,6 +735,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 layer = _make_block512_layer(include_unused_params=False)
                 layer._tpu_fused_rs_has_post_expert_norm = False
                 layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
+                layer._tpu_w13_global_scale = layer._tpu_w2_global_scale = None
                 layer.moe_ep_size = 1
                 fused_moe_rs_gather = mock.Mock(
                     side_effect=lambda **kwargs: kwargs["hidden_states"]
@@ -795,6 +800,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
+        layer._tpu_w13_global_scale = layer._tpu_w2_global_scale = None
         layer.moe_ep_size = 2
 
         # Model rank 0's output is the first partition of each kernel result.

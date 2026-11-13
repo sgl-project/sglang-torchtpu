@@ -233,6 +233,35 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
     )
 
 
+class TestAuxHiddenStatePytree(CustomTestCase):
+    def test_aux_states_flatten_to_tensor_leaves_and_rebuild(self):
+        """An EAGLE3 target's (hidden, aux) output must reach direct_compile as
+        tensor leaves; an opaque list leaf fails its all-TPU-tensors check."""
+        hidden, first, second = torch.zeros(2), torch.ones(2), torch.full((2,), 2.0)
+        leaves, treespec = tree_util.tree_flatten(
+            (hidden, AuxHiddenStateList([first, second]))
+        )
+        self.assertEqual(len(leaves), 3)
+        self.assertTrue(all(isinstance(leaf, torch.Tensor) for leaf in leaves))
+        _, aux = tree_util.tree_unflatten(treespec, leaves)
+        self.assertIsInstance(aux, AuxHiddenStateList)
+        self.assertIs(aux[1], second)
+
+
+class TestDonatedKVPoolInputs(CustomTestCase):
+    def test_donates_only_unshared_base_pool_tensors(self):
+        model, pool, view_base = torch.zeros(2), torch.zeros(2), torch.zeros(4)
+        shared, view = torch.zeros(2), view_base[:2]
+        # [model, kv: pool, shared, view, explicit: shared again]
+        inputs = [model, pool, shared, view, shared]
+        self.assertEqual(direct_compile._donated_kv_pool_inputs(inputs, 1, 3), [1])
+
+    def test_view_of_pool_tensor_blocks_its_donation(self):
+        pool = torch.zeros(4)
+        inputs = [pool, pool[:2]]
+        self.assertEqual(direct_compile._donated_kv_pool_inputs(inputs, 0, 1), [])
+
+
 class TestDirectCompile(CustomTestCase):
     def test_helper_warmup_preserves_shared_queue_participation(self):
         for verify, shared in ((False, False), (True, False), (True, True)):
@@ -1205,6 +1234,11 @@ class TestDirectCompile(CustomTestCase):
         self.assertEqual(
             traverse.call_args.kwargs["argument_layouts"],
             [[]] * len(retained_graph_inputs),
+        )
+        # The KV-pool input sits after the retained model inputs.
+        self.assertEqual(
+            traverse.call_args.kwargs["donated_inputs"],
+            [len(expected_model_inputs)],
         )
         model_inputs = next(iter(compiled.cache.values())).model_inputs
         self.assertEqual(len(model_inputs), len(expected_model_inputs))

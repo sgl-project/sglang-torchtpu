@@ -473,12 +473,15 @@ class TpuDMAHostKVPool(HostKVCache):
             requested_bytes / 1e9,
         )
 
-        self.transfer = create_tpu_dma_kv_transfer(
-            self.io_backend, device_pool, self.page_num, draft_pools=self.draft_pools
-        )
+        self.transfer = self._create_transfer(device_pool)
 
         self.lock = threading.RLock()
         self.clear()
+
+    def _create_transfer(self, device_pool):
+        return create_tpu_dma_kv_transfer(
+            self.io_backend, device_pool, self.page_num, draft_pools=self.draft_pools
+        )
 
     # ------------------------------------------------------------------ #
     # Sizing
@@ -619,11 +622,82 @@ def tpu_dma_host_kv_pool_cls(io_backend: str) -> type[TpuDMAHostKVPool]:
     )
 
 
+class StateSlotTransfer:
+    """Copies state slots between a ``TpuMambaPool``'s live tensors and host memory.
+
+    A compiled forward rebinds the state tensors to new device buffers, so an
+    engine bound to them at construction reads and writes stale memory. These
+    torch copies resolve the tensors per call and the device queue orders them
+    against forwards. A host row is one slot of every state tensor, flattened.
+    """
+
+    def __init__(self, device_pool, num_host_pages: int):
+        states = device_pool.get_state()
+        dtypes = {t.dtype for t in states}
+        if len(dtypes) != 1:
+            raise ValueError(f"state tensors must share one dtype, got {dtypes}")
+        self.device_pool = device_pool
+        self.widths = [math.prod(t.shape[1:]) for t in states]
+        self.host = torch.empty(
+            (num_host_pages, sum(self.widths)), dtype=states[0].dtype
+        )
+        self._d2h = None
+
+    def _indices(self, slots: List[int], device) -> torch.Tensor:
+        # Pow2 bucket (repeating the last slot) bounds the eager op shapes.
+        padded = slots + slots[-1:] * (next_power_of_2(len(slots)) - len(slots))
+        return torch.tensor(padded, dtype=torch.int64).to(device)
+
+    def backup(self, device_pages: List[int], host_pages: List[int]) -> TransferEvent:
+        n = len(device_pages)
+        assert n == len(host_pages)
+        if n == 0:
+            return NOOP_EVENT
+        states = self.device_pool.get_state()
+        idx = self._indices(device_pages, states[0].device)
+        # A fresh gathered tensor: later writes to the slots cannot reach it.
+        rows = torch.cat(
+            [t.index_select(0, idx).reshape(len(idx), -1) for t in states], dim=1
+        )
+        host_idx = torch.tensor(host_pages, dtype=torch.int64)
+
+        def drain():
+            self.host[host_idx] = rows[:n].cpu()
+
+        if rows.device.type == "cpu":
+            drain()
+            return NOOP_EVENT
+        if self._d2h is None:
+            from sglang_tpu.kv_copy_worker import TpuKvCopyWorker
+
+            self._d2h = TpuKvCopyWorker("state-offload-d2h")
+        return self._d2h.submit(drain)
+
+    def load(self, host_pages: List[int], device_pages: List[int]) -> TransferEvent:
+        n = len(host_pages)
+        assert n == len(device_pages)
+        if n == 0:
+            return NOOP_EVENT
+        states = self.device_pool.get_state()
+        device = states[0].device
+        idx = self._indices(device_pages, device)
+        host_rows = self._indices(host_pages, "cpu")
+        rows = self.host[host_rows].to(device)
+        for t, part in zip(states, rows.split(self.widths, dim=1)):
+            t.index_copy_(0, idx, part.reshape(len(idx), *t.shape[1:]))
+        # Queued ahead of any later forward on the device, so already ordered.
+        return NOOP_EVENT
+
+
 class TpuDMAMambaPoolHost(TpuDMAHostKVPool):
-    """Host store for recurrent-state (GDN/KDA) slots, copied by the DMA engine.
+    """Host store for recurrent-state (GDN/KDA/conv) slots.
 
     ``TpuMambaPool`` keeps one ``[state_slots, ...]`` tensor per layer and state
-    kind, so a slot is one row of each: the engine moves it as a page of one row.
+    kind, so a slot is one row of each. Slots move through ``StateSlotTransfer``,
+    not the DMA engine: the state tensors do not keep their device buffers.
+    MERGE-REVIEW: public main copies these slots with the DMA engine (one-row
+    pages, written in place); the torch path stays until the hybrid forwards here
+    stop rebinding state tensors.
     """
 
     def __init__(
@@ -647,6 +721,9 @@ class TpuDMAMambaPoolHost(TpuDMAHostKVPool):
             device="cpu",
             pool_label="mamba",
         )
+
+    def _create_transfer(self, device_pool):
+        return StateSlotTransfer(device_pool, self.page_num)
 
 
 def tpu_dma_mamba_pool_host_cls(io_backend: str) -> type[TpuDMAMambaPoolHost]:

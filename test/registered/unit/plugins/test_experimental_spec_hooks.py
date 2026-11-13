@@ -157,7 +157,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
         batch, rows, drafts, logits, accept, committed = [object() for _ in range(6)]
         bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=object()))
         addressing = SimpleNamespace(
-            verify_cache_candidates=object(), committed_lens=object()
+            verify_cache_candidates=object(),
+            committed_lens=object(),
+            swa_verify_cache_candidates=None,
         )
         grammar_barrier = MagicMock()
         calls = MagicMock()
@@ -185,6 +187,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             addressing.committed_lens,
             bucket.state.seq_lens,
             8,
+            addressing.swa_verify_cache_candidates,
         )
         calls.draft.assert_called_once_with(batch, bucket, rows, addressing)
         calls.verify.assert_called_once_with(
@@ -253,7 +256,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         metadata = SimpleNamespace()
         accepted = object()
-        batch, rows, addressing = object(), object(), object()
+        batch = SimpleNamespace(has_grammar=False)
+        rows, addressing = object(), object()
         with (
             patch.object(worker, "make_verify_input", return_value=metadata) as make,
             patch.object(
@@ -1168,7 +1172,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         worker._all_drafts = {4: None}
         bucket = SimpleNamespace(
-            state=SimpleNamespace(seq_lens=torch.zeros(4), bonus_tokens=None),
+            state=SimpleNamespace(
+                seq_lens=torch.zeros(4), bonus_tokens=None, req_pool_indices=None
+            ),
             live_mask=None,
             temperatures=torch.ones(4),
             top_ks=torch.ones(4),
@@ -1693,10 +1699,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
             batch.return_logprob = False
             batch.has_grammar = True
-            with self.assertRaisesRegex(NotImplementedError, "grammar"):
-                worker._check_supported(batch=batch, pp_proxy_tensors=None)
+            # Grammar requests verify against masked logits, so the window stays.
+            worker._check_supported(batch=batch, pp_proxy_tensors=None)
             draft.prepare_for_decode(batch)
-            self.assertIsNone(draft.tpu_verify_cache_candidates)
+            self.assertEqual(draft.tpu_verify_cache_candidates.shape, (2, 6))
             worker_factory.return_value = _GrammarBlockSpecWorker
             worker = object.__new__(_GrammarBlockSpecWorker)
             worker._bsearch_filtering = True
@@ -1732,6 +1738,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 worker._warmup_draft_block_inputs = lambda c=calls: c.append("block")
                 worker._warmup_draft_sampling = lambda c=calls: c.append("sampling")
                 worker._warmup_extend_draft_inputs = lambda c=calls: c.append("extend")
+                worker._warmup_recurrent_context = lambda: None
                 with (
                     patch.object(
                         TpuSpecWorker,

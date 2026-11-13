@@ -706,6 +706,115 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
+def _pipeline_mode(cfg: config.GDNConfig) -> pl.Buffered:
+    return pl.Buffered(buffer_count=cfg.num_buffers, use_lookahead=False)
+
+
+def _tile_spec(cfg: config.GDNConfig, block_shape: tuple[int, ...]) -> pl.BlockSpec:
+    return pl.BlockSpec(
+        block_shape=block_shape,
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i,),
+        pipeline_mode=_pipeline_mode(cfg),
+    )
+
+
+def create_input_alloc(
+    metadata_ref: MetadataRef,
+    ref: jax.Array,
+    block_shape: tuple[int, ...],
+    cfg: config.GDNConfig,
+) -> InBufferedRef:
+    """Token-row input tile: [seq_tile_size, chunk_size, 1, cols]."""
+    return InBufferedRef.input(
+        spec=_tile_spec(cfg, block_shape),
+        dtype_or_type=ref,
+        buffer_count=cfg.num_buffers,
+        use_lookahead=False,
+        cfg=cfg,
+        metadata_ref=metadata_ref,
+    )
+
+
+def create_output_alloc(
+    metadata_ref: MetadataRef,
+    ref: jax.Array,
+    block_shape: tuple[int, ...],
+    cfg: config.GDNConfig,
+) -> OutBufferedRef:
+    return OutBufferedRef.output(
+        spec=_tile_spec(cfg, block_shape),
+        dtype_or_type=ref,
+        buffer_count=cfg.num_buffers,
+        use_lookahead=False,
+        cfg=cfg,
+        metadata_ref=metadata_ref,
+    )
+
+
+def create_dense_state_allocs(
+    metadata_ref: MetadataRef,
+    state_ref: jax.Array,
+    state_shape: tuple[int, ...],
+    cfg: config.GDNConfig,
+) -> tuple[StateInBufferedRef, StateOutBufferedRef]:
+    """Dense per-slot state: one initial state per sequence in, one checkpoint
+    per window position out (1 without speculative decoding)."""
+    in_alloc = StateInBufferedRef.input(
+        spec=_tile_spec(cfg, (cfg.seq_tile_size, 1, *state_shape)),
+        dtype_or_type=state_ref,
+        buffer_count=cfg.num_buffers,
+        use_lookahead=False,
+        cfg=cfg,
+        metadata_ref=metadata_ref,
+    )
+    out_alloc = StateOutBufferedRef.output(
+        spec=_tile_spec(cfg, (cfg.seq_tile_size, cfg.window_size, *state_shape)),
+        dtype_or_type=state_ref,
+        buffer_count=cfg.num_buffers,
+        use_lookahead=False,
+        cfg=cfg,
+        metadata_ref=metadata_ref,
+    )
+    return in_alloc, out_alloc
+
+
+def _activation_shape(cfg: config.GDNConfig, cols: int) -> tuple[int, ...]:
+    return (cfg.seq_tile_size, cfg.chunk_size, 1, cols)
+
+
+def _qkv_out_allocs(
+    metadata_ref: MetadataRef,
+    qkv_ref: jax.Array,
+    out_ref: jax.Array,
+    cfg: config.GDNConfig,
+) -> tuple[InBufferedRef, OutBufferedRef]:
+    qkv_alloc = create_input_alloc(
+        metadata_ref, qkv_ref, _activation_shape(cfg, cfg.dim_size), cfg
+    )
+    out_shape = (cfg.seq_tile_size, cfg.chunk_size, cfg.num_v_heads, cfg.v_head_dim)
+    out_alloc = create_output_alloc(metadata_ref, out_ref, out_shape, cfg)
+    return qkv_alloc, out_alloc
+
+
+def create_conv_allocs(
+    metadata_ref: MetadataRef,
+    qkv_ref: jax.Array,
+    out_ref: jax.Array,
+    conv_state_ref: jax.Array,
+    cfg: config.GDNConfig,
+) -> tuple[InBufferedRef, OutBufferedRef, StateInBufferedRef, StateOutBufferedRef]:
+    """(qkv, out, conv state in, conv state out) allocs over dense conv states."""
+    qkv_alloc, out_alloc = _qkv_out_allocs(metadata_ref, qkv_ref, out_ref, cfg)
+    conv_in_alloc, conv_out_alloc = create_dense_state_allocs(
+        metadata_ref,
+        conv_state_ref,
+        (cfg.prev_kernel_size, 1, cfg.dim_size),
+        cfg,
+    )
+    return qkv_alloc, out_alloc, conv_in_alloc, conv_out_alloc
+
+
 def create_allocs(
     metadata_ref: MetadataRef,
     qkv_ref: jax.Array,
@@ -740,113 +849,34 @@ def create_allocs(
             f"windows, got window_size={cfg.window_size}."
         )
 
-    qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
-    b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
+    b_alloc = create_input_alloc(
+        metadata_ref, b_ref, _activation_shape(cfg, cfg.aligned_num_v_heads), cfg
+    )
     # Same shape as b under GDN; under KDA the gate is per-channel, so it is
     # d_k times wider (see GDNConfig.gate_dim).
-    a_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_gate_dim)
-
-    out_shape = (
-        cfg.seq_tile_size,
-        cfg.chunk_size,
-        cfg.num_v_heads,
-        cfg.v_head_dim,
-    )
-
-    pipeline_mode = pl.Buffered(buffer_count=cfg.num_buffers, use_lookahead=False)
-
-    block_spec_partial = functools.partial(
-        pl.BlockSpec,
-        memory_space=pltpu.VMEM,
-        index_map=lambda i: (i,),
-        pipeline_mode=pipeline_mode,
-    )
-
-    qkv_spec = block_spec_partial(block_shape=qkv_shape)
-    b_spec = block_spec_partial(block_shape=b_shape)
-    a_spec = block_spec_partial(block_shape=a_shape)
-    in_buffered_partial = functools.partial(
-        InBufferedRef.input,
-        buffer_count=pipeline_mode.buffer_count,
-        use_lookahead=pipeline_mode.use_lookahead,
-        cfg=cfg,
-        metadata_ref=metadata_ref,
-    )
-    qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
-    b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
-    a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
-
-    out_alloc = OutBufferedRef.output(
-        spec=block_spec_partial(block_shape=out_shape),
-        dtype_or_type=out_ref,
-        buffer_count=pipeline_mode.buffer_count,
-        use_lookahead=pipeline_mode.use_lookahead,
-        cfg=cfg,
-        metadata_ref=metadata_ref,
+    a_alloc = create_input_alloc(
+        metadata_ref, a_ref, _activation_shape(cfg, cfg.aligned_gate_dim), cfg
     )
 
     if cfg.state_plan is None:
-        # Initial state needs only 1 slot per sequence; output holds one
-        # checkpoint per window position (1 without speculative decoding).
-        conv_in_shape = (
-            cfg.seq_tile_size,
-            1,
-            cfg.prev_kernel_size,
-            1,
-            cfg.dim_size,
+        qkv_alloc, out_alloc, conv_in_alloc, conv_out_alloc = create_conv_allocs(
+            metadata_ref, qkv_ref, out_ref, conv_state_ref, cfg
         )
-        recurrent_in_shape = (
-            cfg.seq_tile_size,
-            1,
-            cfg.num_v_heads,
-            cfg.kq_head_dim,
-            cfg.v_head_dim,
-        )
-        conv_out_shape = (
-            cfg.seq_tile_size,
-            cfg.window_size,
-            cfg.prev_kernel_size,
-            1,
-            cfg.dim_size,
-        )
-        recurrent_out_shape = (
-            cfg.seq_tile_size,
-            cfg.window_size,
-            cfg.num_v_heads,
-            cfg.kq_head_dim,
-            cfg.v_head_dim,
-        )
-        state_in_partial = functools.partial(
-            StateInBufferedRef.input,
-            buffer_count=pipeline_mode.buffer_count,
-            use_lookahead=pipeline_mode.use_lookahead,
-            cfg=cfg,
-            metadata_ref=metadata_ref,
-        )
-        conv_in_alloc = state_in_partial(
-            spec=block_spec_partial(block_shape=conv_in_shape),
-            dtype_or_type=conv_state_ref,
-        )
-        recurrent_in_alloc = state_in_partial(
-            spec=block_spec_partial(block_shape=recurrent_in_shape),
-            dtype_or_type=recurrent_state_ref,
-        )
-        state_out_partial = functools.partial(
-            StateOutBufferedRef.output,
-            buffer_count=pipeline_mode.buffer_count,
-            use_lookahead=pipeline_mode.use_lookahead,
-            cfg=cfg,
-            metadata_ref=metadata_ref,
-        )
-        conv_out_alloc = state_out_partial(
-            spec=block_spec_partial(block_shape=conv_out_shape),
-            dtype_or_type=conv_state_ref,
-        )
-        recurrent_out_alloc = state_out_partial(
-            spec=block_spec_partial(block_shape=recurrent_out_shape),
-            dtype_or_type=recurrent_state_ref,
+        recurrent_in_alloc, recurrent_out_alloc = create_dense_state_allocs(
+            metadata_ref,
+            recurrent_state_ref,
+            (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim),
+            cfg,
         )
     else:
+        qkv_alloc, out_alloc = _qkv_out_allocs(metadata_ref, qkv_ref, out_ref, cfg)
+        pipeline_mode = _pipeline_mode(cfg)
+        block_spec_partial = functools.partial(
+            pl.BlockSpec,
+            memory_space=pltpu.VMEM,
+            index_map=lambda i: (i,),
+            pipeline_mode=pipeline_mode,
+        )
         # Both state regions stream from/to the one external source ref
         # (passed as both state refs); the tiles keep the source's raw
         # block layout and vmem_ldst applies the typed region view. Like

@@ -918,6 +918,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_layers_num
                     - self._draft_swa_full_layers_num
                 )
+        elif kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+            # The full-pool layers are priced by _dflash_draft_cell_size.
+            self._draft_swa_layers_num = int(
+                kvc.spec_aux_config.dflash_draft_swa_num_layers
+            )
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 
@@ -1182,8 +1187,8 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
                 + self._draft_full_per_token * self._draft_full_layers_num
                 + self._draft_swa_per_token * self._draft_swa_full_layers_num
             )
-            if self._uses_mxint8:
-                full_cell_size += self._draft_cell_size
+            # The DFLASH-family draft pool is sized to full_tokens too.
+            full_cell_size += self._draft_cell_size
             full_tokens = (
                 int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
             ) * page_size

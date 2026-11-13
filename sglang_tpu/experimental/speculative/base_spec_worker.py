@@ -63,13 +63,18 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_server_args,
     get_spec,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import (
+    BaseSpecWorker,
+    HiCacheDraftMode,
+    HiCacheDraftPlan,
+)
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -118,6 +123,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     accept_sampled_step,
     accept_target_only_step,
     accept_top_k_candidates_step,
+    apply_grammar_bitmask,
     build_verify_tokens,
     finalize_accept,
     live_result_rows,
@@ -135,6 +141,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     map_carry,
 )
 from sglang_tpu.experimental.speculative.spec_utils import (
+    grammar_verify_bitmask,
     overridden_fields,
     pad_rows,
     padded_h2d,
@@ -183,6 +190,16 @@ def _check_draft_lm_head_group(draft_model: nn.Module, *, attn_tp_size: int) -> 
         )
 
 
+def _draft_swa_translate(draft_worker):
+    """Host slot translation into the draft's SWA sub-pool; None for a full-pool draft."""
+    from sglang_tpu.dflash_draft_kv_write import translate_draft_swa_locs
+
+    pool = draft_worker.draft_runner.token_to_kv_pool
+    if not isinstance(pool, SWAKVPool):
+        return None
+    return lambda loc: translate_draft_swa_locs(pool, loc, None)[0]
+
+
 class TpuSpecWorker(BaseSpecWorker):
     """Speculative decoding as draft -> verify -> commit.
 
@@ -192,7 +209,8 @@ class TpuSpecWorker(BaseSpecWorker):
     """
 
     supports_logprobs = False
-    supports_grammar = False
+    # verify masks the target logits with xgrammar's bitmask (_grammar_masked_logits).
+    supports_grammar = True
     # Opt in only when verification applies the scheduler's additive snapshot
     # at the padded batch size. Live penalizer state is still unsupported.
     supports_additive_penalties = False
@@ -223,6 +241,8 @@ class TpuSpecWorker(BaseSpecWorker):
             # (--sampling-backend pytorch).
             runner.sampler = TpuSampler()
         self._draft_worker = draft_worker
+        # Resolved in alloc_memory_pool: the draft KV pool does not exist yet.
+        self._draft_swa_translate = None
         self.num_drafts = num_drafts
         self.num_verify_rows = num_drafts + 1
         self.device = target_worker.device
@@ -255,6 +275,7 @@ class TpuSpecWorker(BaseSpecWorker):
         self._target_has_linear_attn = (
             mambaish_config(target_worker.model_runner.model_config) is not None
         )
+        self._grammar_enabled = _grammar_mask_enabled(get_server_args().grammar_backend)
         self._bucket: BucketState | None = None
         # hash_uniforms counter; every TP rank advances it identically, once per sampled step.
         self._rng_step = torch.zeros((1,), dtype=torch.int64).to(self.device)
@@ -422,6 +443,8 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_pd_hidden()
         if not self._sampled_drafts and get_disagg().disaggregation_mode != "prefill":
             self._warmup_target_only_accept()
+        if self._grammar_enabled and get_disagg().disaggregation_mode != "prefill":
+            self._warmup_grammar_mask()
         # A PD prefill server never verifies, so its mamba pool has no checkpoints.
         if (
             self._target_has_linear_attn
@@ -522,16 +545,18 @@ class TpuSpecWorker(BaseSpecWorker):
             for width, pbs in itertools.product(self.verify_widths(), bucket_sizes):
                 # The generic spec-op context only knows the active width. The
                 # worker owns the full-capacity candidate shape used in serving.
+                window = (pbs, 2 * self.verify_window_rows)
                 warmup_compiled_op(
                     select_verify_rows,
-                    torch.zeros(
-                        (pbs, 2 * self.verify_window_rows),
-                        dtype=torch.int64,
-                        device=self.device,
-                    ),
+                    torch.zeros(window, dtype=torch.int64, device=self.device),
                     torch.zeros((pbs,), dtype=torch.int64, device=self.device),
                     torch.zeros((pbs,), dtype=torch.int64, device=self.device),
                     width,
+                    *(
+                        (torch.zeros(window, dtype=torch.int64, device=self.device),)
+                        if self.draft_swa_translate is not None
+                        else ()
+                    ),
                 )
                 # Eager ops compile per input layout, so bump finalize_accept's output.
                 next_seq_lens = self._warmup_accept(pbs, width).next_seq_lens
@@ -550,6 +575,31 @@ class TpuSpecWorker(BaseSpecWorker):
             zeros(padded_bs),
             torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
         )
+
+    def alloc_memory_pool(self, *args, **kwargs):
+        super().alloc_memory_pool(*args, **kwargs)
+        # The scheduler builds this worker before any KV pool exists.
+        self._draft_swa_translate = _draft_swa_translate(self._draft_worker)
+
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        plan = super()._build_hicache_draft_plan()
+        if plan.mode != HiCacheDraftMode.SIDECAR:
+            return plan
+        from sglang_tpu.hybrid_linear_hicache import packs_draft_kv
+
+        runner = self.target_worker.model_runner
+        if not packs_draft_kv(runner, plan.device_pools):
+            return plan
+        # The host stack carries the draft KV on the target's pages.
+        runner.mtp_draft_device_pools = plan.device_pools
+        return HiCacheDraftPlan(
+            mode=HiCacheDraftMode.PACKED, device_pools=plan.device_pools
+        )
+
+    @property
+    def draft_swa_translate(self):
+        """Host slot translation into the draft's SWA sub-pool; None for a full-pool draft."""
+        return self._draft_swa_translate
 
     @property
     def retraction_draft_kv_pools(self) -> tuple[KVCache, ...]:
@@ -687,7 +737,8 @@ class TpuSpecWorker(BaseSpecWorker):
 
         The returned LogitsProcessorOutput holds [pbs * (N + 1), ...] verify rows:
         next_token_logits is p (or its distributed top-k when the accept reads only
-        that), hidden_states is the target feature phi.
+        that), hidden_states is the target feature phi. Acceptance reads p masked
+        by each request's grammar, if any.
         """
         verify_tokens = draft_result.verify_tokens
         if verify_tokens is None:
@@ -706,9 +757,22 @@ class TpuSpecWorker(BaseSpecWorker):
             rows=rows,
             verify_input=verify_input,
             spec_info=spec_info,
-            logits_output_mode=self._verify_logits_output_mode(bucket, draft_result),
+            logits_output_mode=self._verify_logits_output_mode(
+                bucket, draft_result, has_grammar=batch.has_grammar
+            ),
         )
-        accept = self._accept(bucket, draft_result, logits_output)
+        target_logits = None
+        if batch.has_grammar:
+            target_logits = self._grammar_masked_logits(
+                batch,
+                verify_tokens,
+                logits_output.next_token_logits,
+                draft_result.draft_tokens.shape[0],
+                grammar_barrier,
+            )
+        accept = self._accept(
+            bucket, draft_result, logits_output, target_logits=target_logits
+        )
         self._check_rank_agreement(accept)
         return logits_output, accept
 
@@ -736,10 +800,11 @@ class TpuSpecWorker(BaseSpecWorker):
             )
 
     def _verify_logits_output_mode(
-        self, bucket: BucketState, draft_result: DraftResult
+        self, bucket: BucketState, draft_result: DraftResult, *, has_grammar: bool
     ) -> LogitsOutputMode:
         """DISTRIBUTED_TOP_K when the accept reads only the target's top-k (greedy or candidates)."""
-        if self._verify_top_k_width is None:
+        # The grammar mask needs every logit.
+        if self._verify_top_k_width is None or has_grammar:
             return LogitsOutputMode.FULL_VOCAB
         # A simulated accept reads no logits; keep serving's mode so the benchmark
         # pays the same logits traffic as production.
@@ -752,8 +817,13 @@ class TpuSpecWorker(BaseSpecWorker):
         bucket: BucketState,
         draft_result: DraftResult,
         logits_output: LogitsProcessorOutput,
+        *,
+        target_logits: torch.Tensor | None = None,
     ) -> AcceptResult:
-        """Accept and finalize in one program; ranks agree without a broadcast (hash_uniforms)."""
+        """Accept and finalize in one program; ranks agree without a broadcast (hash_uniforms).
+
+        target_logits overrides the output's full-vocabulary p (grammar-masked rows).
+        """
         draft_tokens = draft_result.draft_tokens
         state = bucket.state
         if self._simulate_acc_len > 0:
@@ -768,7 +838,7 @@ class TpuSpecWorker(BaseSpecWorker):
                 bucket.live_mask,
             )
         num_rows = draft_tokens.shape[0] * self.num_verify_rows
-        if logits_output.has_next_token_global_top_k:
+        if target_logits is None and logits_output.has_next_token_global_top_k:
             top_logits = logits_output.next_token_global_top_k_logits
             top_ids = logits_output.next_token_global_top_k_token_ids
             assert top_ids.shape == (num_rows, TARGET_CANDIDATES), top_ids.shape
@@ -798,7 +868,8 @@ class TpuSpecWorker(BaseSpecWorker):
                 self._block_verification,
             )
             return accept
-        target_logits = logits_output.next_token_logits
+        if target_logits is None:
+            target_logits = logits_output.next_token_logits
         assert target_logits.shape[0] == num_rows, (
             "verify logits must keep the bucket rows"
         )
@@ -885,6 +956,33 @@ class TpuSpecWorker(BaseSpecWorker):
             self._simulated_drafts[padded_bs],
         )
 
+    def _grammar_masked_logits(
+        self,
+        batch: ScheduleBatch,
+        verify_tokens: torch.Tensor,
+        target_logits: torch.Tensor,
+        padded_bs: int,
+        grammar_barrier: Callable[[], None] | None,
+    ) -> torch.Tensor:
+        """target_logits [pbs * W, V] with each verify row's grammar-disallowed tokens at -inf.
+
+        Host work issued after the verify launch; only the D2H of the drafts waits on device.
+        """
+        # Advances the FSM over the previous batch's tokens, which the walk reads.
+        if grammar_barrier is not None:
+            grammar_barrier()
+        bitmask = grammar_verify_bitmask(
+            batch.reqs,
+            verify_tokens.to("cpu").view(padded_bs, -1),
+            target_logits.shape[-1],
+            self.device,
+        )
+        if bitmask is None:
+            return target_logits
+        return apply_grammar_bitmask(
+            target_logits, bitmask.to(self.device, non_blocking=True)
+        )
+
     def step(
         self,
         batch: ScheduleBatch,
@@ -899,6 +997,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.committed_lens,
             bucket.state.seq_lens,
             self.num_verify_rows,
+            verify_input.swa_verify_cache_candidates,
         )
         draft_result = self.draft(batch, bucket, rows, verify_input)
         logits_output, accept = self.verify(
@@ -997,7 +1096,10 @@ class TpuSpecWorker(BaseSpecWorker):
         bs = batch.seq_lens.shape[0]
         padded_bs = self._decode_bucket(batch, bs)
         verify_input = TpuSpecVerifyInput.from_batch(
-            batch, self.num_verify_rows, padded_bs
+            batch,
+            self.num_verify_rows,
+            padded_bs,
+            swa_translate=self.draft_swa_translate,
         )
         bucket = self._bucket_state(batch, padded_bs, verify_input)
         committed, logits_output, accept = self.step(
@@ -1098,6 +1200,7 @@ class TpuSpecWorker(BaseSpecWorker):
         """
         padded_bs = self._decode_bucket(batch, 0)
         verify_input = TpuSpecVerifyInput.idle(
+            hybrid_draft=self.draft_swa_translate is not None,
             verify_window_rows=self.verify_window_rows,
             padded_bs=padded_bs,
             device=self.device,
@@ -1115,6 +1218,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.committed_lens,
             state.seq_lens,
             self.num_verify_rows,
+            verify_input.swa_verify_cache_candidates,
         )
         # The forwards' preparation writes these; the idle batch must stay idle.
         with overridden_fields(
@@ -1220,6 +1324,27 @@ class TpuSpecWorker(BaseSpecWorker):
                     self._device_zeros(padded_bs),
                     torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
                     self._rng_step,
+                )
+
+    def _warmup_grammar_mask(self) -> None:
+        """Grammar masking of the verify logits, per batch bucket and verify width."""
+        vocab_size = self.target_worker.model_runner.model_config.vocab_size
+        with torch.no_grad():
+            for width, padded_bs in itertools.product(
+                self.verify_widths(), self._b_bucketer().buckets
+            ):
+                rows = padded_bs * width
+                warmup_compiled_op(
+                    apply_grammar_bitmask,
+                    torch.zeros(
+                        (rows, vocab_size), dtype=torch.float32, device=self.device
+                    ),
+                    torch.full(
+                        (rows, (vocab_size + 31) // 32),
+                        -1,
+                        dtype=torch.int32,
+                        pin_memory=is_pin_memory_available(self.device),
+                    ).to(self.device, non_blocking=True),
                 )
 
     def sync_target_tokens(self, next_token_ids: torch.Tensor) -> torch.Tensor:
@@ -1838,6 +1963,16 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError(
                 "TpuSpecWorker does not support deterministic sampling."
             )
+
+
+def _grammar_mask_enabled(grammar_backend: str | None) -> bool:
+    """Whether verify masks grammar requests; only xgrammar's packed int32 bitmask is supported."""
+    if grammar_backend not in (None, "none", "xgrammar"):
+        raise NotImplementedError(
+            "TpuSpecWorker supports --grammar-backend xgrammar or none, "
+            f"got {grammar_backend!r}."
+        )
+    return grammar_backend not in (None, "none")
 
 
 def _sampled_row_filters(sampling_info: SamplingBatchInfo) -> dict[str, bool]:

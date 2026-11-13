@@ -88,7 +88,9 @@ class TpuDflashDraftWorker(TpuBlockDraftWorker):
         bonus_tokens: torch.Tensor,
         draft_lattice: DraftLattice | None,
         sampler: DraftSampler,
+        req_pool_indices: torch.Tensor,
     ) -> SampledDrafts:
+        del req_pool_indices
         # Row 0 is the root; draft_hidden[:, j - 1] predicts d_j at position n + j.
         lm_head = self._dflash_model.lm_head
         assert lm_head is not None

@@ -567,6 +567,7 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
                 "InklingForConditionalGeneration",
+                "Inkling2ForConditionalGeneration",
                 "MuseSparkForConditionalGeneration",
             ]
             if (
@@ -967,6 +968,19 @@ class ModelConfig:
             self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
         if (
             is_draft_model
+            and self.hf_config.architectures[0] == "Inkling2ForConditionalGeneration"
+        ):
+            from sglang.tml.config import Inkling2MTPConfig
+
+            if self.speculative_algorithm not in (None, "DSPARK"):
+                raise ValueError("Inkling2 MTP requires --speculative-algorithm DSPARK")
+            if self.quantization is not None and self.is_draft_quantization_explicit:
+                raise ValueError("Inkling2 MTP uses its checkpoint BF16 precision")
+            self.quantization = None
+            self.hf_config = Inkling2MTPConfig.from_target(self.hf_config)
+            self.hf_text_config = self.hf_config
+        if (
+            is_draft_model
             and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
         ):
             self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
@@ -1108,6 +1122,7 @@ class ModelConfig:
             "Gemma4ForConditionalGeneration",
             "InklingForConditionalGeneration",
             "InklingForConditionalGenerationMTP",
+            "Inkling2ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
             "DiffusionGemmaForBlockDiffusion",
         ]
@@ -1702,6 +1717,8 @@ class ModelConfig:
 
             {"quant_algo": "FP8", "quant_method": "modelopt", ...}
         """
+        if quant_config_dict.get("quant_method") == "inkling2":
+            return quant_config_dict
         json_quant_configs = unwrap_modelopt_quantization_config(quant_config_dict)
         if not json_quant_configs:
             return None
@@ -2519,6 +2536,7 @@ def is_hybrid_swa_model(
         "MuseGlimmerForConditionalGeneration",
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
+        "Inkling2ForConditionalGeneration",
         "UnlimitedOCRForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):

@@ -1323,20 +1323,17 @@ class LogitsProcessor(nn.Module):
             # every member of this attention-TP group shards the same tokens
             # over the vocabulary, sees 0 here, and skips together.
             return logits.new_empty((0, self.vocab_size))
-        if self.vocab_size % self.attn_tp_size == 0:
+        # A padded LM head shards its padded vocab: gather at the shard width, then cut the padding.
+        if logits.shape[-1] * self.attn_tp_size >= self.vocab_size:
             global_logits = torch.empty(
-                (
-                    self.attn_tp_size,
-                    logits.shape[0],
-                    self.vocab_size // self.attn_tp_size,
-                ),
+                (self.attn_tp_size, logits.shape[0], logits.shape[-1]),
                 device=logits.device,
                 dtype=logits.dtype,
             )
             attn_tp_all_gather_into_tensor(global_logits, logits)
-            global_logits = global_logits.permute(1, 0, 2).reshape(
-                logits.shape[0], self.vocab_size
-            )
+            global_logits = global_logits.permute(1, 0, 2).reshape(logits.shape[0], -1)[
+                :, : self.vocab_size
+            ]
         else:
             global_logits = torch.empty(
                 (self.vocab_size, logits.shape[0]),

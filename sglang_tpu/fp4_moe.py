@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _pad_last_axis,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.expert_loading import _wait_for
 from sglang_tpu.fp8_moe import (
     _clear_replaced_param,
@@ -29,6 +30,7 @@ from sglang_tpu.fused_rs_sequence_parallel import (
     prepare_fused_moe_sequence_parallel_input,
     prepare_tpu_fused_rs_post_expert_norm,
 )
+from sglang_tpu.moe.activation import pallas_moe_activation
 from sglang_tpu.moe.ep_rank import mask_tpu_moe_non_local_experts, traced_moe_ep_rank
 from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
@@ -126,6 +128,31 @@ def _to_gmm_v2_scale_layout(
     return _own_storage(scale.to(dtype).unsqueeze(-1).permute(0, 2, 3, 1).contiguous())
 
 
+def _expert_global_scales(
+    w13_global_scale: torch.Tensor | None,
+    w2_global_scale: torch.Tensor | None,
+    *,
+    num_experts: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-expert globals as f32 ``(E, 2)`` gate/up and ``(E,)``, ones where absent.
+
+    Built by computing ops: a view of a parameter bound into a compiled graph is
+    rebuilt from its base on every call (torch-tpu 0.2).
+    """
+    ones = torch.ones(num_experts, 1, dtype=torch.float32, device=device)
+    if w13_global_scale is None:
+        w13 = torch.cat([ones, ones], dim=1)
+    else:
+        g = w13_global_scale.float().reshape(num_experts, -1)
+        w13 = torch.cat([g[:, :1], g[:, -1:]], dim=1)
+    if w2_global_scale is None:
+        w2 = ones.reshape(num_experts) * 1.0
+    else:
+        w2 = w2_global_scale.float().reshape(num_experts) * 1.0
+    return w13, w2
+
+
 def _fold_w13_global_scale(
     block_scale: torch.Tensor,
     global_scale: torch.Tensor,
@@ -179,8 +206,9 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         (
             "silu or clamped SwiGLU activation",
             # The fused GMM also implements canonical clamped SwiGLU
-            # (swigluoai, as in GPT-OSS), so such layers can use fused-RS.
-            runner_config.activation in ("silu", "silu_and_mul_clamp", "swigluoai"),
+            # (swigluoai, as in GPT-OSS) and SiTU, so such layers can use fused-RS.
+            runner_config.activation
+            in ("silu", "silu_and_mul_clamp", "swigluoai", "situ"),
         ),
         (
             "router weight not applied on input",
@@ -258,6 +286,20 @@ def prepare_tpu_nvfp4_moe_weights(
     _E, two_I, _hidden_packed = w13.shape
     intermediate = two_I // 2
 
+    w13_global_scale = getattr(layer, "w13_weight_scale_2", None)
+    w2_global_scale = getattr(layer, "w2_weight_scale_2", None)
+    w13_gs = w2_gs = None
+    e4m3_scales = use_fused_rs and tpu_envs.SGLANG_TPU_NVFP4_E4M3_SCALES.get()
+    if e4m3_scales:
+        # The block scales stay e4m3 as stored; the kernels apply the globals.
+        w13_gs, w2_gs = _expert_global_scales(
+            None if w13_global_scale is None else w13_global_scale.data,
+            None if w2_global_scale is None else w2_global_scale.data,
+            num_experts=_E,
+            device=w13.device,
+        )
+        scale_dtype = torch.float8_e4m3fn
+
     # Pad intermediate to align_to; pad_n must stay a multiple of group_size and
     # PACKING to keep scale blocks and packed bytes whole (enforced below).
     pad_n = (align_to - intermediate % align_to) % align_to
@@ -274,17 +316,13 @@ def prepare_tpu_nvfp4_moe_weights(
 
         prepare_tpu_fused_rs_post_expert_norm(layer)
         prepare_fused_moe_rs(layer)
-    else:
-        from sglang_tpu.envs import envs as tpu_envs
-
-        if tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.get():
-            scale_dtype = torch.float32
+    elif tpu_envs.SGLANG_TPU_NVFP4_MOE_FP32_SCALES.get():
+        scale_dtype = torch.float32
 
     # W13: fold global scale, pad gate/up halves, and rebind before touching W2
     # so single-device PP stages do not hold both layers' temporaries at once.
     w13_s = layer.w13_weight_scale.data.float()
-    w13_global_scale = getattr(layer, "w13_weight_scale_2", None)
-    if w13_global_scale is not None:
+    if not e4m3_scales and w13_global_scale is not None:
         w13_s = _fold_w13_global_scale(w13_s, w13_global_scale.data)
     w13_w = _pad_gate_up_halves_axis1(w13, intermediate, pad_n)
     w13_s = _pad_gate_up_halves_axis1(w13_s, intermediate, pad_n)
@@ -313,8 +351,7 @@ def prepare_tpu_nvfp4_moe_weights(
     # W2: pad packed-K and scale blocks to match, then transpose so N = hidden.
     w2 = layer.w2_weight.data  # (E, H, I/2) uint8
     w2_s = layer.w2_weight_scale.data.float()
-    w2_global_scale = getattr(layer, "w2_weight_scale_2", None)
-    if w2_global_scale is not None:
+    if not e4m3_scales and w2_global_scale is not None:
         w2_s *= w2_global_scale.data.float()[:, None, None]
     pad_k_packed = pad_n // PACKING
     pad_k_blocks = pad_n // group_size
@@ -336,6 +373,8 @@ def prepare_tpu_nvfp4_moe_weights(
     _free_replaced_storage(old_w2, layer.w2_weight.data)
     _free_replaced_storage(old_w2_scale, layer.w2_weight_scale.data)
     del old_w2, old_w2_scale, w2_w, w2_scale
+    layer.register_buffer("_tpu_w13_global_scale", w13_gs, persistent=False)
+    layer.register_buffer("_tpu_w2_global_scale", w2_gs, persistent=False)
 
     for name in _UNUSED_NVFP4_MOE_PARAMS:
         _clear_replaced_param(layer, name)
@@ -366,6 +405,7 @@ def apply_tpu_nvfp4_moe(
         if activation != "silu":
             raise ValueError("TPU clamped MoE requires silu activation")
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
+    activation = pallas_moe_activation(activation, layer)
 
     qblock = qblock_layout(layer)
     if qblock and not use_fused_rs:
@@ -388,7 +428,13 @@ def apply_tpu_nvfp4_moe(
         topk_weights = topk_weights.to(hidden_states.dtype)
         topk_ids = topk_ids.to(torch.int32)
         valid = topk_ids >= 0
-        topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
+        # Masked slots (-1) spread over all experts: id 0 would send every padding row to the
+        # one rank owning expert 0; an id past the last expert deadlocks the kernel's receive count.
+        spread_ids = (
+            torch.arange(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+            % layer.num_experts
+        ).view_as(topk_ids)
+        topk_ids = torch.where(valid, topk_ids, spread_ids)
         topk_weights = topk_weights * valid.to(topk_weights.dtype)
 
         post_expert_norm_weight = get_tpu_fused_rs_post_expert_norm_weight(layer)
@@ -469,6 +515,8 @@ def apply_tpu_nvfp4_moe(
                 keep_token_shard=keep_output_shard,
                 expert_tp=expert_tp,
                 oneshot_rank=getattr(layer, "_tpu_oneshot_rank", None),
+                w1_global_scale=layer._tpu_w13_global_scale,
+                w2_global_scale=layer._tpu_w2_global_scale,
                 fp4_w4a16=bool(qblock),
             )
             outputs.append(output[:output_rows])

@@ -224,7 +224,9 @@ class FunctionCallParser:
         return sp_result.normal_text, sp_result.calls
 
     def get_legacy_structural_tag(
-        self, at_least_one: bool = False
+        self,
+        at_least_one: bool = False,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"], None] = None,
     ) -> StructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.
@@ -245,7 +247,12 @@ class FunctionCallParser:
         tool_trigger_set: Set[str] = set()
 
         get_structure_info = self.detector.structure_info()
-        for tool in self.tools:
+        tools = self.tools
+        if isinstance(
+            tool_choice, ToolChoice
+        ):  # a named choice admits only that function
+            tools = [t for t in tools if t.function.name == tool_choice.function.name]
+        for tool in tools:
             function = tool.function
             name = function.name
             assert name is not None
@@ -364,7 +371,9 @@ class FunctionCallParser:
                     # model's native tool call format. Schema is only included when
                     # strict=True, per OpenAI protocol semantics.
                     # For "auto": only constrain when strict is enabled.
-                    tag = self.get_legacy_structural_tag(at_least_one=is_required)
+                    tag = self.get_legacy_structural_tag(
+                        at_least_one=is_required, tool_choice=tool_choice
+                    )
                     return ("structural_tag", tag)
 
             if (

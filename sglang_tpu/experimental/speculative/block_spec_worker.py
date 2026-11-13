@@ -60,7 +60,7 @@ from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
 from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
     build_draft_block_inputs,
-    select_verify_rows,
+    verify_last_rows,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -73,7 +73,6 @@ from sglang_tpu.experimental.speculative.spec_types import (
 )
 from sglang_tpu.experimental.speculative.spec_utils import (
     pad_rows,
-    padded_h2d,
     prompt_positions,
 )
 from sglang_tpu.sampler import distributed_top_k_candidate_width_for_model
@@ -133,6 +132,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             if self._sampled_drafts:
                 self._warmup_draft_sampling()
         self._warmup_extend_draft_inputs()
+        self._warmup_recurrent_context()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
 
@@ -168,6 +168,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             draft_lattice,
             temperatures,
             top_ks,
+            state.req_pool_indices,
             target_candidates=bucket.target_candidates,
         )
         return DraftResult(
@@ -185,6 +186,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         draft_lattice: DraftLattice | None,
         temperatures: torch.Tensor,
         top_ks: torch.Tensor,
+        req_pool_indices: torch.Tensor,
         *,
         target_candidates: bool,
     ) -> SampledDrafts:
@@ -204,6 +206,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 bonus_tokens=bonus_tokens,
                 draft_lattice=draft_lattice,
                 sampler=sampling,
+                req_pool_indices=req_pool_indices,
             )
 
     def _sync_greedy_drafts(self, draft_tokens: torch.Tensor) -> torch.Tensor:
@@ -223,20 +226,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         assert target_hidden.shape[0] == rows.cache_locs.numel(), (
             "verify hidden must keep the batch bucket rows"
         )
-        full_to_swa = self._block_draft_worker.full_to_swa
-        if full_to_swa is not None:
-            # A hybrid-SWA draft writes the SWA slots of the same window, mapped on host.
-            swa_candidates = full_to_swa[verify_input.verify_cache_candidates_cpu]
-            rows = select_verify_rows(
-                padded_h2d(
-                    swa_candidates.to(torch.int64),
-                    rows.cache_locs.shape[0],
-                    self.device,
-                ),
-                verify_input.committed_lens,
-                state.seq_lens,
-                self.num_verify_rows,
-            )
+        # MERGE-REVIEW: public main re-selected SWA rows here from full_to_swa; the
+        # window rows already carry their SWA slots (VerifyRows.swa_*), per layer group.
+        del verify_input
         # Padded rows commit 0 tokens, so the writer skips them.
         with self._block_draft_worker.draft_context():
             kv_fence_tail = self._block_draft_worker.write_draft_kv(
@@ -245,6 +237,15 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 cache_loc=rows.flat_cache_locs,
                 cache_loc_2d=rows.cache_locs,
                 commit_lens=accept.accept_lens,
+                swa_cache_loc=rows.swa_flat_cache_locs,
+                swa_cache_loc_2d=rows.swa_cache_locs,
+            )
+            last_rows, live = verify_last_rows(accept.accept_lens, self.num_verify_rows)
+            self._block_draft_worker.seed_recurrent_context(
+                target_hidden=target_hidden,
+                rows=last_rows,
+                req_pool_indices=state.req_pool_indices,
+                live=live,
             )
         # Verify rows past the new seq_lens become dead target KV; freeing them is the allocator's job.
         next_state = SpecState(
@@ -262,9 +263,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        result.next_token_ids = self.sync_target_tokens(result.next_token_ids)
+        bonus_tokens = self.sync_target_tokens(result.next_token_ids)
+        # The scheduler copies the reported tokens to the host after the next step
+        # starts, and that step reuses the sampled buffer in place: report a copy.
         # Sampling ran at the batch bucket; the scheduler takes live rows.
-        result.next_token_ids = result.next_token_ids[: batch.seq_lens.shape[0]]
+        result.next_token_ids = bonus_tokens.clone()[: batch.seq_lens.shape[0]]
+        bonus_tokens = bonus_tokens[: batch.seq_lens.shape[0]]
         logits_output = result.logits_output
         target_hidden = logits_output.hidden_states
         if target_hidden is None:
@@ -289,15 +293,20 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             )
             cache_loc_cpu = batch.out_cache_loc
             assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
-            full_to_swa = self._block_draft_worker.full_to_swa
-            if full_to_swa is not None and not self.ships_pd_hidden:
-                cache_loc_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
         positions = pad_rows(positions_cpu, padded_rows).to(
             self.device, non_blocking=True
         )
-        cache_loc = pad_rows(cache_loc_cpu, padded_rows).to(
-            self.device, non_blocking=True
-        )
+        cache_loc_cpu = pad_rows(cache_loc_cpu, padded_rows)
+        cache_loc = cache_loc_cpu.to(self.device, non_blocking=True)
+        # Translated on the host, where the mapping lives: no device sync.
+        swa_cache_loc = None
+        if self.draft_swa_translate is not None:
+            # The appender was warmed with cache_loc's dtype for both slot inputs.
+            swa_cache_loc = (
+                self.draft_swa_translate(cache_loc_cpu)
+                .to(cache_loc_cpu.dtype)
+                .to(self.device, non_blocking=True)
+            )
         # Must inject before returning: the scheduler may update radix afterward,
         # invalidating out_cache_loc.
         if self.ships_pd_hidden:
@@ -309,12 +318,15 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     target_hidden=target_hidden,
                     positions=positions,
                     cache_loc=cache_loc,
+                    swa_cache_loc=swa_cache_loc,
                 )
+                if batch.reqs:
+                    self._seed_after_extend(batch, target_hidden)
         logits_output.hidden_states = None
         if not batch.reqs:
             return self._idle_extend_result(result)
         next_state = SpecState(
-            bonus_tokens=result.next_token_ids,
+            bonus_tokens=bonus_tokens,
             seq_lens=batch.seq_lens,
             req_pool_indices=batch.req_pool_indices,
         )
@@ -323,6 +335,23 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         next_draft_input.kv_fence_tail = kv_fence_tail
         result.next_draft_input = next_draft_input
         return result
+
+    def _seed_after_extend(
+        self, batch: ScheduleBatch, target_hidden: torch.Tensor
+    ) -> None:
+        """Seed the draft state from each request's last extend row (padded to the largest batch bucket)."""
+        num_rows = self._bucket_sizes()[-1]
+        last_rows = torch.tensor(batch.extend_lens, dtype=torch.int64).cumsum(0) - 1
+        req_rows = batch.req_pool_indices_cpu.to(torch.int64)
+        live = torch.arange(num_rows) < len(batch.reqs)
+        self._block_draft_worker.seed_recurrent_context(
+            target_hidden=target_hidden,
+            rows=pad_rows(last_rows, num_rows).to(self.device, non_blocking=True),
+            req_pool_indices=pad_rows(req_rows, num_rows).to(
+                self.device, non_blocking=True
+            ),
+            live=live.to(self.device, non_blocking=True),
+        )
 
     def verify_top_k_width(self) -> int | None:
         # Negotiates on every TP rank here, at init, never inside a compiled verify.
@@ -464,6 +493,21 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                             dtype=torch.int64,
                             device=self.device,
                         ),
+                        # A hybrid draft serves rows with SWA slots; warm that tree shape.
+                        **(
+                            dict(
+                                swa_cache_locs=torch.zeros(
+                                    block_shape, dtype=torch.int64, device=self.device
+                                ),
+                                swa_flat_cache_locs=torch.zeros(
+                                    (padded_bs * width,),
+                                    dtype=torch.int64,
+                                    device=self.device,
+                                ),
+                            )
+                            if self.draft_swa_translate is not None
+                            else {}
+                        ),
                     ),
                     torch.zeros((padded_bs,), dtype=torch.int64, device=self.device),
                     torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
@@ -502,6 +546,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                         draft_lattice,
                         temperatures,
                         top_ks,
+                        torch.zeros(
+                            (padded_bs,), dtype=torch.int64, device=self.device
+                        ),
                         target_candidates=target_candidates,
                     )
                     torch.cat(
@@ -516,6 +563,22 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                         self._warmup_candidates_accept(
                             padded_bs, sampled.draft_tokens, sampled.draft_candidates
                         )
+
+    def _warmup_recurrent_context(self) -> None:
+        """Seeds after extend (every token bucket) and commit (every batch bucket)."""
+        compile_policy = self.target_worker.model_runner.compile_policy
+        assert isinstance(compile_policy, DecoderTpuCompilePolicy)
+        assert compile_policy.t_bucketer is not None
+        token_buckets = tuple(compile_policy.t_bucketer.buckets)
+        batch_buckets = self._bucket_sizes()
+        hidden_rows = token_buckets + tuple(
+            bs * self.num_verify_rows for bs in batch_buckets
+        )
+        num_rows = (batch_buckets[-1],) * len(token_buckets) + batch_buckets
+        with torch.no_grad(), self._block_draft_worker.draft_context():
+            self._block_draft_worker.warmup_recurrent_context(
+                hidden_rows=hidden_rows, num_rows=num_rows
+            )
 
     def _warmup_extend_draft_inputs(self) -> None:
         """extend's draft positions / cache_loc uploads at every token bucket."""

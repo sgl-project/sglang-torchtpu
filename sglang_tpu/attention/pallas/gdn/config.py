@@ -129,6 +129,13 @@ class GDNConfig:
     # KDA only: the small weights arrive as one f32 array (see
     # memory_ref.unpack_kda_weights) instead of three kernel operands.
     packed_weights: bool = False
+    # Short convolution only (sconv_wrapper): no recurrent state, b, a or SiLU;
+    # out = (conv(x) [+ x_t]) * output_scale.
+    conv_only: bool = False
+    use_residual: bool = False
+    output_scale: float = 1.0
+    # conv_only: per-token tap weights conv_weight[k] + dyn[t, k], dyn f32.
+    dynamic: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -223,6 +230,9 @@ class GDNConfig:
         # Windows of different sizes compile to different kernels; keep them
         # distinguishable in profiles.
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
+        if self.conv_only:
+            kind = "dynamic" if self.dynamic else "static"
+            return f"sconv_{kind}_{self.mode.value}{suffix}"
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
         return (
@@ -288,7 +298,8 @@ class GDNConfig:
         # needed.
         if self.mode == GDNMode.PER_SEQ:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
-            carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
+            if not self.conv_only:
+                carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,

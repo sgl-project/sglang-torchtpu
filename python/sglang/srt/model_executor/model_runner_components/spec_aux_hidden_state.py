@@ -41,6 +41,8 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     eagle_aux_hidden_state_layer_ids: Any = None
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
+    # Draft layers whose KV lives in the target-sized SWA pool, not the full pool.
+    dflash_draft_swa_num_layers: int = 0
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
@@ -206,16 +208,31 @@ def _resolve_dflash_aux_hidden_state(
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
-        config.dflash_target_layer_ids = target_layer_ids
-        config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
+        config.dflash_draft_swa_num_layers = _dflash_draft_swa_num_layers(
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),
+        )
+        config.dflash_target_layer_ids = target_layer_ids
+        # Window layers are charged on the SWA side by the hybrid sizer.
+        config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
+            draft_model_config=draft_model_config,
+            draft_num_layers=int(draft_num_layers) - config.dflash_draft_swa_num_layers,
         )
         if config.dflash_draft_cell_size_per_token is not None:
             config.dflash_draft_kv_geometry = (
                 draft_model_config.get_num_kv_heads(get_parallel().tp_size),
                 draft_model_config.head_dim,
             )
+
+
+def _dflash_draft_swa_num_layers(
+    *, draft_model_config: ModelConfig, draft_num_layers: int
+) -> int:
+    """Draft layers the hybrid draft runner keeps in the SWA pool."""
+    if not draft_model_config.is_hybrid_swa:
+        return 0
+    swa_layer_ids = draft_model_config.swa_attention_layer_ids or []
+    return sum(0 <= int(layer_id) < draft_num_layers for layer_id in swa_layer_ids)
 
 
 def _resolve_dflash_draft_cell_size(

@@ -258,6 +258,9 @@ class InvokeKernelFn(Protocol):
         v_scale,
         decode_query_size: int = 1,
         use_causal_mask: bool = True,
+        rel_r=None,
+        rel_proj=None,
+        token_sink=None,
     ) -> tuple: ...
 
 
@@ -294,6 +297,9 @@ class RpaKernelSpec:
     # per sequence, so fixed-width target verification and decode-phase draft
     # extension run as decode.
     supports_decode_query_size: bool = False
+    # Whether the kernel consumes a learned relative-position bias
+    # (``rel_r``/``rel_proj``) and per-token sinks (``token_sink``).
+    supports_rel_bias: bool = False
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend
@@ -369,6 +375,14 @@ def _resolve_decode_query_size(
     return get_spec().speculative_num_draft_tokens or 1
 
 
+_REL_KWARGS = ("rel_r", "rel_proj", "token_sink")
+
+
+def _rel_kwargs(kwargs: dict) -> dict[str, torch.Tensor]:
+    """Relative-bias / per-token-sink attention kwargs the caller actually set."""
+    return {k: kwargs[k] for k in _REL_KWARGS if kwargs.get(k) is not None}
+
+
 def _build_pallas_kernel_op(spec: RpaKernelSpec):
     """Lazily register ``spec``'s ragged_paged_attention kernel as a torch custom op.
 
@@ -412,10 +426,24 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         decode_query_size: int = 1,
         prefill_kv_tile_hint: jax.Array | None = None,
         use_causal_mask: bool = True,
+        rel_r: jax.Array | None = None,
+        rel_proj: jax.Array | None = None,
+        token_sink: jax.Array | None = None,
         layer_idx: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
+        rel_options = {}
+        if rel_proj is not None or token_sink is not None:
+            if not spec.supports_rel_bias:
+                raise NotImplementedError(
+                    f"{op_name} does not support relative bias or per-token sinks"
+                )
+            rel_options = {
+                "rel_r": rel_r,
+                "rel_proj": rel_proj,
+                "token_sink": token_sink,
+            }
         kv_cache_flat = kv_cache_fused
         if layer_idx is not None:
             num_blocks, layer_num = kv_cache_fused.shape[:2]
@@ -452,6 +480,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             decode_query_size=decode_query_size,
             use_causal_mask=use_causal_mask,
             **hint_options,
+            **rel_options,
         )
         return output, updated.reshape(kv_cache_fused.shape)
 
@@ -460,9 +489,9 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         name=f"jax_{op_name}",
         # Static (non-traced) args by _wrapped position: 10=sm_scale,
         # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale,
-        # 15=decode_query_size, 17=use_causal_mask. 16=prefill_kv_tile_hint and
-        # 18=layer_idx are traced; a traced layer_idx lets every layer share one
-        # program.
+        # 15=decode_query_size, 17=use_causal_mask. 16=prefill_kv_tile_hint,
+        # 18-20=rel_r/rel_proj/token_sink and 21=layer_idx are traced; a traced
+        # layer_idx lets every layer share one program.
         static_argnums=(10, 11, 12, 13, 14, 15, 17),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
@@ -493,6 +522,9 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         decode_query_size: int = 1,
         prefill_kv_tile_hint: torch.Tensor | None = None,
         use_causal_mask: bool = True,
+        rel_r: torch.Tensor | None = None,
+        rel_proj: torch.Tensor | None = None,
+        token_sink: torch.Tensor | None = None,
         layer_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
@@ -515,6 +547,9 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 decode_query_size,
                 prefill_kv_tile_hint,
                 use_causal_mask,
+                rel_r,
+                rel_proj,
+                token_sink,
                 layer_idx,
             )
         return output
@@ -1531,7 +1566,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        return self._forward(q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"))
+        return self._forward(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            sinks=kwargs.get("sinks"),
+            rel=_rel_kwargs(kwargs),
+        )
 
     def forward_decode(
         self,
@@ -1548,7 +1591,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # TorchNativeAttnBackend.
         q_heads = layer.tp_q_head_num * getattr(layer, "dcp_q_heads_factor", 1)
         q = q.reshape(-1, q_heads * layer.qk_head_dim)
-        return self._forward(q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"))
+        return self._forward(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            sinks=kwargs.get("sinks"),
+            rel=_rel_kwargs(kwargs),
+        )
 
     def _kv_lens(self, forward_batch: ForwardBatch) -> torch.Tensor:
         # The fused draft loop runs every step on step 0's metadata and passes
@@ -1579,6 +1630,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         layer: "RadixAttention",
         forward_batch: ForwardBatch,
         sinks: torch.Tensor | None = None,
+        rel: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         assert self.forward_metadata is not None, (
             "Pallas attention backend was not initialised for this forward pass; "
@@ -1697,6 +1749,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
 
         kv_lens = self._kv_lens(forward_batch)
+        if rel and (self._dcp > 1 or pack > 1):
+            raise NotImplementedError(
+                "relative bias and per-token sinks need dcp 1 and unpacked KV heads"
+            )
         if self._dcp > 1:
             if not use_causal_mask:
                 raise NotImplementedError(
@@ -1743,6 +1799,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 v_scale,
                 self.forward_metadata.decode_query_size,
                 use_causal_mask=use_causal_mask,
+                **(rel or {}),
                 layer_idx=kv_layer_idx,
             )
 

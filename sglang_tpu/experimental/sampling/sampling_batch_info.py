@@ -7,6 +7,7 @@ from typing import Callable
 
 import torch
 
+from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -29,6 +30,19 @@ def _pad_host_rows(
     out = torch.full((rows, *value.shape[1:]), fill, dtype=value.dtype, pin_memory=pin)
     out[: value.shape[0]] = value
     return out
+
+
+class RowPaddedGrammarMask(GrammarMask):
+    """A grammar mask whose missing trailing logits rows (bucket padding) allow every token."""
+
+    __slots__ = ()
+
+    def apply(self, logits: torch.Tensor) -> None:
+        mask = self.vocab_mask
+        pad = logits.shape[0] - mask.shape[0]
+        if pad > 0:
+            mask = torch.nn.functional.pad(mask, (0, 0, 0, pad), value=-1)
+        self.grammar.apply_vocab_mask(logits=logits, vocab_mask=mask)
 
 
 @dataclasses.dataclass
@@ -84,6 +98,12 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
             fill = _PARAM_FILLS[name]
             setattr(self, name, _pad_host_rows(value, padded_bs, fill, pin))
         self.real_batch_size = batch_size
+
+    def update_regex_vocab_mask(self):
+        # Logits may sit at a wider extend cap than the bucket rows the mask covers.
+        super().update_regex_vocab_mask()
+        if self.grammar_mask is not None:
+            self.grammar_mask = RowPaddedGrammarMask(*self.grammar_mask)
 
     def host_params_at(self, rows: int) -> dict[str, torch.Tensor]:
         """Host sampling params with exactly the selected bucket's rows."""

@@ -913,19 +913,26 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
     def get_direct_compile_kv_pool(self):
         kv_pool = self.model_runner.token_to_kv_pool
-        if not isinstance(kv_pool, HybridLinearKVPool):
+        req_to_token_pool = getattr(self.model_runner, "req_to_token_pool", None)
+        if not isinstance(kv_pool, HybridLinearKVPool) and not isinstance(
+            req_to_token_pool, HybridReqToTokenPool
+        ):
             return kv_pool
         from sglang_tpu.compilation.hybrid_linear_direct_compile import (
             has_linear_attention,
             hybrid_linear_kv_pool_state,
         )
 
+        # Conv-state models without linear-attention layers keep a plain or SWA KV pool.
+        full_kv_pool = (
+            kv_pool.full_kv_pool if isinstance(kv_pool, HybridLinearKVPool) else kv_pool
+        )
         # An MTP draft shares the target's GDN state but runs no GDN layer; lifting it
         # swaps in new buffers per forward and Raiden keeps the stale registered ones.
         if not has_linear_attention(self.model_runner.model):
-            return kv_pool.full_kv_pool
+            return full_kv_pool
         return hybrid_linear_kv_pool_state(
-            kv_pool=kv_pool, req_to_token_pool=self.model_runner.req_to_token_pool
+            full_kv_pool=full_kv_pool, req_to_token_pool=req_to_token_pool
         )
 
     def _ignored_argnames(self) -> tuple[str, ...]:

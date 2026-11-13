@@ -130,6 +130,7 @@ class TestExperimentalEagle3(CustomTestCase):
             carry_size=3, carry=torch.zeros((3, 3)), dsa_seed_topk_table=None
         )
         worker._draft_runner = SimpleNamespace(dtype=torch.float32)
+        worker._draft_swa_translate = None
         buckets = SimpleNamespace(buckets=[1, 2], max_val=2, next_bucket=lambda bs: bs)
         selections = []
         drafts = []
@@ -939,6 +940,36 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         self._run_fused(drafter)
         self.assertEqual(calls, ["wait", "draft"])
+
+
+class TestDraftSwaTranslateAfterPoolAlloc(CustomTestCase):
+    def test_translation_is_resolved_once_the_draft_pool_exists(self):
+        """The scheduler builds the spec worker before any KV pool, so the draft SWA
+        translation must be resolved when the pools are allocated, not at init."""
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+
+        class _Worker(TpuSpecWorker):
+            pass
+
+        _Worker.__abstractmethods__ = frozenset()
+        for pool, expect_translate in (
+            (object.__new__(SWAKVPool), True),
+            (object(), False),
+        ):
+            with self.subTest(pool=type(pool).__name__):
+                worker = object.__new__(_Worker)
+                runner = SimpleNamespace()
+                worker._draft_worker = SimpleNamespace(draft_runner=runner)
+                worker._draft_swa_translate = None
+
+                def alloc(self, *a, **kw):
+                    runner.token_to_kv_pool = pool
+
+                with patch.object(BaseSpecWorker, "alloc_memory_pool", alloc):
+                    worker.alloc_memory_pool()
+                has_translate = worker.draft_swa_translate is not None
+                self.assertEqual(has_translate, expect_translate)
 
 
 class _IdentityChainDrafter(TpuChainDraftWorker):

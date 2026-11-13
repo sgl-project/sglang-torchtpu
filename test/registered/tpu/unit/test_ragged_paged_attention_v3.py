@@ -812,5 +812,268 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         self._run_and_compare(inputs, distribution=(1, 1, 1), tolerance=0.2)
 
 
+@unittest.skipIf(not _has_jax_tpu(), _SKIP_REASON)
+class TestRaggedPagedAttentionV3RelBias(unittest.TestCase):
+    """Learned relative-position bias + per-token sinks vs the reference.
+
+    Sequences run past the 128-distance bias extent and the sliding window so
+    in-extent, out-of-extent and windowed tiles are all covered.
+    """
+
+    NUM_Q_HEADS = 6  # 6 q heads per kv head, as in the target model
+    NUM_KV_HEADS = 1
+    HEAD_DIM = 128
+    PAGE_SIZE = 16
+    PAGES_PER_SEQ = 24
+    TOTAL_NUM_PAGES = 72
+    REL_DIM = 16
+    EXTENT = 128
+    TOLERANCE = 0.05
+
+    _build_inputs = TestRaggedPagedAttentionV3._build_inputs
+
+    def _rel_inputs(self, inputs, *, seed=1, with_bias=True, with_sink=True):
+        import jax
+        import jax.numpy as jnp
+
+        k_r, k_p, k_s = jax.random.split(jax.random.PRNGKey(seed), 3)
+        shape = (inputs["max_num_tokens"], inputs["num_q_heads"])
+        out = {}
+        if with_bias:
+            # Bias of O(1) logits, comparable to the content score.
+            out["rel_r"] = (
+                jax.random.normal(k_r, (*shape, self.REL_DIM), jnp.float32) * 0.5
+            ).astype(jnp.bfloat16)
+            out["rel_proj"] = jax.random.normal(
+                k_p, (self.REL_DIM, self.EXTENT), jnp.float32
+            ).astype(jnp.bfloat16)
+        if with_sink:
+            out["token_sink"] = (
+                jax.random.normal(k_s, shape, jnp.float32) * 2.0
+            ).astype(jnp.bfloat16)
+        return out
+
+    def _run_and_compare(self, inputs, *, distribution, rel, tolerance=None, **kw):
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+            ref_ragged_paged_attention,
+        )
+
+        n = inputs["total_q_tokens"]
+        sm_scale = 1.0 / float(np.sqrt(self.HEAD_DIM))
+        ref_kw = {k: v for k, v in kw.items() if k in ("causal", "sliding_window")}
+        scale_kw = {
+            k: inputs[k] for k in ("k_scale", "v_scale") if inputs.get(k) is not None
+        }
+        ref_out = ref_ragged_paged_attention(
+            inputs["q"][:n],
+            inputs["ref_kpages"],
+            inputs["ref_vpages"],
+            inputs["kv_lens"],
+            inputs["ref_page_indices"],
+            inputs["cu_q_lens"],
+            jnp.array([inputs["num_seqs"]], dtype=jnp.int32),
+            sm_scale=sm_scale,
+            rel_r=rel["rel_r"][:n] if "rel_r" in rel else None,
+            rel_proj=rel.get("rel_proj"),
+            token_sink=rel["token_sink"][:n] if "token_sink" in rel else None,
+            **ref_kw,
+            **scale_kw,
+        )
+        out, _ = ragged_paged_attention(
+            inputs["q"],
+            inputs["new_k"],
+            inputs["new_v"],
+            inputs["kv_fused"],
+            inputs["kv_lens"],
+            inputs["page_indices_flat"],
+            inputs["cu_q_lens"],
+            inputs["cu_kv_lens"],
+            jnp.asarray(distribution, dtype=jnp.int32),
+            None,  # custom_mask
+            None,  # attention_sink
+            rel.get("rel_r"),
+            rel.get("rel_proj"),
+            rel.get("token_sink"),
+            sm_scale=sm_scale,
+            **kw,
+            **scale_kw,
+        )
+        diff = jnp.abs(ref_out.astype(jnp.float32) - out[:n].astype(jnp.float32)).max()
+        tol = tolerance if tolerance is not None else self.TOLERANCE
+        self.assertLess(float(diff), tol, f"max abs diff {float(diff)} >= {tol}")
+
+    def test_extend_full_attention(self):
+        inputs = self._build_inputs([(300, 300)])
+        self._run_and_compare(
+            inputs, distribution=(0, 0, 1), rel=self._rel_inputs(inputs)
+        )
+
+    def test_extend_with_prefix_sliding_window(self):
+        """Window equal to the extent, as in the local layers."""
+        inputs = self._build_inputs([(330, 190)])
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 1),
+            rel=self._rel_inputs(inputs),
+            sliding_window=self.EXTENT,
+        )
+
+    def test_extend_small_tiles(self):
+        """Several compute tiles per query and KV block exercise the shear."""
+        inputs = self._build_inputs([(300, 200)])
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 1),
+            rel=self._rel_inputs(inputs),
+            m_block_sizes=(64, 128, 16, 32),
+        )
+
+    def test_wide_compute_tile_is_sub_tiled(self):
+        """A compute tile wider than the bias tile (512 keys) is cut into bias
+        tiles where the bias is non-zero and left whole elsewhere; the kernel
+        used to refuse such tiles, which cost 3x at long context."""
+        inputs = self._build_inputs([(300, 300)])
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 1),
+            rel=self._rel_inputs(inputs),
+            m_block_sizes=(64, 1024, 64, 1024),
+        )
+        inputs = self._build_inputs([(260, 8), (300, 8)])
+        self._run_and_compare(
+            inputs,
+            distribution=(2, 2, 2),
+            rel=self._rel_inputs(inputs),
+            decode_query_size=8,
+            d_block_sizes=(8, 1024, 8, 1024),
+        )
+        # The kernel donates its inputs: rebuild them for the next call.
+        inputs = self._build_inputs([(260, 8), (300, 8)])
+        with self.assertRaises(ValueError):
+            self._run_and_compare(
+                inputs,
+                distribution=(2, 2, 2),
+                rel=self._rel_inputs(inputs),
+                decode_query_size=8,
+                d_block_sizes=(8, 1536, 8, 768),
+            )
+
+    def test_decode_multi_seq(self):
+        inputs = self._build_inputs([(260, 1), (37, 1), (129, 1)])
+        self._run_and_compare(
+            inputs, distribution=(3, 3, 3), rel=self._rel_inputs(inputs)
+        )
+
+    def test_decode_sliding_window(self):
+        inputs = self._build_inputs([(260, 1), (128, 1)])
+        self._run_and_compare(
+            inputs,
+            distribution=(2, 2, 2),
+            rel=self._rel_inputs(inputs),
+            sliding_window=self.EXTENT,
+        )
+
+    def test_mixed_decode_and_extend(self):
+        inputs = self._build_inputs([(200, 1), (250, 120)])
+        self._run_and_compare(
+            inputs, distribution=(1, 1, 2), rel=self._rel_inputs(inputs)
+        )
+
+    def test_prefill_case(self):
+        """The PREFILL pallas_call (static chunk length) threads the output."""
+        inputs = self._build_inputs([(100, 1), (160, 64), (64, 64)])
+        self._run_and_compare(
+            inputs,
+            distribution=(1, 3, 3),
+            rel=self._rel_inputs(inputs),
+            chunk_prefill_size=64,
+        )
+
+    def test_bias_only(self):
+        inputs = self._build_inputs([(300, 300)])
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 1),
+            rel=self._rel_inputs(inputs, with_sink=False),
+        )
+
+    def test_token_sink_only(self):
+        inputs = self._build_inputs([(150, 150), (90, 1)])
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 2),
+            rel=self._rel_inputs(inputs, with_bias=False),
+        )
+
+    def test_gqa_two_kv_heads(self):
+        inputs = self._build_inputs([(300, 140)], num_q_heads=12, num_kv_heads=2)
+        self._run_and_compare(
+            inputs, distribution=(0, 0, 1), rel=self._rel_inputs(inputs)
+        )
+
+    def test_fp8_kv(self):
+        import jax.numpy as jnp
+
+        # fp8 packs 4 K/V heads per word, so 2 kv heads (6 q heads each).
+        inputs = self._build_inputs(
+            [(260, 1), (300, 150)],
+            num_q_heads=12,
+            num_kv_heads=2,
+            kv_dtype=jnp.float8_e4m3fn,
+            k_scale=1.0,
+            v_scale=1.0,
+        )
+        self._run_and_compare(
+            inputs,
+            distribution=(1, 1, 2),
+            rel=self._rel_inputs(inputs),
+            tolerance=0.1,
+        )
+
+    # Under speculative decoding every call is compiled with decode_query_size =
+    # the verify width, prefill included.
+    def test_extend_with_decode_query_size(self):
+        inputs = self._build_inputs([(300, 300), (180, 70)])
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 2),
+            rel=self._rel_inputs(inputs),
+            decode_query_size=8,
+        )
+
+    def test_extend_sliding_window_with_decode_query_size(self):
+        inputs = self._build_inputs([(330, 190)])
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 1),
+            rel=self._rel_inputs(inputs),
+            sliding_window=self.EXTENT,
+            decode_query_size=8,
+        )
+
+    def test_verify_window(self):
+        """Fixed-width verify: 8 query rows per sequence on the DECODE range."""
+        inputs = self._build_inputs([(260, 8), (37, 8), (129, 8)])
+        self._run_and_compare(
+            inputs,
+            distribution=(3, 3, 3),
+            rel=self._rel_inputs(inputs),
+            decode_query_size=8,
+        )
+
+    def test_verify_window_sliding(self):
+        inputs = self._build_inputs([(300, 8), (140, 8)])
+        self._run_and_compare(
+            inputs,
+            distribution=(2, 2, 2),
+            rel=self._rel_inputs(inputs),
+            sliding_window=self.EXTENT,
+            decode_query_size=8,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

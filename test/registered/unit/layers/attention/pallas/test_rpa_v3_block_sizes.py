@@ -156,5 +156,120 @@ class TestTpu7xVerifyBlocks(CustomTestCase):
         )
 
 
+def _fp8_single_kv_decode_blocks(
+    *,
+    page_size,
+    pages_per_seq,
+    decode_query_size,
+    sliding_window=None,
+    num_q_heads=6,
+    max_num_seqs=64,
+):
+    """Decode-case blocks for 1 fp8 KV head with the whole tpu7x VMEM as limit."""
+    with mock.patch.object(rpa, "get_tpu_version", return_value=7):
+        blocks = rpa.get_default_block_sizes(
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            num_q_heads,
+            1,
+            128,
+            page_size,
+            512,
+            max_num_seqs,
+            pages_per_seq,
+            case=rpa.RpaCase.DECODE,
+            vmem_limit_bytes=TPU7X_VMEM,
+            sliding_window=sliding_window,
+            decode_query_size=decode_query_size,
+        )
+    return tuple(blocks[k] for k in ("bq_sz", "bkv_sz", "bq_csz", "bkv_csz"))
+
+
+class TestTpu7xFp8SingleKvDecodeBlocks(CustomTestCase):
+    def test_8_row_verify_full_attention_takes_8192_kv_rows(self):
+        """6 query heads over 1 fp8 KV head verifying 8 rows: 8192-row DMA
+        blocks in 4096-row compute tiles at pages 128 and 512, 8k to 1M
+        context. Measured on tpu7x (rel bias on, bs 1-64): 3-12% faster than
+        the VMEM-shrunk (4096, 4096) at 8k, 16-19% at 120k and 1M."""
+        for page_size in (128, 512):
+            for max_kv in (8192, 131072, 1048576):
+                with self.subTest(page_size=page_size, max_kv=max_kv):
+                    self.assertEqual(
+                        _fp8_single_kv_decode_blocks(
+                            page_size=page_size,
+                            pages_per_seq=max_kv // page_size,
+                            decode_query_size=8,
+                        ),
+                        (8, 8192, 8, 4096),
+                    )
+
+    def test_1_row_window_layer_takes_a_2_window_block(self):
+        """1-row decode of a 1024-token window over 16+ sequences: a 2048-row
+        DMA block in 1024-row compute tiles. Measured on tpu7x at 8k and 120k
+        context, bs 16-64: 15-40% faster than one window-sized block (bs 1-8
+        mixed, so small batches keep it)."""
+        for page_size in (128, 512):
+            with self.subTest(page_size=page_size):
+                self.assertEqual(
+                    _fp8_single_kv_decode_blocks(
+                        page_size=page_size,
+                        pages_per_seq=1048576 // page_size,
+                        decode_query_size=1,
+                        sliding_window=1024,
+                    ),
+                    (1, 2048, 1, 1024),
+                )
+
+    def test_unmeasured_shapes_keep_the_heuristic(self):
+        """1-row full attention, 8-row window layers, 1-row window layers
+        under 16 sequences, a context below one 8192-row block and a 4-head
+        group keep the general heuristic."""
+        cases = [
+            (
+                dict(page_size=512, pages_per_seq=2048, decode_query_size=1),
+                (1, 8192, 1, 8192),
+            ),
+            (
+                dict(
+                    page_size=512,
+                    pages_per_seq=2048,
+                    decode_query_size=8,
+                    sliding_window=1024,
+                ),
+                (8, 1024, 8, 1024),
+            ),
+            (
+                dict(
+                    page_size=512,
+                    pages_per_seq=2048,
+                    decode_query_size=1,
+                    sliding_window=1024,
+                    max_num_seqs=8,
+                ),
+                (1, 1024, 1, 1024),
+            ),
+            (
+                dict(page_size=128, pages_per_seq=32, decode_query_size=8),
+                (8, 4096, 8, 4096),
+            ),
+            (
+                dict(
+                    page_size=512,
+                    pages_per_seq=2048,
+                    decode_query_size=8,
+                    num_q_heads=4,
+                ),
+                None,
+            ),
+        ]
+        for kw, want in cases:
+            with self.subTest(**kw):
+                got = _fp8_single_kv_decode_blocks(**kw)
+                if want is None:
+                    self.assertNotEqual(got[1:4:2], (8192, 4096))
+                else:
+                    self.assertEqual(got, want)
+
+
 if __name__ == "__main__":
     unittest.main()

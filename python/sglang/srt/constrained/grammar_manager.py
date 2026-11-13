@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from concurrent import futures
@@ -157,6 +158,14 @@ class GrammarManager:
             else:
                 if req.sampling_params.json_schema is not None:
                     key = ("json", req.sampling_params.json_schema)
+                    custom_params = req.sampling_params.custom_params or {}
+                    if "__sglang_inkling_json" in custom_params:
+                        key = (
+                            "inkling_json",
+                            json.dumps(
+                                [key[1], custom_params["__sglang_inkling_json"]]
+                            ),
+                        )
                 elif req.sampling_params.regex is not None:
                     key = ("regex", req.sampling_params.regex)
                 elif req.sampling_params.ebnf is not None:

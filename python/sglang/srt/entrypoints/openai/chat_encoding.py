@@ -145,6 +145,8 @@ def resolve_chat_encoding_spec(
     # Inkling has no Jinja chat_template and uses a tiktoken base + a special-token
     # overlay + negative MM placeholders, so it can't go through apply_chat_template;
     # render input_ids directly via the Inkling renderer (serving_chat._encode_messages).
+    if "Inkling2ForConditionalGeneration" in arch:
+        return "inkling2"
     if "InklingForConditionalGeneration" in arch:
         return "inkling"
 
@@ -230,7 +232,7 @@ def spec_renders_prompt_ids(spec: Optional[str]) -> bool:
     Token-first encoders leave the text prompt empty; the MM processor
     expands their single placeholder ids rather than re-tokenizing text.
     """
-    return spec in ("inkling", "kimi_k3", "dsv41")
+    return spec in ("inkling", "inkling2", "kimi_k3", "dsv41")
 
 
 def encode_simple_chat(
@@ -248,6 +250,11 @@ def encode_simple_chat(
     ``serving_chat``: dsv4/dsv32 get an empty one prepended, dsv41 does not
     (it renders a system token even for empty content).
     """
+    if spec == "inkling2":
+        from sglang.tml.server import render_inkling2_messages, rendering_tokenizer
+
+        return render_inkling2_messages(messages, rendering_tokenizer(tokenizer))
+
     if spec == "inkling":
         from sglang.srt.parser.inkling_renderer import render_inkling_messages
         from sglang.srt.parser.inkling_tokenizer import InklingTokenizer

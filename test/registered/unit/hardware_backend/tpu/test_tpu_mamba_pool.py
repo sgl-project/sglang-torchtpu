@@ -45,7 +45,13 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.mamba_pool import AT_SLOT, TpuMambaPool, verify_track_steps
+from sglang_tpu.mamba_pool import (
+    AT_SLOT,
+    TpuMambaPool,
+    read_state_rows,
+    verify_track_steps,
+    write_state_rows,
+)
 
 
 def _make_cache_params(n_kq, n_v, d_k, d_v, K, layers):
@@ -430,6 +436,49 @@ class TestTpuMambaPool(CustomTestCase):
             self.assertTrue(torch.all(state[6] == 0))
             self.assertTrue(torch.all(state[0] == 0))
 
+    def test_conv_only_pool_radix_copies_cover_every_stream(self):
+        """Inkling keeps six conv streams per layer and no recurrent state. A prefix
+        hit (copy_from), a post-verify snapshot and a host offload page must each
+        move every stream; one that moves conv[0] only passes the GDN cases above."""
+        from sglang.srt.configs.inkling import (
+            InklingConvCacheParams,
+            InklingConvStateShape,
+        )
+        from sglang_tpu.tpu_dma_hicache import page_major_tensors
+
+        dims = (4, 4, 2, 2, 8, 8)
+        cp = InklingConvCacheParams(
+            shape=InklingConvStateShape(
+                conv=[(self.K - 1, d) for d in dims], temporal=(0, 0, 0)
+            ),
+            layers=[0, 1],
+        )
+        pool = TpuMambaPool(
+            size=4,
+            spec_state_size=2,
+            cache_params=cp,
+            mamba_layer_ids=[0, 1],
+            device="cpu",
+            speculative_num_draft_tokens=2,
+            speculative_eagle_topk=1,
+        )
+        states = pool.get_state()
+        self.assertEqual(len(states), len(dims) * 2)
+        offloaded = page_major_tensors(pool)
+        self.assertEqual(len(offloaded), len(states))
+        self.assertTrue(all(a is b for a, b in zip(offloaded, states)))
+        # Request row 1's window holds rows 7 and 8.
+        for i, state in enumerate(states):
+            state[1].fill_(i + 1)
+            state[8].fill_(i + 100)
+        pool.copy_from(torch.tensor([1]), torch.tensor([3]))
+        pool.snapshot_checkpoints(
+            torch.tensor([4], dtype=torch.int32), torch.tensor([1]), torch.tensor([1])
+        )
+        for i, state in enumerate(states):
+            self.assertTrue(torch.all(state[3] == i + 1))
+            self.assertTrue(torch.all(state[4] == i + 100))
+
     def test_verify_track_steps_match_the_boundary_crossing(self):
         """From 62, accepting 3 reaches 65: the 64-token boundary is window step
         1. From 60, accepting 2 stays short; an inactive row (-1) commits nothing;
@@ -438,6 +487,36 @@ class TestTpuMambaPool(CustomTestCase):
             torch.tensor([62, 60, 66, 64]), torch.tensor([2, 1, -1, 3]), 64
         )
         self.assertEqual(steps.tolist(), [1, -1, -1, -1])
+
+
+class TestWriteStateRows(CustomTestCase):
+    """The sconv row scatter writes exactly the live rows; dead rows touch nothing."""
+
+    def _check(self, rows, live):
+        state = torch.randn(41, 3, 1, 16)
+        new = torch.randn(rows.shape[0], 3 * 16)
+        expected = state.clone()
+        for i in live.nonzero().flatten().tolist():
+            expected[rows[i]] = new[i].view(3, 1, 16)
+        write_state_rows(state, rows, new, live)
+        torch.testing.assert_close(state, expected, rtol=0, atol=0)
+
+    def test_pads_share_null_slot(self):
+        # Pad requests carry slot -1, clamped to the null slot 0 before the write.
+        indices = torch.tensor([5, -1, 2, -1, -1, 9])
+        self._check(indices.clamp(min=0), indices >= 0)
+
+    def test_dead_row_aliasing_live_row_is_skipped(self):
+        rows = torch.tensor([17, 18, 19, 17, 18, 19, 33, 34])
+        live = torch.tensor([True, True, True, False, False, False, True, True])
+        self._check(rows, live)
+
+
+class TestReadStateRows(CustomTestCase):
+    def test_reads_rows_in_order_with_repeats(self):
+        state = torch.randn(9, 3, 1, 16)
+        rows = torch.tensor([4, 0, 4, 8], dtype=torch.int32)
+        torch.testing.assert_close(read_state_rows(state, rows), state[rows.long()])
 
 
 if __name__ == "__main__":

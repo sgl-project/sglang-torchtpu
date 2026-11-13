@@ -34,6 +34,7 @@ from sglang.srt.compilation.support_torch_compile import (
     get_torch_compile_policy,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.core_compile_annotations import (
     annotate_core_compile_boundaries,
@@ -295,7 +296,7 @@ class TpuGraphRunner:
                 compile_timing_recorder=compile_timing_recorder,
             )
             if issubclass(policy_cls, DecoderTpuCompilePolicy):
-                policy_kwargs["tracer"] = model_runner.server_args.tpu_compile_tracer
+                policy_kwargs["tracer"] = get_exec().graph.tpu_compile_tracer
             policy = policy_cls(**policy_kwargs)
             installed = policy.install()
             if installed:
@@ -332,7 +333,7 @@ class TpuGraphRunner:
                 method=getattr(self.model, "forward", None),
                 name=f"{role}/forward",
                 label=type(self.model).__name__,
-                tracer=server_args.tpu_compile_tracer,
+                tracer=get_exec().graph.tpu_compile_tracer,
                 compile_timing_recorder=compile_timing_recorder,
             )
             if fallback_policy.install():

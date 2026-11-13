@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 @_register_for(
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationMTP",
+    "Inkling2ForConditionalGeneration",
 )
 def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     """Inkling architecture defaults: SWA / mamba KV-pool ratios tuned for the

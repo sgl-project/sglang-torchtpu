@@ -406,6 +406,13 @@ def supports_padded_sampling(info: SamplingBatchInfo) -> bool:
     )
 
 
+def _supports_padded_rows(info: SamplingBatchInfo) -> bool:
+    """supports_padded_sampling, except a HOST_PADDED grammar mask, which pads its own rows."""
+    if is_host_padded(info) and any(info.grammars or ()):
+        info = replace(info, grammars=None)
+    return supports_padded_sampling(info)
+
+
 def sampling_params_to_device(
     info: SamplingBatchInfo, *, padded_size: int | None = None
 ) -> SamplingBatchInfo:
@@ -509,7 +516,7 @@ class TpuSampler(Sampler):
             )
             physical_rows = logits.shape[0]
             if physical_rows != live_rows and (
-                return_logprob or not supports_padded_sampling(sampling_info)
+                return_logprob or not _supports_padded_rows(sampling_info)
             ):
                 raise ValueError("This sampling mode requires live-row logits")
             if (

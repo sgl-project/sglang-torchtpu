@@ -116,6 +116,9 @@ class VerifyRows(NamedTuple):
     # A reshape view fed to direct_compile costs an eager as_strided program per bucket.
     flat_positions: torch.Tensor
     flat_cache_locs: torch.Tensor
+    # The same slots in a hybrid draft's SWA sub-pool; None for a full-pool draft.
+    swa_cache_locs: torch.Tensor | None = None
+    swa_flat_cache_locs: torch.Tensor | None = None
 
 
 class DraftResult(NamedTuple):
@@ -219,10 +222,17 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
     seq_lens_cpu: torch.Tensor
     host_len_slack: int
     future_indices: torch.Tensor | None
+    # The candidate window translated to a hybrid draft's SWA sub-pool on the
+    # host, so verify rows pick SWA slots on device as well; None otherwise.
+    swa_verify_cache_candidates: torch.Tensor | None = None
 
     @classmethod
     def from_batch(
-        cls, batch: ScheduleBatch, num_verify_rows: int, padded_bs: int
+        cls,
+        batch: ScheduleBatch,
+        num_verify_rows: int,
+        padded_bs: int,
+        swa_translate: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> TpuSpecVerifyInput:
         """Convert the algorithm's batch.spec_info; raise for types without a TPU window."""
         draft_input = batch.spec_info
@@ -286,11 +296,26 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
                 verify_window_rows if draft_input.tpu_host_seq_lens_is_committed else 0
             ),
             future_indices=draft_input.future_indices,
+            # Same dtype as the full window: the compiled selector was warmed on it.
+            swa_verify_cache_candidates=(
+                None
+                if swa_translate is None
+                else padded_h2d(
+                    swa_translate(candidates).to(candidates.dtype),
+                    padded_bs,
+                    batch.device,
+                )
+            ),
         )
 
     @classmethod
     def idle(
-        cls, *, verify_window_rows: int, padded_bs: int, device: str
+        cls,
+        *,
+        verify_window_rows: int,
+        padded_bs: int,
+        device: str,
+        hybrid_draft: bool = False,
     ) -> TpuSpecVerifyInput:
         """All-padding addressing for a DP-attention rank with no requests.
 
@@ -310,6 +335,13 @@ class TpuSpecVerifyInput(msgspec.Struct, frozen=True):
             seq_lens_cpu=torch.zeros((0,), dtype=torch.int64),
             host_len_slack=0,
             future_indices=None,
+            swa_verify_cache_candidates=(
+                torch.zeros((padded_bs, 2 * verify_window_rows), dtype=torch.int64).to(
+                    device, non_blocking=True
+                )
+                if hybrid_draft
+                else None
+            ),
         )
 
     def kv_lens_after_rows(self, num_rows: int) -> tuple[torch.Tensor, int]:

@@ -174,12 +174,16 @@ def resolve_layout_io_compatibility(server_args: Any):
         # module: plugins patch its helpers to register backends and pools.
         from sglang_tpu import tpu_platform
 
+        use_mla = use_mla_backend(server_args)
         tpu_platform.validate_kv_offload_pools(
             io_backend=cfg.hicache_io_backend,
             attention_backend=cfg.attention_backend,
             attention_backends=attention_backends_of(cfg),
-            use_mla=use_mla_backend(server_args),
-            hybrid_linear=mambaish_config(model_config_of(server_args)) is not None,
+            use_mla=use_mla,
+            # Only MLA reads it; some configs (Inkling2) cannot size their state
+            # before the runtime context is published.
+            hybrid_linear=use_mla
+            and mambaish_config(model_config_of(server_args)) is not None,
         )
 
         if (

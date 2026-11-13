@@ -12,30 +12,86 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang_tpu.models.dflash_mla import DFlashMLAAttention
 
 
+def draft_fused_pools(
+    kv_pool: TpuFusedMHATokenToKVPool | SWAKVPool,
+) -> tuple[TpuFusedMHATokenToKVPool, TpuFusedMHATokenToKVPool | None]:
+    """The fused (full, SWA-or-None) sub-pools a draft runner writes into."""
+    if isinstance(kv_pool, SWAKVPool):
+        full, swa = kv_pool.full_kv_pool, kv_pool.swa_kv_pool
+    else:
+        full, swa = kv_pool, None
+    for pool in (full, swa):
+        if pool is not None and not isinstance(pool, TpuFusedMHATokenToKVPool):
+            raise TypeError(
+                f"DFLASH draft KV writes need TpuFusedMHATokenToKVPool, got {type(pool)}."
+            )
+    return full, swa
+
+
+def draft_layer_groups(
+    kv_pool: TpuFusedMHATokenToKVPool | SWAKVPool, num_layers: int
+) -> tuple[list[int], list[int]]:
+    """Draft layer indices (full-pool layers, SWA-pool layers), each in pool order."""
+    if not isinstance(kv_pool, SWAKVPool):
+        return list(range(num_layers)), []
+    full = [i for i in range(num_layers) if not kv_pool.layers_mapping[i][1]]
+    swa = [i for i in range(num_layers) if kv_pool.layers_mapping[i][1]]
+    return full, swa
+
+
+def translate_draft_swa_locs(
+    kv_pool: TpuFusedMHATokenToKVPool | SWAKVPool,
+    cache_loc: torch.Tensor,
+    cache_loc_2d: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """SWA-pool slots for the draft's window layers, or (None, None) without one.
+
+    Runs on the host: the full-to-SWA mapping is host-resident on TPU, and the
+    compiled writer takes the translated slots as inputs. Slot 0 is the dummy
+    page in both pools, so padded tokens stay on 0 instead of following the
+    mapping's -1 sentinel.
+    """
+    if not isinstance(kv_pool, SWAKVPool):
+        return None, None
+
+    def _translate(loc: torch.Tensor) -> torch.Tensor:
+        swa = kv_pool.translate_loc_from_full_to_swa(loc).to(torch.int32)
+        return torch.where((loc == 0) | (swa < 0), torch.zeros_like(swa), swa)
+
+    swa_loc = _translate(cache_loc)
+    swa_loc_2d = None if cache_loc_2d is None else _translate(cache_loc_2d)
+    return swa_loc, swa_loc_2d
+
+
 def dflash_write_draft_kv(
     *,
     draft_model: DFlashDraftModel,
-    kv_pool: TpuFusedMHATokenToKVPool,
+    kv_pool: TpuFusedMHATokenToKVPool | SWAKVPool,
     ctx_hidden: torch.Tensor,
     ctx_positions: torch.Tensor,
     ctx_cache_loc: torch.Tensor,
     cache_loc_2d: torch.Tensor | None,
     commit_lens: torch.Tensor | None,
     max_num_reqs: int,
+    swa_cache_loc: torch.Tensor | None = None,
+    swa_cache_loc_2d: torch.Tensor | None = None,
 ) -> None:
     """Write context K/V into the draft pool, covering extend and verify.
 
     Projections stay per layer (they are GEMMs), but rope and the scatter run
-    once for all layers, so K/V crosses HBM a single time.
+    once per pool, so K/V crosses HBM a single time. A hybrid draft writes its
+    window layers into the SWA sub-pool at the translated slots.
 
     Args:
       draft_model: DFlash draft model owning the layers and the projections.
-      kv_pool: Fused TPU KV pool the draft layers write into.
+      kv_pool: Fused TPU KV pool, or the SWAKVPool of fused sub-pools, the
+        draft layers write into.
       ctx_hidden: Projected context hidden states [num_tokens, hidden].
       ctx_positions: Token position IDs [num_tokens].
       ctx_cache_loc: Flat destination slot per token [num_tokens]; unused on
@@ -44,24 +100,20 @@ def dflash_write_draft_kv(
         Kept unflattened so the span table can be built from it.
       commit_lens: Verify's accepted counts [bs], or None on extend.
       max_num_reqs: Upper bound on requests in one extend batch.
+      swa_cache_loc: ctx_cache_loc translated to the SWA pool
+        (translate_draft_swa_locs), required for a hybrid pool.
+      swa_cache_loc_2d: cache_loc_2d translated the same way.
     """
+    full_pool, swa_pool = draft_fused_pools(kv_pool)
+    full_layers, swa_layers = draft_layer_groups(kv_pool, len(draft_model.layers))
+    if swa_layers and swa_cache_loc is None:
+        raise ValueError("A hybrid draft KV pool needs the translated SWA slots")
     # Packed pools (SGLANG_TPU_KV_PACK_HEADS) hold a rank's heads side by side in
     # one row, a layout these writers don't produce.
-    if kv_pool.kv_pack_heads > 1:
-        raise NotImplementedError("DFLASH draft KV writes need an unpacked KV pool")
-    # kv_fused_rope_write imports jax eagerly; keep the span math and the rope
-    # gather above importable without it.
-    from sglang_tpu.kv_fused_rope_write import (
-        fused_rope_write_kv,
-    )
+    for pool in (full_pool, swa_pool):
+        if pool is not None and pool.kv_pack_heads > 1:
+            raise NotImplementedError("DFLASH draft KV writes need an unpacked KV pool")
 
-    dst_starts, src_starts, span_lens, max_span_len = get_contiguous_slot_spans(
-        page_size=int(kv_pool.page_size),
-        cache_loc=ctx_cache_loc,
-        cache_loc_2d=cache_loc_2d,
-        commit_lens=commit_lens,
-        max_num_reqs=max_num_reqs,
-    )
     attn0 = draft_model.layers[0].self_attn
     # MLA drafts rope only their k_pe slice, which the fused kernel's neox
     # rotation over the whole head cannot express: rotate in the projection
@@ -74,32 +126,82 @@ def dflash_write_draft_kv(
         cos, sin = _rope_tables(
             draft_model=draft_model, positions=ctx_positions, dtype=ctx_hidden.dtype
         )
-    k = ctx_hidden.new_empty(
-        (
-            len(draft_model.layers),
-            int(ctx_hidden.shape[0]),
-            attn0.num_kv_heads,
-            attn0.head_dim,
+    # One K/V stack per pool, filled in layer order: a gather by layer index
+    # would put a constant index tensor into the compiled writer's graph.
+    groups = [(full_layers, full_pool, ctx_cache_loc, cache_loc_2d)]
+    if swa_layers:
+        groups.append((swa_layers, swa_pool, swa_cache_loc, swa_cache_loc_2d))
+    stacks: dict[int, tuple[torch.Tensor, int]] = {}
+    group_kv = []
+    for layers, _, _, _ in groups:
+        k = ctx_hidden.new_empty(
+            (len(layers), int(ctx_hidden.shape[0]), attn0.num_kv_heads, attn0.head_dim)
         )
-    )
-    v = torch.empty_like(k)
+        v = torch.empty_like(k)
+        group_kv.append((k, v))
+        for slot, layer_idx in enumerate(layers):
+            stacks[layer_idx] = (len(group_kv) - 1, slot)
     for layer_idx, layer in enumerate(draft_model.layers):
         attn = layer.self_attn
         layer_ctx_hidden = draft_model.prepare_context_hidden_for_kv(layer, ctx_hidden)
+        group, slot = stacks[layer_idx]
+        k, v = group_kv[group]
         if prerotated:
             layer_k, layer_v = attn.project_context_kv_rotated(
                 ctx_positions, layer_ctx_hidden
             )
-            k[layer_idx] = layer_k
+            k[slot] = layer_k
             # V shares K's slot width in the fused pool.
-            v[layer_idx] = torch.nn.functional.pad(
+            v[slot] = torch.nn.functional.pad(
                 layer_v, (0, attn.head_dim - attn.v_head_dim)
             )
             continue
         layer_k, layer_v = attn.kv_proj_only(layer_ctx_hidden)
-        k[layer_idx] = attn.apply_k_norm(layer_k).view_as(k[layer_idx])
-        v[layer_idx] = layer_v.view_as(v[layer_idx])
+        k[slot] = attn.apply_k_norm(layer_k).view_as(k[slot])
+        v[slot] = layer_v.view_as(v[slot])
 
+    for (layers, pool, loc, loc_2d), (k, v) in zip(groups, group_kv):
+        if not layers:
+            continue
+        _write_layer_group(
+            pool=pool,
+            k=k,
+            v=v,
+            cos=cos,
+            sin=sin,
+            cache_loc=loc,
+            cache_loc_2d=loc_2d,
+            commit_lens=commit_lens,
+            max_num_reqs=max_num_reqs,
+        )
+
+
+def _write_layer_group(
+    *,
+    pool: TpuFusedMHATokenToKVPool,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    cache_loc: torch.Tensor,
+    cache_loc_2d: torch.Tensor | None,
+    commit_lens: torch.Tensor | None,
+    max_num_reqs: int,
+) -> None:
+    """One fused rope-and-scatter launch of a pool's K/V stack [layers, tokens, heads, dim]."""
+    # kv_fused_rope_write imports jax eagerly; keep the span math and the rope
+    # gather above importable without it.
+    from sglang_tpu.kv_fused_rope_write import (
+        fused_rope_write_kv,
+    )
+
+    dst_starts, src_starts, span_lens, max_span_len = get_contiguous_slot_spans(
+        page_size=int(pool.page_size),
+        cache_loc=cache_loc,
+        cache_loc_2d=cache_loc_2d,
+        commit_lens=commit_lens,
+        max_num_reqs=max_num_reqs,
+    )
     fused_rope_write_kv(
         dst_starts=dst_starts,
         src_starts=src_starts,
@@ -108,7 +210,7 @@ def dflash_write_draft_kv(
         v=v,
         cos=cos,
         sin=sin,
-        kv_bufs=kv_pool.kv_buffer,
+        kv_bufs=pool.kv_buffer,
         max_span_len=max_span_len,
     )
 
@@ -116,10 +218,11 @@ def dflash_write_draft_kv(
 def dflash_write_draft_kv_ref(
     *,
     draft_model: DFlashDraftModel,
-    kv_pool: TpuFusedMHATokenToKVPool,
+    kv_pool: TpuFusedMHATokenToKVPool | SWAKVPool,
     ctx_hidden: torch.Tensor,
     ctx_positions: torch.Tensor,
     ctx_cache_loc: torch.Tensor,
+    swa_cache_loc: torch.Tensor | None = None,
 ) -> None:
     """Per-layer equivalent of dflash_write_draft_kv, for tests and benchmarks.
 
@@ -138,16 +241,23 @@ def dflash_write_draft_kv_ref(
       ctx_positions: Token position IDs [num_tokens].
       ctx_cache_loc: Flat destination slot per token [num_tokens].
     """
+    full_pool, swa_pool = draft_fused_pools(kv_pool)
     for layer_idx, layer in enumerate(draft_model.layers):
         attn = layer.self_attn
         layer_ctx_hidden = draft_model.prepare_context_hidden_for_kv(layer, ctx_hidden)
         k, v = attn.kv_proj_only(layer_ctx_hidden)
         k = attn.apply_k_norm(k)
         k = attn.apply_k_rope(ctx_positions, k)
+        pool, pool_layer_idx, loc = full_pool, layer_idx, ctx_cache_loc
+        if isinstance(kv_pool, SWAKVPool):
+            pool_layer_idx, is_swa = kv_pool.layers_mapping[layer_idx]
+            if is_swa:
+                assert swa_cache_loc is not None
+                pool, loc = swa_pool, swa_cache_loc
         _scatter_layer_kv(
-            kv_pool=kv_pool,
-            layer_idx=layer_idx,
-            loc=ctx_cache_loc,
+            kv_pool=pool,
+            layer_idx=pool_layer_idx,
+            loc=loc,
             k=k.view(-1, attn.num_kv_heads, attn.head_dim),
             v=v.view(-1, attn.num_kv_heads, attn.head_dim),
         )

@@ -20,11 +20,11 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import (
-    HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang_tpu.attention_gdn_pallas import GdnTracedMetadata, TpuGDNAttnBackend
 from sglang_tpu.mamba_pool import TpuMambaPool
@@ -49,19 +49,25 @@ class HybridLinearKVPoolState:
 
 
 def hybrid_linear_kv_pool_state(
-    *, kv_pool: HybridLinearKVPool, req_to_token_pool: ReqToTokenPool
+    *, full_kv_pool: MHATokenToKVPool | SWAKVPool, req_to_token_pool: ReqToTokenPool
 ) -> HybridLinearKVPoolState:
     # The GDN layers read state through the request pool, so lift that one.
     assert isinstance(req_to_token_pool, HybridReqToTokenPool)
     mamba_pool = req_to_token_pool.mamba_pool
     assert isinstance(mamba_pool, TpuMambaPool), type(mamba_pool)
-    full_kv_pool = kv_pool.full_kv_pool
-    assert isinstance(full_kv_pool, MHATokenToKVPool), type(full_kv_pool)
+    assert isinstance(full_kv_pool, (MHATokenToKVPool, SWAKVPool)), type(full_kv_pool)
     return HybridLinearKVPoolState(full_kv_pool=full_kv_pool, mamba_pool=mamba_pool)
 
 
+class ConvStateModule(nn.Module):
+    """A module that mutates TpuMambaPool conv state without a RadixLinearAttention."""
+
+
 def has_linear_attention(model: nn.Module) -> bool:
-    return any(isinstance(module, RadixLinearAttention) for module in model.modules())
+    return any(
+        isinstance(module, (RadixLinearAttention, ConvStateModule))
+        for module in model.modules()
+    )
 
 
 def _conv_weight_owners(

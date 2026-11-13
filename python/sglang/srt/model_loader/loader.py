@@ -438,6 +438,10 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        safetensors_index_file: Optional[str] = SAFE_WEIGHTS_INDEX_NAME
+        """Index that filters the safetensors files; None loads every matched file
+        (a draft whose weights live outside the target checkpoint's index)."""
+
         local_expert_range: Optional[Tuple[int, int]] = None
         """Routed-expert ids this EP rank stores, when the model opts into
         EP-local reads (see ``tpu_local_routed_expert_range``)."""
@@ -460,6 +464,9 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                safetensors_index_file=getattr(
+                    model, "safetensors_index_file", SAFE_WEIGHTS_INDEX_NAME
+                ),
                 local_expert_range=local_expert_range,
             )
 
@@ -514,6 +521,7 @@ class DefaultModelLoader(BaseModelLoader):
         revision: Optional[str],
         fall_back_to_pt: bool,
         allow_patterns_overrides: Optional[list[str]] = None,
+        safetensors_index_file: Optional[str] = SAFE_WEIGHTS_INDEX_NAME,
     ) -> Tuple[str, List[str], bool]:
         """Prepare weights for the model.
 
@@ -525,7 +533,7 @@ class DefaultModelLoader(BaseModelLoader):
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
         use_safetensors = False
-        index_file = SAFE_WEIGHTS_INDEX_NAME
+        index_file = safetensors_index_file
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
@@ -582,7 +590,7 @@ class DefaultModelLoader(BaseModelLoader):
                     use_safetensors = True
                 break
 
-        if use_safetensors:
+        if use_safetensors and index_file is not None:
             # For models like Mistral-7B-Instruct-v0.3
             # there are both sharded safetensors files and a consolidated
             # safetensors file. Using both breaks.
@@ -648,6 +656,7 @@ class DefaultModelLoader(BaseModelLoader):
                 source.revision,
                 source.fall_back_to_pt,
                 source.allow_patterns_overrides,
+                source.safetensors_index_file,
             )
             if use_safetensors and source.model_config is not None:
                 hf_weights_files = maybe_add_mtp_safetensors(
@@ -818,6 +827,7 @@ class DefaultModelLoader(BaseModelLoader):
                 source.revision,
                 source.fall_back_to_pt,
                 source.allow_patterns_overrides,
+                source.safetensors_index_file,
             )
             if use_safetensors and source.model_config is not None:
                 weight_files = maybe_add_mtp_safetensors(

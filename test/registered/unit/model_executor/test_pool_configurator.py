@@ -191,6 +191,7 @@ def _make_model_runner(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        dflash_draft_swa_num_layers=0,
     )
 
     return mr
@@ -1254,6 +1255,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
             eagle_draft_num_layers=None,
             dflash_draft_num_layers=5,
             dflash_draft_cell_size_per_token=draft_kv_per_token,
+            dflash_draft_swa_num_layers=0,
         )
 
         target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
@@ -1293,6 +1295,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 eagle_draft_num_layers=None,
                 dflash_draft_num_layers=5,
                 dflash_draft_cell_size_per_token=draft_kv_per_token,
+                dflash_draft_swa_num_layers=0,
             )
             with mock_cpu_env():
                 from sglang.srt.model_executor.pool_configurator import (
@@ -1304,6 +1307,89 @@ class TestDflashDraftKvBudget(CustomTestCase):
             return config.full_max_total_num_tokens
 
         self.assertLess(_tokens(10240), _tokens(None))
+
+    def test_chunk_cap_budget_charges_draft_pool(self):
+        """The chunk-capped SWA budget charged the DFLASH draft pool only under
+        mxint8; a DSPARK draft on fp8 KV then landed on top of the budget."""
+        available = 10_000_000
+
+        def _tokens(draft_kv_per_token):
+            mr = _make_model_runner(
+                self,
+                is_hybrid_swa=True,
+                full_attention_layer_ids=list(range(16)),
+                swa_attention_layer_ids=list(range(16, 32)),
+                swa_num_kv_heads=4,
+                disable_radix_cache=True,
+                chunked_prefill_size=4,
+                sliding_window_size=8,
+                max_running_requests=2,
+            )
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.spec_aux_config = SimpleNamespace(
+                eagle_draft_num_layers=None,
+                dflash_draft_num_layers=5,
+                dflash_draft_cell_size_per_token=draft_kv_per_token,
+                dflash_draft_swa_num_layers=0,
+            )
+            with mock_cpu_env():
+                from sglang.srt.model_executor.pool_configurator import (
+                    SWAChunkCapPoolConfigurator,
+                    create_memory_pool_configurator,
+                )
+
+                cfg = create_memory_pool_configurator(mr)
+                self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
+                config = cfg.calculate_pool_sizes(available, get_schedule().page_size)
+            return config.full_max_total_num_tokens
+
+        self.assertLess(_tokens(10240), _tokens(None))
+
+    def test_chunk_cap_charges_draft_window_layers_on_swa_side(self):
+        """A hybrid DSPARK draft keeps its window layers in the SWA pool; they
+        were priced at full-pool size, so the pool left room for nothing."""
+        available = 10_000_000
+        full_cell = 2048
+
+        def _sizes(swa_layers):
+            mr = _make_model_runner(
+                self,
+                is_hybrid_swa=True,
+                full_attention_layer_ids=list(range(16)),
+                swa_attention_layer_ids=list(range(16, 32)),
+                swa_num_kv_heads=4,
+                disable_radix_cache=True,
+                chunked_prefill_size=4,
+                sliding_window_size=8,
+                max_running_requests=2,
+            )
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.spec_aux_config = SimpleNamespace(
+                eagle_draft_num_layers=None,
+                dflash_draft_num_layers=5,
+                dflash_draft_cell_size_per_token=full_cell,
+                dflash_draft_swa_num_layers=swa_layers,
+            )
+            with mock_cpu_env():
+                from sglang.srt.model_executor.pool_configurator import (
+                    create_memory_pool_configurator,
+                )
+
+                cfg = create_memory_pool_configurator(mr)
+                config = cfg.calculate_pool_sizes(available, get_schedule().page_size)
+            return (
+                cfg,
+                config.full_max_total_num_tokens,
+                config.swa_max_total_num_tokens,
+            )
+
+        cfg4, full4, swa4 = _sizes(4)
+        cfg0, full0, swa0 = _sizes(0)
+        # Same full-pool cell either way; the window layers come off the fixed SWA bytes.
+        self.assertEqual(cfg4._draft_cell_size, cfg0._draft_cell_size)
+        self.assertEqual(cfg4._draft_swa_layers_num, 4)
+        self.assertEqual(swa4, swa0)
+        self.assertLess(full4, full0)
 
 
 class TestMixedKVFormats(CustomTestCase):
@@ -1364,6 +1450,7 @@ class TestMixedKVFormats(CustomTestCase):
             hf_config=SimpleNamespace(),
             get_num_kv_heads=MagicMock(return_value=3),
             head_dim=64,
+            is_hybrid_swa=False,
         )
         parsed = SimpleNamespace(
             require_num_layers=lambda: 2,

@@ -94,3 +94,30 @@ def test_only_dflash_target_models_share_aux_output(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize(
+    "is_hybrid_swa, swa_layer_ids, expected",
+    [
+        (False, [0, 1, 3, 4], 0),
+        (True, [0, 1, 3, 4], 4),
+        (True, [0, 1, 3, 4, 7], 4),  # ids past the draft depth are not drafted
+        (True, None, 0),
+    ],
+)
+def test_dflash_draft_swa_layers_leave_the_full_pool_budget(
+    is_hybrid_swa, swa_layer_ids, expected
+):
+    """A hybrid draft's window layers are charged on the SWA side; counting them
+    at full-pool size oversized the budget by their share of every token."""
+    from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+        _dflash_draft_swa_num_layers,
+    )
+
+    draft = SimpleNamespace(
+        is_hybrid_swa=is_hybrid_swa, swa_attention_layer_ids=swa_layer_ids
+    )
+    assert (
+        _dflash_draft_swa_num_layers(draft_model_config=draft, draft_num_layers=5)
+        == expected
+    )
