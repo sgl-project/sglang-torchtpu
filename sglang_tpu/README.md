@@ -47,7 +47,27 @@ implementation includes packed/chunked prefill, decode, padding and per-request
 state updates, including lifting the state and metadata into `direct_compile`.
 It currently requires `--disable-radix-cache` and no speculative decoding;
 ZAYA1 and the separate LFM2-MoE ShortConv implementation are outside this wiring.
-Manual full-model validation completed on one TPU v5e chip with BF16 weights
+
+The TPU path now uses `sglang_tpu.kernels.mamba.short_conv_pallas` for the
+causal convolution itself. Prefill streams 64-token tiles and their K-1 halo
+through VMEM double buffers; decode packs eight requests into the vector
+sublanes. The custom op donates the complete per-layer
+`[slots, K-1, 1, channels]` FP32 tensor from `TpuMambaPool`, so a layer update
+does not copy or re-layout the pool. Slot 0 remains a read-only padding slot.
+The operator still preserves LFM2's existing gate placement (`B*x` before the
+convolution and `C*` after it), FP32 accumulation, output dtype, and bias
+semantics.
+
+Run the registered numerical test on a TPU with
+`SGLANG_PLATFORM=tpu_oot python test/registered/kernels/ops/mamba/test_tpu_short_conv.py`.
+For a warmup-separated comparison against the current torch reference path,
+use `python test/manual/kernels/bench_lfm2_short_conv_tpu.py --mode both`.
+Local validation covers CPU Pallas-interpret and offline Mosaic lowering;
+TPU device correctness, xprof timings, and speedup numbers must still be
+collected on the target TPU generation.
+
+The following full-model numbers describe the previous torch implementation,
+before Pallas integration. Manual validation completed on one TPU v5e chip with BF16 weights
 and KV cache, TP=1, single-request concurrency, and `torch.compile` disabled.
 GSM8K accuracy was 72.00% on 200 examples (`max_tokens=1536`), with no request
 errors and a 1.50% truncation rate. Serving benchmarks measured 22.08 and 22.93

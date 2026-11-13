@@ -68,6 +68,11 @@ class TpuShortConvAttnBackend(MambaAttnBackendBase):
             )
         self._metadata: Optional[ShortConvTracedMetadata] = None
         self._decode_query_start_loc: dict[int, torch.Tensor] = {}
+        # Register outside torch.compile. CPU reference tests do not construct
+        # a TPU backend or import JAX/torch_tpu.
+        from sglang_tpu.kernels.mamba.short_conv import build_short_conv_op
+
+        build_short_conv_op()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Do not call the GPU base metadata builder: its tracked-row selection
@@ -269,6 +274,19 @@ def short_conv(
 ) -> torch.Tensor:
     """Platform kernel entry point used between LFM2's two gates."""
     conv_state = metadata.layer_cache.conv[0]
+    if x.device.type == "tpu":
+        from sglang_tpu.kernels.mamba.short_conv import build_short_conv_op
+
+        return build_short_conv_op()(
+            x,
+            weight,
+            bias,
+            conv_state,
+            metadata.cache_indices,
+            metadata.query_start_loc,
+            metadata.has_initial_state,
+            forward_mode.is_decode(),
+        )
     if forward_mode.is_decode():
         return short_conv_decode(x, weight, bias, conv_state, metadata.cache_indices)
     return short_conv_prefill(

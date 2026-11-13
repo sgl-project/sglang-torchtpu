@@ -10,6 +10,7 @@ import itertools
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -194,6 +195,90 @@ class TestShortConvCPU(CustomTestCase):
         self._assert_result(actual, state, torch.zeros(4, 5), initial)
 
 
+@unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX interpreter")
+class TestShortConvPallasInterpreter(CustomTestCase):
+    def test_ragged_dma_halos_and_state_alias_against_conv1d(self):
+        """A short prefix, partial last tile and padding must not share history."""
+        import jax.numpy as jnp
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.kernels.mamba.short_conv_pallas import short_conv_pallas
+
+        generator = torch.Generator().manual_seed(37)
+        lengths, slots = [1, 0, 65, 137, 0], [3, 2, 1, 4, 0]
+        prefix = [False, True, True, False, False]
+        for channels, width, dtype in (
+            (5, 4, torch.float32),
+            (1536, 3, torch.bfloat16),
+        ):
+            with self.subTest(channels=channels, width=width, dtype=dtype):
+
+                def randn(*shape):
+                    return torch.randn(*shape, generator=generator)
+
+                x = randn(256, channels).to(dtype)
+                weight = randn(channels, width).to(dtype)
+                bias = randn(channels).to(dtype)
+                state = randn(7, width - 1, 1, channels)
+                expected, expected_state = _reference(
+                    x, weight, bias, state, slots, lengths, prefix
+                )
+                jdtype = jnp.bfloat16 if dtype == torch.bfloat16 else jnp.float32
+                actual_state, actual = short_conv_pallas(
+                    jnp.asarray(x.float().numpy(), dtype=jdtype),
+                    jnp.asarray(weight.float().numpy(), dtype=jdtype),
+                    jnp.asarray(bias.float().numpy(), dtype=jdtype),
+                    jnp.asarray(state.numpy()),
+                    jnp.asarray(slots),
+                    jnp.asarray([0, *itertools.accumulate(lengths)]),
+                    jnp.asarray(prefix),
+                    decode=False,
+                    interpret=pltpu.InterpretParams(detect_races=True),
+                )
+                torch.testing.assert_close(
+                    torch.from_numpy(np.array(actual, dtype=np.float32)).to(dtype),
+                    expected,
+                    rtol=1e-2 if dtype == torch.bfloat16 else 1e-5,
+                    atol=1e-2 if dtype == torch.bfloat16 else 1e-5,
+                )
+                torch.testing.assert_close(
+                    torch.from_numpy(np.array(actual_state)),
+                    expected_state,
+                    rtol=0,
+                    atol=0,
+                )
+                # Decode a partial vector tile with reordered slots, consuming
+                # exactly the state just written by packed prefill.
+                decode_slots = [4, 0, 3, 1, 2, 0, 5, 6, 0, 0]
+                x = randn(10, channels).to(dtype)
+                expected, expected_state = _reference(
+                    x, weight, None, expected_state, decode_slots, [1] * 10, [True] * 10
+                )
+                actual_state, actual = short_conv_pallas(
+                    jnp.asarray(x.float().numpy(), dtype=jdtype),
+                    jnp.asarray(weight.float().numpy(), dtype=jdtype),
+                    None,
+                    actual_state,
+                    jnp.asarray(decode_slots),
+                    None,
+                    None,
+                    decode=True,
+                    interpret=pltpu.InterpretParams(detect_races=True),
+                )
+                torch.testing.assert_close(
+                    torch.from_numpy(np.array(actual, dtype=np.float32)).to(dtype),
+                    expected,
+                    rtol=1e-2 if dtype == torch.bfloat16 else 1e-5,
+                    atol=1e-2 if dtype == torch.bfloat16 else 1e-5,
+                )
+                torch.testing.assert_close(
+                    torch.from_numpy(np.array(actual_state)),
+                    expected_state,
+                    rtol=0,
+                    atol=0,
+                )
+
+
 @unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "requires torch_tpu")
 class TestShortConvTPU(TestShortConvCPU):
     device = "tpu"
@@ -202,6 +287,71 @@ class TestShortConvTPU(TestShortConvCPU):
     def setUpClass(cls):
         super().setUpClass()
         import torch_tpu  # noqa: F401
+
+    def test_compiled_prefill_replays_lengths_slots_and_prefix_flags(self):
+        """Tile halos and donated state stay correct across one graph bucket."""
+        from sglang_tpu.kernels.mamba.short_conv import build_short_conv_op
+
+        op = torch.compile(
+            build_short_conv_op(), backend="tpu", fullgraph=True, dynamic=False
+        )
+        channels = 1536
+        weight = self._randn(channels, 3, dtype=torch.bfloat16)
+        bias = self._randn(channels, dtype=torch.bfloat16)
+        expected_state = self._randn(7, 2, 1, channels)
+        state = expected_state.clone().to(self.device)
+        weight_t, bias_t = weight.to(self.device), bias.to(self.device)
+        for lengths, slots, prefix in (
+            ([1, 0, 65, 129, 0], [3, 2, 1, 4, 0], [False, True, True, False, False]),
+            ([63, 2, 1, 129, 0], [4, 3, 2, 1, 0], [True, True, False, True, False]),
+            ([0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [False] * 5),
+        ):
+            x = self._randn(256, channels, dtype=torch.bfloat16)
+            expected, expected_state = _reference(
+                x, weight, bias, expected_state, slots, lengths, prefix
+            )
+            actual = op(
+                x.to(self.device),
+                weight_t,
+                bias_t,
+                state,
+                torch.tensor(slots, device=self.device),
+                torch.tensor([0, *itertools.accumulate(lengths)], device=self.device),
+                torch.tensor(prefix, device=self.device),
+                False,
+            )
+            self._assert_result(actual, state, expected, expected_state)
+
+    def test_compiled_decode_partial_vector_tile_keeps_state_across_replays(self):
+        from sglang_tpu.kernels.mamba.short_conv import build_short_conv_op
+
+        op = torch.compile(
+            build_short_conv_op(), backend="tpu", fullgraph=True, dynamic=False
+        )
+        channels = 2048
+        weight = self._randn(channels, 4)
+        expected_state = self._randn(12, 3, 1, channels)
+        state = expected_state.clone().to(self.device)
+        weight_t = weight.to(self.device)
+        for slots in (
+            [3, 0, 1, 4, 5, 6, 7, 8, 2, 0],
+            [2, 8, 0, 7, 6, 5, 4, 1, 0, 3],
+        ):
+            x = self._randn(10, channels)
+            expected, expected_state = _reference(
+                x, weight, None, expected_state, slots, [1] * 10, [True] * 10
+            )
+            actual = op(
+                x.to(self.device),
+                weight_t,
+                None,
+                state,
+                torch.tensor(slots, device=self.device),
+                None,
+                None,
+                True,
+            )
+            self._assert_result(actual, state, expected, expected_state)
 
 
 if __name__ == "__main__":
