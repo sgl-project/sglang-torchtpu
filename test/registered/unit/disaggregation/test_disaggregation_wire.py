@@ -1331,10 +1331,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             )
         )
         self.assertEqual(buffers.output_dsa_topk_indices[1].tolist(), [-1, -1, -1])
-        # A row padded with -1 past the wire width ships its leading entries.
-        padded = torch.tensor([7, 8, 9, -1, -1], dtype=torch.int32)
-        buffers.set_buf(self._make_req(padded, metadata_buffer_index=1))
-        self.assertEqual(buffers.output_dsa_topk_indices[1].tolist(), [7, 8, 9])
         ptrs, data_lens, item_lens = buffers.get_buf_infos()
         self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)

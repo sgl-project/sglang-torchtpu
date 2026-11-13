@@ -848,17 +848,30 @@ class TestExperimentalEagle3(CustomTestCase):
 
     def test_pd_prefill_ships_the_carried_hidden(self):
         """A PD prefill hands core one seed row per request: the carried hidden and DSA
-        top-k at the extend cap (copied to host whole), topk as host placeholders."""
+        top-k at the extend cap (copied to host whole), topk as host placeholders. The
+        DSA top-k is cut to the wire's columns."""
         draft_input = HostPaddedChainDraftInput(
             bonus_tokens=torch.tensor([1, 2]), new_seq_lens=torch.tensor([3, 4])
         )
         tail_hidden = torch.arange(8.0).view(4, 2)
-        dsa_topk = torch.full((4, 3), -1, dtype=torch.int32)
-        _attach_pd_seeds(draft_input, tail_hidden=tail_hidden, dsa_topk=dsa_topk, bs=2)
+        # A TPU top-k row pads the wire's columns with -1 to whole lanes.
+        dsa_topk = torch.tensor([[7, 8, 9, -1, -1]] * 4, dtype=torch.int32)
+        _attach_pd_seeds(
+            draft_input,
+            tail_hidden=tail_hidden,
+            dsa_topk=dsa_topk,
+            dsa_wire_width=3,
+            bs=2,
+        )
         self.assertIs(draft_input.hidden_states, tail_hidden)
-        self.assertIs(draft_input.dsa_topk_indices, dsa_topk)
+        self.assertEqual(draft_input.dsa_topk_indices.tolist(), [[7, 8, 9]] * 4)
         self.assertEqual(draft_input.topk_p.shape, (2, 1))
         self.assertEqual(draft_input.topk_index.device.type, "cpu")
+        # Without index sharing there is no capture to ship.
+        _attach_pd_seeds(
+            draft_input, tail_hidden=tail_hidden, dsa_topk=None, dsa_wire_width=0, bs=2
+        )
+        self.assertIsNone(draft_input.dsa_topk_indices)
 
     def test_multimodal_draft_prompt_reads_the_next_rows_embeds(self):
         """Row p of the draft prompt embeds token p + 1 from the target's embeds;

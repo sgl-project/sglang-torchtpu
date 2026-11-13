@@ -29,6 +29,7 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
+from sglang.srt.disaggregation.utils import get_dsa_seed_metadata_dim
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -120,6 +121,10 @@ class TpuChainSpecWorker(TpuSpecWorker):
         self._target_vocab_size = target_runner.model_config.vocab_size
         self._target_is_multimodal = process_model_config().is_multimodal
         self._disagg_mode = get_disagg().disaggregation_mode
+        # Columns of a DSA top-k seed on core's PD wire (0 without index sharing).
+        self._pd_dsa_seed_width = get_dsa_seed_metadata_dim(
+            target_runner.model_config.hf_config
+        )
         if self._disagg_mode == "decode":
             register_pd_carry_seeder(self._seed_carry)
         self._pd_seed_placeholder: torch.Tensor | None = None
@@ -349,7 +354,11 @@ class TpuChainSpecWorker(TpuSpecWorker):
         draft_input.kv_fence_tail = kv_fence_tail
         if self._disagg_mode == "prefill":
             _attach_pd_seeds(
-                draft_input, tail_hidden=tail_hidden, dsa_topk=seed_capture, bs=bs
+                draft_input,
+                tail_hidden=tail_hidden,
+                dsa_topk=seed_capture,
+                dsa_wire_width=self._pd_dsa_seed_width,
+                bs=bs,
             )
         result.next_draft_input = draft_input
         return result
@@ -783,7 +792,11 @@ class TpuChainSpecWorker(TpuSpecWorker):
             seed_table = self._chain_draft_worker.dsa_seed_topk_table
             if seed_table is not None:
                 seeds = torch.zeros((cap, seed_table.shape[1]), dtype=torch.int32)
-                seed_table.index_copy_(0, pool_rows, seeds.to(self.device))
+                seeds = seeds.to(self.device)
+                seed_table.index_copy_(0, pool_rows, seeds)
+                if self._disagg_mode == "prefill":
+                    # The cut _attach_pd_seeds makes for the PD wire; core copies it to host.
+                    seeds[:, : self._pd_dsa_seed_width].cpu()
 
 
 @compiled_op()
@@ -844,6 +857,7 @@ def _attach_pd_seeds(
     *,
     tail_hidden: torch.Tensor,
     dsa_topk: torch.Tensor | None,
+    dsa_wire_width: int,
     bs: int,
 ) -> None:
     """The per-request seed core PD prefill ships to decode (output_topk_*, hidden_states_tensor).
@@ -851,11 +865,15 @@ def _attach_pd_seeds(
     A chain decode stores only the hidden and re-derives d_1 from it, so topk is
     a host placeholder. hidden stays at the extend cap: core copies it to host
     whole and reads rows by request, so no slice compiles per bs. So does
-    dsa_topk, an index-sharing draft's capture (output_dsa_topk_indices).
+    dsa_topk, an index-sharing draft's capture (output_dsa_topk_indices), cut to
+    the wire's columns: a TPU row pads them with -1 to whole lanes.
     """
     draft_input.hidden_states = tail_hidden
     draft_input.topk_p = torch.ones((bs, 1), dtype=torch.float32)
     draft_input.topk_index = torch.zeros((bs, 1), dtype=torch.int64)
+    if dsa_topk is not None:
+        # One shape at every bs, so one compile (_warmup_extend_ops).
+        dsa_topk = dsa_topk[:, :dsa_wire_width]
     draft_input.dsa_topk_indices = dsa_topk
 
 
