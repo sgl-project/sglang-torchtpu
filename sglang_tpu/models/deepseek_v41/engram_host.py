@@ -148,10 +148,22 @@ def host_hash_ids(hasher, input_ids: torch.Tensor, forward_batch) -> torch.Tenso
         extend_start_loc=_cpu(forward_batch.extend_start_loc),
         # Bucket padding lengthens the device lengths; the host list would not.
         extend_seq_lens_cpu=None,
-        engram_history=_cpu(forward_batch.engram_history),
+        engram_history=_padded_history(
+            _cpu(forward_batch.engram_history), forward_batch.req_pool_indices
+        ),
         tpu_engram_local_ids=None,
     )
     return hasher(_cpu(input_ids), batch)
+
+
+def _padded_history(history, req_pool_indices):
+    """Scheduler history covers the real requests only, but the batch is padded
+    to its bucket's request count, so the hasher indexes rows past it. Padding
+    requests commit to the spare history row, so zero rows serve them."""
+    if history is None or history.shape[0] >= req_pool_indices.shape[0]:
+        return history
+    missing = req_pool_indices.shape[0] - history.shape[0]
+    return torch.cat([history, history.new_zeros(missing, history.shape[1])])
 
 
 @contextlib.contextmanager
