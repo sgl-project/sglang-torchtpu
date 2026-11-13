@@ -17,7 +17,8 @@ from typing import Any
 import torch
 from torch.nn import Parameter
 
-from sglang.srt.layers.linear import LinearBase, LinearMethodBase
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.quantization.base_config import LinearMethodBase
 from sglang.srt.layers.moe.fused_moe_triton import (
     FusedMoE,
     FusedMoeWeightScaleSupported,
