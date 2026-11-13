@@ -262,7 +262,7 @@ def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value)
 def tpu_dsv41_engram_hash_ids(
     original, tokens, blocked, pad_id, token_map, multipliers, primes, offsets
 ):
-    if tokens.is_cuda:
+    if tokens.is_cuda or tokens.device.type == "cpu":
         return original(
             tokens, blocked, pad_id, token_map, multipliers, primes, offsets
         )
@@ -279,7 +279,7 @@ def tpu_dsv41_torch_hash_ids(
     The original widens ids, history and positions to int64 before hashing;
     token ids, positions and the multimodal pad shift all fit in int32.
     """
-    if input_ids.is_cuda:
+    if input_ids.is_cuda or input_ids.device.type == "cpu":
         return original(
             hasher, input_ids, positions, kmode, history, num_real, block, row, starts
         )
@@ -343,9 +343,12 @@ def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
     which lowers to a loop of 64-bit counters; rows here are a compare-sum
     against each request's end (requests are contiguous in extend_start_loc).
     """
+    if forward_batch.tpu_engram_local_ids is not None:
+        # Hashed and looked up on the host (engram_host); the graph reads staged rows.
+        return forward_batch.tpu_engram_local_ids
     num_tokens = input_ids.shape[0]
     mode = forward_batch.forward_mode
-    if input_ids.is_cuda or num_tokens == 0:
+    if input_ids.is_cuda or input_ids.device.type == "cpu" or num_tokens == 0:
         return original(hasher, input_ids, forward_batch)
     if mode.is_decode():
         return _tpu_hasher_decode(hasher, input_ids, forward_batch)
@@ -462,8 +465,21 @@ def tpu_dsv41_int32_graph_inputs(
     if config.model_type != "deepseek_v41":
         return original(shim, fn, input_ids, positions, forward_batch, *args, **kwargs)
     names = _INT32_BATCH_FIELDS
-    hasher = shim.policy.model_runner.model.model.engram_hasher
-    pin_history = hasher is not None and forward_batch.forward_mode.is_extend()
+    model = shim.policy.model_runner.model
+    hasher = model.model.engram_hasher
+    host_tables = ()
+    if hasher is not None and not torch.compiler.is_compiling():
+        from sglang_tpu.models.deepseek_v41 import engram_host
+
+        host_tables = engram_host.shared_host_tables(model)
+    if host_tables:
+        names = (*names, "tpu_engram_local_ids", "tpu_engram_staged")
+    # Host tables hash on the host, so the graph never reads the history.
+    pin_history = (
+        hasher is not None
+        and not host_tables
+        and forward_batch.forward_mode.is_extend()
+    )
     if pin_history:
         names = (*names, "engram_history")
     from sglang.srt.runtime_context import get_parallel
@@ -478,6 +494,8 @@ def tpu_dsv41_int32_graph_inputs(
     if embed_outside:
         names = (*names, "input_embeds")
     saved = {name: getattr(forward_batch, name) for name in names}
+    if host_tables:
+        _stage_host_engram(hasher, host_tables, input_ids, forward_batch)
     if embed_outside:
         embed_tokens = shim.policy.model_runner.model.get_input_embeddings()
         with torch.no_grad():
@@ -518,8 +536,51 @@ def tpu_dsv41_engram_owned_rows(original, embedding, indices):
     return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
 
 
+def _stage_host_engram(hasher, tables, input_ids, forward_batch) -> None:
+    """Hash this rank's tokens and gather their Engram rows on the host."""
+    from sglang_tpu.models.deepseek_v41 import engram_host
+
+    engram_host.move_hasher_to_host(hasher)
+    with torch.no_grad():
+        hash_ids = engram_host.host_hash_ids(hasher, input_ids, forward_batch)
+    num_tokens, num_layers, num_cols = hash_ids.shape
+    device = input_ids.device
+    forward_batch.tpu_engram_staged = engram_host.gather_staged_rows(
+        hash_ids, tables, device
+    )
+    forward_batch.tpu_engram_local_ids = engram_host.local_row_ids(
+        num_tokens, num_layers, num_cols, device
+    )
+
+
+def tpu_dsv41_engram_embed_init(original, embedding, *args, **kwargs):
+    """AROUND EngramEmbedding.__init__: build host tables without the CUDA pin."""
+    if torch.cuda.is_available():
+        return original(embedding, *args, **kwargs)
+    from sglang_tpu.models.deepseek_v41.engram_host import without_cuda_host_register
+
+    with without_cuda_host_register():
+        return original(embedding, *args, **kwargs)
+
+
+def tpu_dsv41_engram_embed_forward(
+    original, embedding, indices, forward_batch=None, **kwargs
+):
+    """AROUND EngramEmbedding.forward: dequantize the host-staged rows."""
+    if not indices.is_cuda and embedding.host_table is not None:
+        from sglang_tpu.models.deepseek_v41.engram_host import staged_lookup
+
+        values = staged_lookup(embedding, indices, forward_batch)
+        if values is not None:
+            return values
+    return original(embedding, indices, forward_batch, **kwargs)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
+
+    # Declares the ForwardBatch fields the Engram hooks read.
+    from sglang_tpu.models.deepseek_v41 import engram_host  # noqa: F401
 
     kvc = "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator"
     cfg = "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator"
@@ -588,6 +649,16 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.EngramEmbedding._owned_rows",
             tpu_dsv41_engram_owned_rows,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.engram.EngramEmbedding.__init__",
+            tpu_dsv41_engram_embed_init,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.engram.EngramEmbedding.forward",
+            tpu_dsv41_engram_embed_forward,
             HookType.AROUND,
         ),
     ]
