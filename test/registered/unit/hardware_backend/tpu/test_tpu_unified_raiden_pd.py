@@ -76,6 +76,7 @@ def _fake_pb2_modules(engine_cls=None) -> dict[str, types.ModuleType]:
 
 class TestUnifiedRaidenPD(RaidenRendezvousTestCase):
     def _unified(self, mgr, pool: TpuUnifiedSWAKVPool, *, chunked: bool = False):
+        mgr.kv_args.total_kv_head_num = pool.full.head_num * mgr.attn_tp_size
         mgr._unified_swa_pool, mgr.kv_layout = pool, UNIFIED_SWA_KV_LAYOUT
         mgr._kv_caches = pool.kv_pool.page_buffers()
         mgr._deferred_ack_targets, mgr._staging_outstanding = {}, {}

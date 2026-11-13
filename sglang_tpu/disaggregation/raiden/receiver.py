@@ -875,6 +875,21 @@ class RaidenReceiverMixin:
         src_attn_tp = self.attn_tp_size * ratio
         r = self.kv_args.engine_rank % self.attn_tp_size
         source_ranks = list(range(r * ratio, (r + 1) * ratio))
+        # Refuse a head slice the KV layout cannot move before asking the
+        # prefill for anything, so the room fails with the reason instead of
+        # timing out (or, with an fp8 pool sized as bf16, landing heads in the
+        # wrong slots).
+        try:
+            for swa in (False, True) if self._swa_kv_caches else (False,):
+                geometry = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=swa)
+                geometry.check_decode_rank(r)
+        except ValueError as e:
+            reason = f"Raiden receive failed: room {room}: {e}"
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                self._failed.add(str(room))
+                self.record_failure(room, reason)
+            return
         push_endpoint = self._ensure_engine().transfer_address
         # A hybrid model's sliding-window pool is a second block-id space on a
         # second engine, so it needs its own destination pages and its own push
@@ -1475,6 +1490,27 @@ class RaidenKVReceiver(CommonKVReceiver):
         decode_prefix_len: Optional[int] = None,
     ):
         if self.conclude_state == KVPoll.Failed:
+            return
+        # A decode sharded finer than its prefill pulls ONE prefill rank's
+        # whole pages (there is no head-slicing pull), which only holds this
+        # rank's heads when the kv-heads are replicated.
+        prefill_info = getattr(self, "prefill_info", None)
+        prefill_tp = int(getattr(prefill_info, "attn_tp_size", 0) or 0)
+        reason = self.kv_mgr.finer_decode_refusal(prefill_tp)
+        if reason is not None:
+            logger.error(
+                "RaidenKVManager rank%d room %s: %s",
+                self.kv_mgr.attn_tp_rank,
+                self.bootstrap_room,
+                reason,
+            )
+            self.kv_mgr.record_failure(self.bootstrap_room, reason)
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
+            # poll() now returns Failed without reaching _conclude_failed, so
+            # tell the prefill here; otherwise it holds the room until its
+            # bootstrap timeout.
+            self._notify_prefill_abort()
             return
         self.kv_mgr.register_decode_request(
             self.bootstrap_room,

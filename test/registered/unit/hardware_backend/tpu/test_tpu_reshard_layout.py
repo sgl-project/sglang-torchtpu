@@ -46,9 +46,10 @@ class TestTpuReshardLayout(unittest.TestCase):
         destination = _layer(dtype, max(1, total_heads // dst_tp))
         mgr = object.__new__(RaidenKVManager)
         mgr.attn_tp_rank = 0
+        mgr.attn_tp_size = dst_tp
         mgr._kv_caches = [destination]
         mgr._swa_kv_caches = [destination] if swa else []
-        mgr.kv_args = SimpleNamespace(total_kv_head_num=total_heads)
+        mgr.kv_args = SimpleNamespace(total_kv_head_num=total_heads, page_size=64)
         geometry = mgr._make_geometry(src_tp, dst_tp, swa=swa)
         source_width = source.stride(1) * source.element_size()
         destination_width = destination.stride(1) * destination.element_size()
