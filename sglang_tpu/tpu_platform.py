@@ -770,11 +770,6 @@ def _validate_mtp_index_share(cfg, hf_config) -> None:
             "DSA index sharing on TPU runs on the experimental spec worker; set "
             f"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1 {opt_out}."
         )
-    if cfg.disaggregation_mode != "null":
-        # A P/D decode would draft on seeds its prefill never sent.
-        raise NotImplementedError(
-            f"DSA index sharing on TPU does not support P/D disaggregation; {opt_out}."
-        )
 
 
 def _register_attention_backends() -> None:

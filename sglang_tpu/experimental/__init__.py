@@ -7,8 +7,9 @@ import torch
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.envs import envs as tpu_envs
 
-# (host req_pool_indices [bs], host draft hidden [bs, H]) -> None.
-PdCarrySeeder = Callable[[torch.Tensor, torch.Tensor], None]
+# (host req_pool_indices [bs], host draft hidden [bs, H],
+#  host DSA top-k seeds [bs, W] or None) -> None.
+PdCarrySeeder = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], None]
 
 _host_batch_padder: Callable[[int], int] | None = None
 _pd_carry_seeder: PdCarrySeeder | None = None

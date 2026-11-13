@@ -902,9 +902,9 @@ class TestDsaValidation(CustomTestCase):
 
     def test_mtp_index_share_runs_only_on_the_chain_worker(self):
         """Only the experimental chain worker reuses the MTP draft's DSA top-k
-        across its steps. Core's workers would take their GPU paths, a non-DSA
-        indexer has no TPU seed, and a P/D decode would draft on seeds its
-        prefill never sent: each must stop the launch."""
+        across its steps. Core's workers would take their GPU paths and a non-DSA
+        indexer has no TPU seed: each must stop the launch. A P/D prefill ships
+        the seed, so P/D may share."""
 
         sparse = dict(attention_backend="pallas_tpu_mla_sparse")
         share = dict(speculative_algorithm="NEXTN", index_share_for_mtp_iteration=True)
@@ -922,8 +922,7 @@ class TestDsaValidation(CustomTestCase):
                 ValueError, "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"
             ):
                 self._apply_dsa(**sparse, **share)
-        with self.assertRaisesRegex(NotImplementedError, "P/D"):
-            self._apply_dsa(**sparse, disaggregation_mode="decode", **share)
+        self._apply_dsa(**sparse, disaggregation_mode="decode", **share)
         with self.assertRaisesRegex(ValueError, "DSA models only"):
             self._apply_dsa(**sparse, index_topk=None, **share)
 
