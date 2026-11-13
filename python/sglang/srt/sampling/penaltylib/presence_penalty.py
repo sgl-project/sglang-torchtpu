@@ -49,7 +49,7 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
         device = self.orchestrator.device
         for row, toks in zip(rows, tokens):
             mask = torch.zeros(self.orchestrator.vocab_size, dtype=torch.bool)
-            mask[torch.tensor(toks, dtype=torch.int64)] = True
+            mask[torch.tensor(self._vocab_tokens(toks), dtype=torch.int64)] = True
             index = torch.tensor([row], dtype=torch.int64, device=device)
             current = self.cumulated_presence_penalties.index_select(0, index)
             seeded = torch.where(

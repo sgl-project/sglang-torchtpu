@@ -51,7 +51,7 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
         values = self.frequency_penalties.reshape(-1).cpu()
         for row, toks in zip(rows, tokens):
             seeded = torch.zeros(self.orchestrator.vocab_size, dtype=torch.float32)
-            for t in toks:
+            for t in self._vocab_tokens(toks):
                 seeded[t] = seeded[t] + values[row]
             index = torch.tensor([row], dtype=torch.int64, device=device)
             self.cumulated_frequency_penalties.index_copy_(
