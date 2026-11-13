@@ -65,6 +65,15 @@ rank mesh, loaded scale shapes, cache budget, compile shapes and active kernels.
 Use identical fixed token inputs from the reference, not independently tokenized
 random text. Isolate compile/warmup, steady prefill device time and client TTFT.
 
+## CPU test runtime selection
+
+`SGLANG_PLATFORM=cpu` is NOT a valid platform plugin in this checkout. For CPU
+contract tests, unset `SGLANG_PLATFORM` and set `SGLANG_USE_CPU_ENGINE=1`.
+The public release image starts successfully on CPU, but differs from the
+current pinned TPU dependency stack; record versions and do not use it for
+on-device performance claims. The private CI base image was inaccessible to
+this cluster (ImagePullBackOff), not a test result.
+
 ## Flash safety
 
 Only GLM5.2-specific files added so far; no production/shared path has changed.
