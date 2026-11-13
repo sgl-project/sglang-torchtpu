@@ -30,7 +30,6 @@ folded encoder SWA replay, beam search, PP/CP/DCP > 1) fall back cleanly to
 from __future__ import annotations
 
 import contextlib
-import ctypes
 import sys
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -354,13 +353,6 @@ def _physical_words(tensor: torch.Tensor, layout_api: Any = None) -> int:
     return words
 
 
-def _host_words(buffer: Any, num_words: int) -> torch.Tensor:
-    if num_words == 0:
-        return torch.empty(0, dtype=torch.int32, device="cpu")
-    owner = (ctypes.c_uint8 * buffer.size_bytes).from_address(buffer.data_ptr)
-    return torch.frombuffer(owner, dtype=torch.uint8)[: num_words * 4].view(torch.int32)
-
-
 class _CpuTransfer:
     """In-memory async transfer double for CPU execution and unit tests."""
 
@@ -378,6 +370,31 @@ class _CpuTransfer:
         return SimpleNamespace(wait=wait)
 
 
+class _BatchTransfer:
+    """Raw DMA adapter backed by ``torch_tpu._internal.batch_transfer``.
+
+    Uses TorchTPU's in-tree ``PJRT_RawBuffer`` bindings directly instead of
+    ``tpu_sync.api.torch.raw_transfer`` so host<->device raw DMA stays
+    ABI-compatible with ``torch_tpu``'s XLA runtime across wheel upgrades.
+    """
+
+    def __init__(
+        self,
+        batch_transfer_mod: Any,
+        device_tensor: torch.Tensor,
+        host_buffer: torch.Tensor,
+    ) -> None:
+        self._mod = batch_transfer_mod
+        self._device = [device_tensor]
+        self._host = [host_buffer]
+
+    def d2h(self) -> None:
+        self._mod.batch_transfer_d2h_sync(self._device, self._host)
+
+    def h2d_async(self) -> Any:
+        return self._mod.batch_transfer_h2d(self._host, self._device)
+
+
 class PreparedEngramUpload:
     """One immutable device allocation, its host storage and consumer lifetime."""
 
@@ -386,7 +403,7 @@ class PreparedEngramUpload:
         num_words: int,
         device: torch.device | str,
         *,
-        raw_transfer_mod: Any = None,
+        batch_transfer_mod: Any = None,
         layout_mod: Any = None,
         sync_fn: Any = None,
     ) -> None:
@@ -395,14 +412,14 @@ class PreparedEngramUpload:
         self.pending: Any = None
         self.consumers: list[torch.Tensor] = []
         self.needs_consumer = False
-        if num_words == 0 or (dev.type == "cpu" and raw_transfer_mod is None):
+        if num_words == 0 or (dev.type == "cpu" and batch_transfer_mod is None):
             self.device = torch.zeros(num_words, dtype=torch.int32, device=dev)
-            self.host_words = torch.zeros(num_words, dtype=torch.int32, device="cpu")
-            self.host_buffer = SimpleNamespace(size_bytes=num_words * 4)
+            self.host_buffer = torch.zeros(num_words, dtype=torch.int32, device="cpu")
+            self.host_words = self.host_buffer
             self.transfer = _CpuTransfer(self.device, self.host_words)
             return
-        if raw_transfer_mod is None:
-            from tpu_sync.api.torch import raw_transfer as raw_transfer_mod
+        if batch_transfer_mod is None:
+            from torch_tpu._internal import batch_transfer as batch_transfer_mod
         if self._sync_fn is None:
             from torch_tpu._internal.sync.sync import synchronize as _tpu_sync
 
@@ -411,11 +428,18 @@ class PreparedEngramUpload:
         probe.bitwise_xor_(0x13579BDF)
         self.device = probe.to(dev)
         phys_words = _physical_words(self.device, layout_mod)
-        self.host_buffer = raw_transfer_mod.RawHostBuffer(phys_words * 4)
-        self.transfer = raw_transfer_mod.PreparedTorchRawTransfer(
-            self.device, self.host_buffer, unsafe_skip_buffer_lock=False
+        # Allocate pinned host memory from PJRT's HostMemoryAllocator on TPU so
+        # PJRT_RawBuffer_CopyRawHostToDevice performs direct zero-copy DMA.
+        self.host_buffer = torch.zeros(
+            phys_words,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=(dev.type != "cpu"),
         )
-        self.host_words = _host_words(self.host_buffer, num_words)
+        self.host_words = self.host_buffer[:num_words]
+        self.transfer = _BatchTransfer(
+            batch_transfer_mod, self.device, self.host_buffer
+        )
         self.transfer.d2h()
         if not torch.equal(self.host_words, probe):
             raise RuntimeError("Engram raw layout validation failed")
@@ -514,7 +538,7 @@ class HostEngramCoordinator:
         embeddings: list[tuple[int, Any]],
         device: torch.device | str,
         *,
-        raw_transfer_mod: Any = None,
+        batch_transfer_mod: Any = None,
         layout_mod: Any = None,
         sync_fn: Any = None,
     ):
@@ -528,7 +552,7 @@ class HostEngramCoordinator:
         self.embeddings = list(embeddings)
         self.by_layer = dict(embeddings)
         self.device = torch.device(device)
-        self._raw_transfer_mod = raw_transfer_mod
+        self._batch_transfer_mod = batch_transfer_mod
         self._layout_mod = layout_mod
         if sync_fn is None and self.device.type != "cpu":
             from torch_tpu._internal.sync.sync import synchronize as sync_fn
@@ -585,7 +609,7 @@ class HostEngramCoordinator:
                 PreparedEngramUpload(
                     words,
                     self.device,
-                    raw_transfer_mod=self._raw_transfer_mod,
+                    batch_transfer_mod=self._batch_transfer_mod,
                     layout_mod=self._layout_mod,
                     sync_fn=self._sync_fn,
                 )
