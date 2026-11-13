@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: tests/kernels/deepseek_v41/test_block_topk.py
-# Revision: cbf592e2be66ebbd5c33be8ff84e2a6a2314ea15 (epic/dsv41)
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Block-maximum top-k: ties, masked keys, short rows, forced and published blocks."""

@@ -1,5 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
-# Sources (epic/dsv41, revision cbf592e2be66ebbd5c33be8ff84e2a6a2314ea15):
+# Sources (epic/dsv41):
 #   src/vllm_torchtpu/kernels/deepseek_v41/indexer.py (score/top-k pipelines)
 #   src/vllm_torchtpu/models/vllm/deepseek_v41/v2/indexer_select.py
 #   src/vllm_torchtpu/models/vllm/deepseek_v41/v2/indexer_fp8.py (JAX parts)
