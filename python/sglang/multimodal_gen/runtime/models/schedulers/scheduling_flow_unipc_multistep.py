@@ -21,6 +21,18 @@ from diffusers.utils import deprecate
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
 
 
+def _einsum(equation: str, *operands: torch.Tensor) -> torch.Tensor:
+    """``torch.einsum`` over operands promoted to one dtype first.
+
+    CPU and CUDA einsum promote mixed dtypes (e.g. float32 solver weights with
+    bfloat16 model outputs) the same way; some backends require one dtype.
+    """
+    dtype = operands[0].dtype
+    for operand in operands[1:]:
+        dtype = torch.promote_types(dtype, operand.dtype)
+    return torch.einsum(equation, *(operand.to(dtype) for operand in operands))
+
+
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
     """
     `UniPCMultistepScheduler` is a training-free framework designed for the fast sampling of diffusion models.
@@ -472,14 +484,14 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
             if D1s is not None:
-                pred_res = torch.einsum("k,bkc...->bc...", rhos_p, D1s)  # pyright: ignore
+                pred_res = _einsum("k,bkc...->bc...", rhos_p, D1s)  # pyright: ignore
             else:
                 pred_res = 0
             x_t = x_t_ - alpha_t * B_h * pred_res
         else:
             x_t_ = alpha_t / alpha_s0 * x - sigma_t * h_phi_1 * m0
             if D1s is not None:
-                pred_res = torch.einsum("k,bkc...->bc...", rhos_p, D1s)  # pyright: ignore
+                pred_res = _einsum("k,bkc...->bc...", rhos_p, D1s)  # pyright: ignore
             else:
                 pred_res = 0
             x_t = x_t_ - sigma_t * B_h * pred_res
@@ -640,7 +652,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
             if D1s is not None:
-                corr_res = torch.einsum("k,bkc...->bc...", rhos_c[:-1], D1s)
+                corr_res = _einsum("k,bkc...->bc...", rhos_c[:-1], D1s)
             else:
                 corr_res = 0
             D1_t = model_t - m0
@@ -648,7 +660,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         else:
             x_t_ = alpha_t / alpha_s0 * x - sigma_t * h_phi_1 * m0
             if D1s is not None:
-                corr_res = torch.einsum("k,bkc...->bc...", rhos_c[:-1], D1s)
+                corr_res = _einsum("k,bkc...->bc...", rhos_c[:-1], D1s)
             else:
                 corr_res = 0
             D1_t = model_t - m0

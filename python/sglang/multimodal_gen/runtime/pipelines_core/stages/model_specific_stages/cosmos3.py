@@ -68,6 +68,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.torch_compile import build_torch_compile_kwargs
 from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
 from sglang.srt.utils.common import get_compiler_backend
 
@@ -1134,6 +1135,10 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "fullgraph": False,
                 "dynamic": False,
             }
+        elif current_platform.is_out_of_tree():
+            # The platform's own compile backend (e.g. torch_tpu), not inductor.
+            compile_kwargs = build_torch_compile_kwargs(mode=None, module=transformer)
+            compile_kwargs["dynamic"] = False
         else:
             try:
                 import torch._inductor.config as _inductor_cfg
@@ -1163,7 +1168,11 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 compile_kwargs,
             )
             transformer._gen_layers_torch_compiled = True
+            # Every rank runs the same GEN layer program (equal SP shards).
+            wrap_region = current_platform.prepare_spmd_region_wrapper()
             for i, layer in enumerate(gen_layers):
+                if wrap_region is not None:
+                    layer.forward = wrap_region(layer.forward)
                 gen_layers[i] = torch.compile(layer, **compile_kwargs)
         else:
             logger.warning("Cosmos3 gen_layers not found, skipping torch.compile")
