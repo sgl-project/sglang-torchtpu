@@ -81,6 +81,12 @@ class TpuOOTPlatform(TpuPlatform):
         return True
 
     @classmethod
+    def supports_rank_subset_collectives(cls) -> bool:
+        # torch_tpu launches a subgroup's collectives on every device of the
+        # slice, so every rank has to issue them together.
+        return False
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
