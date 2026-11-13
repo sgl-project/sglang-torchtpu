@@ -287,6 +287,10 @@ class LogitsProcessorOutput:
     next_token_global_top_k_logits: Optional[torch.Tensor] = None
     next_token_global_top_k_token_ids: Optional[torch.Tensor] = None
 
+    # Set when next_token_logits holds only this rank's vocab columns:
+    # (first vocab id of the shard, valid columns, vocab size).
+    next_token_logits_vocab_shard: Optional[Tuple[int, int, int]] = None
+
     # Sampled draft token IDs when draft sampling is fused into draft model forward
     next_draft_tokens: Optional[torch.Tensor] = None
     # DFlash2 candidate ids [bs, gamma, K] and scores [bs, gamma, K, K] from the
@@ -403,6 +407,9 @@ class LogitsMetadata:
     # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
     attn_tp_sequence_sharded: bool = False
 
+    # Skip the TP logits gather: next_token_logits stays this rank's vocab shard.
+    vocab_shard_logits: bool = False
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     # DRAFT_EXTEND_V2: when set, lm_head and LAST hidden capture use only these
@@ -488,6 +495,9 @@ class LogitsMetadata:
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
+            vocab_shard_logits=(
+                forward_batch.logits_output_mode is LogitsOutputMode.VOCAB_SHARD
+            ),
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -762,6 +772,11 @@ class LogitsProcessor(nn.Module):
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
+                next_token_logits_vocab_shard=(
+                    self._vocab_shard_extent(lm_head, sampled_logits)
+                    if logits_metadata.vocab_shard_logits
+                    else None
+                ),
             )
 
         logprobs_result, sampled_logits = self.input_logprob_processor.forward(
@@ -782,6 +797,23 @@ class LogitsProcessor(nn.Module):
         )
         logprobs_result.write_input_to(logits_output)
         return logits_output
+
+    def _vocab_shard_extent(
+        self, lm_head, logits: torch.Tensor
+    ) -> Tuple[int, int, int]:
+        indices = lm_head.shard_indices
+        if (
+            logits.shape[-1] != lm_head.num_embeddings_per_partition
+            or indices.num_added_elements != 0
+        ):
+            raise RuntimeError(
+                f"vocab-shard sampling needs the lm_head shard's columns: got "
+                f"{logits.shape[-1]} for {lm_head.num_embeddings_per_partition}, "
+                f"{indices.num_added_elements} added-vocab columns"
+            )
+        # Column c < num_org_elements is token org_vocab_start_index + c; the
+        # rest is padding.
+        return indices.org_vocab_start_index, indices.num_org_elements, self.vocab_size
 
     def _get_pruned_states(
         self,
@@ -1157,7 +1189,10 @@ class LogitsProcessor(nn.Module):
             logits = logits.contiguous().float()
 
         used_tp_lm_head_all_to_all = False
-        if self.do_tensor_parallel_all_gather:
+        if (
+            self.do_tensor_parallel_all_gather
+            and not logits_metadata.vocab_shard_logits
+        ):
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
             )

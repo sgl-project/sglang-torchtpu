@@ -445,6 +445,10 @@ class TpuEnvs:
     # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
     # Deployments can override this cutoff after measuring their topology.
     SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = EnvInt(64)
+    # Sample temperature-only and greedy decode batches from each rank's vocab
+    # shard (Gumbel-max plus one [rows, 2] all-gather) instead of all-gathering
+    # the full logits and sampling on every rank. Same distribution and draws.
+    SGLANG_TPU_ENABLE_VOCAB_SHARD_SAMPLING = EnvBool(False)
     # Filter top-k/top-p/min-p with the sort-free binary-search cutoff instead
     # of the full-vocabulary torch sort. Disable to A/B the sampled
     # distribution against the reference path.
