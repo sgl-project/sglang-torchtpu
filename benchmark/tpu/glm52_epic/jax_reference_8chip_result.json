@@ -1,0 +1,182 @@
+{
+  "steady_chunk_extend_ms": 1242.3941209999998,
+  "steady_chunk_extend_p95_ms": 1264.407787,
+  "steady_chunk_extend_samples": [
+    {
+      "bid": 103,
+      "duration_ms": 1227.879982,
+      "prefix_tokens": [
+        51200
+      ]
+    },
+    {
+      "bid": 105,
+      "duration_ms": 1232.578892,
+      "prefix_tokens": [
+        53248
+      ]
+    },
+    {
+      "bid": 107,
+      "duration_ms": 1228.022115,
+      "prefix_tokens": [
+        55296
+      ]
+    },
+    {
+      "bid": 109,
+      "duration_ms": 1234.85413,
+      "prefix_tokens": [
+        57344
+      ]
+    },
+    {
+      "bid": 115,
+      "duration_ms": 1249.952516,
+      "prefix_tokens": [
+        51200
+      ]
+    },
+    {
+      "bid": 117,
+      "duration_ms": 1249.934112,
+      "prefix_tokens": [
+        53248
+      ]
+    },
+    {
+      "bid": 119,
+      "duration_ms": 1253.017334,
+      "prefix_tokens": [
+        55296
+      ]
+    },
+    {
+      "bid": 121,
+      "duration_ms": 1264.407787,
+      "prefix_tokens": [
+        57344
+      ]
+    }
+  ],
+  "steady_chunk_extend_sample_count": 8,
+  "steady_chunk_extend_definition": "consecutive_host_result_completion_intervals_excluding_first_and_final_chunks",
+  "steady_chunk_extend_status": "ok",
+  "rejections": {
+    "nonfull_or_unselected_event": 49,
+    "noninterior_current_event": 4
+  },
+  "input_counts": {
+    "lines": 4138,
+    "completion_lines": 61
+  },
+  "streams_observed": [
+    "untagged"
+  ],
+  "selected_stream": "untagged",
+  "matched_rids": [
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-0",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-1",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-10",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-11",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-12",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-13",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-14",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-15",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-16",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-17",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-18",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-19",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-2",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-20",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-21",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-22",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-23",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-24",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-25",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-26",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-27",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-28",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-29",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-3",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-30",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-31",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-4",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-5",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-6",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-7",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-8",
+    "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-9"
+  ],
+  "selection": {
+    "run_prefix": null,
+    "rids": [
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-0",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-1",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-2",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-3",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-4",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-5",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-6",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-7",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-8",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-9",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-10",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-11",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-12",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-13",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-14",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-15",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-16",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-17",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-18",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-19",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-20",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-21",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-22",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-23",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-24",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-25",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-26",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-27",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-28",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-29",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-30",
+      "f116bfc8a0df41898ccdbdf470e4edec-cache-hit-extend-decode-31"
+    ]
+  },
+  "median_seconds": 1.2423941209999998,
+  "throughput_tokens_per_second": 26374.883337040523,
+  "throughput_definition": "32768 / (steady_chunk_extend_ms / 1000)",
+  "workload": {
+    "prefix_len": 49152,
+    "extend_len": 12288,
+    "dp_size": 16,
+    "chunk_size": 2048
+  },
+  "provenance": {
+    "source_commit": "3695225808f0293cae422ea7adf55eddacadd43d",
+    "source_path": "benchmark/glm52/bench_dsa_cache_hit.py",
+    "source_file_sha256": "7942972af82f57a53874cc843cb79bb08cf7b9a698e2b8229cde9bce3fd97b5ddd47",
+    "helper_sha256": "ff975d82b38202c387aa68e2629cde9b5c6857c425ebed81c355805ae46d693e",
+    "source_lines": "1063-1119",
+    "input_sha256": "307e993532cd9e92bc5cc799433350f1b907f18edd4d956e0ef10484637257e2",
+    "parser_sha256": "4a25e1e57807a267439dc1c547dbab2b39b0199ac06770fc9aefbb46f346ac3c"
+  },
+  "acceptance": "parser_only_not_workload_or_hardware_validation",
+  "input_log": "/private/tmp/glm52-night-jax-final-logs.txt",
+  "experiment": {
+    "exp_id": "exp-266i34jcm1",
+    "artifact_id": "art-2964t9rlq6",
+    "job_id": "job-j41ovz6guo",
+    "status": "SUCCEEDED",
+    "log_source": "falcon exp logs (gcs)",
+    "log_sha256": "307e993532cd9e92bc5cc799433350f1b907f18edd4d956e0ef10484637257e2"
+  },
+  "reference_precision": {
+    "checkpoint": "GLM5.2-fp8-channel-wise",
+    "kv_cache_dtype": "fp8_e4m3",
+    "fp8_q": true,
+    "fp8_pv": true
+  }
+}
