@@ -1,5 +1,6 @@
 """KV pages freed under overlap stay out of non-forward allocations until the
-forwards in flight at free time are processed."""
+forwards in flight at free time are processed, and KV backups wait for the
+forwards writing their pages, also under pipeline parallelism."""
 
 import ast
 import functools
@@ -9,10 +10,11 @@ import textwrap
 import unittest
 import warnings
 from array import array
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Tuple
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -35,6 +37,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -42,7 +45,11 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
-from sglang_tpu.kv_free_fence import install_kv_free_fence
+from sglang_tpu.kv_free_fence import (
+    KVFreeFence,
+    deferred_dma_read,
+    install_kv_free_fence,
+)
 
 register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
@@ -596,6 +603,314 @@ def _attribute_calls(func: ast.FunctionDef | ast.AsyncFunctionDef) -> List[ast.C
         for node in ast.walk(func)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     ]
+
+
+class _LaunchEvent:
+    """A launch event that only reports completion; blocking on it fails."""
+
+    def __init__(self, done=False):
+        self.done = done
+
+    def query(self):
+        return self.done
+
+    def synchronize(self):
+        raise AssertionError("the scheduler blocked on a launch event")
+
+
+def _no_device_sync():
+    raise AssertionError("the scheduler synchronized the device")
+
+
+def _launch_polled(fence, done=False):
+    forward = SimpleNamespace(copy_done=_LaunchEvent(done))
+    fence.on_batch_formed()
+    fence.on_forward_launched(forward)
+    return forward.copy_done
+
+
+class TestRetireCompleted(CustomTestCase):
+    def test_reads_wait_for_the_forwards_formed_before_them(self):
+        fence = KVFreeFence(synchronize_device=_no_device_sync)
+        ran = []
+        first = _launch_polled(fence)
+        fence.after_in_flight(lambda: ran.append("a"))
+        second = _launch_polled(fence)
+        fence.after_in_flight(lambda: ran.append("b"))
+
+        fence.retire_completed()
+        self.assertEqual(ran, [])
+        first.done = True
+        fence.retire_completed()
+        self.assertEqual(ran, ["a"])
+        second.done = True
+        fence.retire_completed()
+        self.assertEqual(ran, ["a", "b"])
+
+    def test_a_later_forward_finishing_first_releases_nothing(self):
+        fence = KVFreeFence(synchronize_device=_no_device_sync)
+        ran = []
+        first = _launch_polled(fence)
+        second = _launch_polled(fence)
+        fence.after_in_flight(lambda: ran.append("read"))
+
+        second.done = True
+        fence.retire_completed()
+        self.assertEqual(ran, [])
+        first.done = True
+        fence.retire_completed()
+        self.assertEqual(ran, ["read"])
+
+
+class TestPPLoopWiring(CustomTestCase):
+    def test_backup_of_a_running_chunk_waits_for_its_launch_event(self):
+        """A PP stage forms chunk 2 right after launching chunk 1; the backup
+        of chunk 1 queued while forming chunk 2 must wait for chunk 1's
+        forward, and is issued by polling, never by blocking."""
+        fence = KVFreeFence(synchronize_device=_no_device_sync)
+        chunk_1_launch = Mock(query=Mock(side_effect=[False, True]))
+        chunk_1_launch.synchronize.side_effect = AssertionError("blocked")
+        launch_events = [chunk_1_launch, _LaunchEvent()]
+        plans = ["chunk 1", "chunk 2", None]
+        issued = []
+        issued_at_intake = []
+
+        def form_batch(**kwargs):
+            batch = plans.pop(0)
+            if batch == "chunk 2":
+                deferred_dma_read(fence, lambda: issued.append("chunk 1 backup"))
+                self.assertEqual(issued, [])
+                self.assertEqual(
+                    (fence.stats.dma_reads_deferred, fence.stats.dma_reads_immediate),
+                    (1, 0),
+                )
+            return SimpleNamespace(running_batch=None, batch_to_run=batch)
+
+        def intake():
+            issued_at_intake.append(list(issued))
+            if len(issued_at_intake) > 3:
+                raise _StopLoop
+            return []
+
+        def init_loop_state():
+            scheduler.pp_loop_size = 2
+            scheduler.mbs = [None, None]
+            scheduler.last_mbs = [None, None]
+            scheduler.running_mbs = [None, None]
+            scheduler.mb_metadata = [None, None]
+            scheduler.last_rank_comm_queue = deque()
+            scheduler.launch_event = None
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.pp_kv_free_fence = fence
+        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler.init_pp_loop_state = init_loop_state
+        scheduler.ingest_requests = intake
+        scheduler.get_next_batch_to_run = form_batch
+        scheduler._pp_launch_batch = lambda *args: (object(), launch_events.pop(0))
+        scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
+            return_value=(None, None, Mock())
+        )
+        for name in (
+            "_pp_begin_iteration",
+            "_pp_recv_proxy",
+            "_pp_commit_proxy_send_work",
+            "_pp_process_batch_result",
+            "_pp_send_proxy",
+            "on_idle",
+        ):
+            setattr(scheduler, name, Mock())
+
+        with get_parallel().override(pp_size=2, pp_async_batch_depth=0):
+            with self.assertRaises(_StopLoop):
+                Scheduler.event_loop_pp(scheduler)
+        # Chunk 1 is still running at the second intake; the poll ahead of
+        # the third issues its backup.
+        self.assertEqual(
+            issued_at_intake, [[], [], ["chunk 1 backup"], ["chunk 1 backup"]]
+        )
+
+    def test_pd_prefill_backup_of_a_running_chunk_waits_for_its_launch_event(self):
+        """The PD prefill PP loop checkpoints the chunk this stage launched one
+        iteration earlier before forming the next; that chunk's HiCache backup
+        must wait for its forward, and is issued by polling, never by blocking."""
+        fence = KVFreeFence(synchronize_device=_no_device_sync)
+        chunk_1_launch = Mock(query=Mock(side_effect=[False, True]))
+        chunk_1_launch.synchronize.side_effect = AssertionError("blocked")
+        launch_events = [chunk_1_launch, _LaunchEvent()]
+        plans = ["chunk 1", "chunk 2", None]
+        issued = []
+        issued_at_checkpoint = []
+
+        def checkpoint_chunk(**kwargs):
+            issued_at_checkpoint.append(list(issued))
+            if len(issued_at_checkpoint) == 2:
+                deferred_dma_read(fence, lambda: issued.append("chunk 1 backup"))
+                self.assertEqual(issued, [])
+            if len(issued_at_checkpoint) > 3:
+                raise _StopLoop
+
+        def form_batch(running_batch):
+            return SimpleNamespace(
+                batch_to_run=plans.pop(0),
+                running_batch=SimpleNamespace(batch_is_full=False),
+            )
+
+        def init_loop_state():
+            scheduler.pp_loop_size = 2
+            scheduler.mbs = [None, None]
+            scheduler.last_mbs = [None, None]
+            scheduler.running_mbs = [None, None]
+            scheduler.mb_metadata = [None, None]
+            scheduler.last_rank_comm_queue = deque()
+            scheduler.launch_event = None
+            scheduler.send_req_work = []
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.pp_kv_free_fence = fence
+        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler.enable_staging = False
+        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.init_pp_loop_state = init_loop_state
+        scheduler.process_prefill_chunk = checkpoint_chunk
+        scheduler.get_new_batch_prefill = form_batch
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch: batch
+        )
+        scheduler._pp_launch_batch = lambda *args: (object(), launch_events.pop(0))
+        scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
+            return_value=(None, None, Mock())
+        )
+        scheduler._pp_pd_send_control = Mock(return_value=None)
+        scheduler._pp_pd_consensus_turn = Mock(return_value=False)
+        scheduler._pp_pd_get_bootstrapped_ids = Mock(return_value=None)
+        scheduler._pp_pd_get_prefill_transferred_ids = Mock(return_value=None)
+        scheduler.ingest_requests = Mock(return_value=[])
+        for name in (
+            "_pp_pd_begin_control_step",
+            "process_pending_chunked_abort",
+            "_pp_commit_comm_work",
+            "_process_hicache_events",
+            "_pp_begin_iteration",
+            "_pp_recv_proxy",
+            "_pp_commit_proxy_send_work",
+            "_pp_pd_stage_ready",
+            "_pp_process_batch_result",
+            "_pp_send_proxy",
+            "_pp_process_freeze_gc",
+            "on_idle",
+        ):
+            setattr(scheduler, name, Mock())
+
+        with get_parallel().override(pp_size=2, pp_async_batch_depth=0):
+            with self.assertRaises(_StopLoop):
+                Scheduler.event_loop_pp_disagg_prefill(scheduler)
+        # Chunk 1 is still running at the second checkpoint; the poll ahead of
+        # the third issues its backup.
+        self.assertEqual(
+            issued_at_checkpoint, [[], [], ["chunk 1 backup"], ["chunk 1 backup"]]
+        )
+
+
+class TestPPFenceGate(CustomTestCase):
+    """The PP fence is installed only on TPU, under PP, in the loops that drive
+    it, with a TPU DMA HiCache backend; every other server keeps none."""
+
+    def _scheduler(self, *, device="tpu", mode="prefill", dma=True):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.device = device
+        scheduler.enable_overlap = False
+        scheduler.disaggregation_mode = DisaggregationMode(mode)
+        scheduler._uses_tpu_dma_hicache = lambda: dma
+        return scheduler
+
+    def test_gate(self):
+        def needs(pp_size=2, **kwargs):
+            with get_parallel().override(pp_size=pp_size):
+                return self._scheduler(**kwargs)._needs_pp_kv_free_fence()
+
+        self.assertTrue(needs(mode="prefill"))
+        self.assertTrue(needs(mode="null"))
+        self.assertFalse(needs(mode="decode"))
+        self.assertFalse(needs(pp_size=1))
+        self.assertFalse(needs(device="cuda"))
+        self.assertFalse(needs(dma=False))
+
+    def _init(
+        self,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        allocator_cls=None,
+        mode="prefill",
+    ):
+        size = 8 * PAGE
+        kv_pool = MHATokenToKVPool(
+            size=size,
+            page_size=PAGE,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=8,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        allocator = (allocator_cls or TpuPagedTokenToKVPoolAllocator)(
+            size=size,
+            page_size=PAGE,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=kv_pool,
+            need_sort=False,
+        )
+        scheduler = self._scheduler(mode=mode)
+        scheduler.token_to_kv_pool_allocator = allocator
+        scheduler.spec_algorithm = spec_algorithm
+        scheduler.tpu_async_copy_worker = None
+        scheduler.device_module = SimpleNamespace(synchronize=_no_device_sync)
+        scheduler.tree_cache = SimpleNamespace(cache_controller=None)
+        memory = SimpleNamespace(hicache_io_backend="raiden")
+        with (
+            patch("sglang.srt.managers.scheduler.get_memory", return_value=memory),
+            get_parallel().override(pp_size=2),
+        ):
+            scheduler.maybe_init_kv_free_fence()
+        return scheduler, allocator
+
+    def test_pp_fence_holds_pages_freed_under_a_running_chunk(self):
+        """A PP chunk checkpoint frees slots its running forward still uses (SWA
+        out of window, deduplicated pages); a HiCache load must not land in
+        them until that forward retires."""
+        scheduler, allocator = self._init()
+        fence = scheduler.pp_kv_free_fence
+        self.assertIsNotNone(fence)
+        self.assertIsNone(scheduler.kv_free_fence)
+        self.assertIs(allocator.kv_free_fence, fence)
+
+        pages = allocator.alloc(allocator.size)
+        launch = _launch_polled(fence)
+        allocator.free(pages[:PAGE])
+        self.assertEqual(allocator.held_pages.num_pages, 1)
+        fence.retire_completed()
+        self.assertEqual(allocator.held_pages.num_pages, 1)
+        launch.done = True
+        fence.retire_completed()
+        self.assertEqual(allocator.held_pages.num_pages, 0)
+
+    def test_pp_fence_spec_check_by_loop(self):
+        """A PD prefill PP stage retires on a launch event after the whole
+        forward, draft writes included, so a speculative PD prefill is fenced.
+        The unified PP loop commits speculative KV after that event while
+        processing results, so it refuses speculative decoding."""
+        spec = CustomSpecAlgo("PLUGIN", factory=lambda args: None)
+        scheduler, _ = self._init(spec_algorithm=spec)
+        self.assertIsNotNone(scheduler.pp_kv_free_fence)
+        with self.assertRaisesRegex(ValueError, "Disable hierarchical cache"):
+            self._init(spec_algorithm=spec, mode="null")
+
+    def test_pp_fence_refuses_pools_it_cannot_hold(self):
+        with self.assertRaisesRegex(ValueError, "Disable hierarchical cache"):
+            self._init(allocator_cls=PagedTokenToKVPoolAllocator)
 
 
 class TestTpuImportOrder(CustomTestCase):

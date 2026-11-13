@@ -22,6 +22,15 @@ DMA reads have the mirror hazard: a device-to-host backup issued while a forward
 is in flight can copy a slot that forward has not written yet, such as the last
 slot of a request that finished at N-1 and was inserted into the tree.
 ``after_in_flight`` runs a DMA read once the forwards formed so far are done.
+
+Pipeline parallelism has both hazards without overlap: a stage checkpoints a
+request's running chunk into the tree before any result is processed, so the
+chunk's backup can read unwritten slots, and the checkpoint frees slots the
+chunk still uses (out-of-window SWA, pages deduplicated against the tree). Its
+loops retire forwards by polling their launch events (``retire_completed``).
+Those frees never reach a pending PD send: a non-last send lists only pages
+below ``cache_protected_len``, after the checkpoint, and the SWA it sends is
+the final window, above every slot a checkpoint frees.
 """
 
 from __future__ import annotations
@@ -57,8 +66,9 @@ class _AfterInFlight(msgspec.Struct, frozen=True):
 
 
 class KVFreeFenceStats(msgspec.Struct):
-    """Counts since the last stats line, summed over page pools. Device syncs
-    per non-forward pool allocation rise if eviction frees stop skipping the hold."""
+    """Counts since the last stats line; page counts are summed over page pools.
+    Device syncs per non-forward pool allocation rise if eviction frees stop
+    skipping the hold."""
 
     pages_held: int = 0
     pages_freed_idle: int = 0
@@ -67,6 +77,9 @@ class KVFreeFenceStats(msgspec.Struct):
     non_forward_allocs: int = 0
     device_syncs: int = 0
     device_sync_s: float = 0.0
+    max_device_sync_s: float = 0.0
+    dma_reads_deferred: int = 0
+    dma_reads_immediate: int = 0
 
 
 class KVFreeFence:
@@ -92,6 +105,10 @@ class KVFreeFence:
         self._after: Deque[_AfterInFlight] = deque()
         self._allocators: List[TpuPagedTokenToKVPoolAllocator] = []
         self.stats = KVFreeFenceStats()
+        # Whether this stats window logged a sync before it started. A scheduler
+        # hung in a sync stops printing the stats line, which retire_completed
+        # otherwise prints every window.
+        self._sync_start_logged = False
         self._stats_since = time.monotonic()
 
     def attach(self, allocator: TpuPagedTokenToKVPoolAllocator) -> None:
@@ -152,18 +169,52 @@ class KVFreeFence:
         self._release(oldest - 1)
         self._maybe_log_stats()
 
+    def retire_completed(self) -> None:
+        """Retire the oldest launched forwards whose ``copy_done`` has
+        completed, without blocking. For loops that launch further forwards
+        before processing any result."""
+        retired = False
+        while self._in_flight:
+            _, _, result = self._in_flight[0]
+            if result is None or not result.copy_done.query():
+                break
+            self._in_flight.popleft()
+            retired = True
+        if retired:
+            oldest = self._in_flight[0][0] if self._in_flight else self._formed + 1
+            self._release(oldest - 1)
+        self._maybe_log_stats()
+
     def wait_for_in_flight(self) -> None:
         """Block until every in-flight forward finishes, then release the
         pages freed during them."""
         # A device sync covers every queued KV write, including ones issued
         # after a result's copy_done.
+        # Under PP this cannot deadlock only because a stage sends everything
+        # iteration k owes the other stages before anything in iteration k+1 that
+        # can get here (a load short of free pages, a state-slot load, a blocking
+        # wait on a deferred backup): the forwards it waits for then need only
+        # launches the later stages make from those messages (the ICI wave's
+        # permute #k needs every stage's k-th launch). Keep those sends ahead.
         launched = self._formed
         if self._in_flight and self._in_flight[-1][2] is None:
             launched -= 1
+        if not self._sync_start_logged:
+            self._sync_start_logged = True
+            logger.info(
+                "KV free fence: device sync over %d in-flight forwards",
+                sum(
+                    1
+                    for seq, _, result in self._in_flight
+                    if seq > self._device_done and result is not None
+                ),
+            )
         start = time.perf_counter()
         self._synchronize_device()
+        elapsed = time.perf_counter() - start
         self.stats.device_syncs += 1
-        self.stats.device_sync_s += time.perf_counter() - start
+        self.stats.device_sync_s += elapsed
+        self.stats.max_device_sync_s = max(self.stats.max_device_sync_s, elapsed)
         self._device_done = launched
         self._release(launched)
 
@@ -188,6 +239,7 @@ class KVFreeFence:
         now = time.monotonic()
         if now - self._stats_since < _STATS_LOG_INTERVAL_S:
             return
+        self._sync_start_logged = False
         stats, self.stats = self.stats, KVFreeFenceStats()
         window_s, self._stats_since = now - self._stats_since, now
         held_queues = {
@@ -197,7 +249,9 @@ class KVFreeFence:
         logger.info(
             "KV free fence over %.0fs: pages held %d, freed idle %d, freed past "
             "write horizon %d, borrowed %d, held now %d; non-forward pool "
-            "allocations %d, device syncs %d (%.3f per allocation, %.1f ms)",
+            "allocations %d, device syncs %d (%.3f per allocation, %.1f ms), "
+            "longest %.1f ms; %d forwards in flight; DMA reads deferred %d, "
+            "immediate %d",
             window_s,
             stats.pages_held,
             stats.pages_freed_idle,
@@ -208,6 +262,10 @@ class KVFreeFence:
             stats.device_syncs,
             stats.device_syncs / max(stats.non_forward_allocs, 1),
             stats.device_sync_s * 1e3,
+            stats.max_device_sync_s * 1e3,
+            len(self._in_flight),
+            stats.dma_reads_deferred,
+            stats.dma_reads_immediate,
         )
 
     @contextmanager
@@ -246,9 +304,11 @@ class _DeferredDmaEvent:
         self._fence = fence
         self._issue_dma = issue
         self._event = None
+        self.issued = False
 
     def issue(self) -> None:
-        if self._event is None:
+        if not self.issued:
+            self.issued = True
             self._event = self._issue_dma()
 
     def query(self) -> bool:
@@ -301,6 +361,10 @@ def deferred_dma_read(fence: Optional[KVFreeFence], issue: Callable[[], object])
         return issue()
     event = _DeferredDmaEvent(fence, issue)
     fence.after_in_flight(event.issue)
+    if event.issued:
+        fence.stats.dma_reads_immediate += 1
+    else:
+        fence.stats.dma_reads_deferred += 1
     return event
 
 

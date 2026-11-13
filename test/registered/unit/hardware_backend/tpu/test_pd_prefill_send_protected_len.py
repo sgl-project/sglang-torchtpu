@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator import swa
@@ -69,6 +70,7 @@ class _Sender:
 
     def send(self, page_indices, state_indices=None, num_kv_tokens=None):
         self.blocks.extend(int(p) for p in page_indices)
+        self.state_indices = state_indices
 
 
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
@@ -79,6 +81,13 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_overlap = True
         self.enable_staging = False
         self.kv_checksum_computer = None
+        self.sliding_window_size = WINDOW
+        self.disagg_metadata_buffers = SimpleNamespace(set_buf=lambda req: None)
+        self.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            kv_manager=SimpleNamespace(
+                kv_args=SimpleNamespace(state_types=[StateType.SWA])
+            )
+        )
 
 
 class TestChunkSendsStayOwned(CustomTestCase):
@@ -271,6 +280,31 @@ class TestChunkSendsStayOwned(CustomTestCase):
         self.assertEqual(len(self.blocks), len(set(self.blocks)), self.blocks)
         # The send list covers the row the decode will be told about.
         self.assertEqual(self.blocks, self._pages(self.pool.req_to_token[1, :48]))
+
+    def test_checkpoint_swa_frees_stay_below_the_sent_window(self):
+        """SWA slots a mid-prefill checkpoint frees while the chunk may still be
+        computing (PP) are never part of the window the closing send lists, so
+        a fence on those frees need not wait for the transfer."""
+        tokens = TOKENS[:46]  # 46 - WINDOW is not page aligned: the tight case
+        x = self._req("x", 1, tokens)
+        self._match_and_lock(x)
+        sender = x.disagg_kv_sender
+        # PP loop order: checkpoint chunk k when forming k+1, then send it.
+        for start, end in ((0, 12), (12, 24), (24, 36), (36, 46)):
+            self._alloc_chunk(x, start, end)
+            self._checkpoint(x, end)
+            if end < len(tokens):
+                self._send(x, end)
+        self.scheduler.send_kv_chunk(x, last_chunk=True)
+        (window_pages,) = sender.state_indices
+        # The window is the request's last len(window_pages) pages.
+        window_start = ((len(tokens) - 1) // PAGE - (len(window_pages) - 1)) * PAGE
+        freed_below = x.kv.get_evicted_seqlen(ComponentType.SWA)
+        # Not vacuous: the checkpoints did free out-of-window SWA.
+        self.assertGreater(freed_below, 0)
+        self.assertLessEqual(
+            freed_below, window_start, "a sent SWA window slot was freed"
+        )
 
 
 if __name__ == "__main__":

@@ -1794,10 +1794,25 @@ class Scheduler(
             )
         )
 
+    def _needs_pp_kv_free_fence(self) -> bool:
+        """Whether a PP stage's unordered DMAs can touch pages its in-flight
+        forwards use: a chunk checkpoint inserts a running chunk (its backup
+        reads it) and frees pages that chunk still uses (a load can land in them)."""
+        return (
+            self.device == "tpu"
+            and get_parallel().pp_size > 1
+            # Only the unified and PD prefill PP loops drive this fence.
+            and self.disaggregation_mode
+            in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
+            and self._uses_tpu_dma_hicache()
+        )
+
     def maybe_init_kv_free_fence(self):
-        """Hold KV pages freed under overlap back from DMA write targets.
-        Raises if the fence cannot cover every KV write of this server."""
-        if not self._needs_kv_free_fence():
+        """Hold KV pages freed under overlap or PP back from DMA write targets,
+        and defer HiCache backups behind in-flight forwards. Raises if the fence
+        cannot cover every KV write of this server."""
+        pp = self._needs_pp_kv_free_fence()
+        if not (pp or self._needs_kv_free_fence()):
             return
         from sglang_tpu.kv_free_fence import (
             fence_hicache_backups,
@@ -1806,13 +1821,24 @@ class Scheduler(
         )
 
         fence_kwargs = dict(
-            spec_algorithm=self.spec_algorithm,
+            # A PP stage retires a forward on an event recorded after its whole
+            # run_batch, draft writes included, not on a copied result tensor.
+            spec_algorithm=SpeculativeAlgorithm.NONE if pp else self.spec_algorithm,
             copies_draft_tail=self.tpu_async_copy_worker is not None
             and self.tpu_async_copy_worker.copy_draft_tail,
         )
         reason = kv_free_fence_unsupported_reason(
             self.token_to_kv_pool_allocator, **fence_kwargs
         )
+        if (
+            pp
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and not self.spec_algorithm.is_none()
+        ):
+            reason = (
+                "the unified PP loop commits speculative KV while processing "
+                "results, after the launch event the fence retires on."
+            )
         if reason is not None:
             # Unfenced, a DMA into a freed page can land before an in-flight
             # forward's write to it and be overwritten without any error.
@@ -1821,17 +1847,25 @@ class Scheduler(
                 if self._uses_tpu_dma_hicache()
                 else "A PD decode server under overlap scheduling"
             )
-            raise ValueError(
-                f"{needed_by} needs the KV free fence: {reason} "
-                "Pass --disable-overlap-schedule to run without it."
+            fix = (
+                "Disable hierarchical cache to run pipeline parallelism without it."
+                if pp
+                else "Pass --disable-overlap-schedule to run without it."
             )
-        self.kv_free_fence = install_kv_free_fence(
+            raise ValueError(f"{needed_by} needs the KV free fence: {reason} {fix}")
+        fence = install_kv_free_fence(
             self.token_to_kv_pool_allocator,
             synchronize_device=self.device_module.synchronize,
             **fence_kwargs,
         )
+        # PP forces overlap off, so at most one of the two is set. The PP loops
+        # retire forwards by polling launch events, not through on_forward_done.
+        if pp:
+            self.pp_kv_free_fence = fence
+        else:
+            self.kv_free_fence = fence
         if self._uses_tpu_dma_hicache():
-            fence_hicache_backups(self.tree_cache.cache_controller, self.kv_free_fence)
+            fence_hicache_backups(self.tree_cache.cache_controller, fence)
 
     def precompile_tpu_spec_ops(self) -> None:
         from sglang_tpu.compilation.spec_decode_compile_policy import (
