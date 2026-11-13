@@ -31,6 +31,9 @@ from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
 from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import (
     fp8_paged_mqa_logits,
 )
+from sglang_tpu.kernels.deepseek_v41.index_selection.selection import (
+    select_fp8_indexer_jax,
+)
 
 
 def _pack(keys, layout):
@@ -113,6 +116,73 @@ def test_paged_mqa_logits_matches_reference(page_size, max_model_len):
         np.testing.assert_allclose(
             actual[visible], expected[visible], rtol=2e-2, atol=2e-2 * expected.max()
         )
+
+
+# Decode-sized batch whose request rows are interleaved and query_start_loc is
+# omitted: selection must sort instead of scoring rows against a neighbor's pages.
+def test_unsorted_requests_select_own_pages():
+    if jax.default_backend() != "tpu":
+        pytest.skip("Packed FP8 selection requires TPU")
+    tokens, width, topk, page_size, groups = 288, 16384, 512, 256, 48
+    rng = np.random.default_rng(13)
+    requests = rng.permutation(np.repeat(np.arange(groups), tokens // groups))
+    lengths = rng.integers(topk + 1, width + 1, tokens).astype(np.int32)
+    layout = PackedFP8Layout(512, page_size=page_size)
+    keys = jnp.asarray(rng.normal(size=(layout.pages * page_size, 128)), jnp.bfloat16)
+    pool, _ = _pack(keys, layout)
+    pool = jnp.asarray(pool)
+    table = rng.integers(0, layout.pages, (groups, width // page_size)).astype(np.int32)
+    q = jnp.asarray(rng.normal(size=(tokens, 32, 128)), jnp.float8_e4m3fn)
+    weights = jnp.asarray(rng.uniform(0.01, 0.1, (tokens, 32)), jnp.float32)
+    layout_args = (layout.pages, layout.page_stride, layout.page_offset, page_size)
+    selected = np.asarray(
+        jax.jit(
+            lambda q, w, n: select_fp8_indexer_jax(
+                q,
+                (pool,),
+                jnp.asarray(table),
+                w,
+                n,
+                jnp.empty((tokens, 0), jnp.int32),
+                jnp.asarray(requests, jnp.int32),
+                n.max().reshape(1),
+                layout_args,
+                topk,
+                8,
+                False,
+                False,
+                True,
+                width,
+            )[0]
+        )(q, weights, jnp.asarray(lengths))
+    )
+    # Reference scores of each row against its own request, scored in sorted order.
+    order = np.argsort(requests, kind="stable")
+    offsets = np.searchsorted(requests[order], np.arange(groups + 1))
+    sorted_scores = np.asarray(
+        fp8_paged_mqa_logits(
+            q[order],
+            pool,
+            weights[order],
+            jnp.asarray(lengths[order]),
+            jnp.asarray(table),
+            query_start_loc=jnp.asarray(offsets, jnp.int32),
+            max_model_len=width,
+            q_scale=jnp.ones_like(weights),
+            query_size=6,
+            cache_layout=layout,
+        )
+    )
+    scores = np.empty_like(sorted_scores)
+    scores[order] = sorted_scores
+    for row in range(tokens):
+        visible = scores[row, : lengths[row]]
+        ids = selected[row][selected[row] >= 0]
+        assert np.unique(ids).size == ids.size == topk, row
+        assert (ids < lengths[row]).all(), row
+        kth = np.sort(visible)[-topk]
+        tolerance = 2e-2 * np.abs(visible).max()
+        assert visible[ids].min() >= kth - tolerance, row
 
 
 if __name__ == "__main__":

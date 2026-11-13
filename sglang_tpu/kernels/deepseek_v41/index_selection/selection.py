@@ -668,7 +668,10 @@ def _select_fp8_indexer_jax(
     inputs = tuple(
         jnp.pad(x, ((0, padded - tokens),) + ((0, 0),) * (x.ndim - 1)) for x in inputs
     )
-    if query_start_loc is None:
+    # Derived boundaries only count rows per request; they are valid only for
+    # grouped rows, so the pipelined path below checks grouping at run time.
+    derived_offsets = query_start_loc is None
+    if derived_offsets:
         query_start_loc = _query_start_loc(requests, page_table.shape[0])
     if query_start_loc.shape != (page_table.shape[0] + 1,):
         raise ValueError("query_start_loc needs one entry per page-table row, plus one")
@@ -820,37 +823,45 @@ def _select_fp8_indexer_jax(
         )
         return jax.tree.map(update, output, selected)
 
-    # Grouped requests need neither sorting nor output reordering, so no
-    # runtime branch to the serial path: a branch costs an overlay load at its
-    # entry. Score tiles may split a request; the kernel resumes it mid-group.
-    output = jnp.full((tokens, topk), -1, jnp.int32)
-    if publish_rows:
-        output = (output, jnp.full(candidates.shape, -1, jnp.int32))
-    pipeline = (
-        pipeline_score_topk_bounded
-        if prefill_chunk_rows is not None or publish_rows
-        else pipeline_score_topk_unrolled
-    )
-    selected = pipeline(
-        padded // chunk_rows,
-        lambda tile: tile * chunk_rows,
-        lambda start, group: score(
-            start, chunk_rows, inputs, pipelined=True, group=group
-        ),
-        select,
-        write,
-        output,
-    )
-    published = candidates
-    if publish_rows:
-        selected, published = selected
-        published = jnp.where(valid_requests[:, None], published, -1)
-    # Batch-wide short-context bypass: every visible key, as in the reference.
-    # A select rather than a cond keeps the scoring path free of branches.
-    short = jnp.minimum(batch_max.max(), width) <= topk
-    ids = jnp.arange(topk, dtype=jnp.int32)
-    visible = jnp.where(ids < lengths[:tokens, None], ids, -1)
-    return jnp.where(short, visible, selected), published
+    def select_pipelined():
+        # Grouped requests need neither sorting nor output reordering, so no
+        # runtime branch to the serial path: a branch costs an overlay load at its
+        # entry. Score tiles may split a request; the kernel resumes it mid-group.
+        output = jnp.full((tokens, topk), -1, jnp.int32)
+        if publish_rows:
+            output = (output, jnp.full(candidates.shape, -1, jnp.int32))
+        pipeline = (
+            pipeline_score_topk_bounded
+            if prefill_chunk_rows is not None or publish_rows
+            else pipeline_score_topk_unrolled
+        )
+        selected = pipeline(
+            padded // chunk_rows,
+            lambda tile: tile * chunk_rows,
+            lambda start, group: score(
+                start, chunk_rows, inputs, pipelined=True, group=group
+            ),
+            select,
+            write,
+            output,
+        )
+        published = candidates
+        if publish_rows:
+            selected, published = selected
+            published = jnp.where(valid_requests[:, None], published, -1)
+        # Batch-wide short-context bypass: every visible key, as in the reference.
+        # A select rather than a cond keeps the scoring path free of branches.
+        short = jnp.minimum(batch_max.max(), width) <= topk
+        ids = jnp.arange(topk, dtype=jnp.int32)
+        visible = jnp.where(ids < lengths[:tokens, None], ids, -1)
+        return jnp.where(short, visible, selected), published
+
+    # A caller-supplied query_start_loc asserts grouped rows, as upstream: no
+    # runtime branch. Derived boundaries fall back to the sorting serial path.
+    if not derived_offsets:
+        return select_pipelined()
+    grouped = jnp.all(inputs[-1][1:] >= inputs[-1][:-1])
+    return jax.lax.cond(grouped, select_pipelined, select_serial)
 
 
 def select_fp8_indexer_jax(
