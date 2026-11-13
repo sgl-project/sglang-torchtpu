@@ -1254,6 +1254,65 @@ class IndexSelect:
             def rescan():
                 jax.lax.fori_loop(first_v, end_v, vreg, 0)
 
+        def scan_chunk(row, buf, base, chunk, local, start):
+            """``scan`` of a whole resident chunk (``buf`` rows ``base ..``) at
+            once: its vregs' bin tests in one pass, then one reduction per bin
+            key (a row holds few: at most GATHER_SLOTS over the group)."""
+            rows_valid = refs["counts"][row] * self.subpages
+            lo = refs["row_prefix"][row] ^ INT_MIN
+            keys, rows_of, hits = [], [], []
+            for v in range(chunk // 8):
+                key = buf[pl_ds(pl.multiple_of(base + v * 8, 8), 8), :]
+                key_row = start + v * 8 + sub8
+                valid = (key_row >= local * chunk) & (key_row < rows_valid)
+                in_bin = (key >= lo) & (
+                    jax.lax.shift_right_logical(key - lo, bits) == 0
+                )
+                keys.append(key)
+                rows_of.append(key_row)
+                hits.append((valid & in_bin).astype(jnp.int32))
+            total_hits = hits[0]
+            for h in hits[1:]:
+                total_hits = total_hits + h
+            n = jnp.sum(total_hits)
+            flat = [v * 8 * LANES + flat8 for v in range(chunk // 8)]
+
+            def one(i, masks):
+                masks = list(masks)
+                best = jnp.where(masks[0] != 0, flat[0], 1 << 24)
+                for v in range(1, len(masks)):
+                    best = jnp.minimum(best, jnp.where(masks[v] != 0, flat[v], 1 << 24))
+                idx = jnp.min(best)
+                k = p = None
+                for v in range(len(masks)):
+                    at = flat[v] == idx
+                    page = rows_of[v] // self.subpages
+                    position = (
+                        (page * self.group + self.owner) * self.T
+                        + (rows_of[v] % self.subpages) * INDEX_SUBPAGE_TOKENS
+                        + lane8
+                    )
+                    kv = jnp.where(at, keys[v], 0)
+                    pv = jnp.where(at, position, 0)
+                    k = kv if k is None else k + kv
+                    p = pv if p is None else p + pv
+                    masks[v] = jnp.where(at, 0, masks[v])
+                k, p = jnp.sum(k), jnp.sum(p)
+                c = refs["cand_n"][row]
+
+                @pl_when(c < GATHER_SLOTS)
+                def put():
+                    cur = cand[pl_ds(row, 1), :]
+                    cur = jnp.where(lane1 == c, k, cur)
+                    cand[pl_ds(row, 1), :] = jnp.where(
+                        lane1 == GATHER_SLOTS + c, p, cur
+                    )
+
+                refs["cand_n"][row] = c + 1
+                return tuple(masks)
+
+            jax.lax.fori_loop(0, n, one, tuple(hits))
+
         def through_ring():
             chunk, total = self.chunk, refs["chunk_starts"][self.batch]
             for step in range(self.key_slots - 1):
@@ -1295,15 +1354,7 @@ class IndexSelect:
 
                     @pl_when(8 * g + r < self.batch)
                     def one_row(r=r, row=row):
-                        scan(
-                            row,
-                            lambda v: slot[
-                                pl_ds(pl.multiple_of(r * gchunk + v * 8, 8), 8), :
-                            ],
-                            gchunk,
-                            local,
-                            start,
-                        )
+                        scan_chunk(row, slot, r * gchunk, gchunk, local, start)
 
                 return carry
 
