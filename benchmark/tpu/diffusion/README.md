@@ -6,7 +6,7 @@ text encoder, the highest TPU clock and a 65536 KiB scoped-VMEM limit for XLA fu
 64 MiB of per-core VMEM on tpu7x (3% faster denoise on Z-Image-Turbo than without it); see `launch.sh`. The Wan
 recipes compile per transformer block (`--regional-compile`), which keeps each block's collectives inside its program,
 and run sequence-parallel attention with the Pallas ring kernel, which passes K/V between cores over ICI
-(TI2V-5B adds Ulysses inside each chip); sequences that need tail padding use the K/V all-gather ring.
+(TI2V-5B and I2V-A14B add Ulysses inside each chip); sequences that need tail padding use the K/V all-gather ring.
 
 | Recipe | Model | Cores | Parallelism |
 | :--- | :--- | :---: | :--- |
@@ -23,7 +23,7 @@ e.g. `./ltx2.sh --warmup-resolutions 1280x720`.
 
 ## Performance
 
-tpu7x 2x2x1, torch_tpu 0.2.0 (Wan2.2-T2V-A14B rows: 0.2.1.dev20261028), libtpu 0.0.50, steady-state request (the first two requests compile and warm up), seed 42. E2E and peak HBM come from a default run;
+tpu7x 2x2x1, torch_tpu 0.2.0 (Wan2.2-T2V-A14B rows: 0.2.1.dev20261028201649, main's pin), libtpu 0.0.50, steady-state request (the first two requests compile and warm up), seed 42. E2E and peak HBM come from a default run;
 denoise step and VAE decode from a run with `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`, which synchronizes the device at
 stage boundaries (otherwise queued denoising work is counted in the decode stage).
 
@@ -35,8 +35,8 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Z-Image-Turbo | T2I 1024x1024, 9 steps | 8 | 0.36 s | 0.026 s | 0.10 s | 22.4 GB |
 | Wan2.2-TI2V-5B | T2V 1280x704, 121 frames, 20 steps | 8 | 10.1 s | 0.251 s | 3.9 s | 30.1 GB |
 | Wan2.2-TI2V-5B | I2V 960x928 (from a square image), 121 frames, 20 steps | 8 | 11.8 s | 0.316 s | 4.1 s | 64.3 GB |
-| Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 53.5 s | 2.44 s | 3.8 s | 70.4 GB |
-| Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 102.5 s | 2.44 s | 3.8 s | 70.4 GB |
+| Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 53.5 s | 2.44 s | 3.8 s | 68.7 GB |
+| Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 102.5 s | 2.45 s | 3.8 s | 68.7 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
 
