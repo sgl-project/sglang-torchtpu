@@ -18,7 +18,7 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.disaggregation.raiden import pipeline as pl
+from sglang_tpu.disaggregation.raiden import pool_transfer as pl
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
 from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
@@ -154,7 +154,7 @@ class Manager:
 
 
 def make(mode, pp_rank, pp_size, controller, bus, name, heads, stage_parts=False):
-    t = object.__new__(pl.PipelineTransfer)
+    t = object.__new__(pl.RaidenPoolTransfer)
     mgr = Manager(mode, pp_rank, pp_size, bus, name)
     groups = SimpleNamespace(
         full=[Tensor(32, 2 * heads, 8, 4)],
@@ -932,7 +932,7 @@ def test_early_close_refuses_stage_groups_and_a_loop_without_deferred_sends(
 ):
     """Stage groups replace the closing transfer, and without the deferred
     output send the last stage would silently close at its result point."""
-    t = object.__new__(pl.PipelineTransfer)
+    t = object.__new__(pl.RaidenPoolTransfer)
     t.producer = True
 
     def depth(value):
