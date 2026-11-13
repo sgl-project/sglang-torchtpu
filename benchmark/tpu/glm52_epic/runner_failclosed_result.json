@@ -1,0 +1,8 @@
+{
+  "elapsed_seconds": 0.001,
+  "error": "RuntimeError: GLM52_IMAGE must be a user-provided immutable image digest; no default image",
+  "falcon_rank": -1,
+  "scope": "startup and one token-ID smoke only; no performance claim",
+  "source_commit": null,
+  "status": "FAILED"
+}
