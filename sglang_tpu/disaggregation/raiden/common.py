@@ -74,6 +74,33 @@ def _tcp_endpoint(ip: str, port: int) -> str:
     return NetworkAddress(host=ip, port=int(port)).to_tcp()
 
 
+# KVArgs.kv_layout / PrefillServerInfo.kv_layout of None.
+TOKEN_MAJOR_KV_LAYOUT = "token_major"
+
+
+def kv_layout_mismatch_reason(
+    local: Optional[str], remote: Optional[str]
+) -> Optional[str]:
+    """Failure reason if the decode (``local``) and prefill (``remote``) KV
+    pool layouts differ, else None.
+
+    Pull copies pages byte-for-byte and push-reshard computes token-major
+    offsets, so a mismatch corrupts KV or, when page sizes differ, fails late
+    (#1077). A prefill that omits the key reads as token-major, including one
+    that predates it.
+    """
+    local = local or TOKEN_MAJOR_KV_LAYOUT
+    remote = remote or TOKEN_MAJOR_KV_LAYOUT
+    if local == remote:
+        return None
+    return (
+        f"KV layout mismatch: prefill uses {remote}, decode uses {local}; set "
+        "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV, SGLANG_TPU_KV_PACK_HEADS and the "
+        "attention backend identically on both (a prefill without kv_layout in "
+        f"its bootstrap info is {TOKEN_MAJOR_KV_LAYOUT})"
+    )
+
+
 @dataclass(frozen=True)
 class RaidenKVCacheGroups:
     """Page-compatible cache groups registered with independent Raiden engines."""
@@ -109,6 +136,8 @@ class RaidenKVCacheGroups:
     swa_head_nums: List[int] = field(default_factory=list)
     # Pools are TpuSeqAlongLaneKVPool (head-major, tokens on lanes).
     seq_along_lane: bool = False
+    # Most heads any pool stores side by side in one row (kv_pack_heads).
+    kv_pack_heads: int = 1
 
 
 def _is_seq_along_lane_pool(pool: Optional[KVCache]) -> bool:
@@ -173,11 +202,15 @@ def _block_major_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
 
 
 def _is_seq_along_lane(pool: Any) -> bool:
+    """Whether ``pool`` is head-major with tokens on lanes, read from the
+    layout it advertises to P/D peers as ``KVArgs.kv_layout``."""
+    from sglang.srt.disaggregation.utils import get_kv_layout
+
     try:
         from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
     except ImportError:
         return False
-    return isinstance(pool, TpuSeqAlongLaneKVPool)
+    return get_kv_layout(pool) == TpuSeqAlongLaneKVPool.disagg_kv_layout
 
 
 def get_raiden_kv_caches(
@@ -357,6 +390,16 @@ def get_raiden_kv_caches(
         num_hidden_full = 1
         full_heads.append(0)
 
+    packs = [
+        getattr(p, "kv_pack_heads", 1)
+        for top in (pool, draft_pool)
+        for p in (
+            top,
+            *(getattr(top, a, None) for a in ("full_kv_pool", "swa_kv_pool")),
+        )
+    ]
+    kv_pack_heads = max([1, *(p for p in packs if isinstance(p, int))])
+
     state: List[torch.Tensor] = []
     state_type = StateType.MAMBA
     state_max_blocks = 1
@@ -407,4 +450,5 @@ def get_raiden_kv_caches(
         full_head_nums=full_heads,
         swa_head_nums=swa_heads,
         seq_along_lane=seq_along_lane,
+        kv_pack_heads=kv_pack_heads,
     )
