@@ -1,0 +1,262 @@
+{
+  "schema": "glm52-checkpoint-inspection-v1",
+  "checkpoint": "/models/GLM5.2-fp8-channel-wise",
+  "config_sha256": "0735624bbd5666283a1f135c59ff4c15e8b51c56fc50e022181525253f29463b",
+  "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+  "architectures": [
+    "GlmMoeDsaForCausalLM"
+  ],
+  "quantization_config": {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "weight_block_size": null
+  },
+  "model_dimensions": {
+    "hidden_size": 6144,
+    "num_hidden_layers": 78,
+    "n_routed_experts": 256,
+    "moe_intermediate_size": 2048,
+    "qk_rope_head_dim": 64,
+    "index_head_dim": 128,
+    "index_topk": 2048,
+    "index_kpool": null
+  },
+  "tensor_count": 118629,
+  "missing_index_tensors": [],
+  "wrong_index_shard": [],
+  "dtype_summary": {
+    "BF16": 465,
+    "F32": 59120,
+    "F8_E4M3": 59044
+  },
+  "excluded_consumer_weights": [
+    {
+      "name": "lm_head.weight",
+      "shape": [
+        154880,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00001-of-00282.safetensors"
+    },
+    {
+      "name": "model.embed_tokens.weight",
+      "shape": [
+        154880,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00001-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.0.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00001-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.1.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00001-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.10.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00005-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.14.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00020-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.18.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00035-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.2.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00038-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.22.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00049-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.26.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00064-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.30.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00083-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.34.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00097-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.38.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00112-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.42.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00130-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.46.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00145-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.50.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00164-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.54.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00178-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.58.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00193-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.6.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00200-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.62.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00211-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.66.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00226-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.70.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00245-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.74.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00259-of-00282.safetensors"
+    },
+    {
+      "name": "model.layers.78.self_attn.indexer.weights_proj.weight",
+      "shape": [
+        32,
+        6144
+      ],
+      "dtype": "BF16",
+      "shard": "model-00274-of-00282.safetensors"
+    }
+  ],
+  "fp8_weights_without_scales": [],
+  "scale_summary": [
+    {
+      "suffix": ".weight_scale_inv",
+      "kind": "output_channel_2d_weight",
+      "scale_rank": 1,
+      "count": 59044
+    }
+  ],
+  "loader_compatibility": "UNVERIFIED: compare recorded scale ABI against consumer allocation/loading",
+  "source_exp": "exp-20ka8bjztj"
+}

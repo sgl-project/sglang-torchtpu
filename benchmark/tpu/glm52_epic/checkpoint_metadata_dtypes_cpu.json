@@ -1,0 +1,43 @@
+{
+  "name": "glm52-night-20261113-checkpoint-dtypes",
+  "exp_type": "TRAINING",
+  "cluster_name": "gke-tpu-train-us-central1-1-prod",
+  "artifact_type": "GCS",
+  "config": "{\"purpose\": \"read-only checkpoint headers, no weights or TPU execution\", \"epic_commit\": \"b3ecb556bd\"}",
+  "role_to_task_spec": {
+    "worker": {
+      "command": "set -eu\nulimit -c 0\nmkdir -p /tmp/glm52-metadata\ncat > /tmp/glm52-metadata/inspect.py <<'GLM52_INSPECT_EOF'\n#!/usr/bin/env python3\n\"\"\"Inspect GLM checkpoint metadata without loading weights or requiring torch.\n\nThis is an evidence collector, not a declaration of loader compatibility.\nOnly config/index JSON and safetensors headers are read. No model is modified.\n\"\"\"\nimport argparse\nimport collections\nimport hashlib\nimport json\nimport struct\nfrom pathlib import Path\n\n\ndef inspect(root: Path) -> dict:\n    config_bytes = (root / \"config.json\").read_bytes()\n    index_bytes = (root / \"model.safetensors.index.json\").read_bytes()\n    config = json.loads(config_bytes)\n    index = json.loads(index_bytes)\n    tensors = {}\n    headers = {}\n    for shard in sorted(set(index[\"weight_map\"].values())):\n        path = (root / shard).resolve()\n        if not path.is_relative_to(root.resolve()):\n            raise ValueError(f\"shard escapes checkpoint: {shard}\")\n        with path.open(\"rb\") as stream:\n            size_bytes = stream.read(8)\n            if len(size_bytes) != 8:\n                raise ValueError(f\"truncated safetensors prefix: {shard}\")\n            size = struct.unpack(\"<Q\", size_bytes)[0]\n            if size > 256 * 1024 * 1024:\n                raise ValueError(f\"oversized safetensors header: {shard}: {size}\")\n            raw = stream.read(size)\n            if len(raw) != size:\n                raise ValueError(f\"truncated safetensors header: {shard}\")\n        header = json.loads(raw)\n        headers[shard] = hashlib.sha256(raw).hexdigest()\n        for name, meta in header.items():\n            if name == \"__metadata__\":\n                continue\n            if name in tensors:\n                raise ValueError(f\"duplicate tensor: {name}\")\n            tensors[name] = {\"shape\": meta[\"shape\"], \"dtype\": meta[\"dtype\"], \"shard\": shard}\n    missing = sorted(set(index[\"weight_map\"]) - tensors.keys())\n    wrong_shard = sorted(name for name, shard in index[\"weight_map\"].items()\n                         if name in tensors and tensors[name][\"shard\"] != shard)\n    scales = []\n    policy = collections.Counter()\n    for name, meta in sorted(tensors.items()):\n        if not name.endswith((\".weight_scale_inv\", \".weight_scale\")):\n            continue\n        suffix = \".weight_scale_inv\" if name.endswith(\".weight_scale_inv\") else \".weight_scale\"\n        weight_name = name[:-len(suffix)] + \".weight\"\n        weight = tensors.get(weight_name)\n        shape = meta[\"shape\"]\n        if not weight:\n            kind = \"missing_weight\"\n        elif len(weight[\"shape\"]) == 2 and shape in ([weight[\"shape\"][0]], [weight[\"shape\"][0], 1]):\n            kind = \"output_channel_2d_weight\"\n        elif shape in ([], [1]):\n            kind = \"scalar\"\n        else:\n            kind = \"other_or_block\"\n        policy[(suffix, kind, len(shape))] += 1\n        scales.append({\"name\": name, **meta, \"weight_shape\": weight[\"shape\"] if weight else None,\n                       \"weight_dtype\": weight[\"dtype\"] if weight else None,\n                       \"classification\": kind})\n    dtype_counts = collections.Counter(meta[\"dtype\"] for meta in tensors.values())\n    # Record excluded consumers explicitly: absence of a scale is not dtype evidence.\n    excluded_weights = [\n        {\"name\": name, **meta}\n        for name, meta in sorted(tensors.items())\n        if name.endswith((\".embed_tokens.weight\", \".weights_proj.weight\", \".shared_head.head.weight\"))\n        or name == \"lm_head.weight\"\n    ]\n    fp8_without_scales = [\n        {\"name\": name, **meta}\n        for name, meta in sorted(tensors.items())\n        if meta[\"dtype\"].startswith(\"F8_\") and name.endswith(\".weight\")\n        and not any(name[:-len(\".weight\")] + suffix in tensors\n                    for suffix in (\".weight_scale_inv\", \".weight_scale\"))\n    ]\n    return {\n        \"schema\": \"glm52-checkpoint-inspection-v1\", \"checkpoint\": str(root.resolve()),\n        \"config_sha256\": hashlib.sha256(config_bytes).hexdigest(),\n        \"index_sha256\": hashlib.sha256(index_bytes).hexdigest(),\n        \"header_sha256\": headers, \"architectures\": config.get(\"architectures\"),\n        \"quantization_config\": config.get(\"quantization_config\"),\n        \"model_dimensions\": {key: config.get(key) for key in (\n            \"hidden_size\", \"num_hidden_layers\", \"n_routed_experts\", \"moe_intermediate_size\",\n            \"qk_rope_head_dim\", \"index_head_dim\", \"index_topk\", \"index_kpool\")},\n        \"tensor_count\": len(tensors), \"missing_index_tensors\": missing,\n        \"wrong_index_shard\": wrong_shard,\n        \"dtype_summary\": dict(sorted(dtype_counts.items())),\n        \"excluded_consumer_weights\": excluded_weights,\n        \"fp8_weights_without_scales\": fp8_without_scales,\n        \"scale_summary\": [{\"suffix\": key[0], \"kind\": key[1], \"scale_rank\": key[2], \"count\": value}\n                          for key, value in sorted(policy.items())],\n        \"scales\": scales,\n        \"loader_compatibility\": \"UNVERIFIED: compare recorded scale ABI against consumer allocation/loading\",\n    }\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument(\"checkpoint\", type=Path)\n    parser.add_argument(\"--output\", type=Path, required=True)\n    args = parser.parse_args()\n    result = inspect(args.checkpoint)\n    args.output.parent.mkdir(parents=True, exist_ok=True)\n    args.output.write_text(json.dumps(result, indent=2) + \"\\n\")\n    print(json.dumps({key: value for key, value in result.items()\n                      if key not in (\"scales\", \"header_sha256\")}, indent=2))\n    if result[\"missing_index_tensors\"] or result[\"wrong_index_shard\"]:\n        raise SystemExit(1)\n\n\nif __name__ == \"__main__\":\n    main()\n\nGLM52_INSPECT_EOF\ntimeout 900 python3 /tmp/glm52-metadata/inspect.py /models/GLM5.2-fp8-channel-wise --output \"$ARTIFACT_LOCAL_DIR/checkpoint-inspection.json\"\n",
+      "replica": 1,
+      "image": "python:3.12-bookworm",
+      "device_type": "cpu",
+      "resources": {
+        "cpu_request": "2",
+        "cpu_limit": "2",
+        "memory_request": "4Gi",
+        "memory_limit": "4Gi"
+      },
+      "mounts": [
+        {
+          "name": "glm52-channelwise-model",
+          "type": "gcs",
+          "bucket": "inference-model-storage-poc-tpu-hns",
+          "prefix": "GLM5.2-fp8-channel-wise",
+          "mount_path": "/models/GLM5.2-fp8-channel-wise",
+          "read_only": true,
+          "mount_options": [
+            "implicit-dirs",
+            "metadata-cache:ttl-secs:-1",
+            "metadata-cache:stat-cache-max-size-mb:-1",
+            "metadata-cache:type-cache-max-size-mb:-1",
+            "file-system:kernel-list-cache-ttl-secs:-1",
+            "read:enable-buffered-read:true",
+            "read:block-size-mb:32",
+            "read:max-blocks-per-handle:64",
+            "read:global-max-blocks:2048",
+            "read_ahead_kb=1024"
+          ]
+        }
+      ]
+    }
+  }
+}
