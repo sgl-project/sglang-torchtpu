@@ -24,7 +24,7 @@ Required stack remains torch2.11.0 CPU ABI, torch_tpu0.2.1.dev20261028201649, tp
 
 ## New actual verification
 
-`exp-ldtcncqheb` / `art-oxwfsxmg4o`: submitted CPU-only bootstrap verification using the above mounts and peer setup, epic source `dd312270841887966b5480be2f451f6c19de1496`, then the nine actual CPU loader tests. It progressed to RUNNING/INSTALL. Actual pip log confirms mounted torch_tpu wheel processing, public JAX/JAXLIB0.11.2 downloads, and installation of the complete dependency set without private-index401/403. Final runtime/test status still requires collection; no pass claimed here.
+`exp-ldtcncqheb` / `art-oxwfsxmg4o`: submitted CPU-only bootstrap verification using the above mounts and peer setup, epic source `dd312270841887966b5480be2f451f6c19de1496`, then the nine actual CPU loader tests. SUCCEEDED. Actual runtime exactly matches torch_tpu0.2.1.dev20261028201649, tpu-sync-torch0.0.1.dev20261031081414, torch2.11.0+cpu/torchvision0.26.0+cpu, JAX/JAXLIB0.11.2 and libtpu0.0.50. All nine real CPU loader tests passed in0.098s. Actual pip log confirms mounted torch_tpu wheel processing and public JAX/JAXLIB downloads, without private-index401/403. This proves the bootstrap/runtime route, not TPU model acceptance; see [result](peer_runtime_cpu_result.json) and [output](peer_runtime_cpu_pass.txt).
 
 Previous private-index401 remains a fact about that failed install route, **not a blocker of the whole Torch baseline objective**. The successful peer route supersedes that conclusion.
 
