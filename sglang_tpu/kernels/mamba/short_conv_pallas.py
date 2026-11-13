@@ -19,9 +19,14 @@ _DECODE_TILE = 8
 
 
 def _channel_tile(channels):
-    # Full-width DMA also permits tiny/nonaligned test shapes. Production
-    # partitions use lane multiples, split into at most 512 channels.
-    return next((c for c in (512, 384, 256, 128) if channels % c == 0), channels)
+    # Every native state row and every channel partition must be DMA aligned.
+    # Full-width copies alone do not make small channel counts DMA safe.
+    if channels <= 0 or channels % 128:
+        raise ValueError(
+            "TPU ShortConv requires channels to be a positive multiple of 128"
+        )
+    # A partition of the rank-one bias also needs a power-of-two block size.
+    return next(c for c in (512, 256, 128) if channels % c == 0)
 
 
 def _prefill_kernel(
@@ -62,7 +67,7 @@ def _prefill_kernel(
         n = jnp.minimum(tile, length - offset)
         halo = jnp.where(i == 0, 0, h)
         return pltpu.make_async_copy(
-            x.at[pl.ds(start + offset - halo, n + halo), pl.ds(col, channels)],
+            x.at[pl.ds(start + offset - halo, n + halo), :, pl.ds(col, channels)],
             inputs.at[i % 2, pl.ds(h - halo, n + halo)],
             read_sem.at[i % 2],
         )
@@ -71,7 +76,7 @@ def _prefill_kernel(
         n = jnp.minimum(tile, length - i * tile)
         return pltpu.make_async_copy(
             outputs.at[i % 2, pl.ds(0, n)],
-            out.at[pl.ds(start + i * tile, n), pl.ds(col, channels)],
+            out.at[pl.ds(start + i * tile, n), :, pl.ds(col, channels)],
             write_sem.at[i % 2],
         )
 
@@ -83,7 +88,7 @@ def _prefill_kernel(
             n = jnp.minimum(tile, stop - begin - i * tile)
             dma = pltpu.make_async_copy(
                 outputs.at[0, pl.ds(0, n)],
-                out.at[pl.ds(begin + i * tile, n), pl.ds(col, channels)],
+                out.at[pl.ds(begin + i * tile, n), :, pl.ds(col, channels)],
                 write_sem.at[0],
             )
             dma.start()
@@ -98,7 +103,7 @@ def _prefill_kernel(
             state_dma().start()
             state_dma().wait()
 
-        old = jnp.concatenate([history[i, 0][None, :] for i in range(h)], axis=0)
+        old = history[...]
         w = weight[...].astype(jnp.float32)
         b = None if bias is None else bias[...].astype(jnp.float32)[None, :]
         num_tiles = pl.cdiv(length, tile)
@@ -118,7 +123,7 @@ def _prefill_kernel(
             window = jnp.where(
                 i == 0, jnp.concatenate((old, window[h:]), axis=0), window
             )
-            value = jnp.zeros((tile, channels), jnp.float32)
+            value = jnp.zeros((tile, 1, channels), jnp.float32)
             for k in range(h + 1):
                 value = value + window[k : k + tile] * w[k : k + 1]
             if b is not None:
@@ -139,7 +144,7 @@ def _prefill_kernel(
         # relevant old history (zeroed above on a fresh request).
         n = jnp.minimum(length, h)
         dma = pltpu.make_async_copy(
-            x.at[pl.ds(end - n, n), pl.ds(col, channels)],
+            x.at[pl.ds(end - n, n), :, pl.ds(col, channels)],
             tail.at[pl.ds(0, n)],
             read_sem.at[0],
         )
@@ -151,7 +156,7 @@ def _prefill_kernel(
             @pl.when(n == size)
             def update(size=size):
                 values = [history[i + size, 0] for i in range(h - size)]
-                values += [tail_values[i] for i in range(size)]
+                values += [tail_values[i, 0] for i in range(size)]
                 for i in range(h):
                     history[i, 0] = values[i]
 
@@ -220,16 +225,18 @@ def _decode_kernel(
     value = value + current * w[h : h + 1]
     if bias is not None:
         value = value + bias[...].astype(jnp.float32)[None, :]
-    active_rows = jnp.concatenate(
+    # Concatenate i32 rows before comparing: concatenating predicate vectors
+    # asks Mosaic to bitcast i1 registers to i32 on multi-request tiles.
+    slot_rows = jnp.concatenate(
         [
-            jnp.broadcast_to(slots[rb * batch_tile + row] > 0, (1, channels))
+            jnp.broadcast_to(slots[rb * batch_tile + row], (1, channels))
             for row in range(batch_tile)
         ],
         axis=0,
     )
     # Store the whole BF16 tile: single-row stores would require packed
     # sublane read/modify/write on TPU.
-    out[...] = jnp.where(active_rows, value, 0).astype(out.dtype)
+    out[...] = jnp.where(slot_rows > 0, value, 0).astype(out.dtype)
     for row in range(batch_tile):
         active = slots[rb * batch_tile + row] > 0
 
@@ -258,7 +265,8 @@ def short_conv_pallas(
 ):
     """Return (aliased FP32 state, x.dtype output); real slots must be unique.
 
-    Shapes: x[T,C], weight[C,K], state[S,K-1,1,C]. Slot 0 is never written.
+    Shapes: x[T,C], weight[C,K], state[S,K-1,1,C]. C must be a positive
+    multiple of 128 for native-state DMA. Slot 0 is never written.
     starts[B+1] describes packed prefill; prefix[B] controls old state reads.
     Decode consumes one token per slot. Metadata values do not specialize JIT.
     ``interpret=pltpu.InterpretParams(...)`` uses the TPU interpreter on CPU;
@@ -269,7 +277,7 @@ def short_conv_pallas(
     assert h > 0 and state.shape[1:] == (h, 1, channels)
     assert state.dtype == jnp.float32
     bc = _channel_tile(channels)
-    # Only the small weights change layout. Pass the state tensor verbatim.
+    # Transpose the small weights; pass the state tensor verbatim.
     weight = weight.T.astype(jnp.float32)
     bias = None if bias is None else bias.astype(jnp.float32)
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
@@ -306,7 +314,12 @@ def short_conv_pallas(
         )(slots, x, state, weight, bias)
         return state, output[:tokens]
 
-    return pl.pallas_call(
+    # Keep token offsets outside the two tiled minor dimensions. In [T,C],
+    # ragged starts and the K-1 halo can cut a VMEM tile (including packed
+    # BF16 rows). [T,1,C] permits whole-row DMAs at arbitrary token offsets;
+    # use the same shape for input, output and tail staging. State stays native.
+    x = x[:, None, :]
+    state, output = pl.pallas_call(
         functools.partial(_prefill_kernel, tile=_TOKEN_TILE, channels=bc),
         out_shape=(state_shape, jax.ShapeDtypeStruct(x.shape, x.dtype)),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -316,9 +329,9 @@ def short_conv_pallas(
             out_specs=(hbm, hbm),
             scratch_shapes=(
                 pltpu.VMEM((h, 1, bc), jnp.float32),
-                pltpu.VMEM((h, bc), x.dtype),
-                pltpu.VMEM((2, _TOKEN_TILE + h, bc), x.dtype),
-                pltpu.VMEM((2, _TOKEN_TILE, bc), x.dtype),
+                pltpu.VMEM((h, 1, bc), x.dtype),
+                pltpu.VMEM((2, _TOKEN_TILE + h, 1, bc), x.dtype),
+                pltpu.VMEM((2, _TOKEN_TILE, 1, bc), x.dtype),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA,
@@ -339,3 +352,4 @@ def short_conv_pallas(
         weight,
         bias,
     )
+    return state, output[:, 0, :]

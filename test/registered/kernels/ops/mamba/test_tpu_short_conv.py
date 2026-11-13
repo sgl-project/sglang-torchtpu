@@ -53,6 +53,7 @@ def _reference(x, weight, bias, state, slots, lengths, has_prefix):
 
 class TestShortConvCPU(CustomTestCase):
     device = "cpu"
+    channels = 5
 
     def setUp(self):
         self.generator = torch.Generator().manual_seed(42)
@@ -89,16 +90,17 @@ class TestShortConvCPU(CustomTestCase):
         # Includes a zero-length real request, repeated null slots, dirty history
         # on fresh requests, and token padding after the last real sequence.
         slots = [3, 2, 1, 4, 0, 0]
-        lengths = [1, 0, 4, 2, 0, 0]
+        lengths = [1, 0, 4, 2, 1, 0]
         has_prefix = [False, True, True, False, False, False]
+        channels = self.channels
         for width, dtype, use_bias in itertools.product(
             (2, 3, 4), (torch.float32, torch.bfloat16), (False, True)
         ):
             with self.subTest(width=width, dtype=dtype, bias=use_bias):
-                x = self._randn(10, 5, dtype=dtype)
-                weight = self._randn(5, width, dtype=dtype)
-                bias = self._randn(5, dtype=dtype) if use_bias else None
-                initial = self._randn(6, width - 1, 1, 5)
+                x = self._randn(10, channels, dtype=dtype)
+                weight = self._randn(channels, width, dtype=dtype)
+                bias = self._randn(channels, dtype=dtype) if use_bias else None
+                initial = self._randn(6, width - 1, 1, channels)
                 expected, expected_state = _reference(
                     x, weight, bias, initial, slots, lengths, has_prefix
                 )
@@ -115,11 +117,12 @@ class TestShortConvCPU(CustomTestCase):
                 self._assert_result(actual, state, expected, expected_state)
 
     def test_decode_reorders_requests_and_keeps_null_slot_unchanged(self):
-        weight = self._randn(5, 3)
-        expected_state = self._randn(5, 2, 1, 5)
+        channels = self.channels
+        weight = self._randn(channels, 3)
+        expected_state = self._randn(5, 2, 1, channels)
         state = expected_state.clone().to(self.device)
         for slots in ([3, 0, 1, 0], [1, 3, 0, 0]):
-            x = self._randn(4, 5)
+            x = self._randn(4, channels)
             expected, expected_state = _reference(
                 x, weight, None, expected_state, slots, [1] * 4, [True] * 4
             )
@@ -141,9 +144,10 @@ class TestShortConvCPU(CustomTestCase):
             self._assert_result(actual, state, expected, expected_state)
 
     def test_chunked_prefill_then_decode_matches_full_sequence(self):
-        x = self._randn(8, 5, dtype=torch.bfloat16)
-        weight = self._randn(5, 3, dtype=torch.bfloat16)
-        initial = self._randn(3, 2, 1, 5)
+        channels = self.channels
+        x = self._randn(8, channels, dtype=torch.bfloat16)
+        weight = self._randn(channels, 3, dtype=torch.bfloat16)
+        initial = self._randn(3, 2, 1, channels)
         expected, expected_state = _reference(
             x, weight, None, initial, [2], [8], [False]
         )
@@ -181,18 +185,19 @@ class TestShortConvCPU(CustomTestCase):
         self._assert_result(torch.cat(pieces), state, expected, expected_state)
 
     def test_all_padding_preserves_dirty_cache(self):
-        initial = self._randn(3, 2, 1, 5)
+        channels = self.channels
+        initial = self._randn(3, 2, 1, channels)
         state = initial.clone().to(self.device)
         actual = self._prefill(
-            self._randn(4, 5).to(self.device),
-            self._randn(5, 3).to(self.device),
-            self._randn(5).to(self.device),
+            self._randn(4, channels).to(self.device),
+            self._randn(channels, 3).to(self.device),
+            self._randn(channels).to(self.device),
             state,
             [0, 0, 0],
             [0, 0, 0],
             [False, False, False],
         )
-        self._assert_result(actual, state, torch.zeros(4, 5), initial)
+        self._assert_result(actual, state, torch.zeros(4, channels), initial)
 
 
 @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX interpreter")
@@ -205,10 +210,11 @@ class TestShortConvPallasInterpreter(CustomTestCase):
         from sglang_tpu.kernels.mamba.short_conv_pallas import short_conv_pallas
 
         generator = torch.Generator().manual_seed(37)
-        lengths, slots = [1, 0, 65, 137, 0], [3, 2, 1, 4, 0]
+        lengths, slots = [1, 0, 65, 137, 3], [3, 2, 1, 4, 0]
         prefix = [False, True, True, False, False]
         for channels, width, dtype in (
-            (5, 4, torch.float32),
+            (128, 4, torch.float32),
+            (768, 3, torch.bfloat16),
             (1536, 3, torch.bfloat16),
         ):
             with self.subTest(channels=channels, width=width, dtype=dtype):
@@ -282,6 +288,8 @@ class TestShortConvPallasInterpreter(CustomTestCase):
 @unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "requires torch_tpu")
 class TestShortConvTPU(TestShortConvCPU):
     device = "tpu"
+    # Exercise the same boundary/state cases at a DMA-aligned channel width.
+    channels = 128
 
     @classmethod
     def setUpClass(cls):
@@ -295,32 +303,45 @@ class TestShortConvTPU(TestShortConvCPU):
         op = torch.compile(
             build_short_conv_op(), backend="tpu", fullgraph=True, dynamic=False
         )
-        channels = 1536
-        weight = self._randn(channels, 3, dtype=torch.bfloat16)
-        bias = self._randn(channels, dtype=torch.bfloat16)
-        expected_state = self._randn(7, 2, 1, channels)
-        state = expected_state.clone().to(self.device)
-        weight_t, bias_t = weight.to(self.device), bias.to(self.device)
-        for lengths, slots, prefix in (
-            ([1, 0, 65, 129, 0], [3, 2, 1, 4, 0], [False, True, True, False, False]),
-            ([63, 2, 1, 129, 0], [4, 3, 2, 1, 0], [True, True, False, True, False]),
-            ([0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [False] * 5),
-        ):
-            x = self._randn(256, channels, dtype=torch.bfloat16)
-            expected, expected_state = _reference(
-                x, weight, bias, expected_state, slots, lengths, prefix
-            )
-            actual = op(
-                x.to(self.device),
-                weight_t,
-                bias_t,
-                state,
-                torch.tensor(slots, device=self.device),
-                torch.tensor([0, *itertools.accumulate(lengths)], device=self.device),
-                torch.tensor(prefix, device=self.device),
-                False,
-            )
-            self._assert_result(actual, state, expected, expected_state)
+        # 768 channels also exercises bias partitions: a 384-element 1D block
+        # cannot lower even though it is a multiple of the 128-channel lane.
+        for channels in (768, 1536):
+            with self.subTest(channels=channels):
+                weight = self._randn(channels, 3, dtype=torch.bfloat16)
+                bias = self._randn(channels, dtype=torch.bfloat16)
+                expected_state = self._randn(7, 2, 1, channels)
+                state = expected_state.clone().to(self.device)
+                weight_t, bias_t = weight.to(self.device), bias.to(self.device)
+                for lengths, slots, prefix in (
+                    (
+                        [1, 0, 65, 129, 3],
+                        [3, 2, 1, 4, 0],
+                        [False, True, True, False, False],
+                    ),
+                    (
+                        [63, 2, 1, 129, 0],
+                        [4, 3, 2, 1, 0],
+                        [True, True, False, True, False],
+                    ),
+                    ([0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [False] * 5),
+                ):
+                    x = self._randn(256, channels, dtype=torch.bfloat16)
+                    expected, expected_state = _reference(
+                        x, weight, bias, expected_state, slots, lengths, prefix
+                    )
+                    actual = op(
+                        x.to(self.device),
+                        weight_t,
+                        bias_t,
+                        state,
+                        torch.tensor(slots, device=self.device),
+                        torch.tensor(
+                            [0, *itertools.accumulate(lengths)], device=self.device
+                        ),
+                        torch.tensor(prefix, device=self.device),
+                        False,
+                    )
+                    self._assert_result(actual, state, expected, expected_state)
 
     def test_compiled_decode_partial_vector_tile_keeps_state_across_replays(self):
         from sglang_tpu.kernels.mamba.short_conv import build_short_conv_op

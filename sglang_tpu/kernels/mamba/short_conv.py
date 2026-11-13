@@ -62,6 +62,10 @@ def build_short_conv_op():
         has_prefix: Optional[torch.Tensor],
         decode: bool,
     ) -> torch.Tensor:
+        # JAX exports int64 inputs as int32 by default. Convert before export
+        # so the torch_tpu call signature matches the kernel's index dtype.
+        slots = slots.to(torch.int32)
+        starts = None if starts is None else starts.to(torch.int32)
         args = (x, weight, bias, state, slots, starts, has_prefix, decode)
         key = (
             tuple(None if t is None else (tuple(t.shape), t.dtype) for t in args[:-1]),
