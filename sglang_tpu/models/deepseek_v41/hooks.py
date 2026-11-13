@@ -186,6 +186,31 @@ trace_tpu_env_default
        defaults depend only on the platform, fixed before any model is traced.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: callable env defaults are resolved at import or are traceable.
+
+tpu_dsv41_fp32_moe_sum
+  Why: with attention DP 8, MoE EP 8 and attn_tp 1, every rank computes MoE
+       partials (its EP-routed experts plus its share of the TP8-sharded shared
+       expert) for every token of the DP-gathered buffer, and _post_experts_sum
+       adds the 8 partials with a BF16 all-reduce. The BF16 summation order
+       depends on where a token sits in that buffer, so one greedy prompt gave
+       different tokens and logprobs on different DP ranks. Summed in FP32 and
+       rounded to BF16 once, all 8 ranks were bit-identical on TPU, GSM8K
+       unchanged. The earlier sglang_tpu V4.1 model summed each token in FP32.
+  How: AROUND sglang.srt.layers.moe.utils._post_experts_sum, which
+       post_experts_all_reduce and sum_post_experts_output call through the
+       module global. A BF16 input that will be reduced (reduce_ep or
+       reduce_tp) goes through the original as .float() and comes back with
+       .to(torch.bfloat16); any other call is passed through. The all-reduce
+       then carries FP32, twice the bytes. Hooks register on TPU for every
+       model, so the hook also requires the process's target model to be V4.1
+       (process_model_config().hf_config.model_type, the check
+       select_tpu_dsv41_loader makes), read through
+       torch._dynamo.assume_constant_result: one constant, the same on every
+       rank, decided at trace time outside the compiled graph.
+  Upstream PR or issue: none yet; candidate seam: a precision option for the
+       post-experts reduction.
+  Remove when: core offers that option, or the TPU all-reduce sums BF16 in an
+       order that does not depend on the rank.
 """
 
 from __future__ import annotations
@@ -394,6 +419,36 @@ def trace_tpu_env_default(original, field):
     if not torch.compiler.is_compiling():
         return original(field)
     return _resolve_env_default(field.name)
+
+
+@torch._dynamo.assume_constant_result
+def _serves_dsv41() -> bool:
+    """Whether this process's target model is DeepSeek-V4.1 (draft workers
+    included: process_model_config is built from the served model path).
+
+    Fixed per process and equal on every rank; under Dynamo it is evaluated once
+    at trace time and baked in, as ModelConfig is not traceable."""
+    from sglang.srt.runtime_context import process_model_config
+
+    config = process_model_config().hf_config
+    return getattr(config, "model_type", None) == "deepseek_v41"
+
+
+def tpu_dsv41_fp32_moe_sum(original, hidden_states, *, reduce_ep, reduce_tp):
+    """AROUND _post_experts_sum: sum V4.1's BF16 MoE partials in FP32.
+
+    The ops are .float(), the original reduction, .to(torch.bfloat16): one
+    rounding to BF16 after the full sum instead of one per partial added. Summed
+    in FP32, 8 BF16 partials are exact (so their order does not matter) unless
+    their exponents span more than about 13 binades."""
+    if (
+        hidden_states.dtype != torch.bfloat16
+        or not (reduce_ep or reduce_tp)
+        or not _serves_dsv41()
+    ):
+        return original(hidden_states, reduce_ep=reduce_ep, reduce_tp=reduce_tp)
+    summed = original(hidden_states.float(), reduce_ep=reduce_ep, reduce_tp=reduce_tp)
+    return summed.to(torch.bfloat16)
 
 
 def tpu_dsv41_hc_combine(original, x_flat, pre, hc, out_dtype):
@@ -774,6 +829,11 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.EngramEmbedding._owned_rows",
             tpu_dsv41_engram_owned_rows,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.moe.utils._post_experts_sum",
+            tpu_dsv41_fp32_moe_sum,
             HookType.AROUND,
         ),
     ]
