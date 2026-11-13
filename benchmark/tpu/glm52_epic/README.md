@@ -65,6 +65,16 @@ rank mesh, loaded scale shapes, cache budget, compile shapes and active kernels.
 Use identical fixed token inputs from the reference, not independently tokenized
 random text. Isolate compile/warmup, steady prefill device time and client TTFT.
 
+## Explicit unsupported loader/speculative modes
+
+The private layout currently supports the target `GlmMoeDsaForCausalLM` only.
+Same-checkpoint NEXTN/MTP rewrites the architecture to its draft class and is
+intentionally rejected; do not advertise decode MTP acceptance before that
+separate gate. `npcache` is rejected because its NumPy conversion cannot
+serialize FP8 tensors. Use the default `auto` / `safetensors` loader for the
+mounted checkpoint; `pt` requires an actual matching serialized PT checkpoint.
+CPU offload and parameter-replacing alternate loaders remain excluded.
+
 ## Global vs local chunk contract
 
 With attention-DP16, native argument resolution divides the supplied

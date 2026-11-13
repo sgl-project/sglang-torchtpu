@@ -62,10 +62,10 @@ class TpuFp8Config(Fp8Config):
             )
         from sglang.srt.runtime_context import get_exec, get_model
 
-        if get_model().load_format not in ("auto", "pt", "safetensors", "npcache"):
+        if get_model().load_format not in ("auto", "pt", "safetensors"):
             raise ValueError(
                 f"{CHECKPOINT_LAYOUT} requires the default checkpoint loader "
-                "(auto, pt, safetensors or npcache); other loaders are unverified"
+                "(auto, pt or safetensors); npcache cannot serialize FP8 dtypes"
             )
         if get_exec().offload.cpu_offload_gb:
             raise ValueError(f"{CHECKPOINT_LAYOUT} does not support CPU offloading")

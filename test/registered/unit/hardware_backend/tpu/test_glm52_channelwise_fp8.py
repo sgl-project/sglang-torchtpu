@@ -178,6 +178,7 @@ class TestGlm52Fp8OptIn(CustomTestCase):
         self.assertEqual(metadata, original)
         for runtime, message in (
             ({"load_format": "dummy"}, "default checkpoint loader"),
+            ({"load_format": "npcache"}, "npcache cannot serialize FP8"),
             ({"load_format": "auto", "cpu_offload_gb": 1}, "CPU offloading"),
         ):
             with self.subTest(runtime=runtime):
