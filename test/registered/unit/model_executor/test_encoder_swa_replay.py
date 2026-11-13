@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.srt.arg_groups import deepseek_v4_hook
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -378,6 +379,8 @@ class TestFoldMlpSync(CustomTestCase):
         runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
         runner.is_draft_worker = False
         runner.attn_tp_sequence_sharded.return_value = False
+        # ModelRunner's default; the policy pads DP counts to the attention TP size.
+        runner.compile_policy = NoopCompilePolicy()
         tp_group = GroupCoordinator.__new__(GroupCoordinator)
         tp_group.world_size = self.ATTN_TP
         tp_group.rank_in_group = 0

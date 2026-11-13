@@ -455,7 +455,8 @@ class TestPrefillAdder(CustomTestCase):
                     rem_chunk_tokens=rem_chunk,
                 )
                 req = self.create_shared_req(f"hit-{prefix_len}-{rem_chunk}")
-                req.prefix_len = prefix_len
+                # Admission reads the hit from prefix_indices on this core.
+                req.prefix_indices = list(range(prefix_len))
                 req.full_untruncated_fill_ids = list(range(prefix_len + 4096))
                 result = adder.add_one_req(
                     req, has_chunked_req=False, truncation_align_size=None
@@ -464,7 +465,7 @@ class TestPrefillAdder(CustomTestCase):
                     self.assertEqual(result, AddReqResult.OTHER)
                     self.assertEqual(adder.can_run_list, [])
                     continue
-                self.assertEqual(req.extend_len, extend_len)
+                self.assertEqual(req.extend_range.length, extend_len)
                 self.assertEqual(adder.log_replay_tokens, min(prefix_len, 128))
                 self.assertEqual(adder.rem_chunk_tokens, 0)
 
