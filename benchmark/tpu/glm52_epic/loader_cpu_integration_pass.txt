@@ -1,0 +1,26 @@
+Falcon exp-yx8wvm6hhg / command cmd-5hi0as8p4z; source2a057e236e plus transferred fixture test SHA256 5221be11cf4da4952045b669e455a93bbcefe3d6c8f9c17308470cbd1a6abe64
+cmd-5hi0as8p4z	pending	0
+/usr/local/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794579018.728237      65 pjrt_api.cc:119] GetPjrtApi was found for TPU at /usr/local/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794579018.748299      65 tpu_profiler_plugin.cc:800] PyTorch PrivateUse1ProfilerRegistry not found. Native TPU profiling will be disabled (this is expected on PyTorch < 2.12).
+/workspace/sglang-torchtpu/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/workspace/sglang-torchtpu/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+[CI Test Method] TestGlm52Fp8OptIn.test_explicit_layout_rejects_incompatible_checkpoint_metadata
+.[CI Test Method] TestGlm52Fp8OptIn.test_opt_in_preserves_upstream_parsing_and_enforces_loader_contract
+.[CI Test Method] TestGlm52Fp8OptIn.test_ordinary_scalar_and_block_fp8_do_not_consult_runtime
+.[CI Test Method] TestGlm52Fp8Packing.test_dense_channel_scales_have_one_checkpoint_name_and_reconstruct
+.[CI Test Method] TestGlm52Fp8Packing.test_dense_rejects_stale_alias_and_nonchannel_scale_before_transpose
+.[CI Test Method] TestGlm52Fp8Packing.test_early_kv_b_absorption_uses_channel_multipliers
+.[CI Test Method] TestGlm52Fp8Packing.test_legacy_dense_loaders_shard_weights_but_replicate_row_scales
+.[CI Test Method] TestGlm52Fp8Packing.test_model_loader_pairs_qkv_scales_and_shards_merged_mlp
+.[CI Test Method] TestGlm52Fp8Packing.test_moe_channel_metadata_survives_real_runtime_formatting
+.
+----------------------------------------------------------------------
+Ran 9 tests in 0.063s
+
+OK
+cmd-5hi0as8p4z	succeeded	exit=0
