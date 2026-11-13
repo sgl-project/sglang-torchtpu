@@ -1,6 +1,6 @@
 {
-  "status": "BLOCKED_BEFORE_SUBMISSION",
-  "reason": "exact torch_tpu nightly unavailable through both tested package sources; no mismatched image substituted",
+  "status": "PEER_ARTIFACT_BOOTSTRAP_SUBMITTED",
+  "reason": "Previous index-only blocker superseded: successful peer exp-bsvzoblh0d mounts exact hash-verified wheel from Falcon artifact; verification exp-ldtcncqheb submitted", 
   "required_runtime": "torch_tpu==0.2.1.dev20261028201649",
   "public_probe": {
     "exp_id": "exp-39bjc3ngd8",
@@ -11,5 +11,5 @@
   "runner": "torch_8chip_runner.sh",
   "runner_scope": "bounded native startup + one-token smoke only until pinned image/peer hostnames are supplied",
   "performance_result": null,
-  "next_input_needed": "user-provided current stack image immutable sha256 and authorized package index credentials or prebuilt image"
+  "next_action": "collect exact runtime probe, then use peer artifact bootstrap and ordered two-host rendezvous; no private index credentials required"
 }
