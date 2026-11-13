@@ -71,5 +71,12 @@ CONFIG["runtime_env"].update(
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": "false",
         "OMP_NUM_THREADS": "4",
         "SGLANG_TPU_CHECK_RECOMPILATION": "1",
+        # One Engram table copy in host memory shared by the 8 ranks, looked up
+        # outside the compiled graph (sglang_tpu/models/deepseek_v41/engram_host.py).
+        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
+        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "shared",
+        # XLA's SparseCore gather offload halted a SparseCore in the 512-token
+        # extend graph (libtpu 0.0.50); drop once that is fixed.
+        "LIBTPU_INIT_ARGS": "--xla_tpu_offload_gather_to_sparsecore=false",
     }
 )
