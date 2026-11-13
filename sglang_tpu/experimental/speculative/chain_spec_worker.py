@@ -365,24 +365,16 @@ class TpuChainSpecWorker(TpuSpecWorker):
         draft_ids = self._draft_prompt_ids(
             batch, padded_tokens=padded_tokens, bucket_tokens=bucket_tokens
         )
-        forward_batch = ForwardBatch.init_new(
-            batch,
-            self._draft_runner,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
-            return_hidden_states_before_norm=False,
-        )
-        forward_batch.input_ids = draft_ids
         drafter = self._chain_draft_worker
-        seed_capture, seed_select = self._prompt_seed_capture(batch)
-        forward_batch.spec_info = chain_draft_forward_input(
-            hidden_states=target_hidden,
-            width=1,
-            dsa_seed_topk_capture=seed_capture,
-            dsa_seed_topk_select=seed_select,
-        )
-        forward_batch.return_logprob = False
-        self._set_draft_prefill_dp_counts(forward_batch, padded_tokens=padded_tokens)
         with drafter.draft_context(), torch.no_grad():
+            forward_batch = self._draft_prompt_batch(
+                batch,
+                hidden_states=target_hidden,
+                padded_tokens=padded_tokens,
+                extend_lens=batch.extend_lens,
+            )
+            forward_batch.input_ids = draft_ids
+            seed_capture = forward_batch.spec_info.dsa_seed_topk_capture
             if mm_input_embeds is not None:
                 assert mm_input_embeds.shape[0] == padded_tokens
                 # Embeds in hand keep the draft off its mm_inputs path, whose
@@ -404,20 +396,52 @@ class TpuChainSpecWorker(TpuSpecWorker):
             seed_table.index_copy_(0, pool_rows, seed_capture)
         return tail_hidden
 
+    def _draft_prompt_batch(
+        self,
+        batch: ScheduleBatch,
+        *,
+        hidden_states: torch.Tensor,
+        padded_tokens: int,
+        extend_lens: Sequence[int],
+    ) -> ForwardBatch:
+        """The draft prompt forward's batch, shaped as its warmed program was traced.
+
+        The rank with prompts and an idle DP rank both build it here, so the two
+        cannot drift apart. Call it inside draft_context(): under DP attention that
+        scope narrows the draft to EP 1, and init_new reads the narrowed EP to leave
+        num_token_non_padded unset, as the warmup does. A draft that shares its DSA
+        top-k gets the capture on idle ranks too; the warmed program has it.
+        """
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self._draft_runner,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            return_hidden_states_before_norm=False,
+        )
+        seed_capture, seed_select = self._prompt_seed_capture(extend_lens)
+        forward_batch.spec_info = chain_draft_forward_input(
+            hidden_states=hidden_states,
+            width=1,
+            dsa_seed_topk_capture=seed_capture,
+            dsa_seed_topk_select=seed_select,
+        )
+        forward_batch.return_logprob = False
+        self._set_draft_prefill_dp_counts(forward_batch, padded_tokens=padded_tokens)
+        return forward_batch
+
     def _prompt_seed_capture(
-        self, batch: ScheduleBatch
+        self, extend_lens: Sequence[int]
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """The draft prompt's DSA top-k capture at the extend cap and the rows it
         keeps: each request's last prompt row, the row its carry comes from."""
-        cap = self._compile_policy()._extend_compile_cap()
-        capture = dsa_seed_topk_buffer(
-            num_rows=cap,
-            width=self._chain_draft_worker.dsa_seed_topk_width,
-            device=self.device,
-        )
-        if capture is None:
+        width = self._chain_draft_worker.dsa_seed_topk_width
+        if width is None:
             return None, None
-        last_rows = torch.cumsum(torch.tensor(batch.extend_lens), dim=0) - 1
+        cap = self._compile_policy()._extend_compile_cap()
+        capture = dsa_seed_topk_buffer(num_rows=cap, width=width, device=self.device)
+        # int64 even with no prompts (an idle rank): torch.tensor([]) is float32.
+        lens = torch.tensor(list(extend_lens), dtype=torch.int64)
+        last_rows = torch.cumsum(lens, dim=0) - 1
         # Padded slots keep row 0; their seed lands in the reserved pool row 0.
         return capture, padded_h2d(last_rows, cap, self.device)
 
@@ -517,25 +541,19 @@ class TpuChainSpecWorker(TpuSpecWorker):
     def _forward_idle_draft_prefill(
         self, batch: ScheduleBatch, *, target_hidden: torch.Tensor
     ) -> None:
-        forward_batch = ForwardBatch.init_new(
-            batch,
-            self._draft_runner,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
-            return_hidden_states_before_norm=False,
-        )
         idle_hidden = target_hidden[:0]
-        forward_batch.spec_info = chain_draft_forward_input(
-            hidden_states=idle_hidden, width=1
-        )
-        forward_batch.return_logprob = False
-        # The TPU forward relabels this idle rank DECODE; core's speculative decode
-        # unpadding then reads the hidden backup that only draft inputs set.
-        forward_batch.hidden_states_backup = idle_hidden
-        # Pad to the peers' token bucket so every rank runs the same draft program.
-        self._set_draft_prefill_dp_counts(
-            forward_batch, padded_tokens=target_hidden.shape[0]
-        )
         with self._chain_draft_worker.draft_context(), torch.no_grad():
+            forward_batch = self._draft_prompt_batch(
+                batch,
+                hidden_states=idle_hidden,
+                # Pad to the peers' token bucket so every rank runs the same draft program.
+                padded_tokens=target_hidden.shape[0],
+                # No prompt rows; nothing reads this rank's capture.
+                extend_lens=(),
+            )
+            # The TPU forward relabels this idle rank DECODE; core's speculative decode
+            # unpadding then reads the hidden backup that only draft inputs set.
+            forward_batch.hidden_states_backup = idle_hidden
             self._draft_runner.forward(forward_batch)
 
     def _set_draft_prefill_dp_counts(
