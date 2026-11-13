@@ -54,4 +54,7 @@
 - Metadata inspector added and checked against a synthetic FP8+per-output-channel safetensors header fixture; Python compile and git diff checks passed. This does not validate the real checkpoint.
 - Native launcher candidate dry-run passed for both node ranks using TEST-NET rendezvous addresses; no TPU/model loading was performed. Candidate config is explicitly marked unvalidated in the benchmark README.
 - Changes through `107e03b28f` touch only this ledger and `benchmark/tpu/glm52_epic/`; no Flash or production runtime paths changed.
+- Real checkpoint CPU preflight SUCCEEDED: `exp-2gq0zsmhs0`, 118629 tensors, 59044 output-channel scale pairs, no missing indexed tensors or wrong shard assignments. Config is full GLM DSA (not Flash), hidden6144/78 layers/256 experts. Summary and config hashes committed. This is header evidence, not weight-content or TPU validation.
+- Declared artifact extraction analyses `an-dqplhgxwpb` and `an-zpjlrgogt0` failed before readable diagnostics; task summary is available via Falcon exp logs, full header output remains remote. Platform issue https://github.com/primatrix/Falcon/issues/1525 tracks missing failed-analyzer logs. No bucket/provider bypass used.
+- Epic pushed to origin; baseline/scaffolding commits remain separable. Plugin-only channelwise loader implementation is now being prepared behind explicit config opt-in; default/Flash behavior must fall through unchanged.
 - This ledger is updated with actual evidence as the work proceeds.
