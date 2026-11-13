@@ -825,9 +825,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        # `seq_lens` may come from another stream; record_stream keeps the device
+        # caching allocator from reusing it early. CPU has no streams (and
+        # torch.accelerator rejects a CPU device), so skip it there.
+        if torch.device(self.device).type != "cpu":
+            batch.seq_lens.record_stream(torch.accelerator.current_stream(self.device))
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens

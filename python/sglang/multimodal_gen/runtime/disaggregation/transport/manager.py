@@ -120,7 +120,7 @@ class DiffusionTransferManager:
             d2h_event.record(stream)
         elif torch.get_device_module().is_available():
             d2h_event = torch.get_device_module().Event()
-            d2h_event.record(torch.get_device_module().current_stream())
+            d2h_event.record(torch.accelerator.current_stream())
 
         staged = StagedTransfer(
             request_id=request_id,
@@ -171,7 +171,7 @@ class DiffusionTransferManager:
             load_event.record(stream)
         elif torch.get_device_module().is_available():
             load_event = torch.get_device_module().Event()
-            load_event.record(torch.get_device_module().current_stream())
+            load_event.record(torch.accelerator.current_stream())
 
         logger.debug(
             "TransferManager: loaded_async %d tensor fields for %s to %s",

@@ -1731,7 +1731,7 @@ class LayerwiseOffloadManager:
         for layer_idx in sorted(self._retained_set - self._permanent_set):
             self.prefetch_layer(layer_idx, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+            torch.accelerator.current_stream().wait_stream(self.copy_stream)
 
         # The head of the stream is issued after that wait, and always
         # asynchronously. wait_stream drains the whole copy stream, so issuing
@@ -2049,7 +2049,7 @@ class LayerwiseOffloadManager:
         ):
             return
         if self.copy_stream is not None:
-            self.copy_stream.wait_stream(torch.get_device_module().current_stream())
+            self.copy_stream.wait_stream(torch.accelerator.current_stream())
             stream_context = torch.get_device_module().stream(self.copy_stream)
         else:
             # the device has no CUDA-like stream or pinned-memory support
@@ -2272,7 +2272,7 @@ class LayerwiseOffloadManager:
         self._debug_collect_wait_s = getattr(self, "_debug_collect_wait_s", 0.0) + (
             time.perf_counter() - started
         )
-        compute_stream = torch.get_device_module().current_stream()
+        compute_stream = torch.accelerator.current_stream()
         compute_stream.wait_event(event)
         with torch.inference_mode(False), torch.no_grad():
             for name, gpu_tensor in tensors.items():
@@ -2355,7 +2355,7 @@ class LayerwiseOffloadManager:
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+            torch.accelerator.current_stream().wait_stream(self.copy_stream)
 
         # A layer still in flight holds device tensors inside the courier;
         # collecting binds and accounts for them so the release below sees them.
@@ -2377,7 +2377,7 @@ class LayerwiseOffloadManager:
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+            torch.accelerator.current_stream().wait_stream(self.copy_stream)
 
         self._materializing_all = True
         try:
@@ -2395,7 +2395,7 @@ class LayerwiseOffloadManager:
         finally:
             self._materializing_all = False
         if self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+            torch.accelerator.current_stream().wait_stream(self.copy_stream)
 
     def release_host_stores(self) -> None:
         """Drop rollback stores after a resident placement is validated.
@@ -2439,7 +2439,7 @@ class LayerwiseOffloadManager:
             return
 
         if self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+            torch.accelerator.current_stream().wait_stream(self.copy_stream)
 
         # Collect current GPU weights and write back to CPU buffer
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
@@ -2469,7 +2469,7 @@ class LayerwiseOffloadManager:
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+            torch.accelerator.current_stream().wait_stream(self.copy_stream)
 
         for layer_idx in list(self._gpu_layers):
             self.sync_layer_to_cpu(layer_idx)
@@ -2687,7 +2687,7 @@ class LayerwiseOffloadManager:
                     # LTX audio VAE traverses decoder.up in reverse order
                     self.prefetch_layer(i, non_blocking=False)
                 if i in self._prefetch_events and self.copy_stream is not None:
-                    torch.get_device_module().current_stream().wait_event(
+                    torch.accelerator.current_stream().wait_event(
                         self._prefetch_events[i]
                     )
 

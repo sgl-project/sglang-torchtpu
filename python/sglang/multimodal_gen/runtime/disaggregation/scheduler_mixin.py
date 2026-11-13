@@ -950,9 +950,7 @@ class SchedulerDisaggMixin:
                     req, load_event, request_id, prealloc_slot_id = data
                     # Wait for load to complete on compute stream
                     if load_event is not None:
-                        torch.get_device_module().current_stream().wait_event(
-                            load_event
-                        )
+                        torch.accelerator.current_stream().wait_event(load_event)
                     # Now safe to free the receive slot
                     if prealloc_slot_id is not None:
                         with self._transfer_manager._lock:
@@ -1354,7 +1352,7 @@ class SchedulerDisaggMixin:
 
         # 4. Wait for load before compute (GPU must see the data)
         if load_event is not None:
-            torch.get_device_module().current_stream().wait_event(load_event)
+            torch.accelerator.current_stream().wait_event(load_event)
 
         # 5. Free receive slot after load completes (data is on compute GPU)
         if prealloc_slot_id is not None:

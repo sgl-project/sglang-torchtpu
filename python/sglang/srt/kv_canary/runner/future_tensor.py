@@ -65,7 +65,7 @@ class FutureTensors:
         }
 
         device_module = torch.get_device_module(device)
-        d2h_stream.wait_stream(device_module.current_stream(device))
+        d2h_stream.wait_stream(torch.accelerator.current_stream(device))
         with device_module.stream(d2h_stream):
             for key in tensors_device_cloned:
                 tensors_host[key].copy_(tensors_device_cloned[key], non_blocking=True)

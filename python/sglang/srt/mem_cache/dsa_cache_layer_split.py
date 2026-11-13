@@ -452,7 +452,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     ) -> None:
         if not self.pending_remote_kv_broadcast:
             return
-        self.device_module.current_stream().wait_stream(self.kv_broadcast_stream)
+        torch.accelerator.current_stream().wait_stream(self.kv_broadcast_stream)
         self.pending_remote_kv_broadcast = False
         if set_remote_layer_id and self.pending_remote_kv_layer_id is not None:
             self.remote_kv_layer_id = self.pending_remote_kv_layer_id
@@ -491,7 +491,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.remote_kv_layer_id = layer_id
             return
 
-        self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
+        self.kv_broadcast_stream.wait_stream(torch.accelerator.current_stream())
         with self.device_module.stream(self.kv_broadcast_stream):
             if layer_transfer_counter is not None and layer_transfer_idx is not None:
                 layer_transfer_counter.wait_until(layer_transfer_idx)

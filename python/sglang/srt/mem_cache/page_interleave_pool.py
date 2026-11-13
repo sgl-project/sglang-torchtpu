@@ -399,7 +399,7 @@ class PageInterleaveKVPoolMixin:
         # Order the gather after all prior compute-stream work: the
         # previous tenant's reads (attention of layer_id - 2) and the pool
         # writes that produced the prefix rows.
-        self.kv_gather_stream.wait_stream(self.device_module.current_stream())
+        self.kv_gather_stream.wait_stream(torch.accelerator.current_stream())
         with self.device_module.stream(self.kv_gather_stream):
             for pool_buf, name in self._gather_pairs(local_layer):
                 scratch = slot.tensors[name]
@@ -429,7 +429,7 @@ class PageInterleaveKVPoolMixin:
                 f"prefix scratch miss for layer {layer_id} "
                 f"(resident={slot.resident_key}, epoch={self._epoch})"
             )
-            self.device_module.current_stream().wait_event(slot.ready)
+            torch.accelerator.current_stream().wait_event(slot.ready)
             self._prefetch_layer(layer_id + 1)
         return slot
 

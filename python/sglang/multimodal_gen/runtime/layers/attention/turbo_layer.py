@@ -168,7 +168,7 @@ def async_a2a_communicate(
                 with torch.get_device_module().stream(cp_stream):
                     a2a_reqs[i - 2].wait()
                     a2a_outputs[i - 2] = a2a_post_fns[i - 2](a2a_outputs[i - 2])
-    torch.get_device_module().current_stream().wait_stream(cp_stream)
+    torch.accelerator.current_stream().wait_stream(cp_stream)
     return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
 
 

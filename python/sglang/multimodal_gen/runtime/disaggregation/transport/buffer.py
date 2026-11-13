@@ -176,7 +176,7 @@ class TransferTensorBuffer:
 
         # Ensure copy stream sees all prior compute kernels
         if stream is not None:
-            stream.wait_stream(torch.get_device_module().current_stream())
+            stream.wait_stream(torch.accelerator.current_stream())
 
         for name, value in tensors.items():
             if value is None:

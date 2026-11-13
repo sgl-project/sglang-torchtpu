@@ -78,7 +78,7 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
                 continue
             indices, _ = prepared[name]
             if indices.is_cuda:
-                indices.record_stream(device_module.current_stream())
+                indices.record_stream(torch.accelerator.current_stream())
             for buffers in self.buffers[name]:
                 self._bcast_layer(
                     buffers, self.kv_staging, indices, buffers[layer].shape[1], layer
