@@ -1,0 +1,19 @@
+{
+  "exp_id": "exp-ldtcncqheb",
+  "artifact_id": "art-oxwfsxmg4o",
+  "status": "SUCCEEDED",
+  "source_sha": "dd312270841887966b5480be2f451f6c19de1496",
+  "versions": {
+    "torch_tpu": "0.2.1.dev20261028201649",
+    "tpu-sync-torch": "0.0.1.dev20261031081414",
+    "libtpu": "0.0.50",
+    "torch": "2.11.0+cpu",
+    "torchvision": "0.26.0+cpu",
+    "jax": "0.11.2",
+    "jaxlib": "0.11.2"
+  },
+  "tests": 9,
+  "elapsed_seconds": 0.098,
+  "private_pip_index_used": false,
+  "hardware": "CPU only; not TPU model acceptance"
+}
