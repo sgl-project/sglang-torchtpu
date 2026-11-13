@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
+    get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     SpShard,
@@ -74,6 +75,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    compile_matching_submodules,
     resolve_torch_compile_kwargs,
 )
 
@@ -208,6 +210,13 @@ class MOVADenoisingStage(PipelineStage):
             return StageParallelismType.CFG_PARALLEL
         return StageParallelismType.REPLICATED
 
+    def cfg_parallel_local_batch_fields(
+        self, batch: Req, server_args: ServerArgs
+    ) -> tuple[str, ...]:
+        # Every rank's timestep stage configures its own scheduler, whose pair
+        # postprocess is a local closure that does not pickle for the broadcast.
+        return ("scheduler",)
+
     def _predict(
         self,
         visual_dit,
@@ -283,7 +292,12 @@ class MOVADenoisingStage(PipelineStage):
             logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
 
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(**compile_kwargs)
+        if getattr(server_args, "regional_compile", False):
+            # The denoising loop calls the DiT blocks directly, past the
+            # module's own forward: compile the blocks themselves.
+            compile_matching_submodules(module, compile_kwargs=compile_kwargs)
+        else:
+            module.compile(**compile_kwargs)
 
     def _maybe_compile_dits(self, server_args: ServerArgs):
         if self._torch_compiled or not server_args.enable_torch_compile:
@@ -586,62 +600,62 @@ class MOVADenoisingStage(PipelineStage):
                                 batch,
                             )
 
-                            visual_noise_pred = self._cfg_combine(
-                                pos[0] if pos[0] is not None else neg[0],
-                                neg[0] if neg[0] is not None else pos[0],
-                                batch.guidance_scale,
+                        visual_noise_pred = self._cfg_combine(
+                            pos[0] if pos[0] is not None else neg[0],
+                            neg[0] if neg[0] is not None else pos[0],
+                            batch.guidance_scale,
+                            cfg_rank,
+                            enable_cfg_parallel,
+                        )
+                        audio_noise_pred = self._cfg_combine(
+                            pos[1] if pos[1] is not None else neg[1],
+                            neg[1] if neg[1] is not None else pos[1],
+                            batch.guidance_scale,
+                            cfg_rank,
+                            enable_cfg_parallel,
+                        )
+
+                        if batch.guidance_rescale > 0.0:
+                            visual_noise_pred = self._apply_guidance_rescale(
+                                visual_noise_pred,
+                                pos[0] if pos[0] is not None else None,
+                                batch.guidance_rescale,
                                 cfg_rank,
                                 enable_cfg_parallel,
                             )
-                            audio_noise_pred = self._cfg_combine(
-                                pos[1] if pos[1] is not None else neg[1],
-                                neg[1] if neg[1] is not None else pos[1],
-                                batch.guidance_scale,
+                            audio_noise_pred = self._apply_guidance_rescale(
+                                audio_noise_pred,
+                                pos[1] if pos[1] is not None else None,
+                                batch.guidance_rescale,
                                 cfg_rank,
                                 enable_cfg_parallel,
                             )
 
-                            if batch.guidance_rescale > 0.0:
-                                visual_noise_pred = self._apply_guidance_rescale(
-                                    visual_noise_pred,
-                                    pos[0] if pos[0] is not None else None,
-                                    batch.guidance_rescale,
-                                    cfg_rank,
-                                    enable_cfg_parallel,
-                                )
-                                audio_noise_pred = self._apply_guidance_rescale(
-                                    audio_noise_pred,
-                                    pos[1] if pos[1] is not None else None,
-                                    batch.guidance_rescale,
-                                    cfg_rank,
-                                    enable_cfg_parallel,
-                                )
-
-                        if idx_step + 1 < total_steps:
-                            next_pair_t = paired_timesteps[idx_step + 1]
-                            if getattr(next_pair_t, "shape", None) == (2,):
-                                next_timestep, next_audio_timestep = next_pair_t
-                            else:
-                                next_timestep = next_pair_t
-                                next_audio_timestep = next_pair_t
+                    if idx_step + 1 < total_steps:
+                        next_pair_t = paired_timesteps[idx_step + 1]
+                        if getattr(next_pair_t, "shape", None) == (2,):
+                            next_timestep, next_audio_timestep = next_pair_t
                         else:
-                            next_timestep = None
-                            next_audio_timestep = None
+                            next_timestep = next_pair_t
+                            next_audio_timestep = next_pair_t
+                    else:
+                        next_timestep = None
+                        next_audio_timestep = None
 
-                        batch.latents = scheduler.step_from_to(
-                            visual_noise_pred,
-                            timestep,
-                            next_timestep,
-                            batch.latents,
-                            **extra_step_kwargs,
-                        )
-                        batch.audio_latents = scheduler.step_from_to(
-                            audio_noise_pred,
-                            audio_timestep,
-                            next_audio_timestep,
-                            batch.audio_latents,
-                            **extra_step_kwargs,
-                        )
+                    batch.latents = scheduler.step_from_to(
+                        visual_noise_pred,
+                        timestep,
+                        next_timestep,
+                        batch.latents,
+                        **extra_step_kwargs,
+                    )
+                    batch.audio_latents = scheduler.step_from_to(
+                        audio_noise_pred,
+                        audio_timestep,
+                        next_audio_timestep,
+                        batch.audio_latents,
+                        **extra_step_kwargs,
+                    )
 
                     if progress_bar is not None:
                         progress_bar.update()
@@ -655,8 +669,16 @@ class MOVADenoisingStage(PipelineStage):
     def _shard_sequence_for_sp(
         self, x: torch.Tensor, dim: int = 1
     ) -> tuple[torch.Tensor, SpShard]:
-        """Tail-padded even shard along the sequence dim (sp_shard.shard_seq)."""
-        return shard_seq(x, dim=dim)
+        """Tail-padded even shard along the sequence dim (sp_shard.shard_seq).
+
+        Under SP the shard is a fresh tensor: a view starts at a rank-dependent
+        storage offset, which some compiled backends key executables on, so
+        every rank compiles the same block program.
+        """
+        x, shard = shard_seq(x, dim=dim)
+        if shard.sp_size > 1:
+            x = x.clone(memory_format=torch.contiguous_format)
+        return x, shard
 
     def _gather_sequence_from_sp(
         self, x: torch.Tensor, shard: SpShard, dim: int = 1
@@ -853,6 +875,17 @@ class MOVADenoisingStage(PipelineStage):
         """
         min_layers = min(len(visual_dit.blocks), len(self.audio_dit.blocks))
         visual_layers = len(visual_dit.blocks)
+        # Under SP the bridge's cross-attention gathers its keys over the
+        # ranks' shards, tail padding included. The audio is short: the
+        # audio-to-video conditioners take the real audio rows of every rank
+        # and attend them without SP. The video keys of video-to-audio stay
+        # sharded, so their count must split evenly.
+        replicate_audio = get_sp_world_size() > 1
+        if replicate_audio and full_visual_seq_len % get_sp_world_size():
+            raise NotImplementedError(
+                f"MOVA under SP needs a video token count ({full_visual_seq_len}) "
+                f"that the SP degree ({get_sp_world_size()}) divides"
+            )
 
         # Build RoPE frequencies for cross-attention if needed (only used when SP == 1)
         # When SP > 1, we rebuild freqs inside the loop after gathering full sequences
@@ -870,6 +903,7 @@ class MOVADenoisingStage(PipelineStage):
                 self._shard_sequence_for_sp(rope_cos_sin, dim=1)[0]
                 for rope_cos_sin in visual_rope_cos_sin
             ]
+        replicated_audio_freqs = audio_rope_cos_sin if replicate_audio else None
         if audio_rope_cos_sin is not None:
             audio_rope_cos_sin = [
                 self._shard_sequence_for_sp(rope_cos_sin, dim=1)[0]
@@ -884,6 +918,9 @@ class MOVADenoisingStage(PipelineStage):
             # Bridge operations (PerFrameAttentionPooling, RoPE) expect full sequences
             # When SP is enabled, we need to gather before bridge and shard after
             if self.dual_tower_bridge.should_interact(layer_idx, "a2v"):
+                replicated_audio = (
+                    gather_seq(audio_x, full_audio_seq_len) if replicate_audio else None
+                )
                 visual_x, audio_x = self.dual_tower_bridge(
                     layer_idx,
                     visual_x,
@@ -894,6 +931,8 @@ class MOVADenoisingStage(PipelineStage):
                     v2a_condition_scale=v2a_condition_scale,
                     condition_scale=condition_scale,
                     video_grid_size=grid_size,
+                    replicated_audio=replicated_audio,
+                    replicated_audio_freqs=replicated_audio_freqs,
                 )
 
             # Self-attention and FFN in DiT blocks

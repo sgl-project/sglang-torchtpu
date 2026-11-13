@@ -294,7 +294,8 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   default under ring; an automatic selection may give it to any layer that takes
   `torch_sdpa`. The built-in platform has no ring-capable backend.
 - Runtime patches applied at worker init (`multimodal_gen/worker.py`), each with
-  the debt header: `rope.py` (RoPE without stride-2 lane access) and
+  the debt header: `rope.py` (RoPE without stride-2 lane access),
+  `mova.py` (MOVA's complex RoPE tables as float32 cos/sin pairs) and
   `minimax_h3.py` (MiniMax-H3 packed sequences padded to a multiple of 512
   rows, only the 50 DiT blocks compiled, the breakable-CUDA-graph break point
   skipped, regionally compiled blocks marked spmd-safe); worker init also

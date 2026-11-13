@@ -426,6 +426,10 @@ class Conv3dLocalIsland(nn.Conv3d):
 class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
+    # SP ranks feed each block equal-length shards at storage offset 0
+    # (MOVADenoisingStage._shard_sequence_for_sp), so all ranks compile the
+    # same block program.
+    _compile_regions_spmd_safe = True
     param_names_mapping = MOVAVideoConfig().param_names_mapping
     reverse_param_names_mapping = MOVAVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVAVideoConfig().lora_param_names_mapping

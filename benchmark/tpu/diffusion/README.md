@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `mova.sh` | `OpenMOSS-Team/MOVA-720p` | 8 | Ulysses 8 (40 video heads; 12 audio heads padded to 16) |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +39,7 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| MOVA-720p | I2V+audio 1280x720, 193 frames, 50 steps | 8 | 767 s | 15.2 s | 3.7 s | 88.7 GB |
 
 
 ## Example requests
@@ -52,7 +54,7 @@ curl -s -X POST http://localhost:30000/v1/images/generations -H "Content-Type: a
 ```
 
 `/v1/videos` queues a job and returns its `id`; poll `GET /v1/videos/{id}` until `status` is `completed`, then
-download `GET /v1/videos/{id}/content`. Image-to-video requests (Wan2.2-I2V-A14B, Wan2.2-TI2V-5B) add
+download `GET /v1/videos/{id}/content`. Image-to-video requests (Wan2.2-I2V-A14B, Wan2.2-TI2V-5B, MOVA-720p) add
 `"input_reference": "<path or URL>"`.
 
 LTX-2 (`ltx2.sh`):
