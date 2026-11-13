@@ -87,10 +87,10 @@ MK_DECODE_ENV = {
 
 # --mk-prefill: extend steps run the megakernel's prefill program (PR #1909), with
 # the decode Waves 1-4, expert grouping and the fused-RS/RPA settings it was measured on.
+# No KPERM: main's decode megakernel serves only unpermuted experts.
 MK_PREFILL_ENV = {
     "SGLANG_TPU_MUSE_MK_EXPERT_GROUP": "15",
     "SGLANG_TPU_MUSE_MK_OPT": "1",
-    "SGLANG_TPU_MUSE_MK_KPERM": "1",
     "SGLANG_TPU_MK_SAL_FP8_DOT": "2",
     "SGLANG_TPU_MUSE_MK_PREFILL": "1",
     "SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER": "1",
@@ -101,7 +101,6 @@ MK_PREFILL_ENV = {
     "MUSE_FUSED_RS_FWD_PSUM": "1",
     "MUSE_FUSED_RS_DIRECT_STAGE": "2",
     "MUSE_PF_FUSED_SCATTER_COMBINE": "1",
-    "MUSE_PF_MOE_KPERM": "1",
     "SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG": "1",
     "SGLANG_TPU_FP4_DEQUANT_VIA_FP8": "0",
     "SGLANG_TPU_RPA_NO_MAX": "1",
@@ -142,6 +141,7 @@ def config_for(
     simulate_acceptance=True,
     mk_prefill=False,
     mk_decode=False,
+    mk_qblock=0,
 ):
     """The server config for one AgentX concurrency.
 
@@ -340,6 +340,10 @@ def config_for(
         env.update(MK_DECODE_ENV)
     if mk_prefill:
         env.update(MK_PREFILL_ENV)
+    if mk_qblock:
+        # Block-256 requantized fp4 experts (main #2131) and the key-column mask.
+        env["SGLANG_TPU_MUSE_MK_QBLOCK"] = str(mk_qblock)
+        env["SGLANG_TPU_MUSE_MK_ATTN_COL_MASK"] = "1"
     return config
 
 
@@ -362,6 +366,12 @@ def main(argv=None):
         action="store_true",
         help="decode megakernel Waves 1-4 and expert grouping only (MK_DECODE_ENV)",
     )
+    parser.add_argument(
+        "--mk-qblock",
+        type=int,
+        default=0,
+        help="fp4 experts requantized to one scale per this many K rows (0 off, 256)",
+    )
     args = parser.parse_args(argv)
     config = config_for(
         args.conc,
@@ -369,6 +379,7 @@ def main(argv=None):
         simulate_acceptance=not args.eval,
         mk_prefill=args.mk_prefill,
         mk_decode=args.mk_decode,
+        mk_qblock=args.mk_qblock,
     )
     print(json.dumps(config, indent=2))
 
