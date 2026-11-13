@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan3d import (
     Hunyuan3DDiTArchConfig,
     Hunyuan3DDiTConfig,
 )
+from sglang.multimodal_gen.configs.models.fsdp import is_double_block, is_single_block
 from sglang.multimodal_gen.runtime.distributed import divide
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
@@ -458,6 +459,9 @@ class Hunyuan3D2DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
     """Hunyuan3D DiT model (Flux-style architecture for Hunyuan3D-2.0)."""
 
     _aliases = ["hy3dgen.shapegen.models.Hunyuan3DDiT"]
+    # --regional-compile: one region per block, so the timestep embedding (a
+    # host arange) stays outside the compiled graphs.
+    _compile_conditions = [is_double_block, is_single_block]
 
     param_names_mapping = Hunyuan3DDiTConfig().param_names_mapping
 

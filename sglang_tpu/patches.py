@@ -370,9 +370,35 @@ def _register_aten_fallbacks() -> None:
         )
         return out.to(device=self.device, dtype=self.dtype)
 
+    # aten::_upsample_bilinear2d_aa -- torchvision's antialiased Resize calls it
+    # in float32 (it casts other dtypes around the call): the Hunyuan3D-2 DINOv2
+    # conditioner resizes its 512x512 input to 518x518. A torch_tpu without a
+    # TPU kernel for it (0.2.0rc4) runs the CPU kernel and copies back (in fp32:
+    # CPU has no float16/bf16 kernel); a torch_tpu with one keeps it.
+    aa_op = "aten::_upsample_bilinear2d_aa"
+    aa_fallback = not any(
+        torch._C._dispatch_has_kernel_for_dispatch_key(aa_op + overload, "PrivateUse1")
+        for overload in ("", ".out")
+    )
+    if aa_fallback:
+
+        @torch.library.register_kernel(aa_op, "PrivateUse1")
+        def _upsample_bilinear2d_aa(
+            self, output_size, align_corners, scales_h=None, scales_w=None
+        ):
+            out = torch._C._nn._upsample_bilinear2d_aa(
+                self.detach().cpu().float(),
+                output_size,
+                align_corners,
+                scales_h,
+                scales_w,
+            )
+            return out.to(device=self.device, dtype=self.dtype)
+
     logger.info(
         "Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, "
-        "masked_scatter_, logaddexp, upsample_bicubic2d"
+        "masked_scatter_, logaddexp, upsample_bicubic2d%s",
+        ", _upsample_bilinear2d_aa" if aa_fallback else "",
     )
 
 

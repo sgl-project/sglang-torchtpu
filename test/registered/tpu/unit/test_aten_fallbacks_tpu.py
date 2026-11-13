@@ -8,6 +8,7 @@ register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.env_override import apply_tpu_env_overrides
@@ -37,6 +38,18 @@ class TestAtenFallbacksTpu(CustomTestCase):
         b = torch.randn(1, 16, 256)
         got = torch.logaddexp(a.to("tpu"), b.to("tpu")).cpu()
         torch.testing.assert_close(got, torch.logaddexp(a, b), rtol=1e-5, atol=1e-5)
+
+    def test_antialiased_bilinear_resize(self):
+        # The op behind torchvision's Resize(antialias=True) (Hunyuan3D-2's
+        # conditioner): the CPU fallback, or torch_tpu's kernel where it has one,
+        # which need not round like the CPU kernel.
+        image = torch.rand(1, 3, 512, 512)
+        for dtype in (torch.float32, torch.float16):
+            x = image.to(dtype)
+            kwargs = dict(size=(518, 518), mode="bilinear", antialias=True)
+            got = F.interpolate(x.to("tpu"), **kwargs).cpu()
+            want = F.interpolate(x.float(), **kwargs).to(dtype)
+            torch.testing.assert_close(got, want, rtol=0, atol=1e-2)
 
 
 if __name__ == "__main__":

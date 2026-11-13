@@ -1,9 +1,10 @@
 # Diffusion recipes on Cloud TPU (`torch_tpu`)
 
 Launch recipes for `sglang.multimodal_gen` on one tpu7x 2x2x1 host (8 TensorCores, `--num-gpus` counts cores).
-All recipes use the Pallas splash attention backend, torch.compile with the `tpu` backend, a TP-folded resident
-text encoder, the highest TPU clock and a 65536 KiB scoped-VMEM limit for XLA fusions (`LIBTPU_INIT_ARGS`), the full
-64 MiB of per-core VMEM on tpu7x (3% faster denoise on Z-Image-Turbo than without it); see `launch.sh`. The Wan
+All recipes use torch.compile with the `tpu` backend, the highest TPU clock and a 65536 KiB scoped-VMEM limit for XLA
+fusions (`LIBTPU_INIT_ARGS`), the full 64 MiB of per-core VMEM on tpu7x (3% faster denoise on Z-Image-Turbo than
+without it); see `launch.sh`. The image and video recipes also use the Pallas splash attention backend and a TP-folded
+resident text encoder; Hunyuan3D-2 (fp16, head dim 64) runs its attention through SDPA. The Wan
 recipes compile per transformer block (`--regional-compile`), which keeps each block's collectives inside its program,
 and run Ulysses across the two cores of a chip with a K/V all-gather ring across chips.
 
@@ -14,6 +15,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `hunyuan3d.sh` | `tencent/Hunyuan3D-2` (shape) | 8 or 1 | DiT on every core, volume decode split over the cores |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +40,10 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| Hunyuan3D-2 | Image-to-mesh (shape), 50 steps, octree 384 | 8 | 10.5 s | 0.125 s | 2.9 s | 7.5 GB |
+| Hunyuan3D-2 | Image-to-mesh (shape), 50 steps, octree 384 | 1 | 23.5 s | 0.125 s | 16.0 s | 8.1 GB |
+
+For Hunyuan3D-2, VAE decode is the VAE transformer, the volume decode and marching cubes.
 
 
 ## Example requests
@@ -71,4 +77,13 @@ curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/j
   "prompt": "A fluffy golden dog sits centered in frame against a soft pastel background, looking into the camera",
   "size": "1280x704", "num_frames": 121, "num_inference_steps": 20, "seed": 42
 }'
+```
+
+`/v1/meshes` queues an image-to-mesh job and returns its `id`; poll `GET /v1/meshes/{id}` until `status` is
+`completed`, then download `GET /v1/meshes/{id}/content`. Hunyuan3D-2 (`hunyuan3d.sh`) returns the shape as an OBJ mesh:
+
+```bash
+curl -sLO https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png
+curl -s -X POST http://localhost:30000/v1/meshes -F image=@hunyuan3d.png -F seed=42 -F guidance_scale=5.0 \
+  -F num_inference_steps=50 -F output_format=obj -F generator_device=cpu
 ```
