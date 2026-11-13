@@ -1510,7 +1510,14 @@ class USPAttention(nn.Module):
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
-            if not self.causal and self.attn_impl.supports_ring_resume():
+            out = (
+                self.attn_impl.forward_ring(q, k, v)
+                if not self.causal and self.attn_impl.supports_ring()
+                else None
+            )
+            if out is not None:
+                pass
+            elif not self.causal and self.attn_impl.supports_ring_resume():
                 out = allgather_kv_ring_attn(q, k, v, attn_impl=self.attn_impl)
             elif self.attn_impl.supports_ring_resume():
                 # Backends that ring by all-gather (TPU) lack a causal kernel
