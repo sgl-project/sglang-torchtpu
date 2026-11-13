@@ -96,6 +96,7 @@ jobs:
               - 'python/sglang/multimodal_gen/test/unit/test_spmd_safe_regions.py'
               # Shared diffusion files behind Ulysses head padding and the Wan SP
               # tail-pad mask, and the core tests the TPU wrappers import.
+              - 'python/sglang/multimodal_gen/runtime/layers/attention/backends/attention_backend.py'
               - 'python/sglang/multimodal_gen/runtime/layers/attention/layer.py'
               - 'python/sglang/multimodal_gen/runtime/models/dits/zimage.py'
               - 'python/sglang/multimodal_gen/test/unit/test_usp_*.py'
