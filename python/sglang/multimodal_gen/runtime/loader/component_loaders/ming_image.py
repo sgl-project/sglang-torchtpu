@@ -12,9 +12,27 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader 
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     checkpoint_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    finalize_encoder_folding,
+    get_folding_tp_group,
+)
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
+
+
+def resolve_ming_encoder_folding(config, policy: str) -> None:
+    """Resolve fold vs replicate as the generic text-encoder loader does.
+
+    The generic check reads the language model's dims only; the connector's
+    attention heads must divide the fold group too.
+    """
+    finalize_encoder_folding(config, policy)
+    if config.parallel_folding_mode is None:
+        return
+    heads = config.arch_config.connector_config["num_attention_heads"]
+    if heads % get_folding_tp_group(config).world_size:
+        config.parallel_folding_mode = None
 
 
 class MingImageEncoderLoader(TextEncoderLoader):
@@ -32,6 +50,7 @@ class MingImageEncoderLoader(TextEncoderLoader):
         config.arch_config.projection_config = get_diffusers_component_config(
             component_path=str(root / "mlp")
         )
+        resolve_ming_encoder_folding(config, server_args.encoder_parallel)
         server_args.model_paths[component_name] = component_model_path
         return self.load_model(
             component_model_path,

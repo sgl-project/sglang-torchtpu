@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 from torch.nn import functional as F
 
 from sglang.multimodal_gen.configs.models.dits.ming_image import MingImageDitConfig
+from sglang.multimodal_gen.configs.models.encoders.ming_image import (
+    MingImageEncoderConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ming_image import (
     MingImageLayerPipelineConfig,
     MingImagePipelineConfig,
@@ -16,6 +20,9 @@ from sglang.multimodal_gen.configs.sample.ming_image import (
     MingImageSamplingParams,
 )
 from sglang.multimodal_gen.registry import get_model_info
+from sglang.multimodal_gen.runtime.loader.component_loaders import (
+    ming_image as ming_loader,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -30,6 +37,7 @@ from sglang.multimodal_gen.runtime.models.dits.ming_image import (
     MingRMSNorm,
     MingSiluAndMul,
 )
+from sglang.multimodal_gen.runtime.models.encoders import base as encoder_base
 from sglang.multimodal_gen.runtime.models.encoders.ming_image import ming_position_ids
 from sglang.multimodal_gen.runtime.pipelines.ming_image_pipeline import (
     MingImagePipeline,
@@ -109,6 +117,30 @@ def test_encoder_loader_is_pipeline_local():
         type(ComponentLoader.for_component_type("text_encoder", "transformers"))
         is TextEncoderLoader
     )
+
+
+@pytest.mark.parametrize(
+    "policy,ranks,connector_heads,expected",
+    [
+        ("fold", 8, 12, None),  # the connector's 12 heads do not divide 8 ranks
+        ("fold", 4, 12, "world"),
+        ("fold", 8, 16, "world"),
+        ("replicate", 4, 12, None),
+    ],
+)
+def test_encoder_folds_only_when_the_connector_heads_divide(
+    policy, ranks, connector_heads, expected
+):
+    config = MingImageEncoderConfig()
+    config.arch_config.connector_config = {"num_attention_heads": connector_heads}
+    config.parallel_folding_mode = "world"
+    group = SimpleNamespace(world_size=ranks)
+    with (
+        patch.object(encoder_base, "get_folding_tp_group", return_value=group),
+        patch.object(ming_loader, "get_folding_tp_group", return_value=group),
+    ):
+        ming_loader.resolve_ming_encoder_folding(config, policy)
+    assert config.parallel_folding_mode == expected
 
 
 @pytest.mark.parametrize(
