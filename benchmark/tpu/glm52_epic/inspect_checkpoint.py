@@ -63,7 +63,23 @@ def inspect(root: Path) -> dict:
             kind = "other_or_block"
         policy[(suffix, kind, len(shape))] += 1
         scales.append({"name": name, **meta, "weight_shape": weight["shape"] if weight else None,
+                       "weight_dtype": weight["dtype"] if weight else None,
                        "classification": kind})
+    dtype_counts = collections.Counter(meta["dtype"] for meta in tensors.values())
+    # Record excluded consumers explicitly: absence of a scale is not dtype evidence.
+    excluded_weights = [
+        {"name": name, **meta}
+        for name, meta in sorted(tensors.items())
+        if name.endswith((".embed_tokens.weight", ".weights_proj.weight", ".shared_head.head.weight"))
+        or name == "lm_head.weight"
+    ]
+    fp8_without_scales = [
+        {"name": name, **meta}
+        for name, meta in sorted(tensors.items())
+        if meta["dtype"].startswith("F8_") and name.endswith(".weight")
+        and not any(name[:-len(".weight")] + suffix in tensors
+                    for suffix in (".weight_scale_inv", ".weight_scale"))
+    ]
     return {
         "schema": "glm52-checkpoint-inspection-v1", "checkpoint": str(root.resolve()),
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
@@ -75,6 +91,9 @@ def inspect(root: Path) -> dict:
             "qk_rope_head_dim", "index_head_dim", "index_topk", "index_kpool")},
         "tensor_count": len(tensors), "missing_index_tensors": missing,
         "wrong_index_shard": wrong_shard,
+        "dtype_summary": dict(sorted(dtype_counts.items())),
+        "excluded_consumer_weights": excluded_weights,
+        "fp8_weights_without_scales": fp8_without_scales,
         "scale_summary": [{"suffix": key[0], "kind": key[1], "scale_rank": key[2], "count": value}
                           for key, value in sorted(policy.items())],
         "scales": scales,
