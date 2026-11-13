@@ -7,7 +7,8 @@ Set ``quantization_config.tpu_checkpoint_layout`` to
 Flash checkpoints keep the upstream config and methods unchanged.
 
 The checkpoint calls its multiplicative dequant scales ``weight_scale_inv``;
-these are output-channel [N, 1] scales, not block scales or reciprocal scales.
+these are rank-one output-channel [N] scales, not block scales or reciprocal
+scales (the paired weights, not the scales, have rank two).
 """
 
 from __future__ import annotations
@@ -119,7 +120,7 @@ class Glm52ChannelwiseFp8LinearMethod(LinearMethodBase):
         layer.orig_dtype = params_dtype
         loader = extra_weight_attrs.get("weight_loader")
         # Channel scales have no input_dim: RowParallelLinear must replicate
-        # them, not shard their singleton axis alongside the weight's K axis.
+        # them, not shard the output-channel vector alongside the weight's K axis.
         layer.register_parameter(
             "weight",
             ModelWeightParameter(
@@ -132,7 +133,7 @@ class Glm52ChannelwiseFp8LinearMethod(LinearMethodBase):
             ),
         )
         scale = ChannelQuantScaleParameter(
-            data=torch.empty(n, 1, dtype=torch.float32),
+            data=torch.empty(n, dtype=torch.float32),
             output_dim=0,
             weight_loader=loader,
         )
@@ -154,8 +155,8 @@ class Glm52ChannelwiseFp8LinearMethod(LinearMethodBase):
                 "with the default loader; moving/replacing parameters before "
                 "postprocessing invalidates the early kv_b scale alias"
             )
-        if layer.weight_scale_inv.shape != (layer.weight.shape[0], 1):
-            raise ValueError("GLM52 dense scales must have shape [output_channels, 1]")
+        if layer.weight_scale_inv.shape != (layer.weight.shape[0],):
+            raise ValueError("GLM52 dense scales must have shape [output_channels]")
         layer.weight = Parameter(
             layer.weight.data.t().contiguous(), requires_grad=False
         )
@@ -194,7 +195,7 @@ class Glm52ChannelwiseFp8MoEMethod(Fp8MoEMethod):
             old = getattr(layer, name)
             n = getattr(layer, f"{stem}_weight").shape[1]
             scale = Parameter(
-                torch.empty(num_experts, n, 1, dtype=torch.float32),
+                torch.empty(num_experts, n, dtype=torch.float32),
                 requires_grad=False,
             )
             scale.__dict__.update(old.__dict__)
@@ -207,13 +208,12 @@ class Glm52ChannelwiseFp8MoEMethod(Fp8MoEMethod):
 
         for stem in ("w13", "w2"):
             scale = getattr(layer, f"{stem}_weight_scale_inv")
-            expected = (*getattr(layer, f"{stem}_weight").shape[:2], 1)
+            expected = tuple(getattr(layer, f"{stem}_weight").shape[:2])
             if tuple(scale.shape) != expected:
                 raise ValueError(f"GLM52 expert scales must have shape {expected}")
-            # The CHANNEL loader needs [E,N,1] to copy checkpoint [N,1]
-            # shards. The runtime formatter consumes [E,N], then makes its
-            # own [E,1,1,N] storage. Preserve the Parameter's staging attrs.
-            scale.data = scale.data.squeeze(-1)
+            # CHANNEL loads checkpoint [N] shards into [E,N] directly:
+            # w1/w3 shard output channels; w2 replicates all output channels.
+            # The formatter makes [E,1,1,N] storage, retaining parameter attrs.
             layer.register_parameter(f"{stem}_weight_scale", scale)
         prepare_tpu_fp8_moe_weights(
             layer,
