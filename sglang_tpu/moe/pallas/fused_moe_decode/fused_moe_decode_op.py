@@ -561,6 +561,13 @@ def should_use_fused_moe_decode(
     FFN boundary's `summed_by_compute`; see `DeepseekV2MoE.use_tpu_fused_moe_decode`.
     """
     if not getattr(moe_layer, "_tpu_fused_moe_decode_ready", False):
+        # Backend off: answer without touching the module. The lazy prepare
+        # below sets a module attribute, which torch.compile guards on; doing
+        # that after warmup forces a recompile and fails under the
+        # `fail_on_recompile` stance. Some loaders (e.g. DSV4.1) do not run
+        # prepare_model_for_fused_moe_decode, so this path is reached.
+        if not is_fused_moe_decode_enabled():
+            return False
         if not getattr(moe_layer, "_tpu_fused_moe_decode_checked", False):
             prepare_moe_layer_for_fused_decode(moe_layer)
         if not getattr(moe_layer, "_tpu_fused_moe_decode_ready", False):
