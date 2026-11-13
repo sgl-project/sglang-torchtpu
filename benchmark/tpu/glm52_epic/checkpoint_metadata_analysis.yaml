@@ -1,0 +1,43 @@
+schema_version: 1
+exp_id: exp-2gq0zsmhs0
+spec:
+  name: glm52-checkpoint-metadata-diagnostic
+  command: python3 "$FALCON_SCRIPT_PATH"
+  script_content: |
+    import json, os, pathlib, shutil, sys, traceback
+    out = pathlib.Path(os.environ['RESULT_LOCAL_DIR'])
+    out.mkdir(parents=True, exist_ok=True)
+    log = (out / 'diagnostic.log').open('w', buffering=1)
+    sys.stdout = log
+    sys.stderr = log
+    sys.excepthook = lambda typ, value, tb: traceback.print_exception(typ, value, tb, file=log)
+    print('artifact_root', os.environ.get('ARTIFACT_LOCAL_DIR'))
+    src = pathlib.Path(os.environ['ARTIFACT_LOCAL_DIR']) / 'checkpoint-inspection.json'
+    out = pathlib.Path(os.environ['RESULT_LOCAL_DIR'])
+    out.mkdir(parents=True, exist_ok=True)
+    d = json.loads(src.read_text())
+    shutil.copyfile(src, out / 'checkpoint-inspection.json')
+    samples = {}
+    for s in d['scales']:
+        n = s['name']
+        for key in ('q_a_proj', 'q_b_proj', 'kv_a_proj_with_mqa', 'kv_b_proj', 'o_proj', 'indexer.wq_b', 'indexer.wk', 'experts.0.gate_proj', 'experts.0.up_proj', 'experts.0.down_proj', 'shared_experts.gate_proj'):
+            if key in n and key not in samples:
+                samples[key] = s
+    (out / 'summary.json').write_text(json.dumps({k:v for k,v in d.items() if k not in ('scales','header_sha256')}, indent=2))
+    (out / 'samples.json').write_text(json.dumps(samples, indent=2))
+  outputs:
+    - path: diagnostic.log
+      type: text
+      required: false
+    - path: output.log
+      type: text
+      required: false
+    - path: checkpoint-inspection.json
+      type: json
+    - path: summary.json
+      type: json
+    - path: samples.json
+      type: json
+  resources:
+    image: python:3.12-bookworm
+    memory_limit: 1Gi
