@@ -83,6 +83,10 @@ class KernelConfig:
     # 16 keys over the DCP group, gather them and finish the rounds locally
     # (batches up to 8 rows).
     dsa_gather_finish: bool = False
+    # Kimi-K3.1 decode selection: 4-bit key rounds (8: the exact top-k). Fewer
+    # select every key at or above the threshold bin's lower bound -- a
+    # superset of the top-k, ~2048 + the bin's other keys.
+    dsa_select_rounds: int = 8
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.

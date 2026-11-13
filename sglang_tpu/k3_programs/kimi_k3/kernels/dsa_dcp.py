@@ -209,6 +209,18 @@ GATHER_MAX_BATCH = (
 GATHER_FROM_ROUND = 3  # the last key round before the first check (16 bits resolved)
 
 
+def select_rounds() -> int:
+    """Key rounds of the selection (``KernelConfig.dsa_select_rounds``; 8: the
+    exact top-k)."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    config = active()
+    rounds = len(KEY_SHIFTS) if config is None else config.dsa_select_rounds
+    if not 2 <= rounds <= len(KEY_SHIFTS):
+        raise ValueError(f"dsa_select_rounds is 2 .. {len(KEY_SHIFTS)}")
+    return rounds
+
+
 def gather_finish(batch: int) -> bool:
     """Whether a ``batch``-row selection uses the gather finish."""
     from sglang_tpu.k3_programs.kimi_k3.config import active
@@ -1426,14 +1438,22 @@ class IndexSelect:
         """The rounds; ``tau`` / ``p_tie`` per row into SMEM."""
         refs, topk = self.refs, self.topk
         cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
-        gather = gather_finish(self.batch)
+        rounds = select_rounds()
+        gather = gather_finish(self.batch) and rounds == len(KEY_SHIFTS)
         if gather:
             refs["sel_done"][0] = 0
-        static_rounds = GATHER_FROM_ROUND + 1 if gather else len(KEY_SHIFTS)
+        static_rounds = GATHER_FROM_ROUND + 1 if gather else rounds
         parity = 0
         for round_, shift in enumerate(KEY_SHIFTS[:static_rounds]):
             self._key_round(shift, parity, round_ >= 2, round_ == 0)
             parity ^= 1
+        if rounds < len(KEY_SHIFTS):
+            # Bin selection (KernelConfig.dsa_select_rounds): every key at or
+            # above the bin's lower bound, a superset of the top-k.
+            self._sent(0)
+            self._sent(1)
+            self._finish_tau(bin_only=True)
+            return
         if gather:
             # Later rounds as a loop: before each, the gather finish once every
             # row's bin is small (then the rest are skipped).
@@ -1498,14 +1518,20 @@ class IndexSelect:
         else:
             distributed_finish()
 
+        del cand
+        self._finish_tau()
+
+    def _finish_tau(self, bin_only=False):
+        """``tau`` / ``p_tie`` / ``own`` per row from the state (``bin_only``:
+        the prefix bin's lower bound, no tie position)."""
+        refs, topk = self.refs, self.topk
         state = refs["state"]
         active = self._active_rows()
-        tie = active & (state[_LOWER : _LOWER + 1] > topk)
+        tie = active & (state[_LOWER : _LOWER + 1] > topk) & (not bin_only)
         tau = jnp.where(active, state[_PREFIX : _PREFIX + 1] ^ INT_MIN, INT_MIN)
         p_tie = jnp.where(
             active, jnp.where(tie, state[_POSITION : _POSITION + 1], INT_MAX), -1
         )
-        del cand
         for b in range(self.batch):
             tau_b, p_tie_b = _row_scalar(tau, b), _row_scalar(p_tie, b)
             refs["tau"][b] = tau_b
