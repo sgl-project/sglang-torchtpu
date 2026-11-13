@@ -1,0 +1,27 @@
+{
+  "exp_id": "exp-266i34jcm1",
+  "source_sha": "3695225808f0293cae422ea7adf55eddacadd43d",
+  "actual_versions": {
+    "jax": "0.11.1",
+    "jaxlib": "0.11.1",
+    "libtpu": "0.0.46.1"
+  },
+  "events_utc": {
+    "running": "2026-11-13T14:01:36Z",
+    "weights_loaded_rank0": "2026-11-13T14:07:23Z",
+    "worker_precompile_begin": "2026-11-13T14:07:27Z"
+  },
+  "precompile": {
+    "bs": [
+      32
+    ],
+    "tokens": [
+      32768
+    ],
+    "local_q": 2048,
+    "fp8_q": true,
+    "fp8_pv": true
+  },
+  "status": "RUNNING_PRECOMPILE_NO_PERFORMANCE_RESULT",
+  "liveness": "rank0 scheduler process stateR,1518threads,cpu_ticks144419 at live probe; no user signal/profiler injected"
+}
