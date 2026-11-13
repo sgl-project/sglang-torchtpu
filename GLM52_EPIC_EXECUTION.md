@@ -60,4 +60,7 @@
 - Opt-in loader committed `1192e6c8be`, candidate JSON wired via HF quantization override `635b971e0c`, six CPU contract tests `322a967f78`. Syntax checks passed; actual imports/execution pending.
 - CPU validation `exp-9dwxb55hll` could not pull private CI base image and was explicitly aborted. Public release-image CPU replacement `exp-3f6ay1a6ek` submitted with same pinned test source; records actual runtime versions and is not TPU-stack equivalence evidence.
 - JAX reference remains pending; latest admission reports eight more TPU chips needed. No duplicate TPU experiment submitted.
+- Real CPU execution SUCCEEDED: `exp-tl4zrfks0x`, exact source `173364f89dc6e07428349092c1ea6cc3c548ebd3`, six tests / 0.054s / exit0. Covers standard FP8 factory isolation, explicit ABI validation, dense reconstruction and stale-alias rejection, MoE reconstruction using real existing formatter. An actual import failure in prior run was fixed by importing LinearMethodBase from quantization.base_config. Logs and fixed manifest committed. Runtime torch2.11.0+cpu/JAX0.10.2; this is NOT on-device or current-stack validation.
+- Public-image first run failed before tests because `SGLANG_PLATFORM=cpu` is not a plugin name. Correct CPU invocation unsets that variable and uses existing `SGLANG_USE_CPU_ENGINE=1`.
+- Remaining hard gates: plugin/OOT regressions, real TPU loading/compile/numerical checks, matched W-P steady-state performance. No performance equivalence claimed.
 - This ledger is updated with actual evidence as the work proceeds.
