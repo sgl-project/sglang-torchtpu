@@ -32,8 +32,33 @@ load_tpu_dsv41_engram_rows
        pread), which the original would slice a second time.
   How: AROUND EngramEmbedding._load_rows; tensors tagged with ROW_START_ATTR
        are copied as-is after a row-range check, others take the original path.
+       Into the uint8 tables of tpu_dsv41_engram_bytes_init it copies the
+       checkpoint's FP8 / E8M0 bytes, not their values.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: EngramEmbedding accepts a pre-sliced row range.
+
+tpu_dsv41_engram_bytes_init
+  Why: reinterpreting an FP8 Engram table inside the compiled TPU forward
+       (weight.view(torch.uint8)[rows]) lowers to a bitcast-convert of the
+       whole table on every step: two 12.3 GB tables plus their scales per
+       rank, 19.3 of the 41 ms decode forward on tpu7x (DP8, 1M context).
+       The two lookup hooks below also need this rank's DP slot and first
+       table row. Read as Python ints inside the compiled forward they become
+       graph constants, so each rank traces its own program; rank-divergent
+       programs can return wrong data on some ranks (see _all_reduce_gather in
+       sglang_tpu/attention_pallas_rpa_dcp.py).
+  How: AFTER EngramEmbedding.__init__ the device-table weight and scale are
+       uint8 parameters, as vllm-torchtpu engram_hbm stores them; the lookup
+       gathers uint8 rows and reinterprets only the gathered rows. On non-CUDA
+       devices it also sets the plain tensor attributes tpu_dp_rank_mask,
+       tpu_dp_rank_index and tpu_row_start (host tables and empty shards
+       included), created eagerly on the model's build device, so the lookups
+       read the rank as runtime graph inputs (_set_engram_rank_tensors).
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: an FP8 / E8M0 table can be gathered in the compiled forward
+       without a whole-table conversion; the rank tensors go with
+       tpu_dsv41_engram_owned_rows and tpu_dsv41_engram_dp_lookup.
+
 trace_tpu_platform_fact
   Why: the V4.1 shifted-mHC loop in DeepseekV4Model reads
        get_platform().is_blackwell inside the compiled forward;
@@ -110,9 +135,33 @@ tpu_dsv41_engram_owned_rows
        Engram lookup fusion ("Unsupported conversion from vmreg/vreg to U64").
   How: AROUND _owned_rows for the device-table, non-CUDA path gathers the raw
        bytes and builds the power of two as (byte << 23) bitcast to fp32, as
-       the vllm-torchtpu epic engram_hbm.dequant and #1743 do.
+       the vllm-torchtpu epic engram_hbm.dequant and #1743 do. With uint8
+       tables it gathers the rows first and reinterprets only those. The
+       table offset is the device tensor tpu_row_start, not the Python int
+       row_start, so every rank traces one program.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TPU lowers float8_e8m0fnu to float32.
+
+tpu_dsv41_engram_dp_lookup
+  Why: under attention DP, EngramEmbedding._dp_sharded_lookup all-gathers the
+       ranks' hash ids into a fresh buffer and reduce-scatters the rows into
+       another. Inside the compiled decode forward on torch_tpu 0.2.0 /
+       libtpu 0.0.50 that returned wrong data (NaN logits from the first
+       decode step) once the whole-table Engram conversion above was gone;
+       the same fault class is documented in
+       sglang_tpu/attention_pallas_rpa_dcp.py.
+  How: AROUND _dp_sharded_lookup on non-CUDA devices: this rank's ids go into
+       a zero [world * rows] buffer that is all-reduced, and the looked-up
+       values are all-reduced before this rank's block is kept. Exact up to
+       the sign of zero, as the core reduce-scatter: the other id blocks are
+       zero and every table row has one owner. The block is placed with the
+       one-hot tpu_dp_rank_mask and kept with index_select on
+       tpu_dp_rank_index, device tensors rather than attn_dp_rank, so every
+       rank traces one program and issues the same collectives (the
+       _all_reduce_gather / own_heads pattern of attention_pallas_rpa_dcp.py).
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: all_gather_into_tensor / reduce_scatter_tensor into fresh
+       buffers are correct inside compiled TPU graphs.
 
 tpu_dsv41_hasher_forward
   Why: the extend path of EngramHasher.forward builds per-token request rows
@@ -137,6 +186,31 @@ trace_tpu_env_default
        defaults depend only on the platform, fixed before any model is traced.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: callable env defaults are resolved at import or are traceable.
+
+tpu_dsv41_fp32_moe_sum
+  Why: with attention DP 8, MoE EP 8 and attn_tp 1, every rank computes MoE
+       partials (its EP-routed experts plus its share of the TP8-sharded shared
+       expert) for every token of the DP-gathered buffer, and _post_experts_sum
+       adds the 8 partials with a BF16 all-reduce. The BF16 summation order
+       depends on where a token sits in that buffer, so one greedy prompt gave
+       different tokens and logprobs on different DP ranks. Summed in FP32 and
+       rounded to BF16 once, all 8 ranks were bit-identical on TPU, GSM8K
+       unchanged. The earlier sglang_tpu V4.1 model summed each token in FP32.
+  How: AROUND sglang.srt.layers.moe.utils._post_experts_sum, which
+       post_experts_all_reduce and sum_post_experts_output call through the
+       module global. A BF16 input that will be reduced (reduce_ep or
+       reduce_tp) goes through the original as .float() and comes back with
+       .to(torch.bfloat16); any other call is passed through. The all-reduce
+       then carries FP32, twice the bytes. Hooks register on TPU for every
+       model, so the hook also requires the process's target model to be V4.1
+       (process_model_config().hf_config.model_type, the check
+       select_tpu_dsv41_loader makes), read through
+       torch._dynamo.assume_constant_result: one constant, the same on every
+       rank, decided at trace time outside the compiled graph.
+  Upstream PR or issue: none yet; candidate seam: a precision option for the
+       post-experts reduction.
+  Remove when: core offers that option, or the TPU all-reduce sums BF16 in an
+       order that does not depend on the rank.
 """
 
 from __future__ import annotations
@@ -185,9 +259,124 @@ def select_tpu_dsv41_loader(result, load_config, model_config=None):
 
 
 def load_tpu_dsv41_engram_rows(original, embedding, param, loaded_weight):
-    from sglang_tpu.models.deepseek_v41.ep_local_expert_reader import load_local_rows
+    from sglang_tpu.models.deepseek_v41.ep_local_expert_reader import (
+        ROW_START_ATTR,
+        load_local_rows,
+    )
 
+    if param.dtype == torch.uint8 and loaded_weight.dtype != torch.uint8:
+        # Byte tables (tpu_dsv41_engram_bytes_init): copy the checkpoint's FP8 / E8M0
+        # bytes, not their values.
+        row_start = getattr(loaded_weight, ROW_START_ATTR, None)
+        loaded_weight = loaded_weight.view(torch.uint8)
+        if row_start is not None:
+            setattr(loaded_weight, ROW_START_ATTR, row_start)
     return load_local_rows(original, embedding, param, loaded_weight)
+
+
+def tpu_dsv41_engram_dp_lookup(original, embedding, indices, forward_batch):
+    """AROUND EngramEmbedding._dp_sharded_lookup on non-CUDA devices: gather the DP
+    ranks' hash ids and return this rank's rows with all-reduces instead of an
+    all-gather and a reduce-scatter into fresh buffers (see the compiled-gather
+    fault documented in sglang_tpu/attention_pallas_rpa_dcp.py). Exact up to the
+    sign of zero: every id block but this rank's is zero, and each table row
+    has exactly one owner.
+
+    The rank is data, not structure: the one-hot tpu_dp_rank_mask picks the block
+    this rank's ids fill and index_select on tpu_dp_rank_index keeps this rank's
+    rows, as _all_reduce_gather / own_heads do in attention_pallas_rpa_dcp.py. The
+    traced graph is then the same on every rank (attn_dp_rank sliced in as a
+    Python int would give each rank its own program)."""
+    if indices.is_cuda:
+        return original(embedding, indices, forward_batch)
+    from sglang.srt.distributed import tensor_model_parallel_all_reduce
+    from sglang.srt.layers.dp_attention import get_global_dp_buffer_len
+    from sglang.srt.runtime_context import get_parallel
+
+    world = get_parallel().attn_dp_size
+    rows = get_global_dp_buffer_len()
+    local_rows = indices.shape[0]
+    if rows == 0:
+        return embedding._empty(indices)
+    if rows != world * local_rows or embedding.tp_size != world:
+        return original(embedding, indices, forward_batch)
+    mask = embedding.tpu_dp_rank_mask.view(world, *([1] * indices.dim()))
+    padded = torch.where(mask, indices.unsqueeze(0), indices.new_zeros(()))
+    ids_global = tensor_model_parallel_all_reduce(
+        padded.reshape(rows, *indices.shape[1:])
+    )
+    values = embedding._owned_rows(ids_global).reshape(rows, -1)
+    values = tensor_model_parallel_all_reduce(values)
+    local = values.reshape(world, local_rows, -1).index_select(
+        0, embedding.tpu_dp_rank_index
+    )
+    return local.reshape(*indices.shape, embedding.dim)
+
+
+def _set_engram_rank_tensors(embedding) -> None:
+    """Give the Engram lookups this rank's position as device tensors.
+
+    tpu_dp_rank_mask   bool[attn_dp_size], True at attn_dp_rank (DP lookup block).
+    tpu_dp_rank_index  int64[1], attn_dp_rank (DP lookup block kept).
+    tpu_row_start      int32[] (int64[] past the int32 range), row_start (table
+                       offset in _owned_rows); TPU hash ids are int32, and a 0-d
+                       operand keeps the ids' dtype.
+
+    A Python int read inside the compiled forward is a graph constant, so the
+    rank-dependent attn_dp_rank and row_start would give each rank its own
+    program. Tensors that exist before tracing are runtime graph inputs instead,
+    so they are created here, eagerly, with no device argument: inside model
+    construction the default device is the loader's target device, where the ids
+    arrive (also for host tables, whose own storage is host memory).
+
+    Plain attributes, not parameters or buffers: load_weights fills only
+    named_parameters(), and they stay out of state_dict(), post-load staging and
+    the startup storage manifest. Dynamo lifts them as graph inputs. The direct
+    tracer would need them in model_extra_tensor_attrs, but DeepSeek-V4.1 TPU
+    attention rejects that tracer.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    world, rank = parallel.attn_dp_size, parallel.attn_dp_rank
+    rank_mask = torch.tensor([r == rank for r in range(world)], dtype=torch.bool)
+    if rank_mask.is_cuda:
+        return
+    embedding.tpu_dp_rank_mask = rank_mask
+    embedding.tpu_dp_rank_index = torch.tensor([rank], dtype=torch.int64)
+    fits = embedding.row_start + embedding.rows <= torch.iinfo(torch.int32).max
+    embedding.tpu_row_start = torch.tensor(
+        embedding.row_start, dtype=torch.int32 if fits else torch.int64
+    )
+
+
+def tpu_dsv41_engram_bytes_init(result, embedding, *args, **kwargs):
+    """AFTER EngramEmbedding.__init__: hold the device tables as uint8 bytes, and
+    set the rank tensors the lookups read (_set_engram_rank_tensors).
+
+    The non-CUDA lookup (tpu_dsv41_engram_owned_rows) gathers uint8 rows and
+    reinterprets only those rows. Reinterpreting an FP8 table inside the compiled
+    TPU forward lowers to a bitcast-convert of the whole table on every step
+    (two 12.3 GB tables per rank), and FP8-typed gathers gave NaN in the decode
+    graph. vllm-torchtpu stores the same tables as uint8 (engram_hbm.py).
+
+    The rank tensors are set before the host-table / empty-shard return: the DP
+    lookup (tpu_dsv41_engram_dp_lookup) runs for those tables too.
+    """
+    _set_engram_rank_tensors(embedding)
+    if embedding.host_table is not None or embedding.rows == 0:
+        return result
+    for name in ("weight", "scale"):
+        old = getattr(embedding, name)
+        if old.is_cuda or old.dtype == torch.uint8:
+            continue
+        new = torch.nn.Parameter(
+            torch.empty(old.shape, dtype=torch.uint8, device=old.device),
+            requires_grad=False,
+        )
+        new.weight_loader = old.weight_loader
+        setattr(embedding, name, new)
+    return result
 
 
 _ORIGINAL_PLATFORM_GETATTR = None
@@ -230,6 +419,36 @@ def trace_tpu_env_default(original, field):
     if not torch.compiler.is_compiling():
         return original(field)
     return _resolve_env_default(field.name)
+
+
+@torch._dynamo.assume_constant_result
+def _serves_dsv41() -> bool:
+    """Whether this process's target model is DeepSeek-V4.1 (draft workers
+    included: process_model_config is built from the served model path).
+
+    Fixed per process and equal on every rank; under Dynamo it is evaluated once
+    at trace time and baked in, as ModelConfig is not traceable."""
+    from sglang.srt.runtime_context import process_model_config
+
+    config = process_model_config().hf_config
+    return getattr(config, "model_type", None) == "deepseek_v41"
+
+
+def tpu_dsv41_fp32_moe_sum(original, hidden_states, *, reduce_ep, reduce_tp):
+    """AROUND _post_experts_sum: sum V4.1's BF16 MoE partials in FP32.
+
+    The ops are .float(), the original reduction, .to(torch.bfloat16): one
+    rounding to BF16 after the full sum instead of one per partial added. Summed
+    in FP32, 8 BF16 partials are exact (so their order does not matter) unless
+    their exponents span more than about 13 binades."""
+    if (
+        hidden_states.dtype != torch.bfloat16
+        or not (reduce_ep or reduce_tp)
+        or not _serves_dsv41()
+    ):
+        return original(hidden_states, reduce_ep=reduce_ep, reduce_tp=reduce_tp)
+    summed = original(hidden_states.float(), reduce_ep=reduce_ep, reduce_tp=reduce_tp)
+    return summed.to(torch.bfloat16)
 
 
 def tpu_dsv41_hc_combine(original, x_flat, pre, hc, out_dtype):
@@ -504,14 +723,26 @@ def tpu_dsv41_int32_graph_inputs(
 
 
 def tpu_dsv41_engram_owned_rows(original, embedding, indices):
-    """_owned_rows with an integer e8m0 dequant; bytes 0 and 255 aside, exact."""
+    """_owned_rows with an integer e8m0 dequant; bytes 0 and 255 aside, exact.
+
+    The offset is the device tensor tpu_row_start (_set_engram_rank_tensors), not
+    the Python int row_start, so the traced graph is the same on every rank.
+    embedding.rows stays a Python int: it is the table's leading dimension, a
+    static shape either way. It is equal on every rank when num_embeddings is a
+    multiple of tp_size; otherwise ranks differ by one row in the table shape
+    itself, and the lookup is still exact."""
     if indices.is_cuda or embedding.host_table is not None or embedding.rows == 0:
         return original(embedding, indices)
-    local = indices - embedding.row_start
+    local = indices - embedding.tpu_row_start
     owned = (local >= 0) & (local < embedding.rows)
     local = local.masked_fill(~owned, 0)
-    raw = embedding.weight.view(torch.uint8)[local].view(torch.float8_e4m3fn)
-    scale = embedding.scale.view(torch.uint8)[local].to(torch.int32)
+    if embedding.weight.dtype == torch.uint8:
+        # Byte tables: gather rows, then reinterpret only the gathered rows.
+        raw = embedding.weight[local].view(torch.float8_e4m3fn)
+        scale = embedding.scale[local].to(torch.int32)
+    else:
+        raw = embedding.weight.view(torch.uint8)[local].view(torch.float8_e4m3fn)
+        scale = embedding.scale.view(torch.uint8)[local].to(torch.int32)
     power = (scale << 23).view(torch.float32)
     rows = raw.float().unflatten(-1, (scale.shape[-1], -1))
     values = (rows * power.unsqueeze(-1)).flatten(-2)
@@ -543,6 +774,16 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.EngramEmbedding._load_rows",
             load_tpu_dsv41_engram_rows,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.engram.EngramEmbedding.__init__",
+            tpu_dsv41_engram_bytes_init,
+            HookType.AFTER,
+        ),
+        (
+            "sglang.srt.layers.engram.EngramEmbedding._dp_sharded_lookup",
+            tpu_dsv41_engram_dp_lookup,
             HookType.AROUND,
         ),
         (
@@ -588,6 +829,11 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.EngramEmbedding._owned_rows",
             tpu_dsv41_engram_owned_rows,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.moe.utils._post_experts_sum",
+            tpu_dsv41_fp32_moe_sum,
             HookType.AROUND,
         ),
     ]
