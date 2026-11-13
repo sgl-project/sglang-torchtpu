@@ -1,0 +1,96 @@
+name: glm52-night-20261113-jax-reference
+exp_type: PROFILING
+cluster_name: gke-tpu-train-us-central1-1-prod
+artifact_type: GCS
+tags: []
+config: '{"source_commit": "3695225808f0293cae422ea7adf55eddacadd43d", "reference_exp": "exp-xqk6ny4789", "benchmark_repeats": 1, "precision": "fp8-qk-pv", "epic_commit": "0d9d5787887996f8d1e63c2194bb4cea1d6ce23e", "pr72_commit": "5d28f0c5f2b86644caf4b7200946bedcacaddcae", "ring_banks": 8, "read_ahead": 4, "runtime": "jax/jaxlib 0.11.1 libtpu 0.0.46.1", "scope": "steady step latency and throughput; no profiler", "refactor": "merged into epic via PR70"}'
+role_to_task_spec:
+    worker:
+        command: |
+            set -eu
+            ulimit -c 0
+            mkdir -p /tmp/tpu_logs/tmp /tmp/tpu_logs/pip-cache /tmp/tpu_logs/uv-cache
+            cat > /tmp/tpu_logs/dsa-runtime-constraints.txt <<'EOF'
+            jax==0.11.1
+            jaxlib==0.11.1
+            libtpu==0.0.46.1
+            EOF
+            cd /workspace/sglang-jax
+            exec timeout 6600 bash benchmark/glm52/delivery/falcon/runner.sh
+        replica: 2
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        device_count: 8
+        device_type: v7x
+        device_topo: 2x2x2
+        envs:
+            GLM52_BENCH_CHUNKED_EXTEND: "1"
+            GLM52_BENCH_EXTEND_LEN: "12288"
+            GLM52_BENCH_INPUT_MODE: longbench-code
+            GLM52_BENCH_OUTPUT_LEN: "16"
+            GLM52_BENCH_PREFIX_LEN: "49152"
+            GLM52_BENCH_PREFIX_MODE: unique
+            GLM52_BENCHMARK_REPEATS: "1"
+            GLM52_CHUNKED_PREFILL_SIZE: "2048"
+            GLM52_CONTEXT_LENGTH: "135168"
+            GLM52_DSA_ATTENTION_PRECISION: fp8-qk-pv
+            GLM52_DSA_EXTEND_TILES: 256,16,512
+            GLM52_DSA_GATHER_PREFLIGHT: "1"
+            GLM52_DSA_HLO_OVERLAP: "1"
+            GLM52_ENABLE_MTP: "0"
+            GLM52_KEEP_SERVER_RUNNING: "0"
+            GLM52_KV_CACHE_DTYPE: fp8_e4m3
+            GLM52_LONGBENCH_PREFIX_FILE: /workspace/sglang-jax/benchmark/glm52/datasets/longbench-v2/longbench-code-c64-p49152-e12288.npy
+            GLM52_MAX_PREFILL_TOKENS: "32768"
+            GLM52_MAX_RUNNING_REQUESTS: "32"
+            GLM52_PHYSICAL_CHIPS: "8"
+            GLM52_PRECOMPILE_BS_PADDING: "32"
+            GLM52_PRECOMPILE_TOKEN_PADDING: "32768"
+            GLM52_PROFILE_REPEATS: "1"
+            GLM52_QUANTIZATION: channelwise
+            JAX_COMPILATION_CACHE_DIR: /cache/pr64/refactor-ee4306058-fp8-k512-jax0111
+            JAX_COMPILATION_CACHE_MAX_SIZE: "-1"
+            JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
+            MEM_FRACTION_STATIC: "0.93"
+            MODEL_PATH: /models/GLM5.2-fp8-channel-wise
+            PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+            PYTHONUNBUFFERED: "1"
+            RUN_MODE: benchmark
+            SOURCE_COMMIT: 3695225808f0293cae422ea7adf55eddacadd43d
+            TMPDIR: /tmp/tpu_logs/tmp
+            UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+            UV_CONSTRAINT: /tmp/tpu_logs/dsa-runtime-constraints.txt
+            UV_VENV_CLEAR: "1"
+        mounts:
+            - name: glm52-channelwise-model
+              type: gcs
+              bucket: inference-model-storage-poc-tpu-hns
+              prefix: GLM5.2-fp8-channel-wise
+              mount_path: /models/GLM5.2-fp8-channel-wise
+              read_only: true
+              mount_options:
+                - implicit-dirs
+                - metadata-cache:ttl-secs:-1
+                - metadata-cache:stat-cache-max-size-mb:-1
+                - metadata-cache:type-cache-max-size-mb:-1
+                - file-system:kernel-list-cache-ttl-secs:-1
+                - read:enable-buffered-read:true
+                - read:block-size-mb:32
+                - read:max-blocks-per-handle:64
+                - read:global-max-blocks:2048
+                - read_ahead_kb=1024
+            - name: pr64-compile-cache
+              type: gcs
+              bucket: tpu-for-training-falcon-logs
+              prefix: compilation-cache/glm52/pr64-v7x-8chip-jax0111
+              mount_path: /cache/pr64
+              mount_options:
+                - implicit-dirs
+        sources:
+            - name: sglang-jax
+              type: git
+              repo: https://github.com/primatrix-glm/sglang-jax-private.git
+              ref: develop/pr72-rebased-fp8-benchmark-20260920
+              commit: 3695225808f0293cae422ea7adf55eddacadd43d
+              path: /workspace/sglang-jax
+              auth:
+                cred: github-primatrix-glm-sglang-jax-private-codex-v2
