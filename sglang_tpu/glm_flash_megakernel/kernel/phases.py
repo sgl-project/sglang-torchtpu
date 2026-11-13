@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 
 F32 = jnp.float32
 BF16 = jnp.bfloat16
@@ -263,6 +264,209 @@ def select_top_k_mask_3d(scores, k, *, score_iters=40, index_iters=24):
 
     jlo, jhi = jax.lax.fori_loop(0, index_iters, index_step, (jlo, jhi))
     return strict | (tie & (idx < jhi))
+
+
+def topk_bisect(
+    scr,
+    *,
+    k,
+    p,
+    kp,
+    n_tiles,
+    chunk_tiles,
+    owner=None,
+    rows=None,
+    score_iters=40,
+    base=0,
+):
+    """Threshold search for the top-k of each query over the [Q, T, P] score ref,
+    chunk_tiles tiles at a time; pass 1 writes -inf over ineligible and stale pools.
+    A pool is eligible for query q when its last token is at or before position p + q
+    and, with owner=(me, n), when its tile index is me modulo n (context parallel).
+    With rows=(lo, hi), only tiles in [lo, hi) are read or written (lo a multiple of
+    chunk_tiles): the chip's contiguous share. Returns (lo, hi, need): count(s > hi) <= k
+    <= count(s > lo), and `need` ties in (lo, hi] still to take, lowest index first.
+    base: tile index of the ref's first row (a multiple of chunk_tiles)."""
+    Q, T, P = scr.shape
+    CT = chunk_tiles
+    if T % CT:
+        raise ValueError(f"chunk_tiles={CT} must divide the tile count {T}")
+    c_base = base // CT
+    n_chunks = (n_tiles + CT - 1) // CT
+    bounds = rows  # the slice helper below shadows the name
+    c_lo, c_hi = 0, n_chunks
+    if bounds is not None:
+        c_lo = bounds[0] // CT
+        c_hi = jnp.maximum(c_lo, jnp.minimum(n_chunks, (bounds[1] + CT - 1) // CT))
+    ax = (1, 2)
+    i32 = jnp.int32
+    qpos = p + jax.lax.broadcasted_iota(i32, (Q, 1, 1), 0)
+    t_iota = jax.lax.broadcasted_iota(i32, (CT, P), 0)
+    c_iota = jax.lax.broadcasted_iota(i32, (CT, P), 1)
+    zero = jnp.zeros((Q, 1, 1), i32)
+
+    def in_rows(c):  # [1, CT, P]: tiles of chunk c inside the owned range
+        t = c * CT + t_iota
+        return ((t >= bounds[0]) & (t < bounds[1]))[None]
+
+    def rows(c):
+        return pl.ds(pl.multiple_of((c - c_base) * CT, CT), CT)
+
+    def count(pred):
+        return jnp.sum(pred.astype(i32), axis=ax, keepdims=True)
+
+    def p_range(c, acc):
+        n, lo, hi = acc
+        s = scr[:, rows(c), :]
+        gidx = ((c * CT + t_iota) * P + c_iota)[None]
+        elig = (((gidx + 1) * kp - 1) <= qpos) & jnp.isfinite(s)
+        if bounds is not None:
+            elig = elig & in_rows(c)
+        if owner is not None:
+            me, n = owner
+            elig = elig & (((c * CT + t_iota) % n == me)[None])
+        s = jnp.where(elig, s, -jnp.inf)
+        if bounds is None:
+            scr[:, rows(c), :] = s
+        else:  # another chip's tiles in this chunk keep their scores
+            scr[:, rows(c), :] = jnp.where(in_rows(c), s, scr[:, rows(c), :])
+        lo = jnp.minimum(
+            lo, jnp.min(jnp.where(elig, s, jnp.inf), axis=ax, keepdims=True)
+        )
+        hi = jnp.maximum(hi, jnp.max(s, axis=ax, keepdims=True))
+        return n + count(elig), lo, hi
+
+    inf = jnp.full((Q, 1, 1), jnp.inf, F32)
+    n_elig, lo, hi = jax.lax.fori_loop(c_lo, c_hi, p_range, (zero, inf, -inf))
+    want = jnp.minimum(n_elig, k)
+    lo = jnp.where(jnp.isfinite(lo), lo, 0.0) - 1.0
+    hi = jnp.where(jnp.isfinite(hi), hi, 0.0) + 1.0
+
+    def above(c, t):
+        a = scr[:, rows(c), :] > t
+        return a if bounds is None else a & in_rows(c)
+
+    def count_above(t):
+        return jax.lax.fori_loop(
+            c_lo, c_hi, lambda c, acc: acc + count(above(c, t)), zero
+        )
+
+    # Invariant: count(s > lo) = c_lo >= want > c_hi = count(s > hi).
+    def more(st):
+        i, lo, hi, c_lo, c_hi = st
+        return (i < score_iters) & jnp.any(c_lo != want)
+
+    def step(st):
+        i, lo, hi, c_lo, c_hi = st
+        mid = 0.5 * (lo + hi)
+        cnt = count_above(mid)
+        up = cnt >= want
+        return (
+            i + 1,
+            jnp.where(up, mid, lo),
+            jnp.where(up, hi, mid),
+            jnp.where(up, cnt, c_lo),
+            jnp.where(up, c_hi, cnt),
+        )
+
+    _, lo, hi, c_lo, c_hi = jax.lax.while_loop(more, step, (0, lo, hi, n_elig, zero))
+    exact = c_lo == want
+    hi = jnp.where(exact, lo, hi)
+    need = jnp.where(exact, 0, want - c_hi)  # ties in (lo, hi] still to take
+    return lo, hi, need
+
+
+def topk_write(
+    scr, msk, *, lo, hi, need, n_tiles, chunk_tiles, rows=None, within=False, base=0
+):
+    """0/1 masks into `msk` from the scores in `scr` (msk may be scr: in place):
+    s > hi, plus the first `need` ties in (lo, hi] by pool index. Only a chunk holding
+    more ties than remain searches for the index bound; Mosaic has no vector-valued
+    cond, so it rewrites the rows. within=True keeps only pools already set in `msk`:
+    a threshold found over a subset of the scores must not admit scores outside it.
+    base: tile index of the refs' first row (a multiple of chunk_tiles)."""
+    Q, T, P = scr.shape
+    CT = chunk_tiles
+    c_base = base // CT
+    n_chunks = (n_tiles + CT - 1) // CT
+    bounds = rows  # the slice helper below shadows the name
+    c_lo, c_hi = 0, n_chunks
+    if bounds is not None:
+        c_lo = bounds[0] // CT
+        c_hi = jnp.maximum(c_lo, jnp.minimum(n_chunks, (bounds[1] + CT - 1) // CT))
+    ax = (1, 2)
+    i32 = jnp.int32
+    t_iota = jax.lax.broadcasted_iota(i32, (CT, P), 0)
+    c_iota = jax.lax.broadcasted_iota(i32, (CT, P), 1)
+    l_iota = (t_iota * P + c_iota)[None]  # pool index within the chunk
+    zero = jnp.zeros((Q, 1, 1), i32)
+    local_iters = (CT * P).bit_length()
+
+    def in_rows(c):  # [1, CT, P]: tiles of chunk c inside the owned range
+        t = c * CT + t_iota
+        return ((t >= bounds[0]) & (t < bounds[1]))[None]
+
+    def put(c, m, old):
+        """Write the chunk's masks; another chip's tiles keep theirs."""
+        m = m.astype(F32)
+        msk[:, rows(c), :] = m if bounds is None else jnp.where(in_rows(c), m, old)
+
+    def rows(c):
+        return pl.ds(pl.multiple_of((c - c_base) * CT, CT), CT)
+
+    def count(pred):
+        return jnp.sum(pred.astype(i32), axis=ax, keepdims=True)
+
+    def write(c, taken):
+        s = scr[:, rows(c), :]
+        strict = s > hi
+        tie = (s > lo) & ~strict
+        old = None if bounds is None and not within else msk[:, rows(c), :]
+        if bounds is not None:
+            strict = strict & in_rows(c)
+            tie = tie & in_rows(c)
+        if within:  # a threshold found over a subset must not admit scores outside it
+            strict = strict & (old > 0.5)
+            tie = tie & (old > 0.5)
+        n_tie = count(tie)
+        left = need - taken
+        put(c, strict | tie, old)
+
+        @pl.when(jnp.max(jnp.where(n_tie > left, 1, 0)) > 0)
+        def _():
+            def halve(_, b):
+                jlo, jhi = b
+                jmid = (jlo + jhi) // 2
+                below = count(tie & (l_iota < jmid)) < left
+                return jnp.where(below, jmid, jlo), jnp.where(below, jhi, jmid)
+
+            _, jhi = jax.lax.fori_loop(
+                0, local_iters, halve, (zero, jnp.full_like(zero, CT * P))
+            )
+            put(c, strict | (tie & (l_iota < jhi)), old)
+
+        return taken + jnp.minimum(n_tie, left)
+
+    jax.lax.fori_loop(c_lo, c_hi, write, zero)
+
+
+def select_top_k_mask_ref(
+    scr, *, k, p, kp, n_tiles, chunk_tiles, score_iters=40, index_iters=24
+):
+    """Top-k mask of each query, replacing the scores in `scr` in place."""
+    del index_iters
+    lo, hi, need = topk_bisect(
+        scr,
+        k=k,
+        p=p,
+        kp=kp,
+        n_tiles=n_tiles,
+        chunk_tiles=chunk_tiles,
+        score_iters=score_iters,
+    )
+    topk_write(
+        scr, scr, lo=lo, hi=hi, need=need, n_tiles=n_tiles, chunk_tiles=chunk_tiles
+    )
 
 
 def sinkhorn_step(c, hc_eps):

@@ -11,6 +11,7 @@ serving's own verify commit and radix snapshots apply unchanged.
 from __future__ import annotations
 
 import logging
+import time
 
 import torch
 
@@ -93,6 +94,9 @@ def require_expert_tp(ep_size: int) -> None:
         )
 
 
+_MAX_ROWS = 16
+
+
 def _buckets(max_req: int) -> list[int]:
     """Request-count buckets 1, 2, 4, ... up to max_req."""
     out, b = [], 1
@@ -152,6 +156,16 @@ class GlmFlashMegakernel:
         max_len = -(-max_len // D.KernelConfig.attn_tile) * D.KernelConfig.attn_tile
         self.max_len = max_len
         self.pages_per_seq = table_pages
+        # 16 rows is the largest bucket that fits tpu7x's 64 MiB VMEM with 256-column
+        # dense tiles (128-column tiles are wrong below 32 rows, 2026-11-12); a recipe's
+        # larger cap does not build an unusable bucket, steps past it run on the model.
+        if max_rows > _MAX_ROWS:
+            logger.info(
+                "GLM-Flash megakernel: max rows %d capped at %d (VMEM)",
+                max_rows,
+                _MAX_ROWS,
+            )
+            max_rows = _MAX_ROWS
         self.max_req = max(1, max_rows // n_query)
         # Requests per kernel call; a larger batch is split into calls of this size.
         call_rows = max_rows if call_rows is None else min(call_rows, max_rows)
@@ -160,11 +174,19 @@ class GlmFlashMegakernel:
         # would only be compiled (one Pallas kernel each), never run.
         if max_requests is not None:
             self.call_req = max(1, min(self.call_req, max_requests))
+        # Dense-weight tile: 512 for a one-row kernel, else 256. 128-column tiles give wrong
+        # results below 32 rows (GSM8K 0.44 at one request; 1.4-1.8 rel at 4-16 rows in the
+        # harness, 2026-11-12), so the 32-row bucket that needs them is not built by default.
         km_tile = 512 if self.max_req * n_query == 1 else 256
 
         def cfg_for(b):
             # Larger steps trade DMA ring depth for the VMEM their row-scaled buffers need.
+            # Measured at tp8 / 1M (tpu7x, 64 MiB): 16 rows overflow by 1.2 MiB with a
+            # 4-slot expert ring and fit with 3; 8 rows fit with 4; 32 rows need the lean form.
+            # Context parallel adds ~5 MiB: 16 rows then also need the 3-slot dense ring and
+            # one slab (67.75 MiB with both at 4 / 2).
             big = b * n_query > 16
+            mid = b * n_query == 16
             return D.KernelConfig(
                 max_len=max_len,
                 n_query=n_query,
@@ -173,12 +195,13 @@ class GlmFlashMegakernel:
                 table_pages=table_pages,
                 embed_2d=True,
                 km_tile=km_tile,
-                slots=3 if big else 4,
-                prefetch=1 if big else 2,
-                km_slots=3 if big else 4,
-                km_issue=1 if big else 2,
+                slots=3 if (big or mid) else 4,
+                prefetch=1 if (big or mid) else 2,
+                km_slots=2 if big else 3 if mid else 4,
+                km_issue=1 if (big or mid) else 2,
                 unroll_periods=big,
-                single_slab=big,
+                single_slab=big or mid,
+                context_parallel=True,  # DSA phase split by score rows across the tp chips
             )
 
         self.cfgs = {b: cfg_for(b) for b in _buckets(self.call_req)}
@@ -353,6 +376,53 @@ class GlmFlashMegakernel:
                     pages_per_seq=self.pages_per_seq,
                     **self._step_input_tables(),
                 )
+
+    def precompile(self, batch_sizes) -> None:
+        """Run the bucket of each warm-up batch size once on zero inputs, so its program
+        compiles with the rest of the server's warm-up and not at its first step (the
+        32-row bucket takes ~15 min). Nothing is live at startup, so the rows the calls
+        write (page 0, state slot 0) are harmless."""
+        device = self.k_scales.device
+        Q, pps = self.Q, self.pages_per_seq
+        buckets = sorted(
+            {self._bucket(min(n, self.call_req)) for n in batch_sizes if n >= 1}
+        )
+        for b in buckets:
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                zeros = lambda *shape, dtype=torch.int64: torch.zeros(
+                    shape, dtype=dtype, device=device
+                )
+                tok, pos, tab, srow, ckrow = _step_inputs_op(
+                    zeros(b * Q),
+                    zeros(b * Q),
+                    zeros(b * pps, dtype=torch.int32),
+                    zeros(b),
+                    q=Q,
+                    bucket=b,
+                    pages_per_seq=pps,
+                    **self._step_input_tables(),
+                )
+                inputs = (
+                    tok,
+                    pos,
+                    self._meta[b],
+                    tab,
+                    srow,
+                    ckrow,
+                    self.k_scales,
+                    self.init_streams[b],
+                )
+                out = self.calls[b](
+                    *inputs, *self.weights, *self.pool_list, *self.experts
+                )
+                out[0][:1].cpu()  # materialize: the compile and the run happen here
+            logger.info(
+                "GLM-Flash megakernel: bucket %d x %d rows compiled in %.0f s",
+                b,
+                Q,
+                time.perf_counter() - t0,
+            )
 
     def _step_inputs(
         self, input_ids, positions, forward_batch, b0: int, n: int, bucket: int

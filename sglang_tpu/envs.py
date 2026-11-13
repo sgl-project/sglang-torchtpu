@@ -191,10 +191,12 @@ class TpuEnvs:
     # model as usual. ..._MAX_LEN caps the request length the kernel takes
     # (default: the context length); ..._MAX_ROWS the rows (requests x draft
     # tokens) of one step; a larger step runs as several calls of at most
-    # ..._CALL_ROWS rows each (32 fits tpu7x's 64 MiB VMEM, 64 does not; measured).
+    # ..._CALL_ROWS rows each. With the context-parallel DSA, 16 rows is the largest
+    # bucket that fits tpu7x's 64 MiB VMEM with 256-column dense tiles; steps with more
+    # requests run on the model path (measured 2026-11-12).
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL = EnvBool(False)
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(None)
-    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_ROWS = EnvInt(32)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_ROWS = EnvInt(16)
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_CALL_ROWS = EnvInt(32)
     # Experimental: the kpool indexer's StreamIndex page table stays in HBM with
     # one row per sequence in SMEM, so a context past ~262k fits the 1 MiB SMEM.
