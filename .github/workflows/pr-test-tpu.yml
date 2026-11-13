@@ -76,6 +76,14 @@ jobs:
               - 'python/sglang/multimodal_gen/runtime/distributed/parallel_state.py'
               - 'python/sglang/multimodal_gen/runtime/disaggregation/transport/manager.py'
               - 'python/sglang/multimodal_gen/runtime/managers/memory_managers/layerwise_offload.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages/denoising.py'
+              # Shared files sglang_tpu/multimodal_gen/minimax_h3.py patches or imports.
+              - 'python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/packed_sequence.py'
+              - 'python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages/comfyui_step.py'
+              - 'python/sglang/multimodal_gen/runtime/layers/attention/backends/attention_backend.py'
+              - 'python/sglang/multimodal_gen/runtime/models/encoders/minimax_h3_qwen3vl.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_minimax_h3_encoder_device.py'
               - 'python/sglang/multimodal_gen/test/unit/test_tpu_*.py'
               - 'python/sglang/multimodal_gen/test/unit/test_platform_detection.py'
               # Shared diffusion files behind the TPU-only platform hooks (SPMD-safe
