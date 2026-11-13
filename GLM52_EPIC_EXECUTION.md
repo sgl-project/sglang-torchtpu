@@ -57,4 +57,7 @@
 - Real checkpoint CPU preflight SUCCEEDED: `exp-2gq0zsmhs0`, 118629 tensors, 59044 output-channel scale pairs, no missing indexed tensors or wrong shard assignments. Config is full GLM DSA (not Flash), hidden6144/78 layers/256 experts. Summary and config hashes committed. This is header evidence, not weight-content or TPU validation.
 - Declared artifact extraction analyses `an-dqplhgxwpb` and `an-zpjlrgogt0` failed before readable diagnostics; task summary is available via Falcon exp logs, full header output remains remote. Platform issue https://github.com/primatrix/Falcon/issues/1525 tracks missing failed-analyzer logs. No bucket/provider bypass used.
 - Epic pushed to origin; baseline/scaffolding commits remain separable. Plugin-only channelwise loader implementation is now being prepared behind explicit config opt-in; default/Flash behavior must fall through unchanged.
+- Opt-in loader committed `1192e6c8be`, candidate JSON wired via HF quantization override `635b971e0c`, six CPU contract tests `322a967f78`. Syntax checks passed; actual imports/execution pending.
+- CPU validation `exp-9dwxb55hll` could not pull private CI base image and was explicitly aborted. Public release-image CPU replacement `exp-3f6ay1a6ek` submitted with same pinned test source; records actual runtime versions and is not TPU-stack equivalence evidence.
+- JAX reference remains pending; latest admission reports eight more TPU chips needed. No duplicate TPU experiment submitted.
 - This ledger is updated with actual evidence as the work proceeds.
