@@ -60,9 +60,24 @@ tpu_dsv41_engram_gate
   Why: the torch fallback of sglang.srt.layers.engram.engram_gate uses
        torch.copysign, which TorchTPU does not implement (aten::copysign.out).
   How: AROUND engram_gate keeps the original on CUDA; elsewhere computes the
-       same gate with torch.where(dot >= 0, |dot|', -|dot|') for the sign.
+       same gate via engram_host.signed_sqrt (int32 sign-bit check so -0.0
+       preserves its sign, matching copysign).
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TorchTPU implements aten::copysign or engram_gate avoids it.
+
+tpu_dsv41_engram_worker_forward
+  Why: hashing on CPU from device input_ids/positions stalls every decode step
+       on D2H copies and oversubscribes PyTorch's intra-op thread pool across
+       8 scheduler processes. Core TpModelWorker.forward_batch_generation has
+       no host-input preparation seam before ForwardBatch construction.
+  How: AROUND TpModelWorker.forward_batch_generation captures the scheduled
+       batch's host Engram windows without waiting for step N-1's sampled token
+       (overlap holes are resolved right before the compiled forward), records
+       PendingTokens after sampling, and clears per-step state in finally.
+       Unsupported modes (warmup, speculative verify, folded CED replay, beam
+       search, PP/CP/DCP > 1) fall back cleanly to host_hash_ids.
+  Upstream PR or issue: not filed (ported from sgl-project/sglang-torchtpu#2092).
+  Remove when: upstream exposes a worker-level host-input preparation seam.
 
 tpu_dsv41_engram_embed_init, tpu_dsv41_engram_embed_forward,
 tpu_dsv41_hasher_forward
@@ -73,10 +88,10 @@ tpu_dsv41_hasher_forward
        mapping with cudaHostRegister, and the core lookup reads it from a GPU.
   How: AROUND EngramEmbedding.__init__ rejects any other placement on TPU and
        builds the table with cudaHostRegister stubbed out. The V4 compile
-       policy (deepseek_v41/compile_policy.py) hashes on the host and stages
-       raw rows after padding; inside the graph EngramHasher.forward returns
-       the staged row ids and EngramEmbedding.forward dequantizes the staged
-       rows.
+       policy and its forward shim (deepseek_v41/compile_policy.py) hash on the
+       host and stage packed rows via double-buffered async raw DMA; inside the
+       graph EngramHasher.forward returns the staged row ids and
+       EngramEmbedding.forward unpacks and dequantizes the staged rows.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: the device can read host tables, or the in-graph HBM lookup
        is correct under attention DP.
@@ -201,6 +216,8 @@ def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value)
     """engram_gate without torch.copysign (no TorchTPU kernel)."""
     if x.is_cuda:
         return original(x, kv, q_weight, k_weight, eps, clamp_value)
+    from sglang_tpu.models.deepseek_v41.engram_host import signed_sqrt
+
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
@@ -210,9 +227,51 @@ def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value)
         key.square().mean(-1) + eps
     )
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
-    magnitude = dot.abs().clamp_min(clamp_value).sqrt()
-    gate = torch.sigmoid(torch.where(dot >= 0, magnitude, -magnitude))
+    gate = torch.sigmoid(signed_sqrt(dot, clamp_value))
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+
+
+def tpu_dsv41_engram_worker_forward(original, worker, batch, *args, **kwargs):
+    """AROUND TpModelWorker.forward_batch_generation: capture host Engram inputs."""
+    runner = worker.model_runner
+    model_config = getattr(runner, "model_config", None)
+    if not getattr(model_config, "use_engram", False) or getattr(
+        runner, "is_draft_worker", False
+    ):
+        return original(worker, batch, *args, **kwargs)
+    model = getattr(runner, "model", None)
+    inner = getattr(model, "model", None)
+    hasher = getattr(inner, "engram_hasher", None)
+    if hasher is None:
+        return original(worker, batch, *args, **kwargs)
+    from sglang.srt.runtime_context import get_exec, get_parallel
+    from sglang_tpu.models.deepseek_v41 import engram_host
+
+    coordinator = engram_host.get_or_create_coordinator(model, hasher, runner.device)
+    if coordinator is None:
+        return original(worker, batch, *args, **kwargs)
+    is_verify = bool(kwargs.get("is_verify", False))
+    prepared = (
+        None
+        if is_verify
+        else coordinator.prepare_if_supported(
+            batch,
+            parallel=get_parallel(),
+            enable_encoder_swa_bounded_replay=bool(
+                get_exec().features.enable_encoder_swa_bounded_replay
+            ),
+        )
+    )
+    try:
+        result = original(worker, batch, *args, **kwargs)
+        if prepared is not None:
+            requests, positions = prepared
+            coordinator.remember(requests, positions, result)
+        elif not is_verify:
+            coordinator.remember_fallback_if_applicable(batch, result)
+        return result
+    finally:
+        coordinator.clear_step()
 
 
 def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
@@ -308,6 +367,11 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.engram_gate",
             tpu_dsv41_engram_gate,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation",
+            tpu_dsv41_engram_worker_forward,
             HookType.AROUND,
         ),
         (
