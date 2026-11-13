@@ -31,7 +31,13 @@ block checkpoint and call it the same numerical model.
 
 ## Torch candidate: NOT VALIDATED
 
-`torch_prefill_candidate.json` proposes TP16 / attention-DP16 / EP16 on two hosts,
+`torch_prefill_candidate.json` explicitly opts into the experimental plugin loader via
+`json_model_override_args.quantization_config.tpu_checkpoint_layout`; it leaves
+the mounted model metadata unchanged. The loader implementation is not yet CPU
+or TPU execution-validated. Ordinary FP8 and Flash omit this field and should
+return the upstream configuration unchanged (CPU regression pending).
+
+The JSON proposes TP16 / attention-DP16 / EP16 on two hosts,
 matching private's intended attention tensor axis1. `dp_size=1` is one complete
 model, not a translation of JAX DP16. Native communication, loader ABI, group
 constraints and per-rank compile buckets still require validation. In particular,
