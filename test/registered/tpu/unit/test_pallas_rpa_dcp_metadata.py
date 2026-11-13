@@ -1,14 +1,16 @@
 """CPU unit tests for the decode-context-parallel (DCP) metadata of the TPU
-batched RPA attention backend, and for the KV-slot parity the owner-masked write
-relies on.
+batched RPA attention backend, and for the KV-slot parity the kernel's
+stripe-local writes rely on.
 
 Covered here:
 
-* ``_build_metadata`` under ``dcp=2`` for decode and extend: ``kv_lens`` holds
-  the per-rank LOCAL lengths, ``page_indices`` uses the widened page stride,
-  and the new ``dcp_kv_lens_global`` / ``dcp_prefix_kv_lens`` /
-  ``dcp_cp_rank`` fields carry the global lengths, the local cached-prefix
-  lengths and the rank constant.
+* ``_build_metadata`` under ``dcp=2`` for decode, extend and mixed batches:
+  ``kv_lens`` holds the per-rank LOCAL lengths the STRIPED pass walks (the
+  cached prefix of a multi-token row, the whole sequence of a single-token
+  row), ``page_indices`` uses the widened page stride, the
+  ``dcp_kv_lens_global`` / ``dcp_cp_rank`` fields carry the global lengths
+  and the rank constant, and a mixed batch's ``distribution`` is
+  ``[n_chunk, n_chunk, n]`` (chunk rows first, the trailing decode rows last).
 * The per-request page-table capacity check measures the LOCAL length, so a
   sequence longer than one rank's table but shorter than the group's is served.
 * The warmup dummy batch (every seq_len 1) shards to one token on rank 0 and
@@ -20,8 +22,10 @@ Covered here:
 * Slot parity over ``TpuPagedTokenToKVPoolAllocator`` with a widened page:
   every token's location satisfies ``loc % dcp == position % dcp`` across
   ``alloc_extend`` (fresh, chunked and page-continuing) and ``alloc_decode``
-  sequences, which is what makes ``build_owner_write_spans`` claim each token on exactly
-  one rank at physical slot ``loc // dcp``.
+  sequences, so a logical (widened) page is position-aligned and the kernel
+  can write each token on exactly one rank -- the one owning its
+  ``page_size`` run -- at physical slot
+  ``(loc // (page_size * dcp)) * page_size + position % page_size``.
 
 Everything here is pure torch-CPU: the backend subclass skips the
 JAX-requiring kernel-op registration, as in ``test_pallas_rpa_batched_backend.py``.
@@ -44,10 +48,6 @@ from sglang_tpu.allocator_tpu import (
 from sglang_tpu.attention_pallas_rpa_batched import (
     PallasForwardMetadata,
     TpuPallasRpaBatchedAttnBackend,
-)
-from sglang_tpu.attention_pallas_rpa_dcp import (
-    build_owner_write_spans,
-    max_write_spans,
 )
 from sglang_tpu.host_metadata_cache import HostMetadataCache
 
@@ -151,8 +151,11 @@ def _build_meta(backend, fb, dcp: int, dcp_rank: int) -> PallasForwardMetadata:
         return backend._build_metadata(fb, backend._non_empty_batch_size(fb))
 
 
-def _local_lens(lens, dcp: int, rank: int) -> torch.Tensor:
-    return get_dcp_lens(torch.tensor(lens, dtype=torch.int32), dcp, rank)
+def _local_lens(lens, dcp: int, rank: int, page_size: int = 16) -> torch.Tensor:
+    # Page-striped: rank r owns page p iff p % dcp == r.
+    return get_dcp_lens(
+        torch.tensor(lens, dtype=torch.int32), dcp, rank, interleave_size=page_size
+    )
 
 
 @_requires_dcp_helpers
@@ -212,18 +215,6 @@ class TestPallasRpaDcpMetadataDecode(CustomTestCase):
                 self.seq_lens.to(torch.int32),
             )
         )
-
-    def test_prefix_kv_lens_equal_kv_lens_in_decode(self):
-        # Decode runs one pass: the cached part is the whole local shard.
-        for rank in range(self.DCP):
-            with self.subTest(rank=rank):
-                meta = self._meta(rank)
-                self.assertTrue(
-                    torch.equal(
-                        meta.dcp_prefix_kv_lens.to(torch.int32),
-                        meta.kv_lens.to(torch.int32),
-                    )
-                )
 
     def test_cp_rank_is_a_one_element_int32_tensor(self):
         for rank in range(self.DCP):
@@ -293,47 +284,93 @@ class TestPallasRpaDcpMetadataExtend(CustomTestCase):
         )
         return _build_meta(backend, self.fb, self.DCP, rank)
 
-    def test_kv_lens_cover_prefix_plus_chunk(self):
+    def test_kv_lens_are_the_striped_pass_lengths(self):
+        # The STRIPED prefix pass walks the cached prefix of a multi-token row
+        # and, for a single-token row, the whole sequence (its token included
+        # on the owner): the chunk pass writes the multi-token rows' tokens.
         for rank in range(self.DCP):
             with self.subTest(rank=rank):
                 meta = self._meta(rank)
-                expected = _local_lens(self.SEQ_LENS, self.DCP, rank)
+                lengths = [
+                    s if e == 1 else s - e
+                    for s, e in zip(self.SEQ_LENS, self.EXTEND_SEQ_LENS)
+                ]
+                expected = _local_lens(lengths, self.DCP, rank)
                 self.assertTrue(
-                    torch.equal(meta.kv_lens.to(torch.int32), expected.to(torch.int32))
+                    torch.equal(meta.kv_lens.to(torch.int32), expected.to(torch.int32)),
+                    f"{meta.kv_lens.tolist()} != {expected.tolist()}",
                 )
-
-    def test_prefix_kv_lens_exclude_this_steps_tokens(self):
-        prefix = [s - e for s, e in zip(self.SEQ_LENS, self.EXTEND_SEQ_LENS)]
-        for rank in range(self.DCP):
-            with self.subTest(rank=rank):
-                meta = self._meta(rank)
-                expected = _local_lens(prefix, self.DCP, rank)
-                self.assertTrue(
-                    torch.equal(
-                        meta.dcp_prefix_kv_lens.to(torch.int32),
-                        expected.to(torch.int32),
-                    ),
-                    f"{meta.dcp_prefix_kv_lens.tolist()} != {expected.tolist()}",
-                )
-
-    def test_prefix_and_chunk_lengths_reconstruct_the_local_length(self):
-        # Pass A reads dcp_prefix_kv_lens, pass B the chunk; together they must
-        # be the rank's whole local shard.
-        for rank in range(self.DCP):
-            meta = self._meta(rank)
-            chunk_local = [
-                sum(1 for p in range(s - e, s) if p % self.DCP == rank)
-                for s, e in zip(self.SEQ_LENS, self.EXTEND_SEQ_LENS)
-            ]
-            total = meta.dcp_prefix_kv_lens.to(torch.int64) + torch.tensor(
-                chunk_local, dtype=torch.int64
-            )
-            self.assertTrue(torch.equal(total, meta.kv_lens.to(torch.int64)))
 
     def test_cu_q_lens_is_the_unsharded_cumsum(self):
         meta = self._meta(1)
         expected = torch.tensor([0, 7, 12, 19, 20], dtype=torch.int32)
         self.assertTrue(torch.equal(meta.cu_q_lens.to(torch.int32), expected))
+
+    def test_extend_distribution_is_the_chunk_range_only(self):
+        # Pure extend keeps the batched layout [n, n, n]: every row, the
+        # one-token row included, runs on the chunk tile.
+        n = len(self.SEQ_LENS)
+        meta = self._meta(0)
+        self.assertEqual(meta.distribution.tolist(), [n, n, n])
+
+
+@_requires_dcp_helpers
+class TestPallasRpaDcpMetadataMixed(CustomTestCase):
+    """Mixed batches under dcp=2: SGLang lists the prefill rows first and the
+    running (decode) rows last, which is the kernel's batch order: the
+    ``distribution`` puts the chunk rows at ``[0, n_chunk)`` and the trailing
+    single-token run at ``[n_chunk, n)``."""
+
+    PAGE_SIZE = 16
+    DCP = 2
+    PAGES_PER_SEQ = 8
+    MAX_CONTEXT_LEN = PAGE_SIZE * DCP * PAGES_PER_SEQ  # 256
+    # Two prefill chunks (one with a single new token, which still belongs to
+    # the chunk range), then three decode rows.
+    SEQ_LENS = [40, 31, 9, 70, 33]
+    EXTEND_SEQ_LENS = [7, 1, 9, 1, 1]
+
+    def setUp(self):
+        self.req_to_token = _build_req_to_token(8, self.MAX_CONTEXT_LEN + 32)
+        self.req_pool_indices = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64)
+        self.fb = _make_forward_batch(
+            seq_lens=torch.tensor(self.SEQ_LENS, dtype=torch.int32),
+            req_pool_indices=self.req_pool_indices,
+            forward_mode=ForwardMode.MIXED,
+            extend_seq_lens=torch.tensor(self.EXTEND_SEQ_LENS, dtype=torch.int32),
+        )
+
+    def _meta(self, rank: int) -> PallasForwardMetadata:
+        backend = _DcpBackendUnderTest(
+            self.PAGE_SIZE,
+            self.req_to_token,
+            self.DCP,
+            rank,
+            max_context_len=self.MAX_CONTEXT_LEN,
+        )
+        return _build_meta(backend, self.fb, self.DCP, rank)
+
+    def test_distribution_lists_the_chunk_rows_then_the_decode_rows(self):
+        meta = self._meta(0)
+        self.assertEqual(meta.distribution.tolist(), [3, 3, 5])
+
+    def test_kv_lens_are_the_striped_pass_lengths(self):
+        for rank in range(self.DCP):
+            with self.subTest(rank=rank):
+                meta = self._meta(rank)
+                lengths = [
+                    s if e == 1 else s - e
+                    for s, e in zip(self.SEQ_LENS, self.EXTEND_SEQ_LENS)
+                ]
+                expected = _local_lens(lengths, self.DCP, rank)
+                self.assertTrue(
+                    torch.equal(meta.kv_lens.to(torch.int32), expected.to(torch.int32)),
+                    f"{meta.kv_lens.tolist()} != {expected.tolist()}",
+                )
+
+    def test_global_kv_lens_are_the_full_lengths(self):
+        meta = self._meta(1)
+        self.assertEqual(meta.dcp_kv_lens_global.tolist(), self.SEQ_LENS)
 
     def test_global_kv_lens_field_is_the_unsharded_length(self):
         meta = self._meta(1)
@@ -372,14 +409,15 @@ class TestPallasRpaDcpCapacity(CustomTestCase):
         return _build_meta(backend, fb, self.DCP, rank)
 
     def test_sequence_longer_than_one_ranks_table_is_accepted(self):
-        # 100 global tokens exceed the 64-entry local table but shard to 50.
+        # 100 global tokens exceed the 64-entry local table but stripe to 52
+        # on rank 0 (three full 16-page runs plus 4 of the fourth).
         seq_len = 100
         self.assertGreater(seq_len, self.LOCAL_CAPACITY)
         meta = self._build(seq_len)
-        self.assertEqual(int(meta.kv_lens[0]), 50)
+        self.assertEqual(int(meta.kv_lens[0]), 52)
 
     def test_local_length_over_capacity_is_refused(self):
-        # 130 global tokens shard to 65 on rank 0 -- one past the local table.
+        # 130 global tokens stripe to 66 on rank 0 -- past the local table.
         with self.assertRaisesRegex(ValueError, "page-table capacity"):
             self._build(130, rank=0)
 
@@ -410,7 +448,6 @@ class TestPallasRpaDcpDisabled(CustomTestCase):
         meta = _build_meta(backend, fb, 1, 0)
 
         self.assertIsNone(meta.dcp_kv_lens_global)
-        self.assertIsNone(meta.dcp_prefix_kv_lens)
         self.assertIsNone(meta.dcp_cp_rank)
         self.assertTrue(torch.equal(meta.kv_lens.to(torch.int32), seq_lens))
         expected_pages = [
@@ -543,17 +580,18 @@ class TestPallasRpaDcpWarmupBatch(CustomTestCase):
                 meta = self._meta(rank, ForwardMode.DECODE)
                 owned = 1 if rank == 0 else 0
                 self.assertEqual(meta.kv_lens.tolist(), [owned] * self.BS)
-                self.assertEqual(meta.dcp_prefix_kv_lens.tolist(), [owned] * self.BS)
                 self.assertEqual(meta.dcp_kv_lens_global.tolist(), [1] * self.BS)
 
-    def test_extend_dummy_batch_has_an_empty_cached_prefix(self):
+    def test_extend_dummy_batch_is_one_owned_token_on_rank_zero(self):
+        # A one-token extend row is the STRIPED pass's: its stripe length
+        # includes the token on the owner (rank 0 for position 0).
         ones = torch.ones(self.BS, dtype=torch.int32)
         for rank in range(self.DCP):
             with self.subTest(rank=rank):
                 meta = self._meta(rank, ForwardMode.EXTEND, extend_seq_lens=ones)
                 owned = 1 if rank == 0 else 0
                 self.assertEqual(meta.kv_lens.tolist(), [owned] * self.BS)
-                self.assertEqual(meta.dcp_prefix_kv_lens.tolist(), [0] * self.BS)
+                self.assertEqual(meta.dcp_kv_lens_global.tolist(), [1] * self.BS)
 
     def test_page_table_keeps_the_widened_stride(self):
         meta = self._meta(1, ForwardMode.DECODE)
@@ -666,100 +704,6 @@ class TestDcpSlotParity(CustomTestCase):
         for token_locs in locs:
             for loc in token_locs:
                 self.assertGreater(loc // self.DCP, 0)
-
-
-class TestOwnerWriteSpans(CustomTestCase):
-    """``build_owner_write_spans`` writes each token's physical slot on exactly
-    one rank, through spans that never straddle a slot jump."""
-
-    DCP = 4
-    PAGE = 8
-
-    def _locations(self, positions):
-        # Position-aligned locations in the widened space, page 1 onwards.
-        widened = self.PAGE * self.DCP
-        return torch.tensor([widened + p for p in positions], dtype=torch.int64)
-
-    @staticmethod
-    def _written(spans):
-        """(compacted row -> physical slot) pairs the spans write, in order."""
-        pairs = []
-        for dst, src, n in zip(
-            spans.dst.tolist(), spans.src.tolist(), spans.lens.tolist()
-        ):
-            pairs.extend((src + i, dst + i) for i in range(n))
-        return pairs
-
-    def test_each_rank_writes_exactly_its_owned_slots(self):
-        positions = torch.arange(17, dtype=torch.int64)
-        locations = self._locations(positions.tolist())
-        claimed = {}
-        for rank in range(self.DCP):
-            spans = build_owner_write_spans(
-                positions, locations, self.DCP, rank, self.PAGE, 32, 1
-            )
-            owned = [
-                i for i, p in enumerate(positions.tolist()) if p % self.DCP == rank
-            ]
-            self.assertEqual(spans.index[: len(owned)].tolist(), owned)
-            self.assertEqual(int(spans.lens.sum()), len(owned))
-            for row, slot in self._written(spans):
-                token = owned[row]
-                self.assertEqual(slot, int(locations[token]) // self.DCP)
-                self.assertNotIn(token, claimed)
-                claimed[token] = rank
-        self.assertEqual(sorted(claimed), positions.tolist())
-
-    def test_consecutive_owned_slots_share_one_span(self):
-        positions = torch.arange(16, dtype=torch.int64)
-        locations = self._locations(positions.tolist())
-        spans = build_owner_write_spans(
-            positions, locations, self.DCP, 1, self.PAGE, 16, 1
-        )
-        self.assertEqual(spans.lens.tolist()[:2], [4, 0])
-
-    def test_a_slot_jump_starts_a_new_span(self):
-        # Two requests whose pages are not adjacent: rank 0 owns positions 0
-        # and 4 of each, so it writes two runs of two.
-        positions = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7] * 2, dtype=torch.int64)
-        widened = self.PAGE * self.DCP
-        locations = torch.tensor(
-            [widened + p for p in range(8)] + [3 * widened + p for p in range(8)],
-            dtype=torch.int64,
-        )
-        spans = build_owner_write_spans(
-            positions, locations, self.DCP, 0, self.PAGE, 16, 2
-        )
-        self.assertEqual(spans.lens.tolist()[:3], [2, 2, 0])
-        self.assertEqual(spans.src.tolist()[:2], [0, 2])
-        self.assertEqual(spans.dst.tolist()[:2], [self.PAGE, 3 * self.PAGE])
-
-    def test_padding_rows_go_to_the_dummy_slot(self):
-        # Sync padding carries out_cache_loc 0 and position 0; only the rank
-        # that owns position 0 writes it, into physical slot 0.
-        positions = torch.zeros(3, dtype=torch.int64)
-        locations = torch.zeros(3, dtype=torch.int64)
-        for rank in range(self.DCP):
-            spans = build_owner_write_spans(
-                positions, locations, self.DCP, rank, self.PAGE, 4, 1
-            )
-            with self.subTest(rank=rank):
-                if rank == 0:
-                    self.assertEqual(spans.dst.tolist()[0], 0)
-                    self.assertEqual(int(spans.lens.sum()), 3)
-                else:
-                    self.assertEqual(int(spans.lens.sum()), 0)
-
-    def test_span_table_has_the_bucket_length_and_rejects_overflow(self):
-        positions = torch.arange(6, dtype=torch.int64)
-        # Every owned token on its own page: more spans than the table holds.
-        locations = torch.tensor(
-            [(p + 1) * self.PAGE * self.DCP * 2 for p in range(6)], dtype=torch.int64
-        )
-        spans = build_owner_write_spans(positions, locations, 1, 0, self.PAGE, 6, 5)
-        self.assertEqual(spans.dst.numel(), max_write_spans(6, 5, self.PAGE))
-        with self.assertRaises(ValueError):
-            build_owner_write_spans(positions, locations, 1, 0, self.PAGE, 6, 1)
 
 
 if __name__ == "__main__":

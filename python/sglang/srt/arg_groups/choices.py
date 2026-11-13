@@ -171,6 +171,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
     "pallas_tpu",
     "pallas_tpu_fused_rs",
+    "pallas_tpu_fused_decode",
     "megamoe",
     "intel_xpu",
 ]

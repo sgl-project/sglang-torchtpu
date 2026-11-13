@@ -19,7 +19,9 @@ _N_V, _D_K, _D_V, _K, _T = 2, 4, 4, 4, 3
 _DIM = 2 * _N_V * _D_K + _N_V * _D_V
 
 
-def _run(lower_bound, conv_weights=None, is_decode=True, **layer_attrs):
+def _run(
+    lower_bound, conv_weights=None, is_decode=True, track=(None, None), **layer_attrs
+):
     conv_state, rec_state = (
         torch.zeros(4, _K - 1, 1, _DIM),
         torch.zeros(4, _N_V, _D_K, _D_V),
@@ -47,7 +49,7 @@ def _run(lower_bound, conv_weights=None, is_decode=True, **layer_attrs):
     backend._distribution = None
     backend._is_decode = is_decode
     backend._read_offsets, backend._num_spec_tokens, backend._spec_window = None, 0, 1
-    backend._track_indices = backend._track_end = None
+    backend._track_indices, backend._track_end = track
     backend._op = Mock(return_value=torch.zeros(_T, _N_V, _D_V))
     out = backend._run(
         layer,
@@ -99,6 +101,13 @@ class TestTpuKDAAttnBackend(CustomTestCase):
         packed = torch.zeros(8, 128)
         kwargs = _run(-5.0, packed_kernel_weights=packed)[3]
         self.assertIs(kwargs["packed_weights"], packed)
+
+    def test_snapshot_plan_is_forwarded(self):
+        # The radix checkpoint plan (track slots, snapshot ends) reaches the op.
+        track = (torch.tensor([3]), torch.tensor([128]))
+        kwargs = _run(-5.0, is_decode=False, track=track)[3]
+        self.assertIs(kwargs["track_indices"], track[0])
+        self.assertIs(kwargs["track_end"], track[1])
 
     def test_fused_qkvg_is_opt_in(self):
         # Only a layer that declares the fused [q, k, v, g] input (Kimi-K3)

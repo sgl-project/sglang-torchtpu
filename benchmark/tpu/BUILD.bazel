@@ -21,6 +21,13 @@ cc_binary(
 )
 
 py_library(
+    name = "checkpoint_prefetch",
+    srcs = ["ci_checkpoint_prefetch.py"],
+    data = ["//python/sglang:checkpoint_prefetch"],
+    imports = ["../.."],
+)
+
+py_library(
     name = "launcher",
     srcs = ["launch_server.py"],
     data = [
@@ -29,6 +36,7 @@ py_library(
     ],
     imports = ["../.."],
     deps = [
+        ":checkpoint_prefetch",
         ":python_configs",
         "@rules_python//python/runfiles",
     ],

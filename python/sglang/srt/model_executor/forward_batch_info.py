@@ -661,6 +661,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     defer_logits_to_eager: bool = False
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+    # Optional platform-set tensor naming the rows whose logits this forward
+    # reads, for models that can skip work on the other rows. The platform that
+    # sets it owns its layout (e.g. sglang_tpu/compilation/logit_rows.py); core
+    # never reads it. A field, so tracers that flatten ForwardBatch see it as an
+    # input. None: not provided.
+    logit_rows: Optional[torch.Tensor] = None
 
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
@@ -1385,12 +1391,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         None means tracking is skipped for this forward:
         no mask, or a prefill CUDA-graph replay without mamba_track_seqlens.
         Masked-off rows hold garbage.
+
+        Decode rows that MAX_LEN DP padding runs as 1-token extends
+        (prepare_mlp_sync_batch) keep their decode track plan: the mask marks
+        rows whose post-token length lands on the track grid, and the decode
+        result path records that snapshot as taken. The whole row is covered;
+        its prefix (seq_len - 1) is off the chunk grid, so the floor below
+        would wrongly round it to 0.
         """
-        if (
-            self.mamba_track_mask is None
-            or self.mamba_track_seqlens is None
-            or self.extend_prefix_lens is None
-        ):
+        if self.mamba_track_mask is None:
+            return None
+        original_mode = getattr(self, "_original_forward_mode", None)
+        if original_mode is not None and original_mode.is_decode():
+            return self.extend_seq_lens
+        if self.mamba_track_seqlens is None or self.extend_prefix_lens is None:
             return None
 
         chunk_size = mamba_cache_chunk_size()

@@ -126,6 +126,7 @@ def _qblock_kernel(
     kv_lens_ref,  # i32[num_blocks] kv length of each block's request
     # Inputs
     q_ref,  # bf16[1, rows, 640] rows = h * query_block + q; 576 real lanes
+    # (bf16[1, rows, 512] with read_rope=False)
     qpos_ref,  # i32[1, 1, query_block] query positions, -1 on padded rows
     member_ref,  # i32[1, pages_pad, query_block] selection word per page
     units_ref,  # SMEM i32[1, 1, pages_pad] union, request-relative pages
@@ -147,6 +148,7 @@ def _qblock_kernel(
     num_heads: int,
     page_size: int,
     kpool: int,
+    read_rope: bool = True,
 ):
     b = pl.program_id(0)
     num_pages = cache_nope_hbm.shape[0]
@@ -165,10 +167,14 @@ def _qblock_kernel(
 
         def copies(j, slot):
             page = phys_ref[0, 0, j]
+            nope_copy = pltpu.make_async_copy(
+                nope_pages.at[page], nope_ring.at[slot], sems.at[0, slot]
+            )
+            if not read_rope:
+                # Identically-zero rope lane: the rope term is 0, skip its DMA.
+                return (nope_copy,)
             return (
-                pltpu.make_async_copy(
-                    nope_pages.at[page], nope_ring.at[slot], sems.at[0, slot]
-                ),
+                nope_copy,
                 pltpu.make_async_copy(
                     rope_pages.at[page], rope_ring.at[slot], sems.at[1, slot]
                 ),
@@ -220,13 +226,10 @@ def _qblock_kernel(
                 cp.wait()
             nope = nope_ring[slot].reshape(page_size, NOPE_DIM)
             nope = pltpu.bitcast(nope, jnp.float8_e4m3fn).astype(jnp.bfloat16)
-            rope = pltpu.bitcast(rope_ring[slot], jnp.float8_e4m3fn)
-            rope = rope.astype(jnp.bfloat16)
             # Rows past the request's kv length were never written and can
             # decode to FP8 NaN; 0 * NaN would poison the PV sum.
             live = rows < kv_len - g * page_size
             nope = jnp.where(live, nope, 0)
-            rope = jnp.where(live, rope, 0)
 
             # Key-major score: [page_size keys, rows].
             q = q_ref[0]
@@ -237,12 +240,15 @@ def _qblock_kernel(
                 nt,
                 preferred_element_type=_ACCUMULATOR_DTYPE,
             )
-            s += lax.dot_general(
-                rope,
-                q[:, NOPE_DIM : NOPE_DIM + ROPE_LANES],
-                nt,
-                preferred_element_type=_ACCUMULATOR_DTYPE,
-            )
+            if read_rope:
+                rope = pltpu.bitcast(rope_ring[slot], jnp.float8_e4m3fn)
+                rope = jnp.where(live, rope.astype(jnp.bfloat16), 0)
+                s += lax.dot_general(
+                    rope,
+                    q[:, NOPE_DIM : NOPE_DIM + ROPE_LANES],
+                    nt,
+                    preferred_element_type=_ACCUMULATOR_DTYPE,
+                )
             s = s * scale + bias
 
             # Flash softmax over keys (axis 0, the sublane axis).
@@ -305,9 +311,47 @@ def _query_blocks(
     return req, start, count, first_pos, ends[-1].astype(jnp.int32), t_row
 
 
+def _selection_words(topk_indices, tok, is_row, *, kpool, pages_pad):
+    """member[b, g, q]: query q's selection word for page g, ``[nb, pages, qb]``.
+
+    One pool id per entry: column ``c * kpool`` of a row is the first token of
+    a pool. Padding rows (``is_row`` false) get no bits. A compare-OR, not a
+    scatter (scatters with this many updates are slow on the TPU).
+
+    A query's words depend only on its own row, so they are built once per
+    token, ``[num_tokens, pages]``, and whole word rows are gathered into the
+    block layout. Building them per block entry instead would run the
+    compare-OR over ``num_blocks * qb`` rows: the block layout reserves a padded
+    last block per possible request (95 blocks for 32 live at an 8192-token
+    prefill with 64 request slots), which made it the largest op of a
+    GLM-5.3-Flash prefill. The row gather also reads ``pages`` words per query
+    rather than ``width / kpool`` entries.
+    """
+    g = jnp.arange(pages_pad, dtype=jnp.int32)
+    first_tok = topk_indices[:, ::kpool]  # [num_tokens, width / kpool]
+    sel = jnp.where(first_tok >= 0, first_tok // kpool, -1)
+    page = jnp.where(sel >= 0, sel // _WORD_BITS, -1)
+    bit = jnp.where(sel >= 0, jnp.left_shift(1, sel % _WORD_BITS), 0)
+    words = lax.reduce(
+        jnp.where(page[:, None, :] == g[None, :, None], bit[:, None, :], 0),
+        np.dtype(_WORD_DTYPE).type(0),
+        lax.bitwise_or,
+        (2,),
+    )  # [num_tokens, pages_pad]
+    member = jnp.where(is_row[..., None], words[tok], 0)  # [nb, qb, pages_pad]
+    return member.transpose(0, 2, 1)
+
+
 @functools.partial(
     jax.jit,
-    static_argnames=("sm_scale", "k_scale", "kpool", "query_block", "interpret"),
+    static_argnames=(
+        "sm_scale",
+        "k_scale",
+        "kpool",
+        "query_block",
+        "interpret",
+        "read_rope",
+    ),
 )
 def sparse_mla_prefill_qblock(
     ql_nope: jax.Array,  # bf16[num_tokens, num_q_heads, 512]
@@ -325,13 +369,16 @@ def sparse_mla_prefill_qblock(
     kpool: int,
     query_block: int = QUERY_BLOCK,
     interpret: bool = False,
+    read_rope: bool = True,
 ) -> jax.Array:
     """Sparse MLA attention over pooled DSA selections, ``query_block`` at a time.
 
     Same result as ``sparse_ragged_paged_attention`` on the same rows (up to
     bf16 rounding of the softmax weights), for rows in the pooled indexer's
     format: selected pools' tokens, then the open pool's tail, then ``-1``.
-    The cache must already hold this step's tokens.
+    The cache must already hold this step's tokens. ``read_rope=False`` skips
+    the rope cache and the rope score term: exact only when ``q_pe`` is
+    identically zero (a model without rope).
 
     Returns ``bf16[num_tokens, num_q_heads, 512]``; rows of padding tokens are 0.
     """
@@ -367,20 +414,14 @@ def sparse_mla_prefill_qblock(
     tok = jnp.where(is_row, start[:, None] + r[None, :], 0)
     qpos = jnp.where(is_row, first_pos[:, None] + r[None, :], -1)
 
-    # One pool id per entry: column c * kpool is the first token of a pool.
-    first_tok = topk_indices[:, ::kpool][tok]  # [num_blocks, qb, width / kpool]
-    sel = jnp.where(is_row[..., None] & (first_tok >= 0), first_tok // kpool, -1)
-    page = jnp.where(sel >= 0, sel // _WORD_BITS, -1)
-    bit = jnp.where(sel >= 0, jnp.left_shift(1, sel % _WORD_BITS), 0)
-    # member[b, g, q]: query q's selection word for page g. A compare-OR, not a
-    # scatter (scatters with this many updates are slow on the TPU).
     pages_pad = _align(pages_per_seq, _SUBLANES)
     g = jnp.arange(pages_pad, dtype=jnp.int32)
-    member = lax.reduce(
-        jnp.where(page[:, None] == g[None, :, None, None], bit[:, None], 0),
-        np.dtype(_WORD_DTYPE).type(0),
-        lax.bitwise_or,
-        (3,),
+    member = _selection_words(
+        topk_indices,
+        tok,
+        is_row,
+        kpool=kpool,
+        pages_pad=pages_pad,
     )  # [num_blocks, pages_pad, qb]
 
     # Each block's page union in ascending order, compacted to the front.
@@ -396,8 +437,9 @@ def sparse_mla_prefill_qblock(
         req[:, None] * pages_per_seq + jnp.minimum(units, pages_per_seq - 1)
     ]
 
-    # Queries in block layout, head-major rows, 128-aligned head dim.
-    q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+    # Queries in block layout, head-major rows, 128-aligned head dim. Without
+    # rope the kernel only reads the NoPE lanes, so the rope lanes are dropped.
+    q = jnp.concatenate([ql_nope, q_pe], axis=-1) if read_rope else ql_nope
     head_dim = _align(q.shape[-1], _LANES)
     q = jnp.pad(q, ((0, 0), (0, 0), (0, head_dim - q.shape[-1])))
     q = jnp.where(is_row[..., None, None], q[tok], 0)  # [nb, qb, H, D]
@@ -411,6 +453,7 @@ def sparse_mla_prefill_qblock(
         num_heads=num_heads,
         page_size=page_size,
         kpool=kpool,
+        read_rope=read_rope,
     )
 
     def live(b, num_live_ref, *_):

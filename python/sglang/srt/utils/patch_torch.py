@@ -199,7 +199,6 @@ def initialize_torch_tpu_worker(
     server_args, tp_rank: int, pp_rank: int = 0, dp_rank: Optional[int] = None
 ):
     """Configure and initialize TorchTPU in a scheduler worker."""
-    monkey_patch_torch_tpu_env(server_args, tp_rank, pp_rank, dp_rank=dp_rank)
     from sglang.srt.arg_groups.model_override_base import resolving_view
 
     cfg = resolving_view(server_args)
@@ -208,6 +207,8 @@ def initialize_torch_tpu_worker(
 
     from sglang.srt.platforms import current_platform
 
+    current_platform.prepare_worker(server_args, tp_rank, pp_rank, dp_rank)
+    monkey_patch_torch_tpu_env(server_args, tp_rank, pp_rank, dp_rank=dp_rank)
     current_platform.init_backend()
 
     try:

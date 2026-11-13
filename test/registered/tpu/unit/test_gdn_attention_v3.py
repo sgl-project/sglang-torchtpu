@@ -42,9 +42,13 @@ import math
 import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import sweep
 from sglang.test.test_utils import CustomTestCase
 
 register_tpu_ci(est_time=300, suite="stage-a-test-tpu-unit", chips=1)
+# The reachable-tile sweep is ~45% of this file. The gate walks one head split;
+# the nightly walks every served one.
+register_tpu_ci(est_time=450, suite="nightly-tpu-4-v7", nightly=True)
 
 
 def _has_jax() -> bool:
@@ -1370,7 +1374,7 @@ class TestGDNAttentionV3(CustomTestCase):
 
         d_k = d_v = 128
         kernel_size = 4
-        for n_kq, n_v in _SERVED_GDN_HEADS:
+        for n_kq, n_v in sweep(_SERVED_GDN_HEADS, ((8, 32),)):
             for state_dtype in (jnp.bfloat16, jnp.float32):
                 for window in (1, 4):
                     for batch in _reachable_tile_batches(

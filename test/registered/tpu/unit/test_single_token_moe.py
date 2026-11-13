@@ -79,6 +79,25 @@ class TestSingleTokenMoe(CustomTestCase):
         k = len(ids)
         w = np.random.default_rng(k).random(k).astype(np.float32)
         w /= w.sum()
+
+        # Arrays go in as arguments, not closed-over constants, so cases that
+        # share a shape share one executable (and the compile cache sees the
+        # same HLO across runs). The jit is per call: the spy fires at trace.
+        def moe(x, weights, topk_weights, topk_ids):
+            return _fused_moe_jax(
+                hidden_states=x,
+                **weights,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                w1_bias=None,
+                w2_bias=None,
+                topk=k,
+                activation_name=ACT,
+                global_num_experts=num_global,
+                expert_group_offset=offset,
+                permute_dense_threshold=threshold,
+            )
+
         with (
             tpu_envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.override(kernel_on),
             mock.patch.object(
@@ -92,21 +111,12 @@ class TestSingleTokenMoe(CustomTestCase):
                 (lambda *a: True) if force_validated else single_token_moe.validated,
             ),
         ):
-            out = jax.jit(
-                lambda: _fused_moe_jax(
-                    hidden_states=x,
-                    **weights,
-                    topk_weights=jnp.asarray(w[None], jnp.bfloat16),
-                    topk_ids=jnp.asarray(np.asarray(ids)[None], jnp.int32),
-                    w1_bias=None,
-                    w2_bias=None,
-                    topk=k,
-                    activation_name=ACT,
-                    global_num_experts=num_global,
-                    expert_group_offset=offset,
-                    permute_dense_threshold=threshold,
-                )
-            )()
+            out = jax.jit(moe)(
+                x,
+                weights,
+                jnp.asarray(w[None], jnp.bfloat16),
+                jnp.asarray(np.asarray(ids)[None], jnp.int32),
+            )
         return np.asarray(out.astype(jnp.float32)), spy.called
 
     def _check(self, ids, offset, msg, **kw):

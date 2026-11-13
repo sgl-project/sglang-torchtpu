@@ -129,8 +129,8 @@ def _build_fused_moe_rs_op():
         hidden_states: jax.Array,
         w1: jax.Array,
         w2: jax.Array,
-        w1_scale: jax.Array,
-        w2_scale: jax.Array,
+        w1_scale: jax.Array | None,
+        w2_scale: jax.Array | None,
         topk_weights: jax.Array,
         topk_ids: jax.Array,
         post_expert_norm_weight: jax.Array,
@@ -140,6 +140,7 @@ def _build_fused_moe_rs_op():
         has_post_expert_norm: bool,
         fp8_direct_write: bool,
         expert_tp: bool,
+        fp4_w4a16: bool,
     ) -> jax.Array:
         num_tokens = hidden_states.shape[0]
         ep_size = mesh.shape["model"]
@@ -173,6 +174,7 @@ def _build_fused_moe_rs_op():
             ),
             fp8_direct_write=fp8_direct_write,
             expert_tp=expert_tp,
+            fp4_w4a16=fp4_w4a16,
         )
         if not has_post_expert_norm:
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
@@ -185,7 +187,7 @@ def _build_fused_moe_rs_op():
         _FUSED_MOE_RS_OP_NAME,
         _wrapped,
         mesh=mesh,
-        input_partition_specs=(P(),) * 9 + (None,) * 5,
+        input_partition_specs=(P(),) * 9 + (None,) * 6,
         output_partition_specs=(P(),),
     )
 
@@ -193,8 +195,8 @@ def _build_fused_moe_rs_op():
         hidden_states: torch.Tensor,
         w1: torch.Tensor,
         w2: torch.Tensor,
-        w1_scale: torch.Tensor,
-        w2_scale: torch.Tensor,
+        w1_scale: torch.Tensor | None,
+        w2_scale: torch.Tensor | None,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         post_expert_norm_weight: torch.Tensor,
@@ -204,6 +206,7 @@ def _build_fused_moe_rs_op():
         has_post_expert_norm: bool,
         fp8_direct_write: bool,
         expert_tp: bool,
+        fp4_w4a16: bool,
     ) -> torch.Tensor:
         ep_size = mesh.shape["model"]
         padded_tokens = fused_moe_rs_padded_tokens(
@@ -222,8 +225,8 @@ def fused_moe_rs_call(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     post_expert_norm_weight: torch.Tensor,
@@ -233,6 +236,7 @@ def fused_moe_rs_call(
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
     expert_tp: bool = False,
+    fp4_w4a16: bool = False,
 ) -> torch.Tensor:
     return _build_fused_moe_rs_op()(
         hidden_states,
@@ -249,6 +253,7 @@ def fused_moe_rs_call(
         has_post_expert_norm,
         fp8_direct_write,
         expert_tp,
+        fp4_w4a16,
     )
 
 
@@ -257,8 +262,8 @@ def fused_moe_rs_gather(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     post_expert_norm_weight: torch.Tensor,
@@ -271,7 +276,9 @@ def fused_moe_rs_gather(
     keep_token_shard: bool = False,
     expert_tp: bool = False,
     oneshot_rank: torch.Tensor | None = None,
+    fp4_w4a16: bool = False,
 ) -> torch.Tensor:
+    """fp4_w4a16: block-256 fp4 experts take bf16 rows instead of fp8-quantized ones."""
     import torch.distributed as dist
 
     if expert_tp:
@@ -301,6 +308,7 @@ def fused_moe_rs_gather(
                         world_size=world_size,
                         expert_tp=True,
                         oneshot_rank=oneshot_rank,
+                        fp4_w4a16=fp4_w4a16,
                     )[: min(max_tokens, hidden_states.shape[0] - start)]
                     for start in range(0, hidden_states.shape[0], max_tokens)
                 ]
@@ -351,6 +359,7 @@ def fused_moe_rs_gather(
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
+        fp4_w4a16=fp4_w4a16,
     )
     if token_shard.ndim != 2 or token_shard.shape != (
         padded_shard_rows,

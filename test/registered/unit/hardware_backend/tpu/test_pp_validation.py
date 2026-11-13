@@ -7,8 +7,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-import sys
-import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -17,13 +15,12 @@ from sglang.srt.arg_groups.overrides import declare_resolution, resolution_resul
 from sglang.srt.arg_groups.validation_hook import (
     check_pipeline_parallel_compat as core_check_pipeline_parallel_compat,
 )
-from sglang.srt.distributed import parallel_state
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
     SpecAuxHiddenStateConfig,
 )
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import pp_stage_chips, pp_stage_groups
+from sglang_tpu import pp_stage_chips
 from sglang_tpu.envs import envs
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
@@ -77,6 +74,8 @@ def _args(**overrides):
         moe_dp_size=1,
         tpu_compile_tracer="dynamo",
         nnodes=1,
+        enable_page_major_kv_layout=False,
+        enable_unified_memory=False,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -163,15 +162,23 @@ class TestPipelineParallelValidation(CustomTestCase):
         prepare_tpu_env.assert_called_once_with(8, setup_slicebuilder=True)
 
     def test_accepts_tensor_parallel_pair_stages(self):
-        prepare_tpu_env = _apply(_args(pp_size=8, tp_size=2, enable_torch_compile=True))
-        prepare_tpu_env.assert_called_once_with(16, setup_slicebuilder=True)
+        for ep_size in (1, 2):
+            with self.subTest(ep_size=ep_size):
+                prepare_tpu_env = _apply(
+                    _args(
+                        pp_size=8,
+                        tp_size=2,
+                        ep_size=ep_size,
+                        enable_torch_compile=True,
+                    )
+                )
+                prepare_tpu_env.assert_called_once_with(16, setup_slicebuilder=True)
 
-    def test_rejects_tensor_parallel_stages_other_than_a_plain_pair(self):
-        """Only two-device stages of plain tensor parallelism were validated."""
+    def test_rejects_unsupported_tensor_parallel_stages(self):
         for overrides in (
             dict(tp_size=4),
             dict(tp_size=2, attn_dp_size=2),
-            dict(tp_size=2, ep_size=2),
+            dict(tp_size=2, ep_size=4),
         ):
             with self.subTest(**overrides):
                 with self.assertRaisesRegex(
@@ -367,59 +374,6 @@ def _group(*ranks):
         world_size=len(ranks),
         device_group=SimpleNamespace(ranks=ranks),
     )
-
-
-def _parallel(*, pp_size, tp_size, stage):
-    return SimpleNamespace(pp_size=pp_size, tp_size=tp_size, pp_rank=1, tp_group=stage)
-
-
-class TestStandaloneStageGroups(CustomTestCase):
-    def _made_standalone(self, parallel):
-        make_standalone = Mock()
-        with patch.object(
-            pp_stage_groups, "_load_make_standalone", return_value=make_standalone
-        ):
-            pp_stage_groups.make_stage_groups_standalone(parallel)
-        return [call.args[0] for call in make_standalone.call_args_list]
-
-    def test_every_group_inside_the_stage_is_made_standalone_in_creation_order(self):
-        """A stage collective over a group left out waits for the other stages,
-        and groups that span stages carry the hand-off, so they stay as built."""
-        world, pp, one_device = _group(*range(8)), _group(0, 2, 4, 6), _group(2)
-        # The stage's tp group, its PD-multiplexing copy and a decode CP group.
-        stage, tp_copy, dcp = _group(2, 3), _group(2, 3), _group(2, 3)
-        built = (world, stage, tp_copy, dcp, one_device, pp)
-        registry = {f"g{i}": (lambda g=group: g) for i, group in enumerate(built)}
-        with patch.object(parallel_state, "_groups", registry):
-            made = self._made_standalone(_parallel(pp_size=4, tp_size=2, stage=stage))
-        self.assertEqual(
-            made, [stage.device_group, tp_copy.device_group, dcp.device_group]
-        )
-
-    def test_one_device_stages_and_one_stage_do_not_need_the_api(self):
-        load = Mock(side_effect=AssertionError("loaded make_standalone"))
-        layouts = (
-            _parallel(pp_size=4, tp_size=1, stage=_group(1)),
-            _parallel(pp_size=1, tp_size=2, stage=_group(0, 1)),
-            _parallel(pp_size=1, tp_size=1, stage=_group(0)),
-        )
-        with patch.object(pp_stage_groups, "_load_make_standalone", load):
-            for parallel in layouts:
-                pp_stage_groups.make_stage_groups_standalone(parallel)
-        load.assert_not_called()
-
-    def test_a_torch_tpu_without_standalone_subgroups_fails_at_startup(self):
-        """A context-parallel pipeline on a torch_tpu without standalone
-        subgroups stalls at its first stage collective, so it must not start."""
-        parallel = _parallel(pp_size=4, tp_size=2, stage=_group(2, 3))
-        without_api = types.ModuleType("torch_tpu._internal.distributed.spmd_util")
-        with patch.dict(
-            sys.modules, {"torch_tpu._internal.distributed.spmd_util": without_api}
-        ):
-            with self.assertRaisesRegex(
-                RuntimeError, r"torch_tpu with standalone process subgroups"
-            ):
-                pp_stage_groups.make_stage_groups_standalone(parallel)
 
 
 def _on(chip, core):

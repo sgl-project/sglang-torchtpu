@@ -3,7 +3,7 @@
 
 torch_tpu has no device send/recv, so each hand-off is one collective-permute
 that every device of the slice launches in the same order: each device sends
-the sum of its hidden states and residual to its column's device in the next
+its hidden states plus any residual to its column's device in the next
 stage, one closed cycle per column. Stage 0 launches once per iteration while
 the wave is active and owes 2 * (stages - 2) zero launches after its last send;
 stage r > 0 launches up to stage 0's count plus min(r - 1, launches owed).
@@ -235,21 +235,27 @@ class PPWave:
         }
 
     def warmup_merge(self, row_buckets: Iterable[int]) -> None:
-        """Compile merge's sum and pad for every bucket a forward hands on."""
+        """Compile both the sum-and-pad and pad-only paths for each bucket."""
         for rows in row_buckets:
             if rows <= self.rows:
-                self.merge(self.warmup_tensors(rows))
+                tensors = self.warmup_tensors(rows)
+                self.merge(tensors)
+                self.merge({k: v for k, v in tensors.items() if k != "residual"})
 
-    def merge(self, tensors: dict[str, torch.Tensor]) -> Payload:
-        """The padded sum of a forward's outgoing hidden states and residual."""
-        if set(tensors) != set(self.KEYS):
+    def merge(self, tensors: dict[str, torch.Tensor | None]) -> Payload:
+        """Pad hidden states, adding a residual only when the forward returns one."""
+        if set(tensors) not in ({"hidden_states"}, set(self.KEYS)):
             raise ValueError(
-                f"the pipeline wave hands on exactly {self.KEYS}, got {sorted(tensors)}"
+                "the pipeline wave requires hidden_states and an optional residual, "
+                f"got {sorted(tensors)}"
             )
-        merged = tensors[self.KEYS[0]] + tensors[self.KEYS[1]]
+        merged = tensors["hidden_states"]
+        residual = tensors.get("residual")
+        if residual is not None:
+            merged = merged + residual
         if merged.dtype != self.dtype:
             raise ValueError(
-                f"the pipeline wave carries {self.dtype}, got a {merged.dtype} sum"
+                f"the pipeline wave carries {self.dtype}, got {merged.dtype}"
             )
         return self._pad(merged, self.zero)
 
@@ -300,6 +306,11 @@ class PPWave:
             )
         return self.unpack(self._launch(self._take_pending()))
 
+    def receive_batch(self, batch: Any) -> dict[str, torch.Tensor] | None:
+        """receive() for the scheduler, which hands every hand-off the batch;
+        the wave's buffer does not depend on it."""
+        return self.receive()
+
     def unpack(self, x: Payload) -> dict[str, torch.Tensor]:
         """The forward's inputs from one received buffer."""
         return {self.KEYS[0]: x, self.KEYS[1]: self.zero}
@@ -312,7 +323,7 @@ class PPWave:
                 f"expected {expected} at the end of this iteration"
             )
 
-    def end_iteration(self, tensors: dict[str, torch.Tensor] | None) -> None:
+    def end_iteration(self, tensors: dict[str, torch.Tensor | None] | None) -> None:
         """After the forward (``tensors`` = its outgoing activations; None
         without a batch or on the last stage): stage 0 launches its one hop of
         the iteration, a middle stage holds the output for its next launch."""
@@ -425,11 +436,10 @@ class PPAuxWave(PPWave):
         )
         return super().warmup_tensors(rows) | {AUX_HIDDEN_STATES_PROXY_KEY: aux}
 
-    def merge(self, tensors: dict[str, torch.Tensor]) -> Payload:
+    def merge(self, tensors: dict[str, torch.Tensor | None]) -> Payload:
         if AUX_HIDDEN_STATES_PROXY_KEY not in tensors:
             raise ValueError(
-                f"the pipeline wave hands on exactly "
-                f"{sorted((*self.KEYS, AUX_HIDDEN_STATES_PROXY_KEY))}, "
+                f"the pipeline wave requires {AUX_HIDDEN_STATES_PROXY_KEY}, "
                 f"got {sorted(tensors)}"
             )
         aux = tensors[AUX_HIDDEN_STATES_PROXY_KEY]

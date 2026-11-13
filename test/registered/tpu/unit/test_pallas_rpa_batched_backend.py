@@ -93,7 +93,7 @@ def _build_meta(backend, fb) -> PallasForwardMetadata:
 
 
 class TestBatchedRpaMetadataDecode(CustomTestCase):
-    """Decode-mode metadata: q_len == 1 per sequence, distribution = [n, n, n]."""
+    """Decode-mode metadata: q_len == 1 per sequence, distribution = [0, 0, n]."""
 
     PAGE_SIZE = 16
     PAGES_PER_SEQ = 4
@@ -154,8 +154,10 @@ class TestBatchedRpaMetadataDecode(CustomTestCase):
                 self.assertEqual(got, expected, f"seq {i} page {j} mismatch")
 
     def test_distribution_decode_all_active(self):
+        # Batched layout is [mixed, mixed + prefill, total]: a decode batch is
+        # entirely the trailing DECODE range, [0, 0, n].
         meta = self._build()
-        expected = torch.full((3,), self.bs, dtype=torch.int32)
+        expected = torch.tensor([0, 0, self.bs], dtype=torch.int32)
         self.assertTrue(torch.equal(meta.distribution, expected))
         self.assertEqual(meta.distribution.dtype, torch.int32)
 
@@ -164,7 +166,7 @@ class TestBatchedRpaMetadataDecode(CustomTestCase):
 
 
 class TestBatchedRpaMetadataExtend(CustomTestCase):
-    """Extend-mode metadata: cu_q_lens from extend_seq_lens, distribution [0,0,n]."""
+    """Extend-mode metadata: cu_q_lens from extend_seq_lens, distribution [n,n,n]."""
 
     PAGE_SIZE = 16
     PAGES_PER_SEQ = 4
@@ -196,13 +198,15 @@ class TestBatchedRpaMetadataExtend(CustomTestCase):
         self.assertTrue(torch.equal(meta.cu_q_lens, expected))
 
     def test_distribution_extend_is_mixed_only(self):
-        # Batched-specific: extend batches are encoded MIXED [0, 0, n], NOT
-        # v3's [0, n, n]. The batched kernel never runs the pure-prefill range.
+        # Batched-specific: extend batches are encoded MIXED [n, n, n] (the
+        # leading range of the batched kernel's [mixed, mixed + prefill, total]
+        # layout), NOT v3's [0, n, n]. The batched kernel never runs the
+        # pure-prefill range.
         meta = self._build()
-        expected = torch.tensor([0, 0, self.bs], dtype=torch.int32)
+        expected = torch.full((3,), self.bs, dtype=torch.int32)
         self.assertTrue(
             torch.equal(meta.distribution, expected),
-            f"expected MIXED [0,0,{self.bs}], got {meta.distribution.tolist()}",
+            f"expected MIXED [{self.bs},{self.bs},{self.bs}], got {meta.distribution.tolist()}",
         )
 
     def test_kv_lens_is_full_seq_lens(self):
@@ -218,17 +222,17 @@ class TestBatchedRpaDistributionEncoding(CustomTestCase):
             16, _build_req_to_token(num_reqs=4, max_context_len=64)
         )
 
-    def test_decode_repeats_active_count(self):
+    def test_decode_is_the_tail_range(self):
         dist = self._backend()._make_rpa_distribution_cpu(
             is_decode=True, non_empty_bs=5
         )
-        self.assertTrue(torch.equal(dist, torch.tensor([5, 5, 5], dtype=torch.int32)))
+        self.assertTrue(torch.equal(dist, torch.tensor([0, 0, 5], dtype=torch.int32)))
 
     def test_extend_is_mixed_only(self):
         dist = self._backend()._make_rpa_distribution_cpu(
             is_decode=False, non_empty_bs=5
         )
-        self.assertTrue(torch.equal(dist, torch.tensor([0, 0, 5], dtype=torch.int32)))
+        self.assertTrue(torch.equal(dist, torch.tensor([5, 5, 5], dtype=torch.int32)))
         self.assertEqual(dist.dtype, torch.int32)
 
 

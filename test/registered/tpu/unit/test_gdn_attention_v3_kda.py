@@ -26,9 +26,13 @@ import math
 import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import sweep
 from sglang.test.test_utils import CustomTestCase
 
 register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
+# The gate walks the reachable tiles of one served head split; the nightly
+# walks all four.
+register_tpu_ci(est_time=220, suite="nightly-tpu-4-v7", nightly=True)
 
 
 def _has_jax_tpu() -> bool:
@@ -925,7 +929,7 @@ class TestGDNAttentionV3KDA(CustomTestCase):
         from sglang_tpu.attention.pallas.gdn import config
 
         kernel = self._kernel()
-        for n_kq, n_v in _SERVED_KDA_HEADS:
+        for n_kq, n_v in sweep(_SERVED_KDA_HEADS, ((12, 12),)):
             for batch in _reachable_tile_batches(
                 n_kq, n_v, jnp.float32, 1, config.AttentionMode.KDA
             ):
