@@ -1,6 +1,6 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/fp8/cache.py
-# Revision: 42c35ec6166a19b3f0db90f31807cc3df44602ec (epic/dsv41)
+# Revision: cbf592e2be66ebbd5c33be8ff84e2a6a2314ea15 (epic/dsv41)
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Feature-major FP8 pages with an in-page FP32 scale per key.
@@ -16,6 +16,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from .prepare import prepare_sorted_fp8, supports_sorted_fp8
 
 PAGE_RECORDS = 128
 PAGE_ROWS = 33
@@ -99,6 +101,42 @@ def _record_addresses(records: jax.Array, layout: PackedFP8Layout):
 
 
 def write_fp8_records(
+    banks: tuple[jax.Array, ...],
+    records: jax.Array,
+    keys: jax.Array,
+    layout: PackedFP8Layout,
+) -> tuple[jax.Array, ...]:
+    """Quantize and write new keys, using fused preparation for verified decode."""
+    if not supports_sorted_fp8(banks, records, keys, layout.page_size):
+        return _write_fp8_records_native(banks, records, keys, layout)
+    layout.validate(tuple(bank.shape[0] for bank in banks))
+    bases, columns, valid = _record_addresses(records, layout)
+    bases = jnp.where(valid, bases, -1)
+    count = records.size
+    first_rows = banks[0].shape[0]
+    total_rows = sum(bank.shape[0] for bank in banks)
+    valid = (bases >= 0) & (bases + layout.page_rows <= first_rows)
+    valid |= (bases >= first_rows) & (bases + layout.page_rows <= total_rows)
+    bases, order = jax.lax.sort_key_val(
+        jnp.where(valid, bases, total_rows), jnp.arange(count, dtype=jnp.int32)
+    )
+    _, scales, _ = quantize_index_rows(keys)
+    columns, values = prepare_sorted_fp8(keys, columns, order, scales)
+    batch = min(count, PACKED_FP8_WRITE_BATCH)
+    bases = jnp.pad(bases, (0, -count % batch + 1), constant_values=total_rows)
+    return _write_sorted_packed_pages(
+        banks,
+        bases,
+        columns,
+        values,
+        count=count,
+        fields=PAGE_ROWS,
+        page_size=layout.page_size,
+        interpret=False,
+    )
+
+
+def _write_fp8_records_native(
     banks: tuple[jax.Array, ...],
     records: jax.Array,
     keys: jax.Array,
@@ -205,6 +243,36 @@ def write_packed_pages(
     bases = jnp.pad(bases, (0, -count % batch + 1), constant_values=total_rows)
     columns = jnp.pad(columns, (0, -count % batch))
     values = jnp.pad(values.T, ((0, padded_fields - fields), (0, -count % page_tokens)))
+
+    return _write_sorted_packed_pages(
+        banks,
+        bases,
+        columns,
+        values,
+        count=count,
+        fields=fields,
+        page_size=page_size,
+        interpret=interpret,
+    )
+
+
+def _write_sorted_packed_pages(
+    banks,
+    bases,
+    columns,
+    values,
+    *,
+    count: int,
+    fields: int,
+    page_size: int,
+    interpret: bool,
+):
+    page_tokens = banks[0].shape[1]
+    page_rows = pl.cdiv(fields * page_size, page_tokens)
+    padded_fields = page_rows * page_tokens // page_size
+    first_rows = banks[0].shape[0]
+    total_rows = sum(bank.shape[0] for bank in banks)
+    batch = min(count, PACKED_FP8_WRITE_BATCH)
 
     def kernel(base_ref, column_ref, value_ref, *refs):
         outputs = refs[len(banks) : 2 * len(banks)]

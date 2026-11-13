@@ -54,7 +54,7 @@ def _select(q, w, banks, pages, lengths, candidates, requests, layout, **kwargs)
         topk=512,
         block_size=8,
         candidate_write=False,
-        candidate_filter=False,
+        sparse_logits=False,
         unordered=True,
         score_width=pages.shape[1] * layout.page_size,
     )
@@ -75,7 +75,7 @@ def _select(q, w, banks, pages, lengths, candidates, requests, layout, **kwargs)
             options["topk"],
             options["block_size"],
             options["candidate_write"],
-            options["candidate_filter"],
+            options["sparse_logits"],
             options["unordered"],
             options["score_width"],
         )
@@ -365,7 +365,7 @@ def test_candidate_scoring_matches_dense_reference_real_tpu(counts, route, unord
                 candidates,
                 owners,
                 f["layout"],
-                candidate_filter=True,
+                sparse_logits=True,
                 unordered=unordered,
             )[0]
         )
@@ -418,7 +418,7 @@ def test_short_batch_bypasses_candidates_real_tpu(route):
             candidates,
             owners,
             f["layout"],
-            candidate_filter=True,
+            sparse_logits=True,
         )[0]
     expected = np.full((f["owners"].size, k), -1, np.int32)
     for row, (owner, length) in enumerate(zip(f["owners"], f["lengths"])):

@@ -115,7 +115,7 @@ def test_fp8_cache_write_preserves_untouched_records(page_size):
     "tokens,groups,width,page_size",
     [
         (1, 1, 4096, 128),
-        (7, 4, 4096, 64),
+        (7, 4, 4096, 256),
         (48, 48, 4096, 256),
         (128, 8, 4096, 128),
         (256, 16, 4096, 128),

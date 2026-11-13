@@ -117,6 +117,10 @@ class TpuEnvs:
     # all-reduce buffer, [attn_tp, rows, topk] int32 per DSA layer, grows with
     # the chunk); decode and verify keep the replicated path.
     SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MIN_TOKENS = EnvInt(1024)
+    # DSV4.1 packed FP8 dense indexer: MXU fragments issued ahead of the one
+    # being reduced (vllm-torchtpu TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH, #2875).
+    # Unset or 0 keeps the tuned PACKED_FP8_MQA_CONFIG depth.
+    SGLANG_TPU_DSV41_INDEXER_ISSUE_DEPTH = EnvInt(8)
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
