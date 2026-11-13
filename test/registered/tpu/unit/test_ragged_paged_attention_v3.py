@@ -591,6 +591,101 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             )
 
     # ------------------------------------------------------------------ #
+    # Sliding-window compute-chunk skip.
+    #
+    # Explicit MIXED block sizes put several bkv_csz chunks in each KV block
+    # and use a window much shorter than a block, so chunks left of the window
+    # are skipped. The skip must not change any output value: compare with
+    # the private _sliding_window_chunk_skip=False exactly, and with the
+    # reference.
+    # ------------------------------------------------------------------ #
+
+    def _check_sliding_window_chunk_skip(self, seqs, *, sliding_window, blocks):
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+            ref_ragged_paged_attention,
+        )
+
+        num_q_heads, num_kv_heads = 8, 2
+        self.PAGES_PER_SEQ = max(kv for kv, _ in seqs) // self.PAGE_SIZE + 1
+        self.TOTAL_NUM_PAGES = len(seqs) * self.PAGES_PER_SEQ
+        inputs = self._build_inputs(
+            seqs,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            noncontiguous_pages=True,
+        )
+        total = inputs["total_q_tokens"]
+        sm_scale = 1.0 / float(np.sqrt(self.HEAD_DIM))
+        for sinks in (None, jnp.linspace(-2.0, 2.0, num_q_heads, dtype=jnp.float32)):
+            with self.subTest(sinks=sinks is not None):
+                ref = ref_ragged_paged_attention(
+                    inputs["q"][:total],
+                    inputs["ref_kpages"],
+                    inputs["ref_vpages"],
+                    inputs["kv_lens"],
+                    inputs["ref_page_indices"],
+                    inputs["cu_q_lens"],
+                    jnp.array([inputs["num_seqs"]], dtype=jnp.int32),
+                    sm_scale=sm_scale,
+                    sliding_window=sliding_window,
+                    attention_sink=sinks,
+                )
+                outs = {}
+                for skip in (True, False):
+                    out, cache = ragged_paged_attention(
+                        inputs["q"].copy(),
+                        inputs["new_k"].copy(),
+                        inputs["new_v"].copy(),
+                        inputs["kv_fused"].copy(),
+                        inputs["kv_lens"],
+                        inputs["page_indices_flat"],
+                        inputs["cu_q_lens"],
+                        inputs["cu_kv_lens"],
+                        # Extend rows on the MIXED range, as the backend runs them.
+                        jnp.array([0, 0, inputs["num_seqs"]], jnp.int32),
+                        None,
+                        sinks,
+                        sm_scale=sm_scale,
+                        sliding_window=sliding_window,
+                        m_block_sizes=blocks,
+                        _sliding_window_chunk_skip=skip,
+                    )
+                    outs[skip] = (
+                        np.asarray(out[:total]).astype(np.float32),
+                        np.asarray(cache).astype(np.float32),
+                    )
+                np.testing.assert_array_equal(outs[True][0], outs[False][0])
+                # The skip is compute-only, so the cache writes are identical.
+                # The writes themselves are checked against the reference by
+                # the test_extend_sliding_window_writes_all_new_kv* tests.
+                np.testing.assert_array_equal(outs[True][1], outs[False][1])
+                diff = float(
+                    np.abs(outs[True][0] - np.asarray(ref).astype(np.float32)).max()
+                )
+                self.assertLess(diff, self.TOLERANCE)
+
+    def test_sliding_window_chunk_skip_prefill(self):
+        """One sequence from position 0; four 32-key chunks per 128-key block."""
+        self._check_sliding_window_chunk_skip(
+            [(256, 256)], sliding_window=40, blocks=(32, 128, 32, 32)
+        )
+
+    def test_sliding_window_chunk_skip_prefix_and_multi_seq(self):
+        """A cached prefix and a second sequence shift the window per row."""
+        self._check_sliding_window_chunk_skip(
+            [(320, 192), (200, 200)], sliding_window=48, blocks=(32, 128, 32, 32)
+        )
+
+    def test_sliding_window_chunk_skip_query_sub_blocks(self):
+        """bq_csz < bq_sz: the skip is decided by the block's first row."""
+        self._check_sliding_window_chunk_skip(
+            [(256, 256)], sliding_window=33, blocks=(64, 128, 32, 32)
+        )
+
+    # ------------------------------------------------------------------ #
     # Original two cases — kept (single seq), now via the multi-seq helper.
     # ------------------------------------------------------------------ #
 

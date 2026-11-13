@@ -618,5 +618,52 @@ class TestKernelBlockSizes(CustomTestCase):
                     )
 
 
+class TestScheduleSizeBound(CustomTestCase):
+    """The HBM schedule holds max_steps_ub * max_schedule_size_multiplier steps;
+    max_steps_ub shrinks as the page table grows, so a long-context call can need
+    more steps than 16 SMEM chunks and the schedule kernel would write past it."""
+
+    def _cfg(self, *, num_seqs, context, total_q_tokens):
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with tpu_info_for_cpu_export():
+            model = configs.ModelConfigs(
+                num_q_heads=16, num_kv_heads=2, head_dim=64, mask_value=0.0
+            )
+            serve = configs.ServingConfigs(
+                num_seqs=num_seqs,
+                page_size=256,
+                total_q_tokens=total_q_tokens,
+                num_page_indices=num_seqs * (context // 256),
+                dtype_q=jnp.bfloat16,
+                dtype_kv=jnp.float8_e4m3fn,
+                dtype_out=jnp.bfloat16,
+            )
+            _, mixed = wrapper.calculate_block_sizes(model, serve, 64 << 20)
+            cfg = configs.RpaConfigs(
+                block=mixed,
+                model=model,
+                serve=serve,
+                mode=configs.RpaCase.MIXED,
+                vmem_limit_bytes=64 << 20,
+            )
+            return cfg, cfg.max_steps_ub, cfg.static_max_steps
+
+    def test_long_context_grows_the_schedule(self):
+        # 32 rows of 1M context: 16 chunks of 128 steps hold 2048 of 51908 steps.
+        cfg, steps_ub, static_steps = self._cfg(
+            num_seqs=32, context=1 << 20, total_q_tokens=4096
+        )
+        self.assertLess(16 * steps_ub, static_steps)
+        self.assertGreater(steps_ub * cfg.max_schedule_size_multiplier, static_steps)
+
+    def test_short_context_keeps_the_default(self):
+        cfg, _, _ = self._cfg(num_seqs=32, context=1 << 17, total_q_tokens=4096)
+        self.assertEqual(cfg.max_schedule_size_multiplier, 16)
+
+
 if __name__ == "__main__":
     unittest.main()
