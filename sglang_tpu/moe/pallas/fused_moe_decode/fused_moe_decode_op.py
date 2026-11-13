@@ -525,10 +525,14 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
 
 
 def prepare_model_for_fused_moe_decode(model: torch.nn.Module) -> int:
-    """Prepare all eligible MoE modules in `model` after weight postprocessing."""
-    if not is_fused_moe_decode_enabled():
-        return 0
+    """Prepare all eligible MoE modules in `model` after weight postprocessing.
 
+    Every eligible module is visited even when the fused decode backend is off,
+    so that `_tpu_fused_moe_decode_checked` is set before torch.compile runs.
+    Otherwise `should_use_fused_moe_decode` sets it lazily on the first call,
+    which changes a guarded module attribute and forces a recompile; after
+    warmup this fails under the `fail_on_recompile` stance.
+    """
     prepared = []
     for module in model.modules():
         if getattr(module, "allow_tpu_fused_moe_decode", False):
