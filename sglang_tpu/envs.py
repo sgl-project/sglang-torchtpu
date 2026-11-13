@@ -603,6 +603,37 @@ class TpuEnvs:
     # Offline block-256 (16, 16)^T pre-shuffling of fp4 expert slabs + wpool/scales for
     # zero-shuffle NVFP4 dequant in the decode megakernel (and prefill MoE via MUSE_PF_MOE_KPERM).
     SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
+    # Muse expert layout for the megakernel: tp | ep | auto
+    # (auto: ep when the server's EP size > 1). muse_megakernel/moe_mode.py.
+    SGLANG_TPU_MUSE_MOE_MODE = EnvStr("auto")
+    # Decode megakernel (TP): fp4 experts requantized at load to one bf16 scale per this many K
+    # rows (0 off, 256), shared with the native fused-RS MoE (W4A16); the expert dots push raw
+    # e2m1 codes to the MXU (MKConfig.qblock).
+    SGLANG_TPU_MUSE_MK_QBLOCK = EnvInt(0)
+    # Kernel-sweep knobs (anvil --env), read here so the compile cache keys them; unset = the
+    # tuned default (dev_int). Muse megakernel tile / plan knobs (ops.py).
+    SGLANG_TPU_MUSE_MK_DEV_ROW_TILE = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_PAIR_Y = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_EXPERT_CHUNK = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILE_LOOPS_BUDGET_MIB = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH = EnvInt(None)
+    # EP megakernel arm: auto | a2a | gather; auto takes a2a from EP_MIN_ROWS rows up.
+    SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("auto")
+    SGLANG_TPU_MUSE_MK_EP_MIN_ROWS = EnvInt(None)
+    # EP fp4 experts requantized to one scale per this many K rows (0 off).
+    SGLANG_TPU_EP_QBLOCK = EnvInt(0)
+    # Largest EP block-diagonal arm in rows (ep_mk/experts.BD_ARMS).
+    SGLANG_TPU_EP_BD_MAX = EnvInt(None)
+    # Rows from which EP all-gathers relay through the partner core (gather.PAIR_AG_MIN_ROWS).
+    SGLANG_TPU_EP_GATHER_PAIR_MIN_ROWS = EnvInt(None)
+    # EP megakernel without Pallas bounds checks.
+    SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
+    # Timing only (wrong results): comma-separated EP phases every rank skips (ep_mk/layer.py).
+    SGLANG_TPU_EP_DEV_SKIP = EnvStr("")
+    # EP in-kernel xprof regions: 1 per phase, 2 per expert chunk / arm too.
+    SGLANG_TPU_EP_TRACE = EnvInt(0)
     # Megakernel KV write on SEQ_ALONG_LANE pools: all page read-modify-writes of a layer in
     # flight together, overlapped with the next layer's (MKConfig.kv_write_pipelined; exact).
     SGLANG_TPU_MUSE_MK_KV_WRITE_PIPELINED = EnvBool(False)
@@ -738,3 +769,9 @@ class TpuEnvs:
 
 envs = TpuEnvs()
 EnvField._allow_set_name = False
+
+
+def dev_int(field: EnvInt, default: int) -> int:
+    """A kernel-sweep knob: its value if set, else the tuned default."""
+    value = field.get()
+    return default if value is None else value
