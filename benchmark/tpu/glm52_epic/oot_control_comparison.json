@@ -1,0 +1,15 @@
+{
+  "main_exp": "exp-d7m6k8cufz",
+  "main_sha": "d6f54cc2899b2f9b23dde8e6e0605cac6d405120",
+  "epic_exp": "exp-5v13xkhwf0",
+  "epic_sha": "173364f89dc6e07428349092c1ea6cc3c548ebd3",
+  "tests_run": 39,
+  "errors": [
+    "test_hooks_load_in_both_modes_and_with_the_platform_unset (__main__.TestTpuPluginHooksLoad.test_hooks_load_in_both_modes_and_with_the_platform_unset)",
+    "test_post_load_prepares_then_binds_kimi_k3_only (__main__.TestTpuOOTPlatformContract.test_post_load_prepares_then_binds_kimi_k3_only)",
+    "test_register_is_idempotent_and_tpu_only (__main__.TestTpuPluginHooksLoad.test_register_is_idempotent_and_tpu_only)",
+    "test_scheduler_initialization_hook_is_declared (__main__.TestTpuOOTPlatformContract.test_scheduler_initialization_hook_is_declared)"
+  ],
+  "shared_signature": "AttributeError: torch.ops.sgl_kernel.fused_sigmoid_mul_cpu missing",
+  "conclusion": "same failure signatures in identical public CPU image, not full OOT pass; newer rank-one-only correction not full-suite tested"
+}
