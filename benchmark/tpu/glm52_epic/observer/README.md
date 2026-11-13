@@ -117,7 +117,19 @@ Each JSON line carries:
 Never subtract monotonic timestamps across files/processes/hosts, merge rank
 logs into one timeline, relabel this marker as JAX `PREFILL_STEP_COMPLETED`, or
 feed it to the matched-JAX estimator as if one local event represented all 16
-attention-DP shards. No matching/aggregation estimator is supplied here.
+attention-DP shards. The standalone [summarizer](<summarize.py>) computes only
+per-process diagnostics, never a pooled full-DP result:
+
+```bash
+python3 benchmark/tpu/glm52_epic/observer/summarize.py --self-test
+python3 benchmark/tpu/glm52_epic/observer/summarize.py \
+  --observer-dir /absolute/run/observer --requests /absolute/run/requests.json \
+  --attn-dp-size 16
+```
+
+It requires all sixteen attention-DP ranks and explicit C32 measured RIDs,
+rejects restarted/mixed process timelines and unavailable boundaries, and retains
+each rank's own samples and median. Its output is NOT a matched-JAX metric.
 Archive all ranks and separately establish the measurement protocol's workload,
 cache-hit, compilation, numerical and boundary-equivalence gates before any
 later matched claim. CPU fake-event selftests establish wrapper behavior only;
