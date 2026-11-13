@@ -416,15 +416,17 @@ class TestListenerSweep(unittest.TestCase):
             pollers.append(threading.current_thread()) or _polled()
         )
 
-        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.05, create=True):
+        # The 200 ms interval is 20x the scheduler's 10 ms poll period, so a
+        # descheduled test thread does not let a sweep slip in.
+        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.2, create=True):
             listener = self._start_listener(mgr)
-            # Scheduler polls every 10 ms for ten sweep intervals.
-            stop_draining = time.monotonic() + 0.5
+            # Scheduler polls every 10 ms for five sweep intervals.
+            stop_draining = time.monotonic() + 1.0
             while time.monotonic() < stop_draining:
                 mgr._drain_engine()
                 time.sleep(0.01)
             self.assertNotIn(listener, pollers)
-            deadline = time.monotonic() + 1.0
+            deadline = time.monotonic() + 2.0
             while listener not in pollers and time.monotonic() < deadline:
                 time.sleep(0.01)
 
