@@ -133,6 +133,8 @@ def test_rank_row_ranges_partition_each_table(
     from sglang_tpu.models.deepseek_v41 import ep_local_expert_reader as reader
 
     monkeypatch.setattr(reader, "_READ_CHUNK_BYTES", 96)
+    # 5 rows of the 32-byte weight per block: every rank's range spans blocks.
+    monkeypatch.setattr(reader, "_ROW_BLOCK_BYTES", 160)
     tables = {
         "layers.1.engram.embed.weight": torch.randn(101, 16).bfloat16(),
         "layers.1.engram.embed.scale": torch.randn(101, 3),
@@ -141,15 +143,20 @@ def test_rank_row_ranges_partition_each_table(
     path = tmp_path / "shard.safetensors"
     _write_safetensors(path, tables)
     names = {"layers.1.engram.embed.weight", "layers.1.engram.embed.scale"}
-    per_rank = [
-        dict(read_row_ranges(str(path), names, r, tp_size)) for r in range(tp_size)
-    ]
     for name in names:
-        parts = [got[name] for got in per_rank]
-        assert [p.shape[0] for p in parts] == _ROWS_PER_RANK[tp_size]
-        starts = [getattr(p, ROW_START_ATTR) for p in parts]
-        assert starts == [sum(_ROWS_PER_RANK[tp_size][:r]) for r in range(tp_size)]
-        assert torch.equal(torch.cat(parts), tables[name])
+        for r in range(tp_size):
+            blocks = [
+                t for n, t in read_row_ranges(str(path), names, r, tp_size) if n == name
+            ]
+            lo = sum(_ROWS_PER_RANK[tp_size][:r])
+            starts = [getattr(b, ROW_START_ATTR) for b in blocks]
+            assert starts[0] == lo
+            assert starts == [
+                lo + sum(b.shape[0] for b in blocks[:i]) for i in range(len(blocks))
+            ]
+            got = torch.cat(blocks)
+            assert got.shape[0] == _ROWS_PER_RANK[tp_size][r]
+            assert torch.equal(got, tables[name][lo : lo + got.shape[0]])
 
 
 def test_preread_rows_skip_the_original_slice_and_check_the_range():
@@ -159,7 +166,10 @@ def test_preread_rows_skip_the_original_slice_and_check_the_range():
     param = torch.nn.Parameter(torch.zeros(10, 4), requires_grad=False)
     rows = full[5:].clone()
     setattr(rows, ROW_START_ATTR, 5)
-    load_local_rows(lambda *a: calls.append(a), embedding, param, rows)
+    for first in (5, 7):  # two blocks of the rank's range
+        block = rows[first - 5 : first - 5 + (2 if first == 5 else 3)].clone()
+        setattr(block, ROW_START_ATTR, first)
+        load_local_rows(lambda *a: calls.append(a), embedding, param, block)
     assert torch.equal(param.data[5:], full[5:]) and not calls
     load_local_rows(lambda *a: calls.append(a), embedding, param, full)
     assert len(calls) == 1  # untagged tensors take the original path

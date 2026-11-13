@@ -341,13 +341,17 @@ def tpu_dsv41_engram_embed_forward(
     original, embedding, indices, forward_batch=None, **kwargs
 ):
     """AROUND EngramEmbedding.forward: dequantize the host-staged rows."""
-    if not indices.is_cuda and embedding.host_table is not None:
-        from sglang_tpu.models.deepseek_v41.engram_host import staged_lookup
+    if indices.is_cuda or embedding.host_table is None:
+        return original(embedding, indices, forward_batch, **kwargs)
+    from sglang_tpu.models.deepseek_v41.engram_host import staged_lookup
 
-        values = staged_lookup(embedding, indices, forward_batch)
-        if values is not None:
-            return values
-    return original(embedding, indices, forward_batch, **kwargs)
+    # The core host-table lookup reads a raw host pointer from the device.
+    if forward_batch is None or forward_batch.tpu_engram_staged is None:
+        raise RuntimeError(
+            "DeepSeek-V4.1 Engram on TPU reads rows staged by the compiled-forward "
+            "shim; this forward did not stage them"
+        )
+    return staged_lookup(embedding, indices, forward_batch)
 
 
 def hook_specs():

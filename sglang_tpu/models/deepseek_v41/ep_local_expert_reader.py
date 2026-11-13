@@ -32,6 +32,8 @@ _ENGRAM_TABLE = re.compile(r"^layers\.(0|[1-9]\d*)\.engram\.embed\.(weight|scale
 ROW_START_ATTR = "_sglang_dsv41_row_start"
 
 _READ_CHUNK_BYTES = 64 * 1024 * 1024
+# Rows yielded per Engram block; arbitrary, a few read chunks per block.
+_ROW_BLOCK_BYTES = 1024 * 1024 * 1024
 
 _SAFETENSORS_DTYPES = {
     "F8_E4M3": torch.float8_e4m3fn,
@@ -128,9 +130,10 @@ def _read_range(path: str, offset: int, out: torch.Tensor) -> None:
 def read_row_ranges(
     path: str, names: set[str], tp_rank: int, tp_size: int
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield this TP rank's rows of each 2-D tensor in ``names``, tagged with
-    ``ROW_START_ATTR``. Rows are contiguous in safetensors, so each table is one
-    byte range."""
+    """Yield this TP rank's rows of each 2-D tensor in ``names`` as blocks of at
+    most ``_ROW_BLOCK_BYTES``, each tagged with its first row in ``ROW_START_ATTR``.
+    The loader copies a block into the table before the next is read, so a rank
+    holds one block instead of its whole 12 GB range."""
     with open(path, "rb") as f:
         header_len = int.from_bytes(f.read(8), "little")
         header = json.loads(f.read(header_len))
@@ -142,20 +145,24 @@ def read_row_ranges(
         start, end = meta["data_offsets"]
         row_bytes = (end - start) // num_rows
         lo, hi = tp_row_range(num_rows, tp_rank, tp_size)
-        out = torch.empty((hi - lo) * row_bytes, dtype=torch.uint8)
+        block_rows = max(1, _ROW_BLOCK_BYTES // row_bytes)
         t0 = perf_counter()
-        _read_range(path, data_base + start + lo * row_bytes, out)
+        for first in range(lo, hi, block_rows):
+            last = min(first + block_rows, hi)
+            out = torch.empty((last - first) * row_bytes, dtype=torch.uint8)
+            _read_range(path, data_base + start + first * row_bytes, out)
+            tensor = out.view(dtype).view(last - first, *row_shape)
+            setattr(tensor, ROW_START_ATTR, first)
+            yield name, tensor
+            del out, tensor
         logger.info(
             "V4.1 %s rows [%d, %d): %.2f GB in %.1f s",
             name,
             lo,
             hi,
-            out.numel() / 1e9,
+            (hi - lo) * row_bytes / 1e9,
             perf_counter() - t0,
         )
-        tensor = out.view(dtype).view(hi - lo, *row_shape)
-        setattr(tensor, ROW_START_ATTR, lo)
-        yield name, tensor
 
 
 class EpLocalExpertReader:
@@ -194,21 +201,23 @@ class EpLocalExpertReader:
 
 
 def load_local_rows(original, embedding, param, loaded_weight):
-    """AROUND ``EngramEmbedding._load_rows``: accept a tensor already holding
-    exactly this rank's rows; anything else takes the original full-table path."""
+    """AROUND ``EngramEmbedding._load_rows``: copy a block of this rank's rows
+    (tagged by ``read_row_ranges``) into place; untagged tensors take the
+    original full-table path."""
     row_start = getattr(loaded_weight, ROW_START_ATTR, None)
     if row_start is None:
         return original(embedding, param, loaded_weight)
-    if row_start != embedding.row_start or loaded_weight.shape[0] != embedding.rows:
+    row_end = row_start + loaded_weight.shape[0]
+    if (
+        row_start < embedding.row_start
+        or row_end > embedding.row_start + embedding.rows
+    ):
         raise ValueError(
-            f"Engram rows [{row_start}, {row_start + loaded_weight.shape[0]}) do not "
-            f"match this rank's [{embedding.row_start}, "
-            f"{embedding.row_start + embedding.rows})"
+            f"Engram rows [{row_start}, {row_end}) do not match this rank's "
+            f"[{embedding.row_start}, {embedding.row_start + embedding.rows})"
         )
-    if embedding._shared:
-        rows = slice(embedding.row_start, embedding.row_start + embedding.rows)
-        param.data[rows].copy_(loaded_weight)
-    else:
-        param.data.copy_(loaded_weight)
+    # The shared table holds every row; a per-rank shard starts at row_start.
+    base = 0 if embedding._shared else embedding.row_start
+    param.data[row_start - base : row_end - base].copy_(loaded_weight)
     if embedding.host_table is not None:
         embedding.host_table.dirty = True

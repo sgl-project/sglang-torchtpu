@@ -68,10 +68,25 @@ def gather_staged_rows(
     staged = []
     for index, (weight, scale) in enumerate(tables):
         ids = hash_ids[:, index].reshape(-1).to(torch.int64)
-        raw = weight.view(torch.uint8).index_select(0, ids)
-        scales = scale.view(torch.uint8).index_select(0, ids)
+        raw, scales = _host_buffers(index, ids.numel(), weight.shape[1], scale.shape[1])
+        torch.index_select(weight.view(torch.uint8), 0, ids, out=raw)
+        torch.index_select(scale.view(torch.uint8), 0, ids, out=scales)
         staged.append((raw.to(device), scales.to(device)))
     return tuple(staged)
+
+
+# (hash index, rows) -> reused host gather buffers; one entry per compiled bucket.
+_HOST_BUFFERS: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _host_buffers(index: int, rows: int, dim: int, blocks: int):
+    key = (index, rows)
+    if key not in _HOST_BUFFERS:
+        _HOST_BUFFERS[key] = (
+            torch.empty(rows, dim, dtype=torch.uint8),
+            torch.empty(rows, blocks, dtype=torch.uint8),
+        )
+    return _HOST_BUFFERS[key]
 
 
 def dequant_staged(
@@ -90,10 +105,8 @@ def dequant_staged(
     return values.flatten(-2).to(torch.bfloat16)
 
 
-def staged_lookup(embedding, indices, forward_batch) -> torch.Tensor | None:
-    """EngramEmbedding.forward from the staged rows, or None if not staged."""
-    if forward_batch is None or forward_batch.tpu_engram_staged is None:
-        return None
+def staged_lookup(embedding, indices, forward_batch) -> torch.Tensor:
+    """EngramEmbedding.forward from the rows the shim staged for this batch."""
     raw, scale = forward_batch.tpu_engram_staged[embedding.tpu_hash_index]
     return dequant_staged(raw, scale, indices)
 
