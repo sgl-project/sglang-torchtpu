@@ -1,0 +1,86 @@
+{
+  "experiment_id": "exp-9320106a77",
+  "source_commit": "1e9935c863b13653ec19adbb9d3cffb190fe75b5",
+  "scope": "interim loading evidence; not compile attribution or baseline acceptance",
+  "memory_snapshots": [
+    {
+      "falcon_rank": 0,
+      "remote_path": "/tmp/tpu_logs/glm52-torch/rank-0/host-memory.jsonl",
+      "copied_file_sha256": "073f9eb540946157702b5b3c104cee5ece090c74cb286a6a1c03f8b32f23e699",
+      "sample_time_ns": 1794666810423603038,
+      "observer_pid": 605,
+      "root_pids": [
+        1480
+      ],
+      "memory_current_bytes": 307499831296,
+      "memory_peak_bytes": 307500224512,
+      "anon_bytes": 49710600192,
+      "file_bytes": 256279629824,
+      "kernel_bytes": 1481465856,
+      "events": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "tracked_survivor_count": 12,
+      "max_survivor_rss_kib": 7264184,
+      "max_survivor_hwm_kib": 9509872
+    },
+    {
+      "falcon_rank": 1,
+      "remote_path": "/tmp/tpu_logs/glm52-torch/rank-1/host-memory.jsonl",
+      "copied_file_sha256": "bd422c3ab5e393ce148390c48923edde6fe544e440a3e8b7266bd93efdf45e83",
+      "sample_time_ns": 1794667410572502017,
+      "observer_pid": 604,
+      "root_pids": [
+        1426
+      ],
+      "memory_current_bytes": 444078829568,
+      "memory_peak_bytes": 444080992256,
+      "anon_bytes": 51210833920,
+      "file_bytes": 391032512512,
+      "kernel_bytes": 1811496960,
+      "events": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "tracked_survivor_count": 13,
+      "max_survivor_rss_kib": 7551764,
+      "max_survivor_hwm_kib": 9631428
+    }
+  ],
+  "native_progress": [
+    {
+      "falcon_rank": 1,
+      "remote_path": "/tmp/tpu_logs/glm52-torch/rank-1/server.log",
+      "copied_file_sha256": "73af83ef0be9d99a3c260100832084672cecac82fd22c5b804687271b4ee0e80",
+      "last_progress": "Multi-thread loading shards:  81% Completed | 229/282 [36:44<07:29,  8.49s/it]"
+    },
+    {
+      "falcon_rank": 1,
+      "remote_path": "/tmp/tpu_logs/glm52-torch/rank-1/server.log",
+      "copied_file_sha256": "11eebed85544eac1feb4d2074ac67852a5b5a6dc525ada407aebdb1334eef297",
+      "last_progress": "Multi-thread loading shards:  91% Completed | 258/282 [41:00<02:39,  6.65s/it]"
+    },
+    {
+      "falcon_rank": 1,
+      "remote_path": "/tmp/tpu_logs/glm52-torch/rank-1/server.log",
+      "copied_file_sha256": "993ff45a573ad49931f6a84b9db2839a8531cf0ac556b65e661f10bec333375c",
+      "last_progress": "Multi-thread loading shards:  95% Completed | 269/282 [42:40<01:42,  7.87s/it]"
+    }
+  ],
+  "limitations": [
+    "Snapshots are not simultaneous.",
+    "Per-process HWM covers surviving sampled processes only.",
+    "Zero memory.events at this cgroup does not exclude ancestor or host OOM.",
+    "Native progress does not establish every rank position.",
+    "No request output or compile acceptance captured here."
+  ]
+}
