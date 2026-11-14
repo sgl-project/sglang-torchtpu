@@ -1,7 +1,7 @@
 """Model-free compile-only reproduction of exp-9320106a77's VMEM failure.
 
 Run only in the pinned TPU runtime, one process/device. Default reproduces
-H64/T2048/page128, request capacity16, cache pages65 and topk2048. Candidate
+H64/T2048/page128, request capacity1, cache pages65 and topk2048. Candidate
 --query-block 32 --pages-per-step 2 changes the query tile only. Compilation
 success is NOT numerical validation or permission to change production tiles.
 No model checkpoint, Torch distributed group, or Flash path is involved.
@@ -34,12 +34,13 @@ def main():
         spec((65, 128, 4, 128), jnp.uint8),
         spec((65, 32, 4, 128), jnp.uint8),
         spec((2048, 2048), jnp.int32),
-        spec((16,), jnp.int32),
+        spec((1,), jnp.int32),
         # HLO phys operand is s32[17,1,34]. Original pages_per_seq may
         # be33 or34 before alignment to2; choose34 to match this kernel
         # operand and its bitmap width256 (not128).
-        spec((16 * 34,), jnp.int32),
-        spec((17,), jnp.int32),
+        spec((34,), jnp.int32),
+        # 16 tiles + one request gives the HLO's17 scalar visit entries.
+        spec((2,), jnp.int32),
         spec((3,), jnp.int32),
     )
 
