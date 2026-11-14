@@ -234,7 +234,18 @@ Independent static review found no actionable metadata/layout/oracle issue.
 Submitted `exp-boqyjlht0k` / `art-iyn4i6c37i`, source
 `1ba0d458d5f4aee3169cf01afe58a2035b997fbf`, using the same 8-chip peer bootstrap
 identity and no model mount. Query1 and query64 run in fresh processes, each
-bounded to 600s. Hardware outcome pending; no duplicate allocation submitted.
+bounded to 600s. It SUCCEEDED: both hosts passed query1 and query64, each
+with two value-changing calls, including output and whole-cache oracles. Logs
+are `sparse_step_rank0.txt` and `sparse_step_rank1.txt`. This is single-live-key
+evidence, not proof of multi-key scores or the full serving graph.
+
+Full-checkpoint eager experiment `exp-2h7w8l2bga` / `art-vo3x7r5w0m` is now
+submitted with source `ea78ecf2d621fb7f45c66c27b90cb8d49f620ddd`, the existing
+hashed bootstrap identity, and `GLM52_BASELINE_MODE=eager`. It restores the model
+mount, retains 8 physical chips / two hosts and requires 512 input tokens plus
+2 generated IDs. Compile is disabled. Result pending; wait is bounded and no
+duplicate allocation submitted. Do not confuse the diagnostic step passes with
+this full-model acceptance criterion.
 
 ## Padding has two distinct contracts
 
