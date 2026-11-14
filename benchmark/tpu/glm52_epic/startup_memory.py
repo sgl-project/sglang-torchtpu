@@ -2,13 +2,25 @@
 import json
 import os
 from pathlib import Path
+import socket
 import time
 
 
 def collect(proc=Path('/proc'), cgroup=Path('/sys/fs/cgroup'), root_pids=()):
+    root_pids = tuple(int(pid) for pid in root_pids)
     record = {'time_ns': time.time_ns(), 'pid': os.getpid(),
-              'root_pids': [int(pid) for pid in root_pids]}
-    root_pids = {int(pid) for pid in root_pids}
+              'hostname': socket.gethostname(),
+              'falcon_rank': os.environ.get('FALCON_RANK'),
+              'cgroup_read_root': str(cgroup),
+              'root_pids': list(root_pids)}
+    # Record membership without assuming the mounted cgroup root is the task's
+    # leaf. Counters can describe a wider scope; zero local events cannot rule
+    # out ancestor-cgroup or host OOM.
+    try:
+        record['self_cgroup'] = (proc / 'self' / 'cgroup').read_text()
+    except OSError:
+        pass
+    root_pids = set(root_pids)
     descendants = set(root_pids)
     for name in ('memory.current', 'memory.peak', 'memory.max', 'memory.events',
                  'memory.events.local', 'memory.stat'):
