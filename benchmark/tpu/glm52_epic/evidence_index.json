@@ -1,0 +1,25 @@
+{
+  "accepted_short_baseline": {
+    "experiment": "exp-48q9eb5nxn",
+    "source": "99ea485f27de77f820da454fd53ea6cde4123286",
+    "evidence": ["torch_baseline_gate.json", "fixed_smoke_acceptance.json", "fixed_smoke_terminal_memory.json"]
+  },
+  "sparse_diagnostics": {
+    "high_page": ["high_page_rank0.txt", "high_page_rank1.txt"],
+    "retained_prefix": ["prefix_pair_rank0.txt", "prefix_pair_rank1.txt"],
+    "two_request_isolation": ["two_request_rank0.txt", "two_request_rank1.txt"],
+    "scope": "synthetic production-op fallback checks, not full model or performance"
+  },
+  "reference": {
+    "experiment": "exp-266i34jcm1",
+    "evidence": ["jax_reference_admission_verified.json", "reference_jax_result.json"],
+    "scope": "JAX workload/admission reference; not Torch equivalence"
+  },
+  "unresolved": [
+    "historical window_bounds/vmreg-vreg U64 originating IR operation",
+    "historical exit137 killed child and compiler unique host peak",
+    "real Torch 32-request admission/completion equivalence",
+    "matched precision and steady-state performance"
+  ],
+  "guardrails": ["no16chip", "noDCP", "noFlashchanges", "matched gate fail-closed"]
+}
