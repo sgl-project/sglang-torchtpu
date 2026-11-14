@@ -1,0 +1,77 @@
+{
+  "experiment_id": "exp-9320106a77",
+  "falcon_rank": 0,
+  "failure": "sparse_mla_prefill_qblock_tokens VMEM capacity exceeded; not host exit137",
+  "samples": [
+    {
+      "time_utc": "2026-11-14T14:56:00.608597+00:00",
+      "observer_pid": 605,
+      "current_bytes": 500968833024,
+      "peak_bytes": 500970119168,
+      "anon_bytes": 49783685120,
+      "file_bytes": 449234042880,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "max_sampled_survivor_hwm_kib": 9509872
+    },
+    {
+      "time_utc": "2026-11-14T14:56:30.612341+00:00",
+      "observer_pid": 605,
+      "current_bytes": 60625575936,
+      "peak_bytes": 504466227200,
+      "anon_bytes": 54076821504,
+      "file_bytes": 5586726912,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "max_sampled_survivor_hwm_kib": 9509872
+    },
+    {
+      "time_utc": "2026-11-14T14:57:00.617023+00:00",
+      "observer_pid": 605,
+      "current_bytes": 61871267840,
+      "peak_bytes": 504466227200,
+      "anon_bytes": 55328174080,
+      "file_bytes": 5586767872,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "max_sampled_survivor_hwm_kib": 9509872
+    },
+    {
+      "time_utc": "2026-11-14T14:57:30.621484+00:00",
+      "observer_pid": 605,
+      "current_bytes": 62681427968,
+      "peak_bytes": 504466227200,
+      "anon_bytes": 56119406592,
+      "file_bytes": 5587001344,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "max_sampled_survivor_hwm_kib": 9509872
+    },
+    {
+      "time_utc": "2026-11-14T14:58:00.626359+00:00",
+      "observer_pid": 605,
+      "current_bytes": 71842983936,
+      "peak_bytes": 504466227200,
+      "anon_bytes": 65087590400,
+      "file_bytes": 5587042304,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "max_sampled_survivor_hwm_kib": 9509872
+    },
+    {
+      "time_utc": "2026-11-14T14:58:30.632622+00:00",
+      "observer_pid": 605,
+      "current_bytes": 121343598592,
+      "peak_bytes": 504466227200,
+      "anon_bytes": 114455773184,
+      "file_bytes": 5588361216,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "max_sampled_survivor_hwm_kib": 20331932
+    },
+    {
+      "time_utc": "2026-11-14T14:59:00.723869+00:00",
+      "observer_pid": 605,
+      "current_bytes": 30116954112,
+      "peak_bytes": 504466227200,
+      "anon_bytes": 609255424,
+      "file_bytes": 5589131264,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "max_sampled_survivor_hwm_kib": 975596
+    }
+  ]
+}

@@ -126,6 +126,28 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## Terminal compile-smoke result: distinct VMEM failure
+
+exp-9320106a77 terminated FAILED at 14:59:10Z. At 14:58:56Z DP8 reports
+Dynamo BackendCompilerFailed: sparse_mla_prefill_qblock_tokens needs 92.94M
+VMEM versus 63.94M available (29.00M excess). Largest allocations include
+22.38M register spills, 16M f32[8192,512] scratch, 16M each double-buffered
+Q input/output window, and 10M bf16[8192,640] scratch. See
+`compile_smoke_vmem_failure.txt` for original allocation diagnostics.
+This is neither historical window-descriptor/U64 fatal nor host exit137.
+Native launcher returns 1, with scheduler exception then controller EOF;
+EOF alone is not a kill-source diagnosis.
+
+Rank-0 current drops from 466.56 GiB at 14:56:00Z (before cache release)
+to 56.46 GiB at 14:56:30Z, then increases to 113.01 GiB at 14:58:30Z
+before the compile failure. Sampled cgroup OOM counters remain zero; the
+469.82 GiB lifetime peak is dominated by loading, not the compiler sample.
+The compiler growth is temporally associated, not fully per-child attributed;
+30-second sampling can miss transient peaks. Structured samples are in
+`compile_smoke_compiler_memory.json`. No EXTEND completion or smoke output:
+baseline remains unestablished. Next work should reproduce/tile the identified
+qblock kernel locally/minimally rather than repeat the unchanged full model.
+
 ## Confirmed global loading-to-compile boundary
 
 Rank-0 DP8–15 completed loading at 14:56:05–08Z (3061–3064 seconds),
