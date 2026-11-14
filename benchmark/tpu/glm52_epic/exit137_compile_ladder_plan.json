@@ -1,0 +1,33 @@
+{
+  "status": "PLANNED_NOT_SUBMITTED",
+  "purpose": "Separate shape/compiler pressure from checkpoint loading without changing production settings",
+  "common_runtime": {
+    "jax": "0.11.2",
+    "jaxlib": "0.11.2",
+    "libtpu": "0.0.50",
+    "torch_tpu": "0.2.1.dev20261028201649",
+    "tracer": "dynamo",
+    "spmd": false,
+    "checkpoint": false,
+    "fresh_process_per_case": true
+  },
+  "cases": [
+    {"id":"gather_q1_p128","entry":"repro_sparse_gather.py","queries":1,"page_size":128,"backend":"jax","compile_only":true},
+    {"id":"gather_q64_p128","entry":"repro_sparse_gather.py","queries":64,"page_size":128,"backend":"jax","compile_only":true},
+    {"id":"gather_q1_p64","entry":"repro_sparse_gather.py","queries":1,"page_size":64,"backend":"jax","compile_only":true},
+    {"id":"gather_q64_p64","entry":"repro_sparse_gather.py","queries":64,"page_size":64,"backend":"jax","compile_only":true},
+    {"id":"mla_q2048_eager","entry":"repro_sparse_step.py","queries":2048,"selection":"self","entry_mode":"prefill-long-table","dynamo":false},
+    {"id":"mla_q2048_dynamo","entry":"repro_sparse_step.py","queries":2048,"selection":"self","entry_mode":"prefill-long-table","dynamo":true}
+  ],
+  "required_markers": ["RUNTIME", "STAGE allocate", "STAGE", "COMPILE_PASS"],
+  "per_case_evidence": ["wall_time", "exit_code", "native_child_pid", "descendant_rss_hwm", "cgroup_memory_stat", "host_mem_available"],
+  "stop_conditions": ["any case exits137", "OOM or OOM_KILL counter becomes nonzero", "native fatal signature recurs", "compiler child identity cannot be captured"],
+  "interpretation_rules": [
+    "a JAX gather pass does not clear Torch bridge or full MLA attribution",
+    "a synthetic compile pass does not prove checkpoint serving success",
+    "cgroup current is not compiler RSS and summed RSS may double-count shared mappings",
+    "a pass with no native child identity is incomplete for exit137 attribution"
+  ],
+  "safety": "Do not submit until 8-chip capacity is explicitly revalidated; do not modify mmap policy, compiler concurrency, decode buckets, Flash path, 16-chip, or DCP.",
+  "scope": "planning evidence only"
+}
