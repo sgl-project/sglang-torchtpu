@@ -12,10 +12,16 @@
     "exp-x5lwnj2m5x",
     "exp-8ag4xpzkix"
   ],
+  "resolved_diagnostic_scopes": [
+    "481-column static long-table fallback at live KV2048",
+    "high logical pages384-399 with prefix49152 cache writes",
+    "retained prefix position0 plus high-page key joint reads",
+    "two disjoint requests of1024 queries with independent481-page tables and opposite prefix values"
+  ],
   "unresolved": [
     "historical eager window/U64 fatal op attribution",
     "historical exit137 kill source and compiler peak",
-    "matched JAX performance"
+    "matched JAX performance and precision contract"
   ],
   "required_runtime": "torch_tpu==0.2.1.dev20261028201649",
   "public_probe": {
