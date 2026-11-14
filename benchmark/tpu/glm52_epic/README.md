@@ -133,7 +133,7 @@ high-confidence host-compiler-pressure hypothesis rather than a proven HBM OOM.
 ## Current exact-source smoke template
 
 `torch_8chip_current_UNSUBMITTED.yaml` is the only current 8-chip smoke
-starting point. It pins source commit `c93996998e`, runs the checked-in runner
+starting point. It pins the current epic branch source commit, runs the checked-in runner
 from that checkout instead of embedding a base64 copy, and fails before TPU
 initialization when placeholders remain. It is intentionally not submitted:
 replace the cluster, immutable image digest, and allocation hostnames only after
