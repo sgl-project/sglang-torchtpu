@@ -10,5 +10,16 @@
   "scope": "small startup/request/decode baseline only; not matched JAX performance",
   "acceptance": ["native server health200", "512 input token IDs generate exactly2 output IDs without abort", "launcher alive after request", "peer acknowledgment"],
   "coverage_limit": "local chunk ceiling256; HTTP request does not prove qblock runtime dispatch; compile warmup2048 covers a distinct graph",
-  "status": "submitted; terminal evidence pending"
+  "status": "running; terminal evidence pending",
+  "early_native_observation": {
+    "time_utc": "2026-11-14T15:59:14Z to 15:59:17Z",
+    "source": "Falcon stdout memory native_log tails on both hosts",
+    "stage_evidence": "native startup configuration reconciled; no load completion or compile marker in these bounded tails",
+    "rank0_current_gib": 8.53,
+    "rank1_current_gib": 6.51,
+    "effective_local_chunk": 256,
+    "effective_compile_max_bs": 1,
+    "effective_decode_buckets": [1],
+    "additional_native_flags": "enhanced launch barrier; SC all-reduce offload false; associative scan emitter false; original HLO save false; VMEM prefetch max outstanding1"
+  }
 }
