@@ -1097,7 +1097,7 @@ class LayerwiseOffloadManager:
             if current_platform.is_mps()
             else torch.device(
                 current_platform.device_type,
-                torch.get_device_module().current_device(),
+                torch.accelerator.current_device_index(),
             )
         )
         self.copy_stream = (
