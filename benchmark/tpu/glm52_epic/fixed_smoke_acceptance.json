@@ -1,0 +1,190 @@
+{
+  "experiment": "exp-48q9eb5nxn",
+  "falcon_terminal_status": "SUCCEEDED",
+  "terminal_time_utc": "2026-11-14T17:01:22Z",
+  "scope": "accepted full-checkpoint short-input runnable baseline; NOT matched JAX performance or qblock runtime coverage",
+  "hosts": [
+    {
+      "stdout_sha256": "4147c319543524a4ae1a5ca2f4d142af8a385e9d7856d1f23a490768988a0250",
+      "result": {
+        "attention_path_runtime_verified": false,
+        "bootstrap_provenance": {
+          "base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+          "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3",
+          "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c",
+          "got": {
+            "jax": "0.11.2",
+            "jaxlib": "0.11.2",
+            "libtpu": "0.0.50",
+            "torch": "2.11.0+cpu",
+            "torch_tpu": "0.2.1.dev20261028201649",
+            "torchvision": "0.26.0+cpu",
+            "tpu-sync-torch": "0.0.1.dev20261031081414"
+          },
+          "peer_experiment": "exp-bsvzoblh0d",
+          "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00",
+          "peer_task_status": "succeeded",
+          "prepared_wheelhouse": "/prepared/wheelhouse",
+          "schema_version": 1,
+          "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity",
+          "source_commit": "99ea485f27de77f820da454fd53ea6cde4123286",
+          "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git",
+          "want": {
+            "jax": "0.11.2",
+            "jaxlib": "0.11.2",
+            "libtpu": "0.0.50",
+            "torch": "2.11.0",
+            "torch_tpu": "0.2.1.dev20261028201649",
+            "torchvision": "0.26.0",
+            "tpu-sync-torch": "0.0.1.dev20261031081414"
+          },
+          "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+          "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+          "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"
+        },
+        "candidate_sha256": "d5047d90ddd2200fee71be2b2579b609cb33d98142d4dcad798e8c0e60d6cfd6",
+        "configured_local_chunk_ceiling": 256,
+        "coordinate_probe": "/tmp/glm52-peer-rank0.GtCMO7/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS=\"ignore:<TorchTpu/Performance/TcMalloc/\" to suppress this warning.\n  _tcmalloc_check.check_tcmalloc()\nWARNING: All log messages before absl::InitializeLog() is called are written to STDERR\nI0000 00:00:1794671910.953506     626 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank0.GtCMO7/venv/lib/python3.12/site-packages/libtpu/libtpu.so\nI0000 00:00:1794671910.968406     626 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.\n[W1114 15:58:31.265516996 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())\nI0000 00:00:1794671911.598628     626 device_rt.cc:172] PjRt runtime initialization deferred for tpu\nSuccessfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')\nRegistered Python module for 'tpu'.\nDevice type: tpu, Device index: default\nInitializing TPU distributed runtime\nI0000 00:00:1794671911.601363     626 libtpu_version.cc:63] Setting libtpu version to: 0.0.50\nI0000 00:00:1794671913.484884     626 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.\nI0000 00:00:1794671920.167896     626 pjrt_c_api_client.cc:187] PjRtCApiClient created.\nW0000 00:00:1794671920.167942     626 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.\nTORCH_TPU_LOCAL_DEVICE_COORDS=[0, 0, 1]\nI0000 00:00:1794671920.171685     626 compilation_cache.cc:360] Compilation cache evicted.\nI0000 00:00:1794671920.171702     626 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0\nnum_cache_hits=0 {NA}\nnum_compilations=0\npeak_compilation_memory_bytes=unknown",
+        "elapsed_seconds": 3765.482,
+        "expected_attention_path": "per_query_prefill_fallback_expected",
+        "falcon_rank": 0,
+        "generate_input_tokens": 512,
+        "generate_status": 200,
+        "health_status": 200,
+        "image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+        "launcher_shutdown_exit_code": 143,
+        "output_ids": [
+          154820,
+          474
+        ],
+        "request_success_count": 1,
+        "scope": "full-checkpoint short-input compile-smoke smoke; NOT JAX performance",
+        "source_commit": "99ea485f27de77f820da454fd53ea6cde4123286",
+        "status": "SUCCEEDED",
+        "topology": {
+          "chip_topology": "2x2x2",
+          "devices_per_host": 8,
+          "hosts": [
+            "10.228.6.117",
+            "10.228.7.239"
+          ],
+          "native_topology": "2,2,2,2",
+          "physical_chip_nodes": [
+            "/dev/vfio/0",
+            "/dev/vfio/1",
+            "/dev/vfio/2",
+            "/dev/vfio/3",
+            "/dev/vfio/4",
+            "/dev/vfio/5",
+            "/dev/vfio/6",
+            "/dev/vfio/7"
+          ],
+          "physical_chips": 8,
+          "total_devices": 16
+        },
+        "versions": {
+          "jax": "0.11.2",
+          "jaxlib": "0.11.2",
+          "libtpu": "0.0.50",
+          "torch": "2.11.0+cpu",
+          "torch_tpu": "0.2.1.dev20261028201649",
+          "tpu-sync-torch": "0.0.1.dev20261031081414"
+        }
+      },
+      "cleanup_boundary": {
+        "time_ns": 1794675669131290219,
+        "falcon_rank": 0,
+        "status": "SUCCEEDED",
+        "error": null,
+        "launcher_pid": 1478,
+        "launcher_returncode_before_cleanup": null
+      }
+    },
+    {
+      "stdout_sha256": "058339a69b44983fe2561f09c353c4ae76ecea93da9cba2c0a9eaf83fae1bf1b",
+      "result": {
+        "bootstrap_provenance": {
+          "base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+          "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3",
+          "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c",
+          "got": {
+            "jax": "0.11.2",
+            "jaxlib": "0.11.2",
+            "libtpu": "0.0.50",
+            "torch": "2.11.0+cpu",
+            "torch_tpu": "0.2.1.dev20261028201649",
+            "torchvision": "0.26.0+cpu",
+            "tpu-sync-torch": "0.0.1.dev20261031081414"
+          },
+          "peer_experiment": "exp-bsvzoblh0d",
+          "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00",
+          "peer_task_status": "succeeded",
+          "prepared_wheelhouse": "/prepared/wheelhouse",
+          "schema_version": 1,
+          "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity",
+          "source_commit": "99ea485f27de77f820da454fd53ea6cde4123286",
+          "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git",
+          "want": {
+            "jax": "0.11.2",
+            "jaxlib": "0.11.2",
+            "libtpu": "0.0.50",
+            "torch": "2.11.0",
+            "torch_tpu": "0.2.1.dev20261028201649",
+            "torchvision": "0.26.0",
+            "tpu-sync-torch": "0.0.1.dev20261031081414"
+          },
+          "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+          "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+          "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"
+        },
+        "candidate_sha256": "d5047d90ddd2200fee71be2b2579b609cb33d98142d4dcad798e8c0e60d6cfd6",
+        "coordinate_probe": "/tmp/glm52-peer-rank1.NsNR43/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS=\"ignore:<TorchTpu/Performance/TcMalloc/\" to suppress this warning.\n  _tcmalloc_check.check_tcmalloc()\nWARNING: All log messages before absl::InitializeLog() is called are written to STDERR\nI0000 00:00:1794671912.101344     629 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.NsNR43/venv/lib/python3.12/site-packages/libtpu/libtpu.so\nI0000 00:00:1794671912.116659     629 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.\n[W1114 15:58:32.100030216 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())\nI0000 00:00:1794671912.797758     629 device_rt.cc:172] PjRt runtime initialization deferred for tpu\nSuccessfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')\nRegistered Python module for 'tpu'.\nDevice type: tpu, Device index: default\nInitializing TPU distributed runtime\nI0000 00:00:1794671912.801461     629 libtpu_version.cc:63] Setting libtpu version to: 0.0.50\nI0000 00:00:1794671914.737526     629 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.\nI0000 00:00:1794671920.009457     629 pjrt_c_api_client.cc:187] PjRtCApiClient created.\nW0000 00:00:1794671920.009515     629 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.\nTORCH_TPU_LOCAL_DEVICE_COORDS=[0, 0, 0]\nI0000 00:00:1794671920.013258     629 compilation_cache.cc:360] Compilation cache evicted.\nI0000 00:00:1794671920.013272     629 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0\nnum_cache_hits=0 {NA}\nnum_compilations=0\npeak_compilation_memory_bytes=unknown",
+        "elapsed_seconds": 3765.295,
+        "falcon_rank": 1,
+        "image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+        "launcher_shutdown_exit_code": 143,
+        "rank0_smoke_acknowledged": true,
+        "scope": "full-checkpoint short-input compile-smoke smoke; NOT JAX performance",
+        "source_commit": "99ea485f27de77f820da454fd53ea6cde4123286",
+        "status": "SUCCEEDED",
+        "topology": {
+          "chip_topology": "2x2x2",
+          "devices_per_host": 8,
+          "hosts": [
+            "10.228.6.117",
+            "10.228.7.239"
+          ],
+          "native_topology": "2,2,2,2",
+          "physical_chip_nodes": [
+            "/dev/vfio/0",
+            "/dev/vfio/1",
+            "/dev/vfio/2",
+            "/dev/vfio/3",
+            "/dev/vfio/4",
+            "/dev/vfio/5",
+            "/dev/vfio/6",
+            "/dev/vfio/7"
+          ],
+          "physical_chips": 8,
+          "total_devices": 16
+        },
+        "versions": {
+          "jax": "0.11.2",
+          "jaxlib": "0.11.2",
+          "libtpu": "0.0.50",
+          "torch": "2.11.0+cpu",
+          "torch_tpu": "0.2.1.dev20261028201649",
+          "tpu-sync-torch": "0.0.1.dev20261031081414"
+        }
+      },
+      "cleanup_boundary": {
+        "time_ns": 1794675669053185791,
+        "falcon_rank": 1,
+        "status": "SUCCEEDED",
+        "error": null,
+        "launcher_pid": 1429,
+        "launcher_returncode_before_cleanup": null
+      }
+    }
+  ]
+}
