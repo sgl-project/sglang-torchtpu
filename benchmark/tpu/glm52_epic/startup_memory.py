@@ -29,7 +29,7 @@ def log_snapshot(path, max_bytes=4096):
 
 def _cmdline(pid_path):
     try:
-        return (pid_path / 'cmdline').read_bytes().replace(b'\\x00', b' ').decode('utf-8', errors='replace').strip()
+        return (pid_path / 'cmdline').read_bytes().replace(b'\x00', b' ').decode('utf-8', errors='replace').strip()
     except OSError:
         return None
 
