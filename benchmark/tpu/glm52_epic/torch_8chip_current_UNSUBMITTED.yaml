@@ -6,7 +6,7 @@ name: glm52-torch-8chip-current-UNSUBMITTED
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: USER_REVALIDATE_CLUSTER
-config: '{"status":"UNSUBMITTED","scope":"GLM52 short-input eager qblock smoke; no performance claim","source_commit":"b43882eae69be264a4e6232057605802960925fd","runner":"benchmark/tpu/glm52_epic/torch_8chip_runner.sh","baseline_mode":"eager","physical_chips":8,"hosts":2,"framework_devices":16}'
+config: '{"status":"UNSUBMITTED","scope":"GLM52 short-input eager qblock smoke; no performance claim","source_commit":"ccac235724d3f0b6ca7f0bfed0a26fc6eb6fd7f4","runner":"benchmark/tpu/glm52_epic/torch_8chip_runner.sh","baseline_mode":"eager","physical_chips":8,"hosts":2,"framework_devices":16}'
 role_to_task_spec:
   worker:
     replica: 2
@@ -17,8 +17,8 @@ role_to_task_spec:
     image: USER_PROVIDED_IMMUTABLE_IMAGE@sha256:REPLACE_64_HEX_DIGEST
     envs:
       GLM52_IMAGE: USER_PROVIDED_IMMUTABLE_IMAGE@sha256:REPLACE_64_HEX_DIGEST
-      SOURCE_COMMIT: b43882eae69be264a4e6232057605802960925fd
-      SOURCE_SHA: b43882eae69be264a4e6232057605802960925fd
+      SOURCE_COMMIT: ccac235724d3f0b6ca7f0bfed0a26fc6eb6fd7f4
+      SOURCE_SHA: ccac235724d3f0b6ca7f0bfed0a26fc6eb6fd7f4
       GLM52_BASELINE_MODE: eager
       TPU_TOPOLOGY: 2x2x2
       TPU_WORKER_HOSTNAMES: USER_RANK0_HOST,USER_RANK1_HOST
@@ -30,7 +30,7 @@ role_to_task_spec:
         type: git
         repo: https://github.com/sgl-project/sglang-torchtpu.git
         ref: epic/glm52-channelwise-port-20261113
-        commit: b43882eae69be264a4e6232057605802960925fd
+        commit: ccac235724d3f0b6ca7f0bfed0a26fc6eb6fd7f4
         path: /workspace/sglang-torchtpu
     mounts:
       - name: glm52-channelwise-model
@@ -54,5 +54,5 @@ role_to_task_spec:
       set -eu
       ulimit -c 0
       cd /workspace/sglang-torchtpu
-      test "$(git rev-parse HEAD)" = b43882eae69be264a4e6232057605802960925fd
+      test "$(git rev-parse HEAD)" = ccac235724d3f0b6ca7f0bfed0a26fc6eb6fd7f4
       exec bash benchmark/tpu/glm52_epic/torch_8chip_runner.sh
