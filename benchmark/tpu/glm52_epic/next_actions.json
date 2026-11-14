@@ -5,7 +5,7 @@
     "short full-checkpoint two-host Torch baseline accepted",
     "static long-table/high-page/retained-prefix/two-request synthetic sparse MLA diagnostics passed on both hosts",
     "JAX reference DP mapping and paused admission inventory verified",
-    "fail-closed scheduler barrier/inventory/observer prototypes and stdlib tests",
+    "fail-closed scheduler barrier/inventory/observer prototypes and stdlib tests, including 16-rank summarizer selftest",
     "exit137 memory sampler retains descendant command lines",
     "compile ladder planned but capacity-gated and not submitted"
   ],
