@@ -27,6 +27,7 @@ CONFIG["server_args"].update(
         "attention_backend": "dsv4",
         "page_size": 256,
         "kv_cache_dtype": "bfloat16",
+        "context_length": 103424,
         # Global values, divided by attn_dp_size (8): 64 requests and 4096
         # prefill tokens per worker.
         "max_running_requests": 512,
