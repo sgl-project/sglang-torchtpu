@@ -50,6 +50,12 @@ claiming equivalent memory use or dispatch. Current Torch attention arithmetic
 is not private FP8 Q/P. No private HLO pass or Flash-specific optimization flag
 is enabled here.
 
+The checked-in `torch_8chip_UNSUBMITTED.yaml` contains an older inline base64
+runner payload and older source SHA; its header explicitly says it must not be
+submitted unchanged. Before any future allocation, regenerate that payload from
+the current reviewed `torch_8chip_runner.sh` and pin the current commit. Do not
+treat the YAML's embedded runner hash as current evidence.
+
 After checkpoint compatibility and native startup are resolved, run on each host
 with explicit `NODE_RANK=0/1`, `RANK0_HOST`, and `DIST_INIT_ADDR`, using the current
 native launcher's JSON config support:
