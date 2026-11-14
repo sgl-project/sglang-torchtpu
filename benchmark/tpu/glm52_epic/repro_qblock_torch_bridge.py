@@ -10,7 +10,7 @@ import os
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--query-block', type=int, choices=(32, 128), required=True)
-    parser.add_argument('--oracle', choices=('zero', 'self', 'causal-mean'), default='zero')
+    parser.add_argument('--oracle', choices=('zero', 'self', 'causal-mean', 'mixed-self'), default='zero')
     args = parser.parse_args()
     os.environ['JAX_PLATFORMS'] = 'cpu'
     import torch
@@ -52,6 +52,16 @@ def main():
         expected_rows = ((row % 8 + 1).float() / 8) * torch.where(channel % 2 == 0, 1, -1)
         encoded = expected_rows.to(torch.float8_e4m3fn).view(torch.uint8)
         cache_cpu[1:17] = encoded.reshape(16, 128, 512)
+    if args.oracle == 'mixed-self':
+        # Requests [0,17), [17,164): both visit tile0 at qb32. The second
+        # request owns separate pages and starts its key positions at zero.
+        # Remaining1884 rows are batch padding, not additional requests.
+        cache_cpu.zero_()
+        encoded = expected_rows.to(torch.float8_e4m3fn).view(torch.uint8)
+        cache_cpu[1, :17] = encoded[:17]
+        cache_cpu[34, :128] = encoded[17:145]
+        cache_cpu[35, :19] = encoded[145:164]
+        expected_rows[164:] = 0
     cn = cache_cpu.reshape(65, 128, 4, 128).to('tpu')
     cr = torch.zeros((65, 32, 4, 128), dtype=torch.uint8, device='tpu')
     topk = torch.full((2048, 2048), -1, dtype=torch.int32)
@@ -62,12 +72,23 @@ def main():
         for row in range(2048):
             topk[row, :row + 1] = torch.arange(row + 1, dtype=torch.int32)
         expected_rows = expected_rows.cumsum(dim=0) / torch.arange(1, 2049)[:, None]
-    values = [x.to('tpu') for x in (
-        topk, torch.tensor([2048], dtype=torch.int32),
-        torch.arange(1, 34, dtype=torch.int32),
-        torch.tensor([0, 2048], dtype=torch.int32),
-        torch.tensor([0, 0, 1], dtype=torch.int32),
-    )]
+    lens = torch.tensor([2048], dtype=torch.int32)
+    pages = torch.arange(1, 34, dtype=torch.int32)
+    cu = torch.tensor([0, 2048], dtype=torch.int32)
+    distribution = torch.tensor([0, 0, 1], dtype=torch.int32)
+    if args.oracle == 'mixed-self':
+        topk.fill_(-1)
+        topk[:17, 0] = torch.arange(17, dtype=torch.int32)
+        topk[17:164, 0] = torch.arange(147, dtype=torch.int32)
+        lens = torch.tensor([17, 147], dtype=torch.int32)
+        # Non-live page table entries are still legal physical pages; only
+        # pages1,34,35 are read by the two live sequences.
+        pages = torch.cat((torch.arange(1, 34, dtype=torch.int32),
+                           torch.full((33,), 36, dtype=torch.int32)))
+        pages[33:35] = torch.tensor([34, 35], dtype=torch.int32)
+        cu = torch.tensor([0, 17, 164], dtype=torch.int32)
+        distribution = torch.tensor([0, 0, 2], dtype=torch.int32)
+    values = [x.to('tpu') for x in (topk, lens, pages, cu, distribution)]
     with torch.no_grad(), tpu_info_for_cpu_export():
         out = kernel(q, qr, cn, cr, *values).cpu()
     assert out.shape == (64, 2048, 512)
