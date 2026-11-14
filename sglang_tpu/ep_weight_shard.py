@@ -260,7 +260,8 @@ class EPShardedRunaiModelStreamerLoader(RunaiModelStreamerLoader):
                 exc,
             )
             return None
-        if len(files) != len(set(weight_map.values())):
+        index_shards = {PurePosixPath(shard).name for shard in weight_map.values()}
+        if any(Path(path).name not in index_shards for path in files):
             # maybe_add_mtp_safetensors added a shard the index does not name;
             # its tensors are absent from the plan, so keep the stock stream.
             logger.info(
