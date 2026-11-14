@@ -16,7 +16,9 @@ def main():
     parser.add_argument('--selection', choices=('self', 'causal-mean'), default='self',
                         help='Single key, or causal keys with zero queries and uniform weights.')
     parser.add_argument('--entry', choices=('per-query', 'prefill-fallback', 'prefill-qblock'), default='per-query',
-                        help='Token-major op or head-major prefill wrapper below q-block threshold.')
+                        help='Token-major op, small head-major fallback, or2048-token fused qblock.')
+    parser.add_argument('--dynamo', action='store_true',
+                        help='Compile the production op fullgraph with backend=tpu, static shapes.')
     args = parser.parse_args()
     if (args.entry == 'prefill-qblock') != (args.queries == 2048):
         parser.error('prefill-qblock requires queries2048; other entries retain small probes')
@@ -65,6 +67,11 @@ def main():
         q = q.transpose(0, 1).contiguous()
         qr = qr.transpose(0, 1).contiguous()
     op = _build_pallas_sparse_mla_kernel_op(qblock_kpool=1 if head_major else 0)
+    if args.dynamo:
+        # Same backend registration import as the plugin's startup path.
+        import torch_tpu._internal.compile  # noqa: F401
+        op = torch.compile(op, backend='tpu', fullgraph=True, dynamic=False)
+        print('PRODUCTION_SPARSE_DYNAMO_ENABLED fullgraph=True dynamic=False', flush=True)
     for iteration, sign in enumerate((1, -1)):
         # Exactly representable FP8 dyadics. Self selection returns that value;
         # zero-query causal selection returns the prefix's uniform mean.
