@@ -16,7 +16,7 @@ page table ``req_to_token[req, ::256] // 256``, the SWA page table through
 on group-completing tokens (core ``_low_ratio_compression_metadata``) and the
 indexer page table from core ``expand_index_page_table``. The ratio-2 compressor
 ports core ``_low_ratio_pair_partners`` on the pool's request-scoped pair state,
-with the ring write as a functional update copied back (as the Engram history fix).
+with the ring write through the donated ``csa2_ops.write_rows``.
 
 Padding tokens (``out_cache_loc == 0`` or past the batch's real tokens) never write
 a cache (record -1) and produce zeros.
@@ -594,13 +594,11 @@ class DSV41TPUAttnBackend(AttentionBackend):
         return pooled, torch.where(pos % 2 == 1, pos - 1, pos)
 
     def _pair_partners(self, *, layer_id, kv, score, req, pos, pad):
-        """Core ``_low_ratio_pair_partners`` with the ring write as a functional
-        update copied back into the pool buffer.
+        """Core ``_low_ratio_pair_partners``, writing the ring through the
+        donated ``write_rows`` op after every read of the old ring.
 
-        Core writes ``kv_score_buffer[state_loc] = value`` in place; inside the
-        compiled TPU graph that indexed assignment is the pattern the Engram
-        history fix found not written back (84c46f2eaf), which would leave an
-        odd token pooling with a stale partner. Reads all precede the write."""
+        Core's in-place ``kv_score_buffer[state_loc] = value`` is not written
+        back in the compiled TPU graph (84c46f2eaf)."""
         state = self.token_to_kv_pool.get_attention_compress_states(layer_id)
         ring = state.ring_size
         num_tokens = pos.shape[0]
@@ -621,27 +619,15 @@ class DSV41TPUAttnBackend(AttentionBackend):
         )
 
         # Keep only a request's last ring_size rows so each write hits a distinct
-        # live slot; dropped and padding rows land on the scratch row -1.
+        # live slot; dropped and padding rows skip the write.
         keep = ~pad
         if num_tokens > ring:
             keep[:-ring] &= (req[:-ring] != req[ring:]) | pad[ring:]
         write_pos = pos.masked_fill(~keep, -1)
         slots = state.translate_from_req_position_to_state_loc(req, write_pos)
         buffer = state.kv_score_buffer.kv_score
-        slots = torch.where(slots < 0, buffer.shape[0] - 1, slots).to(torch.int64)
-        values = torch.cat([kv, score], dim=-1).to(buffer.dtype)
-        updated = buffer.index_put((slots,), values)
-        # Row -1 reads as an empty partner: kv 0, score -inf (core clear()).
-        half = buffer.shape[-1] // 2
-        empty = torch.cat(
-            [
-                buffer.new_zeros(1, half),
-                buffer.new_full((1, half), float("-inf")),
-            ],
-            dim=-1,
-        )
-        updated = torch.cat([updated[:-1], empty], dim=0)
-        buffer.copy_(updated)
+        values = torch.cat([kv, score], dim=-1)
+        buffer.copy_(self.csa2_ops.write_rows(buffer, slots, values, carried.kv_score))
         return partner_kv, partner_score
 
     def _select(self, *, layer, x, q_lora, metadata) -> None:

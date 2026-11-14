@@ -91,6 +91,15 @@ def _publish_main(
     return publish_csa2_kv(words, scales, records, encoded, encoded_scales)
 
 
+def _write_rows(
+    rows: jax.Array, slots: jax.Array, values: jax.Array, after: jax.Array
+) -> jax.Array:
+    # Finish reading the old rows first; otherwise XLA copies the whole buffer.
+    rows, _ = jax.lax.optimization_barrier((rows, after))
+    slots = jnp.where(slots >= 0, slots, rows.shape[0])
+    return rows.at[slots].set(values.astype(rows.dtype), mode="drop")
+
+
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
     """CSA2's ``[T, 2, 128]`` rotation of the output's last 128 features.
 
@@ -221,6 +230,10 @@ def _fake_publish_main(words, scales, records, latent):
     return torch.empty_like(words), torch.empty_like(scales)
 
 
+def _fake_write_rows(rows, *args):
+    return torch.empty_like(rows)
+
+
 def _fake_attend(q, *args):
     return torch.empty_like(q)
 
@@ -230,6 +243,7 @@ _DEFINITIONS = {
     "swa_metadata": (_swa_metadata, _fake_swa_metadata, ()),
     "publish_swa": (_publish_swa, _fake_publish_swa, (0,)),
     "publish_main": (_publish_main, _fake_publish_main, (0, 1)),
+    "write_rows": (_write_rows, _fake_write_rows, (0,)),
     "attend_swa": (_attend_swa, _fake_attend, ()),
     "attend_main": (_attend_main, _fake_attend, ()),
 }
@@ -313,6 +327,17 @@ def publish_main(
     valid records must be unique. Returns the new ``(words, scales)``.
     """
     return _op("publish_main")(words, scales, _i32(records), latent)
+
+
+def write_rows(
+    rows: torch.Tensor, slots: torch.Tensor, values: torch.Tensor, after: torch.Tensor
+) -> torch.Tensor:
+    """Write ``values`` [N, D] at row ``slots`` [N] of ``rows`` [R, D]; -1 skips.
+
+    ``after`` holds rows already read from ``rows``; those reads finish first.
+    Returns the new ``rows``; the caller does ``rows.copy_(...)``.
+    """
+    return _op("write_rows")(rows, _i32(slots), values, after)
 
 
 def attention(

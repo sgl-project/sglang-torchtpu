@@ -28,14 +28,14 @@ CONFIG["server_args"].update(
         "page_size": 256,
         "kv_cache_dtype": "bfloat16",
         "context_length": 103424,
-        # Global values, divided by attn_dp_size (8): 64 requests and 4096
+        # Global values, divided by attn_dp_size (8): 64 requests and 2048
         # prefill tokens per worker.
         "max_running_requests": 512,
-        "chunked_prefill_size": 32768,
-        "max_prefill_tokens": 4096,
+        "chunked_prefill_size": 16384,
+        "max_prefill_tokens": 2048,
         "mem_fraction_static": 0.85,
         "enable_torch_compile": True,
-        "tpu_compile_tokens": [512, 1024, 2048, 4096],
+        "tpu_compile_tokens": [512, 1024, 2048],
         # bs 1 decode returns NaN logits after the first token.
         "tpu_compile_bs": [8, 16, 32, 64],
         "torch_compile_max_bs": 64,
