@@ -19,7 +19,13 @@ case "${GLM52_QBLOCK_COMPILE_MODE:-eager}" in
   dynamo) compile_args=(--dynamo) ;;
   *) echo 'Unsupported compile mode' >&2; exit 2 ;;
 esac
-for selection in self causal-mean; do
+selections=(self causal-mean)
+case "${GLM52_QBLOCK_FUSED_SUITE:-standard}" in
+  standard) ;;
+  rope) selections=(rope-pair) ;;
+  *) echo 'Unsupported fused suite' >&2; exit 2 ;;
+esac
+for selection in "${selections[@]}"; do
   timeout --signal=TERM --kill-after=15s 400s python -m benchmark.tpu.glm52_epic.repro_sparse_step \
     --queries 2048 --entry prefill-qblock --selection "$selection" "${compile_args[@]}" 2>&1 | tee "$OUT/$selection.log"
   python - "$OUT/$selection.log" "$selection" "${GLM52_QBLOCK_COMPILE_MODE:-eager}" <<'PY'

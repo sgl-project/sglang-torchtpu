@@ -126,6 +126,16 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## Static Dynamo fused custom-op gates passed
+
+exp-x5lwnj2m5x (eda6a557ab), SUCCEEDED15:50:04Z. Both hosts show two
+Dynamo-enabled markers (fullgraph=True,dynamic=False,backend=tpu) and pass
+self/causal-mean iteration0/1 output and entire cache byte comparisons.
+Evidence: qblock_dynamo_rank0.txt/rank1.txt. This closes the isolated compiled
+production custom-op gate with cache reuse; not the complete model's Dynamo
+EXTEND graph/rank concurrency or decode. Nonuniform RoPE pair remains the
+last proposed local numerical check before a model-mounted smoke retry.
+
 ## Production fused cache-write/donation oracle passed
 
 exp-9d46tguhmn (72dffcd100), SUCCEEDED15:44:57Z. Both pods pass self and
