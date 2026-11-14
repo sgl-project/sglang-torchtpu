@@ -12,9 +12,11 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--queries', type=int, choices=(1, 64), default=1)
+    parser.add_argument('--queries', type=int, choices=(1, 4, 64), default=1)
     parser.add_argument('--selection', choices=('self', 'causal-mean'), default='self',
                         help='Single key, or causal keys with zero queries and uniform weights.')
+    parser.add_argument('--entry', choices=('per-query', 'prefill-fallback'), default='per-query',
+                        help='Token-major op or head-major prefill wrapper below q-block threshold.')
     args = parser.parse_args()
     if 'jax' in sys.modules:
         raise RuntimeError('fresh process required')
@@ -50,10 +52,15 @@ def main():
     else:
         for row in range(t):
             topk[row, :row + 1] = np.arange(row + 1)
+    head_major = args.entry == 'prefill-fallback'
+    distribution = [1, 1, 1] if t == 1 and not head_major else [0, 0, 1]
     metadata = [upload(np.array(a, np.int32)) for a in (
-        [t], [1], [0, t], [0, p], [1, 1, 1] if t == 1 else [0, 0, 1])]
+        [t], [1], [0, t], [0, p], distribution)]
     topk_tensor = upload(topk)
-    op = _build_pallas_sparse_mla_kernel_op(qblock_kpool=0)
+    if head_major:
+        q = q.transpose(0, 1).contiguous()
+        qr = qr.transpose(0, 1).contiguous()
+    op = _build_pallas_sparse_mla_kernel_op(qblock_kpool=1 if head_major else 0)
     for iteration, sign in enumerate((1, -1)):
         # Exactly representable FP8 dyadics. Self selection returns that value;
         # zero-query causal selection returns the prefix's uniform mean.
@@ -67,6 +74,8 @@ def main():
         with torch.no_grad():
             out = op(q, qr, vn, vr, cn, cr, *metadata,
                      1 / 16, 1.0, 1.0, topk_tensor)
+            if head_major:
+                out = out.transpose(0, 1)
             actual = out.cpu().float().numpy()
             actual_cn = cn.cpu().numpy()
             actual_cr = cr.cpu().numpy()
@@ -83,7 +92,7 @@ def main():
         expected_cr[1, :t, :64] = vr_cpu.view(torch.uint8).numpy()
         np.testing.assert_array_equal(actual_cn.reshape(2, p, 512), expected_cn)
         np.testing.assert_array_equal(actual_cr.reshape(2, p, 128), expected_cr)
-        print(f'PRODUCTION_SPARSE_STEP_PASS iteration={iteration} queries={t} selection={args.selection}', flush=True)
+        print(f'PRODUCTION_SPARSE_STEP_PASS iteration={iteration} queries={t} selection={args.selection} entry={args.entry}', flush=True)
 
 
 if __name__ == '__main__':
