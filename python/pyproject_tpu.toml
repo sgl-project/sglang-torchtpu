@@ -74,7 +74,7 @@ dependencies = [
   # The pins below form one TPU stack and must be upgraded and validated
   # together:
   # - torch_tpu and torch must be ABI compatible.
-  # - torch and torchvision must be ABI compatible.
+  # - torch, torchvision and torchaudio must be ABI compatible.
   # - torch_tpu and libtpu must be validated together.
   # - jax and jaxlib must be compatible with libtpu.
   # - tpu-sync-torch's native extension links torch_tpu's per-torch-version
@@ -91,6 +91,7 @@ dependencies = [
   "libtpu==0.0.50",
   "torch==2.11.0",
   "torchvision==0.26.0",
+  "torchaudio==2.11.0",
   "jax==0.11.2",
   "jaxlib==0.11.2",
 ]
@@ -131,7 +132,7 @@ test = [
 ]
 
 # Mirrors srt_npu / all_npu / dev_npu shape. All TPU stack pins (torch_tpu,
-# libtpu, torch, torchvision, jax, jaxlib) live in `dependencies`.
+# libtpu, torch, torchvision, torchaudio, jax, jaxlib) live in `dependencies`.
 srt_tpu = []
 all_tpu = []
 # The `diffusion` extra minus CUDA-only kernels and model-specific tooling;
@@ -224,6 +225,7 @@ explicit = true
 torch-tpu = { index = "torch-tpu-registry" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
 
 [[tool.uv.index]]
 name = "torch-tpu-registry"
