@@ -1501,14 +1501,21 @@ class TpuSRTPlatform(SRTPlatform):
     def get_batch_input_device(self, batch) -> str | None:
         """Keep eligible prefill inputs on CPU until backend padding."""
         from sglang.srt.layers.cp.base import get_cp_strategy
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.utils.common import print_warning_once
         from sglang_tpu.allocator_tpu import host_return_allocators
         from sglang_tpu.host_padding import _can_stage_forward_metadata
 
         # TBO, hisparse and beam search have no TPU path, so they need no opt-out.
         allocator = batch.token_to_kv_pool_allocator
+        # Pipeline stages pad prefill to the same buckets, so host-pad it too. A
+        # PD decode server's prebuilt first token keeps the device placement.
+        staged = _can_stage_forward_metadata(batch) or (
+            _can_stage_forward_metadata(batch, allow_pipeline_parallel=True)
+            and batch.forward_mode == ForwardMode.EXTEND
+        )
         checks = (
-            ("forward metadata is not staged", _can_stage_forward_metadata(batch)),
+            ("forward metadata is not staged", staged),
             ("context parallelism is on", get_cp_strategy() is None),
             ("the allocator returns device indices", host_return_allocators(allocator)),
             # Page size 1 uses alloc(), which has no host-return contract.
