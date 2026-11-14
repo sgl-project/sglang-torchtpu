@@ -5,8 +5,7 @@ With expert parallelism every rank keeps ``num_experts / ep_size`` of the
 routed experts, but ``RunaiModelStreamerLoader`` fetches every expert tensor
 on every rank. This loader rebuilds the fetch plan from the safetensors index
 and hands Run:AI only the kept tensor names, so the skipped byte ranges are
-never requested from storage. It mirrors the EP-sharded streaming added to
-vllm-torchtpu in PR #373.
+never requested from storage.
 
 The filter is conservative: a tensor is skipped only when its name carries a
 numeric ``experts.<id>`` segment, ends in a per-expert weight or scale suffix,
@@ -25,7 +24,8 @@ Hook header (AFTER ``get_model_loader``):
        ``EPShardedRunaiModelStreamerLoader`` on Run:AI loads when EP is on,
        experts are placed contiguously, and the checkpoint index names them.
        ``SGLANG_TPU_EP_SHARDED_WEIGHT_LOAD=0`` keeps the stock stream.
-  Upstream PR or issue: not filed; vllm-torchtpu PR #373 is the reference.
+  Upstream PR or issue: not filed (plugin-only loader; SGLang core has no EP
+       weight filter).
   Remove when: upstream SGLang's ``RunaiModelStreamerLoader`` accepts an EP
        weight filter.
 """
