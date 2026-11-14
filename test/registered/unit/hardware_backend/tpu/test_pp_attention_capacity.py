@@ -65,7 +65,7 @@ class TestHbmScheduleCapacity(CustomTestCase):
         cfg = NS(
             max_steps_ub=128,
             max_schedule_size_multiplier=16,
-            block=NS(n_buffer=3, batch_size=1, bq_sz=256, bkv_sz=512),
+            block=NS(batch_size=1, bq_sz=256, bkv_sz=512),
         )
         self.assertEqual(capacity._capacity_from_config(cfg, 64, 256), (2044, 256, 512))
 
@@ -73,7 +73,7 @@ class TestHbmScheduleCapacity(CustomTestCase):
         cfg = NS(
             max_steps_ub=128,
             max_schedule_size_multiplier=16,
-            block=NS(n_buffer=3, batch_size=4, bq_sz=1, bkv_sz=512),
+            block=NS(batch_size=4, bq_sz=1, bkv_sz=512),
         )
         self.assertEqual(capacity._capacity_from_config(cfg, 65, 256), (8044, 1, 512))
 
