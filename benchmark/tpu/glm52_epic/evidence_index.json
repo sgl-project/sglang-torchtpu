@@ -12,7 +12,7 @@
   },
   "reference": {
     "experiment": "exp-266i34jcm1",
-    "evidence": ["jax_reference_admission_verified.json", "reference_jax_result.json"],
+    "evidence": ["jax_reference_admission_verified.json", "jax_reference_8chip_result.json"],
     "scope": "JAX workload/admission reference; not Torch equivalence"
   },
   "unresolved": [
