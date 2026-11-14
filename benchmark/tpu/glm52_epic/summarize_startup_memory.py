@@ -46,7 +46,7 @@ def summarize(text):
             'native_log': row.get('native_log'),
         }
         groups.setdefault(key, []).append(sample)
-    return {'scope': 'sampled usage only; cgroup cache is not compiler RSS; exited children/transient peaks may be missed',
+    return {'scope': 'sampled usage only; cgroup cache is not compiler RSS; summed process RSS can double-count shared mappings and is not physical usage; exited children/transient peaks may be missed',
             'hosts': [{'hostname': key[0], 'falcon_rank': key[1], 'observer_pid': key[2],
                        'samples': sorted(rows, key=lambda r: r['time_utc'])}
                       for key, rows in groups.items()]}
