@@ -126,6 +126,22 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## Historical exit137 decode attribution tightened
+
+Original durable log exit137_native_output.txt:864–873 reports EXTEND complete
+at01:36:31Z and DECODE six variants [1,2,4,8,16,32], then progress0/6.
+Controller EOF is01:37:23Z (~52s later), with no completed decode variant.
+Current decoder_compile_policy.py:1588–1615 iterates compile_items serially,
+calling _run_one before moving to the next. For verified Dynamo config the
+direct async path is unavailable. Thus six configured buckets do NOT prove
+six concurrent bucket compiles; first bs1 decode is the earliest unfinished
+item, though native/rank concurrency and unlogged progress remain possible.
+Current logits-mode helper can multiply variants, but original log explicitly
+says6, so do not retroactively double that historical count. Native compiler
+subprocess concurrency and kill source still lack direct attribution. A small
+smoke success would not establish that bucket reduction alone fixed exit137,
+since context/cache/page/EXTEND batch shape also differ from history.
+
 ## Nonuniform RoPE weighting gate passed; ready for model smoke
 
 exp-8ag4xpzkix (ff015ef4d9), SUCCEEDED15:54:29Z. Both hosts show static
