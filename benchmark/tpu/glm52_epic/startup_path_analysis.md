@@ -42,6 +42,20 @@ repeat_interleave/index_put_ helper. This synchronous read can surface an earlie
 asynchronous compiler failure; it does NOT identify D2H as its cause. Do not
 launch the device-table draft as a current fatal gate; no hardware was spent.
 
+## Local TPU distributed probe outcome
+
+The corrected standalone local probe exp-p2624l9hla (source
+3c5b0ee805) did not reach the Python boundary probe. Discovery validated one
+host, eight localhost slice-builder addresses, WORLD_SIZE=8 and topology
+2,2,1,2. However, all eight torchrun children blocked during
+`torch_tpu::ProcessGroupTpu -> PjrtBackend::GetClient -> PJRT_Client_Create`.
+The per-case 240s timeout sent SIGTERM; there were no BOUNDARY/STAGE/pass
+markers. This is a TPU distributed/PJRT initialization hang under this
+launcher setup, not evidence about all_reduce, sparse MLA, allocator transfer,
+or the historical XLA lowering fatal. The earlier exp-a77tly0f0f and
+exp-vdlzc92azo outer exit0 logs lacked child markers and are not acceptance
+runs. Do not retry this same local launcher unchanged.
+
 ## Distributed stack interpretation: CPU control broadcast is not TPU HLO
 
 The repeated request_receiver.py:200 -> broadcast_pyobj:2816 frames are the
