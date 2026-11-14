@@ -508,6 +508,7 @@ def alloc_for_extend(
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
+    out_cache_loc_host = None
     if reuse_kv is not None and any(reuse_kv):
         out_cache_loc = _alloc_extend_loc_with_kv_reuse(
             batch,
@@ -528,6 +529,12 @@ def alloc_for_extend(
             (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=_last_loc_dev))
             for t in prefix_tensors
         ]
+        if batch.req_to_token_pool.host_resident:
+            # The allocator also fills out_cache_loc_host for the req_to_token
+            # write, so neither it nor the SWA mapping reads the locations back.
+            out_cache_loc_host = torch.empty(
+                (batch.extend_num_tokens,), dtype=torch.int32
+            )
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
@@ -538,11 +545,12 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             batch=batch,
+            out_cache_loc_host=out_cache_loc_host,
         )
 
     # Write to req_to_token_pool
     write_cache_indices(
-        out_cache_loc,
+        out_cache_loc if out_cache_loc_host is None else out_cache_loc_host,
         req_pool_indices_device,
         req_pool_indices_cpu,
         prefix_lens_device,
