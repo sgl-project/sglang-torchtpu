@@ -10,17 +10,29 @@ Four pieces, each checked against a reference built from a plain dense softmax:
   extend step.
 * ``get_dcp_lens`` gives each rank the count of the positions it owns.
 
+A DCP group whose ranks each compute every head themselves (attention TP 1,
+as in ring-mode prefill context parallelism, where the group is the CP group)
+merges without gathering or cropping heads; ``TestAllHeadsLocal`` checks that
+variant of the merge and of the backend's decode and extend paths.
+
 The collectives are faked: every rank's call runs in-process and the fake group
 serves the other ranks' tensors, so the values crossing the "wire" are the ones
 the function under test produced.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention_pallas_rpa_base import PallasForwardMetadata
+from sglang_tpu.attention_pallas_rpa_batched import (
+    TpuPallasRpaBatchedAttnBackend,
+)
 from sglang_tpu.attention_pallas_rpa_dcp import (
     gather_heads,
     merge_across_ranks,
@@ -359,6 +371,142 @@ class TestGlobalWindowRule(CustomTestCase):
                     len(self._owned_positions(L, dcp, rank)) for L in self.LENGTHS
                 ]
                 self.assertEqual(got, expected, f"dcp={dcp} rank={rank}")
+
+
+class TestAllHeadsLocal(CustomTestCase):
+    """Attention TP 1 inside a DCP group: every rank holds all heads."""
+
+    HEADS = 6
+    HEAD_DIM = 8
+
+    def _partials(self, cp, num_tokens, num_keys, seed, keys=None):
+        scores, values = _random_problem(
+            num_tokens, self.HEADS, num_keys, self.HEAD_DIM, seed
+        )
+        keys = torch.ones(num_keys, dtype=torch.bool) if keys is None else keys
+        key_rank = torch.arange(num_keys) % cp
+        partials = []
+        for rank in range(cp):
+            owned = ((key_rank == rank) & keys).view(1, 1, num_keys).expand_as(scores)
+            partials.append(_softmax_over(scores, values, owned))
+        return scores, values, partials
+
+    def test_merge_keeps_every_head_and_matches_dense_softmax(self):
+        for cp in (2, 4, 8):
+            for num_keys in (1, 7, 64):
+                with self.subTest(cp=cp, num_keys=num_keys):
+                    scores, values, partials = self._partials(
+                        cp, 5, num_keys, seed=cp * 100 + num_keys
+                    )
+                    ref_out, ref_lse = _softmax_over(
+                        scores, values, torch.ones_like(scores).bool()
+                    )
+                    results = _simulate_group(
+                        cp,
+                        lambda group: merge_across_ranks(
+                            partials[group.rank_in_group][0].clone(),
+                            partials[group.rank_in_group][1].clone(),
+                            group,
+                            group.world_size,
+                            *_rank_tensors(cp, group.rank_in_group),
+                            keep_all_heads=True,
+                        ),
+                    )
+                    for out, lse in results:
+                        # Every rank ends with the same full-head result.
+                        self.assertEqual(out.shape, ref_out.shape)
+                        self.assertFalse(torch.isnan(out).any())
+                        torch.testing.assert_close(out, ref_out, atol=1e-5, rtol=1e-5)
+                        torch.testing.assert_close(lse, ref_lse, atol=1e-5, rtol=1e-5)
+
+    def test_default_merge_is_unchanged(self):
+        """Without the flag the merge still crops to the rank's head block."""
+        cp = 2
+        scores, values, partials = self._partials(cp, 3, 9, seed=3)
+        ref_out, _ = _softmax_over(scores, values, torch.ones_like(scores).bool())
+        results = _run_cp_merge([p[0] for p in partials], [p[1] for p in partials])
+        per_rank = self.HEADS // cp
+        for rank, (out, _) in enumerate(results):
+            torch.testing.assert_close(
+                out,
+                ref_out[:, rank * per_rank : (rank + 1) * per_rank],
+                atol=1e-5,
+                rtol=1e-5,
+            )
+
+    def _backend(self, cp, rank, group, dcp_op, heads_local=True):
+        backend = object.__new__(TpuPallasRpaBatchedAttnBackend)
+        backend._dcp = cp
+        backend._dcp_group = group
+        backend._dcp_heads_local = heads_local
+        backend._dcp_op = dcp_op
+        backend._cp_rank_mask, backend._cp_rank_index = _rank_tensors(cp, rank)
+        tensor = torch.zeros(1, dtype=torch.int32)
+        backend.forward_metadata = PallasForwardMetadata(
+            kv_lens=tensor,
+            cu_q_lens=tensor,
+            cu_kv_lens=tensor,
+            page_indices=tensor,
+            distribution=tensor,
+            active_num_tokens=tensor,
+            dcp_kv_lens_global=tensor,
+            dcp_cp_rank=tensor,
+        )
+        return backend
+
+    def _run_forward(self, cp, mode, partials, chunk=None):
+        """``_forward_dcp`` on every rank with a kernel stub that returns the
+        rank's stripe partial (STRIPED scope) or the chunk partial."""
+        seen = []
+        num_tokens = partials[0][0].shape[0]
+        q = torch.randn(num_tokens, self.HEADS, self.HEAD_DIM)
+
+        def run(group):
+            rank = group.rank_in_group
+
+            def dcp_op(q_all, *args):
+                seen.append(q_all.shape)
+                scope = args[-2]
+                out, lse = chunk if scope == 2 else partials[rank]
+                return out.clone(), lse.clone()
+
+            backend = self._backend(cp, rank, group, dcp_op)
+            batch = SimpleNamespace(forward_mode=mode)
+            with patch(
+                "sglang_tpu.attention_pallas_rpa_base.gather_heads",
+                side_effect=AssertionError("heads must not be gathered"),
+            ):
+                return backend._forward_dcp(
+                    q, None, None, None, None, batch, None, 1.0, None, None, None,
+                    None, self.HEADS,
+                )  # fmt: skip
+
+        results = _simulate_group(cp, run)
+        # The kernel ran on the rank's own heads, never on cp * heads.
+        self.assertEqual(set(seen), {q.shape})
+        return results
+
+    def test_decode_merges_stripes_without_a_head_gather(self):
+        cp = 4
+        scores, values, partials = self._partials(cp, 3, 21, seed=11)
+        ref_out, _ = _softmax_over(scores, values, torch.ones_like(scores).bool())
+        for out in self._run_forward(cp, ForwardMode.DECODE, partials):
+            self.assertEqual(out.shape, ref_out.shape)
+            torch.testing.assert_close(out, ref_out, atol=1e-5, rtol=1e-5)
+
+    def test_extend_joins_the_striped_prefix_with_the_chunk(self):
+        """Short-only extends in ring mode run this path: the cached prefix is
+        merged across the stripes, the chunk is attended locally on every rank."""
+        cp, num_keys, num_prefix = 4, 21, 13
+        is_prefix = torch.arange(num_keys) < num_prefix
+        scores, values, partials = self._partials(cp, 3, num_keys, 5, keys=is_prefix)
+        chunk = _softmax_over(
+            scores, values, (~is_prefix).view(1, 1, num_keys).expand_as(scores)
+        )
+        ref_out, _ = _softmax_over(scores, values, torch.ones_like(scores).bool())
+        for out in self._run_forward(cp, ForwardMode.EXTEND, partials, chunk=chunk):
+            self.assertEqual(out.shape, ref_out.shape)
+            torch.testing.assert_close(out, ref_out, atol=1e-5, rtol=1e-5)
 
 
 if __name__ == "__main__":

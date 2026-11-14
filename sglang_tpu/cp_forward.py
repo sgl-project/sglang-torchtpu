@@ -29,7 +29,9 @@ from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.cp_layout import (
     TpuCpHostLayout,
     build_tpu_cp_layout,
+    build_tpu_cp_ring_layout,
     max_local_rows,
+    ring_local_rows,
 )
 from sglang_tpu.kv_row_write import write_rows_torch
 
@@ -44,6 +46,34 @@ class TpuCpBatchLayout(NamedTuple):
     # Device int64 [local_rows_padded]: global token index of each local row
     # (padding rows point at token 0; their contents are never consumed).
     local_rows: torch.Tensor
+
+
+# Cache-phase rows the ring-mode layout hands the fused kernel per request: 1
+# (one row spanning both owned blocks, as the kernel's reference driver does)
+# or 2 (the new-token rows again, so both phases cut identical query blocks).
+RING_CACHE_ROWS_PER_REQ = 1
+
+
+def ring_token_buckets(t_bucketer: Any, page_size: int) -> list[int]:
+    """Token buckets a ring-mode context-parallel extend can use.
+
+    A request reserves two page-aligned blocks on every rank and the fused
+    kernel reads the rank-major gathered chunk by page, so a usable bucket is a
+    multiple of ``2 * page_size``.
+    """
+    return [bucket for bucket in t_bucketer.buckets if bucket % (2 * page_size) == 0]
+
+
+def ring_token_bucket(t_bucketer: Any, rows: int, page_size: int) -> int:
+    """Smallest ring-mode token bucket holding ``rows`` local rows."""
+    for bucket in ring_token_buckets(t_bucketer, page_size):
+        if bucket >= rows:
+            return bucket
+    raise ValueError(
+        f"Ring-mode context parallelism needs {rows} local rows, above every "
+        f"usable token bucket of {list(t_bucketer.buckets)} (multiples of "
+        f"{2 * page_size}); the batch should have run the striped extend path."
+    )
 
 
 def get_tpu_cp_layout(forward_batch: Any) -> TpuCpBatchLayout | None:
@@ -74,6 +104,7 @@ def prepare_tpu_cp_forward_batch(
     cp_size: int,
     cp_rank: int,
     device: torch.device,
+    ring_page_size: int | None = None,
 ) -> tuple[int, int]:
     """Bucket a context-parallel extend batch on its local rows.
 
@@ -82,6 +113,10 @@ def prepare_tpu_cp_forward_batch(
     rank), pads the request-indexed fields to the request bucket, and attaches
     the layout to the batch. Token-indexed fields keep the global row count;
     the compiled-forward shim gathers the local rows from them.
+
+    ``ring_page_size`` (the KV page size) selects the ring-mode layout: blocks
+    are page-aligned and every rank reserves the same rows per request, so the
+    bucketed quantity is ``cp_layout.ring_local_rows``.
 
     Returns the real (global) token count and the real request count.
     """
@@ -110,17 +145,34 @@ def prepare_tpu_cp_forward_batch(
             f"{real_q} rows; context parallelism needs a pure extend batch."
         )
 
-    local_rows_padded = t_bucketer.next_bucket(
-        max(max_local_rows(extend_lens, cp_size), pad_b)
-    )
-    host = build_tpu_cp_layout(
-        extend_lens=extend_lens,
-        prefix_lens=prefix_lens,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        pad_b=pad_b,
-        local_rows_padded=local_rows_padded,
-    )
+    if ring_page_size is None:
+        local_rows_padded = t_bucketer.next_bucket(
+            max(max_local_rows(extend_lens, cp_size), pad_b)
+        )
+        host = build_tpu_cp_layout(
+            extend_lens=extend_lens,
+            prefix_lens=prefix_lens,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            pad_b=pad_b,
+            local_rows_padded=local_rows_padded,
+        )
+    else:
+        local_rows_padded = ring_token_bucket(
+            t_bucketer,
+            max(ring_local_rows(extend_lens, cp_size, ring_page_size), pad_b),
+            ring_page_size,
+        )
+        host = build_tpu_cp_ring_layout(
+            extend_lens=extend_lens,
+            prefix_lens=prefix_lens,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            pad_b=pad_b,
+            local_rows_padded=local_rows_padded,
+            page_size=ring_page_size,
+            cache_rows_per_req=RING_CACHE_ROWS_PER_REQ,
+        )
     local_rows = torch.from_numpy(np.clip(host.local_rows, 0, None)).to(
         device, non_blocking=True
     )
@@ -262,6 +314,33 @@ def fused_kv_rows(
     return rows.reshape(num_tokens, packed, packing, padded_head_dim)
 
 
+def all_gather_kv(
+    *,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    group: Any,
+    quantize: Callable[[torch.Tensor, torch.Tensor], tuple] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rank-major ``[cp_size * T, heads, head_dim]`` K and V of this layer.
+
+    ``k``/``v`` are this rank's ``[T, heads, head_dim]`` rows in the compute
+    dtype; ``quantize`` (fp8 pools) maps the gathered K/V to the pool dtype
+    after the gather.
+    """
+    # K/V are gathered as [T, heads, head_dim] in the compute dtype and laid out
+    # afterwards: on libtpu 0.0.47 an 8-bit all-gather gave wrong tokens with the
+    # SparseCore gather offload on and halted with it off, and an all-gather of the
+    # bf16 pool rows stalls warmup at attention CP 8.
+    # TODO(yinlin09): gather the fp8 rows directly once that runs correctly.
+    k_all = k.new_empty((group.world_size * k.shape[0], *k.shape[1:]))
+    v_all = v.new_empty((group.world_size * v.shape[0], *v.shape[1:]))
+    group.all_gather_into_tensor(k_all, k.contiguous())
+    group.all_gather_into_tensor(v_all, v.contiguous())
+    if quantize is not None:
+        k_all, v_all = quantize(k_all, v_all)
+    return k_all, v_all
+
+
 def all_gather_and_write_kv(
     *,
     kv_cache: torch.Tensor,
@@ -290,17 +369,29 @@ def all_gather_and_write_kv(
         raise ValueError(
             f"A {kv_cache.dtype} KV pool needs `quantize` to write gathered K/V rows."
         )
-    # K/V are gathered as [T, heads, head_dim] in the compute dtype and laid out
-    # afterwards: on libtpu 0.0.47 an 8-bit all-gather gave wrong tokens with the
-    # SparseCore gather offload on and halted with it off, and an all-gather of the
-    # bf16 pool rows stalls warmup at attention CP 8.
-    # TODO(yinlin09): gather the fp8 rows directly once that runs correctly.
-    k_all = k.new_empty((group.world_size * k.shape[0], *k.shape[1:]))
-    v_all = v.new_empty((group.world_size * v.shape[0], *v.shape[1:]))
-    group.all_gather_into_tensor(k_all, k.contiguous())
-    group.all_gather_into_tensor(v_all, v.contiguous())
-    if quantize is not None:
-        k_all, v_all = quantize(k_all, v_all)
+    k_all, v_all = all_gather_kv(k=k, v=v, group=group, quantize=quantize)
+    write_gathered_kv(
+        kv_cache=kv_cache,
+        k_all=k_all,
+        v_all=v_all,
+        write_segments=write_segments,
+        write_num_segments=write_num_segments,
+    )
+
+
+def write_gathered_kv(
+    *,
+    kv_cache: torch.Tensor,
+    k_all: torch.Tensor,
+    v_all: torch.Tensor,
+    write_segments: torch.Tensor,
+    write_num_segments: torch.Tensor,
+) -> None:
+    """Write runs of the all-gathered K/V (pool dtype) into ``kv_cache`` in place.
+
+    Gather mode writes every row; ring mode passes the runs of the pages this
+    rank owns, at their slots in its page stripe.
+    """
     gathered = fused_kv_rows(k_all, v_all, kv_cache).contiguous().view(kv_cache.dtype)
     write_rows_torch(write_num_segments, write_segments, gathered, kv_cache)
 

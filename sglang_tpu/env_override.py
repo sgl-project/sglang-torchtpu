@@ -179,6 +179,11 @@ def apply_prefill_cp_sparse_core_override(*, attn_cp_size: int) -> None:
     Called with the resolved ``--attn-cp-size`` before workers spawn, so they
     inherit the flags; without context parallelism the offloads keep the
     libtpu defaults.
+
+    Applies to both ``SGLANG_TPU_PCP_MODE`` values: ring mode drops the
+    full-sequence KV write but keeps the per-layer K/V all-gather these
+    overrides protect (and its decode path needs the same two flags, see
+    ``apply_decode_cp_sparse_core_override``).
     """
     if attn_cp_size <= 1:
         return

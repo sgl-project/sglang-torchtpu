@@ -256,6 +256,52 @@ zero launches.
   cache, failing with the size it needs if not.
 - Not supported with DP attention or prefill context parallelism.
 
+## Prefill context parallelism modes
+
+`--attn-cp-size N --enable-prefill-cp --cp-strategy zigzag` shards each prefill
+over the TP group by zigzag blocks (`cp_layout.py`). `SGLANG_TPU_PCP_MODE`
+selects where the KV cache lives:
+
+- `gather` (default). Every core all-gathers the chunk's K/V on every layer,
+  writes the whole sequence into its own fully replicated KV pool and runs
+  ordinary attention over its rows. Decode is not split across cores.
+- `ring`. The KV cache is page-striped across the cores, exactly as under
+  decode context parallelism: core `r` stores global page `l * N + r`, the page
+  table is identical on every core, and each core holds 1/N of the cache. A
+  zigzag prefill still all-gathers the chunk's K/V per layer (bf16, quantized
+  to fp8 after the gather), but nothing is written from another core's rows:
+  the fused ring kernel (`attention_pallas_rpa_pcp.py`) attends the cached
+  prefix by rotating KV blocks around the cores with remote DMA, then the
+  gathered chunk; each core then writes only the new pages it owns
+  (`sglang_tpu::kv_write_rows`). The ring kernel reads the pool and never
+  aliases it, because XLA copies an operand that a kernel with remote DMA
+  aliases. Decode and every extend the zigzag strategy does not take run the
+  DCP path over the same stripes.
+
+Ring mode:
+
+- Requires `--dcp-size == --attn-cp-size == --tp-size`, a power of two (an
+  unset `--dcp-size` is set at start-up; pass it explicitly so the hooks that
+  run before the platform defaults see it), `--page-size >= 256`, and
+  `--chunked-prefill-size >= page size x N` (DCP's rule). `--max-total-tokens`
+  is the pool of one core, so the server holds N times that.
+- Supports Qwen3-MoE on the batched RPA backend with the `HEAD_ALONG_SUBLANE`
+  KV layout, on one host, with the CP group equal to the whole world. Refused:
+  gpt-oss (attention sinks, sliding window), `SGLANG_TPU_USE_SEQ_ALONG_LANE_KV`,
+  `--enable-mixed-chunk`, pipeline parallelism, DP replicas, DP attention,
+  HiCache, PD disaggregation, speculative decoding, `--dcp-replicate-q-proj`.
+- Zigzag blocks are page-aligned and every core reserves two blocks per
+  request (`2 x align_up(ceil(len / 2N), page)` local rows), padded with rows
+  whose outputs are discarded, so that every core runs the same ring schedule.
+  Prompts shorter than `2N` pages therefore lose load balance, and a prefill
+  batch can hold at most `largest CP token bucket / (2 x page)` requests; a
+  batch that does not fit runs the DCP extend program instead. Token buckets
+  used by context-parallel batches must be multiples of `2 x page`.
+- One compiled program per bucket serves first chunks and cached prefixes. The
+  ring op is a collective: every core launches it in the same order with the
+  same static shapes, during warmup too.
+- Recipe: `benchmark/tpu/recipe/qwen3_30b_a3b_fp8_pcp_ring.sh`.
+
 ## Fixed-cohort benchmark gate
 
 - Enable with `SGLANG_TPU_BENCHMARK_BATCH_SIZE=N` (default: `0`, disabled).
