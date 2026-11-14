@@ -378,6 +378,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self.page_size = FULL_PAGE_TOKENS
         self.index_topk = int(config.index_topk)
         self.low_ratios = tuple(r for r in LOW_RATIOS if r in config.compress_ratios)
+        self.last_candidate_consumer = self._last_candidate_consumers(config)
         self.forward_metadata: Optional[DSV41TPUForwardMetadata] = None
         # layer_id -> fp32 [cos | sin] table; forward only sees the RadixAttention.
         self.rope_tables: Dict[int, torch.Tensor] = {}
@@ -707,8 +708,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self, *, layer, q, weights, candidates, metadata, block_size, width
     ) -> torch.Tensor:
         """Candidate-consumer top-k; the candidate K gather runs once per source
-        and batch, as the epic's stage cache does. A gather per consumer layer
-        kept two 8.25 GiB copies live in the 2048-token extend graph."""
+        and batch and lives until its last consumer, as the epic's stage cache."""
         pool = self.token_to_kv_pool
         low = metadata.low_ratio[layer.compress_ratio]
         key = pool.index_source(layer.layer_id)
@@ -723,7 +723,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
                 block_size=block_size,
             )
             metadata.prepared_candidates[key] = prepared
-        return self.indexer_ops.select_prepared(
+        selected = self.indexer_ops.select_prepared(
             q,
             weights,
             low.lengths,
@@ -732,6 +732,24 @@ class DSV41TPUAttnBackend(AttentionBackend):
             topk=self.index_topk,
             block_size=block_size,
         )
+        # Drop the gathered K after its last reader, as the epic's per-stage
+        # scope does; kept on the metadata it outlives the forward (8.86 GB at
+        # 2048 tokens) and the next program fails to load.
+        if layer.layer_id >= self.last_candidate_consumer.get(key, -1):
+            metadata.prepared_candidates.pop(key, None)
+        return selected
+
+    def _last_candidate_consumers(self, config) -> Dict[tuple, int]:
+        """(ratio, index source) -> last index layer reading its candidates."""
+        last: Dict[tuple, int] = {}
+        source = config.candidate_source_layer_id
+        for layer_id in sorted(config.index_source_layer_ids):
+            if (
+                0 <= source < layer_id
+                and config.compress_ratios[layer_id] in LOW_RATIOS
+            ):
+                last[self.token_to_kv_pool.index_source(layer_id)] = layer_id
+        return last
 
     # ------------------------------------------------------------------ #
     # Attention
