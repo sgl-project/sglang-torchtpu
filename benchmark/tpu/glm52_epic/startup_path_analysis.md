@@ -126,6 +126,15 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## Default selector hardware integration passed
+
+exp-xwfxnyiy94 (a0c3474763), SUCCEEDED15:39:39Z. Each host independently
+reports default32/pps2 three times and passes SELF, CAUSAL_MEAN, MIXED_SELF
+without explicit tile overrides. Evidence: qblock_default_rank0.txt/rank1.txt.
+This validates the ef4e214fc9 selector change through attention-only bridge
+export/execution. Fused cache-write/donation/custom-op and Dynamo/full-model
+initialization remain distinct pending gates; no E2E acceptance claimed.
+
 ## Qb32 nonzero single-request gates passed on both hosts
 
 exp-m6fhbd2rvo (f95127c9a2), SUCCEEDED 15:26:46Z. Both Falcon pods0/1
