@@ -6,7 +6,8 @@
     {"name":"ds-tpu7x-b1-sb1","topology":"4x4x4","chips":64,"status":"RUNNING"},
     {"name":"ds-tpu7x-b1-sb2","topology":"4x4x4","chips":64,"status":"RUNNING"}
   ],
-  "decision": "DO_NOT_SUBMIT",
-  "reason": "Capacity observation exposes 64-chip 4x4x4 pools, not an explicit two-host 2x2x2 admission. Existing successful bounded 8-chip experiments remain authoritative; compile ladder requires exact eight-chip topology rendering before submission.",
+  "decision": "CURRENT_EIGHT_CHIP_AVAILABILITY_UNKNOWN",
+  "reason": "CORRECTION: a 64-chip pool listing alone cannot establish that an 8-chip allocation is unavailable or would allocate the entire pool. Falcon exp get exp-bg6520x9g7 confirms this same cluster previously admitted worker replica2/device_count8/device_topo2x2x2 and succeeded. This historical admission does not prove current free capacity. The compile ladder was not submitted; lack of a validated executable runner remains separate from capacity.",
+  "verified_prior_admission": {"experiment":"exp-bg6520x9g7","replica":2,"device_count":8,"device_type":"v7x","device_topo":"2x2x2","resource_ready_reason":"Admitted","terminal_status":"succeeded"},
   "scope": "capacity evidence only; no experiment submitted"
 }
