@@ -21,7 +21,11 @@ def main():
                         help='Compile the production op fullgraph with backend=tpu, static shapes.')
     parser.add_argument('--prefix-tokens', type=int, choices=(0, 49152), default=0,
                         help='Long-table probe only: shift live writes/selected keys to high logical pages; prefix cache remains unselected zero.')
+    parser.add_argument('--requests', type=int, choices=(1, 2), default=1,
+                        help='Two disjoint long-table prefix-pair requests,1024 queries each.')
     args = parser.parse_args()
+    if args.requests == 2 and args.selection != 'prefix-pair':
+        parser.error('two-request probe requires prefix-pair')
     if args.prefix_tokens and args.entry != 'prefill-long-table':
         parser.error('nonzero prefix requires prefill-long-table')
     if args.selection == 'prefix-pair' and args.prefix_tokens != 49152:
@@ -60,7 +64,10 @@ def main():
     # nonzero tokens; optional prefix shifts them to logical pages384..399.
     # Prefix cache remains zero/unselected: this is not realistic long attention.
     table_pages = 481 if args.entry == 'prefill-long-table' else 33
-    num_pages = 482 if args.entry == 'prefill-long-table' else (65 if large_prefill else 2)
+    num_pages = (1 + 481 * args.requests) if args.entry == 'prefill-long-table' else (65 if large_prefill else 2)
+    per_request = t // args.requests
+    token_request = np.arange(t) // per_request
+    local_row = np.arange(t) % per_request
     cn = torch.zeros((num_pages, p, 4, 128), dtype=torch.uint8, device='tpu')
     cr = torch.zeros((num_pages, p // 4, 4, 128), dtype=torch.uint8, device='tpu')
     topk = np.full((t, k), -1, np.int32)
@@ -79,16 +86,20 @@ def main():
     if args.selection == 'prefix-pair':
         topk[:] = -1
         topk[:, 0] = 0
-        topk[:, 1] = args.prefix_tokens + np.arange(t)
-    live_kv = args.prefix_tokens + t
+        topk[:, 1] = args.prefix_tokens + local_row
+    live_kv = args.prefix_tokens + per_request
     head_major = args.entry == 'prefill-fallback' or large_prefill
-    distribution = [1, 1, 1] if t == 1 and not head_major else [0, 0, 1]
-    pages = list(range(1, table_pages + 1)) if large_prefill else [1]
-    print(f'SPARSE_METADATA pages_per_seq={len(pages)} live_kv={live_kv} prefix={args.prefix_tokens} '
+    distribution = [1, 1, 1] if t == 1 and not head_major else [0, 0, args.requests]
+    pages = list(range(1, table_pages * args.requests + 1)) if large_prefill else [1]
+    print(f'SPARSE_REQUESTS count={args.requests} queries_per_request={per_request}', flush=True)
+    print(f'SPARSE_METADATA pages_per_seq={len(pages) // args.requests} live_kv={live_kv} prefix={args.prefix_tokens} '
           f'expected_prefill_path={"per-query" if len(pages) > 256 else "shape-dependent"}',
           flush=True)
     metadata = [upload(np.array(a, np.int32)) for a in (
-        [live_kv], pages, [0, t], [0, live_kv if large_prefill else p], distribution)]
+        [live_kv] * args.requests, pages,
+        list(range(0, t + 1, per_request)),
+        [i * (live_kv if large_prefill else p) for i in range(args.requests + 1)],
+        distribution)]
     topk_tensor = upload(topk)
     prefix_nope = prefix_rope = None
     if args.selection == 'prefix-pair':
@@ -98,8 +109,12 @@ def main():
         prefix_rope = torch.full((64,), -0.5).to(torch.float8_e4m3fn).view(torch.uint8).numpy()
         seed_n = np.zeros((num_pages * p, 512), np.uint8)
         seed_r = np.zeros((num_pages * p, 128), np.uint8)
-        seed_n[p] = prefix_nope
-        seed_r[p, :64] = prefix_rope
+        for request in range(args.requests):
+            base = p * (1 + request * table_pages)
+            # Request1 uses negative prefix to detect request0 cache leakage.
+            n = prefix_nope if request == 0 else torch.full((512,), -0.25).to(torch.float8_e4m3fn).view(torch.uint8).numpy()
+            seed_n[base] = n
+            seed_r[base, :64] = prefix_rope
         cn = upload(seed_n.reshape(num_pages, p, 4, 128))
         cr = upload(seed_r.reshape(num_pages, p // 4, 4, 128))
     if head_major:
@@ -131,7 +146,8 @@ def main():
             actual_cr = cr.cpu().numpy()
         expected_rows = values
         if args.selection == 'prefix-pair':
-            expected_rows = (values + 0.25) / 2
+            prefix_values = np.where(token_request[:, None] == 0, 0.25, -0.25)
+            expected_rows = (values + prefix_values) / 2
         elif args.selection == 'causal-mean':
             expected_rows = values.cumsum(axis=0) / np.arange(1, t + 1)[:, None]
         elif args.selection == 'rope-pair':
@@ -147,12 +163,15 @@ def main():
         np.testing.assert_allclose(actual, expected, rtol=0, atol=1 / 128)
         expected_cn = np.zeros((num_pages * p, 512), np.uint8)
         expected_cr = np.zeros((num_pages * p, 128), np.uint8)
-        if prefix_nope is not None:
-            expected_cn[p] = prefix_nope
-            expected_cr[p, :64] = prefix_rope
-        write_start = p + args.prefix_tokens
-        expected_cn[write_start:write_start + t] = vn_cpu.view(torch.uint8).numpy()
-        expected_cr[write_start:write_start + t, :64] = vr_cpu.view(torch.uint8).numpy()
+        for request in range(args.requests):
+            base = p * (1 + request * table_pages) if large_prefill else p
+            if prefix_nope is not None:
+                expected_cn[base] = seed_n[base]
+                expected_cr[base, :64] = prefix_rope
+            write_start = base + args.prefix_tokens
+            rows = slice(request * per_request, (request + 1) * per_request)
+            expected_cn[write_start:write_start + per_request] = vn_cpu.view(torch.uint8).numpy()[rows]
+            expected_cr[write_start:write_start + per_request, :64] = vr_cpu.view(torch.uint8).numpy()[rows]
         np.testing.assert_array_equal(actual_cn.reshape(num_pages * p, 512), expected_cn)
         np.testing.assert_array_equal(actual_cr.reshape(num_pages * p, 128), expected_cr)
         print(f'PRODUCTION_SPARSE_STEP_PASS iteration={iteration} queries={t} selection={args.selection} entry={args.entry}', flush=True)
