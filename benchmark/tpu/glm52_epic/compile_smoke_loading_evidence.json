@@ -82,5 +82,60 @@
     "Zero memory.events at this cgroup does not exclude ancestor or host OOM.",
     "Native progress does not establish every rank position.",
     "No request output or compile acceptance captured here."
+  ],
+  "load_completion_snapshots": [
+    {
+      "falcon_rank": 0,
+      "copied_native_sha256": "0c5c9f1604a1c84677b9cfc0f230f976a5bdc0a06e2e9b36b161f78e2813755d",
+      "completed_workers": [],
+      "interpretation": "no load-end marker in this copy"
+    },
+    {
+      "falcon_rank": 1,
+      "copied_native_sha256": "877f2c27c61e64a716b53b6899d40985dad2800706f8680738d5fd1348b8bca7",
+      "completed_workers": [
+        {
+          "timestamp_utc": "2026-11-14 14:49:23Z",
+          "dp_rank": 2,
+          "elapsed_seconds": 2658.51
+        },
+        {
+          "timestamp_utc": "2026-11-14 14:49:23Z",
+          "dp_rank": 4,
+          "elapsed_seconds": 2658.56
+        },
+        {
+          "timestamp_utc": "2026-11-14 14:49:23Z",
+          "dp_rank": 1,
+          "elapsed_seconds": 2658.58
+        },
+        {
+          "timestamp_utc": "2026-11-14 14:49:23Z",
+          "dp_rank": 6,
+          "elapsed_seconds": 2658.59
+        },
+        {
+          "timestamp_utc": "2026-11-14 14:49:23Z",
+          "dp_rank": 7,
+          "elapsed_seconds": 2658.61
+        },
+        {
+          "timestamp_utc": "2026-11-14 14:49:23Z",
+          "dp_rank": 5,
+          "elapsed_seconds": 2658.7
+        },
+        {
+          "timestamp_utc": "2026-11-14 14:49:23Z",
+          "dp_rank": 0,
+          "elapsed_seconds": 2658.72
+        },
+        {
+          "timestamp_utc": "2026-11-14 14:49:26Z",
+          "dp_rank": 3,
+          "elapsed_seconds": 2661.54
+        }
+      ],
+      "interpretation": "local worker load-end only, not global compile readiness"
+    }
   ]
 }
