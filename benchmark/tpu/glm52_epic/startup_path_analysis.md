@@ -126,6 +126,20 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## Nonuniform RoPE weighting gate passed; ready for model smoke
+
+exp-8ag4xpzkix (ff015ef4d9), SUCCEEDED15:54:29Z. Both hosts show static
+Dynamo enabled and pass rope-pair iteration0/1 with positive/negative cache
+overwrite, output atol1/128,rtol0 and exact full-cache bytes. Zero NoPE query,
+unit64-lane RoPE query, scale1/16 gives logits4*rope_scalar; unique selected
+keys are0 and self (row0 once), checked against independent CPU two-key
+softmax. Evidence: qblock_rope_rank0.txt/rank1.txt. This covers nonuniform
+attention weighting, not arbitrary real-model logits or E2E performance.
+All proposed local gates for the minimal selector change now passed. Next
+experiment should retain compile-smoke configuration/model mounts and test
+full distributed native EXTEND/decode/request with newest memory diagnostics.
+Historical eager lowering fatal and compile exit137 remain unclosed.
+
 ## Static Dynamo fused custom-op gates passed
 
 exp-x5lwnj2m5x (eda6a557ab), SUCCEEDED15:50:04Z. Both hosts show two
