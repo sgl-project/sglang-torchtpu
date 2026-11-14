@@ -1,0 +1,35 @@
+{
+  "experiment": "exp-48q9eb5nxn",
+  "source_commit": "99ea485f27de77f820da454fd53ea6cde4123286",
+  "native_log_sha256": "b88d1a15bcc1c78163f76ef6a0c42683538ff449cc12f5e9c68c6e83a7759c1a",
+  "extend": {
+    "tokens": 2048,
+    "batch_size": 1,
+    "variant": "plain",
+    "logits": "FULL_VOCAB",
+    "seconds": 204.9,
+    "completed_native_time_utc": "2026-11-14T16:56:28Z"
+  },
+  "decode": {
+    "batch_size": 1,
+    "logits": "FULL_VOCAB",
+    "seconds": 160.6,
+    "completed_native_time_utc": "2026-11-14T16:59:08Z"
+  },
+  "acceptance": "compile markers only; health503 at17:00:17Z, request/decode serving acceptance pending",
+  "markers": [
+    "[2026-11-14 16:56:28 DP7 TP7 EP7] [TPU] [decoder compile policy] DECODE: 1 graph variants (bs=[1])",
+    "[2026-11-14 16:56:28 DP6 TP6 EP6] [TPU] [decoder compile policy] DECODE: 1 graph variants (bs=[1])",
+    "[2026-11-14 16:56:28 DP5 TP5 EP5] [TPU] [decoder compile policy] DECODE: 1 graph variants (bs=[1])",
+    "[2026-11-14 16:56:28 DP3 TP3 EP3] [TPU] [decoder compile policy] DECODE: 1 graph variants (bs=[1])",
+    "Compiled EXTEND (tokens=2048, bs=1, variant=plain, logits=FULL_VOCAB) in 204.9s HBM: +222 MB (59970/97012 MB): :   0% Completed | 0/1 [03:24<?, ?it/s]",
+    "Compiled EXTEND (tokens=2048, bs=1, variant=plain, logits=FULL_VOCAB) in 204.9s HBM: +222 MB (59970/97012 MB): : 100% Completed | 1/1 [03:24<00:00, 204.90s/it][2026-11-14 16:56:28 DP4 TP4 EP4] [TPU] [decoder compile policy] DECODE: 1 graph variants (bs=[1])",
+    "Compiled EXTEND (tokens=2048, bs=1, variant=plain, logits=FULL_VOCAB) in 204.9s HBM: +222 MB (59970/97012 MB): : 100% Completed | 1/1 [03:24<00:00, 204.90s/it]",
+    "[2026-11-14 16:56:28 DP1 TP1 EP1] [TPU] [decoder compile policy] DECODE: 1 graph variants (bs=[1])",
+    "[2026-11-14 16:56:28 DP0 TP0 EP0] [TPU] [decoder compile policy] DECODE: 1 graph variants (bs=[1])",
+    "Compiling DECODE:   0% Completed | 0/1 [00:00<?, ?it/s][2026-11-14 16:56:28 DP2 TP2 EP2] [TPU] [decoder compile policy] DECODE: 1 graph variants (bs=[1])",
+    "Compiled DECODE (bs=1, logits=FULL_VOCAB) in 160.6s HBM: +116 MB (60086/97012 MB): :   0% Completed | 0/1 [02:40<?, ?it/s][2026-11-14 16:59:08 DP1 TP1 EP1] [TPU] TpuGraphRunner queued 0 global warmups",
+    "Compiled DECODE (bs=1, logits=FULL_VOCAB) in 160.6s HBM: +116 MB (60086/97012 MB): : 100% Completed | 1/1 [02:40<00:00, 160.59s/it]",
+    "Compiled DECODE (bs=1, logits=FULL_VOCAB) in 160.6s HBM: +116 MB (60086/97012 MB): : 100% Completed | 1/1 [02:40<00:00, 160.59s/it]"
+  ]
+}
