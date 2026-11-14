@@ -14,11 +14,46 @@ Consequently, enabling q-block and changing the runner request to 512 tokens
 does not by itself route startup through q-block. The short startup prefill can
 fall back to per-query sparse MLA; subsequent startup decode uses per-query
 MLA regardless of q-block. This is a reachable pre-probe path, not proof that it
-caused the archived lowering fatal. Actual fatal-stage logs are still needed.
+caused the archived lowering fatal's exact operation. Wider archived logs now
+confirm that the fatal occurred during the pre-ready startup request window
+(see timeline below), not after the runner's health-gated 512-token probe.
 
 Do not call `/health` success alone a working baseline. Disabling server warmup
 would only isolate the later probe, not fix per-query lowering or establish
 decode correctness. No default or shared runtime behavior is changed here.
+
+## Archived eager fatal timeline (Falcon exp-30eq5xauez)
+
+Retrieved via `falcon exp logs exp-30eq5xauez --tail 2000 --output json`
+(source=gcs, 1492 lines; default tail200 omitted the startup context).
+
+- 05:37:53: schedulers report async result-copy worker enabled.
+- 05:37:57: engine startup completes, Uvicorn starts.
+- 05:37:58: `/model_info` returns 200; `/health` returns 503. Several DP ranks
+  report prefill inputs uploaded at live length, then logits processing begins.
+- 05:37:59–05:38:03: `/health` remains 503.
+- 05:38:03: scheduler creates copy_done Event, followed by vmreg/vreg-to-U64
+  and window_bounds rank fatal; result-copy worker event.record warnings also
+  occur near the crash.
+
+This narrows failure to startup request processing before readiness. It does
+not attribute the fault to sparse gather, first prefill, decode, or event/copy
+lowering: dispatch is asynchronous and neighboring log messages do not identify
+the failing compiled operation. The corrected current candidate disables async
+copy; a gather-only reproduction cannot test that alternative fault boundary.
+
+## Async-copy toggle does not remove events
+
+Traced `scheduler.py:4843-4874` and `result_copy_worker.py:77-121`.
+The scheduler creates `copy_done = device_module.Event()` before selecting
+worker versus inline copy. Disabling the async-copy worker only moves
+`GenerationBatchResult.copy_to_cpu` back to the scheduler/copy-stream context;
+that method still records copy_done (`managers/utils.py:221`). Therefore
+`SGLANG_TPU_ASYNC_COPY_WORKER=0` does not remove event lowering or make the
+request synchronous. It isolates worker/thread/stream scheduling only.
+Do not describe this setting as an event-free diagnostic or treat another
+fatal with it as proof against an event-related hypothesis. No synchronization
+or event ownership changes are justified without an actual minimal failure.
 
 ## Peer topology correction
 
