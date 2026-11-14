@@ -267,8 +267,10 @@ try:
             time.sleep(1)
         # Plain-DSA q-block prefill is selected only for >=512 tokens. A four-token
         # probe silently falls back to the old per-query sparse kernel and cannot
-        # validate the peer recipe we are testing here.
-        request_body = {'input_ids': [1] * 512, 'sampling_params': {
+        # validate the peer recipe we are testing here. The long candidate keeps
+        # the historical short probe because it is not the q-block smoke.
+        smoke_tokens = 512 if mode in ('eager', 'compile-smoke') else 4
+        request_body = {'input_ids': [1] * smoke_tokens, 'sampling_params': {
             'temperature': 0, 'max_new_tokens': 1, 'ignore_eos': True}, 'stream': False}
         save('generate-request.json', request_body)
         code, body = request('http://127.0.0.1:30000/generate', request_body, timeout=600)
@@ -284,7 +286,10 @@ try:
                 'current native /generate must return one output token ID')
         result.update(health_status=200, generate_status=code, output_ids=ids,
                       request_success_count=1, generate_input_tokens=len(request_body['input_ids']),
-                      expected_attention_path='plain_dsa_qblock_prefill')
+                      expected_attention_path=(
+                          'plain_dsa_qblock_prefill'
+                          if mode in ('eager', 'compile-smoke')
+                          else 'candidate_default_attention_path'))
         check_child()
         # Opt-in only: prepared requests must reference frozen data + its manifest
         # available locally (e.g. supplemental exact JAX source /workspace/sglang-jax).
