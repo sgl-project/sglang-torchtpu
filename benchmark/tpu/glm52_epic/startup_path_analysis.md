@@ -126,6 +126,18 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## Production fused cache-write/donation oracle passed
+
+exp-9d46tguhmn (72dffcd100), SUCCEEDED15:44:57Z. Both pods pass self and
+causal-mean for iteration0 positive values and iteration1 negative values at
+T2048/H64/P128. Production custom op uses head-major fused wrapper/default
+selector, writes NoPE and RoPE caches, donates both buffers, then reuses them.
+Every iteration checks full output at atol1/128,rtol0 plus entire cache bytes
+including untouched pages. Evidence: qblock_fused_rank0.txt/rank1.txt.
+This establishes the tested fused eager custom-op contract, not Dynamo/full
+model/distributed acceptance. Next gate changes only compilation to static
+Dynamo fullgraph; no checkpoint needed for this discriminating test.
+
 ## Default selector hardware integration passed
 
 exp-xwfxnyiy94 (a0c3474763), SUCCEEDED15:39:39Z. Each host independently
