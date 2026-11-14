@@ -283,10 +283,10 @@ try:
             except (OSError, urllib.error.URLError):
                 pass
             time.sleep(1)
-        # Plain-DSA q-block prefill is selected only for >=512 tokens. A four-token
-        # probe silently falls back to the old per-query sparse kernel and cannot
-        # validate the peer recipe we are testing here. The long candidate keeps
-        # the historical short probe because it is not the q-block smoke.
+        # A >=512-token request alone does not prove q-block execution: attention
+        # DP divides the configured chunk ceiling, and the scheduler can split
+        # this request below the kernel threshold. Record intent, not coverage.
+        # Keep the long candidate's historical short probe unchanged.
         smoke_tokens = 512 if mode in ('eager', 'compile-smoke') else 4
         # One output comes from prefill logits; require a second output to
         # exercise a decode forward, which never uses the q-block prefill op.
@@ -307,10 +307,14 @@ try:
         require(isinstance(ids, list) and len(ids) == smoke_outputs
                 and all(type(token) is int for token in ids),
                 f'current native /generate must return {smoke_outputs} output token IDs')
+        local_chunk = args['chunked_prefill_size'] // args['attn_dp_size']
+        result['configured_local_chunk_ceiling'] = local_chunk
+        result['attention_path_runtime_verified'] = False
         result.update(health_status=200, generate_status=code, output_ids=ids,
                       request_success_count=1, generate_input_tokens=len(request_body['input_ids']),
                       expected_attention_path=(
-                          'plain_dsa_qblock_prefill'
+                          ('per_query_prefill_fallback_expected'
+                            if local_chunk < 512 else 'qblock_prefill_eligible_not_verified')
                           if mode in ('eager', 'compile-smoke')
                           else 'candidate_default_attention_path'))
         check_child()

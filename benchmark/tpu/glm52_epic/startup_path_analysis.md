@@ -22,6 +22,19 @@ Do not call `/health` success alone a working baseline. Disabling server warmup
 would only isolate the later probe, not fix per-query lowering or establish
 decode correctness. No default or shared runtime behavior is changed here.
 
+## Attention-DP divides the short probe's chunk ceiling
+
+`arg_groups/parallel_hook.py:312-327` divides global chunked_prefill_size by
+attention-DP size. Both short configs specify 4096 / DP16, hence a per-worker
+chunk ceiling of 256. The 512-token external probe therefore does NOT guarantee
+a >=512-token q-block invocation; an eager scheduler can split it into two
+256-token chunks, each taking the head-major wrapper's per-query fallback.
+The runner's expected_attention_path field records intent only, not proof.
+The active eager run remains useful for full-checkpoint generation/decode
+acceptance, but must not be called q-block coverage without actual shape logs.
+A later q-block-specific run needs a local chunk >=512 (global >=8192 at DP16)
+and evidence of its actual invocation. Do not mutate the in-flight experiment.
+
 ## Archived eager fatal timeline (Falcon exp-30eq5xauez)
 
 Retrieved via `falcon exp logs exp-30eq5xauez --tail 2000 --output json`
