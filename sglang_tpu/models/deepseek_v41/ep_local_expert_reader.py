@@ -130,10 +130,8 @@ def _read_range(path: str, offset: int, out: torch.Tensor) -> None:
 def read_row_ranges(
     path: str, names: set[str], tp_rank: int, tp_size: int
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield this TP rank's rows of each 2-D tensor in ``names`` as blocks of at
-    most ``_ROW_BLOCK_BYTES``, each tagged with its first row in ``ROW_START_ATTR``.
-    The loader copies a block into the table before the next is read, so a rank
-    holds one block instead of its whole 12 GB range."""
+    """Yield this TP rank's rows of each 2-D tensor in ``names`` in blocks of at
+    most ``_ROW_BLOCK_BYTES``, each tagged with its first row in ``ROW_START_ATTR``."""
     with open(path, "rb") as f:
         header_len = int.from_bytes(f.read(8), "little")
         header = json.loads(f.read(header_len))

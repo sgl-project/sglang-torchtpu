@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_failures
 
 register_tpu_ci(
-    est_time=3600,
+    est_time=5400,
     suite="nightly-tpu-4-v7",
     nightly=True,
     disabled="manual: dispatched by dsv41-flash-test-tpu.yml",
@@ -26,7 +26,7 @@ register_tpu_ci(
     weights_pvc="model-weights",
 )
 
-SERVED_MODEL_NAME = "deepseek-v4.1-flash"
+SERVED_MODEL_NAME = "deepseek-ai/DeepSeek-V4.1-Flash"
 MODEL_PATH = os.environ.get("MODEL", "/weights/DeepSeek-V4.1-Flash")
 CONFIG_MODULE = "recipe/configs/deepseek_v41_flash.py"
 

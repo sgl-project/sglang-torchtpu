@@ -143,20 +143,6 @@ def trim_host_heap(reason: str) -> Optional[HeapTrimResult]:
     )
 
 
-def reclaim_compile_memory(reason: str) -> None:
-    """Free the dead objects a finished compile left behind, then their pages.
-
-    A trim alone returns nothing while the compiler's reference cycles are
-    still alive, so collect first, as vllm-torchtpu b0ec390a8 does.
-    """
-    if tpu_envs.SGLANG_TPU_RECLAIM_COMPILE_JAX_CACHES.get():
-        import jax
-
-        jax.clear_caches()
-    gc.collect()
-    trim_host_heap(reason)
-
-
 def _start_periodic(interval_s: float) -> Optional[threading.Thread]:
     global _periodic_thread
     if interval_s <= 0 or _periodic_thread is not None:

@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """DeepSeek-V4.1 Engram lookup from one host table shared by the node's ranks.
 
-With SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 (layout "shared") every rank maps
-the same memfd copy of each layer's table, so under attention DP a rank looks
-up its own tokens only: no id all-gather, no value all-reduce, no table in HBM
-and no gather of a 100 GB table inside the compiled graph. Before each compiled
-forward, on the host:
+Every rank maps the same memfd copy of each layer's table, so under attention
+DP a rank looks up its own tokens only. Before each compiled forward, on the
+host:
 
 1. ``host_hash_ids`` hashes this rank's (padded) tokens with core's torch path
    on CPU and commits the CPU history.

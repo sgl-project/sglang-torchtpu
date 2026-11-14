@@ -545,11 +545,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         capture_hidden_mode: str | None = None,
         has_spec_info: bool | None = None,
     ) -> PendingCall | None:
-        # Every precompiled graph passes here; a queued one is still compiling.
-        if pending_call is None and tpu_envs.SGLANG_TPU_RECLAIM_COMPILE_MEMORY.get():
-            from sglang_tpu.host_heap_trim import reclaim_compile_memory
-
-            reclaim_compile_memory(f"after {phase} compile")
         if self.compile_timing_recorder is None:
             return pending_call
         assert self.model_runner is not None
