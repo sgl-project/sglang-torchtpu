@@ -126,7 +126,7 @@ class TestCheckpointPrefetch(unittest.TestCase):
             "--tp",
             "8",
             "--weight-loader-drop-cache-after-load",
-            "--weight-loader-prefetch-num-threads=4",
+            "--weight-loader-prefetch-num-threads=2",
             "--model-loader-extra-config",
             extra,
         ]
@@ -135,7 +135,7 @@ class TestCheckpointPrefetch(unittest.TestCase):
         command, child, _ = configure_checkpoint_prefetch(args, env)
         self.assertIn("--weight-loader-prefetch-checkpoints", command)
         self.assertEqual(
-            command[command.index("--weight-loader-prefetch-num-threads") + 1], "1"
+            command[command.index("--weight-loader-prefetch-num-threads") + 1], "4"
         )
         self.assertNotIn("--weight-loader-disable-mmap", command)
         self.assertNotIn("--weight-loader-drop-cache-after-load", command)
