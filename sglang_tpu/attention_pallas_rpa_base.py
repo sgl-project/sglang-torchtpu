@@ -196,25 +196,34 @@ def _pool_kv_pack_heads(pool) -> int:
 
 
 def _pack_qkv_heads(q, k, v, pack: int):
-    """q ``[T, Hq, d]``, k/v ``[T, pack, d]`` -> one kv head of width ``pack * d``.
+    """q ``[T, Hq, d]``, k/v ``[T, Hkv, d]`` -> ``Hkv // pack`` kv heads of width ``pack * d``.
 
-    K/V rows are the heads side by side; each query head carries its q in its kv
-    head's lanes and zeros elsewhere, so it scores only its own head's keys and its
-    output lands in those lanes (``_unpack_out_heads``). Built with a one-hot
-    multiply: torch_tpu returns wrong values for strided head slices joined by ``cat``.
+    Each group's ``pack`` K/V heads sit side by side in one ``pack * d`` row; each
+    query head carries its q in its kv head's lanes and zeros elsewhere, so it scores
+    only its own head's keys and its output lands in those lanes (``_unpack_out_heads``).
+    Built with a one-hot multiply: torch_tpu returns wrong values for strided head
+    slices joined by ``cat``.
     """
     T, hq, d = q.shape
-    eye = torch.eye(pack, dtype=q.dtype, device=q.device).view(1, pack, 1, pack, 1)
-    q = (q.reshape(T, pack, hq // pack, 1, d) * eye).reshape(T, hq, pack * d)
-    return q, k.reshape(T, 1, pack * d), v.reshape(T, 1, pack * d)
+    groups = k.shape[1] // pack
+    eye = torch.eye(pack, dtype=q.dtype, device=q.device).view(1, 1, pack, 1, pack, 1)
+    q = (q.reshape(T, groups, pack, hq // (groups * pack), 1, d) * eye).reshape(
+        T, hq, pack * d
+    )
+    return q, k.reshape(T, groups, pack * d), v.reshape(T, groups, pack * d)
 
 
-def _unpack_out_heads(out, pack: int, d: int):
+def _unpack_out_heads(out, pack: int, d: int, num_kv_heads: int | None = None):
     """``[T, Hq, pack * d]`` -> ``[T, Hq, d]``: each head's own lanes (one-hot sum, exact)."""
     T, hq, _ = out.shape
-    eye = torch.eye(pack, dtype=out.dtype, device=out.device).view(1, pack, 1, pack, 1)
+    groups = 1 if num_kv_heads is None else num_kv_heads // pack
+    eye = torch.eye(pack, dtype=out.dtype, device=out.device).view(
+        1, 1, pack, 1, pack, 1
+    )
     return (
-        (out.reshape(T, pack, hq // pack, pack, d) * eye).sum(dim=3).reshape(T, hq, d)
+        (out.reshape(T, groups, pack, hq // (groups * pack), pack, d) * eye)
+        .sum(dim=4)
+        .reshape(T, hq, d)
     )
 
 
@@ -1616,9 +1625,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # Packed pools (SGLANG_TPU_KV_PACK_HEADS) hold this rank's kv heads side by side.
         pack = _pool_kv_pack_heads(self.token_to_kv_pool)
         if pack > 1:
-            if self._dcp != 1 or pack != layer.tp_k_head_num:
+            if self._dcp != 1 or layer.tp_k_head_num % pack != 0:
                 raise NotImplementedError(
-                    "packed KV heads need dcp 1 and all local heads packed"
+                    "packed KV heads need dcp 1 and tp_k_head_num divisible by pack"
                 )
             q, k, v = _pack_qkv_heads(q, k, v, pack)
 
@@ -1757,7 +1766,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # When qk == v this view+slice is a no-op reshape.
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)
         if pack > 1:
-            out = _unpack_out_heads(out, pack, layer.qk_head_dim)
+            out = _unpack_out_heads(out, pack, layer.qk_head_dim, layer.tp_k_head_num)
         out = out[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
