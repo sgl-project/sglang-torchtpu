@@ -1,0 +1,29 @@
+{
+  "status": "BLOCKED_FAIL_CLOSED",
+  "torch_baseline": {
+    "experiment": "exp-48q9eb5nxn",
+    "source": "99ea485f27de77f820da454fd53ea6cde4123286",
+    "accepted": true,
+    "workload": "short input 512 IDs, two generated IDs"
+  },
+  "jax_reference": {
+    "experiment": "exp-266i34jcm1",
+    "source": "3695225808f0293cae422ea7adf55eddacadd43",
+    "workload": "32 requests, prefix49152, extend12288, output16, concurrency32, DP16, local chunk2048",
+    "measured_admission": "32 unique waiting RIDs under paused scheduler; DP mapping index modulo16"
+  },
+  "blocking_differences": [
+    "Torch has no proven multi-rank admission barrier/readback in a real server",
+    "Torch completion intervals for the JAX workload are absent",
+    "Torch source audit does not prove the same fp8_q=true and fp8_pv=true operand contract",
+    "Current bounded Torch probes are synthetic attention/cache diagnostics, not the 32-request model workload"
+  ],
+  "required_before_submit": [
+    "real 8-chip two-host scheduler barrier with exact RID inventory and rank completion evidence",
+    "same model/checkpoint, prefix, extend, output, concurrency, DP and chunk cadence",
+    "verified precision/IR contract or explicitly labeled native-mode comparison",
+    "separate compile/warmup from steady-state completion intervals"
+  ],
+  "decision": "Do not submit matched performance experiment; do not report a ratio",
+  "scope": "admission gate only; no hardware result"
+}
