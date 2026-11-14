@@ -42,6 +42,20 @@ repeat_interleave/index_put_ helper. This synchronous read can surface an earlie
 asynchronous compiler failure; it does NOT identify D2H as its cause. Do not
 launch the device-table draft as a current fatal gate; no hardware was spent.
 
+## Allocator producer at the host-table sync boundary
+
+TPU platform get_paged_allocator_cls returns TpuPagedTokenToKVPoolAllocator.
+Its alloc_extend computes page-expanded indices on CPU using
+alloc_extend_vectorized_cpu and returns one async H2D of **int32**, unless
+return_host is requested (allocator_tpu.py:230-257). The source is not the
+int64/device repeat_interleave scatter previously considered. In ordinary
+alloc_for_extend with host table, last_loc is already CPU. The subsequent
+out_cache_loc.cpu() can therefore be a plain int32 H2D->D2H roundtrip, or a
+synchronization exposing unrelated in-flight work. No evidence yet identifies
+a faulty page-expansion kernel on TPU: this producer does not launch one.
+The copy/Event probe used int64, so it is not an exact allocator dtype match.
+Do not launch an allocator kernel rewrite based on the native U64 diagnostic.
+
 ## Result-copy isolation execution-mode caveat
 
 Full-model peer logs explicitly show `TorchTPU eager mode set to DEFER_NEVER`
