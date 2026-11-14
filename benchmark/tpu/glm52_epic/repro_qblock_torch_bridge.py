@@ -10,7 +10,7 @@ import os
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--query-block', type=int, choices=(32, 128), required=True)
-    parser.add_argument('--oracle', choices=('zero', 'self'), default='zero')
+    parser.add_argument('--oracle', choices=('zero', 'self', 'causal-mean'), default='zero')
     args = parser.parse_args()
     os.environ['JAX_PLATFORMS'] = 'cpu'
     import torch
@@ -44,7 +44,7 @@ def main():
     qr = torch.zeros((64, 2048, 64), dtype=torch.bfloat16, device='tpu')
     cache_cpu = torch.zeros((65, 128, 512), dtype=torch.uint8)
     expected_rows = torch.zeros((2048, 512), dtype=torch.float32)
-    if args.oracle == 'self':
+    if args.oracle != 'zero':
         # Exact FP8 dyadics, alternating signs across channels and token-varying
         # values. Physical pages1..16 hold logical tokens0..2047; page0 is unused.
         row = torch.arange(2048)[:, None]
@@ -56,6 +56,12 @@ def main():
     cr = torch.zeros((65, 32, 4, 128), dtype=torch.uint8, device='tpu')
     topk = torch.full((2048, 2048), -1, dtype=torch.int32)
     topk[:, 0] = torch.arange(2048, dtype=torch.int32)
+    if args.oracle == 'causal-mean':
+        # Zero queries make all selected causal logits equal. Unique keys only:
+        # select_bits uses additive scatter, so duplicates are not valid inputs.
+        for row in range(2048):
+            topk[row, :row + 1] = torch.arange(row + 1, dtype=torch.int32)
+        expected_rows = expected_rows.cumsum(dim=0) / torch.arange(1, 2049)[:, None]
     values = [x.to('tpu') for x in (
         topk, torch.tensor([2048], dtype=torch.int32),
         torch.arange(1, 34, dtype=torch.int32),
@@ -72,7 +78,8 @@ def main():
     else:
         expected = expected_rows.unsqueeze(0).expand(64, -1, -1)
         torch.testing.assert_close(out.float(), expected, rtol=0, atol=1 / 128)
-        print(f'QBLOCK_BRIDGE_SELF_PASS query_block={args.query_block}', flush=True)
+        label = args.oracle.upper().replace('-', '_')
+        print(f'QBLOCK_BRIDGE_{label}_PASS query_block={args.query_block}', flush=True)
 
 
 if __name__ == '__main__':
