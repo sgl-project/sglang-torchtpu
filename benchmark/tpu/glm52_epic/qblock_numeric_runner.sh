@@ -13,7 +13,14 @@ from pathlib import Path
 print(json.loads(Path('benchmark/tpu/glm52_epic/torch_runnable_baseline.json').read_text())['runtime_env']['LIBTPU_INIT_ARGS'])
 PY
 )
-for oracle in self causal-mean; do
+oracles=(self causal-mean)
+if [[ "${GLM52_QBLOCK_ORACLE_SUITE:-standard}" == mixed ]]; then
+  oracles=(mixed-self)
+elif [[ "${GLM52_QBLOCK_ORACLE_SUITE:-standard}" != standard ]]; then
+  echo 'Unsupported oracle suite' >&2
+  exit 2
+fi
+for oracle in "${oracles[@]}"; do
   timeout --signal=TERM --kill-after=15s 300s python -m benchmark.tpu.glm52_epic.repro_qblock_torch_bridge \
     --query-block 32 --oracle "$oracle" 2>&1 | tee "$OUT/$oracle.log"
   python - "$OUT/$oracle.log" "$oracle" <<'PY'

@@ -126,6 +126,18 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## Qb32 nonzero single-request gates passed on both hosts
+
+exp-m6fhbd2rvo (f95127c9a2), SUCCEEDED 15:26:46Z. Both Falcon pods0/1
+emit exactly one SELF_PASS and CAUSAL_MEAN_PASS at qb32/pps2. Full output
+comparison uses atol1/128, rtol0 across64 heads/2048 queries/512 channels.
+Nonzero FP8 dyadics vary with token and channel sign; self picks one key,
+causal mean picks1..2048 unique keys with zero queries. This validates cache
+reading and multi-page/step accumulation in the tested single-request case,
+not nonuniform softmax/rope logits, full model, or general performance.
+Logs: qblock_numeric_rank0.txt/rank1.txt. Mixed-request shared-tile/padding
+oracle remains a separate pending hardware gate. Production selector unchanged.
+
 ## TorchTPU bridge pair: VMEM control reproduced, qb32 zero oracle passed
 
 exp-n6457yyy41 (04925b6c3a), terminal SUCCEEDED at 15:20:23Z, independently
