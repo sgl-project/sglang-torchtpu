@@ -19,8 +19,13 @@ failed=0
 for queries in 1 64; do
     set +e
     timeout --signal=TERM --kill-after=15s 600s python -m benchmark.tpu.glm52_epic.repro_sparse_step \
-        --queries "$queries" > "$OUT/q$queries.log" 2>&1
-    rc=$?
+        --queries "$queries" 2>&1 | tee "$OUT/q$queries.log"
+    pipeline_status=("${PIPESTATUS[@]}")
+    rc=${pipeline_status[0]}
+    # Preserve compiler/timeout failure; also fail if evidence capture fails.
+    if [[ "$rc" == 0 && "${pipeline_status[1]}" != 0 ]]; then
+        rc=${pipeline_status[1]}
+    fi
     set -e
     printf 'q%s exit_code=%s\n' "$queries" "$rc" | tee -a "$OUT/status.txt"
     tail -n 60 "$OUT/q$queries.log"
