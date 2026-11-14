@@ -12,12 +12,14 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--queries', type=int, choices=(1, 4, 64), default=1)
+    parser.add_argument('--queries', type=int, choices=(1, 4, 64, 2048), default=1)
     parser.add_argument('--selection', choices=('self', 'causal-mean'), default='self',
                         help='Single key, or causal keys with zero queries and uniform weights.')
-    parser.add_argument('--entry', choices=('per-query', 'prefill-fallback'), default='per-query',
+    parser.add_argument('--entry', choices=('per-query', 'prefill-fallback', 'prefill-qblock'), default='per-query',
                         help='Token-major op or head-major prefill wrapper below q-block threshold.')
     args = parser.parse_args()
+    if (args.entry == 'prefill-qblock') != (args.queries == 2048):
+        parser.error('prefill-qblock requires queries2048; other entries retain small probes')
     if 'jax' in sys.modules:
         raise RuntimeError('fresh process required')
     pins = {'jax': '0.11.2', 'jaxlib': '0.11.2', 'libtpu': '0.0.50',
@@ -44,18 +46,20 @@ def main():
     q = torch.full((t, h, 512), query_value, dtype=torch.bfloat16, device='tpu')
     qr = torch.full((t, h, 64), query_value, dtype=torch.bfloat16, device='tpu')
     # Whole allocations, not views: the production op donates these buffers.
-    cn = torch.zeros((2, p, 4, 128), dtype=torch.uint8, device='tpu')
-    cr = torch.zeros((2, p // 4, 4, 128), dtype=torch.uint8, device='tpu')
+    num_pages = 65 if args.entry == 'prefill-qblock' else 2
+    cn = torch.zeros((num_pages, p, 4, 128), dtype=torch.uint8, device='tpu')
+    cr = torch.zeros((num_pages, p // 4, 4, 128), dtype=torch.uint8, device='tpu')
     topk = np.full((t, k), -1, np.int32)
     if args.selection == 'self':
         topk[:, 0] = np.arange(t)
     else:
         for row in range(t):
             topk[row, :row + 1] = np.arange(row + 1)
-    head_major = args.entry == 'prefill-fallback'
+    head_major = args.entry in ('prefill-fallback', 'prefill-qblock')
     distribution = [1, 1, 1] if t == 1 and not head_major else [0, 0, 1]
+    pages = list(range(1, 34)) if args.entry == 'prefill-qblock' else [1]
     metadata = [upload(np.array(a, np.int32)) for a in (
-        [t], [1], [0, t], [0, p], distribution)]
+        [t], pages, [0, t], [0, t if args.entry == 'prefill-qblock' else p], distribution)]
     topk_tensor = upload(topk)
     if head_major:
         q = q.transpose(0, 1).contiguous()
@@ -86,12 +90,12 @@ def main():
         assert actual.shape == (t, h, 512), actual.shape
         assert np.isfinite(actual).all()
         np.testing.assert_allclose(actual, expected, rtol=0, atol=1 / 128)
-        expected_cn = np.zeros((2, p, 512), np.uint8)
-        expected_cr = np.zeros((2, p, 128), np.uint8)
-        expected_cn[1, :t] = vn_cpu.view(torch.uint8).numpy()
-        expected_cr[1, :t, :64] = vr_cpu.view(torch.uint8).numpy()
-        np.testing.assert_array_equal(actual_cn.reshape(2, p, 512), expected_cn)
-        np.testing.assert_array_equal(actual_cr.reshape(2, p, 128), expected_cr)
+        expected_cn = np.zeros((num_pages * p, 512), np.uint8)
+        expected_cr = np.zeros((num_pages * p, 128), np.uint8)
+        expected_cn[p:p + t] = vn_cpu.view(torch.uint8).numpy()
+        expected_cr[p:p + t, :64] = vr_cpu.view(torch.uint8).numpy()
+        np.testing.assert_array_equal(actual_cn.reshape(num_pages * p, 512), expected_cn)
+        np.testing.assert_array_equal(actual_cr.reshape(num_pages * p, 128), expected_cr)
         print(f'PRODUCTION_SPARSE_STEP_PASS iteration={iteration} queries={t} selection={args.selection} entry={args.entry}', flush=True)
 
 
