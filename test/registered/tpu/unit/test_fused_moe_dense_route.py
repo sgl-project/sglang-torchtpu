@@ -3,7 +3,7 @@ permute), its SparseCore-combine extension, and the EP counting-sort route."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=210, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 from unittest import mock
@@ -87,10 +87,12 @@ def _weights(kind, num_experts):
 
     E, N, H = num_experts, INTER, HIDDEN
     if kind == "bf16":
-        k1, k2 = jax.random.split(jax.random.key(0))
-        w1 = jax.random.normal(k1, (E, H, 2 * N)) * 0.05
-        w2 = jax.random.normal(k2, (E, N, H)) * 0.05
-        w1, w2 = w1.astype(jnp.bfloat16), w2.astype(jnp.bfloat16)
+        # Host RNG: eager jax.random compiles per shape, ~10 s per route on tpu7x.
+        rng = np.random.default_rng(0)
+        w1, w2 = (
+            jnp.asarray(rng.standard_normal(s, dtype=np.float32) * 0.05, jnp.bfloat16)
+            for s in ((E, H, 2 * N), (E, N, H))
+        )
         ref = tuple(np.asarray(t.astype(jnp.float32)) for t in (w1, w2))
         return (w1, w2, None, None), ref
     if kind == "fp8_ch":
@@ -392,16 +394,12 @@ class TestFusedMoEDenseRoute(CustomTestCase):
                     np.testing.assert_array_equal(new, old)
 
     def test_ep_counting_route(self):
-        """Past the dense permute (prefill chunks), and every batch, decode
-        included, at the default threshold 0."""
+        """At the default threshold 0 every batch, decode included, takes the
+        EP route; multi-block sorts are covered by TestCountingSort."""
         self._check_route(
             "_ep_counting_route",
             flag=EP_ROUTE_FLAG,
-            cases=[
-                (4096, "glm53_ep8", True, GLM_DENSE_THRESHOLD),
-                (16, "glm53_ep8", True, 0),
-                (64, "k3", True, 0),
-            ],
+            cases=[(16, "glm53_ep8", True, 0)],
         )
 
     def test_rank_route_with_sparse_combine(self):
