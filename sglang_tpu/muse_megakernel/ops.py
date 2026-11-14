@@ -34,6 +34,7 @@ from sglang_tpu.muse_megakernel.ep_mk.kernel import ep_arm, ep_megakernel_call
 from sglang_tpu.muse_megakernel.expert_requant import requant_tpu_nvfp4_experts
 from sglang_tpu.muse_megakernel.mk import trace as mk_trace
 from sglang_tpu.muse_megakernel.moe_mode import MoeMode, resolve_moe_mode
+from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
 logger = logging.getLogger(__name__)
 
@@ -445,8 +446,13 @@ class MuseMegakernel(torch.nn.Module):
         capture: tuple,
         kv_sal: bool = False,
         kv_sal_fp8: bool = False,
+        unified_kv: bool = False,
     ) -> K.MKConfig:
         g = self.geo
+        kv_buf_map, swa_group_map = (
+            unified_kv_maps(g.n_layers, g.global_layers) if unified_kv else ((), ())
+        )
+        n_swa_groups = max(swa_group_map) + 1 if swa_group_map else 1
         opt = tpu_envs.SGLANG_TPU_MUSE_MK_OPT.get()
         fold_env = tpu_envs.SGLANG_TPU_MUSE_MK_FOLD.get()
         # the EP layout runs the row-tiled program at every size (ep_mk.config.ep_arm)
@@ -512,10 +518,12 @@ class MuseMegakernel(torch.nn.Module):
             # SAL chunks are one expert w13 slot row of tokens (the ring is a view of those slots)
             chunk_pages=chunk_pages,
             swa_chunk_pages=swa_chunk_pages,
-            swa_window_table=_swa_window_table(kv_sal, n_page_entries),
+            swa_window_table=_swa_window_table(kv_sal, n_page_entries, n_swa_groups),
             kv_packed=self.kv_packed and not kv_sal,
             kv_sal=kv_sal,
             kv_sal_fp8=kv_sal_fp8,
+            kv_buf_map=kv_buf_map,
+            swa_group_map=swa_group_map,
             # fp8 cached K (1) and V (2) straight into the MXU in mixed bf16 x fp8 dots
             sal_fp8_dot=tpu_envs.SGLANG_TPU_MK_SAL_FP8_DOT.get()
             if kv_sal and kv_sal_fp8
@@ -801,11 +809,22 @@ class MuseMegakernel(torch.nn.Module):
     def check_kv_pools(self, pool) -> None:
         """Raise unless the KV pools have a layout the kernel reads: bf16 or fp8 SEQ_ALONG_LANE
         pools, or bf16 fused pools with heads packed exactly when the kernel was built for it."""
-        pools = (
-            (pool.full_kv_pool, pool.swa_kv_pool)
-            if isinstance(pool, SWAKVPool)
-            else (pool,)
-        )
+        if isinstance(pool, TpuUnifiedSWAKVPool):
+            pools = (pool.kv_pool,)
+            exp_buf, exp_grp = unified_kv_maps(
+                self.geo.n_layers, self.geo.global_layers
+            )
+            got_buf = tuple(pool._buffer_idx(i) for i in range(self.geo.n_layers))
+            got_grp = tuple(pool.swa_page_group(i) for i in range(self.geo.n_layers))
+            if got_buf != exp_buf or got_grp != exp_grp:
+                raise ValueError(
+                    "TpuUnifiedSWAKVPool layer-to-buffer or SWA-group mapping does not "
+                    "match the Muse megakernel geometry"
+                )
+        elif isinstance(pool, SWAKVPool):
+            pools = (pool.full_kv_pool, pool.swa_kv_pool)
+        else:
+            pools = (pool,)
         for p in pools:
             if type(p) is TpuSeqAlongLaneKVPool:
                 if p.store_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
@@ -863,9 +882,20 @@ class MuseMegakernel(torch.nn.Module):
                 f"the Muse megakernel runs decode / verify steps, got {mode}"
             )
         page_indices = md.page_indices
-        swa_page_indices = (
-            md.swa_page_indices if md.swa_page_indices is not None else page_indices
-        )
+        if getattr(md, "swa_all_page_indices", None) is not None:
+            swa_page_indices = md.swa_all_page_indices.reshape(-1)
+        else:
+            swa_page_indices = (
+                md.swa_page_indices if md.swa_page_indices is not None else page_indices
+            )
+            if getattr(md, "swa_group_page_indices", None) is not None:
+                swa_page_indices = torch.cat(
+                    [
+                        swa_page_indices,
+                        md.swa_group_page_indices.contiguous().reshape(-1),
+                    ],
+                    dim=0,
+                )
         n_req = forward_batch.seq_lens.shape[0]
         T = embeds.shape[0]
         if T % n_req:
@@ -881,7 +911,12 @@ class MuseMegakernel(torch.nn.Module):
         meta = torch.cat([n_live, self.rank_t], dim=0)
         pool = backend.token_to_kv_pool
         self.check_kv_pools(pool)
-        kv = [pool.get_fused_kv_buffer(i) for i in range(self.geo.n_layers)]
+        unified_kv = isinstance(pool, TpuUnifiedSWAKVPool)
+        kv = (
+            list(pool.kv_pool.page_buffers())
+            if unified_kv
+            else [pool.get_fused_kv_buffer(i) for i in range(self.geo.n_layers)]
+        )
         weights = [getattr(self, f"w_{n}") for n in K.WEIGHT_NAMES]
         experts = [getattr(self, f"expert_{i}") for i in range(self.n_expert_refs)]
         hidden, aux = torch.ops.sglang_tpu_pallas.muse_megakernel(
@@ -896,6 +931,7 @@ class MuseMegakernel(torch.nn.Module):
             T // n_req,
             n_req,
             list(capture),
+            unified_kv,
         )
         return hidden[:T], (aux[:T] if capture else None)
 
@@ -904,6 +940,26 @@ class MuseMegakernel(torch.nn.Module):
 # geometry; one model per process.
 _INSTANCE: list = []
 _REGISTERED: list = []
+
+
+def unified_kv_maps(
+    n_layers: int, global_layers: tuple
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """``(kv_buf_map, swa_group_map)`` matching ``TpuUnifiedSWAKVPool``'s layer assignment."""
+    gl = set(global_layers)
+    full_ids = sorted(gl)
+    swa_ids = [i for i in range(n_layers) if i not in gl]
+    if not full_ids:
+        raise ValueError("TpuUnifiedSWAKVPool requires at least one global layer")
+    g = len(full_ids)
+    buf = [0] * n_layers
+    grp = [0] * n_layers
+    for i, l in enumerate(full_ids):
+        buf[l] = i
+    for j, l in enumerate(swa_ids):
+        buf[l] = j % g
+        grp[l] = j // g
+    return tuple(buf), tuple(grp)
 
 
 def _register_op() -> None:
@@ -926,6 +982,7 @@ def _register_op() -> None:
         rows_per_req: int,
         n_req: int,
         capture: list[int],
+        unified_kv: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
@@ -940,6 +997,7 @@ def _register_op() -> None:
             capture=tuple(capture),
             kv_sal=kv_sal,
             kv_sal_fp8=kv_sal and kv[0].dtype == torch.float8_e4m3fn,
+            unified_kv=unified_kv,
         )
         callable_ = mk.callable_for(cfg)
         with tpu_info_for_cpu_export():
@@ -947,7 +1005,20 @@ def _register_op() -> None:
         return outs[0], outs[1]
 
     @op.register_fake
-    def _(meta, pos, pf, psw, emb, weights, experts, kv, rows_per_req, n_req, capture):
+    def _(
+        meta,
+        pos,
+        pf,
+        psw,
+        emb,
+        weights,
+        experts,
+        kv,
+        rows_per_req,
+        n_req,
+        capture,
+        unified_kv=False,
+    ):
         aux_w = len(capture) * emb.shape[1] if capture else K.LANE
         return emb.new_empty((emb.shape[0], emb.shape[1])), emb.new_empty(
             (emb.shape[0], aux_w)
@@ -987,12 +1058,15 @@ _TILED_VY_MIN_SLOTS = 2
 _TILED_VY_MIN_DEPTH = 3
 
 
-def _swa_window_table(kv_sal: bool, n_page_entries: int) -> bool:
+def _swa_window_table(kv_sal: bool, n_page_entries: int, n_swa_groups: int = 1) -> bool:
     mode = tpu_envs.SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE.get()
     if mode not in ("auto", "0", "1"):
         raise ValueError(f"SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE={mode!r}: auto, 0 or 1")
     if mode == "auto":
-        return kv_sal and 2 * 4 * n_page_entries > _SMEM_PAGE_TABLES_BUDGET
+        return (
+            kv_sal
+            and (1 + n_swa_groups) * 4 * n_page_entries > _SMEM_PAGE_TABLES_BUDGET
+        )
     return mode == "1"
 
 
@@ -1108,26 +1182,31 @@ def _export_program(body, *, tp: int, n_args: int, kv0: int, n_out: int, tag: st
 def _build_callable(cfg: K.MKConfig, tp: int, ep: str | None = None):
     """The megakernel + KV scatter as one jitted ``shard_map`` program over the TP mesh; with
     ep (an ep_arm), that arm of the EP megakernel (ep_mk: whole experts per rank)."""
-    L = cfg.n_layers
+    B = cfg.n_kv_buffers
     nw = len(K.WEIGHT_NAMES)
     ne = K.n_expert_refs(cfg)
-    n_args = 5 + nw + ne + L
+    n_args = 5 + nw + ne + B
     kv0 = 5 + nw + ne
     mk = ep_megakernel_call(cfg, arm=ep) if ep else K.megakernel_call(cfg)
     kvw = K.kv_write_call(cfg)
 
     def body(*xs):
-        hid, aux, newkv = mk(*xs)
-        pools = kvw(*xs[:4], newkv, *xs[kv0:])
+        psw = K.pad_table(cfg, xs[3]) if cfg.swa_window_table else xs[3]
+        hid, aux, newkv = mk(*xs[:3], psw, *xs[4:])
+        pools = kvw(*xs[:3], psw, newkv, *xs[kv0:])
         return (hid, aux, *pools)
 
-    tag = f"r{cfg.rows}_q{cfg.rows_per_req}_n{cfg.n_req}_c{len(cfg.capture_layers)}_p{cfg.pages_per_seq}"
+    utag = f"_u{B}" if cfg.kv_buf_map else ""
+    tag = (
+        f"r{cfg.rows}_q{cfg.rows_per_req}_n{cfg.n_req}_c{len(cfg.capture_layers)}"
+        f"_p{cfg.pages_per_seq}{utag}"
+    )
     callable_ = _export_program(
         body,
         tp=tp,
         n_args=n_args,
         kv0=kv0,
-        n_out=2 + L,
+        n_out=2 + B,
         tag=f"muse_{f'ep_{ep}_' if ep else ''}megakernel_{tag}",
     )
     logger.info(

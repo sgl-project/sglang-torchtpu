@@ -122,6 +122,8 @@ class PallasForwardMetadata:
     swa_page_indices: torch.Tensor | None = None
     # i32[num_swa_groups - 1, max_num_seqs * pages_per_seq]  companion SWA group page indices
     swa_group_page_indices: torch.Tensor | None = None
+    # i32[num_swa_groups, max_num_seqs * pages_per_seq]  contiguous all-group SWA page indices
+    swa_all_page_indices: torch.Tensor | None = None
     # Static query rows per DECODE sequence for this forward (1 = ordinary
     # decode); above 1 the active rows take the kernel's DECODE range.
     decode_query_size: int = 1
@@ -1012,6 +1014,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
         swa_page_indices: torch.Tensor | None = None
         swa_group_page_indices: torch.Tensor | None = None
+        swa_all_page_indices: torch.Tensor | None = None
         if self._is_hybrid_swa:
             # ``page_indices`` are page-level indices into the full pool. To get
             # the SWA-pool variant, look up the full→swa token mapping at the
@@ -1028,9 +1031,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             # table lives), then move the small int32 result to the batch device.
             full_token_starts = page_indices.to(torch.int64).cpu() * page_size
             swa_pages = full_to_swa[full_token_starts] // page_size
-            swa_page_indices = swa_pages.to(torch.int32).to(device)
             if self._swa_group_pages is not None:
-                swa_group_page_indices = self._swa_group_pages[:, swa_pages].to(device)
+                swa_all_page_indices = self._build_swa_all_page_indices_cpu(
+                    swa_pages
+                ).to(device)
+                swa_page_indices = swa_all_page_indices[0]
+                swa_group_page_indices = swa_all_page_indices[1:]
+            else:
+                swa_page_indices = swa_pages.to(torch.int32).to(device)
 
         return PallasForwardMetadata(
             kv_lens=seq_lens,
@@ -1041,6 +1049,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             active_num_tokens=_make_active_num_tokens(cu_q_lens, non_empty_bs),
             swa_page_indices=swa_page_indices,
             swa_group_page_indices=swa_group_page_indices,
+            swa_all_page_indices=swa_all_page_indices,
             decode_query_size=decode_query_size,
             segments=segments,
         )
@@ -1260,6 +1269,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # page indices through the CPU mapping before uploading or reusing them.
         swa_page_indices: torch.Tensor | None = None
         swa_group_page_indices: torch.Tensor | None = None
+        swa_all_page_indices: torch.Tensor | None = None
         if self._is_hybrid_swa:
             full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
             assert full_to_swa is not None, (
@@ -1269,15 +1279,18 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             # The mapping uses token slots, so look up each page's first token.
             full_token_starts = page_indices.to(torch.int64) * self._page_stride
             swa_pages = full_to_swa[full_token_starts] // self._page_stride
-            swa_page_indices = self._value_metadata(
-                name="swa_page_indices",
-                value=swa_pages.to(torch.int32),
-                device=device,
-            )
             if self._swa_group_pages is not None:
-                swa_group_page_indices = self._value_metadata(
-                    name="swa_group_page_indices",
-                    value=self._swa_group_pages[:, swa_pages],
+                swa_all_page_indices = self._value_metadata(
+                    name="swa_all_page_indices",
+                    value=self._build_swa_all_page_indices_cpu(swa_pages),
+                    device=device,
+                )
+                swa_page_indices = swa_all_page_indices[0]
+                swa_group_page_indices = swa_all_page_indices[1:]
+            else:
+                swa_page_indices = self._value_metadata(
+                    name="swa_page_indices",
+                    value=swa_pages.to(torch.int32),
                     device=device,
                 )
 
@@ -1293,11 +1306,22 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             active_num_tokens=active_num_tokens,
             swa_page_indices=swa_page_indices,
             swa_group_page_indices=swa_group_page_indices,
+            swa_all_page_indices=swa_all_page_indices,
             dcp_kv_lens_global=dcp_kv_lens_global,
             dcp_cp_rank=dcp_cp_rank,
             decode_query_size=decode_query_size,
             segments=segments,
         )
+
+    def _build_swa_all_page_indices_cpu(self, swa_pages: torch.Tensor) -> torch.Tensor:
+        """Contiguous ``[num_swa_groups, N]`` int32 CPU page table across all SWA groups."""
+        assert self._swa_group_pages is not None
+        out = torch.empty(
+            (1 + self._swa_group_pages.shape[0], swa_pages.numel()), dtype=torch.int32
+        )
+        out[0] = swa_pages
+        torch.index_select(self._swa_group_pages, 1, swa_pages, out=out[1:])
+        return out
 
     def _host_page_columns(self, pages_per_seq: int, page_size: int) -> torch.Tensor:
         """Cached ``[pages_per_seq]`` req_to_token columns, one per page."""

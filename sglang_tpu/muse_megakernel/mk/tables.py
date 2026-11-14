@@ -34,7 +34,15 @@ def table_entries_padded(c) -> int:
 
 def pad_table(c, table):
     """pages_swa for swa_window_table kernels: whole TABLE_ALIGN tiles (pad never read)."""
-    return jnp.pad(table, (0, table_entries_padded(c) - table.shape[0]))
+    tp_pad = table_entries_padded(c)
+    pad = tp_pad - c.n_pages_entries
+    if pad == 0 or table.shape[0] == c.n_swa_groups * tp_pad:
+        return table
+    if c.n_swa_groups == 1:
+        return jnp.pad(table, (0, pad))
+    return jnp.pad(
+        table.reshape(c.n_swa_groups, c.n_pages_entries), ((0, 0), (0, pad))
+    ).reshape(-1)
 
 
 def swa_window_entries(c) -> int:
