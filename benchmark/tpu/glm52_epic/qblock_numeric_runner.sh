@@ -13,21 +13,28 @@ from pathlib import Path
 print(json.loads(Path('benchmark/tpu/glm52_epic/torch_runnable_baseline.json').read_text())['runtime_env']['LIBTPU_INIT_ARGS'])
 PY
 )
+qb=32
+if [[ "${GLM52_QBLOCK_ORACLE_SUITE:-standard}" == default ]]; then qb=0; fi
 oracles=(self causal-mean)
 if [[ "${GLM52_QBLOCK_ORACLE_SUITE:-standard}" == mixed ]]; then
   oracles=(mixed-self)
+elif [[ "${GLM52_QBLOCK_ORACLE_SUITE:-standard}" == default ]]; then
+  oracles=(self causal-mean mixed-self)
 elif [[ "${GLM52_QBLOCK_ORACLE_SUITE:-standard}" != standard ]]; then
   echo 'Unsupported oracle suite' >&2
   exit 2
 fi
 for oracle in "${oracles[@]}"; do
   timeout --signal=TERM --kill-after=15s 300s python -m benchmark.tpu.glm52_epic.repro_qblock_torch_bridge \
-    --query-block 32 --oracle "$oracle" 2>&1 | tee "$OUT/$oracle.log"
-  python - "$OUT/$oracle.log" "$oracle" <<'PY'
+    --query-block "$qb" --oracle "$oracle" 2>&1 | tee "$OUT/$oracle.log"
+  python - "$OUT/$oracle.log" "$oracle" "$qb" <<'PY'
 from pathlib import Path
 import sys
 label = sys.argv[2].upper().replace('-', '_')
-marker = f'QBLOCK_BRIDGE_{label}_PASS query_block=32'
-assert Path(sys.argv[1]).read_text().splitlines().count(marker) == 1
+marker = f'QBLOCK_BRIDGE_{label}_PASS query_block={sys.argv[3]}'
+lines = Path(sys.argv[1]).read_text().splitlines()
+assert lines.count(marker) == 1
+if sys.argv[3] == '0':
+    assert lines.count('QBLOCK_DEFAULT_SELECTED query_block=32 pages_per_step=2') == 1
 PY
 done

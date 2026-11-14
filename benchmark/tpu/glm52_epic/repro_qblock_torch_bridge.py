@@ -9,7 +9,8 @@ import os
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--query-block', type=int, choices=(32, 128), required=True)
+    parser.add_argument('--query-block', type=int, choices=(0, 32, 128), required=True,
+                        help='0 exercises both default tile selectors; otherwise explicit qb/pps2')
     parser.add_argument('--oracle', choices=('zero', 'self', 'causal-mean', 'mixed-self'), default='zero')
     args = parser.parse_args()
     os.environ['JAX_PLATFORMS'] = 'cpu'
@@ -20,10 +21,19 @@ def main():
     from torch_tpu._internal import execution_mode
     from sglang_tpu.attention.pallas.mla_sparse_qblock_tokens import (
         sparse_mla_prefill_qblock_tokens,
+        block_shape,
     )
     from sglang_tpu.attention_pallas_mla_sparse import tpu_info_for_cpu_export
 
     execution_mode.eager_mode = execution_mode.EagerMode.DEFER_NEVER
+
+    tile_kwargs = {}
+    if args.query_block:
+        tile_kwargs = dict(query_block=args.query_block, pages_per_step=2)
+    else:
+        selected = block_shape(64, 2048, 128)
+        assert selected == (32, 2), selected
+        print(f'QBLOCK_DEFAULT_SELECTED query_block={selected[0]} pages_per_step={selected[1]}', flush=True)
 
     def wrapped(q: jax.Array, qr: jax.Array, cn: jax.Array, cr: jax.Array,
                 topk: jax.Array, lens: jax.Array, pages: jax.Array,
@@ -31,7 +41,7 @@ def main():
         return sparse_mla_prefill_qblock_tokens(
             q, qr, cn, cr, topk, lens, pages, cu, distribution,
             sm_scale=576 ** -0.5, k_scale=1.0,
-            query_block=args.query_block, pages_per_step=2,
+            **tile_kwargs,
         )
 
     kernel = pallas.custom_jax_kernel(
