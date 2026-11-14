@@ -19,15 +19,18 @@ PY
 # Never initialize a distributed client: these are independent single-device cases.
 # A fatal in one case must not suppress evidence from the other backend.
 failed=0
+for queries in 1 64; do
 for backend in jax torch; do
+    case_id="$backend-q$queries"
     set +e
     timeout --signal=TERM --kill-after=15s 600s python -m benchmark.tpu.glm52_epic.repro_sparse_gather \
-        --backend "$backend" --queries 1 --page-size 128 \
-        --evidence-dir "$OUT/$backend" > "$OUT/$backend.log" 2>&1
+        --backend "$backend" --queries "$queries" --page-size 128 \
+        --evidence-dir "$OUT/$case_id" > "$OUT/$case_id.log" 2>&1
     rc=$?
     set -e
-    printf '%s exit_code=%s\n' "$backend" "$rc" | tee -a "$OUT/status.txt"
-    tail -n 30 "$OUT/$backend.log"
+    printf '%s exit_code=%s\n' "$case_id" "$rc" | tee -a "$OUT/status.txt"
+    tail -n 30 "$OUT/$case_id.log"
     if [[ "$rc" != 0 ]]; then failed=1; fi
+done
 done
 exit "$failed"

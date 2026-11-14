@@ -11,6 +11,6 @@
   "runtime_identity": "Documented mutable peer base tag plus SHA-verified bootstrap and wheel; not immutable image",
   "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3",
   "submission_status": "PENDING",
-  "hardware_result": {"status": "FAILED", "rank0_torch_bridge": "BYTE_EXACT_PASS", "rank0_raw_jax": "compile passed; host read failed because global jax.devices()[0] selected non-addressable device", "rank1": "not yet collected", "baseline": "not tested"},
+  "hardware_result": {"status": "FAILED", "rank0_torch_bridge": "BYTE_EXACT_PASS", "rank0_raw_jax": "compile passed; host read failed because global jax.devices()[0] selected non-addressable device", "rank1": "raw-JAX and TorchTPU bridge both BYTE_EXACT_PASS", "baseline": "not tested"},
   "local_runner_fixture": "Verified child137 does not suppress second backend and parent exits1; no hardware exercised"
 }

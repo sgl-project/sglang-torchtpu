@@ -1,0 +1,52 @@
+/tmp/tpu_logs/peer_bootstrap_8chip.sh: OK
+{"base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1", "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3", "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c", "got": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0+cpu", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0+cpu", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "peer_experiment": "exp-bsvzoblh0d", "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00", "peer_task_status": "succeeded", "prepared_wheelhouse": "/prepared/wheelhouse", "schema_version": 1, "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity", "source_commit": "edcf9b47b998b37d4bf3d5dcdf12e80a2eb07a99", "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git", "want": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"}
+jax exit_code=1
+/tmp/glm52-peer-rank0.aRbIXm/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+[W1114 10:52:41.298606993 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+STAGE {"backend": "jax", "stage": "initialize_jax", "time_ns": 1794653561640905865}
+STAGE {"backend": "jax", "stage": "lower", "time_ns": 1794653568823629069}
+EVIDENCE precompile_ir=/gcs/experiments/exp-8vb32ntf9t/artifacts/art-bskwwao3nn/gather-pair/rank-0/jax/lowered.mlir
+STAGE {"backend": "jax", "stage": "compile", "time_ns": 1794653569395396566}
+COMPILE_PASS elapsed_s=1.401
+STAGE {"backend": "jax", "stage": "execute", "time_ns": 1794653570381435727}
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/glm52-peer-rank0.aRbIXm/src/benchmark/tpu/glm52_epic/repro_sparse_gather.py", line 160, in <module>
+    main()
+  File "/tmp/glm52-peer-rank0.aRbIXm/src/benchmark/tpu/glm52_epic/repro_sparse_gather.py", line 154, in main
+    np.testing.assert_array_equal(np.asarray(out_nope).reshape(n, 512)[:live], nope[indices[:live]])
+                                  ^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.aRbIXm/venv/lib/python3.12/site-packages/jax/_src/array.py", line 409, in __array__
+    return np.asarray(self._value, dtype=dtype, **kwds)  # pyrefly: ignore[no-matching-overload]
+                      ^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.aRbIXm/venv/lib/python3.12/site-packages/jax/_src/profiler.py", line 420, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.aRbIXm/venv/lib/python3.12/site-packages/jax/_src/array.py", line 647, in _value
+    raise RuntimeError(
+RuntimeError: Fetching value for `jax.Array` that spans non-addressable (non process local) devices is not possible. You can use `jax.experimental.multihost_utils.process_allgather` to print the global array or use `.addressable_shards` method of jax.Array to inspect the addressable (process local) shards.
+torch exit_code=0
+RUNTIME {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50"}
+STAGE {"backend": "torch", "stage": "runtime_checked", "time_ns": 1794653576298201226}
+COMPILER_ENV {"JAX_PLATFORMS": "cpu", "LIBTPU_INIT_ARGS": "--xla_tpu_buffer_assignment_enable_fast_merge_fallback=false --xla_tpu_offload_gather_to_sparsecore=true", "XLA_FLAGS": null}
+/tmp/glm52-peer-rank0.aRbIXm/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+[W1114 10:52:59.251309947 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+STAGE {"backend": "torch", "stage": "initialize_jax", "time_ns": 1794653579593709257}
+TORCH_RUNTIME {"torch": "2.11.0+cpu", "torch_tpu": "0.2.1.dev20261028201649", "tpu-sync-torch": "0.0.1.dev20261031081414"}
+STAGE {"backend": "torch", "stage": "initialize_torch_and_upload", "time_ns": 1794653579876220103}
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1794653585.824850    1644 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+STAGE {"backend": "torch", "stage": "bridge_compile_and_execute", "time_ns": 1794653585836420404}
+TORCH_BRIDGE_GATHER_BYTE_EXACT_PASS (not a serving baseline)
+falcon-agent: command failed: exit status 1
