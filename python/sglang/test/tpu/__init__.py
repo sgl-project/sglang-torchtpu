@@ -2,6 +2,7 @@
 
 from sglang.test.tpu.evals.eval_support import (
     BASE_URL,
+    DEEPSEEK_V41_FLASH,
     GEMMA4_26B_A4B,
     GEMMA4_31B,
     GLM_5_3_FLASH,
@@ -36,6 +37,7 @@ from sglang.test.tpu.evals.model_config import (
 
 __all__ = [
     "BASE_URL",
+    "DEEPSEEK_V41_FLASH",
     "GEMMA4_26B_A4B",
     "GEMMA4_31B",
     "GLM_5_3_FLASH",

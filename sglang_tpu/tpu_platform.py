@@ -830,6 +830,14 @@ def _register_attention_backends() -> None:
 
     @register_attention_backend("dsv4")
     def create_tpu_dsv4_backend(runner):
+        from sglang_tpu.models.deepseek_v41.memory_pool import uses_dsv41_pool
+
+        if uses_dsv41_pool(runner.model_config.compress_ratios):
+            from sglang_tpu.models.deepseek_v41.attention_backend import (
+                DSV41TPUAttnBackend,
+            )
+
+            return DSV41TPUAttnBackend(runner)
         from sglang_tpu.dsv4 import DSV4TPUAttnBackend
 
         return DSV4TPUAttnBackend(runner)
