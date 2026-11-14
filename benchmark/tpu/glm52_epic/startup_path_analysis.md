@@ -126,6 +126,23 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## TorchTPU bridge pair: VMEM control reproduced, qb32 zero oracle passed
+
+exp-n6457yyy41 (04925b6c3a), terminal SUCCEEDED at 15:20:23Z, independently
+verified on Falcon pods0/1. On BOTH hosts qb128 exits1 with the target
+sparse_mla_prefill_qblock_tokens VMEM error: 92.82M used /63.94M capacity,
+28.89M excess. qb32 at the same pages_per_step2 exits0 after blocking D2H,
+finite/shape checks, and QBLOCK_BRIDGE_ZERO_PASS. Original full-model graph
+needs92.94M, so this isolates the same capacity failure closely, not an
+identical whole-graph compile. Raw logs: qblock_bridge_rank0.txt/rank1.txt.
+The working path keeps JAX CPU-only, exports via custom_jax_kernel with
+production tpu_info_for_cpu_export, and lets TorchTPU own PJRT. Production
+selector unchanged. Zero cache cannot establish general numerical accuracy;
+next gate is the nonzero self-selection oracle and then multi-key/mixed-request
+coverage before any selector change/full-model retry. No host exit137 or
+historical window/U64 fatal occurred in this pair; their attribution remains
+separate and unresolved.
+
 ## Compile-only pair initialization failure (not a kernel result)
 
 exp-enaw64q1qb (8a8f12159e) failed at `jax.devices()` for both qb128 and

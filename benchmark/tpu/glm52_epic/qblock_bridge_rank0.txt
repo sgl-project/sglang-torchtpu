@@ -1,0 +1,278 @@
+/tmp/tpu_logs/peer_bootstrap_8chip.sh: OK
+{"base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1", "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3", "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c", "got": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0+cpu", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0+cpu", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "peer_experiment": "exp-bsvzoblh0d", "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00", "peer_task_status": "succeeded", "prepared_wheelhouse": "/prepared/wheelhouse", "schema_version": 1, "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity", "source_commit": "04925b6c3acdc7f6af2af1b499671600c60d1187", "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git", "want": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"}
+/tmp/glm52-peer-rank0.MsZOgZ/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794669574.248023     633 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank0.MsZOgZ/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794669574.260531     633 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794669574.911887     633 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794669574.914607     633 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+/tmp/glm52-peer-rank0.MsZOgZ/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank0.MsZOgZ/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+QBLOCK_BRIDGE_BEGIN query_block=128
+I0000 00:00:1794669578.574336     633 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794669584.289381     633 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794669584.289425     633 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+I0000 00:00:1794669584.327141    1427 compilation_cache_utils.cc:220] Tier-3 compilation cache root directory: 
+I0000 00:00:1794669584.327160    1427 tier2_compilation_cache.cc:81] Tier-2 compilation cache is disabled for world size 1.
+E0000 00:00:1794669588.371910    1428 materialize.cc:437] [MaterializationWorker] ExecutionTask failed: RESOURCE_EXHAUSTED: failed to compile MLIR module -- the XLA compiler failed with: XLA:TPU compile permanent error. Ran out of memory in memory space vmem. Used 92.82M of 63.94M vmem. Exceeded vmem capacity by 28.89M.
+
+Program vmem requirement 92.82M:
+    scoped           92.82M
+
+  Largest program allocations in vmem:
+
+  1. Size: 22.26M
+     XLA label: register allocator spill slots in HLO :: sparse_mla_prefill_qblock_tokens.1
+     Allocation type: scoped
+     ==========================
+
+  2. Size: 16.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: f32[8192,512]{1,0:T(8,128)}
+     Unpadded size: 16.00M
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  3. Size: 16.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: u8[16777216]{0}
+     Unpadded size: 16.00M
+     Tag: input window allocation for operator input 8. The window shape is bf16[64,128,512], while the full shape is bf16[64,2048,512]. The u8 shape/size shown above represents the raw byte size of this window in VMEM. This allocation has 2 buffering levels.
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  4. Size: 16.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: u8[16777216]{0}
+     Unpadded size: 16.00M
+     Tag: output window allocation for operator output 0. The window shape is bf16[64,128,512], while the full shape is bf16[64,2048,512]. The u8 shape/size shown above represents the raw byte size of this window in VMEM. This allocation has 2 buffering levels.
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  5. Size: 10.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: bf16[8192,640]{1,0:T(16,128)(2,1)}
+     Unpadded size: 10.00M
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  6. Size: 4.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: f32[8192,1]{1,0:T(8,128)}
+     Unpadded size: 32.0K
+     Extra memory due to padding: 3.97M (128.0x expansion)
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  7. Size: 4.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: f32[8192,1]{1,0:T(8,128)}
+     Unpadded size: 32.0K
+     Extra memory due to padding: 3.97M (128.0x expansion)
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  8. Size: 4.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: u8[4194304]{0}
+     Unpadded size: 4.00M
+     Tag: input window allocation for operator input 9. The window shape is bf16[64,128,128], while the full shape is bf16[64,2048,128]. The u8 shape/size shown above represents the raw byte size of this window in VMEM. This allocation has 2 buffering levels.
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  9. Size: 256.0K
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: s8[4,512,128]{2,1,0:T(32,128)(4,1)}
+     Unpadded size: 256.0K
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  10. Size: 256.0K
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: u8[262144]{0}
+     Unpadded size: 256.0K
+     Tag: input window allocation for operator input 10. The window shape is s32[128,256], while the full shape is s32[2048,256]. The u8 shape/size shown above represents the raw byte size of this window in VMEM. This allocation has 2 buffering levels.
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  11. Size: 64.0K
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: s8[4,128,128]{2,1,0:T(32,128)(4,1)}
+     Unpadded size: 64.0K
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+=== Source Location Trace: ===
+csrc/common/status_builder.cc:99
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/glm52-peer-rank0.MsZOgZ/src/benchmark/tpu/glm52_epic/repro_qblock_torch_bridge.py", line 63, in <module>
+    main()
+  File "/tmp/glm52-peer-rank0.MsZOgZ/src/benchmark/tpu/glm52_epic/repro_qblock_torch_bridge.py", line 55, in main
+    out = kernel(q, qr, cn, cr, *values).cpu()
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: failed to compile MLIR module -- the XLA compiler failed with: XLA:TPU compile permanent error. Ran out of memory in memory space vmem. Used 92.82M of 63.94M vmem. Exceeded vmem capacity by 28.89M.
+
+Program vmem requirement 92.82M:
+    scoped           92.82M
+
+  Largest program allocations in vmem:
+
+  1. Size: 22.26M
+     XLA label: register allocator spill slots in HLO :: sparse_mla_prefill_qblock_tokens.1
+     Allocation type: scoped
+     ==========================
+
+  2. Size: 16.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: f32[8192,512]{1,0:T(8,128)}
+     Unpadded size: 16.00M
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  3. Size: 16.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: u8[16777216]{0}
+     Unpadded size: 16.00M
+     Tag: input window allocation for operator input 8. The window shape is bf16[64,128,512], while the full shape is bf16[64,2048,512]. The u8 shape/size shown above represents the raw byte size of this window in VMEM. This allocation has 2 buffering levels.
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  4. Size: 16.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: u8[16777216]{0}
+     Unpadded size: 16.00M
+     Tag: output window allocation for operator output 0. The window shape is bf16[64,128,512], while the full shape is bf16[64,2048,512]. The u8 shape/size shown above represents the raw byte size of this window in VMEM. This allocation has 2 buffering levels.
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  5. Size: 10.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: bf16[8192,640]{1,0:T(16,128)(2,1)}
+     Unpadded size: 10.00M
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  6. Size: 4.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: f32[8192,1]{1,0:T(8,128)}
+     Unpadded size: 32.0K
+     Extra memory due to padding: 3.97M (128.0x expansion)
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  7. Size: 4.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: f32[8192,1]{1,0:T(8,128)}
+     Unpadded size: 32.0K
+     Extra memory due to padding: 3.97M (128.0x expansion)
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  8. Size: 4.00M
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: u8[4194304]{0}
+     Unpadded size: 4.00M
+     Tag: input window allocation for operator input 9. The window shape is bf16[64,128,128], while the full shape is bf16[64,2048,128]. The u8 shape/size shown above represents the raw byte size of this window in VMEM. This allocation has 2 buffering levels.
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  9. Size: 256.0K
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: s8[4,512,128]{2,1,0:T(32,128)(4,1)}
+     Unpadded size: 256.0K
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  10. Size: 256.0K
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: u8[262144]{0}
+     Unpadded size: 256.0K
+     Tag: input window allocation for operator input 10. The window shape is s32[128,256], while the full shape is s32[2048,256]. The u8 shape/size shown above represents the raw byte size of this window in VMEM. This allocation has 2 buffering levels.
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+
+  11. Size: 64.0K
+     Operator: op_name="sparse_mla_prefill_qblock_tokens/pallas_call"
+     Shape: s8[4,128,128]{2,1,0:T(32,128)(4,1)}
+     Unpadded size: 64.0K
+     Tag: scratch operand
+     XLA label: sparse_mla_prefill_qblock_tokens.1 = custom-call(bitcast.3.num_live_ref, scatter_custom_fusion.tile_ref, add_convert_fusion.first_ref, get-tuple-element.15.tok_lo_ref, ...(+10)), custom_call_target="tpu_custom_call", operand_layout_constraints={s32[1]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, s32[17]{0}, bf16[64,2048,512]{2,1,0}, bf16[64,2048,128]{2,1,0}, s32[2048,256]{1,0}, s32[17,1,34]{2,1,0}, u8[65,128,4,128]{3,2,1,0}, u8[65,32,4,128]{3,2,1,0}}, frontend_attributes={kernel_metadata={}}
+     Allocation type: scoped
+     ==========================
+I0000 00:00:1794669589.395488     633 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794669589.395521     633 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=5
+num_cache_hits=0 {0.0%}
+num_compilations=5
+peak_compilation_memory_bytes=unknown
+
+QBLOCK_BRIDGE_EXIT query_block=128 exit_code=1
+QBLOCK_BRIDGE_ACCEPT query_block=128 valid=True
+/tmp/glm52-peer-rank0.MsZOgZ/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794669596.349061    2997 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank0.MsZOgZ/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794669596.362489    2997 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794669597.029690    2997 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794669597.032316    2997 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+/tmp/glm52-peer-rank0.MsZOgZ/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank0.MsZOgZ/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+QBLOCK_BRIDGE_BEGIN query_block=32
+I0000 00:00:1794669600.629178    2997 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794669606.307496    2997 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794669606.307534    2997 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+I0000 00:00:1794669606.348099    3793 compilation_cache_utils.cc:220] Tier-3 compilation cache root directory: 
+I0000 00:00:1794669606.348131    3793 tier2_compilation_cache.cc:81] Tier-2 compilation cache is disabled for world size 1.
+QBLOCK_BRIDGE_ZERO_PASS query_block=32
+I0000 00:00:1794669609.252478    2997 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794669609.252519    2997 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=5
+num_cache_hits=0 {0.0%}
+num_compilations=5
+peak_compilation_memory_bytes=unknown
+
+QBLOCK_BRIDGE_EXIT query_block=32 exit_code=0
+QBLOCK_BRIDGE_ACCEPT query_block=32 valid=True
