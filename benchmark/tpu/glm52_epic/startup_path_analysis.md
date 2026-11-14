@@ -28,6 +28,18 @@ Thus neither narrow bridge reproduction triggers the full-model fatal. Scoring,
 combined graphs, larger cache shapes, model ops and distributed scheduling remain
 uncovered. No production kernel change is justified from these passing probes.
 
+## Result-copy isolation execution-mode caveat
+
+Full-model peer logs explicitly show `TorchTPU eager mode set to DEFER_NEVER`
+on all eight workers. `patches._configure_eager_mode` sets that internal runtime
+state during backend setup; importing TorchTPU alone is not evidence that the
+same state is selected. The currently submitted result-copy experiment
+exp-kxinhtzlc0 / art-mhc4o29set (source8b1aa30567) does not explicitly configure
+or print execution_mode. Its results must be scoped to the installed runtime's
+initial mode unless the logs establish otherwise. Do not silently interpret
+passing copy/Event controls as matching serving DEFER_NEVER. A follow-up should
+explicitly record/pin that mode before dispatch if this distinction matters.
+
 ## Confirmed source facts
 
 The 512-token runner probe is not necessarily the first model forward.

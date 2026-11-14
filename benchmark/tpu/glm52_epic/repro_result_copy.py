@@ -17,6 +17,11 @@ def main():
     import torch
     import torch_tpu  # noqa: F401
     from sglang.srt.utils.common import async_d2h
+    from torch_tpu._internal import execution_mode
+
+    print(f'EAGER_MODE initial={execution_mode.eager_mode}', flush=True)
+    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_NEVER
+    print(f'EAGER_MODE effective={execution_mode.eager_mode}', flush=True)
 
     for iteration in range(2):
         expected = torch.arange(args.elements, dtype=torch.int64) + iteration
