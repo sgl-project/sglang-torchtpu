@@ -10,6 +10,7 @@ import os
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--query-block', type=int, choices=(32, 128), required=True)
+    parser.add_argument('--oracle', choices=('zero', 'self'), default='zero')
     args = parser.parse_args()
     os.environ['JAX_PLATFORMS'] = 'cpu'
     import torch
@@ -41,7 +42,17 @@ def main():
     # Whole cache allocations, no mutation/donation in this attention-only probe.
     q = torch.zeros((64, 2048, 512), dtype=torch.bfloat16, device='tpu')
     qr = torch.zeros((64, 2048, 64), dtype=torch.bfloat16, device='tpu')
-    cn = torch.zeros((65, 128, 4, 128), dtype=torch.uint8, device='tpu')
+    cache_cpu = torch.zeros((65, 128, 512), dtype=torch.uint8)
+    expected_rows = torch.zeros((2048, 512), dtype=torch.float32)
+    if args.oracle == 'self':
+        # Exact FP8 dyadics, alternating signs across channels and token-varying
+        # values. Physical pages1..16 hold logical tokens0..2047; page0 is unused.
+        row = torch.arange(2048)[:, None]
+        channel = torch.arange(512)[None, :]
+        expected_rows = ((row % 8 + 1).float() / 8) * torch.where(channel % 2 == 0, 1, -1)
+        encoded = expected_rows.to(torch.float8_e4m3fn).view(torch.uint8)
+        cache_cpu[1:17] = encoded.reshape(16, 128, 512)
+    cn = cache_cpu.reshape(65, 128, 4, 128).to('tpu')
     cr = torch.zeros((65, 32, 4, 128), dtype=torch.uint8, device='tpu')
     topk = torch.full((2048, 2048), -1, dtype=torch.int32)
     topk[:, 0] = torch.arange(2048, dtype=torch.int32)
@@ -55,8 +66,13 @@ def main():
         out = kernel(q, qr, cn, cr, *values).cpu()
     assert out.shape == (64, 2048, 512)
     assert torch.isfinite(out).all()
-    assert torch.count_nonzero(out) == 0
-    print(f'QBLOCK_BRIDGE_ZERO_PASS query_block={args.query_block}', flush=True)
+    if args.oracle == 'zero':
+        assert torch.count_nonzero(out) == 0
+        print(f'QBLOCK_BRIDGE_ZERO_PASS query_block={args.query_block}', flush=True)
+    else:
+        expected = expected_rows.unsqueeze(0).expand(64, -1, -1)
+        torch.testing.assert_close(out.float(), expected, rtol=0, atol=1 / 128)
+        print(f'QBLOCK_BRIDGE_SELF_PASS query_block={args.query_block}', flush=True)
 
 
 if __name__ == '__main__':
