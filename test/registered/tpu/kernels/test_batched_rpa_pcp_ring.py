@@ -63,7 +63,8 @@ def _round_through(x: np.ndarray, dtype) -> np.ndarray:
     import jax.numpy as jnp
 
     j = jnp.asarray(x, dtype=jnp.float32).astype(dtype).astype(jnp.float32)
-    return np.asarray(j, dtype=np.float32)
+    # np.array (not asarray): host views of JAX buffers are read-only.
+    return np.array(j, dtype=np.float32)
 
 
 def _dense_causal_attention(
@@ -138,14 +139,14 @@ def _to_has_cache(fused_kv: np.ndarray, kv_dtype) -> np.ndarray:
         ((0, 0), (0, 0), (0, aligned_nkv2 - nkv2), (0, aligned_hd - hd)),
         constant_values=0,
     ).reshape(shape)
-    return jax.device_get(arr)
+    return np.array(jax.device_get(arr))
 
 
 def _from_has_cache(cache, nkv: int, hd: int) -> tuple[np.ndarray, np.ndarray]:
     """Unpack ``HEAD_ALONG_SUBLANE`` cache to float32 ``(k, v)`` of shape ``[pages, page, nkv, hd]``."""
     import jax.numpy as jnp
 
-    c = np.asarray(jnp.asarray(cache).astype(jnp.float32))
+    c = np.array(jnp.asarray(cache).astype(jnp.float32))
     pages, page = c.shape[:2]
     c = c.reshape(pages, page, -1, c.shape[-1])[:, :, : 2 * nkv, :hd]
     return c[:, :, 0::2], c[:, :, 1::2]
@@ -835,9 +836,12 @@ class TestBatchedRpaPcpRing(CustomTestCase):
 
         # Pack striped cache on device: [pages_per_req, cp, page, nkv, hd] -> per-rank HAS cache.
         per_shape = wrapper.get_kv_cache_shape(pages_per_req, page, nkv, hd, fp8)
-        kv_inter = jnp.stack([k_prev, v_prev], axis=2).reshape(
-            pages_per_req, cp, page, 2 * nkv, hd
-        )
+        # The pool holds whole pages: zero-fill past the cached prefix (the
+        # kernel never reads those slots).
+        pad = ((0, context_len - cached_len), (0, 0), (0, 0))
+        kv_inter = jnp.stack(
+            [jnp.pad(k_prev, pad), jnp.pad(v_prev, pad)], axis=2
+        ).reshape(pages_per_req, cp, page, 2 * nkv, hd)
         kv_inter = jnp.transpose(kv_inter, (1, 0, 2, 3, 4)).reshape(
             cp, pages_per_req, page, per_shape[2], per_shape[3], per_shape[4]
         )
