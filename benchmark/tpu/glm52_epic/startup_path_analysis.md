@@ -42,6 +42,24 @@ repeat_interleave/index_put_ helper. This synchronous read can surface an earlie
 asynchronous compiler failure; it does NOT identify D2H as its cause. Do not
 launch the device-table draft as a current fatal gate; no hardware was spent.
 
+## Copy controls and compiler-descriptor size interpretation
+
+Corrected copy/Event experiment exp-rkxqx7sxep succeeded: both hosts reported
+initial and effective DEFER_NEVER; all12 cases per host x2 iterations passed,
+including int64 upload/argmax and copy-only/Event-only/copy+Event. Evidence is
+result_copy_defer_never_rank0/1.txt. No target native fatal reproduced.
+
+The fatal's `element_size_in_bytes:4096` belongs to an internal XLA window
+descriptor (peer log723), not an established total user-tensor byte size.
+512 int64 elements in copy controls are a size variation only; do NOT describe
+them as a matched failing shape or use that field to identify an operand.
+Matching the operation/producer boundary is stronger evidence than this guess.
+
+Current allocator-transfer isolation exp-h3780e83wv / art-oejsgmh18d, source
+39d65f571db9b9341ee124d3aacce1824113dcea, tests actual CPU page expansion and
+int32 upload/blocking readback with page128, no model/distributed groups.
+One15-minute bounded wait; hardware result pending.
+
 ## Allocator producer at the host-table sync boundary
 
 TPU platform get_paged_allocator_cls returns TpuPagedTokenToKVPoolAllocator.
