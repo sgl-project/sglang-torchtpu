@@ -121,7 +121,9 @@ try:
     require(actual == expected, 'checkout SHA differs from requested exact source')
     require(not run(['git', 'status', '--porcelain', '--untracked-files=no'], 'source-status.txt'),
             'tracked source modifications detected')
-    candidate = Path('benchmark/tpu/glm52_epic/torch_prefill_candidate.json')
+    runnable = os.environ.get('GLM52_RUNNABLE_BASELINE') == '1'
+    candidate = Path('benchmark/tpu/glm52_epic/' + (
+        'torch_runnable_baseline.json' if runnable else 'torch_prefill_candidate.json'))
     require(candidate.is_file(), 'run from exact source checkout root')
     candidate_bytes = candidate.read_bytes()
     (OUT / candidate.name).write_bytes(candidate_bytes)
@@ -129,9 +131,18 @@ try:
     args = cfg['server_args']
     require(all(args.get(k) == v for k, v in {
         'tp_size': 16, 'attn_dp_size': 16, 'dp_size': 1, 'ep_size': 16,
-        'nnodes': 2, 'device': 'tpu', 'model_path': '/models/GLM5.2-fp8-channel-wise',
-        'chunked_prefill_size': 32768, 'max_prefill_tokens': 32768,
-        'tpu_compile_tokens': [2048]}.items()), 'candidate mesh/chunk/model contract changed')
+        'nnodes': 2, 'device': 'tpu', 'model_path': '/models/GLM5.2-fp8-channel-wise'
+        }.items()), 'candidate mesh/model contract changed')
+    contract = ({'enable_torch_compile': False, 'context_length': 4096,
+                 'max_total_tokens': 8192, 'chunked_prefill_size': 4096,
+                 'max_prefill_tokens': 4096} if runnable else {
+                 'chunked_prefill_size': 32768, 'max_prefill_tokens': 32768,
+                 'tpu_compile_tokens': [2048]})
+    require(all(args.get(k) == v for k, v in contract.items()), 'baseline shape contract changed')
+    if runnable:
+        require(not os.environ.get('GLM52_DIAGNOSTIC_REQUESTS'),
+                'short eager baseline cannot run matched-workload diagnostic')
+        result['scope'] = 'full-checkpoint short-input eager runnable baseline; NOT JAX performance'
     result['candidate_sha256'] = hashlib.sha256(candidate_bytes).hexdigest()
     pins = {'torch': '2.11.0+cpu', 'jax': '0.11.2', 'jaxlib': '0.11.2',
             'libtpu': '0.0.50', 'torch_tpu': '0.2.1.dev20261028201649',
