@@ -24,18 +24,24 @@ def summarize(text):
             continue
         key = (row.get('hostname'), row.get('falcon_rank'), row.get('pid'))
         stat = dict(item.split() for item in row.get('memory.stat', '').splitlines())
+        tracking_available = 'descendant_pids' in row
         children = [p for p in row.get('processes', []) if p.get('tracked_descendant')]
         sample = {
             'time_utc': datetime.datetime.fromtimestamp(row['time_ns'] / 1e9,
                         datetime.timezone.utc).isoformat(),
             'current_bytes': int(row['memory.current']),
-            'lifetime_peak_bytes': int(row.get('memory.peak', 0)),
-            'anon_bytes': int(stat.get('anon', 0)),
-            'file_bytes': int(stat.get('file', 0)),
-            'surviving_descendant_rss_kib': sum(p['rss_kib'] for p in children),
+            'lifetime_peak_bytes': int(row['memory.peak']) if 'memory.peak' in row else None,
+            'anon_bytes': int(stat['anon']) if 'anon' in stat else None,
+            'file_bytes': int(stat['file']) if 'file' in stat else None,
+            'cgroup_read_root': row.get('cgroup_read_root'),
+            'self_cgroup': row.get('self_cgroup'),
+            'root_pids': row.get('root_pids'),
+            'descendant_processes': children,
+            'surviving_descendant_rss_kib': (
+                sum(p['rss_kib'] for p in children) if tracking_available else None),
             # Max individual HWM; summing independent HWMs invents a peak.
             'max_individual_survivor_hwm_kib': max(
-                (p['rss_hwm_kib'] for p in children), default=0),
+                (p['rss_hwm_kib'] for p in children), default=0) if tracking_available else None,
             'memory_events': row.get('memory.events'),
             'native_log': row.get('native_log'),
         }
