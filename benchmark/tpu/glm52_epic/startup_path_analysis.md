@@ -135,8 +135,17 @@ Nonzero FP8 dyadics vary with token and channel sign; self picks one key,
 causal mean picks1..2048 unique keys with zero queries. This validates cache
 reading and multi-page/step accumulation in the tested single-request case,
 not nonuniform softmax/rope logits, full model, or general performance.
-Logs: qblock_numeric_rank0.txt/rank1.txt. Mixed-request shared-tile/padding
-oracle remains a separate pending hardware gate. Production selector unchanged.
+Logs: qblock_numeric_rank0.txt/rank1.txt.
+
+exp-x22a112f8z (200ed0c758), terminal SUCCEEDED 15:31:06Z: both pods emit
+exactly one MIXED_SELF_PASS. Requests [0,17) and [17,164) share qb32 tile0;
+second request uses independent pages34/35, crosses a page boundary; remaining
+1884 batch rows are padding. All64 heads and all output rows match the
+nonzero self oracle / zero padding at atol1/128. Logs:
+qblock_mixed_rank0.txt/rank1.txt. Production selector still unchanged.
+A future selector adjustment must retain validated pps2 at H64/P128: simply
+shrinking qb before the existing score-budget loop would increase pps from2
+to8 and would NOT be the hardware-tested candidate.
 
 ## TorchTPU bridge pair: VMEM control reproduced, qb32 zero oracle passed
 
