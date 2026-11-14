@@ -34,6 +34,9 @@ class TpuEnvs:
     SGLANG_TPU_BENCHMARK_TIMEOUT_SEC = EnvFloat(600.0)
     SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE = EnvBool(True)
     SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS = EnvBool(True)
+    # Fetch only this rank's routed-expert tensors with Run:AI when expert
+    # parallelism shards the checkpoint (ep_weight_shard.py).
+    SGLANG_TPU_EP_SHARDED_WEIGHT_LOAD = EnvBool(False)
     # Host heap (see host_heap_trim.py)
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
