@@ -265,6 +265,7 @@ NIGHTLY_SUITES = {
         "nightly-tpu-accuracy-muse-spark-gsm8k",
         "nightly-tpu-accuracy-muse-spark-mmlupro",
         "nightly-tpu-accuracy-glm-5-3-flash-aime",
+        "nightly-tpu-accuracy-deepseek-v41-flash-gsm8k",
         # External tpu7x cluster (nightly-test-external-tpu.yml; see
         # .github/tpu-ci/external/README.md). 1host: single-host tests that launch
         # their own server. 2x2x2 / 2x2x4: multi-host jobs wired by hand in
