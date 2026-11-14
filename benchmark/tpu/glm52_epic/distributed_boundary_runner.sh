@@ -39,19 +39,6 @@ for case in roundtrip all-reduce asymmetric; do
         done
         [[ -n "$TORCH_TPU_TOPOLOGY" ]] || exit 2
         printf 'LOCAL_DISCOVERY_VALIDATED topology=%s addresses=%s\n' "$TORCH_TPU_TOPOLOGY" "$TORCH_TPU_SLICEBUILDER_ADDRESSES"
-        : <<'PY'
-import os, socket
-addresses = os.environ['TORCH_TPU_SLICEBUILDER_ADDRESSES'].split(',')
-if len(addresses) != 8 or any(':' not in a for a in addresses):
-    raise SystemExit('expected exactly 8 local slice-builder addresses')
-for address in addresses:
-    host, _port = address.rsplit(':', 1)
-    if host not in ('localhost', '127.0.0.1') and socket.gethostname() != host:
-        raise SystemExit(f'non-local launcher address: {host!r}')
-if not os.environ.get('TORCH_TPU_TOPOLOGY'):
-    raise SystemExit('launcher did not produce local topology')
-print('LOCAL_DISCOVERY_VALIDATED', os.environ['TORCH_TPU_TOPOLOGY'], addresses, flush=True)
-PY
         python -m torch.distributed.run --standalone --nproc_per_node="$WORLD_SIZE" \
             -m benchmark.tpu.glm52_epic.repro_distributed_boundary --case "$1"
     ' _ "$case" 2>&1 | tee "$OUT/$case.log"
