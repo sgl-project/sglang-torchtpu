@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checkpoint-free production sparse MLA op, single-key analytical oracle.
+"""Checkpoint-free production sparse MLA op with analytical output oracles.
 
 Use a fresh pinned-runtime process. Not a model/decode baseline, full-topk
 accuracy test, or performance benchmark. Cache writes and reuse are checked.
@@ -13,6 +13,8 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--queries', type=int, choices=(1, 64), default=1)
+    parser.add_argument('--selection', choices=('self', 'causal-mean'), default='self',
+                        help='Single key, or causal keys with zero queries and uniform weights.')
     args = parser.parse_args()
     if 'jax' in sys.modules:
         raise RuntimeError('fresh process required')
@@ -36,20 +38,25 @@ def main():
     def upload(a):
         return torch.from_numpy(a).to('tpu')
 
-    q = torch.ones((t, h, 512), dtype=torch.bfloat16, device='tpu')
-    qr = torch.ones((t, h, 64), dtype=torch.bfloat16, device='tpu')
+    query_value = 1 if args.selection == 'self' else 0
+    q = torch.full((t, h, 512), query_value, dtype=torch.bfloat16, device='tpu')
+    qr = torch.full((t, h, 64), query_value, dtype=torch.bfloat16, device='tpu')
     # Whole allocations, not views: the production op donates these buffers.
     cn = torch.zeros((2, p, 4, 128), dtype=torch.uint8, device='tpu')
     cr = torch.zeros((2, p // 4, 4, 128), dtype=torch.uint8, device='tpu')
     topk = np.full((t, k), -1, np.int32)
-    topk[:, 0] = np.arange(t)
+    if args.selection == 'self':
+        topk[:, 0] = np.arange(t)
+    else:
+        for row in range(t):
+            topk[row, :row + 1] = np.arange(row + 1)
     metadata = [upload(np.array(a, np.int32)) for a in (
         [t], [1], [0, t], [0, p], [1, 1, 1] if t == 1 else [0, 0, 1])]
     topk_tensor = upload(topk)
     op = _build_pallas_sparse_mla_kernel_op(qblock_kpool=0)
     for iteration, sign in enumerate((1, -1)):
-        # Exactly representable FP8 dyadics. Each query selects only itself:
-        # softmax has one element, so its output must be the selected value.
+        # Exactly representable FP8 dyadics. Self selection returns that value;
+        # zero-query causal selection returns the prefix's uniform mean.
         rows = np.arange(t)[:, None]
         values = sign * ((rows % 8 + 1) / 8) * np.where(np.arange(512) % 2, -1, 1)
         rope = np.broadcast_to(sign * ((rows % 4 + 1) / 8), (t, 64)).copy()
@@ -63,7 +70,10 @@ def main():
             actual = out.cpu().float().numpy()
             actual_cn = cn.cpu().numpy()
             actual_cr = cr.cpu().numpy()
-        expected = np.broadcast_to(values[:, None, :], (t, h, 512))
+        expected_rows = values
+        if args.selection == 'causal-mean':
+            expected_rows = values.cumsum(axis=0) / np.arange(1, t + 1)[:, None]
+        expected = np.broadcast_to(expected_rows[:, None, :], (t, h, 512))
         assert actual.shape == (t, h, 512), actual.shape
         assert np.isfinite(actual).all()
         np.testing.assert_allclose(actual, expected, rtol=0, atol=1 / 128)
@@ -73,7 +83,7 @@ def main():
         expected_cr[1, :t, :64] = vr_cpu.view(torch.uint8).numpy()
         np.testing.assert_array_equal(actual_cn.reshape(2, p, 512), expected_cn)
         np.testing.assert_array_equal(actual_cr.reshape(2, p, 128), expected_cr)
-        print(f'PRODUCTION_SPARSE_STEP_PASS iteration={iteration} queries={t}', flush=True)
+        print(f'PRODUCTION_SPARSE_STEP_PASS iteration={iteration} queries={t} selection={args.selection}', flush=True)
 
 
 if __name__ == '__main__':
