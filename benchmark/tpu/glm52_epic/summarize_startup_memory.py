@@ -14,7 +14,10 @@ def summarize(text):
         text = envelope['content']
     groups = {}
     for line in text.splitlines():
-        if line.startswith('GLM52_HOST_MEMORY '):
+        sample_kind = 'periodic'
+        if line.startswith(('GLM52_HOST_MEMORY ', 'GLM52_PRE_CLEANUP_MEMORY ')):
+            sample_kind = ('pre_cleanup' if line.startswith('GLM52_PRE_CLEANUP_MEMORY ')
+                           else 'periodic')
             line = line.split(' ', 1)[1]
         try:
             row = json.loads(line)
@@ -27,6 +30,7 @@ def summarize(text):
         tracking_available = 'descendant_pids' in row
         children = [p for p in row.get('processes', []) if p.get('tracked_descendant')]
         sample = {
+            'sample_kind': sample_kind,
             'time_utc': datetime.datetime.fromtimestamp(row['time_ns'] / 1e9,
                         datetime.timezone.utc).isoformat(),
             'current_bytes': int(row['memory.current']),
