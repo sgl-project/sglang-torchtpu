@@ -25,6 +25,8 @@ def collect(proc=Path('/proc'), cgroup=Path('/sys/fs/cgroup')):
             rss = int(fields.get('VmRSS', '0 kB').split()[0])
             if rss > 100000:
                 processes.append({'pid': int(p.name), 'rss_kib': rss,
+                                  'rss_hwm_kib': int(fields.get('VmHWM', '0 kB').split()[0]),
+                                  'ppid': int(fields.get('PPid', '0').strip()),
                                   'name': fields.get('Name', '').strip()})
         except (OSError, ValueError):
             pass

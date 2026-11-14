@@ -1,0 +1,16 @@
+{
+  "experiment_id": "exp-8vb32ntf9t",
+  "artifact_id": "art-bskwwao3nn",
+  "job_id": "job-8w8nc3y79t",
+  "source_commit": "edcf9b47b998b37d4bf3d5dcdf12e80a2eb07a99",
+  "cluster": "gke-tpu-train-us-central1-1-prod",
+  "scope": "Checkpoint-free single-device gather per host; not model serving or performance evidence",
+  "physical_chips": 8,
+  "hosts": 2,
+  "cases": {"backends": ["jax", "torch"], "queries": 1, "page_size": 128, "per_case_timeout_seconds": 600},
+  "runtime_identity": "Documented mutable peer base tag plus SHA-verified bootstrap and wheel; not immutable image",
+  "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3",
+  "submission_status": "PENDING",
+  "hardware_result": null,
+  "local_runner_fixture": "Verified child137 does not suppress second backend and parent exits1; no hardware exercised"
+}
