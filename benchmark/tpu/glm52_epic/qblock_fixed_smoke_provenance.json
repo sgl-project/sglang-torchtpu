@@ -4,11 +4,18 @@
   "source_commit": "99ea485f27de77f820da454fd53ea6cde4123286",
   "comparison_experiment": "exp-9320106a77",
   "comparison_source": "1e9935c863b13653ec19adbb9d3cffb190fe75b5",
-  "verified_production_delta": ["sglang_tpu/attention/pallas/mla_sparse_qblock_tokens.py: post-legacy-pps query tile shrinking, minimum32"],
+  "verified_production_delta": [
+    "sglang_tpu/attention/pallas/mla_sparse_qblock_tokens.py: post-legacy-pps query tile shrinking, minimum32"
+  ],
   "config_byte_identical_to_comparison": true,
   "diagnostic_changes": "host identity, bounded native tails, CR progress parsing, pre-cleanup snapshot and cleanup boundary",
   "scope": "small startup/request/decode baseline only; not matched JAX performance",
-  "acceptance": ["native server health200", "512 input token IDs generate exactly2 output IDs without abort", "launcher alive after request", "peer acknowledgment"],
+  "acceptance": [
+    "native server health200",
+    "512 input token IDs generate exactly2 output IDs without abort",
+    "launcher alive after request",
+    "peer acknowledgment"
+  ],
   "coverage_limit": "local chunk ceiling256; HTTP request does not prove qblock runtime dispatch; compile warmup2048 covers a distinct graph",
   "status": "running; terminal evidence pending",
   "early_native_observation": {
@@ -19,7 +26,29 @@
     "rank1_current_gib": 6.51,
     "effective_local_chunk": 256,
     "effective_compile_max_bs": 1,
-    "effective_decode_buckets": [1],
+    "effective_decode_buckets": [
+      1
+    ],
     "additional_native_flags": "enhanced launch barrier; SC all-reduce offload false; associative scan emitter false; original HLO save false; VMEM prefetch max outstanding1"
+  },
+  "partial_load_completion": {
+    "falcon_rank": 1,
+    "worker_dp_ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "native_time_utc": "2026-11-14T16:45:34Z",
+    "elapsed_seconds_range": [
+      2740.71,
+      2741.44
+    ],
+    "source_envelope_sha256": "135ce7b3abdcb8a429e7ba3fc780928378eea5d9c65ab201002fef60fc713372",
+    "limitation": "Only DP0-7 load-end observed; host0 DP8-15 load-end, global cache release and compile entry not yet established"
   }
 }
