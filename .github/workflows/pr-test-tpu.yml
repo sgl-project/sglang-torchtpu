@@ -100,6 +100,10 @@ jobs:
               - 'python/sglang/multimodal_gen/runtime/models/dits/zimage.py'
               - 'python/sglang/multimodal_gen/test/unit/test_usp_*.py'
               - 'python/sglang/multimodal_gen/test/unit/test_wan_sp_padding.py'
+              # Shared diffusion warmup request builder and the core test the TPU
+              # wrapper imports.
+              - 'python/sglang/multimodal_gen/runtime/warmup_request_builder.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_cfg_parallel_warmup.py'
               - 'python/pyproject_tpu.toml'
               - 'benchmark/tpu/**'
               - 'docker/tpu.Dockerfile'
