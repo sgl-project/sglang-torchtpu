@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Select this kernel with `--attention-backend pallas_tpu_rpa_batched`. It reads
-# the token-major KV cache by default; set SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 for
-# the seq-along-lane layout, which also switches the KV pool that allocates it.
+"""Batched ragged paged attention (RPA) Pallas kernel.
+
+Select this kernel with `--attention-backend pallas_tpu_rpa_batched`. It reads
+the token-major KV cache by default; set SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 for
+the seq-along-lane layout, which also switches the KV pool that allocates it.
+
+The package is a port of google3's
+`experimental/users/alynie/batched_rpa/kernel`, synced at google3 cl/1018717699,
+and keeps that tree's file split and names (`pipeline`, `scheduler`,
+`scheduler_cp`, ...) so later google3 changes can be applied as diffs. SGLang
+behaviour that google3 does not have is layered on top; `wrapper` documents the
+public contract.
+"""
