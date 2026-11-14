@@ -1,0 +1,11 @@
+{
+  "round": 244,
+  "status": "ACTIVE_NOT_COMPLETE",
+  "accepted_baseline": "exp-48q9eb5nxn",
+  "latest_commit": "e66a76893f",
+  "validated_local": ["observer", "summarizer", "cache client", "barrier", "inventory", "JSON", "shell syntax"],
+  "unresolved": ["historical fatal originating IR", "exit137 killed child/unique peak", "real Torch matched admission", "matched precision/performance"],
+  "capacity_decision": "compile ladder not submitted because observed pools are64-chip4x4x4, not explicit8-chip2x2x2",
+  "guardrails": ["no16chip", "noDCP", "noFlashchanges", "matched gate fail-closed"],
+  "untracked_intentional": ["repro_request_table.py", "request_table_runner.sh"]
+}
