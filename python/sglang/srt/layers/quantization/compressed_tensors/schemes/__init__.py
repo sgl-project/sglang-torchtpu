@@ -11,7 +11,10 @@ from .compressed_tensors_w4a8_fp8_moe import CompressedTensorsW4AFP8MoE
 from .compressed_tensors_w4a8_int8_moe import NPUCompressedTensorsW4A8Int8DynamicMoE
 from .compressed_tensors_w4a8_mxfp4_moe import NPUCompressedTensorsW4A8mxfp4MoE
 from .compressed_tensors_w8a8_fp8 import CompressedTensorsW8A8Fp8
-from .compressed_tensors_w8a8_fp8_moe import CompressedTensorsW8A8Fp8MoE
+from .compressed_tensors_w8a8_fp8_moe import (
+    CompressedTensorsW8A8Fp8MoE,
+    TpuCompressedTensorsW8A8Fp8MoE,
+)
 from .compressed_tensors_w8a8_int8 import (
     CompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8,
@@ -35,6 +38,7 @@ __all__ = [
     "CompressedTensorsMoEScheme",
     "CompressedTensorsW8A8Fp8",
     "CompressedTensorsW8A8Fp8MoE",
+    "TpuCompressedTensorsW8A8Fp8MoE",
     "CompressedTensorsW8A16Fp8",
     "CompressedTensorsW8A8Int8",
     "NPUCompressedTensorsW8A8Int8",
