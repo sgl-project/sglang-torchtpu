@@ -1549,24 +1549,41 @@ class ModelConfig:
             return max(per_layer)
         return self.num_attention_heads
 
+    def _kv_dcp_size(self, dcp_size: int) -> int:
+        """DCP ranks that replicate this model's KV heads inside attention TP.
+
+        1 for a draft (it never joins the DCP group) and on a platform whose
+        DCP ranks are the attention context-parallel ranks: those already
+        lie outside attention TP and hold different tokens of the same heads.
+        """
+        if dcp_size <= 1 or self.is_draft_model:
+            return 1
+        from sglang.srt.platforms import current_platform
+
+        if current_platform.dcp_stripes_over_attn_cp():
+            return 1
+        return dcp_size
+
     def get_num_kv_heads(self, tensor_parallel_size: int, dcp_size: int = 1) -> int:
         """Number of KV heads per GPU.
 
         DCP ranks replicate KV, so heads shard across ``tp // dcp`` groups.
-        Drafts never join the group and ignore ``dcp_size``. With fewer heads
-        than groups, each GPU keeps one.
+        Drafts never join the group and ignore ``dcp_size``, and so does a
+        platform whose DCP stripe group is the attention context-parallel
+        group (``dcp_stripes_over_attn_cp``). With fewer heads than groups,
+        each GPU keeps one. A DCP group wider than the attention TP width
+        (context-parallel ranks, which each hold every head) is a single KV
+        group.
         """
         total_num_kv_heads = self.get_total_num_kv_heads()
-        if self.is_draft_model:
-            dcp_size = 1
-        kv_tensor_parallel_size = tensor_parallel_size // dcp_size
+        dcp_size = self._kv_dcp_size(dcp_size)
+        kv_tensor_parallel_size = max(1, tensor_parallel_size // dcp_size)
         return max(1, total_num_kv_heads // kv_tensor_parallel_size)
 
     def get_swa_num_kv_heads(self, tensor_parallel_size, dcp_size: int = 1) -> int:
         """Similar to get_num_kv_heads(), but for SWA."""
-        if self.is_draft_model:
-            dcp_size = 1
-        kv_tensor_parallel_size = tensor_parallel_size // dcp_size
+        dcp_size = self._kv_dcp_size(dcp_size)
+        kv_tensor_parallel_size = max(1, tensor_parallel_size // dcp_size)
         if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
             total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
             return max(1, total_num_kv_heads // kv_tensor_parallel_size)

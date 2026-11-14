@@ -379,6 +379,40 @@ class TestGetDcpLens(CustomTestCase):
         self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 1)
         self.assertEqual(model_config.get_num_kv_heads(16), 1)
 
+    def test_a_dcp_group_wider_than_the_attention_tp_width_is_one_kv_group(self):
+        """Context-parallel ranks each hold every head, so the attention TP
+        width (tp // cp) can be smaller than the DCP group: the pool then
+        holds all KV heads instead of dividing by a zero group count."""
+        model_config = self._kv_head_config(is_draft_model=False)
+
+        self.assertEqual(model_config.get_num_kv_heads(1, dcp_size=8), 8)
+        self.assertEqual(model_config.get_num_kv_heads(2, dcp_size=8), 8)
+        self.assertEqual(model_config.get_swa_num_kv_heads(1, dcp_size=8), 8)
+        model_config.hf_text_config.swa_num_key_value_heads = 4
+        self.assertEqual(model_config.get_swa_num_kv_heads(1, dcp_size=8), 4)
+        # Unchanged wherever the group fits the TP width.
+        self.assertEqual(model_config.get_num_kv_heads(8, dcp_size=8), 8)
+        self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=8), 4)
+
+    def test_a_dcp_stripe_over_the_attention_cp_group_keeps_tp_sharded_heads(self):
+        """When the platform stripes DCP over the attention context-parallel
+        group, the DCP ranks hold different tokens of the same heads, so the
+        pool shards heads over attention TP alone (e.g. PCP4 x TP2 with 8 KV
+        heads: 4 per rank, not 8)."""
+        from sglang.srt.platforms import current_platform
+
+        model_config = self._kv_head_config(is_draft_model=False)
+        model_config.hf_text_config.swa_num_key_value_heads = 4
+        with patch.object(
+            type(current_platform), "dcp_stripes_over_attn_cp", return_value=True
+        ):
+            self.assertEqual(model_config.get_num_kv_heads(2, dcp_size=4), 4)
+            self.assertEqual(model_config.get_num_kv_heads(1, dcp_size=8), 8)
+            self.assertEqual(model_config.get_num_kv_heads(4, dcp_size=2), 2)
+            self.assertEqual(model_config.get_swa_num_kv_heads(2, dcp_size=4), 2)
+        # Without the platform opt-in DCP still divides the TP width.
+        self.assertEqual(model_config.get_num_kv_heads(4, dcp_size=2), 4)
+
     def test_gqa_qkv_loader_replicates_kv_within_dcp_group(self):
         hidden_size = 4
         head_size = 2
