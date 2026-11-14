@@ -40,7 +40,7 @@ if __name__ == '__main__':
         with out.open('a') as stream:
             stream.write(json.dumps(data) + '\n')
             stream.flush()
-        # Mirror bounded counters to durable Falcon stdout before a possible kill.
-        print('GLM52_HOST_MEMORY ' + json.dumps({k: v for k, v in data.items()
-              if k not in ('meminfo', 'memory.stat')}), flush=True)
+        # Keep anon/file/shmem and host availability in durable stdout too:
+        # cgroup usage includes file cache and must not be called compiler RSS.
+        print('GLM52_HOST_MEMORY ' + json.dumps(data), flush=True)
         time.sleep(30)

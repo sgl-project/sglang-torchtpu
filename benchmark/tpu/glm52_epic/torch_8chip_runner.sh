@@ -270,20 +270,25 @@ try:
         # validate the peer recipe we are testing here. The long candidate keeps
         # the historical short probe because it is not the q-block smoke.
         smoke_tokens = 512 if mode in ('eager', 'compile-smoke') else 4
+        # One output comes from prefill logits; require a second output to
+        # exercise a decode forward, which never uses the q-block prefill op.
+        smoke_outputs = 2 if mode in ('eager', 'compile-smoke') else 1
         request_body = {'input_ids': [1] * smoke_tokens, 'sampling_params': {
-            'temperature': 0, 'max_new_tokens': 1, 'ignore_eos': True}, 'stream': False}
+            'temperature': 0, 'max_new_tokens': smoke_outputs, 'ignore_eos': True}, 'stream': False}
         save('generate-request.json', request_body)
         code, body = request('http://127.0.0.1:30000/generate', request_body, timeout=600)
         (OUT / 'generate-response.json').write_bytes(body)
         response = json.loads(body)
         require(code == 200 and isinstance(response, dict), '/generate failed')
         meta = response.get('meta_info', {})
-        require(meta.get('completion_tokens') == 1, 'smoke did not produce exactly one token')
+        require(meta.get('completion_tokens') == smoke_outputs,
+                f'smoke did not produce exactly {smoke_outputs} tokens')
         require(meta.get('finish_reason', {}).get('type') != 'abort', 'generation aborted')
         ids = response.get('output_ids')
         # Current native response includes IDs; never silently treat absence as success.
-        require(isinstance(ids, list) and len(ids) == 1 and type(ids[0]) is int,
-                'current native /generate must return one output token ID')
+        require(isinstance(ids, list) and len(ids) == smoke_outputs
+                and all(type(token) is int for token in ids),
+                f'current native /generate must return {smoke_outputs} output token IDs')
         result.update(health_status=200, generate_status=code, output_ids=ids,
                       request_success_count=1, generate_input_tokens=len(request_body['input_ids']),
                       expected_attention_path=(
