@@ -15,7 +15,7 @@
     "tpu_fp8_runtime": "channelwise",
     "json_model_override_args": "{\"quantization_config\":{\"quant_method\":\"fp8\",\"activation_scheme\":\"dynamic\",\"fmt\":\"e4m3\",\"weight_block_size\":null,\"tpu_checkpoint_layout\":\"glm52_channelwise_fp8\"}}",
     "kv_cache_dtype": "fp8_e4m3",
-    "page_size": 64,
+    "page_size": 128,
     "context_length": 4096,
     "chunked_prefill_size": 4096,
     "max_prefill_tokens": 4096,

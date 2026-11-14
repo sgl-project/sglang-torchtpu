@@ -138,10 +138,10 @@ try:
         }.items()), 'candidate mesh/model contract changed')
     contract = ({'enable_torch_compile': False, 'context_length': 4096,
                  'max_total_tokens': 8192, 'chunked_prefill_size': 4096,
-                 'max_prefill_tokens': 4096} if mode == 'eager' else
+                 'max_prefill_tokens': 4096, 'page_size': 128} if mode == 'eager' else
                 {'enable_torch_compile': True, 'context_length': 4096,
                  'max_total_tokens': 8192, 'chunked_prefill_size': 4096,
-                 'max_prefill_tokens': 4096, 'torch_compile_max_bs': 1,
+                 'max_prefill_tokens': 4096, 'page_size': 128, 'torch_compile_max_bs': 1,
                  'tpu_compile_bs': [1], 'tpu_compile_tokens': [2048]} if mode == 'compile-smoke' else {
                  'chunked_prefill_size': 32768, 'max_prefill_tokens': 32768,
                  'tpu_compile_tokens': [2048]})

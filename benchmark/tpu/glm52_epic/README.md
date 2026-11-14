@@ -105,7 +105,10 @@ observed fatal signatures were `window_bounds` rank mismatch and an unsupported
 
 The peer Kimi-K3.1 and GLM-5.3-Flash recipes enable the query-blocked sparse MLA
 prefill path and set the libtpu SparseCore/fast-merge flags. The short GLM52
-candidates now carry the same narrowly relevant settings:
+candidates now carry the same narrowly relevant settings. They also use
+`page_size=128`, matching the peer DSA recipes and satisfying the q-block
+plain-DSA kernel's hardware contract (`page_size % 128 == 0`); the earlier
+`page_size=64` candidate could never enter that q-block path.
 `SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL=1`,
 `SGLANG_TPU_ASYNC_COPY_WORKER=0`,
 `xla_tpu_buffer_assignment_enable_fast_merge_fallback=false`, and
