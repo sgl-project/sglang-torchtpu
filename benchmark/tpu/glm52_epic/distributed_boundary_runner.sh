@@ -29,7 +29,17 @@ for case in roundtrip all-reduce asymmetric; do
         eval "$discovery"
         export TORCH_TPU_TOPOLOGY TORCH_TPU_SLICEBUILDER_ADDRESSES WORLD_SIZE
         [[ "$WORLD_SIZE" == 8 ]] || exit 2
-        python - <<'PY'
+        # Validate the launcher output in shell; do not embed a heredoc inside
+        # the single-quoted nested bash command.
+        IFS=, read -r -a addresses <<< "$TORCH_TPU_SLICEBUILDER_ADDRESSES"
+        [[ "${#addresses[@]}" == 8 ]] || exit 2
+        for address in "${addresses[@]}"; do
+            host=${address%:*}
+            [[ "$host" == localhost || "$host" == 127.0.0.1 || "$host" == "$(hostname)" ]] || exit 2
+        done
+        [[ -n "$TORCH_TPU_TOPOLOGY" ]] || exit 2
+        printf 'LOCAL_DISCOVERY_VALIDATED topology=%s addresses=%s\n' "$TORCH_TPU_TOPOLOGY" "$TORCH_TPU_SLICEBUILDER_ADDRESSES"
+        : <<'PY'
 import os, socket
 addresses = os.environ['TORCH_TPU_SLICEBUILDER_ADDRESSES'].split(',')
 if len(addresses) != 8 or any(':' not in a for a in addresses):
