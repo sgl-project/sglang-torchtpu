@@ -1,5 +1,24 @@
 # GLM52 startup-path audit
 
+## Latest full-checkpoint eager outcome: exp-2h7w8l2bga
+
+FAILED (peer task exit1; schedulers SIGABRT -6), not exit137. Both hosts
+finished loading; peer DP8-15 ended at 12:01:02-03 UTC after ~3026s, versus
+primary DP0-7 ~2600s. Peer allocated tokens8192/KV0.43GB at 12:01:09.
+Crucially, its global compile warmup explicitly submitted **0 calls** at
+12:01:10. At 12:01:20 it emitted the same window_bounds rank0-vs1/base(2)
+and vmreg/vreg-to-U64 native lowering fatals as the archived run. Thus this
+reproduction does not require torch.compile graph warmup, large KV capacity,
+or the asynchronous copy worker. It still requires attribution to an actual
+operation; asynchronous Python broadcast/Event stacks are not that attribution.
+Peer evidence: `eager_r59_peer_failure.txt`. Primary durable stdout currently
+contains bootstrap provenance only, despite copied live log proving load end;
+do not invent primary HTTP/prefill timing from the peer log.
+
+Next bounded experiment: exp-pjqqwzqvwk / art-87lllasmfe, source
+da842fd3a6d1b492c2a12a6c1ed1865be8866ac0, query4 head-major prefill fallback,
+no checkpoint. One 25-minute wait; no full-model retry.
+
 ## Confirmed source facts
 
 The 512-token runner probe is not necessarily the first model forward.
