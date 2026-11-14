@@ -370,6 +370,22 @@ except BaseException as error:
     traceback.print_exc()
 finally:
     signal.alarm(0)
+    # Preserve the boundary before our own TERM/KILL can change process evidence.
+    cleanup_boundary = {'time_ns': time.time_ns(), 'falcon_rank': RANK,
+                        'status': result['status'], 'error': result.get('error'),
+                        'launcher_pid': None if launcher is None else launcher.pid,
+                        'launcher_returncode_before_cleanup': (
+                            None if launcher is None else launcher.poll())}
+    save('cleanup-boundary.json', cleanup_boundary)
+    print('GLM52_CLEANUP_BEGIN ' + json.dumps(cleanup_boundary), flush=True)
+    if launcher is not None:
+        try:
+            data = collect_memory(root_pids=(launcher.pid,))
+            data['native_log'] = log_snapshot(OUT / 'server.log')
+            save('pre-cleanup-memory.json', data)
+            print('GLM52_PRE_CLEANUP_MEMORY ' + json.dumps(data), flush=True)
+        except Exception as error:
+            print(f'GLM52_HOST_MEMORY_ERROR pre-cleanup {error!r}', flush=True)
     # The native launcher owns separate server process groups. SIGTERM it first
     # so its finally block reaps workers; capture descendant groups as fallback.
     if launcher is not None:
