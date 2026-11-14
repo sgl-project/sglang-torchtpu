@@ -806,6 +806,38 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
         self.assertEqual(seen[0].tolist(), [1, 2])
 
+    def test_dflash_kv_fence_tail_reads_layer_buffers_of_any_rank(self):
+        """A plugin's pool (_mha_kv_pool_cls) may give its layer buffers another rank than 5."""
+        from sglang_tpu.experimental.speculative import block_draft_worker
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        class PluginPool(TpuFusedMHATokenToKVPool):
+            def __init__(self, shape):
+                self.kv_buffer = [torch.zeros(shape), torch.zeros(shape)]
+
+        def write_draft_kv(*, kv_pool, **_):
+            kv_pool.kv_buffer[-1].fill_(1)
+
+        for shape in ((3, 2, 4, 8, 16), (3, 2, 4, 32)):
+            pool = PluginPool(shape)
+            worker = SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    token_to_kv_pool=pool, req_to_token_pool=SimpleNamespace(size=2)
+                ),
+                _draft_model=lambda: SimpleNamespace(project_target_hidden=lambda h: h),
+            )
+            with patch.object(
+                block_draft_worker, "dflash_write_draft_kv", write_draft_kv
+            ):
+                tail = block_draft_worker.TpuBlockDraftWorker._write_draft_kv_eager(
+                    worker,
+                    target_hidden=torch.zeros(2, 8),
+                    cache_loc=torch.arange(2),
+                    positions=torch.arange(2),
+                )
+            # The last layer's first row, read after the write.
+            torch.testing.assert_close(tail, torch.ones(shape)[0, 0].sum().reshape(1))
+
     def test_pp_stages_before_the_last_get_no_draft(self):
         """Under PP only the last stage hosts the draft; an earlier stage building one
         would bind the target embedding or lm_head its stage does not hold."""

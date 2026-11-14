@@ -176,7 +176,8 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         # next step donates the pool, and an indexed view lowers to an as_strided
         # that relayouts the whole tiled layer on every write. Reducing a slice of
         # the two untiled leading dims avoids both.
-        return kv_pool.kv_buffer[-1][:1, :1].to(torch.float32).sum(dim=(1, 2, 3, 4))
+        buf = kv_pool.kv_buffer[-1]
+        return buf[:1, :1].to(torch.float32).sum(dim=tuple(range(1, buf.dim())))
 
     def _draft_model(self) -> DFlashDraftModel:
         model = self.model_runner.model
