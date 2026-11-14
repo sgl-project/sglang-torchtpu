@@ -1,0 +1,30 @@
+{
+  "goal_status": "ACTIVE_NOT_COMPLETE",
+  "accepted_baseline": "exp-48q9eb5nxn",
+  "completed_this_span": [
+    "short full-checkpoint two-host Torch baseline accepted",
+    "static long-table/high-page/retained-prefix/two-request synthetic sparse MLA diagnostics passed on both hosts",
+    "JAX reference DP mapping and paused admission inventory verified",
+    "fail-closed scheduler barrier/inventory/observer prototypes and stdlib tests",
+    "exit137 memory sampler retains descendant command lines",
+    "compile ladder planned but capacity-gated and not submitted"
+  ],
+  "remaining": [
+    "historical eager window/U64 fatal originating op and IR attribution",
+    "historical exit137 killed child and compiler unique peak attribution",
+    "real 8-chip scheduler barrier/readback and rank completion evidence",
+    "same-workload Torch run and precision/IR equivalence against JAX",
+    "matched steady-state performance intervals and ratio"
+  ],
+  "guardrails": [
+    "no16chip",
+    "noDCP",
+    "noFlashchanges",
+    "do not relax matched performance gate",
+    "do not change mmap/compiler concurrency/decode buckets without causal evidence"
+  ],
+  "untracked_intentionally_not_staged": [
+    "benchmark/tpu/glm52_epic/repro_request_table.py",
+    "benchmark/tpu/glm52_epic/request_table_runner.sh"
+  ]
+}
