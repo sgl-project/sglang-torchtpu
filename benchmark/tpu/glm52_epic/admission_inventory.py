@@ -6,7 +6,7 @@ on scheduler threads while paused. Counts alone are intentionally insufficient.
 from collections import Counter
 
 
-def validate_inventory(expected_routes, snapshots):
+def validate_inventory(expected_routes, snapshots, *, run_token, epoch, sequence):
     """Validate one snapshot per attention-DP scheduler (PP1/attnTP1 only).
 
     expected_routes maps explicit RID to integer DP rank. Each snapshot contains
@@ -17,6 +17,9 @@ def validate_inventory(expected_routes, snapshots):
                                   type(rank) is not int or rank < 0
                                   for rid, rank in expected_routes.items()):
         raise ValueError('nonempty explicit RID-to-rank mapping required')
+    if (type(run_token) is not str or not run_token or type(epoch) is not str
+            or not epoch or type(sequence) is not int or sequence < 0):
+        raise ValueError('explicit run/epoch/nonnegative sequence required')
     ranks = set(expected_routes.values())
     if ranks != set(range(max(ranks) + 1)):
         raise ValueError('expected routes must cover contiguous participating ranks')
@@ -30,12 +33,15 @@ def validate_inventory(expected_routes, snapshots):
             reasons.append('unexpected_rank')
             continue
         seen_ranks.append(rank)
+        if (snap.get('run_token') != run_token or snap.get('epoch') != epoch
+                or type(snap.get('sequence')) is not int or snap['sequence'] != sequence):
+            reasons.append(f'rank{rank}:stale_or_wrong_epoch')
         for key in ('pending_results', 'deferred_inputs'):
             if type(snap.get(key)) is not int or snap[key] != 0:
                 reasons.append(f'rank{rank}:nonzero_or_unknown_{key}')
         if snap.get('paused') is not True:
             reasons.append(f'rank{rank}:not_paused')
-        for key in ('waiting_rids', 'running_rids', 'chunked_rids'):
+        for key in ('waiting_rids', 'running_rids', 'chunked_rids', 'last_batch_rids'):
             value = snap.get(key)
             if not isinstance(value, list) or any(type(rid) is not str for rid in value):
                 reasons.append(f'rank{rank}:malformed_{key}')

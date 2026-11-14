@@ -12,12 +12,14 @@ from pathlib import Path
 def snapshot(scheduler, rank):
     running = getattr(scheduler, 'running_batch', None)
     chunked = getattr(scheduler, 'chunked_req', None)
+    last = getattr(scheduler, 'last_batch', None)
     return {
         'dp_rank': rank,
         'paused': scheduler._engine_paused,
         'waiting_rids': [r.rid for r in scheduler.waiting_queue],
         'running_rids': [] if running is None else [r.rid for r in running.reqs],
         'chunked_rids': [] if chunked is None else [chunked.rid],
+        'last_batch_rids': [] if last is None else [r.rid for r in last.reqs],
         'pending_results': len(getattr(scheduler, 'result_queue', ())),
         'deferred_inputs': len(scheduler._deferred_input_requests),
     }
@@ -33,6 +35,7 @@ class SchedulerBarrier:
         self.epoch = None
         self.last_sequence = -1
         self.owned_pause = False
+        self.last_command = None
 
     def tick(self, scheduler):
         """Scheduler thread only; malformed commands fail closed, not silently."""
@@ -47,6 +50,8 @@ class SchedulerBarrier:
             raise ValueError('nonnegative command sequence required')
         if sequence < self.last_sequence:
             raise ValueError('stale barrier command')
+        if sequence == self.last_sequence and command != self.last_command:
+            raise ValueError('same sequence command mutated')
         if sequence > self.last_sequence:
             epoch = command.get('epoch')
             if type(epoch) is not str or not epoch:
@@ -56,6 +61,7 @@ class SchedulerBarrier:
             if action == 'pause':
                 if (self.owned_pause or state['paused'] or state['waiting_rids']
                         or state['running_rids'] or state['chunked_rids']
+                        or state['last_batch_rids']
                         or state['pending_results'] or state['deferred_inputs']):
                     raise RuntimeError('barrier pause requires exclusive fully idle scheduler')
                 scheduler._engine_paused = True
@@ -69,6 +75,7 @@ class SchedulerBarrier:
             else:
                 raise ValueError('unsupported barrier action')
             self.last_sequence = sequence
+            self.last_command = command
         state = snapshot(scheduler, self.rank)
         state.update(run_token=self.run_token, epoch=self.epoch,
                      sequence=self.last_sequence)
