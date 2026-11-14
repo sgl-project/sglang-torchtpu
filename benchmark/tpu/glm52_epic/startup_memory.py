@@ -14,9 +14,13 @@ def log_snapshot(path, max_bytes=4096):
             offset = max(0, stat.st_size - max_bytes)
             stream.seek(offset)
             tail = stream.read(max_bytes)
-        # Drop a possibly cut first line. Never scan the entire growing log.
+        # Both newline logs and carriage-return progress bars delimit records.
+        # If the bounded window contains neither, retain its raw partial tail.
         if offset:
-            tail = tail.partition(b'\n')[2]
+            boundaries = [i for sep in (b'\n', b'\r')
+                          if (i := tail.find(sep)) >= 0]
+            if boundaries:
+                tail = tail[min(boundaries) + 1:]
         return {'size_bytes': stat.st_size, 'mtime_ns': stat.st_mtime_ns,
                 'tail': tail.decode('utf-8', errors='replace')}
     except OSError as error:
