@@ -256,7 +256,7 @@ try:
         with (OUT / 'host-memory.jsonl').open('a', buffering=1) as stream:
             while not memory_stop.is_set():
                 try:
-                    data = collect_memory()
+                    data = collect_memory(root_pids=(() if launcher is None else (launcher.pid,)))
                     stream.write(json.dumps(data) + '\n')
                     print('GLM52_HOST_MEMORY ' + json.dumps(data), flush=True)
                 except Exception as error:
