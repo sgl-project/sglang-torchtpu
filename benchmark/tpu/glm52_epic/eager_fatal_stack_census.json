@@ -1,0 +1,11 @@
+{
+  "source": "benchmark/tpu/glm52_epic/eager_r59_peer_failure.txt",
+  "source_sha256": "a39ec8f38938faaa6f88854945d6063cd7016db7e3b017edf468d6b5299b6249",
+  "main_thread_stack_count": 8,
+  "counts": {
+    "request_broadcast": 7,
+    "request_table_write": 1
+  },
+  "interpretation": "Python stacks identify synchronization/materialization boundaries, not the originating failing XLA op. Seven broadcast waiters and one request-table writer do not establish eight independent causes or sparse MLA culpability. Existing isolated allocator transfer pass does not clear distributed pending graphs.",
+  "next_discriminator": "Full compile smoke request result; if fatal recurs capture rank-correlated native graph/op evidence before changing shared broadcast or allocation paths."
+}
