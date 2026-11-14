@@ -136,8 +136,9 @@ high-confidence host-compiler-pressure hypothesis rather than a proven HBM OOM.
 starting point. It pins the current epic branch source commit, runs the checked-in runner
 from that checkout instead of embedding a base64 copy, and fails before TPU
 initialization when placeholders remain. It is intentionally not submitted:
-replace the cluster, immutable image digest, and allocation hostnames only after
-Falcon admission/capacity is revalidated. The older
+replace the cluster, immutable image digest, pinned TorchTPU wheel filename/SHA,
+and allocation hostnames only after Falcon admission/capacity is revalidated.
+The older
 `torch_8chip_UNSUBMITTED.yaml` is historical evidence only because its inline
 runner and source SHA are stale.
 

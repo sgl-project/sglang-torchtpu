@@ -25,6 +25,8 @@ role_to_task_spec:
       PYTHONPATH: /workspace/sglang-torchtpu:/workspace/sglang-torchtpu/python
       PYTHONDONTWRITEBYTECODE: '1'
       PYTHONUNBUFFERED: '1'
+      TORCH_TPU_WHEEL: USER_PROVIDE_PINNED_WHEEL_FILENAME
+      TORCH_TPU_WHEEL_SHA256: USER_PROVIDE_64_HEX_WHEEL_SHA256
     sources:
       - name: sglang-torchtpu
         type: git
