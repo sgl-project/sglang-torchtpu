@@ -75,6 +75,7 @@ from sglang_tpu.compilation.frame_stack import (
 )
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.cp_forward import (
+    cp_local_rows_padded,
     install_cp_logits_forward,
     prepare_tpu_cp_forward_batch,
     wrap_cp_embedding_forward,
@@ -587,8 +588,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     ) -> int:
         """The token rows a forward of ``real_q`` tokens over ``real_b``
         requests is padded to (prepare_forward_batch), for a stage that must
-        size its pipeline receive before the forward. Not for context-parallel
-        or DP-attention forwards, whose padding depends on other ranks."""
+        size its pipeline receive before the forward. Context-parallel
+        forwards pad their local rows instead (cp_forward_rows); DP-attention
+        forwards pad to a shape agreed across ranks and are not covered."""
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         pad_t, _ = forward_pad_shape(
@@ -601,6 +603,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self.extend_bs,
         )
         return pad_t
+
+    def cp_forward_rows(self, extend_lens: list[int]) -> int:
+        """The local rows a context-parallel extend of ``extend_lens`` is
+        padded to on every rank (prepare_tpu_cp_forward_batch)."""
+        assert self.t_bucketer is not None
+        assert self._cp_strategy is not None
+        return cp_local_rows_padded(
+            extend_lens,
+            pad_b=self._extend_compile_cap(),
+            t_bucketer=self.t_bucketer,
+            cp_size=self._cp_strategy.cp_size,
+        )
 
     def max_padded_tokens(self) -> int:
         """The most token rows a forward is padded to: the last token bucket,
