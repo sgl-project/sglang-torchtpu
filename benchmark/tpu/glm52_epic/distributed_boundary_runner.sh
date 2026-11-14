@@ -42,8 +42,10 @@ for case in roundtrip all-reduce asymmetric; do
         printf 'CHILD_LAUNCH_BEGIN case=%s\\n' "$1"
         python -u -m torch.distributed.run --standalone --nproc_per_node="$WORLD_SIZE" \
             --tee 3 --redirects 3 \
-            -m benchmark.tpu.glm52_epic.repro_distributed_boundary --case "$1"
-        printf 'CHILD_LAUNCH_END case=%s status=%s\\n' "$1" "$?"
+            benchmark/tpu/glm52_epic/repro_distributed_boundary.py --case "$1"
+        child_rc=$?
+        printf 'CHILD_LAUNCH_END case=%s status=%s\\n' "$1" "$child_rc"
+        exit "$child_rc"
     ' _ "$case" 2>&1 | tee "$OUT/$case.log"
     status=("${PIPESTATUS[@]}")
     rc=${status[0]}
