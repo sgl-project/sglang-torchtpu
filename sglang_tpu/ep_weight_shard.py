@@ -3,9 +3,11 @@
 
 With expert parallelism every rank keeps ``num_experts / ep_size`` of the
 routed experts, but ``RunaiModelStreamerLoader`` fetches every expert tensor
-on every rank. This loader rebuilds the fetch plan from the safetensors index
-and hands Run:AI only the kept tensor names, so the skipped byte ranges are
-never requested from storage.
+on every rank. This loader builds the fetch plan from the safetensors shard
+headers and hands Run:AI only the kept tensor names, so the skipped byte
+ranges are never requested from storage. Headers also name tensors a stale
+index omits, and they are read through Run:AI, so object-storage checkpoints
+take the same path.
 
 The filter is conservative: a tensor is skipped only when its name carries a
 numeric ``experts.<id>`` segment, ends in a per-expert weight or scale suffix,
@@ -33,10 +35,8 @@ Hook header (AFTER ``get_model_loader``):
 from __future__ import annotations
 
 import inspect
-import json
 import re
-from collections.abc import Mapping
-from pathlib import Path, PurePosixPath
+from collections.abc import Iterable, Mapping
 
 import msgspec
 
@@ -104,16 +104,18 @@ def _validate_expert_layers(
 
 
 def plan_expert_fetch(
-    weight_map: Mapping[str, str],
+    names: Iterable[str],
     *,
     num_routed_experts: int,
     ep_size: int,
     ep_rank: int,
 ) -> ExpertFetchPlan:
-    """Split the checkpoint index into this rank's tensors and the rest.
+    """Split the checkpoint's tensor names into this rank's and the rest.
 
-    Experts are placed contiguously by EP rank, as
-    ``sglang.srt.layers.moe.utils.local_routed_expert_range`` assumes.
+    ``names`` comes from the shard headers, not the index, so a tensor a
+    stale index omits is still kept. Experts are placed contiguously by EP
+    rank, as ``sglang.srt.layers.moe.utils.local_routed_expert_range``
+    assumes.
     """
     if num_routed_experts <= 0 or num_routed_experts % ep_size:
         raise ValueError(
@@ -123,7 +125,7 @@ def plan_expert_fetch(
     start, end = ep_rank * local, (ep_rank + 1) * local
     kept, skipped = [], []
     layers: dict[str, dict[int, set[str]]] = {}
-    for name in weight_map:
+    for name in names:
         if _MTP_NAME.search(name):
             kept.append(name)
             continue
@@ -227,49 +229,35 @@ class EPShardedRunaiModelStreamerLoader(RunaiModelStreamerLoader):
             yield from super()._get_weights_iterator(source)
             return
 
-        prepared = self._prepare_fetch(source)
-        if prepared is None:
-            yield from super()._get_weights_iterator(source)
-            return
-        stream_files, plan = prepared
-
         from runai_model_streamer import SafetensorsStreamer
 
-        if (
-            "tensor_names"
-            not in inspect.signature(SafetensorsStreamer.stream_files).parameters
-        ):
-            logger.warning(
-                "[ep-sharded-load] this Run:AI has no tensor_names support; "
-                "using the stock full-checkpoint stream"
+        folder, files = self._prepare_weights(source.model_or_path, source.revision)
+        if source.model_config is not None:
+            files = maybe_add_mtp_safetensors(
+                files, folder, INDEX_NAME, source.model_config.hf_config
             )
-            yield from super()._get_weights_iterator(source)
-            return
 
-        logger.info(
-            "[ep-sharded-load] fetching %d tensors from %d shards; skipping %d "
-            "non-local routed-expert tensors for experts [%d, %d) of %d",
-            len(plan.kept),
-            len(stream_files),
-            len(plan.skipped),
-            plan.local_experts[0],
-            plan.local_experts[1],
-            self._num_routed_experts,
-        )
-        if self._is_distributed:
-            logger.info(
-                "[ep-sharded-load] ignoring distributed streaming: per-rank "
-                "fetch plans differ, so each rank streams independently"
-            )
         with SafetensorsStreamer() as streamer:
-            streamer.stream_files(
-                stream_files,
-                device="cpu",
-                # Per-rank plans differ, so the streamer's cross-rank broadcast
-                # mode cannot be used; each rank streams independently.
-                is_distributed=False,
-                tensor_names=set(plan.kept),
-            )
+            plan = self._plan(streamer, files)
+            if plan is None:
+                streamer.stream_files(
+                    files,
+                    device=self.target_device_str,
+                    is_distributed=bool(self._is_distributed),
+                )
+            else:
+                if self._is_distributed:
+                    logger.info(
+                        "[ep-sharded-load] ignoring distributed streaming: "
+                        "per-rank fetch plans differ, so each rank streams "
+                        "independently"
+                    )
+                streamer.stream_files(
+                    files,
+                    device="cpu",
+                    is_distributed=False,
+                    tensor_names=set(plan.kept),
+                )
             for name, tensor in streamer.get_tensors():
                 setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
                 yield name, tensor
@@ -281,36 +269,31 @@ class EPShardedRunaiModelStreamerLoader(RunaiModelStreamerLoader):
             and self.load_config.draft_model_idx is None
         )
 
-    def _prepare_fetch(self, source) -> tuple[list[str], ExpertFetchPlan] | None:
-        """The shards to stream and the fetch plan, or None for the stock path."""
-        folder, files = self._prepare_weights(source.model_or_path, source.revision)
-        if source.model_config is not None:
-            files = maybe_add_mtp_safetensors(
-                files, folder, INDEX_NAME, source.model_config.hf_config
-            )
-        index_path = Path(folder) / INDEX_NAME
-        try:
-            weight_map = json.loads(index_path.read_text())["weight_map"]
-        except (OSError, ValueError, KeyError) as exc:
-            logger.info(
-                "[ep-sharded-load] no readable %s (%s); using the stock "
-                "full-checkpoint stream",
-                index_path,
-                exc,
-            )
-            return None
-        index_shards = {PurePosixPath(shard).name for shard in weight_map.values()}
-        if any(Path(path).name not in index_shards for path in files):
-            # maybe_add_mtp_safetensors added a shard the index does not name;
-            # its tensors are absent from the plan, so keep the stock stream.
-            logger.info(
-                "[ep-sharded-load] checkpoint has shards outside the index; "
+    def _plan(self, streamer, files) -> ExpertFetchPlan | None:
+        """The fetch plan from the shard headers, or None for the stock stream."""
+        if "tensor_names" not in inspect.signature(streamer.stream_files).parameters:
+            logger.warning(
+                "[ep-sharded-load] this Run:AI has no tensor_names support; "
                 "using the stock full-checkpoint stream"
             )
             return None
         try:
+            import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
+
+            metas = sp.SafetensorsMetadata.from_files(
+                streamer.file_streamer, files, None
+            )
+            names = [tensor.name for meta in metas for tensor in meta.tensors_metadata]
+        except (ImportError, AttributeError, OSError, RuntimeError, ValueError) as exc:
+            logger.warning(
+                "[ep-sharded-load] cannot read safetensors headers (%s); using "
+                "the stock full-checkpoint stream",
+                exc,
+            )
+            return None
+        try:
             plan = plan_expert_fetch(
-                weight_map,
+                names,
                 num_routed_experts=self._num_routed_experts,
                 ep_size=self._ep_size,
                 ep_rank=self._ep_rank,
@@ -324,24 +307,21 @@ class EPShardedRunaiModelStreamerLoader(RunaiModelStreamerLoader):
             return None
         if not plan.skipped:
             logger.info(
-                "[ep-sharded-load] no non-local expert tensors in the index; "
+                "[ep-sharded-load] no non-local expert tensors in the shards; "
                 "using the stock full-checkpoint stream"
             )
             return None
-
-        by_name = {Path(path).name: path for path in files}
-        try:
-            stream_files = sorted(
-                {by_name[PurePosixPath(weight_map[name]).name] for name in plan.kept}
-            )
-        except KeyError as exc:
-            logger.warning(
-                "[ep-sharded-load] checkpoint shard %s is missing; using the "
-                "stock full-checkpoint stream",
-                exc,
-            )
-            return None
-        return stream_files, plan
+        logger.info(
+            "[ep-sharded-load] fetching %d tensors from %d shards; skipping %d "
+            "non-local routed-expert tensors for experts [%d, %d) of %d",
+            len(plan.kept),
+            len(files),
+            len(plan.skipped),
+            plan.local_experts[0],
+            plan.local_experts[1],
+            self._num_routed_experts,
+        )
+        return plan
 
 
 def select_tpu_ep_sharded_loader(result, load_config, model_config=None):
