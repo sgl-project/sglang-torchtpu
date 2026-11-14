@@ -47,6 +47,10 @@ for case in roundtrip all-reduce asymmetric; do
     if [[ "$rc" == 0 && "${status[1]}" != 0 ]]; then rc=${status[1]}; fi
     set -e
     printf '%s exit_code=%s\n' "$case" "$rc" | tee -a "$OUT/status.txt"
-    if [[ "$rc" != 0 ]]; then failed=1; fi
+    # A launcher exit alone is insufficient: require child evidence from all
+    # eight ranks and both iterations before accepting this case.
+    pass_count=$(grep -c 'DISTRIBUTED_BOUNDARY_PASS' "$OUT/$case.log" || true)
+    [[ "$rc" == 0 && "$pass_count" == 16 ]] || failed=1
+    printf '%s pass_markers=%s\n' "$case" "$pass_count" | tee -a "$OUT/status.txt"
 done
 exit "$failed"
