@@ -126,6 +126,19 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## Loading progress visibility is distributed-rank gated
+
+For exp-48q9eb5nxn, direct Falcon cp of host-rank0 server.log confirms all
+DP8–15 workers Load weight begin at15:59:53Z. That host has no shard tqdm:
+weight_utils.py:1286–1288 enables it only if distributed is uninitialized or
+torch.distributed.get_rank()==0; lines1315–1318 pass this as disable gate.
+Torch distributed rank0 resides on Falcon host-rank1 (DP0–7), explaining why
+only host-rank1 shows advancing shard counters. Constant host-rank0 log size
+while file cache grows is therefore expected logging behavior, NOT evidence
+of a loading hang. Per-worker load-end markers remain required for completion.
+The copied interim log is /tmp/glm52-fixed-r201-rank0-native.log; no native
+failure/traceback was found in that snapshot.
+
 ## Historical exit137 decode attribution tightened
 
 Original durable log exit137_native_output.txt:864–873 reports EXTEND complete
