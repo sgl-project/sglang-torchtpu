@@ -99,6 +99,14 @@ mmap path does not use that optimization. These are code-path explanations
 consistent with observed file-cache growth, not a demonstrated loading
 bottleneck or a reason to flip mmap/drop-cache during this ongoing run.
 
+Live rank-1 native progress is CR-delimited tqdm, not newline-delimited:
+229/282 at 36:44 advanced to 239/282 at 38:18. At 14:43:30Z, its sampler
+recorded current/peak=413.58 GiB, file=364.18 GiB, anon=47.69 GiB,
+zero memory.events, and max tracked surviving HWM=9.19 GiB. This confirms
+reader progress rather than a completely stuck loader; it does not prove
+all ranks have the same shard position. A bounded log-tail helper must
+recognize CR as well as LF or it can discard the entire tqdm tail.
+
 ## Instrumented compile-smoke outcome
 
 exp-sx62ld4v1e (source 7830981b0e) failed before model loading: the bootstrap
