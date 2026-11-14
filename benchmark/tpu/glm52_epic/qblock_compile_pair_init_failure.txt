@@ -1,0 +1,87 @@
+/tmp/tpu_logs/peer_bootstrap_8chip.sh: OK
+{"base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1", "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3", "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c", "got": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0+cpu", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0+cpu", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "peer_experiment": "exp-bsvzoblh0d", "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00", "peer_task_status": "succeeded", "prepared_wheelhouse": "/prepared/wheelhouse", "schema_version": 1, "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity", "source_commit": "8a8f12159e769629283b7ab3c6a84f8547362025", "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git", "want": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"}
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1794669139.901198     631 common_lib.cc:848] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:370
+Traceback (most recent call last):
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 827, in backends
+    backend = _init_backend(platform)
+              ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 911, in _init_backend
+    backend = registration.factory()
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 236, in tpu_client_timer_callback
+    client = make_tpu_client(
+             ^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 213, in make_tpu_client
+    return _jax.get_c_api_client(
+           ^^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: INVALID_ARGUMENT: TPU initialization failed: --deepsea_slice_builder_worker_addresses must be set for multihost jobs.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/glm52-peer-rank0.ZayiGY/src/benchmark/tpu/glm52_epic/repro_qblock_vmem_compile.py", line 67, in <module>
+    main()
+  File "/tmp/glm52-peer-rank0.ZayiGY/src/benchmark/tpu/glm52_epic/repro_qblock_vmem_compile.py", line 25, in main
+    devices = jax.devices()
+              ^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 1025, in devices
+    return get_backend(backend).devices()
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 959, in get_backend
+    return _get_backend_uncached(platform)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 938, in _get_backend_uncached
+    bs = backends()
+         ^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 843, in backends
+    raise RuntimeError(err_msg)
+RuntimeError: Unable to initialize backend 'tpu': INVALID_ARGUMENT: TPU initialization failed: --deepsea_slice_builder_worker_addresses must be set for multihost jobs. (set JAX_PLATFORMS='' to automatically choose an available backend)
+QBLOCK_COMPILE_EXIT query_block=128 exit_code=1
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1794669140.895376     986 common_lib.cc:848] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:370
+Traceback (most recent call last):
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 827, in backends
+    backend = _init_backend(platform)
+              ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 911, in _init_backend
+    backend = registration.factory()
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 236, in tpu_client_timer_callback
+    client = make_tpu_client(
+             ^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 213, in make_tpu_client
+    return _jax.get_c_api_client(
+           ^^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: INVALID_ARGUMENT: TPU initialization failed: --deepsea_slice_builder_worker_addresses must be set for multihost jobs.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/glm52-peer-rank0.ZayiGY/src/benchmark/tpu/glm52_epic/repro_qblock_vmem_compile.py", line 67, in <module>
+    main()
+  File "/tmp/glm52-peer-rank0.ZayiGY/src/benchmark/tpu/glm52_epic/repro_qblock_vmem_compile.py", line 25, in main
+    devices = jax.devices()
+              ^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 1025, in devices
+    return get_backend(backend).devices()
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 959, in get_backend
+    return _get_backend_uncached(platform)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 938, in _get_backend_uncached
+    bs = backends()
+         ^^^^^^^^^^
+  File "/tmp/glm52-peer-rank0.ZayiGY/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 843, in backends
+    raise RuntimeError(err_msg)
+RuntimeError: Unable to initialize backend 'tpu': INVALID_ARGUMENT: TPU initialization failed: --deepsea_slice_builder_worker_addresses must be set for multihost jobs. (set JAX_PLATFORMS='' to automatically choose an available backend)
+QBLOCK_COMPILE_EXIT query_block=32 exit_code=1
+falcon-agent: command failed: exit status 1

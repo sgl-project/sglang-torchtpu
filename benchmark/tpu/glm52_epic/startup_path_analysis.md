@@ -126,6 +126,21 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## Compile-only pair initialization failure (not a kernel result)
+
+exp-enaw64q1qb (8a8f12159e) failed at `jax.devices()` for both qb128 and
+qb32 before QBLOCK_COMPILE_BEGIN: libtpu rejected missing worker addresses
+(`deepsea_slice_builder_worker_addresses must be set for multihost jobs`).
+The runner cleared TPU_WORKER_HOSTNAMES while retaining a physical multi-host
+allocation; runtime hostname autodiscovery produced a warning string, not a
+valid address. Both exit1 values are initialization failures, not VMEM
+reproduction or candidate compile rejection. Do not retry unchanged. A future
+JAX-native probe needs explicit supported distributed initialization on the
+existing host pair, or the already working TorchTPU PJRT bridge; a made-up
+single-host topology is not established by unsetting environment variables.
+The fail-closed runner update (67e10387ff, not part of this experiment) rejects
+this exact false-positive control scenario.
+
 ## Qblock selector attribution (CPU-only static verification)
 
 `mla_sparse_qblock_tokens.block_shape` starts qb=128 and only considers
