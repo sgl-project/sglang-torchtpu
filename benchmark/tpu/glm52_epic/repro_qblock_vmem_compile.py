@@ -35,7 +35,10 @@ def main():
         spec((65, 32, 4, 128), jnp.uint8),
         spec((2048, 2048), jnp.int32),
         spec((16,), jnp.int32),
-        spec((16 * 32,), jnp.int32),
+        # HLO phys operand is s32[17,1,34]. Original pages_per_seq may
+        # be33 or34 before alignment to2; choose34 to match this kernel
+        # operand and its bitmap width256 (not128).
+        spec((16 * 34,), jnp.int32),
         spec((17,), jnp.int32),
         spec((3,), jnp.int32),
     )
