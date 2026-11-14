@@ -2,6 +2,8 @@
   <img src="assets/torch-tpu.svg" alt="SGLang-TorchTPU" width="360">
 </p>
 
+[TPU CI timing dashboard: preview and hosting](scripts/ci/tpu_dashboard/README.md)
+
 <h1 align="center">SGLang-TorchTPU</h1>
 
 <p align="center">
