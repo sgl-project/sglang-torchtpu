@@ -254,6 +254,13 @@ def block_shape(num_heads: int, num_tokens: int, page_size: int) -> tuple[int, i
         and num_heads * qb * page_size * pps * 2 <= _SCORE_ELEMS
     ):
         pps *= 2
+    # The 128-query fallback can exceed the row budget (e.g. 64 heads
+    # produce8192 rows). Keep the legacy page step: recomputing it after
+    # shrinking queries grows the score tile and defeats the VMEM reduction.
+    # qb32/pps2 at64 heads/page128 is hardware-validated. Do not extrapolate
+    # to smaller query layouts; this heuristic is not a general VMEM fit test.
+    while qb > 32 and num_heads * qb > _MAX_ROWS:
+        qb //= 2
     return qb, pps
 
 
