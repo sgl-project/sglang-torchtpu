@@ -58,6 +58,17 @@ anon is not per-process/compiler RSS. These samples cannot explain historical
 exit137 alone. Earlier progress replies mislabeled raw decimal billions of
 bytes as GiB (e.g. 284309639168 bytes is 264.78 GiB, not 284.3 GiB);
 the 274/250 GiB values above were explicitly divided by 2**30.
+
+Host attribution correction: live `falcon exp cp --rank 0` of
+`rank-0/host-memory.jsonl` identifies observer PID 605 / launcher 1480 as
+Falcon host rank 0 (286.38 GiB at timestamp 1794666810423603038, events
+all zero). Prior stdout contains interleaved observers 604 and 605; the
+274.18 GiB sample belongs to observer 604, not confirmed rank 0. Prior
+progress replies reversed this host label. At the earlier 274/250 GiB
+snapshots, each observer retained 12–13 launcher descendants, with largest
+surviving scheduler RSS ~6.9–7.0 GiB and HWM ~9 GiB. Host MemAvailable was
+~857–861 GiB. This is positive process evidence, but neither a compiler
+peak nor evidence excluding a future ancestor-cgroup/system OOM.
 The experiment deadline is 16:01Z; do not interpret its running state as a
 successful baseline until the server log and smoke result are present.
 
