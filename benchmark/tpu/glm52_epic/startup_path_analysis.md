@@ -42,6 +42,25 @@ repeat_interleave/index_put_ helper. This synchronous read can surface an earlie
 asynchronous compiler failure; it does NOT identify D2H as its cause. Do not
 launch the device-table draft as a current fatal gate; no hardware was spent.
 
+## Instrumented compile-smoke live memory curve
+
+The corrected model-mounted exp-9320106a77 (source 1e9935c863) is still
+running. The runner redirects native stdout/stderr to `server.log`; absence
+of compile markers in Falcon workload stdout alone does not establish its stage. The durable
+sampler has now observed alternating host peaks: roughly 274 GiB on one host
+and 250 GiB on the other, with anon only ~47.6/46.3 GiB, file cache
+~225.2/202.9 GiB, kernel ~1.3 GiB, and cgroup `oom=0`, `oom_kill=0`.
+A live `falcon exp exec --rank 0 -- tail` of the native log confirmed DP8–15
+entered `Load weight begin` at 14:05:04Z; the tail ends in initialization
+warnings with no load-complete/compile marker. This supports weight-loading
+as the last logged stage, not proof of every rank's current stack. Cgroup
+anon is not per-process/compiler RSS. These samples cannot explain historical
+exit137 alone. Earlier progress replies mislabeled raw decimal billions of
+bytes as GiB (e.g. 284309639168 bytes is 264.78 GiB, not 284.3 GiB);
+the 274/250 GiB values above were explicitly divided by 2**30.
+The experiment deadline is 16:01Z; do not interpret its running state as a
+successful baseline until the server log and smoke result are present.
+
 ## Instrumented compile-smoke outcome
 
 exp-sx62ld4v1e (source 7830981b0e) failed before model loading: the bootstrap
