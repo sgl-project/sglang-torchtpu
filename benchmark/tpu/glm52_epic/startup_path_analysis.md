@@ -184,9 +184,9 @@ python -m benchmark.tpu.glm52_epic.repro_sparse_gather --queries 4 --live-querie
 
 Repeat page64 versus page128 only when the first case yields useful evidence.
 Local CLI, invalid-argument and runtime-mismatch checks passed; independent
-source review found no actionable shape/oracle defect. Hardware execution is
-still unverified. Passing this raw-JAX reproduction would not validate the
-TorchTPU bridge or serving baseline.
+source review found no actionable shape/oracle defect. Subsequent hardware
+results are recorded below; passing raw JAX alone does not validate the bridge
+or serving baseline.
 
 The optional `--backend torch` now isolates the bridge using the same inputs
 and byte oracle. It selects CPU JAX before import, allocates inputs through
@@ -200,10 +200,22 @@ python -m benchmark.tpu.glm52_epic.repro_sparse_gather --queries 1 --backend tor
 ```
 
 Independent source review found no actionable initialization, concrete JAX
-annotation, shape or oracle defect in this bridge adapter. This remains
-hardware-unvalidated; it does not exercise cache donation, whole attention,
-model decode, or repeated-call compile-cache reuse. A bridge-only failure
-would narrow the investigation, not by itself identify a TorchTPU bug.
+annotation, shape or oracle defect in this bridge adapter. Experiment
+`exp-8vb32ntf9t` (source `edcf9b47b998b37d4bf3d5dcdf12e80a2eb07a99`)
+then passed bridge byte checks on both hosts for query1/page128/topk2048.
+Raw JAX passed byte checks on rank1; rank0 compiled successfully but selected
+a non-addressable global device and failed at NumPy host read. The diagnostic
+now selects `jax.local_devices()[0]`. Logs are retained as
+`gather_pair_r49_rank0.log` and `gather_pair_r49_rank1.log`.
+The experiment's overall FAILED status is not a gather lowering failure.
+
+Experiment `exp-ts3syd5ifc`, pinned to
+`0ed40cc6912a173cc10eaf56724f2549d401150a`, tests query1 and query64 in each
+backend with that selector fix; results pending. Neither experiment exercises
+cache donation, whole attention, model decode or repeated-call compile-cache
+reuse. The next useful scope is the actual production custom op, whose two
+cache inputs are donated/aliased and whose public return is only attention
+output (the updated cache tensors must be checked through their input objects).
 
 ## Padding has two distinct contracts
 
