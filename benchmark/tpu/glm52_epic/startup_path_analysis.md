@@ -153,6 +153,23 @@ source review found no actionable shape/oracle defect. Hardware execution is
 still unverified. Passing this raw-JAX reproduction would not validate the
 TorchTPU bridge or serving baseline.
 
+The optional `--backend torch` now isolates the bridge using the same inputs
+and byte oracle. It selects CPU JAX before import, allocates inputs through
+TorchTPU and wraps the first lazy `custom_jax_kernel` invocation in
+`tpu_info_for_cpu_export`. Compile and execution cannot be separated by this
+bridge API, so `--compile-only` is rejected in torch mode. Run in a separate
+fresh process, after the matching raw-JAX case:
+
+```sh
+python -m benchmark.tpu.glm52_epic.repro_sparse_gather --queries 1 --backend torch
+```
+
+Independent source review found no actionable initialization, concrete JAX
+annotation, shape or oracle defect in this bridge adapter. This remains
+hardware-unvalidated; it does not exercise cache donation, whole attention,
+model decode, or repeated-call compile-cache reuse. A bridge-only failure
+would narrow the investigation, not by itself identify a TorchTPU bug.
+
 ## Next diagnostic boundary
 
 Before another full-checkpoint run, isolate sparse MLA at the kernel interface:
