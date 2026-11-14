@@ -126,6 +126,21 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## Qblock selector attribution (CPU-only static verification)
+
+`mla_sparse_qblock_tokens.block_shape` starts qb=128 and only considers
+512/256 under `_MAX_ROWS=3072`; the fallback itself is not capped. AST-executed
+selector confirms H64,T2048,P128 -> qb128, pages_per_step2, rows8192, matching
+the failing XLA allocations exactly. H32 similarly produces rows4096; H24
+produces rows3072. Known padded scratch and double-buffered Q/Qpe/output
+windows at H64 already account for 70 MiB before other intermediates/spills.
+The fused plain-token dispatch calls this kernel without the separate pooled
+qblock VMEM-fit selector. This identifies a reachable uncapped fallback in
+the token selector, not a general reason to alter Flash or the pooled path.
+A smaller query tile (or head tiling/fallback) is a candidate, not yet a
+validated fix; `qb % 8` validation alone does not prove supported Pallas
+layout, numerical behavior, or VMEM fit for tiles below128.
+
 ## Terminal compile-smoke result: distinct VMEM failure
 
 exp-9320106a77 terminated FAILED at 14:59:10Z. At 14:58:56Z DP8 reports
