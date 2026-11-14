@@ -1,0 +1,65 @@
+{
+  "experiment": "exp-48q9eb5nxn",
+  "acceptance": "interim loading samples, not compiler peak or baseline acceptance",
+  "snapshots": [
+    {
+      "rank": "0",
+      "time_utc": "2026-11-14T16:02:15.007184+00:00",
+      "current_bytes": 75765747712,
+      "anon_bytes": 49566830592,
+      "file_bytes": 25253855232,
+      "last_shard_in_bounded_tail": null,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "source_envelope_sha256": "bb2ae4f27f7ca8b256b9a4ac1dfe3b48e45403c94f5e7c6ddfc78186c29d8b69"
+    },
+    {
+      "rank": "1",
+      "time_utc": "2026-11-14T16:02:17.418240+00:00",
+      "current_bytes": 79722647552,
+      "anon_bytes": 50976645120,
+      "file_bytes": 27766411264,
+      "last_shard_in_bounded_tail": 9,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "source_envelope_sha256": "bb2ae4f27f7ca8b256b9a4ac1dfe3b48e45403c94f5e7c6ddfc78186c29d8b69"
+    },
+    {
+      "rank": "0",
+      "time_utc": "2026-11-14T16:10:45.082225+00:00",
+      "current_bytes": 147764420608,
+      "anon_bytes": 49595490304,
+      "file_bytes": 97047736320,
+      "last_shard_in_bounded_tail": null,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "source_envelope_sha256": "8ca6a8e23b5334e46f5d5b11f189384413a9e912f213fad888b6d70cd3ff02ed"
+    },
+    {
+      "rank": "1",
+      "time_utc": "2026-11-14T16:10:47.495202+00:00",
+      "current_bytes": 161904787456,
+      "anon_bytes": 51021856768,
+      "file_bytes": 109715275776,
+      "last_shard_in_bounded_tail": 60,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "source_envelope_sha256": "8ca6a8e23b5334e46f5d5b11f189384413a9e912f213fad888b6d70cd3ff02ed"
+    }
+  ],
+  "deltas": [
+    {
+      "rank": "0",
+      "start_utc": "2026-11-14T16:02:15.007184+00:00",
+      "end_utc": "2026-11-14T16:10:45.082225+00:00",
+      "delta_current_bytes": 71998672896,
+      "delta_anon_bytes": 28659712,
+      "delta_file_bytes": 71793881088
+    },
+    {
+      "rank": "1",
+      "start_utc": "2026-11-14T16:02:17.418240+00:00",
+      "end_utc": "2026-11-14T16:10:47.495202+00:00",
+      "delta_current_bytes": 82182139904,
+      "delta_anon_bytes": 45211648,
+      "delta_file_bytes": 81948864512
+    }
+  ],
+  "limitations": "rank0 bounded log tail lacks shard counter; null is unknown, not zero. Cgroup scope may include processes outside launcher. Zero leaf events cannot exclude ancestor/system OOM."
+}
