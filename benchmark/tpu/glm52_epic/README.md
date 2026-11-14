@@ -114,8 +114,10 @@ plain-DSA kernel's hardware contract (`page_size % 128 == 0`); the earlier
 `xla_tpu_buffer_assignment_enable_fast_merge_fallback=false`, and
 `xla_tpu_offload_gather_to_sparsecore=true`. This is a diagnostic candidate,
 not a confirmed fix: q-block only changes extend prefill and decode still uses
-the original per-query kernel. It must be validated on TPU before any claim of
-a runnable baseline.
+the original per-query kernel. The runner's smoke request is now 512 tokens,
+which is the q-block activation threshold; a four-token request would silently
+exercise the old per-query fallback and would not test the intended candidate.
+It must be validated on TPU before any claim of a runnable baseline.
 
 The one-shape compile smoke is a separate failure. It exited 137 after host
 memory peaked near 505 GB, without cgroup OOM events or the sparse-lowering

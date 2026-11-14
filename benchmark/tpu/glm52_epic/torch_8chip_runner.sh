@@ -250,7 +250,10 @@ try:
             except (OSError, urllib.error.URLError):
                 pass
             time.sleep(1)
-        request_body = {'input_ids': [1, 2, 3, 4], 'sampling_params': {
+        # Plain-DSA q-block prefill is selected only for >=512 tokens. A four-token
+        # probe silently falls back to the old per-query sparse kernel and cannot
+        # validate the peer recipe we are testing here.
+        request_body = {'input_ids': [1] * 512, 'sampling_params': {
             'temperature': 0, 'max_new_tokens': 1, 'ignore_eos': True}, 'stream': False}
         save('generate-request.json', request_body)
         code, body = request('http://127.0.0.1:30000/generate', request_body, timeout=600)
@@ -264,7 +267,9 @@ try:
         # Current native response includes IDs; never silently treat absence as success.
         require(isinstance(ids, list) and len(ids) == 1 and type(ids[0]) is int,
                 'current native /generate must return one output token ID')
-        result.update(health_status=200, generate_status=code, output_ids=ids, request_success_count=1)
+        result.update(health_status=200, generate_status=code, output_ids=ids,
+                      request_success_count=1, generate_input_tokens=len(request_body['input_ids']),
+                      expected_attention_path='plain_dsa_qblock_prefill')
         check_child()
         # Opt-in only: prepared requests must reference frozen data + its manifest
         # available locally (e.g. supplemental exact JAX source /workspace/sglang-jax).
