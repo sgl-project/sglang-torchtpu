@@ -211,11 +211,30 @@ The experiment's overall FAILED status is not a gather lowering failure.
 
 Experiment `exp-ts3syd5ifc`, pinned to
 `0ed40cc6912a173cc10eaf56724f2549d401150a`, tests query1 and query64 in each
-backend with that selector fix; results pending. Neither experiment exercises
+backend with that selector fix. It SUCCEEDED: all eight host/backend/query
+cases returned exit0 and byte-exact PASS (logs `gather_shapes_r54_rank0.txt`
+and `gather_shapes_r54_rank1.txt`). This also hardware-validates local device
+selection. Neither experiment exercises
 cache donation, whole attention, model decode or repeated-call compile-cache
 reuse. The next useful scope is the actual production custom op, whose two
 cache inputs are donated/aliased and whose public return is only attention
 output (the updated cache tensors must be checked through their input objects).
+
+## Production sparse step isolation
+
+`repro_sparse_step.py` calls the actual production factory with qblock=0,
+H64/topk2048/page128. Each query selects only itself, so the output oracle is
+its newly written FP8 latent, broadcast across heads. Both original whole cache
+objects are checked byte-for-byte after each of two same-shape calls that
+change the values. This covers production cache scatter, per-query attention
+and retained Torch cache ownership; it does not test 2048 live keys, scoring
+accuracy across keys, q-block prefill, indexer, model layers or serving.
+Independent static review found no actionable metadata/layout/oracle issue.
+
+Submitted `exp-boqyjlht0k` / `art-iyn4i6c37i`, source
+`1ba0d458d5f4aee3169cf01afe58a2035b997fbf`, using the same 8-chip peer bootstrap
+identity and no model mount. Query1 and query64 run in fresh processes, each
+bounded to 600s. Hardware outcome pending; no duplicate allocation submitted.
 
 ## Padding has two distinct contracts
 
@@ -233,6 +252,17 @@ kernel batch size**, multiplied by top-k (`kernel.py:1234-1247`), not the number
 of nonpadding picks within a query. `--live-queries` in the reproduction models
 that query-prefix boundary only. Its random physical indices do not model the
 logical remap or prove that startup's page metadata is correct.
+
+## Compile-smoke reconciliation check
+
+Executed the real dependency-free `reconcile_tpu_batch_limits` function via
+AST extraction on `torch_compile_smoke.json`: max_bs1, bs[1], global MRR16,
+attention-DP16 and attention-TP1 resolve to `(1, [1], 16)`. Thus this concurrency
+reconciliation does not silently grow the smoke decode grid back to bs32.
+This is a local pure-function result, not evidence that a remote compile used
+these settings. Runtime compile-policy EXTEND/MIXED and DECODE graph-variant
+logs must still establish effective shapes and modes; one bucket does not
+necessarily mean one executable.
 
 ## Validation boundary
 
