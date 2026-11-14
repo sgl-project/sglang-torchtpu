@@ -1,10 +1,22 @@
 {
-  "status": "LOCAL_QBLOCK_FIX_VALIDATED_FULL_MODEL_SMOKE_RUNNING",
-  "reason": "Historical admission entry superseded: VMEM failure isolated, selector fixed and both-host default/fused/Dynamo/nonuniform-RoPE gates passed. Full model acceptance remains pending.",
-  "active_experiment": "exp-48q9eb5nxn",
+  "status": "FULL_CHECKPOINT_SHORT_INPUT_BASELINE_ACCEPTED",
+  "reason": "exp-48q9eb5nxn both-host SUCCEEDED; EXTEND2048/bs1 and decodebs1 compiled; health200;512 input IDs generated exactly2 IDs; launchers alive before intentional cleanup",
+  "active_experiment": null,
   "active_source_commit": "99ea485f27de77f820da454fd53ea6cde4123286",
-  "local_gate_experiments": ["exp-n6457yyy41", "exp-m6fhbd2rvo", "exp-x22a112f8z", "exp-xwfxnyiy94", "exp-9d46tguhmn", "exp-x5lwnj2m5x", "exp-8ag4xpzkix"],
-  "unresolved": ["full model EXTEND/decode/request acceptance", "historical eager window/U64 fatal op attribution", "historical exit137 kill source and compiler peak", "matched JAX performance"],
+  "local_gate_experiments": [
+    "exp-n6457yyy41",
+    "exp-m6fhbd2rvo",
+    "exp-x22a112f8z",
+    "exp-xwfxnyiy94",
+    "exp-9d46tguhmn",
+    "exp-x5lwnj2m5x",
+    "exp-8ag4xpzkix"
+  ],
+  "unresolved": [
+    "historical eager window/U64 fatal op attribution",
+    "historical exit137 kill source and compiler peak",
+    "matched JAX performance"
+  ],
   "required_runtime": "torch_tpu==0.2.1.dev20261028201649",
   "public_probe": {
     "exp_id": "exp-39bjc3ngd8",
@@ -15,5 +27,6 @@
   "runner": "torch_8chip_runner.sh",
   "runner_scope": "bounded native startup plus512 input IDs/two output IDs smoke (includes decode); ordered two-host rendezvous; optional HTTP diagnostic is not JAX-equivalent",
   "performance_result": null,
-  "next_action": "continue existing wait for exp-48q9eb5nxn; correlate native tails and host memory; inspect exact failure before any retry. On full smoke acceptance plan matched frozen-input diagnostic separately; no private source,16chip,DCP,Flash changes or duplicate submission"
+  "next_action": "baseline accepted; review long-context/cache/shape capacity and observable DP cache-hit admission before any matched-performance submission; no16chip,DCP,Flash changes",
+  "accepted_experiment": "exp-48q9eb5nxn"
 }

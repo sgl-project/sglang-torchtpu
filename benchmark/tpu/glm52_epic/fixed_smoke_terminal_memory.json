@@ -1,0 +1,758 @@
+{
+  "experiment": "exp-48q9eb5nxn",
+  "phase_boundary_utc": "2026-11-14T16:53:09Z",
+  "phase_boundary_basis": "Both native cache release logs at16:53:08Z; post-release includes trace/compile/warmup/serving, not pure compiler allocations",
+  "scope": "30s sampled peaks; excludes missed transient/exited-child peaks; zero local OOM counters does not exclude ancestor/system OOM",
+  "hosts": [
+    {
+      "rank": "0",
+      "hostname": "falcon-job-lqs4qh7uol-workers-0-0",
+      "samples": 126,
+      "stdout_sha256": "4147c319543524a4ae1a5ca2f4d142af8a385e9d7856d1f23a490768988a0250",
+      "all_current_peak": {
+        "sample_kind": "periodic",
+        "time_utc": "2026-11-14T16:52:45.451483+00:00",
+        "current_bytes": 500665114624,
+        "lifetime_peak_bytes": 500665364480,
+        "anon_bytes": 49745113088,
+        "file_bytes": 448792203264,
+        "cgroup_read_root": "/sys/fs/cgroup",
+        "self_cgroup": "0::/\n",
+        "root_pids": [
+          1478
+        ],
+        "descendant_processes": [
+          {
+            "pid": 2755,
+            "rss_kib": 7306264,
+            "rss_hwm_kib": 9503244,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2754,
+            "rss_kib": 7271756,
+            "rss_hwm_kib": 9495176,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2761,
+            "rss_kib": 7258856,
+            "rss_hwm_kib": 9462748,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2756,
+            "rss_kib": 7247364,
+            "rss_hwm_kib": 9385536,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2759,
+            "rss_kib": 7241516,
+            "rss_hwm_kib": 9471016,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2760,
+            "rss_kib": 7193416,
+            "rss_hwm_kib": 9364132,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2758,
+            "rss_kib": 6887488,
+            "rss_hwm_kib": 9446820,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2757,
+            "rss_kib": 6720028,
+            "rss_hwm_kib": 9463884,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1635,
+            "rss_kib": 977072,
+            "rss_hwm_kib": 977072,
+            "ppid": 1478,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2600,
+            "rss_kib": 809344,
+            "rss_hwm_kib": 809344,
+            "ppid": 1635,
+            "name": "sglang::data_pa",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1478,
+            "rss_kib": 23528,
+            "rss_hwm_kib": 23528,
+            "ppid": 603,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2599,
+            "rss_kib": 14660,
+            "rss_hwm_kib": 14660,
+            "ppid": 1635,
+            "name": "python3",
+            "tracked_descendant": true
+          }
+        ],
+        "surviving_descendant_rss_kib": 58951292,
+        "max_individual_survivor_hwm_kib": 9503244,
+        "memory_events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+        "native_log": {
+          "size_bytes": 91982,
+          "mtime_ns": 1794671994675736088,
+          "tail": "/tmp/glm52-peer-rank0.GtCMO7/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)\n  return func(*args, **kwargs)\n/tmp/glm52-peer-rank0.GtCMO7/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)\n  return func(*args, **kwargs)\n/tmp/glm52-peer-rank0.GtCMO7/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.\n  custom_op = jax_op(op_name, _wrapped)\n/tmp/glm52-peer-rank0.GtCMO7/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.\n  custom_op = jax_op(op_name, _wrapped)\n/tmp/glm52-peer-rank0.GtCMO7/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.\n  custom_op = jax_op(op_name, _wrapped)\n/tmp/glm52-peer-rank0.GtCMO7/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)\n  return func(*args, **kwargs)\n/tmp/glm52-peer-rank0.GtCMO7/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)\n  return func(*args, **kwargs)\n/tmp/glm52-peer-rank0.GtCMO7/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)\n  return func(*args, **kwargs)\n/tmp/glm52-peer-rank0.GtCMO7/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)\n  return func(*args, **kwargs)\n/tmp/glm52-peer-rank0.GtCMO7/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.\n  custom_op = jax_op(op_name, _wrapped)\n/tmp/glm52-peer-rank0.GtCMO7/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.\n  custom_op = jax_op(op_name, _wrapped)\n/tmp/glm52-peer-rank0.GtCMO7/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.\n  custom_op = jax_op(op_name, _wrapped)\n/tmp/glm52-peer-rank0.GtCMO7/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.\n  custom_op = jax_op(op_name, _wrapped)\n"
+        }
+      },
+      "post_release_current_peak": {
+        "sample_kind": "periodic",
+        "time_utc": "2026-11-14T17:00:45.564199+00:00",
+        "current_bytes": 281578430464,
+        "lifetime_peak_bytes": 504199647232,
+        "anon_bytes": 271061504000,
+        "file_bytes": 8993611776,
+        "cgroup_read_root": "/sys/fs/cgroup",
+        "self_cgroup": "0::/\n",
+        "root_pids": [
+          1478
+        ],
+        "descendant_processes": [
+          {
+            "pid": 2754,
+            "rss_kib": 34748888,
+            "rss_hwm_kib": 34748888,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2756,
+            "rss_kib": 34010992,
+            "rss_hwm_kib": 34045300,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2760,
+            "rss_kib": 33611640,
+            "rss_hwm_kib": 33750900,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2758,
+            "rss_kib": 33602932,
+            "rss_hwm_kib": 33630456,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2755,
+            "rss_kib": 33292736,
+            "rss_hwm_kib": 33301532,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2761,
+            "rss_kib": 33165300,
+            "rss_hwm_kib": 33194220,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2759,
+            "rss_kib": 33162956,
+            "rss_hwm_kib": 33203788,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2757,
+            "rss_kib": 32936340,
+            "rss_hwm_kib": 32936340,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1635,
+            "rss_kib": 982920,
+            "rss_hwm_kib": 982920,
+            "ppid": 1478,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2600,
+            "rss_kib": 809488,
+            "rss_hwm_kib": 809488,
+            "ppid": 1635,
+            "name": "sglang::data_pa",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1478,
+            "rss_kib": 23528,
+            "rss_hwm_kib": 23528,
+            "ppid": 603,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2599,
+            "rss_kib": 14660,
+            "rss_hwm_kib": 14660,
+            "ppid": 1635,
+            "name": "python3",
+            "tracked_descendant": true
+          }
+        ],
+        "surviving_descendant_rss_kib": 270362380,
+        "max_individual_survivor_hwm_kib": 34748888,
+        "memory_events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+        "native_log": {
+          "size_bytes": 140114,
+          "mtime_ns": 1794675623451097993,
+          "tail": "  yield pickle.loads(content), content, True\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/scheduler.py:4843: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.\n  batch_result.copy_done = self.device_module.Event()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/utils.py:221: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.\n  self.copy_done.record()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/scheduler.py:4843: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.\n  batch_result.copy_done = self.device_module.Event()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/utils.py:221: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.\n  self.copy_done.record()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/scheduler.py:4843: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.\n  batch_result.copy_done = self.device_module.Event()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/utils.py:221: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.\n  self.copy_done.record()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/scheduler.py:4843: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.\n  batch_result.copy_done = self.device_module.Event()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/utils.py:221: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.\n  self.copy_done.record()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/scheduler.py:4843: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.\n  batch_result.copy_done = self.device_module.Event()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/utils.py:221: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.\n  self.copy_done.record()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/scheduler.py:4843: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.\n  batch_result.copy_done = self.device_module.Event()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/utils.py:221: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.\n  self.copy_done.record()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/scheduler.py:4843: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.\n  batch_result.copy_done = self.device_module.Event()\n/tmp/glm52-peer-rank0.GtCMO7/src/python/sglang/srt/managers/utils.py:221: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.\n  self.copy_done.record()\n[2026-11-14 17:00:23 DP8 TP8 EP8] Split graph into 1 partitions, 0 of which run on CPU\n"
+        }
+      },
+      "pre_cleanup": {
+        "sample_kind": "pre_cleanup",
+        "time_utc": "2026-11-14T17:01:09.131470+00:00",
+        "current_bytes": 199258628096,
+        "lifetime_peak_bytes": 504199647232,
+        "anon_bytes": 188143513600,
+        "file_bytes": 8994566144,
+        "cgroup_read_root": "/sys/fs/cgroup",
+        "self_cgroup": "0::/\n",
+        "root_pids": [
+          1478
+        ],
+        "descendant_processes": [
+          {
+            "pid": 2754,
+            "rss_kib": 23898076,
+            "rss_hwm_kib": 35288344,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2758,
+            "rss_kib": 23708604,
+            "rss_hwm_kib": 33630456,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2756,
+            "rss_kib": 23692972,
+            "rss_hwm_kib": 34045300,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2760,
+            "rss_kib": 23543528,
+            "rss_hwm_kib": 33750900,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2759,
+            "rss_kib": 23461388,
+            "rss_hwm_kib": 33203788,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2761,
+            "rss_kib": 23352912,
+            "rss_hwm_kib": 33194220,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2757,
+            "rss_kib": 23001380,
+            "rss_hwm_kib": 32933060,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2755,
+            "rss_kib": 22908264,
+            "rss_hwm_kib": 33301532,
+            "ppid": 2600,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1635,
+            "rss_kib": 982920,
+            "rss_hwm_kib": 982920,
+            "ppid": 1478,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2600,
+            "rss_kib": 809664,
+            "rss_hwm_kib": 809664,
+            "ppid": 1635,
+            "name": "sglang::data_pa",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1478,
+            "rss_kib": 23528,
+            "rss_hwm_kib": 23528,
+            "ppid": 603,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2599,
+            "rss_kib": 14660,
+            "rss_hwm_kib": 14660,
+            "ppid": 1635,
+            "name": "python3",
+            "tracked_descendant": true
+          }
+        ],
+        "surviving_descendant_rss_kib": 189397896,
+        "max_individual_survivor_hwm_kib": 35288344,
+        "memory_events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+        "native_log": {
+          "size_bytes": 149635,
+          "mtime_ns": 1794675663392057873,
+          "tail": "[2026-11-14 17:00:59 DP15 TP15 EP15] Prefill batch, #new-seq: 1, #new-token: 6, #cached-token: 0, token usage: 0.02, #running-req: 0, #queue-req: 0, #pending-token: 0, cuda graph: False, input throughput (token/s): 0.05\n[2026-11-14 17:00:59 DP12 TP12 EP12] Prefill batch, #new-seq: 1, #new-token: 6, #cached-token: 0, token usage: 0.02, #running-req: 0, #queue-req: 0, #pending-token: 0, cuda graph: False, input throughput (token/s): 0.05\n[2026-11-14 17:00:59 DP8 TP8 EP8] Compile-cache tmpfs release: root=/tmp/tpu_logs/home/.cache/sglang/inductor_dp16_dprank8_tp16/aotautograd removed_gb=0.304 elapsed_s=0.0\n[2026-11-14 17:00:59 DP8 TP8 EP8] Compile-cache tmpfs release: root=/tmp/tpu_logs/jax-cache removed_gb=0.000 elapsed_s=0.0\n[2026-11-14 17:01:01 DP12 TP12 EP12] [TPU] host heap trim via glibc (after warmup): rss 31.87 -> 22.58 GiB in 0.52s\n[2026-11-14 17:01:01 DP10 TP10 EP10] [TPU] host heap trim via glibc (after warmup): rss 32.26 -> 22.56 GiB in 0.53s\n[2026-11-14 17:01:02 DP14 TP14 EP14] [TPU] host heap trim via glibc (after warmup): rss 31.88 -> 22.42 GiB in 0.60s\n[2026-11-14 17:01:02 DP8 TP8 EP8] [TPU] host heap trim via glibc (after warmup): rss 33.25 -> 22.76 GiB in 0.58s\n[2026-11-14 17:01:02 DP11 TP11 EP11] [TPU] host heap trim via glibc (after warmup): rss 31.24 -> 21.91 GiB in 0.55s\n[2026-11-14 17:01:02 DP15 TP15 EP15] [TPU] host heap trim via glibc (after warmup): rss 31.46 -> 22.24 GiB in 0.55s\n[2026-11-14 17:01:02 DP9 TP9 EP9] [TPU] host heap trim via glibc (after warmup): rss 31.58 -> 21.82 GiB in 0.59s\n[2026-11-14 17:01:02 DP13 TP13 EP13] [TPU] host heap trim via glibc (after warmup): rss 31.45 -> 22.34 GiB in 0.51s\n[2026-11-14 17:01:03 DP8 TP8 EP8] [TPU] TPU startup memory: memory.current=198967488512 bytes\n[2026-11-14 17:01:03 DP8 TP8 EP8] [TPU] [recompilation checker] XLA graph baseline: 200 cached programs, 158.9s total compile time, 200 tier-1 misses.\n[2026-11-14 17:01:03 DP12 TP12 EP12] [TPU] [recompilation checker] XLA graph baseline: 199 cached programs, 153.6s total compile time, 199 tier-1 misses.\n[2026-11-14 17:01:03 DP13 TP13 EP13] [TPU] [recompilation checker] XLA graph baseline: 199 cached programs, 159.6s total compile time, 199 tier-1 misses.\n[2026-11-14 17:01:03 DP15 TP15 EP15] [TPU] [recompilation checker] XLA graph baseline: 199 cached programs, 160.0s total compile time, 199 tier-1 misses.\n[2026-11-14 17:01:03 DP8 TP8 EP8] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP14 TP14 EP14] [TPU] [recompilation checker] XLA graph baseline: 199 cached programs, 158.0s total compile time, 199 tier-1 misses.\n[2026-11-14 17:01:03 DP9 TP9 EP9] [TPU] [recompilation checker] XLA graph baseline: 200 cached programs, 145.7s total compile time, 200 tier-1 misses.\n[2026-11-14 17:01:03 DP11 TP11 EP11] [TPU] [recompilation checker] XLA graph baseline: 199 cached programs, 157.1s total compile time, 199 tier-1 misses.\n[2026-11-14 17:01:03 DP12 TP12 EP12] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP13 TP13 EP13] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP15 TP15 EP15] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP9 TP9 EP9] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP10 TP10 EP10] [TPU] [recompilation checker] XLA graph baseline: 199 cached programs, 158.4s total compile time, 199 tier-1 misses.\n[2026-11-14 17:01:03 DP14 TP14 EP14] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP11 TP11 EP11] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP10 TP10 EP10] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n"
+        }
+      }
+    },
+    {
+      "rank": "1",
+      "hostname": "falcon-job-lqs4qh7uol-workers-0-1",
+      "samples": 126,
+      "stdout_sha256": "058339a69b44983fe2561f09c353c4ae76ecea93da9cba2c0a9eaf83fae1bf1b",
+      "all_current_peak": {
+        "sample_kind": "periodic",
+        "time_utc": "2026-11-14T16:45:47.812934+00:00",
+        "current_bytes": 505003503616,
+        "lifetime_peak_bytes": 505011998720,
+        "anon_bytes": 53555855360,
+        "file_bytes": 449554309120,
+        "cgroup_read_root": "/sys/fs/cgroup",
+        "self_cgroup": "0::/\n",
+        "root_pids": [
+          1429
+        ],
+        "descendant_processes": [
+          {
+            "pid": 2791,
+            "rss_kib": 6895812,
+            "rss_hwm_kib": 9198992,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2794,
+            "rss_kib": 6845548,
+            "rss_hwm_kib": 9315520,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2797,
+            "rss_kib": 6843328,
+            "rss_hwm_kib": 9422636,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2793,
+            "rss_kib": 6840468,
+            "rss_hwm_kib": 9492472,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2795,
+            "rss_kib": 6813636,
+            "rss_hwm_kib": 9601660,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2798,
+            "rss_kib": 6808948,
+            "rss_hwm_kib": 9484092,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2792,
+            "rss_kib": 6807432,
+            "rss_hwm_kib": 9201192,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2796,
+            "rss_kib": 6768716,
+            "rss_hwm_kib": 9579508,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1583,
+            "rss_kib": 1349140,
+            "rss_hwm_kib": 1409164,
+            "ppid": 1429,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2510,
+            "rss_kib": 1141748,
+            "rss_hwm_kib": 1229824,
+            "ppid": 1583,
+            "name": "sglang::detoken",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2509,
+            "rss_kib": 808672,
+            "rss_hwm_kib": 808672,
+            "ppid": 1583,
+            "name": "sglang::data_pa",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1429,
+            "rss_kib": 23600,
+            "rss_hwm_kib": 23600,
+            "ppid": 606,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2508,
+            "rss_kib": 14688,
+            "rss_hwm_kib": 14688,
+            "ppid": 1583,
+            "name": "python3",
+            "tracked_descendant": true
+          }
+        ],
+        "surviving_descendant_rss_kib": 57961736,
+        "max_individual_survivor_hwm_kib": 9601660,
+        "memory_events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+        "native_log": {
+          "size_bytes": 118214,
+          "mtime_ns": 1794674734859949436,
+          "tail": "Multi-thread loading shards:  93% Completed | 261/282 [42:48<03:02,  8.67s/it]\rMulti-thread loading shards:  93% Completed | 262/282 [42:58<03:03,  9.18s/it]\rMulti-thread loading shards:  93% Completed | 263/282 [43:14<03:36, 11.37s/it]\rMulti-thread loading shards:  94% Completed | 264/282 [43:16<02:30,  8.37s/it]\rMulti-thread loading shards:  94% Completed | 265/282 [43:19<01:57,  6.91s/it]\rMulti-thread loading shards:  94% Completed | 266/282 [43:32<02:18,  8.68s/it]\rMulti-thread loading shards:  95% Completed | 267/282 [43:53<03:03, 12.26s/it]\rMulti-thread loading shards:  95% Completed | 268/282 [43:56<02:12,  9.48s/it]\rMulti-thread loading shards:  95% Completed | 269/282 [43:58<01:36,  7.42s/it]\rMulti-thread loading shards:  96% Completed | 270/282 [44:12<01:51,  9.31s/it]\rMulti-thread loading shards:  96% Completed | 271/282 [44:17<01:26,  7.84s/it]\rMulti-thread loading shards:  96% Completed | 272/282 [44:21<01:08,  6.82s/it]\rMulti-thread loading shards:  97% Completed | 273/282 [44:24<00:51,  5.69s/it]\rMulti-thread loading shards:  97% Completed | 274/282 [44:33<00:54,  6.77s/it]\rMulti-thread loading shards:  98% Completed | 275/282 [44:41<00:48,  6.94s/it]\rMulti-thread loading shards:  98% Completed | 276/282 [44:42<00:31,  5.21s/it]\rMulti-thread loading shards:  98% Completed | 277/282 [44:51<00:32,  6.47s/it]\rMulti-thread loading shards:  99% Completed | 278/282 [45:08<00:37,  9.50s/it]\rMulti-thread loading shards:  99% Completed | 279/282 [45:13<00:24,  8.23s/it]\rMulti-thread loading shards:  99% Completed | 280/282 [45:15<00:12,  6.32s/it]\rMulti-thread loading shards: 100% Completed | 281/282 [45:26<00:07,  7.83s/it]\rMulti-thread loading shards: 100% Completed | 282/282 [45:30<00:00,  6.61s/it]\rMulti-thread loading shards: 100% Completed | 282/282 [45:30<00:00,  9.68s/it]\n[2026-11-14 16:45:34 DP4 TP4 EP4] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.\n[2026-11-14 16:45:34 DP4 TP4 EP4] Load weight end. elapsed=2740.71 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.\n[2026-11-14 16:45:34 DP0 TP0 EP0] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.\n[2026-11-14 16:45:34 DP0 TP0 EP0] Load weight end. elapsed=2740.72 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.\n[2026-11-14 16:45:34 DP1 TP1 EP1] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.\n[2026-11-14 16:45:34 DP1 TP1 EP1] Load weight end. elapsed=2740.95 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.\n[2026-11-14 16:45:34 DP7 TP7 EP7] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.\n[2026-11-14 16:45:34 DP7 TP7 EP7] Load weight end. elapsed=2740.98 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.\n[2026-11-14 16:45:34 DP2 TP2 EP2] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.\n[2026-11-14 16:45:34 DP2 TP2 EP2] Load weight end. elapsed=2741.00 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.\n[2026-11-14 16:45:34 DP5 TP5 EP5] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.\n[2026-11-14 16:45:34 DP5 TP5 EP5] Load weight end. elapsed=2741.07 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.\n[2026-11-14 16:45:34 DP6 TP6 EP6] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.\n[2026-11-14 16:45:34 DP6 TP6 EP6] Load weight end. elapsed=2741.12 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.\n[2026-11-14 16:45:34 DP3 TP3 EP3] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.\n[2026-11-14 16:45:34 DP3 TP3 EP3] Load weight end. elapsed=2741.44 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.\n"
+        }
+      },
+      "post_release_current_peak": {
+        "sample_kind": "periodic",
+        "time_utc": "2026-11-14T17:00:48.060490+00:00",
+        "current_bytes": 283917135872,
+        "lifetime_peak_bytes": 505900470272,
+        "anon_bytes": 273384734720,
+        "file_bytes": 8982663168,
+        "cgroup_read_root": "/sys/fs/cgroup",
+        "self_cgroup": "0::/\n",
+        "root_pids": [
+          1429
+        ],
+        "descendant_processes": [
+          {
+            "pid": 2798,
+            "rss_kib": 34245888,
+            "rss_hwm_kib": 34392688,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2793,
+            "rss_kib": 34204316,
+            "rss_hwm_kib": 34261816,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2795,
+            "rss_kib": 33995168,
+            "rss_hwm_kib": 34067904,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2797,
+            "rss_kib": 33755984,
+            "rss_hwm_kib": 33799620,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2791,
+            "rss_kib": 33499820,
+            "rss_hwm_kib": 33499820,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2792,
+            "rss_kib": 33438848,
+            "rss_hwm_kib": 33491924,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2794,
+            "rss_kib": 33299164,
+            "rss_hwm_kib": 33369188,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2796,
+            "rss_kib": 33202072,
+            "rss_hwm_kib": 33360252,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1583,
+            "rss_kib": 1360740,
+            "rss_hwm_kib": 1409164,
+            "ppid": 1429,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2510,
+            "rss_kib": 1142084,
+            "rss_hwm_kib": 1229824,
+            "ppid": 1583,
+            "name": "sglang::detoken",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2509,
+            "rss_kib": 808748,
+            "rss_hwm_kib": 808748,
+            "ppid": 1583,
+            "name": "sglang::data_pa",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1429,
+            "rss_kib": 23988,
+            "rss_hwm_kib": 23988,
+            "ppid": 606,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2508,
+            "rss_kib": 14688,
+            "rss_hwm_kib": 14688,
+            "ppid": 1583,
+            "name": "python3",
+            "tracked_descendant": true
+          }
+        ],
+        "surviving_descendant_rss_kib": 272991508,
+        "max_individual_survivor_hwm_kib": 34392688,
+        "memory_events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+        "native_log": {
+          "size_bytes": 176494,
+          "mtime_ns": 1794675647212043815,
+          "tail": "  self.copy_done.record()\n[2026-11-14 17:00:10] INFO:     10.228.6.117:45558 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:11] INFO:     10.228.6.117:45568 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:12] INFO:     10.228.6.117:45580 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:13] INFO:     10.228.6.117:45584 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:14] INFO:     10.228.6.117:45600 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:15] INFO:     10.228.6.117:45602 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:16] INFO:     10.228.6.117:45606 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:17] INFO:     10.228.6.117:39376 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:18] INFO:     10.228.6.117:39378 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:19] INFO:     10.228.6.117:39386 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:20] INFO:     10.228.6.117:39392 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:21] INFO:     10.228.6.117:39394 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:22] INFO:     10.228.6.117:39404 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:23] INFO:     10.228.6.117:39408 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:24] INFO:     10.228.6.117:39410 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:25] INFO:     10.228.6.117:39424 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:25 DP0 TP0 EP0] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-14 17:00:26] INFO:     10.228.6.117:39430 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:27] INFO:     10.228.6.117:33180 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:28] INFO:     10.228.6.117:33196 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:29] INFO:     10.228.6.117:33202 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:30] INFO:     10.228.6.117:33218 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:31] INFO:     10.228.6.117:33232 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:32] INFO:     10.228.6.117:33234 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:33] INFO:     10.228.6.117:33242 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:34] INFO:     10.228.6.117:33256 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:35] INFO:     10.228.6.117:33264 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:36] INFO:     10.228.6.117:33280 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:37] INFO:     10.228.6.117:42256 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:38] INFO:     10.228.6.117:42264 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:39] INFO:     10.228.6.117:42272 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:40] INFO:     10.228.6.117:42288 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:41] INFO:     10.228.6.117:42298 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:42] INFO:     10.228.6.117:42304 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:43] INFO:     10.228.6.117:42318 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:44] INFO:     10.228.6.117:42332 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:45] INFO:     10.228.6.117:42338 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:46] INFO:     10.228.6.117:42348 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:00:47] INFO:     10.228.6.117:47010 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n"
+        }
+      },
+      "pre_cleanup": {
+        "sample_kind": "pre_cleanup",
+        "time_utc": "2026-11-14T17:01:09.053351+00:00",
+        "current_bytes": 199654350848,
+        "lifetime_peak_bytes": 505900470272,
+        "anon_bytes": 188558852096,
+        "file_bytes": 8983719936,
+        "cgroup_read_root": "/sys/fs/cgroup",
+        "self_cgroup": "0::/\n",
+        "root_pids": [
+          1429
+        ],
+        "descendant_processes": [
+          {
+            "pid": 2798,
+            "rss_kib": 24563448,
+            "rss_hwm_kib": 34392688,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2795,
+            "rss_kib": 23793796,
+            "rss_hwm_kib": 34067904,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2793,
+            "rss_kib": 23356260,
+            "rss_hwm_kib": 34261816,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2797,
+            "rss_kib": 23213224,
+            "rss_hwm_kib": 33799620,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2791,
+            "rss_kib": 23178040,
+            "rss_hwm_kib": 34044068,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2796,
+            "rss_kib": 23114448,
+            "rss_hwm_kib": 33360252,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2792,
+            "rss_kib": 23100916,
+            "rss_hwm_kib": 33491924,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2794,
+            "rss_kib": 22488136,
+            "rss_hwm_kib": 33369188,
+            "ppid": 2509,
+            "name": "sglang::schedul",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1583,
+            "rss_kib": 1361344,
+            "rss_hwm_kib": 1409164,
+            "ppid": 1429,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2510,
+            "rss_kib": 1142316,
+            "rss_hwm_kib": 1229824,
+            "ppid": 1583,
+            "name": "sglang::detoken",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2509,
+            "rss_kib": 808752,
+            "rss_hwm_kib": 808752,
+            "ppid": 1583,
+            "name": "sglang::data_pa",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 1429,
+            "rss_kib": 23988,
+            "rss_hwm_kib": 23988,
+            "ppid": 606,
+            "name": "python3",
+            "tracked_descendant": true
+          },
+          {
+            "pid": 2508,
+            "rss_kib": 14688,
+            "rss_hwm_kib": 14688,
+            "ppid": 1583,
+            "name": "python3",
+            "tracked_descendant": true
+          }
+        ],
+        "surviving_descendant_rss_kib": 190159356,
+        "max_individual_survivor_hwm_kib": 34392688,
+        "memory_events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+        "native_log": {
+          "size_bytes": 187397,
+          "mtime_ns": 1794675668529022673,
+          "tail": "[2026-11-14 17:01:02 DP7 TP7 EP7] [TPU] host heap trim via glibc (after warmup): rss 32.48 -> 23.39 GiB in 0.56s\n[2026-11-14 17:01:02 DP5 TP5 EP5] [TPU] host heap trim via glibc (after warmup): rss 31.43 -> 22.01 GiB in 0.56s\n[2026-11-14 17:01:02 DP1 TP1 EP1] [TPU] host heap trim via glibc (after warmup): rss 31.43 -> 22.00 GiB in 0.58s\n[2026-11-14 17:01:02] INFO:     10.228.6.117:52754 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:01:02 DP3 TP3 EP3] [TPU] host heap trim via glibc (after warmup): rss 31.58 -> 21.41 GiB in 0.43s\n[2026-11-14 17:01:02 DP2 TP2 EP2] [TPU] host heap trim via glibc (after warmup): rss 32.45 -> 22.24 GiB in 0.43s\n[2026-11-14 17:01:03] INFO:     10.228.6.117:52766 - \"GET /health HTTP/1.1\" 503 Service Unavailable\n[2026-11-14 17:01:03 DP0 TP0 EP0] [TPU] host heap trim via glibc (after warmup): rss 32.05 -> 22.07 GiB in 0.39s\n[2026-11-14 17:01:03 DP0 TP0 EP0] [TPU] TPU startup memory: memory.current=199365214208 bytes\n[2026-11-14 17:01:03 DP5 TP5 EP5] [TPU] [recompilation checker] XLA graph baseline: 200 cached programs, 168.5s total compile time, 200 tier-1 misses.\n[2026-11-14 17:01:03 DP4 TP4 EP4] [TPU] [recompilation checker] XLA graph baseline: 200 cached programs, 172.7s total compile time, 200 tier-1 misses.\n[2026-11-14 17:01:03 DP3 TP3 EP3] [TPU] [recompilation checker] XLA graph baseline: 200 cached programs, 169.2s total compile time, 200 tier-1 misses.\n[2026-11-14 17:01:03 DP6 TP6 EP6] [TPU] [recompilation checker] XLA graph baseline: 200 cached programs, 171.3s total compile time, 200 tier-1 misses.\n[2026-11-14 17:01:03 DP4 TP4 EP4] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP5 TP5 EP5] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP2 TP2 EP2] [TPU] [recompilation checker] XLA graph baseline: 200 cached programs, 171.0s total compile time, 200 tier-1 misses.\n[2026-11-14 17:01:03 DP7 TP7 EP7] [TPU] [recompilation checker] XLA graph baseline: 200 cached programs, 169.5s total compile time, 200 tier-1 misses.\n[2026-11-14 17:01:03 DP6 TP6 EP6] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP3 TP3 EP3] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP0 TP0 EP0] [TPU] [recompilation checker] XLA graph baseline: 200 cached programs, 165.8s total compile time, 200 tier-1 misses.\n[2026-11-14 17:01:03 DP1 TP1 EP1] [TPU] [recompilation checker] XLA graph baseline: 200 cached programs, 162.6s total compile time, 200 tier-1 misses.\n[2026-11-14 17:01:03 DP2 TP2 EP2] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP7 TP7 EP7] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP0 TP0 EP0] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03 DP1 TP1 EP1] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile').\n[2026-11-14 17:01:03] The server is fired up and ready to roll!\n[2026-11-14 17:01:05 DP0 TP0 EP0] Prefill batch, #new-seq: 1, #new-token: 1, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, #pending-token: 0, cuda graph: False, input throughput (token/s): 0.13\n[2026-11-14 17:01:05] INFO:     10.228.6.117:52774 - \"GET /health HTTP/1.1\" 200 OK\n[2026-11-14 17:01:07 DP1 TP1 EP1] Prefill batch, #new-seq: 1, #new-token: 256, #cached-token: 0, token usage: 0.06, #running-req: 0, #queue-req: 0, #pending-token: 256, cuda graph: False, input throughput (token/s): 27.66\n[2026-11-14 17:01:08 DP1 TP1 EP1] Prefill batch, #new-seq: 1, #new-token: 256, #cached-token: 0, token usage: 0.08, #running-req: 0, #queue-req: 0, #pending-token: 0, cuda graph: False, input throughput (token/s): 194.67\n[2026-11-14 17:01:08] INFO:     10.228.6.117:52790 - \"POST /generate HTTP/1.1\" 200 OK\n"
+        }
+      }
+    }
+  ]
+}
