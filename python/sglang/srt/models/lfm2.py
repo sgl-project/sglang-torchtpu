@@ -49,6 +49,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
@@ -314,6 +315,11 @@ class Lfm2ShortConv(nn.Module):
             self.register_parameter("conv_bias", None)
 
         register_shortconv_verify_buffers(self)
+        self._short_conv_kernel = (
+            current_platform.get_short_conv_kernel()
+            if current_platform.is_out_of_tree()
+            else None
+        )
 
     def forward(
         self,
@@ -334,7 +340,15 @@ class Lfm2ShortConv(nn.Module):
         B_gate, C_gate, x = proj.chunk(3, dim=-1)
         Bx = B_gate * x
 
-        if forward_batch.forward_mode.is_decode():
+        if self._short_conv_kernel is not None:
+            conv_out = self._short_conv_kernel(
+                Bx,
+                self.conv_weight,
+                self.conv_bias,
+                meta,
+                forward_batch.forward_mode,
+            )
+        elif forward_batch.forward_mode.is_decode():
             # Decode: single token per request, use optimized update kernel
             conv_out = causal_conv1d_update(
                 Bx,

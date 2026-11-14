@@ -1382,6 +1382,16 @@ class TpuSRTPlatform(SRTPlatform):
 
         return TpuMambaPool
 
+    def get_short_conv_backend_cls(self) -> type:
+        from sglang_tpu.attention_short_conv import TpuShortConvAttnBackend
+
+        return TpuShortConvAttnBackend
+
+    def get_short_conv_kernel(self):
+        from sglang_tpu.attention_short_conv import short_conv
+
+        return short_conv
+
     def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
         from sglang.srt.mem_cache.pool_host.base import (
             host_memory_budget_bytes,
