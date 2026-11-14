@@ -39,8 +39,11 @@ for case in roundtrip all-reduce asymmetric; do
         done
         [[ -n "$TORCH_TPU_TOPOLOGY" ]] || exit 2
         printf 'LOCAL_DISCOVERY_VALIDATED topology=%s addresses=%s\n' "$TORCH_TPU_TOPOLOGY" "$TORCH_TPU_SLICEBUILDER_ADDRESSES"
-        python -m torch.distributed.run --standalone --nproc_per_node="$WORLD_SIZE" \
+        printf 'CHILD_LAUNCH_BEGIN case=%s\\n' "$1"
+        python -u -m torch.distributed.run --standalone --nproc_per_node="$WORLD_SIZE" \
+            --tee 3 --redirects 3 \
             -m benchmark.tpu.glm52_epic.repro_distributed_boundary --case "$1"
+        printf 'CHILD_LAUNCH_END case=%s status=%s\\n' "$1" "$?"
     ' _ "$case" 2>&1 | tee "$OUT/$case.log"
     status=("${PIPESTATUS[@]}")
     rc=${status[0]}
