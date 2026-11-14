@@ -6,8 +6,11 @@ NEG = -1e30
 LOG2E = 1.4426950408889634
 # largest score bound MKConfig.attn_unshifted accepts
 UNSHIFTED_MAX = 60.0
-# Barrier semaphore id; distinct from the fused-RS MoE (0) and two-shot all-reduce (7) kernels.
+# Barrier semaphore ids; distinct from the fused-RS MoE (0) and two-shot all-reduce (7) kernels.
 _COLLECTIVE_ID = 6
+# The prefill program's attention-output (9) and post-MoE (10) kernels.
+PREFILL_ATTN_OUT_COLLECTIVE_ID = 9
+PREFILL_POST_MOE_COLLECTIVE_ID = 10
 FP4_PACK = 8
 FP4_GROUP = 16
 QBLOCK_SIZES = (64, 128, 256)  # SGLANG_TPU_MUSE_MK_QBLOCK: K rows per scale row

@@ -860,6 +860,10 @@ class _LayerRef:
     """Teacher-forced reference of one decoder layer on the gathered (all-rank) weights,
     mirroring the kernel's documented bf16 rounding points."""
 
+    # The prefill program hands RPA bf16 K/V (rounded to the pool dtype from bf16) and gets
+    # a bf16 attention output back; the decode megakernel rounds from f32 in both places.
+    bf16_attention_io = False
+
     def __init__(
         self,
         l: int,
@@ -897,6 +901,8 @@ class _LayerRef:
         kn = _heads_rms(k, KV_HEADS)
         if not self.is_global:
             qn, kn = _rope(qn, Q_HEADS, self.rope), _rope(kn, KV_HEADS, self.rope)
+        if self.bf16_attention_io:
+            kn, v = _bf(kn), _bf(v)
         kb = kn.to(self.kv_dt).float().to(torch.bfloat16).float()
         vb = v.to(self.kv_dt).float().to(torch.bfloat16).float()
         out = torch.cat(
@@ -905,7 +911,7 @@ class _LayerRef:
                 for j in range(self.case.n_req)
             ]
         )
-        attn = _bf(_heads_rms(out, Q_HEADS))
+        attn = _bf(_heads_rms(_bf(out) if self.bf16_attention_io else out, Q_HEADS))
         gated = _bf(torch.sigmoid(_bf(og)) * attn)
         return self._mv(gated, d, "wo"), kb, vb
 
