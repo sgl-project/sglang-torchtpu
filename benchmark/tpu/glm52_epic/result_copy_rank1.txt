@@ -1,0 +1,431 @@
+/tmp/tpu_logs/peer_bootstrap_8chip.sh: OK
+{"base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1", "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3", "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c", "got": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0+cpu", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0+cpu", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "peer_experiment": "exp-bsvzoblh0d", "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00", "peer_task_status": "succeeded", "prepared_wheelhouse": "/prepared/wheelhouse", "schema_version": 1, "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity", "source_commit": "8b1aa305675d0739ee077eccf7c458d682a03600", "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git", "want": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"}
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794658965.590239     631 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794658965.700282     631 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794658966.830823     631 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794658966.834162     631 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=copy
+I0000 00:00:1794658968.825733     631 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794658974.069188     631 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794658974.069230     631 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py", line 52, in <module>
+    main()
+  File "/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py", line 41, in main
+    torch.tpu.synchronize()
+  File "/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/_internal/utils/annotations.py", line 276, in wrapper
+    raise RuntimeError(f"{msg} {reason}" if reason else msg)
+RuntimeError: synchronize is internal to TorchTPU and can only be called by the PyTorch framework (torch and torch_tpu). Use torch.accelerator.synchronize instead.
+I0000 00:00:1794658974.075287     631 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794658974.075303     631 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0
+num_cache_hits=0 {NA}
+num_compilations=0
+peak_compilation_memory_bytes=unknown
+
+upload-1-copy exit_code=1
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794658981.645036    1459 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794658981.658364    1459 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794658982.309919    1459 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794658982.312557    1459 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=event
+I0000 00:00:1794658984.304291    1459 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794658988.972710    1459 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794658988.972754    1459 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:34: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.
+  event = torch.tpu.Event() if args.case != 'copy' else None
+STAGE copy_or_record
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:38: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.
+  event.record()
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:39: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> synchronize is experimental and subject to change: synchronize() is experimental and may change or be removed without notice.
+  event.synchronize()
+RESULT_COPY_PASS case=event producer=upload elements=1 iteration=0
+STAGE upload iteration=1 case=event
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+RESULT_COPY_PASS case=event producer=upload elements=1 iteration=1
+I0000 00:00:1794658988.980334    1459 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794658988.980355    1459 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0
+num_cache_hits=0 {NA}
+num_compilations=0
+peak_compilation_memory_bytes=unknown
+
+upload-1-event exit_code=0
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794658995.727546    2260 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794658995.740058    2260 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794658996.382917    2260 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794658996.385603    2260 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=copy-event
+I0000 00:00:1794658998.342806    2260 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794659003.161529    2260 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794659003.161573    2260 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:34: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.
+  event = torch.tpu.Event() if args.case != 'copy' else None
+STAGE copy_or_record
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:38: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.
+  event.record()
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:39: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> synchronize is experimental and subject to change: synchronize() is experimental and may change or be removed without notice.
+  event.synchronize()
+RESULT_COPY_PASS case=copy-event producer=upload elements=1 iteration=0
+STAGE upload iteration=1 case=copy-event
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+RESULT_COPY_PASS case=copy-event producer=upload elements=1 iteration=1
+I0000 00:00:1794659003.168885    2260 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794659003.168905    2260 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0
+num_cache_hits=0 {NA}
+num_compilations=0
+peak_compilation_memory_bytes=unknown
+
+upload-1-copy-event exit_code=0
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794659010.397805    3069 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794659010.410638    3069 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794659011.085965    3069 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794659011.088676    3069 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=copy
+I0000 00:00:1794659013.048068    3069 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794659017.782912    3069 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794659017.782964    3069 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py", line 52, in <module>
+    main()
+  File "/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py", line 41, in main
+    torch.tpu.synchronize()
+  File "/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/_internal/utils/annotations.py", line 276, in wrapper
+    raise RuntimeError(f"{msg} {reason}" if reason else msg)
+RuntimeError: synchronize is internal to TorchTPU and can only be called by the PyTorch framework (torch and torch_tpu). Use torch.accelerator.synchronize instead.
+I0000 00:00:1794659017.789041    3069 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794659017.789054    3069 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0
+num_cache_hits=0 {NA}
+num_compilations=0
+peak_compilation_memory_bytes=unknown
+
+upload-512-copy exit_code=1
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794659024.719100    3889 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794659024.731119    3889 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794659025.372906    3889 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794659025.375552    3889 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=event
+I0000 00:00:1794659027.323076    3889 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794659032.802338    3889 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794659032.802384    3889 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:34: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.
+  event = torch.tpu.Event() if args.case != 'copy' else None
+STAGE copy_or_record
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:38: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.
+  event.record()
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:39: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> synchronize is experimental and subject to change: synchronize() is experimental and may change or be removed without notice.
+  event.synchronize()
+RESULT_COPY_PASS case=event producer=upload elements=512 iteration=0
+STAGE upload iteration=1 case=event
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+RESULT_COPY_PASS case=event producer=upload elements=512 iteration=1
+I0000 00:00:1794659032.810118    3889 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794659032.810134    3889 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0
+num_cache_hits=0 {NA}
+num_compilations=0
+peak_compilation_memory_bytes=unknown
+
+upload-512-event exit_code=0
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794659040.597143    4694 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794659040.609489    4694 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794659041.269739    4694 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794659041.272700    4694 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=copy-event
+I0000 00:00:1794659043.256461    4694 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794659048.202297    4694 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794659048.202339    4694 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:34: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.
+  event = torch.tpu.Event() if args.case != 'copy' else None
+STAGE copy_or_record
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:38: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.
+  event.record()
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:39: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> synchronize is experimental and subject to change: synchronize() is experimental and may change or be removed without notice.
+  event.synchronize()
+RESULT_COPY_PASS case=copy-event producer=upload elements=512 iteration=0
+STAGE upload iteration=1 case=copy-event
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+RESULT_COPY_PASS case=copy-event producer=upload elements=512 iteration=1
+I0000 00:00:1794659048.209950    4694 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794659048.209968    4694 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0
+num_cache_hits=0 {NA}
+num_compilations=0
+peak_compilation_memory_bytes=unknown
+
+upload-512-copy-event exit_code=0
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794659055.223325    5492 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794659055.238539    5492 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794659055.880270    5492 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794659055.882919    5492 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=copy
+I0000 00:00:1794659057.843006    5492 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794659063.169244    5492 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794659063.169290    5492 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py", line 52, in <module>
+    main()
+  File "/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py", line 41, in main
+    torch.tpu.synchronize()
+  File "/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/_internal/utils/annotations.py", line 276, in wrapper
+    raise RuntimeError(f"{msg} {reason}" if reason else msg)
+RuntimeError: synchronize is internal to TorchTPU and can only be called by the PyTorch framework (torch and torch_tpu). Use torch.accelerator.synchronize instead.
+I0000 00:00:1794659063.206264    6280 compilation_cache_utils.cc:220] Tier-3 compilation cache root directory: 
+I0000 00:00:1794659063.206284    6280 tier2_compilation_cache.cc:81] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1794659064.517144    5492 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794659064.517179    5492 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=1
+num_cache_hits=0 {0.0%}
+num_compilations=1
+peak_compilation_memory_bytes=unknown
+
+argmax-1-copy exit_code=1
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794659071.658492    6767 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794659071.670981    6767 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794659072.308684    6767 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794659072.311365    6767 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=event
+I0000 00:00:1794659074.275760    6767 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794659079.124310    6767 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794659079.124360    6767 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:34: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.
+  event = torch.tpu.Event() if args.case != 'copy' else None
+STAGE copy_or_record
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:38: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.
+  event.record()
+I0000 00:00:1794659079.161752    7558 compilation_cache_utils.cc:220] Tier-3 compilation cache root directory: 
+I0000 00:00:1794659079.161773    7558 tier2_compilation_cache.cc:81] Tier-2 compilation cache is disabled for world size 1.
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:39: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> synchronize is experimental and subject to change: synchronize() is experimental and may change or be removed without notice.
+  event.synchronize()
+RESULT_COPY_PASS case=event producer=argmax elements=1 iteration=0
+STAGE upload iteration=1 case=event
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+RESULT_COPY_PASS case=event producer=argmax elements=1 iteration=1
+I0000 00:00:1794659080.476093    6767 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794659080.476132    6767 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=2
+num_cache_hits=1 {50.0%}
+num_compilations=1
+peak_compilation_memory_bytes=unknown
+
+argmax-1-event exit_code=0
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794659087.599683    8052 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794659087.612089    8052 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794659088.257556    8052 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794659088.260303    8052 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=copy-event
+I0000 00:00:1794659090.222213    8052 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794659095.410240    8052 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794659095.410284    8052 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:34: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.
+  event = torch.tpu.Event() if args.case != 'copy' else None
+STAGE copy_or_record
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:38: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.
+  event.record()
+I0000 00:00:1794659095.446911    8848 compilation_cache_utils.cc:220] Tier-3 compilation cache root directory: 
+I0000 00:00:1794659095.446931    8848 tier2_compilation_cache.cc:81] Tier-2 compilation cache is disabled for world size 1.
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:39: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> synchronize is experimental and subject to change: synchronize() is experimental and may change or be removed without notice.
+  event.synchronize()
+RESULT_COPY_PASS case=copy-event producer=argmax elements=1 iteration=0
+STAGE upload iteration=1 case=copy-event
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+RESULT_COPY_PASS case=copy-event producer=argmax elements=1 iteration=1
+I0000 00:00:1794659096.770073    8052 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794659096.770110    8052 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=2
+num_cache_hits=1 {50.0%}
+num_compilations=1
+peak_compilation_memory_bytes=unknown
+
+argmax-1-copy-event exit_code=0
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794659105.469818    9336 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794659105.482154    9336 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794659106.133141    9336 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794659106.135814    9336 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=copy
+I0000 00:00:1794659108.102663    9336 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794659113.650121    9336 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794659113.650170    9336 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py", line 52, in <module>
+    main()
+  File "/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py", line 41, in main
+    torch.tpu.synchronize()
+  File "/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/_internal/utils/annotations.py", line 276, in wrapper
+    raise RuntimeError(f"{msg} {reason}" if reason else msg)
+RuntimeError: synchronize is internal to TorchTPU and can only be called by the PyTorch framework (torch and torch_tpu). Use torch.accelerator.synchronize instead.
+I0000 00:00:1794659113.685641   10244 compilation_cache_utils.cc:220] Tier-3 compilation cache root directory: 
+I0000 00:00:1794659113.685671   10244 tier2_compilation_cache.cc:81] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1794659115.102204    9336 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794659115.102237    9336 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=1
+num_cache_hits=0 {0.0%}
+num_compilations=1
+peak_compilation_memory_bytes=unknown
+
+argmax-512-copy exit_code=1
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794659122.378309   10725 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794659122.390845   10725 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794659123.032461   10725 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794659123.035119   10725 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=event
+I0000 00:00:1794659124.989088   10725 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794659130.330685   10725 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794659130.330731   10725 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:34: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.
+  event = torch.tpu.Event() if args.case != 'copy' else None
+STAGE copy_or_record
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:38: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.
+  event.record()
+I0000 00:00:1794659130.369676   11625 compilation_cache_utils.cc:220] Tier-3 compilation cache root directory: 
+I0000 00:00:1794659130.369707   11625 tier2_compilation_cache.cc:81] Tier-2 compilation cache is disabled for world size 1.
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:39: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> synchronize is experimental and subject to change: synchronize() is experimental and may change or be removed without notice.
+  event.synchronize()
+RESULT_COPY_PASS case=event producer=argmax elements=512 iteration=0
+STAGE upload iteration=1 case=event
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+RESULT_COPY_PASS case=event producer=argmax elements=512 iteration=1
+I0000 00:00:1794659131.817771   10725 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794659131.817802   10725 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=2
+num_cache_hits=1 {50.0%}
+num_compilations=1
+peak_compilation_memory_bytes=unknown
+
+argmax-512-event exit_code=0
+/tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794659139.226716   12109 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.Q5r22P/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794659139.242718   12109 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794659139.892020   12109 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794659139.894912   12109 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+STAGE upload iteration=0 case=copy-event
+I0000 00:00:1794659141.881069   12109 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794659146.829317   12109 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794659146.829362   12109 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+BRANCH device=tpu:0 is_cuda=False
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:34: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Event is experimental and subject to change: Event() is experimental and may change or be removed without notice.
+  event = torch.tpu.Event() if args.case != 'copy' else None
+STAGE copy_or_record
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:38: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> record is experimental and subject to change: record() is experimental and may change or be removed without notice.
+  event.record()
+I0000 00:00:1794659146.866398   13005 compilation_cache_utils.cc:220] Tier-3 compilation cache root directory: 
+I0000 00:00:1794659146.866422   13005 tier2_compilation_cache.cc:81] Tier-2 compilation cache is disabled for world size 1.
+/tmp/glm52-peer-rank1.Q5r22P/src/benchmark/tpu/glm52_epic/repro_result_copy.py:39: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> synchronize is experimental and subject to change: synchronize() is experimental and may change or be removed without notice.
+  event.synchronize()
+RESULT_COPY_PASS case=copy-event producer=argmax elements=512 iteration=0
+STAGE upload iteration=1 case=copy-event
+BRANCH device=tpu:0 is_cuda=False
+STAGE copy_or_record
+RESULT_COPY_PASS case=copy-event producer=argmax elements=512 iteration=1
+I0000 00:00:1794659148.309669   12109 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794659148.309705   12109 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=2
+num_cache_hits=1 {50.0%}
+num_compilations=1
+peak_compilation_memory_bytes=unknown
+
+argmax-512-copy-event exit_code=0
+falcon-agent: command failed: exit status 1

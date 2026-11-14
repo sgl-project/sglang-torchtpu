@@ -43,7 +43,7 @@ def main():
             event.record()
             event.synchronize()
         else:
-            torch.tpu.synchronize()
+            torch.accelerator.synchronize()
         if host is not None:
             torch.testing.assert_close(host, expected, rtol=0, atol=0)
         else:
