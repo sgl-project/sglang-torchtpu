@@ -1,0 +1,14 @@
+{
+  "experiment_id": "exp-48q9eb5nxn",
+  "artifact_id": "art-8d6rrv2vxw",
+  "source_commit": "99ea485f27de77f820da454fd53ea6cde4123286",
+  "comparison_experiment": "exp-9320106a77",
+  "comparison_source": "1e9935c863b13653ec19adbb9d3cffb190fe75b5",
+  "verified_production_delta": ["sglang_tpu/attention/pallas/mla_sparse_qblock_tokens.py: post-legacy-pps query tile shrinking, minimum32"],
+  "config_byte_identical_to_comparison": true,
+  "diagnostic_changes": "host identity, bounded native tails, CR progress parsing, pre-cleanup snapshot and cleanup boundary",
+  "scope": "small startup/request/decode baseline only; not matched JAX performance",
+  "acceptance": ["native server health200", "512 input token IDs generate exactly2 output IDs without abort", "launcher alive after request", "peer acknowledgment"],
+  "coverage_limit": "local chunk ceiling256; HTTP request does not prove qblock runtime dispatch; compile warmup2048 covers a distinct graph",
+  "status": "submitted; terminal evidence pending"
+}
