@@ -9,6 +9,42 @@ import json
 from pathlib import Path
 
 
+def publish_command(directory, *, run_token, sequence, epoch, action):
+    """Atomically publish one immutable command for all scheduler processes."""
+    if (type(run_token) is not str or not run_token or type(sequence) is not int
+            or sequence < 0 or type(epoch) is not str or not epoch
+            or action not in ('pause', 'resume')):
+        raise ValueError('invalid barrier command')
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / 'command.json'
+    temporary = root / 'command.json.tmp'
+    temporary.write_text(json.dumps({'run_token': run_token, 'sequence': sequence,
+                                     'epoch': epoch, 'action': action},
+                                    sort_keys=True) + '\\n')
+    temporary.replace(target)
+
+
+def load_acknowledgments(directory, *, run_token, epoch, sequence, ranks):
+    """Read exact per-rank acks; return None until every rank is valid."""
+    if type(ranks) is not list or not ranks or len(set(ranks)) != len(ranks):
+        raise ValueError('explicit unique rank list required')
+    result = []
+    for rank in ranks:
+        path = Path(directory) / f'rank-{rank}.json'
+        if not path.exists():
+            return None
+        try:
+            state = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        if (state.get('run_token') != run_token or state.get('epoch') != epoch
+                or state.get('sequence') != sequence or state.get('dp_rank') != rank):
+            return None
+        result.append(state)
+    return result
+
+
 def snapshot(scheduler, rank):
     running = getattr(scheduler, 'running_batch', None)
     chunked = getattr(scheduler, 'chunked_req', None)
