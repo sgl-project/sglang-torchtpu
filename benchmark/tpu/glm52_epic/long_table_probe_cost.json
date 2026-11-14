@@ -1,0 +1,22 @@
+{
+  "experiment": "exp-0yr6557d19",
+  "source_commit": "c214cdfe2606b43eeba2f8b3a3a4d4b244349762",
+  "scope": "static source-level work accounting, not HLO/LLO census or measured bottleneck",
+  "shape": {"queries": 2048, "heads": 64, "topk": 2048, "page_size": 128, "pages_per_seq": 481, "live_kv": 2048},
+  "gather_page_ids": {
+    "source": "sglang_tpu/attention/pallas/mla_sparse/kernel.py:68-130",
+    "page_chunk_columns": 128,
+    "padded_columns": 512,
+    "chunk_iterations": 4,
+    "per_token_table_window_logical_bytes": 4194304,
+    "output_physical_page_ids_logical_bytes": 16777216,
+    "caveat": "Logical arrays need not materialize exactly this way after XLA optimization; not HBM traffic measurement.33-page per-query gather would pad128 and iterate once, but accepted smoke qblock skips this fallback entirely."
+  },
+  "attention_chunking": {
+    "source": "sglang_tpu/attention/pallas/mla_sparse/kernel.py:898-946; mla_sparse_fused.py:268-270",
+    "default_chunk_queries": 64,
+    "python_unrolled_chunk_calls": 32,
+    "caveat": "Source expansion count is not runtime concurrency or independent compilation process count."
+  },
+  "decision": "Wait for bounded production Dynamo self/causal oracles before changing guard, page layout or full-model config; failure signatures and numerical results determine next step. No full-model retry yet."
+}
