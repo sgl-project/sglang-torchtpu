@@ -264,6 +264,16 @@ initial Python `-c` inspection command failed with exit2 through exec's command
 quoting; the simple `tail` inspection succeeded without modifying the workload. Do not confuse the diagnostic step passes with
 this full-model acceptance criterion.
 
+## Loading progress is rank-gated, not a cross-host skew metric
+
+`weight_utils.py:1286-1288` enables the multi-thread shard progress bar only
+before distributed init or on global distributed rank0. Rank1 host logs contain
+DP8-15 Load weight begin but no shard counter; this is expected logging policy,
+not evidence its loader is stuck. The bar increments after yielding each shard's
+tensors (`1322-1339`), not after all hosts finish that shard. Thus rank0's
+147/282 snapshot is local consumer progress only and cannot establish global
+checkpoint readiness or relative host speed.
+
 ## Indexer remains a separate untested startup boundary
 
 The serving backend builds `build_dsa_index_topk_op` for plain DSA. This op
