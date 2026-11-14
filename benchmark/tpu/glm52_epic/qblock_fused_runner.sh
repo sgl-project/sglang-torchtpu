@@ -25,10 +25,15 @@ case "${GLM52_QBLOCK_FUSED_SUITE:-standard}" in
   rope) selections=(rope-pair) ;;
   *) echo 'Unsupported fused suite' >&2; exit 2 ;;
 esac
+entry="${GLM52_SPARSE_PREFILL_ENTRY:-prefill-qblock}"
+case "$entry" in
+  prefill-qblock|prefill-long-table) ;;
+  *) echo 'Unsupported prefill entry' >&2; exit 2 ;;
+esac
 for selection in "${selections[@]}"; do
   timeout --signal=TERM --kill-after=15s 400s python -m benchmark.tpu.glm52_epic.repro_sparse_step \
-    --queries 2048 --entry prefill-qblock --selection "$selection" "${compile_args[@]}" 2>&1 | tee "$OUT/$selection.log"
-  python - "$OUT/$selection.log" "$selection" "${GLM52_QBLOCK_COMPILE_MODE:-eager}" <<'PY'
+    --queries 2048 --entry "$entry" --selection "$selection" "${compile_args[@]}" 2>&1 | tee "$OUT/$selection.log"
+  python - "$OUT/$selection.log" "$selection" "${GLM52_QBLOCK_COMPILE_MODE:-eager}" "$entry" <<'PY'
 from pathlib import Path
 import sys
 lines = Path(sys.argv[1]).read_text().splitlines()
@@ -36,7 +41,7 @@ if sys.argv[3] == 'dynamo':
     assert lines.count('PRODUCTION_SPARSE_DYNAMO_ENABLED fullgraph=True dynamic=False') == 1
 for iteration in (0, 1):
     marker = (f'PRODUCTION_SPARSE_STEP_PASS iteration={iteration} queries=2048 '
-              f'selection={sys.argv[2]} entry=prefill-qblock')
+              f'selection={sys.argv[2]} entry={sys.argv[4]}')
     assert lines.count(marker) == 1
 PY
 done
