@@ -407,3 +407,71 @@ class TestDisaggregatedWave(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPackedDraftRelay(unittest.TestCase):
+    """The last stage relays EAGLE3's three draft outputs as one tensor over the wave."""
+
+    def draft(self, dsa=None):
+        return SimpleNamespace(
+            topk_p=torch.tensor([[0.25], [0.5], [1.0]], dtype=torch.float32),
+            topk_index=torch.tensor([[5], [201087], [0]], dtype=torch.int64),
+            hidden_states=torch.randn(3, 16).to(torch.bfloat16),
+            dsa_topk_indices=dsa,
+        )
+
+    def relay(self, wave, draft):
+        scheduler = SchedulerPPMixin()
+        scheduler._pp_spec_relay = False
+        scheduler._pp_wave = object() if wave else None
+        result = SimpleNamespace(
+            next_token_ids=torch.tensor([1, 2, 3]),
+            accept_lens=None,
+            next_draft_input=draft,
+            logits_output=None,
+        )
+        batch = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: False),
+            return_logprob=False,
+        )
+        return scheduler._pp_prepare_tensor_dict(result, batch)
+
+    def test_pack_round_trip_is_exact(self):
+        draft = self.draft()
+        packed = scheduler_pp_mixin._pack_draft_relay(
+            draft.topk_p, draft.topk_index, draft.hidden_states
+        )
+        out = scheduler_pp_mixin._unpack_draft_relay(packed)
+        self.assertTrue(torch.equal(out["draft_topk_p"], draft.topk_p))
+        self.assertTrue(torch.equal(out["draft_topk_index"], draft.topk_index))
+        self.assertTrue(torch.equal(out["draft_hidden_states"], draft.hidden_states))
+        self.assertEqual(out["draft_topk_index"].dtype, torch.int64)
+        self.assertEqual(out["draft_hidden_states"].dtype, torch.bfloat16)
+
+    def test_pack_keeps_each_parts_rows_when_hidden_states_are_padded(self):
+        # The captured hidden states are padded to the compiled batch size.
+        draft = self.draft()
+        hidden = torch.randn(8, 16).to(torch.bfloat16)
+        packed = scheduler_pp_mixin._pack_draft_relay(
+            draft.topk_p, draft.topk_index, hidden
+        )
+        out = scheduler_pp_mixin._unpack_draft_relay(packed)
+        self.assertTrue(torch.equal(out["draft_topk_p"], draft.topk_p))
+        self.assertTrue(torch.equal(out["draft_topk_index"], draft.topk_index))
+        self.assertTrue(torch.equal(out["draft_hidden_states"], hidden))
+
+    def test_wave_relays_the_draft_outputs_as_one_tensor(self):
+        tensors = self.relay(True, self.draft())
+        self.assertIn(scheduler_pp_mixin._PACKED_DRAFT_KEY, tensors)
+        self.assertNotIn("draft_topk_p", tensors)
+        self.assertEqual(
+            sum(isinstance(v, torch.Tensor) for v in tensors.values()), 2
+        )  # next_token_ids + the packed draft outputs
+
+    def test_without_the_wave_or_with_dsa_seeds_the_tensors_stay_separate(self):
+        for wave, dsa in ((False, None), (True, torch.tensor([[1, 2]] * 3))):
+            with self.subTest(wave=wave, dsa=dsa is not None):
+                tensors = self.relay(wave, self.draft(dsa))
+                self.assertNotIn(scheduler_pp_mixin._PACKED_DRAFT_KEY, tensors)
+                self.assertIn("draft_topk_p", tensors)
+                self.assertIn("draft_hidden_states", tensors)

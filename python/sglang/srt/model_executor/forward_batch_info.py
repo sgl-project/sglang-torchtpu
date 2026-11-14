@@ -1210,6 +1210,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ret.extend_prefix_lens,
                     ret.extend_seq_lens,
                     ret.extend_num_tokens,
+                    extend_prefix_lens_cpu=ret.extend_prefix_lens_cpu,
+                    extend_seq_lens_cpu=ret.extend_seq_lens_cpu,
                 )
             else:
                 positions, ret.extend_start_loc, _ = extend_position_info
@@ -2293,6 +2295,9 @@ def compute_position(
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
+    *,
+    extend_prefix_lens_cpu: Optional[List[int]] = None,
+    extend_seq_lens_cpu: Optional[List[int]] = None,
 ):
     if support_triton(attn_backend):
         positions, extend_start_loc = compute_position_triton(
@@ -2302,13 +2307,23 @@ def compute_position(
         )
     else:
         positions, extend_start_loc = compute_position_torch(
-            extend_prefix_lens, extend_seq_lens
+            extend_prefix_lens,
+            extend_seq_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
         )
     return positions, extend_start_loc
 
 
 def compute_position_torch(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    *,
+    # Host copies of the two length tensors, when the caller has them. Unused
+    # here; a backend that stages positions on the host reads these instead of
+    # syncing the device (see sglang_tpu.patches).
+    extend_prefix_lens_cpu: Optional[List[int]] = None,
+    extend_seq_lens_cpu: Optional[List[int]] = None,
 ):
     positions = torch.cat(
         [
