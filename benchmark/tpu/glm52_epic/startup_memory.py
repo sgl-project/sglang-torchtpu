@@ -23,9 +23,12 @@ def collect(proc=Path('/proc'), cgroup=Path('/sys/fs/cgroup')):
             status = (p / 'status').read_text()
             fields = dict(line.split(':', 1) for line in status.splitlines() if ':' in line)
             rss = int(fields.get('VmRSS', '0 kB').split()[0])
-            if rss > 100000:
+            hwm = int(fields.get('VmHWM', '0 kB').split()[0])
+            # Keep surviving compiler children whose allocations have receded
+            # since their peak. Exited children still require external evidence.
+            if max(rss, hwm) > 100000:
                 processes.append({'pid': int(p.name), 'rss_kib': rss,
-                                  'rss_hwm_kib': int(fields.get('VmHWM', '0 kB').split()[0]),
+                                  'rss_hwm_kib': hwm,
                                   'ppid': int(fields.get('PPid', '0').strip()),
                                   'name': fields.get('Name', '').strip()})
         except (OSError, ValueError):
