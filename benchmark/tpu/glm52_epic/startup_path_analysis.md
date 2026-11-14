@@ -264,6 +264,24 @@ initial Python `-c` inspection command failed with exit2 through exec's command
 quoting; the simple `tail` inspection succeeded without modifying the workload. Do not confuse the diagnostic step passes with
 this full-model acceptance criterion.
 
+## Indexer remains a separate untested startup boundary
+
+The serving backend builds `build_dsa_index_topk_op` for plain DSA. This op
+quantizes query/key, writes a third (index-key) cache, then invokes
+`streamindex_topk`; the passing attention-step reproduction injects selections
+and does not execute any of it. Existing `test_dsa_index_topk.py` is raw JAX,
+H32/D128/page128 but topk256, not the production topk2048 bridge.
+
+A minimal future indexer bridge isolation can use the actual factory, H32/D128,
+query4, topk2048, one sequence with kvlen4 and page1. Its public contract gives
+a cheap selection oracle: row j must contain each of 0..j exactly once in an
+unspecified order, then only -1 (because all causal keys fit within topk).
+The index cache has uint8[pages,32,4,256] at page128/D128; it is distinct from
+the attention caches. This tests selection membership and lowering, not score
+ordering or the quantization byte oracle. Do not attribute an indexer failure
+to attention gather merely because both are Pallas custom ops. No new remote
+allocation is warranted while the full-model run is progressing.
+
 ## Padding has two distinct contracts
 
 The gather-only reproduction intentionally supplies nonnegative **physical**
