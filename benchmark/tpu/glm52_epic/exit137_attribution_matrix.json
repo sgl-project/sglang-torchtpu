@@ -1,0 +1,33 @@
+{
+  "status": "UNRESOLVED_KILL_ORIGIN",
+  "historical_signature": "compile subprocess exit137 after EXTEND2048/bs32 and decode 0/6",
+  "confirmed": [
+    "historical and smoke native server_args use tpu_compile_tracer=dynamo and use_spmd_compile=false",
+    "historical workload differs materially from accepted short smoke: context135168 vs4096, max_total_tokens147456 vs8192, page_size64 vs128, decode buckets [1,2,4,8,16,32] vs [1]",
+    "archived host cgroup peaks were approximately468.99/470.63 GiB with oom and oom_kill counters zero",
+    "listed survivor RSS sums were approximately53.76/55.41 GiB and can double-count shared pages",
+    "later loading samples show large file-cache component and low anon component, but are not compiler RSS or a causal reconstruction",
+    "dynamo mode does not enter the plugin direct-tracer async warmup branch"
+  ],
+  "not_proven": [
+    "which native child received SIGKILL",
+    "whether an ancestor/system OOM killer, scheduler eviction, or another external kill caused exit137",
+    "compiler peak RSS or peak unique host memory",
+    "that qblock VMEM, SparseCore gather, decode bucket cardinality, or host mmap cache caused the kill"
+  ],
+  "candidate_experiments": [
+    {
+      "name": "fresh-process shape compile ladder",
+      "control": "same pinned runtime, one shape per process, compile-only markers",
+      "variables": ["queries 1/64/2048", "page size 64/128", "decode bucket set"],
+      "needed": "native compiler child identity, periodic descendant RSS/HWM, cgroup memory.stat and host MemAvailable"
+    },
+    {
+      "name": "historical-capacity configuration without checkpoint",
+      "control": "preserve context/max_total/page/bucket cardinality but synthetic tensors",
+      "needed": "separate host compiler pressure from weight loading and model startup"
+    }
+  ],
+  "safety": "Do not alter loader mmap policy, compiler concurrency, or decode buckets based on current evidence; no production fix justified.",
+  "scope": "diagnostic bookkeeping only; no performance result"
+}
