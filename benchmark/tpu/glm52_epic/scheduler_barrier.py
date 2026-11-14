@@ -1,0 +1,79 @@
+"""Explicit benchmark-only scheduler-thread file barrier; never auto-installed.
+
+Call tick AFTER scheduler.ingest_requests on every participating scheduler.
+Requires PP1/attentionTP1; caller owns installation, shared directory, unique
+run token, idle/exclusive server and waiting for all rank acknowledgments.
+No tokenizer gate, threads, device imports, collectives or device fences.
+"""
+import json
+from pathlib import Path
+
+
+def snapshot(scheduler, rank):
+    running = getattr(scheduler, 'running_batch', None)
+    chunked = getattr(scheduler, 'chunked_req', None)
+    return {
+        'dp_rank': rank,
+        'paused': scheduler._engine_paused,
+        'waiting_rids': [r.rid for r in scheduler.waiting_queue],
+        'running_rids': [] if running is None else [r.rid for r in running.reqs],
+        'chunked_rids': [] if chunked is None else [chunked.rid],
+        'pending_results': len(getattr(scheduler, 'result_queue', ())),
+        'deferred_inputs': len(scheduler._deferred_input_requests),
+    }
+
+
+class SchedulerBarrier:
+    def __init__(self, directory, run_token, rank):
+        if not run_token or type(rank) is not int or rank < 0:
+            raise ValueError('unique run token and nonnegative rank required')
+        self.directory = Path(directory)
+        self.run_token = run_token
+        self.rank = rank
+        self.epoch = None
+        self.last_sequence = -1
+        self.owned_pause = False
+
+    def tick(self, scheduler):
+        """Scheduler thread only; malformed commands fail closed, not silently."""
+        command_path = self.directory / 'command.json'
+        if not command_path.exists():
+            return
+        command = json.loads(command_path.read_text())
+        if command.get('run_token') != self.run_token:
+            raise ValueError('barrier run token mismatch')
+        sequence = command.get('sequence')
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError('nonnegative command sequence required')
+        if sequence < self.last_sequence:
+            raise ValueError('stale barrier command')
+        if sequence > self.last_sequence:
+            epoch = command.get('epoch')
+            if type(epoch) is not str or not epoch:
+                raise ValueError('explicit epoch required')
+            state = snapshot(scheduler, self.rank)
+            action = command.get('action')
+            if action == 'pause':
+                if (self.owned_pause or state['paused'] or state['waiting_rids']
+                        or state['running_rids'] or state['chunked_rids']
+                        or state['pending_results'] or state['deferred_inputs']):
+                    raise RuntimeError('barrier pause requires exclusive fully idle scheduler')
+                scheduler._engine_paused = True
+                self.owned_pause = True
+                self.epoch = epoch
+            elif action == 'resume':
+                if not self.owned_pause or epoch != self.epoch or not state['paused']:
+                    raise RuntimeError('resume requires matching owned pause epoch')
+                scheduler._engine_paused = False
+                self.owned_pause = False
+            else:
+                raise ValueError('unsupported barrier action')
+            self.last_sequence = sequence
+        state = snapshot(scheduler, self.rank)
+        state.update(run_token=self.run_token, epoch=self.epoch,
+                     sequence=self.last_sequence)
+        # One writer per rank; command publisher must also use atomic replace.
+        target = self.directory / f'rank-{self.rank}.json'
+        temporary = self.directory / f'rank-{self.rank}.json.tmp'
+        temporary.write_text(json.dumps(state) + '\n')
+        temporary.replace(target)

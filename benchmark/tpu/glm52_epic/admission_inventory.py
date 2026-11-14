@@ -30,6 +30,9 @@ def validate_inventory(expected_routes, snapshots):
             reasons.append('unexpected_rank')
             continue
         seen_ranks.append(rank)
+        for key in ('pending_results', 'deferred_inputs'):
+            if type(snap.get(key)) is not int or snap[key] != 0:
+                reasons.append(f'rank{rank}:nonzero_or_unknown_{key}')
         if snap.get('paused') is not True:
             reasons.append(f'rank{rank}:not_paused')
         for key in ('waiting_rids', 'running_rids', 'chunked_rids'):
