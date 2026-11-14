@@ -42,6 +42,20 @@ repeat_interleave/index_put_ helper. This synchronous read can surface an earlie
 asynchronous compiler failure; it does NOT identify D2H as its cause. Do not
 launch the device-table draft as a current fatal gate; no hardware was spent.
 
+## Distributed stack interpretation: CPU control broadcast is not TPU HLO
+
+The repeated request_receiver.py:200 -> broadcast_pyobj:2816 frames are the
+control-request broadcast on tp_group.cpu_group (request_receiver.py:198-205).
+The helper defaults force_cpu_device=True and creates a two-element int64
+`sizes` tensor on CPU (common.py:2777,2786-2792,2815-2816). Its length2 is NOT
+an identified match for the XLA descriptor base_bounds(2). A thread blocked in
+this CPU broadcast can simply be waiting for a peer that has aborted; no device
+collective attribution follows from this stack. A meaningful distributed probe
+must explicitly distinguish Gloo coordination from actual tpu_dist operations.
+Existing test_spmd_safe.py:50-60 supplies the supported local multi-device
+launcher pattern via torch.tpu.distributed + torch.distributed.run; no replacement
+multi-host bootstrap or arbitrary world-size assumptions should be invented.
+
 ## Copy controls and compiler-descriptor size interpretation
 
 Corrected copy/Event experiment exp-rkxqx7sxep succeeded: both hosts reported
