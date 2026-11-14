@@ -1,7 +1,6 @@
 """Code that runs inside a torch.compile'd DiT forward must trace as one graph
 and must not recompile from one denoise step to the next."""
 
-import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -103,22 +102,20 @@ class TestWanStepCounter(unittest.TestCase):
     def setUpClass(cls):
         from sglang.multimodal_gen.runtime.distributed import parallel_state
 
-        cls._rendezvous = None
-        if not parallel_state.model_parallel_is_initialized():
-            cls._rendezvous = tempfile.TemporaryDirectory()
-            parallel_state.maybe_init_distributed_environment_and_model_parallel(
-                tp_size=1,
-                sp_size=1,
-                distributed_init_method=f"file://{cls._rendezvous.name}/store",
-            )
-
-    @classmethod
-    def tearDownClass(cls):
-        from sglang.multimodal_gen.runtime.distributed import parallel_state
-
-        if cls._rendezvous is not None:
-            parallel_state.cleanup_dist_env_and_memory()
-            cls._rendezvous.cleanup()
+        # One-rank stand-ins for the groups the DiT reads. A real distributed
+        # init runs the TPU worker bootstrap, which opens a chip outside the
+        # TPU lane's per-file TPU_VISIBLE_CHIPS pin.
+        one_rank = SimpleNamespace(
+            world_size=1,
+            rank_in_group=0,
+            ulysses_world_size=1,
+            ring_world_size=1,
+            all_gather=lambda x, dim=-1: x,
+        )
+        for name in ("_TP", "_SP"):
+            group = patch.object(parallel_state, name, one_rank)
+            group.start()
+            cls.addClassCleanup(group.stop)
 
     @staticmethod
     def _tiny_dit(model_cls, config_cls, arch_cls):
