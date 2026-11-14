@@ -27,7 +27,9 @@ def publish_command(directory, *, run_token, sequence, epoch, action):
 
 def load_acknowledgments(directory, *, run_token, epoch, sequence, ranks):
     """Read exact per-rank acks; return None until every rank is valid."""
-    if type(ranks) is not list or not ranks or len(set(ranks)) != len(ranks):
+    if (type(ranks) is not list or not ranks
+            or any(type(rank) is not int or rank < 0 for rank in ranks)
+            or len(set(ranks)) != len(ranks)):
         raise ValueError('explicit unique rank list required')
     result = []
     for rank in ranks:
@@ -38,7 +40,10 @@ def load_acknowledgments(directory, *, run_token, epoch, sequence, ranks):
             state = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             return None
-        if (state.get('run_token') != run_token or state.get('epoch') != epoch
+        if (not isinstance(state, dict)
+                or state.get('run_token') != run_token or state.get('epoch') != epoch
+                or type(state.get('sequence')) is not int
+                or type(state.get('dp_rank')) is not int
                 or state.get('sequence') != sequence or state.get('dp_rank') != rank):
             return None
         result.append(state)
@@ -88,6 +93,10 @@ class SchedulerBarrier:
             raise ValueError('stale barrier command')
         if sequence == self.last_sequence and command != self.last_command:
             raise ValueError('same sequence command mutated')
+        if sequence == self.last_sequence and not self.owned_pause:
+            # Resume ack already published: no queue walk/ack rewrite per step.
+            # Command polling remains and must be accounted for in measurements.
+            return
         if sequence > self.last_sequence:
             epoch = command.get('epoch')
             if type(epoch) is not str or not epoch:
