@@ -42,6 +42,19 @@ repeat_interleave/index_put_ helper. This synchronous read can surface an earlie
 asynchronous compiler failure; it does NOT identify D2H as its cause. Do not
 launch the device-table draft as a current fatal gate; no hardware was spent.
 
+## Instrumented compile-smoke outcome
+
+exp-sx62ld4v1e (source 7830981b0e) failed before model loading: the bootstrap
+had no `/models/GLM5.2-fp8-channel-wise` mount, so HuggingFace raised
+`HFValidationError` followed by `OSError` for the local model path. It is not
+an exit137 or compiler-memory sample. One host-memory sample did capture
+cgroup `memory.current=5.64GiB`, `memory.peak=8.10GiB`, `oom_kill=0`; the
+sample's launcher root list was empty because sampling starts before the native
+launcher is spawned. Do not use this run to infer compile memory. The new
+sampler is still valid for a run that reaches launcher startup, but a future
+runner should record the launcher PID only after Popen and sample descendants
+from the next interval.
+
 ## Local TPU distributed probe outcome
 
 The corrected standalone local probe exp-p2624l9hla (source
