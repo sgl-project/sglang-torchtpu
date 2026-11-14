@@ -41,6 +41,7 @@ def _decode_manager(hybrid):
     mgr._completed_recv = set()
     mgr._failed = set()
     mgr._native_failed = set()
+    mgr._pull_sessions = {}
     mgr._timeout_s = 120.0
     return mgr
 
