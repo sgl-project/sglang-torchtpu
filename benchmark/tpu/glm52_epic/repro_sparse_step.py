@@ -19,7 +19,11 @@ def main():
                         help='Token-major, small prefill fallback,2048-token qblock, or481-page static-table fallback.')
     parser.add_argument('--dynamo', action='store_true',
                         help='Compile the production op fullgraph with backend=tpu, static shapes.')
+    parser.add_argument('--prefix-tokens', type=int, choices=(0, 49152), default=0,
+                        help='Long-table probe only: shift live writes/selected keys to high logical pages; prefix cache remains unselected zero.')
     args = parser.parse_args()
+    if args.prefix_tokens and args.entry != 'prefill-long-table':
+        parser.error('nonzero prefix requires prefill-long-table')
     large_prefill = args.entry in ('prefill-qblock', 'prefill-long-table')
     if large_prefill != (args.queries == 2048):
         parser.error('qblock/long-table entries require queries2048; other entries retain small probes')
@@ -50,8 +54,9 @@ def main():
     qr = torch.full((t, h, 64), 1 if args.selection == 'rope-pair' else query_value,
                     dtype=torch.bfloat16, device='tpu')
     # Whole allocations, not views: the production op donates these buffers.
-    # Long-table isolates static context capacity, NOT long live KV: only the
-    # first16 pages contain2048 real tokens; remaining valid entries are unused.
+    # Long-table isolates static context capacity. Only16 pages contain new
+    # nonzero tokens; optional prefix shifts them to logical pages384..399.
+    # Prefix cache remains zero/unselected: this is not realistic long attention.
     table_pages = 481 if args.entry == 'prefill-long-table' else 33
     num_pages = 482 if args.entry == 'prefill-long-table' else (65 if large_prefill else 2)
     cn = torch.zeros((num_pages, p, 4, 128), dtype=torch.uint8, device='tpu')
@@ -66,14 +71,18 @@ def main():
     else:
         for row in range(t):
             topk[row, :row + 1] = np.arange(row + 1)
+    # Preserve padding -1 while moving selected keys across page-gather chunk
+    # boundaries (prefix49152/page128 = logical page384, fourth128-page chunk).
+    topk = np.where(topk >= 0, topk + args.prefix_tokens, topk)
+    live_kv = args.prefix_tokens + t
     head_major = args.entry == 'prefill-fallback' or large_prefill
     distribution = [1, 1, 1] if t == 1 and not head_major else [0, 0, 1]
     pages = list(range(1, table_pages + 1)) if large_prefill else [1]
-    print(f'SPARSE_METADATA pages_per_seq={len(pages)} live_kv={t} '
+    print(f'SPARSE_METADATA pages_per_seq={len(pages)} live_kv={live_kv} prefix={args.prefix_tokens} '
           f'expected_prefill_path={"per-query" if len(pages) > 256 else "shape-dependent"}',
           flush=True)
     metadata = [upload(np.array(a, np.int32)) for a in (
-        [t], pages, [0, t], [0, t if large_prefill else p], distribution)]
+        [live_kv], pages, [0, t], [0, live_kv if large_prefill else p], distribution)]
     topk_tensor = upload(topk)
     if head_major:
         q = q.transpose(0, 1).contiguous()
@@ -118,8 +127,9 @@ def main():
         np.testing.assert_allclose(actual, expected, rtol=0, atol=1 / 128)
         expected_cn = np.zeros((num_pages * p, 512), np.uint8)
         expected_cr = np.zeros((num_pages * p, 128), np.uint8)
-        expected_cn[p:p + t] = vn_cpu.view(torch.uint8).numpy()
-        expected_cr[p:p + t, :64] = vr_cpu.view(torch.uint8).numpy()
+        write_start = p + args.prefix_tokens
+        expected_cn[write_start:write_start + t] = vn_cpu.view(torch.uint8).numpy()
+        expected_cr[write_start:write_start + t, :64] = vr_cpu.view(torch.uint8).numpy()
         np.testing.assert_array_equal(actual_cn.reshape(num_pages * p, 512), expected_cn)
         np.testing.assert_array_equal(actual_cr.reshape(num_pages * p, 128), expected_cr)
         print(f'PRODUCTION_SPARSE_STEP_PASS iteration={iteration} queries={t} selection={args.selection} entry={args.entry}', flush=True)

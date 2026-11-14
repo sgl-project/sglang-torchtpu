@@ -30,9 +30,15 @@ case "$entry" in
   prefill-qblock|prefill-long-table) ;;
   *) echo 'Unsupported prefill entry' >&2; exit 2 ;;
 esac
+prefix="${GLM52_SPARSE_PREFIX_TOKENS:-0}"
+case "$prefix" in
+  0) ;;
+  49152) [[ "$entry" == prefill-long-table ]] ;;
+  *) echo 'Unsupported sparse prefix' >&2; exit 2 ;;
+esac
 for selection in "${selections[@]}"; do
   timeout --signal=TERM --kill-after=15s 400s python -m benchmark.tpu.glm52_epic.repro_sparse_step \
-    --queries 2048 --entry "$entry" --selection "$selection" "${compile_args[@]}" 2>&1 | tee "$OUT/$selection.log"
+    --queries 2048 --entry "$entry" --prefix-tokens "$prefix" --selection "$selection" "${compile_args[@]}" 2>&1 | tee "$OUT/$selection.log"
   python - "$OUT/$selection.log" "$selection" "${GLM52_QBLOCK_COMPILE_MODE:-eager}" "$entry" <<'PY'
 from pathlib import Path
 import sys
