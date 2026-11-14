@@ -1,0 +1,15 @@
+{
+  "round": 248,
+  "active_goal": true,
+  "accepted_baseline": "exp-48q9eb5nxn",
+  "latest_pushed_head": "d35332df91",
+  "evidence_status": {
+    "short_torch_baseline": "accepted",
+    "historical_sparse_lowering_origin": "unresolved_no_originating_ir",
+    "historical_exit137_kill_origin": "unresolved_kill_origin",
+    "matched_jax_performance": "blocked_fail_closed"
+  },
+  "next_safe_action": "obtain explicit eight-chip 2x2x2 capacity/admission, then optionally submit one bounded fresh-process ladder; otherwise continue local evidence analysis",
+  "prohibited": ["16chip", "DCP", "Flash path changes", "unproven matched ratio"],
+  "intentional_untracked": ["benchmark/tpu/glm52_epic/repro_request_table.py", "benchmark/tpu/glm52_epic/request_table_runner.sh"]
+}
