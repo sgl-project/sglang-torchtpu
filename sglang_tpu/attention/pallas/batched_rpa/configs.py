@@ -252,12 +252,43 @@ class ServingConfigs:
     skip_kv_write: bool = False
     # Lane-folded fp8 HEAD_ALONG_SUBLANE cache; see `num_lane_folds_in_head_dim`.
     lane_fold_kv_head_dim: bool = False
+    # PCP ring attention (google3 cl/985434096); all off outside the ring /
+    # fused-PCP kernels.
+    # Mesh axis the KV window rotates around (`scheduler_cp.RingAttention`), and
+    # the names of every axis of the enclosing `shard_map` mesh, in mesh order
+    # (None: the ring axis is the only one).
+    ring_axis_name: str | None = None
+    ring_mesh_axis_names: tuple[str, ...] | None = None
+    # New K/V are read through a per-sequence page table (`extra_scalars[1]`,
+    # `new_kv_page_indices`) instead of contiguously at the query offsets, so
+    # there may be more new K/V tokens than queries.
+    paged_new_kv: bool = False
+    # Keep q / out token-major in HBM ([T, kv_heads, ...]) and let the kernel's
+    # per-step DMAs gather one kv head at a time, instead of transposing to
+    # kv-head-major ([kv_heads, T, ...]) around the kernel. With a single kv
+    # head per device the two layouts coincide; with several the transposes
+    # cost HLO copies of the whole query / output array per layer.
+    token_major_q: bool = False
+    # Carry the online-softmax row sum `l` and the output accumulator in
+    # float32 instead of `dtype_out`, so block contributions are not rounded
+    # away once `l` grows large at long context. google3 does this for every
+    # kernel; here only the ring / fused-PCP kernels turn it on, so the
+    # numerics and VMEM use of the other paths stay as they were.
+    float32_softmax_state: bool = False
 
     def __post_init__(self):
         if self.cache_only and self.attention_scope == AttentionScope.FULL:
             object.__setattr__(self, "attention_scope", AttentionScope.CACHE_ONLY)
         elif self.attention_scope == AttentionScope.CACHE_ONLY and not self.cache_only:
             object.__setattr__(self, "cache_only", True)
+
+    @property
+    def has_cache_kv(self) -> bool:
+        return self.attention_scope != AttentionScope.NEW_TOKENS_ONLY
+
+    @property
+    def has_new_kv(self) -> bool:
+        return self.attention_scope != AttentionScope.CACHE_ONLY
 
     @property
     def matmuls_are_8bit(self) -> bool:
@@ -487,6 +518,10 @@ class RpaConfigs:
             return min(self.serve.max_decode_bkv_p_new, self.bkv_p)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.bkv_p + 1
+        if self.serve.paged_new_kv:
+            # Two entries per cache page: see
+            # `StripedNewTokensScheduler._paged_new_kv_entries`.
+            return 2 * self.bkv_p
         return self.bkv_p
 
     @property
@@ -663,6 +698,38 @@ class RpaConfigs:
         )
 
     @property
+    def ring_enabled(self) -> bool:
+        return self.serve.ring_axis_name is not None
+
+    @property
+    def issues_new_kv_dmas(self) -> bool:
+        """Whether the KV buffered ref issues the new-K/V fetch / writeback DMAs.
+
+        The ring's cache phase has no new K/V and skips them (google3
+        cl/985434096 skips them for every CACHE_ONLY kernel; the other
+        cache-only kernels here keep issuing their zero-size DMAs, as before).
+        """
+        return self.serve.has_new_kv or not self.ring_enabled
+
+    @property
+    def issues_kv_writeback_dmas(self) -> bool:
+        """Whether the KV buffered ref issues the new-K/V writeback DMAs.
+
+        Off for a paged-new-K/V kernel that never writes: its schedule has two
+        writeback entries per cache page, all of them empty.
+        """
+        return self.issues_new_kv_dmas and not (
+            self.serve.paged_new_kv and self.serve.skip_kv_write
+        )
+
+    @property
+    def softmax_state_dtype(self) -> jnp.dtype:
+        """Dtype of the `l` and `acc` scratches (`m` is always `dtype_out`)."""
+        if self.serve.float32_softmax_state:
+            return jnp.dtype(jnp.float32)
+        return jnp.dtype(self.serve.dtype_out)
+
+    @property
     def dma_kv_new_size(self) -> int:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return 5
@@ -745,7 +812,16 @@ class RpaConfigs:
             )
         if k.shape != v.shape:
             raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
-        if not (q.shape[0] == k.shape[0] == v.shape[0]):
+        if self.serve.paged_new_kv:
+            # New K/V are addressed through `new_kv_page_indices`: the buffer
+            # holds whole pages and may be larger than the query array.
+            if q.shape[0] > k.shape[0] or k.shape[0] % self.serve.page_size:
+                raise ValueError(
+                    "Expected at least as many K/V tokens as Q tokens and a whole"
+                    f" number of pages of K/V, but got {q.shape[0]=},"
+                    f" {k.shape[0]=} and {self.serve.page_size=}"
+                )
+        elif not (q.shape[0] == k.shape[0] == v.shape[0]):
             raise ValueError(
                 "Expected number of sequences in Q, K, and V to be the same, but got"
                 f" {q.shape[0]=}, {k.shape[0]=}, and {v.shape[0]=}"
