@@ -15,13 +15,14 @@ def main():
     parser.add_argument('--queries', type=int, choices=(1, 4, 64, 2048), default=1)
     parser.add_argument('--selection', choices=('self', 'causal-mean', 'rope-pair'), default='self',
                         help='Single key, or causal keys with zero queries and uniform weights.')
-    parser.add_argument('--entry', choices=('per-query', 'prefill-fallback', 'prefill-qblock'), default='per-query',
+    parser.add_argument('--entry', choices=('per-query', 'prefill-fallback', 'prefill-qblock', 'prefill-long-table'), default='per-query',
                         help='Token-major op, small head-major fallback, or2048-token fused qblock.')
     parser.add_argument('--dynamo', action='store_true',
                         help='Compile the production op fullgraph with backend=tpu, static shapes.')
     args = parser.parse_args()
-    if (args.entry == 'prefill-qblock') != (args.queries == 2048):
-        parser.error('prefill-qblock requires queries2048; other entries retain small probes')
+    large_prefill = args.entry in ('prefill-qblock', 'prefill-long-table')
+    if large_prefill != (args.queries == 2048):
+        parser.error('qblock/long-table entries require queries2048; other entries retain small probes')
     if 'jax' in sys.modules:
         raise RuntimeError('fresh process required')
     pins = {'jax': '0.11.2', 'jaxlib': '0.11.2', 'libtpu': '0.0.50',
@@ -49,7 +50,10 @@ def main():
     qr = torch.full((t, h, 64), 1 if args.selection == 'rope-pair' else query_value,
                     dtype=torch.bfloat16, device='tpu')
     # Whole allocations, not views: the production op donates these buffers.
-    num_pages = 65 if args.entry == 'prefill-qblock' else 2
+    # Long-table isolates static context capacity, NOT long live KV: only the
+    # first16 pages contain2048 real tokens; remaining valid entries are unused.
+    table_pages = 481 if args.entry == 'prefill-long-table' else 33
+    num_pages = 482 if args.entry == 'prefill-long-table' else (65 if large_prefill else 2)
     cn = torch.zeros((num_pages, p, 4, 128), dtype=torch.uint8, device='tpu')
     cr = torch.zeros((num_pages, p // 4, 4, 128), dtype=torch.uint8, device='tpu')
     topk = np.full((t, k), -1, np.int32)
@@ -62,11 +66,14 @@ def main():
     else:
         for row in range(t):
             topk[row, :row + 1] = np.arange(row + 1)
-    head_major = args.entry in ('prefill-fallback', 'prefill-qblock')
+    head_major = args.entry == 'prefill-fallback' or large_prefill
     distribution = [1, 1, 1] if t == 1 and not head_major else [0, 0, 1]
-    pages = list(range(1, 34)) if args.entry == 'prefill-qblock' else [1]
+    pages = list(range(1, table_pages + 1)) if large_prefill else [1]
+    print(f'SPARSE_METADATA pages_per_seq={len(pages)} live_kv={t} '
+          f'expected_prefill_path={"per-query" if len(pages) > 256 else "shape-dependent"}',
+          flush=True)
     metadata = [upload(np.array(a, np.int32)) for a in (
-        [t], pages, [0, t], [0, t if args.entry == 'prefill-qblock' else p], distribution)]
+        [t], pages, [0, t], [0, t if large_prefill else p], distribution)]
     topk_tensor = upload(topk)
     if head_major:
         q = q.transpose(0, 1).contiguous()
