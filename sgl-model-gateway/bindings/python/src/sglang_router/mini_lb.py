@@ -56,10 +56,11 @@ PREFILL_DRAIN_TIMEOUT_SECS = 60
 _background_tasks: set = set()
 
 
-def _spawn_background(coro) -> None:
+def _spawn_background(coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 async def _read_to_eof(response) -> None:
@@ -200,6 +201,9 @@ class MiniLoadBalancer:
         try:
             return await operation(*args, **kwargs)
         except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as error:
+            # Covers a refused connect too, which the stream-break probe in
+            # stream_results never sees.
+            self.request_health_probe(engine)
             if self.affinity_policy is None:
                 raise
             self.affinity_policy.loads.mark_unreachable(engine)
@@ -286,10 +290,11 @@ class MiniLoadBalancer:
                         url: probe for url, probe in probes.items() if not probe.done()
                     }
                     for url in self._registered_urls():
-                        if url not in probes:
+                        if not self._probe_in_flight(url):
                             probes[url] = asyncio.create_task(
                                 self._probe_health(session, url)
                             )
+                            self._health_probes()[url] = (probes[url], False)
                     await asyncio.sleep(self.health_poll_interval_secs)
             finally:
                 for probe in probes.values():
@@ -307,6 +312,47 @@ class MiniLoadBalancer:
             await asyncio.gather(
                 *(self._probe_health(session, url) for url in self._registered_urls())
             )
+
+    def request_health_probe(self, url: str) -> None:
+        """Probe `url` now instead of at the next poll.
+
+        Called when a request to a backend fails or breaks mid-stream, so
+        routing stops sending it traffic within one probe rather than one
+        poll interval. The probe decides, not the failure: a transient error
+        on a healthy backend leaves it routable. A periodic probe still in
+        flight is cancelled, since it may have been answered before the
+        failure; a requested one still in flight already covers it. No-op
+        when health checks are off.
+        """
+        if getattr(self, "health_poll_interval_secs", None) is None:
+            return
+        probes = self._health_probes()
+        if url in probes:
+            probe, requested = probes[url]
+            if not probe.done():
+                if requested:
+                    return
+                probe.cancel()
+        probes[url] = (_spawn_background(self._probe_once(url)), True)
+
+    def _health_probes(self) -> Dict[str, Tuple[asyncio.Task, bool]]:
+        """Each backend's latest probe task, and whether it was requested.
+
+        Periodic and requested probes share it, so one backend has at most
+        one probe in flight and an older verdict cannot land after a newer
+        one.
+        """
+        # Kept in __dict__ so instances built without __init__ work too.
+        return self.__dict__.setdefault("_health_probe_by_url", {})
+
+    def _probe_in_flight(self, url: str) -> bool:
+        entry = self._health_probes().get(url)
+        return entry is not None and not entry[0].done()
+
+    async def _probe_once(self, url: str) -> None:
+        timeout = aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT_SECS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await self._probe_health(session, url)
 
     async def _probe_health(self, session: aiohttp.ClientSession, url: str) -> None:
         """GET HEALTH_PROBE_PATH on `url` and route to it only if it answers 200."""
@@ -364,6 +410,11 @@ class MiniLoadBalancer:
     def _forget_health(self, worker_url) -> None:
         """Treat `worker_url` as not probed yet."""
         self._health.forget(worker_url)
+        # Its verdict would be dropped as stale anyway; cancelling it lets a
+        # re-registered backend be probed without waiting for the old probe.
+        entry = self._health_probes().pop(worker_url, None)
+        if entry is not None:
+            entry[0].cancel()
 
     async def _ensure_dp_sizes(self):
         if self.prefill_dp_size is not None:
@@ -624,6 +675,8 @@ class MiniLoadBalancer:
                 # stream reports errors.
                 message = f"upstream {upstream} stream broke: {type(e).__name__}: {e}"
                 logger.error(f"[MiniLB] {message}")
+                # Let health routing (#1801) re-check this backend now.
+                self.request_health_probe(upstream)
                 yield _stream_error_event(message)
                 yield b"data: [DONE]\n\n"
             finally:
