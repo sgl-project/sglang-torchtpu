@@ -172,15 +172,15 @@ DEFAULT_CASES = tuple(c for c in CASES if not CASES[c].opt_in)
 # outputs differ from vec_route=True by ~1 bf16 ulp in the expert branch (both match the
 # reference equally well); pass --exact vec_route=False to see it. coll_order='ring' runs on a
 # few-row step: the folds of 16+ row steps need xor peers (MKConfig.validate).
+# o_rs_rotate / o_rs_streamed are not listed: they change which wo column tile runs first, and
+# Mosaic accumulates the first wo matmul's first 256 columns in another f32 order (~1 ulp); the
+# unrotated path matches the reference as well (--base-cfg o_rs_rotate=False).
 DEFAULT_EXACT = (
     ("fused_c1q1_s", "coll_order='ring'"),
     ("fused_c2q8_s", "repeat"),
     ("fused_c2q8_s", "y_block_send=False"),
-    ("fused_c2q8_s", "o_rs_streamed=False"),
-    ("fused_c2q8_s", "o_rs_rotate=False"),
     ("fused_c2q8_s", "expert_group=2"),
     ("salfp8_c2q8_s", "y_block_send=False"),
-    ("salfp8_c2q8_s", "o_rs_streamed=False"),
 )
 
 
