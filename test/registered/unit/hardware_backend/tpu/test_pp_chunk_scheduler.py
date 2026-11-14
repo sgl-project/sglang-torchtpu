@@ -443,5 +443,51 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
     assert all(model == models[0] for model in models)
 
 
+def test_profile_forwards_hybrid_swa_sliding_window_as_min_prefix(monkeypatch):
+    seen_min_prefixes = []
+
+    def capture_profile_points(
+        buckets, max_tokens, max_model_len, schedule=None, min_prefix=0
+    ):
+        seen_min_prefixes.append(min_prefix)
+        return [(1024, 0), (1024, 2048), (1024, 3072)]
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda out, obj, group: out.__setitem__(slice(None), [obj]),
+    )
+    monkeypatch.setattr(pp_chunk_scheduler, "uses_dynamic_chunks", lambda: True)
+    monkeypatch.setattr(
+        pp_chunk_scheduler, "get_exec", lambda: NS(graph=NS(enable_torch_compile=True))
+    )
+    monkeypatch.setattr(
+        pp_chunk_scheduler, "attention_schedule_capacity", lambda runner, policy: None
+    )
+    monkeypatch.setattr(pp_chunk_scheduler, "profile_points", capture_profile_points)
+    monkeypatch.setattr(
+        pp_profile, "profile_cache", lambda policy, max_tokens: contextlib.nullcontext()
+    )
+    policy = NS(
+        t_bucketer=NS(buckets=[1024]),
+        _run_one=lambda **kw: 10.0 + kw["profile_prefix"] * 1e-4,
+    )
+    runner = NS(
+        compile_policy=policy,
+        model_config=NS(context_len=131072),
+        is_hybrid_swa=True,
+        sliding_window_size=2048,
+    )
+    scheduler = NS(
+        tp_worker=NS(model_runner=runner),
+        page_size=64,
+        chunked_prefill_size=1024,
+        pp_group=NS(cpu_group=(0,)),
+        world_group=NS(world_size=1, cpu_group=(0,)),
+    )
+    profile_and_install_cost_model(scheduler)
+    assert seen_min_prefixes == [2048]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

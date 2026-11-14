@@ -228,10 +228,23 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
         )
     from sglang_tpu.pp_profile import profile_cache
 
+    is_hybrid_swa = bool(getattr(runner, "is_hybrid_swa", False))
+    sliding_window = getattr(runner, "sliding_window_size", None) or getattr(
+        scheduler, "sliding_window_size", None
+    )
+    min_prefix = (
+        int(sliding_window)
+        if is_hybrid_swa and sliding_window and sliding_window > 0
+        else 0
+    )
     samples: list[tuple[int, int, float]] = []
     with profile_cache(policy, buckets[-1]):
         for tokens, prefix in profile_points(
-            buckets, buckets[-1], runner.model_config.context_len, schedule
+            buckets,
+            buckets[-1],
+            runner.model_config.context_len,
+            schedule,
+            min_prefix,
         ):
             kwargs = dict(
                 num_tokens=tokens, bs=1, mode=ForwardMode.EXTEND, profile_prefix=prefix
