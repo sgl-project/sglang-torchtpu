@@ -34,7 +34,9 @@ from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
     write_fp8_records,
 )
 from sglang_tpu.kernels.deepseek_v41.index_selection.selection import (
+    prepare_fp8_candidates,
     select_fp8_indexer_jax,
+    select_fp8_prepared,
 )
 
 INDEX_TOPK = 512
@@ -141,6 +143,51 @@ def _select(
     return jax.lax.cond(batch_max[0] <= topk, every_visible_id, scored)
 
 
+def _prepare_candidates(
+    index_k: jax.Array,
+    index_pages: jax.Array,
+    candidates: jax.Array,
+    requests: jax.Array,
+    pages: int,
+    page_stride: int,
+    page_offset: int,
+    page_size: int,
+    block_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    layout_args = (pages, page_stride, page_offset, page_size)
+    width = index_pages.shape[1] * page_size
+    return prepare_fp8_candidates(
+        (index_k,), index_pages, candidates, requests, layout_args, block_size, width
+    )
+
+
+def _select_prepared(
+    q: jax.Array,
+    weights: jax.Array,
+    lengths: jax.Array,
+    keys: jax.Array,
+    block_ids: jax.Array,
+    offsets: jax.Array,
+    valid: jax.Array,
+    spans: jax.Array,
+    width: int,
+    topk: int,
+    block_size: int,
+) -> jax.Array:
+    q8, q_scales, _ = quantize_index_rows(q)
+    selected = select_fp8_prepared(
+        q8,
+        weights.astype(jnp.float32) * q_scales,
+        jnp.clip(lengths, 0, width),
+        (keys, block_ids, offsets, valid, spans),
+        topk,
+        block_size,
+        True,
+        width,
+    )
+    return _compact(selected[:, : min(topk, width)])
+
+
 # =============================================================================
 # Fakes and registration
 # =============================================================================
@@ -161,10 +208,18 @@ def _fake_select(
     )
 
 
-# name -> (JAX function, fake, donated argument positions)
+def _fake_select_prepared(q, *args):
+    width, topk = args[-3], args[-2]
+    return q.new_empty((q.shape[0], min(topk, width)), dtype=torch.int32)
+
+
+# name -> (JAX function, fake, donated argument positions); a None fake keeps
+# cpu_export_jax_op's exported shapes (the candidate gather pads its rows).
 _DEFINITIONS = {
     "write_index_k": (_write_index_k, _fake_write_index_k, (0,)),
     "select": (_select, _fake_select, ()),
+    "prepare_candidates": (_prepare_candidates, None, ()),
+    "select_prepared": (_select_prepared, _fake_select_prepared, ()),
 }
 
 
@@ -179,7 +234,8 @@ def _op(name: str):
         if op is None:
             function, fake, donated = _DEFINITIONS[name]
             op = cpu_export_jax_op(_OP_PREFIX + name, function, donate_argnums=donated)
-            op.register_fake(fake)
+            if fake is not None:
+                op.register_fake(fake)
             _OPS[name] = op
     return op
 
@@ -274,6 +330,64 @@ def select(
         block_size,
         publish,
         consume,
+    )
+
+
+def uses_prepared_candidates(*, count: int, block_size: int, width: int) -> bool:
+    """Whether a candidate consumer scores only its candidate blocks (the epic's
+    sparse-logits path); otherwise ``select`` scores the whole context."""
+    return block_size in (8, 16, 32, 64, 128) and 0 < count * block_size < width
+
+
+def prepare_candidates(
+    index_k: torch.Tensor,
+    index_pages: torch.Tensor,
+    candidates: torch.Tensor,
+    requests: torch.Tensor,
+    layout: tuple[int, int, int, int],
+    *,
+    block_size: int = CANDIDATE_BLOCK_SIZE,
+) -> tuple[torch.Tensor, ...]:
+    """Gather the packed FP8 K of every query's candidate blocks, once per batch.
+
+    Every consumer layer of one source reads the same candidates and index K, so
+    the caller shares the result (the epic's ``packed_fp8_candidate_keys``
+    stage cache): the gathered K is ``[tokens * 2 * K * block / 128 * 33, 128]``
+    int32, 8.25 GiB at 2048 tokens and K = 2048.
+    """
+    return _op("prepare_candidates")(
+        index_k,
+        _i32(index_pages),
+        _i32(candidates),
+        _i32(requests),
+        *layout,
+        block_size,
+    )
+
+
+def select_prepared(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    lengths: torch.Tensor,
+    prepared: tuple[torch.Tensor, ...],
+    *,
+    width: int,
+    topk: int = INDEX_TOPK,
+    block_size: int = CANDIDATE_BLOCK_SIZE,
+) -> torch.Tensor:
+    """``select``'s consumer result from ``prepare_candidates``'s gathered K.
+
+    ``width`` is ``index_pages.shape[1] * 128``; the other arguments are as in
+    ``select``. Returns ``selected`` only; the candidates pass through.
+    """
+    return _op("select_prepared")(
+        q,
+        weights,
+        _i32(lengths).reshape(-1),
+        *prepared,
+        width,
+        topk,
+        block_size,
     )
 
 

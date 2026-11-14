@@ -153,6 +153,9 @@ class DSV41TPUForwardMetadata:
     selected: Dict[int, torch.Tensor] = field(default_factory=dict)
     # Candidate blocks published by config.candidate_source_layer_id.
     candidates: Optional[torch.Tensor] = None
+    # (ratio, index source layer) -> indexer_ops.prepare_candidates result,
+    # gathered once and read by every candidate consumer of that source.
+    prepared_candidates: Dict[tuple, tuple] = field(default_factory=dict)
 
 
 def _as_cpu_int64(values, length: int) -> torch.Tensor:
@@ -566,6 +569,8 @@ class DSV41TPUAttnBackend(AttentionBackend):
                     index_k, records, keys, pool.index_k_layout(layer.layer_id)
                 )
             )
+            # Candidate K gathered before this write is stale.
+            metadata.prepared_candidates.pop(pool.index_source(layer.layer_id), None)
 
         latent = apply_rope(latent, group_pos, layer.freqs_cis)
         words, scales = pool.get_main_kv(layer.layer_id)
@@ -660,20 +665,36 @@ class DSV41TPUAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=x.device,
             )
-        selected, blocks = self.indexer_ops.select(
-            q,
-            weights,
-            pool.get_index_k(layer.layer_id),
-            low.index_pages,
-            metadata.token_rows,
-            low.lengths,
-            candidates,
-            pool.index_k_layout(layer.layer_id),
-            topk=self.index_topk,
-            block_size=max(1, indexer.candidate_block_size),
-            publish=publish,
-            consume=consume,
-        )
+        block_size = max(1, indexer.candidate_block_size)
+        width = low.index_pages.shape[1] * pool.index_k_layout(layer.layer_id)[3]
+        if consume and self.indexer_ops.uses_prepared_candidates(
+            count=candidates.shape[1], block_size=block_size, width=width
+        ):
+            selected = self._select_prepared(
+                layer=layer,
+                q=q,
+                weights=weights,
+                candidates=candidates,
+                metadata=metadata,
+                block_size=block_size,
+                width=width,
+            )
+            blocks = candidates
+        else:
+            selected, blocks = self.indexer_ops.select(
+                q,
+                weights,
+                pool.get_index_k(layer.layer_id),
+                low.index_pages,
+                metadata.token_rows,
+                low.lengths,
+                candidates,
+                pool.index_k_layout(layer.layer_id),
+                topk=self.index_topk,
+                block_size=block_size,
+                publish=publish,
+                consume=consume,
+            )
         if publish:
             metadata.candidates = blocks
         if selected.shape[1] < SELECTION_WIDTH:
@@ -681,6 +702,36 @@ class DSV41TPUAttnBackend(AttentionBackend):
                 selected, (0, SELECTION_WIDTH - selected.shape[1]), value=-1
             )
         metadata.selected[ratio] = selected
+
+    def _select_prepared(
+        self, *, layer, q, weights, candidates, metadata, block_size, width
+    ) -> torch.Tensor:
+        """Candidate-consumer top-k; the candidate K gather runs once per source
+        and batch, as the epic's stage cache does. A gather per consumer layer
+        kept two 8.25 GiB copies live in the 2048-token extend graph."""
+        pool = self.token_to_kv_pool
+        low = metadata.low_ratio[layer.compress_ratio]
+        key = pool.index_source(layer.layer_id)
+        prepared = metadata.prepared_candidates.get(key)
+        if prepared is None:
+            prepared = self.indexer_ops.prepare_candidates(
+                pool.get_index_k(layer.layer_id),
+                low.index_pages,
+                candidates,
+                metadata.token_rows,
+                pool.index_k_layout(layer.layer_id),
+                block_size=block_size,
+            )
+            metadata.prepared_candidates[key] = prepared
+        return self.indexer_ops.select_prepared(
+            q,
+            weights,
+            low.lengths,
+            prepared,
+            width=width,
+            topk=self.index_topk,
+            block_size=block_size,
+        )
 
     # ------------------------------------------------------------------ #
     # Attention

@@ -511,6 +511,10 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         return item.compress_ratio, item.compress_layer_id
 
+    def index_source(self, layer_id: int) -> Tuple[int, int]:
+        """(compress ratio, kv_source index) of the layer's index keys."""
+        return self._low_ratio_item(layer_id)
+
     def get_main_kv(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """(int32 words [R, 128], fp32 scales [R]) of the layer's kv_source."""
         self.wait_layer_transfer(layer_id)
