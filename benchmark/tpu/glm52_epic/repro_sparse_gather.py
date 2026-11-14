@@ -78,7 +78,9 @@ def main():
     from sglang_tpu.attention.pallas.mla_sparse.dsa_gather import dsa_gather
 
     stage('initialize_jax')
-    device = jax.devices()[0]
+    # Multi-host PJRT may enumerate another process's device first. This
+    # diagnostic promises local host reads, so never select a global device.
+    device = jax.local_devices()[0]
     if args.backend == 'jax' and device.platform != 'tpu':
         raise RuntimeError('TPU required; CPU fallback is not a reproduction')
     from jax.experimental.pallas import tpu as pltpu
