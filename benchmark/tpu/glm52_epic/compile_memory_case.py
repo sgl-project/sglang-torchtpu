@@ -1,0 +1,84 @@
+"""Bound one fresh-process sparse probe and retain passive memory samples.
+
+Not compile-only: includes allocation, bridge compilation, execution and oracle.
+No checkpoint or server. Run each mode separately; sampler may miss transient
+children. Neither RSS sums nor cgroup current are unique compiler memory.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+from benchmark.tpu.glm52_epic.startup_memory import collect
+
+
+def supervise(command, directory, *, timeout, interval):
+    if timeout <= 0 or interval <= 0:
+        raise ValueError('positive timeout and interval required')
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    with (directory / 'native.log').open('w') as log, (directory / 'memory.jsonl').open('w') as memory:
+        child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+        started = time.monotonic()
+        timed_out = False
+        try:
+            while True:
+                data = collect(root_pids=(child.pid,))
+                data['case_root_returncode'] = child.poll()
+                memory.write(json.dumps(data) + '\n')
+                memory.flush()
+                if child.poll() is not None:
+                    break
+                if time.monotonic() - started >= timeout:
+                    timed_out = True
+                    break
+                time.sleep(min(interval, max(0.001, timeout - (time.monotonic() - started))))
+        finally:
+            # The new process group belongs only to this probe. Always reap it,
+            # including on sampler/serialization failure or local interruption.
+            if child.poll() is None or timed_out:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    child.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+        result = dict(command=command, pid=child.pid, returncode=child.returncode,
+                      timed_out=timed_out, elapsed_s=time.monotonic() - started,
+                      scope='whole probe; not pure compile or unique compiler peak')
+        (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+        return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--mode', choices=('eager', 'dynamo'), required=True)
+    parser.add_argument('--output', type=Path, required=True, help='New per-case evidence directory')
+    parser.add_argument('--timeout', type=float, default=400)
+    parser.add_argument('--interval', type=float, default=0.5)
+    args = parser.parse_args()
+    command = [sys.executable, '-m', 'benchmark.tpu.glm52_epic.repro_sparse_step',
+               '--queries', '2048', '--selection', 'self', '--entry', 'prefill-long-table']
+    if args.mode == 'dynamo':
+        command.append('--dynamo')
+    result = supervise(command, args.output, timeout=args.timeout, interval=args.interval)
+    if result['returncode'] or result['timed_out']:
+        return 2
+    lines = (args.output / 'native.log').read_text().splitlines()
+    for i in (0, 1):
+        marker = f'PRODUCTION_SPARSE_STEP_PASS iteration={i} queries=2048 selection=self entry=prefill-long-table'
+        if lines.count(marker) != 1:
+            raise RuntimeError('missing exact numerical/cache oracle marker')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
