@@ -1,8 +1,9 @@
-"""Fused MoE multi-token dense route: local ids, sort-free rank permute."""
+"""Fused MoE local-id routing: the multi-token dense route (sort-free rank
+permute), its SparseCore-combine extension, and the EP counting-sort route."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 from unittest import mock
@@ -33,7 +34,21 @@ ROUTES = {
     "qwen3_coder": (20, 160, 3 * 20, 8, (2, 5, 16, 32, 128), "silu"),  # EP8
     # EP8; decode bucket 20 pads to 24 tokens, 240 routed rows.
     "qwen35": (64, 512, 2 * 64, 10, (2, 9, 20, 24, 100), "silu"),
+    "glm53_ep8": (36, 288, 3 * 36, 8, (2, 16, 32), "silu"),
 }
+
+# (routed rows, buckets, key pattern). 37 buckets is GLM-5.3-Flash's 36 local
+# experts at EP8 plus the sentinel. 512 is one block, 520 pads into a second;
+# one_key ranks past bf16's exact-integer range; 262659 rows takes the
+# multi-block prefix past 512 blocks.
+COUNTING_SORT_CASES = (
+    (512, 37, "uniform"),
+    (520, 37, "uniform"),
+    (2048, 37, "one_key"),
+    (262659, 37, "uniform"),
+)
+EP_ROUTE_FLAG = "SGLANG_TPU_FUSED_MOE_EP_COUNTING_ROUTE"
+GLM_DENSE_THRESHOLD = 512
 
 
 def _silu(gate, up):
@@ -72,10 +87,12 @@ def _weights(kind, num_experts):
 
     E, N, H = num_experts, INTER, HIDDEN
     if kind == "bf16":
-        k1, k2 = jax.random.split(jax.random.key(0))
-        w1 = jax.random.normal(k1, (E, H, 2 * N)) * 0.05
-        w2 = jax.random.normal(k2, (E, N, H)) * 0.05
-        w1, w2 = w1.astype(jnp.bfloat16), w2.astype(jnp.bfloat16)
+        # Host RNG: eager jax.random compiles per shape, ~10 s per route on tpu7x.
+        rng = np.random.default_rng(0)
+        w1, w2 = (
+            jnp.asarray(rng.standard_normal(s, dtype=np.float32) * 0.05, jnp.bfloat16)
+            for s in ((E, H, 2 * N), (E, N, H))
+        )
         ref = tuple(np.asarray(t.astype(jnp.float32)) for t in (w1, w2))
         return (w1, w2, None, None), ref
     if kind == "fp8_ch":
@@ -134,6 +151,31 @@ def _routing(m, route, ep, seed):
     return ids.astype(np.int32), w / w.sum(-1, keepdims=True)
 
 
+def _count_primitive(jaxpr, name):
+    """Calls of primitive ``name`` in ``jaxpr``, walking nested jaxprs per call.
+
+    Text counts of the lowered module undercount: a jitted helper called twice
+    (``jnp.argsort``) is emitted once and called twice.
+    """
+    from jax.extend.core import ClosedJaxpr, Jaxpr
+
+    count = 0
+    for eqn in jaxpr.eqns:
+        count += eqn.primitive.name == name
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, (list, tuple)) else (param,):
+                inner = sub.jaxpr if isinstance(sub, ClosedJaxpr) else sub
+                if isinstance(inner, Jaxpr):
+                    count += _count_primitive(inner, name)
+    return count
+
+
+def _keys(n, buckets, pattern, rng):
+    if pattern == "one_key":
+        return np.full(n, 5, np.int32)
+    return rng.integers(0, buckets, n).astype(np.int32)
+
+
 def _poison_unwritten(gmm_v2):
     """Fill the rows a no-zero-init grouped matmul leaves unwritten with NaN."""
 
@@ -149,7 +191,8 @@ def _poison_unwritten(gmm_v2):
 
 @unittest.skipUnless(_HAS_TPU, _SKIP)
 class TestFusedMoEDenseRoute(CustomTestCase):
-    """_fused_moe_jax with the dense route vs the existing paths and a reference."""
+    """_fused_moe_jax with the local-id routes (dense rank route, its SparseCore
+    combine extension, EP counting route) vs the existing paths and a reference."""
 
     _weight_cache = {}
 
@@ -159,9 +202,27 @@ class TestFusedMoEDenseRoute(CustomTestCase):
             self._weight_cache[key] = _weights(kind, ROUTES[route][0])
         return self._weight_cache[key]
 
-    def _fused(self, kind, route, m, ep, ids, w, *, use_route=True, threshold):
+    def _fused(
+        self,
+        kind,
+        route,
+        m,
+        ep,
+        ids,
+        w,
+        *,
+        use_route=True,
+        threshold,
+        sc_gather=0,
+        env=None,
+        spy="_dense_rank_route",
+    ):
+        """``env``: optional (flag name, value) override; returns whether the
+        ``spy`` route function was traced."""
+        import contextlib
         import importlib
 
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.moe.pallas import fused_moe_op
 
         gmm_mod = importlib.import_module("sglang_tpu.moe.pallas.gmm_v2")
@@ -187,10 +248,17 @@ class TestFusedMoEDenseRoute(CustomTestCase):
                 act,
                 global_num_experts=e_global if ep else 0,
                 expert_group_offset=offset if ep else 0,
+                use_sc_gather=sc_gather,
                 permute_dense_threshold=threshold,
             )
         )
+        env_override = (
+            getattr(tpu_envs, env[0]).override(env[1])
+            if env is not None
+            else contextlib.nullcontext()
+        )
         with (
+            env_override,
             mock.patch.object(
                 fused_moe_op,
                 "_RANK_PERMUTE_MAX_ROWS",
@@ -198,9 +266,7 @@ class TestFusedMoEDenseRoute(CustomTestCase):
             ),
             mock.patch.object(gmm_mod, "gmm_v2", _poison_unwritten(gmm_mod.gmm_v2)),
             mock.patch.object(
-                fused_moe_op,
-                "_dense_rank_route",
-                wraps=fused_moe_op._dense_rank_route,
+                fused_moe_op, spy, wraps=getattr(fused_moe_op, spy)
             ) as route_spy,
         ):
             out = jax.block_until_ready(fn(hidden, w1, w2, w1_s, w2_s))
@@ -293,6 +359,139 @@ class TestFusedMoEDenseRoute(CustomTestCase):
                 self.assertTrue(routed)
                 ref = self._reference("bf16", "k3", hidden, bad_ids, w, ep)
                 _assert_close(self, out, ref, 0.03)
+
+    def _check_route(self, spy, cases, *, flag=None):
+        """On vs off for the ``spy`` route: off is the env ``flag`` when given,
+        else a zero rank-route row cap."""
+        for m, route, ep, threshold in cases:
+            with self.subTest(spy=spy, m=m, route=route, ep=ep, threshold=threshold):
+                ids, w = _routing(m, route, ep, m + 1)
+                ids[0, :2] = -1  # TopK padding lands on the sentinel
+                ids[1, 1] = ids[1, 0]  # a duplicate (token, expert) route
+                run = lambda on: self._fused(
+                    "bf16",
+                    route,
+                    m,
+                    ep,
+                    ids,
+                    w,
+                    use_route=on or flag is not None,
+                    threshold=threshold,
+                    sc_gather=1,
+                    env=None if flag is None else (flag, on),
+                    spy=spy,
+                )
+                new, _, took = run(True)
+                self.assertTrue(took)
+                old, _, took = run(False)
+                self.assertFalse(took)
+                if ep:
+                    # Owned rows move from the global window to a prefix, which
+                    # can regroup the f32 combine sum: within one bf16 ulp.
+                    np.testing.assert_allclose(new, old, rtol=2**-7, atol=1e-6)
+                else:
+                    # Same rows in the same stable order: bitwise.
+                    np.testing.assert_array_equal(new, old)
+
+    def test_ep_counting_route(self):
+        """At the default threshold 0 every batch, decode included, takes the
+        EP route; multi-block sorts are covered by TestCountingSort."""
+        self._check_route(
+            "_ep_counting_route",
+            flag=EP_ROUTE_FLAG,
+            cases=[(16, "glm53_ep8", True, 0)],
+        )
+
+    def test_rank_route_with_sparse_combine(self):
+        """Dense-permute batches whose routed rows reach the dense-unpermute
+        threshold (64 tokens x top-8 = 512 rows) up to the 2048-row cap."""
+        self._check_route(
+            "_dense_rank_route",
+            cases=[
+                (64, "glm53_ep8", True, GLM_DENSE_THRESHOLD),
+                (200, "glm53_ep8", False, GLM_DENSE_THRESHOLD),
+            ],
+        )
+
+    def test_ep_counting_route_drops_the_argsorts(self):
+        """Traced with the EP route, the op makes one sort call fewer than
+        without it (one packed sort for two argsorts) and no extra cumsum, so
+        the sorts cannot quietly come back. Sorts elsewhere in the op (the
+        SparseCore combine's own) cancel out."""
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.moe.pallas import fused_moe_op
+
+        e_local, e_global, offset, topk, _, act = ROUTES["glm53_ep8"]
+        (w1, w2, _, _), _ = self._weights_for("bf16", "glm53_ep8")
+
+        def ops(m, threshold, on):
+            ids, w = _routing(m, "glm53_ep8", True, m + 1)
+            fn = jax.jit(
+                lambda h, w1, w2, w, ids: fused_moe_op._fused_moe_jax(
+                    h,
+                    w1,
+                    w2,
+                    w,
+                    ids,
+                    None,
+                    None,
+                    None,
+                    None,
+                    topk,
+                    act,
+                    global_num_experts=e_global,
+                    expert_group_offset=offset,
+                    use_sc_gather=1,
+                    permute_dense_threshold=threshold,
+                )
+            )
+            with tpu_envs.SGLANG_TPU_FUSED_MOE_EP_COUNTING_ROUTE.override(on):
+                jaxpr = jax.make_jaxpr(fn)(
+                    jnp.zeros((m, HIDDEN), jnp.bfloat16),
+                    w1,
+                    w2,
+                    jnp.asarray(w, jnp.bfloat16),
+                    jnp.asarray(ids),
+                ).jaxpr
+            return _count_primitive(jaxpr, "sort"), _count_primitive(jaxpr, "cumsum")
+
+        for m, threshold in ((64, 0), (4096, GLM_DENSE_THRESHOLD)):
+            with self.subTest(m=m):
+                (sorts_on, scans_on), (sorts_off, scans_off) = (
+                    ops(m, threshold, True),
+                    ops(m, threshold, False),
+                )
+                self.assertEqual(sorts_off - sorts_on, 1)
+                self.assertLessEqual(scans_on, scans_off)
+
+
+@unittest.skipUnless(_HAS_TPU, _SKIP)
+class TestCountingSort(CustomTestCase):
+    def test_matches_stable_argsort(self):
+        """Positions and real-key counts equal a stable argsort under jit."""
+        from sglang_tpu.moe.pallas import fused_moe_op
+
+        rng = np.random.default_rng(0)
+        for n, buckets, pattern in COUNTING_SORT_CASES:
+            with self.subTest(n=n, buckets=buckets, pattern=pattern):
+                keys = _keys(n, buckets, pattern, rng)
+                pos, counts = jax.jit(
+                    lambda k: fused_moe_op._counting_sort_positions(
+                        k, num_buckets=buckets
+                    )
+                )(jnp.asarray(keys))
+                order = np.argsort(keys, kind="stable")
+                np.testing.assert_array_equal(pos, np.argsort(order))
+                # The sentinel's count also includes the block padding.
+                np.testing.assert_array_equal(
+                    np.asarray(counts)[:-1], np.bincount(keys, minlength=buckets)[:-1]
+                )
+        for n, buckets in ((256, 289), (2048, 513)):
+            with self.subTest(n=n, buckets=buckets, declines=True):
+                pos, _ = fused_moe_op._counting_sort_positions(
+                    jnp.zeros((n,), jnp.int32), num_buckets=buckets
+                )
+                self.assertIsNone(pos)
 
 
 if __name__ == "__main__":

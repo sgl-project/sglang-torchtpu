@@ -419,6 +419,7 @@ class _DenseRoute(NamedTuple):
     sorted_weights: "jax.Array"  # f32[n]: routing weight of each sorted row
     group_sizes: "jax.Array"  # i32[num_local_experts]
     num_owned: "jax.Array"  # i32[]: owned rows, a prefix of the sorted order
+    sorted_pos: "jax.Array"  # i32[n]: sorted row of each slot (inverse permute)
 
 
 def _dense_rank_route(
@@ -462,7 +463,9 @@ def _dense_rank_route(
         axis=0, dtype=jnp.int32
     )
     num_owned = jnp.sum(owned, dtype=jnp.int32)
-    return _DenseRoute(sorted_token_ids, sorted_weights, group_sizes, num_owned)
+    return _DenseRoute(
+        sorted_token_ids, sorted_weights, group_sizes, num_owned, sorted_pos
+    )
 
 
 def _dense_route_combine(
@@ -487,6 +490,126 @@ def _dense_route_combine(
         gmm2_out.astype(jnp.float32),
         (((0,), (0,)), ((), ())),
         preferred_element_type=jnp.float32,
+    )
+
+
+# Rows per block of the counting sort's rank contraction: the triangular matmul
+# is B x B, so this trades that against the number of blocks.
+_COUNTING_SORT_BLOCK = 512
+
+
+def _counting_sort_positions(
+    sort_keys: "jax.Array", num_buckets: int
+) -> tuple[Optional["jax.Array"], Optional["jax.Array"]]:
+    """Stable counting sort: each row's position in the sorted order, and the
+    row count of every key (the last key's count also includes block padding).
+
+    The keys take only ``num_buckets`` values, so the rank within a bucket
+    comes from a triangular matmul on each one-hot block (MXU work instead of a
+    comparison sort), and the bucket totals fall out of the same contraction.
+    Prefix sums are triangular matmuls too, not VPU ``reduce-window`` scans.
+    Returns ``(None, None)`` for more buckets than one block.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    m = sort_keys.shape[0]
+    block = min(_COUNTING_SORT_BLOCK, m)
+    if num_buckets > block:
+        # XLA returned a non-permutation here under jit (vllm-torchtpu,
+        # jaxlib 0.10.2 + libtpu 0.0.44.1); lift once a newer libtpu is verified.
+        return None, None
+    pad = -m % block
+    if pad:
+        # The sentinel bucket sorts after every real one, so padding into it
+        # leaves the real bucket bases untouched.
+        sort_keys = jnp.pad(sort_keys, (0, pad), constant_values=num_buckets - 1)
+    onehot = jax.nn.one_hot(
+        sort_keys.reshape(-1, block), num_buckets, dtype=jnp.bfloat16
+    )
+    # The histogram rides along as one more row of the rank contraction. Exact:
+    # 0/1 summands, at most `block` of them, accumulated in f32.
+    lower = jnp.concatenate(
+        [
+            jnp.ones((1, block), jnp.bfloat16),
+            jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1),
+        ],
+        axis=0,
+    )
+    both = jnp.einsum("ij,bje->bie", lower, onehot, preferred_element_type=jnp.float32)
+    hist = both[:, 0, :]
+    rank = both[:, 1:, :]
+    num_blocks = hist.shape[0]
+    counts = hist[0] if num_blocks == 1 else hist.sum(axis=0)
+    upper_buckets = jnp.triu(jnp.ones((num_buckets, num_buckets), jnp.bfloat16), 1)
+    base = jnp.einsum(
+        "e,ef->f",
+        counts,
+        upper_buckets,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )[None, :]
+    if num_blocks > _COUNTING_SORT_BLOCK:
+        # vllm-torchtpu's cutoff for the block-prefix matmul; not re-measured here.
+        base = base + (jnp.cumsum(hist, axis=0) - hist)
+    elif num_blocks > 1:
+        lower_blocks = jnp.tril(jnp.ones((num_blocks, num_blocks), jnp.bfloat16), -1)
+        base = base + jnp.einsum(
+            "ab,be->ae",
+            lower_blocks,
+            hist,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
+    pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
+    return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
+
+
+class _EpCountingRoute(NamedTuple):
+    sorted_token_ids: "jax.Array"  # i32[n]: owner token of each sorted row
+    sorted_pos: "jax.Array"  # i32[n]: sorted row of each slot (inverse permute)
+    group_sizes: "jax.Array"  # i32[num_local_experts]
+    num_owned: "jax.Array"  # i32[]: owned rows, a prefix of the sorted order
+
+
+def _ep_counting_route(
+    topk_ids_flat: "jax.Array",
+    *,
+    topk: int,
+    num_experts: int,
+    expert_group_offset: int,
+) -> Optional[_EpCountingRoute]:
+    """Expert-major routing over this EP rank's local expert ids, owned rows first.
+
+    The large-batch analogue of ``_dense_rank_route``: ids outside this rank's
+    window map to one sentinel bucket past the last local expert, so the owned
+    rows form the prefix ``[0, num_owned)``. The counting sort gives each
+    slot's sorted row and the local ``group_sizes``; one packed single-operand
+    sort of ``(key, slot)`` gives the row order. Both order by (key, slot), so
+    they agree row for row. None when the counting sort or the packing declines.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    n = topk_ids_flat.shape[0]
+    flat_bits = max(1, (n - 1).bit_length())
+    if num_experts.bit_length() + flat_bits >= 31:
+        return None
+    local_ids = topk_ids_flat - expert_group_offset
+    owned = (local_ids >= 0) & (local_ids < num_experts)
+    keys = jnp.where(owned, local_ids, num_experts).astype(jnp.int32)
+    sorted_pos, counts = _counting_sort_positions(keys, num_buckets=num_experts + 1)
+    if sorted_pos is None:
+        return None
+    slot = jnp.arange(n, dtype=jnp.int32)
+    packed = jax.lax.sort(jnp.left_shift(keys, flat_bits) | slot, is_stable=False)
+    sorted_slot = jnp.bitwise_and(packed, (1 << flat_bits) - 1)
+    group_sizes = counts[:num_experts]
+    return _EpCountingRoute(
+        sorted_token_ids=(sorted_slot // topk).astype(jnp.int32),
+        sorted_pos=sorted_pos,
+        group_sizes=group_sizes,
+        num_owned=jnp.sum(group_sizes, dtype=jnp.int32),
     )
 
 
@@ -694,6 +817,23 @@ def _fused_moe_jax(
     single_token = use_dense_permute and use_dense_unpermute and m_orig == 1
 
     row_start = row_end = None
+    # EP batches off the dense permute (every batch when the threshold is 0)
+    # with the SparseCore gather and combine: route on local expert ids, so only
+    # the owned rows are gathered and one packed sort replaces the two argsorts.
+    ep_route = None
+    if (
+        not use_dense_permute
+        and use_sc_gather
+        and use_group_offset
+        and not no_combine
+        and tpu_envs.SGLANG_TPU_FUSED_MOE_EP_COUNTING_ROUTE.get()
+    ):
+        ep_route = _ep_counting_route(
+            topk_ids_flat,
+            topk=topk,
+            num_experts=num_experts,
+            expert_group_offset=expert_group_offset,
+        )
     if single_token:
         from sglang_tpu.moe.pallas.route_meta import single_token_route_meta
 
@@ -706,6 +846,8 @@ def _fused_moe_jax(
             offset=expert_group_offset if use_group_offset else 0,
             num_experts=num_experts,
         )
+    elif ep_route is not None:
+        sorted_token_ids = ep_route.sorted_token_ids
     else:
         # argsort is stable enough on TPU for our usage; the gmm kernel
         # only cares about contiguous expert runs.
@@ -739,7 +881,11 @@ def _fused_moe_jax(
 
         n_sorted = sorted_token_ids.shape[0]
         gather_start = jnp.array([0], dtype=jnp.int32)
-        gather_end = jnp.array([n_sorted], dtype=jnp.int32)
+        if ep_route is not None:
+            # Owned rows only: gmm_v2 reads no other row, the combine masks them.
+            gather_end = ep_route.num_owned.reshape(1)
+        else:
+            gather_end = jnp.array([n_sorted], dtype=jnp.int32)
         x_sorted = ragged_gather_v2(
             hidden_states,
             sorted_token_ids,
@@ -762,11 +908,15 @@ def _fused_moe_jax(
 
     # Multi-token dense decode: route on local expert ids with a sort-free rank
     # permute. The routing above is then unused, and XLA drops it as dead code.
-    # A single token keeps the path above.
+    # A single token keeps the path above. A batch whose routed rows reach the
+    # dense-unpermute threshold (bs 64 x top-8 = 512 at threshold 512) keeps
+    # the SparseCore combine, fed by the rank route's slot positions, instead
+    # of two argsorts and a global-expert histogram.
+    rank_route_sparse_combine = bool(use_sc_gather and not no_combine)
     dense_route = None
     if (
         use_dense_permute
-        and use_dense_unpermute
+        and (use_dense_unpermute or rank_route_sparse_combine)
         and m_orig > 1
         and m * topk <= _RANK_PERMUTE_MAX_ROWS
     ):
@@ -867,6 +1017,10 @@ def _fused_moe_jax(
     if dense_route is not None:
         # Local groups only; the combine masks the rows past the owned prefix.
         group_sizes, group_offset, zero_init = dense_route.group_sizes, None, False
+    elif ep_route is not None:
+        # Local groups over the owned prefix, which is all the gather wrote;
+        # the SparseCore combine masks the rest (zero_init is already False).
+        group_sizes, group_offset = ep_route.group_sizes, None
 
     gmm1_out = gmm_v2(
         lhs=x_sorted,
@@ -960,8 +1114,20 @@ def _fused_moe_jax(
         )
         return combined[:m_orig].astype(out_dtype)
 
-    # TODO (Qinghan): check performance against scatter
-    unsort_idx = jnp.argsort(argsort_idx)
+    if ep_route is not None:
+        # The counting sort's positions are the inverse permutation.
+        unsort_idx = ep_route.sorted_pos
+        owned_rows_mask = unsort_idx < ep_route.num_owned
+    elif dense_route is not None:
+        # Rank route with the SparseCore combine (no_combine and the
+        # TensorCore gather never get here): a slot's rank is its sorted row,
+        # and only the owned prefix was written.
+        unsort_idx = dense_route.sorted_pos
+        owned_rows_mask = unsort_idx < dense_route.num_owned
+    else:
+        # TODO (Qinghan): check performance against scatter
+        unsort_idx = jnp.argsort(argsort_idx)
+        owned_rows_mask = None
     if use_sc_gather:
         if not no_combine:
             # Fused gather + weighted top-k sum.
@@ -977,7 +1143,11 @@ def _fused_moe_jax(
                     gmm2_out,
                     unsort_idx.astype(jnp.int32),
                     topk_weights.reshape(-1),
-                    _valid_rows_mask(row_start, row_end, unsort_idx),
+                    (
+                        owned_rows_mask
+                        if owned_rows_mask is not None
+                        else _valid_rows_mask(row_start, row_end, unsort_idx)
+                    ),
                     topk,
                 )
             else:
