@@ -16,6 +16,9 @@
 #   BASE_URL=http://127.0.0.1:30000     endpoint to bench (mini-LB for P/D)
 #   PROBE_URL=$BASE_URL                 where /metrics lives (P/D: the prefill
 #                                       engine -- the LB serves no /metrics)
+#   PROBE_URLS=$PROBE_URL               space-separated engines whose counters
+#                                       are summed into the metrics snapshot
+#                                       (P/D with several prefill engines)
 #   PROBE_URL_2=                        optional second /metrics snapshot
 #   OUTPUT_DIR=    REQUIRED
 #   TRACE_DIR=$TRACE_CACHE_DIR
@@ -30,6 +33,9 @@ BS=${BS:?set BS (client concurrency)}
 NUM_LONG=${NUM_LONG:-0}
 BASE_URL=${BASE_URL:-http://127.0.0.1:$PORT}
 PROBE_URL=${PROBE_URL:-$BASE_URL}
+PROBE_URLS=${PROBE_URLS:-$PROBE_URL}
+probe_url_args=()
+for url in $PROBE_URLS; do probe_url_args+=(--url "$url"); done
 PROBE_URL_2=${PROBE_URL_2:-}
 OUTPUT_DIR=${OUTPUT_DIR:?set OUTPUT_DIR}
 TRACE_DIR=${TRACE_DIR:-$TRACE_CACHE_DIR}
@@ -135,7 +141,7 @@ if [[ "$FLUSH_CACHE" == "1" ]]; then
     sleep 2
 fi
 
-"$PYTHON" "$NIGHTLY_TOOLS_DIR/metrics_probe.py" snapshot --url "$PROBE_URL" \
+"$PYTHON" "$NIGHTLY_TOOLS_DIR/metrics_probe.py" snapshot "${probe_url_args[@]}" \
     --out "$OUTPUT_DIR/${TAG}.metrics.pre.json" || true
 [[ -n "$PROBE_URL_2" ]] && "$PYTHON" "$NIGHTLY_TOOLS_DIR/metrics_probe.py" snapshot \
     --url "$PROBE_URL_2" --out "$OUTPUT_DIR/${TAG}.decode.metrics.pre.json" || true
@@ -163,7 +169,7 @@ bench_args=(
 
 {
     echo "==== leg $TAG ($BENCH_MODEL/$BENCH_RECIPE/$WORKLOAD) ===="
-    echo "  base_url        = $BASE_URL  (metrics: $PROBE_URL)"
+    echo "  base_url        = $BASE_URL  (metrics: $PROBE_URLS)"
     echo "  concurrency     = $BS"
     echo "  long requests   = $NUM_LONG  (target ctx $LONG_TARGET_CONTEXT, ${long_rounds} round(s) each)"
     echo "  normal sessions = $(( num_sessions - NUM_LONG ))  (target ctx $TARGET_CONTEXT, ${normal_rounds} round(s), ${sessions_per_slot} session(s)/slot)"
@@ -189,7 +195,7 @@ fi
 
 # Post-leg observability; runs even on failure (the counters are often the
 # whole diagnosis).
-"$PYTHON" "$NIGHTLY_TOOLS_DIR/metrics_probe.py" snapshot --url "$PROBE_URL" \
+"$PYTHON" "$NIGHTLY_TOOLS_DIR/metrics_probe.py" snapshot "${probe_url_args[@]}" \
     --out "$OUTPUT_DIR/${TAG}.metrics.post.json" || true
 [[ -n "$PROBE_URL_2" ]] && "$PYTHON" "$NIGHTLY_TOOLS_DIR/metrics_probe.py" snapshot \
     --url "$PROBE_URL_2" --out "$OUTPUT_DIR/${TAG}.decode.metrics.post.json" || true
