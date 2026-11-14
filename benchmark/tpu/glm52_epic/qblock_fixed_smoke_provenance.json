@@ -17,7 +17,7 @@
     "peer acknowledgment"
   ],
   "coverage_limit": "local chunk ceiling256; HTTP request does not prove qblock runtime dispatch; compile warmup2048 covers a distinct graph",
-  "status": "running; terminal evidence pending",
+  "status": "SUCCEEDED; both-host short-input baseline accepted; see fixed_smoke_acceptance.json and fixed_smoke_terminal_memory.json",
   "early_native_observation": {
     "time_utc": "2026-11-14T15:59:14Z to 15:59:17Z",
     "source": "Falcon stdout memory native_log tails on both hosts",
