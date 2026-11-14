@@ -57,9 +57,21 @@ def main():
     stage('runtime_checked')
     if evidence is not None:
         (evidence / 'runtime.json').write_text(json.dumps(versions, indent=2) + '\n')
+        # Whitelist compiler inputs only; never dump credentials or full env.
+        compiler_env = {name: os.environ.get(name) for name in (
+            'LIBTPU_INIT_ARGS', 'XLA_FLAGS', 'JAX_PLATFORMS',
+            'JAX_ENABLE_COMPILATION_CACHE', 'JAX_COMPILATION_CACHE_DIR',
+            'TORCH_TPU_TIER2_COMPILATION_CACHE',
+            'TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT')}
+        (evidence / 'compiler-env-inherited.json').write_text(
+            json.dumps(compiler_env, indent=2) + '\n')
     if versions != pins:
         raise RuntimeError(f'pinned runtime required: {pins}; found {versions}')
     os.environ['JAX_PLATFORMS'] = 'tpu' if args.backend == 'jax' else 'cpu'
+    print('COMPILER_ENV ' + json.dumps({
+        'JAX_PLATFORMS': os.environ['JAX_PLATFORMS'],
+        'LIBTPU_INIT_ARGS': os.environ.get('LIBTPU_INIT_ARGS'),
+        'XLA_FLAGS': os.environ.get('XLA_FLAGS')}, sort_keys=True), flush=True)
     import jax
     import jax.numpy as jnp
     import numpy as np

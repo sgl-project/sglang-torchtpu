@@ -205,6 +205,32 @@ hardware-unvalidated; it does not exercise cache donation, whole attention,
 model decode, or repeated-call compile-cache reuse. A bridge-only failure
 would narrow the investigation, not by itself identify a TorchTPU bug.
 
+## Padding has two distinct contracts
+
+The gather-only reproduction intentionally supplies nonnegative **physical**
+indices. Production does not pass the indexer's `-1` entries directly to
+`dsa_gather`: `prepare_gather_indices` (`kernel.py:972-1021`) counts valid
+selections, remaps logical positions through the page table, and replaces `-1`
+with scattered in-range cache reads. Attention masks those extra gathered keys.
+Thus adding raw `-1` gather inputs would test an invalid boundary, not reproduce
+production padding. A separate prepare-indices test is needed to isolate page
+mapping if gather itself succeeds.
+
+Also, `num_valid_indices` is a valid **query-row prefix rounded to the attention
+kernel batch size**, multiplied by top-k (`kernel.py:1234-1247`), not the number
+of nonpadding picks within a query. `--live-queries` in the reproduction models
+that query-prefix boundary only. Its random physical indices do not model the
+logical remap or prove that startup's page metadata is correct.
+
+## Validation boundary
+
+`falcon workflow validate` validates the workflow DSL (`schema_version`,
+`workflow`, `steps`), not a bare experiment manifest. Running it on the checked-in
+bare smoke template returned input error / exit2 for those missing DSL fields;
+this is not experiment admission or evidence the job is launchable. The submit
+wrapper help exposes no dry-run flag. Do not submit placeholders just to test
+schema validation. Local shell/JSON checks remain distinct from Falcon admission.
+
 ## Next diagnostic boundary
 
 Before another full-checkpoint run, isolate sparse MLA at the kernel interface:
