@@ -74,6 +74,11 @@ from sglang_tpu.compilation.frame_stack import (
     call_with_reserved_frame_stack,
 )
 from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.compilation.symbolic_warmup import (
+    PerShapeBackend,
+    mark_bucket_dims_dynamic,
+    warmup_objects,
+)
 from sglang_tpu.cp_forward import (
     install_cp_logits_forward,
     prepare_tpu_cp_forward_batch,
@@ -823,12 +828,24 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         aot_fast_runtime_wrapper.install_from_env()
         # The bundle Compiler installs its own guard filter for restorable guards.
         options = None if use_bundle else _guard_filter_options(server_args)
+        backend = self.backend or current_platform.get_compile_backend()
+        if self._symbolic_warmup_enabled(use_bundle=use_bundle):
+            backend = PerShapeBackend(backend)
         return compiler(
             torch.no_grad()(fn),
-            backend=self.backend or current_platform.get_compile_backend(),
+            backend=backend,
             fullgraph=self.fullgraph,
             dynamic=self.dynamic,
             **({"options": options} if options else {}),
+        )
+
+    def _symbolic_warmup_enabled(self, *, use_bundle: bool = False) -> bool:
+        # The torch.compile bundle restores static guards per bucket, and the
+        # direct tracer specializes per bucket by construction.
+        return (
+            tpu_envs.SGLANG_TPU_ENABLE_SYMBOLIC_WARMUP.get()
+            and self.tracer == "dynamo"
+            and not use_bundle
         )
 
     def _direct_compile(
@@ -1775,6 +1792,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                     self.owner.forward.warmup_async, *args, **kwargs
                 )
             else:
+                if self._symbolic_warmup_enabled() and profile_prefix is None:
+                    mark_bucket_dims_dynamic(
+                        (num_tokens, bs),
+                        tensors=(*args, *kwargs.values()),
+                        objects=warmup_objects(forward_batch, forward_attn_backend),
+                    )
                 out = call_with_reserved_frame_stack(entry.forward, *args, **kwargs)
             if isinstance(out, PendingCall):
                 return out.then(

@@ -138,6 +138,10 @@ class TpuEnvs:
     # decoder_compile_policy._guard_filter_options). Assumes module state is
     # fixed after warmup.
     SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER = EnvBool(False)
+    # Dynamo-traced decoder warmup traces each forward mode once with symbolic
+    # token/batch dims, then compiles one static TPU program per bucket
+    # (compilation/symbolic_warmup.py). Off traces every bucket separately.
+    SGLANG_TPU_ENABLE_SYMBOLIC_WARMUP = EnvBool(False)
     # Serving-time decode forwards of a dynamo-compiled decoder run only
     # Dynamo's differentiating guards (tensor shapes/dtypes and every guard
     # that failed during warmup) instead of the full guard set, once warmup
