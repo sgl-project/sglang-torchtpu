@@ -51,10 +51,17 @@ def main():
         attention_tp = tp // (dp * cp)
         assert total_heads % attention_tp == 0
         local_heads = total_heads // attention_tp
+        local_chunk = args['chunked_prefill_size'] // dp
         for tokens in (128, 512, 2048):
             qb, pps = scope['block_shape'](local_heads, tokens, args['page_size'])
             results.append(dict(candidate=name, attention_tp=attention_tp,
                                 local_heads=local_heads, tokens=tokens,
+                                configured_local_chunk_ceiling=local_chunk,
+                                within_eager_chunk_ceiling=tokens <= local_chunk,
+                                qblock_length_eligible=tokens >= 512 and tokens % 128 == 0,
+                                # Compile padding can exceed the eager live chunk;
+                                # neither field establishes actual runtime routing.
+                                runtime_path_verified=False,
                                 query_block=qb, pages_per_step=pps,
                                 head_query_rows=local_heads * qb,
                                 exceeds_selector_row_budget=local_heads * qb > scope['_MAX_ROWS']))

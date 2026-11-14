@@ -257,7 +257,11 @@ submitted with source `ea78ecf2d621fb7f45c66c27b90cb8d49f620ddd`, the existing
 hashed bootstrap identity, and `GLM52_BASELINE_MODE=eager`. It restores the model
 mount, retains 8 physical chips / two hosts and requires 512 input tokens plus
 2 generated IDs. Compile is disabled. Result pending; wait is bounded and no
-duplicate allocation submitted. Do not confuse the diagnostic step passes with
+duplicate allocation submitted. A read-only Falcon exec inspection confirmed
+rank0 weight loading progressing to 56/282 shards after 9m25s (load began
+11:10:37 UTC). This is loading progress, not ready/generation evidence. An
+initial Python `-c` inspection command failed with exit2 through exec's command
+quoting; the simple `tail` inspection succeeded without modifying the workload. Do not confuse the diagnostic step passes with
 this full-model acceptance criterion.
 
 ## Padding has two distinct contracts
