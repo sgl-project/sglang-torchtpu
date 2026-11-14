@@ -93,8 +93,14 @@ plugin's direct-compile async queue or change its queue depth as a fix.
 This does not prove serialized native XLA compilation: TorchTPU/Dynamo may
 have internal threads/processes, and separate scheduler ranks can compile
 concurrently. Attribution still requires sampled process identity/stacks and
-compile-stage evidence. Current source alone does not establish historical
-exit137's compiler mode.
+compile-stage evidence. Historical exit137 native `server_args` (line 63)
+was independently parsed and also says `tpu_compile_tracer=dynamo`,
+`use_spmd_compile=False`. It differs materially in context=135168,
+max_total_tokens=147456, page_size=64 and decode bs=[1,2,4,8,16,32]
+versus smoke context=4096, max_total_tokens=8192, page_size=128, bs=[1].
+Thus smoke success would establish a runnable short baseline, not isolate
+compile-cardinality as the cause of the historical failure: KV capacity,
+page layout and shape contracts changed too.
 
 ## Loading-policy audit (no runtime change)
 
