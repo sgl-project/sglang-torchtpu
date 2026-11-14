@@ -13,7 +13,7 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--queries', type=int, choices=(1, 4, 64, 2048), default=1)
-    parser.add_argument('--selection', choices=('self', 'causal-mean'), default='self',
+    parser.add_argument('--selection', choices=('self', 'causal-mean', 'rope-pair'), default='self',
                         help='Single key, or causal keys with zero queries and uniform weights.')
     parser.add_argument('--entry', choices=('per-query', 'prefill-fallback', 'prefill-qblock'), default='per-query',
                         help='Token-major op, small head-major fallback, or2048-token fused qblock.')
@@ -46,7 +46,8 @@ def main():
 
     query_value = 1 if args.selection == 'self' else 0
     q = torch.full((t, h, 512), query_value, dtype=torch.bfloat16, device='tpu')
-    qr = torch.full((t, h, 64), query_value, dtype=torch.bfloat16, device='tpu')
+    qr = torch.full((t, h, 64), 1 if args.selection == 'rope-pair' else query_value,
+                    dtype=torch.bfloat16, device='tpu')
     # Whole allocations, not views: the production op donates these buffers.
     num_pages = 65 if args.entry == 'prefill-qblock' else 2
     cn = torch.zeros((num_pages, p, 4, 128), dtype=torch.uint8, device='tpu')
@@ -54,6 +55,10 @@ def main():
     topk = np.full((t, k), -1, np.int32)
     if args.selection == 'self':
         topk[:, 0] = np.arange(t)
+    elif args.selection == 'rope-pair':
+        # Unique causal keys, including row0 only once (no bitmap duplicates).
+        topk[:, 0] = 0
+        topk[1:, 1] = np.arange(1, t)
     else:
         for row in range(t):
             topk[row, :row + 1] = np.arange(row + 1)
@@ -93,6 +98,13 @@ def main():
         expected_rows = values
         if args.selection == 'causal-mean':
             expected_rows = values.cumsum(axis=0) / np.arange(1, t + 1)[:, None]
+        elif args.selection == 'rope-pair':
+            # NoPE query=0, RoPE query=1 over64 lanes, scale1/16. All
+            # stored FP8 values are exact dyadics, so logits are4*rope_scalar.
+            delta = 4 * (rope[:, :1] - rope[0, :1])
+            w_self = 1 / (1 + np.exp(-delta))
+            expected_rows = (1 - w_self) * values[0] + w_self * values
+            expected_rows[0] = values[0]
         expected = np.broadcast_to(expected_rows[:, None, :], (t, h, 512))
         assert actual.shape == (t, h, 512), actual.shape
         assert np.isfinite(actual).all()
