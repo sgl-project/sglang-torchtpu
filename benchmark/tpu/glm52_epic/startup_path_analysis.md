@@ -126,6 +126,21 @@ reader progress rather than a completely stuck loader; it does not prove
 all ranks have the same shard position. A bounded log-tail helper must
 recognize CR as well as LF or it can discard the entire tqdm tail.
 
+## Confirmed global loading-to-compile boundary
+
+Rank-0 DP8–15 completed loading at 14:56:05–08Z (3061–3064 seconds),
+about seven minutes after rank-1 DP0–7. At 14:56:15Z native logs explicitly
+enter one EXTEND variant, tokens=[2048], cap=1. Existing plugin checkpoint
+page-cache release (distinct from loader per-shard drop-cache=False) completes
+at 14:56:20Z: 282 files advised, 756.267 decimal GB, 5.5 seconds.
+`advised_gb` is summed file size, not measured freed memory (page_cache.py:69–105).
+At 14:57:30Z rank-0 current is 58.38 GiB, file=5.20 GiB, anon=52.27 GiB,
+compared with current=459.55/file=411.40/anon=46.36 GiB at 14:55:00Z.
+Thus the observed loading cache mostly recedes before the early compiler
+sample; the previous loader-only audit did not cover this post-load plugin
+release. Graph partition logs appear at 14:57:18–26Z, but no completed
+EXTEND/request acceptance yet. No new release behavior was added for this run.
+
 ## Instrumented compile-smoke outcome
 
 exp-sx62ld4v1e (source 7830981b0e) failed before model loading: the bootstrap
