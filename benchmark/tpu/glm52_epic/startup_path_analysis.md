@@ -17,7 +17,16 @@ do not invent primary HTTP/prefill timing from the peer log.
 
 Next bounded experiment: exp-pjqqwzqvwk / art-87lllasmfe, source
 da842fd3a6d1b492c2a12a6c1ed1865be8866ac0, query4 head-major prefill fallback,
-no checkpoint. One 25-minute wait; no full-model retry.
+no checkpoint. SUCCEEDED: both hosts ran two output/cache-checked calls,
+all four passed (prefill_fallback_rank0/1.txt). Each host used one local device;
+this does not validate distributed idle/collectives or query-score numerics.
+
+Follow-up exp-0vl9iuolg7 / art-sfn90qoppa, source e4ab0d1903: indexer query1
+and4 x XLA/Pallas writer with ordinary serving segments also SUCCEEDED on both
+hosts (eight membership/i32/padding passes; indexer_bridge_rank0/1.txt).
+Thus neither narrow bridge reproduction triggers the full-model fatal. Scoring,
+combined graphs, larger cache shapes, model ops and distributed scheduling remain
+uncovered. No production kernel change is justified from these passing probes.
 
 ## Confirmed source facts
 
