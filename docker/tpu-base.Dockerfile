@@ -16,8 +16,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # libssl-dev: the HiCache page-hash extension (mem_cache/cpp_utils) links
 # OpenSSL; storage backends and KV events JIT-build it at runtime.
 # Raiden's torch extension links libibverbs even for host KV-cache offload.
+# libtcmalloc-minimal4t64: the host allocator preloaded below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl ca-certificates build-essential libgomp1 libssl-dev libibverbs1 \
+        libtcmalloc-minimal4t64 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /sgl-workspace/sglang
@@ -42,6 +44,12 @@ RUN --mount=type=secret,id=gar_netrc,target=/root/.netrc,required=true \
     pip uninstall -y sglang && \
     rm -rf sglang && \
     pip install "antlr4-python3-runtime==4.9.3" "sgl-eval==0.1.0"
+
+# Use tcmalloc as the host allocator. Set after the dependency install.
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4
+# A missing preload only warns at load time; fail the build instead.
+RUN test -f "$LD_PRELOAD" \
+ && python -c "import ctypes; assert hasattr(ctypes.CDLL(None), 'MallocExtension_ReleaseFreeMemory'), 'tcmalloc is not the process allocator'; print('tcmalloc OK')"
 
 # Fill sgl-eval's mmlu cache so the accuracy suite runs the eval offline.
 RUN python scripts/ci/tpu/warm_mmlu_cache.py
