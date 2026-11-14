@@ -28,7 +28,10 @@ from sglang_tpu.attention.pallas.batched_rpa import (
     schedule,
 )
 from sglang_tpu.attention.pallas.batched_rpa import scheduler as scheduler_lib
-from sglang_tpu.attention.pallas.batched_rpa import stitch_utils, utils
+from sglang_tpu.attention.pallas.batched_rpa import (
+    stitch_utils,
+    utils,
+)
 
 
 def strided_load_bkv(
@@ -75,19 +78,118 @@ def strided_load_bkv(
     )
 
 
+def add_attention_sink(l: jax.Array, m: jax.Array, sink_ref: jax.Ref) -> jax.Array:
+    """Adds exp(sink - m) to one lane's softmax denominator l: [KV, rows, 128].
+
+    The sink is one extra key per row with logit sink[head] and a zero value.
+    """
+    num_rows = l.shape[1]
+    num_kv_heads, period, num_lanes = sink_ref.shape
+    if num_rows <= period:
+        sink = sink_ref[:, :num_rows]
+    else:
+        assert num_rows % period == 0, (num_rows, period)
+        sink = jnp.broadcast_to(
+            sink_ref[...][:, None],
+            (num_kv_heads, num_rows // period, period, num_lanes),
+        ).reshape(l.shape)
+    l_sink = l.astype(jnp.float32) + jnp.exp(sink - m.astype(jnp.float32))
+    return l_sink.astype(l.dtype)
+
+
+def store_lse(
+    lse_vref: jax.Ref,
+    b_idx: jax.Array,
+    m: jax.Array,
+    l: jax.Array,
+    stage_ref: jax.Ref | None,
+    sink_ref: jax.Ref | None,
+    *,
+    cfgs: configs.RpaConfigs,
+):
+    """Stores one lane's lse = log(sum exp(s)) in f32, natural log.
+
+    m, l: [KV, bq * G, lanes], rows (token, aligned q head) with the value
+    repeated over the lanes. Token t of KV head h lands in the row
+    lse_vref[b_idx, h, t, 0] with q head g in lane g. Without a sink, l == 0
+    gives -inf; a sink adds exp(sink) to the sum.
+    """
+    num_heads = cfgs.aligned_num_q_heads_per_kv_head
+    num_lanes = m.shape[-1]
+    lane = lax.broadcasted_iota(jnp.int32, (cfgs.bq_sz, num_lanes), 1)
+
+    def pack(rows: jax.Array) -> jax.Array:
+        # Lane g of token t takes row t * num_heads + g.
+        if rows.shape[0] == num_heads:
+            row = lax.broadcasted_iota(jnp.int32, rows.shape, 0)
+            own = lax.broadcasted_iota(jnp.int32, rows.shape, 1) == row
+            masked = jnp.where(own, rows.astype(jnp.float32), 0.0)
+            return jnp.sum(masked, axis=0, keepdims=True)
+        stage_ref[...] = rows.astype(jnp.float32)
+        packed = jnp.zeros((cfgs.bq_sz, num_lanes), jnp.float32)
+        for head in range(num_heads):
+            head_rows = stage_ref[pl.ds(head, cfgs.bq_sz, num_heads)]
+            packed += jnp.where(lane == head, head_rows, 0.0)
+        return packed
+
+    for kv_head in range(m.shape[0]):
+        m_packed = pack(m[kv_head])
+        l_packed = pack(l[kv_head])
+        if sink_ref is None:
+            lse = m_packed + jnp.log(l_packed)
+        else:
+            # log(l * e^m + e^sink), finite also for a row that attended no key.
+            sink = pack(sink_ref[kv_head, :num_heads])
+            top = jnp.maximum(m_packed, sink)
+            lse = top + jnp.log(
+                l_packed * jnp.exp(m_packed - top) + jnp.exp(sink - top)
+            )
+        lse_vref.at[b_idx, kv_head].reshape(cfgs.bq_sz, num_lanes)[...] = lse
+
+
 def calculate_and_store_out(
     step_idx: jax.Array,
     schedule_ref: schedule.RpaSchedule,
     acc_list: list[jax.Array],
     l_list: list[jax.Array],
-    m_list: list[jax.Array],
+    m_list: list[jax.Array] | None,
     o_vref: jax.Ref,
     lse_o_vref: jax.Ref | None,
     *,
+    attention_sink_ref: jax.Ref | None,
+    lse_stage_ref: jax.Ref | None,
     cfgs: configs.RpaConfigs,
 ):
+    """Normalizes and stores the output (and LSE) of lanes at their last KV step.
 
-    def _accum(b_idx: jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
+    Unlike google3, the attention sink joins the softmax denominator here, once
+    per query block and in float32 (`add_attention_sink`), instead of seeding
+    the running max and sum; and the LSE is stored as one float32 row of lanes
+    per (KV head, token) (`store_lse`).
+    """
+
+    def _accum(
+        b_idx: jax.Array,
+        batch_acc: jax.Array,
+        batch_l: jax.Array,
+        batch_m: jax.Array | None,
+    ):
+        if cfgs.serve.return_lse:
+            store_lse(
+                lse_o_vref,
+                b_idx,
+                batch_m,
+                batch_l,
+                lse_stage_ref,
+                attention_sink_ref,
+                cfgs=cfgs,
+            )
+        if cfgs.model.has_attention_sink:
+            batch_l = add_attention_sink(batch_l, batch_m, attention_sink_ref)
+        if cfgs.serve.attention_scope.walks_cache_stripe:
+            # A row that attended no key (empty stripe) keeps l == 0 and
+            # outputs 0.
+            batch_l = jnp.where(batch_l == 0, jnp.ones_like(batch_l), batch_l)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
         if (
@@ -96,7 +198,7 @@ def calculate_and_store_out(
         ):
             result = lax.div(batch_acc, batch_l)
         else:
-            result = batch_acc * pl.reciprocal(batch_l, approx=True)
+            result = batch_acc * pltpu.reciprocal(batch_l, approx=True)
         out = result.astype(cfgs.serve.dtype_out)
 
         o_u32_vref = o_vref.at[b_idx].bitcast(jnp.uint32)
@@ -107,18 +209,9 @@ def calculate_and_store_out(
         out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
         utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
 
-    def _stage_lse(b_idx: int, batch_m: jax.Array, batch_l: jax.Array):
-        lse_val = batch_m + jnp.log(jnp.maximum(batch_l, 1e-9))
-        lse_u32 = lse_o_vref.at[b_idx].bitcast(jnp.uint32)
-        lse_ref = lse_u32.reshape(-1, lse_o_vref.shape[-1])
-        lse_val = pltpu.bitcast(
-            lse_val.astype(cfgs.serve.dtype_out), jnp.uint32
-        ).reshape(lse_ref.shape)
-        utils.strided_store(lse_ref, 0, lse_ref.shape[0], 1, lse_val)
-
     if cfgs.fuse_accum:
         for b in range(cfgs.batch_size):
-            _accum(b, acc_list[b], l_list[b])
+            _accum(b, acc_list[b], l_list[b], None if m_list is None else m_list[b])
     else:
         # Adding a conditional causes a scheduling barrier. In prefill, we often
         # use small block sizes, so it's not worth executing the accumulation
@@ -129,17 +222,11 @@ def calculate_and_store_out(
             is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
             acc_val = acc_list[b]
             l_val = l_list[b]
+            m_val = None if m_list is None else m_list[b]
             accum_named_call = jax.named_call(_accum, name=f"accum_{b}")
             jax.lax.cond(
-                is_last_k, accum_named_call, lambda *_: None, b, acc_val, l_val
+                is_last_k, accum_named_call, lambda *_: None, b, acc_val, l_val, m_val
             )
-
-    if cfgs.serve.return_lse:
-        for b in range(cfgs.batch_size):
-            is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
-            m_val = m_list[b]
-            l_val = l_list[b]
-            jax.lax.cond(is_last_k, _stage_lse, lambda *_: None, b, m_val, l_val)
 
 
 def get_scale_factors(
@@ -224,6 +311,9 @@ class ComputeMetadata:
     causal_offset: list[jax.Array]
     local_k_start: list[jax.Array] | None = None
     local_k_end: list[jax.Array] | None = None
+    # Sliding window in global positions over a page-striped cache.
+    k_start: list[jax.Array] | None = None
+    global_q_k_gap: list[jax.Array] | None = None
 
 
 # The `pl.when` region in `rpa_body` is a basic block boundary, so splitting
@@ -257,11 +347,16 @@ def fetch_stitch_metadata(
     for b_idx in range(cfgs.batch_size):
         s_idx = schedule_ref.s_idx[step, b_idx]
         is_valid = s_idx != -1
+        # Clamp the sentinel (-1, written by mask_out_steps for padded steps)
+        # so the eager arm of jnp.where below reads an in-bounds slot. The
+        # kernel runs with disable_bounds_checks=True, which assumes indices
+        # are already in range.
+        safe_s_idx = jnp.maximum(0, s_idx)
         k_idx = schedule_ref.k_idx[step, b_idx]
         k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
-        kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
-        kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
-        q_end = jnp.where(is_valid, cu_q_lens_ref[s_idx + 1], 0)
+        kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[safe_s_idx], 0)
+        kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[safe_s_idx], 0)
+        q_end = jnp.where(is_valid, cu_q_lens_ref[safe_s_idx + 1], 0)
 
         # KV stitch boundaries: where the cached tokens end and the newly arrived
         # tokens begin, which is what `stitch_utils.stitch_new_kv_lane` merges on.
@@ -289,6 +384,7 @@ def fetch_compute_metadata(
     schedule_ref: schedule.RpaSchedule,
     q_offsets_ref: jax.Ref,
     kv_cache_lens_ref: jax.Ref,
+    kv_new_lens_ref: jax.Ref,
     extra_refs: Sequence[jax.Ref] = (),
     *,
     cfgs: configs.RpaConfigs,
@@ -301,7 +397,9 @@ def fetch_compute_metadata(
       schedule_ref: Per-step sequence, query, and KV block indices.
       q_offsets_ref: Query offset per sequence.
       kv_cache_lens_ref: Cached KV length per sequence. Only read when the
-        attention scope needs `local_k_end`.
+        attention scope needs `local_k_start` / `local_k_end`.
+      kv_new_lens_ref: New KV length per sequence. Only read when the attention
+        scope needs `local_k_end`.
       extra_refs: Additional scalar prefetch refs for custom schedulers.
       cfgs: Kernel configs.
       scheduler: Scheduler instance defining KV coordinate mapping.
@@ -309,22 +407,31 @@ def fetch_compute_metadata(
     Returns:
       The mask intervals for every batch element in this step.
     """
+    scope = cfgs.serve.attention_scope
     causal_offset_list = []
-    local_k_start_list = (
-        []
-        if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY
-        else None
+    local_k_start_list = [] if scope.skips_cached_keys else None
+    local_k_end_list = [] if scope.walks_cache_stripe else None
+    # Page-striped cache with a sliding window: the window runs in global
+    # positions, `q_offsets` being the global position of the first query.
+    global_window = (
+        cfgs.serve.cp_group_size is not None
+        and cfgs.model.sliding_window is not None
+        and scope.walks_cache_stripe
     )
-    local_k_end_list = (
-        [] if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY else None
-    )
+    k_start_list = [] if global_window else None
+    global_q_k_gap_list = [] if global_window else None
 
     for b_idx in range(cfgs.batch_size):
         s_idx = schedule_ref.s_idx[step, b_idx]
         is_valid = s_idx != -1
+        # Clamp the sentinel (-1, written by mask_out_steps for padded steps)
+        # so the eager arm of jnp.where below reads an in-bounds slot. The
+        # kernel runs with disable_bounds_checks=True, which assumes indices
+        # are already in range.
+        safe_s_idx = jnp.maximum(0, s_idx)
         q_idx = schedule_ref.q_idx[step, b_idx]
         k_idx = schedule_ref.k_idx[step, b_idx]
-        q_offset = jnp.where(is_valid, q_offsets_ref[s_idx], 0)
+        q_offset = jnp.where(is_valid, q_offsets_ref[safe_s_idx], 0)
 
         # Causal base offset: K_base - Q_base
         q_base = scheduler.get_q_start(q_idx, q_offset, cfgs)
@@ -334,15 +441,33 @@ def fetch_compute_metadata(
         causal_offset_list.append(causal_offset)
 
         if local_k_start_list is not None:
-            local_k_start_list.append(q_offset - k_id)
+            # NEW_TOKENS_ONLY: keys before the first new token are masked.
+            kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[safe_s_idx], 0)
+            local_k_start_list.append(kv_cache_len_val - k_id)
         if local_k_end_list is not None:
-            kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
-            local_k_end_list.append(kv_cache_len_val - k_id)
+            # CACHE_ONLY / STRIPED: every key of the call precedes every query;
+            # keys past its length are stale.
+            kv_len_val = jnp.where(
+                is_valid,
+                kv_cache_lens_ref[safe_s_idx] + kv_new_lens_ref[safe_s_idx],
+                0,
+            )
+            local_k_end_list.append(kv_len_val - k_id)
+        if global_q_k_gap_list is not None:
+            # Local key j holds global position
+            # j + (j // page_size) * (cp - 1) * page_size + rank * page_size. The
+            # mask adds the j-dependent stripe term per key; the scalar part of
+            # the gap is q_global - (k_id + rank * page_size).
+            cp_rank = extra_refs[0][0]
+            k_start_list.append(k_id)
+            global_q_k_gap_list.append(q_base - (k_id + cp_rank * cfgs.serve.page_size))
 
     return ComputeMetadata(
         causal_offset=causal_offset_list,
         local_k_start=local_k_start_list,
         local_k_end=local_k_end_list,
+        k_start=k_start_list,
+        global_q_k_gap=global_q_k_gap_list,
     )
 
 
@@ -355,11 +480,28 @@ def generate_mask(
 ) -> list[jax.Array]:
     """Generates causal, sliding window, and attention scope mask for QK computation."""
     b, k_heads, tq, s = shape
+    scope = cfgs.serve.attention_scope
+    sliding_window = cfgs.model.sliding_window
+
+    if scope.walks_cache_stripe and sliding_window is None:
+        # Every query attends every key of the call, so the causal compare
+        # (q_kv_diff >= offset) is always true and only keys beyond the (local)
+        # length need masking. A single [1, 1, s] key-validity vector broadcast
+        # over the tile replaces the full [k_heads, tq, s] compare/select chain.
+        assert step_meta.local_k_end is not None
+        kv_iota = lax.broadcasted_iota(jnp.int32, (1, 1, s), 2)
+        return [kv_iota < step_meta.local_k_end[b_idx] for b_idx in range(b)]
 
     kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
     q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
     q_iota //= cfgs.aligned_num_q_heads_per_kv_head
     q_kv_diff = q_iota - kv_iota
+    if step_meta.global_q_k_gap is not None:
+        # Page-striped cache: the rank term of a key's global position is scalar
+        # and lives in global_q_k_gap; the local-index part is computed per
+        # batch element below from the block's first key.
+        lp = cfgs.serve.page_size_log2
+        stripe_gap = (cfgs.serve.cp_group_size - 1) << lp
 
     masks = []
     for b_idx in range(b):
@@ -374,14 +516,26 @@ def generate_mask(
         # Step 2
         #   offset = causal_offset - bq_start
         offset = step_meta.causal_offset[b_idx] - bq_start
-        mask_b = q_kv_diff >= offset
-        if (sliding_window := cfgs.model.sliding_window) is not None:
-            mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+        if scope.walks_cache_stripe:
+            mask_b = kv_iota < step_meta.local_k_end[b_idx]
+        else:
+            mask_b = q_kv_diff >= offset
+        if sliding_window is not None:
+            if step_meta.global_q_k_gap is None:
+                mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+            else:
+                # Same in global positions: gap = q_global - (k_id + rank * page)
+                # at q_iota = kv_iota = 0 of the block; the stripe term adds
+                # (cp - 1) pages per local page of the key's local index.
+                local_key = kv_iota + step_meta.k_start[b_idx]
+                q_kv_diff_global = q_kv_diff - (local_key >> lp) * stripe_gap
+                window_offset = sliding_window - (
+                    bq_start + step_meta.global_q_k_gap[b_idx]
+                )
+                mask_b = jnp.logical_and(mask_b, q_kv_diff_global < window_offset)
 
         if step_meta.local_k_start is not None:
             mask_b = jnp.logical_and(mask_b, kv_iota >= step_meta.local_k_start[b_idx])
-        if step_meta.local_k_end is not None:
-            mask_b = jnp.logical_and(mask_b, kv_iota < step_meta.local_k_end[b_idx])
 
         masks.append(mask_b)
 
@@ -409,7 +563,8 @@ def rpa_body(
     kv_cache_lens_ref: jax.Ref,
     kv_new_lens_ref: jax.Ref,
     extra_refs: Sequence[jax.Ref] = (),
-    attention_sink_ref: jax.Ref | None,  # [KV, aligned_q_per_kv, 128]
+    attention_sink_ref: jax.Ref | None,  # [KV, period, 128] f32
+    lse_stage_ref: jax.Ref | None = None,
     # Configs.
     cfgs: configs.RpaConfigs,
     scheduler: scheduler_lib.BaseScheduler,
@@ -476,6 +631,7 @@ def rpa_body(
         schedule_ref,
         q_offsets_ref,
         kv_cache_lens_ref,
+        kv_new_lens_ref,
         extra_refs,
         cfgs=cfgs,
         scheduler=scheduler,
@@ -578,9 +734,14 @@ def rpa_body(
     m_val = m_scratch_ref[...]
     l_val = l_scratch_ref[...]
     acc_val = acc_scratch_ref[...]
+    # The sink is folded in by `calculate_and_store_out`, not seeded into the
+    # running max / sum as in google3, so the flash attention steps get none.
     sink_val = None
-    if attention_sink_ref is not None:
-        sink_val = jnp.concat([attention_sink_ref[...]] * cfgs.bq_c_sz, axis=1)
+    want_m = cfgs.serve.return_lse or cfgs.model.has_attention_sink
+    # Scopes whose rows can attend no key zero p on the masked keys: such a
+    # row then keeps l == 0 instead of weighting masked keys by
+    # exp(mask_value - mask_value).
+    zero_masked = cfgs.serve.attention_scope.walks_cache_stripe
 
     l_new_list = []
     m_new_list = []
@@ -618,11 +779,12 @@ def rpa_body(
                 bq_start=bq_start,
                 k_scale=k_scale,
                 attention_sink=sink_val,
+                zero_masked=zero_masked,
             )
         )
         m_scratch_ref[:, q_slice] = m_carry
         l_scratch_ref[:, q_slice] = l_carry
-        if cfgs.serve.return_lse:
+        if want_m:
             m_new_list.append(m_next)
         l_new_list.append(l_next)
 
@@ -659,7 +821,8 @@ def rpa_body(
     )
     acc_scratch_ref[:, prev_q_slice] = o_carry
     acc_new_list.append(o_next)
-    if cfgs.serve.return_lse:
+    m_next = None
+    if want_m:
         m_next = jnp.concatenate(m_new_list, axis=2)
     l_next = jnp.concatenate(l_new_list, axis=2)
     acc_next = jnp.concatenate(acc_new_list, axis=2)
@@ -673,6 +836,8 @@ def rpa_body(
         m_next,
         o_vref,
         lse_o_vref,
+        attention_sink_ref=attention_sink_ref,
+        lse_stage_ref=lse_stage_ref,
         cfgs=cfgs,
     )
 
@@ -771,8 +936,18 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
         name += "-new_only"
     elif serve.attention_scope == configs.AttentionScope.CACHE_ONLY:
         name += "-cache_only"
+    elif serve.attention_scope == configs.AttentionScope.STRIPED:
+        name += "-striped"
     elif serve.attention_scope == configs.AttentionScope.FULL:
         name += "-full"
+    if cfgs.model.has_attention_sink:
+        name += "-sink"
+    if serve.skip_kv_write:
+        name += "-nowb"
+    if serve.return_lse:
+        name += "-lse"
+    if serve.cp_group_size is not None:
+        name += f"-cp{serve.cp_group_size}"
     return name
 
 
@@ -825,9 +1000,10 @@ def rpa_kernel(
       kv_cache_hbm: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
         kv_packing, head_dim]. Stores existing kv cache data where k & vs are
         concatenated along num kv heads dim.
-      lse_hbm: pre-allocated buffer for LSE output. None when return_lse=False.
-      attention_sink_hbm: [num_kv_heads, aligned_num_q_heads_per_kv_head,
-        num_lanes]. Per q head sink logit, or None.
+      lse_hbm: [num_kv_heads, max_num_tokens, 1, num_lanes] f32 with return_lse,
+        else None. Lane g of a (KV head, token) row holds aligned q head g.
+      attention_sink_hbm: [num_kv_heads, period, num_lanes] f32 or None. Per-row
+        sink logits from `wrapper.prepare_attention_sink`.
       cfgs: Configuration of the kernel.
       scheduler: Scheduler instance defining schedule shape and KV coordinates.
       extra_scalars: Dynamic scalar arrays prefetched into SMEM for `scheduler`.
@@ -836,7 +1012,7 @@ def rpa_kernel(
       out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
       new_kv_cache: [num_pages, page_size, num_kv_heads // kv_packing, kv_packing,
         head_dim]. Result of new kv cache.
-      lse_out: [max_num_tokens, num_q_heads] LSE values, or None.
+      lse_out: the updated lse_hbm, or None.
     """
     return_lse = cfgs.serve.return_lse
 
@@ -889,8 +1065,13 @@ def rpa_kernel(
                     dtype=cfgs.serve.dtype_out,
                 ),  # acc
             ),
+            lse_stage=(
+                pltpu.VMEM(cfgs.lse_stage_shape, dtype=jnp.float32)
+                if return_lse and cfgs.bq_sz > 1
+                else None
+            ),
         )
-        def _run(final_allocs, schedule_ref, dma_sem, scratches):
+        def _run(final_allocs, schedule_ref, dma_sem, scratches, lse_stage):
             # Initialize Q to zeros to prevent NaN pollution.
             #
             # When a query block is partially filled, tail slots in uninitialized VMEM
@@ -900,23 +1081,18 @@ def rpa_kernel(
             # subsequent iterations cannot recover (0 * NaN = NaN).
 
             # Initialize KV cache to zeros.
-            # When perfomring p * v, we perform causal masking on lhs (p) by zeroing
+            # When performing p * v, we perform causal masking on lhs (p) by zeroing
             # out columns that should not be processed for a given row. Even if we
             # don't perform masking on rows of rhs (v), the output is still correct
-            # since reuslt of multiplication will be zero thanks zero on lhs. However,
+            # since result of multiplication will be zero thanks zero on lhs. However,
             # this assumption does not hold if a row of rhs has NaNs. To avoid this,
-            # we initiallize scratch memory with non-zero values. Even if the scratch
+            # we initialize scratch memory with non-zero values. Even if the scratch
             # memory is storing kv cache from previous step, as long as the data is
             # not NaNs, there will be no numeric concerns.
 
-            if attention_sink_ref is None:
-                scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
-                scratches[1][...] = jnp.zeros_like(scratches[1])
-            else:
-                scratches[0][...] = jnp.concat(
-                    [attention_sink_ref[...]] * cfgs.bq_sz, axis=1
-                )
-                scratches[1][...] = jnp.ones_like(scratches[1])
+            # The sink does not seed m / l (see `calculate_and_store_out`).
+            scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
+            scratches[1][...] = jnp.zeros_like(scratches[1])
 
             q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
 
@@ -1005,6 +1181,7 @@ def rpa_kernel(
                         kv_new_lens_ref=kv_new_lens_ref,
                         extra_refs=extra_refs,
                         attention_sink_ref=attention_sink_ref,
+                        lse_stage_ref=lse_stage,
                         cfgs=cfgs,
                         scheduler=scheduler,
                         start_next_fetch=start_next_fetch,
@@ -1092,7 +1269,5 @@ def rpa_kernel(
         new_kv_hbm,
         kv_cache_hbm,
         lse_hbm if return_lse else None,
-        None
-        if attention_sink_hbm is None
-        else attention_sink_hbm.astype(cfgs.serve.dtype_out),
+        attention_sink_hbm,
     )

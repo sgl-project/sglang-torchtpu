@@ -62,9 +62,15 @@ class BaseScheduler:
         q_lens: jax.Array,
         page_size: int = 1,
         extra_scalars: Sequence[jax.Array] = (),
+        kv_lens_global: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Returns `(kv_cache_lens, kv_new_lens, q_offsets)` for the kernels."""
-        del page_size, extra_scalars
+        """Returns `(kv_cache_lens, kv_new_lens, q_offsets)` for the kernels.
+
+        `kv_lens_global` is each sequence's global KV length under context
+        parallelism (host side only; schedulers that need it in the kernels fold
+        it into the lengths they return).
+        """
+        del page_size, extra_scalars, kv_lens_global
         kv_cache_lens = kv_lens - q_lens
         return kv_cache_lens, q_lens, kv_cache_lens
 
@@ -231,6 +237,9 @@ class BaseScheduler:
         # that attends to it.
         q_wb = jnp.maximum(0, (kv_len_start - kv_cache_len)) // cfgs.bq_sz
         do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
+        if cfgs.serve.skip_kv_write:
+            # The new keys are still fetched and attended; only the write is off.
+            do_writeback = 0
         schedule_ref.do_writeback[step, target_lane] = do_writeback
         src_hbm = q_end - kv_left_frm_new
 
@@ -313,6 +322,35 @@ class BaseScheduler:
             cfgs=cfgs,
         )
 
+    def get_k_range(
+        self,
+        *,
+        q_idx,
+        q_len,
+        q_sz_task,
+        q_offset,
+        kv_cache_len,
+        num_k,
+        cfgs: configs.RpaConfigs,
+        extra_refs: Sequence[jax.Ref] = (),
+    ):
+        """Returns `(start_k_idx, end_k_idx)`, the KV blocks query block `q_idx`
+        attends: from the sliding window's first block to the causal bound."""
+        del q_len, extra_refs
+        start_k_idx = 0
+        if (sliding_window := cfgs.model.sliding_window) is not None:
+            sw_start_idx = q_offset + q_idx * cfgs.bq_sz - sliding_window + 1
+            start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
+
+        end_k_idx_causal = (
+            q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
+        ) // cfgs.bkv_sz + 1
+        end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
+
+        if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
+            start_k_idx = jnp.maximum(start_k_idx, kv_cache_len // cfgs.bkv_sz)
+        return start_k_idx, end_k_idx
+
     @jax.named_scope("q_loop")
     def q_loop(
         self,
@@ -337,18 +375,16 @@ class BaseScheduler:
         q_src = q_start + q_idx * cfgs.bq_sz
         q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
 
-        start_k_idx = 0
-        if (sliding_window := cfgs.model.sliding_window) is not None:
-            sw_start_idx = q_offset + q_idx * cfgs.bq_sz - sliding_window + 1
-            start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
-
-        end_k_idx_causal = (
-            q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
-        ) // cfgs.bkv_sz + 1
-        end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
-
-        if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
-            start_k_idx = jnp.maximum(start_k_idx, kv_cache_len // cfgs.bkv_sz)
+        start_k_idx, end_k_idx = self.get_k_range(
+            q_idx=q_idx,
+            q_len=q_end - q_start,
+            q_sz_task=q_sz_task,
+            q_offset=q_offset,
+            kv_cache_len=kv_cache_len,
+            num_k=num_k,
+            cfgs=cfgs,
+            extra_refs=extra_refs,
+        )
 
         def k_loop_fn(k_idx, c: schedule.LoopCarry) -> schedule.LoopCarry:
             return self.k_loop(
@@ -456,6 +492,60 @@ class BaseScheduler:
 
         init_carry = schedule.LoopCarry(0, 0)
         return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop_fn, init_carry)
+
+
+@dataclasses.dataclass(frozen=True)
+class CacheOnlyScheduler(BaseScheduler):
+    """Reads all `kv_lens` keys of every sequence from the cache (SGLang).
+
+    The queries follow every key, so there is no causal bound, and `kv_lens`
+    may be 0 or below the query length. One KV block always runs, so a query
+    block with no key in range still writes output 0 and LSE -inf.
+    """
+
+    scope: ClassVar[configs.AttentionScope] = configs.AttentionScope.CACHE_ONLY
+
+    def get_kv_lens(
+        self,
+        kv_lens: jax.Array,
+        q_lens: jax.Array,
+        page_size: int = 1,
+        extra_scalars: Sequence[jax.Array] = (),
+        kv_lens_global: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        del page_size, extra_scalars, kv_lens_global
+        return kv_lens, jnp.zeros_like(q_lens), kv_lens
+
+    def get_k_range(
+        self,
+        *,
+        q_idx,
+        q_len,
+        q_sz_task,
+        q_offset,
+        kv_cache_len,
+        num_k,
+        cfgs: configs.RpaConfigs,
+        extra_refs: Sequence[jax.Ref] = (),
+    ):
+        del q_len, q_sz_task, kv_cache_len, extra_refs
+        start_k_idx = 0
+        if (sliding_window := cfgs.model.sliding_window) is not None:
+            sw_start_idx = q_offset + q_idx * cfgs.bq_sz - sliding_window + 1
+            start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
+        return start_k_idx, jnp.maximum(num_k, start_k_idx + 1)
+
+
+@dataclasses.dataclass(frozen=True)
+class NewTokensOnlyScheduler(BaseScheduler):
+    """Attends only the new tokens of every sequence and writes them back.
+
+    `kv_lens` is the full length; the cached keys of the first new token's
+    block are still fetched (and masked out), so that the block is laid out as
+    in FULL and its writeback is the same.
+    """
+
+    scope: ClassVar[configs.AttentionScope] = configs.AttentionScope.NEW_TOKENS_ONLY
 
 
 def rpa_metadata_schedule_kernel(

@@ -59,7 +59,9 @@ class StripedCacheScheduler(CPScheduler):
         q_lens: jax.Array,
         page_size: int = 1,
         extra_scalars: Sequence[jax.Array] = (),
+        kv_lens_global: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        del kv_lens_global
         cp_rank = self._get_cp_rank(extra_scalars)
         global_cache_lens = kv_lens - q_lens
         local_cache_lens = utils.cp_local_cache_len(
@@ -166,6 +168,9 @@ class StripedNewTokensScheduler(CPScheduler):
         q_wb = jnp.maximum(0, (kv_len_start - kv_cache_len)) // cfgs.bq_sz
 
         do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
+        if cfgs.serve.skip_kv_write:
+            # The new keys are still fetched and attended; only the write is off.
+            do_writeback = 0
         schedule_ref.do_writeback[step, target_lane] = do_writeback
         src_hbm = q_end - kv_left_frm_new
 
@@ -259,3 +264,155 @@ class StripedNewTokensScheduler(CPScheduler):
             dma_sem,
             cfgs=cfgs,
         )
+
+
+# ---------------------------------------------------------------------------
+# SGLang schedulers for decode context parallelism (DCP).
+#
+# google3's `StripedCacheScheduler` derives a rank's stripe length from the
+# global length and always runs next to a `StripedNewTokensScheduler` launch.
+# SGLang's backend hands the kernel the stripe lengths it already keeps, runs
+# decode as one launch (`StripedDecodeScheduler`), and applies the sliding
+# window in global positions.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class StripedCacheOnlyScheduler(CPScheduler):
+    """Attends this rank's page stripe of the cache; nothing is written.
+
+    `kv_lens` are the lengths of this rank's stripes (local page `j` is global
+    page `j * cp_group_size + cp_rank`) and `kv_lens_global` the global lengths,
+    whose last `q_len` positions are the queries. Every stripe key precedes
+    every query, so there is no causal bound; the kernels get the first query's
+    global position as `q_offsets` and mask the sliding window in global
+    positions. One KV block always runs, so a query block with no key in range
+    (an empty stripe, or a window that starts past it) still writes output 0
+    and LSE -inf.
+    """
+
+    scope: ClassVar[configs.AttentionScope] = configs.AttentionScope.CACHE_ONLY
+
+    def _new_token_lens(
+        self,
+        kv_lens: jax.Array,
+        q_lens: jax.Array,
+        kv_lens_global: jax.Array,
+        page_size: int,
+        cp_rank: jax.Array,
+    ) -> jax.Array:
+        """Per sequence, how many of the `kv_lens` keys come from keys/values."""
+        del kv_lens, kv_lens_global, page_size, cp_rank
+        return jnp.zeros_like(q_lens)
+
+    def get_kv_lens(
+        self,
+        kv_lens: jax.Array,
+        q_lens: jax.Array,
+        page_size: int = 1,
+        extra_scalars: Sequence[jax.Array] = (),
+        kv_lens_global: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        if kv_lens_global is None:
+            raise ValueError(f"{type(self).__name__} requires `kv_lens_global`.")
+        cp_rank = self._get_cp_rank(extra_scalars)
+        kv_new_lens = self._new_token_lens(
+            kv_lens, q_lens, kv_lens_global, page_size, cp_rank
+        )
+        return kv_lens - kv_new_lens, kv_new_lens, kv_lens_global - q_lens
+
+    def get_k_range(
+        self,
+        *,
+        q_idx,
+        q_len,
+        q_sz_task,
+        q_offset,
+        kv_cache_len,
+        num_k,
+        cfgs: configs.RpaConfigs,
+        extra_refs: Sequence[jax.Ref] = (),
+    ):
+        del q_len, q_sz_task, kv_cache_len
+        start_k_idx = 0
+        if (sliding_window := cfgs.model.sliding_window) is not None:
+            # First local key inside the window of the block's first query,
+            # whose global position is `q_offset + q_idx * bq_sz`. The first
+            # local page at or after the window's first global page p0 is
+            # ceil((p0 - cp_rank) / cp_group_size); keys of that page before
+            # the window are masked by the kernel.
+            cp_rank = self._get_cp_rank(extra_refs)
+            first_global = jnp.maximum(
+                q_offset + q_idx * cfgs.bq_sz - sliding_window + 1, 0
+            )
+            first_page = first_global >> cfgs.serve.page_size_log2
+            first_local_page = (
+                jnp.maximum(first_page - cp_rank + self.cp_group_size - 1, 0)
+                // self.cp_group_size
+            )
+            start_k_idx = (first_local_page << cfgs.serve.page_size_log2) // cfgs.bkv_sz
+        return start_k_idx, jnp.maximum(num_k, start_k_idx + 1)
+
+
+@dataclasses.dataclass(frozen=True)
+class StripedDecodeScheduler(StripedCacheOnlyScheduler):
+    """DCP decode in one launch (`AttentionScope.STRIPED`).
+
+    Attends this rank's stripe and, on the rank that owns the page of a
+    single-token row's new token (global position `kv_lens_global - 1`), also
+    that token: `kv_lens` then counts it, it is fetched from keys/values,
+    stitched at the end of the stripe -- exactly its slot, since the owner's
+    stripe ends on that page -- and written back from there. Multi-token rows
+    attend their stripe only; their tokens are the chunk pass's
+    (`StripedChunkScheduler`).
+    """
+
+    scope: ClassVar[configs.AttentionScope] = configs.AttentionScope.STRIPED
+
+    def _new_token_lens(
+        self,
+        kv_lens: jax.Array,
+        q_lens: jax.Array,
+        kv_lens_global: jax.Array,
+        page_size: int,
+        cp_rank: jax.Array,
+    ) -> jax.Array:
+        owns_token = (
+            (kv_lens_global > 0)
+            & (q_lens == 1)
+            & (((kv_lens_global - 1) // page_size) % self.cp_group_size == cp_rank)
+        )
+        return (owns_token & (kv_lens > 0)).astype(q_lens.dtype)
+
+
+@dataclasses.dataclass(frozen=True)
+class StripedChunkScheduler(StripedNewTokensScheduler):
+    """DCP chunk pass: `StripedNewTokensScheduler` minus the single-token rows.
+
+    A single-token row is the STRIPED launch's (attended and written there),
+    so it is left unprocessed here: output untouched, LSE -inf.
+    """
+
+    def get_k_range(
+        self,
+        *,
+        q_idx,
+        q_len,
+        q_sz_task,
+        q_offset,
+        kv_cache_len,
+        num_k,
+        cfgs: configs.RpaConfigs,
+        extra_refs: Sequence[jax.Ref] = (),
+    ):
+        start_k_idx, end_k_idx = super().get_k_range(
+            q_idx=q_idx,
+            q_len=q_len,
+            q_sz_task=q_sz_task,
+            q_offset=q_offset,
+            kv_cache_len=kv_cache_len,
+            num_k=num_k,
+            cfgs=cfgs,
+            extra_refs=extra_refs,
+        )
+        return start_k_idx, jnp.where(q_len == 1, start_k_idx, end_k_idx)

@@ -32,6 +32,9 @@ class BlockSizes:
       bq_c_sz: Query chunk block size for prefill.
       bkv_sz: Key/Value block size.
       batch_size: Batch size.
+
+    The number of pipeline buffers is not tunable: every kernel uses
+    ``NUM_INPUT_SLOTS`` input and ``NUM_OUTPUT_SLOTS`` output slots.
     """
 
     bq_sz: int
@@ -61,6 +64,7 @@ class ModelConfigs:
     sm_scale: float = 1.0
     soft_cap: float | None = None
     sliding_window: int | None = None
+    has_attention_sink: bool = False
 
     @property
     def num_q_heads_per_kv_head(self) -> int:
@@ -71,13 +75,47 @@ class AttentionScope(enum.StrEnum):
     """Which KV positions to attend to.
 
     FULL:            attend all positions (default).
-    CACHE_ONLY:      attend only cached tokens, skip new tokens.
-    NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens.
+    CACHE_ONLY:      attend only cached tokens, skip new tokens. Every one of
+                     the ``kv_lens`` keys is read from the cache and precedes
+                     every query, so there is no causal bound; a row with no
+                     key in range gets output 0 and LSE -inf.
+    NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens. The KV index
+                     space is the sequence's global positions (``kv_lens`` is
+                     the full length, the last ``q_len`` of it new), the cached
+                     keys are masked out, and the new tokens are written back
+                     as in FULL. With ``cp_group_size`` the cache is
+                     page-striped, so the write of each new token goes to its
+                     owner rank's stripe slot (``page // cp`` on rank
+                     ``page % cp``) and only the owner issues it; a
+                     single-token row is left unprocessed (output untouched,
+                     LSE -inf), its token being the STRIPED launch's to attend
+                     and write.
+    STRIPED:         decode under decode context parallelism in one launch:
+                     attend this rank's page stripe of the cache plus the
+                     sequence's new token when this rank owns its page. The
+                     scheduler passes the kernel ``kv_new_lens`` of 1 on the
+                     owner and 0 elsewhere; the new token is stitched and
+                     written at the end of the stripe, which is exactly its
+                     slot because the owner's stripe ends on that page.
+                     Single-token rows only attend a new token; a multi-token
+                     row attends its stripe alone. The mask attends every key
+                     of the stripe, so no causal offset is needed.
     """
 
     FULL = enum.auto()
     CACHE_ONLY = enum.auto()
     NEW_TOKENS_ONLY = enum.auto()
+    STRIPED = enum.auto()
+
+    @property
+    def walks_cache_stripe(self) -> bool:
+        """Whether every key of the call precedes every query (no causal bound)."""
+        return self in (AttentionScope.CACHE_ONLY, AttentionScope.STRIPED)
+
+    @property
+    def skips_cached_keys(self) -> bool:
+        """Whether cached keys are masked out."""
+        return self == AttentionScope.NEW_TOKENS_ONLY
 
 
 class KVLayout(enum.StrEnum):
@@ -104,8 +142,19 @@ def num_lane_folds_in_head_dim(
     dtype_kv: jnp.dtype,
     kv_layout: KVLayout,
     num_lanes: int,
+    enabled: bool = False,
 ) -> int:
-    """Number of lane folds of a K/V head when head_dim is on the lane dim."""
+    """Number of lane folds of a K/V head when head_dim is on the lane dim.
+
+    Folding (google3 cl/1018717699) stores an fp8 HEAD_ALONG_SUBLANE head wider
+    than a lane tile as several 128-lane chunks instead of one padded row. It
+    changes the cache layout, and SGLang's token-major pool is shared with code
+    that assumes the unfolded rows (the rpa_v3 kernel, the context-parallel KV
+    write, DFlash, the fused rope write, KV transfer and HiCache), so it is off
+    unless ``enabled`` (``ServingConfigs.lane_fold_kv_head_dim``).
+    """
+    if not enabled:
+        return 1
     if kv_layout != KVLayout.HEAD_ALONG_SUBLANE or dtype_kv == jnp.uint8:
         return 1
     if utils.get_dtype_packing(dtype_kv) < 4:
@@ -124,6 +173,14 @@ class RpaCase(enum.StrEnum):
       Batched RPA folds PREFILL into MIXED, but the enum value is kept because
       distribution still has three entries and RPA v3 / MLA use it.
     - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
+
+    A batch lists its MIXED sequences first, then PREFILL, then DECODE, and
+    ``distribution`` holds the cumulative counts in that order:
+    ``[n_mixed, n_mixed + n_prefill, total]``. This is the order SGLang's
+    scheduler produces (prefill chunks first, running decode rows appended
+    after them), so a mixed batch needs no permutation of its rows. google3
+    lists DECODE first; ``RpaConfigs.seq_range`` is the one place the kernels
+    read ``distribution``.
     """
 
     DECODE = enum.auto()
@@ -145,11 +202,11 @@ class RpaCase(enum.StrEnum):
     ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
         assert distribution.shape == (3,)
         match self:
-            case RpaCase.DECODE:
+            case RpaCase.MIXED:
                 return 0, distribution[0]
             case RpaCase.PREFILL:
                 return distribution[0], distribution[1]
-            case RpaCase.MIXED:
+            case RpaCase.DECODE:
                 return distribution[1], distribution[2]
 
 
@@ -190,6 +247,17 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     quantize_p: bool = False
+    # SGLang additions; see `wrapper.ragged_paged_attention`.
+    cache_only: bool = False
+    skip_kv_write: bool = False
+    # Lane-folded fp8 HEAD_ALONG_SUBLANE cache; see `num_lane_folds_in_head_dim`.
+    lane_fold_kv_head_dim: bool = False
+
+    def __post_init__(self):
+        if self.cache_only and self.attention_scope == AttentionScope.FULL:
+            object.__setattr__(self, "attention_scope", AttentionScope.CACHE_ONLY)
+        elif self.attention_scope == AttentionScope.CACHE_ONLY and not self.cache_only:
+            object.__setattr__(self, "cache_only", True)
 
     @property
     def matmuls_are_8bit(self) -> bool:
@@ -330,12 +398,13 @@ class RpaConfigs:
         """Sequences this kernel call schedules.
 
         Batched RPA has no specialised prefill-only path, so MIXED also covers the
-        prefill-only segment [distribution[0], distribution[1]).
+        prefill-only segment [distribution[0], distribution[1]). The batch order
+        is SGLang's (see ``RpaCase``): MIXED and PREFILL rows first, DECODE last.
         """
         if self.mode == RpaCase.DECODE:
-            return 0, distribution[0]
+            return distribution[1], distribution[2]
         if self.mode == RpaCase.MIXED:
-            return distribution[0], distribution[2]
+            return 0, distribution[1]
         raise ValueError(f"Batched RPA does not dispatch {self.mode}; use MIXED.")
 
     # Define derived values.
@@ -427,6 +496,7 @@ class RpaConfigs:
             self.serve.dtype_kv,
             self.serve.kv_layout,
             pltpu.get_tpu_info().num_lanes,
+            enabled=self.serve.lane_fold_kv_head_dim,
         )
 
     @property
@@ -599,8 +669,10 @@ class RpaConfigs:
         if (
             self.serve.kv_layout == KVLayout.HEAD_ALONG_SUBLANE
             and self.serve.cp_group_size is not None
-            and self.serve.attention_scope != AttentionScope.CACHE_ONLY
+            and self.serve.attention_scope == AttentionScope.NEW_TOKENS_ONLY
         ):
+            # HeadAlongSublaneDmaNewCP; the stripe walks (CACHE_ONLY, STRIPED)
+            # use the plain struct.
             return 5
         return 4
 
@@ -615,16 +687,28 @@ class RpaConfigs:
 
     @property
     def lse_vmem_shape(self):
+        # One f32 row of lanes per (KV head, token); lane g is aligned q head g.
+        # The unit axis keeps tokens on an untiled axis, so a q block can be
+        # copied out at any token offset.
         num_lanes = pltpu.get_tpu_info().num_lanes
-        q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
         return (
             self.block.batch_size,
             self.model.num_kv_heads,
             self.block.bq_sz,
-            q_per_kv_packing,
-            self.serve.packing_q,
+            1,
             num_lanes,
         )
+
+    @property
+    def lse_stage_shape(self):
+        # One KV head's (token, aligned q head) rows of `lm_scratch_shape`.
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return (self.block.bq_sz * self.aligned_num_q_heads_per_kv_head, num_lanes)
+
+    @property
+    def lse_bytes_per_token(self) -> int:
+        """Bytes of LSE output per token: an f32 row of lanes per KV head."""
+        return self.model.num_kv_heads * pltpu.get_tpu_info().num_lanes * 4
 
     @property
     def acc_scratch_shape(self):
@@ -650,6 +734,8 @@ class RpaConfigs:
         cu_q_lens: jax.Array,
         distribution: jax.Array,
         attention_sink: jax.Array | None = None,
+        cp_rank: jax.Array | None = None,
+        kv_lens_global: jax.Array | None = None,
     ):
         """Validate inputs to the RPA kernel statically."""
 
@@ -703,6 +789,12 @@ class RpaConfigs:
                 f"Expected {kv_cache.shape=} to be equal to {expected_kv_cache_shape=}"
             )
 
+        if not (kv_cache.dtype == k.dtype == v.dtype):
+            raise ValueError(
+                "Expected KV cache dtype and K/V dtype to be the same, but got"
+                f" {kv_cache.dtype=}, {k.dtype=}, and {v.dtype=}"
+            )
+
         # If we are using per-token quantization, we expect the kv-cache scale to be
         # in VMEM, and so it will not be in the configs.
         if self.serve.per_token_scale:
@@ -753,29 +845,57 @@ class RpaConfigs:
                     f"Expected {attention_sink.shape=} to be"
                     f" ({self.model.num_q_heads},)."
                 )
-            if attention_sink.dtype != jnp.float32:
-                raise ValueError(
-                    f"Expected {attention_sink.dtype=} to be equal to {jnp.float32=}."
-                )
+        if self.bkv_p_cache and self.block.bkv_sz % self.serve.page_size:
+            # Block k's cached pages start at k * cdiv(bkv_sz, page_size).
+            raise ValueError(
+                f"Expected {self.block.bkv_sz=} to be a multiple of"
+                f" {self.serve.page_size=} when the kernel reads cached pages."
+            )
 
-        # Context Parallel Support
-        if self.serve.cp_group_size is not None:
-            if attention_sink is not None:
-                raise ValueError("Context Parallel does not support attention sink")
-            if self.serve.attention_scope == AttentionScope.FULL:
-                raise ValueError(
-                    "Context Parallel does not support AttentionScope.FULL"
-                    " where cache is sharded but current tokens is sequential"
-                )
-            if self.model.sliding_window is not None:
-                raise ValueError(
-                    "Context Parallel does not support sliding window right now"
-                )
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        if self.serve.return_lse and self.aligned_num_q_heads_per_kv_head > num_lanes:
+            raise ValueError(
+                f"return_lse packs {self.aligned_num_q_heads_per_kv_head=} q heads"
+                f" into {num_lanes} lanes."
+            )
 
-        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            bkv_sz = self.block.bkv_sz
-            page_size = self.serve.page_size
-            if bkv_sz % page_size != 0:
-                raise NotImplementedError(
-                    f"SEQ_ALONG_LANE expects {bkv_sz=} to be aligned to {page_size=}."
-                )
+        # Context Parallel Support. Unlike google3, the sliding window (in global
+        # positions) and the attention sink are supported here.
+        validate_cp_inputs(self.serve, kv_lens, cp_rank, kv_lens_global)
+
+
+def validate_cp_inputs(
+    serve: ServingConfigs,
+    kv_lens: jax.Array,
+    cp_rank: jax.Array | None,
+    kv_lens_global: jax.Array | None,
+):
+    """Validate the context-parallel arguments of a kernel call statically."""
+    if serve.cp_group_size is not None:
+        if serve.cp_group_size < 1:
+            raise ValueError(f"Expected {serve.cp_group_size=} >= 1.")
+        if serve.attention_scope == AttentionScope.FULL:
+            raise ValueError(
+                "Context Parallel does not support AttentionScope.FULL"
+                " where cache is sharded."
+            )
+        if cp_rank is None or kv_lens_global is None:
+            raise ValueError("cp_group_size requires cp_rank and kv_lens_global.")
+        if cp_rank.shape != (1,) or cp_rank.dtype != jnp.int32:
+            raise ValueError(f"Expected int32 {cp_rank.shape=} to be (1,).")
+        if kv_lens_global.shape != kv_lens.shape or (kv_lens_global.dtype != jnp.int32):
+            raise ValueError(
+                f"Expected int32 {kv_lens_global.shape=} to be {kv_lens.shape}."
+            )
+    elif serve.attention_scope == AttentionScope.STRIPED:
+        raise ValueError("AttentionScope.STRIPED requires cp_group_size.")
+    elif cp_rank is not None or kv_lens_global is not None:
+        raise ValueError("cp_rank and kv_lens_global require cp_group_size.")
+
+    if serve.attention_scope == AttentionScope.STRIPED:
+        if serve.decode_query_size != 1:
+            raise ValueError(
+                "AttentionScope.STRIPED requires decode_query_size == 1, got"
+                f" {serve.decode_query_size=}; use the CACHE_ONLY +"
+                " NEW_TOKENS_ONLY pair for multi-token decode."
+            )

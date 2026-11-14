@@ -31,8 +31,14 @@ def flash_attention_qk_softmax(
     bq_start: int,
     k_scale: jax.Array | float | None = None,  # [B, KV, S]
     attention_sink: jax.Array | None = None,  # [KV, TQ, 128]
+    zero_masked: bool = False,
 ):
-    """Flash attention kernel."""
+    """Flash attention kernel.
+
+    `zero_masked` zeroes p on the masked keys, so that a row with no key in
+    range keeps l == 0 instead of weighting masked keys by
+    exp(mask_value - mask_value); the scopes whose rows can be empty set it.
+    """
     b, k_heads, tq, h_size = q.shape
 
     if cfgs.serve.scale_q is not None:
@@ -97,6 +103,8 @@ def flash_attention_qk_softmax(
 
     m_next = jnp.stack(m_next_list, axis=0)
     p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
+    if zero_masked:
+        p = jnp.where(jnp.stack(custom_mask, axis=0), p, 0)
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []
