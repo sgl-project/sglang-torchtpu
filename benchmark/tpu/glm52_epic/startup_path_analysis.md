@@ -108,6 +108,51 @@ excluded them from stdout; it now mirrors both to durable logs to distinguish
 anon/file/shmem and host MemAvailable after a kill. Historical cause of exit137
 remains unknown.
 
+## Lowering boundary traced through the actual bridge
+
+`attention_pallas_mla_sparse.py:116-178` wraps the JAX step with
+`torch_tpu._internal.pallas.custom_jax_kernel`, donates both cache inputs and
+aliases outputs 1/2. The plain-DSA q-block op calls
+`sparse_mla_prefill_fused_tokens`; its fallback transposes queries to token-major
+and calls the same per-query fused function (fused source lines 338-353).
+
+In the default tensorcore cache layout the per-query attention reaches
+`mla_sparse/kernel.py:1334-1346`, which calls `dsa_gather.dsa_gather` and then
+runs MLA on gathered rows. That gather builds a SparseCore `pl.kernel` with
+`VectorSubcoreMesh`, `use_tc_tiling_on_sc=True`, and
+`needs_layout_passes=True` (`dsa_gather.py:361-396`). This is a concrete
+SC/layout compilation boundary to isolate for the archived vmreg/vreg-to-U64
+fatal; it is not evidence identifying which operation actually crashed.
+The q-block path bypasses this gather for attention, but still performs cache
+writes and `select_bits`, and does not change decode's per-query gather.
+
+The default per-query gather chunk is 64 tokens. The main attention loop is a
+Python `for` over ceil(T/64) (`kernel.py:898-922`), so T=2048 emits 32 chunk
+bodies per layer, versus one for a tiny decode. This is a source-level reason
+to compare compile time/memory across shapes, not proof that it caused exit137.
+The 64-head q-block VMEM concern is a separate candidate risk and cannot explain
+the earlier run before q-block was enabled.
+
+## Prepared standalone gather reproduction
+
+`repro_sparse_gather.py` isolates the existing SC gather without checkpoint
+loading. It checks JAX/JAXLIB 0.11.2 and libtpu 0.0.50 before importing JAX,
+requires TPU/SparseCore, emits lower/compile/execute markers, and checks raw
+bytes against NumPy indexing. Use a fresh process per case:
+
+```sh
+python -m benchmark.tpu.glm52_epic.repro_sparse_gather --queries 1 --compile-only
+python -m benchmark.tpu.glm52_epic.repro_sparse_gather --queries 1
+python -m benchmark.tpu.glm52_epic.repro_sparse_gather --queries 64
+python -m benchmark.tpu.glm52_epic.repro_sparse_gather --queries 4 --live-queries 1
+```
+
+Repeat page64 versus page128 only when the first case yields useful evidence.
+Local CLI, invalid-argument and runtime-mismatch checks passed; independent
+source review found no actionable shape/oracle defect. Hardware execution is
+still unverified. Passing this raw-JAX reproduction would not validate the
+TorchTPU bridge or serving baseline.
+
 ## Next diagnostic boundary
 
 Before another full-checkpoint run, isolate sparse MLA at the kernel interface:
