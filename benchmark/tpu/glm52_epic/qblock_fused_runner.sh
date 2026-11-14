@@ -37,16 +37,24 @@ case "$prefix" in
   49152) [[ "$entry" == prefill-long-table ]] ;;
   *) echo 'Unsupported sparse prefix' >&2; exit 2 ;;
 esac
+requests="${GLM52_SPARSE_REQUESTS:-1}"
+case "$requests" in
+  1) ;;
+  2) [[ "$entry" == prefill-long-table && "$prefix" == 49152 && "${GLM52_QBLOCK_FUSED_SUITE:-standard}" == prefix ]] ;;
+  *) echo 'Unsupported request count' >&2; exit 2 ;;
+esac
 for selection in "${selections[@]}"; do
   timeout --signal=TERM --kill-after=15s 400s python -m benchmark.tpu.glm52_epic.repro_sparse_step \
-    --queries 2048 --entry "$entry" --prefix-tokens "$prefix" --selection "$selection" "${compile_args[@]}" 2>&1 | tee "$OUT/$selection.log"
-  python - "$OUT/$selection.log" "$selection" "${GLM52_QBLOCK_COMPILE_MODE:-eager}" "$entry" "$prefix" <<'PY'
+    --queries 2048 --entry "$entry" --prefix-tokens "$prefix" --requests "$requests" --selection "$selection" "${compile_args[@]}" 2>&1 | tee "$OUT/$selection.log"
+  python - "$OUT/$selection.log" "$selection" "${GLM52_QBLOCK_COMPILE_MODE:-eager}" "$entry" "$prefix" "$requests" <<'PY'
 from pathlib import Path
 import sys
 lines = Path(sys.argv[1]).read_text().splitlines()
+requests = int(sys.argv[6])
+assert lines.count(f'SPARSE_REQUESTS count={requests} queries_per_request={2048 // requests}') == 1
 if sys.argv[4] == 'prefill-long-table':
     prefix = int(sys.argv[5])
-    metadata = (f'SPARSE_METADATA pages_per_seq=481 live_kv={prefix + 2048} '
+    metadata = (f'SPARSE_METADATA pages_per_seq=481 live_kv={prefix + 2048 // requests} '
                 f'prefix={prefix} expected_prefill_path=per-query')
     assert lines.count(metadata) == 1
 if sys.argv[3] == 'dynamo':
