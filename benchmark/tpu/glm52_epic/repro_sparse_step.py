@@ -13,7 +13,7 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--queries', type=int, choices=(1, 4, 64, 2048), default=1)
-    parser.add_argument('--selection', choices=('self', 'causal-mean', 'rope-pair'), default='self',
+    parser.add_argument('--selection', choices=('self', 'causal-mean', 'rope-pair', 'prefix-pair'), default='self',
                         help='Single key, or causal keys with zero queries and uniform weights.')
     parser.add_argument('--entry', choices=('per-query', 'prefill-fallback', 'prefill-qblock', 'prefill-long-table'), default='per-query',
                         help='Token-major, small prefill fallback,2048-token qblock, or481-page static-table fallback.')
@@ -24,6 +24,8 @@ def main():
     args = parser.parse_args()
     if args.prefix_tokens and args.entry != 'prefill-long-table':
         parser.error('nonzero prefix requires prefill-long-table')
+    if args.selection == 'prefix-pair' and args.prefix_tokens != 49152:
+        parser.error('prefix-pair requires long-table prefix49152')
     large_prefill = args.entry in ('prefill-qblock', 'prefill-long-table')
     if large_prefill != (args.queries == 2048):
         parser.error('qblock/long-table entries require queries2048; other entries retain small probes')
@@ -74,6 +76,10 @@ def main():
     # Preserve padding -1 while moving selected keys across page-gather chunk
     # boundaries (prefix49152/page128 = logical page384, fourth128-page chunk).
     topk = np.where(topk >= 0, topk + args.prefix_tokens, topk)
+    if args.selection == 'prefix-pair':
+        topk[:] = -1
+        topk[:, 0] = 0
+        topk[:, 1] = args.prefix_tokens + np.arange(t)
     live_kv = args.prefix_tokens + t
     head_major = args.entry == 'prefill-fallback' or large_prefill
     distribution = [1, 1, 1] if t == 1 and not head_major else [0, 0, 1]
@@ -84,6 +90,18 @@ def main():
     metadata = [upload(np.array(a, np.int32)) for a in (
         [live_kv], pages, [0, t], [0, live_kv if large_prefill else p], distribution)]
     topk_tensor = upload(topk)
+    prefix_nope = prefix_rope = None
+    if args.selection == 'prefix-pair':
+        # Seed whole donated allocations once. Logical position0 maps to page1.
+        # Fixed prefix values deliberately differ from both signed new writes.
+        prefix_nope = torch.full((512,), 0.25).to(torch.float8_e4m3fn).view(torch.uint8).numpy()
+        prefix_rope = torch.full((64,), -0.5).to(torch.float8_e4m3fn).view(torch.uint8).numpy()
+        seed_n = np.zeros((num_pages * p, 512), np.uint8)
+        seed_r = np.zeros((num_pages * p, 128), np.uint8)
+        seed_n[p] = prefix_nope
+        seed_r[p, :64] = prefix_rope
+        cn = upload(seed_n.reshape(num_pages, p, 4, 128))
+        cr = upload(seed_r.reshape(num_pages, p // 4, 4, 128))
     if head_major:
         q = q.transpose(0, 1).contiguous()
         qr = qr.transpose(0, 1).contiguous()
@@ -112,7 +130,9 @@ def main():
             actual_cn = cn.cpu().numpy()
             actual_cr = cr.cpu().numpy()
         expected_rows = values
-        if args.selection == 'causal-mean':
+        if args.selection == 'prefix-pair':
+            expected_rows = (values + 0.25) / 2
+        elif args.selection == 'causal-mean':
             expected_rows = values.cumsum(axis=0) / np.arange(1, t + 1)[:, None]
         elif args.selection == 'rope-pair':
             # NoPE query=0, RoPE query=1 over64 lanes, scale1/16. All
@@ -127,6 +147,9 @@ def main():
         np.testing.assert_allclose(actual, expected, rtol=0, atol=1 / 128)
         expected_cn = np.zeros((num_pages * p, 512), np.uint8)
         expected_cr = np.zeros((num_pages * p, 128), np.uint8)
+        if prefix_nope is not None:
+            expected_cn[p] = prefix_nope
+            expected_cr[p, :64] = prefix_rope
         write_start = p + args.prefix_tokens
         expected_cn[write_start:write_start + t] = vn_cpu.view(torch.uint8).numpy()
         expected_cr[write_start:write_start + t, :64] = vr_cpu.view(torch.uint8).numpy()

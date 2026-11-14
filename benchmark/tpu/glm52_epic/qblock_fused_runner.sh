@@ -23,6 +23,7 @@ selections=(self causal-mean)
 case "${GLM52_QBLOCK_FUSED_SUITE:-standard}" in
   standard) ;;
   rope) selections=(rope-pair) ;;
+  prefix) selections=(prefix-pair) ;;
   *) echo 'Unsupported fused suite' >&2; exit 2 ;;
 esac
 entry="${GLM52_SPARSE_PREFILL_ENTRY:-prefill-qblock}"
