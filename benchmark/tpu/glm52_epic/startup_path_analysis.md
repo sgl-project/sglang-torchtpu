@@ -69,6 +69,17 @@ snapshots, each observer retained 12–13 launcher descendants, with largest
 surviving scheduler RSS ~6.9–7.0 GiB and HWM ~9 GiB. Host MemAvailable was
 ~857–861 GiB. This is positive process evidence, but neither a compiler
 peak nor evidence excluding a future ancestor-cgroup/system OOM.
+
+Live native rank-1 `server_args` was parsed independently: compile is enabled,
+`torch_compile_max_bs=1`, `tpu_compile_bs=[1]`, `tpu_compile_tokens=[2048]`,
+TP/attentionDP=16. Effective local `chunked_prefill_size=256` (requested
+4096 across attentionDP16); do not confuse this with historical EXTEND bs32
+or its six decode buckets. At 14:37:00Z, rank-1 current=351.47 GiB,
+file=302.24 GiB, anon=47.67 GiB; largest tracked survivor RSS=7.58 GiB.
+The earlier rank-0 snapshot at 14:33:30Z was current=286.38 GiB,
+file=238.68 GiB, anon=46.30 GiB, largest survivor RSS=6.93 GiB. These
+snapshots are not simultaneous. Both copied native logs still end after
+`Load weight begin` with no completion/compile marker.
 The experiment deadline is 16:01Z; do not interpret its running state as a
 successful baseline until the server log and smoke result are present.
 
