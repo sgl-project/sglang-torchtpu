@@ -1,0 +1,163 @@
+{
+  "experiment": "exp-266i34jcm1",
+  "source_log_sha256": "307e993532cd9e92bc5cc799433350f1b907f18edd4d956e0ef10484637257e2",
+  "source_envelope_sha256": "b093fc463d0f476f27defe9e9a20529d1dae54e524d59ec06d64e6dc7df3a4b8",
+  "measured_completion_events": 12,
+  "measured_request_dp_mapping": {
+    "0": [
+      0
+    ],
+    "1": [
+      1
+    ],
+    "2": [
+      2
+    ],
+    "3": [
+      3
+    ],
+    "4": [
+      4
+    ],
+    "5": [
+      5
+    ],
+    "6": [
+      6
+    ],
+    "7": [
+      7
+    ],
+    "8": [
+      8
+    ],
+    "9": [
+      9
+    ],
+    "10": [
+      10
+    ],
+    "11": [
+      11
+    ],
+    "12": [
+      12
+    ],
+    "13": [
+      13
+    ],
+    "14": [
+      14
+    ],
+    "15": [
+      15
+    ],
+    "16": [
+      0
+    ],
+    "17": [
+      1
+    ],
+    "18": [
+      2
+    ],
+    "19": [
+      3
+    ],
+    "20": [
+      4
+    ],
+    "21": [
+      5
+    ],
+    "22": [
+      6
+    ],
+    "23": [
+      7
+    ],
+    "24": [
+      8
+    ],
+    "25": [
+      9
+    ],
+    "26": [
+      10
+    ],
+    "27": [
+      11
+    ],
+    "28": [
+      12
+    ],
+    "29": [
+      13
+    ],
+    "30": [
+      14
+    ],
+    "31": [
+      15
+    ]
+  },
+  "admission_ready": {
+    "expected_request_count": 32,
+    "expected_rids_sha256": "7eac583a1c4d2d622fc247d3752174488634b4bfa20ccc508e9bee83c329a8d6",
+    "ordered_native_batch": true,
+    "poll_count": 2,
+    "queue_ready_s": 0.4482584148645401,
+    "snapshot": {
+      "chunked_rids": [],
+      "complete": true,
+      "engine_paused": [
+        true
+      ],
+      "malformed_states": [],
+      "missing_rids": [],
+      "pending_dp_reqs_sizes": [
+        0
+      ],
+      "running_rids": [],
+      "state_count": 1,
+      "state_unique_rid_counts": [
+        32
+      ],
+      "state_waiting_sizes": [
+        32
+      ],
+      "unexpected_rids": [],
+      "waiting_unique_count": 32
+    }
+  },
+  "server_config": [
+    {
+      "cached_prefixes_per_dp": 2,
+      "capacity_layout": "single_global_scheduler_state",
+      "concurrency": 32,
+      "dp_schedule_policy": "round_robin",
+      "dp_size": 16,
+      "kv_cache_dtype": "fp8_e4m3",
+      "observed_chunked_prefill_size": 2048,
+      "observed_context_length": 135168,
+      "observed_max_prefill_tokens": 32768,
+      "observed_max_running_requests": 32,
+      "page_size": 64,
+      "per_dp_token_capacity_max": 318016,
+      "per_dp_token_capacity_min": 318016,
+      "requests_per_dp": 2,
+      "required_context_tokens": 61456,
+      "required_global_prefill_tokens": 393216,
+      "required_per_dp_chunk_tokens": 24576,
+      "required_per_dp_token_capacity": 123200,
+      "rounded_cached_prefix_tokens": 49216,
+      "warm_suffix_len": 2,
+      "warnings": [
+        "max_prefill_tokens=32768 < required_global_prefill_tokens=393216",
+        "chunked_prefill_size=2048 < required_per_dp_chunk_tokens=24576"
+      ]
+    }
+  ],
+  "interpretation": "Measured mapping index modulo16 observed at completion, and32 unique waiting RIDs observed before scheduler resume. This closes reference-side mapping uncertainty only; Torch equivalent barrier and completion instrumentation remain absent.",
+  "warm_mapping_limit": "Measured prefix49152 is observed in first chunk; this is not a full warm request routing transcript."
+}
