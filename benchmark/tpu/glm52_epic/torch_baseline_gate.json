@@ -1,6 +1,10 @@
 {
-  "status": "EXACT_RUNTIME_VERIFIED_TPU_ADMISSION_PENDING",
-  "reason": "exp-ldtcncqheb SUCCEEDED with exact runtime and nine real loader tests; native eight-chip exp-h1cttjx0ai waits Kueue quota", 
+  "status": "LOCAL_QBLOCK_FIX_VALIDATED_FULL_MODEL_SMOKE_RUNNING",
+  "reason": "Historical admission entry superseded: VMEM failure isolated, selector fixed and both-host default/fused/Dynamo/nonuniform-RoPE gates passed. Full model acceptance remains pending.",
+  "active_experiment": "exp-48q9eb5nxn",
+  "active_source_commit": "99ea485f27de77f820da454fd53ea6cde4123286",
+  "local_gate_experiments": ["exp-n6457yyy41", "exp-m6fhbd2rvo", "exp-x22a112f8z", "exp-xwfxnyiy94", "exp-9d46tguhmn", "exp-x5lwnj2m5x", "exp-8ag4xpzkix"],
+  "unresolved": ["full model EXTEND/decode/request acceptance", "historical eager window/U64 fatal op attribution", "historical exit137 kill source and compiler peak", "matched JAX performance"],
   "required_runtime": "torch_tpu==0.2.1.dev20261028201649",
   "public_probe": {
     "exp_id": "exp-39bjc3ngd8",
@@ -9,7 +13,7 @@
   },
   "private_probe": "earlier Falcon experiment exp-lw6e0evey6 returned HTTP401 then pip EOF",
   "runner": "torch_8chip_runner.sh",
-  "runner_scope": "submitted bounded native startup and one-token smoke, artifact wheel bootstrap and ordered two-host rendezvous; optional later HTTP diagnostic is not JAX-equivalent",
+  "runner_scope": "bounded native startup plus512 input IDs/two output IDs smoke (includes decode); ordered two-host rendezvous; optional HTTP diagnostic is not JAX-equivalent",
   "performance_result": null,
-  "next_action": "follow original exp-h1cttjx0ai admission and startup; after smoke acceptance run prepared frozen-input diagnostic; no private credentials or duplicate accelerator submission"
+  "next_action": "continue existing wait for exp-48q9eb5nxn; correlate native tails and host memory; inspect exact failure before any retry. On full smoke acceptance plan matched frozen-input diagnostic separately; no private source,16chip,DCP,Flash changes or duplicate submission"
 }
