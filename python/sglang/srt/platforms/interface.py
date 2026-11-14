@@ -90,6 +90,10 @@ class SRTPlatform(DeviceMixin):
     # Subsystem factory methods
     # ------------------------------------------------------------------
 
+    def get_scheduler_profiler_manager_cls(self) -> type | None:
+        """Return a platform profiler manager, or None for the shared manager."""
+        return None
+
     def get_default_attention_backend(self) -> str:
         """Return the default attention backend name for this platform."""
         raise NotImplementedError

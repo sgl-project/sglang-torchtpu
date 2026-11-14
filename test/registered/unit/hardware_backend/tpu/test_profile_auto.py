@@ -179,6 +179,13 @@ class TestCompletion(_ProfileAutoTestCase):
     """The marker is the collector's handshake: one per rank, written after
     that rank's last stage is flushed, and never for an API-armed profile."""
 
+    def test_continuous_capture_completes_both_stages(self):
+        mgr = self._capturing_manager()
+        mgr._start_profile(ForwardMode.MIXED)
+        mgr._stop_profile(ForwardMode.MIXED)
+        self.assertIsNone(tpu._pending_stages(mgr))
+        self.assertEqual(_markers(self.tmp), [".xprof-done-TP-0"])
+
     def test_marker_lands_only_after_the_last_stage(self):
         mgr = self._capturing_manager()
 

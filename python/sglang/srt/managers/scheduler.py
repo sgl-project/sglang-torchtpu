@@ -2468,7 +2468,11 @@ class Scheduler(
                 )
 
     def init_profiler(self) -> None:
-        self.profiler_manager = SchedulerProfilerManager(
+        profiler_cls = (
+            current_platform.get_scheduler_profiler_manager_cls()
+            or SchedulerProfilerManager
+        )
+        self.profiler_manager = profiler_cls(
             get_forward_ct=lambda: self.forward_ct,
         )
 
