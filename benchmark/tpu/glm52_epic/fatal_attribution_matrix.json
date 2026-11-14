@@ -1,0 +1,39 @@
+{
+  "status": "UNRESOLVED_NO_ORIGINATING_IR",
+  "historical_signature": ["window_bounds rank mismatch", "vmreg/vreg to U64"],
+  "accepted_baseline": "exp-48q9eb5nxn",
+  "candidate_boundaries": [
+    {
+      "name": "raw_sc_gather",
+      "entry": "repro_sparse_gather.py",
+      "shape_cases": [[1,128],[64,128]],
+      "coverage": "SparseCore gather lowering; no cache donation, full attention, model, or decode",
+      "result": "existing local and archived narrow probes passed; no originating fatal"
+    },
+    {
+      "name": "torch_bridge_sc_gather",
+      "entry": "repro_sparse_gather.py --backend torch",
+      "coverage": "custom_jax_kernel bridge around dsa_gather",
+      "result": "bridge byte-exact probes passed; does not prove full model path"
+    },
+    {
+      "name": "mla_sparse_per_query",
+      "entry": "repro_sparse_step.py entry=per-query",
+      "coverage": "production wrapper plus cache writes; limited synthetic values",
+      "result": "local and bounded hardware probes passed; not a full checkpoint fatal reproduction"
+    },
+    {
+      "name": "result_copy_event",
+      "entry": "scheduler result copy path",
+      "coverage": "fatal-adjacent Event creation/record boundary",
+      "result": "async worker toggle does not remove Event; no proof Event is failing op"
+    }
+  ],
+  "negative_evidence": [
+    "fatal repeats with global compile warmup submitted 0 calls",
+    "request-table host path is observed but synchronous out_cache_loc.cpu is only a boundary",
+    "Python broadcast and allocation stacks are synchronization boundaries, not XLA op attribution"
+  ],
+  "next_required_evidence": "fresh-process native lower/compile marker plus rank-correlated failing IR/op from one candidate; do not change generic broadcast/allocation/Event code without it",
+  "scope": "diagnostic bookkeeping only; no production fix or performance claim"
+}
