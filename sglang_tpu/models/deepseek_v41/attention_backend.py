@@ -21,6 +21,13 @@ with the ring write as a functional update copied back (as the Engram history fi
 Padding tokens (``out_cache_loc == 0`` or past the batch's real tokens) never write
 a cache (record -1) and produce zeros.
 
+Under ``--enable-encoder-swa-bounded-replay`` the pool keeps SWA in a request window
+(``request_window.py``) and core folds each prefix hit's last <=128 cached tokens in
+front of its extend (``encoder_swa_replay.fold_encoder_swa_replay``). Those replay
+rows rebuild the window: they write SWA and attend from the hit's replay start
+(``encoder_swa_row_floor``), but publish no compressed record and touch no pair
+state, since the cache hit already holds both (``encoder_swa_compress_rows``).
+
 Kernels come from ``ops/csa2.py`` and ``ops/indexer.py``; tests replace them
 through ``csa2_ops`` / ``indexer_ops``.
 
@@ -30,13 +37,19 @@ IMPORTANT: Do NOT add ``from __future__ import annotations``; see
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang_tpu.models.deepseek_v41.request_window import (
+    DSV41TPURequestWindow,
+    WindowPlan,
+    decode_window_pages,
+    extend_window_pages,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -134,15 +147,19 @@ class DSV41TPUForwardMetadata:
     token_req_pool: torch.Tensor
     # [T] bool: a real token with a cache slot.
     valid: torch.Tensor
+    # [T] bool: a valid token that compresses (not a folded replay row).
+    compress_valid: torch.Tensor
     # [T] int32 scheduler full_loc; TPU lowering rejects 64-bit integer vectors.
     out_cache_loc: torch.Tensor
     # [B, C] int32 full page ids, C = ceil(context_len / 256); also main KV pages.
     full_pages: torch.Tensor
     # [B, 4C] int32 SWA 64-token page ids; 0 is the null page (evicted or unmapped).
     swa_pages: torch.Tensor
-    # [B] int32 earliest visible SWA position (no replay: 0).
+    # [B] int32 earliest visible SWA position: a folded hit's replay start, else 0.
     swa_minimum: torch.Tensor
     low_ratio: Dict[int, LowRatioMetadata]
+    # Request-window row moves of an extend forward (history in, window out).
+    swa_window_plan: Optional[WindowPlan] = None
 
     # Filled lazily during the forward.
     swa_meta: Optional[torch.Tensor] = None
@@ -223,6 +240,7 @@ def _low_ratio_metadata(
     positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
     valid: torch.Tensor,
+    compress_valid: torch.Tensor,
     full_pages: torch.Tensor,
 ) -> LowRatioMetadata:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -233,7 +251,7 @@ def _low_ratio_metadata(
     seq_lens_casual = positions + 1
     out_loc, _ = _low_ratio_compression_metadata(ratio, seq_lens_casual, out_cache_loc)
     return LowRatioMetadata(
-        out_loc=out_loc.masked_fill(~valid, -1).to(torch.int32),
+        out_loc=out_loc.masked_fill(~compress_valid, -1).to(torch.int32),
         lengths=torch.where(valid, seq_lens_casual // ratio, 0).to(torch.int32),
         index_pages=expand_index_page_table(
             full_pages.to(torch.int32),
@@ -244,11 +262,62 @@ def _low_ratio_metadata(
     )
 
 
+def _fold_masks(
+    forward_batch: ForwardBatch,
+    *,
+    num_tokens: int,
+    query_start_loc: torch.Tensor,
+    valid: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """([B] int64 SWA floor, [T] compress mask) of a folded extend; padding rows,
+    past the folded rows, have floor 0."""
+    bs = query_start_loc.shape[0] - 1
+    row_floor = forward_batch.encoder_swa_row_floor
+    if row_floor is None:
+        return torch.zeros(bs, dtype=torch.int64), valid
+    floor_rows = _as_cpu_int64(row_floor, num_tokens)
+    first_rows = query_start_loc[:-1].clamp(max=max(num_tokens - 1, 0))
+    counts = query_start_loc[1:] - query_start_loc[:-1]
+    floor = torch.where(counts > 0, floor_rows[first_rows], 0)
+    compress = torch.zeros(num_tokens, dtype=torch.bool)
+    keep = forward_batch.encoder_swa_compress_rows.detach().to("cpu", torch.int64)
+    compress[keep] = True
+    return floor, valid & compress
+
+
+def _window_swa_table(
+    *,
+    forward_batch: ForwardBatch,
+    window: DSV41TPURequestWindow,
+    positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    minimum: torch.Tensor,
+    columns: int,
+) -> Tuple[torch.Tensor, Optional[WindowPlan]]:
+    """[B, columns] int64 SWA table of a request-window forward and its row moves."""
+    if not forward_batch.forward_mode.is_extend():
+        return decode_window_pages(req_pool_indices, columns), None
+    counts = query_start_loc[1:] - query_start_loc[:-1]
+    last = max(positions.shape[0] - 1, 0)
+    first = torch.where(counts > 0, positions[query_start_loc[:-1].clamp(max=last)], 0)
+    return extend_window_pages(
+        slots=req_pool_indices,
+        first=first,
+        counts=counts,
+        minimum=minimum,
+        columns=columns,
+        base_page=window.workspace_first_page,
+        capacity_pages=window.workspace_pages,
+    )
+
+
 def build_forward_metadata(
     forward_batch: ForwardBatch,
     *,
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: Optional[torch.Tensor],
+    request_window: Optional[DSV41TPURequestWindow],
     max_context_len: int,
     low_ratios: Sequence[int],
     device: torch.device,
@@ -270,15 +339,35 @@ def build_forward_metadata(
     req_pool_indices = _as_cpu_int64(forward_batch.req_pool_indices, bs)
     token_req_pool = req_pool_indices[token_rows.clamp_min(0)].masked_fill(~valid, 0)
 
+    swa_minimum, compress_valid = _fold_masks(
+        forward_batch,
+        num_tokens=num_tokens,
+        query_start_loc=query_start_loc,
+        valid=valid,
+    )
+
     columns = max(1, -(-int(max_context_len) // FULL_PAGE_TOKENS))
     full_pages = _full_page_table(req_to_token, req_pool_indices, columns)
-    swa_pages = _swa_page_table(full_pages, full_to_swa_index_mapping)
+    window_plan = None
+    if request_window is None:
+        swa_pages = _swa_page_table(full_pages, full_to_swa_index_mapping)
+    else:
+        swa_pages, window_plan = _window_swa_table(
+            forward_batch=forward_batch,
+            window=request_window,
+            positions=positions,
+            query_start_loc=query_start_loc,
+            req_pool_indices=req_pool_indices,
+            minimum=swa_minimum,
+            columns=columns * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS),
+        )
     low_ratio = {
         ratio: _low_ratio_metadata(
             ratio=ratio,
             positions=positions,
             out_cache_loc=out_cache_loc,
             valid=valid,
+            compress_valid=compress_valid,
             full_pages=full_pages,
         )
         for ratio in low_ratios
@@ -293,14 +382,18 @@ def build_forward_metadata(
         token_rows=put(token_rows.to(torch.int32)),
         token_req_pool=put(token_req_pool.to(torch.int32)),
         valid=put(valid),
+        compress_valid=put(compress_valid),
         out_cache_loc=put(out_cache_loc.to(torch.int32)),
         full_pages=put(full_pages.to(torch.int32)),
         swa_pages=put(swa_pages.to(torch.int32)),
-        swa_minimum=put(torch.zeros(bs, dtype=torch.int32)),
+        swa_minimum=put(swa_minimum.to(torch.int32)),
         low_ratio={
             ratio: LowRatioMetadata(*(put(t) for t in meta))
             for ratio, meta in low_ratio.items()
         },
+        swa_window_plan=(
+            None if window_plan is None else WindowPlan(*(put(t) for t in window_plan))
+        ),
     )
 
 
@@ -321,12 +414,10 @@ def _check_supported(config) -> None:
             )
     if get_spec().speculative_algorithm is not None:
         raise NotImplementedError("DeepSeek-V4.1 TPU attention does not run MTP yet")
-    features = get_exec().features
-    if (
-        features.enable_encoder_swa_bounded_replay
-        or features.enable_decoder_swa_bounded_replay
-    ):
-        raise NotImplementedError("DeepSeek-V4.1 TPU attention has no SWA replay")
+    if get_exec().features.enable_decoder_swa_bounded_replay:
+        raise NotImplementedError(
+            "DeepSeek-V4.1 TPU attention has no decoder SWA bounded replay"
+        )
     if set(config.compress_ratios) - {0, *LOW_RATIOS}:
         raise ValueError(
             "DeepSeek-V4.1 TPU attention serves ratios 0/1/2, got "
@@ -351,6 +442,9 @@ def _check_index_sources(config) -> None:
 class DSV41TPUAttnBackend(AttentionBackend):
     """DeepSeek-V4.1 CSA2 attention on sglang request/page metadata."""
 
+    # Encoder replay rows run inside the extend forward (see the module docstring).
+    folds_encoder_swa_replay: bool = True
+
     def __init__(self, model_runner: "ModelRunner"):
         super().__init__()
         model_config = model_runner.model_config
@@ -371,6 +465,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.request_window = self.token_to_kv_pool.request_window
         self.max_context_len = int(model_config.context_len)
         self.page_size = FULL_PAGE_TOKENS
         self.index_topk = int(config.index_topk)
@@ -445,6 +540,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             forward_batch,
             req_to_token=self.req_to_token,
             full_to_swa_index_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
+            request_window=self.request_window,
             max_context_len=self.max_context_len,
             low_ratios=self.low_ratios,
             device=self.device,
@@ -585,7 +681,8 @@ class DSV41TPUAttnBackend(AttentionBackend):
             score=score,
             req=metadata.token_req_pool,
             pos=pos,
-            pad=~metadata.valid,
+            # Folded replay rows keep the cached pair state of their hit.
+            pad=~metadata.compress_valid,
         )
         pooled = layer.compressor.pool_pairs(
             torch.stack([partner_kv, kv], dim=1),
@@ -759,7 +856,15 @@ class DSV41TPUAttnBackend(AttentionBackend):
 
         swa = pool.get_swa_pages(layer_id)
         kv = k.reshape(k.shape[0], -1).contiguous()
-        swa.copy_(self.csa2_ops.publish_swa(swa, metadata.swa_write_records, kv))
+        records = metadata.swa_write_records
+        plan = metadata.swa_window_plan
+        if plan is not None:
+            # One publish also copies ring history into the workspace pages the
+            # chunk attends and the chunk's last window back into the ring.
+            history = swa.reshape(-1, kv.shape[1])[plan.history_src]
+            kv = torch.cat((kv, history, kv[plan.commit_token]))
+            records = torch.cat((records, plan.history_dst, plan.commit_dst))
+        swa.copy_(self.csa2_ops.publish_swa(swa, records, kv))
 
         if attn_sink is None:
             sink = torch.zeros(q.shape[1], dtype=torch.float32, device=q.device)

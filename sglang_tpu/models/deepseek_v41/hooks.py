@@ -100,6 +100,35 @@ tpu_dsv41_hasher_forward
   Remove when: the device can read host tables, or the in-graph HBM lookup
        is correct under attention DP.
 
+allow_tpu_dsv41_encoder_replay
+  Why: validate_deepseek_v41_features rejects --enable-encoder-swa-bounded-replay
+       on hardware other than CUDA and gfx950 with one inline check, so the TPU
+       request window and folded replay rows cannot be enabled. Every other check
+       (prefill graphs, CP, ROCm DP, PD, mixed chunk, LoRA, radix sessions) must
+       still apply.
+  How: AROUND the validator; for a V4.1 model on TPU with the flag it runs the
+       original with the module's get_platform reporting CUDA and not ROCm, the
+       only two platform facts the validator reads.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR3).
+  Remove when: the validator asks current_platform whether it folds encoder
+       SWA replay.
+
+derive_tpu_dsv41_pool_sizes, build_tpu_dsv41_allocator, get_tpu_dsv41_swa_fixed_bytes
+  Why: under --enable-encoder-swa-bounded-replay the core sizes the paged SWA pool
+       at 0 tokens (SWA lives in the request window), which the TPU 8-page SWA
+       floor in _derive_pool_sizes refuses; the allocator builder then takes the
+       core PagedTokenToKVPoolAllocator, whose alloc paths launch Triton; and the
+       configurator prices core's FlashMLA-packed window instead of the TPU
+       window's bf16 pages.
+  How: AROUND each target, bodies in sglang_tpu.models.deepseek_v41.memory_pool:
+       skip the floor for a 0-token SWA size only, bind the module's
+       PagedTokenToKVPoolAllocator to the TPU paged allocator, and swap the
+       window bytes. Every other case calls the original unchanged.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR3).
+  Remove when: the SWA floor skips pools without a paged SWA allocator, that
+       allocator arm asks current_platform for its class, and the configurator
+       asks the pool for its window bytes.
+
 trace_tpu_env_default
   Why: EnvField._resolve_default calls callable(self.default) for lazily
        computed defaults (e.g. SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)),
@@ -135,6 +164,49 @@ def get_tpu_dsv41_bytes_per_swa_token(original, configurator) -> float:
 def get_tpu_dsv41_bytes_per_full_token(original, configurator) -> float:
     from sglang_tpu.models.deepseek_v41.memory_pool import (
         get_tpu_dsv41_bytes_per_full_token as _impl,
+    )
+
+    return _impl(original, configurator)
+
+
+def allow_tpu_dsv41_encoder_replay(original, server_args):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from sglang.srt.arg_groups import deepseek_v4_hook as validator
+    from sglang.srt.runtime_context import get_platform
+
+    cfg = validator.resolving_view(server_args)
+    if (
+        not get_platform().is_tpu
+        or validator.model_config_of(server_args).hf_config.model_type != "deepseek_v41"
+        or not cfg.enable_encoder_swa_bounded_replay
+    ):
+        return original(server_args)
+    cuda = SimpleNamespace(is_cuda=True, is_hip=False)
+    with patch.object(validator, "get_platform", lambda: cuda):
+        return original(server_args)
+
+
+def derive_tpu_dsv41_pool_sizes(original, kvc, *, config):
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        derive_tpu_dsv41_pool_sizes as _impl,
+    )
+
+    return _impl(original, kvc, config=config)
+
+
+def build_tpu_dsv41_allocator(original, kvc, **kwargs):
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        build_tpu_dsv41_allocator as _impl,
+    )
+
+    return _impl(original, kvc, **kwargs)
+
+
+def get_tpu_dsv41_swa_fixed_bytes(original, configurator) -> float:
+    from sglang_tpu.models.deepseek_v41.memory_pool import (
+        get_tpu_dsv41_swa_fixed_bytes as _impl,
     )
 
     return _impl(original, configurator)
@@ -372,6 +444,22 @@ def hook_specs():
         (
             f"{cfg}._get_bytes_per_full_token",
             get_tpu_dsv41_bytes_per_full_token,
+            HookType.AROUND,
+        ),
+        (
+            f"{cfg}._get_swa_fixed_bytes",
+            get_tpu_dsv41_swa_fixed_bytes,
+            HookType.AROUND,
+        ),
+        (f"{kvc}._derive_pool_sizes", derive_tpu_dsv41_pool_sizes, HookType.AROUND),
+        (
+            f"{kvc}._build_token_to_kv_pool_allocator",
+            build_tpu_dsv41_allocator,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.arg_groups.deepseek_v4_hook.validate_deepseek_v41_features",
+            allow_tpu_dsv41_encoder_replay,
             HookType.AROUND,
         ),
         (

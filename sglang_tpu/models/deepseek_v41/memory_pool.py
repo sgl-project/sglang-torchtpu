@@ -31,15 +31,20 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
+from sglang.srt.mem_cache import dsv41_request_window as core_request_window
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4IndexerPool,
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool import get_tensor_size_bytes
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.utils import ceil_div
 from sglang_tpu.dsv4.dsv4_memory_pool import _zeros_kv_buffer
+from sglang_tpu.models.deepseek_v41.request_window import (
+    DSV41TPURequestWindow,
+    window_buffer_pages,
+)
 
 try:
     from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
@@ -304,10 +309,6 @@ def _check_dsv41_pool_supported(
         ("HiSparse", enable_hisparse),
         ("unified_kv", is_unified_kv_triton()),
         (
-            "encoder SWA bounded replay (request window)",
-            exec_cfg.features.enable_encoder_swa_bounded_replay,
-        ),
-        (
             "--dsv4-attn-backend trtllm",
             exec_cfg.kernel.dsv4_attn_backend == "trtllm",
         ),
@@ -352,25 +353,32 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # The core constructor builds the SWA pool first, then the main-KV pools,
         # both through _make_kv_pool.
         self._swa_pool_pending = True
-        super().__init__(
-            compression_ratios=list(compression_ratios),
-            layer_num=layer_num,
-            page_size=page_size,
-            swa_page_size=swa_page_size,
-            qk_nope_head_dim=qk_nope_head_dim,
-            qk_rope_head_dim=qk_rope_head_dim,
-            indexer_head_dim=indexer_head_dim,
-            full_size=full_size,
-            start_layer=start_layer,
-            end_layer=end_layer,
-            enable_hisparse=False,
-            kv_layout=kv_layout,
-            **kwargs,
-        )
+        # Only register_mapping sets it; a request-window pool never gets one.
+        self.full_to_swa_index_mapping = None
+        # Under encoder replay the core constructor builds its request window,
+        # looked up at call time, instead of a paged SWA pool.
+        with patch.object(core_request_window, "RequestWindow", DSV41TPURequestWindow):
+            super().__init__(
+                compression_ratios=list(compression_ratios),
+                layer_num=layer_num,
+                page_size=page_size,
+                swa_page_size=swa_page_size,
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                indexer_head_dim=indexer_head_dim,
+                full_size=full_size,
+                start_layer=start_layer,
+                end_layer=end_layer,
+                enable_hisparse=False,
+                kv_layout=kv_layout,
+                **kwargs,
+            )
         assert not self._swa_pool_pending, "the core pool built no SWA pool"
         logger.info(
-            "DSV41 TPU pool: swa_pages64=%d, sources=%s, main_records=%s, index_pages=%s",
-            self.swa_kv_pool.num_pages,
+            "DSV41 TPU pool: swa_pages64=%d (%s), sources=%s, main_records=%s, "
+            "index_pages=%s",
+            self._swa_storage().num_pages,
+            "request window" if self.request_window is not None else "paged",
             self.sources_by_ratio,
             {r: p.num_records for r, p in self.kv_pools.items() if p is not None},
             {r: p.layout.pages for r, p in self.index_pools.items()},
@@ -402,7 +410,11 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         return total
 
     def get_kv_size_bytes(self) -> Tuple[int, int]:
-        pools = [self.swa_kv_pool, *self.kv_pools.values(), *self.index_pools.values()]
+        pools = [
+            self._swa_storage(),
+            *self.kv_pools.values(),
+            *self.index_pools.values(),
+        ]
         total = sum(pool.get_kv_size_bytes()[0] for pool in pools if pool is not None)
         total += sum(
             int(get_tensor_size_bytes(pool.kv_score_buffer.kv_score))
@@ -502,7 +514,13 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_swa_pages(self, layer_id: int) -> torch.Tensor:
         """bf16 [num_swa_pages64, 64, 512]."""
         self.wait_layer_transfer(layer_id)
-        return self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
+        return self._swa_storage().kv_buffer[self._swa_local_layer_id(layer_id)]
+
+    def _swa_storage(self) -> DSV41TPUSWAKVPool:
+        """The paged SWA pool, or the request window's buffers under encoder replay."""
+        if self.request_window is not None:
+            return self.request_window.state
+        return self.swa_kv_pool
 
     def _low_ratio_item(self, layer_id: int) -> Tuple[int, int]:
         item = self.layer_mapping[layer_id]
@@ -564,8 +582,12 @@ def build_tpu_dsv41_kv_pool(original, kvc, *args, **kwargs):
 
 
 def get_tpu_dsv41_bytes_per_swa_token(original, configurator) -> float:
-    """AROUND DSV4PoolConfigurator._get_bytes_per_swa_token."""
-    if not uses_dsv41_pool(configurator.stage_compress_ratios):
+    """AROUND DSV4PoolConfigurator._get_bytes_per_swa_token. Under encoder replay
+    the target has no paged SWA, which the core method already prices."""
+    if (
+        not uses_dsv41_pool(configurator.stage_compress_ratios)
+        or configurator.encoder_replay
+    ):
         return original(configurator)
     return DSV41TPUTokenToKVPool.bytes_per_swa_token(
         num_layers=configurator.num_layers_total
@@ -588,3 +610,71 @@ def get_tpu_dsv41_bytes_per_full_token(original, configurator) -> float:
         bytes_per_swa_token=configurator.bytes_per_swa_token,
         sources_by_ratio=configurator.stage_owner_layers,
     )
+
+
+def window_bytes(*, num_slots: int, chunk_tokens: int, num_layers: int) -> int:
+    """SWA bytes of the TPU request window (reserved pages, rings, workspace)."""
+    pages = window_buffer_pages(num_slots=num_slots, chunk_tokens=chunk_tokens)
+    return pages * SWA_PAGE_TOKENS * SWA_BYTES_PER_TOKEN * num_layers
+
+
+def get_tpu_dsv41_swa_fixed_bytes(original, configurator) -> float:
+    """AROUND DSV4PoolConfigurator._get_swa_fixed_bytes: price the request window
+    as the TPU window's bf16 pages instead of core's FlashMLA-packed rows."""
+    fixed = original(configurator)
+    if (
+        not uses_dsv41_pool(configurator.stage_compress_ratios)
+        or not configurator.encoder_replay
+    ):
+        return fixed
+    tpu_window = window_bytes(
+        num_slots=configurator.requested_max_running_requests_per_worker + 1,
+        chunk_tokens=get_schedule().chunked_prefill_size,
+        num_layers=configurator.num_layers_total,
+    )
+    return fixed - configurator.request_window_bytes + tpu_window
+
+
+def derive_tpu_dsv41_pool_sizes(original, kvc, *, config):
+    """AROUND KVCacheConfigurator._derive_pool_sizes. Under encoder replay the core
+    sizes the paged SWA pool at 0 tokens (SWA lives in the request window), which
+    the TPU 8-page SWA floor refuses; skip the floor for that case only."""
+    import dataclasses
+
+    import msgspec
+
+    if (
+        kvc.is_draft_worker
+        or kvc.device != "tpu"
+        or not uses_dsv41_pool(kvc.model_config.compress_ratios)
+        or not get_exec().features.enable_encoder_swa_bounded_replay
+        or config.swa_max_total_num_tokens != 0
+    ):
+        return original(kvc, config=config)
+    sizes = original(
+        kvc, config=dataclasses.replace(config, swa_max_total_num_tokens=None)
+    )
+    return msgspec.structs.replace(sizes, swa_max_total_num_tokens=0)
+
+
+def build_tpu_dsv41_allocator(original, kvc, **kwargs):
+    """AROUND KVCacheConfigurator._build_token_to_kv_pool_allocator. A V4.1 pool
+    without a paged SWA side reaches the core PagedTokenToKVPoolAllocator arm,
+    whose alloc_extend/alloc_decode launch Triton; take the TPU paged allocator."""
+    import sglang.srt.mem_cache.kv_cache_configurator as kvc_mod
+    from sglang.srt.platforms import current_platform
+
+    pool = kwargs["token_to_kv_pool"]
+    if (
+        kvc.device != "tpu"
+        or kwargs["token_to_kv_pool_allocator"] is not None
+        or not isinstance(pool, DSV41TPUTokenToKVPool)
+        or pool.needs_paged_swa_allocator
+    ):
+        return original(kvc, **kwargs)
+    with patch.object(
+        kvc_mod,
+        "PagedTokenToKVPoolAllocator",
+        current_platform.get_paged_allocator_cls(),
+    ):
+        return original(kvc, **kwargs)
