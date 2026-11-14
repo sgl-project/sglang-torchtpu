@@ -13,7 +13,12 @@ try:
     import torch
     import torch_tpu  # noqa: F401
 
-    _HAS_TPU = torch.tpu.is_available()
+    # torch.tpu.is_available() is internal to torch_tpu and raises; the except
+    # below then silently skipped this test even on a TPU host.
+    _HAS_TPU = (
+        torch.accelerator.is_available()
+        and torch.accelerator.current_accelerator().type == "tpu"
+    )
 except Exception:  # pragma: no cover - non-TPU host
     _HAS_TPU = False
 
