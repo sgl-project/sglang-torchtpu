@@ -22,6 +22,7 @@ from sglang.srt.compilation.support_torch_compile import (
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase, enter_scope
+from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
 from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
@@ -58,6 +59,14 @@ class _ServerArgs(SimpleNamespace):
     def override(self, _source: str, **fields: Any) -> None:
         for name, value in fields.items():
             setattr(self, name, value)
+
+
+def _smem_overflowing_rpa_v3() -> TpuPallasRpaV3AttnBackend:
+    # 2M context at page 64: RPA v3 fits 7 sequences; setUp's ceiling is 8.
+    backend = object.__new__(TpuPallasRpaV3AttnBackend)
+    backend._page_stride = 64
+    backend.max_context_len = 32768 * 64
+    return backend
 
 
 def _model_with(**attrs: Any) -> Any:
@@ -200,6 +209,7 @@ class TestTpuGraphRunner(CustomTestCase):
         server_args.override = _override
         return SimpleNamespace(
             model=model,
+            attn_backend=None,
             model_config=SimpleNamespace(context_len=2048),
             max_running_requests=1,
             is_draft_worker=False,
@@ -388,6 +398,42 @@ class TestTpuGraphRunner(CustomTestCase):
 
         model_prepare.assert_called_once_with(forward_batch)
         policy_prepare.assert_called_once_with(forward_batch)
+
+    def test_installs_every_policy_before_any_warmup(self):
+        # A vision tower listed first must not compile while the decoder's
+        # install still refuses the grid.
+        events = []
+
+        class _RefusingPolicy(DecoderTpuCompilePolicy):
+            def install(self) -> bool:
+                events.append("install decoder")
+                raise ValueError("grid overflows attention SMEM")
+
+        vision = self._annotate(_model_with(forward=MagicMock()))
+        decoder = support_torch_compile(
+            _model_with(forward=MagicMock()), policy=_RefusingPolicy
+        )
+        model = _model_with(
+            named_modules=lambda: [("visual", vision), ("model", decoder)]
+        )
+        self.mock_precompile.side_effect = lambda: events.append("warm vision") or []
+        with self.assertRaisesRegex(ValueError, "attention SMEM"):
+            TpuGraphRunner(self._runner_for(model))
+        self.assertEqual(events, ["install decoder"])
+
+    def test_eager_fallback_warns_when_batches_overflow_smem(self):
+        from sglang.srt.runtime_context import get_flags
+
+        model = _model_with(forward=MagicMock())
+        model._can_torch_compile = False
+        runner = self._runner_for(model)
+        runner.attn_backend = _smem_overflowing_rpa_v3()
+        with (
+            get_flags().capture.override(enable_torch_compile=True),
+            self.assertLogs("sglang_tpu.attention_pallas_rpa_base", "WARNING") as logs,
+        ):
+            TpuGraphRunner(runner)
+        self.assertIn("fits at most 7 sequences", logs.output[0])
 
     def test_respects_can_torch_compile_false(self):
         from sglang.srt.runtime_context import get_flags
@@ -652,11 +698,17 @@ class TestTpuGraphRunner(CustomTestCase):
         support_torch_compile(_VisionModule, policy=_VisionPolicy)
         model = _model_with()
         model.named_modules = lambda: (("", model), ("vision", _VisionModule()))
-        with self.assertLogs(tpu_graph_runner.logger, level="WARNING") as logs:
-            TpuGraphRunner(self._runner_for(model))
+        runner = self._runner_for(model)
+        runner.attn_backend = _smem_overflowing_rpa_v3()
+        with (
+            self.assertLogs(tpu_graph_runner.logger, level="WARNING") as logs,
+            self.assertLogs("sglang_tpu.attention_pallas_rpa_base", "WARNING") as smem,
+        ):
+            TpuGraphRunner(runner)
         self.assertTrue(
             any("decode steps run eager" in line for line in logs.output), logs.output
         )
+        self.assertIn("fits at most 7 sequences", smem.output[0])
         self.mock_compile.assert_not_called()
 
     def test_decoder_policy_install_does_not_warn(self):

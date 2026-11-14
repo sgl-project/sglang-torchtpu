@@ -368,6 +368,34 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
                     np.asarray(inputs["ref_vpages"][page, slot]).astype(np.float32),
                 )
 
+    def _compile_for_smem(
+        self, *, max_num_seqs: int, pages_per_seq: int, page_size: int = 64
+    ):
+        import jax
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+        )
+
+        max_tokens = max(8, ((max_num_seqs + 7) // 8) * 8)
+        sd = jax.ShapeDtypeStruct
+        return ragged_paged_attention.lower(
+            sd((max_tokens, 8, self.HEAD_DIM), jnp.bfloat16),
+            sd((max_tokens, self.NUM_KV_HEADS, self.HEAD_DIM), jnp.bfloat16),
+            sd((max_tokens, self.NUM_KV_HEADS, self.HEAD_DIM), jnp.bfloat16),
+            sd(
+                (self.TOTAL_NUM_PAGES, page_size, self.NUM_KV_HEADS, 2, self.HEAD_DIM),
+                jnp.bfloat16,
+            ),
+            sd((max_num_seqs,), jnp.int32),
+            sd((max_num_seqs * pages_per_seq,), jnp.int32),
+            sd((max_num_seqs + 1,), jnp.int32),
+            sd((max_num_seqs + 1,), jnp.int32),
+            sd((3,), jnp.int32),
+            None,
+        ).compile()
+
     # ------------------------------------------------------------------ #
     # Fixed-width verification on the DECODE range (decode_query_size > 1).
     # ------------------------------------------------------------------ #
@@ -905,6 +933,14 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             [(17, 1)], kv_dtype=jnp.float8_e5m2, k_scale=1.0, v_scale=1.0
         )
         self._run_and_compare(inputs, distribution=(1, 1, 1), tolerance=0.2)
+
+    def test_mosaic_compile_matches_smem_reserve_boundary(self):
+        """Mosaic compilation succeeds at the 1 MiB - 8 KiB reserve and rejects 256K x 64."""
+        self._compile_for_smem(max_num_seqs=64, pages_per_seq=4048)
+        with self.assertRaisesRegex(
+            Exception, r"(?i)(memory space smem|scoped memory|\bsmem\b)"
+        ):
+            self._compile_for_smem(max_num_seqs=64, pages_per_seq=4097)
 
 
 if __name__ == "__main__":

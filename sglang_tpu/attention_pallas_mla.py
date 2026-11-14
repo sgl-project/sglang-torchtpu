@@ -38,6 +38,7 @@ Design notes
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
+import dataclasses
 import logging
 from typing import TYPE_CHECKING, Optional
 
@@ -48,6 +49,7 @@ from sglang_tpu.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
 )
 from sglang_tpu.attention_pallas_rpa_v3 import (
+    RPA_V3_SPEC,
     TpuPallasRpaV3AttnBackend,
 )
 from sglang_tpu.kv_pool import NOPE_MLA_ROPE_DIM
@@ -194,6 +196,10 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
     MLA kernel consumes the identical layout — and overrides only the op
     registration and the per-layer forward.
     """
+
+    # MLA v2 and sparse MLA run their own kernels (see _build_kernel_op), so only
+    # the page-table part of RPA v3's SMEM model applies.
+    kernel_spec = dataclasses.replace(RPA_V3_SPEC, smem_estimate_bytes=None)
 
     def _build_kernel_op(self):
         # Hook called by ``super().__init__()`` to populate ``self._op``. Both

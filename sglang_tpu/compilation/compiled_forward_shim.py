@@ -57,7 +57,8 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-DEFAULT_TPU_COMPILE_MAX_BS = 64
+# Compile ceiling when no batch flag is set, matching the upstream fallback.
+DEFAULT_TPU_COMPILE_MAX_BS = 32
 
 # Fields whose token dim gets padded to the token bucket.
 _TOKEN_FIELDS = (
