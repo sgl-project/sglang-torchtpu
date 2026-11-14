@@ -39,10 +39,15 @@ esac
 for selection in "${selections[@]}"; do
   timeout --signal=TERM --kill-after=15s 400s python -m benchmark.tpu.glm52_epic.repro_sparse_step \
     --queries 2048 --entry "$entry" --prefix-tokens "$prefix" --selection "$selection" "${compile_args[@]}" 2>&1 | tee "$OUT/$selection.log"
-  python - "$OUT/$selection.log" "$selection" "${GLM52_QBLOCK_COMPILE_MODE:-eager}" "$entry" <<'PY'
+  python - "$OUT/$selection.log" "$selection" "${GLM52_QBLOCK_COMPILE_MODE:-eager}" "$entry" "$prefix" <<'PY'
 from pathlib import Path
 import sys
 lines = Path(sys.argv[1]).read_text().splitlines()
+if sys.argv[4] == 'prefill-long-table':
+    prefix = int(sys.argv[5])
+    metadata = (f'SPARSE_METADATA pages_per_seq=481 live_kv={prefix + 2048} '
+                f'prefix={prefix} expected_prefill_path=per-query')
+    assert lines.count(metadata) == 1
 if sys.argv[3] == 'dynamo':
     assert lines.count('PRODUCTION_SPARSE_DYNAMO_ENABLED fullgraph=True dynamic=False') == 1
 for iteration in (0, 1):
