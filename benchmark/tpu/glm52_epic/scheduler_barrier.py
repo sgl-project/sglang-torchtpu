@@ -21,7 +21,7 @@ def publish_command(directory, *, run_token, sequence, epoch, action):
     temporary = root / 'command.json.tmp'
     temporary.write_text(json.dumps({'run_token': run_token, 'sequence': sequence,
                                      'epoch': epoch, 'action': action},
-                                    sort_keys=True) + '\\n')
+                                    sort_keys=True) + '\n')
     temporary.replace(target)
 
 
