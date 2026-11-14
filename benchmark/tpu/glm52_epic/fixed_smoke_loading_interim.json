@@ -61,6 +61,30 @@
       "last_shard_in_bounded_tail": 134,
       "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
       "source_envelope_sha256": "150c46cee6b4dbb510ea4e052f9a4c74beda2a8b5414beb72c6ef1d64e684bc7"
+    },
+    {
+      "rank": "0",
+      "time_utc": "2026-11-14T16:36:45.309434+00:00",
+      "current_bytes": 371056279552,
+      "anon_bytes": 49683886080,
+      "file_bytes": 319717515264,
+      "last_shard_in_bounded_tail": null,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "source_envelope_sha256": "3bfb96a09b983680922623c67ef183fb424abc51231ac8c2bbcb6d157dc75f58",
+      "memory_max": "max",
+      "host_available_bytes": 925687734272
+    },
+    {
+      "rank": "1",
+      "time_utc": "2026-11-14T16:36:47.729314+00:00",
+      "current_bytes": 420844675072,
+      "anon_bytes": 51125383168,
+      "file_bytes": 367943659520,
+      "last_shard_in_bounded_tail": 225,
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "source_envelope_sha256": "3bfb96a09b983680922623c67ef183fb424abc51231ac8c2bbcb6d157dc75f58",
+      "memory_max": "max",
+      "host_available_bytes": 919756521472
     }
   ],
   "deltas": [
