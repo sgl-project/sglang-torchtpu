@@ -100,6 +100,11 @@ jobs:
               - 'python/sglang/multimodal_gen/runtime/models/dits/zimage.py'
               - 'python/sglang/multimodal_gen/test/unit/test_usp_*.py'
               - 'python/sglang/multimodal_gen/test/unit/test_wan_sp_padding.py'
+              # Shared diffusion files behind CFG normalization over SP shards, and
+              # the core test the TPU wrapper imports.
+              - 'python/sglang/multimodal_gen/configs/pipeline_configs/zimage.py'
+              - 'python/sglang/multimodal_gen/runtime/distributed/cfg_policy.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_cfg_policy.py'
               - 'python/pyproject_tpu.toml'
               - 'benchmark/tpu/**'
               - 'docker/tpu.Dockerfile'

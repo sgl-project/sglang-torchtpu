@@ -608,6 +608,12 @@ class PipelineConfig:
             )
         return noise_pred
 
+    def latent_shard_group(self, batch):
+        """The group (with ``all_reduce``) whose ranks each denoise a disjoint,
+        unpadded piece of the latents, for reductions over the whole latents
+        such as CFG normalization; None while each rank holds all of them."""
+        return None
+
     def preprocess_vae_image(self, batch, vae_image_processor):
         pass
 

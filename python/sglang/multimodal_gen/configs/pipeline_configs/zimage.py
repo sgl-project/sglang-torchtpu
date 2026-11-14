@@ -299,6 +299,13 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         w1 = (plan["w0_tok"] + plan["local_w_tok"]) * self.PATCH_SIZE
         return latents[:, :, :, :, w0:w1].contiguous(), True
 
+    def latent_shard_group(self, batch):
+        # shard_latents_for_sp splits the latents into disjoint native slices,
+        # and the transformer returns each rank's slice without padding.
+        if getattr(batch, "did_sp_shard_latents", False) and get_sp_world_size() > 1:
+            return get_sp_group()
+        return None
+
     def gather_latents_for_sp(self, latents, batch):
         # Gather native H/W shards by padding to a common collective shape, then crop.
         latents = latents.contiguous()
