@@ -435,7 +435,7 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
             padded_tokens=self.EXTEND_TOKENS,
             use_sink=True,
             prefill_block_sizes=BlockSizes(
-                bq_sz=256, bq_c_sz=128, bkv_sz=512, batch_size=2, n_buffer=3
+                bq_sz=256, bq_c_sz=128, bkv_sz=512, batch_size=2
             ),
         )
 

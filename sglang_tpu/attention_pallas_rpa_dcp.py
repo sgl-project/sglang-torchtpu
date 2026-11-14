@@ -44,8 +44,9 @@ __all__ = [
 
 # torch custom-op name of the CP-aware kernel. Distinct from the plain batched op
 # so both can be registered in one process and keyed separately by the FX-graph
-# compile cache.
-DCP_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_batched_dcp"
+# compile cache. The compile cache keys on the op name, so the suffix is bumped
+# when the kernel source changes (_v2: synced to google3 cl/1018717699).
+DCP_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_batched_dcp_v2"
 
 # torch custom ops are process-global; cache the registration per kernel spec so
 # repeated backend construction reuses it (mirrors ``_OP_CACHE`` in the base

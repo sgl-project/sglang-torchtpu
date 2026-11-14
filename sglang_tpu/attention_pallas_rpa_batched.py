@@ -124,7 +124,8 @@ def _invoke_batched_kernel(
 _MIN_PAGE_SIZE = 256
 
 RPA_BATCHED_SPEC = RpaKernelSpec(
-    op_name="sglang_tpu_pallas::ragged_paged_attention_batched",
+    # _v2: kernel synced to google3 cl/1018717699 (see batched_rpa/__init__.py).
+    op_name="sglang_tpu_pallas::ragged_paged_attention_batched_v2",
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
     supports_attention_sink=True,
