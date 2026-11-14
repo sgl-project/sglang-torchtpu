@@ -130,6 +130,17 @@ memory peaked near 505 GB, without cgroup OOM events or the sparse-lowering
 fatal. Falcon did not identify the first killed native child, so this remains a
 high-confidence host-compiler-pressure hypothesis rather than a proven HBM OOM.
 
+## Current exact-source smoke template
+
+`torch_8chip_current_UNSUBMITTED.yaml` is the only current 8-chip smoke
+starting point. It pins source commit `c93996998e`, runs the checked-in runner
+from that checkout instead of embedding a base64 copy, and fails before TPU
+initialization when placeholders remain. It is intentionally not submitted:
+replace the cluster, immutable image digest, and allocation hostnames only after
+Falcon admission/capacity is revalidated. The older
+`torch_8chip_UNSUBMITTED.yaml` is historical evidence only because its inline
+runner and source SHA are stale.
+
 ## Flash safety
 
 Only GLM5.2-specific files added so far; no production/shared path has changed.
