@@ -1,0 +1,23 @@
+{
+  "experiment_id": "exp-2h7w8l2bga",
+  "source_commit": "ea78ecf2d621fb7f45c66c27b90cb8d49f620ddd",
+  "scope": "effective ServerArgs during weight loading; NOT readiness or generation evidence",
+  "log_snapshot_sha256": "ca99dfc6b321a3d5599d6ba9e2cd0fed1c96015a2bb607d1221a8dba48de3f2f",
+  "server_args_line": 55,
+  "effective_server_args": {
+    "enable_torch_compile": false,
+    "chunked_prefill_size": 256,
+    "max_total_tokens": 8192,
+    "context_length": 4096,
+    "page_size": 128,
+    "tp_size": 16,
+    "attn_dp_size": 16,
+    "ep_size": 16,
+    "nnodes": 2,
+    "max_running_requests": 16,
+    "attention_backend": "pallas_tpu_mla_sparse",
+    "kv_cache_dtype": "fp8_e4m3"
+  },
+  "dp_adjustment_log": "[2026-11-14 11:09:44] DP attention is enabled. chunked prefill size is adjusted from 4096 to 256.",
+  "hardware_generation_result": null
+}
