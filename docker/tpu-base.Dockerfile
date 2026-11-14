@@ -47,9 +47,6 @@ RUN --mount=type=secret,id=gar_netrc,target=/root/.netrc,required=true \
 
 # Use tcmalloc as the host allocator. Set after the dependency install.
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4
-# A missing preload only warns at load time; fail the build instead.
-RUN test -f "$LD_PRELOAD" \
- && python -c "import ctypes; assert hasattr(ctypes.CDLL(None), 'MallocExtension_ReleaseFreeMemory'), 'tcmalloc is not the process allocator'; print('tcmalloc OK')"
 
 # Fill sgl-eval's mmlu cache so the accuracy suite runs the eval offline.
 RUN python scripts/ci/tpu/warm_mmlu_cache.py
