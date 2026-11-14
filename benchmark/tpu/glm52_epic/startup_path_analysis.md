@@ -83,6 +83,19 @@ snapshots are not simultaneous. Both copied native logs still end after
 The experiment deadline is 16:01Z; do not interpret its running state as a
 successful baseline until the server log and smoke result are present.
 
+## Compile-concurrency scope audit
+
+The live native args also confirm `tpu_compile_tracer=dynamo` and
+`use_spmd_compile=False`. DecoderCompilePolicy's async warmup submission
+requires `tracer == direct` (decoder_compile_policy.py:1765–1778); that branch
+is not reachable for this run. Do not attribute a future peak here to the
+plugin's direct-compile async queue or change its queue depth as a fix.
+This does not prove serialized native XLA compilation: TorchTPU/Dynamo may
+have internal threads/processes, and separate scheduler ranks can compile
+concurrently. Attribution still requires sampled process identity/stacks and
+compile-stage evidence. Current source alone does not establish historical
+exit137's compiler mode.
+
 ## Loading-policy audit (no runtime change)
 
 The effective native arguments have `load_format=auto`, extra config `{}`,
