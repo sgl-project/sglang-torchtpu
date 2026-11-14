@@ -282,7 +282,7 @@ quantizes query/key, writes a third (index-key) cache, then invokes
 and does not execute any of it. Existing `test_dsa_index_topk.py` is raw JAX,
 H32/D128/page128 but topk256, not the production topk2048 bridge.
 
-A minimal future indexer bridge isolation can use the actual factory, H32/D128,
+`repro_sparse_indexer.py` now prepares that bridge isolation using the actual factory, H32/D128,
 query4, topk2048, one sequence with kvlen4 and page1. Its public contract gives
 a cheap selection oracle: row j must contain each of 0..j exactly once in an
 unspecified order, then only -1 (because all causal keys fit within topk).
@@ -291,6 +291,13 @@ the attention caches. This tests selection membership and lowering, not score
 ordering or the quantization byte oracle. Do not attribute an indexer failure
 to attention gather merely because both are Pallas custom ops. No new remote
 allocation is warranted while the full-model run is progressing.
+The explicit `--key-store xla|pallas` and `--segments all|serving` switches
+separate writer and specialization boundaries. Ordinary serving mode here means
+query1 decode / query4,64 mixed, matching MLA metadata (not speculative verify).
+Independent review found no actionable metadata/shape/oracle issue; dtype i32
+is also asserted. Imports still require the installed SGLang dependency stack
+through the DSV4 package initializer; this is checkpoint-free, not dependency-free.
+No hardware result is claimed for this diagnostic.
 
 ## Padding has two distinct contracts
 

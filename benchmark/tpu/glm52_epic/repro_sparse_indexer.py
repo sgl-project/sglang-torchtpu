@@ -15,6 +15,8 @@ def main():
     parser.add_argument('--queries', type=int, choices=(1, 4, 64), default=4)
     parser.add_argument('--key-store', choices=('xla', 'pallas'), default='xla',
                         help='Explicit writer; serving can auto-select Pallas for short batches.')
+    parser.add_argument('--segments', choices=('all', 'serving'), default='all',
+                        help='All passes, or ordinary MLA serving specialization by forward mode.')
     args = parser.parse_args()
     if 'jax' in sys.modules:
         raise RuntimeError('fresh process required')
@@ -47,10 +49,11 @@ def main():
     metadata = [upload(np.array(a, np.int32)) for a in (
         [t], [1], [0, t], [1, 1, 1] if t == 1 else [0, 0, 1])]
     op = build_dsa_index_topk_op()
-    print('STAGE indexer_compile_execute', flush=True)
+    segments = ('decode' if t == 1 else 'mixed') if args.segments == 'serving' else 'all'
+    print(f'STAGE indexer_compile_execute segments={segments} key_store={args.key_store}', flush=True)
     with torch.no_grad():
         result = op(q, key, weights, cache, *metadata,
-                    float(d ** -0.5 * h ** -0.5), topk, 1, 'all', args.key_store)
+                    float(d ** -0.5 * h ** -0.5), topk, 1, segments, args.key_store)
         selected = result.cpu().numpy()
     assert selected.shape == (t, topk), selected.shape
     assert selected.dtype == np.int32, selected.dtype
