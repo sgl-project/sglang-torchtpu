@@ -292,6 +292,15 @@ these settings. Runtime compile-policy EXTEND/MIXED and DECODE graph-variant
 logs must still establish effective shapes and modes; one bucket does not
 necessarily mean one executable.
 
+Executed `build_bucketers`' real body with the DP-adjusted max_t256, explicit
+smoke token list[2048], bs[1], and dynamic-chunk expansion disabled: it retains
+TokenBucketer[2048] and BatchSizeBucketer[1], so token next_bucket(256)=2048.
+The function keeps the smallest configured bucket covering max_t rather than
+clipping it to max_t. Consequently compile-smoke can still warm a T2048 q-block
+shape despite the eager local chunk ceiling256. This is not a config error by
+itself and does not establish actual graph routing; it explains why eager
+success would not establish compile-smoke coverage or memory requirements.
+
 ## Validation boundary
 
 `falcon workflow validate` validates the workflow DSL (`schema_version`,
