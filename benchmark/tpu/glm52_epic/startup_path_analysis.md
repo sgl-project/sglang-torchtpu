@@ -264,6 +264,17 @@ initial Python `-c` inspection command failed with exit2 through exec's command
 quoting; the simple `tail` inspection succeeded without modifying the workload. Do not confuse the diagnostic step passes with
 this full-model acceptance criterion.
 
+## Production cache ownership matches the isolated step
+
+Traced `_kv_cache_buffers` to `TpuSplitMLATokenToKVPool` allocations in
+`kv_pool.py:1400-1417` and getters `1463-1470`. Each layer's NoPE, RoPE and
+index cache is separately allocated, not a slice of one layer-stacked tensor.
+`_zeros_kv_buffer` creates a genuine uint8 base allocation and asserts `_base
+is None` / matching dtype (`58-70`). The direct getters return those objects.
+Thus the isolated step's whole uint8 cache setup matches this production
+boundary; source inspection does not support a current layer-view donation
+bug. This does not establish runtime absence of buffer copies or reuse bugs.
+
 ## Loading progress is rank-gated, not a cross-host skew metric
 
 `weight_utils.py:1286-1288` enables the multi-thread shard progress bar only
