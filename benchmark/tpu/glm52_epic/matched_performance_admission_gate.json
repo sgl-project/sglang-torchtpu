@@ -18,6 +18,11 @@
     "Torch source audit does not prove the same fp8_q=true and fp8_pv=true operand contract",
     "Current bounded Torch probes are synthetic attention/cache diagnostics, not the 32-request model workload"
   ],
+  "client_validation": {
+    "command": "python3 benchmark/tpu/glm52_epic/torch_cache_hit_client.py selftest",
+    "result": "PASS",
+    "meaning": "stdlib protocol and explicit unmatched/strict gate behavior validated; no inference or matched admission claim"
+  },
   "required_before_submit": [
     "real 8-chip two-host scheduler barrier with exact RID inventory and rank completion evidence",
     "same model/checkpoint, prefix, extend, output, concurrency, DP and chunk cadence",
