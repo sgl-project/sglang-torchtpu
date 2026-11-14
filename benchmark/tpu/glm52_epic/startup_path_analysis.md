@@ -83,6 +83,22 @@ snapshots are not simultaneous. Both copied native logs still end after
 The experiment deadline is 16:01Z; do not interpret its running state as a
 successful baseline until the server log and smoke result are present.
 
+## Loading-policy audit (no runtime change)
+
+The effective native arguments have `load_format=auto`, extra config `{}`,
+`weight_loader_disable_mmap=False`, `weight_loader_prefetch_checkpoints=False`,
+and `weight_loader_drop_cache_after_load=False`. DefaultModelLoader selects
+multi-threaded safetensors loading (loader.py:633–733), with default 8 workers
+(loader.py:412). The iterator's sliding window bounds in-flight shard objects,
+but `safe_open`/`get_tensor` is mmap-backed and no DONTNEED follows consumed
+shards (weight_utils.py:1265–1339). Its documented RAM bound is not a bound
+on accumulated cgroup page cache. With eight schedulers per host, reader
+concurrency can also multiply; cache pages are not necessarily duplicated
+per rank. The EP-selective read path requires disable_mmap, so the effective
+mmap path does not use that optimization. These are code-path explanations
+consistent with observed file-cache growth, not a demonstrated loading
+bottleneck or a reason to flip mmap/drop-cache during this ongoing run.
+
 ## Instrumented compile-smoke outcome
 
 exp-sx62ld4v1e (source 7830981b0e) failed before model loading: the bootstrap
