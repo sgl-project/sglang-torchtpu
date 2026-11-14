@@ -100,7 +100,7 @@ current pinned TPU dependency stack; record versions and do not use it for
 on-device performance claims. The private CI base image was inaccessible to
 this cluster (ImagePullBackOff), not a test result.
 
-## Current TorchTPU failure diagnosis
+## Historical TorchTPU failure diagnosis (superseded for the accepted smoke)
 
 The first short-input eager smoke reached model execution setup but failed in the
 TorchTPU/XLA lowering of the sparse MLA path, before `/health` became ready. The
@@ -123,7 +123,11 @@ not a confirmed fix: q-block only changes extend prefill and decode still uses
 the original per-query kernel. The runner's smoke request is now 512 tokens,
 which is the q-block activation threshold; a four-token request would silently
 exercise the old per-query fallback and would not test the intended candidate.
-It must be validated on TPU before any claim of a runnable baseline.
+It was validated by the accepted two-host smoke `exp-48q9eb5nxn` (source
+`99ea485f27`), which reached health, generated two outputs from512 input IDs,
+and completed intentional cleanup. The q-block candidate is therefore not the
+status of the accepted baseline; its exact per-shape role remains separately
+scoped.
 
 The one-shape compile smoke is a separate failure. It exited 137 after host
 memory peaked near 505 GB, without cgroup OOM events or the sparse-lowering
