@@ -33,6 +33,8 @@ result = {'status': 'FAILED', 'scope': 'startup and one token-ID smoke only; no 
 launcher = None
 server_log = None
 control = None
+memory_stop = threading.Event()
+memory_thread = None
 state = {'status': 'RUNNING', 'peer_ack': False}
 
 
@@ -248,6 +250,22 @@ try:
     if RANK == 0:
         control = http.server.ThreadingHTTPServer(('0.0.0.0', 31001), Control)
         threading.Thread(target=control.serve_forever, daemon=True).start()
+    from benchmark.tpu.glm52_epic.startup_memory import collect as collect_memory
+
+    def sample_memory():
+        with (OUT / 'host-memory.jsonl').open('a', buffering=1) as stream:
+            while not memory_stop.is_set():
+                try:
+                    data = collect_memory()
+                    stream.write(json.dumps(data) + '\n')
+                    print('GLM52_HOST_MEMORY ' + json.dumps(data), flush=True)
+                except Exception as error:
+                    # Diagnostic sampling must never terminate model execution.
+                    print(f'GLM52_HOST_MEMORY_ERROR {error!r}', flush=True)
+                memory_stop.wait(30)
+
+    memory_thread = threading.Thread(target=sample_memory, daemon=True)
+    memory_thread.start()
     server_log = (OUT / 'server.log').open('wb', buffering=0)
     command = [sys.executable, '-u', '-m', 'benchmark.tpu.launch_server', '--config',
                '@'+str(candidate), '--shutdown-grace', '25']
@@ -380,6 +398,9 @@ finally:
                 pass
         launcher.wait(timeout=3)
         result['launcher_shutdown_exit_code'] = launcher.returncode
+    memory_stop.set()
+    if memory_thread is not None:
+        memory_thread.join(timeout=2)
     if server_log:
         server_log.close()
     if control:
