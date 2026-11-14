@@ -133,22 +133,24 @@ try:
     cfg = json.loads(candidate_bytes)
     args = cfg['server_args']
     runtime_env = cfg.get('runtime_env', cfg.get('runtime_envs', {}))
-    require(runtime_env.get('SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL') == '1',
-            'short baseline must enable DSA qblock prefill')
-    require(runtime_env.get('SGLANG_TPU_ASYNC_COPY_WORKER') == '0',
-            'short baseline must disable async copy worker')
-    require('xla_tpu_buffer_assignment_enable_fast_merge_fallback=false' in
-            runtime_env.get('LIBTPU_INIT_ARGS', ''),
-            'short baseline must disable libtpu fast-merge fallback')
-    require('xla_tpu_offload_gather_to_sparsecore=true' in
-            runtime_env.get('LIBTPU_INIT_ARGS', ''),
-            'short baseline must offload gather to SparseCore')
+    if mode in ('eager', 'compile-smoke'):
+        require(runtime_env.get('SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL') == '1',
+                'short baseline must enable DSA qblock prefill')
+        require(runtime_env.get('SGLANG_TPU_ASYNC_COPY_WORKER') == '0',
+                'short baseline must disable async copy worker')
+        require('xla_tpu_buffer_assignment_enable_fast_merge_fallback=false' in
+                runtime_env.get('LIBTPU_INIT_ARGS', ''),
+                'short baseline must disable libtpu fast-merge fallback')
+        require('xla_tpu_offload_gather_to_sparsecore=true' in
+                runtime_env.get('LIBTPU_INIT_ARGS', ''),
+                'short baseline must offload gather to SparseCore')
     require(all(args.get(k) == v for k, v in {
         'tp_size': 16, 'attn_dp_size': 16, 'dp_size': 1, 'ep_size': 16,
         'nnodes': 2, 'device': 'tpu', 'model_path': '/models/GLM5.2-fp8-channel-wise'
         }.items()), 'candidate mesh/model contract changed')
-    require(args.get('page_size') == 128,
-            'short baseline must use the qblock-compatible page size')
+    if mode in ('eager', 'compile-smoke'):
+        require(args.get('page_size') == 128,
+                'short baseline must use the qblock-compatible page size')
     contract = ({'enable_torch_compile': False, 'context_length': 4096,
                  'max_total_tokens': 8192, 'chunked_prefill_size': 4096,
                  'max_prefill_tokens': 4096, 'page_size': 128} if mode == 'eager' else
