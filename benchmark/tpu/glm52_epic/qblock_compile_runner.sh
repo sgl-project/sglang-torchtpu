@@ -21,8 +21,25 @@ for qb in 128 32; do
   rc=${status[0]}
   if [[ "${status[1]}" != 0 ]]; then exit "${status[1]}"; fi
   printf 'QBLOCK_COMPILE_EXIT query_block=%s exit_code=%s\n' "$qb" "$rc" | tee -a "$OUT/status.txt"
-  # qb128 is an expected-failure control, but its diagnostic must be inspected.
-  # A timeout or unrelated failure is not proof of the original VMEM error.
-  if [[ "$qb" == 32 && "$rc" != 0 ]]; then failed=1; fi
+  # Fail closed: timeout/import/initialization failures are not VMEM evidence.
+  if ! python - "$OUT/qb-$qb.log" "$qb" "$rc" <<'PY'
+import json
+from pathlib import Path
+import sys
+text = Path(sys.argv[1]).read_text(errors='replace')
+qb, rc = map(int, sys.argv[2:])
+if qb == 128:
+    valid = (rc == 1 and 'sparse_mla_prefill_qblock_tokens' in text
+             and 'Ran out of memory in memory space vmem' in text)
+else:
+    markers = [json.loads(line.split(' ', 1)[1]) for line in text.splitlines()
+               if line.startswith('QBLOCK_COMPILE_PASS ')]
+    valid = (rc == 0 and len(markers) == 1
+             and markers[0].get('query_block') == qb
+             and markers[0].get('compiled') is True)
+print(f'QBLOCK_CASE_ACCEPT query_block={qb} valid={valid}', flush=True)
+sys.exit(0 if valid else 1)
+PY
+  then failed=1; fi
 done
 exit "$failed"
