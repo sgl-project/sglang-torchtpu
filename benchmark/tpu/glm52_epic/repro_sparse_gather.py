@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 
 def main():
@@ -24,7 +25,10 @@ def main():
                         help='Raw JAX or the TorchTPU custom_jax_kernel bridge.')
     parser.add_argument('--live-queries', type=int, default=None,
                         help='Live prefix of the padded query bucket; default all.')
+    parser.add_argument('--evidence-dir', type=Path,
+                        help='New directory for run metadata and precompile raw-JAX IR.')
     args = parser.parse_args()
+    evidence = args.evidence_dir
     live_queries = args.queries if args.live_queries is None else args.live_queries
     if not 0 <= live_queries <= args.queries:
         parser.error('--live-queries must be between zero and --queries')
@@ -32,9 +36,27 @@ def main():
         parser.error('--compile-only is raw-JAX only; bridge compiles lazily on invocation')
     if 'jax' in sys.modules:
         raise RuntimeError('run in a fresh process before JAX initialization')
+    if evidence is not None:
+        # Invalid CLI arguments do not create artifacts; valid cases never
+        # overwrite another case's evidence, including an interrupted run.
+        evidence.mkdir(parents=True, exist_ok=False)
+        (evidence / 'invocation.json').write_text(json.dumps(
+            {**vars(args), 'evidence_dir': str(evidence)}, indent=2) + '\n')
     pins = {'jax': '0.11.2', 'jaxlib': '0.11.2', 'libtpu': '0.0.50'}
     versions = {name: importlib.metadata.version(name) for name in pins}
     print('RUNTIME ' + json.dumps(versions, sort_keys=True), flush=True)
+
+    def stage(name):
+        record = {'stage': name, 'time_ns': time.time_ns(), 'backend': args.backend}
+        print('STAGE ' + json.dumps(record, sort_keys=True), flush=True)
+        if evidence is not None:
+            with (evidence / 'stages.jsonl').open('a') as stream:
+                stream.write(json.dumps(record) + '\n')
+                stream.flush()
+
+    stage('runtime_checked')
+    if evidence is not None:
+        (evidence / 'runtime.json').write_text(json.dumps(versions, indent=2) + '\n')
     if versions != pins:
         raise RuntimeError(f'pinned runtime required: {pins}; found {versions}')
     os.environ['JAX_PLATFORMS'] = 'tpu' if args.backend == 'jax' else 'cpu'
@@ -43,7 +65,7 @@ def main():
     import numpy as np
     from sglang_tpu.attention.pallas.mla_sparse.dsa_gather import dsa_gather
 
-    print(f'STAGE initialize_jax backend={args.backend}', flush=True)
+    stage('initialize_jax')
     device = jax.devices()[0]
     if args.backend == 'jax' and device.platform != 'tpu':
         raise RuntimeError('TPU required; CPU fallback is not a reproduction')
@@ -80,9 +102,9 @@ def main():
         arrays = (nope.reshape(pages, args.page_size, 4, 128),
                   rope.reshape(pages, args.page_size // 4, 4, 128),
                   indices, np.asarray(live, dtype=np.int32))
-        print('STAGE initialize_torch_and_upload', flush=True)
+        stage('initialize_torch_and_upload')
         tensors = tuple(torch.from_numpy(a).to('tpu') for a in arrays)
-        print('STAGE bridge_compile_and_execute', flush=True)
+        stage('bridge_compile_and_execute')
         with torch.no_grad(), tpu_info_for_cpu_export():
             outputs = kernel(*tensors)
             actual_nope, actual_rope = (out.cpu().numpy() for out in outputs)
@@ -99,15 +121,20 @@ def main():
         jax.block_until_ready(inputs)
         # Scalar valid count matches the production kernel's bounded gather.
         fn = jax.jit(lambda a, b, c, valid: dsa_gather(a, b, c, num_valid_indices=valid))
-        print(f'STAGE lower queries={args.queries} topk={topk} page={args.page_size} device={device}', flush=True)
+        stage('lower')
         start = time.monotonic()
         lowered = fn.lower(*inputs)
-        print('STAGE compile', flush=True)
+        if evidence is not None:
+            (evidence / 'lowered.mlir').write_text(lowered.as_text())
+            (evidence / 'device.json').write_text(json.dumps(
+                {'device': str(device), 'device_kind': device.device_kind}, indent=2) + '\n')
+            print(f'EVIDENCE precompile_ir={evidence / "lowered.mlir"}', flush=True)
+        stage('compile')
         compiled = lowered.compile()
         print(f'COMPILE_PASS elapsed_s={time.monotonic()-start:.3f}', flush=True)
         if args.compile_only:
             return
-        print('STAGE execute', flush=True)
+        stage('execute')
         out_nope, out_rope = jax.block_until_ready(compiled(*inputs))
         # Rows after the valid prefix are unspecified, as in production.
         assert out_nope.shape == (n, 4, 128), out_nope.shape
