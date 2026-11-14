@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/fused_moe/v2/token_parallel.py
-# Revision: bdb38700dd25959c029c7d77f00cee91ccd3a0bc
 # SPDX-License-Identifier: Apache-2.0
 """Disjoint token ownership within groups of replicated MoE inputs."""
 

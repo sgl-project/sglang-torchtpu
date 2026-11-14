@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py
-# Revision: bdb38700dd25959c029c7d77f00cee91ccd3a0bc
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -847,7 +846,7 @@ def _build_fused_ep_moe_kernel(
         #   recv_row_off == push_dst << ROWBLK_SHIFT -- `recv_base` is a cumsum
         #     of ALIGNED run lengths, so the row offset is the block offset in
         #     rows. Asserted over eight shards and several routings by
-        #     test/registered/tpu/unit/test_fused_ep_moe_v2_tables.py; that test
+        #     test/registered/tpu/kernels/moe/test_fused_ep_moe_v2_tables.py; that test
         #     is what keeps this derivation honest if recv_base ever changes to
         #     track true lengths.
         (commit_start_sm, commit_len_sm, contrib_off_sm, push_dst_sm) = (
@@ -2321,7 +2320,9 @@ def combine_step_tokens(t_local):
     return 0
 
 
-def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype):
+def _build_combine_kernel(
+    *, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype, fuse_scales=False
+):
     """out[i] = sum_k coef[i, k] * arrivals[pos[i * topk + k]].
 
     `pos` is a scalar-prefetch table of arrival rows, already clamped into the
@@ -2336,6 +2337,12 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     therefore runs in the ROW's layout and only its bf16 result is relaid out,
     so the sublane shuffle sees one bf16 token per group instead of topk
     packed-f8 rows, and the live accumulator is one token wide.
+
+    With ``fuse_scales``, scalar prefetch carries the mirror indices, router
+    weights and arrival-scale mirror instead of precomputed coefficients.
+    The same f32 scale * weight product runs in SMEM, avoiding an XLA gather
+    behind push's other SparseCore work. All row DMAs and reduction ordering
+    are shared by the two builds; the choice is static at trace time.
     """
     tb = combine_step_tokens(t_local)
     steps = t_local // tb
@@ -2343,9 +2350,13 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     groups = tb // gt
     lanes = HIDDEN_LANE_BLOCK
 
-    def kernel(
-        pos_sm, coef_sm, arr_hbm, out_hbm, rows_vm, tile_vm, out_vm, row_sems, out_sems
-    ):
+    def kernel(pos_sm, *refs):
+        if fuse_scales:
+            scl_sm, tw_sm, scales_sm, *refs = refs
+        else:
+            coef_sm, *refs = refs
+        arr_hbm, out_hbm, rows_vm, tile_vm, out_vm, row_sems, out_sems = refs
+
         def start_row(base, parity, i, k):
             # Alternate queues by slot: this kernel is one 4 KiB descriptor per
             # arrival row and an in-order queue retires descriptors at a fixed
@@ -2362,10 +2373,15 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
             """One token's weighted sum, in the arrival rows' own layout."""
             acc = None
             for k in range(topk):
-                term = (
-                    rows_vm[parity, k * tb + i].astype(jnp.float32)
-                    * coef_sm[(base + i) * topk + k]
-                )
+                if fuse_scales:
+                    idx = (base + i) * topk + k
+                    coefficient = scales_sm[scl_sm[idx]] * tw_sm[idx]
+                    term = rows_vm[parity, k * tb + i].astype(jnp.float32) * coefficient
+                else:
+                    term = (
+                        rows_vm[parity, k * tb + i].astype(jnp.float32)
+                        * coef_sm[(base + i) * topk + k]
+                    )
                 acc = term if acc is None else acc + term
             tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
 
@@ -2426,7 +2442,7 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=4 if fuse_scales else 2,
             in_specs=[hbm],
             out_specs=hbm,
             scratch_shapes=(
@@ -2444,8 +2460,24 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True
         ),
-        name=f"moe_v2_combine_t{t_local}_k{topk}_b{tb}",
+        name=(
+            f"moe_v2_combine_t{t_local}_k{topk}_b{tb}"
+            + (f"_p{COMBINE_PARITIES}_fs" if fuse_scales else "")
+        ),
     )
+
+    if fuse_scales:
+
+        def fn_with_scales(arrivals, arrival_scales, scl, topk_weights, pos):
+            return call(
+                pos.astype(jnp.int32).reshape(-1),
+                scl.astype(jnp.int32).reshape(-1),
+                topk_weights.astype(jnp.float32).reshape(-1),
+                arrival_scales.astype(jnp.float32).reshape(-1),
+                arrivals,
+            )
+
+        return fn_with_scales
 
     def fn(arrivals, coef, pos):
         # Both tables flatten TOKEN-major, so a token's topk entries are one
