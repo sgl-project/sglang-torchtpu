@@ -21,53 +21,65 @@ def _weight_map(*names):
 
 class TestPlanExpertFetch(CustomTestCase):
     def test_keeps_dense_and_local_experts_and_skips_the_rest(self):
+        layer = "model.layers.0.mlp"
         names = (
             "model.embed_tokens.weight",
-            "model.layers.0.mlp.experts.0.w1.weight",
-            "model.layers.0.mlp.experts.0.w1.scale",
-            "model.layers.0.mlp.experts.3.w2.weight",
-            "model.layers.0.mlp.experts.4.w3.weight",
+            *(f"{layer}.experts.{expert}.w1.weight" for expert in range(4)),
+            *(f"{layer}.experts.{expert}.w1.scale" for expert in range(4)),
             "model.layers.0.mlp.shared_experts.gate_proj.weight",
         )
         plan = shard.plan_expert_fetch(
-            _weight_map(*names), num_routed_experts=8, ep_size=2, ep_rank=1
+            _weight_map(*names), num_routed_experts=4, ep_size=2, ep_rank=1
         )
         self.assertEqual(
             set(plan.kept),
             {
                 "model.embed_tokens.weight",
-                "model.layers.0.mlp.experts.4.w3.weight",
                 "model.layers.0.mlp.shared_experts.gate_proj.weight",
+                f"{layer}.experts.2.w1.weight",
+                f"{layer}.experts.2.w1.scale",
+                f"{layer}.experts.3.w1.weight",
+                f"{layer}.experts.3.w1.scale",
             },
         )
         self.assertEqual(
             set(plan.skipped),
             {
-                "model.layers.0.mlp.experts.0.w1.weight",
-                "model.layers.0.mlp.experts.0.w1.scale",
-                "model.layers.0.mlp.experts.3.w2.weight",
+                f"{layer}.experts.0.w1.weight",
+                f"{layer}.experts.0.w1.scale",
+                f"{layer}.experts.1.w1.weight",
+                f"{layer}.experts.1.w1.scale",
             },
         )
-        self.assertEqual(plan.local_experts, (4, 8))
+        self.assertEqual(plan.local_experts, (2, 4))
 
     def test_mtp_experts_are_never_skipped(self):
         """The draft head's expert ids need not follow the target's EP slots."""
+        layer = "model.layers.0.mlp"
         names = (
+            *(f"{layer}.experts.{expert}.w1.weight" for expert in range(4)),
             "model.mtp.layers.0.mlp.experts.7.w1.weight",
             "mtp.layers.0.block_sparse_moe.experts.7.w3.weight",
-            "model.layers.0.mlp.experts.7.w1.weight",
         )
         plan = shard.plan_expert_fetch(
-            _weight_map(*names), num_routed_experts=8, ep_size=2, ep_rank=0
+            _weight_map(*names), num_routed_experts=4, ep_size=2, ep_rank=0
         )
         self.assertEqual(
             set(plan.kept),
             {
+                f"{layer}.experts.0.w1.weight",
+                f"{layer}.experts.1.w1.weight",
                 "model.mtp.layers.0.mlp.experts.7.w1.weight",
                 "mtp.layers.0.block_sparse_moe.experts.7.w3.weight",
             },
         )
-        self.assertEqual(plan.skipped, ("model.layers.0.mlp.experts.7.w1.weight",))
+        self.assertEqual(
+            set(plan.skipped),
+            {
+                f"{layer}.experts.2.w1.weight",
+                f"{layer}.experts.3.w1.weight",
+            },
+        )
 
     def test_fused_expert_tensor_without_an_id_is_kept(self):
         names = ("model.layers.0.mlp.experts.gate_up_proj",)
@@ -77,6 +89,20 @@ class TestPlanExpertFetch(CustomTestCase):
         self.assertEqual(plan.kept, names)
         self.assertEqual(plan.skipped, ())
 
+    def test_non_weight_expert_tensors_are_kept(self):
+        """Biases and input scales are tiny and may be needed by every rank."""
+        layer = "model.layers.0.mlp"
+        names = (
+            *(f"{layer}.experts.{expert}.w1.weight" for expert in range(4)),
+            f"{layer}.experts.0.bias",
+            f"{layer}.experts.3.input_scale",
+        )
+        plan = shard.plan_expert_fetch(
+            _weight_map(*names), num_routed_experts=4, ep_size=2, ep_rank=1
+        )
+        self.assertIn(f"{layer}.experts.0.bias", plan.kept)
+        self.assertIn(f"{layer}.experts.3.input_scale", plan.kept)
+
     def test_expert_id_outside_the_config_is_rejected(self):
         """A mismatch must fail to the stock loader, never drop a tensor."""
         with self.assertRaisesRegex(ValueError, "outside 8 routed experts"):
@@ -85,6 +111,29 @@ class TestPlanExpertFetch(CustomTestCase):
                 num_routed_experts=8,
                 ep_size=2,
                 ep_rank=0,
+            )
+
+    def test_layer_missing_an_expert_id_is_rejected(self):
+        """A different expert id space must not be sharded from the index."""
+        names = tuple(
+            f"model.layers.0.mlp.experts.{expert}.w1.weight" for expert in range(3)
+        )
+        with self.assertRaisesRegex(ValueError, "names 3 of 4 expert ids"):
+            shard.plan_expert_fetch(
+                _weight_map(*names), num_routed_experts=4, ep_size=2, ep_rank=0
+            )
+
+    def test_experts_with_different_tensor_names_are_rejected(self):
+        """Per-expert tensor sets must be uniform or the plan is unsafe."""
+        names = (
+            "model.layers.0.mlp.experts.0.w1.weight",
+            "model.layers.0.mlp.experts.1.w2.weight",
+            "model.layers.0.mlp.experts.2.w2.weight",
+            "model.layers.0.mlp.experts.3.w2.weight",
+        )
+        with self.assertRaisesRegex(ValueError, "different tensors"):
+            shard.plan_expert_fetch(
+                _weight_map(*names), num_routed_experts=4, ep_size=2, ep_rank=0
             )
 
 

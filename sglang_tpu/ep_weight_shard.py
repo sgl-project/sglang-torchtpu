@@ -9,18 +9,22 @@ never requested from storage. It mirrors the EP-sharded streaming added to
 vllm-torchtpu in PR #373.
 
 The filter is conservative: a tensor is skipped only when its name carries a
-numeric ``experts.<id>`` segment and the id is outside this rank's contiguous
-range. Every other tensor, including ``mtp`` layers and fused expert tensors
-without an id, is kept. It is inert unless
-``SGLANG_TPU_EP_SHARDED_WEIGHT_LOAD=1`` and expert parallelism is on.
+numeric ``experts.<id>`` segment, ends in a per-expert weight or scale suffix,
+and the id is outside this rank's contiguous range. Every other tensor,
+including ``mtp`` layers, fused expert tensors without an id, and per-expert
+biases or input scales, is kept. Every expert layer must name the config's
+full expert set with uniform suffixes, otherwise the loader falls back to the
+stock full-checkpoint stream. Enabled by default for Run:AI loads under EP;
+set ``SGLANG_TPU_EP_SHARDED_WEIGHT_LOAD=0`` to force the stock stream.
 
 Hook header (AFTER ``get_model_loader``):
   Why: ``RunaiModelStreamerLoader`` fetches every routed expert on every rank;
        under EP each rank keeps ``1/ep_size`` of them, so startup reads
        ``ep_size`` times the bytes it needs.
   How: AFTER ``get_model_loader`` swaps in
-       ``EPShardedRunaiModelStreamerLoader`` when the env is set, EP is on,
+       ``EPShardedRunaiModelStreamerLoader`` on Run:AI loads when EP is on,
        experts are placed contiguously, and the checkpoint index names them.
+       ``SGLANG_TPU_EP_SHARDED_WEIGHT_LOAD=0`` keeps the stock stream.
   Upstream PR or issue: not filed; vllm-torchtpu PR #373 is the reference.
   Remove when: upstream SGLang's ``RunaiModelStreamerLoader`` accepts an EP
        weight filter.
@@ -50,11 +54,17 @@ logger = get_logger(__name__)
 INDEX_NAME = "model.safetensors.index.json"
 # A numeric segment after "experts." is the checkpoint's global routed-expert
 # id. "shared_experts" has no digit and fused tensors ("experts.gate_up_proj")
-# have no id, so both stay in every rank's plan.
-_EXPERT_ID = re.compile(r"(?:^|\.)experts\.(\d+)(?:\.|$)")
+# have no id, so both stay in every rank's plan. The greedy layer prefix makes
+# the last ".experts." segment win when a name contains more than one.
+_EXPERT_NAME = re.compile(r"^(?P<layer>.*)\.experts\.(?P<id>\d+)(?P<suffix>\..+)?$")
 # Checkpoint tensors of the multi-token-prediction head. Their expert layout
 # need not follow the target model's EP ownership.
 _MTP_NAME = re.compile(r"(?:^|\.)mtp\.")
+# Per-expert tensor suffixes that only the owning rank needs. Anything else
+# under experts.<id> (biases, input scales, router tensors, fused tensors) is
+# fetched by every rank; skipping an unknown suffix would drop a tensor the
+# model may need. ".scale" is the DeepSeek FP8 block scale next to ".weight".
+_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
 
 
 class ExpertFetchPlan(msgspec.Struct, frozen=True):
@@ -67,8 +77,30 @@ class ExpertFetchPlan(msgspec.Struct, frozen=True):
 
 def expert_id_of(name: str) -> int | None:
     """Global routed-expert id encoded in a checkpoint tensor name."""
-    match = _EXPERT_ID.search(name)
-    return int(match[1]) if match else None
+    match = _EXPERT_NAME.match(name)
+    return int(match["id"]) if match else None
+
+
+def _validate_expert_layers(
+    layers: Mapping[str, Mapping[int, set[str]]], num_routed_experts: int
+) -> None:
+    """Reject a checkpoint whose expert ids or suffixes do not match the config.
+
+    A layer that names a subset of the config's experts (a different id space,
+    a fused per-group layout, or a different expert count) cannot be sharded
+    from the index alone; the caller then keeps the stock stream.
+    """
+    expected = set(range(num_routed_experts))
+    for layer, experts in layers.items():
+        if set(experts) != expected:
+            missing = sorted(expected - set(experts))
+            raise ValueError(
+                f"layer {layer} names {len(experts)} of {num_routed_experts} "
+                f"expert ids; first missing ids {missing[:4]}"
+            )
+        suffixes = next(iter(experts.values()))
+        if any(expert_suffixes != suffixes for expert_suffixes in experts.values()):
+            raise ValueError(f"layer {layer} names experts with different tensors")
 
 
 def plan_expert_fetch(
@@ -90,22 +122,29 @@ def plan_expert_fetch(
     local = num_routed_experts // ep_size
     start, end = ep_rank * local, (ep_rank + 1) * local
     kept, skipped = [], []
+    layers: dict[str, dict[int, set[str]]] = {}
     for name in weight_map:
         if _MTP_NAME.search(name):
             kept.append(name)
             continue
-        expert = expert_id_of(name)
-        if expert is None:
+        match = _EXPERT_NAME.match(name)
+        if match is None or not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
             kept.append(name)
-        elif expert >= num_routed_experts:
+            continue
+        expert = int(match["id"])
+        if expert >= num_routed_experts:
             raise ValueError(
                 f"expert id {expert} of {name} is outside "
                 f"{num_routed_experts} routed experts"
             )
-        elif start <= expert < end:
+        layers.setdefault(match["layer"], {}).setdefault(expert, set()).add(
+            match["suffix"]
+        )
+        if start <= expert < end:
             kept.append(name)
         else:
             skipped.append(name)
+    _validate_expert_layers(layers, num_routed_experts)
     return ExpertFetchPlan(
         kept=tuple(sorted(kept)),
         skipped=tuple(sorted(skipped)),
