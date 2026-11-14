@@ -417,10 +417,11 @@ class TestDirectCompile(CustomTestCase):
                     artifact.pending_compile = future
 
                 def compile_helper(
-                    args, kwargs, *, async_compile, spmd_compiler, graph
+                    args, kwargs, *, async_compile, spmd_compiler, graph, store
                 ):
                     self.assertEqual(async_compile, asynchronous)
                     self.assertIsNone(spmd_compiler)
+                    self.assertIsNone(store)
                     self.assertIsNone(graph)
                     return artifact
 

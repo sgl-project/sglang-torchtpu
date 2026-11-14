@@ -1,5 +1,6 @@
 """Unit tests for global TPU warmup collection."""
 
+import contextlib
 import contextvars
 import sys
 import weakref
@@ -14,9 +15,11 @@ from sglang.srt.model_executor.forward_context import (
     get_forward_context,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.compilation import warmup_queue
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.warmup_queue import (
     collect_warmups,
+    current_lowered_graph_store,
     current_warmup_queue,
     eager_warmup,
 )
@@ -73,6 +76,81 @@ def test_collect_warmups_clears_after_failure():
     assert completed == []
     assert queue.calls == []
     assert queue.completions == []
+
+
+class _Store:
+    def __init__(self, mode, root):
+        self.mode, self.root, self.events = mode, root, []
+
+    def finish(self):
+        self.events.append("finish")
+
+
+def _distributed_queue(monkeypatch, *, save=None, tracer="direct"):
+    """A one-rank distributed warmup; returns the calls to the store's
+    ``create_lowered_graph_store``, replaced so the store (which needs
+    TorchTPU) isn't imported."""
+    graph = SimpleNamespace(
+        tpu_compile_tracer=tracer,
+        unsafe_save_torch_compile_bundle=save,
+        unsafe_load_torch_compile_bundle=None,
+        use_spmd_compile=False,
+    )
+    monkeypatch.setattr(warmup_queue.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(warmup_queue.dist, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(
+        warmup_queue.dist,
+        "all_gather_object",
+        lambda gathered, mode, group: gathered.__setitem__(0, mode),
+    )
+    monkeypatch.setattr(warmup_queue, "get_exec", lambda: SimpleNamespace(graph=graph))
+    created = []
+
+    def create(save_dir, load_dir):
+        created.append((save_dir, load_dir))
+        return _Store("save" if save_dir else "load", save_dir or load_dir)
+
+    monkeypatch.setattr(warmup_queue, "create_lowered_graph_store", create)
+    return created
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_bundle_flag_gives_the_warmup_a_store_finished_on_success(monkeypatch, fail):
+    _distributed_queue(monkeypatch, save="/bundle")
+
+    def run():
+        if fail:
+            raise RuntimeError("warmup failed")
+
+    with pytest.raises(RuntimeError) if fail else contextlib.nullcontext():
+        with collect_warmups(group="cpu") as queue:
+            store = queue.lowered_graph_store
+            assert (store.mode, str(store.root)) == ("save", "/bundle")
+            assert current_lowered_graph_store() is store
+            queue.calls.append(PendingCall(run))
+
+    assert store.events == ([] if fail else ["finish"])
+    assert queue.lowered_graph_store is None
+    assert current_lowered_graph_store() is None
+
+
+def test_the_store_finishes_after_every_other_completion(monkeypatch):
+    _distributed_queue(monkeypatch, save="/bundle")
+    events = []
+    with collect_warmups(group="cpu") as queue:
+        queue.lowered_graph_store.events = events
+        queue.completions.append(lambda: events.append("complete"))
+    assert events == ["complete", "finish"]
+
+
+@pytest.mark.parametrize(("save", "tracer"), [(None, "direct"), ("/bundle", "dynamo")])
+def test_only_a_bundle_flag_under_the_direct_tracer_builds_a_store(
+    monkeypatch, save, tracer
+):
+    created = _distributed_queue(monkeypatch, save=save, tracer=tracer)
+    with collect_warmups(group="cpu") as queue:
+        assert queue.lowered_graph_store is None
+    assert created == []
 
 
 def test_pending_call_restores_forward_context():

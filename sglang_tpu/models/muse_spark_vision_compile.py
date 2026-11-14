@@ -5,6 +5,7 @@ import logging
 
 import torch
 
+from sglang.srt.arg_groups.platform_hook import torch_compile_bundle_dirs
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang_tpu.models.muse_spark_vision import PATCH_BUCKETS, vision_metadata
@@ -20,10 +21,7 @@ class MuseVisionCompilePolicy(CompilePolicy):
 
     def install(self):
         _register_tpu_compile_backend()
-        cfg = self.model_runner.server_args
-        bundled = (
-            cfg.unsafe_save_torch_compile_bundle or cfg.unsafe_load_torch_compile_bundle
-        )
+        bundled = any(torch_compile_bundle_dirs(self.model_runner.server_args))
         compiler = torch_compile_bundle.Compiler if bundled else torch.compile
         self.owner.forward = compiler(
             torch.no_grad()(self.method),
