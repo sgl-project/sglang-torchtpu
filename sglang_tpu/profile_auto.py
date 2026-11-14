@@ -165,7 +165,10 @@ def _stop_profile(
     if not pending or stage is None or result is None or not result.success:
         return result
 
-    pending.discard(_stage_name(stage))
+    if stage == ForwardMode.MIXED:
+        pending.clear()
+    else:
+        pending.discard(_stage_name(stage))
     if not pending:
         # Disarm, so a later /start_profile runs as upstream.
         setattr(self, _PENDING_ATTR, None)
