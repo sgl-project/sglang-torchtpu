@@ -97,11 +97,13 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_pp_context,
     draft_tp_context,
+    sample_simulated_acc_len,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu, is_xpu
 from sglang_tpu.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
     build_tpu_draft_extend_metadata,
+    dflash_simulated_verify_bookkeeping_torch,
     dflash_verify_argmax_torch,
     dflash_verify_bookkeeping_torch,
 )
@@ -597,6 +599,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._embed_module: torch.nn.Module | None = None
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
+        )
+        self._sim_commit_len_tensors = (
+            {
+                k: torch.tensor([k], dtype=torch.int32, device=self.device)
+                for k in range(1, int(self.block_size) + 1)
+            }
+            if str(self.device).startswith("tpu")
+            else {}
         )
         self._draft_greedy_gathered_max_buf: torch.Tensor | None = None
         self._draft_greedy_gathered_ids_buf: torch.Tensor | None = None
@@ -2434,6 +2444,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info,
         draft_input: DFlashDraftInputV2,
         block_size: int,
+        simulate_acc_len: float = 0.0,
     ):
         """Run accept on the TPU bucket shape, then trim back to the logical batch.
 
@@ -2480,6 +2491,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Re-read: prepare_spec_verify rebinds seq_lens, so the alias captured
             # before the forward would still be the logical tensor.
             prefix_lens=batch.seq_lens,
+            simulate_acc_len=simulate_acc_len,
         )
         if verify_padding is not None:
             accept_result = compile_policy.finalize_dflash_verify(
@@ -2501,6 +2513,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info,
         draft_input,
         prefix_lens: torch.Tensor,
+        simulate_acc_len: float = 0.0,
     ):
         # Physical (bucket) rows whenever the verify outputs stayed padded.
         bs = int(candidates.shape[0])
@@ -2543,17 +2556,53 @@ class DFlashWorkerV2(BaseSpecWorker):
             if _is_tpu:
                 # Callers hand us bucket-width rows, which is what the bookkeeping
                 # op is warmed on; the caller trims the outputs back.
-                (
-                    accept_len,
-                    commit_lens,
-                    bonus,
-                    out_tokens,
-                    new_seq_lens,
-                ) = dflash_verify_bookkeeping_torch(
-                    candidates=candidates,
-                    target_predict=target_predict,
-                    prefix_lens=prefix_lens.to(torch.int64),
+                prefix_lens_i64 = (
+                    prefix_lens
+                    if prefix_lens.dtype == torch.int64
+                    else prefix_lens.to(torch.int64)
                 )
+                if simulate_acc_len > 0.0:
+                    forced_commit_len = sample_simulated_acc_len(
+                        simulate_acc_len,
+                        SIMULATE_ACC_METHOD,
+                        int(candidates.shape[1]),
+                    )
+                    forced_commit_len_tensor = self._sim_commit_len_tensors.get(
+                        forced_commit_len
+                    )
+                    if forced_commit_len_tensor is None:
+                        forced_commit_len_tensor = torch.tensor(
+                            [forced_commit_len],
+                            dtype=torch.int32,
+                            device=candidates.device,
+                        )
+                        self._sim_commit_len_tensors[forced_commit_len] = (
+                            forced_commit_len_tensor
+                        )
+                    (
+                        accept_len,
+                        commit_lens,
+                        bonus,
+                        out_tokens,
+                        new_seq_lens,
+                    ) = dflash_simulated_verify_bookkeeping_torch(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                        prefix_lens=prefix_lens_i64,
+                        forced_commit_len_tensor=forced_commit_len_tensor,
+                    )
+                else:
+                    (
+                        accept_len,
+                        commit_lens,
+                        bonus,
+                        out_tokens,
+                        new_seq_lens,
+                    ) = dflash_verify_bookkeeping_torch(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                        prefix_lens=prefix_lens_i64,
+                    )
             elif self._use_triton_accept_bonus:
                 try:
                     (
@@ -3244,7 +3293,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         if grammar_mask is not None:
             grammar_mask.apply(logical_logits)
 
+        use_tpu_compiled_sim_accept = False
         if _is_tpu:
+            use_tpu_compiled_sim_accept = bool(
+                SIMULATE_ACC_LEN > 0
+                and SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
+                and self._selector_sample is None
+                and (
+                    _is_all_greedy(sampling_info)
+                    or not is_dflash_sampling_verify_available()
+                )
+            )
             accept_result, logits_output, candidates = self._accept_block_on_bucket(
                 compile_policy=compile_policy,
                 batch=batch,
@@ -3255,6 +3314,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
                 block_size=block_size,
+                simulate_acc_len=(
+                    float(SIMULATE_ACC_LEN) if use_tpu_compiled_sim_accept else 0.0
+                ),
             )
         else:
             candidates = draft_tokens
@@ -3274,7 +3336,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict,
         ) = accept_result
 
-        if SIMULATE_ACC_LEN > 0:
+        if SIMULATE_ACC_LEN > 0 and not use_tpu_compiled_sim_accept:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
                 raise ValueError(
                     "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
