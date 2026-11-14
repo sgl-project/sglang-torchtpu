@@ -3,7 +3,7 @@
   "status": "ACTIVE_NOT_COMPLETE",
   "latest_head_before_this_checkpoint": "36602aff08",
   "accepted": "exp-48q9eb5nxn short Torch full-checkpoint smoke",
-  "new_finding": "untracked request-table draft omits production extend_lens argument and is rejected before scatter",
+  "new_finding": "CORRECTION: prior missing-extend_lens finding retracted; *metadata supplies rows,prefixes,extends correctly. Draft remains nonrepresentative of observed host-table path and production shape.",
   "unresolved": ["historical lowering originating IR", "historical exit137 killed child/unique peak", "real matched Torch admission", "precision and steady-state JAX comparison"],
   "capacity": "last observed pools 64-chip 4x4x4; no explicit 8-chip 2x2x2 admission",
   "guardrails": ["no16chip", "noDCP", "noFlashchanges", "matched gate fail-closed"],
