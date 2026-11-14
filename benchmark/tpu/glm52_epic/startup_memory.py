@@ -6,6 +6,23 @@ import socket
 import time
 
 
+def log_snapshot(path, max_bytes=4096):
+    """Read a bounded raw tail, not an inferred execution-stage classifier."""
+    try:
+        with Path(path).open('rb') as stream:
+            stat = os.fstat(stream.fileno())
+            offset = max(0, stat.st_size - max_bytes)
+            stream.seek(offset)
+            tail = stream.read(max_bytes)
+        # Drop a possibly cut first line. Never scan the entire growing log.
+        if offset:
+            tail = tail.partition(b'\n')[2]
+        return {'size_bytes': stat.st_size, 'mtime_ns': stat.st_mtime_ns,
+                'tail': tail.decode('utf-8', errors='replace')}
+    except OSError as error:
+        return {'error': type(error).__name__}
+
+
 def collect(proc=Path('/proc'), cgroup=Path('/sys/fs/cgroup'), root_pids=()):
     root_pids = tuple(int(pid) for pid in root_pids)
     record = {'time_ns': time.time_ns(), 'pid': os.getpid(),

@@ -250,13 +250,14 @@ try:
     if RANK == 0:
         control = http.server.ThreadingHTTPServer(('0.0.0.0', 31001), Control)
         threading.Thread(target=control.serve_forever, daemon=True).start()
-    from benchmark.tpu.glm52_epic.startup_memory import collect as collect_memory
+    from benchmark.tpu.glm52_epic.startup_memory import collect as collect_memory, log_snapshot
 
     def sample_memory():
         with (OUT / 'host-memory.jsonl').open('a', buffering=1) as stream:
             while not memory_stop.is_set():
                 try:
                     data = collect_memory(root_pids=(() if launcher is None else (launcher.pid,)))
+                    data['native_log'] = log_snapshot(OUT / 'server.log')
                     stream.write(json.dumps(data) + '\n')
                     print('GLM52_HOST_MEMORY ' + json.dumps(data), flush=True)
                 except Exception as error:
