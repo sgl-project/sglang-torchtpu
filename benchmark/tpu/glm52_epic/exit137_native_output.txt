@@ -1,0 +1,909 @@
+/tmp/tpu_logs/peer_bootstrap_8chip.sh: OK
+{"base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1", "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3", "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c", "got": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0+cpu", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0+cpu", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "peer_experiment": "exp-bsvzoblh0d", "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00", "peer_task_status": "succeeded", "prepared_wheelhouse": "/prepared/wheelhouse", "schema_version": 1, "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity", "source_commit": "a95cfc47f4b00c705d68e9acd7508b5e41e1fc26", "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git", "want": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"}
+Traceback (most recent call last):
+  File "<stdin>", line 271, in <module>
+  File "<stdin>", line 60, in check_child
+RuntimeError: native launcher exited unexpectedly: 137
+{"bootstrap_provenance": {"base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1", "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3", "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c", "got": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0+cpu", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0+cpu", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "peer_experiment": "exp-bsvzoblh0d", "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00", "peer_task_status": "succeeded", "prepared_wheelhouse": "/prepared/wheelhouse", "schema_version": 1, "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity", "source_commit": "a95cfc47f4b00c705d68e9acd7508b5e41e1fc26", "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git", "want": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"}, "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c", "coordinate_probe": "/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS=\"ignore:<TorchTpu/Performance/TcMalloc/\" to suppress this warning.\n  _tcmalloc_check.check_tcmalloc()\nWARNING: All log messages before absl::InitializeLog() is called are written to STDERR\nI0000 00:00:1794616589.901463     630 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/libtpu/libtpu.so\nI0000 00:00:1794616589.916668     630 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.\n[W1114 00:36:30.889312097 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())\nI0000 00:00:1794616590.586528     630 device_rt.cc:172] PjRt runtime initialization deferred for tpu\nSuccessfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')\nRegistered Python module for 'tpu'.\nDevice type: tpu, Device index: default\nInitializing TPU distributed runtime\nI0000 00:00:1794616590.589434     630 libtpu_version.cc:63] Setting libtpu version to: 0.0.50\nI0000 00:00:1794616592.532204     630 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.\nI0000 00:00:1794616597.757273     630 pjrt_c_api_client.cc:187] PjRtCApiClient created.\nW0000 00:00:1794616597.757321     630 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.\nTORCH_TPU_LOCAL_DEVICE_COORDS=[0, 0, 0]\nI0000 00:00:1794616597.761203     630 compilation_cache.cc:360] Compilation cache evicted.\nI0000 00:00:1794616597.761217     630 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0\nnum_cache_hits=0 {NA}\nnum_compilations=0\npeak_compilation_memory_bytes=unknown", "elapsed_seconds": 3658.249, "error": "RuntimeError: native launcher exited unexpectedly: 137", "falcon_rank": 1, "image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1", "launcher_shutdown_exit_code": 137, "scope": "startup and one token-ID smoke only; no performance claim", "source_commit": "a95cfc47f4b00c705d68e9acd7508b5e41e1fc26", "status": "FAILED", "topology": {"chip_topology": "2x2x2", "devices_per_host": 8, "hosts": ["10.228.6.96", "10.228.7.222"], "native_topology": "2,2,2,2", "physical_chip_nodes": ["/dev/vfio/0", "/dev/vfio/1", "/dev/vfio/2", "/dev/vfio/3", "/dev/vfio/4", "/dev/vfio/5", "/dev/vfio/6", "/dev/vfio/7"], "physical_chips": 8, "total_devices": 16}, "versions": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0+cpu", "torch_tpu": "0.2.1.dev20261028201649", "tpu-sync-torch": "0.0.1.dev20261031081414"}}
+===== BEGIN WHOLE SERVER LOG rank=1 =====
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794616604.556725    1432 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794616604.569181    1432 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794616605.201542    1432 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794616605.204206    1432 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+[dump_meta] wrote launch metadata -> /tmp/tpu_logs/glm52-torch/rank-1/launch_meta.json
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794616609.903657    1586 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794616609.915943    1586 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794616610.603329    1586 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794616610.606086    1586 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/launch_server.py:71: UserWarning: 'python -m sglang.launch_server' is still supported, but 'sglang serve' is the recommended entrypoint.
+  Example: sglang serve --model-path <model> [options]
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+[2026-11-14 00:36:55] Cannot detect CUDA architecture.
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+[2026-11-14 00:36:56] sglang_tpu: registered 107 hook(s).
+[2026-11-14 00:36:57] Multiple AROUND hooks on 'sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch' (2 hooks, from: plugin=tpu_hooks, dist=sglang, plugin=tpu_hooks, dist=sglang). If any AROUND hook skips calling original_fn, inner hooks will be bypassed.
+[transformers] The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[2026-11-14 00:36:57] [TPU] TPU env_override set renamed compilation-cache env var(s): TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT
+[2026-11-14 00:36:57] [TPU] TPU env_override appended 3 LIBTPU_INIT_ARGS flag(s): --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false
+[2026-11-14 00:36:57] [TPU] TPU env:
+  TORCH_TPU_SLICEBUILDER_ADDRESSES=10.228.6.96:8070,10.228.6.96:8071,10.228.6.96:8072,10.228.6.96:8073,10.228.6.96:8074,10.228.6.96:8075,10.228.6.96:8076,10.228.6.96:8077,10.228.7.222:8070,10.228.7.222:8071,10.228.7.222:8072,10.228.7.222:8073,10.228.7.222:8074,10.228.7.222:8075,10.228.7.222:8076,10.228.7.222:8077
+  TORCH_TPU_TOPOLOGY=2,2,2,2
+  TORCH_TPU_BASE_PORT=8070
+  TORCH_TPU_DEVICES_PER_HOST=8
+  TPU_WORKER_HOSTNAMES=10.228.6.96,10.228.7.222
+  TPU_WORKER_ID=1
+  TPU_TOPOLOGY=2x2x2
+  LIBTPU_INIT_ARGS=--xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false
+  SGLANG_NATIVE_MOVE_KV_CACHE=1
+  TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS=1
+[2026-11-14 00:36:57] [TPU] TPU env_override: KV pool of 147456 tokens is below 262144; serializing VMEM prefetches (--xla_gf_vmem_max_outstanding_prefetches=1)
+[2026-11-14 00:36:57] TPU batch limits after reconciliation: torch_compile_max_bs=32, tpu_compile_bs=[1, 2, 4, 8, 16, 32], max_running_requests=32
+[2026-11-14 00:36:57] Set dense attention kv len threshold to model index_topk=2048 for DeepSeek with DSA.
+[2026-11-14 00:36:57] DP attention is enabled. chunked prefill size is adjusted from 32768 to 2048.
+[2026-11-14 00:37:14] TPU normalized node rank=0, rendezvous=10.228.7.222:10011; route serving traffic to node rank 0
+[2026-11-14 00:37:14] server_args={'model_path': '/models/GLM5.2-fp8-channel-wise', 'tokenizer_path': '/models/GLM5.2-fp8-channel-wise', 'tokenizer_mode': 'auto', 'tokenizer_backend': 'huggingface', 'tokenizer_worker_num': 1, 'detokenizer_worker_num': 1, 'skip_tokenizer_init': False, 'load_format': 'auto', 'model_loader_extra_config': '{}', 'trust_remote_code': False, 'context_length': 135168, 'is_embedding': False, 'enable_multimodal': None, 'revision': None, 'model_impl': 'auto', 'model_config_parser': 'auto', 'json_model_override_args': '{"quantization_config":{"quant_method":"fp8","activation_scheme":"dynamic","fmt":"e4m3","weight_block_size":null,"tpu_checkpoint_layout":"glm52_channelwise_fp8"}}', 'dtype': 'bfloat16', 'quantization': 'fp8', 'quantization_param_path': None, 'kv_cache_dtype': 'fp8_e4m3', 'enable_fp32_lm_head': False, 'modelopt_quant': None, 'modelopt_checkpoint_restore_path': None, 'modelopt_checkpoint_save_path': None, 'modelopt_export_path': None, 'quantize_and_serve': False, 'rl_quant_profile': None, 'enable_tf32_matmul': False, 'mem_fraction_static': 0.93, 'max_running_requests': 32, 'max_queued_requests': None, 'max_total_tokens': 147456, 'chunked_prefill_size': 2048, 'prefill_decode_interval': 0, 'enable_dynamic_chunking': False, 'max_prefill_tokens': 32768, 'prefill_max_requests': None, 'schedule_policy': 'fcfs', 'enable_priority_scheduling': False, 'disable_priority_preemption': False, 'default_priority_value': None, 'abort_on_priority_when_disabled': False, 'schedule_low_priority_values_first': False, 'priority_scheduling_preemption_threshold': 10, 'retraction_policy': 'length', 'schedule_conservativeness': 0.3, 'page_size': 64, 'c128_page_size': 16, 'swa_full_tokens_ratio': 0.8, 'disable_hybrid_swa_memory': False, 'radix_eviction_policy': 'lru', 'radix_eviction_policy_config': None, 'prefill_only_disable_kv_cache': False, 'disable_radix_cache': False, 'enable_page_major_kv_layout': False, 'enable_unified_memory': False, 'disable_chunked_prefix_cache': False, 'disable_overlap_schedule': False, 'num_continuous_decode_steps': 1, 'scheduler_recv_interval': 1, 'enable_mixed_chunk': False, 'nccl_port': None, 'dist_timeout': None, 'dist_init_addr': '10.228.7.222:10011', 'gated_launch_port': None, 'nnodes': 2, 'node_rank': 0, 'tp_size': 16, 'dcp_size': 1, 'pp_size': 1, 'pp_max_micro_batch_size': None, 'pp_async_batch_depth': 0, 'dp_size': 1, 'attn_dp_size': 16, 'load_balance_method': 'round_robin', 'attn_cp_size': 1, 'moe_dp_size': 1, 'dwdp_size': 1, 'dcp_comm_backend': 'ag_rs', 'dcp_replicate_q_proj': None, 'enable_prefill_cp': False, 'cp_strategy': None, 'enable_dsa_cache_layer_split': False, 'enable_cp_decode_attn_tp': False, 'enable_dp_attention': True, 'enable_dp_attention_local_control_broadcast': False, 'enable_dp_lm_head': False, 'enable_tp_lm_head_all_to_all': False, 'enable_attn_tp_input_scattered': False, 'enable_shared_experts_attn_tp': False, 'shared_experts_tp_size': None, 'enable_dense_mlp_attn_tp': False, 'enable_layernorm_sp': False, 'disable_attn_tp_gather': False, 'enable_p2p_check': False, 'device': 'tpu', 'base_gpu_id': 0, 'gpu_id_step': 1, 'random_seed': 658231457, 'mlx_enable_sampling': False, 'watchdog_timeout': 1800.0, 'soft_watchdog_timeout': None, 'sleep_on_idle': False, 'use_ray': False, 'custom_sigquit_handler': None, 'numa_node': None, 'gc_threshold': None, 'host': '0.0.0.0', 'port': 30000, 'fastapi_root_path': '', 'smg_grpc_mode': False, 'grpc_mode': False, 'grpc_port': None, 'grpc_worker_threads': 4, 'sidecar': None, 'sidecar_args': None, 'skip_server_warmup': False, 'warmups': None, 'enable_http2': False, 'http2_max_concurrent_streams': 200, 'http2_initial_connection_window_size': 1048576, 'ssl_keyfile': None, 'ssl_certfile': None, 'ssl_ca_certs': None, 'ssl_keyfile_password': None, 'enable_ssl_refresh': False, 'api_key': None, 'admin_api_key': None, 'served_model_name': '/models/GLM5.2-fp8-channel-wise', 'weight_version': 'default', 'chat_template': None, 'trust_request_chat_template': False, 'hf_chat_template_name': None, 'completion_template': None, 'file_storage_path': 'sglang_storage', 'enable_cache_report': False, 'return_input_ids': False, 'return_output_ids': False, 'reasoning_parser': None, 'default_chat_template_kwargs': None, 'strip_thinking_cache': False, 'enable_strict_thinking': False, 'tool_call_parser': None, 'tool_server': None, 'sampling_defaults': 'model', 'asr_max_buffer_seconds': 60, 'asr_max_concurrent_sessions': 32, 'preferred_sampling_params': None, 'allow_auto_truncate': False, 'stream_interval': 1, 'batch_notify_size': 16, 'stream_response_default_include_usage': False, 'incremental_streaming_output': False, 'enable_streaming_session': False, 'enable_session_radix_cache': False, 'log_level': 'info', 'log_level_http': None, 'log_requests': False, 'log_requests_level': 2, 'log_requests_format': 'text', 'log_requests_target': None, 'uvicorn_access_log_exclude_prefixes': [], 'crash_dump_folder': None, 'show_time_cost': False, 'enable_metrics': False, 'smg_http_sidecar_port': None, 'enable_mfu_metrics': False, 'enable_metrics_for_all_schedulers': False, 'load_snapshot_publish_interval': 15, 'tokenizer_metrics_custom_labels_header': 'x-custom-labels', 'tokenizer_metrics_allowed_custom_labels': None, 'extra_metric_labels': None, 'bucket_time_to_first_token': None, 'bucket_inter_token_latency': None, 'bucket_e2e_request_latency': None, 'prompt_tokens_buckets': None, 'generation_tokens_buckets': None, 'gc_warning_threshold_secs': 0.0, 'decode_log_interval': 40, 'enable_request_time_stats_logging': False, 'kv_events_config': None, 'load_publish_endpoint': None, 'enable_forward_pass_metrics': False, 'forward_pass_metrics_worker_id': '', 'forward_pass_metrics_ipc_name': None, 'enable_trace': False, 'trace_modules': 'request', 'otlp_traces_endpoint': 'localhost:4317', 'export_metrics_to_file': False, 'export_metrics_to_file_dir': None, 'stat_loggers': None, 'constrained_json_whitespace_pattern': None, 'constrained_json_disable_any_whitespace': False, 'constrained_json_max_whitespace_cnt': None, 'attention_backend': 'pallas_tpu_mla_sparse', 'decode_attention_backend': None, 'enable_lean_attention': None, 'prefill_attention_backend': None, 'sampling_backend': 'tpu', 'grammar_backend': 'none', 'radix_cache_backend': None, 'mm_attention_backend': None, 'fp8_gemm_runner_backend': 'auto', 'tpu_fp8_runtime': 'channelwise', 'fp4_gemm_runner_backend': 'auto', 'bf16_gemm_backend': 'auto', 'dsa_prefill_backend': None, 'dsv4_prefill_backend': 'auto', 'dsa_decode_backend': None, 'dsa_paged_mqa_logits_backend': 'auto', 'dsa_topk_backend': 'sgl-kernel', 'disable_flashinfer_autotune': False, 'flashinfer_autotune_skip_ops': None, 'mamba_backend': 'triton', 'cuda_graph_config': {'decode': {'backend': 'disabled', 'max_bs': 160, 'bs': [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160], 'tc_compiler': 'eager', 'max_context_size': None, 'full_prefill_max_req': None, 'full_prefill_prefix_chunk_tokens': None, 'max_seq_len': None}, 'prefill': {'backend': 'disabled', 'max_bs': 2048, 'bs': [4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 1536, 1792, 2048], 'tc_compiler': 'eager', 'max_context_size': None, 'full_prefill_max_req': None, 'full_prefill_prefix_chunk_tokens': None, 'max_seq_len': None}}, 'cuda_graph_backend_decode': None, 'cuda_graph_backend_prefill': None, 'cuda_graph_max_bs_decode': None, 'cuda_graph_max_bs_prefill': None, 'cuda_graph_bs_decode': None, 'cuda_graph_bs_prefill': None, 'cuda_graph_prefill_max_context': None, 'cuda_graph_tc_compiler': None, 'disable_prefill_cuda_graph': False, 'disable_decode_cuda_graph': False, 'disable_cuda_graph': True, 'disable_cuda_graph_padding': False, 'enable_profile_cuda_graph': False, 'enable_cudagraph_gc': False, 'debug_cuda_graph': False, 'enable_layerwise_nvtx_marker': False, 'enable_nccl_nvls': False, 'enable_symm_mem': False, 'triton_attention_reduce_in_fp32': False, 'triton_attention_num_kv_splits': 8, 'triton_attention_split_tile_size': None, 'flashinfer_mla_disable_ragged': False, 'enable_fused_qk_norm_rope': False, 'enable_precise_embedding_interpolation': False, 'enable_fused_moe_sum_all_reduce': False, 'enable_deepseek_v4_fp4_indexer': False, 'disable_custom_all_reduce': False, 'enable_mscclpp': False, 'enable_torch_symm_mem': False, 'enable_scattered_sconv': False, 'pre_warm_nccl': False, 'boundary_reduction': 'rs+rsv', 'enable_quant_communications': False, 'enable_flashinfer_allreduce_fusion': False, 'enforce_disable_flashinfer_allreduce_fusion': False, 'flashinfer_allreduce_fusion_backend': None, 'enable_aiter_allreduce_fusion': False, 'enable_torch_compile': True, 'enable_torch_compile_debug_mode': False, 'tpu_compile_tracer': 'dynamo', 'use_spmd_compile': False, 'unsafe_save_torch_compile_bundle': None, 'unsafe_load_torch_compile_bundle': None, 'torch_compile_max_bs': 32, 'torchao_config': '', 'speculative_algorithm': None, 'uno_lora_path': None, 'speculative_draft_model_path': None, 'speculative_draft_model_revision': None, 'speculative_draft_load_format': None, 'speculative_num_steps': None, 'speculative_eagle_topk': None, 'speculative_num_draft_tokens': None, 'speculative_dflash_block_size': None, 'speculative_dspark_block_size': None, 'speculative_dspark_sps_table_path': None, 'speculative_dspark_confidence_sts_path': None, 'speculative_dspark_align_verify_tokens_to_graph_tier': False, 'speculative_accept_threshold_single': 1.0, 'speculative_accept_threshold_acc': 1.0, 'speculative_use_rejection_sampling': False, 'speculative_token_map': None, 'speculative_attention_mode': 'prefill', 'speculative_draft_attention_backend': None, 'speculative_dsa_topk_backend': 'sgl-kernel', 'speculative_draft_kv_cache_dtype': None, 'speculative_draft_window_size': None, 'speculative_moe_runner_backend': 'auto', 'speculative_moe_a2a_backend': None, 'speculative_draft_model_quantization': 'fp8', '_speculative_draft_quantization_explicitly_set': False, 'speculative_skip_dp_mlp_sync': False, 'enable_multi_layer_eagle': False, 'speculative_adaptive': False, 'speculative_adaptive_config': None, 'decoupled_spec_bind_endpoint': None, 'decoupled_spec_connect_endpoints': None, 'decoupled_spec_rank': None, 'decoupled_spec_role': 'null', 'spec_trace_dir': None, 'speculative_ngram_min_bfs_breadth': 1, 'speculative_ngram_max_bfs_breadth': 10, 'speculative_ngram_match_type': 'BFS', 'speculative_ngram_max_trie_depth': 18, 'speculative_ngram_capacity': 10000000, 'speculative_ngram_external_corpus_path': None, 'speculative_ngram_external_sam_budget': 0, 'speculative_ngram_external_corpus_max_tokens': 10000000, 'ep_size': 16, 'moe_a2a_backend': 'none', 'enable_w4a4_mxfp4_megamoe': False, 'deepep_v2_mode': 'direct', 'moe_runner_backend': 'auto', 'flashinfer_mxfp4_moe_precision': 'default', 'deepep_mode': 'auto', 'fuseep_mode': 2, 'deepep_dispatcher_output_dtype': 'auto', 'ep_num_redundant_experts': 0, 'ep_dispatch_algorithm': None, 'init_expert_location': 'trivial', 'enable_eplb': False, 'eplb_algorithm': 'auto', 'eplb_rebalance_num_iterations': 1000, 'eplb_rebalance_layers_per_chunk': None, 'eplb_min_rebalancing_utilization_threshold': 1.0, 'expert_distribution_recorder_mode': None, 'expert_distribution_recorder_buffer_size': 1000, 'expert_balancedness_report_mode': 'off', 'deepep_config': None, 'moe_dense_tp_size': None, 'elastic_ep_backend': None, 'enable_elastic_expert_backup': False, 'mooncake_ib_device': None, 'enable_waterfill': False, 'ep_join_mode': None, 'ep_join_rank_offset': 0, 'elastic_ep_initial_size': None, 'max_ep_size': None, 'elastic_ep_scale_timeout': 600, 'disable_flashinfer_cutlass_moe_fp4_allgather': False, 'disable_shared_experts_fusion': True, 'enforce_shared_experts_fusion': False, 'max_mamba_cache_size': None, 'mamba_ssm_dtype': None, 'mamba_max_states_per_path': -1, 'enable_mamba_cache_stochastic_rounding': False, 'mamba_cache_philox_rounds': 0, 'mamba_full_memory_ratio': 0.9, 'mamba_radix_cache_strategy': 'auto', 'uses_mamba_radix_cache': False, 'mamba_track_interval': 256, 'enable_int8_mamba_checkpoint': False, 'int8_mamba_ckpt_size': None, 'linear_attn_backend': 'triton', 'linear_attn_decode_backend': None, 'linear_attn_prefill_backend': None, 'linear_attn_verify_backend': None, 'enable_linear_replayssm': False, 'linear_replayssm_cache_len': 16, 'enable_linear_replayssm_spec': False, 'enable_hierarchical_cache': False, 'hicache_host_memory_mode': 'cache', 'hicache_ratio': 2.0, 'hicache_size': 0, 'hicache_write_policy': 'write_through', 'hicache_io_backend': 'kernel', 'hicache_mem_layout': 'page_first', 'hicache_storage_backend': None, 'hicache_storage_prefetch_policy': 'timeout', 'hicache_storage_backend_extra_config': None, 'hicache_storage_prefetch_retry_poll_interval': 8, 'hicache_storage_prefetch_retry_max_attempts': 8, 'enable_unified_cache_external_linker': False, 'unified_cache_external_linker_backend': 'mooncake', 'enable_hisparse': False, 'hisparse_config': None, 'enable_broadcast_mm_inputs_process': False, 'enable_prefix_mm_cache': False, 'mm_enable_dp_encoder': False, 'mm_process_config': {}, 'mm_processor_worker_num': 0, 'mm_io_worker_num': 0, 'allowed_media_domains': [], 'media_url_max_file_size_mb': 64, 'mm_preprocess_cache_size_mb': None, 'trust_mm_content_hashes': False, 'limit_mm_data_per_request': None, 'enable_mm_global_cache': False, 'image_processor_backend': 'auto', 'mm_global_cache_backend': 'mooncake', 'disable_fast_image_processor': False, 'mm_feature_transport': 'cpu', 'enable_lora': None, 'enable_lora_overlap_loading': None, 'max_lora_rank': None, 'lora_target_modules': None, 'lora_paths': None, 'max_loaded_loras': None, 'max_loras_per_batch': 8, 'lora_eviction_policy': 'lru', 'lora_backend': 'csgmv', 'max_lora_chunk_size': 16, 'experts_shared_outer_loras': None, 'lora_use_virtual_experts': False, 'lora_strict_loading': False, 'lora_drain_wait_threshold': 0.0, 'enable_two_batch_overlap': False, 'enable_single_batch_overlap': False, 'tbo_token_distribution_threshold': 0.48, 'cpu_offload_gb': 0, 'offload_group_size': -1, 'offload_num_in_group': 1, 'offload_prefetch_step': 1, 'offload_mode': 'cpu', 'enable_lmcache': False, 'lmcache_config_file': None, 'enable_flexkv': False, 'flexkv_config_file': None, 'kt_weight_path': None, 'kt_method': 'AMXINT4', 'kt_cpuinfer': None, 'kt_threadpool_count': 2, 'kt_num_gpu_experts': None, 'kt_max_deferred_experts_per_token': None, 'dllm_algorithm': None, 'dllm_algorithm_config': None, 'dllm_fdfo': True, 'disaggregation_mode': 'null', 'disaggregation_transfer_backend': 'mooncake', 'disaggregation_bootstrap_port': 8998, 'disaggregation_ib_device': None, 'disaggregation_decode_enable_radix_cache': False, 'disaggregation_decode_enable_offload_kvcache': False, 'disaggregation_decode_retraction_backup': None, 'num_reserved_decode_tokens': 512, 'disaggregation_decode_extra_slots': None, 'disaggregation_decode_polling_interval': 1, 'optimistic_prefill_attempts': 0, 'encoder_only': False, 'language_only': False, 'language_model_only': False, 'encoder_transfer_backend': 'zmq_to_scheduler', 'encoder_urls': [], 'encoder_bootstrap_port': 8997, 'encoder_register_urls': [], 'enable_adaptive_dispatch_to_encoder': False, 'enable_pdmux': False, 'pdmux_config_path': None, 'sm_group_num': 8, 'startup_weight_load_mode': 'serial', 'custom_weight_loader': [], 'weight_loader_disable_mmap': False, 'weight_loader_prefetch_checkpoints': False, 'weight_loader_prefetch_num_threads': 4, 'weight_loader_drop_cache_after_load': False, 'remote_instance_weight_loader_seed_instance_ip': None, 'remote_instance_weight_loader_seed_instance_service_port': None, 'remote_instance_weight_loader_send_weights_group_ports': None, 'remote_instance_weight_loader_backend': 'nccl', 'remote_instance_weight_loader_start_seed_via_transfer_engine': False, 'engine_info_bootstrap_port': 6789, 'modelexpress_config': None, 'download_dir': None, 'model_checksum': None, 'delete_ckpt_after_loading': False, 'decrypted_config_file': None, 'decrypted_draft_config_file': None, 'checkpoint_engine_wait_weights_before_ready': False, 'enable_prefill_delayer': False, 'prefill_delayer_max_delay_passes': 30, 'prefill_delayer_token_usage_low_watermark': None, 'prefill_delayer_forward_passes_buckets': None, 'prefill_delayer_wait_seconds_buckets': None, 'prefill_delayer_queue_min_ratio': None, 'prefill_delayer_max_delay_ms': None, 'min_free_slots_delay': None, 'enable_deterministic_inference': False, 'rl_on_policy_target': None, 'kv_canary': 'none', 'kv_canary_real_data': 'none', 'kv_canary_sweep_interval': 0, 'enable_dynamic_batch_tokenizer': False, 'dynamic_batch_tokenizer_batch_size': 32, 'dynamic_batch_tokenizer_batch_timeout': 0.002, 'enable_tokenizer_batch_encode': False, 'disable_tokenizer_batch_decode': False, 'debug_tensor_dump_output_folder': None, 'debug_tensor_dump_layers': None, 'debug_tensor_dump_input_file': None, 'enable_memory_saver': False, 'enable_weights_cpu_backup': False, 'enable_draft_weights_cpu_backup': False, 'enable_custom_logit_processor': False, 'enable_return_hidden_states': False, 'return_hidden_states_mode': None, 'enable_return_routed_experts': False, 'enable_return_indexer_topk': False, 'sampling_mask_max_tokens': 4096, 'disable_outlines_disk_cache': False, 'enable_mis': False, 'weight_cache_mode': 'off', 'weight_cache_socket': None, 'weight_cache_timeout': 1800, 'forward_hooks': None, 'msprobe_dump_config': None, 'ple_offload_embedding': None, 'ple_offload_backend': 'pinned', 'ple_offload_dir': None, 'disaggregation_enable_kv_checksum': False, 'enable_pd_role_switch': False, 'speculative_domino_candidate_pool_size': 2048, 'flashinfer_a2a_dispatch_type': None, 'cuda_graph_max_seq_len_prefill': None, 'prefill_kv_cache_dequant_dtype': 'auto', 'dsv4_attn_backend': 'auto', 'otlp_service_name': None, '_radix_eviction_policy_explicitly_set': False, 'hicache_host_memory_fraction': 0.8, 'enable_linker_mla_dedup': False, '_swa_full_tokens_ratio_explicitly_set': False, 'swa_prefix_tails': None, 'enable_encoder_swa_bounded_replay': False, 'enable_decoder_swa_bounded_replay': False, 'enable_response_store': False, 'disaggregation_decode_host_receive_threshold': 0.0, 'tpu_compile_tokens': [2048], 'tpu_compile_bs': [1, 2, 4, 8, 16, 32], 'tpu_worker_hostnames': '10.228.7.222,10.228.6.96', 'torch_tpu_slicebuilder_addresses': '10.228.7.222:8070,10.228.7.222:8071,10.228.7.222:8072,10.228.7.222:8073,10.228.7.222:8074,10.228.7.222:8075,10.228.7.222:8076,10.228.7.222:8077,10.228.6.96:8070,10.228.6.96:8071,10.228.6.96:8072,10.228.6.96:8073,10.228.6.96:8074,10.228.6.96:8075,10.228.6.96:8076,10.228.6.96:8077', 'torch_tpu_topology': '2,2,2,2', 'qsa_indexer_dtype': 'auto', 'custom_pull_weights_pre_read_hook': None, 'disaggregation_decode_allocation_policy': 'early', 'speculative_boundary_reduction': 'rs+rsv', 'speculative_draft_sink_size': None, 'disable_aiter_allreduce_fusion_in_prefill': False, 'disable_aiter_allreduce_fusion_in_decode': False, 'enable_dsa_fused_indexer': None, 'tpu_node_normalization': True, 'grpc_response_timeout_secs': 300}
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+[W1114 00:37:17.479730849 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+[W1114 00:37:17.537961197 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+[2026-11-14 00:37:18] Using default HuggingFace chat template with detected content format: openai
+[2026-11-14 00:37:19] Auto-detected template features: reasoning_config=ReasoningToggleConfig(toggle_param='enable_thinking', default_enabled=True, special_case=None, effort_kwarg=None), reasoning_parser=glm45, tool_call_parser=glm47
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+[W1114 00:37:24.102284323 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+[W1114 00:37:24.118623688 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+[W1114 00:37:24.140729812 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+[W1114 00:37:24.147272825 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+[W1114 00:37:24.153391143 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:24.154652537 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+[W1114 00:37:24.198646077 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:24.201386861 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+[2026-11-14 00:37:29] [TPU] libtpu premapped host staging pool: 4.00 GiB (TPU_PREMAPPED_BUFFER_SIZE=4294967296); raise it if KV-offload H2D OOMs.
+[2026-11-14 00:37:29] [TPU] libtpu premapped host staging pool: 4.00 GiB (TPU_PREMAPPED_BUFFER_SIZE=4294967296); raise it if KV-offload H2D OOMs.
+[2026-11-14 00:37:29] [TPU] libtpu premapped host staging pool: 4.00 GiB (TPU_PREMAPPED_BUFFER_SIZE=4294967296); raise it if KV-offload H2D OOMs.
+[2026-11-14 00:37:29] [TPU] TPU env:
+  TORCH_TPU_SLICEBUILDER_ADDRESSES=10.228.7.222:8070,10.228.7.222:8071,10.228.7.222:8072,10.228.7.222:8073,10.228.7.222:8074,10.228.7.222:8075,10.228.7.222:8076,10.228.7.222:8077,10.228.6.96:8070,10.228.6.96:8071,10.228.6.96:8072,10.228.6.96:8073,10.228.6.96:8074,10.228.6.96:8075,10.228.6.96:8076,10.228.6.96:8077
+  TORCH_TPU_TOPOLOGY=2,2,2,2
+  TORCH_TPU_BASE_PORT=8070
+  TORCH_TPU_DEVICES_PER_HOST=8
+  TPU_WORKER_HOSTNAMES=10.228.7.222,10.228.6.96
+  TPU_WORKER_ID=1
+  TPU_TOPOLOGY=2x2x2
+  TPU_PREMAPPED_BUFFER_SIZE=4294967296
+  LIBTPU_INIT_ARGS=--xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false --xla_gf_vmem_max_outstanding_prefetches=1
+  SGLANG_NATIVE_MOVE_KV_CACHE=1
+  TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS=1
+[2026-11-14 00:37:29] [TPU] TPU env:
+  TORCH_TPU_SLICEBUILDER_ADDRESSES=10.228.7.222:8070,10.228.7.222:8071,10.228.7.222:8072,10.228.7.222:8073,10.228.7.222:8074,10.228.7.222:8075,10.228.7.222:8076,10.228.7.222:8077,10.228.6.96:8070,10.228.6.96:8071,10.228.6.96:8072,10.228.6.96:8073,10.228.6.96:8074,10.228.6.96:8075,10.228.6.96:8076,10.228.6.96:8077
+  TORCH_TPU_TOPOLOGY=2,2,2,2
+  TORCH_TPU_BASE_PORT=8070
+  TORCH_TPU_DEVICES_PER_HOST=8
+  TPU_WORKER_HOSTNAMES=10.228.7.222,10.228.6.96
+  TPU_WORKER_ID=1
+  TPU_TOPOLOGY=2x2x2
+  TPU_PREMAPPED_BUFFER_SIZE=4294967296
+  LIBTPU_INIT_ARGS=--xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false --xla_gf_vmem_max_outstanding_prefetches=1
+  SGLANG_NATIVE_MOVE_KV_CACHE=1
+  TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS=1
+[2026-11-14 00:37:29] [TPU] TPU env:
+  TORCH_TPU_SLICEBUILDER_ADDRESSES=10.228.7.222:8070,10.228.7.222:8071,10.228.7.222:8072,10.228.7.222:8073,10.228.7.222:8074,10.228.7.222:8075,10.228.7.222:8076,10.228.7.222:8077,10.228.6.96:8070,10.228.6.96:8071,10.228.6.96:8072,10.228.6.96:8073,10.228.6.96:8074,10.228.6.96:8075,10.228.6.96:8076,10.228.6.96:8077
+  TORCH_TPU_TOPOLOGY=2,2,2,2
+  TORCH_TPU_BASE_PORT=8070
+  TORCH_TPU_DEVICES_PER_HOST=8
+  TPU_WORKER_HOSTNAMES=10.228.7.222,10.228.6.96
+  TPU_WORKER_ID=1
+  TPU_TOPOLOGY=2x2x2
+  TPU_PREMAPPED_BUFFER_SIZE=4294967296
+  LIBTPU_INIT_ARGS=--xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false --xla_gf_vmem_max_outstanding_prefetches=1
+  SGLANG_NATIVE_MOVE_KV_CACHE=1
+  TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS=1
+[2026-11-14 00:37:29] TPU compile cache kernel inputs: tag=tpu-kernel-inputs-v1:49cb69d7414eb3deaf7e96f938dfcf80d7f49a29d97c9f50c54e972952b6bc33
+[2026-11-14 00:37:29] TPU compile cache kernel inputs: tag=tpu-kernel-inputs-v1:49cb69d7414eb3deaf7e96f938dfcf80d7f49a29d97c9f50c54e972952b6bc33
+[2026-11-14 00:37:29] [TPU] TorchTPU eager mode set to DEFER_NEVER.
+[2026-11-14 00:37:29] [TPU] TorchTPU eager mode set to DEFER_NEVER.
+[2026-11-14 00:37:29] TPU compile cache kernel inputs: tag=tpu-kernel-inputs-v1:49cb69d7414eb3deaf7e96f938dfcf80d7f49a29d97c9f50c54e972952b6bc33
+[2026-11-14 00:37:29] [TPU] TorchTPU eager mode set to DEFER_NEVER.
+[2026-11-14 00:37:29] [TPU] libtpu premapped host staging pool: 4.00 GiB (TPU_PREMAPPED_BUFFER_SIZE=4294967296); raise it if KV-offload H2D OOMs.
+[2026-11-14 00:37:29] [TPU] TPU env:
+  TORCH_TPU_SLICEBUILDER_ADDRESSES=10.228.7.222:8070,10.228.7.222:8071,10.228.7.222:8072,10.228.7.222:8073,10.228.7.222:8074,10.228.7.222:8075,10.228.7.222:8076,10.228.7.222:8077,10.228.6.96:8070,10.228.6.96:8071,10.228.6.96:8072,10.228.6.96:8073,10.228.6.96:8074,10.228.6.96:8075,10.228.6.96:8076,10.228.6.96:8077
+  TORCH_TPU_TOPOLOGY=2,2,2,2
+  TORCH_TPU_BASE_PORT=8070
+  TORCH_TPU_DEVICES_PER_HOST=8
+  TPU_WORKER_HOSTNAMES=10.228.7.222,10.228.6.96
+  TPU_WORKER_ID=1
+  TPU_TOPOLOGY=2x2x2
+  TPU_PREMAPPED_BUFFER_SIZE=4294967296
+  LIBTPU_INIT_ARGS=--xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false --xla_gf_vmem_max_outstanding_prefetches=1
+  SGLANG_NATIVE_MOVE_KV_CACHE=1
+  TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS=1
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:363: UserWarning: Warning only once for all operators,  other operators may also be overridden.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
+    registered at /pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: PrivateUse1
+  previous kernel: registered at /pytorch/build/aten/src/ATen/RegisterCPU_3.cpp:2489
+       new kernel: registered at /tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:743 (Triggered internally at /pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:208.)
+  self.m.impl(
+[2026-11-14 00:37:29] [TPU] Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, masked_scatter_, logaddexp, upsample_bicubic2d
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:363: UserWarning: Warning only once for all operators,  other operators may also be overridden.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
+    registered at /pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: PrivateUse1
+  previous kernel: registered at /pytorch/build/aten/src/ATen/RegisterCPU_3.cpp:2489
+       new kernel: registered at /tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:743 (Triggered internally at /pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:208.)
+  self.m.impl(
+[2026-11-14 00:37:29] [TPU] Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, masked_scatter_, logaddexp, upsample_bicubic2d
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:363: UserWarning: Warning only once for all operators,  other operators may also be overridden.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
+    registered at /pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: PrivateUse1
+  previous kernel: registered at /pytorch/build/aten/src/ATen/RegisterCPU_3.cpp:2489
+       new kernel: registered at /tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:743 (Triggered internally at /pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:208.)
+  self.m.impl(
+[2026-11-14 00:37:29] [TPU] Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, masked_scatter_, logaddexp, upsample_bicubic2d
+[2026-11-14 00:37:29] [TPU] libtpu premapped host staging pool: 4.00 GiB (TPU_PREMAPPED_BUFFER_SIZE=4294967296); raise it if KV-offload H2D OOMs.
+[2026-11-14 00:37:29] [TPU] libtpu premapped host staging pool: 4.00 GiB (TPU_PREMAPPED_BUFFER_SIZE=4294967296); raise it if KV-offload H2D OOMs.
+[2026-11-14 00:37:29] [TPU] TPU env:
+  TORCH_TPU_SLICEBUILDER_ADDRESSES=10.228.7.222:8070,10.228.7.222:8071,10.228.7.222:8072,10.228.7.222:8073,10.228.7.222:8074,10.228.7.222:8075,10.228.7.222:8076,10.228.7.222:8077,10.228.6.96:8070,10.228.6.96:8071,10.228.6.96:8072,10.228.6.96:8073,10.228.6.96:8074,10.228.6.96:8075,10.228.6.96:8076,10.228.6.96:8077
+  TORCH_TPU_TOPOLOGY=2,2,2,2
+  TORCH_TPU_BASE_PORT=8070
+  TORCH_TPU_DEVICES_PER_HOST=8
+  TPU_WORKER_HOSTNAMES=10.228.7.222,10.228.6.96
+  TPU_WORKER_ID=1
+  TPU_TOPOLOGY=2x2x2
+  TPU_PREMAPPED_BUFFER_SIZE=4294967296
+  LIBTPU_INIT_ARGS=--xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false --xla_gf_vmem_max_outstanding_prefetches=1
+  SGLANG_NATIVE_MOVE_KV_CACHE=1
+  TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS=1
+[2026-11-14 00:37:29] [TPU] TPU env:
+  TORCH_TPU_SLICEBUILDER_ADDRESSES=10.228.7.222:8070,10.228.7.222:8071,10.228.7.222:8072,10.228.7.222:8073,10.228.7.222:8074,10.228.7.222:8075,10.228.7.222:8076,10.228.7.222:8077,10.228.6.96:8070,10.228.6.96:8071,10.228.6.96:8072,10.228.6.96:8073,10.228.6.96:8074,10.228.6.96:8075,10.228.6.96:8076,10.228.6.96:8077
+  TORCH_TPU_TOPOLOGY=2,2,2,2
+  TORCH_TPU_BASE_PORT=8070
+  TORCH_TPU_DEVICES_PER_HOST=8
+  TPU_WORKER_HOSTNAMES=10.228.7.222,10.228.6.96
+  TPU_WORKER_ID=1
+  TPU_TOPOLOGY=2x2x2
+  TPU_PREMAPPED_BUFFER_SIZE=4294967296
+  LIBTPU_INIT_ARGS=--xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false --xla_gf_vmem_max_outstanding_prefetches=1
+  SGLANG_NATIVE_MOVE_KV_CACHE=1
+  TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS=1
+[2026-11-14 00:37:29] TPU compile cache kernel inputs: tag=tpu-kernel-inputs-v1:49cb69d7414eb3deaf7e96f938dfcf80d7f49a29d97c9f50c54e972952b6bc33
+[2026-11-14 00:37:29] [TPU] TorchTPU eager mode set to DEFER_NEVER.
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:363: UserWarning: Warning only once for all operators,  other operators may also be overridden.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
+    registered at /pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: PrivateUse1
+  previous kernel: registered at /pytorch/build/aten/src/ATen/RegisterCPU_3.cpp:2489
+       new kernel: registered at /tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:743 (Triggered internally at /pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:208.)
+  self.m.impl(
+[2026-11-14 00:37:29] [TPU] Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, masked_scatter_, logaddexp, upsample_bicubic2d
+[2026-11-14 00:37:29] TPU compile cache kernel inputs: tag=tpu-kernel-inputs-v1:49cb69d7414eb3deaf7e96f938dfcf80d7f49a29d97c9f50c54e972952b6bc33
+[2026-11-14 00:37:29] [TPU] TorchTPU eager mode set to DEFER_NEVER.
+[2026-11-14 00:37:29] TPU compile cache kernel inputs: tag=tpu-kernel-inputs-v1:49cb69d7414eb3deaf7e96f938dfcf80d7f49a29d97c9f50c54e972952b6bc33
+[2026-11-14 00:37:29] [TPU] TorchTPU eager mode set to DEFER_NEVER.
+[2026-11-14 00:37:29] [TPU] libtpu premapped host staging pool: 4.00 GiB (TPU_PREMAPPED_BUFFER_SIZE=4294967296); raise it if KV-offload H2D OOMs.
+[2026-11-14 00:37:29] [TPU] TPU env:
+  TORCH_TPU_SLICEBUILDER_ADDRESSES=10.228.7.222:8070,10.228.7.222:8071,10.228.7.222:8072,10.228.7.222:8073,10.228.7.222:8074,10.228.7.222:8075,10.228.7.222:8076,10.228.7.222:8077,10.228.6.96:8070,10.228.6.96:8071,10.228.6.96:8072,10.228.6.96:8073,10.228.6.96:8074,10.228.6.96:8075,10.228.6.96:8076,10.228.6.96:8077
+  TORCH_TPU_TOPOLOGY=2,2,2,2
+  TORCH_TPU_BASE_PORT=8070
+  TORCH_TPU_DEVICES_PER_HOST=8
+  TPU_WORKER_HOSTNAMES=10.228.7.222,10.228.6.96
+  TPU_WORKER_ID=1
+  TPU_TOPOLOGY=2x2x2
+  TPU_PREMAPPED_BUFFER_SIZE=4294967296
+  LIBTPU_INIT_ARGS=--xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false --xla_gf_vmem_max_outstanding_prefetches=1
+  SGLANG_NATIVE_MOVE_KV_CACHE=1
+  TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS=1
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:363: UserWarning: Warning only once for all operators,  other operators may also be overridden.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
+    registered at /pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: PrivateUse1
+  previous kernel: registered at /pytorch/build/aten/src/ATen/RegisterCPU_3.cpp:2489
+       new kernel: registered at /tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:743 (Triggered internally at /pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:208.)
+  self.m.impl(
+[2026-11-14 00:37:29] [TPU] Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, masked_scatter_, logaddexp, upsample_bicubic2d
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:363: UserWarning: Warning only once for all operators,  other operators may also be overridden.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
+    registered at /pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: PrivateUse1
+  previous kernel: registered at /pytorch/build/aten/src/ATen/RegisterCPU_3.cpp:2489
+       new kernel: registered at /tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:743 (Triggered internally at /pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:208.)
+  self.m.impl(
+[2026-11-14 00:37:29] [TPU] Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, masked_scatter_, logaddexp, upsample_bicubic2d
+[2026-11-14 00:37:29] TPU compile cache kernel inputs: tag=tpu-kernel-inputs-v1:49cb69d7414eb3deaf7e96f938dfcf80d7f49a29d97c9f50c54e972952b6bc33
+[2026-11-14 00:37:29] [TPU] TorchTPU eager mode set to DEFER_NEVER.
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:363: UserWarning: Warning only once for all operators,  other operators may also be overridden.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
+    registered at /pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: PrivateUse1
+  previous kernel: registered at /pytorch/build/aten/src/ATen/RegisterCPU_3.cpp:2489
+       new kernel: registered at /tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:743 (Triggered internally at /pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:208.)
+  self.m.impl(
+[2026-11-14 00:37:29] [TPU] Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, masked_scatter_, logaddexp, upsample_bicubic2d
+[2026-11-14 00:37:29] [TPU] libtpu premapped host staging pool: 4.00 GiB (TPU_PREMAPPED_BUFFER_SIZE=4294967296); raise it if KV-offload H2D OOMs.
+[2026-11-14 00:37:29] [TPU] TPU env:
+  TORCH_TPU_SLICEBUILDER_ADDRESSES=10.228.7.222:8070,10.228.7.222:8071,10.228.7.222:8072,10.228.7.222:8073,10.228.7.222:8074,10.228.7.222:8075,10.228.7.222:8076,10.228.7.222:8077,10.228.6.96:8070,10.228.6.96:8071,10.228.6.96:8072,10.228.6.96:8073,10.228.6.96:8074,10.228.6.96:8075,10.228.6.96:8076,10.228.6.96:8077
+  TORCH_TPU_TOPOLOGY=2,2,2,2
+  TORCH_TPU_BASE_PORT=8070
+  TORCH_TPU_DEVICES_PER_HOST=8
+  TPU_WORKER_HOSTNAMES=10.228.7.222,10.228.6.96
+  TPU_WORKER_ID=1
+  TPU_TOPOLOGY=2x2x2
+  TPU_PREMAPPED_BUFFER_SIZE=4294967296
+  LIBTPU_INIT_ARGS=--xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false --xla_gf_vmem_max_outstanding_prefetches=1
+  SGLANG_NATIVE_MOVE_KV_CACHE=1
+  TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS=1
+[2026-11-14 00:37:29] TPU compile cache kernel inputs: tag=tpu-kernel-inputs-v1:49cb69d7414eb3deaf7e96f938dfcf80d7f49a29d97c9f50c54e972952b6bc33
+[2026-11-14 00:37:29] [TPU] TorchTPU eager mode set to DEFER_NEVER.
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:363: UserWarning: Warning only once for all operators,  other operators may also be overridden.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
+    registered at /pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: PrivateUse1
+  previous kernel: registered at /pytorch/build/aten/src/ATen/RegisterCPU_3.cpp:2489
+       new kernel: registered at /tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/library.py:743 (Triggered internally at /pytorch/aten/src/ATen/core/dispatch/OperatorEntry.cpp:208.)
+  self.m.impl(
+[2026-11-14 00:37:29] [TPU] Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, masked_scatter_, logaddexp, upsample_bicubic2d
+[2026-11-14 00:37:30] Cannot detect CUDA architecture.
+[2026-11-14 00:37:30] Cannot detect CUDA architecture.
+[2026-11-14 00:37:30] Cannot detect CUDA architecture.
+[2026-11-14 00:37:30] Cannot detect CUDA architecture.
+[2026-11-14 00:37:30] Cannot detect CUDA architecture.
+[2026-11-14 00:37:30] Cannot detect CUDA architecture.
+[2026-11-14 00:37:30] Cannot detect CUDA architecture.
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_linear: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_nextn: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_linear: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_linear: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_nextn: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_nextn: No module named 'vllm'
+[2026-11-14 00:37:30] Cannot detect CUDA architecture.
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_linear: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_linear: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_nextn: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_nextn: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_linear: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_nextn: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_linear: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_nextn: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.falcon_mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_linear: No module named 'vllm'
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.falcon_mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.falcon_mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:30] Ignore import error when loading sglang.srt.models.bailing_moe_nextn: No module named 'vllm'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.falcon_mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.falcon_mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.falcon_mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.falcon_mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.falcon_mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.inkling: No module named 'cutlass'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.inkling: No module named 'cutlass'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.inkling: No module named 'cutlass'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.inkling: No module named 'cutlass'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.inkling: No module named 'cutlass'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.inkling: No module named 'cutlass'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.inkling: No module named 'cutlass'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.midashenglm: No module named 'torchaudio'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.midashenglm: No module named 'torchaudio'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.midashenglm: No module named 'torchaudio'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.inkling: No module named 'cutlass'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.midashenglm: No module named 'torchaudio'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.midashenglm: No module named 'torchaudio'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.midashenglm: No module named 'torchaudio'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.midashenglm: No module named 'torchaudio'
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.mamba: cannot import name 'causal_conv1d_fn' from 'sglang.srt.layers.attention.mamba.mamba' (/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/mamba/mamba.py)
+[2026-11-14 00:37:31] Ignore import error when loading sglang.srt.models.midashenglm: No module named 'torchaudio'
+[2026-11-14 00:37:31] sglang_tpu: registered 107 hook(s).
+[2026-11-14 00:37:31] sglang_tpu: registered 107 hook(s).
+[2026-11-14 00:37:31] sglang_tpu: registered 107 hook(s).
+[2026-11-14 00:37:32] sglang_tpu: registered 107 hook(s).
+[2026-11-14 00:37:32] sglang_tpu: registered 107 hook(s).
+[2026-11-14 00:37:32] sglang_tpu: registered 107 hook(s).
+[2026-11-14 00:37:32] sglang_tpu: registered 107 hook(s).
+[2026-11-14 00:37:32] sglang_tpu: registered 107 hook(s).
+[2026-11-14 00:37:32] Multiple AROUND hooks on 'sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch' (2 hooks, from: plugin=tpu_hooks, dist=sglang, plugin=tpu_hooks, dist=sglang). If any AROUND hook skips calling original_fn, inner hooks will be bypassed.
+[2026-11-14 00:37:33] Multiple AROUND hooks on 'sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch' (2 hooks, from: plugin=tpu_hooks, dist=sglang, plugin=tpu_hooks, dist=sglang). If any AROUND hook skips calling original_fn, inner hooks will be bypassed.
+[2026-11-14 00:37:33] Multiple AROUND hooks on 'sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch' (2 hooks, from: plugin=tpu_hooks, dist=sglang, plugin=tpu_hooks, dist=sglang). If any AROUND hook skips calling original_fn, inner hooks will be bypassed.
+[2026-11-14 00:37:33] Multiple AROUND hooks on 'sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch' (2 hooks, from: plugin=tpu_hooks, dist=sglang, plugin=tpu_hooks, dist=sglang). If any AROUND hook skips calling original_fn, inner hooks will be bypassed.
+[2026-11-14 00:37:33] Multiple AROUND hooks on 'sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch' (2 hooks, from: plugin=tpu_hooks, dist=sglang, plugin=tpu_hooks, dist=sglang). If any AROUND hook skips calling original_fn, inner hooks will be bypassed.
+[2026-11-14 00:37:33] Multiple AROUND hooks on 'sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch' (2 hooks, from: plugin=tpu_hooks, dist=sglang, plugin=tpu_hooks, dist=sglang). If any AROUND hook skips calling original_fn, inner hooks will be bypassed.
+[2026-11-14 00:37:33] Multiple AROUND hooks on 'sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch' (2 hooks, from: plugin=tpu_hooks, dist=sglang, plugin=tpu_hooks, dist=sglang). If any AROUND hook skips calling original_fn, inner hooks will be bypassed.
+[transformers] The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[2026-11-14 00:37:33] Multiple AROUND hooks on 'sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.from_schedule_batch' (2 hooks, from: plugin=tpu_hooks, dist=sglang, plugin=tpu_hooks, dist=sglang). If any AROUND hook skips calling original_fn, inner hooks will be bypassed.
+[transformers] The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[transformers] The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[2026-11-14 00:37:33 DP7 TP7 EP7] Init parallel begin.
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/patches.py:406: UserWarning: <TorchTpu/ApiStage/InternalApi/> set_device is internal to TorchTPU and may change or be removed without notice. Use torch.accelerator.set_device_index instead.
+  return orig_set_device(device)
+[2026-11-14 00:37:33 DP7 TP7 EP7] [TPU] TPU set_device(idx=7) skipped: Cannot set TPU device to index 7, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[2026-11-14 00:37:33 DP0 TP0 EP0] Init parallel begin.
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/patches.py:406: UserWarning: <TorchTpu/ApiStage/InternalApi/> set_device is internal to TorchTPU and may change or be removed without notice. Use torch.accelerator.set_device_index instead.
+  return orig_set_device(device)
+[2026-11-14 00:37:33 DP4 TP4 EP4] Init parallel begin.
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/patches.py:406: UserWarning: <TorchTpu/ApiStage/InternalApi/> set_device is internal to TorchTPU and may change or be removed without notice. Use torch.accelerator.set_device_index instead.
+  return orig_set_device(device)
+[2026-11-14 00:37:33 DP4 TP4 EP4] [TPU] TPU set_device(idx=4) skipped: Cannot set TPU device to index 4, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[W1114 00:37:33.699840604 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_SLICEBUILDER_ADDRESSES environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:33.699859148 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TOPOLOGY environment variable is an experimental feature and may change or be removed without notice. (function operator())
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1794616653.393392    2812 environment.cc:99] libtpu_init_args contains --xla_tpu_use_enhanced_launch_barrier=true, this can cause distributed hangs. Rewriting environment variable to false.
+[transformers] The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[transformers] The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[transformers] The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[transformers] The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[2026-11-14 00:37:33 DP2 TP2 EP2] Init parallel begin.
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/patches.py:406: UserWarning: <TorchTpu/ApiStage/InternalApi/> set_device is internal to TorchTPU and may change or be removed without notice. Use torch.accelerator.set_device_index instead.
+  return orig_set_device(device)
+[2026-11-14 00:37:33 DP2 TP2 EP2] [TPU] TPU set_device(idx=2) skipped: Cannot set TPU device to index 2, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[W1114 00:37:33.791430843 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_SLICEBUILDER_ADDRESSES environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:33.791443680 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TOPOLOGY environment variable is an experimental feature and may change or be removed without notice. (function operator())
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1794616653.484956    2810 environment.cc:99] libtpu_init_args contains --xla_tpu_use_enhanced_launch_barrier=true, this can cause distributed hangs. Rewriting environment variable to false.
+[2026-11-14 00:37:33 DP1 TP1 EP1] Init parallel begin.
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/patches.py:406: UserWarning: <TorchTpu/ApiStage/InternalApi/> set_device is internal to TorchTPU and may change or be removed without notice. Use torch.accelerator.set_device_index instead.
+  return orig_set_device(device)
+[2026-11-14 00:37:33 DP1 TP1 EP1] [TPU] TPU set_device(idx=1) skipped: Cannot set TPU device to index 1, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[W1114 00:37:33.831963163 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_SLICEBUILDER_ADDRESSES environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:33.831984190 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TOPOLOGY environment variable is an experimental feature and may change or be removed without notice. (function operator())
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1794616653.525540    2809 environment.cc:99] libtpu_init_args contains --xla_tpu_use_enhanced_launch_barrier=true, this can cause distributed hangs. Rewriting environment variable to false.
+[W1114 00:37:33.209129974 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_SLICEBUILDER_ADDRESSES environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:33.209144127 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TOPOLOGY environment variable is an experimental feature and may change or be removed without notice. (function operator())
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1794616653.902677    2815 environment.cc:99] libtpu_init_args contains --xla_tpu_use_enhanced_launch_barrier=true, this can cause distributed hangs. Rewriting environment variable to false.
+[transformers] The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[2026-11-14 00:37:33 DP3 TP3 EP3] Init parallel begin.
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/patches.py:406: UserWarning: <TorchTpu/ApiStage/InternalApi/> set_device is internal to TorchTPU and may change or be removed without notice. Use torch.accelerator.set_device_index instead.
+  return orig_set_device(device)
+[2026-11-14 00:37:33 DP3 TP3 EP3] [TPU] TPU set_device(idx=3) skipped: Cannot set TPU device to index 3, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[W1114 00:37:33.279321506 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_SLICEBUILDER_ADDRESSES environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:33.279335532 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TOPOLOGY environment variable is an experimental feature and may change or be removed without notice. (function operator())
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1794616653.972859    2811 environment.cc:99] libtpu_init_args contains --xla_tpu_use_enhanced_launch_barrier=true, this can cause distributed hangs. Rewriting environment variable to false.
+[2026-11-14 00:37:37 DP5 TP5 EP5] Init parallel begin.
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/patches.py:406: UserWarning: <TorchTpu/ApiStage/InternalApi/> set_device is internal to TorchTPU and may change or be removed without notice. Use torch.accelerator.set_device_index instead.
+  return orig_set_device(device)
+[2026-11-14 00:37:37 DP5 TP5 EP5] [TPU] TPU set_device(idx=5) skipped: Cannot set TPU device to index 5, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[W1114 00:37:37.649498339 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_SLICEBUILDER_ADDRESSES environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:37.649512451 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TOPOLOGY environment variable is an experimental feature and may change or be removed without notice. (function operator())
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1794616657.343041    2813 environment.cc:99] libtpu_init_args contains --xla_tpu_use_enhanced_launch_barrier=true, this can cause distributed hangs. Rewriting environment variable to false.
+[2026-11-14 00:37:37 DP6 TP6 EP6] Init parallel begin.
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/patches.py:406: UserWarning: <TorchTpu/ApiStage/InternalApi/> set_device is internal to TorchTPU and may change or be removed without notice. Use torch.accelerator.set_device_index instead.
+  return orig_set_device(device)
+[2026-11-14 00:37:37 DP6 TP6 EP6] [TPU] TPU set_device(idx=6) skipped: Cannot set TPU device to index 6, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[W1114 00:37:37.680625077 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_SLICEBUILDER_ADDRESSES environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:37.680639817 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TOPOLOGY environment variable is an experimental feature and may change or be removed without notice. (function operator())
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1794616657.374171    2814 environment.cc:99] libtpu_init_args contains --xla_tpu_use_enhanced_launch_barrier=true, this can cause distributed hangs. Rewriting environment variable to false.
+[W1114 00:37:37.689053297 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_SLICEBUILDER_ADDRESSES environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:37.689066509 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TOPOLOGY environment variable is an experimental feature and may change or be removed without notice. (function operator())
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1794616657.382598    2808 environment.cc:99] libtpu_init_args contains --xla_tpu_use_enhanced_launch_barrier=true, this can cause distributed hangs. Rewriting environment variable to false.
+[W1114 00:37:41.385945072 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_DEVICES_PER_HOST environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:41.026790987 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_DEVICES_PER_HOST environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:41.086613324 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_DEVICES_PER_HOST environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:41.142193064 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_DEVICES_PER_HOST environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:41.189754530 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_DEVICES_PER_HOST environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:41.215269996 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_DEVICES_PER_HOST environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:41.301329714 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_DEVICES_PER_HOST environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[W1114 00:37:42.538245475 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_DEVICES_PER_HOST environment variable is an experimental feature and may change or be removed without notice. (function operator())
+[2026-11-14 00:37:42 DP4 TP4 EP4] Init parallel ends. elapsed=8.99 s
+[2026-11-14 00:37:42 DP3 TP3 EP3] Init parallel ends. elapsed=8.42 s
+[2026-11-14 00:37:42 DP5 TP5 EP5] Init parallel ends. elapsed=5.05 s
+[2026-11-14 00:37:42 DP6 TP6 EP6] Init parallel ends. elapsed=5.01 s
+[2026-11-14 00:37:42 DP1 TP1 EP1] Init parallel ends. elapsed=8.87 s
+[2026-11-14 00:37:42 DP2 TP2 EP2] Init parallel ends. elapsed=8.90 s
+[2026-11-14 00:37:42 DP7 TP7 EP7] Init parallel ends. elapsed=9.07 s
+[2026-11-14 00:37:42 DP0 TP0 EP0] Init parallel ends. elapsed=9.03 s
+[2026-11-14 00:37:47 DP7 TP7 EP7] [TPU] TPU set_device(idx=7) skipped: Cannot set TPU device to index 7, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[2026-11-14 00:37:47 DP6 TP6 EP6] [TPU] TPU set_device(idx=6) skipped: Cannot set TPU device to index 6, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[2026-11-14 00:37:47 DP1 TP1 EP1] [TPU] TPU set_device(idx=1) skipped: Cannot set TPU device to index 1, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[2026-11-14 00:37:47 DP3 TP3 EP3] [TPU] TPU set_device(idx=3) skipped: Cannot set TPU device to index 3, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[2026-11-14 00:37:47 DP5 TP5 EP5] [TPU] TPU set_device(idx=5) skipped: Cannot set TPU device to index 5, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[2026-11-14 00:37:47 DP4 TP4 EP4] [TPU] TPU set_device(idx=4) skipped: Cannot set TPU device to index 4, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[2026-11-14 00:37:47 DP2 TP2 EP2] [TPU] TPU set_device(idx=2) skipped: Cannot set TPU device to index 2, current process is bound to device index 0. Changing the active TPU device within a process is not supported.
+[2026-11-14 00:37:48 DP0 TP0 EP0] Memory baseline taken. mem usage=0.00 GB
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/model_executor/model_runner.py:450: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Stream is experimental and subject to change: Stream() is experimental and may change or be removed without notice.
+  self.forward_stream = torch.get_device_module(self.device).Stream()
+[2026-11-14 00:37:48 DP0 TP0 EP0] Load weight begin. avail mem=94.74 GB
+[2026-11-14 00:37:48 DP6 TP6 EP6] Memory baseline taken. mem usage=0.00 GB
+[2026-11-14 00:37:48 DP5 TP5 EP5] Memory baseline taken. mem usage=0.00 GB
+[2026-11-14 00:37:48 DP4 TP4 EP4] Memory baseline taken. mem usage=0.00 GB
+[2026-11-14 00:37:48 DP7 TP7 EP7] Memory baseline taken. mem usage=0.00 GB
+[2026-11-14 00:37:48 DP1 TP1 EP1] Memory baseline taken. mem usage=0.00 GB
+[2026-11-14 00:37:48 DP2 TP2 EP2] Memory baseline taken. mem usage=0.00 GB
+[2026-11-14 00:37:48 DP3 TP3 EP3] Memory baseline taken. mem usage=0.00 GB
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/model_executor/model_runner.py:450: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Stream is experimental and subject to change: Stream() is experimental and may change or be removed without notice.
+  self.forward_stream = torch.get_device_module(self.device).Stream()
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/model_executor/model_runner.py:450: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Stream is experimental and subject to change: Stream() is experimental and may change or be removed without notice.
+  self.forward_stream = torch.get_device_module(self.device).Stream()
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/model_executor/model_runner.py:450: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Stream is experimental and subject to change: Stream() is experimental and may change or be removed without notice.
+  self.forward_stream = torch.get_device_module(self.device).Stream()
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/model_executor/model_runner.py:450: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Stream is experimental and subject to change: Stream() is experimental and may change or be removed without notice.
+  self.forward_stream = torch.get_device_module(self.device).Stream()
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/model_executor/model_runner.py:450: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Stream is experimental and subject to change: Stream() is experimental and may change or be removed without notice.
+  self.forward_stream = torch.get_device_module(self.device).Stream()
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/model_executor/model_runner.py:450: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Stream is experimental and subject to change: Stream() is experimental and may change or be removed without notice.
+  self.forward_stream = torch.get_device_module(self.device).Stream()
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/model_executor/model_runner.py:450: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> Stream is experimental and subject to change: Stream() is experimental and may change or be removed without notice.
+  self.forward_stream = torch.get_device_module(self.device).Stream()
+[2026-11-14 00:37:48 DP5 TP5 EP5] Load weight begin. avail mem=94.74 GB
+[2026-11-14 00:37:48 DP6 TP6 EP6] Load weight begin. avail mem=94.74 GB
+[2026-11-14 00:37:48 DP7 TP7 EP7] Load weight begin. avail mem=94.74 GB
+[2026-11-14 00:37:48 DP2 TP2 EP2] Load weight begin. avail mem=94.74 GB
+[2026-11-14 00:37:48 DP1 TP1 EP1] Load weight begin. avail mem=94.74 GB
+[2026-11-14 00:37:48 DP4 TP4 EP4] Load weight begin. avail mem=94.74 GB
+[2026-11-14 00:37:48 DP3 TP3 EP3] Load weight begin. avail mem=94.74 GB
+[2026-11-14 00:37:48 DP0 TP0 EP0] Detected fp8 checkpoint.
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)
+  return func(*args, **kwargs)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)
+  return func(*args, **kwargs)
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.
+  custom_op = jax_op(op_name, _wrapped)
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.
+  custom_op = jax_op(op_name, _wrapped)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)
+  return func(*args, **kwargs)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)
+  return func(*args, **kwargs)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)
+  return func(*args, **kwargs)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)
+  return func(*args, **kwargs)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)
+  return func(*args, **kwargs)
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.
+  custom_op = jax_op(op_name, _wrapped)
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.
+  custom_op = jax_op(op_name, _wrapped)
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.
+  custom_op = jax_op(op_name, _wrapped)
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.
+  custom_op = jax_op(op_name, _wrapped)
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.
+  custom_op = jax_op(op_name, _wrapped)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/utils/_device.py:116: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_TIER2_COMPILATION_CACHE environment variable is an experimental feature and may change or be removed without notice. (Triggered internally at ./csrc/common/env_vars.h:393.)
+  return func(*args, **kwargs)
+/tmp/glm52-peer-rank1.sv5wBI/src/sglang_tpu/moe/pallas/fused_moe_op.py:1109: UserWarning: <TorchTpu/ApiStage/ExperimentalApi/> jax_op is experimental and subject to change: torch.tpu.pallas.jax_op is experimental and subject to change.
+  custom_op = jax_op(op_name, _wrapped)
+Multi-thread loading shards:   0% Completed | 0/282 [00:00<?, ?it/s]Multi-thread loading shards:   0% Completed | 1/282 [00:40<3:11:17, 40.84s/it]Multi-thread loading shards:   1% Completed | 2/282 [01:02<2:18:53, 29.76s/it]Multi-thread loading shards:   1% Completed | 3/282 [01:03<1:16:34, 16.47s/it]Multi-thread loading shards:   1% Completed | 4/282 [01:10<58:29, 12.63s/it]  Multi-thread loading shards:   2% Completed | 5/282 [01:30<1:11:38, 15.52s/it]Multi-thread loading shards:   2% Completed | 6/282 [01:38<58:56, 12.81s/it]  Multi-thread loading shards:   2% Completed | 7/282 [01:39<40:44,  8.89s/it]Multi-thread loading shards:   3% Completed | 8/282 [01:47<40:13,  8.81s/it]Multi-thread loading shards:   3% Completed | 9/282 [02:07<55:43, 12.25s/it]Multi-thread loading shards:   4% Completed | 10/282 [02:11<43:25,  9.58s/it]Multi-thread loading shards:   4% Completed | 11/282 [02:13<32:58,  7.30s/it]Multi-thread loading shards:   4% Completed | 12/282 [02:25<38:48,  8.62s/it]Multi-thread loading shards:   5% Completed | 13/282 [02:44<53:01, 11.83s/it]Multi-thread loading shards:   5% Completed | 14/282 [02:45<38:00,  8.51s/it]Multi-thread loading shards:   5% Completed | 15/282 [02:47<30:09,  6.78s/it]Multi-thread loading shards:   6% Completed | 16/282 [03:07<47:39, 10.75s/it]Multi-thread loading shards:   6% Completed | 17/282 [03:15<43:49,  9.92s/it]Multi-thread loading shards:   6% Completed | 18/282 [03:19<34:46,  7.90s/it]Multi-thread loading shards:   7% Completed | 19/282 [03:28<37:10,  8.48s/it]Multi-thread loading shards:   7% Completed | 20/282 [03:42<44:16, 10.14s/it]Multi-thread loading shards:   7% Completed | 21/282 [03:45<34:51,  8.01s/it]Multi-thread loading shards:   8% Completed | 22/282 [03:49<28:52,  6.66s/it]Multi-thread loading shards:   8% Completed | 23/282 [03:55<28:31,  6.61s/it]Multi-thread loading shards:   9% Completed | 24/282 [04:16<46:22, 10.78s/it]Multi-thread loading shards:   9% Completed | 25/282 [04:18<34:48,  8.13s/it]Multi-thread loading shards:   9% Completed | 26/282 [04:23<30:10,  7.07s/it]Multi-thread loading shards:  10% Completed | 27/282 [04:40<43:13, 10.17s/it]Multi-thread loading shards:  10% Completed | 28/282 [04:47<39:20,  9.29s/it]Multi-thread loading shards:  10% Completed | 29/282 [04:49<29:28,  6.99s/it]Multi-thread loading shards:  11% Completed | 30/282 [05:01<35:21,  8.42s/it]Multi-thread loading shards:  11% Completed | 31/282 [05:18<46:27, 11.11s/it]Multi-thread loading shards:  11% Completed | 32/282 [05:21<35:44,  8.58s/it]Multi-thread loading shards:  12% Completed | 33/282 [05:23<28:18,  6.82s/it]Multi-thread loading shards:  12% Completed | 34/282 [05:35<34:09,  8.26s/it]Multi-thread loading shards:  12% Completed | 35/282 [05:54<47:08, 11.45s/it]Multi-thread loading shards:  13% Completed | 36/282 [05:54<33:26,  8.16s/it]Multi-thread loading shards:  13% Completed | 37/282 [06:00<30:06,  7.38s/it]Multi-thread loading shards:  13% Completed | 38/282 [06:18<43:35, 10.72s/it]Multi-thread loading shards:  14% Completed | 39/282 [06:35<50:00, 12.35s/it]Multi-thread loading shards:  14% Completed | 40/282 [06:36<36:03,  8.94s/it]Multi-thread loading shards:  15% Completed | 41/282 [06:43<34:23,  8.56s/it]Multi-thread loading shards:  15% Completed | 42/282 [07:00<43:57, 10.99s/it]Multi-thread loading shards:  15% Completed | 43/282 [07:07<39:09,  9.83s/it]Multi-thread loading shards:  16% Completed | 44/282 [07:07<27:38,  6.97s/it]Multi-thread loading shards:  16% Completed | 45/282 [07:19<33:00,  8.36s/it]Multi-thread loading shards:  16% Completed | 46/282 [07:35<42:22, 10.77s/it]Multi-thread loading shards:  17% Completed | 47/282 [07:38<32:48,  8.38s/it]Multi-thread loading shards:  17% Completed | 48/282 [07:40<24:50,  6.37s/it]Multi-thread loading shards:  17% Completed | 49/282 [07:49<28:23,  7.31s/it]Multi-thread loading shards:  18% Completed | 50/282 [08:09<43:00, 11.12s/it]Multi-thread loading shards:  18% Completed | 51/282 [08:11<31:48,  8.26s/it]Multi-thread loading shards:  18% Completed | 52/282 [08:14<26:18,  6.86s/it]Multi-thread loading shards:  19% Completed | 53/282 [08:35<41:18, 10.82s/it]Multi-thread loading shards:  19% Completed | 54/282 [08:44<39:21, 10.36s/it]Multi-thread loading shards:  20% Completed | 55/282 [08:46<29:46,  7.87s/it]Multi-thread loading shards:  20% Completed | 56/282 [08:53<29:13,  7.76s/it]Multi-thread loading shards:  20% Completed | 57/282 [09:19<49:38, 13.24s/it]Multi-thread loading shards:  21% Completed | 58/282 [09:20<35:26,  9.50s/it]Multi-thread loading shards:  21% Completed | 59/282 [09:22<26:49,  7.22s/it]Multi-thread loading shards:  21% Completed | 60/282 [09:31<28:59,  7.83s/it]Multi-thread loading shards:  22% Completed | 61/282 [09:45<35:34,  9.66s/it]Multi-thread loading shards:  22% Completed | 62/282 [09:46<25:56,  7.07s/it]Multi-thread loading shards:  22% Completed | 63/282 [09:52<24:36,  6.74s/it]Multi-thread loading shards:  23% Completed | 64/282 [10:11<37:08, 10.22s/it]Multi-thread loading shards:  23% Completed | 65/282 [10:20<36:00,  9.96s/it]Multi-thread loading shards:  23% Completed | 66/282 [10:22<27:52,  7.74s/it]Multi-thread loading shards:  24% Completed | 67/282 [10:31<28:50,  8.05s/it]Multi-thread loading shards:  24% Completed | 68/282 [10:53<43:12, 12.11s/it]Multi-thread loading shards:  24% Completed | 69/282 [10:55<32:49,  9.24s/it]Multi-thread loading shards:  25% Completed | 70/282 [11:01<28:38,  8.11s/it]Multi-thread loading shards:  25% Completed | 71/282 [11:12<31:19,  8.91s/it]Multi-thread loading shards:  26% Completed | 72/282 [11:34<45:11, 12.91s/it]Multi-thread loading shards:  26% Completed | 73/282 [11:36<33:17,  9.56s/it]Multi-thread loading shards:  26% Completed | 74/282 [11:52<40:31, 11.69s/it]Multi-thread loading shards:  27% Completed | 75/282 [12:05<41:44, 12.10s/it]Multi-thread loading shards:  27% Completed | 76/282 [12:13<37:11, 10.83s/it]Multi-thread loading shards:  27% Completed | 77/282 [12:13<26:10,  7.66s/it]Multi-thread loading shards:  28% Completed | 78/282 [12:34<39:27, 11.60s/it]Multi-thread loading shards:  28% Completed | 79/282 [12:48<41:47, 12.35s/it]Multi-thread loading shards:  28% Completed | 80/282 [12:54<34:35, 10.28s/it]Multi-thread loading shards:  29% Completed | 81/282 [12:55<25:10,  7.51s/it]Multi-thread loading shards:  29% Completed | 82/282 [13:08<30:14,  9.07s/it]Multi-thread loading shards:  29% Completed | 83/282 [13:41<54:11, 16.34s/it]Multi-thread loading shards:  30% Completed | 84/282 [13:41<38:08, 11.56s/it]Multi-thread loading shards:  30% Completed | 85/282 [13:44<29:15,  8.91s/it]Multi-thread loading shards:  30% Completed | 86/282 [14:05<41:04, 12.57s/it]Multi-thread loading shards:  31% Completed | 87/282 [14:16<39:00, 12.00s/it]Multi-thread loading shards:  31% Completed | 88/282 [14:17<28:14,  8.74s/it]Multi-thread loading shards:  32% Completed | 89/282 [14:24<26:17,  8.18s/it]Multi-thread loading shards:  32% Completed | 90/282 [14:43<36:50, 11.51s/it]Multi-thread loading shards:  32% Completed | 91/282 [14:49<30:50,  9.69s/it]Multi-thread loading shards:  33% Completed | 92/282 [14:50<23:08,  7.31s/it]Multi-thread loading shards:  33% Completed | 93/282 [15:01<26:28,  8.41s/it]Multi-thread loading shards:  33% Completed | 94/282 [15:18<34:06, 10.88s/it]Multi-thread loading shards:  34% Completed | 95/282 [15:21<27:05,  8.69s/it]Multi-thread loading shards:  34% Completed | 96/282 [15:24<21:13,  6.85s/it]Multi-thread loading shards:  34% Completed | 97/282 [15:42<31:05, 10.09s/it]Multi-thread loading shards:  35% Completed | 98/282 [15:50<29:06,  9.49s/it]Multi-thread loading shards:  35% Completed | 99/282 [15:54<23:55,  7.84s/it]Multi-thread loading shards:  35% Completed | 100/282 [15:58<20:49,  6.87s/it]Multi-thread loading shards:  36% Completed | 101/282 [16:21<34:40, 11.49s/it]Multi-thread loading shards:  36% Completed | 102/282 [16:27<29:27,  9.82s/it]Multi-thread loading shards:  37% Completed | 103/282 [16:27<20:42,  6.94s/it]Multi-thread loading shards:  37% Completed | 104/282 [16:34<20:42,  6.98s/it]Multi-thread loading shards:  37% Completed | 105/282 [16:56<33:42, 11.42s/it]Multi-thread loading shards:  38% Completed | 106/282 [16:59<26:45,  9.12s/it]Multi-thread loading shards:  38% Completed | 107/282 [17:03<21:36,  7.41s/it]Multi-thread loading shards:  38% Completed | 108/282 [17:20<29:49, 10.28s/it]Multi-thread loading shards:  39% Completed | 109/282 [17:29<28:43,  9.96s/it]Multi-thread loading shards:  39% Completed | 110/282 [17:31<21:29,  7.50s/it]Multi-thread loading shards:  39% Completed | 111/282 [17:36<19:08,  6.72s/it]Multi-thread loading shards:  40% Completed | 112/282 [17:57<31:32, 11.13s/it]Multi-thread loading shards:  40% Completed | 113/282 [17:58<23:06,  8.20s/it]Multi-thread loading shards:  40% Completed | 114/282 [18:01<17:48,  6.36s/it]Multi-thread loading shards:  41% Completed | 115/282 [18:11<21:22,  7.68s/it]Multi-thread loading shards:  41% Completed | 116/282 [18:30<30:46, 11.12s/it]Multi-thread loading shards:  41% Completed | 117/282 [18:33<23:29,  8.54s/it]Multi-thread loading shards:  42% Completed | 118/282 [18:35<17:50,  6.52s/it]Multi-thread loading shards:  42% Completed | 119/282 [18:50<24:42,  9.10s/it]Multi-thread loading shards:  43% Completed | 120/282 [19:19<40:39, 15.06s/it]Multi-thread loading shards:  43% Completed | 121/282 [19:23<31:34, 11.77s/it]Multi-thread loading shards:  43% Completed | 122/282 [19:27<25:04,  9.40s/it]Multi-thread loading shards:  44% Completed | 123/282 [19:46<32:49, 12.39s/it]Multi-thread loading shards:  44% Completed | 124/282 [19:54<28:46, 10.93s/it]Multi-thread loading shards:  44% Completed | 125/282 [19:56<21:45,  8.31s/it]Multi-thread loading shards:  45% Completed | 126/282 [20:02<19:33,  7.53s/it]Multi-thread loading shards:  45% Completed | 127/282 [20:21<28:15, 10.94s/it]Multi-thread loading shards:  45% Completed | 128/282 [20:23<21:40,  8.44s/it]Multi-thread loading shards:  46% Completed | 129/282 [20:26<17:27,  6.85s/it]Multi-thread loading shards:  46% Completed | 130/282 [20:37<20:33,  8.12s/it]Multi-thread loading shards:  46% Completed | 131/282 [20:57<28:58, 11.52s/it]Multi-thread loading shards:  47% Completed | 132/282 [20:58<21:16,  8.51s/it]Multi-thread loading shards:  47% Completed | 133/282 [21:04<19:03,  7.67s/it]Multi-thread loading shards:  48% Completed | 134/282 [21:25<28:39, 11.62s/it]Multi-thread loading shards:  48% Completed | 135/282 [21:34<26:40, 10.88s/it]Multi-thread loading shards:  48% Completed | 136/282 [21:35<18:59,  7.80s/it]Multi-thread loading shards:  49% Completed | 137/282 [21:43<19:19,  8.00s/it]Multi-thread loading shards:  49% Completed | 138/282 [22:01<26:31, 11.05s/it]Multi-thread loading shards:  49% Completed | 139/282 [22:02<19:21,  8.12s/it]Multi-thread loading shards:  50% Completed | 140/282 [22:06<16:01,  6.77s/it]Multi-thread loading shards:  50% Completed | 141/282 [22:12<15:20,  6.53s/it]Multi-thread loading shards:  50% Completed | 142/282 [22:38<28:38, 12.28s/it]Multi-thread loading shards:  51% Completed | 143/282 [22:39<20:53,  9.02s/it]Multi-thread loading shards:  51% Completed | 144/282 [22:44<17:57,  7.81s/it]Multi-thread loading shards:  51% Completed | 145/282 [23:01<24:03, 10.54s/it]Multi-thread loading shards:  52% Completed | 146/282 [23:09<21:59,  9.70s/it]Multi-thread loading shards:  52% Completed | 147/282 [23:13<18:07,  8.06s/it]Multi-thread loading shards:  52% Completed | 148/282 [23:23<19:08,  8.57s/it]Multi-thread loading shards:  53% Completed | 149/282 [23:41<25:07, 11.33s/it]Multi-thread loading shards:  53% Completed | 150/282 [23:43<19:17,  8.77s/it]Multi-thread loading shards:  54% Completed | 151/282 [23:47<15:30,  7.10s/it]Multi-thread loading shards:  54% Completed | 152/282 [23:55<16:11,  7.47s/it]Multi-thread loading shards:  54% Completed | 153/282 [24:15<24:29, 11.39s/it]Multi-thread loading shards:  55% Completed | 154/282 [24:16<17:09,  8.05s/it]Multi-thread loading shards:  55% Completed | 155/282 [24:22<15:51,  7.49s/it]Multi-thread loading shards:  55% Completed | 156/282 [24:39<21:41, 10.33s/it]Multi-thread loading shards:  56% Completed | 157/282 [24:48<20:36,  9.89s/it]Multi-thread loading shards:  56% Completed | 158/282 [24:50<15:40,  7.58s/it]Multi-thread loading shards:  56% Completed | 159/282 [24:59<16:13,  7.91s/it]Multi-thread loading shards:  57% Completed | 160/282 [25:17<22:21, 11.00s/it]Multi-thread loading shards:  57% Completed | 161/282 [25:23<19:01,  9.44s/it]Multi-thread loading shards:  57% Completed | 162/282 [25:25<14:30,  7.25s/it]Multi-thread loading shards:  58% Completed | 163/282 [25:35<16:01,  8.08s/it]Multi-thread loading shards:  58% Completed | 164/282 [25:52<21:16, 10.82s/it]Multi-thread loading shards:  59% Completed | 165/282 [25:55<16:32,  8.48s/it]Multi-thread loading shards:  59% Completed | 166/282 [25:59<13:33,  7.01s/it]Multi-thread loading shards:  59% Completed | 167/282 [26:19<20:55, 10.92s/it]Multi-thread loading shards:  60% Completed | 168/282 [26:27<19:32, 10.28s/it]Multi-thread loading shards:  60% Completed | 169/282 [26:31<15:30,  8.23s/it]Multi-thread loading shards:  60% Completed | 170/282 [26:37<14:15,  7.64s/it]Multi-thread loading shards:  61% Completed | 171/282 [26:55<19:47, 10.70s/it]Multi-thread loading shards:  61% Completed | 172/282 [27:00<16:22,  8.93s/it]Multi-thread loading shards:  61% Completed | 173/282 [27:01<11:54,  6.56s/it]Multi-thread loading shards:  62% Completed | 174/282 [27:13<14:37,  8.13s/it]Multi-thread loading shards:  62% Completed | 175/282 [27:30<19:19, 10.84s/it]Multi-thread loading shards:  62% Completed | 176/282 [27:33<15:18,  8.66s/it]Multi-thread loading shards:  63% Completed | 177/282 [27:37<12:34,  7.19s/it]Multi-thread loading shards:  63% Completed | 178/282 [27:55<18:08, 10.46s/it]Multi-thread loading shards:  63% Completed | 179/282 [28:03<16:43,  9.74s/it]Multi-thread loading shards:  64% Completed | 180/282 [28:04<11:49,  6.96s/it]Multi-thread loading shards:  64% Completed | 181/282 [28:09<10:49,  6.43s/it]Multi-thread loading shards:  65% Completed | 182/282 [28:29<17:29, 10.50s/it]Multi-thread loading shards:  65% Completed | 183/282 [28:34<14:47,  8.97s/it]Multi-thread loading shards:  65% Completed | 184/282 [28:34<10:21,  6.34s/it]Multi-thread loading shards:  66% Completed | 185/282 [28:46<12:54,  7.98s/it]Multi-thread loading shards:  66% Completed | 186/282 [29:04<17:32, 10.96s/it]Multi-thread loading shards:  66% Completed | 187/282 [29:07<13:15,  8.37s/it]Multi-thread loading shards:  67% Completed | 188/282 [29:10<10:46,  6.88s/it]Multi-thread loading shards:  67% Completed | 189/282 [29:30<16:34, 10.69s/it]Multi-thread loading shards:  67% Completed | 190/282 [29:41<16:55, 11.04s/it]Multi-thread loading shards:  68% Completed | 191/282 [29:42<12:11,  8.04s/it]Multi-thread loading shards:  68% Completed | 192/282 [29:50<11:43,  7.81s/it]Multi-thread loading shards:  68% Completed | 193/282 [30:09<16:41, 11.25s/it]Multi-thread loading shards:  69% Completed | 194/282 [30:16<14:27,  9.86s/it]Multi-thread loading shards:  69% Completed | 195/282 [30:17<10:40,  7.36s/it]Multi-thread loading shards:  70% Completed | 196/282 [30:29<12:17,  8.57s/it]Multi-thread loading shards:  70% Completed | 197/282 [30:48<16:37, 11.74s/it]Multi-thread loading shards:  70% Completed | 198/282 [30:51<12:43,  9.09s/it]Multi-thread loading shards:  71% Completed | 199/282 [30:54<10:12,  7.38s/it]Multi-thread loading shards:  71% Completed | 200/282 [31:06<12:03,  8.83s/it]Multi-thread loading shards:  71% Completed | 201/282 [31:26<16:30, 12.23s/it]Multi-thread loading shards:  72% Completed | 202/282 [31:27<11:34,  8.69s/it]Multi-thread loading shards:  72% Completed | 203/282 [31:33<10:22,  7.88s/it]Multi-thread loading shards:  72% Completed | 204/282 [31:52<14:43, 11.32s/it]Multi-thread loading shards:  73% Completed | 205/282 [32:00<13:19, 10.38s/it]Multi-thread loading shards:  73% Completed | 206/282 [32:03<10:18,  8.14s/it]Multi-thread loading shards:  73% Completed | 207/282 [32:10<09:52,  7.89s/it]Multi-thread loading shards:  74% Completed | 208/282 [32:29<13:49, 11.21s/it]Multi-thread loading shards:  74% Completed | 209/282 [32:30<09:47,  8.05s/it]Multi-thread loading shards:  74% Completed | 210/282 [32:32<07:34,  6.31s/it]Multi-thread loading shards:  75% Completed | 211/282 [32:46<09:56,  8.39s/it]Multi-thread loading shards:  75% Completed | 212/282 [33:07<14:17, 12.24s/it]Multi-thread loading shards:  76% Completed | 213/282 [33:10<10:46,  9.37s/it]Multi-thread loading shards:  76% Completed | 214/282 [33:16<09:35,  8.47s/it]Multi-thread loading shards:  76% Completed | 215/282 [33:35<13:04, 11.72s/it]Multi-thread loading shards:  77% Completed | 216/282 [33:44<11:48, 10.74s/it]Multi-thread loading shards:  77% Completed | 217/282 [33:45<08:26,  7.79s/it]Multi-thread loading shards:  77% Completed | 218/282 [33:54<08:45,  8.20s/it]Multi-thread loading shards:  78% Completed | 219/282 [34:11<11:29, 10.95s/it]Multi-thread loading shards:  78% Completed | 220/282 [34:15<09:11,  8.90s/it]Multi-thread loading shards:  78% Completed | 221/282 [34:19<07:24,  7.28s/it]Multi-thread loading shards:  79% Completed | 222/282 [34:30<08:28,  8.48s/it]Multi-thread loading shards:  79% Completed | 223/282 [34:54<13:03, 13.29s/it]Multi-thread loading shards:  79% Completed | 224/282 [34:57<09:43, 10.07s/it]Multi-thread loading shards:  80% Completed | 225/282 [35:03<08:17,  8.73s/it]Multi-thread loading shards:  80% Completed | 226/282 [35:23<11:28, 12.29s/it]Multi-thread loading shards:  80% Completed | 227/282 [35:46<14:04, 15.35s/it]Multi-thread loading shards:  81% Completed | 228/282 [35:49<10:32, 11.72s/it]Multi-thread loading shards:  81% Completed | 229/282 [36:02<10:40, 12.09s/it]Multi-thread loading shards:  82% Completed | 230/282 [36:27<13:55, 16.07s/it]Multi-thread loading shards:  82% Completed | 231/282 [36:31<10:31, 12.38s/it]Multi-thread loading shards:  82% Completed | 232/282 [36:36<08:25, 10.10s/it]Multi-thread loading shards:  83% Completed | 233/282 [36:48<08:42, 10.67s/it]Multi-thread loading shards:  83% Completed | 234/282 [37:08<10:47, 13.49s/it]Multi-thread loading shards:  83% Completed | 235/282 [37:08<07:27,  9.52s/it]Multi-thread loading shards:  84% Completed | 236/282 [37:14<06:23,  8.34s/it]Multi-thread loading shards:  84% Completed | 237/282 [37:34<08:53, 11.85s/it]Multi-thread loading shards:  84% Completed | 238/282 [37:44<08:24, 11.47s/it]Multi-thread loading shards:  85% Completed | 239/282 [37:47<06:18,  8.81s/it]Multi-thread loading shards:  85% Completed | 240/282 [37:54<05:51,  8.38s/it]Multi-thread loading shards:  85% Completed | 241/282 [38:28<10:49, 15.84s/it]Multi-thread loading shards:  86% Completed | 242/282 [38:34<08:38, 12.96s/it]Multi-thread loading shards:  86% Completed | 243/282 [38:35<06:01,  9.28s/it]Multi-thread loading shards:  87% Completed | 244/282 [38:45<06:09,  9.72s/it]Multi-thread loading shards:  87% Completed | 245/282 [39:05<07:45, 12.59s/it]Multi-thread loading shards:  87% Completed | 246/282 [39:08<05:50,  9.75s/it]Multi-thread loading shards:  88% Completed | 247/282 [39:11<04:36,  7.89s/it]Multi-thread loading shards:  88% Completed | 248/282 [39:29<06:05, 10.75s/it]Multi-thread loading shards:  88% Completed | 249/282 [39:34<04:57,  9.01s/it]Multi-thread loading shards:  89% Completed | 250/282 [39:38<04:07,  7.74s/it]Multi-thread loading shards:  89% Completed | 251/282 [39:46<03:59,  7.72s/it]Multi-thread loading shards:  89% Completed | 252/282 [40:06<05:45, 11.53s/it]Multi-thread loading shards:  90% Completed | 253/282 [40:12<04:39,  9.62s/it]Multi-thread loading shards:  90% Completed | 254/282 [40:15<03:35,  7.69s/it]Multi-thread loading shards:  90% Completed | 255/282 [40:27<04:06,  9.12s/it]Multi-thread loading shards:  91% Completed | 256/282 [40:49<05:36, 12.93s/it]Multi-thread loading shards:  91% Completed | 257/282 [40:54<04:23, 10.54s/it]Multi-thread loading shards:  91% Completed | 258/282 [40:55<03:00,  7.53s/it]Multi-thread loading shards:  92% Completed | 259/282 [41:17<04:38, 12.12s/it]Multi-thread loading shards:  92% Completed | 260/282 [41:26<04:03, 11.05s/it]Multi-thread loading shards:  93% Completed | 261/282 [41:29<03:00,  8.60s/it]Multi-thread loading shards:  93% Completed | 262/282 [41:36<02:40,  8.04s/it]Multi-thread loading shards:  93% Completed | 263/282 [41:55<03:38, 11.49s/it]Multi-thread loading shards:  94% Completed | 264/282 [41:57<02:32,  8.48s/it]Multi-thread loading shards:  94% Completed | 265/282 [42:00<01:57,  6.91s/it]Multi-thread loading shards:  94% Completed | 266/282 [42:14<02:26,  9.19s/it]Multi-thread loading shards:  95% Completed | 267/282 [42:37<03:18, 13.23s/it]Multi-thread loading shards:  95% Completed | 268/282 [42:41<02:25, 10.39s/it]Multi-thread loading shards:  95% Completed | 269/282 [42:43<01:42,  7.86s/it]Multi-thread loading shards:  96% Completed | 270/282 [42:57<01:59,  9.93s/it]Multi-thread loading shards:  96% Completed | 271/282 [43:01<01:27,  7.93s/it]Multi-thread loading shards:  96% Completed | 272/282 [43:06<01:10,  7.01s/it]Multi-thread loading shards:  97% Completed | 273/282 [43:10<00:56,  6.27s/it]Multi-thread loading shards:  97% Completed | 274/282 [43:20<00:59,  7.39s/it]Multi-thread loading shards:  98% Completed | 275/282 [43:28<00:52,  7.51s/it]Multi-thread loading shards:  98% Completed | 276/282 [43:29<00:33,  5.54s/it]Multi-thread loading shards:  98% Completed | 277/282 [43:40<00:35,  7.15s/it]Multi-thread loading shards:  99% Completed | 278/282 [43:57<00:40, 10.20s/it]Multi-thread loading shards:  99% Completed | 279/282 [44:03<00:26,  8.88s/it]Multi-thread loading shards:  99% Completed | 280/282 [44:05<00:13,  6.79s/it]Multi-thread loading shards: 100% Completed | 281/282 [44:16<00:08,  8.14s/it]Multi-thread loading shards: 100% Completed | 282/282 [44:17<00:00,  6.11s/it]Multi-thread loading shards: 100% Completed | 282/282 [44:17<00:00,  9.43s/it]
+[2026-11-14 01:22:16 DP2 TP2 EP2] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.
+[2026-11-14 01:22:16 DP2 TP2 EP2] Load weight end. elapsed=2668.07 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-14 01:22:16 DP7 TP7 EP7] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.
+[2026-11-14 01:22:16 DP7 TP7 EP7] Load weight end. elapsed=2668.11 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-14 01:22:16 DP5 TP5 EP5] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.
+[2026-11-14 01:22:16 DP5 TP5 EP5] Load weight end. elapsed=2668.21 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-14 01:22:16 DP0 TP0 EP0] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.
+[2026-11-14 01:22:16 DP0 TP0 EP0] Load weight end. elapsed=2668.26 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-14 01:22:16 DP6 TP6 EP6] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.
+[2026-11-14 01:22:16 DP6 TP6 EP6] Load weight end. elapsed=2668.26 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-14 01:22:16 DP1 TP1 EP1] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.
+[2026-11-14 01:22:16 DP1 TP1 EP1] Load weight end. elapsed=2668.27 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-14 01:22:16 DP4 TP4 EP4] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.
+[2026-11-14 01:22:16 DP4 TP4 EP4] Load weight end. elapsed=2668.39 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-14 01:22:17 DP3 TP3 EP3] Using FP8 KV cache but no scaling factors provided. Defaulting to scaling factors of 1.0.
+[2026-11-14 01:22:17 DP3 TP3 EP3] Load weight end. elapsed=2668.98 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-14 01:28:23 DP0 TP0 EP0] Allocating split TPU MLA KV buffers: layers=78, nope=(2305, 64, 4, 128), rope=(2305, 16, 4, 128), index keys=(2305, 16, 4, 256) on 21 layers
+[2026-11-14 01:28:23 DP7 TP7 EP7] Allocating split TPU MLA KV buffers: layers=78, nope=(2305, 64, 4, 128), rope=(2305, 16, 4, 128), index keys=(2305, 16, 4, 256) on 21 layers
+[2026-11-14 01:28:23 DP6 TP6 EP6] Allocating split TPU MLA KV buffers: layers=78, nope=(2305, 64, 4, 128), rope=(2305, 16, 4, 128), index keys=(2305, 16, 4, 256) on 21 layers
+[2026-11-14 01:28:23 DP2 TP2 EP2] Allocating split TPU MLA KV buffers: layers=78, nope=(2305, 64, 4, 128), rope=(2305, 16, 4, 128), index keys=(2305, 16, 4, 256) on 21 layers
+[2026-11-14 01:28:23 DP3 TP3 EP3] Allocating split TPU MLA KV buffers: layers=78, nope=(2305, 64, 4, 128), rope=(2305, 16, 4, 128), index keys=(2305, 16, 4, 256) on 21 layers
+[2026-11-14 01:28:23 DP0 TP0 EP0] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 147456, KV size: 7.60 GB
+[2026-11-14 01:28:23 DP5 TP5 EP5] Allocating split TPU MLA KV buffers: layers=78, nope=(2305, 64, 4, 128), rope=(2305, 16, 4, 128), index keys=(2305, 16, 4, 256) on 21 layers
+[2026-11-14 01:28:23 DP4 TP4 EP4] Allocating split TPU MLA KV buffers: layers=78, nope=(2305, 64, 4, 128), rope=(2305, 16, 4, 128), index keys=(2305, 16, 4, 256) on 21 layers
+[2026-11-14 01:28:23 DP0 TP0 EP0] Memory pool end. avail mem=36.82 GB
+[2026-11-14 01:28:23 DP1 TP1 EP1] Allocating split TPU MLA KV buffers: layers=78, nope=(2305, 64, 4, 128), rope=(2305, 16, 4, 128), index keys=(2305, 16, 4, 256) on 21 layers
+[2026-11-14 01:28:23 DP7 TP7 EP7] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 147456, KV size: 7.60 GB
+[2026-11-14 01:28:23 DP6 TP6 EP6] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 147456, KV size: 7.60 GB
+[2026-11-14 01:28:23 DP7 TP7 EP7] Memory pool end. avail mem=36.82 GB
+[2026-11-14 01:28:23 DP2 TP2 EP2] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 147456, KV size: 7.60 GB
+[2026-11-14 01:28:23 DP6 TP6 EP6] Memory pool end. avail mem=36.82 GB
+[2026-11-14 01:28:23 DP2 TP2 EP2] Memory pool end. avail mem=36.82 GB
+[2026-11-14 01:28:23 DP3 TP3 EP3] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 147456, KV size: 7.60 GB
+[2026-11-14 01:28:23 DP4 TP4 EP4] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 147456, KV size: 7.60 GB
+[2026-11-14 01:28:23 DP3 TP3 EP3] Memory pool end. avail mem=36.82 GB
+[2026-11-14 01:28:23 DP5 TP5 EP5] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 147456, KV size: 7.60 GB
+[2026-11-14 01:28:23 DP4 TP4 EP4] Memory pool end. avail mem=36.82 GB
+[2026-11-14 01:28:23 DP1 TP1 EP1] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 147456, KV size: 7.60 GB
+[2026-11-14 01:28:23 DP5 TP5 EP5] Memory pool end. avail mem=36.82 GB
+[2026-11-14 01:28:23 DP1 TP1 EP1] Memory pool end. avail mem=36.82 GB
+[2026-11-14 01:28:23 DP0 TP0 EP0] Checkpoint page-cache release queued before graph warmup
+[2026-11-14 01:28:23 DP4 TP4 EP4] Disable prefill CUDA graph because cuda_graph_config resolved prefill.backend='disabled' (e.g. via --cuda-graph-backend-prefill=disabled or auto-disable rules).
+[2026-11-14 01:28:23 DP7 TP7 EP7] Disable prefill CUDA graph because cuda_graph_config resolved prefill.backend='disabled' (e.g. via --cuda-graph-backend-prefill=disabled or auto-disable rules).
+[2026-11-14 01:28:23 DP5 TP5 EP5] Disable prefill CUDA graph because cuda_graph_config resolved prefill.backend='disabled' (e.g. via --cuda-graph-backend-prefill=disabled or auto-disable rules).
+[2026-11-14 01:28:23 DP6 TP6 EP6] Disable prefill CUDA graph because cuda_graph_config resolved prefill.backend='disabled' (e.g. via --cuda-graph-backend-prefill=disabled or auto-disable rules).
+[2026-11-14 01:28:23 DP3 TP3 EP3] Disable prefill CUDA graph because cuda_graph_config resolved prefill.backend='disabled' (e.g. via --cuda-graph-backend-prefill=disabled or auto-disable rules).
+[2026-11-14 01:28:23 DP2 TP2 EP2] Disable prefill CUDA graph because cuda_graph_config resolved prefill.backend='disabled' (e.g. via --cuda-graph-backend-prefill=disabled or auto-disable rules).
+[2026-11-14 01:28:23 DP4 TP4 EP4] Capture target decode TPU graph begin. backend=disabled, num_tokens_per_req=1, bs=[1, 2], avail mem=29.22 GB
+[2026-11-14 01:28:23 DP7 TP7 EP7] Capture target decode TPU graph begin. backend=disabled, num_tokens_per_req=1, bs=[1, 2], avail mem=29.22 GB
+[2026-11-14 01:28:23 DP1 TP1 EP1] Disable prefill CUDA graph because cuda_graph_config resolved prefill.backend='disabled' (e.g. via --cuda-graph-backend-prefill=disabled or auto-disable rules).
+[2026-11-14 01:28:23 DP6 TP6 EP6] Capture target decode TPU graph begin. backend=disabled, num_tokens_per_req=1, bs=[1, 2], avail mem=29.22 GB
+[2026-11-14 01:28:23 DP5 TP5 EP5] Capture target decode TPU graph begin. backend=disabled, num_tokens_per_req=1, bs=[1, 2], avail mem=29.22 GB
+[2026-11-14 01:28:23 DP3 TP3 EP3] Capture target decode TPU graph begin. backend=disabled, num_tokens_per_req=1, bs=[1, 2], avail mem=29.22 GB
+[2026-11-14 01:28:23 DP2 TP2 EP2] Capture target decode TPU graph begin. backend=disabled, num_tokens_per_req=1, bs=[1, 2], avail mem=29.22 GB
+[2026-11-14 01:28:23 DP4 TP4 EP4] TPU compile cache rank assignment: {'rank': 4, 'rank_to_device': [0, 1, 4, 5, 6, 7, 2, 3, 8, 9, 12, 13, 14, 15, 10, 11], 'topology': '2,2,2,2'}, tag=tpu-rank-assignment-v1:16979a07bca3c9e335edd573350a087c173f862c375319ce79aac0de2b851ef7
+[2026-11-14 01:28:23 DP7 TP7 EP7] TPU compile cache rank assignment: {'rank': 7, 'rank_to_device': [0, 1, 4, 5, 6, 7, 2, 3, 8, 9, 12, 13, 14, 15, 10, 11], 'topology': '2,2,2,2'}, tag=tpu-rank-assignment-v1:c3893552527a3ff99e983903b60d95baca24755c8c731018eabf346f9d2acfc0
+[2026-11-14 01:28:23 DP1 TP1 EP1] Capture target decode TPU graph begin. backend=disabled, num_tokens_per_req=1, bs=[1, 2], avail mem=29.22 GB
+[2026-11-14 01:28:23 DP0 TP0 EP0] Disable prefill CUDA graph because cuda_graph_config resolved prefill.backend='disabled' (e.g. via --cuda-graph-backend-prefill=disabled or auto-disable rules).
+[2026-11-14 01:28:23 DP6 TP6 EP6] TPU compile cache rank assignment: {'rank': 6, 'rank_to_device': [0, 1, 4, 5, 6, 7, 2, 3, 8, 9, 12, 13, 14, 15, 10, 11], 'topology': '2,2,2,2'}, tag=tpu-rank-assignment-v1:65ad15e38059b5db45cfe6974d9df258e878bad650ab5e598c93bd9fba7bdecb
+[2026-11-14 01:28:23 DP3 TP3 EP3] TPU compile cache rank assignment: {'rank': 3, 'rank_to_device': [0, 1, 4, 5, 6, 7, 2, 3, 8, 9, 12, 13, 14, 15, 10, 11], 'topology': '2,2,2,2'}, tag=tpu-rank-assignment-v1:c6ae60264307bad67675dadfeb18c2cb12d409113ae3db434ff781c2f8f53a89
+[2026-11-14 01:28:23 DP5 TP5 EP5] TPU compile cache rank assignment: {'rank': 5, 'rank_to_device': [0, 1, 4, 5, 6, 7, 2, 3, 8, 9, 12, 13, 14, 15, 10, 11], 'topology': '2,2,2,2'}, tag=tpu-rank-assignment-v1:f8c67420703c4969189ca2de6fe5296485aa1270250d3790a1d16a545d197695
+[2026-11-14 01:28:23 DP2 TP2 EP2] TPU compile cache rank assignment: {'rank': 2, 'rank_to_device': [0, 1, 4, 5, 6, 7, 2, 3, 8, 9, 12, 13, 14, 15, 10, 11], 'topology': '2,2,2,2'}, tag=tpu-rank-assignment-v1:88a30c51da7d08dfea6489672fd3ed45fea795337c39b58e6fa4de9b36eebc58
+[2026-11-14 01:28:23 DP1 TP1 EP1] TPU compile cache rank assignment: {'rank': 1, 'rank_to_device': [0, 1, 4, 5, 6, 7, 2, 3, 8, 9, 12, 13, 14, 15, 10, 11], 'topology': '2,2,2,2'}, tag=tpu-rank-assignment-v1:71fce507024dab634f112221b43672a1a7fba0ff589fe8f00613e62661112e06
+[2026-11-14 01:28:23 DP0 TP0 EP0] Capture target decode TPU graph begin. backend=disabled, num_tokens_per_req=1, bs=[1, 2], avail mem=29.22 GB
+[2026-11-14 01:28:23 DP0 TP0 EP0] TPU compile cache rank assignment: {'rank': 0, 'rank_to_device': [0, 1, 4, 5, 6, 7, 2, 3, 8, 9, 12, 13, 14, 15, 10, 11], 'topology': '2,2,2,2'}, tag=tpu-rank-assignment-v1:759bda09e18c0e188456e56849ff82bbe8c52967012512026b23f6318be5c249
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+[2026-11-14 01:28:23 DP0 TP0 EP0] Available diffusion platform plugins:
+[2026-11-14 01:28:23 DP0 TP0 EP0]   - tpu_oot -> sglang_tpu.multimodal_gen:activate
+[2026-11-14 01:28:23 DP0 TP0 EP0] OOT platform plugin activated: tpu_oot -> sglang_tpu.multimodal_gen.platform.TpuOOTPlatform
+[2026-11-14 01:28:23 DP7 TP7 EP7] [TPU] enable_torch_compile=True but GlmMoeDsaForCausalLM declares no TPU compile policies; falling back to DecoderTpuCompilePolicy on forward.
+[2026-11-14 01:28:23 DP6 TP6 EP6] [TPU] enable_torch_compile=True but GlmMoeDsaForCausalLM declares no TPU compile policies; falling back to DecoderTpuCompilePolicy on forward.
+[2026-11-14 01:28:23 DP7 TP7 EP7] [TPU] [decoder compile policy] _install_forward_shim for GlmMoeDsaForCausalLM (is_draft=False, is_eagle3_draft=False, shim_target=forward)
+[2026-11-14 01:28:23 DP7 TP7 EP7] [TPU] [decoder compile policy] Installed target/forward on GlmMoeDsaForCausalLM.forward (t-bucketer=TokenBucketer, b-bucketer=BatchSizeBucketer).
+[2026-11-14 01:28:23 DP6 TP6 EP6] [TPU] [decoder compile policy] _install_forward_shim for GlmMoeDsaForCausalLM (is_draft=False, is_eagle3_draft=False, shim_target=forward)
+[2026-11-14 01:28:23 DP6 TP6 EP6] [TPU] [decoder compile policy] Installed target/forward on GlmMoeDsaForCausalLM.forward (t-bucketer=TokenBucketer, b-bucketer=BatchSizeBucketer).
+[2026-11-14 01:28:23 DP4 TP4 EP4] [TPU] enable_torch_compile=True but GlmMoeDsaForCausalLM declares no TPU compile policies; falling back to DecoderTpuCompilePolicy on forward.
+[2026-11-14 01:28:23 DP4 TP4 EP4] [TPU] [decoder compile policy] _install_forward_shim for GlmMoeDsaForCausalLM (is_draft=False, is_eagle3_draft=False, shim_target=forward)
+[2026-11-14 01:28:23 DP2 TP2 EP2] [TPU] enable_torch_compile=True but GlmMoeDsaForCausalLM declares no TPU compile policies; falling back to DecoderTpuCompilePolicy on forward.
+[2026-11-14 01:28:23 DP4 TP4 EP4] [TPU] [decoder compile policy] Installed target/forward on GlmMoeDsaForCausalLM.forward (t-bucketer=TokenBucketer, b-bucketer=BatchSizeBucketer).
+[2026-11-14 01:28:23 DP2 TP2 EP2] [TPU] [decoder compile policy] _install_forward_shim for GlmMoeDsaForCausalLM (is_draft=False, is_eagle3_draft=False, shim_target=forward)
+[2026-11-14 01:28:23 DP2 TP2 EP2] [TPU] [decoder compile policy] Installed target/forward on GlmMoeDsaForCausalLM.forward (t-bucketer=TokenBucketer, b-bucketer=BatchSizeBucketer).
+[2026-11-14 01:28:23 DP1 TP1 EP1] [TPU] enable_torch_compile=True but GlmMoeDsaForCausalLM declares no TPU compile policies; falling back to DecoderTpuCompilePolicy on forward.
+[2026-11-14 01:28:23 DP3 TP3 EP3] [TPU] enable_torch_compile=True but GlmMoeDsaForCausalLM declares no TPU compile policies; falling back to DecoderTpuCompilePolicy on forward.
+[2026-11-14 01:28:23 DP1 TP1 EP1] [TPU] [decoder compile policy] _install_forward_shim for GlmMoeDsaForCausalLM (is_draft=False, is_eagle3_draft=False, shim_target=forward)
+[2026-11-14 01:28:23 DP1 TP1 EP1] [TPU] [decoder compile policy] Installed target/forward on GlmMoeDsaForCausalLM.forward (t-bucketer=TokenBucketer, b-bucketer=BatchSizeBucketer).
+[2026-11-14 01:28:23 DP3 TP3 EP3] [TPU] [decoder compile policy] _install_forward_shim for GlmMoeDsaForCausalLM (is_draft=False, is_eagle3_draft=False, shim_target=forward)
+[2026-11-14 01:28:23 DP3 TP3 EP3] [TPU] [decoder compile policy] Installed target/forward on GlmMoeDsaForCausalLM.forward (t-bucketer=TokenBucketer, b-bucketer=BatchSizeBucketer).
+[2026-11-14 01:28:23 DP5 TP5 EP5] [TPU] enable_torch_compile=True but GlmMoeDsaForCausalLM declares no TPU compile policies; falling back to DecoderTpuCompilePolicy on forward.
+[2026-11-14 01:28:23 DP5 TP5 EP5] [TPU] [decoder compile policy] _install_forward_shim for GlmMoeDsaForCausalLM (is_draft=False, is_eagle3_draft=False, shim_target=forward)
+[2026-11-14 01:28:23 DP5 TP5 EP5] [TPU] [decoder compile policy] Installed target/forward on GlmMoeDsaForCausalLM.forward (t-bucketer=TokenBucketer, b-bucketer=BatchSizeBucketer).
+[2026-11-14 01:28:23 DP0 TP0 EP0] [TPU] enable_torch_compile=True but GlmMoeDsaForCausalLM declares no TPU compile policies; falling back to DecoderTpuCompilePolicy on forward.
+[2026-11-14 01:28:23 DP0 TP0 EP0] [TPU] [decoder compile policy] _install_forward_shim for GlmMoeDsaForCausalLM (is_draft=False, is_eagle3_draft=False, shim_target=forward)
+[2026-11-14 01:28:23 DP0 TP0 EP0] [TPU] [decoder compile policy] Installed target/forward on GlmMoeDsaForCausalLM.forward (t-bucketer=TokenBucketer, b-bucketer=BatchSizeBucketer).
+[2026-11-14 01:28:23 DP1 TP1 EP1] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)
+[2026-11-14 01:28:23 DP2 TP2 EP2] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)
+[2026-11-14 01:28:23 DP3 TP3 EP3] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)
+[2026-11-14 01:28:23 DP4 TP4 EP4] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)
+[2026-11-14 01:28:23 DP7 TP7 EP7] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)
+[2026-11-14 01:28:23 DP6 TP6 EP6] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)
+[2026-11-14 01:28:23 DP5 TP5 EP5] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)
+[2026-11-14 01:28:23 DP0 TP0 EP0] Pallas distributed TopK disabled; using full-vocabulary logits: rank 0: the logits processor does not use a supported TP gather
+[2026-11-14 01:28:23 DP0 TP0 EP0] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)
+Compiling EXTEND/MIXED:   0% Completed | 0/1 [00:00<?, ?it/s][2026-11-14 01:28:24 DP3 TP3 EP3] Prefill tokens reached padding on the device instead of the host, which may compile a program per prompt length.
+[2026-11-14 01:28:24 DP2 TP2 EP2] Prefill tokens reached padding on the device instead of the host, which may compile a program per prompt length.
+[2026-11-14 01:28:24 DP0 TP0 EP0] Prefill tokens reached padding on the device instead of the host, which may compile a program per prompt length.
+[2026-11-14 01:28:24 DP1 TP1 EP1] Prefill tokens reached padding on the device instead of the host, which may compile a program per prompt length.
+[2026-11-14 01:28:24 DP5 TP5 EP5] Prefill tokens reached padding on the device instead of the host, which may compile a program per prompt length.
+[2026-11-14 01:28:24 DP4 TP4 EP4] Prefill tokens reached padding on the device instead of the host, which may compile a program per prompt length.
+[2026-11-14 01:28:24 DP7 TP7 EP7] Prefill tokens reached padding on the device instead of the host, which may compile a program per prompt length.
+[2026-11-14 01:28:24 DP6 TP6 EP6] Prefill tokens reached padding on the device instead of the host, which may compile a program per prompt length.
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'utils.py:236'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/dsa/utils.py", line 236, in is_graph_dsa_split_op_surface
+    is_cuda()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'utils.py:236'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/dsa/utils.py", line 236, in is_graph_dsa_split_op_surface
+    is_cuda()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'utils.py:236'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/dsa/utils.py", line 236, in is_graph_dsa_split_op_surface
+    is_cuda()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'utils.py:236'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/dsa/utils.py", line 236, in is_graph_dsa_split_op_surface
+    is_cuda()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'utils.py:236'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/dsa/utils.py", line 236, in is_graph_dsa_split_op_surface
+    is_cuda()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'utils.py:236'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/dsa/utils.py", line 236, in is_graph_dsa_split_op_surface
+    is_cuda()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'utils.py:236'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/dsa/utils.py", line 236, in is_graph_dsa_split_op_surface
+    is_cuda()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'utils.py:236'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/layers/attention/dsa/utils.py", line 236, in is_graph_dsa_split_op_surface
+    is_cuda()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'parallel_state.py:1194'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/distributed/parallel_state.py", line 1194, in _maybe_aiter_reduce_scatter
+    is_hip()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'parallel_state.py:1194'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/distributed/parallel_state.py", line 1194, in _maybe_aiter_reduce_scatter
+    is_hip()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'parallel_state.py:1194'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/distributed/parallel_state.py", line 1194, in _maybe_aiter_reduce_scatter
+    is_hip()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'parallel_state.py:1194'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/distributed/parallel_state.py", line 1194, in _maybe_aiter_reduce_scatter
+    is_hip()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'parallel_state.py:1194'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/distributed/parallel_state.py", line 1194, in _maybe_aiter_reduce_scatter
+    is_hip()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'parallel_state.py:1194'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/distributed/parallel_state.py", line 1194, in _maybe_aiter_reduce_scatter
+    is_hip()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'parallel_state.py:1194'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/distributed/parallel_state.py", line 1194, in _maybe_aiter_reduce_scatter
+    is_hip()
+
+  torch._dynamo.utils.warn_once(msg)
+/tmp/glm52-peer-rank1.sv5wBI/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'parallel_state.py:1194'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/distributed/parallel_state.py", line 1194, in _maybe_aiter_reduce_scatter
+    is_hip()
+
+  torch._dynamo.utils.warn_once(msg)
+[2026-11-14 01:28:28 DP0 TP0 EP0] Checkpoint page-cache release: files=282 advised_gb=756.267 elapsed_s=5.6
+[2026-11-14 01:29:30 DP1 TP1 EP1] Split graph into 1 partitions, 0 of which run on CPU
+[2026-11-14 01:29:30 DP2 TP2 EP2] Split graph into 1 partitions, 0 of which run on CPU
+[2026-11-14 01:29:30 DP3 TP3 EP3] Split graph into 1 partitions, 0 of which run on CPU
+[2026-11-14 01:29:31 DP4 TP4 EP4] Split graph into 1 partitions, 0 of which run on CPU
+[2026-11-14 01:29:31 DP7 TP7 EP7] Split graph into 1 partitions, 0 of which run on CPU
+[2026-11-14 01:29:31 DP0 TP0 EP0] Split graph into 1 partitions, 0 of which run on CPU
+[2026-11-14 01:29:31 DP5 TP5 EP5] Split graph into 1 partitions, 0 of which run on CPU
+[2026-11-14 01:29:31 DP6 TP6 EP6] Split graph into 1 partitions, 0 of which run on CPU
+Compiled EXTEND (tokens=2048, bs=32, variant=plain, logits=FULL_VOCAB) in 487.7s HBM: +1144 MB (68233/97012 MB): :   0% Completed | 0/1 [08:07<?, ?it/s]Compiled EXTEND (tokens=2048, bs=32, variant=plain, logits=FULL_VOCAB) in 487.7s HBM: +1144 MB (68233/97012 MB): : 100% Completed | 1/1 [08:07<00:00, 487.68s/it][2026-11-14 01:36:31 DP1 TP1 EP1] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])
+Compiled EXTEND (tokens=2048, bs=32, variant=plain, logits=FULL_VOCAB) in 487.7s HBM: +1144 MB (68233/97012 MB): : 100% Completed | 1/1 [08:07<00:00, 487.68s/it]
+[2026-11-14 01:36:31 DP4 TP4 EP4] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])
+[2026-11-14 01:36:31 DP2 TP2 EP2] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])
+[2026-11-14 01:36:31 DP3 TP3 EP3] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])
+[2026-11-14 01:36:31 DP6 TP6 EP6] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])
+[2026-11-14 01:36:31 DP5 TP5 EP5] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])
+[2026-11-14 01:36:31 DP7 TP7 EP7] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])
+[2026-11-14 01:36:31 DP0 TP0 EP0] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])
+Compiling DECODE:   0% Completed | 0/6 [00:00<?, ?it/s]+-----------+
+| Anomalies |
++-----------+
+---------
+Anomalies
+---------
++-----------+
+| Anomalies |
++-----------+
+---------
+Anomalies
+---------
+[2026-11-14 01:37:23] DataParallelController hit an exception: Traceback (most recent call last):
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/managers/data_parallel_controller.py", line 833, in run_data_parallel_controller_process
+    controller = DataParallelController(
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/managers/data_parallel_controller.py", line 209, in __init__
+    self.launch_dp_attention_schedulers(server_args, port_args)
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/managers/data_parallel_controller.py", line 600, in launch_dp_attention_schedulers
+    self.launch_tensor_parallel_group(
+  File "/tmp/glm52-peer-rank1.sv5wBI/src/python/sglang/srt/managers/data_parallel_controller.py", line 724, in launch_tensor_parallel_group
+    scheduler_info.append(scheduler_pipe_readers[i].recv())
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/multiprocessing/connection.py", line 250, in recv
+    buf = self._recv_bytes()
+          ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/multiprocessing/connection.py", line 430, in _recv_bytes
+    buf = self._recv(4)
+          ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/multiprocessing/connection.py", line 399, in _recv
+    raise EOFError
+EOFError
+
+[2026-11-14 01:37:23] Received sigquit from a child process. It usually means the child failed.
+[2026-11-14 01:37:23] kill_process_tree called: parent_pid=1586, include_parent=True, pid=1586
+===== END WHOLE SERVER LOG rank=1 =====
+falcon-agent: command failed: exit status 1
