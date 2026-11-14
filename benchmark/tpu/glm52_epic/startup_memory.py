@@ -27,6 +27,13 @@ def log_snapshot(path, max_bytes=4096):
         return {'error': type(error).__name__}
 
 
+def _cmdline(pid_path):
+    try:
+        return (pid_path / 'cmdline').read_bytes().replace(b'\\x00', b' ').decode('utf-8', errors='replace').strip()
+    except OSError:
+        return None
+
+
 def collect(proc=Path('/proc'), cgroup=Path('/sys/fs/cgroup'), root_pids=()):
     root_pids = tuple(int(pid) for pid in root_pids)
     record = {'time_ns': time.time_ns(), 'pid': os.getpid(),
@@ -82,6 +89,7 @@ def collect(proc=Path('/proc'), cgroup=Path('/sys/fs/cgroup'), root_pids=()):
                                   'rss_hwm_kib': hwm,
                                   'ppid': int(fields.get('PPid', '0').strip()),
                                   'name': fields.get('Name', '').strip(),
+                                  'cmdline': _cmdline(p),
                                   'tracked_descendant': int(p.name) in descendants})
         except (OSError, ValueError):
             pass
