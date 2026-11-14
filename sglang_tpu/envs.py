@@ -38,6 +38,9 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
+    # Diffusion: under --enable-torch-compile, compile the Hunyuan3D-2 volume-decode
+    # chunk step (multimodal_gen/hunyuan3d.py); False runs it eagerly.
+    SGLANG_TPU_ENABLE_HUNYUAN3D_DECODE_COMPILE = EnvBool(True)
     # Kimi-K3: run these RMSNorm-fed dense decode GEMVs as fp8 W8A8 with a static
     # input scale (see kimi_k3/static_fp8.py). Comma-separated subset of
     # moe_front, latent_up, kda_qkvg, mla_qkv_a, or "all" (every validated part:

@@ -16,6 +16,7 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -255,7 +256,14 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
 
         generator = batch.generator
         if generator is None and batch.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(batch.seed)
+            # A "cpu" generator_device (the request's, else the pipeline config's)
+            # seeds a CPU generator, as in InputValidationStage.
+            generator_device = batch.generator_device or getattr(
+                server_args.pipeline_config, "generator_device", None
+            )
+            if generator_device != "cpu":
+                generator_device = device
+            generator = torch.Generator(device=generator_device).manual_seed(batch.seed)
 
         latents = self._prepare_latents(batch_size, dtype, device, generator, scheduler)
 
@@ -581,7 +589,13 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
         output_dir = os.path.dirname(obj_path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-        mesh.export(obj_path)
+        # Every rank holds the same mesh; the rank that answers the request (the
+        # first of its DP replica) writes it, so no rank rewrites a served file.
+        if (
+            not parallel_state.world_group_is_initialized()
+            or parallel_state.get_replica_group().rank_in_group == 0
+        ):
+            mesh.export(obj_path)
 
         batch.extra["shape_obj_path"] = obj_path
         batch.extra["shape_return_path"] = return_path
