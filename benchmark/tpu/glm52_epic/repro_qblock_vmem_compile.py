@@ -35,10 +35,9 @@ def main():
         spec((65, 32, 4, 128), jnp.uint8),
         spec((2048, 2048), jnp.int32),
         spec((1,), jnp.int32),
-        # HLO phys operand is s32[17,1,34]. Original pages_per_seq may
-        # be33 or34 before alignment to2; choose34 to match this kernel
-        # operand and its bitmap width256 (not128).
-        spec((34,), jnp.int32),
+        # Context4096 + non-spec request-table headroom4 -> ceil(4100/128)
+        # =33 pages. The kernel pads to34 at pps2; bitmap width is256.
+        spec((33,), jnp.int32),
         # 16 tiles + one request gives the HLO's17 scalar visit entries.
         spec((2,), jnp.int32),
         spec((3,), jnp.int32),
