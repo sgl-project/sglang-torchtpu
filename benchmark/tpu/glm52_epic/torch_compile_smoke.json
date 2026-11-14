@@ -1,0 +1,44 @@
+{
+  "server_args": {
+    "model_path": "/models/GLM5.2-fp8-channel-wise",
+    "device": "tpu",
+    "dtype": "bfloat16",
+    "host": "0.0.0.0",
+    "port": 30000,
+    "tp_size": 16,
+    "attn_dp_size": 16,
+    "dp_size": 1,
+    "ep_size": 16,
+    "nnodes": 2,
+    "attention_backend": "pallas_tpu_mla_sparse",
+    "quantization": "fp8",
+    "tpu_fp8_runtime": "channelwise",
+    "json_model_override_args": "{\"quantization_config\":{\"quant_method\":\"fp8\",\"activation_scheme\":\"dynamic\",\"fmt\":\"e4m3\",\"weight_block_size\":null,\"tpu_checkpoint_layout\":\"glm52_channelwise_fp8\"}}",
+    "kv_cache_dtype": "fp8_e4m3",
+    "page_size": 64,
+    "context_length": 4096,
+    "chunked_prefill_size": 4096,
+    "max_prefill_tokens": 4096,
+    "max_running_requests": 16,
+    "max_total_tokens": 8192,
+    "mem_fraction_static": 0.93,
+    "enable_torch_compile": true,
+    "disable_shared_experts_fusion": true,
+    "disable_radix_cache": false,
+    "grammar_backend": "none",
+    "watchdog_timeout": 1800,
+    "torch_compile_max_bs": 1,
+    "tpu_compile_bs": [
+      1
+    ],
+    "tpu_compile_tokens": [
+      2048
+    ]
+  },
+  "runtime_env": {
+    "SGLANG_PLATFORM": "tpu",
+    "SGLANG_USE_RAY": "0",
+    "PYTHONUNBUFFERED": "1",
+    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"
+  }
+}

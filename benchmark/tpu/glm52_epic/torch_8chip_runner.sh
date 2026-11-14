@@ -121,9 +121,12 @@ try:
     require(actual == expected, 'checkout SHA differs from requested exact source')
     require(not run(['git', 'status', '--porcelain', '--untracked-files=no'], 'source-status.txt'),
             'tracked source modifications detected')
-    runnable = os.environ.get('GLM52_RUNNABLE_BASELINE') == '1'
+    mode = os.environ.get('GLM52_BASELINE_MODE', '')
+    require(mode in ('', 'eager', 'compile-smoke'), 'unsupported baseline mode')
     candidate = Path('benchmark/tpu/glm52_epic/' + (
-        'torch_runnable_baseline.json' if runnable else 'torch_prefill_candidate.json'))
+        'torch_runnable_baseline.json' if mode == 'eager' else
+        'torch_compile_smoke.json' if mode == 'compile-smoke' else
+        'torch_prefill_candidate.json'))
     require(candidate.is_file(), 'run from exact source checkout root')
     candidate_bytes = candidate.read_bytes()
     (OUT / candidate.name).write_bytes(candidate_bytes)
@@ -135,14 +138,18 @@ try:
         }.items()), 'candidate mesh/model contract changed')
     contract = ({'enable_torch_compile': False, 'context_length': 4096,
                  'max_total_tokens': 8192, 'chunked_prefill_size': 4096,
-                 'max_prefill_tokens': 4096} if runnable else {
+                 'max_prefill_tokens': 4096} if mode == 'eager' else
+                {'enable_torch_compile': True, 'context_length': 4096,
+                 'max_total_tokens': 8192, 'chunked_prefill_size': 4096,
+                 'max_prefill_tokens': 4096, 'torch_compile_max_bs': 1,
+                 'tpu_compile_bs': [1], 'tpu_compile_tokens': [2048]} if mode == 'compile-smoke' else {
                  'chunked_prefill_size': 32768, 'max_prefill_tokens': 32768,
                  'tpu_compile_tokens': [2048]})
     require(all(args.get(k) == v for k, v in contract.items()), 'baseline shape contract changed')
-    if runnable:
+    if mode in ('eager', 'compile-smoke'):
         require(not os.environ.get('GLM52_DIAGNOSTIC_REQUESTS'),
-                'short eager baseline cannot run matched-workload diagnostic')
-        result['scope'] = 'full-checkpoint short-input eager runnable baseline; NOT JAX performance'
+                'baseline smoke cannot run matched-workload diagnostic')
+        result['scope'] = f'full-checkpoint short-input {mode} smoke; NOT JAX performance'
     result['candidate_sha256'] = hashlib.sha256(candidate_bytes).hexdigest()
     pins = {'torch': '2.11.0+cpu', 'jax': '0.11.2', 'jaxlib': '0.11.2',
             'libtpu': '0.0.50', 'torch_tpu': '0.2.1.dev20261028201649',
