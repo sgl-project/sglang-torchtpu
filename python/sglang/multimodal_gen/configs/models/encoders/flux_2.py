@@ -57,3 +57,19 @@ class Flux2MistralTextConfig(TextEncoderConfig):
         default_factory=Flux2MistralTextArchConfig
     )
     prefix: str = "flux_2_mistral"
+
+    def post_diffusers_config_update(self) -> None:
+        """Copy the language model's sizes up from the nested ``text_config``.
+
+        The Mistral3 checkpoint config keeps them only there, and encoder
+        tensor-parallel folding reads them from the top level: without them the
+        fold is dropped and every rank holds the whole encoder.
+        """
+        arch = self.arch_config
+        # Set by the loader from the checkpoint config; absent before it.
+        text_config = getattr(arch, "text_config", None)
+        if text_config is None:
+            return
+        arch.hidden_size = text_config.hidden_size
+        arch.num_attention_heads = text_config.num_attention_heads
+        arch.intermediate_size = text_config.intermediate_size
