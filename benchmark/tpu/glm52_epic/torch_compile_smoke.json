@@ -39,6 +39,9 @@
     "SGLANG_PLATFORM": "tpu",
     "SGLANG_USE_RAY": "0",
     "PYTHONUNBUFFERED": "1",
-    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"
+    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
+    "SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL": "1",
+    "SGLANG_TPU_ASYNC_COPY_WORKER": "0",
+    "LIBTPU_INIT_ARGS": "--xla_tpu_buffer_assignment_enable_fast_merge_fallback=false --xla_tpu_offload_gather_to_sparsecore=true"
   }
 }

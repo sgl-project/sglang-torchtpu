@@ -94,6 +94,31 @@ current pinned TPU dependency stack; record versions and do not use it for
 on-device performance claims. The private CI base image was inaccessible to
 this cluster (ImagePullBackOff), not a test result.
 
+## Current TorchTPU failure diagnosis
+
+The first short-input eager smoke reached model execution setup but failed in the
+TorchTPU/XLA lowering of the sparse MLA path, before `/health` became ready. The
+observed fatal signatures were `window_bounds` rank mismatch and an unsupported
+`vmreg/vreg` to `U64` conversion; the later Gloo reset is secondary. Disabling
+`enable_torch_compile` does not bypass this lowering because
+`pallas_tpu_mla_sparse` still exports a Pallas custom JAX kernel.
+
+The peer Kimi-K3.1 and GLM-5.3-Flash recipes enable the query-blocked sparse MLA
+prefill path and set the libtpu SparseCore/fast-merge flags. The short GLM52
+candidates now carry the same narrowly relevant settings:
+`SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL=1`,
+`SGLANG_TPU_ASYNC_COPY_WORKER=0`,
+`xla_tpu_buffer_assignment_enable_fast_merge_fallback=false`, and
+`xla_tpu_offload_gather_to_sparsecore=true`. This is a diagnostic candidate,
+not a confirmed fix: q-block only changes extend prefill and decode still uses
+the original per-query kernel. It must be validated on TPU before any claim of
+a runnable baseline.
+
+The one-shape compile smoke is a separate failure. It exited 137 after host
+memory peaked near 505 GB, without cgroup OOM events or the sparse-lowering
+fatal. Falcon did not identify the first killed native child, so this remains a
+high-confidence host-compiler-pressure hypothesis rather than a proven HBM OOM.
+
 ## Flash safety
 
 Only GLM5.2-specific files added so far; no production/shared path has changed.
