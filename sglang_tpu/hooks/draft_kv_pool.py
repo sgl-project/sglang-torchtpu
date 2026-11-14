@@ -17,6 +17,20 @@ draft_mha_pool_class, draft_cell_size_per_token
   Upstream PR or issue: not filed yet.
   Remove when: the configurator asks the platform for the pool class, and its
        bytes per token, of the runner's own attention backend.
+
+derive_unified_draft_pool_sizes, attach_unified_draft_kv_pool
+  Why: TpuUnifiedSWATokenToKVPoolAllocator hands out logical slot IDs in
+       [0, size_full) and allocates M_T physical pages per SWA logical page,
+       so a speculative draft paired with it must size its Full sub-pool to
+       size_full, its compact SWA sub-pool to size_full // M_T, and bind its
+       SWA index mapping to the unified allocator's _DraftSwaSidecar.
+  How: AROUND KVCacheConfigurator._derive_pool_sizes replaces the draft's
+       MemoryPoolConfig token capacities via allocator.derive_draft_pool_sizes;
+       AROUND KVCacheConfigurator._build_token_to_kv_pool_allocator delegates
+       draft pool attachment to allocator.attach_draft_kv_pool.
+  Upstream PR or issue: not filed yet.
+  Remove when: BaseTokenToKVPoolAllocator declares draft pool sizing and
+       attachment hooks upstream.
 """
 
 from __future__ import annotations
@@ -71,3 +85,42 @@ def draft_cell_size_per_token(
     )
     # Never below the generic count: the fused pool only adds padding.
     return max(generic, int(per_layer) * int(draft_num_layers))
+
+
+def derive_unified_draft_pool_sizes(original, configurator, *, config):
+    alloc = getattr(configurator, "token_to_kv_pool_allocator", None)
+    if getattr(configurator, "is_draft_worker", False) and alloc is not None:
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWATokenToKVPoolAllocator
+
+        if isinstance(alloc, TpuUnifiedSWATokenToKVPoolAllocator):
+            import dataclasses
+            import types
+
+            max_tok, full_tok, swa_tok = alloc.derive_draft_pool_sizes(
+                configurator,
+                max_total_num_tokens=config.max_total_num_tokens,
+                full_max_total_num_tokens=config.full_max_total_num_tokens,
+                swa_max_total_num_tokens=config.swa_max_total_num_tokens,
+            )
+            updates = {
+                "max_total_num_tokens": max_tok,
+                "full_max_total_num_tokens": full_tok,
+                "swa_max_total_num_tokens": swa_tok,
+            }
+            config = (
+                dataclasses.replace(config, **updates)
+                if dataclasses.is_dataclass(config)
+                else types.SimpleNamespace(**{**vars(config), **updates})
+            )
+    return original(configurator, config=config)
+
+
+def attach_unified_draft_kv_pool(original, configurator, *args, **kwargs):
+    alloc = kwargs.get("token_to_kv_pool_allocator")
+    if getattr(configurator, "is_draft_worker", False) and alloc is not None:
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWATokenToKVPoolAllocator
+
+        if isinstance(alloc, TpuUnifiedSWATokenToKVPoolAllocator):
+            alloc.attach_draft_kv_pool(configurator, kwargs["token_to_kv_pool"])
+            return alloc
+    return original(configurator, *args, **kwargs)
