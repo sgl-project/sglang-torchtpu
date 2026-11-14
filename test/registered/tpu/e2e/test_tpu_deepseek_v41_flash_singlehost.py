@@ -4,8 +4,7 @@ Boots recipe/configs/deepseek_v41_flash.py, then runs one of:
   * TestDeepSeekV41Flash.test_smoke   greedy chat, "17*23" must answer 391
   * TestDeepSeekV41Flash.test_gsm8k   GSM8K against a lenient floor
 
-Dispatch-only: .github/workflows/dsv41-flash-test-tpu.yml runs it at any ref.
-It is registered disabled so nightly and PR discovery never schedule it.
+Registered disabled, so nightly and PR discovery never schedule it; run it by hand.
 To run against an already-running server, set SGLANG_TPU_USE_LIVE_SERVER=1 and BASE_URL.
 """
 
@@ -21,7 +20,7 @@ register_tpu_ci(
     est_time=5400,
     suite="nightly-tpu-4-v7",
     nightly=True,
-    disabled="manual: dispatched by dsv41-flash-test-tpu.yml",
+    disabled="manual: run by hand until the nightly accuracy test lands",
     labels=["singlehost", "deepseek-v4.1-flash", "accuracy"],
     weights_pvc="model-weights",
 )
