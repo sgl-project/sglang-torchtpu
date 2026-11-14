@@ -128,12 +128,14 @@ It must be validated on TPU before any claim of a runnable baseline.
 The one-shape compile smoke is a separate failure. It exited 137 after host
 memory peaked near 505 GB, without cgroup OOM events or the sparse-lowering
 fatal. Falcon did not identify the first killed native child, so this remains a
-high-confidence host-compiler-pressure hypothesis rather than a proven HBM OOM.
+unconfirmed host/compiler-pressure hypothesis, not a proven host or HBM OOM.
+The later cgroup/RSS audit in `startup_path_analysis.md` shows why cgroup usage
+must not be equated with compiler process memory.
 
 ## Current exact-source smoke template
 
-`torch_8chip_current_UNSUBMITTED.yaml` is the only current 8-chip smoke
-starting point. It pins the current epic branch source commit, runs the checked-in runner
+`torch_8chip_current_UNSUBMITTED.yaml` is an immutable-image 8-chip smoke
+starting point. It pins an existing reviewed source commit, runs the checked-in runner
 from that checkout instead of embedding a base64 copy, and fails before TPU
 initialization when placeholders remain. It is intentionally not submitted:
 replace the cluster, immutable image digest, and allocation hostnames only after
@@ -143,6 +145,16 @@ intentionally unresolved because the peer only recorded a mutable tag.
 The older
 `torch_8chip_UNSUBMITTED.yaml` is historical evidence only because its inline
 runner and source SHA are stale.
+
+An immutable image is not the only runtime identity the runner accepts:
+`torch_8chip_runner.sh:89-110` already supports the documented peer base tag
+with a separately SHA-verified bootstrap, exact wheel hash, source and installed
+version checks. `peer_bootstrap_8chip.sh` supplies that benchmark-only path and
+allocation-time host rendezvous. Earlier status reports calling the missing
+image digest and pre-known hostnames absolute blockers were incorrect. Old
+submitted manifests still require explicit source/mode and identity rendering;
+do not resubmit them unchanged. A base tag plus hashed bootstrap is not an
+immutable image and must be reported as such.
 
 ## Flash safety
 
