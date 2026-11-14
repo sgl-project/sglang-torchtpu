@@ -28,6 +28,20 @@ Thus neither narrow bridge reproduction triggers the full-model fatal. Scoring,
 combined graphs, larger cache shapes, model ops and distributed scheduling remain
 uncovered. No production kernel change is justified from these passing probes.
 
+## Request-table writer candidate rejected as current-path reproduction
+
+Independent review of the unsubmitted request-table draft found it directly
+calls the device vectorized scatter with (5,4096), whereas current serving
+capacity16 / attentionDP16 resolves to one request per worker, plus padding
+row and extra context4 => (2,4100). More importantly the TPU request table is
+host-resident by default. Actual peer fatal evidence goes beyond that default:
+`eager_r59_peer_failure.txt:871` places a worker in allocation.py:188,
+`out_cache_loc.cpu()`, guarded by req_to_token being CPU and locations non-CPU.
+At least that worker demonstrably took the host-table path, not the device
+repeat_interleave/index_put_ helper. This synchronous read can surface an earlier
+asynchronous compiler failure; it does NOT identify D2H as its cause. Do not
+launch the device-table draft as a current fatal gate; no hardware was spent.
+
 ## Result-copy isolation execution-mode caveat
 
 Full-model peer logs explicitly show `TorchTPU eager mode set to DEFER_NEVER`
