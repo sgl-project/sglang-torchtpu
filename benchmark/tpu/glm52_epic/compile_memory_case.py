@@ -6,6 +6,7 @@ children. Neither RSS sums nor cgroup current are unique compiler memory.
 """
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -17,8 +18,8 @@ from benchmark.tpu.glm52_epic.startup_memory import collect
 
 
 def supervise(command, directory, *, timeout, interval):
-    if timeout <= 0 or interval <= 0:
-        raise ValueError('positive timeout and interval required')
+    if not all(math.isfinite(x) and x > 0 for x in (timeout, interval)):
+        raise ValueError('finite positive timeout and interval required')
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     with (directory / 'native.log').open('w') as log, (directory / 'memory.jsonl').open('w') as memory:
@@ -49,7 +50,10 @@ def supervise(command, directory, *, timeout, interval):
                 try:
                     child.wait(timeout=15)
                 except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
             child.wait()
         result = dict(command=command, pid=child.pid, returncode=child.returncode,
                       timed_out=timed_out, elapsed_s=time.monotonic() - started,
