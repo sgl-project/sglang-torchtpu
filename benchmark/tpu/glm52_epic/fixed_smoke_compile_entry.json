@@ -1,0 +1,339 @@
+{
+  "experiment": "exp-48q9eb5nxn",
+  "acceptance": "all16 ranks loaded and partitioned; EXTEND/decode/request acceptance pending",
+  "native_evidence": [
+    {
+      "falcon_rank": 0,
+      "native_log_sha256": "66189a56d0ec61e4fdab26c19937903df359732cc606da5dda2ffdd1d83c0e24",
+      "load_end": [
+        {
+          "native_time": "2026-11-14 16:52:53",
+          "dp_rank": 15,
+          "elapsed_seconds": 3180.32
+        },
+        {
+          "native_time": "2026-11-14 16:52:53",
+          "dp_rank": 11,
+          "elapsed_seconds": 3180.36
+        },
+        {
+          "native_time": "2026-11-14 16:52:54",
+          "dp_rank": 9,
+          "elapsed_seconds": 3180.61
+        },
+        {
+          "native_time": "2026-11-14 16:52:54",
+          "dp_rank": 13,
+          "elapsed_seconds": 3180.65
+        },
+        {
+          "native_time": "2026-11-14 16:52:54",
+          "dp_rank": 10,
+          "elapsed_seconds": 3180.72
+        },
+        {
+          "native_time": "2026-11-14 16:52:54",
+          "dp_rank": 14,
+          "elapsed_seconds": 3180.93
+        },
+        {
+          "native_time": "2026-11-14 16:52:54",
+          "dp_rank": 12,
+          "elapsed_seconds": 3180.99
+        },
+        {
+          "native_time": "2026-11-14 16:52:55",
+          "dp_rank": 8,
+          "elapsed_seconds": 3182.44
+        }
+      ],
+      "graph_partition_ranks": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    {
+      "falcon_rank": 1,
+      "native_log_sha256": "2e3ceae7f61537ab1cdd3758d31eb5ec35db07048c7be5b77c87365db7e20cf2",
+      "load_end": [
+        {
+          "native_time": "2026-11-14 16:45:34",
+          "dp_rank": 4,
+          "elapsed_seconds": 2740.71
+        },
+        {
+          "native_time": "2026-11-14 16:45:34",
+          "dp_rank": 0,
+          "elapsed_seconds": 2740.72
+        },
+        {
+          "native_time": "2026-11-14 16:45:34",
+          "dp_rank": 1,
+          "elapsed_seconds": 2740.95
+        },
+        {
+          "native_time": "2026-11-14 16:45:34",
+          "dp_rank": 7,
+          "elapsed_seconds": 2740.98
+        },
+        {
+          "native_time": "2026-11-14 16:45:34",
+          "dp_rank": 2,
+          "elapsed_seconds": 2741.0
+        },
+        {
+          "native_time": "2026-11-14 16:45:34",
+          "dp_rank": 5,
+          "elapsed_seconds": 2741.07
+        },
+        {
+          "native_time": "2026-11-14 16:45:34",
+          "dp_rank": 6,
+          "elapsed_seconds": 2741.12
+        },
+        {
+          "native_time": "2026-11-14 16:45:34",
+          "dp_rank": 3,
+          "elapsed_seconds": 2741.44
+        }
+      ],
+      "graph_partition_ranks": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    }
+  ],
+  "samples": {
+    "0": {
+      "time_ns": 1794675345499675436,
+      "current_bytes": 173105352704,
+      "anon_bytes": 166175117312,
+      "file_bytes": 5561262080,
+      "processes": [
+        {
+          "pid": 2760,
+          "rss_kib": 21996364,
+          "rss_hwm_kib": 21996364,
+          "ppid": 2600,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2758,
+          "rss_kib": 21861824,
+          "rss_hwm_kib": 21861824,
+          "ppid": 2600,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2755,
+          "rss_kib": 21624644,
+          "rss_hwm_kib": 21624644,
+          "ppid": 2600,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2757,
+          "rss_kib": 21411732,
+          "rss_hwm_kib": 21411732,
+          "ppid": 2600,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2756,
+          "rss_kib": 20002372,
+          "rss_hwm_kib": 20002372,
+          "ppid": 2600,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2754,
+          "rss_kib": 19928472,
+          "rss_hwm_kib": 19928472,
+          "ppid": 2600,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2759,
+          "rss_kib": 19669540,
+          "rss_hwm_kib": 19669540,
+          "ppid": 2600,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2761,
+          "rss_kib": 19590272,
+          "rss_hwm_kib": 19590272,
+          "ppid": 2600,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 1635,
+          "rss_kib": 977072,
+          "rss_hwm_kib": 977072,
+          "ppid": 1478,
+          "name": "python3",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2600,
+          "rss_kib": 809344,
+          "rss_hwm_kib": 809344,
+          "ppid": 1635,
+          "name": "sglang::data_pa",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 1478,
+          "rss_kib": 23528,
+          "rss_hwm_kib": 23528,
+          "ppid": 603,
+          "name": "python3",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2599,
+          "rss_kib": 14660,
+          "rss_hwm_kib": 14660,
+          "ppid": 1635,
+          "name": "python3",
+          "tracked_descendant": true
+        }
+      ],
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+    },
+    "1": {
+      "time_ns": 1794675347979330663,
+      "current_bytes": 171950632960,
+      "anon_bytes": 165029998592,
+      "file_bytes": 5550133248,
+      "processes": [
+        {
+          "pid": 2792,
+          "rss_kib": 21933872,
+          "rss_hwm_kib": 21933872,
+          "ppid": 2509,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2796,
+          "rss_kib": 21400632,
+          "rss_hwm_kib": 21400632,
+          "ppid": 2509,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2798,
+          "rss_kib": 20711656,
+          "rss_hwm_kib": 20711656,
+          "ppid": 2509,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2793,
+          "rss_kib": 20220320,
+          "rss_hwm_kib": 20220320,
+          "ppid": 2509,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2791,
+          "rss_kib": 20198620,
+          "rss_hwm_kib": 20198620,
+          "ppid": 2509,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2794,
+          "rss_kib": 19947628,
+          "rss_hwm_kib": 19947628,
+          "ppid": 2509,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2797,
+          "rss_kib": 19802340,
+          "rss_hwm_kib": 19802340,
+          "ppid": 2509,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2795,
+          "rss_kib": 19587668,
+          "rss_hwm_kib": 19587668,
+          "ppid": 2509,
+          "name": "sglang::schedul",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 1583,
+          "rss_kib": 1351408,
+          "rss_hwm_kib": 1409164,
+          "ppid": 1429,
+          "name": "python3",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2510,
+          "rss_kib": 1141748,
+          "rss_hwm_kib": 1229824,
+          "ppid": 1583,
+          "name": "sglang::detoken",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2509,
+          "rss_kib": 808672,
+          "rss_hwm_kib": 808672,
+          "ppid": 1583,
+          "name": "sglang::data_pa",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 1429,
+          "rss_kib": 23988,
+          "rss_hwm_kib": 23988,
+          "ppid": 606,
+          "name": "python3",
+          "tracked_descendant": true
+        },
+        {
+          "pid": 2508,
+          "rss_kib": 14688,
+          "rss_hwm_kib": 14688,
+          "ppid": 1583,
+          "name": "python3",
+          "tracked_descendant": true
+        }
+      ],
+      "events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+    }
+  },
+  "stdout_envelope_sha256": "d0b419859ccede2b20c862bf04196af17fc17181b9ca597367bf253ee4c5974b"
+}
