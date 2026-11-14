@@ -16,7 +16,7 @@ def main():
     parser.add_argument('--selection', choices=('self', 'causal-mean', 'rope-pair'), default='self',
                         help='Single key, or causal keys with zero queries and uniform weights.')
     parser.add_argument('--entry', choices=('per-query', 'prefill-fallback', 'prefill-qblock', 'prefill-long-table'), default='per-query',
-                        help='Token-major op, small head-major fallback, or2048-token fused qblock.')
+                        help='Token-major, small prefill fallback,2048-token qblock, or481-page static-table fallback.')
     parser.add_argument('--dynamo', action='store_true',
                         help='Compile the production op fullgraph with backend=tpu, static shapes.')
     args = parser.parse_args()
