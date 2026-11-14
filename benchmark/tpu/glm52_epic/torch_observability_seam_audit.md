@@ -38,6 +38,13 @@ acknowledged multi-rank barrier. Any TPU plugin permanent hook would be tracked
 migration debt and needs the standard Why/How/upstream/removal header. No new
 core branches/imports or permanent hooks were added by this audit.
 
+A local 16-rank simulation now exercises the opt-in file barrier plus the
+exact32-RID inventory validator: all ranks pause, publish snapshots, an
+adversarial running-RID mutation is rejected, and all ranks resume. This is
+only a state-machine test; it does not prove shared-filesystem visibility,
+atomic multi-rank snapshot timing, scheduler construction hooks, or TPU
+behavior.
+
 Until the actual transport/barrier and rank completion aggregation are proven,
 keep torch_cache_hit_client.py matched gate fail-closed. A long-context HTTP
 diagnostic can be labeled UNMATCHED, but cannot close the cadence objective.
