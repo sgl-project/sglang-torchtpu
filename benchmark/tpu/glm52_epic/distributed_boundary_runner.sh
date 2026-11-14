@@ -20,9 +20,10 @@ for case in roundtrip all-reduce asymmetric; do
     timeout --signal=TERM --kill-after=15s 240s bash -c '
         # The shared bootstrap intentionally exports a two-host list. This
         # probe must not inherit it: force the launcher onto this host only.
-        unset RANK LOCAL_RANK LOCAL_WORLD_SIZE WORLD_SIZE TPU_WORKER_HOSTNAMES
-        unset NNODES NODE_RANK MASTER_ADDR MASTER_PORT
+        unset RANK LOCAL_RANK LOCAL_WORLD_SIZE WORLD_SIZE
+        unset NNODES NODE_RANK MASTER_ADDR MASTER_PORT JOB_COMPLETION_INDEX
         unset TORCH_TPU_SLICEBUILDER_ADDRESSES TORCH_TPU_TOPOLOGY
+        export TPU_WORKER_HOSTNAMES="$(hostname)"
         discovery=$(python -m torch.tpu.distributed) || exit $?
         printf "DISCOVERY_BEGIN\n%s\nDISCOVERY_END\n" "$discovery"
         eval "$discovery"
