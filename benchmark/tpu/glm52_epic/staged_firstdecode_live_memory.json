@@ -1,0 +1,111 @@
+{
+  "experiment": "exp-24def76f9j",
+  "status": "LIVE_FIRSTDECODE_NOT_COMPLETE",
+  "hosts": [
+    {
+      "falcon_rank": 0,
+      "last_utc": "2026-11-15T12:19:16.556647+00:00",
+      "samples": 1406,
+      "current_gib": 287.18555450439453,
+      "anon_gib": 279.23894119262695,
+      "file_gib": 6.375041961669922,
+      "leaf_events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "scheduler_processes": [
+        {
+          "pid": 3834,
+          "start_ticks": 496330169,
+          "rss_gib": 40.134742736816406
+        },
+        {
+          "pid": 3840,
+          "start_ticks": 496330172,
+          "rss_gib": 37.80858612060547
+        },
+        {
+          "pid": 3837,
+          "start_ticks": 496330169,
+          "rss_gib": 37.78911590576172
+        },
+        {
+          "pid": 3836,
+          "start_ticks": 496330169,
+          "rss_gib": 37.35687255859375
+        },
+        {
+          "pid": 3839,
+          "start_ticks": 496330171,
+          "rss_gib": 35.89841079711914
+        },
+        {
+          "pid": 3841,
+          "start_ticks": 496330172,
+          "rss_gib": 34.593814849853516
+        },
+        {
+          "pid": 3835,
+          "start_ticks": 496330169,
+          "rss_gib": 31.470352172851562
+        },
+        {
+          "pid": 3838,
+          "start_ticks": 496330171,
+          "rss_gib": 27.95146942138672
+        }
+      ],
+      "native_tail": " DP12 TP12 EP12] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:10:14 DP14 TP14 EP14] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:10:14 DP13 TP13 EP13] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:10:14 DP15 TP15 EP15] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:17:12 DP10 TP10 EP10] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n[2026-11-15 12:17:12 DP9 TP9 EP9] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n[2026-11-15 12:17:12 DP12 TP12 EP12] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n[2026-11-15 12:17:12 DP14 TP14 EP14] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n[2026-11-15 12:17:12 DP13 TP13 EP13] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n[2026-11-15 12:17:12 DP15 TP15 EP15] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n[2026-11-15 12:17:12 DP8 TP8 EP8] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n[2026-11-15 12:17:12 DP11 TP11 EP11] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n[2026-11-15 12:18:16 DP14 TP14 EP14] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:16 DP15 TP15 EP15] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:16 DP13 TP13 EP13] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:17 DP10 TP10 EP10] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:17 DP9 TP9 EP9] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:17 DP8 TP8 EP8] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:17 DP11 TP11 EP11] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:18 DP12 TP12 EP12] Split graph into 1 partitions, 0 of which run on CPU\n"
+    },
+    {
+      "falcon_rank": 1,
+      "last_utc": "2026-11-15T12:20:27.317454+00:00",
+      "samples": 1547,
+      "current_gib": 319.5132484436035,
+      "anon_gib": 309.6459655761719,
+      "file_gib": 8.242938995361328,
+      "leaf_events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+      "scheduler_processes": [
+        {
+          "pid": 3864,
+          "start_ticks": 496266633,
+          "rss_gib": 40.66581344604492
+        },
+        {
+          "pid": 3862,
+          "start_ticks": 496266632,
+          "rss_gib": 40.5670166015625
+        },
+        {
+          "pid": 3868,
+          "start_ticks": 496266633,
+          "rss_gib": 39.4331169128418
+        },
+        {
+          "pid": 3869,
+          "start_ticks": 496266633,
+          "rss_gib": 39.367984771728516
+        },
+        {
+          "pid": 3866,
+          "start_ticks": 496266633,
+          "rss_gib": 38.73119354248047
+        },
+        {
+          "pid": 3863,
+          "start_ticks": 496266633,
+          "rss_gib": 38.26713562011719
+        },
+        {
+          "pid": 3865,
+          "start_ticks": 496266633,
+          "rss_gib": 37.73456954956055
+        },
+        {
+          "pid": 3867,
+          "start_ticks": 496266633,
+          "rss_gib": 37.40972900390625
+        }
+      ],
+      "native_tail": "VOCAB) in 485.9s HBM: +1144 MB (68233/97012 MB): :   0% Completed | 0/1 [08:05<?, ?it/s][2026-11-15 12:17:12 DP2 TP2 EP2] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n\rCompiled EXTEND (tokens=2048, bs=32, variant=plain, logits=FULL_VOCAB) in 485.9s HBM: +1144 MB (68233/97012 MB): : 100% Completed | 1/1 [08:05<00:00, 485.93s/it]\rCompiled EXTEND (tokens=2048, bs=32, variant=plain, logits=FULL_VOCAB) in 485.9s HBM: +1144 MB (68233/97012 MB): : 100% Completed | 1/1 [08:05<00:00, 485.93s/it]\n[2026-11-15 12:17:12 DP6 TP6 EP6] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n[2026-11-15 12:17:12 DP0 TP0 EP0] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n[2026-11-15 12:17:12 DP7 TP7 EP7] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n[2026-11-15 12:17:12 DP4 TP4 EP4] [TPU] [decoder compile policy] DECODE: 6 graph variants (bs=[1, 2, 4, 8, 16, 32])\n\rCompiling DECODE:   0% Completed | 0/6 [00:00<?, ?it/s][2026-11-15 12:18:15 DP6 TP6 EP6] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:16 DP7 TP7 EP7] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:16 DP0 TP0 EP0] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:17 DP1 TP1 EP1] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:17 DP2 TP2 EP2] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:17 DP3 TP3 EP3] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:20 DP5 TP5 EP5] Split graph into 1 partitions, 0 of which run on CPU\n[2026-11-15 12:18:26 DP4 TP4 EP4] Split graph into 1 partitions, 0 of which run on CPU\n\rCompiled DECODE (bs=1, logits=FULL_VOCAB) in 179.6s HBM: +174 MB (68408/97012 MB): :   0% Completed | 0/6 [02:59<?, ?it/s]\rCompiled DECODE (bs=1, logits=FULL_VOCAB) in 179.6s HBM: +174 MB (68408/97012 MB): :  17% Completed | 1/6 [02:59<14:58, 179.62s/it]"
+    }
+  ],
+  "caveats": "leafevents cannot exclude hidden ancestors/systemOOM; current includesfilecache; no unique compilerpeak assertion"
+}
