@@ -1,0 +1,17 @@
+{
+ "failed_replay":"exp-88cbehgzz1",
+ "confirmed":"Host1 globalTP0-7 finished; host0 globalTP8-15 not logged finished by480s monitored barrier expiry. Not target compiler failure.",
+ "source_discriminators":[
+  {"source":"python/sglang/srt/model_loader/weight_utils.py1286-1288","finding":"Only distributed globalrank0 renders progress bar. Host0 lacking shard progress is expected, not evidence zero progress."},
+  {"source":"python/sglang/srt/model_loader/weight_utils.py1307-1339","finding":"Main thread may wait future.result on ThreadPoolExecutor shard read, then yield tensors to model loader. Futex main thread does not discriminate I/O versus worker processing."},
+  {"source":"weight_utils.py1293-1301","finding":"mmap/safe_open tensor path means low read_bytes/rchar is not evidence checkpoint data were not faulted/read."},
+  {"source":"benchmark/tpu/glm52_epic/observer/startup_stacks.py14-27","finding":"Existing opt-in faulthandler.dump_traceback_later emits all Python thread stacks without ptrace/signals; must enable before worker spawn via observer/sitecustomize.py."}
+ ],
+ "next_fullmodel_debug_contract":{
+  "preserve":"8 physicalchips,TP16/attentionDP16/EP16,noDCP,page64 and historical compile buckets,noFlash edits",
+  "instrument":"Explicit observer directory on PYTHONPATH; GLM52_STARTUP_STACK_DIR absolute persistent evidence dir, GLM52_STARTUP_STACK_SECONDS=300; collect each hostname/PID stack through Falcon. This is diagnostic not performance mode.",
+  "timeout_policy":"Do not blindly disable480s safety. A bounded larger load-skew allowance may be tested with stack evidence, clearly classified startup-only change and no rootcause claim.",
+  "required_observations":"Both host thread stacks at load wait; perhost rank identity and last loaded shard if observable; actual allocated KV pool after load; EXTEND then firstDECODE native/child/kill provenance."
+ },
+ "not_submitted":"No further fullmodel replay submitted; previous replay did not reach compile, independent probes passed but do not justify claiming model fixed."
+}
