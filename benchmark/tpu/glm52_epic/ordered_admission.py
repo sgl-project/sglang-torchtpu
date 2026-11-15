@@ -67,6 +67,36 @@ class OrderedCommandSource:
         return dict(command, rid=f'glm52-control:{self.run_token}:{epoch}:{seq}:{action}')
 
 
+def accept_inventory(directory, *, expected_routes, snapshots, run_token, epoch, pause_sequence):
+    """Coordinator-only: validate exact rank inventory before issuing resume receipt."""
+    from benchmark.tpu.glm52_epic.admission_inventory import validate_inventory
+
+    if set(expected_routes.values()) != set(range(16)) or len(expected_routes) != 32:
+        raise ValueError('exact32 requests across16ranks required')
+    if any(sum(v == rank for v in expected_routes.values()) != 2 for rank in range(16)):
+        raise ValueError('exact2 queued requests perrank required')
+    verdict = validate_inventory(expected_routes, snapshots, run_token=run_token,
+                                 epoch=epoch, sequence=pause_sequence)
+    if not verdict['ready']:
+        raise ValueError(f'inventory rejected: {verdict["reasons"]}')
+    root = Path(directory)
+    sequence = pause_sequence+1
+    inventory = root/f'inventory-{sequence}.json'
+    receipt = root/f'accepted-{sequence}.json'
+    if inventory.exists() or receipt.exists():
+        raise ValueError('accepted inventory cannot be overwritten')
+    raw = json.dumps(dict(expected_routes=expected_routes, snapshots=snapshots), sort_keys=True).encode()
+    # Exclusive creation: never overwrite prior acceptance under the same seq.
+    with inventory.open('xb') as stream:
+        stream.write(raw)
+    acceptance = dict(run_token=run_token, sequence=sequence, epoch=epoch,
+                      status='ALL_RANK_INVENTORY_ACCEPTED', inventory_file=inventory.name,
+                      inventory_sha256=hashlib.sha256(raw).hexdigest())
+    with receipt.open('x') as stream:
+        json.dump(acceptance, stream)
+    return acceptance
+
+
 def typed_control(command):
     """Lazy real IPC import, called only at the receiver boundary."""
     from sglang.srt.managers.io_struct import (
