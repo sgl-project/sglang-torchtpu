@@ -44,6 +44,11 @@ def verify_run(directory, run_token):
 def publish_command(directory, *, run_token, sequence, epoch, action):
     root = Path(directory)
     verify_run(root, run_token)
+    ready = json.loads((root/'root-consumer.json').read_text())
+    if ready.get('run_token') != run_token or ready.get('status') != 'ROOT_READY':
+        raise ValueError('root consumer not ready for this run')
+    if (root/'ordered-error.json').exists():
+        raise ValueError('run already has terminal control error')
     if type(sequence) is not int or sequence < 0 or not isinstance(epoch,str) or not epoch or ':' in epoch:
         raise ValueError('invalid sequence/epoch')
     if action not in ('pause','resume'):

@@ -68,8 +68,10 @@ def install(receiver_class, *, directory, run_token, topology, factory=typed_con
 
                 # A restarted root cannot reopen the same command stream. The
                 # old claim remains even after clean uninstall; new run required.
+                if (Path(directory)/'ordered-command.json').exists():
+                    raise ValueError('commands published before root readiness; stale run rejected')
                 publish_immutable(Path(directory)/'root-consumer.json',
-                                  dict(run_token=run_token, pid=os.getpid()))
+                                  dict(run_token=run_token, pid=os.getpid(), status='ROOT_READY'))
                 source.claimed = True
             command = source.poll()
             if command is not None:
