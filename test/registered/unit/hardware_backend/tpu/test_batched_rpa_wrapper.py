@@ -191,6 +191,43 @@ class TestBlockSizeSearch(CustomTestCase):
             (prefill.bq_sz, prefill.bkv_sz, prefill.batch_size), (512, 1024, 1)
         )
 
+    def test_ring_block_sizes_follow_the_step_cost_model_on_qwen3(self):
+        """Qwen3-30B-A3B fp8 on v7x: PCP4 x TP2 (16 q / 2 KV heads) is
+        compute-bound per ring step, so bq=512 (no padding of 2k/4k-row chunks)
+        beats bq=768 (fewer steps, 12.5% padded rows); PCP8 (32 q / 4 KV heads)
+        is hop-bound below bq=384, so it keeps bq=384 over the unpadded 256."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import wrapper
+
+        def cache_bq(nq, nkv, cp, total_q):
+            fused = wrapper.pcp_fused_configs(
+                num_q_heads=nq,
+                num_kv_heads=nkv,
+                head_dim=128,
+                dtype_q=jnp.bfloat16,
+                dtype_kv=jnp.float8_e4m3fn,
+                page_size=256,
+                cp_group_size=cp,
+                total_q_tokens=total_q,
+                num_cache_rows=8,
+                cache_pages_per_row=-(-70000 // (256 * cp)),
+                num_new_rows=16,
+                new_pages_per_row=-(-70000 // (256 * cp)),
+                k_scale=1.0,
+                v_scale=1.0,
+                vmem_limit_bytes=64 << 20,
+            )
+            return fused.cfgs_cache.bq_sz, fused.cfgs_cache.bkv_sz
+
+        with mock.patch(
+            "jax.experimental.pallas.tpu.get_tpu_info",
+            return_value=_mock_tpu_info(7, "v7x"),
+        ):
+            for total_q in (1024, 2048, 4096):
+                self.assertEqual(cache_bq(16, 2, 4, total_q), (512, 1024), total_q)
+                self.assertEqual(cache_bq(32, 4, 8, total_q), (384, 1024), total_q)
+
     def test_pcp_fused_configs_and_schedule_check_on_qwen3_serving_shape(self):
         """`pcp_fused_configs` and `check_pcp_fused_schedule` agree on Qwen3-30B-A3B
         PCP=8 (32 q heads, 4 KV heads, hd 128, fp8 KV, page 256) and reject a

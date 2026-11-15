@@ -1235,8 +1235,9 @@ class RingBlockSizeCalculator(CPBlockSizeCalculator):
     steps is proportional to num_q_blocks * num_kv_blocks. The search tries bq_sz
     up to the local query length and power-of-two bkv_sz up to
     min(max_bkv_sz, local_kv_len), keeps the pairs that fit in VMEM, and picks
-    the fewest steps, then the least padding (Q and KV), then the largest bkv_sz
-    and bq_sz.
+    the one with the least modelled time (`ring_step_time`: the larger of the
+    tile compute and the KV hop, times the number of steps), then the fewest
+    steps, the least padding, and the largest bkv_sz and bq_sz.
     """
 
     # One lane per step: the rotation moves the whole buffer in a single copy,
@@ -1256,6 +1257,29 @@ class RingBlockSizeCalculator(CPBlockSizeCalculator):
         # Capping bkv_sz at 1024 matches the maximum TPU attention tile size
         # and prevents compiler register spills while maximizing compute per step.
         return min(super().max_bkv_sz, 1024)
+
+    # SGLang: cost model of one ring step, fitted on v7x (PCP4 x TP2 and PCP8,
+    # Qwen3-30B-A3B, fp8 KV, bkv_sz 1024). A step computes a full
+    # bq_sz x bkv_sz tile for every query head (padded Q rows cost as much as
+    # real ones) and, overlapped with it, forwards the bkv_sz-token KV block to
+    # the next rank; it takes the longer of the two. Measured: the tile at
+    # ~370 TFLOP/s per core, the hop at ~60 GB/s (1 MiB in ~17 us). So PCP4 x
+    # TP2 (16 q heads, 2 KV heads) is compute-bound at bq_sz 512 and bq_sz 768
+    # only adds padding to a 4096-row chunk (9% slower), while PCP8 (32 q heads,
+    # 4 KV heads) is DMA-bound below bq_sz ~384 (bq_sz 256: 21% slower).
+    ring_tile_flops_per_s = 370e12
+    ring_hop_bytes_per_s = 60e9
+
+    def ring_step_time(self, bq_sz: int, bkv_sz: int) -> float:
+        """Modelled seconds of one ring step (tile compute vs KV hop)."""
+        model_cfgs = self.model_cfgs
+        flops = 4 * bq_sz * bkv_sz * model_cfgs.num_q_heads * model_cfgs.head_dim
+        hop_bytes = (
+            bkv_sz * 2 * model_cfgs.num_kv_heads * model_cfgs.head_dim * self.kv_bytes
+        )
+        return max(
+            flops / self.ring_tile_flops_per_s, hop_bytes / self.ring_hop_bytes_per_s
+        )
 
     def prefill_block_sizes(self) -> configs.BlockSizes:
         serve_cfgs = self.serve_cfgs
@@ -1302,12 +1326,15 @@ class RingBlockSizeCalculator(CPBlockSizeCalculator):
                     n_kv = pl.cdiv(total_kv, bkv_sz)
                     total_steps = n_q * n_kv
                     padding = (n_q * bq_sz - total_q) + (n_kv * bkv_sz - total_kv)
-                    # Prioritize:
-                    # 1. Minimize ring schedule steps (n_q * n_kv)
-                    # 2. Minimize total tile padding waste on Q and KV
-                    # 3. Maximize bkv_sz (fewer ring steps, larger transfers)
-                    # 4. Maximize bq_sz (fewer Q tiles)
-                    score = (total_steps, padding, -bkv_sz, -bq_sz)
+                    # SGLang: rank by the modelled time of the cache phase.
+                    # The KV extent is the page-table capacity rather than a
+                    # real length, so it enters as total_kv / bkv_sz (no
+                    # ceil), and only the Q padding counts as work. Prioritize:
+                    # 1. Minimize the modelled time (`ring_step_time`)
+                    # 2. Minimize ring schedule steps (n_q * n_kv)
+                    # 3. Minimize padding, then maximize bkv_sz and bq_sz
+                    est = n_q * (total_kv / bkv_sz) * self.ring_step_time(bq_sz, bkv_sz)
+                    score = (round(est, 6), total_steps, padding, -bkv_sz, -bq_sz)
                     valid_configs.append((score, bq_sz, bkv_sz))
 
         if not valid_configs:
