@@ -47,6 +47,15 @@ PACKING = 2  # two FP4 codes per uint8 byte
 _FUSED_RS_MAX_TOKENS_PER_CALL = 8192
 
 
+def mark_qblock_layout(layer: torch.nn.Module, block: int) -> None:
+    layer.__dict__["_tpu_nvfp4_qblock"] = block
+
+
+def qblock_layout(layer: torch.nn.Module) -> int:
+    """K rows per bf16 scale of experts requantized after load (0: as loaded)."""
+    return layer.__dict__.get("_tpu_nvfp4_qblock", 0)
+
+
 def _transpose_packed_fp4(matrix: torch.Tensor) -> torch.Tensor:
     """Transpose ``(E, M, K/2)`` packed FP4 into ``(E, K, M/2)`` bytes."""
     if matrix.dtype != torch.uint8 or matrix.ndim != 3:
@@ -168,8 +177,10 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         ("attn_dp_size == 1", parallel.attn_dp_size == 1),
         ("gated MoE", runner_config.is_gated),
         (
-            "silu activation",
-            runner_config.activation in ("silu", "silu_and_mul_clamp"),
+            "silu or clamped SwiGLU activation",
+            # The fused GMM also implements canonical clamped SwiGLU
+            # (swigluoai, as in GPT-OSS), so such layers can use fused-RS.
+            runner_config.activation in ("silu", "silu_and_mul_clamp", "swigluoai"),
         ),
         (
             "router weight not applied on input",
@@ -356,6 +367,12 @@ def apply_tpu_nvfp4_moe(
             raise ValueError("TPU clamped MoE requires silu activation")
         activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
 
+    qblock = qblock_layout(layer)
+    if qblock and not use_fused_rs:
+        raise RuntimeError(
+            f"NVFP4 experts requantized to block {qblock} run only on the fused-RS MoE"
+        )
+
     if use_fused_rs:
         from sglang_tpu.moe.pallas.fused_moe_rs_op import (
             fused_moe_rs_gather,
@@ -413,6 +430,17 @@ def apply_tpu_nvfp4_moe(
             partition_count, rows_per_partition, topk_ids.shape[-1]
         )
 
+        # Stacked expert slabs of the Muse megakernel (SGLANG_TPU_MUSE_MK_EXPERT_GROUP).
+        buffers = layer._buffers
+        stacked = "_stacked_w13_weight" in buffers
+        w1 = buffers["_stacked_w13_weight"] if stacked else layer.w13_weight
+        w2 = buffers["_stacked_w2_weight"] if stacked else layer.w2_weight
+        w1_scale = (
+            buffers["_stacked_w13_weight_scale"] if stacked else layer.w13_weight_scale
+        )
+        w2_scale = (
+            buffers["_stacked_w2_weight_scale"] if stacked else layer.w2_weight_scale
+        )
         outputs = []
         for token_start in range(0, rows_per_partition, rows_per_call):
             token_end = min(token_start + rows_per_call, rows_per_partition)
@@ -423,10 +451,10 @@ def apply_tpu_nvfp4_moe(
 
             output = fused_moe_rs_gather(
                 hidden_states=chunk_hidden,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
+                w1=w1,
+                w2=w2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
                 topk_weights=chunk_weights,
                 topk_ids=chunk_ids,
                 post_expert_norm_weight=post_expert_norm_weight,
@@ -441,6 +469,7 @@ def apply_tpu_nvfp4_moe(
                 keep_token_shard=keep_output_shard,
                 expert_tp=expert_tp,
                 oneshot_rank=getattr(layer, "_tpu_oneshot_rank", None),
+                fp4_w4a16=bool(qblock),
             )
             outputs.append(output[:output_rows])
         return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))
