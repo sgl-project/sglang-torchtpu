@@ -1,0 +1,21 @@
+{
+ "comparison":"Exact successful JAX reference3695225808f0293cae422ea7adf55eddacadd43d versus Torch replay291f5f1a6a7567ed7af462e296f969e026ce6a5f; current Torch source paths verified for cited unchanged host mechanisms",
+ "experiments":{"jax":"exp-266i34jcm1","torch":"exp-88cbehgzz1"},
+ "mounts":"Both Falcon task specs have identical model bucket,prefix,mount path and buffered-read mount options. Mount configuration difference is not supported as explanation.",
+ "jax":{
+  "cache_prewarm":"loader.py193-254 reads all safetensors sequentially in4MiB buffers via max8 threads BEFORE model initialize/load; reference log proves282files704.3GiB warmup134.3s5371MiB/s on NP0",
+  "metadata":"utils/weight_utils.py1148-1237 raw header scan on process0 and broadcast, avoids safe_open mmap metadata scan",
+  "moe":"utils/weight_utils.py1802-1946 computes union of local-device experts, groups by file/byte offsets, coalesces reads when span<=2x requested bytes, assembles/uploads local device shards in parallel",
+  "actual_moe_log":"225 host-bulk groups in returned NP0 log; example128of256 experts across8local devices,1610.6MB io0.29s,assemble+put0.06s. Those are per-group warm-cache metrics, not end-to-end cold network throughput."
+ },
+ "torch":{
+  "actual_baseline":"mmap enabled, prefetch disabled; GLM does not opt into supports_tpu_ep_local_expert_reads, so EP-local reader returnsNone",
+  "iteration":"weight_utils.py1265-1343 threadpool stages whole-file tensor mappings, FIFO future.result then serial yield; nonlocal experts discarded later by FusedMoE.weight_loader",
+  "copy":"model_loader/utils.py should_async_load excludesTPU; per-parameter loading inline, unlike JAX host-level assembly/parallel perdevice puts",
+  "sync":"sglang_tpu/tpu_platform.py85-110 counts every yielded tensor toward2GiB/64tensor synchronize, including subsequently rejected nonlocal expert weights. Accounting is global checkpoint stream rather than accepted local copies.",
+  "caveat":"Whole-file mmap/get_tensor enumeration does NOT prove16xphysical/network reads: nonlocal pages may remain unfaulted. Switching disable_mmap alone would explicitly read whole shards per rank and could worsen I/O."
+ },
+ "conclusion":"Host loading organization materially differs; prioritize perhost prewarm/read planning and early expert filtering rather than new fullmodel retries or timeout increase. These structural findings do not yet uniquely explain host0 asymmetry or historical compiler fatal/137.",
+ "recommended_order":["Verify GLM expert-key/local-range contract before plugin-local selective reader adaptation; include channelwise scales/shared/MTP handling","Separate host-level cold sequential cache preparation from per-rank tensor loading; one reader coordinator perhost, no8duplicate full checkpoint prewarms","Reuse early selective byte-range reader, keep bounded staging and sync on actual accepted work; do not blindly disable sync","Validate exact bytes/keys/local tensor correctness on representative checkpoint shard before one end-to-end rerun"],
+ "new_hardware_runs":0
+}
