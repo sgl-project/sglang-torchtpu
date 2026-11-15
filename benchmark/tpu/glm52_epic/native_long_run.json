@@ -1,0 +1,12 @@
+{
+ "experiment":"exp-r188nvdf96",
+ "job":"job-20cf1ccpfo",
+ "artifact":"art-izu9cvog1u",
+ "source":"2160012cc6",
+ "wait_job":"bash-d9b601274a9f486d",
+ "scope":"warmup plus3sequential plus16routed12288input16output; report actual cache; hostwallbaseline not matchedJAX/C16 proof",
+ "topology":"8physicalchip/2host/TP16 attentionDP16 EP16",
+ "dump":false,
+ "status_at_submit":"PENDING",
+ "text_acceptance_anchor":"exp-k0nnadpb6q twentychecks passed"
+}
