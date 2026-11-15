@@ -85,15 +85,13 @@ def accept_inventory(directory, *, expected_routes, snapshots, run_token, epoch,
     receipt = root/f'accepted-{sequence}.json'
     if inventory.exists() or receipt.exists():
         raise ValueError('accepted inventory cannot be overwritten')
-    raw = json.dumps(dict(expected_routes=expected_routes, snapshots=snapshots), sort_keys=True).encode()
-    # Exclusive creation: never overwrite prior acceptance under the same seq.
-    with inventory.open('xb') as stream:
-        stream.write(raw)
+    from benchmark.tpu.glm52_epic.admission_run import publish_immutable
+    publish_immutable(inventory, dict(expected_routes=expected_routes, snapshots=snapshots))
+    raw = inventory.read_bytes()
     acceptance = dict(run_token=run_token, sequence=sequence, epoch=epoch,
                       status='ALL_RANK_INVENTORY_ACCEPTED', inventory_file=inventory.name,
                       inventory_sha256=hashlib.sha256(raw).hexdigest())
-    with receipt.open('x') as stream:
-        json.dump(acceptance, stream)
+    publish_immutable(receipt, acceptance)
     return acceptance
 
 

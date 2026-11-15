@@ -31,6 +31,8 @@ def install(receiver_class, *, directory, run_token, topology, factory=typed_con
     Does NOT install scheduler acknowledgments or a coordinator. Keep dormant
     until both exist and full receive/broadcast integration is CPU tested.
     """
+    from benchmark.tpu.glm52_epic.admission_run import verify_run
+    verify_run(directory, run_token)
     original = receiver_class._pull_raw_reqs
     if getattr(original, '_glm52_ordered_receiver', False):
         raise RuntimeError('ordered receiver already installed')
