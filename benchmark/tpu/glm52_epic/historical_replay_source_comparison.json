@@ -1,0 +1,9 @@
+{
+  "old": "a95cfc47f4b00c705d68e9acd7508b5e41e1fc26",
+  "replay": "291f5f1a6a7567ed7af462e296f969e026ce6a5f",
+  "production_delta": {"commit":"ef4e214fc9656ed5407e220b706e54bf15d1f391","file":"sglang_tpu/attention/pallas/mla_sparse_qblock_tokens.py","change":"7 added lines shrink oversized query-block tile after preserving legacy page step","reachable_in_page64_decode":false},
+  "identical_production_blobs": ["sglang_tpu/attention_pallas_mla_sparse.py","sglang_tpu/attention/pallas/mla_sparse_fused.py","sglang_tpu/attention/pallas/mla_sparse/kernel.py","sglang_tpu/compilation/decoder_compile_policy.py","sglang_tpu/compilation/direct_compile.py","sglang_tpu/kv_pool.py"],
+  "unchanged_configuration": "torch_prefill_candidate.json and benchmark/tpu/launch_server.py are identical; page64 ctx135168 cache147456 maxbs32 buckets1,2,4,8,16,32 tokenbucket2048",
+  "harness_differences": ["Passive descendant-aware sampling every0.5s instead of30s","Native log tail and pre-cleanup process evidence","Explicit historical-replay contract","Post-startup request4 tokens now all1 instead of1,2,3,4; requires2 generated IDs instead of1"],
+  "interpretation": "A pass would not demonstrate a page64 decode production fix. Compare resource/runtime/cache/termination provenance, not qb32. A repeated failure requires originating child/native evidence before source change."
+}
