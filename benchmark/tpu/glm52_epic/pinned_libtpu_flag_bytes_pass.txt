@@ -1,0 +1,2 @@
+Requirement already satisfied: libtpu==0.0.50 in /usr/local/lib/python3.12/site-packages (0.0.50)
+PINNED_LIBTPU_FLAG_BYTES_PASS {"version": "0.0.50", "sha256": "eb7cbd2bc7c7283c9f6e89a8d23dfbd2b275a3215b121c8f9bc3face842fc7c7", "size_bytes": 630899976, "flags": {"xla_dump_to": true, "xla_dump_hlo_as_text": true, "xla_dump_hlo_as_proto": true, "xla_jf_dump_to": true, "xla_jf_dump_llo_text": true}, "scope": "exactinstalledbinary flagstrings; not parseracceptance/IRemission or TPUexecution"}
