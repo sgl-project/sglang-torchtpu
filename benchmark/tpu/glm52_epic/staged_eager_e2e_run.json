@@ -13,5 +13,6 @@
   "scope": "Natural pre-ready warmup then actual512input/2output greedy request exercising prefill and decode; not longcontext/performance proof",
   "loading": "same staged eager candidate; hostunion exactrange preparation,mmapoff,prefetchoff,EP-local one reader",
   "next": "If pass proceed E2E longrequest/precision/correctcadence; if fail diagnose actual error minimally, no dump effort by default",
-  "wait_job": "bash-81979ef1d50341d3"
+  "wait_job": "bash-81979ef1d50341d3",
+  "terminal_status": "FAILED_NATIVE_EAGER_LOWERING"
 }
