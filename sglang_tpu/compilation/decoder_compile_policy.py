@@ -454,6 +454,10 @@ class EagerLogitsCase(msgspec.Struct, frozen=True):
 class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     """Compile, pad, unpad, and precompile one decoder boundary."""
 
+    # Drop model tensors a specialization never reads from its direct_compile
+    # inputs (e.g. host-resident tables read only outside the graph).
+    direct_compile_prune_unused_inputs = False
+
     model_runner: ModelRunner
     platform = "tpu"
     fullgraph = True
@@ -884,6 +888,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
             kv_pool=self.get_direct_compile_kv_pool(),
             ignored_argnames=self._ignored_argnames(),
+            prune_unused_inputs=self.direct_compile_prune_unused_inputs,
         )
 
         @functools.wraps(fn)

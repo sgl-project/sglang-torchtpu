@@ -103,9 +103,29 @@ def dequant_staged(
     return values.flatten(-2).to(torch.bfloat16)
 
 
-def staged_lookup(embedding, indices, forward_batch) -> torch.Tensor:
-    """EngramEmbedding.forward from the rows the shim staged for this batch."""
-    raw, scale = forward_batch.tpu_engram_staged[embedding.tpu_hash_index]
+def staged_inputs(forward_batch):
+    """(local row ids, staged rows) for this forward, or (None, None).
+
+    The V4 compile policy stages them on the batch. The direct tracer rebuilds ForwardBatch
+    from its dataclass fields only, so inside its trace they come from the
+    attention metadata, which carries them as graph inputs."""
+    if forward_batch is not None and forward_batch.tpu_engram_local_ids is not None:
+        return forward_batch.tpu_engram_local_ids, forward_batch.tpu_engram_staged
+    from sglang.srt.model_executor.forward_context import (
+        get_forward_context,
+        has_forward_context,
+    )
+
+    if not has_forward_context():
+        return None, None
+    metadata = get_forward_context().attn_backend.forward_metadata
+    carried = getattr(metadata, "engram", None)
+    return carried if carried is not None else (None, None)
+
+
+def staged_lookup(embedding, indices, staged) -> torch.Tensor:
+    """EngramEmbedding.forward from the rows staged for this batch."""
+    raw, scale = staged[embedding.tpu_hash_index]
     return dequant_staged(raw, scale, indices)
 
 
