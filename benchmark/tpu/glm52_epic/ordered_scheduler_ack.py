@@ -19,10 +19,7 @@ def install(scheduler_class, *, directory, run_token, topology):
     states = {}
     prefix = f'glm52-control:{run_token}:'
 
-    @functools.wraps(original)
-    def ingest(scheduler, *args, **kwargs):
-        rank = validate_mesh(topology(scheduler))
-        received = original(scheduler, *args, **kwargs)
+    def observe(scheduler, received, rank):
         key = id(scheduler)
         if key not in states:
             states[key] = (scheduler, dict(sequence=-1, epoch=None, action=None))
@@ -68,10 +65,40 @@ def install(scheduler_class, *, directory, run_token, topology):
             os.replace(temp, target)
         return received
 
+    failures = {}
+
+    @functools.wraps(original)
+    def ingest(scheduler, *args, **kwargs):
+        rank = validate_mesh(topology(scheduler))
+        received = original(scheduler, *args, **kwargs)
+        key = id(scheduler)
+        if key in failures:
+            return received
+        try:
+            observe(scheduler, received, rank)
+        except Exception as error:
+            # Observation is not an admission barrier. Do not let rank-local
+            # validation/filesystem failure break the next native collective.
+            # The external watchdog MUST fail the whole run, not resume timing.
+            failure = dict(run_token=run_token, dp_rank=rank,
+                           status='ACK_TERMINAL_ERROR',
+                           error=f'{type(error).__name__}: {error}')
+            failures[key] = (scheduler, failure)
+            try:
+                root = Path(directory)
+                temp = root/f'.ack-error-{rank}-{os.getpid()}.tmp'
+                temp.write_text(json.dumps(failure)+'\n')
+                os.replace(temp, root/f'ordered-rank-{rank}-error.json')
+            except OSError:
+                pass  # Missing fresh ack also forces coordinator timeout/abort.
+        return received
+
     ingest._glm52_ordered_ack = True
     scheduler_class.ingest_requests = ingest
 
     def uninstall():
+        if failures:
+            raise RuntimeError('failed observation requires whole-run teardown')
         if any(state['action'] == 'pause' for _, state in states.values()):
             raise RuntimeError('cannot uninstall while pause owned')
         if scheduler_class.ingest_requests is not ingest:
