@@ -1796,8 +1796,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                     self.owner.forward.warmup_async, *args, **kwargs
                 )
             else:
+                # The env check comes first so the default path never reads
+                # server_args (policies built without a full runner skip it).
                 if (
-                    self.tracer == "dynamo"
+                    tpu_envs.SGLANG_TPU_ENABLE_SYMBOLIC_WARMUP.get()
+                    and self.tracer == "dynamo"
                     and profile_prefix is None
                     and _symbolic_warmup_enabled(self.model_runner.server_args)
                 ):
