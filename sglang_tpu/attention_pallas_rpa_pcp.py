@@ -37,9 +37,13 @@ here. The host-side row layout is ``cp_layout.RingLayout``.
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
+import logging
+
 import torch
 
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "PCP_RING_AXIS",
@@ -128,6 +132,86 @@ def pcp_ring_partition_specs(attn_tp_size: int = 1):
     return in_specs, out_specs
 
 
+# Static shapes whose block sizes were already logged (trace time, per process).
+_LOGGED_BLOCK_SIZES: set = set()
+
+
+def _log_block_sizes_once(
+    *,
+    cp_size,
+    mesh_axes,
+    queries,
+    keys,
+    kv_cache_fused,
+    cache_kv_lens,
+    cache_page_indices,
+    new_kv_lens,
+    new_page_indices,
+    k_scale,
+    v_scale,
+):
+    """Log, once per static shape, the block sizes the fused kernel resolves
+    (``pcp_fused_configs`` is what the kernel itself calls). Runs at trace time;
+    never fails the trace."""
+    try:
+        key = (
+            tuple(queries.shape),
+            tuple(keys.shape),
+            tuple(kv_cache_fused.shape),
+            tuple(cache_page_indices.shape),
+            tuple(new_page_indices.shape),
+            cp_size,
+        )
+        if key in _LOGGED_BLOCK_SIZES:
+            return
+        _LOGGED_BLOCK_SIZES.add(key)
+        from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
+            pcp_fused_configs,
+        )
+
+        num_cache_rows = cache_kv_lens.shape[0]
+        num_new_rows = new_kv_lens.shape[0]
+        fused = pcp_fused_configs(
+            num_q_heads=queries.shape[1],
+            num_kv_heads=keys.shape[1],
+            head_dim=queries.shape[2],
+            dtype_q=queries.dtype,
+            dtype_kv=kv_cache_fused.dtype,
+            page_size=kv_cache_fused.shape[1],
+            cp_group_size=cp_size,
+            total_q_tokens=queries.shape[0],
+            num_cache_rows=num_cache_rows,
+            cache_pages_per_row=cache_page_indices.shape[0] // num_cache_rows,
+            num_new_rows=num_new_rows,
+            new_pages_per_row=new_page_indices.shape[0] // num_new_rows,
+            ring_axis_name=mesh_axes[0],
+            ring_mesh_axis_names=mesh_axes,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        c, n = fused.cfgs_cache.block, fused.cfgs_new.block
+        logger.info(
+            "PCP ring kernel blocks: q=%s kv=%s cache_rows=%d new_rows=%d "
+            "cache_pages/row=%d | cache phase bq=%d bq_c=%d bkv=%d batch=%d | "
+            "new-token phase bq=%d bq_c=%d bkv=%d batch=%d",
+            tuple(queries.shape),
+            tuple(keys.shape),
+            num_cache_rows,
+            num_new_rows,
+            cache_page_indices.shape[0] // num_cache_rows,
+            c.bq_sz,
+            c.bq_c_sz,
+            c.bkv_sz,
+            c.batch_size,
+            n.bq_sz,
+            n.bq_c_sz,
+            n.bkv_sz,
+            n.batch_size,
+        )
+    except Exception as e:  # noqa: BLE001 -- diagnostics only
+        logger.debug("PCP ring block-size log skipped: %s", e)
+
+
 def _invoke_pcp_kernel(
     kernel,
     *,
@@ -162,6 +246,19 @@ def _invoke_pcp_kernel(
     """
     from sglang_tpu.attention_pallas_rpa_batched import kv_layout
 
+    _log_block_sizes_once(
+        cp_size=cp_size,
+        mesh_axes=mesh_axes,
+        queries=queries,
+        keys=keys,
+        kv_cache_fused=kv_cache_fused,
+        cache_kv_lens=cache_kv_lens,
+        cache_page_indices=cache_page_indices,
+        new_kv_lens=new_kv_lens,
+        new_page_indices=new_page_indices,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
     return kernel(
         queries,
         keys,
