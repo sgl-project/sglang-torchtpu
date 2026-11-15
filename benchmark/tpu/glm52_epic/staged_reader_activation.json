@@ -1,0 +1,27 @@
+{
+  "experiment": "exp-24def76f9j",
+  "stage": "READER_ACTIVATED; loadend/compile pending",
+  "load_begin_all16": [
+    "2026-11-15 12:08:02 DP14 TP14 EP14",
+    "2026-11-15 12:08:02 DP15 TP15 EP15",
+    "2026-11-15 12:08:02 DP11 TP11 EP11",
+    "2026-11-15 12:08:02 DP13 TP13 EP13",
+    "2026-11-15 12:08:02 DP10 TP10 EP10",
+    "2026-11-15 12:08:02 DP8 TP8 EP8",
+    "2026-11-15 12:08:02 DP12 TP12 EP12",
+    "2026-11-15 12:08:02 DP9 TP9 EP9",
+    "2026-11-15 12:08:02 DP0 TP0 EP0",
+    "2026-11-15 12:08:02 DP5 TP5 EP5",
+    "2026-11-15 12:08:02 DP4 TP4 EP4",
+    "2026-11-15 12:08:02 DP7 TP7 EP7",
+    "2026-11-15 12:08:02 DP6 TP6 EP6",
+    "2026-11-15 12:08:02 DP3 TP3 EP3",
+    "2026-11-15 12:08:02 DP1 TP1 EP1",
+    "2026-11-15 12:08:02 DP2 TP2 EP2"
+  ],
+  "reader_activation": "physicalhost0/Falconhost1 EP0range0-16",
+  "effective_model": "/models/GLM5.2-fp8-channel-wise",
+  "effective_port": 30000,
+  "load_skew_env": "absent in launch_meta envSGLANG prefix; source default480s",
+  "source_running": "25d226dafd"
+}

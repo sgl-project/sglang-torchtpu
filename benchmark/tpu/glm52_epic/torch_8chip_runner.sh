@@ -135,6 +135,11 @@ try:
     (OUT / candidate.name).write_bytes(candidate_bytes)
     cfg = json.loads(candidate_bytes)
     args = cfg['server_args']
+    for override, field in (('MODEL', 'model_path'), ('HOST', 'host'), ('PORT', 'port')):
+        require(not os.environ.get(override) or os.environ[override] == str(args[field]),
+                f'{override} conflicts with admitted candidate {field}')
+    require(os.environ.get('SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S', '480') == '480',
+            'replay must preserve native480s postload skew timeout')
     runtime_env = cfg.get('runtime_env', cfg.get('runtime_envs', {}))
     if mode in ('eager', 'compile-smoke'):
         require(runtime_env.get('SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL') == '1',
