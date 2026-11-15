@@ -8,7 +8,10 @@
   },
   "jax_reference": {
     "experiment": "exp-266i34jcm1",
-    "source": "3695225808f0293cae422ea7adf55eddacadd43",
+    "source": "3695225808f0293cae422ea7adf55eddacadd43d",
+    "actual_prefill_step": {"active_requests":16,"requests_per_dp":1,"tokens_per_dp":2048,"global_tokens":32768,"queued_requests":16},
+    "measured_totals": {"steps":12,"extend_tokens":393216},
+    "interpretation": "Submitted32 is not active per-step16; user DEP16/C16 correction matches actual step shape. A client-C16 run would change queueing and must be labeled separately.",
     "workload": "32 requests, prefix49152, extend12288, output16, concurrency32, DP16, local chunk2048",
     "measured_admission": "32 unique waiting RIDs under paused scheduler; DP mapping index modulo16"
   },
