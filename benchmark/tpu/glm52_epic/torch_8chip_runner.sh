@@ -225,6 +225,40 @@ try:
     coords = run([sys.executable, '-m', 'sglang_tpu.node_normalization',
                   '--print_local_device_coords'], 'native-coordinate-probe.log', 180)
     result['coordinate_probe'] = coords
+    # Optional benchmark-only staged loading. Falcon pod order is NOT physical
+    # host order: use the same native rank calculation as normalization, never
+    # FALCON_RANK to choose the host's expert union. Reader still checks actual
+    # constructed MoE layouts before any payload pruning.
+    if args.get('weight_loader_disable_mmap', False):
+        require(args.get('weight_loader_prefetch', False) is False,
+                'EP-local mode cannot combine mmap-only prefetch')
+        require(args.get('enable_eplb', False) is False,
+                'host union preparation requires static contiguous EP ownership')
+        require(os.environ.get('SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS', '0') == '0',
+                'selective loading requested but EP-local kill switch is enabled')
+        mapping_code = '''import json
+from sglang_tpu.node_normalization import TopologyConfig, query_node_rank
+import os
+cfg=TopologyConfig(hosts=tuple(os.environ['TPU_WORKER_HOSTNAMES'].split(',')),topology=(2,2,2,2))
+rank=query_node_rank(cfg,int(os.environ['FALCON_RANK']),180)
+print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
+'''
+        mapping = run([sys.executable, '-c', mapping_code], 'host-preparation-rank.log', 240)
+        entries = [json.loads(line.split(' ', 1)[1]) for line in mapping.splitlines()
+                   if line.startswith('GLM52_PREP_PHYSICAL_RANK ')]
+        require(len(entries) == 1 and entries[0]['rank'] in (0, 1),
+                'missing unique physical host rank for preparation')
+        physical_rank = entries[0]['rank']
+        prep = run([sys.executable, '-m', 'benchmark.tpu.glm52_epic.prepare_host_checkpoint',
+                    args['model_path'], '--expert-start', str(physical_rank * 128),
+                    '--expert-end', str((physical_rank + 1) * 128), '--execute'],
+                   'host-preparation.log', 900)
+        markers = [json.loads(line.split(' ', 1)[1]) for line in prep.splitlines()
+                   if line.startswith('HOST_PREPARE_PASS ')]
+        require(len(markers) == 1 and not markers[0]['slice_only'] and
+                not markers[0]['unindexed_not_prepared'],
+                'host checkpoint preparation incomplete')
+        result['host_preparation'] = dict(physical_rank=physical_rank, **markers[0])
     result['topology'] = {'physical_chips': 8, 'hosts': hosts, 'physical_chip_nodes': devices,
                           'devices_per_host': 8, 'total_devices': 16,
                           'chip_topology': '2x2x2', 'native_topology': '2,2,2,2'}
