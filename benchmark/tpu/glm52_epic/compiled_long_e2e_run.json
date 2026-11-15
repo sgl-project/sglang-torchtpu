@@ -1,0 +1,17 @@
+{
+ "experiment":"exp-19jk2vguvj",
+ "job":"job-az4ky5w19v",
+ "artifact":"art-x9kwaldf2c",
+ "source":"475000ffe8",
+ "mode":"compiled-long-e2e",
+ "status_at_submit":"PENDING",
+ "anchor":"exp-24def76f9j",
+ "dump":false,
+ "physical_chips":8,
+ "hosts":2,
+ "framework_devices":16,
+ "configuration":"existing successful historical compile candidate unchanged; localchunk2048 globalchunk32768; context135168; full6DECODEbuckets",
+ "request":"single12288inputids1; greedy16outputs; require noabort and exact16integeroutputIDs",
+ "scope":"longrequest functional E2E only; repeatedtoken syntheticinput NOT precision or C16performance",
+ "wait_job":"bash-96eb024791394e7a"
+}
