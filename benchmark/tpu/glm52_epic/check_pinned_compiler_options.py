@@ -9,7 +9,7 @@ def main():
     path=Path('/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl')
     assert hashlib.sha256(path.read_bytes()).hexdigest()=='6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82'
     with zipfile.ZipFile(path) as wheel:
-        candidates=[name for name in wheel.namelist() if name.endswith('compiler_options.py')]
+        candidates=[name for name in wheel.namelist() if name.endswith('compiler_options.py') or name.endswith('compiler_options/__init__.py')]
         assert candidates,candidates
         for name in candidates:
             raw=wheel.read(name);text=raw.decode()
