@@ -32,6 +32,13 @@
     "verified precision/IR contract or explicitly labeled native-mode comparison",
     "separate compile/warmup from steady-state completion intervals"
   ],
+  "latest_hardware_evidence": {
+    "fullmodel_historical_shape": {"experiment":"exp-88cbehgzz1","result":"FAILED before compile: unbalanced loading barrier480s; no matched timing or compiler verdict"},
+    "metadata_sequence": {"experiment":"exp-knq072ob26","result":"Both independent hosts baseline/preceding metadata numerical oracles passed; not TP16 model proof"},
+    "decode_static_capacity": {"experiment":"exp-7ebqrpc7f0","result":"Production2113-page shape eager/Dynamo numerical and signed cache-write oracles passed both independent hosts; not fullmodel DECODE"},
+    "precision": "JAX0.11.2 abstract dot trace retains mixed BF16/FP8 QK and FP32/FP8 PV. Target instruction precision and parity still unverified."
+  },
+  "local_revalidation": "Observer4 stdlib groups and client NPY/HTTP rejection selftests PASS; actual rank admission barrier installation still pending",
   "decision": "Do not submit matched performance experiment; do not report a ratio",
   "scope": "admission gate only; no hardware result"
 }
