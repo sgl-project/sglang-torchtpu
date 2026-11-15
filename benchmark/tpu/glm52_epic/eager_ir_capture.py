@@ -18,6 +18,13 @@ def install(directory):
     if any(name in sys.modules for name in ('jax','torch_tpu','torch_xla')):
         raise RuntimeError('IR setup must precede backend imports')
     inherited=os.environ.get('XLA_FLAGS','')
+    owned=os.environ.get('GLM52_OWNED_IR_FLAGS','')
+    if owned:
+        # Spawn inherits parent's env. Strip ONLY the exact suffix we emitted;
+        # arbitrary external dump flags remain forbidden rather than hidden.
+        if not inherited.endswith(owned):
+            raise ValueError('owned dump flags changed after setup')
+        inherited=inherited[:-len(owned)].strip()
     if 'xla_dump_' in inherited:
         raise ValueError('inherited dump flags/filter conflict with producer capture')
     pidroot=root/f'host-{os.environ.get("FALCON_RANK","unknown")}'/f'pid-{os.getpid()}'
@@ -27,6 +34,7 @@ def install(directory):
         raise ValueError('XLA dump directory cannot contain whitespace')
     flags=f'--xla_dump_to={hlo} --xla_dump_hlo_as_text --xla_dump_hlo_as_proto'
     os.environ['XLA_FLAGS']=(inherited+' '+flags).strip()
+    os.environ['GLM52_OWNED_IR_FLAGS']=flags
     record=dict(pid=os.getpid(),ppid=os.getppid(),hostname=socket.gethostname(),
         falcon_rank=os.environ.get('FALCON_RANK'),wall_ns=time.time_ns(),
         monotonic_ns=time.monotonic_ns(),source_commit=os.environ.get('SOURCE_COMMIT'),
