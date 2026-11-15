@@ -20,6 +20,10 @@ def wrap_loop(original, directory, context_factory=None, parallel_getter=None):
     def loop(owner,*args,**kwargs):
         if not owner.spec_algorithm.is_none():
             raise ValueError('scoped IR supports non-speculative eager loop only')
+        if owner.server_args.enable_torch_compile:
+            raise ValueError('scoped IR requires eager mode')
+        if owner.disaggregation_mode.value != 'null' or owner.enable_pdmux or owner.enable_overlap_mlx:
+            raise ValueError('scoped IR requires normal NULL-disagg scheduler loop')
         factory=context_factory
         if factory is None:
             from torch_tpu._internal.compiler_options import custom_compiler_options
@@ -29,6 +33,8 @@ def wrap_loop(original, directory, context_factory=None, parallel_getter=None):
             from sglang.srt.runtime_context import get_parallel
             getter=get_parallel
         parallel=getter()
+        if parallel.pp_size != 1:
+            raise ValueError('scoped IR requires PP1')
         root=Path(directory)/f'host-{os.environ.get("FALCON_RANK","unknown")}'/f'pid-{os.getpid()}'/'post-load'
         root.mkdir(parents=True,exist_ok=False)
         options=dict(xla_dump_to=str(root),xla_dump_hlo_as_text='true',xla_dump_hlo_as_proto='true')
