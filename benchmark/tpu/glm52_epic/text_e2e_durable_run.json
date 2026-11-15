@@ -1,0 +1,16 @@
+{
+ "experiment":"exp-vist8hk13c",
+ "job":"job-se7i0twtwi",
+ "artifact":"art-p4ofx586zs",
+ "source":"1844dd61d7",
+ "status_at_submit":"PENDING",
+ "anchor":"exp-j857cxgdiv",
+ "dump":false,
+ "physical_chips":8,
+ "hosts":2,
+ "framework_devices":16,
+ "change":"same text inputs/assertions and compile config; preserve client exception+rawresponses in durablelogs/artifact evenon failure",
+ "local_verification":"real localhostHTTP and separateclientprocess;20wrongresponses rejected,result+error+allrawresponses retained",
+ "scope":"realtext/native DP routing sanity; no accuracy certification or matchedC16performance",
+ "wait_job":"bash-61a61e0a267444fd"
+}
