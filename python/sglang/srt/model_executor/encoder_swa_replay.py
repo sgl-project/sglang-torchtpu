@@ -206,9 +206,17 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         r, n = replay[i], ext[i]
         if r:
             head = list(req.full_untruncated_fill_ids[pre[i] : pre[i] + r])
-            ids.append(torch.tensor(head, dtype=batch.input_ids.dtype, device=device))
+            # Replay rows join the batch tensors on their device: TPU may stage
+            # input_ids on the host and keep req_to_token host-resident.
+            ids.append(
+                torch.tensor(
+                    head, dtype=batch.input_ids.dtype, device=batch.input_ids.device
+                )
+            )
             locs.append(
-                req_to_token[batch.req_pool_indices[i], pre[i] : pre[i] + r].long()
+                req_to_token[batch.req_pool_indices[i], pre[i] : pre[i] + r]
+                .to(batch.out_cache_loc.device)
+                .long()
             )
             cpu_ids.append(torch.tensor(head, dtype=torch.int64))
         ids.append(batch.input_ids[off : off + n])
