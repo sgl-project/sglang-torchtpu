@@ -15,7 +15,7 @@
   "scope": "longrequest functional E2E only; repeatedtoken syntheticinput NOT precision or C16performance",
   "wait_job": "bash-96eb024791394e7a",
   "last_verified": {
-    "status": "RUNNING DECODE compilation",
+    "status": "TERMINAL_SUCCEEDED",
     "extend_begin_utc": "2026-11-15T14:35:22Z",
     "decode_begin_utc": "2026-11-15T14:43:30Z",
     "extend_phase_wall_seconds": 488,
@@ -29,5 +29,6 @@
     ],
     "graph_cpu_partitions": 0,
     "scope": "native host0 eight scheduler logs; not completed decode or request evidence"
-  }
+  },
+  "terminal_status": "SUCCEEDED"
 }
