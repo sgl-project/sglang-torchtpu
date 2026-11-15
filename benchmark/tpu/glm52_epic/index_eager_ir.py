@@ -15,7 +15,7 @@ PATTERN=re.compile(r'\bu64\[|custom-call\(|op_name=|source_file=')
 def index(root, max_bytes=4*1024**3, max_files=12500, max_hits=20000):
     root=Path(root).resolve()
     total=0;count=0;hits=[];modules=[];truncated=False
-    for path in sorted(root.rglob('*')):
+    for path in root.rglob('*'):
         if path.is_symlink() or not path.is_file():continue
         count+=1;size=path.stat().st_size;total+=size
         if count>max_files or total>max_bytes:
@@ -24,7 +24,9 @@ def index(root, max_bytes=4*1024**3, max_files=12500, max_hits=20000):
         # Keep per-file allocation bounded, stream hash/lines. Refuse giantlines.
         digest=hashlib.sha256();local=[]
         with path.open('rb') as stream:
-            for lineno,raw in enumerate(stream,1):
+            lineno=0
+            while raw := stream.readline(1024*1024+1):
+                lineno+=1
                 if len(raw)>1024*1024:
                     raise ValueError('IR line exceeds1MiB bound')
                 digest.update(raw)
