@@ -336,6 +336,71 @@ def _check_dcp_kv_heads(*, layer: "RadixAttention", pool_kv_heads: int) -> None:
         )
 
 
+def _hadamard_matrix(dim: int) -> torch.Tensor:
+    """Orthonormal Sylvester Hadamard matrix ``[dim, dim]`` (float32, CPU).
+
+    Symmetric and its own inverse, so ``(x @ H) @ H == x`` and
+    ``(q @ H) . (k @ H) == q . k``.
+    """
+    if dim <= 0 or dim & (dim - 1):
+        raise ValueError(
+            f"SGLANG_TPU_FP8_KV_HADAMARD needs a power-of-two head_dim, got {dim}."
+        )
+    h = torch.ones(1, 1, dtype=torch.float64)
+    while h.shape[0] < dim:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    return (h / dim**0.5).to(torch.float32)
+
+
+def _hadamard_signs(dim: int, *, device, dtype: torch.dtype) -> torch.Tensor:
+    """Unnormalized Sylvester Hadamard matrix ``[dim, dim]`` of +-1, built in-graph.
+
+    ``H[i, j] = (-1) ** popcount(i & j)`` from two iotas and log2(dim)
+    shift/and/xor steps, so no stored tensor constant enters the graph (the
+    ``--tpu-compile-tracer direct`` path rejects captured constants) and XLA
+    can fold it. +-1 is exact in any float dtype.
+    """
+    idx = torch.arange(dim, device=device, dtype=torch.int32)
+    both = idx[:, None] & idx[None, :]
+    parity = torch.zeros_like(both)
+    for shift in range(dim.bit_length() - 1):
+        parity = parity ^ ((both >> shift) & 1)
+    return (1 - 2 * parity).to(dtype)
+
+
+def _rotate_heads(x: torch.Tensor) -> torch.Tensor:
+    """``x [..., d] @ _hadamard_matrix(d)``, back in ``x``'s dtype.
+
+    One matmul in ``x``'s dtype against the in-graph +-1 matrix (exact
+    operands, accumulated by the matmul unit), then the 1/sqrt(d) scale in
+    float32. ``d`` must be a power of two.
+    """
+    d = x.shape[-1]
+    signs = _hadamard_signs(d, device=x.device, dtype=x.dtype)
+    return (torch.matmul(x, signs).float() * d**-0.5).to(x.dtype)
+
+
+def _fp8_k_hadamard_dim(
+    *, fp8_kv: bool, enabled: bool, head_dim: int | None, external_k_writer: bool
+) -> int | None:
+    """Head dim to Hadamard-rotate q/k at, or None to keep K unrotated.
+
+    Only fp8 caches rotate, and only power-of-two head dims (Sylvester
+    construction). Every K the backend attends must have gone through
+    ``_forward``, so runners with another writer of the same pool stay off
+    (``external_k_writer``): DFlash/DSpark drafts write context K through
+    dflash_draft_kv_write.py and the Muse megakernel attends and writes the
+    pool itself on decode, both unrotated. Layers whose ``qk_head_dim``
+    differs from ``head_dim`` are not rotated.
+    """
+    if not (fp8_kv and enabled) or external_k_writer:
+        return None
+    dim = int(head_dim or 0)
+    if dim <= 0 or dim & (dim - 1):
+        return None
+    return dim
+
+
 def _quantize_kv_to_fp8(
     t: torch.Tensor, scale: float, fp8_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -695,6 +760,21 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self.kv_cache_quant_dtype: torch.dtype | None = (
             kv_cache_dtype if kv_cache_dtype in fp8_dtypes else None
         )
+        # fp8 KV cache: rotate q and k per head by an orthonormal Hadamard
+        # matrix before K is stored (see SGLANG_TPU_FP8_KV_HADAMARD).
+        hadamard_dim = _fp8_k_hadamard_dim(
+            fp8_kv=self.kv_cache_quant_dtype is not None,
+            enabled=envs.SGLANG_TPU_FP8_KV_HADAMARD.get(),
+            head_dim=getattr(
+                getattr(model_runner, "model_config", None), "head_dim", None
+            ),
+            external_k_writer=(
+                bool(getattr(model_runner, "is_draft_worker", False))
+                and model_runner.spec_algorithm.is_dflash_family()
+            )
+            or envs.SGLANG_TPU_MUSE_MEGAKERNEL.get(),
+        )
+        self._fp8_k_hadamard_dim = hadamard_dim
 
         # Query rows per DECODE sequence. Target verification and the draft's
         # decode-phase extension both carry a fixed number of draft tokens per
@@ -1613,6 +1693,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # (or output slicing) is needed; until then this keeps K==V width.
         if layer.v_head_dim < layer.qk_head_dim:
             v = torch.nn.functional.pad(v, (0, layer.qk_head_dim - layer.v_head_dim))
+        # fp8 KV cache: store K rotated (and rotate q to match) so fp8 rounding
+        # does not concentrate on K's outlier channels. Done before anything
+        # writes K, so every cache writer (kernel, DCP, both PCP modes) and
+        # every reader sees the same rotated K.
+        if layer.qk_head_dim == self._fp8_k_hadamard_dim:
+            q = _rotate_heads(q)
+            k = _rotate_heads(k)
         # Packed pools (SGLANG_TPU_KV_PACK_HEADS) hold this rank's kv heads side by side.
         pack = _pool_kv_pack_heads(self.token_to_kv_pool)
         if pack > 1:
