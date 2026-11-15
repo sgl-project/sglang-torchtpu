@@ -136,6 +136,15 @@ tpu_dsv41_commit_engram_history
        to each live request's history (functional update + copy_).
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
   Remove when: TpuSpecWorker commits the target's Engram history itself.
+
+tpu_dsv41_get_last_loc
+  Why: get_last_loc picks the Triton kernel unless the attention backend name
+       is in its non-Triton list; "dsv4" is not, so the spec decode allocation
+       (allocate_and_assign_decode_cache) launches Triton on TPU and fails with
+       "0 active drivers".
+  How: AROUND get_last_loc sends non-CUDA tensors to get_last_loc_torch.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
+  Remove when: get_last_loc dispatches on the tensor device, not backend names.
 """
 
 from __future__ import annotations
@@ -423,6 +432,17 @@ def tpu_dsv41_create_draft_worker(original, *, algorithm, target_runner):
     return original(algorithm=algorithm, target_runner=target_runner)
 
 
+def tpu_dsv41_get_last_loc(
+    original, req_to_token, req_pool_indices_tensor, prefix_lens_tensor
+):
+    """AROUND get_last_loc: the torch lookup off CUDA, where Triton has no driver."""
+    if req_to_token.is_cuda:
+        return original(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
+    from sglang.srt.mem_cache.allocation import get_last_loc_torch
+
+    return get_last_loc_torch(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -511,6 +531,11 @@ def hook_specs():
         (
             "sglang_tpu.experimental.speculative.block_spec_worker._create_draft_worker",
             tpu_dsv41_create_draft_worker,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.mem_cache.allocation.get_last_loc",
+            tpu_dsv41_get_last_loc,
             HookType.AROUND,
         ),
     ]

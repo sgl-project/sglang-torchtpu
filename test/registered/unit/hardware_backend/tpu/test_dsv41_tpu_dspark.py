@@ -274,5 +274,20 @@ class TestDraftPlacement(CustomTestCase):
         self.assertTrue(TpuDsv41DsparkDraftWorker._keeps_target_placement)
 
 
+class TestGetLastLocOffCuda(CustomTestCase):
+    def test_host_tensors_skip_the_triton_kernel(self):
+        """Spec decode allocation on TPU called the Triton get_last_loc
+        ("0 active drivers"); host tensors must take the torch lookup."""
+        req_to_token = torch.arange(12, dtype=torch.int32).view(3, 4)
+        rows = torch.tensor([2, 0])
+        lens = torch.tensor([3, 0], dtype=torch.int32)
+
+        def triton(*args):
+            raise AssertionError("Triton get_last_loc called off CUDA")
+
+        out = hooks.tpu_dsv41_get_last_loc(triton, req_to_token, rows, lens)
+        self.assertEqual(out.tolist(), [10, -1])
+
+
 if __name__ == "__main__":
     unittest.main()
