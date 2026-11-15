@@ -496,6 +496,8 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
             response = json.loads(body)
             require(code == 200 and isinstance(response, dict), '/generate failed')
             meta = response.get('meta_info', {})
+            require(meta.get('prompt_tokens') == smoke_tokens,
+                    f'smoke prompt token accounting mismatch: expected {smoke_tokens}')
             require(meta.get('completion_tokens') == smoke_outputs,
                     f'smoke did not produce exactly {smoke_outputs} tokens')
             require(meta.get('finish_reason', {}).get('type') != 'abort', 'generation aborted')
