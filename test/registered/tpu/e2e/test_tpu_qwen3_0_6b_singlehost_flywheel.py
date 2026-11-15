@@ -1,8 +1,9 @@
 """--attention-backend flywheel serves Qwen3-0.6B as RPA v3 does.
 
 Serves the same greedy requests with RPA v3 and then with flywheel, both on a
-bf16 KV cache. Flywheel's tokens must match RPA's up to the first position
-where RPA's top-2 logprobs are nearly tied; bf16 rounding can flip those.
+bf16 KV cache and again both on an fp8 one. Flywheel's tokens must match RPA's
+up to the first position where RPA's top-2 logprobs are nearly tied; rounding
+can flip those.
 The prompts run each kernel branch the server reaches at batch size 1: ragged
 prefill (the 64-token bucket), dense prefill (a 512-token chunk), paged
 extend (the later chunks and a radix-cache hit) and decode.

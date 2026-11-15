@@ -125,7 +125,7 @@ _DENSE_MAX_BLOCK = max(FWD_BLOCKS)
 def select_attention_phase(
     num_decode: int, cu_q_lens: np.ndarray, kv_lens: np.ndarray
 ) -> str:
-    """A rank's attention phase, from this step's own host lengths.
+    """The step's attention phase, from its host lengths.
 
     PREFILL is a step of fresh prefill requests alone (kv_len == q_len and no
     decode row), which the prefill kernels serve from this step's K/V. A
@@ -154,32 +154,27 @@ def select_attention_phase(
 
 
 def use_dense_prefill(
-    scheduled_tokens_per_dp_rank: Sequence[Sequence[int]],
-    padded_num_tokens_per_dp_rank: int,
+    scheduled_tokens: Sequence[int],
+    padded_num_tokens: int,
     ragged_block_span: int,
 ) -> bool:
     """Whether a prefill step runs the dense kernel instead of the ragged one
-    at ragged_block_span: every DP rank schedules one request, the dense
-    kernel can tile the token bucket, and the cost model favours dense.
+    at ragged_block_span: the step schedules one request, the dense kernel
+    can tile the token bucket, and the cost model favours dense.
 
     The runner packs requests end to end and pads the tail, so one request is
     already a (1, bucket) dense row: the causal mask keeps every real query
     off the padded keys, and the KV writer copies real rows only.
     """
-    bucket = padded_num_tokens_per_dp_rank
-    if not (
-        all(len(lengths) == 1 for lengths in scheduled_tokens_per_dp_rank)
-        and is_dense_tileable(bucket)
-    ):
+    bucket = padded_num_tokens
+    if not (len(scheduled_tokens) == 1 and is_dense_tileable(bucket)):
         return False
     # Note: both kernels pay for the bucket's pad tail. The dense cost
     # has no per-step overhead term because its schedule is built on the host.
     block = min(bucket, _DENSE_MAX_BLOCK)
     num_blocks = bucket // block
     dense_cost = num_blocks * (num_blocks + 1) // 2 * block * block
-    return dense_cost <= ragged_step_cost(
-        scheduled_tokens_per_dp_rank, bucket, ragged_block_span
-    )
+    return dense_cost <= ragged_step_cost(scheduled_tokens, bucket, ragged_block_span)
 
 
 # Note: the varlen kernel caps its q/kv block at max_seqlen_q/k, picking
@@ -199,32 +194,25 @@ _VARLEN_BLOCK_SPANS = tuple(
 _VARLEN_STEP_OVERHEAD_TOKENS = 704
 
 
-def varlen_block_spans(padded_num_tokens_per_dp_rank: int) -> tuple[int, ...]:
+def varlen_block_spans(padded_num_tokens: int) -> tuple[int, ...]:
     """Every block span varlen_block_span can return at this token bucket,
     which is the set of ragged prefill kernels in the bucket's backbone."""
-    spans = tuple(s for s in _VARLEN_BLOCK_SPANS if s <= padded_num_tokens_per_dp_rank)
-    return spans or (padded_num_tokens_per_dp_rank,)
+    spans = tuple(s for s in _VARLEN_BLOCK_SPANS if s <= padded_num_tokens)
+    return spans or (padded_num_tokens,)
 
 
-def varlen_block_span(
-    scheduled_tokens_per_dp_rank: Sequence[Sequence[int]],
-    padded_num_tokens_per_dp_rank: int,
-) -> int:
+def varlen_block_span(scheduled_tokens: Sequence[int], padded_num_tokens: int) -> int:
     """The varlen_block_spans entry with the lowest ragged_step_cost for this
-    step (one executable serves every DP rank). min keeps the first of equal
-    costs, and the spans go widest first, so a tie goes to the wider span."""
+    step. min keeps the first of equal costs, and the spans go widest first,
+    so a tie goes to the wider span."""
     return min(
-        reversed(varlen_block_spans(padded_num_tokens_per_dp_rank)),
-        key=lambda span: ragged_step_cost(
-            scheduled_tokens_per_dp_rank, padded_num_tokens_per_dp_rank, span
-        ),
+        reversed(varlen_block_spans(padded_num_tokens)),
+        key=lambda span: ragged_step_cost(scheduled_tokens, padded_num_tokens, span),
     )
 
 
 def ragged_step_cost(
-    scheduled_tokens_per_dp_rank: Sequence[Sequence[int]],
-    padded_num_tokens_per_dp_rank: int,
-    span: int,
+    scheduled_tokens: Sequence[int], padded_num_tokens: int, span: int
 ) -> int:
     """Modelled cost of one ragged prefill step at this block span. It is a
     relative cost: only its ratio across spans, and to the dense cost in
@@ -237,28 +225,26 @@ def ragged_step_cost(
     sequence. A step costs its span x span tile plus a fixed overhead, written
     as a tile of _VARLEN_STEP_OVERHEAD_TOKENS x _VARLEN_STEP_OVERHEAD_TOKENS:
 
-        cost = max over DP ranks of sum(t * (t + 1) / 2)
-               * (span**2 + _VARLEN_STEP_OVERHEAD_TOKENS**2)
+        cost = sum(t * (t + 1) / 2) * (span**2 + _VARLEN_STEP_OVERHEAD_TOKENS**2)
 
-    The DP ranks run at the same time, so the step costs its slowest rank.
     A wide span computes more of the tiles past the end of short sequences
     and along the diagonal; a narrow one takes more steps, each paying the
     overhead. For example, one 3000-token request in a 4096-token bucket (a
     1096-token tail) costs (21 + 6) * (512**2 + 704**2) = 20.5M at span 512,
     and (6 + 3) * (1024**2 + 704**2) = 13.9M at span 1024.
     """
-    max_num_steps = 0
-    for lengths in scheduled_tokens_per_dp_rank:
-        tail = padded_num_tokens_per_dp_rank - sum(lengths)
-        num_blocks = [-(-length // span) for length in [*lengths, tail] if length > 0]
-        max_num_steps = max(max_num_steps, sum(t * (t + 1) // 2 for t in num_blocks))
-    return max_num_steps * (span * span + _VARLEN_STEP_OVERHEAD_TOKENS**2)
+    tail = padded_num_tokens - sum(scheduled_tokens)
+    num_blocks = [
+        -(-length // span) for length in [*scheduled_tokens, tail] if length > 0
+    ]
+    num_steps = sum(t * (t + 1) // 2 for t in num_blocks)
+    return num_steps * (span * span + _VARLEN_STEP_OVERHEAD_TOKENS**2)
 
 
-def is_dense_tileable(padded_num_tokens_per_dp_rank: int) -> bool:
+def is_dense_tileable(padded_num_tokens: int) -> bool:
     """Whether the dense kernel can tile a (1, bucket) row at this token
     bucket."""
-    bucket = padded_num_tokens_per_dp_rank
+    bucket = padded_num_tokens
     return bucket % _DENSE_PAD_MULTIPLE == 0 and (
         bucket <= _DENSE_MAX_BLOCK or bucket % _DENSE_MAX_BLOCK == 0
     )
@@ -472,12 +458,12 @@ def _step_kernel_rows(
         )
 
 
-def step_kernels(padded_num_tokens_per_dp_rank: int) -> tuple[str | int, ...]:
+def step_kernels(padded_num_tokens: int) -> tuple[str | int, ...]:
     """The kernels one backbone holds at this token bucket for a step's rows
     after its decode rows, in lax.switch order: none (a decode step), the
     paged extend kernel, dense prefill when the bucket is tileable, and
     ragged prefill at each block span (an int)."""
-    bucket = padded_num_tokens_per_dp_rank
+    bucket = padded_num_tokens
     kernels: list[str | int] = [_DECODE_PHASE, _EXTEND_PHASE]
     if is_dense_tileable(bucket):
         kernels.append(_DENSE_KERNEL)
@@ -502,7 +488,7 @@ def flywheel_tpu_attention(
     k_descale: float | None = None,
     v_descale: float | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """One shard's attention for any step, in one executable per bucket.
+    """One rank's attention for any step, in one executable per bucket.
 
     The DMA writer copies the K/V of the rows after the leading decode rows
     into the pages, and the decode kernel appends and attends the decode
@@ -510,10 +496,10 @@ def flywheel_tpu_attention(
     rows. Every switch branch only reads the cache: a branch that wrote it
     would make XLA copy the whole cache per layer.
 
-    request_distribution is this rank's (decode_end, prefill_end, mixed_end),
-    RPA's cumulative request counts of its three request groups. The runner
-    puts no request in the middle, prefill-only group, so it is
-    [num_decode, num_decode, num_reqs], and only entries 0 and 2 are read.
+    request_distribution is RPA's (decode_end, prefill_end, mixed_end), the
+    cumulative request counts of its three request groups: [n, n, n] for a
+    decode step and [0, n, n] for an extend step. Only entries 0 and 2 are
+    read.
     """
     head_dim = q.shape[-1]
     if k.shape[-1] != head_dim or v.shape != k.shape:
@@ -541,8 +527,7 @@ def flywheel_tpu_attention(
             (x.astype(jnp.float32) * (1.0 if s is None else s)).astype(q.dtype)
             for x, s in ((padded_k, k_descale), (padded_v, v_descale))
         )
-    # Note: per-rank metadata is sharded as flat arrays, so the
-    # writer's (3, bound) table arrives flattened.
+    # The op passes the writer's (3, bound) table flattened.
     cache = write_kv_cache_pages(
         padded_k,
         padded_v,
@@ -594,7 +579,7 @@ def flywheel_tpu_attention(
     # Note: the leading rows take the decode kernel's output below
     # num_decode and zeros past the scheduled tokens: a branch need not own
     # the rows below its first request (row num_decode), and a decode-only
-    # rank leaves it no request. num_decode never exceeds num_leading_rows.
+    # step leaves it no request. num_decode never exceeds num_leading_rows.
     num_leading_rows = min(align_to(decode_output.shape[0], 8), padded_q.shape[0])
     # Note: shape padding only; num_decode cannot reach these rows.
     padded_decode_output = jnp.pad(
@@ -624,12 +609,11 @@ def check_supported(
     use_causal_mask: bool,
 ) -> None:
     """Raises NotImplementedError for a feature of one attention layer that
-    the backend does not support. FlywheelAttentionBackend.check_config has
-    already rejected, at startup, what the engine configuration shows
-    (parallelism, speculative decoding, dtypes)."""
-    # Note: every served model decodes, and check_config can only check
-    # the model's one get_head_size(); a layer of another head_dim would
-    # decode wrong rows rather than fail.
+    the backend does not support. validate_flywheel_server_args has already
+    rejected, at startup, what the server args show (parallelism, speculative
+    decoding, dtypes)."""
+    # Checked per layer: a layer of another head_dim would decode wrong rows
+    # rather than fail.
     if q.shape[-1] not in _DECODE_HEAD_DIMS:
         raise NotImplementedError(
             f"The flywheel attention backend decodes only head_dim in "
@@ -659,7 +643,7 @@ def step_kernel_index(
     """The step's index into step_kernels(padded_num_tokens)."""
     kernel: str | int = select_attention_phase(num_decode, cu_q_lens, kv_lens)
     if kernel == _PREFILL_PHASE:
-        scheduled_tokens = [np.diff(cu_q_lens).tolist()]
+        scheduled_tokens = np.diff(cu_q_lens).tolist()
         span = varlen_block_span(scheduled_tokens, padded_num_tokens)
         dense = use_dense_prefill(scheduled_tokens, padded_num_tokens, span)
         kernel = _DENSE_KERNEL if dense else span
