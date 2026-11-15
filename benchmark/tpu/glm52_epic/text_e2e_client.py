@@ -5,6 +5,7 @@ import uuid
 import json
 from pathlib import Path
 import urllib.request
+import urllib.error
 
 
 def run(base_url, output):
@@ -16,9 +17,16 @@ def run(base_url, output):
         if rank is not None:payload['routed_dp_rank']=rank
         (output/f'{name}-request.json').write_text(json.dumps(payload,ensure_ascii=False)+'\n')
         request=urllib.request.Request(base_url.rstrip('/')+'/generate',json.dumps(payload).encode(),{'Content-Type':'application/json'})
-        with urllib.request.urlopen(request,timeout=900) as response:
-            assert response.status==200
-            raw=response.read()
+        try:
+            with urllib.request.urlopen(request,timeout=900) as response:
+                assert response.status==200
+                raw=response.read()
+        except urllib.error.HTTPError as error:
+            raw=error.read()
+            (output/f'{name}-response.json').write_bytes(raw)
+            (output/f'{name}-http-error.json').write_text(json.dumps(dict(
+                status=error.code,reason=str(error.reason),body=raw.decode(errors='replace')),indent=2)+'\n')
+            raise
         (output/f'{name}-response.json').write_bytes(raw)
         records=json.loads(raw);records=records if isinstance(records,list) else [records]
         assert len(records)==(len(text) if isinstance(text,list) else 1)
