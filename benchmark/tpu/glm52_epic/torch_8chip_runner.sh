@@ -36,6 +36,7 @@ control = None
 memory_stop = threading.Event()
 memory_thread = None
 state = {'status': 'RUNNING', 'peer_ack': False}
+prep_root = None  # Allocation-scoped shared failure channel after staged prep.
 
 
 def save(name, data):
@@ -64,6 +65,13 @@ def run(argv, name, timeout=120):
 
 def check_child():
     remaining()
+    if prep_root is not None:
+        # Both directions: a failed peer may no longer serve HTTP. Marker is
+        # scoped by the already validated unique allocation, not a global flag.
+        for rank in range(2):
+            failure = prep_root / f'failure-{rank}.json'
+            if failure.exists():
+                raise RuntimeError(f'host {rank} reported terminal failure; shared cleanup required')
     if launcher is not None and launcher.poll() is not None:
         raise RuntimeError(f'native launcher exited unexpectedly: {launcher.returncode}')
 
@@ -462,6 +470,13 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
 except BaseException as error:
     state['status'] = 'FAILED'
     result['error'] = f'{type(error).__name__}: {error}'
+    if prep_root is not None:
+        try:
+            temp = prep_root / f'.failure-{RANK}-{os.getpid()}.tmp'
+            temp.write_text(json.dumps(dict(falcon_rank=RANK, error=result['error']))+'\n')
+            os.replace(temp, prep_root / f'failure-{RANK}.json')
+        except OSError:
+            pass  # Existing global work deadline remains the final bound.
     traceback.print_exc()
 finally:
     signal.alarm(0)
