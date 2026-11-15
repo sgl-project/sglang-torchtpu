@@ -318,6 +318,28 @@ class RpaSchedule:
         sz = self.dma_q[step, batch_idx, 1]
         return src_hbm, sz
 
+    def get_hop(
+        self,
+        step: jax.typing.ArrayLike,
+        batch_idx: jax.typing.ArrayLike = 0,
+    ) -> jax.Array:
+        """Extracts the ring hop index encoded in k_idx."""
+        cp_group_size = self.cfgs.serve.cp_group_size
+        if cp_group_size is None:
+            return jnp.int32(0)
+        return jax.lax.rem(self.k_idx[step, batch_idx], cp_group_size)
+
+    def get_local_k_idx(
+        self,
+        step: jax.typing.ArrayLike,
+        batch_idx: jax.typing.ArrayLike = 0,
+    ) -> jax.Array:
+        """Extracts the local k_idx encoded in k_idx for ring attention."""
+        cp_group_size = self.cfgs.serve.cp_group_size
+        if cp_group_size is None:
+            return self.k_idx[step, batch_idx]
+        return self.k_idx[step, batch_idx] // cp_group_size
+
     def scratch_shapes(self):
         """Returns a Pytree of SMEM scratch memory."""
 

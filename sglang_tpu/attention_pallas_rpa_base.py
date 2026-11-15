@@ -54,12 +54,16 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
     own_heads,
     sink_fold,
 )
+from sglang_tpu.attention_pallas_rpa_pcp import build_pcp_ring_op
 from sglang_tpu.cp_forward import (
     TpuCpBatchLayout,
     all_gather_and_write_kv,
+    all_gather_kv,
     get_tpu_cp_layout,
+    write_gathered_kv,
 )
 from sglang_tpu.cp_layout import TpuCpHostLayout
+from sglang_tpu.cp_mode import pcp_ring_enabled
 from sglang_tpu.envs import envs
 from sglang_tpu.host_metadata_cache import HostMetadataCache
 from sglang_tpu.kv_row_write import (
@@ -100,6 +104,44 @@ def _validate_kv_len_capacity(max_kv_len: int, capacity: int) -> None:
             "RPA KV length exceeds the per-request page-table capacity: "
             f"required={max_kv_len}, available={capacity}."
         )
+
+
+@dataclass
+class PcpRingMetadata:
+    """Operands of the fused ring kernel for one ring-mode context-parallel
+    extend (``cp_layout.RingLayout`` on the device, plus the page tables).
+
+    Lengths and positions are global token counts. Everything but
+    ``q_positions`` and ``cp_rank`` has the same value on every rank.
+    """
+
+    # Cache (ring) phase rows.
+    # i32[cache_rows]  cached prefix + the row's query length
+    cache_kv_lens: torch.Tensor
+    # i32[cache_rows * pages_per_seq]  striped page table of each row's request
+    cache_page_indices: torch.Tensor
+    # i32[cache_rows + 1]
+    cache_cu_q_lens: torch.Tensor
+    # i32[3]
+    cache_distribution: torch.Tensor
+    # New-token phase rows (two per request).
+    # i32[2 * max_num_seqs]  prefix + extend length of the row's request
+    new_kv_lens: torch.Tensor
+    # i32[2 * max_num_seqs * pages_per_seq]
+    new_page_indices: torch.Tensor
+    # i32[2 * max_num_seqs + 1]
+    new_cu_q_lens: torch.Tensor
+    # i32[3]
+    new_distribution: torch.Tensor
+    # i32[2 * max_num_seqs * gathered_pages]  page of the rank-major gathered
+    # K/V buffer holding each page of the row's chunk
+    new_kv_page_indices: torch.Tensor
+    # i32[2 * max_num_seqs]  global position of each row's first query
+    q_positions: torch.Tensor
+    # i32[2 * max_num_seqs]  cached prefix of the row's request
+    kv_cache_lens: torch.Tensor
+    # i32[1]  this rank's index in the context-parallel group
+    cp_rank: torch.Tensor
 
 
 @dataclass
@@ -156,6 +198,11 @@ class PallasForwardMetadata:
     dcp_kv_lens_global: torch.Tensor | None = None
     # i32[1]  this rank's index inside its DCP group
     dcp_cp_rank: torch.Tensor | None = None
+    # Ring-mode prefill context parallelism only (SGLANG_TPU_PCP_MODE=ring):
+    # the fused ring kernel's operands. ``cp_write_segments`` then holds only
+    # the runs of the pages this rank owns, at their slots in its page stripe,
+    # and the fields above describe the new-token rows.
+    cp_ring: PcpRingMetadata | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -311,6 +358,25 @@ def _import_dcp_helpers():
     from sglang.srt.layers.dcp.layout import get_dcp_lens
 
     return get_dcp_lens
+
+
+def _dcp_stripe_group(parallel, *, pcp_ring: bool):
+    """``(stripe rank, stripe group, heads_local)`` of the page-striped KV cache.
+
+    Plain DCP stripes over SGLang's DCP group (consecutive ranks inside the
+    TP group). Ring-mode prefill CP stripes over the attention-CP group
+    instead: with attention TP ``t`` that is ranks ``r, r + t, ...``, which
+    share one attention-TP head shard and differ only in tokens, so the
+    attention-CP rank owns the stripe and decode merges over that group.
+    ``heads_local``: every rank of the group computes the same query heads
+    (attention TP 1, or ring mode at any attention TP), so the striped
+    kernels run on this rank's own heads and nothing is gathered or cropped.
+    """
+    if parallel.attn_dcp_size <= 1:
+        return 0, None, False
+    if pcp_ring:
+        return parallel.attn_cp_rank, parallel.attn_cp_group, True
+    return parallel.attn_dcp_rank, parallel.dcp_group, parallel.attn_tp_size == 1
 
 
 def _check_dcp_kv_heads(*, layer: "RadixAttention", pool_kv_heads: int) -> None:
@@ -606,10 +672,18 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # allocator hands out slots from a pool widened by dcp, so one logical
         # page spans page_size * dcp tokens over page_size physical slots per
         # rank: rank r's physical page holds the r-th page_size run of it.
+        #
+        # Ring-mode prefill CP stripes over the attention-CP group instead of
+        # SGLang's DCP group (consecutive ranks inside the TP group): with
+        # attention TP > 1 the CP group is ranks ``t, t + attn_tp, ...``, which
+        # share one head shard and differ only in tokens. The stripe owner is
+        # then the attention-CP rank and decode merges over that group.
         parallel = get_parallel()
+        self._pcp_ring = pcp_ring_enabled()
         self._dcp = parallel.attn_dcp_size
-        self._dcp_rank = parallel.attn_dcp_rank if self._dcp > 1 else 0
-        self._dcp_group = parallel.dcp_group if self._dcp > 1 else None
+        self._dcp_rank, self._dcp_group, self._dcp_heads_local = _dcp_stripe_group(
+            parallel, pcp_ring=self._pcp_ring
+        )
         self._page_stride = self.page_size * self._dcp
         self._cp_rank_t: torch.Tensor | None = None
         self._cp_rank_index: torch.Tensor | None = None
@@ -648,7 +722,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 == self._dcp_rank
             )
             self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
-
         max_bs = get_exec().graph.torch_compile_max_bs
         if max_bs:
             pages_per_seq = _get_pages_per_seq(self.max_context_len, self._page_stride)
@@ -719,8 +792,34 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # traced region — dynamo can't handle ``inspect.signature`` on the
         # wrapped JAX function. The forward path then just looks the op up.
         self._op = self._build_kernel_op()
+        # Ring-mode prefill context parallelism: the fused ring op replaces the
+        # all-gather-and-write + full attention of gather mode.
+        self._pcp_ring_op = None
+        if self._pcp_ring:
+            self._init_pcp_ring(model_runner)
         if get_parallel().attn_cp_size > 1 and model_runner.device == "tpu":
             get_write_rows_op()
+
+    def _init_pcp_ring(self, model_runner: "ModelRunner") -> None:
+        """Check the ring-mode invariants and register the fused ring op."""
+        parallel = get_parallel()
+        cp_size = parallel.attn_cp_size
+        if self._dcp != cp_size or not self._dcp_heads_local:
+            raise ValueError(
+                "Ring-mode prefill context parallelism stripes the KV cache like "
+                "decode context parallelism and needs --dcp-size == "
+                f"--attn-cp-size (got dcp {self._dcp}, attention CP {cp_size}, "
+                f"attention TP {parallel.attn_tp_size})."
+            )
+        if self._is_hybrid_swa:
+            raise NotImplementedError(
+                "Ring-mode prefill context parallelism does not support hybrid "
+                "sliding-window KV pools."
+            )
+        if model_runner.device == "tpu":
+            self._pcp_ring_op = build_pcp_ring_op(
+                self.kernel_spec, cp_size, attn_tp_size=parallel.attn_tp_size
+            )
 
     def _build_kernel_op(self):
         """Build the Pallas custom op stored as ``self._op``.
@@ -1329,6 +1428,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 "req_to_token (SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1)."
             )
         host = cp_layout.host
+        if host.ring is not None:
+            return self._build_cp_ring_metadata(forward_batch, host)
         page_size = self.page_size
         pages_per_seq = _get_pages_per_seq(self.max_context_len, page_size)
         num_rows = 2 * host.pad_b
@@ -1408,6 +1509,173 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             .to(torch.int32)
             .to(device, non_blocking=True),
         )
+
+    def _build_cp_ring_metadata(
+        self, forward_batch: ForwardBatch, host: TpuCpHostLayout
+    ) -> PallasForwardMetadata:
+        """Metadata for a ring-mode context-parallel extend.
+
+        The KV cache is page-striped (rank ``r`` holds global page
+        ``l * cp + r``), so the page table is read at the logical page stride
+        ``page_size * cp`` and is identical on every rank, exactly as under
+        DCP; all lengths handed to the kernel are global. Built on the host and
+        uploaded once.
+        """
+        ring = host.ring
+        if not self._pcp_ring:
+            raise RuntimeError(
+                "A ring-mode context-parallel layout reached a backend that was "
+                "not built for SGLANG_TPU_PCP_MODE=ring."
+            )
+        page_size = self.page_size
+        if ring.page_size != page_size:
+            raise ValueError(
+                f"Ring layout page size {ring.page_size} differs from the KV "
+                f"page size {page_size}."
+            )
+        stride = self._page_stride
+        pages_per_seq = _get_pages_per_seq(self.max_context_len, stride)
+        new_rows = 2 * host.pad_b
+        cache_rows = ring.cache_rows_per_req * host.pad_b
+        # All three tables are scalar-prefetch operands of one kernel launch.
+        table_bytes = (
+            _page_table_smem_bytes(new_rows, pages_per_seq)
+            + _page_table_smem_bytes(cache_rows, pages_per_seq)
+            + _page_table_smem_bytes(new_rows, ring.gathered_pages)
+        )
+        if table_bytes > _SCOPED_SMEM_BYTES:
+            raise ValueError(
+                f"Ring-mode context-parallel page tables ({new_rows} rows x "
+                f"{pages_per_seq} cache pages and x {ring.gathered_pages} chunk "
+                f"pages) need {table_bytes / 2**20:.2f} MiB of SMEM, above the "
+                f"{_SCOPED_SMEM_BYTES / 2**20:.0f} MiB budget; lower "
+                "--prefill-max-requests or the prefill token buckets."
+            )
+        _validate_kv_len_capacity(
+            self._dcp_local_kv_len(int(ring.new_kv_lens.max())),
+            pages_per_seq * page_size,
+        )
+        device = forward_batch.seq_lens.device
+
+        req_pool_indices = forward_batch.req_pool_indices_cpu
+        assert req_pool_indices is not None
+        assert req_pool_indices.device.type == "cpu"
+        assert req_pool_indices.shape[0] == host.pad_b
+        req_pool_indices = req_pool_indices.to(torch.int64)
+        page_cols = self._host_page_columns(pages_per_seq, stride)
+        req_to_token = self.req_to_token_pool.req_to_token
+        if req_to_token.device.type != "cpu":
+            raise RuntimeError(
+                "Prefill context parallelism on TPU needs a host-resident "
+                "req_to_token (SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1)."
+            )
+        per_seq = req_to_token[req_pool_indices[:, None], page_cols[None, :]]
+        req_pages = (per_seq // stride).to(torch.int32)
+
+        def _rows(table: torch.Tensor, row_reqs) -> torch.Tensor:
+            return table[torch.from_numpy(row_reqs)].reshape(-1).contiguous()
+
+        def _i32(values) -> torch.Tensor:
+            return torch.from_numpy(values).to(torch.int32)
+
+        def _cu(lens) -> torch.Tensor:
+            out = torch.zeros(lens.shape[0] + 1, dtype=torch.int32)
+            out[1:] = torch.cumsum(torch.from_numpy(lens), dim=0, dtype=torch.int32)
+            return out
+
+        def _dev(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.to(device, non_blocking=True)
+
+        write_segments, write_num_segments = self._cp_ring_write_runs(
+            host=host, req_to_token=req_to_token, req_pool_indices=req_pool_indices
+        )
+        new_cu_q_lens = _dev(_cu(ring.new_q_lens))
+        new_kv_lens = _dev(_i32(ring.new_kv_lens))
+        new_page_indices = _dev(_rows(req_pages, host.row_reqs))
+        new_distribution = self._get_cached_rpa_distribution(
+            False, ring.new_num_rows, device
+        )
+        ring_md = PcpRingMetadata(
+            cache_kv_lens=_dev(_i32(ring.cache_kv_lens)),
+            cache_page_indices=_dev(_rows(req_pages, ring.cache_row_reqs)),
+            cache_cu_q_lens=_dev(_cu(ring.cache_q_lens)),
+            cache_distribution=self._get_cached_rpa_distribution(
+                False, ring.cache_num_rows, device
+            ),
+            new_kv_lens=new_kv_lens,
+            new_page_indices=new_page_indices,
+            new_cu_q_lens=new_cu_q_lens,
+            new_distribution=new_distribution,
+            new_kv_page_indices=_dev(_i32(ring.new_kv_page_indices).reshape(-1)),
+            q_positions=_dev(_i32(ring.q_positions)),
+            kv_cache_lens=_dev(_i32(ring.kv_cache_lens)),
+            cp_rank=self._cp_rank_t,
+        )
+        cu_kv_lens = torch.arange(new_rows + 1, dtype=torch.int32) * (
+            pages_per_seq * page_size
+        )
+        return PallasForwardMetadata(
+            kv_lens=new_kv_lens,
+            cu_q_lens=new_cu_q_lens,
+            cu_kv_lens=_dev(cu_kv_lens),
+            page_indices=new_page_indices,
+            distribution=new_distribution,
+            active_num_tokens=_make_active_num_tokens(new_cu_q_lens, ring.new_num_rows),
+            cp_write_segments=_dev(write_segments),
+            cp_write_num_segments=_dev(write_num_segments),
+            cp_last_rows=_dev(torch.from_numpy(host.last_rows)),
+            cp_last_owner_mask=_dev(_i32(host.last_owner_mask)),
+            cp_ring=ring_md,
+        )
+
+    def _cp_ring_write_runs(
+        self,
+        *,
+        host: TpuCpHostLayout,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write runs of the rank-major all-gathered rows this rank owns, as
+        slots of its page stripe, and their i32[1] count.
+
+        The allocator hands out locations in a space widened by the group size
+        (as under DCP): a logical page spans ``page_size * cp`` locations and
+        maps to one physical page id on every rank, whose rank-``r`` copy holds
+        the ``r``-th ``page_size`` run. So location ``loc`` belongs to rank
+        ``(loc % stride) // page_size`` and lands in that rank's pool at row
+        ``(loc // stride) * page_size + loc % page_size``. Rows of every other
+        rank's pages, padding rows and the reserved page 0 (warmup batches)
+        are left out. Which rows are written is data, not program structure:
+        the table has the same shape on every rank.
+        """
+        page_size = self.page_size
+        stride = self._page_stride
+        gathered_req = torch.from_numpy(host.gathered_req)
+        gathered_pos = torch.from_numpy(host.gathered_pos)
+        valid = gathered_req >= 0
+        req = gathered_req.clamp(min=0)
+        pos = torch.from_numpy(host.prefix_lens)[req] + gathered_pos.clamp(min=0)
+        locs = req_to_token[req_pool_indices[req], pos].to(torch.int64)
+        allocated = valid & (locs >= stride)
+        # The kernel derives a key's rank and row from its position, so the
+        # allocator's location must sit at the same offset in its logical page.
+        if bool((locs[allocated] % stride != pos[allocated] % stride).any()):
+            raise RuntimeError(
+                "ring-mode context parallelism: a KV location is not aligned with "
+                "its token position inside the logical page; the page stripes of "
+                "the cache would not match the kernel's."
+            )
+        owned = allocated & ((locs % stride) // page_size == self._dcp_rank)
+        slots = (locs // stride) * page_size + locs % page_size
+        max_segments = write_run_bound(
+            slots.shape[0],
+            page_size=page_size,
+            blocks=2 * host.cp_size * host.pad_b,
+        )
+        write_segments, num_segments = kv_write_segments(
+            dest_slots=slots.numpy(), valid=owned.numpy(), max_segments=max_segments
+        )
+        return write_segments, torch.tensor([num_segments], dtype=torch.int32)
 
     def _cp_write_runs(
         self,
@@ -1685,7 +1953,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         if is_swa_layer and self.forward_metadata.cp_swa_write_segments is not None:
             cp_write_segments = self.forward_metadata.cp_swa_write_segments
             cp_write_num_segments = self.forward_metadata.cp_swa_write_num_segments
-        if cp_write_segments is not None:
+        if cp_write_segments is not None and self.forward_metadata.cp_ring is None:
             all_gather_and_write_kv(
                 kv_cache=kv_cache,
                 k=k if quantize_kv is None else k_compute,
@@ -1697,7 +1965,29 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             )
 
         kv_lens = self._kv_lens(forward_batch)
-        if self._dcp > 1:
+        if self.forward_metadata.cp_ring is not None:
+            if sinks is not None or sliding_window is not None or soft_cap is not None:
+                raise NotImplementedError(
+                    "Ring-mode prefill context parallelism supports plain causal "
+                    "attention only (no attention sink, sliding window or logit "
+                    f"cap); layer {layer.layer_id} needs one."
+                )
+            if not use_causal_mask or pack > 1:
+                raise NotImplementedError(
+                    "Ring-mode prefill context parallelism supports only causal "
+                    "attention over an unpacked KV pool."
+                )
+            out = self._forward_pcp_ring(
+                q,
+                k if quantize_kv is None else k_compute,
+                v if quantize_kv is None else v_compute,
+                kv_cache,
+                quantize_kv,
+                float(layer.scaling),
+                k_scale,
+                v_scale,
+            )
+        elif self._dcp > 1:
             if not use_causal_mask:
                 raise NotImplementedError(
                     "Decode context parallelism supports only causal attention."
@@ -1761,6 +2051,65 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         out = out[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _forward_pcp_ring(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: torch.Tensor,
+        quantize_kv,
+        sm_scale: float,
+        k_scale: float | None,
+        v_scale: float | None,
+    ) -> torch.Tensor:
+        """One layer of a ring-mode context-parallel extend, ``[T, H, D]``.
+
+        ``q``/``k``/``v`` are this rank's zigzag rows in the compute dtype.
+        The chunk's K/V are all-gathered over the group and, for an fp8 pool,
+        quantized after the gather, as in gather mode. The fused kernel attends
+        the striped cached prefix around the ring and then the gathered chunk;
+        it only reads the pool. The new pages this rank owns are written from
+        the gathered rows by the local in-place writer *before* the kernel:
+        the kernel reads cached positions only, so the order does not change
+        its result, and writing after a read of the same buffer made XLA copy
+        the whole per-layer pool ahead of the in-place write (one pool-sized
+        HBM copy per layer, growing with --max-total-tokens).
+        """
+        md = self.forward_metadata
+        ring = md.cp_ring
+        k_all, v_all = all_gather_kv(
+            k=k, v=v, group=get_parallel().attn_cp_group, quantize=quantize_kv
+        )
+        write_gathered_kv(
+            kv_cache=kv_cache,
+            k_all=k_all,
+            v_all=v_all,
+            write_segments=md.cp_write_segments,
+            write_num_segments=md.cp_write_num_segments,
+        )
+        out = self._pcp_ring_op(
+            q,
+            k_all,
+            v_all,
+            kv_cache,
+            ring.cache_kv_lens,
+            ring.cache_page_indices,
+            ring.cache_cu_q_lens,
+            ring.cache_distribution,
+            ring.new_kv_lens,
+            ring.new_page_indices,
+            ring.new_cu_q_lens,
+            ring.new_distribution,
+            ring.new_kv_page_indices,
+            ring.q_positions,
+            ring.kv_cache_lens,
+            ring.cp_rank,
+            sm_scale,
+            k_scale,
+            v_scale,
+        )
+        return out
+
     def _forward_dcp(
         self,
         q: torch.Tensor,
@@ -1812,8 +2161,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         cp = self._dcp
         group = self._dcp_group
 
-        if q.shape[1] == cp * layer_q_heads:
+        heads_local = self._dcp_heads_local
+        if q.shape[1] == cp * layer_q_heads or heads_local:
             # --dcp-replicate-q-proj: the layer projected the group's heads.
+            # Attention TP 1 (ring-mode prefill CP): this rank computes every
+            # head itself, so the kernel runs on its own queries and the merge
+            # below keeps all of them.
             q_all = q.contiguous()
         else:
             q_all = gather_heads(q.contiguous(), group, cp, self._cp_rank_mask)
@@ -1853,6 +2206,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 cp,
                 self._cp_rank_mask,
                 self._cp_rank_index,
+                keep_all_heads=heads_local,
             )
             if sinks is not None:
                 out = sink_fold(out, lse, sinks)
@@ -1922,10 +2276,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             cp,
             self._cp_rank_mask,
             self._cp_rank_index,
+            keep_all_heads=heads_local,
         )
 
-        out_chunk = own_heads(out_chunk, cp, self._cp_rank_index).float()
-        lse_chunk = own_heads(lse_chunk, cp, self._cp_rank_index)
+        if heads_local:
+            out_chunk = out_chunk.float()
+        else:
+            out_chunk = own_heads(out_chunk, cp, self._cp_rank_index).float()
+            lse_chunk = own_heads(lse_chunk, cp, self._cp_rank_index)
         # A single-token row attended its token in the prefix pass; the chunk
         # pass leaves such rows (and a mixed batch's decode rows, outside its
         # range) unprocessed, with LSE -inf, so the merge weighs them zero.

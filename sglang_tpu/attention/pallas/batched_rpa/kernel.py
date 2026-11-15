@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import functools
 from collections.abc import Callable, Sequence
+from typing import Any
 
 import jax
 import jax.experimental.pallas as pl
@@ -159,6 +161,7 @@ def calculate_and_store_out(
     attention_sink_ref: jax.Ref | None,
     lse_stage_ref: jax.Ref | None,
     cfgs: configs.RpaConfigs,
+    on_last_k: Callable[..., None] | None = None,
 ):
     """Normalizes and stores the output (and LSE) of lanes at their last KV step.
 
@@ -166,6 +169,10 @@ def calculate_and_store_out(
     per query block and in float32 (`add_attention_sink`), instead of seeding
     the running max and sum; and the LSE is stored as one float32 row of lanes
     per (KV head, token) (`store_lse`).
+
+    `on_last_k(b_idx, m_val, l_val)`, if given, runs inside the same
+    `is_last_k` region after the output store (so it adds no scheduling
+    barrier of its own); the fused PCP kernel uses it for its hand-off DMAs.
     """
 
     def _accum(
@@ -174,6 +181,7 @@ def calculate_and_store_out(
         batch_l: jax.Array,
         batch_m: jax.Array | None,
     ):
+        batch_l_rows = batch_l
         if cfgs.serve.return_lse:
             store_lse(
                 lse_o_vref,
@@ -208,6 +216,8 @@ def calculate_and_store_out(
         out = jnp.pad(out, pad_width, constant_values=0)
         out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
         utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
+        if on_last_k is not None:
+            on_last_k(b_idx, batch_m, batch_l_rows)
 
     if cfgs.fuse_accum:
         for b in range(cfgs.batch_size):
@@ -449,7 +459,14 @@ def fetch_compute_metadata(
             # keys past its length are stale.
             kv_len_val = jnp.where(
                 is_valid,
-                kv_cache_lens_ref[safe_s_idx] + kv_new_lens_ref[safe_s_idx],
+                scheduler.get_local_k_end(
+                    safe_s_idx,
+                    k_idx,
+                    kv_cache_lens_ref,
+                    kv_new_lens_ref,
+                    cfgs,
+                    extra_refs,
+                ),
                 0,
             )
             local_k_end_list.append(kv_len_val - k_id)
@@ -534,7 +551,10 @@ def generate_mask(
                 )
                 mask_b = jnp.logical_and(mask_b, q_kv_diff_global < window_offset)
 
-        if step_meta.local_k_start is not None:
+        if (
+            step_meta.local_k_start is not None
+            and not cfgs.serve.cached_lens_block_aligned
+        ):
             mask_b = jnp.logical_and(mask_b, kv_iota >= step_meta.local_k_start[b_idx])
 
         masks.append(mask_b)
@@ -572,8 +592,19 @@ def rpa_body(
     # `pipeline.py`
     start_next_fetch: Callable[[], None],
     start_kv_writeback: Callable[[], None],
+    # PCP ring (`scheduler_cp.RingAttention`), with the number of steps of the
+    # current pipeline run.
+    total_steps: int | jax.Array | None = None,
+    ring: Any = None,
+    # Fused-PCP hooks (see `rpa_kernel_pcp_fused`): `prior_init` seeds the
+    # softmax state at the first KV step of a Q block (run inside the fence
+    # region), `on_last_k(b, m, l)` runs inside the epilogue's is_last_k branch.
+    prior_init: Callable[..., None] | None = None,
+    on_last_k: Callable[..., None] | None = None,
 ):
     del slot
+    if ring is not None and total_steps is None:
+        raise ValueError("The ring needs `total_steps`.")
 
     kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
 
@@ -600,6 +631,19 @@ def rpa_body(
     @pl.when(always_true)
     @jax.named_scope("stitch_and_issue_writeback")
     def _kv_store_fence():
+        # Both hooks sit inside this existing conditional region, so they add
+        # no scheduling barrier, and they run before the lookahead fetch below.
+        if ring is not None:
+            ring.release_previous_step(step, schedule_ref)
+        if prior_init is not None:
+            prior_init(
+                step,
+                schedule_ref,
+                o_vref,
+                m_scratch_ref,
+                l_scratch_ref,
+                acc_scratch_ref,
+            )
         if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             stitch_results = []
             for b_idx in range(cfgs.batch_size):
@@ -636,6 +680,9 @@ def rpa_body(
         cfgs=cfgs,
         scheduler=scheduler,
     )
+
+    if ring is not None:
+        ring.receive_and_forward(step, schedule_ref, total_steps)
 
     # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
@@ -737,7 +784,9 @@ def rpa_body(
     # The sink is folded in by `calculate_and_store_out`, not seeded into the
     # running max / sum as in google3, so the flash attention steps get none.
     sink_val = None
-    want_m = cfgs.serve.return_lse or cfgs.model.has_attention_sink
+    want_m = (
+        cfgs.serve.return_lse or cfgs.model.has_attention_sink or on_last_k is not None
+    )
     # Scopes whose rows can attend no key zero p on the masked keys: such a
     # row then keeps l == 0 instead of weighting masked keys by
     # exp(mask_value - mask_value).
@@ -782,8 +831,8 @@ def rpa_body(
                 zero_masked=zero_masked,
             )
         )
-        m_scratch_ref[:, q_slice] = m_carry
-        l_scratch_ref[:, q_slice] = l_carry
+        m_scratch_ref[:, q_slice] = m_carry.astype(m_scratch_ref.dtype)
+        l_scratch_ref[:, q_slice] = l_carry.astype(l_scratch_ref.dtype)
         if want_m:
             m_new_list.append(m_next)
         l_new_list.append(l_next)
@@ -839,7 +888,11 @@ def rpa_body(
         attention_sink_ref=attention_sink_ref,
         lse_stage_ref=lse_stage_ref,
         cfgs=cfgs,
+        on_last_k=on_last_k,
     )
+
+    if ring is not None:
+        ring.finish(step, schedule_ref, total_steps)
 
 
 # Define main kernel.
@@ -1051,6 +1104,7 @@ def rpa_kernel(
             final_allocs=(q_alloc, kv_cache_alloc, o_alloc, lse_alloc),
             schedule_ref=scheduler.get_rpa_schedule(cfgs).scratch_shapes(),
             dma_sem=pltpu.SemaphoreType.DMA((1,)),
+            ring_sems=scheduler.get_ring_sems_spec(),
             scratches=(
                 pltpu.VMEM(
                     cfgs.lm_scratch_shape,
@@ -1058,11 +1112,11 @@ def rpa_kernel(
                 ),  # m
                 pltpu.VMEM(
                     cfgs.lm_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
+                    dtype=cfgs.softmax_state_dtype,
                 ),  # l
                 pltpu.VMEM(
                     cfgs.acc_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
+                    dtype=cfgs.softmax_state_dtype,
                 ),  # acc
             ),
             lse_stage=(
@@ -1071,7 +1125,13 @@ def rpa_kernel(
                 else None
             ),
         )
-        def _run(final_allocs, schedule_ref, dma_sem, scratches, lse_stage):
+        def _run(final_allocs, schedule_ref, dma_sem, ring_sems, scratches, lse_stage):
+            ring = scheduler.create_ring(
+                cfgs, ring_sems, kv_window_ref=final_allocs[1].window_ref
+            )
+            if ring is not None:
+                ring.initial_handshake()
+
             # Initialize Q to zeros to prevent NaN pollution.
             #
             # When a query block is partially filled, tail slots in uninitialized VMEM
@@ -1163,7 +1223,6 @@ def rpa_kernel(
                     start_next_fetch,
                     start_kv_writeback,
                 ):
-                    del total_steps
                     rpa_body(
                         step,
                         slot,
@@ -1186,6 +1245,8 @@ def rpa_kernel(
                         scheduler=scheduler,
                         start_next_fetch=start_next_fetch,
                         start_kv_writeback=start_kv_writeback,
+                        total_steps=total_steps,
+                        ring=ring,
                     )
 
                 pipeline.run_manual_triple_buffer(
@@ -1206,6 +1267,9 @@ def rpa_kernel(
                 size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
 
                 execute_schedule_chunk(start, size)
+
+            if ring is not None:
+                ring.drain_credits()
 
         _run()
 
@@ -1258,6 +1322,8 @@ def rpa_kernel(
             flags={
                 "XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True,
             },
+            # Only the ring kernel synchronizes with other devices.
+            collective_id=scheduler.get_collective_id(),
         ),
         input_output_aliases=input_output_aliases,
         name=get_kernel_name(cfgs),
@@ -1271,3 +1337,630 @@ def rpa_kernel(
         lse_hbm if return_lse else None,
         attention_sink_hbm,
     )
+
+
+# ----------------------------------------------------------------------------
+# Fused PCP kernel: ring cache phase + new-token phase in one pallas_call
+# (google3 cl/985434096).
+# ----------------------------------------------------------------------------
+
+
+def rpa_kernel_pcp_fused(
+    cache_scalars: tuple[Any, ...],
+    new_scalars: tuple[Any, ...],
+    schedule_cache_hbm: schedule.RpaSchedule,
+    schedule_new_hbm: schedule.RpaSchedule,
+    o_hbm_alias_q_hbm: jax.Array,
+    new_kv_hbm: jax.Array,
+    kv_cache_hbm: jax.Array,
+    *,
+    cfgs_cache: configs.RpaConfigs,
+    cfgs_new: configs.RpaConfigs,
+    cache_scheduler: scheduler_lib.BaseScheduler,
+    new_scheduler: scheduler_lib.BaseScheduler,
+) -> tuple[jax.Array, jax.Array | None]:
+    """Runs the PCP cache (ring) phase and the new-token phase in one kernel.
+
+    Both phases share the Q / KV / output VMEM windows and the online-softmax
+    scratch. Phase 1 is the ring cache pass: its normalized output goes to an
+    internal `prior_out` HBM buffer and its per-row LSE is DMA'd straight out of
+    the `m` scratch (lane-replicated layout) into `prior_lse`. Phase 2 is the
+    new-token pass: at the first KV step of every Q block it seeds
+    `(m, l, acc) <- (prior_lse, 1, prior_out)` and continues the same online
+    softmax, so no LSE merge (and no second launch / schedule / Q copy) is
+    needed. The two phases keep their own compute bodies, so the ring hops keep
+    the cheap `[1, 1, s]` cache-only mask.
+
+    The hand-off is stored per query token, so the two phases need not cut the
+    queries into the same Q blocks or sequences. A sequence of phase 2 whose
+    cached length is 0 has no phase-1 step (see `RingCacheScheduler`) and
+    starts from the empty state instead of loading a prior.
+
+    Args:
+      cache_scalars: `(cu_q_lens, q_offsets, kv_cache_lens, kv_new_lens,
+        extra_scalars)` for the cache phase (as for `rpa_kernel`).
+      new_scalars: Same for the new-token phase.
+      schedule_cache_hbm: Cache-phase schedule (from `generate_rpa_metadata`).
+      schedule_new_hbm: New-token-phase schedule.
+      o_hbm_alias_q_hbm: Prepared queries; aliased to the output.
+      new_kv_hbm: Prepared new K/V.
+      kv_cache_hbm: KV cache. Read-only when the new-token phase does not write
+        (`cfgs_new.serve.skip_kv_write`); otherwise aliased to the updated
+        cache, which makes XLA copy it if it treats the kernel as a collective.
+      cfgs_cache: Kernel configs of the cache phase (CACHE_ONLY, ring).
+      cfgs_new: Kernel configs of the new-token phase (NEW_TOKENS_ONLY). Must use
+        the same `bq_sz`, `batch_size == 1`, the same KV layout and a `bkv_sz`
+        no larger than the cache phase's (the KV window is shared).
+      cache_scheduler: Ring scheduler of the cache phase.
+      new_scheduler: Striped new-token scheduler.
+
+    Returns:
+      `(out, kv_cache)`; `kv_cache` is None when the kernel does not write it.
+    """
+    if cfgs_cache.bq_sz != cfgs_new.bq_sz:
+        raise ValueError("Fused PCP needs the same bq_sz in both phases.")
+    if cfgs_cache.batch_size != 1 or cfgs_new.batch_size != 1:
+        raise ValueError("Fused PCP needs batch_size == 1 in both phases.")
+    if cfgs_new.bkv_sz > cfgs_cache.bkv_sz:
+        raise ValueError("Fused PCP needs bkv_sz(new) <= bkv_sz(cache).")
+    if cfgs_cache.serve.kv_layout != configs.KVLayout.HEAD_ALONG_SUBLANE:
+        raise NotImplementedError("Fused PCP supports HEAD_ALONG_SUBLANE only.")
+    if cfgs_cache.serve.return_lse or cfgs_new.serve.return_lse:
+        raise ValueError("Fused PCP does not return the LSE.")
+    if not (
+        cfgs_cache.serve.float32_softmax_state and cfgs_new.serve.float32_softmax_state
+    ):
+        raise ValueError("Fused PCP carries the softmax state in float32.")
+    for cfgs in (cfgs_cache, cfgs_new):
+        if cfgs.model.has_attention_sink or cfgs.model.sliding_window is not None:
+            raise ValueError(
+                "Fused PCP does not support attention sinks or a sliding window."
+            )
+    collective_id = cache_scheduler.get_collective_id()
+    if collective_id is None:
+        raise ValueError("The cache scheduler of fused PCP must be a ring scheduler.")
+    writes_kv_cache = not cfgs_new.serve.skip_kv_write
+
+    g = cfgs_cache.aligned_num_q_heads_per_kv_head
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    token_major = cfgs_cache.serve.token_major_q
+    # Row-granular LSE hand-off buffer: [kv_heads, tokens * g (+ tile slack), lanes]
+    # in the compute dtype, i.e. exactly the `m` scratch layout.
+    lse_rows = utils.align_to(cfgs_cache.serve.total_q_tokens * g + 16, 16)
+    prior_lse_shape = jax.ShapeDtypeStruct(
+        (cfgs_cache.model.num_kv_heads, lse_rows, num_lanes),
+        cfgs_cache.serve.dtype_out,
+    )
+
+    def pipeline_fn(
+        # Scalar prefetch (two phases).
+        c_cu_q_lens_ref,
+        c_q_offsets_ref,
+        c_kv_cache_lens_ref,
+        c_kv_new_lens_ref,
+        c_extra_refs,
+        n_cu_q_lens_ref,
+        n_q_offsets_ref,
+        n_kv_cache_lens_ref,
+        n_kv_new_lens_ref,
+        n_extra_refs,
+        # Inputs.
+        schedule_cache_hbm_ref,
+        schedule_new_hbm_ref,
+        q_hbm_ref,
+        new_kv_hbm_ref,
+        kv_cache_hbm_ref,
+        # Outputs: out, [kv cache,] prior_out, prior_lse.
+        o_hbm_ref,
+        *rest_out_refs,
+    ):
+        prior_out_hbm_ref, prior_lse_hbm_ref = rest_out_refs[-2:]
+        q_alloc, kv_cache_alloc, o_alloc, _ = create_allocs(
+            kv_cache_hbm_ref, q_hbm_ref, None, cfgs_cache
+        )
+
+        @pl.with_scoped(
+            final_allocs=(q_alloc, kv_cache_alloc, o_alloc),
+            dma_sem=pltpu.SemaphoreType.DMA((2,)),
+            ring_sems=cache_scheduler.get_ring_sems_spec(),
+            scratches=(
+                pltpu.VMEM(cfgs_cache.lm_scratch_shape, cfgs_cache.serve.dtype_out),
+                pltpu.VMEM(cfgs_cache.lm_scratch_shape, jnp.float32),
+                pltpu.VMEM(cfgs_cache.acc_scratch_shape, jnp.float32),
+            ),
+        )
+        def _run(
+            final_allocs,
+            dma_sem,
+            ring_sems,
+            scratches,
+        ):
+            q_alloc, kv_cache_alloc, o_alloc = final_allocs
+            m_scratch, l_scratch, acc_scratch = scratches
+            prior_sem = dma_sem.at[1]
+
+            # The ring's entry barrier comes first: nothing below is visible to
+            # a peer, and no peer may touch this device before it.
+            ring = cache_scheduler.create_ring(
+                cfgs_cache, ring_sems, kv_window_ref=kv_cache_alloc.window_ref
+            )
+            ring.initial_handshake()
+
+            m_scratch[...] = jnp.full_like(m_scratch, -jnp.inf)
+            l_scratch[...] = jnp.zeros_like(l_scratch)
+            q_ref_flat = q_alloc.window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
+            kv_ref_flat = kv_cache_alloc.window_ref.bitcast(jnp.uint32).reshape(
+                -1, num_lanes
+            )
+            # The output window is read back as the phase-2 prior for partially
+            # filled Q blocks, so it must not hold NaNs either.
+            o_ref_flat = o_alloc.window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
+            for ref in (acc_scratch, q_ref_flat, kv_ref_flat, o_ref_flat):
+                ref[...] = jnp.zeros_like(ref)
+
+            # ---- Phase hooks -----------------------------------------------------
+            def _q_span(schedule_ref, step):
+                q_src, q_sz = schedule_ref.get_dma_q(step, 0)
+                return q_src, q_sz
+
+            # Hand-off DMAs. Everything is issued one step early and waited one step
+            # late, so the pipeline never blocks on them:
+            #   * phase 1 exports the LSE of a Q block from the `m` scratch at the
+            #     block's last KV step and does not wait; the next step waits before
+            #     it re-initializes `m` (the epilogue's reset was overwritten by the
+            #     staging, so the consumer resets instead).
+            #   * phase 2 prefetches the next Q block's prior_out into the output slot
+            #     that block will own ((t+1) % NUM_OUTPUT_SLOTS, idle during step t
+            #     whenever step t-1 emitted no output) and its prior_lse into `m`
+            #     (dead after step t's epilogue), and only waits at the first KV step.
+            # Descriptors are rebuilt from the SMEM schedule, so nothing is carried
+            # across steps; chunk boundaries fall back to the synchronous path.
+            #
+            # The LSE rows of query token t are rows [t * g, (t + 1) * g) of
+            # `prior_lse`; a copy covers whole 16-row tiles, so a Q block must
+            # start at a token whose first row is a multiple of 16 (the wrapper
+            # documents this as "sequences start at multiples of 16 tokens"),
+            # and may overrun its last token by up to 15 rows, into the slack
+            # or into rows of the next token, whose own copy is issued later.
+            out_slots = configs.NUM_OUTPUT_SLOTS
+
+            def _lse_copy(schedule_ref, step, vmem_ref, *, to_hbm):
+                q_src, q_sz = _q_span(schedule_ref, step)
+                rows = pl.multiple_of(utils.align_to(q_sz * g, 16), 16)
+                row_src = pl.multiple_of(q_src * g, 16)
+                hbm = prior_lse_hbm_ref.at[:, pl.ds(row_src, rows)]
+                vmem = vmem_ref.at[:, pl.ds(0, rows)]
+                if to_hbm:
+                    return pltpu.make_async_copy(vmem, hbm, prior_sem)
+                return pltpu.make_async_copy(hbm, vmem, prior_sem)
+
+            def _prior_out_copies(schedule_ref, step, slot_ref):
+                q_src, q_sz = _q_span(schedule_ref, step)
+                if token_major:
+                    return [
+                        pltpu.make_async_copy(
+                            prior_out_hbm_ref.at[pl.ds(q_src, q_sz), h],
+                            slot_ref.at[0, h, pl.ds(0, q_sz)],
+                            prior_sem,
+                        )
+                        for h in range(cfgs_new.model.num_kv_heads)
+                    ]
+                return [
+                    pltpu.make_async_copy(
+                        prior_out_hbm_ref.at[:, pl.ds(q_src, q_sz)],
+                        slot_ref.at[0, :, pl.ds(0, q_sz)],
+                        prior_sem,
+                    )
+                ]
+
+            def _prev_was_last_k(schedule_ref, step):
+                prev = jnp.maximum(step - 1, 0)
+                return jnp.logical_and(step >= 1, schedule_ref.is_last_k[prev, 0] == 1)
+
+            def _next_slot_idle(schedule_ref, step):
+                # Out slot (step+1) % 2 is idle during `step` iff step-1 emitted no
+                # output (otherwise its DMA is in flight until the pipeline's
+                # wait_out at step+1, and a semaphore cannot be waited twice).
+                return jnp.logical_not(_prev_was_last_k(schedule_ref, step))
+
+            # ---- Phase 1 ---------------------------------------------------------
+            def export_prior_lse(
+                b_idx, m_val, l_val, *, step, schedule_ref, m_scratch_ref, total_steps
+            ):
+                """Runs inside the epilogue's is_last_k branch (lane 0 only)."""
+                del b_idx
+                lse_val = m_val + jnp.log(jnp.maximum(l_val, 1e-9))
+                m_scratch_ref[...] = lse_val.astype(m_scratch_ref.dtype)
+                copy = _lse_copy(schedule_ref, step, m_scratch_ref, to_hbm=True)
+                copy.start()
+
+                @pl.when(step == total_steps - 1)  # no next step in this chunk
+                def _():
+                    copy.wait()
+                    m_scratch_ref[...] = jnp.full_like(m_scratch_ref, -jnp.inf)
+
+            def drain_prior_lse(
+                step,
+                schedule_ref,
+                o_vref,
+                m_scratch_ref,
+                l_scratch_ref,
+                acc_scratch_ref,
+            ):
+                """Runs inside the fence region at the top of every phase-1 step."""
+                del o_vref, l_scratch_ref, acc_scratch_ref
+
+                @pl.when(_prev_was_last_k(schedule_ref, step))
+                def _():
+                    _lse_copy(schedule_ref, step - 1, m_scratch_ref, to_hbm=True).wait()
+                    m_scratch_ref[...] = jnp.full_like(m_scratch_ref, -jnp.inf)
+
+            # ---- Phase 2 ---------------------------------------------------------
+            def _is_first_k(schedule_ref, step):
+                s_idx = schedule_ref.s_idx[step, 0]
+                is_valid = s_idx != -1
+                safe_s_idx = jnp.maximum(0, s_idx)
+                # NEW_TOKENS_ONLY schedules start each Q block at the first KV block
+                # holding new tokens (see BaseScheduler.get_k_range), not at
+                # k_idx == 0.
+                kv_cache_len = jnp.where(is_valid, n_kv_cache_lens_ref[safe_s_idx], 0)
+                first_k_idx = kv_cache_len // cfgs_new.bkv_sz
+                is_first_k = jnp.logical_and(
+                    is_valid, schedule_ref.k_idx[step, 0] == first_k_idx
+                )
+                # Phase 1 ran for the sequence iff it has cached tokens.
+                return is_first_k, kv_cache_len > 0
+
+            def prefetch_prior(
+                b_idx,
+                m_val,
+                l_val,
+                *,
+                step,
+                schedule_ref,
+                o_window_ref,
+                out_slot,
+                m_scratch_ref,
+                total_steps,
+            ):
+                """Runs inside the epilogue's is_last_k branch: pull the next Q block's
+                prior into the slot / scratch it will use."""
+                del b_idx, m_val, l_val
+                nxt = step + 1
+                can_prefetch = jnp.logical_and(
+                    nxt < total_steps, _next_slot_idle(schedule_ref, step)
+                )
+
+                @pl.when(can_prefetch)
+                def _():
+                    nxt_c = jnp.minimum(nxt, total_steps - 1)
+                    slot_ref = o_window_ref.at[(out_slot + 1) % out_slots]
+                    for c in _prior_out_copies(schedule_ref, nxt_c, slot_ref):
+                        c.start()
+                    _lse_copy(schedule_ref, nxt_c, m_scratch_ref, to_hbm=False).start()
+
+            def prior_init(
+                step,
+                schedule_ref,
+                o_vref,
+                m_scratch_ref,
+                l_scratch_ref,
+                acc_scratch_ref,
+            ):
+                """Phase 2, first KV step of a Q block: seed (m, l, acc) from phase 1."""
+                is_first_k, has_prior = _is_first_k(schedule_ref, step)
+                prefetched = jnp.logical_and(
+                    _prev_was_last_k(schedule_ref, step),
+                    _next_slot_idle(schedule_ref, jnp.maximum(step - 1, 0)),
+                )
+
+                @pl.when(is_first_k)
+                def _():
+                    out_copies = _prior_out_copies(schedule_ref, step, o_vref)
+                    lse_copy = _lse_copy(
+                        schedule_ref, step, m_scratch_ref, to_hbm=False
+                    )
+
+                    # The copies are issued (or were prefetched) whether or not
+                    # the sequence has a prior, so that every started copy is
+                    # waited; without a prior they read rows phase 1 never wrote.
+                    @pl.when(jnp.logical_not(prefetched))
+                    def _():
+                        for c in out_copies:
+                            c.start()
+                        lse_copy.start()
+
+                    for c in out_copies:
+                        c.wait()
+                    lse_copy.wait()
+
+                    @pl.when(has_prior)
+                    def _():
+                        # acc <- normalized prior output (l = 1 makes the state
+                        # consistent).
+                        q_p = g // cfgs_new.serve.packing_q
+                        o_u32 = o_vref.bitcast(jnp.uint32).reshape(
+                            -1, cfgs_new.aligned_q_head_dim
+                        )
+                        prior = utils.strided_load(
+                            o_u32,
+                            0,
+                            cfgs_new.model.num_kv_heads * cfgs_new.bq_sz * q_p,
+                            1,
+                            dtype=cfgs_new.serve.dtype_out,
+                        ).reshape(
+                            cfgs_new.model.num_kv_heads,
+                            cfgs_new.bq_sz * g,
+                            cfgs_new.aligned_q_head_dim,
+                        )[..., : cfgs_new.compute_kv_head_dim]
+                        acc_scratch_ref[...] = prior.astype(acc_scratch_ref.dtype)
+                        l_scratch_ref[...] = jnp.ones_like(l_scratch_ref)
+
+                    @pl.when(jnp.logical_not(has_prior))
+                    def _():
+                        # No cached token: start from the empty state. The
+                        # copies above left arbitrary bytes in `m` and in the
+                        # output slot; the slot is rewritten by this Q block's
+                        # epilogue before it is read again.
+                        m_scratch_ref[...] = jnp.full_like(m_scratch_ref, -jnp.inf)
+                        l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+                        acc_scratch_ref[...] = jnp.zeros_like(acc_scratch_ref)
+
+            # ---- One phase = one pipelined schedule -------------------------------
+            def run_phase(
+                schedule_hbm_ref,
+                cfgs,
+                scheduler,
+                scalar_refs,
+                out_hbm_ref,
+                ring,
+                hooks,
+            ):
+                # The SMEM schedule window is a per-phase scoped allocation: the two
+                # phases never overlap, so they reuse the same SMEM instead of each
+                # holding a window for the whole kernel (which doubled the SMEM
+                # footprint and visibly degraded the generated code).
+                pl.run_scoped(
+                    functools.partial(
+                        _run_phase_with_schedule,
+                        schedule_hbm_ref,
+                        cfgs,
+                        scheduler,
+                        scalar_refs,
+                        out_hbm_ref,
+                        ring,
+                        hooks,
+                    ),
+                    scheduler.get_rpa_schedule(cfgs).scratch_shapes(),
+                )
+
+            def _run_phase_with_schedule(
+                schedule_hbm_ref,
+                cfgs,
+                scheduler,
+                scalar_refs,
+                out_hbm_ref,
+                ring,
+                hooks,
+                schedule_ref,
+            ):
+                (
+                    cu_q_lens_ref,
+                    q_offsets_ref,
+                    kv_cache_lens_ref,
+                    kv_new_lens_ref,
+                    extra_refs,
+                ) = scalar_refs
+                # The buffered refs carry the phase's configs (block sizes, DMA
+                # layout); the VMEM windows and semaphores are the shared ones.
+                q_ph = dataclasses.replace(q_alloc, cfgs=cfgs)
+                kv_ph = dataclasses.replace(kv_cache_alloc, cfgs=cfgs)
+                o_ph = dataclasses.replace(o_alloc, cfgs=cfgs)
+
+                actual_steps = schedule_hbm_ref.actual_steps[0]
+                num_safe_step_iterations = pl.cdiv(actual_steps, cfgs.max_steps_ub)
+
+                def execute_schedule_chunk(start_step, num_steps):
+                    aligned_start_step = (start_step // 128) * 128
+                    prefix_steps = start_step - aligned_start_step
+                    flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
+                    flat_smem = jax.tree_util.tree_leaves(schedule_ref)
+                    dma_list = []
+                    for h, s_ in zip(flat_hbm, flat_smem):
+                        if jax.typeof(h).memory_space == pltpu.HBM:
+                            element_size = s_.shape[0] // cfgs.max_steps_ub
+                            read_size = element_size * (num_steps + prefix_steps)
+                            read_size = utils.align_to(read_size, 1024)
+                            read_size = jnp.minimum(read_size, s_.shape[0])
+                            src_off = pl.multiple_of(
+                                element_size * aligned_start_step, 128
+                            )
+                            copy = pltpu.make_async_copy(
+                                h.at[pl.ds(src_off, read_size)],
+                                s_.at[pl.ds(0, read_size)],
+                                dma_sem.at[0],
+                            )
+                            copy.start()
+                            dma_list.append(copy)
+                    jax.tree.map(lambda x: x.wait(), dma_list)
+
+                    total_steps = num_steps + prefix_steps
+                    kv_bound = kv_ph.bind(
+                        src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
+                        dst_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
+                    )
+                    q_bound = q_ph.bind(src_ref=(q_hbm_ref, schedule_ref))
+                    o_bound = o_ph.bind(dst_ref=(out_hbm_ref, schedule_ref))
+
+                    def compute_fn(
+                        step,
+                        slot,
+                        total_steps,
+                        out_slot,
+                        start_next_fetch,
+                        start_kv_writeback,
+                    ):
+                        bound = {
+                            "step": step,
+                            "schedule_ref": schedule_ref,
+                            "o_window_ref": o_alloc.window_ref,
+                            "out_slot": out_slot,
+                            "m_scratch_ref": m_scratch,
+                            "total_steps": total_steps,
+                        }
+                        step_hooks = {
+                            name: functools.partial(fn, **{k: bound[k] for k in needs})
+                            for name, (fn, needs) in hooks.items()
+                        }
+                        rpa_body(
+                            step,
+                            slot,
+                            q_alloc.window_ref.at[slot],
+                            kv_cache_alloc.window_ref.at[slot],
+                            o_alloc.window_ref.at[out_slot],
+                            None,
+                            schedule_ref,
+                            m_scratch,
+                            l_scratch,
+                            acc_scratch,
+                            cu_q_lens_ref=cu_q_lens_ref,
+                            q_offsets_ref=q_offsets_ref,
+                            kv_cache_lens_ref=kv_cache_lens_ref,
+                            kv_new_lens_ref=kv_new_lens_ref,
+                            extra_refs=extra_refs,
+                            attention_sink_ref=None,
+                            cfgs=cfgs,
+                            scheduler=scheduler,
+                            start_next_fetch=start_next_fetch,
+                            start_kv_writeback=start_kv_writeback,
+                            total_steps=total_steps,
+                            ring=ring,
+                            **step_hooks,
+                        )
+
+                    pipeline.run_manual_triple_buffer(
+                        total_steps, compute_fn, q_bound, o_bound, kv_bound
+                    )
+
+                @pl.loop(0, num_safe_step_iterations)
+                def loop_body(step_idx):
+                    start = step_idx * cfgs.max_steps_ub
+                    rem = actual_steps % cfgs.max_steps_ub
+                    last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
+                    is_last_step = step_idx == num_safe_step_iterations - 1
+                    size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
+                    execute_schedule_chunk(start, size)
+
+            # ---- Phase 1: ring over the cache -> prior_out / prior_lse ----------
+            run_phase(
+                schedule_cache_hbm_ref,
+                cfgs_cache,
+                cache_scheduler,
+                (
+                    c_cu_q_lens_ref,
+                    c_q_offsets_ref,
+                    c_kv_cache_lens_ref,
+                    c_kv_new_lens_ref,
+                    c_extra_refs,
+                ),
+                prior_out_hbm_ref,
+                ring,
+                {
+                    "prior_init": (drain_prior_lse, ()),
+                    "on_last_k": (
+                        export_prior_lse,
+                        ("step", "schedule_ref", "m_scratch_ref", "total_steps"),
+                    ),
+                },
+            )
+            ring.drain_credits()
+
+            # ---- Phase 2: new tokens, seeded from phase 1 -> final output --------
+            run_phase(
+                schedule_new_hbm_ref,
+                cfgs_new,
+                new_scheduler,
+                (
+                    n_cu_q_lens_ref,
+                    n_q_offsets_ref,
+                    n_kv_cache_lens_ref,
+                    n_kv_new_lens_ref,
+                    n_extra_refs,
+                ),
+                o_hbm_ref,
+                None,
+                {
+                    "prior_init": (prior_init, ()),
+                    "on_last_k": (
+                        prefetch_prior,
+                        (
+                            "step",
+                            "schedule_ref",
+                            "o_window_ref",
+                            "out_slot",
+                            "m_scratch_ref",
+                            "total_steps",
+                        ),
+                    ),
+                },
+            )
+
+        _run()
+
+    scalar_prefetches = (*cache_scalars, *new_scalars)
+    num_scalar_prefetch = len(scalar_prefetches)
+    num_active_scalers = len(jax.tree_util.tree_leaves(scalar_prefetches))
+    schedule_leaves = len(jax.tree_util.tree_leaves(schedule_cache_hbm)) + len(
+        jax.tree_util.tree_leaves(schedule_new_hbm)
+    )
+    q_arg = num_active_scalers + schedule_leaves
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    # The queries are aliased to the output: rows no Q block covers keep the
+    # query values. The cache is an output (aliased to the input) only when
+    # the kernel writes it.
+    input_output_aliases = {q_arg: 0}
+    out_shape = [o_hbm_alias_q_hbm]
+    if writes_kv_cache:
+        input_output_aliases[q_arg + 2] = 1
+        out_shape.append(kv_cache_hbm)
+    out_shape += [
+        jax.ShapeDtypeStruct(o_hbm_alias_q_hbm.shape, o_hbm_alias_q_hbm.dtype),
+        prior_lse_shape,
+    ]
+
+    outs = pl.pallas_call(
+        pipeline_fn,
+        out_shape=out_shape,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=num_scalar_prefetch,
+            in_specs=[
+                schedule_cache_hbm.in_specs(),
+                schedule_new_hbm.in_specs(),
+                hbm,  # q
+                hbm,  # new kv
+                hbm,  # kv cache
+            ],
+            # out (aliases q), [kv cache,] prior_out, prior_lse
+            out_specs=[hbm] * len(out_shape),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=cfgs_cache.vmem_limit_bytes,
+            disable_bounds_checks=True,
+            flags={"XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True},
+            collective_id=collective_id,
+        ),
+        input_output_aliases=input_output_aliases,
+        # The cache phase's name (block sizes, "-nowb" for the read-only cache,
+        # group size) plus the new-token phase's K block.
+        name=get_kernel_name(cfgs_cache).replace("cache_only", "pcp_fused")
+        + f"-nk{cfgs_new.bkv_sz}",
+        metadata=get_kernel_metadata(cfgs_cache),
+    )(
+        *scalar_prefetches,
+        schedule_cache_hbm,
+        schedule_new_hbm,
+        o_hbm_alias_q_hbm,
+        new_kv_hbm,
+        kv_cache_hbm,
+    )
+    return outs[0], (outs[1] if writes_kv_cache else None)

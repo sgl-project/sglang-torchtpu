@@ -32,6 +32,7 @@ Note: batched_rpa is build on top / derived from RPA3.
 """
 
 import dataclasses
+import functools
 import math
 from collections.abc import Sequence
 
@@ -57,10 +58,17 @@ def prepare_inputs(
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     page_size: int = 128,
     lane_fold_kv_head_dim: bool = False,
+    token_major_q: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
+    """Lays out q and the new k/v for the kernels.
+
+    The new k/v may have more tokens than q (paged new K/V, see
+    `ServingConfigs.paged_new_kv`). With `token_major_q` the queries stay
+    `[tokens, kv_heads, ...]` instead of `[kv_heads, tokens, ...]`.
+    """
 
     total_q_tokens, actual_num_q_heads, actual_q_head_dim = q.shape
-    _, actual_num_kv_heads, actual_kv_head_dim = k.shape
+    total_kv_tokens, actual_num_kv_heads, actual_kv_head_dim = k.shape
     num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
     q_packing = utils.get_dtype_packing(q_dtype)
@@ -98,32 +106,30 @@ def prepare_inputs(
             actual_kv_head_dim // num_lane_folds_in_head_dim, num_lanes
         )
 
-    # queries: (T, H, D) -> (T, H_kv, G, D)
-    o_hbm_alias_q_hbm = (
-        jnp.pad(
-            q.reshape(
-                total_q_tokens,
-                actual_num_kv_heads,
-                num_q_heads_per_kv_head,
-                actual_q_head_dim,
-            ),
-            (
-                (0, 0),
-                (0, 0),
-                (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
-                (0, aligned_q_head_dim - actual_q_head_dim),
-            ),
-            constant_values=0,
-        )
-        .reshape(
+    # queries: (T, H, D) -> (T, H_kv, G, D); kv-head-major unless token_major_q.
+    o_hbm_alias_q_hbm = jnp.pad(
+        q.reshape(
             total_q_tokens,
             actual_num_kv_heads,
-            aligned_num_q_heads_per_kv_head // q_packing,
-            q_packing,
-            aligned_q_head_dim,
-        )
-        .swapaxes(0, 1)
+            num_q_heads_per_kv_head,
+            actual_q_head_dim,
+        ),
+        (
+            (0, 0),
+            (0, 0),
+            (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
+            (0, aligned_q_head_dim - actual_q_head_dim),
+        ),
+        constant_values=0,
+    ).reshape(
+        total_q_tokens,
+        actual_num_kv_heads,
+        aligned_num_q_heads_per_kv_head // q_packing,
+        q_packing,
+        aligned_q_head_dim,
     )
+    if not token_major_q:
+        o_hbm_alias_q_hbm = o_hbm_alias_q_hbm.swapaxes(0, 1)
 
     # Pad keys and values head_dim
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
@@ -132,8 +138,8 @@ def prepare_inputs(
     )
 
     if k_scale is not None and v_scale is not None:
-        k_scale = k_scale.reshape(total_q_tokens, actual_num_kv_heads)
-        v_scale = v_scale.reshape(total_q_tokens, actual_num_kv_heads)
+        k_scale = k_scale.reshape(total_kv_tokens, actual_num_kv_heads)
+        v_scale = v_scale.reshape(total_kv_tokens, actual_num_kv_heads)
 
         scale_bits = jax.dtypes.itemsize_bits(k_scale.dtype)
         kv_bits = jax.dtypes.itemsize_bits(k.dtype)
@@ -142,10 +148,10 @@ def prepare_inputs(
         # Bitcast the scale factors to the kv dtype and reshape scale factors to
         # (T, H_kv, num_scale_channels).
         k_scale_split = jax.lax.bitcast_convert_type(k_scale, k.dtype).reshape(
-            total_q_tokens, actual_num_kv_heads, num_scale_channels
+            total_kv_tokens, actual_num_kv_heads, num_scale_channels
         )
         v_scale_split = jax.lax.bitcast_convert_type(v_scale, v.dtype).reshape(
-            total_q_tokens, actual_num_kv_heads, num_scale_channels
+            total_kv_tokens, actual_num_kv_heads, num_scale_channels
         )
 
         # k/v have shape (T, H_kv, D) -> (T, H_kv, D + num_scale_channels)
@@ -157,14 +163,14 @@ def prepare_inputs(
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         num_lanes = pltpu.get_tpu_info().num_lanes
         align_tokens = max(num_lanes, page_size)
-        padded_total_tokens = utils.align_to(total_q_tokens, align_tokens)
+        padded_total_tokens = utils.align_to(total_kv_tokens, align_tokens)
         new_kv_hbm = (
             jnp.pad(
                 jnp.concatenate([k, v], axis=-1).reshape(
-                    total_q_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
+                    total_kv_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
                 ),
                 (
-                    (0, padded_total_tokens - total_q_tokens),
+                    (0, padded_total_tokens - total_kv_tokens),
                     (0, 0),
                     (0, aligned_kv_head_dim - actual_kv_head_dim),
                 ),
@@ -180,19 +186,19 @@ def prepare_inputs(
         )
     else:
         kv = jnp.concatenate([k, v], axis=-1).reshape(
-            total_q_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
+            total_kv_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
         )
         if num_lane_folds_in_head_dim > 1:
             actual_kv_head_dim //= num_lane_folds_in_head_dim
             kv = (
                 kv.reshape(
-                    total_q_tokens,
+                    total_kv_tokens,
                     actual_num_kv_heads_x2,
                     num_lane_folds_in_head_dim,
                     actual_kv_head_dim,
                 )
                 .transpose(0, 2, 1, 3)
-                .reshape(total_q_tokens, -1, actual_kv_head_dim)
+                .reshape(total_kv_tokens, -1, actual_kv_head_dim)
             )
             actual_num_kv_heads_x2 *= num_lane_folds_in_head_dim
         new_kv_hbm = jnp.pad(
@@ -204,7 +210,7 @@ def prepare_inputs(
             ),
             constant_values=0,
         ).reshape(
-            total_q_tokens,
+            total_kv_tokens,
             num_kv_heads_x2_aligned // kv_packing,
             kv_packing,
             aligned_kv_head_dim,
@@ -761,6 +767,591 @@ def calculate_block_sizes(
     return decode_block_sizes, prefill_block_sizes
 
 
+# ---------------------------------------------------------------------------
+# Block sizes of the PCP ring / fused-PCP kernels (google3 cl/985434096).
+#
+# `calculate_block_sizes` above is SGLang's search and serves every other
+# kernel, including the DCP ones. The classes below are google3's calculators
+# with their own VMEM model; only the ring cache phase
+# (`RingBlockSizeCalculator`) and the paged new-token phase of PCP
+# (`CPBlockSizeCalculator`) use them. `BaseBlockSizeCalculator` is their shared
+# base and is not used on its own here.
+# ---------------------------------------------------------------------------
+
+
+class BaseBlockSizeCalculator:
+    """Chooses kernel block sizes that fit the VMEM budget.
+
+    Subclass and override `prefill_block_sizes` to change how the budget is
+    spent; the VMEM model and the compute-tile search are shared.
+    """
+
+    decode_batch_size = 8
+    prefill_batch_size = 2
+
+    def __init__(
+        self,
+        model_cfgs: configs.ModelConfigs,
+        serve_cfgs: configs.ServingConfigs,
+        vmem_limit_bytes: int,
+        decode_query_size: int = 1,
+    ):
+        self.model_cfgs = model_cfgs
+        self.serve_cfgs = serve_cfgs
+        self.vmem_limit_bytes = vmem_limit_bytes
+        self.decode_query_size = decode_query_size
+
+        tpu_info = pltpu.get_tpu_info()
+        self.tpu_info = tpu_info
+        num_lanes = tpu_info.num_lanes
+        num_sublanes = tpu_info.num_sublanes
+        self.mxu_column_size = tpu_info.mxu_column_size
+
+        # Calculate aligned model dimensions.
+        self.aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
+
+        aligned_num_q_heads_per_kv_head = utils.align_to(
+            model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
+        )
+        self.aligned_num_q_heads_per_kv_head = aligned_num_q_heads_per_kv_head
+        self.aligned_num_q_heads = (
+            aligned_num_q_heads_per_kv_head * model_cfgs.num_kv_heads
+        )
+
+        self.num_lane_folds_in_head_dim = configs.num_lane_folds_in_head_dim(
+            model_cfgs.head_dim,
+            serve_cfgs.dtype_kv,
+            serve_cfgs.kv_layout,
+            num_lanes,
+            enabled=serve_cfgs.lane_fold_kv_head_dim,
+        )
+        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            self.aligned_num_kv_heads_x2 = model_cfgs.num_kv_heads * 2
+        else:
+            bkv_stride = pl.cdiv(
+                model_cfgs.num_kv_heads * 2 * self.num_lane_folds_in_head_dim,
+                serve_cfgs.packing_kv,
+            )
+            if utils.has_bank_conflicts(bkv_stride):
+                bkv_stride += 1
+            self.aligned_num_kv_heads_x2 = bkv_stride * serve_cfgs.packing_kv
+
+        self.q_bytes = jax.dtypes.itemsize_bits(serve_cfgs.dtype_q) / 8
+        self.kv_bytes = jax.dtypes.itemsize_bits(serve_cfgs.dtype_kv) / 8
+        self.out_bytes = jax.dtypes.itemsize_bits(serve_cfgs.dtype_out) / 8
+
+        is_packed_fp4 = serve_cfgs.dtype_kv == jnp.uint8
+        physical_kv_head_dim = model_cfgs.head_dim
+        if is_packed_fp4:
+            physical_kv_head_dim = physical_kv_head_dim // 2
+
+        packing_kv = serve_cfgs.packing_kv
+        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            base_dim = physical_kv_head_dim + serve_cfgs.scale_channels
+            self.aligned_kv_head_dim_val = utils.align_to(
+                base_dim, num_sublanes * packing_kv
+            )
+        else:
+            self.aligned_kv_head_dim_val = utils.align_to(
+                model_cfgs.head_dim // self.num_lane_folds_in_head_dim, num_lanes
+            )
+
+    @property
+    def capped_vmem_limit_bytes(self) -> float:
+        # Even if we loose some potential performance, we want to avoid OOM at
+        # all costs. Therefore, we conservatively only use 80% of the VMEM
+        # budget.
+        return self.vmem_limit_bytes * 0.8
+
+    @property
+    def max_bkv_sz(self) -> int:
+        max_seq_len = self.serve_cfgs.pages_per_seq * self.serve_cfgs.page_size
+        return min(max_seq_len, 4096)
+
+    @property
+    def bkv_stride_sz(self) -> int:
+        """Granularity of the K block search.
+
+        SGLang: K blocks are whole pages (the schedule fetches block k's cached
+        pages from `k * cdiv(bkv_sz, page_size)`), so the MXU column size is
+        rounded up to a whole number of pages.
+        """
+        return utils.align_to(self.mxu_column_size, self.serve_cfgs.page_size)
+
+    def lse_buffer_bytes(self, bq_sz: int) -> int:
+        """VMEM bytes of the LSE output buffers and staging for `bq_sz`.
+
+        SGLang's LSE is one float32 row of lanes per (KV head, token) in each
+        output slot (`RpaConfigs.lse_vmem_shape`), staged through one float32
+        row per (token, aligned q head) of a KV head (`lse_stage_shape`).
+        """
+        if not self.serve_cfgs.return_lse:
+            return 0
+        num_lanes = self.tpu_info.num_lanes
+        slots = configs.NUM_OUTPUT_SLOTS * self.model_cfgs.num_kv_heads * num_lanes
+        stage = self.aligned_num_q_heads_per_kv_head * num_lanes
+        return (slots + stage) * 4 * bq_sz
+
+    def calculate_vmem_usage(self, batch_size: int, bq_sz: int, bkv_sz: int) -> int:
+        """Given tile size, calculate VMEM usage of the kernel."""
+        model_cfgs = self.model_cfgs
+        serve_cfgs = self.serve_cfgs
+
+        # Step 1: Calculate buffer sizes.
+        bq_array_size = bq_sz * self.aligned_num_q_heads * self.aligned_head_dim
+        vmem_bkv_sz = bkv_sz
+        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            # Allocate extra buffer to perform lane stitching. Must match
+            # RpaConfigs.kv_vmem_lanes.
+            vmem_bkv_sz += 2 * self.tpu_info.num_lanes
+        bkv_array_size = (
+            vmem_bkv_sz * self.aligned_num_kv_heads_x2 * self.aligned_kv_head_dim_val
+        )
+        bo_array_size = bq_array_size
+
+        bq_bytes = bq_array_size * self.q_bytes
+        bkv_bytes = bkv_array_size * self.kv_bytes
+        bo_bytes = bo_array_size * self.out_bytes
+
+        # Account for multiple buffers. These counts are fixed by the pipeline; see
+        # `configs.NUM_INPUT_SLOTS` / `configs.NUM_OUTPUT_SLOTS`.
+        bq_bytes *= configs.NUM_INPUT_SLOTS
+        bkv_bytes *= configs.NUM_INPUT_SLOTS
+        bo_bytes *= configs.NUM_OUTPUT_SLOTS
+
+        # Sum up all buffer memory usage (scales are co-located inside bkv_bytes).
+        buffer_bytes = bq_bytes + bkv_bytes + bo_bytes
+        buffer_bytes += self.lse_buffer_bytes(bq_sz)
+
+        # Step 2: Calculate worst case memory usage during computation.
+        loaded_bq_size = bq_sz * model_cfgs.num_q_heads * self.aligned_head_dim
+        loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * self.aligned_head_dim
+        qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
+
+        loaded_bq_bytes = loaded_bq_size * self.q_bytes
+        loaded_bkv_bytes = loaded_bkv_size * self.kv_bytes
+        qk_bytes = qk_size * self.out_bytes
+
+        loaded_scale_bytes = 0
+        if serve_cfgs.per_token_scale:
+            scale_bits = jax.dtypes.itemsize_bits(serve_cfgs.per_token_scale_dtype)
+            scale_bytes = scale_bits // 8
+            loaded_scale_bytes = 2 * bkv_sz * model_cfgs.num_kv_heads * scale_bytes
+
+        compute_bytes = (
+            loaded_bq_bytes + loaded_bkv_bytes + qk_bytes + loaded_scale_bytes
+        )
+
+        total_bytes = buffer_bytes + compute_bytes
+        total_bytes *= batch_size
+
+        # Online-softmax scratch (m, l, and the output accumulator)
+        lm_array_size = (
+            model_cfgs.num_kv_heads * bq_sz * self.aligned_num_q_heads_per_kv_head
+        )
+        acc_array_size = (
+            model_cfgs.num_kv_heads * bq_sz * self.aligned_num_q_heads_per_kv_head
+        )
+        # m stays in the compute dtype; l and acc are carried in float32.
+        scratch_bytes = (
+            lm_array_size * self.out_bytes + lm_array_size * 4 + acc_array_size * 4
+        )
+        total_bytes += scratch_bytes
+
+        return int(total_bytes)
+
+    def fits(self, batch_size: int, bq_sz: int, bkv_sz: int) -> bool:
+        return (
+            self.calculate_vmem_usage(batch_size, bq_sz, bkv_sz)
+            <= self.capped_vmem_limit_bytes
+        )
+
+    def calculate_compute_buffer_time(
+        self, batch_size: int, bq_c_sz: int, bkv_sz: int
+    ) -> int:
+        """Calculate approximate time it takes to compute a given tile."""
+        model_cfgs = self.model_cfgs
+
+        num_k_rows = pl.cdiv(bkv_sz, self.mxu_column_size)
+        num_k_cols = pl.cdiv(model_cfgs.head_dim, self.mxu_column_size)
+        num_k = num_k_rows * num_k_cols
+        num_muls = bq_c_sz * num_k * model_cfgs.num_q_heads
+
+        return batch_size * num_muls
+
+    def compute_tile_size(self, batch_size: int, bq_sz: int, bkv_sz: int) -> int:
+        """Largest divisor of bq_sz whose compute block stays under threshold."""
+        tpu_info = self.tpu_info
+        is_8bit = jnp.dtype(self.serve_cfgs.dtype_q).itemsize == 1
+
+        match tpu_info.generation:
+            case 8 if configs.is_sfs(tpu_info):
+                threshold = 800
+            case 7:
+                threshold = 1500
+            case _:
+                threshold = 1500
+
+        if is_8bit:
+            flops_ratio = tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
+            threshold *= flops_ratio
+        num_bq_c = 1
+        last_valid_bq_c_sz = bq_c_sz = bq_sz
+        bq_c_rem = 0
+
+        while (
+            self.calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
+            or bq_c_rem != 0
+        ) and num_bq_c < bq_sz:
+            if bq_c_rem == 0:
+                last_valid_bq_c_sz = bq_c_sz
+            num_bq_c += 1
+            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
+
+        return last_valid_bq_c_sz
+
+    def find_best_block_sizes(
+        self,
+        max_batch_size: int,
+        fixed_bq_sz: int | None = None,
+        max_bkv_sz: int | None = None,
+        max_bq_sz: int | None = None,
+    ) -> configs.BlockSizes:
+        """Loop through different block sizes to find the most optimal one."""
+        capped_vmem_limit_bytes = self.capped_vmem_limit_bytes
+
+        bkv_sz = bkv_stride = self.bkv_stride_sz
+        if fixed_bq_sz is None:
+            bq_sz = bq_stride = bkv_sz
+        else:
+            bq_sz = fixed_bq_sz
+            bq_stride = 0
+        batch_size = max_batch_size
+
+        # Step 1: Lower batch_size if even the smallest bq and bkv size can trigger
+        # OOM.
+        while (
+            batch_size > 1
+            and self.calculate_vmem_usage(batch_size, bq_sz, bkv_sz)
+            > capped_vmem_limit_bytes
+        ):
+            batch_size -= 1
+
+        # NOTE: as in google3, a smallest tile that is still over the cap at
+        # batch_size 1 is returned as is; `CPBlockSizeCalculator` re-checks
+        # single-lane tiles against its own cap and the fused-PCP wrapper
+        # checks the tiles it ends up with (`pcp_fused_configs`).
+
+        # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
+        while (
+            self.calculate_vmem_usage(batch_size, bq_sz, bkv_sz)
+            < capped_vmem_limit_bytes
+            and bkv_sz <= self.max_bkv_sz
+        ):
+            # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
+            # size. When using causal masking, if bq size is larger than bkv size,
+            # entire kv tile can be masked out for some query tokens. Similarly, if
+            # bkv size is larger than bq size, entire query tile can be masked out for
+            # some kv tokens.
+            bkv_sz += bkv_stride
+            bq_sz += bq_stride
+
+        # Rollback one step since the last attempted value triggered OOM.
+        if bkv_sz > bkv_stride:
+            bkv_sz -= bkv_stride
+            if fixed_bq_sz is None:
+                bq_sz -= bq_stride
+
+        # Applied after the rollback, not inside the growth loop: the rollback
+        # assumes the loop exited on the VMEM budget, so a cap in the loop
+        # condition would roll back a step that was never taken. Caps must be
+        # multiples of bkv_stride to keep KV tiles page-aligned. bq and bkv are
+        # capped independently (see configs.SFS_PREFILL_MAX_*).
+        if max_bkv_sz is not None and bkv_sz > max_bkv_sz:
+            bkv_sz = max_bkv_sz
+            if fixed_bq_sz is None:
+                bq_sz = max_bkv_sz
+        if fixed_bq_sz is None and max_bq_sz is not None and bq_sz > max_bq_sz:
+            bq_sz = max_bq_sz
+
+        # Step 2b: Step 2 grows bq and bkv together, so when bq hits the VMEM limit
+        # bkv stops too. With many q heads per chip (e.g. Qwen3-32B at TP=2, 32 q
+        # heads) that happens at 256, while a larger bkv still fits. Keep growing
+        # bkv alone, up to a cap, while it fits.
+        max_seq_len = self.serve_cfgs.pages_per_seq * self.serve_cfgs.page_size
+        if fixed_bq_sz is None:
+            step2b_max_bkv_sz = 512
+            if max_bkv_sz is not None:
+                step2b_max_bkv_sz = min(step2b_max_bkv_sz, max_bkv_sz)
+            while (
+                bkv_sz + bkv_stride <= max_seq_len
+                and bkv_sz + bkv_stride <= step2b_max_bkv_sz
+                and self.calculate_vmem_usage(batch_size, bq_sz, bkv_sz + bkv_stride)
+                < capped_vmem_limit_bytes
+            ):
+                bkv_sz += bkv_stride
+
+        # Step 3: Given current tile size, calculate compute tile size.
+        # For decode mode (fixed_bq_sz is not None), query chunking (bq_c_sz < bq_sz)
+        # is unnecessary because the query tile size is already very small.
+        bq_c_sz = (
+            bq_sz
+            if fixed_bq_sz is not None
+            else self.compute_tile_size(batch_size, bq_sz, bkv_sz)
+        )
+        return configs.BlockSizes(
+            bq_sz=bq_sz,
+            bq_c_sz=bq_c_sz,
+            bkv_sz=bkv_sz,
+            batch_size=batch_size,
+        )
+
+    def decode_block_sizes(self) -> configs.BlockSizes:
+        return self.find_best_block_sizes(
+            self.decode_batch_size, self.decode_query_size
+        )
+
+    def prefill_block_sizes(self) -> configs.BlockSizes:
+        return self.find_best_block_sizes(self.prefill_batch_size)
+
+    def calculate(self) -> tuple[configs.BlockSizes, configs.BlockSizes]:
+        return self.decode_block_sizes(), self.prefill_block_sizes()
+
+
+class CPBlockSizeCalculator(BaseBlockSizeCalculator):
+    """Block sizes for the context-parallel phases (`cp_group_size` set).
+
+    Uses a tile-aware VMEM model: compute-time temporaries (loaded Q/KV, the QK
+    tile) scale with the compute tile `bq_c_sz`, while the Q/O pipeline buffers,
+    the LSE buffers and the online-softmax scratch are sized by the full
+    `bq_sz`. The scratch is modeled with its real shapes (`m` in the compute
+    dtype, `l`/`acc` in float32), plus the live full-block copies the kernel
+    keeps until the epilogue (observed as ~bq_sz-sized register spill slots:
+    ~1.5x the state for batch_size=1, ~2.5-3x for batch_size=2).
+
+    The model was calibrated in google3 against google3's kernel body on v7x;
+    it has not been re-measured against this repo's kernel.
+    """
+
+    @property
+    def capped_vmem_limit_bytes(self) -> float:
+        # The model above tracks the compiler's VMEM usage closely (calibrated on
+        # v7x against CP kernels known to compile / OOM), so a 15% headroom for
+        # compiler temporaries suffices.
+        return self.vmem_limit_bytes * 0.85
+
+    def softmax_state_bytes(self, bq_sz: int) -> int:
+        """VMEM bytes of the online-softmax state (m, l, acc) for `bq_sz`.
+
+        Matches `RpaConfigs.lm_scratch_shape` / `acc_scratch_shape`: m and l are
+        [num_kv_heads, bq_sz * q_per_kv, num_lanes] and acc is
+        [num_kv_heads, bq_sz * q_per_kv, head_dim]; `l` and `acc` are float32 so
+        block contributions are not rounded away once `l` grows large at long
+        context, `m` stays in the compute dtype (it cancels exactly).
+        """
+        rows = (
+            self.model_cfgs.num_kv_heads * bq_sz * self.aligned_num_q_heads_per_kv_head
+        )
+        lm_array_size = rows * self.tpu_info.num_lanes
+        acc_array_size = rows * self.aligned_head_dim
+        return int(
+            lm_array_size * self.out_bytes  # m
+            + lm_array_size * 4  # l
+            + acc_array_size * 4  # acc
+        )
+
+    def calculate_vmem_usage(self, batch_size: int, bq_sz: int, bkv_sz: int) -> int:
+        bq_c_sz = self.compute_tile_size(batch_size, bq_sz, bkv_sz)
+        used = super().calculate_vmem_usage(batch_size, bq_c_sz, bkv_sz)
+        q_diff = (
+            (bq_sz - bq_c_sz)
+            * self.aligned_num_q_heads
+            * self.aligned_head_dim
+            * (
+                configs.NUM_INPUT_SLOTS * self.q_bytes
+                + configs.NUM_OUTPUT_SLOTS * self.out_bytes
+            )
+            * batch_size
+        )
+        lse_diff = (
+            self.lse_buffer_bytes(bq_sz) - self.lse_buffer_bytes(bq_c_sz)
+        ) * batch_size
+        state = self.softmax_state_bytes(bq_sz)
+        scratch_diff = state - self.softmax_state_bytes(bq_c_sz)
+        live_state = state * (batch_size + 0.5)
+        stitch_bytes = 0
+        if (
+            self.serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            and self.serve_cfgs.attention_scope != configs.AttentionScope.CACHE_ONLY
+        ):
+            # Lane stitching of new tokens (`stitch_utils._stitch_prefill_lane`)
+            # materializes the whole KV slot a few times (load, roll, select,
+            # store); the ring's cache phase has no new tokens to stitch.
+            vmem_bkv_sz = bkv_sz + 2 * self.tpu_info.num_lanes
+            kv_slot_bytes = (
+                vmem_bkv_sz
+                * self.aligned_num_kv_heads_x2
+                * self.aligned_kv_head_dim_val
+                * self.kv_bytes
+            )
+            stitch_bytes = 4 * kv_slot_bytes * batch_size
+        return int(used + q_diff + lse_diff + scratch_diff + live_state + stitch_bytes)
+
+    # Single-lane (batch_size=1) CP kernels are modelled tightly enough to run at
+    # the ring's 95% cap (see RingBlockSizeCalculator); measured in google3 on
+    # v7x for the PCP=8 new-token phase: q256-k512 (model 60.5 MB) compiles,
+    # q256-k1024 (model 62.9 MB, real 69.1 MB) does not. Multi-lane tiles keep
+    # the 85% cap.
+    single_lane_vmem_fraction = 0.95
+    single_lane_max_bkv_sz = 512
+
+    def prefill_block_sizes(self) -> configs.BlockSizes:
+        blocks = super().prefill_block_sizes()
+        if blocks.batch_size != 1:
+            return blocks
+        cap = self.vmem_limit_bytes * self.single_lane_vmem_fraction
+        max_seq_len = self.serve_cfgs.pages_per_seq * self.serve_cfgs.page_size
+        bkv_sz = blocks.bkv_sz
+        while (
+            bkv_sz * 2 <= self.single_lane_max_bkv_sz
+            and bkv_sz * 2 <= self.max_bkv_sz
+            and bkv_sz * 2 <= max_seq_len
+            and self.calculate_vmem_usage(1, blocks.bq_sz, bkv_sz * 2) < cap
+        ):
+            bkv_sz *= 2
+        if bkv_sz == blocks.bkv_sz:
+            return blocks
+        return configs.BlockSizes(
+            bq_sz=blocks.bq_sz,
+            bq_c_sz=self.compute_tile_size(1, blocks.bq_sz, bkv_sz),
+            bkv_sz=bkv_sz,
+            batch_size=1,
+        )
+
+
+class RingBlockSizeCalculator(CPBlockSizeCalculator):
+    """Block sizes for the PCP ring's cache phase (`ring_axis_name` set).
+
+    Each Q block walks every local KV block around the ring, so the number of ring
+    steps is proportional to num_q_blocks * num_kv_blocks. The search tries bq_sz
+    up to the local query length and power-of-two bkv_sz up to
+    min(max_bkv_sz, local_kv_len), keeps the pairs that fit in VMEM, and picks
+    the one with the least modelled time (`ring_step_time`: the larger of the
+    tile compute and the KV hop, times the number of steps), then the fewest
+    steps, the least padding, and the largest bkv_sz and bq_sz.
+    """
+
+    # One lane per step: the rotation moves the whole buffer in a single copy,
+    # so every lane of a step would otherwise have to be on the same hop.
+    ring_batch_size = 1
+
+    @property
+    def capped_vmem_limit_bytes(self) -> float:
+        # For the single-lane ring kernels the model matches the compiler's VMEM
+        # usage within a few MB on v7x (google3 measurements): q512-k1024
+        # (PCP=4, 16 q heads/KV) and q256-k1024 (PCP=8, 2 KV heads) sit at
+        # ~59-60 MB of 64 MB.
+        return self.vmem_limit_bytes * 0.95
+
+    @property
+    def max_bkv_sz(self) -> int:
+        # Capping bkv_sz at 1024 matches the maximum TPU attention tile size
+        # and prevents compiler register spills while maximizing compute per step.
+        return min(super().max_bkv_sz, 1024)
+
+    # SGLang: cost model of one ring step, fitted on v7x (PCP4 x TP2 and PCP8,
+    # Qwen3-30B-A3B, fp8 KV, bkv_sz 1024). A step computes a full
+    # bq_sz x bkv_sz tile for every query head (padded Q rows cost as much as
+    # real ones) and, overlapped with it, forwards the bkv_sz-token KV block to
+    # the next rank; it takes the longer of the two. Measured: the tile at
+    # ~370 TFLOP/s per core, the hop at ~60 GB/s (1 MiB in ~17 us). So PCP4 x
+    # TP2 (16 q heads, 2 KV heads) is compute-bound at bq_sz 512 and bq_sz 768
+    # only adds padding to a 4096-row chunk (9% slower), while PCP8 (32 q heads,
+    # 4 KV heads) is DMA-bound below bq_sz ~384 (bq_sz 256: 21% slower).
+    ring_tile_flops_per_s = 370e12
+    ring_hop_bytes_per_s = 60e9
+
+    def ring_step_time(self, bq_sz: int, bkv_sz: int) -> float:
+        """Modelled seconds of one ring step (tile compute vs KV hop)."""
+        model_cfgs = self.model_cfgs
+        flops = 4 * bq_sz * bkv_sz * model_cfgs.num_q_heads * model_cfgs.head_dim
+        hop_bytes = (
+            bkv_sz * 2 * model_cfgs.num_kv_heads * model_cfgs.head_dim * self.kv_bytes
+        )
+        return max(
+            flops / self.ring_tile_flops_per_s, hop_bytes / self.ring_hop_bytes_per_s
+        )
+
+    def prefill_block_sizes(self) -> configs.BlockSizes:
+        serve_cfgs = self.serve_cfgs
+        batch_size = self.ring_batch_size
+        step_sz = self.mxu_column_size
+        # SGLang: K blocks are whole pages (see `bkv_stride_sz`).
+        min_bkv_sz = self.bkv_stride_sz
+
+        max_bq = utils.align_to(max(serve_cfgs.total_q_tokens, step_sz), step_sz)
+
+        local_kv_tokens = (
+            serve_cfgs.pages_per_seq * serve_cfgs.page_size
+            if serve_cfgs.pages_per_seq > 0
+            else serve_cfgs.num_page_indices * serve_cfgs.page_size
+        )
+        total_kv = max(local_kv_tokens, min_bkv_sz)
+        max_bkv = min(
+            self.max_bkv_sz, max(utils.align_to(total_kv, min_bkv_sz), min_bkv_sz)
+        )
+
+        bkv_candidates = []
+        bkv = min_bkv_sz
+        while bkv <= max(max_bkv, min_bkv_sz):
+            bkv_candidates.append(bkv)
+            bkv *= 2
+
+        # Q tiles only need lane alignment (rows = bq_sz * q_heads_per_kv_head),
+        # so search from one lane tile up; the fewest-steps score still prefers the
+        # largest bq_sz that fits, and 128 is the fallback when the float32
+        # softmax state does not fit at mxu_column_size.
+        bq_step = min(step_sz, self.tpu_info.num_lanes)
+        bq_candidates = []
+        bq = bq_step
+        while bq <= max_bq:
+            bq_candidates.append(bq)
+            bq += bq_step
+
+        valid_configs = []
+        total_q = max(serve_cfgs.total_q_tokens, 1)
+        for bq_sz in bq_candidates:
+            for bkv_sz in bkv_candidates:
+                if self.fits(batch_size, bq_sz, bkv_sz):
+                    n_q = pl.cdiv(total_q, bq_sz)
+                    n_kv = pl.cdiv(total_kv, bkv_sz)
+                    total_steps = n_q * n_kv
+                    padding = (n_q * bq_sz - total_q) + (n_kv * bkv_sz - total_kv)
+                    # SGLang: rank by the modelled time of the cache phase.
+                    # The KV extent is the page-table capacity rather than a
+                    # real length, so it enters as total_kv / bkv_sz (no
+                    # ceil), and only the Q padding counts as work. Prioritize:
+                    # 1. Minimize the modelled time (`ring_step_time`)
+                    # 2. Minimize ring schedule steps (n_q * n_kv)
+                    # 3. Minimize padding, then maximize bkv_sz and bq_sz
+                    est = n_q * (total_kv / bkv_sz) * self.ring_step_time(bq_sz, bkv_sz)
+                    score = (round(est, 6), total_steps, padding, -bkv_sz, -bq_sz)
+                    valid_configs.append((score, bq_sz, bkv_sz))
+
+        if not valid_configs:
+            raise ValueError("Cannot find block sizes that fit within VMEM limit.")
+
+        valid_configs.sort(key=lambda x: x[0])
+        _, best_bq_sz, best_bkv_sz = valid_configs[0]
+
+        return configs.BlockSizes(
+            bq_sz=best_bq_sz,
+            bq_c_sz=self.compute_tile_size(batch_size, best_bq_sz, best_bkv_sz),
+            bkv_sz=best_bkv_sz,
+            batch_size=batch_size,
+        )
+
+
 def _scheduler_for_scope(
     attention_scope: configs.AttentionScope, cp_group_size: int | None
 ) -> scheduler_lib.BaseScheduler:
@@ -857,6 +1448,8 @@ def ragged_paged_attention(
     update_kv_cache: bool | None = None,
     quantize_p: bool = False,
     lane_fold_kv_head_dim: bool = False,
+    q_positions: jax.Array | None = None,
+    kv_cache_lens: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -953,6 +1546,20 @@ def ragged_paged_attention(
             HEAD_ALONG_SUBLANE layout of ``get_kv_cache_shape(...,
             lane_fold_kv_head_dim=True)``. Off by default: SGLang's KV pools
             keep the unfolded layout.
+        q_positions: [max_num_seqs] int32, only with an explicit ``scheduler``.
+            Replaces the query offsets the scheduler derives (the global
+            position of each sequence's first query).
+        kv_cache_lens: [max_num_seqs] int32, only with an explicit
+            ``scheduler``. Replaces the cached lengths the scheduler derives;
+            the new length becomes ``kv_lens - kv_cache_lens``, so a sequence
+            may have more new keys than queries. Together with
+            ``extra_scalars=(cp_rank, new_kv_page_indices[, new_kv_write_rows])``
+            and a ``scheduler_cp.StripedNewTokensScheduler`` this is the
+            new-token phase of PCP as a kernel launch of its own; the cache
+            phase is a launch with ``scheduler_cp.RingCacheScheduler``. Both
+            must run inside ``jax.shard_map``; see
+            ``ragged_paged_attention_pcp_fused`` for the argument layout and for
+            the single-kernel version, which is what serving uses.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -1038,6 +1645,23 @@ def ragged_paged_attention(
         attention_scope = scheduler.scope
         cp_group_size = scheduler.get_cp_group_size()
         cache_only = attention_scope == configs.AttentionScope.CACHE_ONLY
+    if scheduler is None and (q_positions is not None or kv_cache_lens is not None):
+        raise ValueError("q_positions and kv_cache_lens need an explicit scheduler.")
+
+    # PCP ring attention: the ring cache phase and the paged new-token phase.
+    ring_axis_name = getattr(scheduler, "ring_axis_name", None)
+    paged_new_kv = (
+        isinstance(scheduler, scheduler_cp.StripedNewTokensScheduler)
+        and len(extra_scalars) > 1
+    )
+    if ring_axis_name is not None or paged_new_kv:
+        _refuse_unsupported_pcp_features(
+            kv_layout=kv_layout,
+            sliding_window=sliding_window,
+            attention_sink=attention_sink,
+            soft_cap=None,
+            paged_new_kv=paged_new_kv,
+        )
 
     serve_cfgs = configs.ServingConfigs(
         num_seqs=max_num_seqs,
@@ -1062,6 +1686,10 @@ def ragged_paged_attention(
         cache_only=cache_only,
         skip_kv_write=skip_kv_write,
         lane_fold_kv_head_dim=lane_fold_kv_head_dim,
+        ring_axis_name=ring_axis_name,
+        ring_mesh_axis_names=getattr(scheduler, "ring_mesh_axis_names", None),
+        paged_new_kv=paged_new_kv,
+        float32_softmax_state=ring_axis_name is not None or paged_new_kv,
     )
 
     if scheduler is None:
@@ -1098,7 +1726,19 @@ def ragged_paged_attention(
     # Explicit block sizes for both modes are used as given, even where the
     # search would refuse.
     default_decode = default_prefill = None
-    if decode_block_sizes is None or prefill_block_sizes is None:
+    if ring_axis_name is not None or paged_new_kv:
+        # The PCP phases only launch MIXED and size it with google3's CP
+        # calculators.
+        if prefill_block_sizes is None:
+            calculator_cls = (
+                RingBlockSizeCalculator
+                if ring_axis_name is not None
+                else CPBlockSizeCalculator
+            )
+            default_prefill = calculator_cls(
+                model_cfgs, serve_cfgs, vmem_limit_bytes
+            ).prefill_block_sizes()
+    elif decode_block_sizes is None or prefill_block_sizes is None:
         default_decode, default_prefill = calculate_block_sizes(
             model_cfgs,
             serve_cfgs,
@@ -1119,13 +1759,19 @@ def ragged_paged_attention(
 
     # Compute per-sequence length parameters for the kernel.
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    kv_cache_lens, kv_new_lens, q_offsets = scheduler.get_kv_lens(
+    computed_cache_lens, kv_new_lens, q_offsets = scheduler.get_kv_lens(
         kv_lens,
         q_lens,
         page_size,
         extra_scalars=extra_scalars,
         kv_lens_global=kv_lens_global,
     )
+    if kv_cache_lens is not None:
+        computed_cache_lens = kv_cache_lens
+        kv_new_lens = kv_lens - kv_cache_lens
+    if q_positions is not None:
+        q_offsets = q_positions
+    kv_cache_lens = computed_cache_lens
 
     def run_rpa_kernel(
         mode: configs.RpaCase,
@@ -1145,6 +1791,8 @@ def ragged_paged_attention(
             vmem_limit_bytes=vmem_limit_bytes,
             mode=mode,
         )
+        if cfgs.ring_enabled:
+            _validate_ring_configs(cfgs)
         cfgs.validate_inputs(
             q=queries,
             k=keys,
@@ -1186,7 +1834,9 @@ def ragged_paged_attention(
             extra_scalars=extra_scalars,
         )
 
-    if rpa_cases is None:
+    if ring_axis_name is not None or paged_new_kv:
+        active_cases = (configs.RpaCase.MIXED,)
+    elif rpa_cases is None:
         active_cases = (configs.RpaCase.DECODE, configs.RpaCase.MIXED)
     elif isinstance(rpa_cases, configs.RpaCase):
         active_cases = (rpa_cases,)
@@ -1216,3 +1866,804 @@ def ragged_paged_attention(
     # [kv_heads, tokens, 1, lanes] -> [tokens, num_q_heads]
     lse = lse_hbm[:, :, 0, :num_q_heads_per_kv_head].swapaxes(0, 1)
     return o_hbm, kv_cache, lse.reshape(queries.shape[0], num_q_heads)
+
+
+# ---------------------------------------------------------------------------
+# PCP ring attention (google3 cl/985434096): the fused kernel's wrapper.
+# ---------------------------------------------------------------------------
+
+
+def _refuse_unsupported_pcp_features(
+    *,
+    kv_layout: configs.KVLayout,
+    sliding_window: int | None,
+    attention_sink: jax.Array | None,
+    soft_cap: float | None,
+    paged_new_kv: bool,
+):
+    """Features the PCP ring / paged new-token kernels do not implement."""
+    if sliding_window is not None:
+        raise NotImplementedError(
+            "PCP ring attention does not support a sliding window: the ring"
+            " walks whole stripes and has no window in global positions."
+        )
+    if attention_sink is not None:
+        raise NotImplementedError(
+            "PCP ring attention does not support attention sinks."
+        )
+    if soft_cap is not None:
+        raise NotImplementedError(
+            "The fused PCP kernel does not support soft-capped logits."
+        )
+    if paged_new_kv and kv_layout != configs.KVLayout.HEAD_ALONG_SUBLANE:
+        raise NotImplementedError(
+            "Paged new K/V (the PCP new-token phase) supports HEAD_ALONG_SUBLANE"
+            f" only, got {kv_layout}."
+        )
+
+
+def _validate_ring_configs(cfgs: configs.RpaConfigs):
+    """Static requirements of a ring (cache phase) kernel."""
+    cp_group_size = cfgs.serve.cp_group_size
+    if cp_group_size is None or cp_group_size < 2:
+        raise ValueError(f"The PCP ring needs cp_group_size >= 2, got {cp_group_size}.")
+    if cfgs.batch_size != 1:
+        raise ValueError(
+            "The PCP ring rotates one KV block per step and needs batch_size == 1,"
+            f" got {cfgs.batch_size}."
+        )
+    if cfgs.max_steps_ub % cp_group_size != 0:
+        # A schedule chunk has `max_steps_ub` steps (a multiple of 128) and the
+        # pipeline restarts its slot rotation at every chunk, so a chunk must
+        # end on the last hop of a rotation.
+        raise ValueError(
+            f"The PCP ring needs cp_group_size to divide {cfgs.max_steps_ub=};"
+            f" use a power of two, got {cp_group_size}."
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class PcpFusedConfigs:
+    """Static configuration of one fused PCP kernel: both phases."""
+
+    cfgs_cache: configs.RpaConfigs
+    cfgs_new: configs.RpaConfigs
+    cache_scheduler: scheduler_cp.RingCacheScheduler
+    new_scheduler: scheduler_cp.StripedNewTokensScheduler
+
+
+def pcp_fused_configs(
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype_q: jnp.dtype,
+    dtype_kv: jnp.dtype,
+    page_size: int,
+    cp_group_size: int,
+    total_q_tokens: int,
+    num_cache_rows: int,
+    cache_pages_per_row: int,
+    num_new_rows: int,
+    new_pages_per_row: int,
+    ring_axis_name: str = "pcp",
+    ring_mesh_axis_names: tuple[str, ...] | None = None,
+    sm_scale: float = 1.0,
+    mask_value: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    out_dtype: jnp.dtype | None = None,
+    kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+    token_major_q: bool = False,
+    update_kv_cache: bool = False,
+    cache_prefill_block_sizes: configs.BlockSizes | None = None,
+    new_prefill_block_sizes: configs.BlockSizes | None = None,
+    vmem_limit_bytes: int | None = None,
+    collective_id: int = 3,
+    cache_lens_cp_page_aligned: bool = False,
+) -> PcpFusedConfigs:
+    """Resolves the schedulers, block sizes and configs of a fused PCP kernel.
+
+    Everything here is static (shapes, dtypes, flags), so the same call gives
+    the host what `ragged_paged_attention_pcp_fused` will run with: it is the
+    one place the fused kernel's block sizes are chosen. Needs the TPU info
+    (a TPU, or `sglang_tpu.pallas_export.tpu_info_for_cpu_export`).
+
+    Block sizes: the ring picks its tile (`RingBlockSizeCalculator`); the
+    new-token phase shares the Q block and the (larger) KV window, so it keeps
+    bq and uses the smaller of its own (`CPBlockSizeCalculator`) and the
+    ring's bkv.
+
+    `cache_lens_cp_page_aligned` (SGLang): the caller guarantees that every
+    row's cached length (`kv_cache_lens`) is a multiple of page_size * cp,
+    i.e. whole stripes, as SGLang's ring mode does (its allocator page and
+    prefill chunk boundaries are page_size * cp tokens). The new-token phase
+    then skips the mask of cached keys (see
+    `ServingConfigs.cached_lens_block_aligned`).
+    """
+    if kv_layout != configs.KVLayout.HEAD_ALONG_SUBLANE:
+        raise NotImplementedError(
+            f"Fused PCP supports HEAD_ALONG_SUBLANE only, got {kv_layout}."
+        )
+    if num_cache_rows < 1 or num_new_rows < 1:
+        raise ValueError(
+            f"Fused PCP needs at least one row per phase, got {num_cache_rows=},"
+            f" {num_new_rows=}."
+        )
+    if cache_pages_per_row < 1 or new_pages_per_row < 1:
+        raise ValueError(
+            "Fused PCP needs page tables with at least one column, got"
+            f" {cache_pages_per_row=}, {new_pages_per_row=}."
+        )
+    dtype_q = jnp.dtype(dtype_q)
+    dtype_kv = jnp.dtype(dtype_kv)
+    out_dtype = dtype_q if out_dtype is None else jnp.dtype(out_dtype)
+    if mask_value is None:
+        mask_value = float(jnp.finfo(out_dtype).min)
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+
+    model_cfgs = configs.ModelConfigs(
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        sm_scale=sm_scale,
+        mask_value=mask_value,
+    )
+    cache_scheduler = scheduler_cp.RingCacheScheduler(
+        cp_group_size=cp_group_size,
+        ring_axis_name=ring_axis_name,
+        ring_mesh_axis_names=ring_mesh_axis_names,
+        collective_id=collective_id,
+    )
+    new_scheduler = scheduler_cp.StripedNewTokensScheduler(cp_group_size=cp_group_size)
+
+    def _serve_cfgs(scheduler, num_seqs, pages_per_row, paged_new_kv):
+        return configs.ServingConfigs(
+            num_seqs=num_seqs,
+            num_page_indices=num_seqs * pages_per_row,
+            total_q_tokens=total_q_tokens,
+            dtype_q=dtype_q,
+            dtype_kv=dtype_kv,
+            dtype_out=out_dtype,
+            page_size=page_size,
+            scale_k=k_scale,
+            scale_v=v_scale,
+            kv_layout=kv_layout,
+            cp_group_size=cp_group_size,
+            attention_scope=scheduler.scope,
+            ring_axis_name=getattr(scheduler, "ring_axis_name", None),
+            ring_mesh_axis_names=getattr(scheduler, "ring_mesh_axis_names", None),
+            paged_new_kv=paged_new_kv,
+            # Phase 1 hands its LSE over inside the kernel; no LSE output.
+            return_lse=False,
+            skip_kv_update=False,
+            skip_kv_write=not update_kv_cache,
+            token_major_q=token_major_q,
+            float32_softmax_state=True,
+        )
+
+    serve_cache = _serve_cfgs(
+        cache_scheduler, num_cache_rows, cache_pages_per_row, False
+    )
+    serve_new = _serve_cfgs(new_scheduler, num_new_rows, new_pages_per_row, True)
+
+    cache_blocks = cache_prefill_block_sizes
+    if cache_blocks is None:
+        cache_blocks = RingBlockSizeCalculator(
+            model_cfgs, serve_cache, vmem_limit_bytes
+        ).prefill_block_sizes()
+    new_blocks = new_prefill_block_sizes
+    if new_blocks is None:
+        new_calc = CPBlockSizeCalculator(model_cfgs, serve_new, vmem_limit_bytes)
+        bkv_new = min(new_calc.prefill_block_sizes().bkv_sz, cache_blocks.bkv_sz)
+        new_blocks = configs.BlockSizes(
+            bq_sz=cache_blocks.bq_sz,
+            bq_c_sz=new_calc.compute_tile_size(1, cache_blocks.bq_sz, bkv_new),
+            bkv_sz=bkv_new,
+            batch_size=1,
+        )
+
+    if (
+        cache_lens_cp_page_aligned
+        and (page_size * cp_group_size) % new_blocks.bkv_sz == 0
+    ):
+        # Cached lengths are whole stripes (multiples of page_size * cp), so
+        # also multiples of the new-token phase's bkv_sz: skip its start mask.
+        serve_new = dataclasses.replace(serve_new, cached_lens_block_aligned=True)
+
+    def _cfgs(blocks, serve_cfgs):
+        return configs.RpaConfigs(
+            block=blocks,
+            model=model_cfgs,
+            serve=serve_cfgs,
+            vmem_limit_bytes=vmem_limit_bytes,
+            mode=configs.RpaCase.MIXED,
+        )
+
+    cfgs_cache = _cfgs(cache_blocks, serve_cache)
+    cfgs_new = _cfgs(new_blocks, serve_new)
+    _validate_ring_configs(cfgs_cache)
+    for name, blocks in (("cache", cache_blocks), ("new", new_blocks)):
+        if blocks.bkv_sz % page_size or blocks.bq_sz % blocks.bq_c_sz:
+            raise ValueError(
+                f"Fused PCP {name}-phase blocks need bkv_sz to be a whole number"
+                f" of pages and bq_c_sz to divide bq_sz, got {blocks}."
+            )
+    if (
+        cache_blocks.bq_sz != new_blocks.bq_sz
+        or new_blocks.batch_size != 1
+        or new_blocks.bkv_sz > cache_blocks.bkv_sz
+    ):
+        raise ValueError(
+            "Fused PCP needs one bq_sz for both phases, batch_size == 1 and"
+            f" bkv_sz(new) <= bkv_sz(cache), got {cache_blocks=}, {new_blocks=}."
+        )
+    return PcpFusedConfigs(
+        cfgs_cache=cfgs_cache,
+        cfgs_new=cfgs_new,
+        cache_scheduler=cache_scheduler,
+        new_scheduler=new_scheduler,
+    )
+
+
+def pcp_fused_schedule_capacity(fused: PcpFusedConfigs) -> tuple[int, int]:
+    """Steps the (cache phase, new-token phase) schedules of a fused kernel hold.
+
+    A phase whose schedule needs more steps than this overflows the schedule
+    buffer: the kernel then silently drops the excess steps. Same accounting
+    as `sglang_tpu.pp_attention_capacity` uses for the other kernels.
+    """
+    return tuple(
+        max(
+            0,
+            cfgs.max_steps_ub * cfgs.max_schedule_size_multiplier
+            - configs.NUM_INPUT_SLOTS
+            - 1,
+        )
+        for cfgs in (fused.cfgs_cache, fused.cfgs_new)
+    )
+
+
+def pcp_fused_schedule_steps(
+    fused: PcpFusedConfigs,
+    *,
+    cache_cu_q_lens,
+    cache_kv_lens,
+    num_cache_rows_live: int,
+    new_cu_q_lens,
+    new_kv_lens,
+    kv_cache_lens,
+    q_positions,
+    num_new_rows_live: int,
+    new_kv_write_rows=None,
+) -> tuple[int, int]:
+    """Steps the (cache phase, new-token phase) schedules of a batch need.
+
+    Host-side mirror of `RingCacheScheduler` and `StripedNewTokensScheduler`
+    (paged new K/V); the arguments are the host (NumPy / list) values of the
+    operands of `ragged_paged_attention_pcp_fused` with the same names, and
+    the live row counts are `cache_distribution[1]` / `new_distribution[1]`.
+    """
+    cfgs_cache, cfgs_new = fused.cfgs_cache, fused.cfgs_new
+    cp_group_size = cfgs_cache.serve.cp_group_size
+    page_size = cfgs_cache.serve.page_size
+    super_page = cp_group_size * page_size
+    bq_sz = cfgs_cache.bq_sz
+
+    def cdiv(a, b):
+        return -(-int(a) // int(b))
+
+    cache_steps = 0
+    for row in range(int(num_cache_rows_live)):
+        q_len = int(cache_cu_q_lens[row + 1]) - int(cache_cu_q_lens[row])
+        cache_len = int(cache_kv_lens[row]) - q_len
+        # Rank 0's stripe: `utils.cp_local_cache_len(cache_len, cp, 0, page)`.
+        local_len = (cache_len // super_page) * page_size + min(
+            page_size, cache_len % super_page
+        )
+        cache_steps += (
+            cdiv(q_len, bq_sz) * cdiv(local_len, cfgs_cache.bkv_sz) * cp_group_size
+        )
+
+    writes = not cfgs_new.serve.skip_kv_write
+    bkv_sz = cfgs_new.bkv_sz
+    new_steps = 0
+    for row in range(int(num_new_rows_live)):
+        q_len = int(new_cu_q_lens[row + 1]) - int(new_cu_q_lens[row])
+        cache_len = int(kv_cache_lens[row])
+        num_q = cdiv(q_len, bq_sz)
+        num_k = cdiv(int(new_kv_lens[row]), bkv_sz)
+        start_k = cache_len // bkv_sz
+        row_writes = writes and (
+            new_kv_write_rows is None or int(new_kv_write_rows[row]) != 0
+        )
+        for q_idx in range(num_q):
+            q_sz = min(bq_sz, q_len - q_idx * bq_sz)
+            last_pos = int(q_positions[row]) + q_idx * bq_sz + q_sz - 1
+            end_k = min(num_k, last_pos // bkv_sz + 1)
+            if row_writes and q_idx == num_q - 1:
+                end_k = num_k
+            new_steps += max(0, end_k - start_k)
+    return cache_steps, new_steps
+
+
+@functools.lru_cache(maxsize=64)
+def _cached_pcp_fused_configs(tpu_info, **kwargs) -> PcpFusedConfigs:
+    """`pcp_fused_configs` memoized on its (static) arguments and the chip.
+
+    Resolving the block sizes takes ~10 ms of host time, and
+    `check_pcp_fused_schedule` runs on every ring-mode extend batch before the
+    forward is launched, so an uncached call adds that to every prefill chunk.
+    `tpu_info` is only part of the key: the block sizes depend on the chip.
+    """
+    del tpu_info
+    return pcp_fused_configs(**kwargs)
+
+
+def check_pcp_fused_schedule(
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype_q,
+    dtype_kv,
+    page_size: int,
+    cp_group_size: int,
+    total_q_tokens: int,
+    total_kv_tokens: int,
+    cache_cu_q_lens,
+    cache_kv_lens,
+    cache_pages_per_row: int,
+    new_cu_q_lens,
+    new_kv_lens,
+    kv_cache_lens,
+    q_positions,
+    new_pages_per_row: int,
+    new_kv_pages_per_row: int,
+    num_cache_rows_live: int,
+    num_new_rows_live: int,
+    new_kv_write_rows=None,
+    kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+    update_kv_cache: bool = False,
+    cache_prefill_block_sizes: configs.BlockSizes | None = None,
+    new_prefill_block_sizes: configs.BlockSizes | None = None,
+    vmem_limit_bytes: int | None = None,
+    cache_lens_cp_page_aligned: bool = False,
+) -> None:
+    """Raises ValueError if a batch does not fit the fused PCP kernel.
+
+    Host-side: static shapes plus the host values of the length operands; no
+    device is touched. Checks, with the block sizes the kernel will pick for
+    these shapes (`pcp_fused_configs`), that neither phase's schedule
+    overflows, and the static layout rules of `keys` / `values` and of the row
+    starts. `cache_cu_q_lens` has `num_cache_rows + 1` entries and
+    `new_cu_q_lens` has `num_new_rows + 1` (the operands' static sizes).
+    """
+    num_cache_rows = len(cache_cu_q_lens) - 1
+    num_new_rows = len(new_cu_q_lens) - 1
+    if total_kv_tokens % page_size or total_kv_tokens < total_q_tokens:
+        raise ValueError(
+            f"Fused PCP needs a whole number of pages of new K/V and at least as"
+            f" many as queries, got {total_kv_tokens=}, {total_q_tokens=},"
+            f" {page_size=}."
+        )
+    if new_kv_pages_per_row < 1:
+        raise ValueError(f"Expected {new_kv_pages_per_row=} >= 1.")
+    for name, cu, live in (
+        ("cache", cache_cu_q_lens, num_cache_rows_live),
+        ("new", new_cu_q_lens, num_new_rows_live),
+    ):
+        starts = [int(cu[row]) for row in range(int(live))]
+        if any(start % 16 for start in starts):
+            raise ValueError(
+                f"Fused PCP {name}-phase rows must start at multiples of 16"
+                f" query tokens, got starts {starts}."
+            )
+        if int(live) and int(cu[int(live)]) > total_q_tokens:
+            raise ValueError(
+                f"Fused PCP {name}-phase rows cover {int(cu[int(live)])} query"
+                f" tokens, more than {total_q_tokens=}."
+            )
+    if cache_lens_cp_page_aligned:
+        stripe = page_size * cp_group_size
+        bad = [
+            int(kv_cache_lens[row])
+            for row in range(int(num_new_rows_live))
+            if int(kv_cache_lens[row]) % stripe
+        ]
+        if bad:
+            raise ValueError(
+                "Fused PCP with cache_lens_cp_page_aligned needs cached lengths"
+                f" in whole stripes of {stripe} tokens, got {bad}."
+            )
+    fused = _cached_pcp_fused_configs(
+        pltpu.get_tpu_info(),
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype_q=dtype_q,
+        dtype_kv=dtype_kv,
+        page_size=page_size,
+        cp_group_size=cp_group_size,
+        total_q_tokens=total_q_tokens,
+        num_cache_rows=num_cache_rows,
+        cache_pages_per_row=cache_pages_per_row,
+        num_new_rows=num_new_rows,
+        new_pages_per_row=new_pages_per_row,
+        kv_layout=kv_layout,
+        update_kv_cache=update_kv_cache,
+        cache_prefill_block_sizes=cache_prefill_block_sizes,
+        new_prefill_block_sizes=new_prefill_block_sizes,
+        vmem_limit_bytes=vmem_limit_bytes,
+        cache_lens_cp_page_aligned=cache_lens_cp_page_aligned,
+    )
+    needed = pcp_fused_schedule_steps(
+        fused,
+        cache_cu_q_lens=cache_cu_q_lens,
+        cache_kv_lens=cache_kv_lens,
+        num_cache_rows_live=num_cache_rows_live,
+        new_cu_q_lens=new_cu_q_lens,
+        new_kv_lens=new_kv_lens,
+        kv_cache_lens=kv_cache_lens,
+        q_positions=q_positions,
+        num_new_rows_live=num_new_rows_live,
+        new_kv_write_rows=new_kv_write_rows,
+    )
+    capacity = pcp_fused_schedule_capacity(fused)
+    for name, steps, cap, cfgs in zip(
+        ("cache (ring)", "new-token"),
+        needed,
+        capacity,
+        (fused.cfgs_cache, fused.cfgs_new),
+    ):
+        if steps > cap:
+            raise ValueError(
+                f"The fused PCP {name} phase needs {steps} schedule steps but"
+                f" holds {cap} (bq_sz={cfgs.bq_sz}, bkv_sz={cfgs.bkv_sz},"
+                f" {cp_group_size=})."
+            )
+
+
+@jax.jit(
+    static_argnames=(
+        "cp_group_size",
+        "ring_axis_name",
+        "ring_mesh_axis_names",
+        "sm_scale",
+        "mask_value",
+        "k_scale",
+        "v_scale",
+        "out_dtype",
+        "kv_layout",
+        "token_major_q",
+        "update_kv_cache",
+        "cache_prefill_block_sizes",
+        "new_prefill_block_sizes",
+        "vmem_limit_bytes",
+        "collective_id",
+        "sliding_window",
+        "soft_cap",
+        "cache_lens_cp_page_aligned",
+    ),
+)
+def ragged_paged_attention_pcp_fused(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    kv_cache: jax.Array,
+    *,
+    # Cache (ring) phase inputs, as passed to `ragged_paged_attention` with a
+    # `RingCacheScheduler`.
+    cache_kv_lens: jax.Array,
+    cache_page_indices: jax.Array,
+    cache_cu_q_lens: jax.Array,
+    cache_distribution: jax.Array,
+    # New-token phase inputs, as passed with a `StripedNewTokensScheduler`.
+    new_kv_lens: jax.Array,
+    new_page_indices: jax.Array,
+    new_cu_q_lens: jax.Array,
+    new_distribution: jax.Array,
+    new_kv_page_indices: jax.Array,
+    q_positions: jax.Array,
+    kv_cache_lens: jax.Array,
+    cp_rank: jax.Array,
+    cp_group_size: int,
+    ring_axis_name: str,
+    ring_mesh_axis_names: tuple[str, ...] | None,
+    new_kv_write_rows: jax.Array | None = None,
+    sm_scale: float = 1.0,
+    mask_value: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    out_dtype: jnp.dtype | None = None,
+    kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+    token_major_q: bool = False,
+    update_kv_cache: bool = False,
+    cache_prefill_block_sizes: configs.BlockSizes | None = None,
+    new_prefill_block_sizes: configs.BlockSizes | None = None,
+    vmem_limit_bytes: int | None = None,
+    collective_id: int = 3,
+    attention_sink: jax.Array | None = None,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    cache_lens_cp_page_aligned: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """PCP prefill in one kernel: ring cache phase + new-token phase.
+
+    Prefill context parallelism over `cp_group_size` ranks whose KV caches are
+    page-striped (rank r holds the pages p of a sequence with
+    p % cp_group_size == r, as under decode context parallelism). Each rank
+    holds some of a chunk's queries and attends (1) the cached prefix, by
+    rotating every rank's stripe around the ring (remote DMAs of KV blocks),
+    and (2) the chunk's own tokens, whose K/V the caller has all-gathered, in
+    one `pallas_call`: the new-token phase continues the cache phase's online
+    softmax (see `kernel.rpa_kernel_pcp_fused`), so there is no second launch,
+    no LSE output and no merge.
+
+    Must be called inside `jax.shard_map` over a mesh with the ring axis, by
+    every rank, with identical static arguments. It contains no collective of
+    its own.
+
+    Rows ("sequences") of the two phases index the same query array but are
+    independent partitions of it: the hand-off between the phases is stored
+    per query token. Every row must start at a multiple of 16 query tokens.
+
+    Args:
+      queries: [T_q, num_q_heads, head_dim]. This rank's queries.
+      keys, values: [T_kv, num_kv_heads, head_dim] in the cache dtype. The new
+        K/V of the chunk, read only through `new_kv_page_indices`; T_kv is a
+        whole number of pages and at least T_q.
+      kv_cache: This rank's page stripe of the cache, in the layout of
+        `get_kv_cache_shape`.
+      cache_kv_lens: [S_c] int32. Per cache row, the global cached length plus
+        the row's query length (the scheduler subtracts the latter).
+      cache_page_indices: [S_c * pages] int32, pages >= 1. Stripe page table of
+        each cache row. Entries up to rank 0's stripe length must be valid on
+        every rank.
+      cache_cu_q_lens: [S_c + 1] int32. Cumulative query lengths of the cache
+        rows.
+      cache_distribution: [3] int32, SGLang order; `[n, n, n]` for n live rows.
+      new_kv_lens: [S_n] int32. Per new row, the global length after the
+        chunk: cached length plus the number of new tokens of its sequence.
+      new_page_indices: [S_n * pages] int32. Stripe page table of each new row
+        (writeback destination); unused unless `update_kv_cache`.
+      new_cu_q_lens: [S_n + 1] int32. Cumulative query lengths of the new rows.
+      new_distribution: [3] int32, `[n, n, n]` for n live rows.
+      new_kv_page_indices: [S_n * new_pages] int32. Per new row, page j of its
+        sequence's new tokens (counted from the first new token) is page
+        `new_kv_page_indices[row, j]` of keys/values. Every entry must be a
+        valid page of keys/values.
+      q_positions: [S_n] int32. Global position of each new row's first query.
+      kv_cache_lens: [S_n] int32. Global cached length of each new row.
+      cp_rank: [1] int32. This rank's index in the group. Must increase by one
+        (mod cp_group_size) along the ring axis.
+      cp_group_size: Number of ranks; a power of two.
+      ring_axis_name: Mesh axis the ring runs on.
+      ring_mesh_axis_names: All axis names of the mesh, in mesh order; None
+        when the ring axis is the only one.
+      new_kv_write_rows: [S_n] int32 or None, only with `update_kv_cache`.
+        Nonzero entries mark the rows that write their sequence's new K/V;
+        None marks every row. See `StripedNewTokensScheduler`.
+      sm_scale: Softmax scale.
+      mask_value: Value of masked logits; defaults to the smallest value of the
+        output dtype.
+      k_scale, v_scale: Static quantization scales of the cache dtype (same
+        meaning as in `ragged_paged_attention`).
+      out_dtype: Output dtype; defaults to the queries' dtype.
+      kv_layout: HEAD_ALONG_SUBLANE only.
+      token_major_q: Keep q / out token-major in HBM; see
+        `ServingConfigs.token_major_q`.
+      update_kv_cache: False (default): `kv_cache` is read-only and the kernel
+        writes nothing; the caller writes each rank's owned pages of the new
+        K/V itself, before or after this call. True: the kernel writes them
+        and returns the cache; the cache is then aliased by a kernel that
+        contains remote DMAs, which XLA may copy on every call.
+      cache_prefill_block_sizes, new_prefill_block_sizes: Explicit block sizes
+        of the two phases (same bq_sz, batch_size 1, bkv_sz(new) <=
+        bkv_sz(cache)).
+      vmem_limit_bytes: VMEM limit of the kernel.
+      collective_id: Pallas collective id of the kernel (barrier semaphore);
+        unique among the kernels of the process that synchronize devices.
+      attention_sink, sliding_window, soft_cap: Not supported; must be None.
+      cache_lens_cp_page_aligned: SGLang. The caller guarantees every
+        `kv_cache_lens` entry is a multiple of page_size * cp_group_size; see
+        `pcp_fused_configs`.
+
+    Returns:
+      `out` [T_q, num_q_heads, head_dim], or `(out, kv_cache)` with
+      `update_kv_cache`. Query rows that no new row covers keep the query
+      values.
+    """
+    _refuse_unsupported_pcp_features(
+        kv_layout=kv_layout,
+        sliding_window=sliding_window,
+        attention_sink=attention_sink,
+        soft_cap=soft_cap,
+        paged_new_kv=True,
+    )
+    if out_dtype is None:
+        out_dtype = queries.dtype
+
+    page_size = kv_cache.shape[1]
+    num_q_heads = queries.shape[1]
+    head_dim = queries.shape[2]
+    num_kv_heads = keys.shape[1]
+    num_cache_rows = cache_kv_lens.shape[0]
+    num_new_rows = new_kv_lens.shape[0]
+    for name, pages, rows in (
+        ("cache_page_indices", cache_page_indices, num_cache_rows),
+        ("new_page_indices", new_page_indices, num_new_rows),
+        ("new_kv_page_indices", new_kv_page_indices, num_new_rows),
+    ):
+        if pages.ndim != 1 or pages.shape[0] % rows or pages.shape[0] < rows:
+            raise ValueError(
+                f"Expected {name} to hold at least one page per row for {rows}"
+                f" rows, got shape {pages.shape}."
+            )
+
+    fused = pcp_fused_configs(
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype_q=queries.dtype,
+        dtype_kv=kv_cache.dtype,
+        page_size=page_size,
+        cp_group_size=cp_group_size,
+        total_q_tokens=queries.shape[0],
+        num_cache_rows=num_cache_rows,
+        cache_pages_per_row=cache_page_indices.shape[0] // num_cache_rows,
+        num_new_rows=num_new_rows,
+        new_pages_per_row=new_page_indices.shape[0] // num_new_rows,
+        ring_axis_name=ring_axis_name,
+        ring_mesh_axis_names=ring_mesh_axis_names,
+        sm_scale=sm_scale,
+        mask_value=mask_value,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        out_dtype=out_dtype,
+        kv_layout=kv_layout,
+        token_major_q=token_major_q,
+        update_kv_cache=update_kv_cache,
+        cache_prefill_block_sizes=cache_prefill_block_sizes,
+        new_prefill_block_sizes=new_prefill_block_sizes,
+        vmem_limit_bytes=vmem_limit_bytes,
+        collective_id=collective_id,
+        cache_lens_cp_page_aligned=cache_lens_cp_page_aligned,
+    )
+    cfgs_cache, cfgs_new = fused.cfgs_cache, fused.cfgs_new
+
+    # Static checks. The new-token phase's are the kernel's usual ones; the
+    # cache phase shares the arrays and only adds its own operands.
+    cfgs_new.validate_inputs(
+        q=queries,
+        k=keys,
+        v=values,
+        kv_cache=kv_cache,
+        kv_lens=new_kv_lens,
+        page_indices=new_page_indices,
+        cu_q_lens=new_cu_q_lens,
+        distribution=new_distribution,
+        cp_rank=cp_rank,
+        kv_lens_global=new_kv_lens,
+    )
+    int_operands = {
+        "cache_kv_lens": (cache_kv_lens, (num_cache_rows,)),
+        "cache_cu_q_lens": (cache_cu_q_lens, (num_cache_rows + 1,)),
+        "cache_distribution": (cache_distribution, (3,)),
+        "cache_page_indices": (cache_page_indices, cache_page_indices.shape),
+        "new_kv_page_indices": (new_kv_page_indices, new_kv_page_indices.shape),
+        "q_positions": (q_positions, (num_new_rows,)),
+        "kv_cache_lens": (kv_cache_lens, (num_new_rows,)),
+    }
+    if new_kv_write_rows is not None:
+        if not update_kv_cache:
+            raise ValueError("new_kv_write_rows requires update_kv_cache=True.")
+        int_operands["new_kv_write_rows"] = (new_kv_write_rows, (num_new_rows,))
+    for name, (operand, shape) in int_operands.items():
+        if operand.dtype != jnp.int32 or operand.shape != shape:
+            raise ValueError(
+                f"Expected int32 {name} of shape {shape}, got {operand.dtype}"
+                f" {operand.shape}."
+            )
+
+    q_hbm, new_kv_hbm = prepare_inputs(
+        queries,
+        keys,
+        values,
+        queries.dtype,
+        kv_cache.dtype,
+        kv_layout=kv_layout,
+        page_size=page_size,
+        token_major_q=token_major_q,
+    )
+
+    def _phase(
+        scheduler,
+        cfgs,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        extra_scalars,
+        q_offsets_override,
+        kv_cache_lens_override,
+    ):
+        q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+        computed_cache_lens, kv_new_lens, q_offsets = scheduler.get_kv_lens(
+            kv_lens, q_lens, page_size, extra_scalars=extra_scalars
+        )
+        if kv_cache_lens_override is not None:
+            computed_cache_lens = kv_cache_lens_override
+            kv_new_lens = kv_lens - kv_cache_lens_override
+        if q_offsets_override is not None:
+            q_offsets = q_offsets_override
+        schedule_hbm = scheduler_lib.generate_rpa_metadata(
+            cu_q_lens,
+            q_offsets,
+            computed_cache_lens,
+            kv_new_lens,
+            distribution,
+            page_indices,
+            cfgs=cfgs,
+            scheduler=scheduler,
+            extra_scalars=extra_scalars,
+        )
+        scalars = (
+            cu_q_lens,
+            q_offsets,
+            computed_cache_lens,
+            kv_new_lens,
+            extra_scalars,
+        )
+        return schedule_hbm, scalars
+
+    schedule_cache, cache_scalars = _phase(
+        fused.cache_scheduler,
+        cfgs_cache,
+        cache_kv_lens,
+        cache_page_indices,
+        cache_cu_q_lens,
+        cache_distribution,
+        (cp_rank,),
+        None,
+        None,
+    )
+    new_extra_scalars = (cp_rank, new_kv_page_indices)
+    if new_kv_write_rows is not None:
+        new_extra_scalars += (new_kv_write_rows,)
+    schedule_new, new_scalars = _phase(
+        fused.new_scheduler,
+        cfgs_new,
+        new_kv_lens,
+        new_page_indices,
+        new_cu_q_lens,
+        new_distribution,
+        new_extra_scalars,
+        q_positions,
+        kv_cache_lens,
+    )
+
+    o_hbm, kv_cache_out = kernel.rpa_kernel_pcp_fused(
+        cache_scalars,
+        new_scalars,
+        schedule_cache,
+        schedule_new,
+        q_hbm,
+        new_kv_hbm,
+        kv_cache,
+        cfgs_cache=cfgs_cache,
+        cfgs_new=cfgs_new,
+        cache_scheduler=fused.cache_scheduler,
+        new_scheduler=fused.new_scheduler,
+    )
+
+    o_hbm = prepare_outputs(o_hbm)
+    num_q_heads_per_kv_head = num_q_heads // num_kv_heads
+    o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
+    if not token_major_q:
+        o_hbm = o_hbm.swapaxes(1, 0)
+    o_hbm = o_hbm.reshape(queries.shape)
+    if update_kv_cache:
+        return o_hbm, kv_cache_out
+    return o_hbm

@@ -105,7 +105,14 @@ def flash_attention_qk_softmax(
     p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
     if zero_masked:
         p = jnp.where(jnp.stack(custom_mask, axis=0), p, 0)
-    p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
+    # `p` and its row sum are computed in the compute dtype (dtype_out); the
+    # running sum `l` may be carried in float32 (see
+    # `ServingConfigs.float32_softmax_state`), in which case the row sum is
+    # widened here so that block contributions are not rounded away once `l`
+    # grows large at long context.
+    p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out).astype(
+        l_prev.dtype
+    )
 
     l_next_list = []
     l_reset = 0.0 if attention_sink is None else 1.0
@@ -165,7 +172,10 @@ def flash_attention_pv(
             dimension_numbers=(([2], [1]), ([0], [0])),
             preferred_element_type=jnp.float32,
         )
-    pv = pv.astype(cfgs.serve.dtype_out).reshape(b, k_heads, tq, h_size)
+    # `pv` is float32 (`preferred_element_type`); it is narrowed to the dtype
+    # of the accumulator, which is dtype_out unless the softmax state is
+    # carried in float32.
+    pv = pv.astype(o_prev.dtype).reshape(b, k_heads, tq, h_size)
 
     if not cfgs.serve.per_token_scale and cfgs.serve.scale_v is not None:
         pv *= cfgs.serve.scale_v

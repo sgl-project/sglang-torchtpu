@@ -37,6 +37,7 @@ from sglang_tpu.replica_group import ReplicaGroupCoordinator
 from sglang_tpu.tpu_platform import (
     TpuSRTPlatform,
     _validate_decode_context_parallel,
+    _validate_prefill_context_parallel,
 )
 
 # CPU suite: mocks torch_tpu, so it runs on the CPU runners -- never a TPU node.
@@ -838,6 +839,173 @@ class TestPrefillContextParallelValidation(CustomTestCase):
             attn_cp_size=2,
             moe_dp_size=2,
         )
+
+
+class TestPrefillContextParallelRingValidation(CustomTestCase):
+    """SGLANG_TPU_PCP_MODE=ring: prefill CP over a page-striped KV cache, with
+    decode on the DCP path over the attention-CP group (--dcp-size ==
+    --attn-cp-size, any attention TP)."""
+
+    _args = TestTpuPlatformServerDefaults._args
+    _apply = TestTpuPlatformServerDefaults._apply
+    _resolved = TestTpuPlatformServerDefaults._resolved
+
+    def _apply_ring(
+        self,
+        architectures=("Qwen3MoeForCausalLM",),
+        env=None,
+        apply=None,
+        **overrides,
+    ):
+        fields = dict(
+            tp_size=8,
+            attn_cp_size=8,
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+            moe_dp_size=8,
+            enable_torch_compile=True,
+            tpu_compile_tracer="dynamo",
+            model_path="model",
+            trust_remote_code=False,
+            revision=None,
+            dcp_comm_backend="ag_rs",
+            dcp_replicate_q_proj=False,
+            chunked_prefill_size=None,
+            enable_mixed_chunk=False,
+            nnodes=1,
+        )
+        fields.update(overrides)
+        args = self._args(**fields)
+        hf_config = SimpleNamespace(architectures=list(architectures))
+        environment = {"SGLANG_TPU_PCP_MODE": "ring", "LIBTPU_INIT_ARGS": ""}
+        environment.update(env or {})
+        with (
+            patch.dict(os.environ, environment),
+            patch(
+                "sglang.srt.utils.hf_transformers.config.get_config",
+                return_value=hf_config,
+            ),
+        ):
+            (apply or self._apply)(args)
+        return args
+
+    def test_sets_dcp_size_and_keeps_the_fp8_kv_default(self):
+        """The KV cache is striped like DCP's, so an unset --dcp-size becomes
+        the CP size; unlike plain DCP the pool keeps the fp8 default, because
+        the chunk K/V are gathered in bf16 and quantized afterwards."""
+        args = self._apply_ring()
+        self.assertEqual(self._resolved(args, "dcp_size"), 8)
+        self.assertEqual(
+            self._resolved(args, "attention_backend"), "pallas_tpu_rpa_batched"
+        )
+        self.assertEqual(self._resolved(args, "kv_cache_dtype"), "fp8_e4m3")
+        self.assertEqual(self._resolved(args, "sampling_backend"), "pytorch")
+
+    def test_accepts_an_explicit_matching_dcp_size_and_smaller_groups(self):
+        self.assertEqual(self._resolved(self._apply_ring(dcp_size=8), "dcp_size"), 8)
+        for cp in (2, 4):
+            with self.subTest(cp=cp):
+                args = self._apply_ring(tp_size=cp, attn_cp_size=cp, moe_dp_size=cp)
+                self.assertEqual(self._resolved(args, "dcp_size"), cp)
+
+    def test_gather_mode_is_untouched_and_still_refuses_dcp(self):
+        """Without the env the same flags are today's all-gather PCP: no DCP,
+        and DCP together with prefill CP stays refused."""
+        for mode in ({}, {"SGLANG_TPU_PCP_MODE": "gather"}):
+            with self.subTest(mode=mode):
+                env = {"SGLANG_TPU_PCP_MODE": "gather", **mode}
+                args = self._apply_ring(env=env)
+                self.assertEqual(self._resolved(args, "dcp_size"), 1)
+                with self.assertRaisesRegex(ValueError, "except as ring-mode"):
+                    self._apply_ring(env=env, dcp_size=8)
+
+    def test_unknown_mode_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_TPU_PCP_MODE must be one of"):
+            self._apply_ring(env={"SGLANG_TPU_PCP_MODE": "rings"})
+
+    def test_rejections_name_the_missing_piece(self):
+        cases = [
+            (
+                dict(architectures=("GptOssForCausalLM",)),
+                {},
+                "no attention sink and no sliding window",
+            ),
+            (
+                dict(tp_size=6, attn_cp_size=6, moe_dp_size=6),
+                {},
+                "power-of-two --attn-cp-size",
+            ),
+            (dict(nnodes=2), {}, "runs on one host"),
+            (dict(enable_mixed_chunk=True), {}, "--enable-mixed-chunk"),
+            (dict(enable_hierarchical_cache=True), {}, "--enable-hierarchical-cache"),
+            (dict(disaggregation_mode="prefill"), {}, "PD disaggregation"),
+            (dict(dcp_size=4), {}, "requires --dcp-size 8"),
+            (dict(dcp_replicate_q_proj=True), {}, "--dcp-replicate-q-proj"),
+            (
+                {},
+                {"SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "1"},
+                "token-major fused layout",
+            ),
+            (dict(speculative_algorithm="EAGLE3"), {}, "speculative decoding"),
+            (dict(attn_dp_size=8), {}, "DP attention"),
+        ]
+        for overrides, env, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(NotImplementedError, message):
+                    self._apply_ring(env=env, **overrides)
+
+    def test_attention_tp_above_one_is_admitted(self):
+        """PCP4 x TP2: the stripe and decode-merge group is the attention-CP
+        group, so --dcp-size resolves to the CP size, not the TP size."""
+        args = self._apply_ring(tp_size=8, attn_cp_size=4, moe_dp_size=4)
+        self.assertEqual(self._resolved(args, "dcp_size"), 4)
+        self.assertEqual(self._resolved(args, "kv_cache_dtype"), "fp8_e4m3")
+        with self.assertRaisesRegex(NotImplementedError, "requires --dcp-size 4"):
+            self._apply_ring(tp_size=8, attn_cp_size=4, moe_dp_size=4, dcp_size=8)
+
+    def test_a_world_wider_than_the_cp_group_is_refused(self):
+        """The ring kernel's mesh is the whole world: no pipeline stages and no
+        data-parallel replicas next to the context-parallel group. (Earlier
+        gates of the full hook refuse these too; this pins the ring's own.)"""
+        for overrides, message in (
+            (dict(pp_size=2), "pipeline parallelism"),
+            (dict(dp_size=2), "data-parallel replicas"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(NotImplementedError, message):
+                    self._apply_ring(
+                        apply=_validate_prefill_context_parallel, **overrides
+                    )
+
+    def test_inherits_the_dcp_chunk_rule(self):
+        """Chunks are cut at logical pages of page_size * cp tokens."""
+        with self.assertRaisesRegex(ValueError, "--chunked-prefill-size"):
+            self._apply_ring(page_size=256, chunked_prefill_size=1024)
+        self._apply_ring(page_size=256, chunked_prefill_size=2048)
+
+    def test_dcp_validation_admits_only_the_ring_topology(self):
+        """The DCP gate lets prefill CP through for ring mode with dcp == cp."""
+
+        def dcp_args(**overrides):
+            fields = dict(tp_size=8, dcp_size=8, attn_cp_size=8, enable_prefill_cp=True)
+            fields.update(overrides)
+            return TestTpuPlatformDecodeContextParallel._args(None, **fields)
+
+        env = {"SGLANG_TPU_REQ_TO_TOKEN_ON_HOST": "1", "SGLANG_TPU_PCP_MODE": "ring"}
+        with patch.dict(os.environ, env):
+            _validate_decode_context_parallel(dcp_args())
+            _validate_decode_context_parallel(dcp_args(dcp_size=4, attn_cp_size=4))
+            for overrides in (
+                dict(dcp_size=4),
+                dict(attn_cp_size=4),
+                dict(enable_prefill_cp=False),
+            ):
+                with self.subTest(overrides=overrides):
+                    with self.assertRaisesRegex(ValueError, "ring-mode"):
+                        _validate_decode_context_parallel(dcp_args(**overrides))
+        with patch.dict(os.environ, {**env, "SGLANG_TPU_PCP_MODE": "gather"}):
+            with self.assertRaisesRegex(ValueError, "ring-mode"):
+                _validate_decode_context_parallel(dcp_args())
 
 
 class TestDsaValidation(CustomTestCase):

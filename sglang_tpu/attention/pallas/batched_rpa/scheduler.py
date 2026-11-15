@@ -16,7 +16,7 @@
 import dataclasses
 import functools
 from collections.abc import Sequence
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -54,6 +54,42 @@ class BaseScheduler:
 
     def get_cp_group_size(self) -> int | None:
         return None
+
+    # PCP ring hooks (google3 cl/985434096); no-ops outside `RingCacheScheduler`.
+    def get_collective_id(self) -> int | None:
+        """Pallas collective id of the kernel, for schedulers whose kernel
+        synchronizes with other devices."""
+        return None
+
+    def get_ring_sems_spec(self) -> Any:
+        """Scoped semaphore allocations of the ring, or None."""
+        return None
+
+    def create_ring(
+        self,
+        cfgs: configs.RpaConfigs,
+        ring_sems: Any,
+        *,
+        kv_window_ref: jax.Ref,
+    ) -> Any:
+        """The object that rotates the KV window between ranks, or None."""
+        del cfgs, ring_sems, kv_window_ref
+        return None
+
+    def get_local_k_end(
+        self,
+        s_idx: jax.Array,
+        k_idx: jax.Array,
+        kv_cache_lens_ref: jax.Ref,
+        kv_new_lens_ref: jax.Ref,
+        cfgs: configs.RpaConfigs,
+        extra_refs: Sequence[jax.Ref] = (),
+    ) -> jax.Array:
+        """Number of valid keys of sequence `s_idx` for a stripe walk (the
+        scopes with `walks_cache_stripe`), in the coordinates of
+        `get_kv_start`. Keys at or past it are stale and masked."""
+        del k_idx, cfgs, extra_refs
+        return kv_cache_lens_ref[s_idx] + kv_new_lens_ref[s_idx]
 
     # For masking inside RPA kernel
     def get_kv_lens(

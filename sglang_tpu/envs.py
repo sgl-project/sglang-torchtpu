@@ -464,6 +464,15 @@ class TpuEnvs:
     # 100 GB of host RAM per host to compile them). Compilation is frozen after warmup, so
     # scheduler intake rejects multimodal requests with a 400 (sglang_tpu/patches.py).
     SGLANG_TPU_VL_TEXT_ONLY_EXTEND = EnvBool(False)
+    # Prefill context parallelism mode (cp_mode.py). "gather": every rank
+    # all-gathers the chunk's K/V per layer and writes the whole sequence into
+    # its own replicated KV pool. "ring": the KV cache is page-striped across
+    # the CP ranks (rank r holds global page l * P + r, as under decode context
+    # parallelism), the zigzag prefill attends the cached prefix through the
+    # fused ring kernel and everything else runs the DCP path over the
+    # attention-CP group; needs --dcp-size == --attn-cp-size (validation sets
+    # --dcp-size).
+    SGLANG_TPU_PCP_MODE = EnvStr("gather")
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);

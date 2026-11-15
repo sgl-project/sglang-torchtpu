@@ -34,4 +34,40 @@ class TpuZigzagCPStrategy(ZigzagCPStrategy):
         if extend_lens is None:
             return True
         lengths = [int(length) for length in extend_lens]
-        return min(lengths) > 0 and max(lengths) >= self.cp_size
+        if not (min(lengths) > 0 and max(lengths) >= self.cp_size):
+            return False
+        if self._ring_page_size is None:
+            return True
+        return self._ring_fits(forward_batch, lengths)
+
+    # Ring mode (SGLANG_TPU_PCP_MODE=ring), set by ``configure_ring``: the KV
+    # page size and the largest usable local token bucket. None in gather mode.
+    _ring_page_size: int | None = None
+    _ring_max_local_rows: int | None = None
+
+    def configure_ring(self, *, page_size: int, max_local_rows: int) -> None:
+        """Switch ``can_apply`` to the ring-mode layout's capacity rule.
+
+        Called by the compile policy on every rank with identical values, so
+        the ranks keep admitting the same batches to the same program.
+        """
+        self._ring_page_size = int(page_size)
+        self._ring_max_local_rows = int(max_local_rows)
+
+    def _ring_fits(self, forward_batch: Any, lengths: list[int]) -> bool:
+        """Whether the ring-mode layout of this batch fits a token bucket.
+
+        Ring mode reserves two page-aligned blocks per request on every rank,
+        so a batch of many short requests can need more local rows than the
+        largest bucket holds; it then runs the striped (DCP) extend program
+        like any other batch the zigzag strategy does not take.
+        """
+        from sglang_tpu.cp_forward import get_tpu_cp_layout
+        from sglang_tpu.cp_layout import ring_local_rows
+
+        # Decided on the host before the layout was attached; the compiled
+        # forward only re-reads that decision (see pinned_extend_seq_lens_cpu).
+        if get_tpu_cp_layout(forward_batch) is not None:
+            return True
+        rows = ring_local_rows(lengths, self.cp_size, self._ring_page_size)
+        return rows <= self._ring_max_local_rows
