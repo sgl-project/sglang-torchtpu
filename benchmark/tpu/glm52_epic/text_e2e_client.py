@@ -26,7 +26,7 @@ def run(base_url, output):
             meta=record['meta_info'];assert meta['completion_tokens']>0 and meta['prompt_tokens']>0
             assert meta.get('finish_reason',{}).get('type')!='abort'
             assert isinstance(record.get('text'),str)
-            checks.append(dict(case=name,routed_dp_rank=rank,rid=payload['rid'],expected=expected,matched=expected in record['text'].casefold(),
+            checks.append(dict(case=name,routed_dp_rank=rank,rid=payload['rid'],text=record['text'],expected=expected,matched=expected in record['text'].casefold(),
                                prompt_tokens=meta['prompt_tokens'],completion_tokens=meta['completion_tokens']))
     for case in spec['cases']:execute(case['id'],case['text'],case['expected_substring_casefold'])
     batch=spec['parallel_batch']
