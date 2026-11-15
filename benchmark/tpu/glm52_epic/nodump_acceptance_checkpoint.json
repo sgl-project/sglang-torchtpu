@@ -1,0 +1,24 @@
+{
+  "status": "FUNCTIONAL_AND_NATIVE_LONG_BASELINE_PASSED_FULL_ACCEPTANCE_PENDING",
+  "chat_experiment": "exp-k0nnadpb6q",
+  "long_experiment": "exp-r188nvdf96",
+  "sanity": "20/20 actual model chat checks; not comprehensive accuracy",
+  "sequential_cached_tokens": 12224,
+  "sequential_median_host_seconds": 1.891264108940959,
+  "sequential_outputs_equal_warmup": false,
+  "cold_cohort_host_seconds": 19.346528542228043,
+  "cold_input_tokens": 196608,
+  "cold_output_tokens": 256,
+  "input_tokens_per_cohort_e2e_second": 10162.443332965906,
+  "throughput_scope": "input tokens divided by whole cohort E2E incl output16; NOT prefill-only throughput",
+  "native_prefill": "six2048 chunks perDP,16DP,zero reported cache; pending phases verified, not synchronized device timestamps",
+  "remaining": [
+    "Full numerical accuracy/reference acceptance beyond20substring checks",
+    "Matched frozen reference cache sequence49152prefix/12288extend/C32submit/actualC16",
+    "Native logs or metadata proving occupancy cadence throughout measurement; currentdefault decode interval insufficient",
+    "Comparable Torch/JAX precision semantics before any ratio"
+  ],
+  "next_action": "No new hardware submitted. Plan one bounded native reference-workload experiment using existing routed_dp_rank, native per-iteration decode logs and preserved frozen data; first inspect cache capacity and matched sequence. Do not add observer/admission patch/dump.",
+  "goal": "active; automatic round cap reached, objective not marked complete",
+  "source_head": "2f0530b907"
+}
