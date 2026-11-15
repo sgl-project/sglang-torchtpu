@@ -437,5 +437,75 @@ class TestMuseSparkPDPP8Recipe(unittest.TestCase):
                 parser.parse_args(argv)
 
 
+class TestMuseSparkPP8ProductionRecipes(unittest.TestCase):
+    """The batched-RPA PP8 recipes keep the settings their measurements need."""
+
+    STANDALONE_RECIPE = "recipe/configs/muse_spark/server_pp8_batched_rpa.py"
+    PD_RECIPE = "recipe/configs/muse_spark/pd_singlehost_pp8_64k_dflash.py"
+
+    @staticmethod
+    def _parse(plan):
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        argv = plan.command[plan.command.index("sglang.launch_server") + 1 :]
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parser.parse_args(argv)
+
+    def test_standalone_recipe_uses_batched_rpa_and_fp32_scales(self):
+        plan = plan_launch(load_recipe(self.STANDALONE_RECIPE), inherited={})
+        args = plan.config.server_args
+        self.assertEqual((args["pp_size"], args["tp_size"], args["ep_size"]), (8, 1, 1))
+        self.assertEqual(args["attention_backend"], "pallas_tpu_rpa_batched")
+        # Batched RPA refuses page_size < 256 at startup.
+        self.assertGreaterEqual(args["page_size"], 256)
+        self.assertEqual(plan.env["SGLANG_TPU_NVFP4_MOE_FP32_SCALES"], "1")
+        # max_running_requests // pp_size is the default micro-batch; keep it > 1.
+        self.assertGreater(args["max_running_requests"] // args["pp_size"], 1)
+        self.assertEqual(plan.env["SGLANG_PP_LAYER_PARTITION"], "7,8,8,8,8,8,8,7")
+        self._parse(plan)
+
+    def test_pd_recipe_matches_page_size_and_enables_decode_radix_cache(self):
+        group_topology = {
+            "SGLANG_LAUNCHER_HOSTNAMES": "prefill-0,decode-0",
+            "SGLANG_LAUNCHER_RANK": "0",
+            "SGLANG_HOST_IP": "10.0.0.1",
+        }
+        prefill_plan = plan_launch(
+            load_recipe(self.PD_RECIPE), inherited=group_topology
+        )
+        decode_plan = plan_launch(
+            load_recipe(f"{self.PD_RECIPE}:DECODE_CONFIG"),
+            inherited={"SGLANG_LAUNCHER_RANK": "0", "SGLANG_HOST_IP": "10.0.0.2"},
+        )
+        p_args = prefill_plan.config.server_args
+        d_args = decode_plan.config.server_args
+        self.assertEqual(p_args["disaggregation_mode"], "prefill")
+        self.assertEqual(d_args["disaggregation_mode"], "decode")
+        self.assertEqual(p_args["attention_backend"], "pallas_tpu_rpa_batched")
+        # Raiden refuses a page-size mismatch between prefill and decode pools.
+        self.assertEqual(p_args["page_size"], d_args["page_size"])
+        self.assertGreaterEqual(p_args["page_size"], 256)
+        # One DFlash2 draft KV head per TP8 decode rank cannot use fp8 packing.
+        self.assertEqual(p_args["kv_cache_dtype"], "bfloat16")
+        self.assertEqual(d_args["kv_cache_dtype"], "bfloat16")
+        self.assertEqual(prefill_plan.env["SGLANG_TPU_NVFP4_MOE_FP32_SCALES"], "1")
+        self.assertEqual(p_args["mem_fraction_static"], 0.94)
+        self.assertEqual(p_args["swa_full_tokens_ratio"], 0.25)
+        self.assertGreaterEqual(p_args["context_length"], 64 * 1024 + 8 * 1024)
+        self.assertEqual(p_args["context_length"], d_args["context_length"])
+        self.assertTrue(d_args["disaggregation_decode_enable_radix_cache"])
+        # Early parts fail with the decode radix cache on hybrid-SWA Muse.
+        for plan in (prefill_plan, decode_plan):
+            self.assertNotIn("SGLANG_RAIDEN_PIPELINE_EARLY_PARTS", plan.env)
+            self.assertNotIn("SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE", plan.env)
+        self.assertEqual(decode_plan.env["SGLANG_RAIDEN_PIPELINE_TRANSFER"], "1")
+        for label, plan in (("prefill", prefill_plan), ("decode", decode_plan)):
+            with self.subTest(role=label):
+                self._parse(plan)
+
+
 if __name__ == "__main__":
     unittest.main()
