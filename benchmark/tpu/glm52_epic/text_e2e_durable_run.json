@@ -1,16 +1,31 @@
 {
- "experiment":"exp-vist8hk13c",
- "job":"job-se7i0twtwi",
- "artifact":"art-p4ofx586zs",
- "source":"1844dd61d7",
- "status_at_submit":"PENDING",
- "anchor":"exp-j857cxgdiv",
- "dump":false,
- "physical_chips":8,
- "hosts":2,
- "framework_devices":16,
- "change":"same text inputs/assertions and compile config; preserve client exception+rawresponses in durablelogs/artifact evenon failure",
- "local_verification":"real localhostHTTP and separateclientprocess;20wrongresponses rejected,result+error+allrawresponses retained",
- "scope":"realtext/native DP routing sanity; no accuracy certification or matchedC16performance",
- "wait_job":"bash-61a61e0a267444fd"
+  "experiment": "exp-vist8hk13c",
+  "job": "job-se7i0twtwi",
+  "artifact": "art-p4ofx586zs",
+  "source": "1844dd61d7",
+  "status_at_submit": "PENDING",
+  "anchor": "exp-j857cxgdiv",
+  "dump": false,
+  "physical_chips": 8,
+  "hosts": 2,
+  "framework_devices": 16,
+  "change": "same text inputs/assertions and compile config; preserve client exception+rawresponses in durablelogs/artifact evenon failure",
+  "local_verification": "real localhostHTTP and separateclientprocess;20wrongresponses rejected,result+error+allrawresponses retained",
+  "scope": "realtext/native DP routing sanity; no accuracy certification or matchedC16performance",
+  "wait_job": "bash-61a61e0a267444fd",
+  "last_verified": {
+    "status": "RUNNING_DECODE_4_OF_6",
+    "extend_seconds": 489.9,
+    "completed_decode_seconds": {
+      "1": 177.0,
+      "2": 177.8,
+      "4": 184.4,
+      "8": 181.9
+    },
+    "remaining_buckets": [
+      16,
+      32
+    ],
+    "scope": "physicalrank0 native log; no textclientresult yet"
+  }
 }
