@@ -1,0 +1,15 @@
+{
+  "scope":"Source-level capacity semantics, not measured admission or HBM allocation success",
+  "reference":{"attention_dp":16,"submitted_requests":32,"active_prefill_requests":16,"prefix_tokens_per_request":49152,"extend_total_per_request":12288,"output_tokens":16},
+  "replay":{"max_total_tokens_user_cap":147456,"max_running_requests_global":32,"page_size":64,"context_length":135168},
+  "source_evidence":[
+    "python/sglang/srt/mem_cache/kv_cache_configurator.py397-407 describes max_total_num_tokens as per-rank rows, logical scaling only by attention DCP (disabled here)",
+    "kv_cache_configurator.py2675-2702 applies max_total_tokens directly to local profiled token capacity, no attention-DP division",
+    "kv_cache_configurator.py2704-2714 divides global max_running_requests32 by attention_dp16, yielding2 requests per worker",
+    "kv_cache_configurator.py2523-2526 creates per-worker paged allocator with finalized local sizes; attention DCP multiplier1"
+  ],
+  "two_requests_per_worker_conservative_page_rounded_tokens":123008,
+  "calculation":"2*ceil((49152+12288+16)/64)*64 =123008 <147456 local cap. User cap is upper bound, not guarantee: actual profiled allocation may be smaller.",
+  "next_gate":"Read actual per-rank allocated pool/max_total_num_tokens after load; observe admission/no-retraction at reference cadence and completion. Do not divide147456 by16 or compare global32-request resident tokens against single rank cap.",
+  "live_observation_issue":"https://github.com/primatrix/Falcon/issues/1527: numeric pod0/pod1 live cloud_logging responses identical rank1. Exact pod-name argument is rejected (integer only). Validate embedded host identity before rank correlation."
+}
