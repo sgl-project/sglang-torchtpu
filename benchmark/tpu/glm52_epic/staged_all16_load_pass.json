@@ -1,0 +1,156 @@
+{
+  "experiment": "exp-24def76f9j",
+  "stage": "ALL16_LOAD_COMPLETE; POSTLOAD_BARRIER_PASSED; EXTEND_COMPILING",
+  "load_elapsed_min_s": 46.09,
+  "load_elapsed_max_s": 56.82,
+  "load_completion_skew_approx_s": 11,
+  "rank_loads": [
+    {
+      "falcon_rank": 0,
+      "dp": 12,
+      "tp": 12,
+      "ep": 12,
+      "elapsed_s": 50.57,
+      "log": "[2026-11-15 12:08:52 DP12 TP12 EP12] Load weight end. elapsed=50.57 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 0,
+      "dp": 11,
+      "tp": 11,
+      "ep": 11,
+      "elapsed_s": 51.62,
+      "log": "[2026-11-15 12:08:53 DP11 TP11 EP11] Load weight end. elapsed=51.62 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 0,
+      "dp": 14,
+      "tp": 14,
+      "ep": 14,
+      "elapsed_s": 52.21,
+      "log": "[2026-11-15 12:08:54 DP14 TP14 EP14] Load weight end. elapsed=52.21 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 0,
+      "dp": 10,
+      "tp": 10,
+      "ep": 10,
+      "elapsed_s": 52.35,
+      "log": "[2026-11-15 12:08:54 DP10 TP10 EP10] Load weight end. elapsed=52.35 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 0,
+      "dp": 13,
+      "tp": 13,
+      "ep": 13,
+      "elapsed_s": 52.53,
+      "log": "[2026-11-15 12:08:54 DP13 TP13 EP13] Load weight end. elapsed=52.53 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 0,
+      "dp": 15,
+      "tp": 15,
+      "ep": 15,
+      "elapsed_s": 53.69,
+      "log": "[2026-11-15 12:08:55 DP15 TP15 EP15] Load weight end. elapsed=53.69 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 0,
+      "dp": 9,
+      "tp": 9,
+      "ep": 9,
+      "elapsed_s": 55.16,
+      "log": "[2026-11-15 12:08:57 DP9 TP9 EP9] Load weight end. elapsed=55.16 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 0,
+      "dp": 8,
+      "tp": 8,
+      "ep": 8,
+      "elapsed_s": 55.77,
+      "log": "[2026-11-15 12:08:57 DP8 TP8 EP8] Load weight end. elapsed=55.77 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 1,
+      "dp": 1,
+      "tp": 1,
+      "ep": 1,
+      "elapsed_s": 46.09,
+      "log": "[2026-11-15 12:08:48 DP1 TP1 EP1] Load weight end. elapsed=46.09 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 1,
+      "dp": 0,
+      "tp": 0,
+      "ep": 0,
+      "elapsed_s": 46.91,
+      "log": "[2026-11-15 12:08:48 DP0 TP0 EP0] Load weight end. elapsed=46.91 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 1,
+      "dp": 2,
+      "tp": 2,
+      "ep": 2,
+      "elapsed_s": 50.38,
+      "log": "[2026-11-15 12:08:52 DP2 TP2 EP2] Load weight end. elapsed=50.38 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 1,
+      "dp": 3,
+      "tp": 3,
+      "ep": 3,
+      "elapsed_s": 53.56,
+      "log": "[2026-11-15 12:08:55 DP3 TP3 EP3] Load weight end. elapsed=53.56 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 1,
+      "dp": 4,
+      "tp": 4,
+      "ep": 4,
+      "elapsed_s": 53.68,
+      "log": "[2026-11-15 12:08:55 DP4 TP4 EP4] Load weight end. elapsed=53.68 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 1,
+      "dp": 6,
+      "tp": 6,
+      "ep": 6,
+      "elapsed_s": 56.16,
+      "log": "[2026-11-15 12:08:58 DP6 TP6 EP6] Load weight end. elapsed=56.16 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 1,
+      "dp": 7,
+      "tp": 7,
+      "ep": 7,
+      "elapsed_s": 56.23,
+      "log": "[2026-11-15 12:08:58 DP7 TP7 EP7] Load weight end. elapsed=56.23 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    },
+    {
+      "falcon_rank": 1,
+      "dp": 5,
+      "tp": 5,
+      "ep": 5,
+      "elapsed_s": 56.82,
+      "log": "[2026-11-15 12:08:58 DP5 TP5 EP5] Load weight end. elapsed=56.82 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB."
+    }
+  ],
+  "compile_policy_all16": [
+    "[2026-11-15 12:09:06 DP12 TP12 EP12] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP11 TP11 EP11] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP13 TP13 EP13] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP14 TP14 EP14] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP10 TP10 EP10] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP15 TP15 EP15] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP9 TP9 EP9] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP8 TP8 EP8] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP4 TP4 EP4] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP2 TP2 EP2] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP3 TP3 EP3] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP1 TP1 EP1] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP5 TP5 EP5] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP6 TP6 EP6] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP7 TP7 EP7] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)",
+    "[2026-11-15 12:09:06 DP0 TP0 EP0] [TPU] [decoder compile policy] EXTEND/MIXED: 1 graph variants (mode_caps=[('EXTEND', 32)], token_buckets=[2048], context_parallel_cases=0)"
+  ],
+  "limits": "No firstEXTEND completion or DECODE observed yet; no performance/modelaccuracy conclusion. Staged source25d226dafd. No480sbarrier increase."
+}
