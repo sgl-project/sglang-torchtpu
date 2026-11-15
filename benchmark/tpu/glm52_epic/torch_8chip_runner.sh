@@ -293,6 +293,7 @@ try:
         # Disable implicit /dev/shm tier2; all cache writes stay under /tmp.
         ENABLE_COMPILE_CACHE='0', TORCH_TPU_TIER2_COMPILATION_CACHE='disabled',
         TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT='/tmp/tpu_logs/torch-cache',
+        TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT='/tmp/tpu_logs/torch-cache',
         PYTHONDONTWRITEBYTECODE='1', PYTHONUNBUFFERED='1')
     for name in ('HOME', 'TMPDIR', 'XDG_CACHE_HOME', 'PIP_CACHE_DIR', 'UV_CACHE_DIR',
                  'JAX_COMPILATION_CACHE_DIR'):

@@ -42,4 +42,20 @@ def install(directory):
         libtpu_init_args_at_setup=os.environ.get('LIBTPU_INIT_ARGS'),
         scope='preimport setup only; final env_override/dependency/rank map still required')
     (pidroot/'capture-setup.json').write_text(json.dumps(record,indent=2)+'\n')
+    # sys.setprofile observes the original override returning without replacing
+    # production functions/import loaders. Remove immediately after one return.
+    # Do not overwrite an existing profiler (would contaminate diagnostics).
+    if sys.getprofile() is not None:
+        raise RuntimeError('existing Python profiler conflicts with effective-env capture')
+    def final_environment(frame, event, arg):
+        if (event == 'return' and frame.f_code.co_name == 'apply_tpu_env_overrides'
+                and frame.f_globals.get('__name__') == 'sglang_tpu.env_override'):
+            sys.setprofile(None)
+            selected={k:v for k,v in os.environ.items() if k in (
+                'XLA_FLAGS','LIBTPU_INIT_ARGS','SOURCE_COMMIT','FALCON_RANK')
+                or 'COMPILATION_CACHE' in k}
+            (pidroot/'effective-compiler-env.json').write_text(json.dumps(dict(
+                pid=os.getpid(),wall_ns=time.time_ns(),env=selected,
+                scope='after base env_override; later shape-dependent overrides may append'),indent=2)+'\n')
+    sys.setprofile(final_environment)
     return pidroot
