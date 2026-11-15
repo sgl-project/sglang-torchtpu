@@ -1,0 +1,16 @@
+{
+  "experiment": "exp-88cbehgzz1",
+  "observed_rank": 1,
+  "stage": "checkpoint loading, not compilation",
+  "membership": "0::/",
+  "mount": "cgroup2 namespace root at /sys/fs/cgroup, read-only; host ancestors not exposed by parent /sys/fs",
+  "memory_max": "max",
+  "memory_high": "max",
+  "memory_current_bytes": 353972596736,
+  "memory_peak_bytes": 353972727808,
+  "local_oom_and_oomkill": 0,
+  "host_memtotal_kib": 990725052,
+  "host_memavailable_kib": 898693856,
+  "interpretation": "Visible cgroup has no configured hard/high limit; cannot inspect invisible ancestors from this namespace. Current loading snapshot shows substantial host available memory. Neither this snapshot nor zero local counters establishes historical exit137 cause or future compile safety.",
+  "inspection_caveat": "Falcon exec all-rank output returned only rank1; explicit rank0 command returned no stdout despite exit0. Do not infer rank0 state from rank1."
+}
