@@ -2068,15 +2068,24 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         The chunk's K/V are all-gathered over the group and, for an fp8 pool,
         quantized after the gather, as in gather mode. The fused kernel attends
         the striped cached prefix around the ring and then the gathered chunk;
-        it only reads the pool. The new pages this rank owns are then written
-        from the gathered rows by the local in-place writer (the kernel reads
-        cached positions only, so the order does not change its result; the
-        write comes last so the collective never takes a just-mutated pool).
+        it only reads the pool. The new pages this rank owns are written from
+        the gathered rows by the local in-place writer *before* the kernel:
+        the kernel reads cached positions only, so the order does not change
+        its result, and writing after a read of the same buffer made XLA copy
+        the whole per-layer pool ahead of the in-place write (one pool-sized
+        HBM copy per layer, growing with --max-total-tokens).
         """
         md = self.forward_metadata
         ring = md.cp_ring
         k_all, v_all = all_gather_kv(
             k=k, v=v, group=get_parallel().attn_cp_group, quantize=quantize_kv
+        )
+        write_gathered_kv(
+            kv_cache=kv_cache,
+            k_all=k_all,
+            v_all=v_all,
+            write_segments=md.cp_write_segments,
+            write_num_segments=md.cp_write_num_segments,
         )
         out = self._pcp_ring_op(
             q,
@@ -2098,13 +2107,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             sm_scale,
             k_scale,
             v_scale,
-        )
-        write_gathered_kv(
-            kv_cache=kv_cache,
-            k_all=k_all,
-            v_all=v_all,
-            write_segments=md.cp_write_segments,
-            write_num_segments=md.cp_write_num_segments,
         )
         return out
 

@@ -937,7 +937,7 @@ class TestRingStripeGroup(CustomTestCase):
 class TestRingForward(CustomTestCase):
     """One layer of a ring extend: gather, read-only ring op, owned-page write."""
 
-    def test_gathers_quantizes_calls_the_op_and_writes_after_it(self):
+    def test_gathers_quantizes_writes_then_calls_the_op(self):
         events = []
         tokens, heads, dim = 4, 2, 8
         k = torch.arange(tokens * heads * dim, dtype=torch.float32).reshape(
@@ -1020,9 +1020,10 @@ class TestRingForward(CustomTestCase):
         # Twelve metadata tensors in the op's order, then the static scales.
         self.assertEqual([int(t) for t in args[4:16]], list(range(12)))
         self.assertEqual(args[16:], (0.25, 0.5, 2.0))
-        # The op saw the pool before the write and did not change it ...
-        self.assertFalse(snapshots["pool_at_call"].any())
-        # ... and the owned rows were written afterwards, K and V interleaved.
+        # The owned rows were written before the op (so XLA updates the pool in
+        # place instead of copying it after the op's read), K and V
+        # interleaved, and the op did not change the pool.
+        self.assertTrue(torch.equal(snapshots["pool_at_call"], kv_cache))
         flat = kv_cache.flatten(0, 1)
         for row, source in ((9, 5), (10, 6)):
             self.assertTrue(torch.equal(flat[row, 0::2, 0], k_all[source]))
