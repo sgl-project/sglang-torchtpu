@@ -389,6 +389,11 @@ def register() -> None:
     )
 
     register_muse_spark_processor()
+    # Before the launcher parses --attention-backend; the backend itself is
+    # registered with the worker's init_backend.
+    from sglang.srt.server_args import add_attention_backend_choices
+
+    add_attention_backend_choices(["flywheel"])
     register_tpu_dsv4_resolution_hooks()
     register_unified_hicache_strategy()
 

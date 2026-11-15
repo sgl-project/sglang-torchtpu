@@ -105,6 +105,10 @@ runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 # test_ray_bundle_order.py's importorskip("ray") silently skips forever).
 ray = ["ray[default]>=2.54.0"]
 
+# Kernels for --attention-backend flywheel; pulled into dev_tpu so the TPU
+# test image runs its unit and e2e tests.
+flywheel = ["flywheel-tpu==0.4.1"]
+
 tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
@@ -153,6 +157,7 @@ dev_tpu = [
   "sglang[test]",
   "sglang[ray]",
   "sglang[runai]",
+  "sglang[flywheel]",
 ]
 
 [project.urls]

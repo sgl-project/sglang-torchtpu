@@ -38,8 +38,16 @@ logger = logging.getLogger(__name__)
 TPU_KERNEL_CORE_FILES = ("layers/moe/tpu_moe_utils.py",)
 
 # Packages that trace, lower or compile the kernels. torch's own build is
-# already part of the AOTAutograd key.
-_TPU_STACK_DISTRIBUTIONS = ("jax", "jaxlib", "libtpu", "libtpu-nightly", "torch_tpu")
+# already part of the AOTAutograd key. flywheel-tpu holds the kernels of
+# --attention-backend flywheel, outside the hashed sources.
+_TPU_STACK_DISTRIBUTIONS = (
+    "jax",
+    "jaxlib",
+    "libtpu",
+    "libtpu-nightly",
+    "torch_tpu",
+    "flywheel-tpu",
+)
 
 # Flags torch_tpu, libtpu and XLA read when building executables: the set
 # vllm-torchtpu hashes, plus the torch_tpu lowering switches in
