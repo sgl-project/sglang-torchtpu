@@ -1,0 +1,15 @@
+{
+ "experiment":"exp-s04p89hobu",
+ "job":"job-922twj5akh",
+ "artifact":"art-geezjbhz0p",
+ "source":"a2f1f27cfb81d7ebba2be92aad91864bff3c1bbb",
+ "status_at_submit":"PENDING",
+ "anchor":"exp-24def76f9j",
+ "bootstrap":"unchanged exact successful anchor bootstrap; same dependency pins and verified wheel",
+ "topology":"8physical v7xchips,2hosts,16frameworkdevices TP16 attentionDP16 EP16; noDCP",
+ "diagnostic":"staged nonmmap1reader+physicalhost expertunion; recurrent smallpage128ctx4096cache8192 eager mode; natural pre-ready warmup only; NOT exactoriginal largecache or performance",
+ "capture":"perprocess HLOtext+proto no modulefilter; postbase env record; artifactpersist;4GiB12500files perhost80%abort",
+ "LLO":"not enabled: binaryflags present but parser/emission not proven",
+ "acceptance":"If fatal captures originatingproducerIR correlate PID/rank and exact module. If nofatal report changedshape NONREPRO notfixed. If budget/setup fails distinguish diagnosticfailure from nativefailure. No ratio.",
+ "wait_job":"bash-82ce916e7e204864"
+}
