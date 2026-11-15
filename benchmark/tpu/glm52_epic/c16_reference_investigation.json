@@ -1,0 +1,20 @@
+{
+  "status": "USER_TARGET_ACKNOWLEDGED_HISTORICAL_MATCH_NOT_YET_VERIFIED",
+  "requested_target": {"attention_dp":16,"expert_parallel":16,"concurrency":16,"local_chunk_tokens":2048,"global_step_extend_tokens":32768},
+  "important_distinction": "16*2048 defines global tokens per step if all16 DP ranks each process2048. This alone does not define per-request total extend length.",
+  "historical_c16_candidates": {
+    "exp-xhd39u3q1s": "failed; original log reports max_running_requests16 below fused-MoE minimum2*EP32, server died before ready",
+    "exp-bade0kztm7": "aborted",
+    "exp-fruweqz1r8": "evicted",
+    "configuration": {"physical_chips":8,"jax_devices":16,"tp":16,"dp":16,"ep":16,"concurrency":16,"requests_per_dp":1,"local_chunk_tokens":2048,"max_prefill_tokens":32768,"prefix_tokens":48000,"per_request_extend_tokens":12288,"output_tokens":16,"source_commit":"6758d4f4faf9484c0ff87765a4213e65a4c05104"},
+    "interpretation": "Exact C16 configuration evidence, NOT successful performance evidence and not established as latest. Do not set serving capacity16 merely because client concurrency16."
+  },
+  "old_successful_reference": {"experiment":"exp-266i34jcm1","source_commit":"3695225808f0293cae422ea7adf55eddacadd43d","concurrency":32,"prefix_tokens":49152,"per_request_extend_tokens":12288,"local_chunk_tokens":2048,"interpretation":"Verified old successful reference, not the newly requested target."},
+  "failure_discriminators": {
+    "exit137": "Original exp-hhidk7adq2 pod1 logs: EXTEND2048 bs32 completed487.7s, then DECODE0/6 and launcher137. Prioritize first DECODE compile with historical page64/context135168/cache147456, not another prefill-only ladder. Do not assume six concurrent bucket compiles.",
+    "eager_fatal": "Original exp-30eq5xauez and exp-2h7w8l2bga show zero global warmup calls; page128 retry still fatal. Event/broadcast/host allocation stacks are synchronization boundaries, not originating IR.",
+    "fixed_distinct_failure": "exp-9320106a77 actual qblock VMEM92.94M/63.94M was addressed by query tile shrink and accepted smoke. This does not explain historical page64 exit137."
+  },
+  "next_action": "Verify latest C16 serving task or configure explicit C16 workload independently of capacity; prepare first-decode historical-shape diagnostic with native IR and compiler process evidence. No model launch until runtime/topology and bounded runner validated.",
+  "guardrails": ["no16chip","noDCP","noFlashchanges","no matched ratio until exact workload and precision proven"]
+}
