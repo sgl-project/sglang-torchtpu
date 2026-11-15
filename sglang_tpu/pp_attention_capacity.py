@@ -260,4 +260,5 @@ def check_cp_ring_schedule(runner, backend, host):
             new_kv_pages_per_row=ring.gathered_pages,
             num_cache_rows_live=ring.cache_num_rows,
             num_new_rows_live=ring.new_num_rows,
+            cache_lens_cp_page_aligned=True,
         )

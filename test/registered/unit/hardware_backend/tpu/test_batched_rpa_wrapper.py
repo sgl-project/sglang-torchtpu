@@ -228,6 +228,67 @@ class TestBlockSizeSearch(CustomTestCase):
                 self.assertEqual(cache_bq(16, 2, 4, total_q), (512, 1024), total_q)
                 self.assertEqual(cache_bq(32, 4, 8, total_q), (384, 1024), total_q)
 
+    def test_whole_stripe_cache_lens_drop_the_new_token_start_mask(self):
+        """With cached lengths in whole stripes (page_size * cp) the new-token
+        phase's KV blocks never hold a cached key, so its start mask is skipped;
+        the host check refuses a batch that breaks the promise."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import wrapper
+
+        common = dict(
+            num_q_heads=16,
+            num_kv_heads=2,
+            head_dim=128,
+            page_size=256,
+            cp_group_size=4,
+            total_q_tokens=1024,
+        )
+        with mock.patch(
+            "jax.experimental.pallas.tpu.get_tpu_info",
+            return_value=_mock_tpu_info(7, "v7x"),
+        ):
+            for aligned in (False, True):
+                fused = wrapper.pcp_fused_configs(
+                    **common,
+                    dtype_q=jnp.bfloat16,
+                    dtype_kv=jnp.float8_e4m3fn,
+                    num_cache_rows=1,
+                    cache_pages_per_row=8,
+                    num_new_rows=2,
+                    new_pages_per_row=8,
+                    vmem_limit_bytes=64 << 20,
+                    cache_lens_cp_page_aligned=aligned,
+                )
+                self.assertEqual(
+                    fused.cfgs_new.serve.cached_lens_block_aligned, aligned
+                )
+                self.assertFalse(fused.cfgs_cache.serve.cached_lens_block_aligned)
+            # One request, 1024 cached + 1024 new tokens (C = 128 per block).
+            batch = dict(
+                **common,
+                dtype_q="bfloat16",
+                dtype_kv="float8_e4m3fn",
+                total_kv_tokens=4 * 1024,
+                cache_cu_q_lens=[0, 256],
+                cache_kv_lens=[1024 + 256],
+                cache_pages_per_row=8,
+                new_cu_q_lens=[0, 128, 256],
+                new_kv_lens=[2048, 2048],
+                kv_cache_lens=[1024, 1024],
+                q_positions=[1024, 1024 + 7 * 128],
+                new_pages_per_row=8,
+                new_kv_pages_per_row=16,
+                num_cache_rows_live=1,
+                num_new_rows_live=2,
+                vmem_limit_bytes=64 << 20,
+                cache_lens_cp_page_aligned=True,
+            )
+            wrapper.check_pcp_fused_schedule(**batch)
+            batch.update(kv_cache_lens=[768, 768], q_positions=[768, 768 + 896])
+            with self.assertRaisesRegex(ValueError, "whole stripes of 1024"):
+                wrapper.check_pcp_fused_schedule(**batch)
+
     def test_pcp_fused_configs_and_schedule_check_on_qwen3_serving_shape(self):
         """`pcp_fused_configs` and `check_pcp_fused_schedule` agree on Qwen3-30B-A3B
         PCP=8 (32 q heads, 4 KV heads, hd 128, fp8 KV, page 256) and reject a

@@ -188,6 +188,7 @@ def _log_block_sizes_once(
             ring_mesh_axis_names=mesh_axes,
             k_scale=k_scale,
             v_scale=v_scale,
+            cache_lens_cp_page_aligned=True,
         )
         c, n = fused.cfgs_cache.block, fused.cfgs_new.block
         logger.info(
@@ -284,6 +285,10 @@ def _invoke_pcp_kernel(
         v_scale=v_scale,
         kv_layout=kv_layout(),
         update_kv_cache=False,
+        # Ring-mode cached prefixes are whole stripes: the allocator page and
+        # the prefill chunk boundaries are page_size * cp tokens (checked on
+        # the host by `pp_attention_capacity.check_cp_ring_schedule`).
+        cache_lens_cp_page_aligned=True,
     )
 
 

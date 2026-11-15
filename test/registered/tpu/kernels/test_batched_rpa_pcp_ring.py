@@ -387,6 +387,7 @@ class _PcpRingHarness:
         update_kv_cache: bool = False,
         token_major_q: bool = False,
         t_local: int | None = None,
+        cache_lens_cp_page_aligned: bool = False,
     ) -> None:
         import jax
         import jax.numpy as jnp
@@ -432,6 +433,7 @@ class _PcpRingHarness:
             if update_kv_cache
             else None,
             update_kv_cache=update_kv_cache,
+            cache_lens_cp_page_aligned=cache_lens_cp_page_aligned,
         )
 
         new_q = [
@@ -528,6 +530,7 @@ class _PcpRingHarness:
                 v_scale=self.v_scale,
                 token_major_q=token_major_q,
                 update_kv_cache=update_kv_cache,
+                cache_lens_cp_page_aligned=cache_lens_cp_page_aligned,
             )
             if update_kv_cache:
                 o, c = res
@@ -801,6 +804,34 @@ class TestBatchedRpaPcpRing(CustomTestCase):
             seed=55,
         )
         h.run_chunk(self, "pcp4x2 chunk0", [2048])
+
+    @unittest.skipIf(_tpu_device_count() < 8, "Requires >= 8 TPU devices")
+    def test_pcp4_x_tp2_whole_stripe_prefix_skips_start_mask(self):
+        """Cached prefixes in whole stripes (page x cp = 1024 tokens), as SGLang's
+        ring mode guarantees: the new-token phase drops its start mask and must
+        give the same attention, first chunk and cached-prefix chunk alike."""
+        import jax.numpy as jnp
+
+        h = _PcpRingHarness(
+            4,
+            mesh_shape=(4, 2),
+            nq=16,
+            nkv=2,
+            hd=128,
+            kv_dtype=jnp.float8_e4m3fn,
+            k_scale=0.5,
+            v_scale=0.5,
+            n_req=2,
+            pages_per_req=8,
+            start_lens=[0, 2048],
+            seed=77,
+        )
+        h.run_chunk(
+            self, "aligned chunk0", [2048, 1024], cache_lens_cp_page_aligned=True
+        )
+        h.run_chunk(
+            self, "aligned chunk1", [1024, 2048], cache_lens_cp_page_aligned=True
+        )
 
     @unittest.skipIf(_tpu_device_count() < 8, "Requires >= 8 TPU devices")
     def test_pcp8_128k_long_context(self):

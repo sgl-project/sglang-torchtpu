@@ -128,6 +128,8 @@ class TestPcpRingKernelCall(CustomTestCase):
                 kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
                 # The pool is read-only: the caller writes the owned pages.
                 update_kv_cache=False,
+                # Cached prefixes are whole stripes in ring mode.
+                cache_lens_cp_page_aligned=True,
             ),
         )
 

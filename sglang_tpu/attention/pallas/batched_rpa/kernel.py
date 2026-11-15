@@ -551,7 +551,10 @@ def generate_mask(
                 )
                 mask_b = jnp.logical_and(mask_b, q_kv_diff_global < window_offset)
 
-        if step_meta.local_k_start is not None:
+        if (
+            step_meta.local_k_start is not None
+            and not cfgs.serve.cached_lens_block_aligned
+        ):
             mask_b = jnp.logical_and(mask_b, kv_iota >= step_meta.local_k_start[b_idx])
 
         masks.append(mask_b)

@@ -263,6 +263,13 @@ class ServingConfigs:
     # `new_kv_page_indices`) instead of contiguously at the query offsets, so
     # there may be more new K/V tokens than queries.
     paged_new_kv: bool = False
+    # SGLang: NEW_TOKENS_ONLY with every sequence's cached length a multiple of
+    # bkv_sz. The first KV block of a sequence then starts at its first new
+    # token, no block holds a cached key, and the `kv_iota >= local_k_start`
+    # mask (a full-tile compare + and per step) is skipped. The fused PCP
+    # wrapper sets it when the caller guarantees cached lengths in whole
+    # stripes (`cache_lens_cp_page_aligned`).
+    cached_lens_block_aligned: bool = False
     # Keep q / out token-major in HBM ([T, kv_heads, ...]) and let the kernel's
     # per-step DMAs gather one kv head at a time, instead of transposing to
     # kv-head-major ([kv_heads, T, ...]) around the kernel. With a single kv

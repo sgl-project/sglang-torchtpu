@@ -1959,6 +1959,7 @@ def pcp_fused_configs(
     new_prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
     collective_id: int = 3,
+    cache_lens_cp_page_aligned: bool = False,
 ) -> PcpFusedConfigs:
     """Resolves the schedulers, block sizes and configs of a fused PCP kernel.
 
@@ -1971,6 +1972,13 @@ def pcp_fused_configs(
     new-token phase shares the Q block and the (larger) KV window, so it keeps
     bq and uses the smaller of its own (`CPBlockSizeCalculator`) and the
     ring's bkv.
+
+    `cache_lens_cp_page_aligned` (SGLang): the caller guarantees that every
+    row's cached length (`kv_cache_lens`) is a multiple of page_size * cp,
+    i.e. whole stripes, as SGLang's ring mode does (its allocator page and
+    prefill chunk boundaries are page_size * cp tokens). The new-token phase
+    then skips the mask of cached keys (see
+    `ServingConfigs.cached_lens_block_aligned`).
     """
     if kv_layout != configs.KVLayout.HEAD_ALONG_SUBLANE:
         raise NotImplementedError(
@@ -2054,6 +2062,14 @@ def pcp_fused_configs(
             bkv_sz=bkv_new,
             batch_size=1,
         )
+
+    if (
+        cache_lens_cp_page_aligned
+        and (page_size * cp_group_size) % new_blocks.bkv_sz == 0
+    ):
+        # Cached lengths are whole stripes (multiples of page_size * cp), so
+        # also multiples of the new-token phase's bkv_sz: skip its start mask.
+        serve_new = dataclasses.replace(serve_new, cached_lens_block_aligned=True)
 
     def _cfgs(blocks, serve_cfgs):
         return configs.RpaConfigs(
@@ -2199,6 +2215,7 @@ def check_pcp_fused_schedule(
     cache_prefill_block_sizes: configs.BlockSizes | None = None,
     new_prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
+    cache_lens_cp_page_aligned: bool = False,
 ) -> None:
     """Raises ValueError if a batch does not fit the fused PCP kernel.
 
@@ -2234,6 +2251,18 @@ def check_pcp_fused_schedule(
                 f"Fused PCP {name}-phase rows cover {int(cu[int(live)])} query"
                 f" tokens, more than {total_q_tokens=}."
             )
+    if cache_lens_cp_page_aligned:
+        stripe = page_size * cp_group_size
+        bad = [
+            int(kv_cache_lens[row])
+            for row in range(int(num_new_rows_live))
+            if int(kv_cache_lens[row]) % stripe
+        ]
+        if bad:
+            raise ValueError(
+                "Fused PCP with cache_lens_cp_page_aligned needs cached lengths"
+                f" in whole stripes of {stripe} tokens, got {bad}."
+            )
     fused = pcp_fused_configs(
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -2252,6 +2281,7 @@ def check_pcp_fused_schedule(
         cache_prefill_block_sizes=cache_prefill_block_sizes,
         new_prefill_block_sizes=new_prefill_block_sizes,
         vmem_limit_bytes=vmem_limit_bytes,
+        cache_lens_cp_page_aligned=cache_lens_cp_page_aligned,
     )
     needed = pcp_fused_schedule_steps(
         fused,
@@ -2299,6 +2329,7 @@ def check_pcp_fused_schedule(
         "collective_id",
         "sliding_window",
         "soft_cap",
+        "cache_lens_cp_page_aligned",
     ),
 )
 def ragged_paged_attention_pcp_fused(
@@ -2341,6 +2372,7 @@ def ragged_paged_attention_pcp_fused(
     attention_sink: jax.Array | None = None,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
+    cache_lens_cp_page_aligned: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """PCP prefill in one kernel: ring cache phase + new-token phase.
 
@@ -2419,6 +2451,9 @@ def ragged_paged_attention_pcp_fused(
       collective_id: Pallas collective id of the kernel (barrier semaphore);
         unique among the kernels of the process that synchronize devices.
       attention_sink, sliding_window, soft_cap: Not supported; must be None.
+      cache_lens_cp_page_aligned: SGLang. The caller guarantees every
+        `kv_cache_lens` entry is a multiple of page_size * cp_group_size; see
+        `pcp_fused_configs`.
 
     Returns:
       `out` [T_q, num_q_heads, head_dim], or `(out, kv_cache)` with
@@ -2479,6 +2514,7 @@ def ragged_paged_attention_pcp_fused(
         new_prefill_block_sizes=new_prefill_block_sizes,
         vmem_limit_bytes=vmem_limit_bytes,
         collective_id=collective_id,
+        cache_lens_cp_page_aligned=cache_lens_cp_page_aligned,
     )
     cfgs_cache, cfgs_new = fused.cfgs_cache, fused.cfgs_new
 
