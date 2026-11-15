@@ -646,7 +646,9 @@ finally:
             require(artifact.is_absolute(), 'absolute Falcon artifact mount required')
             archive = artifact / 'eager-ir' / allocation / f'host-{RANK}'
             require(not archive.exists(), 'IR artifact archive must be fresh')
-            shutil.copytree(ir_root, archive)
+            archive.mkdir(parents=True, exist_ok=False)
+            from benchmark.tpu.glm52_epic.archive_eager_ir import archive as archive_ir
+            result['ir_archive'] = archive_ir(ir_root, archive / 'compiler-ir.tar')
             if (OUT / 'ir-inventory.json').exists():
                 shutil.copy2(OUT / 'ir-inventory.json', archive / 'ir-inventory.json')
             result['ir_archive_relative'] = str(archive.relative_to(artifact))
