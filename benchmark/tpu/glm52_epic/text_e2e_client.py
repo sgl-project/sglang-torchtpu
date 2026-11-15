@@ -33,8 +33,10 @@ def run(base_url, output):
         for record in records:
             meta=record['meta_info'];assert meta['completion_tokens']>0 and meta['prompt_tokens']>0
             assert meta.get('finish_reason',{}).get('type')!='abort'
+            if rank is not None:
+                assert meta.get('dp_rank') == rank, f"routing receipt mismatch: requested {rank}, got {meta.get('dp_rank')}"
             assert isinstance(record.get('text'),str)
-            checks.append(dict(case=name,routed_dp_rank=rank,rid=payload['rid'],text=record['text'],expected=expected,matched=expected in record['text'].casefold(),
+            checks.append(dict(case=name,routed_dp_rank=rank,returned_dp_rank=meta.get('dp_rank'),rid=payload['rid'],text=record['text'],expected=expected,matched=expected in record['text'].casefold(),
                                prompt_tokens=meta['prompt_tokens'],completion_tokens=meta['completion_tokens']))
     for case in spec['cases']:execute(case['id'],case['text'],case['expected_substring_casefold'])
     batch=spec['parallel_batch']
