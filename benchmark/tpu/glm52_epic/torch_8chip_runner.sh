@@ -632,6 +632,12 @@ finally:
             inventory = scan_ir(inventory=True, enforce=False)
             save('ir-inventory.json', inventory)  # Paths and sizes, never hash massive dumps.
             result['ir_artifacts'] = {k: v for k, v in inventory.items() if k != 'files'}
+            require(inventory['file_count'] < IR_STOP_FILES and
+                    inventory['size_bytes'] < IR_STOP_BYTES,
+                    'final IR artifact inventory reached 80% stop threshold')
+        except Exception as error:
+            result.update(status='FAILED', ir_inventory_error=f'{type(error).__name__}: {error}')
+        try:
             # A local inventory is not durable evidence after task shutdown.
             # Copy preserved producer artifacts to this Falcon artifact mount;
             # never delete/rotate earliest modules, even after budget failure.
@@ -641,13 +647,11 @@ finally:
             archive = artifact / 'eager-ir' / allocation / f'host-{RANK}'
             require(not archive.exists(), 'IR artifact archive must be fresh')
             shutil.copytree(ir_root, archive)
-            shutil.copy2(OUT / 'ir-inventory.json', archive / 'ir-inventory.json')
+            if (OUT / 'ir-inventory.json').exists():
+                shutil.copy2(OUT / 'ir-inventory.json', archive / 'ir-inventory.json')
             result['ir_archive_relative'] = str(archive.relative_to(artifact))
-            require(inventory['file_count'] < IR_STOP_FILES and
-                    inventory['size_bytes'] < IR_STOP_BYTES,
-                    'final IR artifact inventory reached 80% stop threshold')
         except Exception as error:
-            result.update(status='FAILED', ir_inventory_error=f'{type(error).__name__}: {error}')
+            result.update(status='FAILED', ir_archive_error=f'{type(error).__name__}: {error}')
     result['elapsed_seconds'] = round(time.monotonic() - START, 3)
     save('result.json', result)
     print(json.dumps(result, sort_keys=True), flush=True)
