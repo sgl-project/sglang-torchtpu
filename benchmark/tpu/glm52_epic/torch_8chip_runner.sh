@@ -543,6 +543,14 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
             except (OSError, urllib.error.URLError):
                 pass
             time.sleep(1)
+    if mode == 'eager-ir':
+        receipts = [json.loads(path.read_text()) for path in ir_root.rglob('scope.json')]
+        physical = result['host_preparation']['physical_rank']
+        require({r['tp_rank'] for r in receipts} == set(range(physical*8, physical*8+8))
+                and len(receipts) == 8, 'missing/duplicate actual scheduler scope receipts')
+        require(any(path.suffix in ('.txt', '.hlo', '.pb') for path in ir_root.rglob('*')
+                    if path.is_file()), 'scope entered but no compiler artifacts produced')
+        save('scope-receipts.json', receipts)
     if args.get('weight_loader_disable_mmap', False):
         native_text = (OUT / 'server.log').read_text(errors='replace')
         require('EP-local expert reads off (' not in native_text,

@@ -15,6 +15,29 @@ def main():
             raw=wheel.read(name);text=raw.decode()
             print('PINNED_COMPILER_OPTIONS_SOURCE '+json.dumps(dict(path=name,sha256=hashlib.sha256(raw).hexdigest(),source=text)),flush=True)
             assert 'custom_compiler_options' in text
+            # Execute ONLY exact packaged function with nativepush/pop boundary
+            # supplied. No torch_tpu import or claim about native implementation.
+            import ast
+            import contextlib
+            import types
+            tree=ast.parse(text)
+            function=next(node for node in tree.body if isinstance(node,ast.FunctionDef)
+                          and node.name=='custom_compiler_options')
+            function.decorator_list=[]
+            events=[]
+            namespace=dict(compiler=types.SimpleNamespace(
+                push_compiler_options=lambda options:events.append(('push',dict(options))),
+                pop_compiler_options=lambda:events.append(('pop',None))))
+            exec(compile(ast.Module(body=[function],type_ignores=[]),name,'exec'),namespace)
+            context=contextlib.contextmanager(namespace['custom_compiler_options'])
+            try:
+                with context({'xla_dump_hlo_as_text':'true'}):
+                    events.append(('materialize',None))
+                    raise RuntimeError('intentional')
+            except RuntimeError as error:
+                assert str(error)=='intentional'
+            assert [event[0] for event in events]==['push','materialize','pop']
+            print('PINNED_COMPILER_CONTEXT_FINALLY_CPU_PASS nativeboundaryfakeonly',flush=True)
     print('PINNED_COMPILER_OPTIONS_SOURCE_PASS; sourcecontract only no runtime/thread/materialization proof',flush=True)
 
 
