@@ -1,0 +1,14 @@
+{
+  "experiment": "exp-88cbehgzz1",
+  "artifact_id": "art-rggaq6w6l4",
+  "source_commit": "291f5f1a6a7567ed7af462e296f969e026ce6a5f",
+  "status_at_submission": "PENDING",
+  "physical_chips": 8,
+  "hosts": 2,
+  "visible_devices": 16,
+  "scope": "Current-source full-model historical-shape compile replay; not exact historical-source reproduction or performance",
+  "configuration": {"page_size":64,"context_length":135168,"max_total_tokens":147456,"global_chunk":32768,"local_chunk":2048,"max_running_requests":32,"compile_max_bs":32,"compile_decode_buckets":[1,2,4,8,16,32],"compile_tokens":[2048]},
+  "acceptance": "Both-host source/pin/topology validation; compile stages and health200; rank0 short request produces2 IDs covering runtime decode; inspect launcher before cleanup, do not misattribute cleanup SIGTERM/SIGKILL",
+  "failure_evidence": "0.5s passive process/cgroup/host sampling and native log tail to durable stdout; full native log replay on exit; missing short-lived children remains possible",
+  "next_discriminator": "Compare whether EXTEND completes then first DECODE stalls/kills as exp-hhidk7adq2. If successful, separate source/runtime changes before claiming historical cause. No JAX performance ratio."
+}
