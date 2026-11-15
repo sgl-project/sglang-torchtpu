@@ -545,6 +545,18 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
             print('GLM52_TEXT_E2E_RESULT ' + json.dumps(text_result), flush=True)
             require(text_result['status'] == 'TEXT_E2E_PASS', 'real text sanity failed')
             check_child()
+        if os.environ.get('GLM52_NATIVE_LONG_PERF') == '1':
+            require(mode == 'compiled-long-e2e', 'native long requires proven compiled config')
+            try:
+                run([sys.executable, '-m', 'benchmark.tpu.glm52_epic.native_long_client',
+                     '--base-url', 'http://127.0.0.1:30000', '--output', str(OUT / 'native-long')],
+                    'native-long-client.log', 3600)
+            finally:
+                for evidence in [OUT / 'native-long-client.log', *sorted((OUT / 'native-long').glob('*.json'))]:
+                    if evidence.is_file():
+                        print('GLM52_NATIVE_LONG_EVIDENCE ' + evidence.name + '\\n' + evidence.read_text(errors='replace'), flush=True)
+            result['native_long'] = json.loads((OUT / 'native-long/result.json').read_text())
+            check_child()
         # Opt-in only: prepared requests must reference frozen data + its manifest
         # available locally (e.g. supplemental exact JAX source /workspace/sglang-jax).
         # No observer is required/enabled here; no claim of matched JAX cadence.
