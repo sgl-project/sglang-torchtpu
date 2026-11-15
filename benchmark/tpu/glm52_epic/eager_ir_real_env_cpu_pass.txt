@@ -1,0 +1,2 @@
+EAGER_IR_REAL_ENV_CPU_PASS {"pid": 19, "wall_ns": 1794749355958997262, "env": {"FALCON_RANK": "0", "XLA_FLAGS": "--xla_dump_to=/tmp/tmpnpgpvvg9/host-0/pid-19/hlo --xla_dump_hlo_as_text --xla_dump_hlo_as_proto", "LIBTPU_INIT_ARGS": "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false"}, "scope": "after base env_override; later shape-dependent overrides may append"}
+CPU only; no backend initialized, no pinned compiler flag acceptance or fatal IR proof
