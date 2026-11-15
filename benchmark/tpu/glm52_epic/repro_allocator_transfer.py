@@ -4,11 +4,16 @@
 This covers the producer/transfer boundary seen in host request-table stacks,
 not allocator ownership/eviction or concurrent model/collective work.
 """
+import argparse
 import os
 import sys
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--preceding-metadata', action='store_true',
+                        help='Retain production-order metadata H2Ds before int32 allocator transfer, without intermediate synchronization.')
+    args = parser.parse_args()
     if 'jax' in sys.modules:
         raise RuntimeError('fresh process required')
     os.environ['JAX_PLATFORMS'] = 'cpu'
@@ -32,6 +37,20 @@ def main():
                 first_new_logical_page = (prefix + 127) // 128
                 oracle.append(pages[pos // 128 - first_new_logical_page] * 128 + pos % 128)
         for iteration in range(2):
+            retained_metadata = []
+            if args.preceding_metadata:
+                # Production ordering before allocation.write_cache_indices:
+                # schedule_batch seq_lens/orig_seq_lens, then allocation's
+                # prefix_lens/extend_lens/req_pool_indices. Do not fence here.
+                for name, value, dtype in (
+                    ('seq_lens', prefix + count, torch.int64),
+                    ('orig_seq_lens', prefix + count, torch.int32),
+                    ('prefix_lens', prefix, torch.int64),
+                    ('extend_lens', count, torch.int64),
+                    ('req_pool_indices', 0, torch.int64),
+                ):
+                    print(f'STAGE metadata_upload name={name} dtype={dtype}', flush=True)
+                    retained_metadata.append(torch.tensor([value], dtype=dtype).to('tpu', non_blocking=True))
             out = torch.empty(count, dtype=torch.int32)
             alloc_extend_vectorized_cpu(
                 torch.tensor([prefix], dtype=torch.int64),
@@ -44,6 +63,12 @@ def main():
             actual = device_out.cpu()
             torch.testing.assert_close(actual, out, rtol=0, atol=0)
             print(f'ALLOCATOR_TRANSFER_PASS prefix={prefix} count={count} iteration={iteration}', flush=True)
+            if args.preceding_metadata:
+                # Check only AFTER the original blocking output readback.
+                for tensor, value in zip(retained_metadata,
+                                         (prefix + count, prefix + count, prefix, count, 0)):
+                    torch.testing.assert_close(tensor.cpu(), torch.tensor([value], dtype=tensor.dtype), rtol=0, atol=0)
+                print(f'ALLOCATOR_METADATA_SEQUENCE_PASS prefix={prefix} count={count} iteration={iteration}', flush=True)
 
 
 if __name__ == '__main__':
