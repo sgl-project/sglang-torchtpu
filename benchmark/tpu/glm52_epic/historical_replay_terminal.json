@@ -1,0 +1,16 @@
+{
+ "experiment":"exp-88cbehgzz1",
+ "artifact":"art-rggaq6w6l4",
+ "job":"job-ftblmjjwwu",
+ "status":"FAILED",
+ "terminal_utc":"2026-11-15T09:06:25Z",
+ "outer_exit_code":1,
+ "observed_failure":"dist_barrier_after_load ValueError: loaded ranks waited beyond SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S; Gloo monitoredBarrier errors; scheduler initialization failed",
+ "host1_loaded":"DP0-7 Load weight end around08:58:03-06Z",
+ "host0_latest_snapshot":"09:03:06Z all8 scheduler processes present, anon46.29GiB file393.54GiB current441.59GiB localOOM0; no Load weight end in transferred native log",
+ "host1_scheduler_exit_report":-3,
+ "reached_extend_or_decode_compile":false,
+ "historical137_reproduced":false,
+ "lowering_fatal_reproduced":false,
+ "scope":"Run failed before target compile stage, not evidence compile passed or historical137 fixed. Determine host0 load delay/failure and actual configured barrier timeout before retry. Avoid blind full-model resubmit."
+}
