@@ -16,7 +16,8 @@ passes. Traces go to SGLANG_TORCH_PROFILER_DIR.
   directories group together.
 
 ``install()`` wraps three SchedulerProfilerManager methods. Each behaves exactly
-like upstream unless the manager was armed here.
+like upstream unless the manager was armed here, except that a batch never opens
+or stops the other stage's capture.
 """
 
 from __future__ import annotations
@@ -64,6 +65,23 @@ def _stage_name(forward_mode: ForwardMode) -> Optional[str]:
 
 def _pending_stages(manager: SchedulerProfilerManager) -> Optional[set[str]]:
     return getattr(manager, _PENDING_ATTR, None)
+
+
+def _disturbs_open_capture(
+    manager: SchedulerProfilerManager, stage: Optional[str]
+) -> bool:
+    """Whether upstream would open or stop a capture that is not ``stage``'s.
+
+    xprof runs one capture per process, so opening a second one raises.
+    """
+    if not (manager.profile_by_stage and manager.profile_in_progress):
+        return False
+    decode_ct = manager.profiler_decode_ct
+    decode_target = manager.profiler_target_decode_ct
+    if stage == "prefill":
+        return 1 <= decode_ct <= decode_target
+    # Decode's first batch still flushes an open prefill capture.
+    return stage == "decode" and decode_ct > decode_target
 
 
 def _shared_profile_id(manager: SchedulerProfilerManager) -> str:
@@ -151,6 +169,9 @@ def _profile_batch_predicate(
     if pending is not None and stage is not None and stage not in pending:
         # Not ours to capture. Upstream would also end a running decode
         # capture early on the first prefill batch after prefill's capture.
+        return
+    if not envs.SGLANG_PROFILE_V2.get() and _disturbs_open_capture(self, stage):
+        # Not counted, so this stage still gets its full capture afterwards.
         return
     upstream(self, batch)
 

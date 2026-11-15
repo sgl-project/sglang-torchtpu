@@ -102,6 +102,12 @@ class _ProfileAutoTestCase(CustomTestCase):
         self.addCleanup(patcher.stop)
         return mgr
 
+    def _api_armed_manager(self, steps=2) -> SchedulerProfilerManager:
+        """A capturing manager armed as /start_profile does, not at launch."""
+        mgr = self._capturing_manager(enabled=False)
+        mgr._init_profile(self.tmp, None, steps, None, None, None, True, "api")
+        return mgr
+
     def _run_stage(self, mgr, forward_mode, steps=2):
         # Two batches past the budget: the capture stops on the batch that
         # crosses the target, not on the one that reaches it.
@@ -256,13 +262,44 @@ class TestCompletion(_ProfileAutoTestCase):
     def test_no_marker_for_an_api_armed_profile(self):
         # /start_profile owns its own lifecycle; a marker there would tell the
         # collector to copy a capture it never asked for.
-        mgr = self._capturing_manager(enabled=False)
-        mgr._init_profile(self.tmp, None, 2, None, None, None, True, "api")
+        mgr = self._api_armed_manager()
 
         self._run_stage(mgr, ForwardMode.EXTEND)
         self._run_stage(mgr, ForwardMode.DECODE)
 
         self.assertEqual(_markers(self.tmp), [])
+
+
+class TestInterleavedStages(_ProfileAutoTestCase):
+    """xprof runs one capture per process, so a batch of the other stage must
+    neither open a second capture nor stop the open one."""
+
+    def test_each_stage_is_captured_in_full_when_decode_comes_first(self):
+        for mgr in (self._capturing_manager(), self._api_armed_manager()):
+            # Upstream opens prefill's capture inside decode's; xprof raises.
+            mgr._profile_batch_predicate(_batch(ForwardMode.DECODE))
+            mgr._profile_batch_predicate(_batch(ForwardMode.EXTEND))
+            mgr._start_profile.assert_called_once_with(ForwardMode.DECODE)
+
+            self._run_stage(mgr, ForwardMode.DECODE)
+            self.assertFalse(mgr.profile_in_progress)
+
+            # A decode batch must not stop prefill's capture, which still has
+            # its whole budget of 2 passes.
+            mgr._profile_batch_predicate(_batch(ForwardMode.EXTEND))
+            mgr._profile_batch_predicate(_batch(ForwardMode.DECODE))
+            mgr._profile_batch_predicate(_batch(ForwardMode.EXTEND))
+            self.assertTrue(mgr.profile_in_progress)
+
+    def test_prefill_batch_does_not_cut_an_api_armed_decode_capture_short(self):
+        # As the launch-armed case in TestCompletion, without a pending set.
+        mgr = self._api_armed_manager(steps=3)
+        self._run_stage(mgr, ForwardMode.EXTEND, steps=3)
+
+        mgr._profile_batch_predicate(_batch(ForwardMode.DECODE))
+        mgr._profile_batch_predicate(_batch(ForwardMode.EXTEND))
+
+        self.assertTrue(mgr.profile_in_progress)
 
 
 class TestInstall(CustomTestCase):
