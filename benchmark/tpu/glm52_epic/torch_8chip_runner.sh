@@ -225,13 +225,16 @@ try:
     # or PJRT distributed world survives to contend with the real server.
     coords = run([sys.executable, '-m', 'sglang_tpu.node_normalization',
                   '--print_local_device_coords'], 'native-coordinate-probe.log', 180)
+    # Validate CLI/config before potentially reading hundreds of GiB.
+    run([sys.executable, '-m', 'benchmark.tpu.launch_server', '--config', '@'+str(candidate),
+         '--dry-run'], 'native-dry-run.json')
     result['coordinate_probe'] = coords
     # Optional benchmark-only staged loading. Falcon pod order is NOT physical
     # host order: use the same native rank calculation as normalization, never
     # FALCON_RANK to choose the host's expert union. Reader still checks actual
     # constructed MoE layouts before any payload pruning.
     if args.get('weight_loader_disable_mmap', False):
-        require(args.get('weight_loader_prefetch', False) is False,
+        require(args.get('weight_loader_prefetch_checkpoints', False) is False,
                 'EP-local mode cannot combine mmap-only prefetch')
         require(args.get('enable_eplb', False) is False,
                 'host union preparation requires static contiguous EP ownership')
@@ -267,8 +270,6 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
     # Native Engine startup performs the cross-host coordinate exchange, verifies
     # complete physical assignment and normalizes pod-index -> physical host rank.
     # Its input leader forwards HTTP if the physical rank-zero host changes.
-    run([sys.executable, '-m', 'benchmark.tpu.launch_server', '--config', '@'+str(candidate),
-         '--dry-run'], 'native-dry-run.json')
 
     class Control(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
