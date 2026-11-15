@@ -1,0 +1,11 @@
+{
+ "status":"OBJECTIVE_INCOMPLETE_ACTIVE",
+ "accepted_startup":{"experiment":"exp-24def76f9j","source":"25d226dafd5195ad7868fbfb6c65497f8e48b98c","result":"physicalhost EPunion preparation,all16loads,EXTEND/all6DECODE,health200/generate200 outputIDs154820,17351"},
+ "eager_ir_attempt":{"experiment":"exp-s04p89hobu","source":"a2f1f27cfb81d7ebba2be92aad91864bff3c1bbb","result":"diagnostic filebudget abort bothhosts10000files~64MB duringload beforewarmup; NOT originalfatal/NONREPRO/OOM","archive":"finalscan bound failed and oldsource skipped archive; durableterminal logs retained"},
+ "changes_after_attempt":["independentfinalarchive evenifinventoryfails; singletar transport","exactwheel custom_compiler_options packaging and finallypop CPUverified","scoped schedulerloop capture instead ofglobal loadcapture; realclass import wrappingCPUverified","all8localrank receipts and artifact gate before diagnosticpass"],
+ "next_minimal_hardware":"Do not immediately load model. Use exactbootstrap/wheel pins for bounded TPU scoped compiler-options microprobe (small tensor materialization, options parsed, HLOtext/proto emitted). Isolate1physicalchip if supported without changing objective topology; no16chip/DCP. Only after actualartifactproof consider ONEstaged eager scoped rerun, same8physical/2host16framework mesh, no budgetincrease.",
+ "remaining":["originalwindow318/U64 originatingproducerIR and rank correlation","historicalexit137 killorigin (leafOOM0 not exclusion)","real16rank scheduler admission/routing/cacheproof; explicit installer remains runtimegated","actualC16 oneDPrequest local2048/global32768 aligned12rounds393216tokens","longcontext precision and comparable steady-state intervals; no ratio yet"],
+ "production_delta_since_successful_anchor":"No changes under sglang_tpu/ or python/sglang/srt/ in gitdiff25d226..current; all interimchanges benchmarkonly",
+ "untracked_drafts":"preexisting requesttable drafts untouched/unrun; not partof acceptance",
+ "jobs":"No remaining relevant background jobs or hardware experiments as of this checkpoint"
+}
