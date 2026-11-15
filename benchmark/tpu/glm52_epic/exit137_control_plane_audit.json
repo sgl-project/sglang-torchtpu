@@ -1,0 +1,14 @@
+{
+  "experiment":"exp-hhidk7adq2",
+  "job":"job-18qbrzwr60",
+  "verified_via":"falcon exp get and falcon audit list --exp-id --limit20",
+  "terminal_status":"failed",
+  "job_reason":"Error",
+  "job_message":"Pod falcon-job-18qbrzwr60-workers-0-1-zh68x container task terminated: Error exit_code=1 signal=0",
+  "terminal_time":"2026-11-14T01:37:34.70963839Z",
+  "audit_events_returned":["experiment.create.binding_created"],
+  "abort_delete_events_returned":false,
+  "native_launcher_returncode":137,
+  "supervisor_mapping":"benchmark/tpu/launch_server.py run_server returns code if >=0 else128-code; therefore137 can be child positive137 or child negative9 mapped137. It does not identify a compiler subprocess.",
+  "interpretation":"Control plane shows outer task failed1, not recorded container OOMKilled. Internal server/launcher137 is a different layer. No returned abort audit evidence. These observations do not exclude process-level OOM, hidden ancestor/system kill or unaudited external action. Actual killed PID/source unresolved."
+}
