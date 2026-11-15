@@ -60,6 +60,29 @@ def block_width(model) -> int:
     return model.gamma if model.sample_from_anchor else model.gamma + 1
 
 
+def draft_base_logits(model, x: torch.Tensor) -> torch.Tensor:
+    """[rows, vocab] base logits of the draft rows on this rank.
+
+    Under attention DP the target lm_head shards over the attention-TP group;
+    at attention TP 1 every rank holds the full vocab for its own rows. Core's
+    gather_and_crop_vocab gathers over the full TP group instead, so cropping
+    keeps TP rank 0's logits on every rank. vllm-torchtpu runs the draft head
+    at TP1 with no gather; this does the same.
+    """
+    lm_head = model.lm_head
+    if lm_head is None or lm_head.tp_size != 1:
+        if lm_head is not None and lm_head.use_attn_tp_group:
+            raise NotImplementedError(
+                "V4.1 DSpark draft logits under attention TP > 1 are not supported."
+            )
+        logits, _ = model.compute_base_logits(x)
+        return logits
+    from sglang.srt.models.dspark import project_through_lm_head
+
+    x = model.stages[-1].norm(model.collapse_hc_head(x))
+    return project_through_lm_head(x, lm_head)[..., : int(lm_head.org_vocab_size)]
+
+
 def greedy_markov_drafts(
     model, hidden_states: torch.Tensor, input_ids: torch.Tensor
 ) -> torch.Tensor:
@@ -76,7 +99,7 @@ def greedy_markov_drafts(
     draft_hidden = hidden if model.sample_from_anchor else hidden[:, 1:]
     head = model.markov_head
     vocab = head.vocab_size
-    base_logits, _ = model.compute_base_logits(draft_hidden.reshape(bs * gamma, -1))
+    base_logits = draft_base_logits(model, draft_hidden.reshape(bs * gamma, -1))
     base_logits = base_logits[..., :vocab].float().view(bs, gamma, vocab)
     w1 = head.markov_w1.weight[:vocab]
     w2 = head.markov_w2.weight[:vocab]

@@ -24,6 +24,7 @@ from sglang_tpu.experimental.speculative.block_draft_worker import (
 )
 from sglang_tpu.models.deepseek_v41.dspark import (
     block_width,
+    draft_base_logits,
     is_dsv41_dspark_draft,
     swa_commit_records,
     write_context_kv,
@@ -95,8 +96,8 @@ class TpuDsv41DsparkDraftWorker(TpuBlockDraftWorker):
         bs = block_hidden.shape[0]
         draft_hidden = block_hidden if model.sample_from_anchor else block_hidden[:, 1:]
         with torch.no_grad():
-            base_logits, _ = model.compute_base_logits(
-                draft_hidden.reshape(bs * self.num_drafts, -1)
+            base_logits = draft_base_logits(
+                model, draft_hidden.reshape(bs * self.num_drafts, -1)
             )
         draft_tokens, draft_logits = model.markov_head.sample_block(
             base_logits.view(bs, self.num_drafts, -1),

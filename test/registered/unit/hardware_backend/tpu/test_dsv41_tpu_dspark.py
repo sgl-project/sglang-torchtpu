@@ -101,6 +101,7 @@ class _MarkovModel:
         self.gamma = gamma
         self.sample_from_anchor = sample_from_anchor
         self.lm = torch.randn(vocab, hidden, generator=g)
+        self.lm_head = None
         self.markov_head = SimpleNamespace(
             vocab_size=vocab,
             markov_w1=SimpleNamespace(weight=torch.randn(vocab, 8, generator=g)),
@@ -145,6 +146,37 @@ class TestGreedyMarkovDrafts(CustomTestCase):
                 torch.testing.assert_close(
                     drafts, _gather_reference(model, hidden, input_ids, width)
                 )
+
+
+class TestDraftBaseLogits(CustomTestCase):
+    def test_attention_tp1_head_keeps_this_ranks_logits(self):
+        """Under attention DP8 the draft gathered vocab logits over the 8-rank TP
+        group and cropped to one vocab width, so every rank drafted from TP rank
+        0's rows (accept ~1.05 on 7 of 8 ranks). A full-vocab head must project
+        this rank's rows locally and never call the gathering path."""
+        g = torch.Generator().manual_seed(0)
+        vocab, padded, hidden = 10, 12, 4
+        lm_head = SimpleNamespace(
+            tp_size=1,
+            use_attn_tp_group=True,
+            org_vocab_size=vocab,
+            weight=torch.randn(padded, hidden, generator=g),
+            quant_method=None,
+        )
+        norm_scale = torch.randn(hidden, generator=g)
+
+        def gathering_path(x):
+            raise AssertionError("compute_base_logits gathers over the TP group")
+
+        model = SimpleNamespace(
+            lm_head=lm_head,
+            stages=[SimpleNamespace(norm=lambda x: x * norm_scale)],
+            collapse_hc_head=lambda x: x,
+            compute_base_logits=gathering_path,
+        )
+        x = torch.randn(3, hidden, generator=g)
+        out = dspark.draft_base_logits(model, x)
+        torch.testing.assert_close(out, (x * norm_scale) @ lm_head.weight[:vocab].T)
 
 
 class TestDsparkAttention(CustomTestCase):
