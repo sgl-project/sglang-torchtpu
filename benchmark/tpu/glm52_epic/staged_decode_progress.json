@@ -1,0 +1,15 @@
+{
+  "experiment": "exp-24def76f9j",
+  "status": "RUNNING2of6",
+  "compiled_decode": [
+    {
+      "bs": 1,
+      "elapsed_s": 179.6
+    },
+    {
+      "bs": 2,
+      "elapsed_s": 184.4
+    }
+  ],
+  "scope": "compile progress not performance not fullstartup"
+}
