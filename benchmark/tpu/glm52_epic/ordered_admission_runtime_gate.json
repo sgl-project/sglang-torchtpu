@@ -1,0 +1,8 @@
+{
+ "status":"DO_NOT_INSTALL_RUNTIME",
+ "accepted_evidence":["exp-86x85koous nativeIPC/classifier/pausehandlers CPU pass","exp-4od8oq50j2 real2process Gloo nativecontrol broadcast pass","exp-lzcxiecilm composed16 scheduler boundary CPU pass; simulated delivery not collective"],
+ "fixed":"Root malformedcommand now latches terminalerror and returns originalingress instead of throwing before peer nativebroadcast; f9e71f96bd. This is containment not distributed recovery.",
+ "required_before_install":["Exclusive fresh perrun directory and nonce-bound artifacts; restart must not replay prior command/receipt","Atomic immutable receipt publication and current allrank paused inventory validation immediatelybefore resume; no unobserved externaltraffic","Bounded external watchdog must terminally stop whole experiment on commanderror/missingack; never silently leave pause forever","Posthandler ack validation/filewrite errors must not throw ranklocally into nextcollective; record terminalfailure while preserving ordered ingress until wholejobabort","Perprocess runtime mesh/install acknowledgments; no unsupportedlocalcontrol or skipper path","Endtoend adapters using root injection/nativebroadcast/nativehandlers/passiveack; current composition excludes actualrootadapter and collective combination"],
+ "precision_performance":"Still blocked: no real16rank admission/cadence/precision evidence; do not quote performance ratio",
+ "original_diagnostics":"Originaleagerfatal and historical137 rootcause unresolved; no attribution from staged startup pass"
+}
