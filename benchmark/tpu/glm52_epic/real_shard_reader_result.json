@@ -1,0 +1,27 @@
+{
+  "experiment": "exp-ahnoex3mma",
+  "source": "5f09176723",
+  "status": "SUCCEEDED",
+  "scope": "CPU single real shard expert range0-16 bytewise oracle against safetensors; not fullmodel or physical I/O throughput",
+  "results": [
+    {
+      "shard": "model-00002-of-00282.safetensors",
+      "gap": 0,
+      "keys": 51,
+      "skipped_keys": 372,
+      "payload_readinto_bytes": 335949824,
+      "useful_bytes": 335949824,
+      "gap_overread_bytes": 0
+    },
+    {
+      "shard": "model-00002-of-00282.safetensors",
+      "gap": 16777216,
+      "keys": 51,
+      "skipped_keys": 372,
+      "payload_readinto_bytes": 335949824,
+      "useful_bytes": 335949824,
+      "gap_overread_bytes": 0
+    }
+  ],
+  "full_regression": "exp-ivszxcm85a import failed missing sgl_kernel; pending"
+}
