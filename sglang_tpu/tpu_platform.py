@@ -340,13 +340,15 @@ def _pcp_ring_requested() -> bool:
 
 
 def _is_pcp_ring_topology(cfg) -> bool:
-    """Whether ``cfg`` is the one topology ring-mode PCP runs with decode
-    context parallelism: prefill CP over the whole TP group, striped like DCP."""
+    """Whether ``cfg`` is the topology ring-mode PCP runs with decode context
+    parallelism: prefill CP over the attention-CP groups of the TP group
+    (attention TP ``tp_size // attn_cp_size``, possibly 1), with the KV cache
+    striped like DCP over each attention-CP group."""
     return (
         _pcp_ring_requested()
         and bool(cfg.enable_prefill_cp)
         and cfg.attn_cp_size > 1
-        and cfg.attn_cp_size == cfg.tp_size
+        and cfg.tp_size % cfg.attn_cp_size == 0
         and cfg.dcp_size == cfg.attn_cp_size
     )
 
@@ -358,10 +360,14 @@ def _validate_prefill_context_parallel_ring(
 
     Ring mode stripes the KV cache across the CP ranks by page, exactly as
     decode context parallelism does, so it requires ``--dcp-size ==
-    --attn-cp-size == --tp-size`` (an unset ``--dcp-size`` is set here) and
-    inherits every DCP restriction through ``_validate_decode_context_parallel``.
-    The fused ring kernel runs as a mesh kernel over the whole world, on one
-    host, and covers causal full attention only.
+    --attn-cp-size`` (an unset ``--dcp-size`` is set here) and inherits every
+    DCP restriction through ``_validate_decode_context_parallel``. The DCP
+    stripe group is the attention-CP group (ranks ``t, t + attn_tp, ...``),
+    not SGLang's consecutive-rank DCP group, so attention TP
+    (``--tp-size // --attn-cp-size``) may exceed 1: each rank keeps its
+    attention-TP head shard. The fused ring kernel runs as a mesh kernel over
+    the whole world (a ``(cp, tp)`` mesh ringing along ``cp``), on one host,
+    and covers causal full attention only.
     """
     from sglang.srt.arg_groups.overrides import (
         declare_resolution,
@@ -385,11 +391,11 @@ def _validate_prefill_context_parallel_ring(
             f"{feature} requires a power-of-two --attn-cp-size (2, 4 or 8): the "
             "ring's schedule ends on a rotation boundary only then."
         )
-    if cfg.tp_size != cp:
+    if cfg.tp_size % cp:
         raise NotImplementedError(
-            f"{feature} requires --attn-cp-size equal to --tp-size (got --tp-size "
-            f"{cfg.tp_size}): every rank must hold all attention heads and the "
-            "ring spans the whole TP group."
+            f"{feature} requires --tp-size divisible by --attn-cp-size (got "
+            f"--tp-size {cfg.tp_size}): the ring runs along the attention-CP "
+            "axis of a (cp, attention TP) mesh over the TP group."
         )
     if cfg.pp_size > 1:
         raise NotImplementedError(
@@ -423,8 +429,8 @@ def _validate_prefill_context_parallel_ring(
         )
     if getattr(cfg, "dcp_replicate_q_proj", False):
         raise NotImplementedError(
-            f"{feature} does not take --dcp-replicate-q-proj: with attention CP "
-            "equal to the TP size every rank already projects all query heads."
+            f"{feature} does not take --dcp-replicate-q-proj: every rank of an "
+            "attention-CP group already projects the same query heads."
         )
     if cfg.dcp_size == 1:
         logger.info(
@@ -1048,14 +1054,14 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU (got "
             f"attn_cp_size={cfg.attn_cp_size}), except as ring-mode prefill "
             "context parallelism (SGLANG_TPU_PCP_MODE=ring with --dcp-size == "
-            "--attn-cp-size == --tp-size)."
+            "--attn-cp-size)."
         )
     if cfg.enable_prefill_cp and not pcp_ring:
         raise ValueError(
             "--enable-prefill-cp is not supported with "
             "--decode-context-parallel-size > 1 on TPU, except as ring-mode "
             "prefill context parallelism (SGLANG_TPU_PCP_MODE=ring with "
-            "--dcp-size == --attn-cp-size == --tp-size)."
+            "--dcp-size == --attn-cp-size)."
         )
     if cfg.disaggregation_mode != "null":
         raise ValueError(
@@ -1698,6 +1704,14 @@ class TpuSRTPlatform(SRTPlatform):
 
     def dcp_replicates_q_heads(self) -> bool:
         return True
+
+    def dcp_stripes_over_attn_cp(self) -> bool:
+        # Ring-mode prefill CP stripes the KV cache over the attention-CP
+        # group (decode merges over it too), so each rank keeps its
+        # attention-TP share of the KV heads.
+        from sglang_tpu.cp_mode import pcp_ring_enabled
+
+        return pcp_ring_enabled()
 
     def supports_moe_dp_pipeline_stages(self) -> bool:
         return True

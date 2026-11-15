@@ -360,6 +360,25 @@ def _import_dcp_helpers():
     return get_dcp_lens
 
 
+def _dcp_stripe_group(parallel, *, pcp_ring: bool):
+    """``(stripe rank, stripe group, heads_local)`` of the page-striped KV cache.
+
+    Plain DCP stripes over SGLang's DCP group (consecutive ranks inside the
+    TP group). Ring-mode prefill CP stripes over the attention-CP group
+    instead: with attention TP ``t`` that is ranks ``r, r + t, ...``, which
+    share one attention-TP head shard and differ only in tokens, so the
+    attention-CP rank owns the stripe and decode merges over that group.
+    ``heads_local``: every rank of the group computes the same query heads
+    (attention TP 1, or ring mode at any attention TP), so the striped
+    kernels run on this rank's own heads and nothing is gathered or cropped.
+    """
+    if parallel.attn_dcp_size <= 1:
+        return 0, None, False
+    if pcp_ring:
+        return parallel.attn_cp_rank, parallel.attn_cp_group, True
+    return parallel.attn_dcp_rank, parallel.dcp_group, parallel.attn_tp_size == 1
+
+
 def _check_dcp_kv_heads(*, layer: "RadixAttention", pool_kv_heads: int) -> None:
     """Refuse a layer whose K/V heads do not fit decode context parallelism.
 
@@ -653,10 +672,18 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # allocator hands out slots from a pool widened by dcp, so one logical
         # page spans page_size * dcp tokens over page_size physical slots per
         # rank: rank r's physical page holds the r-th page_size run of it.
+        #
+        # Ring-mode prefill CP stripes over the attention-CP group instead of
+        # SGLang's DCP group (consecutive ranks inside the TP group): with
+        # attention TP > 1 the CP group is ranks ``t, t + attn_tp, ...``, which
+        # share one head shard and differ only in tokens. The stripe owner is
+        # then the attention-CP rank and decode merges over that group.
         parallel = get_parallel()
+        self._pcp_ring = pcp_ring_enabled()
         self._dcp = parallel.attn_dcp_size
-        self._dcp_rank = parallel.attn_dcp_rank if self._dcp > 1 else 0
-        self._dcp_group = parallel.dcp_group if self._dcp > 1 else None
+        self._dcp_rank, self._dcp_group, self._dcp_heads_local = _dcp_stripe_group(
+            parallel, pcp_ring=self._pcp_ring
+        )
         self._page_stride = self.page_size * self._dcp
         self._cp_rank_t: torch.Tensor | None = None
         self._cp_rank_index: torch.Tensor | None = None
@@ -695,11 +722,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 == self._dcp_rank
             )
             self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
-        # With attention TP 1 every rank of the DCP group already computes all
-        # query heads (the group is then a context-parallel group, as in
-        # ring-mode prefill CP), so nothing is gathered and nothing is cropped.
-        self._dcp_heads_local = self._dcp > 1 and parallel.attn_tp_size == 1
-
         max_bs = get_exec().graph.torch_compile_max_bs
         if max_bs:
             pages_per_seq = _get_pages_per_seq(self.max_context_len, self._page_stride)
@@ -772,7 +794,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self._op = self._build_kernel_op()
         # Ring-mode prefill context parallelism: the fused ring op replaces the
         # all-gather-and-write + full attention of gather mode.
-        self._pcp_ring = pcp_ring_enabled()
         self._pcp_ring_op = None
         if self._pcp_ring:
             self._init_pcp_ring(model_runner)
@@ -787,14 +808,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             raise ValueError(
                 "Ring-mode prefill context parallelism stripes the KV cache like "
                 "decode context parallelism and needs --dcp-size == "
-                f"--attn-cp-size == --tp-size (got dcp {self._dcp}, attention CP "
-                f"{cp_size}, attention TP {parallel.attn_tp_size})."
-            )
-        if parallel.attn_cp_rank != self._dcp_rank:
-            raise ValueError(
-                f"Context-parallel rank {parallel.attn_cp_rank} differs from the "
-                f"decode-context-parallel rank {self._dcp_rank}: the page stripes "
-                "of prefill and decode would not line up."
+                f"--attn-cp-size (got dcp {self._dcp}, attention CP {cp_size}, "
+                f"attention TP {parallel.attn_tp_size})."
             )
         if self._is_hybrid_swa:
             raise NotImplementedError(
@@ -802,7 +817,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 "sliding-window KV pools."
             )
         if model_runner.device == "tpu":
-            self._pcp_ring_op = build_pcp_ring_op(self.kernel_spec, cp_size)
+            self._pcp_ring_op = build_pcp_ring_op(
+                self.kernel_spec, cp_size, attn_tp_size=parallel.attn_tp_size
+            )
 
     def _build_kernel_op(self):
         """Build the Pallas custom op stored as ``self._op``.

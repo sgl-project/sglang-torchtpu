@@ -398,9 +398,10 @@ def merge_across_ranks(
     neither ``logsumexp`` nor ``logaddexp``. ``rank_mask`` / ``rank_index`` are
     the rank as device tensors (``bool[world_size]`` one-hot, ``i64[1]``).
 
-    ``keep_all_heads`` is for a group whose ranks each computed every head on
-    their own queries (attention TP 1, e.g. ring-mode prefill context
-    parallelism): ``H_all`` is then the layer's head count rather than the
+    ``keep_all_heads`` is for a group whose ranks each computed the same heads
+    on their own queries (attention TP 1, or the attention-CP group of
+    ring-mode prefill context parallelism, whose ranks share one attention-TP
+    head shard): ``H_all`` is then the layer's head count rather than the
     rank-major gathered one, and the merged result is returned whole.
     """
     if world_size == 1:

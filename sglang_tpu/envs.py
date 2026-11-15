@@ -469,8 +469,9 @@ class TpuEnvs:
     # its own replicated KV pool. "ring": the KV cache is page-striped across
     # the CP ranks (rank r holds global page l * P + r, as under decode context
     # parallelism), the zigzag prefill attends the cached prefix through the
-    # fused ring kernel and everything else runs the DCP path; needs
-    # --dcp-size == --attn-cp-size == --tp-size (validation sets --dcp-size).
+    # fused ring kernel and everything else runs the DCP path over the
+    # attention-CP group; needs --dcp-size == --attn-cp-size (validation sets
+    # --dcp-size).
     SGLANG_TPU_PCP_MODE = EnvStr("gather")
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)

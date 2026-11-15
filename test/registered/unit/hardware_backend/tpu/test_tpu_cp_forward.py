@@ -16,6 +16,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
     PcpRingMetadata,
+    _dcp_stripe_group,
 )
 from sglang_tpu.attention_pallas_rpa_batched import (
     TpuPallasRpaBatchedAttnBackend,
@@ -894,6 +895,43 @@ class TestRingMetadata(CustomTestCase):
             backend._build_cp_metadata(
                 batch, TpuCpBatchLayout(host=host, local_rows=torch.zeros(1).long())
             )
+
+
+class TestRingStripeGroup(CustomTestCase):
+    """Which group owns the page stripes and merges decode."""
+
+    @staticmethod
+    def _parallel(*, tp_rank, attn_tp, cp, dcp):
+        return SimpleNamespace(
+            attn_dcp_size=dcp,
+            attn_dcp_rank=tp_rank % dcp if dcp > 1 else 0,
+            dcp_group="dcp-group",
+            attn_cp_rank=(tp_rank // attn_tp) % cp,
+            attn_cp_group="attn-cp-group",
+            attn_tp_size=attn_tp,
+        )
+
+    def test_ring_pcp4_x_tp2_stripes_over_the_attention_cp_group(self):
+        """tp_rank = cp_rank * 2 + tp_rank_in_attn_tp: rank 5 is CP rank 2 of
+        the group {1, 3, 5, 7}, not DCP rank 1 of SGLang's group {4..7}."""
+        parallel = self._parallel(tp_rank=5, attn_tp=2, cp=4, dcp=4)
+        self.assertEqual(
+            _dcp_stripe_group(parallel, pcp_ring=True), (2, "attn-cp-group", True)
+        )
+
+    def test_ring_pcp8_is_unchanged(self):
+        parallel = self._parallel(tp_rank=5, attn_tp=1, cp=8, dcp=8)
+        self.assertEqual(
+            _dcp_stripe_group(parallel, pcp_ring=True), (5, "attn-cp-group", True)
+        )
+
+    def test_plain_dcp_keeps_sglang_dcp_group(self):
+        parallel = self._parallel(tp_rank=5, attn_tp=8, cp=1, dcp=4)
+        self.assertEqual(
+            _dcp_stripe_group(parallel, pcp_ring=False), (1, "dcp-group", False)
+        )
+        parallel = self._parallel(tp_rank=0, attn_tp=8, cp=1, dcp=1)
+        self.assertEqual(_dcp_stripe_group(parallel, pcp_ring=False), (0, None, False))
 
 
 class TestRingForward(CustomTestCase):

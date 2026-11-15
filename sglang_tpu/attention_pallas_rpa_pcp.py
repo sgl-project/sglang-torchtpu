@@ -18,7 +18,10 @@ layer on every rank:
 Because the ring uses remote DMA, the op is a mesh kernel: it is exported as a
 ``jax.shard_map`` over the whole world with partition specs, every rank passes
 its own shard, and all ranks must launch it in the same order with the same
-static shapes. Everything rank-dependent (``cp_rank``, ``q_positions``) is a
+static shapes. With attention TP 1 the mesh is one axis over the world; with
+attention TP ``t > 1`` it is ``(cp, t)`` in torch-rank order (rank
+``cp_rank * t + tp_rank``) and the ring runs along the ``cp`` axis, so the
+``t`` rings of one host (one per attention-TP head shard) run side by side. Everything rank-dependent (``cp_rank``, ``q_positions``) is a
 traced tensor, so all ranks trace one program.
 
 The op reads the KV pool and never writes it: XLA copies every operand that a
@@ -40,8 +43,10 @@ from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
 __all__ = [
     "PCP_RING_AXIS",
+    "PCP_RING_CP_AXIS",
     "PCP_RING_OP_NAME",
     "build_pcp_ring_op",
+    "pcp_ring_mesh_axes",
     "pcp_ring_partition_specs",
 ]
 
@@ -50,9 +55,13 @@ __all__ = [
 # FX-graph compile cache; bump the suffix when the kernel source changes.
 PCP_RING_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_batched_pcp_ring_v1"
 
-# Mesh axis the ring runs along. The mesh is one-dimensional over the whole
-# world, in torch-rank order (``torch_tpu.get_pallas_mesh``).
+# Mesh axis the ring runs along with attention TP 1. The mesh is then
+# one-dimensional over the whole world, in torch-rank order
+# (``torch_tpu.get_pallas_mesh``).
 PCP_RING_AXIS = "model"
+# With attention TP > 1 the mesh is ``(PCP_RING_CP_AXIS, PCP_RING_AXIS)`` of
+# shape ``(cp, attn_tp)``; the ring runs along the first axis.
+PCP_RING_CP_AXIS = "pcp"
 
 # Tensor operands of the op, in order. Every one is passed per rank and
 # partitioned along its first dimension, so nothing relies on two ranks holding
@@ -79,8 +88,8 @@ _TENSOR_ARGS = (
 # kernel, so they key the export.
 _STATIC_ARGS = ("sm_scale", "k_scale", "v_scale")
 
-# torch custom ops are process-global; cache the registration per CP size so
-# repeated backend construction reuses it.
+# torch custom ops are process-global; cache the registration per
+# (CP size, attention TP size) so repeated backend construction reuses it.
 _OP_CACHE: dict = {}
 
 
@@ -94,16 +103,28 @@ def _import_pcp_kernel():
     return ragged_paged_attention_pcp_fused
 
 
-def pcp_ring_partition_specs():
+def pcp_ring_mesh_axes(attn_tp_size: int = 1) -> tuple[str, ...]:
+    """Mesh axis names, ring axis first: ``("model",)`` with attention TP 1,
+    else ``("pcp", "model")`` for a ``(cp, attn_tp)`` mesh."""
+    if attn_tp_size == 1:
+        return (PCP_RING_AXIS,)
+    return (PCP_RING_CP_AXIS, PCP_RING_AXIS)
+
+
+def pcp_ring_partition_specs(attn_tp_size: int = 1):
     """``(input specs, output specs)`` of the exported mesh function.
 
     Inputs: one spec per positional argument of the wrapped function (the
     static ones included; they carry no array). Output: the attention output.
+    Every tensor is split along its first dimension over all mesh axes, in
+    torch-rank order, so each rank's shard is exactly what it passed.
     """
     from jax.sharding import PartitionSpec as P
 
-    in_specs = (P(PCP_RING_AXIS),) * len(_TENSOR_ARGS) + (P(),) * len(_STATIC_ARGS)
-    out_specs = (P(PCP_RING_AXIS),)
+    axes = pcp_ring_mesh_axes(attn_tp_size)
+    shard = P(axes[0]) if len(axes) == 1 else P(axes)
+    in_specs = (shard,) * len(_TENSOR_ARGS) + (P(),) * len(_STATIC_ARGS)
+    out_specs = (shard,)
     return in_specs, out_specs
 
 
@@ -111,6 +132,7 @@ def _invoke_pcp_kernel(
     kernel,
     *,
     cp_size: int,
+    mesh_axes: tuple[str, ...] = (PCP_RING_AXIS,),
     queries,
     keys,
     values,
@@ -158,8 +180,8 @@ def _invoke_pcp_kernel(
         kv_cache_lens=kv_cache_lens,
         cp_rank=cp_rank,
         cp_group_size=cp_size,
-        ring_axis_name=PCP_RING_AXIS,
-        ring_mesh_axis_names=(PCP_RING_AXIS,),
+        ring_axis_name=mesh_axes[0],
+        ring_mesh_axis_names=mesh_axes,
         sm_scale=sm_scale,
         k_scale=k_scale,
         v_scale=v_scale,
@@ -168,8 +190,11 @@ def _invoke_pcp_kernel(
     )
 
 
-def build_pcp_ring_op(spec, cp_size: int, *, mesh=None, kernel=None):
-    """Register the fused ring kernel as a torch custom op for ``cp_size`` ranks.
+def build_pcp_ring_op(
+    spec, cp_size: int, *, attn_tp_size: int = 1, mesh=None, kernel=None
+):
+    """Register the fused ring kernel as a torch custom op for ``cp_size`` ranks
+    per ring and ``attn_tp_size`` rings (one per attention-TP head shard).
 
     Must be called from the backend constructor, never inside a traced region
     (the registration inspects signatures, which dynamo cannot trace), and
@@ -190,7 +215,8 @@ def build_pcp_ring_op(spec, cp_size: int, *, mesh=None, kernel=None):
             "context parallelism on TPU requires --attention-backend "
             "pallas_tpu_rpa_batched."
         )
-    cached = _OP_CACHE.get(cp_size)
+    cache_key = (cp_size, attn_tp_size)
+    cached = _OP_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
@@ -200,13 +226,17 @@ def build_pcp_ring_op(spec, cp_size: int, *, mesh=None, kernel=None):
 
     from sglang_tpu.pallas_jax_op import _CpuExportJaxCallable
 
+    mesh_axes = pcp_ring_mesh_axes(attn_tp_size)
     if mesh is None:
         from torch_tpu._internal.pallas import get_pallas_mesh
 
-        mesh = get_pallas_mesh((PCP_RING_AXIS,), (cp_size,))
+        if attn_tp_size == 1:
+            mesh = get_pallas_mesh((PCP_RING_AXIS,), (cp_size,))
+        else:
+            mesh = get_pallas_mesh(mesh_axes, (cp_size, attn_tp_size))
     if kernel is None:
         kernel = _import_pcp_kernel()
-    in_specs, out_specs = pcp_ring_partition_specs()
+    in_specs, out_specs = pcp_ring_partition_specs(attn_tp_size)
 
     def _wrapped(
         queries: jax.Array,
@@ -233,6 +263,7 @@ def build_pcp_ring_op(spec, cp_size: int, *, mesh=None, kernel=None):
             return _invoke_pcp_kernel(
                 kernel,
                 cp_size=cp_size,
+                mesh_axes=mesh_axes,
                 sm_scale=sm_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
@@ -280,10 +311,15 @@ def build_pcp_ring_op(spec, cp_size: int, *, mesh=None, kernel=None):
     trace_key = pallas_impl._get_kernel_invocation_key(
         f"jax_{PCP_RING_OP_NAME}",
         [],
-        {"cp_size": cp_size, "static_argnums": static_argnums},
+        {
+            "cp_size": cp_size,
+            "attn_tp_size": attn_tp_size,
+            "static_argnums": static_argnums,
+        },
     )
     jax_kernel = _CpuExportJaxCallable(
-        name=f"jax_{PCP_RING_OP_NAME}_cp{cp_size}",
+        name=f"jax_{PCP_RING_OP_NAME}_cp{cp_size}"
+        + (f"_tp{attn_tp_size}" if attn_tp_size > 1 else ""),
         jit_fn=jit_fn,
         trace_key=trace_key,
         mesh=mesh,
@@ -293,7 +329,7 @@ def build_pcp_ring_op(spec, cp_size: int, *, mesh=None, kernel=None):
     jax_kernel.sglang_output_shardings = (out_sharding,)
 
     custom_op = _register_torch_op(jax_kernel)
-    _OP_CACHE[cp_size] = custom_op
+    _OP_CACHE[cache_key] = custom_op
     return custom_op
 
 

@@ -7,7 +7,8 @@ own fully replicated KV pool and runs ordinary attention over its zigzag rows.
 
 ``ring`` stripes the KV cache across the CP ranks by page -- rank ``r`` holds
 global page ``l * P + r``, exactly the decode-context-parallel (DCP) layout,
-which is why the mode requires ``--dcp-size == --attn-cp-size == --tp-size``.
+which is why the mode requires ``--dcp-size == --attn-cp-size``; the stripe
+group is the attention-CP group, so attention TP may exceed 1.
 A zigzag prefill attends the striped cached prefix through the fused ring
 kernel (remote DMA of KV blocks between ranks) and the all-gathered chunk in a
 new-token phase; every other forward (decode, extends the zigzag strategy does

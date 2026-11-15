@@ -137,6 +137,7 @@ class TestPcpRingOpExport(CustomTestCase):
     """Export the op on CPU with a stand-in kernel and a mocked world mesh."""
 
     CP = 4
+    ATTN_TP = 1
     TOKENS, Q_HEADS, KV_HEADS, DIM, PAGE = 64, 8, 2, 128, 16
     PAD_B, PAGES_PER_SEQ = 2, 3
 
@@ -148,7 +149,9 @@ class TestPcpRingOpExport(CustomTestCase):
         from sglang_tpu.pallas_export import tpu_info_for_cpu_export
         from sglang_tpu.pallas_jax_op import _jax_placeholders
 
-        mesh = get_cpu_export_mesh((pcp.PCP_RING_AXIS,), (self.CP,))
+        axes = pcp.pcp_ring_mesh_axes(self.ATTN_TP)
+        shape = (self.CP,) if self.ATTN_TP == 1 else (self.CP, self.ATTN_TP)
+        mesh = get_cpu_export_mesh(axes, shape)
         seen = {}
 
         def kernel(queries, keys, values, kv_cache, **kwargs):
@@ -164,7 +167,7 @@ class TestPcpRingOpExport(CustomTestCase):
                 else:
                     seen.setdefault("static", {})[name] = value
             # Depends on the ring axis, as the real kernel's neighbour ids do.
-            rank = jax.lax.axis_index(pcp.PCP_RING_AXIS) + kwargs["cp_rank"][0]
+            rank = jax.lax.axis_index(axes[0]) + kwargs["cp_rank"][0]
             return queries + rank.astype(queries.dtype)
 
         captured = {}
@@ -178,7 +181,11 @@ class TestPcpRingOpExport(CustomTestCase):
             patch.object(pcp, "_register_torch_op", side_effect=capture),
         ):
             op = pcp.build_pcp_ring_op(
-                RPA_BATCHED_SPEC, self.CP, mesh=mesh, kernel=kernel
+                RPA_BATCHED_SPEC,
+                self.CP,
+                attn_tp_size=self.ATTN_TP,
+                mesh=mesh,
+                kernel=kernel,
             )
         jax_kernel = captured["jax_kernel"]
         self.assertIs(op, jax_kernel)
@@ -208,7 +215,7 @@ class TestPcpRingOpExport(CustomTestCase):
             cp_rank=tensor(1),
         )
         args = tuple(self.local[name] for name in TENSOR_ARGS) + (0.125, 0.5, 0.25)
-        in_specs, _ = pcp.pcp_ring_partition_specs()
+        in_specs, _ = pcp.pcp_ring_partition_specs(self.ATTN_TP)
         placeholders = _jax_placeholders(args, mesh=mesh, partition_specs=in_specs)
         with (
             tpu_info_for_cpu_export(),
@@ -225,14 +232,15 @@ class TestPcpRingOpExport(CustomTestCase):
                 tuple(seen["shapes"][name]), tuple(self.local[name].shape), name
             )
         # ... the exported program takes one such shard per rank along dim 0 ...
+        world = self.CP * self.ATTN_TP
         for name, aval in zip(TENSOR_ARGS, lowered.in_avals):
             local = tuple(self.local[name].shape)
-            self.assertEqual(tuple(aval.shape), (self.CP * local[0], *local[1:]), name)
+            self.assertEqual(tuple(aval.shape), (world * local[0], *local[1:]), name)
         # ... and returns this rank's attention rows, nothing else.
         self.assertEqual(len(lowered.out_avals), 1)
         out = lowered.out_avals[0]
         self.assertEqual(
-            tuple(out.shape), (self.CP * self.TOKENS, self.Q_HEADS, self.DIM)
+            tuple(out.shape), (world * self.TOKENS, self.Q_HEADS, self.DIM)
         )
         self.assertEqual(str(out.dtype), "bfloat16")
 
@@ -243,8 +251,9 @@ class TestPcpRingOpExport(CustomTestCase):
             dict(sm_scale=0.125, k_scale=0.5, v_scale=0.25),
         )
         self.assertEqual(seen["static"]["cp_group_size"], self.CP)
-        self.assertEqual(seen["static"]["ring_axis_name"], pcp.PCP_RING_AXIS)
-        self.assertEqual(seen["static"]["ring_mesh_axis_names"], (pcp.PCP_RING_AXIS,))
+        axes = pcp.pcp_ring_mesh_axes(self.ATTN_TP)
+        self.assertEqual(seen["static"]["ring_axis_name"], axes[0])
+        self.assertEqual(seen["static"]["ring_mesh_axis_names"], axes)
         self.assertFalse(seen["static"]["update_kv_cache"])
         # cp_rank is an operand, so every rank traces the same program.
         self.assertEqual(tuple(seen["shapes"]["cp_rank"]), (1,))
@@ -260,6 +269,23 @@ class TestPcpRingOpExport(CustomTestCase):
             jax_kernel.static_argnums,
             tuple(range(len(TENSOR_ARGS), len(TENSOR_ARGS) + len(STATIC_ARGS))),
         )
+
+
+class TestPcpRingOpExport2DMesh(TestPcpRingOpExport):
+    """PCP4 x attention TP 2: a ``(pcp, model)`` mesh in torch-rank order,
+    ringing along ``pcp``; every rank still passes and gets its own shard."""
+
+    ATTN_TP = 2
+
+    def test_mesh_axes_and_specs(self):
+        from jax.sharding import PartitionSpec as P
+
+        self.assertEqual(pcp.pcp_ring_mesh_axes(1), ("model",))
+        self.assertEqual(pcp.pcp_ring_mesh_axes(2), ("pcp", "model"))
+        in_specs, out_specs = pcp.pcp_ring_partition_specs(2)
+        self.assertEqual(in_specs[0], P(("pcp", "model")))
+        self.assertEqual(out_specs, (P(("pcp", "model")),))
+        self.assertEqual(in_specs[-1], P())
 
 
 @unittest.skipUnless(
