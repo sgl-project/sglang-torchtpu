@@ -37,6 +37,54 @@ memory_stop = threading.Event()
 memory_thread = None
 state = {'status': 'RUNNING', 'peer_ack': False}
 prep_root = None  # Allocation-scoped shared failure channel after staged prep.
+ir_root = None
+ir_last_scan = float('-inf')
+# Per-host limits: two hosts together admit at most 25000 files. Stop at 80%
+# headroom, without deleting evidence. This is a sampled guard, not a disk quota.
+IR_MAX_BYTES = 4 * 1024**3
+IR_MAX_FILES = 12500
+IR_STOP_BYTES = IR_MAX_BYTES * 4 // 5
+IR_STOP_FILES = IR_MAX_FILES * 4 // 5
+
+
+def scan_ir(inventory=False, enforce=True):
+    """Bound each scan to 0.75s, failing closed rather than delaying supervision."""
+    started = time.monotonic()
+    stack = [ir_root]
+    count = size = 0
+    files = []
+    while stack:
+        require(time.monotonic() - started < 0.75, 'IR inventory scan exceeded 0.75s bound')
+        with os.scandir(stack.pop()) as entries:
+            for entry in entries:
+                require(time.monotonic() - started < 0.75,
+                        'IR inventory scan exceeded 0.75s bound')
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    count += 1
+                    entry_size = entry.stat(follow_symlinks=False).st_size
+                    size += entry_size
+                    if inventory:
+                        files.append({'path': entry.path, 'size_bytes': entry_size})
+                    require(not enforce or (count < IR_STOP_FILES and size < IR_STOP_BYTES),
+                            f'IR artifact 80% stop threshold reached: {size} bytes, {count} files; '
+                            'evidence preserved, no deletion')
+    data = dict(directory=str(ir_root), size_bytes=size, file_count=count,
+                max_bytes_per_host=IR_MAX_BYTES, max_files_per_host=IR_MAX_FILES,
+                stop_bytes_per_host=IR_STOP_BYTES, stop_files_per_host=IR_STOP_FILES,
+                max_files_two_hosts=2 * IR_MAX_FILES)
+    if inventory:
+        data['files'] = sorted(files, key=lambda item: item['path'])
+    return data
+
+
+def check_ir_budget():
+    global ir_last_scan
+    if ir_root is None or time.monotonic() - ir_last_scan < 1:
+        return
+    ir_last_scan = time.monotonic()
+    result['ir_artifacts'] = scan_ir()
 
 
 def save(name, data):
@@ -65,6 +113,7 @@ def run(argv, name, timeout=120):
 
 def check_child():
     remaining()
+    check_ir_budget()
     if prep_root is not None:
         # Both directions: a failed peer may no longer serve HTTP. Marker is
         # scoped by the already validated unique allocation, not a global flag.
@@ -132,9 +181,10 @@ try:
     require(not run(['git', 'status', '--porcelain', '--untracked-files=no'], 'source-status.txt'),
             'tracked source modifications detected')
     mode = os.environ.get('GLM52_BASELINE_MODE', '')
-    require(mode in ('', 'eager', 'compile-smoke', 'historical-replay'), 'unsupported baseline mode')
+    require(mode in ('', 'eager', 'eager-ir', 'compile-smoke', 'historical-replay'), 'unsupported baseline mode')
     candidate = Path('benchmark/tpu/glm52_epic/' + (
         'torch_runnable_baseline.json' if mode == 'eager' else
+        'torch_staged_eager_ir.json' if mode == 'eager-ir' else
         'torch_compile_smoke.json' if mode == 'compile-smoke' else
         'torch_staged_loading_candidate.json' if mode == 'historical-replay' else
         'torch_prefill_candidate.json'))
@@ -149,7 +199,9 @@ try:
     require(os.environ.get('SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S', '480') == '480',
             'replay must preserve native480s postload skew timeout')
     runtime_env = cfg.get('runtime_env', cfg.get('runtime_envs', {}))
-    if mode in ('eager', 'compile-smoke'):
+    require(runtime_env.get('SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S', '480') == '480',
+            'candidate must preserve native480s postload skew timeout')
+    if mode in ('eager', 'eager-ir', 'compile-smoke'):
         require(runtime_env.get('SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL') == '1',
                 'short baseline must enable DSA qblock prefill')
         require(runtime_env.get('SGLANG_TPU_ASYNC_COPY_WORKER') == '0',
@@ -164,12 +216,12 @@ try:
         'tp_size': 16, 'attn_dp_size': 16, 'dp_size': 1, 'ep_size': 16,
         'nnodes': 2, 'device': 'tpu', 'model_path': '/models/GLM5.2-fp8-channel-wise'
         }.items()), 'candidate mesh/model contract changed')
-    if mode in ('eager', 'compile-smoke'):
+    if mode in ('eager', 'eager-ir', 'compile-smoke'):
         require(args.get('page_size') == 128,
                 'short baseline must use the qblock-compatible page size')
     contract = ({'enable_torch_compile': False, 'context_length': 4096,
                  'max_total_tokens': 8192, 'chunked_prefill_size': 4096,
-                 'max_prefill_tokens': 4096, 'page_size': 128} if mode == 'eager' else
+                 'max_prefill_tokens': 4096, 'page_size': 128} if mode in ('eager', 'eager-ir') else
                 {'enable_torch_compile': True, 'context_length': 4096,
                  'max_total_tokens': 8192, 'chunked_prefill_size': 4096,
                  'max_prefill_tokens': 4096, 'page_size': 128, 'torch_compile_max_bs': 1,
@@ -186,10 +238,21 @@ try:
                 'historical replay cannot run matched-workload diagnostic')
         result['scope'] = 'current-source historical-shape compile replay; NOT performance or exact historical-source reproduction'
     require(all(args.get(k) == v for k, v in contract.items()), 'baseline shape contract changed')
-    if mode in ('eager', 'compile-smoke'):
+    if mode in ('eager', 'eager-ir', 'compile-smoke'):
         require(not os.environ.get('GLM52_DIAGNOSTIC_REQUESTS'),
                 'baseline smoke cannot run matched-workload diagnostic')
         result['scope'] = f'full-checkpoint short-input {mode} smoke; NOT JAX performance'
+    if mode == 'eager-ir':
+        require(all(args.get(k) == v for k, v in {
+            'weight_loader_disable_mmap': True, 'weight_loader_prefetch_checkpoints': False,
+            'enable_eplb': False}.items()), 'eager-ir requires current staged reader contract')
+        require(not any(k in runtime_env for k in ('PYTHONPATH', 'GLM52_EAGER_IR_DIR')),
+                'candidate must not override capture observer environment')
+        result['scope'] = ('benchmark-only recurrent small eager compiler IR; page128 ctx4096; '
+                           'natural pre-ready warmup only, NOT original-shape or performance evidence')
+    else:
+        require(not os.environ.get('GLM52_EAGER_IR_DIR'),
+                'GLM52_EAGER_IR_DIR requires explicit eager-ir mode')
     result['candidate_sha256'] = hashlib.sha256(candidate_bytes).hexdigest()
     pins = {'torch': '2.11.0+cpu', 'jax': '0.11.2', 'jaxlib': '0.11.2',
             'libtpu': '0.0.50', 'torch_tpu': '0.2.1.dev20261028201649',
@@ -360,6 +423,25 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
 
     memory_thread = threading.Thread(target=sample_memory, daemon=True)
     memory_thread.start()
+    if mode == 'eager-ir':
+        # Opt in only after all coordinate/dry-run/staged preparation subprocesses.
+        # Every launcher/server/spawned worker then installs the existing early hook.
+        observer = Path('benchmark/tpu/glm52_epic/observer').resolve()
+        require((observer / 'sitecustomize.py').is_file(), 'missing benchmark sitecustomize')
+        ir_root = (OUT / 'eager-ir' / allocation).resolve()
+        require(ir_root.is_relative_to(Path('/tmp/tpu_logs').resolve()),
+                'capture directory must remain under /tmp/tpu_logs')
+        require(not os.environ.get('GLM52_EAGER_IR_DIR') or
+                os.environ['GLM52_EAGER_IR_DIR'] == str(ir_root),
+                'conflicting inherited GLM52_EAGER_IR_DIR')
+        ir_root.mkdir(parents=True, exist_ok=False)
+        inherited_path = os.environ.get('PYTHONPATH', '')
+        os.environ['PYTHONPATH'] = os.pathsep.join(
+            [str(observer), str(Path.cwd().resolve())] + ([inherited_path] if inherited_path else []))
+        os.environ['GLM52_EAGER_IR_DIR'] = str(ir_root)
+        result['ir_capture'] = dict(directory=str(ir_root), observer=str(observer),
+                                    pythonpath=os.environ['PYTHONPATH'])
+        check_ir_budget()
     server_log = (OUT / 'server.log').open('wb', buffering=0)
     command = [sys.executable, '-u', '-m', 'benchmark.tpu.launch_server', '--config',
                '@'+str(candidate), '--shutdown-grace', '25']
@@ -377,40 +459,47 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
             except (OSError, urllib.error.URLError):
                 pass
             time.sleep(1)
-        # A >=512-token request alone does not prove q-block execution: attention
-        # DP divides the configured chunk ceiling, and the scheduler can split
-        # this request below the kernel threshold. Record intent, not coverage.
-        # Keep the long candidate's historical short probe unchanged.
-        smoke_tokens = 512 if mode in ('eager', 'compile-smoke') else 4
-        # One output comes from prefill logits; require a second output to
-        # exercise a decode forward, which never uses the q-block prefill op.
-        smoke_outputs = 2 if mode in ('eager', 'compile-smoke', 'historical-replay') else 1
-        request_body = {'input_ids': [1] * smoke_tokens, 'sampling_params': {
-            'temperature': 0, 'max_new_tokens': smoke_outputs, 'ignore_eos': True}, 'stream': False}
-        save('generate-request.json', request_body)
-        code, body = request('http://127.0.0.1:30000/generate', request_body, timeout=600)
-        (OUT / 'generate-response.json').write_bytes(body)
-        response = json.loads(body)
-        require(code == 200 and isinstance(response, dict), '/generate failed')
-        meta = response.get('meta_info', {})
-        require(meta.get('completion_tokens') == smoke_outputs,
-                f'smoke did not produce exactly {smoke_outputs} tokens')
-        require(meta.get('finish_reason', {}).get('type') != 'abort', 'generation aborted')
-        ids = response.get('output_ids')
-        # Current native response includes IDs; never silently treat absence as success.
-        require(isinstance(ids, list) and len(ids) == smoke_outputs
-                and all(type(token) is int for token in ids),
-                f'current native /generate must return {smoke_outputs} output token IDs')
-        local_chunk = args['chunked_prefill_size'] // args['attn_dp_size']
-        result['configured_local_chunk_ceiling'] = local_chunk
-        result['attention_path_runtime_verified'] = False
-        result.update(health_status=200, generate_status=code, output_ids=ids,
-                      request_success_count=1, generate_input_tokens=len(request_body['input_ids']),
-                      expected_attention_path=(
-                          ('per_query_prefill_fallback_expected'
-                            if local_chunk < 512 else 'qblock_prefill_eligible_not_verified')
-                          if mode in ('eager', 'compile-smoke')
-                          else 'candidate_default_attention_path'))
+        if mode == 'eager-ir':
+            # /health=200 follows the server's natural pre-ready warmup. Do not
+            # manufacture additional shapes with the usual post-ready /generate.
+            result.update(health_status=200, request_success_count=0,
+                          postready_generate_skipped=True,
+                          capture_boundary='natural pre-ready warmup complete')
+        else:
+            # A >=512-token request alone does not prove q-block execution: attention
+            # DP divides the configured chunk ceiling, and the scheduler can split
+            # this request below the kernel threshold. Record intent, not coverage.
+            # Keep the long candidate's historical short probe unchanged.
+            smoke_tokens = 512 if mode in ('eager', 'eager-ir', 'compile-smoke') else 4
+            # One output comes from prefill logits; require a second output to
+            # exercise a decode forward, which never uses the q-block prefill op.
+            smoke_outputs = 2 if mode in ('eager', 'compile-smoke', 'historical-replay') else 1
+            request_body = {'input_ids': [1] * smoke_tokens, 'sampling_params': {
+                'temperature': 0, 'max_new_tokens': smoke_outputs, 'ignore_eos': True}, 'stream': False}
+            save('generate-request.json', request_body)
+            code, body = request('http://127.0.0.1:30000/generate', request_body, timeout=600)
+            (OUT / 'generate-response.json').write_bytes(body)
+            response = json.loads(body)
+            require(code == 200 and isinstance(response, dict), '/generate failed')
+            meta = response.get('meta_info', {})
+            require(meta.get('completion_tokens') == smoke_outputs,
+                    f'smoke did not produce exactly {smoke_outputs} tokens')
+            require(meta.get('finish_reason', {}).get('type') != 'abort', 'generation aborted')
+            ids = response.get('output_ids')
+            # Current native response includes IDs; never silently treat absence as success.
+            require(isinstance(ids, list) and len(ids) == smoke_outputs
+                    and all(type(token) is int for token in ids),
+                    f'current native /generate must return {smoke_outputs} output token IDs')
+            local_chunk = args['chunked_prefill_size'] // args['attn_dp_size']
+            result['configured_local_chunk_ceiling'] = local_chunk
+            result['attention_path_runtime_verified'] = False
+            result.update(health_status=200, generate_status=code, output_ids=ids,
+                          request_success_count=1, generate_input_tokens=len(request_body['input_ids']),
+                          expected_attention_path=(
+                              ('per_query_prefill_fallback_expected'
+                                if local_chunk < 512 else 'qblock_prefill_eligible_not_verified')
+                              if mode in ('eager', 'eager-ir', 'compile-smoke')
+                              else 'candidate_default_attention_path'))
         check_child()
         # Opt-in only: prepared requests must reference frozen data + its manifest
         # available locally (e.g. supplemental exact JAX source /workspace/sglang-jax).
@@ -537,6 +626,16 @@ finally:
     if control:
         control.shutdown()
         control.server_close()
+    if ir_root is not None:
+        try:
+            inventory = scan_ir(inventory=True, enforce=False)
+            save('ir-inventory.json', inventory)  # Paths and sizes, never hash massive dumps.
+            result['ir_artifacts'] = {k: v for k, v in inventory.items() if k != 'files'}
+            require(inventory['file_count'] < IR_STOP_FILES and
+                    inventory['size_bytes'] < IR_STOP_BYTES,
+                    'final IR artifact inventory reached 80% stop threshold')
+        except Exception as error:
+            result.update(status='FAILED', ir_inventory_error=f'{type(error).__name__}: {error}')
     result['elapsed_seconds'] = round(time.monotonic() - START, 3)
     save('result.json', result)
     print(json.dumps(result, sort_keys=True), flush=True)
