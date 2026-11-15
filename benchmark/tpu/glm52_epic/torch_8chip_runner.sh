@@ -519,9 +519,15 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
         check_child()
         if os.environ.get('GLM52_TEXT_E2E') == '1':
             require(mode == 'compiled-long-e2e', 'text E2E requires proven compiled long mode')
-            run([sys.executable, '-m', 'benchmark.tpu.glm52_epic.text_e2e_client',
-                 '--base-url', 'http://127.0.0.1:30000', '--output', str(OUT / 'text-e2e')],
-                'text-e2e-client.log', 3600)
+            try:
+                run([sys.executable, '-m', 'benchmark.tpu.glm52_epic.text_e2e_client',
+                     '--base-url', 'http://127.0.0.1:30000', '--output', str(OUT / 'text-e2e')],
+                    'text-e2e-client.log', 3600)
+            finally:
+                for evidence in [OUT / 'text-e2e-client.log', *sorted((OUT / 'text-e2e').glob('*.json'))]:
+                    if evidence.is_file():
+                        print('GLM52_TEXT_EVIDENCE ' + evidence.name + '\\n' +
+                              evidence.read_text(errors='replace'), flush=True)
             text_result = json.loads((OUT / 'text-e2e/result.json').read_text())
             result['text_e2e'] = text_result
             print('GLM52_TEXT_E2E_RESULT ' + json.dumps(text_result), flush=True)
