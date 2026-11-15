@@ -1431,6 +1431,39 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         del self.index_key_buffer
         del self.kpool_raw_buffer
 
+    def get_state(self) -> list[torch.Tensor]:
+        """Every buffer the ops update in place, for direct_compile.
+
+        Every layer's NoPE, then RoPE, then the index keys and raw key|gate of
+        the layers that have them. The inherited MLA version returns
+        ``kv_buffer``, which this pool does not have.
+        """
+        return [
+            buf
+            for kind in (
+                self.nope_buffer,
+                self.rope_buffer,
+                self.index_key_buffer,
+                self.kpool_raw_buffer,
+            )
+            for buf in kind
+            if buf is not None
+        ]
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        """Install a list laid out like ``get_state``; absent buffers stay None."""
+        it = iter(state)
+
+        def take(kind: list) -> list:
+            return [None if buf is None else next(it) for buf in kind]
+
+        self.nope_buffer = take(self.nope_buffer)
+        self.rope_buffer = take(self.rope_buffer)
+        self.index_key_buffer = take(self.index_key_buffer)
+        self.kpool_raw_buffer = take(self.kpool_raw_buffer)
+        leftover = sum(1 for _ in it)
+        assert leftover == 0, f"set_state got {leftover} extra tensors"
+
     def get_page_buffers(self, layer_id: int) -> list[torch.Tensor]:
         """Layer ``layer_id``'s buffers in a fixed order: NoPE, RoPE, then the
         index keys and raw key|gate when it has them. Each leads with
