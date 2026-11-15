@@ -44,5 +44,6 @@
       "requested_global_chunk": 4096
     },
     "evidence": "live native server_args and preflight; defaultpreflightFAILED is not terminalstatus"
-  }
+  },
+  "terminal": "FAILED diagnostic reached10000files at64.38MB; loader still starting; no eagerwarmup/fatal verdict"
 }

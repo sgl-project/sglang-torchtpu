@@ -1,0 +1,120 @@
+{
+  "experiment": "exp-s04p89hobu",
+  "status": "DIAGNOSTIC_FILE_BUDGET_ABORT_BEFORE_WARMUP",
+  "hosts": [
+    {
+      "bootstrap_provenance": {
+        "base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+        "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3",
+        "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c",
+        "got": {
+          "jax": "0.11.2",
+          "jaxlib": "0.11.2",
+          "libtpu": "0.0.50",
+          "torch": "2.11.0+cpu",
+          "torch_tpu": "0.2.1.dev20261028201649",
+          "torchvision": "0.26.0+cpu",
+          "tpu-sync-torch": "0.0.1.dev20261031081414"
+        },
+        "peer_experiment": "exp-bsvzoblh0d",
+        "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00",
+        "peer_task_status": "succeeded",
+        "prepared_wheelhouse": "/prepared/wheelhouse",
+        "schema_version": 1,
+        "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity",
+        "source_commit": "a2f1f27cfb81d7ebba2be92aad91864bff3c1bbb",
+        "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git",
+        "want": {
+          "jax": "0.11.2",
+          "jaxlib": "0.11.2",
+          "libtpu": "0.0.50",
+          "torch": "2.11.0",
+          "torch_tpu": "0.2.1.dev20261028201649",
+          "torchvision": "0.26.0",
+          "tpu-sync-torch": "0.0.1.dev20261031081414"
+        },
+        "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+        "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+        "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"
+      },
+      "candidate_sha256": "da8b1c4bf63f7eed1cdbc268e608a93b9d775bc7d03ba0871789d0e86a371724",
+      "coordinate_probe": "/tmp/glm52-peer-rank0.FQMVua/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS=\"ignore:<TorchTpu/Performance/TcMalloc/\" to suppress this warning.\n  _tcmalloc_check.check_tcmalloc()\nWARNING: All log messages before absl::InitializeLog() is called are written to STDERR\nI0000 00:00:1794749818.282048     628 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank0.FQMVua/venv/lib/python3.12/site-packages/libtpu/libtpu.so\nI0000 00:00:1794749818.294400     628 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.\n[W1115 13:36:58.592922259 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())\nI0000 00:00:1794749818.925997     628 device_rt.cc:172] PjRt runtime initialization deferred for tpu\nSuccessfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')\nRegistered Python module for 'tpu'.\nDevice type: tpu, Device index: default\nInitializing TPU distributed runtime\nI0000 00:00:1794749818.928784     628 libtpu_version.cc:63] Setting libtpu version to: 0.0.50\nI0000 00:00:1794749820.802522     628 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.\nI0000 00:00:1794749825.573054     628 pjrt_c_api_client.cc:187] PjRtCApiClient created.\nW0000 00:00:1794749825.573098     628 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.\nTORCH_TPU_LOCAL_DEVICE_COORDS=[0, 0, 1]\nI0000 00:00:1794749825.576823     628 compilation_cache.cc:360] Compilation cache evicted.\nI0000 00:00:1794749825.576843     628 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0\nnum_cache_hits=0 {NA}\nnum_compilations=0\npeak_compilation_memory_bytes=unknown",
+      "elapsed_seconds": 316.947,
+      "error": "RuntimeError: IR artifact 80% stop threshold reached: 64379511 bytes, 10000 files; evidence preserved, no deletion",
+      "falcon_rank": 0,
+      "host_preparation": {
+        "actual_read_bytes": 388633344768,
+        "buffer_bytes_per_worker": 4194304,
+        "checkpoint": "/models/GLM5.2-fp8-channel-wise",
+        "elapsed_s": 86.06072007864714,
+        "execute": true,
+        "host": "falcon-job-922twj5akh-workers-0-0",
+        "host_expert_union": [
+          128,
+          256
+        ],
+        "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+        "indexed_files": 282,
+        "physical_rank": 1,
+        "requested_bytes": 388633344768,
+        "scope": "numeric expert union plus all unmatched/shared keys; not physical I/O or cache residency",
+        "selected_useful_bytes": 388633344768,
+        "slice_only": false,
+        "threads": 8,
+        "total_indexed_payload_bytes": 756251507456,
+        "unindexed_not_prepared": []
+      },
+      "image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+      "ir_artifacts": {
+        "directory": "/tmp/tpu_logs/glm52-torch/rank-0/eager-ir/4cf25111e44443c188861613ac8ef92c",
+        "file_count": 7763,
+        "max_bytes_per_host": 4294967296,
+        "max_files_per_host": 12500,
+        "max_files_two_hosts": 25000,
+        "size_bytes": 49336959,
+        "stop_bytes_per_host": 3435973836,
+        "stop_files_per_host": 10000
+      },
+      "ir_capture": {
+        "directory": "/tmp/tpu_logs/glm52-torch/rank-0/eager-ir/4cf25111e44443c188861613ac8ef92c",
+        "observer": "/tmp/glm52-peer-rank0.FQMVua/src/benchmark/tpu/glm52_epic/observer",
+        "pythonpath": "/tmp/glm52-peer-rank0.FQMVua/src/benchmark/tpu/glm52_epic/observer:/tmp/glm52-peer-rank0.FQMVua/src"
+      },
+      "ir_inventory_error": "RuntimeError: IR inventory scan exceeded 0.75s bound",
+      "launcher_shutdown_exit_code": 143,
+      "scope": "benchmark-only recurrent small eager compiler IR; page128 ctx4096; natural pre-ready warmup only, NOT original-shape or performance evidence",
+      "source_commit": "a2f1f27cfb81d7ebba2be92aad91864bff3c1bbb",
+      "status": "FAILED",
+      "topology": {
+        "chip_topology": "2x2x2",
+        "devices_per_host": 8,
+        "hosts": [
+          "10.228.6.6",
+          "10.228.7.254"
+        ],
+        "native_topology": "2,2,2,2",
+        "physical_chip_nodes": [
+          "/dev/vfio/0",
+          "/dev/vfio/1",
+          "/dev/vfio/2",
+          "/dev/vfio/3",
+          "/dev/vfio/4",
+          "/dev/vfio/5",
+          "/dev/vfio/6",
+          "/dev/vfio/7"
+        ],
+        "physical_chips": 8,
+        "total_devices": 16
+      },
+      "versions": {
+        "jax": "0.11.2",
+        "jaxlib": "0.11.2",
+        "libtpu": "0.0.50",
+        "torch": "2.11.0+cpu",
+        "torch_tpu": "0.2.1.dev20261028201649",
+        "tpu-sync-torch": "0.0.1.dev20261031081414"
+      }
+    }
+  ],
+  "scope": "not originalfatal or NONREPRO or OOM evidence; no automaticrerun"
+}
