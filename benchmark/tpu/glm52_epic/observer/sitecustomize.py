@@ -7,7 +7,9 @@ if os.environ.get("GLM52_EAGER_IR_DIR"):
     # Python normally ignores sitecustomize exceptions: force explicit failure
     # instead of silently running a diagnostic without compiler artifacts.
     try:
-        from benchmark.tpu.glm52_epic.eager_ir_capture import install as install_ir
+        # Scoped mode avoids loading-time dump flood; initialization/weight
+        # loading are intentionally outside capture. No silent fallback global.
+        from benchmark.tpu.glm52_epic.scoped_eager_ir import install as install_ir
 
         install_ir(os.environ["GLM52_EAGER_IR_DIR"])
     except Exception as error:
