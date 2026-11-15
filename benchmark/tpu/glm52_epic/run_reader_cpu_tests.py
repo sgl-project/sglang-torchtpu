@@ -25,7 +25,9 @@ def main():
     boundary.assign_extend_cache_locs_cpu = unavailable
     boundary.fill_accept_out_cache_loc_cpu = unavailable
     boundary.fill_bonus_tokens_cpu = unavailable
-    print('CPU_EXTENSION_BOUNDARY: 5 unused symbols fail on execution; real reader/loader tests', flush=True)
+    boundary.build_tree_kernel_efficient_cpu = unavailable
+    boundary.verify_tree_greedy_cpu = unavailable
+    print('CPU_EXTENSION_BOUNDARY: 7 unused symbols fail on execution; real reader/loader tests', flush=True)
     with patch.dict(sys.modules, {'sgl_kernel': boundary}):
         runpy.run_path('test/registered/unit/hardware_backend/tpu/test_ep_local_expert_reader.py', run_name='__main__')
 
