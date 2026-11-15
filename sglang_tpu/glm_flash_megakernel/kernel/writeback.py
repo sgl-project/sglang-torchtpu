@@ -1,9 +1,12 @@
-"""Scatter a step's new nope rows and KDA checkpoints into serving's pools in place.
+"""Scatter a step's new nope rows and KDA conv checkpoints into serving's pools in place.
 
 A separate local kernel: XLA copies every operand that a kernel with remote DMA
 aliases, so the megakernel emits its rows as outputs and this one writes them.
 Raw index rows and pooled records are sub-tile slices of their pools, which a DMA
-cannot address; `runner` scatters those with XLA, as serving's kpool step does.
+cannot address, and the KDA temporal checkpoints are too big for an HBM->HBM DMA
+(~33 GB/s on v7x); `runner` scatters those with XLA, as serving's kpool step does.
+The conv checkpoints (36 KB per row) go here: an XLA scatter on the [slots, K-1, 1,
+dim] pool squeezes the unit dim and relayouts the whole pool three times per layer.
 """
 
 from __future__ import annotations
@@ -16,29 +19,19 @@ from . import pools as PL
 
 
 def row_write_call(spec, cfg):
-    """`f(meta, pos, tab, ckrow, nkv, recur, conv, *nope, *temporal, *conv) -> pools`.
-
-    Row r = b*Q + qi is token pos[b]+qi of request b. The Q checkpoint rows of a
-    request are contiguous (`TpuMambaPool.checkpoint_rows`), one DMA per layer.
-    """
+    """`f(meta, pos, tab, ckrow, nkv, conv, *nope, *conv_pools) -> (*nope, *conv_pools)`.
+    Row r = b*Q + qi is token pos[b]+qi of request b; its conv checkpoint goes to
+    pool row ckrow[r]."""
     B, Q, R = cfg.n_req, cfg.n_query, cfg.rows
     ps, pps = cfg.page_size, cfg.pages_per_seq
     n_dsa, n_kda = len(spec.dsa_layers), len(spec.kda_layers)
-    n_pool = n_dsa + n_kda * 2
 
-    def kernel(meta_ref, pos_ref, tab_ref, ckrow_ref, nkv, recur, conv, *rest):
-        out = rest[n_pool : 2 * n_pool]
-        sems = rest[2 * n_pool]
-        nope = out[:n_dsa]
-        tmp, cnv = out[n_dsa : n_dsa + n_kda], out[n_dsa + n_kda :]
+    def kernel(meta_ref, pos_ref, tab_ref, ckrow_ref, nkv, conv, *rest):
+        nope = rest[n_dsa + n_kda : 2 * n_dsa + n_kda]
+        cpool = rest[2 * n_dsa + n_kda : 2 * (n_dsa + n_kda)]
+        sems, csems = rest[2 * (n_dsa + n_kda)], rest[2 * (n_dsa + n_kda) + 1]
         n_live = meta_ref[0]
         issued = []
-
-        def dma(cond, src, dst, sem):
-            cp = pltpu.make_async_copy(src, dst, sem)
-            pl.when(cond)(cp.start)
-            issued.append((cond, cp))
-
         for b in range(B):
             live = b < n_live
             p = pos_ref[b]
@@ -48,38 +41,38 @@ def row_write_call(spec, cfg):
                 page = PL.page_of(tab_ref, b, tok // ps, pps)
                 off = tok % ps
                 for d in range(n_dsa):
-                    dma(live, nkv.at[d, r], nope[d].at[page, off], sems.at[0, d])
-            row0 = ckrow_ref[b * Q]
-            for k in range(n_kda):
-                dma(
-                    live,
-                    recur.at[k, pl.ds(b * Q, Q)],
-                    tmp[k].at[pl.ds(row0, Q)],
-                    sems.at[1, k],
-                )
-                dma(
-                    live,
-                    conv.at[k, pl.ds(b * Q, Q)],
-                    cnv[k].at[pl.ds(row0, Q)],
-                    sems.at[2, k],
-                )
-        for cond, cp in issued:
-            pl.when(cond)(cp.wait)
+                    cp = pltpu.make_async_copy(
+                        nkv.at[d, r], nope[d].at[page, off], sems.at[d]
+                    )
+                    pl.when(live)(cp.start)
+                    issued.append((live, cp))
+                row = ckrow_ref[r]
+                for k in range(n_kda):
+                    cp = pltpu.make_async_copy(
+                        conv.at[k, r], cpool[k].at[row], csems.at[k]
+                    )
+                    pl.when(live)(cp.start)
+                    issued.append((live, cp))
+        for live, cp in issued:
+            pl.when(live)(cp.wait)
 
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     anyspace = pl.BlockSpec(memory_space=pl.ANY)
-    n_in = 7
+    n_in = 6
 
-    def call(meta, pos, tab, ckrow, nkv, recur, conv, *pools):
-        assert len(pools) == n_pool, (len(pools), n_pool)
+    def call(meta, pos, tab, ckrow, nkv, conv, *pools):
+        assert len(pools) == n_dsa + n_kda, (len(pools), n_dsa, n_kda)
         return pl.pallas_call(
             kernel,
             out_shape=tuple(jax.ShapeDtypeStruct(c.shape, c.dtype) for c in pools),
-            in_specs=[smem] * 4 + [anyspace] * (3 + n_pool),
-            out_specs=(anyspace,) * n_pool,
-            scratch_shapes=[pltpu.SemaphoreType.DMA((3, max(n_dsa, n_kda)))],
-            input_output_aliases={n_in + i: i for i in range(n_pool)},
+            in_specs=[smem] * 4 + [anyspace] * (2 + len(pools)),
+            out_specs=(anyspace,) * len(pools),
+            scratch_shapes=[
+                pltpu.SemaphoreType.DMA((n_dsa,)),
+                pltpu.SemaphoreType.DMA((n_kda,)),
+            ],
+            input_output_aliases={n_in + i: i for i in range(len(pools))},
             name=f"glm_flash_mk_write_r{R}",
-        )(meta, pos, tab, ckrow, nkv, recur, conv, *pools)
+        )(meta, pos, tab, ckrow, nkv, conv, *pools)
 
     return call

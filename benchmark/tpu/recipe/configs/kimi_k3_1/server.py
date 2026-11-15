@@ -96,12 +96,6 @@ CONFIG["runtime_env"].update(
             xla_tpu_offload_gather_to_sparsecore="true",
         ),
         "SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL": "1",
-        # Prefill: each attention-TP rank runs the DSA indexer top-k for its slice of
-        # the chunk's rows and an all-reduce reassembles them. The rows equal the
-        # unsplit op's on 93 layers / 16 chips (every layer and chunk checked); prompt
-        # logprobs still move at the bf16 level because the prefill graph changes.
-        # Cold TTFT 64K 17.6 -> 13.5 s, 128K 37.9 -> 27.0 s; GSM8K-200 0.995.
-        "SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT": "1",
         # Text-only serving compiles only the token-id EXTEND graphs (host RAM at
         # startup); scheduler intake rejects image requests with a 400.
         "SGLANG_TPU_VL_TEXT_ONLY_EXTEND": "1",

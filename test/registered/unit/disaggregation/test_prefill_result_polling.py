@@ -210,8 +210,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_fpm = False
         self._record_step_counters = Mock()
         self._maybe_clear_mm_inputs = Mock()
-        self.maybe_send_health_check_signal = Mock()
-        self.maybe_signal_queued_health_checks = Mock()
+        self.health_monitor = Mock()
         self.disagg_prefill_inflight_queue = []
         self.send_kv_chunk = Mock()
         self.process_pending_chunked_abort = Mock()

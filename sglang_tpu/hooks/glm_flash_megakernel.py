@@ -30,6 +30,7 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
     from sglang_tpu.envs import envs as tpu_envs
 
     args = runner.model_runner.server_args
+    ops.require_expert_tp(args.ep_size)
     n_query = (
         (args.speculative_num_draft_tokens or 1) if args.speculative_algorithm else 1
     )
@@ -42,8 +43,13 @@ def route_glm_flash_megakernel(result: None, runner: Any, *args, **kwargs) -> No
         tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_ROWS.get(),
         runner.model_runner.attn_backend,
         call_rows=tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL_CALL_ROWS.get(),
+        max_requests=args.max_running_requests,
     )
     mk.radix_snapshots = not args.disable_radix_cache
+    # The buckets of the server's warm-up batch sizes compile now, with the warm-up.
+    from sglang.srt.runtime_context import get_exec
+
+    mk.precompile(get_exec().graph.tpu_compile_bs or [1])
     model._tpu_glm_flash_mk = mk
     _KERNELS.append(mk)
     compiled = model.forward

@@ -958,6 +958,15 @@ def handle_model_capability_adjustments(server_args: Any):
             f"{hf_config.model_type}"
         )
 
+    if getattr(hf_config, "model_type", None) == "deepseek_v41":
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            validate_deepseek_v41_encoder_replay_budget,
+        )
+
+        validate_deepseek_v41_encoder_replay_budget(server_args)
+    elif cfg.enable_encoder_swa_bounded_replay:
+        raise ValueError("--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1")
+
 
 def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
     # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
@@ -1006,11 +1015,6 @@ def handle_language_model_only(server_args: Any):
     ):
         if flag:
             raise ValueError(f"--language-model-only cannot be combined with {name}")
-    if cfg.disaggregation_mode != "null":
-        raise ValueError(
-            "--language-model-only is incompatible with --disaggregation-mode "
-            "prefill/decode"
-        )
     architectures = model_config_of(server_args).hf_config.architectures
     if not any(
         a in server_args.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures

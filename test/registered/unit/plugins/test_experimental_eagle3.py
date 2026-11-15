@@ -155,7 +155,7 @@ class TestExperimentalEagle3(CustomTestCase):
 
         expected = {((bs, 8), width) for bs in (1, 2) for width in (2, 4)}
         with (
-            patch.object(torch, "tpu", create=True) as tpu,
+            patch.object(torch.accelerator, "current_stream") as stream,
             patch.object(
                 base_spec_worker, "max_speculative_num_draft_tokens", return_value=4
             ),
@@ -178,8 +178,8 @@ class TestExperimentalEagle3(CustomTestCase):
             idle = TpuSpecVerifyInput.idle(
                 verify_window_rows=worker.verify_window_rows, padded_bs=2, device="cpu"
             )
-        tpu.current_stream.assert_called_once_with()
-        tpu.current_stream.return_value.synchronize.assert_called_once_with()
+        stream.assert_called_once_with()
+        stream.return_value.synchronize.assert_called_once_with()
         self.assertEqual(idle.verify_cache_candidates.shape, (2, 8))
         self.assertEqual(
             set(drafts), {(bs, width) for bs in (1, 2) for width in (2, 4)}
@@ -187,35 +187,58 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertEqual((worker.num_drafts, worker.num_verify_rows), (3, 4))
         self.assertEqual(_chain_worker().verify_widths(), (3,))
 
-    def test_radix_track_step_counts_from_the_device_length(self):
-        """Under overlap the host committed base trails the device by the last
-        commit; the snapshot step must count from the device length (63 + 2 -> step 0)."""
-        snapshots = []
+    def _radix_track_commit(self, *, host_lens, device_lens, last_steps):
+        """The backend's verify commit kwargs for one step (track grid 64, slack 4)."""
+        commits = []
         backend = object.__new__(HybridLinearAttnBackend)
-        backend.update_mamba_state_after_mtp_verify = lambda **kw: snapshots.append(
-            kw["mamba_steps_to_track"]
-        )
+        backend.update_mamba_state_after_mtp_verify = lambda **kw: commits.append(kw)
         worker = _chain_worker()
         worker._target_has_linear_attn = True
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=backend, model=None)
         )
-        accept = SimpleNamespace(last_steps=torch.tensor([1, -1]))
+        accept = SimpleNamespace(last_steps=torch.tensor(last_steps))
         worker.draft = lambda *args: None
-        worker.verify = lambda *args: (None, accept)
+        worker.verify = lambda *args, grammar_barrier=None: (None, accept)
         worker.commit = lambda *args: None
         batch = SimpleNamespace(
             mamba_track_indices=torch.tensor([3, 0]),
             tree_cache=SimpleNamespace(page_size=64),
         )
-        bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=torch.tensor([63, 0])))
-        verify_input = SimpleNamespace(
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=torch.tensor(device_lens))
+        )
+        zeros = torch.zeros(2, dtype=torch.int64)
+        verify_input = TpuSpecVerifyInput(
             verify_cache_candidates=torch.zeros((2, 8), dtype=torch.int64),
-            committed_lens=torch.tensor([60, 0]),
+            verify_cache_candidates_cpu=zeros,
+            committed_lens=zeros,
+            req_pool_indices=zeros,
+            req_pool_indices_cpu=zeros,
+            seq_lens_cpu=torch.tensor(host_lens),
+            host_len_slack=4,
+            future_indices=None,
         )
         with patch.object(base_spec_worker, "mamba_track_grid", return_value=64):
             TpuSpecWorker.step(worker, batch, bucket, verify_input)
-        self.assertEqual(snapshots[0].tolist(), [0, -1])
+        return commits[0]
+
+    def test_radix_track_step_counts_from_the_device_length(self):
+        """Under overlap the host committed base trails the device by the last
+        commit; the snapshot step must count from the device length (63 + 2 -> step 0)."""
+        commit = self._radix_track_commit(
+            host_lens=[60, 0], device_lens=[63, 0], last_steps=[1, -1]
+        )
+        self.assertEqual(commit["mamba_steps_to_track"].tolist(), [0, -1])
+
+    def test_radix_tracking_skips_a_verify_that_cannot_cross_a_boundary(self):
+        """A verify whose host bounds (base 8, base + 4 rows + slack 4) stay inside one
+        track interval snapshots nothing, so it must not launch the snapshot."""
+        commit = self._radix_track_commit(
+            host_lens=[8, 0], device_lens=[11, 0], last_steps=[3, -1]
+        )
+        self.assertIsNone(commit["mamba_track_indices"])
+        self.assertIsNone(commit["mamba_steps_to_track"])
 
     def test_flag_routes_eagle3_and_leaves_other_algorithms_alone(self):
         with (
@@ -743,13 +766,13 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         buckets = SimpleNamespace(next_bucket=lambda bs: 1 << (bs - 1).bit_length())
         with (
-            patch.object(torch, "tpu", create=True) as tpu,
+            patch.object(torch.accelerator, "current_stream") as stream,
             patch.object(TpuChainSpecWorker, "_compile_policy", return_value=policy),
             patch.object(TpuChainSpecWorker, "_b_bucketer", return_value=buckets),
         ):
             worker._warmup_extend_sampling()
-        tpu.current_stream.assert_called_once_with()
-        tpu.current_stream.return_value.synchronize.assert_called_once_with()
+        stream.assert_called_once_with()
+        stream.return_value.synchronize.assert_called_once_with()
         self.assertEqual({shape for shape, _ in sampled}, {(1,), (2,), (4,)})
         self.assertEqual(
             broadcast,
@@ -824,16 +847,31 @@ class TestExperimentalEagle3(CustomTestCase):
         )
 
     def test_pd_prefill_ships_the_carried_hidden(self):
-        """A PD prefill hands core one seed row per request: the carried hidden at
-        the extend cap (copied to host whole), topk as host placeholders."""
+        """A PD prefill hands core one seed row per request: the carried hidden and DSA
+        top-k at the extend cap (copied to host whole), topk as host placeholders. The
+        DSA top-k is cut to the wire's columns."""
         draft_input = HostPaddedChainDraftInput(
             bonus_tokens=torch.tensor([1, 2]), new_seq_lens=torch.tensor([3, 4])
         )
         tail_hidden = torch.arange(8.0).view(4, 2)
-        _attach_pd_seeds(draft_input, tail_hidden=tail_hidden, bs=2)
+        # A TPU top-k row pads the wire's columns with -1 to whole lanes.
+        dsa_topk = torch.tensor([[7, 8, 9, -1, -1]] * 4, dtype=torch.int32)
+        _attach_pd_seeds(
+            draft_input,
+            tail_hidden=tail_hidden,
+            dsa_topk=dsa_topk,
+            dsa_wire_width=3,
+            bs=2,
+        )
         self.assertIs(draft_input.hidden_states, tail_hidden)
+        self.assertEqual(draft_input.dsa_topk_indices.tolist(), [[7, 8, 9]] * 4)
         self.assertEqual(draft_input.topk_p.shape, (2, 1))
         self.assertEqual(draft_input.topk_index.device.type, "cpu")
+        # Without index sharing there is no capture to ship.
+        _attach_pd_seeds(
+            draft_input, tail_hidden=tail_hidden, dsa_topk=None, dsa_wire_width=0, bs=2
+        )
+        self.assertIsNone(draft_input.dsa_topk_indices)
 
     def test_multimodal_draft_prompt_reads_the_next_rows_embeds(self):
         """Row p of the draft prompt embeds token p + 1 from the target's embeds;
@@ -1214,6 +1252,90 @@ class TestChainDsaIndexShare(CustomTestCase):
         self.assertEqual(
             _capture_layout(warm_extend["spec_info"]), _capture_layout(served_extend)
         )
+        # An idle DP rank runs the same warmed prompt program as its peers.
+        served_idle = self._idle_prefill(seed_table=self._seed_table(), cap=cap)
+        self.assertEqual(
+            _capture_layout(warm_extend["spec_info"]),
+            _capture_layout(served_idle.spec_info),
+        )
+
+    def _idle_prefill(
+        self, *, seed_table, cap, tokens: int = 8, draft_context=None, init_new=None
+    ):
+        """TpuChainSpecWorker._forward_idle_draft_prefill; returns the batch it forwards."""
+        worker = object.__new__(TpuChainSpecWorker)
+        worker.device = "cpu"
+        drafter = self._drafter(seed_table)
+        if draft_context is not None:
+            drafter.draft_context = draft_context
+        worker._chain_draft_worker = drafter
+        worker._compile_policy = lambda: SimpleNamespace(
+            _extend_compile_cap=lambda: cap
+        )
+        served = []
+        worker._draft_runner = SimpleNamespace(forward=served.append)
+        if init_new is None:
+            init_new = lambda *args, **kwargs: SimpleNamespace(  # noqa: E731
+                forward_mode=ForwardMode.IDLE, global_num_tokens_cpu=[0, tokens]
+            )
+        with patch.object(chain_spec_worker.ForwardBatch, "init_new", init_new):
+            worker._forward_idle_draft_prefill(
+                SimpleNamespace(extend_lens=None),
+                target_hidden=torch.zeros((tokens, self.HIDDEN)),
+            )
+        (forward_batch,) = served
+        return forward_batch
+
+    def test_draft_prompt_batches_are_built_in_the_draft_scope(self):
+        """Under DP attention the draft scope narrows EP to one, and init_new reads
+        it to leave num_token_non_padded unset, as the warmed program has it. Built
+        outside the scope, both prompt passes guard-miss under fail_on_recompile."""
+        in_scope = []
+
+        @contextlib.contextmanager
+        def draft_context():
+            in_scope.append(True)
+            try:
+                yield
+            finally:
+                in_scope.pop()
+
+        built_in_scope = []
+
+        def init_new(*args, **kwargs):
+            built_in_scope.append(bool(in_scope))
+            return SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND, global_num_tokens_cpu=None
+            )
+
+        self._idle_prefill(
+            seed_table=None, cap=4, draft_context=draft_context, init_new=init_new
+        )
+        worker = object.__new__(TpuChainSpecWorker)
+        worker.device = "cpu"
+        drafter = self._drafter(None)
+        drafter.draft_context = draft_context
+        worker._chain_draft_worker = drafter
+        worker._compile_policy = lambda: SimpleNamespace(_extend_compile_cap=lambda: 4)
+        worker._draft_prompt_ids = lambda batch, **_: None
+        tail = torch.zeros((4, self.HIDDEN))
+        worker._draft_runner = SimpleNamespace(
+            forward=lambda forward_batch: SimpleNamespace(
+                logits_output=SimpleNamespace(
+                    next_token_logits=tail, hidden_states=tail
+                )
+            )
+        )
+        with patch.object(chain_spec_worker.ForwardBatch, "init_new", init_new):
+            worker._extend_draft(
+                SimpleNamespace(
+                    extend_lens=[8], req_pool_indices_cpu=torch.tensor([1])
+                ),
+                target_hidden=torch.zeros((8, 1)),
+                bucket_tokens=None,
+                mm_input_embeds=None,
+            )
+        self.assertEqual(built_in_scope, [True, True])
 
 
 if __name__ == "__main__":

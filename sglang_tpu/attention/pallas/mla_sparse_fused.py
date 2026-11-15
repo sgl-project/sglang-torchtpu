@@ -135,8 +135,13 @@ def _store_step(
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     distribution: jax.Array,
+    write_rope: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
-    """Store this step's tokens in the layer's two cache buffers."""
+    """Store this step's tokens in the layer's two cache buffers.
+
+    ``write_rope=False`` leaves the rope buffer untouched (see
+    ``update_sparse_mla_kv_cache``).
+    """
     # The pool allocates the buffers without importing the kernels. The writer
     # below checks them against these specs, so a buffer with the wrong shape
     # or dtype fails here instead of being written with a wrong layout.
@@ -157,6 +162,7 @@ def _store_step(
         active_cu_q_lens,
         nope_spec=nope_spec,
         rope_spec=rope_spec,
+        write_rope=write_rope,
     )
 
 
@@ -177,12 +183,18 @@ def sparse_mla_attention_fused(
     k_scale: float,
     qblock_kpool: int = 0,
     gather_chunk_tokens: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+    zero_rope: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run one step: store the new tokens in the cache, then attend.
 
     Each row of ``topk_indices`` lists the key positions one query token may
     attend to, counted from the start of its own sequence. The valid positions
     come first and the rest of the row is ``-1``.
+
+    ``zero_rope`` is for a model without rope, whose rope lane (``q_pe`` and
+    ``new_k_pe``) is identically zero. The rope cache is allocated zeroed, so
+    the step neither writes nor reads it: the rope score term is 0 either way,
+    and the output does not change.
 
     Returns ``(output, cache_nope, cache_rope)``: the attention output
     ``[max_num_tokens, num_q_heads, 512]`` and the two updated buffers.
@@ -201,6 +213,7 @@ def sparse_mla_attention_fused(
         page_indices,
         cu_q_lens,
         distribution,
+        write_rope=not zero_rope,
     )
 
     pages_per_seq = page_indices.shape[0] // (cu_q_lens.shape[0] - 1)
@@ -236,6 +249,7 @@ def sparse_mla_attention_fused(
             k_scale=k_scale,
             kpool=qblock_kpool,
             query_block=query_block,
+            read_rope=not zero_rope,
         )
         return out, cache_nope, cache_rope
 
@@ -254,6 +268,7 @@ def sparse_mla_attention_fused(
         gather_and_attention_chunk_size=min(
             gather_chunk_tokens, max(64, ql_nope.shape[0])
         ),
+        gather_rope=not zero_rope,
     )
     # The kernel returns 512 NoPE + 64 RoPE values per head. Only the NoPE part
     # is the attention output.

@@ -14,6 +14,17 @@ index and the group sums the buffers. Adding zero leaves every value unchanged,
 so the result equals a correct all-gather; the only bit-level difference is that
 a -0.0 element comes back as +0.0.
 
+The workaround is scoped to the vocabulary logits gathers: in
+``LogitsProcessor``, the TP gather (``_logits_gatherer``, which falls back to
+``tensor_model_parallel_all_gather`` on TPU) and the attention-TP gather used
+with ``--enable-dp-lm-head`` (``_gather_attn_tp_logits``); and the speculative
+draft gather ``sglang.srt.models.dspark.gather_and_crop_vocab``.
+``GroupCoordinator`` collectives stay native. Hooking them changed every
+per-layer gather (DP-attention token gathers, fused-MoE token gathers) and
+moved about 2x the bytes. A similar compiled-gather fault on the DCP query-head
+gather is handled at its own call site
+(``sglang_tpu/attention_pallas_rpa_dcp.py``).
+
 The hook keys on ``torch.compiler.is_dynamo_compiling()``, so only graphs the
 Dynamo tracer builds take this path. The direct tracer and eager calls keep the
 native all-gather. The direct tracer never showed the defect, and it must not
@@ -28,6 +39,8 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import torch
+
+from sglang.srt.runtime_context import get_parallel
 
 
 def gather_blocks_via_all_reduce(group: Any, block: torch.Tensor) -> torch.Tensor:
@@ -50,19 +63,75 @@ def gather_blocks_via_all_reduce(group: Any, block: torch.Tensor) -> torch.Tenso
     return blocks.reshape(world_size * block.shape[0], *block.shape[1:])
 
 
-def all_gather_into_tensor_around(
-    original: Callable[..., Any],
-    group: Any,
-    output: torch.Tensor,
-    input: torch.Tensor,  # noqa: A002 - mirrors GroupCoordinator's signature
-) -> None:
-    """AROUND hook for ``GroupCoordinator.all_gather_into_tensor``.
+def gather_last_dim_via_all_reduce(group: Any, x: torch.Tensor) -> torch.Tensor:
+    """Concatenates every rank's ``x`` along its last dim, using one all-reduce."""
+    world_size = group.world_size
+    gathered = gather_blocks_via_all_reduce(group, x)
+    gathered = gathered.reshape((world_size, *x.shape)).movedim(0, -2)
+    return gathered.reshape((*x.shape[:-1], world_size * x.shape[-1]))
 
-    Only Dynamo-traced calls on a multi-rank group take the all-reduce path.
-    Eager calls, direct-tracer graphs and single-rank groups call the original
-    collective.
+
+def _use_all_reduce_gather(group: Any) -> bool:
+    return torch.compiler.is_dynamo_compiling() and group.world_size > 1
+
+
+class TpuLogitsGatherer:
+    """Wraps ``LogitsProcessor._logits_gatherer`` for the TP logits gather.
+
+    Under Dynamo on a multi-rank TP group, gathers through the all-reduce;
+    otherwise calls the wrapped gatherer.
     """
-    if not torch.compiler.is_dynamo_compiling() or group.world_size == 1:
-        return original(group, output, input)
-    output.copy_(gather_blocks_via_all_reduce(group, input).view(output.shape))
-    return None
+
+    def __init__(self, fallback: Callable[[torch.Tensor], torch.Tensor]):
+        self._fallback = fallback
+
+    def __call__(self, logits: torch.Tensor) -> torch.Tensor:
+        group = get_parallel().tp_group
+        if not _use_all_reduce_gather(group):
+            return self._fallback(logits)
+        return gather_last_dim_via_all_reduce(group, logits)
+
+
+def wrap_logits_gatherer(result: Any, processor: Any, *args: Any, **kwargs: Any):
+    """AFTER hook for ``LogitsProcessor.__init__``."""
+    gatherer = getattr(processor, "_logits_gatherer", None)
+    if gatherer is not None and not isinstance(gatherer, TpuLogitsGatherer):
+        processor._logits_gatherer = TpuLogitsGatherer(gatherer)
+    return result
+
+
+def gather_attn_tp_logits_around(
+    original: Callable[..., torch.Tensor], processor: Any, logits: torch.Tensor
+) -> torch.Tensor:
+    """AROUND hook for ``LogitsProcessor._gather_attn_tp_logits``.
+
+    Covers the ``--enable-dp-lm-head`` logits gather over the attention-TP
+    group. Rows of zero and a vocabulary that does not divide evenly use the
+    original, as do eager and direct-tracer calls.
+    """
+    group = get_parallel().attn_tp_group
+    if (
+        not _use_all_reduce_gather(group)
+        or logits.shape[0] == 0
+        or processor.vocab_size % group.world_size
+    ):
+        return original(processor, logits)
+    return gather_last_dim_via_all_reduce(group, logits)
+
+
+def gather_and_crop_vocab_around(
+    original: Callable[..., torch.Tensor],
+    local_logits: torch.Tensor,
+    lm_head: Any,
+) -> torch.Tensor:
+    """AROUND hook for ``sglang.srt.models.dspark.gather_and_crop_vocab``.
+
+    The speculative draft logits gather (MTP, EAGLE3 and DSpark draft workers)
+    runs inside Dynamo-compiled draft graphs, so it gets the same treatment as
+    the ``LogitsProcessor`` TP gather.
+    """
+    group = get_parallel().tp_group
+    if not _use_all_reduce_gather(group):
+        return original(local_logits, lm_head)
+    full_logits = gather_last_dim_via_all_reduce(group, local_logits)
+    return full_logits[..., : int(lm_head.org_vocab_size)]

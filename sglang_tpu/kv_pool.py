@@ -1441,6 +1441,25 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             buf for buf in optional if buf is not None
         ]
 
+    def transfer_page_buffers(self) -> list[tuple[int, torch.Tensor]]:
+        """``(layer_id, buffer)`` for every buffer a P/D transfer moves.
+
+        Grouped by kind: every layer's NoPE, then RoPE, index keys and raw
+        key|gate. A model without RoPE dims (``qk_rope_head_dim == 0``) only
+        writes zeros to its RoPE buffer, so the buffer stays behind: the
+        receiver's starts zeroed too.
+        """
+        kinds = [self.nope_buffer]
+        if self.qk_rope_head_dim > 0:
+            kinds.append(self.rope_buffer)
+        kinds += [self.index_key_buffer, self.kpool_raw_buffer]
+        return [
+            (self.start_layer + i, buf)
+            for kind in kinds
+            for i, buf in enumerate(kind)
+            if buf is not None
+        ]
+
     def get_nope_cache(self, layer_id: int) -> torch.Tensor:
         return self.nope_buffer[layer_id - self.start_layer]
 
@@ -1487,8 +1506,13 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
     def get_kv_buffer(self, *args, **kwargs):
         self._unsupported("get_kv_buffer")
 
-    def get_contiguous_buf_infos(self, *args, **kwargs):
-        self._unsupported("get_contiguous_buf_infos")
+    def get_contiguous_buf_infos(self):
+        buffers = [buf for _, buf in self.transfer_page_buffers()]
+        data_ptrs = [buf.data_ptr() for buf in buffers]
+        data_lens = [buf.nbytes for buf in buffers]
+        # One item = one page: every buffer leads with num_pages.
+        item_lens = [buf[0].nbytes for buf in buffers]
+        return data_ptrs, data_lens, item_lens
 
     def get_cpu_copy(self, *args, **kwargs):
         self._unsupported("get_cpu_copy")

@@ -35,7 +35,9 @@ from sglang_tpu.attention_pallas_mla import (
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
     build_dsa_index_topk_split_op,
+    build_dsa_kpool_expand_op,
     build_dsa_kpool_topk_op,
+    build_dsa_kpool_topk_split_op,
     indexer_forward,
     kpool_indexer_forward,
 )
@@ -63,7 +65,9 @@ def topk_row_width(hf_config) -> int:
 
 
 def _build_pallas_sparse_mla_kernel_op(
-    qblock_kpool: int = 0, gather_chunk_tokens: Optional[int] = None
+    qblock_kpool: int = 0,
+    gather_chunk_tokens: Optional[int] = None,
+    zero_rope: bool = False,
 ):
     """Register the sparse MLA step as a torch custom op, once per process.
 
@@ -72,8 +76,11 @@ def _build_pallas_sparse_mla_kernel_op(
     rows. ``cu_kv_lens`` and ``v_scale`` are accepted but not used: the sparse
     kernels find pages with a fixed stride, and they use one scale for both
     keys and values.
+
+    ``zero_rope`` neither writes nor reads the rope cache, for a model whose
+    rope lane is identically zero (see ``sparse_mla_attention_fused``).
     """
-    key = (qblock_kpool, gather_chunk_tokens)
+    key = (qblock_kpool, gather_chunk_tokens, zero_rope)
     if key in _PALLAS_SPARSE_MLA_OPS:
         return _PALLAS_SPARSE_MLA_OPS[key]
 
@@ -97,6 +104,10 @@ def _build_pallas_sparse_mla_kernel_op(
         # qblock_kpool == 1 (plain DSA) also takes and returns head-major
         # queries and output, [heads, tokens, ...] (_forward_mla).
         op_name += f"_qblock{qblock_kpool}"
+    if zero_rope:
+        # No rope cache write or read: a different body, so a different name.
+        op_name += "_zero_rope"
+        chunk_kwargs["zero_rope"] = True
 
     # custom_jax_kernel reads this function's signature: every tensor has to
     # be a positional parameter annotated ``jax.Array``. The JAX step cannot be
@@ -222,6 +233,20 @@ def _build_pallas_sparse_mla_kernel_op(
     return custom_op
 
 
+def _has_zero_rope(hf_config) -> bool:
+    """Whether the model has no rope (``qk_rope_head_dim == 0``, GLM-5.3-Flash).
+
+    Such a model attends with an identically-zero rope lane
+    (``_mla_kernel_args``), so the rope cache, allocated zeroed, never needs
+    writing or reading.
+    """
+    rope_dim = getattr(hf_config, "qk_rope_head_dim", None)
+    if rope_dim is None:
+        text_config = getattr(hf_config, "text_config", None) or hf_config
+        rope_dim = getattr(text_config, "qk_rope_head_dim", None)
+    return rope_dim == 0
+
+
 def _kpool_query_bound(metadata, *, num_tokens: int) -> int:
     """Static per-request new-token bound for fused kpool pooling.
 
@@ -275,6 +300,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         hf_config = model_runner.model_config.hf_config
         # Set before super().__init__(), which calls _build_kernel_op().
         self._kpool = get_dsa_index_kpool(hf_config)
+        self._zero_rope = _has_zero_rope(hf_config)
         super().__init__(model_runner, speculative_step_id)
         self._topk = get_dsa_index_topk(hf_config)
         if self._kpool > 1:
@@ -285,13 +311,12 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         self._init_indexer_token_split()
 
     def _init_indexer_token_split(self) -> None:
-        """Set up SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT (plain DSA, attn-TP > 1)."""
+        """Set up the DSA indexer token split (always on with attn-TP > 1)."""
         self._idx_split_group = None
         self._idx_split_size = 1
         self._idx_split_min_tokens = 0
         self._index_topk_split_op = None
-        if self._kpool > 1 or not tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT.get():
-            return
+        self._kpool_expand_op = None
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
@@ -312,7 +337,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MIN_TOKENS.get(),
             _TOKEN_SPLIT_MIN_ROWS_PER_RANK * group.world_size,
         )
-        self._index_topk_split_op = build_dsa_index_topk_split_op()
+        if self._kpool > 1:
+            # Pooled indexer: the ranks exchange picked pools (topk // kpool
+            # per row), not token rows, and expand them after the all-reduce.
+            self._index_topk_split_op = build_dsa_kpool_topk_split_op()
+            self._kpool_expand_op = build_dsa_kpool_expand_op()
+        else:
+            self._index_topk_split_op = build_dsa_index_topk_split_op()
 
     def _indexer_split_rows(self, forward_batch: ForwardBatch, num_tokens: int) -> int:
         """Rows per rank for the indexer token split, or 0 to run unsplit.
@@ -337,9 +368,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         rows = -(-rows // 8) * 8
         if rows < _TOKEN_SPLIT_MIN_ROWS_PER_RANK:
             return 0
-        # The all-reduce buffer is [tp, rows, topk] int32 per DSA layer: bound it.
-        if rows > tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MAX_ROWS.get():
-            return 0
         return rows
 
     def _build_kernel_op(self):
@@ -347,21 +375,24 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # opt-in adds a prefill op: decode, verify and draft extend keep the
         # per-query kernel.
         self._prefill_op = None
+        zero_rope = self._zero_rope
         if not tpu_envs.SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL.get():
-            return _build_pallas_sparse_mla_kernel_op()
+            return _build_pallas_sparse_mla_kernel_op(zero_rope=zero_rope)
         if self._kpool == 1:
             # Plain DSA: token-bitmap q-block prefill. Its fallback (short or
             # long-context batches) and the decode op keep the default chunk.
             self._prefill_op = _build_pallas_sparse_mla_kernel_op(1)
-            return _build_pallas_sparse_mla_kernel_op()
+            return _build_pallas_sparse_mla_kernel_op(zero_rope=zero_rope)
         from sglang_tpu.attention.pallas.mla_sparse_fused import (
             QBLOCK_GATHER_CHUNK_TOKENS,
         )
 
         self._prefill_op = _build_pallas_sparse_mla_kernel_op(
-            self._kpool, QBLOCK_GATHER_CHUNK_TOKENS
+            self._kpool, QBLOCK_GATHER_CHUNK_TOKENS, zero_rope=zero_rope
         )
-        return _build_pallas_sparse_mla_kernel_op(0, QBLOCK_GATHER_CHUNK_TOKENS)
+        return _build_pallas_sparse_mla_kernel_op(
+            0, QBLOCK_GATHER_CHUNK_TOKENS, zero_rope=zero_rope
+        )
 
     def forward_indexer(
         self,
@@ -454,7 +485,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         key_store: str,
         split_rows: int,
     ) -> torch.Tensor:
-        """index_topk with SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT.
+        """index_topk with the DSA indexer token split.
 
         Every rank stores the index keys of all tokens (each keeps the full
         index-key cache) and selects the rows of its own token slice
@@ -510,6 +541,20 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         ``i32[num_tokens, width]`` rows in the format of index_topk."""
         metadata = self.forward_metadata
         pool = self.token_to_kv_pool
+        split_rows = self._indexer_split_rows(forward_batch, query.shape[0])
+        if split_rows:
+            return self._index_topk_kpool_token_split(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                query=query,
+                key=key,
+                gate=gate,
+                head_weights=head_weights,
+                ape=ape,
+                weight_scale=weight_scale,
+                kpool=kpool,
+                split_rows=split_rows,
+            )
         return self._index_topk_op(
             query.contiguous(),
             key.contiguous(),
@@ -530,6 +575,73 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             _kpool_query_bound(metadata, num_tokens=query.shape[0]),
         )
 
+    def _index_topk_kpool_token_split(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        gate: torch.Tensor,
+        head_weights: torch.Tensor,
+        ape: torch.Tensor,
+        weight_scale: float,
+        kpool: int,
+        split_rows: int,
+    ) -> torch.Tensor:
+        """index_topk_kpool with the DSA indexer token split.
+
+        Every rank stores all tokens' raw keys and closes all pools (each
+        keeps the full caches), and scores only its own token slice
+        ``[rank * split_rows, (rank + 1) * split_rows)``. Scoring every query
+        against every closed pool is the part that grows with the context, and
+        unsplit, all attention-TP ranks repeat it for the whole batch. The
+        ranks' picked pools, ``i32[split_rows, topk // kpool]``, are put
+        together by ``_assemble_split_rows`` and expanded to token rows.
+        """
+        from sglang.srt.layers.dp_attention import _rank_tensor
+
+        metadata = self.forward_metadata
+        pool = self.token_to_kv_pool
+        num_tokens = query.shape[0]
+        kv_lens = self._kv_lens(forward_batch)
+        rank = _rank_tensor("attn_tp", query.device)
+        row_start = (rank * split_rows).to(torch.int32).reshape(1)
+        local_picked = self._index_topk_split_op(
+            query.contiguous(),
+            key.contiguous(),
+            gate.contiguous(),
+            head_weights.contiguous(),
+            ape.contiguous(),
+            pool.get_kpool_raw_cache(layer_id),
+            pool.get_index_key_cache(layer_id),
+            kv_lens,
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            row_start,
+            weight_scale,
+            self._topk,
+            kpool,
+            _kpool_query_bound(metadata, num_tokens=num_tokens),
+            split_rows,
+        )  # i32[split_rows, topk // kpool]
+        picked = _assemble_split_rows(
+            local_picked, rank, self._idx_split_size, self._idx_split_group.all_reduce
+        )
+        if picked.shape[0] != num_tokens:
+            # Padding rows of the last slices (all -1) are dropped.
+            picked = picked[:num_tokens].contiguous()
+        return self._kpool_expand_op(
+            picked,
+            kv_lens,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            self._topk,
+            kpool,
+            self._kpool_width,
+        )
+
     def _forward_mla(
         self,
         q: torch.Tensor,
@@ -546,6 +658,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             f"layer {layer.layer_id} reached pallas_tpu_mla_sparse without the "
             "indexer's top-k rows."
         )
+        if self._zero_rope:
+            # The zero-rope ops are exact only for a zero rope lane, which
+            # _mla_kernel_args builds when the layer has no rope dims.
+            assert layer.qk_head_dim == layer.v_head_dim, (
+                f"layer {layer.layer_id} has rope dims, but the sparse MLA ops "
+                "were built for a model without rope."
+            )
         args = self._mla_kernel_args(
             q=q,
             k=k,
