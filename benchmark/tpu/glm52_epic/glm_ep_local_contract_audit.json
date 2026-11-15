@@ -1,0 +1,13 @@
+{
+ "status":"SOURCE_CONTRACT_REVIEWED; production opt-in not enabled; real shard validation pending",
+ "target":"sglang.srt.models.glm4_moe.GlmMoeDsaForCausalLM exact runtime class; exclude NextN/draft and arbitrary Deepseek subclasses",
+ "expert_mapping":"deepseek_weight_loader.py257-264,395-419 and fused_moe layer.py1658-1684 preserve numeric expert id for gate/up/down weight and suffixes including weight_scale_inv. FusedMoE maps global to local before copy1045-1058.",
+ "channel_scale":"sglang_tpu/glm52_channelwise_fp8.py182-216 maintains weight loader attrs and perexpert channel scale allocations. Ownership is perexpert, no cross-expert reduction.",
+ "shared":"Loose shared_experts keys do not match numeric expert regex and are retained. Must keep actual m._has_fused_shared guard, not decide from raw CLI flag.",
+ "keep_fallbacks":["nonTPU","noEP","global expert location metadata including identity EPLB","elasticEP scale join","actual fused shared experts","parameters requiring global experts","MoE layout disagreement","missing checkpoint index","mmap still enabled"],
+ "mtp":"Reader may read local indexed MTP keys that target loader later skips; nonindexed MTP shards read whole. verify checks read coverage, NOT actual model parameter consumption. Do not claim MTP I/O removed.",
+ "packed":"Nonnumeric packed expert keys read whole; safe fallback but no expert pruning.",
+ "implementation_direction":"Plugin-local exact target eligibility before existing runtime guards; do not set attribute on shared Deepseek parent, do not add coreTPU branch or new hook without need.",
+ "verification_required":["Exact target eligibility and subclass/NextN exclusion","All runtime fallback guards preserved","Representative indexed shard local weights and scale values identical to baseline safetensors reader","Shared and unmatched keys retained","Compute requested byte ranges vs useful bytes at0 and16MiB merge gaps; no physical I/O speed claim from logical pruning"],
+ "next_action":"Prepare boundary tests using existing reader test infrastructure, then smallest plugin change and representative shard check. No fullmodel resubmit."
+}
