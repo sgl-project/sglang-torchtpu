@@ -181,12 +181,12 @@ try:
     require(not run(['git', 'status', '--porcelain', '--untracked-files=no'], 'source-status.txt'),
             'tracked source modifications detected')
     mode = os.environ.get('GLM52_BASELINE_MODE', '')
-    require(mode in ('', 'eager', 'staged-eager', 'eager-ir', 'compile-smoke', 'historical-replay'), 'unsupported baseline mode')
+    require(mode in ('', 'eager', 'staged-eager', 'eager-ir', 'compile-smoke', 'historical-replay', 'compiled-long-e2e'), 'unsupported baseline mode')
     candidate = Path('benchmark/tpu/glm52_epic/' + (
         'torch_runnable_baseline.json' if mode == 'eager' else
         'torch_staged_eager_ir.json' if mode in ('staged-eager', 'eager-ir') else
         'torch_compile_smoke.json' if mode == 'compile-smoke' else
-        'torch_staged_loading_candidate.json' if mode == 'historical-replay' else
+        'torch_staged_loading_candidate.json' if mode in ('historical-replay', 'compiled-long-e2e') else
         'torch_prefill_candidate.json'))
     require(candidate.is_file(), 'run from exact source checkout root')
     candidate_bytes = candidate.read_bytes()
@@ -228,7 +228,7 @@ try:
                  'tpu_compile_bs': [1], 'tpu_compile_tokens': [2048]} if mode == 'compile-smoke' else {
                  'chunked_prefill_size': 32768, 'max_prefill_tokens': 32768,
                  'tpu_compile_tokens': [2048]})
-    if mode == 'historical-replay':
+    if mode in ('historical-replay', 'compiled-long-e2e'):
         contract = {'enable_torch_compile': True, 'context_length': 135168,
                     'max_total_tokens': 147456, 'chunked_prefill_size': 32768,
                     'max_prefill_tokens': 32768, 'page_size': 64,
@@ -242,7 +242,7 @@ try:
         require(not os.environ.get('GLM52_DIAGNOSTIC_REQUESTS'),
                 'baseline smoke cannot run matched-workload diagnostic')
         result['scope'] = f'full-checkpoint short-input {mode} smoke; NOT JAX performance'
-    if mode == 'staged-eager':
+    if mode in ('staged-eager', 'compiled-long-e2e'):
         require(not any(os.environ.get(k) for k in ('GLM52_EAGER_IR_DIR', 'GLM52_STARTUP_STACK_DIR')),
                 'no observers permitted for staged E2E')
         require(not any('xla_dump_' in value for value in
@@ -430,7 +430,7 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
                 except Exception as error:
                     # Diagnostic sampling must never terminate model execution.
                     print(f'GLM52_HOST_MEMORY_ERROR {error!r}', flush=True)
-                memory_stop.wait(0.5 if mode == 'historical-replay' else 30)
+                memory_stop.wait(0.5 if mode in ('historical-replay', 'compiled-long-e2e') else 30)
 
     memory_thread = threading.Thread(target=sample_memory, daemon=True)
     memory_thread.start()
@@ -484,7 +484,10 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
             smoke_tokens = 512 if mode in ('eager', 'staged-eager', 'eager-ir', 'compile-smoke') else 4
             # One output comes from prefill logits; require a second output to
             # exercise a decode forward, which never uses the q-block prefill op.
-            smoke_outputs = 2 if mode in ('eager', 'staged-eager', 'compile-smoke', 'historical-replay') else 1
+            smoke_outputs = 2 if mode in ('eager', 'staged-eager', 'compile-smoke', 'historical-replay', 'compiled-long-e2e') else 1
+            if mode == 'compiled-long-e2e':
+                smoke_tokens, smoke_outputs = 12288, 16
+                result['scope'] = 'compiled long request E2E; 12288input/16output; NOT precision or matched C16 performance'
             request_body = {'input_ids': [1] * smoke_tokens, 'sampling_params': {
                 'temperature': 0, 'max_new_tokens': smoke_outputs, 'ignore_eos': True}, 'stream': False}
             save('generate-request.json', request_body)
