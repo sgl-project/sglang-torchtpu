@@ -65,6 +65,37 @@ def main():
             record=json.loads(Path(directory,'ordered-rank-0.json').read_text())
             assert record['action']=='resume' and record['sequence']==1
             undo()
+        # Compose command source, realhandlers, passiveack and all16 inventory.
+        from benchmark.tpu.glm52_epic.ordered_admission import OrderedCommandSource, accept_inventory
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=OrderedCommandSource(root,'run')
+            owners=[IngestBoundary() for _ in range(16)]
+            for rank,owner in enumerate(owners):owner.rank=rank
+            undo=install(IngestBoundary,directory=directory,run_token='run',
+                         topology=lambda owner:dict(config,tp_rank=owner.rank,attn_dp_rank=owner.rank))
+            command=dict(run_token='run',sequence=0,epoch='measure',action='pause')
+            (root/'ordered-command.json').write_text(json.dumps(command))
+            control=typed_control(source.poll())
+            for owner in owners:
+                owner.incoming=[control];owner.ingest_requests()
+            routes={f'request-{i}':i%16 for i in range(32)}
+            for owner in owners:
+                owner.waiting_queue=[types.SimpleNamespace(rid=rid) for rid,rank in routes.items() if rank==owner.rank]
+                owner.ingest_requests()
+            snapshots=[json.loads((root/f'ordered-rank-{rank}.json').read_text()) for rank in range(16)]
+            command.update(sequence=1,action='resume')
+            (root/'ordered-command.json').write_text(json.dumps(command))
+            try:source.poll()
+            except FileNotFoundError:pass
+            else:raise AssertionError('premature resume accepted')
+            accept_inventory(root,expected_routes=routes,snapshots=snapshots,run_token='run',epoch='measure',pause_sequence=0)
+            control=typed_control(source.poll())
+            for owner in owners:
+                owner.incoming=[control];owner.ingest_requests()
+                assert owner._engine_paused is False
+            assert source.poll() is None
+            undo()
+        print('ORDERED_COMPOSED16_BOUNDARY_CPU_PASS: realIPC+handlers;simulated16scheduler delivery;notcollectives',flush=True)
         print('ORDERED_REAL_CONTROL_CPU_PASS '+json.dumps(dict(real='IPC types/classifier/pause/continue handlers',
               scope='single scheduler boundary; no receive transport/16rankcollective/hardware/admission/cadence proof')),flush=True)
 
