@@ -1,0 +1,82 @@
+Source: Falcon exp logs exp-88cbehgzz1 --pod1 (gcs); selected native excerpts, not complete log.
+GLM52_CLEANUP_BEGIN {"time_ns": 1794733572150089563, "falcon_rank": 1, "status": "FAILED", "error": "RuntimeError: native launcher exited unexpectedly: 1", "launcher_pid": 1428, "launcher_returncode_before_cleanup": 1}
+[2026-11-15 08:58:03 DP6 TP6 EP6] Load weight end. elapsed=2533.34 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-15 08:58:03 DP1 TP1 EP1] Load weight end. elapsed=2533.58 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-15 08:58:03 DP7 TP7 EP7] Load weight end. elapsed=2533.60 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-15 08:58:03 DP2 TP2 EP2] Load weight end. elapsed=2533.70 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-15 08:58:03 DP0 TP0 EP0] Load weight end. elapsed=2533.79 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-15 08:58:03 DP5 TP5 EP5] Load weight end. elapsed=2534.00 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-15 08:58:03 DP3 TP3 EP3] Load weight end. elapsed=2534.14 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[2026-11-15 08:58:06 DP4 TP4 EP4] Load weight end. elapsed=2537.14 s, type=GlmMoeDsaForCausalLM, quant=fp8, fmt=e4m3, avail mem=36.82 GB, mem usage=57.92 GB.
+[rank1]:[E1115 09:06:06.237389470 ProcessGroupGloo.cpp:67] Rank 1 successfully reached monitoredBarrier, but received errors while waiting for send/recv from rank 0. Please check rank 0 logs for faulty rank.
+[2026-11-15 09:06:06 DP1 TP1 EP1] Scheduler hit an exception: Traceback (most recent call last):
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/managers/scheduler.py", line 6380, in run_scheduler_process
+    scheduler = Scheduler(server_args, port_args)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/managers/scheduler.py", line 577, in __init__
+    self.init_model_worker()
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/sglang_tpu/host_heap_trim.py", line 258, in init_model_worker
+    result = init_worker(self, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/managers/scheduler.py", line 1147, in init_model_worker
+    self.init_tp_model_worker()
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/managers/scheduler.py", line 1032, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/managers/tp_worker.py", line 320, in __init__
+    self._init_model_runner()
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/managers/tp_worker.py", line 481, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/model_executor/model_runner.py", line 483, in __init__
+    self.initialize()
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/model_executor/model_runner.py", line 681, in initialize
+    self.load_model()
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/model_executor/model_runner.py", line 1356, in load_model
+    dist_barrier_after_load(
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py", line 386, in dist_barrier_after_load
+    raise ValueError(
+ValueError: TP rank 1 finished loading, but other ranks did not within SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S. Check their logs for a load failure (e.g. OOM, a missing or truncated checkpoint shard); for slow nodes raise the timeout.
+
+    dist_barrier_after_load(
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py", line 386, in dist_barrier_after_load
+    raise ValueError(
+ValueError: TP rank 5 finished loading, but other ranks did not within SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S. Check their logs for a load failure (e.g. OOM, a missing or truncated checkpoint shard); for slow nodes raise the timeout.
+
+[2026-11-15 09:06:07] kill_process_tree called: parent_pid=1582, include_parent=False, pid=1582
+Traceback (most recent call last):
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/entrypoints/engine.py", line 1957, in _wait_for_scheduler_ready
+    data = scheduler_pipe_readers[i].recv()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/multiprocessing/connection.py", line 250, in recv
+    buf = self._recv_bytes()
+          ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/multiprocessing/connection.py", line 430, in _recv_bytes
+    buf = self._recv(4)
+          ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/multiprocessing/connection.py", line 399, in _recv
+    raise EOFError
+EOFError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/launch_server.py", line 84, in <module>
+    run_server(server_args)
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/launch_server.py", line 67, in run_server
+    launch_server(server_args)
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/entrypoints/http_server.py", line 2960, in launch_server
+    ) = engine_class._launch_subprocesses(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/entrypoints/engine.py", line 1266, in _launch_subprocesses
+    scheduler_init_result.wait_for_ready()
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/entrypoints/engine.py", line 954, in wait_for_ready
+    infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/glm52-peer-rank1.DCSaWj/src/python/sglang/srt/entrypoints/engine.py", line 1959, in _wait_for_scheduler_ready
+    raise _scheduler_died_error(i, scheduler_procs[i])
+RuntimeError: Rank 0 scheduler died during initialization (exit code: -3). If exit code is -9 (SIGKILL), a common cause is the OS OOM killer. Run `dmesg -T | grep -i oom` to check.
+===== END WHOLE SERVER LOG rank=1 =====
+falcon-agent: command failed: exit status 1
