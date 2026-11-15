@@ -280,13 +280,19 @@ selects where the KV cache lives:
 
 Ring mode:
 
-- Requires `--dcp-size == --attn-cp-size == --tp-size`, a power of two (an
-  unset `--dcp-size` is set at start-up; pass it explicitly so the hooks that
-  run before the platform defaults see it), `--page-size >= 256`, and
+- Requires `--dcp-size == --attn-cp-size`, a power of two (an unset
+  `--dcp-size` is set at start-up; pass it explicitly so the hooks that run
+  before the platform defaults see it), `--page-size >= 256`, and
   `--chunked-prefill-size >= page size x N` (DCP's rule). `--max-total-tokens`
   is the pool of one core, so the server holds N times that.
+- Attention TP `T = --tp-size / N` may exceed 1 (e.g. PCP4 x TP2 on 8 cores):
+  each core keeps its attention-TP share of the KV heads, the stripes and the
+  decode merge run over the attention-CP group (ranks `t, t + T, ...`), not
+  SGLang's consecutive-rank DCP group, and the ring kernel runs on a `(N, T)`
+  mesh ringing along `N`. For Qwen3-30B-A3B (4 KV heads, fp8 cache packing 4
+  rows per word) `T = 2` is the largest attention TP that does not pad the pool.
 - Supports Qwen3-MoE on the batched RPA backend with the `HEAD_ALONG_SUBLANE`
-  KV layout, on one host, with the CP group equal to the whole world. Refused:
+  KV layout, on one host, with the TP group equal to the whole world. Refused:
   gpt-oss (attention sinks, sliding window), `SGLANG_TPU_USE_SEQ_ALONG_LANE_KV`,
   `--enable-mixed-chunk`, pipeline parallelism, DP replicas, DP attention,
   HiCache, PD disaggregation, speculative decoding, `--dcp-replicate-q-proj`.
@@ -300,7 +306,8 @@ Ring mode:
 - One compiled program per bucket serves first chunks and cached prefixes. The
   ring op is a collective: every core launches it in the same order with the
   same static shapes, during warmup too.
-- Recipe: `benchmark/tpu/recipe/qwen3_30b_a3b_fp8_pcp_ring.sh`.
+- Recipe: `benchmark/tpu/recipe/qwen3_30b_a3b_fp8_pcp_ring.sh` (`ATTN_CP_SIZE=4`
+  for PCP4 x TP2).
 
 ## Fixed-cohort benchmark gate
 
