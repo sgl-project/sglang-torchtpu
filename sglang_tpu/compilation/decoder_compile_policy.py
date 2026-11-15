@@ -95,6 +95,21 @@ from sglang_tpu.pp_wave import num_relayed_aux_slots
 logger = get_logger(__name__)
 
 
+def _uses_compile_bundle(server_args: Any) -> bool:
+    return (
+        server_args.unsafe_save_torch_compile_bundle is not None
+        or server_args.unsafe_load_torch_compile_bundle is not None
+    )
+
+
+def _symbolic_warmup_enabled(server_args: Any) -> bool:
+    # The torch.compile bundle restores static guards per bucket, so marking
+    # dims dynamic there would hand a symbolic graph to the plain tpu backend.
+    return tpu_envs.SGLANG_TPU_ENABLE_SYMBOLIC_WARMUP.get() and not (
+        _uses_compile_bundle(server_args)
+    )
+
+
 def _guard_filter_options(server_args: Any) -> dict[str, Any] | None:
     """torch.compile options that skip guards on nn.Module state, or None.
 
@@ -820,16 +835,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
     def _compile(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         server_args = self.model_runner.server_args
-        use_bundle = (
-            server_args.unsafe_save_torch_compile_bundle is not None
-            or server_args.unsafe_load_torch_compile_bundle is not None
-        )
+        use_bundle = _uses_compile_bundle(server_args)
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
         aot_fast_runtime_wrapper.install_from_env()
         # The bundle Compiler installs its own guard filter for restorable guards.
         options = None if use_bundle else _guard_filter_options(server_args)
         backend = self.backend or current_platform.get_compile_backend()
-        if self._symbolic_warmup_enabled(use_bundle=use_bundle):
+        # Only the dynamo tracer reaches _compile; direct goes through _direct_compile.
+        if _symbolic_warmup_enabled(server_args):
             backend = PerShapeBackend(backend)
         return compiler(
             torch.no_grad()(fn),
@@ -837,15 +850,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             fullgraph=self.fullgraph,
             dynamic=self.dynamic,
             **({"options": options} if options else {}),
-        )
-
-    def _symbolic_warmup_enabled(self, *, use_bundle: bool = False) -> bool:
-        # The torch.compile bundle restores static guards per bucket, and the
-        # direct tracer specializes per bucket by construction.
-        return (
-            tpu_envs.SGLANG_TPU_ENABLE_SYMBOLIC_WARMUP.get()
-            and self.tracer == "dynamo"
-            and not use_bundle
         )
 
     def _direct_compile(
@@ -1792,7 +1796,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                     self.owner.forward.warmup_async, *args, **kwargs
                 )
             else:
-                if self._symbolic_warmup_enabled() and profile_prefix is None:
+                if (
+                    self.tracer == "dynamo"
+                    and profile_prefix is None
+                    and _symbolic_warmup_enabled(self.model_runner.server_args)
+                ):
                     mark_bucket_dims_dynamic(
                         (num_tokens, bs),
                         tensors=(*args, *kwargs.values()),
