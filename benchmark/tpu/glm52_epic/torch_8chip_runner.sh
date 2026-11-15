@@ -226,6 +226,9 @@ try:
     coords = run([sys.executable, '-m', 'sglang_tpu.node_normalization',
                   '--print_local_device_coords'], 'native-coordinate-probe.log', 180)
     # Validate CLI/config before potentially reading hundreds of GiB.
+    if args.get('weight_loader_disable_mmap', False):
+        run([sys.executable, '-m', 'benchmark.tpu.glm52_epic.validate_staged_cli'],
+            'staged-native-cli-parse.log', 120)
     run([sys.executable, '-m', 'benchmark.tpu.launch_server', '--config', '@'+str(candidate),
          '--dry-run'], 'native-dry-run.json')
     result['coordinate_probe'] = coords
@@ -437,6 +440,16 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
             except (OSError, urllib.error.URLError):
                 pass
             time.sleep(1)
+    if args.get('weight_loader_disable_mmap', False):
+        native_text = (OUT / 'server.log').read_text(errors='replace')
+        require('EP-local expert reads off (' not in native_text,
+                'staged loading silently fell back to whole shards')
+        # Current reader logs only global rank0; that process is on physical
+        # host0, which need not be Falcon host0. Do not require duplicate logs.
+        if result['host_preparation']['physical_rank'] == 0:
+            require("Reading only this EP rank's routed experts: ids [0, 16)" in native_text,
+                    'missing native reader activation evidence on physical rank0')
+        result['selective_reader_log_verified'] = True
     result['status'] = ('SMOKE_AND_HTTP_DIAGNOSTIC_PASS' if state.get('http_diagnostic_pass')
                         else 'SUCCEEDED')
     if state.get('http_diagnostic_pass'):
