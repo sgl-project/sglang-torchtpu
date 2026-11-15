@@ -1,0 +1,15 @@
+{
+ "status":"DESIGN_BEFORE_IMPLEMENTATION; not hardware verified",
+ "source_constraints":[
+  "weight_utils.py987-1023 already partitions background prefetch by local_rank/local_world_size, not global ranks; reuse principle rather than add8perrank fullwarmups",
+  "weight_utils.py1172-1175 and1282-1285 start prefetch only if not disable_mmap; EP-local reader requires disable_mmap. Existingflags alone do not combine both paths.",
+  "tpu_platform._sync_weight_stream2GiB/64tensor accounts every yielded key. Early EP-local filtering removes most rejected numeric experts before this wrapper, so actual selection improves sync accounting without deleting memory safety sync.",
+  "Shared/nonexpert and packed keys remain replicated, so local stream bytes still not identical to device enqueue bytes. Do not describe it as perfect copied-byte accounting."
+ ],
+ "chosen_minimum":"Benchmark prelaunch host-only preparation, once per Falcon host before scheduler spawn; no new core branch/hooks/env registry. Fixed source runner explicitly invokes preparation, then selective loader with disable_mmap. Keep existing perstream sync unchanged initially.",
+ "policy":"Do not blindly read704GiB perhost if selective byte plan shows unnecessary I/O. First header-plan all indexed shards for union of8local rank expert ranges plus shared/dense. Choose range warmup vs full sequential warmup based on declared bytes, buffer/cache budget and real CPU slice test.",
+ "coordination":"Falcon host runner is single coordinator; no filesystem lock/protocol inside8scheduler processes. Each host independently prepares local kernel cache; no crosshost shared-cache assumption.",
+ "boundedness":"Fixed8 reader threads maximum,4MiB reusable perthread buffer, bounded inflight futures; no entire payload accumulation, no tensor materialization in prewarm. Timeout propagates failure; completion marker contains checkpoint/index/source identity and planned/read bytes.",
+ "validation_order":["Complete actualreader regression with extension-only dependency boundary if image lacks CPU kernels","Header-plan useful versus requested bytes for host expert union","Verify warmup on one representative shard with bounded buffers and short-read rejection","Only then enable benchmark-specific whole-checkpoint preparation and one fullmodel startup"],
+ "not_done":"No prewarm implemented or submitted yet; fullmodel/fatal/137 goals remain unresolved."
+}
