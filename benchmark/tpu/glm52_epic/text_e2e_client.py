@@ -1,5 +1,7 @@
 """Plain native HTTP functional checks; no observers or scheduler patches."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import uuid
 import json
 from pathlib import Path
 import urllib.request
@@ -9,8 +11,9 @@ def run(base_url, output):
     spec=json.loads(Path(__file__).with_name('text_e2e_requests.json').read_text())
     output=Path(output);output.mkdir(parents=True,exist_ok=False)
     checks=[]
-    def execute(name,text,expected):
-        payload=dict(text=text,sampling_params=spec['sampling_params'],stream=False)
+    def execute(name,text,expected,rank=None):
+        payload=dict(text=text,sampling_params=spec['sampling_params'],stream=False,rid=str(uuid.uuid4()))
+        if rank is not None:payload['routed_dp_rank']=rank
         (output/f'{name}-request.json').write_text(json.dumps(payload,ensure_ascii=False)+'\n')
         request=urllib.request.Request(base_url.rstrip('/')+'/generate',json.dumps(payload).encode(),{'Content-Type':'application/json'})
         with urllib.request.urlopen(request,timeout=900) as response:
@@ -23,10 +26,15 @@ def run(base_url, output):
             meta=record['meta_info'];assert meta['completion_tokens']>0 and meta['prompt_tokens']>0
             assert meta.get('finish_reason',{}).get('type')!='abort'
             assert isinstance(record.get('text'),str)
-            checks.append(dict(case=name,expected=expected,matched=expected in record['text'].casefold(),
+            checks.append(dict(case=name,routed_dp_rank=rank,rid=payload['rid'],expected=expected,matched=expected in record['text'].casefold(),
                                prompt_tokens=meta['prompt_tokens'],completion_tokens=meta['completion_tokens']))
     for case in spec['cases']:execute(case['id'],case['text'],case['expected_substring_casefold'])
-    batch=spec['parallel_batch'];execute('batch16',[batch['text_template'].format(index=i) for i in range(batch['count'])],batch['expected_substring_casefold'])
+    batch=spec['parallel_batch']
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        pending=[pool.submit(execute,f'dp-{rank}',batch['text_template'].format(index=rank),
+                             batch['expected_substring_casefold'],rank) for rank in range(batch['count'])]
+        for future in pending:future.result()
+    checks.sort(key=lambda item:item['case'])
     result=dict(status='TEXT_E2E_PASS' if all(c['matched'] for c in checks) else 'TEXT_E2E_SANITY_MISMATCH',checks=checks,
                 scope='20 functional responses; no measured rankadmission/C16performance/accuracy benchmark proof')
     (output/'result.json').write_text(json.dumps(result,indent=2)+'\n')
