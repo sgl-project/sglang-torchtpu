@@ -175,12 +175,19 @@ def select_tpu_dsv41_loader(result, load_config, model_config=None):
     if (
         type(result) not in (RunaiModelStreamerLoader, EPLocalRunaiModelStreamerLoader)
         or model_config is None
-        # Without Engram tables the generic EP-local loader does everything.
-        or not model_config.use_engram
-        or model_config.is_draft_model
+        # Without Engram tables the generic EP-local loader does everything;
+        # the bundled V4.1 DSpark draft comes here to stream only mtp.*.
+        or not (
+            model_config.use_engram
+            or (
+                model_config.is_draft_model
+                and model_config.hf_config.model_type == "deepseek_v41"
+            )
+        )
         or load_config.draft_model_idx is not None
     ):
         return result
+    # The DSpark draft also comes here: the loader streams only its mtp.* tensors.
     from sglang_tpu.models.deepseek_v41.loader import DSV41RunaiModelStreamerLoader
 
     return DSV41RunaiModelStreamerLoader(load_config)

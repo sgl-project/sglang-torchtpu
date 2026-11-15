@@ -3,20 +3,26 @@
 
 Routed experts follow the generic EP-local Run:AI read
 (``sglang_tpu.ep_weight_shard``). Engram tables leave the stream and are read
-as this rank's row range (``engram_row_reader``).
+as this rank's row range (``engram_row_reader``). The bundled DSpark draft
+streams only its ``mtp.*`` tensors (``_draft_weights``).
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Mapping
+from pathlib import Path
 
 import torch
 
-from sglang_tpu.ep_weight_shard import EPLocalRunaiModelStreamerLoader
+from sglang_tpu._logging import get_logger
+from sglang_tpu.ep_weight_shard import INDEX_NAME, EPLocalRunaiModelStreamerLoader
 from sglang_tpu.models.deepseek_v41.engram_row_reader import (
     is_engram_table,
     iter_row_tables,
 )
+
+logger = get_logger(__name__)
 
 # DeepseekV4ForCausalLM.load_weights skips every MTP tensor of the target model.
 _MTP_PREFIX = "mtp."
@@ -26,6 +32,17 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
     """EP-local Run:AI stream without MTP and Engram tables, then Engram rows."""
 
     _plans_without_expert_range = True
+
+    def _get_weights_iterator(self, source):
+        config = getattr(source.model_config, "hf_config", None)
+        if (
+            getattr(source.model_config, "is_draft_model", False)
+            and getattr(config, "model_type", None) == "deepseek_v41"
+            and self.load_config.draft_model_idx is None
+        ):
+            yield from self._draft_weights(source)
+            return
+        yield from super()._get_weights_iterator(source)
 
     def _shard_of_names(self, streamer, files: list[str]) -> dict[str, str]:
         shard_of = super()._shard_of_names(streamer, files)
@@ -56,3 +73,33 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
             tp_size=parallel.tp_size,
         )
         return streamed, rows
+
+    def _draft_weights(self, source):
+        """The bundled DSpark draft reads only ``mtp.*`` tensors (its loader drops
+        the rest); streaming the whole checkpoint needs a RunAI buffer as large
+        as the ~100 GB Engram tables."""
+        from runai_model_streamer import SafetensorsStreamer
+
+        from sglang.srt.model_loader.weight_utils import RUNAI_STREAMER_TENSOR_ATTR
+
+        folder, files = self._prepare_weights(source.model_or_path, source.revision)
+        weight_map = json.loads((Path(folder) / INDEX_NAME).read_text())["weight_map"]
+        names = {n for n in weight_map if n.startswith(_MTP_PREFIX)}
+        if not names:
+            raise ValueError(
+                "DSpark draft: the checkpoint index lists no mtp.* tensors"
+            )
+        by_name = {path.rsplit("/", 1)[-1]: path for path in files}
+        shards = sorted({by_name[weight_map[n]] for n in names})
+        logger.info(
+            "V4.1 DSpark draft: reading %d mtp tensors from %d shards",
+            len(names),
+            len(shards),
+        )
+        with SafetensorsStreamer() as streamer:
+            streamer.stream_files(
+                shards, device="cpu", is_distributed=False, tensor_names=names
+            )
+            for name, tensor in streamer.get_tensors():
+                setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+                yield source.prefix + name, tensor
