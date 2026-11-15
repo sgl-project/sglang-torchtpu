@@ -521,7 +521,9 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
             require(mode == 'compiled-long-e2e', 'text E2E requires proven compiled long mode')
             try:
                 run([sys.executable, '-m', 'benchmark.tpu.glm52_epic.text_e2e_client',
-                     '--base-url', 'http://127.0.0.1:30000', '--output', str(OUT / 'text-e2e')],
+                     '--base-url', 'http://127.0.0.1:30000', '--output', str(OUT / 'text-e2e'),
+                     *(['--tokenizer-path', '/models/GLM5.2-fp8-channel-wise']
+                       if os.environ.get('GLM52_TEXT_CHAT_TEMPLATE') == '1' else [])],
                     'text-e2e-client.log', 3600)
             finally:
                 for evidence in [OUT / 'text-e2e-client.log', *sorted((OUT / 'text-e2e').glob('*.json'))]:

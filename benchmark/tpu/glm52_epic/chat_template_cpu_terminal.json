@@ -1,0 +1,53 @@
+{
+  "experiment": "exp-k45fnh2ogx",
+  "status": "SUCCEEDED",
+  "scope": "actualcheckpoint templateCPU inspection; no weights loaded; noTPU",
+  "renders": [
+    {
+      "kwargs": {},
+      "prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is the capital of France?<|assistant|><think>",
+      "ids": [
+        154822,
+        154824,
+        154826,
+        25062,
+        287,
+        29905,
+        371,
+        25,
+        7487,
+        154827,
+        3838,
+        374,
+        279,
+        6722,
+        315,
+        9621,
+        30,
+        154828,
+        154841
+      ]
+    },
+    {
+      "kwargs": {
+        "enable_thinking": false
+      },
+      "prompt": "[gMASK]<sop><|user|>What is the capital of France?<|assistant|><think></think>",
+      "ids": [
+        154822,
+        154824,
+        154827,
+        3838,
+        374,
+        279,
+        6722,
+        315,
+        9621,
+        30,
+        154828,
+        154841,
+        154842
+      ]
+    }
+  ]
+}

@@ -8,11 +8,20 @@ import urllib.request
 import urllib.error
 
 
-def run(base_url, output):
+def run(base_url, output, tokenizer_path=None):
     spec=json.loads(Path(__file__).with_name('text_e2e_requests.json').read_text())
     output=Path(output);output.mkdir(parents=True,exist_ok=False)
+    tokenizer=None
+    if tokenizer_path is not None:
+        from transformers import AutoTokenizer
+        tokenizer=AutoTokenizer.from_pretrained(tokenizer_path,trust_remote_code=True)
+        assert tokenizer.chat_template, 'model authored chat template required'
     checks=[]
     def execute(name,text,expected,rank=None):
+        if tokenizer is not None:
+            assert isinstance(text,str), 'chat checks require scalar input'
+            text=tokenizer.apply_chat_template([dict(role='user',content=text)],
+                tokenize=False,add_generation_prompt=True,enable_thinking=False)
         payload=dict(text=text,sampling_params=spec['sampling_params'],stream=False,rid=str(uuid.uuid4()))
         if rank is not None:payload['routed_dp_rank']=rank
         (output/f'{name}-request.json').write_text(json.dumps(payload,ensure_ascii=False)+'\n')
@@ -53,9 +62,10 @@ def run(base_url, output):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--base-url',required=True);parser.add_argument('--output',required=True)
+    parser.add_argument('--tokenizer-path',help='model authored chat template, nonthinking mode; omitted preserves raw completion')
     args=parser.parse_args()
     try:
-        run(args.base_url,args.output)
+        run(args.base_url,args.output,args.tokenizer_path)
     except Exception as error:
         import traceback
         output=Path(args.output)
