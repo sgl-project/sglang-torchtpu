@@ -1,0 +1,14 @@
+{
+ "objective_status":"INCOMPLETE; goal remains active, automatic round cap reached; no completion or blocker claim",
+ "verified_reference":{"experiment":"exp-266i34jcm1","attention_dp":16,"actual_active_requests":16,"tokens_per_dp_per_step":2048,"global_tokens_per_step":32768,"submitted_concurrency":32,"queued":16,"prefix_per_request":49152,"total_extend_per_request":12288,"measured_steps":12,"measured_extend_tokens":393216,"output_tokens":16},
+ "latest_replay":{"experiment":"exp-88cbehgzz1","result":"Failed at480s load-skew barrier, before target compilation; host0 cause not established","native_evidence":"replay_load_barrier_native.txt"},
+ "negative_discriminators":[
+  {"experiment":"exp-knq072ob26","result":"Both independent hosts baseline and retained int64/int32 metadata sequence numerical gates PASS; standalone sequence not sufficient for fatal"},
+  {"experiment":"exp-7ebqrpc7f0","result":"Both independent hosts production2113-page64 decode eager/Dynamo numerical/cache gates PASS; not TP16 model compile proof"}
+ ],
+ "historical137":"Completed EXTEND then firstDECODE0/6, launcher137; outer task1/signal0, no returned abort event; killed PID and signal origin unknown. Do not claim OOM or concurrent6 bucket compiles.",
+ "next_action":"One explicitly diagnostic historical-shape fullmodel replay with existing pre-spawn300s Python stack capture and perhost rank-verified collection, bounded load-skew policy and no Flash/DCP/16physicalchip changes. Determine host0 loading wait before inferring compiler failure. No new replay submitted.",
+ "performance_gate":"Closed: real multi-rank admission barrier, long-model capacity and completion, precision target evidence missing; no ratio",
+ "resource_state":"All three recent waits collected terminal; no background job running at check",
+ "workspace":"Tracked changes committed/pushed; two intentional untracked request-table drafts untouched"
+}
