@@ -29,10 +29,9 @@ def summarize(path):
         for p in row.get('processes', []):
             if not p.get('tracked_descendant'):
                 continue
-            # PID reuse cannot be ruled out by this sampler; cmdline separates
-            # observed exec identities, not full process lifetimes.
-            key = (p['pid'], p.get('cmdline'))
-            old = processes.setdefault(key, dict(pid=p['pid'], cmdline=p.get('cmdline'),
+            # Legacy samples lack start_ticks and cannot distinguish PID reuse.
+            key = (p['pid'], p.get('start_ticks'), p.get('cmdline'))
+            old = processes.setdefault(key, dict(pid=p['pid'], start_ticks=p.get('start_ticks'), cmdline=p.get('cmdline'),
                                                  max_sampled_rss_kib=0, max_observed_hwm_kib=0))
             old['max_sampled_rss_kib'] = max(old['max_sampled_rss_kib'], p['rss_kib'])
             old['max_observed_hwm_kib'] = max(old['max_observed_hwm_kib'], p['rss_hwm_kib'])
@@ -45,7 +44,7 @@ def summarize(path):
                 limitations=['Not unique compiler peak or RSS sum.',
                              'memory.peak may predate the probe; stat fields peak at different times.',
                              'file may include shmem; these fields are not additive.',
-                             'Sampling can miss short-lived children; PID lifetimes unavailable.',
+                             'Sampling can miss short-lived children; legacy samples without start_ticks cannot distinguish PID reuse.',
                              'Zero counters do not exclude ancestor or host OOM.'])
 
 

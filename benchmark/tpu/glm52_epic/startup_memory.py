@@ -34,6 +34,15 @@ def _cmdline(pid_path):
         return None
 
 
+def _start_ticks(pid_path):
+    """Linux /proc stat field22; comm can contain spaces and parentheses."""
+    try:
+        fields = (pid_path / 'stat').read_text().rsplit(')', 1)[1].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def collect(proc=Path('/proc'), cgroup=Path('/sys/fs/cgroup'), root_pids=()):
     root_pids = tuple(int(pid) for pid in root_pids)
     record = {'time_ns': time.time_ns(), 'pid': os.getpid(),
@@ -90,6 +99,7 @@ def collect(proc=Path('/proc'), cgroup=Path('/sys/fs/cgroup'), root_pids=()):
                                   'ppid': int(fields.get('PPid', '0').strip()),
                                   'name': fields.get('Name', '').strip(),
                                   'cmdline': _cmdline(p),
+                                  'start_ticks': _start_ticks(p),
                                   'tracked_descendant': int(p.name) in descendants})
         except (OSError, ValueError):
             pass
