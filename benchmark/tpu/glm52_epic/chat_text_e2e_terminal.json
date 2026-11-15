@@ -1,0 +1,1203 @@
+{
+  "experiment": "exp-k0nnadpb6q",
+  "status": "SUCCEEDED",
+  "functional_responses": 20,
+  "sanity_matched": 20,
+  "returned_dp_ranks": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "scope": "actualmodel nonthinkingchat; same20questions/max128/substrings; no matchedC16performance or accuracycertification",
+  "responses": {
+    "addition-response.json": {
+      "text": "42",
+      "output_ids": [
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "669bbdc7-d803-44f7-a758-fe592a133ce8",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 19,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 2,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 2
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 4,
+        "e2e_latency": 1.5890457862988114,
+        "response_sent_to_client_ts": 1794762915.9592118
+      }
+    },
+    "dp-0-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "4f4e4be4-3ab5-40bd-b606-d72a9bafa4ef",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 0,
+        "e2e_latency": 1.6755228163674474,
+        "response_sent_to_client_ts": 1794762919.3570676
+      }
+    },
+    "dp-1-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "059d2c94-a289-4cf7-a307-5fef9f0a01a6",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 1,
+        "e2e_latency": 1.6738869585096836,
+        "response_sent_to_client_ts": 1794762919.356583
+      }
+    },
+    "dp-10-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "206a2986-f34f-430b-9287-215aa321209f",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 10,
+        "e2e_latency": 1.666684003546834,
+        "response_sent_to_client_ts": 1794762919.3560696
+      }
+    },
+    "dp-11-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "9021e39a-72da-4e95-85d9-1ed732afea1b",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 11,
+        "e2e_latency": 1.6679074699059129,
+        "response_sent_to_client_ts": 1794762919.359911
+      }
+    },
+    "dp-12-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "42c08342-697d-4321-a6de-e8a1f9a0fb9a",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 12,
+        "e2e_latency": 1.6712259063497186,
+        "response_sent_to_client_ts": 1794762919.3611796
+      }
+    },
+    "dp-13-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "9d970ff1-728c-4886-94db-6aa7d1600c94",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 13,
+        "e2e_latency": 1.6668214639648795,
+        "response_sent_to_client_ts": 1794762919.35756
+      }
+    },
+    "dp-14-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "88f51a77-080a-4208-89e3-4e38bcb056be",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 14,
+        "e2e_latency": 1.6694185947999358,
+        "response_sent_to_client_ts": 1794762919.3607779
+      }
+    },
+    "dp-15-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "ac38468a-c937-4032-ac08-e07e632f9052",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 15,
+        "e2e_latency": 1.6658926187083125,
+        "response_sent_to_client_ts": 1794762919.3584468
+      }
+    },
+    "dp-2-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "4b74a228-e5c8-48f3-a76a-680f740a4b1b",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 2,
+        "e2e_latency": 1.6710021551698446,
+        "response_sent_to_client_ts": 1794762919.3545797
+      }
+    },
+    "dp-3-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "78837c95-691e-4825-a8bf-21ff90e5cd32",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 3,
+        "e2e_latency": 1.6698528062552214,
+        "response_sent_to_client_ts": 1794762919.3551092
+      }
+    },
+    "dp-4-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "1aacf9ed-bd68-4a84-9244-78e674c062f5",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 4,
+        "e2e_latency": 1.669609130360186,
+        "response_sent_to_client_ts": 1794762919.3555949
+      }
+    },
+    "dp-5-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "77ca8dca-1185-4f21-bd16-c7da0a183f5c",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 5,
+        "e2e_latency": 1.6689261952415109,
+        "response_sent_to_client_ts": 1794762919.3537192
+      }
+    },
+    "dp-6-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "de33f5d9-3c04-4d2c-9d08-f7f7b77cbecb",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 6,
+        "e2e_latency": 1.6722758552059531,
+        "response_sent_to_client_ts": 1794762919.3589265
+      }
+    },
+    "dp-7-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "98ec390d-7ed0-43a1-bba2-4fffbaa0a143",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 7,
+        "e2e_latency": 1.672107147052884,
+        "response_sent_to_client_ts": 1794762919.3594344
+      }
+    },
+    "dp-8-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "75d23408-9b04-4adf-839f-51138894dda2",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 8,
+        "e2e_latency": 1.6722708139568567,
+        "response_sent_to_client_ts": 1794762919.3603456
+      }
+    },
+    "dp-9-response.json": {
+      "text": "17 + 25 = 42",
+      "output_ids": [
+        99419,
+        488,
+        220,
+        99446,
+        284,
+        220,
+        101961,
+        154827
+      ],
+      "meta_info": {
+        "id": "6ef5dd95-908d-470c-8fdf-0b1a252bee34",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 23,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 9,
+        "e2e_latency": 1.669264143332839,
+        "response_sent_to_client_ts": 1794762919.358005
+      }
+    },
+    "fact-en-response.json": {
+      "text": "The capital of France is Paris.",
+      "output_ids": [
+        785,
+        6722,
+        315,
+        9621,
+        374,
+        12089,
+        13,
+        154827
+      ],
+      "meta_info": {
+        "id": "8991a3ce-4655-434c-9217-b9158bce4e20",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 18,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 8,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 8
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 2,
+        "e2e_latency": 1.730179350823164,
+        "response_sent_to_client_ts": 1794762912.8052154
+      }
+    },
+    "fact-zh-response.json": {
+      "text": "巴黎。",
+      "output_ids": [
+        105217,
+        1773,
+        154827
+      ],
+      "meta_info": {
+        "id": "5034a599-fe86-4d3e-a49f-8a1561b05ab7",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 18,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 3,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 3
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 3,
+        "e2e_latency": 1.5584548264741898,
+        "response_sent_to_client_ts": 1794762914.3669646
+      }
+    },
+    "retrieval-response.json": {
+      "text": "CEDAR-7284",
+      "output_ids": [
+        61621,
+        934,
+        12,
+        22,
+        99869,
+        19,
+        154827
+      ],
+      "meta_info": {
+        "id": "6968978f-a9a9-48e6-9025-c4395f50824d",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 154827
+        },
+        "prompt_tokens": 41,
+        "weight_version": "default",
+        "num_retractions": 0,
+        "reasoning_tokens": 0,
+        "completion_tokens": 7,
+        "cached_tokens": 0,
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 7
+          }
+        ],
+        "cached_tokens_details": null,
+        "dp_rank": 5,
+        "e2e_latency": 1.7139215786010027,
+        "response_sent_to_client_ts": 1794762917.6763594
+      }
+    }
+  },
+  "hosts": [
+    {
+      "attention_path_runtime_verified": false,
+      "bootstrap_provenance": {
+        "base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+        "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3",
+        "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c",
+        "got": {
+          "jax": "0.11.2",
+          "jaxlib": "0.11.2",
+          "libtpu": "0.0.50",
+          "torch": "2.11.0+cpu",
+          "torch_tpu": "0.2.1.dev20261028201649",
+          "torchvision": "0.26.0+cpu",
+          "tpu-sync-torch": "0.0.1.dev20261031081414"
+        },
+        "peer_experiment": "exp-bsvzoblh0d",
+        "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00",
+        "peer_task_status": "succeeded",
+        "prepared_wheelhouse": "/prepared/wheelhouse",
+        "schema_version": 1,
+        "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity",
+        "source_commit": "552e93ab661682f89bfda5890e8a413ad7b12821",
+        "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git",
+        "want": {
+          "jax": "0.11.2",
+          "jaxlib": "0.11.2",
+          "libtpu": "0.0.50",
+          "torch": "2.11.0",
+          "torch_tpu": "0.2.1.dev20261028201649",
+          "torchvision": "0.26.0",
+          "tpu-sync-torch": "0.0.1.dev20261031081414"
+        },
+        "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+        "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+        "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"
+      },
+      "candidate_sha256": "89cb743221199fa0ca8733c83b8d10dbe91102f81e1f1f6a48bfba5ec71310d8",
+      "configured_local_chunk_ceiling": 2048,
+      "coordinate_probe": "/tmp/glm52-peer-rank0.QvPuQT/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS=\"ignore:<TorchTpu/Performance/TcMalloc/\" to suppress this warning.\n  _tcmalloc_check.check_tcmalloc()\nWARNING: All log messages before absl::InitializeLog() is called are written to STDERR\nI0000 00:00:1794760868.189446     628 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank0.QvPuQT/venv/lib/python3.12/site-packages/libtpu/libtpu.so\nI0000 00:00:1794760868.204352     628 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.\n[W1115 16:41:08.558026714 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())\nI0000 00:00:1794760868.891158     628 device_rt.cc:172] PjRt runtime initialization deferred for tpu\nSuccessfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')\nRegistered Python module for 'tpu'.\nDevice type: tpu, Device index: default\nInitializing TPU distributed runtime\nI0000 00:00:1794760868.894018     628 libtpu_version.cc:63] Setting libtpu version to: 0.0.50\nI0000 00:00:1794760870.815418     628 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.\nI0000 00:00:1794760876.307317     628 pjrt_c_api_client.cc:187] PjRtCApiClient created.\nW0000 00:00:1794760876.307362     628 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.\nTORCH_TPU_LOCAL_DEVICE_COORDS=[0, 0, 1]\nI0000 00:00:1794760876.311084     628 compilation_cache.cc:360] Compilation cache evicted.\nI0000 00:00:1794760876.311095     628 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0\nnum_cache_hits=0 {NA}\nnum_compilations=0\npeak_compilation_memory_bytes=unknown",
+      "elapsed_seconds": 2067.493,
+      "expected_attention_path": "candidate_default_attention_path",
+      "falcon_rank": 0,
+      "generate_input_tokens": 12288,
+      "generate_status": 200,
+      "health_status": 200,
+      "host_preparation": {
+        "actual_read_bytes": 388633344768,
+        "buffer_bytes_per_worker": 4194304,
+        "checkpoint": "/models/GLM5.2-fp8-channel-wise",
+        "elapsed_s": 71.82613486796618,
+        "execute": true,
+        "host": "falcon-job-33knebsvk4-workers-0-0",
+        "host_expert_union": [
+          128,
+          256
+        ],
+        "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+        "indexed_files": 282,
+        "physical_rank": 1,
+        "requested_bytes": 388633344768,
+        "scope": "numeric expert union plus all unmatched/shared keys; not physical I/O or cache residency",
+        "selected_useful_bytes": 388633344768,
+        "slice_only": false,
+        "threads": 8,
+        "total_indexed_payload_bytes": 756251507456,
+        "unindexed_not_prepared": []
+      },
+      "image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+      "launcher_shutdown_exit_code": 143,
+      "output_ids": [
+        154820,
+        474,
+        733,
+        474,
+        733,
+        474,
+        474,
+        474,
+        733,
+        474,
+        474,
+        474,
+        474,
+        474,
+        474,
+        474
+      ],
+      "request_success_count": 1,
+      "scope": "compiled long request E2E; 12288input/16output; NOT precision or matched C16 performance",
+      "selective_reader_log_verified": true,
+      "source_commit": "552e93ab661682f89bfda5890e8a413ad7b12821",
+      "status": "SUCCEEDED",
+      "text_e2e": {
+        "checks": [
+          {
+            "case": "addition",
+            "completion_tokens": 2,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 19,
+            "returned_dp_rank": 4,
+            "rid": "669bbdc7-d803-44f7-a758-fe592a133ce8",
+            "routed_dp_rank": null,
+            "text": "42"
+          },
+          {
+            "case": "dp-0",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 0,
+            "rid": "4f4e4be4-3ab5-40bd-b606-d72a9bafa4ef",
+            "routed_dp_rank": 0,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-1",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 1,
+            "rid": "059d2c94-a289-4cf7-a307-5fef9f0a01a6",
+            "routed_dp_rank": 1,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-10",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 10,
+            "rid": "206a2986-f34f-430b-9287-215aa321209f",
+            "routed_dp_rank": 10,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-11",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 11,
+            "rid": "9021e39a-72da-4e95-85d9-1ed732afea1b",
+            "routed_dp_rank": 11,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-12",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 12,
+            "rid": "42c08342-697d-4321-a6de-e8a1f9a0fb9a",
+            "routed_dp_rank": 12,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-13",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 13,
+            "rid": "9d970ff1-728c-4886-94db-6aa7d1600c94",
+            "routed_dp_rank": 13,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-14",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 14,
+            "rid": "88f51a77-080a-4208-89e3-4e38bcb056be",
+            "routed_dp_rank": 14,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-15",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 15,
+            "rid": "ac38468a-c937-4032-ac08-e07e632f9052",
+            "routed_dp_rank": 15,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-2",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 2,
+            "rid": "4b74a228-e5c8-48f3-a76a-680f740a4b1b",
+            "routed_dp_rank": 2,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-3",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 3,
+            "rid": "78837c95-691e-4825-a8bf-21ff90e5cd32",
+            "routed_dp_rank": 3,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-4",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 4,
+            "rid": "1aacf9ed-bd68-4a84-9244-78e674c062f5",
+            "routed_dp_rank": 4,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-5",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 5,
+            "rid": "77ca8dca-1185-4f21-bd16-c7da0a183f5c",
+            "routed_dp_rank": 5,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-6",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 6,
+            "rid": "de33f5d9-3c04-4d2c-9d08-f7f7b77cbecb",
+            "routed_dp_rank": 6,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-7",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 7,
+            "rid": "98ec390d-7ed0-43a1-bba2-4fffbaa0a143",
+            "routed_dp_rank": 7,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-8",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 8,
+            "rid": "75d23408-9b04-4adf-839f-51138894dda2",
+            "routed_dp_rank": 8,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "dp-9",
+            "completion_tokens": 8,
+            "expected": "42",
+            "matched": true,
+            "prompt_tokens": 23,
+            "returned_dp_rank": 9,
+            "rid": "6ef5dd95-908d-470c-8fdf-0b1a252bee34",
+            "routed_dp_rank": 9,
+            "text": "17 + 25 = 42"
+          },
+          {
+            "case": "fact-en",
+            "completion_tokens": 8,
+            "expected": "paris",
+            "matched": true,
+            "prompt_tokens": 18,
+            "returned_dp_rank": 2,
+            "rid": "8991a3ce-4655-434c-9217-b9158bce4e20",
+            "routed_dp_rank": null,
+            "text": "The capital of France is Paris."
+          },
+          {
+            "case": "fact-zh",
+            "completion_tokens": 3,
+            "expected": "巴黎",
+            "matched": true,
+            "prompt_tokens": 18,
+            "returned_dp_rank": 3,
+            "rid": "5034a599-fe86-4d3e-a49f-8a1561b05ab7",
+            "routed_dp_rank": null,
+            "text": "巴黎。"
+          },
+          {
+            "case": "retrieval",
+            "completion_tokens": 7,
+            "expected": "cedar-7284",
+            "matched": true,
+            "prompt_tokens": 41,
+            "returned_dp_rank": 5,
+            "rid": "6968978f-a9a9-48e6-9025-c4395f50824d",
+            "routed_dp_rank": null,
+            "text": "CEDAR-7284"
+          }
+        ],
+        "scope": "20 functional responses; no measured rankadmission/C16performance/accuracy benchmark proof",
+        "status": "TEXT_E2E_PASS"
+      },
+      "topology": {
+        "chip_topology": "2x2x2",
+        "devices_per_host": 8,
+        "hosts": [
+          "10.228.6.11",
+          "10.228.7.134"
+        ],
+        "native_topology": "2,2,2,2",
+        "physical_chip_nodes": [
+          "/dev/vfio/0",
+          "/dev/vfio/1",
+          "/dev/vfio/2",
+          "/dev/vfio/3",
+          "/dev/vfio/4",
+          "/dev/vfio/5",
+          "/dev/vfio/6",
+          "/dev/vfio/7"
+        ],
+        "physical_chips": 8,
+        "total_devices": 16
+      },
+      "versions": {
+        "jax": "0.11.2",
+        "jaxlib": "0.11.2",
+        "libtpu": "0.0.50",
+        "torch": "2.11.0+cpu",
+        "torch_tpu": "0.2.1.dev20261028201649",
+        "tpu-sync-torch": "0.0.1.dev20261031081414"
+      }
+    },
+    {
+      "bootstrap_provenance": {
+        "base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+        "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3",
+        "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c",
+        "got": {
+          "jax": "0.11.2",
+          "jaxlib": "0.11.2",
+          "libtpu": "0.0.50",
+          "torch": "2.11.0+cpu",
+          "torch_tpu": "0.2.1.dev20261028201649",
+          "torchvision": "0.26.0+cpu",
+          "tpu-sync-torch": "0.0.1.dev20261031081414"
+        },
+        "peer_experiment": "exp-bsvzoblh0d",
+        "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00",
+        "peer_task_status": "succeeded",
+        "prepared_wheelhouse": "/prepared/wheelhouse",
+        "schema_version": 1,
+        "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity",
+        "source_commit": "552e93ab661682f89bfda5890e8a413ad7b12821",
+        "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git",
+        "want": {
+          "jax": "0.11.2",
+          "jaxlib": "0.11.2",
+          "libtpu": "0.0.50",
+          "torch": "2.11.0",
+          "torch_tpu": "0.2.1.dev20261028201649",
+          "torchvision": "0.26.0",
+          "tpu-sync-torch": "0.0.1.dev20261031081414"
+        },
+        "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+        "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl",
+        "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"
+      },
+      "candidate_sha256": "89cb743221199fa0ca8733c83b8d10dbe91102f81e1f1f6a48bfba5ec71310d8",
+      "coordinate_probe": "/tmp/glm52-peer-rank1.t4ZiaB/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS=\"ignore:<TorchTpu/Performance/TcMalloc/\" to suppress this warning.\n  _tcmalloc_check.check_tcmalloc()\nWARNING: All log messages before absl::InitializeLog() is called are written to STDERR\nI0000 00:00:1794760868.726948     627 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.t4ZiaB/venv/lib/python3.12/site-packages/libtpu/libtpu.so\nI0000 00:00:1794760868.740093     627 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.\n[W1115 16:41:09.674796295 env_vars.h:393] Warning: <TorchTpu/ApiStage/ExperimentalApi/> the TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS environment variable is an experimental feature and may change or be removed without notice. (function operator())\nI0000 00:00:1794760869.371989     627 device_rt.cc:172] PjRt runtime initialization deferred for tpu\nSuccessfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')\nRegistered Python module for 'tpu'.\nDevice type: tpu, Device index: default\nInitializing TPU distributed runtime\nI0000 00:00:1794760869.374783     627 libtpu_version.cc:63] Setting libtpu version to: 0.0.50\nI0000 00:00:1794760871.336250     627 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.\nI0000 00:00:1794760876.066433     627 pjrt_c_api_client.cc:187] PjRtCApiClient created.\nW0000 00:00:1794760876.066487     627 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.\nTORCH_TPU_LOCAL_DEVICE_COORDS=[0, 0, 0]\nI0000 00:00:1794760876.070208     627 compilation_cache.cc:360] Compilation cache evicted.\nI0000 00:00:1794760876.070219     627 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=0\nnum_cache_hits=0 {NA}\nnum_compilations=0\npeak_compilation_memory_bytes=unknown",
+      "elapsed_seconds": 2071.578,
+      "falcon_rank": 1,
+      "host_preparation": {
+        "actual_read_bytes": 388633344768,
+        "buffer_bytes_per_worker": 4194304,
+        "checkpoint": "/models/GLM5.2-fp8-channel-wise",
+        "elapsed_s": 78.06515526771545,
+        "execute": true,
+        "host": "falcon-job-33knebsvk4-workers-0-1",
+        "host_expert_union": [
+          0,
+          128
+        ],
+        "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+        "indexed_files": 282,
+        "physical_rank": 0,
+        "requested_bytes": 388633344768,
+        "scope": "numeric expert union plus all unmatched/shared keys; not physical I/O or cache residency",
+        "selected_useful_bytes": 388633344768,
+        "slice_only": false,
+        "threads": 8,
+        "total_indexed_payload_bytes": 756251507456,
+        "unindexed_not_prepared": []
+      },
+      "image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+      "launcher_shutdown_exit_code": 143,
+      "rank0_smoke_acknowledged": true,
+      "scope": "current-source historical-shape compile replay; NOT performance or exact historical-source reproduction",
+      "selective_reader_log_verified": true,
+      "source_commit": "552e93ab661682f89bfda5890e8a413ad7b12821",
+      "status": "SUCCEEDED",
+      "topology": {
+        "chip_topology": "2x2x2",
+        "devices_per_host": 8,
+        "hosts": [
+          "10.228.6.11",
+          "10.228.7.134"
+        ],
+        "native_topology": "2,2,2,2",
+        "physical_chip_nodes": [
+          "/dev/vfio/0",
+          "/dev/vfio/1",
+          "/dev/vfio/2",
+          "/dev/vfio/3",
+          "/dev/vfio/4",
+          "/dev/vfio/5",
+          "/dev/vfio/6",
+          "/dev/vfio/7"
+        ],
+        "physical_chips": 8,
+        "total_devices": 16
+      },
+      "versions": {
+        "jax": "0.11.2",
+        "jaxlib": "0.11.2",
+        "libtpu": "0.0.50",
+        "torch": "2.11.0+cpu",
+        "torch_tpu": "0.2.1.dev20261028201649",
+        "tpu-sync-torch": "0.0.1.dev20261031081414"
+      }
+    }
+  ]
+}
