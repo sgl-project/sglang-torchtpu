@@ -1,0 +1,14 @@
+{
+ "experiment":"exp-k0nnadpb6q",
+ "job":"job-33knebsvk4",
+ "artifact":"art-9spdg5u243",
+ "source":"552e93ab66",
+ "status_at_submit":"PENDING",
+ "wait_job":"bash-eee1b7ea5a4742b9",
+ "cpu_integration":"exp-heqccy233c SUCCEEDED; actualmodel tokenizer and20HTTP requests roleboundaries/nonthinking/DP receipts verified",
+ "anchor":"exp-vist8hk13c functional20responses, rawcompletion18of20sanity",
+ "change":"GLM52_TEXT_CHAT_TEMPLATE=1 uses actual model authored template enable_thinking=False; same questions/max128/expected substrings",
+ "dump":false,
+ "topology":"8physicalchips/2hosts/TP16 attentionDP16 EP16",
+ "scope":"functional chattext sanity and native DP receipts; not numericalprecision benchmark or matchedC16performance"
+}
