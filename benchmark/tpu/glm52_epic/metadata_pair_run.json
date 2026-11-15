@@ -1,0 +1,15 @@
+{
+ "experiment":"exp-knq072ob26",
+ "job":"job-mbgjox2ck7",
+ "artifact":"art-7fcg3ki6jv",
+ "parent":"exp-d7z6ng4w0i",
+ "source_commit":"e96e242a657ae2e15009492eb89b55b9023e5a2f",
+ "runner":"benchmark/tpu/glm52_epic/allocator_metadata_pair_runner.sh",
+ "hardware":"8 physical v7x chips total,2 hosts,16 visible cores; each independent probe uses default1 device, no TP model or DCP",
+ "scope":"checkpoint-free eager DEFER_NEVER baseline versus retained preceding int64/int32 metadata uploads then production CPU allocator expansion/int32 TPU upload/blocking D2H. No intermediate fencing.",
+ "acceptance":"Both hosts baseline and metadata arms exact8 transfer markers; metadata arm8 numerical metadata markers; no native fatal. Passing does not exclude concurrent model/collective-dependent failure.",
+ "status":"SUCCEEDED",
+ "terminal_utc":"2026-11-15T09:11:59Z",
+ "verified_results":"Both distinct host GCS logs: baseline8 + metadata8 transfer oracles, metadata8 retained-value oracles, exact pair arm markers; no native fatal signature.",
+ "conclusion":"Preceding mixed int64/int32 length/index H2Ds plus production int32 allocator roundtrip alone did not reproduce eager fatal. Do not change metadata dtype based on this hypothesis. Distributed collective/model concurrency and other queued producers remain untested."
+}
