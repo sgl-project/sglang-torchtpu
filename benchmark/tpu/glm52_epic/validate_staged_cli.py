@@ -2,6 +2,7 @@
 """Parse actual staged CLI grammar without constructing model/runtime/device."""
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
@@ -9,7 +10,8 @@ from sglang.srt.server_args import ServerArgs
 
 
 def main():
-    path = Path('benchmark/tpu/glm52_epic/torch_staged_loading_candidate.json')
+    path = Path(sys.argv[1] if len(sys.argv) == 2 else
+                'benchmark/tpu/glm52_epic/torch_staged_loading_candidate.json')
     cfg = json.loads(path.read_text())
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
