@@ -10,6 +10,7 @@ streams only its ``mtp.*`` tensors (``_draft_weights``).
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
@@ -89,11 +90,16 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
             raise ValueError(
                 "DSpark draft: the checkpoint index lists no mtp.* tensors"
             )
+        names, local_experts = _draft_ep_local_names(
+            names, config=source.model_config.hf_config
+        )
         by_name = {path.rsplit("/", 1)[-1]: path for path in files}
         shards = sorted({by_name[weight_map[n]] for n in names})
         logger.info(
-            "V4.1 DSpark draft: reading %d mtp tensors from %d shards",
+            "V4.1 DSpark draft: reading %d mtp tensors (%d local expert tensors) "
+            "from %d shards",
             len(names),
+            local_experts,
             len(shards),
         )
         with SafetensorsStreamer() as streamer:
@@ -103,3 +109,46 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
             for name, tensor in streamer.get_tensors():
                 setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
                 yield source.prefix + name, tensor
+
+
+_DRAFT_EXPERT = re.compile(
+    r"^mtp\.(0|[1-9]\d*)\.ffn\.experts\.(0|[1-9]\d*)\.w[123]\.(weight|scale)$"
+)
+
+
+def _draft_ep_local_names(names: set[str], *, config) -> tuple[set[str], int]:
+    """Drop the draft's routed experts outside this EP rank's range.
+
+    The draft MoE shards over the target's EP group (TpuDsv41DsparkDraftWorker),
+    so a rank keeps experts [rank * E / ep, (rank + 1) * E / ep), as the target's
+    EP-local read (sglang_tpu.ep_weight_shard) does; vllm-torchtpu filters its
+    draft the same way.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    ep_size, ep_rank = parallel.moe_ep_size, parallel.moe_ep_rank
+    num_experts = int(
+        getattr(config, "dspark_n_routed_experts", 0) or config.n_routed_experts
+    )
+    if ep_size <= 1:
+        experts = sum(1 for n in names if _DRAFT_EXPERT.fullmatch(n))
+        return names, experts
+    if num_experts % ep_size:
+        raise ValueError(
+            f"DSpark draft: {num_experts} routed experts do not divide EP {ep_size}"
+        )
+    local = num_experts // ep_size
+    lo, hi = ep_rank * local, (ep_rank + 1) * local
+    kept, experts = set(), 0
+    for name in names:
+        match = _DRAFT_EXPERT.fullmatch(name)
+        if match is not None:
+            expert = int(match[2])
+            if expert >= num_experts:
+                raise ValueError(f"DSpark draft expert outside the config: {name}")
+            if not lo <= expert < hi:
+                continue
+            experts += 1
+        kept.add(name)
+    return kept, experts

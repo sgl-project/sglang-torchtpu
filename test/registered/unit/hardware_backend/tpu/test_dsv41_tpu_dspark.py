@@ -226,5 +226,53 @@ class TestDrafterSelection(CustomTestCase):
             )
 
 
+class TestDraftEpLocalNames(CustomTestCase):
+    def test_keeps_local_experts_and_every_replicated_tensor(self):
+        from sglang_tpu.models.deepseek_v41 import loader
+
+        names = {
+            f"mtp.{s}.ffn.experts.{e}.w{w}.{k}"
+            for s in range(2)
+            for e in range(16)
+            for w in (1, 2, 3)
+            for k in ("weight", "scale")
+        } | {"mtp.0.attn.wq_a.weight", "mtp.1.ffn.shared_experts.w1.weight"}
+        config = SimpleNamespace(dspark_n_routed_experts=16, n_routed_experts=256)
+        parallel = SimpleNamespace(moe_ep_size=8, moe_ep_rank=3)
+        with mock.patch(
+            "sglang.srt.runtime_context.get_parallel", return_value=parallel
+        ):
+            kept, experts = loader._draft_ep_local_names(names, config=config)
+        kept_experts = {int(n.split(".")[4]) for n in kept if ".experts." in n}
+        self.assertEqual(kept_experts, {6, 7})
+        self.assertEqual(experts, 2 * 2 * 3 * 2)
+        self.assertIn("mtp.0.attn.wq_a.weight", kept)
+        self.assertIn("mtp.1.ffn.shared_experts.w1.weight", kept)
+
+    def test_without_ep_reads_everything(self):
+        from sglang_tpu.models.deepseek_v41 import loader
+
+        names = {"mtp.0.ffn.experts.5.w1.weight", "mtp.0.norm.weight"}
+        config = SimpleNamespace(dspark_n_routed_experts=0, n_routed_experts=8)
+        parallel = SimpleNamespace(moe_ep_size=1, moe_ep_rank=0)
+        with mock.patch(
+            "sglang.srt.runtime_context.get_parallel", return_value=parallel
+        ):
+            kept, experts = loader._draft_ep_local_names(names, config=config)
+        self.assertEqual(kept, names)
+        self.assertEqual(experts, 1)
+
+
+class TestDraftPlacement(CustomTestCase):
+    def test_v41_dspark_draft_keeps_the_target_placement(self):
+        from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
+        from sglang_tpu.models.deepseek_v41.dspark_drafter import (
+            TpuDsv41DsparkDraftWorker,
+        )
+
+        self.assertFalse(TpuDraftWorker._keeps_target_placement)
+        self.assertTrue(TpuDsv41DsparkDraftWorker._keeps_target_placement)
+
+
 if __name__ == "__main__":
     unittest.main()

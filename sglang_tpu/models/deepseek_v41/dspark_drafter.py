@@ -34,6 +34,12 @@ _MAX_BLOCK_ROWS = 64
 
 
 class TpuDsv41DsparkDraftWorker(TpuBlockDraftWorker):
+    # The draft stages are DeepseekV4DecoderLayers: under attention DP they gather
+    # tokens across DP ranks and run EP MoE like the target (vllm-torchtpu
+    # epic/dsv41 builds them with the target's EP). Idle DP ranks already enter
+    # the draft forward through _forward_idle_decode.
+    _keeps_target_placement = True
+
     def __init__(self, target_runner: ModelRunner) -> None:
         super().__init__(target_runner)
         model = self.model_runner.model

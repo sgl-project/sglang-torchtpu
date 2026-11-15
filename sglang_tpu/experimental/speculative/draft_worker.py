@@ -28,12 +28,17 @@ class TpuDraftWorker(ABC):
     """
 
     num_drafts: int
+    # A draft built from the target's decoder layers keeps the target placement,
+    # so its MoE shards over the target's EP group instead of replicating.
+    _keeps_target_placement: bool = False
 
     def __init__(self, target_runner: ModelRunner) -> None:
         self._target_runner = target_runner
         # Under DP attention the draft runs inside its rank's attention-TP group, as
         # an EAGLE3 draft does in core, so it gathers nothing across DP ranks.
-        self._owns_attention = get_parallel().attn_dp_enabled
+        self._owns_attention = (
+            get_parallel().attn_dp_enabled and not self._keeps_target_placement
+        )
         model_config = ModelConfig.from_server_args(
             target_runner.server_args,
             model_path=get_spec().speculative_draft_model_path,
