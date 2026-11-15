@@ -1,0 +1,37 @@
+"""Explicit pre-runtime HLO capture setup; dormant until runner opts in.
+
+Only established HLO flags. No unverified Jellyfish flags, tensors or fences.
+"""
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+import time
+
+
+def install(directory):
+    root=Path(directory)
+    if not root.is_absolute():
+        raise ValueError('absolute allocation-scoped capture directory required')
+    # Initializing after backend import could capture the wrong compiler flags.
+    if any(name in sys.modules for name in ('jax','torch_tpu','torch_xla')):
+        raise RuntimeError('IR setup must precede backend imports')
+    inherited=os.environ.get('XLA_FLAGS','')
+    if 'xla_dump_' in inherited:
+        raise ValueError('inherited dump flags/filter conflict with producer capture')
+    pidroot=root/f'host-{os.environ.get("FALCON_RANK","unknown")}'/f'pid-{os.getpid()}'
+    pidroot.mkdir(parents=True,exist_ok=False)
+    hlo=pidroot/'hlo';hlo.mkdir()
+    if any(c.isspace() for c in str(hlo)):
+        raise ValueError('XLA dump directory cannot contain whitespace')
+    flags=f'--xla_dump_to={hlo} --xla_dump_hlo_as_text --xla_dump_hlo_as_proto'
+    os.environ['XLA_FLAGS']=(inherited+' '+flags).strip()
+    record=dict(pid=os.getpid(),ppid=os.getppid(),hostname=socket.gethostname(),
+        falcon_rank=os.environ.get('FALCON_RANK'),wall_ns=time.time_ns(),
+        monotonic_ns=time.monotonic_ns(),source_commit=os.environ.get('SOURCE_COMMIT'),
+        inherited_xla_flags=inherited,final_xla_flags=os.environ['XLA_FLAGS'],
+        libtpu_init_args_at_setup=os.environ.get('LIBTPU_INIT_ARGS'),
+        scope='preimport setup only; final env_override/dependency/rank map still required')
+    (pidroot/'capture-setup.json').write_text(json.dumps(record,indent=2)+'\n')
+    return pidroot
