@@ -58,8 +58,23 @@ class OrderedCommandSource:
             inventory = (self.directory/receipt['inventory_file']).resolve()
             if inventory.parent != self.directory.resolve():
                 raise ValueError('inventory must be directly inside run directory')
-            if hashlib.sha256(inventory.read_bytes()).hexdigest() != receipt.get('inventory_sha256'):
+            inventory_bytes = inventory.read_bytes()
+            if hashlib.sha256(inventory_bytes).hexdigest() != receipt.get('inventory_sha256'):
                 raise ValueError('accepted inventory digest mismatch')
+            # Re-read currently published scheduler snapshots, not just the old
+            # accepted copy. This detects changed queues/errors, but is NOT an
+            # atomic distributed freeze: exclusive traffic remains mandatory.
+            from benchmark.tpu.glm52_epic.admission_inventory import validate_inventory
+            accepted = json.loads(inventory_bytes)
+            for rank in range(16):
+                if (self.directory/f'ordered-rank-{rank}-error.json').exists():
+                    raise ValueError('rank observation failed before resume')
+            current = [json.loads((self.directory/f'ordered-rank-{rank}.json').read_text())
+                       for rank in range(16)]
+            verdict = validate_inventory(accepted['expected_routes'], current,
+                run_token=self.run_token, epoch=epoch, sequence=seq-1)
+            if not verdict['ready']:
+                raise ValueError(f'current inventory changed: {verdict["reasons"]}')
         else:
             raise ValueError('invalid action')
         self.sequence, self.last = seq, dict(command)
