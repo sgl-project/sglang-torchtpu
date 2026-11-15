@@ -33,15 +33,23 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('checkpoint', type=Path)
     p.add_argument('--max-shard-bytes', type=int, default=4*1024**3)
+    p.add_argument('--expert-start', type=int, default=0)
+    p.add_argument('--expert-end', type=int, default=16)
+    p.add_argument('--shard', help='Indexed shard basename; default first containing selected expert')
     args = p.parse_args()
     if args.max_shard_bytes <= 0:
         p.error('positive shard byte cap required')
     index = json.loads((args.checkpoint/'model.safetensors.index.json').read_text())['weight_map']
     # Choose from index keys, not whole-file tensor reads or 282 shard scans.
-    candidates = sorted({v for k,v in index.items() if '.experts.0.' in k})
+    if not 0 <= args.expert_start < args.expert_end <= 256:
+        p.error('GLM256 expert interval must be within [0,256)')
+    candidates = sorted({v for k,v in index.items() if f'.experts.{args.expert_start}.' in k})
     if not candidates:
-        raise ValueError('no expert0 indexed shard')
-    shard = args.checkpoint/candidates[0]
+        raise ValueError('no indexed shard for selected expert')
+    name = args.shard or candidates[0]
+    if Path(name).name != name or name not in set(index.values()):
+        p.error('shard must be an indexed basename')
+    shard = args.checkpoint/name
     if shard.stat().st_size > args.max_shard_bytes:
         raise ValueError('representative shard exceeds bounded-memory cap')
     h = header(shard)
@@ -66,8 +74,8 @@ def main():
         def counted_open(path, mode='r', *a, **kw):
             return CountingFile(real_open(path, mode, *a, **kw))
 
-        expected = plan(h, 0, 16, gap)
-        r = reader.EpLocalExpertReader([str(shard)], (0, 16))
+        expected = plan(h, args.expert_start, args.expert_end, gap)
+        r = reader.EpLocalExpertReader([str(shard)], (args.expert_start, args.expert_end))
         print('SHARD_READ_BEGIN', json.dumps(dict(shard=shard.name, gap=gap,
               useful_bytes=expected['useful_bytes'], requested_span_bytes=expected['requested_span_bytes'])), flush=True)
         with patch.object(reader, '_SPAN_MERGE_GAP_BYTES', gap), patch.object(reader, 'open', counted_open, create=True):
@@ -89,7 +97,10 @@ def main():
                     if not torch.equal(a[offset:offset+8*1024**2], b[offset:offset+8*1024**2]):
                         raise AssertionError('payload mismatch: '+name)
         print('EXPERT_SHARD_BYTE_PASS', json.dumps(dict(shard=shard.name, gap=gap,
-              keys=len(loaded), skipped_keys=expected['skipped_keys'], **counters,
+              expert_range=[args.expert_start, args.expert_end],
+              keys=len(loaded), scale_keys=sum('scale' in k for k in loaded),
+              shared_keys=sum('.shared_experts.' in k for k in loaded),
+              skipped_keys=expected['skipped_keys'], **counters,
               useful_bytes=expected['useful_bytes'], gap_overread_bytes=expected['gap_overread_bytes'])), flush=True)
         del loaded, r, actual, target, a, b
         gc.collect()
