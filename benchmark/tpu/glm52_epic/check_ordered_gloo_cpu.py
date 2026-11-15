@@ -10,7 +10,7 @@ import types
 from unittest.mock import patch
 
 
-def worker(rank, port):
+def worker(rank, port, directory, run_token):
     import torch.distributed as dist
     from benchmark.tpu.glm52_epic.run_reader_cpu_tests import unavailable
     boundary = types.ModuleType('sgl_kernel')
@@ -44,6 +44,34 @@ def worker(rank, port):
                     assert isinstance(result[0],PauseGenerationReqInput if seq==0 else ContinueGenerationReqInput)
                     if seq==1:assert result[0].torch_empty_cache is False
                     received.append(result[0].rid)
+            # Real adapter + run handshake, followed by native fullgroup Gloo.
+            from benchmark.tpu.glm52_epic.admission_run import publish_command
+            from benchmark.tpu.glm52_epic.ordered_receiver_adapter import install
+            class RawBoundary:
+                recv_skipper=input_blocker=scripted_scheduler_hook=None
+                def _pull_raw_reqs(self):return []
+            # Explicit synthetic16 mesh exercises adapter guard only. Actual
+            # transport remains two processes and is NEVER reported as16ranks.
+            config=dict(dp_size=1,tp_size=16,attn_dp_size=16,pp_size=1,attn_tp_size=1,
+                attn_cp_size=1,attn_dcp_size=1,local_control=False,elastic_join=False,
+                speculative=False,disaggregation=False,tp_rank=rank,attn_dp_rank=rank)
+            undo=install(RawBoundary,directory=directory,run_token=run_token,topology=lambda _:config)
+            owner=RawBoundary();assert owner._pull_raw_reqs()==[]
+            dist.barrier()
+            if rank==0:publish_command(directory,run_token=run_token,sequence=0,epoch='warm',action='pause')
+            dist.barrier()
+            raw=owner._pull_raw_reqs()
+            assert len(raw)==(1 if rank==0 else 0)
+            with patch.object(module,'get_parallel',return_value=parallel), \
+                 patch.object(module,'get_exec',return_value=types.SimpleNamespace(moe=types.SimpleNamespace(is_ep_scale_joiner=False))), \
+                 patch.object(module,'node_fanout_enabled',return_value=False), \
+                 patch.object(module,'attn_cp_tp_broadcast_pyobj',side_effect=lambda x:x):
+                result=receiver._broadcast_reqs_across_ranks(raw)
+            assert len(result)==1 and result[0].rid==f'glm52-control:{run_token}:warm:0:pause'
+            assert owner._pull_raw_reqs()==[]
+            print('ORDERED_ROOT_ADAPTER_GLOO_RANK_PASS '+str(rank),flush=True)
+            # Ownedpause fixture deliberately ends with processgroup teardown;
+            # cannot call clean uninstall without validated resume inventory.
             print('ORDERED_NATIVE_GLOO_RANK_PASS '+json.dumps(dict(rank=rank,received=received,scope='real2process nativecontrolbroadcast; attentionTP1 identityboundary; no16rank/admission/modelproof')),flush=True)
         finally:
             dist.destroy_process_group()
@@ -53,7 +81,11 @@ def main():
     import torch.multiprocessing as mp
     with socket.socket() as sock:
         sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
-    mp.spawn(worker,args=(port,),nprocs=2,join=True)
+    import tempfile
+    from benchmark.tpu.glm52_epic.admission_run import create_run
+    with tempfile.TemporaryDirectory() as parent:
+        root,token=create_run(parent)
+        mp.spawn(worker,args=(port,str(root),token),nprocs=2,join=True)
     print('ORDERED_NATIVE_GLOO_CPU_PASS ranks=2',flush=True)
 
 
