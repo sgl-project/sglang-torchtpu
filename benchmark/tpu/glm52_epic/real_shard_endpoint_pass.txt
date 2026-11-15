@@ -1,0 +1,18 @@
+/usr/local/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794742751.543178      19 pjrt_api.cc:119] GetPjrtApi was found for TPU at /usr/local/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794742751.559837      19 tpu_profiler_plugin.cc:800] PyTorch PrivateUse1ProfilerRegistry not found. Native TPU profiling will be disabled (this is expected on PyTorch < 2.12).
+SHARD_READ_BEGIN {"shard": "model-00004-of-00282.safetensors", "gap": 0, "useful_bytes": 604635136, "requested_span_bytes": 604635136}
+EXPERT_SHARD_BYTE_PASS {"shard": "model-00004-of-00282.safetensors", "gap": 0, "expert_range": [240, 256], "keys": 96, "scale_keys": 48, "shared_keys": 0, "skipped_keys": 330, "payload_readinto_bytes": 604635136, "useful_bytes": 604635136, "gap_overread_bytes": 0}
+SHARD_READ_BEGIN {"shard": "model-00004-of-00282.safetensors", "gap": 16777216, "useful_bytes": 604635136, "requested_span_bytes": 604635136}
+EXPERT_SHARD_BYTE_PASS {"shard": "model-00004-of-00282.safetensors", "gap": 16777216, "expert_range": [240, 256], "keys": 96, "scale_keys": 48, "shared_keys": 0, "skipped_keys": 330, "payload_readinto_bytes": 604635136, "useful_bytes": 604635136, "gap_overread_bytes": 0}
+/usr/local/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794742766.771150      64 pjrt_api.cc:119] GetPjrtApi was found for TPU at /usr/local/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794742766.792286      64 tpu_profiler_plugin.cc:800] PyTorch PrivateUse1ProfilerRegistry not found. Native TPU profiling will be disabled (this is expected on PyTorch < 2.12).
+SHARD_READ_BEGIN {"shard": "model-00005-of-00282.safetensors", "gap": 0, "useful_bytes": 518104320, "requested_span_bytes": 518104320}
+EXPERT_SHARD_BYTE_PASS {"shard": "model-00005-of-00282.safetensors", "gap": 0, "expert_range": [0, 16], "keys": 77, "scale_keys": 34, "shared_keys": 6, "skipped_keys": 344, "payload_readinto_bytes": 518104320, "useful_bytes": 518104320, "gap_overread_bytes": 0}
+SHARD_READ_BEGIN {"shard": "model-00005-of-00282.safetensors", "gap": 16777216, "useful_bytes": 518104320, "requested_span_bytes": 518104320}
+EXPERT_SHARD_BYTE_PASS {"shard": "model-00005-of-00282.safetensors", "gap": 16777216, "expert_range": [0, 16], "keys": 77, "scale_keys": 34, "shared_keys": 6, "skipped_keys": 344, "payload_readinto_bytes": 518104320, "useful_bytes": 518104320, "gap_overread_bytes": 0}

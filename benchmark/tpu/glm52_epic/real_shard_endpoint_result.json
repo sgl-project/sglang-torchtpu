@@ -1,0 +1,68 @@
+{
+  "experiment": "exp-wfoy1x5uv4",
+  "status": "SUCCEEDED",
+  "source": "2b36506ca8",
+  "scope": "CPU two representative realshards, exact bit oracle and requested bytes; not all checkpoint or model loading",
+  "results": [
+    {
+      "shard": "model-00004-of-00282.safetensors",
+      "gap": 0,
+      "expert_range": [
+        240,
+        256
+      ],
+      "keys": 96,
+      "scale_keys": 48,
+      "shared_keys": 0,
+      "skipped_keys": 330,
+      "payload_readinto_bytes": 604635136,
+      "useful_bytes": 604635136,
+      "gap_overread_bytes": 0
+    },
+    {
+      "shard": "model-00004-of-00282.safetensors",
+      "gap": 16777216,
+      "expert_range": [
+        240,
+        256
+      ],
+      "keys": 96,
+      "scale_keys": 48,
+      "shared_keys": 0,
+      "skipped_keys": 330,
+      "payload_readinto_bytes": 604635136,
+      "useful_bytes": 604635136,
+      "gap_overread_bytes": 0
+    },
+    {
+      "shard": "model-00005-of-00282.safetensors",
+      "gap": 0,
+      "expert_range": [
+        0,
+        16
+      ],
+      "keys": 77,
+      "scale_keys": 34,
+      "shared_keys": 6,
+      "skipped_keys": 344,
+      "payload_readinto_bytes": 518104320,
+      "useful_bytes": 518104320,
+      "gap_overread_bytes": 0
+    },
+    {
+      "shard": "model-00005-of-00282.safetensors",
+      "gap": 16777216,
+      "expert_range": [
+        0,
+        16
+      ],
+      "keys": 77,
+      "scale_keys": 34,
+      "shared_keys": 6,
+      "skipped_keys": 344,
+      "payload_readinto_bytes": 518104320,
+      "useful_bytes": 518104320,
+      "gap_overread_bytes": 0
+    }
+  ]
+}
