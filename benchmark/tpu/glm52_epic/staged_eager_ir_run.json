@@ -1,15 +1,48 @@
 {
- "experiment":"exp-s04p89hobu",
- "job":"job-922twj5akh",
- "artifact":"art-geezjbhz0p",
- "source":"a2f1f27cfb81d7ebba2be92aad91864bff3c1bbb",
- "status_at_submit":"PENDING",
- "anchor":"exp-24def76f9j",
- "bootstrap":"unchanged exact successful anchor bootstrap; same dependency pins and verified wheel",
- "topology":"8physical v7xchips,2hosts,16frameworkdevices TP16 attentionDP16 EP16; noDCP",
- "diagnostic":"staged nonmmap1reader+physicalhost expertunion; recurrent smallpage128ctx4096cache8192 eager mode; natural pre-ready warmup only; NOT exactoriginal largecache or performance",
- "capture":"perprocess HLOtext+proto no modulefilter; postbase env record; artifactpersist;4GiB12500files perhost80%abort",
- "LLO":"not enabled: binaryflags present but parser/emission not proven",
- "acceptance":"If fatal captures originatingproducerIR correlate PID/rank and exact module. If nofatal report changedshape NONREPRO notfixed. If budget/setup fails distinguish diagnosticfailure from nativefailure. No ratio.",
- "wait_job":"bash-82ce916e7e204864"
+  "experiment": "exp-s04p89hobu",
+  "job": "job-922twj5akh",
+  "artifact": "art-geezjbhz0p",
+  "source": "a2f1f27cfb81d7ebba2be92aad91864bff3c1bbb",
+  "status_at_submit": "PENDING",
+  "anchor": "exp-24def76f9j",
+  "bootstrap": "unchanged exact successful anchor bootstrap; same dependency pins and verified wheel",
+  "topology": "8physical v7xchips,2hosts,16frameworkdevices TP16 attentionDP16 EP16; noDCP",
+  "diagnostic": "staged nonmmap1reader+physicalhost expertunion; recurrent smallpage128ctx4096cache8192 eager mode; natural pre-ready warmup only; NOT exactoriginal largecache or performance",
+  "capture": "perprocess HLOtext+proto no modulefilter; postbase env record; artifactpersist;4GiB12500files perhost80%abort",
+  "LLO": "not enabled: binaryflags present but parser/emission not proven",
+  "acceptance": "If fatal captures originatingproducerIR correlate PID/rank and exact module. If nofatal report changedshape NONREPRO notfixed. If budget/setup fails distinguish diagnosticfailure from nativefailure. No ratio.",
+  "wait_job": "bash-82ce916e7e204864",
+  "last_verified": {
+    "status": "RUNNING native scheduler plugin registration; not loaded or ready yet",
+    "falcon_rank0_hostprep": {
+      "actual_read_bytes": 388633344768,
+      "buffer_bytes_per_worker": 4194304,
+      "checkpoint": "/models/GLM5.2-fp8-channel-wise",
+      "elapsed_s": 86.06072007864714,
+      "execute": true,
+      "host": "falcon-job-922twj5akh-workers-0-0",
+      "host_expert_union": [
+        128,
+        256
+      ],
+      "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+      "indexed_files": 282,
+      "physical_rank": 1,
+      "requested_bytes": 388633344768,
+      "scope": "numeric expert union plus all unmatched/shared keys; not physical I/O or cache residency",
+      "selected_useful_bytes": 388633344768,
+      "slice_only": false,
+      "threads": 8,
+      "total_indexed_payload_bytes": 756251507456,
+      "unindexed_not_prepared": []
+    },
+    "effective_shape": {
+      "context_length": 4096,
+      "max_total_tokens": 8192,
+      "page_size": 128,
+      "local_chunk": 256,
+      "requested_global_chunk": 4096
+    },
+    "evidence": "live native server_args and preflight; defaultpreflightFAILED is not terminalstatus"
+  }
 }
