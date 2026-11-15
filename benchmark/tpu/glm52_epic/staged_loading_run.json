@@ -1,0 +1,11 @@
+{
+ "experiment":"exp-24def76f9j", "job":"job-8cu2p7jr5j", "artifact":"art-gkroz6twqo",
+ "source":"25d226dafd5195ad7868fbfb6c65497f8e48b98c", "status_at_submit":"PENDING",
+ "hardware":"v7x2x2x2 total8physicalchips,2hosts,16frameworkdevices",
+ "changes":"host physicalrank union preparation before scheduler; postprep identity rendezvous; GLM exactclass EP-local range reader; disablemmap;1fileworker/scheduler; keepstreamsync",
+ "invariants":"same historical compile shapes/runtime/compiler; unchanged480s loadskew barrier; noFlash noDCP no16physicalchip no performance claim",
+ "admission":"19CPUreader tests pass;3actualshards exactbit oracle pass incl shared/scale;bounded2shard hostprep pass;282shard headerplan; actualnativeargparse pass;reviewedrankmapping",
+ "wait_job":"bash-8485946c7f684659",
+ "acceptance":"hostprep BOTH full pass; actualreader activation physicalrank0; nofallback; all16rankloadend;passloadbarrier;capture firstEXTEND/DECODE terminalcause if failure;startup success notperformance",
+ "note":"One controlled replay, do not duplicate while running. submission is not success."
+}
