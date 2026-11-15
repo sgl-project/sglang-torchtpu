@@ -1,6 +1,6 @@
 {
   "experiment": "exp-24def76f9j",
-  "status": "RUNNING4of6",
+  "status": "ALL6_COMPILED_STARTUP_SMOKE_PASS",
   "compiled_decode": [
     {
       "bs": 1,
@@ -17,6 +17,14 @@
     {
       "bs": 8,
       "elapsed_s": 178.9
+    },
+    {
+      "bs": 16,
+      "elapsed_s": 194.3
+    },
+    {
+      "bs": 32,
+      "elapsed_s": 195.6
     }
   ],
   "scope": "compile progress not performance not fullstartup"

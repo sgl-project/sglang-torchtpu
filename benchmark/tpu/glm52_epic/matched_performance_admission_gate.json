@@ -34,7 +34,7 @@
   ],
   "latest_hardware_evidence": {
     "fullmodel_historical_shape": {"experiment":"exp-88cbehgzz1","result":"FAILED before compile: unbalanced loading barrier480s; no matched timing or compiler verdict"},
-    "staged_loading_replay": {"experiment":"exp-24def76f9j","source":"25d226dafd","status":"RUNNING","result":"All16 load46.09-56.82s, postload barrier passed, EXTEND485.9s completed, DECODEbs1 179.6s andbs2 184.4s completed; remaining compile/startup/smoke pending. No matched timing/precision verdict, no originalfatal/killrootcause conclusion"},
+    "staged_loading_replay": {"experiment":"exp-24def76f9j","source":"25d226dafd","status":"SUCCEEDED","result":"All16 load46.09-56.82s; EXTEND485.9s and all6DECODE buckets complete; health200/generate200 outputIDs154820,17351. Bothhosts cleanup statusSUCCEEDED launcher alivebeforecleanup,143 afterward. No matched timing/longcontextprecision verdict, no originaleagerfatal/killrootcause conclusion"},
     "metadata_sequence": {"experiment":"exp-knq072ob26","result":"Both independent hosts baseline/preceding metadata numerical oracles passed; not TP16 model proof"},
     "decode_static_capacity": {"experiment":"exp-7ebqrpc7f0","result":"Production2113-page shape eager/Dynamo numerical and signed cache-write oracles passed both independent hosts; not fullmodel DECODE"},
     "precision": "JAX0.11.2 abstract dot trace retains mixed BF16/FP8 QK and FP32/FP8 PV. Target instruction precision and parity still unverified."
