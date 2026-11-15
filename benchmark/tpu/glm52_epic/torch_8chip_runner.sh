@@ -124,7 +124,7 @@ try:
     require(not run(['git', 'status', '--porcelain', '--untracked-files=no'], 'source-status.txt'),
             'tracked source modifications detected')
     mode = os.environ.get('GLM52_BASELINE_MODE', '')
-    require(mode in ('', 'eager', 'compile-smoke'), 'unsupported baseline mode')
+    require(mode in ('', 'eager', 'compile-smoke', 'historical-replay'), 'unsupported baseline mode')
     candidate = Path('benchmark/tpu/glm52_epic/' + (
         'torch_runnable_baseline.json' if mode == 'eager' else
         'torch_compile_smoke.json' if mode == 'compile-smoke' else
@@ -162,6 +162,15 @@ try:
                  'tpu_compile_bs': [1], 'tpu_compile_tokens': [2048]} if mode == 'compile-smoke' else {
                  'chunked_prefill_size': 32768, 'max_prefill_tokens': 32768,
                  'tpu_compile_tokens': [2048]})
+    if mode == 'historical-replay':
+        contract = {'enable_torch_compile': True, 'context_length': 135168,
+                    'max_total_tokens': 147456, 'chunked_prefill_size': 32768,
+                    'max_prefill_tokens': 32768, 'page_size': 64,
+                    'max_running_requests': 32, 'torch_compile_max_bs': 32,
+                    'tpu_compile_bs': [1, 2, 4, 8, 16, 32], 'tpu_compile_tokens': [2048]}
+        require(not os.environ.get('GLM52_DIAGNOSTIC_REQUESTS'),
+                'historical replay cannot run matched-workload diagnostic')
+        result['scope'] = 'current-source historical-shape compile replay; NOT performance or exact historical-source reproduction'
     require(all(args.get(k) == v for k, v in contract.items()), 'baseline shape contract changed')
     if mode in ('eager', 'compile-smoke'):
         require(not os.environ.get('GLM52_DIAGNOSTIC_REQUESTS'),
@@ -263,7 +272,7 @@ try:
                 except Exception as error:
                     # Diagnostic sampling must never terminate model execution.
                     print(f'GLM52_HOST_MEMORY_ERROR {error!r}', flush=True)
-                memory_stop.wait(30)
+                memory_stop.wait(0.5 if mode == 'historical-replay' else 30)
 
     memory_thread = threading.Thread(target=sample_memory, daemon=True)
     memory_thread.start()
@@ -291,7 +300,7 @@ try:
         smoke_tokens = 512 if mode in ('eager', 'compile-smoke') else 4
         # One output comes from prefill logits; require a second output to
         # exercise a decode forward, which never uses the q-block prefill op.
-        smoke_outputs = 2 if mode in ('eager', 'compile-smoke') else 1
+        smoke_outputs = 2 if mode in ('eager', 'compile-smoke', 'historical-replay') else 1
         request_body = {'input_ids': [1] * smoke_tokens, 'sampling_params': {
             'temperature': 0, 'max_new_tokens': smoke_outputs, 'ignore_eos': True}, 'stream': False}
         save('generate-request.json', request_body)
