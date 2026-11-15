@@ -1,0 +1,11 @@
+{
+  "scope": "Real-text functional checks; exact arithmetic/fact markers are lightweight sanity checks, not model accuracy certification or performance workload",
+  "sampling_params": {"temperature": 0, "max_new_tokens": 128},
+  "cases": [
+    {"id": "fact-en", "text": "Answer briefly in English. What is the capital of France?", "expected_substring_casefold": "paris"},
+    {"id": "fact-zh", "text": "请简短回答：法国的首都是哪座城市？", "expected_substring_casefold": "巴黎"},
+    {"id": "addition", "text": "Compute 17 + 25. Reply with the final answer.", "expected_substring_casefold": "42"},
+    {"id": "retrieval", "text": "Read this note: The project verification code is CEDAR-7284. The meeting room is Blue. What is the project verification code? Repeat the code exactly.", "expected_substring_casefold": "cedar-7284"}
+  ],
+  "parallel_batch": {"count": 16, "text_template": "Request number {index}. Compute 17 + 25 and give the final answer.", "expected_substring_casefold": "42", "scope": "16 submitted requests; actual rank routing/admission must be separately evidenced"}
+}
