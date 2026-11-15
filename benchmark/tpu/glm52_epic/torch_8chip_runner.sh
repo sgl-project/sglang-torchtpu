@@ -517,6 +517,16 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
                               if mode in ('eager', 'staged-eager', 'eager-ir', 'compile-smoke')
                               else 'candidate_default_attention_path'))
         check_child()
+        if os.environ.get('GLM52_TEXT_E2E') == '1':
+            require(mode == 'compiled-long-e2e', 'text E2E requires proven compiled long mode')
+            run([sys.executable, '-m', 'benchmark.tpu.glm52_epic.text_e2e_client',
+                 '--base-url', 'http://127.0.0.1:30000', '--output', str(OUT / 'text-e2e')],
+                'text-e2e-client.log', 3600)
+            text_result = json.loads((OUT / 'text-e2e/result.json').read_text())
+            result['text_e2e'] = text_result
+            print('GLM52_TEXT_E2E_RESULT ' + json.dumps(text_result), flush=True)
+            require(text_result['status'] == 'TEXT_E2E_PASS', 'real text sanity failed')
+            check_child()
         # Opt-in only: prepared requests must reference frozen data + its manifest
         # available locally (e.g. supplemental exact JAX source /workspace/sglang-jax).
         # No observer is required/enabled here; no claim of matched JAX cadence.
