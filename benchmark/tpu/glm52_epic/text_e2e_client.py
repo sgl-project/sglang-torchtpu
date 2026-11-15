@@ -43,4 +43,14 @@ def run(base_url, output):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--base-url',required=True);parser.add_argument('--output',required=True)
-    args=parser.parse_args();run(args.base_url,args.output)
+    args=parser.parse_args()
+    try:
+        run(args.base_url,args.output)
+    except Exception as error:
+        import traceback
+        output=Path(args.output)
+        if output.is_dir():
+            (output/'client-error.json').write_text(json.dumps(dict(
+                status='CLIENT_FAILED',type=type(error).__name__,message=str(error),
+                traceback=traceback.format_exc()),indent=2)+'\n')
+        raise

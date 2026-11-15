@@ -528,6 +528,16 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
                     if evidence.is_file():
                         print('GLM52_TEXT_EVIDENCE ' + evidence.name + '\\n' +
                               evidence.read_text(errors='replace'), flush=True)
+                import shutil
+                artifact = Path(os.environ['ARTIFACT_LOCAL_DIR'])
+                require(artifact.is_absolute(), 'absolute Falcon artifact mount required')
+                text_archive = artifact / 'text-e2e' / f'host-{RANK}'
+                require(not text_archive.exists(), 'text evidence archive must be fresh')
+                text_archive.mkdir(parents=True, exist_ok=False)
+                if (OUT / 'text-e2e').is_dir():
+                    shutil.copytree(OUT / 'text-e2e', text_archive / 'responses')
+                if (OUT / 'text-e2e-client.log').is_file():
+                    shutil.copy2(OUT / 'text-e2e-client.log', text_archive / 'client.log')
             text_result = json.loads((OUT / 'text-e2e/result.json').read_text())
             result['text_e2e'] = text_result
             print('GLM52_TEXT_E2E_RESULT ' + json.dumps(text_result), flush=True)
