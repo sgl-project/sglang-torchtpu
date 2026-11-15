@@ -17,6 +17,8 @@ def main():
                         help='Single key, or causal keys with zero queries and uniform weights.')
     parser.add_argument('--entry', choices=('per-query', 'prefill-fallback', 'prefill-qblock', 'prefill-long-table'), default='per-query',
                         help='Token-major, small prefill fallback,2048-token qblock, or481-page static-table fallback.')
+    parser.add_argument('--decode-capacity', action='store_true',
+                        help='Per-query self probe only: page64 and2112-page static request table (context135168). Not full-model decode.')
     parser.add_argument('--dynamo', action='store_true',
                         help='Compile the production op fullgraph with backend=tpu, static shapes.')
     parser.add_argument('--prefix-tokens', type=int, choices=(0, 49152), default=0,
@@ -24,6 +26,10 @@ def main():
     parser.add_argument('--requests', type=int, choices=(1, 2), default=1,
                         help='Two disjoint long-table prefix-pair requests,1024 queries each.')
     args = parser.parse_args()
+    if args.decode_capacity and (args.entry != 'per-query' or args.queries != 1
+                                 or args.selection != 'self' or args.requests != 1
+                                 or args.prefix_tokens != 0):
+        parser.error('decode-capacity requires per-query queries1 self requests1 prefix0')
     if args.requests == 2 and args.selection != 'prefix-pair':
         parser.error('two-request probe requires prefix-pair')
     if args.prefix_tokens and args.entry != 'prefill-long-table':
@@ -50,7 +56,7 @@ def main():
         raise RuntimeError('torch 2.11.0 CPU ABI required')
     from sglang_tpu.attention_pallas_mla_sparse import _build_pallas_sparse_mla_kernel_op
 
-    t, h, p, k = args.queries, 64, 128, 2048
+    t, h, p, k = args.queries, 64, 64 if args.decode_capacity else 128, 2048
     print('STAGE allocate', flush=True)
     def upload(a):
         return torch.from_numpy(a).to('tpu')
@@ -65,6 +71,10 @@ def main():
     # Prefix cache remains zero/unselected: this is not realistic long attention.
     table_pages = 481 if args.entry == 'prefill-long-table' else 33
     num_pages = (1 + 481 * args.requests) if args.entry == 'prefill-long-table' else (65 if large_prefill else 2)
+    if args.decode_capacity:
+        table_pages = 135168 // p
+        num_pages = table_pages + 1
+        print(f'DECODE_CAPACITY page_size={p} pages_per_seq={table_pages} live_kv=1', flush=True)
     per_request = t // args.requests
     token_request = np.arange(t) // per_request
     local_row = np.arange(t) % per_request
@@ -90,7 +100,7 @@ def main():
     live_kv = args.prefix_tokens + per_request
     head_major = args.entry == 'prefill-fallback' or large_prefill
     distribution = [1, 1, 1] if t == 1 and not head_major else [0, 0, args.requests]
-    pages = list(range(1, table_pages * args.requests + 1)) if large_prefill else [1]
+    pages = list(range(1, table_pages * args.requests + 1)) if large_prefill or args.decode_capacity else [1]
     print(f'SPARSE_REQUESTS count={args.requests} queries_per_request={per_request}', flush=True)
     print(f'SPARSE_METADATA pages_per_seq={len(pages) // args.requests} live_kv={live_kv} prefix={args.prefix_tokens} '
           f'expected_prefill_path={"per-query" if len(pages) > 256 else "shape-dependent"}',

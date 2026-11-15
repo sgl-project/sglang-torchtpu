@@ -65,12 +65,16 @@ def supervise(command, directory, *, timeout, interval):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', choices=('eager', 'dynamo'), required=True)
+    parser.add_argument('--case', choices=('prefill', 'decode-capacity'), default='prefill')
     parser.add_argument('--output', type=Path, required=True, help='New per-case evidence directory')
     parser.add_argument('--timeout', type=float, default=400)
     parser.add_argument('--interval', type=float, default=0.5)
     args = parser.parse_args()
+    queries, entry = (1, 'per-query') if args.case == 'decode-capacity' else (2048, 'prefill-long-table')
     command = [sys.executable, '-m', 'benchmark.tpu.glm52_epic.repro_sparse_step',
-               '--queries', '2048', '--selection', 'self', '--entry', 'prefill-long-table']
+               '--queries', str(queries), '--selection', 'self', '--entry', entry]
+    if args.case == 'decode-capacity':
+        command.append('--decode-capacity')
     if args.mode == 'dynamo':
         command.append('--dynamo')
     result = supervise(command, args.output, timeout=args.timeout, interval=args.interval)
@@ -78,7 +82,7 @@ def main():
         return 2
     lines = (args.output / 'native.log').read_text().splitlines()
     for i in (0, 1):
-        marker = f'PRODUCTION_SPARSE_STEP_PASS iteration={i} queries=2048 selection=self entry=prefill-long-table'
+        marker = f'PRODUCTION_SPARSE_STEP_PASS iteration={i} queries={queries} selection=self entry={entry}'
         if lines.count(marker) != 1:
             raise RuntimeError('missing exact numerical/cache oracle marker')
     return 0
