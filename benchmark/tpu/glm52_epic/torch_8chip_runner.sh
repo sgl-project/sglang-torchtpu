@@ -128,6 +128,7 @@ try:
     candidate = Path('benchmark/tpu/glm52_epic/' + (
         'torch_runnable_baseline.json' if mode == 'eager' else
         'torch_compile_smoke.json' if mode == 'compile-smoke' else
+        'torch_staged_loading_candidate.json' if mode == 'historical-replay' else
         'torch_prefill_candidate.json'))
     require(candidate.is_file(), 'run from exact source checkout root')
     candidate_bytes = candidate.read_bytes()
