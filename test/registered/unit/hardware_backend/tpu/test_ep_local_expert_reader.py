@@ -398,6 +398,31 @@ class TestTpuLocalRoutedExpertRange(CustomTestCase):
             local = FusedMoE._map_global_expert_id_to_local_expert_id(layers[0], eid)
             self.assertEqual(local != -1, rng[0] <= eid < rng[1], eid)
 
+    def test_glm_target_exact_class_and_runtime_guards(self):
+        from sglang.srt.models.glm4_moe import (
+            GlmMoeDsaForCausalLM,
+            GlmMoeDsaForCausalLMNextN,
+        )
+
+        class UnreviewedSubclass(GlmMoeDsaForCausalLM):
+            pass
+
+        for cls in (GlmMoeDsaForCausalLM, GlmMoeDsaForCausalLMNextN,
+                    UnreviewedSubclass):
+            model = cls.__new__(cls)
+            torch.nn.Module.__init__(model)
+            model.layers = torch.nn.ModuleList([_fused_moe(16, 3, 16, 256)])
+            with self.subTest(cls=cls), self._env():
+                result = ep_local_expert_reader.tpu_local_routed_expert_range(model)
+                self.assertEqual(result, (48, 64) if cls is GlmMoeDsaForCausalLM else None)
+            if cls is GlmMoeDsaForCausalLM:
+                for env in (dict(tpu=False), dict(eplb=object()), dict(join='scale')):
+                    with self.subTest(env=env), self._env(**env):
+                        self.assertIsNone(ep_local_expert_reader.tpu_local_routed_expert_range(model))
+                model.layers[0]._has_fused_shared = True
+                with self._env():
+                    self.assertIsNone(ep_local_expert_reader.tpu_local_routed_expert_range(model))
+
     def test_no_range(self):
         cases = {
             "not_tpu": (dict(tpu=False), [_fused_moe(4, 1, 8, 32)], True),
