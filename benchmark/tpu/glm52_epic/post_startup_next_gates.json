@@ -1,0 +1,10 @@
+{
+ "startup_anchor":{"experiment":"exp-24def76f9j","source":"25d226dafd5195ad7868fbfb6c65497f8e48b98c","status":"SUCCEEDED allcompile health200 generate200","scope":"shortsmoke only; source/kernels frozen as accepted anchor"},
+ "next_scope":"Build CPU-verifiable benchmark-only real scheduler admission/readback before allocating another fullmodel run.",
+ "exact_reference":{"submitted":32,"active_perstep":16,"requests_per_dp":1,"queued":16,"prefix":49152,"extend":12288,"output":16,"localtokens":2048,"globaltokens":32768,"expected_extend_steps":12},
+ "observed_scheduler_seam":"scheduler.event_loop_overlap ingests requests before get_next_batch_to_run, lines2173-2185. Benchmark wrapping scheduling selection can keep ingesting while delaying selection; must not block ingest waiting for missing requests.",
+ "unsafe_shortcuts":["TokenizerManager HTTP pause blocks dispatch before scheduler, so not realinventory gate","Blocking run_batch after selecting early batch already changes admission","Setting _engine_paused alone affects lifecycle semantics and can spin; not chosen without design/testing","HTTP concurrency32 alone cannot certify actual16 cadence","Existing observer proves completion only, not admission or precision"],
+ "required_design":["Explicit unique session and allowlisted RIDs assigned to attentionDP","Snapshot exactwaiting andrunninginventory perrank after ingestion","Nonblocking gate returns no plan until coordinator validates all16ranks","Bounded failure cancellation and release marker; cannot deadlock request ingress or background control","Track cache prefix assignment and generated completions; reject skewed/nonmatching stages","CPU tests behavior on real source boundaries; then one realhardware admission check"],
+ "parallel_remaining":"Originaleagerfatal originatingIR and original137 killer unresolved. Current compileenabled replay bypasses neither rootcause claim nor precisioncontract. Do not repeat negative allocator probe.",
+ "performance":"Gate remains closed until actualrankproof and precision/native-mode labeling. No ratio."
+}
