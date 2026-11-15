@@ -1,0 +1,17 @@
+{
+  "experiment": "exp-fwe7p1dc1x",
+  "job": "job-mtldyzhrsw",
+  "artifact": "art-pb6uxwdhy8",
+  "source": "527dd98eaafea4d3d698c961103ff65228fbfea6",
+  "mode": "staged-eager",
+  "status_at_submit": "PENDING",
+  "compiler_dump": false,
+  "capture_observer": false,
+  "physical_chips": 8,
+  "hosts": 2,
+  "framework_devices": 16,
+  "scope": "Natural pre-ready warmup then actual512input/2output greedy request exercising prefill and decode; not longcontext/performance proof",
+  "loading": "same staged eager candidate; hostunion exactrange preparation,mmapoff,prefetchoff,EP-local one reader",
+  "next": "If pass proceed E2E longrequest/precision/correctcadence; if fail diagnose actual error minimally, no dump effort by default",
+  "wait_job": "bash-81979ef1d50341d3"
+}
