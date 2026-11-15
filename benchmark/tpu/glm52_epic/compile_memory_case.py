@@ -81,6 +81,14 @@ def main():
     if result['returncode'] or result['timed_out']:
         return 2
     lines = (args.output / 'native.log').read_text().splitlines()
+    if args.case == 'decode-capacity':
+        for marker in ('DECODE_CAPACITY page_size=64 pages_per_seq=2113 live_kv=1',
+                       'SPARSE_REQUESTS count=1 queries_per_request=1'):
+            if lines.count(marker) != 1:
+                raise RuntimeError('missing exact decode shape marker')
+    dynamo_marker = 'PRODUCTION_SPARSE_DYNAMO_ENABLED fullgraph=True dynamic=False'
+    if lines.count(dynamo_marker) != int(args.mode == 'dynamo'):
+        raise RuntimeError('compile mode marker mismatch')
     for i in (0, 1):
         marker = f'PRODUCTION_SPARSE_STEP_PASS iteration={i} queries={queries} selection=self entry={entry}'
         if lines.count(marker) != 1:
