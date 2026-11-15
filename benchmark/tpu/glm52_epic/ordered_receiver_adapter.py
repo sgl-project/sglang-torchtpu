@@ -52,10 +52,35 @@ def install(receiver_class, *, directory, run_token, topology, factory=typed_con
         key = id(receiver)
         if key not in sources:
             sources[key] = (receiver, OrderedCommandSource(directory, run_token))
-        command = sources[key][1].poll()
-        if command is not None:
-            # Existing receiver then classifies and broadcasts this typed object.
-            reqs.append(factory(command))
+        source = sources[key][1]
+        if getattr(source, 'terminal_error', None) is not None:
+            # Do not strand peers in their next native control broadcast.
+            # External coordinator must observe failure and terminate the run;
+            # never resume or retry a failed command implicitly.
+            return reqs
+        try:
+            command = source.poll()
+            if command is not None:
+                control = factory(command)
+                reqs.append(control)
+        except Exception as error:
+            # Root-only file/validation failures must NOT escape before the
+            # collective that peers are already entering. Keep ingress alive,
+            # latch failure, reject all later commands and emit best-effort ack.
+            import json
+            import os
+            from pathlib import Path
+
+            source.terminal_error = f'{type(error).__name__}: {error}'
+            try:
+                root = Path(directory)
+                temp = root / f'.ordered-error-{os.getpid()}.tmp'
+                temp.write_text(json.dumps(dict(run_token=run_token,
+                    status='CONTROL_TERMINAL_ERROR', error=source.terminal_error))+'\n')
+                os.replace(temp, root / 'ordered-error.json')
+            except OSError:
+                import warnings
+                warnings.warn('ordered admission failed; error artifact unavailable', RuntimeWarning)
         return reqs
 
     pull._glm52_ordered_receiver = True
