@@ -1,9 +1,9 @@
 {
  "original_eager_fatal":{"experiment":"exp-30eq5xauez","exact_source":"e529276df104880fd0f1367cb27e829c61e94365","evidence":"Falcon exp get confirms envSOURCE_SHA SOURCE_COMMIT and git sources.commit all identical; recovered2026-11-15T12:29Z","loading_timeout_env":1800,"signature":"windowing_util318 rank0vs1 and unsupportedvmreg/vreg U64; pre-ready startup request"},
  "recurrent_eager_fatal":{"experiment":"exp-2h7w8l2bga","source":"ea78ecf2d621fb7f45c66c27b90cb8d49f620ddd","evidence":"eager_r59_effective_config.json and eager_r59_peer_failure.txt","global_compile_warmup_calls":0},
- "staged_replay":{"experiment":"exp-24def76f9j","source":"25d226dafd5195ad7868fbfb6c65497f8e48b98c","state":"RUNNING EXTEND complete DECODEbs1/2 complete; not equivalent eagerstartup path"},
+ "staged_replay":{"experiment":"exp-24def76f9j","source":"25d226dafd5195ad7868fbfb6c65497f8e48b98c","state":"SUCCEEDED EXTEND and all6DECODE plus health200 generate200 outputIDs154820,17351; not equivalent eagerstartup path"},
  "production_delta_since_original_and_recurrent":["ef4e214fc9 qblock query tile shrink addresses separate demonstratedVMEMoverflow, NOT attributedU64 fix","72bd1b9afb exactGLM EP-local reader eligibility"],
  "not_changed":"No production allocator/attentionmetadata/KVpool/sharedcache logic or TPU dependency pins in audited interval.",
  "causality":"Currentstaged loading solves observedexp88 loadskew onthisrun; cannot claim it fixes originaleagerfatal or identifies historical137 killorigin.",
- "next_needed":"Do not repeat alreadynegative standalone allocator metadata transfer. Need originaleagerpath producerIR/rank correlation if fatal persists; first finish currentcompile andsmoke. Performance admission remains closed."
+ "next_needed":"Do not repeat alreadynegative standalone allocator metadata transfer. Compiled startup anchor now terminalsuccess. Next eagerdiagnostic must keep staged loading guards, exactpinned source/deps and original pre-ready request boundary, instrument freshprocess lowering IR/rank correlation, and declare startupshape delta explicitly. Do not allocate until executable IRcapture plan is reviewed. Historical137 killer unresolved: current143 was runnercleanup, not OOM evidence. Performance admission remains closed."
 }
