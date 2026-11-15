@@ -27,5 +27,6 @@
       32
     ],
     "scope": "physicalrank0 native log; no textclientresult yet"
-  }
+  },
+  "terminal": "FAILED_CONTENT_SANITY_18_OF_20"
 }
