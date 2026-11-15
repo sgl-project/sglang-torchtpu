@@ -1,0 +1,82 @@
+CPU_EXTENSION_BOUNDARY: 7 unused symbols fail on execution; real reader/loader tests
+/usr/local/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794743295.481312      19 pjrt_api.cc:119] GetPjrtApi was found for TPU at /usr/local/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794743295.496125      19 tpu_profiler_plugin.cc:800] PyTorch PrivateUse1ProfilerRegistry not found. Native TPU profiling will be disabled (this is expected on PyTorch < 2.12).
+/workspace/sglang-torchtpu/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/workspace/sglang-torchtpu/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+test_chunked_span_reads (__main__.TestEpLocalExpertReads.test_chunked_span_reads) ... [CI Test Method] TestEpLocalExpertReads.test_chunked_span_reads
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00, 3981.30it/s]
+ok
+test_files_outside_the_index_are_read_whole (__main__.TestEpLocalExpertReads.test_files_outside_the_index_are_read_whole) ... [CI Test Method] TestEpLocalExpertReads.test_files_outside_the_index_are_read_whole
+Loading safetensors checkpoint shards:   0% Completed | 0/3 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 3/3 [00:00<00:00, 5435.38it/s]
+ok
+test_fnuz_and_complex_dtypes_are_read_directly (__main__.TestEpLocalExpertReads.test_fnuz_and_complex_dtypes_are_read_directly) ... [CI Test Method] TestEpLocalExpertReads.test_fnuz_and_complex_dtypes_are_read_directly
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00, 4865.78it/s]
+Multi-thread loading shards:   0% Completed | 0/2 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 2/2 [00:00<00:00, 1961.79it/s]
+ok
+test_index_shards_outside_this_load_are_not_expected (__main__.TestEpLocalExpertReads.test_index_shards_outside_this_load_are_not_expected) ... [CI Test Method] TestEpLocalExpertReads.test_index_shards_outside_this_load_are_not_expected
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00, 5279.17it/s]
+Multi-thread loading shards:   0% Completed | 0/2 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 2/2 [00:00<00:00, 1546.29it/s]
+ok
+test_missing_local_expert_raises (__main__.TestEpLocalExpertReads.test_missing_local_expert_raises) ... [CI Test Method] TestEpLocalExpertReads.test_missing_local_expert_raises
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00, 4202.71it/s]
+Multi-thread loading shards:   0% Completed | 0/2 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 2/2 [00:00<00:00, 2693.84it/s]
+ok
+test_reads_everything_without_range_mmap_off_or_index (__main__.TestEpLocalExpertReads.test_reads_everything_without_range_mmap_off_or_index) ... [CI Test Method] TestEpLocalExpertReads.test_reads_everything_without_range_mmap_off_or_index
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00, 3802.63it/s]
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00, 1759.72it/s]
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00, 5203.85it/s]
+ok
+test_reads_only_local_experts_and_all_other_weights (__main__.TestEpLocalExpertReads.test_reads_only_local_experts_and_all_other_weights) ... [CI Test Method] TestEpLocalExpertReads.test_reads_only_local_experts_and_all_other_weights
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00, 4505.16it/s]
+Multi-thread loading shards:   0% Completed | 0/2 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 2/2 [00:00<00:00, 1860.41it/s]
+ok
+test_routed_expert_dtype_probe_regex_untouched (__main__.TestEpLocalExpertReads.test_routed_expert_dtype_probe_regex_untouched) ... [CI Test Method] TestEpLocalExpertReads.test_routed_expert_dtype_probe_regex_untouched
+ok
+test_span_reads_fetch_only_the_kept_bytes (__main__.TestEpLocalExpertReads.test_span_reads_fetch_only_the_kept_bytes)
+Without gap merging every run of kept tensors is its own span, as on ... [CI Test Method] TestEpLocalExpertReads.test_span_reads_fetch_only_the_kept_bytes
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00, 3437.95it/s]
+Multi-thread loading shards:   0% Completed | 0/2 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 2/2 [00:00<00:00, 2919.81it/s]
+ok
+test_tensor_unaligned_for_its_dtype_is_copied_out (__main__.TestEpLocalExpertReads.test_tensor_unaligned_for_its_dtype_is_copied_out) ... [CI Test Method] TestEpLocalExpertReads.test_tensor_unaligned_for_its_dtype_is_copied_out
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00, 4002.20it/s]
+Multi-thread loading shards:   0% Completed | 0/1 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 1/1 [00:00<00:00, 2317.30it/s]
+ok
+test_truncated_shard_fails_before_reading (__main__.TestEpLocalExpertReads.test_truncated_shard_fails_before_reading) ... [CI Test Method] TestEpLocalExpertReads.test_truncated_shard_fails_before_reading
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]
+Multi-thread loading shards:   0% Completed | 0/2 [00:00<?, ?it/s]Multi-thread loading shards:   0% Completed | 0/2 [00:00<?, ?it/s]
+ok
+test_unviewable_dtype_is_read_by_safetensors (__main__.TestEpLocalExpertReads.test_unviewable_dtype_is_read_by_safetensors) ... [CI Test Method] TestEpLocalExpertReads.test_unviewable_dtype_is_read_by_safetensors
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00, 2362.32it/s]
+Multi-thread loading shards:   0% Completed | 0/2 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 2/2 [00:00<00:00, 1024.00it/s]
+ok
+test_zero_element_tensor (__main__.TestEpLocalExpertReads.test_zero_element_tensor) ... [CI Test Method] TestEpLocalExpertReads.test_zero_element_tensor
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00, 3901.68it/s]
+Multi-thread loading shards:   0% Completed | 0/2 [00:00<?, ?it/s]Multi-thread loading shards: 100% Completed | 2/2 [00:00<00:00, 2453.53it/s]
+ok
+test_both_iterators_get_the_source_range (__main__.TestLoaderPassesTheRange.test_both_iterators_get_the_source_range) ... [CI Test Method] TestLoaderPassesTheRange.test_both_iterators_get_the_source_range
+ok
+test_init_new_takes_the_range_from_the_model (__main__.TestLoaderPassesTheRange.test_init_new_takes_the_range_from_the_model) ... [CI Test Method] TestLoaderPassesTheRange.test_init_new_takes_the_range_from_the_model
+ok
+test_glm_target_exact_class_and_runtime_guards (__main__.TestTpuLocalRoutedExpertRange.test_glm_target_exact_class_and_runtime_guards) ... [CI Test Method] TestTpuLocalRoutedExpertRange.test_glm_target_exact_class_and_runtime_guards
+<frozen abc>:106: DeprecationWarning: MultiPlatformOp is deprecated; subclass sglang.kernels.fused_op.BaseFusedOp instead (RFC #29630).
+Cannot detect CUDA architecture.
+ok
+test_kill_switch (__main__.TestTpuLocalRoutedExpertRange.test_kill_switch) ... [CI Test Method] TestTpuLocalRoutedExpertRange.test_kill_switch
+ok
+test_no_range (__main__.TestTpuLocalRoutedExpertRange.test_no_range) ... [CI Test Method] TestTpuLocalRoutedExpertRange.test_no_range
+ok
+test_range_comes_from_the_fused_moe_layers (__main__.TestTpuLocalRoutedExpertRange.test_range_comes_from_the_fused_moe_layers) ... [CI Test Method] TestTpuLocalRoutedExpertRange.test_range_comes_from_the_fused_moe_layers
+ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 0.677s
+
+OK
+HOST_PREPARE_PLAN {"checkpoint": "/models/GLM5.2-fp8-channel-wise", "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0", "host_expert_union": [0, 128], "indexed_files": 2, "unindexed_not_prepared": [], "selected_useful_bytes": 6007493120, "requested_bytes": 6007493120, "total_indexed_payload_bytes": 7254553088, "threads": 8, "buffer_bytes_per_worker": 4194304, "execute": true, "slice_only": true, "scope": "numeric expert union plus all unmatched/shared keys; not physical I/O or cache residency"}
+HOST_PREPARE_PASS {"checkpoint": "/models/GLM5.2-fp8-channel-wise", "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0", "host_expert_union": [0, 128], "indexed_files": 2, "unindexed_not_prepared": [], "selected_useful_bytes": 6007493120, "requested_bytes": 6007493120, "total_indexed_payload_bytes": 7254553088, "threads": 8, "buffer_bytes_per_worker": 4194304, "execute": true, "slice_only": true, "scope": "numeric expert union plus all unmatched/shared keys; not physical I/O or cache residency", "actual_read_bytes": 6007493120, "elapsed_s": 5.256094527999949, "host": "falcon-job-10fg10evwa-qkwxk"}
+HOST_PREPARE_PLAN {"checkpoint": "/models/GLM5.2-fp8-channel-wise", "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0", "host_expert_union": [128, 256], "indexed_files": 282, "unindexed_not_prepared": [], "selected_useful_bytes": 388633344768, "requested_bytes": 388633344768, "total_indexed_payload_bytes": 756251507456, "threads": 8, "buffer_bytes_per_worker": 4194304, "execute": false, "slice_only": false, "scope": "numeric expert union plus all unmatched/shared keys; not physical I/O or cache residency"}

@@ -1,0 +1,69 @@
+{
+  "experiment": "exp-0jfqq5nqgz",
+  "status": "SUCCEEDED",
+  "source": "f60e61ef3e",
+  "tests": 19,
+  "extension_boundary": "7unused compiledCPU symbols raise on invocation; realGLM/MoE/loader/reader tested",
+  "plans": [
+    {
+      "checkpoint": "/models/GLM5.2-fp8-channel-wise",
+      "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+      "host_expert_union": [
+        0,
+        128
+      ],
+      "indexed_files": 2,
+      "unindexed_not_prepared": [],
+      "selected_useful_bytes": 6007493120,
+      "requested_bytes": 6007493120,
+      "total_indexed_payload_bytes": 7254553088,
+      "threads": 8,
+      "buffer_bytes_per_worker": 4194304,
+      "execute": true,
+      "slice_only": true,
+      "scope": "numeric expert union plus all unmatched/shared keys; not physical I/O or cache residency"
+    },
+    {
+      "checkpoint": "/models/GLM5.2-fp8-channel-wise",
+      "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+      "host_expert_union": [
+        128,
+        256
+      ],
+      "indexed_files": 282,
+      "unindexed_not_prepared": [],
+      "selected_useful_bytes": 388633344768,
+      "requested_bytes": 388633344768,
+      "total_indexed_payload_bytes": 756251507456,
+      "threads": 8,
+      "buffer_bytes_per_worker": 4194304,
+      "execute": false,
+      "slice_only": false,
+      "scope": "numeric expert union plus all unmatched/shared keys; not physical I/O or cache residency"
+    }
+  ],
+  "hostprep": [
+    {
+      "checkpoint": "/models/GLM5.2-fp8-channel-wise",
+      "index_sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+      "host_expert_union": [
+        0,
+        128
+      ],
+      "indexed_files": 2,
+      "unindexed_not_prepared": [],
+      "selected_useful_bytes": 6007493120,
+      "requested_bytes": 6007493120,
+      "total_indexed_payload_bytes": 7254553088,
+      "threads": 8,
+      "buffer_bytes_per_worker": 4194304,
+      "execute": true,
+      "slice_only": true,
+      "scope": "numeric expert union plus all unmatched/shared keys; not physical I/O or cache residency",
+      "actual_read_bytes": 6007493120,
+      "elapsed_s": 5.256094527999949,
+      "host": "falcon-job-10fg10evwa-qkwxk"
+    }
+  ],
+  "limitations": "CPU only; hostprep execution limited2shards; full plan headeronly; noTPU nofullmodel no guaranteedcache residency"
+}
