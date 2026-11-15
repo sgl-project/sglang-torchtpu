@@ -6,6 +6,7 @@
   "sequential_cached_tokens": 12224,
   "sequential_median_host_seconds": 1.891264108940959,
   "sequential_outputs_equal_warmup": false,
+  "repeat_precision_observation": "All3hotcache greedy output sequences identical to eachother, but differ from coldwarmup on same12288synthetic tokeninput. Unresolved cold-vs-cache path consistency observation, not accuracy certification; inspect cache boundary and numerical sensitivity before attributing cause.",
   "cold_cohort_host_seconds": 19.346528542228043,
   "cold_input_tokens": 196608,
   "cold_output_tokens": 256,
