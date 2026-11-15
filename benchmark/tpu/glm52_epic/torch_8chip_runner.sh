@@ -263,6 +263,38 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
                 not markers[0]['unindexed_not_prepared'],
                 'host checkpoint preparation incomplete')
         result['host_preparation'] = dict(physical_rank=physical_rank, **markers[0])
+        # Both hosts must finish potentially skewed cold reads BEFORE native
+        # normalization's short TCPStore timeout starts. Reuse the bootstrap's
+        # per-allocation shared artifact rendezvous, never a stale global flag.
+        allocation = os.environ.get('GLM52_RENDEZVOUS_ID', '')
+        require(re.fullmatch('[A-Za-z0-9_-]+', allocation),
+                'staged loading requires unique allocation rendezvous id')
+        shared = os.environ.get('ARTIFACT_LOCAL_DIR', '')
+        require(shared.startswith('/'), 'staged loading requires shared artifact directory')
+        prep_root = Path(shared) / 'host-preparation-rendezvous' / allocation
+        prep_root.mkdir(parents=True, exist_ok=True)
+        record = dict(falcon_rank=RANK, physical_rank=physical_rank, source_commit=actual,
+                      allocation=allocation, index_sha256=markers[0]['index_sha256'])
+        temp = prep_root / f'.rank-{RANK}-{os.getpid()}.tmp'
+        temp.write_text(json.dumps(record) + '\n')
+        os.replace(temp, prep_root / f'rank-{RANK}.json')
+        prep_deadline = time.monotonic() + remaining(930)
+        while True:
+            try:
+                peers = [json.loads((prep_root / f'rank-{rank}.json').read_text())
+                         for rank in range(2)]
+                require({p['physical_rank'] for p in peers} == {0, 1},
+                        'preparation physical host assignment is not a permutation')
+                for rank, peer in enumerate(peers):
+                    require(peer['falcon_rank'] == rank and all(peer[k] == record[k]
+                            for k in ('source_commit', 'allocation', 'index_sha256')),
+                            'preparation peer identity mismatch')
+                save('host-preparation-peers.json', peers)
+                break
+            except (FileNotFoundError, json.JSONDecodeError):
+                require(time.monotonic() < prep_deadline,
+                        'peer host checkpoint preparation did not finish within930s')
+                time.sleep(1)
     result['topology'] = {'physical_chips': 8, 'hosts': hosts, 'physical_chip_nodes': devices,
                           'devices_per_host': 8, 'total_devices': 16,
                           'chip_topology': '2x2x2', 'native_topology': '2,2,2,2'}
