@@ -1,0 +1,9 @@
+{
+  "runtime": "jax0.11.2 from exp-88cbehgzz1 pinned venv; JAX_PLATFORMS=cpu; rank0 read-only tracing, no TPU client",
+  "qk": "bf16[64,640] and f8_e4m3fn[2048,640] remain mixed inputs to dot_general with preferred_element_type=float32; outputf32[64,2048]",
+  "pv": "f32[64,2048] and f8_e4m3fn[512,2048] remain mixed inputs to dot_general with preferred_element_type=float32; outputf32[64,512]",
+  "verified": "jax.make_jaxpr of actual jnp.einsum API with preferred_element_type float32 succeeds and inserts no explicit FP8 Q/P conversion",
+  "non_issue": "jnp.result_type(bf16,fp8) raises TypePromotionError but is not equivalent to einsum with explicit preferred_element_type. Do not infer actual attention TypePromotionError from result_type.",
+  "scope": "CPU abstract tracing of dot expressions only, not production Pallas target lowering or final MXU instruction proof. Hardware numerical probes remain stronger evidence of path execution.",
+  "next_precision_evidence": "Inspect target StableHLO/Mosaic/LLO operands before matched FP8-Q/PV performance claims; do not silently change numerical mode."
+}
