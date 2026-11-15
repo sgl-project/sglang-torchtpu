@@ -181,10 +181,10 @@ try:
     require(not run(['git', 'status', '--porcelain', '--untracked-files=no'], 'source-status.txt'),
             'tracked source modifications detected')
     mode = os.environ.get('GLM52_BASELINE_MODE', '')
-    require(mode in ('', 'eager', 'eager-ir', 'compile-smoke', 'historical-replay'), 'unsupported baseline mode')
+    require(mode in ('', 'eager', 'staged-eager', 'eager-ir', 'compile-smoke', 'historical-replay'), 'unsupported baseline mode')
     candidate = Path('benchmark/tpu/glm52_epic/' + (
         'torch_runnable_baseline.json' if mode == 'eager' else
-        'torch_staged_eager_ir.json' if mode == 'eager-ir' else
+        'torch_staged_eager_ir.json' if mode in ('staged-eager', 'eager-ir') else
         'torch_compile_smoke.json' if mode == 'compile-smoke' else
         'torch_staged_loading_candidate.json' if mode == 'historical-replay' else
         'torch_prefill_candidate.json'))
@@ -201,7 +201,7 @@ try:
     runtime_env = cfg.get('runtime_env', cfg.get('runtime_envs', {}))
     require(runtime_env.get('SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S', '480') == '480',
             'candidate must preserve native480s postload skew timeout')
-    if mode in ('eager', 'eager-ir', 'compile-smoke'):
+    if mode in ('eager', 'staged-eager', 'eager-ir', 'compile-smoke'):
         require(runtime_env.get('SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL') == '1',
                 'short baseline must enable DSA qblock prefill')
         require(runtime_env.get('SGLANG_TPU_ASYNC_COPY_WORKER') == '0',
@@ -216,12 +216,12 @@ try:
         'tp_size': 16, 'attn_dp_size': 16, 'dp_size': 1, 'ep_size': 16,
         'nnodes': 2, 'device': 'tpu', 'model_path': '/models/GLM5.2-fp8-channel-wise'
         }.items()), 'candidate mesh/model contract changed')
-    if mode in ('eager', 'eager-ir', 'compile-smoke'):
+    if mode in ('eager', 'staged-eager', 'eager-ir', 'compile-smoke'):
         require(args.get('page_size') == 128,
                 'short baseline must use the qblock-compatible page size')
     contract = ({'enable_torch_compile': False, 'context_length': 4096,
                  'max_total_tokens': 8192, 'chunked_prefill_size': 4096,
-                 'max_prefill_tokens': 4096, 'page_size': 128} if mode in ('eager', 'eager-ir') else
+                 'max_prefill_tokens': 4096, 'page_size': 128} if mode in ('eager', 'staged-eager', 'eager-ir') else
                 {'enable_torch_compile': True, 'context_length': 4096,
                  'max_total_tokens': 8192, 'chunked_prefill_size': 4096,
                  'max_prefill_tokens': 4096, 'page_size': 128, 'torch_compile_max_bs': 1,
@@ -238,10 +238,20 @@ try:
                 'historical replay cannot run matched-workload diagnostic')
         result['scope'] = 'current-source historical-shape compile replay; NOT performance or exact historical-source reproduction'
     require(all(args.get(k) == v for k, v in contract.items()), 'baseline shape contract changed')
-    if mode in ('eager', 'eager-ir', 'compile-smoke'):
+    if mode in ('eager', 'staged-eager', 'eager-ir', 'compile-smoke'):
         require(not os.environ.get('GLM52_DIAGNOSTIC_REQUESTS'),
                 'baseline smoke cannot run matched-workload diagnostic')
         result['scope'] = f'full-checkpoint short-input {mode} smoke; NOT JAX performance'
+    if mode == 'staged-eager':
+        require(not any(os.environ.get(k) for k in ('GLM52_EAGER_IR_DIR', 'GLM52_STARTUP_STACK_DIR')),
+                'no observers permitted for staged E2E')
+        require(not any('xla_dump_' in value for value in
+                        (os.environ.get('XLA_FLAGS', ''), os.environ.get('LIBTPU_INIT_ARGS', ''),
+                         runtime_env.get('XLA_FLAGS', ''), runtime_env.get('LIBTPU_INIT_ARGS', ''))),
+                'no compiler dumps permitted for staged E2E')
+        require(args.get('weight_loader_disable_mmap') is True and
+                args.get('weight_loader_prefetch_checkpoints') is False and
+                args.get('enable_eplb') is False, 'staged E2E reader contract')
     if mode == 'eager-ir':
         require(all(args.get(k) == v for k, v in {
             'weight_loader_disable_mmap': True, 'weight_loader_prefetch_checkpoints': False,
@@ -471,10 +481,10 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
             # DP divides the configured chunk ceiling, and the scheduler can split
             # this request below the kernel threshold. Record intent, not coverage.
             # Keep the long candidate's historical short probe unchanged.
-            smoke_tokens = 512 if mode in ('eager', 'eager-ir', 'compile-smoke') else 4
+            smoke_tokens = 512 if mode in ('eager', 'staged-eager', 'eager-ir', 'compile-smoke') else 4
             # One output comes from prefill logits; require a second output to
             # exercise a decode forward, which never uses the q-block prefill op.
-            smoke_outputs = 2 if mode in ('eager', 'compile-smoke', 'historical-replay') else 1
+            smoke_outputs = 2 if mode in ('eager', 'staged-eager', 'compile-smoke', 'historical-replay') else 1
             request_body = {'input_ids': [1] * smoke_tokens, 'sampling_params': {
                 'temperature': 0, 'max_new_tokens': smoke_outputs, 'ignore_eos': True}, 'stream': False}
             save('generate-request.json', request_body)
@@ -499,7 +509,7 @@ print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
                           expected_attention_path=(
                               ('per_query_prefill_fallback_expected'
                                 if local_chunk < 512 else 'qblock_prefill_eligible_not_verified')
-                              if mode in ('eager', 'eager-ir', 'compile-smoke')
+                              if mode in ('eager', 'staged-eager', 'eager-ir', 'compile-smoke')
                               else 'candidate_default_attention_path'))
         check_child()
         # Opt-in only: prepared requests must reference frozen data + its manifest
