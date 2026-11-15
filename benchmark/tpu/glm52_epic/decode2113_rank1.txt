@@ -1,0 +1,77 @@
+/tmp/tpu_logs/peer_bootstrap_8chip.sh: OK
+{"base_image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1", "bootstrap_sha256": "5e1ef2bea524c99c44cb5ca7a649f12d5ea2451ee73bf11540b77ca9cdb5cbd3", "candidate_sha256": "29971a5b3d32379398df213f04b7800c4fa7baa4746b75b90d99ffb6061eef9c", "got": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0+cpu", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0+cpu", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "peer_experiment": "exp-bsvzoblh0d", "peer_setup_sha256": "e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00", "peer_task_status": "succeeded", "prepared_wheelhouse": "/prepared/wheelhouse", "schema_version": 1, "scope": "benchmark-only bootstrap identity; base tag NOT immutable image identity", "source_commit": "b15c3a0bd2234a0da7e612c7878a6f659c6d0f5f", "source_repo": "https://github.com/sgl-project/sglang-torchtpu.git", "want": {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50", "torch": "2.11.0", "torch_tpu": "0.2.1.dev20261028201649", "torchvision": "0.26.0", "tpu-sync-torch": "0.0.1.dev20261031081414"}, "wheel": "torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_path": "/wheels/torch-tpu/torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl", "wheel_sha256": "6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82"}
+RUNTIME {'jax': '0.11.2', 'jaxlib': '0.11.2', 'libtpu': '0.0.50', 'torch_tpu': '0.2.1.dev20261028201649', 'tpu-sync-torch': '0.0.1.dev20261031081414'}
+/tmp/glm52-peer-rank1.tmZ01o/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794734140.508944     633 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.tmZ01o/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794734140.524926     633 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794734141.239684     633 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794734141.243921     633 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+/tmp/glm52-peer-rank1.tmZ01o/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.tmZ01o/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+STAGE allocate
+I0000 00:00:1794734144.642545     633 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794734149.197612     633 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794734149.197800     633 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+DECODE_CAPACITY page_size=64 pages_per_seq=2113 live_kv=1
+SPARSE_REQUESTS count=1 queries_per_request=1
+SPARSE_METADATA pages_per_seq=2113 live_kv=1 prefix=0 expected_prefill_path=per-query
+I0000 00:00:1794734149.234720    1415 compilation_cache_utils.cc:220] Tier-3 compilation cache root directory: 
+I0000 00:00:1794734149.234873    1415 tier2_compilation_cache.cc:81] Tier-2 compilation cache is disabled for world size 1.
+STAGE production_op iteration=0
+PRODUCTION_SPARSE_STEP_PASS iteration=0 queries=1 selection=self entry=per-query
+STAGE production_op iteration=1
+PRODUCTION_SPARSE_STEP_PASS iteration=1 queries=1 selection=self entry=per-query
+I0000 00:00:1794734153.824083     633 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794734153.824441     633 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=6
+num_cache_hits=1 {16.6%}
+num_compilations=5
+peak_compilation_memory_bytes=unknown
+
+
+DECODE_MEMORY_CASE_PASS mode=eager
+RUNTIME {'jax': '0.11.2', 'jaxlib': '0.11.2', 'libtpu': '0.0.50', 'torch_tpu': '0.2.1.dev20261028201649', 'tpu-sync-torch': '0.0.1.dev20261031081414'}
+/tmp/glm52-peer-rank1.tmZ01o/venv/lib/python3.12/site-packages/torch_tpu/__init__.py:37: UserWarning: <TorchTpu/Performance/TcMalloc/> tcmalloc is not loaded; TorchTPU host performance may be degraded due to glibc ptmalloc contention. Preload libtcmalloc before starting Python (e.g. LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4), or set PYTHONWARNINGS="ignore:<TorchTpu/Performance/TcMalloc/" to suppress this warning.
+  _tcmalloc_check.check_tcmalloc()
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794734161.963513    2890 pjrt_api.cc:119] GetPjrtApi was found for TPU at /tmp/glm52-peer-rank1.tmZ01o/venv/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1794734161.978964    2890 tpu_profiler_plugin.cc:808] PyTorch PrivateUse1ProfilerRegistry not found (expected on PyTorch < 2.12); registering the TPU profiler with Kineto directly.
+I0000 00:00:1794734162.632603    2890 device_rt.cc:172] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+I0000 00:00:1794734162.636143    2890 libtpu_version.cc:63] Setting libtpu version to: 0.0.50
+/tmp/glm52-peer-rank1.tmZ01o/src/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/tmp/glm52-peer-rank1.tmZ01o/src/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+STAGE allocate
+I0000 00:00:1794734165.931879    2890 pjrt_api.cc:168] The PJRT plugin has PJRT API version 0.116. The framework PJRT API version is 0.117.
+I0000 00:00:1794734171.499578    2890 pjrt_c_api_client.cc:187] PjRtCApiClient created.
+W0000 00:00:1794734171.499750    2890 pjrt_state.cc:319] Only using 1 device out of all the 8 addressable devices.
+DECODE_CAPACITY page_size=64 pages_per_seq=2113 live_kv=1
+SPARSE_REQUESTS count=1 queries_per_request=1
+SPARSE_METADATA pages_per_seq=2113 live_kv=1 prefix=0 expected_prefill_path=per-query
+I0000 00:00:1794734171.536534    3684 compilation_cache_utils.cc:220] Tier-3 compilation cache root directory: 
+I0000 00:00:1794734171.536681    3684 tier2_compilation_cache.cc:81] Tier-2 compilation cache is disabled for world size 1.
+PRODUCTION_SPARSE_DYNAMO_ENABLED fullgraph=True dynamic=False
+STAGE production_op iteration=0
+PRODUCTION_SPARSE_STEP_PASS iteration=0 queries=1 selection=self entry=per-query
+STAGE production_op iteration=1
+PRODUCTION_SPARSE_STEP_PASS iteration=1 queries=1 selection=self entry=per-query
+I0000 00:00:1794734176.758708    2890 compilation_cache.cc:360] Compilation cache evicted.
+I0000 00:00:1794734176.758933    2890 compilation_cache.cc:207] CompilationCache final stats: num_cache_reqs=5
+num_cache_hits=0 {0.0%}
+num_compilations=5
+peak_compilation_memory_bytes=unknown
+
+
+DECODE_MEMORY_CASE_PASS mode=dynamo

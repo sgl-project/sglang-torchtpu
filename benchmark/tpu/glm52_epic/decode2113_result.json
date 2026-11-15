@@ -1,0 +1,12 @@
+{
+ "experiment":"exp-7ebqrpc7f0",
+ "artifact":"art-4oy5foghps",
+ "source_commit":"b15c3a0bd2",
+ "status":"SUCCEEDED",
+ "terminal_utc":"2026-11-15T09:16:30Z",
+ "hardware":"8 physicalchips total2hosts; independent default1-device probe per host; no DCP",
+ "shape":{"page_size":64,"pages_per_seq":2113,"queries":1,"live_kv":1,"context_length":135168,"extra_context_tokens":4},
+ "verified":"Both distinct host GCS logs exactly2 shape markers; eager2 and Dynamo2 production numerical output/signed cache-write oracles, one Dynamo fullgraph marker, both case PASS.",
+ "conclusion":"Corrected production static-table headroom shape compiles and runs in isolated eager and Dynamo paths. Supersedes only validation gap of initial2112-page probe, not fullmodel first-DECODE compile or fatal/137 rootcause.",
+ "not_verified":"TP16/collective model graph, activeC16 long-prefix cadence, actual pool capacity, precision parity, compiler child/kill attribution and matched performance remain open."
+}
