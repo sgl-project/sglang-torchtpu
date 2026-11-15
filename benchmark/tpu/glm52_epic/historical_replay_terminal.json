@@ -12,5 +12,9 @@
  "reached_extend_or_decode_compile":false,
  "historical137_reproduced":false,
  "lowering_fatal_reproduced":false,
- "scope":"Run failed before target compile stage, not evidence compile passed or historical137 fixed. Determine host0 load delay/failure and actual configured barrier timeout before retry. Avoid blind full-model resubmit."
+ "barrier_timeout_source_default_s":480,
+ "barrier_observed_elapsed_s":483,
+ "cleanup_boundary":{"rank":1,"launcher_returncode_before_cleanup":1,"error":"RuntimeError: native launcher exited unexpectedly: 1"},
+ "host1_precleanup":{"memory_peak_bytes":505262239744,"memory_current_bytes":451274739712,"local_oom_kill":0,"note":"Taken after scheduler death; anon already released, cannot identify unique live peak."},
+ "scope":"Run failed before target compile stage, not evidence compile passed or historical137 fixed. Native launcher exited1 before runner cleanup, so runner cleanup did not originate this failure. Default load-skew allowance480s agrees with observed483s. Host0 underlying load delay/failure remains unresolved; no blind full-model resubmit."
 }
