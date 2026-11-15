@@ -34,6 +34,12 @@ def install(scheduler_class, *, directory, run_token, topology):
             if config.get('speculative_enabled') is not False:
                 raise ValueError('non-speculative scheduler required')
             rank, size = config.get('dp_rank'), config.get('num_dp_ranks')
+            # AttentionTP1 does not mean independent schedulers: attention-DP
+            # ranks can share MoE/receive/control collectives. Independent file
+            # polling can resume ranks in different iterations and reorder them.
+            # Keep this prototype single-rank until ordered broadcast exists.
+            if size != 1:
+                raise ValueError('file-poll barrier is single-rank only; ordered control broadcast required')
             if (type(size) is not int or size < 1 or type(rank) is not int
                     or not 0 <= rank < size):
                 raise ValueError('explicit valid scheduler DP identity required')
