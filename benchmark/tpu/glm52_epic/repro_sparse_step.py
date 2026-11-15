@@ -18,7 +18,7 @@ def main():
     parser.add_argument('--entry', choices=('per-query', 'prefill-fallback', 'prefill-qblock', 'prefill-long-table'), default='per-query',
                         help='Token-major, small prefill fallback,2048-token qblock, or481-page static-table fallback.')
     parser.add_argument('--decode-capacity', action='store_true',
-                        help='Per-query self probe only: page64 and2112-page static request table (context135168). Not full-model decode.')
+                        help='Per-query self probe only: page64 and2113-page static request table (context135168 plus4 headroom). Not full-model decode.')
     parser.add_argument('--dynamo', action='store_true',
                         help='Compile the production op fullgraph with backend=tpu, static shapes.')
     parser.add_argument('--prefix-tokens', type=int, choices=(0, 49152), default=0,
@@ -72,7 +72,9 @@ def main():
     table_pages = 481 if args.entry == 'prefill-long-table' else 33
     num_pages = (1 + 481 * args.requests) if args.entry == 'prefill-long-table' else (65 if large_prefill else 2)
     if args.decode_capacity:
-        table_pages = 135168 // p
+        # Ordinary backend includes4 extra request-table token slots, even
+        # without speculative decoding; the last partial page changes shape.
+        table_pages = (135168 + 4 + p - 1) // p
         num_pages = table_pages + 1
         print(f'DECODE_CAPACITY page_size={p} pages_per_seq={table_pages} live_kv=1', flush=True)
     per_request = t // args.requests
