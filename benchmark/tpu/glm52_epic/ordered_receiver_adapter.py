@@ -61,6 +61,16 @@ def install(receiver_class, *, directory, run_token, topology, factory=typed_con
             # never resume or retry a failed command implicitly.
             return reqs
         try:
+            if not getattr(source, 'claimed', False):
+                from benchmark.tpu.glm52_epic.admission_run import publish_immutable
+                import os
+                from pathlib import Path
+
+                # A restarted root cannot reopen the same command stream. The
+                # old claim remains even after clean uninstall; new run required.
+                publish_immutable(Path(directory)/'root-consumer.json',
+                                  dict(run_token=run_token, pid=os.getpid()))
+                source.claimed = True
             command = source.poll()
             if command is not None:
                 control = factory(command)
