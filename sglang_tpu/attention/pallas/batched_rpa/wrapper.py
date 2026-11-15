@@ -32,6 +32,7 @@ Note: batched_rpa is build on top / derived from RPA3.
 """
 
 import dataclasses
+import functools
 import math
 from collections.abc import Sequence
 
@@ -2187,6 +2188,19 @@ def pcp_fused_schedule_steps(
     return cache_steps, new_steps
 
 
+@functools.lru_cache(maxsize=64)
+def _cached_pcp_fused_configs(tpu_info, **kwargs) -> PcpFusedConfigs:
+    """`pcp_fused_configs` memoized on its (static) arguments and the chip.
+
+    Resolving the block sizes takes ~10 ms of host time, and
+    `check_pcp_fused_schedule` runs on every ring-mode extend batch before the
+    forward is launched, so an uncached call adds that to every prefill chunk.
+    `tpu_info` is only part of the key: the block sizes depend on the chip.
+    """
+    del tpu_info
+    return pcp_fused_configs(**kwargs)
+
+
 def check_pcp_fused_schedule(
     *,
     num_q_heads: int,
@@ -2263,7 +2277,8 @@ def check_pcp_fused_schedule(
                 "Fused PCP with cache_lens_cp_page_aligned needs cached lengths"
                 f" in whole stripes of {stripe} tokens, got {bad}."
             )
-    fused = pcp_fused_configs(
+    fused = _cached_pcp_fused_configs(
+        pltpu.get_tpu_info(),
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
