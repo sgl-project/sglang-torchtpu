@@ -34,15 +34,19 @@ LAYOUT = [["bfloat16", [4, 16, 8]]]
 class _Pools:
     """decode_stage_branches.StagePoolSet as the channel uses it."""
 
-    def __init__(self, stages):
+    def __init__(self, stages, drafts=()):
         self.transfers = {
-            (stage, swa): FakeHostTransfer()
+            (stage, swa, draft): FakeHostTransfer()
             for stage in stages
             for swa in (False, True)
+            for draft in ((False, True) if stage in drafts else (False,))
         }
 
-    def transfer(self, stage, *, swa=False):
-        return self.transfers[(stage, swa)]
+    def transfer(self, stage, *, swa=False, draft=False):
+        return self.transfers[(stage, swa, draft)]
+
+    def has(self, stage, *, swa=False, draft=False):
+        return (stage, swa, draft) in self.transfers
 
 
 def _push(stage, *, tokens=(), uuid=9, seq=3, **fields):

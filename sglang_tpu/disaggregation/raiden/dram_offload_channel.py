@@ -102,6 +102,9 @@ class PrefixRegistration(msgspec.Struct, frozen=True):
     endpoint: str = ""
     swa_uuid: int = 0
     swa_endpoint: str = ""
+    # Draft sidecars of a pipeline stage, under the same UUIDs and page ids.
+    draft_endpoint: str = ""
+    draft_swa_endpoint: str = ""
 
     @property
     def refused(self) -> bool:
@@ -148,6 +151,11 @@ class StagePushPart(msgspec.Struct, frozen=True):
     swa_address: str
     layout: StagePoolLayout
     swa_layout: StagePoolLayout
+    # The stage's draft sidecars, None on a stage without draft layers.
+    draft_address: str = ""
+    draft_layout: Optional[StagePoolLayout] = None
+    draft_swa_address: str = ""
+    draft_swa_layout: Optional[StagePoolLayout] = None
 
     @classmethod
     def of(cls, push: VictimPush) -> StagePushPart:
@@ -173,6 +181,18 @@ class StagePushPart(msgspec.Struct, frozen=True):
             swa_address=push.swa_address,
             layout=layout(push.layout, push.page_bytes, False),
             swa_layout=layout(push.swa_layout, push.swa_page_bytes, True),
+            draft_address=push.draft_address,
+            draft_layout=(
+                layout(push.draft_layout, push.draft_page_bytes, False)
+                if push.draft_address
+                else None
+            ),
+            draft_swa_address=push.draft_swa_address,
+            draft_swa_layout=(
+                layout(push.draft_swa_layout, push.draft_swa_page_bytes, True)
+                if push.draft_swa_address
+                else None
+            ),
         )
 
 
@@ -191,6 +211,9 @@ class DramOffloadChannel:
         # The HiCache host pools whose pages move, (full, sliding window or
         # None), bound by the L2 extension.
         self._host_pools: Tuple[Any, Any] = (None, None)
+        # A pipeline stage's draft sidecar pools (draft KV, draft window),
+        # addressed by the page ids of the pools above.
+        self._draft_pools: Tuple[Any, Any] = (None, None)
         # This engine's native host reads by request id, as source or as
         # destination: None while raiden may still read or write the pages,
         # then whether the read succeeded. A room's reads outlive its cleanup
@@ -263,28 +286,48 @@ class DramOffloadChannel:
 
     # ----- native host reads, shared by recall and push -------------------------
 
-    def bind_host_pools(self, full: Any, swa: Any = None) -> None:
+    def bind_host_pools(
+        self, full: Any, swa: Any = None, *, draft: Any = None, draft_swa: Any = None
+    ) -> None:
         with self._lock:
             self._host_pools = (full, swa)
+            self._draft_pools = (draft, draft_swa)
 
-    def host_control_address(self, *, swa: bool = False) -> str:
+    def _host_pool(self, *, swa: bool, draft: bool) -> Any:
+        return (self._draft_pools if draft else self._host_pools)[swa]
+
+    def host_control_address(self, *, swa: bool = False, draft: bool = False) -> str:
         """Where a peer reads this engine's registered host pages from."""
-        transfer = self._host_pools[swa].transfer
+        transfer = self._host_pool(swa=swa, draft=draft).transfer
         return transfer.host_control_address(self._mgr.local_ip)
 
     def register_host_read(
-        self, req_id: str, uuid: int, pages: List[int], *, swa: bool = False
+        self,
+        req_id: str,
+        uuid: int,
+        pages: List[int],
+        *,
+        swa: bool = False,
+        draft: bool = False,
     ) -> bool:
         """Register this engine's host ``pages`` (of its SWA pool with ``swa``)
         as the source of a peer's read. An accepted registration keeps the
         pages owned by the native read until it settles."""
         with self._lock:
-            return self._register_host_read_locked(req_id, uuid, pages, swa=swa)
+            return self._register_host_read_locked(
+                req_id, uuid, pages, swa=swa, draft=draft
+            )
 
     def _register_host_read_locked(
-        self, req_id: str, uuid: int, pages: List[int], *, swa: bool = False
+        self,
+        req_id: str,
+        uuid: int,
+        pages: List[int],
+        *,
+        swa: bool = False,
+        draft: bool = False,
     ) -> bool:
-        transfer = self._host_pools[swa].transfer
+        transfer = self._host_pool(swa=swa, draft=draft).transfer
         try:
             transfer.register_read(req_id, uuid, pages)
         except Exception as exc:  # noqa: BLE001 - the caller declines the transfer
@@ -303,12 +346,18 @@ class DramOffloadChannel:
         local: List[int],
         *,
         swa: bool = False,
+        draft: bool = False,
     ) -> bool:
         """Read a peer's registered host pages into this engine's host pages
         (of its SWA pool with ``swa``); no device page and no staging slot is
         involved."""
         return self._start_read(
-            req_id, uuid, endpoint, remote, local, self._host_pools[swa].transfer
+            req_id,
+            uuid,
+            endpoint,
+            remote,
+            local,
+            self._host_pool(swa=swa, draft=draft).transfer,
         )
 
     def _start_read(
@@ -348,6 +397,7 @@ class DramOffloadChannel:
         *,
         stage: int,
         swa: bool = False,
+        draft: bool = False,
     ) -> bool:
         """Read a prefill stage's registered host pages into the pool this
         rank keeps in that stage's layout."""
@@ -357,7 +407,7 @@ class DramOffloadChannel:
             endpoint,
             remote,
             local,
-            self._stage_pools.transfer(stage, swa=swa),
+            self._stage_pools.transfer(stage, swa=swa, draft=draft),
         )
 
     def received_stage_pushes(self) -> Dict[Tuple[str, int], StagePush]:
@@ -420,44 +470,60 @@ class DramOffloadChannel:
                 endpoint=registration.endpoint,
                 swa_uuid=registration.swa_uuid,
                 swa_endpoint=registration.swa_endpoint,
+                draft_endpoint=registration.draft_endpoint,
+                draft_swa_endpoint=registration.draft_swa_endpoint,
             ),
         )
 
     def _register_stage_pull_locked(
         self, room: int, stage: int, pages: List[int], window: List[int]
     ) -> PrefixRegistration:
-        try:
-            transfers = [(False, pages, self._stage_pools.transfer(stage))]
-            if window:
-                transfers.append(
-                    (True, window, self._stage_pools.transfer(stage, swa=True))
-                )
-        except (AttributeError, KeyError):
+        pools = self._stage_pools
+        if pools is None or not pools.has(stage):
             # This rank hosts no pool of that stage.
             return PrefixRegistration()
-        registered = []
-        for swa, part, transfer in transfers:
-            uuid = secrets.randbelow((1 << 63) - 1) + 1
-            req_id = self.stage_prefix_req_id(room, stage, swa=swa)
+        # (window, draft sidecar, pages): a sidecar is registered at the page
+        # ids, and under the UUID, of the pool it follows.
+        wanted = [(False, False, pages)]
+        if window:
+            wanted.append((True, False, window))
+        if pools.has(stage, draft=True):
+            wanted.append((False, True, pages))
+        if window and pools.has(stage, swa=True, draft=True):
+            wanted.append((True, True, window))
+        uuids = {
+            swa: secrets.randbelow((1 << 63) - 1) + 1
+            for swa in {swa for swa, _, _ in wanted}
+        }
+        endpoints = {}
+        for swa, draft, part in wanted:
+            transfer = pools.transfer(stage, swa=swa, draft=draft)
+            req_id = self.stage_prefix_req_id(room, stage, swa=swa, draft=draft)
             try:
-                transfer.register_read(req_id, uuid, part)
+                transfer.register_read(req_id, uuids[swa], part)
             except Exception as exc:  # noqa: BLE001 - the stage computes instead
                 logger.warning("Cannot register host read %s: %s", req_id, exc)
                 # An accepted registration stays owned by its native read.
                 return PrefixRegistration()
             self._reads[req_id] = None
             self._read_transfers[req_id] = transfer
-            registered.append((uuid, transfer.host_control_address(self._mgr.local_ip)))
-        (uuid, endpoint), (swa_uuid, swa_endpoint) = (*registered, (0, ""))[:2]
+            endpoints[(swa, draft)] = transfer.host_control_address(self._mgr.local_ip)
         return PrefixRegistration(
-            uuid=uuid, endpoint=endpoint, swa_uuid=swa_uuid, swa_endpoint=swa_endpoint
+            uuid=uuids[False],
+            endpoint=endpoints[(False, False)],
+            swa_uuid=uuids.get(True, 0),
+            swa_endpoint=endpoints.get((True, False), ""),
+            draft_endpoint=endpoints.get((False, True), ""),
+            draft_swa_endpoint=endpoints.get((True, True), ""),
         )
 
     @staticmethod
-    def stage_prefix_req_id(room: int, stage: int, *, swa: bool = False) -> str:
+    def stage_prefix_req_id(
+        room: int, stage: int, *, swa: bool = False, draft: bool = False
+    ) -> str:
         # Room-shaped, like prefix_req_id; the stage keeps a rank that hosts
         # several stages apart.
-        return f"{room}#pxs.s{stage}" if swa else f"{room}#px.s{stage}"
+        return f"{room}#px{'s' * swa}{'d' * draft}.s{stage}"
 
     # ----- pipeline-parallel prefill, stage side --------------------------------------
 
@@ -530,6 +596,8 @@ class DramOffloadChannel:
         window_pages: int,
         layout: StagePoolLayout,
         swa_layout: Optional[StagePoolLayout],
+        draft_layout: Optional[StagePoolLayout] = None,
+        draft_swa_layout: Optional[StagePoolLayout] = None,
     ) -> bool:
         """Offer this stage's registered host pages to the decode rank that
         hosts its pool. Stage zero also sends the branch's tokens to every
@@ -578,6 +646,26 @@ class DramOffloadChannel:
                     swa_layout=wire(swa_layout) if carries_pages else [],
                     swa_page_bytes=(
                         swa_layout.page_bytes if carries_pages and swa_layout else 0
+                    ),
+                    **(
+                        dict(
+                            draft_address=self.host_control_address(draft=True),
+                            draft_layout=wire(draft_layout),
+                            draft_page_bytes=draft_layout.page_bytes,
+                        )
+                        if carries_pages and draft_layout is not None
+                        else {}
+                    ),
+                    **(
+                        dict(
+                            draft_swa_address=self.host_control_address(
+                                swa=True, draft=True
+                            ),
+                            draft_swa_layout=wire(draft_swa_layout),
+                            draft_swa_page_bytes=draft_swa_layout.page_bytes,
+                        )
+                        if carries_pages and swa_blocks and draft_swa_layout is not None
+                        else {}
                     ),
                 ),
             )
@@ -660,9 +748,9 @@ class DramOffloadChannel:
     # ----- recall, prefill side (prefill_dram_prefix_puller.PrefillDramPrefixPuller) --------------
 
     @staticmethod
-    def prefix_req_id(room: int, *, swa: bool = False) -> str:
+    def prefix_req_id(room: int, *, swa: bool = False, draft: bool = False) -> str:
         # Shaped like a chunk id so the manager's room bookkeeping covers it.
-        return f"{room}#pxs" if swa else f"{room}#px"
+        return f"{room}#px{'s' * swa}{'d' * draft}"
 
     def accept_prefix_offer_locked(
         self, room: int, blocks: List[int], swa_blocks: List[int]
@@ -738,6 +826,8 @@ class DramOffloadChannel:
                     endpoint=ready.endpoint,
                     swa_uuid=ready.swa_uuid,
                     swa_endpoint=ready.swa_endpoint,
+                    draft_endpoint=ready.draft_endpoint,
+                    draft_swa_endpoint=ready.draft_swa_endpoint,
                 )
 
     # ----- recall, decode side (decode_dram_prefix_offerer.DecodeDramPrefixOfferer) ---------------

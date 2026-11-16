@@ -52,8 +52,27 @@ MAX_INFLIGHT = 4
 PushKey = Tuple[str, int]
 
 
-def stage_transfer_id(prefill: str, seq: int, stage: int, *, swa: bool = False) -> str:
-    return f"victim:{prefill}:{seq}:s{stage}" + (":swa" if swa else "")
+def stage_transfer_id(
+    prefill: str, seq: int, stage: int, *, swa: bool = False, draft: bool = False
+) -> str:
+    return (
+        f"victim:{prefill}:{seq}:s{stage}"
+        + (":swa" if swa else "")
+        + (":draft" if draft else "")
+    )
+
+
+def _layouts(part: Any) -> List[Tuple[bool, bool, Any]]:
+    """(window, draft sidecar, layout) of every pool a stage's part brings.
+    A draft sidecar is addressed by the page ids of the pool it follows."""
+    kinds = [(False, False, part.layout)]
+    if part.swa_blocks:
+        kinds.append((True, False, part.swa_layout))
+    if getattr(part, "draft_layout", None) is not None:
+        kinds.append((False, True, part.draft_layout))
+    if part.swa_blocks and getattr(part, "draft_swa_layout", None) is not None:
+        kinds.append((True, True, part.draft_swa_layout))
+    return kinds
 
 
 def _manifest(header: Any) -> Tuple[int, int]:
@@ -89,9 +108,11 @@ class StagePush:
 
 class StagePoolSet:
     """This decode rank's host-only pools, one per hosted stage and one more
-    per hosted stage for sliding windows. They are built at the first push,
-    when the stages' layouts are known, and every pool of every rank gets the
-    same number of pages so that one page id serves all of them."""
+    per hosted stage for sliding windows, and with a draft the stage's draft
+    sidecar of each. They are built at the first push, when the stages'
+    layouts are known, and every pool of every rank gets the same number of
+    pages so that one page id serves all of them; a sidecar has the pages of
+    the pool it follows."""
 
     def __init__(
         self,
@@ -107,8 +128,9 @@ class StagePoolSet:
         # (layout of a part, pages) -> an object with RaidenKVTransfer's host
         # read methods, over host memory in that layout.
         self._build_pool = build_pool
-        self._pools: Dict[Tuple[int, bool], Any] = {}
-        self._fingerprints: Dict[Tuple[int, bool], int] = {}
+        # By (stage, window, draft sidecar).
+        self._pools: Dict[Tuple[int, bool, bool], Any] = {}
+        self._fingerprints: Dict[Tuple[int, bool, bool], int] = {}
         self.sizes: Optional[Tuple[int, int]] = None
         # Why no pool can be built; every push is declined from then on.
         self.refusal: Optional[str] = None
@@ -116,19 +138,26 @@ class StagePoolSet:
     def hosted(self, stages: int) -> List[int]:
         return hosted_stages(self.rank, stages, self.decode_ranks)
 
-    def transfer(self, stage: int, *, swa: bool = False) -> Any:
-        return self._pools[(stage, swa)]
+    def transfer(self, stage: int, *, swa: bool = False, draft: bool = False) -> Any:
+        return self._pools[(stage, swa, draft)]
+
+    def has(self, stage: int, *, swa: bool = False, draft: bool = False) -> bool:
+        return (stage, swa, draft) in self._pools
 
     def fits(self, parts: Dict[int, Any]) -> bool:
-        """Whether the parts are in the layouts the pools were built for."""
-        return all(
-            self._fingerprints.get((stage, swa)) == fingerprint
-            for stage, part in parts.items()
-            for swa, fingerprint in (
-                (False, part.layout.fingerprint()),
-                *(((True, part.swa_layout.fingerprint()),) if part.swa_blocks else ()),
-            )
-        )
+        """Whether the parts are in the layouts the pools were built for,
+        draft sidecars included: a stage that brings a draft needs its pool,
+        and a pool built with a draft needs the stage to bring it."""
+        for stage, part in parts.items():
+            brought = {(swa, draft): layout for swa, draft, layout in _layouts(part)}
+            for (swa, draft), layout in brought.items():
+                if self._fingerprints.get((stage, swa, draft)) != layout.fingerprint():
+                    return False
+            for swa in (False, True):
+                if (swa, False) in brought and self.has(stage, swa=swa, draft=True):
+                    if (swa, True) not in brought:
+                        return False
+        return True
 
     def build(
         self, parts: Dict[int, Any], *, window_pages: int, lockstep: Any
@@ -136,10 +165,19 @@ class StagePoolSet:
         """Size and allocate the pools from the first agreed push: (pages,
         windows) of every pool, the same on all ranks, or None once any rank
         could not build its own."""
-        page_bytes = lockstep.max(sum(p.layout.page_bytes for p in parts.values()))
-        swa_bytes = lockstep.max(
-            sum(p.swa_layout.page_bytes for p in parts.values()) if window_pages else 0
-        )
+
+        # A page costs its bytes in the pool and in the draft sidecar that
+        # follows it, on the stages that have one.
+        def cost(swa: bool) -> int:
+            return sum(
+                layout.page_bytes
+                for part in parts.values()
+                for is_swa, _, layout in self._kinds(part, window_pages)
+                if is_swa == swa
+            )
+
+        page_bytes = lockstep.max(cost(False))
+        swa_bytes = lockstep.max(cost(True) if window_pages else 0)
         # A rank that hosts no stage reports zero; the largest rank sizes all.
         pages, windows = size_store(
             budget_bytes=self._budget_bytes,
@@ -153,9 +191,9 @@ class StagePoolSet:
         else:
             try:
                 for stage, part in sorted(parts.items()):
-                    self._add(stage, False, part.layout, pages)
-                    if window_pages:
-                        self._add(stage, True, part.swa_layout, windows * window_pages)
+                    for swa, draft, layout in self._kinds(part, window_pages):
+                        count = windows * window_pages if swa else pages
+                        self._add(stage, swa, draft, layout, count)
             except Exception as exc:  # noqa: BLE001 - the offload is declined
                 error = f"cannot build a stage-layout pool: {exc}"
         if error is not None:
@@ -176,9 +214,23 @@ class StagePoolSet:
         )
         return self.sizes
 
-    def _add(self, stage: int, swa: bool, layout: Any, pages: int) -> None:
-        self._pools[(stage, swa)] = self._build_pool(layout, pages)
-        self._fingerprints[(stage, swa)] = layout.fingerprint()
+    @staticmethod
+    def _kinds(part: Any, window_pages: int) -> List[Tuple[bool, bool, Any]]:
+        """The pools to build for a stage from its first part. The window
+        pools are built whenever the model has a window, also when this
+        branch is too short to bring window pages of its own."""
+        kinds = [(False, False, part.layout)]
+        if window_pages:
+            kinds.append((True, False, part.swa_layout))
+        if getattr(part, "draft_layout", None) is not None:
+            kinds.append((False, True, part.draft_layout))
+        if window_pages and getattr(part, "draft_swa_layout", None) is not None:
+            kinds.append((True, True, part.draft_swa_layout))
+        return kinds
+
+    def _add(self, stage: int, swa: bool, draft: bool, layout: Any, pages: int) -> None:
+        self._pools[(stage, swa, draft)] = self._build_pool(layout, pages)
+        self._fingerprints[(stage, swa, draft)] = layout.fingerprint()
 
 
 @dataclass
@@ -352,27 +404,25 @@ class DecodeStageBranchReceiver:
         """Read the stage's pages the index does not hold yet, and its window,
         into the reserved pages of the stage's pools."""
         landing = entry.landing
+        # (window, draft sidecar, source address, remote ids, local ids). A
+        # sidecar's pages have the ids of the pool it follows on both sides.
         reads = []
+        full = (part.blocks[landing.first_new_page :], landing.new_pages)
+        window = (
+            (part.swa_blocks, landing.window[: len(part.swa_blocks)])
+            if landing.window is not None
+            else None
+        )
         if landing.new_pages:
-            reads.append(
-                (
-                    False,
-                    part.address,
-                    part.blocks[landing.first_new_page :],
-                    landing.new_pages,
-                )
-            )
-        if landing.window is not None:
-            reads.append(
-                (
-                    True,
-                    part.swa_address,
-                    part.swa_blocks,
-                    landing.window[: len(part.swa_blocks)],
-                )
-            )
-        for swa, address, remote, local in reads:
-            read_id = stage_transfer_id(*key, stage, swa=swa)
+            reads.append((False, False, part.address, *full))
+            if getattr(part, "draft_layout", None) is not None:
+                reads.append((False, True, part.draft_address, *full))
+        if window is not None:
+            reads.append((True, False, part.swa_address, *window))
+            if getattr(part, "draft_swa_layout", None) is not None:
+                reads.append((True, True, part.draft_swa_address, *window))
+        for swa, draft, address, remote, local in reads:
+            read_id = stage_transfer_id(*key, stage, swa=swa, draft=draft)
             if not self._channel.start_stage_read(
                 read_id,
                 part.uuid,
@@ -381,6 +431,7 @@ class DecodeStageBranchReceiver:
                 list(local),
                 stage=stage,
                 swa=swa,
+                draft=draft,
             ):
                 return False
             entry.read_ids.append(read_id)

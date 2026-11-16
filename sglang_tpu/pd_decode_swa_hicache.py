@@ -227,7 +227,14 @@ def _validate_full_only_host_cache_config(
         # model. Refuse the combination until sidecars travel with the pages.
         (
             hicache_draft_plan is None
-            or not tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get(),
+            or not tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get()
+            # Behind a pipeline prefill this decode never loads a pushed page
+            # (it keeps them in stage-layout pools), and the prefill moves its
+            # sidecars with the pages when it opts in.
+            or (
+                tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+                and tpu_envs.SGLANG_PD_OFFLOAD_ALLOW_DRAFT.get()
+            ),
             "the KV offload to decode DRAM does not transfer HiCache draft "
             "sidecars yet; run the draft without a sidecar or unset "
             "SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM",

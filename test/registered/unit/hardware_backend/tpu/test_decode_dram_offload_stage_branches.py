@@ -125,10 +125,12 @@ class _Channel:
     def take_stage_push(self, key):
         return self.pushes.pop(key, None)
 
-    def start_stage_read(self, read_id, uuid, address, remote, local, *, stage, swa):
+    def start_stage_read(
+        self, read_id, uuid, address, remote, local, *, stage, swa, draft=False
+    ):
         if self.refuse_start:
             return False
-        self.started.append((read_id, uuid, address, remote, local, stage, swa))
+        self.started.append((read_id, uuid, address, remote, local, stage, swa, draft))
         self.reads[read_id] = None
         return True
 
@@ -306,7 +308,7 @@ class TestLanding(unittest.TestCase):
         decode.land(1, _tokens(1, 2, 3))
         for rank, channel in enumerate(decode.channels):
             (read,) = channel.started
-            read_id, uuid, address, remote, local, stage, swa = read
+            read_id, uuid, address, remote, local, stage, swa, _ = read
             self.assertEqual((stage, swa, address), (rank, False, f"host{rank}"))
             self.assertEqual(remote, [1000 * rank + i for i in range(3)])
             self.assertEqual(local, [0, 1, 2])
@@ -402,7 +404,7 @@ class TestLanding(unittest.TestCase):
         decode = _Decode(ranks=2, stages=2)
         decode.land(1, _tokens(1, 2))
         decode.land(2, _tokens(1, 2, 3, 4))
-        _, _, _, remote, local, stage, _ = decode.channels[1].started[-1]
+        _, _, _, remote, local, stage, _, _ = decode.channels[1].started[-1]
         self.assertEqual((stage, remote, local), (1, [1002, 1003], [2, 3]))
         # Pushed again: held, answered at once, nothing read.
         reads = len(decode.channels[0].started)
@@ -484,6 +486,90 @@ class TestSlidingWindow(unittest.TestCase):
         self.assertEqual((window[3], window[4]), ([5000], [0]))
         match = decode.stores()[1].match((None, None), _tokens(1, 2))
         self.assertEqual((match.pages, match.window), ([0], [0]))
+
+
+class TestDraftSidecars(unittest.TestCase):
+    """With a draft, a stage's sidecar pools ride at the page ids of the
+    pools they follow."""
+
+    def _push_with_draft(self, decode, seq, tokens, stages_with_draft):
+        decode.push(seq, tokens)
+        for channel in decode.channels:
+            for stage, part in channel.pushes[("p", seq)].parts.items():
+                if stage in stages_with_draft:
+                    part.draft_address = f"draft{stage}"
+                    part.draft_layout = _layout(stage, decode.stages, heads=4)
+                    part.draft_swa_address = f"draftswa{stage}"
+                    part.draft_swa_layout = _layout(
+                        stage, decode.stages, heads=4, window=True
+                    )
+
+    def test_a_sidecar_lands_at_the_page_ids_of_its_source(self):
+        decode = _Decode(ranks=2, stages=2, window_pages=2, budget_pages=64)
+        # Stage 1 runs the draft layers; stage 0 has no sidecar.
+        self._push_with_draft(decode, 1, _tokens(1, 2, 3), {1})
+        decode.round()
+        self.assertEqual(
+            sorted((s, w) for s, w, _ in decode.built[0]), [(0, False), (0, True)]
+        )
+        # A sidecar pool has as many pages as the pool it follows.
+        by_kind = {}
+        for stage, window, pages in decode.built[1]:
+            by_kind.setdefault(window, []).append(pages)
+        self.assertEqual({len(v) for v in by_kind.values()}, {2})
+        self.assertEqual({len(set(v)) for v in by_kind.values()}, {1})
+        reads = {(r[6], r[7]): r for r in decode.channels[1].started}
+        self.assertEqual(
+            sorted(reads), [(False, False), (False, True), (True, False), (True, True)]
+        )
+        self.assertEqual(
+            reads[(False, True)][2:5], ("draft1", [1000, 1001, 1002], [0, 1, 2])
+        )
+        self.assertEqual(reads[(False, True)][3:5], reads[(False, False)][3:5])
+        self.assertEqual(
+            reads[(True, True)][2:5], ("draftswa1", [10000, 10001], [0, 1])
+        )
+        self.assertEqual(reads[(True, True)][0], "victim:p:1:s1:swa:draft")
+        decode.settle_reads()
+        decode.round()
+        self.assertEqual(decode.acks(), {"stage0": [True], "stage1": [True]})
+
+    def test_the_budget_pays_for_the_sidecar_bytes(self):
+        plain = _Decode(ranks=2, stages=2, window_pages=2, budget_pages=64)
+        plain.land(1, _tokens(1, 2, 3))
+        drafted = _Decode(ranks=2, stages=2, window_pages=2, budget_pages=64)
+        self._push_with_draft(drafted, 1, _tokens(1, 2, 3), {0, 1})
+        drafted.round()
+        self.assertLess(
+            drafted.stores()[0].capacity_pages, plain.stores()[0].capacity_pages
+        )
+
+    def test_a_failed_sidecar_read_fails_the_landing(self):
+        decode = _Decode(ranks=2, stages=2, budget_pages=64)
+        self._push_with_draft(decode, 1, _tokens(1, 2), {1})
+        decode.round()
+        for read_id in decode.channels[0].reads:
+            decode.channels[0].reads[read_id] = True
+        for read_id in decode.channels[1].reads:
+            decode.channels[1].reads[read_id] = not read_id.endswith(":draft")
+        decode.round()
+        self.assertEqual(decode.acks(), {"stage0": [False], "stage1": [False]})
+        self.assertEqual([s.used_pages for s in decode.stores()], [0, 0])
+
+    def test_a_stage_must_keep_bringing_the_sidecar_its_pool_was_built_with(self):
+        decode = _Decode(ranks=2, stages=2, budget_pages=64)
+        self._push_with_draft(decode, 1, _tokens(1), {1})
+        decode.round()
+        decode.settle_reads()
+        decode.round()
+        # A later push of stage 1 without its draft, or with a draft from a
+        # stage whose pool has none, is declined: the pools would disagree.
+        decode.push(2, _tokens(2))
+        decode.round()
+        self._push_with_draft(decode, 3, _tokens(3), {0, 1})
+        decode.round()
+        self.assertEqual(decode.acks()["stage1"], [True, False, False])
+        self.assertEqual([r.stats["layout"] for r in decode.receivers], [2, 2])
 
 
 class TestOffers(unittest.TestCase):

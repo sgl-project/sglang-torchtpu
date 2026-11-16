@@ -151,6 +151,20 @@ def unlock_host_path(cache: Any, locks: List[Any]) -> None:
         cache.dec_host_lock_ref(node_id, receipt)
 
 
+def draft_sidecar_host_pools(cache: Any) -> Tuple[Any, Any]:
+    """HiCache's draft sidecar host pools (draft KV, draft window), None for
+    each this engine does not have. A sidecar has no allocator of its own:
+    its pages are addressed by the host page ids of the full-attention pool
+    and of the SWA pool."""
+    entries = getattr(cache.host_pool_group, "entry_map", None) or {}
+
+    def pool(name: PoolName) -> Any:
+        entry = entries.get(name)
+        return None if entry is None else entry.host_pool
+
+    return pool(PoolName.DRAFT), pool(PoolName.DRAFT_SWA)
+
+
 def anchor_host_pool(cache: Any) -> Any:
     """The HiCache host pool that holds full KV, and its raiden manager."""
     return cache.cache_controller.mem_pool_host.anchor_entry.host_pool

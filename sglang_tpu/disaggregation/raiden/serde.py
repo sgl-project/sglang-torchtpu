@@ -136,6 +136,10 @@ class PrefixReady(WireMessage, omit_defaults=True):
     # full-only models and on a refusal.
     swa_uuid: int = 0
     swa_endpoint: str = ""
+    # A pipeline stage with a draft: where its draft sidecar pages are
+    # registered, under ``uuid`` and ``swa_uuid`` and at the same page ids.
+    draft_endpoint: str = ""
+    draft_swa_endpoint: str = ""
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -181,6 +185,15 @@ class VictimPush(WireMessage, omit_defaults=True):
     page_bytes: int = 0
     swa_layout: list = msgspec.field(default_factory=list)
     swa_page_bytes: int = 0
+    # A stage that runs draft layers: its draft sidecar pools, registered
+    # under the same UUID at the same page ids as ``blocks`` (the draft KV)
+    # and ``swa_blocks`` (the draft's window).
+    draft_address: str = ""
+    draft_layout: list = msgspec.field(default_factory=list)
+    draft_page_bytes: int = 0
+    draft_swa_address: str = ""
+    draft_swa_layout: list = msgspec.field(default_factory=list)
+    draft_swa_page_bytes: int = 0
 
 
 class VictimAck(WireMessage):

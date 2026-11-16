@@ -9,7 +9,7 @@ reason. A setting that silently runs without the offload fails here.
 import functools
 import sys
 import unittest
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -52,11 +52,6 @@ _UNSUPPORTED = (
         "scheduler.server_args.enable_hierarchical_cache",
         False,
         "--enable-hierarchical-cache",
-    ),
-    (
-        "scheduler.server_args.pp_size",
-        2,
-        "pipeline parallelism is not supported (--pp-size 2)",
     ),
     ("scheduler.server_args.dp_size", 2, "data parallelism"),
     ("scheduler.server_args.attn_dp_size", 2, "data parallelism"),
@@ -102,15 +97,70 @@ class TestEngineRefusals(CustomTestCase):
         ):
             validate_engine_as(engine, role="decode")
 
-    def test_pipeline_transfer_env_is_refused_on_the_decode(self):
+    def test_a_pipeline_prefill_pairs_with_a_tensor_parallel_decode(self):
+        """The prefill may be a pipeline at attention TP 1; its decode opts in
+        to the pipeline transfer and is not itself a pipeline."""
+        engine = supported_engine()
+        engine.scheduler.server_args.pp_size = 8
+        validate_engine_as(engine, role="prefill")
+        with self.assertRaisesRegex(
+            startup_validation.UnsupportedDramOffloadConfig,
+            r"pipeline-parallel decode is not supported \(--pp-size 8\)",
+        ):
+            validate_engine_as(engine, role="decode")
+        engine.parallel.attn_tp_size = 2
+        with self.assertRaisesRegex(
+            startup_validation.UnsupportedDramOffloadConfig,
+            r"pipeline-parallel prefill needs attention TP 1 .*\(--pp-size 8\)",
+        ):
+            validate_engine_as(engine, role="prefill")
         engine = supported_engine()
         with patch.dict("os.environ", {"SGLANG_RAIDEN_PIPELINE_TRANSFER": "1"}):
             validate_engine_as(engine, role="prefill")
+            validate_engine_as(engine, role="decode")
+
+    def test_a_draft_is_refused_in_the_pipeline_pairing_too(self):
+        """The draft KV of a cached prefix is in HiCache's draft sidecar pool,
+        which no pairing moves (seen live: a decode with a DFlash draft refuses
+        to build its cache with the switch on)."""
+        engine = supported_engine()
+        engine.scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+        engine.scheduler.server_args.pp_size = 8
+        with self.assertRaisesRegex(
+            startup_validation.UnsupportedDramOffloadConfig, "speculative decoding"
+        ):
+            validate_engine_as(engine, role="prefill")
+        engine.scheduler.server_args.pp_size = 1
+        with patch.dict("os.environ", {"SGLANG_RAIDEN_PIPELINE_TRANSFER": "1"}):
             with self.assertRaisesRegex(
                 startup_validation.UnsupportedDramOffloadConfig,
-                "SGLANG_RAIDEN_PIPELINE_TRANSFER",
+                "speculative decoding",
             ):
                 validate_engine_as(engine, role="decode")
+
+    def test_a_draft_needs_the_opt_in_and_only_the_pipeline_pairing_has_one(self):
+        engine = supported_engine()
+        engine.scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+        with patch.dict("os.environ", {"SGLANG_PD_OFFLOAD_ALLOW_DRAFT": "1"}):
+            # Between tensor-parallel engines the opt-in changes nothing.
+            for role in ("prefill", "decode"):
+                with self.assertRaisesRegex(
+                    startup_validation.UnsupportedDramOffloadConfig,
+                    r"speculative decoding is not supported \(change",
+                ):
+                    validate_engine_as(engine, role=role)
+            engine.scheduler.server_args.pp_size = 8
+            validate_engine_as(engine, role="prefill")
+            engine.scheduler.server_args.pp_size = 1
+            with patch.dict("os.environ", {"SGLANG_RAIDEN_PIPELINE_TRANSFER": "1"}):
+                validate_engine_as(engine, role="decode")
+        # Without it the refusal names the opt-in.
+        engine.scheduler.server_args.pp_size = 8
+        with self.assertRaisesRegex(
+            startup_validation.UnsupportedDramOffloadConfig,
+            "SGLANG_PD_OFFLOAD_ALLOW_DRAFT=1 on both roles",
+        ):
+            validate_engine_as(engine, role="prefill")
 
 
 class TestHybridModels(CustomTestCase):
@@ -190,9 +240,9 @@ class TestEngineRefusalsExtra(CustomTestCase):
         with self.assertRaises(
             startup_validation.UnsupportedDramOffloadConfig
         ) as raised:
-            validate_engine_as(engine)
+            validate_engine_as(engine, role="decode")
         self.assertIn("--enable-unified-memory", str(raised.exception))
-        self.assertIn("pipeline parallelism", str(raised.exception))
+        self.assertIn("pipeline-parallel decode", str(raised.exception))
 
 
 class TestPairRefusals(CustomTestCase):
