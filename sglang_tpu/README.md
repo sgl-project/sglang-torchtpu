@@ -288,6 +288,12 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   collectives in one program (torch_tpu's `spmd_safe`, with its own cache tag);
   `fusion_barrier` is XLA's optimization barrier; every rank drains its device
   queue at the end of each request.
+- `--attention-backend hybrid_window_attn_h3` for VDN-H3 (`minimax_h3_vdn.py`):
+  the window softmax as resumed ring-step kernel calls and the Ulysses
+  exchanges compiled per DiT block and video size, the Video DeltaNet branch
+  eager between them (torch_tpu miscompiles it); Newton-Schulz inverts the
+  delta rule's I + A (`{"vdn_spd_inverse": "cholesky"}` keeps the Cholesky
+  chain).
 - Checkpoints read on the host, then moved (safetensors cannot open `tpu:N`);
   the Ulysses output all-to-all exchanges heads-major outputs in head slabs.
 - `--ring-degree` (non-causal, by K/V all-gather) on the splash backend, its

@@ -481,6 +481,15 @@ def frame_statistics(
     return A, B
 
 
+def cholesky_spd_inverse(m: torch.Tensor) -> torch.Tensor:
+    """Batched inverse of SPD ``m`` as L^-T L^-1 (fp32)."""
+    eye = torch.eye(m.shape[-1], device=m.device, dtype=m.dtype).expand_as(m)
+    chol = torch.linalg.cholesky(m)
+    # a batched trsm at 128x128 is far slower than the GEMM
+    linv = torch.linalg.solve_triangular(chol, eye, upper=False, left=True)
+    return linv.transpose(-1, -2) @ linv
+
+
 def delta_factor_apply(
     rule: str,
     alpha: torch.Tensor,
@@ -489,6 +498,7 @@ def delta_factor_apply(
     *,
     tokens_per_frame: int,
     fused: bool = False,
+    spd_inverse=cholesky_spd_inverse,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One frame's statistics -> (transition [F,H,dk,dk], injection [F,H,dv,dk]) fp32.
 
@@ -499,7 +509,8 @@ def delta_factor_apply(
 
     ``fused`` takes the inverse and both products through one CUDA kernel
     (``vdn_delta_factors``, fp32 / head_dim 128) with the same accuracy as the
-    Cholesky chain; anything the kernel does not cover falls back to eager.
+    Cholesky chain; anything the kernel does not cover falls back to eager,
+    which inverts I + A with ``spd_inverse``.
     """
     A32, B32 = A.float(), B.float()
     eye = torch.eye(A32.shape[-1], device=A32.device, dtype=_FP32).expand_as(A32)
@@ -522,10 +533,7 @@ def delta_factor_apply(
         )
         if can_use_vdn_delta_factors(A32.device, A32.dtype, A32.shape[-1]):
             return vdn_delta_factors(A32, B32, alpha32)
-    chol = torch.linalg.cholesky(A32 + eye)
-    # (I+A)^-1 = L^-T L^-1: a batched trsm at 128x128 is far slower than the GEMM
-    linv = torch.linalg.solve_triangular(chol, eye, upper=False, left=True)
-    inv = linv.transpose(-1, -2) @ linv
+    inv = spd_inverse(A32 + eye)
     transition = alpha.unsqueeze(-1) * inv
     injection = B32 @ inv
     return transition, injection
@@ -805,6 +813,8 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         self.head_dim = arch.attention_head_dim
         # tests flip this to compare the fused Triton stages with the eager chain
         self.fused_kernels = True
+        # the (I + A) inverse of the delta rule; a backend may swap it per module
+        self.spd_inverse = cholesky_spd_inverse
         hidden = arch.hidden_size
         channels = local_heads * self.head_dim
         self.short_conv = (
@@ -880,6 +890,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             B,
             tokens_per_frame=length,
             fused=self.fused_kernels,
+            spd_inverse=self.spd_inverse,
         )
         return TEXT_STATE_SCALE * injection[0]
 
@@ -1030,6 +1041,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             B,
             tokens_per_frame=per_frame,
             fused=self.fused_kernels,
+            spd_inverse=self.spd_inverse,
         )
         if text_stats is not None:
             text_state = TEXT_STATE_SCALE * injections[0]
@@ -1067,6 +1079,7 @@ __all__ = [
     "VDNOutputGate",
     "VDNShortConv",
     "VDNSoftmaxGate",
+    "cholesky_spd_inverse",
     "delta_factor_apply",
     "frame_statistics",
     "gather_linear_state",

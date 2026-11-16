@@ -139,11 +139,16 @@ class MiniMaxH3VDNHybridAttention(nn.Module):
         softmax_gate = self.softmax_gate(x) if self.softmax_gate is not None else None
         beta = self.linear_attention.beta(x)
         gate_hidden, _ = self.linear_attention.output_gate.down(x)
-        attention_core = (
-            _hybrid_attention_core_bcg
-            if attention.bcg_breakpoint
-            else _minimax_h3_hybrid_attention_core_impl
+        # a backend may bring its own core (the TPU plugin's compiles per block)
+        attention_core = getattr(
+            attention._attention_impl, "hybrid_attention_core", None
         )
+        if attention_core is None:
+            attention_core = (
+                _hybrid_attention_core_bcg
+                if attention.bcg_breakpoint
+                else _minimax_h3_hybrid_attention_core_impl
+            )
         softmax_out, linear_out = attention_core(
             attention,
             x,
@@ -617,12 +622,19 @@ def prepare_hybrid_attention_metadata(
                 _rope_cos_sin_cache(rope_freqs, dtype=torch.bfloat16),
                 torch.arange(layout.seq_len, device=device, dtype=torch.long),
             )
-    metadata = HybridWindowAttentionH3MetadataBuilder().build(
+    builder_cls = getattr(
+        model.blocks[0].attn._attention_impl,
+        "hybrid_metadata_builder_cls",
+        HybridWindowAttentionH3MetadataBuilder,
+    )
+    metadata = builder_cls().build(
         layout=layout,
         hybrid=hybrid,
         device=device,
         rope_cache_full=rope_cache_full,
         max_gather_rows=max_gather_rows,
+        model=model,
+        server_args=server_args,
     )
     logger.info(
         "VDN-H3 hybrid attention: frames=%d tokens/frame=%d text=%d "
