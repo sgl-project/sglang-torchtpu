@@ -1,14 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Private, explicitly opted-in GLM52 channelwise FP8 checkpoint ABI.
+"""GLM-5.2 offline channelwise FP8 checkpoint loading.
 
-Set ``quantization_config.tpu_checkpoint_layout`` to
-``glm52_channelwise_fp8`` (including through the HF config override). Null
-``weight_block_size`` alone is deliberately NOT an opt-in: ordinary FP8 and
-Flash checkpoints keep the upstream config and methods unchanged.
+The existing block-FP8 paths keep their checkpoint metadata unchanged:
 
-The checkpoint calls its multiplicative dequant scales ``weight_scale_inv``;
-these are rank-one output-channel [N] scales, not block scales or reciprocal
-scales (the paired weights, not the scales, have rank two).
+* Existing defaults: ``--quantization fp8``.
+* Explicit conversion of the SAME block-FP8 checkpoint:
+  ``--quantization fp8 --tpu-fp8-runtime channelwise``.
+  The current runtime default is already channelwise, so these are equivalent.
+
+The offline channelwise checkpoint instead uses ``--quantization fp8`` with
+``--load-format safetensors`` and this explicit HF model override:
+
+.. code-block:: json
+
+    {"quantization_config": {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "weight_block_size": null,
+        "tpu_checkpoint_layout": "glm52_channelwise_fp8"
+    }}
+
+Pass the JSON with ``--json-model-override-args``. It replaces the whole quant
+config: preserve the checkpoint's ignored_layers/modules_to_not_convert.
+Null weight_block_size alone never selects this ABI. The checkpoint's
+weight_scale_inv is a MULTIPLICATIVE channel dequantization coefficient,
+not a reciprocal or a block scale. Already quantized bytes are loaded directly.
+
+Kernel/backend selection and dynamic activation quantization remain independent
+of checkpoint source. Native NEXTN uses the same checkpoint; a 5-step chain uses
+``--speculative-algorithm NEXTN --speculative-num-steps 5`` plus
+``--speculative-eagle-topk 1 --speculative-num-draft-tokens 6``. DP attention
+also requires ``--enable-dp-lm-head``. Full-model MTP serving needs separate
+E2E validation; component loading tests do not establish it.
 """
 
 from __future__ import annotations
@@ -18,19 +42,56 @@ from typing import Any
 import torch
 from torch.nn import Parameter
 
-from sglang.srt.layers.linear import LinearBase
-from sglang.srt.layers.moe.fused_moe_triton import (
-    FusedMoE,
-    FusedMoeWeightScaleSupported,
-)
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
-from sglang_tpu.fp8_config import _remap_draft_ignored_layers
 
 CHECKPOINT_LAYOUT = "glm52_channelwise_fp8"
+
+
+class TpuFp8Config(Fp8Config):
+    """Select the offline channelwise ABI only through its explicit layout key.
+
+    Both block-FP8 runtime choices and metadata-free BF16 online quantization
+    retain the upstream config. The existing --tpu-fp8-runtime flag selects
+    block-to-channel conversion independently of the checkpoint factory.
+    """
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> Fp8Config:
+        layout = config.get("tpu_checkpoint_layout")
+        if layout is None:
+            return Fp8Config.from_config(config)
+        if layout != CHECKPOINT_LAYOUT:
+            raise ValueError(f"Unknown TPU FP8 checkpoint layout: {layout!r}")
+        if config.get("is_checkpoint_fp8_serialized") is False:
+            raise ValueError(
+                "Channelwise checkpoint layout requires serialized FP8 weights"
+            )
+        return Glm52ChannelwiseFp8Config.from_fp8_config(config)
+
+
+def _remap_draft_ignored_layers(config: Fp8Config, hf_config) -> None:
+    """Use the model's mapping for checkpoint-named GLM NextN exclusions."""
+    if "GlmMoeDsaForCausalLMNextN" not in (
+        getattr(hf_config, "architectures", None) or []
+    ):
+        return
+    from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
+
+    num_layers = hf_config.num_hidden_layers
+    layer_id = 0 if num_layers == 1 else num_layers
+    prefix = f"model.layers.{layer_id}"
+    mapped = []
+    for name in config.ignored_layers:
+        normalized = name if name.startswith("model.") else f"model.{name}"
+        if normalized == prefix or normalized.startswith(prefix + "."):
+            mapped.append(
+                GlmMoeDsaForCausalLMNextN._map_mtp_ckpt_name(normalized, prefix)
+            )
+    config.ignored_layers = list(dict.fromkeys([*config.ignored_layers, *mapped]))
 
 
 class Glm52ChannelwiseFp8Config(Fp8Config):
@@ -75,6 +136,9 @@ class Glm52ChannelwiseFp8Config(Fp8Config):
         return result
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
         if is_layer_skipped(
             prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
         ):
@@ -171,6 +235,8 @@ class Glm52ChannelwiseFp8MoEMethod(Fp8MoEMethod):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         super().create_weights(
             layer,
             num_experts,

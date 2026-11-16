@@ -15,7 +15,7 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_context, get_flags
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.fp8_config import TpuFp8Config
+from sglang_tpu.glm52_channelwise_fp8 import TpuFp8Config
 from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op, fused_moe_call
 
 register_tpu_ci(

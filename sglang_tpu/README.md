@@ -16,25 +16,6 @@ pip install --no-deps -e .        # this plugin (dist "sglang-tpu")
 `--no-deps` keeps pip from re-resolving the fork's dependency tree; the editable
 fork already satisfies the plugin's `sglang` requirement.
 
-## FP8 weight loading policies
-
-| Mode | Checkpoint | Configuration |
-|---|---|---|
-| (1) Existing behavior | Original block-FP8 | `--quantization fp8`; preserve checkpoint metadata and runtime choice |
-| (2) Explicit channelwise conversion | **The same original block-FP8 as (1)** | Add `--tpu-fp8-runtime channelwise`; no quant config override |
-| (3) Offline channelwise | `GLM5.2-fp8-channel-wise` | Select `tpu_checkpoint_layout=glm52_channelwise_fp8` in checkpoint metadata or a merged model-config override |
-
-The current FP8 runtime default is already `channelwise`, so modes (1) and (2)
-currently agree. Mode (2) uses the existing block-dequantize/channel-requantize
-path, not a new BF16/FP16 online quantizer. The existing BF16 fallback remains
-unchanged. `activation_scheme=dynamic` describes runtime activation scales;
-weights are fixed after loading.
-
-See [GLM-5.2 FP8 loading modes](docs/glm52_fp8_loading.md) for the exact serve
-arguments and quant configs, safe override merging, target/NEXTN settings,
-runtime contract, support-matrix scope, and the historical Falcon evidence and
-MTP retest decision. Component tests do not establish full-model serving support.
-
 ## Two platform identities, one code base
 
 | Mode | Select with | Platform class | `is_out_of_tree()` | Status |

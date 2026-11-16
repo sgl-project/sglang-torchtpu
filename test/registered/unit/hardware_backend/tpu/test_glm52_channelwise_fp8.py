@@ -34,11 +34,11 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.runtime_context import get_context, get_flags
-from sglang_tpu.fp8_config import TpuFp8Config
 from sglang_tpu.glm52_channelwise_fp8 import (
     Glm52ChannelwiseFp8Config,
     Glm52ChannelwiseFp8LinearMethod,
     Glm52ChannelwiseFp8MoEMethod,
+    TpuFp8Config,
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
