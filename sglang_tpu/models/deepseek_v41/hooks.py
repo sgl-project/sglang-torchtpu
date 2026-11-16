@@ -64,30 +64,6 @@ tpu_dsv41_engram_gate
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: TorchTPU implements aten::copysign or engram_gate avoids it.
 
-tpu_dsv41_int32_graph_inputs
-  Why: the compiled V4.1 forward takes input_ids, positions and
-       req_pool_indices as int64 graph inputs; the image-token torch.where,
-       the Engram hasher and the ratio-2 pair state split them into 64-bit
-       halves, which TPU lowering rejects ("Unsupported conversion from
-       vmreg/vreg to U64"). A cast inside the forward still leaves the
-       int64 parameter in the graph.
-  How: AROUND CompiledForwardShim._forward passes int32 copies of input_ids
-       and positions as the compiled call's arguments for V4.1 on non-CUDA
-       devices; the batch fields keep the caller's dtype, so the shim's
-       unpadding stays the only change to their shape. Engram rows are hashed
-       and gathered here on the host (engram_host) and enter the graph as int32
-       staged row ids; the backend metadata (positions, request rows, slots) is
-       built in int32 on the host, so no int64 index reaches the graph.
-       With attention DP the token embedding is looked up eagerly here and
-       passed in as input_embeds (input_ids still go in for Engram and MoE
-       routing), as vllm-torchtpu #1848 does: inside the TP1/DP8 compiled
-       graph the unsharded BF16 embedding gather returns wrong rows, while the
-       same lookup outside the graph is exact. Warmup takes this path too, so
-       precompiled and serving graphs share one signature.
-  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
-  Remove when: the TPU batch builder produces int32 index tensors and the
-       in-graph embedding gather is fixed in torch_tpu.
-
 tpu_dsv41_engram_embed_init, tpu_dsv41_engram_embed_forward,
 tpu_dsv41_hasher_forward
   Why: TPU serves Engram only from one host table per node shared by the DP
@@ -96,10 +72,11 @@ tpu_dsv41_hasher_forward
        and its offloaded gather halted a SparseCore. _HostTable pins its
        mapping with cudaHostRegister, and the core lookup reads it from a GPU.
   How: AROUND EngramEmbedding.__init__ rejects any other placement on TPU and
-       builds the table with cudaHostRegister stubbed out. The shim hook
-       (tpu_dsv41_int32_graph_inputs) hashes on the host and stages raw rows;
-       inside the graph EngramHasher.forward returns the staged row ids and
-       EngramEmbedding.forward dequantizes the staged rows.
+       builds the table with cudaHostRegister stubbed out. The V4 compile
+       policy (deepseek_v41/compile_policy.py) hashes on the host and stages
+       raw rows after padding; inside the graph EngramHasher.forward returns
+       the staged row ids and EngramEmbedding.forward dequantizes the staged
+       rows.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: the device can read host tables, or the in-graph HBM lookup
        is correct under attention DP.
@@ -244,81 +221,6 @@ def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
     return original(hasher, input_ids, forward_batch)
 
 
-def _int32(t):
-    if isinstance(t, torch.Tensor) and t.dtype == torch.int64 and not t.is_cuda:
-        return t.to(torch.int32)
-    return t
-
-
-def tpu_dsv41_int32_graph_inputs(
-    original, shim, fn, input_ids, positions, forward_batch, *args, **kwargs
-):
-    """AROUND CompiledForwardShim._forward: V4.1 index tensors enter as int32."""
-    config = shim.policy.model_runner.model_config.hf_config
-    if config.model_type != "deepseek_v41":
-        return original(shim, fn, input_ids, positions, forward_batch, *args, **kwargs)
-    names = ()
-    model = shim.policy.model_runner.model
-    hasher = model.model.engram_hasher
-    host_tables = ()
-    if hasher is not None and not torch.compiler.is_compiling():
-        from sglang_tpu.models.deepseek_v41 import engram_host
-
-        host_tables = engram_host.shared_host_tables(model)
-    if host_tables:
-        names = (*names, "tpu_engram_local_ids", "tpu_engram_staged")
-    from sglang.srt.runtime_context import get_parallel
-
-    embed_outside = (
-        forward_batch.input_embeds is None
-        and isinstance(input_ids, torch.Tensor)
-        and not input_ids.is_cuda
-        and not torch.compiler.is_compiling()
-        and get_parallel().attn_dp_size > 1
-    )
-    if embed_outside:
-        names = (*names, "input_embeds")
-    saved = {name: getattr(forward_batch, name) for name in names}
-    if host_tables:
-        _stage_host_engram(hasher, host_tables, input_ids, forward_batch)
-    if embed_outside:
-        embed_tokens = shim.policy.model_runner.model.get_input_embeddings()
-        with torch.no_grad():
-            forward_batch.input_embeds = embed_tokens(input_ids)
-    try:
-        return original(
-            shim,
-            fn,
-            _int32(input_ids),
-            _int32(positions),
-            forward_batch,
-            *args,
-            **kwargs,
-        )
-    finally:
-        # Only fields this hook set (None before it ran) are restored; the shim
-        # owns the shape of every other batch field.
-        for name, value in saved.items():
-            setattr(forward_batch, name, value)
-
-
-def _stage_host_engram(hasher, tables, input_ids, forward_batch) -> None:
-    """Hash this rank's tokens and gather their Engram rows on the host."""
-    from sglang_tpu.models.deepseek_v41 import engram_host
-
-    engram_host.move_hasher_to_host(hasher)
-    with torch.no_grad():
-        hash_ids = engram_host.host_hash_ids(hasher, input_ids, forward_batch)
-    num_tokens, num_layers, num_cols = hash_ids.shape
-    device = input_ids.device
-    forward_batch.tpu_engram_staged = engram_host.gather_staged_rows(
-        hash_ids, tables, device
-    )
-    forward_batch.tpu_engram_local_ids = engram_host.local_row_ids(
-        num_tokens, num_layers, num_cols, device
-    )
-
-
 def tpu_dsv41_engram_embed_init(original, embedding, *args, **kwargs):
     """AROUND EngramEmbedding.__init__: build host tables without the CUDA pin."""
     if torch.cuda.is_available():
@@ -405,11 +307,6 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.engram_gate",
             tpu_dsv41_engram_gate,
-            HookType.AROUND,
-        ),
-        (
-            "sglang_tpu.compilation.compiled_forward_shim.CompiledForwardShim._forward",
-            tpu_dsv41_int32_graph_inputs,
             HookType.AROUND,
         ),
         (
