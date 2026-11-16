@@ -13,8 +13,8 @@ Native reference:
   * ``attention/pallas/dsa_key_store``: the decode key writer (record bytes,
     UE8M0 exponent from the abs-max bits, torch_tpu-style LayerNorm).
   * ``dsv4/streamindex_topk``: scores ``relu(q8 . k8) * w`` summed over heads
-    (decode: ``.sum(axis=1)`` of ``[1, 32, N]``; mixed / rows: head-sequential),
-    times the key's UE8M0 scale, ``-inf`` past the causal bound.
+    (decode: ``.sum(axis=1)`` of ``[1, 32, N]``; mixed / rows: head-sequential
+    ``bf16_reduce``), times the key's UE8M0 scale, ``-inf`` past the causal bound.
   * ``dsv4/sparsecore_topk``: exact top-k over the monotone int32 keys of the
     f32 score bits (unsorted; ties at the threshold arbitrary).
 
@@ -619,11 +619,16 @@ class DsaRun:
             st = st.reshape(1, HEADS, -1)
             st = jnp.maximum(st, 0.0) * self.w[:, :, None]
             acc = st.sum(axis=1)
-        else:  # head-major, sequential over heads (the mixed pass)
+        else:  # head-major, sequential over heads (the mixed pass; bf16_reduce)
             st = st.reshape(HEADS, s.R, -1)
-            acc = jnp.maximum(st[0], 0.0) * self.w[:, 0:1]
+            w = self.w.astype(jnp.bfloat16).astype(jnp.float32)
+            acc = (
+                jnp.maximum(st[0].astype(jnp.bfloat16), 0).astype(jnp.float32)
+                * w[:, 0:1]
+            )
             for h in range(1, HEADS):
-                acc = acc + jnp.maximum(st[h], 0.0) * self.w[:, h : h + 1]
+                r = jnp.maximum(st[h].astype(jnp.bfloat16), 0)
+                acc = acc + r.astype(jnp.float32) * w[:, h : h + 1]
         acc = acc * scale
         pos = b * n + lax.broadcasted_iota(jnp.int32, acc.shape, 1)
         return jnp.where(pos < lim, acc, -jnp.inf)

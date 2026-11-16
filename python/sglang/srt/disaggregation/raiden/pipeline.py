@@ -1,8 +1,8 @@
-"""Moved to :mod:`sglang_tpu.disaggregation.raiden.pipeline`; alias kept for in-flight branches, delete once they merge."""
+"""Moved to :mod:`sglang_tpu.disaggregation.raiden.pool_transfer`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib
 import sys
 
 sys.modules[__name__] = importlib.import_module(
-    "sglang_tpu.disaggregation.raiden.pipeline"
+    "sglang_tpu.disaggregation.raiden.pool_transfer"
 )

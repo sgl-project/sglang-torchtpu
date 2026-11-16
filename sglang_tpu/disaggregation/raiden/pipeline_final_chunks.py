@@ -6,7 +6,7 @@ each microbatch slot's sampled tokens once its deferred output send has copied
 them to the host. For every request whose final chunk a forward computes:
 - with stage groups (SGLANG_RAIDEN_PIPELINE_STAGE_PARTS), this stage's share
   registers once a host copy of one element of the forward's output lands
-  (PipelineTransfer.make_fence);
+  (RaidenPoolTransfer.make_fence);
 - with SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE, this stage's share of the closing
   transfer registers at launch on stages before the last, and at the token
   copy on the last stage. That copy completes after the last stage's forward,

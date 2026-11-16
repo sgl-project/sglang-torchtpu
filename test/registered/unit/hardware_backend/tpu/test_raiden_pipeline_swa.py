@@ -1,4 +1,4 @@
-"""Hybrid sliding-window KV on the Raiden pipeline transfer (pp_swa).
+"""Hybrid sliding-window KV on the Raiden pipeline transfer (pool_side_engine).
 
 A hybrid pool's full-attention and sliding-window layers hold different block
 counts, which one tpu-sync KVCacheManager rejects, so the window layers get a
@@ -24,8 +24,8 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.disaggregation.raiden import pipeline as pl
-from sglang_tpu.disaggregation.raiden import pp_swa as ps
+from sglang_tpu.disaggregation.raiden import pool_side_engine as ps
+from sglang_tpu.disaggregation.raiden import pool_transfer as pl
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
@@ -187,8 +187,8 @@ class Domain:
 
 
 def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
-    """A PipelineTransfer with its window link, built like __init__ would."""
-    t = object.__new__(pl.PipelineTransfer)
+    """A RaidenPoolTransfer with its window link, built like __init__ would."""
+    t = object.__new__(pl.RaidenPoolTransfer)
     producer = mode == PREFILL
     mgr = harness.Manager(mode, rank if producer else 0, pp_size, world.bus, name)
     mgr.attn_tp_size, mgr.attn_tp_rank = (1, 0) if producer else (tp_size, rank)
@@ -242,7 +242,8 @@ def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
     t.max_blocks = PRODUCER_BLOCKS["full"]
     t.admission = StagingAdmission(4 * t.max_blocks, 4 * WINDOW_PAGES)
     t.engine = harness.Engine()
-    link = ps.SwaLink(
+    link = ps.SideLink(
+        family=ps.SWA,
         pools=swa_pools,
         tensors=list(groups.swa),
         controller=f"{side}swa",
@@ -263,7 +264,7 @@ def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
     link.client = world.client_type(link.controller)
     link.executor = None if producer else harness.SyncExecutor()
     link.engine = harness.Engine()
-    t.swa = link
+    t.side = link
     world.fa.add_unit(
         t, t.unit, {p["tag"]: x for p, x in zip(t.pools, t.tensors)}, t.engine
     )
@@ -359,13 +360,13 @@ def assert_landed(w, pairs_by_kind):
     tp_size = len(w.decodes)
     for rank, d in enumerate(w.decodes):
         tensors = {p["tag"]: x for p, x in zip(d.pools, d.tensors)} | {
-            p["tag"]: x for p, x in zip(d.swa.pools, d.swa.tensors)
+            p["tag"]: x for p, x in zip(d.side.pools, d.side.tensors)
         }
         written = {tag: set() for tag in tensors}
         for kind, pairs in pairs_by_kind.items():
             for s in w.stages:
                 src = {p["tag"]: x for p, x in zip(s.pools, s.tensors)} | {
-                    p["tag"]: x for p, x in zip(s.swa.pools, s.swa.tensors)
+                    p["tag"]: x for p, x in zip(s.side.pools, s.side.tensors)
                 }
                 for tag, x in src.items():
                     if tag.startswith("swa.") != (kind == "swa"):
@@ -471,7 +472,7 @@ def test_closing_moves_full_and_window_pages_to_each_tp_rank(world):
     assert fa["req_id"] == str(ROOM) and fa["uuid"] == ROOM
     assert sorted(fa["transfer_pool_tags"]) == ["fa.l1", "fa.l3"]
     assert fa["dst_device_block_ids"] == DST_FULL[:5] * 2
-    assert swa["req_id"] == f"swa:{ROOM}" and swa["uuid"] == ps.twin_uuid(str(ROOM))
+    assert swa["req_id"] == f"swa:{ROOM}" and swa["uuid"] == ps.SWA.twin_uuid(str(ROOM))
     assert sorted(swa["transfer_pool_tags"]) == ["swa.l0", "swa.l2"]
     assert swa["dst_device_block_ids"] == DST_SWA * 2
     assert [unit_key(u) for u in swa["src_units"]] == [
@@ -661,7 +662,7 @@ def test_transfer_accepted_after_the_room_failed_keeps_its_pages():
     w = build_world(tp_size=1)
     d = w.decodes[0]
     w.swa.auto_land = False
-    d.swa.executor = Deferred()
+    d.side.executor = Deferred()
     ask(w)
     for s in w.stages:
         close(s, range(10, 13), [6, 4])
@@ -670,7 +671,7 @@ def test_transfer_accepted_after_the_room_failed_keeps_its_pages():
     assert d.maybe_start_pull(ROOM)
     poll(d)
     assert ROOM in d.failed and d.active(ROOM)  # the twin is still coordinating
-    d.swa.executor.run()  # the controller accepts the twin
+    d.side.executor.run()  # the controller accepts the twin
     poll(d)
     assert d.active(ROOM)
     w.swa.land(f"swa:{ROOM}")
@@ -776,7 +777,7 @@ def test_producer_and_decode_must_agree_on_the_window_engine():
     reverse) fails the room instead of planning a transfer that cannot match."""
     w = build_world(tp_size=1)
     one_engine = w.decodes[0]
-    one_engine.swa = None
+    one_engine.side = None
     ask(w)
     close(w.stages[0], range(10, 13), [6, 4])
     with pytest.raises(ValueError, match="disagree on the sliding-window engine"):
@@ -860,7 +861,7 @@ def test_stage_groups_move_each_groups_window_as_its_twin(staged):
     (twin,) = w.swa.transfers
     assert twin["transfer_pool_tags"] == ["swa.l0"]  # stage 0's window layer only
     assert [unit_key(u) for u in twin["src_units"]] == [("pswa", "prefill", 0)]
-    assert twin["uuid"] == ps.twin_uuid(pl.stage_req_id(ROOM, 0))
+    assert twin["uuid"] == ps.SWA.twin_uuid(pl.stage_req_id(ROOM, 0))
     fences[1].ready = True
     w.stages[1].advance_stages()
     w.pump()
@@ -984,7 +985,7 @@ class Buffer:
 
 
 def _initialize(groups, *, bounded_staging=True, real_budget=False):
-    """PipelineTransfer(...) over fake tpu-sync natives; the result records
+    """RaidenPoolTransfer(...) over fake tpu-sync natives; the result records
     the engines, stores, work units and slot plans it made. Slot counts come
     from RaidenKVManager's host budget with ``real_budget``, else fixed."""
     r = SimpleNamespace(pipe=None, error=None, engines=[], stores=[], units=[])
@@ -1101,10 +1102,10 @@ def _initialize(groups, *, bounded_staging=True, real_budget=False):
     }
     with patch.dict(sys.modules, native):
         try:
-            r.pipe = pl.PipelineTransfer(manager, groups)
+            r.pipe = pl.RaidenPoolTransfer(manager, groups)
         except Exception as error:
             r.error = error
-    for pipe in (r.pipe, getattr(r.pipe, "swa", None)):
+    for pipe in (r.pipe, getattr(r.pipe, "side", None)):
         if pipe is not None and pipe.executor is not None:
             pipe.executor.shutdown(wait=False)
     return r
@@ -1145,18 +1146,18 @@ def test_hybrid_worker_builds_a_window_engine_beside_the_full_one():
     pipe.engine.register_pools.assert_called_once_with(
         pipe.pools, staging_leases=6, staging_blocks_per_pool=[64]
     )
-    pipe.swa.engine.register_pools.assert_called_once_with(
-        pipe.swa.pools, staging_leases=4, staging_blocks_per_pool=[3, 3, 3]
+    pipe.side.engine.register_pools.assert_called_once_with(
+        pipe.side.pools, staging_leases=4, staging_blocks_per_pool=[3, 3, 3]
     )
     assert [p["tag"] for p in pipe.pools] == ["fa.l3"]
-    assert [(p["tag"], p["storage_index"]) for p in pipe.swa.pools] == [
+    assert [(p["tag"], p["storage_index"]) for p in pipe.side.pools] == [
         ("swa.l0", 0),
         ("swa.l1", 1),
         ("swa.l2", 2),
     ]
     (fa_addr, fa_unit), (swa_addr, swa_unit) = r.units
-    assert swa_addr == pipe.swa.controller != fa_addr
-    assert swa_unit["unit"].job_replica_id == pipe.swa.controller
+    assert swa_addr == pipe.side.controller != fa_addr
+    assert swa_unit["unit"].job_replica_id == pipe.side.controller
     assert swa_unit["transfer_rank"] == fa_unit["transfer_rank"] == 0
     # The window engine sizes its slots in pairs with full-attention ones and
     # takes its staging out of the rank's budget first.
@@ -1201,14 +1202,14 @@ def test_full_attention_only_stage_is_unchanged():
     )
     r = _initialize(groups)
     (engine,) = r.engines
-    assert engine["private"] is None and r.pipe.swa is None
+    assert engine["private"] is None and r.pipe.side is None
     assert r.stores == [("pipeline", None)] and r.slot_calls == [(1, 64, 1, 0, 0)]
     assert r.pipe.admission.swa_capacity is None
 
 
 @pytest.mark.parametrize("local_swa", [True, False])
 def test_workers_must_agree_with_rank_zero_on_the_window_engine(local_swa):
-    pipe = object.__new__(pl.PipelineTransfer)
+    pipe = object.__new__(pl.RaidenPoolTransfer)
     pipe.rank = 1
     pipe.manager = SimpleNamespace(
         pp_size=2, attn_tp_size=1, local_ip="10.0.0.2", _control_port=31004
@@ -1225,8 +1226,11 @@ def test_workers_must_agree_with_rank_zero_on_the_window_engine(local_swa):
         patch.object(pl, "get_parallel", lambda: SimpleNamespace(pp_group=group)),
     ):
         with pytest.raises(ValueError, match="--disable-hybrid-swa-memory"):
-            pipe._rendezvous(swa=local_swa)
-        assert pipe._rendezvous(swa=not local_swa)[:2] == ("a:1", "b:2")
+            pipe._rendezvous(side=ps.SWA if local_swa else None)
+        assert pipe._rendezvous(side=None if local_swa else ps.SWA)[:2] == (
+            "a:1",
+            "b:2",
+        )
 
 
 if __name__ == "__main__":
