@@ -144,6 +144,14 @@ class KernelConfig:
     # 8- and 16-row decode steps: keep the small embedding all-reduce on the
     # TensorCore instead of the SparseCore collective offload.
     decode_tc_all_reduce: bool = False
+    # 16-row decode steps: records in the instruction-overlay allocation table
+    # (XLA's xla_tpu_overlay_allocation_table_size; 0: the compiler's 10). At
+    # 16 rows the KDA layers' overlays are larger than IMEM. With 2 records
+    # the overlay handler skips the back-edge prefetch of the first MLA
+    # overlay, so on KDA layers it prefetches the experts overlay while the
+    # post-join code runs instead of loading it on demand. Only the prelude's
+    # overlay handler changes; the program's code is the same.
+    decode_b16_overlay_table: int = 0
     # MLA DSpark drafts with more than two heads a rank (Kimi-K3.1's): hold
     # o_proj whole in VMEM at up to 8 rows and down_proj at up to 16 (attention
     # DP1) instead of streaming them one 896-column chunk at a time.
