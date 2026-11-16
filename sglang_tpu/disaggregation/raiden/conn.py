@@ -522,13 +522,15 @@ class RaidenKVManager(
     def _staging_allocator(self) -> Any:
         return getattr(self, "_token_allocator", None)
 
-    def _alloc_reshard_staging(self, n_pages: int, n_swa_pages: int):
+    def _alloc_reshard_staging(self, n_pages: int, n_swa_pages: int) -> ReshardStaging:
         """Allocate ``n_pages`` full (and ``n_swa_pages`` SWA) staging pages."""
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
-        def page_ids(token_indices) -> List[int]:
+        def page_ids(token_indices) -> Tuple[int, ...]:
             # Whole-page allocations: every page_size-th token names one page.
-            return [int(p) for p in (token_indices[::page_size] // page_size).tolist()]
+            return tuple(
+                int(p) for p in (token_indices[::page_size] // page_size).tolist()
+            )
 
         def no_pages(n: int, what: str) -> RuntimeError:
             pool = f"{what} " if what else ""
@@ -556,7 +558,7 @@ class RaidenKVManager(
             if full is None:
                 raise no_pages(n_pages, "full-attention")
             frees = [(full_alloc, full)]
-            swa_pages: List[int] = []
+            swa_pages: Tuple[int, ...] = ()
             if n_swa_pages:
                 swa = swa_alloc.alloc(n_swa_pages * page_size)
                 if swa is None:
@@ -565,7 +567,7 @@ class RaidenKVManager(
                 frees.append((swa_alloc, swa))
                 swa_pages = page_ids(swa)
             return ReshardStaging(
-                pages=page_ids(full), swa_pages=swa_pages, frees=frees
+                pages=page_ids(full), swa_pages=swa_pages, frees=tuple(frees)
             )
         indices = allocator.alloc(n_pages * page_size)
         if indices is None:
@@ -573,7 +575,7 @@ class RaidenKVManager(
         full = indices
         if hasattr(allocator, "translate_kv_indices_for_transfer"):
             full = allocator.translate_kv_indices_for_transfer(indices)
-        swa_pages = []
+        swa_pages = ()
         if n_swa_pages:
             if not hasattr(allocator, "translate_swa_indices_for_transfer"):
                 allocator.free(indices)
@@ -583,7 +585,7 @@ class RaidenKVManager(
             swa_pages = page_ids(allocator.translate_swa_indices_for_transfer(indices))
             swa_pages = swa_pages[-n_swa_pages:]
         return ReshardStaging(
-            pages=page_ids(full), swa_pages=swa_pages, frees=[(allocator, indices)]
+            pages=page_ids(full), swa_pages=swa_pages, frees=((allocator, indices),)
         )
 
     def _free_reshard_staging(self, room: int) -> None:

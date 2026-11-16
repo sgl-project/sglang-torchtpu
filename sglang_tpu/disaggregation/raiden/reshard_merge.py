@@ -23,7 +23,9 @@ def bucket_pages(
     return list(real_pages) + pad, list(staging_pages) + pad
 
 
-def _slot_pairs(merges: Sequence[Merge], kv_packing: int):
+def _slot_pairs(
+    merges: Sequence[Merge], kv_packing: int
+) -> Tuple[Tuple[Tuple[int, int], Tuple[int, int]], ...]:
     """((stage_pack, stage_lane), (dst_pack, dst_lane)) for every merged slot."""
     pairs = []
     for stage_slot, decode_slot, num_slots in merges:

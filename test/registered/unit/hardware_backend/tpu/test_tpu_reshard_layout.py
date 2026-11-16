@@ -893,7 +893,7 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         self.assertFalse(set(staging.pages) & {3, 4, 5})
         reqs = [ReshardReq.from_frames(frames) for _, frames in mgr.sent]
         self.assertEqual(
-            [list(r.decode_blocks) for r in reqs], [[3, 4, 5], staging.pages]
+            [list(r.decode_blocks) for r in reqs], [[3, 4, 5], list(staging.pages)]
         )
         # The merge runs once.
         torch.manual_seed(2)
@@ -996,7 +996,7 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         self.assertTrue(all(0 < p < 16 for p in staging.pages + staging.swa_pages))
         reqs = [ReshardReq.from_frames(frames) for _, frames in mgr.sent]
         self.assertEqual(
-            [list(r.decode_swa_blocks) for r in reqs], [[6, 7], staging.swa_pages]
+            [list(r.decode_swa_blocks) for r in reqs], [[6, 7], list(staging.swa_pages)]
         )
         torch.manual_seed(3)
         swa_t.copy_(torch.randn(swa_t.shape).to(FP8))

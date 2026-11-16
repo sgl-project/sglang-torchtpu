@@ -6,7 +6,9 @@ manager because they can survive protocol-state cleanup.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Protocol, Set, Tuple
+
+import msgspec
 
 
 @dataclass
@@ -124,10 +126,13 @@ class DecodeState:
     reshard_staging: Dict[int, "ReshardStaging"] = field(default_factory=dict)
 
 
-@dataclass
-class ReshardStaging:
+class _StagingAllocator(Protocol):
+    def free(self, indices: Any, /) -> Any: ...
+
+
+class ReshardStaging(msgspec.Struct, frozen=True):
     """Tracks staging pages and allocator handles allocated for staged resharding."""
 
-    pages: List[int]
-    swa_pages: List[int]
-    frees: List[Tuple[Any, Any]]
+    pages: Tuple[int, ...]
+    swa_pages: Tuple[int, ...]
+    frees: Tuple[Tuple[_StagingAllocator, Any], ...]
