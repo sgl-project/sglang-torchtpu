@@ -294,10 +294,18 @@ def _experts_at(
     presharded, rank: int, layers: int, rank_dir: RankDir, ep: int, split: bool
 ):
     """``rank``'s expert-family read jobs at expert parallelism ``ep``: its own
-    EP8/TP4 shards, or (16, 32) regrouped from its EP8 group's quarters on the
-    same host -- 16: 56 experts, half the intermediate (TP2 within the chip);
-    32: 28 whole experts. Regrouped families come per file, as ``split``."""
+    EP8/TP4 shards (with ``KernelConfig.expert_steal`` those of pre-shard
+    directory ``expert_steal.expert_directory(rank)``, on the same host), or
+    (16, 32) regrouped from its EP8 group's quarters on the same host -- 16:
+    56 experts, half the intermediate (TP2 within the chip); 32: 28 whole
+    experts. Regrouped families come per file, as ``split``."""
     if ep not in (16, 32):
+        if _config().expert_steal:
+            from sglang_tpu.k3_programs.kimi_k3.kernels.expert_steal import (
+                expert_directory,
+            )
+
+            rank_dir = RankDir(presharded, expert_directory(rank), layers)
         return _expert_jobs(rank_dir, split)
     group = 4 * (rank // 4)
     if ep == 32:

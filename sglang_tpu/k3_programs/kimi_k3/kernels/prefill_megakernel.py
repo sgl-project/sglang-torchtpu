@@ -75,6 +75,7 @@ from jax.sharding import PartitionSpec as P
 
 from sglang_tpu.k3_programs.common import pool_alias
 from sglang_tpu.k3_programs.kimi_k3.config import active as _config
+from sglang_tpu.k3_programs.kimi_k3.kernels import expert_steal
 from sglang_tpu.k3_programs.kimi_k3.kernels.helpers import (
     e8m0_scale,
     expert_activation,
@@ -5734,7 +5735,10 @@ def moe_local_routed(hidden_local, length, weights, *, axis_name, gather_tables)
         weights["expert_gus"],
         weights["expert_down"],
         weights["expert_ds"],
-        first_expert=(rank // expert_tp) * local_experts,
+        first_expert=expert_steal.owned_expert_group(
+            rank, expert_tp, _config().expert_steal
+        )
+        * local_experts,
         expert_layer=weights.get("expert_layer"),
     )
     shared = _moe_sp_shared_partial(

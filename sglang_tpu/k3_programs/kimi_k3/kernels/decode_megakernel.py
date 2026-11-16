@@ -20,7 +20,12 @@ from sglang_tpu.k3_programs.common import collectives32, pool_alias
 from sglang_tpu.k3_programs.common.vmem_pool import VmemPool
 from sglang_tpu.k3_programs.kimi_k3 import kernels as kimi
 from sglang_tpu.k3_programs.kimi_k3.config import active as _config
-from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp, dsa_decode, mla_dcp
+from sglang_tpu.k3_programs.kimi_k3.kernels import (
+    dsa_dcp,
+    dsa_decode,
+    expert_steal,
+    mla_dcp,
+)
 from sglang_tpu.k3_programs.kimi_k3.layout import CONV_HEAD_ROWS
 
 _COMMUNICATION_SCRATCH_SPEC_COUNT = 10
@@ -197,6 +202,11 @@ def _project_routing_scores(
     copy.wait()
 
 
+# EP8/TP4 routed experts in the sibling-steal layout (KernelConfig.expert_steal):
+# the router's ownership test uses expert_steal.owned_expert_group.
+EXPERT_STEAL = _config().expert_steal
+
+
 def _route_hidden_states(
     hidden_states,
     routing_projection_vmem,
@@ -270,7 +280,12 @@ def _route_hidden_states(
         )
 
         counts_before_selection = local_route_counts
-        owned_locally = winners // local_expert_count == rank // expert_tensor_parallel
+        owned_locally = (
+            winners // local_expert_count
+            == expert_steal.owned_expert_group(
+                rank, expert_tensor_parallel, EXPERT_STEAL
+            )
+        )
         if live_rows is not None:
             owned_locally &= live_rows
         destination_mask = owned_locally[:, None] & (
@@ -423,7 +438,12 @@ def _route_owned_rows(
         winners = all_winners[:, selection]
         probabilities = all_probabilities[:, selection]
         counts_before_selection = local_route_counts
-        owned_locally = winners // local_expert_count == rank // expert_tensor_parallel
+        owned_locally = (
+            winners // local_expert_count
+            == expert_steal.owned_expert_group(
+                rank, expert_tensor_parallel, EXPERT_STEAL
+            )
+        )
         if live_rows is not None:
             owned_locally &= live_rows
         destination_mask = owned_locally[:, None] & (

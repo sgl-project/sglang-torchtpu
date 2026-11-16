@@ -147,6 +147,13 @@ class KernelConfig:
     # prefill's EP16/TP2 regrouping, run as TP4-shaped half experts), so
     # colocated programs can share EP16 experts with the fused prefill MoE.
     decode_expert_parallel: int = 8
+    # EP8/TP4 routed experts in the sibling-steal layout: the two cores of a
+    # chip hold different expert groups with the same TP4 quarter (kernel rank
+    # r: group 2 * (r // 8) + r % 2, quarter (r % 8) // 2, read from pre-shard
+    # directory 4 * group + quarter; kernels.expert_steal). The decode router,
+    # the rank loader and the EP8 prefill follow it. Numerics: each host's
+    # eight-lane routed sum adds the same lane partials in another order.
+    expert_steal: bool = False
     # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
     # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
     # False: the unfused SparseCore gather/combine.
@@ -171,6 +178,8 @@ class KernelConfig:
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
         if self.decode_expert_parallel not in (8, 16):
             raise ValueError("decode_expert_parallel is 8 or 16")
+        if self.expert_steal and self.decode_expert_parallel != 8:
+            raise ValueError("expert_steal needs decode_expert_parallel=8")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
             raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):

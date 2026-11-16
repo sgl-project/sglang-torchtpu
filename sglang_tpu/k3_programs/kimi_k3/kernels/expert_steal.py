@@ -4,7 +4,9 @@
 Under the steal layout the two TensorCores of a chip own different EP8 expert
 groups with the same TP4 quarter: kernel rank ``r`` holds group
 ``2 * (r // 8) + r % 2`` and quarter ``(r % 8) // 2`` (:func:`expert_group`,
-pre-shard directory :func:`expert_directory`). After routing both cores hold
+pre-shard directory :func:`expert_directory`; ``KernelConfig.expert_steal``
+puts the decode router, the rank loader and the EP8 prefill in this layout,
+:func:`owned_expert_group`). After routing both cores hold
 every row's experts, so each computes the same plan (:func:`steal_plan`): the
 core whose group routes more distinct experts gives its
 ``(D_mine - D_sibling) // 2`` highest-id experts (at most ``slots``) to its
@@ -61,6 +63,16 @@ def expert_directory(rank: int) -> int:
     """The pre-shard rank directory (group * 4 + quarter) that holds kernel
     ``rank``'s experts under the steal layout; a permutation within each host."""
     return 4 * expert_group(rank) + expert_quarter(rank)
+
+
+def owned_expert_group(rank, expert_tensor_parallel: int, steal_layout: bool):
+    """The expert group (of ``32 // expert_tensor_parallel``) whose experts
+    kernel ``rank`` holds: ``rank // expert_tensor_parallel``, or at EP8/TP4
+    in the steal layout (``KernelConfig.expert_steal``) :func:`expert_group`.
+    The decode router's ownership test and the EP8 prefill's expert offset."""
+    if steal_layout and expert_tensor_parallel == 4:
+        return expert_group(rank)
+    return rank // expert_tensor_parallel
 
 
 def used_experts(winners, live_rows, group, local_expert_count):
