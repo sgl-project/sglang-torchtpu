@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# SANA-WM camera-controlled image-to-video on one TensorCore, every component
+# resident: chunk-causal streaming stage 1 and the chunked LTX-2 refiner.
+#   ./sana_wm.sh
+set -euo pipefail
+export MODEL="${MODEL:-Efficient-Large-Model/SANA-WM_streaming}"
+export NUM_GPUS="${NUM_GPUS:-1}"
+export PARALLEL_ARGS="${PARALLEL_ARGS-}"
+export MODEL_ARGS="${MODEL_ARGS---streaming --refiner-chunked --regional-compile --dit-cpu-offload false --dit-layerwise-offload false --warmup-mode request}"
+exec bash "$(dirname "$0")/launch.sh" "$@"

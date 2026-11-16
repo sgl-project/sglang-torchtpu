@@ -2903,9 +2903,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if save_kv_cache:
             kv_cache[_SLOT_K] = state_kv.detach().clone()
             kv_cache[_SLOT_V] = state_z.detach().clone()
-            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor(
-                [_CACHE_TYPE_STATE], device=x.device
-            )
+            # A host tensor: the chunk accumulator reads it once per block.
+            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor([_CACHE_TYPE_STATE])
 
         out = out.permute(0, 3, 1, 2).reshape(B, N, C)
         return out, beta, decay
@@ -2953,9 +2952,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if save_kv_cache:
             kv_cache[_SLOT_K] = k_in.detach().clone()
             kv_cache[_SLOT_V] = v_in.detach().clone()
-            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor(
-                [_CACHE_TYPE_CONCAT], device=x.device
-            )
+            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor([_CACHE_TYPE_CONCAT])
         if cached_k is not None:
             k_in = torch.cat([cached_k.to(k_in.dtype), k_in], dim=1)
             v_in = torch.cat([cached_v.to(v_in.dtype), v_in], dim=1)

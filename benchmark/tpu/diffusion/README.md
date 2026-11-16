@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `sana_wm.sh` | `Efficient-Large-Model/SANA-WM_streaming` | 1 | None |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +39,8 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| SANA-WM_streaming | TI2V 1280x704, 49 frames (2 chunks of 4 steps), chunked refiner | 1 | 9.6 s | — | — | 87.9 GB |
+| SANA-WM_streaming | TI2V 1280x704, 321 frames (13 chunks), camera actions, chunked refiner | 1 | 91.4 s | — | — | 92.5 GB |
 
 
 ## Example requests
@@ -61,6 +64,17 @@ LTX-2 (`ltx2.sh`):
 curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
   "prompt": "A fluffy golden dog sits centered in frame against a soft pastel background, looking into the camera",
   "size": "1280x720", "num_frames": 121, "num_inference_steps": 40, "guidance_scale": 4.0, "seed": 42
+}'
+```
+
+SANA-WM (`sana_wm.sh`): `input_reference` is the first frame and `diffusers_kwargs.action` the camera path, which
+also sets the frame count (`"w-48"` walks forward for 48 frames, 49 with the first).
+
+```bash
+curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
+  "prompt": "A cozy street cafe on a cobblestone lane at dusk, people stroll past the tables",
+  "input_reference": "/path/to/first_frame.png", "size": "1280x704", "num_frames": 49, "fps": 16, "seed": 42,
+  "diffusers_kwargs": {"action": "w-48"}
 }'
 ```
 

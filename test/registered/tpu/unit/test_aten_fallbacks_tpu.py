@@ -38,6 +38,17 @@ class TestAtenFallbacksTpu(CustomTestCase):
         got = torch.logaddexp(a.to("tpu"), b.to("tpu")).cpu()
         torch.testing.assert_close(got, torch.logaddexp(a, b), rtol=1e-5, atol=1e-5)
 
+    def test_linalg_cross(self):
+        gen = torch.Generator().manual_seed(0)
+        a = torch.randn(2, 5, 3, generator=gen)
+        b = torch.randn(1, 5, 3, generator=gen)
+        cases = ((-1, a, b), (0, a.movedim(-1, 0), b.movedim(-1, 0)))
+        for dim, x, y in cases:
+            with self.subTest(dim=dim):
+                got = torch.cross(x.to("tpu"), y.to("tpu"), dim=dim).cpu()
+                want = torch.linalg.cross(x, y, dim=dim)
+                torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -460,6 +460,8 @@ class RefinerChunkRunner:
         self.prompt_attention_mask = prompt_attention_mask
         self.fps = float(fps)
         self.sigmas = sigmas
+        # Host copies for the per-block Euler arithmetic, read once.
+        self.sigma_values = sigmas.tolist()
         self.source_sink_frames = int(source_sink_frames)
         self.block_size = int(block_size)
         self.kv_max_frames = int(kv_max_frames)
@@ -555,7 +557,7 @@ class RefinerChunkRunner:
                     "history_v": history[1] if history is not None else None,
                 }
             )
-        sigma0 = float(self.sigmas[0].item())
+        sigma0 = self.sigma_values[0]
         eps = torch.randn(
             clean_block.shape,
             generator=self.generator,
@@ -566,9 +568,9 @@ class RefinerChunkRunner:
             self.dtype
         )
         active_positions = list(range(int(block_start), int(block_end)))
-        for level in range(int(self.sigmas.numel()) - 1):
-            sigma_cur = float(self.sigmas[level].item())
-            sigma_next = float(self.sigmas[level + 1].item())
+        for level in range(len(self.sigma_values) - 1):
+            sigma_cur = self.sigma_values[level]
+            sigma_next = self.sigma_values[level + 1]
             pred_x0 = refiner._predict_x0_active_block(
                 active=x_t,
                 active_positions=active_positions,
