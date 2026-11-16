@@ -79,6 +79,9 @@
     "gemma4-26b-a4b": {
       "name": "Gemma 4 26B-A4B"
     },
+    "glm-5.2": {
+      "name": "GLM-5.2"
+    },
     "glm-5.3-flash": {
       "name": "GLM-5.3-Flash"
     },

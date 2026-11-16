@@ -16,6 +16,69 @@ pip install --no-deps -e .        # this plugin (dist "sglang-tpu")
 `--no-deps` keeps pip from re-resolving the fork's dependency tree; the editable
 fork already satisfies the plugin's `sglang` requirement.
 
+## FP8 weight loading policies
+
+`--quantization fp8` keeps its existing behavior unless a TPU loading policy is
+explicitly selected. A BF16 checkpoint without quantization metadata retains
+online per-channel dense and per-expert-scalar MoE weight quantization. A block-FP8
+checkpoint retains the existing `--tpu-fp8-runtime channelwise|blockwise` conversion
+policy. `activation_scheme: dynamic` always describes runtime activation scales;
+it does not mean that weights are quantized on every forward.
+
+To quantize **unquantized** MoE weights per expert/output channel at load time,
+provide this `quantization_config` through the model config or
+`--json-model-override-args`:
+
+```json
+{
+  "quantization_config": {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "is_checkpoint_fp8_serialized": false,
+    "tpu_moe_weight_quantization": "channelwise"
+  }
+}
+```
+
+The explicit source declaration prevents serialized FP8 bytes from being
+treated as high-precision weights. Dense weights use the existing online FP8
+method. Routed MoE weights are quantized once with independent output-channel
+scales. Each rank computes scales over its local K shard; weights quantized
+offline over a larger K extent can have different bytes/scales.
+
+To directly load the GLM-5.2 offline channelwise checkpoint ABI, use:
+
+```json
+{
+  "quantization_config": {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "weight_block_size": null,
+    "tpu_checkpoint_layout": "glm52_channelwise_fp8"
+  }
+}
+```
+
+This ABI stores FP8 weights and rank-one output-channel `weight_scale_inv`
+vectors. Despite the name, these scales are **multiplicative dequantization
+scales**, not reciprocals or block scales. It requires the default loader
+(`auto`, `pt` or `safetensors`) and direct target-device construction without
+CPU offload. Preserve the checkpoint's `ignored_layers`/`modules_to_not_convert`
+when overriding metadata.
+
+Both channelwise sources share the runtime MoE weight/scale layout, activation
+quantization and backend selection. `--moe-runner-backend` selects the existing
+execution backend independently of the source checkpoint. The loader does not
+select a new kernel or change GMM accumulation precision.
+
+GLM target and native NextN draft architectures accept the offline ABI. Draft
+loading maps checkpoint-layer exclusions with the same mapping as the model's
+weight loader. Keep `--speculative-algorithm NEXTN` enabled in an MTP recipe;
+DP attention additionally requires `--enable-dp-lm-head`. Long-context capacity
+and performance depend on the complete target/draft recipe and require their
+own E2E validation.
+
 ## Two platform identities, one code base
 
 | Mode | Select with | Platform class | `is_out_of_tree()` | Status |

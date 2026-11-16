@@ -12,6 +12,7 @@ native torch here without touching the generic FP8 quantization method.
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -24,6 +25,8 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import print_warning_once
 from sglang_tpu.envs import envs
+
+logger = logging.getLogger(__name__)
 
 
 def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
@@ -60,11 +63,8 @@ def _quantize_moe_weight_channelwise(
     weight: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # ``weight`` is the float32 dequant of a block-FP8 weight (expanded from fp8
-    # so a fresh per-output-channel scale can be computed; see the caller), and
-    # ``out_dtype`` is the fp8 dtype to requantize it back to. The two differ on
-    # purpose: the input is the high-precision intermediate, the output is fp8
-    # storage.
+    # Both block-FP8 conversion and online quantization provide float32 [E,N,K]
+    # weights. Reduce K, retaining an independent scale for each expert/channel.
     dtype = out_dtype
     dtype_max = torch.finfo(dtype).max
     weight_scale = torch.clamp(
@@ -77,6 +77,39 @@ def _quantize_moe_weight_channelwise(
         max=dtype_max,
     ).to(dtype)
     return weight_q, weight_scale.squeeze(-1)
+
+
+def quantize_tpu_moe_weights_channelwise(layer: torch.nn.Module) -> None:
+    """Quantize unquantized expert weights once, with bounded host scratch.
+
+    As in the legacy online per-tensor fallback, each expert is quantized on
+    the host. Keep float32 intermediates off the nearly-full TPU and drain each
+    transfer before reusing its host scratch. No quantization runs at inference.
+    The amax covers the rank's full local K; an offline checkpoint quantized
+    before K sharding can therefore have different bytes/scales.
+    """
+    for stem in ("w13", "w2"):
+        weight = getattr(layer, f"{stem}_weight")
+        if weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise ValueError("Online channelwise MoE requires unquantized weights")
+
+    for stem in ("w13", "w2"):
+        name = f"{stem}_weight"
+        old = getattr(layer, name).data
+        quantized = torch.empty_like(old, dtype=torch.float8_e4m3fn)
+        scales = torch.empty(old.shape[:2], dtype=torch.float32, device="cpu")
+        for expert in range(old.shape[0]):
+            source = old[expert : expert + 1].detach().cpu().float()
+            qweight, scale = _quantize_moe_weight_channelwise(
+                source, torch.float8_e4m3fn
+            )
+            quantized[expert : expert + 1].copy_(qweight.to(old.device))
+            scales[expert].copy_(scale[0])
+            if old.device.type != "cpu":
+                torch.accelerator.synchronize()
+        copy_or_rebind_param(layer, name, quantized)
+        _free_replaced_storage(old, getattr(layer, name).data)
+        copy_or_rebind_param(layer, f"{stem}_weight_scale", scales.to(old.device))
 
 
 def _requantize_tpu_fp8_moe_block_to_channelwise(
@@ -527,6 +560,43 @@ def prepare_tpu_fp8_moe_weights(
     # expert-chunk (bounding the float32 dequant transient), and the loader
     # drains once more via _drain_device_transients_after_module_load() right
     # after this layer's process_weights_after_loading returns.
+
+
+def prepare_tpu_fp8_moe(
+    layer: torch.nn.Module,
+    *,
+    block_quant: bool,
+    weight_block_size: list[int] | tuple[int, int] | None,
+    use_mxfp8: bool,
+    is_fp4_expert: bool,
+) -> bool:
+    """Shared post-load formatting and backend selection for all FP8 sources."""
+    from sglang.srt.layers.moe import get_moe_runner_backend
+
+    prepare_tpu_fp8_moe_weights(
+        layer,
+        block_quant=block_quant,
+        weight_block_size=weight_block_size,
+        use_mxfp8=use_mxfp8,
+        is_fp4_expert=is_fp4_expert,
+    )
+    backend = get_moe_runner_backend()
+    if not (backend.is_auto() or backend.is_pallas_tpu_fused_rs()):
+        return False
+    from sglang_tpu.fp8_moe_fused_rs import prepare_fp8_fused_rs
+
+    handles_reduction = prepare_fp8_fused_rs(layer)
+    if handles_reduction and get_parallel().tp_rank == 0:
+        logger.info_once("Using TPU Pallas FP8 fused-RS MoE backend")
+    if backend.is_pallas_tpu_fused_rs() and not handles_reduction:
+        reason = getattr(
+            layer, "_tpu_fused_rs_unsupported_reason", "unknown incompatibility"
+        )
+        raise ValueError(
+            "--moe-runner-backend pallas_tpu_fused_rs is not supported by "
+            f"this model or parallel layout: {reason}"
+        )
+    return handles_reduction
 
 
 def apply_tpu_fp8_moe(
