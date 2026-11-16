@@ -639,6 +639,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     # model outputs during TPU precompile is enough to execute the graph.
     requires_kv_sync_after_compile = False
 
+    # Head dim whose q/k are Hadamard-rotated for the fp8 KV cache (set in
+    # __init__); None, the default for test stubs that skip __init__, rotates
+    # nothing.
+    _fp8_k_hadamard_dim: int | None = None
+
     def __init__(
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
     ) -> None:
