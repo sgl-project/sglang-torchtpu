@@ -10,5 +10,5 @@ export PYTHONPATH="$PWD/python:$PWD"
 export GLM52_RUNTIME_DIR="$OUT/actual-process-runtime"
 export PYTHONPATH="$PWD/benchmark/tpu/glm52_baseline/runtime_probe:$PYTHONPATH"
 "$PY" -u test/registered/kernels/ops/moe/test_glm_ep_moe_v2.py \
-  > "$OUT/device-tests.log" 2>&1
+  2>&1 | tee "$OUT/device-tests.log"
 echo MOE_KERNEL_PASS
