@@ -50,7 +50,7 @@ def _metadata(**overrides):
         "activation_scheme": "dynamic",
         "fmt": "e4m3",
         "weight_block_size": None,
-        "tpu_checkpoint_layout": "glm52_channelwise_fp8",
+        "weight_scale_granularity": "channel",
         "hf_config": SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"]),
         **overrides,
     }
@@ -63,7 +63,7 @@ def _config(**overrides):
 
 def _block_config(**overrides):
     return TpuFp8Config.from_config(
-        _metadata(tpu_checkpoint_layout=None, weight_block_size=[2, 2], **overrides)
+        _metadata(weight_scale_granularity=None, weight_block_size=[2, 2], **overrides)
     )
 
 
@@ -153,16 +153,11 @@ class TestGlm52Fp8OptIn(CustomTestCase):
         cases = (
             (None, TpuFp8Config, False),
             (
-                _metadata(tpu_checkpoint_layout=None, weight_block_size=[128, 128]),
+                _metadata(weight_scale_granularity=None, weight_block_size=[128, 128]),
                 Fp8Config,
                 True,
             ),
             (_metadata(), TpuChannelwiseFp8Config, True),
-            (
-                _metadata(tpu_checkpoint_layout="channelwise_fp8"),
-                TpuChannelwiseFp8Config,
-                True,
-            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             for metadata, expected_type, serialized in cases:
@@ -204,8 +199,10 @@ class TestGlm52Fp8OptIn(CustomTestCase):
             ),
         ):
             for block_size in (None, [128, 128]):
-                for layout in ({}, {"tpu_checkpoint_layout": None}):
-                    with self.subTest(block_size=block_size, layout=layout):
+                for scale_metadata in ({}, {"weight_scale_granularity": None}):
+                    with self.subTest(
+                        block_size=block_size, scale_metadata=scale_metadata
+                    ):
                         metadata = {
                             "quant_method": "fp8",
                             "activation_scheme": "dynamic",
@@ -213,7 +210,7 @@ class TestGlm52Fp8OptIn(CustomTestCase):
                             "hf_config": SimpleNamespace(
                                 architectures=["Glm4MoeForCausalLM"]
                             ),
-                            **layout,
+                            **scale_metadata,
                         }
                         config = TpuFp8Config.from_config(metadata)
                         self.assertIs(type(config), Fp8Config)
@@ -226,19 +223,22 @@ class TestGlm52Fp8OptIn(CustomTestCase):
                         self.assertIs(type(config), Fp8Config)
                         self.assertTrue(config.is_checkpoint_fp8_serialized)
 
-    def test_explicit_layout_rejects_incompatible_checkpoint_metadata(self):
+    def test_channel_scales_reject_incompatible_quantization_metadata(self):
         cases = (
-            ({"tpu_checkpoint_layout": "channelwise"}, "Unknown TPU FP8"),
-            ({"hf_config": None}, "requires GlmMoeDsaForCausalLM"),
             (
-                {"hf_config": SimpleNamespace(architectures=["Glm4MoeForCausalLM"])},
-                "requires GlmMoeDsaForCausalLM",
+                {"weight_scale_granularity": "unknown"},
+                "Unsupported FP8 weight scale granularity",
             ),
-            ({"quant_method": "mxfp8"}, "requires serialized fp8"),
-            ({"activation_scheme": "static"}, "requires serialized fp8"),
-            ({"fmt": "e5m2"}, "requires serialized fp8"),
-            ({"weight_block_size": [128, 128]}, "requires serialized fp8"),
-            ({"scale_fmt": "ue8m0"}, "requires serialized fp8"),
+            (
+                {"weight_scale_granularity": True},
+                "Unsupported FP8 weight scale granularity",
+            ),
+            ({"is_checkpoint_fp8_serialized": False}, "require serialized FP8"),
+            ({"quant_method": "mxfp8"}, "require serialized fp8"),
+            ({"activation_scheme": "static"}, "require serialized fp8"),
+            ({"fmt": "e5m2"}, "require serialized fp8"),
+            ({"weight_block_size": [128, 128]}, "require serialized fp8"),
+            ({"scale_fmt": "ue8m0"}, "require serialized fp8"),
         )
         for overrides, message in cases:
             with self.subTest(overrides=overrides):
@@ -628,7 +628,7 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
             get_flags().moe.override(runner_backend=MoeRunnerBackend.PALLAS_TPU)
         )
 
-    def test_generic_channelwise_abi_matches_legacy_without_model_whitelist(self):
+    def test_channel_scale_loading_is_independent_of_model_architecture(self):
         fixture = _expert_fixture()
         for hf_config in (
             None,
@@ -638,27 +638,21 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
                 self.subTest(hf_config=hf_config),
                 get_context().override_server_args(moe_runner_backend="pallas_tpu"),
             ):
-                legacy = _moe(_config())
-                generic_config = _config(
-                    tpu_checkpoint_layout="channelwise_fp8", hf_config=hf_config
-                )
-                self.assertEqual(
-                    generic_config.tpu_checkpoint_layout, "channelwise_fp8"
-                )
-                generic = _moe(generic_config)
-                for layer in (legacy, generic):
-                    _load_expert_fixture(layer, fixture, blockwise=False)
-                    layer.quant_method.process_weights_after_loading(layer)
-                for stem in fixture:
-                    left, right = (
-                        getattr(layer, f"{stem}_weight") for layer in (legacy, generic)
-                    )
+                config = _config(hf_config=hf_config)
+                self.assertEqual(config.weight_scale_granularity, "channel")
+                layer = _moe(config)
+                _load_expert_fixture(layer, fixture, blockwise=False)
+                layer.quant_method.process_weights_after_loading(layer)
+                for stem, (_, _, q, scales) in fixture.items():
                     self.assertTrue(
-                        torch.equal(left.view(torch.uint8), right.view(torch.uint8))
+                        torch.equal(
+                            getattr(layer, f"{stem}_weight").view(torch.uint8),
+                            q.transpose(1, 2).contiguous().view(torch.uint8),
+                        )
                     )
                     torch.testing.assert_close(
-                        getattr(legacy, f"{stem}_weight_scale"),
-                        getattr(generic, f"{stem}_weight_scale"),
+                        getattr(layer, f"{stem}_weight_scale").float().reshape(2, -1),
+                        scales.to(torch.bfloat16).float(),
                         rtol=0,
                         atol=0,
                     )
@@ -711,79 +705,72 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
             q_lora_rank=None,
         )
         fixture = _expert_fixture()
-        for layout in ("channelwise_fp8", "glm52_channelwise_fp8"):
-            with (
-                self.subTest(layout=layout),
-                get_context().override_server_args(moe_runner_backend="pallas_tpu"),
-            ):
-                config = _config(
-                    tpu_checkpoint_layout=layout,
-                    hf_config=hf_config,
-                    ignored_layers=["model.layers.3.self_attn.o_proj"],
-                )
-                skipped = ReplicatedLinear.__new__(ReplicatedLinear)
-                torch.nn.Module.__init__(skipped)
-                self.assertIsInstance(
-                    config.get_quant_method(skipped, "model.decoder.self_attn.o_proj"),
-                    UnquantizedLinearMethod,
-                )
-                experts = _moe(config)
-                model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
-                torch.nn.Module.__init__(model)
-                model.config = hf_config
-                model.quant_config = config
-                model.num_fused_shared_experts = 0
-                model.pp_group = SimpleNamespace(is_last_rank=True)
-                model.model = torch.nn.Module()
-                model.model.decoder = torch.nn.Module()
-                model.model.decoder.self_attn = torch.nn.Module()
-                model.model.decoder.mlp = torch.nn.Module()
-                model.model.decoder.mlp.experts = experts
-                model.model.eh_proj = torch.nn.Linear(
-                    8, 4, bias=False, dtype=torch.bfloat16
-                )
-                weights = [("model.layers.3.eh_proj.weight", torch.full((4, 8), 0.5))]
-                for stem, (_, _, q, scales) in fixture.items():
-                    for expert in range(2):
-                        projections = (
-                            (("gate_proj", slice(0, 4)), ("up_proj", slice(4, 8)))
-                            if stem == "w13"
-                            else (("down_proj", slice(None)),)
+        with get_context().override_server_args(moe_runner_backend="pallas_tpu"):
+            config = _config(
+                hf_config=hf_config,
+                ignored_layers=["model.layers.3.self_attn.o_proj"],
+            )
+            skipped = ReplicatedLinear.__new__(ReplicatedLinear)
+            torch.nn.Module.__init__(skipped)
+            self.assertIsInstance(
+                config.get_quant_method(skipped, "model.decoder.self_attn.o_proj"),
+                UnquantizedLinearMethod,
+            )
+            experts = _moe(config)
+            model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+            torch.nn.Module.__init__(model)
+            model.config = hf_config
+            model.quant_config = config
+            model.num_fused_shared_experts = 0
+            model.pp_group = SimpleNamespace(is_last_rank=True)
+            model.model = torch.nn.Module()
+            model.model.decoder = torch.nn.Module()
+            model.model.decoder.self_attn = torch.nn.Module()
+            model.model.decoder.mlp = torch.nn.Module()
+            model.model.decoder.mlp.experts = experts
+            model.model.eh_proj = torch.nn.Linear(
+                8, 4, bias=False, dtype=torch.bfloat16
+            )
+            weights = [("model.layers.3.eh_proj.weight", torch.full((4, 8), 0.5))]
+            for stem, (_, _, q, scales) in fixture.items():
+                for expert in range(2):
+                    projections = (
+                        (("gate_proj", slice(0, 4)), ("up_proj", slice(4, 8)))
+                        if stem == "w13"
+                        else (("down_proj", slice(None)),)
+                    )
+                    for projection, rows in projections:
+                        prefix = f"model.layers.3.mlp.experts.{expert}.{projection}."
+                        weights.append((prefix + "weight", q[expert, rows]))
+                        weights.append(
+                            (prefix + "weight_scale_inv", scales[expert, rows])
                         )
-                        for projection, rows in projections:
-                            prefix = (
-                                f"model.layers.3.mlp.experts.{expert}.{projection}."
-                            )
-                            weights.append((prefix + "weight", q[expert, rows]))
-                            weights.append(
-                                (prefix + "weight_scale_inv", scales[expert, rows])
-                            )
-                weights.insert(
-                    0,
-                    (
-                        "model.layers.2.mlp.experts.0.gate_proj.weight",
-                        torch.zeros(4, 4),
-                    ),
+            weights.insert(
+                0,
+                (
+                    "model.layers.2.mlp.experts.0.gate_proj.weight",
+                    torch.zeros(4, 4),
+                ),
+            )
+            model.load_weights(iter(weights))
+            torch.testing.assert_close(
+                model.model.eh_proj.weight,
+                torch.full((4, 8), 0.5, dtype=torch.bfloat16),
+            )
+            experts.quant_method.process_weights_after_loading(experts)
+            for stem, (_, _, q, scales) in fixture.items():
+                self.assertTrue(
+                    torch.equal(
+                        getattr(experts, f"{stem}_weight").view(torch.uint8),
+                        q.transpose(1, 2).contiguous().view(torch.uint8),
+                    )
                 )
-                model.load_weights(iter(weights))
                 torch.testing.assert_close(
-                    model.model.eh_proj.weight,
-                    torch.full((4, 8), 0.5, dtype=torch.bfloat16),
+                    getattr(experts, f"{stem}_weight_scale").float().reshape(2, -1),
+                    scales.to(torch.bfloat16).float(),
+                    rtol=0,
+                    atol=0,
                 )
-                experts.quant_method.process_weights_after_loading(experts)
-                for stem, (_, _, q, scales) in fixture.items():
-                    self.assertTrue(
-                        torch.equal(
-                            getattr(experts, f"{stem}_weight").view(torch.uint8),
-                            q.transpose(1, 2).contiguous().view(torch.uint8),
-                        )
-                    )
-                    torch.testing.assert_close(
-                        getattr(experts, f"{stem}_weight_scale").float().reshape(2, -1),
-                        scales.to(torch.bfloat16).float(),
-                        rtol=0,
-                        atol=0,
-                    )
 
 
 if __name__ == "__main__":

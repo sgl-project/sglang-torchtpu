@@ -73,7 +73,7 @@ class TestTpuChannelwiseFp8Loading(CustomTestCase):
                 if blockwise:
                     metadata["weight_block_size"] = [128, 128]
                 else:
-                    metadata["tpu_checkpoint_layout"] = "channelwise_fp8"
+                    metadata["weight_scale_granularity"] = "channel"
                 config = TpuFp8Config.from_config(metadata)
                 layer = FusedMoE.__new__(FusedMoE)
                 torch.nn.Module.__init__(layer)

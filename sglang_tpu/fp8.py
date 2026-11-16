@@ -1,40 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TPU FP8 config selection and offline channelwise checkpoint loading.
+"""TPU FP8 configuration and checkpoint loading.
 
-The existing block-FP8 paths keep their checkpoint metadata unchanged:
+Inherit the existing FP8 configuration and execution methods. The additional
+checkpoint property ``weight_scale_granularity="channel"`` declares one
+multiplicative scale per output channel: dense [N] and MoE [E,N], stored under
+weight_scale_inv. It changes parameter allocation/loading, not activation
+quantization or backend selection. Without the property, upstream FP8 parsing
+and the existing block-FP8 runtime selection are unchanged.
 
-* Existing defaults: ``--quantization fp8``.
-* Explicit conversion of the SAME block-FP8 checkpoint:
-  ``--quantization fp8 --tpu-fp8-runtime channelwise``.
-  The current runtime default is already channelwise, so these are equivalent.
-
-The offline channelwise checkpoint instead uses ``--quantization fp8`` with
-``--load-format safetensors`` and this explicit HF model override:
-
-.. code-block:: json
-
-    {"quantization_config": {
-        "quant_method": "fp8",
-        "activation_scheme": "dynamic",
-        "fmt": "e4m3",
-        "weight_block_size": null,
-        "tpu_checkpoint_layout": "channelwise_fp8"
-    }}
-
-Pass the JSON with ``--json-model-override-args``. It replaces the whole quant
-config: preserve the checkpoint's ignored_layers/modules_to_not_convert.
-Null weight_block_size alone never selects this ABI. The checkpoint's
-weight_scale_inv is a MULTIPLICATIVE channel dequantization coefficient,
-not a reciprocal or a block scale. Already quantized bytes are loaded directly.
-The legacy glm52_channelwise_fp8 layout name remains accepted for GLM checkpoints.
-The ABI selector describes the weight format; it does not certify model serving.
-
-Kernel/backend selection and dynamic activation quantization remain independent
-of checkpoint source. Native NEXTN uses the same checkpoint; a 5-step chain uses
-``--speculative-algorithm NEXTN --speculative-num-steps 5`` plus
-``--speculative-eagle-topk 1 --speculative-num-draft-tokens 6``. DP attention
-also requires ``--enable-dp-lm-head``. Full-model MTP serving needs separate
-E2E validation; component loading tests do not establish it.
+Channel-scale checkpoints require serialized e4m3fn weights, dynamic
+activations, no weight blocks, and direct target-device construction with the
+default loader. GLM NextN exclusion remapping is a model-loading adaptation;
+it does not select a checkpoint format or a kernel.
 """
 
 from __future__ import annotations
@@ -50,29 +27,21 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
-CHANNELWISE_CHECKPOINT_LAYOUT = "channelwise_fp8"
-_LEGACY_GLM52_LAYOUT = "glm52_channelwise_fp8"
-
 
 class TpuFp8Config(Fp8Config):
-    """Select the offline channelwise ABI only through its explicit layout key.
-
-    Both block-FP8 runtime choices and metadata-free BF16 online quantization
-    retain the upstream config. The existing --tpu-fp8-runtime flag selects
-    block-to-channel conversion independently of the checkpoint factory.
-    """
+    """Select channel-scale loading from quantization metadata, not model names."""
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> Fp8Config:
-        layout = config.get("tpu_checkpoint_layout")
-        if layout is None:
+        granularity = config.get("weight_scale_granularity")
+        if granularity is None:
             return Fp8Config.from_config(config)
-        if layout not in (CHANNELWISE_CHECKPOINT_LAYOUT, _LEGACY_GLM52_LAYOUT):
-            raise ValueError(f"Unknown TPU FP8 checkpoint layout: {layout!r}")
-        if config.get("is_checkpoint_fp8_serialized") is False:
+        if granularity != "channel":
             raise ValueError(
-                "Channelwise checkpoint layout requires serialized FP8 weights"
+                f"Unsupported FP8 weight scale granularity: {granularity!r}"
             )
+        if config.get("is_checkpoint_fp8_serialized") is False:
+            raise ValueError("Channelwise weight scales require serialized FP8 weights")
         return TpuChannelwiseFp8Config.from_fp8_config(config)
 
 
@@ -103,18 +72,6 @@ class TpuChannelwiseFp8Config(Fp8Config):
     @classmethod
     def from_fp8_config(cls, config: dict[str, Any]) -> TpuChannelwiseFp8Config:
         hf_config = config.get("hf_config")
-        architectures = getattr(hf_config, "architectures", None) or []
-        # The generic format has no architecture whitelist. Keep the old,
-        # GLM-named selector's validation for existing checkpoint metadata.
-        layout = config["tpu_checkpoint_layout"]
-        if layout == _LEGACY_GLM52_LAYOUT and not any(
-            arch in ("GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN")
-            for arch in architectures
-        ):
-            raise ValueError(
-                f"{layout} requires GlmMoeDsaForCausalLM or its NextN draft; "
-                f"got {architectures!r}"
-            )
         if (
             config.get("quant_method") != "fp8"
             or config.get("activation_scheme") != "dynamic"
@@ -123,21 +80,21 @@ class TpuChannelwiseFp8Config(Fp8Config):
             or config.get("scale_fmt") is not None
         ):
             raise ValueError(
-                f"{layout} requires serialized fp8, dynamic activations, "
+                "Channelwise weight scales require serialized fp8, dynamic activations, "
                 "fmt=e4m3, null weight_block_size and no scale_fmt"
             )
         from sglang.srt.runtime_context import get_exec, get_model
 
         if get_model().load_format not in ("auto", "pt", "safetensors"):
             raise ValueError(
-                f"{layout} requires the default checkpoint loader "
+                "Channelwise weight scales require the default checkpoint loader "
                 "(auto, pt or safetensors); npcache cannot serialize FP8 dtypes"
             )
         if get_exec().offload.cpu_offload_gb:
-            raise ValueError(f"{layout} does not support CPU offloading")
+            raise ValueError("Channelwise FP8 loading does not support CPU offloading")
         # Reuse upstream parsing/normalization without changing the input metadata.
         result = Fp8Config.from_config.__func__(cls, config)
-        result.tpu_checkpoint_layout = layout
+        result.weight_scale_granularity = config["weight_scale_granularity"]
         _remap_glm_nextn_ignored_layers(result, hf_config)
         return result
 
