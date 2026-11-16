@@ -542,6 +542,7 @@ class HostEngramCoordinator:
         layout_mod: Any = None,
         sync_fn: Any = None,
     ):
+        self._hasher = hasher
         self.ngram = hasher.max_ngram_size
         self.tables = {
             name: np.asarray(getattr(hasher, name).detach().cpu(), dtype=np.int64)
@@ -562,11 +563,14 @@ class HostEngramCoordinator:
         self.started = False
         # This step's windows while the previous step's sampled token is in flight.
         self.deferred: DeferredEngramInputs | None = None
+        self._step_inputs: HostEngramInputs | None = None
+        self._history_commit: list[tuple[int, int]] = []
         # Double-buffered upload slots per (layer_index, padded_tokens) bucket.
         self._uploads_by_layer: dict[int, dict[int, list[PreparedEngramUpload]]] = {
             layer_index: {} for layer_index, _ in self.embeddings
         }
         self._active_uploads: dict[int, PreparedEngramUpload] = {}
+        self._last_bucket_upload: dict[tuple[int, int], PreparedEngramUpload] = {}
         self._staged_uploads: dict[int, PreparedEngramUpload] = {}
         self._staged_padded_tokens: int | None = None
         self._next_prompt_spec: tuple[tuple[Any, ...], list[int], list[int]] | None = (
@@ -596,10 +600,6 @@ class HostEngramCoordinator:
         self, layer_index: int, padded_tokens: int
     ) -> PreparedEngramUpload:
         by_tokens = self._uploads_by_layer[layer_index]
-        for tokens, slots in by_tokens.items():
-            if tokens != padded_tokens:
-                for slot in slots:
-                    slot.release_consumers()
         slots = by_tokens.get(padded_tokens)
         if slots is None:
             embedding = self.by_layer[layer_index]
@@ -616,8 +616,8 @@ class HostEngramCoordinator:
                 for _ in range(2)
             ]
             by_tokens[padded_tokens] = slots
-        active = self._active_uploads.get(layer_index)
-        return next(slot for slot in slots if slot is not active)
+        last = self._last_bucket_upload.get((layer_index, padded_tokens))
+        return next(slot for slot in slots if slot is not last)
 
     def _start_layer_upload(
         self,
@@ -654,8 +654,62 @@ class HostEngramCoordinator:
         self._discard_prefetch()
         self.hashes = None
         self.deferred = None
+        self._step_inputs = None
+        self._history_commit = []
         self._next_prompt_spec = None
         self.started = False
+
+    @staticmethod
+    def _batch_req_slots(batch, requests: list[Any]) -> list[int | None]:
+        raw = getattr(batch, "req_pool_indices_cpu", None)
+        if raw is not None:
+            values = raw.tolist() if isinstance(raw, torch.Tensor) else list(raw)
+            if len(values) >= len(requests):
+                return [int(v) for v in values[: len(requests)]]
+        slots: list[int | None] = []
+        for req in requests:
+            kv = getattr(req, "kv", None)
+            slot = getattr(kv, "req_pool_idx", None) if kv is not None else None
+            if slot is None:
+                slot = getattr(req, "req_pool_idx", None)
+            slots.append(None if slot is None else int(slot))
+        return slots
+
+    def _commit_history(self) -> None:
+        """Mirror fast-path n-1 token tails into ``hasher.history`` on CPU.
+
+        Keeps ``EngramHasher.history`` current when a later decode batch falls
+        back to ``host_hash_ids`` (for example, when a beam-search request
+        joins the running batch).
+        """
+        if not self._history_commit or self._step_inputs is None:
+            return
+        history = getattr(self._hasher, "history", None)
+        if history is None:
+            return
+        n1 = self.ngram - 1
+        if n1 <= 0 or history.shape[1] != n1:
+            return
+        num_slots = history.shape[0]
+        valid = [
+            (slot, row) for slot, row in self._history_commit if 0 <= slot < num_slots
+        ]
+        if not valid:
+            return
+        slots = [slot for slot, _ in valid]
+        rows = np.asarray([row for _, row in valid], dtype=np.int64)
+        shifts = np.arange(n1, dtype=np.int64)
+        tail = np.where(
+            self._step_inputs.positions[rows, None] >= shifts,
+            np.minimum(self._step_inputs.tokens[rows, :n1], _MM_PAD_SHIFT_VALUE),
+            0,
+        )[:, ::-1]
+        tail_tensor = torch.as_tensor(
+            np.ascontiguousarray(tail), dtype=history.dtype, device=history.device
+        )
+        slot_tensor = torch.tensor(slots, dtype=torch.int64, device=history.device)
+        history[slot_tensor] = tail_tensor
+        self._history_commit = []
 
     def prepare(self, batch) -> tuple[list, list[int]]:
         """Capture this batch's host Engram windows (raising if unsupported)."""
@@ -683,6 +737,17 @@ class HostEngramCoordinator:
             if mode.is_extend_without_speculative()
             else None
         )
+        row_end = 0
+        commit: list[tuple[int, int]] = []
+        for slot, length in zip(
+            self._batch_req_slots(batch, requests), lengths, strict=True
+        ):
+            if length <= 0:
+                continue
+            row_end += length
+            if slot is not None:
+                commit.append((slot, row_end - 1))
+        self._history_commit = commit
         prefetched = self._prefetch
         self._prefetch = None
         if (
@@ -691,6 +756,7 @@ class HostEngramCoordinator:
             and prefetched.matches(requests, starts, lengths, self.ngram)
         ):
             self.hashes = prefetched.hashes
+            self._step_inputs = prefetched.inputs
             self.deferred = None
             self._staged_uploads = dict(prefetched.uploads)
             self._staged_padded_tokens = prefetched.padded_tokens
@@ -698,6 +764,7 @@ class HostEngramCoordinator:
             if prefetched is not None:
                 prefetched.discard()
             self.hashes = None
+            self._step_inputs = None
             self.deferred = capture_inputs(
                 requests, starts, lengths, self.ngram, self.pending
             )
@@ -758,6 +825,7 @@ class HostEngramCoordinator:
         """
         if self.deferred is not None:
             inputs = self.deferred.resolve(self.pending)
+            self._step_inputs = inputs
             self.hashes = hash_on_host(
                 inputs,
                 **self.tables,
@@ -794,6 +862,7 @@ class HostEngramCoordinator:
         for layer_index, upload in uploads:
             upload.activate()
             self._active_uploads[layer_index] = upload
+            self._last_bucket_upload[(layer_index, padded_tokens)] = upload
             ordered.append(upload)
         num_cols = int(hashes.shape[2])
         return tuple(upload.device for upload in ordered), ordered, num_cols
@@ -809,6 +878,7 @@ class HostEngramCoordinator:
             hashes = torch.empty(
                 (0, *self.tables["offsets"].shape), dtype=torch.int64, device="cpu"
             )
+        self._commit_history()
         return self._stage_layers(hashes, padded_tokens, use_prestaged=True)
 
     def stage_from_hashes(
@@ -880,27 +950,43 @@ class HostEngramCoordinator:
         self.pending = PendingTokens(requests, positions, result)
 
     def remember_fallback_if_applicable(self, batch, result) -> None:
-        """Keep PendingTokens valid across a fallback extend (e.g. folded CED)."""
-        if batch is None:
+        """Keep PendingTokens valid across fallback decode and extend steps."""
+        self.pending = None
+        if batch is None or result is None:
             return
         spec_algorithm = getattr(batch, "spec_algorithm", None)
         if spec_algorithm is not None and not spec_algorithm.is_none():
             return
-        mode = batch.forward_mode
-        if not mode.is_extend_without_speculative():
-            return
         reqs = getattr(batch, "reqs", None)
-        prefix_lens = getattr(batch, "prefix_lens", None)
-        extend_lens = getattr(batch, "extend_lens", None)
-        if (
-            reqs is None
-            or prefix_lens is None
-            or extend_lens is None
-            or len(reqs) != len(prefix_lens)
-            or len(reqs) != len(extend_lens)
-        ):
+        if reqs is None:
             return
-        positions = [s + n for s, n in zip(prefix_lens, extend_lens, strict=True)]
+        mode = batch.forward_mode
+        if mode.is_decode():
+            seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
+            if seq_lens_cpu is None:
+                return
+            seq_lens = (
+                seq_lens_cpu.tolist()
+                if isinstance(seq_lens_cpu, torch.Tensor)
+                else list(seq_lens_cpu)
+            )
+            # Beam tails append member rows after the reqs-aligned base rows.
+            if len(seq_lens) < len(reqs):
+                return
+            positions = [int(n) for n in seq_lens[: len(reqs)]]
+        elif mode.is_extend_without_speculative():
+            prefix_lens = getattr(batch, "prefix_lens", None)
+            extend_lens = getattr(batch, "extend_lens", None)
+            if (
+                prefix_lens is None
+                or extend_lens is None
+                or len(reqs) != len(prefix_lens)
+                or len(reqs) != len(extend_lens)
+            ):
+                return
+            positions = [s + n for s, n in zip(prefix_lens, extend_lens, strict=True)]
+        else:
+            return
         self.remember(list(reqs), positions, result)
 
     def clear_step(self) -> None:
@@ -910,6 +996,8 @@ class HostEngramCoordinator:
                 upload.record_consumers([upload.device])
         self.hashes = None
         self.deferred = None
+        self._step_inputs = None
+        self._history_commit = []
         self._next_prompt_spec = None
         self.started = False
 
