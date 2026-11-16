@@ -11,5 +11,6 @@
   "allocation_contract": "6900 seconds; retain setup/model failures; client failures keep live server; explicit recovery only",
   "running_started_at": "2026-11-16T12:02:21.833398Z",
   "running_deadline_at": "2026-11-16T14:02:21.833398Z",
-  "heartbeat_id": "glm52-8-chip"
+  "heartbeat_id": "glm52-8-chip",
+  "last_verified_progress": "Both allocation supervisors RUNNING; rank 0 passed bootstrap and checkpoint metadata and recorded source-tree SHA256; no tar dependency"
 }
