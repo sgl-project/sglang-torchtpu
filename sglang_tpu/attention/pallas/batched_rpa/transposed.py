@@ -24,9 +24,11 @@ along sublanes and (token, q head) rows along lanes:
 * O^T = V^T P^T is [head_dim, rows], 4x fewer MXU rows and result pops than
   P V, and a block of ones rows in V^T yields l for free,
 * K streams through the MXU as the LHS; with fp8 K and fp8 q it takes one
-  MXU op per 32 keys. q is quantized to fp8 here (a bf16 q would be upcast
-  with K and double the MXU issue), so this path is not bit-exact with the
-  standard tile.
+  MXU op per 32 keys. A bf16 q would upcast K and cost 3-4x, so Q^T is stored
+  as two fp8 terms hi + lo (about bf16 precision) and S^T = [K; K]^T [hi; lo]
+  is one fp8 matmul whose contraction 2 * head_dim still fits one MXU pass.
+  The fp8 MXU result itself is only about bf16 precise (not f32 accumulated),
+  so scores stay noisier than the standard tile's.
 
 One compute block is bq_c tokens x q heads = 128k lanes; scratch carries are
 m [KV, 1, rows] and acc [KV, head_dim + 16, rows] in f32, and Q^T is built
@@ -49,14 +51,14 @@ LOG2E = 1.0 / math.log(2.0)
 
 def refresh_qt(
     load_q: Callable[[], jax.Array],  # -> [1, KV, rows, aligned_q_head_dim]
-    qt_ref: jax.Ref,  # [KV, aligned_kv_head_dim, rows]
+    qt_ref: jax.Ref,  # [KV, 2 * aligned_kv_head_dim, rows]: hi, then lo
     qkey_ref: jax.Ref,  # SMEM [2]: (s_idx, q_idx) the cached Q^T belongs to
     s_idx: jax.Array,
     q_idx: jax.Array,
     *,
     cfgs: configs.RpaConfigs,
 ):
-    """Rebuilds the fp8 Q^T when the step moved to another (sequence, q block)."""
+    """Rebuilds Q^T = [hi; lo] (fp8) when the step moved to another (sequence, q block)."""
     changed = jnp.logical_or(s_idx != qkey_ref[0], q_idx != qkey_ref[1])
 
     @pl.when(changed)
@@ -69,7 +71,11 @@ def refresh_qt(
             qt = qh.T[:hd]  # [hd, rows]
             info = jnp.finfo(qt_ref.dtype)
             qt = jnp.clip(qt, float(info.min), float(info.max))
-            qt_ref[kv_head] = qt.astype(qt_ref.dtype)
+            # Scores reach ~44 in log2 units: a lone e4m3 q (3 mantissa bits) puts
+            # whole units of error into exp2; lo brings q to ~2^-8.
+            hi = qt.astype(qt_ref.dtype)
+            lo = (qt - hi.astype(jnp.float32)).astype(qt_ref.dtype)
+            qt_ref[kv_head] = jnp.concatenate([hi, lo], axis=0)
         qkey_ref[0] = s_idx
         qkey_ref[1] = q_idx
 
@@ -81,7 +87,7 @@ def tile(
     schedule_ref,
     m_ref: jax.Ref,  # [KV, 1, rows] f32, base-2 running max
     acc_ref: jax.Ref,  # [KV, acc_rows, rows] f32: O^T, then l in row aligned_kv_head_dim
-    qt_ref: jax.Ref,  # [KV, aligned_kv_head_dim, rows] fp8
+    qt_ref: jax.Ref,  # [KV, 2 * aligned_kv_head_dim, rows] fp8: hi, then lo
     *,
     processed_q_len: jax.Array,
     processed_kv_len: jax.Array,
@@ -100,12 +106,12 @@ def tile(
         q_iota = lax.broadcasted_iota(jnp.int32, (bkv, lanes), 1) // heads
         q_kv_diff = q_iota - kv_iota
 
-    def block(kv_head, kh, vt, bq_start, cs):
+    def block(kv_head, kh2, vt, bq_start, cs):
         """One compute block: queries [bq_start, bq_start + bq_c_sz) of the q block."""
-        qt = qt_ref[kv_head, :, cs]  # [hd, lanes] fp8
+        qt = qt_ref[kv_head, :, cs]  # [2 * hd, lanes] fp8
         s = lax.dot_general(
-            kh, qt, (((0,), (0,)), ((), ())), preferred_element_type=jnp.float32
-        )  # [bkv, lanes]
+            kh2, qt, (((0,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        )  # [bkv, lanes]: K^T hi + K^T lo
         s = s.astype(jnp.bfloat16)
         if apply_mask:
             # key index kv_iota + processed_kv_len <= query index
@@ -131,6 +137,7 @@ def tile(
 
     for kv_head in range(cfgs.model.num_kv_heads):
         kh = k[0, kv_head]  # [hd, bkv] fp8, contracted on dim 0: the MXU LHS
+        kh2 = jnp.concatenate([kh, kh], axis=0)  # [2 * hd, bkv]
         ones_rows = cfgs.acct_scratch_shape[1] - hd
         vt = jnp.concatenate(
             [
@@ -141,7 +148,7 @@ def tile(
         )  # [acc rows, bkv]
         for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
             cs = slice(bq_start * heads, bq_start * heads + lanes)
-            block(kv_head, kh, vt, bq_start, cs)
+            block(kv_head, kh2, vt, bq_start, cs)
 
 
 def store_tile(
