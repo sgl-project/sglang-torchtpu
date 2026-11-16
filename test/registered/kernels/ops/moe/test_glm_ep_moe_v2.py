@@ -25,6 +25,151 @@ register_tpu_ci(
 )
 
 
+def full_shape_cases(ep, rank):
+    """Real checkpoint geometry, with an analytic same-weight reference.
+
+    Each expert has distinct FP8 constant slabs and nonuniform channel scales.
+    This exercises the full H/I/E traffic and routing without materializing all
+    E weights on every host process just to compute the reference.
+    """
+    import json
+    import time
+
+    import numpy as np
+    import torch
+
+    from sglang_tpu.moe.pallas.glm_moe_v2.op import get_op
+
+    h, inter, e, k = 6144, 2048, 256, 8
+    assert e % ep == 0
+    local_e = e // ep
+    constants = []
+    for expert in range(e):
+        values = torch.tensor(
+            [
+                0.01 * (1 + expert % 7 / 16),
+                0.015 * (1 + expert % 5 / 16),
+                0.01 * ((expert % 3) - 1),
+            ]
+        )
+        constants.append(values.to(torch.float8_e4m3fn).float())
+    constants = torch.stack(constants)
+    w13 = torch.empty((2, local_e, h, inter), dtype=torch.float8_e4m3fn)
+    w2 = torch.empty((local_e, inter, h), dtype=torch.float8_e4m3fn)
+    for local in range(local_e):
+        values = constants[rank * local_e + local]
+        for branch in range(2):
+            w13[branch, local].copy_(
+                torch.full((h, inter), float(values[branch])).to(torch.float8_e4m3fn)
+            )
+        w2[local].copy_(
+            torch.full((inter, h), float(values[2])).to(torch.float8_e4m3fn)
+        )
+    s13 = (
+        torch.linspace(0.7, 1.3, 2 * inter)
+        .reshape(2, 1, inter)
+        .expand(2, local_e, inter)
+        .bfloat16()
+        .contiguous()
+    )
+    s2 = (
+        torch.linspace(0.8, 1.2, h)
+        .reshape(1, 1, 1, h)
+        .expand(local_e, 1, 1, h)
+        .bfloat16()
+        .contiguous()
+    )
+    gate_scale, up_scale = s13[:, 0].float()
+    down_scale = s2[0, 0, 0].float()
+    operands = [a.to("tpu") for a in (w13, w2, s13, s2)]
+    del w13, w2, s13, s2
+    shared_gate = torch.tensor(0.012).to(torch.float8_e4m3fn).float()
+    shared_up = torch.tensor(0.016).to(torch.float8_e4m3fn).float()
+    shared_down = torch.tensor(0.008).to(torch.float8_e4m3fn).float()
+    sw13 = torch.stack(
+        [
+            torch.full((h, inter), float(c)).to(torch.float8_e4m3fn)
+            for c in (shared_gate, shared_up)
+        ]
+    )
+    sw2 = torch.full((inter, h), float(shared_down)).to(torch.float8_e4m3fn)
+    ss13 = torch.linspace(0.6, 1.4, 2 * inter).reshape(2, inter)
+    ss2 = torch.linspace(0.7, 1.3, h)
+    shared = [a.to("tpu") for a in (sw13, sw2, ss13, ss2)]
+    del sw13, sw2
+    rank_arg = torch.tensor([rank], dtype=torch.int32, device="tpu")
+    stub = torch.empty(0, device="tpu")
+    generator = torch.Generator().manual_seed(61442048)
+    reports = []
+    for local_rows, has_shared in [(6, False), (24, True)]:
+        rows = ep * local_rows
+        x = (torch.randn((rows, h), generator=generator) * 0.2).bfloat16()
+        ids = torch.stack(
+            [torch.randperm(e, generator=generator)[:k] for _ in range(rows)]
+        ).int()
+        weights = torch.rand((rows, k), generator=generator)
+        weights /= weights.sum(-1, keepdim=True)
+        sums = x.float().sum(-1)
+        expected = torch.zeros((rows, h))
+        for slot in range(k):
+            c = constants[ids[:, slot].long()]
+            gate = sums[:, None] * c[:, 0, None] * gate_scale
+            up = sums[:, None] * c[:, 1, None] * up_scale
+            scalar = (torch.nn.functional.silu(gate) * up).sum(-1) * c[:, 2]
+            expected += scalar[:, None] * down_scale * weights[:, slot, None]
+        if has_shared:
+            gate = sums[:, None] * shared_gate * ss13[0]
+            up = sums[:, None] * shared_up * ss13[1]
+            expected += (
+                (torch.nn.functional.silu(gate) * up).sum(-1)[:, None]
+                * shared_down
+                * ss2
+            )
+        args = [
+            x.to("tpu"),
+            ids.to("tpu"),
+            weights.to("tpu"),
+            *operands,
+            rank_arg,
+            *(shared if has_shared else (stub,) * 4),
+        ]
+        op = get_op(ep, has_shared)
+        got = op(*args)
+        torch.accelerator.synchronize()
+        elapsed = []
+        for _ in range(5):
+            start = time.perf_counter()
+            got = op(*args)
+            torch.accelerator.synchronize()
+            elapsed.append((time.perf_counter() - start) * 1000)
+        got = got.cpu().float()
+        error = float(
+            torch.linalg.vector_norm(got - expected)
+            / torch.linalg.vector_norm(expected).clamp_min(1e-8)
+        )
+        assert torch.isfinite(got).all() and error < 0.15, (
+            "full_shape",
+            local_rows,
+            error,
+        )
+        report = dict(
+            event="full_shape_pass",
+            rank=rank,
+            h=h,
+            inter=inter,
+            experts=e,
+            topk=k,
+            local_rows=local_rows,
+            shared=has_shared,
+            relative_l2=error,
+            median_ms=float(np.median(elapsed)),
+            range_ms=[min(elapsed), max(elapsed)],
+        )
+        reports.append(report)
+        print(json.dumps(report), flush=True)
+    return reports
+
+
 def worker():
     import json
     import time
@@ -171,6 +316,7 @@ def worker():
         }
         reports.append(report)
         print(json.dumps({"event": "case_pass", "rank": rank, **report}), flush=True)
+    reports.extend(full_shape_cases(ep, rank))
     maps = Path("/proc/self/maps").read_text()
     libraries = sorted(
         {line.split()[-1] for line in maps.splitlines() if "libtpu" in line}
