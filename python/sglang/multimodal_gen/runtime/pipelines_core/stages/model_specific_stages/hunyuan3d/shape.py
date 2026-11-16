@@ -568,8 +568,10 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
         if isinstance(mesh, list):
             mesh = mesh[0]
 
+        # Warmup requests and the server's compile prewarm save no output.
+        saves_output = batch.save_output and not batch.is_warmup
         if mesh is None:
-            if batch.is_warmup:
+            if not saves_output:
                 logger.info(
                     "Skipping mesh export during warmup "
                     "(surface extraction returned None)"
@@ -583,7 +585,7 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
                 "The surface level may be outside the volume data range."
             )
 
-        if batch.is_warmup:
+        if not saves_output:
             if self.config.paint_enable:
                 return batch
             return OutputBatch(output_file_paths=[], metrics=batch.metrics)

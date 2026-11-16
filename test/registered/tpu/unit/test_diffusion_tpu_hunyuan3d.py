@@ -198,6 +198,7 @@ class TestShapeStages(CustomTestCase):
                 batch = SimpleNamespace(
                     extra={"shape_meshes": [mesh]},
                     is_warmup=False,
+                    save_output=True,
                     metrics=None,
                     output_file_path=lambda: path,
                 )
@@ -208,6 +209,23 @@ class TestShapeStages(CustomTestCase):
                     mesh.export.assert_called_once_with(path)
                 else:
                     mesh.export.assert_not_called()
+
+    def test_a_request_that_saves_no_output_writes_no_mesh(self):
+        # The server's torch.compile prewarm: not a warmup, no output path.
+        stage = shape.Hunyuan3DShapeSaveStage.__new__(shape.Hunyuan3DShapeSaveStage)
+        stage.config = SimpleNamespace(paint_enable=False)
+        for mesh in (Mock(), None):
+            batch = SimpleNamespace(
+                extra={"shape_meshes": [mesh]},
+                is_warmup=False,
+                save_output=False,
+                metrics=None,
+                output_path=None,
+                output_file_path=lambda: None,
+            )
+            self.assertEqual(stage.forward(batch, None).output_file_paths, [])
+            if mesh is not None:
+                mesh.export.assert_not_called()
 
     def test_latents_are_drawn_in_float32(self):
         # A float16 draw quantizes the normal; the latents are a float32 draw
