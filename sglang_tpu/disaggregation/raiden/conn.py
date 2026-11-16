@@ -1276,10 +1276,6 @@ class RaidenKVManager(
             if sweeps and time.monotonic() >= next_sweep:
                 now = time.monotonic()
                 next_sweep = now + _LISTENER_SWEEP_INTERVAL_S
-                # A scheduler that drained within the interval polls every
-                # room itself; only a stalled one needs the sweep. So only a
-                # scheduler idle for a whole interval can find the sweep
-                # holding the drain lock, and it then waits out one drain.
                 if now - self._last_scheduler_drain < _LISTENER_SWEEP_INTERVAL_S:
                     continue
                 try:
