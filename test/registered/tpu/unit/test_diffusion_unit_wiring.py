@@ -14,9 +14,11 @@ import re
 import unittest
 from pathlib import Path
 
-from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 
-# The lane that runs for diffusion PRs; base-a-test-cpu skips multimodal_gen paths.
+# The lane that runs for diffusion PRs. base-a-test-cpu runs from the checkout,
+# which has the workflow the path-filter case reads; the TPU image does not.
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 _REPO = Path(__file__).resolve().parents[4]
@@ -126,6 +128,9 @@ class TestDiffusionUnitWiring(unittest.TestCase):
                 if path.parent == _TPU_WRAPPERS:
                     cls.wrapped.add(module)
 
+    @unittest.skipUnless(
+        _TPU_PATH_FILTER.exists(), "the TPU image ships without .github"
+    )
     def test_every_path_filtered_file_is_wrapped_or_exempt(self):
         missing = sorted(_path_filtered_modules() - self.wrapped - set(_NOT_WRAPPED))
         self.assertEqual(
@@ -148,6 +153,9 @@ class TestDiffusionUnitWiring(unittest.TestCase):
             "the module to _PARTLY_WIRED with why",
         )
 
+    @unittest.skipUnless(
+        _TPU_PATH_FILTER.exists(), "the TPU image ships without .github"
+    )
     def test_exemptions_are_current(self):
         stale = sorted(
             [f"_PARTLY_WIRED: {m}" for m in _PARTLY_WIRED if m not in self.wrapped]
