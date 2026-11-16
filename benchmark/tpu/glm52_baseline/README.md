@@ -71,3 +71,57 @@ The pinned Falcon manifest also mounts the previous run's compilation cache.
 `GLM52_COMPILE_CACHE_ROOT` selects that mount; omit it to keep a new cache under
 the current artifact. The cache is an optimization and does not replace warmup
 or serving-time compile checks.
+
+## Complete allocation and recovery
+
+The Falcon entry is `allocation_runner.sh`, which starts the standard-library
+allocation supervisor before installing the runtime. Its 6,900-second bound
+covers setup, all model work, client recovery and cleanup. The application runs
+under `application-attempts/1/`; both ranks must report an actual successful
+application result. A zero process exit without that result retains an
+`ATTENTION` state, rather than establishing a pass.
+
+The native Git entry hashes the actual benchmark `.py` and `.sh` source tree;
+there is no dependency on a manually uploaded tar. Both hosts record and compare
+that identity before model loading. Serving processes and clients record the
+same source hash, their exact interpreter and the pinned Git revision.
+
+A client failure leaves the already compiled server running. Its log,
+measurements and `session-*/client-attention.json` explain the failure. After a
+confirmed client fix, write `session-*/retry-client.json` with a new `id` to run
+the full client again in `measurements/attempt-2/`. This repeats all workload
+checks without restarting the model. Success requires six measured round
+summaries and the 16 routed smoke receipts, not just exit code zero.
+
+Setup or model failures retain the allocation for explicit recovery. After
+fixing the recorded cause, place `allocation/retry.json` containing a larger
+`generation` and the exact checked-out `source_commit`; both hosts then run the
+application again on those same machines. There are no automatic retries.
+The deadline remains fixed across recovery attempts. A deadline exits 124.
+
+`inspect_run.py` is a read-only, standard-library inspector for use through
+`falcon exp exec`. It reads the current allocation state, bounded log tails,
+client attention state and measurement summaries, and also writes
+`/tmp/glm52-inspection-rank-<rank>.json` for `falcon exp cp`.
+
+## CPU preflight before requesting TPU resources
+
+Use a local Python with `aiohttp` and `numpy`:
+
+```sh
+python -m benchmark.tpu.glm52_baseline.preflight_allocation
+python -m benchmark.tpu.glm52_baseline.preflight --output /tmp/glm52-preflight
+```
+
+The first checks retained setup failures, explicit recovery, bounded expiry and
+false-success prevention. The second exercises the real two-rank session and
+full client against a local HTTP fixture: source-only startup, metadata and
+host reads, one injected client failure, recovery without an engine restart,
+16 routed smoke requests, both warmups, and all six measured rounds (368 total
+requests). The fixture includes native plain-text cache-control responses and
+short keep-alive expiry. File writes, tokenization and summary work run outside
+the client event loop; pooled connections expire after one second, below the
+native server's five-second timeout. Active batches are sampled every 20 ms.
+
+These are control-flow and HTTP-contract checks. They provide no evidence of
+TPU compilation, model accuracy, cache residency or measured device performance.

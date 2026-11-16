@@ -19,33 +19,115 @@ def atomic(path, data):
     tmp.replace(path)
 
 
+def benchmark_identity():
+    root = Path(__file__).resolve().parent
+    files = {
+        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(root.rglob("*"))
+        if p.is_file() and p.suffix in (".py", ".sh")
+    }
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+    return dict(kind="source-tree", sha256=digest, files=files)
+
+
+def run_client(proc, command, out, art, shared, deadline):
+    """A client failure retains the live server until an explicit retry or deadline."""
+    attempt = 1
+    request = shared / "retry-client.json"
+    last_request = None
+    while True:
+        destination = out / "measurements" / f"attempt-{attempt}"
+        with (art / f"client-attempt-{attempt}.log").open("wb", buffering=0) as log:
+            try:
+                subprocess.run(
+                    [*command, "--output", str(destination)],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                    timeout=max(1, deadline - time.monotonic()),
+                )
+                summary = json.loads((destination / "summary.json").read_text())
+                smoke = json.loads((destination / "smoke-summary.json").read_text())
+                assert len(summary["rounds"]) == 6 and smoke["status"] == "PASS"
+                assert {row["dp_rank"] for row in smoke["checks"]} == set(range(16))
+                atomic(
+                    shared / "client-attention.json",
+                    dict(
+                        status="RESOLVED",
+                        attempt=attempt,
+                        measurements=str(destination),
+                    ),
+                )
+                return destination
+            except Exception as error:
+                atomic(
+                    shared / "client-attention.json",
+                    dict(
+                        status="ATTENTION",
+                        attempt=attempt,
+                        returncode=getattr(error, "returncode", None),
+                        error=str(error),
+                        measurements=str(destination),
+                        server_pid=proc.pid,
+                        recovery="write retry-client.json with a new id after fixing the client",
+                    ),
+                )
+        while True:
+            assert proc.poll() is None, (
+                f"server exited while retaining client failure: {proc.returncode}"
+            )
+            assert time.monotonic() < deadline, "client recovery deadline exceeded"
+            try:
+                retry = json.loads(request.read_text())
+                if retry["id"] != last_request:
+                    last_request = retry["id"]
+                    attempt += 1
+                    break
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+            time.sleep(1)
+
+
 def run():
     rank = int(os.environ["FALCON_RANK"])
-    root = Path("/tmp/glm52-baseline-runtime")
+    root = Path(os.environ.get("GLM52_RUN_ROOT", "/tmp/glm52-baseline-runtime"))
     out = Path(os.environ["ARTIFACT_LOCAL_DIR"]) / "glm52-e2e"
-    overlay = hashlib.sha256(
-        Path("/tmp/benchmark-overlay.tar.gz").read_bytes()
-    ).hexdigest()
-    shared = out / ("session-" + os.environ.get("GLM52_RUN_ID", overlay[:12]))
+    identity = benchmark_identity()
+    benchmark_sha = identity["sha256"]
+    shared = out / ("session-" + os.environ.get("GLM52_RUN_ID", benchmark_sha[:12]))
     shared.mkdir(parents=True, exist_ok=True)
     art = out / f"rank-{rank}"
     art.mkdir(exist_ok=True)
-    deadline = time.monotonic() + 6000
+    atomic(art / "benchmark-source.json", identity)
+    deadline = time.monotonic() + float(os.environ.get("GLM52_SESSION_SECONDS", "6000"))
+    if "GLM52_ALLOCATION_EXPIRES_AT" in os.environ:
+        deadline = min(
+            deadline,
+            time.monotonic()
+            + float(os.environ["GLM52_ALLOCATION_EXPIRES_AT"])
+            - time.time()
+            - 60,
+        )
+    peer_deadline = time.monotonic() + 300
     proc = None
     result = dict(status="FAILED", rank=rank)
+
+    def interrupted(signum, frame):
+        raise SystemExit(128 + signum)
+
+    handlers = {
+        s: signal.signal(s, interrupted) for s in (signal.SIGTERM, signal.SIGINT)
+    }
     try:
         assert Path(root / "SETUP_READY").exists()
         source = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip()
         assert source == os.environ["SOURCE_COMMIT"]
-        overlay = hashlib.sha256(
-            Path("/tmp/benchmark-overlay.tar.gz").read_bytes()
-        ).hexdigest()
         ip = socket.gethostbyname(socket.gethostname())
         atomic(
             shared / f"peer-{rank}.json",
-            dict(rank=rank, ip=ip, source=source, overlay=overlay),
+            dict(rank=rank, ip=ip, source=source, benchmark_sha256=benchmark_sha),
         )
         while True:
             try:
@@ -55,14 +137,13 @@ def run():
                 ]
                 assert [p["rank"] for p in peers] == [0, 1]
                 assert all(
-                    p["source"] == source and p["overlay"] == overlay for p in peers
+                    p["source"] == source and p["benchmark_sha256"] == benchmark_sha
+                    for p in peers
                 )
                 assert peers[0]["ip"] != peers[1]["ip"]
                 break
             except (FileNotFoundError, json.JSONDecodeError):
-                assert time.monotonic() < deadline - 5700, (
-                    "peer bootstrap exceeded 300s"
-                )
+                assert time.monotonic() < peer_deadline, "peer bootstrap exceeded 300s"
                 time.sleep(1)
         hosts = ",".join(p["ip"] for p in peers)
         os.environ.update(
@@ -75,7 +156,7 @@ def run():
             TORCH_TPU_DEVICES_PER_HOST="8",
             TORCH_TPU_BASE_PORT="8070",
             SGLANG_USE_RAY="0",
-            GLM52_OVERLAY_SHA256=overlay,
+            GLM52_BENCHMARK_SHA256=benchmark_sha,
             HOME=str(root / "home"),
             XDG_CACHE_HOME=str(root / "cache"),
             TMPDIR=str(root / "tmp"),
@@ -129,7 +210,8 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                 if line.startswith("PHYSICAL_RANK=")
             )
         )
-        model = Path("/models/GLM5.2-fp8-channel-wise")
+        recipe = json.loads(config.read_text())["server_args"]
+        model = Path(recipe["model_path"])
         experts = json.loads((model / "config.json").read_text())["n_routed_experts"]
         assert experts == 256 and physical_rank in (0, 1)
         with (art / "host-preparation.log").open("wb") as log:
@@ -244,7 +326,7 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                     command=command,
                     executable=sys.executable,
                     source=source,
-                    overlay_sha256=overlay,
+                    benchmark_sha256=benchmark_sha,
                     peers=peers,
                 ),
             )
@@ -253,7 +335,7 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                     assert proc.poll() is None, f"launcher exited {proc.returncode}"
                     try:
                         with urllib.request.urlopen(
-                            "http://127.0.0.1:30000/health", timeout=5
+                            f"http://127.0.0.1:{recipe['port']}/health", timeout=5
                         ) as response:
                             if response.status == 200:
                                 break
@@ -269,20 +351,15 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                     "-u",
                     "-m",
                     "benchmark.tpu.glm52_baseline.client",
-                    "--output",
-                    str(out / "measurements"),
+                    "--base-url",
+                    f"http://127.0.0.1:{recipe['port']}",
+                    "--model",
+                    str(model),
                     "--decode-prefix",
                     "auto",
                 ]
-                with (art / "client.log").open("wb", buffering=0) as client_log:
-                    subprocess.run(
-                        client,
-                        stdout=client_log,
-                        stderr=subprocess.STDOUT,
-                        check=True,
-                        timeout=max(1, deadline - time.monotonic()),
-                    )
-                result.update(status="SUCCEEDED")
+                measurements = run_client(proc, client, out, art, shared, deadline)
+                result.update(status="SUCCEEDED", measurements=str(measurements))
             else:
                 while not (shared / "result-0.json").exists():
                     assert proc.poll() is None, f"launcher exited {proc.returncode}"
@@ -307,6 +384,8 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                     status="FAILED", shutdown_error="launcher exceeded 35s shutdown"
                 )
         atomic(art / "result.json", result)
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
         print(json.dumps(result), flush=True)
     return 0 if result["status"] == "SUCCEEDED" else 1
 

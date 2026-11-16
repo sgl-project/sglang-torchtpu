@@ -8,7 +8,7 @@
   "role_to_task_spec": {
     "worker": {
       "shared_memory_size": "256Gi",
-      "command": "exec bash /workspace/sglang-torchtpu/benchmark/tpu/glm52_baseline/falcon_runner.sh",
+      "command": "exec bash /workspace/sglang-torchtpu/benchmark/tpu/glm52_baseline/allocation_runner.sh",
       "replica": 2,
       "image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
       "device_count": 8,

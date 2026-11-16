@@ -20,6 +20,12 @@ def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
 
 
+def persist_record(path, record, ids):
+    record["input_sha256"] = hashlib.sha256(json.dumps(ids).encode()).hexdigest()
+    save(path, record)
+    return record
+
+
 async def api(session, base, endpoint, payload=None):
     method = session.get if payload is None else session.post
     async with method(
@@ -28,7 +34,8 @@ async def api(session, base, endpoint, payload=None):
         body = await r.text()
         if r.status != 200:
             raise RuntimeError(f"{endpoint}: HTTP {r.status}: {body[:2000]}")
-        return json.loads(body)
+        # The native cache-control endpoint returns plain text on success.
+        return body if endpoint == "/flush_cache" else json.loads(body)
 
 
 async def generate(
@@ -75,9 +82,8 @@ async def generate(
         events=events,
         meta=meta,
         text=final.get("text"),
-        input_sha256=hashlib.sha256(json.dumps(ids).encode()).hexdigest(),
     )
-    save(output / f"{label}.json", result)
+    await asyncio.to_thread(persist_record, output / f"{label}.json", result, ids)
     assert meta.get("dp_rank") == rank, meta
     assert meta["completion_tokens"] == output_len, meta
     assert meta.get("finish_reason", {}).get("type") != "abort", meta
@@ -138,7 +144,7 @@ async def batch(session, base, inputs, output_len, out, label, synchronized=Fals
                 snapshots.append(dict(time=time.perf_counter(), **state))
             except Exception as e:
                 snapshots.append(dict(time=time.perf_counter(), error=str(e)))
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.02)
 
     if synchronized:
         await api(session, base, "/pause_generation", {"mode": "in_place"})
@@ -164,13 +170,30 @@ async def batch(session, base, inputs, output_len, out, label, synchronized=Fals
             # Paused Torch schedulers do not publish fresh /v1/loads snapshots.
             # HTTP headers acknowledge ingress only. Sustained per-DP batch size
             # is checked independently after inference resumes.
-            await asyncio.wait_for(
-                asyncio.gather(*(event.wait() for event in accepted)), timeout=120
+            ingress = asyncio.ensure_future(
+                asyncio.wait_for(
+                    asyncio.gather(*(event.wait() for event in accepted)), timeout=120
+                )
             )
+            try:
+                done, _ = await asyncio.wait(
+                    [ingress, *tasks], return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    task.result()
+                if not ingress.done():
+                    raise RuntimeError(
+                        "a request finished before synchronized ingress completed"
+                    )
+            finally:
+                if not ingress.done():
+                    ingress.cancel()
+                await asyncio.gather(ingress, return_exceptions=True)
             for task in tasks:
                 if task.done():
                     task.result()
-            save(
+            await asyncio.to_thread(
+                save,
                 out / f"{label}-ingress.json",
                 dict(
                     http_accepted=len(accepted),
@@ -186,7 +209,7 @@ async def batch(session, base, inputs, output_len, out, label, synchronized=Fals
         stop.set()
         if monitoring:
             await monitoring
-        save(out / f"{label}-loads.json", snapshots)
+        await asyncio.to_thread(save, out / f"{label}-loads.json", snapshots)
         if synchronized:
             await api(
                 session, base, "/continue_generation", {"torch_empty_cache": False}
@@ -219,6 +242,7 @@ def summarize(records, loads, cached, per_dp, out, label):
         if len(s.get("loads", [])) == 16
         and all(r["num_running_reqs"] == per_dp for r in s["loads"])
     ]
+    assert full, "no load snapshot proves the requested per-DP active batch"
     result = dict(
         label=label,
         physical_chips=8,
@@ -288,20 +312,23 @@ def summarize(records, loads, cached, per_dp, out, label):
 
 async def main(a):
     a.output.mkdir(parents=True, exist_ok=False)
-    save(
+    await asyncio.to_thread(
+        save,
         a.output / "client-identity.json",
         dict(
             client_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             implementation_commit=__import__("os").environ.get("SOURCE_COMMIT"),
-            model_overlay_sha256=__import__("os").environ.get("GLM52_OVERLAY_SHA256"),
+            benchmark_source_sha256=__import__("os").environ.get(
+                "GLM52_BENCHMARK_SHA256"
+            ),
         ),
     )
     timeout = aiohttp.ClientTimeout(total=3600)
     async with aiohttp.ClientSession(
-        timeout=timeout, connector=aiohttp.TCPConnector(limit=160)
+        timeout=timeout, connector=aiohttp.TCPConnector(limit=160, keepalive_timeout=1)
     ) as session:
         info = await api(session, a.base_url, "/server_info")
-        save(a.output / "server-info.json", info)
+        await asyncio.to_thread(save, a.output / "server-info.json", info)
         expected = dict(
             tp_size=16,
             attn_dp_size=16,
@@ -347,11 +374,15 @@ async def main(a):
             )
             assert "4" in r["text"], r["text"]
             checks.append(r["meta"])
-        save(a.output / "smoke-summary.json", dict(status="PASS", checks=checks))
+        await asyncio.to_thread(
+            save, a.output / "smoke-summary.json", dict(status="PASS", checks=checks)
+        )
         if a.smoke_only:
             return
         capacities = await api(session, a.base_url, "/v1/loads")
-        save(a.output / "capacity-before-workload.json", capacities)
+        await asyncio.to_thread(
+            save, a.output / "capacity-before-workload.json", capacities
+        )
         assert len(capacities["loads"]) == 16
         minimum_capacity = min(
             row["max_total_num_tokens"] for row in capacities["loads"]
@@ -360,7 +391,8 @@ async def main(a):
         decode_mode = a.decode_prefix
         if decode_mode == "auto":
             decode_mode = "unique" if minimum_capacity >= unique_slots else "shared"
-        save(
+        await asyncio.to_thread(
+            save,
             a.output / "prefix-decision.json",
             dict(
                 mode=decode_mode,
@@ -434,8 +466,14 @@ async def main(a):
                 )
                 if iteration:
                     all_summaries.append(
-                        summarize(
-                            records, loads, prefix_len, count // 16, a.output, label
+                        await asyncio.to_thread(
+                            summarize,
+                            records,
+                            loads,
+                            prefix_len,
+                            count // 16,
+                            a.output,
+                            label,
                         )
                     )
             # Raw metrics and logs remain authoritative for retraction/eviction checks.
@@ -454,13 +492,14 @@ async def main(a):
                 minimum=min(values),
                 maximum=max(values),
             )
-        save(
+        await asyncio.to_thread(
+            save,
             a.output / "summary.json",
             dict(rounds=all_summaries, aggregate=aggregated, decode_prefix=decode_mode),
         )
 
 
-if __name__ == "__main__":
+def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--base-url", default="http://127.0.0.1:30000")
     p.add_argument("--model", default="/models/GLM5.2-fp8-channel-wise")
@@ -470,4 +509,8 @@ if __name__ == "__main__":
     p.add_argument(
         "--decode-prefix", choices=["auto", "shared", "unique"], default="auto"
     )
-    asyncio.run(main(p.parse_args()))
+    return p.parse_args(argv)
+
+
+if __name__ == "__main__":
+    asyncio.run(main(parse_args()))

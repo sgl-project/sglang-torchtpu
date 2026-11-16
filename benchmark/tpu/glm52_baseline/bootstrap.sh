@@ -5,6 +5,7 @@ SRC=/workspace/sglang-torchtpu
 RUN_DIR=/tmp/glm52-baseline-runtime
 ART="$ARTIFACT_LOCAL_DIR/glm52-e2e/rank-$FALCON_RANK"
 mkdir -p "$ART" "$RUN_DIR" /tmp/tpu_logs/tmp
+rm -f "$RUN_DIR/SETUP_READY"
 exec > >(tee -a "$ART/driver.log") 2>&1
 export TMPDIR="$RUN_DIR/tmp" PIP_NO_CACHE_DIR=1
 mkdir -p "$TMPDIR"

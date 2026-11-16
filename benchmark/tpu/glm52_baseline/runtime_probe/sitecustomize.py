@@ -25,7 +25,7 @@ def capture():
                 versions=versions,
                 imports={name: sys.modules[name].__file__ for name in names},
                 source_commit=os.environ.get("SOURCE_COMMIT"),
-                benchmark_overlay_sha256=os.environ.get("GLM52_OVERLAY_SHA256"),
+                benchmark_source_sha256=os.environ.get("GLM52_BENCHMARK_SHA256"),
                 compiler_env={
                     k: v
                     for k, v in os.environ.items()
