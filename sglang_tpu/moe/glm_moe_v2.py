@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in GLM selected-route EP MoE preparation, through the platform seam."""
+"""Opt-in GLM selected-route EP MoE preparation at loader finalization."""
 
 import logging
 
@@ -94,6 +94,11 @@ def _prepare_shared(moe, parallel):
 
 
 def prepare_model(model):
+    from sglang.srt.layers.moe.utils import (
+        get_moe_runner_backend,
+        is_sbo_enabled,
+        is_tbo_enabled,
+    )
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
     from sglang.srt.runtime_context import get_exec, get_parallel
     from sglang_tpu.envs import envs
@@ -107,14 +112,35 @@ def prepare_model(model):
         return
     # This adapter targets the GLM DSA model; unrelated models retain their
     # established backend even if the process-level expert toggle is inherited.
-    if "GlmMoeDsaForCausalLM" not in model.config.architectures:
+    architectures = getattr(getattr(model, "config", None), "architectures", ()) or ()
+    if (
+        "GlmMoeDsaForCausalLMNextN" in architectures
+        or type(model).__name__ == "GlmMoeDsaForCausalLMNextN"
+    ):
+        logger.info("GLM_MOE_V2_DRAFT_KEEP_BASELINE %s", type(model).__name__)
+        return 0
+    if "GlmMoeDsaForCausalLM" not in architectures:
         logger.info("GLM fused EP MoE v2: skipping %s", type(model).__name__)
         return
     from sglang_tpu.moe.glm_moe_v2_runtime import GlmSelectedEPMoE
 
     parallel = get_parallel()
-    for name, moe in model.named_modules():
-        if not isinstance(moe, DeepseekV2MoE) or isinstance(moe, GlmSelectedEPMoE):
+    modules = [
+        (name, moe)
+        for name, moe in model.named_modules()
+        if isinstance(moe, DeepseekV2MoE)
+    ]
+    draft = sum(bool(moe.is_nextn) for _, moe in modules)
+    candidates = [(name, moe) for name, moe in modules if not moe.is_nextn]
+    if candidates and not get_moe_runner_backend().is_pallas_tpu():
+        raise ValueError("GLM MoE v2 requires --moe-runner-backend pallas_tpu")
+    if candidates and (is_sbo_enabled() or is_tbo_enabled()):
+        raise ValueError("GLM MoE v2 does not support decomposed SBO/TBO forwards")
+    prepared = shared_count = max_post_drain_used = 0
+    for name, moe in candidates:
+        if isinstance(moe, GlmSelectedEPMoE):
+            prepared += 1
+            shared_count += int(moe._glm_v2_shared)
             continue
         reason = unsupported_reason(moe, parallel, get_exec())
         if reason:
@@ -151,9 +177,29 @@ def prepare_model(model):
             moe._glm_v2_shared = _prepare_shared(moe, parallel)
             if moe._glm_v2_shared:
                 moe._glm_v2_op = get_op(parallel.moe_ep_size, True)
+        # This full-model pass is outside the loader's per-quant-module drain.
+        # Materialize this layer's pack/gathers before the next layer retains
+        # another old layout through its deferred DeviceBufferRef readers.
+        torch.accelerator.synchronize()
+        free, total = torch.accelerator.get_memory_info(layer.w13_weight.device)
+        max_post_drain_used = max(max_post_drain_used, int(total - free))
+        prepared += 1
+        shared_count += int(moe._glm_v2_shared)
         logger.info(
             "GLM fused EP MoE v2 prepared %s: EP%d, shared=%s",
             name,
             parallel.moe_ep_size,
             moe._glm_v2_shared,
         )
+    summary = dict(
+        expected=len(candidates),
+        prepared=prepared,
+        shared=shared_count,
+        draft_skipped=draft,
+        max_observed_post_drain_used_bytes=max_post_drain_used,
+    )
+    model._glm_v2_preparation_summary = summary
+    logger.info("GLM_MOE_V2_PREPARED %s", summary)
+    if prepared != len(candidates):
+        raise RuntimeError(f"GLM MoE v2 did not bind every target MoE layer: {summary}")
+    return prepared

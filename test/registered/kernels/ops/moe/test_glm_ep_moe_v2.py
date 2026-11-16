@@ -527,6 +527,7 @@ def worker(*, case_filter=None, include_loading=True, include_large=True):
         pack_gate_up,
         pack_gate_up_scale,
     )
+    from sglang_tpu.moe.glm_moe_v2 import _replace_data
 
     dist.init_process_group(backend="tpu_dist")
     rank, ep = dist.get_rank(), dist.get_world_size()
@@ -572,10 +573,17 @@ def worker(*, case_filter=None, include_loading=True, include_large=True):
     s2 = torch.linspace(0.8, 1.2, e * h).reshape(e, 1, 1, h).bfloat16()
     ownership_rank = (rank * 3 + 1) % ep
     sl = slice(ownership_rank * 2, (ownership_rank + 1) * 2)
+    # These are the real post-load Parameter operations, consumed directly by
+    # the subsequent bridge calls. Do not only check pack via a CPU copy and
+    # then use unrelated CPU-packed weights for all numerical cases.
+    packed_parameter = torch.nn.Parameter(w13[sl].to("tpu"), requires_grad=False)
+    scale_parameter = torch.nn.Parameter(s13[sl].to("tpu"), requires_grad=False)
+    _replace_data(packed_parameter, pack_gate_up(packed_parameter.data))
+    _replace_data(scale_parameter, pack_gate_up_scale(scale_parameter.data))
     device_weights = [
-        pack_gate_up(w13[sl]).to("tpu"),
+        packed_parameter.data,
         w2[sl].to("tpu"),
-        pack_gate_up_scale(s13[sl]).to("tpu"),
+        scale_parameter.data,
         s2[sl].to("tpu"),
     ]
     rank_tensor = torch.tensor([ownership_rank], dtype=torch.int32, device="tpu")

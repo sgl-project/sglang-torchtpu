@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GLM MoE runtime adapter; installed by process_model_after_loading."""
+"""GLM MoE runtime adapter; installed after loader quant postprocessing."""
 
 import torch
 

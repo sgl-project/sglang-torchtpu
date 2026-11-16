@@ -7,10 +7,13 @@ Expert ids remain logical EP ids at the public boundary. A rank operand maps
 those ids to the physical Pallas mesh; pod ranks never enter that mapping.
 """
 
+import logging
 import os
 from functools import cache
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 _SOURCE_DEBUG_ENVS = (
     "SGLJAX_SKIP_PREQUANT",
@@ -112,6 +115,15 @@ def get_op(ep_size: int, has_shared: bool):
         ss2: jax.Array,
     ) -> jax.Array:
         original_rows = x.shape[0] // ep_size
+        # This runs while exporting a shape's actual custom-call graph, not
+        # once per decode step; it gives E2E an operator/shape provenance marker.
+        logger.info(
+            "GLM_MOE_V2_EXPORT op=glm_ep_moe_v2_ep%d_shared%d rows=%d hidden=%d",
+            ep_size,
+            int(has_shared),
+            original_rows,
+            x.shape[-1],
+        )
         x, ids, weights, mesh_ranks = split(x, ids, weights, rank)
         w1, w3, s1, s3 = unpack(w13, s13)
         # Build-time shape arithmetic; expert ownership never reads a device
