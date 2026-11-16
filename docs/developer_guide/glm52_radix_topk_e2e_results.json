@@ -1,0 +1,574 @@
+{
+  "experiment": {
+    "id": "exp-l3h3amkwm8",
+    "artifact": "art-8cnbsifu1t",
+    "analysis": "an-5o5hdp36tf",
+    "measurement_source": "6991974e9b5245902a0310a1dd26e985d4d455d3",
+    "kernel_source": "125bf7fe4dffa405bf2a1905633e5b97542d2a0b",
+    "base": "ffd83db8f6168e0752e0769f8947cffb308e724d",
+    "baseline_experiment": "exp-6mtkc6t2qi",
+    "baseline_artifact": "art-tfqylgfhvw",
+    "baseline_source": "811865ca48ca23aa14dc74c9dbebaf5b380279dc",
+    "physical_chips": 8,
+    "hosts": 2,
+    "visible_devices": 16,
+    "host_application_statuses": {
+      "rank-0": "SUCCEEDED",
+      "rank-1": "SUCCEEDED"
+    },
+    "attempt": 1
+  },
+  "candidate_policy": {
+    "SGLANG_TPU_USE_DSA_RADIX_TOPK": "1",
+    "default_enabled": false,
+    "maximum_v2_query_chunk_rows": 64,
+    "k2048_width92160_configuration": {
+      "block_size": 16384,
+      "reconstruct_threshold": 8192,
+      "reverse_scan": false
+    },
+    "large_prefill_selector": "sparsecore"
+  },
+  "input_manifest": {
+    "input_mode": "natural-code",
+    "token_count": 1142656,
+    "token_ids_sha256": "607d4dc372753216266489042597330f2fc66c94b5e0fd6a760181a10162b3c6",
+    "construction": "sorted UTF-8 python/sglang/*.py; concatenate encoded source; no repeated filling",
+    "reused_from": "/glm52-frozen-inputs"
+  },
+  "input_source_file_count": 320,
+  "checkpoint_identity": {
+    "config.json": {
+      "sha256": "0735624bbd5666283a1f135c59ff4c15e8b51c56fc50e022181525253f29463b",
+      "bytes": 3876
+    },
+    "model.safetensors.index.json": {
+      "sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+      "bytes": 11359252
+    },
+    "tokenizer_config.json": {
+      "sha256": "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc",
+      "bytes": 761
+    }
+  },
+  "runtime": {
+    "executable": "/tmp/glm52-baseline-runtime/venv/bin/python",
+    "python": "3.12.12 (main, Feb  4 2026, 20:22:22) [GCC 12.2.0]",
+    "declared": {
+      "torch_tpu": "0.2.1.dev20261028201649",
+      "tpu-sync-torch": "0.0.1.dev20261112081648",
+      "libtpu": "0.0.50",
+      "torch": "2.11.0",
+      "torchvision": "0.26.0",
+      "jax": "0.11.2",
+      "jaxlib": "0.11.2"
+    },
+    "actual": {
+      "torch_tpu": "0.2.1.dev20261028201649",
+      "tpu-sync-torch": "0.0.1.dev20261112081648",
+      "libtpu": "0.0.50",
+      "torch": "2.11.0+cpu",
+      "torchvision": "0.26.0+cpu",
+      "jax": "0.11.2",
+      "jaxlib": "0.11.2"
+    }
+  },
+  "harness_sha256": "bbf1b6384c71c655c4497670f63eb1ba9edb72e2752fe93c2dad1fc4147ea475",
+  "compile_cache_identity_key": "6066dffbee517d306f60",
+  "smoke": {
+    "status": "PASS",
+    "dp_receipts": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ]
+  },
+  "prefix_decision": {
+    "mode": "shared",
+    "minimum_capacity": 219008,
+    "unique_slots_lower_bound": 364288,
+    "shared_prefix_tokens": 89984,
+    "reason": "share prefix within each DP to reduce KV slots"
+  },
+  "summary": {
+    "rounds": [
+      {
+        "label": "prefill-unique-round1",
+        "physical_chips": 8,
+        "requests": 16,
+        "requests_per_dp": 1,
+        "expected_cached_tokens": 49152,
+        "observed_cached_tokens": [
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49152,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088
+        ],
+        "ttft_ms_median": 6287.122114561498,
+        "client_tpot_ms_median": 16.19040435180068,
+        "mtp_verify_count": 58,
+        "mtp_correct_drafts": 214,
+        "full_concurrency_load_samples": 20,
+        "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)"
+      },
+      {
+        "label": "prefill-unique-round2",
+        "physical_chips": 8,
+        "requests": 16,
+        "requests_per_dp": 1,
+        "expected_cached_tokens": 49152,
+        "observed_cached_tokens": [
+          49088,
+          49088,
+          49152,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49152
+        ],
+        "ttft_ms_median": 6268.739408347756,
+        "client_tpot_ms_median": 21.439754590392113,
+        "mtp_verify_count": 71,
+        "mtp_correct_drafts": 206,
+        "full_concurrency_load_samples": 29,
+        "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)"
+      },
+      {
+        "label": "prefill-unique-round3",
+        "physical_chips": 8,
+        "requests": 16,
+        "requests_per_dp": 1,
+        "expected_cached_tokens": 49152,
+        "observed_cached_tokens": [
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49088,
+          49152,
+          49088,
+          49088
+        ],
+        "ttft_ms_median": 6264.611433260143,
+        "client_tpot_ms_median": 21.33060467119018,
+        "mtp_verify_count": 69,
+        "mtp_correct_drafts": 199,
+        "full_concurrency_load_samples": 28,
+        "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)"
+      },
+      {
+        "label": "decode-shared-round1",
+        "physical_chips": 8,
+        "requests": 64,
+        "requests_per_dp": 4,
+        "expected_cached_tokens": 89984,
+        "observed_cached_tokens": [
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89984,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89984,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920
+        ],
+        "ttft_ms_median": 5246.065789368004,
+        "client_tpot_ms_median": 18.337877292025794,
+        "mtp_verify_count": 12532,
+        "mtp_correct_drafts": 53082,
+        "full_concurrency_load_samples": 689,
+        "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)",
+        "steady_start": 5067623.986760681,
+        "steady_end": 5067637.422814924,
+        "steady_output_tokens": 49024,
+        "steady_output_tokens_per_second": 3648.6902412562267,
+        "steady_output_tokens_per_second_per_chip": 456.08628015702834,
+        "tail_seconds": 5.314273806288838
+      },
+      {
+        "label": "decode-shared-round2",
+        "physical_chips": 8,
+        "requests": 64,
+        "requests_per_dp": 4,
+        "expected_cached_tokens": 89984,
+        "observed_cached_tokens": [
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89984,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89984,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920
+        ],
+        "ttft_ms_median": 5358.194273430854,
+        "client_tpot_ms_median": 18.86377789768393,
+        "mtp_verify_count": 12707,
+        "mtp_correct_drafts": 52920,
+        "full_concurrency_load_samples": 754,
+        "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)",
+        "steady_start": 5067652.22062265,
+        "steady_end": 5067665.949923804,
+        "steady_output_tokens": 47892,
+        "steady_output_tokens_per_second": 3488.3057385011516,
+        "steady_output_tokens_per_second_per_chip": 436.03821731264395,
+        "tail_seconds": 4.830351284705102
+      },
+      {
+        "label": "decode-shared-round3",
+        "physical_chips": 8,
+        "requests": 64,
+        "requests_per_dp": 4,
+        "expected_cached_tokens": 89984,
+        "observed_cached_tokens": [
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89984,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89984,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89984,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89920,
+          89984
+        ],
+        "ttft_ms_median": 5337.7022868953645,
+        "client_tpot_ms_median": 18.508554378912248,
+        "mtp_verify_count": 12784,
+        "mtp_correct_drafts": 52824,
+        "full_concurrency_load_samples": 733,
+        "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)",
+        "steady_start": 5067680.269289886,
+        "steady_end": 5067694.558536278,
+        "steady_output_tokens": 50896,
+        "steady_output_tokens_per_second": 3561.8393442316587,
+        "steady_output_tokens_per_second_per_chip": 445.22991802895734,
+        "tail_seconds": 4.843634475022554
+      }
+    ],
+    "aggregate": {
+      "prefill": {
+        "metric": "ttft_ms_median",
+        "median": 6268.739408347756,
+        "minimum": 6264.611433260143,
+        "maximum": 6287.122114561498
+      },
+      "decode": {
+        "metric": "client_tpot_ms_median",
+        "median": 18.508554378912248,
+        "minimum": 18.337877292025794,
+        "maximum": 18.86377789768393
+      }
+    },
+    "decode_prefix": "shared"
+  },
+  "historical_comparison": {
+    "baseline": {
+      "prefill": {
+        "ttft_ms_median": {
+          "median": 6302.241573575884,
+          "minimum": 6301.600041799247,
+          "maximum": 6327.231901232153
+        },
+        "accepted_drafts_per_verify": 3.019704433497537,
+        "cache_hits": {
+          "minimum": 49088,
+          "maximum": 49152
+        }
+      },
+      "decode": {
+        "client_tpot_ms_median": {
+          "median": 18.849124448266487,
+          "minimum": 18.225220800855382,
+          "maximum": 19.39315679423941
+        },
+        "steady_output_tokens_per_second": {
+          "median": 3511.8608840921393,
+          "minimum": 3368.3368732270214,
+          "maximum": 3628.1841761131727
+        },
+        "steady_output_tokens_per_second_per_chip": {
+          "median": 438.9826105115174,
+          "minimum": 421.0421091533777,
+          "maximum": 453.5230220141466
+        },
+        "accepted_drafts_per_verify": 4.166522298343701,
+        "cache_hits": {
+          "minimum": 89920,
+          "maximum": 89984
+        }
+      }
+    },
+    "candidate": {
+      "prefill": {
+        "ttft_ms_median": {
+          "median": 6268.739408347756,
+          "minimum": 6264.611433260143,
+          "maximum": 6287.122114561498
+        },
+        "accepted_drafts_per_verify": 3.1262626262626263,
+        "cache_hits": {
+          "minimum": 49088,
+          "maximum": 49152
+        }
+      },
+      "decode": {
+        "client_tpot_ms_median": {
+          "median": 18.508554378912248,
+          "minimum": 18.337877292025794,
+          "maximum": 18.86377789768393
+        },
+        "steady_output_tokens_per_second": {
+          "median": 3561.8393442316587,
+          "minimum": 3488.3057385011516,
+          "maximum": 3648.6902412562267
+        },
+        "steady_output_tokens_per_second_per_chip": {
+          "median": 445.22991802895734,
+          "minimum": 436.03821731264395,
+          "maximum": 456.08628015702834
+        },
+        "accepted_drafts_per_verify": 4.177103332193672,
+        "cache_hits": {
+          "minimum": 89920,
+          "maximum": 89984
+        }
+      }
+    },
+    "deltas": {
+      "prefill": {
+        "ttft_ms_median": {
+          "baseline": 6302.241573575884,
+          "candidate": 6268.739408347756,
+          "change_percent": -0.5315912574439641
+        }
+      },
+      "decode": {
+        "client_tpot_ms_median": {
+          "baseline": 18.849124448266487,
+          "candidate": 18.508554378912248,
+          "change_percent": -1.8068216923760705
+        },
+        "steady_output_tokens_per_second": {
+          "baseline": 3511.8608840921393,
+          "candidate": 3561.8393442316587,
+          "change_percent": 1.423133255816289
+        },
+        "steady_output_tokens_per_second_per_chip": {
+          "baseline": 438.9826105115174,
+          "candidate": 445.22991802895734,
+          "change_percent": 1.423133255816289
+        }
+      }
+    },
+    "comparison": "historical cross-run; no new A/B; cannot establish isolated kernel causality"
+  }
+}
