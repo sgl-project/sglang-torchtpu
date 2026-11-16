@@ -378,13 +378,23 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 return_value=a2a_backend,
             ),
         ):
-            for group_size in SUPPORTED_BLOCK_SIZES:
-                with self.subTest(group_size=group_size):
-                    self.assertTrue(
-                        can_use_tpu_nvfp4_fused_rs(
-                            layer, group_size=group_size, no_combine=False
+            for activation in ("silu", "silu_and_mul_clamp", "swigluoai"):
+                layer.moe_runner_config.activation = activation
+                for group_size in SUPPORTED_BLOCK_SIZES:
+                    with self.subTest(activation=activation, group_size=group_size):
+                        self.assertTrue(
+                            can_use_tpu_nvfp4_fused_rs(
+                                layer, group_size=group_size, no_combine=False
+                            )
                         )
-                    )
+                        layer.supports_tpu_fused_rs_post_expert_norm = True
+                        self.assertTrue(
+                            can_use_tpu_nvfp4_fused_rs(
+                                layer, group_size=group_size, no_combine=True
+                            )
+                        )
+                        del layer.supports_tpu_fused_rs_post_expert_norm
+            layer.moe_runner_config.activation = "silu"
             layer.moe_ep_size = 2
             self.assertFalse(
                 can_use_tpu_nvfp4_fused_rs(
@@ -485,6 +495,14 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 ),
                 [],
             )
+            layer.moe_runner_config.activation = "gelu"
+            self.assertEqual(
+                unmet_tpu_nvfp4_fused_rs_requirements(
+                    layer, group_size=BLOCK_SIZE, no_combine=False
+                ),
+                ["silu or clamped SwiGLU activation"],
+            )
+            layer.moe_runner_config.activation = "silu"
             self.assertEqual(
                 unmet_tpu_nvfp4_fused_rs_requirements(
                     layer, group_size=BLOCK_SIZE, no_combine=True

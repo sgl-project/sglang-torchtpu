@@ -125,6 +125,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -2904,9 +2905,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     raise ValueError(
                         "encoder SWA replay cannot return cached prompt logprobs"
                     )
-            self.encoder_swa_reset = [
-                r.kv.req_pool_idx is None or r.is_retracted for r in reqs
-            ]
+            self.encoder_swa_reset = [resets_swa_window(r) for r in reqs]
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
@@ -3377,6 +3376,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Also stale residue; None keeps the prefill result path from
         # re-reporting old prefill stats for what is decode work.
         self.prefill_stats = None
+        # Also stale residue: decode rows are never fresh placements, so they
+        # reset no encoder SWA window and fold no replay rows the vote missed.
+        if self.encoder_swa_reset is not None:
+            self.encoder_swa_reset = [False] * bs
         # A 1-token extend's position is arange(prefix, prefix + 1), so prefix
         # must be seq_len - 1; output_ids trails the row by one or zero and
         # cannot stand in for it. Rows past bs are a beam tail, not requests.
