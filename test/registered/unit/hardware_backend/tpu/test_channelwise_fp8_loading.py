@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """CPU checkpoint-ABI tests; no TPU device, kernel execution, or model download.
 
 Guard the explicit opt-in (ordinary/Flash FP8 must remain upstream), channel
@@ -35,11 +36,10 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
-from sglang.srt.runtime_context import get_context, get_flags
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang_tpu.fp8 import (
     TpuChannelwiseFp8Config,
     TpuChannelwiseFp8LinearMethod,
-    TpuChannelwiseFp8MoEMethod,
     TpuFp8Config,
 )
 
@@ -69,7 +69,7 @@ def _block_config(**overrides):
     )
 
 
-def _moe(config):
+def _moe(config, *, intermediate=4, weight_loader=None):
     # Keep real allocation and expert shard loaders without distributed runners.
     layer = FusedMoE.__new__(FusedMoE)
     torch.nn.Module.__init__(layer)
@@ -91,23 +91,14 @@ def _moe(config):
     layer.use_flashinfer_trtllm_moe = False
     layer.scheme = None
     layer.quant_method.create_weights(
-        layer, 2, 4, 4, torch.bfloat16, weight_loader=layer.weight_loader
+        layer,
+        2,
+        4,
+        intermediate,
+        torch.bfloat16,
+        weight_loader=layer.weight_loader if weight_loader is None else weight_loader,
     )
     return layer
-
-
-def _dense():
-    layer = torch.nn.Module()
-    method = TpuChannelwiseFp8LinearMethod(_config())
-    method.create_weights(
-        layer,
-        input_size_per_partition=3,
-        output_partition_sizes=[2, 3],
-        input_size=3,
-        output_size=5,
-        params_dtype=torch.bfloat16,
-    )
-    return layer, method
 
 
 class _LoaderModel(DeepseekV2WeightLoaderMixin, torch.nn.Module):
@@ -148,7 +139,7 @@ def _linear_for_loader(loader, widths, input_width=3):
     return layer, method
 
 
-class TestGlm52Fp8OptIn(CustomTestCase):
+class TestTpuFp8Config(CustomTestCase):
     def test_model_loader_covers_legacy_sources_and_offline_opt_in(self):
         from sglang.srt.model_loader.weight_utils import get_quant_config
 
@@ -275,15 +266,17 @@ class TestGlm52Fp8OptIn(CustomTestCase):
                         TpuFp8Config.from_config(metadata)
 
 
-class TestGlm52Fp8Packing(CustomTestCase):
+class _TpuMoETestCase(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.enterContext(
             get_flags().moe.override(runner_backend=MoeRunnerBackend.PALLAS_TPU)
         )
 
+
+class TestChannelwiseFp8Loading(_TpuMoETestCase):
     def test_dense_channel_scales_have_one_checkpoint_name_and_reconstruct(self):
-        layer, method = _dense()
+        layer, method = _linear_for_loader(None, [2, 3])
         self.assertIsInstance(layer.weight, ModelWeightParameter)
         self.assertIsInstance(layer.weight_scale_inv, ChannelQuantScaleParameter)
         self.assertEqual((layer.weight.input_dim, layer.weight.output_dim), (1, 0))
@@ -489,7 +482,7 @@ class TestGlm52Fp8Packing(CustomTestCase):
     def test_dense_rejects_stale_alias_and_nonchannel_scale_before_transpose(self):
         for stale_alias in (True, False):
             with self.subTest(stale_alias=stale_alias):
-                layer, method = _dense()
+                layer, method = _linear_for_loader(None, [2, 3])
                 if stale_alias:
                     layer.weight_scale_inv = torch.nn.Parameter(
                         layer.weight_scale_inv.detach().clone(), requires_grad=False
@@ -508,19 +501,9 @@ class TestGlm52Fp8Packing(CustomTestCase):
         with get_context().override_server_args(
             tp_size=1, pp_size=1, moe_runner_backend="pallas_tpu"
         ):
-            method = TpuChannelwiseFp8MoEMethod(_config())
-            # Bypass only the distributed runner constructor, not loader logic.
-            layer = FusedMoE.__new__(FusedMoE)
-            torch.nn.Module.__init__(layer)
-            layer.moe_runner_config = SimpleNamespace(is_gated=True)
-            layer.quant_method = method
-            layer.moe_tp_rank = 0
-            layer.moe_tp_size = 1
-            layer.use_padded_loading = False
-            layer.use_presharded_weights = False
-            layer.use_triton_kernels = False
             loader = object()
-            method.create_weights(layer, 2, 4, 3, torch.bfloat16, weight_loader=loader)
+            layer = _moe(_config(), intermediate=3, weight_loader=loader)
+            method = layer.quant_method
             expected = {}
             for stem, shape in (("w13", (2, 6, 4)), ("w2", (2, 4, 3))):
                 weight = getattr(layer, f"{stem}_weight")
@@ -623,12 +606,22 @@ def _load_expert_fixture(layer, fixture, blockwise):
                     param.weight_loader(param, value, suffix, shard, expert)
 
 
-class TestBlockChannelwiseAndDraft(CustomTestCase):
-    def setUp(self):
-        super().setUp()
-        self.enterContext(
-            get_flags().moe.override(runner_backend=MoeRunnerBackend.PALLAS_TPU)
-        )
+class TestChannelwiseMoeAndNextN(_TpuMoETestCase):
+    def assert_moe_fixture(self, layer, fixture, *, check_dtype=True):
+        for stem, (_, _, q, scales) in fixture.items():
+            self.assertTrue(
+                torch.equal(
+                    getattr(layer, f"{stem}_weight").view(torch.uint8),
+                    q.transpose(1, 2).contiguous().view(torch.uint8),
+                )
+            )
+            torch.testing.assert_close(
+                getattr(layer, f"{stem}_weight_scale").reshape(2, -1),
+                scales.to(torch.bfloat16),
+                rtol=0,
+                atol=0,
+                check_dtype=check_dtype,
+            )
 
     def test_channel_scale_loading_is_independent_of_model_architecture(self):
         fixture = _expert_fixture()
@@ -645,19 +638,7 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
                 layer = _moe(config)
                 _load_expert_fixture(layer, fixture, blockwise=False)
                 layer.quant_method.process_weights_after_loading(layer)
-                for stem, (_, _, q, scales) in fixture.items():
-                    self.assertTrue(
-                        torch.equal(
-                            getattr(layer, f"{stem}_weight").view(torch.uint8),
-                            q.transpose(1, 2).contiguous().view(torch.uint8),
-                        )
-                    )
-                    torch.testing.assert_close(
-                        getattr(layer, f"{stem}_weight_scale").float().reshape(2, -1),
-                        scales.to(torch.bfloat16).float(),
-                        rtol=0,
-                        atol=0,
-                    )
+                self.assert_moe_fixture(layer, fixture, check_dtype=False)
 
     def test_block_conversion_and_offline_share_runtime(self):
         fixture = _expert_fixture()
@@ -678,19 +659,8 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
             _load_expert_fixture(offline, fixture, blockwise=False)
             for layer in (converted, offline):
                 layer.quant_method.process_weights_after_loading(layer)
-            for stem in fixture:
-                left, right = (
-                    getattr(layer, f"{stem}_weight") for layer in (converted, offline)
-                )
-                self.assertTrue(
-                    torch.equal(left.view(torch.uint8), right.view(torch.uint8))
-                )
-                torch.testing.assert_close(
-                    getattr(converted, f"{stem}_weight_scale"),
-                    getattr(offline, f"{stem}_weight_scale"),
-                    rtol=0,
-                    atol=0,
-                )
+            for layer in (converted, offline):
+                self.assert_moe_fixture(layer, fixture)
             self.assertIsNone(converted.weight_block_size)
             self.assertFalse(converted.quant_method.handles_moe_reduction)
             self.assertFalse(offline.quant_method.handles_moe_reduction)
@@ -711,6 +681,7 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
             moe_tp_rank=0,
             moe_ep_size=2,
             moe_ep_rank=0,
+            attn_tp_size=2,
             attn_dp_size=1,
             attn_dp_enabled=False,
         )
@@ -757,9 +728,7 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
             patch.object(fp8, "_is_tpu", True),
             patch.object(fp8, "_is_cpu", False),
             patch.dict(os.environ, WORLD_SIZE="2"),
-            patch.object(fp8, "get_parallel", return_value=parallel),
-            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
-            patch("sglang_tpu.fp8_moe.get_parallel", return_value=parallel),
+            get_parallel().override(**vars(parallel)),
             patch(
                 "sglang_tpu.fp8_moe.current_platform.get_available_memory",
                 return_value=(4 * 1024**3, 8 * 1024**3),
@@ -784,19 +753,7 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
                         self.assertTrue(layer.quant_method.handles_moe_reduction)
                         self.assertFalse(layer._tpu_fused_rs_expert_tp)
                         self.assertEqual(layer._tpu_fused_rs_group_offset.tolist(), [0])
-                        for stem, (_, _, q, scales) in fixture.items():
-                            self.assertTrue(
-                                torch.equal(
-                                    getattr(layer, f"{stem}_weight").view(torch.uint8),
-                                    q.transpose(1, 2).contiguous().view(torch.uint8),
-                                )
-                            )
-                            torch.testing.assert_close(
-                                getattr(layer, f"{stem}_weight_scale").reshape(2, -1),
-                                scales.to(torch.bfloat16),
-                                rtol=0,
-                                atol=0,
-                            )
+                        self.assert_moe_fixture(layer, fixture)
                         with patch.object(
                             rs_op,
                             "fused_moe_rs_gather",
@@ -805,18 +762,22 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
                             result = layer.quant_method.apply(layer, dispatch)
                         torch.testing.assert_close(result.hidden_states, x + 7)
 
-            parallel.attn_dp_enabled = True
-            with get_flags().moe.override(
-                runner_backend=MoeRunnerBackend.PALLAS_TPU_FUSED_RS
+            with get_parallel().override(
+                attn_tp_size=1, attn_dp_size=2, attn_dp_enabled=True
             ):
-                with self.assertRaisesRegex(ValueError, "DP attention"):
+                with get_flags().moe.override(
+                    runner_backend=MoeRunnerBackend.PALLAS_TPU_FUSED_RS
+                ):
+                    with self.assertRaisesRegex(ValueError, "DP attention"):
+                        layer = make_layer()
+                        layer.quant_method.process_weights_after_loading(layer)
+                with get_flags().moe.override(runner_backend=None):
                     layer = make_layer()
                     layer.quant_method.process_weights_after_loading(layer)
-            with get_flags().moe.override(runner_backend=None):
-                layer = make_layer()
-                layer.quant_method.process_weights_after_loading(layer)
-                self.assertFalse(layer.quant_method.handles_moe_reduction)
-                self.assertIn("DP attention", layer._tpu_fused_rs_unsupported_reason)
+                    self.assertFalse(layer.quant_method.handles_moe_reduction)
+                    self.assertIn(
+                        "DP attention", layer._tpu_fused_rs_unsupported_reason
+                    )
 
     def test_nextn_loads_channel_experts_and_preserves_exclusions_and_bridge(self):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -883,19 +844,7 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
                 torch.full((4, 8), 0.5, dtype=torch.bfloat16),
             )
             experts.quant_method.process_weights_after_loading(experts)
-            for stem, (_, _, q, scales) in fixture.items():
-                self.assertTrue(
-                    torch.equal(
-                        getattr(experts, f"{stem}_weight").view(torch.uint8),
-                        q.transpose(1, 2).contiguous().view(torch.uint8),
-                    )
-                )
-                torch.testing.assert_close(
-                    getattr(experts, f"{stem}_weight_scale").float().reshape(2, -1),
-                    scales.to(torch.bfloat16).float(),
-                    rtol=0,
-                    atol=0,
-                )
+            self.assert_moe_fixture(experts, fixture, check_dtype=False)
 
 
 if __name__ == "__main__":
