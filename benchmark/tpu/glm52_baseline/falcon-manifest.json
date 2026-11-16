@@ -15,9 +15,10 @@
       "device_type": "v7x",
       "device_topo": "2x2x2",
       "envs": {
-        "SOURCE_COMMIT": "fa6269a0b13fea32cfaf9db51c1b590114a1bd2b",
+        "SOURCE_COMMIT": "d8f342b878e566edce8ade0ebba3ae31e783c867",
         "PYTHONUNBUFFERED": "1",
-        "TPU_TOPOLOGY": "2x2x2"
+        "TPU_TOPOLOGY": "2x2x2",
+        "GLM52_COMPILE_CACHE_ROOT": "/glm52-prior-compile-cache"
       },
       "mounts": [
         {
@@ -61,6 +62,17 @@
             "read:global-max-blocks:2048",
             "read_ahead_kb=1024"
           ]
+        },
+        {
+          "name": "glm52-compile-cache",
+          "type": "gcs",
+          "bucket": "tpu-for-training-falcon-logs",
+          "prefix": "experiments/exp-jjzf5biomm/artifacts/art-tuqtvn2txw/glm52-e2e/compile-cache",
+          "mount_path": "/glm52-prior-compile-cache",
+          "read_only": false,
+          "mount_options": [
+            "implicit-dirs"
+          ]
         }
       ],
       "sources": [
@@ -69,11 +81,11 @@
           "type": "git",
           "repo": "https://github.com/sgl-project/sglang-torchtpu.git",
           "ref": "codex/glm52-e2e-baseline-20261116",
-          "commit": "fa6269a0b13fea32cfaf9db51c1b590114a1bd2b",
+          "commit": "d8f342b878e566edce8ade0ebba3ae31e783c867",
           "path": "/workspace/sglang-torchtpu"
         }
       ]
     }
   },
-  "model_version": "fa6269a0b13fea32cfaf9db51c1b590114a1bd2b"
+  "model_version": "d8f342b878e566edce8ade0ebba3ae31e783c867"
 }

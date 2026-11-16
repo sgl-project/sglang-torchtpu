@@ -40,7 +40,9 @@ HTTP TTFT and first-to-last-output TPOT are client timings, not TPU step times.
 
 The paused native Torch scheduler does not publish fresh load snapshots.
 The client therefore waits for HTTP SSE ingress headers before resuming and
-checks actual batch size separately during execution. Ingress acknowledgements
+checks actual batch size separately during execution. Tokenizer imports, loading,
+and long-input encoding run in a thread so the HTTP event loop can process
+keep-alive closure while CPU work is in progress. Ingress acknowledgements
 alone do not prove scheduler admission or concurrency.
 
 Use `benchmark/tpu/launch_server.py` through this harness on both hosts.
@@ -64,3 +66,8 @@ model correctness, numerical equivalence, or device performance.
 
 See the task execution report for verified results and incomplete validation.
 No model performance number is claimed by committing this harness.
+
+The pinned Falcon manifest also mounts the previous run's compilation cache.
+`GLM52_COMPILE_CACHE_ROOT` selects that mount; omit it to keep a new cache under
+the current artifact. The cache is an optimization and does not replace warmup
+or serving-time compile checks.
