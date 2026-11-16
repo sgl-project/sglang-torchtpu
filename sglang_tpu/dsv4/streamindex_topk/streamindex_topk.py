@@ -233,7 +233,7 @@ def kernel(
     _, num_q_heads, head_dim = q_hbm_ref.shape
 
     if seq_along_lane:
-        (_, kv_sublane_groups, kv_packing, page_size) = cache_kv_hbm_ref.shape
+        _, kv_sublane_groups, kv_packing, page_size = cache_kv_hbm_ref.shape
         kv_head_dim_groups = head_dim // kv_packing
         page_size_per_kv_packing = page_size // kv_packing
     else:
@@ -852,6 +852,12 @@ def _effective_row_lengths(
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
 
 
+def _radix_supported(k):
+    from sglang_tpu.attention.pallas.radix_topk import supports_radix_topk
+
+    return supports_radix_topk(k)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -875,6 +881,7 @@ def _effective_row_lengths(
         "segments",
         "row_count",
         "page_table_in_hbm",
+        "selector",
     ),
 )
 def streamindex_topk(
@@ -908,8 +915,12 @@ def streamindex_topk(
     row_start: jax.Array | None = None,
     row_count: int | None = None,
     page_table_in_hbm: bool = False,
+    selector: str = "sparsecore",
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
+
+    ``selector="radix_v2"`` replaces only selection over the existing score
+    buffer on supported v7/K shapes. CP and return_scores retain sparsecore.
 
     ``page_table_in_hbm`` keeps the page table in HBM and copies one sequence's
     row into SMEM at its first KV block. Off, the table is a scalar-prefetch
@@ -970,6 +981,9 @@ def streamindex_topk(
                 f" decode_req_batch_size * decode_query_size"
                 f" ({decode_req_batch_size * decode_query_size})."
             )
+    if selector not in ("sparsecore", "radix_v2"):
+        raise ValueError(f"Unknown streamindex selector: {selector}")
+
     if decode_query_size > 1:
         if enable_early_exit or cp_size > 1:
             raise NotImplementedError(
@@ -1470,6 +1484,12 @@ def streamindex_topk(
                     branch_max_len=branch_max_len,
                 )
                 topk_scores_list.append(chunk_topk_scores)
+            elif selector == "radix_v2" and _radix_supported(k):
+                from sglang_tpu.attention.pallas.radix_topk import select_radix_topk
+
+                chunk_topk_idxs = select_radix_topk(
+                    scores, k, row_lengths, scheduling_group_id=sc_group
+                )
             else:
                 chunk_topk_idxs = sparsecore_topk(
                     scores,
