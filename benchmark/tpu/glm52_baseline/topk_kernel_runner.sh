@@ -10,9 +10,8 @@ export JAX_PLATFORMS=tpu PYTHONPATH=.:python
 export JAX_COMPILATION_CACHE_DIR="/tmp/glm52-baseline-runtime/kernel-cache-$SOURCE_COMMIT"
 export GLM52_RUNTIME_DIR="$OUT/actual-process-runtime"
 export PYTHONPATH="$PWD/benchmark/tpu/glm52_baseline/runtime_probe:$PYTHONPATH"
-"$PY" -u test/registered/tpu/unit/test_dsa_index_topk.py TestDsaRadixTopk \
-  2>&1 | tee "$OUT/device-tests.log"
-"$PY" -u test/manual/kernels/benchmark_glm52_radix_topk.py --repeats 20 \
-  --source-v2 benchmark/tpu/glm52_baseline/reference/radix_topk_v2.py \
-  2>&1 | tee "$OUT/benchmark.jsonl"
-echo TOPK_KERNEL_PASS
+"$PY" -u test/registered/kernels/ops/attention/test_dsa_radix_serving_op.py \
+  2>&1 | tee "$OUT/serving-bridge.log"
+JAX_PLATFORMS=tpu "$PY" -u test/manual/kernels/tune_glm52_radix_topk.py --repeats 12 \
+  2>&1 | tee "$OUT/tuning.jsonl"
+echo TOPK_TUNING_PASS
