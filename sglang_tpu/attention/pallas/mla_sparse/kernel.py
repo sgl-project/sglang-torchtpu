@@ -83,6 +83,28 @@ def _gather_page_ids_kernel(windows_ref, logical_ref, out_ref, *, num_chunks):
     out_ref[...] = out
 
 
+# Above this many 128-page chunks, the unrolled loop's cost grows with MAX_MODEL_LEN rather
+# than with the sequence: bound the loop by each token block's largest logical page instead.
+_GATHER_PAGE_BOUNDED_MIN_CHUNKS = 16
+
+
+def _gather_page_ids_bounded_kernel(nchunks_ref, windows_ref, logical_ref, out_ref):
+    logical = logical_ref[...]  # i32[block_tokens, topk]
+
+    def body(c, out):
+        start = pl.multiple_of(c * _GATHER_PAGE_CHUNK, _GATHER_PAGE_CHUNK)
+        window_chunk = windows_ref[:, pl.ds(start, _GATHER_PAGE_CHUNK)]
+        local = logical - c * _GATHER_PAGE_CHUNK
+        gathered = jnp.take_along_axis(
+            window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
+        )
+        return jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, out)
+
+    out_ref[...] = lax.fori_loop(
+        0, nchunks_ref[pl.program_id(0)], body, jnp.zeros_like(logical)
+    )
+
+
 def gather_page_ids(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     seq_page_ids: jax.Array,  # i32[num_tokens, topk]  (logical page within seq)
@@ -109,6 +131,33 @@ def gather_page_ids(
         pad = padded_tokens - num_tokens
         windows = jnp.pad(windows, ((0, pad), (0, 0)))
         logical = jnp.pad(logical, ((0, pad), (0, 0)))
+
+    if num_chunks > _GATHER_PAGE_BOUNDED_MIN_CHUNKS:
+        nblocks = padded_tokens // block_tokens
+        nchunks = (
+            logical.reshape(nblocks, block_tokens * topk).max(axis=1)
+            // _GATHER_PAGE_CHUNK
+            + 1
+        ).astype(jnp.int32)
+        out = pl.pallas_call(
+            _gather_page_ids_bounded_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1,
+                in_specs=[
+                    pl.BlockSpec((block_tokens, padded_pps), lambda t, n: (t, 0)),
+                    pl.BlockSpec((block_tokens, topk), lambda t, n: (t, 0)),
+                ],
+                out_specs=pl.BlockSpec((block_tokens, topk), lambda t, n: (t, 0)),
+                grid=(nblocks,),
+            ),
+            out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                disable_bounds_checks=True,
+            ),
+            name="gather_page_ids_bounded",
+        )(nchunks, windows, logical)
+        return out[:num_tokens]
 
     out = pl.pallas_call(
         functools.partial(_gather_page_ids_kernel, num_chunks=num_chunks),
