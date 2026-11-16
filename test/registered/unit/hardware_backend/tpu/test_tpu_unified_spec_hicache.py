@@ -286,7 +286,8 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
             for fl, sl in (((), (0, 1, 2, 3)), ((0, 1), ())):
                 p, a = make_target()
                 d = attach_draft(a, fl, sl, head_dim=128)
-                self.assertLess(_pair(p, host_size=0.01)[0].page_num, kv0.page_num)
+                # Draft host sidecars stay outside --hicache-size (matching separate).
+                self.assertEqual(_pair(p, host_size=0.01)[0].page_num, kv0.page_num)
                 exp = hicache_auto_size._pool_bytes(d.swa_kv_pool if sl else d) * (
                     1 if sl else p.size // d.size
                 )
@@ -362,6 +363,94 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "PD disaggregation"):
                 ukp.unified_kv_pool_enabled(kvc)
+
+    def test_write_back_swa_copy_ahead_and_host_alloc_extend_no_d2h(self):
+        from sglang.srt.mem_cache.allocator import swa
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType as CT
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.hicache_write_back_copy_ahead import attach_copy_ahead
+
+        # 1. Unified write_back defaults SWA copy-ahead to 131072 without shrinking Full.
+        tp, ta = make_target(size=128)
+        rp = ReqToTokenPool(
+            size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+        )
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=rp,
+                token_to_kv_pool_allocator=ta,
+                page_size=4,
+                sliding_window_size=8,
+                tree_components=(CT.FULL, CT.SWA),
+                tree_core_backend="python",
+            )
+        )
+        ctrl = object.__new__(TpuDMAHybridCacheController)
+        ctrl.write_policy = "write_back"
+        cache.cache_controller = ctrl
+        cache.tree_core.has_swa_host_pool = True
+
+        with (
+            tpu_envs.SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS.override(None),
+            tpu_envs.SGLANG_TPU_HICACHE_WRITE_BACK_SWA_COPY_AHEAD_TOKENS.override(None),
+        ):
+            attach_copy_ahead(cache=cache, chunked_prefill_size=4096)
+            ca = cache._write_back_copy_ahead
+            self.assertEqual(
+                (ca.copy_ahead_tokens, ca.swa_copy_ahead_tokens), (16384, 131072)
+            )
+            with (
+                patch.object(ca, "_cover_full") as cf,
+                patch.object(ca, "_cover_swa") as cs,
+            ):
+                ca.refill()
+                self.assertEqual(cf.call_args.kwargs["budget"], 16384)
+                self.assertEqual(cs.call_args.kwargs["budget"], 131072)
+
+        with tpu_envs.SGLANG_TPU_HICACHE_WRITE_BACK_SWA_COPY_AHEAD_TOKENS.override(500):
+            attach_copy_ahead(cache=cache, chunked_prefill_size=4096)
+            self.assertEqual(cache._write_back_copy_ahead.swa_copy_ahead_tokens, 500)
+
+        # 2. alloc_extend updates full_to_swa_index_mapping + draft SWA sidecar from host
+        #    buffers without reading back from device ("meta" raises on any D2H copy).
+        with (
+            patch.object(swa, "_is_tpu", True),
+            patch.object(
+                swa,
+                "TpuPagedTokenToKVPoolAllocator",
+                TpuPagedTokenToKVPoolAllocator,
+                create=True,
+            ),
+        ):
+            _, ta_meta = make_target(size=64)
+            dp_meta = attach_draft(ta_meta, (), (0, 1))
+            ta_meta.full_attn_allocator.device = "meta"
+            ta_meta.swa_attn_allocator.device = "meta"
+            z0, neg1, s8 = torch.tensor([0]), torch.tensor([-1]), torch.tensor([8])
+            out_cpu1 = torch.empty((8,), dtype=torch.int32)
+            out_dev = ta_meta.alloc_extend(
+                z0, z0, s8, s8, neg1, 8, out_indices_cpu=out_cpu1
+            )
+            self.assertEqual(out_dev.device.type, "meta")
+
+            out_cpu = torch.empty((8,), dtype=torch.int32)
+            s16 = torch.tensor([16])
+            last = out_cpu1[-1:].long()
+            out_dev2 = ta_meta.alloc_extend(
+                s8, s8, s16, s16, last, 8, out_indices_cpu=out_cpu
+            )
+            self.assertEqual(out_dev2.device.type, "meta")
+            self.assertTrue(
+                torch.all(ta_meta.full_to_swa_index_mapping[out_cpu.long()] > 0)
+            )
+            self.assertTrue(
+                torch.all(dp_meta.full_to_swa_index_mapping[out_cpu.long()] > 0)
+            )
 
 
 if __name__ == "__main__":

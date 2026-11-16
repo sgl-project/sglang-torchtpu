@@ -394,6 +394,10 @@ class TpuEnvs:
     # of the next eviction victims kept copied to host. Unset: four chunked-prefill
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
+    # Separate copy-ahead token budget for the SWA eviction order under write_back
+    # (independent of the Full leaf window when set). Unset: 131072 on the unified
+    # KV pool, else 1/4 of SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS.
+    SGLANG_TPU_HICACHE_WRITE_BACK_SWA_COPY_AHEAD_TOKENS = EnvInt(None)
 
     # TPU PD KV transfer (disaggregation/tpu/conn.py)
     # Transfers between logged latency summaries; 0 disables.

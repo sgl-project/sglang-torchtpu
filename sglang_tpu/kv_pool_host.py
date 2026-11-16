@@ -54,7 +54,6 @@ from sglang.srt.mem_cache.pool_host.base import (
     sync_fixed_hicache_size,
 )
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import next_power_of_2
@@ -683,24 +682,6 @@ class _UnifiedHostSide:
     live_pages: set[int] = field(default_factory=set)
 
 
-def _attached_draft_bytes_per_token(
-    unified_pool: TpuUnifiedSWAKVPool, page_size: int, num_swa_groups: int
-) -> int:
-    total = 0
-    for draft in getattr(unified_pool, "_attached_draft_pools", ())[:1]:
-        if isinstance(draft, SWAKVPool):
-            if getattr(draft.swa_kv_pool, "layer_num", 0) > 0:
-                swa_page_bytes = sum(
-                    int(t[0].nbytes) for t in page_major_tensors(draft.swa_kv_pool)
-                )
-                denom = page_size * num_swa_groups
-                total += (swa_page_bytes + denom - 1) // denom
-        elif getattr(draft, "layer_num", 0) > 0:
-            full_page_bytes = sum(int(t[0].nbytes) for t in page_major_tensors(draft))
-            total += full_page_bytes // page_size
-    return total
-
-
 class _SharedUnifiedDMAHostState:
     """Shared host page arena and single DMA engine for ``TpuUnifiedSWAKVPool``."""
 
@@ -726,11 +707,8 @@ class _SharedUnifiedDMAHostState:
         self.full_size_per_token = self.bytes_per_page // page_size
 
         if host_size > 0:
-            effective_bpt = self.full_size_per_token + _attached_draft_bytes_per_token(
-                unified_pool, page_size, self.num_swa_groups
-            )
             tokens = sync_fixed_hicache_size(
-                int(host_size * 1e9 // effective_bpt), host_size
+                int(host_size * 1e9 // self.full_size_per_token), host_size
             )
         else:
             tokens = int(unified_pool.size * host_to_device_ratio)
