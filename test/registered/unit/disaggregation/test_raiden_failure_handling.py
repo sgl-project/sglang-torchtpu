@@ -92,7 +92,10 @@ def _prefill_manager():
     mgr._pulling = None
     # Settle-aware cleanup state shared by every manager mode.
     mgr._pulling_cleared = set()
-    mgr._cleared_plans = {}
+    mgr._pull_sessions = {}
+    mgr._reshard_plans = {}
+    mgr._cancelled_recvs = set()
+    mgr._cleared_plans = set()
     mgr._stale_plans = []
     mgr._engine_poll_failing_since = {}
     mgr.chunked_transfer = False
@@ -127,6 +130,10 @@ def _decode_manager():
     mgr._failed = set()
     mgr._native_failed = set()
     mgr._completed_recv = set()
+    mgr._pull_sessions = {}
+    mgr._reshard_plans = {}
+    mgr._cancelled_recvs = set()
+    mgr._pending_unregisters = {}
     mgr.chunked_transfer = False
     mgr.waiting_timeout = 300
     mgr._message_handlers = {RoomFailed.TAG: mgr._on_room_failed}
@@ -369,6 +376,8 @@ def _decode_manager_stub(**overrides):
         _prefill=None,
         _failed=set(),
         _native_failed=set(),
+        _pull_sessions={},
+        _reshard_plans={},
         room_has_active_io=lambda room: False,
         # _check_waiting_timeout takes the manager's connection lock.
         connection_lock=threading.Lock(),
@@ -437,9 +446,15 @@ class TestReceiverFailurePaths(unittest.TestCase):
         mgr._aborted = {}
         mgr._failed = set()
         mgr._native_failed = set()
+        mgr._completed_recv = set()
+        mgr._pull_sessions = {}
+        mgr._reshard_plans = {}
+        mgr._cancelled_recvs = set()
+        mgr._pending_unregisters = {}
         mgr._decode.remote_blocks = {ROOM: [11, 12]}
         mgr._decode.remote_endpoint = {ROOM: "peer"}
         mgr._decode.local_blocks = {ROOM: [21, 22]}
+        mgr._engine = engine
         mgr._swa_engine = None
         mgr.chunked_transfer = False
         mgr._full_engine_max_blocks = 4
@@ -2053,6 +2068,8 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
+        mgr._pull_sessions = {}
+        mgr._reshard_plans = {}
         mgr.connection_lock = threading.Lock()
         mgr.connection_pool = {
             "10.0.0.1:8998_0_0_0": [{"rank_ip": "10.0.0.1", "rank_port": 4444}],
@@ -2095,6 +2112,8 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
+        mgr._pull_sessions = {}
+        mgr._reshard_plans = {}
         mgr.connection_lock = threading.Lock()
         mgr.connection_pool = {}
         mgr.request_status = {ROOM: KVPoll.WaitingForInput}
