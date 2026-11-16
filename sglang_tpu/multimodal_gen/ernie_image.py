@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ERNIE-Image on TPU workers: one compiled DiT per image size and prompt bucket.
+"""ERNIE-Image on TPU workers: one compiled program per image size and prompt bucket.
 
 Runtime patch, tracked debt:
 - Why: torch_tpu compiles static shapes. The single-stream DiT attends

@@ -39,9 +39,13 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
-| ERNIE-Image | T2I 1024x1024, 50 steps, prompt enhancer on | 8 | 7.6 s | 0.061 s | 0.22 s | 53.8 GB |
-| ERNIE-Image | T2I 1024x1024, 50 steps, `"use_pe": false` | 8 | 3.4 s | 0.061 s | 0.22 s | 53.8 GB |
-| ERNIE-Image | T2I 2048x2048, 50 steps, prompt enhancer on | 8 | 27.9 s | 0.469 s | 1.0 s | 92.5 GB |
+| ERNIE-Image | T2I 1024x1024, 50 steps, prompt enhancer on | 8 | 7.8 s | 0.063 s | 0.22 s | 53.4 GB |
+| ERNIE-Image | T2I 1024x1024, 50 steps, `"use_pe": false` | 8 | 3.5 s | 0.063 s | 0.22 s | 53.4 GB |
+| ERNIE-Image | T2I 2048x2048, 50 steps, prompt enhancer on | 8 | 17.7 s | 0.255 s | 0.90 s | 95.5 GB |
+
+ERNIE-Image rows: torch_tpu 0.2.1.dev20261028201649. The prompt pads to a multiple of 512 tokens; the first request
+at a new image size compiles for 30-48 s (2048x2048: 127 s), and the first prompt in a new 512-token bucket at a
+served size for about 10 s.
 
 
 ## Example requests
