@@ -82,7 +82,11 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
-from sglang_tpu.hooks.qwen4_exp import check_dense_qsa_context, dense_qsa_config
+from sglang_tpu.hooks.qwen4_exp import (
+    check_dense_qsa_context,
+    dense_qsa_config,
+    load_ple_table_on_host,
+)
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
@@ -119,6 +123,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.configs.model_config.ModelConfig.__init__",
         check_dense_qsa_context,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.qwen4_exp.Qwen4ExpForConditionalGeneration.load_weights",
+        load_ple_table_on_host,
+        HookType.AROUND,
     ),
     (
         "sglang.srt.utils.common.set_gpu_proc_affinity",
