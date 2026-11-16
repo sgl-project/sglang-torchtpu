@@ -5884,7 +5884,7 @@ def mla(
 
     streams = streams or {}
     weight_copies = weights.make_projection_copies()
-    mla_scope = [_phase_start("q6_mla_projections")]
+    mla_scope = []
 
     def start_copy(name):
         if name in streams:
@@ -5899,17 +5899,6 @@ def mla(
             return streams[name].dot(x, guard)
         getattr(weight_copies, name).wait()
         return _dot(x, getattr(weights, f"{name}_projection_vmem")[...])
-
-    if not weights_are_prefetched:
-        weight_copies.query_down.start()
-        weight_copies.key_value_down.start()
-    start_copy("query_up")
-    start_copy("key_value_up")
-    start_copy("output_gate")
-    if not output_projection_after_query_down:
-        start_copy("output")
-    if dsa is not None:
-        dsa.start()
 
     # Diagnostic (KernelConfig.dcp_skip): skip the DCP query gather, local
     # attention and/or partial combine, e.g. "gather,combine". Results are
@@ -5930,85 +5919,6 @@ def mla(
             attention.prime()
         return attention
 
-    dcp_attention = make_attention() if dsa is None else None
-    if dsa is not None:
-        # When the selection will mark every attention step (its dense regime),
-        # the first steps' pages do not depend on it: start them now, as the
-        # selection-free attention does, and only the key copies after it.
-        early_prime = dsa.dense_attention(dcp[0], position_ref, batch_size)
-
-        @pl.when(early_prime)
-        def prime_pages():
-            make_attention()
-
-    if "query_down" in streams:
-        query_latent = (
-            streams["query_down"]
-            .dot(hidden_ref[...], communication_workspace.reduction_phase[0] >= 0)
-            .astype(jnp.bfloat16)
-            .astype(jnp.float32)
-        )
-    else:
-        weight_copies.query_down.wait()
-        query_latent = (
-            _dot(hidden_ref[...], weights.query_down_projection_vmem[...])
-            .astype(jnp.bfloat16)
-            .astype(jnp.float32)
-        )
-    if output_projection_after_query_down:
-        # The pool views are reinterpret casts, so the compiler need not see
-        # that this copy aliases the q-down loads above; a region (on a runtime
-        # condition that is never false) keeps it from being hoisted over them.
-        @pl.when(communication_workspace.reduction_phase[0] >= 0)
-        def start_output_projection_copy():
-            start_copy("output")
-
-    query_latent = (
-        query_latent
-        * jax.lax.rsqrt(
-            jnp.mean(query_latent * query_latent, axis=1, keepdims=True) + epsilon
-        )
-        * weights.query_normalization[...]
-    ).astype(jnp.bfloat16)
-
-    weight_copies.key_value_down.wait()
-    compressed = _dot(
-        hidden_ref[...], weights.key_value_down_projection_vmem[...]
-    ).astype(jnp.bfloat16)
-    key_value_latent = compressed[:, :512].astype(jnp.float32)
-    key_value_latent = (
-        key_value_latent
-        * jax.lax.rsqrt(
-            jnp.mean(
-                key_value_latent * key_value_latent,
-                axis=1,
-                keepdims=True,
-            )
-            + epsilon
-        )
-        * weights.key_value_normalization[...]
-    ).astype(jnp.bfloat16)
-    workspace.query_vmem[...] = (
-        projection("query_up", query_latent)
-        .astype(jnp.bfloat16)
-        .reshape(batch_size, 3, 256)
-    )
-
-    # The new token's latent row, handed out for the owner's commit.
-    new_latent = jnp.concatenate(
-        (
-            key_value_latent,
-            compressed[:, 512:576],
-            jnp.zeros((batch_size, 64), jnp.bfloat16),
-        ),
-        axis=1,
-    )
-    new_key_ref[:, 0] = new_latent[:, :256]
-    new_key_ref[:, 1] = new_latent[:, 256:512]
-    new_key_ref[:, 2] = jnp.concatenate(
-        (new_latent[:, 512:], jnp.zeros((batch_size, 128), jnp.bfloat16)), axis=1
-    )
-    new_value_ref[:, :3] = jnp.zeros((batch_size, 3, 128), jnp.bfloat16)
     def absorbed_queries():
         """W_UK absorbed into this rank's queries (score scale folded in),
         [B, 3, 640] FP32."""
@@ -6048,28 +5958,146 @@ def mla(
         and not mla_dcp.chunked(batch_size)  # chunked calls send per chunk (not prototyped)
         and "gather_late" not in dcp_skip
     )
-    if dsa is not None:
 
-        def send_queries_early():
-            make_attention(prime=False).send_queries(
-                absorbed_queries(), new_latent.astype(jnp.float32), dcp[0].layer % 2
+    def project_and_select():
+        """q6: the projections, the new latent row's hand-out and (DSA) the
+        selection; returns the new latent row and the attention."""
+        mla_scope.append(_phase_start("q6_mla_projections"))
+        if not weights_are_prefetched:
+            weight_copies.query_down.start()
+            weight_copies.key_value_down.start()
+        start_copy("query_up")
+        start_copy("key_value_up")
+        start_copy("output_gate")
+        if not output_projection_after_query_down:
+            start_copy("output")
+        if dsa is not None:
+            dsa.start()
+
+        dcp_attention = make_attention() if dsa is None else None
+        if dsa is not None:
+            # When the selection will mark every attention step (its dense regime),
+            # the first steps' pages do not depend on it: start them now, as the
+            # selection-free attention does, and only the key copies after it.
+            early_prime = dsa.dense_attention(dcp[0], position_ref, batch_size)
+
+            @pl.when(early_prime)
+            def prime_pages():
+                make_attention()
+
+        if "query_down" in streams:
+            query_latent = (
+                streams["query_down"]
+                .dot(hidden_ref[...], communication_workspace.reduction_phase[0] >= 0)
+                .astype(jnp.bfloat16)
+                .astype(jnp.float32)
             )
+        else:
+            weight_copies.query_down.wait()
+            query_latent = (
+                _dot(hidden_ref[...], weights.query_down_projection_vmem[...])
+                .astype(jnp.bfloat16)
+                .astype(jnp.float32)
+            )
+        if output_projection_after_query_down:
+            # The pool views are reinterpret casts, so the compiler need not see
+            # that this copy aliases the q-down loads above; a region (on a runtime
+            # condition that is never false) keeps it from being hoisted over them.
+            @pl.when(communication_workspace.reduction_phase[0] >= 0)
+            def start_output_projection_copy():
+                start_copy("output")
 
-        dcp_attention = make_attention(
-            dsa.selection(
-                dcp[0],
-                position_ref,
-                hidden_ref[...],
-                query_latent,
-                dcp[0].layer % 2,
-                after_gather=send_queries_early if queries_sent else None,
-            ),
-            prime=False,
+        query_latent = (
+            query_latent
+            * jax.lax.rsqrt(
+                jnp.mean(query_latent * query_latent, axis=1, keepdims=True) + epsilon
+            )
+            * weights.query_normalization[...]
+        ).astype(jnp.bfloat16)
+
+        weight_copies.key_value_down.wait()
+        compressed = _dot(
+            hidden_ref[...], weights.key_value_down_projection_vmem[...]
+        ).astype(jnp.bfloat16)
+        key_value_latent = compressed[:, :512].astype(jnp.float32)
+        key_value_latent = (
+            key_value_latent
+            * jax.lax.rsqrt(
+                jnp.mean(
+                    key_value_latent * key_value_latent,
+                    axis=1,
+                    keepdims=True,
+                )
+                + epsilon
+            )
+            * weights.key_value_normalization[...]
+        ).astype(jnp.bfloat16)
+        workspace.query_vmem[...] = (
+            projection("query_up", query_latent)
+            .astype(jnp.bfloat16)
+            .reshape(batch_size, 3, 256)
         )
-        pl.when(early_prime)(dcp_attention.prime_keys)
-        pl.when(jnp.logical_not(early_prime))(dcp_attention.prime)
 
-    _phase_end(mla_scope.pop())
+        # The new token's latent row, handed out for the owner's commit.
+        new_latent = jnp.concatenate(
+            (
+                key_value_latent,
+                compressed[:, 512:576],
+                jnp.zeros((batch_size, 64), jnp.bfloat16),
+            ),
+            axis=1,
+        )
+        new_key_ref[:, 0] = new_latent[:, :256]
+        new_key_ref[:, 1] = new_latent[:, 256:512]
+        new_key_ref[:, 2] = jnp.concatenate(
+            (new_latent[:, 512:], jnp.zeros((batch_size, 128), jnp.bfloat16)), axis=1
+        )
+        new_value_ref[:, :3] = jnp.zeros((batch_size, 3, 128), jnp.bfloat16)
+        if dsa is not None:
+
+            def send_queries_early():
+                make_attention(prime=False).send_queries(
+                    absorbed_queries(), new_latent.astype(jnp.float32), dcp[0].layer % 2
+                )
+
+            dcp_attention = make_attention(
+                dsa.selection(
+                    dcp[0],
+                    position_ref,
+                    hidden_ref[...],
+                    query_latent,
+                    dcp[0].layer % 2,
+                    after_gather=send_queries_early if queries_sent else None,
+                ),
+                prime=False,
+            )
+            pl.when(early_prime)(dcp_attention.prime_keys)
+            pl.when(jnp.logical_not(early_prime))(dcp_attention.prime)
+
+        _phase_end(mla_scope.pop())
+        return new_latent, dcp_attention
+
+    if dsa is None or not _config().decode_mla_prefix_region:
+        new_latent, dcp_attention = project_and_select()
+    else:
+        # One trip; the count is read at run time (the phase is never
+        # negative) so the loop stays and the overlays start a new overlay
+        # after it. The selection holds only refs: the attention is rebuilt
+        # from it after the loop.
+        selections = []
+
+        def one_trip(_, carry):
+            latent, attention = project_and_select()
+            selections.append(attention.selection)
+            return latent
+
+        new_latent = pl.loop(
+            0,
+            (communication_workspace.reduction_phase[0] >= 0).astype(jnp.int32),
+            init_carry=jnp.zeros((batch_size, 640), jnp.bfloat16),
+        )(one_trip)
+        dcp_attention = make_attention(selections[0], prime=False)
+
     mla_scope.append(_phase_start("q7_mla_attend"))
     workspace.maximum_vmem[...] = jnp.full((batch_size, 3, 1), -jnp.inf, jnp.float32)
     workspace.denominator_vmem[...] = jnp.zeros((batch_size, 3, 1), jnp.float32)
