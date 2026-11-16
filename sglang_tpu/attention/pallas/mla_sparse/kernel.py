@@ -17,6 +17,7 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel - GLM5.2 DeepSeek Sparse Attention."""
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -83,26 +84,56 @@ def _gather_page_ids_kernel(windows_ref, logical_ref, out_ref, *, num_chunks):
     out_ref[...] = out
 
 
-# Above this many 128-page chunks, the unrolled loop's cost grows with MAX_MODEL_LEN rather
-# than with the sequence: bound the loop by each token block's largest logical page instead.
-_GATHER_PAGE_BOUNDED_MIN_CHUNKS = 16
+# Cost of one dynamic fori_loop iteration (scalar trip count, loop-carried output) relative to
+# one chunk step of the loop body, measured with gather_page_ids on tpu7x (4096 tokens x top-k
+# 2048: ~33 us per iteration vs ~20 us per chunk step across 512 token blocks).
+_GATHER_PAGE_LOOP_ITERATION_COST_IN_CHUNKS = 1.6
+# Fixed cost of one token-block grid step (DMA of the block + pipeline step, ~0.6 us) relative
+# to one chunk step of the unrolled kernel (~0.06 us per block), same measurement. While the
+# table is narrower than this the unrolled kernel is bound by the fixed cost, not by the chunk
+# loop, so bounding the loop cannot save time and only adds loop overhead.
+_GATHER_PAGE_BLOCK_STEP_COST_IN_CHUNKS = 10
 
 
-def _gather_page_ids_bounded_kernel(nchunks_ref, windows_ref, logical_ref, out_ref):
+def _gather_page_chunks_per_iteration(num_chunks: int) -> int:
+    """Chunks the bounded kernel unrolls per loop iteration.
+
+    A block that needs ``c`` chunks costs about ``ceil(c / g) * (o + g * u)``: ``o`` per loop
+    iteration, ``u`` per chunk step, with on average ``(g - 1) / 2`` wasted tail steps.
+    Minimizing ``c * o / g + g * u / 2`` gives ``g = sqrt(2 * c * o / u)``, with ``c`` taken as
+    the table width. ``g`` is then evened out over the table, so a full-length block runs
+    ``ceil(c / g)`` iterations with fewer than one wasted step per iteration.
+    """
+    g = math.sqrt(2 * num_chunks * _GATHER_PAGE_LOOP_ITERATION_COST_IN_CHUNKS)
+    num_iterations = max(1, round(num_chunks / g))
+    return -(-num_chunks // num_iterations)
+
+
+def _gather_page_ids_bounded_kernel(
+    nchunks_ref, windows_ref, logical_ref, out_ref, *, chunks_per_iteration, num_chunks
+):
+    """Visits only the chunks up to each token block's largest logical page.
+
+    ``chunks_per_iteration`` chunks are unrolled per loop iteration so the loop overhead is
+    amortized; tail steps past the table repeat its last chunk, which selects the same values.
+    """
     logical = logical_ref[...]  # i32[block_tokens, topk]
+    g = chunks_per_iteration
 
-    def body(c, out):
-        start = pl.multiple_of(c * _GATHER_PAGE_CHUNK, _GATHER_PAGE_CHUNK)
-        window_chunk = windows_ref[:, pl.ds(start, _GATHER_PAGE_CHUNK)]
-        local = logical - c * _GATHER_PAGE_CHUNK
-        gathered = jnp.take_along_axis(
-            window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
-        )
-        return jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, out)
+    def body(i, out):
+        for j in range(g):
+            c = jnp.minimum(i * g + j, num_chunks - 1)
+            start = pl.multiple_of(c * _GATHER_PAGE_CHUNK, _GATHER_PAGE_CHUNK)
+            window_chunk = windows_ref[:, pl.ds(start, _GATHER_PAGE_CHUNK)]
+            local = logical - c * _GATHER_PAGE_CHUNK
+            gathered = jnp.take_along_axis(
+                window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
+            )
+            out = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, out)
+        return out
 
-    out_ref[...] = lax.fori_loop(
-        0, nchunks_ref[pl.program_id(0)], body, jnp.zeros_like(logical)
-    )
+    num_iterations = (nchunks_ref[pl.program_id(0)] + g - 1) // g
+    out_ref[...] = lax.fori_loop(0, num_iterations, body, jnp.zeros_like(logical))
 
 
 def gather_page_ids(
@@ -132,7 +163,12 @@ def gather_page_ids(
         windows = jnp.pad(windows, ((0, pad), (0, 0)))
         logical = jnp.pad(logical, ((0, pad), (0, 0)))
 
-    if num_chunks > _GATHER_PAGE_BOUNDED_MIN_CHUNKS:
+    chunks_per_iteration = _gather_page_chunks_per_iteration(num_chunks)
+    # One iteration covering the whole table is the unrolled kernel without the loop.
+    if (
+        num_chunks > _GATHER_PAGE_BLOCK_STEP_COST_IN_CHUNKS
+        and chunks_per_iteration < num_chunks
+    ):
         nblocks = padded_tokens // block_tokens
         nchunks = (
             logical.reshape(nblocks, block_tokens * topk).max(axis=1)
@@ -140,7 +176,11 @@ def gather_page_ids(
             + 1
         ).astype(jnp.int32)
         out = pl.pallas_call(
-            _gather_page_ids_bounded_kernel,
+            functools.partial(
+                _gather_page_ids_bounded_kernel,
+                chunks_per_iteration=chunks_per_iteration,
+                num_chunks=num_chunks,
+            ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,
                 in_specs=[
