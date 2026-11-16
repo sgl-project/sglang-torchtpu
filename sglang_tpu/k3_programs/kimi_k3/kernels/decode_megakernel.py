@@ -2250,32 +2250,37 @@ def _run_routed_expert_stream(
                     else:
                         multi_pair = jnp.bool_(False)
 
-                    @pl.when(has_first & has_second & ~compact_pair & ~multi_pair)
-                    @_scoped("e_pass_pair")
-                    def execute_noncompact_pair():
-                        if compact_only:
-                            run_expert_in_passes(
-                                first_rows,
-                                first_slot_mask,
-                                first_copies,
-                                first_row_count,
-                                current_base_slot,
-                                paired_gate=compact_overflow,
-                                row_words=scheduled_row_words(0),
-                                expert=first_expert,
-                            )
-                            run_expert_in_passes(
-                                second_rows,
-                                second_slot_mask,
-                                second_copies,
-                                second_row_count,
-                                current_base_slot + 1,
-                                paired_gate=compact_overflow,
-                                row_words=scheduled_row_words(1),
-                                expert=second_expert,
-                            )
-                        else:
-                            execute_full_pair()
+                    # KernelConfig.shared_expert_passes: the noncompact pair and
+                    # tail run their passes from one copy (execute_noncompact_passes).
+                    shared_passes = SHARED_EXPERT_PASSES and compact_only and not EXPERT_STEAL
+                    if not shared_passes:
+
+                        @pl.when(has_first & has_second & ~compact_pair & ~multi_pair)
+                        @_scoped("e_pass_pair")
+                        def execute_noncompact_pair():
+                            if compact_only:
+                                run_expert_in_passes(
+                                    first_rows,
+                                    first_slot_mask,
+                                    first_copies,
+                                    first_row_count,
+                                    current_base_slot,
+                                    paired_gate=compact_overflow,
+                                    row_words=scheduled_row_words(0),
+                                    expert=first_expert,
+                                )
+                                run_expert_in_passes(
+                                    second_rows,
+                                    second_slot_mask,
+                                    second_copies,
+                                    second_row_count,
+                                    current_base_slot + 1,
+                                    paired_gate=compact_overflow,
+                                    row_words=scheduled_row_words(1),
+                                    expert=second_expert,
+                                )
+                            else:
+                                execute_full_pair()
 
                     compact_tail = has_first & ~has_second & (first_row_count == 1)
 
@@ -2348,22 +2353,65 @@ def _run_routed_expert_stream(
                     else:
                         multi_tail = jnp.bool_(False)
 
-                    @pl.when(
-                        has_first & ~has_second & (first_row_count != 1) & ~multi_tail
-                    )
-                    def execute_noncompact_tail():
-                        if compact_only:
-                            run_expert_in_passes(
-                                first_rows,
-                                first_slot_mask,
-                                first_copies,
-                                first_row_count,
-                                current_base_slot,
-                                row_words=scheduled_row_words(0),
-                                expert=first_expert,
-                            )
-                        else:
-                            execute_full_tail()
+                    if shared_passes:
+                        # The noncompact pair or tail: each of its experts in
+                        # turn, first then second, with the operands of its
+                        # unrolled copy (the tail's gate/up is the paired
+                        # order's product either way).
+
+                        @pl.when(
+                            has_first
+                            & ~compact_pair
+                            & ~multi_pair
+                            & ~compact_tail
+                            & ~multi_tail
+                        )
+                        @_scoped("e_pass")
+                        def execute_noncompact_passes():
+                            def pick(first, a, b):
+                                # Masks select as int32 (no mask selects).
+                                if a.dtype == jnp.bool_:
+                                    a, b = a.astype(jnp.int32), b.astype(jnp.int32)
+                                    return jnp.where(first, a, b) != 0
+                                return jnp.where(first, a, b)
+
+                            @pl.loop(0, jnp.where(has_second, 2, 1))
+                            def noncompact_expert(index):
+                                first = index == 0
+                                slot = current_base_slot + index
+                                run_expert_in_passes(
+                                    pick(first, first_rows, second_rows),
+                                    pick(first, first_slot_mask, second_slot_mask),
+                                    copy_expert(
+                                        pick(first, first_expert, second_expert), slot
+                                    ),
+                                    pick(first, first_row_count, second_row_count),
+                                    slot,
+                                    paired_gate=compact_overflow,
+                                    row_words=scheduled_row_words(index),
+                                )
+
+                    else:
+
+                        @pl.when(
+                            has_first
+                            & ~has_second
+                            & (first_row_count != 1)
+                            & ~multi_tail
+                        )
+                        def execute_noncompact_tail():
+                            if compact_only:
+                                run_expert_in_passes(
+                                    first_rows,
+                                    first_slot_mask,
+                                    first_copies,
+                                    first_row_count,
+                                    current_base_slot,
+                                    row_words=scheduled_row_words(0),
+                                    expert=first_expert,
+                                )
+                            else:
+                                execute_full_tail()
 
                     if share_full_finish:
 
@@ -7575,6 +7623,9 @@ COMPACT_ONLY = _config().compact_only
 # Shared finishers keep the B16-B128 expert loop and its successor within
 # IMEM (decode runs these batches without deduplicated HLO calls).
 SHARED_EXPERT_FINISHERS = _config().shared_expert_finishers
+# KernelConfig.shared_expert_passes: one copy of the compact tiles' eight-row
+# passes for an iteration's noncompact pair or tail (B16-B128).
+SHARED_EXPERT_PASSES = _config().shared_expert_passes
 # Grouped MXFP4 routes at B16-B128 keep the 2/4/8-row gate/up pairs but
 # finish overflowing experts in eight-row passes; without the full-batch
 # fallback the expert loop fits in IMEM next to its predecessor.

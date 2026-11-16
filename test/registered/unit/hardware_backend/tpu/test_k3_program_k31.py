@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=780, suite="base-a-test-cpu")
+register_cpu_ci(est_time=930, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -1979,6 +1979,163 @@ print("OK")
 """
 
     def test_matches_the_row_scan(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", self.SCRIPT],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
+
+
+class TestSharedExpertPasses(CustomTestCase):
+    """KernelConfig.shared_expert_passes: the routed-expert stream with compact
+    tiles (B16, B32) runs an iteration's noncompact pair or tail (experts with
+    more rows than a compact tile) from one copy of the eight-row passes, a
+    loop over its one or two experts, instead of three unrolled copies. In
+    Pallas interpret mode both give bitwise-identical outputs over routes that
+    take every pair and tail path, with and without the SMEM expert schedule
+    and B16 one-hot staging (NaN/inf latents in rows without routes, signed
+    zeros in routed rows)."""
+
+    SCRIPT = r"""
+import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+from types import SimpleNamespace
+import jax, jax.numpy as jnp, ml_dtypes, numpy as np
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk
+
+C, K, W, OUT, SLOTS = 8, 512, 256, 128, 4
+NAMES = ("gate_up", "gate_up_scales", "down", "down_scales")
+
+
+def stream(B, shared, scheduled, one_hot, latents, experts, probabilities, counts, totals, weights):
+    dmk.SHARED_EXPERT_PASSES = shared  # read when the stream is traced
+    dmk.B16_ONE_HOT_STAGING = one_hot
+    k = experts.shape[1]
+    rows = dmk._expert_accumulator_rows(B, jnp.uint32, group_pending_routes=True)
+
+    def kernel(latent_ref, expert_ref, probability_ref, count_ref, total_ref, *refs):
+        hbm, (out_ref, source_ref), vmem = refs[:4], refs[4:6], refs[6:10]
+        gate_up_acc, down_acc, processed, first, second, semaphores, table, table_semaphore = refs[10:]
+        source_ref[...] = latent_ref[...]
+
+        def copy_expert(expert, slot, *, gate_up=True, down=True):
+            wanted = (gate_up, gate_up, down, down)
+            return SimpleNamespace(**{
+                name: pltpu.make_async_copy(hbm[i].at[expert], vmem[i].at[slot],
+                                            semaphores.at[slot, i]) if wanted[i] else None
+                for i, name in enumerate(NAMES)})
+
+        selected, route_counts = expert_ref[:, :k], count_ref[:, 0]
+        dmk._start_initial_expert_weight_copies(
+            selected, route_counts, copy_expert, slot_count=SLOTS, already_started=0,
+            group_pending_routes=True)
+        schedule = None
+        if scheduled:
+            schedule = dmk._expert_schedule(processed.at[:8], table, table_semaphore)
+            dmk._start_expert_schedule(schedule, selected, route_counts)
+        dmk._run_routed_expert_stream(
+            source_ref, selected, probability_ref[:, :k], route_counts, total_ref[:, 0], *vmem,
+            out_ref, gate_up_acc, down_acc, processed, first, second, copy_expert,
+            expert_input_size=K, expert_width=W, expert_output_size=OUT,
+            group_pending_routes=True, expert_schedule=schedule)
+
+    vmem, hbm = pl.BlockSpec(memory_space=pltpu.VMEM), pl.BlockSpec(memory_space=pl.ANY)
+    wide = lambda x: np.pad(x.reshape(B, -1), ((0, 0), (0, 128 - x.size // B)), mode="edge")
+    out, source = pl.pallas_call(
+        kernel,
+        out_shape=(jax.ShapeDtypeStruct((B, OUT), jnp.float32),
+                   jax.ShapeDtypeStruct(latents.shape, jnp.bfloat16)),
+        in_specs=[vmem] * 5 + [hbm] * 4,
+        out_specs=(vmem, vmem),
+        scratch_shapes=[*(pltpu.VMEM((SLOTS, *w.shape[1:]), w.dtype) for w in weights),
+                        pltpu.VMEM((rows[0], 4 * W), jnp.float32),
+                        pltpu.VMEM((rows[1], OUT), jnp.float32),
+                        pltpu.VMEM((B, 128), jnp.int32), pltpu.VMEM((C, K), jnp.float32),
+                        pltpu.VMEM((C, K), jnp.float32), pltpu.SemaphoreType.DMA((SLOTS, 4)),
+                        pltpu.SMEM((8, 128), jnp.int32), pltpu.SemaphoreType.DMA],
+        interpret=pltpu.InterpretParams(),
+    )(latents, wide(experts), wide(probabilities), wide(counts), wide(totals), *weights)
+    return np.asarray(out), np.asarray(source)
+
+
+def case(B, seed, live, local_experts, k):
+    rng = np.random.default_rng(seed)
+    latents = rng.standard_normal((B, K + 128)).astype(np.float32)
+    rows = rng.choice(B, live, replace=False)
+    dead = np.setdiff1d(np.arange(B), rows)
+    if dead.size:
+        latents[dead[:, None], rng.integers(0, K, 3)[None, :]] = (np.nan, np.inf, -np.inf)
+        latents[dead[0]] = np.nan
+    for r in rows[:3]:
+        latents[r, rng.integers(0, K, 6)] = (0.0, -0.0, -0.0, 1e-30, -1e-30, 3e4)
+    popularity = rng.dirichlet(np.full(local_experts, 0.6))
+    experts, probabilities = np.zeros((B, k), np.int32), np.zeros((B, k), np.float32)
+    counts = np.zeros(B, np.int32)
+    for r in rows:
+        n = counts[r] = rng.integers(1, k + 1)
+        experts[r, :n] = rng.choice(local_experts, n, replace=False, p=popularity)
+        probabilities[r, :n] = rng.uniform(0.02, 0.2, n)
+    totals = np.where(counts > 0, probabilities.sum(1) + rng.uniform(0.5, 1, B), 1)
+    bits = lambda *shape: rng.integers(0, 2**32, shape, dtype=np.uint64).astype(np.uint32)
+    exponents = lambda *shape: rng.integers(119, 123, shape).astype(np.uint8)
+    weights = (bits(local_experts, K // 8, 2 * W), exponents(local_experts, K // 32, 2 * W),
+               bits(local_experts, W // 8, OUT), exponents(local_experts, W // 32, OUT))
+    return (latents.astype(ml_dtypes.bfloat16), experts, probabilities, counts,
+            totals.astype(np.float32), weights)
+
+
+def paths(experts, counts):
+    # Distinct experts run in pairs in id order; their row counts pick the path.
+    routed = (np.arange(experts.shape[1]) < counts[:, None])
+    sizes = [n for e in range(experts.max() + 1) if (n := int(np.sum(routed & (experts == e))))]
+    kinds = set()
+    for i in range(0, len(sizes), 2):
+        pair = sizes[i:i + 2]
+        size = "pass" if max(pair) > C else "single" if max(pair) == 1 else "multi"
+        kinds.add(f"{size}_{'pair' if len(pair) == 2 else 'tail'}")
+    return kinds
+
+
+# (batch, schedule, one-hot staging): B16 as before and as served; B32 (no schedule).
+CASES = {(16, False, False): ((11, 13, 9, 4), (10, 14, 5, 3), (1, 3, 5, 3), (22, 16, 4, 4)),
+         (16, True, True): ((11, 13, 9, 4), (10, 14, 5, 3), (1, 3, 5, 3), (22, 16, 4, 4)),
+         (32, False, False): ((37, 20, 7, 3), (32, 28, 6, 4))}
+for (B, scheduled, one_hot), cases in CASES.items():
+    covered = set()
+    for seed, live, local_experts, k in cases:
+        latents, experts, probabilities, counts, totals, weights = case(B, seed, live, local_experts, k)
+        covered |= paths(experts, counts)
+        inputs = (latents, experts, probabilities, counts, totals, weights)
+        old, old_source = stream(B, False, scheduled, one_hot, *inputs)
+        new, new_source = stream(B, True, scheduled, one_hot, *inputs)
+        routed = counts > 0
+        assert np.array_equal(old.view(np.uint32), new.view(np.uint32)), (B, seed)
+        assert np.array_equal(old_source.view(np.uint16), new_source.view(np.uint16)), (B, seed)
+        assert np.all(np.isfinite(new)) and np.all(np.any(old[routed] != 0, axis=1)), (B, seed)
+    want = {"pass_pair", "pass_tail", "multi_pair"}
+    if B == 16:
+        want = {f"{s}_{p}" for s in ("single", "multi", "pass") for p in ("pair", "tail")}
+    assert want <= covered, (B, covered)
+print("OK")
+"""
+
+    def test_one_copy_matches_the_unrolled_passes(self):
         import os
         import subprocess
         import sys
