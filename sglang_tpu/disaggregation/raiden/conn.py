@@ -510,14 +510,8 @@ class RaidenKVManager(
         )
 
     # ----- reshard staging --------------------------------------------------
-    # Staged writers land in extra decode pages from the token allocator; the
-    # decode merges them in before the request runs. Allocation
-    # (send_metadata) and release (clear) happen at scheduler points every
-    # attention-TP rank reaches in the same order, keeping allocators identical.
 
     def attach_token_allocator(self, allocator: Any) -> None:
-        """Hand the decode's token-to-KV allocator to the manager, for reshard
-        staging pages. Installed by sglang_tpu.patches on DecodePreallocQueue."""
         self._token_allocator = allocator
 
     @property
@@ -527,7 +521,6 @@ class RaidenKVManager(
     def _alloc_reshard_staging(
         self, *, n_pages: int, n_swa_pages: int
     ) -> ReshardStaging:
-        """Allocate ``n_pages`` full (and ``n_swa_pages`` SWA) staging pages."""
         from sglang.srt.mem_cache.allocator.hisparse import (
             DeepSeekV4HiSparseTokenToKVPoolAllocator,
         )
@@ -546,15 +539,15 @@ class RaidenKVManager(
                 "that share a decode pack, and the decode has fewer"
             )
 
+        # Attention-TP ranks allocate and free in lockstep, keeping allocators aligned.
         allocator = self._staging_allocator
         page_size = int(self.kv_args.page_size)
         if (
             isinstance(allocator, SWATokenToKVPoolAllocator)
             and type(allocator).alloc is SWATokenToKVPoolAllocator.alloc
         ):
-            # The hybrid SWA allocator only allocates whole requests; staging needs
-            # plain pages from each pool, with no full->SWA mapping since the
-            # decode addresses both.
+            # SWATokenToKVPoolAllocator.alloc only allocates whole requests;
+            # draw plain pages from each sub-pool with no full->SWA mapping.
             full_alloc = allocator.full_attn_allocator
             swa_alloc = (
                 full_alloc
@@ -611,7 +604,6 @@ class RaidenKVManager(
                 allocator.free(indices)
 
     def merge_reshard_staging(self, room: int) -> None:
-        """Merge staged K/V slots into destination pages before notifying receiver completion."""
         from sglang_tpu.disaggregation.raiden.reshard_merge import (
             merge_staged_pages,
         )
@@ -1625,8 +1617,8 @@ class RaidenKVManager(
         if self._pipeline is not None:
             self._pipeline.clear(room)
         self._drop_room_state(room, clear_failure_record=True)
-        # The framework releases the room's own pages at this same point, so
-        # its staging pages go back to the allocator with them.
+        # The framework releases the room's own pages at this same point,
+        # so its staging pages go back to the allocator with them.
         self._free_reshard_staging(room)
 
     def _drop_room_state(

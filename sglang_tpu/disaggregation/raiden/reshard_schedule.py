@@ -196,8 +196,6 @@ class ReshardGeometry:
     def _entry(
         self, *, src_head: int, num_heads: int, dst_head: int
     ) -> Tuple[int, int, int, int, int]:
-        """(src_offset, size, src_stride, dst_offset, dst_stride) of a run of
-        ``num_heads`` heads, per token; the strides are the two row widths."""
         return (
             src_head * self.hp_bytes,
             num_heads * self.hp_bytes,
@@ -211,17 +209,14 @@ class ReshardGeometry:
             self.entry_bytes(prefill_rank, decode_rank)
 
     def _sources_of(self, decode_rank: int) -> List[int]:
-        """Attention-TP ranks of the prefill that feed ``decode_rank``."""
         if self.src_tp >= self.dst_tp:
             return source_ranks_for(decode_rank % self.dst_tp, self.ratio)
         return [decode_rank % self.dst_tp * self.src_tp // self.dst_tp]
 
     def _slot_bytes(self) -> int:
-        """Bytes one K/V slot adds to a token row (a pack row / kv_packing)."""
         return self.padded_head_dim * self.element_size
 
     def decode_rank_plan(self, decode_rank: int) -> Dict[int, WriterPlan]:
-        """Determine whether each prefill source lands DIRECT or STAGED for decode_rank."""
         heads_per_pack = max(1, self.kv_packing // 2)
         src_row = self._token_bytes(self.src_tp)
         dst_row = self._token_bytes(self.dst_tp)
@@ -243,8 +238,8 @@ class ReshardGeometry:
                 direct[prefill_rank] = (dh, n, packed)
             else:
                 staged.append(prefill_rank)
-        # Replicas of one kv-head (more prefill ranks than kv-heads) carry the
-        # same bytes: they share one staging slot and land identically.
+        # Replicas of one kv-head carry identical bytes;
+        # they share one staging slot and land identically.
         staged_slices = list(dict.fromkeys(slices[p] for p in staged))
         if len(staged_slices) * src_row > dst_row:
             src_hpr = self.heads_per_rank(self.src_tp)
@@ -278,8 +273,8 @@ class ReshardGeometry:
                 ),
                 merges=(),
             )
-        # Each decode head's final bytes come from a merge (which runs after
-        # every push), or from a direct push no other padded pack overwrites.
+        # Each decode head's final bytes come from a post-push merge,
+        # or from a direct push no other padded pack overwrites.
         unplaced = [
             h
             for h in range(dst_heads)
@@ -299,15 +294,12 @@ class ReshardGeometry:
         return self.decode_rank_plan(decode_rank)[prefill_rank % self.src_tp]
 
     def merge_spec(self, decode_rank: int) -> Tuple[Tuple[int, int, int], ...]:
-        """Return (staging_slot, decode_slot, num_slots) copy specs for staged head merges."""
         plans = self.decode_rank_plan(decode_rank)
         merges = (m for rank in sorted(plans) for m in plans[rank].merges)
         return tuple(dict.fromkeys(merges))  # replicas merge the same slots
 
 
 class WriterPlan(NamedTuple):
-    """How one prefill rank's contribution lands on one decode rank."""
-
     staged: bool  # lands in the decode's staging pages, not its real pages
     entry: Tuple[int, int, int, int, int]  # per-token schedule entry bytes
     merges: Tuple[Tuple[int, int, int], ...]  # (staging_slot, decode_slot, n)
@@ -415,10 +407,7 @@ def build_receiver_request(
     full id, while the byte geometry uses the engine's attention-TP rank within
     its replica (``sender_id % src_tp``). ``dst_mem_type = HBM`` makes the
     receiver auto-H2D the assembled host staging into HBM.
-
-    A staged source (``ReshardGeometry.decode_rank_plan``) lands in
-    ``staging_block_ids`` -- decode pages paired one-to-one with
-    ``dst_block_ids`` -- instead of the real pages.
+    Staged sources land in ``staging_block_ids``, paired 1:1 with ``dst_block_ids``.
     """
     plans = geom.decode_rank_plan(decode_rank)
     req = pb2.StartTransferRequest()

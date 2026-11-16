@@ -1040,13 +1040,10 @@ def _patch_scheduler_reject_unservable_requests() -> None:
 def _patch_raiden_reshard_staging_allocator() -> None:
     """Hand the decode token allocator to RaidenKVManager for staged FP8 resharding.
 
-    Why: DecodePreallocQueue._init_kv_manager attaches the KV pool to the
-    manager, but not self.token_to_kv_pool_allocator needed to allocate staging pages.
-    How: wrap DecodePreallocQueue._init_kv_manager and call
-    attach_token_allocator when the created manager is a RaidenKVManager.
+    Why: core DecodePreallocQueue._init_kv_manager attaches only token_to_kv_pool.
+    How: wrap _init_kv_manager to call RaidenKVManager.attach_token_allocator.
     Upstream PR or issue: not filed yet.
-    Remove when: DecodePreallocQueue._init_kv_manager passes or attaches the
-    token allocator to the KV manager upstream.
+    Remove when: core _init_kv_manager passes or attaches the token allocator.
     """
     from sglang.srt.disaggregation.decode import DecodePreallocQueue
 

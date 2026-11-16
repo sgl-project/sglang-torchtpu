@@ -120,9 +120,8 @@ class DecodeState:
     reshard_meta: Dict[int, dict] = field(default_factory=dict)
     reshard_registered: Set[int] = field(default_factory=set)
 
-    # Staging pages of rooms whose reshard has staged writers. Freed
-    # by clear_room, not by the generic table cleanup, so that the token
-    # allocator gets them back exactly once.
+    # Freed by clear_room, not generic table cleanup,
+    # so the token allocator gets staging pages back once.
     reshard_staging: Dict[int, "ReshardStaging"] = field(default_factory=dict)
 
 
@@ -131,8 +130,6 @@ class _StagingAllocator(Protocol):
 
 
 class ReshardStaging(msgspec.Struct, frozen=True):
-    """Tracks staging pages and allocator handles allocated for staged resharding."""
-
     pages: Tuple[int, ...]
     swa_pages: Tuple[int, ...]
     frees: Tuple[Tuple[_StagingAllocator, Any], ...]

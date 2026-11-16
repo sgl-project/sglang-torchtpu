@@ -14,10 +14,10 @@ _INT_OF_WIDTH = {1: torch.uint8, 2: torch.int16, 4: torch.int32}
 def bucket_pages(
     *, real_pages: Sequence[int], staging_pages: Sequence[int]
 ) -> Tuple[List[int], List[int]]:
-    """Pad real and staging page lists to the next power of two using dummy page 0."""
     if len(real_pages) != len(staging_pages):
         raise ValueError("real and staging page lists must pair one-to-one")
     n = len(real_pages)
+    # Power-of-two batch sizes bound Pallas recompilations; page 0 is reserved.
     size = 1 << max(0, (n - 1).bit_length())
     pad = [0] * (size - n)
     return list(real_pages) + pad, list(staging_pages) + pad
@@ -26,7 +26,6 @@ def bucket_pages(
 def _slot_pairs(
     *, merges: Sequence[Merge], kv_packing: int
 ) -> Tuple[Tuple[Tuple[int, int], Tuple[int, int]], ...]:
-    """((stage_pack, stage_lane), (dst_pack, dst_lane)) for every merged slot."""
     pairs = []
     for stage_slot, decode_slot, num_slots in merges:
         for i in range(num_slots):
@@ -47,7 +46,6 @@ def _merge_layer(
     merges: Sequence[Merge],
     write_pages: Optional[Callable[..., None]] = None,
 ) -> None:
-    """Merge staged slots into real pages for one layer buffer via write_pages."""
     if write_pages is None:
         from sglang_tpu.kv_page_write import write_pages_torch as write_pages
     target = buf
@@ -68,7 +66,6 @@ def merge_staged_pages(
     merges: Sequence[Merge],
     write_pages: Optional[Callable[..., None]] = None,
 ) -> None:
-    """Merge staged slots across all layer buffers in a pool."""
     if not bufs or not real_pages or not merges:
         return
     for buf in bufs:

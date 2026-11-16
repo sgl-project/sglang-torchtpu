@@ -875,9 +875,8 @@ class RaidenReceiverMixin:
         src_attn_tp = self.attn_tp_size * ratio
         r = self.kv_args.engine_rank % self.attn_tp_size
         source_ranks = list(range(r * ratio, (r + 1) * ratio))
-        # Refuse unsupported head slices before messaging prefill so the room fails immediately.
-        # Writers whose heads share a decode pack with another writer's land
-        # in staging pages and are merged in on completion.
+        # Stage shared-pack writers before messaging prefill;
+        # refuse unstageable slices so the room fails immediately.
         staging = None
         try:
             staged_ranks = set()
@@ -886,7 +885,7 @@ class RaidenReceiverMixin:
                 plans = geometry.decode_rank_plan(r)
                 staged_ranks |= {p for p, plan in plans.items() if plan.staged}
                 if staged_ranks and self._staging_allocator is None:
-                    # No allocator to stage with: keep the strict refusal.
+                    # check_decode_rank rejects slices that require staging.
                     geometry.check_decode_rank(r)
             if staged_ranks:
                 staging = self._alloc_reshard_staging(
@@ -927,8 +926,8 @@ class RaidenReceiverMixin:
             if staging is not None:
                 self._decode.reshard_staging[room] = staging
         for source_rank, info in zip(source_ranks, bootstrap_infos):
-            # A staged source pushes into the staging pages paired one-to-one
-            # with the room's pages; it needs no other protocol change.
+            # A staged source pushes to staging pages paired 1:1 with the room's pages;
+            # it needs no other protocol change.
             blocks, swa_blocks = local_blocks, local_swa_blocks or []
             if source_rank in staged_ranks:
                 blocks, swa_blocks = staging.pages, staging.swa_pages
@@ -1599,8 +1598,7 @@ class RaidenKVReceiver(CommonKVReceiver):
             # notify.
             return self._conclude_failed(notify=False)
         if self.kv_mgr.is_recv_done(self.bootstrap_room):
-            # Staged reshard writers are merged into the real pages
-            # here, on the scheduler thread, before the request can run.
+            # Merge staged writers on the scheduler thread before the request can run.
             try:
                 self.kv_mgr.merge_reshard_staging(self.bootstrap_room)
             except Exception as e:

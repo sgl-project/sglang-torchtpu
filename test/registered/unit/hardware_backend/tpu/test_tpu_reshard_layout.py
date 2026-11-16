@@ -278,7 +278,6 @@ def _apply(entry, source_pages, dest_pages):
 
 
 def _apply_merge(dest_pages, decode_t, layout, real_pages, staging_pages, merges):
-    """The decode's merge, defined on logical slots, realized on the bytes."""
     offsets = _byte_offsets(decode_t, layout)
     for real, stage in zip(real_pages, staging_pages):
         for stage_slot, decode_slot, num_slots in merges:
@@ -299,9 +298,6 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
     LIVE = [PAGE_SIZE, PAGE_SIZE, 35]
 
     def _transfer(self, dtype, src_tp, dst_tp, total_heads, layout, replica=0):
-        """``replica`` offsets the prefill engine ids by whole attention-TP
-        groups, as a prefill with DP attention (or several DP replicas)
-        numbers them; the geometry uses ``engine_id % src_tp``."""
         src_heads = max(1, total_heads // src_tp)
         dst_heads = max(1, total_heads // dst_tp)
         prefill_t = _fused_layer(dtype, src_heads)
@@ -478,7 +474,6 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
                 self.assertEqual(plan.entry, geometry.entry_bytes(rank, decode_rank))
 
     def test_general_head_counts(self):
-        """Other kv-head counts and TP pairs, staged or not, both dtypes."""
         cases = [
             (16, 16, 8),  # fp8: 1 head -> 2 heads, staged
             (16, 16, 4),  # 1 -> 4 heads, two staged writers per staging row
@@ -498,20 +493,15 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
                     self._check(dtype, src_tp, dst_tp, total_heads=total)
 
     def test_prefill_dp_replica_engine_ids(self):
-        """Fan-in from a prefill whose engine ids are offset by whole
-        attention-TP groups (prefill DP attention / DP replicas): the geometry
-        keys on ``engine_id % src_tp`` and places the same bytes."""
+        """Prefill engine ids offset by attention-TP replicas place identical bytes."""
         for dtype in (FP8, torch.bfloat16):
             for replica in (1, 3):
                 with self.subTest(dtype=dtype, replica=replica):
                     self._check(dtype, 8, 4, replica=replica)
 
     def test_fan_out_geometry_places_or_refuses(self):
-        """Decode attention TP > prefill attention TP. At runtime Raiden maps
-        each such decode rank to one prefill rank and pulls whole pages (see
-        test_finer_decode_*), so this path is refused unless heads are
-        replicated; the reshard geometry itself either places correctly or
-        raises an actionable error -- never a silent misplacement."""
+        """When decode_tp > prefill_tp,
+        decode_rank_plan either places bytes accurately or raises ValueError."""
         cases = {
             (FP8, 4, 8): False,  # one staged head per decode rank
             (torch.bfloat16, 4, 8): False,
@@ -537,8 +527,7 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
             geometry.decode_rank_plan(1)
 
     def test_swa_receiver_registers_plan(self):
-        """The decode registers its sliding-window receive plan with the SWA
-        engine (tpu_sync is stubbed so this runs on CPU-only CI)."""
+        """Reshard SWA receive must register its active plan on the SWA engine."""
         mgr = _manager(_fused_layer(FP8, 2), 4)
         mgr._swa_kv_caches = [_fused_layer(FP8, 2)]
         mgr._engine = mock.Mock()
@@ -592,8 +581,7 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
             wrong.check_token_bytes(tp=4, actual=row, what="decode")
 
     def test_fp8_replicated_entry_unchanged(self):
-        """TP16 -> attention TP8 fp8 (1 head -> 1 head) keeps the whole padded
-        pack move it had before, and nothing is staged."""
+        """TP16 -> attention TP8 fp8 (1 -> 1 head) moves the 512 B pack unstaged."""
         decode_t = _fused_layer(FP8, 1)
         geometry = _manager(decode_t, 8)._make_geometry(16, 8)
         for prefill_rank in (0, 1, 14, 15):
@@ -772,9 +760,8 @@ class TestTpuReshardMerge(unittest.TestCase):
             bucket_pages(real_pages=[1, 2], staging_pages=[3])
 
     def test_merge_writes_back_through_the_pool_page_write(self):
-        """The merged pages go back through kv_page_write.write_pages_torch
-        (the in-place aliased page write load_cpu_copy uses), once per layer,
-        into the live buffer's storage -- never an eager in-place op on it."""
+        """Merged pages must write back via kv_page_write.write_pages_torch,
+        targeting each layer's live storage once without eager in-place ops."""
         import sglang_tpu.kv_page_write as kv_page_write
 
         bufs = [_fused_layer(FP8, 2), _fused_layer(FP8, 2)]
@@ -799,8 +786,6 @@ class TestTpuReshardMerge(unittest.TestCase):
 
 
 class _FakeAllocator:
-    """Paged token allocator stand-in that records every alloc and free."""
-
     def __init__(self, pages):
         self.free_pages = list(pages)
         self.live = {}
@@ -829,8 +814,7 @@ class _FakeAllocator:
 
 
 class TestTpuReshardStagingLifecycle(unittest.TestCase):
-    """Staging pages: allocated once per staged room, handed to the staged
-    sources, merged once, returned to the allocator exactly once."""
+    """Staged rooms must allocate, merge, and free staging pages at most once."""
 
     def _decode_manager(self, allocator, src_tp=8, dst_tp=4):
         decode_t = _fused_layer(FP8, max(1, TOTAL_KV_HEADS // dst_tp), num_pages=16)
@@ -922,13 +906,10 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
     def test_failed_rooms_and_aborts_do_not_leak(self):
         allocator = _FakeAllocator(range(10, 16))
         mgr, _ = self._decode_manager(allocator)
-        # Room cleared (abort / timeout / failure all end in clear_room)
-        # before its transfer ever completes: no merge, pages returned.
+        # Abort, timeout, and failure all end in clear_room before merge.
         self._register(mgr, 1, [3, 4])
         self._register(mgr, 2, [5, 6])
         self.assertEqual(len(allocator.free_pages), 2)
-        # Not enough pages for a third room: it fails with the reason and
-        # allocates nothing.
         self._register(mgr, 3, [7, 8, 9])
         self.assertIn("3", mgr._failed)
         self.assertIn("free KV pages", mgr.failure_records[3])
@@ -956,9 +937,6 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         self.assertEqual(allocator.frees, 0)
 
     def _hybrid_swa_allocator(self, full_pages, swa_pages):
-        """The real SWATokenToKVPoolAllocator class (its alloc() asserts
-        page_size == 1) over real paged sub-allocators, as on a paged
-        GPT-OSS decode; only its constructor's pool wiring is skipped."""
         from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
@@ -976,15 +954,14 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         allocator.page_size = PAGE_SIZE
         allocator.full_attn_allocator = paged(full_pages)
         allocator.swa_attn_allocator = paged(swa_pages)
+        # SWATokenToKVPoolAllocator.alloc asserts page_size == 1.
         with self.assertRaises(AssertionError):
-            allocator.alloc(PAGE_SIZE)  # the F1 failure, j-a0bd1397
+            allocator.alloc(PAGE_SIZE)
         return allocator
 
     def test_paged_hybrid_swa_allocator_stages_both_pools(self):
-        """GPT-OSS decodes run the hybrid SWA allocator, whose alloc() only
-        serves page_size 1 (F1 j-a0bd1397: ``assert self.page_size == 1``).
-        Staging takes plain pages from its full and SWA sub-allocators, sends
-        both to the staged source, merges both pools and frees both."""
+        """Under SWATokenToKVPoolAllocator with page_size > 1,
+        staged resharding must stage, merge, and free both full and SWA pools."""
         from sglang_tpu.disaggregation.raiden.serde import ReshardReq
 
         allocator = self._hybrid_swa_allocator(15, 15)
@@ -1204,8 +1181,8 @@ class TestTpuUnifiedSwaReshardStaging(unittest.TestCase):
         return recv
 
     def test_unified_swa_staging_allocates_exact_physical_pages(self):
-        """Unified SWA staging must allocate one physical page per expanded full and SWA page,
-        never multiplying expanded SWA pages by num_swa_groups again."""
+        """Unified SWA staging must allocate one physical page per full and SWA page,
+        without multiplying SWA pages by num_swa_groups."""
         pool, alloc = self._build_unified_pool_and_allocator(num_phys_pages=64)
         mgr = self._build_decode_mgr(pool=pool, allocator=alloc)
         f_page = (
