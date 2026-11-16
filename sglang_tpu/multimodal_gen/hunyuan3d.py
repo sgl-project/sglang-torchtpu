@@ -4,10 +4,10 @@
 Runtime patch, tracked debt:
 - Why: ``VanillaVolumeDecoder`` evaluates the occupancy logits on a dense grid
   (385^3 points at octree resolution 384) in 32000-point chunks sliced from one
-  grid tensor, so every chunk starts at a new storage offset, which torch_tpu
-  guards: a compiled decoder would compile once per chunk. Each chunk also
+  device grid, so every chunk starts at a new storage offset. Each chunk also
   recomputes the cross-attention keys and values of the same latents, and every
-  rank decodes the whole grid.
+  rank decodes the whole grid. On TPU a one-core server's stock decode does not
+  finish its warmup mesh in 20 minutes (CDK j-5f091b77).
 - How: :func:`install` replaces ``VanillaVolumeDecoder.__call__`` for latents
   on TPU and a ``CrossAttentionDecoder`` geometry decoder with
   ``downsample_ratio == 1`` and no K/V cache (other calls run the stock
@@ -18,12 +18,12 @@ Runtime patch, tracked debt:
       takes chunks [r * P, (r + 1) * P), P = ceil(chunks / W), so only the last
       chunk (the stock tail) has a second shape;
   (2) the keys and values are computed once per request with the stock layers,
-      and each chunk runs the decoder's layers in the stock order on them
-      (compiled under --enable-torch-compile unless
-      SGLANG_TPU_ENABLE_HUNYUAN3D_DECODE_COMPILE=0) and returns flat logits;
+      and each chunk runs the decoder's layers in the stock order on them and
+      returns flat logits;
   (3) each rank pads its logits to P chunks, the decode group all-gathers them
-      and the padding is trimmed: eager, the grid equals the stock grid bit for
-      bit. Surface extraction stays stock, on every rank.
+      and the padding is trimmed: the grid equals the stock grid bit for bit
+      (on CPU, test_diffusion_tpu_hunyuan3d). Surface extraction stays stock,
+      on every rank.
 - Upstream PR or issue: none.
 - Remove when: the volume decoders take a platform-provided chunk layout and
   split the grid over the ranks.
@@ -39,11 +39,6 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.models.vaes import hunyuan3d_vae as vae_module
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-from sglang.multimodal_gen.runtime.utils.torch_compile import (
-    build_torch_compile_kwargs,
-)
-from sglang_tpu.envs import envs
 
 # Devices that take these paths.
 _DEVICE_TYPES = ("tpu",)
@@ -57,13 +52,6 @@ def _decode_group():
         return None
     group = parallel_state.get_decode_parallel_group_coordinator()
     return group if group.world_size > 1 else None
-
-
-def _compile_enabled() -> bool:
-    return bool(
-        get_global_server_args().enable_torch_compile
-        and envs.SGLANG_TPU_ENABLE_HUNYUAN3D_DECODE_COMPILE.get()
-    )
 
 
 def _takes_chunk_path(geo_decoder) -> bool:
@@ -123,19 +111,6 @@ def _decode_chunk(geo_decoder, queries: torch.Tensor, kv: torch.Tensor):
     return geo_decoder.output_proj(x).flatten(1)
 
 
-def _chunk_step(geo_decoder):
-    step = geo_decoder.__dict__.get("_tpu_chunk_step")
-    if step is None:
-
-        def step(queries, kv):
-            return _decode_chunk(geo_decoder, queries, kv)
-
-        if _compile_enabled():
-            step = torch.compile(step, **build_torch_compile_kwargs(mode=None))
-        geo_decoder.__dict__["_tpu_chunk_step"] = step
-    return step
-
-
 @torch.no_grad()
 def volume_decoder_call(
     self,
@@ -168,8 +143,7 @@ def volume_decoder_call(
     )
     block = geo_decoder.cross_attn_decoder
     kv = block.attn.c_kv(block.ln_2(latents))
-    step = _chunk_step(geo_decoder)
-    logits = [step(queries, kv) for queries in chunks]
+    logits = [_decode_chunk(geo_decoder, queries, kv) for queries in chunks]
     if group is None:
         grid_logits = torch.cat(logits, dim=1)
     else:

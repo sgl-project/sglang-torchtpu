@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
+    resolve_generator_device,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -162,11 +165,20 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         if batch.num_outputs_per_prompt != 1:
             raise ValueError("Hunyuan3D only supports num_outputs_per_prompt=1.")
 
-    def _prepare_latents(self, batch_size, dtype, device, generator, scheduler):
+    def _prepare_latents(self, batch, server_args, batch_size, dtype, scheduler):
         from diffusers.utils.torch_utils import randn_tensor
 
+        generator = batch.generator
+        if generator is None and batch.seed is not None:
+            generator = torch.Generator(
+                resolve_generator_device(batch, server_args)
+            ).manual_seed(batch.seed)
         shape = (batch_size, *self.latent_shape)
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        # A float16 draw quantizes the normal (on TPU and on the CPU): draw in
+        # float32 and round.
+        latents = randn_tensor(
+            shape, generator=generator, device=self.device, dtype=torch.float32
+        ).to(dtype)
         return latents * getattr(scheduler, "init_noise_sigma", 1.0)
 
     def component_uses(
@@ -254,18 +266,9 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
             sigmas=sigmas,
         )
 
-        generator = batch.generator
-        if generator is None and batch.seed is not None:
-            # A "cpu" generator_device (the request's, else the pipeline config's)
-            # seeds a CPU generator, as in InputValidationStage.
-            generator_device = batch.generator_device or getattr(
-                server_args.pipeline_config, "generator_device", None
-            )
-            if generator_device != "cpu":
-                generator_device = device
-            generator = torch.Generator(device=generator_device).manual_seed(batch.seed)
-
-        latents = self._prepare_latents(batch_size, dtype, device, generator, scheduler)
+        latents = self._prepare_latents(
+            batch, server_args, batch_size, dtype, scheduler
+        )
 
         guidance = None
         if self.guidance_embed:

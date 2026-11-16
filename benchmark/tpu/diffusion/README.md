@@ -85,5 +85,5 @@ curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/j
 ```bash
 curl -sLO https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png
 curl -s -X POST http://localhost:30000/v1/meshes -F image=@hunyuan3d.png -F seed=42 -F guidance_scale=5.0 \
-  -F num_inference_steps=50 -F output_format=obj -F generator_device=cpu
+  -F num_inference_steps=50 -F output_format=obj
 ```
