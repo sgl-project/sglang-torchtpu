@@ -1024,9 +1024,7 @@ class LTX2Attention(nn.Module):
             b, t = out.shape[:2]
             out = out.view(b, t, self.local_heads, self.dim_head)
             out = out * (2.0 * torch.sigmoid(gate_logits).unsqueeze(-1))
-            # Attention may return a [b, t, h, d] view of heads-major storage
-            # (the SDPA math and masked paths, the TPU kernels); the product
-            # keeps that layout, so heads and dims merge by reshape, not view.
+            # Attention may return a [b, t, h, d] view of heads-major storage.
             out = out.reshape(b, t, self.local_heads * self.dim_head)
 
         out_flat = out.flatten(2)
