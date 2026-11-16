@@ -157,6 +157,15 @@ class TpuOOTPlatform(TpuPlatform):
                 "warmup cannot layerwise-offload the DiT); disabling it."
             )
         server_args.offload_during_compile = False
+        # This process sizes requests and runs no worker init.
+        from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
+            Cosmos3Config,
+        )
+
+        if isinstance(server_args.pipeline_config, Cosmos3Config):
+            from sglang_tpu.multimodal_gen import cosmos3
+
+            cosmos3.install_server_patches()
 
     def supports_teacache_with_torch_compile(self) -> bool:
         # Every TeaCache state update is a full XLA recompile under the

@@ -303,7 +303,8 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   only the 50 DiT blocks compiled, the breakable-CUDA-graph break point skipped,
   regionally compiled blocks marked spmd-safe) and `cosmos3.py` (Cosmos3 prompts
   in 512-token buckets with the real key count as device data, RoPE ids built on
-  the host); worker init also registers srt's ATen fallbacks
+  the host, serial CFG; the server process takes the last for Cosmos3 configs);
+  worker init also registers srt's ATen fallbacks
   (`patches._register_aten_fallbacks`, e.g. `logaddexp`).
 
 Gates that take the OOT arm, with the same outcome as the built-in platform:

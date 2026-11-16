@@ -16,6 +16,8 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
     Cosmos3VideoArchConfig,
     Cosmos3VideoConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -39,6 +41,7 @@ from sglang.multimodal_gen.test.unit.conftest import _make_unit_server_args
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.multimodal_gen import cosmos3, worker
+from sglang_tpu.multimodal_gen.platform import TpuOOTPlatform
 
 # Whole node, not chips=1: the parallel-state setup runs the TPU worker
 # bootstrap, which opens a chip outside the chip-parallel TPU_VISIBLE_CHIPS pin.
@@ -57,6 +60,7 @@ def _installed():
             (stage.Cosmos3DenoisingStage, "_predict_noise_cfg_batched"),
             (stage.Cosmos3DenoisingStage, "_maybe_enable_torch_compile"),
             (dit.Cosmos3LanguageModel, "forward"),
+            (Cosmos3Config, "get_model_deployment_config"),
         ):
             stack.enter_context(patch.object(owner, name, getattr(owner, name)))
         stack.enter_context(patch.object(cosmos3, "_DEVICE_TYPES", ("cpu",)))
@@ -433,6 +437,28 @@ class TestCosmos3Stage(CustomTestCase):
             actual = Stage()._predict_noise_cfg_batched(**kwargs)
         self.assertEqual(calls, [(1, 7), (1, 7)])
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+class TestCosmos3ServerArgs(CustomTestCase):
+    def test_the_server_process_refuses_cfg_parallel(self):
+        owner, name = Cosmos3Config, "get_model_deployment_config"
+        validate = server_args_module.ServerArgs._validate_cfg_parallel
+        for config in (Cosmos3Config(), PipelineConfig()):
+            # What ServerArgs holds after --cfg-parallel-size 2 or auto-CFG.
+            args = SimpleNamespace(
+                pipeline_config=config,
+                enable_cfg_parallel=True,
+                num_gpus=8,
+                offload_during_compile=False,
+                is_arg_explicitly_set=lambda _: False,
+            )
+            with patch.object(owner, name, getattr(owner, name)):
+                TpuOOTPlatform().apply_server_args_defaults(args)
+                if isinstance(config, Cosmos3Config):
+                    with self.assertRaisesRegex(ValueError, "CFG parallelism"):
+                        validate(args)
+                else:
+                    validate(args)
 
 
 class TestFlowUniPCOneDtypeEinsum(CustomTestCase):

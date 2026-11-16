@@ -16,6 +16,8 @@ Runtime patch, tracked debt:
   (4) hands the compiled GEN layers fresh tensors: torch_tpu guards input
       storage offsets and Dynamo guards strides.
   Control, action and sound requests, and ring or K/V-gather SP, run stock.
+  :func:`install_server_patches`, also in the server process, runs CFG
+  serially: CFG 2 x Ulysses 4 gave run-to-run different videos on TPU.
 - Upstream PR or issue: none.
 - Remove when: the text K/V cache takes a platform prompt bucket with its real
   length as data, and the RoPE ids are built from host lengths.
@@ -23,11 +25,13 @@ Runtime patch, tracked debt:
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_sp_world_size,
@@ -57,6 +61,7 @@ _STOCK_PREFIX_ATTENTION = USPAttention.forward_with_replicated_kv_prefix
 _STOCK_CFG_BATCHED = stage.Cosmos3DenoisingStage._predict_noise_cfg_batched
 _STOCK_COMPILE = stage.Cosmos3DenoisingStage._maybe_enable_torch_compile
 _STOCK_UND_FORWARD = dit.Cosmos3LanguageModel.forward
+_STOCK_DEPLOYMENT_CONFIG = Cosmos3Config.get_model_deployment_config
 
 
 def compute_rope_position_ids(self, text_mask, T, Hp, Wp, fps, device, **kwargs):
@@ -263,7 +268,20 @@ def maybe_enable_torch_compile(self, transformer, server_args):
             layer.register_forward_pre_hook(_fresh_gen_layer_inputs, with_kwargs=True)
 
 
+def deployment_config(self):
+    """``get_model_deployment_config`` without CFG parallelism."""
+    return dataclasses.replace(
+        _STOCK_DEPLOYMENT_CONFIG(self), supports_cfg_parallel=False
+    )
+
+
+def install_server_patches() -> None:
+    # ServerArgs then rejects --cfg-parallel-size > 1 and the auto-CFG layout.
+    Cosmos3Config.get_model_deployment_config = deployment_config
+
+
 def install() -> None:
+    install_server_patches()
     dit.Cosmos3OmniTransformer._compute_rope_position_ids = compute_rope_position_ids
     dit.Cosmos3OmniTransformer.__call__ = _transformer_call
     USPAttention.forward_with_replicated_kv_prefix = prefix_attention
