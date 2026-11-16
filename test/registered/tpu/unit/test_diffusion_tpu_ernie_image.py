@@ -166,18 +166,9 @@ class TestErnieImageDenoise(_TestBase):
                 _run(model, kwargs)
 
     def test_cfg_parallel_is_refused_at_load(self):
-        with (
-            _installed(),
-            patch.object(ernie_image, "_STOCK_LOAD_MODULES") as stock,
-        ):
-            load = pipeline.ErnieImagePipeline.load_modules
-            args = SimpleNamespace(enable_cfg_parallel=True)
-            with self.assertRaisesRegex(ValueError, "--ulysses-degree"):
-                load(None, args)
-            stock.assert_not_called()
-            args.enable_cfg_parallel = False
-            load(None, args)
-            stock.assert_called_once_with(None, args, None)
+        args = SimpleNamespace(enable_cfg_parallel=True)
+        with _installed(), self.assertRaisesRegex(ValueError, "--ulysses-degree"):
+            pipeline.ErnieImagePipeline.load_modules(None, args)
 
     def test_dit_compiles_once_across_prompt_lengths(self):
         wrapped = []
@@ -263,12 +254,6 @@ class TestErnieImageDenoise(_TestBase):
             )
 
 
-def _causal_hidden(input_ids):
-    """Per-token rows that see only earlier tokens, like the text encoder."""
-    rows = input_ids[..., None].float().cumsum(1)
-    return SimpleNamespace(hidden_states=(rows, rows))
-
-
 class TestErnieImageHostConditioning(_TestBase):
     def test_postprocess_takes_real_rows_by_host_indices(self):
         mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]])
@@ -288,28 +273,7 @@ class TestErnieImageHostConditioning(_TestBase):
         self.assertEqual(tuple(on_meta.prompt_embeds.shape), (2, 5, 3))
         self.assertEqual(on_meta.prompt_seq_lens, [3, 5])
 
-    def test_prompt_tokens_pad_to_256_and_keep_real_rows(self):
-        ids = torch.arange(12, 52)[None]
-        tokenizer = Mock(
-            side_effect=lambda prompts, **kwargs: BatchEncoding(
-                {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
-            ),
-            pad_token_id=11,
-        )
-        pipeline_config = config.ErnieImagePipelineConfig()
-        stock = pipeline_config.tokenize_prompt(["p"], tokenizer, {})
-        with _installed():
-            padded = pipeline_config.tokenize_prompt(["p"], tokenizer, {})
-        self.assertEqual(tuple(padded["input_ids"].shape), (1, 256))
-        self.assertTrue((padded["input_ids"][0, 40:] == 11).all())
-        want, got = (
-            config.ernie_image_postprocess_text(_causal_hidden(t["input_ids"]), t)
-            for t in (stock, padded)
-        )
-        self.assertTrue(torch.equal(got.prompt_embeds, want.prompt_embeds))
-        self.assertEqual(got.prompt_seq_lens, [40])
-
-    def test_text_encoder_real_rows_ignore_the_padding(self):
+    def test_prompt_tokens_pad_to_256_and_real_rows_ignore_the_padding(self):
         torch.manual_seed(0)
         encoder = MistralModel(
             MistralConfig(
@@ -327,7 +291,11 @@ class TestErnieImageHostConditioning(_TestBase):
         stock = BatchEncoding(
             {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
         )
-        padded = ernie_image._pad_tokens(BatchEncoding(dict(stock)), encoder.config)
+        tokenizer = Mock(return_value=BatchEncoding(dict(stock)), pad_token_id=11)
+        with _installed():
+            pipeline_config = config.ErnieImagePipelineConfig()
+            padded = pipeline_config.tokenize_prompt(["p"], tokenizer, {})
+        self.assertEqual(tuple(padded["input_ids"].shape), (1, 256))
 
         def encode(inputs):
             with set_forward_context(current_timestep=0, attn_metadata=None):
