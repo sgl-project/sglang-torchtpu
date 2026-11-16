@@ -17,8 +17,9 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu import kv_mxint8
 from sglang_tpu.disaggregation.raiden import common
-from sglang_tpu.disaggregation.raiden import pipeline as pl
-from sglang_tpu.disaggregation.raiden import pp_common, pp_mxint8
+from sglang_tpu.disaggregation.raiden import pool_transfer as pl
+from sglang_tpu.disaggregation.raiden import pool_spans as spans_lib
+from sglang_tpu.disaggregation.raiden import pp_mxint8
 from sglang_tpu.disaggregation.raiden.reshard_schedule import head_slice_params
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
@@ -134,7 +135,7 @@ def test_head_slices_rebuild_each_rank_page(
         _groups([src, draft], [swa], [1, 0], [2], num_draft_full=1)
     )
     pages = list(range(num_pages))
-    spans = pp_common.head_slice_spans(
+    spans = spans_lib.head_slice_spans(
         pools,
         [src, draft, swa],
         pages,
@@ -222,7 +223,7 @@ def test_unsupported_mxint8_pages_are_refused():
     with pytest.raises(ValueError, match="needs an MXINT8 page format"):
         pl.layout_fingerprint(pools, [tensor], _getter, ships_pd_hidden=False)
     with pytest.raises(ValueError, match="needs an MXINT8 page format"):
-        pp_common.head_slice_spans(pools, [tensor], [0], [], 2, 8)
+        spans_lib.head_slice_spans(pools, [tensor], [0], [], 2, 8)
     other_tiling = lambda t: ((2, 1, 0), ((8, 128), (4, 1)), 8)  # noqa: E731
     with pytest.raises(ValueError, match="int8 tiling"):
         pl.layout_fingerprint(
@@ -239,11 +240,11 @@ def test_unsupported_mxint8_pages_are_refused():
     )
     odd_tensor = torch.zeros((4, odd.rows(8), odd.width), dtype=torch.int8)
     odd_pools = pl.pool_manifest(_groups([odd_tensor], [], [3], []))
-    assert pp_common.part_spans(
+    assert spans_lib.part_spans(
         odd_pools, [odd_tensor], [0], [], 1, 8, page_formats={"fa": odd}, with_swa=True
     )
     with pytest.raises(ValueError, match="even head_dim / group_size"):
-        pp_common.part_spans(
+        spans_lib.part_spans(
             odd_pools,
             [odd_tensor],
             [0],
@@ -260,7 +261,7 @@ def test_unsupported_mxint8_pages_are_refused():
         )
     )
     for attn_tp_size in (1, 2):
-        pipe = pl.PipelineTransfer.__new__(pl.PipelineTransfer)
+        pipe = pl.RaidenPoolTransfer.__new__(pl.RaidenPoolTransfer)
         pipe.manager = SimpleNamespace(
             attn_cp_size=1, attn_tp_size=attn_tp_size, pp_size=1
         )

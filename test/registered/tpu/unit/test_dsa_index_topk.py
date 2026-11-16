@@ -223,7 +223,7 @@ def _run(
 
 
 def _run_token_split(step, tp, segments="all", topk=_TOPK):
-    """SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT on one device: run every rank's
+    """The DSA indexer token split on one device: run every rank's
     window (rows [r * R, (r + 1) * R), R = ceil(T / tp) rounded up to 8, as
     the backend does) and concatenate them in rank order, as the backend's
     all-reduce does."""

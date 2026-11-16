@@ -266,7 +266,7 @@ def _attention_kernel(
         out = (
             lax.div(pv, l_sum)
             if q_dtype == jnp.float32
-            else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+            else (pv * pltpu.reciprocal(l_sum, approx=True)).astype(q_dtype)
         )
         return out
 
@@ -524,7 +524,7 @@ def _attention_kernel(
                 out = (
                     lax.div(pv, l_sum)
                     if q_dtype == jnp.float32
-                    else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+                    else (pv * pltpu.reciprocal(l_sum, approx=True)).astype(q_dtype)
                 )
                 bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out[:, :o_dim]
                 if return_lse:

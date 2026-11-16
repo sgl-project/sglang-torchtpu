@@ -35,7 +35,9 @@ from sglang_tpu.attention_pallas_mla import (
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
     build_dsa_index_topk_split_op,
+    build_dsa_kpool_expand_op,
     build_dsa_kpool_topk_op,
+    build_dsa_kpool_topk_split_op,
     indexer_forward,
     kpool_indexer_forward,
 )
@@ -49,6 +51,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
 
 _PALLAS_SPARSE_MLA_OPS = {}
 
@@ -66,6 +69,7 @@ def _build_pallas_sparse_mla_kernel_op(
     qblock_kpool: int = 0,
     gather_chunk_tokens: Optional[int] = None,
     zero_rope: bool = False,
+    window: bool = False,
 ):
     """Register the sparse MLA step as a torch custom op, once per process.
 
@@ -77,8 +81,12 @@ def _build_pallas_sparse_mla_kernel_op(
 
     ``zero_rope`` neither writes nor reads the rope cache, for a model whose
     rope lane is identically zero (see ``sparse_mla_attention_fused``).
+
+    ``window`` (SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT) builds
+    ``sparse_mla_prefill_window`` instead: the queries and rows are one window
+    of the batch, and the ``cu_kv_lens`` slot carries the window's cu_q_lens.
     """
-    key = (qblock_kpool, gather_chunk_tokens, zero_rope)
+    key = (qblock_kpool, gather_chunk_tokens, zero_rope, window)
     if key in _PALLAS_SPARSE_MLA_OPS:
         return _PALLAS_SPARSE_MLA_OPS[key]
 
@@ -88,9 +96,12 @@ def _build_pallas_sparse_mla_kernel_op(
     from sglang_tpu.attention.pallas.mla_sparse_fused import (
         sparse_mla_attention_fused,
         sparse_mla_prefill_fused_tokens,
+        sparse_mla_prefill_window,
     )
 
     op_name = "sglang_tpu_pallas::sparse_mla_attention_fused"
+    if window:
+        op_name = "sglang_tpu_pallas::sparse_mla_prefill_window"
     chunk_kwargs = {}
     if gather_chunk_tokens is not None:
         # The chunk size changes the op body; naming it keeps cached graphs apart.
@@ -128,6 +139,23 @@ def _build_pallas_sparse_mla_kernel_op(
         v_scale: Optional[float],
         topk_indices: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        if window:
+            return sparse_mla_prefill_window(
+                ql_nope,
+                q_pe,
+                new_kv_c,
+                new_k_pe,
+                cache_nope,
+                cache_rope,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                topk_indices,
+                sm_scale=sm_scale,
+                k_scale=k_scale,
+            )
         if qblock_kpool == 1:
             return sparse_mla_prefill_fused_tokens(
                 ql_nope,
@@ -307,15 +335,45 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         else:
             self._index_topk_op = build_dsa_index_topk_op()
         self._init_indexer_token_split()
+        self._init_attention_token_split()
+
+    def _init_attention_token_split(self) -> None:
+        """Set up SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT (on the indexer split)."""
+        self._attn_split_world = 0
+        if not tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.get():
+            return
+        import torch.distributed as dist
+
+        from sglang.srt.runtime_context import get_parallel
+
+        # The all-to-all addresses peers by mesh position, which is the global
+        # rank (get_pallas_mesh is rank-aligned): the attention-TP group must be
+        # the whole world, in order. The pooled indexer has no local rows.
+        world = dist.get_world_size()
+        if (
+            self._kpool > 1
+            or self._idx_split_group is None
+            or self._idx_split_size != world
+            or get_parallel().attn_tp_rank != dist.get_rank()
+        ):
+            raise RuntimeError(
+                "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT needs plain DSA "
+                "(index kpool 1) and an attention-TP group that spans the "
+                "world in rank order."
+            )
+        from sglang_tpu.oneshot_collectives import get_oneshot_all_to_all_op
+
+        get_oneshot_all_to_all_op(world)  # build before torch.compile traces
+        self._window_op = _build_pallas_sparse_mla_kernel_op(window=True)
+        self._attn_split_world = world
 
     def _init_indexer_token_split(self) -> None:
-        """Set up SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT (plain DSA, attn-TP > 1)."""
+        """Set up the DSA indexer token split (always on with attn-TP > 1)."""
         self._idx_split_group = None
         self._idx_split_size = 1
         self._idx_split_min_tokens = 0
         self._index_topk_split_op = None
-        if self._kpool > 1 or not tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT.get():
-            return
+        self._kpool_expand_op = None
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
@@ -336,7 +394,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MIN_TOKENS.get(),
             _TOKEN_SPLIT_MIN_ROWS_PER_RANK * group.world_size,
         )
-        self._index_topk_split_op = build_dsa_index_topk_split_op()
+        if self._kpool > 1:
+            # Pooled indexer: the ranks exchange picked pools (topk // kpool
+            # per row), not token rows, and expand them after the all-reduce.
+            self._index_topk_split_op = build_dsa_kpool_topk_split_op()
+            self._kpool_expand_op = build_dsa_kpool_expand_op()
+        else:
+            self._index_topk_split_op = build_dsa_index_topk_split_op()
 
     def _indexer_split_rows(self, forward_batch: ForwardBatch, num_tokens: int) -> int:
         """Rows per rank for the indexer token split, or 0 to run unsplit.
@@ -361,10 +425,51 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         rows = -(-rows // 8) * 8
         if rows < _TOKEN_SPLIT_MIN_ROWS_PER_RANK:
             return 0
-        # The all-reduce buffer is [tp, rows, topk] int32 per DSA layer: bound it.
-        if rows > tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MAX_ROWS.get():
+        return rows
+
+    def _attention_split_rows(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> int:
+        """Rows per rank for the attention token split, or 0 to attend unsplit.
+
+        Static per trace, like _indexer_split_rows: prefill batches the
+        indexer splits and the per-query kernel would attend. Batches the
+        query-blocked kernel takes keep it.
+        """
+        # getattr: tests build the backend without __init__.
+        if not getattr(self, "_attn_split_world", 0):
+            return 0
+        if not forward_batch.forward_mode.is_extend_without_speculative():
+            return 0
+        # Rows that leave the layer must be the whole batch's: MTP top-k sharing
+        # (IndexTopKShareState publishes them) and the indexer top-k capturer.
+        from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if (
+            getattr(forward_batch, "reuse_dsa_topk_indices", False)
+            or getattr(spec_info, "dsa_seed_topk_capture", None) is not None
+            or get_global_indexer_capturer() is not None
+        ):
+            return 0
+        rows = self._indexer_split_rows(forward_batch, num_tokens)
+        if not rows or self._prefill_takes_qblock(num_tokens):
             return 0
         return rows
+
+    def _prefill_takes_qblock(self, num_tokens: int) -> bool:
+        """Whether this prefill batch goes through the query-blocked kernel."""
+        if self._prefill_op is None:
+            return False
+        from sglang_tpu.attention.pallas.mla_sparse_fused import (
+            qblock_tokens_supported,
+        )
+
+        metadata = self.forward_metadata
+        pages_per_seq = metadata.page_indices.shape[0] // (
+            metadata.cu_q_lens.shape[0] - 1
+        )
+        return qblock_tokens_supported(num_tokens, pages_per_seq, self.page_size)
 
     def _build_kernel_op(self):
         # The base class constructor calls this to set self._op. The q-block
@@ -433,7 +538,8 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     ) -> torch.Tensor:
         """Run one layer's indexer: store its index keys, return its top-k rows.
 
-        Returns ``i32[num_tokens, index_topk]``. Each row lists the chosen key
+        Returns ``i32[num_tokens, index_topk]``, or only this rank's window of
+        rows under the attention token split. Each row lists the chosen key
         positions, counted from the start of the token's own sequence. The
         chosen positions come first and the rest of the row is ``-1``.
         """
@@ -481,13 +587,15 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         key_store: str,
         split_rows: int,
     ) -> torch.Tensor:
-        """index_topk with SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT.
+        """index_topk with the DSA indexer token split.
 
         Every rank stores the index keys of all tokens (each keeps the full
         index-key cache) and selects the rows of its own token slice
         ``[rank * split_rows, (rank + 1) * split_rows)``; ``_assemble_split_rows``
-        puts the slices of the attention-TP group together. The rank enters as
-        a device tensor, so all ranks run one compiled program.
+        puts the slices of the attention-TP group together. Under the attention
+        token split, each rank attends its own slice and gets ``i32[split_rows,
+        topk]`` back instead. The rank enters as a device tensor, so all ranks
+        run one compiled program.
         """
         from sglang.srt.layers.dp_attention import _rank_tensor
 
@@ -512,6 +620,10 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             key_store,
             split_rows,
         )  # i32[split_rows, topk]
+        if self._attention_split_rows(forward_batch, num_tokens):
+            # The attention token split attends this rank's window with these
+            # rows; no other rank needs them.
+            return local_rows
         rows = _assemble_split_rows(
             local_rows, rank, self._idx_split_size, self._idx_split_group.all_reduce
         )
@@ -537,6 +649,20 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         ``i32[num_tokens, width]`` rows in the format of index_topk."""
         metadata = self.forward_metadata
         pool = self.token_to_kv_pool
+        split_rows = self._indexer_split_rows(forward_batch, query.shape[0])
+        if split_rows:
+            return self._index_topk_kpool_token_split(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                query=query,
+                key=key,
+                gate=gate,
+                head_weights=head_weights,
+                ape=ape,
+                weight_scale=weight_scale,
+                kpool=kpool,
+                split_rows=split_rows,
+            )
         return self._index_topk_op(
             query.contiguous(),
             key.contiguous(),
@@ -555,6 +681,73 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._kpool_width,
             metadata.decode_query_size,
             _kpool_query_bound(metadata, num_tokens=query.shape[0]),
+        )
+
+    def _index_topk_kpool_token_split(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        gate: torch.Tensor,
+        head_weights: torch.Tensor,
+        ape: torch.Tensor,
+        weight_scale: float,
+        kpool: int,
+        split_rows: int,
+    ) -> torch.Tensor:
+        """index_topk_kpool with the DSA indexer token split.
+
+        Every rank stores all tokens' raw keys and closes all pools (each
+        keeps the full caches), and scores only its own token slice
+        ``[rank * split_rows, (rank + 1) * split_rows)``. Scoring every query
+        against every closed pool is the part that grows with the context, and
+        unsplit, all attention-TP ranks repeat it for the whole batch. The
+        ranks' picked pools, ``i32[split_rows, topk // kpool]``, are put
+        together by ``_assemble_split_rows`` and expanded to token rows.
+        """
+        from sglang.srt.layers.dp_attention import _rank_tensor
+
+        metadata = self.forward_metadata
+        pool = self.token_to_kv_pool
+        num_tokens = query.shape[0]
+        kv_lens = self._kv_lens(forward_batch)
+        rank = _rank_tensor("attn_tp", query.device)
+        row_start = (rank * split_rows).to(torch.int32).reshape(1)
+        local_picked = self._index_topk_split_op(
+            query.contiguous(),
+            key.contiguous(),
+            gate.contiguous(),
+            head_weights.contiguous(),
+            ape.contiguous(),
+            pool.get_kpool_raw_cache(layer_id),
+            pool.get_index_key_cache(layer_id),
+            kv_lens,
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            row_start,
+            weight_scale,
+            self._topk,
+            kpool,
+            _kpool_query_bound(metadata, num_tokens=num_tokens),
+            split_rows,
+        )  # i32[split_rows, topk // kpool]
+        picked = _assemble_split_rows(
+            local_picked, rank, self._idx_split_size, self._idx_split_group.all_reduce
+        )
+        if picked.shape[0] != num_tokens:
+            # Padding rows of the last slices (all -1) are dropped.
+            picked = picked[:num_tokens].contiguous()
+        return self._kpool_expand_op(
+            picked,
+            kv_lens,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            self._topk,
+            kpool,
+            self._kpool_width,
         )
 
     def _forward_mla(
@@ -588,7 +781,10 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             q_rope=q_rope,
             k_rope=k_rope,
         )
-        if (
+        split_rows = self._attention_split_rows(forward_batch, q.shape[0])
+        if split_rows:
+            out = self._forward_mla_token_split(args, topk_indices, split_rows)
+        elif (
             self._prefill_op is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
@@ -609,6 +805,48 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             out = self._op(*args, topk_indices)
         # TODO(sglang-torchtpu#1072): avoid this reshape, as in pallas_tpu_mla.
         return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_mla_token_split(
+        self, args: tuple, topk_indices: torch.Tensor, rows: int
+    ) -> torch.Tensor:
+        """Prefill attention with SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.
+
+        Each rank holds its heads' queries for all T tokens and the indexer
+        rows of its window ``[rank * rows, (rank + 1) * rows)``. An all-to-all
+        gives each rank its window's queries for every head; the window op
+        stores the step's latents (every token, on every rank) and attends the
+        window; a second all-to-all returns each rank's heads for every token.
+        Returns ``[T, heads, 512]``, as the per-query op does.
+        """
+        from sglang.srt.layers.dp_attention import _rank_tensor
+        from sglang_tpu.oneshot_collectives import oneshot_all_to_all
+
+        ql_nope, q_pe, cu_q_lens = args[0], args[1], args[8]
+        num_tokens, heads, nope = ql_nope.shape
+        world = self._attn_split_world
+        # Send block j = window j's tokens: [world, rows * heads * (512 + 64)].
+        q = torch.cat([ql_nope, q_pe], dim=-1)
+        if world * rows != num_tokens:
+            q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, world * rows - num_tokens))
+        q = oneshot_all_to_all(q.reshape(world, -1), world_size=world)
+        # Received block i = rank i's heads: [rows, world * heads, 512 + 64].
+        q = q.view(world, rows, heads, -1).transpose(0, 1)
+        q = q.reshape(rows, world * heads, -1)
+        # The window's own cu_q_lens: each request's tokens inside the window.
+        rank = _rank_tensor("attn_tp", q.device)
+        window_cu_q_lens = (cu_q_lens - rank * rows).clamp(0, rows).to(torch.int32)
+        out = self._window_op(
+            q[..., :nope].contiguous(),
+            q[..., nope:].contiguous(),
+            *args[2:9],
+            window_cu_q_lens,  # in the cu_kv_lens slot
+            *args[10:],
+            topk_indices.contiguous(),
+        )  # [rows, world * heads, 512]
+        # Send block i = this window for rank i's heads; receive every window.
+        out = out.view(rows, world, heads, nope).transpose(0, 1)
+        out = oneshot_all_to_all(out.reshape(world, -1), world_size=world)
+        return out.view(world * rows, heads, nope)[:num_tokens]
 
     def _kv_cache_buffers(self, layer_id: int) -> tuple:
         # This backend's pool has two buffers per layer where the fused pool

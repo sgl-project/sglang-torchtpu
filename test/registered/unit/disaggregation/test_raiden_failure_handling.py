@@ -24,7 +24,7 @@ from sglang_tpu.disaggregation.raiden.conn import (
     RaidenKVReceiver,
     RaidenKVSender,
 )
-from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
+from sglang_tpu.disaggregation.raiden.pool_transfer import RaidenPoolTransfer
 from sglang_tpu.disaggregation.raiden.serde import (
     MessageTag,
     PullReq,
@@ -583,6 +583,7 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
         mgr.finish_bootstrap_if_decode_requested = types.MethodType(
             RaidenKVManager.finish_bootstrap_if_decode_requested, mgr
         )
+        mgr.dram_offload_channel = None
         mgr.fail_decode_silence = types.MethodType(
             RaidenKVManager.fail_decode_silence, mgr
         )
@@ -638,8 +639,8 @@ def _gate_sender(mgr, room):
 
 
 def _producer_pipeline(mgr):
-    """A prefill-side PipelineTransfer that records requests but never replies."""
-    pipe = PipelineTransfer.__new__(PipelineTransfer)
+    """A prefill-side RaidenPoolTransfer that records requests but never replies."""
+    pipe = RaidenPoolTransfer.__new__(RaidenPoolTransfer)
     pipe.manager = mgr
     pipe.producer = True
     pipe.lock = threading.RLock()

@@ -770,11 +770,6 @@ def _validate_mtp_index_share(cfg, hf_config) -> None:
             "DSA index sharing on TPU runs on the experimental spec worker; set "
             f"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1 {opt_out}."
         )
-    if cfg.disaggregation_mode != "null":
-        # A P/D decode would draft on seeds its prefill never sent.
-        raise NotImplementedError(
-            f"DSA index sharing on TPU does not support P/D disaggregation; {opt_out}."
-        )
 
 
 def _register_attention_backends() -> None:
@@ -835,6 +830,14 @@ def _register_attention_backends() -> None:
 
     @register_attention_backend("dsv4")
     def create_tpu_dsv4_backend(runner):
+        from sglang_tpu.models.deepseek_v41.memory_pool import uses_dsv41_pool
+
+        if uses_dsv41_pool(runner.model_config.compress_ratios):
+            from sglang_tpu.models.deepseek_v41.attention_backend import (
+                DSV41TPUAttnBackend,
+            )
+
+            return DSV41TPUAttnBackend(runner)
         from sglang_tpu.dsv4 import DSV4TPUAttnBackend
 
         return DSV4TPUAttnBackend(runner)
