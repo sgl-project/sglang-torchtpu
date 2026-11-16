@@ -1168,11 +1168,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 compile_kwargs,
             )
             transformer._gen_layers_torch_compiled = True
-            # Every rank runs the same GEN layer program (equal SP shards).
-            wrap_region = current_platform.prepare_spmd_region_wrapper()
             for i, layer in enumerate(gen_layers):
-                if wrap_region is not None:
-                    layer.forward = wrap_region(layer.forward)
                 gen_layers[i] = torch.compile(layer, **compile_kwargs)
         else:
             logger.warning("Cosmos3 gen_layers not found, skipping torch.compile")
