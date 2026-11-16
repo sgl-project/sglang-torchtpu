@@ -3,8 +3,13 @@
 This opt-in candidate ports `sgl-project/sglang-jax` revision
 `c948bdda95208e68a474c8088937347d08fe8937`,
 `python/sgl_jax/srt/kernels/fused_moe/v2/{kernel,tuned_block_configs}.py`
-(Apache-2.0). `kernel.py` is the source implementation; the tuning file changes
-only device-name discovery to the existing CPU-export TPU-info context. This is
+(Apache-2.0). The computation and every DMA/wait/barrier/drain remain identical.
+The one kernel adaptation is `has_side_effects=False` for the returned-output
+call: TorchTPU repartitions CPU-exported StableHLO and rejects the source's
+unsharded side-effect custom call. Original and port reproduced that failure
+under the same target runtime; an explicit manual-sharding annotation also
+failed. The tuning adapter only changes device-name discovery to the existing
+CPU-export TPU-info context. This is
 separate from the existing vLLM-derived `fused_moe_v2`, whose input is router
 logits and packed gate/up rather than GLM's existing selected ids/coefficients.
 
@@ -72,3 +77,47 @@ Use the candidate-declared stack for source/port testing and record the actual
 worker runtime. E2E uses the frozen historical Falcon baseline
 `exp-6mtkc6t2qi`, as explicitly requested, without rerunning baseline A/B.
 Cross-run comparisons are descriptive and cannot isolate kernel causality.
+
+
+The bridge uses the explicit logical-rank operand and its gathered table for
+its mesh index. It does not emit a host-HLO `partition-id`, which is ambiguous
+when TorchTPU partitions the locally embedded module a second time. Pallas's
+internal device-id/RDMA semantics are unchanged.
+
+The pure-call dependency contract requires the supported TPU MAX_LEN FFN
+caller: while any DP peer is active, every rank consumes a nonempty physical
+bucket. The compiled-forward shim publishes that bucket, idle decode creates
+physical dummy rows, speculative idle keeps outputs padded, and the FFN
+scatter consumes a nonempty slot. Global-empty calls return empty on every
+rank without entering the kernel. Directly cropping a participating rank's
+kernel result to an unused/empty value is outside this adapter's contract.
+The registered test checks a compiled 64-row slot through DP drain/refill.
+
+Source-only debug variables `SGLJAX_SKIP_PREQUANT`,
+`FUSED_MOE_V2_PAD_TOPK_TO_128` and `FUSED_MOE_V2_ROUTE_SMEM_TOPK_ONLY` are rejected
+when present, before model load and again when building the op. In particular,
+the source treats even `SGLJAX_SKIP_PREQUANT=0` as truthy. This candidate always
+uses prequantization, 128-wide TopK padding and the ordinary route metadata.
+These values are frozen for the process; no source debug API is exposed.
+
+For an eight-chip allocation, run the independent preflight launcher on both
+hosts after the harness peer exchange, before checkpoint preparation or model
+startup (the same frozen production code is tested, with no temporary kernel):
+
+```sh
+/absolute/candidate/venv/bin/python \
+  test/manual/kernels/glm_moe_v2_multihost_preflight.py \
+  --hosts "$TPU_WORKER_HOSTNAMES" --host-index "$FALCON_RANK" \
+  --output-dir "$GLM52_ART/moe-preflight" --seconds 1500
+```
+
+It reuses `TopologyConfig`/`discover_host_order` and native environment setup,
+launches two hosts x eight workers, and records exact source/runtime identity.
+Real binder preflight first packs/replaces small TPU Parameters and checks
+storage pointers, release and preserved attributes. It also invokes the real
+GroupCoordinator FP8 shared-weight all-gather and verifies the reconstructed
+gate/up/down weights and FP32 scales. The tests then exercise EP16 numerical
+cases, ownership permutations, padded idle/drain, and full H6144/I2048/E256/K8
+at local 6/24/64/2048 rows. Only after both hosts report success may the original
+model harness start; failures propagate nonzero and the preflight cannot renew
+its deadline. This stage counts inside the allocation's overall deadline.

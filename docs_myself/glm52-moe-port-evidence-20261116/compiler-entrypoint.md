@@ -83,3 +83,20 @@ logical expert ownership relative to physical process rank and add real
 H6144/I2048/E256/TopK8 64- and 2048-row cases. This tests the actual dependency
 contract; an artificial local empty result would be a different unsupported
 caller and is not treated as proof that the model drops the kernel.
+
+`exp-s9ky7hjpat` / `art-hn3h0or1gq`, measurement
+`74232ca78456cbd6eb1864b9161102e10fd8034e`, obtained resources and ran the
+pure-call diagnostic. It passed the previous effect check but all eight
+workers failed before numerical execution with `partitionId instruction is not
+supported for SPMD partitioning`, pointing to the bridge's outer
+`lax.axis_index("tensor")`. The current candidate follows the existing fused EP
+adapter's explicit-rank contract instead: gather logical rank operands and
+compute this rank's physical mesh position by comparing its operand with that
+table. Pallas-internal device ids, RDMA and synchronization remain unchanged.
+
+The production pure-call adaptation and this rank fix are frozen together for
+the next preflight; no earlier failed run is a numerical or performance pass.
+The independent multihost launcher tests that exact committed production bridge
+before any model load, including its actual loading/storage/shared-gather
+operations. Source debug variables are rejected before load rather than
+allowed to silently alter prequantization or compile-cache behavior.
