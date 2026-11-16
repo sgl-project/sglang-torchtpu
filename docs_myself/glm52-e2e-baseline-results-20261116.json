@@ -2971,6 +2971,17 @@
         "mitigation": "MTP-only index with original 5 shard symlinks, 1569 MTP tensors; no tensor conversion"
       }
     ],
-    "attribution": "These four loader/model files are unchanged from the PR base; neither issue is established as introduced by PR2198. Successful baseline includes the reader fix and MTP view. No wrong FP8 bytes/channel scale mismatch was identified in the new adapter, but selected byte oracles and routed smoke are not full-checkpoint numerical equivalence."
+    "attribution": "These four loader/model files are unchanged from the PR base; neither issue is established as introduced by PR2198. Successful baseline includes the reader fix and MTP view. No wrong FP8 bytes/channel scale mismatch was identified in the new adapter, but selected byte oracles and routed smoke are not full-checkpoint numerical equivalence.",
+    "incorporated_head": "ed78e85c42d4dcbfbd2f5caadc607909b682d36a",
+    "follow_up_validation": {
+      "CPU_tests_passed": 104,
+      "python": "3.10.20",
+      "torch": "2.14.1",
+      "automatic_shard_selection_real_index": "original shards 270-274, 1569 MTP tensors",
+      "full_8_chip_E2E_on_updated_PR_head": "not rerun",
+      "PR_state": "ready",
+      "base_CI_run": 43884646093,
+      "TPU_CI_run": 43884646347
+    }
   }
 }
