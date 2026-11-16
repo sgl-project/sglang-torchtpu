@@ -77,8 +77,10 @@ def _pads_text(transformer) -> bool:
     """Whether the joint attentions run the Pallas backend with QK norms, and
     locally or with heads split by Ulysses only."""
     attn = transformer.transformer_blocks[0].attn1
+    impl = attn.attn.attn_impl
     if (
-        not getattr(attn.attn.attn_impl, "use_splash", False)
+        not isinstance(impl, tpu_splash_attn.TpuSplashAttentionImpl)
+        or not impl.use_splash
         or attn.norm_q is None
         or attn.norm_k is None
     ):

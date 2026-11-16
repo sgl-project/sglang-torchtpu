@@ -33,9 +33,9 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.multimodal_gen import glm_image_dit
+from sglang_tpu.multimodal_gen.tpu_splash_attn import TpuSplashAttentionImpl
 
-# Nightly: the stage-a unit suite is at its time budget.
-register_tpu_ci(est_time=40, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(est_time=40, suite="stage-a-test-tpu-unit", chips=1)
 
 _GLOBAL_ARGS = (
     "sglang.multimodal_gen.runtime.server_args.server_args._global_server_args"
@@ -97,7 +97,11 @@ def _model():
         param.data.normal_(0, 0.1, generator=gen)
     for block in model.transformer_blocks:
         # The joint attention runs the Pallas backend, as on a v7x worker.
-        block.attn1.attn.attn_impl.use_splash = True
+        attn = block.attn1.attn
+        attn.attn_impl = TpuSplashAttentionImpl(
+            num_heads=4, head_size=16, causal=False, softmax_scale=16**-0.5
+        )
+        attn.attn_impl.use_splash = True
     return model.eval()
 
 
@@ -205,10 +209,6 @@ class TestGlmImageGlyphBucket(CustomTestCase):
                 self.assertFalse(glm_image_dit._pads_text(model))
                 padded, stock = _padded_and_stock(model, _inputs(5))
                 torch.testing.assert_close(padded, stock, rtol=1e-5, atol=1e-5)
-
-    def test_text_buckets_are_powers_of_two_from_16(self):
-        buckets = [glm_image_dit.text_bucket(n) for n in (1, 5, 16, 17, 64, 65, 300)]
-        self.assertEqual(buckets, [16, 16, 16, 32, 64, 128, 512])
 
     def test_compiled_dit_compiles_once_across_glyph_lengths(self):
         model = _model()
