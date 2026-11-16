@@ -1,0 +1,103 @@
+name: TPU CI Timing Dashboard
+
+on:
+  workflow_run:
+    workflows: ['PR Test (TPU)', 'Nightly Test (TPU)', 'Feature Validation (TPU)', 'Accuracy Test (TPU)', 'Perf Test (TPU)']
+    types: [completed]
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Days of history to reconcile (1–90)'
+        default: '1'
+
+# Pages is explicitly opt-in; enabling it must not replace an existing site.
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: tpu-ci-timing-dashboard
+  # Keep completion events so reruns of older PRs are collected.
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    if: github.repository == 'sgl-project/sglang-torchtpu'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Read saved history
+        run: |
+          if git ls-remote --exit-code --heads origin ci-metrics > /dev/null; then
+            git fetch origin ci-metrics
+            git show FETCH_HEAD:data.json > "$RUNNER_TEMP/history.json"
+          fi
+      - name: Collect job and test timings
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DAYS: ${{ inputs.days || '1' }}
+          TRIGGER_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          extra=()
+          if [ -n "$TRIGGER_RUN_ID" ]; then extra=(--run-id "$TRIGGER_RUN_ID"); fi
+          python3 scripts/ci/tpu_dashboard/collect.py "${extra[@]}" \
+            --days "$DAYS" --history "$RUNNER_TEMP/history.json" \
+            --output "$RUNNER_TEMP/site/data.json"
+          cp scripts/ci/tpu_dashboard/web/* "$RUNNER_TEMP/site/"
+      - name: Persist history
+        run: |
+          mkdir "$RUNNER_TEMP/metrics"
+          cd "$RUNNER_TEMP/metrics"
+          git init -b ci-metrics
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          # Reuse checkout's authenticated git configuration without exposing the token.
+          git config --local --add "http.$GITHUB_SERVER_URL/.extraheader" "$(git -C "$GITHUB_WORKSPACE" config --get "http.$GITHUB_SERVER_URL/.extraheader")"
+          if git ls-remote --exit-code --heads origin ci-metrics > /dev/null; then
+            git fetch origin ci-metrics
+            git checkout -B ci-metrics FETCH_HEAD
+          fi
+          cp "$RUNNER_TEMP/site/data.json" data.json
+          git add data.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update TPU CI timing history'
+            git push origin HEAD:ci-metrics
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tpu-ci-dashboard-preview
+          path: ${{ runner.temp }}/site
+          retention-days: 30
+      - name: Summary
+        run: |
+          echo '## TPU CI timing dashboard' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Download the tpu-ci-dashboard-preview artifact to preview. Public hosting is opt-in via TPU_CI_TIMING_PAGES_ENABLED.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-pages-artifact@v3
+        if: vars.TPU_CI_TIMING_PAGES_ENABLED == 'true'
+        with:
+          path: ${{ runner.temp }}/site
+  deploy:
+    if: vars.TPU_CI_TIMING_PAGES_ENABLED == 'true'
+    needs: collect
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

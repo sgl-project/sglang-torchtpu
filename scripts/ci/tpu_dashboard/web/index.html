@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="TPU CI workflow durations, runner wait, and test-file timings for SGLang.">
+  <title>TPU CI · SGLang</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to dashboard</a>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="SGLang TPU CI home"><span class="brand-mark" aria-hidden="true">S</span><strong>SGLang</strong><span class="brand-divider">/</span><span>Engineering</span></a>
+    <div class="topbar-right"><span class="environment"><span class="status-dot" aria-hidden="true"></span>TPU infrastructure</span><a class="icon-link" href="https://github.com/sgl-project/sglang-torchtpu" target="_blank" rel="noopener noreferrer">GitHub ↗</a></div>
+  </header>
+  <main id="main">
+    <div class="page-heading"><div><div class="eyebrow">OBSERVABILITY <span>/</span> CONTINUOUS INTEGRATION</div><h1>TPU CI <span>performance</span></h1><p class="subtitle">From trigger to test result. Know where the time goes.</p></div><div class="heading-meta"><span id="data-badge" class="badge">Loading snapshot</span><span id="updated" class="muted">Reading data…</span><a id="sample-link" href="?sample=1">Explore sample data ↗</a></div></div>
+    <div id="notice" class="notice" role="status" hidden></div>
+    <div class="toolbar"><nav class="lane-tabs" aria-label="Workflow lane"><button type="button" class="active" data-lane="pr" aria-pressed="true">Pull requests <span id="pr-count">0</span></button><button type="button" data-lane="nightly" aria-pressed="false">Nightly · scheduled <span id="nightly-count">0</span></button></nav><div class="window-controls"><span>Time range</span><div class="range-tabs" role="group" aria-label="Time range"><button type="button" data-days="1" aria-pressed="true" class="active">24h</button><button type="button" data-days="3" aria-pressed="false">3d</button><button type="button" data-days="7" aria-pressed="false">7d</button><button type="button" data-days="30" aria-pressed="false">30d</button><button type="button" data-days="90" aria-pressed="false">90d</button></div></div></div>
+    <div id="dashboard" aria-busy="true">
+      <section class="metrics" aria-label="Workflow metrics" id="metrics"></section>
+      <section class="charts" aria-label="Timing trends"><article class="panel"><div class="panel-heading"><div><h2>Workflow duration</h2><p id="duration-description">Elapsed wall time · passed runs only</p></div><div id="duration-keys" class="chart-keys"><span class="chart-key"><i class="violet"></i>Duration</span></div></div><div id="duration-chart" class="chart"></div></article><article class="panel"><div class="panel-heading"><div><h2>Wait time</h2><p id="wait-description">CI submission to first TPU test start per attempt</p></div><div id="wait-keys" class="chart-keys"><span class="chart-key"><i class="cyan"></i>GitHub</span><span class="chart-key"><i class="amber"></i>TPU queue</span></div></div><div id="wait-chart" class="chart"></div></article></section>
+      <section class="panel runs-panel" aria-label="Workflow runs"><div class="panel-heading runs-heading"><div><h2>Workflow runs <span id="run-count" class="count">0</span></h2><p>Expand a run to inspect jobs and test-file timings.</p></div><span class="table-hint">Most recent first</span></div><div class="run-table"><div class="run-table-head" aria-hidden="true"><span>WORKFLOW / COMMIT</span><span>STATUS</span><span>WALL TIME</span><span>STARTED</span><span></span></div><div id="runs" aria-live="polite"><div class="empty-state">Loading workflow data…</div></div></div></section>
+      <div class="method-note"><span class="info-icon" aria-hidden="true">i</span><p>Workflow duration is elapsed wall time, so parallel jobs are not added together. Wait and TPU phase metrics use measured jobs only. <span>— means unavailable.</span> Timestamps use your local timezone.</p></div>
+    </div>
+    <footer><span><span class="footer-mark" aria-hidden="true">▦</span> SGLang <span class="muted">/ TPU CI Observatory</span></span><span>Powered by GitHub Actions <span class="footer-dot">·</span> Static snapshot</span></footer>
+  </main>
+</body>
+</html>

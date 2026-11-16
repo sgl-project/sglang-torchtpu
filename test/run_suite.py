@@ -3,6 +3,7 @@ import glob
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import tabulate
@@ -536,6 +537,12 @@ def run_a_suite(args):
     # Add extra timeout when retry is enabled
     if timeout is not None and args.enable_retry:
         timeout += args.retry_timeout_increase
+
+    if args.hw == "tpu" and ci_tests:
+        print(
+            f"TPU_CI_TEST_STARTED_AT {datetime.now(timezone.utc).isoformat()}",
+            flush=True,
+        )
 
     pinned_ok = True
     pinned_results = []
