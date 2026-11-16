@@ -41,11 +41,11 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
 | ERNIE-Image | T2I 1024x1024, 50 steps, prompt enhancer on | 8 | 7.8 s | 0.063 s | 0.22 s | 53.4 GB |
 | ERNIE-Image | T2I 1024x1024, 50 steps, `"use_pe": false` | 8 | 3.5 s | 0.063 s | 0.22 s | 53.4 GB |
-| ERNIE-Image | T2I 2048x2048, 50 steps, prompt enhancer on | 8 | 17.7 s | 0.255 s | 0.90 s | 95.5 GB |
+| ERNIE-Image | T2I 2048x2048, 50 steps, prompt enhancer on, `--vae-tiling true` | 8 | 18.3 s | 0.255 s | 2.0 s | 55.9 GB |
 
 ERNIE-Image rows: torch_tpu 0.2.1.dev20261028201649. The prompt pads to a multiple of 512 tokens; the first request
-at a new image size compiles for 30-48 s (2048x2048: 127 s), and the first prompt in a new 512-token bucket at a
-served size for about 10 s.
+at a new image size compiles for 30-48 s (2048x2048: 127 s, and 78 s for the first tiled VAE decode), and the first
+prompt in a new 512-token bucket at a served size for about 10 s.
 
 
 ## Example requests
