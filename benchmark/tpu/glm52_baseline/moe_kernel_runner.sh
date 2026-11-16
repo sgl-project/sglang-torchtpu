@@ -10,6 +10,6 @@ export PYTHONPATH="$PWD/python:$PWD"
 export GLM52_RUNTIME_DIR="$OUT/actual-process-runtime"
 export PYTHONPATH="$PWD/benchmark/tpu/glm52_baseline/runtime_probe:$PYTHONPATH"
 export GLM_DIAGNOSTIC_DIR="$OUT/export-diagnostic"
-"$PY" -u test/manual/kernels/glm_moe_v2_export_diagnostic.py \
+"$PY" -u test/manual/kernels/glm_moe_v2_export_diagnostic.py --modes=pure \
   2>&1 | tee "$OUT/device-tests.log"
 echo MOE_EXPORT_DIAGNOSTIC_PASS
