@@ -172,3 +172,18 @@ the prior kernel invocation history differs. The explicit-output candidate
 therefore retains the original scale-folding branch and all tuning choices,
 and requires the complete sequential registered test rather than treating this
 isolated result as acceptance.
+
+A bounded CPU-only Falcon helper (`exp-3oan0ipcqm`, succeeded) read the real R6
+NPZ without direct object-store access. Its compact JSON confirms the 107 bad
+rows have all 512 features nonfinite, while the CPU reference is finite. The
+bad-row set is exactly the union of the 94 rows selecting logical expert 6 or 7
+and all 24 rows in physical mesh origin slot 6 (`144:168`); the two sets overlap
+in 11 rows. No row outside that union is bad. In this test logical expert 6/7
+belongs to logical EP rank 3, supplied by Torch rank 6's `(rank*3+1)%8` ownership
+permutation. Equating that Torch rank with physical mesh slot 6 additionally
+requires the actual mesh-rank table; that table was not directly logged, so the
+hardware-identity inference remains qualified. All 182 valid input rows have
+finite amax in approximately [0.516, 0.949], ordinary FP32 scale exponents, and
+no `7f`/`ff` FP8-NaN byte in their embedded-scale bit patterns. This correlation
+narrows the failure beyond invalid routing or a tiny precision difference, but
+does not alone prove buffer aliasing or any other unique cause.
