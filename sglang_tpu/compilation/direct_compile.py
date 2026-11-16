@@ -316,6 +316,17 @@ class CompiledFunction:
             self._model_extra_tensor_attrs
         ):
             raise ValueError("model_extra_tensor_attrs contains duplicate paths")
+        if self._model_extra_tensor_attrs:
+            err = getattr(self._model, "_derived_weight_cache_error", None)
+            if not err:
+                # Compiled artifacts retain load-time extra tensors; load_weights
+                # rebinds plain attributes to new tensors, leaving graphs stale.
+                self._model._derived_weight_cache_error = (
+                    "Online weight updates are not supported with "
+                    "--tpu-compile-tracer direct when model_extra_tensor_attrs "
+                    "are bound at compile time. Restart the server or use "
+                    "--tpu-compile-tracer dynamo to update weights online."
+                )
         self._kv_pool = kv_pool
         self._ignored_argnames = ignored_argnames
         self._prune_unused_inputs = prune_unused_inputs
