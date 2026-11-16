@@ -616,7 +616,7 @@ class TextEncodingStage(ConditionEncodingStage):
                 # before the upload: BatchEncoding.to moves its tensors in place
                 position_ids = (
                     server_args.pipeline_config.get_text_encoder_position_ids(
-                        host_inputs, i
+                        host_inputs, i, text_encoder
                     )
                 )
                 text_inputs = host_inputs.to(target_device, non_blocking=True)

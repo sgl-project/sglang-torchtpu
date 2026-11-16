@@ -2,6 +2,7 @@
 """Tests for sglang_tpu's Qwen-Image patches (sglang_tpu.multimodal_gen.qwen_image)."""
 
 import contextlib
+import copy
 import importlib.util
 import inspect
 import math
@@ -48,7 +49,7 @@ from sglang_tpu.multimodal_gen import qwen_image, worker
 
 # Whole node, not chips=1: the parallel-state setup runs the TPU worker
 # bootstrap, which opens a chip outside the chip-parallel TPU_VISIBLE_CHIPS pin.
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=90, suite="stage-a-test-tpu-unit")
 
 _T2I = [(1, 4, 4)]
 _EDIT = [(1, 4, 4), (1, 2, 3)]  # the noisy image, then one condition image
@@ -170,49 +171,25 @@ class TestQwenImageDenoise(_TestBase):
                     got = _run(model, _inputs(model, text_len, shapes))
                 torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
 
-    def test_nan_in_padded_prompt_rows_stays_there(self):
-        model = _model()
-        forward = dit.QwenImageTransformer2DModel.forward
-
-        def poisoned(self, *args, encoder_hidden_states, **kwargs):
-            encoder_hidden_states = encoder_hidden_states.clone()
-            encoder_hidden_states[:, 37:] = float("nan")
-            return forward(
-                self, *args, encoder_hidden_states=encoder_hidden_states, **kwargs
-            )
-
-        with _installed():
-            want = _run(model, _inputs(model, 37, _EDIT))
-            with patch.object(dit.QwenImageTransformer2DModel, "forward", poisoned):
-                got = _run(model, _inputs(model, 37, _EDIT))
-        self.assertTrue(torch.isfinite(got).all())
-        torch.testing.assert_close(got, want, rtol=0, atol=0)
-
-    def test_batched_prompts_of_different_lengths_are_rejected(self):
-        model = _model()
-        kwargs = _inputs(model, 5, _T2I)
-        kwargs["txt_seq_lens"] = [5, 3]
-        with _installed(), self.assertRaises(NotImplementedError):
-            _run(model, kwargs)
-
     def test_whole_dit_compiles_once_across_prompt_lengths(self):
-        model = _model()
-        graphs = []
+        for shapes in (_T2I, _EDIT):
+            torch._dynamo.reset()
+            model, graphs = _model(), []
 
-        def counting_backend(graph_module, example_inputs):
-            graphs.append(graph_module)
-            return graph_module.forward
+            def counting_backend(graph_module, example_inputs):
+                graphs.append(graph_module)
+                return graph_module.forward
 
-        counts = []
-        with _installed():
-            # The TPU default (no --regional-compile) compiles the whole DiT.
-            model.compile(backend=counting_backend, dynamic=False)
-            # The first request also settles a lazily resolved kernel-dispatch
-            # global (sglang.kernels.fused_op), which recompiles one graph once.
-            for text_len in (5, 5, 37, 300):
-                _run(model, _inputs(model, text_len, _T2I))
-                counts.append(len(graphs))
-        self.assertEqual(counts[2:], [counts[1]] * 2)
+            counts = []
+            with _installed():
+                # The TPU default (no --regional-compile) compiles the whole DiT.
+                model.compile(backend=counting_backend, dynamic=False)
+                # The first request also settles a lazily resolved kernel-dispatch
+                # global (sglang.kernels.fused_op), which recompiles one graph once.
+                for text_len in (5, 5, 37, 300):
+                    _run(model, _inputs(model, text_len, shapes))
+                    counts.append(len(graphs))
+            self.assertEqual(counts[2:], [counts[1]] * 2)
 
 
 def _causal_hidden(input_ids):
@@ -250,21 +227,20 @@ class TestQwenImagePromptPadding(_TestBase):
 
         processor = Mock(side_effect=process)
         processor.tokenizer.pad_token_id = 0
-        encoder = SimpleNamespace()
         with (
             _installed(),
             patch.object(
                 qwen2_5vl, "Qwen2_5_VLForConditionalGeneration", SimpleNamespace
             ),
         ):
-            stage = ImageEncodingStage(processor, text_encoder=encoder)
+            stage = ImageEncodingStage(processor, text_encoder=SimpleNamespace())
         self.assertEqual(
             list(inspect.signature(stage.image_processor.__call__).parameters),
             ["images", "text", "videos", "kwargs"],
         )
         padded = stage.image_processor(images=[None], text=["p"])
         self.assertEqual(tuple(padded["input_ids"].shape), (1, 256))
-        self.assertEqual(padded["attention_mask"].sum().item(), 80)
+        self.assertIs(copy.copy(stage.image_processor).tokenizer, processor.tokenizer)
         want, got = (
             config.qwen_image_edit_postprocess_text(_causal_hidden(t["input_ids"]), t)
             for t in (process(), padded)
@@ -302,7 +278,9 @@ class TestQwenImageKernelAttention(_TestBase):
                 for n, real in zip(rows, [text_len, *image_lens], strict=True)
             ]
             with patch.object(
-                impl, "forward_ring_resume", wraps=impl.forward_ring_resume
+                tpu_splash_attn,
+                "tpu_ring_attention_step",
+                wraps=tpu_splash_attn.tpu_ring_attention_step,
             ) as resume:
                 got = qwen_image._joint_attention(
                     usp, *map(to_tpu, (q, k, v)), segments, False

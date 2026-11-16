@@ -227,7 +227,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             tok_kwargs["padding"] = True
         return tokenizer(prompts, **tok_kwargs)
 
-    def get_text_encoder_position_ids(self, text_inputs, encoder_index):
+    def get_text_encoder_position_ids(self, text_inputs, encoder_index, text_encoder):
         # get_rope_index's text-only positions, from the host mask: the encoder
         # would otherwise take an int64 cumsum on the device.
         mask = self.get_text_encoder_attention_mask(text_inputs, encoder_index)
@@ -511,6 +511,18 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (qwen_image_edit_postprocess_text,)
     )
+
+    def get_text_encoder_position_ids(self, text_inputs, encoder_index, text_encoder):
+        # Positions of the prompt and its image tokens from the processor's
+        # host tensors; the encoder would derive them on the device (an int64
+        # cumsum and boolean indexing).
+        position_ids, _ = text_encoder.model.get_rope_index(
+            text_inputs["input_ids"],
+            text_inputs.get("image_grid_thw"),
+            text_inputs.get("video_grid_thw"),
+            attention_mask=text_inputs["attention_mask"],
+        )
+        return position_ids
 
     def _prepare_edit_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype, *, negative=False

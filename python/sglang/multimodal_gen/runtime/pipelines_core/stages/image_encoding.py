@@ -189,22 +189,13 @@ class ImageEncodingStage(PipelineStage):
 
         return postprocess_funcs[0](outputs, image_inputs)
 
-    def _text_encoder_position_ids(self, inputs, device):
-        """Text encoder positions from the processor's host tensors, or None.
-
-        The encoder would otherwise derive them on the device (an int64
-        cumsum and boolean indexing).
-        """
-        model = getattr(self.text_encoder, "model", None)
-        if self.image_encoder or not hasattr(model, "get_rope_index"):
-            return None
-        position_ids, _ = model.get_rope_index(
-            inputs["input_ids"],
-            inputs.get("image_grid_thw"),
-            inputs.get("video_grid_thw"),
-            attention_mask=inputs.get("attention_mask"),
+    def _text_encoder_position_ids(self, inputs, server_args, device):
+        """The pipeline's text encoder positions from the processor's host
+        tensors (before ``BatchFeature.to`` moves them in place), or None."""
+        position_ids = server_args.pipeline_config.get_text_encoder_position_ids(
+            inputs, 0, self.text_encoder
         )
-        return position_ids.to(device)
+        return None if position_ids is None else position_ids.to(device)
 
     @staticmethod
     def _split_text_conditioning_output(output):
@@ -281,8 +272,9 @@ class ImageEncodingStage(PipelineStage):
             image_inputs = self.image_processor(
                 images=prompt_images, return_tensors="pt", **cur_kwargs
             )
-            # before the upload: BatchFeature.to moves its tensors in place
-            position_ids = self._text_encoder_position_ids(image_inputs, cuda_device)
+            position_ids = self._text_encoder_position_ids(
+                image_inputs, server_args, cuda_device
+            )
             image_inputs = image_inputs.to(cuda_device)
 
             if self.image_encoder:
@@ -329,7 +321,7 @@ class ImageEncodingStage(PipelineStage):
                         **neg_image_processor_kwargs,
                     )
                     neg_position_ids = self._text_encoder_position_ids(
-                        neg_image_inputs, cuda_device
+                        neg_image_inputs, server_args, cuda_device
                     )
                     neg_image_inputs = neg_image_inputs.to(cuda_device)
 

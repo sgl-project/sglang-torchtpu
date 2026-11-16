@@ -2,32 +2,27 @@
 """Qwen-Image and Qwen-Image-Edit on TPU workers: one compiled DiT per image size.
 
 Runtime patch, tracked debt:
-- Why: torch_tpu compiles static shapes. The DiT attends [prompt | image]
-  jointly at the prompt's exact row count, so every prompt length compiles the
-  whole DiT again (the TPU default compiles the whole module), and the eager
-  text encoder compiles once per prompt length too. Its RoPE is a complex
-  multiply on ``torch.polar`` tables, whose interleaved pairs torch_tpu re-lays
-  out (see rope.py). Under Ulysses the stock attention also reads the SP
-  padding rows of the image as keys.
+- Why: torch_tpu compiles static shapes, and the DiT attends [prompt | image]
+  at the prompt's exact row count, so every prompt length recompiles the whole
+  DiT (and the eager text encoder). The complex RoPE reads interleaved pairs
+  (see rope.py), and under Ulysses the stock attention reads the image's SP
+  padding rows as keys.
 - How: :func:`install`
-  (1) wraps the DiT's ``__call__``, outside the compiled module: the prompt
-      rows pad with zeros to a multiple of 512, then of the SP degree, and the
-      attention gets the real prompt and image key counts as device int32
-      tensors;
-  (2) builds the RoPE on the host as real float32 cos/sin tables, padded
-      prompt rows taking the identity rotation;
-  (3) replaces ``QwenImageCrossAttention.forward``: queries attend the real
-      prompt keys, then each image segment's real keys, as resumable kernel
-      steps (each key run padded at its tail only), rotating pairs in the
-      pair-swap form. These are the same keys, and padded keys are never read;
-  (4) right-pads the prompt tokens to a multiple of 256 (the T2I tokenizer and
-      the edit processor). The encoder is causal, so real tokens never see the
-      padding, and only real rows reach the DiT;
-  (5) marks the blocks spmd-safe, one program per block.
+  (1) wraps the DiT's ``__call__``: prompt rows pad with zeros to a multiple of
+      512 (then of the SP degree), and the attention gets the real prompt and
+      image key counts as device int32 tensors;
+  (2) builds real float32 cos/sin RoPE tables on the host (padded prompt rows
+      take the identity rotation);
+  (3) replaces ``QwenImageCrossAttention.forward``: queries attend each
+      segment's real keys as resumable kernel steps, in the pair-swap rotation;
+      padded keys are never read;
+  (4) right-pads the prompt tokens to a multiple of 256 (the encoder is causal,
+      and only real rows reach the DiT);
+  (5) marks the blocks spmd-safe through the platform's region wrapper; they
+      carry no rank-dependent value.
 - Upstream PR or issue: none.
 - Remove when: the DiT takes a platform-provided prompt bucket and key counts,
-  RoPE goes through a platform rotation, and regional compile marks spmd-safe
-  regions.
+  and RoPE goes through a platform rotation.
 """
 
 from __future__ import annotations
@@ -49,6 +44,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_output_all_to_all,
 )
 from sglang.multimodal_gen.runtime.models.dits import qwen_image as dit
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang_tpu.multimodal_gen import tpu_splash_attn
 from sglang_tpu.multimodal_gen.rope import _pair_swap_matrix
 
@@ -58,6 +54,7 @@ PROMPT_TOKEN_ALIGNMENT = 256
 
 _STOCK_GET_FREQS_CIS = config.QwenImagePipelineConfig.get_freqs_cis
 _STOCK_ATTENTION_FORWARD = dit.QwenImageCrossAttention.forward
+_STOCK_BLOCK_FORWARD = dit.QwenImageTransformerBlock.forward
 
 
 def _real_table(freqs: torch.Tensor) -> torch.Tensor:
@@ -68,11 +65,8 @@ def _real_table(freqs: torch.Tensor) -> torch.Tensor:
 
 
 def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
-    """``QwenImagePipelineConfig.get_freqs_cis`` built on the host, as real tables.
-
-    Both slots hold the ``[N, 2 * head_dim]`` tables, 2D as the SP shard
-    helpers expect; only :func:`attention_forward` reads them.
-    """
+    """``get_freqs_cis`` built on the host as real ``[N, 2 * head_dim]`` tables in
+    both slots (2D, as the SP shard helpers expect)."""
     if isinstance(rotary_emb, dit.QwenEmbedLayer3DRope):
         return _STOCK_GET_FREQS_CIS(img_shapes, txt_seq_lens, rotary_emb, device, dtype)
     _, (img, txt) = _STOCK_GET_FREQS_CIS(
@@ -83,11 +77,8 @@ def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
 
 
 def apply_rope_pair_swap(x: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
-    """The stock complex rotation of ``x`` ``[B, N, H, D]`` on a ``[N, 2D]`` table.
-
-    ``x * cos + (x @ R) * sin`` in float32 forms (ac - bd, ad + bc) per pair,
-    the complex product; ``x @ R`` is a signed pair swap, exact in bfloat16.
-    """
+    """The stock complex rotation of ``x`` ``[B, N, H, D]`` on a ``[N, 2D]`` table:
+    ``x * cos + (x @ R) * sin`` in float32, with ``x @ R`` an exact pair swap."""
     cos, sin = table[None, :, None].chunk(2, -1)
     swapped = torch.matmul(x, _pair_swap_matrix(x.shape[-1], x.dtype, x.device))
     return (x.float() * cos + swapped.float() * sin).to(x.dtype)
@@ -98,25 +89,20 @@ def _counts(real: int, device) -> torch.Tensor:
 
 
 def _image_keys(img_shapes, sp: int, device) -> list:
-    """``(rows per rank, [0, real keys])`` per image segment, as the config shards them.
-
-    Under SP the noisy image and the condition images shard separately, each
-    padded at its tail; one rank takes them as one segment.
-    """
+    """``(rows per rank, [0, real keys])`` per image segment: under SP the noisy and
+    condition images shard separately, each padded at its tail."""
     sizes = [math.prod(shape) for shape in img_shapes[0]]
     counts = [sizes[0], sum(sizes[1:])] if sp > 1 else [sum(sizes)]
     return [(-(-n // sp), _counts(n, device)) for n in counts if n]
 
 
 def _dit_call(self, *args, **kwargs):
-    """Pads the prompt rows to the bucket before the compiled DiT runs.
-
-    Padded rows are zeros with the identity rotation; the attention reads only
-    the real prompt keys (``tpu_text_keys``), and their outputs are dropped.
-    """
+    """Pads the prompt rows (zeros, identity rotation) to the bucket before the
+    compiled DiT runs; attention reads only the real keys (``tpu_text_keys``)."""
     states, freqs = kwargs.get("encoder_hidden_states"), kwargs.get("freqs_cis")
     if states is None or freqs is None or self.use_layer3d_rope:
         return torch.nn.Module.__call__(self, *args, **kwargs)
+    _mark_blocks_spmd_safe()
     packed = states[0] if isinstance(states, list) else states
     batch, text_len = packed.shape[:2]
     if kwargs.get("encoder_hidden_states_mask") is not None or any(
@@ -145,22 +131,17 @@ def _dit_call(self, *args, **kwargs):
     return torch.nn.Module.__call__(self, *args, **kwargs)
 
 
-def _uses_kernel(impl, q, keys) -> bool:
-    if not getattr(impl, "use_splash", False) or q.device.type != "tpu":
-        return False
+def _uses_kernel(q, keys) -> bool:
     # Every step takes the kernel or none does: their carries differ.
-    return all(
+    return q.device.type == "tpu" and all(
         tpu_splash_attn._ring_kernel_fallback_reason(q, key, key) is None
         for key in keys
     )
 
 
 def _joint_attention(usp, q, k, v, segments, text_sharded):
-    """``[B, S, H, D]`` attention over each segment's real keys.
-
-    ``segments`` lists ``(rows per rank, [0, real keys])`` in each rank's row
-    order [prompt | image segments], every segment padded at its tail.
-    """
+    """``[B, S, H, D]`` attention over each segment's real keys; ``segments`` lists
+    ``(rows per rank, [0, real keys])`` in row order [prompt | images]."""
     sp = get_sp_world_size()
     sharded = not usp.skip_sequence_parallel and sp > 1
     if sharded:
@@ -184,11 +165,13 @@ def _joint_attention(usp, q, k, v, segments, text_sharded):
         ]
 
     q, keys, values = q.transpose(1, 2), runs(k), runs(v)
-    impl = usp.attn_impl
-    if _uses_kernel(impl, q, keys):
+    scale = usp.attn_impl.softmax_scale
+    if _uses_kernel(q, keys):
         carry = None
         for key, value, (_, real) in zip(keys, values, segments, strict=True):
-            out, carry = impl.forward_ring_resume(q, key, value, real, carry)
+            out, carry = tpu_splash_attn.tpu_ring_attention_step(
+                q, key, value, real, carry, scale
+            )
     else:
         valid = torch.cat(
             [
@@ -203,7 +186,7 @@ def _joint_attention(usp, q, k, v, segments, text_sharded):
             torch.where(valid[:, None], torch.cat(keys, 2), 0),
             torch.where(valid[:, None], torch.cat(values, 2), 0),
             attn_mask=valid[None, None, None],
-            scale=impl.softmax_scale,
+            scale=scale,
         )
     out = out.transpose(1, 2)
     return _usp_output_all_to_all(out, head_dim=2) if sharded else out
@@ -262,16 +245,16 @@ def _pad_tokens(inputs, tokenizer):
 
 
 class _PromptPadding:
-    """An image processor whose token rows are right-padded to a multiple of 256.
-
-    It keeps the processor's named parameters: the stage passes only the
-    keyword arguments ``__call__``'s signature names.
-    """
+    """The edit processor with token rows right-padded to a multiple of 256; it keeps
+    the named parameters (the stage passes only those ``__call__`` names)."""
 
     def __init__(self, processor):
         self._processor = processor
 
     def __getattr__(self, name):
+        # copy and pickle look up dunders before __init__ sets _processor.
+        if name.startswith("_"):
+            raise AttributeError(name)
         return getattr(self._processor, name)
 
     def __call__(self, images=None, text=None, videos=None, **kwargs):
@@ -306,26 +289,15 @@ def _padded_processor_init(init):
     return wrapped
 
 
-# The annotation is not part of torch's compile cache key.
-_SPMD_SAFE_CACHE_TAG = "qwen-image-spmd-safe-blocks-v1"
-
-
-def _mark_blocks_spmd_safe(block_cls) -> None:
-    import torch.compiler.config as compiler_config
-
-    try:
-        from torch_tpu._internal.distributed.spmd_util import spmd_safe
-    except ImportError:
-        # A private torch_tpu API: without it, blocks keep split collectives.
+def _mark_blocks_spmd_safe() -> None:
+    """Wraps the blocks with the platform's spmd-safe region wrapper when a
+    Qwen-Image DiT first runs, so its compile-cache tag reaches only this model."""
+    block_cls = dit.QwenImageTransformerBlock
+    if block_cls.forward is not _STOCK_BLOCK_FORWARD:
         return
-    if getattr(block_cls.forward, "__spmd_safe_for_tpu__", False):
-        return
-    forward = spmd_safe(block_cls.forward)
-    forward.__spmd_safe_for_tpu__ = True
-    block_cls.forward = forward
-    tags = [t for t in str(compiler_config.cache_key_tag or "").split("|") if t]
-    if _SPMD_SAFE_CACHE_TAG not in tags:
-        compiler_config.cache_key_tag = "|".join([*tags, _SPMD_SAFE_CACHE_TAG])
+    wrap = current_platform.prepare_spmd_region_wrapper()
+    if wrap is not None:
+        block_cls.forward = wrap(_STOCK_BLOCK_FORWARD)
 
 
 def install() -> None:
@@ -344,4 +316,3 @@ def install() -> None:
     pipeline_config.get_freqs_cis = staticmethod(get_freqs_cis)
     dit.QwenImageCrossAttention.forward = attention_forward
     dit.QwenImageTransformer2DModel.__call__ = _dit_call
-    _mark_blocks_spmd_safe(dit.QwenImageTransformerBlock)
