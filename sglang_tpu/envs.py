@@ -210,6 +210,10 @@ class TpuEnvs:
     # Pooled DSA indexer: keep each request's raw key|gate rows in a ring of pages per
     # request slot instead of one row per pool token; only the open pool is read back.
     SGLANG_TPU_DSA_KPOOL_RAW_RING = EnvBool(False)
+    # Experimental: shard the sparse-MLA latent cache by page across groups of this
+    # many attention-TP ranks (page g on rank g % shards, at page g // shards); each
+    # rank attends its own pages and the group merges partials. 1 = replicated.
+    SGLANG_TPU_DSA_MLA_KV_SHARDS = EnvInt(1)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)
