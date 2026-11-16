@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.utils import is_tpu
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -213,8 +214,14 @@ class GatedResidual(HyperConnectionBase):
             )
             return (R + injection).flatten(-2)
 
-        self._mix_compute = torch.compile(_mix_compute)
-        self._combine_compute = torch.compile(_combine_compute)
+        if is_tpu():
+            # TPU compiles the whole forward; a nested torch.compile would run
+            # its own graph on that trace's placeholder tensors.
+            self._mix_compute = _mix_compute
+            self._combine_compute = _combine_compute
+        else:
+            self._mix_compute = torch.compile(_mix_compute)
+            self._combine_compute = torch.compile(_combine_compute)
 
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
