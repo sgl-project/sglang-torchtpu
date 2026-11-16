@@ -1195,6 +1195,8 @@ class DcpAttention:
         ``KernelConfig.dsa_compact_window`` run it inside a scoped window
         (zeroed: an unused slot must hold a finite value for P V)."""
         window = _config().dsa_compact_window if self._compact_tokens() else 0
+        if self.batch >= 16:  # VMEM: the 16-row verifies sit within ~1 MiB of the limit
+            window //= 2
         if not (
             window
             and self.cache_verify_rows
@@ -1799,6 +1801,26 @@ class DcpAttention:
             @pl.when(step < self.total)
             def prime(step=step):
                 self._start_step(step)
+
+    def prime_keys(self):
+        """The selection's key copies of the first steps, whose pages an
+        earlier selection-free attention of the same rows primed (every step
+        active: the DSA's dense regime)."""
+        sel = self.selection
+        for step in range(self.buffers - 1):
+
+            @pl.when(step < self.total)
+            def prime(step=step):
+                row, local_step, _ = self._locate(step)
+                slot = step % self.buffers
+                tpu.make_async_copy(
+                    sel.keys.at[
+                        pl.ds(row, sel.key_buf.shape[1]),
+                        pl.ds(local_step * sel.key_buf.shape[2], sel.key_buf.shape[2]),
+                    ],
+                    sel.key_buf.at[slot],
+                    sel.key_semaphores.at[slot],
+                ).start()
 
     def row_groups(self):
         """``[(first row, end row)]``: the batch in ``packet_layout``'s groups."""

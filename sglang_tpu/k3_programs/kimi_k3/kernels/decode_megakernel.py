@@ -5178,7 +5178,7 @@ def mla(
     # invalid; timing only.
     dcp_skip = _config().dcp_skip
 
-    def make_attention(selection=None):
+    def make_attention(selection=None, prime=True):
         attention = mla_dcp.DcpAttention(
             *dcp,
             position_ref,
@@ -5188,10 +5188,20 @@ def mla(
             cache_verify_rows=sequence_rows > 1 and dcp[0].dtype == jnp.float8_e4m3fn,
             selection=selection,
         )
-        attention.prime()
+        if prime:
+            attention.prime()
         return attention
 
     dcp_attention = make_attention() if dsa is None else None
+    if dsa is not None:
+        # When the selection will mark every attention step (its dense regime),
+        # the first steps' pages do not depend on it: start them now, as the
+        # selection-free attention does, and only the key copies after it.
+        early_prime = dsa.dense_attention(dcp[0], position_ref, batch_size)
+
+        @pl.when(early_prime)
+        def prime_pages():
+            make_attention()
 
     if "query_down" in streams:
         query_latent = (
@@ -5265,8 +5275,11 @@ def mla(
         dcp_attention = make_attention(
             dsa.selection(
                 dcp[0], position_ref, hidden_ref[...], query_latent, dcp[0].layer % 2
-            )
+            ),
+            prime=False,
         )
+        pl.when(early_prime)(dcp_attention.prime_keys)
+        pl.when(jnp.logical_not(early_prime))(dcp_attention.prime)
 
     _phase_end(mla_scope.pop())
     mla_scope.append(_phase_start("q7_mla_attend"))

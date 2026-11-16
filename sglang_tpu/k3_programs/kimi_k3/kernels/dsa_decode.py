@@ -335,6 +335,25 @@ class DecodeIndexer:
         )
         return self._blocked_product(x, first, HEADS, transposed=True)
 
+    def dense_attention(self, cache, position_ref, batch):
+        """Whether the selection will mark every attention step of every row
+        (``dsa_dcp`` step activity: no row has more than
+        ``ACTIVITY_MIN_STEPS`` local steps), from the positions alone -- the
+        same counts as ``IndexSelect.plan``."""
+        group, T = cache.group, cache.page_tokens
+        member = jax.lax.axis_index("tp") % group
+        owner = member if cache.owner is None else cache.owner
+        subpages = T // dsa_dcp.INDEX_SUBPAGE_TOKENS
+        span_rows = self.scoped["attend_keys"].shape[2]
+        longest = jnp.int32(0)
+        for b in range(batch):
+            needed = (position_ref[b] + 1 + T - 1) // T
+            count = jnp.maximum(needed - owner + group - 1, 0) // group
+            longest = jnp.maximum(longest, count)
+        return (
+            longest * subpages + span_rows - 1
+        ) // span_rows <= dsa_dcp.ACTIVITY_MIN_STEPS
+
     def selection(
         self, cache, position_ref, hidden, query_latent, parity
     ) -> mla_dcp.DcpSelection:
