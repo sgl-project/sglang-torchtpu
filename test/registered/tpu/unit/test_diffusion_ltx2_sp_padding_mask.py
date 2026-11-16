@@ -15,6 +15,10 @@ from sglang.multimodal_gen.test.unit.test_ltx2_sp_padding_mask import (  # noqa:
     TestLtx2SplitRotaryEmb,
     TestLtx2SpPaddingMask,
 )
+from sglang.multimodal_gen.test.unit.test_ltx2_two_stage_cfg_parallel import (  # noqa: F401
+    TestLtx2RefinementStageParallelism,
+    TestLtx2RefinementStageSharesMainRankLatents,
+)
 
 if __name__ == "__main__":
     unittest.main()
