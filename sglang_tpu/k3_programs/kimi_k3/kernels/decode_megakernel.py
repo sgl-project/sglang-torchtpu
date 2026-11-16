@@ -7849,7 +7849,22 @@ def stack(
         attention_dp == 1 or attention_schedule != "legacy"
     )
     # Router halves a rank holds in the arena (2: its own and its pair peer's).
-    router_slots = 2 if ROUTER_BOTH_HALVES and pool_managed and not shard_routing else 1
+    # Only where the pair peer's t10 gather cannot still be reading the
+    # shared-reduction buffer this rank writes next (the score exchange's wait
+    # ordered it): attention DP1 without token scatter, or token scatter with a
+    # power-of-two count of at least two rows per owner (the direct t10 path).
+    both_halves_ordered = attention_dp == 1 and (
+        not attention_token_scatter
+        or (owned_rows >= 2 and owned_rows & (owned_rows - 1) == 0)
+    )
+    router_slots = (
+        2
+        if ROUTER_BOTH_HALVES
+        and pool_managed
+        and not shard_routing
+        and both_halves_ordered
+        else 1
+    )
     if blocks_block_major and not sequence_parallel_pre_attention:
         raise ValueError(
             "Above eight rows the decoder needs sequence-parallel pre-attention"
