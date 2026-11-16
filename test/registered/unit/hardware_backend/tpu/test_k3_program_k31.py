@@ -571,8 +571,9 @@ class TestSelectedAttention(CustomTestCase):
         import dataclasses
         base_config = mla_dcp._config()
 
-        def case(firsts, S, topk, seed, grouped=False, activity="exact", poison=False, compact=0, expect=None):
-            config = dataclasses.replace(base_config, dsa_compact_tokens=compact)
+        def case(firsts, S, topk, seed, grouped=False, activity="exact", poison=False, compact=0, expect=None,
+                 window=0):
+            config = dataclasses.replace(base_config, dsa_compact_tokens=compact, dsa_compact_window=window)
             mla_dcp._config = lambda: config
             mla_dcp._grouped_spec = ((lambda b, g, h, rows: rows in (4, 8) and b % 4 == 0) if grouped
                                      else (lambda *a: False))
@@ -695,6 +696,11 @@ class TestSelectedAttention(CustomTestCase):
         case([1500, 3000], 4, 24, 5, grouped=True, compact=64, expect=("compact",))
         case([1500, 3000], 4, 200, 1, grouped=True, compact=128, expect=("compact", "dense"))
         case([900, 2600], 8, 40, 6, grouped=True, compact=64, expect=("compact",))
+        # Windowed compact steps (KernelConfig.dsa_compact_window): gathered tokens of several steps fold
+        # once; a small window flushes when the next step's slots would not fit.
+        case([1500, 3000], 4, 200, 1, grouped=True, compact=128, expect=("compact", "dense"), window=512)
+        case([900, 2600], 8, 40, 6, grouped=True, compact=64, expect=("compact",), window=64)
+        case([700, 9000], 4, 8, 4, grouped=True, compact=64, poison=True, window=256)
         print("OK")
     """
 

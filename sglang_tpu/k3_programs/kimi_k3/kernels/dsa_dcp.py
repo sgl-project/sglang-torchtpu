@@ -181,10 +181,12 @@ def _scope(name):
     )
 
 
-def chunk_rows(batch: int) -> int:
+def chunk_rows(batch: int, sequence_rows: int = 1) -> int:
     """Key rows a counting step reads (a step's overhead outweighs its rows; the
-    wider chunk's ring needs VMEM the widest batches lack)."""
-    return WIDE_CHUNK_ROWS if batch < WIDE_CHUNK_MAX_BATCH else CHUNK_ROWS
+    wider chunk's ring needs VMEM the wider verifies lack: 32 rows, and 16 rows
+    of eight-row sequences)."""
+    narrow = batch >= WIDE_CHUNK_MAX_BATCH or (batch >= 16 and sequence_rows >= 8)
+    return CHUNK_ROWS if narrow else WIDE_CHUNK_ROWS
 
 
 def ring_slots(batch: int) -> tuple[int, int]:
@@ -1701,7 +1703,8 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         "stage": vmem((2, sequence_rows, subpages, LANES), jnp.int32),
         "stage_sems": pltpu.SemaphoreType.DMA((2,)),
         "key_buf": vmem(
-            (key_slots, min(chunk_rows(batch), key_rows), LANES), jnp.int32
+            (key_slots, min(chunk_rows(batch, sequence_rows), key_rows), LANES),
+            jnp.int32,
         ),
         "key_sems": pltpu.SemaphoreType.DMA((key_slots,)),
         "exchange": vmem((2, group, COUNT_ROWS, LANES), jnp.int32),
@@ -1714,10 +1717,12 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         "page_starts": pltpu.SMEM((batch + 1,), jnp.int32),
         "chunk_starts": pltpu.SMEM((batch + 1,), jnp.int32),
         "step_row": pltpu.SMEM(
-            (batch * -(-key_rows // min(chunk_rows(batch), key_rows)),), jnp.int32
+            (batch * -(-key_rows // min(chunk_rows(batch, sequence_rows), key_rows)),),
+            jnp.int32,
         ),
         "step_local": pltpu.SMEM(
-            (batch * -(-key_rows // min(chunk_rows(batch), key_rows)),), jnp.int32
+            (batch * -(-key_rows // min(chunk_rows(batch, sequence_rows), key_rows)),),
+            jnp.int32,
         ),
         "page_seq": pltpu.SMEM(
             (batch * -(-key_rows * LANES // (subpages * INDEX_SUBPAGE_TOKENS)),),
@@ -1729,7 +1734,11 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
         ),
         "row_prefix": pltpu.SMEM((batch,), jnp.int32),
         "row_position": pltpu.SMEM((batch,), jnp.int32),
-        **(_group_scratch(batch, key_rows) if batch < WIDE_CHUNK_BATCH else {}),
+        **(
+            _group_scratch(batch, key_rows, sequence_rows)
+            if batch < WIDE_CHUNK_BATCH
+            else {}
+        ),
         **(_gather_scratch(batch, group) if gather_finish(batch) else {}),
     }
 
@@ -1749,12 +1758,12 @@ def _gather_scratch(batch, group):
     }
 
 
-def _group_scratch(batch, key_rows):
+def _group_scratch(batch, key_rows, sequence_rows=1):
     """The grouped count passes' buffers (``IndexSelect._count_groups``): two
     slots of 8 rows' key chunks and the group steps' SMEM tables."""
     from jax.experimental.pallas import tpu as pltpu
 
-    groups, chunk = -(-batch // 8), min(chunk_rows(batch), key_rows)
+    groups, chunk = -(-batch // 8), min(chunk_rows(batch, sequence_rows), key_rows)
     return {
         "group_buf": pltpu.VMEM(
             (2, 8 * chunk, LANES), jnp.int32

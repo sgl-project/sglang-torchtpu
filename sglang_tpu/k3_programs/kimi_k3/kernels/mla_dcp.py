@@ -120,9 +120,15 @@ def page_plan(
         plan = page_plan(
             batch, heads, sequence_rows, cache_dtype, force_chunks=force_chunks
         )
-        # The 32-row verify's decode VMEM fits three steps in flight beside the
-        # indexer's buffers.
-        return {**plan, "buffers": min(plan["buffers"], BUFFERS if batch < 32 else 3)}
+        # The 32-row verify's (and 16 rows of eight-row sequences') decode VMEM fits
+        # three steps in flight beside the indexer's buffers.
+        return {
+            **plan,
+            "buffers": min(
+                plan["buffers"],
+                3 if batch >= 32 or (batch >= 16 and sequence_rows >= 8) else BUFFERS,
+            ),
+        }
     if batch <= 4:
         return {"span": SPAN, "buffers": BUFFERS}
     if sequence_rows == 1:
@@ -961,7 +967,7 @@ class DcpAttention:
 
     def _attend_cached_verify(self, step, row, load, base):
         # Earlier verify tokens use the cache's FP8 QK/PV, like sequential decode.
-        _, local_step, _ = self._locate(step)
+        _, local_step, row_pages = self._locate(step)
         assert self.sequence_rows - 1 <= self.page_tokens  # the rows span <= 2 pages
 
         def in_step(position):
@@ -1031,10 +1037,25 @@ class DcpAttention:
                 union = union | mask
             union = union.astype(jnp.int32)
             count = jnp.sum(union)
-            pl.when((count > 0) & (count <= compact))(
-                lambda: self._compact_verify(load, masks, union, row - base, compact)
+            take = (count > 0) & (count <= compact)
+            window = getattr(self, "_window", None)
+            if window is None:
+                pl.when(take)(
+                    lambda: self._compact_verify(load, masks, union, row - base, compact)
+                )
+                pl.when(count > compact)(dense)
+                return
+            capacity = window[0].shape[0]
+            pl.when(take & (window[2][0] + compact > capacity))(
+                lambda: self._flush_window(row - base)
+            )
+            pl.when(take)(
+                lambda: self._window_gather(load, masks, union, count, compact)
             )
             pl.when(count > compact)(dense)
+            # ``_locate``'s count is the row's local pages: its last step folds the window.
+            last_step = (row_pages + self.span - 1) // self.span - 1
+            pl.when(local_step == last_step)(lambda: self._flush_window(row - base))
         else:
 
             @pl.loop(0, self.sequence_rows)
@@ -1079,6 +1100,27 @@ class DcpAttention:
         by a one-hot matmul (exact: each slot copies one cache value), then the
         grouped QK / fold over the slots with each row's own mask; unused slots
         are masked out."""
+        gathered, one_hot, row_masks = self._gather_selected(
+            load, masks, union, compact
+        )
+        slot_visible = jax.lax.dot_general(
+            row_masks,
+            one_hot,
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )  # [rows, compact]: 1 where the slot's token is the row's
+
+        def compact_load(lanes, tokens=None):
+            assert tokens is None
+            return gathered[:, lanes.start : lanes.start + lanes.size]
+
+        self._fold_slots(compact_load, slot_visible, held)
+
+    def _gather_selected(self, load, masks, union, compact):
+        """The step's selected tokens (``union``) gathered into ``compact``
+        slots in token order: ``(tokens [compact, 640] cache dtype, one-hot
+        [compact, W] BF16, the rows' masks [rows, W] BF16)``; slots past the
+        count hold zeros."""
         key_rows = union.shape[0]
 
         def flat(x):  # [key rows, 128] -> [1, key rows * 128] (tokens on lanes)
@@ -1097,29 +1139,84 @@ class DcpAttention:
         row_masks = jnp.concatenate(
             [flat(mask.astype(jnp.int32)) for mask in masks], axis=0
         ).astype(jnp.bfloat16)  # [rows, W]
-        slot_visible = jax.lax.dot_general(
-            row_masks,
-            one_hot.astype(jnp.bfloat16),
-            (((1,), (1,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )  # [rows, compact]: 1 where the slot's token is the row's
+        return gathered, one_hot.astype(jnp.bfloat16), row_masks
 
-        def compact_load(lanes, tokens=None):
-            assert tokens is None
-            return gathered[:, lanes.start : lanes.start + lanes.size]
-
+    def _fold_slots(self, slot_load, slot_visible, held):
+        """Grouped QK / fold of gathered slots (``slot_load(lanes)``) with the
+        rows' slot masks ``slot_visible`` [rows, slots] (1.0 visible)."""
+        slots = slot_visible.shape[1]
         for first in range(0, self.sequence_rows, 4):
             query = (
                 jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0)
                 // self.tile
             )
-            visible = jnp.broadcast_to(slot_visible[first : first + 1], (1, compact))
+            visible = jnp.broadcast_to(slot_visible[first : first + 1], (1, slots))
             for i in range(1, 4):
                 visible = jnp.where(
                     query == i, slot_visible[first + i : first + i + 1], visible
                 )
-            score = self._group_scores(compact_load, visible > 0.5, held + first, 4)
-            self._group_fold(score, compact_load, held + first, 4)
+            score = self._group_scores(slot_load, visible > 0.5, held + first, 4)
+            self._group_fold(score, slot_load, held + first, 4)
+
+    def _window_gather(self, load, masks, union, count, compact):
+        """Append a compact step's gathered tokens to the window at its fill
+        (32-slot aligned) and their rows' masks; the fill advances by the
+        count rounded up to 32."""
+        tokens, visible, fill = self._window
+        gathered, one_hot, row_masks = self._gather_selected(
+            load, masks, union, compact
+        )
+        at = pl.multiple_of(fill[0], 32)
+        tokens[pl.ds(at, compact), :] = gathered
+        visible[pl.ds(at, compact), :] = jax.lax.dot_general(
+            one_hot,
+            row_masks,
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )  # [compact, rows]
+        fill[0] = fill[0] + (count + 31) // 32 * 32
+
+    def _flush_window(self, held):
+        """Fold the window's slots into row ``held``'s state and empty it."""
+        tokens, visible, fill = self._window
+
+        @pl.when(fill[0] > 0)
+        def fold():
+            def window_load(lanes, tokens_=None):
+                assert tokens_ is None
+                return tokens[:, lanes]
+
+            self._fold_slots(window_load, jnp.transpose(visible[...]), held)
+            visible[...] = jnp.zeros(visible.shape, visible.dtype)
+            fill[0] = jnp.int32(0)
+
+    def _step_loop(self, first, end, base=0):
+        """The attention's step loop; compact grouped verifies with
+        ``KernelConfig.dsa_compact_window`` run it inside a scoped window
+        (zeroed: an unused slot must hold a finite value for P V)."""
+        window = _config().dsa_compact_window if self._compact_tokens() else 0
+        if not (
+            window
+            and self.cache_verify_rows
+            and _grouped_spec(self.batch, self.group, self.heads, self.sequence_rows)
+        ):
+            pl.loop(first, end)(lambda step: self._attend_step(step, base=base))
+            return
+
+        def run(tokens, visible, fill):
+            tokens[...] = jnp.zeros(tokens.shape, tokens.dtype)
+            visible[...] = jnp.zeros(visible.shape, visible.dtype)
+            fill[0] = jnp.int32(0)
+            self._window = (tokens, visible, fill)
+            pl.loop(first, end)(lambda step: self._attend_step(step, base=base))
+            self._window = None
+
+        pl.run_scoped(
+            run,
+            tpu.VMEM((window, LANES), self.cache.dtype),
+            tpu.VMEM((window, self.sequence_rows), jnp.float32),
+            tpu.SMEM((1,), jnp.int32),
+        )
 
     def _step_pages(self, step):
         """Step ``step``'s row, the mask of its visible tokens and a reader of
@@ -1314,7 +1411,7 @@ class DcpAttention:
         ``peel`` is static: the split-tail path finishes PV outside the loop
         instead, before issuing the separate half-width QK/PV."""
         if self.sequence_rows > 1 or "pagecompute" in self.skip:
-            pl.loop(first, end)(lambda step: self._attend_step(step, base=base))
+            self._step_loop(first, end, base)
             return
 
         def scores(step):
@@ -1825,12 +1922,10 @@ class DcpAttention:
                 )
             else:
 
-                @pl.loop(
+                self._step_loop(
                     self.starts[first],
                     self.starts[first] if "attend" in self.skip else self.starts[end],
                 )
-                def attend(step):
-                    self._attend_step(step)
 
             # 3. Normalize and send each owner its heads' rows.
             self._pack_partials(first, end)

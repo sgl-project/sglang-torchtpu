@@ -92,6 +92,10 @@ class KernelConfig:
     # gathered into that many slots by a one-hot matmul; busier steps run
     # dense with the mask. 0: always dense.
     dsa_compact_tokens: int = 0
+    # Compact verify steps append their gathered tokens to a window of this
+    # many slots, folded once when full and at each row's last step (instead
+    # of one fold a step). 0: fold every compact step.
+    dsa_compact_window: int = 0
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
