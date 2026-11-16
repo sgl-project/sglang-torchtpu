@@ -14,7 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
-| `ideogram4.sh` | `ideogram-ai/ideogram-4-fp8` | 8 | Ulysses 8 (18 heads, padded to 24); conditional and unconditional DiTs in turn |
+| `ideogram4.sh` | `ideogram-ai/ideogram-4-fp8` | 8 | Ulysses 8 (18 heads, padded to 24), per-block compile; conditional and unconditional DiTs in turn |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -39,9 +39,9 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
-| Ideogram 4 (FP8) | T2I 1024x1024, 20 steps, guidance 7 | 8 | 1.9 s | 0.073 s | 0.09 s | 50.2 GB |
-| Ideogram 4 (FP8) | T2I 1536x1024, 20 steps, guidance 7 | 8 | 2.6 s | 0.103 s | 0.14 s | 56.7 GB |
-| Ideogram 4 (FP8) | T2I 2048x2048, 20 steps, guidance 7 | 8 | 6.2 s | 0.283 s | 0.36 s | 85.6 GB |
+| Ideogram 4 (FP8) | T2I 1024x1024, 20 steps, guidance 7 | 8 | 1.7 s | 0.074 s | 0.09 s | 49.7 GB |
+| Ideogram 4 (FP8) | T2I 1536x1024, 20 steps, guidance 7 | 8 | 2.3 s | 0.100 s | 0.14 s | 55.7 GB |
+| Ideogram 4 (FP8) | T2I 2048x2048, 20 steps, guidance 7 | 8 | 6.2 s | 0.279 s | 0.36 s | 84.9 GB |
 
 
 ## Example requests
@@ -63,6 +63,10 @@ curl -s -X POST http://localhost:30000/v1/images/generations -H "Content-Type: a
   "size": "1024x1024", "seed": 42, "response_format": "b64_json"
 }' | python3 -c 'import base64, json, sys; open("out.png", "wb").write(base64.b64decode(json.load(sys.stdin)["data"][0]["b64_json"]))'
 ```
+
+Prompts take up to 2048 tokens. The DiT's packed rows (prompt plus image tokens) pad to a multiple of 512, so an image
+size has up to four prompt buckets: the first prompt of a new bucket compiles the blocks for it once (13 to 15 s at
+1024x1024), and a new prompt length inside a bucket served before adds about 3 s once.
 
 `/v1/videos` queues a job and returns its `id`; poll `GET /v1/videos/{id}` until `status` is `completed`, then
 download `GET /v1/videos/{id}/content`. Image-to-video requests (Wan2.2-I2V-A14B, Wan2.2-TI2V-5B) add
