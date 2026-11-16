@@ -46,7 +46,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | FLUX.2-klein-4B (diffusion) | bf16 | 1 chip, 1 host | Experimental |
 | Z-Image-Turbo (diffusion) | bf16 | 1 chip, 1 host | Experimental |
 | LTX-2 (diffusion) | bf16 | 1 host | Experimental |
-| SANA 1.5 4.8B (diffusion) | bf16 | 1 chip | Experimental |
+| SANA 1.5 4.8B (diffusion) | bf16 | 1 core | Experimental |
 
 ### Features
 

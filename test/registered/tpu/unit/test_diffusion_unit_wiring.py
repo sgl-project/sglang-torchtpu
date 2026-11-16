@@ -40,6 +40,8 @@ _PARTLY_WIRED = {
     "test_platform_detection": "the rest are upstream CUDA detection",
     "test_minimax_h3_encoder_device": "the rest check the encoder device under "
     "CPU offload on a mocked CUDA device",
+    "test_vae_loader": "the SANA DC-AE load; the rest are upstream loader cases "
+    "with no platform branch or for a mocked CUDA, XPU or MPS device",
 }
 
 # Core test files the TPU path filter matches that no TPU wrapper runs, with why.

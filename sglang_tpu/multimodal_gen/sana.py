@@ -17,11 +17,11 @@ Runtime patch, tracked debt:
 
 from __future__ import annotations
 
-import functools
-
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.pipeline_configs import sana as config
+
+_STOCK_TOKENIZE = config.SanaPipelineConfig.tokenize_prompt
 
 
 def _pad_tokens(inputs, tokenizer, max_length):
@@ -36,19 +36,11 @@ def _pad_tokens(inputs, tokenizer, max_length):
     return inputs
 
 
-def _padded_tokenize(tokenize):
-    @functools.wraps(tokenize)
-    def wrapped(self, prompts, tokenizer, tok_kwargs):
-        inputs = tokenize(self, prompts, tokenizer, tok_kwargs)
-        return _pad_tokens(inputs, tokenizer, tok_kwargs.get("max_length"))
-
-    wrapped.__wrapped_for_tpu__ = True
-    return wrapped
+def tokenize_prompt(self, prompts, tokenizer, tok_kwargs):
+    """``tokenize_prompt`` with the rows right-padded to ``max_length``."""
+    inputs = _STOCK_TOKENIZE(self, prompts, tokenizer, tok_kwargs)
+    return _pad_tokens(inputs, tokenizer, tok_kwargs.get("max_length"))
 
 
 def install() -> None:
-    pipeline_config = config.SanaPipelineConfig
-    if not getattr(pipeline_config.tokenize_prompt, "__wrapped_for_tpu__", False):
-        pipeline_config.tokenize_prompt = _padded_tokenize(
-            pipeline_config.tokenize_prompt
-        )
+    config.SanaPipelineConfig.tokenize_prompt = tokenize_prompt
