@@ -113,6 +113,10 @@ class KernelConfig:
     # 8- and 16-row decode steps: keep the small embedding all-reduce on the
     # TensorCore instead of the SparseCore collective offload.
     decode_tc_all_reduce: bool = False
+    # MLA DSpark drafts with more than two heads a rank (Kimi-K3.1's): hold
+    # o_proj whole in VMEM at up to 8 rows and down_proj at up to 16 (attention
+    # DP1) instead of streaming them one 896-column chunk at a time.
+    draft_whole_weights: bool = False
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
