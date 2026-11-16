@@ -350,21 +350,23 @@ GROUPED_SPEC_SHAPES = (
 
 def _exclusive_prefix(flags):
     """Exclusive running count of ``flags`` (int32 0/1 ``[rows, 128]``) in
-    row-major order: log-step lane scans, then the rows' totals carried down."""
-    lane = jax.lax.broadcasted_iota(jnp.int32, flags.shape, 1)
-    row = jax.lax.broadcasted_iota(jnp.int32, flags.shape, 0)
-    total = flags
-    shift = 1
-    while shift < flags.shape[1]:
-        total = total + jnp.where(lane >= shift, pltpu.roll(total, shift, 1), 0)
-        shift *= 2
-    carry = jnp.broadcast_to(total[:, flags.shape[1] - 1 :], flags.shape)
-    carry = jnp.where(row >= 1, pltpu.roll(carry, 1, 0), 0)
-    shift = 1
-    while shift < flags.shape[0]:
-        carry = carry + jnp.where(row >= shift, pltpu.roll(carry, shift, 0), 0)
-        shift *= 2
-    return total - flags + carry
+    row-major order: a strictly upper-triangular matmul within each row (exact
+    in FP32), then the earlier rows' totals carried down."""
+    rows, lanes = flags.shape
+    source = jax.lax.broadcasted_iota(jnp.int32, (lanes, lanes), 0)
+    target = jax.lax.broadcasted_iota(jnp.int32, (lanes, lanes), 1)
+    within = jax.lax.dot_general(
+        flags.astype(jnp.bfloat16),
+        (source < target).astype(jnp.bfloat16),
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    ).astype(jnp.int32)
+    totals = jnp.sum(flags, axis=1, keepdims=True)  # [rows, 1]
+    carried, running = [], jnp.zeros((1, 1), jnp.int32)
+    for row in range(rows):
+        carried.append(jnp.broadcast_to(running, (1, lanes)))
+        running = running + totals[row : row + 1]
+    return within + jnp.concatenate(carried, axis=0)
 
 
 def _grouped_spec(batch, group, heads, sequence_rows):
@@ -1197,6 +1199,8 @@ class DcpAttention:
         window = _config().dsa_compact_window if self._compact_tokens() else 0
         if self.batch >= 16:  # VMEM: the 16-row verifies sit within ~1 MiB of the limit
             window //= 2
+        if window:
+            window = max(window, self._compact_tokens())  # a step's slots always fit
         if not (
             window
             and self.cache_verify_rows
