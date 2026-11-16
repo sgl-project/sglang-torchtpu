@@ -131,6 +131,7 @@ def main():
                     backend=backend,
                     config=config,
                     key_store="xla",
+                    page_size=fixture["_PAGE_SIZE"],
                     writer_and_score_included=True,
                     **timing,
                 )
