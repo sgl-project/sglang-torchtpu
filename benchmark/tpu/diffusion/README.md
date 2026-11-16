@@ -4,8 +4,8 @@ Launch recipes for `sglang.multimodal_gen` on one tpu7x 2x2x1 host (8 TensorCore
 All recipes use the Pallas splash attention backend, torch.compile with the `tpu` backend, a TP-folded resident
 text encoder, the highest TPU clock and a 65536 KiB scoped-VMEM limit for XLA fusions (`LIBTPU_INIT_ARGS`), the full
 64 MiB of per-core VMEM on tpu7x (3% faster denoise on Z-Image-Turbo than without it); see `launch.sh`. The Wan
-recipes compile per transformer block (`--regional-compile`), which keeps each block's collectives inside its program,
-and run Ulysses across the two cores of a chip with a K/V all-gather ring across chips.
+and ERNIE-Image recipes compile per transformer block (`--regional-compile`), which keeps each block's collectives
+inside its program; the Wan recipes run Ulysses across the two cores of a chip with a K/V all-gather ring across chips.
 
 | Recipe | Model | Cores | Parallelism |
 | :--- | :--- | :---: | :--- |

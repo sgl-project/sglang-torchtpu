@@ -27,7 +27,8 @@ Runtime patch, tracked debt:
       so real tokens never see the padding, and only real rows reach the DiT;
   (5) keeps the latents whole under SP (the DiT shards its own stream), and
       declares the blocks as spmd-safe regions for ``--regional-compile``;
-  (6) runs requests one at a time: a batch takes one prompt length.
+  (6) runs requests one at a time (a batch takes one prompt length) and
+      refuses CFG parallel at load.
 - Upstream PR or issue: none.
 - Remove when: the DiT takes a platform-provided prompt bucket and key counts
   and shards its own stream under SP.
@@ -53,12 +54,14 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_output_all_to_all,
 )
 from sglang.multimodal_gen.runtime.models.dits import ernie_image as dit
+from sglang.multimodal_gen.runtime.pipelines import ernie_image as pipeline
 from sglang_tpu.multimodal_gen import tpu_splash_attn
 
 # Prompts stay within one bucket; the kernel's prompt step needs >= 512 keys.
 TEXT_ALIGNMENT = 512
 PROMPT_TOKEN_ALIGNMENT = 256
 
+_STOCK_LOAD_MODULES = pipeline.ErnieImagePipeline.load_modules
 _STOCK_TOKENIZE = config.ErnieImagePipelineConfig.tokenize_prompt
 _STOCK_FORWARD = dit.ErnieImageTransformer2DModel.forward
 _STOCK_ATTENTION_FORWARD = dit.ErnieImageSelfAttention.forward
@@ -330,12 +333,24 @@ def _unbatched(self, batch) -> bool:
     return False
 
 
+def _load_modules(self, server_args, loaded_modules=None):
+    # Two CFG halves, each running Ulysses in its own process subgroup, gave
+    # identical requests different images on TPU.
+    if server_args.enable_cfg_parallel:
+        raise ValueError(
+            "ERNIE-Image on TPU runs classifier-free guidance serially: launch "
+            "with --ulysses-degree N instead of CFG parallel"
+        )
+    return _STOCK_LOAD_MODULES(self, server_args, loaded_modules)
+
+
 def _whole_latents(self, batch, latents):
     """Latents stay whole under SP: the DiT shards its own stream (:func:`forward`)."""
     return latents, False
 
 
 def install() -> None:
+    pipeline.ErnieImagePipeline.load_modules = _load_modules
     pipeline_config = config.ErnieImagePipelineConfig
     pipeline_config.tokenize_prompt = _tokenize
     pipeline_config.shard_latents_for_sp = _whole_latents

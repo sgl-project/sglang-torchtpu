@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits import ernie_image as dit
 from sglang.multimodal_gen.runtime.models.encoders.mistral_3 import MistralModel
+from sglang.multimodal_gen.runtime.pipelines import ernie_image as pipeline
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 from sglang.multimodal_gen.runtime.utils import torch_compile
 from sglang.multimodal_gen.test.unit.conftest import _make_unit_server_args
@@ -55,6 +56,7 @@ def _installed():
     """Run install() with every patched name restored afterwards."""
     with contextlib.ExitStack() as stack:
         for owner, name in (
+            (pipeline.ErnieImagePipeline, "load_modules"),
             (config.ErnieImagePipelineConfig, "tokenize_prompt"),
             (config.ErnieImagePipelineConfig, "shard_latents_for_sp"),
             (config.ErnieImagePipelineConfig, "supports_dynamic_batching_for_request"),
@@ -162,6 +164,20 @@ class TestErnieImageDenoise(_TestBase):
             )
             with self.assertRaises(NotImplementedError):
                 _run(model, kwargs)
+
+    def test_cfg_parallel_is_refused_at_load(self):
+        with (
+            _installed(),
+            patch.object(ernie_image, "_STOCK_LOAD_MODULES") as stock,
+        ):
+            load = pipeline.ErnieImagePipeline.load_modules
+            args = SimpleNamespace(enable_cfg_parallel=True)
+            with self.assertRaisesRegex(ValueError, "--ulysses-degree"):
+                load(None, args)
+            stock.assert_not_called()
+            args.enable_cfg_parallel = False
+            load(None, args)
+            stock.assert_called_once_with(None, args, None)
 
     def test_dit_compiles_once_across_prompt_lengths(self):
         wrapped = []
