@@ -300,6 +300,10 @@ class TpuEnvs:
     # one Pallas kernel (attention/pallas/dsa_key_store.py, same bytes as the
     # XLA path); False keeps the XLA whole-row scatter for every batch.
     SGLANG_TPU_DSA_PALLAS_KEY_STORE = EnvBool(True)
+    # Opt-in JAX radix V2 selection over the existing streamindex score buffer.
+    # Freeze before custom-op registration/compilation. v7 and K=16/2048 only;
+    # unsupported shapes and score-returning/CP calls retain SparseCore.
+    SGLANG_TPU_USE_DSA_RADIX_TOPK = EnvBool(False)
     # SparseCore top-k (dsv4/sparsecore_topk.py): when every row's valid prefix fits
     # one slice, run a single pass over the narrowest 4096-wide bucket instead of the
     # partitioned top-k; long-context pools pad rows to the max context. Selects the

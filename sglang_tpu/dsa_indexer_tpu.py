@@ -48,6 +48,11 @@ def build_dsa_index_topk_op():
 
     from sglang_tpu.attention.pallas.dsa_index_topk import dsa_indexer_step
 
+    from sglang_tpu.envs import tpu_envs
+
+    selector = (
+        "radix_v2" if tpu_envs.SGLANG_TPU_USE_DSA_RADIX_TOPK.get() else "sparsecore"
+    )
     op_name = "sglang_tpu_pallas::dsa_index_topk"
 
     # custom_jax_kernel reads this function's signature: every tensor has to
@@ -82,6 +87,7 @@ def build_dsa_index_topk_op():
             topk=topk,
             decode_query_size=decode_query_size,
             segments=segments,
+            selector=selector,
             key_store=key_store,
         )
 
@@ -195,6 +201,11 @@ def build_dsa_index_topk_split_op():
 
     from sglang_tpu.attention.pallas.dsa_index_topk import dsa_indexer_step
 
+    from sglang_tpu.envs import tpu_envs
+
+    selector = (
+        "radix_v2" if tpu_envs.SGLANG_TPU_USE_DSA_RADIX_TOPK.get() else "sparsecore"
+    )
     op_name = "sglang_tpu_pallas::dsa_index_topk_split"
 
     # Positional jax.Array tensors, as in build_dsa_index_topk_op.
@@ -229,6 +240,7 @@ def build_dsa_index_topk_split_op():
             topk=topk,
             decode_query_size=decode_query_size,
             segments=segments,
+            selector=selector,
             key_store=key_store,
             row_count=row_count,
         )

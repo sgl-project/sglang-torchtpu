@@ -34,7 +34,12 @@ import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(
+    est_time=180,
+    suite="stage-a-test-tpu-unit",
+    chips=1,
+    labels=["singlehost", "glm-5.2", "spec", "prefix-cache"],
+)
 
 # Standalone raw-JAX kernel test, not a TorchTPU runtime process: select the
 # physical backend before the first JAX import below.
@@ -202,6 +207,7 @@ def _run(
     row_start=None,
     row_count=0,
     topk=_TOPK,
+    selector="sparsecore",
 ):
     rows, cache = dsa_indexer_step(
         jnp.asarray(step.query),
@@ -218,6 +224,7 @@ def _run(
         decode_query_size=decode_query_size,
         segments=segments,
         row_count=row_count,
+        selector=selector,
     )
     return np.asarray(rows), np.asarray(cache)
 
@@ -523,6 +530,114 @@ class TestDsaIndexTopk(CustomTestCase):
                     reference_scores=False,
                 )
                 self._assert_prefill_split_exact(step, tps=(32, 8))
+
+
+class TestDsaRadixTopk(CustomTestCase):
+    """Exact selection and integration invariants for the opt-in v7 radix path."""
+
+    @classmethod
+    def setUpClass(cls):
+        from sglang_tpu.attention.pallas.radix_topk import supports_radix_topk
+
+        if not supports_radix_topk(2048):
+            raise unittest.SkipTest("radix V2 requires a v7 SparseCore target")
+
+    def test_exact_selector_masks_ties_and_partial_blocks(self):
+        from sglang_tpu.attention.pallas.radix_topk import select_radix_topk
+        from sglang_tpu.dsv4.sparsecore_topk import sparsecore_topk
+
+        rng = np.random.default_rng(20261116)
+        for width in (2176, 53248, 92160):
+            scores = rng.normal(size=(8, width)).astype(np.float32)
+            lengths = np.array(
+                [0, 1, 2047, 2048, 2049, width - 5, width, width], np.int32
+            )
+            scores[1::2] = np.round(scores[1::2] * 2)  # Many cutoff ties.
+            scores[6] = -3.0  # All equal negative scores, valid boundary ties.
+            scores[7, ::3] = -np.inf  # Masked holes inside the valid prefix.
+            words = jnp.asarray(scores.view(np.int32))
+            candidate = np.asarray(select_radix_topk(words, 2048, jnp.asarray(lengths)))
+            incumbent = np.asarray(sparsecore_topk(words, 2048, jnp.asarray(lengths)))
+            for output in (candidate, incumbent):
+                for row, length in enumerate(lengths):
+                    valid = np.flatnonzero(scores[row, :length] > -np.inf)
+                    count = min(2048, len(valid))
+                    picks = output[row, :count]
+                    np.testing.assert_array_equal(output[row, count:], -1)
+                    self.assertEqual(len(np.unique(picks)), count)
+                    self.assertTrue(np.all((picks >= 0) & (picks < length)))
+                    if count:
+                        cutoff = np.partition(scores[row, valid], -count)[-count]
+                        self.assertTrue(np.all(scores[row, picks] >= cutoff))
+                        # Exactness under arbitrary ties: all strictly higher
+                        # scores must be included and no masked hole selected.
+                        strict = valid[scores[row, valid] > cutoff]
+                        self.assertTrue(np.isin(strict, picks).all())
+
+    def test_full_indexer_preserves_writer_causal_and_split_contract(self):
+        # Physical pages are shuffled by _build_step. Requests cross K and
+        # have unequal causal lengths; idle/padded rows reuse live page tables.
+        cases = [
+            (
+                dict(
+                    lens=[(6, 3100), (6, 70), (6, 2200)],
+                    token_bucket=24,
+                    padded_rows=1,
+                    padded_q_len=6,
+                    is_decode=True,
+                ),
+                6,
+                "decode",
+            ),
+            (
+                dict(
+                    lens=[(40, 3100), (24, 70), (28, 2200)],
+                    token_bucket=96,
+                    padded_rows=4,
+                    is_decode=False,
+                ),
+                1,
+                "mixed",
+            ),
+        ]
+        for build, query_size, segments in cases:
+            step = _build_step(**build)
+            rows, cache = _run(
+                step,
+                topk=2048,
+                selector="radix_v2",
+                decode_query_size=query_size,
+                segments=segments,
+            )
+            np.testing.assert_array_equal(cache, step.expected_cache)
+            np.testing.assert_array_equal(rows[step.num_active_tokens :], -1)
+            for token, scores in enumerate(step.scores):
+                count = min(2048, len(scores))
+                picks = rows[token, :count]
+                np.testing.assert_array_equal(rows[token, count:], -1)
+                self.assertEqual(len(np.unique(picks)), count)
+                self.assertTrue(np.all((picks >= 0) & (picks < len(scores))))
+                cutoff = np.partition(scores, -count)[-count]
+                self.assertGreaterEqual(
+                    float(scores[picks].min()), float(cutoff) * (1 - _SCORE_SLACK)
+                )
+            # Token split changes query ownership only, and must preserve the
+            # same exact candidate threshold and every cache byte.
+            for start in (0, 16, step.query.shape[0]):
+                sliced, sliced_cache = _run(
+                    step,
+                    topk=2048,
+                    selector="radix_v2",
+                    row_start=start,
+                    row_count=16,
+                    decode_query_size=query_size,
+                    segments=segments,
+                )
+                expected = np.pad(rows, ((0, 16), (0, 0)), constant_values=-1)[
+                    start : start + 16
+                ]
+                np.testing.assert_array_equal(sliced, expected)
+                np.testing.assert_array_equal(sliced_cache, cache)
 
 
 if __name__ == "__main__":

@@ -179,6 +179,7 @@ def dsa_indexer_step(
     segments: str = "all",
     key_store: str = "xla",
     row_count: int = 0,
+    selector: str = "sparsecore",
 ) -> tuple[jax.Array, jax.Array]:
     """Store this step's index keys, then pick the top-k keys for each query.
 
@@ -249,6 +250,7 @@ def dsa_indexer_step(
         decode_query_size=decode_query_size,
         segments=segments,
         enable_early_exit=False,
+        selector=selector,
         kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
         **(
             dict(row_start=row_start.reshape(()), row_count=row_count)
