@@ -72,7 +72,6 @@ class TestSPMDSafe(CustomTestCase):
                 "VERIFY_SPMD_SAFE": "0",
                 "JAX_PLATFORMS": "cpu",
                 "XLA_FLAGS": f"--xla_force_host_platform_device_count={world_size}",
-                "LIBTPU_INIT_ARGS": "--xla_jf_emit_global_barrier_at_start=false",
                 "SGLANG_TPU_SHARED_COMPILE_COST_PROFILE": "",
             },
             check=True,
@@ -113,7 +112,6 @@ class TestSPMDSafe(CustomTestCase):
                             env={
                                 "JAX_PLATFORMS": "cpu",
                                 "XLA_FLAGS": f"--xla_force_host_platform_device_count={world_size}",
-                                "LIBTPU_INIT_ARGS": "--xla_jf_emit_global_barrier_at_start=false",
                             },
                         )
 

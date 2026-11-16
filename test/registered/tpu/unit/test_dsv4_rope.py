@@ -21,15 +21,18 @@ import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=35, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=40, suite="stage-a-test-tpu-unit", chips=1)
 
 assert "jax" not in sys.modules
-os.environ["JAX_PLATFORMS"] = "tpu"
+# TPU stays the default backend; the DMA race check interprets the kernel on CPU.
+os.environ["JAX_PLATFORMS"] = "tpu,cpu"
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
+from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from sglang_tpu.dsv4.rope import qnorm_rope, rope, rope_quant
 
@@ -168,6 +171,65 @@ class RopeTest(parameterized.TestCase):
             rope(jnp.asarray(x), jnp.asarray(positions), jnp.asarray(cos_sin_cache))
         )
         np.testing.assert_array_equal(actual[..., :-ROTARY_DIM], x[..., :-ROTARY_DIM])
+
+    # tile_n is capped at 128, so 384 tokens are 3 tiles: the first point where
+    # the pipeline reuses a VMEM slot that already held a written-back tile.
+    @parameterized.product(dtype=(np.float32, jnp.bfloat16))
+    def test_matches_reference_many_tiles(self, dtype):
+        num_tokens = 384
+        actual, expected = self._run(
+            (num_tokens, NUM_HEADS, HEAD_DIM), num_tokens, False, dtype
+        )
+        tol = 1e-6 if dtype == np.float32 else 1e-2
+        np.testing.assert_allclose(
+            actual.astype(np.float32),
+            np.asarray(expected).astype(np.float32),
+            rtol=tol,
+            atol=tol,
+        )
+
+    def test_no_dma_race_from_the_third_tile(self):
+        """A tile's input prefetch must not overwrite a VMEM slot that an earlier
+        tile's output DMA may still be reading."""
+        # On hardware the overlap corrupts rows only when the writeback lags the
+        # prefetch, so check the order with the interpret-mode race detector instead.
+        # 384 tokens are 3 tiles of 128, the first point where a slot is reused.
+        shape = (384, 8, HEAD_DIM)
+        rng = np.random.default_rng(0)
+        x = rng.normal(size=shape).astype(np.float32)
+        positions = rng.integers(0, 4096, size=(shape[0],)).astype(np.int32)
+        cos_sin_cache = make_cos_sin_cache(4096, ROTARY_DIM)
+        expected = np.asarray(rope_ref_impl(x, positions, cos_sin_cache))
+
+        cpu = jax.devices("cpu")[0]
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        interpreter = sys.modules[pltpu.reset_tpu_interpret_mode_state.__module__]
+        # The detector gives each DMA a random virtual clock slot; fix the draw.
+        np.random.seed(0)
+        pltpu.reset_tpu_interpret_mode_state()
+        try:
+            with (
+                jax.default_device(cpu),
+                use_abstract_mesh(mesh),
+                pltpu.force_tpu_interpret_mode(
+                    pltpu.InterpretParams(detect_races=True, vector_clock_size=128)
+                ),
+            ):
+                actual = np.asarray(
+                    rope(
+                        jax.device_put(x, cpu),
+                        jax.device_put(positions, cpu),
+                        jax.device_put(cos_sin_cache, cpu),
+                    )
+                )
+            races_found = interpreter.races.races_found
+        finally:
+            pltpu.reset_tpu_interpret_mode_state()
+
+        self.assertFalse(races_found, "DMA race in rope; see RACE DETECTED above")
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
 class RopeQuantTest(parameterized.TestCase):
