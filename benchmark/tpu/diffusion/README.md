@@ -66,14 +66,9 @@ curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/j
 }'
 ```
 
-LingBot-Video-MoE (`lingbot_video_moe.sh`), prompt as the structured JSON caption of `docs/cookbook/diffusion/LingBot-Video`:
-
-```bash
-curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
-  "prompt": "{\"comprehensive_description\":{\"scene_content_description\":\"A small silver robot arm on a white table slowly reaches toward a red cube. The background is a softly lit laboratory wall.\",\"camera_movement_description\":\"The camera is static at eye level in a medium shot.\"},\"camera_info\":{\"color\":\"Neutral\",\"frame_size\":\"Medium\",\"shot_type_angle\":\"Eye level\",\"lens_size\":\"Medium\",\"composition\":\"Center\",\"lighting\":\"Soft light\",\"lighting_type\":\"Artificial light\"},\"world_knowledge\":[],\"prominent_elements\":[{\"name\":\"robot arm\",\"description\":\"A small silver robot arm with a two-finger gripper.\",\"actions\":[{\"timestamp\":\"[0.0s - 1.0s]\",\"action\":\"reaches toward the red cube\"}],\"location\":\"center of the frame\",\"relative_size\":\"dominant\",\"shape_and_color\":\"articulated silver metal arm\",\"texture\":\"brushed metal\",\"appearance_details\":\"two-finger gripper and visible joints\",\"relationship\":\"reaching toward the red cube on the table\",\"orientation\":\"upright, base on the table\",\"pose\":\"reaching\"}]}",
-  "size": "480x480", "num_frames": 81, "fps": 16, "num_inference_steps": 40, "guidance_scale": 6.0, "seed": 42
-}'
-```
+LingBot-Video-MoE (`lingbot_video_moe.sh`) takes the structured JSON caption of
+[docs/cookbook/diffusion/LingBot-Video](../../../docs/cookbook/diffusion/LingBot-Video/LingBot-Video-MoE.mdx)
+as the `prompt`, with `"size": "480x480", "num_frames": 81, "fps": 16`.
 
 Wan2.2-TI2V-5B (`wan22_ti2v_5b.sh`):
 
