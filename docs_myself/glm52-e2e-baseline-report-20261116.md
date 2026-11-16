@@ -17,6 +17,20 @@
 - TTFT 是 client 发出 HTTP 请求至首个有输出的 SSE event，包含 HTTP、调度和 prefill。TPOT 是首末输出 event 的间隔除以 `completion_tokens - 1`，不是 TPU 单步时间。前置 prefix priming、workload round0 warmup 和启动编译不计入六轮正式结果。
 - C64 稳态窗口取所有请求达到64个输出后、任何请求达到960个输出前的公共区间；三轮分别 **14.090 / 13.374 / 14.441 秒**。每个窗口内所有 `/v1/loads` 采样均通过16 DP、每 DP 4条 running requests 检查。整个轮次的满并发采样数分别707 / 732 / 768；C16分别23 / 24 / 30。吞吐按公共窗口内实际 SSE 累积 token 增量计算，剔除了尾部批量下降阶段。
 
+### 根据 MTP step time 估算吞吐（后续核对）
+
+通过 Falcon CPU analyzer `an-dink13hkrq` 读取同一正式三轮的完整 `*-loads.json`，在每轮 C64 公共满载窗口内，对每个 DP 的累计 `decode_moments` 做首末差分。源码 `scheduler.py::_accumulate_decode_moment` 的六项为 `n, sum_b, sum_step_us, sum_b2, sum_b_step_us, sum_generated`。16 DP 的差分全部满足 `sum_b=4*n`、`sum_b2=16*n`，因此仅覆盖每 DP 4条请求的满载 step。
+
+| 轮次 | MTP 整轮 step ms | 每请求每 step 实际输出 tokens | 估算总 output token/s | 估算 token/s/物理 chip | SSE 实测总 token/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 95.115 | 5.2324 | 3520.73 | 440.09 | 3511.86 |
+| 2 | 91.732 | 5.2088 | 3634.07 | 454.26 | 3628.18 |
+| 3 | 97.301 | 5.1246 | 3370.72 | 421.34 | 3368.34 |
+
+计算为 `64 × 实际输出tokens/请求/step ÷ step秒`，再除以8个物理 chips。三轮吞吐估算的中位数 **3520.73 token/s**，即 **440.09 token/s/chip**，与 SSE 实测中位数3511.86/438.98相符。不是假定每轮固定接受6 tokens，也没有再乘 TP16。
+
+这里 step time 是相邻 decode launch 的调度 wall-clock cadence，覆盖 native MTP draft/verify 整轮执行节奏；不是独立 device profiler 的 target-forward 时间。满载窗口的平均输出长度来自同窗口 `sum_generated / sum_b`，与整请求的 `completion_tokens / verify_ct` 范围不同。保留逐 DP 差分和原始边界时间：[step audit](glm52-e2e-baseline-step-audit-20261116.json)。没有新增 TPU 实验。
+
 ### Cache、MTP 与验证范围
 
 - 16 DP 的真实 KV 容量均为 **219,008 tokens/DP**，FP8 `torch.float8_e4m3fn`；target KV 11.282 GB/DP。4条独立90K请求含输出和 speculative/page 余量的 slots 下限为 **364,288/DP**，因此选择 shared prefix；没有降低 C64、90K 输入、1,024 输出或 MTP 配置。

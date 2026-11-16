@@ -1,0 +1,879 @@
+{
+  "exp_id": "exp-6mtkc6t2qi",
+  "source_commit": "811865ca48ca23aa14dc74c9dbebaf5b380279dc",
+  "scope": "Decode launch cadence: scheduler.py _accumulate_decode_moment; cumulative [n,sum_b,sum_step_us,sum_b2,sum_b_step_us,sum_generated] endpoint differences within common C64 window. Not independent device-only timing. MTP whole iteration includes native draft/verify cadence.",
+  "rounds": [
+    {
+      "label": "decode-shared-round1",
+      "load_sample_window": [
+        5051478.445542475,
+        5051492.51274615
+      ],
+      "snapshot_samples": 583,
+      "per_dp": [
+        {
+          "dp_rank": 0,
+          "delta": [
+            135.0,
+            540.0,
+            12867881.0,
+            2160.0,
+            51471524.0,
+            2746.0
+          ],
+          "steps": 135.0,
+          "mean_step_ms": 95.31763703703704,
+          "accepted_tokens_per_request_step": 5.0851851851851855,
+          "output_tokens_per_second": 213.39954884568797,
+          "first_snapshot_timestamp": 1794832631.5725362,
+          "last_snapshot_timestamp": 1794832644.4482982
+        },
+        {
+          "dp_rank": 1,
+          "delta": [
+            150.0,
+            600.0,
+            14265490.0,
+            2400.0,
+            57061960.0,
+            3124.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10326666666666,
+          "accepted_tokens_per_request_step": 5.206666666666667,
+          "output_tokens_per_second": 218.9900241772277,
+          "first_snapshot_timestamp": 1794832631.4819787,
+          "last_snapshot_timestamp": 1794832645.7518628
+        },
+        {
+          "dp_rank": 2,
+          "delta": [
+            150.0,
+            600.0,
+            14265329.0,
+            2400.0,
+            57061316.0,
+            3152.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10219333333333,
+          "accepted_tokens_per_request_step": 5.253333333333333,
+          "output_tokens_per_second": 220.95529657956016,
+          "first_snapshot_timestamp": 1794832631.4820864,
+          "last_snapshot_timestamp": 1794832645.751404
+        },
+        {
+          "dp_rank": 3,
+          "delta": [
+            150.0,
+            600.0,
+            14265400.0,
+            2400.0,
+            57061600.0,
+            3142.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10266666666668,
+          "accepted_tokens_per_request_step": 5.236666666666666,
+          "output_tokens_per_second": 220.25320005047178,
+          "first_snapshot_timestamp": 1794832631.481927,
+          "last_snapshot_timestamp": 1794832645.7505536
+        },
+        {
+          "dp_rank": 4,
+          "delta": [
+            150.0,
+            600.0,
+            14265345.0,
+            2400.0,
+            57061380.0,
+            3151.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.1023,
+          "accepted_tokens_per_request_step": 5.251666666666667,
+          "output_tokens_per_second": 220.88494880425256,
+          "first_snapshot_timestamp": 1794832631.4818978,
+          "last_snapshot_timestamp": 1794832645.7507412
+        },
+        {
+          "dp_rank": 5,
+          "delta": [
+            150.0,
+            600.0,
+            14265289.0,
+            2400.0,
+            57061156.0,
+            3179.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10192666666667,
+          "accepted_tokens_per_request_step": 5.298333333333333,
+          "output_tokens_per_second": 222.84862227466965,
+          "first_snapshot_timestamp": 1794832631.4823637,
+          "last_snapshot_timestamp": 1794832645.7511883
+        },
+        {
+          "dp_rank": 6,
+          "delta": [
+            150.0,
+            600.0,
+            14265320.0,
+            2400.0,
+            57061280.0,
+            3118.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10213333333333,
+          "accepted_tokens_per_request_step": 5.196666666666666,
+          "output_tokens_per_second": 218.5720334349317,
+          "first_snapshot_timestamp": 1794832631.481645,
+          "last_snapshot_timestamp": 1794832645.7511182
+        },
+        {
+          "dp_rank": 7,
+          "delta": [
+            150.0,
+            600.0,
+            14265333.0,
+            2400.0,
+            57061332.0,
+            3154.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10222,
+          "accepted_tokens_per_request_step": 5.256666666666667,
+          "output_tokens_per_second": 221.0954346456546,
+          "first_snapshot_timestamp": 1794832631.4817593,
+          "last_snapshot_timestamp": 1794832645.7514591
+        },
+        {
+          "dp_rank": 8,
+          "delta": [
+            150.0,
+            600.0,
+            14265315.0,
+            2400.0,
+            57061260.0,
+            3318.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10210000000001,
+          "accepted_tokens_per_request_step": 5.53,
+          "output_tokens_per_second": 232.5921299319363,
+          "first_snapshot_timestamp": 1794832631.481402,
+          "last_snapshot_timestamp": 1794832645.7508893
+        },
+        {
+          "dp_rank": 9,
+          "delta": [
+            150.0,
+            600.0,
+            14265363.0,
+            2400.0,
+            57061452.0,
+            2980.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10242,
+          "accepted_tokens_per_request_step": 4.966666666666667,
+          "output_tokens_per_second": 208.89759342261394,
+          "first_snapshot_timestamp": 1794832631.48255,
+          "last_snapshot_timestamp": 1794832645.7508793
+        },
+        {
+          "dp_rank": 10,
+          "delta": [
+            150.0,
+            600.0,
+            14265366.0,
+            2400.0,
+            57061464.0,
+            3142.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10244,
+          "accepted_tokens_per_request_step": 5.236666666666666,
+          "output_tokens_per_second": 220.25372500081667,
+          "first_snapshot_timestamp": 1794832631.4821854,
+          "last_snapshot_timestamp": 1794832645.7515054
+        },
+        {
+          "dp_rank": 11,
+          "delta": [
+            150.0,
+            600.0,
+            14265348.0,
+            2400.0,
+            57061392.0,
+            3136.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10232,
+          "accepted_tokens_per_request_step": 5.226666666666667,
+          "output_tokens_per_second": 219.83340329307075,
+          "first_snapshot_timestamp": 1794832631.4819388,
+          "last_snapshot_timestamp": 1794832645.7521324
+        },
+        {
+          "dp_rank": 12,
+          "delta": [
+            150.0,
+            600.0,
+            14265389.0,
+            2400.0,
+            57061556.0,
+            2942.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10259333333333,
+          "accepted_tokens_per_request_step": 4.903333333333333,
+          "output_tokens_per_second": 206.2334227268531,
+          "first_snapshot_timestamp": 1794832631.4827144,
+          "last_snapshot_timestamp": 1794832645.7517018
+        },
+        {
+          "dp_rank": 13,
+          "delta": [
+            150.0,
+            600.0,
+            14265427.0,
+            2400.0,
+            57061708.0,
+            3144.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10284666666666,
+          "accepted_tokens_per_request_step": 5.24,
+          "output_tokens_per_second": 220.3929822780629,
+          "first_snapshot_timestamp": 1794832631.4823048,
+          "last_snapshot_timestamp": 1794832645.7515948
+        },
+        {
+          "dp_rank": 14,
+          "delta": [
+            150.0,
+            600.0,
+            14265442.0,
+            2400.0,
+            57061768.0,
+            3275.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10294666666667,
+          "accepted_tokens_per_request_step": 5.458333333333333,
+          "output_tokens_per_second": 229.57578180893378,
+          "first_snapshot_timestamp": 1794832631.4830601,
+          "last_snapshot_timestamp": 1794832645.7512596
+        },
+        {
+          "dp_rank": 15,
+          "delta": [
+            150.0,
+            600.0,
+            14265577.0,
+            2400.0,
+            57062308.0,
+            3214.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 95.10384666666667,
+          "accepted_tokens_per_request_step": 5.3566666666666665,
+          "output_tokens_per_second": 225.29758172417422,
+          "first_snapshot_timestamp": 1794832631.4823878,
+          "last_snapshot_timestamp": 1794832645.7514124
+        }
+      ],
+      "mean_step_ms": 95.11472285115305,
+      "accepted_tokens_per_request_step": 5.232389937106918,
+      "estimated_total_output_tokens_per_second": 3520.7268226906594,
+      "estimated_output_tokens_per_second_per_physical_chip": 440.09085283633243,
+      "sum_dp_throughput": 3520.0757289989174,
+      "measured_SSE_output_tokens_per_second": 3511.8608840921393
+    },
+    {
+      "label": "decode-shared-round2",
+      "load_sample_window": [
+        5051508.012911181,
+        5051521.35105065
+      ],
+      "snapshot_samples": 560,
+      "per_dp": [
+        {
+          "dp_rank": 0,
+          "delta": [
+            150.0,
+            600.0,
+            13760406.0,
+            2400.0,
+            55041624.0,
+            3083.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73603999999999,
+          "accepted_tokens_per_request_step": 5.138333333333334,
+          "output_tokens_per_second": 224.04862182118754,
+          "first_snapshot_timestamp": 1794832660.6636477,
+          "last_snapshot_timestamp": 1794832674.41429
+        },
+        {
+          "dp_rank": 1,
+          "delta": [
+            150.0,
+            600.0,
+            13759684.0,
+            2400.0,
+            55038736.0,
+            3027.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73122666666667,
+          "accepted_tokens_per_request_step": 5.045,
+          "output_tokens_per_second": 219.9905172240874,
+          "first_snapshot_timestamp": 1794832660.5669737,
+          "last_snapshot_timestamp": 1794832674.3232737
+        },
+        {
+          "dp_rank": 2,
+          "delta": [
+            150.0,
+            600.0,
+            13759704.0,
+            2400.0,
+            55038816.0,
+            3078.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73136,
+          "accepted_tokens_per_request_step": 5.13,
+          "output_tokens_per_second": 223.69667254470008,
+          "first_snapshot_timestamp": 1794832660.5665367,
+          "last_snapshot_timestamp": 1794832674.3232222
+        },
+        {
+          "dp_rank": 3,
+          "delta": [
+            150.0,
+            600.0,
+            13759741.0,
+            2400.0,
+            55038964.0,
+            3091.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73160666666668,
+          "accepted_tokens_per_request_step": 5.151666666666666,
+          "output_tokens_per_second": 224.64085624867502,
+          "first_snapshot_timestamp": 1794832660.5666263,
+          "last_snapshot_timestamp": 1794832674.321933
+        },
+        {
+          "dp_rank": 4,
+          "delta": [
+            150.0,
+            600.0,
+            13759849.0,
+            2400.0,
+            55039396.0,
+            3286.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73232666666667,
+          "accepted_tokens_per_request_step": 5.476666666666667,
+          "output_tokens_per_second": 238.81076020529005,
+          "first_snapshot_timestamp": 1794832660.5658715,
+          "last_snapshot_timestamp": 1794832674.3220668
+        },
+        {
+          "dp_rank": 5,
+          "delta": [
+            150.0,
+            600.0,
+            13759813.0,
+            2400.0,
+            55039252.0,
+            3032.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73208666666667,
+          "accepted_tokens_per_request_step": 5.053333333333334,
+          "output_tokens_per_second": 220.35183181631902,
+          "first_snapshot_timestamp": 1794832660.566162,
+          "last_snapshot_timestamp": 1794832674.3233788
+        },
+        {
+          "dp_rank": 6,
+          "delta": [
+            150.0,
+            600.0,
+            13759847.0,
+            2400.0,
+            55039388.0,
+            3230.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73231333333334,
+          "accepted_tokens_per_request_step": 5.383333333333334,
+          "output_tokens_per_second": 234.74098222167734,
+          "first_snapshot_timestamp": 1794832660.5657346,
+          "last_snapshot_timestamp": 1794832674.3226101
+        },
+        {
+          "dp_rank": 7,
+          "delta": [
+            150.0,
+            600.0,
+            13759793.0,
+            2400.0,
+            55039172.0,
+            3120.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73195333333334,
+          "accepted_tokens_per_request_step": 5.2,
+          "output_tokens_per_second": 226.74759714771872,
+          "first_snapshot_timestamp": 1794832660.5661266,
+          "last_snapshot_timestamp": 1794832674.3217697
+        },
+        {
+          "dp_rank": 8,
+          "delta": [
+            150.0,
+            600.0,
+            13759837.0,
+            2400.0,
+            55039348.0,
+            2982.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73224666666667,
+          "accepted_tokens_per_request_step": 4.97,
+          "output_tokens_per_second": 216.7176835016287,
+          "first_snapshot_timestamp": 1794832660.5651782,
+          "last_snapshot_timestamp": 1794832674.3224077
+        },
+        {
+          "dp_rank": 9,
+          "delta": [
+            150.0,
+            600.0,
+            13759817.0,
+            2400.0,
+            55039268.0,
+            3110.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73211333333333,
+          "accepted_tokens_per_request_step": 5.183333333333334,
+          "output_tokens_per_second": 226.02044780101363,
+          "first_snapshot_timestamp": 1794832660.5655167,
+          "last_snapshot_timestamp": 1794832674.3230152
+        },
+        {
+          "dp_rank": 10,
+          "delta": [
+            150.0,
+            600.0,
+            13759801.0,
+            2400.0,
+            55039204.0,
+            3197.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73200666666666,
+          "accepted_tokens_per_request_step": 5.328333333333333,
+          "output_tokens_per_second": 232.34347647905662,
+          "first_snapshot_timestamp": 1794832660.5657427,
+          "last_snapshot_timestamp": 1794832674.3226404
+        },
+        {
+          "dp_rank": 11,
+          "delta": [
+            150.0,
+            600.0,
+            13759767.0,
+            2400.0,
+            55039068.0,
+            3091.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73178,
+          "accepted_tokens_per_request_step": 5.151666666666666,
+          "output_tokens_per_second": 224.64043177475318,
+          "first_snapshot_timestamp": 1794832660.5664186,
+          "last_snapshot_timestamp": 1794832674.3233695
+        },
+        {
+          "dp_rank": 12,
+          "delta": [
+            150.0,
+            600.0,
+            13759644.0,
+            2400.0,
+            55038576.0,
+            3153.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73096000000001,
+          "accepted_tokens_per_request_step": 5.255,
+          "output_tokens_per_second": 229.14837040842045,
+          "first_snapshot_timestamp": 1794832660.5656588,
+          "last_snapshot_timestamp": 1794832674.3227766
+        },
+        {
+          "dp_rank": 13,
+          "delta": [
+            150.0,
+            600.0,
+            13759621.0,
+            2400.0,
+            55038484.0,
+            3098.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73080666666667,
+          "accepted_tokens_per_request_step": 5.163333333333333,
+          "output_tokens_per_second": 225.15155032249797,
+          "first_snapshot_timestamp": 1794832660.566211,
+          "last_snapshot_timestamp": 1794832674.3226194
+        },
+        {
+          "dp_rank": 14,
+          "delta": [
+            150.0,
+            600.0,
+            13759697.0,
+            2400.0,
+            55038788.0,
+            3202.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73131333333333,
+          "accepted_tokens_per_request_step": 5.336666666666667,
+          "output_tokens_per_second": 232.70861269692205,
+          "first_snapshot_timestamp": 1794832660.5653799,
+          "last_snapshot_timestamp": 1794832674.3225918
+        },
+        {
+          "dp_rank": 15,
+          "delta": [
+            150.0,
+            600.0,
+            13759664.0,
+            2400.0,
+            55038656.0,
+            3224.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 91.73109333333333,
+          "accepted_tokens_per_request_step": 5.373333333333333,
+          "output_tokens_per_second": 234.30804705696303,
+          "first_snapshot_timestamp": 1794832660.5666263,
+          "last_snapshot_timestamp": 1794832674.323636
+        }
+      ],
+      "mean_step_ms": 91.73195208333334,
+      "accepted_tokens_per_request_step": 5.20875,
+      "estimated_total_output_tokens_per_second": 3634.066346883811,
+      "estimated_output_tokens_per_second_per_physical_chip": 454.2582933604764,
+      "sum_dp_throughput": 3634.066459270911,
+      "measured_SSE_output_tokens_per_second": 3628.1841761131727
+    },
+    {
+      "label": "decode-shared-round3",
+      "load_sample_window": [
+        5051537.013098723,
+        5051551.427517321
+      ],
+      "snapshot_samples": 595,
+      "per_dp": [
+        {
+          "dp_rank": 0,
+          "delta": [
+            150.0,
+            600.0,
+            14598585.0,
+            2400.0,
+            58394340.0,
+            3023.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.3239,
+          "accepted_tokens_per_request_step": 5.038333333333333,
+          "output_tokens_per_second": 207.0748637624811,
+          "first_snapshot_timestamp": 1794832689.7771027,
+          "last_snapshot_timestamp": 1794832704.3907945
+        },
+        {
+          "dp_rank": 1,
+          "delta": [
+            150.0,
+            600.0,
+            14594809.0,
+            2400.0,
+            58379236.0,
+            3052.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29872666666667,
+          "accepted_tokens_per_request_step": 5.086666666666667,
+          "output_tokens_per_second": 209.11544645770974,
+          "first_snapshot_timestamp": 1794832689.6867936,
+          "last_snapshot_timestamp": 1794832704.2961833
+        },
+        {
+          "dp_rank": 2,
+          "delta": [
+            150.0,
+            600.0,
+            14594869.0,
+            2400.0,
+            58379476.0,
+            3177.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29912666666667,
+          "accepted_tokens_per_request_step": 5.295,
+          "output_tokens_per_second": 217.67924056050109,
+          "first_snapshot_timestamp": 1794832689.6867301,
+          "last_snapshot_timestamp": 1794832704.2959173
+        },
+        {
+          "dp_rank": 3,
+          "delta": [
+            150.0,
+            600.0,
+            14594847.0,
+            2400.0,
+            58379388.0,
+            3071.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29898,
+          "accepted_tokens_per_request_step": 5.118333333333333,
+          "output_tokens_per_second": 210.41673132990022,
+          "first_snapshot_timestamp": 1794832689.6868637,
+          "last_snapshot_timestamp": 1794832704.2963195
+        },
+        {
+          "dp_rank": 4,
+          "delta": [
+            150.0,
+            600.0,
+            14594815.0,
+            2400.0,
+            58379260.0,
+            3201.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29876666666667,
+          "accepted_tokens_per_request_step": 5.335,
+          "output_tokens_per_second": 219.32446557219123,
+          "first_snapshot_timestamp": 1794832689.6867914,
+          "last_snapshot_timestamp": 1794832704.2965796
+        },
+        {
+          "dp_rank": 5,
+          "delta": [
+            150.0,
+            600.0,
+            14594792.0,
+            2400.0,
+            58379168.0,
+            3205.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29861333333332,
+          "accepted_tokens_per_request_step": 5.341666666666667,
+          "output_tokens_per_second": 219.59888157364628,
+          "first_snapshot_timestamp": 1794832689.686734,
+          "last_snapshot_timestamp": 1794832704.2967768
+        },
+        {
+          "dp_rank": 6,
+          "delta": [
+            150.0,
+            600.0,
+            14594944.0,
+            2400.0,
+            58379776.0,
+            3186.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29962666666667,
+          "accepted_tokens_per_request_step": 5.31,
+          "output_tokens_per_second": 218.29477386141392,
+          "first_snapshot_timestamp": 1794832689.6860082,
+          "last_snapshot_timestamp": 1794832704.2962
+        },
+        {
+          "dp_rank": 7,
+          "delta": [
+            150.0,
+            600.0,
+            14595019.0,
+            2400.0,
+            58380076.0,
+            2850.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.30012666666666,
+          "accepted_tokens_per_request_step": 4.75,
+          "output_tokens_per_second": 195.27209933745206,
+          "first_snapshot_timestamp": 1794832689.6864266,
+          "last_snapshot_timestamp": 1794832704.2975764
+        },
+        {
+          "dp_rank": 8,
+          "delta": [
+            150.0,
+            600.0,
+            14595016.0,
+            2400.0,
+            58380064.0,
+            2927.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.30010666666668,
+          "accepted_tokens_per_request_step": 4.878333333333333,
+          "output_tokens_per_second": 200.54791306840636,
+          "first_snapshot_timestamp": 1794832689.685678,
+          "last_snapshot_timestamp": 1794832704.2960737
+        },
+        {
+          "dp_rank": 9,
+          "delta": [
+            150.0,
+            600.0,
+            14594829.0,
+            2400.0,
+            58379316.0,
+            3139.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29886,
+          "accepted_tokens_per_request_step": 5.2316666666666665,
+          "output_tokens_per_second": 215.07617526728131,
+          "first_snapshot_timestamp": 1794832689.6856759,
+          "last_snapshot_timestamp": 1794832704.296635
+        },
+        {
+          "dp_rank": 10,
+          "delta": [
+            150.0,
+            600.0,
+            14594816.0,
+            2400.0,
+            58379264.0,
+            3056.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29877333333333,
+          "accepted_tokens_per_request_step": 5.093333333333334,
+          "output_tokens_per_second": 209.38941607759907,
+          "first_snapshot_timestamp": 1794832689.6862319,
+          "last_snapshot_timestamp": 1794832704.296192
+        },
+        {
+          "dp_rank": 11,
+          "delta": [
+            150.0,
+            600.0,
+            14594758.0,
+            2400.0,
+            58379032.0,
+            2954.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29838666666667,
+          "accepted_tokens_per_request_step": 4.923333333333333,
+          "output_tokens_per_second": 202.401437557238,
+          "first_snapshot_timestamp": 1794832689.6859758,
+          "last_snapshot_timestamp": 1794832704.296415
+        },
+        {
+          "dp_rank": 12,
+          "delta": [
+            150.0,
+            600.0,
+            14594738.0,
+            2400.0,
+            58378952.0,
+            2865.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29825333333332,
+          "accepted_tokens_per_request_step": 4.775,
+          "output_tokens_per_second": 196.3036266906607,
+          "first_snapshot_timestamp": 1794832689.6866527,
+          "last_snapshot_timestamp": 1794832704.2965338
+        },
+        {
+          "dp_rank": 13,
+          "delta": [
+            150.0,
+            600.0,
+            14594783.0,
+            2400.0,
+            58379132.0,
+            3229.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29855333333333,
+          "accepted_tokens_per_request_step": 5.381666666666667,
+          "output_tokens_per_second": 221.24344020736726,
+          "first_snapshot_timestamp": 1794832689.687216,
+          "last_snapshot_timestamp": 1794832704.2972455
+        },
+        {
+          "dp_rank": 14,
+          "delta": [
+            150.0,
+            600.0,
+            14594831.0,
+            2400.0,
+            58379324.0,
+            3128.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.29887333333333,
+          "accepted_tokens_per_request_step": 5.213333333333333,
+          "output_tokens_per_second": 214.32245429905973,
+          "first_snapshot_timestamp": 1794832689.6862743,
+          "last_snapshot_timestamp": 1794832704.2972598
+        },
+        {
+          "dp_rank": 15,
+          "delta": [
+            150.0,
+            600.0,
+            14594880.0,
+            2400.0,
+            58379520.0,
+            3133.0
+          ],
+          "steps": 150.0,
+          "mean_step_ms": 97.2992,
+          "accepted_tokens_per_request_step": 5.221666666666667,
+          "output_tokens_per_second": 214.66432063847049,
+          "first_snapshot_timestamp": 1794832689.6868546,
+          "last_snapshot_timestamp": 1794832704.296748
+        }
+      ],
+      "mean_step_ms": 97.30055458333334,
+      "accepted_tokens_per_request_step": 5.124583333333334,
+      "estimated_total_output_tokens_per_second": 3370.7241930716814,
+      "estimated_output_tokens_per_second_per_physical_chip": 421.3405241339602,
+      "sum_dp_throughput": 3370.725286261378,
+      "measured_SSE_output_tokens_per_second": 3368.3368732270214
+    }
+  ],
+  "analysis_id": "an-dink13hkrq",
+  "measurement_method": "Per-DP cumulative decode_moments differences between first and last sampled points inside each measured C64 common window. All deltas satisfy sum_b=4*n and sum_b2=16*n; all 16 DPs contribute.",
+  "formula": "total output token/s = 64 * accepted_tokens_per_request_step / (mean_step_ms / 1000); per physical chip = total / 8",
+  "aggregate": {
+    "median_step_ms": 95.11472285115305,
+    "median_estimated_output_tokens_per_second": 3520.7268226906594,
+    "median_estimated_output_tokens_per_second_per_physical_chip": 440.09085283633243
+  }
+}

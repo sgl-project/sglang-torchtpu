@@ -2885,5 +2885,48 @@
     "load-audit.json": "e107c1de231f984a30ca7f9dcf9a048c4a264d89aca1f695147c46ea6e5f7ec8",
     "log-audit.json": "bf4ff027eab508efe9c908eb1e9fdbb479bd6d9f60e00638832db8b3b90ae3e2",
     "checks.json": "6a3a379cb28333b36b66fbe094e4212dcef2c80846a1ee3afbc635f7559e8e8a"
+  },
+  "step_time_estimate": {
+    "audit": "glm52-e2e-baseline-step-audit-20261116.json",
+    "analysis_id": "an-dink13hkrq",
+    "scope": "Decode launch cadence: scheduler.py _accumulate_decode_moment; cumulative [n,sum_b,sum_step_us,sum_b2,sum_b_step_us,sum_generated] endpoint differences within common C64 window. Not independent device-only timing. MTP whole iteration includes native draft/verify cadence.",
+    "formula": "total output token/s = 64 * accepted_tokens_per_request_step / (mean_step_ms / 1000); per physical chip = total / 8",
+    "rounds": [
+      {
+        "label": "decode-shared-round1",
+        "snapshot_samples": 583,
+        "mean_step_ms": 95.11472285115305,
+        "accepted_tokens_per_request_step": 5.232389937106918,
+        "estimated_total_output_tokens_per_second": 3520.7268226906594,
+        "estimated_output_tokens_per_second_per_physical_chip": 440.09085283633243,
+        "sum_dp_throughput": 3520.0757289989174,
+        "measured_SSE_output_tokens_per_second": 3511.8608840921393
+      },
+      {
+        "label": "decode-shared-round2",
+        "snapshot_samples": 560,
+        "mean_step_ms": 91.73195208333334,
+        "accepted_tokens_per_request_step": 5.20875,
+        "estimated_total_output_tokens_per_second": 3634.066346883811,
+        "estimated_output_tokens_per_second_per_physical_chip": 454.2582933604764,
+        "sum_dp_throughput": 3634.066459270911,
+        "measured_SSE_output_tokens_per_second": 3628.1841761131727
+      },
+      {
+        "label": "decode-shared-round3",
+        "snapshot_samples": 595,
+        "mean_step_ms": 97.30055458333334,
+        "accepted_tokens_per_request_step": 5.124583333333334,
+        "estimated_total_output_tokens_per_second": 3370.7241930716814,
+        "estimated_output_tokens_per_second_per_physical_chip": 421.3405241339602,
+        "sum_dp_throughput": 3370.725286261378,
+        "measured_SSE_output_tokens_per_second": 3368.3368732270214
+      }
+    ],
+    "aggregate": {
+      "median_step_ms": 95.11472285115305,
+      "median_estimated_output_tokens_per_second": 3520.7268226906594,
+      "median_estimated_output_tokens_per_second_per_physical_chip": 440.09085283633243
+    }
   }
 }
