@@ -336,11 +336,7 @@ class TestCosmos3CompiledInputs(_TestBase):
         # layer, it splits the graph and exposes the layer's own views.
         _run(model, _inputs(5))
         torch._dynamo.reset()
-        platform = SimpleNamespace(
-            is_npu=lambda: False,
-            is_out_of_tree=lambda: True,
-            prepare_spmd_region_wrapper=lambda: None,
-        )
+        platform = SimpleNamespace(is_npu=lambda: False, is_out_of_tree=lambda: True)
         with (
             patch.object(stage, "current_platform", platform),
             patch.object(
