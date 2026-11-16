@@ -293,6 +293,10 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
 - `--ring-degree` (non-causal, by K/V all-gather) on the splash backend, its
   default under ring; an automatic selection may give it to any layer that takes
   `torch_sdpa`. The built-in platform has no ring-capable backend.
+- Subgroup collectives need every rank (`supports_rank_subset_collectives`), so
+  LTX-2's two-stage refinement runs on every CFG rank. The built-in platform
+  (`SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu`) keeps the default and still hangs
+  with CFG-parallel and Ulysses on the two-stage pipeline.
 - Runtime patches applied at worker init (`multimodal_gen/worker.py`), each with
   the debt header: `rope.py` (RoPE without stride-2 lane access),
   `mova.py` (MOVA's complex RoPE tables as float32 cos/sin pairs) and
