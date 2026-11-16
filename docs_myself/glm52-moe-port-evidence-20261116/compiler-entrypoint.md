@@ -100,3 +100,24 @@ The independent multihost launcher tests that exact committed production bridge
 before any model load, including its actual loading/storage/shared-gather
 operations. Source debug variables are rejected before load rather than
 allowed to silently alter prequantization or compile-cache behavior.
+
+`exp-ekf3axxxpk` / `art-ixx0uwqz2k`, measurement
+`871b9460fd5e24145bd68bfb7b9c21d150c30695`, first executed the production
+bridge with explicit rank operands. All eight ranks passed real loading/storage
+and shared FP8 all-gather checks. Random, hot and zero-route small numerical
+cases executed; the hot dense-reference relative L2 was approximately 0.13555.
+The partial/padded case then failed its nonfinite check before full geometries
+or idle tests. The recorded assertion did not locate NaNs by row, so it does
+not prove whether valid rows were affected. The next candidate records exact
+nonfinite rows and compact failure arrays and does not relax that check.
+
+Source inspection independently confirms a mixed-slot correctness gap: scatter
+and metadata count valid slots, but combine tests only slot zero, reads all K
+expert results, and waits valid_rows*K copies. The port changes those three
+operations together to the individual-slot contract, masking invalid operands
+before multiplication. This is not a blanket NaN-to-zero conversion or a
+whole-row output mask. Partially invalid route cases, including first-slot
+invalid/later-slot valid, are added with shared off/on. Valid-route errors and
+nonfinite output remain fatal. The source compatibility patch can be reversed
+and SHA-checked mechanically, preserving an exact independent source module
+for further same-entrypoint comparisons.

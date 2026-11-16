@@ -42,13 +42,30 @@ def configure(mode):
     )
     directory.mkdir(parents=True, exist_ok=True)
     rank = os.environ.get("RANK", "unknown")
-    # Recover the exact original bytes from the documented effect-only port.
-    # The fresh source module always retains True; the port uses committed code.
+    # Reverse the committed compatibility patch, then verify the exact source
+    # bytes before loading an independent module. This also covers the selected
+    # route contract adaptation, rather than assuming only the effect differs.
     port_text = Path(kernel.__file__).read_text()
-    source = port_text[port_text.index('"""Fused EP MoE v2 kernel') :]
-    if "has_side_effects=False," in source:
-        assert source.count("has_side_effects=False,") == 1
-        source = source.replace("has_side_effects=False,", "has_side_effects=True,")
+    restoration = directory / f"source-restore-{rank}"
+    restoration.mkdir(parents=True, exist_ok=True)
+    (restoration / "kernel.py").write_text(port_text)
+    patch = Path(__file__).with_name("glm_moe_v2_source_to_port.patch").resolve()
+    subprocess.run(
+        [
+            "git",
+            "apply",
+            "--reverse",
+            "--unsafe-paths",
+            "--directory",
+            str(restoration.resolve()),
+            str(patch),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    source = (restoration / "kernel.py").read_text()
     sha = hashlib.sha256(source.encode()).hexdigest()
     assert sha == "79722fd38f31db054c83e20903cd9a42557f79b97c5d5a95c6aeb8cf5302664c", (
         sha

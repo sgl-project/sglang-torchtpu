@@ -1,0 +1,102 @@
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,3 +1,13 @@
++# SPDX-License-Identifier: Apache-2.0
++# Adapted from sgl-project/sglang-jax, Apache-2.0.
++# Revision: c948bdda95208e68a474c8088937347d08fe8937
++# Source: python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py
++# TorchTPU adaptation: pure returned-output call; synchronization is unchanged.
++# The fixed-bucket caller dependency contract is documented in README.md.
++# Preserve the vendored body formatting and its upstream unused locals.
++# ruff: noqa: F841
++# isort: skip_file
++# fmt: off
+ """Fused EP MoE v2 kernel — Strix-style double-buffer expert FFN.
+ 
+ Key differences from v1:
+@@ -1671,13 +1681,15 @@
+ 
+             def _load_one(t_i, _):
+                 t_id = tile_start + t_i
+-                token_e0 = t2e_routing_x2_smem[bt_sem_id, t_id, 0]
+-                is_valid = token_e0 >= 0
+-
+-                @pl.when(is_valid)
+-                def _():
+-                    for k_id in range(top_k):
+-                        e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
++                # The bridge accepts invalid slots independently, including
++                # slot zero followed by valid routes. Scatter and metadata
++                # already count each slot; combine must use the same contract.
++                for k_id in range(top_k):
++                    e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
++                    is_valid = e_id >= 0
++
++                    @pl.when(is_valid)
++                    def _():
+                         offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
+                         expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
+                         pltpu.make_async_copy(
+@@ -1686,11 +1698,11 @@
+                             sem=a2a_acc_sems.at[buf_id],
+                         ).start()
+ 
+-                @pl.when(jnp.logical_not(is_valid))
+-                def _():
+-                    zeros = jnp.zeros((1, out_packing, h_per_out), dtype=a2a_g_acc_vmem.dtype)
+-                    for k_id in range(top_k):
+-                        a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)][...] = zeros
++                    @pl.when(jnp.logical_not(is_valid))
++                    def _():
++                        a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)][...] = jnp.zeros(
++                            (1, out_packing, h_per_out), dtype=a2a_g_acc_vmem.dtype
++                        )
+ 
+                 return None
+ 
+@@ -1700,8 +1712,10 @@
+         def wait_load_acc_bt(*, buf_id, tile_start):
+ 
+             def _count_valid(t_i, acc):
+-                token_e0 = t2e_routing_x2_smem[bt_sem_id, tile_start + t_i, 0]
+-                return acc + (token_e0 >= 0).astype(jnp.int32)
++                for k_id in range(top_k):
++                    e_id = t2e_routing_x2_smem[bt_sem_id, tile_start + t_i, k_id]
++                    acc = acc + (e_id >= 0).astype(jnp.int32)
++                return acc
+ 
+             num_valid = lax.fori_loop(0, acc_bt, _count_valid, jnp.int32(0), unroll=False)
+ 
+@@ -1714,7 +1728,7 @@
+                     ).wait()
+                     return None
+ 
+-                lax.fori_loop(0, num_valid * jnp.int32(top_k), _wait_one, None, unroll=False)
++                lax.fori_loop(0, num_valid, _wait_one, None, unroll=False)
+ 
+         def acc_gather_to_output(*, tile_start, out_offset, buf_id):
+             output_tile = jnp.zeros((acc_bt, out_packing, h_per_out), dtype=jnp.float32)
+@@ -1725,6 +1739,14 @@
+                 for k_id in range(top_k):
+                     acc_tile = a2a_g_acc_vmem[buf_id, k_id, :acc_bt].astype(jnp.float32)
+                     logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
++                    # Invalid slots must contribute exactly zero even when
++                    # the unused scratch or coefficient contains NaN. Mask
++                    # each operand before multiplication, not the whole row.
++                    valid = (b_topk_ids_x2_vmem[
++                        bt_sem_id, pl.ds(tile_start, acc_bt), k_id
++                    ] >= 0).reshape(acc_bt, 1, 1)
++                    acc_tile = jnp.where(valid, acc_tile, jnp.float32(0))
++                    logits = jnp.where(valid, logits, jnp.float32(0))
+                     output_tile += acc_tile * logits
+ 
+             out_offset = pl.multiple_of(out_offset, 16)
+@@ -2867,7 +2889,7 @@
+             compiler_params=pltpu.CompilerParams(
+                 collective_id=0,
+                 allow_collective_id_without_custom_barrier=True,
+-                has_side_effects=True,
++                has_side_effects=False,
+                 vmem_limit_bytes=64 * 1024 * 1024,
+             ),
+             name=scope_name,

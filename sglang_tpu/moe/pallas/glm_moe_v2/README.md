@@ -3,8 +3,8 @@
 This opt-in candidate ports `sgl-project/sglang-jax` revision
 `c948bdda95208e68a474c8088937347d08fe8937`,
 `python/sgl_jax/srt/kernels/fused_moe/v2/{kernel,tuned_block_configs}.py`
-(Apache-2.0). The computation and every DMA/wait/barrier/drain remain identical.
-The one kernel adaptation is `has_side_effects=False` for the returned-output
+(Apache-2.0). The valid-route computation and EP pipeline are retained.
+Compiler adaptation uses `has_side_effects=False` for the returned-output
 call: TorchTPU repartitions CPU-exported StableHLO and rejects the source's
 unsharded side-effect custom call. Original and port reproduced that failure
 under the same target runtime; an explicit manual-sharding annotation also
@@ -121,3 +121,23 @@ cases, ownership permutations, padded idle/drain, and full H6144/I2048/E256/K8
 at local 6/24/64/2048 rows. Only after both hosts report success may the original
 model harness start; failures propagate nonzero and the preflight cannot renew
 its deadline. This stage counts inside the allocation's overall deadline.
+
+
+The source combine assumes the first route determines validity for the entire
+row, while its metadata/scatter already handle individual invalid slots. The
+port completes that contract: guard each gather by its slot id, wait for the
+actual number of started DMA copies, and mask each invalid scratch value and
+coefficient before multiplication. A valid slot in a partially invalid row is
+still computed; no invalid id is remapped to a real expert and no whole-row
+post-mask discards valid contributions. Tests cover an invalid first slot and
+invalid later slots, shared on/off, and dump any nonfinite row with its valid
+route count. All valid DMA completions and end-of-pipeline drain remain intact.
+The committed `glm_moe_v2_source_to_port.patch` reverses the adaptations to the
+exact original source bytes; the source diagnostic verifies its pinned SHA256.
+
+The source W8A8 transport also embeds a float32 activation scale into four FP8
+lane positions (one at the end of each hidden packing segment), then clears
+those positions before FFN1. This loses four activation coordinates; it is
+visible in small-H dense-reference error and is part of the source numerical
+strategy, not a claim of bitwise equivalence with the old GMM. Full H6144 cases
+and model smoke/E2E remain necessary; a relaxed error bound never permits NaN.
