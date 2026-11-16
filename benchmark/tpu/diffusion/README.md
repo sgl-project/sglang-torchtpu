@@ -4,8 +4,8 @@ Launch recipes for `sglang.multimodal_gen` on one tpu7x 2x2x1 host (8 TensorCore
 All recipes use the Pallas splash attention backend, torch.compile with the `tpu` backend, a TP-folded resident
 text encoder, the highest TPU clock and a 65536 KiB scoped-VMEM limit for XLA fusions (`LIBTPU_INIT_ARGS`), the full
 64 MiB of per-core VMEM on tpu7x (3% faster denoise on Z-Image-Turbo than without it); see `launch.sh`. The Wan
-recipes compile per transformer block (`--regional-compile`), which keeps each block's collectives inside its program,
-and run Ulysses across the two cores of a chip with a K/V all-gather ring across chips.
+and ERNIE-Image recipes compile per transformer block (`--regional-compile`), which keeps each block's collectives
+inside its program; the Wan recipes run Ulysses across the two cores of a chip with a K/V all-gather ring across chips.
 
 | Recipe | Model | Cores | Parallelism |
 | :--- | :--- | :---: | :--- |
@@ -14,6 +14,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `ernie_image.sh` | `baidu/ERNIE-Image` | 8 | Ulysses 8, serial CFG (32 heads) |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +39,13 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| ERNIE-Image | T2I 1024x1024, 50 steps, prompt enhancer on | 8 | 7.8 s | 0.063 s | 0.22 s | 53.4 GB |
+| ERNIE-Image | T2I 1024x1024, 50 steps, `"use_pe": false` | 8 | 3.5 s | 0.063 s | 0.22 s | 53.4 GB |
+| ERNIE-Image | T2I 2048x2048, 50 steps, prompt enhancer on, `--vae-tiling true` | 8 | 18.3 s | 0.255 s | 2.0 s | 55.9 GB |
+
+ERNIE-Image rows: torch_tpu 0.2.1.dev20261028201649. The prompt pads to a multiple of 512 tokens; the first request
+at a new image size compiles for 30-48 s (2048x2048: 127 s, and 78 s for the first tiled VAE decode), and the first
+prompt in a new 512-token bucket at a served size for about 10 s.
 
 
 ## Example requests
