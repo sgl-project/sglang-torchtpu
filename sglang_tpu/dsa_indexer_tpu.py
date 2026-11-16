@@ -47,7 +47,7 @@ def build_dsa_index_topk_op():
     from torch_tpu._internal import pallas as _torch_pallas
 
     from sglang_tpu.attention.pallas.dsa_index_topk import dsa_indexer_step
-    from sglang_tpu.envs import tpu_envs
+    from sglang_tpu.envs import envs as tpu_envs
 
     selector = (
         "radix_v2" if tpu_envs.SGLANG_TPU_USE_DSA_RADIX_TOPK.get() else "sparsecore"
@@ -199,7 +199,7 @@ def build_dsa_index_topk_split_op():
     from torch_tpu._internal import pallas as _torch_pallas
 
     from sglang_tpu.attention.pallas.dsa_index_topk import dsa_indexer_step
-    from sglang_tpu.envs import tpu_envs
+    from sglang_tpu.envs import envs as tpu_envs
 
     selector = (
         "radix_v2" if tpu_envs.SGLANG_TPU_USE_DSA_RADIX_TOPK.get() else "sparsecore"

@@ -27,7 +27,7 @@ def supports_radix_topk(k: int) -> bool:
     )
 
 
-def select_radix_topk(scores, k, row_lengths, *, scheduling_group_id=None):
+def select_radix_topk(scores, k, row_lengths, *, scheduling_group_id=None, config=None):
     """Select exact logical positions from an existing score buffer.
 
     Accepts fp32 or its int32 bit representation, as the streamindex scorer
@@ -36,14 +36,22 @@ def select_radix_topk(scores, k, row_lengths, *, scheduling_group_id=None):
     """
     if scores.dtype == jnp.int32:
         scores = jax.lax.bitcast_convert_type(scores, jnp.float32)
-    config = get_score_width_config(scores.shape[-1], k)
+    if config is None:
+        tuned = get_score_width_config(scores.shape[-1], k)
+        block_size, reconstruct_threshold, reverse_scan = (
+            tuned.block_size,
+            tuned.reconstruct_threshold,
+            True,
+        )
+    else:
+        block_size, reconstruct_threshold, reverse_scan = config
     result = radix_topk_v2(
         scores,
         k=k,
         valid_lengths=row_lengths,
-        block_size=config.block_size,
-        reconstruct_threshold=config.reconstruct_threshold,
-        reverse_scan=True,
+        block_size=block_size,
+        reconstruct_threshold=reconstruct_threshold,
+        reverse_scan=reverse_scan,
         indices_only=True,
     )
     if scheduling_group_id is not None:

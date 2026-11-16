@@ -882,6 +882,7 @@ def _radix_supported(k):
         "row_count",
         "page_table_in_hbm",
         "selector",
+        "radix_config",
     ),
 )
 def streamindex_topk(
@@ -916,6 +917,7 @@ def streamindex_topk(
     row_count: int | None = None,
     page_table_in_hbm: bool = False,
     selector: str = "sparsecore",
+    radix_config: tuple[int, int, bool] | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1488,7 +1490,11 @@ def streamindex_topk(
                 from sglang_tpu.attention.pallas.radix_topk import select_radix_topk
 
                 chunk_topk_idxs = select_radix_topk(
-                    scores, k, row_lengths, scheduling_group_id=sc_group
+                    scores,
+                    k,
+                    row_lengths,
+                    scheduling_group_id=sc_group,
+                    config=radix_config,
                 )
             else:
                 chunk_topk_idxs = sparsecore_topk(

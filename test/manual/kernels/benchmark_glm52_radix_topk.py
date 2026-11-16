@@ -12,14 +12,19 @@ import importlib.metadata
 import importlib.util
 import json
 import os
-import runpy
 import statistics
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-fixture = runpy.run_path(str(ROOT / "test/registered/tpu/unit/test_dsa_index_topk.py"))
+fixture_spec = importlib.util.spec_from_file_location(
+    "glm52_dsa_fixture", ROOT / "test/registered/tpu/unit/test_dsa_index_topk.py"
+)
+fixture_module = importlib.util.module_from_spec(fixture_spec)
+sys.modules[fixture_spec.name] = fixture_module
+fixture_spec.loader.exec_module(fixture_module)
+fixture = vars(fixture_module)
 
 import jax
 import jax.numpy as jnp
