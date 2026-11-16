@@ -44,6 +44,50 @@ def _replace_data(param, value):
         old.untyped_storage().resize_(0)
 
 
+def _prepare_shared(moe, parallel):
+    """Replicate the existing shared MLP weights once, without requantizing.
+
+    TP shards split the gate/up *separately*. Concatenating packed gate/up
+    shards would interleave different ranks' gates with their up projections.
+    Row-parallel down scales are already replicated output-channel vectors.
+    """
+    if not hasattr(moe, "shared_experts"):
+        return False
+    shared = moe.shared_experts
+    gate_up, down = shared.gate_up_proj, shared.down_proj
+    if (
+        gate_up.weight.dtype != torch.float8_e4m3fn
+        or down.weight.dtype != torch.float8_e4m3fn
+    ):
+        logger.warning(
+            "GLM fused EP shared expert keeps external MLP: requires FP8 weights"
+        )
+        return False
+    if (
+        getattr(gate_up, "weight_block_size", None) is not None
+        or getattr(down, "weight_block_size", None) is not None
+    ):
+        logger.warning(
+            "GLM fused EP shared expert keeps external MLP: requires channel scales"
+        )
+        return False
+    gate, up = gate_up.weight.data.chunk(2, dim=1)
+    gate_scale, up_scale = gate_up.weight_scale_inv.data.reshape(-1).chunk(2)
+    down_weight = down.weight.data
+    if not moe._shared_expert_tp1:
+        group = parallel.tp_group
+        gate = group.all_gather(gate.contiguous(), dim=1)
+        up = group.all_gather(up.contiguous(), dim=1)
+        gate_scale = group.all_gather(gate_scale.contiguous(), dim=0)
+        up_scale = group.all_gather(up_scale.contiguous(), dim=0)
+        down_weight = group.all_gather(down_weight.contiguous(), dim=0)
+    moe._glm_v2_sw13 = torch.stack((gate, up)).contiguous()
+    moe._glm_v2_sw2 = down_weight.contiguous()
+    moe._glm_v2_ss13 = torch.stack((gate_scale, up_scale)).float().contiguous()
+    moe._glm_v2_ss2 = down.weight_scale_inv.data.reshape(-1).float().contiguous()
+    return True
+
+
 def prepare_model(model):
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
     from sglang.srt.runtime_context import get_exec, get_parallel
@@ -98,8 +142,13 @@ def prepare_model(model):
         moe._glm_v2_routed_op = get_op(parallel.moe_ep_size, False)
         moe._glm_v2_op = moe._glm_v2_routed_op
         moe.__class__ = GlmSelectedEPMoE
+        if envs.SGLANG_TPU_GLM_MOE_V2_SHARED.get():
+            moe._glm_v2_shared = _prepare_shared(moe, parallel)
+            if moe._glm_v2_shared:
+                moe._glm_v2_op = get_op(parallel.moe_ep_size, True)
         logger.info(
-            "GLM fused EP MoE v2 prepared %s: EP%d, routed only",
+            "GLM fused EP MoE v2 prepared %s: EP%d, shared=%s",
             name,
             parallel.moe_ep_size,
+            moe._glm_v2_shared,
         )

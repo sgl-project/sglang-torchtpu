@@ -74,8 +74,8 @@ def worker():
     w2 = (torch.randn((e, inter, h), generator=generator) * 0.02).to(
         torch.float8_e4m3fn
     )
-    s13 = torch.linspace(0.7, 1.3, e * 2 * inter).reshape(e, 1, 1, 2 * inter)
-    s2 = torch.linspace(0.8, 1.2, e * h).reshape(e, 1, 1, h)
+    s13 = torch.linspace(0.7, 1.3, e * 2 * inter).reshape(e, 1, 1, 2 * inter).bfloat16()
+    s2 = torch.linspace(0.8, 1.2, e * h).reshape(e, 1, 1, h).bfloat16()
     sl = slice(rank * 2, (rank + 1) * 2)
     device_weights = [
         pack_gate_up(w13[sl]).to("tpu"),
@@ -85,13 +85,23 @@ def worker():
     ]
     rank_tensor = torch.tensor([rank], dtype=torch.int32, device="tpu")
     stub = torch.empty(0, device="tpu")
+    sw13 = (torch.randn((2, h, inter), generator=generator) * 0.02).to(
+        torch.float8_e4m3fn
+    )
+    sw2 = (torch.randn((inter, h), generator=generator) * 0.02).to(torch.float8_e4m3fn)
+    ss13 = torch.linspace(0.6, 1.4, 2 * inter).reshape(2, inter)
+    ss2 = torch.linspace(0.7, 1.3, h)
+    device_shared = [a.to("tpu") for a in (sw13, sw2, ss13, ss2)]
     reports = []
-    for local_rows, routing in [
-        (6, "random"),
-        (12, "hot"),
-        (18, "zeros"),
-        (24, "padded"),
-        (65, "random"),
+    for local_rows, routing, has_shared in [
+        (6, "random", False),
+        (12, "hot", False),
+        (18, "zeros", False),
+        (24, "padded", False),
+        (65, "random", False),
+        (6, "random", True),
+        (24, "padded", True),
+        (65, "hot", True),
     ]:
         rows = local_rows * ep - (3 if routing == "padded" else 0)
         x = (torch.randn((rows, h), generator=generator) * 0.2).to(torch.bfloat16)
@@ -107,6 +117,7 @@ def worker():
         if routing == "padded":
             ids[-7:] = -1
             weights[-7:] = 0
+            x[-7:] = 0
         expected = torch.zeros(rows, h)
         for expert in range(e):
             tokens, columns = torch.where(ids == expert)
@@ -118,18 +129,19 @@ def worker():
                 w2[expert].float() * s2[expert, 0, 0]
             )
             expected.index_add_(0, tokens, y * weights[tokens, columns, None])
+        if has_shared:
+            gate = x.float() @ (sw13[0].float() * ss13[0])
+            up = x.float() @ (sw13[1].float() * ss13[1])
+            expected += (torch.nn.functional.silu(gate) * up) @ (sw2.float() * ss2)
         args = [
             x.to("tpu"),
             ids.to("tpu"),
             weights.to("tpu"),
             *device_weights,
             rank_tensor,
-            stub,
-            stub,
-            stub,
-            stub,
+            *(device_shared if has_shared else (stub, stub, stub, stub)),
         ]
-        op = get_op(ep, False)
+        op = get_op(ep, has_shared)
         got = op(*args)
         torch.accelerator.synchronize()
         times = []
@@ -152,6 +164,7 @@ def worker():
             "local_rows": local_rows,
             "global_rows": rows,
             "routing": routing,
+            "shared": has_shared,
             "relative_l2": relative_l2,
             "median_ms": float(np.median(times)),
             "range_ms": [min(times), max(times)],
