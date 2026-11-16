@@ -33,9 +33,7 @@ from sglang_tpu.mamba_pool import TpuMambaPool
 class HybridLinearKVPoolState:
     """KVPool over the full-attention KV buffers followed by the linear-attention state."""
 
-    def __init__(
-        self, *, full_kv_pool: KVCache, mamba_pool: TpuMambaPool
-    ) -> None:
+    def __init__(self, *, full_kv_pool: KVCache, mamba_pool: TpuMambaPool) -> None:
         self._full_kv_pool = full_kv_pool
         self._mamba_pool = mamba_pool
 
@@ -99,9 +97,7 @@ def _conv_weight_owners(
             continue
         parent = modules[name.rpartition(".")[0]]
         # GDN layers call it conv1d; KDA layers fuse q/k/v into qkv_conv1d.
-        conv_name = next(
-            (n for n in _CONV_SUBMODULE_NAMES if hasattr(parent, n)), None
-        )
+        conv_name = next((n for n in _CONV_SUBMODULE_NAMES if hasattr(parent, n)), None)
         if conv_name is None:
             raise NotImplementedError(
                 f"direct_compile found none of {_CONV_SUBMODULE_NAMES} next to {name}."

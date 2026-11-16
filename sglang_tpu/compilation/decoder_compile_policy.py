@@ -165,10 +165,14 @@ def _module_plain_tensor_attrs(model: torch.nn.Module) -> tuple[str, ...]:
     paths = []
     for name, module in model.named_modules():
         for attr, value in vars(module).items():
+            # Views (e.g. GDN conv_weights) share storage with a parameter and
+            # are re-derived by bind_traced_conv_weights; lifting them breaks
+            # the _base check and direct_compile requires base buffers.
             if (
                 isinstance(value, torch.Tensor)
                 and not isinstance(value, torch.nn.Parameter)
                 and not value.is_meta
+                and value._base is None
             ):
                 paths.append(f"{name}.{attr}" if name else attr)
     return tuple(paths)

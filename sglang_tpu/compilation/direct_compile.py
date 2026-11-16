@@ -647,7 +647,9 @@ class CompiledFunction:
         mutated_leaf_positions: set[int] = set()
         for position, (input_index, leaf_index) in enumerate(
             zip(
-                range(kv_pool_input_stop, kv_pool_input_stop + len(tensor_leaf_indices)),
+                range(
+                    kv_pool_input_stop, kv_pool_input_stop + len(tensor_leaf_indices)
+                ),
                 tensor_leaf_indices,
             )
         ):
