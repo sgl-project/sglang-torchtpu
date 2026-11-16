@@ -342,6 +342,10 @@ class TpuEnvs:
     # Raiden: a decode starts a room's next read as soon as the prefill
     # announces it; 0 starts reads only on the next scheduler poll.
     SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(True)
+    # Raiden: seconds between the decode listener's sweeps, which settle reads
+    # and start queued chunks while the scheduler is not draining. Must be
+    # > 0 and below SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.
+    SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S = EnvFloat(1.0)
     # Raiden: deadline of each KV chunk transfer, not of the whole request; the
     # closing read counts as a chunk, and a non-chunked transfer is one chunk.
     # Counted from registration on the prefill and from start_read on the

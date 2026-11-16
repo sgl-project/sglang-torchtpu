@@ -111,11 +111,6 @@ from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import SettledTransfer
 
-# How often a decode listener settles finished reads and starts queued chunks
-# itself, so a stalled scheduler cannot hold them past the transfer deadline.
-# Arbitrary; it only has to be well under SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.
-_LISTENER_SWEEP_INTERVAL_S = 1.0
-
 # Re-exported so that "from …raiden.conn import X" keeps resolving for the
 # callers and tests that predate the split into common/sender/receiver.
 __all__ = [
@@ -187,6 +182,9 @@ class RaidenKVManager(
     # Whether an engine stages through fewer host buffers than device layers.
     _bounded_staging = False
     _listener_start_read = False
+    # Seconds between decode listener sweeps, from
+    # SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.
+    _listener_sweep_interval_s = 1.0
     _stop_listener: Optional[threading.Event] = None
     _last_scheduler_drain = float("-inf")
     # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
@@ -374,6 +372,7 @@ class RaidenKVManager(
             self._start_heartbeat_checker_thread()
             self._decode = DecodeState()
             self._listener_start_read = tpu_envs.SGLANG_RAIDEN_LISTENER_START_READ.get()
+            self._listener_sweep_interval_s = self._read_listener_sweep_interval()
 
         # Native I/O tracking stays on the manager: it survives room cleanup.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1251,12 +1250,25 @@ class RaidenKVManager(
 
     # ----- rendezvous (ZMQ over the existing per-rank PULL socket) -----------
 
+    def _read_listener_sweep_interval(self) -> float:
+        """SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S, checked against the chunk
+        transfer deadline: a sweep that comes later than the deadline cannot
+        save a read the stalled scheduler is holding."""
+        interval = tpu_envs.SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.get()
+        if not (math.isfinite(interval) and 0 < interval < self._timeout_s):
+            raise ValueError(
+                f"{tpu_envs.SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.name} must be "
+                f"> 0 and below {tpu_envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.name}"
+                f" ({self._timeout_s:g} s), got {interval!r}"
+            )
+        return interval
+
     def _listen(self) -> None:
         # chunked_transfer and _pipeline are only known after set_kv_caches,
         # which runs after this thread starts; _sweep_pulls checks them per sweep.
         sweeps = self._decode is not None and self._listener_start_read
         stop = self._stop_listener
-        next_sweep = time.monotonic() + _LISTENER_SWEEP_INTERVAL_S
+        next_sweep = time.monotonic() + self._listener_sweep_interval_s
         while stop is None or not stop.is_set():
             try:
                 ready = not sweeps or self.server_socket.poll(
@@ -1275,8 +1287,9 @@ class RaidenKVManager(
                     logger.error("RaidenKVManager message handling error: %s", e)
             if sweeps and time.monotonic() >= next_sweep:
                 now = time.monotonic()
-                next_sweep = now + _LISTENER_SWEEP_INTERVAL_S
-                if now - self._last_scheduler_drain < _LISTENER_SWEEP_INTERVAL_S:
+                interval = self._listener_sweep_interval_s
+                next_sweep = now + interval
+                if now - self._last_scheduler_drain < interval:
                     continue
                 try:
                     self._sweep_pulls()

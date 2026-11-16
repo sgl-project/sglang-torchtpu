@@ -3,6 +3,7 @@ with SGLANG_RAIDEN_LISTENER_START_READ an announcement starts its read."""
 
 import ast
 import inspect
+import os
 import queue
 import threading
 import time
@@ -13,12 +14,12 @@ from unittest.mock import Mock, patch
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang_tpu.disaggregation.raiden import conn as conn_module
 from sglang_tpu.disaggregation.raiden import receiver as receiver_module
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
 from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
 from sglang_tpu.disaggregation.raiden.serde import Blocks, Chunk
 from sglang_tpu.disaggregation.raiden.state import DecodeState
+from sglang_tpu.envs import envs as tpu_envs
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -373,7 +374,7 @@ class TestListenerSweep(unittest.TestCase):
             received=[f"{ROOM}#0"]
         )
 
-        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True):
+        with patch.object(mgr, "_listener_sweep_interval_s", 0.01):
             self._start_listener(mgr)
             mgr.server_socket.put(_chunk(0))
             mgr.server_socket.put(_chunk(1))
@@ -393,7 +394,7 @@ class TestListenerSweep(unittest.TestCase):
         self.assertTrue(mgr._drain_lock.acquire(blocking=False))
         self.addCleanup(mgr._drain_lock.release)
 
-        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True):
+        with patch.object(mgr, "_listener_sweep_interval_s", 0.01):
             self._start_listener(mgr)
             # Let at least two sweep deadlines fire while _drain_lock is held.
             time.sleep(0.05)
@@ -418,7 +419,7 @@ class TestListenerSweep(unittest.TestCase):
 
         # The 200 ms interval is 20x the scheduler's 10 ms poll period, so a
         # descheduled test thread does not let a sweep slip in.
-        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.2, create=True):
+        with patch.object(mgr, "_listener_sweep_interval_s", 0.2):
             listener = self._start_listener(mgr)
             # Scheduler polls every 10 ms for five sweep intervals.
             stop_draining = time.monotonic() + 1.0
@@ -448,7 +449,7 @@ class TestListenerSweep(unittest.TestCase):
 
         mgr._engine.poll_stats_with_details.side_effect = listener_poll
         mgr._on_blocks(_blocks(hybrid=False))
-        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True):
+        with patch.object(mgr, "_listener_sweep_interval_s", 0.01):
             self._start_listener(mgr)
             self.assertTrue(in_poll.wait(5))
             mgr._engine.poll_stats_with_details.side_effect = None
@@ -470,7 +471,7 @@ class TestListenerSweep(unittest.TestCase):
         mgr._engine.poll_stats_with_details.side_effect = RuntimeError("poll boom")
         mgr._engine_poll_failing_since = {"full": -200.0}
 
-        with patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True):
+        with patch.object(mgr, "_listener_sweep_interval_s", 0.01):
             self._start_listener(mgr)
             deadline = time.monotonic() + 1.0
             while (
@@ -496,7 +497,7 @@ class TestListenerSweep(unittest.TestCase):
 
         with (
             patch.object(RaidenKVReceiver, "_send_abort_notification"),
-            patch.object(conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True),
+            patch.object(mgr, "_listener_sweep_interval_s", 0.01),
         ):
             mgr._on_chunk(_chunk(0))
             mgr._on_chunk(_chunk(1))
@@ -533,15 +534,45 @@ class TestListenerSweep(unittest.TestCase):
                 mgr._message_handlers = {}
                 mgr.server_socket = _FakeServerSocket()
 
-                with patch.object(
-                    conn_module, "_LISTENER_SWEEP_INTERVAL_S", 0.01, create=True
-                ):
+                with patch.object(mgr, "_listener_sweep_interval_s", 0.01):
                     self._start_listener(mgr)
                     time.sleep(0.05)
 
                 mgr._engine.poll_stats_with_details.assert_not_called()
                 if mgr._pipeline is not None:
                     mgr._pipeline.poll.assert_not_called()
+
+
+class TestListenerSweepInterval(unittest.TestCase):
+    def _interval(self, value, timeout_s=60.0):
+        mgr = object.__new__(RaidenKVManager)
+        mgr._timeout_s = timeout_s
+        # patch.dict, not EnvField.override: override does not restore the
+        # variable when the body raises.
+        name = tpu_envs.SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.name
+        with patch.dict(os.environ, {name: str(value)}):
+            return mgr._read_listener_sweep_interval()
+
+    def test_default_is_one_second(self):
+        mgr = object.__new__(RaidenKVManager)
+        mgr._timeout_s = 60.0
+        name = tpu_envs.SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.name
+        with patch.dict(os.environ):
+            os.environ.pop(name, None)
+            self.assertEqual(mgr._read_listener_sweep_interval(), 1.0)
+
+    def test_valid_interval_is_used(self):
+        self.assertEqual(self._interval(0.25), 0.25)
+
+    def test_invalid_interval_is_rejected(self):
+        for value in (0.0, -1.0, float("inf"), float("nan"), 60.0, 120.0):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S must be > 0 and "
+                    r"below SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S \(60 s\)",
+                ):
+                    self._interval(value)
 
 
 if __name__ == "__main__":
