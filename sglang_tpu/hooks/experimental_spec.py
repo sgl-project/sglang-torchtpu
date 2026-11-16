@@ -176,15 +176,16 @@ def build_disagg_eagle_input(
     )
 
     assert is_experimental_chain(batch.spec_algorithm), batch.spec_algorithm
-    if any(req.output_dsa_topk_indices is not None for req in batch.reqs):
-        raise NotImplementedError("TpuChainSpecWorker does not support DSA PD seeds.")
     if pd_decode_draft_prefill():
         # The draft prompt pass writes the draft KV and the carry.
         get_pd_draft_prefiller()(batch)
     else:
+        dsa_topk = [req.output_dsa_topk_indices for req in batch.reqs]
         get_pd_carry_seeder()(
             batch.req_pool_indices_cpu,
             torch.stack([req.hidden_states_tensor for req in batch.reqs]),
+            # With index sharing the prefill ships each request's DSA top-k too.
+            torch.stack(dsa_topk) if all(t is not None for t in dsa_topk) else None,
         )
     draft_input = HostPaddedChainDraftInput(
         bonus_tokens=last_tokens_tensor,
