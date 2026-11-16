@@ -293,7 +293,13 @@ class TestWorkerRuntimePatches(CustomTestCase):
         # Ring attention merges replicated-token partials with logaddexp, which
         # torch_tpu has no kernel for (test_aten_fallbacks_tpu checks the kernel).
         from sglang_tpu import patches
-        from sglang_tpu.multimodal_gen import glm_image_ar, glm_image_dit, minimax_h3, rope, worker
+        from sglang_tpu.multimodal_gen import (
+            glm_image_ar,
+            glm_image_dit,
+            minimax_h3,
+            rope,
+            worker,
+        )
 
         with (
             patch.object(patches, "_register_aten_fallbacks") as aten_fallbacks,
