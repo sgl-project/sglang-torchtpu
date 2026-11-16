@@ -144,6 +144,12 @@ class SPMDCompiler:
         )
         self._serializer: ThreadPoolExecutor | None = None
         self._verification_group = None
+        # step(gather) callables run in finish() once every rank traced
+        # successfully, while the submitted compiles are still running (not
+        # under verification). gather (value -> per-rank list) is this
+        # compiler's group gather; a step must make the same collective calls
+        # on every rank.
+        self.before_distribute: list[Callable[[Callable[[Any], list[Any]]], None]] = []
         if verify_spmd_safe:
             # All engines must finish tracing before any worker exits: the
             # serving launcher treats an early worker exit as startup failure.
@@ -277,6 +283,9 @@ class SPMDCompiler:
         errors = self.gather(error)
         if any(error is not None for error in errors):
             raise RuntimeError(f"Shared compile tracing failed: {errors}")
+        if not self.verify_spmd_safe:
+            for step in self.before_distribute:
+                step(self.gather)
         assignments = [(graph, item.owner) for graph, item in self.submissions.items()]
         if any(peer != assignments for peer in self.gather(assignments)):
             raise ValueError("Shared TPU graph order or owners differ across ranks")

@@ -110,6 +110,10 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
             prepare_direct_compile(self)
         call, warmup_async = super()._direct_compile(fn)
+        if self.is_v41:
+            from sglang_tpu.models.deepseek_v41 import deferred_load
+
+            deferred_load.register(self.model_runner, call.compiled_function)
         if not self._engram_tables:
             return call, warmup_async
         return _carrying_engram(call), _carrying_engram(warmup_async)

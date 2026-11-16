@@ -12,6 +12,7 @@ from collections.abc import Iterator, Mapping
 
 import torch
 
+from sglang.srt.model_loader.loader import BaseModelLoader, DummyModelLoader
 from sglang_tpu.ep_weight_shard import EPLocalRunaiModelStreamerLoader
 from sglang_tpu.models.deepseek_v41.engram_row_reader import (
     is_engram_table,
@@ -56,3 +57,43 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
             tp_size=parallel.tp_size,
         )
         return streamed, rows
+
+
+class DSV41DeferredDummyLoader(DummyModelLoader):
+    """Boots a V4.1 target on dummy weights whose real ones (``real_loader``,
+    the loader get_model_loader chose for --load-format) load while the
+    direct-tracer compile runs (deferred_load): records the raw parameters
+    before the post-load pass and leaves the host Engram tables unfilled."""
+
+    def __init__(self, load_config, real_loader):
+        # DummyModelLoader rejects model_loader_extra_config; it belongs to the
+        # real loader here.
+        BaseModelLoader.__init__(self, load_config)
+        self.real_loader = real_loader
+
+    def load_model(self, *, model_config, device_config):
+        from sglang.srt.model_loader.loader import (
+            _get_quantization_config,
+            _initialize_model,
+            post_load_weights,
+        )
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
+        from sglang.srt.model_loader.weight_utils import initialize_dummy_weights
+        from sglang_tpu.models.deepseek_v41 import deferred_load
+
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(model_config, self.load_config, quant_config)
+            deferred_load.defer(model, self.real_loader)
+            initialize_dummy_weights(deferred_load.device_only(model))
+            post_load_weights(model)
+            for module in model.modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is None or (
+                    hasattr(module, "is_weights_quantized")
+                    and module.is_weights_quantized()
+                ):
+                    continue
+                quant_method.process_weights_after_loading(module)
+        return model.eval()

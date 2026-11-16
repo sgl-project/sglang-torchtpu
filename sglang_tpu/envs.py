@@ -638,6 +638,11 @@ class TpuEnvs:
     # the loops in IMEM overlays (q8 32k: TP -3 to -6.5%); 64 restores the previous hoisting.
     SGLANG_TPU_MUSE_MK_ATTN_HOIST_MAX_ROWS = EnvInt(0)
 
+    # DeepSeek-V4.1: boot on dummy weights and load the --load-format weights
+    # from --model-path while the direct tracer's SPMD compiles run
+    # (models/deepseek_v41/deferred_load.py).
+    SGLANG_TPU_DSV41_DEFERRED_LOAD = EnvBool(False)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(

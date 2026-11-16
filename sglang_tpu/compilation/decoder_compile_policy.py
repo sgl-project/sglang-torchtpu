@@ -954,6 +954,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 **kwargs,
             )
 
+        # Callers that rebuild the model's parameters re-attach its inputs.
+        call.compiled_function = compiled
         return call, warmup_async
 
     def get_direct_compile_kv_pool(self):
