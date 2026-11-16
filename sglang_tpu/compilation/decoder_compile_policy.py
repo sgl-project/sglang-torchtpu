@@ -49,6 +49,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation import aot_fast_runtime_wrapper
 from sglang_tpu.compilation.attention_rank_inputs import (
@@ -2415,6 +2416,13 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         assert self.t_bucketer is not None
 
         embed_tokens = self.owner.get_input_embeddings()
+        # Only the stage that embeds tokens places multimodal rows (a later
+        # pipeline stage has a PPMissingLayer here), and a language-model-only
+        # model places none.
+        if isinstance(embed_tokens, PPMissingLayer) or getattr(
+            self.owner, "language_model_only", False
+        ):
+            return
         hidden = embed_tokens.embedding_dim
         dtype = embed_tokens.weight.dtype
         device = self.model_runner.device
