@@ -342,6 +342,25 @@ GROUPED_SPEC_SHAPES = (
 )
 
 
+def _exclusive_prefix(flags):
+    """Exclusive running count of ``flags`` (int32 0/1 ``[rows, 128]``) in
+    row-major order: log-step lane scans, then the rows' totals carried down."""
+    lane = jax.lax.broadcasted_iota(jnp.int32, flags.shape, 1)
+    row = jax.lax.broadcasted_iota(jnp.int32, flags.shape, 0)
+    total = flags
+    shift = 1
+    while shift < flags.shape[1]:
+        total = total + jnp.where(lane >= shift, pltpu.roll(total, shift, 1), 0)
+        shift *= 2
+    carry = jnp.broadcast_to(total[:, flags.shape[1] - 1 :], flags.shape)
+    carry = jnp.where(row >= 1, pltpu.roll(carry, 1, 0), 0)
+    shift = 1
+    while shift < flags.shape[0]:
+        carry = carry + jnp.where(row >= shift, pltpu.roll(carry, shift, 0), 0)
+        shift *= 2
+    return total - flags + carry
+
+
 def _grouped_spec(batch, group, heads, sequence_rows):
     """Verifier shapes (rows per call, rows per sequence) supported by grouped
     FP8 QK/PV and query transport: DCP32 with three heads per rank, or
@@ -943,10 +962,26 @@ class DcpAttention:
     def _attend_cached_verify(self, step, row, load, base):
         # Earlier verify tokens use the cache's FP8 QK/PV, like sequential decode.
         _, local_step, _ = self._locate(step)
+        assert self.sequence_rows - 1 <= self.page_tokens  # the rows span <= 2 pages
 
-        @pl.loop(0, self.sequence_rows - 1)
-        def cache(r):
-            self._cache_verify_row(step % self.buffers, local_step, row + r)
+        def in_step(position):
+            page = position // self.page_tokens
+            local_page = page // self.group - local_step * self.span
+            return (
+                (page % self.group == self.owner)
+                & (local_page >= 0)
+                & (local_page < self.span)
+            )
+
+        # Only the step holding the cached verify rows' pages writes them.
+        @pl.when(
+            in_step(self.position_ref[row])
+            | in_step(self.position_ref[row + self.sequence_rows - 2])
+        )
+        def cache_rows():
+            @pl.loop(0, self.sequence_rows - 1)
+            def cache(r):
+                self._cache_verify_row(step % self.buffers, local_step, row + r)
 
         offset = jax.lax.broadcasted_iota(
             jnp.int32, (1, self.span * self.page_tokens), 1
@@ -957,29 +992,49 @@ class DcpAttention:
         token = page * self.page_tokens + offset % self.page_tokens
         slot = step % self.buffers
         if _grouped_spec(self.batch, self.group, self.heads, self.sequence_rows):
-            for first in range(0, self.sequence_rows, 4):
-                query = (
-                    jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0)
-                    // self.tile
-                )
-                visible = token < self.position_ref[row] + first + query
-                if (
-                    self.selection is not None
-                ):  # each query row its own mask (int32: no i1 selects)
-                    chosen = self._selected(slot, local_step, row, first).astype(
-                        jnp.int32
+
+            def dense():
+                for first in range(0, self.sequence_rows, 4):
+                    query = (
+                        jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0)
+                        // self.tile
                     )
-                    for i in range(1, 4):
-                        chosen = jnp.where(
-                            query == i,
-                            self._selected(slot, local_step, row, first + i).astype(
-                                jnp.int32
-                            ),
-                            chosen,
+                    visible = token < self.position_ref[row] + first + query
+                    if (
+                        self.selection is not None
+                    ):  # each query row its own mask (int32: no i1 selects)
+                        chosen = self._selected(slot, local_step, row, first).astype(
+                            jnp.int32
                         )
-                    visible = visible & (chosen != 0)
-                score = self._group_scores(load, visible, row - base + first, 4)
-                self._group_fold(score, load, row - base + first, 4)
+                        for i in range(1, 4):
+                            chosen = jnp.where(
+                                query == i,
+                                self._selected(
+                                    slot, local_step, row, first + i
+                                ).astype(jnp.int32),
+                                chosen,
+                            )
+                        visible = visible & (chosen != 0)
+                    score = self._group_scores(load, visible, row - base + first, 4)
+                    self._group_fold(score, load, row - base + first, 4)
+
+            compact = self._compact_tokens()
+            if not compact:
+                dense()
+                return
+            masks = [
+                self._selected_rows(slot, local_step, row, r)
+                for r in range(self.sequence_rows)
+            ]
+            union = masks[0]
+            for mask in masks[1:]:
+                union = union | mask
+            union = union.astype(jnp.int32)
+            count = jnp.sum(union)
+            pl.when((count > 0) & (count <= compact))(
+                lambda: self._compact_verify(load, masks, union, row - base, compact)
+            )
+            pl.when(count > compact)(dense)
         else:
 
             @pl.loop(0, self.sequence_rows)
@@ -988,6 +1043,83 @@ class DcpAttention:
                 if self.selection is not None:
                     visible = visible & self._selected(slot, local_step, row, r)
                 self._fold_pages(load, visible, row - base + r)
+
+    def _compact_tokens(self):
+        """Slots of a compact verify step (``KernelConfig.dsa_compact_tokens``;
+        0: dense steps only)."""
+        if self.selection is None or not self.fp8:
+            return 0
+        return _config().dsa_compact_tokens
+
+    def _selected_rows(self, slot, local_step, row, r):
+        """Verify row ``row + r``'s visible selected tokens of a step,
+        ``[span * page_tokens / 128, 128]`` (tokens row-major, as the step's
+        key buffer)."""
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
+
+        sel = self.selection
+        keys = sel.key_buf[slot, r]
+        offset = jax.lax.broadcasted_iota(
+            jnp.int32, keys.shape, 0
+        ) * 128 + jax.lax.broadcasted_iota(jnp.int32, keys.shape, 1)
+        page = (
+            local_step * self.span + offset // self.page_tokens
+        ) * self.group + self.owner
+        token = page * self.page_tokens + offset % self.page_tokens
+        mask = dsa_dcp.selected(keys, token, sel.tau[row + r], sel.p_tie[row + r])
+        mask = mask & (token < self.position_ref[row] + r)
+        if sel.active is not None:  # a skipped step's buffers hold an earlier step's bytes
+            mask = mask & self._active(row, local_step)
+        return mask
+
+    def _compact_verify(self, load, masks, union, held, compact):
+        """A verify step over only its selected tokens: the union of the rows'
+        masks (``union`` int32 ``[key rows, 128]``, at most ``compact`` set)
+        numbered by an exclusive prefix count, gathered into ``compact`` slots
+        by a one-hot matmul (exact: each slot copies one cache value), then the
+        grouped QK / fold over the slots with each row's own mask; unused slots
+        are masked out."""
+        key_rows = union.shape[0]
+
+        def flat(x):  # [key rows, 128] -> [1, key rows * 128] (tokens on lanes)
+            return jnp.concatenate([x[k : k + 1] for k in range(key_rows)], axis=1)
+
+        number = flat(_exclusive_prefix(union))
+        chosen = flat(union) != 0
+        slot_id = jax.lax.broadcasted_iota(jnp.int32, (compact, 1), 0)
+        one_hot = jnp.where((slot_id == number) & chosen, 1.0, 0.0)  # [compact, W]
+        gathered = jax.lax.dot_general(
+            one_hot.astype(self.cache.dtype),
+            load(pl.ds(0, LANES)),
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        ).astype(self.cache.dtype)  # [compact, 640]
+        row_masks = jnp.concatenate(
+            [flat(mask.astype(jnp.int32)) for mask in masks], axis=0
+        ).astype(jnp.bfloat16)  # [rows, W]
+        slot_visible = jax.lax.dot_general(
+            row_masks,
+            one_hot.astype(jnp.bfloat16),
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )  # [rows, compact]: 1 where the slot's token is the row's
+
+        def compact_load(lanes, tokens=None):
+            assert tokens is None
+            return gathered[:, lanes.start : lanes.start + lanes.size]
+
+        for first in range(0, self.sequence_rows, 4):
+            query = (
+                jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0)
+                // self.tile
+            )
+            visible = jnp.broadcast_to(slot_visible[first : first + 1], (1, compact))
+            for i in range(1, 4):
+                visible = jnp.where(
+                    query == i, slot_visible[first + i : first + i + 1], visible
+                )
+            score = self._group_scores(compact_load, visible > 0.5, held + first, 4)
+            self._group_fold(score, compact_load, held + first, 4)
 
     def _step_pages(self, step):
         """Step ``step``'s row, the mask of its visible tokens and a reader of

@@ -568,7 +568,12 @@ class TestSelectedAttention(CustomTestCase):
         mla_dcp.DcpAttention._zero_slot = _zero_slot
         mla_dcp.DcpAttention._cache_verify_row = _cache_verify_row
 
-        def case(firsts, S, topk, seed, grouped=False, activity="exact", poison=False):
+        import dataclasses
+        base_config = mla_dcp._config()
+
+        def case(firsts, S, topk, seed, grouped=False, activity="exact", poison=False, compact=0, expect=None):
+            config = dataclasses.replace(base_config, dsa_compact_tokens=compact)
+            mla_dcp._config = lambda: config
             mla_dcp._grouped_spec = ((lambda b, g, h, rows: rows in (4, 8) and b % 4 == 0) if grouped
                                      else (lambda *a: False))
             rng = np.random.default_rng(seed)
@@ -613,6 +618,19 @@ class TestSelectedAttention(CustomTestCase):
                     active[g, first * steps + (j * (T // 128) + (t % T) // 128) // step_rows] = 1
             if activity == "none":
                 active[:] = 0
+            if expect is not None:  # which compact steps the case exercises (per sequence, rank, step)
+                counts = []
+                for s in range(len(firsts)):
+                    union = np.zeros(pages * G * T, bool)
+                    for r in range(S):
+                        union[:positions[s * S + r] + 1] |= masks[s * S + r]
+                        union[positions[s * S + r]] = False  # its own token goes through the merge
+                    for g in range(G):
+                        for j in range(pages // span):
+                            toks = [((j * span + k) * G + g) * T + t for k in range(span) for t in range(T)]
+                            counts.append(int(union[toks].sum()))
+                kinds = {"compact" if 0 < c <= compact else "dense" if c > compact else "empty" for c in counts}
+                assert set(expect) <= kinds, (expect, sorted(counts))
             q = (rng.standard_normal((G, B, H, 640)) * 0.05).astype(np.float32)
             q[..., 576:] = 0
             new = np.broadcast_to(lat[np.arange(B) // S, positions], (G, B, 640)).astype(np.float32)
@@ -672,6 +690,11 @@ class TestSelectedAttention(CustomTestCase):
         case([2047, 600, 64, 3000], 2, 128, 2)
         case([700, 5000], 1, 64, 3, activity="none")
         case([700, 9000], 1, 8, 4, poison=True)  # skipped steps on never-loaded slots stay finite
+        # Compact verify steps (KernelConfig.dsa_compact_tokens): few selected tokens a step attend
+        # only those, gathered; busier steps fall back to the dense masked step.
+        case([1500, 3000], 4, 24, 5, grouped=True, compact=64, expect=("compact",))
+        case([1500, 3000], 4, 200, 1, grouped=True, compact=128, expect=("compact", "dense"))
+        case([900, 2600], 8, 40, 6, grouped=True, compact=64, expect=("compact",))
         print("OK")
     """
 

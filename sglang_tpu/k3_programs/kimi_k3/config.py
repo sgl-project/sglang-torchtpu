@@ -87,6 +87,11 @@ class KernelConfig:
     # select every key at or above the threshold bin's lower bound -- a
     # superset of the top-k, ~2048 + the bin's other keys.
     dsa_select_rounds: int = 8
+    # Kimi-K3.1 decode attention (grouped FP8 verifies): a step whose rows
+    # select at most this many of its tokens (their union) attends only them,
+    # gathered into that many slots by a one-hot matmul; busier steps run
+    # dense with the mask. 0: always dense.
+    dsa_compact_tokens: int = 0
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
