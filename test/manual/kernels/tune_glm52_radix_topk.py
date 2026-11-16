@@ -89,7 +89,7 @@ def main():
                 "mixed",
             ),
         ):
-            step = fixture["_build_step"](**build, reference_scores=False)
+            step = helpers["build_benchmark_step"](**build)
             inputs = tuple(
                 jnp.asarray(getattr(step, name))
                 for name in (
@@ -132,6 +132,7 @@ def main():
                     config=config,
                     key_store="xla",
                     page_size=fixture["_PAGE_SIZE"],
+                    score_width_capacity=92160,
                     writer_and_score_included=True,
                     **timing,
                 )
