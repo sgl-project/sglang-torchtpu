@@ -625,11 +625,21 @@ def simulated_real_draft_accept_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token: forced accept length, real tokens.
 
-    target_argmax is the target's greedy id per verify row, [bs, N + 1]. Returns the
-    forced num_correct_drafts clamped to num_verify_drafts and, as the bonus, the target's
-    token at that row: the upstream spec_utils rule (accepted draft tokens, then the
-    target-derived bonus). Eager on purpose: the outputs feed finalize_accept, whose
-    programs warmup already builds, so no serving-time program is added per bucket.
+    Follows the upstream spec_utils rule: the accepted rows commit the draft's own tokens
+    and the bonus is the target's token at the first unaccepted row. Eager on purpose: the
+    outputs feed finalize_accept, whose programs warmup already builds per bucket.
+
+    Args:
+        target_argmax: [bs, N + 1] the target's greedy token id at each verify row.
+        draft_tokens: [bs, N] the draft tokens verified this step; sets the bonus dtype.
+        num_correct_drafts: [bs] forced number of accepted drafts, from the simulated
+            accept-length sampler.
+        num_verify_drafts: [bs] drafts each request can verify this step; caps
+            num_correct_drafts.
+
+    Returns:
+        num_correct_drafts clamped to num_verify_drafts, and the [bs] bonus tokens
+        (target_argmax at that row, in draft_tokens' dtype).
     """
     bs = draft_tokens.shape[0]
     num_correct = torch.minimum(
