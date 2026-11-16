@@ -405,38 +405,20 @@ class TpuMambaPool(MambaPool):
             for state in states
         ]
 
-    def _copyable_states(self):
-        """Return state tensors that have a real DMA payload.
+    def get_state(self) -> list[torch.Tensor]:
+        """Return non-empty mutable state for direct_compile and state copies.
 
-        LFM2 is conv-only, so its Mamba2 temporal tensors have zero elements.
-        The TPU state-copy Pallas op cannot issue a zero-byte row copy; those
-        tensors are absent from both the COW payload and the direct-compile
-        state list, while the public ``get_state`` keeps the full cache layout.
+        TorchTPU cannot lower zero-element inputs or DMA zero bytes. ShortConv's
+        empty recurrent buffers stay in mamba_cache and are retained by set_state.
         """
         return [state for state in self._copy_states() if state.numel() > 0]
 
-    def get_state(self) -> list[torch.Tensor]:
-        """The per-layer conv and recurrent tensors the GDN/KDA kernels mutate."""
-        return self._copy_states()
-
-    def get_state_for_compile(self) -> list[torch.Tensor]:
-        """Return the state tensors that can cross the TPU compile boundary.
-
-        LFM2 is ShortConv-only, so its recurrent state is represented by
-        zero-element tensors.  Those tensors are useful as part of the public
-        cache layout, but TorchTPU cannot lower a zero-element ``f32[0]``
-        argument with a valid layout.  Direct compilation does not need them:
-        ShortConv only reads and mutates the non-empty convolution state.
-        """
-        return self._copyable_states()
-
-    def set_state_for_compile(self, state: list[torch.Tensor]) -> None:
-        """Install a compile-bound state list while retaining empty buffers."""
-        expected = self._copyable_states()
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        """Install the get_state layout while retaining empty buffers."""
+        expected = self.get_state()
         if len(state) != len(expected):
             raise ValueError(
-                "compile state length changed: "
-                f"expected {len(expected)}, got {len(state)}"
+                f"state length changed: expected {len(expected)}, got {len(state)}"
             )
 
         replacements = iter(state)
@@ -451,24 +433,6 @@ class TpuMambaPool(MambaPool):
             ],
             temporal=[replace(tensor) for tensor in self.mamba_cache.temporal],
         )
-        try:
-            next(replacements)
-        except StopIteration:
-            return
-        raise ValueError("compile state contains more tensors than expected")
-
-    def set_state(self, state: list[torch.Tensor]) -> None:
-        """Install a list laid out like get_state."""
-        num_layers = self.num_mamba_layers
-        num_kinds = len(self.mamba_cache.conv)
-        assert len(state) == (num_kinds + 1) * num_layers, len(state)
-        self.mamba_cache = TpuPerLayerState(
-            conv=[
-                state[kind * num_layers : (kind + 1) * num_layers]
-                for kind in range(num_kinds)
-            ],
-            temporal=state[num_kinds * num_layers :],
-        )
 
     @torch.no_grad()
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
@@ -476,7 +440,7 @@ class TpuMambaPool(MambaPool):
             return
         # Slot rows only: with no_buffer radix caching, copies run between a
         # cached prefix slot and a request's slot before its extend.
-        states = self._copyable_states()
+        states = self.get_state()
         if not states:
             return
         if states[0].device.type == "cpu":
@@ -515,7 +479,7 @@ class TpuMambaPool(MambaPool):
             copy_bucket_size,
         )
 
-        states = self._copyable_states()
+        states = self.get_state()
         if not states:
             self._state_copy_warmed = True
             return

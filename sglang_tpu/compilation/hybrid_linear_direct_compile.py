@@ -44,15 +44,12 @@ class HybridLinearKVPoolState:
         self._mamba_pool = mamba_pool
 
     def get_state(self) -> list[torch.Tensor]:
-        return [
-            *self._full_kv_pool.get_state(),
-            *self._mamba_pool.get_state_for_compile(),
-        ]
+        return [*self._full_kv_pool.get_state(), *self._mamba_pool.get_state()]
 
     def set_state(self, state: list[torch.Tensor]) -> None:
         num_full = len(self._full_kv_pool.get_state())
         self._full_kv_pool.set_state(state[:num_full])
-        self._mamba_pool.set_state_for_compile(state[num_full:])
+        self._mamba_pool.set_state(state[num_full:])
 
 
 def hybrid_linear_kv_pool_state(

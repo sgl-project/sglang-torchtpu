@@ -14,10 +14,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.layers.attention.linear.short_conv_backend import ShortConvMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention_short_conv import TpuShortConvMetadata, short_conv
+from sglang_tpu.attention_short_conv import short_conv
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_tpu_ci(
@@ -69,7 +70,7 @@ class TestShortConvTPU(CustomTestCase):
 
     def _prefill(self, x, weight, bias, state, slots, lengths, has_prefix):
         boundaries = [0, *itertools.accumulate(lengths)]
-        metadata = TpuShortConvMetadata(
+        metadata = ShortConvMetadata(
             layer_cache=SimpleNamespace(conv=[state]),
             cache_indices=torch.tensor(slots, device=self.device),
             query_start_loc=torch.tensor(boundaries, device=self.device),
@@ -124,7 +125,7 @@ class TestShortConvTPU(CustomTestCase):
             expected, expected_state = _reference(
                 x, weight, None, expected_state, slots, [1] * 4, [True] * 4
             )
-            metadata = TpuShortConvMetadata(
+            metadata = ShortConvMetadata(
                 SimpleNamespace(conv=[state]),
                 torch.tensor(slots, device=self.device),
                 torch.arange(5, device=self.device),
@@ -161,7 +162,7 @@ class TestShortConvTPU(CustomTestCase):
                     [start > 0],
                 )
             )
-        metadata = TpuShortConvMetadata(
+        metadata = ShortConvMetadata(
             SimpleNamespace(conv=[state]),
             torch.tensor([2], device=self.device),
             torch.tensor([0, 1], device=self.device),

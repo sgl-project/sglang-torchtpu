@@ -11,12 +11,13 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.configs.lfm2 import Lfm2Config
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.short_conv_backend import ShortConvMetadata
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.runtime_context import get_exec, get_spec
 
@@ -31,15 +32,6 @@ class ShortConvTracedMetadata(NamedTuple):
     cache_indices: torch.Tensor
     query_start_loc: torch.Tensor
     has_initial_state: Optional[torch.Tensor] = None
-
-
-class TpuShortConvMetadata(NamedTuple):
-    """Per-layer cache handle plus the shared per-step device metadata."""
-
-    layer_cache: Any
-    cache_indices: torch.Tensor
-    query_start_loc: torch.Tensor
-    has_initial_state: Optional[torch.Tensor]
 
 
 class TpuShortConvAttnBackend(MambaAttnBackendBase):
@@ -135,13 +127,11 @@ class TpuShortConvAttnBackend(MambaAttnBackendBase):
 
     def conv_state_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
-    ) -> TpuShortConvMetadata:
-        # List-index the per-layer buffer, preserving its storage identity for
-        # compiled in-place writes. The no_buffer radix path copies this state
-        # through the shared MambaPool COW operation before the extend.
-        pool = self.req_to_token_pool
-        layer_cache = pool.mamba_pool.mamba2_layer_cache(pool.mamba_map[layer_id])
-        return TpuShortConvMetadata(layer_cache, *self._metadata)
+    ) -> ShortConvMetadata:
+        # The pool handles layer mapping and transfer readiness; TPU's per-layer
+        # storage keeps the returned tensor identity for compiled in-place writes.
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        return ShortConvMetadata(layer_cache, *self._metadata)
 
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError("ShortConv layers call conv_state_metadata directly.")
@@ -154,7 +144,7 @@ def short_conv(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
-    metadata: TpuShortConvMetadata,
+    metadata: ShortConvMetadata,
     forward_mode: ForwardMode,
 ) -> torch.Tensor:
     """Platform kernel entry point used between LFM2's two gates."""

@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     ShortConvHybridAttnBackend,
 )
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -44,12 +45,13 @@ def _backend(device="cpu"):
         ),
         SimpleNamespace(conv=[torch.full((5, 2, 1, 3), 100.0, device=device)]),
     ]
-    backend.req_to_token_pool = SimpleNamespace(
-        get_mamba_indices=lambda rows: request_to_virtual[rows],
-        translate_mamba_indices=lambda slots: virtual_to_physical[slots],
-        mamba_map={4: 1, 9: 0},
-        mamba_pool=SimpleNamespace(mamba2_layer_cache=lambda layer: layers[layer]),
-    )
+    pool = HybridReqToTokenPool.__new__(HybridReqToTokenPool)
+    pool.req_index_to_mamba_index_mapping = request_to_virtual
+    pool.translate_mamba_indices = lambda slots: virtual_to_physical[slots]
+    pool.mamba_map = {4: 1, 9: 0}
+    pool.mamba_pool = SimpleNamespace(mamba2_layer_cache=lambda layer: layers[layer])
+    pool.layer_transfer_counter = None
+    backend.req_to_token_pool = pool
     backend._metadata = None
     backend._decode_query_start_loc = {}
     return backend
