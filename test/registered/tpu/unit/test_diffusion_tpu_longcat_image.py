@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits import longcat_image as dit
 from sglang.multimodal_gen.runtime.models.encoders import qwen2_5vl
+from sglang.multimodal_gen.runtime.pipelines.longcat_image import LongCatImagePipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
     longcat_image as rewrite,
 )
@@ -59,6 +60,7 @@ def _installed(backend="eager"):
             (qwen2_5vl, "create_causal_mask"),
             (dit.LongCatImageTransformer2DModel, "__call__"),
             (rewrite.LongCatPromptRewriteStage, "forward"),
+            (LongCatImagePipeline, "create_pipeline_stages"),
         ):
             stack.enter_context(patch.object(owner, name, getattr(owner, name)))
         stack.enter_context(patch.object(longcat_image, "_DEVICE_TYPES", ("cpu",)))
@@ -252,6 +254,11 @@ class TestLongCatPromptRewrite(_TestBase):
             other_seed = rank(43, 0)
         self.assertTrue(torch.equal(*ranks), ranks)
         self.assertFalse(torch.equal(ranks[0], other_seed))
+
+    def test_cfg_parallel_is_refused(self):
+        args = SimpleNamespace(enable_cfg_parallel=True)
+        with _installed(), self.assertRaisesRegex(ValueError, "CFG parallel"):
+            LongCatImagePipeline.create_pipeline_stages(None, args)
 
     def test_padded_prompt_encodes_as_stock(self):
         model = _encoder()

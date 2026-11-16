@@ -29,7 +29,10 @@ Runtime patch, tracked debt:
   (4) gives the compiled DiT its prompt embeddings in their own contiguous
       storage: the backend guards every input's storage offset, and the
       embeddings are a slice of the encoder output on a conditioning-cache
-      miss but a copy on a hit, which would compile the DiT once per layout.
+      miss but a copy on a hit, which would compile the DiT once per layout;
+  (5) refuses CFG parallel at startup: at CFG 2 x Ulysses 4 (the default
+      for CFG models given no parallel flags), 3 of 11 requests returned
+      blank images and identical requests differed.
 - Upstream PR or issue: none.
 - Remove when: torch_tpu lowers int64 reductions and float64, and the
   rewrite runs on a TPU decode engine.
@@ -46,6 +49,7 @@ from sglang.multimodal_gen.runtime.models.encoders import qwen2_5vl
 from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
     apply_qwen_vl_text_rope,
 )
+from sglang.multimodal_gen.runtime.pipelines import longcat_image as pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
     longcat_image as rewrite,
 )
@@ -64,6 +68,7 @@ _STOCK_ROPE_INDEX = qwen2_5vl.Qwen2_5_VLModel.get_rope_index
 _STOCK_CAUSAL_MASK = qwen2_5vl.create_causal_mask
 _STOCK_DIT_CALL = dit.LongCatImageTransformer2DModel.__call__
 _STOCK_REWRITE_FORWARD = rewrite.LongCatPromptRewriteStage.forward
+_STOCK_CREATE_STAGES = pipeline.LongCatImagePipeline.create_pipeline_stages
 
 
 def _attend(q, keys, values, visible, scale):
@@ -383,9 +388,20 @@ def _dit_call(self, *args, **kwargs):
     return _STOCK_DIT_CALL(self, **kwargs)
 
 
+def _create_pipeline_stages(self, server_args):
+    if server_args.enable_cfg_parallel:
+        raise ValueError(
+            "LongCat-Image on TPU runs CFG serially: CFG parallel returned blank "
+            "images. Serve with --ulysses-degree <cores> "
+            "(benchmark/tpu/diffusion/longcat_image.sh)."
+        )
+    return _STOCK_CREATE_STAGES(self, server_args)
+
+
 def install() -> None:
     qwen2_5vl.Qwen2_5_VLForConditionalGeneration.generate = _generate
     qwen2_5vl.Qwen2_5_VLModel.get_rope_index = _get_rope_index
     qwen2_5vl.create_causal_mask = _causal_mask_on_host
     dit.LongCatImageTransformer2DModel.__call__ = _dit_call
     rewrite.LongCatPromptRewriteStage.forward = _rewrite_forward
+    pipeline.LongCatImagePipeline.create_pipeline_stages = _create_pipeline_stages
