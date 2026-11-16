@@ -128,6 +128,13 @@ class KernelConfig:
     # Decode layer loop: test KDA first in the layer-type branch, so the
     # instruction overlays place the post-join code for the 68 KDA layers.
     decode_kda_branch_first: bool = True
+    # Decode MLA layers with the DSA indexer (attention DP1): run the q/kv
+    # projections, the new row's hand-out and the selection inside a loop of
+    # one trip (the trip count is read at run time). The instruction overlays
+    # then hold the MLA code in two overlays split at that loop, and the one
+    # the KDA path prefetches fits in IMEM beside the KDA path's code. The
+    # same operations run in the same order (bit-identical).
+    decode_mla_prefix_region: bool = False
     # 8- and 16-row decode steps: keep the small embedding all-reduce on the
     # TensorCore instead of the SparseCore collective offload.
     decode_tc_all_reduce: bool = False
