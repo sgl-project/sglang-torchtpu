@@ -4,12 +4,11 @@ on one tpu7x host, tp8, text only.
     python3 -m benchmark.tpu.launch_server \\
         --config recipe/configs/qwen3_8_flash_next/server_tp8.py
 
-TPU has no QSA kernel yet, so the full-attention layers run dense; that equals
-QSA while every sequence fits the indexer budget (2048 tokens), which bounds the
-context here.
+TPU has no QSA kernel yet, so the full-attention layers run dense
+(sglang_tpu.hooks.qwen4_exp); that equals QSA while every sequence fits the
+indexer budget (2048 tokens), which bounds the context here.
 """
 
-import json
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.base import _FP8_BASE_CONFIG
@@ -42,8 +41,6 @@ CONFIG["server_args"].update(
         "language_model_only": True,
         "trust_remote_code": True,
         "tpu_compile_tracer": "direct",
-        # Until the TPU hook strips them: no QSA indexer, dense full attention.
-        "json_model_override_args": json.dumps({"text_config": {"indexer_n_heads": None}}),
     }
 )
 CONFIG["runtime_env"].update(
