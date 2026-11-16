@@ -42,7 +42,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 # The full numerical sweep took 34m02s in PR #1962; retain it on nightly.
 register_tpu_ci(
-    est_time=2042,
+    est_time=2480,
     suite="nightly-tpu-4-v7",
     nightly=True,
     chips=4,

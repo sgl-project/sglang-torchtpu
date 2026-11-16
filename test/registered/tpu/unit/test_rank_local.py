@@ -15,7 +15,7 @@ from sglang.test.test_utils import CustomTestCase
 # Four ranks under torchrun hold every chip of the host (266 s in the PR gate),
 # which the stage-a budget cannot fit; run it nightly.
 register_tpu_ci(
-    est_time=270,
+    est_time=340,
     suite="nightly-tpu-4-v7",
     nightly=True,
     chips=4,

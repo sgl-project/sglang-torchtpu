@@ -27,7 +27,7 @@ Usage:
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
-    est_time=360,
+    est_time=300,
     suite="nightly-tpu-4-v7",
     nightly=True,
     labels=["singlehost", "qwen3-0.6b", "kv-offload", "l3-file"],
