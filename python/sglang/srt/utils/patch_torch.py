@@ -209,6 +209,8 @@ def initialize_torch_tpu_worker(
 
     current_platform.prepare_worker(server_args, tp_rank, pp_rank, dp_rank)
     monkey_patch_torch_tpu_env(server_args, tp_rank, pp_rank, dp_rank=dp_rank)
+    # Before init_backend so the checkpoint reads overlap PJRT and distributed init.
+    current_platform.start_early_checkpoint_prefetch(cfg)
     current_platform.init_backend()
 
     try:

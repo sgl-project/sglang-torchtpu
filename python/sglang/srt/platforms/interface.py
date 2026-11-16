@@ -346,6 +346,10 @@ class SRTPlatform(DeviceMixin):
     # Initialization
     # ------------------------------------------------------------------
 
+    def start_early_checkpoint_prefetch(self, cfg) -> None:
+        """Optionally prefetch checkpoints before backend initialization."""
+        pass
+
     def init_backend(self) -> None:
         """One-time backend initialization.  Called in each worker."""
         pass

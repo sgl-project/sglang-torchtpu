@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Optional, Type
 
@@ -1642,6 +1643,19 @@ class TpuSRTPlatform(SRTPlatform):
         return super().get_group_coordinator_cls()
 
     def init_backend(self) -> None:
+        try:
+            self._init_backend()
+        except BaseException:
+            # The early checkpoint prefetch started just before this call;
+            # a failed backend init must not leave its readers running.
+            from sglang_tpu.checkpoint_prefetch import (
+                cancel_early_checkpoint_prefetch,
+            )
+
+            cancel_early_checkpoint_prefetch()
+            raise
+
+    def _init_backend(self) -> None:
         if getattr(self, "_backend_initialized", False):
             return
 
@@ -1846,24 +1860,34 @@ class TpuSRTPlatform(SRTPlatform):
     def synchronize(self) -> None:
         torch.accelerator.synchronize()
 
+    def start_early_checkpoint_prefetch(self, cfg) -> None:
+        from sglang_tpu.checkpoint_prefetch import start_early_checkpoint_prefetch
+
+        start_early_checkpoint_prefetch(cfg)
+
     @contextmanager
     def weight_loading_context(self, weights):
         from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.checkpoint_prefetch import cancel_early_checkpoint_prefetch
         from sglang_tpu.expert_loading import (
             expert_loading_context,
         )
 
-        if get_parallel().pp_size > 1:
-            with expert_loading_context():
+        start = time.perf_counter()
+        try:
+            if get_parallel().pp_size > 1:
+                with expert_loading_context():
+                    yield _sync_weight_stream(weights)
+            else:
+                # No eager drain at load exit: torch.accelerator.synchronize() here
+                # deadlocks EAGLE3 draft init under TP>1 -- rank 0 blocks on an
+                # async buffer while peers reach the post-load barrier. Let it
+                # resolve at the first aligned sync instead. Periodic syncs in
+                # _sync_weight_stream still bound HBM during large loads.
                 yield _sync_weight_stream(weights)
-            return
-
-        # No eager drain at load exit: torch.accelerator.synchronize() here deadlocks
-        # EAGLE3 draft init under TP>1 -- rank 0 blocks on an async buffer while
-        # peers reach the post-load barrier. Let it resolve at the first aligned
-        # sync instead. Periodic syncs in _sync_weight_stream still bound HBM
-        # during large loads.
-        yield _sync_weight_stream(weights)
+        finally:
+            cancel_early_checkpoint_prefetch()
+        logger.info("load_weights_only took %.2f s", time.perf_counter() - start)
 
     def empty_cache(self) -> None:
         pass

@@ -76,9 +76,22 @@ class TestWorkerEnvUnderPipelineParallelism(CustomTestCase):
         declare_resolution(
             args, "test.worker_defaults", device="tpu", pp_size=8, nnodes=2
         )
-        with patch("sglang.srt.platforms.current_platform.init_backend") as initialize:
+        calls = []
+        with (
+            patch(
+                "sglang.srt.platforms.current_platform.start_early_checkpoint_prefetch",
+                side_effect=lambda cfg: calls.append(
+                    ("prefetch", cfg.device, os.environ["RANK"])
+                ),
+            ),
+            patch(
+                "sglang.srt.platforms.current_platform.init_backend",
+                side_effect=lambda: calls.append(("init_backend", os.environ["RANK"])),
+            ) as initialize,
+        ):
             initialize_torch_tpu_worker(args, tp_rank=0, pp_rank=5)
         initialize.assert_called_once_with()
+        self.assertEqual(calls, [("prefetch", "tpu", "5"), ("init_backend", "5")])
         self.assertIsNone(args.device)
         self.assertEqual(args.pp_size, 1)
         self.assertEqual(os.environ["RANK"], "5")

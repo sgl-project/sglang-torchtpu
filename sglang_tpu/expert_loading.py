@@ -268,6 +268,20 @@ def _replace_with_expert_chunks(
     _wait_for(param.data)
 
 
+_PREPARED_EARLY = "_tpu_weights_prepared_early"
+
+
+def mark_weights_prepared_early(layer: torch.nn.Module) -> None:
+    """Record that ``layer`` ran its post-load weight prep inside load_weights."""
+    layer.__dict__[_PREPARED_EARLY] = True
+
+
+def take_weights_prepared_early(layer: torch.nn.Module) -> bool:
+    """True once per mark. The loader's postprocess pass reaches every layer
+    again, and a second prep would transpose or quantize prepared weights."""
+    return layer.__dict__.pop(_PREPARED_EARLY, False)
+
+
 def _wait_for(*tensors: torch.Tensor) -> None:
     """Wait for the programs producing device tensors, so one chunk's
     intermediates are released before the next chunk is queued."""

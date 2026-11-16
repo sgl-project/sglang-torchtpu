@@ -6,7 +6,7 @@ import sys
 
 PREFETCH_SETTINGS = {
     "weight_loader_prefetch_checkpoints": True,
-    "weight_loader_prefetch_num_threads": 1,
+    "weight_loader_prefetch_num_threads": 4,
     "weight_loader_disable_mmap": False,
     "weight_loader_drop_cache_after_load": False,
 }
@@ -63,7 +63,7 @@ def configure_checkpoint_prefetch(argv, env):
         [
             "--weight-loader-prefetch-checkpoints",
             "--weight-loader-prefetch-num-threads",
-            "1",
+            "4",
         ]
     )
     env["LOCAL_SIZE"] = local_size

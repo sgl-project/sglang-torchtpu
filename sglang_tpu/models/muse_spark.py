@@ -57,7 +57,11 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, process_model_config
 from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.expert_loading import _wait_for
+from sglang_tpu.expert_loading import (
+    _wait_for,
+    mark_weights_prepared_early,
+    take_weights_prepared_early,
+)
 from sglang_tpu.fp8_moe import _free_replaced_storage
 from sglang_tpu.fp8_moe_fused_rs import apply_fp8_fused_rs, prepare_fp8_fused_rs
 
@@ -98,6 +102,18 @@ def _param_name(checkpoint_name: str) -> Optional[str]:
         if name.endswith(old):
             return name.removesuffix(old) + new
     return name
+
+
+def _host_load_buf(
+    bufs: dict[tuple, torch.Tensor], shape: tuple[int, ...], dtype: torch.dtype
+) -> torch.Tensor:
+    """One reusable host staging tensor per (shape, dtype) for a load_weights call."""
+    key = (tuple(shape), dtype)
+    buf = bufs.get(key)
+    if buf is None:
+        buf = torch.empty(shape, dtype=dtype, device="cpu")
+        bufs[key] = buf
+    return buf
 
 
 def _layer_index(name: str) -> int:
@@ -372,6 +388,8 @@ class _HostQuantizedFp8MoEMethod(Fp8MoEMethod):
         from sglang.srt.layers.moe import get_moe_runner_backend
         from sglang_tpu.fp8_moe import prepare_tpu_fp8_moe_weights
 
+        if take_weights_prepared_early(layer):
+            return
         prepare_tpu_fp8_moe_weights(
             layer,
             block_quant=False,
@@ -431,6 +449,8 @@ class MuseTpuBf16MoEMethod(UnquantizedFusedMoEMethod):
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         from sglang.srt.layers.moe import get_moe_runner_backend
 
+        if take_weights_prepared_early(layer):
+            return
         super().process_weights_after_loading(layer)
         self.handles_moe_reduction = False
         backend = get_moe_runner_backend()
@@ -870,6 +890,9 @@ class MuseSparkForConditionalGeneration(nn.Module):
         self.text_config = text_config
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
+        # Host staging buffers for expert shards, keyed by (shape, dtype);
+        # live only for the duration of load_weights.
+        self._host_load_bufs: dict[tuple, torch.Tensor] = {}
         # The fp32 RoPE table must cover the served context: positions past its
         # end rotate with the last row. 2^17 rows = 32 MiB floor.
         max_position = min(
@@ -991,6 +1014,14 @@ class MuseSparkForConditionalGeneration(nn.Module):
         self.capture_aux_hidden_states = self.pp_group.is_last_rank
         self.model._set_layers_to_capture(layer_ids)
 
+    def _postprocess_layer_moe(self, layer_idx: int) -> None:
+        """Run the experts' post-load weight prep as soon as the layer is loaded,
+        so it overlaps the next layer's shard reads instead of running at the end."""
+        experts = self.model.layers[layer_idx].mlp.experts
+        experts.quant_method.process_weights_after_loading(experts)
+        _wait_for(experts.w13_weight.data, experts.w2_weight.data)
+        mark_weights_prepared_early(experts)
+
     def _load_expert_stack(
         self,
         params: dict,
@@ -1016,26 +1047,33 @@ class MuseSparkForConditionalGeneration(nn.Module):
             local = loaded_weight.narrow(
                 0, parallel.moe_ep_rank * local_count, local_count
             )
+        device, dtype = param.device, param.dtype
+        is_online_fp8 = dtype == fp8_dtype and local.dtype != fp8_dtype
         tp_size, tp_rank = parallel.moe_tp_size, parallel.moe_tp_rank
         if tp_size > 1 and local.dim() == 3:
             if ".w13_" in name and local.shape[1] == param.shape[1] * tp_size:
                 half, shard = local.shape[1] // 2, param.shape[1] // 2
-                local = torch.cat(
-                    (
-                        local.narrow(1, tp_rank * shard, shard),
-                        local.narrow(1, half + tp_rank * shard, shard),
-                    ),
-                    dim=1,
+                target_dtype = local.dtype if is_online_fp8 else dtype
+                buf = _host_load_buf(
+                    self._host_load_bufs, tuple(param.shape), target_dtype
                 )
+                buf[:, :shard].copy_(local.narrow(1, tp_rank * shard, shard))
+                buf[:, shard:].copy_(local.narrow(1, half + tp_rank * shard, shard))
+                local = buf
             elif ".w2_" in name and local.shape[2] == param.shape[2] * tp_size:
                 shard = param.shape[2]
                 local = local.narrow(2, tp_rank * shard, shard)
+                if not is_online_fp8:
+                    buf = _host_load_buf(
+                        self._host_load_bufs, tuple(param.shape), dtype
+                    )
+                    buf.copy_(local)
+                    local = buf
         if tuple(local.shape) != tuple(param.shape):
             raise RuntimeError(
                 f"Expert tensor {name}: parameter {tuple(param.shape)} vs "
                 f"checkpoint slice {tuple(local.shape)}"
             )
-        device, dtype = param.device, param.dtype
         old = param.data
         param.data = torch.empty(0, dtype=dtype, device=device)
         _free_replaced_storage(old, param.data)
@@ -1044,30 +1082,23 @@ class MuseSparkForConditionalGeneration(nn.Module):
             1, local[0].numel() * max(param.element_size(), local.element_size())
         )
         step = max(1, (256 << 20) // per_expert_bytes)
-        if dtype == fp8_dtype and local.dtype != fp8_dtype:
+        if is_online_fp8:
             fp8_max = torch.finfo(fp8_dtype).max
             chunks: list[torch.Tensor] = []
             scale_chunks: list[torch.Tensor] = []
-            prev_threads = torch.get_num_threads()
-            host_cpus = os.cpu_count() or 8
-            active_ranks = min(host_cpus, max(1, parallel.tp_size, parallel.pp_size))
-            torch.set_num_threads(max(1, host_cpus // active_ranks))
-            try:
-                for start in range(0, local.shape[0], step):
-                    src = local[start : start + step].detach().cpu()
-                    scales = (
-                        src.abs().amax(dim=(1, 2)).to(torch.float32).clamp(min=1e-12)
-                        / fp8_max
-                    )
-                    qchunk = (
-                        (src / scales[:, None, None])
-                        .clamp(min=-fp8_max, max=fp8_max)
-                        .to(fp8_dtype)
-                    )
-                    chunks.append(qchunk.to(device=device, copy=True))
-                    scale_chunks.append(scales)
-            finally:
-                torch.set_num_threads(prev_threads)
+            for start in range(0, local.shape[0], step):
+                src = local[start : start + step].detach().cpu()
+                scales = (
+                    src.abs().amax(dim=(1, 2)).to(torch.float32).clamp(min=1e-12)
+                    / fp8_max
+                )
+                qchunk = (
+                    (src / scales[:, None, None])
+                    .clamp(min=-fp8_max, max=fp8_max)
+                    .to(fp8_dtype)
+                )
+                chunks.append(qchunk.to(device=device, copy=True))
+                scale_chunks.append(scales)
             param.data = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
             del chunks
             scale_name = f"{name}_scale"
@@ -1082,12 +1113,16 @@ class MuseSparkForConditionalGeneration(nn.Module):
             _wait_for(param.data, scale_param.data)
             return scale_name
 
-        chunks = [
-            local[start : start + step].to(device=device, dtype=dtype, copy=True)
-            for start in range(0, local.shape[0], step)
-        ]
-        param.data = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
-        del chunks
+        total_bytes = local.numel() * param.element_size()
+        if total_bytes <= (2 << 30):
+            param.data = local.to(device=device, dtype=dtype, copy=True)
+        else:
+            chunks = [
+                local[start : start + step].to(device=device, dtype=dtype, copy=True)
+                for start in range(0, local.shape[0], step)
+            ]
+            param.data = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+            del chunks
         _wait_for(param.data)
         return None
 
@@ -1139,35 +1174,78 @@ class MuseSparkForConditionalGeneration(nn.Module):
         num_layers = self.text_config.num_hidden_layers
         loaded = set()
         skipped = 0
-        for checkpoint_name, loaded_weight in weights:
-            name = _param_name(checkpoint_name)
-            if (
-                name is None
-                or _layer_index(name) >= num_layers
-                or self._is_off_stage_param(name)
+        pending_moe_params: dict[int, set[str]] = {}
+        for param_name in params:
+            if param_name.endswith(
+                ("w13_input_scale", "w2_input_scale")
+            ) or self._is_online_quant_scale(param_name):
+                continue
+            if ".mlp.experts.w" in param_name or param_name.endswith(
+                ".mlp.post_expert_norm.weight"
             ):
-                # Tower tensors, unused scales, off-stage PP parameters, or cut layers.
-                skipped += 1
-                continue
-            if self.text_config.tie_word_embeddings and name == "lm_head.weight":
-                continue
-            qkv_name = self._load_qkv_shard(params, name, loaded_weight)
-            if qkv_name is not None:
-                loaded.add(qkv_name)
-                continue
-            param = params.get(name)
-            if param is None:
-                raise ValueError(
-                    f"Checkpoint tensor {checkpoint_name} has no model parameter"
-                )
-            if ".experts.w" in name:
-                scale_name = self._load_expert_stack(params, param, loaded_weight, name)
-                if scale_name is not None:
-                    loaded.add(scale_name)
-            else:
-                loader = getattr(param, "weight_loader", default_weight_loader)
-                loader(param, loaded_weight)
-            loaded.add(name)
+                layer_idx = _layer_index(param_name)
+                if self.start_layer <= layer_idx < self.end_layer:
+                    pending_moe_params.setdefault(layer_idx, set()).add(param_name)
+        started_layers: set[int] = set()
+
+        prev_threads = torch.get_num_threads()
+        host_cpus = os.cpu_count() or 8
+        local_ranks = int(
+            os.environ.get("LOCAL_SIZE") or os.environ.get("LOCAL_WORLD_SIZE") or 1
+        )
+        active_ranks = min(host_cpus, max(1, local_ranks))
+        # Share the host's cores across co-located ranks;
+        # the 14 cap is picked by hand, not measured.
+        torch.set_num_threads(max(1, min(14, host_cpus // active_ranks)))
+        try:
+            for checkpoint_name, loaded_weight in weights:
+                name = _param_name(checkpoint_name)
+                if (
+                    name is None
+                    or _layer_index(name) >= num_layers
+                    or self._is_off_stage_param(name)
+                ):
+                    # Tower tensors, unused scales, off-stage PP parameters, or cut layers.
+                    skipped += 1
+                    continue
+                if self.text_config.tie_word_embeddings and name == "lm_head.weight":
+                    continue
+                qkv_name = self._load_qkv_shard(params, name, loaded_weight)
+                if qkv_name is not None:
+                    loaded.add(qkv_name)
+                    continue
+                param = params.get(name)
+                if param is None:
+                    raise ValueError(
+                        f"Checkpoint tensor {checkpoint_name} has no model parameter"
+                    )
+                if ".experts.w" in name:
+                    scale_name = self._load_expert_stack(
+                        params, param, loaded_weight, name
+                    )
+                    if scale_name is not None:
+                        loaded.add(scale_name)
+                else:
+                    loader = getattr(param, "weight_loader", default_weight_loader)
+                    loader(param, loaded_weight)
+                loaded.add(name)
+                layer_idx = _layer_index(name)
+                layer_pending = pending_moe_params.get(layer_idx)
+                if layer_pending is not None and name in layer_pending:
+                    if layer_idx not in started_layers:
+                        started_layers.add(layer_idx)
+                        # A load that failed after preparing this layer left its mark;
+                        # layers this call never touches keep theirs.
+                        take_weights_prepared_early(
+                            self.model.layers[layer_idx].mlp.experts
+                        )
+                    layer_pending.discard(name)
+                    if not layer_pending:
+                        del pending_moe_params[layer_idx]
+                        self._postprocess_layer_moe(layer_idx)
+        finally:
+            self._host_load_bufs.clear()
+            torch.set_num_threads(prev_threads)
         missing = sorted(
             name
             for name in params

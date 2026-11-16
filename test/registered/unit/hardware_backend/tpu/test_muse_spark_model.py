@@ -649,7 +649,7 @@ class TestMuseSparkHostFp8ExpertLoad(CustomTestCase):
 
         with patch.object(muse_mod, "get_parallel", return_value=fake_parallel):
             scale_name = muse_mod.MuseSparkForConditionalGeneration._load_expert_stack(
-                SimpleNamespace(),
+                SimpleNamespace(_host_load_bufs={}),
                 params,
                 w13_param,
                 w13_ckpt,
