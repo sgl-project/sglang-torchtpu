@@ -65,8 +65,22 @@ def tpu_local_routed_expert_range(model: torch.nn.Module) -> tuple[int, int] | N
     (fused shared experts, parameters that need every expert), or when
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS is true.
     """
-    if not _is_tpu or not getattr(model, "supports_tpu_ep_local_expert_reads", False):
+    if not _is_tpu:
         return None
+    if not getattr(model, "supports_tpu_ep_local_expert_reads", False):
+        # GLM's inherited loader preserves numeric expert ids for both weights
+        # and channelwise scales. Opt in only the audited target, not its
+        # Deepseek parent, subclasses, or the separate NextN/draft model.
+        # Import lazily: unrelated model loaders need not import GLM.
+        cls = type(model)
+        if (cls.__module__, cls.__name__) != (
+            "sglang.srt.models.glm4_moe", "GlmMoeDsaForCausalLM"
+        ):
+            return None
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
+
+        if cls is not GlmMoeDsaForCausalLM:
+            return None
     from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.utils import local_routed_expert_range

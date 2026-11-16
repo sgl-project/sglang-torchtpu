@@ -1,0 +1,498 @@
+#!/usr/bin/env bash
+# Compiled-long staged native startup and optional text/native-long clients.
+# Run identically on both Falcon hosts. No installs, model writes or remote APIs.
+set -euo pipefail
+ulimit -c 0
+exec python3 -u - "$@" <<'PY'
+import glob
+import hashlib
+import http.server
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.request
+
+START = time.monotonic()
+# Reserve 40 seconds for native launcher's child cleanup inside the 7200s bound.
+DEADLINE = START + 7160
+RANK = int(os.environ.get('FALCON_RANK', '-1'))
+OUT = Path('/tmp/tpu_logs/glm52-torch') / f'rank-{RANK}'
+OUT.mkdir(parents=True, exist_ok=True)
+result = {'status': 'FAILED', 'scope': 'compiled long request E2E; 12288input/16output; NOT precision or matched C16 performance',
+          'falcon_rank': RANK, 'source_commit': None}
+launcher = None
+server_log = None
+control = None
+state = {'status': 'RUNNING', 'peer_ack': False}
+prep_root = None  # Allocation-scoped shared failure channel after staged prep.
+
+
+def save(name, data):
+    (OUT / name).write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
+
+
+def require(test, message):
+    if not test:
+        raise RuntimeError(message)
+
+
+def remaining(cap=30):
+    value = min(cap, DEADLINE - time.monotonic())
+    if value <= 0:
+        raise TimeoutError('7160s work deadline exhausted (40s cleanup reserved)')
+    return value
+
+
+def run(argv, name, timeout=120):
+    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, timeout=remaining(timeout), check=False)
+    (OUT / name).write_text(proc.stdout)
+    require(proc.returncode == 0, f'{argv!r} failed: exit {proc.returncode}; see {name}')
+    return proc.stdout.strip()
+
+
+def check_child():
+    remaining()
+    if prep_root is not None:
+        # Both directions: a failed peer may no longer serve HTTP. Marker is
+        # scoped by the already validated unique allocation, not a global flag.
+        for rank in range(2):
+            failure = prep_root / f'failure-{rank}.json'
+            if failure.exists():
+                raise RuntimeError(f'host {rank} reported terminal failure; shared cleanup required')
+    if launcher is not None and launcher.poll() is not None:
+        raise RuntimeError(f'native launcher exited unexpectedly: {launcher.returncode}')
+
+
+def request(url, payload=None, timeout=5):
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=remaining(timeout)) as response:
+        body = response.read()
+        return response.status, body
+
+
+def interrupted(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, interrupted)
+signal.signal(signal.SIGINT, interrupted)
+signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError('work deadline')))
+signal.alarm(7160)
+
+try:
+    # Fail closed BEFORE imports that might initialize the TPU or any model load.
+    image = os.environ.get('GLM52_IMAGE', '')
+    if os.environ.get('GLM52_BOOTSTRAP_PROVENANCE'):
+        # Benchmark-only alternative identity: a tagged BASE is not a runtime image.
+        # The separately delivered, hashed bootstrap records the exact source/wheel
+        # and pins; the installed runtime is still checked independently below.
+        provenance = json.loads(Path(os.environ['GLM52_BOOTSTRAP_PROVENANCE']).read_text())
+        bootstrap_sha = os.environ.get('GLM52_BOOTSTRAP_SHA256', '')
+        require(re.fullmatch('[0-9a-f]{64}', bootstrap_sha), 'missing bootstrap SHA256')
+        require(image == 'us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1',
+                'bootstrap mode accepts only documented peer base tag')
+        require(provenance.get('schema_version') == 1 and all(provenance.get(k) == v for k, v in {
+            'base_image': image, 'source_commit': os.environ.get('SOURCE_COMMIT'),
+            'source_repo': 'https://github.com/sgl-project/sglang-torchtpu.git',
+            'bootstrap_sha256': bootstrap_sha,
+            'wheel': 'torch_tpu-0.2.1.dev20261028201649-cp312-cp312-manylinux_2_31_x86_64.whl',
+            'wheel_sha256': '6e12816e92f9a5d9649358541f332f06583ccdfee5b6a74434dbf2141757fd82',
+            'peer_experiment': 'exp-bsvzoblh0d', 'peer_task_status': 'succeeded',
+        }.items()), 'bootstrap provenance does not match documented peer identity')
+        require(provenance.get('peer_setup_sha256') ==
+                'e13506f849a5f7fef901cce7730a0bb1fdabe125b3eba4173475f59dfbff7a00',
+                'extracted peer bootstrap provenance mismatch')
+        save('bootstrap-provenance.json', provenance)
+        result['bootstrap_provenance'] = provenance
+    else:
+        require(re.fullmatch(r'[^\s<>]+@sha256:[0-9a-f]{64}', image),
+                'GLM52_IMAGE must be a user-provided immutable image digest; no default image')
+    require('lmsysorg/sglang:v0.1.0-tpu' not in image, 'known mismatched public image rejected')
+    require(RANK in (0, 1) and os.environ.get('FALCON_WORLD_SIZE') == '2',
+            'expected exactly two Falcon hosts, ranks 0 and 1 (not device ranks)')
+    expected = os.environ.get('SOURCE_COMMIT', '')
+    require(re.fullmatch('[0-9a-f]{40}', expected), 'SOURCE_COMMIT must be a full SHA')
+    actual = run(['git', 'rev-parse', 'HEAD'], 'source-sha.txt')
+    result.update(source_commit=actual, image=image)
+    require(actual == expected, 'checkout SHA differs from requested exact source')
+    require(not run(['git', 'status', '--porcelain', '--untracked-files=no'], 'source-status.txt'),
+            'tracked source modifications detected')
+    require(os.environ.get('GLM52_BASELINE_MODE', 'compiled-long-e2e') == 'compiled-long-e2e',
+            'only compiled-long-e2e is supported')
+    candidate = Path('benchmark/tpu/glm52_epic/torch_staged_loading_candidate.json')
+    require(candidate.is_file(), 'run from exact source checkout root')
+    candidate_bytes = candidate.read_bytes()
+    (OUT / candidate.name).write_bytes(candidate_bytes)
+    cfg = json.loads(candidate_bytes)
+    args = cfg['server_args']
+    for override, field in (('MODEL', 'model_path'), ('HOST', 'host'), ('PORT', 'port')):
+        require(not os.environ.get(override) or os.environ[override] == str(args[field]),
+                f'{override} conflicts with admitted candidate {field}')
+    require(os.environ.get('SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S', '480') == '480',
+            'staged startup must preserve native480s postload skew timeout')
+    runtime_env = cfg.get('runtime_env', cfg.get('runtime_envs', {}))
+    require(runtime_env.get('SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S', '480') == '480',
+            'candidate must preserve native480s postload skew timeout')
+    require(all(args.get(k) == v for k, v in {
+        'tp_size': 16, 'attn_dp_size': 16, 'dp_size': 1, 'ep_size': 16,
+        'nnodes': 2, 'device': 'tpu', 'model_path': '/models/GLM5.2-fp8-channel-wise'
+        }.items()), 'candidate mesh/model contract changed')
+    contract = {'enable_torch_compile': True, 'context_length': 135168,
+                'max_total_tokens': 147456, 'chunked_prefill_size': 32768,
+                'max_prefill_tokens': 32768, 'page_size': 64,
+                'max_running_requests': 32, 'torch_compile_max_bs': 32,
+                'tpu_compile_bs': [1, 2, 4, 8, 16, 32], 'tpu_compile_tokens': [2048]}
+    require(all(args.get(k) == v for k, v in contract.items()), 'compiled shape contract changed')
+    require(not any('xla_dump_' in value for value in
+                    (os.environ.get('XLA_FLAGS', ''), os.environ.get('LIBTPU_INIT_ARGS', ''),
+                     runtime_env.get('XLA_FLAGS', ''), runtime_env.get('LIBTPU_INIT_ARGS', ''))),
+            'compiler dumps are not permitted for staged E2E')
+    require(args.get('weight_loader_disable_mmap') is True and
+            args.get('weight_loader_prefetch_checkpoints') is False and
+            args.get('enable_eplb') is False, 'staged E2E reader contract')
+    result['candidate_sha256'] = hashlib.sha256(candidate_bytes).hexdigest()
+    pins = {'torch': '2.11.0+cpu', 'jax': '0.11.2', 'jaxlib': '0.11.2',
+            'libtpu': '0.0.50', 'torch_tpu': '0.2.1.dev20261028201649',
+            'tpu-sync-torch': '0.0.1.dev20261031081414'}
+    versions = {key: importlib.metadata.version(key) for key in pins}
+    save('versions.json', versions)
+    result['versions'] = versions
+    # The checkout's torch==2.11.0 pin resolves to its +cpu build for PrivateUse1.
+    require(versions['torch'] in ('2.11.0', '2.11.0+cpu'), 'torch must be pinned 2.11.0 CPU ABI')
+    require(all(versions[k] == v for k, v in pins.items() if k != 'torch'),
+            f'installed runtime mismatch: {versions}; no runtime repair/install is allowed')
+    result['versions'] = versions
+    save('versions.json', versions)
+    require(os.environ.get('TPU_TOPOLOGY') == '2x2x2', 'expected physical 2x2x2 chip slice')
+    hosts = os.environ.get('TPU_WORKER_HOSTNAMES', '').split(',')
+    require(len(hosts) == 2 and len(set(hosts)) == 2 and all(
+        h and not h.startswith('USER_') and ':' not in h and not any(c.isspace() for c in h) for h in hosts),
+        'require ordered TPU_WORKER_HOSTNAMES with exactly two distinct bare hostnames')
+    if 'TPU_WORKER_ID' in os.environ:
+        require(os.environ['TPU_WORKER_ID'] == str(RANK), 'Falcon and input TPU host ranks disagree')
+    for key, value in [('FALCON_JAX_PROCESS_COUNT', '2'), ('FALCON_JAX_PROCESS_ID', str(RANK))]:
+        if key in os.environ:
+            require(os.environ[key] == value, f'{key} conflicts with two-host Falcon mapping')
+    for key in ('TPU_VISIBLE_CHIPS', 'FORCE_SINGLE_HOST', 'SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE'):
+        require(not os.environ.get(key), f'{key} is incompatible with full native slice')
+    # TPU runtimes may expose VFIO rather than legacy /dev/accelN nodes.
+    # Device-file counts are not a physical topology API; native coordinate
+    # discovery below must succeed before the server can initialize its mesh.
+    devices = sorted(glob.glob('/dev/accel[0-9]*') + glob.glob('/dev/accel/accel[0-9]*')
+                     + glob.glob('/dev/vfio/[0-9]*'))
+    os.environ.update(NODE_RANK=str(RANK), RANK0_HOST=hosts[0], DIST_INIT_ADDR=hosts[0]+':10011',
+        TPU_WORKER_ID=str(RANK), TORCH_TPU_TOPOLOGY='2,2,2,2', TORCH_TPU_DEVICES_PER_HOST='8',
+        TORCH_TPU_BASE_PORT='8070', SGLANG_PLATFORM='tpu', SGLANG_USE_RAY='0',
+        HOME='/tmp/tpu_logs/home', XDG_CACHE_HOME='/tmp/tpu_logs/cache',
+        TMPDIR='/tmp/tpu_logs/tmp', PIP_CACHE_DIR='/tmp/tpu_logs/pip-cache',
+        UV_CACHE_DIR='/tmp/tpu_logs/uv-cache', JAX_COMPILATION_CACHE_DIR='/tmp/tpu_logs/jax-cache',
+        RUN_DIR=str(OUT),
+        # Disable implicit /dev/shm tier2; all cache writes stay under /tmp.
+        ENABLE_COMPILE_CACHE='0', TORCH_TPU_TIER2_COMPILATION_CACHE='disabled',
+        TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT='/tmp/tpu_logs/torch-cache',
+        TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT='/tmp/tpu_logs/torch-cache',
+        PYTHONDONTWRITEBYTECODE='1', PYTHONUNBUFFERED='1')
+    for name in ('HOME', 'TMPDIR', 'XDG_CACHE_HOME', 'PIP_CACHE_DIR', 'UV_CACHE_DIR',
+                 'JAX_COMPILATION_CACHE_DIR'):
+        Path(os.environ[name]).mkdir(parents=True, exist_ok=True)
+    # Probe only native physical coordinates in an isolated process, no JAX client
+    # or PJRT distributed world survives to contend with the real server.
+    coords = run([sys.executable, '-m', 'sglang_tpu.node_normalization',
+                  '--print_local_device_coords'], 'native-coordinate-probe.log', 180)
+    # Validate CLI/config before potentially reading hundreds of GiB.
+    run([sys.executable, '-m', 'benchmark.tpu.glm52_epic.validate_staged_cli'],
+        'staged-native-cli-parse.log', 120)
+    run([sys.executable, '-m', 'benchmark.tpu.launch_server', '--config', '@'+str(candidate),
+         '--dry-run'], 'native-dry-run.json')
+    result['coordinate_probe'] = coords
+    # Staged loading: Falcon pod order is NOT physical
+    # host order: use the same native rank calculation as normalization, never
+    # FALCON_RANK to choose the host's expert union. Reader still checks actual
+    # constructed MoE layouts before any payload pruning.
+    require(args.get('weight_loader_prefetch_checkpoints', False) is False,
+            'EP-local mode cannot combine mmap-only prefetch')
+    require(args.get('enable_eplb', False) is False,
+            'host union preparation requires static contiguous EP ownership')
+    require(os.environ.get('SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS', '0') == '0',
+            'selective loading requested but EP-local kill switch is enabled')
+    mapping_code = '''import json
+from sglang_tpu.node_normalization import TopologyConfig, query_node_rank
+import os
+cfg=TopologyConfig(hosts=tuple(os.environ['TPU_WORKER_HOSTNAMES'].split(',')),topology=(2,2,2,2))
+rank=query_node_rank(cfg,int(os.environ['FALCON_RANK']),180)
+print('GLM52_PREP_PHYSICAL_RANK '+json.dumps({'rank':rank}))
+'''
+    mapping = run([sys.executable, '-c', mapping_code], 'host-preparation-rank.log', 240)
+    entries = [json.loads(line.split(' ', 1)[1]) for line in mapping.splitlines()
+               if line.startswith('GLM52_PREP_PHYSICAL_RANK ')]
+    require(len(entries) == 1 and entries[0]['rank'] in (0, 1),
+            'missing unique physical host rank for preparation')
+    physical_rank = entries[0]['rank']
+    prep = run([sys.executable, '-m', 'benchmark.tpu.glm52_epic.prepare_host_checkpoint',
+                args['model_path'], '--expert-start', str(physical_rank * 128),
+                '--expert-end', str((physical_rank + 1) * 128), '--execute'],
+               'host-preparation.log', 900)
+    markers = [json.loads(line.split(' ', 1)[1]) for line in prep.splitlines()
+               if line.startswith('HOST_PREPARE_PASS ')]
+    require(len(markers) == 1 and not markers[0]['slice_only'] and
+            not markers[0]['unindexed_not_prepared'],
+            'host checkpoint preparation incomplete')
+    result['host_preparation'] = dict(physical_rank=physical_rank, **markers[0])
+    # Both hosts must finish potentially skewed cold reads BEFORE native
+    # normalization's short TCPStore timeout starts. Reuse the bootstrap's
+    # per-allocation shared artifact rendezvous, never a stale global flag.
+    allocation = os.environ.get('GLM52_RENDEZVOUS_ID', '')
+    require(re.fullmatch('[A-Za-z0-9_-]+', allocation),
+            'staged loading requires unique allocation rendezvous id')
+    shared = os.environ.get('ARTIFACT_LOCAL_DIR', '')
+    require(shared.startswith('/'), 'staged loading requires shared artifact directory')
+    prep_root = Path(shared) / 'host-preparation-rendezvous' / allocation
+    prep_root.mkdir(parents=True, exist_ok=True)
+    record = dict(falcon_rank=RANK, physical_rank=physical_rank, source_commit=actual,
+                  allocation=allocation, index_sha256=markers[0]['index_sha256'])
+    temp = prep_root / f'.rank-{RANK}-{os.getpid()}.tmp'
+    temp.write_text(json.dumps(record) + '\n')
+    os.replace(temp, prep_root / f'rank-{RANK}.json')
+    prep_deadline = time.monotonic() + remaining(930)
+    while True:
+        try:
+            peers = [json.loads((prep_root / f'rank-{rank}.json').read_text())
+                     for rank in range(2)]
+            require({p['physical_rank'] for p in peers} == {0, 1},
+                    'preparation physical host assignment is not a permutation')
+            for rank, peer in enumerate(peers):
+                require(peer['falcon_rank'] == rank and all(peer[k] == record[k]
+                        for k in ('source_commit', 'allocation', 'index_sha256')),
+                        'preparation peer identity mismatch')
+            save('host-preparation-peers.json', peers)
+            break
+        except (FileNotFoundError, json.JSONDecodeError):
+            require(time.monotonic() < prep_deadline,
+                    'peer host checkpoint preparation did not finish within930s')
+            time.sleep(1)
+    result['topology'] = {'physical_chips': 8, 'hosts': hosts, 'physical_chip_nodes': devices,
+                          'devices_per_host': 8, 'total_devices': 16,
+                          'chip_topology': '2x2x2', 'native_topology': '2,2,2,2'}
+    save('preflight.json', result)
+    # Native Engine startup performs the cross-host coordinate exchange, verifies
+    # complete physical assignment and normalizes pod-index -> physical host rank.
+    # Its input leader forwards HTTP if the physical rank-zero host changes.
+
+    class Control(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != '/status':
+                self.send_error(404)
+                return
+            payload = json.dumps(state).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            if self.path != '/ack':
+                self.send_error(404)
+                return
+            state['peer_ack'] = True
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    if RANK == 0:
+        control = http.server.ThreadingHTTPServer(('0.0.0.0', 31001), Control)
+        threading.Thread(target=control.serve_forever, daemon=True).start()
+    server_log = (OUT / 'server.log').open('wb', buffering=0)
+    command = [sys.executable, '-u', '-m', 'benchmark.tpu.launch_server', '--config',
+               '@'+str(candidate), '--shutdown-grace', '25']
+    save('command.json', command)
+    launcher = subprocess.Popen(command, stdout=server_log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    if RANK == 0:
+        while True:
+            check_child()
+            try:
+                code, body = request('http://127.0.0.1:30000/health')
+                if code == 200:
+                    (OUT / 'health.body').write_bytes(body)
+                    break
+            except (OSError, urllib.error.URLError):
+                pass
+            time.sleep(1)
+        smoke_tokens, smoke_outputs = 12288, 16
+        request_body = {'input_ids': [1] * smoke_tokens, 'sampling_params': {
+            'temperature': 0, 'max_new_tokens': smoke_outputs, 'ignore_eos': True}, 'stream': False}
+        save('generate-request.json', request_body)
+        code, body = request('http://127.0.0.1:30000/generate', request_body, timeout=600)
+        (OUT / 'generate-response.json').write_bytes(body)
+        response = json.loads(body)
+        require(code == 200 and isinstance(response, dict), '/generate failed')
+        meta = response.get('meta_info', {})
+        require(meta.get('prompt_tokens') == smoke_tokens,
+                f'smoke prompt token accounting mismatch: expected {smoke_tokens}')
+        require(meta.get('completion_tokens') == smoke_outputs,
+                f'smoke did not produce exactly {smoke_outputs} tokens')
+        require(meta.get('finish_reason', {}).get('type') != 'abort', 'generation aborted')
+        ids = response.get('output_ids')
+        # Current native response includes IDs; never silently treat absence as success.
+        require(isinstance(ids, list) and len(ids) == smoke_outputs
+                and all(type(token) is int for token in ids),
+                f'current native /generate must return {smoke_outputs} output token IDs')
+        local_chunk = args['chunked_prefill_size'] // args['attn_dp_size']
+        result['configured_local_chunk_ceiling'] = local_chunk
+        result['attention_path_runtime_verified'] = False
+        result.update(health_status=200, generate_status=code, output_ids=ids,
+                      request_success_count=1, generate_input_tokens=len(request_body['input_ids']),
+                      expected_attention_path='candidate_default_attention_path')
+        check_child()
+        if os.environ.get('GLM52_TEXT_E2E') == '1':
+            try:
+                run([sys.executable, '-m', 'benchmark.tpu.glm52_epic.text_e2e_client',
+                     '--base-url', 'http://127.0.0.1:30000', '--output', str(OUT / 'text-e2e'),
+                     *(['--tokenizer-path', '/models/GLM5.2-fp8-channel-wise']
+                       if os.environ.get('GLM52_TEXT_CHAT_TEMPLATE') == '1' else [])],
+                    'text-e2e-client.log', 3600)
+            finally:
+                for evidence in [OUT / 'text-e2e-client.log', *sorted((OUT / 'text-e2e').glob('*.json'))]:
+                    if evidence.is_file():
+                        print('GLM52_TEXT_EVIDENCE ' + evidence.name + '\\n' +
+                              evidence.read_text(errors='replace'), flush=True)
+                import shutil
+                artifact = Path(os.environ['ARTIFACT_LOCAL_DIR'])
+                require(artifact.is_absolute(), 'absolute Falcon artifact mount required')
+                text_archive = artifact / 'text-e2e' / f'host-{RANK}'
+                require(not text_archive.exists(), 'text evidence archive must be fresh')
+                text_archive.mkdir(parents=True, exist_ok=False)
+                if (OUT / 'text-e2e').is_dir():
+                    shutil.copytree(OUT / 'text-e2e', text_archive / 'responses')
+                if (OUT / 'text-e2e-client.log').is_file():
+                    shutil.copy2(OUT / 'text-e2e-client.log', text_archive / 'client.log')
+            text_result = json.loads((OUT / 'text-e2e/result.json').read_text())
+            result['text_e2e'] = text_result
+            print('GLM52_TEXT_E2E_RESULT ' + json.dumps(text_result), flush=True)
+            require(text_result['status'] == 'TEXT_E2E_PASS', 'real text sanity failed')
+            check_child()
+        if os.environ.get('GLM52_NATIVE_LONG_PERF') == '1':
+            try:
+                run([sys.executable, '-m', 'benchmark.tpu.glm52_epic.native_long_client',
+                     '--base-url', 'http://127.0.0.1:30000', '--output', str(OUT / 'native-long')],
+                    'native-long-client.log', 3600)
+            finally:
+                for evidence in [OUT / 'native-long-client.log', *sorted((OUT / 'native-long').glob('*.json'))]:
+                    if evidence.is_file():
+                        print('GLM52_NATIVE_LONG_EVIDENCE ' + evidence.name + '\\n' + evidence.read_text(errors='replace'), flush=True)
+            result['native_long'] = json.loads((OUT / 'native-long/result.json').read_text())
+            check_child()
+        state['status'] = 'SUCCEEDED'
+        while not state['peer_ack']:
+            check_child()
+            time.sleep(0.2)
+    else:
+        while True:
+            check_child()
+            try:
+                _, body = request('http://'+hosts[0]+':31001/status')
+                remote = json.loads(body)
+                require(remote['status'] != 'FAILED', 'input rank0 reported smoke failure')
+                if remote['status'] == 'SUCCEEDED':
+                    check_child()
+                    request('http://'+hosts[0]+':31001/ack', {})
+                    result['rank0_smoke_acknowledged'] = True
+                    break
+            except (OSError, urllib.error.URLError):
+                pass
+            time.sleep(1)
+    native_text = (OUT / 'server.log').read_text(errors='replace')
+    require('EP-local expert reads off (' not in native_text,
+            'staged loading silently fell back to whole shards')
+    # Current reader logs only global rank0; that process is on physical
+    # host0, which need not be Falcon host0. Do not require duplicate logs.
+    if result['host_preparation']['physical_rank'] == 0:
+        require("Reading only this EP rank's routed experts: ids [0, 16)" in native_text,
+                'missing native reader activation evidence on physical rank0')
+    result['selective_reader_log_verified'] = True
+    result['status'] = 'SUCCEEDED'
+except BaseException as error:
+    state['status'] = 'FAILED'
+    result['error'] = f'{type(error).__name__}: {error}'
+    if prep_root is not None:
+        try:
+            temp = prep_root / f'.failure-{RANK}-{os.getpid()}.tmp'
+            temp.write_text(json.dumps(dict(falcon_rank=RANK, error=result['error']))+'\n')
+            os.replace(temp, prep_root / f'failure-{RANK}.json')
+        except OSError:
+            pass  # Existing global work deadline remains the final bound.
+    traceback.print_exc()
+finally:
+    signal.alarm(0)
+    # Preserve the boundary before our own TERM/KILL can change process evidence.
+    cleanup_boundary = {'time_ns': time.time_ns(), 'falcon_rank': RANK,
+                        'status': result['status'], 'error': result.get('error'),
+                        'launcher_pid': None if launcher is None else launcher.pid,
+                        'launcher_returncode_before_cleanup': (
+                            None if launcher is None else launcher.poll())}
+    save('cleanup-boundary.json', cleanup_boundary)
+    print('GLM52_CLEANUP_BEGIN ' + json.dumps(cleanup_boundary), flush=True)
+    # The native launcher owns separate server process groups. SIGTERM it first
+    # so its finally block reaps workers; capture descendant groups as fallback.
+    if launcher is not None:
+        descendants = {launcher.pid}
+        for _ in range(32):
+            before = len(descendants)
+            for proc in Path('/proc').glob('[0-9]*/stat'):
+                try:
+                    fields = proc.read_text().rsplit(')', 1)[1].split()
+                    if int(fields[1]) in descendants:
+                        descendants.add(int(proc.parent.name))
+                except (OSError, ValueError, IndexError):
+                    pass
+            if len(descendants) == before:
+                break
+        groups = set()
+        for pid in descendants:
+            try:
+                groups.add(os.getpgid(pid))
+            except ProcessLookupError:
+                pass
+        try:
+            launcher.send_signal(signal.SIGTERM)
+            launcher.wait(timeout=32)
+        except subprocess.TimeoutExpired:
+            result.update(status='FAILED', cleanup_error='native launcher did not stop within 32s')
+        for group in groups:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        launcher.wait(timeout=3)
+        result['launcher_shutdown_exit_code'] = launcher.returncode
+    if server_log:
+        server_log.close()
+    if control:
+        control.shutdown()
+        control.server_close()
+    result['elapsed_seconds'] = round(time.monotonic() - START, 3)
+    save('result.json', result)
+    print(json.dumps(result, sort_keys=True), flush=True)
+    # Replay WHOLE native server log to Falcon's durable stdout sink, including
+    # on failure; the untruncated /tmp copy also remains available for exp cp.
+    if (OUT / 'server.log').exists():
+        print(f'===== BEGIN WHOLE SERVER LOG rank={RANK} =====', flush=True)
+        with (OUT / 'server.log').open('rb') as stream:
+            while chunk := stream.read(1024 * 1024):
+                sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+        print(f'===== END WHOLE SERVER LOG rank={RANK} =====', flush=True)
+sys.exit(0 if result['status'] == 'SUCCEEDED' else 1)
+PY

@@ -1,0 +1,22 @@
+{
+  "torch": [
+    "python/sglang/srt/hardware_backend/tpu/dsv4/streamindex_topk/streamindex_topk.py",
+    "python/sglang/srt/layers/attention/pallas/mla_sparse/kernel.py",
+    "python/sglang/srt/layers/rotary_embedding/rope_variant.py",
+    "sglang_tpu/attention/pallas/mla_sparse/kernel.py",
+    "sglang_tpu/dsv4/streamindex_topk/streamindex_topk.py",
+    "sglang_tpu/attention/pallas/mla_sparse/dsa_gather.py",
+    "sglang_tpu/dsv4/sparsecore_topk.py"
+  ],
+  "jax": [
+    "python/sgl_jax/srt/configs/dsa_config.py",
+    "python/sgl_jax/srt/kernels/dsa/exact_attention.py",
+    "python/sgl_jax/srt/kernels/dsa/fp8_attention.py",
+    "python/sgl_jax/srt/kernels/dsa/indexer.py",
+    "python/sgl_jax/srt/kernels/dsa/paged_score.py",
+    "python/sgl_jax/srt/kernels/dsa/topk.py",
+    "python/sgl_jax/srt/kernels/quantized_matmul/kernel.py",
+    "python/sgl_jax/srt/kernels/quantized_matmul/quantized_matmul_kernels/kernel.py",
+    "python/sgl_jax/srt/layers/attention/dsa_indexer_ops.py"
+  ]
+}
