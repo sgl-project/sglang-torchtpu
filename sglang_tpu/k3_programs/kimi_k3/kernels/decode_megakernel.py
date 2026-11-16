@@ -9376,6 +9376,14 @@ def stack(
                         consume_attention(run_latent_attention),
                         consume_attention(run_delta_attention),
                     )
+                elif _config().decode_kda_branch_first:
+                    # The delta (KDA) branch first: the instruction overlays then
+                    # place the post-join code so KDA layers (68 of 92) miss less.
+                    jax.lax.cond(
+                        (layer_index % 4 != 3) & (layer_index != 92),
+                        run_delta_attention,
+                        run_latent_attention,
+                    )
                 else:
                     jax.lax.cond(
                         (layer_index % 4 == 3) | (layer_index == 92),

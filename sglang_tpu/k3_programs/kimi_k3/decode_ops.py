@@ -502,11 +502,14 @@ class DecodeOps:
     def _compiler_options(rows: int) -> dict[str, str]:
         config = kernel_config.active()
         dp_rows = rows in (2, 4) and config.attention_dp > 1
+        options = {}
         if (
             rows in (8, 16, 24, 32, 48, 64, 80, 96, 128) or dp_rows
         ) and config.decode_no_hlo_calls:
-            return {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
-        return {}
+            options["xla_tpu_enable_deduplicated_calls"] = "DISABLED"
+        if rows in (8, 16) and config.decode_tc_all_reduce:
+            options["xla_tpu_enable_sparse_core_collective_offload_all_reduce"] = "false"
+        return options
 
     def _build_mask_pack(self, control: Any, batch: int) -> Any:
         """Keep the masked plain step within Torch's 64-operand limit: pack

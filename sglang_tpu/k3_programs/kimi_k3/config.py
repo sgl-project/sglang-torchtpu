@@ -96,6 +96,12 @@ class KernelConfig:
     # many slots, folded once when full and at each row's last step (instead
     # of one fold a step). 0: fold every compact step.
     dsa_compact_window: int = 0
+    # Decode layer loop: test KDA first in the layer-type branch, so the
+    # instruction overlays place the post-join code for the 68 KDA layers.
+    decode_kda_branch_first: bool = True
+    # 8- and 16-row decode steps: keep the small embedding all-reduce on the
+    # TensorCore instead of the SparseCore collective offload.
+    decode_tc_all_reduce: bool = False
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
