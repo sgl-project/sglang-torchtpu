@@ -2980,14 +2980,20 @@
       "automatic_shard_selection_real_index": "original shards 270-274, 1569 MTP tensors",
       "full_8_chip_E2E_on_updated_PR_head": "not rerun",
       "PR_state": "ready",
-      "base_CI_run": 43884646093,
-      "TPU_CI_run": 43884646347,
+      "base_CI_run": 43892616327,
+      "TPU_CI_run": 43892616291,
       "MTP_shard_filter": {
         "env": "SGLANG_ENABLE_MTP_SHARD_FILTER",
         "default": false,
         "case_use": "explicitly enabled only in the audited GLM-5.2 benchmark launch environment",
         "scope": "default off preserves original model/quantization recipe read set; enabled mode assumes complete index; no SHA or fixed model/quantization gate"
-      }
+      },
+      "previous_head_CI_runs": {
+        "head": "ed78e85c42",
+        "base": 43884646093,
+        "TPU": 43884646347
+      },
+      "CI_scope": "new-head runs dispatched; not a passing CI or new-head full-model E2E claim"
     }
   }
 }
