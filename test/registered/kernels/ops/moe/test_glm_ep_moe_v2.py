@@ -456,15 +456,57 @@ def record_nonfinite(
                 local_rows=local_rows,
                 routing=routing,
                 shared=shared,
-                rows=rows,
+                rows=rows if rank == 0 else None,
                 bad_valid_rows=int((bad & (route_count > 0)).sum()),
                 bad_invalid_rows=int((bad & (route_count == 0)).sum()),
-                route_count_at_bad_rows=route_count[bad].tolist(),
+                route_count_at_bad_rows=route_count[bad].tolist()
+                if rank == 0
+                else None,
                 artifact=str(path),
             )
         ),
         flush=True,
     )
+    if rank == 0:
+        valid_ids = ids[ids >= 0].unique().tolist()
+        bad_features = (~got.isfinite()).sum(-1)
+        histogram = {}
+        for count in bad_features.tolist():
+            histogram[count] = histogram.get(count, 0) + 1
+        amax = x.float().abs().amax(-1).numpy()
+        scale = np.maximum(amax / np.float32(448), np.float32(1e-12))
+        bits = scale.astype(np.float32).view(np.uint32)
+        good_rows = (~bad).nonzero().flatten().tolist()
+        sample = rows[:16] + good_rows[:8]
+        print(
+            json.dumps(
+                dict(
+                    event="nonfinite_correlation",
+                    routing=routing,
+                    shared=shared,
+                    bad_feature_histogram=histogram,
+                    expert_rows=[
+                        dict(
+                            expert=int(expert),
+                            selected=int((ids == expert).any(-1).sum()),
+                            bad=int(((ids == expert).any(-1) & bad).sum()),
+                        )
+                        for expert in valid_ids
+                    ],
+                    row_samples=[
+                        dict(
+                            row=i,
+                            bad_features=int(bad_features[i]),
+                            ids=ids[i].tolist(),
+                            x_amax=float(amax[i]),
+                            scale_bits=f"{int(bits[i]):08x}",
+                        )
+                        for i in sample
+                    ],
+                )
+            ),
+            flush=True,
+        )
 
 
 def worker(*, case_filter=None, include_loading=True, include_large=True):
