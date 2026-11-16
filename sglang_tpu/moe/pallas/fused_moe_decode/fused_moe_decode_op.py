@@ -15,6 +15,10 @@ other batch (extend/prefill, mixed chunked prefill, speculative target-verify
 and draft-extend, and decode batches above the threshold) uses the regular
 `gmm_v2` path.
 
+Layers with tensor-parallel experts (`moe_ep_size == 1`, attention TP over the
+whole world) run `moe_tp_decode` instead, for decode batches up to the largest
+row bucket that kernel admits (64 tokens); see `sglang_tpu.moe.pallas.moe_tp_decode`.
+
 Because the kernel returns an already all-reduced output, the decoder layer
 must tell its FFN boundary not to sum it again (`summed_by_compute`). Only MoE
 blocks whose decoder layer does that set `allow_tpu_fused_moe_decode = True`
@@ -401,8 +405,19 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
     parallel = get_parallel()
     tp_size = parallel.tp_size
     ep_size = parallel.moe_ep_size
-    if tp_size < 1 or ep_size != tp_size or parallel.pp_size > 1:
+    if tp_size < 1 or parallel.pp_size > 1:
         return False
+    if ep_size == tp_size:
+        mode = "ep"
+    else:
+        # Tensor-parallel experts run the moe_tp_decode kernel instead.
+        from sglang_tpu.moe.pallas.moe_tp_decode.op import moe_tp_layout_reason
+
+        reason = moe_tp_layout_reason()
+        if reason is not None:
+            logger.debug("fused_moe_decode disabled: %s", reason)
+            return False
+        mode = "tp"
 
     experts = getattr(moe_layer, "experts", None)
     if experts is None:
@@ -482,16 +497,30 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
     )
     swiglu_limit = _resolve_swiglu_limit(moe_layer, experts, shared)
 
-    # Eagerly build the custom op outside torch.compile / Dynamo tracing.
-    _get_op(tp_size, routed_scaling_factor, swiglu_limit, has_shared=has_shared)
+    max_tokens = get_fused_moe_decode_max_tokens()
+    if mode == "tp":
+        from sglang_tpu.moe.pallas.moe_tp_decode.op import prepare_moe_tp_decode
 
+        if not has_shared:
+            return False
+        admitted = prepare_moe_tp_decode(
+            moe_layer, experts, routed_scaling_factor, swiglu_limit
+        )
+        if admitted == 0:
+            return False
+        max_tokens = min(max_tokens, admitted)
+    else:
+        # Eagerly build the custom op outside torch.compile / Dynamo tracing.
+        _get_op(tp_size, routed_scaling_factor, swiglu_limit, has_shared=has_shared)
+
+    moe_layer._tpu_fused_moe_decode_mode = mode
     moe_layer._tpu_fused_moe_decode_ready = True
     moe_layer._tpu_fused_moe_decode_has_shared = has_shared
     moe_layer._tpu_fused_moe_decode_world_size = int(tp_size)
     moe_layer._tpu_fused_moe_decode_ep_rank = int(parallel.moe_ep_rank)
     moe_layer._tpu_fused_moe_decode_routed_scale = routed_scaling_factor
     moe_layer._tpu_fused_moe_decode_swiglu_limit = swiglu_limit
-    moe_layer._tpu_fused_moe_decode_max_tokens = get_fused_moe_decode_max_tokens()
+    moe_layer._tpu_fused_moe_decode_max_tokens = max_tokens
     return True
 
 
@@ -500,19 +529,21 @@ def prepare_model_for_fused_moe_decode(model: torch.nn.Module) -> int:
     if not is_fused_moe_decode_enabled():
         return 0
 
-    prepared = 0
+    prepared = []
     for module in model.modules():
         if getattr(module, "allow_tpu_fused_moe_decode", False):
             if prepare_moe_layer_for_fused_decode(module):
-                prepared += 1
+                prepared.append(module)
 
-    if prepared > 0:
+    if prepared:
+        modes = sorted({m._tpu_fused_moe_decode_mode for m in prepared})
         logger.info(
-            "Prepared TPU fused_moe_decode kernel on %d MoE layers (max_tokens=%d).",
-            prepared,
-            get_fused_moe_decode_max_tokens(),
+            "Prepared TPU fused_moe_decode kernel on %d MoE layers (mode=%s, max_tokens=%d).",
+            len(prepared),
+            ",".join(modes),
+            min(m._tpu_fused_moe_decode_max_tokens for m in prepared),
         )
-    return prepared
+    return len(prepared)
 
 
 def should_use_fused_moe_decode(
@@ -557,6 +588,11 @@ def apply_fused_moe_decode(
     topk_weights, topk_ids, _ = topk_output
     topk_ids = topk_ids.to(torch.int32)
     topk_weights = topk_weights.to(torch.float32)
+
+    if moe_layer._tpu_fused_moe_decode_mode == "tp":
+        from sglang_tpu.moe.pallas.moe_tp_decode.op import apply_moe_tp_decode
+
+        return apply_moe_tp_decode(moe_layer, hidden_states, topk_ids, topk_weights)
 
     experts = moe_layer.experts
     world_size = int(moe_layer._tpu_fused_moe_decode_world_size)

@@ -355,21 +355,20 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             if video_grid_thw is not None
             else None
         )
-        position_ids = None
-        if host_image_grid_thw is not None or host_video_grid_thw is not None:
-            position_ids, _ = self.model.get_rope_index(
-                host_ids,
-                host_image_grid_thw,
-                host_video_grid_thw,
-                attention_mask=torch.ones_like(host_ids),
-            )
+        # Positions depend only on host token and grid metadata, so resolve
+        # them on the host before the transfer, for text-only requests too.
+        position_ids, _ = self.model.get_rope_index(
+            host_ids,
+            host_image_grid_thw,
+            host_video_grid_thw,
+            attention_mask=torch.ones_like(host_ids),
+        )
         ids = host_ids.to(self.device)
         call_kwargs: dict[str, Any] = {
             "input_ids": ids,
             "attention_mask": torch.ones_like(ids),
+            "position_ids": position_ids.to(self.device),
         }
-        if position_ids is not None:
-            call_kwargs["position_ids"] = position_ids.to(self.device)
         if pixel_values is not None:
             call_kwargs["pixel_values"] = pixel_values.to(self.device, torch.bfloat16)
             call_kwargs["image_grid_thw"] = host_image_grid_thw

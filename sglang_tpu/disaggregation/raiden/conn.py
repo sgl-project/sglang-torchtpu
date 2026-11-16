@@ -76,7 +76,7 @@ from sglang_tpu.disaggregation.raiden.host_pool import (
     slots_within_budget,
     split_staging_layers,
 )
-from sglang_tpu.disaggregation.raiden.pp_common import (
+from sglang_tpu.disaggregation.raiden.pool_spans import (
     _BLOCK_MAJOR_KV_RANK,
     _FUSED_KV_RANK,
 )
@@ -492,9 +492,11 @@ class RaidenKVManager(
                     "pipeline parallelism or "
                     f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
                 )
-            from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
+            from sglang_tpu.disaggregation.raiden.pool_transfer import (
+                RaidenPoolTransfer,
+            )
 
-            pipeline = PipelineTransfer(self, kv_caches)
+            pipeline = RaidenPoolTransfer(self, kv_caches)
             self._engine = pipeline.engine
             self.raiden_endpoint = pipeline.controller
             self.chunked_transfer = False

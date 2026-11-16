@@ -37,11 +37,10 @@ _UNSUPPORTED = (
     ("parallel.attn_cp_size", 2, "context parallelism"),
     ("mambaish", object(), "GDN/Mamba"),
     ("scheduler.spec_algorithm.is_none", lambda: False, "speculative decoding"),
-    ("scheduler.model_config.is_hybrid_swa", True, "hybrid sliding-window models"),
     (
         "scheduler.model_config.is_hybrid_swa_compress",
         True,
-        "hybrid sliding-window models",
+        "compressed window state",
     ),
     ("missing_api", ["register_read(source=)"], "(missing register_read(source=))"),
     (
@@ -112,6 +111,32 @@ class TestEngineRefusals(CustomTestCase):
                 "SGLANG_RAIDEN_PIPELINE_TRANSFER",
             ):
                 validate_engine_as(engine, role="decode")
+
+
+class TestHybridModels(CustomTestCase):
+    def _hybrid(self):
+        engine = supported_engine()
+        engine.scheduler.model_config.is_hybrid_swa = True
+        return engine
+
+    def test_hybrid_model_is_accepted_with_its_host_tier_of_windows(self):
+        engine = self._hybrid()
+        engine.scheduler.tree_cache.tree_core.has_swa_host_pool = True
+        validate_engine_as(engine)
+        # A window cannot be cut to whole pages of one token.
+        engine.scheduler.server_args.page_size = 1
+        with self.assertRaisesRegex(
+            startup_validation.UnsupportedDramOffloadConfig, "--page-size > 1"
+        ):
+            validate_engine_as(engine)
+
+    def test_hybrid_model_needs_the_host_tier_of_windows(self):
+        engine = self._hybrid()
+        with self.assertRaisesRegex(
+            startup_validation.UnsupportedDramOffloadConfig,
+            "host tier of SWA windows",
+        ):
+            validate_engine_as(engine)
 
 
 class TestTpuSyncHostApi(CustomTestCase):

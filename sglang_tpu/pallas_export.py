@@ -37,28 +37,33 @@ def get_pallas_tpu_device_kind() -> str:
 @contextmanager
 def tpu_info_for_cpu_export():
     """Ensure Pallas kernels receive physical TPU7x hardware metadata during export."""
+    from jax._src import tpu_info as core_tpu_info
     from jax._src.pallas.mosaic import tpu_info
     from jax.experimental.pallas import tpu as pltpu
 
+    # Since JAX 0.11, jax._src.pallas.mosaic.tpu_info only re-exports
+    # jax._src.tpu_info. Mosaic lowering reads the re-export, while tiling
+    # inference and lax lowerings read the core module, so patch both.
+    patched = ("get_tpu_info", "get_device_kind", "is_tpu_device")
+    modules = (tpu_info, core_tpu_info)
     with _TPU_INFO_PATCH_LOCK:
         original_public = pltpu.get_tpu_info
-        original_private = tpu_info.get_tpu_info
-        original_device_kind = getattr(tpu_info, "get_device_kind", None)
-        original_is_tpu_device = getattr(tpu_info, "is_tpu_device", None)
+        originals = [
+            {name: getattr(module, name) for name in patched} for module in modules
+        ]
         device_name = get_pallas_tpu_device_kind()
         chip_version = tpu_info.chip_version_from_device_kind(device_name)
         if chip_version is not None:
             info = tpu_info.get_tpu_info_for_chip(chip_version, 1)
             pltpu.get_tpu_info = lambda: info
-            tpu_info.get_tpu_info = lambda: info
-            tpu_info.get_device_kind = lambda: device_name
-            tpu_info.is_tpu_device = lambda: True
+            for module in modules:
+                module.get_tpu_info = lambda: info
+                module.get_device_kind = lambda: device_name
+                module.is_tpu_device = lambda: True
         try:
             yield
         finally:
             pltpu.get_tpu_info = original_public
-            tpu_info.get_tpu_info = original_private
-            if original_device_kind is not None:
-                tpu_info.get_device_kind = original_device_kind
-            if original_is_tpu_device is not None:
-                tpu_info.is_tpu_device = original_is_tpu_device
+            for module, original in zip(modules, originals, strict=True):
+                for name, value in original.items():
+                    setattr(module, name, value)
