@@ -3,7 +3,9 @@
 
 import contextlib
 import importlib.util
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -213,14 +215,40 @@ class TestCosmos3Transformer(_TestBase):
         # float32 attention, rounded once to bfloat16.
         torch.testing.assert_close(out.float(), expected, atol=1e-5, rtol=2**-8)
 
-    def test_host_positions_match_stock(self):
-        model = _model()
-        mask = (torch.arange(20) < 13).long()[None]
-        expected = model._compute_rope_position_ids(mask, 3, 2, 4, 24.0, "cpu")
+    def test_ulysses_ranks_match_one_rank(self):
+        heads, kv_heads, head_dim, real, rows = 4, 2, 16, 37, 300
+        gen = torch.Generator().manual_seed(0)
+        q = 4 * torch.randn(1, rows, heads, head_dim, generator=gen)
+        k_text, v_text, k_vis, v_vis = (
+            torch.randn(1, n, kv_heads, head_dim, generator=gen)
+            for n in (512, 512, rows, rows)
+        )
+
+        def prefix_attention(sp, rank=0):
+            share = slice(rank * rows // sp, (rank + 1) * rows // sp)
+            attn = SimpleNamespace(
+                attn_impl=SimpleNamespace(softmax_scale=head_dim**-0.5),
+                skip_sequence_parallel=sp == 1,
+                _tpu_text_keys=torch.tensor([0, real], dtype=torch.int32),
+            )
+            return cosmos3.prefix_attention(
+                attn, q[:, share], k_text, v_text, k_vis[:, share], v_vis[:, share]
+            )
+
+        ranks = _ThreadRanks(2)
         with _installed():
-            actual = model._compute_rope_position_ids(mask, 3, 2, 4, 24.0, "cpu")
-        for a, e in zip(actual, expected, strict=True):
-            self.assertTrue(torch.equal(a, e))
+            expected = prefix_attention(1)
+            with contextlib.ExitStack() as stack:
+                for name, value in (
+                    ("get_sp_world_size", lambda: ranks.sp),
+                    ("get_ulysses_parallel_rank", ranks.rank),
+                    ("_usp_input_all_to_all", ranks.input_a2a),
+                    ("_usp_output_all_to_all", ranks.output_a2a),
+                ):
+                    stack.enter_context(patch.object(cosmos3, name, value))
+                outputs = ranks.run(lambda: prefix_attention(2, ranks.rank()))
+        # Rank r's rows; its text keys are the heads paired with its queries.
+        torch.testing.assert_close(torch.cat(outputs, 1), expected, atol=1e-5, rtol=0)
 
     def test_gen_layers_compile_once_across_prompt_lengths(self):
         model = _model()
@@ -243,6 +271,43 @@ class TestCosmos3Transformer(_TestBase):
                 _run(model, _inputs(text_len))
         self.assertGreater(first, 0)
         self.assertEqual(len(graphs), first)
+
+
+class _ThreadRanks:
+    """Ulysses ranks as threads of one process; collectives meet at a barrier."""
+
+    def __init__(self, sp):
+        self.sp, self.slots = sp, [None] * sp
+        self.barrier, self.local = threading.Barrier(sp, timeout=60), threading.local()
+
+    def rank(self):
+        return self.local.rank
+
+    def _all(self, x):
+        self.slots[self.rank()] = x
+        self.barrier.wait()
+        parts = list(self.slots)
+        self.barrier.wait()
+        return parts
+
+    def input_a2a(self, x, head_dim):  # [1, S / sp, H, D] -> [1, S, H / sp, D]
+        heads = x.shape[head_dim] // self.sp
+        own = slice(self.rank() * heads, (self.rank() + 1) * heads)
+        return torch.cat([p[:, :, own] for p in self._all(x)], 1)
+
+    def output_a2a(self, x, head_dim):  # [1, S, H / sp, D] -> [1, S / sp, H, D]
+        rows = x.shape[1] // self.sp
+        own = slice(self.rank() * rows, (self.rank() + 1) * rows)
+        return torch.cat([p[:, own] for p in self._all(x)], head_dim)
+
+    def run(self, fn):
+        def rank_fn(rank):
+            self.local.rank = rank
+            with torch.no_grad():
+                return fn()
+
+        with ThreadPoolExecutor(self.sp) as pool:
+            return list(pool.map(rank_fn, range(self.sp)))
 
 
 def _views(tensors):

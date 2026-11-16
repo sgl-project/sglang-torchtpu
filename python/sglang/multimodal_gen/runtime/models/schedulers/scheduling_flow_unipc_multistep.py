@@ -22,11 +22,9 @@ from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
 
 
 def _einsum(equation: str, *operands: torch.Tensor) -> torch.Tensor:
-    """``torch.einsum`` over operands promoted to one dtype first.
-
-    CPU and CUDA einsum promote mixed dtypes (e.g. float32 solver weights with
-    bfloat16 model outputs) the same way; some backends require one dtype.
-    """
+    """``torch.einsum`` over operands promoted to one dtype first: float32
+    solver weights meet bfloat16 model outputs, and some backends' einsum
+    (torch_tpu) takes one dtype."""
     dtype = operands[0].dtype
     for operand in operands[1:]:
         dtype = torch.promote_types(dtype, operand.dtype)

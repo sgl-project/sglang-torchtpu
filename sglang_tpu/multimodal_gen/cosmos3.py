@@ -3,32 +3,19 @@
 
 Runtime patch, tracked debt:
 - Why: torch_tpu compiles static shapes. Each GEN layer cross-attends to the
-  text pathway's K/V at the prompt's exact token count, so every prompt
-  length compiles all GEN layers again. The text and visual RoPE ids are
-  built on the device from ``text_mask.sum``, read back with ``.item()`` for
-  every sample of every forward.
+  text K/V at the prompt's exact token count, so every prompt length compiles
+  all GEN layers again. The RoPE ids are built on the device from
+  ``text_mask.sum`` and read back with ``.item()`` on every forward.
 - How: :func:`install`
-  (1) wraps the transformer's ``__call__``: the prompt's tokens right-pad to a
-      multiple of 512 (masked, as the stock pads them), and the real token
-      count goes to every GEN cross-attention as a device int32 tensor. The
-      text pathway is causal and zeroes masked rows, so the real K/V rows are
-      the stock ones;
-  (2) builds the RoPE ids on the host, from the same functions, and moves
-      them to the device (no device-to-host read per forward);
-  (3) replaces ``USPAttention.forward_with_replicated_kv_prefix`` for
-      attentions that carry that count: queries attend the real text keys,
-      then the visual keys, as resumable kernel steps (Ulysses splits the
-      heads as the stock does). These are the keys the stock attends, and
-      padded text keys are never read. Control, action and sound calls, and
-      ring or K/V-gather SP, run the stock transformer and attention;
-  (4) runs text CFG as the serial forwards when both prompts tokenize to the
-      same length, so the GEN layers keep batch 1;
-  (5) hands the compiled GEN layers their tensors laid out as new ones, as
-      each program is guarded on its inputs' storage offsets (torch_tpu) and
-      strides (Dynamo): the text pathway's K/V (views of the fused QKV
-      projection on a conditioning-cache miss, copies on a hit) are copied
-      once per prompt, and each compiled layer copies any other view, e.g.
-      this rank's Ulysses rows of the assembled control/sound stream.
+  (1) pads the prompt's tokens to a multiple of 512 (masked, as the stock pads
+      them) and gives every GEN cross-attention the real count as a device
+      int32 tensor; :func:`prefix_attention` attends the real text keys, then
+      the visual keys, as resumable kernel steps;
+  (2) builds the RoPE ids on the host;
+  (3) runs equal-length text CFG as the serial forwards (GEN batch 1);
+  (4) hands the compiled GEN layers fresh tensors: torch_tpu guards input
+      storage offsets and Dynamo guards strides.
+  Control, action and sound requests, and ring or K/V-gather SP, run stock.
 - Upstream PR or issue: none.
 - Remove when: the text K/V cache takes a platform prompt bucket with its real
   length as data, and the RoPE ids are built from host lengths.
@@ -270,7 +257,7 @@ def maybe_enable_torch_compile(self, transformer, server_args):
     """``_maybe_enable_torch_compile``; each compiled GEN layer then copies the
     views it is called with (:func:`_fresh`) before its program runs."""
     _STOCK_COMPILE(self, transformer, server_args)
-    if getattr(transformer, "_gen_layers_torch_compiled", False):
+    if transformer._gen_layers_torch_compiled:
         # On the compiled wrapper, so the hook runs outside the program.
         for layer in transformer.gen_layers:
             layer.register_forward_pre_hook(_fresh_gen_layer_inputs, with_kwargs=True)
