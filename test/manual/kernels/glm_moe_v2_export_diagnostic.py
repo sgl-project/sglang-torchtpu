@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Same-entrypoint source/port/pure-call diagnostic, bounded and isolated.
+"""Same-entrypoint source/port diagnostics, bounded and isolated.
 
-Each implementation runs in fresh TorchTPU workers. Source and port retain the
-upstream effect declaration and must reproduce the same first compiler failure;
-the pure-call candidate changes that declaration alone, retaining every DMA,
-wait, barrier and drain, and runs the complete registered numerical bridge test.
+Source retains the original effect declaration; pure changes only that flag.
+Port uses the committed production adaptations. Unfold is a temporary port
+variant using the source's small-bt gate/up branch at every bt, to isolate the
+large-bt per-channel scale-folding path. No variant removes communication waits.
 """
 
 import ast
@@ -86,6 +86,16 @@ def configure(mode):
         pure_path = directory / f"c948-pure-{rank}.py"
         pure_path.write_text(pure)
         candidate = load_module(f"glm_c948_pure_rank{rank}", pure_path)
+        kernel.fused_ep_moe_v2 = candidate.fused_ep_moe_v2
+    elif mode == "unfold":
+        conditional = "direct_scaled_dot and w1_scale_hbm is not None and bt <= 16"
+        assert port_text.count(conditional) == 1
+        unfolded = port_text.replace(
+            conditional, "direct_scaled_dot and w1_scale_hbm is not None"
+        )
+        path = directory / f"port-unfold-{rank}.py"
+        path.write_text(unfolded)
+        candidate = load_module(f"glm_port_unfold_rank{rank}", path)
         kernel.fused_ep_moe_v2 = candidate.fused_ep_moe_v2
     elif mode not in ("port", "manual"):
         raise ValueError(mode)
@@ -203,7 +213,7 @@ def configure(mode):
     pallas_jax_op.cpu_export_jax_op = capture
 
 
-def run_worker(mode):
+def run_worker(mode, padded_only=False):
     # Avoid the enormous custom-call config in native ERROR logs. The exception
     # is captured below, with its first compiler signature retained verbatim.
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -213,7 +223,11 @@ def run_worker(mode):
         ROOT / "test/registered/kernels/ops/moe/test_glm_ep_moe_v2.py",
     )
     try:
-        test.worker()
+        test.worker(
+            case_filter={(24, "padded", False)} if padded_only else None,
+            include_loading=not padded_only,
+            include_large=not padded_only,
+        )
     except RuntimeError as exc:
         message = str(exc)
         expected = (
@@ -265,16 +279,26 @@ def run_worker(mode):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--worker-mode":
-        run_worker(sys.argv[2])
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--worker-mode", choices=("source", "port", "manual", "pure", "unfold")
+    )
+    parser.add_argument("--modes", default="source,port")
+    parser.add_argument("--padded-only", action="store_true")
+    args = parser.parse_args()
+    if args.worker_mode:
+        run_worker(args.worker_mode, args.padded_only)
     else:
         python = shlex.quote(sys.executable)
         script = shlex.quote(str(Path(__file__).resolve()))
-        modes = (
-            sys.argv[1].split("=", 1)[1].split(",")
-            if len(sys.argv) == 2 and sys.argv[1].startswith("--modes=")
-            else ("source", "port")
-        )
+        modes = args.modes.split(",")
+        if any(
+            mode not in ("source", "port", "manual", "pure", "unfold") for mode in modes
+        ):
+            parser.error("unknown diagnostic mode")
+        failed = False
         for mode in modes:
             command = (
                 "unset RANK LOCAL_RANK LOCAL_WORLD_SIZE WORLD_SIZE; "
@@ -283,5 +307,18 @@ if __name__ == "__main__":
                 'export JAX_PLATFORMS=cpu; export XLA_FLAGS="--xla_force_host_platform_device_count=$WORLD_SIZE"; '
                 "export TF_CPP_MIN_LOG_LEVEL=3; "
                 f'{python} -m torch.distributed.run --standalone --nproc_per_node="$WORLD_SIZE" {script} --worker-mode {mode}'
+                + (" --padded-only" if args.padded_only else "")
             )
-            subprocess.run(["bash", "-lc", command], check=True, timeout=1800)
+            result = subprocess.run(["bash", "-lc", command], timeout=1800)
+            print(
+                json.dumps(
+                    dict(
+                        event="diagnostic_phase",
+                        mode=mode,
+                        returncode=result.returncode,
+                    )
+                ),
+                flush=True,
+            )
+            failed |= result.returncode != 0
+        sys.exit(int(failed))

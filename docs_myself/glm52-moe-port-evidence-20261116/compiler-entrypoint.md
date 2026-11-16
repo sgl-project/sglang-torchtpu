@@ -121,3 +121,24 @@ invalid/later-slot valid, are added with shared off/on. Valid-route errors and
 nonfinite output remain fatal. The source compatibility patch can be reversed
 and SHA-checked mechanically, preserving an exact independent source module
 for further same-entrypoint comparisons.
+
+`exp-h5x8m9y9fr` / `art-7vlxetei08`, measurement
+`06cecda79d800783534acfcd7b2d75515a746094` (implementation `04ba952921`),
+ran the per-slot correction. All eight ranks again passed random6/hot12/zeros18
+and the loading checks. The padded24 failure now identifies 107 nonfinite
+**valid** rows, each with four valid routes, and zero nonfinite invalid rows.
+All ranks observe the same row set. Thus slot masking alone does not resolve
+the upstream numerical failure; full geometry, shared numerical and model E2E
+acceptance remain blocked. Compact inputs/routes/output/reference arrays are in
+`glm52-e2e/rank-0/kernel-failure-dumps/rank{rank}-rows24-padded-shared0.npz`
+inside that artifact. This result does not justify masking valid results.
+
+For bounded isolation, the manual diagnostic supports `--padded-only`: it
+preserves the registered test's exact RNG consumption, executes only the failed
+case, and skips the already-verified loading operations and later large tests.
+`--modes=pure,port,unfold` compares the exact source with only its effect flag
+adapted, the committed production kernel, and a temporary port using the
+source's small-bt sequential gate/up branch at all bt sizes. The latter isolates
+the larger-bt raw-dot/channel-scale folding branch and is not a production fix
+or an acceptance pass. Phases run in fresh processes; all phases are attempted
+and any unexpected failure keeps the diagnostic's overall exit nonzero.
