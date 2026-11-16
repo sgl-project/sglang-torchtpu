@@ -17,8 +17,8 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu import kv_mxint8
 from sglang_tpu.disaggregation.raiden import common
-from sglang_tpu.disaggregation.raiden import pool_transfer as pl
 from sglang_tpu.disaggregation.raiden import pool_spans as spans_lib
+from sglang_tpu.disaggregation.raiden import pool_transfer as pl
 from sglang_tpu.disaggregation.raiden import pp_mxint8
 from sglang_tpu.disaggregation.raiden.reshard_schedule import head_slice_params
 
