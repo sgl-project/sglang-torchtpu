@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """DeepSeek-V4.1 TPU runtime hooks (compress ratios 0/1/2).
 
-Every hook here passes V4 (no ratio-1/2 layers, model_type != deepseek_v41)
+Every hook here passes V4 (no ratio-1/2 layers, no Engram, no vision layers)
 through to ``original``. They are appended after sglang_tpu/hooks/dsv4.py so
 that, on shared targets, they are the outer wrapper.
 
@@ -19,10 +19,10 @@ get_tpu_dsv41_bytes_per_full_token
 select_tpu_dsv41_loader
   Why: each ~100 GB Engram table is one tensor, far above a per-rank Run:AI
        buffer, and every rank keeps only its TP row range of it.
-  How: AFTER get_model_loader swaps in DSV41RunaiModelStreamerLoader for the
-       V4.1 target. Routed experts take the generic EP-local Run:AI read
-       (sglang_tpu.ep_weight_shard); Engram tables leave the stream and are
-       read as this rank's row range.
+  How: AFTER get_model_loader swaps in DSV41RunaiModelStreamerLoader for a
+       target model with Engram layers. Routed experts take the generic
+       EP-local Run:AI read (sglang_tpu.ep_weight_shard); Engram tables leave
+       the stream and are read as this rank's row range.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: EngramEmbedding loads a pre-sliced row range from a
        model-owned checkpoint tensor filter.
@@ -129,7 +129,8 @@ def select_tpu_dsv41_loader(result, load_config, model_config=None):
     if (
         type(result) not in (RunaiModelStreamerLoader, EPLocalRunaiModelStreamerLoader)
         or model_config is None
-        or model_config.hf_config.model_type != "deepseek_v41"
+        # Without Engram tables the generic EP-local loader does everything.
+        or not model_config.use_engram
         or model_config.is_draft_model
         or load_config.draft_model_idx is not None
     ):

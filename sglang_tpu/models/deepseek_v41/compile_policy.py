@@ -2,13 +2,13 @@
 """TPU compile policy of ``DeepseekV4ForCausalLM`` (attached in
 ``sglang_tpu.compilation.core_compile_annotations``).
 
-V4 and V4.1 share the model class; for V4 this is the plain decoder policy.
-For V4.1, after the batch is padded to its bucket and before attention
-planning, it stages the graph inputs the compiled forward reads:
+After the batch is padded to its bucket and before attention planning, it
+stages the graph inputs the compiled forward reads:
 
-- Engram: this rank's tokens are hashed on the host and their rows of the
-  shared host table copied to the device (``engram_host``); the graph takes
-  the staged rows and their int32 row ids instead of hashing and looking up.
+- Engram, when the model has Engram layers: this rank's tokens are hashed on
+  the host and their rows of the shared host table copied to the device
+  (``engram_host``); the graph takes the staged rows and their int32 row ids
+  instead of hashing and looking up.
 - Token embedding, under attention DP: looked up eagerly and passed in as
   ``input_embeds``. Inside the TP1/DP8 compiled graph the unsharded BF16
   embedding gather returns wrong rows, while the same lookup outside the graph
@@ -31,27 +31,28 @@ from sglang_tpu.models.deepseek_v41 import engram_host
 
 
 class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
-    """Decoder policy that stages V4.1 Engram rows and DP token embeddings."""
+    """Decoder policy that stages host Engram rows and DP token embeddings."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         model = self.model_runner.model
-        self._is_dsv41 = (
-            self.model_runner.model_config.hf_config.model_type == "deepseek_v41"
+        # No Engram layers (DeepSeek-V4) or a NextN draft, which has no hasher.
+        self._engram_hasher = (
+            model.model.engram_hasher
+            if self.model_runner.model_config.use_engram
+            and not self.model_runner.is_draft_worker
+            else None
         )
-        self._engram_hasher = model.model.engram_hasher if self._is_dsv41 else None
         # Empty unless every Engram table is a shared host table.
         self._engram_tables = (
             engram_host.shared_host_tables(model)
             if self._engram_hasher is not None
             else ()
         )
-        self._embeds_outside_graph = self._is_dsv41 and get_parallel().attn_dp_size > 1
+        self._embeds_outside_graph = get_parallel().attn_dp_size > 1
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         super().prepare_forward_batch(forward_batch)
-        if not self._is_dsv41:
-            return
         input_ids = forward_batch.input_ids
         if self._engram_tables:
             self._stage_engram_rows(forward_batch=forward_batch, input_ids=input_ids)

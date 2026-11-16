@@ -406,7 +406,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
         if model is None or model_runner.model_config.is_multimodal:
             return
         config = model.model.config
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if config.vision_n_layers > 0:
             config.vision_n_layers = 0
 
     @staticmethod
