@@ -2871,15 +2871,7 @@ def fused_ep_moe_v2(
             compiler_params=pltpu.CompilerParams(
                 collective_id=0,
                 allow_collective_id_without_custom_barrier=True,
-                # TorchTPU re-partitions CPU-exported StableHLO for one local
-                # device. A side-effect custom call inside shard_map loses its
-                # manual sharding in that entrypoint and SPMD refuses it. This
-                # operation is a pure input->output MoE: RDMA destinations and
-                # semaphores are internal scratch, with all waits/drain retained.
-                # As in the existing fused_ep_moe_v2 port, its returned rows
-                # carry the dependency; no externally visible mutation needs an
-                # effect token. Do not remove the communication or barriers.
-                has_side_effects=False,
+                has_side_effects=True,
                 vmem_limit_bytes=64 * 1024 * 1024,
             ),
             name=scope_name,

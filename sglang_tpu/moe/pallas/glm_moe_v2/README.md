@@ -3,13 +3,8 @@
 This opt-in candidate ports `sgl-project/sglang-jax` revision
 `c948bdda95208e68a474c8088937347d08fe8937`,
 `python/sgl_jax/srt/kernels/fused_moe/v2/{kernel,tuned_block_configs}.py`
-(Apache-2.0). `kernel.py` preserves the source computation and all RDMA/waits.
-The sole compiler adaptation sets the Pallas call's `has_side_effects=False`:
-TorchTPU re-partitions CPU-exported StableHLO and rejects the source's unsharded
-side-effect custom call. The MoE is pure input-to-output; communication buffers
-and semaphores are internal scratch, and output dependencies retain ordering.
-This follows the existing fused EP port's compiler contract. The tuning file
-changes only device-name discovery to the CPU-export TPU-info context. This is
+(Apache-2.0). `kernel.py` is the source implementation; the tuning file changes
+only device-name discovery to the existing CPU-export TPU-info context. This is
 separate from the existing vLLM-derived `fused_moe_v2`, whose input is router
 logits and packed gate/up rather than GLM's existing selected ids/coefficients.
 
