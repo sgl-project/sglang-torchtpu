@@ -58,8 +58,16 @@ class TestDeviceEncoderScatter(unittest.TestCase):
             with self.subTest(on_device=on_device):
                 self._check_embed(on_device, chunk_size=4)
 
+    def test_wide_sentinel_embed(self):
+        # Every one of an item's sentinels must be scattered, including ids
+        # above 2**31 that only fit an int64 token id.
+        for on_device in (False, True):
+            for chunk_size in (20, 4):
+                with self.subTest(on_device=on_device, chunk_size=chunk_size):
+                    self._check_embed(on_device, chunk_size=chunk_size, wide=True)
+
     @torch.no_grad()
-    def _check_embed(self, on_device, chunk_size):
+    def _check_embed(self, on_device, chunk_size, wide=False):
         encoder_device = "tpu" if on_device else "cpu"
         # Both modalities cross chunk boundaries; the second image arrives later.
         specs = [
@@ -72,17 +80,22 @@ class TestDeviceEncoderScatter(unittest.TestCase):
         weight = torch.arange(32).reshape(8, 4).to(torch.bfloat16)
         for i, (modality, start, end) in enumerate(specs):
             key = 100 + i
-            items.append(
-                MultimodalDataItem(
+            if wide:
+                item = MultimodalDataItem(modality=modality, offsets=[(start, end)])
+                item.set_hash(key)
+            else:
+                item = MultimodalDataItem(
                     modality=modality, hash=key, pad_value=key, offsets=[(start, end)]
                 )
-            )
+            items.append(item)
             width = 12 if modality == Modality.IMAGE else 4
             sources[key] = (
                 torch.arange((end - start + 1) * width).reshape(-1, width).float() / 10
                 + i * 10
             )
-            tokens[start : end + 1] = key
+            tokens[start : end + 1] = torch.as_tensor(
+                item.padding_sequence(end - start + 1), dtype=tokens.dtype
+            )
         expected = weight[tokens.clamp(0, 7)].clone()
         expected_deepstack = torch.zeros(20, 8, dtype=weight.dtype)
         for item in items:
