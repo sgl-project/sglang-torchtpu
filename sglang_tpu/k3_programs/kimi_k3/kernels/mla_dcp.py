@@ -1002,6 +1002,8 @@ class DcpAttention:
         if _grouped_spec(self.batch, self.group, self.heads, self.sequence_rows):
 
             def dense():
+                if self._compact_steps():
+                    self._zero_step_pad_lanes(slot)
                 for first in range(0, self.sequence_rows, 4):
                     query = (
                         jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0)
@@ -1051,9 +1053,14 @@ class DcpAttention:
             pl.when(take & (window[2][0] + compact > capacity))(
                 lambda: self._flush_window(row - base)
             )
-            pl.when(take)(
-                lambda: self._window_gather(load, masks, union, count, compact)
-            )
+            # Gather tiers (32 / 64 / compact slots): the flush reserve stays at
+            # ``compact`` so the window schedule (and every bit) is unchanged.
+            low = 0
+            for tier in [t for t in (32, 64) if t < compact] + [compact]:
+                pl.when((count > low) & (count <= tier))(
+                    lambda tier=tier: self._window_gather(load, masks, union, count, tier)
+                )
+                low = tier
             pl.when(count > compact)(dense)
             # ``_locate``'s count is the row's local pages: its last step folds the window.
             last_step = (row_pages + self.span - 1) // self.span - 1
@@ -1137,7 +1144,12 @@ class DcpAttention:
             load(pl.ds(0, LANES)),
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
-        ).astype(self.cache.dtype)  # [compact, 640]
+        )  # [compact, 640]
+        tail = gathered[:, LATENT:]
+        tail_lane = jax.lax.broadcasted_iota(jnp.int32, tail.shape, 1)
+        gathered = jnp.concatenate(
+            [gathered[:, :LATENT], jnp.where(tail_lane < 64, tail, 0.0)], axis=1
+        ).astype(self.cache.dtype)
         row_masks = jnp.concatenate(
             [flat(mask.astype(jnp.int32)) for mask in masks], axis=0
         ).astype(jnp.bfloat16)  # [rows, W]
@@ -1239,8 +1251,15 @@ class DcpAttention:
         slot = step % self.buffers
         if self.selection is not None and not self.shared:
             visible = visible & self._selected(slot, local_step, row)
-        self._clean_step(slot, row, local_step)
+        self._clean_step(slot, row, local_step, pad=not self._compact_steps())
         return row, visible, self._pages(slot)
+
+    def _compact_steps(self):
+        return bool(
+            self.cache_verify_rows
+            and self._compact_tokens()
+            and _grouped_spec(self.batch, self.group, self.heads, self.sequence_rows)
+        )
 
     def _pages(self, slot):
         """``load(lanes, tokens=None)``: buffer ``slot``'s pages in the cache
@@ -1613,7 +1632,7 @@ class DcpAttention:
             )
         ws.accumulator[held] = ws.accumulator[held] * scale + weighted
 
-    def _clean_step(self, slot, row, local_step, tokens=None, end=None):
+    def _clean_step(self, slot, row, local_step, tokens=None, end=None, pad=True):
         """A step's pages as 32-bit rows ``[span * page_rows, 640]`` (a word
         packs ``packing`` tokens), with vLLM's stale bytes zeroed in place:
         lanes 576:640 of every token and every token at or past the row's
@@ -1629,6 +1648,26 @@ class DcpAttention:
             .at[slot]
             .reshape(self.span * self.page_rows, LANES)
         )
+        if pad:
+            self._zero_pad_lanes(words, rows, tokens)
+        return self._zero_invisible(words, rows, row, local_step, end)
+
+    def _zero_step_pad_lanes(self, slot):
+        """A dense step among compact ones zeroes its pages' lanes 576:640
+        itself (compact steps skip it: their gathered tiles are zeroed)."""
+        self._zero_pad_lanes(self._slot_words(slot), self.span * self.page_tokens)
+
+    def _slot_words(self, slot):
+        ws = self.ws
+        return (
+            ws.pages.bitcast(jnp.uint32).at[slot]
+            if self.native
+            else ws.pages.bitcast(jnp.uint32)
+            .at[slot]
+            .reshape(self.span * self.page_rows, LANES)
+        )
+
+    def _zero_pad_lanes(self, words, rows, tokens=None):
         if (
             self.batch in (16, 32, 48, 64)
             or self.heads != HEADS_PER_RANK
@@ -1653,6 +1692,8 @@ class DcpAttention:
             words[:, pl.ds(LATENT, LANES - LATENT)] = jnp.where(
                 pad_lane < 64, pad, jnp.zeros((), pad.dtype)
             )
+
+    def _zero_invisible(self, words, rows, row, local_step, end):
         limit = self._limit(row)
         cut = 0  # visible offsets
         for k in range(rows // self.page_tokens):
@@ -1832,6 +1873,51 @@ class DcpAttention:
         bounds = [self.batch * g // groups for g in range(groups + 1)]
         return [(bounds[g], bounds[g + 1]) for g in range(groups)]
 
+    def send_queries(self, queries, new_latents, parity):
+        """PROTOTYPE: ``attend``'s step 1 on its own -- stage the rows' own
+        queries and new latents, pack this rank's query slot and start the
+        remote copies to every peer -- so it can run early (e.g. right after
+        the indexer's own query gather, under its scoring); ``attend`` then
+        runs with ``queries_sent=True`` on the same workspace."""
+        ws, group, member, base, batch = (
+            self.ws,
+            self.group,
+            self.member,
+            self.base,
+            self.batch,
+        )
+        groups = self.row_groups()
+        ws.own_rows[...] = jnp.zeros(ws.own_rows.shape, jnp.float32)
+        ws.new_rows[...] = jnp.zeros(ws.new_rows.shape, jnp.float32)
+        for b in range(batch):
+            ws.own_rows[pl.ds(self.slots * b, self.heads), :] = queries[b]
+            ws.new_rows[pl.ds(self.slots * b, self.heads), :] = jnp.broadcast_to(
+                new_latents[b][None, :], (self.heads, LANES)
+            )
+
+        def rows_of(g):
+            first, end = groups[g]
+            return pl.ds(self.slots * first, self.slots * (end - first))
+
+        ws.gathered[parity, member] = (
+            _pack_fp8_query(ws.own_rows[...])
+            if ws.gathered.dtype == jnp.uint8
+            else ws.own_rows[...].astype(jnp.bfloat16)
+        )
+        for g in range(len(groups)):
+            for peer in range(0 if "gather" in self.skip else group):
+
+                @pl.when(peer != member)
+                def send_query(peer=peer, g=g):
+                    tpu.make_async_remote_copy(
+                        ws.gathered.at[parity, member, rows_of(g)],
+                        ws.gathered.at[parity, member, rows_of(g)],
+                        ws.gather_semaphores.at[0, parity, g],
+                        ws.gather_semaphores.at[1, parity, g],
+                        device_id=(base + peer,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
     def attend(
         self,
         queries,
@@ -1841,6 +1927,8 @@ class DcpAttention:
         *,
         keys=None,
         key_valid=None,
+        queries_sent=False,
+        while_combining: Callable[[], None] | None = None,
     ):
         """``queries`` [B, heads, 640] FP32 absorbed (scale folded in),
         ``new_latents`` [B, 640] FP32, ``parity`` alternating per invocation
@@ -1874,37 +1962,15 @@ class DcpAttention:
         )
         heads = group * self.slots
         groups = self.row_groups()
-        ws.own_rows[...] = jnp.zeros(ws.own_rows.shape, jnp.float32)
-        ws.new_rows[...] = jnp.zeros(ws.new_rows.shape, jnp.float32)
-        for b in range(batch):
-            ws.own_rows[pl.ds(self.slots * b, self.heads), :] = queries[b]
-            ws.new_rows[pl.ds(self.slots * b, self.heads), :] = jnp.broadcast_to(
-                new_latents[b][None, :], (self.heads, LANES)
-            )
 
         def rows_of(g):
             first, end = groups[g]
             return pl.ds(self.slots * first, self.slots * (end - first))
 
-        # 1. q all-gather into slot `member` of every peer, group by group.
-        ws.gathered[parity, member] = (
-            _pack_fp8_query(ws.own_rows[...])
-            if ws.gathered.dtype == jnp.uint8
-            else ws.own_rows[...].astype(jnp.bfloat16)
-        )
-        for g in range(len(groups)):
-            for peer in range(0 if "gather" in self.skip else group):
-
-                @pl.when(peer != member)
-                def send_query(peer=peer, g=g):
-                    tpu.make_async_remote_copy(
-                        ws.gathered.at[parity, member, rows_of(g)],
-                        ws.gathered.at[parity, member, rows_of(g)],
-                        ws.gather_semaphores.at[0, parity, g],
-                        ws.gather_semaphores.at[1, parity, g],
-                        device_id=(base + peer,),
-                        device_id_type=pl.DeviceIdType.MESH,
-                    ).start()
+        # 1. q all-gather into slot `member` of every peer, group by group
+        # (PROTOTYPE: already issued by send_queries, e.g. during the indexer).
+        if not queries_sent:
+            self.send_queries(queries, new_latents, parity)
 
         if between is not None:
             between()
@@ -1972,6 +2038,8 @@ class DcpAttention:
 
             ws.receive[parity, member, rows_of(g)] = ws.send[member, rows_of(g)]
             local_scope.__exit__(None, None, None)
+        if while_combining is not None:  # PROTOTYPE: independent work under the combine
+            while_combining()
         with self._scope("combine_wait"):
             for g in range(len(groups)):
                 others = ws.receive.at[

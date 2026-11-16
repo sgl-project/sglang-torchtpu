@@ -653,14 +653,17 @@ class TestSelectedAttention(CustomTestCase):
                 return x.reshape(x.shape[0] * x.shape[1], x.shape[2])[:, lanes]
             return load
 
-        def _clean_step(self, slot, row, local_step, tokens_=None, end=None):
+        def _clean_step(self, slot, row, local_step, tokens_=None, end=None, pad=True):
             x = self.ws.pages[slot]
             cut = 0
             for k in range(self.span):
                 first = ((local_step * self.span + k) * self.group + self.owner) * self.page_tokens
                 cut = cut + jnp.clip(self._limit(row) - first, 0, self.page_tokens)
             lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
-            self.ws.pages[slot] = jnp.where((tokens(x) < cut) & (lane < 576), x, jnp.zeros((), x.dtype))
+            keep = tokens(x) < cut
+            if pad:  # compact steps (pad=False) leave the stale lanes 576:640 to their gathered tiles
+                keep = keep & (lane < 576)
+            self.ws.pages[slot] = jnp.where(keep, x, jnp.zeros((), x.dtype))
 
         def _cache_verify_row(self, slot, local_step, row):
             position = self.position_ref[row]
@@ -678,6 +681,11 @@ class TestSelectedAttention(CustomTestCase):
                 offset = local_page * self.page_tokens + position % self.page_tokens
                 self.ws.pages[slot] = jnp.where(tokens(x) == offset, latent.astype(x.dtype)[None, None, :], x)
 
+        def _zero_step_pad_lanes(self, slot):
+            x = self.ws.pages[slot]
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+            self.ws.pages[slot] = jnp.where(lane < 576, x, jnp.zeros((), x.dtype))
+
         def _zero_slot(self, slot):
             x = self.ws.pages[slot]
             self.ws.pages[slot] = jnp.zeros(x.shape, x.dtype)
@@ -685,6 +693,7 @@ class TestSelectedAttention(CustomTestCase):
         mla_dcp.DcpAttention._pages = _pages
         mla_dcp.DcpAttention._clean_step = _clean_step
         mla_dcp.DcpAttention._zero_slot = _zero_slot
+        mla_dcp.DcpAttention._zero_step_pad_lanes = _zero_step_pad_lanes
         mla_dcp.DcpAttention._cache_verify_row = _cache_verify_row
 
         import dataclasses

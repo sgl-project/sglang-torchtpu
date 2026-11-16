@@ -355,15 +355,19 @@ class DecodeIndexer:
         ) // span_rows <= dsa_dcp.ACTIVITY_MIN_STEPS
 
     def selection(
-        self, cache, position_ref, hidden, query_latent, parity
+        self, cache, position_ref, hidden, query_latent, parity, after_gather=None
     ) -> mla_dcp.DcpSelection:
         """``hidden`` [B, hidden] and ``query_latent`` [B, 1536] (normalized,
-        BF16) values; ``cache`` the layer's ``mla_dcp.DcpCache``."""
+        BF16) values; ``cache`` the layer's ``mla_dcp.DcpCache``.
+        PROTOTYPE ``after_gather``: runs once the index query gather has
+        landed (e.g. the attention's own query gather, under the scoring)."""
         with dsa_dcp._scope("d_indexer"):
-            return self._selection(cache, position_ref, hidden, query_latent, parity)
+            return self._selection(
+                cache, position_ref, hidden, query_latent, parity, after_gather
+            )
 
     def _selection(
-        self, cache, position_ref, hidden, query_latent, parity
+        self, cache, position_ref, hidden, query_latent, parity, after_gather=None
     ) -> mla_dcp.DcpSelection:
         s, batch = self.scoped, hidden.shape[0]
         group = cache.group
@@ -413,6 +417,8 @@ class DecodeIndexer:
         others = gather.at[pl.ds(0, group - 1)]
         pltpu.make_async_copy(others, others, gather_sems.at[0]).wait()
         pltpu.make_async_copy(others, others, gather_sems.at[1]).wait()
+        if after_gather is not None:
+            after_gather()
         heads_width = DIM * per
         key_raw = jnp.sum(
             gather[:, :, heads_width : heads_width + LANES].astype(jnp.float32), axis=0

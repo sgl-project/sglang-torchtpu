@@ -5271,28 +5271,9 @@ def mla(
         (new_latent[:, 512:], jnp.zeros((batch_size, 128), jnp.bfloat16)), axis=1
     )
     new_value_ref[:, :3] = jnp.zeros((batch_size, 3, 128), jnp.bfloat16)
-    if dsa is not None:
-        dcp_attention = make_attention(
-            dsa.selection(
-                dcp[0], position_ref, hidden_ref[...], query_latent, dcp[0].layer % 2
-            ),
-            prime=False,
-        )
-        pl.when(early_prime)(dcp_attention.prime_keys)
-        pl.when(jnp.logical_not(early_prime))(dcp_attention.prime)
-
-    _phase_end(mla_scope.pop())
-    mla_scope.append(_phase_start("q7_mla_attend"))
-    workspace.maximum_vmem[...] = jnp.full((batch_size, 3, 1), -jnp.inf, jnp.float32)
-    workspace.denominator_vmem[...] = jnp.zeros((batch_size, 3, 1), jnp.float32)
-    workspace.accumulator_vmem[...] = jnp.zeros((batch_size, 3, 128), jnp.float32)
-
-    def attend_dcp():
-        """DCP attention: W_UK absorbed into this rank's queries (score scale
-        folded in), latent-space attention over the group's token shards
-        (``mla_dcp.DcpAttention``, the output gate projected while the query
-        gather is in flight), then W_UV per head. The heads' outputs land in
-        the accumulator with a unit denominator."""
+    def absorbed_queries():
+        """W_UK absorbed into this rank's queries (score scale folded in),
+        [B, 3, 640] FP32."""
         if "key_value_up" in streams:
             streams["key_value_up"].wait_all()
         else:
@@ -5320,18 +5301,70 @@ def mla(
                 )
                 * scale
             )
+        return jnp.stack(absorbed, axis=1)
 
+    # PROTOTYPE: with DSA the attention's query all-gather leaves right after
+    # the indexer's own query gather has landed, so it flies under the scoring.
+    queries_sent = (
+        dsa is not None
+        and not mla_dcp.chunked(batch_size)  # chunked calls send per chunk (not prototyped)
+        and "gather_late" not in dcp_skip
+    )
+    if dsa is not None:
+
+        def send_queries_early():
+            make_attention(prime=False).send_queries(
+                absorbed_queries(), new_latent.astype(jnp.float32), dcp[0].layer % 2
+            )
+
+        dcp_attention = make_attention(
+            dsa.selection(
+                dcp[0],
+                position_ref,
+                hidden_ref[...],
+                query_latent,
+                dcp[0].layer % 2,
+                after_gather=send_queries_early if queries_sent else None,
+            ),
+            prime=False,
+        )
+        pl.when(early_prime)(dcp_attention.prime_keys)
+        pl.when(jnp.logical_not(early_prime))(dcp_attention.prime)
+
+    _phase_end(mla_scope.pop())
+    mla_scope.append(_phase_start("q7_mla_attend"))
+    workspace.maximum_vmem[...] = jnp.full((batch_size, 3, 1), -jnp.inf, jnp.float32)
+    workspace.denominator_vmem[...] = jnp.zeros((batch_size, 3, 1), jnp.float32)
+    workspace.accumulator_vmem[...] = jnp.zeros((batch_size, 3, 128), jnp.float32)
+
+    def attend_dcp():
+        """DCP attention: W_UK absorbed into this rank's queries (score scale
+        folded in), latent-space attention over the group's token shards
+        (``mla_dcp.DcpAttention``, the output gate projected while the query
+        gather is in flight), then W_UV per head. The heads' outputs land in
+        the accumulator with a unit denominator."""
         def output_gate():
             workspace.output_gate_values_vmem[...] = projection(
                 "output_gate", hidden_ref[...]
             ).astype(jnp.bfloat16)
 
-        merged = dcp_attention.attend(
-            jnp.stack(absorbed, axis=1),
-            new_latent.astype(jnp.float32),
-            dcp[0].layer % 2,
-            between=output_gate,
-        )
+        if queries_sent:
+            # The gather left during the indexer; the output gate fills the combine.
+            merged = dcp_attention.attend(
+                None,
+                new_latent.astype(jnp.float32),
+                dcp[0].layer % 2,
+                queries_sent=True,
+                while_combining=output_gate,
+            )
+        else:
+            merged = dcp_attention.attend(
+                absorbed_queries(),
+                new_latent.astype(jnp.float32),
+                dcp[0].layer % 2,
+                between=output_gate,
+            )
+        up = weights.key_value_up_projection_vmem
         outputs = []
         for head in range(3):
             value_up = up[:, head * 256 + 128 : head * 256 + 256]
