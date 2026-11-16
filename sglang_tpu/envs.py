@@ -470,6 +470,13 @@ class TpuEnvs:
     # 100 GB of host RAM per host to compile them). Compilation is frozen after warmup, so
     # scheduler intake rejects multimodal requests with a 400 (sglang_tpu/patches.py).
     SGLANG_TPU_VL_TEXT_ONLY_EXTEND = EnvBool(False)
+    # fp8 KV cache: rotate q and k of every head by an orthonormal Hadamard
+    # matrix before K is quantized (q.k is unchanged). Spreads K's outlier
+    # channels over the head so fp8 rounding error averages out across the
+    # dot product instead of landing on the few channels that dominate it
+    # (Qwen3-30B-A3B GSM8K: fp8 0.76-0.83 -> 0.96, bf16 0.955). Applies to
+    # power-of-two head dims only; set 0 to store K unrotated.
+    SGLANG_TPU_FP8_KV_HADAMARD = EnvBool(True)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
