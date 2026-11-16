@@ -79,12 +79,21 @@ def ep_mk_config(c: MKConfig) -> MKConfig:
     )
 
 
-def ep_arm() -> str:
-    """The EP decode paradigm, SGLANG_TPU_MUSE_MK_EP_ARM: gather (EP, every row on every rank)
-    or a2a (SP + EP, own rows behind ragged all-to-alls). Read at trace time."""
+# ep_mixed: the gather arm's VMEM ends near 128 rows, and it beats a2a up to there (doc/discovery.md).
+MIXED_GATHER_MAX_ROWS = 128
+
+
+def ep_arm(rows: int | None = None) -> str:
+    """The EP decode paradigm, SGLANG_TPU_MUSE_MK_EP_ARM: gather (EP, every row on every rank),
+    a2a (SP + EP, own rows behind ragged all-to-alls) or mixed (gather for steps of at most
+    MIXED_GATHER_MAX_ROWS rows, a2a above; both read the same EP weights). Read at trace time."""
     arm = tpu_envs.SGLANG_TPU_MUSE_MK_EP_ARM.get()
+    if arm == "mixed":
+        if rows is None:
+            raise ValueError("SGLANG_TPU_MUSE_MK_EP_ARM=mixed picks the arm by the step's rows")
+        return "gather" if rows <= MIXED_GATHER_MAX_ROWS else "a2a"
     if arm not in ARMS:
-        raise ValueError(f"SGLANG_TPU_MUSE_MK_EP_ARM={arm!r}: a2a or gather")
+        raise ValueError(f"SGLANG_TPU_MUSE_MK_EP_ARM={arm!r}: a2a, gather or mixed")
     return arm
 
 

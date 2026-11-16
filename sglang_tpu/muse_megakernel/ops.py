@@ -44,6 +44,11 @@ from sglang_tpu.muse_megakernel.common.consts import (
     SMALL_ROWS,
     UNSHIFTED_MAX,
 )
+from sglang_tpu.muse_megakernel.common.ep_layout import KPERM_BLOCK, kperm
+from sglang_tpu.muse_megakernel.common.ep_weights import (
+    convert_experts_to_ep,
+    ep_expert_refs,
+)
 from sglang_tpu.muse_megakernel.common.expert_requant import requant_tpu_nvfp4_experts
 from sglang_tpu.muse_megakernel.common.moe_mode import MoeMode, resolve_moe_mode
 from sglang_tpu.muse_megakernel.common.plan import (
@@ -114,7 +119,7 @@ def _stack(tensors: list[torch.Tensor]) -> torch.Tensor:
 class _ModelGeometry:
     """Static model numbers the kernel needs, read from the loaded model."""
 
-    def __init__(self, model) -> None:
+    def __init__(self, model, *, ep_ranks: int = 1) -> None:
         cfg = model.text_config
         decoder = model.model
         layer0 = decoder.layers[0]
@@ -128,8 +133,9 @@ class _ModelGeometry:
         self.n_experts = moe.num_experts
         self.top_k = moe.top_k
         self.expert_hidden = moe.expert_hidden_size
-        # w2 is [E, I_local, H_e] in the fused-RS expert-TP layout (fp4 packs the last dim)
-        self.inter_local = moe.experts.w2_weight.shape[1]
+        # w2 is [E, I_local, H_e] in the fused-RS expert-TP layout (fp4 packs the last dim);
+        # under EP it holds whole experts [E / ep, I, H_e] and the kernels still chunk I / ep
+        self.inter_local = moe.experts.w2_weight.shape[1] // ep_ranks
         self.rms_eps = cfg.rms_norm_eps
         self.post_eps = cfg.post_norm_eps
         self.scale_query_by = attn.query_scale
@@ -165,6 +171,81 @@ def _expert_refs(experts, kind: str) -> list[torch.Tensor]:
         s13 = s13.reshape(s13.shape[0], 1, s13.shape[-1]).expand(-1, 2, -1).contiguous()
         s2 = s2.reshape(s2.shape[0], 1, s2.shape[-1]).expand(-1, 2, -1).contiguous()
     return [experts.w13_weight, s13, experts.w2_weight, s2]
+
+
+def _check_ep_serving(parallel) -> None:
+    """The EP layout replaces the experts the native MoE reads, so every forward must run a
+    Muse EP program: decode/spep for decode and verify, prefill/spep for extend."""
+    if not (
+        parallel.moe_ep_size == parallel.tp_size == parallel.attn_tp_size
+        and parallel.moe_tp_size == 1
+    ):
+        raise NotImplementedError(
+            "SGLANG_TPU_MUSE_MOE_MODE=ep: the Muse EP megakernel needs EP across the whole TP "
+            f"group, got ep {parallel.moe_ep_size}, moe_tp {parallel.moe_tp_size}, "
+            f"tp {parallel.tp_size}"
+        )
+    if tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get() != KPERM_BLOCK:
+        raise NotImplementedError(
+            f"SGLANG_TPU_MUSE_MOE_MODE=ep needs SGLANG_TPU_MUSE_MK_QBLOCK={KPERM_BLOCK}"
+        )
+    if tpu_envs.SGLANG_TPU_MUSE_MK_EXPERT_GROUP.get():
+        raise NotImplementedError(
+            "SGLANG_TPU_MUSE_MOE_MODE=ep: no stacked expert groups "
+            "(SGLANG_TPU_MUSE_MK_EXPERT_GROUP=0)"
+        )
+    required = (
+        tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL,
+        tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_SP,
+        tpu_envs.SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT,
+    )
+    missing = [env.name for env in required if not env.get()]
+    if missing:
+        raise NotImplementedError(
+            "SGLANG_TPU_MUSE_MOE_MODE=ep: extend must run prefill/spep on the decode layout; "
+            f"set {', '.join(missing)}"
+        )
+    if tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER.get():
+        raise NotImplementedError(
+            "SGLANG_TPU_MUSE_MOE_MODE=ep: prefill/spep has no SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER"
+        )
+
+
+def _ep_wo(weight: torch.Tensor, *, rank: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Under EP, the whole o_proj (RowParallel, [H, qd] per rank as loaded) as fp8 K-major
+    [tp * qd, H], which prefill/spep reads, this rank's row block of it, which decode reads,
+    and their shared per-output-channel scales [H] (one quantization of the whole matrix)."""
+    from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+    qd = weight.shape[1]
+    whole, scale = _fp8_channelwise(
+        _k_major(tensor_model_parallel_all_gather(weight.detach().contiguous(), dim=1))
+    )
+    return whole, whole[rank * qd : (rank + 1) * qd].contiguous(), scale
+
+
+def _kperm_index(n: int, device: torch.device) -> torch.Tensor:
+    return torch.as_tensor(kperm(n), dtype=torch.int32, device=device)
+
+
+def _pool_weight(weight: torch.Tensor, *, ep: bool) -> torch.Tensor:
+    """K-major pre_expert_proj [H, H_e / tp] (TP) or, under EP, the whole [H, H_e] replicated
+    on every rank with its columns in kperm order (a ColumnParallel shard per rank as loaded)."""
+    if not ep:
+        return _k_major(weight)
+    from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+    whole = _k_major(tensor_model_parallel_all_gather(weight.detach().contiguous(), dim=0))
+    return whole.index_select(1, _kperm_index(whole.shape[1], whole.device)).contiguous()
+
+
+def _unpool_weight(weight: torch.Tensor, *, ep: bool) -> torch.Tensor:
+    """K-major post_expert_proj [H_e, H / tp] (TP) or, under EP, the whole [H_e, H]."""
+    if not ep:
+        return _k_major(weight)
+    from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+    return _k_major(tensor_model_parallel_all_gather(weight.detach().contiguous(), dim=0))
 
 
 def w4a16_layers_of(kinds: tuple, qblock: int) -> tuple:
@@ -300,6 +381,10 @@ class MuseMegakernel(torch.nn.Module):
         # entries alias FusedMoE parameters.
         for name in WEIGHT_NAMES:
             self.register_buffer(f"w_{name}", weights[name], persistent=False)
+        # EP: prefill/spep's o-proj reads the whole wo; decode keeps this rank's row block
+        self.prefill_whole_wo = "wo_full" in weights
+        if self.prefill_whole_wo:
+            self.register_buffer("w_wo_full", weights["wo_full"], persistent=False)
         for i, t in enumerate(experts):
             self.register_buffer(f"expert_{i}", t, persistent=False)
         self.n_expert_refs = len(experts)
@@ -326,17 +411,10 @@ class MuseMegakernel(torch.nn.Module):
                 )
         parallel = get_parallel()
         moe_mode = resolve_moe_mode(parallel.moe_ep_size)
-        if moe_mode == "ep":
-            # the EP layout has no serving weight load
-            raise NotImplementedError(
-                "SGLANG_TPU_MUSE_MOE_MODE=ep: the Muse EP megakernel is not wired for "
-                "serving: it needs replicated pre/post_expert_proj (ColumnParallel under "
-                "EP), experts in the EP layout "
-                "(kperm rows, chunk_cols-interleaved gate/up, which the native fused-RS MoE "
-                "also reads) and, with SGLANG_TPU_MUSE_MK_QBLOCK, "
-                "block-requantized scales shared with them"
-            )
-        if not (
+        ep = moe_mode == "ep"
+        if ep:
+            _check_ep_serving(parallel)
+        elif not (
             parallel.moe_ep_size == 1
             and parallel.moe_tp_size == parallel.tp_size == parallel.attn_tp_size
         ):
@@ -359,19 +437,20 @@ class MuseMegakernel(torch.nn.Module):
             )
         if prefill:
             _check_prefill_setup()
-        geo = _ModelGeometry(model)
+        geo = _ModelGeometry(model, ep_ranks=parallel.moe_ep_size if ep else 1)
         decoder = model.model
         L, H = geo.n_layers, geo.hidden
         Ep = -(-geo.n_experts // LANE) * LANE
         device = decoder.norm.weight.device
         qkvg, wo, wpool, wunpool, wrouter, smalls = [], [], [], [], [], []
+        wo_full: list[torch.Tensor] = []  # EP only: the whole wo prefill/spep reads
         experts, kinds = [], []
         qblock = tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get()
         if qblock:
             # One copy, before stacking: the native fused-RS MoE (extend, large steps) reads it too.
             for layer in decoder.layers:
                 if _expert_kind(layer.mlp.experts) == "fp4":
-                    requant_tpu_nvfp4_experts(layer.mlp.experts, qblock)
+                    requant_tpu_nvfp4_experts(layer.mlp.experts, qblock, ep_megakernel=ep)
             torch.accelerator.synchronize()
             logger.info("Muse megakernel: fp4 experts requantized to block %d", qblock)
         for layer in decoder.layers:
@@ -383,9 +462,14 @@ class MuseMegakernel(torch.nn.Module):
                     torch.cat([attn.qkv_proj.weight, attn.gate_proj.weight], dim=0)
                 )
             )
-            wo.append(_k_major(attn.o_proj.weight))
-            wpool.append(_k_major(moe.pre_expert_proj.weight))
-            wunpool.append(_k_major(moe.post_expert_proj.weight))
+            if ep:
+                whole, mine, wo_scale = _ep_wo(attn.o_proj.weight, rank=parallel.tp_rank)
+                wo_full.append(whole)
+                wo.append(mine)
+            else:
+                wo.append(_k_major(attn.o_proj.weight))
+            wpool.append(_pool_weight(moe.pre_expert_proj.weight, ep=ep))
+            wunpool.append(_unpool_weight(moe.post_expert_proj.weight, ep=ep))
             rw = moe.gate.weight.detach()
             rw = rw if rw.shape == (H, geo.n_experts) else rw.t()
             rpad = torch.zeros(H, Ep, dtype=torch.bfloat16, device=device)
@@ -408,7 +492,11 @@ class MuseMegakernel(torch.nn.Module):
             sm[S["ffn_beta"]] = (
                 layer.post_feedforward_residual_gate.beta.float().reshape(-1)
             )
-            sm[S["pre_expert_w"], : geo.expert_hidden] = moe.pre_expert_norm.gain()
+            pre_expert_w = moe.pre_expert_norm.gain()
+            if ep:
+                # the pooled width in kperm order, as wpool's columns
+                pre_expert_w = pre_expert_w[_kperm_index(geo.expert_hidden, device)]
+            sm[S["pre_expert_w"], : geo.expert_hidden] = pre_expert_w
             sm[S["expert_bias"], :Ep] = NEG
             sm[S["expert_bias"], : geo.n_experts] = moe.e_score_correction_bias.float()
             sm[S["post_expert_w"], : geo.expert_hidden] = moe.post_expert_norm.gain()
@@ -419,12 +507,20 @@ class MuseMegakernel(torch.nn.Module):
                 ("wpool", wpool),
                 ("wunpool", wunpool),
             ):
-                mats[-1], scale = _fp8_channelwise(mats[-1])
+                if ep and name == "wo":
+                    # quantized whole in _ep_wo: the row block shares the whole's scales
+                    scale = wo_scale
+                else:
+                    mats[-1], scale = _fp8_channelwise(mats[-1])
                 sm[S[name + "_s"], : scale.numel()] = scale
             smalls.append(sm)
             kind = _expert_kind(moe.experts)
             kinds.append(kind)
-            experts.extend(_expert_refs(moe.experts, kind))
+            if ep:
+                convert_experts_to_ep(moe.experts, kind, geo.inter_local)
+                experts.extend(ep_expert_refs(moe.experts))
+            else:
+                experts.extend(_expert_refs(moe.experts, kind))
         expert_groups = expert_groups_of(
             tuple(kinds), tpu_envs.SGLANG_TPU_MUSE_MK_EXPERT_GROUP.get()
         )
@@ -455,6 +551,8 @@ class MuseMegakernel(torch.nn.Module):
             "wrouter": _stack(wrouter),
             "wunpool": _stack(wunpool),
         }
+        if wo_full:
+            weights["wo_full"] = _stack(wo_full)
         extra = sum(t.numel() * t.element_size() for t in weights.values())
         logger.info(
             "Muse megakernel prepared: %d layers, experts %s, %.2f GiB of K-major copies per device",
@@ -475,7 +573,8 @@ class MuseMegakernel(torch.nn.Module):
             moe_mode=moe_mode,
             prefill=prefill,
             prefill_fp8_gather=tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER.get(),
-            w4a16_layers=w4a16_layers_of(tuple(kinds), qblock),
+            # under EP no native MoE runs (the experts hold the EP layout)
+            w4a16_layers=() if ep else w4a16_layers_of(tuple(kinds), qblock),
         )
         torch.accelerator.synchronize()
         _INSTANCE[:] = [mk]
@@ -870,7 +969,7 @@ class MuseMegakernel(torch.nn.Module):
                 )
 
     def callable_for(self, cfg: MKConfig):
-        arm = ep_arm() if self.moe_mode == "ep" else None
+        arm = ep_arm(cfg.rows) if self.moe_mode == "ep" else None
         if (cfg, arm) not in self._ops:
             self._ops[(cfg, arm)] = _build_callable(cfg, self.tp_size, arm)
         return self._ops[(cfg, arm)]
@@ -1020,7 +1119,10 @@ class MuseMegakernel(torch.nn.Module):
         )
         meta = torch.cat([md.active_num_tokens.reshape(1).to(torch.int32), self.rank_t])
         kv = [pool.get_fused_kv_buffer(i) for i in range(self.geo.n_layers)]
-        weights = [getattr(self, f"w_{n}") for n in WEIGHT_NAMES]
+        weights = [
+            self.w_wo_full if n == "wo" and self.prefill_whole_wo else getattr(self, f"w_{n}")
+            for n in WEIGHT_NAMES
+        ]
         experts = [getattr(self, f"expert_{i}") for i in range(self.n_expert_refs)]
         hidden, aux = torch.ops.sglang_tpu_pallas.muse_prefill(
             meta,

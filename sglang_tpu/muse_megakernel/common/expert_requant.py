@@ -64,14 +64,18 @@ def _requant_slabs(
     return out
 
 
-def requant_tpu_nvfp4_experts(layer: torch.nn.Module, block: int) -> None:
+def requant_tpu_nvfp4_experts(
+    layer: torch.nn.Module, block: int, *, ep_megakernel: bool = False
+) -> None:
     """Rewrite a fused-RS-prepared block-16 NVFP4 layer's experts in place to one bf16 scale
-    per block K rows; the megakernel and the native fused-RS MoE then read only these."""
+    per block K rows; the megakernel and the native fused-RS MoE then read only these.
+    ep_megakernel: whole experts per rank, converted next to the EP layout, which only the
+    Muse EP programs read."""
     if block not in QBLOCK_SIZES:
         raise NotImplementedError(
             f"NVFP4 expert requant to block {block}: supported {QBLOCK_SIZES}"
         )
-    if not layer.__dict__.get("_tpu_fused_rs_expert_tp", False):
+    if not ep_megakernel and not layer.__dict__.get("_tpu_fused_rs_expert_tp", False):
         raise NotImplementedError(
             "NVFP4 expert requant needs the fused-RS expert-TP layout (the only native "
             "MoE with a block-scaled W4A16 arm)"
