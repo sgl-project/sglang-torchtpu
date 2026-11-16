@@ -13,7 +13,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `zimage_turbo.sh` | `Tongyi-MAI/Z-Image-Turbo` | 8 or 1 | Ulysses = cores (30 heads, padded to 32) |
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
-| `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `ltx2.sh` | `Lightricks/LTX-2` | 8 | Ulysses 8 (32 heads) |
 | `ltx23.sh` | `Lightricks/LTX-2.3` | 8 | Ulysses 8 (32 heads) |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
@@ -36,7 +36,7 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 20 steps | 8 | 60.3 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
-| LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.3 s | 0.422 s | 8.2 s | 61.6 GB |
+| LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 30.6 s | 0.502 s | 8.5 s | 61.7 GB |
 | LTX-2.3 | T2V+audio 1280x704, 121 frames, 30 steps | 8 | 35.8 s | 0.975 s | 3.8 s | 66.0 GB |
 
 
