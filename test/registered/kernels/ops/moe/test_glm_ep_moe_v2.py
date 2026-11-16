@@ -467,7 +467,7 @@ def record_nonfinite(
     )
 
 
-def worker():
+def worker(*, case_filter=None, include_loading=True, include_large=True):
     import json
     import time
 
@@ -514,7 +514,8 @@ def worker():
         flush=True,
     )
     torch.set_num_threads(1)
-    binder_loading_cases(ep, rank)
+    if include_loading:
+        binder_loading_cases(ep, rank)
     generator = torch.Generator().manual_seed(2198)
     # Small weights permit a complete independent float32 CPU reference on
     # every worker, including adversarial routing and decode padding shapes.
@@ -576,6 +577,13 @@ def worker():
             ids[-7:] = -1
             weights[-7:] = 0
             x[-7:] = 0
+        # Manual diagnostics may select one case while retaining the original
+        # RNG consumption, so its input matches the failed registered run.
+        if (
+            case_filter is not None
+            and (local_rows, routing, has_shared) not in case_filter
+        ):
+            continue
         expected = torch.zeros(rows, h)
         for expert in range(e):
             tokens, columns = torch.where(ids == expert)
@@ -640,24 +648,25 @@ def worker():
         }
         reports.append(report)
         print(json.dumps({"event": "case_pass", "rank": rank, **report}), flush=True)
-    reports.extend(
-        idle_bucket_cases(
-            ep,
-            rank,
-            device_weights,
-            rank_tensor,
-            w13,
-            w2,
-            s13,
-            s2,
-            sw13,
-            sw2,
-            ss13,
-            ss2,
-            device_shared,
+    if include_large:
+        reports.extend(
+            idle_bucket_cases(
+                ep,
+                rank,
+                device_weights,
+                rank_tensor,
+                w13,
+                w2,
+                s13,
+                s2,
+                sw13,
+                sw2,
+                ss13,
+                ss2,
+                device_shared,
+            )
         )
-    )
-    reports.extend(full_shape_cases(ep, rank))
+        reports.extend(full_shape_cases(ep, rank))
     maps = Path("/proc/self/maps").read_text()
     libraries = sorted(
         {line.split()[-1] for line in maps.splitlines() if "libtpu" in line}
