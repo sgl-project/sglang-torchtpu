@@ -5961,6 +5961,10 @@ def mla_dcp_shards(
 # host sums can change long-context logits. The final gather has private
 # persistent storage so adjacent phases cannot overwrite unread packets.
 B4_ATTENTION_GATHER = _config().b4_attention_gather
+# Token-scattered steps: send each host's four-pair sum across hosts as BF16
+# (KernelConfig.attention_host_bf16). Each rank rounds its own host's slot
+# as well, so all four hosts add the same BF16 values in the same order.
+ATTENTION_HOST_BF16 = _config().attention_host_bf16
 
 
 def _project_attention_2d(
@@ -6109,9 +6113,18 @@ def _project_attention_2d(
             else:
                 local_sum = jnp.sum(local_receive[...].astype(jnp.float32), axis=0)
                 # The caller supplies the four-lane FP32 host workspace
-                # used by MoE after attention.
-                host_receive = host_reduction.at[:, pl.ds(0, payload_rows), :]
-                host_receive[host] = local_sum
+                # used by MoE after attention. BF16 host sums travel two rows
+                # to an FP32 row (value bitcasts load whole tiles; the BF16
+                # view of the workspace loads one sublane at a time).
+                if ATTENTION_HOST_BF16:
+                    host_receive = host_reduction.at[:, pl.ds(0, payload_rows // 2), :]
+                    host_receive[host] = jax.lax.bitcast_convert_type(
+                        tpu.bitcast(local_sum.astype(jnp.bfloat16), jnp.uint32),
+                        jnp.float32,
+                    )
+                else:
+                    host_receive = host_reduction.at[:, pl.ds(0, payload_rows), :]
+                    host_receive[host] = local_sum
             host_copies = []
             host_view = host_receive.at[host]
             for offset in range(3, 0, -1):
@@ -6134,7 +6147,13 @@ def _project_attention_2d(
                 )
                 reduced_half = jnp.sum(rank_partials, axis=0).astype(jnp.bfloat16)
             else:
-                reduced_half = jnp.sum(host_receive[...], axis=0).astype(jnp.bfloat16)
+                host_sums = host_receive[...]
+                if ATTENTION_HOST_BF16:
+                    host_sums = tpu.bitcast(
+                        jax.lax.bitcast_convert_type(host_sums, jnp.uint32),
+                        jnp.bfloat16,
+                    ).astype(jnp.float32)
+                reduced_half = jnp.sum(host_sums, axis=0).astype(jnp.bfloat16)
             pair_send = local.at[2].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]
             pair_receive = (
                 local.at[3].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]

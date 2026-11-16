@@ -58,6 +58,12 @@ class KernelConfig:
     # pending routes every iteration.
     expert_schedule: bool = False
     b4_attention_gather: bool = True
+    # Token-scattered decode attention output projection (attention DP1, 8+
+    # rows): the cross-host round carries each host's four-pair FP32 sum
+    # rounded to BF16 (half its bytes). Every rank rounds its own host's sum
+    # too and adds the four hosts in the same order, so the host copies of a
+    # row stay bitwise equal. Changes numerics: one more BF16 rounding.
+    attention_host_bf16: bool = False
     # Serving batches beyond the powers of two, by request count: plain
     # decode and three-draft verifies (e.g. "48" / "12"; multiples of 16 rows
     # take the staged MoE paths).

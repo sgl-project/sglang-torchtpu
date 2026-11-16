@@ -1863,3 +1863,228 @@ class TestSingletonRowStaging(CustomTestCase):
         bits, routes = inputs(12)
         source = bits.view(ml_dtypes.bfloat16)
         self.assertEqual(branches(staging(12, True), routes, source), 12 * 12)
+
+
+class TestAttentionHostBf16(CustomTestCase):
+    """The token-scattered attention output projection (``_project_attention_2d``)
+    at B8, B16 and B24 in Pallas interpret mode on 32 host devices (4 hosts x 4 rank
+    pairs x 2 lanes), with stale NaN bytes wherever a round lands. With FP32
+    host sums and with BF16 host sums (``KernelConfig.attention_host_bf16``)
+    every rank's owned rows equal, bit for bit, the reduction's rounding points
+    applied to the ranks' own FP32 partials: BF16 pair partials, FP32 sums of
+    each host's four pairs in pair order, the host sums kept in FP32 or rounded
+    to BF16, an FP32 sum of the four hosts in host order, a BF16 output. The four
+    hosts' copies of every row are bitwise equal."""
+
+    SCRIPT = r"""
+import math, os
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=32"
+os.environ["JAX_PLATFORMS"] = "cpu"
+import jax, jax.numpy as jnp, ml_dtypes, numpy as np
+from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
+from jax._src.pallas.mosaic.interpret import utils as interpret_utils
+from jax._src.state import indexing, types as state_types
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import Mesh, PartitionSpec as P
+from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk
+
+BF16 = ml_dtypes.bfloat16
+H, HALF, W = 7168, 3584, 384
+
+
+# TPU interpret mode reads and writes NDIndexer views only; give its loads,
+# stores and DMAs the kernel's bitcast and reshape views too (TPU semantics: a
+# 32-bit row r is 16-bit rows 2r and 2r + 1; dmk._PaddedBf16Rows is the leading
+# rows of its backing).
+def view_index(content, transforms):
+    units = content.dtype.itemsize // 2
+    index = np.arange(content.size * units).reshape(*content.shape, units)
+    dtype = content.dtype
+    for t in transforms:
+        if isinstance(t, indexing.NDIndexer):
+            index = index[interpret_utils.to_range((t,))]
+        elif isinstance(t, state_types.BitcastTransform):
+            dtype = np.dtype(t.dtype)
+            new, (*lead, rows, cols, old) = dtype.itemsize // 2, index.shape
+            if new < old:
+                index = index.swapaxes(-1, -2).reshape(*lead, rows * old, cols, 1)
+            elif new > old:
+                index = index.reshape(*lead, rows // new, new, cols).swapaxes(-1, -2)
+        elif isinstance(t, state_types.ReshapeTransform):
+            shape = tuple(t.shape)
+            if math.prod(shape) == math.prod(index.shape[:-1]):
+                index = index.reshape(*shape, index.shape[-1])
+            else:
+                index = index.reshape(-1, shape[-1], index.shape[-1])[: shape[0]]
+        else:
+            raise NotImplementedError(t)
+    return index, dtype
+
+
+def access(device_id, local_core_id, memory_space, buffer_id, transforms, val=None):
+    memory = ipc._get_shared_memory()
+    space = ipc.TPU_MEMORY_SPACE_NAMES[int(memory_space)]
+    core = ipc._local_core_id_or_zero_if_hbm(int(local_core_id), space)
+    content = memory.mem[(space, int(buffer_id), int(device_id), core)].content
+    with memory.lock:
+        index, dtype = view_index(content, transforms)
+        flat = content.reshape(-1).view(np.uint16)
+        old = np.ascontiguousarray(flat[index]).view(dtype)[..., 0]
+        if val is not None:
+            new = np.ascontiguousarray(np.asarray(val, dtype)[..., None]).view(np.uint16)
+            flat[index] = new.reshape(index.shape)
+    return old
+
+
+ORIGINAL = {name: getattr(ipc, name).__wrapped__ for name in ("get", "store", "swap")}
+plain = lambda transforms: all(isinstance(t, indexing.NDIndexer) for t in transforms)
+
+
+@ipc.fail_on_exception
+def get(token, device_id, core, space, buffer_id, transforms, *args, **kwargs):
+    transforms = jax.tree.map(int, transforms)
+    if plain(transforms):
+        return ORIGINAL["get"](token, device_id, core, space, buffer_id, transforms, *args, **kwargs)
+    return token, access(device_id, core, space, buffer_id, transforms)
+
+
+@ipc.fail_on_exception
+def store(token, device_id, core, space, buffer_id, transforms, val, *args, **kwargs):
+    transforms = jax.tree.map(int, transforms)
+    if plain(transforms):
+        return ORIGINAL["store"](token, device_id, core, space, buffer_id, transforms, val, *args, **kwargs)
+    access(device_id, core, space, buffer_id, transforms, val)
+    return token
+
+
+@ipc.fail_on_exception
+def swap(token, device_id, core, space, buffer_id, transforms, val, mask, **kwargs):
+    transforms = jax.tree.map(int, transforms)
+    if plain(transforms) or mask is not None:
+        return ORIGINAL["swap"](token, device_id, core, space, buffer_id, transforms, val, mask, **kwargs)
+    return token, access(device_id, core, space, buffer_id, transforms, val)
+
+
+ipc.get, ipc.store, ipc.swap = get, store, swap
+mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+
+
+def project(attended, weight, host_bf16):
+    # Every rank's owned rows (native 16-row backing) and FP32 partial.
+    B = attended.shape[1]
+    dmk.ATTENTION_HOST_BF16 = host_bf16  # read when the kernel is traced
+    scratch = dmk.communication_scratch(B)
+    backing = max(16, -(-B // 16) * 16)
+
+    def kernel(attended_ref, weight_ref, owned_out, partial_out, out, comm, local, host,
+               features, outputs, sends, recvs, phase):
+        phase[0] = 0
+        local[...] = jnp.full(local.shape, jnp.nan, jnp.float32)
+        host[...] = jnp.full(host.shape, jnp.nan, jnp.float32)
+        features[...] = jnp.full(features.shape, jnp.nan, jnp.bfloat16)
+        outputs[...] = jnp.full(outputs.shape, jnp.nan, jnp.bfloat16)
+        dmk._project_attention_2d(
+            attended_ref[...], weight_ref, out, comm, local, host, features, outputs,
+            sends, recvs, phase, dmk._dot, token_scatter_output=True)
+        owned_out[...] = outputs[...]
+        partial_out[...] = comm[...]
+
+    vmem = pltpu.VMEM
+
+    def body(attended, weight):
+        owned, partial = pl.pallas_call(
+            kernel,
+            out_shape=(jax.ShapeDtypeStruct((backing, H), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((B, 8192), jnp.float32)),
+            in_specs=[pl.BlockSpec(memory_space=vmem)] * 2,
+            out_specs=[pl.BlockSpec(memory_space=vmem)] * 2,
+            scratch_shapes=[vmem((B, H), jnp.bfloat16), vmem((B, 8192), jnp.float32),
+                            scratch[0], scratch[2], vmem((backing, 1024), jnp.bfloat16),
+                            vmem((backing, H), jnp.bfloat16), pltpu.SemaphoreType.DMA((16,)),
+                            pltpu.SemaphoreType.DMA((16,)), pltpu.SMEM((1,), jnp.int32)],
+            compiler_params=pltpu.CompilerParams(has_side_effects=True),
+            interpret=pltpu.InterpretParams(),
+        )(attended[0], weight[0])
+        return owned[None], partial[None]
+
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("tp"), P("tp")),
+                              out_specs=(P("tp"), P("tp")), check_vma=False))
+    return [np.asarray(x) for x in f(attended, weight)]
+
+
+f32 = lambda x: np.asarray(x, np.float32)
+bf = lambda x: f32(x).astype(BF16)
+
+
+def ordered_sum(parts):
+    total = parts[0]
+    for part in parts[1:]:
+        total = f32(total + part)
+    return total
+
+
+def reference(partial, B, host_bf16):
+    tpp = B // 4
+    out = np.zeros((32, tpp, H), BF16)
+    for t in range(4):
+        rows = slice(t * tpp, (t + 1) * tpp)
+        halves = []
+        for q in range(2):
+            hosts = [ordered_sum([f32(bf(partial[8 * h + 2 * p + q, rows, :HALF]))
+                                  for p in range(4)]) for h in range(4)]
+            if host_bf16:
+                hosts = [f32(bf(s)) for s in hosts]
+            halves.append(bf(ordered_sum(hosts)))
+        for h in range(4):
+            out[8 * h + 2 * t: 8 * h + 2 * t + 2] = np.concatenate(halves, axis=1)
+    return out
+
+
+rng = np.random.default_rng(0)
+for B in (8, 16, 24):
+    tpp = B // 4
+    attended = (rng.standard_normal((32, B, W)) * rng.uniform(0.2, 2.0, (32, 1, W))
+                / (1 + np.exp(-rng.standard_normal((32, B, W))))).astype(BF16)
+    full = (rng.standard_normal((32 * W, H)) * 0.01).astype(BF16)
+    # Rank r's shard: its pair's 768 features x its lane's output half.
+    weight = np.stack([full[768 * (r // 2):768 * (r // 2 + 1), (r % 2) * HALF:(r % 2 + 1) * HALF]
+                       for r in range(32)])
+    rows = {}
+    for host_bf16 in (False, True):
+        owned, partial = project(attended, weight, host_bf16)
+        got = owned[:, :tpp]
+        want = reference(partial, B, host_bf16)
+        assert np.array_equal(got.view(np.uint16), want.view(np.uint16)), (B, host_bf16)
+        for r in range(32):  # the four hosts' copies
+            for offset in (8, 16, 24):
+                assert np.array_equal(got[r].view(np.uint16), got[r ^ offset].view(np.uint16))
+        rows[host_bf16] = np.concatenate([got[2 * t] for t in range(4)])
+        print(f"B{B} host_bf16={host_bf16}: bit-exact")
+    changed = np.mean(rows[False] != rows[True])
+    assert 0.2 < changed < 0.6, changed  # the extra rounding moves a share of outputs by an ulp
+print("OK")
+"""
+
+    def test_host_sums_match_their_rounding_points(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        # 32 interpret devices block in callbacks: give the CPU client enough
+        # threads (XLA reads NPROC for its pool size).
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [sys.executable, "-c", self.SCRIPT],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1200,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
