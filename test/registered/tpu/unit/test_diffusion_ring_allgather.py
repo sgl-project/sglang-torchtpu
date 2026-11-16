@@ -21,6 +21,11 @@ from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEn
 from sglang.multimodal_gen.test.unit.test_usp_allgather_ring import (  # noqa: F401
     TestAllGatherRingAttention,
 )
+from sglang.multimodal_gen.test.unit.test_usp_ring_replicated import (  # noqa: F401
+    TestMergePartials,
+    TestRingReplicatedPrefix,
+    TestRingReplicatedSuffix,
+)
 from sglang.multimodal_gen.test.unit.test_usp_ring_tail_pad import (  # noqa: F401
     TestRingTailPadDispatch,
 )
