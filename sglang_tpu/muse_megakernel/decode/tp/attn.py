@@ -458,7 +458,11 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
     NS = c.attn_streams
     gls = sorted(c.global_layers)
     hoist_rows = tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_HOIST_MAX_ROWS.get()
-    hoist_kv = (R <= 64 or c.attn_opt == 5) if hoist_rows is None else R <= hoist_rows
+    hoist_kv = (
+        (R >= 64 or (hkv * qg <= 64 and c.n_req > 1 and not c.dense_skip))
+        if hoist_rows is None
+        else R <= hoist_rows
+    )
     n_alias_p = _attn_p_ysend_streams(c)
 
     if not isinstance(n_clean, int):
@@ -813,8 +817,274 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                             (qr_h * (c.attn_scale * LOG2E)).astype(jnp.bfloat16)
                         )
                         q_sch.append(1.0)
-                p_sub_dt = jnp.float8_e4m3fn if c.attn_head_fp8 >= 2 else jnp.bfloat16
-                ys_sub_rows = R * (4 if c.attn_head_fp8 >= 2 else 2) * c.top_k
+                p_sub_dt = jnp.float8_e4m3fn if c.attn_head_fp8 == 2 else jnp.bfloat16
+                ys_sub_rows = R * (4 if c.attn_head_fp8 == 2 else 2) * c.top_k
+
+                if c.attn_head_fp8 in (3, 4):
+                    q128 = jnp.concatenate(qh_list, axis=0)
+                    qsc128 = 1.0
+                    if use_fp8_q:
+                        qsc128 = jnp.concatenate(
+                            [jnp.broadcast_to(s, (64, 1)) for s in q_sch], axis=0
+                        )
+
+                    def p_get_128(par, t, s0, width):
+                        if t >= n_alias_p:
+                            return S["attn_p"][
+                                par, t - n_alias_p, pl.ds(0, 128), pl.ds(s0, width)
+                            ]
+                        ys_2d = S["ysend"].bitcast(p_sub_dt).reshape(ys_sub_rows, yw)
+                        if 2 * cpt_g <= yw:
+                            c0 = (
+                                par * cpt_g + s0
+                                if isinstance(par, int)
+                                else pl.multiple_of(par * cpt_g + s0, LANE)
+                            )
+                            return ys_2d[pl.ds(t * 128, 128), pl.ds(c0, width)]
+                        r_sub = (par * n_alias_p + t) * 128
+                        r_sub = (
+                            r_sub
+                            if isinstance(par, int)
+                            else pl.multiple_of(r_sub, 128)
+                        )
+                        return ys_2d[pl.ds(r_sub, 128), pl.ds(s0, width)]
+
+                    def p_put_128(par, t, s0, width, pb_128):
+                        if t >= n_alias_p:
+                            S["attn_p"][
+                                par, t - n_alias_p, pl.ds(0, 128), pl.ds(s0, width)
+                            ] = pb_128
+                            return
+                        ys_2d = S["ysend"].bitcast(p_sub_dt).reshape(ys_sub_rows, yw)
+                        if 2 * cpt_g <= yw:
+                            c0 = (
+                                par * cpt_g + s0
+                                if isinstance(par, int)
+                                else pl.multiple_of(par * cpt_g + s0, LANE)
+                            )
+                            ys_2d[pl.ds(t * 128, 128), pl.ds(c0, width)] = pb_128
+                            return
+                        r_sub = (par * n_alias_p + t) * 128
+                        r_sub = (
+                            r_sub
+                            if isinstance(par, int)
+                            else pl.multiple_of(r_sub, 128)
+                        )
+                        ys_2d[pl.ds(r_sub, 128), pl.ds(s0, width)] = pb_128
+
+                    def k_128(slot, s0, width):
+                        with _scope("kv_unpack"):
+                            return jnp.concatenate(
+                                [
+                                    pltpu.bitcast(
+                                        ring_words(geo, slot, 2 * h * w_hd, w_hd)[
+                                            :, pl.ds(s0, width)
+                                        ],
+                                        jnp.float8_e4m3fn,
+                                    )
+                                    for h in range(hkv)
+                                ],
+                                axis=0,
+                            )
+
+                    def v_128(slot, s0, width):
+                        with _scope("kv_unpack"):
+                            return jnp.concatenate(
+                                [
+                                    pltpu.bitcast(
+                                        ring_words(geo, slot, (2 * h + 1) * w_hd, w_hd)[
+                                            :, pl.ds(s0, width)
+                                        ],
+                                        jnp.float8_e4m3fn,
+                                    )
+                                    for h in range(hkv)
+                                ],
+                                axis=0,
+                            )
+
+                    if c.attn_head_fp8 == 4 and NS % 2 == 0:
+                        z128_q = jnp.zeros_like(q128)
+                        q256 = jnp.concatenate(
+                            [
+                                jnp.concatenate([q128, z128_q], axis=1),
+                                jnp.concatenate([z128_q, q128], axis=1),
+                            ],
+                            axis=0,
+                        )
+                        qsc256 = (
+                            jnp.concatenate([qsc128, qsc128], axis=0)
+                            if use_fp8_q
+                            else 1.0
+                        )
+
+                        def qk_all_128(i_start, par):
+                            ls128 = w2_f32[pl.ds(0, 128), pl.ds(2 * LANE, LANE)]
+                            for u in range(NS // 2):
+                                ta, tb = 2 * u, 2 * u + 1
+                                sa_sl = (i_start + ta) % KR_g
+                                sb_sl = (i_start + tb) % KR_g
+                                for s0 in (0, 256, 512, 768):
+                                    k256 = jnp.concatenate(
+                                        [
+                                            k_128(sa_sl, s0, 256),
+                                            k_128(sb_sl, s0, 256),
+                                        ],
+                                        axis=0,
+                                    )
+                                    with _scope("qk"):
+                                        s256 = jax.lax.dot_general(
+                                            q256,
+                                            k256,
+                                            (((1,), (0,)), ((), ())),
+                                            preferred_element_type=jnp.float32,
+                                        )
+                                        if use_fp8_q:
+                                            s256 = s256 * qsc256
+                                    with _scope("softmax"):
+                                        pe = jnp.exp2(s256)
+                                        ps = pe[:, :128] + pe[:, 128:256]
+                                        ls128 = ls128 + (ps[:128] + ps[128:])
+                                        pe_b = pe.astype(jnp.bfloat16)
+                                        p_put_128(par, ta, s0, 256, pe_b[:128])
+                                        p_put_128(par, tb, s0, 256, pe_b[128:])
+                            w2_f32[pl.ds(0, 128), pl.ds(2 * LANE, LANE)] = ls128
+
+                        def pv_all_128(i0, par):
+                            acc0 = w2_f32[pl.ds(0, 128), pl.ds(0, LANE)]
+                            acc1 = w2_f32[pl.ds(0, 128), pl.ds(LANE, LANE)]
+                            for u in range(NS // 2):
+                                ta, tb = 2 * u, 2 * u + 1
+                                sa_sl, sb_sl = (i0 + ta) % KR_g, (i0 + tb) % KR_g
+                                for s0 in (0, 256, 512, 768):
+                                    p256 = jnp.concatenate(
+                                        [
+                                            p_get_128(par, ta, s0, 256),
+                                            p_get_128(par, tb, s0, 256),
+                                        ],
+                                        axis=0,
+                                    )
+                                    v256 = jnp.concatenate(
+                                        [
+                                            v_128(sa_sl, s0, 256),
+                                            v_128(sb_sl, s0, 256),
+                                        ],
+                                        axis=0,
+                                    )
+                                    with _scope("pv"):
+                                        o256 = jax.lax.dot_general(
+                                            p256,
+                                            v256,
+                                            (((1,), (1,)), ((), ())),
+                                            preferred_element_type=jnp.float32,
+                                        )
+                                    acc0 = acc0 + o256[:128, :128]
+                                    acc1 = acc1 + o256[128:, 128:]
+                            w2_f32[pl.ds(0, 128), pl.ds(0, LANE)] = acc0
+                            w2_f32[pl.ds(0, 128), pl.ds(LANE, LANE)] = acc1
+
+                    else:
+
+                        def qk_all_128(i_start, par):
+                            ls128 = w2_f32[pl.ds(0, 128), pl.ds(2 * LANE, LANE)]
+                            for t in range(NS):
+                                slot = (i_start + t) % KR_g
+                                for s0 in (0, 512):
+                                    kp = k_128(slot, s0, 512)
+                                    with _scope("qk"):
+                                        s_h = jax.lax.dot_general(
+                                            q128,
+                                            kp,
+                                            (((1,), (0,)), ((), ())),
+                                            preferred_element_type=jnp.float32,
+                                        )
+                                        if use_fp8_q:
+                                            s_h = s_h * qsc128
+                                    with _scope("softmax"):
+                                        pe = jnp.exp2(s_h)
+                                        ls128 = ls128 + (
+                                            (pe[:, :128] + pe[:, 128:256])
+                                            + (pe[:, 256:384] + pe[:, 384:512])
+                                        )
+                                        p_put_128(
+                                            par, t, s0, 512, pe.astype(jnp.bfloat16)
+                                        )
+                            w2_f32[pl.ds(0, 128), pl.ds(2 * LANE, LANE)] = ls128
+
+                        def pv_all_128(i0, par):
+                            for a_idx in (0, 1):
+                                acc_cur = w2_f32[
+                                    pl.ds(0, 128), pl.ds(a_idx * LANE, LANE)
+                                ]
+                                for t in range(a_idx, NS, 2):
+                                    slot = (i0 + t) % KR_g
+                                    for s0 in (0, 512):
+                                        pb_s = p_get_128(par, t, s0, 512)
+                                        vp_s = v_128(slot, s0, 512)
+                                        with _scope("pv"):
+                                            dpv = jax.lax.dot_general(
+                                                pb_s,
+                                                vp_s,
+                                                (((1,), (1,)), ((), ())),
+                                                preferred_element_type=jnp.float32,
+                                            )
+                                        acc_cur = acc_cur + dpv
+                                w2_f32[pl.ds(0, 128), pl.ds(a_idx * LANE, LANE)] = (
+                                    acc_cur
+                                )
+
+                    z128_f = jnp.zeros((128, LANE), jnp.float32)
+                    for b_i in range(3):
+                        w2_f32[pl.ds(0, 128), pl.ds(b_i * LANE, LANE)] = z128_f
+                    qk_all_128(0, 0)
+
+                    def step_128(k, dummy, ref=None):
+                        i0 = NS * k
+                        par, npar = k % 2, (k + 1) % 2
+                        with _scope("kv_wait"):
+                            for t in range(NS):
+                                wait_chunk(geo, (i0 + NS + t) % KR_g)
+                        pv_all_128(i0, par)
+                        qk_all_128(i0 + NS, npar)
+                        if ref is not None:
+                            for t in range(NS):
+                                refill_slot(ref, i0 + KR_g + t)
+                        else:
+                            refill_global(i0 + KR_g)
+                        return dummy
+
+                    k_full = jnp.clip((n_ch - KR_g) // NS, 0, n_it - 1)
+                    if isinstance(l, int):
+                        jax.lax.fori_loop(
+                            0,
+                            k_full,
+                            functools.partial(step_128, ref=KV[l]),
+                            jnp.int32(0),
+                        )
+                    elif hoist_kv:
+                        _, k_full = hoisted(step_128, k_full, jnp.int32(0))
+                    else:
+                        k_full = 0
+                    jax.lax.fori_loop(k_full, n_it - 1, step_128, jnp.int32(0))
+                    pv_all_128(NS * (n_it - 1), (n_it - 1) % 2)
+                    refill_global(NS * (n_it - 1) + KR_g)
+                    acc_128 = (
+                        w2_f32[pl.ds(0, 128), pl.ds(0, LANE)]
+                        + w2_f32[pl.ds(0, 128), pl.ds(LANE, LANE)]
+                    )
+                    col_i = jax.lax.broadcasted_iota(jnp.int32, (qg, LANE), 1)
+                    acc_out = jnp.concatenate(
+                        [
+                            jnp.where(col_i < hd, acc_128[:qg], 0.0),
+                            jnp.where(col_i >= hd, acc_128[64 : 64 + qg], 0.0),
+                        ],
+                        axis=0,
+                    )
+                    ls_128 = w2_f32[pl.ds(0, 128), pl.ds(2 * LANE, LANE)]
+                    ls_out = jnp.concatenate(
+                        [ls_128[:qg], ls_128[64 : 64 + qg]],
+                        axis=0,
+                    )
+                    return (init[0], ls_out, acc_out), init
 
                 def p_get_sub(par, t, h, s0):
                     if t >= n_alias_p:
@@ -1361,7 +1631,7 @@ def request_attention_body(k: KernelCtx, geo, l, j, n_req_live):
                 carry4 = jax.lax.fori_loop(
                     0, k_full, functools.partial(step_body, ref=KV[l]), init4
                 )
-            elif hoist_rows is None or hoist_kv:
+            elif hoist_kv:
                 carry4, k_full = hoisted(step_body, k_full, init4)
             else:
                 carry4, k_full = init4, 0

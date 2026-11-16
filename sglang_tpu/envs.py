@@ -557,9 +557,11 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE = EnvStr("auto")
     # Megakernel attention on fp8 SEQ_ALONG_LANE pools: feed K (and V) to the MXU as fp8
     # instead of widening each chunk to bf16 on the VPU first. 0 = off, 1 = K only, 2 = K and V
-    # (exact). With the 2026-10-27 megakernel, 2 saves 0.09 / 0.20 / 0.40 ms per q = 1 step at
-    # 128k / 256k / 512k and nothing at q = 8.
-    SGLANG_TPU_MK_SAL_FP8_DOT = EnvInt(0)
+    # (exact).
+    SGLANG_TPU_MK_SAL_FP8_DOT = EnvInt(2)
+    # Decode megakernels (q > 4 on sal_fp8 pools): spill-free 256-token-sliced chunk-pair B2 +
+    # fp8 Q (fills the 256-deep fp8 MXU in one pass; NOT bit-identical).
+    SGLANG_TPU_MUSE_MK_ATTN_B2_FP8Q = EnvBool(False)
     # Profiling only: name the megakernel's in-kernel regions for xprof (needs libtpu
     # --xla_enable_custom_call_region_trace=true and a device tracer level above 1): 1 per
     # phase; 2 also per chunk / expert, which distorts the timing they show.
@@ -617,7 +619,7 @@ class TpuEnvs:
     SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
     # Decode megakernels (TP and EP): rows up to which global-layer chunk loops are hoisted
     # per global layer. 0 (default): one shared loop with tree-walk KV refill, which keeps
-    # the loops in IMEM overlays (q8 32k: TP -3 to -6.5%); 64 restores the previous hoisting.
+    # the loops in IMEM overlays; None: smart hoist (R >= 64 or multi-request stack2 q <= 4).
     SGLANG_TPU_MUSE_MK_ATTN_HOIST_MAX_ROWS = EnvInt(0)
 
     @classmethod
