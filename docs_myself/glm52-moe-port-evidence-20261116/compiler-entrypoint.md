@@ -160,3 +160,15 @@ only its reference argument order changes from 19 inputs + 1 output to 15 inputs
 buffer-interface adaptation, not evidence that aliasing caused the observed
 NaNs; actual sequential-shape device validation is still required. The bt24
 scale-folding math and every tuning choice are retained.
+
+`exp-n2lc3kxqlx` / `art-q8hoxm2726`, measurement
+`93d35535158b79ad49f14fca43cc836dc3ea70a5`, completed the isolated padded-only
+comparison in fresh workers. All eight ranks in each of pure/port/unfold passed
+with finite results. Relative L2 was 0.13696110 for pure and port, 0.13695937 for
+unfold; host-observed post-warmup medians were about 0.50–0.58 ms. This does not
+reproduce R6's sequential random/hot/zero/padded failure and does not establish
+the folded math as a cause. The exact failed input's RNG sequence is retained;
+the prior kernel invocation history differs. The explicit-output candidate
+therefore retains the original scale-folding branch and all tuning choices,
+and requires the complete sequential registered test rather than treating this
+isolated result as acceptance.
