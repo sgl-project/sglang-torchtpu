@@ -1,27 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ming-Image on TPU workers: a compiled MoE encoder and one compiled DiT per size.
+"""Ming-Image on TPU workers: a compiled MoE encoder and a bucketed DiT.
 
 Runtime patch, tracked debt:
-- Why: the encoder's MoE runs a Triton kernel, and its routing, image-token
-  mask and ``masked_scatter`` compute on int64 tensors on the device, which
-  torch_tpu aborts on or lacks; run eagerly it would also compile every op per
-  prompt length. The DiT's caption length is the prompt's, so the TPU default
-  (the whole DiT compiles as one module) compiles it again for every prompt,
-  and its masks and SP slices are Python ints of that length.
-- How: :func:`install`
-  (1) runs the encoder over prompt tokens right-padded to a multiple of 256
-      (causal: real tokens never see the padding), with the image rows and
-      their embeddings placed by host indices, and slices the real rows by
-      host lengths;
-  (2) compiles each encoder block whole, so routing stays in one XLA program,
-      and runs the experts through sglang_tpu's Pallas ``fused_moe_call``
-      (per-expert outputs, combined in float32 as the stock does), with expert
-      weights moved once to its ``(experts, in, out)`` layout;
-  (3) pads the DiT's caption to a multiple of 512 outside the compiled call.
-      The stock RoPE positions are built on the host, and the real image and
-      caption key counts go in as device int32. The joint and caption
-      attentions read each segment's real keys as resumable kernel steps,
-      with zero heads appended where Ulysses needs them (30 heads at 8).
+- Why: the encoder's MoE is a Triton kernel, and its routing, image-token mask
+  and ``masked_scatter`` run int64 ops on the device. The DiT's caption has
+  the prompt's length, and its masks and SP slices are Python ints of it, so
+  every new prompt compiles the DiT again.
+- How: :func:`install` runs the encoder over prompt tokens right-padded to a
+  multiple of 256 (causal) with host-built indices, compiles each encoder
+  block whole with the experts on sglang_tpu's Pallas ``fused_moe_call``,
+  and pads the DiT's caption to a multiple of 512 outside the compiled code;
+  the attention reads each segment's real keys (device int32 counts) as
+  resumable kernel steps, heads padded for Ulysses (30 to 32 at 8).
 - Upstream PR or issue: none.
 - Remove when: the encoder has a platform MoE path and host-built masks, and
   the DiT takes a platform caption bucket with key counts as data.
@@ -30,6 +20,7 @@ Runtime patch, tracked debt:
 from __future__ import annotations
 
 import functools
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -65,6 +56,8 @@ _STOCK_BLOCK_FORWARD = encoder.MingEncoderBlock.forward
 _STOCK_FUSED_EXPERTS = encoder.fused_experts
 _STOCK_DIT_FORWARD = dit.MingImageTransformer2DModel.forward
 _STOCK_USP_FORWARD = USPAttention.forward
+# Encoders whose expert weights are in the fused MoE's layout.
+_TPU_LAYOUT = weakref.WeakSet()
 
 
 # --- Encoder ---------------------------------------------------------------
@@ -93,16 +86,16 @@ def _fused_experts(hidden_states, w13, w2, topk_output, config):
 
 def _to_tpu_layout(model) -> None:
     """Moves expert weights once to the fused MoE's (experts, in, out) layout."""
+    if model in _TPU_LAYOUT:
+        return
     for module in model.modules():
-        if isinstance(module, encoder.MingExperts) and not getattr(
-            module, "_tpu_layout", False
-        ):
+        if isinstance(module, encoder.MingExperts):
             experts = module.experts
             experts.w13_weight.data = experts.w13_weight.data.transpose(
                 1, 2
             ).contiguous()
             experts.w2.data = experts.w2.data.transpose(1, 2).contiguous()
-            module._tpu_layout = True
+    _TPU_LAYOUT.add(model)
 
 
 @functools.lru_cache(maxsize=1)
@@ -196,12 +189,9 @@ def _counts(real: int, device) -> torch.Tensor:
 
 @functools.lru_cache(maxsize=16)
 def _layout(rope, shape, device):
-    """RoPE tables and real key counts of one request, built on the host.
-
-    ``rope`` is ``(theta, axes_dims, axes_lens)``. Returns the image rows'
-    and the caption rows' tables (the refiners'), this rank's
-    [image share | caption share] tables (the joint layers'), and the counts.
-    """
+    """One request's host-built RoPE tables: the image's and the caption's (the
+    refiners'), this rank's [image share | caption share] (the joint layers'),
+    and the real key counts. ``rope`` is ``(theta, axes_dims, axes_lens)``."""
     frames, hp, wp, cap_length, bucket, sp, rank = shape
     rotary = RopeEmbedder(*rope)
     n_img = frames * hp * wp
@@ -261,15 +251,8 @@ def _dit_call(self, *args, **kwargs):
         frames += reference.shape[2]
     rank = get_sp_parallel_rank() if sp > 1 else 0
     rope = (self.rotary_emb.theta, tuple(self.axes_dims), tuple(self.axes_lens))
-    shape = (
-        frames,
-        latents.shape[3] // 2,
-        latents.shape[4] // 2,
-        cap_length,
-        bucket,
-        sp,
-        rank,
-    )
+    shape = (frames, latents.shape[3] // 2, latents.shape[4] // 2, cap_length)
+    shape += (bucket, sp, rank)
     kwargs.update(
         # Zero rows, as the stock zero-masked padding.
         direct_embeddings=F.pad(direct, (0, 0, 0, bucket - cap_length)),
@@ -278,8 +261,16 @@ def _dit_call(self, *args, **kwargs):
     return torch.nn.Module.__call__(self, **kwargs)
 
 
-def dit_forward(
+def dit_forward(self, *args, tpu_layout=None, **kwargs):
+    """The stock forward, or with ``tpu_layout`` the bucketed one."""
+    if tpu_layout is None:
+        return _STOCK_DIT_FORWARD(self, *args, **kwargs)
+    return _bucketed_forward(self, tpu_layout, **kwargs)
+
+
+def _bucketed_forward(
     self,
+    layout,
     hidden_states,
     encoder_hidden_states,
     timestep,
@@ -287,18 +278,6 @@ def dit_forward(
     reference_latents=None,
     **kwargs,
 ):
-    """``MingImageTransformer2DModel.forward`` over a bucketed caption."""
-    layout = kwargs.pop("tpu_layout", None)
-    if layout is None:
-        return _STOCK_DIT_FORWARD(
-            self,
-            hidden_states,
-            encoder_hidden_states,
-            timestep,
-            direct_embeddings,
-            reference_latents,
-            **kwargs,
-        )
     x_freqs, cap_freqs, joint_freqs, (image_keys, cap_keys) = layout
     x = hidden_states
     batch_size, channels, output_frames, height, width = x.shape
@@ -357,7 +336,11 @@ def dit_forward(
 
 
 def _uses_kernel(impl, q, keys) -> bool:
-    if not getattr(impl, "use_splash", False) or q.device.type != "tpu":
+    if (
+        not isinstance(impl, tpu_splash_attn.TpuSplashAttentionImpl)
+        or not impl.use_splash
+        or q.device.type != "tpu"
+    ):
         return False
     # Every step takes the kernel or none does: their carries differ.
     return all(
