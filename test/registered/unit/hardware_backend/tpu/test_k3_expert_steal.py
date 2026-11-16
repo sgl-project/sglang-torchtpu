@@ -104,7 +104,6 @@ def _child(mode):
             barrier, 1, device_id=(sibling,), device_id_type=pl.DeviceIdType.MESH
         )
         pl.semaphore_wait(barrier, 1)
-        lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
 
         def run_expert(part0_source, part1_source, global_id, enabled, routes):
             copies = [
@@ -138,7 +137,7 @@ def _child(mode):
             partial[...] = jnp.zeros(partial.shape, jnp.float32)
             for expert in range(GROUP_EXPERTS):
                 # Every own expert a row routes, except the ones given away.
-                keep = jnp.sum(jnp.where((lanes == expert) & plan.given, 1, 0)) == 0
+                keep = ~plan.gives(expert)
                 run_expert(
                     part0_ref.at[layer, expert],
                     part1_ref.at[layer, expert],
@@ -146,9 +145,7 @@ def _child(mode):
                     keep,
                     routes,
                 )
-            expected = es.plan_packet(
-                plan.taken, plan.taken_slots, plan.take, layer, SLOTS
-            )
+            expected = es.packet(plan.take, layer, plan.ids, SLOTS)
             count, table = steal.receive(expected)
 
             @pl.loop(0, count)

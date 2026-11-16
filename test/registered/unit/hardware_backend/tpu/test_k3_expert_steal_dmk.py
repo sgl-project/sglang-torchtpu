@@ -204,7 +204,8 @@ def _child(mode, batch):
                             errors, ready=ready, returns=returns,
                             return_semaphores=(return_send, return_receive)),
                         group=group, local_expert_count=GROUP_EXPERTS,
-                        live_rows=rows_live, accumulators=accumulators)
+                        live_rows=rows_live, accumulators=accumulators,
+                        weights=moe_weights)
                     plan = None
                     if perturbed:
                         # Each core plans every other layer without rows 0-3
@@ -212,9 +213,14 @@ def _child(mode, batch):
                         dropped = (layer % 2 == rank) & (row_ids < 4)
                         plan = es.steal_plan(
                             layer_winners, rows_live & ~dropped, group, GROUP_EXPERTS, slots)
+                    # The router feeds the planner one selection at a time.
+                    planner = step.planner(batch, TOP_K)
+                    for selection in range(TOP_K):
+                        planner.add(selection, layer_winners[:, selection],
+                                    layer_probabilities[:, selection])
                     selected, selected_probabilities, counts = step.begin(
-                        layer_winners, layer_probabilities, layer, plan=plan)
-                    copy_expert = dmk._steal_copy_expert(moe_weights, staging, GROUP_EXPERTS)
+                        planner, layer, plan=plan)
+                    copy_expert = dmk._steal_copy_expert(moe_weights, GROUP_EXPERTS)
                 else:
                     nothing = jnp.zeros((1, 128), jnp.int32)
                     selected, selected_probabilities, counts = es.steal_routes(
@@ -366,7 +372,8 @@ def _child(mode, batch):
                     else "stolen multi-row" if n <= 8 else "stolen past a compact tile")
             # The receiver's routes name the stolen experts 112 + slot.
             light_routes = routes[light, layer, :, :128]
-            taken = set(light_routes[light_routes >= GROUP_EXPERTS].tolist())
+            stolen_ids = (light_routes >= GROUP_EXPERTS) & (light_routes != es.UNROUTED)
+            taken = set(light_routes[stolen_ids].tolist())
             ok &= taken == set(range(GROUP_EXPERTS, GROUP_EXPERTS + give))
     coverage.discard("")
     print(f"coverage {sorted(coverage)}", flush=True)

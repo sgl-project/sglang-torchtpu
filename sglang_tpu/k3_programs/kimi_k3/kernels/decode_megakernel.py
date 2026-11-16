@@ -236,7 +236,7 @@ def _route_hidden_states(
     after_score_send=None,
     live_rows=None,
     wait_for_projection_half=None,
-    defer_ownership=False,
+    steal_planner=None,
 ):
     """Project and select local expert routes through one shared B1/B2 path.
 
@@ -246,10 +246,10 @@ def _route_hidden_states(
     batch rows together. Selected local routes are returned as
     [batch_size, top_k] values for scalar SMEM materialization by the caller.
 
-    ``defer_ownership`` (the expert steal, which plans from every row's
-    experts first) returns every row's selections instead: (global expert ids
-    [batch_size, top_k], their probabilities, probability totals), with no
-    ``on_local_selection`` calls.
+    ``steal_planner`` (the expert steal, expert_steal.StealPlanner) takes
+    every selection instead of the ownership pass (inside the top-k loop, so
+    its work fills the argmax chain); only the probability totals are
+    returned then, with no ``on_local_selection`` calls.
     """
     rank = jax.lax.axis_index("tp")
     batch_size = hidden_states.shape[0]
@@ -282,7 +282,6 @@ def _route_hidden_states(
     probability_totals = jnp.zeros((batch_size,), jnp.float32)
     expert_ids = jnp.arange(expert_count)[None, :]
     route_slots = jnp.arange(selected_expert_count)[None, :]
-    winners_by_slot, probabilities_by_slot = [], []
     # Only top-k rank is sequential. Every score reduction and ownership
     # operation carries the leading batch dimension with no per-row control.
     for selection in range(selected_expert_count):
@@ -297,9 +296,8 @@ def _route_hidden_states(
         routing_scores_vmem[:, :expert_count] = jnp.where(
             winner_mask, -jnp.inf, routing_scores_vmem[:, :expert_count]
         )
-        if defer_ownership:
-            winners_by_slot.append(winners)
-            probabilities_by_slot.append(probabilities)
+        if steal_planner is not None:
+            steal_planner.add(selection, winners, probabilities)
             after_selection(selection)
             continue
 
@@ -333,12 +331,8 @@ def _route_hidden_states(
 
     if live_rows is not None:
         probability_totals = jnp.where(live_rows, probability_totals, 1.0)
-    if defer_ownership:
-        return (
-            jnp.stack(winners_by_slot, axis=1),
-            jnp.stack(probabilities_by_slot, axis=1),
-            probability_totals,
-        )
+    if steal_planner is not None:
+        return probability_totals
     return (
         selected_experts,
         selected_probabilities,
@@ -1126,9 +1120,12 @@ def _run_routed_expert_stream(
 
     ``stolen`` (the expert steal, with the schedule): local experts from
     ``stolen.first_expert`` on are the sibling's, in staging slot ``expert -
-    first_expert``. The stream copies them in without prefetching, after
-    ``stolen.stage(slot)`` (waits for the slot's slab), and adds each one's
-    output to its own FP32 accumulator ``stolen.accumulators[1 + slot]``
+    first_expert``. Each is copied in by ``stolen.start(staging_slot,
+    expert_slot)`` (which first waits for its slab) when it enters the copy
+    window, like a prefetched own expert: at the start of the iteration
+    before the one that runs it (iteration 0 for the first two pairs, whose
+    own experts the initial copies cover), and each one's output goes to its
+    own FP32 accumulator ``stolen.accumulators[1 + slot]``
     (``accumulators[0]`` is ``expert_output``).
     """
     batch_size, selected_expert_count = selected_experts.shape
@@ -2036,17 +2033,19 @@ def _run_routed_expert_stream(
                     _start_async_copies(fourth_copies)
 
                 if stolen is not None:
-                    # A stolen expert is copied in when it runs, once its slab
-                    # has landed in staging (never prefetched).
-                    for expert, has_expert, copies in (
-                        (first_expert, has_first, first_copies),
-                        (second_expert, has_second, second_copies),
-                    ):
+                    # Stolen experts entering the copy window (the next pair;
+                    # at iteration 0 also this one): from staging, once each
+                    # slab has landed. Schedule position p uses slot p % 4.
+                    @pl.loop(
+                        jnp.where(iteration == 0, 0, 2 * iteration + 2),
+                        2 * iteration + 4,
+                    )
+                    def start_stolen(position):
+                        expert, has_expert, _ = scheduled_expert(position)
 
                         @pl.when(has_expert & (expert >= stolen.first_expert))
-                        def start_stolen(expert=expert, copies=copies):
-                            stolen.stage(expert - stolen.first_expert)
-                            _start_async_copies(copies)
+                        def _():
+                            stolen.start(expert - stolen.first_expert, position % 4)
 
                 _phase_end(select_scope)
 
@@ -2252,7 +2251,7 @@ def _run_routed_expert_stream(
 
                     # KernelConfig.shared_expert_passes: the noncompact pair and
                     # tail run their passes from one copy (execute_noncompact_passes).
-                    shared_passes = SHARED_EXPERT_PASSES and compact_only and not EXPERT_STEAL
+                    shared_passes = SHARED_EXPERT_PASSES and compact_only
                     if not shared_passes:
 
                         @pl.when(has_first & has_second & ~compact_pair & ~multi_pair)
@@ -2379,16 +2378,16 @@ def _run_routed_expert_stream(
                             def noncompact_expert(index):
                                 first = index == 0
                                 slot = current_base_slot + index
+                                expert = pick(first, first_expert, second_expert)
                                 run_expert_in_passes(
                                     pick(first, first_rows, second_rows),
                                     pick(first, first_slot_mask, second_slot_mask),
-                                    copy_expert(
-                                        pick(first, first_expert, second_expert), slot
-                                    ),
+                                    copy_expert(expert, slot),
                                     pick(first, first_row_count, second_row_count),
                                     slot,
                                     paired_gate=compact_overflow,
                                     row_words=scheduled_row_words(index),
+                                    expert=expert,
                                 )
 
                     else:
@@ -2716,56 +2715,19 @@ def _start_async_copies(copies: SimpleNamespace) -> None:
             copy.start()
 
 
-class _StagedCopy:
-    """An expert weight family's copy into its slot from this core's HBM, or
-    for a stolen expert (``staged``) from its steal staging slot (built by
-    ``make_staging`` when started). Both land in the same slot with the same
-    semaphore and size, so either waits."""
-
-    def __init__(self, staged, local, make_staging):
-        self.staged, self.local, self.make_staging = staged, local, make_staging
-
-    def start(self):
-        @pl.when(self.staged)
-        def from_staging():
-            self.make_staging().start()
-
-        @pl.when(~self.staged)
-        def from_hbm():
-            self.local.start()
-
-    def wait(self):
-        self.local.wait()
-
-
-def _steal_copy_expert(weights, staging, local_expert_count):
-    """``copy_expert`` under the expert steal: local ids from
-    ``local_expert_count`` on are stolen experts, read from staging slot
-    ``expert - local_expert_count`` (``weights.make_staged_expert_copies``)."""
-    slots = staging[0].shape[0]
+def _steal_copy_expert(weights, local_expert_count):
+    """``copy_expert`` under the expert steal: local experts' copies from this
+    core's HBM. A stolen expert (local id ``local_expert_count + slot``) gets
+    the last local expert's descriptors, which only its waits use: its copy
+    from staging (_ExpertStealStep.start_stolen_copy) lands in the same expert
+    slot with the same semaphores and sizes."""
 
     def copy_expert(expert, slot, *, gate_up=True, down=True):
-        staged = expert >= local_expert_count
-        local = weights.make_expert_copies(
+        return weights.make_expert_copies(
             jnp.minimum(expert, local_expert_count - 1),
             slot,
             gate_up=gate_up,
             down=down,
-        )
-        index = jnp.clip(expert - local_expert_count, 0, slots - 1)
-        return SimpleNamespace(
-            **{
-                name: None
-                if copy is None
-                else _StagedCopy(
-                    staged,
-                    copy,
-                    functools.partial(
-                        weights.make_staged_expert_copy, staging, kind, index, slot
-                    ),
-                )
-                for kind, (name, copy) in enumerate(vars(local).items())
-            }
         )
 
     return copy_expert
@@ -2776,77 +2738,88 @@ class _ExpertStealStep:
     kernels/expert_steal.py, ``KernelConfig.expert_steal``, grouped B8/B16
     steps on the expert schedule).
 
-    ``begin`` (after routing, from every row's selections) plans, sends the
-    plan packet, pushes the given slabs and returns the local routes for the
-    expected packet: this group's experts except the given ones, then the
-    sibling's experts this core expects as local ids ``local_expert_count +
-    slot``. ``receive`` (before the expert stream) waits for the sibling's
-    packet; if it differs from the expected one, the routes are rebuilt from
-    it (``replace_routes``), so the slabs waited for and the experts run are
-    always the ones the sibling sent. The stream runs the stolen experts after
-    the own ones, each into ``accumulators[1 + slot]`` (``stream_hooks``).
-    ``combine`` returns those outputs, waits for this core's returned outputs
-    and adds them to ``routed_outputs`` in ascending expert id order (slot 0
-    holds the highest), then waits for this core's sends.
+    The router feeds every selection to ``planner`` (expert_steal.StealPlanner)
+    inside its top-k loop. ``begin`` then plans, sends the plan packet, pushes
+    the given slabs and returns the local routes for the expected packet: this
+    group's experts except the given ones, and the sibling's experts this core
+    expects as local ids ``local_expert_count + slot``. ``receive`` (before
+    the expert stream) waits for the sibling's packet; if it differs from the
+    expected one, the routes are rebuilt from it (``replace_routes``), so the
+    slabs waited for and the experts run are always the ones the sibling sent.
+    The stream runs the stolen experts after the own ones, each copied in from
+    its staging slot once the slot's slab has landed (``stream_hooks``) and
+    added to ``accumulators[1 + slot]``. ``combine`` returns those outputs,
+    waits for this core's returned outputs and adds them to ``routed_outputs``
+    in ascending expert id order (slot 0 holds the highest), then waits for
+    this core's sends.
     """
 
-    def __init__(self, protocol, *, group, local_expert_count, live_rows, accumulators):
+    def __init__(
+        self,
+        protocol,
+        *,
+        group,
+        local_expert_count,
+        live_rows,
+        accumulators,
+        weights,
+    ):
         self.protocol = protocol
         self.group = group
         self.local_expert_count = local_expert_count
         self.live_rows = live_rows
         self.accumulators = accumulators
+        self.weights = weights
         self.slots = protocol.slots
 
-    def routes(self, taken_ids, taken_count):
-        return expert_steal.steal_routes(
-            self.winners,
-            self.probabilities,
+    def planner(self, batch_size, top_k):
+        return expert_steal.StealPlanner(
+            batch_size,
+            top_k,
             self.live_rows,
             self.group,
             self.local_expert_count,
-            self.plan.given,
-            taken_ids,
-            taken_count,
+            self.slots,
         )
 
-    def begin(self, winners, probabilities, tag, plan=None):
+    def begin(self, planner, tag, plan=None):
         """``plan``: an override (tests perturb one core's plan)."""
         if plan is None:
-            plan = expert_steal.steal_plan(
-                winners, self.live_rows, self.group, self.local_expert_count, self.slots
-            )
-        self.winners, self.probabilities, self.plan = winners, probabilities, plan
+            plan = planner.plan()
+        self.planner_state, self.plan = planner, plan
         self.protocol.begin(plan, tag)
-        self.expected = expert_steal.plan_packet(
-            plan.taken, plan.taken_slots, plan.take, tag, self.slots
-        )
-        ids = expert_steal.IDS_ROW
-        return self.routes(self.expected[ids : ids + 1], plan.take)
+        self.expected = expert_steal.packet(plan.take, tag, plan.ids, self.slots)
+        return planner.routes(plan, plan.ids, plan.take)
 
     def receive(self, replace_routes):
-        count, _ = self.protocol.receive(self.expected)
-        received = self.protocol.packets[1]
+        received, mismatch = self.protocol.receive_packet(self.expected)
 
-        @pl.when(jnp.any(received != self.expected))
+        @pl.when(mismatch)
         def follow_the_sender():
-            ids = expert_steal.IDS_ROW
-            replace_routes(self.routes(received[ids : ids + 1], count))
+            count, ids = expert_steal.packet_fields(received, self.slots)
+            replace_routes(self.planner_state.routes(self.plan, ids, count))
+
+    def start_stolen_copy(self, index, slot):
+        """Copy stolen expert ``index`` (its staging slot) into expert slot
+        ``slot`` once its slab has landed, and zero its accumulator."""
+        self.protocol.stage(index)
+        stolen = self.accumulators.at[1 + index]
+        stolen[...] = jnp.zeros(stolen.shape, stolen.dtype)
+        for kind in range(4):
+            self.weights.make_staged_expert_copy(
+                self.protocol.staging, kind, index, slot
+            ).start()
 
     def stream_hooks(self):
-        def stage(slot):
-            self.protocol.stage(slot)
-            stolen = self.accumulators.at[1 + slot]
-            stolen[...] = jnp.zeros(stolen.shape, stolen.dtype)
-
         return SimpleNamespace(
             first_expert=self.local_expert_count,
             accumulators=self.accumulators,
-            stage=stage,
+            start=self.start_stolen_copy,
         )
 
     def combine(self, routed_outputs, width):
         protocol = self.protocol
+        protocol.wait_table()
         tables = protocol.packet_tables
         count = tables[1, expert_steal.HEADER_ROW, expert_steal.GIVE_LANE]
         give = tables[0, expert_steal.HEADER_ROW, expert_steal.GIVE_LANE]
@@ -3553,8 +3526,9 @@ def moe(
             local_expert_count=local_expert_count,
             live_rows=live_rows,
             accumulators=steal.accumulators,
+            weights=weights,
         )
-        copy_expert = _steal_copy_expert(weights, steal.staging, local_expert_count)
+        copy_expert = _steal_copy_expert(weights, local_expert_count)
 
     if not routing_projection_is_prefetched:
         weights.start_routing_projection_copy()
@@ -3742,7 +3716,8 @@ def moe(
                 )
 
         def route_for_steal():
-            winners, winner_probabilities, probability_totals = _route_hidden_states(
+            planner = steal_step.planner(batch_size, selected_expert_count)
+            probability_totals = _route_hidden_states(
                 hidden,
                 weights.routing_projection_vmem,
                 weights.routing_bias,
@@ -3764,10 +3739,10 @@ def moe(
                     if router_slots == 2
                     else None
                 ),
-                defer_ownership=True,
+                steal_planner=planner,
             )
             # Plan, send the packet and push the given slabs first.
-            routes = steal_step.begin(winners, winner_probabilities, steal.tag)
+            routes = steal_step.begin(planner, steal.tag)
             return (*routes, probability_totals)
 
         with _phase("p3_route"):

@@ -7,8 +7,8 @@ groups with the same TP4 quarter: kernel rank ``r`` holds group
 pre-shard directory :func:`expert_directory`; ``KernelConfig.expert_steal``
 puts the decode router, the rank loader and the EP8 prefill in this layout,
 :func:`owned_expert_group`). After routing both cores hold
-every row's experts, so each computes the same plan (:func:`steal_plan`): the
-core whose group routes more distinct experts gives its
+every row's experts, so each computes the same plan (:class:`StealPlanner`,
+:func:`steal_plan`): the core whose group routes more distinct experts gives its
 ``(D_mine - D_sibling) // 2`` highest-id experts (at most ``slots``) to its
 sibling. It pushes their weight slabs from its HBM into the sibling's HBM
 staging slots; the sibling runs them after its own experts and adds them to
@@ -19,7 +19,8 @@ Protocol per layer, the same code on both cores (:class:`ExpertSteal`):
 * ``begin(plan, layer)``: send the plan packet (always; it holds the give
   count, the layer and the given experts in slot order), then push the given
   slabs, one receive semaphore per staging slot.
-* ``receive(expected)``: wait for the sibling's packet. Its give count and
+* ``receive(expected)`` (or ``receive_packet``, which leaves the packet's
+  SMEM table copy in flight): wait for the sibling's packet. Its give count and
   expert ids, not this core's own plan, decide which slabs to wait for and
   run, so a plan mismatch cannot hang (every core sends and waits for exactly
   one packet a layer, and the slab waits follow the sender's count) and the
@@ -33,8 +34,8 @@ orders the two cores (every rank waits for its sibling's partial).
 
 In the decode megakernel (variant B, ``KernelConfig.expert_steal`` at the
 grouped B8/B16 steps) the receiver runs the stolen experts as local experts
-``local_expert_count + slot`` after its own (:func:`steal_routes`), each into
-its own FP32 accumulator, and returns those weighted outputs
+``local_expert_count + slot`` after its own (:meth:`StealPlanner.routes`),
+each into its own FP32 accumulator, and returns those weighted outputs
 (:meth:`ExpertSteal.send_returns`); the giver adds them after its own experts
 in ascending id order. The given experts are its highest-id ones, so every
 row adds the same terms in the same order as without the steal: the outputs
@@ -84,49 +85,24 @@ def owned_expert_group(rank, expert_tensor_parallel: int, steal_layout: bool):
     return rank // expert_tensor_parallel
 
 
-def used_experts(winners, live_rows, group, local_expert_count):
-    """[1, 128] bool: the local experts of ``group`` that a live row routes.
-
-    ``winners`` [batch, top_k] global expert ids, ``live_rows`` a [batch]
-    mask or None. Per route slot the ownership test and the live mask stay
-    one-dimensional, as in the router: Mosaic rejects reshaping a [batch]
-    mask loaded as a VMEM row into a [batch, 1] column."""
-    lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
-    used = jnp.zeros((1, 128), jnp.bool_)
-    for route in range(winners.shape[1]):
-        column = winners[:, route]
-        owned = column // local_expert_count == group
-        if live_rows is not None:
-            owned &= live_rows
-        local = jnp.where(owned, column % local_expert_count, -1)
-        used |= jnp.any(local[:, None] == lanes, axis=0, keepdims=True)
-    return used
+# Route value of a route slot that runs no expert here under the steal's route
+# layout (StealPlanner.routes): above every expert lane, so neither the expert
+# schedule nor the initial expert copies pick it.
+UNROUTED = 255
 
 
-def _count(mask):
-    return jnp.sum(mask.astype(jnp.int32))
-
-
-def _higher_used(used):
-    """[1, 128] int32: per lane, how many used lanes have a higher id (exact:
-    a 0/1 product of at most 128 terms)."""
-    rows = jax.lax.broadcasted_iota(jnp.int32, (128, 128), 0)
-    columns = jax.lax.broadcasted_iota(jnp.int32, (128, 128), 1)
-    product = jax.lax.dot_general(
-        jnp.broadcast_to(used.astype(jnp.bfloat16), (8, 128)),
-        (rows > columns).astype(jnp.bfloat16),
-        (((1,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32,
-    )
-    return product[:1].astype(jnp.int32)
-
-
-def _side(used, count):
-    """The ``count`` highest-id used experts: their mask and staging slots
-    (slot 0 the highest id)."""
-    higher = _higher_used(used)
-    moved = used & (higher < count)
-    return moved, higher
+def route_code(winners, live_rows, group, local_expert_count):
+    """Per route (``winners``: global expert ids, any shape): its local id when
+    ``group`` holds the expert, local id + 128 when the sibling group
+    (``group ^ 1``) does, else -1 (also for rows outside ``live_rows``, a mask
+    of ``winners``' shape or None). Integer compares and selects only."""
+    pair_local = winners - (group // 2) * (2 * local_expert_count)
+    high = pair_local >= local_expert_count
+    local = jnp.where(high, pair_local - local_expert_count, pair_local)
+    keep = (pair_local >= 0) & (pair_local < 2 * local_expert_count)
+    if live_rows is not None:
+        keep &= live_rows
+    return jnp.where(keep, jnp.where(high == (group % 2 == 1), local, local + 128), -1)
 
 
 def steal_slots(batch_size: int) -> int:
@@ -135,42 +111,149 @@ def steal_slots(batch_size: int) -> int:
     return 2 if batch_size <= 8 else 4
 
 
+class StealPlan(SimpleNamespace):
+    """Both cores' identical plan (:meth:`StealPlanner.plan`), int32 scalars:
+    ``d_mine`` / ``d_theirs`` the distinct experts this core's and the
+    sibling's group route, ``give`` / ``take`` the experts this core gives /
+    takes and ``ids[s]`` (s < ``slots``) the moving experts' local ids in
+    staging-slot order (the heavier group's highest used ids, slot 0 the
+    highest; valid for s < give + take)."""
+
+    def gives(self, local):
+        """Whether this core gives local expert(s) ``local``: exactly the
+        experts its packet declares, also when its plan differs from the
+        sibling's."""
+        given = jnp.zeros(jnp.shape(local), jnp.bool_)
+        for slot, expert in enumerate(self.ids):
+            given |= (local == expert) & (slot < self.give)
+        return given
+
+
+class StealPlanner:
+    """The steal plan and routes, built one top-k selection at a time.
+
+    ``add(selection, winners, probabilities)`` (every row's winner of one
+    selection, [batch]) marks each live route's expert in this core's or the
+    sibling's used-expert lanes and keeps the routes' codes
+    (:func:`route_code`) and probabilities by selection slot. The decode
+    router calls it inside its top-k loop, where it fills the argmax chain's
+    idle slots. :meth:`plan` then counts the distinct experts of each group
+    and finds the moving experts with a few lane reductions, and
+    :meth:`routes` gives the local routes from the codes with elementwise ops.
+    """
+
+    def __init__(self, batch_size, top_k, live_rows, group, local_expert_count, slots):
+        self.top_k, self.live_rows, self.group = top_k, live_rows, group
+        self.local_expert_count, self.slots = local_expert_count, slots
+        self.lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
+        self.route_slots = jax.lax.broadcasted_iota(jnp.int32, (1, top_k), 1)
+        self.mine = jnp.zeros((batch_size, 128), jnp.bool_)
+        self.theirs = jnp.zeros((batch_size, 128), jnp.bool_)
+        self.codes = jnp.full((batch_size, top_k), -1, jnp.int32)
+        self.probabilities = jnp.zeros((batch_size, top_k), jnp.float32)
+
+    def add(self, selection, winners, probabilities=None):
+        code = route_code(winners, self.live_rows, self.group, self.local_expert_count)
+        code = code[:, None]
+        self.mine |= code == self.lanes
+        self.theirs |= code == self.lanes + 128
+        here = self.route_slots == selection
+        self.codes = jnp.where(here, code, self.codes)
+        if probabilities is not None:
+            self.probabilities = jnp.where(
+                here, probabilities[:, None], self.probabilities
+            )
+
+    @classmethod
+    def from_winners(
+        cls, winners, live_rows, group, local_expert_count, slots, probabilities=None
+    ):
+        """The planner of whole [batch, top_k] selections."""
+        planner = cls(*winners.shape, live_rows, group, local_expert_count, slots)
+        for selection in range(winners.shape[1]):
+            planner.add(
+                selection,
+                winners[:, selection],
+                None if probabilities is None else probabilities[:, selection],
+            )
+        return planner
+
+    def plan(self):
+        """The core whose group routes more distinct experts gives its
+        ``(D_mine - D_sibling) // 2`` highest-id ones (at most ``slots``)."""
+        lanes = self.lanes.astype(jnp.float32)
+        # Lane counts and ids below 128: exact FP32 reductions.
+        used_mine = jnp.any(self.mine, axis=0, keepdims=True).astype(jnp.float32)
+        used_theirs = jnp.any(self.theirs, axis=0, keepdims=True).astype(jnp.float32)
+        d_mine = jnp.sum(used_mine).astype(jnp.int32)
+        d_theirs = jnp.sum(used_theirs).astype(jnp.int32)
+        difference = d_mine - d_theirs
+        moved = jnp.minimum(jnp.abs(difference) // 2, self.slots)
+        giving = (difference > 0).astype(jnp.float32)
+        heavy = used_theirs + giving * (used_mine - used_theirs)
+        candidates = jnp.where(heavy > 0, lanes, -1.0)
+        ids = []
+        for _ in range(self.slots):
+            top = jnp.max(candidates)
+            ids.append(top.astype(jnp.int32))
+            candidates = jnp.where(lanes < top, candidates, -1.0)
+        give = jnp.where(difference > 0, moved, 0)
+        return StealPlan(
+            used=used_mine > 0,
+            d_mine=d_mine,
+            d_theirs=d_theirs,
+            give=give,
+            take=moved - give,
+            ids=ids,
+        )
+
+    def routes(self, plan, taken_ids, taken_count):
+        """The local routes under the steal: [batch, top_k] experts in
+        selection slots (UNROUTED where a slot runs nothing here), their
+        probabilities, and the route count (top_k for a row with any local
+        route, else 0; every slot below it is checked against the expert).
+
+        A route is local when its expert is this core's group's except the
+        ones ``plan`` gives, or the sibling's expert ``taken_ids[s]`` with
+        s < ``taken_count`` (staging slot s), which runs as local id
+        ``local_expert_count + s``. The expert schedule and the stream ignore
+        route order within a row."""
+        codes = self.codes
+        mine = (codes >= 0) & (codes < 128)
+        theirs = codes >= 128
+        local = jnp.where(theirs, codes - 128, codes)
+        owned = mine & ~plan.gives(local)
+        slot_of = jnp.zeros(codes.shape, jnp.int32)
+        for slot, expert in enumerate(taken_ids):
+            hit = theirs & (local == expert) & (slot < taken_count)
+            owned |= hit
+            slot_of = jnp.where(hit, slot, slot_of)
+        experts = jnp.where(
+            owned,
+            jnp.where(mine, local, self.local_expert_count + slot_of),
+            UNROUTED,
+        )
+        counts = jnp.where(jnp.any(owned, axis=1), self.top_k, 0)
+        return experts, self.probabilities, counts
+
+
 def steal_plan(winners, live_rows, group, local_expert_count, slots):
     """Both cores' identical plan from every row's routed experts.
 
     ``winners`` [batch, top_k] global expert ids, ``group`` this core's expert
-    group (the sibling holds ``group ^ 1``). ``give`` experts of this core's
-    group move to the sibling, ``take`` of the sibling's move here."""
-    mine = used_experts(winners, live_rows, group, local_expert_count)
-    theirs = used_experts(winners, live_rows, group ^ 1, local_expert_count)
-    d_mine, d_theirs = _count(mine), _count(theirs)
-    give = jnp.minimum(jnp.maximum(d_mine - d_theirs, 0) // 2, slots)
-    take = jnp.minimum(jnp.maximum(d_theirs - d_mine, 0) // 2, slots)
-    given, given_slots = _side(mine, give)
-    taken, taken_slots = _side(theirs, take)
-    return SimpleNamespace(
-        used=mine,
-        given=given,
-        given_slots=given_slots,
-        give=give,
-        taken=taken,
-        taken_slots=taken_slots,
-        take=take,
-        d_mine=d_mine,
-        d_theirs=d_theirs,
-    )
+    group (the sibling holds ``group ^ 1``)."""
+    return StealPlanner.from_winners(
+        winners, live_rows, group, local_expert_count, slots
+    ).plan()
 
 
-def plan_packet(moved, moved_slots, count, layer, slots):
-    """The [8, 128] int32 packet announcing ``count`` moved experts."""
+def packet(count, layer, ids, slots):
+    """The [8, 128] int32 plan packet announcing ``count`` moved experts
+    (``ids[s]``: staging slot s's local expert id)."""
     lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
-    ids = jnp.zeros((1, 128), jnp.int32)
+    id_row = jnp.zeros((1, 128), jnp.int32)
     for slot in range(slots):
-        ids += jnp.where(
-            lanes == slot,
-            jnp.sum(jnp.where(moved & (moved_slots == slot), lanes, 0)),
-            0,
-        )
+        id_row = jnp.where((lanes == slot) & (slot < count), ids[slot], id_row)
     header = jnp.where(
         lanes == GIVE_LANE,
         count,
@@ -180,8 +263,22 @@ def plan_packet(moved, moved_slots, count, layer, slots):
     )
     rows = jax.lax.broadcasted_iota(jnp.int32, PACKET_SHAPE, 0)
     return jnp.where(
-        rows == HEADER_ROW, header, jnp.where(rows == IDS_ROW, ids, 0)
+        rows == HEADER_ROW, header, jnp.where(rows == IDS_ROW, id_row, 0)
     ).astype(jnp.int32)
+
+
+def packet_fields(value, slots):
+    """A packet value's count and staging-slot expert ids (int32 scalars)."""
+    rows = jax.lax.broadcasted_iota(jnp.int32, PACKET_SHAPE, 0)
+    lanes = jax.lax.broadcasted_iota(jnp.int32, PACKET_SHAPE, 1)
+    values = value.astype(jnp.float32)  # small integers: exact
+
+    def field(row, lane):
+        return jnp.sum(jnp.where((rows == row) & (lanes == lane), values, 0.0)).astype(
+            jnp.int32
+        )
+
+    return field(HEADER_ROW, GIVE_LANE), [field(IDS_ROW, slot) for slot in range(slots)]
 
 
 def steal_routes(
@@ -194,7 +291,8 @@ def steal_routes(
     taken_ids,
     taken_count,
 ):
-    """The local routes under the steal, in the router's layout.
+    """The local routes under the steal, in the router's layout (compacted
+    in selection order; the decode megakernel uses StealPlanner.routes).
 
     ``winners`` / ``probabilities`` [batch, top_k] are every row's selections
     in top-k order. A route is local when its expert is one of ``group``'s
@@ -249,7 +347,8 @@ class ExpertSteal:
     indexed by local expert id); ``staging``: the staging families
     ([slots, ...] HBM refs, written by the sibling); ``packets``: VMEM
     [2, 8, 128] int32 (0: sent, 1: received); ``packet_tables``: SMEM
-    [2, 8, 128] int32 copies of them; ``semaphores``: DMA semaphores
+    [2, 8, 128] int32 (0: the sent count and ids, 1: a copy of the received
+    packet); ``semaphores``: DMA semaphores
     (packet send, packet receive, slab send, the packet table copies [2],
     slab receives [slots]); ``errors``: SMEM int32 [1] mismatch counter.
 
@@ -322,36 +421,44 @@ class ExpertSteal:
         ]
 
     def begin(self, plan, layer):
-        """Send the plan packet, then push the given experts' slabs."""
+        """Send the plan packet, then push the given experts' slabs (slot 0
+        first). The packet table 0 in SMEM holds the give count and the given
+        ids, stored from the plan's scalars."""
         if self.ready is not None:
             for slot in range(self.slots):
                 self.ready[slot] = 0
-        self.packets[0] = plan_packet(
-            plan.given, plan.given_slots, plan.give, layer, self.slots
-        )
+        self.packets[0] = packet(plan.give, layer, plan.ids, self.slots)
         self._packet_copy().start()
-        table = self._table_copy(0)
-        table.start()
-        table.wait()
-        give = self.packet_tables[0, HEADER_ROW, GIVE_LANE]
+        table = self.packet_tables.at[0]
+        table[HEADER_ROW, GIVE_LANE] = plan.give
+        for slot in range(self.slots):
+            table[IDS_ROW, slot] = plan.ids[slot]
 
-        @pl.loop(0, give)
+        @pl.loop(0, plan.give)
         def _(slot):
-            expert = self.packet_tables[0, IDS_ROW, slot]
-            for copy in self._slab_copies(expert, slot):
+            for copy in self._slab_copies(table[IDS_ROW, slot], slot):
                 copy.start()
+
+    def receive_packet(self, expected_packet):
+        """Wait for the sibling's packet and start its copy to packet table 1
+        (:meth:`wait_table` before reading it). Returns the packet and whether
+        it differs from ``expected_packet`` (counted as a mismatch)."""
+        self._packet_copy().wait_recv()
+        self._table_copy(1).start()
+        received = self.packets[1]
+        mismatch = jnp.any(received != expected_packet)
+        self.errors[0] += mismatch.astype(jnp.int32)
+        return received, mismatch
+
+    def wait_table(self):
+        self._table_copy(1).wait()
 
     def receive(self, expected_packet):
         """Wait for the sibling's packet; returns its (count, table) where
         ``table[IDS_ROW, j]`` is staging slot j's expert (sibling-local id).
         Counts a mismatch when the packet is not ``expected_packet``."""
-        self._packet_copy().wait_recv()
-        table = self._table_copy(1)
-        table.start()
-        received = self.packets[1]
-        mismatch = jnp.any(received != expected_packet).astype(jnp.int32)
-        table.wait()
-        self.errors[0] += mismatch
+        self.receive_packet(expected_packet)
+        self.wait_table()
         return self.packet_tables[1, HEADER_ROW, GIVE_LANE], self.packet_tables.at[1]
 
     def wait_slab(self, slot):
