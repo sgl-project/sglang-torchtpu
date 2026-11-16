@@ -296,6 +296,30 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "splits a 4-slot pack"):
             geometry.check_decode_rank(0)
 
+    def test_register_reshard_request_refuses_partial_pack_without_sending(self):
+        mgr = _manager(
+            tensor=_fused_layer(dtype=torch.float8_e4m3fn, heads=2), local_tp=4
+        )
+        mgr.kv_args.engine_rank = 0
+        mgr._state_lock = threading.Lock()
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr._failed = set()
+        mgr._ensure_engine = mock.Mock()
+        mgr._send_multipart_locked = mock.Mock()
+        infos = [{"rank_ip": "10.0.0.1", "rank_port": p} for p in (1, 2)]
+        mgr._register_reshard_request(
+            room=42,
+            local_blocks=[1, 2],
+            local_swa_blocks=[],
+            aux_index=None,
+            bootstrap_infos=infos,
+        )
+        self.assertIn("42", mgr._failed)
+        self.assertIn("Partial FP8 head packs are unsupported", mgr.failure_records[42])
+        mgr._ensure_engine.assert_not_called()
+        mgr._send_multipart_locked.assert_not_called()
+
     def test_fp8_equal_8_to_8(self):
         self._check(torch.float8_e4m3fn, 8, 8)
 
