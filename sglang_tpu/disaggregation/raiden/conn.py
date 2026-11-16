@@ -188,8 +188,6 @@ class RaidenKVManager(
     _bounded_staging = False
     _listener_start_read = False
     _stop_listener: Optional[threading.Event] = None
-    # time.monotonic() of the scheduler's latest drain; the listener sweep
-    # stands down while the scheduler drains on its own.
     _last_scheduler_drain = float("-inf")
     # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
     kv_layout: str = PER_LAYER_KV_LAYOUT
