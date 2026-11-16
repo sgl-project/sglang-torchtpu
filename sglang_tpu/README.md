@@ -256,6 +256,70 @@ zero launches.
   cache, failing with the size it needs if not.
 - Not supported with DP attention or prefill context parallelism.
 
+## Prefill context parallelism modes
+
+`--attn-cp-size N --enable-prefill-cp --cp-strategy zigzag` shards each prefill
+over the TP group by zigzag blocks (`cp_layout.py`). `SGLANG_TPU_PCP_MODE`
+selects where the KV cache lives:
+
+- `gather` (default). Every core all-gathers the chunk's K/V on every layer,
+  writes the whole sequence into its own fully replicated KV pool and runs
+  ordinary attention over its rows. Decode is not split across cores.
+- `ring`. The KV cache is page-striped across the cores, exactly as under
+  decode context parallelism: core `r` stores global page `l * N + r`, the page
+  table is identical on every core, and each core holds 1/N of the cache. A
+  zigzag prefill still all-gathers the chunk's K/V per layer (bf16, quantized
+  to fp8 after the gather), but nothing is written from another core's rows:
+  the fused ring kernel (`attention_pallas_rpa_pcp.py`) attends the cached
+  prefix by rotating KV blocks around the cores with remote DMA, then the
+  gathered chunk; each core then writes only the new pages it owns
+  (`sglang_tpu::kv_write_rows`). The ring kernel reads the pool and never
+  aliases it, because XLA copies an operand that a kernel with remote DMA
+  aliases. Decode and every extend the zigzag strategy does not take run the
+  DCP path over the same stripes.
+
+Ring mode:
+
+- Requires a power-of-two `--attn-cp-size` with `--enable-prefill-cp`;
+  `--dcp-size` is set to it at start-up (a different `--dcp-size` is refused).
+  Also `--page-size >= 256` and
+  `--chunked-prefill-size >= page size x N` (DCP's rule). `--max-total-tokens`
+  is the pool of one core, so the server holds N times that.
+- Attention TP `T = --tp-size / N` may exceed 1 (e.g. PCP4 x TP2 on 8 cores):
+  each core keeps its attention-TP share of the KV heads, the stripes and the
+  decode merge run over the attention-CP group (ranks `t, t + T, ...`), not
+  SGLang's consecutive-rank DCP group, and the ring kernel runs on a `(N, T)`
+  mesh ringing along `N`. For Qwen3-30B-A3B (4 KV heads, fp8 cache packing 4
+  rows per word) `T = 2` is the largest attention TP that does not pad the pool.
+- MoE: `--moe-dp-size N` is required (the MoE runs on each core's own tokens).
+  With `T > 1` the recommended layout is MoE DP x EP, `--ep-size T` (whole
+  experts per core, `--ep-size x --moe-dp-size == --tp-size`); expert
+  parallelism over the CP-gathered tokens is not supported.
+- Supports Qwen3-MoE on the batched RPA backend with the `HEAD_ALONG_SUBLANE`
+  KV layout, on one host, with the TP group equal to the whole world. Refused:
+  gpt-oss (attention sinks, sliding window), `SGLANG_TPU_USE_SEQ_ALONG_LANE_KV`,
+  `--enable-mixed-chunk`, pipeline parallelism, DP replicas, DP attention,
+  HiCache, PD disaggregation, speculative decoding, `--dcp-replicate-q-proj`.
+- Zigzag blocks are page-aligned and every core reserves two blocks per
+  request (`2 x align_up(ceil(len / 2N), page)` local rows), padded with rows
+  whose outputs are discarded, so that every core runs the same ring schedule.
+  Prompts shorter than `2N` pages therefore lose load balance, and a prefill
+  batch can hold at most `largest CP token bucket / (2 x page)` requests; a
+  batch that does not fit runs the DCP extend program instead. Token buckets
+  used by context-parallel batches must be multiples of `2 x page`.
+- One compiled program per bucket serves first chunks and cached prefixes. The
+  ring op is a collective: every core launches it in the same order with the
+  same static shapes, during warmup too.
+- Recipe: `benchmark/tpu/recipe/qwen3_30b_a3b_fp8_pcp_ring.sh` (`ATTN_CP_SIZE=4`
+  for PCP4 x TP2 with MoE DP4 x EP2; `EP_SIZE` overrides the EP default).
+- Experimental kernel package: the fused ring kernel
+  (`ragged_paged_attention_pcp_fused`) and its host-side schedule check live in
+  `attention/pallas/batched_rpa_pcp/`, a separate copy of the batched RPA kernel
+  (synced to google3, plus the ring kernel) that only ring-mode prefill
+  imports. Decode and DCP extends in ring mode use the production
+  `attention/pallas/batched_rpa/` kernel (`AttentionScope.STRIPED` /
+  `NEW_TOKENS_ONLY`), like plain DCP.
+
 ## Fixed-cohort benchmark gate
 
 - Enable with `SGLANG_TPU_BENCHMARK_BATCH_SIZE=N` (default: `0`, disabled).
