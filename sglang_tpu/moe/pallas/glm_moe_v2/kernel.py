@@ -2,6 +2,8 @@
 # Adapted from sgl-project/sglang-jax, Apache-2.0.
 # Revision: c948bdda95208e68a474c8088937347d08fe8937
 # Source: python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py
+# TorchTPU adaptation: pure returned-output call; synchronization is unchanged.
+# The fixed-bucket caller dependency contract is documented in README.md.
 """Fused EP MoE v2 kernel — Strix-style double-buffer expert FFN.
 
 Key differences from v1:
@@ -2871,7 +2873,7 @@ def fused_ep_moe_v2(
             compiler_params=pltpu.CompilerParams(
                 collective_id=0,
                 allow_collective_id_without_custom_barrier=True,
-                has_side_effects=True,
+                has_side_effects=False,
                 vmem_limit_bytes=64 * 1024 * 1024,
             ),
             name=scope_name,

@@ -300,6 +300,128 @@ def idle_bucket_cases(
     return reports
 
 
+def binder_loading_cases(ep, rank):
+    """Run the real post-load storage and shared-gather operations on TPU."""
+    import json
+    from types import SimpleNamespace
+
+    import torch
+    from torch.nn import Parameter
+
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
+    from sglang_tpu.moe.glm_moe_v2 import _prepare_shared, _replace_data
+    from sglang_tpu.moe.pallas.glm_moe_v2.op import pack_gate_up, pack_gate_up_scale
+
+    cpu = ((torch.arange(2 * 128 * 256).reshape(2, 128, 256) % 31).float() * 0.001).to(
+        torch.float8_e4m3fn
+    )
+    parameter = Parameter(cpu.to("tpu"), requires_grad=False)
+    marker = object()
+    parameter.loader_marker = marker
+    old = parameter.data
+    old_storage = old.untyped_storage()
+    packed = pack_gate_up(old)
+    old_pointer, new_pointer = (
+        old_storage.data_ptr(),
+        packed.untyped_storage().data_ptr(),
+    )
+    _replace_data(parameter, packed)
+    torch.accelerator.synchronize()
+    assert parameter.loader_marker is marker
+    assert torch.equal(
+        parameter.cpu().view(torch.uint8), pack_gate_up(cpu).view(torch.uint8)
+    )
+    if old_pointer != new_pointer:
+        assert old_storage.nbytes() == 0
+    scale_cpu = torch.linspace(0.7, 1.3, 2 * 256).reshape(2, 1, 1, 256).bfloat16()
+    scale = Parameter(scale_cpu.to("tpu"), requires_grad=False)
+    _replace_data(scale, pack_gate_up_scale(scale.data))
+    torch.accelerator.synchronize()
+    assert torch.equal(scale.cpu(), pack_gate_up_scale(scale_cpu))
+
+    # Create the real coordinator, not a mocked collective. It invokes the same
+    # registered TPU all_gather_into_tensor path used by model preparation.
+    group = GroupCoordinator(
+        group_ranks=[list(range(ep))],
+        local_rank=int(os.environ["LOCAL_RANK"]),
+        torch_distributed_backend="tpu_dist",
+        use_pynccl=False,
+        use_mscclpp=False,
+        use_custom_allreduce=False,
+        use_torch_symm_mem_all_reduce=False,
+        use_hpu_communicator=False,
+        use_xpu_communicator=False,
+        use_npu_communicator=False,
+        group_name="glm-moe-v2-loading-preflight",
+    )
+    try:
+        h, inter = 256, 2048
+        gate = (
+            ((torch.arange(h * inter).reshape(h, inter) % 23).float() - 11) * 0.002
+        ).to(torch.float8_e4m3fn)
+        up = (
+            ((torch.arange(h * inter).reshape(h, inter) % 19).float() - 9) * 0.003
+        ).to(torch.float8_e4m3fn)
+        down = (
+            ((torch.arange(inter * h).reshape(inter, h) % 17).float() - 8) * 0.004
+        ).to(torch.float8_e4m3fn)
+        gate_scale = torch.linspace(0.6, 1.2, inter)
+        up_scale = torch.linspace(0.8, 1.4, inter)
+        down_scale = torch.linspace(0.7, 1.3, h)
+        width = inter // ep
+        shard = slice(rank * width, (rank + 1) * width)
+        fixture_moe = torch.nn.Module()
+        fixture_moe._shared_expert_tp1 = False
+        fixture_moe.shared_experts = torch.nn.Module()
+        gate_up = fixture_moe.shared_experts.gate_up_proj = torch.nn.Module()
+        gate_up.weight = Parameter(
+            torch.cat((gate[:, shard], up[:, shard]), 1).contiguous().to("tpu"),
+            requires_grad=False,
+        )
+        gate_up.weight_scale_inv = Parameter(
+            torch.cat((gate_scale[shard], up_scale[shard])).to("tpu"),
+            requires_grad=False,
+        )
+        gate_up.weight_block_size = None
+        projection = fixture_moe.shared_experts.down_proj = torch.nn.Module()
+        projection.weight = Parameter(
+            down[shard].contiguous().to("tpu"), requires_grad=False
+        )
+        projection.weight_scale_inv = Parameter(
+            down_scale.to("tpu"), requires_grad=False
+        )
+        projection.weight_block_size = None
+        assert _prepare_shared(fixture_moe, SimpleNamespace(tp_group=group))
+        torch.accelerator.synchronize()
+        assert torch.equal(
+            fixture_moe._glm_v2_sw13.cpu().view(torch.uint8),
+            torch.stack((gate, up)).view(torch.uint8),
+        )
+        assert torch.equal(
+            fixture_moe._glm_v2_sw2.cpu().view(torch.uint8), down.view(torch.uint8)
+        )
+        assert torch.equal(
+            fixture_moe._glm_v2_ss13.cpu(), torch.stack((gate_scale, up_scale))
+        )
+        assert torch.equal(fixture_moe._glm_v2_ss2.cpu(), down_scale)
+        print(
+            json.dumps(
+                dict(
+                    event="binder_loading_pass",
+                    rank=rank,
+                    ep=ep,
+                    packed_storage_released=old_pointer != new_pointer,
+                    loader_attributes_preserved=True,
+                    shared_fp8_gather_bit_exact=True,
+                    shared_geometry=[h, inter],
+                )
+            ),
+            flush=True,
+        )
+    finally:
+        group.destroy()
+
+
 def worker():
     import json
     import time
@@ -347,6 +469,7 @@ def worker():
         flush=True,
     )
     torch.set_num_threads(1)
+    binder_loading_cases(ep, rank)
     generator = torch.Generator().manual_seed(2198)
     # Small weights permit a complete independent float32 CPU reference on
     # every worker, including adversarial routing and decode padding shapes.

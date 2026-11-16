@@ -7,9 +7,28 @@ Expert ids remain logical EP ids at the public boundary. A rank operand maps
 those ids to the physical Pallas mesh; pod ranks never enter that mapping.
 """
 
+import os
 from functools import cache
 
 import torch
+
+_SOURCE_DEBUG_ENVS = (
+    "SGLJAX_SKIP_PREQUANT",
+    "FUSED_MOE_V2_PAD_TOPK_TO_128",
+    "FUSED_MOE_V2_ROUTE_SMEM_TOPK_ONLY",
+)
+
+
+def validate_source_environment():
+    """Reject source-only tuning/debug settings, including a truthy '0'."""
+    inherited = [name for name in _SOURCE_DEBUG_ENVS if name in os.environ]
+    if inherited:
+        raise ValueError(
+            "GLM MoE v2 requires the safe source defaults; unset "
+            + ", ".join(inherited)
+            + ". Prequantization is required, TopK padding is 128, "
+            "and the route-SMEM-only debug path is disabled."
+        )
 
 
 def pack_gate_up(weight: torch.Tensor) -> torch.Tensor:
@@ -25,6 +44,7 @@ def pack_gate_up_scale(scale: torch.Tensor) -> torch.Tensor:
 
 @cache
 def get_op(ep_size: int, has_shared: bool):
+    validate_source_environment()
     import jax
     import jax.numpy as jnp
     from jax import lax
@@ -51,7 +71,11 @@ def get_op(ep_size: int, has_shared: bool):
     def split(x, ids, weights, logical_rank):
         # Every shard receives the same FFN replica. Physical mesh index owns
         # one contiguous slice, independently of the process/EP rank ordering.
-        me = lax.axis_index("tensor")
+        mesh_ranks = lax.all_gather(logical_rank, ep, tiled=True)
+        # TorchTPU partitions this export again after embedding it. A host-HLO
+        # partition-id is ambiguous there, so derive mesh position from the
+        # explicit rank operand, just as the existing fused EP adapter does.
+        me = jnp.argmax(mesh_ranks == logical_rank[0]).astype(jnp.int32)
         local_rows = (x.shape[0] + ep_size - 1) // ep_size
         padding = local_rows * ep_size - x.shape[0]
         x = jnp.pad(x, ((0, padding), (0, 0)))
@@ -60,7 +84,6 @@ def get_op(ep_size: int, has_shared: bool):
         x = lax.dynamic_slice_in_dim(x, me * local_rows, local_rows, axis=0)
         ids = lax.dynamic_slice_in_dim(ids, me * local_rows, local_rows, axis=0)
         weights = lax.dynamic_slice_in_dim(weights, me * local_rows, local_rows, axis=0)
-        mesh_ranks = lax.all_gather(logical_rank, ep, tiled=True)
         # Position j in mesh_ranks owns logical experts [rank[j]*Elocal, ...).
         return x, ids, weights, mesh_ranks
 

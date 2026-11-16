@@ -1050,6 +1050,13 @@ class TpuSRTPlatform(SRTPlatform):
 
         register_tpu_dsv4_resolution_hooks()
 
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_USE_GLM_MOE_V2.get():
+            from sglang_tpu.moe.pallas.glm_moe_v2.op import validate_source_environment
+
+            validate_source_environment()
+
         # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
         # weights have loaded (its binder runs post-load).
         _pin_moe_gather_permute_for_static_fp8(static_fp8_parts())
