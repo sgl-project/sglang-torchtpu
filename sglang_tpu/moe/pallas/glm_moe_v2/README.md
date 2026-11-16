@@ -165,3 +165,11 @@ post-drain HBM usage is a boundary observation, not an instantaneous peak.
 adding a per-token host counter. Numerical preflight operands now directly
 consume TPU Parameters after pack/`_replace_data`, matching the loader reader
 path instead of using a separate CPU-packed tensor.
+
+The complete eight-chip model run (`exp-0ppqh107uo`) succeeds with all 75 target
+MoE/shared layers bound and the separate NextN draft unchanged. Against the
+requested historical baseline, C16 TTFT is +11.67%, C64 TPOT is +10.31%, and
+steady per-chip throughput is -8.60%; minimum token capacity is 168512 versus
+219008. This is a functional opt-in port with a measured regression, so the
+default stays off. See `docs_myself/glm52-moe-port-e2e-results-20261117.md` for
+workload, full-concurrency windows, cache checks and evidence identities.
