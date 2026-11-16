@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.vaes import base as vae_base
+from sglang.multimodal_gen.runtime.pipelines_core.stages import base as stage_base
 from sglang.multimodal_gen.runtime.pipelines_core.stages import decoding
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
@@ -25,6 +26,15 @@ class FakeVAE(nn.Module):
 
 
 class TestDecodingStageParallelism(unittest.TestCase):
+    def setUp(self):
+        # PipelineStage.__init__ reads the global server args, which only the
+        # unit conftest sets; the TPU lane runs this class without it.
+        patcher = patch.object(
+            stage_base, "get_global_server_args", return_value=SimpleNamespace()
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_component_use_honors_decode_precision_override(self):
         stage = DecodingStage(FakeVAE())
         server_args = SimpleNamespace(
@@ -57,7 +67,9 @@ class TestDecodingStageParallelism(unittest.TestCase):
         self,
     ):
         stage = object.__new__(DecodingStage)
-        stage.vae = SimpleNamespace(use_parallel_decode=True)
+        stage.vae = SimpleNamespace(
+            use_parallel_decode=True, parallel_decode_mode="spatial_shard"
+        )
 
         with (
             patch(
@@ -83,10 +95,18 @@ class TestDecodingStageParallelism(unittest.TestCase):
         stage = DecodingStage(vae)
         server_args = SimpleNamespace(enable_torch_compile=True)
 
-        with patch(
-            "torch.compile",
-            side_effect=lambda fn, **_: fn,
-        ) as compile_fn:
+        with (
+            # A platform may keep the VAE decode eager (TPU does).
+            patch.object(
+                decoding.current_platform,
+                "supports_vae_torch_compile",
+                return_value=True,
+            ),
+            patch(
+                "torch.compile",
+                side_effect=lambda fn, **_: fn,
+            ) as compile_fn,
+        ):
             compiled_vae_decode = stage._get_vae_decode_fn(vae, server_args)
             self.assertIs(
                 stage._get_vae_decode_fn(vae, server_args), compiled_vae_decode
@@ -129,7 +149,9 @@ class TestDecodingStageParallelism(unittest.TestCase):
         self,
     ):
         stage = object.__new__(DecodingStage)
-        stage.vae = SimpleNamespace(use_parallel_decode=True)
+        stage.vae = SimpleNamespace(
+            use_parallel_decode=True, parallel_decode_mode="spatial_shard"
+        )
 
         with (
             patch(
@@ -166,17 +188,13 @@ class TestDecodingStageParallelism(unittest.TestCase):
     def test_ltx2_refinement_broadcasts_when_decode_uses_all_ranks(self):
         stage = object.__new__(LTX2RefinementStage)
         stage.server_args = SimpleNamespace(enable_cfg_parallel=True)
-        stage.vae = SimpleNamespace(use_parallel_decode=True)
+        stage.vae = SimpleNamespace(
+            use_parallel_decode=True, parallel_decode_mode="spatial_shard"
+        )
 
         with (
-            patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av.model_parallel_is_initialized",
-                return_value=True,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av.get_decode_parallel_world_size",
-                return_value=2,
-            ),
+            patch.object(decoding, "model_parallel_is_initialized", return_value=True),
+            patch.object(decoding, "get_decode_parallel_world_size", return_value=2),
         ):
             self.assertEqual(
                 stage.parallelism_type,
@@ -189,14 +207,8 @@ class TestDecodingStageParallelism(unittest.TestCase):
         stage.vae = SimpleNamespace(use_parallel_decode=False)
 
         with (
-            patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av.model_parallel_is_initialized",
-                return_value=True,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av.get_decode_parallel_world_size",
-                return_value=2,
-            ),
+            patch.object(decoding, "model_parallel_is_initialized", return_value=True),
+            patch.object(decoding, "get_decode_parallel_world_size", return_value=2),
         ):
             self.assertEqual(
                 stage.parallelism_type,
