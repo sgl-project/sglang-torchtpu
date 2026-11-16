@@ -1603,6 +1603,7 @@ def kernel_main_fused_rs_fp8(
         "fp8_direct_write",
         "caller_tile_m",
         "expert_tp",
+        "fp4_w4a16",
     ],
 )
 def gmm_v2_fused_rs(
@@ -1632,8 +1633,12 @@ def gmm_v2_fused_rs(
     top_k: int,
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
+    fp4_w4a16: bool = False,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
+
+    fp4_w4a16: block-256 fp4 experts take bf16 rows, each block's scale applied after its
+    dot (requantized NVFP4), instead of fp8-quantized rows.
 
     Output: (chunk_size * top_k, size_n2) per chip — raw expert contributions.
     Post-kernel reduction applies topk_weights and sums over top_k dim.
@@ -1874,6 +1879,18 @@ def gmm_v2_fused_rs(
     rhs2_packing = (32 // jax.dtypes.itemsize_bits(w2.dtype)) if is_quantized else 1
     lhs1_quant_block_size = min(256 if rhs1_quant_block_size < 512 else 512, size_k1)
     lhs2_quant_block_size = min(256 if rhs2_quant_block_size < 512 else 512, size_k2)
+    if fp4_w4a16 and not (
+        is_quantized
+        and jnp.dtype(w1.dtype) == jnp.dtype(w2.dtype) == jnp.float4_e2m1fn
+        and rhs1_quant_block_size == lhs1_quant_block_size == 256
+        and rhs2_quant_block_size == lhs2_quant_block_size == 256
+    ):
+        raise ValueError(
+            "fp4_w4a16 takes block-256 fp4 experts; got "
+            f"{w1.dtype} / {w2.dtype}, rhs blocks {rhs1_quant_block_size} / "
+            f"{rhs2_quant_block_size}, lhs blocks {lhs1_quant_block_size} / "
+            f"{lhs2_quant_block_size}"
+        )
 
     cfgs1 = GmmConfigs(
         dims=Dimensions(
@@ -1889,6 +1906,7 @@ def gmm_v2_fused_rs(
             quant_dtype=(
                 jnp.float8_e4m3fn.dtype
                 if is_quantized
+                and not fp4_w4a16
                 and get_maybe_quantize_lhs(
                     w1.dtype, rhs1_quant_block_size, lhs1_quant_block_size
                 )
@@ -1926,6 +1944,7 @@ def gmm_v2_fused_rs(
             quant_dtype=(
                 jnp.float8_e4m3fn.dtype
                 if is_quantized
+                and not fp4_w4a16
                 and get_maybe_quantize_lhs(
                     w2.dtype, rhs2_quant_block_size, lhs2_quant_block_size
                 )
