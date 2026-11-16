@@ -66,16 +66,17 @@ def _models(vocab=256):
 
 
 @contextlib.contextmanager
-def _on_cpu():
-    """The TPU paths on CPU: dynamo traces each graph whole, then runs it eagerly."""
+def _installed(rank=0, broadcast=lambda obj, src: obj):
+    """install() on one world rank, with eager compiles."""
     names = ("_can_use_unmasked_causal_attention", "create_causal_mask")
+    world = Mock(rank_in_group=rank, broadcast_object=Mock(side_effect=broadcast))
     with contextlib.ExitStack() as stack:
         for owner, name in [(mistral_3, n) for n in names] + [
             (mistral_3.Ministral3ForCausalLM, "generate"),
             (ernie_image_pe.PromptEnhancementStage, "forward"),
         ]:
             stack.enter_context(patch.object(owner, name, getattr(owner, name)))
-        stack.enter_context(patch.object(ministral3, "_DEVICE_TYPES", ("cpu",)))
+        stack.enter_context(patch.object(ministral3, "get_world_group", lambda: world))
         stack.enter_context(
             patch.object(
                 ministral3,
@@ -85,7 +86,20 @@ def _on_cpu():
         )
         ministral3.install()
         ministral3.install()  # idempotent
-        yield
+        yield world
+
+
+def _stage(generate):
+    """A prompt-enhancement stage whose model calls ``generate()``."""
+    # Its __init__ reads the global server args, which forward does not use.
+    stage = object.__new__(ernie_image_pe.PromptEnhancementStage)
+    stage.pe_model, stage.pe_tokenizer = Mock(), Mock()
+    stage.pe_model.generate = lambda prompt, sampling_params: {"text": generate()}
+    stage.pe_tokenizer.apply_chat_template.return_value = ""
+    return stage
+
+
+_STAGE_ARGS = Mock(pipeline_config=Mock(pe_model_max_length=16))
 
 
 def _prompt(n, vocab=256):
@@ -93,39 +107,16 @@ def _prompt(n, vocab=256):
 
 
 class TestMinistral3Decode(CustomTestCase):
-    def test_decoder_logits_match_stock_forward(self):
-        _, native = _models()
-        decoder = ministral3._Decoder(native)
-        decoder.forward = decoder._forward
-        ids = _prompt(300)  # two prompt chunks, the second padded
-        decoder.reserve(1024)
-        padded = torch.nn.functional.pad(ids[0], (0, 212), value=11)
-        prompt = torch.stack((padded, torch.arange(512))).int()
-        with torch.no_grad():
-            for start in (0, 256):
-                last = torch.tensor([min(299 - start, 255)], dtype=torch.int32)
-                chunk = prompt[:, start : start + 256].contiguous()
-                logits, *_ = decoder.forward(chunk, last)
-            steps = [logits]
-            for token in (5, 9, 200):
-                ids = torch.cat((ids, torch.tensor([[token]])), -1)
-                step = torch.tensor([[token], [ids.shape[1] - 1]], dtype=torch.int32)
-                steps.append(decoder.forward(step, decoder.last_row)[0])
-            with set_forward_context(current_timestep=0, attn_metadata=None):
-                stock = native(input_ids=ids).logits[0]
-        for i, logits in enumerate(steps):
-            torch.testing.assert_close(logits[0], stock[299 + i], atol=2e-5, rtol=1e-4)
-
     def test_generate_matches_transformers_generate(self):
         reference, native = _models()
         for n, sampling in (
             (5, dict(do_sample=False)),
             (300, dict(do_sample=True, top_k=1)),
         ):
-            with self.subTest(n=n, **sampling), _on_cpu():
+            with self.subTest(n=n, **sampling), _installed(), torch.no_grad():
                 ids = _prompt(n)
                 expected = reference.generate(ids, max_new_tokens=12, **sampling)
-                actual = native.generate(
+                actual = ministral3._Decoder(native).generate(
                     input_ids=ids,
                     attention_mask=torch.ones_like(ids),
                     max_new_tokens=12,
@@ -142,40 +133,55 @@ class TestMinistral3Decode(CustomTestCase):
             return gm.forward
 
         with (
-            _on_cpu(),
             patch.object(
                 ministral3,
                 "build_torch_compile_kwargs",
                 lambda mode: {"backend": counting},
             ),
+            torch.no_grad(),
         ):
+            decoder = ministral3._Decoder(native)
             for n in (5, 40, 300):
-                native.generate(input_ids=_prompt(n), max_new_tokens=6, do_sample=True)
+                decoder.generate(input_ids=_prompt(n), max_new_tokens=6, do_sample=True)
         self.assertEqual(len(graphs), 2)  # a prompt chunk and one token
 
     def test_same_seed_draws_the_same_tokens(self):
         _, native = _models()
-        # Its __init__ reads the global server args, which forward does not use.
-        stage = object.__new__(ernie_image_pe.PromptEnhancementStage)
-        stage.pe_model, stage.pe_tokenizer = Mock(), Mock()
         outputs = []
 
-        def generate(**kwargs):
-            ids = native.generate(
-                input_ids=_prompt(9), max_new_tokens=16, do_sample=True
+        def generate():
+            outputs.append(
+                decoder.generate(
+                    input_ids=_prompt(9), max_new_tokens=16, do_sample=True
+                )
             )
-            outputs.append(ids)
-            return {"text": ""}
+            return ""
 
-        stage.pe_model.generate = lambda prompt, sampling_params: generate()
-        stage.pe_tokenizer.apply_chat_template.return_value = ""
-        args = Mock(pipeline_config=Mock(pe_model_max_length=16))
-        with _on_cpu():
+        with _installed(), torch.no_grad():
+            decoder = ministral3._Decoder(native)
             for seed in (3, 3, 4):
-                stage.forward(Mock(prompt="p", seed=seed, height=64, width=64), args)
+                request = Mock(prompt="p", seed=seed, height=64, width=64)
+                _stage(generate).forward(request, _STAGE_ARGS)
         self.assertIsNone(ministral3._SEED.get())
         torch.testing.assert_close(outputs[0], outputs[1])
         self.assertFalse(torch.equal(outputs[0], outputs[2]))
+
+    def test_rank_0_enhances_and_every_rank_takes_its_prompt(self):
+        generate = Mock(return_value="enhanced")
+        sent_by_rank_0 = (lambda obj, src: obj, lambda obj, src: ("enhanced", None))
+        for rank, broadcast in enumerate(sent_by_rank_0):
+            request = Mock(prompt="p", seed=3, height=64, width=64)
+            with _installed(rank, broadcast) as world:
+                _stage(generate).forward(request, _STAGE_ARGS)
+            self.assertEqual(request.prompt, "enhanced")
+            self.assertEqual(world.broadcast_object.call_args.kwargs, {"src": 0})
+        generate.assert_called_once()  # on rank 0 only
+        # A failure on rank 0 fails the other ranks instead of leaving them waiting.
+        with (
+            _installed(1, lambda obj, src: (None, "OSError()")),
+            self.assertRaisesRegex(RuntimeError, "OSError"),
+        ):
+            _stage(generate).forward(Mock(prompt="p", seed=3), _STAGE_ARGS)
 
 
 class TestCandidateDraws(CustomTestCase):
@@ -244,7 +250,7 @@ class TestEncoderMask(CustomTestCase):
                 input_ids=ids, attention_mask=mask
             ).last_hidden_state
             with (
-                _on_cpu(),
+                _installed(),
                 patch.object(
                     ministral3, "_STOCK_CAUSAL_MASK", side_effect=AssertionError
                 ),

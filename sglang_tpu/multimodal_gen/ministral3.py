@@ -18,8 +18,9 @@ Runtime patch, tracked debt:
       the processors are temperature, top-k (k < 64), top-p and min-p and no
       logit tied with the k-th lies past the 64th; any other step draws from
       the full row;
-  (2) seeds the draws from the request's seed, so every SP rank, each running
-      the enhancer, takes the same tokens;
+  (2) runs the enhancer on world rank 0 only, its draws seeded from the
+      request's seed, and broadcasts the enhanced prompt, so every rank
+      conditions the DiT on the same tokens;
   (3) builds the encoder's causal and padding mask on the host.
 - Upstream PR or issue: none.
 - Remove when: torch_tpu lowers int64 reductions and the enhancer runs on a
@@ -37,6 +38,7 @@ from transformers.generation import logits_process
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 
+from sglang.multimodal_gen.runtime.distributed import get_world_group
 from sglang.multimodal_gen.runtime.models.encoders import mistral_3
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
     ernie_image_pe,
@@ -54,8 +56,6 @@ _STOCK_UNMASKED = mistral_3._can_use_unmasked_causal_attention
 _STOCK_CAUSAL_MASK = mistral_3.create_causal_mask
 _STOCK_PE_FORWARD = ernie_image_pe.PromptEnhancementStage.forward
 _SEED = contextvars.ContextVar("sglang_tpu_prompt_enhancer_seed", default=None)
-# Devices that take these paths.
-_DEVICE_TYPES = ("tpu",)
 
 
 def candidate_top_k(processors) -> int | None:
@@ -246,7 +246,7 @@ class _Decoder:
 
 
 def _generate(self, *args, **kwargs):
-    if args or self.lm_head.weight.device.type not in _DEVICE_TYPES:
+    if args or self.lm_head.weight.device.type != "tpu":
         return _STOCK_GENERATE(self, *args, **kwargs)
     decoder = self.__dict__.get("_tpu_decoder")
     if decoder is None:
@@ -255,13 +255,32 @@ def _generate(self, *args, **kwargs):
         return decoder.generate(**kwargs)
 
 
-def _seeded_forward(self, batch, server_args):
-    seed = getattr(batch, "seed", None)
-    token = _SEED.set(seed[0] if isinstance(seed, list) else seed)
-    try:
-        return _STOCK_PE_FORWARD(self, batch, server_args)
-    finally:
-        _SEED.reset(token)
+def _rank0_forward(self, batch, server_args):
+    """The stock stage on world rank 0; the other ranks take its prompt.
+
+    One rank's draws decide the prompt, so its length, and with it the DiT's
+    collectives, match on every rank.
+    """
+    world = get_world_group()
+    failure = None
+    if world.rank_in_group == 0:
+        seed = batch.seed
+        token = _SEED.set(seed[0] if isinstance(seed, list) else seed)
+        try:
+            batch = _STOCK_PE_FORWARD(self, batch, server_args)
+        except Exception as exc:
+            failure = exc
+        finally:
+            _SEED.reset(token)
+    prompt, error = world.broadcast_object(
+        (batch.prompt, None if failure is None else repr(failure)), src=0
+    )
+    if failure is not None:
+        raise failure
+    if error is not None:
+        raise RuntimeError(f"Prompt enhancement failed on rank 0: {error}")
+    batch.prompt = prompt
+    return batch
 
 
 def causal_padding_mask(attention_mask, length):
@@ -280,8 +299,7 @@ def _causal_mask_on_host(**kwargs):
     embeds = kwargs[mistral_3._CREATE_CAUSAL_MASK_ARG]
     mask, cache = kwargs.get("attention_mask"), kwargs.get("past_key_values")
     if (
-        embeds.device.type not in _DEVICE_TYPES
-        or (cache is not None and cache.get_seq_length() > 0)
+        (cache is not None and cache.get_seq_length() > 0)
         or mask is None
         or mask.dim() != 2
     ):
@@ -293,4 +311,4 @@ def install() -> None:
     mistral_3._can_use_unmasked_causal_attention = _unmasked_on_host
     mistral_3.create_causal_mask = _causal_mask_on_host
     mistral_3.Ministral3ForCausalLM.generate = _generate
-    ernie_image_pe.PromptEnhancementStage.forward = _seeded_forward
+    ernie_image_pe.PromptEnhancementStage.forward = _rank0_forward
