@@ -11,6 +11,7 @@ import importlib
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -269,7 +270,9 @@ class TestTpuFp8Config(CustomTestCase):
 class _TpuMoETestCase(CustomTestCase):
     def setUp(self):
         super().setUp()
-        self.enterContext(
+        self.contexts = ExitStack()
+        self.addCleanup(self.contexts.close)
+        self.contexts.enter_context(
             get_flags().moe.override(runner_backend=MoeRunnerBackend.PALLAS_TPU)
         )
 
@@ -715,7 +718,7 @@ class TestChannelwiseMoeAndNextN(_TpuMoETestCase):
                 None,
             ),
         )
-        self.enterContext(
+        self.contexts.enter_context(
             patch.dict(
                 "sys.modules",
                 {"torch_tpu._internal.pallas": SimpleNamespace(jax_op=None)},
