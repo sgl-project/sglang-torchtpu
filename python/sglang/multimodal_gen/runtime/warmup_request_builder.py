@@ -621,14 +621,9 @@ def build_warmup_reqs(
             prompt=DEFAULT_PLACEHOLDER_PROMPT,
         )
         warmup_params = copy(sampling_defaults)
-        # Real requests resolve the flag in SamplingParams._adjust_visual_fields, which
-        # warmup requests skip; left at None, a sequence-shard pipeline warms up with
-        # the whole sequence on every SP rank, shapes no real request runs.
-        warmup_params.enable_sequence_shard = resolve_sequence_shard(
-            server_args.pipeline_config, warmup_params.enable_sequence_shard
-        )
-        if warmup_params.enable_sequence_shard:
-            warmup_params.adjust_frames = False
+        # Warmup requests skip SamplingParams._adjust_visual_fields, where real
+        # requests resolve sequence sharding.
+        warmup_params.apply_sequence_shard(server_args.pipeline_config)
         req_kwargs["sampling_params"] = warmup_params
         req_kwargs.update(
             negative_prompt=negative_prompt,
