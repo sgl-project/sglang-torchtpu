@@ -25,13 +25,18 @@ from sglang.test.ci.ci_register import register_tpu_ci
 register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=1)
 
 assert "jax" not in sys.modules
-os.environ["JAX_PLATFORMS"] = "tpu"
+os.environ.setdefault("JAX_PLATFORMS", "tpu")
 
 import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
 from sglang_tpu.dsv4.streamindex_topk import metadata
+from sglang_tpu.dsv4.streamindex_topk.streamindex_topk import (
+    _BlockedPrefillConfig,
+    _effective_row_lengths,
+    get_kv_cache_shape,
+)
 
 
 class MetadataTest(parameterized.TestCase):
@@ -505,6 +510,65 @@ class ChunkedMetadataTest(parameterized.TestCase):
         """The empty branch has to agree with the schedule branch on shape."""
         meta_ = self._chunk_meta((0, 256, 512), start_seq_idx=0, end_seq_idx=0)
         np.testing.assert_array_equal(np.array(meta_.num_steps), [0, 0, 0])
+
+    def test_blocked_prefill_config_and_complete_groups(self):
+        """Tests _BlockedPrefillConfig creation, bank-conflict padding, and complete-group row lengths."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        with mock.patch(
+            "jax.experimental.pallas.tpu.get_tpu_info",
+            return_value=SimpleNamespace(num_mxus=4),
+        ):
+            cfg_fp8 = _BlockedPrefillConfig.create(
+                bq_sz=64,
+                bkv_sz=2048,
+                num_q_heads=32,
+                q_dtype=jnp.float8_e4m3fn,
+                seq_batch_size=1,
+            )
+            self.assertTrue(cfg_fp8.enabled)
+            self.assertEqual(cfg_fp8.tok_blk, 32)
+            self.assertEqual(cfg_fp8.num_head_groups, 4)
+            self.assertEqual(cfg_fp8.score_pitch, 24)
+            self.assertTrue(cfg_fp8.bf16_reduce)
+
+            cfg_bf16 = _BlockedPrefillConfig.create(
+                bq_sz=64,
+                bkv_sz=1024,
+                num_q_heads=32,
+                q_dtype=jnp.bfloat16,
+                seq_batch_size=1,
+            )
+            self.assertTrue(cfg_bf16.enabled)
+            self.assertEqual(cfg_bf16.score_pitch, 8)
+            self.assertFalse(cfg_bf16.bf16_reduce)
+
+            cfg_batched = _BlockedPrefillConfig.create(
+                bq_sz=64,
+                bkv_sz=2048,
+                num_q_heads=32,
+                q_dtype=jnp.float8_e4m3fn,
+                seq_batch_size=4,
+            )
+            self.assertFalse(cfg_batched.enabled)
+
+        # Unpacked actual_head_dim normalization in get_kv_cache_shape (129 -> 128)
+        self.assertEqual(
+            get_kv_cache_shape(10, 128, 129),
+            get_kv_cache_shape(10, 128, 128),
+        )
+
+        # _effective_row_lengths sees only closed groups by default
+        row_lens = _effective_row_lengths(
+            seq_lens=jnp.array([8], dtype=jnp.int32),
+            cu_q_lens=jnp.array([0, 8], dtype=jnp.int32),
+            distribution=jnp.array([0, 0, 1], dtype=jnp.int32),
+            num_tokens=8,
+            num_positions=16,
+            compression_ratio=4,
+        )
+        np.testing.assert_array_equal(np.array(row_lens), [0, 0, 0, 1, 1, 1, 1, 2])
 
 
 if __name__ == "__main__":
