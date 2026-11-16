@@ -57,9 +57,11 @@ same SPMD failure. Each exported six `sdy.manual_computation` regions, one
 side-effect custom call and no `mhlo.sharding` attribute. The manual annotation
 candidate had one explicit `mhlo.sharding={manual}` in exported MLIR but still
 failed with the same missing-sharding error in all eight workers. No numerical
-case ran. `export-diagnostic-records.json` contains the parsed export records,
+case ran. The local-only `export-diagnostic-records.json` contains the parsed export records,
 first compiler signatures and 24 complete actual-process runtime/import/maps
-records; the full MLIR belongs to the Falcon artifact.
+records; the same raw records and full MLIR belong to the Falcon artifact.
+The raw JSON is intentionally excluded from the final PR diff; this mechanism
+summary and experiment/artifact/source identities are the committed evidence.
 
 The real target idle path differs from manually cropping a kernel result to
 zero rows. `compiled_forward_shim._dp_attn_apply_bucket_metadata` publishes
