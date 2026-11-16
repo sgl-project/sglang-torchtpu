@@ -1,6 +1,6 @@
 # GLM-5.2 native MTP baseline 执行记录
 
-本记录仍在执行中；尚未宣称完整模型、MTP 或目标性能场景通过。
+当前状态：续跑排队等待完整8-chip资源。完整target/draft加载、全部启动图及原生MTP生成warmup已通过；显式routed chat和两组正式性能场景尚未验收，不能宣称完整E2E基线完成。
 
 ## 固定目标
 
@@ -12,7 +12,7 @@
 ## 机器与当前实验
 
 - 1-prod 已实际获配 8-chip `2x2x2` slice。
-- 当前保留 allocation：`exp-jjzf5biomm` / `job-ctbj0kddm6` / `art-tuqtvn2txw`。
+- 首轮 allocation（已自然到期）：`exp-jjzf5biomm` / `job-ctbj0kddm6` / `art-tuqtvn2txw`。
 - 主 holding command 有界；holding 本身的成功不等于模型成功。
 - 后续不查询或使用已经退出的 antgroup / antgroup-v2。
 
@@ -59,6 +59,8 @@
 - 已重新核查1-prod资源快照（包含running/pending allocations与active leases），只使用1-prod候选；未查询退出集群。
 - 固定源码 `d8f342b878`（模型/reader/依赖相对1879无变化；含已验证的client修复及MTP host预读），续跑 `exp-7eqnrujaw6` / `job-dgowhe71v1` / `art-yi2osnr97j`。
 - 续跑直接执行已提交的falcon_runner，不以holding作为application；挂载原25GB compile cache到 `/glm52-prior-compile-cache`，缓存不替代实际warmup/serve验收。
+- 11:11–11:16 UTC多次admission快照仍为PENDING，ResourceReady=False，无法容纳完整2x2x2 slice；control-plane pending workloads也已核查。
+- 2-prod候选已只读核查：单host4-chip pools、已占用64-chip pool，以及空闲大拓扑；没有已验证的完整8-chip route，且runtime=k8s_job与已验证1-prod的jobset不同。未据空闲节点数断言可调度，未试投第二份fallback。
 
 ## 模型身份
 
@@ -74,4 +76,4 @@
 - `exp-wgzfz1wtp6`、`exp-v7sl08xwpe` 在 pip 安装阶段失败，未进入模型；第二轮日志证实 ENOSPC。
 - CPU helper 未获资源，已终止；两个 custom analysis preflight 未产出可读启动日志，未作为任何验证依据。
 - `exp-jjzf5biomm` 内原 c286 的慢加载已主动停止并归档到 `glm52-e2e/rank-*/pre-fix-whole-shard-load/`；allocation 保留。
-- 下一步：在固定 reader-fix SHA 上完整加载 target/draft、编译和 MTP smoke，再执行目标场景的至少3轮测量；记录实际 KV 容量、cache hits、各 DP active batch、接受统计和重编译。
+- 下一步：等待`exp-7eqnrujaw6`获配；runner将固定源码自动完成16-DP routed chat与至少3轮目标测量，记录实际KV容量、cache hits、active batch、接受统计和重编译。当前无可报告的正式TTFT/TPOT/吞吐结果。
