@@ -7,6 +7,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.muse_megakernel import kernel as K
 from sglang_tpu.muse_megakernel import ops
+from sglang_tpu.muse_megakernel.ep_mk.config import ep_mk_config
 
 register_tpu_ci(est_time=2, suite="stage-a-test-tpu-unit", chips=1)
 
@@ -46,12 +47,12 @@ def _megakernel(**flags):
         chunk_pages=4,
         kv_packed=flags.get("kv_packed", True),
         expert_groups=flags.get("expert_groups", ()),
-        moe_mode="tp",
+        moe_mode=flags.get("moe_mode", "tp"),
     )
 
 
-def _config(mk, q, n_req, **pool):
-    cfg = ops.MuseMegakernel.config(
+def _raw_config(mk, q, n_req, **pool):
+    return ops.MuseMegakernel.config(
         mk,
         rows=ops.step_rows(q * n_req, mk.tp_size, mk.moe_mode),
         q=q,
@@ -61,7 +62,12 @@ def _config(mk, q, n_req, **pool):
         capture=(1, 16, 30, 44, 59),
         **pool,
     )
-    return cfg.validate()  # the kernel builder's own checks
+
+
+def _config(mk, q, n_req, **pool):
+    return _raw_config(
+        mk, q, n_req, **pool
+    ).validate()  # the kernel builder's own checks
 
 
 class TestMuseMegakernelConfig(CustomTestCase):
@@ -174,6 +180,15 @@ class TestMuseMegakernelConfig(CustomTestCase):
                         )
                     )
                     self.assertLessEqual(K.scratch_vmem_bytes(cfg), budget)
+
+    def test_ep_steps_validate(self):
+        # the EP kernel validates ep_mk_config's config (no VMEM Y, no single-row collectives)
+        for q, n_req in ((1, 1), (8, 2), (8, 8), (8, 16)):
+            for pool in ({}, _FP8_SAL):
+                with self.subTest(q=q, n_req=n_req, **pool):
+                    cfg = _raw_config(_megakernel(moe_mode="ep"), q, n_req, **pool)
+                    self.assertEqual(cfg.row_tile, 16)
+                    ep_mk_config(cfg).validate()
 
     def test_expert_groups_of(self):
         groups = ops.expert_groups_of(_KINDS, 15)

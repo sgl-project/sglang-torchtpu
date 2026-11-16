@@ -9,14 +9,12 @@
 and front them with the P/D router (``sglang_router.launch_router
 --pd-disaggregation --mini-lb``). At equal attention TP, Raiden pulls each
 request's sparse-MLA pages (target and MTP layers) and its KDA conv /
-recurrent state; the aux blob carries the draft's hidden seed.
-
-The prefill does not ship the draft's shared DSA top-k, so the draft runs its
-indexer on every step (index_share_for_mtp_iteration off). Neither engine keeps
-a prefix cache.
+recurrent state; the aux blob carries the draft's hidden seed and, with MTP
+index sharing (mtp.py's default; GLM_FLASH_MTP_INDEX_SHARE=0 turns it off on
+both engines), the draft's DSA top-k at the last prompt row. Neither engine
+keeps a prefix cache.
 """
 
-import json
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.base import (
@@ -35,11 +33,6 @@ for _key in HICACHE_ARGS:
 # max_mamba_cache_size.
 _args["disable_radix_cache"] = True
 _args.pop("mamba_radix_cache_strategy", None)
-_no_index_share = {"index_share_for_mtp_iteration": False}
-_overrides = json.loads(_args.get("json_model_override_args") or "{}")
-_overrides.update(_no_index_share)
-_overrides["text_config"] = {**_overrides.get("text_config", {}), **_no_index_share}
-_args["json_model_override_args"] = json.dumps(_overrides)
 _args.update(
     {
         # The sampler every TPU P/D gate pins; greedy picks the argmax either way.
