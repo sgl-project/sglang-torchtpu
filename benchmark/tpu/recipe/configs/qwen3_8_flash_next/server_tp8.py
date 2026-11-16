@@ -26,6 +26,10 @@ CONFIG["server_args"].update(
         "model_path": "/weights/Qwen3.8-Flash-Next-FP8",
         "served_model_name": "Qwen/Qwen3.8-Flash-Next-FP8",
         "tp_size": 8,
+        # Experts are 640 wide, five fp8 128-blocks: an expert-TP shard (80)
+        # splits a block, so each rank holds whole experts (moe_tp_size 1). The
+        # bf16 shared expert stays tensor parallel.
+        "ep_size": 8,
         "quantization": "fp8",
         # 2 KV heads over 8 ranks: keep KV unpacked.
         "kv_cache_dtype": "bfloat16",
