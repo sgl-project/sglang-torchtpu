@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=420, suite="base-a-test-cpu")
+register_cpu_ci(est_time=480, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -933,6 +933,142 @@ class TestDecodeIndexer(CustomTestCase):
                     self.assertGreaterEqual(
                         result.stdout.count("GATHER at round"), 4, result.stdout[-2000:]
                     )
+
+
+class TestRouterBothHalves(CustomTestCase):
+    """The decode MoE router with both router halves on every rank
+    (``KernelConfig.decode_router_both_halves``) in Pallas interpret mode on a
+    rank pair of host devices: on both lanes the raw score rows assembled from
+    the own and peer half projections, and the final score rows, selected
+    experts, probabilities, route counts and probability totals, are
+    bit-identical to the pair's score-half exchange, with stale NaN bytes in
+    the router's padding columns."""
+
+    SCRIPT = """
+        import dataclasses, os
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk
+
+        H, E, K = 7168, 896, 16
+        FIELDS = [f.name for f in dataclasses.fields(dmk.MixtureOfExpertsWeights)]
+        mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+
+        def run(slots, hidden, router, bias, live):
+            B = hidden.shape[0]
+
+            def kernel(live_ref, hidden_ref, bias_ref, router_ref, raw_out, scores_out,
+                       experts_out, probabilities_out, counts_out, totals_out,
+                       router_vmem, router_semaphores, scores_vmem, sends, receives):
+                weights = dmk.MixtureOfExpertsWeights(**dict(
+                    dict.fromkeys(FIELDS), routing_projection=router_ref,
+                    routing_projection_vmem=router_vmem,
+                    routing_copy_semaphores=router_semaphores, routing_bias=bias_ref))
+                rank = jax.lax.axis_index("tp")
+                wait_half = weights.wait_for_routing_projection_half if slots == 2 else None
+
+                def load_router():
+                    # Stale arena bytes (NaN) under every router column, then the
+                    # arena request's copies; one slot is waited for up front.
+                    router_vmem[...] = jnp.full(router_vmem.shape, jnp.nan, jnp.bfloat16)
+                    scores_vmem[...] = jnp.full(scores_vmem.shape, jnp.nan, jnp.float32)
+                    dmk._router_copy(router_ref, router_vmem, router_semaphores, False,
+                                     initialize_padding=False)
+                    if slots == 1:
+                        weights.wait_for_routing_projection_copy()
+
+                load_router()
+                dmk._project_routing_scores(rank, hidden_ref[...], router_vmem, scores_vmem,
+                                            sends.at[0], receives.at[0],
+                                            wait_for_projection_half=wait_half)
+                raw_out[...] = scores_vmem[...]
+                load_router()
+                live_rows = (jnp.stack([live_ref[b] for b in range(B)]) != 0) if live else None
+                experts, probabilities, counts, totals = dmk._route_hidden_states(
+                    hidden_ref[...], router_vmem, bias_ref, scores_vmem, sends.at[0],
+                    receives.at[0], selected_expert_count=K, local_expert_count=112,
+                    expert_tensor_parallel=1, on_local_selection=lambda *unused: None,
+                    after_selection=lambda unused: None, live_rows=live_rows,
+                    wait_for_projection_half=wait_half)
+                scores_out[...] = scores_vmem[...]
+                experts_out[...] = experts
+                probabilities_out[...] = probabilities
+                counts_out[...] = jnp.broadcast_to(counts[:, None], counts_out.shape)
+                totals_out[...] = jnp.broadcast_to(totals[:, None], totals_out.shape)
+
+            vmem = pltpu.VMEM
+            shapes = ((B, 1024, jnp.float32), (B, 1024, jnp.float32), (B, K, jnp.int32),
+                      (B, K, jnp.float32), (B, 128, jnp.int32), (B, 128, jnp.float32))
+
+            def body(live_rows, hidden, bias, router):
+                outputs = pl.pallas_call(
+                    kernel,
+                    out_shape=tuple(jax.ShapeDtypeStruct(s[:2], s[2]) for s in shapes),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=1,
+                        in_specs=[pl.BlockSpec(memory_space=vmem)] * 2
+                        + [pl.BlockSpec(memory_space=pl.ANY)],
+                        out_specs=[pl.BlockSpec(memory_space=vmem)] * len(shapes),
+                        scratch_shapes=[vmem((slots, H, 512), jnp.bfloat16),
+                                        pltpu.SemaphoreType.DMA((2,)),
+                                        vmem((B, 1024), jnp.float32),
+                                        pltpu.SemaphoreType.DMA((1,)),
+                                        pltpu.SemaphoreType.DMA((1,))]),
+                    compiler_params=pltpu.CompilerParams(has_side_effects=True),
+                    interpret=pltpu.InterpretParams(),
+                )(live_rows, hidden, bias, router)
+                return tuple(x[None] for x in outputs)
+
+            f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(),) * 4,
+                                      out_specs=(P("tp"),) * len(shapes), check_vma=False))
+            live_rows = (np.arange(B) % 3 != 1) if live else np.ones(B, bool)
+            return [np.asarray(x) for x in f(live_rows.astype(np.int32), hidden, bias, router)]
+
+        rng = np.random.default_rng(0)
+        for B, live in ((1, False), (8, False), (16, True)):
+            hidden = rng.standard_normal((B, H)).astype(ml_dtypes.bfloat16)
+            router = (rng.standard_normal((H, E)) * H**-0.5).astype(ml_dtypes.bfloat16)
+            bias = (0.1 * rng.standard_normal((1, E))).astype(np.float32)
+            exchanged = run(1, hidden, router, bias, live)
+            projected = run(2, hidden, router, bias, live)
+            names = ("raw scores", "final scores", "experts", "probabilities", "counts",
+                     "totals")
+            for name, old, new in zip(names, exchanged, projected):
+                assert old.tobytes() == new.tobytes(), (B, name)
+            raw = exchanged[0]
+            assert np.array_equal(raw[0], raw[1]), B  # both lanes hold the same rows
+            assert not np.isnan(raw).any() and not raw[..., 896:].any(), B
+            want = hidden.astype(np.float32) @ router.astype(np.float32)
+            assert np.abs(raw[0, :, :896] - want).max() < 1e-3 * np.abs(want).max(), B
+            assert exchanged[4][..., 0].sum(axis=1).all(), B  # both lanes own routes
+        print("OK")
+    """
+
+    def test_both_halves_match_the_score_exchange(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
 
 
 class TestManyOperandOps(CustomTestCase):
