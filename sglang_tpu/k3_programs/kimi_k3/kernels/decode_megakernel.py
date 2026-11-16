@@ -511,6 +511,95 @@ def _start_initial_expert_weight_copies(
         processed |= consumed
 
 
+# Rows of the grouped expert schedule (_expert_schedule_table).
+(
+    SCHEDULE_EXPERT,
+    SCHEDULE_ROW_COUNT,
+    SCHEDULE_ROW,
+    SCHEDULE_ROW_MASK_LOW,
+    SCHEDULE_ROW_MASK_HIGH,
+    SCHEDULE_EXPERT_COUNT,
+) = range(6)
+
+
+def _expert_schedule_table(selected_experts, local_route_counts):
+    """The grouped expert loop's schedule as an [8, 128] int32 table.
+
+    Lane k describes the k-th used local expert in ascending id order (the
+    grouped loop's pending-route minimum): its id, its row count, its row if
+    it has one (else 0) and the low and high bytes of its row bitmask. Lanes
+    past the last used expert are zero; every lane of SCHEDULE_EXPERT_COUNT
+    holds the used-expert count. Each value is an integer below 256 (exact in
+    BF16), and each one-hot product sums one nonzero term, so it is exact.
+    """
+    batch_size, route_count = selected_experts.shape
+    if batch_size > 16:
+        raise ValueError("Expert schedule row bitmasks hold at most 16 rows")
+    lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
+    # Invalid routes match no expert (one lane broadcast a route slot).
+    routes = jnp.where(
+        jax.lax.broadcasted_iota(jnp.int32, (batch_size, route_count), 1)
+        < local_route_counts[:, None],
+        selected_experts,
+        -1,
+    )
+    routed = jnp.zeros((batch_size, 128), jnp.bool_)
+    for route_slot in range(route_count):
+        routed |= routes[:, route_slot : route_slot + 1] == lanes
+    rows = jax.lax.broadcasted_iota(jnp.int32, (batch_size, 128), 0)
+
+    def row_sum(values):
+        # Below 2**16: exact FP32 sublane sums.
+        return jnp.sum(
+            jnp.where(routed, values, 0).astype(jnp.float32), axis=0, keepdims=True
+        ).astype(jnp.int32)
+
+    row_counts = row_sum(1)
+    row_masks = row_sum(1 << rows)
+    used = row_counts > 0
+    positions = jax.lax.broadcasted_iota(jnp.int32, (128, 128), 0)
+    experts = jax.lax.broadcasted_iota(jnp.int32, (128, 128), 1)
+    # Each used expert's position: the used experts below its id.
+    ranks = _dot(
+        used.astype(jnp.bfloat16), (positions < experts).astype(jnp.bfloat16)
+    ).astype(jnp.int32)
+    one_hot = (used & (ranks == positions)).astype(jnp.bfloat16)
+    table_rows = jax.lax.broadcasted_iota(jnp.int32, (16, 128), 0)
+    values = jnp.zeros((16, 128), jnp.int32)
+    for table_row, value in (
+        (SCHEDULE_EXPERT, lanes),
+        (SCHEDULE_ROW_COUNT, row_counts),
+        (SCHEDULE_ROW, jnp.where(row_counts == 1, row_sum(rows), 0)),
+        (SCHEDULE_ROW_MASK_LOW, row_masks & 255),
+        (SCHEDULE_ROW_MASK_HIGH, row_masks >> 8),
+    ):
+        values = jnp.where(table_rows == table_row, value, values)
+    table = jax.lax.dot_general(
+        values.astype(jnp.bfloat16),
+        one_hot,
+        (((1,), (1,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    expert_count = jnp.sum(used.astype(jnp.float32), axis=1, keepdims=True)
+    table = jnp.where(table_rows == SCHEDULE_EXPERT_COUNT, expert_count, table)
+    return table[:8].astype(jnp.int32)
+
+
+def _expert_schedule(staging_vmem, table_smem, semaphore):
+    """The schedule's VMEM staging rows, SMEM table and their copy."""
+    return SimpleNamespace(
+        staging=staging_vmem,
+        table=table_smem,
+        copy=tpu.make_async_copy(staging_vmem, table_smem, semaphore),
+    )
+
+
+def _start_expert_schedule(schedule, selected_experts, local_route_counts):
+    """Build the schedule after routing; the expert stream waits for its copy."""
+    schedule.staging[...] = _expert_schedule_table(selected_experts, local_route_counts)
+    schedule.copy.start()
+
+
 def _quantized_expert_dot(
     source,
     packed,
@@ -891,12 +980,21 @@ if PHASE_SCOPES:
 
 
 def _stage_singleton_row(
-    source, active_rows, destination, *, expert_input_size, block_select, row_select
+    source,
+    active_rows,
+    destination,
+    *,
+    expert_input_size,
+    block_select,
+    row_select,
+    active_index=None,
 ):
-    """Copy the one active row of ``source`` into ``destination`` [1, K]."""
+    """Copy the one active row of ``source`` into ``destination`` [1, K]
+    (``active_index``: that row's index when the caller already has it)."""
     batch_size = active_rows.shape[0]
-    if block_select and batch_size % 16 == 0:
+    if active_index is None:
         active_index = jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
+    if block_select and batch_size % 16 == 0:
         block = source[
             pl.ds(pl.multiple_of(active_index // 16 * 16, 16), 16),
             :expert_input_size,
@@ -922,7 +1020,6 @@ def _stage_singleton_row(
             picked.astype(jnp.int16), jnp.bfloat16
         ).astype(destination.dtype)
         return
-    active_index = jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
     for row in range(batch_size):
 
         @pl.when(active_index == row)
@@ -955,6 +1052,7 @@ def _run_routed_expert_stream(
     expert_output_size,
     group_pending_routes,
     progress=None,
+    expert_schedule=None,
 ):
     """Execute the next route shared by any ready batch rows.
 
@@ -962,6 +1060,11 @@ def _run_routed_expert_stream(
     expert, its weights are loaded once and its projections carry the batch
     dimension. The loop is bounded by the distinct experts (grouped routes)
     or the route count, never by batch size.
+
+    ``expert_schedule`` (_expert_schedule, grouped B8/B16 routes; its copy
+    started by _start_expert_schedule) supplies each pair's experts, row
+    counts, single rows and row masks from SMEM; ``processed_routes_vmem``
+    is its staging buffer then.
     """
     batch_size, selected_expert_count = selected_experts.shape
     # Narrow masked products avoid zero MACs and register spills while keeping
@@ -1029,7 +1132,10 @@ def _run_routed_expert_stream(
             )
 
     route_slots = jnp.arange(selected_expert_count)[None, :]
-    processed_routes_vmem[...] = jnp.zeros(processed_routes_vmem.shape, jnp.int32)
+    if expert_schedule is None:
+        processed_routes_vmem[...] = jnp.zeros(processed_routes_vmem.shape, jnp.int32)
+    elif not group_pending_routes or batch_size not in (8, 16):
+        raise ValueError("The expert schedule serves grouped B8/B16 routes")
     expert_output[...] = jnp.zeros(expert_output.shape, jnp.float32)
 
     def next_expert(processed):
@@ -1127,8 +1233,10 @@ def _run_routed_expert_stream(
         compact_row,
         column,
         slot,
+        active_row=None,
     ):
-        """Finish one expert whose route is active for exactly one batch row."""
+        """Finish one expert whose route is active for exactly one batch row
+        (``active_row``, if known as a scalar)."""
         gate_up = (
             gate_up_accumulator[
                 compact_row : compact_row + 1,
@@ -1166,7 +1274,11 @@ def _run_routed_expert_stream(
             / probability_totals
         )
         singleton_output = down_accumulator[:1].astype(jnp.bfloat16).astype(jnp.float32)
-        row = jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
+        row = (
+            jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
+            if active_row is None
+            else active_row
+        )
         probability = jnp.sum(
             jnp.where(active_rows, route_probabilities, jnp.float32(0))
         )
@@ -1181,7 +1293,7 @@ def _run_routed_expert_stream(
         first_single_source = first_compact_source_vmem
         second_single_source = second_compact_source_vmem
 
-    def stage_singleton_source(active_rows, destination):
+    def stage_singleton_source(active_rows, destination, active_index=None):
         _stage_singleton_row(
             source,
             active_rows,
@@ -1189,6 +1301,7 @@ def _run_routed_expert_stream(
             expert_input_size=expert_input_size,
             block_select=singleton_block,
             row_select=B8_SINGLETON_SELECT,
+            active_index=active_index,
         )
 
     def row_bitmask_words(active_rows):
@@ -1313,9 +1426,12 @@ def _run_routed_expert_stream(
             ).astype(jnp.float32)
             destination[pl.ds(position, 1), :] = selected_row
 
-    def stage_compact_rows(active_rows, destination, offset=0, row_plan=None):
+    def stage_compact_rows(
+        active_rows, destination, offset=0, row_plan=None, row_words=None
+    ):
         """Copy active rows offset .. offset + C - 1 (in row order) into
-        ``destination`` [C, K] FP32 (the rest zero)."""
+        ``destination`` [C, K] FP32 (the rest zero). ``row_words``: the
+        active rows' scalar bit words, if known (row_bitmask_words)."""
         if reuse_row_plan:
             if row_plan is None:
                 row_plan = compact_row_plan(active_rows, offset)
@@ -1330,7 +1446,7 @@ def _run_routed_expert_stream(
         destination[...] = jnp.zeros(destination.shape, destination.dtype)
         if stage_blocks and batch_size == 16:
             # B16 stages rows with a scalar scan over the row bitmask.
-            (word,) = row_bitmask_words(active_rows)
+            (word,) = row_bitmask_words(active_rows) if row_words is None else row_words
 
             def stage_block(block, position):
                 first = pl.multiple_of(block * 16, 16)
@@ -1509,7 +1625,13 @@ def _run_routed_expert_stream(
     share_full_finish = share_compact_finish and not compact_only
 
     def run_expert_in_passes(
-        active_rows, current_slot_mask, copies, row_count, slot, paired_gate=False
+        active_rows,
+        current_slot_mask,
+        copies,
+        row_count,
+        slot,
+        paired_gate=False,
+        row_words=None,
     ):
         """One expert with more than C rows, C rows per pass."""
         copies.gate_up.wait()
@@ -1527,7 +1649,9 @@ def _run_routed_expert_stream(
                 if reuse_row_plan
                 else None
             )
-            stage_compact_rows(active_rows, first_compact_source_vmem, offset, row_plan)
+            stage_compact_rows(
+                active_rows, first_compact_source_vmem, offset, row_plan, row_words
+            )
             if paired_gate:
                 _paired_order_expert_gate_up(
                     first_compact_source_vmem,
@@ -1669,7 +1793,11 @@ def _run_routed_expert_stream(
             )
             finish_shared_expert(index, slot, 0)
 
-    if group_pending_routes:
+    if expert_schedule is not None:
+        expert_schedule.copy.wait()
+        schedule = expert_schedule.table
+        pair_count = (schedule[SCHEDULE_EXPERT_COUNT, 0] + 1) // 2
+    elif group_pending_routes:
         # Each iteration serves every pending route of its two experts, so the
         # loop needs one iteration per two distinct experts, not per two
         # routes (local expert ids are < 128).
@@ -1694,8 +1822,9 @@ def _run_routed_expert_stream(
     def run_divergent_routes():
         # Reuse the choices already made for the next four-slot prefetch.
         # Other batch/routing combinations use the selector loop.
-        carry_routes = (batch_size in (2, 4) and not group_pending_routes) or (
-            batch_size in (8, 16, 32, 48, 64, 96, 128) and group_pending_routes
+        carry_routes = expert_schedule is None and (
+            (batch_size in (2, 4) and not group_pending_routes)
+            or (batch_size in (8, 16, 32, 48, 64, 96, 128) and group_pending_routes)
         )
 
         def pack(choice):
@@ -1709,45 +1838,94 @@ def _run_routed_expert_stream(
             initial_first = next_expert(initial_processed)
             initial_second = next_expert(initial_processed | initial_first[3])
 
+        def scheduled_expert(position):
+            """The schedule's position-th expert: its id (0 past the last),
+            whether it exists, and its row count."""
+            row_count = schedule[SCHEDULE_ROW_COUNT, position]
+            return schedule[SCHEDULE_EXPERT, position], row_count > 0, row_count
+
+        def scheduled_routes(position):
+            """A scheduled expert with its active rows and route slots: every
+            valid route to it is pending when it is the pending minimum."""
+            expert, has_expert, row_count = scheduled_expert(position)
+            slot_mask = valid_routes & (
+                selected_experts == jnp.where(has_expert, expert, -1)
+            )
+            return expert, jnp.any(slot_mask, axis=1), slot_mask, has_expert, row_count
+
         def run_next_expert_pair(iteration, carry=None):
             if progress is not None:
                 progress(iteration)
+
+            def scheduled(table_row, index):
+                """This pair's first (index 0) or second expert's schedule
+                entry; None without a schedule."""
+                if expert_schedule is None:
+                    return None
+                return schedule[table_row, 2 * iteration + index]
+
+            def scheduled_row_words(index):
+                if expert_schedule is None:
+                    return None
+                return (
+                    scheduled(SCHEDULE_ROW_MASK_LOW, index)
+                    | scheduled(SCHEDULE_ROW_MASK_HIGH, index) << 8,
+                )
+
             with _phase("e_iteration"):
                 select_scope = _phase_start("e_select")
-                processed = processed_routes_vmem[:, :selected_expert_count] != 0
-                (
-                    first_expert,
-                    first_rows,
-                    first_slot_mask,
-                    first_consumed,
-                    has_first,
-                ) = unpack(carry[0]) if carry_routes else next_expert(processed)
-                (
-                    second_expert,
-                    second_rows,
-                    second_slot_mask,
-                    second_consumed,
-                    has_second,
-                ) = (
-                    unpack(carry[1])
-                    if carry_routes
-                    else next_expert(processed | first_consumed)
-                )
-                processed_after_pair = processed | first_consumed | second_consumed
-                (
-                    third_expert,
-                    third_rows,
-                    third_slot_mask,
-                    third_consumed,
-                    has_third,
-                ) = next_expert(processed_after_pair)
-                (
-                    fourth_expert,
-                    fourth_rows,
-                    fourth_slot_mask,
-                    fourth_consumed,
-                    has_fourth,
-                ) = next_expert(processed_after_pair | third_consumed)
+                if expert_schedule is not None:
+                    (
+                        first_expert,
+                        first_rows,
+                        first_slot_mask,
+                        has_first,
+                        first_row_count,
+                    ) = scheduled_routes(2 * iteration)
+                    (
+                        second_expert,
+                        second_rows,
+                        second_slot_mask,
+                        has_second,
+                        second_row_count,
+                    ) = scheduled_routes(2 * iteration + 1)
+                    third_expert, has_third, _ = scheduled_expert(2 * iteration + 2)
+                    fourth_expert, has_fourth, _ = scheduled_expert(2 * iteration + 3)
+                else:
+                    processed = processed_routes_vmem[:, :selected_expert_count] != 0
+                    (
+                        first_expert,
+                        first_rows,
+                        first_slot_mask,
+                        first_consumed,
+                        has_first,
+                    ) = unpack(carry[0]) if carry_routes else next_expert(processed)
+                    (
+                        second_expert,
+                        second_rows,
+                        second_slot_mask,
+                        second_consumed,
+                        has_second,
+                    ) = (
+                        unpack(carry[1])
+                        if carry_routes
+                        else next_expert(processed | first_consumed)
+                    )
+                    processed_after_pair = processed | first_consumed | second_consumed
+                    (
+                        third_expert,
+                        third_rows,
+                        third_slot_mask,
+                        third_consumed,
+                        has_third,
+                    ) = next_expert(processed_after_pair)
+                    (
+                        fourth_expert,
+                        fourth_rows,
+                        fourth_slot_mask,
+                        fourth_consumed,
+                        has_fourth,
+                    ) = next_expert(processed_after_pair | third_consumed)
 
                 current_base_slot = (iteration % 2) * 2
                 next_base_slot = ((iteration + 1) % 2) * 2
@@ -1823,8 +2001,9 @@ def _run_routed_expert_stream(
                 # than a full padded MXU tile. At B2/B4 the selection overhead
                 # offsets the saved padded work.
                 if batch_size >= 8:
-                    first_row_count = jnp.sum(first_rows.astype(jnp.int32))
-                    second_row_count = jnp.sum(second_rows.astype(jnp.int32))
+                    if expert_schedule is None:
+                        first_row_count = jnp.sum(first_rows.astype(jnp.int32))
+                        second_row_count = jnp.sum(second_rows.astype(jnp.int32))
                     compact_pair = (
                         has_first
                         & has_second
@@ -1846,8 +2025,14 @@ def _run_routed_expert_stream(
                         first_copies.gate_up_scales.wait()
                         second_copies.gate_up.wait()
                         second_copies.gate_up_scales.wait()
-                        stage_singleton_source(first_rows, first_single_source)
-                        stage_singleton_source(second_rows, second_single_source)
+                        first_row = scheduled(SCHEDULE_ROW, 0)
+                        second_row = scheduled(SCHEDULE_ROW, 1)
+                        stage_singleton_source(
+                            first_rows, first_single_source, first_row
+                        )
+                        stage_singleton_source(
+                            second_rows, second_single_source, second_row
+                        )
                         _paired_expert_gate_up(
                             first_single_source,
                             expert_gate_up_vmem,
@@ -1865,6 +2050,7 @@ def _run_routed_expert_stream(
                             0,
                             0,
                             current_base_slot,
+                            first_row,
                         )
                         finish_singleton_expert(
                             second_rows,
@@ -1873,6 +2059,7 @@ def _run_routed_expert_stream(
                             1,
                             2 * expert_width,
                             current_base_slot + 1,
+                            second_row,
                         )
 
                     if compact_capacity > 1:
@@ -1895,11 +2082,13 @@ def _run_routed_expert_stream(
                                 first_rows,
                                 first_compact_source_vmem,
                                 row_plan=first_plan,
+                                row_words=scheduled_row_words(0),
                             )
                             stage_compact_rows(
                                 second_rows,
                                 second_compact_source_vmem,
                                 row_plan=second_plan,
+                                row_words=scheduled_row_words(1),
                             )
 
                             def project_pair(capacity=None):
@@ -1962,6 +2151,7 @@ def _run_routed_expert_stream(
                                 first_row_count,
                                 current_base_slot,
                                 paired_gate=compact_overflow,
+                                row_words=scheduled_row_words(0),
                             )
                             run_expert_in_passes(
                                 second_rows,
@@ -1970,6 +2160,7 @@ def _run_routed_expert_stream(
                                 second_row_count,
                                 current_base_slot + 1,
                                 paired_gate=compact_overflow,
+                                row_words=scheduled_row_words(1),
                             )
                         else:
                             execute_full_pair()
@@ -1981,7 +2172,10 @@ def _run_routed_expert_stream(
                     def execute_compact_tail():
                         first_copies.gate_up.wait()
                         first_copies.gate_up_scales.wait()
-                        stage_singleton_source(first_rows, first_single_source)
+                        first_row = scheduled(SCHEDULE_ROW, 0)
+                        stage_singleton_source(
+                            first_rows, first_single_source, first_row
+                        )
                         expert_dot(
                             first_single_source,
                             expert_gate_up_vmem.at[current_base_slot],
@@ -1997,6 +2191,7 @@ def _run_routed_expert_stream(
                             0,
                             0,
                             current_base_slot,
+                            first_row,
                         )
 
                     if compact_capacity > 1:
@@ -2015,6 +2210,7 @@ def _run_routed_expert_stream(
                                 first_rows,
                                 first_compact_source_vmem,
                                 row_plan=first_plan,
+                                row_words=scheduled_row_words(0),
                             )
                             expert_dot(
                                 first_compact_source_vmem,
@@ -2049,6 +2245,7 @@ def _run_routed_expert_stream(
                                 first_copies,
                                 first_row_count,
                                 current_base_slot,
+                                row_words=scheduled_row_words(0),
                             )
                         else:
                             execute_full_tail()
@@ -2147,11 +2344,12 @@ def _run_routed_expert_stream(
                     def execute_tail():
                         execute_full_tail()
 
-                processed_routes_vmem[:, :selected_expert_count] = jnp.where(
-                    first_consumed | second_consumed,
-                    jnp.int32(1),
-                    processed_routes_vmem[:, :selected_expert_count],
-                )
+                if expert_schedule is None:
+                    processed_routes_vmem[:, :selected_expert_count] = jnp.where(
+                        first_consumed | second_consumed,
+                        jnp.int32(1),
+                        processed_routes_vmem[:, :selected_expert_count],
+                    )
                 if carry_routes:
                     return (
                         pack(
@@ -2635,6 +2833,9 @@ class MixtureOfExpertsWorkspace:
     # Sharded routing only: this pair's selection rows and everyone's.
     selection_source_vmem: Any = None  # [batch_size / 4, 128] FP32
     selections_vmem: Any = None  # [batch_size, 128] FP32
+    # KernelConfig.expert_schedule only (_use_expert_schedule).
+    expert_schedule_smem: Any = None  # [8, 128] int32
+    expert_schedule_semaphore: Any = None
 
 
 def _consume_completed_routed_chunks(
@@ -2940,6 +3141,16 @@ def moe(
     gate_up_accumulator_vmem = workspace.gate_up_accumulator_vmem
     down_accumulator_vmem = workspace.down_accumulator_vmem
     processed_routes_vmem = workspace.processed_routes_vmem
+    expert_schedule = None
+    if workspace.expert_schedule_smem is not None:
+        # Schedule positions run to the used-expert count + 2 (< 128).
+        if (2 if half_experts else 1) * local_expert_count > 125:
+            raise ValueError("The expert schedule needs at most 125 local experts")
+        expert_schedule = _expert_schedule(
+            processed_routes_vmem.at[:8],
+            workspace.expert_schedule_smem,
+            workspace.expert_schedule_semaphore,
+        )
     first_compact_source_vmem = workspace.first_compact_source_vmem
     second_compact_source_vmem = workspace.second_compact_source_vmem
     shared_send_semaphores = workspace.shared_send_semaphores
@@ -3239,6 +3450,11 @@ def moe(
             already_started=prefetched_expert_count,
             group_pending_routes=group_pending_expert_routes,
         )
+        if expert_schedule is not None:
+            # After the first expert copies, ahead of the shared expert.
+            _start_expert_schedule(
+                expert_schedule, selected_experts, local_route_counts
+            )
 
         if not overlap_latent_gather:
             start_latent_gather(
@@ -3750,6 +3966,7 @@ def moe(
                 expert_output_size=expert_output_size,
                 group_pending_routes=group_pending_expert_routes,
                 progress=poll_shared,
+                expert_schedule=expert_schedule,
             )
 
         @pl.when(progress_state[0] == 0)
@@ -3786,6 +4003,7 @@ def moe(
                 expert_output_size=expert_output_size,
                 group_pending_routes=group_pending_expert_routes,
                 progress=None,
+                expert_schedule=expert_schedule,
             )
 
     def consume_routed_chunk(first, rows):
@@ -6939,6 +7157,9 @@ SHARED_EXPERT_FINISHERS = _config().shared_expert_finishers
 # finish overflowing experts in eight-row passes; without the full-batch
 # fallback the expert loop fits in IMEM next to its predecessor.
 COMPACT_OVERFLOW = _config().compact_overflow
+# KernelConfig.expert_schedule: grouped B8/B16 expert loops read their
+# experts from an SMEM schedule (_expert_schedule_table).
+EXPERT_SCHEDULE = _config().expert_schedule
 SHARED_SHARDS = _config().shared_shards
 # KernelConfig.kda_staged=True (above B8, no attention DP): stage the KDA input
 # and feature-gate projections in VMEM; with a state stream (above B16) the
@@ -6980,6 +7201,10 @@ def _use_compact_overflow(batch_size, gate_up_dtype, *, group_pending_routes):
         and gate_up_dtype == jnp.uint32
         and group_pending_routes
     )
+
+
+def _use_expert_schedule(batch_size, *, group_pending_routes):
+    return EXPERT_SCHEDULE and group_pending_routes and batch_size in (8, 16)
 
 
 def _expert_accumulator_rows(
@@ -7278,6 +7503,13 @@ def _moe_scoped_scratch(
                 tpu.VMEM((batch_size, 128), jnp.float32),
             )
             if shard_routing
+            else ()
+        ),
+        *(
+            (tpu.SMEM((8, 128), jnp.int32), tpu.SemaphoreType.DMA)
+            if _use_expert_schedule(
+                batch_size, group_pending_routes=group_pending_routes
+            )
             else ()
         ),
     )
@@ -7718,6 +7950,12 @@ def stack(
             page_plan=plan,
         )
         mla_scoped_scratch = (*mla_scoped_scratch, *dsa_scoped.values())
+    group_pending_expert_routes = (
+        batch_size in (6, *SCATTER_BATCHES) and residual_reduction_order == "relaxed"
+    )
+    expert_schedule = _use_expert_schedule(
+        batch_size, group_pending_routes=group_pending_expert_routes
+    )
     moe_scoped_scratch = _moe_scoped_scratch(
         local_weights,
         batch_size=batch_size,
@@ -7725,10 +7963,7 @@ def stack(
         token_scatter_output=moe_token_scatter_output,
         token_scatter_owners=sp_owners,
         shard_routing=shard_routing,
-        group_pending_routes=(
-            batch_size in (6, *SCATTER_BATCHES)
-            and residual_reduction_order == "relaxed"
-        ),
+        group_pending_routes=group_pending_expert_routes,
     )
 
     def body(position_ref, state_row_ref, *refs):
@@ -9800,6 +10035,15 @@ def stack(
                     gate_up_vmem, down_vmem = layer_expert_vmem
                     gate_up_scales_vmem, down_scales_vmem = resources[3:5]
                     workspace_resources = resources[5:]
+                schedule_resources = {}
+                if expert_schedule:
+                    *workspace_resources, schedule_smem, schedule_semaphore = (
+                        workspace_resources
+                    )
+                    schedule_resources = dict(
+                        expert_schedule_smem=schedule_smem,
+                        expert_schedule_semaphore=schedule_semaphore,
+                    )
                 mixture_output_vmem = (
                     owned_rows_vmem if moe_token_scatter_output else mixture_vmem
                 )
@@ -9828,15 +10072,14 @@ def stack(
                         down_scales_vmem,
                         expert_semaphores,
                     ),
-                    workspace=MixtureOfExpertsWorkspace(*workspace_resources),
+                    workspace=MixtureOfExpertsWorkspace(
+                        *workspace_resources, **schedule_resources
+                    ),
                     communication_workspace=communication_workspace,
                     epsilon=eps,
                     synchronize_devices=False,
                     routing_projection_is_prefetched=True,
-                    group_pending_expert_routes=(
-                        batch_size in (6, *SCATTER_BATCHES)
-                        and residual_reduction_order == "relaxed"
-                    ),
+                    group_pending_expert_routes=group_pending_expert_routes,
                     after_experts=after_experts,
                     after_routing_scores=after_routing_scores,
                     overlap_router_latent=(
@@ -10696,6 +10939,11 @@ def stack(
                         *(
                             ("routing selection source", "routing selections")
                             if shard_routing
+                            else ()
+                        ),
+                        *(
+                            ("expert schedule", "expert schedule semaphore")
+                            if expert_schedule
                             else ()
                         ),
                     ),

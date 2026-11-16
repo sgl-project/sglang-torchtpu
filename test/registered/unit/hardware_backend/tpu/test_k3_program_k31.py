@@ -12,12 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=480, suite="base-a-test-cpu")
-
-
-register_cpu_ci(est_time=540, suite="base-a-test-cpu")
-
-
+register_cpu_ci(est_time=780, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -1440,80 +1435,218 @@ class TestK31Draft(CustomTestCase):
         self.assertFalse(np.allclose(causal[0], full[0], atol=1e-5))
 
 
-class TestSingletonRowStaging(CustomTestCase):
-    """A singleton route's row staging (``_stage_singleton_row``) in Pallas
-    interpret mode: at 8 rows, ``KernelConfig.b8_singleton_select`` (one select
-    over the row tile, no branch) stages the bits of the per-row copies for
-    every active row and every BF16 bit pattern (signed zeros, subnormals,
-    infinities, NaN payloads); other row counts keep the per-row copies."""
+class TestExpertSchedule(CustomTestCase):
+    """The grouped routed-expert stream (``_run_routed_expert_stream``) at B8
+    and B16 in Pallas interpret mode, on random MXFP4 experts and routings
+    (single-row and multi-row experts, more rows than a compact tile, odd
+    expert counts, empty rows, expert 0, no experts): reading each pair from
+    the SMEM schedule (``KernelConfig.expert_schedule``) gives bit-identical
+    outputs to reducing the pending routes every iteration."""
 
-    def test_select_matches_the_row_copies(self):
-        import jax
-        import jax.numpy as jnp
-        import ml_dtypes
+    SCRIPT = """
+        import os
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        from types import SimpleNamespace
+        import numpy as np, jax, jax.numpy as jnp
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
-
         from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk
+
+        E, K, IN, WIDTH, OUT = 112, 16, 512, 768, 128
+
+        def stream(B, scheduled):
+            rows = dmk._expert_accumulator_rows(B, jnp.uint32, group_pending_routes=True)
+            compact = dmk._compact_rows(B)
+
+            def kernel(sel_ref, prob_ref, count_ref, total_ref, source_ref, gu_hbm, gus_hbm,
+                       down_hbm, ds_hbm, out_ref, gu, gus, down, ds, semaphores, gate_up_acc,
+                       down_acc, processed, first_compact, second_compact, table, table_semaphore):
+                selected, counts = sel_ref[:, :K], count_ref[:, 0]
+
+                def copy_expert(expert, slot, *, gate_up=True, down=True):
+                    def copy(hbm, vmem, kind, wanted):
+                        return (pltpu.make_async_copy(hbm.at[expert], vmem.at[slot],
+                                                      semaphores.at[slot, kind]) if wanted else None)
+                    return SimpleNamespace(
+                        gate_up=copy(gu_hbm, gu, 0, gate_up), gate_up_scales=copy(gus_hbm, gus, 1, gate_up),
+                        down=copy(down_hbm, down_slots, 2, down), down_scales=copy(ds_hbm, ds, 3, down))
+
+                down_slots = down
+                dmk._start_initial_expert_weight_copies(
+                    selected, counts, copy_expert, slot_count=4, already_started=jnp.int32(0),
+                    group_pending_routes=True)
+                schedule = None
+                if scheduled:
+                    schedule = dmk._expert_schedule(processed.at[:8], table, table_semaphore)
+                    dmk._start_expert_schedule(schedule, selected, counts)
+                dmk._run_routed_expert_stream(
+                    source_ref, selected, prob_ref[:, :K], counts, total_ref[:, 0], gu, gus, down_slots,
+                    ds, out_ref, gate_up_acc, down_acc, processed, first_compact, second_compact,
+                    copy_expert, expert_input_size=IN, expert_width=WIDTH, expert_output_size=OUT,
+                    group_pending_routes=True, expert_schedule=schedule)
+
+            sources = ((pltpu.VMEM((compact, IN), jnp.float32),) * 2 if compact
+                       else (pltpu.VMEM((1, IN), jnp.bfloat16),) * 2)
+            return jax.jit(pl.pallas_call(
+                kernel, out_shape=jax.ShapeDtypeStruct((B, OUT), jnp.float32),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 5
+                + [pl.BlockSpec(memory_space=pl.ANY)] * 4,
+                out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                scratch_shapes=[
+                    pltpu.VMEM((4, IN // 8, 2 * WIDTH), jnp.uint32),
+                    pltpu.VMEM((4, IN // 32, 2 * WIDTH), jnp.uint8),
+                    pltpu.VMEM((4, WIDTH // 8, OUT), jnp.uint32),
+                    pltpu.VMEM((4, WIDTH // 32, OUT), jnp.uint8),
+                    pltpu.SemaphoreType.DMA((4, 4)),
+                    pltpu.VMEM((rows[0], 4 * WIDTH), jnp.float32),
+                    pltpu.VMEM((rows[1], OUT), jnp.float32),
+                    pltpu.VMEM((B, 128), jnp.int32), *sources,
+                    pltpu.SMEM((8, 128), jnp.int32), pltpu.SemaphoreType.DMA],
+                interpret=pltpu.InterpretParams()))
+
+        rng = np.random.default_rng(0)
+        weights = (rng.integers(0, 2**32, (E, IN // 8, 2 * WIDTH), dtype=np.uint32),
+                   rng.integers(122, 128, (E, IN // 32, 2 * WIDTH), dtype=np.uint8),
+                   rng.integers(0, 2**32, (E, WIDTH // 8, OUT), dtype=np.uint32),
+                   rng.integers(122, 128, (E, WIDTH // 32, OUT), dtype=np.uint8))
+
+        def routing(B, seed, pool, most):
+            # Rows pick up to `most` distinct experts of a pool holding expert 0
+            # (row 0 the most, others 0..most); slots past a row's count hold
+            # expert 0, as after routing.
+            r = np.random.default_rng(seed)
+            experts = r.choice(E, pool, replace=False)
+            experts[0] = 0
+            sel = np.zeros((B, 128), np.int32)
+            prob = np.zeros((B, 128), np.float32)
+            cnt = np.zeros((B, 128), np.int32)
+            for b in range(B):
+                n = int(r.integers(0, min(most, pool) + 1)) if b else min(most, pool)
+                sel[b, :n] = r.choice(experts, n, replace=False)
+                prob[b, :n] = r.uniform(0.01, 1.0, n)
+                cnt[b] = n
+            total = np.broadcast_to(prob.sum(1, keepdims=True) + r.uniform(0.5, 2.0, (B, 1)), (B, 128))
+            source = r.standard_normal((B, IN)).astype(jnp.bfloat16)
+            return sel, prob, cnt, np.ascontiguousarray(total, np.float32), source
+
+        CASES = {8: [(1, 112, 4), (3, 9, 5), (4, 1, 1), (8, 5, 0)],
+                 16: [(11, 112, 3), (12, 12, 12), (13, 20, 6)]}
+        for B, cases in CASES.items():
+            old, new = stream(B, False), stream(B, True)
+            for seed, pool, most in cases:
+                sel, prob, cnt, total, source = routing(B, seed, pool, most)
+                a = np.asarray(old(sel, prob, cnt, total, source, *weights))
+                b = np.asarray(new(sel, prob, cnt, total, source, *weights))
+                used = {int(sel[r, s]) for r in range(B) for s in range(cnt[r, 0])}
+                rows_per_expert = [sum(e in sel[r, :cnt[r, 0]] for r in range(B)) for e in sorted(used)]
+                assert np.isfinite(a).all() and (np.abs(a).sum(1) > 0).sum() == (cnt[:, 0] > 0).sum()
+                assert np.array_equal(a.view(np.uint32), b.view(np.uint32)), (B, seed)
+                print(f"B{B} seed {seed}: rows per expert {rows_per_expert} bit-identical")
+        print("OK")
+    """
+
+    def test_schedule_matches_the_pending_route_loop(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
 
         if not hasattr(pltpu, "InterpretParams"):
             self.skipTest("Pallas TPU interpret mode unavailable")
-        width = 3584  # expert input columns of the [rows, 4096] latent tile
-        # -0, +0, -/+ smallest subnormal, -/+ largest finite, -/+ infinity,
-        # NaNs (quiet, signalling, payloads, negative), +/-1.
-        special = np.array(
-            [0x8000, 0x0000, 0x8001, 0x0001, 0xFF7F, 0x7F7F, 0xFF80, 0x7F80]
-            + [0x7FC0, 0x7F81, 0x7FC1, 0xFFC0, 0xFFFF, 0x7FFF, 0x3F80, 0xBF80],
-            np.uint16,
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1800,
         )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
-        def staging(rows, row_select):
-            def kernel(routes_ref, source_ref, out_ref):
-                for case in range(rows):
-                    dmk._stage_singleton_row(
-                        source_ref,
-                        jnp.any(routes_ref[case] != 0, axis=1),
-                        out_ref.at[case],
-                        expert_input_size=width,
-                        block_select=False,
-                        row_select=row_select,
-                    )
 
-            return pl.pallas_call(
+class TestK31DraftWholeWeights(CustomTestCase):
+    """``KernelConfig.draft_whole_weights``: Kimi-K3.1's draft (three heads a
+    rank) holds o whole at up to 8 rows and down at up to 16 instead of
+    streaming them one 896-column chunk at a time (other drafts and shapes as
+    before), and the chunks ``all_reduce`` multiplies
+    (``dspark_mla_kernel._ChunkedWeight``) give bit-identical products either
+    way (Pallas interpret mode)."""
+
+    SCRIPT = """
+        import os
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark_mla as mla
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark_mla_kernel as kern
+
+        for heads in (64, 96):
+            c = mla.MlaDraftConfig(heads=heads)
+            for rows in (4, 8, 12, 16, 24, 32, 48, 64):
+                for dp in (1, 2):
+                    old = rows > 32 or heads > 64  # before the knob: down; o also under DP
+                    assert kern.streamed_weights(c, rows, dp) == (old or dp > 1, old)
+                    if heads > 64 and dp == 1:
+                        want = (rows > 8, rows > 16)
+                    else:
+                        want = (old or dp > 1, old)
+                    assert kern.streamed_weights(c, rows, dp, whole=True) == want, (heads, rows, dp)
+
+        LAYERS, CHUNK = 2, kern.CHUNK
+        def products(lhs, weight, streamed):
+            T, K = lhs.shape
+            def kernel(lhs_ref, weight_hbm, out_ref, buffer, sems):
+                copy = lambda src, dst, sem: pltpu.make_async_copy(src, dst, sems.at[sem])
+                chunked = kern._ChunkedWeight(weight_hbm, buffer, (0, 1), copy)
+                assert chunked.streamed == streamed
+                for layer in range(LAYERS):
+                    chunked.load(layer).wait()
+                    for k, operand in enumerate(chunked.chunks(layer)):
+                        out_ref[layer, k] = kern._dot(lhs_ref[...], operand)
+            buffer = (2, K, CHUNK) if streamed else (K, 8 * CHUNK)
+            return np.asarray(pl.pallas_call(
                 kernel,
-                out_shape=jax.ShapeDtypeStruct((rows, 1, width), jnp.bfloat16),
+                out_shape=jax.ShapeDtypeStruct((LAYERS, 8, T, CHUNK), jnp.float32),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM), pl.BlockSpec(memory_space=pl.ANY)],
+                out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                scratch_shapes=[pltpu.VMEM(buffer, jnp.bfloat16), pltpu.SemaphoreType.DMA((2,))],
                 interpret=pltpu.InterpretParams(),
-            )
-
-        def inputs(rows):
-            bits = rng.integers(0, 1 << 16, (rows, 4096), dtype=np.uint16)
-            # Each row holds every special pattern; in each of those columns
-            # the other rows hold other ones.
-            for column in range(0, width, 448):
-                for row in range(rows):
-                    bits[row, column : column + 16] = np.roll(special, row)
-            # Case r: row r is the only row with a route to the expert.
-            routes = np.zeros((rows, rows, 16), np.int32)
-            for row in range(rows):
-                routes[row, row, rng.integers(0, 16)] = 1 + rng.integers(0, 128)
-            return bits, routes
-
-        def branches(call, *args):
-            return str(jax.make_jaxpr(call)(*args)).count("cond[")
+            )(lhs, weight))
 
         rng = np.random.default_rng(0)
-        bits, routes = inputs(8)
-        source = bits.view(ml_dtypes.bfloat16)
-        copy, select = staging(8, False), staging(8, True)
-        self.assertEqual(branches(copy, routes, source), 8 * 8)
-        self.assertEqual(branches(select, routes, source), 0)
-        for call in (copy, select):
-            staged = np.asarray(call(routes, source)).view(np.uint16)
-            np.testing.assert_array_equal(staged[:, 0], bits[:, :width])
-        # Other row counts keep the per-row copies.
-        bits, routes = inputs(12)
-        source = bits.view(ml_dtypes.bfloat16)
-        self.assertEqual(branches(staging(12, True), routes, source), 12 * 12)
+        for T, K in ((8, 384), (16, 512)):  # o (three heads) at 8 rows, down at 16
+            lhs = jnp.asarray(rng.standard_normal((T, K)), jnp.bfloat16)
+            weight = jnp.asarray(rng.standard_normal((LAYERS, K, 8 * CHUNK)), jnp.bfloat16)
+            streamed, whole = products(lhs, weight, True), products(lhs, weight, False)
+            assert np.array_equal(streamed.view(np.uint32), whole.view(np.uint32)), (T, K)
+            ref = np.asarray(lhs, np.float32) @ np.asarray(weight, np.float32)
+            ref = ref.reshape(LAYERS, T, 8, CHUNK).transpose(0, 2, 1, 3)
+            np.testing.assert_allclose(whole, ref, rtol=1e-4, atol=1e-3)
+        print("OK")
+    """
+
+    def test_whole_and_streamed_chunks_match(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
 class TestB16OneHotStaging(CustomTestCase):
@@ -1639,75 +1772,6 @@ print("OK")
         import subprocess
         import sys
 
-
-class TestK31DraftWholeWeights(CustomTestCase):
-    """``KernelConfig.draft_whole_weights``: Kimi-K3.1's draft (three heads a
-    rank) holds o whole at up to 8 rows and down at up to 16 instead of
-    streaming them one 896-column chunk at a time (other drafts and shapes as
-    before), and the chunks ``all_reduce`` multiplies
-    (``dspark_mla_kernel._ChunkedWeight``) give bit-identical products either
-    way (Pallas interpret mode)."""
-
-    SCRIPT = """
-        import os
-        os.environ["JAX_PLATFORMS"] = "cpu"
-        import numpy as np, jax, jax.numpy as jnp
-        from jax.experimental import pallas as pl
-        from jax.experimental.pallas import tpu as pltpu
-        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark_mla as mla
-        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark_mla_kernel as kern
-
-        for heads in (64, 96):
-            c = mla.MlaDraftConfig(heads=heads)
-            for rows in (4, 8, 12, 16, 24, 32, 48, 64):
-                for dp in (1, 2):
-                    old = rows > 32 or heads > 64  # before the knob: down; o also under DP
-                    assert kern.streamed_weights(c, rows, dp) == (old or dp > 1, old)
-                    if heads > 64 and dp == 1:
-                        want = (rows > 8, rows > 16)
-                    else:
-                        want = (old or dp > 1, old)
-                    assert kern.streamed_weights(c, rows, dp, whole=True) == want, (heads, rows, dp)
-
-        LAYERS, CHUNK = 2, kern.CHUNK
-        def products(lhs, weight, streamed):
-            T, K = lhs.shape
-            def kernel(lhs_ref, weight_hbm, out_ref, buffer, sems):
-                copy = lambda src, dst, sem: pltpu.make_async_copy(src, dst, sems.at[sem])
-                chunked = kern._ChunkedWeight(weight_hbm, buffer, (0, 1), copy)
-                assert chunked.streamed == streamed
-                for layer in range(LAYERS):
-                    chunked.load(layer).wait()
-                    for k, operand in enumerate(chunked.chunks(layer)):
-                        out_ref[layer, k] = kern._dot(lhs_ref[...], operand)
-            buffer = (2, K, CHUNK) if streamed else (K, 8 * CHUNK)
-            return np.asarray(pl.pallas_call(
-                kernel,
-                out_shape=jax.ShapeDtypeStruct((LAYERS, 8, T, CHUNK), jnp.float32),
-                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM), pl.BlockSpec(memory_space=pl.ANY)],
-                out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
-                scratch_shapes=[pltpu.VMEM(buffer, jnp.bfloat16), pltpu.SemaphoreType.DMA((2,))],
-                interpret=pltpu.InterpretParams(),
-            )(lhs, weight))
-
-        rng = np.random.default_rng(0)
-        for T, K in ((8, 384), (16, 512)):  # o (three heads) at 8 rows, down at 16
-            lhs = jnp.asarray(rng.standard_normal((T, K)), jnp.bfloat16)
-            weight = jnp.asarray(rng.standard_normal((LAYERS, K, 8 * CHUNK)), jnp.bfloat16)
-            streamed, whole = products(lhs, weight, True), products(lhs, weight, False)
-            assert np.array_equal(streamed.view(np.uint32), whole.view(np.uint32)), (T, K)
-            ref = np.asarray(lhs, np.float32) @ np.asarray(weight, np.float32)
-            ref = ref.reshape(LAYERS, T, 8, CHUNK).transpose(0, 2, 1, 3)
-            np.testing.assert_allclose(whole, ref, rtol=1e-4, atol=1e-3)
-        print("OK")
-    """
-
-    def test_whole_and_streamed_chunks_match(self):
-        import os
-        import subprocess
-        import sys
-        import textwrap
-
         from jax.experimental.pallas import tpu as pltpu
 
         if not hasattr(pltpu, "InterpretParams"):
@@ -1715,9 +1779,6 @@ class TestK31DraftWholeWeights(CustomTestCase):
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
         result = subprocess.run(
             [sys.executable, "-c", self.SCRIPT],
-
-
-            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
             capture_output=True,
             text=True,
             env=env,
@@ -1728,4 +1789,77 @@ class TestK31DraftWholeWeights(CustomTestCase):
         )
 
 
-        self.assertIn("OK", result.stdout, result.stderr[-3000:])
+class TestSingletonRowStaging(CustomTestCase):
+    """A singleton route's row staging (``_stage_singleton_row``) in Pallas
+    interpret mode: at 8 rows, ``KernelConfig.b8_singleton_select`` (one select
+    over the row tile, no branch) stages the bits of the per-row copies for
+    every active row and every BF16 bit pattern (signed zeros, subnormals,
+    infinities, NaN payloads); other row counts keep the per-row copies."""
+
+    def test_select_matches_the_row_copies(self):
+        import jax
+        import jax.numpy as jnp
+        import ml_dtypes
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        width = 3584  # expert input columns of the [rows, 4096] latent tile
+        # -0, +0, -/+ smallest subnormal, -/+ largest finite, -/+ infinity,
+        # NaNs (quiet, signalling, payloads, negative), +/-1.
+        special = np.array(
+            [0x8000, 0x0000, 0x8001, 0x0001, 0xFF7F, 0x7F7F, 0xFF80, 0x7F80]
+            + [0x7FC0, 0x7F81, 0x7FC1, 0xFFC0, 0xFFFF, 0x7FFF, 0x3F80, 0xBF80],
+            np.uint16,
+        )
+
+        def staging(rows, row_select):
+            def kernel(routes_ref, source_ref, out_ref):
+                for case in range(rows):
+                    dmk._stage_singleton_row(
+                        source_ref,
+                        jnp.any(routes_ref[case] != 0, axis=1),
+                        out_ref.at[case],
+                        expert_input_size=width,
+                        block_select=False,
+                        row_select=row_select,
+                    )
+
+            return pl.pallas_call(
+                kernel,
+                out_shape=jax.ShapeDtypeStruct((rows, 1, width), jnp.bfloat16),
+                interpret=pltpu.InterpretParams(),
+            )
+
+        def inputs(rows):
+            bits = rng.integers(0, 1 << 16, (rows, 4096), dtype=np.uint16)
+            # Each row holds every special pattern; in each of those columns
+            # the other rows hold other ones.
+            for column in range(0, width, 448):
+                for row in range(rows):
+                    bits[row, column : column + 16] = np.roll(special, row)
+            # Case r: row r is the only row with a route to the expert.
+            routes = np.zeros((rows, rows, 16), np.int32)
+            for row in range(rows):
+                routes[row, row, rng.integers(0, 16)] = 1 + rng.integers(0, 128)
+            return bits, routes
+
+        def branches(call, *args):
+            return str(jax.make_jaxpr(call)(*args)).count("cond[")
+
+        rng = np.random.default_rng(0)
+        bits, routes = inputs(8)
+        source = bits.view(ml_dtypes.bfloat16)
+        copy, select = staging(8, False), staging(8, True)
+        self.assertEqual(branches(copy, routes, source), 8 * 8)
+        self.assertEqual(branches(select, routes, source), 0)
+        for call in (copy, select):
+            staged = np.asarray(call(routes, source)).view(np.uint16)
+            np.testing.assert_array_equal(staged[:, 0], bits[:, :width])
+        # Other row counts keep the per-row copies.
+        bits, routes = inputs(12)
+        source = bits.view(ml_dtypes.bfloat16)
+        self.assertEqual(branches(staging(12, True), routes, source), 12 * 12)
