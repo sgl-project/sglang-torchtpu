@@ -1,6 +1,6 @@
 # GLM-5.2 native MTP baseline 执行记录
 
-当前状态：续跑排队等待完整8-chip资源。完整target/draft加载、全部启动图及原生MTP生成warmup已通过；显式routed chat和两组正式性能场景尚未验收，不能宣称完整E2E基线完成。
+当前状态：已按用户“一次启动完成全流程、失败保留现场”的原则重新预检并获配，完整任务`exp-6mtkc6t2qi`正在运行。完整target/draft加载、全部启动图及原生MTP生成warmup已通过；显式routed chat和两组正式性能场景尚未验收，不能宣称完整E2E基线完成。
 
 ## 固定目标
 
@@ -77,3 +77,12 @@
 - CPU helper 未获资源，已终止；两个 custom analysis preflight 未产出可读启动日志，未作为任何验证依据。
 - `exp-jjzf5biomm` 内原 c286 的慢加载已主动停止并归档到 `glm52-e2e/rank-*/pre-fix-whole-shard-load/`；allocation 保留。
 - 下一步：等待`exp-7eqnrujaw6`获配；runner将固定源码自动完成16-DP routed chat与至少3轮目标测量，记录实际KV容量、cache hits、active batch、接受统计和重编译。当前无可报告的正式TTFT/TPOT/吞吐结果。
+
+## 2026-11-16 原生runner完整预检与资源保留
+
+- `exp-7eqnrujaw6`于11:19获配，11:22在模型加载前失败：原生Git入口误依赖手工会话的`/tmp/benchmark-overlay.tar.gz`。这是runner打包错误，已去除，改为实际源码树SHA256与双host一致性校验。
+- 用户要求减少启动次数：新增6900秒有界allocation supervisor；环境/模型失败后保留机器，只有明确修复后的显式指令才重跑应用。client失败保留已编译服务，可原地重跑完整client；退出码0本身不足以证明成功。
+- 本地完整HTTP/API对照发现并修复`/flush_cache`纯文本解析；stream记录/输入哈希/汇总写入移到线程，避免阻塞event loop；连接池1秒过期低于server的5秒；同步ingress任一请求失败立即报错；active batch采样间隔20ms。
+- 干净Git checkout `811865ca48`的两组CPU预检均通过：双rank完整控制流，实际metadata/host读，注入client失败后保留服务、显式重跑，16 routed smoke、两组warmup和六个measurement round共368次模拟HTTP请求；以及false-success防护、setup失败保留、恢复、有界到期。CPU fixture不计入任何TPU/模型/性能结论。详见`glm52-runner-preflight-20261116.json`。
+- 固定代码`811865ca48`，当前任务`exp-6mtkc6t2qi` / `job-agyoxxt6mj` / `art-tfqylgfhvw`，12:02:21 UTC Running，保留前轮25GB compile cache。模型/reader/依赖实现相对1879无变化。
+- 已启用本线程5分钟heartbeat `glm52-8-chip`，仅实质进展/异常/完成时通知。最新ID与监控状态以`glm52-e2e-baseline-status.json`为准。

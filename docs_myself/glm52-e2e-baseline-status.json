@@ -1,0 +1,15 @@
+{
+  "latest_exp_id": "exp-6mtkc6t2qi",
+  "job_id": "job-agyoxxt6mj",
+  "artifact_id": "art-tfqylgfhvw",
+  "artifact_uri": "gs://tpu-for-training-falcon-logs/experiments/exp-6mtkc6t2qi/artifacts/art-tfqylgfhvw/",
+  "source_commit": "811865ca48ca23aa14dc74c9dbebaf5b380279dc",
+  "phase": "RUNNING",
+  "preflight": "docs_myself/glm52-runner-preflight-20261116.json",
+  "previous_exp_id": "exp-7eqnrujaw6",
+  "previous_failure": "native runner required an absent manually uploaded tar; fixed by actual source-tree identity",
+  "allocation_contract": "6900 seconds; retain setup/model failures; client failures keep live server; explicit recovery only",
+  "running_started_at": "2026-11-16T12:02:21.833398Z",
+  "running_deadline_at": "2026-11-16T14:02:21.833398Z",
+  "heartbeat_id": "glm52-8-chip"
+}
