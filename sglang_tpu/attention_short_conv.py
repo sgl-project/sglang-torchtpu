@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Causal ShortConv and its per-step state metadata for TPU.
-
-Inputs and outputs are token-major [tokens, channels]. History is stored oldest
-first in [slots, width - 1, 1, channels], and weight[:, -1] multiplies the current
-token. Arithmetic and history use FP32; outputs retain the input dtype before
-the model applies its output gate. The convolution runs through the Pallas bridge.
-"""
+"""TPU ShortConv metadata and dispatch."""
 
 from __future__ import annotations
 
@@ -57,14 +51,12 @@ class TpuShortConvAttnBackend(MambaAttnBackendBase):
             )
         self._metadata: Optional[ShortConvTracedMetadata] = None
         self._decode_query_start_loc: dict[int, torch.Tensor] = {}
-        # Register the Pallas bridge before torch.compile traces the model.
+        # Register before torch.compile traces the model.
         from sglang_tpu.kernels.mamba.short_conv import build_short_conv_op
 
         build_short_conv_op()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # Do not call the GPU base metadata builder: its tracked-row selection
-        # uses variable-size indexing and device-to-host mask reads.
         mode = forward_batch.forward_mode
         if mode.is_target_verify() or mode.is_draft_extend_v2():
             raise NotImplementedError(
@@ -87,12 +79,8 @@ class TpuShortConvAttnBackend(MambaAttnBackendBase):
                 self._decode_query_start_loc[batch_size] = query_start_loc
             self._metadata = ShortConvTracedMetadata(slots, query_start_loc)
         else:
-            # Padded extend_start_loc rows are zero, not cumulative. Build
-            # monotonic boundaries from lengths so zero-length requests and
-            # trailing token padding do not change real request boundaries.
-            # Build token offsets in the Pallas index dtype:
-            # int64 cumsum aborts in libtpu with the server's non-associative
-            # scan emitter, before the kernel bridge can cast its inputs.
+            # Rebuild boundaries from lengths: extend_start_loc has zeroed padding.
+            # libtpu's non-associative scan rejects int64 cumsum, so use int32.
             query_start_loc = torch.cat(
                 (
                     torch.zeros(1, dtype=torch.int32, device=device),
@@ -128,8 +116,6 @@ class TpuShortConvAttnBackend(MambaAttnBackendBase):
     def conv_state_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> ShortConvMetadata:
-        # The pool handles layer mapping and transfer readiness; TPU's per-layer
-        # storage keeps the returned tensor identity for compiled in-place writes.
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         return ShortConvMetadata(layer_cache, *self._metadata)
 
@@ -147,7 +133,7 @@ def short_conv(
     metadata: ShortConvMetadata,
     forward_mode: ForwardMode,
 ) -> torch.Tensor:
-    """Platform kernel entry point used between LFM2's two gates."""
+    """Run the TPU ShortConv kernel between LFM2's two gates."""
     from sglang_tpu.kernels.mamba.short_conv import build_short_conv_op
 
     return build_short_conv_op()(

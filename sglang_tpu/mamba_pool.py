@@ -406,19 +406,15 @@ class TpuMambaPool(MambaPool):
         ]
 
     def get_state(self) -> list[torch.Tensor]:
-        """Return non-empty mutable state for direct_compile and state copies.
-
-        TorchTPU cannot lower zero-element inputs or DMA zero bytes. ShortConv's
-        empty recurrent buffers stay in mamba_cache and are retained by set_state.
-        """
+        """Return non-empty state tensors used by compilation and copies."""
         return [state for state in self._copy_states() if state.numel() > 0]
 
     def set_state(self, state: list[torch.Tensor]) -> None:
-        """Install the get_state layout while retaining empty buffers."""
-        expected = self.get_state()
-        if len(state) != len(expected):
+        """Install state tensors while preserving empty buffers."""
+        expected = len(self.get_state())
+        if len(state) != expected:
             raise ValueError(
-                f"state length changed: expected {len(expected)}, got {len(state)}"
+                f"state length changed: expected {expected}, got {len(state)}"
             )
 
         replacements = iter(state)
@@ -438,11 +434,7 @@ class TpuMambaPool(MambaPool):
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         if src_indices.numel() == 0:
             return
-        # Slot rows only: with no_buffer radix caching, copies run between a
-        # cached prefix slot and a request's slot before its extend.
         states = self.get_state()
-        if not states:
-            return
         if states[0].device.type == "cpu":
             # CPU reference for layout and allocator tests.
             for state in states:
@@ -480,9 +472,6 @@ class TpuMambaPool(MambaPool):
         )
 
         states = self.get_state()
-        if not states:
-            self._state_copy_warmed = True
-            return
         # Pool initialization must finish before its buffers are first donated.
         synchronize(states, wait=True)
         size = 8
