@@ -5,7 +5,8 @@ Each layer, both cores take every row's routes, plan, send their packets and
 push the given MXFP4 slabs (decode_megakernel._ExpertStealStep), start the
 initial expert copies and the expert schedule, receive the sibling's packet,
 run the real _run_routed_expert_stream (the stolen experts after the own
-ones, copied in from staging) and combine (the receiver returns the stolen
+ones, copied in from staging an iteration early when the slab poll says the
+slab has landed, which the harness answers by layer parity) and combine (the receiver returns the stolen
 experts' FP32 outputs; the giver adds them after its own in ascending id
 order). A semaphore handshake then orders the cores, as the routed reduction
 does.
@@ -202,7 +203,12 @@ def _child(mode, batch):
                             (packet_send, packet_receive, slab_send, table_copies,
                              slab_receives),
                             errors, ready=ready, returns=returns,
-                            return_semaphores=(return_send, return_receive)),
+                            return_semaphores=(return_send, return_receive),
+                            # Interpret mode has no semaphore reads: the slab
+                            # poll says "landed" in even layers (the next
+                            # pair's stolen experts start an iteration early)
+                            # and "in flight" in odd ones.
+                            landed=lambda slot: layer % 2 == 0),
                         group=group, local_expert_count=GROUP_EXPERTS,
                         live_rows=rows_live, accumulators=accumulators,
                         weights=moe_weights)

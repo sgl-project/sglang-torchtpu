@@ -44,6 +44,7 @@ are bit-identical to the steal layout alone.
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import jax
@@ -355,7 +356,8 @@ class ExpertSteal:
     Variant B (the decode megakernel) adds ``ready`` (SMEM int32 [slots]:
     staging slot j waited for this layer, :meth:`stage`), ``returns`` (VMEM
     [slots, ...] FP32, the sibling's returned outputs of this core's given
-    experts) and ``return_semaphores`` (send, receive).
+    experts), ``return_semaphores`` (send, receive) and optionally ``landed``
+    (:meth:`landed`).
     """
 
     def __init__(
@@ -371,6 +373,7 @@ class ExpertSteal:
         ready=None,
         returns=None,
         return_semaphores=(None, None),
+        landed=None,
     ):
         self.sibling = sibling
         self.sources = tuple(sources)
@@ -389,6 +392,7 @@ class ExpertSteal:
         self.ready = ready
         self.returns = returns
         self.return_send, self.return_receive = return_semaphores
+        self.landed_hint = landed
 
     def _packet_copy(self):
         return tpu.make_async_remote_copy(
@@ -464,6 +468,21 @@ class ExpertSteal:
     def wait_slab(self, slot):
         for copy in self._slab_copies(0, slot):
             copy.wait_recv()
+
+    def landed(self, slot):
+        """Whether staging slot ``slot``'s bytes have all arrived: its receive
+        semaphore against the slab size in DMA counter units (32 bytes, as the
+        decode MoE's shared-reduction poll counts them). Only a hint for when
+        to start reading the slot; :meth:`wait_slab` still consumes it.
+        ``landed`` (constructor) stands in for the poll where semaphores
+        cannot be read (interpret mode)."""
+        if self.landed_hint is not None:
+            return self.landed_hint(slot)
+        units = sum(
+            math.prod(family.shape[1:]) * family.dtype.itemsize
+            for family in self.staging
+        )
+        return pl.semaphore_read(self.slab_receives.at[slot]) >= units // 32
 
     def stage(self, slot):
         """Wait for staging slot ``slot``'s bytes once a layer (``ready``)."""

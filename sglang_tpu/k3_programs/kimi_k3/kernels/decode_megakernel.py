@@ -1121,12 +1121,12 @@ def _run_routed_expert_stream(
     ``stolen`` (the expert steal, with the schedule): local experts from
     ``stolen.first_expert`` on are the sibling's, in staging slot ``expert -
     first_expert``. Each is copied in by ``stolen.start(staging_slot,
-    expert_slot)`` (which first waits for its slab) when it enters the copy
-    window, like a prefetched own expert: at the start of the iteration
-    before the one that runs it (iteration 0 for the first two pairs, whose
-    own experts the initial copies cover), and each one's output goes to its
-    own FP32 accumulator ``stolen.accumulators[1 + slot]``
-    (``accumulators[0]`` is ``expert_output``).
+    expert_slot, required)`` in the copy window, like a prefetched own
+    expert: at the start of the iteration before the one that runs it if its
+    slab has landed by then, else at the start of its own iteration after
+    waiting for the slab. Each one's output goes to its own FP32 accumulator
+    ``stolen.accumulators[1 + slot]`` (``accumulators[0]`` is
+    ``expert_output``).
     """
     batch_size, selected_expert_count = selected_experts.shape
     if stolen is not None and expert_schedule is None:
@@ -2033,11 +2033,12 @@ def _run_routed_expert_stream(
                     _start_async_copies(fourth_copies)
 
                 if stolen is not None:
-                    # Stolen experts entering the copy window (the next pair;
-                    # at iteration 0 also this one): from staging, once each
-                    # slab has landed. Schedule position p uses slot p % 4.
+                    # Stolen experts in the copy window (this pair and the
+                    # next) not copied in yet: from staging, this pair's after
+                    # waiting for their slabs, the next pair's only if theirs
+                    # have landed. Schedule position p uses slot p % 4.
                     @pl.loop(
-                        jnp.where(iteration == 0, 0, 2 * iteration + 2),
+                        jnp.where(iteration == 0, 0, 2 * iteration),
                         2 * iteration + 4,
                     )
                     def start_stolen(position):
@@ -2045,7 +2046,11 @@ def _run_routed_expert_stream(
 
                         @pl.when(has_expert & (expert >= stolen.first_expert))
                         def _():
-                            stolen.start(expert - stolen.first_expert, position % 4)
+                            stolen.start(
+                                expert - stolen.first_expert,
+                                position % 4,
+                                position < 2 * iteration + 2,
+                            )
 
                 _phase_end(select_scope)
 
@@ -2747,8 +2752,8 @@ class _ExpertStealStep:
     expected one, the routes are rebuilt from it (``replace_routes``), so the
     slabs waited for and the experts run are always the ones the sibling sent.
     The stream runs the stolen experts after the own ones, each copied in from
-    its staging slot once the slot's slab has landed (``stream_hooks``) and
-    added to ``accumulators[1 + slot]``. ``combine`` returns those outputs,
+    its staging slot an iteration ahead if the slot's slab has landed by then
+    (``stream_hooks``), and added to ``accumulators[1 + slot]``. ``combine`` returns those outputs,
     waits for this core's returned outputs and adds them to ``routed_outputs``
     in ascending expert id order (slot 0 holds the highest), then waits for
     this core's sends.
@@ -2799,16 +2804,23 @@ class _ExpertStealStep:
             count, ids = expert_steal.packet_fields(received, self.slots)
             replace_routes(self.planner_state.routes(self.plan, ids, count))
 
-    def start_stolen_copy(self, index, slot):
-        """Copy stolen expert ``index`` (its staging slot) into expert slot
-        ``slot`` once its slab has landed, and zero its accumulator."""
-        self.protocol.stage(index)
-        stolen = self.accumulators.at[1 + index]
-        stolen[...] = jnp.zeros(stolen.shape, stolen.dtype)
-        for kind in range(4):
-            self.weights.make_staged_expert_copy(
-                self.protocol.staging, kind, index, slot
-            ).start()
+    def start_stolen_copy(self, index, slot, required):
+        """Once a layer, copy stolen expert ``index`` (its staging slot) into
+        expert slot ``slot`` and zero its accumulator: when ``required`` (it
+        runs in this iteration) after waiting for its slab, else only if the
+        slab has already landed (the next iteration requires it otherwise)."""
+        protocol = self.protocol
+
+        @pl.when((protocol.ready[index] == 0) & (required | protocol.landed(index)))
+        def _():
+            protocol.wait_slab(index)
+            protocol.ready[index] = 1
+            stolen = self.accumulators.at[1 + index]
+            stolen[...] = jnp.zeros(stolen.shape, stolen.dtype)
+            for kind in range(4):
+                self.weights.make_staged_expert_copy(
+                    protocol.staging, kind, index, slot
+                ).start()
 
     def stream_hooks(self):
         return SimpleNamespace(
