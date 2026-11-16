@@ -48,7 +48,7 @@ alone do not prove scheduler admission or concurrency.
 Use `benchmark/tpu/launch_server.py` through this harness on both hosts.
 Falcon manifests must pin the exact Git commit and provide the model, private
 TorchTPU wheel and prepared wheelhouse as Falcon mounts. The executable is
-`bash benchmark/tpu/glm52_baseline/falcon_runner.sh`. Use one bounded allocation,
+`bash benchmark/tpu/glm52_baseline/allocation_runner.sh`. Use one bounded allocation,
 retain failures, and set the parent experiment exit code from the actual
 application result. A holding command does not establish an E2E pass.
 

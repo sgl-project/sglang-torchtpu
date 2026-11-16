@@ -1,0 +1,22 @@
+{
+  "status": "PASS",
+  "scope": "CPU control flow and HTTP contract only; no TPU/model/performance result",
+  "source_commit": "811865ca48ca23aa14dc74c9dbebaf5b380279dc",
+  "clean_checkout": "/tmp/glm52-native-git-preflight-811865ca48",
+  "requests": 368,
+  "checks": [
+    "two-rank source-only startup",
+    "checkpoint metadata and host reads",
+    "injected client failure retains service",
+    "explicit retry without engine restart",
+    "16 routed smoke requests",
+    "C16 warmup plus 3 rounds",
+    "C64 shared-prefix 90K/1024 warmup plus 3 rounds",
+    "plain-text native cache control",
+    "HTTP keep-alive handling",
+    "application false-success prevention",
+    "retained setup failure and explicit recovery",
+    "bounded allocation expiry",
+    "manifest source/command/topology consistency"
+  ]
+}

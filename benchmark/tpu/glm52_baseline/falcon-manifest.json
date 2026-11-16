@@ -15,7 +15,7 @@
       "device_type": "v7x",
       "device_topo": "2x2x2",
       "envs": {
-        "SOURCE_COMMIT": "d8f342b878e566edce8ade0ebba3ae31e783c867",
+        "SOURCE_COMMIT": "811865ca48ca23aa14dc74c9dbebaf5b380279dc",
         "PYTHONUNBUFFERED": "1",
         "TPU_TOPOLOGY": "2x2x2",
         "GLM52_COMPILE_CACHE_ROOT": "/glm52-prior-compile-cache"
@@ -81,11 +81,11 @@
           "type": "git",
           "repo": "https://github.com/sgl-project/sglang-torchtpu.git",
           "ref": "codex/glm52-e2e-baseline-20261116",
-          "commit": "d8f342b878e566edce8ade0ebba3ae31e783c867",
+          "commit": "811865ca48ca23aa14dc74c9dbebaf5b380279dc",
           "path": "/workspace/sglang-torchtpu"
         }
       ]
     }
   },
-  "model_version": "d8f342b878e566edce8ade0ebba3ae31e783c867"
+  "model_version": "811865ca48ca23aa14dc74c9dbebaf5b380279dc"
 }
