@@ -240,6 +240,12 @@ class TestGlm52Fp8OptIn(CustomTestCase):
                         self.assertIs(type(config), Fp8Config)
                         self.assertEqual(config.weight_block_size, block_size)
                         self.assertTrue(config.is_checkpoint_fp8_serialized)
+                        # An upstream-ignored source key alone must not opt
+                        # into the new online policy or change legacy parsing.
+                        metadata["is_checkpoint_fp8_serialized"] = False
+                        config = TpuFp8Config.from_config(metadata)
+                        self.assertIs(type(config), Fp8Config)
+                        self.assertTrue(config.is_checkpoint_fp8_serialized)
 
     def test_explicit_layout_rejects_incompatible_checkpoint_metadata(self):
         cases = (

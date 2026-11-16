@@ -29,11 +29,8 @@ class TpuFp8Config(Fp8Config):
         layout = config.get("tpu_checkpoint_layout")
         policy = config.get("tpu_moe_weight_quantization")
         if layout is None and policy is None:
-            if config.get("is_checkpoint_fp8_serialized") is False:
-                raise ValueError(
-                    "Unquantized FP8 source metadata requires "
-                    "tpu_moe_weight_quantization=channelwise"
-                )
+            # Only a TPU-specific key opts in. Preserve upstream handling of
+            # all other metadata, including keys it does not currently parse.
             return Fp8Config.from_config(config)
 
         if layout is not None:
