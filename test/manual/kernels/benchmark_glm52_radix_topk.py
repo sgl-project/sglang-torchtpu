@@ -12,11 +12,11 @@ import importlib.metadata
 import importlib.util
 import json
 import os
-from pathlib import Path
 import runpy
 import statistics
 import sys
 import time
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 fixture = runpy.run_path(str(ROOT / "test/registered/tpu/unit/test_dsa_index_topk.py"))
@@ -45,13 +45,13 @@ def latency(fn, *args, repeats):
         start = time.perf_counter_ns()
         jax.block_until_ready(fn(*args))
         times.append((time.perf_counter_ns() - start) / 1e3)
-    return result, dict(
-        compile_and_first_s=compile_and_first_s,
-        median_us=statistics.median(times),
-        min_us=min(times),
-        max_us=max(times),
-        samples_us=times,
-    )
+    return result, {
+        "compile_and_first_s": compile_and_first_s,
+        "median_us": statistics.median(times),
+        "min_us": min(times),
+        "max_us": max(times),
+        "samples_us": times,
+    }
 
 
 def main():
@@ -105,7 +105,7 @@ def main():
 
                 cfg = get_score_width_config(width)
                 functions["jax_source_v2"] = jax.jit(
-                    lambda s, l: original.radix_topk_v2(
+                    lambda s, l, cfg=cfg: original.radix_topk_v2(
                         s,
                         k=2048,
                         valid_lengths=l,
@@ -137,18 +137,18 @@ def main():
         for kind, build, query_size, segments in (
             (
                 "verify",
-                dict(
-                    lens=[(6, context)] * 4,
-                    token_bucket=64,
-                    padded_rows=40,
-                    is_decode=True,
-                ),
+                {
+                    "lens": [(6, context)] * 4,
+                    "token_bucket": 64,
+                    "padded_rows": 40,
+                    "is_decode": True,
+                },
                 6,
                 "decode",
             ),
             (
                 "prefill",
-                dict(lens=[(2048, context)], token_bucket=2048, is_decode=False),
+                {"lens": [(2048, context)], "token_bucket": 2048, "is_decode": False},
                 1,
                 "mixed",
             ),
@@ -169,7 +169,9 @@ def main():
             )
             for selector in ("sparsecore", "radix_v2"):
                 fn = jax.jit(
-                    lambda *a: fixture["dsa_indexer_step"](
+                    lambda *a, query_size=query_size, segments=segments, selector=selector: fixture[
+                        "dsa_indexer_step"
+                    ](
                         *a,
                         weight_scale=fixture["_WEIGHT_SCALE"],
                         topk=2048,
