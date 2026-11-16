@@ -1,12 +1,14 @@
 """Unit tests for the TPU PD decode SWA HiCache patch (pd_decode_swa_hicache).
 
-Decode backs up and restores full-attention KV through host RAM, and the SWA
-window always comes from the prefill transfer. Each wrapper is called with the
-real upstream function (or a fake where upstream needs a full server), so the
-tests pin both the full-only behavior and the pass-through to upstream for
-every other cache, except the restore hold, which every raiden PD decode cache
-gets. Two tests drive a real unified tree: its host stack attach
-and its locks.
+Decode backs up and restores full-attention KV through host RAM, and a
+request's SWA window always comes from the prefill transfer. With the KV
+offload to decode DRAM on, RAM also keeps the last window of each path, for the
+prefill to recall together with the full KV (pd_host_prefix_recall). Each wrapper is called
+with the real upstream function (or a fake where upstream needs a full server),
+so the tests pin both this behavior and the pass-through to upstream for every
+other cache, except the restore hold, which every raiden PD decode cache gets.
+Some tests drive a real unified tree: its host stack attach, its locks and
+its SWA backup walk.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,7 +27,10 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.disaggregation import decode
-from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
+from sglang.srt.disaggregation.decode import (
+    DecodePreallocQueue,
+    DecodeRequest,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
@@ -39,6 +44,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
     InsertParams,
+    MatchPrefixParams,
+    MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -52,6 +59,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
@@ -61,6 +69,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pd_decode_swa_hicache as tpu
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool_host import (
     _TPU_UNIFIED_SWA_STRATEGY,
     register_unified_hicache_strategy,
@@ -169,6 +178,7 @@ def memory(**overrides):
         hicache_storage_backend=None,
         hicache_size=0,
         hicache_write_policy="write_through",
+        enable_unified_memory=False,
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -354,6 +364,24 @@ class TestCacheConstruction(CustomTestCase):
         auto_size.assert_called_once_with(ctx.params, draft_plan, enabled=True)
         register_draft.assert_called_once_with(tree_cache=cache, draft_plan=draft_plan)
         self.assertIsNone(tpu._building_draft_plan)
+
+    def test_draft_sidecar_is_refused_while_the_offload_is_on(self):
+        # The push and the recall move FULL and SWA pages only; load-back would
+        # feed untransferred draft bytes to the draft model.
+        ctx = make_ctx()
+        draft_plan = SimpleNamespace(mode=HiCacheDraftMode.SIDECAR)
+        with (
+            patch(TPU + ".get_disagg", return_value=disagg()),
+            patch(TPU + ".get_memory", return_value=memory()),
+            tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.override(True),
+            self.assertRaisesRegex(ValueError, "draft sidecars"),
+        ):
+            tpu._build_kv_cache(
+                lambda **kwargs: self.fail("the build must not start"),
+                **build_kwargs(
+                    spec_algorithm=spec(eagle3=True), hicache_draft_plan=draft_plan
+                ),
+            )
 
     def test_full_only_build_requires_the_full_only_stack(self):
         # E.g. a cache type the SWA host strategy does not build.
@@ -545,19 +573,33 @@ class TestFullOnlyStrategy(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="scheduler")
 
-    def test_only_a_full_only_build_attaches_one_full_pool(self):
+    def attach(self, *, offload, hicache_size=0):
         cache, params = real_swa_cache()
+        params.token_to_kv_pool_allocator.swa_attn_allocator = MagicMock()
         kvcache = MagicMock(spec=SWAKVPool)
         # SWA at layer 0, full attention at layer 1.
         kvcache.start_layer = 0
         kvcache.layers_mapping = {0: (0, True), 1: (0, False)}
-        kvcache.full_kv_pool = MagicMock()
+        # Device bytes: full 12 MB, SWA 4 MB (no blocked host envelope).
+        kvcache.full_kv_pool = MagicMock(host_capacity_bytes=None)
+        kvcache.full_kv_pool.get_kv_size_bytes.return_value = (6144000, 6144000)
+        kvcache.swa_kv_pool = MagicMock(size=4096, host_capacity_bytes=None)
+        kvcache.swa_kv_pool.get_kv_size_bytes.return_value = (2048000, 2048000)
         cache.token_to_kv_pool_allocator.get_kvcache.return_value = kvcache
         components = {ComponentType.FULL, ComponentType.SWA}
+        host_pools = {"full": MagicMock(), "swa": MagicMock()}
         with (
             installed_patches(),
-            patch(TPU + ".get_memory", return_value=memory()),
-            patch(ASSEMBLER + ".build_kv_host_pool", autospec=True) as host_pool,
+            tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.override(offload),
+            patch(
+                TPU + ".get_memory",
+                return_value=memory(hicache_size=hicache_size),
+            ),
+            patch(
+                ASSEMBLER + ".build_kv_host_pool",
+                autospec=True,
+                side_effect=lambda **kw: host_pools[kw["pool_label"]],
+            ) as host_pool,
             patch(TPU + ".HybridCacheController.create_for_backend") as controller,
         ):
             # Outside a full-only build, upstream picks its own SWA stack.
@@ -574,11 +616,16 @@ class TestFullOnlyStrategy(CustomTestCase):
                 )
         self.assertTrue(tpu.uses_full_only_host_cache(cache))
         self.assertIs(cache.cache_controller, controller.return_value)
-        self.assertEqual(set(cache.host_pool_group.entry_map), {PoolName.KV})
         self.assertIs(
             cache.components[ComponentType.FULL]._full_kv_pool_host,
-            host_pool.return_value,
+            host_pools["full"],
         )
+        return cache, host_pool, host_pools
+
+    def test_switch_off_attaches_one_full_pool(self):
+        cache, _, _ = self.attach(offload=False)
+        self.assertEqual(set(cache.host_pool_group.entry_map), {PoolName.KV})
+        self.assertFalse(tpu.uses_window_host_cache(cache))
         # init_hicache derives has_swa_host_pool=False from this.
         self.assertIsNone(cache.components[ComponentType.SWA]._swa_kv_pool_host)
 
@@ -661,6 +708,28 @@ class TestFullOnlyStrategy(CustomTestCase):
                     {0: None, 1: 0, 2: None, 3: 1, 4: None, 5: None},
                 )
                 self.assertIsNone(cache.components[ComponentType.SWA]._swa_kv_pool_host)
+
+    def test_switch_on_adds_an_swa_pool_sized_like_upstream(self):
+        """Both pools take the budget a hybrid host stack gets upstream: the
+        ratio with no fixed size, else --hicache-size split by device bytes."""
+        cache, host_pool, host_pools = self.attach(offload=True)
+        self.assertEqual(
+            set(cache.host_pool_group.entry_map), {PoolName.KV, PoolName.SWA}
+        )
+        self.assertTrue(tpu.uses_window_host_cache(cache))
+        self.assertIs(
+            cache.components[ComponentType.SWA]._swa_kv_pool_host, host_pools["swa"]
+        )
+
+        def sizes(pool_mock):
+            return {
+                call.kwargs["pool_label"]: call.kwargs["host_size"]
+                for call in pool_mock.call_args_list
+            }
+
+        self.assertEqual(sizes(host_pool), {"full": None, "swa": None})
+        _, host_pool, _ = self.attach(offload=True, hicache_size=16)
+        self.assertEqual(sizes(host_pool), {"full": 12.0, "swa": 4.0})
 
 
 class TestAdmissionAndAllocation(CustomTestCase):
@@ -1094,6 +1163,168 @@ class TestRealLockAccounting(CustomTestCase):
                     queue._clean_hicache_prefetch_resources(decode_req)
                     release_kv_cache(req, cache, is_insert=False)
                 self.assert_unlocked(cache)
+
+
+def mark_window(cache):
+    # As the full + SWA window host stack builder does.
+    mark_full_only(cache)
+    tpu._window_host_caches.add(cache)
+
+
+class TestSwaWindowRestoreGate(CustomTestCase):
+    """Only the offer restore loads SWA KV back, a request's own restore never."""
+
+    @staticmethod
+    def component(*, window):
+        cache = MagicMock()
+        if window:
+            mark_window(cache)
+        else:
+            mark_full_only(cache)
+        component = object.__new__(SWAComponent)
+        component.cache = cache
+        return component
+
+    def test_swa_load_back_runs_only_inside_a_window_restore(self):
+        # A request's own restore anchors at its SWA window start, usually a
+        # tombstone, and upstream's SWA LOAD_BACK asserts on it.
+        load_back = CacheTransferPhase.LOAD_BACK
+        upstream = MagicMock(return_value=["swa"])
+        component = self.component(window=True)
+        build = tpu._build_swa_hicache_transfers
+        self.assertIsNone(build(upstream, component, "node", load_back))
+        upstream.assert_not_called()
+        backup = CacheTransferPhase.BACKUP_HOST
+        self.assertEqual(build(upstream, component, "node", backup), ["swa"])
+        with tpu.swa_window_restore():
+            self.assertEqual(build(upstream, component, "node", load_back), ["swa"])
+        self.assertFalse(tpu._swa_window_restore)
+        # With the offload switch off upstream decides, as it has no SWA host pool.
+        upstream.reset_mock()
+        build(upstream, self.component(window=False), "node", load_back)
+        upstream.assert_called_once()
+
+    def test_swa_host_hit_is_reported_only_inside_a_window_restore(self):
+        result = MatchResult(
+            device_indices=torch.arange(64),
+            last_device_node=1,
+            last_host_node=2,
+            best_match_node=2,
+            swa_host_hit_length=128,
+        )
+        upstream = MagicMock(return_value=result)
+        component = self.component(window=True)
+        finalize = tpu._finalize_swa_match_result
+        self.assertEqual(
+            finalize(upstream, component, result=result).swa_host_hit_length, 0
+        )
+        with tpu.swa_window_restore():
+            self.assertEqual(
+                finalize(upstream, component, result=result).swa_host_hit_length, 128
+            )
+        self.assertEqual(
+            finalize(
+                upstream, self.component(window=False), result=result
+            ).swa_host_hit_length,
+            128,
+        )
+
+
+class TestPathEndSwaBackup(CustomTestCase):
+    """Host RAM keeps the last SWA window of each path and nothing above it."""
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
+        # Window 128 tokens, page 64.
+        self.cache, _ = real_swa_cache()
+        self.cache.tree_core.has_swa_host_pool = True
+        mark_window(self.cache)
+        self.swa = self.cache.components[ComponentType.SWA]
+
+    def insert(self, num_tokens, **kwargs):
+        self.cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", range(num_tokens))),
+                value=torch.arange(num_tokens),
+                **kwargs,
+            )
+        )
+        # The mocked allocator leaves live SWA values empty: one slot per token.
+        for node in self.path():
+            data = node.component_data[ComponentType.SWA]
+            if data.value is not None:
+                data.value = torch.arange(len(node.key))
+
+    def path(self):
+        """The nodes from the root down the first child at each level."""
+        nodes = []
+        node = self.cache.tree_core.root_node
+        while node.children:
+            node = next(iter(node.children.values()))
+            nodes.append(node)
+        return nodes
+
+    def collect(self, node):
+        return tpu._collect_unbacked_swa_nodes(
+            SWAComponent._collect_unbacked_swa_nodes, self.swa, node
+        )
+
+    def lengths(self):
+        return [len(node.key) for node in self.path()]
+
+    def test_leaf_backs_up_its_window(self):
+        # Insert splits the last window off as its own leaf.
+        self.insert(320)
+        self.assertEqual(self.lengths(), [192, 128])
+        _, leaf = self.path()
+        self.assertEqual(self.collect(leaf), [leaf])
+
+    def test_stale_internal_windows_are_not_backed_up(self):
+        self.insert(128)
+        self.insert(320)
+        self.assertEqual(self.lengths(), [128, 64, 128])
+        far, near, _ = self.path()
+        # Upstream copies a window ending at each, though the path goes on
+        # for a whole window past them (exactly one for ``near``).
+        upstream = SWAComponent._collect_unbacked_swa_nodes
+        self.assertEqual(upstream(self.swa, near), [near, far])
+        self.assertEqual(upstream(self.swa, far), [far])
+        self.assertEqual(self.collect(near), [])
+        self.assertEqual(self.collect(far), [])
+
+    def test_prefill_cache_keeps_the_window_of_every_evicted_node(self):
+        # Not a decode window cache: upstream's rule applies, so a request that
+        # forks from a shared prefix finds the window that ends at the fork.
+        tpu._window_host_caches.discard(self.cache)
+        self.insert(128)
+        self.insert(320)
+        far, near, _ = self.path()
+        self.assertEqual(self.collect(near), [near, far])
+        self.assertEqual(self.collect(far), [far])
+
+    def test_window_above_a_tombstone_is_not_a_path_end(self):
+        # The path end lost its window, so the part above it is no window either.
+        self.insert(128)
+        self.insert(192, component_evicted_seqlens={ComponentType.SWA: 192})
+        parent, child = self.path()
+        self.assertIsNone(child.component_data[ComponentType.SWA].value)
+        self.assertEqual(self.collect(parent), [])
+
+    def test_split_leaf_keeps_the_whole_last_window(self):
+        self.insert(256)
+        # A shorter match splits the window leaf: the last window now spans
+        # the new leaf and its new parent.
+        self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", range(192)))))
+        self.assertEqual(self.lengths(), [128, 64, 64])
+        stale, split, leaf = self.path()
+        self.assertEqual(self.collect(split), [split])
+        self.assertEqual(self.collect(stale), [])
+        self.assertEqual(self.collect(leaf), [leaf, split])
+        # Once the split part is in RAM only the leaf is left.
+        split.component_data[ComponentType.SWA].host_value = torch.arange(64)
+        self.assertEqual(self.collect(leaf), [leaf])
 
 
 class TestInstall(CustomTestCase):

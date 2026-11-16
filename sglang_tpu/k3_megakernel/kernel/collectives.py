@@ -38,8 +38,8 @@ def entry_barrier(me, topo: Topology) -> None:
         return
     barrier = pltpu.get_barrier_semaphore()
     for off in topo.all_offsets:
-        pltpu.semaphore_signal(barrier, 1, device_id=(me ^ off,), device_id_type=_MESH)
-    pltpu.semaphore_wait(barrier, topo.world - 1)
+        pl.semaphore_signal(barrier, 1, device_id=(me ^ off,), device_id_type=_MESH)
+    pl.semaphore_wait(barrier, topo.world - 1)
 
 
 def _coords(me, topo: Topology, stride: int = 1):

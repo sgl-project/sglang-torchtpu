@@ -78,7 +78,7 @@ COLLECTIVE_ID = 0
 # The jax whose private ref-level bitcast the four-bit weight stream binds
 # to. Recorded so the failure names the version this was built against
 # rather than only the version that broke it.
-_REF_BITCAST_JAX_VERSION = "0.10.2"
+_REF_BITCAST_JAX_VERSION = "0.11.2"
 # The scalar-prefetch operands, in the order the kernel body unpacks them.
 # The grid spec is told the total, so a table cannot be added on one side
 # without the other.

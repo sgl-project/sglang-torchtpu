@@ -3,9 +3,10 @@
 The prefill caches every session as usual and records, at each request's
 bootstrap commit, which decode serves the session. When its host pool runs low
 it takes the tracked host-backed session with the oldest path end, host-locks
-it and offers its host pages (VICTIM_PUSH). The decode pulls them into its
-host pages, inserts the session and answers (VICTIM_ACK). On a stored session
-the prefill makes its own copy the next eviction victim.
+it and offers its host pages (VICTIM_PUSH), with the window pages that end
+where they end on a hybrid sliding-window model. The decode pulls them into
+its host pages, inserts the session and answers (VICTIM_ACK). On a stored
+session the prefill makes its own copy the next eviction victim.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     mark_next_victim,
     path_tokens,
     unlock_host_path,
+    window_host_pages,
 )
 from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
     DramOffloadWorkerContext,
@@ -43,6 +45,9 @@ logger = logging.getLogger(__name__)
 MAX_INFLIGHT = 4
 # Arbitrary: push once the host pool could take only about two more sessions.
 _PUSH_FULL_FREE_TOKENS = 65536
+# Arbitrary: on a hybrid model, also once the SWA host pool could take only
+# this many more windows.
+_PUSH_SWA_FREE_WINDOWS = 4
 # Arbitrary, well past one RAM-to-RAM push of a session and the decode's
 # agreement rounds.
 _ACK_TIMEOUT_S = 60.0
@@ -73,15 +78,17 @@ class _PushInFlight(msgspec.Struct):
     leaf: Any
     locks: List[Any]
     sent_at: float
-    # The native registration of the leaf's pages; None if it was refused.
-    read_id: Optional[str] = None
+    # The accepted native registrations of the leaf's pages (full, then the
+    # window of a hybrid model); ``registered`` once all were accepted.
+    read_ids: List[str] = msgspec.field(default_factory=list)
+    registered: bool = False
     # The decode's answer; False also once the offer could not be sent, timed
     # out or failed. The registration still drains before the push settles.
     stored: Optional[bool] = None
 
 
-def victim_transfer_id(prefill: str, seq: int) -> str:
-    return f"victim:{prefill}:{seq}"
+def victim_transfer_id(prefill: str, seq: int, *, swa: bool = False) -> str:
+    return f"victim:{prefill}:{seq}" + (":swa" if swa else "")
 
 
 def _transfer_uuid(prefill: str, seq: int) -> int:
@@ -96,6 +103,8 @@ class PrefillDramVictimPusher:
         self._channel = ctx.channel
         self._cache = ctx.cache
         self._host_pool = ctx.host_pool
+        self._swa_host_pool = ctx.swa_host_pool
+        self._window_tokens = ctx.window_tokens
         self._page_size = ctx.page_size
         self._lockstep = ctx.lockstep
         # Incarnation shared by this prefill's ranks: independent prefills and
@@ -156,6 +165,14 @@ class PrefillDramVictimPusher:
         self._start_push_if_agreed(serving=serving)
         log_offload_stats(self.stats, "push", self._last_log)
 
+    def _under_host_pressure(self) -> bool:
+        host_free = self._cache.cache_controller.mem_pool_host.available_size()
+        return host_free < _PUSH_FULL_FREE_TOKENS or (
+            self._swa_host_pool is not None
+            and self._swa_host_pool.available_size()
+            < _PUSH_SWA_FREE_WINDOWS * self._window_tokens
+        )
+
     def has_pushes_in_flight(self) -> bool:
         return bool(self._pushes)
 
@@ -180,11 +197,10 @@ class PrefillDramVictimPusher:
                 push.stored = self._channel.victim_reply(push.seq)
                 if push.stored is None and now - push.sent_at > _ACK_TIMEOUT_S:
                     push.stored = False
-            sent = (
-                False
-                if push.read_id is None
-                else self._channel.poll_host_read(push.read_id)
-            )
+            # Accepted registrations drain even when another one was refused.
+            sent = self._channel.poll_host_reads(push.read_ids)
+            if sent is not None and not push.registered:
+                sent = False
             if sent is False:
                 push.stored = False
             settled = push.stored is not None and sent is not None
@@ -198,8 +214,7 @@ class PrefillDramVictimPusher:
                 self._finish_push(push, stored=bool(ok))
 
     def _finish_push(self, push: _PushInFlight, *, stored: bool) -> None:
-        if push.read_id is not None:
-            self._channel.forget_host_read(push.read_id)
+        self._channel.forget_host_reads(push.read_ids)
         del self._pushes[push.seq]
         unlock_host_path(self._cache, push.locks)
         self._channel.forget_victim(push.seq)
@@ -213,23 +228,24 @@ class PrefillDramVictimPusher:
     def _start_push_if_agreed(self, *, serving: bool) -> None:
         """Start a push in a step where every rank serves requests, is under
         host pressure, picked the same leaf and holds it whole in host RAM."""
-        host_free = self._cache.cache_controller.mem_pool_host.available_size()
         picked = (
             self._pick_coldest_host_leaf()
             if serving
             and len(self._pushes) < MAX_INFLIGHT
-            and host_free < _PUSH_FULL_FREE_TOKENS
+            and self._under_host_pressure()
             else None
         )
-        # [picked, the leaf's fingerprint (2 values), its tokens, its host pages]
-        row = [0, 0, 0, 0, 0]
+        # [picked, the leaf's fingerprint (2 values), its tokens, its host
+        # pages, its window pages]
+        row = [0, 0, 0, 0, 0, 0]
         if picked is not None:
-            decode, leaf, path, pages = picked
+            decode, leaf, path, pages, swa_pages = picked
             row = [
                 1,
                 *push_manifest(path, leaf.key.extra_key, leaf.key.cache_salt),
                 len(path),
                 len(pages),
+                len(swa_pages),
             ]
         low, high = self._lockstep.min_max(row)
         if not low[0] or low != high:
@@ -239,7 +255,6 @@ class PrefillDramVictimPusher:
         seq = self._next_seq
         self._next_seq += 1
         uuid = _transfer_uuid(self._namespace, seq)
-        read_id = victim_transfer_id(self._namespace, seq)
         push = _PushInFlight(
             seq=seq,
             leaf=leaf,
@@ -248,15 +263,15 @@ class PrefillDramVictimPusher:
         )
         self._pushes[seq] = push
         self.stats["started"] += 1
-        if self._channel.register_host_read(read_id, uuid, pages):
-            push.read_id = read_id
-        if not self._lockstep.all(push.read_id is not None) or not (
+        push.registered = self._register_leaf_pages(push, uuid, pages, swa_pages)
+        if not self._lockstep.all(push.registered) or not (
             self._channel.send_victim_push(
                 decode=decode,
                 prefill=self._namespace,
                 seq=seq,
                 tokens=path,
                 blocks=pages,
+                swa_blocks=swa_pages,
                 uuid=uuid,
                 extra_key=leaf.key.extra_key,
                 cache_salt=leaf.key.cache_salt,
@@ -264,13 +279,29 @@ class PrefillDramVictimPusher:
         ):
             push.stored = False
 
+    def _register_leaf_pages(
+        self, push: _PushInFlight, uuid: int, pages: List[int], swa_pages: List[int]
+    ) -> bool:
+        """Register the leaf's host pages as the sources of the decode's reads:
+        the full pages, and on a hybrid model the window pages under the same
+        UUID on their own pool. An accepted registration stays in ``read_ids``
+        when a later one is refused: it drains before the push settles."""
+        for swa, part in ((False, pages), (True, swa_pages)):
+            if not part:
+                continue
+            read_id = victim_transfer_id(self._namespace, push.seq, swa=swa)
+            if not self._channel.register_host_read(read_id, uuid, part, swa=swa):
+                return False
+            push.read_ids.append(read_id)
+        return True
+
     def _pick_coldest_host_leaf(
         self,
-    ) -> Optional[Tuple[Tuple[str, int], Any, List[int], List[int]]]:
-        """(decode peer, leaf, its path tokens, its host pages) of the oldest
-        leaf owned by a known decode whose whole path is in host RAM now. A
-        leaf whose backup is still pending is a candidate again once it
-        completed."""
+    ) -> Optional[Tuple[Tuple[str, int], Any, List[int], List[int], List[int]]]:
+        """(decode peer, leaf, its path tokens, its host pages, its window
+        pages) of the oldest leaf owned by a known decode whose whole path,
+        and window, is in host RAM now. A leaf whose backup is still pending
+        is a candidate again once it completed."""
         busy = {push.leaf for push in self._pushes.values()}
         candidates = []
         for node, (peer, fingerprint) in list(self._routes.items()):
@@ -285,10 +316,19 @@ class PrefillDramVictimPusher:
             pages = host_pages(self._cache, self._host_pool, node)
             if pages is None:
                 continue
+            swa_pages = window_host_pages(
+                self._cache,
+                self._swa_host_pool,
+                node,
+                tokens=len(path),
+                window_tokens=self._window_tokens,
+            )
+            if swa_pages is None:
+                continue
             candidates.append(
-                (node.last_access_time, fingerprint, peer, node, path, pages)
+                (node.last_access_time, fingerprint, peer, node, path, pages, swa_pages)
             )
         if not candidates:
             return None
-        _, _, peer, node, path, pages = min(candidates, key=lambda x: x[:2])
-        return peer, node, path, pages
+        _, _, peer, node, path, pages, swa_pages = min(candidates, key=lambda x: x[:2])
+        return peer, node, path, pages, swa_pages

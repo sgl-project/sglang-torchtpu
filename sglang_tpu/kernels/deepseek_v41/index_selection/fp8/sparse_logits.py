@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/fp8/sparse_logits.py
-# Revision: 42c35ec6166a19b3f0db90f31807cc3df44602ec (epic/dsv41)
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FP8 pair-union scoring with contiguous per-query output windows."""
@@ -66,8 +65,8 @@ def _kernel(
 ):
     q, weights, pool = inputs
     queries, keys, scores, counts, read_sem, write_sem, q_sem = scratch
-    # JAX 0.10.2 has no pltpu.annotate(no_store=...). Keep the same refs:
-    # weights are read-only and keys are explicitly managed by the DMA ring.
+    keys = pltpu.annotate(keys, no_store=True)
+    weights = pltpu.annotate(weights, no_store=True)
     tokens, heads, dim = weights.shape[0], weights.shape[1], q.shape[-1]
     q_tile, mxu, sublanes = config.query_tile, info.mxu_column_size, info.num_sublanes
     pairs = PACKED_FP8_PREPARED_PAIRS

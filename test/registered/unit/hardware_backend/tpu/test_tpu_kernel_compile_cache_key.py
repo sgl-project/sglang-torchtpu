@@ -68,7 +68,7 @@ class TestKernelInputsDigest(CustomTestCase):
         enter_scope(self, tpu_envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.override(False))
         enter_scope(self, envs.SGLANG_TPU_INT4_MOE_MODE.override(None))
         enter_scope(self, tpu_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False))
-        self.versions = {"jax": "0.10.2", "jaxlib": "0.10.2", "libtpu": "0.0.47"}
+        self.versions = {"jax": "0.11.2", "jaxlib": "0.11.2", "libtpu": "0.0.50"}
         enter_scope(
             self,
             patch.object(
