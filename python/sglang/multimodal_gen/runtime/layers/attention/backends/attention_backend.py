@@ -226,6 +226,19 @@ class AttentionImpl(ABC, Generic[T]):
     def supports_ring_resume(cls) -> bool:
         return cls.forward_ring_resume is not AttentionImpl.forward_ring_resume
 
+    def forward_ring(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Run full ring attention over ``[B, S_shard, H, D]`` shards, or return None to fall back."""
+        return None
+
+    @classmethod
+    def supports_ring(cls) -> bool:
+        return cls.forward_ring is not AttentionImpl.forward_ring
+
 
 def wrap_attention_impl_forward(attn_impl: AttentionImpl) -> AttentionImpl:
     return wrap_method_with_debug_kernel_once(

@@ -599,6 +599,14 @@ class TpuEnvs:
     # EP in-kernel xprof regions: 1 per phase, 2 per expert chunk / arm too.
     SGLANG_TPU_EP_TRACE = EnvInt(0)
 
+    # Diffusion ring attention
+    # Run ring attention on the Pallas paths (ICI-DMA kernel, short-shard 2D ring);
+    # off keeps the K/V all-gather ring (multimodal_gen/tpu_splash_attn.py).
+    SGLANG_TPU_ENABLE_DIFFUSION_RING_KERNEL = EnvBool(True)
+    # Use the fixed-m softmax on heads whose logit bound allows it,
+    # the online one elsewhere (multimodal_gen/diffusion_ring_attention.py).
+    SGLANG_TPU_ENABLE_DIFFUSION_RING_FIXED_M = EnvBool(True)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(
