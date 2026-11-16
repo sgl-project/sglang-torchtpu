@@ -128,12 +128,16 @@ tpu_dsv41_create_draft_worker
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
   Remove when: the block worker selects drafters by draft model class.
 
-tpu_dsv41_commit_engram_history
+tpu_dsv41_commit_engram_history, tpu_dsv41_flush_engram_before_prebuilt
   Why: the target's Engram history must advance past the tokens each verify
        commits; core does it in DSparkWorkerV2 (update_after_verify), which
        TpuBlockSpecWorker replaces, and a verify forward commits nothing.
-  How: AROUND TpuBlockSpecWorker.commit appends the anchor and correct drafts
-       to each live request's history (functional update + copy_).
+  How: AROUND TpuBlockSpecWorker.commit queues the anchor and correct drafts
+       on the hasher; the host Engram staging of the next target forward
+       (DeepseekV4DecoderTpuCompilePolicy._stage_engram_rows) applies them, so
+       the verify outputs are read back only after the next draft is
+       dispatched. tpu_dsv41_flush_engram_before_prebuilt applies them before a
+       PD prebuilt batch writes history rows itself.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
   Remove when: TpuSpecWorker commits the target's Engram history itself.
 
@@ -406,9 +410,9 @@ def tpu_dsv41_commit_engram_history(
     hasher = getattr(inner, "engram_hasher", None)
     if hasher is None or accept.accept_lens.is_cuda:
         return result
-    from sglang_tpu.models.deepseek_v41.dspark import commit_engram_history
+    from sglang_tpu.models.deepseek_v41.dspark import defer_engram_commit
 
-    commit_engram_history(
+    defer_engram_commit(
         hasher,
         bonus_tokens=state.bonus_tokens,
         accept_tokens=accept.accept_tokens,
@@ -416,6 +420,17 @@ def tpu_dsv41_commit_engram_history(
         req_pool_indices=state.req_pool_indices,
     )
     return result
+
+
+def tpu_dsv41_flush_engram_before_prebuilt(original, manager, batch):
+    """AROUND NgramEmbeddingManager._prepare_engram_history: a PD prebuilt batch
+    writes history rows directly, so queued verify commits land first."""
+    hasher = manager.engram_hasher
+    if batch.forward_mode.is_prebuilt() and hasher.tpu_pending_commits:
+        from sglang_tpu.models.deepseek_v41.dspark import flush_engram_commits
+
+        flush_engram_commits(hasher)
+    return original(manager, batch)
 
 
 def tpu_dsv41_create_draft_worker(original, *, algorithm, target_runner):
@@ -526,6 +541,12 @@ def hook_specs():
         (
             "sglang_tpu.experimental.speculative.block_spec_worker.TpuBlockSpecWorker.commit",
             tpu_dsv41_commit_engram_history,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.model_runner_components.ngram_embedding_manager"
+            ".NgramEmbeddingManager._prepare_engram_history",
+            tpu_dsv41_flush_engram_before_prebuilt,
             HookType.AROUND,
         ),
         (

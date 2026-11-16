@@ -95,6 +95,91 @@ class TestCommitEngramHistory(CustomTestCase):
         self.assertEqual(hasher.history[0].tolist(), [7, 8])
 
 
+class TestDeferredEngramCommit(CustomTestCase):
+    """The verify commit must not read the verify outputs back on the commit
+    path (it blocked the host for the whole verify); the history must still be
+    core's by the time the next target forward or a PD prebuilt batch reads it."""
+
+    def _commit(self, hasher):
+        worker = SimpleNamespace(
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    model=SimpleNamespace(model=SimpleNamespace(engram_hasher=hasher))
+                )
+            )
+        )
+        state = SimpleNamespace(
+            bonus_tokens=torch.tensor([10, 20]), req_pool_indices=torch.tensor([2, 5])
+        )
+        accept = SimpleNamespace(
+            accept_tokens=torch.tensor([[11, 12, 99, -1], [77, -1, -1, -1]]),
+            accept_lens=torch.tensor([3, 1], dtype=torch.int32),
+        )
+        original = mock.MagicMock(return_value="committed")
+        out = hooks.tpu_dsv41_commit_engram_history(
+            original, worker, None, state, None, None, None, accept
+        )
+        self.assertEqual(out, "committed")
+
+    def _reference(self, n, num_slots, history):
+        reference = _hasher(num_slots, n)
+        reference.history[torch.tensor([2, 5])] = history
+        EngramHasher.commit_after_verify(
+            reference,
+            torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]]),
+            torch.tensor([2, 5]),
+            torch.tensor([3, 1], dtype=torch.int32),
+        )
+        return reference.history
+
+    def test_commit_waits_for_the_next_history_read(self):
+        n, num_slots = 4, 6
+        history = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+        hasher = _hasher(num_slots, n)
+        hasher.history[torch.tensor([2, 5])] = history
+        before = hasher.history.clone()
+        self._commit(hasher)
+        torch.testing.assert_close(hasher.history, before)
+        dspark.flush_engram_commits(hasher)
+        torch.testing.assert_close(
+            hasher.history, self._reference(n, num_slots, history)
+        )
+        self.assertEqual(hasher.tpu_pending_commits, ())
+
+    def test_queued_commits_apply_in_verify_order(self):
+        hasher = _hasher(4, 3)
+        for bonus in (5, 6):
+            dspark.defer_engram_commit(
+                hasher,
+                bonus_tokens=torch.tensor([bonus]),
+                accept_tokens=torch.tensor([[bonus + 1, -1]]),
+                accept_lens=torch.tensor([1], dtype=torch.int32),
+                req_pool_indices=torch.tensor([1]),
+            )
+        dspark.flush_engram_commits(hasher)
+        # Each commit appends its anchor: [0, 0] -> [0, 5] -> [5, 6].
+        self.assertEqual(hasher.history[1].tolist(), [5, 6])
+
+    def test_prebuilt_history_write_follows_queued_commits(self):
+        hasher = _hasher(4, 3)
+        dspark.defer_engram_commit(
+            hasher,
+            bonus_tokens=torch.tensor([5]),
+            accept_tokens=torch.tensor([[-1, -1]]),
+            accept_lens=torch.tensor([1], dtype=torch.int32),
+            req_pool_indices=torch.tensor([1]),
+        )
+        seen = {}
+
+        def original(manager, batch):
+            seen["history"] = manager.engram_hasher.history[1].tolist()
+
+        manager = SimpleNamespace(engram_hasher=hasher)
+        batch = SimpleNamespace(forward_mode=SimpleNamespace(is_prebuilt=lambda: True))
+        hooks.tpu_dsv41_flush_engram_before_prebuilt(original, manager, batch)
+        self.assertEqual(seen["history"], [0, 5])
+
+
 class _MarkovModel:
     def __init__(self, *, gamma, vocab, hidden, sample_from_anchor):
         g = torch.Generator().manual_seed(0)

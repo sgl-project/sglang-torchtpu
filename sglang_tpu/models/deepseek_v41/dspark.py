@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.layers.engram import EngramHasher
 from sglang_tpu.models.deepseek_v41.attention_backend import apply_rope
+
+# Verify commits not yet applied to the host history, oldest first.
+EngramHasher.tpu_pending_commits = ()
 
 
 def is_dsv41_dspark_draft(model) -> bool:
@@ -208,3 +212,34 @@ def commit_engram_history(
     values = window.gather(1, cols)
     rows = torch.where(accept_lens > 0, req, torch.full_like(req, hasher.pad_row))
     history.copy_(history.index_put((rows,), values))
+
+
+def defer_engram_commit(
+    hasher,
+    *,
+    bonus_tokens: torch.Tensor,
+    accept_tokens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+) -> None:
+    """Queue a verify's Engram commit for flush_engram_commits.
+
+    The history lives on the host, so committing in the verify step copies the
+    verify outputs back and blocks the host until the verify finishes; the
+    next reader of the history runs after the next draft is dispatched.
+    """
+    commit = (bonus_tokens, accept_tokens, accept_lens, req_pool_indices)
+    hasher.tpu_pending_commits = (*hasher.tpu_pending_commits, commit)
+
+
+def flush_engram_commits(hasher) -> None:
+    """Apply the queued verify commits in order; call before reading or writing history."""
+    pending, hasher.tpu_pending_commits = hasher.tpu_pending_commits, ()
+    for bonus_tokens, accept_tokens, accept_lens, req_pool_indices in pending:
+        commit_engram_history(
+            hasher,
+            bonus_tokens=bonus_tokens,
+            accept_tokens=accept_tokens,
+            accept_lens=accept_lens,
+            req_pool_indices=req_pool_indices,
+        )
