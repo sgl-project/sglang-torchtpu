@@ -4994,9 +4994,6 @@ class DeepseekV4Model(nn.Module):
 
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
-    # Every `.experts.<id>.` checkpoint key loads into FusedMoE expert <id>, so a
-    # TPU EP rank may read only its own routed experts.
-    supports_tpu_ep_local_expert_reads = True
 
     def __init__(
         self,

@@ -64,10 +64,26 @@ def _log_whole_shards(reason: str) -> None:
     )
 
 
+# Core model classes opted in from the plugin, so core carries no TPU-only flag.
+# Every `.experts.<id>.` checkpoint key of these loads into FusedMoE expert <id>.
+_PLUGIN_EP_LOCAL_EXPERT_READ_MODELS = frozenset(
+    {"sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM"}
+)
+
+
+def _supports_ep_local_expert_reads(model: torch.nn.Module) -> bool:
+    cls = type(model)
+    return (
+        getattr(model, "supports_tpu_ep_local_expert_reads", False)
+        or f"{cls.__module__}.{cls.__qualname__}" in _PLUGIN_EP_LOCAL_EXPERT_READ_MODELS
+    )
+
+
 def tpu_local_routed_expert_range(model: torch.nn.Module) -> tuple[int, int] | None:
     """Routed-expert ids [start, end) this EP rank stores, for EP-local reads.
 
-    For models that set ``supports_tpu_ep_local_expert_reads`` (every
+    For models that set ``supports_tpu_ep_local_expert_reads`` or are listed in
+    ``_PLUGIN_EP_LOCAL_EXPERT_READ_MODELS`` (every
     ``.experts.<id>.`` checkpoint key loads into FusedMoE expert ``<id>``), the
     range is ``local_routed_expert_range`` of their FusedMoE layers. None (read
     everything) off TPU, without EP, with EPLB metadata or elastic EP join, when
@@ -75,7 +91,7 @@ def tpu_local_routed_expert_range(model: torch.nn.Module) -> tuple[int, int] | N
     (fused shared experts, parameters that need every expert), or when
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS is true.
     """
-    if not _is_tpu or not getattr(model, "supports_tpu_ep_local_expert_reads", False):
+    if not _is_tpu or not _supports_ep_local_expert_reads(model):
         return None
     from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE

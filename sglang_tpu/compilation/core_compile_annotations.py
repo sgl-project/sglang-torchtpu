@@ -82,8 +82,8 @@ CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
         policy=_bailing_vl_decoder_policy,
     ),
     # DeepSeek-V4 and V4.1 share this class. The policy pads like the generic
-    # whole-model fallback, then stages V4.1's host Engram rows and DP token
-    # embeddings before attention planning; V4 batches pass through unchanged.
+    # whole-model fallback, then stages host Engram rows before attention
+    # planning when the model has Engram layers; V4 batches pass through unchanged.
     _CoreCompileBoundary(
         module="sglang.srt.models.deepseek_v4",
         class_name="DeepseekV4ForCausalLM",
