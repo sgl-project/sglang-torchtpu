@@ -112,6 +112,13 @@ class KernelConfig:
     # index keys in one kernel (paged._commit_dsa_rows_fused) instead of the
     # latent commit kernel and 48 XLA scatters.
     dsa_fused_commit: bool = False
+    # MLA DCP combine of unchunked one-group calls with three heads a rank
+    # (B1, B4, B8 and the 8-row verifies) in two stages: the chip's two
+    # cores (members 2k, 2k + 1) first merge their partials on-chip, each
+    # core for the owners of its parity, then send each owner one merged
+    # partial per chip -- half the cross-chip combine bytes. Merged partials
+    # round to BF16 once more.
+    dcp_pair_combine: bool = False
     # Decode layer loop: test KDA first in the layer-type branch, so the
     # instruction overlays place the post-join code for the 68 KDA layers.
     decode_kda_branch_first: bool = True

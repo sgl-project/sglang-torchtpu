@@ -1049,6 +1049,217 @@ class TestSelectedAttention(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+class TestPairCombine(CustomTestCase):
+    """``KernelConfig.dcp_pair_combine`` (the two-stage DCP combine) in Pallas
+    interpret mode on a 4-rank group whose chips are ranks 0/1 and 2/3, with
+    a DSA selection: ``attend`` and ``send_queries`` + ``attend(queries_sent=
+    True)`` agree bitwise, and every output is within one BF16 rounding of the
+    one-stage combine's: |pair - one-stage| <= 2^-8 sum_i softmax(lse)_i |o_i|
+    over the owner's received partials. A rank whose mate holds no selected
+    tokens passes its partial through unchanged (the skewed case is bitwise
+    the one-stage result)."""
+
+    SCRIPT = """
+        import dataclasses, os
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3 import dsa
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp, mla_dcp
+
+        G, T, H, FP8 = 4, 512, 3, jnp.float8_e4m3fn
+        mla_dcp.GROUPS = (G, 8, 16, 32)
+
+        def tokens(x):
+            return (jax.lax.broadcasted_iota(jnp.int32, x.shape, 0) * x.shape[1]
+                    + jax.lax.broadcasted_iota(jnp.int32, x.shape, 1))
+
+        def _pages(self, slot):  # interpret mode has no ref bitcasts (see TestSelectedAttention)
+            def load(lanes, tokens=None):
+                x = self.ws.pages[slot]
+                return x.reshape(x.shape[0] * x.shape[1], x.shape[2])[:, lanes]
+            return load
+
+        def _clean_step(self, slot, row, local_step, tokens_=None, end=None, pad=True):
+            x = self.ws.pages[slot]
+            cut = 0
+            for k in range(self.span):
+                first = ((local_step * self.span + k) * self.group + self.owner) * self.page_tokens
+                cut = cut + jnp.clip(self._limit(row) - first, 0, self.page_tokens)
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+            keep = (tokens(x) < cut) & ((lane < 576) if pad else True)
+            self.ws.pages[slot] = jnp.where(keep, x, jnp.zeros((), x.dtype))
+
+        def _cache_verify_row(self, slot, local_step, row):
+            position = self.position_ref[row]
+            page = position // self.page_tokens
+            local_page = page // self.group - local_step * self.span
+
+            @pl.when((page % self.group == self.owner) & (local_page >= 0) & (local_page < self.span))
+            def write():
+                latent = self.ws.new_rows[self.slots * row]
+                x = self.ws.pages[slot]
+                offset = local_page * self.page_tokens + position % self.page_tokens
+                self.ws.pages[slot] = jnp.where(tokens(x) == offset, latent.astype(x.dtype)[None, None, :], x)
+
+        def _zero_step_pad_lanes(self, slot):
+            x = self.ws.pages[slot]
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+            self.ws.pages[slot] = jnp.where(lane < 576, x, jnp.zeros((), x.dtype))
+
+        def _zero_slot(self, slot):
+            self.ws.pages[slot] = jnp.zeros(self.ws.pages.shape[1:], self.ws.pages.dtype)
+
+        mla_dcp.DcpAttention._pages = _pages
+        mla_dcp.DcpAttention._clean_step = _clean_step
+        mla_dcp.DcpAttention._zero_slot = _zero_slot
+        mla_dcp.DcpAttention._zero_step_pad_lanes = _zero_step_pad_lanes
+        mla_dcp.DcpAttention._cache_verify_row = _cache_verify_row
+        base_config = mla_dcp._config()
+
+        def run(firsts, S, topk, seed, pair, early, compact=0, window=0, favor=None):
+            config = dataclasses.replace(base_config, dsa_compact_tokens=compact, dsa_compact_window=window,
+                                         dcp_pair_combine=pair)
+            mla_dcp._config = lambda: config
+            mla_dcp._grouped_spec = lambda b, g, h, rows: rows in (4, 8) and b % 4 == 0
+            rng = np.random.default_rng(seed)
+            positions = np.array([p0 + r for p0 in firsts for r in range(S)], np.int32)
+            B = len(positions)
+            persistent = mla_dcp.persistent_scratch(B, G, cache_dtype=FP8, sequence_rows=S)
+            scoped = mla_dcp.scoped_scratch(B, group=G, cache_dtype=FP8, page_tokens=T, sequence_rows=S)
+            selection = mla_dcp.selection_scratch(B, page_tokens=T, sequence_rows=S)
+            span = selection[0].shape[2] * 128 // T
+            pages = -(-(max(-(-(int(p) + T) // T) // G for p in positions) + 1) // span) * span
+            key_rows = dsa_dcp.key_rows_for(pages, T, span)
+            lat = (rng.standard_normal((len(firsts), pages * G * T, 640)) * 0.5).astype(np.float32)
+            lat[..., 576:] = 0
+            lat = lat.astype(ml_dtypes.float8_e4m3fn).astype(np.float32)
+            pool = rng.standard_normal((G, 1 + len(firsts) * pages, 128, 4, 640)).astype(ml_dtypes.float8_e4m3fn)
+            tables = np.zeros((G, B, pages), np.int32)
+            keys = np.full((G, B, key_rows, 128), -2**31, np.int32)
+            tok = rng.integers(-2**31 + 1, 2**31 - 1, (B, pages * G * T), dtype=np.int64)
+            if favor is not None:  # rank `favor`'s tokens hold the top keys: only it attends pages
+                hot = (np.arange(pages * G * T) // T) % G == favor
+                tok[:, hot] = 2**31 - 2 - rng.integers(0, 2**20, (B, int(hot.sum())))
+            for b in range(B):
+                s, p0 = b // S, firsts[b // S]
+                tables[:, b] = 1 + s * pages + np.arange(pages)
+                for t in range(positions[b]):
+                    page = t // T; g, j = page % G, page // G
+                    if t < p0:
+                        pool[g, tables[g, b, j], (t % T) // 4, t % 4] = lat[s, t].astype(ml_dtypes.float8_e4m3fn)
+                    keys[g, b, j * (T // 128) + (t % T) // 128, t % 128] = tok[b, t]
+            tau = np.zeros(B, np.int32); ptie = np.zeros(B, np.int32); own = np.zeros(B, np.int32)
+            steps = key_rows // selection[0].shape[2]
+            active = np.zeros((G, B * steps), np.int32)
+            for b in range(B):
+                L = positions[b] + 1
+                kk = tok[b, :L]
+                m = dsa.topk_mask(kk, np.arange(L), topk)
+                order = np.lexsort((np.arange(L), -kk))
+                tau[b], ptie[b] = (-2**31, -1) if L <= topk else (kk[order[topk - 1]], 2**31 - 1)
+                own[b] = int(m[-1])
+                for t in np.flatnonzero(m):
+                    page = t // T; g, j = page % G, page // G
+                    active[g, (b - b % S) * steps + (j * (T // 128) + (t % T) // 128) // selection[0].shape[2]] = 1
+            q = (rng.standard_normal((G, B, H, 640)) * 0.05).astype(np.float32)
+            q[..., 576:] = 0
+            new = np.broadcast_to(lat[np.arange(B) // S, positions], (G, B, 640)).astype(np.float32)
+            n_p, n_s, rows = len(persistent), len(scoped), persistent[2].shape[2]
+
+            def kernel(pos, table, tau_r, ptie_r, own_r, act_r, q_r, new_r, pool_r, keys_r, out_r, recv_r, *scratch):
+                cache = mla_dcp.DcpCache((pool_r,), table, pages, 0, group=G, global_pages=False)
+                ws = mla_dcp.DcpWorkspace(*scratch[:n_p], *scratch[n_p:n_p + n_s])
+                sel = mla_dcp.DcpSelection(keys_r, tau_r, ptie_r, own_r, *scratch[n_p + n_s:],
+                                           active=act_r, steps=steps)
+                att = mla_dcp.DcpAttention(cache, ws, pos, B, selection=sel, sequence_rows=S,
+                                           cache_verify_rows=S > 1)
+                if early:  # the queries leave first (as under the indexer); work fills the combine
+                    mla_dcp.DcpAttention(cache, ws, pos, B, sequence_rows=S, cache_verify_rows=S > 1
+                                         ).send_queries(q_r[...], new_r[...], 0)
+                    att.prime()
+
+                    def while_combining():
+                        out_r[...] = jnp.full(out_r.shape, 3.0, jnp.float32)
+
+                    out_r[...] = att.attend(None, new_r[...], 0, queries_sent=True,
+                                            while_combining=while_combining)
+                else:
+                    att.prime()
+                    out_r[...] = att.attend(q_r[...], new_r[...], 0)
+                recv_r[...] = ws.receive[0].astype(jnp.float32)
+
+            def body(pos, table, tau_, ptie_, own_, act_, q_, new_, pool_, keys_):
+                vmem = pltpu.VMEM
+                out, recv = pl.pallas_call(kernel,
+                    out_shape=(jax.ShapeDtypeStruct((B, H, 512), jnp.float32),
+                               jax.ShapeDtypeStruct((G, rows, 640), jnp.float32)),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=6,
+                        in_specs=[pl.BlockSpec(memory_space=vmem)] * 2 + [pl.BlockSpec(memory_space=pl.ANY)] * 2,
+                        out_specs=(pl.BlockSpec(memory_space=vmem),) * 2,
+                        scratch_shapes=[*persistent, *scoped, *selection]),
+                    compiler_params=pltpu.CompilerParams(has_side_effects=True),
+                    interpret=pltpu.InterpretParams())(pos, table[0], tau_, ptie_, own_, act_[0], q_[0], new_[0],
+                                                       pool_[0], keys_[0])
+                return out[None], recv[None]
+
+            mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+            f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P("tp"), P(), P(), P()) + (P("tp"),) * 5,
+                                      out_specs=(P("tp"), P("tp")), check_vma=False))
+            out, recv = f(positions, tables.reshape(G, -1), tau, ptie, own, active, q, new, pool, keys)
+            return np.asarray(out), np.asarray(recv), mla_dcp.packet_layout(B)[0]
+
+        def case(*args, exact=False, **kwargs):
+            one, recv, slots = run(*args, pair=False, early=False, **kwargs)
+            two, _, _ = run(*args, pair=True, early=False, **kwargs)
+            two_early, _, _ = run(*args, pair=True, early=True, **kwargs)
+            assert np.array_equal(two, two_early), "queries_sent changes the pair combine's outputs"
+            lse = recv[..., 512] + recv[..., 513]  # [owner, source, packet row]
+            w = np.exp(lse - lse.max(axis=1, keepdims=True))
+            w /= w.sum(axis=1, keepdims=True)
+            bound = np.einsum("dir,dire->dre", w, np.abs(recv[..., :512]))
+            bound = np.stack([bound[:, slots * b:slots * b + H] for b in range(one.shape[1])], axis=1)
+            diff = np.abs(two.astype(np.float64) - one)
+            assert np.isfinite(two).all()
+            assert (diff <= 2.0**-8 * bound * (1 + 2.0**-6) + 1e-7 * bound.max()).all(), (
+                args, (diff / np.maximum(2.0**-8 * bound, 1e-30)).max())
+            assert not exact or np.array_equal(one, two), args
+            print(args, "max |pair - one-stage| / (2^-8 bound):", (diff / np.maximum(2.0**-8 * bound, 1e-30)).max())
+
+        # One 8-row verify (the B1 x7 shape) on compact steps with a 512-slot window; two 4-row
+        # sequences dense; plain decode; ranks skewed so that only rank 1 attends pages (its mate and
+        # the other chip reach the combine first; the mates' partials pass through).
+        case([3000], 8, 200, 11, compact=128, window=512)
+        case([1500, 3000], 4, 200, 1)
+        case([2047, 600, 64, 3000], 1, 128, 2)
+        case([3000], 8, 200, 13, favor=1, exact=True)
+        print("OK")
+    """
+
+    def test_pair_combine_within_one_bf16_rounding(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
+
+
 class TestPrefillIndexRows(CustomTestCase):
     """A prefill window's index keys laid out as pool rows match the decode's
     per-token commit of the same keys, byte for byte."""

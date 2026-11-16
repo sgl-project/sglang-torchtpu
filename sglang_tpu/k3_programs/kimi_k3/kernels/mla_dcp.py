@@ -1918,6 +1918,98 @@ class DcpAttention:
                         device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
+    # Pair combine (KernelConfig.dcp_pair_combine): members 2k and 2k + 1 are
+    # the two cores of a chip. Stage one: each core sends its mate the packets
+    # of the owners of the mate's parity (owner 2j + p into the mate's receive
+    # slot G/2 + j) and merges the two partials of each owner of its own
+    # parity. Stage two: owner 2j + p gets that merged partial in slot k, the
+    # sending chip, and merges G/2. Stage one waits on row group 1's combine
+    # semaphores (free with one row group): stage two's bytes must not count
+    # toward it.
+
+    def _pair_combine(self, keys):
+        """Whether ``attend`` combines in two stages: one row group of three
+        heads a rank, packets with their log-sum-exps in lanes 512:514."""
+        return (
+            bool(_config().dcp_pair_combine)
+            and self.groups == 1
+            and self.heads == HEADS_PER_RANK
+            and keys is None
+            and not self.lse_in_padding
+            and self.group % 2 == 0
+        )
+
+    def _pair_swap(self, parity, rows):
+        """Stage one's sends: the mate's owners' packets, on-chip."""
+        ws, half, lanes = self.ws, self.group // 2, self._combine_lanes()
+        mate = self.member ^ 1
+        for j in range(0 if "combine" in self.skip else half):
+            tpu.make_async_remote_copy(
+                ws.send.at[2 * j + mate % 2, rows, lanes],
+                ws.receive.at[parity, half + j, rows, lanes],
+                ws.combine_semaphores.at[0, parity, 1],
+                ws.combine_semaphores.at[1, parity, 1],
+                device_id=(self.base + mate,),
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+
+    def _pair_send(self, parity, rows):
+        """Stage one's merges, each owner's merged partial sent as soon as it
+        is ready (a rolled loop: the merges run under stage two's flight).
+        Chip k starts at owner k + 1, so an owner takes one chip's packet at a
+        time; its own partial is merged last, into its slot."""
+        ws, half, lanes = self.ws, self.group // 2, self._combine_lanes()
+        own_parity, chip = self.member % 2, self.member // 2
+        if "combine" not in self.skip:
+            with self._scope("pair_wait"):
+                mates = ws.receive.at[parity, pl.ds(half, half), rows, lanes]
+                tpu.make_async_copy(
+                    mates, mates, ws.combine_semaphores.at[1, parity, 1]
+                ).wait()
+
+        def merge(j):
+            index = 2 * j + own_parity  # the owner
+            ws.send[index, rows, :] = _merge_pair(
+                ws.send[index, rows, :], ws.receive[parity, half + j, rows, :]
+            )
+            return index
+
+        with self._scope("pair_merge"):
+
+            @pl.loop(1, half)
+            def merge_and_send(i):
+                index = merge((chip + i) % half)
+                if "combine" not in self.skip:
+                    tpu.make_async_remote_copy(
+                        ws.send.at[index, rows, lanes],
+                        ws.receive.at[parity, chip, rows, lanes],
+                        ws.combine_semaphores.at[0, parity, 0],
+                        ws.combine_semaphores.at[1, parity, 0],
+                        device_id=(self.base + index,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+            merge(chip)
+            ws.receive[parity, chip, rows] = ws.send[self.member, rows]
+
+    def _pair_wait(self, parity, rows):
+        """Both stages' sends have left; the other chips' G/2 - 1 merged
+        partials have arrived."""
+        if "combine" in self.skip:
+            return
+        ws, half, lanes = self.ws, self.group // 2, self._combine_lanes()
+        swapped = ws.receive.at[parity, pl.ds(half, half), rows, lanes]
+        tpu.make_async_copy(
+            swapped, swapped, ws.combine_semaphores.at[0, parity, 1]
+        ).wait()
+        others = ws.receive.at[parity, pl.ds(0, half - 1), rows, lanes]
+        tpu.make_async_copy(
+            others, others, ws.combine_semaphores.at[0, parity, 0]
+        ).wait()
+        tpu.make_async_copy(
+            others, others, ws.combine_semaphores.at[1, parity, 0]
+        ).wait()
+
     def attend(
         self,
         queries,
@@ -1962,6 +2054,7 @@ class DcpAttention:
         )
         heads = group * self.slots
         groups = self.row_groups()
+        pair = self._pair_combine(keys)
 
         def rows_of(g):
             first, end = groups[g]
@@ -2021,6 +2114,11 @@ class DcpAttention:
 
             # 3. Normalize and send each owner its heads' rows.
             self._pack_partials(first, end)
+            if pair:
+                self._pair_swap(parity, rows_of(g))
+                local_scope.__exit__(None, None, None)
+                self._pair_send(parity, rows_of(g))
+                continue
             for peer in range(0 if "combine" in self.skip else group):
 
                 @pl.when(peer != member)
@@ -2042,6 +2140,9 @@ class DcpAttention:
             while_combining()
         with self._scope("combine_wait"):
             for g in range(len(groups)):
+                if pair:
+                    self._pair_wait(parity, rows_of(g))
+                    continue
                 others = ws.receive.at[
                     parity, pl.ds(0, group - 1), rows_of(g), self._combine_lanes()
                 ]
@@ -2055,8 +2156,11 @@ class DcpAttention:
         merge_scope = self._scope("merge")
         merge_scope.__enter__()
 
-        # 4. Log-sum-exp merge of the G partials and the new token.
-        partials = ws.receive[parity].astype(jnp.float32)  # [G, rows, 640]
+        # 4. Log-sum-exp merge of the G partials (pair combine: one per chip,
+        # in slot ``member // 2`` of its sender) and the new token.
+        partials = (
+            ws.receive[parity, : group // 2] if pair else ws.receive[parity]
+        ).astype(jnp.float32)  # [G (G/2), rows, 640]
         lse = (
             partials[:, :, LATENT : LATENT + 1]
             + partials[:, :, LATENT + 1 : LATENT + 2]
@@ -2133,6 +2237,24 @@ class DcpAttention:
         )
         merge_scope.__exit__(None, None, None)
         return result
+
+
+def _merge_pair(first, second):
+    """Two partials' BF16 packets ``[rows, 640]`` (normalized outputs, lse
+    high and low parts in lanes 512 and 513) merged by log-sum-exp into one
+    such packet; the owner's merge weighs it as the two."""
+    a, b = first.astype(jnp.float32), second.astype(jnp.float32)
+    lse_a = a[:, LATENT : LATENT + 1] + a[:, LATENT + 1 : LATENT + 2]
+    lse_b = b[:, LATENT : LATENT + 1] + b[:, LATENT + 1 : LATENT + 2]
+    top = jnp.maximum(lse_a, lse_b)
+    weight_a, weight_b = jnp.exp(lse_a - top), jnp.exp(lse_b - top)
+    total = weight_a + weight_b
+    normalized = (weight_a / total) * a[:, :LATENT] + (weight_b / total) * b[:, :LATENT]
+    lse = top + jnp.log(total)
+    high = lse.astype(jnp.bfloat16).astype(jnp.float32)
+    lane = jax.lax.broadcasted_iota(jnp.int32, (lse.shape[0], LANES - LATENT), 1)
+    tail = jnp.where(lane == 0, high, jnp.where(lane == 1, lse - high, 0.0))
+    return jnp.concatenate((normalized, tail), axis=1).astype(jnp.bfloat16)
 
 
 def _merge_received(received, own_rows, new_rows, group, *, unroll=1, own=None):
