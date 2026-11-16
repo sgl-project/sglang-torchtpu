@@ -377,7 +377,7 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                     "--model",
                     str(model),
                     "--decode-prefix",
-                    "auto",
+                    os.environ.get("GLM52_DECODE_PREFIX", "auto"),
                 ]
                 measurements = run_client(proc, client, out, art, shared, deadline)
                 result.update(status="SUCCEEDED", measurements=str(measurements))
