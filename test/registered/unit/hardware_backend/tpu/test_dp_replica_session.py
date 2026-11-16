@@ -114,7 +114,7 @@ def test_session_restores_engine_rank_even_when_backend_fails(monkeypatch):
 
 
 @pytest.mark.parametrize("tp_size", [1, 4])
-def test_parent_preserves_ports_and_rejects_global_barrier(monkeypatch, tp_size):
+def test_parent_preserves_ports_and_libtpu_args(monkeypatch, tp_size):
     monkeypatch.delenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", raising=False)
     monkeypatch.delenv("TORCH_TPU_INTERNAL_HANDSHAKE_PORT", raising=False)
     monkeypatch.delenv("SGLANG_TPU_DP_SESSION_PORT", raising=False)
@@ -135,15 +135,7 @@ def test_parent_preserves_ports_and_rejects_global_barrier(monkeypatch, tp_size)
     assert pick.call_count == 2
     assert len(os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
     assert os.environ["SGLANG_TPU_DP_SESSION_PORT"] == "12349"
-    assert (
-        os.environ["LIBTPU_INIT_ARGS"]
-        .split()
-        .count("--xla_jf_emit_global_barrier_at_start=false")
-        == 1
-    )
-    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_jf_emit_global_barrier_at_start=true")
-    with pytest.raises(ValueError, match="Independent TPU replicas"):
-        dp_replicas.prepare_host_session(8 // tp_size, tp_size)
+    assert os.environ["LIBTPU_INIT_ARGS"] == "--unrelated=false"
 
 
 def test_session_applies_timeout_to_borrowed_groups(monkeypatch):
