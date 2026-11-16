@@ -23,6 +23,7 @@ Variants (core 0 of each chip is side A, core 1 side B, unless noted):
   push_d2+a_local  A pushes to B and streams its own slabs HBM -> VMEM at once
   push_d2+b_local  A pushes to B while B streams its own slabs HBM -> VMEM
   slab_latency     A pushes one slab, B rings A back after it lands (per slab)
+  burst_K          the same with K slabs issued at once (K = 2, 4)
   pp_<mem>_<size>  64 KB / 4 KB ping-pong (A -> B, B -> A) between VMEM or HBM
   pp_sem           remote semaphore ping-pong (no data)
   ici_*            the same between core 0 of two x-neighbour chips (ICI)
@@ -90,6 +91,8 @@ VARIANTS = (
     dict(name="push_d4", kind="push", depth=4),
     dict(name="push_d1", kind="push", depth=1),
     dict(name="slab_latency", kind="slablat"),
+    dict(name="burst_2", kind="slablat", burst=2),
+    dict(name="burst_4", kind="slablat", burst=4),
     dict(name="pp_vmem_64k", kind="pingpong", nbytes=65536, space="vmem"),
     dict(name="pp_hbm_64k", kind="pingpong", nbytes=65536, space="hbm"),
     dict(name="pp_vmem_4k", kind="pingpong", nbytes=4096, space="vmem"),
@@ -440,8 +443,10 @@ def _push_kernel(variant, parts):
 
 
 def _slab_latency_kernel(variant, parts):
-    """A pushes one slab and waits for B's doorbell; B rings after it lands."""
+    """A pushes ``burst`` slabs at once and waits for B's doorbell; B rings
+    after all of them land (one receive semaphore per slab)."""
     count = len(parts)
+    burst = variant.get("burst", 1)
 
     def kernel(params, *refs):
         src, dst = refs[:count], refs[count : 2 * count]
@@ -449,16 +454,16 @@ def _slab_latency_kernel(variant, parts):
         iterations, peer, role = params[0], params[1], params[2]
 
         def copies(i):
-            slab, slot = i % SRC_SLABS, i % DST_SLOTS
             return [
                 pltpu.make_async_remote_copy(
-                    src[p].at[slab],
-                    dst[p].at[slot],
+                    src[p].at[(i * burst + b) % SRC_SLABS],
+                    dst[p].at[(i * burst + b) % DST_SLOTS],
                     send.at[0],
-                    receive.at[0],
+                    receive.at[b],
                     device_id=(peer,),
                     device_id_type=MESH_ID,
                 )
+                for b in range(burst)
                 for p in range(count)
             ]
 
@@ -488,7 +493,7 @@ def _slab_latency_kernel(variant, parts):
                     device_id_type=MESH_ID,
                 )
 
-    scratch = [pltpu.SemaphoreType.DMA((1,)), pltpu.SemaphoreType.DMA((1,))]
+    scratch = [pltpu.SemaphoreType.DMA((1,)), pltpu.SemaphoreType.DMA((burst,))]
     inputs = [((SRC_SLABS, *shape), dtype) for shape, dtype in parts]
     outputs = [((DST_SLOTS, *shape), dtype) for shape, dtype in parts]
     return kernel, inputs, outputs, scratch
@@ -659,7 +664,8 @@ def _check_push(
     variant, host_sources, results, iterations, peers, roles, devices_count
 ):
     """Each receiver's staging slots hold its peer's slabs of the last
-    iterations (push variants with HBM staging)."""
+    ``iterations`` copies (push variants with HBM staging; burst copies count
+    one each)."""
     if variant["kind"] not in ("push", "slablat") or variant.get("dst", "hbm") != "hbm":
         return "n/a"
     if variant["kind"] == "push" and not (
@@ -719,7 +725,7 @@ def _iteration_counts(variant):
 
 def _bytes_per_iteration(variant, parts):
     if variant["kind"] in ("push", "slablat"):
-        return _part_bytes(parts)
+        return variant.get("burst", 1) * _part_bytes(parts)
     if variant["kind"] == "pingpong":
         return variant["nbytes"]
     return 0
@@ -752,9 +758,11 @@ def run_variant(variant, mesh, devices, tables, out_path):
         _SOURCES[key] = host, [jax.device_put(a, sharding) for a in host]
     host_sources, sources = _SOURCES[key]
     n_low, n_high = _iteration_counts(variant)
+    burst = variant.get("burst", 1)
+    n_check = max(1, DST_SLOTS // burst)  # each staging slot written at most once
     params = {
         n: jax.device_put(_params(count, n, peers, roles), sharding)
-        for n in (n_low, n_high, DST_SLOTS)
+        for n in (n_low, n_high, n_check)
     }
 
     def run(n):
@@ -775,10 +783,10 @@ def run_variant(variant, mesh, devices, tables, out_path):
     checked |= variant["kind"] == "pingpong" and variant["space"] == "hbm"
     check = "n/a"
     if checked:
-        _, out = run(DST_SLOTS)
+        _, out = run(n_check)
         host_out = [np.asarray(x) for x in out]
         check = _check_push(
-            variant, host_sources, host_out, DST_SLOTS, peers, roles, count
+            variant, host_sources, host_out, n_check * burst, peers, roles, count
         )
         if check == "n/a":
             check = _check_pingpong(
