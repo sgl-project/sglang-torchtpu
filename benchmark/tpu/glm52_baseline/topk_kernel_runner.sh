@@ -11,8 +11,8 @@ export JAX_COMPILATION_CACHE_DIR="/tmp/glm52-baseline-runtime/kernel-cache-$SOUR
 export GLM52_RUNTIME_DIR="$OUT/actual-process-runtime"
 export PYTHONPATH="$PWD/benchmark/tpu/glm52_baseline/runtime_probe:$PYTHONPATH"
 "$PY" -u test/registered/tpu/unit/test_dsa_index_topk.py TestDsaRadixTopk \
-  > "$OUT/device-tests.log" 2>&1
+  2>&1 | tee "$OUT/device-tests.log"
 "$PY" -u test/manual/kernels/benchmark_glm52_radix_topk.py --repeats 20 \
   --source-v2 benchmark/tpu/glm52_baseline/reference/radix_topk_v2.py \
-  > "$OUT/benchmark.jsonl" 2>&1
+  2>&1 | tee "$OUT/benchmark.jsonl"
 echo TOPK_KERNEL_PASS
