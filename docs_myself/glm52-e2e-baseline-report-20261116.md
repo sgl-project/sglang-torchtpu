@@ -41,9 +41,24 @@
 ## 当前模型启动证据
 
 - MTP-only 视图运行：`session-readerfix-1879-mtp-view`，implementation `1879b469580f6a78fb8356c53c526a0dc79dec63`，bundle SHA256 `22a3cbc8be05e5e8cd23bf1ea976d5184c874e6edc87f469215da4a62f52bb9f`。
-- target 本轮 host0 各 DP 加载29.63–42.39秒；draft 5个 shard 的 iterator 232秒完成，已进入 TARGET_VERIFY 编译。
+- target 本轮 host0 各 DP 加载29.63–42.39秒；draft 5个 shard 的 iterator 232秒完成，TARGET_VERIFY BS1/2/3/4全部完成，分别181.6/182.6/195.9/197.2秒；BS4覆盖24个verify rows。EXTEND(FULL)的64-token无/有spec info两档分别194.4/58.3秒完成，2K无spec info档494.3秒完成，其余档也已完成；target共4个verify及4个extend shapes通过，正在native EAGLE FUSED DRAFT chain预编译。
 - 两个 host 日志16 DP target/draft KV 容量219,008 tokens，FP8；4条独立90K请求的 page-rounded slots需求364,288，容量不足。正式 client 将再查询完整16 DP 容量，按用户授权选择 shared prefix，C64和90K输入不降低。
 - 可复现 harness commit：`fa6269a0b1`（只新增 benchmark 脚本，模型/reader 代码与运行中的1879一致）；正式性能结果尚未产生。
+
+## HTTP client 回归与本轮后续
+
+- 10:53:50 全部target/draft图、global warmup及原生多DP生成warmup完成；16 DP启用 `fail_on_recompile`。原生decode日志有native MTP accept len 2–6。它不代替chat正确性和目标性能验收。
+- 首个显式routed chat请求在client报 `ServerDisconnectedError`；两机无kernel/compiler异常，随后supervisor按client失败清理server。
+- 已复现并修复：`/server_info`后同步import/初始化tokenizer阻塞event loop约7秒，超过server默认5秒HTTP keep-alive，aiohttp复用尚未处理EOF的连接。将import、初始化、输入编码放入 `asyncio.to_thread`。
+- 最小HTTP复现：blocking=ServerDisconnectedError，to_thread=200；实际client.main回归：旧代码ServerDisconnectedError，新代码16模拟DP smoke全部PASS。这是transport验证，不是模型质量验证。
+- client修复与MTP整shard host预读commit：`6bf809456f`。模型实现仍为1879，未修改kernel/策略；新bundle `6ebfe7b98972fc31cb4d0f7c393ff7f32b37e90a50d6ef563461f780a37af259`，run id `readerfix-1879-clientfix-v2`。
+
+## 续跑资源与固定源码
+
+- 旧allocation于11:10 UTC自然达到6,800秒holding上限，exit124；非模型错误，也未把holding误记为成功。clientfix-v2尚未完成验收。
+- 已重新核查1-prod资源快照（包含running/pending allocations与active leases），只使用1-prod候选；未查询退出集群。
+- 固定源码 `d8f342b878`（模型/reader/依赖相对1879无变化；含已验证的client修复及MTP host预读），续跑 `exp-7eqnrujaw6` / `job-dgowhe71v1` / `art-yi2osnr97j`。
+- 续跑直接执行已提交的falcon_runner，不以holding作为application；挂载原25GB compile cache到 `/glm52-prior-compile-cache`，缓存不替代实际warmup/serve验收。
 
 ## 模型身份
 
