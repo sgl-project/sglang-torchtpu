@@ -100,6 +100,7 @@
     "hybrid": "DP attention hybrid (attn-TP>1)",
     "tp": "Tensor parallel",
     "pcp": "Prefill context parallel",
+    "pcp-ring": "Prefill context parallel, ring mode (striped KV cache)",
     "pp": "Pipeline parallel",
     "pd": "PD disaggregation",
     "epd": "EPD (standalone vision encode server)",
