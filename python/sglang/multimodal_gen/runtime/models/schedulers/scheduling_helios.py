@@ -403,8 +403,10 @@ class HeliosScheduler:
             rks.append(rk)
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        # Stacked on the device: torch.tensor over device scalars reads each
+        # one back to the host.
+        rks.append(torch.ones_like(h))
+        rks = torch.stack(rks)
 
         R = []
         b = []
@@ -428,7 +430,7 @@ class HeliosScheduler:
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b)
 
         if len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)
@@ -494,8 +496,10 @@ class HeliosScheduler:
             rks.append(rk)
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        # Stacked on the device: torch.tensor over device scalars reads each
+        # one back to the host.
+        rks.append(torch.ones_like(h))
+        rks = torch.stack(rks)
 
         R = []
         b = []
@@ -518,7 +522,7 @@ class HeliosScheduler:
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b)
 
         if len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)
@@ -527,6 +531,13 @@ class HeliosScheduler:
 
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
+        elif order == 2:
+            # R = [[1, 1], [rk, 1]], solved by Cramer's rule: torch.linalg.solve
+            # checks its result on the host.
+            rk = rks[0]
+            det = 1 - rk
+            rhos_c = torch.stack([(b[0] - b[1]) / det, (b[1] - rk * b[0]) / det])
+            rhos_c = rhos_c.to(device=device, dtype=x.dtype)
         else:
             rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
 
