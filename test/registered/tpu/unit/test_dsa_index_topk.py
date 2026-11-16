@@ -623,18 +623,19 @@ class TestDsaRadixTopk(CustomTestCase):
                 )
             # Token split changes query ownership only, and must preserve the
             # same exact candidate threshold and every cache byte.
-            for start in (0, 16, step.query.shape[0]):
+            split_rows = 4 * query_size
+            for start in (0, split_rows, step.query.shape[0]):
                 sliced, sliced_cache = _run(
                     step,
                     topk=2048,
                     selector="radix_v2",
                     row_start=start,
-                    row_count=16,
+                    row_count=split_rows,
                     decode_query_size=query_size,
                     segments=segments,
                 )
-                expected = np.pad(rows, ((0, 16), (0, 0)), constant_values=-1)[
-                    start : start + 16
+                expected = np.pad(rows, ((0, split_rows), (0, 0)), constant_values=-1)[
+                    start : start + split_rows
                 ]
                 np.testing.assert_array_equal(sliced, expected)
                 np.testing.assert_array_equal(sliced_cache, cache)
