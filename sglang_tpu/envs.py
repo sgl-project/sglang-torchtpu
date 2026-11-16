@@ -599,6 +599,10 @@ class TpuEnvs:
     # EP in-kernel xprof regions: 1 per phase, 2 per expert chunk / arm too.
     SGLANG_TPU_EP_TRACE = EnvInt(0)
 
+    # Selected-route GLM EP MoE v2. Resolved once after model weight loading.
+    SGLANG_TPU_USE_GLM_MOE_V2 = EnvBool(False)
+    SGLANG_TPU_GLM_MOE_V2_SHARED = EnvBool(True)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(
