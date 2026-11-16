@@ -37,8 +37,11 @@ class TestTpuChannelwiseFp8Loading(CustomTestCase):
             ("w2", (experts, hidden, intermediate)),
         ):
             block_q = (torch.randn(shape) * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
+            # Keep dequantized weights in the original smoke's ~0.05 range.
+            # The final FP32 sanity oracle does not model W8A8 activation
+            # quantization; exact source/layout/output parity is checked above.
             block_scales = 2.0 ** torch.randint(
-                -10, -6, (experts, shape[1] // 128, shape[2] // 128)
+                -13, -10, (experts, shape[1] // 128, shape[2] // 128)
             )
             source = block_q.float() * block_scales.repeat_interleave(
                 128, 1
