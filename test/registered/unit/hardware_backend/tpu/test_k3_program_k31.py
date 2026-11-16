@@ -1101,3 +1101,86 @@ class TestK31Draft(CustomTestCase):
             causal[0], alone[0], atol=1e-5
         )  # the first sees only itself
         self.assertFalse(np.allclose(causal[0], full[0], atol=1e-5))
+
+
+class TestK31DraftWholeWeights(CustomTestCase):
+    """``KernelConfig.draft_whole_weights``: Kimi-K3.1's draft (three heads a
+    rank) holds o whole at up to 8 rows and down at up to 16 instead of
+    streaming them one 896-column chunk at a time (other drafts and shapes as
+    before), and the chunks ``all_reduce`` multiplies
+    (``dspark_mla_kernel._ChunkedWeight``) give bit-identical products either
+    way (Pallas interpret mode)."""
+
+    SCRIPT = """
+        import os
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark_mla as mla
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark_mla_kernel as kern
+
+        for heads in (64, 96):
+            c = mla.MlaDraftConfig(heads=heads)
+            for rows in (4, 8, 12, 16, 24, 32, 48, 64):
+                for dp in (1, 2):
+                    old = rows > 32 or heads > 64  # before the knob: down; o also under DP
+                    assert kern.streamed_weights(c, rows, dp) == (old or dp > 1, old)
+                    if heads > 64 and dp == 1:
+                        want = (rows > 8, rows > 16)
+                    else:
+                        want = (old or dp > 1, old)
+                    assert kern.streamed_weights(c, rows, dp, whole=True) == want, (heads, rows, dp)
+
+        LAYERS, CHUNK = 2, kern.CHUNK
+        def products(lhs, weight, streamed):
+            T, K = lhs.shape
+            def kernel(lhs_ref, weight_hbm, out_ref, buffer, sems):
+                copy = lambda src, dst, sem: pltpu.make_async_copy(src, dst, sems.at[sem])
+                chunked = kern._ChunkedWeight(weight_hbm, buffer, (0, 1), copy)
+                assert chunked.streamed == streamed
+                for layer in range(LAYERS):
+                    chunked.load(layer).wait()
+                    for k, operand in enumerate(chunked.chunks(layer)):
+                        out_ref[layer, k] = kern._dot(lhs_ref[...], operand)
+            buffer = (2, K, CHUNK) if streamed else (K, 8 * CHUNK)
+            return np.asarray(pl.pallas_call(
+                kernel,
+                out_shape=jax.ShapeDtypeStruct((LAYERS, 8, T, CHUNK), jnp.float32),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM), pl.BlockSpec(memory_space=pl.ANY)],
+                out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                scratch_shapes=[pltpu.VMEM(buffer, jnp.bfloat16), pltpu.SemaphoreType.DMA((2,))],
+                interpret=pltpu.InterpretParams(),
+            )(lhs, weight))
+
+        rng = np.random.default_rng(0)
+        for T, K in ((8, 384), (16, 512)):  # o (three heads) at 8 rows, down at 16
+            lhs = jnp.asarray(rng.standard_normal((T, K)), jnp.bfloat16)
+            weight = jnp.asarray(rng.standard_normal((LAYERS, K, 8 * CHUNK)), jnp.bfloat16)
+            streamed, whole = products(lhs, weight, True), products(lhs, weight, False)
+            assert np.array_equal(streamed.view(np.uint32), whole.view(np.uint32)), (T, K)
+            ref = np.asarray(lhs, np.float32) @ np.asarray(weight, np.float32)
+            ref = ref.reshape(LAYERS, T, 8, CHUNK).transpose(0, 2, 1, 3)
+            np.testing.assert_allclose(whole, ref, rtol=1e-4, atol=1e-3)
+        print("OK")
+    """
+
+    def test_whole_and_streamed_chunks_match(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])

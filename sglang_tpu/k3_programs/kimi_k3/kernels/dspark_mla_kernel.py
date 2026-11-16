@@ -40,6 +40,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
 from sglang_tpu.k3_programs.common import collectives32
+from sglang_tpu.k3_programs.kimi_k3.config import active as _config
 
 from . import mla_dcp
 from .decode_megakernel import PHASE_SCOPES, _dot, _phase_end, _phase_start
@@ -129,6 +130,67 @@ def _rope(x_bf16, rot_bf16, cos32, sin32):
     return _bf16(_f32(x_bf16) * cos32 + rotated * sin32)
 
 
+def streamed_weights(
+    c: MlaDraftConfig, rows: int, dp: int = 1, whole: bool = False
+) -> tuple[bool, bool]:
+    """``(o, down)``: whether a call over ``rows`` rows (all its requests')
+    streams that weight one 896-column chunk at a time through two VMEM slots
+    instead of holding it whole. Both stream above 32 rows and with more than
+    two heads a rank (Kimi-K3.1's draft: three), o also under attention DP;
+    ``whole`` (``KernelConfig.draft_whole_weights``, attention DP1) holds o
+    whole up to 8 rows and down up to 16, as VMEM allows."""
+    whole = whole and dp == 1
+    many = c.heads_per_rank > 2
+    o = rows > 32 or dp > 1 or (many and not (whole and rows <= 8))
+    down = rows > 32 or (many and not (whole and rows <= 16))
+    return o, down
+
+
+class _ChunkedWeight:
+    """A ``[layers, K, 7168]`` o / down weight (chunk-permuted, see
+    ``all_reduce``) through ``buffer``: whole (``[K, 7168]``) or streamed one
+    896-column memory chunk at a time through two slots (``[2, K, 896]``),
+    each slot's copies on its semaphore (``sems``)."""
+
+    def __init__(self, weight, buffer, sems, copy):
+        self.weight, self.buffer, self.sems, self.copy = weight, buffer, sems, copy
+        self.streamed = len(buffer.shape) == 3
+
+    def load(self, layer):
+        """Start ``layer``'s copy: the whole weight, or streamed its chunk 0
+        into slot 0."""
+        item = self.copy(
+            self.weight.at[layer, :, pl.ds(0, self.buffer.shape[-1])],
+            self.buffer.at[0] if self.streamed else self.buffer,
+            self.sems[0],
+        )
+        item.start()
+        return item
+
+    def chunks(self, layer):
+        """``layer``'s memory chunks ``[K, 896]`` in order, once ``load``'s
+        copy has arrived (streamed: chunk k + 1's copy in flight while chunk k
+        is used)."""
+        if not self.streamed:
+            for k in range(8):
+                yield self.buffer[:, pl.ds(k * CHUNK, CHUNK)]
+            return
+        refill = self.weight.at[layer]
+        loading = None
+        for k in range(8):
+            arrived = loading
+            if k + 1 < 8:
+                loading = self.copy(
+                    refill.at[:, pl.ds((k + 1) * CHUNK, CHUNK)],
+                    self.buffer.at[(k + 1) % 2],
+                    self.sems[(k + 1) % 2],
+                )
+                loading.start()
+            if arrived is not None:
+                arrived.wait()
+            yield self.buffer[k % 2]
+
+
 def _make_body(
     c: MlaDraftConfig,
     block: int,
@@ -153,10 +215,6 @@ def _make_body(
     eps = c.eps
     scale = c.softmax_scale
     drafts_count = rows - 1  # verify rows after the anchor
-    # o / down stream one 896-column chunk at a time (VMEM): above 32 rows,
-    # and with more than two heads a rank (Kimi-K3.1's draft: three).
-    streamed = T > 32 or per > 2
-    streamed_o = streamed or dp > 1  # o also under attention DP
     KEYS = 2 * rows
     n_persist = len(mla_dcp.PERSISTENT_NAMES)
     n_scoped = len(mla_dcp.SCOPED_NAMES)
@@ -305,34 +363,16 @@ def _make_body(
             _phase_end(scope)
             return result
 
-        def all_reduce(
-            lhs_bf16, weight_ref, slot, refill=None, refill_sems=(7, 7), tag=""
-        ):
+        def all_reduce(lhs_bf16, chunks, slot, tag=""):
             """``lhs @ W`` (a chunk-permuted ``[K, 7168]`` weight: memory chunk
-            k is logical chunk ``lane ^ k``) summed over the 32 ranks: the
+            k is logical chunk ``lane ^ k``; ``chunks``: its memory chunks in
+            order, ``_ChunkedWeight.chunks``) summed over the 32 ranks: the
             host-local reduce-scatter chunk by chunk, then the cross-host
-            reduction and gather. ``refill``: the HBM weight, streamed a chunk
-            at a time through ``weight_ref``'s two slots (``[2, K, 896]``,
-            chunk 0 already in slot 0), the next chunk in flight."""
+            reduction and gather."""
             scope = _phase_start(f"ar_{tag}_local")
             copies = []
             own = None
-            loading = None
-            for k in range(8):
-                if refill is not None:
-                    arrived = loading
-                    if k + 1 < 8:
-                        loading = copy(
-                            refill.at[:, pl.ds((k + 1) * CHUNK, CHUNK)],
-                            weight_ref.at[(k + 1) % 2],
-                            refill_sems[(k + 1) % 2],
-                        )
-                        loading.start()
-                    if arrived is not None:
-                        arrived.wait()
-                    operand = weight_ref[k % 2]
-                else:
-                    operand = weight_ref[:, pl.ds(k * CHUNK, CHUNK)]
+            for k, operand in enumerate(chunks):
                 partial = _dot(lhs_bf16, operand)  # [T, 896] FP32
                 stage[slot, k] = pack(_bf16(partial))
                 if k == 0:
@@ -781,32 +821,38 @@ def _make_body(
         workspace = mla_dcp.DcpWorkspace(*persistent, *dcp_scoped)
 
         # Each layer buffer refills with the next layer's weights as soon as
-        # this layer is done with it.
+        # this layer is done with it (o / down: whole, or their first chunk).
+        chunked = {
+            "o": _ChunkedWeight(weights["o"], o_buf, (5, SEM_O2), copy),
+            "down": _ChunkedWeight(
+                weights["down"], down_buf, (SEM_DOWN, SEM_DOWN2), copy
+            ),
+        }
+
         def layer_copy(name, layer):
+            if name in chunked:
+                return chunked[name].load(layer)
             buffers = {
                 "q_b": (weights["q_b"].at[layer], q_buf, 2),
                 "w_uk": (weights["w_uk"].at[layer], w_uk_buf, 3),
                 "w_uv": (weights["w_uv"].at[layer], w_uv_buf, 4),
-                "o": (
-                    weights["o"].at[layer, :, pl.ds(0, o_buf.shape[-1])],
-                    o_buf.at[0] if streamed_o else o_buf,
-                    5,
-                ),
                 "gate": (weights["gate"].at[layer], gate_buf, 6),
                 "up": (weights["up"].at[layer], up_buf, 7),
-                "down": (
-                    weights["down"].at[layer, :, pl.ds(0, down_buf.shape[-1])],
-                    down_buf.at[0] if streamed else down_buf,
-                    SEM_DOWN,
-                ),
             }
             item = copy(*buffers[name])
             item.start()
             return item
 
+        # o / down held whole by KernelConfig.draft_whole_weights (more than
+        # two heads a rank): layer 0's copies start once q_b(0) has arrived,
+        # so their bytes do not slow it.
+        deferred = [
+            name for name, weight in chunked.items() if per > 2 and not weight.streamed
+        ]
         pending = {
             name: layer_copy(name, 0)
             for name in ("q_b", "w_uk", "w_uv", "o", "gate", "up", "down")
+            if name not in deferred
         }
 
         def refill(name, layer):
@@ -846,6 +892,9 @@ def _make_body(
             _phase_end(scope)
             scope = _phase_start("d_query")
             pending["q_b"].wait()
+            if layer == 0:
+                for name in deferred:
+                    pending[name] = layer_copy(name, 0)
             q = _bf16(
                 _dot(q_c, q_buf[...])
             )  # [group rows, dp Q_WIDTH]: each held shard's columns
@@ -922,15 +971,7 @@ def _make_body(
             pending["o"].wait()
             _phase_end(wuv_scope)
             x = _bf16(
-                _f32(x)
-                + all_reduce(
-                    attended,
-                    o_buf,
-                    1,
-                    refill=weights["o"].at[layer] if streamed_o else None,
-                    refill_sems=(5, SEM_O2),
-                    tag="o",
-                )
+                _f32(x) + all_reduce(attended, chunked["o"].chunks(layer), 1, tag="o")
             )
             refill("o", layer)
 
@@ -947,14 +988,7 @@ def _make_body(
             _phase_end(scope)
             scope = _phase_start("d_down")
             pending["down"].wait()
-            mlp = all_reduce(
-                activation,
-                down_buf,
-                0,
-                refill=weights["down"].at[layer] if streamed else None,
-                refill_sems=(SEM_DOWN, SEM_DOWN2),
-                tag="down",
-            )
+            mlp = all_reduce(activation, chunked["down"].chunks(layer), 0, tag="down")
             refill("down", layer)
             x = _bf16(_f32(x) + mlp)
             _phase_end(scope)
@@ -1102,7 +1136,10 @@ def fused_draft_local(
         )
     heads, group_rows = c.heads_per_rank * dp, T // dp
     packed = T * CHUNK // 256
-    streamed = T > 32 or c.heads_per_rank > 2  # as _make_body
+    # The body streams o / down iff their buffers hold two chunk slots.
+    streamed_o, streamed_down = streamed_weights(
+        c, T, dp, _config().draft_whole_weights
+    )
 
     def call(
         weights,
@@ -1168,14 +1205,14 @@ def fused_draft_local(
             tpu.VMEM((heads, c.kv_lora, c.v_head), jnp.bfloat16),  # w_uv_buf
             tpu.VMEM(
                 (2, heads * c.v_head, CHUNK)
-                if streamed or dp > 1
+                if streamed_o
                 else (heads * c.v_head, c.hidden),
                 jnp.bfloat16,
             ),  # o_buf (streamed: two chunk slots)
             tpu.VMEM((c.hidden, MLP_PADDED), jnp.bfloat16),  # gate_buf
             tpu.VMEM((c.hidden, MLP_PADDED), jnp.bfloat16),  # up_buf
             tpu.VMEM(
-                (2, MLP_PADDED, CHUNK) if streamed else (MLP_PADDED, c.hidden),
+                (2, MLP_PADDED, CHUNK) if streamed_down else (MLP_PADDED, c.hidden),
                 jnp.bfloat16,
             ),  # down_buf
             tpu.VMEM((c.markov_rank, c.vocab // RANKS), jnp.bfloat16),  # w2t_buf
