@@ -28,11 +28,10 @@ Variants (core 0 of each chip is side A, core 1 side B, unless noted):
   ici_*            the same between core 0 of two x-neighbour chips (ICI)
 
 Every kernel loops a runtime iteration count on the device. A variant runs at
-two counts; the per-iteration time is the difference of the two run times over
-the difference of the counts, so launch and sync costs cancel. Run times come
-from the device (each launch's module duration in an xprof trace, the slowest
-device) and from the host clock. Push variants check after the timing that
-each receiver's buffers hold its sibling's slabs.
+two counts (seven runs each, best of each); the per-iteration time is the
+difference of the two run times over the difference of the counts, so launch
+and sync costs cancel. Push variants check before the timing that each
+receiver's buffers hold its sibling's slabs.
 
     python3 bench_tpu7x_d2d.py                  # on a tpu7x host (8 devices)
     D2D_INTERPRET=1 python3 bench_tpu7x_d2d.py  # CPU interpret check (4 devices)
@@ -44,14 +43,11 @@ to ``$D2D_OUT/d2d_bench.jsonl``.
 
 from __future__ import annotations
 
-import glob
 import json
 import os
-import re
 import statistics
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 
@@ -708,47 +704,6 @@ def _check_pingpong(variant, host_sources, results, peers, roles, devices_count)
     return "ok"
 
 
-def _module_durations(trace_dir, name, launches):
-    """Per TPU device: durations (ns) of the variant's program launches, in
-    launch order, from the trace's module events (the trace holds only this
-    variant's launches)."""
-    files = sorted(
-        glob.glob(os.path.join(trace_dir, "**", "*.xplane.pb"), recursive=True)
-    )
-    if not files:
-        raise RuntimeError("no xplane.pb written")
-    data = jax.profiler.ProfileData.from_file(files[-1])
-    per_device = {}
-    for plane in data.planes:
-        if not re.fullmatch(r"/device:TPU:\d+", plane.name):
-            continue  # also skips the SparseCore planes
-        for line in plane.lines:
-            if line.name != "XLA Modules":
-                continue
-            events = sorted((e.start_ns, e.duration_ns, e.name) for e in line.events)
-            named = [ev for ev in events if name in ev[2]]
-            chosen = named if len(named) >= launches else events
-            per_device[plane.name] = [duration for _, duration, _ in chosen]
-    if not per_device:
-        names = [plane.name for plane in data.planes]
-        raise RuntimeError(f"no TPU module events (planes {names[:12]})")
-    return per_device
-
-
-def _summarize_device(per_device, n_low, n_high, reps):
-    """Per launch, the slowest device; median over launches; difference."""
-    usable = {k: v for k, v in per_device.items() if len(v) >= 2 * reps}
-    if not usable:
-        raise RuntimeError(
-            f"too few launches in trace: { {k: len(v) for k, v in per_device.items()} }"
-        )
-    low = [max(v[i] for v in usable.values()) for i in range(reps)]
-    high = [max(v[-reps + i] for v in usable.values()) for i in range(reps)]
-    low_median, high_median = statistics.median(low), statistics.median(high)
-    per_iteration_ns = (high_median - low_median) / (n_high - n_low)
-    return per_iteration_ns, low_median, high_median, len(usable)
-
-
 def _iteration_counts(variant):
     if MODE == "interpret":
         # D2D_INTERPRET_ITERS=low,high (default 1,2: no staging slot is rewritten,
@@ -756,10 +711,10 @@ def _iteration_counts(variant):
         low, high = os.environ.get("D2D_INTERPRET_ITERS", "1,2").split(",")
         return int(low), int(high)
     if variant["kind"] in ("pingpong", "sempp"):
-        return 200, 2200
+        return 200, 4200
     if variant["kind"] == "slablat":
-        return 32, 352
-    return 64, 768
+        return 32, 704
+    return 64, 1536
 
 
 def _bytes_per_iteration(variant, parts):
@@ -832,55 +787,39 @@ def run_variant(variant, mesh, devices, tables, out_path):
     if MODE == "interpret" and os.environ.get("D2D_INTERPRET_TIMING") != "1":
         print(f"{name:18s} interpret OK, data check: {check}", flush=True)
         return check
-    reps = 5
+    # The xprof profiler is not used: jax.profiler.start_trace segfaults on
+    # TPU in the sglang-torchtpu:20261017 image (PLUGIN_Profiler_Api size
+    # mismatch). The kernels loop on the device; differencing two counts
+    # cancels launch and sync costs.
+    reps = 7
     wall_low, wall_high = [], []
     for _ in range(reps):
         wall_low.append(run(n_low)[0])
         wall_high.append(run(n_high)[0])
     wall_ns = (min(wall_high) - min(wall_low)) / (n_high - n_low) * 1e9
-    device_ns, device_note = None, ""
-    try:
-        trace_dir = tempfile.mkdtemp(prefix=f"d2d_{name.replace('+', '_')}_")
-        jax.profiler.start_trace(trace_dir)
-        try:
-            for _ in range(reps):
-                run(n_low)
-            for _ in range(reps):
-                run(n_high)
-        finally:
-            jax.profiler.stop_trace()
-        per_device = _module_durations(trace_dir, "jit_body", 2 * reps)
-        device_ns, low_ns, high_ns, ndev = _summarize_device(
-            per_device, n_low, n_high, reps
-        )
-        device_note = (
-            f"device launches {low_ns / 1e3:.1f} us @{n_low} / {high_ns / 1e3:.1f} us @{n_high} "
-            f"({ndev} devices)"
-        )
-    except Exception as exc:  # the host clock still gives a number
-        device_note = (
-            f"device timing unavailable: {type(exc).__name__}: {str(exc)[:200]}"
-        )
-    per_ns = device_ns if device_ns is not None else wall_ns
+    median_ns = (
+        (statistics.median(wall_high) - statistics.median(wall_low))
+        / (n_high - n_low)
+        * 1e9
+    )
     nbytes = _bytes_per_iteration(variant, parts)
-    rate = f"{nbytes / per_ns:7.3f} TB/s" if nbytes else "       -    "
+    rate = f"{nbytes / wall_ns:7.3f} TB/s" if nbytes else "       -    "
     print(
-        f"{name:18s} {per_ns / 1e3:9.3f} us/iter  {rate}  (host clock {wall_ns / 1e3:.3f} us/iter; "
-        f"{nbytes} B/iter; check {check}; compile {compile_s:.1f} s)\n"
-        f"{'':18s} {device_note}",
+        f"{name:18s} {wall_ns / 1e3:9.3f} us/iter  {rate}  (medians {median_ns / 1e3:.3f} "
+        f"us/iter; runs {min(wall_low) * 1e3:.3f} ms @{n_low}, {min(wall_high) * 1e3:.3f} ms "
+        f"@{n_high}; {nbytes} B/iter; check {check}; compile {compile_s:.1f} s)",
         flush=True,
     )
     record = dict(
         name=name,
         variant=variant,
         bytes_per_iteration=nbytes,
-        device_us_per_iteration=None if device_ns is None else device_ns / 1e3,
-        host_us_per_iteration=wall_ns / 1e3,
-        tb_per_s=(nbytes / per_ns) if nbytes else None,
+        us_per_iteration=wall_ns / 1e3,
+        median_us_per_iteration=median_ns / 1e3,
+        tb_per_s=(nbytes / wall_ns) if nbytes else None,
         iterations=[n_low, n_high],
         wall_low_s=wall_low,
         wall_high_s=wall_high,
-        device_note=device_note,
         check=check,
         peers=list(map(int, peers)),
         roles=list(map(int, roles)),
