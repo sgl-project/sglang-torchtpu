@@ -18,18 +18,15 @@ from __future__ import annotations
 
 import torch
 
-from sglang.srt.layers.engram import EngramHasher
 from sglang_tpu.models.deepseek_v41.attention_backend import apply_rope
 
-# Verify commits not yet applied to the host history, oldest first.
-EngramHasher.tpu_pending_commits = ()
 
+def serves_dspark_draft() -> bool:
+    """Whether the forward runs on the CSA2 backend these draft pieces call into."""
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+    from sglang_tpu.models.deepseek_v41.attention_backend import DSV41TPUAttnBackend
 
-def is_dsv41_dspark_draft(model) -> bool:
-    return (
-        type(model).__name__ == "DeepseekV4ForCausalLMDSpark"
-        and model.config.model_type == "deepseek_v41"
-    )
+    return isinstance(get_attn_backend(), DSV41TPUAttnBackend)
 
 
 def dspark_attention_forward(attn, positions, hidden_states, forward_batch):
@@ -93,8 +90,9 @@ def greedy_markov_drafts(
     """[bs, gamma] greedy drafts from the [bs * width, H] block hidden.
 
     The Markov embedding is a one-hot matmul instead of a gather: an unsharded
-    BF16 table gathered inside the TP1/DP8 compiled graph returned wrong rows
-    with int32 indices. With one 1.0 per row it is exact.
+    BF16 table gathered inside the TP1/DP8 compiled graph returns wrong rows,
+    with int32 and int64 ids alike (DeepseekV4DecoderTpuCompilePolicy). With one
+    1.0 per row it is exact.
     """
     width = block_width(model)
     gamma = model.gamma
@@ -172,74 +170,20 @@ def write_context_kv(
     return pages[:1, :1].to(torch.float32).sum(dim=(1, 2))
 
 
-def commit_engram_history(
-    hasher,
-    *,
-    bonus_tokens: torch.Tensor,
-    accept_tokens: torch.Tensor,
-    accept_lens: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-) -> None:
-    """Advance each request's Engram history past its committed verify tokens.
+def embed_draft_tokens_outside_graph(model, prepare):
+    """``prepare_forward_batch`` that also looks the draft tokens up eagerly.
 
-    The verify window is [r, d_1..d_N]; a request commits r and its correct
-    drafts (accept_lens tokens; accept_tokens holds the correct drafts first),
-    so its history becomes the last n - 1 of history + committed, oldest first,
-    as core EngramHasher.commit_after_verify. Padded rows (accept_lens 0) write
-    the hasher's pad row.
+    The draft embeds with the target's unsharded BF16 table, which the TP1/DP8
+    compiled graph gathers wrong rows from (DeepseekV4DecoderTpuCompilePolicy
+    embeds the target outside the graph for the same reason). The rows enter as
+    input_embeds spread over hc_mult, as forward_embed would return them.
     """
-    history = hasher.history
-    # The shared host Engram table hashes on CPU, so history may live there
-    # while the accept tensors come from the TPU verify.
-    device = history.device
-    bonus_tokens, accept_tokens, accept_lens, req_pool_indices = (
-        t.to(device)
-        for t in (bonus_tokens, accept_tokens, accept_lens, req_pool_indices)
-    )
-    n1 = hasher.max_ngram_size - 1
-    req = req_pool_indices.to(torch.int64)
-    window = torch.cat(
-        [
-            history[req],
-            bonus_tokens.view(-1, 1).to(history.dtype),
-            accept_tokens.clamp_min(0).to(history.dtype),
-        ],
-        dim=1,
-    )
-    cols = accept_lens.to(torch.int64).unsqueeze(-1) + torch.arange(
-        n1, device=window.device
-    )
-    values = window.gather(1, cols)
-    rows = torch.where(accept_lens > 0, req, torch.full_like(req, hasher.pad_row))
-    history.copy_(history.index_put((rows,), values))
 
+    def prepare_forward_batch(forward_batch) -> None:
+        prepare(forward_batch)
+        if forward_batch.input_embeds is None:
+            with torch.no_grad():
+                embeds = model.embed_tokens(forward_batch.input_ids)
+            forward_batch.input_embeds = embeds.unsqueeze(1).repeat(1, model.hc_mult, 1)
 
-def defer_engram_commit(
-    hasher,
-    *,
-    bonus_tokens: torch.Tensor,
-    accept_tokens: torch.Tensor,
-    accept_lens: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-) -> None:
-    """Queue a verify's Engram commit for flush_engram_commits.
-
-    The history lives on the host, so committing in the verify step copies the
-    verify outputs back and blocks the host until the verify finishes; the
-    next reader of the history runs after the next draft is dispatched.
-    """
-    commit = (bonus_tokens, accept_tokens, accept_lens, req_pool_indices)
-    hasher.tpu_pending_commits = (*hasher.tpu_pending_commits, commit)
-
-
-def flush_engram_commits(hasher) -> None:
-    """Apply the queued verify commits in order; call before reading or writing history."""
-    pending, hasher.tpu_pending_commits = hasher.tpu_pending_commits, ()
-    for bonus_tokens, accept_tokens, accept_lens, req_pool_indices in pending:
-        commit_engram_history(
-            hasher,
-            bonus_tokens=bonus_tokens,
-            accept_tokens=accept_tokens,
-            accept_lens=accept_lens,
-            req_pool_indices=req_pool_indices,
-        )
+    return prepare_forward_batch

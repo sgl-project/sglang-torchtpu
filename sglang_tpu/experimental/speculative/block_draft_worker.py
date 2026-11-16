@@ -22,6 +22,7 @@ from sglang_tpu.experimental.compilation.block_compile_policy import (
 )
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import sample_tokens
+from sglang_tpu.experimental.speculative.spec_types import AcceptResult, SpecState
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 # (step_logits [pbs, V], step_idx) -> sampled [pbs] tokens.
@@ -143,6 +144,14 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         )
         assert tail is not None
         return tail
+
+    def after_commit(self, *, state: SpecState, accept: AcceptResult) -> None:
+        """Called by TpuBlockSpecWorker.commit after the draft KV write.
+
+        For per-request target state the commit must advance beside the KV, from
+        the step's state (bonus_tokens, req_pool_indices) and its accept. Noop.
+        """
+        del state, accept
 
     def _write_draft_kv_eager(
         self,

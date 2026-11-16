@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
+import weakref
 from dataclasses import dataclass, is_dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -1239,3 +1240,87 @@ def without_cuda_host_register():
         yield
     finally:
         torch.cuda.cudart = original
+
+
+# hasher -> verify commits not yet applied to its host history, oldest first.
+_PENDING_COMMITS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def commit_engram_history(
+    hasher,
+    *,
+    bonus_tokens: torch.Tensor,
+    accept_tokens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+) -> None:
+    """Advance each request's Engram history past its committed verify tokens.
+
+    The verify window is [r, d_1..d_N]; a request commits r and its correct
+    drafts (accept_lens tokens; accept_tokens holds the correct drafts first),
+    so its history becomes the last n - 1 of history + committed, oldest first,
+    as core EngramHasher.commit_after_verify. Padded rows (accept_lens 0) write
+    the hasher's pad row.
+    """
+    history = hasher.history
+    # The history lives on the host; the accept tensors come from the verify.
+    device = history.device
+    bonus_tokens, accept_tokens, accept_lens, req_pool_indices = (
+        t.to(device)
+        for t in (bonus_tokens, accept_tokens, accept_lens, req_pool_indices)
+    )
+    n1 = hasher.max_ngram_size - 1
+    req = req_pool_indices.to(torch.int64)
+    window = torch.cat(
+        [
+            history[req],
+            bonus_tokens.view(-1, 1).to(history.dtype),
+            accept_tokens.clamp_min(0).to(history.dtype),
+        ],
+        dim=1,
+    )
+    cols = accept_lens.to(torch.int64).unsqueeze(-1) + torch.arange(
+        n1, device=window.device
+    )
+    values = window.gather(1, cols)
+    rows = torch.where(accept_lens > 0, req, torch.full_like(req, hasher.pad_row))
+    history.copy_(history.index_put((rows,), values))
+
+
+def defer_engram_commit(
+    hasher,
+    *,
+    bonus_tokens: torch.Tensor,
+    accept_tokens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+) -> None:
+    """Queue a verify's Engram commit for flush_engram_commits.
+
+    Committing in the verify step copies the verify outputs to the host and
+    blocks it until the verify finishes; the next reader of the history runs
+    after the next draft is dispatched.
+    """
+    commit = (bonus_tokens, accept_tokens, accept_lens, req_pool_indices)
+    _PENDING_COMMITS.setdefault(hasher, []).append(commit)
+
+
+def has_pending_engram_commits(hasher) -> bool:
+    return bool(_PENDING_COMMITS.get(hasher))
+
+
+def flush_engram_commits(hasher) -> None:
+    """Apply the queued verify commits in order; call before reading or writing history."""
+    for (
+        bonus_tokens,
+        accept_tokens,
+        accept_lens,
+        req_pool_indices,
+    ) in _PENDING_COMMITS.pop(hasher, ()):
+        commit_engram_history(
+            hasher,
+            bonus_tokens=bonus_tokens,
+            accept_tokens=accept_tokens,
+            accept_lens=accept_lens,
+            req_pool_indices=req_pool_indices,
+        )

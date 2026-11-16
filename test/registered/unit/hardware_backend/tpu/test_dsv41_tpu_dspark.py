@@ -3,10 +3,11 @@
 
 Guards the conventions TpuBlockSpecWorker and the CSA2 backend rely on: which
 verify rows the draft context-KV commit writes, the target Engram history after
-a partial accept (against core EngramHasher.commit_after_verify), the in-graph
-one-hot Markov chain (against the gather form), the draft attention handing
-the backend output to wo_a without a second inverse RoPE, and the draft graph
-input shim never reaching for the target-only Engram hasher.
+a partial accept (against core EngramHasher.commit_after_verify) and its
+deferral to the next host read, the in-graph one-hot Markov chain (against the
+gather form), the draft attention handing the backend output to wo_a without a
+second inverse RoPE, the draft embedding looked up outside the graph, and the
+drafter registration for CSA2 targets.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -21,7 +22,7 @@ import torch
 
 from sglang.srt.layers.engram import EngramHasher
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.models.deepseek_v41 import dspark, hooks
+from sglang_tpu.models.deepseek_v41 import dspark, engram_host, hooks
 
 
 class TestSwaCommitRecords(CustomTestCase):
@@ -70,7 +71,7 @@ class TestCommitEngramHistory(CustomTestCase):
 
         hasher = _hasher(num_slots, n)
         hasher.history[req] = history
-        dspark.commit_engram_history(
+        engram_host.commit_engram_history(
             hasher,
             bonus_tokens=bonus,
             accept_tokens=accept_tokens,
@@ -85,7 +86,7 @@ class TestCommitEngramHistory(CustomTestCase):
         overwrite it."""
         hasher = _hasher(4, 3)
         hasher.history[0] = torch.tensor([7, 8], dtype=torch.int32)
-        dspark.commit_engram_history(
+        engram_host.commit_engram_history(
             hasher,
             bonus_tokens=torch.tensor([5]),
             accept_tokens=torch.tensor([[-1, -1]]),
@@ -101,12 +102,13 @@ class TestDeferredEngramCommit(CustomTestCase):
     core's by the time the next target forward or a PD prebuilt batch reads it."""
 
     def _commit(self, hasher):
-        worker = SimpleNamespace(
-            target_worker=SimpleNamespace(
-                model_runner=SimpleNamespace(
-                    model=SimpleNamespace(model=SimpleNamespace(engram_hasher=hasher))
-                )
-            )
+        from sglang_tpu.models.deepseek_v41.dspark_drafter import (
+            TpuDsv41DsparkDraftWorker,
+        )
+
+        drafter = object.__new__(TpuDsv41DsparkDraftWorker)
+        drafter._target_runner = SimpleNamespace(
+            ngram_embedding_manager=SimpleNamespace(engram_hasher=hasher)
         )
         state = SimpleNamespace(
             bonus_tokens=torch.tensor([10, 20]), req_pool_indices=torch.tensor([2, 5])
@@ -115,11 +117,7 @@ class TestDeferredEngramCommit(CustomTestCase):
             accept_tokens=torch.tensor([[11, 12, 99, -1], [77, -1, -1, -1]]),
             accept_lens=torch.tensor([3, 1], dtype=torch.int32),
         )
-        original = mock.MagicMock(return_value="committed")
-        out = hooks.tpu_dsv41_commit_engram_history(
-            original, worker, None, state, None, None, None, accept
-        )
-        self.assertEqual(out, "committed")
+        drafter.after_commit(state=state, accept=accept)
 
     def _reference(self, n, num_slots, history):
         reference = _hasher(num_slots, n)
@@ -140,29 +138,43 @@ class TestDeferredEngramCommit(CustomTestCase):
         before = hasher.history.clone()
         self._commit(hasher)
         torch.testing.assert_close(hasher.history, before)
-        dspark.flush_engram_commits(hasher)
+        self.assertTrue(engram_host.has_pending_engram_commits(hasher))
+        engram_host.flush_engram_commits(hasher)
         torch.testing.assert_close(
             hasher.history, self._reference(n, num_slots, history)
         )
-        self.assertEqual(hasher.tpu_pending_commits, ())
+        self.assertFalse(engram_host.has_pending_engram_commits(hasher))
 
     def test_queued_commits_apply_in_verify_order(self):
         hasher = _hasher(4, 3)
         for bonus in (5, 6):
-            dspark.defer_engram_commit(
+            engram_host.defer_engram_commit(
                 hasher,
                 bonus_tokens=torch.tensor([bonus]),
                 accept_tokens=torch.tensor([[bonus + 1, -1]]),
                 accept_lens=torch.tensor([1], dtype=torch.int32),
                 req_pool_indices=torch.tensor([1]),
             )
-        dspark.flush_engram_commits(hasher)
+        engram_host.flush_engram_commits(hasher)
         # Each commit appends its anchor: [0, 0] -> [0, 5] -> [5, 6].
         self.assertEqual(hasher.history[1].tolist(), [5, 6])
 
+    def test_target_without_engram_queues_nothing(self):
+        from sglang_tpu.models.deepseek_v41.dspark_drafter import (
+            TpuDsv41DsparkDraftWorker,
+        )
+
+        drafter = object.__new__(TpuDsv41DsparkDraftWorker)
+        drafter._target_runner = SimpleNamespace(
+            ngram_embedding_manager=SimpleNamespace(engram_hasher=None)
+        )
+        with mock.patch.object(engram_host, "defer_engram_commit") as defer:
+            drafter.after_commit(state=None, accept=None)
+        defer.assert_not_called()
+
     def test_prebuilt_history_write_follows_queued_commits(self):
         hasher = _hasher(4, 3)
-        dspark.defer_engram_commit(
+        engram_host.defer_engram_commit(
             hasher,
             bonus_tokens=torch.tensor([5]),
             accept_tokens=torch.tensor([[-1, -1]]),
@@ -306,41 +318,73 @@ class TestDsparkAttention(CustomTestCase):
 
 
 class TestDrafterSelection(CustomTestCase):
-    def test_only_v41_dspark_targets_get_the_v41_drafter(self):
+    def test_csa2_dspark_targets_get_the_moe_drafter(self):
+        """The MoE drafter is registered once and serves only targets on the
+        CSA2 backend (ratio-1/2 layers); other DSPARK targets keep the built-in."""
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang_tpu.models.deepseek_v41 import dspark_drafter
+        from sglang_tpu import experimental
 
-        def runner(model_type):
-            return SimpleNamespace(
-                model_config=SimpleNamespace(
-                    hf_config=SimpleNamespace(model_type=model_type)
-                )
+        def runner(ratios):
+            return SimpleNamespace(model_config=SimpleNamespace(compress_ratios=ratios))
+
+        dspark_alg = SpeculativeAlgorithm.DSPARK
+        with mock.patch.dict(experimental._BLOCK_DRAFT_WORKERS, clear=True):
+            hooks.register_tpu_dsv41_draft_workers()
+            hooks.register_tpu_dsv41_draft_workers()
+            entries = experimental.registered_block_draft_workers(dspark_alg)
+            self.assertEqual(len(entries), 1)
+            matches, _ = entries[0]
+            self.assertTrue(matches(runner([0, 1, 2, 0])))
+            self.assertFalse(matches(runner([0, 4, 128])))
+            self.assertFalse(matches(SimpleNamespace(model_config=SimpleNamespace())))
+            self.assertEqual(
+                experimental.registered_block_draft_workers(
+                    SpeculativeAlgorithm.DFLASH
+                ),
+                (),
             )
 
-        original = mock.MagicMock(return_value="built-in")
-        with mock.patch.object(
-            dspark_drafter, "TpuDsv41DsparkDraftWorker", return_value="v41"
+
+class TestDraftEmbedsOutsideGraph(CustomTestCase):
+    def test_draft_tokens_enter_as_hc_spread_input_embeds(self):
+        """The TP1/DP8 graph gathers wrong rows from the unsharded embedding
+        (PR1 1e68ff41eb); the draft must get its embedding from outside the
+        graph, after the policy's own prepare, spread over hc_mult."""
+        model = SimpleNamespace(embed_tokens=torch.nn.Embedding(10, 3), hc_mult=4)
+        calls = []
+        prepare = dspark.embed_draft_tokens_outside_graph(
+            model, lambda fb: calls.append(fb.input_embeds)
+        )
+        ids = torch.tensor([1, 2, 7])
+        batch = SimpleNamespace(input_ids=ids, input_embeds=None)
+        prepare(batch)
+        self.assertEqual(calls, [None])
+        expected = model.embed_tokens(ids).unsqueeze(1).repeat(1, 4, 1)
+        torch.testing.assert_close(batch.input_embeds, expected)
+
+    def test_given_embeds_are_kept(self):
+        model = SimpleNamespace(embed_tokens=mock.MagicMock(), hc_mult=4)
+        prepare = dspark.embed_draft_tokens_outside_graph(model, lambda fb: None)
+        given = torch.zeros(2, 4, 3)
+        batch = SimpleNamespace(input_ids=torch.tensor([1, 2]), input_embeds=given)
+        prepare(batch)
+        self.assertIs(batch.input_embeds, given)
+        model.embed_tokens.assert_not_called()
+
+
+class TestDsparkHooksGate(CustomTestCase):
+    def test_other_backends_keep_the_core_forward(self):
+        """The draft hooks key on the CSA2 backend, not on model_type."""
+        original = mock.MagicMock(return_value="core")
+        with mock.patch(
+            "sglang.srt.model_executor.forward_context.get_attn_backend",
+            return_value=object(),
         ):
-            pick = hooks.tpu_dsv41_create_draft_worker
-            dspark_alg = SpeculativeAlgorithm.DSPARK
-            self.assertEqual(
-                pick(
-                    original, algorithm=dspark_alg, target_runner=runner("deepseek_v41")
-                ),
-                "v41",
+            out = hooks.tpu_dsv41_dspark_attention(
+                original, "attn", "pos", torch.zeros(1), "fb"
             )
-            self.assertEqual(
-                pick(original, algorithm=dspark_alg, target_runner=runner("qwen3")),
-                "built-in",
-            )
-            self.assertEqual(
-                pick(
-                    original,
-                    algorithm=SpeculativeAlgorithm.DFLASH,
-                    target_runner=runner("deepseek_v41"),
-                ),
-                "built-in",
-            )
+        self.assertEqual(out, "core")
+        original.assert_called_once()
 
 
 class TestDraftEpLocalNames(CustomTestCase):
@@ -395,6 +439,8 @@ class TestGetLastLocOffCuda(CustomTestCase):
     def test_host_tensors_skip_the_triton_kernel(self):
         """Spec decode allocation on TPU called the Triton get_last_loc
         ("0 active drivers"); host tensors must take the torch lookup."""
+        from sglang_tpu.hooks.dsv4 import tpu_dsv4_get_last_loc
+
         req_to_token = torch.arange(12, dtype=torch.int32).view(3, 4)
         rows = torch.tensor([2, 0])
         lens = torch.tensor([3, 0], dtype=torch.int32)
@@ -402,7 +448,7 @@ class TestGetLastLocOffCuda(CustomTestCase):
         def triton(*args):
             raise AssertionError("Triton get_last_loc called off CUDA")
 
-        out = hooks.tpu_dsv41_get_last_loc(triton, req_to_token, rows, lens)
+        out = tpu_dsv4_get_last_loc(triton, req_to_token, rows, lens)
         self.assertEqual(out.tolist(), [10, -1])
 
 

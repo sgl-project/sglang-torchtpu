@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import functools
 import itertools
-from collections.abc import Callable
 
 import torch
 
@@ -42,6 +41,7 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.experimental import registered_block_draft_workers
 from sglang_tpu.experimental.speculative.base_spec_worker import (
     TpuSpecWorker,
 )
@@ -85,35 +85,12 @@ _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
     SpeculativeAlgorithm.DSPARK: TpuDsparkDraftWorker,
 }
 
-# (target runner) -> whether the registered drafter serves this target.
-BlockDraftWorkerMatcher = Callable[[ModelRunner], bool]
-# (target runner) -> the drafter; it builds the draft ModelRunner.
-BlockDraftWorkerFactory = Callable[[ModelRunner], TpuBlockDraftWorker]
-
-_DRAFT_WORKER_OVERRIDES: dict[
-    SpeculativeAlgorithm, list[tuple[BlockDraftWorkerMatcher, BlockDraftWorkerFactory]]
-] = {}
-
-
-def register_block_draft_worker(
-    *,
-    algorithm: SpeculativeAlgorithm,
-    matches: BlockDraftWorkerMatcher,
-    factory: BlockDraftWorkerFactory,
-) -> None:
-    """Serve `algorithm` with `factory(target_runner)` when `matches(target_runner)`.
-
-    The first registration that matches wins; otherwise _DRAFT_WORKER_CLS applies.
-    The draft ModelRunner does not exist yet when this runs, so `matches` can only
-    read the target runner.
-    """
-    _DRAFT_WORKER_OVERRIDES.setdefault(algorithm, []).append((matches, factory))
-
 
 def _create_draft_worker(
     *, algorithm: SpeculativeAlgorithm, target_runner: ModelRunner
 ) -> TpuBlockDraftWorker:
-    for matches, factory in _DRAFT_WORKER_OVERRIDES.get(algorithm, ()):
+    """A drafter from sglang_tpu.experimental.register_block_draft_worker, else the built-in one."""
+    for matches, factory in registered_block_draft_workers(algorithm):
         if matches(target_runner):
             return factory(target_runner)
     return _DRAFT_WORKER_CLS[algorithm](target_runner)
@@ -283,6 +260,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 cache_loc_2d=rows.cache_locs,
                 commit_lens=accept.accept_lens,
             )
+        self._block_draft_worker.after_commit(state=state, accept=accept)
         # Verify rows past the new seq_lens become dead target KV; freeing them is the allocator's job.
         next_state = SpecState(
             bonus_tokens=accept.bonus_tokens,

@@ -47,7 +47,6 @@ from sglang_tpu.compilation.compiled_forward_shim import CompiledForwardShim
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.models.deepseek_v41 import engram_host
-from sglang_tpu.models.deepseek_v41.dspark import flush_engram_commits
 
 
 def _stage_host_engram(coordinator, hasher, input_ids, forward_batch):
@@ -56,7 +55,7 @@ def _stage_host_engram(coordinator, hasher, input_ids, forward_batch):
     device = input_ids.device
     # DSpark verify commits wait here, after the next draft is dispatched; both
     # paths below read or write hasher.history.
-    flush_engram_commits(hasher)
+    engram_host.flush_engram_commits(hasher)
     if coordinator.started:
         staged, uploads, num_cols = coordinator.stage_all(padded_tokens)
     else:

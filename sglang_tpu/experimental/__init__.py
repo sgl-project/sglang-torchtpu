@@ -1,11 +1,49 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.envs import envs as tpu_envs
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang_tpu.experimental.speculative.block_draft_worker import (
+        TpuBlockDraftWorker,
+    )
+
+# (target runner) -> whether the registered drafter serves this target.
+BlockDraftWorkerMatcher = Callable[["ModelRunner"], bool]
+# (target runner) -> the drafter; it builds the draft ModelRunner.
+BlockDraftWorkerFactory = Callable[["ModelRunner"], "TpuBlockDraftWorker"]
+
+_BLOCK_DRAFT_WORKERS: dict[
+    SpeculativeAlgorithm, list[tuple[BlockDraftWorkerMatcher, BlockDraftWorkerFactory]]
+] = {}
+
+
+def register_block_draft_worker(
+    *,
+    algorithm: SpeculativeAlgorithm,
+    matches: BlockDraftWorkerMatcher,
+    factory: BlockDraftWorkerFactory,
+) -> None:
+    """Serve `algorithm` with `factory(target_runner)` when `matches(target_runner)`.
+
+    The first registration that matches wins; otherwise TpuBlockSpecWorker uses
+    its built-in drafter. Registering does not import the speculative package,
+    and the draft ModelRunner does not exist yet when `matches` runs, so it can
+    only read the target runner.
+    """
+    _BLOCK_DRAFT_WORKERS.setdefault(algorithm, []).append((matches, factory))
+
+
+def registered_block_draft_workers(
+    algorithm: SpeculativeAlgorithm,
+) -> tuple[tuple[BlockDraftWorkerMatcher, BlockDraftWorkerFactory], ...]:
+    return tuple(_BLOCK_DRAFT_WORKERS.get(algorithm, ()))
+
 
 # (host req_pool_indices [bs], host draft hidden [bs, H],
 #  host DSA top-k seeds [bs, W] or None) -> None.

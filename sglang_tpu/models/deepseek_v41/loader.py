@@ -10,13 +10,13 @@ streams only its ``mtp.*`` tensors (``_draft_weights``).
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import torch
 
 from sglang_tpu._logging import get_logger
+from sglang_tpu.ep_local_expert_reader import local_expert_id
 from sglang_tpu.ep_weight_shard import INDEX_NAME, EPLocalRunaiModelStreamerLoader
 from sglang_tpu.models.deepseek_v41.engram_row_reader import (
     is_engram_table,
@@ -27,6 +27,15 @@ logger = get_logger(__name__)
 
 # DeepseekV4ForCausalLM.load_weights skips every MTP tensor of the target model.
 _MTP_PREFIX = "mtp."
+_DSPARK_DRAFT_ARCH = "DeepseekV4ForCausalLMDSpark"
+
+
+def is_bundled_dspark_draft(model_config) -> bool:
+    """The DSpark head bundled in a V4-family checkpoint (core remaps its arch)."""
+    return bool(
+        getattr(model_config, "is_draft_model", False)
+        and _DSPARK_DRAFT_ARCH in model_config.hf_config.architectures
+    )
 
 
 class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
@@ -35,10 +44,8 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
     _plans_without_expert_range = True
 
     def _get_weights_iterator(self, source):
-        config = getattr(source.model_config, "hf_config", None)
         if (
-            getattr(source.model_config, "is_draft_model", False)
-            and getattr(config, "model_type", None) == "deepseek_v41"
+            is_bundled_dspark_draft(source.model_config)
             and self.load_config.draft_model_idx is None
         ):
             yield from self._draft_weights(source)
@@ -111,11 +118,6 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
                 yield source.prefix + name, tensor
 
 
-_DRAFT_EXPERT = re.compile(
-    r"^mtp\.(0|[1-9]\d*)\.ffn\.experts\.(0|[1-9]\d*)\.w[123]\.(weight|scale)$"
-)
-
-
 def _draft_ep_local_names(names: set[str], *, config) -> tuple[set[str], int]:
     """Drop the draft's routed experts outside this EP rank's range.
 
@@ -132,23 +134,19 @@ def _draft_ep_local_names(names: set[str], *, config) -> tuple[set[str], int]:
         getattr(config, "dspark_n_routed_experts", 0) or config.n_routed_experts
     )
     if ep_size <= 1:
-        experts = sum(1 for n in names if _DRAFT_EXPERT.fullmatch(n))
-        return names, experts
-    if num_experts % ep_size:
-        raise ValueError(
-            f"DSpark draft: {num_experts} routed experts do not divide EP {ep_size}"
-        )
-    local = num_experts // ep_size
-    lo, hi = ep_rank * local, (ep_rank + 1) * local
+        expert_range = (0, num_experts)
+    else:
+        if num_experts % ep_size:
+            raise ValueError(
+                f"DSpark draft: {num_experts} routed experts do not divide EP {ep_size}"
+            )
+        local = num_experts // ep_size
+        expert_range = (ep_rank * local, (ep_rank + 1) * local)
     kept, experts = set(), 0
     for name in names:
-        match = _DRAFT_EXPERT.fullmatch(name)
-        if match is not None:
-            expert = int(match[2])
-            if expert >= num_experts:
-                raise ValueError(f"DSpark draft expert outside the config: {name}")
-            if not lo <= expert < hi:
-                continue
-            experts += 1
+        expert = local_expert_id(name, expert_range)
+        if expert == -1:
+            continue
+        experts += expert is not None
         kept.add(name)
     return kept, experts

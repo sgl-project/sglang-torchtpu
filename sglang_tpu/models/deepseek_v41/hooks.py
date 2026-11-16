@@ -111,44 +111,24 @@ tpu_dsv41_dspark_attention, tpu_dsv41_dspark_forward
        writer and inverse-rotates its output, which CSA2 already does; the
        draft forward returns no next_draft_tokens, which TpuBlockSpecWorker
        reads for greedy drafts.
-  How: AROUND both for the V4.1 draft off CUDA (dspark.py): attention goes
-       through the backend's prepare_mqa_qkv and non-causal forward, then
-       wo_a / wo_b; the forward appends the greedy Markov chain in-graph, as
-       vllm-torchtpu models/vllm/deepseek_v41/v2/dspark.py does.
+  How: AROUND both when the forward runs on the CSA2 backend
+       (DSV41TPUAttnBackend; dspark.py): attention goes through the backend's
+       prepare_mqa_qkv and non-causal forward, then wo_a / wo_b; the forward
+       appends the greedy Markov chain in-graph, as vllm-torchtpu
+       models/vllm/deepseek_v41/v2/dspark.py does.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
   Remove when: DSparkAttention reads its KV write and inverse RoPE from the
        attention backend and the V4 draft returns draft tokens.
 
-tpu_dsv41_create_draft_worker
-  Why: TpuBlockSpecWorker's DSPARK drafter accepts only the dense
-       DSparkDraftModel; the V4.1 draft is the MoE DeepseekV4ForCausalLMDSpark.
-  How: AROUND block_spec_worker._create_draft_worker returns
-       TpuDsv41DsparkDraftWorker (dspark_drafter.py, imported lazily) for a
-       V4.1 target; other targets keep the built-in drafter.
+tpu_dsv41_flush_engram_before_prebuilt
+  Why: TpuDsv41DsparkDraftWorker.after_commit queues each verify's Engram
+       history commit and the next target forward's host Engram staging
+       applies the queue (engram_host); a PD prebuilt batch writes history rows
+       in NgramEmbeddingManager._prepare_engram_history without staging.
+  How: AROUND _prepare_engram_history applies the queued commits first for a
+       prebuilt batch.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
-  Remove when: the block worker selects drafters by draft model class.
-
-tpu_dsv41_commit_engram_history, tpu_dsv41_flush_engram_before_prebuilt
-  Why: the target's Engram history must advance past the tokens each verify
-       commits; core does it in DSparkWorkerV2 (update_after_verify), which
-       TpuBlockSpecWorker replaces, and a verify forward commits nothing.
-  How: AROUND TpuBlockSpecWorker.commit queues the anchor and correct drafts
-       on the hasher; the host Engram staging of the next target forward
-       (DeepseekV4DecoderTpuCompilePolicy._stage_engram_rows) applies them, so
-       the verify outputs are read back only after the next draft is
-       dispatched. tpu_dsv41_flush_engram_before_prebuilt applies them before a
-       PD prebuilt batch writes history rows itself.
-  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
-  Remove when: TpuSpecWorker commits the target's Engram history itself.
-
-tpu_dsv41_get_last_loc
-  Why: get_last_loc picks the Triton kernel unless the attention backend name
-       is in its non-Triton list; "dsv4" is not, so the spec decode allocation
-       (allocate_and_assign_decode_cache) launches Triton on TPU and fails with
-       "0 active drivers".
-  How: AROUND get_last_loc sends non-CUDA tensors to get_last_loc_torch.
-  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
-  Remove when: get_last_loc dispatches on the tensor device, not backend names.
+  Remove when: the Engram history lives on the device and commits in-graph.
 """
 
 from __future__ import annotations
@@ -188,20 +168,18 @@ def select_tpu_dsv41_loader(result, load_config, model_config=None):
     if (
         type(result) not in (RunaiModelStreamerLoader, EPLocalRunaiModelStreamerLoader)
         or model_config is None
-        # Without Engram tables the generic EP-local loader does everything;
-        # the bundled V4.1 DSpark draft comes here to stream only mtp.*.
-        or not (
-            model_config.use_engram
-            or (
-                model_config.is_draft_model
-                and model_config.hf_config.model_type == "deepseek_v41"
-            )
-        )
         or load_config.draft_model_idx is not None
     ):
         return result
-    # The DSpark draft also comes here: the loader streams only its mtp.* tensors.
-    from sglang_tpu.models.deepseek_v41.loader import DSV41RunaiModelStreamerLoader
+    from sglang_tpu.models.deepseek_v41.loader import (
+        DSV41RunaiModelStreamerLoader,
+        is_bundled_dspark_draft,
+    )
+
+    # Without Engram tables the generic EP-local loader does everything; a
+    # bundled DSpark draft comes here to stream only its mtp.* tensors.
+    if not (model_config.use_engram or is_bundled_dspark_draft(model_config)):
+        return result
 
     return DSV41RunaiModelStreamerLoader(load_config)
 
@@ -380,11 +358,14 @@ def tpu_dsv41_engram_embed_forward(
 
 
 def tpu_dsv41_dspark_attention(original, attn, positions, hidden_states, forward_batch):
-    """AROUND DSparkAttention.forward: the V4.1 draft on the CSA2 backend."""
-    if not attn.is_dsv41 or hidden_states.is_cuda:
-        return original(attn, positions, hidden_states, forward_batch)
-    from sglang_tpu.models.deepseek_v41.dspark import dspark_attention_forward
+    """AROUND DSparkAttention.forward: the draft on the CSA2 backend."""
+    from sglang_tpu.models.deepseek_v41.dspark import (
+        dspark_attention_forward,
+        serves_dspark_draft,
+    )
 
+    if hidden_states.is_cuda or not serves_dspark_draft():
+        return original(attn, positions, hidden_states, forward_batch)
     return dspark_attention_forward(attn, positions, hidden_states, forward_batch)
 
 
@@ -392,70 +373,65 @@ def tpu_dsv41_dspark_forward(original, model, input_ids, positions, *args, **kwa
     """AROUND DeepseekV4ForCausalLMDSpark.forward: add the greedy drafts."""
     from sglang_tpu.models.deepseek_v41.dspark import (
         dspark_forward,
-        is_dsv41_dspark_draft,
+        serves_dspark_draft,
     )
 
-    if input_ids.is_cuda or not is_dsv41_dspark_draft(model):
+    if input_ids.is_cuda or not serves_dspark_draft():
         return original(model, input_ids, positions, *args, **kwargs)
     return dspark_forward(original, model, input_ids, positions, *args, **kwargs)
-
-
-def tpu_dsv41_commit_engram_history(
-    original, worker, batch, state, rows, verify_input, logits_output, accept
-):
-    """AROUND TpuBlockSpecWorker.commit: advance the target's Engram history."""
-    result = original(worker, batch, state, rows, verify_input, logits_output, accept)
-    model = worker.target_worker.model_runner.model
-    inner = getattr(model, "model", None)
-    hasher = getattr(inner, "engram_hasher", None)
-    if hasher is None or accept.accept_lens.is_cuda:
-        return result
-    from sglang_tpu.models.deepseek_v41.dspark import defer_engram_commit
-
-    defer_engram_commit(
-        hasher,
-        bonus_tokens=state.bonus_tokens,
-        accept_tokens=accept.accept_tokens,
-        accept_lens=accept.accept_lens,
-        req_pool_indices=state.req_pool_indices,
-    )
-    return result
 
 
 def tpu_dsv41_flush_engram_before_prebuilt(original, manager, batch):
     """AROUND NgramEmbeddingManager._prepare_engram_history: a PD prebuilt batch
     writes history rows directly, so queued verify commits land first."""
-    hasher = manager.engram_hasher
-    if batch.forward_mode.is_prebuilt() and hasher.tpu_pending_commits:
-        from sglang_tpu.models.deepseek_v41.dspark import flush_engram_commits
+    from sglang_tpu.models.deepseek_v41 import engram_host
 
-        flush_engram_commits(hasher)
+    hasher = manager.engram_hasher
+    if batch.forward_mode.is_prebuilt() and engram_host.has_pending_engram_commits(
+        hasher
+    ):
+        engram_host.flush_engram_commits(hasher)
     return original(manager, batch)
 
 
-def tpu_dsv41_create_draft_worker(original, *, algorithm, target_runner):
-    """AROUND block_spec_worker._create_draft_worker: the V4.1 DSpark drafter."""
-    if (
-        algorithm.is_dspark()
-        and target_runner.model_config.hf_config.model_type == "deepseek_v41"
+def _serves_dspark_on_csa2(target_runner) -> bool:
+    """A DeepSeek-V4-family target on the CSA2 backend (ratio-1/2 layers)."""
+    from sglang_tpu.models.deepseek_v41.memory_pool import uses_dsv41_pool
+
+    return uses_dsv41_pool(getattr(target_runner.model_config, "compress_ratios", ()))
+
+
+def _make_dspark_draft_worker(target_runner):
+    from sglang_tpu.models.deepseek_v41.dspark_drafter import (
+        TpuDsv41DsparkDraftWorker,
+    )
+
+    return TpuDsv41DsparkDraftWorker(target_runner)
+
+
+def register_tpu_dsv41_draft_workers() -> None:
+    """Serve DSPARK on a CSA2 target with the MoE draft drafter.
+
+    TpuBlockSpecWorker's built-in DSPARK drafter takes only the dense
+    DSparkDraftModel; the bundled V4-family draft is DeepseekV4ForCausalLMDSpark.
+    """
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang_tpu.experimental import (
+        register_block_draft_worker,
+        registered_block_draft_workers,
+    )
+
+    algorithm = SpeculativeAlgorithm.DSPARK
+    if any(
+        factory is _make_dspark_draft_worker
+        for _, factory in registered_block_draft_workers(algorithm)
     ):
-        from sglang_tpu.models.deepseek_v41.dspark_drafter import (
-            TpuDsv41DsparkDraftWorker,
-        )
-
-        return TpuDsv41DsparkDraftWorker(target_runner)
-    return original(algorithm=algorithm, target_runner=target_runner)
-
-
-def tpu_dsv41_get_last_loc(
-    original, req_to_token, req_pool_indices_tensor, prefix_lens_tensor
-):
-    """AROUND get_last_loc: the torch lookup off CUDA, where Triton has no driver."""
-    if req_to_token.is_cuda:
-        return original(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
-    from sglang.srt.mem_cache.allocation import get_last_loc_torch
-
-    return get_last_loc_torch(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
+        return
+    register_block_draft_worker(
+        algorithm=algorithm,
+        matches=_serves_dspark_on_csa2,
+        factory=_make_dspark_draft_worker,
+    )
 
 
 def hook_specs():
@@ -539,24 +515,9 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
-            "sglang_tpu.experimental.speculative.block_spec_worker.TpuBlockSpecWorker.commit",
-            tpu_dsv41_commit_engram_history,
-            HookType.AROUND,
-        ),
-        (
             "sglang.srt.model_executor.model_runner_components.ngram_embedding_manager"
             ".NgramEmbeddingManager._prepare_engram_history",
             tpu_dsv41_flush_engram_before_prebuilt,
-            HookType.AROUND,
-        ),
-        (
-            "sglang_tpu.experimental.speculative.block_spec_worker._create_draft_worker",
-            tpu_dsv41_create_draft_worker,
-            HookType.AROUND,
-        ),
-        (
-            "sglang.srt.mem_cache.allocation.get_last_loc",
-            tpu_dsv41_get_last_loc,
             HookType.AROUND,
         ),
     ]
