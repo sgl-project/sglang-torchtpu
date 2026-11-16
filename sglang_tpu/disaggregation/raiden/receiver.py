@@ -1443,6 +1443,8 @@ class RaidenReceiverMixin:
                 sources.append((p_rank, full_pb))
             if unified_swa_sources is not None:
                 local_blocks = list(local_blocks) + local_swa_blocks
+                if staging_blocks is not None:
+                    staging_blocks = list(staging_blocks) + list(staging.swa_pages)
                 n = len(local_blocks)
         live = [self.kv_args.page_size] * n
 

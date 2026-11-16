@@ -547,7 +547,11 @@ class RaidenKVManager(
             # plain pages from each pool, with no full->SWA mapping since the
             # decode addresses both.
             full_alloc = allocator.full_attn_allocator
-            swa_alloc = allocator.swa_attn_allocator
+            swa_alloc = (
+                full_alloc
+                if self._unified_swa_pool is not None
+                else allocator.swa_attn_allocator
+            )
             full = full_alloc.alloc(n_pages * page_size)
             if full is None:
                 raise no_pages(n_pages, "full-attention")
@@ -610,6 +614,8 @@ class RaidenKVManager(
             swa_blocks = meta.get("local_swa_blocks")
             if self._swa_kv_caches and swa_blocks:
                 pools.append((True, self._swa_kv_caches, swa_blocks, staging.swa_pages))
+            elif self._unified_swa_pool is not None and swa_blocks:
+                pools.append((False, self._kv_caches, swa_blocks, staging.swa_pages))
             src_attn_tp = meta["src_attn_tp"]
         for swa, bufs, real_pages, staging_pages in pools:
             geometry = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=swa)

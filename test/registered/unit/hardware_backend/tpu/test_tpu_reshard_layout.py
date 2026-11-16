@@ -11,7 +11,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import reshard_schedule as rs
 from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
@@ -22,13 +22,18 @@ from sglang_tpu.disaggregation.raiden.reshard_merge import (
     bucket_pages,
     merge_staged_pages,
 )
+from sglang_tpu.disaggregation.raiden.serde import UNIFIED_SWA_KV_LAYOUT
 from sglang_tpu.disaggregation.raiden.state import DecodeState
 from sglang_tpu.kv_pool import (
     TpuBlockMajorMHATokenToKVPool,
     TpuFusedMHATokenToKVPool,
     TpuSeqAlongLaneKVPool,
 )
-from sglang_tpu.unified_kv_pool import AttnLayerSpec, TpuUnifiedSWAKVPool
+from sglang_tpu.unified_kv_pool import (
+    AttnLayerSpec,
+    TpuUnifiedSWAKVPool,
+    TpuUnifiedSWATokenToKVPoolAllocator,
+)
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -1080,6 +1085,205 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         self.assertTrue(req.abort_notified)
         self.assertIn("42", mgr._failed)
         self.assertIn("has no sliding-window pool", mgr.failure_records[42])
+
+
+class TestTpuUnifiedSwaReshardStaging(unittest.TestCase):
+    PAGE_SIZE = 16
+    INFOS = (
+        {"rank_ip": "10.0.0.1", "rank_port": 20001},
+        {"rank_ip": "10.0.0.1", "rank_port": 20002},
+    )
+
+    def _build_unified_pool_and_allocator(self, *, num_phys_pages: int):
+        # 1 full layer per 6 SWA layers gives num_swa_groups == 6.
+        pool = TpuUnifiedSWAKVPool(
+            size=num_phys_pages * self.PAGE_SIZE,
+            page_size=self.PAGE_SIZE,
+            dtype=FP8,
+            full=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=[5]),
+            swa=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=[0, 1, 2, 3, 4, 6]),
+            device="cpu",
+        )
+        self.assertEqual(pool.layout.num_swa_groups, 6)
+        allocator = TpuUnifiedSWATokenToKVPoolAllocator(
+            size=num_phys_pages * self.PAGE_SIZE,
+            page_size=self.PAGE_SIZE,
+            dtype=FP8,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+        return pool, allocator
+
+    def _build_decode_mgr(
+        self,
+        *,
+        pool: TpuUnifiedSWAKVPool,
+        allocator: TpuUnifiedSWATokenToKVPoolAllocator,
+        chunked: bool = True,
+    ) -> RaidenKVManager:
+        mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
+        mgr.attn_tp_size = 4
+        mgr.pp_size = 1
+        mgr.pp_rank = 0
+        mgr.is_mla_backend = False
+        mgr.is_hybrid_mla_backend = False
+        mgr._kv_caches = pool.kv_pool.page_buffers()
+        mgr._swa_kv_caches = []
+        mgr._unified_swa_pool = pool
+        mgr.kv_layout = UNIFIED_SWA_KV_LAYOUT
+        mgr._seq_along_lane = False
+        mgr._bounded_staging = False
+        mgr._dynamic_host_staging = True
+        mgr._engine = mock.Mock(
+            transfer_address="decode:1",
+            poll_stats_with_details=lambda: SimpleNamespace(
+                sent=[], received=[], failed=[]
+            ),
+        )
+        mgr._swa_engine = None
+        mgr._state_engine = None
+        mgr._engine_poll_failing_since = {}
+        mgr._pipeline = None
+        mgr._pipeline_enabled = False
+        mgr._prefill = None
+        mgr._decode = DecodeState()
+        mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr._failed, mgr._native_failed = set(), set()
+        mgr.chunked_transfer = chunked
+        mgr._completed_send, mgr._completed_recv = set(), set()
+        mgr._send_done_at = {}
+        mgr._pulling = None
+        mgr._cleared_plans = {}
+        mgr._reshard_plans = {}
+        mgr._stale_plans = []
+        mgr._aborted = {}
+        mgr.waiting_timeout = 300
+        mgr.local_ip, mgr.rank_port = "127.0.0.1", 31001
+        mgr.sent = []
+        mgr.addr_to_rooms_tracker = collections.defaultdict(set)
+        mgr.defer_decode_allocation = False
+        mgr.request_status = {}
+        mgr._deferred_ack_targets = {}
+        mgr._deferred_ack_poisoned_rooms = set()
+        mgr._staging_outstanding = {}
+        mgr.dram_offload_channel = None
+        mgr._ensure_engine = lambda: mgr._engine
+        mgr._send_multipart_locked = lambda ep, frames: mgr.sent.append((ep, frames))
+        mgr._is_room_transfer = lambda key, room: str(key).split("#")[0] == str(room)
+        mgr.kv_args = SimpleNamespace(
+            total_kv_head_num=8,
+            page_size=self.PAGE_SIZE,
+            engine_rank=0,
+            state_types=[StateType.SWA],
+        )
+        mgr.attach_token_allocator(allocator)
+        return mgr
+
+    def _send_unified_metadata(
+        self, *, mgr: RaidenKVManager, room: int, f_page: int, s_page: int
+    ) -> RaidenKVReceiver:
+        recv = RaidenKVReceiver(
+            mgr=mgr, bootstrap_addr="10.0.0.1:8998", bootstrap_room=room
+        )
+        recv.prefill_info = SimpleNamespace(attn_tp_size=8, pp_size=1)
+        recv.bootstrap_infos = list(self.INFOS)
+        recv._send_abort_notification = lambda: setattr(recv, "abort_notified", True)
+        recv.send_metadata(
+            kv_indices=np.array([f_page], dtype=np.int32), state_indices=[[s_page]]
+        )
+        return recv
+
+    def test_unified_swa_staging_allocates_exact_physical_pages(self):
+        """Unified SWA staging must allocate one physical page per expanded full and SWA page,
+        never multiplying expanded SWA pages by num_swa_groups again."""
+        pool, alloc = self._build_unified_pool_and_allocator(num_phys_pages=64)
+        mgr = self._build_decode_mgr(pool=pool, allocator=alloc)
+        f_page = (
+            int(alloc.full_attn_allocator.alloc(self.PAGE_SIZE)[0].item())
+            // self.PAGE_SIZE
+        )
+        s_page = (
+            int(alloc.swa_attn_allocator.alloc(self.PAGE_SIZE)[0].item())
+            // self.PAGE_SIZE
+        )
+        free_before = alloc._free_page_count()
+
+        self._send_unified_metadata(mgr=mgr, room=51, f_page=f_page, s_page=s_page)
+        taken = free_before - alloc._free_page_count()
+        self.assertEqual(taken, 7, f"Expected 1 + 6 = 7 physical pages, got {taken}")
+
+    def test_unified_swa_staging_fits_tight_shared_pool(self):
+        """Unified SWA staging must succeed whenever enough shared physical pages remain,
+        instead of failing the room with spurious out-of-pages."""
+        pool, alloc = self._build_unified_pool_and_allocator(num_phys_pages=24)
+        mgr = self._build_decode_mgr(pool=pool, allocator=alloc)
+        f_page = (
+            int(alloc.full_attn_allocator.alloc(self.PAGE_SIZE)[0].item())
+            // self.PAGE_SIZE
+        )
+        s_page = (
+            int(alloc.swa_attn_allocator.alloc(self.PAGE_SIZE)[0].item())
+            // self.PAGE_SIZE
+        )
+        self.assertEqual(alloc._free_page_count(), 17)
+
+        recv = self._send_unified_metadata(
+            mgr=mgr, room=52, f_page=f_page, s_page=s_page
+        )
+        self.assertNotEqual(
+            recv.poll(),
+            KVPoll.Failed,
+            f"Spurious OOM with 17 free physical pages: {mgr.failure_records.get(52)}",
+        )
+
+    def test_unified_swa_staging_merges_swa_pages(self):
+        """Unified SWA staging must merge staged SWA slots in the shared pool buffer,
+        and include staged SWA pages on non-chunked receive plans."""
+        pool, alloc = self._build_unified_pool_and_allocator(num_phys_pages=64)
+        mgr = self._build_decode_mgr(pool=pool, allocator=alloc, chunked=False)
+        f_page = (
+            int(alloc.full_attn_allocator.alloc(self.PAGE_SIZE)[0].item())
+            // self.PAGE_SIZE
+        )
+        s_page = (
+            int(alloc.swa_attn_allocator.alloc(self.PAGE_SIZE)[0].item())
+            // self.PAGE_SIZE
+        )
+        self._send_unified_metadata(mgr=mgr, room=53, f_page=f_page, s_page=s_page)
+
+        mgr._decode.reshard_sources[53] = {0: [1], 1: [1]}
+        mgr._decode.reshard_swa_sources[53] = {0: [2] * 6, 1: [2] * 6}
+        mgr._decode.reshard_meta[53]["ready_endpoints"] = []
+        rpc = SimpleNamespace(raiden_service_pb2=_Pb2)
+        stub = {
+            "tpu_sync": SimpleNamespace(rpc=rpc),
+            "tpu_sync.rpc": rpc,
+            "tpu_sync.rpc.raiden_service_pb2": _Pb2,
+        }
+        with mock.patch.dict(sys.modules, stub):
+            mgr._register_receiver_and_signal(53)
+        self.assertEqual(mgr.failure_records, {})
+        mgr._engine.register_active_plan.assert_called_once()
+
+        buf = mgr._kv_caches[0]
+        torch.manual_seed(7)
+        buf.copy_(torch.randn(buf.shape).to(FP8))
+        before = buf.clone().view(torch.uint8)
+        mgr.merge_reshard_staging(53)
+        after = buf.view(torch.uint8)
+
+        staging = mgr._decode.reshard_staging[53]
+        local_swa = mgr._decode.reshard_meta[53]["local_swa_blocks"]
+        for real_p, stage_p in zip(local_swa, staging.swa_pages):
+            self.assertTrue(
+                torch.equal(after[real_p, :, 0, 2:4], before[stage_p, :, 0, 0:2]),
+                f"Unified SWA page {real_p} was not merged from staging page {stage_p}",
+            )
 
 
 if __name__ == "__main__":
