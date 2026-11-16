@@ -81,7 +81,9 @@ def run():
             TMPDIR=str(root / "tmp"),
             JAX_COMPILATION_CACHE_DIR=str(root / "jax-cache"),
             TORCH_TPU_TIER2_NAME="glm52_c286_jax0112_libtpu0050_tp16_dp16_mtp5",
-            TORCH_TPU_TIER3_ROOT=str(out / "compile-cache"),
+            TORCH_TPU_TIER3_ROOT=os.environ.get(
+                "GLM52_COMPILE_CACHE_ROOT", str(out / "compile-cache")
+            ),
             PYTHONPATH=str(Path("benchmark/tpu/glm52_baseline/runtime_probe").resolve())
             + os.pathsep
             + str(Path.cwd()),
