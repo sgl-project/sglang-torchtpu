@@ -2,6 +2,19 @@
 
 当前状态：`exp-6mtkc6t2qi` 已完成 8-chip native MTP E2E 基线。两 rank 均为 `SUCCEEDED`，16-DP routed smoke、两组 workload warmup 和六轮正式测量全部完成。同一 allocation / application generation 1 / client attempt 1 跑完环境、加载、编译和全部请求，未重启或重试。Decode 使用用户授权的 shared prefix。以下是实际 TPU 结果；后半部分保留此前排障历史。
 
+## 用户确认的基线与 #2198 验证边界
+
+用户已确认将本次结果作为后续对照基线。固定实验 `exp-6mtkc6t2qi` 和实际执行源码 `811865ca48ca23aa14dc74c9dbebaf5b380279dc`；正式基准数字采用 SSE 实测：prefill TTFT 6302.24 ms、decode TPOT 18.849 ms、shared-prefix decode 3511.86 token/s（438.98/物理 chip）。Step-time 估算3520.73 token/s作为交叉核对，不替换实测值。
+
+实时核查 #2198 仍为 `c2861ccb90f7b970218057c981eb30bab5bbef01`。本次发现两项会明显拖慢启动的加载路径缺口：
+
+1. **Target 未启用 EP-local expert reads**：GLM target 未声明该能力，原 helper 返回 `None`，回退读取整 shard，再由正常 loader 过滤 experts。确认的是冗余 I/O 和 host 内存压力，没有证据说明该 fallback 读错 expert/scale。独立修复 `1879b469580f6a78fb8356c53c526a0dc79dec63` 精确启用 GLM target，保留全部 runtime guards；原回归 `None != (48,64)`，修复后19个 CPU tests和两个真实 shard FP8 weight/F32 scale byte oracles通过。
+2. **MTP draft 重读整个 checkpoint**：`DeepseekWeightLoaderMixin.do_load_weights` 取得 tensor 后才跳过非 MTP layer。观察到282个 shards约14分钟只扫57个；不是已证实的死锁或权重映射错误。基线通过原始5个 shard的 symlink和仅含1569个MTP tensor的 index缩小读取范围；没有重写或重新量化权重。
+
+上述 reader、GLM model、DeepSeek common loader和NextN文件相对 #2198 的 PR base `55f642b178a602689b852a0ecb51667310d4de29` 均 byte-for-byte 不变，因此应记为当前组合的既有启动性能缺口，不能归因为本 PR 新增回归。**成功基线包含 reader 修复与 MTP-only view，不是原样 #2198 head 的完整 E2E 通过。** #2198 分支尚未纳入这些附加改动。
+
+本次没有定位到新增 channelwise FP8 adapter 的错误权重字节或 scale 错配；但选定 shard的byte oracle和16-DP算术smoke不构成全模型数值等价验证。venv临时目录ENOSPC、runner缺tar、HTTP keep-alive/client阻塞属于本轮环境或benchmark脚本问题；服务期编译和清理时Gloo异常也未证实由 #2198 新增逻辑引起。
+
 ## 最终实测结果（2026-11-16）
 
 | 场景 | 轮次 | TTFT 中位数 ms | Client TPOT 中位数 ms | 稳态 output token/s（总计） | output token/s / 物理 chip |

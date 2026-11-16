@@ -2928,5 +2928,49 @@
       "median_estimated_output_tokens_per_second": 3520.7268226906594,
       "median_estimated_output_tokens_per_second_per_physical_chip": 440.09085283633243
     }
+  },
+  "baseline_designation": {
+    "status": "ACCEPTED_BY_USER",
+    "accepted_at_utc": "2026-11-16T13:54:49.044858+00:00",
+    "exp_id": "exp-6mtkc6t2qi",
+    "source_commit": "811865ca48ca23aa14dc74c9dbebaf5b380279dc",
+    "scope": "8 physical v7x chips; TP16/attention-DP16/EP16; native MTP 5 steps/6 draft tokens; C16 cached49152+extend4096 and C64 shared-prefix 90000 input/1024 output",
+    "canonical_metrics": {
+      "prefill_TTFT_ms": 6302.241573575884,
+      "decode_TPOT_ms": 18.849124448266487,
+      "decode_steady_output_tokens_per_second": 3511.8608840921393,
+      "decode_steady_output_tokens_per_second_per_physical_chip": 438.9826105115174
+    },
+    "required_additions_to_PR2198_head": [
+      "EP-local GLM target reader fix 1879b469580f6a78fb8356c53c526a0dc79dec63",
+      "Original-shard MTP-only index/view and documented launch/benchmark harness"
+    ],
+    "not_an_unmodified_PR2198_pass": true
+  },
+  "PR2198_loading_findings": {
+    "checked_head": "c2861ccb90f7b970218057c981eb30bab5bbef01",
+    "checked_base": "55f642b178a602689b852a0ecb51667310d4de29",
+    "base_unchanged_paths": [
+      "sglang_tpu/ep_local_expert_reader.py",
+      "python/sglang/srt/models/glm4_moe.py",
+      "python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py",
+      "python/sglang/srt/models/deepseek_nextn.py"
+    ],
+    "findings": [
+      {
+        "kind": "existing_startup_performance_gap",
+        "finding": "GLM target does not opt into EP-local expert reads at PR head; whole-shard fallback increases I/O and host memory pressure",
+        "correctness": "No demonstrated wrong weight bytes; fallback reads all weights before normal filtering",
+        "fix": "1879b469580f6a78fb8356c53c526a0dc79dec63",
+        "verification": "Original reader regression returns None instead of (48,64); fixed 19 CPU tests PASS and two real shard weight/scale byte oracles PASS"
+      },
+      {
+        "kind": "existing_MTP_loading_performance_gap",
+        "finding": "NextN loads full checkpoint tensors before ignoring non-MTP layers; observed about 14 minutes to scan only 57 of 282 shards",
+        "correctness": "No demonstrated wrong MTP weights; redundant full-checkpoint reads",
+        "mitigation": "MTP-only index with original 5 shard symlinks, 1569 MTP tensors; no tensor conversion"
+      }
+    ],
+    "attribution": "These four loader/model files are unchanged from the PR base; neither issue is established as introduced by PR2198. Successful baseline includes the reader fix and MTP view. No wrong FP8 bytes/channel scale mismatch was identified in the new adapter, but selected byte oracles and routed smoke are not full-checkpoint numerical equivalence."
   }
 }

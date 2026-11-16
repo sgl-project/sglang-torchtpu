@@ -30,5 +30,23 @@
     "Serving-time XLA compilation exists; no new compile records in the three common C64 windows under log timestamp alignment.",
     "Gloo peer-close exceptions after the last request during teardown; clean graceful shutdown not established.",
     "16 routed arithmetic smoke requests are not broad model accuracy validation."
-  ]
+  ],
+  "baseline_designation": {
+    "status": "ACCEPTED_BY_USER",
+    "accepted_at_utc": "2026-11-16T13:54:49.044858+00:00",
+    "exp_id": "exp-6mtkc6t2qi",
+    "source_commit": "811865ca48ca23aa14dc74c9dbebaf5b380279dc",
+    "scope": "8 physical v7x chips; TP16/attention-DP16/EP16; native MTP 5 steps/6 draft tokens; C16 cached49152+extend4096 and C64 shared-prefix 90000 input/1024 output",
+    "canonical_metrics": {
+      "prefill_TTFT_ms": 6302.241573575884,
+      "decode_TPOT_ms": 18.849124448266487,
+      "decode_steady_output_tokens_per_second": 3511.8608840921393,
+      "decode_steady_output_tokens_per_second_per_physical_chip": 438.9826105115174
+    },
+    "required_additions_to_PR2198_head": [
+      "EP-local GLM target reader fix 1879b469580f6a78fb8356c53c526a0dc79dec63",
+      "Original-shard MTP-only index/view and documented launch/benchmark harness"
+    ],
+    "not_an_unmodified_PR2198_pass": true
+  }
 }
