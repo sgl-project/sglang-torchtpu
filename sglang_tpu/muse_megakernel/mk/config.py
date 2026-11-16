@@ -238,6 +238,23 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     qblock: int = 0
     # dense weights left out of the ring (an FFN-section hook streams its own copies)
     dense_skip: tuple = ()
+    # TpuUnifiedSWAKVPool: layer -> shared physical KV buffer (0..B-1) and SWA page group (0..M_swa-1)
+    kv_buf_map: tuple = ()
+    swa_group_map: tuple = ()
+
+    @property
+    def n_kv_buffers(self) -> int:
+        return max(self.kv_buf_map) + 1 if self.kv_buf_map else self.n_layers
+
+    @property
+    def n_swa_groups(self) -> int:
+        return max(self.swa_group_map) + 1 if self.swa_group_map else 1
+
+    def layer_kv_buf(self, l: int) -> int:
+        return self.kv_buf_map[l] if self.kv_buf_map else l
+
+    def layer_swa_group(self, l: int) -> int:
+        return self.swa_group_map[l] if self.swa_group_map else 0
 
     @property
     def q_dim(self):
@@ -378,6 +395,13 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
 
     def validate(self):
         assert self.rows % self.tp == 0 and self.rows >= self.tp
+        if self.kv_buf_map:
+            assert len(self.kv_buf_map) == self.n_layers
+            assert set(self.kv_buf_map) == set(range(self.n_kv_buffers))
+        if self.swa_group_map:
+            assert len(self.swa_group_map) == self.n_layers
+            assert all(0 <= g < self.n_swa_groups for g in self.swa_group_map)
+            assert all(self.swa_group_map[l] == 0 for l in self.global_layers)
         if self.qblock:
             self._validate_qblock()
         # windows are DMA'd in TABLE_ALIGN-entry units; only the SAL kv write reads them

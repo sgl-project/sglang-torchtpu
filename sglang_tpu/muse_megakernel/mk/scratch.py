@@ -240,7 +240,12 @@ def scratch_plan(cfg: MKConfig, ep: EPHook | None = None):
         plan = ep.scratch_plan(cfg, plan)
     if cfg.swa_window_table:
         plan = plan + [
-            ("psw_win", pltpu.SMEM((cfg.n_req * swa_window_entries(cfg),), jnp.int32)),
+            (
+                "psw_win",
+                pltpu.SMEM(
+                    (cfg.n_swa_groups * cfg.n_req * swa_window_entries(cfg),), jnp.int32
+                ),
+            ),
             ("psw_base", pltpu.SMEM((cfg.n_req,), jnp.int32)),
             ("psw_sem", pltpu.SemaphoreType.DMA((1,))),
         ]
