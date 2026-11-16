@@ -450,7 +450,9 @@ class MuseMegakernel(torch.nn.Module):
             # One copy, before stacking: the native fused-RS MoE (extend, large steps) reads it too.
             for layer in decoder.layers:
                 if _expert_kind(layer.mlp.experts) == "fp4":
-                    requant_tpu_nvfp4_experts(layer.mlp.experts, qblock, ep_megakernel=ep)
+                    requant_tpu_nvfp4_experts(
+                        layer.mlp.experts, qblock, ep_ranks=parallel.moe_ep_size if ep else 0
+                    )
             torch.accelerator.synchronize()
             logger.info("Muse megakernel: fp4 experts requantized to block %d", qblock)
         for layer in decoder.layers:

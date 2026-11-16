@@ -26,8 +26,8 @@ from sglang_tpu.muse_megakernel.common.ep_layout import (
     kperm,
 )
 
-# Experts per converted slab, bounding the unpacked fp4 code temporaries (8 x 32 MiB x 32).
-_EXPERT_CHUNK = 8
+# Experts per converted slab, bounding the unpacked fp4 code temporaries (whole experts).
+_EXPERT_CHUNK = 4
 
 
 def mark_ep_layout(experts: torch.nn.Module) -> None:

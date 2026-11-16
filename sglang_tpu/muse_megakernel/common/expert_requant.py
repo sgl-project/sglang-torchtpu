@@ -21,7 +21,8 @@ from sglang_tpu.moe.nvfp4_requant import (
     requant_nvfp4_blocks,
 )
 
-# Experts per compiled call, bounding the f32 temporaries.
+# Expert-TP slices per compiled call, bounding the f32 temporaries; whole experts
+# (EP) are ep x larger, so a call takes ep x fewer.
 _EXPERT_CHUNK = 32
 
 _Requant = Callable[
@@ -36,7 +37,7 @@ def _compiled_requant() -> _Requant:
 
 
 def _requant_slabs(
-    w: torch.Tensor, s: torch.Tensor, block: int
+    w: torch.Tensor, s: torch.Tensor, block: int, chunk: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
         w.dtype != torch.float4_e2m1fn_x2
@@ -49,11 +50,11 @@ def _requant_slabs(
         )
     u = w.view(torch.uint8)
     codes, scales = [], []
-    for e0 in range(0, w.shape[0], _EXPERT_CHUNK):
+    for e0 in range(0, w.shape[0], chunk):
         # clones: a slice's storage offset is a guard, recompiling per chunk
         c, sb = _compiled_requant()(
-            u[e0 : e0 + _EXPERT_CHUNK].clone(),
-            s[e0 : e0 + _EXPERT_CHUNK].clone(),
+            u[e0 : e0 + chunk].clone(),
+            s[e0 : e0 + chunk].clone(),
             block,
         )
         _wait_for(c, sb)
@@ -65,17 +66,17 @@ def _requant_slabs(
 
 
 def requant_tpu_nvfp4_experts(
-    layer: torch.nn.Module, block: int, *, ep_megakernel: bool = False
+    layer: torch.nn.Module, block: int, *, ep_ranks: int = 0
 ) -> None:
     """Rewrite a fused-RS-prepared block-16 NVFP4 layer's experts in place to one bf16 scale
     per block K rows; the megakernel and the native fused-RS MoE then read only these.
-    ep_megakernel: whole experts per rank, converted next to the EP layout, which only the
-    Muse EP programs read."""
+    ep_ranks: under EP, whole experts per rank, converted next to the EP layout, which only
+    the Muse EP programs read."""
     if block not in QBLOCK_SIZES:
         raise NotImplementedError(
             f"NVFP4 expert requant to block {block}: supported {QBLOCK_SIZES}"
         )
-    if not ep_megakernel and not layer.__dict__.get("_tpu_fused_rs_expert_tp", False):
+    if not ep_ranks and not layer.__dict__.get("_tpu_fused_rs_expert_tp", False):
         raise NotImplementedError(
             "NVFP4 expert requant needs the fused-RS expert-TP layout (the only native "
             "MoE with a block-scaled W4A16 arm)"
@@ -88,12 +89,13 @@ def requant_tpu_nvfp4_experts(
         layer.w2_weight.data,
         layer.w2_weight_scale.data,
     )
+    chunk = max(1, _EXPERT_CHUNK // max(ep_ranks, 1))
     # w13 rebound before w2 is requantized: one projection's temporaries at a time
-    w13, s13 = _requant_slabs(old[0], old[1], block)
+    w13, s13 = _requant_slabs(old[0], old[1], block, chunk)
     copy_or_rebind_param(layer, "w13_weight", w13)
     copy_or_rebind_param(layer, "w13_weight_scale", s13)
     del w13, s13
-    w2, s2 = _requant_slabs(old[2], old[3], block)
+    w2, s2 = _requant_slabs(old[2], old[3], block, chunk)
     copy_or_rebind_param(layer, "w2_weight", w2)
     copy_or_rebind_param(layer, "w2_weight_scale", s2)
     del w2, s2
