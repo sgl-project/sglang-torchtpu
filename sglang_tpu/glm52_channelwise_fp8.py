@@ -19,20 +19,21 @@ import torch
 from torch.nn import Parameter
 
 from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe.fused_moe_triton import (
+    FusedMoE,
+    FusedMoeWeightScaleSupported,
+)
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
-from sglang_tpu.fp8_config import (
-    TpuChannelwiseFp8Config,
-    _remap_draft_ignored_layers,
-)
+from sglang_tpu.fp8_config import _remap_draft_ignored_layers
 
 CHECKPOINT_LAYOUT = "glm52_channelwise_fp8"
 
 
-class Glm52ChannelwiseFp8Config(TpuChannelwiseFp8Config):
+class Glm52ChannelwiseFp8Config(Fp8Config):
     """Loader-only specialization; existing TPU channelwise kernels execute."""
 
     @classmethod
@@ -80,6 +81,8 @@ class Glm52ChannelwiseFp8Config(TpuChannelwiseFp8Config):
             return super().get_quant_method(layer, prefix)
         if isinstance(layer, LinearBase):
             return Glm52ChannelwiseFp8LinearMethod(self)
+        if isinstance(layer, FusedMoE):
+            return Glm52ChannelwiseFp8MoEMethod(self)
         # Preserve KV-cache quantization and other upstream consumers.
         return super().get_quant_method(layer, prefix)
 
@@ -155,3 +158,61 @@ class Glm52ChannelwiseFp8LinearMethod(LinearMethodBase):
         from sglang_tpu.fp8_linear import apply_tpu_fp8_linear
 
         return apply_tpu_fp8_linear(x, layer.weight, layer.weight_scale_inv, bias)
+
+
+class Glm52ChannelwiseFp8MoEMethod(Fp8MoEMethod):
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        with_bias: bool = False,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            with_bias=with_bias,
+            **extra_weight_attrs,
+        )
+        for stem in ("w13", "w2"):
+            name = f"{stem}_weight_scale"
+            old = getattr(layer, name)
+            weight = getattr(layer, f"{stem}_weight")
+            scale = Parameter(
+                torch.empty(
+                    *weight.shape[:2], dtype=torch.float32, device=weight.device
+                ),
+                requires_grad=False,
+            )
+            scale.__dict__.update(old.__dict__)
+            scale.quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
+            delattr(layer, name)
+            layer.register_parameter(f"{name}_inv", scale)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang_tpu.fp8_moe import (
+            prepare_tpu_fp8_moe,
+        )
+
+        for stem in ("w13", "w2"):
+            scale = getattr(layer, f"{stem}_weight_scale_inv")
+            expected = tuple(getattr(layer, f"{stem}_weight").shape[:2])
+            if tuple(scale.shape) != expected:
+                raise ValueError(
+                    f"Channelwise expert scales must have shape {expected}"
+                )
+            layer.register_parameter(f"{stem}_weight_scale", scale)
+
+        self.handles_moe_reduction = prepare_tpu_fp8_moe(
+            layer,
+            block_quant=False,
+            weight_block_size=None,
+            use_mxfp8=False,
+            is_fp4_expert=False,
+        )

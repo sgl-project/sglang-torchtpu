@@ -63,8 +63,8 @@ def _quantize_moe_weight_channelwise(
     weight: torch.Tensor,
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Both block-FP8 conversion and online quantization provide float32 [E,N,K]
-    # weights. Reduce K, retaining an independent scale for each expert/channel.
+    # Block-FP8 conversion provides float32 [E,N,K] dequantized weights.
+    # Reduce K, retaining an independent scale for each expert/channel.
     dtype = out_dtype
     dtype_max = torch.finfo(dtype).max
     weight_scale = torch.clamp(
@@ -77,39 +77,6 @@ def _quantize_moe_weight_channelwise(
         max=dtype_max,
     ).to(dtype)
     return weight_q, weight_scale.squeeze(-1)
-
-
-def quantize_tpu_moe_weights_channelwise(layer: torch.nn.Module) -> None:
-    """Quantize unquantized expert weights once, with bounded host scratch.
-
-    As in the legacy online per-tensor fallback, each expert is quantized on
-    the host. Keep float32 intermediates off the nearly-full TPU and drain each
-    transfer before reusing its host scratch. No quantization runs at inference.
-    The amax covers the rank's full local K; an offline checkpoint quantized
-    before K sharding can therefore have different bytes/scales.
-    """
-    for stem in ("w13", "w2"):
-        weight = getattr(layer, f"{stem}_weight")
-        if weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-            raise ValueError("Online channelwise MoE requires unquantized weights")
-
-    for stem in ("w13", "w2"):
-        name = f"{stem}_weight"
-        old = getattr(layer, name).data
-        quantized = torch.empty_like(old, dtype=torch.float8_e4m3fn)
-        scales = torch.empty(old.shape[:2], dtype=torch.float32, device="cpu")
-        for expert in range(old.shape[0]):
-            source = old[expert : expert + 1].detach().cpu().float()
-            qweight, scale = _quantize_moe_weight_channelwise(
-                source, torch.float8_e4m3fn
-            )
-            quantized[expert : expert + 1].copy_(qweight.to(old.device))
-            scales[expert].copy_(scale[0])
-            if old.device.type != "cpu":
-                torch.accelerator.synchronize()
-        copy_or_rebind_param(layer, name, quantized)
-        _free_replaced_storage(old, getattr(layer, name).data)
-        copy_or_rebind_param(layer, f"{stem}_weight_scale", scales.to(old.device))
 
 
 def _requantize_tpu_fp8_moe_block_to_channelwise(

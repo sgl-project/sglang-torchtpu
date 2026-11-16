@@ -1,4 +1,4 @@
-"""Device smoke for GLM's shared online/offline channelwise MoE contract.
+"""Device smoke for block-FP8 conversion and offline channelwise MoE loading.
 
 This exercises post-load transfers, TPU-owned scale buffers and compiled MoE;
 the CPU loader tests cover the checkpoint names, TP shards and NextN mapping.
@@ -10,11 +10,12 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_context, get_flags
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.fp8_config import TpuChannelwiseFp8MoEMethod, TpuFp8Config
+from sglang_tpu.fp8_config import TpuFp8Config
 from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op, fused_moe_call
 
 register_tpu_ci(
@@ -26,7 +27,7 @@ register_tpu_ci(
 
 
 class TestTpuChannelwiseFp8Loading(CustomTestCase):
-    def test_online_and_serialized_weights_run_the_same_compiled_moe(self):
+    def test_block_conversion_and_offline_run_the_same_compiled_moe(self):
         _build_fused_moe_op()
         torch.manual_seed(17)
         experts, hidden, intermediate = 4, 128, 128
@@ -35,17 +36,29 @@ class TestTpuChannelwiseFp8Loading(CustomTestCase):
             ("w13", (experts, 2 * intermediate, hidden)),
             ("w2", (experts, hidden, intermediate)),
         ):
-            source = (torch.randn(shape) * 0.05).to(torch.bfloat16)
-            scales = source.float().abs().amax(-1).clamp_min(448e-12) / 448
-            quantized = (source.float() / scales[:, :, None]).to(torch.float8_e4m3fn)
-            weights[stem] = (source, quantized, scales)
+            block_q = (torch.randn(shape) * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
+            block_scales = 2.0 ** torch.randint(
+                -10, -6, (experts, shape[1] // 128, shape[2] // 128)
+            )
+            source = block_q.float() * block_scales.repeat_interleave(
+                128, 1
+            ).repeat_interleave(128, 2)
+            channel_scales = (source.abs().amax(-1) / 448).clamp_min(1e-12)
+            channel_q = (
+                (source / channel_scales[:, :, None])
+                .clamp(-448, 448)
+                .to(torch.float8_e4m3fn)
+            )
+            weights[stem] = (block_q, block_scales, channel_q, channel_scales)
 
         layers = []
         with (
-            get_context().override_server_args(moe_runner_backend="pallas_tpu"),
+            get_context().override_server_args(
+                moe_runner_backend="pallas_tpu", tpu_fp8_runtime="channelwise"
+            ),
             get_flags().moe.override(runner_backend=MoeRunnerBackend.PALLAS_TPU),
         ):
-            for online in (True, False):
+            for blockwise in (True, False):
                 metadata = {
                     "quant_method": "fp8",
                     "activation_scheme": "dynamic",
@@ -54,30 +67,25 @@ class TestTpuChannelwiseFp8Loading(CustomTestCase):
                         architectures=["GlmMoeDsaForCausalLM"]
                     ),
                 }
-                if online:
-                    metadata.update(
-                        is_checkpoint_fp8_serialized=False,
-                        tpu_moe_weight_quantization="channelwise",
-                    )
+                if blockwise:
+                    metadata["weight_block_size"] = [128, 128]
                 else:
                     metadata["tpu_checkpoint_layout"] = "glm52_channelwise_fp8"
-                method = TpuChannelwiseFp8MoEMethod(TpuFp8Config.from_config(metadata))
-                layer = torch.nn.Module()
-                for stem, (source, quantized, scales) in weights.items():
-                    layer.register_parameter(
-                        f"{stem}_weight",
-                        torch.nn.Parameter(
-                            (source if online else quantized).to("tpu"),
-                            requires_grad=False,
-                        ),
+                config = TpuFp8Config.from_config(metadata)
+                layer = FusedMoE.__new__(FusedMoE)
+                torch.nn.Module.__init__(layer)
+                layer.moe_runner_config = SimpleNamespace(is_gated=True)
+                method = config.get_quant_method(layer, "model.layers.0.mlp.experts")
+                layer.quant_method = method
+                with torch.device("tpu"):
+                    method.create_weights(
+                        layer, experts, hidden, intermediate, torch.bfloat16
                     )
-                    name = f"{stem}_weight_scale" + ("" if online else "_inv")
-                    layer.register_parameter(
-                        name,
-                        torch.nn.Parameter(
-                            (torch.ones(experts) if online else scales).to("tpu"),
-                            requires_grad=False,
-                        ),
+                for stem, values in weights.items():
+                    weight, scale = values[:2] if blockwise else values[2:]
+                    getattr(layer, f"{stem}_weight").data.copy_(weight.to("tpu"))
+                    getattr(layer, f"{stem}_weight_scale_inv").data.copy_(
+                        scale.to("tpu")
                     )
                 method.process_weights_after_loading(layer)
                 self.assertFalse(method.handles_moe_reduction)
@@ -133,12 +141,12 @@ class TestTpuChannelwiseFp8Loading(CustomTestCase):
         torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
 
         w1 = (
-            weights["w13"][1].float()
-            * weights["w13"][2].to(torch.bfloat16)[:, :, None].float()
+            weights["w13"][2].float()
+            * weights["w13"][3].to(torch.bfloat16)[:, :, None].float()
         )
         w2 = (
-            weights["w2"][1].float()
-            * weights["w2"][2].to(torch.bfloat16)[:, :, None].float()
+            weights["w2"][2].float()
+            * weights["w2"][3].to(torch.bfloat16)[:, :, None].float()
         )
         reference = torch.zeros_like(x, dtype=torch.float32)
         for token in range(8):
