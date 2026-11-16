@@ -9,6 +9,7 @@ mkdir -p "$OUT"
 export PYTHONPATH="$PWD/python:$PWD"
 export GLM52_RUNTIME_DIR="$OUT/actual-process-runtime"
 export PYTHONPATH="$PWD/benchmark/tpu/glm52_baseline/runtime_probe:$PYTHONPATH"
-"$PY" -u test/registered/kernels/ops/moe/test_glm_ep_moe_v2.py \
+export GLM_DIAGNOSTIC_DIR="$OUT/export-diagnostic"
+"$PY" -u test/manual/kernels/glm_moe_v2_export_diagnostic.py \
   2>&1 | tee "$OUT/device-tests.log"
-echo MOE_KERNEL_PASS
+echo MOE_EXPORT_DIAGNOSTIC_PASS
