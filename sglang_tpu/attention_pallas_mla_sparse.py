@@ -347,6 +347,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._index_topk_op = build_dsa_index_topk_op()
         self._init_indexer_token_split()
         self._init_attention_token_split()
+        self._init_mla_kv_shards()
 
     def _init_attention_token_split(self) -> None:
         """Set up SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT (on the indexer split)."""
@@ -377,6 +378,24 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         get_oneshot_all_to_all_op(world)  # build before torch.compile traces
         self._window_op = _build_pallas_sparse_mla_kernel_op(window=True)
         self._attn_split_world = world
+
+    def _init_mla_kv_shards(self) -> None:
+        """The sharded latent cache's ops and group (attention_pallas_mla_kv_shard)."""
+        split = _split_pool(self.token_to_kv_pool)
+        self.mla_shards, self.mla_role = split.mla_shards, split.mla_role
+        if self.mla_shards <= 1:
+            return
+        from sglang_tpu.attention.pallas.mla_sparse.kernel import (
+            DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+        )
+        from sglang_tpu.attention_pallas_mla_kv_shard import build_kv_shard_attention_op
+        from sglang_tpu.mla_kv_shard_group import mla_kv_shard_group
+
+        self._mla_group = mla_kv_shard_group(self.mla_shards)
+        self._kv_shard_op = build_kv_shard_attention_op(
+            zero_rope=self._zero_rope,
+            gather_chunk_tokens=DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -826,6 +845,9 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             q_rope=q_rope,
             k_rope=k_rope,
         )
+        if self.mla_shards > 1:
+            out = self._forward_mla_kv_shard(args, topk_indices)
+            return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         split_rows = self._attention_split_rows(forward_batch, q.shape[0])
         if split_rows:
             out = self._forward_mla_token_split(args, topk_indices, split_rows)
@@ -892,6 +914,35 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         out = out.view(rows, world, heads, nope).transpose(0, 1)
         out = oneshot_all_to_all(out.reshape(world, -1), world_size=world)
         return out.view(world * rows, heads, nope)[:num_tokens]
+
+    def _forward_mla_kv_shard(self, args: tuple, topk_indices: torch.Tensor):
+        """Attention over a latent cache sharded across the group: gather the
+        group's queries, attend this rank's candidates, merge into own heads."""
+        from sglang_tpu.attention_pallas_mla_kv_shard import merge_kv_shards
+
+        (ql_nope, q_pe, new_kv_c, new_k_pe, cache_nope, cache_rope, kv_lens,
+         page_indices, cu_q_lens, _cu_kv_lens, distribution, sm_scale, k_scale,
+         _v_scale) = args  # fmt: skip
+        group = self._mla_group
+        out, lse = self._kv_shard_op(
+            group.all_gather(ql_nope, dim=1).contiguous(),
+            group.all_gather(q_pe, dim=1).contiguous(),
+            new_kv_c,
+            new_k_pe,
+            cache_nope,
+            cache_rope,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            topk_indices,
+            sm_scale,
+            1.0 if k_scale is None else k_scale,
+            self.mla_shards,
+            self.mla_role,
+            max(self._kpool, 1),
+        )
+        return merge_kv_shards(out, lse, group)
 
     def _kv_cache_buffers(self, layer_id: int) -> tuple:
         # This backend's pool has two buffers per layer where the fused pool

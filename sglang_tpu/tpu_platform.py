@@ -729,6 +729,46 @@ def _validate_dsa(server_args) -> None:
             f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
         )
     _validate_kpool_raw_ring(cfg)
+    _validate_mla_kv_shards(cfg)
+
+
+def _validate_mla_kv_shards(cfg) -> None:
+    """A sparse-MLA latent cache sharded by page (SGLANG_TPU_DSA_MLA_KV_SHARDS):
+    groups of consecutive attention-TP ranks, attention TP only, and nothing
+    that addresses the latent cache by page id or decodes outside the backend."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    shards = tpu_envs.SGLANG_TPU_DSA_MLA_KV_SHARDS.get()
+    if shards <= 1:
+        return
+    tp, attn_cp = cfg.tp_size, cfg.attn_cp_size
+    if shards & (shards - 1):
+        raise ValueError(
+            f"SGLANG_TPU_DSA_MLA_KV_SHARDS={shards} must be a power of two: the "
+            "kernels split page ids with a mask and a shift."
+        )
+    if tp % shards or attn_cp > 1 or cfg.attn_dp_size > 1 or cfg.pp_size > 1:
+        raise ValueError(
+            f"SGLANG_TPU_DSA_MLA_KV_SHARDS={shards} needs attention TP alone with a "
+            f"multiple of {shards} ranks (got tp {tp}, attention CP {attn_cp}, "
+            f"attention DP {cfg.attn_dp_size}, PP {cfg.pp_size})."
+        )
+    refused = {
+        "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
+        "--disaggregation-mode": cfg.disaggregation_mode != "null",
+        "--enable-prefill-cp": cfg.enable_prefill_cp,
+        "SGLANG_TPU_GLM_FLASH_MEGAKERNEL": tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL.get(),
+        # Its window op stores every token on every rank's whole cache.
+        "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT": (
+            tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.get()
+        ),
+    }
+    on = [name for name, active in refused.items() if active]
+    if on:
+        raise ValueError(
+            f"SGLANG_TPU_DSA_MLA_KV_SHARDS={shards} does not support {', '.join(on)}: "
+            "the sharded latent cache is not addressed by page id."
+        )
 
 
 def _validate_kpool_raw_ring(cfg) -> None:

@@ -38,7 +38,11 @@ def _split_pool_bytes(kvc, *, layer_ids, all_index_layers: bool) -> int:
         get_dsa_index_head_dim,
         get_dsa_index_kpool,
     )
-    from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool, kpool_raw_ring_pages
+    from sglang_tpu.kv_pool import (
+        TpuSplitMLATokenToKVPool,
+        kpool_raw_ring_pages,
+        mla_kv_shards,
+    )
 
     hf_config = kvc.model_config.hf_config
     kpool = get_dsa_index_kpool(hf_config)
@@ -51,6 +55,7 @@ def _split_pool_bytes(kvc, *, layer_ids, all_index_layers: bool) -> int:
         ],
         index_kpool=kpool,
         raw_ring=kpool_raw_ring_pages(page_size=1, kpool=kpool) > 0,
+        mla_shards=mla_kv_shards(),
         qk_rope_head_dim=_qk_rope_head_dim(kvc.model_config),
     )
 
