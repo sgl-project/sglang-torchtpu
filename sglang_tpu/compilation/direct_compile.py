@@ -282,6 +282,16 @@ def direct_compile(
     return functools.update_wrapper(compiled, fn)
 
 
+def _input_spec(tensor: torch.Tensor) -> tuple:
+    """(shape, dtype, device, device layout) a compiled executable binds."""
+    layout = (
+        tpu_torch_compile.get_device_layout_if_materialized(tensor)
+        if tensor.device.type == "tpu"
+        else None
+    )
+    return (tuple(tensor.shape), tensor.dtype, tensor.device, layout)
+
+
 class CompiledFunction:
     """A CompiledFunction is a collection of 0+ CompiledArtifacts.
 
@@ -376,6 +386,79 @@ class CompiledFunction:
         artifact = self._get_artifact(args, kwargs, async_compile=async_compile)
         return PendingCall(artifact.wait_for_compile)
 
+    def release_model_inputs(self) -> None:
+        """Drop every artifact's references to its model-input tensors, keeping
+        their shape, dtype, device and device layout, so the caller can free and
+        rebuild the parameters; refresh_model_inputs re-attaches them. "keep"
+        inputs (the lifted rank) stay attached."""
+        for artifact in self.cache.values():
+            if (
+                artifact is None
+                or artifact.released_input_specs is not None
+                or not artifact.model_input_sources
+            ):
+                continue
+            specs, kept = [], []
+            for tensor, source in zip(
+                artifact.model_inputs, artifact.model_input_sources, strict=True
+            ):
+                specs.append(_input_spec(tensor))
+                kept.append(tensor if source[0] == "keep" else None)
+            artifact.released_input_specs = tuple(specs)
+            artifact.model_inputs = tuple(kept)
+            if artifact.unbound_inputs is not None:
+                full, flat = artifact.unbound_inputs
+                for index, tensor in enumerate(kept):
+                    full[index] = tensor
+                    flat[index] = tensor
+
+    def refresh_model_inputs(self) -> int:
+        """Re-resolve every compiled artifact's model inputs from the model.
+
+        For callers that rebind parameters after compiling (e.g. load the real
+        weights while the compile runs): each input is looked up again by the
+        name or attribute it was traced from, and must keep the shape, dtype,
+        device and device layout it was traced with. Returns the number of
+        inputs that changed."""
+        if self._model is None:
+            return 0
+        changed = 0
+        for artifact in self.cache.values():
+            if artifact is None or not artifact.model_input_sources:
+                continue
+            specs = artifact.released_input_specs
+            fresh = []
+            for position, (old, source) in enumerate(
+                zip(artifact.model_inputs, artifact.model_input_sources, strict=True)
+            ):
+                if source[0] == "module":
+                    try:
+                        new = self._model.get_parameter(source[1])
+                    except AttributeError:
+                        new = self._model.get_buffer(source[1])
+                elif source[0] == "attr":
+                    new = getattr(source[1], source[2])
+                else:
+                    new = old
+                want = specs[position] if specs is not None else _input_spec(old)
+                got = _input_spec(new)
+                if got != want:
+                    raise ValueError(
+                        f"refresh_model_inputs: {source[1:]} was traced as {want}, "
+                        f"now {got}"
+                    )
+                if new is not old:
+                    changed += 1
+                fresh.append(new)
+            artifact.model_inputs = tuple(fresh)
+            artifact.released_input_specs = None
+            if artifact.unbound_inputs is not None:
+                full, flat = artifact.unbound_inputs
+                for index, tensor in enumerate(fresh):
+                    full[index] = tensor
+                    flat[index] = tensor
+        return changed
+
     def _get_artifact(
         self,
         args: tuple[Any, ...],
@@ -464,6 +547,9 @@ class CompiledFunction:
         registered_model_inputs: list[tuple[str, int]] = []
         extra_model_inputs: list[tuple[object, str, int]] = []
         model_inputs: list[torch.Tensor] = []
+        # Where each model input comes from, aligned with model_inputs, so a
+        # compiled artifact can re-resolve them (refresh_model_inputs).
+        model_input_sources: list[tuple] = []
         if self._model is not None:
             all_names_and_tensors = [
                 *self._model.named_parameters(remove_duplicate=False),
@@ -478,6 +564,7 @@ class CompiledFunction:
                 tensor_index = len(model_inputs)
                 tensor_indices[tensor_id] = tensor_index
                 model_inputs.append(tensor)
+                model_input_sources.append(("module", name))
                 registered_model_inputs.append((name, tensor_index))
 
             for path in self._model_extra_tensor_attrs:
@@ -498,6 +585,7 @@ class CompiledFunction:
                     tensor_index = len(model_inputs)
                     tensor_indices[tensor_id] = tensor_index
                     model_inputs.append(tensor)
+                    model_input_sources.append(("attr", parent, attr_name))
                 extra_model_inputs.append((parent, attr_name, tensor_index))
 
         rank_input_index = None
@@ -510,6 +598,7 @@ class CompiledFunction:
                 self._rank_input.cpu()
             rank_input_index = len(model_inputs)
             model_inputs.append(self._rank_input)
+            model_input_sources.append(("keep",))
 
         kv_pool_inputs = self._kv_pool.get_state() if self._kv_pool is not None else []
 
@@ -576,6 +665,10 @@ class CompiledFunction:
                     output_treespec=None,
                     output_count=0,
                     pending_compile=submission,
+                    model_input_sources=tuple(model_input_sources),
+                    # bind() narrows these lists to the owner's live inputs; until
+                    # then release/refresh update them in place.
+                    unbound_inputs=(model_inputs, flat_inputs),
                 )
 
                 def bind(owner_interface: ExecutableInterface) -> None:
@@ -616,6 +709,11 @@ class CompiledFunction:
                             f"local_layouts={layouts}"
                         )
                     artifact.model_inputs = live_model_inputs
+                    artifact.unbound_inputs = None
+                    artifact.model_input_sources = tuple(
+                        model_input_sources[index]
+                        for index in owner_interface.model_indices
+                    )
                     artifact.output_treespec = owner_interface.output_treespec
                     artifact.output_count = owner_interface.output_treespec.num_leaves
                     artifact.callbacks = tuple(
@@ -750,6 +848,9 @@ class CompiledFunction:
                 *range(model_input_count, len(graph_inputs)),
             )
             model_inputs = [model_inputs[index] for index in live_model_indices]
+            model_input_sources = [
+                model_input_sources[index] for index in live_model_indices
+            ]
             graph_inputs = [graph_inputs[index] for index in retained_indices]
             flat_inputs = [
                 flat_inputs[index]
@@ -843,6 +944,7 @@ class CompiledFunction:
         return _CompiledArtifact(
             executable=executable,
             model_inputs=tuple(model_inputs),
+            model_input_sources=tuple(model_input_sources),
             kv_pool=self._kv_pool,
             tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
             tensor_inputs_traced_shapes=tuple(
@@ -883,6 +985,13 @@ class _CompiledArtifact:
     callbacks: tuple[Callable[[torch.Tensor], None], ...] = ()
     pending_compile: Any | None = None
     rng_device: torch.device | None = None
+    # Aligned with model_inputs: ("module", name) | ("attr", owner, name) | ("keep",).
+    model_input_sources: tuple = ()
+    # (shape, dtype, device, layout) per model input while released.
+    released_input_specs: tuple | None = None
+    # SPMD consumer before bind(): (model_inputs, flat_inputs) lists its bind
+    # closure reads; their model-input entries are released/refreshed in place.
+    unbound_inputs: tuple | None = None
 
     def wait_for_compile(self) -> None:
         if self.pending_compile is not None:
