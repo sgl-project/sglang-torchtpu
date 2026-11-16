@@ -1284,7 +1284,7 @@ class TpuSRTPlatform(SRTPlatform):
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:
         if quantization == "fp8":
-            from sglang_tpu.glm52_channelwise_fp8 import TpuFp8Config
+            from sglang_tpu.fp8 import TpuFp8Config
 
             return TpuFp8Config
         if quantization == "modelopt_fp4":

@@ -34,10 +34,10 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.runtime_context import get_context, get_flags
-from sglang_tpu.glm52_channelwise_fp8 import (
-    Glm52ChannelwiseFp8Config,
-    Glm52ChannelwiseFp8LinearMethod,
-    Glm52ChannelwiseFp8MoEMethod,
+from sglang_tpu.fp8 import (
+    TpuChannelwiseFp8Config,
+    TpuChannelwiseFp8LinearMethod,
+    TpuChannelwiseFp8MoEMethod,
     TpuFp8Config,
 )
 
@@ -96,7 +96,7 @@ def _moe(config):
 
 def _dense():
     layer = torch.nn.Module()
-    method = Glm52ChannelwiseFp8LinearMethod(_config())
+    method = TpuChannelwiseFp8LinearMethod(_config())
     method.create_weights(
         layer,
         input_size_per_partition=3,
@@ -133,7 +133,7 @@ class _LoaderModel(DeepseekV2WeightLoaderMixin, torch.nn.Module):
 
 def _linear_for_loader(loader, widths, input_width=3):
     layer = torch.nn.Module()
-    method = Glm52ChannelwiseFp8LinearMethod(_config())
+    method = TpuChannelwiseFp8LinearMethod(_config())
     method.create_weights(
         layer,
         input_size_per_partition=input_width,
@@ -157,7 +157,12 @@ class TestGlm52Fp8OptIn(CustomTestCase):
                 Fp8Config,
                 True,
             ),
-            (_metadata(), Glm52ChannelwiseFp8Config, True),
+            (_metadata(), TpuChannelwiseFp8Config, True),
+            (
+                _metadata(tpu_checkpoint_layout="channelwise_fp8"),
+                TpuChannelwiseFp8Config,
+                True,
+            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             for metadata, expected_type, serialized in cases:
@@ -248,7 +253,7 @@ class TestGlm52Fp8OptIn(CustomTestCase):
         original = copy.deepcopy(metadata)
         with get_context().override_server_args(load_format="safetensors"):
             config = TpuFp8Config.from_config(metadata)
-        self.assertIs(type(config), Glm52ChannelwiseFp8Config)
+        self.assertIs(type(config), TpuChannelwiseFp8Config)
         self.assertTrue(config.is_checkpoint_fp8_serialized)
         self.assertEqual(config.activation_scheme, "dynamic")
         self.assertIsNone(config.weight_block_size)
@@ -319,7 +324,7 @@ class TestGlm52Fp8Packing(CustomTestCase):
             for column_parallel in (True, False):
                 with self.subTest(rank=rank, column_parallel=column_parallel):
                     layer = torch.nn.Module()
-                    method = Glm52ChannelwiseFp8LinearMethod(_config())
+                    method = TpuChannelwiseFp8LinearMethod(_config())
                     topology = SimpleNamespace(
                         tp_rank=rank, tp_size=2, use_presharded_weights=False
                     )
@@ -501,7 +506,7 @@ class TestGlm52Fp8Packing(CustomTestCase):
         with get_context().override_server_args(
             tp_size=1, pp_size=1, moe_runner_backend="pallas_tpu"
         ):
-            method = Glm52ChannelwiseFp8MoEMethod(_config())
+            method = TpuChannelwiseFp8MoEMethod(_config())
             # Bypass only the distributed runner constructor, not loader logic.
             layer = FusedMoE.__new__(FusedMoE)
             torch.nn.Module.__init__(layer)
@@ -623,6 +628,41 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
             get_flags().moe.override(runner_backend=MoeRunnerBackend.PALLAS_TPU)
         )
 
+    def test_generic_channelwise_abi_matches_legacy_without_model_whitelist(self):
+        fixture = _expert_fixture()
+        for hf_config in (
+            None,
+            SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+        ):
+            with (
+                self.subTest(hf_config=hf_config),
+                get_context().override_server_args(moe_runner_backend="pallas_tpu"),
+            ):
+                legacy = _moe(_config())
+                generic_config = _config(
+                    tpu_checkpoint_layout="channelwise_fp8", hf_config=hf_config
+                )
+                self.assertEqual(
+                    generic_config.tpu_checkpoint_layout, "channelwise_fp8"
+                )
+                generic = _moe(generic_config)
+                for layer in (legacy, generic):
+                    _load_expert_fixture(layer, fixture, blockwise=False)
+                    layer.quant_method.process_weights_after_loading(layer)
+                for stem in fixture:
+                    left, right = (
+                        getattr(layer, f"{stem}_weight") for layer in (legacy, generic)
+                    )
+                    self.assertTrue(
+                        torch.equal(left.view(torch.uint8), right.view(torch.uint8))
+                    )
+                    torch.testing.assert_close(
+                        getattr(legacy, f"{stem}_weight_scale"),
+                        getattr(generic, f"{stem}_weight_scale"),
+                        rtol=0,
+                        atol=0,
+                    )
+
     def test_block_conversion_and_offline_share_runtime(self):
         fixture = _expert_fixture()
         with (
@@ -671,67 +711,79 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
             q_lora_rank=None,
         )
         fixture = _expert_fixture()
-        with get_context().override_server_args(moe_runner_backend="pallas_tpu"):
-            config = _config(
-                hf_config=hf_config, ignored_layers=["model.layers.3.self_attn.o_proj"]
-            )
-            skipped = ReplicatedLinear.__new__(ReplicatedLinear)
-            torch.nn.Module.__init__(skipped)
-            self.assertIsInstance(
-                config.get_quant_method(skipped, "model.decoder.self_attn.o_proj"),
-                UnquantizedLinearMethod,
-            )
-            experts = _moe(config)
-            model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
-            torch.nn.Module.__init__(model)
-            model.config = hf_config
-            model.quant_config = config
-            model.num_fused_shared_experts = 0
-            model.pp_group = SimpleNamespace(is_last_rank=True)
-            model.model = torch.nn.Module()
-            model.model.decoder = torch.nn.Module()
-            model.model.decoder.self_attn = torch.nn.Module()
-            model.model.decoder.mlp = torch.nn.Module()
-            model.model.decoder.mlp.experts = experts
-            model.model.eh_proj = torch.nn.Linear(
-                8, 4, bias=False, dtype=torch.bfloat16
-            )
-            weights = [("model.layers.3.eh_proj.weight", torch.full((4, 8), 0.5))]
-            for stem, (_, _, q, scales) in fixture.items():
-                for expert in range(2):
-                    projections = (
-                        (("gate_proj", slice(0, 4)), ("up_proj", slice(4, 8)))
-                        if stem == "w13"
-                        else (("down_proj", slice(None)),)
-                    )
-                    for projection, rows in projections:
-                        prefix = f"model.layers.3.mlp.experts.{expert}.{projection}."
-                        weights.append((prefix + "weight", q[expert, rows]))
-                        weights.append(
-                            (prefix + "weight_scale_inv", scales[expert, rows])
+        for layout in ("channelwise_fp8", "glm52_channelwise_fp8"):
+            with (
+                self.subTest(layout=layout),
+                get_context().override_server_args(moe_runner_backend="pallas_tpu"),
+            ):
+                config = _config(
+                    tpu_checkpoint_layout=layout,
+                    hf_config=hf_config,
+                    ignored_layers=["model.layers.3.self_attn.o_proj"],
+                )
+                skipped = ReplicatedLinear.__new__(ReplicatedLinear)
+                torch.nn.Module.__init__(skipped)
+                self.assertIsInstance(
+                    config.get_quant_method(skipped, "model.decoder.self_attn.o_proj"),
+                    UnquantizedLinearMethod,
+                )
+                experts = _moe(config)
+                model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+                torch.nn.Module.__init__(model)
+                model.config = hf_config
+                model.quant_config = config
+                model.num_fused_shared_experts = 0
+                model.pp_group = SimpleNamespace(is_last_rank=True)
+                model.model = torch.nn.Module()
+                model.model.decoder = torch.nn.Module()
+                model.model.decoder.self_attn = torch.nn.Module()
+                model.model.decoder.mlp = torch.nn.Module()
+                model.model.decoder.mlp.experts = experts
+                model.model.eh_proj = torch.nn.Linear(
+                    8, 4, bias=False, dtype=torch.bfloat16
+                )
+                weights = [("model.layers.3.eh_proj.weight", torch.full((4, 8), 0.5))]
+                for stem, (_, _, q, scales) in fixture.items():
+                    for expert in range(2):
+                        projections = (
+                            (("gate_proj", slice(0, 4)), ("up_proj", slice(4, 8)))
+                            if stem == "w13"
+                            else (("down_proj", slice(None)),)
                         )
-            weights.insert(
-                0, ("model.layers.2.mlp.experts.0.gate_proj.weight", torch.zeros(4, 4))
-            )
-            model.load_weights(iter(weights))
-            torch.testing.assert_close(
-                model.model.eh_proj.weight,
-                torch.full((4, 8), 0.5, dtype=torch.bfloat16),
-            )
-            experts.quant_method.process_weights_after_loading(experts)
-            for stem, (_, _, q, scales) in fixture.items():
-                self.assertTrue(
-                    torch.equal(
-                        getattr(experts, f"{stem}_weight").view(torch.uint8),
-                        q.transpose(1, 2).contiguous().view(torch.uint8),
-                    )
+                        for projection, rows in projections:
+                            prefix = (
+                                f"model.layers.3.mlp.experts.{expert}.{projection}."
+                            )
+                            weights.append((prefix + "weight", q[expert, rows]))
+                            weights.append(
+                                (prefix + "weight_scale_inv", scales[expert, rows])
+                            )
+                weights.insert(
+                    0,
+                    (
+                        "model.layers.2.mlp.experts.0.gate_proj.weight",
+                        torch.zeros(4, 4),
+                    ),
                 )
+                model.load_weights(iter(weights))
                 torch.testing.assert_close(
-                    getattr(experts, f"{stem}_weight_scale").float().reshape(2, -1),
-                    scales.to(torch.bfloat16).float(),
-                    rtol=0,
-                    atol=0,
+                    model.model.eh_proj.weight,
+                    torch.full((4, 8), 0.5, dtype=torch.bfloat16),
                 )
+                experts.quant_method.process_weights_after_loading(experts)
+                for stem, (_, _, q, scales) in fixture.items():
+                    self.assertTrue(
+                        torch.equal(
+                            getattr(experts, f"{stem}_weight").view(torch.uint8),
+                            q.transpose(1, 2).contiguous().view(torch.uint8),
+                        )
+                    )
+                    torch.testing.assert_close(
+                        getattr(experts, f"{stem}_weight_scale").float().reshape(2, -1),
+                        scales.to(torch.bfloat16).float(),
+                        rtol=0,
+                        atol=0,
+                    )
 
 
 if __name__ == "__main__":
