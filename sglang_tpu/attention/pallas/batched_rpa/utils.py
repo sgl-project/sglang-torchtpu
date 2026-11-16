@@ -24,10 +24,17 @@ def align_to(a, b):
     return pl.cdiv(a, b) * b
 
 
-def cp_local_cache_len(global_kv_cache_len, cp_group_size, cp_rank, page_size):
-    """Number of cache tokens owned by this CP rank under page striping.
+def align_span(start, size, align):
+    """Returns (aligned_start, lead, aligned_size) for [start, start + size)."""
+    # Grows the span out to 'align'; an 'align' of 1 is the identity.
+    lead = start % align
+    return start - lead, lead, align_to(lead + size, align)
 
-    Page p lives on rank p % cp_group_size.
+
+def cp_local_cache_len(global_kv_cache_len, cp_group_size, cp_rank, page_size):
+    """Number of cache tokens owned by this CP rank.
+
+    Currently only support cp_kv_cache_interleave_size = page_size
     """
     super_page = cp_group_size * page_size
     full_tokens = (global_kv_cache_len // super_page) * page_size
@@ -55,6 +62,10 @@ def broadcast_minor(src, shape):
 
 def get_dtype_packing(dtype):
     return 32 // jax.dtypes.itemsize_bits(dtype)
+
+
+def get_dtype_bits(dtype):
+    return jax.dtypes.itemsize_bits(dtype)
 
 
 def strided_load(ref, start_row, num_rows, step, *, dtype=None):
@@ -139,15 +150,6 @@ def convert_to_target_bitwidth(val, target_bitwidth: int, kv_dtype: jnp.dtype):
             right, target_bitwidth=target_bitwidth, kv_dtype=kv_dtype
         )
         return left_out + right_out
-
-
-def without_cp_refs(kernel, *refs, num_scalar_prefetch: int):
-    """Calls `kernel` with None for the cp_rank / kv_lens_global scalar refs.
-
-    Those two refs follow the other scalar prefetches and are passed only with
-    cp_group_size, so every other program keeps its operands.
-    """
-    return kernel(*refs[:num_scalar_prefetch], None, None, *refs[num_scalar_prefetch:])
 
 
 def has_bank_conflicts(stride: int, distance=24, num_banks=32) -> bool:

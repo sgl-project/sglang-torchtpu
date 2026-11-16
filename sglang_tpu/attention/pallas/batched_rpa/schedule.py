@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""DMA schedule data structures and HBM/SMEM flush helpers for RPA."""
 
 import dataclasses
-import functools
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -51,15 +51,16 @@ class DmaNew(ABC):
     data: Any
     pos: Any
 
-    # HBM address to fetch new KV tokens from
+    # New-KV fetch. The new tokens are contiguous in HBM and in VMEM, so a
+    # single DMA covers them all: copy_in takes the addresses from entry 0 and
+    # the length from the sum of fetch_val over all entries.
     fetch_hbm = FieldOffset(is_abstract=True)
-    # VMEM offset within the block where new tokens are placed
     fetch_vmem = FieldOffset(is_abstract=True)
-    # HBM address to write the updated KV cache block back to
+    # Writeback, which stays per-entry because page_indices scatters the
+    # destinations. wb_hbm packs them as (page_idx << page_size_log2) | p_off.
     wb_hbm = FieldOffset(is_abstract=True)
-    # VMEM offset of the cache block to write back
     wb_vmem = FieldOffset(is_abstract=True)
-    # Bitpacked: Flags for whether to fetch or write back new tokens.
+    # Fetch/writeback token counts, packed per the subclass's field layout.
     _flags = FieldOffset(is_abstract=True)
 
     @staticmethod
@@ -93,26 +94,27 @@ class SeqAlongLaneDmaNew(DmaNew):
 
     @property
     def fetch_val(self):
-        return self._flags[...] & 1
+        # First 16 bits are for fetch
+        return self._flags[...] & 0xFFFF
 
     @property
     def wb_val(self):
-        return (self._flags[...] >> 1) & 1
+        # Last 16 bits are for writeback
+        return self._flags[...] >> 16
 
     def set_flags(self, fetch_val, wb_val):
-        self._flags[...] = fetch_val | (wb_val << 1)
+        self._flags[...] = fetch_val | (wb_val << 16)
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class HeadAlongSublaneDmaNew(DmaNew):
+    # Each page writes back exactly the tokens it fetched, from the offset it
+    # fetched them into, so vmem offsets and token counts alias down to 4 slots.
     wb_hbm = FieldOffset(0)
     fetch_hbm = FieldOffset(1)
     fetch_vmem = FieldOffset(2)
     wb_vmem = FieldOffset(2)
-    # fetch size in the low 16 bits, writeback size in the high 16 (a page is
-    # at most 2**16 tokens). They differ under context parallelism, where a
-    # rank fetches every new token but writes back only its own pages.
     _flags = FieldOffset(3)
 
     @staticmethod
@@ -121,14 +123,47 @@ class HeadAlongSublaneDmaNew(DmaNew):
 
     @property
     def fetch_val(self):
-        return self._flags[...] & 0xFFFF
+        return self._flags[...]
 
     @property
     def wb_val(self):
-        return self._flags[...] >> 16
+        return self._flags[...]
 
     def set_flags(self, fetch_val, wb_val):
-        self._flags[...] = fetch_val | (wb_val << 16)
+        self._flags[...] = fetch_val
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class HeadAlongSublaneDmaNewCP(DmaNew):
+    """Like HeadAlongSublaneDmaNew but with separate fetch/wb flags for CP.
+
+    wb_val encodes per-page ownership (dma_sz if this rank owns the page,
+    else 0), so bref_override copy_out needs no CP-specific logic.
+    """
+
+    wb_hbm = FieldOffset(0)
+    fetch_hbm = FieldOffset(1)
+    fetch_vmem = FieldOffset(2)
+    wb_vmem = FieldOffset(2)
+    _fetch_flags = FieldOffset(3)
+    _wb_flags = FieldOffset(4)
+
+    @staticmethod
+    def num_fields() -> int:
+        return 5
+
+    @property
+    def fetch_val(self):
+        return self._fetch_flags[...]
+
+    @property
+    def wb_val(self):
+        return self._wb_flags[...]
+
+    def set_flags(self, fetch_val, wb_val):
+        self._fetch_flags[...] = fetch_val
+        self._wb_flags[...] = wb_val
 
 
 @jax.tree_util.register_dataclass
@@ -210,12 +245,20 @@ class RpaSchedule:
     total_wait_kv_out: SmemWrapper  # [steps]
     total_wait_q_in: SmemWrapper  # [steps]
     total_wait_o_out: SmemWrapper  # [steps]
+    total_wait_lse_out: SmemWrapper  # [steps]
     actual_steps: Any  # [1]
 
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
+    kv_interleaved_size: int = dataclasses.field(default=1, metadata=dict(static=True))
 
     @classmethod
-    def create_shape_dtype(cls, cfgs: configs.RpaConfigs, multiplier: int = 1):
+    def create_shape_dtype(
+        cls,
+        cfgs: configs.RpaConfigs,
+        dma_kv_new_struct_cls: type[DmaNew] = SeqAlongLaneDmaNew,
+        multiplier: int = 1,
+        kv_interleaved_size: int = 1,
+    ):
         effective_max_steps = cfgs.max_steps_ub * multiplier
 
         idx_wrapper = SmemWrapper.create_shape_dtype(
@@ -242,19 +285,17 @@ class RpaSchedule:
                     cfgs.batch_size,
                     cfgs.bkv_p_new,
                 ),
-                struct_cls=(
-                    SeqAlongLaneDmaNew
-                    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
-                    else HeadAlongSublaneDmaNew
-                ),
-                struct_size=cfgs.dma_kv_new_size,
+                struct_cls=dma_kv_new_struct_cls,
+                struct_size=dma_kv_new_struct_cls.num_fields(),
             ),
             total_wait_kv_in=steps_wrapper,
             total_wait_kv_out=steps_wrapper,
             total_wait_q_in=steps_wrapper,
             total_wait_o_out=steps_wrapper,
+            total_wait_lse_out=steps_wrapper,
             actual_steps=jax.ShapeDtypeStruct((1,), jnp.int32),
             cfgs=cfgs,
+            kv_interleaved_size=kv_interleaved_size,
         )
 
     def get_dma_kv_cache(
@@ -341,6 +382,7 @@ def _mask_out_steps(
     schedule_smem.total_wait_kv_out[step] = 0
     schedule_smem.total_wait_q_in[step] = 0
     schedule_smem.total_wait_o_out[step] = 0
+    schedule_smem.total_wait_lse_out[step] = 0
 
 
 def _write_schedule_to_hbm(
@@ -401,24 +443,11 @@ def _compute_waits(
         # KV IN
         kv_in_tokens = 0
         for b in range(cfgs.batch_size):
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                for i in range(cfgs.bkv_p_cache):
-                    _, _, dma_valid = schedule.get_dma_kv_cache(step, b, i)
-                    kv_in_tokens += dma_valid * cfgs.serve.page_size
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_in_tokens += jnp.where(
-                        dma_entry.fetch_val > 0, cfgs.serve.page_size, 0
-                    )
-            else:
-                for i in range(cfgs.bkv_p_cache):
-                    _, _, sz = schedule.get_dma_kv_cache(step, b, i)
-                    kv_in_tokens += sz
-                total_new_sz = 0
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    total_new_sz += dma_entry.fetch_val
-                kv_in_tokens += total_new_sz
+            for i in range(cfgs.bkv_p_cache):
+                _, _, sz = schedule.get_dma_kv_cache(step, b, i)
+                kv_in_tokens += sz
+            for i in range(cfgs.bkv_p_new):
+                kv_in_tokens += schedule.dma_kv_new[step, b, i].fetch_val
 
         schedule.total_wait_kv_in[step] = (
             kv_in_tokens * kv_bytes_per_token
@@ -428,16 +457,9 @@ def _compute_waits(
         kv_out_tokens = 0
         for b in range(cfgs.batch_size):
             do_writeback = schedule.do_writeback[step, b] == 1
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_out_tokens += jnp.where(
-                        do_writeback & (dma_entry.wb_val > 0), cfgs.serve.page_size, 0
-                    )
-            else:
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_out_tokens += jnp.where(do_writeback, dma_entry.wb_val, 0)
+            for i in range(cfgs.bkv_p_new):
+                dma_entry = schedule.dma_kv_new[step, b, i]
+                kv_out_tokens += jnp.where(do_writeback, dma_entry.wb_val, 0)
 
         schedule.total_wait_kv_out[step] = (
             kv_out_tokens * kv_bytes_per_token
@@ -460,6 +482,11 @@ def _compute_waits(
             o_out_tokens += jnp.where(is_last_k, q_sz, 0)
         schedule.total_wait_o_out[step] = (
             o_out_tokens * o_bytes_per_token
+        ) // dma_chunk_size
+
+        # LSE OUT
+        schedule.total_wait_lse_out[step] = (
+            o_out_tokens * cfgs.lse_bytes_per_token
         ) // dma_chunk_size
 
     jax.lax.fori_loop(start_step, end_step, body, None)
@@ -503,493 +530,31 @@ class LoopCarry:
     count: jax.Array | int
 
 
-def compute_metadata(
-    cu_q_lens_ref: jax.Ref,
-    kv_lens_ref: jax.Ref,
-    distribution_ref: jax.Ref,
-    schedule: RpaSchedule,
-    schedule_hbm_ref: RpaSchedule,
-    dma_sem: jax.Ref,
-    *,
-    cfgs: configs.RpaConfigs,
-    skip_kv_update: bool = False,
-    cp_rank_ref: jax.Ref | None = None,
-    kv_lens_global_ref: jax.Ref | None = None,
-) -> LoopCarry:
-    """Fill metadata using triple nested loop of seq->q->k loop.
-
-    When `skip_kv_update=True` (cross-layer KV-share path): the current step's
-    K/V tokens are NOT pulled from the input k/v tensors, the whole `kv_len` is
-    read from the (redirected) cache slot, and `do_writeback` is forced to 0 so
-    the kernel doesn't overwrite the source layer's cache contents.
-
-    `cfgs.serve.cache_only` reads the whole `kv_len` from the cache too, but the
-    queries follow every key: no causal bound, and every q block gets at least
-    one k block. `cp_rank_ref` / `kv_lens_global_ref` (with `cp_group_size`)
-    move the sliding window to global positions.
-    """
-
-    @jax.named_scope("k_loop")
-    def k_loop(
-        k_idx,
-        carry: LoopCarry,
-        *,
-        s_idx,
-        q_idx,
-        q_end,
-        q_src,
-        q_sz_task,
-        k_len,
-        q_len,
-        end_k_idx,
-    ):
-        count = carry.count
-        step, target_lane = divmod(count, cfgs.batch_size)
-
-        schedule.s_idx[step, target_lane] = s_idx
-        schedule.q_idx[step, target_lane] = q_idx
-        schedule.k_idx[step, target_lane] = k_idx
-
-        is_last_k = jnp.where(k_idx == end_k_idx - 1, 1, 0)
-        schedule.is_last_k[step, target_lane] = is_last_k
-
-        schedule.dma_q[step, target_lane, 0] = q_src
-        schedule.dma_q[step, target_lane, 1] = q_sz_task
-
-        kv_len_start = k_idx * cfgs.bkv_sz
-        kv_p_start = k_idx * cfgs.bkv_p
-        kv_left = k_len - kv_len_start
-        if cfgs.serve.cache_only:
-            # Every key comes from the cache; a guard k block past the end of a
-            # short shard reads none.
-            kv_left = jnp.maximum(kv_left, 0)
-            kv_left_frm_cache = kv_left
-        elif skip_kv_update:
-            # KV-share: read everything from cache. The source (target) layer's
-            # call ran earlier in this step and already wrote the current-step
-            # K/V into the (redirected) cache slot, so this shared layer's
-            # locally-computed k/v is unused. Drives kv_left_frm_new -> 0 ->
-            # new_sz -> 0 -> do_writeback -> 0 automatically.
-            kv_left_frm_cache = kv_left
-        elif cfgs.serve.attention_scope == configs.AttentionScope.STRIPED:
-            # Under STRIPED decode, this rank only writes back if it owns the page
-            # of the new token (global position k_len_global - 1).
-            k_len_global = (
-                kv_lens_global_ref[s_idx] if kv_lens_global_ref is not None else 0
-            )
-            page_size = cfgs.serve.page_size
-            cp_size = cfgs.serve.cp_group_size
-            rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
-            owns_token = (
-                (k_len_global > 0)
-                & (q_len == 1)
-                & (((k_len_global - 1) // page_size) % cp_size == rank)
-            )
-            kv_left_frm_cache = jnp.where(
-                owns_token, jnp.maximum(kv_left - q_len, 0), kv_left
-            )
-        else:
-            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
-        p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
-        # NEW_TOKENS_ONLY keeps the cached keys' VMEM slots (so the new tokens
-        # sit at their global offsets and the page-aligned writeback below
-        # applies) but, on HEAD_ALONG_SUBLANE, fetches none of them; the
-        # kernel masks them out. SEQ_ALONG_LANE writes back whole pages, so
-        # the one page the first new token shares with cached keys is fetched
-        # (its cached head would otherwise be written back stale); every
-        # other cached page stays unfetched. Under cp_group_size the lengths
-        # are global and the cache page-striped: global page g is local slot
-        # g // cp on rank g % cp, and only that rank fetches (and writes) it.
-        skip_cached = cfgs.serve.attention_scope.skips_cached_keys
-        cp_size = cfgs.serve.cp_group_size
-        rank = cp_rank_ref[0] if cp_rank_ref is not None else 0
-        sal = cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
-
-        for i in range(cfgs.bkv_p_cache):
-            dst_vmem = i << cfgs.serve.page_size_log2
-            dma_sz = kv_left_frm_cache - dst_vmem
-            dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
-
-            src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
-            if skip_cached:
-                if sal:
-                    # Only the page shared with the first new token, and only
-                    # on the rank that owns it.
-                    shared = (dma_sz > 0) & (dma_sz < cfgs.serve.page_size)
-                    if cp_size is not None:
-                        g = kv_p_start + i
-                        shared &= g % cp_size == rank
-                        src_hbm = s_idx * cfgs.serve.pages_per_seq + jnp.minimum(
-                            g // cp_size, cfgs.serve.pages_per_seq - 1
-                        )
-                    dma_sz = jnp.where(shared, dma_sz, 0)
-                else:
-                    dma_sz = 0
-
-            if sal:
-                dma_valid = jnp.where(dma_sz > 0, 1, 0)
-                schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-                schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-                schedule.dma_kv_cache[step, target_lane, i, 2] = dma_valid
-            else:
-                schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-                schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-                schedule.dma_kv_cache[step, target_lane, i, 2] = dma_sz
-
-        kv_left_frm_new = kv_left - kv_left_frm_cache
-        bkv_sz_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
-        new_sz = jnp.minimum(cfgs.bkv_sz - bkv_sz_cache, kv_left_frm_new)
-
-        # Writeback logic: each new k block is written back by the first q block
-        # that attends to it.
-        q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
-
-        do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
-        if cfgs.serve.skip_kv_write:
-            do_writeback = 0
-        schedule.do_writeback[step, target_lane] = do_writeback
-        src_hbm = q_end - kv_left_frm_new
-
-        def fill_dma_kv_new(i, dst_vmem, dma_sz, slot_start):
-            dma_entry = schedule.dma_kv_new[step, target_lane, i]
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
-                hbm_token_idx_base = q_end - kv_left_frm_new
-                new_tok_offset = hbm_token_idx_base % cfgs.serve.page_size
-                # If new_sz = 150, new_tok_offset = 120, page_size = 128.  The new
-                # tokens occupy indices 120 through 269 relative to the HBM page
-                # boundaries.  This spans 3 pages: [120-127], [128-255], and [256-269].
-                # (120 + 150 - 1) // 128 + 1 = 269 // 128 + 1 = 3 pages.
-                num_pages_to_fetch = jnp.where(
-                    new_sz > 0,
-                    (new_tok_offset + new_sz - 1) // cfgs.serve.page_size + 1,
-                    0,
-                )
-                fetch_val = jnp.where(i < num_pages_to_fetch, 1, 0)
-                new_page_start = (
-                    hbm_token_idx_base - new_tok_offset
-                ) + i * cfgs.serve.page_size
-                # Fetched pages of new tokens are placed sequentially in VMEM
-                # immediately following the existing cached pages. E.g., if
-                # cache_pages=2, new pages go to offsets 2*page_size, 3*page_size, etc.
-                fetch_vmem = (cache_pages + i) * cfgs.serve.page_size
-                tok_idx = kv_len_start + slot_start
-                if skip_cached and cp_size is not None:
-                    # Page-striped cache: global page g lives in local slot
-                    # g // cp of rank g % cp. Only the owner writes, and only
-                    # for multi-token rows (a single new token is written by
-                    # the STRIPED launch that also attends it). The page's
-                    # cached head was fetched above, so the whole-page write
-                    # carries it back intact.
-                    g = jnp.minimum(
-                        tok_idx >> cfgs.serve.page_size_log2,
-                        cfgs.serve.pages_per_seq * cp_size - 1,
-                    )
-                    p_idx = g // cp_size
-                    wb_val = jnp.where(
-                        (dma_sz > 0) & (g % cp_size == rank) & (q_len > 1), 1, 0
-                    )
-                else:
-                    p_idx = jnp.minimum(
-                        tok_idx >> cfgs.serve.page_size_log2,
-                        cfgs.serve.pages_per_seq - 1,
-                    )
-                    wb_val = jnp.where(dma_sz > 0, 1, 0)
-                dst_hbm = s_idx * cfgs.serve.pages_per_seq + p_idx
-
-                dma_entry.fetch_hbm[...] = new_page_start
-                dma_entry.fetch_vmem[...] = fetch_vmem
-                dma_entry.wb_hbm[...] = dst_hbm
-                dma_entry.wb_vmem[...] = slot_start
-                dma_entry.set_flags(fetch_val, wb_val)
-            else:
-                tok_idx = kv_len_start + dst_vmem
-                p_off = tok_idx & cfgs.serve.page_size_mask
-                if skip_cached and cp_size is not None:
-                    # Page-striped cache: global page g lives in local slot
-                    # g // cp of rank g % cp. Only the owner writes, and only
-                    # for multi-token rows (a single new token is written by
-                    # the STRIPED launch that also attends it).
-                    p_idx = jnp.minimum(
-                        tok_idx >> cfgs.serve.page_size_log2,
-                        cfgs.serve.pages_per_seq * cp_size - 1,
-                    )
-                    local_slot = p_idx // cp_size
-                    wb_sz = jnp.where(
-                        (p_idx % cp_size == rank) & (q_len > 1), dma_sz, 0
-                    )
-                else:
-                    local_slot = jnp.minimum(
-                        tok_idx >> cfgs.serve.page_size_log2,
-                        cfgs.serve.pages_per_seq - 1,
-                    )
-                    wb_sz = dma_sz
-                dst_hbm = (
-                    (s_idx * cfgs.serve.pages_per_seq + local_slot)
-                    << cfgs.serve.page_size_log2
-                ) | p_off
-
-                dma_entry.fetch_hbm[...] = src_hbm
-                dma_entry.fetch_vmem[...] = dst_vmem
-                dma_entry.wb_hbm[...] = dst_hbm
-                dma_entry.set_flags(dma_sz, wb_sz)
-
-        if cfgs.block.bq_sz == 1:
-            # Decode path
-            assert cfgs.bkv_p_new == 1
-            slot_start = (bkv_sz_cache // cfgs.serve.page_size) * cfgs.serve.page_size
-            fill_dma_kv_new(0, bkv_sz_cache, new_sz, slot_start)
-        else:
-            iters = max(cfgs.bkv_p, cfgs.bkv_p_new)
-            for i in range(iters):
-                slot_start = i * cfgs.serve.page_size
-                slot_end = slot_start + cfgs.serve.page_size
-
-                dst_vmem = jnp.maximum(slot_start, bkv_sz_cache)
-                end_in_slot = jnp.minimum(slot_end, bkv_sz_cache + new_sz)
-                dma_sz = jnp.maximum(0, end_in_slot - dst_vmem)
-
-                fill_dma_kv_new(i, dst_vmem, dma_sz, slot_start)
-
-        def flush(carry: LoopCarry):
-            hbm_offset = carry.hbm_offset
-            count = carry.count
-            new_hbm_offset, _ = flush_to_hbm(
-                count,
-                schedule,
-                schedule_hbm_ref,
-                hbm_offset,
-                dma_sem,
-                cfgs=cfgs,
-            )
-            return LoopCarry(new_hbm_offset, 0)
-
-        hbm_offset = carry.hbm_offset
-        new_count = count + 1
-
-        return jax.lax.cond(
-            new_count < cfgs.max_steps_ub * cfgs.batch_size,
-            lambda carry: carry,
-            flush,
-            LoopCarry(hbm_offset, new_count),
-        )
-
-    @jax.named_scope("q_loop")
-    def q_loop(
-        q_idx, carry, *, s_idx, q_start, q_end, k_len, q_len, num_k, q_global_start
-    ):
-        q_src = q_start + q_idx * cfgs.bq_sz
-        q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
-
-        start_k_idx = 0
-        if (sliding_window := cfgs.model.sliding_window) is not None:
-            if (
-                q_global_start is not None
-                and cfgs.serve.attention_scope.walks_cache_stripe
-            ):
-                # First local key inside the window of the block's first query.
-                # The cache is page-striped: local page l of this rank is
-                # global page l * cp_group_size + cp_rank, so the first local
-                # page at or after the window's first global page p0 is
-                # ceil((p0 - cp_rank) / cp_group_size); keys of that page before
-                # the window are masked by the kernel.
-                cp_group_size = cfgs.serve.cp_group_size
-                first_global = jnp.maximum(
-                    q_global_start + q_idx * cfgs.bq_sz - sliding_window + 1, 0
-                )
-                first_page = first_global >> cfgs.serve.page_size_log2
-                first_local_page = (
-                    jnp.maximum(first_page - cp_rank_ref[0] + cp_group_size - 1, 0)
-                    // cp_group_size
-                )
-                start_k_idx = (
-                    first_local_page << cfgs.serve.page_size_log2
-                ) // cfgs.bkv_sz
-            elif cfgs.serve.cache_only:
-                sw_start_idx = k_len + q_idx * cfgs.bq_sz - sliding_window + 1
-                start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
-            else:
-                sw_start_idx = k_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
-                start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
-        if cfgs.serve.attention_scope.skips_cached_keys:
-            # Cached keys are not attended: start at the block holding the
-            # first new token.
-            start_k_idx = jnp.maximum(start_k_idx, (k_len - q_len) // cfgs.bkv_sz)
-
-        if cfgs.serve.cache_only or cfgs.serve.attention_scope.walks_cache_stripe:
-            # No causal bound. One k block always runs, so a q block with no key
-            # in range still writes output 0 and LSE -inf.
-            end_k_idx = jnp.maximum(num_k, start_k_idx + 1)
-        else:
-            end_k_idx_causal = (
-                k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task - 1
-            ) // cfgs.bkv_sz + 1
-            end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
-            if (
-                cfgs.serve.attention_scope.skips_cached_keys
-                and cfgs.serve.cp_group_size is not None
-            ):
-                # A single-token row is the STRIPED launch's (attended and
-                # written there); leave it unprocessed here: output untouched,
-                # LSE -inf.
-                end_k_idx = jnp.where(q_len == 1, start_k_idx, end_k_idx)
-
-        k_loop_fn = functools.partial(
-            k_loop,
-            s_idx=s_idx,
-            q_idx=q_idx,
-            q_end=q_end,
-            q_src=q_src,
-            q_sz_task=q_sz_task,
-            k_len=k_len,
-            q_len=q_len,
-            end_k_idx=end_k_idx,
-        )
-
-        return jax.lax.fori_loop(start_k_idx, end_k_idx, k_loop_fn, carry)
-
-    @jax.named_scope("seq_loop")
-    def seq_loop(s_idx, carry):
-        q_start = cu_q_lens_ref[s_idx]
-        q_end = cu_q_lens_ref[s_idx + 1]
-        k_len = kv_lens_ref[s_idx]
-        q_len = q_end - q_start
-
-        num_q = pl.cdiv(q_len, cfgs.bq_sz)
-        num_k = pl.cdiv(k_len, cfgs.bkv_sz)
-        # Global position of the sequence's first query.
-        q_global_start = None
-        if kv_lens_global_ref is not None:
-            q_global_start = kv_lens_global_ref[s_idx] - q_len
-
-        q_loop_fn = functools.partial(
-            q_loop,
-            s_idx=s_idx,
-            q_start=q_start,
-            q_end=q_end,
-            k_len=k_len,
-            q_len=q_len,
-            num_k=num_k,
-            q_global_start=q_global_start,
-        )
-
-        return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
-
-    start_seq_idx, end_seq_idx = cfgs.mode.get_range(distribution_ref)
-    init_carry = LoopCarry(0, 0)
-    return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop, init_carry)
-
-
-def rpa_metadata_schedule_kernel(
-    ## Scalar prefetch.
-    cu_q_lens_ref: jax.Ref,
-    kv_lens_ref: jax.Ref,
-    distribution_ref: jax.Ref,
-    # Scalar prefetch with cp_group_size, None otherwise.
-    cp_rank_ref: jax.Ref | None,
-    kv_lens_global_ref: jax.Ref | None,
-    # Outputs.
-    schedule_hbm_ref: RpaSchedule,
-    # Scratch.
+def advance_carry(
+    carry: LoopCarry,
     schedule_ref: RpaSchedule,
+    schedule_hbm_ref: RpaSchedule,
     dma_sem: jax.Ref,
     *,
     cfgs: configs.RpaConfigs,
-    skip_kv_update: bool = False,
-):
-    """Generates the HBM-to-VMEM DMA schedule.
+) -> LoopCarry:
+    """Increments the step counter and flushes SMEM schedule to HBM when full."""
+    new_count = carry.count + 1
 
-    This kernel:
-    1. Iterates through each (potentially ragged) sequence
-    2. Breaks Queries (Q) and Key-Values (KV) into blocks (bq_sz, bkv_sz).
-    3. Assigns tasks to 'lanes' (TPU batch items) based on current lane occupancy
-        to ensure balanced execution across the batch dimension.
-    4. Encodes DMA offsets:
-        - dma_q: HBM start index and size for Query blocks.
-        - dma_kv_cache: Paged indices for existing KV tokens.
-        - dma_kv_new: offsets for new tokens being added to the cache.
-        - do_writeback: boolean flag indicating if a block should be flushed to
-        HBM (ie does this block contain new tokens to add to KV cache).
+    def _flush(c: LoopCarry) -> LoopCarry:
+        new_hbm_offset, _ = flush_to_hbm(
+            c.count,
+            schedule_ref,
+            schedule_hbm_ref,
+            c.hbm_offset,
+            dma_sem,
+            cfgs=cfgs,
+        )
+        return LoopCarry(new_hbm_offset, 0)
 
-    Args:
-        cu_q_lens_ref: [max_num_seqs + 1]. Cumulative sum of each sequence's query
-            length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
-            b=cu_q_lens[i+1] represents q/k/v of sequence i.
-        kv_lens_ref: [max_num_seqs]. Existing kv cache length of each sequence.
-        distribution_ref: [3]. Cumulative sum of the number of mixed, prefill
-            and decode sequences, in that batch order (see ``RpaCase``).
-        schedule_hbm_ref: HBM memory that will store output of the kernel.
-        schedule_ref: Scratch memory where schedule results gets written.
-        dma_sem: Semaphore used for writing scheduler output to HBM.
-        cfgs: Configuration of the kernel.
-    """
-
-    # Step 1: Compute and fill scheduler metadata.
-    loop_carry = compute_metadata(
-        cu_q_lens_ref,
-        kv_lens_ref,
-        distribution_ref,
-        schedule_ref,
-        schedule_hbm_ref,
-        dma_sem,
-        cfgs=cfgs,
-        skip_kv_update=skip_kv_update,
-        cp_rank_ref=cp_rank_ref,
-        kv_lens_global_ref=kv_lens_global_ref,
+    return jax.lax.cond(
+        new_count < cfgs.max_steps_ub * cfgs.batch_size,
+        lambda c: c,
+        _flush,
+        LoopCarry(carry.hbm_offset, new_count),
     )
-    count = loop_carry.count
-    hbm_offset = loop_carry.hbm_offset
-    steps = pl.cdiv(count, cfgs.batch_size) + hbm_offset
-    schedule_ref.actual_steps[0] = steps
-
-    # Step 3: Mask out unvisited steps.
-    flush_to_hbm(
-        count,
-        schedule_ref,
-        schedule_hbm_ref,
-        hbm_offset,
-        dma_sem,
-        cfgs=cfgs,
-    )
-
-
-def generate_rpa_metadata(
-    cu_q_lens: jax.Array,
-    kv_lens: jax.Array,
-    distribution: jax.Array,
-    cfgs: configs.RpaConfigs,
-    *,
-    interpret=False,
-    skip_kv_update: bool = False,
-    cp_rank: jax.Array | None = None,
-    kv_lens_global: jax.Array | None = None,
-) -> RpaSchedule:
-    schedule_shaped_dtype = RpaSchedule.create_shape_dtype(cfgs)
-    schedule_hbm = RpaSchedule.create_shape_dtype(
-        cfgs, multiplier=cfgs.max_schedule_size_multiplier
-    )
-
-    kernel = functools.partial(
-        rpa_metadata_schedule_kernel, cfgs=cfgs, skip_kv_update=skip_kv_update
-    )
-    scalar_prefetches = (cu_q_lens, kv_lens, distribution)
-    if cfgs.serve.cp_group_size is None:
-        kernel = functools.partial(utils.without_cp_refs, kernel, num_scalar_prefetch=3)
-    else:
-        scalar_prefetches += (cp_rank, kv_lens_global)
-
-    return pl.pallas_call(
-        kernel,
-        out_shape=schedule_hbm,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=len(scalar_prefetches),
-            in_specs=[],
-            out_specs=schedule_hbm.out_specs(),
-            scratch_shapes=[
-                schedule_shaped_dtype.scratch_shapes(),
-                pltpu.SemaphoreType.DMA((1,)),
-            ],
-        ),
-        interpret=interpret,
-        name="rpa_metadata_schedule",
-    )(*scalar_prefetches)

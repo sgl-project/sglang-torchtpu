@@ -339,12 +339,12 @@ class TestPrefillBlockSizes(CustomTestCase):
                         full_prefill.bq_c_sz,
                         full_prefill.bkv_sz,
                         full_prefill.batch_size,
-                        full_prefill.n_buffer,
+                        configs.NUM_INPUT_SLOTS,
                     ),
                     (64, 16, 512, 1, 3),
                 )
                 self.assertEqual(
-                    (swa_prefill.bq_sz, swa_prefill.bkv_sz, swa_prefill.n_buffer),
+                    (swa_prefill.bq_sz, swa_prefill.bkv_sz, configs.NUM_INPUT_SLOTS),
                     (64, 256, 3),
                 )
 
@@ -473,7 +473,6 @@ class TestKernelBlockSizes(CustomTestCase):
                     self.assertEqual(blocks.bkv_sz % page_size, 0)
                     self.assertGreaterEqual(blocks.bkv_sz, page_size)
                     self.assertGreaterEqual(blocks.batch_size, 1)
-                    self.assertGreaterEqual(blocks.n_buffer, 1)
                 self.assertGreater(block_sizes[1].bq_sz, 1)
 
     def test_grown_mixed_q_block_is_never_one_token(self):
@@ -483,11 +482,14 @@ class TestKernelBlockSizes(CustomTestCase):
 
         from sglang_tpu.attention.pallas.batched_rpa import configs
 
+        # With three input buffers the one-page decode k block of this shape
+        # needs 52 MiB at page size 512 (at 1024 it no longer fits a 64 MiB
+        # chip at all), so the budgets start below that.
         shrunk = 0
-        for vmem_mib in range(30, 46):
+        for vmem_mib in range(44, 64):
             try:
                 _, prefill = self._block_sizes(
-                    page_size=1024,
+                    page_size=512,
                     kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
                     dtype_kv=jnp.bfloat16,
                     geometry=(16, 16, 64, None),
@@ -536,9 +538,7 @@ class TestKernelBlockSizes(CustomTestCase):
         )
 
         def validate(bkv_sz, mode):
-            block = configs.BlockSizes(
-                bq_sz=1, bq_c_sz=1, bkv_sz=bkv_sz, batch_size=1, n_buffer=2
-            )
+            block = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=bkv_sz, batch_size=1)
             configs.RpaConfigs(
                 block=block,
                 model=model,
@@ -564,7 +564,9 @@ class TestKernelBlockSizes(CustomTestCase):
         from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
         from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
-        page_size, num_seqs, pages_per_seq, vmem_limit_bytes = 256, 4, 2, 1 << 20
+        # 512 KiB: the search gives a smaller q block before it refuses, so it
+        # takes a budget below one lane's k buffers to make it refuse.
+        page_size, num_seqs, pages_per_seq, vmem_limit_bytes = 256, 4, 2, 1 << 19
         with self.assertRaises(ValueError):
             self._block_sizes(
                 page_size=page_size,
@@ -576,10 +578,10 @@ class TestKernelBlockSizes(CustomTestCase):
         attention = functools.partial(
             wrapper.ragged_paged_attention,
             decode_block_sizes=configs.BlockSizes(
-                bq_sz=1, bq_c_sz=1, bkv_sz=page_size, batch_size=1, n_buffer=2
+                bq_sz=1, bq_c_sz=1, bkv_sz=page_size, batch_size=1
             ),
             prefill_block_sizes=configs.BlockSizes(
-                bq_sz=16, bq_c_sz=16, bkv_sz=page_size, batch_size=1, n_buffer=2
+                bq_sz=16, bq_c_sz=16, bkv_sz=page_size, batch_size=1
             ),
             vmem_limit_bytes=vmem_limit_bytes,
         )
@@ -600,13 +602,13 @@ class TestKernelBlockSizes(CustomTestCase):
             )
 
     def test_budget_below_one_lane_and_one_buffer_is_refused(self):
-        """A VMEM budget too small for one lane and one buffer is refused, not
-        answered with a buffer count below one."""
+        """A VMEM budget too small for one lane of the kernel's fixed buffers is
+        refused, not answered with a lane count below one."""
         import jax.numpy as jnp
 
         from sglang_tpu.attention.pallas.batched_rpa import configs
 
-        for vmem_limit_bytes in (1 << 18, 1 << 19, 1 << 20, 1 << 21):
+        for vmem_limit_bytes in (1 << 18, 1 << 19, 1 << 20):
             with self.subTest(vmem_limit_bytes=vmem_limit_bytes):
                 with self.assertRaises(ValueError):
                     self._block_sizes(

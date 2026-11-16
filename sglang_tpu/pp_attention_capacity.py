@@ -58,12 +58,14 @@ def _capacity_for_shape(
             mode=configs.RpaCase.DECODE if mode == "decode" else configs.RpaCase.MIXED,
             vmem_limit_bytes=vmem,
         )
-        return _capacity_from_config(cfg, pages_per_seq, page_size)
+        return _capacity_from_config(
+            cfg, pages_per_seq, page_size, configs.NUM_INPUT_SLOTS
+        )
 
 
-def _capacity_from_config(cfg, pages_per_seq, page_size):
+def _capacity_from_config(cfg, pages_per_seq, page_size, num_input_slots):
     block = cfg.block
-    per_lane = cfg.max_steps_ub * cfg.max_schedule_size_multiplier - block.n_buffer - 1
+    per_lane = cfg.max_steps_ub * cfg.max_schedule_size_multiplier - num_input_slots - 1
     if block.batch_size > 1:
         per_lane -= -(-pages_per_seq * page_size // block.bkv_sz)
     return max(0, per_lane) * block.batch_size, block.bq_sz, block.bkv_sz

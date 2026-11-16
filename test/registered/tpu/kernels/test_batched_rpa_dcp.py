@@ -105,14 +105,14 @@ def _small_decode_blocks():
     """One page per k block, so long shards span several k blocks."""
     from sglang_tpu.attention.pallas.batched_rpa.configs import BlockSizes
 
-    return BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=PAGE_SIZE, batch_size=8, n_buffer=3)
+    return BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=PAGE_SIZE, batch_size=8)
 
 
 def _small_prefill_blocks():
     """Several q blocks per chunk, two compute tiles per q block, two lanes."""
     from sglang_tpu.attention.pallas.batched_rpa.configs import BlockSizes
 
-    return BlockSizes(bq_sz=128, bq_c_sz=64, bkv_sz=PAGE_SIZE, batch_size=2, n_buffer=3)
+    return BlockSizes(bq_sz=128, bq_c_sz=64, bkv_sz=PAGE_SIZE, batch_size=2)
 
 
 def _round_to_bf16(array: np.ndarray) -> np.ndarray:
