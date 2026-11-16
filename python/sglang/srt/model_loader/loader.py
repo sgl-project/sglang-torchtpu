@@ -120,9 +120,9 @@ from sglang.srt.model_loader.weight_utils import (
     gguf_quant_weights_iterator,
     initialize_capture_safe_weights,
     initialize_dummy_weights,
-    maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
+    prepare_mtp_safetensors,
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
@@ -650,7 +650,7 @@ class DefaultModelLoader(BaseModelLoader):
                 source.allow_patterns_overrides,
             )
             if use_safetensors and source.model_config is not None:
-                hf_weights_files = maybe_add_mtp_safetensors(
+                hf_weights_files = prepare_mtp_safetensors(
                     hf_weights_files,
                     hf_folder,
                     "model.safetensors.index.json",
@@ -820,7 +820,7 @@ class DefaultModelLoader(BaseModelLoader):
                 source.allow_patterns_overrides,
             )
             if use_safetensors and source.model_config is not None:
-                weight_files = maybe_add_mtp_safetensors(
+                weight_files = prepare_mtp_safetensors(
                     weight_files,
                     hf_folder,
                     "model.safetensors.index.json",
@@ -4275,7 +4275,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         )
 
         if source.model_config is not None:
-            hf_weights_files = maybe_add_mtp_safetensors(
+            hf_weights_files = prepare_mtp_safetensors(
                 hf_weights_files,
                 hf_folder,
                 "model.safetensors.index.json",

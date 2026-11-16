@@ -854,6 +854,51 @@ def maybe_add_mtp_safetensors(
     return hf_weights_files + [mtp_path]
 
 
+def prepare_mtp_safetensors(
+    hf_weights_files: List[str], hf_folder: str, index_file: str, hf_config
+) -> List[str]:
+    """Resolve NextN shards before payload reads or startup prefetching.
+
+    These loaders consume model.layers.<N> and share embedding/head with the
+    target. The index selects whole original shards, including any target
+    tensors co-located with MTP. Unknown layouts keep the complete file list.
+    """
+    files = maybe_add_mtp_safetensors(
+        hf_weights_files, hf_folder, index_file, hf_config
+    )
+    architectures = getattr(hf_config, "architectures", None) or []
+    config = getattr(hf_config, "text_config", hf_config)
+    if not architectures or architectures[0] not in (
+        "DeepseekV3ForCausalLMNextN",
+        "GlmMoeDsaForCausalLMNextN",
+        "Glm4MoeForCausalLMNextN",
+        "Glm4MoeLiteForCausalLMNextN",
+    ):
+        return files
+    layers = getattr(config, "num_hidden_layers", None)
+    if getattr(config, "num_nextn_predict_layers", 0) != 1 or not layers:
+        return files
+    index_path = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_path):
+        return files
+    with open(index_path) as f:
+        weight_map = json.load(f)["weight_map"]
+    # Match the native NextN loader's legacy one-layer checkpoint convention.
+    prefix = f"model.layers.{0 if layers == 1 else layers}."
+    needed = {
+        os.path.join(hf_folder, shard)
+        for name, shard in weight_map.items()
+        if name.startswith(prefix)
+    }
+    if not needed or not needed.issubset(files):
+        return files
+    indexed = {os.path.join(hf_folder, shard) for shard in weight_map.values()}
+    # Retain unindexed MTP sidecars added for incorrectly packaged checkpoints.
+    selected = [path for path in files if path in needed or path not in indexed]
+    logger.info("NextN checkpoint reads: %d/%d shards", len(selected), len(files))
+    return selected
+
+
 def filter_files_not_needed_for_inference(hf_weights_files: List[str]) -> List[str]:
     """
     Exclude files that are not needed for inference.

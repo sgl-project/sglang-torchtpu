@@ -7,13 +7,23 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import safetensors.torch
+import torch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
     maybe_add_mtp_safetensors,
+    prepare_mtp_safetensors,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import runai_utils
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -197,6 +207,140 @@ class TestMaybeAddMtpSafetensors(CustomTestCase):
                     [model, mtp],
                 )
                 listing.assert_not_called()
+
+
+class TestNextNShardSelection(CustomTestCase):
+    def test_loader_skips_target_payload_and_keeps_original_mtp_bytes(self):
+        """Draft startup must not open target-only shards of a full checkpoint."""
+        with tempfile.TemporaryDirectory() as folder:
+            target = _touch(folder, "target.safetensors")
+            # Index discovery may stat this shard, but no draft payload reader
+            # may open it. A regression to reading every shard fails decoding it.
+            with open(target, "wb") as f:
+                f.write(b"target payload must not be read")
+            mtp = os.path.join(folder, "draft.safetensors")
+            mixed = os.path.join(folder, "mixed.safetensors")
+            tensors = {
+                "model.layers.78.eh_proj.weight": torch.arange(16)
+                .reshape(4, 4)
+                .to(torch.float8_e4m3fn),
+                "model.layers.78.eh_proj.weight_scale_inv": torch.tensor(
+                    [0.1, 0.2, 0.3, 0.4]
+                ),
+            }
+            shared = {
+                "model.layers.77.norm.weight": torch.ones(4),
+                "model.layers.78.shared_head.norm.weight": torch.arange(4).float(),
+            }
+            safetensors.torch.save_file(tensors, mtp)
+            safetensors.torch.save_file(shared, mixed)
+            _write_index(
+                folder,
+                {
+                    "model.layers.0.weight": "target.safetensors",
+                    **{name: "draft.safetensors" for name in tensors},
+                    **{name: "mixed.safetensors" for name in shared},
+                },
+            )
+            config = SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLMNextN"],
+                num_hidden_layers=78,
+                num_nextn_predict_layers=1,
+            )
+            model_config = SimpleNamespace(
+                model_path=folder, revision=None, hf_config=config
+            )
+            with get_context().override_server_args(
+                device="cpu",
+                weight_loader_disable_mmap=True,
+                weight_loader_prefetch_checkpoints=False,
+            ):
+                for multithread in (False, True):
+                    loader = DefaultModelLoader(
+                        LoadConfig(
+                            load_format="safetensors",
+                            model_loader_extra_config={
+                                "enable_multithread_load": multithread
+                            },
+                        )
+                    )
+                    source = DefaultModelLoader.Source.init_new(
+                        model_config, torch.nn.Module()
+                    )
+                    resolved = loader.resolve_model_weights(
+                        model_config, torch.nn.Module()
+                    )[0]
+                    self.assertEqual(set(resolved.weight_files), {mtp, mixed})
+                    for resolution in (None, resolved):
+                        with self.subTest(
+                            multithread=multithread, pre_resolved=resolution is not None
+                        ):
+                            loaded = dict(
+                                loader._get_weights_iterator(
+                                    source, resolved_source=resolution
+                                )
+                            )
+                            self.assertEqual(set(loaded), set(tensors) | set(shared))
+                            for name, expected in {**tensors, **shared}.items():
+                                self.assertTrue(
+                                    torch.equal(
+                                        loaded[name].view(torch.uint8),
+                                        expected.view(torch.uint8),
+                                    ),
+                                    name,
+                                )
+
+    def test_layout_guards_and_unindexed_sidecars(self):
+        """Targets/unknown layouts retain all files; draft sidecars survive filtering."""
+        with tempfile.TemporaryDirectory() as folder:
+            target = _touch(folder, "target.safetensors")
+            draft = _touch(folder, "draft.safetensors")
+            sidecar = _touch(folder, "mtp.safetensors")
+            files = [target, sidecar, draft]
+            for layers, prefix in ((78, 78), (1, 0)):
+                _write_index(
+                    folder,
+                    {
+                        "model.embed_tokens.weight": "target.safetensors",
+                        f"model.layers.{prefix}.eh_proj.weight": "draft.safetensors",
+                    },
+                )
+                for arch in (
+                    "DeepseekV3ForCausalLMNextN",
+                    "GlmMoeDsaForCausalLMNextN",
+                    "Glm4MoeForCausalLMNextN",
+                    "Glm4MoeLiteForCausalLMNextN",
+                    "GlmMoeDsaForCausalLM",
+                    "DeepseekV4ForCausalLMNextN",
+                ):
+                    config = SimpleNamespace(
+                        architectures=[arch],
+                        text_config=SimpleNamespace(
+                            num_hidden_layers=layers, num_nextn_predict_layers=1
+                        ),
+                    )
+                    with self.subTest(arch=arch, layers=layers):
+                        selected = prepare_mtp_safetensors(
+                            files, folder, INDEX_NAME, config
+                        )
+                        self.assertEqual(
+                            selected,
+                            files
+                            if arch
+                            in ("GlmMoeDsaForCausalLM", "DeepseekV4ForCausalLMNextN")
+                            else [sidecar, draft],
+                        )
+            # An index without the native NextN prefix must not silently drop
+            # embeddings or other weights from a standalone/custom draft layout.
+            config.architectures = ["GlmMoeDsaForCausalLMNextN"]
+            _write_index(folder, {"model.weight": "target.safetensors"})
+            self.assertEqual(
+                prepare_mtp_safetensors(files, folder, INDEX_NAME, config), files
+            )
+            os.unlink(os.path.join(folder, INDEX_NAME))
+            self.assertEqual(
+                prepare_mtp_safetensors(files, folder, INDEX_NAME, config), files
+            )
 
 
 if __name__ == "__main__":
