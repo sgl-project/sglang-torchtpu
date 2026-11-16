@@ -98,6 +98,14 @@ from sglang_tpu.models.deepseek_v41.hooks import hook_specs as dsv41_hooks
 
 logger = logging.getLogger(__name__)
 
+
+def _select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
+    # The model-loader module is heavy; keep it out of plugin startup.
+    from sglang_tpu.ep_weight_shard import select_tpu_ep_local_runai_loader
+
+    return select_tpu_ep_local_runai_loader(result, load_config, model_config)
+
+
 # (target, hook, hook_type) triples.
 
 HOOKS: list[tuple] = [
@@ -346,6 +354,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.speculative.spec_tp_sync.SpecTpSync.sync",
         broadcast_undeferred,
         HookType.AROUND,
+    ),
+    (
+        "sglang.srt.model_loader.loader.get_model_loader",
+        _select_tpu_ep_local_runai_loader,
+        HookType.AFTER,
     ),
 ]
 

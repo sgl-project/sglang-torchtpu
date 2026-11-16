@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""EP-local checkpoint reads for DeepSeek-V4.1 Flash.
+"""This TP rank's rows of each DeepSeek-V4.1 Engram table.
 
-Each EP rank reads only its routed experts plus the replicated tensors, and
-only its own TP row range of every Engram hash table. Experts and replicated
-tensors stream through RunAI; Engram tables (~100 GB single ranges, far above a
-per-rank RunAI buffer) are read with concurrent ``pread`` of one contiguous byte
-range per rank, like the GPU loader's background prefetch.
-
-The read plan follows sgl-project/sglang-torchtpu#1744 (e0a43ce363).
+Each Engram hash table is one ~100 GB tensor, far above a per-rank Run:AI
+buffer, and ``EngramEmbedding`` keeps only its TP row range. Each rank reads
+that one contiguous byte range with Run:AI's FileStreamer, in blocks tagged
+with their first row, and ``load_local_rows`` copies the blocks into place.
 """
 
 from __future__ import annotations
@@ -15,17 +12,13 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Mapping
 from time import perf_counter
-from typing import Iterator, Mapping
 
 import torch
 
 logger = logging.getLogger(__name__)
 
-_EXPERT = re.compile(
-    r"^layers\.(0|[1-9]\d*)\.ffn\.experts\.(0|[1-9]\d*)\.w[123]\.(weight|scale)$"
-)
 _ENGRAM_TABLE = re.compile(r"^layers\.(0|[1-9]\d*)\.engram\.embed\.(weight|scale)$")
 
 # Marks a tensor that holds only rows [value, value + shape[0]) of its table.
@@ -48,60 +41,8 @@ _SAFETENSORS_DTYPES = {
 }
 
 
-@dataclass(frozen=True)
-class ExpertReadPlan:
-    tensor_names: frozenset[str]
-    shard_names: frozenset[str]
-    total_tensors: int
-    local_expert_tensors: int
-
-
-def plan_expert_reads(
-    weight_map: Mapping[str, str],
-    *,
-    num_layers: int,
-    num_experts: int,
-    ep_size: int,
-    ep_rank: int,
-) -> ExpertReadPlan:
-    """Keep local routed experts and every replicated tensor; drop MTP.
-
-    Unknown names are retained rather than silently dropped. Fails closed when
-    the index does not list exactly ``num_layers * num_experts * 6`` expert
-    tensors, so a naming mismatch cannot look like a fast load.
-    """
-    if num_layers <= 0 or num_experts <= 0:
-        raise ValueError("Layer and expert counts must be positive")
-    if ep_size <= 0 or num_experts % ep_size or not 0 <= ep_rank < ep_size:
-        raise ValueError("Expert count must divide EP size and rank must be in range")
-    local_count = num_experts // ep_size
-    lo, hi = ep_rank * local_count, (ep_rank + 1) * local_count
-    selected = set()
-    expert_count = local_expert_count = 0
-    for name in weight_map:
-        if name.startswith("mtp."):
-            continue
-        match = _EXPERT.fullmatch(name)
-        if match is not None:
-            layer, expert = int(match[1]), int(match[2])
-            if layer >= num_layers or expert >= num_experts:
-                raise ValueError(f"Checkpoint expert outside configured model: {name}")
-            expert_count += 1
-            if not lo <= expert < hi:
-                continue
-            local_expert_count += 1
-        selected.add(name)
-    expected = num_layers * num_experts * 6
-    if expert_count != expected:
-        raise ValueError(
-            f"Expected {expected} routed expert tensors, found {expert_count}"
-        )
-    return ExpertReadPlan(
-        frozenset(selected),
-        frozenset(weight_map[name] for name in selected),
-        len(weight_map),
-        local_expert_count,
-    )
+def is_engram_table(name: str) -> bool:
+    return _ENGRAM_TABLE.fullmatch(name) is not None
 
 
 def tp_row_range(num_rows: int, tp_rank: int, tp_size: int) -> tuple[int, int]:
@@ -127,8 +68,8 @@ def _read_range(path: str, offset: int, out: torch.Tensor) -> None:
             out[start : start + sizes[index]].copy_(chunk.view(-1))
 
 
-def read_row_ranges(
-    path: str, names: set[str], tp_rank: int, tp_size: int
+def _read_row_ranges(
+    path: str, names: set[str], *, tp_rank: int, tp_size: int
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield this TP rank's rows of each 2-D tensor in ``names`` in blocks of at
     most ``_ROW_BLOCK_BYTES``, each tagged with its first row in ``ROW_START_ATTR``."""
@@ -163,44 +104,23 @@ def read_row_ranges(
         )
 
 
-class EpLocalExpertReader:
-    """One rank's selected checkpoint tensors: RunAI for experts and replicated
-    tensors, row-range preads for Engram tables."""
-
-    def __init__(
-        self,
-        weight_map: Mapping[str, str],
-        files: list[str],
-        plan: ExpertReadPlan,
-        *,
-        tp_rank: int,
-        tp_size: int,
-    ):
-        self.weight_map = weight_map
-        self.plan = plan
-        self.tp_rank, self.tp_size = tp_rank, tp_size
-        self.by_name = {path.rsplit("/", 1)[-1]: path for path in files}
-        if not plan.shard_names <= self.by_name.keys():
-            raise ValueError("Shard list does not cover the selected checkpoint index")
-        self.row_tables = {n for n in plan.tensor_names if _ENGRAM_TABLE.fullmatch(n)}
-        self.streamed = plan.tensor_names - self.row_tables
-
-    @property
-    def stream_files(self) -> list[str]:
-        shards = {self.weight_map[n] for n in self.streamed}
-        return [self.by_name[s] for s in sorted(shards)]
-
-    def iter_row_tables(self) -> Iterator[tuple[str, torch.Tensor]]:
-        for shard in sorted({self.weight_map[n] for n in self.row_tables}):
-            names = {n for n in self.row_tables if self.weight_map[n] == shard}
-            yield from read_row_ranges(
-                self.by_name[shard], names, self.tp_rank, self.tp_size
-            )
+def iter_row_tables(
+    *, shard_of: Mapping[str, str], names: Iterable[str], tp_rank: int, tp_size: int
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """This TP rank's rows of the Engram tables ``names``, shard by shard;
+    ``shard_of`` maps a tensor name to its local shard path."""
+    by_shard: dict[str, set[str]] = {}
+    for name in names:
+        by_shard.setdefault(shard_of[name], set()).add(name)
+    for path in sorted(by_shard):
+        yield from _read_row_ranges(
+            path, by_shard[path], tp_rank=tp_rank, tp_size=tp_size
+        )
 
 
 def load_local_rows(original, embedding, param, loaded_weight):
     """AROUND ``EngramEmbedding._load_rows``: copy a block of this rank's rows
-    (tagged by ``read_row_ranges``) into place; untagged tensors take the
+    (tagged by ``iter_row_tables``) into place; untagged tensors take the
     original full-table path."""
     row_start = getattr(loaded_weight, ROW_START_ATTR, None)
     if row_start is None:

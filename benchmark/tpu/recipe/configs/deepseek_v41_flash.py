@@ -18,7 +18,7 @@ CONFIG["server_args"].update(
         "model_path": MODEL_PATH,
         "served_model_name": "deepseek-ai/DeepSeek-V4.1-Flash",
         "trust_remote_code": True,
-        # EP-local expert reads (sglang_tpu/models/deepseek_v41/loader.py).
+        # EP-local expert and TP-local Engram reads (deepseek_v41/loader.py).
         "load_format": "runai_streamer",
         "tp_size": 8,
         "attn_dp_size": 8,

@@ -17,13 +17,15 @@ get_tpu_dsv41_bytes_per_full_token
        current_platform for the DSV4 pool class and its byte sizing.
 
 select_tpu_dsv41_loader
-  Why: RunaiModelStreamerLoader reads every routed expert on every rank; under
-       EP8 each rank keeps 1/8 of them, so startup reads ~8x the bytes it needs.
-       The loader has no model-owned tensor selection seam.
+  Why: each ~100 GB Engram table is one tensor, far above a per-rank Run:AI
+       buffer, and every rank keeps only its TP row range of it.
   How: AFTER get_model_loader swaps in DSV41RunaiModelStreamerLoader for the
-       V4.1 target only; it inherits construction, loading and postprocessing.
-  Upstream PR or issue: not filed (forked from sgl-project/sglang-torchtpu#1744).
-  Remove when: the core loader accepts a model-owned checkpoint tensor filter.
+       V4.1 target. Routed experts take the generic EP-local Run:AI read
+       (sglang_tpu.ep_weight_shard); Engram tables leave the stream and are
+       read as this rank's row range.
+  Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
+  Remove when: EngramEmbedding loads a pre-sliced row range from a
+       model-owned checkpoint tensor filter.
 
 load_tpu_dsv41_engram_rows
   Why: EngramEmbedding._load_rows slices its TP row range out of the full
@@ -142,22 +144,24 @@ def get_tpu_dsv41_bytes_per_full_token(original, configurator) -> float:
 
 def select_tpu_dsv41_loader(result, load_config, model_config=None):
     from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
+    from sglang_tpu.ep_weight_shard import EPLocalRunaiModelStreamerLoader
 
-    config = getattr(model_config, "hf_config", None)
+    # The generic EP-local Run:AI hook may already have wrapped the stock loader.
     if (
-        type(result) is not RunaiModelStreamerLoader
-        or getattr(config, "model_type", None) != "deepseek_v41"
-        or getattr(model_config, "is_draft_model", False)
+        type(result) not in (RunaiModelStreamerLoader, EPLocalRunaiModelStreamerLoader)
+        or model_config is None
+        or model_config.hf_config.model_type != "deepseek_v41"
+        or model_config.is_draft_model
         or load_config.draft_model_idx is not None
     ):
         return result
     from sglang_tpu.models.deepseek_v41.loader import DSV41RunaiModelStreamerLoader
 
-    return DSV41RunaiModelStreamerLoader(load_config, model_config)
+    return DSV41RunaiModelStreamerLoader(load_config)
 
 
 def load_tpu_dsv41_engram_rows(original, embedding, param, loaded_weight):
-    from sglang_tpu.models.deepseek_v41.ep_local_expert_reader import load_local_rows
+    from sglang_tpu.models.deepseek_v41.engram_row_reader import load_local_rows
 
     return load_local_rows(original, embedding, param, loaded_weight)
 
