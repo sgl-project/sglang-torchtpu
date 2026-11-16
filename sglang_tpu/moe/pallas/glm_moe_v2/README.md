@@ -141,3 +141,13 @@ those positions before FFN1. This loses four activation coordinates; it is
 visible in small-H dense-reference error and is part of the source numerical
 strategy, not a claim of bitwise equivalence with the old GMM. Full H6144 cases
 and model smoke/E2E remain necessary; a relaxed error bound never permits NaN.
+
+Mutable HBM scatter, expert-accumulate, gather and prequantization workspaces
+are explicit outputs of the Pallas call. They have the same shapes and memory
+spaces as the source, and only completed rows leave the enclosing JAX function.
+They are not writable `pl.empty` inputs: XLA sees their writes and simultaneous
+buffer lifetimes. No input/output alias is needed because no caller-owned input
+is mutated. The compute, DMA, semaphore and drain body is unchanged by this
+buffer-interface adaptation. This follows the existing fused EP kernel's
+output-workspace pattern; sequential-shape, idle and full-geometry device
+validation remain necessary.
