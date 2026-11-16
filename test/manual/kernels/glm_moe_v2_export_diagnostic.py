@@ -222,6 +222,24 @@ def run_worker(mode):
     finally:
         import torch.distributed as dist
 
+        libraries = sorted(
+            {
+                line.split()[-1]
+                for line in Path("/proc/self/maps").read_text().splitlines()
+                if "libtpu" in line
+            }
+        )
+        print(
+            json.dumps(
+                dict(
+                    event="worker_mapped_libtpu",
+                    mode=mode,
+                    rank=os.environ.get("RANK"),
+                    libraries=libraries,
+                )
+            ),
+            flush=True,
+        )
         if dist.is_initialized():
             dist.destroy_process_group()
 

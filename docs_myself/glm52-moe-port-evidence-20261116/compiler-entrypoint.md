@@ -47,3 +47,37 @@ scratch; input weights/routes/tokens are read-only. Returned rows retain the
 true producer/consumer dependencies. This does not authorize removing waits or
 assuming correctness from compilation alone. The candidate requires the same
 numerical, invalid-id/zero-route, tail, shared-on/off and full-geometry tests.
+
+## Same-entrypoint result and real idle caller
+
+`exp-5ngfhlvifc` / `art-wanrutaz3g`, measurement source
+`d372787e374d5f19f73b6ba5a23d606c8dc64c62`, completed source/port/manual
+phases. Each of eight source workers and eight port workers reproduced the
+same SPMD failure. Each exported six `sdy.manual_computation` regions, one
+side-effect custom call and no `mhlo.sharding` attribute. The manual annotation
+candidate had one explicit `mhlo.sharding={manual}` in exported MLIR but still
+failed with the same missing-sharding error in all eight workers. No numerical
+case ran. `export-diagnostic-records.json` contains the parsed export records,
+first compiler signatures and 24 complete actual-process runtime/import/maps
+records; the full MLIR belongs to the Falcon artifact.
+
+The real target idle path differs from manually cropping a kernel result to
+zero rows. `compiled_forward_shim._dp_attn_apply_bucket_metadata` publishes
+`set_dp_buffer_len(pad_t*dp_size, pad_t, True, ...)`, so every rank's local FFN
+buffer remains a nonempty physical bucket while any peer is active.
+`DecoderCompilePolicy._match_busiest_dp_decode_rows` materializes idle decode
+rows to the busiest peer explicitly to preserve collective issue order.
+`spec_decode_compile_policy_eagle3._normalize_dp_idle_forward` sets
+`spec_info.keep_outputs_padded=True` and materializes idle speculative rows.
+The FFN's already-summed exit still performs `dp_scatter` into that padded
+local buffer via `index_select`; cropping to logical outputs happens later.
+Global-empty calls return the same empty result on all ranks without entering
+the kernel.
+
+The pure-call diagnostic will therefore exercise a compiled nonempty DP-slot
+`index_select` at a 64-row physical bucket as live DPs drain 8->4->1 and refill,
+using zero/invalid routes for idle slots. It will also explicitly permute
+logical expert ownership relative to physical process rank and add real
+H6144/I2048/E256/TopK8 64- and 2048-row cases. This tests the actual dependency
+contract; an artificial local empty result would be a different unsupported
+caller and is not treated as proof that the model drops the kernel.

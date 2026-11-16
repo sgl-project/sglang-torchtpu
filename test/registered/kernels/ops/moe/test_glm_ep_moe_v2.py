@@ -43,6 +43,7 @@ def full_shape_cases(ep, rank):
     h, inter, e, k = 6144, 2048, 256, 8
     assert e % ep == 0
     local_e = e // ep
+    ownership_rank = (rank * 3 + 1) % ep
     constants = []
     for expert in range(e):
         values = torch.tensor(
@@ -57,7 +58,7 @@ def full_shape_cases(ep, rank):
     w13 = torch.empty((2, local_e, h, inter), dtype=torch.float8_e4m3fn)
     w2 = torch.empty((local_e, inter, h), dtype=torch.float8_e4m3fn)
     for local in range(local_e):
-        values = constants[rank * local_e + local]
+        values = constants[ownership_rank * local_e + local]
         for branch in range(2):
             w13[branch, local].copy_(
                 torch.full((h, inter), float(values[branch])).to(torch.float8_e4m3fn)
@@ -97,11 +98,11 @@ def full_shape_cases(ep, rank):
     ss2 = torch.linspace(0.7, 1.3, h)
     shared = [a.to("tpu") for a in (sw13, sw2, ss13, ss2)]
     del sw13, sw2
-    rank_arg = torch.tensor([rank], dtype=torch.int32, device="tpu")
+    rank_arg = torch.tensor([ownership_rank], dtype=torch.int32, device="tpu")
     stub = torch.empty(0, device="tpu")
     generator = torch.Generator().manual_seed(61442048)
     reports = []
-    for local_rows, has_shared in [(6, False), (24, True)]:
+    for local_rows, has_shared in [(6, False), (24, True), (64, True), (2048, True)]:
         rows = ep * local_rows
         x = (torch.randn((rows, h), generator=generator) * 0.2).bfloat16()
         ids = torch.stack(
@@ -170,6 +171,135 @@ def full_shape_cases(ep, rank):
     return reports
 
 
+def idle_bucket_cases(
+    ep, rank, operands, rank_tensor, w13, w2, s13, s2, sw13, sw2, ss13, ss2, shared
+):
+    """Match the TPU FFN caller: consume a nonempty fixed DP slot while idle.
+
+    The real compiled-forward shim sets every local DP buffer to pad_t, and
+    speculative idle normalization keeps outputs padded. It does not crop the
+    MoE result to a zero-row local tensor inside the compiled graph. Exercise
+    the same nonempty index_select boundary as live DPs drain and refill.
+    """
+    import json
+    import time
+
+    import torch
+
+    from sglang_tpu.moe.pallas.glm_moe_v2.op import get_op
+
+    h = w2.shape[-1]
+    e = w2.shape[0]
+    k, bucket = 4, 64
+    generator = torch.Generator().manual_seed(640064)
+    x = (torch.randn((ep * bucket, h), generator=generator) * 0.2).bfloat16()
+    ids = torch.stack(
+        [torch.randperm(e, generator=generator)[:k] for _ in range(ep * bucket)]
+    ).int()
+    weights = torch.rand((ep * bucket, k), generator=generator)
+    weights /= weights.sum(-1, keepdim=True)
+    indices = (torch.arange(bucket) + rank * bucket).to(device="tpu", dtype=torch.int64)
+    op = get_op(ep, True)
+
+    def ffn_slot(
+        x_arg,
+        ids_arg,
+        coefficients,
+        gate_up,
+        down,
+        gate_scale,
+        down_scale,
+        logical_rank,
+        shared_gate_up,
+        shared_down,
+        shared_gate_scale,
+        shared_down_scale,
+        slot,
+    ):
+        return op(
+            x_arg,
+            ids_arg,
+            coefficients,
+            gate_up,
+            down,
+            gate_scale,
+            down_scale,
+            logical_rank,
+            shared_gate_up,
+            shared_down,
+            shared_gate_scale,
+            shared_down_scale,
+        ).index_select(0, slot)
+
+    import torch_tpu._internal.compile  # noqa: F401
+
+    compiled = torch.compile(ffn_slot, backend="tpu", fullgraph=True, dynamic=False)
+    reports = []
+    for live in (ep, ep // 2, 1, ep):
+        mx, mi, mw = x.clone(), ids.clone(), weights.clone()
+        mx[live * bucket :] = 0
+        mi[live * bucket :] = -1
+        mw[live * bucket :] = 0
+        lx, li, lw = (a[rank * bucket : (rank + 1) * bucket] for a in (mx, mi, mw))
+        expected = torch.zeros((bucket, h))
+        for expert in range(e):
+            token, column = torch.where(li == expert)
+            if token.numel() == 0:
+                continue
+            gate, up = (
+                lx[token].float() @ (w13[expert].float() * s13[expert, 0, 0])
+            ).chunk(2, -1)
+            out = (torch.nn.functional.silu(gate) * up) @ (
+                w2[expert].float() * s2[expert, 0, 0]
+            )
+            expected.index_add_(0, token, out * lw[token, column, None])
+        gate = lx.float() @ (sw13[0].float() * ss13[0])
+        up = lx.float() @ (sw13[1].float() * ss13[1])
+        expected += (torch.nn.functional.silu(gate) * up) @ (sw2.float() * ss2)
+        args = [
+            mx.to("tpu"),
+            mi.to("tpu"),
+            mw.to("tpu"),
+            *operands,
+            rank_tensor,
+            *shared,
+            indices,
+        ]
+        # First warm call also resolves the diagnostic wrapper outside Dynamo.
+        ffn_slot(*args)
+        torch.accelerator.synchronize()
+        started = time.perf_counter()
+        with torch.no_grad():
+            got = compiled(*args)
+        torch.accelerator.synchronize()
+        elapsed = (time.perf_counter() - started) * 1000
+        got = got.cpu().float()
+        error = float(
+            torch.linalg.vector_norm(got - expected)
+            / torch.linalg.vector_norm(expected).clamp_min(1e-8)
+        )
+        assert torch.isfinite(got).all() and error < 0.15, (
+            "idle_bucket",
+            live,
+            rank,
+            error,
+        )
+        if rank >= live:
+            assert torch.count_nonzero(got) == 0
+        report = dict(
+            event="idle_bucket_pass",
+            rank=rank,
+            live_dp_ranks=live,
+            padded_rows=bucket,
+            physical_result_rows=got.shape[0],
+            relative_l2=error,
+            first_compiled_or_replay_ms=elapsed,
+        )
+        reports.append(report)
+        print(json.dumps(report), flush=True)
+    return reports
+
+
 def worker():
     import json
     import time
@@ -178,6 +308,9 @@ def worker():
     import torch
     import torch.distributed as dist
     import torch_tpu
+    import jax
+    import jaxlib
+    import libtpu
     from importlib.metadata import version
 
     from sglang_tpu.moe.pallas.glm_moe_v2.op import (
@@ -196,6 +329,11 @@ def worker():
                 "executable": sys.executable,
                 "torch_file": torch.__file__,
                 "torch_tpu_file": torch_tpu.__file__,
+                "jax_file": jax.__file__,
+                "jaxlib_file": jaxlib.__file__,
+                "libtpu_file": libtpu.__file__,
+                "jax_module_version": jax.__version__,
+                "jaxlib_module_version": jaxlib.__version__,
                 "versions": {
                     p: version(p)
                     for p in ("torch", "torch-tpu", "jax", "jaxlib", "libtpu")
@@ -221,14 +359,15 @@ def worker():
     )
     s13 = torch.linspace(0.7, 1.3, e * 2 * inter).reshape(e, 1, 1, 2 * inter).bfloat16()
     s2 = torch.linspace(0.8, 1.2, e * h).reshape(e, 1, 1, h).bfloat16()
-    sl = slice(rank * 2, (rank + 1) * 2)
+    ownership_rank = (rank * 3 + 1) % ep
+    sl = slice(ownership_rank * 2, (ownership_rank + 1) * 2)
     device_weights = [
         pack_gate_up(w13[sl]).to("tpu"),
         w2[sl].to("tpu"),
         pack_gate_up_scale(s13[sl]).to("tpu"),
         s2[sl].to("tpu"),
     ]
-    rank_tensor = torch.tensor([rank], dtype=torch.int32, device="tpu")
+    rank_tensor = torch.tensor([ownership_rank], dtype=torch.int32, device="tpu")
     stub = torch.empty(0, device="tpu")
     sw13 = (torch.randn((2, h, inter), generator=generator) * 0.02).to(
         torch.float8_e4m3fn
@@ -316,6 +455,23 @@ def worker():
         }
         reports.append(report)
         print(json.dumps({"event": "case_pass", "rank": rank, **report}), flush=True)
+    reports.extend(
+        idle_bucket_cases(
+            ep,
+            rank,
+            device_weights,
+            rank_tensor,
+            w13,
+            w2,
+            s13,
+            s2,
+            sw13,
+            sw2,
+            ss13,
+            ss2,
+            device_shared,
+        )
+    )
     reports.extend(full_shape_cases(ep, rank))
     maps = Path("/proc/self/maps").read_text()
     libraries = sorted(
