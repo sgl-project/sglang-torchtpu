@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -25,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.pool_configurator import (
     MemoryPoolConfig,
     MemoryPoolConfigurator,
@@ -1449,6 +1451,56 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             lo, hi = (mid, hi) if fits(mid) else (lo, mid - 1)
         return lo
 
+    def _reclaim_draft_swa_sidecar(self, tree_cache, need_s: int) -> None:
+        sidecar = self._draft_swa_sidecar
+        if sidecar is None or need_s <= 0:
+            return
+        ps = self.page_size
+        sc_short = need_s - sidecar.allocator.available_size() // ps
+        if sc_short <= 0:
+            return
+        tree_core = getattr(tree_cache, "tree_core", None)
+        swa_comp = getattr(tree_core, "components_by_type", {}).get(
+            ComponentType.SWA
+        ) or getattr(tree_cache, "components", {}).get(ComponentType.SWA)
+        lru = getattr(tree_core, "lru_lists", {}).get(ComponentType.SWA)
+        if swa_comp is None or lru is None:
+            evict_fn = getattr(tree_cache, "evict", None) or tree_cache.evict_for_alloc
+            evict_fn(EvictParams(num_tokens=0, swa_num_tokens=sc_short * ps))
+            return
+
+        enabled = tree_core.enable_session_radix_cache
+        orig_next = swa_comp._evict_device_next_node
+
+        def _owns_sidecar_pages(swa_indices: torch.Tensor) -> bool:
+            if swa_indices.numel() == 0:
+                return False
+            sample = swa_indices[::ps] if swa_indices.numel() % ps == 0 else swa_indices
+            target_pages = sample.to(device="cpu", dtype=torch.int64).clamp(min=0) // ps
+            return bool(torch.any(sidecar.target_to_draft_page[target_pages] > 0))
+
+        def _filtered_next(tracker, device_frees, host_frees):
+            if sidecar.allocator.available_size() // ps >= need_s:
+                return None
+            cur = swa_comp._evict_device_cursor
+            if cur is not None and not lru.in_list(cur):
+                cur = lru.cursor_next() if enabled else lru.get_lru_no_lock()
+            while cur is not None and lru.in_list(cur):
+                val = cur.component_data[ComponentType.SWA].value
+                if val is not None and _owns_sidecar_pages(val):
+                    break
+                cur = lru.cursor_next() if enabled else lru.get_prev_no_lock(cur)
+            swa_comp._evict_device_cursor = cur
+            if cur is None:
+                return None
+            return orig_next(tracker, device_frees, host_frees)
+
+        swa_comp._evict_device_next_node = _filtered_next
+        try:
+            tree_cache.evict(EvictParams(num_tokens=0, swa_num_tokens=sys.maxsize))
+        finally:
+            swa_comp._evict_device_next_node = orig_next
+
     def evict_to_free_tokens(
         self, tree_cache, num_tokens: int, *, swa_num_tokens: Optional[int] = None
     ) -> bool | None:
@@ -1461,12 +1513,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             _cdiv(max(0, int(req_swa)), ps),
         )
         if self._draft_swa_sidecar is not None:
-            sc_free = self._draft_swa_sidecar.allocator.available_size() // ps
-            sc_short = need_s - sc_free
-            if sc_short > 0:
-                tree_cache.evict_for_alloc(
-                    EvictParams(num_tokens=0, swa_num_tokens=sc_short * ps)
-                )
+            self._reclaim_draft_swa_sidecar(tree_cache, need_s)
         needed_pages = self._page_ids_needed(need_f, need_s)
         short = needed_pages - self._free_page_count()
         if short > 0:
@@ -1576,14 +1623,23 @@ def resolve_unified_draft_kv_pricing(kvc) -> DraftKVPricing:
     return DraftKVPricing(full_per_token=total_layers * full_bpt)
 
 
-_DRAFT_SWA_HICACHE_WINDOW_MULT = 4
+_DRAFT_SWA_HICACHE_WINDOW_MULT = 4.0
 _DRAFT_SWA_HICACHE_CHUNK_MULT = 2
 
 
-def _draft_swa_runtime_budget() -> Tuple[bool, int, int, int]:
-    """Return ``(enable_hicache, per_worker_mrr, spec_draft_tokens, chunked_prefill_size)``."""
+def _draft_swa_runtime_budget() -> Tuple[bool, int, int, int, float]:
+    """Return ``(enable_hicache, per_worker_mrr, spec_draft_tokens, chunked_prefill_size, window_mult)``."""
     from sglang_tpu.compilation.compiled_forward_shim import DEFAULT_TPU_COMPILE_MAX_BS
 
+    raw_mult = tpu_envs.SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER.get()
+    window_mult = (
+        _DRAFT_SWA_HICACHE_WINDOW_MULT if raw_mult is None else float(raw_mult)
+    )
+    if window_mult <= 0:
+        raise ValueError(
+            "SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER must be positive, "
+            f"got {window_mult}."
+        )
     try:
         enable_hicache = bool(get_memory().enable_hierarchical_cache)
         sched = get_schedule()
@@ -1602,9 +1658,9 @@ def _draft_swa_runtime_budget() -> Tuple[bool, int, int, int]:
             ),
             0,
         )
-        return enable_hicache, per_worker_mrr, draft_tokens, chunk_tokens
     except ValueError:
-        return False, DEFAULT_TPU_COMPILE_MAX_BS, 0, 0
+        return False, DEFAULT_TPU_COMPILE_MAX_BS, 0, 0, window_mult
+    return enable_hicache, per_worker_mrr, draft_tokens, chunk_tokens, window_mult
 
 
 def _compute_draft_swa_pages(
@@ -1619,13 +1675,13 @@ def _compute_draft_swa_pages(
     Device-only uses the lossless bound ``floor(N_phys / (1 + M_T))`` so SWA leaf
     eviction never cascade-deletes cached Full prefixes. With HiCache enabled,
     cold SWA leaf windows spill to host RAM, so device HBM only needs
-    ``4 * B * w_win + 2 * w_chunk`` pages (clamped by the lossless bound).
+    ``window_mult * B * w_win + 2 * w_chunk`` pages (clamped by the lossless bound).
     """
     if total_target_pages <= 0:
         return 0
     raw_ceil = max(1, total_target_pages // (1 + num_swa_groups))
     ceil_pages = (raw_ceil // 8) * 8 if raw_ceil >= 8 else raw_ceil
-    enable_hicache, per_worker_mrr, draft_tokens, chunk_tokens = (
+    enable_hicache, per_worker_mrr, draft_tokens, chunk_tokens, window_mult = (
         _draft_swa_runtime_budget()
     )
     if not enable_hicache or sliding_window_size is None:
@@ -1633,7 +1689,7 @@ def _compute_draft_swa_pages(
     w_win = _cdiv(int(sliding_window_size) + draft_tokens + page_size, page_size)
     w_chunk = _cdiv(chunk_tokens, page_size)
     working_pages = (
-        _DRAFT_SWA_HICACHE_WINDOW_MULT * per_worker_mrr * w_win
+        math.ceil(window_mult * per_worker_mrr * w_win)
         + _DRAFT_SWA_HICACHE_CHUNK_MULT * w_chunk
     )
     aligned_working = _cdiv(max(8, working_pages), 8) * 8

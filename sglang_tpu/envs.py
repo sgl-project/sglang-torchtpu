@@ -258,6 +258,9 @@ class TpuEnvs:
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.
     SGLANG_TPU_DFLASH_FP8_DRAFT = EnvBool(False)
+    # Multiplier applied to max_running_requests * sliding_window when sizing the
+    # compact SWA draft KV pool on TpuUnifiedSWAKVPool under hierarchical cache.
+    SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER = EnvFloat(4.0)
 
     # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
     # steps, with fp8 dense weight copies and an fp8 weight-only LM head.

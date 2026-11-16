@@ -513,28 +513,56 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
         ta1.free(ext1)
 
     def test_hicache_window_sizing_and_sidecar_capacity_eviction(self):
-        # HiCache ON: 4 * B * w_win + 2 * w_chunk (clamped by N_phys // (1 + M_T)).
-        with get_context().override_server_args(
-            enable_hierarchical_cache=True,
-            max_running_requests=4,
-            speculative_num_draft_tokens=8,
-            chunked_prefill_size=4096,
-            page_size=256,
-        ):
-            with get_parallel().override(attn_dp_size=1):
+        from contextlib import nullcontext
+
+        from sglang_tpu.envs import envs as tpu_envs
+
+        self.assertEqual(
+            tpu_envs.SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER.get(), 4.0
+        )
+
+        # HiCache ON: mult * B * w_win + 2 * w_chunk (clamped by N_phys // (1 + M_T)).
+        for mult, expected in ((None, 192), (6.0, 272), (2.5, 136)):
+            env_ctx = (
+                nullcontext()
+                if mult is None
+                else tpu_envs.SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER.override(mult)
+            )
+            with (
+                env_ctx,
+                get_context().override_server_args(
+                    enable_hierarchical_cache=True,
+                    max_running_requests=4,
+                    speculative_num_draft_tokens=8,
+                    chunked_prefill_size=4096,
+                    page_size=256,
+                ),
+                get_parallel().override(attn_dp_size=1),
+            ):
                 pages = ukp._compute_draft_swa_pages(
                     10000,
                     page_size=256,
                     num_swa_groups=3,
                     sliding_window_size=2048,
                 )
-                # w_win = ceil((2048 + 8 + 256) / 256) = 10; w_chunk = 16 -> 4*4*10 + 32 = 192.
-                self.assertEqual(pages, 192)
-                self.assertEqual(
-                    ukp._compute_draft_swa_pages(
-                        400, page_size=256, num_swa_groups=3, sliding_window_size=2048
-                    ),
-                    96,
+                self.assertEqual(pages, expected)
+                if mult is None:
+                    self.assertEqual(
+                        ukp._compute_draft_swa_pages(
+                            400,
+                            page_size=256,
+                            num_swa_groups=3,
+                            sliding_window_size=2048,
+                        ),
+                        96,
+                    )
+
+        with tpu_envs.SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER.override(0.0):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER"
+            ):
+                ukp._compute_draft_swa_pages(
+                    1000, page_size=256, num_swa_groups=3, sliding_window_size=2048
                 )
 
         # Sidecar smaller than shared SWA capacity gates swa_available_size / can_reserve
@@ -588,6 +616,111 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
         self.assertIsNotNone(ext2)
         ta.free(held)
         ta.free(ext2)
+
+    def test_sidecar_reclaim_filters_to_draft_owning_swa_windows(self):
+        from array import array
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        # End-to-end UnifiedRadixCache reproduction of the W2-nopt prefill OOM:
+        # 3 older SWA windows hold no draft sidecar pages, 2 newer windows hold
+        # 1 sidecar page each (2 total), and the shared pool has extra room so
+        # sidecar reclamation alone decides which SWA windows get evicted.
+        ta, rp = self._build_target(24, 1)  # 24 shared pages, page_size=8, M_T=1
+        dp = SWAKVPool(
+            size=192,
+            size_swa=16,  # 2 sidecar pages total
+            page_size=8,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=64,
+            swa_attention_layer_ids=[0],
+            full_attention_layer_ids=[],
+            device="cpu",
+            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+        )
+        dk = types.SimpleNamespace(
+            is_draft_worker=True,
+            is_hybrid_swa=True,
+            sliding_window_size=8,
+            layer_info=types.SimpleNamespace(
+                full_attention_layer_ids=[], swa_attention_layer_ids=[0]
+            ),
+            model_config=types.SimpleNamespace(sliding_window_size=None),
+        )
+        ta.attach_draft_kv_pool(dk, dp)
+        cache = UnifiedRadixCache(
+            params=CacheInitParams(
+                req_to_token_pool=rp,
+                token_to_kv_pool_allocator=ta,
+                page_size=8,
+                disable=False,
+                sliding_window_size=8,
+                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                eviction_policy="lru",
+                tree_core_backend="python",
+            )
+        )
+        z0, neg1 = torch.tensor([0]), torch.tensor([-1])
+
+        def _insert_seq(base_tok: int, length: int = 16):
+            s_t = torch.tensor([length])
+            idx = ta.alloc_extend(z0, z0, s_t, s_t, neg1, length)
+            self.assertIsNotNone(idx)
+            toks = list(range(base_tok, base_tok + length))
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", toks), None),
+                    value=idx.to(torch.int64),
+                    prev_prefix_len=0,
+                )
+            )
+            return idx
+
+        # Three 16-token windows (12 shared pages) whose draft sidecar pages were lost.
+        for base in (100, 200, 300):
+            seq_idx = _insert_seq(base, 16)
+            swa_pages = torch.unique(ta.full_to_swa_index_mapping[seq_idx] // 8)
+            ta.draft_swa_sidecar.release_target_pages(swa_pages)
+            ta.draft_swa_sidecar.clear_mapping(seq_idx)
+
+        # Two 8-token windows (2 shared pages each = 4 shared pages) owning 1 sidecar page each.
+        _insert_seq(400, 8)
+        _insert_seq(500, 8)
+        self.assertEqual(ta._free_page_count(), 8)
+        self.assertEqual(ta.draft_swa_sidecar.allocator.available_size(), 0)
+
+        # Reclaiming 8 prefill tokens (1 sidecar page) skips all 3 draft-less windows
+        # (100, 200, 300), evicts ONLY 400 (freeing exactly 1 sidecar page), and stops
+        # before touching 500 (zero over-eviction).
+        s8 = torch.tensor([8])
+        self.assertTrue(ta.evict_to_free_tokens(cache, 8))
+        self.assertEqual(ta.draft_swa_sidecar.allocator.available_size(), 8)
+        for kept_base, kept_len in ((100, 16), (200, 16), (300, 16), (500, 8)):
+            hit = cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(
+                        array("q", list(range(kept_base, kept_base + kept_len))), None
+                    )
+                )
+            )
+            self.assertEqual(len(hit.device_indices), kept_len)
+        evicted_400 = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", list(range(400, 408))), None))
+        )
+        self.assertEqual(len(evicted_400.device_indices), 0)
+
+        prefill = ta.alloc_extend(z0, z0, s8, s8, neg1, 8)
+        self.assertIsNotNone(prefill)
+        ta.free(prefill)
+        cache.sanity_check()
 
 
 if __name__ == "__main__":
