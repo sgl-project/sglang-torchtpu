@@ -314,7 +314,7 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
         )
         results = {}
         for decode_rank in range(dst_tp):
-            senders = receiver_geom.sources_of(decode_rank)
+            senders = receiver_geom._sources_of(decode_rank)
             self.assertEqual(
                 sender_geom.decode_rank_plan(decode_rank),
                 receiver_geom.decode_rank_plan(decode_rank),
@@ -605,7 +605,9 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
         decode_t = _fused_layer(FP8, 1)
         geometry = _manager(decode_t, 8)._make_geometry(16, 8)
         for prefill_rank in (0, 1, 14, 15):
-            plan = geometry.writer_plan(prefill_rank, prefill_rank // 2)
+            plan = geometry.writer_plan(
+                prefill_rank=prefill_rank, decode_rank=prefill_rank // 2
+            )
             self.assertFalse(plan.staged)
             self.assertEqual(plan.entry, (0, 512, 512, 0, 512))
             self.assertEqual(
@@ -754,7 +756,9 @@ class TestTpuReshardMerge(unittest.TestCase):
                 buf.copy_(torch.randn(buf.shape).to(FP8))
                 before = buf.clone()
                 real, stage = [3, 5], [7, 1]
-                merge_staged_pages([buf], real, stage, merges)
+                merge_staged_pages(
+                    bufs=[buf], real_pages=real, staging_pages=stage, merges=merges
+                )
                 logical, old = self._logical(buf), self._logical(before)
                 expected = old.clone()
                 for r, s in zip(real, stage):
@@ -768,11 +772,12 @@ class TestTpuReshardMerge(unittest.TestCase):
 
     def test_bucket_pads_with_dummy_page(self):
         self.assertEqual(
-            bucket_pages([3, 4, 5], [6, 7, 8]), ([3, 4, 5, 0], [6, 7, 8, 0])
+            bucket_pages(real_pages=[3, 4, 5], staging_pages=[6, 7, 8]),
+            ([3, 4, 5, 0], [6, 7, 8, 0]),
         )
-        self.assertEqual(bucket_pages([3], [6]), ([3], [6]))
+        self.assertEqual(bucket_pages(real_pages=[3], staging_pages=[6]), ([3], [6]))
         with self.assertRaises(ValueError):
-            bucket_pages([1, 2], [3])
+            bucket_pages(real_pages=[1, 2], staging_pages=[3])
 
     def test_merge_writes_back_through_the_pool_page_write(self):
         """The merged pages go back through kv_page_write.write_pages_torch
@@ -789,7 +794,12 @@ class TestTpuReshardMerge(unittest.TestCase):
             real_write(block_ids, pages, kv)
 
         with mock.patch.object(kv_page_write, "write_pages_torch", recorder):
-            merge_staged_pages(bufs, [3, 5, 2], [7, 1, 8], ((0, 2, 2),))
+            merge_staged_pages(
+                bufs=bufs,
+                real_pages=[3, 5, 2],
+                staging_pages=[7, 1, 8],
+                merges=((0, 2, 2),),
+            )
         self.assertEqual(
             calls,
             [([3, 5, 2, 0], b.untyped_storage().data_ptr()) for b in bufs],
@@ -821,6 +831,9 @@ class _FakeAllocator:
         pages = self.live.pop(id(idx))
         self.free_pages.extend(pages)
         self.frees += 1
+
+    def translate_kv_indices_for_transfer(self, kv_indices):
+        return kv_indices
 
 
 class TestTpuReshardStagingLifecycle(unittest.TestCase):

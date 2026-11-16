@@ -197,6 +197,7 @@ class RaidenKVManager(
     _read_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     _write_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     state_raiden_endpoint: Optional[str] = None
+    _token_allocator: Optional[Any] = None
 
     def __init__(
         self,
@@ -226,6 +227,7 @@ class RaidenKVManager(
         self._swa_engine: Optional[Any] = None
         self._kv_caches: Optional[list] = None
         self._swa_kv_caches: Optional[list] = None
+        self._token_allocator: Optional[Any] = None
         self.raiden_endpoint: Optional[str] = None
         self.swa_raiden_endpoint: Optional[str] = None
         self._pipeline = None
@@ -520,10 +522,15 @@ class RaidenKVManager(
 
     @property
     def _staging_allocator(self) -> Any:
-        return getattr(self, "_token_allocator", None)
+        return self._token_allocator
 
-    def _alloc_reshard_staging(self, n_pages: int, n_swa_pages: int) -> ReshardStaging:
+    def _alloc_reshard_staging(
+        self, *, n_pages: int, n_swa_pages: int
+    ) -> ReshardStaging:
         """Allocate ``n_pages`` full (and ``n_swa_pages`` SWA) staging pages."""
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
         def page_ids(token_indices) -> Tuple[int, ...]:
@@ -532,7 +539,7 @@ class RaidenKVManager(
                 int(p) for p in (token_indices[::page_size] // page_size).tolist()
             )
 
-        def no_pages(n: int, what: str) -> RuntimeError:
+        def no_pages(*, n: int, what: str) -> RuntimeError:
             pool = f"{what} " if what else ""
             return RuntimeError(
                 f"Raiden reshard needs {n} free {pool}KV pages to stage writers "
@@ -556,14 +563,14 @@ class RaidenKVManager(
             )
             full = full_alloc.alloc(n_pages * page_size)
             if full is None:
-                raise no_pages(n_pages, "full-attention")
+                raise no_pages(n=n_pages, what="full-attention")
             frees = [(full_alloc, full)]
             swa_pages: Tuple[int, ...] = ()
             if n_swa_pages:
                 swa = swa_alloc.alloc(n_swa_pages * page_size)
                 if swa is None:
                     full_alloc.free(full)
-                    raise no_pages(n_swa_pages, "sliding-window")
+                    raise no_pages(n=n_swa_pages, what="sliding-window")
                 frees.append((swa_alloc, swa))
                 swa_pages = page_ids(swa)
             return ReshardStaging(
@@ -571,13 +578,17 @@ class RaidenKVManager(
             )
         indices = allocator.alloc(n_pages * page_size)
         if indices is None:
-            raise no_pages(n_pages, "")
-        full = indices
-        if hasattr(allocator, "translate_kv_indices_for_transfer"):
-            full = allocator.translate_kv_indices_for_transfer(indices)
+            raise no_pages(n=n_pages, what="")
+        full = allocator.translate_kv_indices_for_transfer(indices)
         swa_pages = ()
         if n_swa_pages:
-            if not hasattr(allocator, "translate_swa_indices_for_transfer"):
+            if not isinstance(
+                allocator,
+                (
+                    SWATokenToKVPoolAllocator,
+                    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+                ),
+            ):
                 allocator.free(indices)
                 raise RuntimeError(
                     "Raiden reshard needs sliding-window staging pages, but the decode allocator has no sliding-window pool"
@@ -623,7 +634,12 @@ class RaidenKVManager(
             geometry = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=swa)
             # The receive plans were built for decode_rank=self.attn_tp_rank.
             merges = geometry.merge_spec(self.attn_tp_rank)
-            merge_staged_pages(bufs, list(real_pages), staging_pages, merges)
+            merge_staged_pages(
+                bufs=bufs,
+                real_pages=list(real_pages),
+                staging_pages=staging_pages,
+                merges=merges,
+            )
 
     # ----- engine lifecycle -------------------------------------------------
 

@@ -1047,8 +1047,10 @@ def _patch_raiden_reshard_staging_allocator() -> None:
 
     @functools.wraps(original)
     def _init_kv_manager(self):
+        from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+
         kv_manager = original(self)
-        if hasattr(kv_manager, "attach_token_allocator"):
+        if isinstance(kv_manager, RaidenKVManager):
             kv_manager.attach_token_allocator(self.token_to_kv_pool_allocator)
         return kv_manager
 

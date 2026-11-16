@@ -12,7 +12,7 @@ _INT_OF_WIDTH = {1: torch.uint8, 2: torch.int16, 4: torch.int32}
 
 
 def bucket_pages(
-    real_pages: Sequence[int], staging_pages: Sequence[int]
+    *, real_pages: Sequence[int], staging_pages: Sequence[int]
 ) -> Tuple[List[int], List[int]]:
     """Pad real and staging page lists to the next power of two using dummy page 0."""
     if len(real_pages) != len(staging_pages):
@@ -24,7 +24,7 @@ def bucket_pages(
 
 
 def _slot_pairs(
-    merges: Sequence[Merge], kv_packing: int
+    *, merges: Sequence[Merge], kv_packing: int
 ) -> Tuple[Tuple[Tuple[int, int], Tuple[int, int]], ...]:
     """((stage_pack, stage_lane), (dst_pack, dst_lane)) for every merged slot."""
     pairs = []
@@ -39,7 +39,8 @@ def _slot_pairs(
     return tuple(pairs)
 
 
-def merge_layer(
+def _merge_layer(
+    *,
     buf: torch.Tensor,
     real_idx: torch.Tensor,
     stage_idx: torch.Tensor,
@@ -54,12 +55,13 @@ def merge_layer(
         target = buf.view(_INT_OF_WIDTH[buf.element_size()])
     pages = target[real_idx]
     staged = target[stage_idx]
-    for (sp, sl), (dp, dl) in _slot_pairs(merges, int(buf.shape[3])):
+    for (sp, sl), (dp, dl) in _slot_pairs(merges=merges, kv_packing=int(buf.shape[3])):
         pages[:, :, dp, dl] = staged[:, :, sp, sl]
     write_pages(real_idx, pages, target)
 
 
 def merge_staged_pages(
+    *,
     bufs: Sequence[torch.Tensor],
     real_pages: Sequence[int],
     staging_pages: Sequence[int],
@@ -74,9 +76,15 @@ def merge_staged_pages(
             raise ValueError(
                 f"Raiden reshard merge needs fused 5-D KV buffers, got {tuple(buf.shape)}"
             )
-    real, stage = bucket_pages(real_pages, staging_pages)
+    real, stage = bucket_pages(real_pages=real_pages, staging_pages=staging_pages)
     device = bufs[0].device
     real_idx = torch.tensor(real, dtype=torch.long, device=device)
     stage_idx = torch.tensor(stage, dtype=torch.long, device=device)
     for buf in bufs:
-        merge_layer(buf, real_idx, stage_idx, merges, write_pages)
+        _merge_layer(
+            buf=buf,
+            real_idx=real_idx,
+            stage_idx=stage_idx,
+            merges=merges,
+            write_pages=write_pages,
+        )

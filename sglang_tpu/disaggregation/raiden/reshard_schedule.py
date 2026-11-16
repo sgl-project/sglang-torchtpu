@@ -191,9 +191,11 @@ class ReshardGeometry:
                 f"({src_hpr} src head(s) vs {dst_hpr} dst head(s))."
             )
         packed_heads = -(-num_heads // heads_per_pack) * heads_per_pack
-        return self._entry(sh_start, packed_heads, dh_start)
+        return self._entry(src_head=sh_start, num_heads=packed_heads, dst_head=dh_start)
 
-    def _entry(self, src_head: int, num_heads: int, dst_head: int):
+    def _entry(
+        self, *, src_head: int, num_heads: int, dst_head: int
+    ) -> Tuple[int, int, int, int, int]:
         """(src_offset, size, src_stride, dst_offset, dst_stride) of a run of
         ``num_heads`` heads, per token; the strides are the two row widths."""
         return (
@@ -205,16 +207,16 @@ class ReshardGeometry:
         )
 
     def check_decode_rank(self, decode_rank: int) -> None:
-        for prefill_rank in self.sources_of(decode_rank):
+        for prefill_rank in self._sources_of(decode_rank):
             self.entry_bytes(prefill_rank, decode_rank)
 
-    def sources_of(self, decode_rank: int) -> List[int]:
+    def _sources_of(self, decode_rank: int) -> List[int]:
         """Attention-TP ranks of the prefill that feed ``decode_rank``."""
         if self.src_tp >= self.dst_tp:
             return source_ranks_for(decode_rank % self.dst_tp, self.ratio)
         return [decode_rank % self.dst_tp * self.src_tp // self.dst_tp]
 
-    def slot_bytes(self) -> int:
+    def _slot_bytes(self) -> int:
         """Bytes one K/V slot adds to a token row (a pack row / kv_packing)."""
         return self.padded_head_dim * self.element_size
 
@@ -225,11 +227,11 @@ class ReshardGeometry:
         dst_row = self._token_bytes(self.dst_tp)
         dst_heads = self.heads_per_rank(self.dst_tp)
         dst_padded_heads = -(-dst_heads // heads_per_pack) * heads_per_pack
-        slot_bytes = self.slot_bytes()
+        slot_bytes = self._slot_bytes()
         direct: Dict[int, Tuple[int, int, int]] = {}  # rank -> (dh, n, packed)
         staged: List[int] = []
         slices = {}
-        for prefill_rank in self.sources_of(decode_rank):
+        for prefill_rank in self._sources_of(decode_rank):
             sh, n, dh, src_hpr, _ = head_slice_params(
                 self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
             )
@@ -271,7 +273,9 @@ class ReshardGeometry:
             padding.update(range(dh + n, dh + packed))
             plans[prefill_rank] = WriterPlan(
                 staged=False,
-                entry=self._entry(slices[prefill_rank][0], packed, dh),
+                entry=self._entry(
+                    src_head=slices[prefill_rank][0], num_heads=packed, dst_head=dh
+                ),
                 merges=(),
             )
         # Each decode head's final bytes come from a merge (which runs after
@@ -291,7 +295,7 @@ class ReshardGeometry:
             )
         return plans
 
-    def writer_plan(self, prefill_rank: int, decode_rank: int) -> WriterPlan:
+    def writer_plan(self, *, prefill_rank: int, decode_rank: int) -> WriterPlan:
         return self.decode_rank_plan(decode_rank)[prefill_rank % self.src_tp]
 
     def merge_spec(self, decode_rank: int) -> Tuple[Tuple[int, int, int], ...]:
@@ -360,7 +364,7 @@ def build_sender_request(
             "src_block_ids, dst_block_ids, live_tokens must be equal length"
         )
     src_off, size, src_stride, dst_off, dst_stride = geom.writer_plan(
-        prefill_rank % geom.src_tp, decode_rank
+        prefill_rank=prefill_rank % geom.src_tp, decode_rank=decode_rank
     ).entry
     req = pb2.StartTransferRequest()
     req.uuid = uuid

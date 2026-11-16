@@ -890,7 +890,8 @@ class RaidenReceiverMixin:
                     geometry.check_decode_rank(r)
             if staged_ranks:
                 staging = self._alloc_reshard_staging(
-                    len(local_blocks), len(local_swa_blocks or [])
+                    n_pages=len(local_blocks),
+                    n_swa_pages=len(local_swa_blocks or []),
                 )
         except (ValueError, RuntimeError) as e:
             reason = f"Raiden receive failed: room {room}: {e}"
