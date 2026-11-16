@@ -49,7 +49,6 @@ def _capacity_for_shape(
             kv_layout=layout,
         )
         vmem = pltpu.get_tpu_info().vmem_capacity_bytes
-        assert configs.NUM_INPUT_SLOTS == _PIPELINE_INPUT_SLOTS
         decode, mixed = calculate_block_sizes(model, serve, vmem)
         block = decode if mode == "decode" else mixed
         cfg = configs.RpaConfigs(
@@ -59,20 +58,14 @@ def _capacity_for_shape(
             mode=configs.RpaCase.DECODE if mode == "decode" else configs.RpaCase.MIXED,
             vmem_limit_bytes=vmem,
         )
-        return _capacity_from_config(cfg, pages_per_seq, page_size)
+        return _capacity_from_config(
+            cfg, pages_per_seq, page_size, configs.NUM_INPUT_SLOTS
+        )
 
 
-# Input buffers of the kernel's pipeline (batched_rpa `configs.NUM_INPUT_SLOTS`,
-# the same for every kernel); kept as a literal so this stays importable without
-# JAX.
-_PIPELINE_INPUT_SLOTS = 3
-
-
-def _capacity_from_config(cfg, pages_per_seq, page_size):
+def _capacity_from_config(cfg, pages_per_seq, page_size, num_input_slots):
     block = cfg.block
-    per_lane = (
-        cfg.max_steps_ub * cfg.max_schedule_size_multiplier - _PIPELINE_INPUT_SLOTS - 1
-    )
+    per_lane = cfg.max_steps_ub * cfg.max_schedule_size_multiplier - num_input_slots - 1
     if block.batch_size > 1:
         per_lane -= -(-pages_per_seq * page_size // block.bkv_sz)
     return max(0, per_lane) * block.batch_size, block.bq_sz, block.bkv_sz

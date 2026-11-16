@@ -67,7 +67,9 @@ class TestHbmScheduleCapacity(CustomTestCase):
             max_schedule_size_multiplier=16,
             block=NS(batch_size=1, bq_sz=256, bkv_sz=512),
         )
-        self.assertEqual(capacity._capacity_from_config(cfg, 64, 256), (2044, 256, 512))
+        self.assertEqual(
+            capacity._capacity_from_config(cfg, 64, 256, 3), (2044, 256, 512)
+        )
 
     def test_multiple_lanes_reserve_the_longest_sequence_imbalance(self):
         cfg = NS(
@@ -75,7 +77,9 @@ class TestHbmScheduleCapacity(CustomTestCase):
             max_schedule_size_multiplier=16,
             block=NS(batch_size=4, bq_sz=1, bkv_sz=512),
         )
-        self.assertEqual(capacity._capacity_from_config(cfg, 65, 256), (8044, 1, 512))
+        self.assertEqual(
+            capacity._capacity_from_config(cfg, 65, 256, 3), (8044, 1, 512)
+        )
 
 
 class TestLiveBatchCapacity(CustomTestCase):
