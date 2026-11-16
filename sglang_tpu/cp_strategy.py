@@ -34,4 +34,24 @@ class TpuZigzagCPStrategy(ZigzagCPStrategy):
         if extend_lens is None:
             return True
         lengths = [int(length) for length in extend_lens]
-        return min(lengths) > 0 and max(lengths) >= self.cp_size
+        if not (min(lengths) > 0 and max(lengths) >= self.cp_size):
+            return False
+        if self.ring_max_local_rows is None:
+            return True
+        # Ring mode reserves two page-aligned blocks per request on every rank,
+        # so many short requests can overflow the largest token bucket; such a
+        # batch runs the striped (DCP) extend program instead. The decision is
+        # made on the host before the layout is attached; the compiled forward
+        # only re-reads it (see pinned_extend_seq_lens_cpu).
+        from sglang.srt.runtime_context import get_schedule
+        from sglang_tpu.cp_forward import get_tpu_cp_layout
+        from sglang_tpu.cp_layout import ring_local_rows
+
+        if get_tpu_cp_layout(forward_batch) is not None:
+            return True
+        rows = ring_local_rows(lengths, self.cp_size, get_schedule().page_size)
+        return rows <= self.ring_max_local_rows
+
+    # Ring mode (SGLANG_TPU_PCP_MODE=ring) only: the largest local token bucket
+    # its layout can use, set by the compile policy on every rank alike.
+    ring_max_local_rows: int | None = None

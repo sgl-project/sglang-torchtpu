@@ -386,6 +386,7 @@ def merge_across_ranks(
     world_size: int,
     rank_mask: torch.Tensor,
     rank_index: torch.Tensor,
+    replicated_o_proj: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge one partial ``(out [T, H_all, D] fp32, lse [T, H_all])`` per rank.
 
@@ -395,6 +396,16 @@ def merge_across_ranks(
     elementwise ops (pairwise max, exp, log) because torch_tpu implements
     neither ``logsumexp`` nor ``logaddexp``. ``rank_mask`` / ``rank_index`` are
     the rank as device tensors (``bool[world_size]`` one-hot, ``i64[1]``).
+
+    ``replicated_o_proj``: the group's ranks share one o_proj head shard (and
+    computed the same q heads on their own queries: attention TP 1, or the
+    attention-CP group of ring-mode prefill context parallelism, vLLM's
+    "DCP = PCP" case). ``H_all`` is then the layer's head count rather than
+    the rank-major gathered one, and the merged result is returned whole
+    instead of cropped to this rank's head block.
+    TODO: drive this from a generic ``--dcp-replicate-o-proj`` (the
+    counterpart of ``--dcp-replicate-q-proj``) once both flags handle a DCP
+    group that spans the attention-CP axis.
     """
     if world_size == 1:
         return out, lse
@@ -414,6 +425,8 @@ def merge_across_ranks(
     scale = _zero_non_finite(torch.exp(lse - global_lse))
     out = _zero_non_finite(out) * scale[..., None]
     out = group.all_reduce(out)
+    if replicated_o_proj:
+        return out, global_lse
     heads = heads_all // world_size
     return (
         out.view(num_tokens, world_size, heads, -1)
