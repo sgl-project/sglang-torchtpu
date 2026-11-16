@@ -49,6 +49,7 @@ from sglang_tpu.cp_forward import (
     pinned_extend_seq_lens_cpu,
 )
 from sglang_tpu.envs import envs
+from sglang_tpu.host_upload import upload
 
 if TYPE_CHECKING:
     from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
@@ -563,10 +564,12 @@ def _pad_mamba_tracking(forward_batch: Any, pad_b: int) -> None:
             continue
         if val.device.type == "cpu":
             originals[field] = val
+            # Earlier programs are usually still queued here (the draft, before
+            # a verify); a blocking upload would wait for all of them.
             setattr(
                 forward_batch,
                 field,
-                _zero_pad_dim0(val, pad_b).to(forward_batch.seq_lens.device),
+                upload(_zero_pad_dim0(val, pad_b), forward_batch.seq_lens.device),
             )
         elif val.shape[0] != pad_b:
             # Already-padded inputs make repeated preparation harmless. Never
