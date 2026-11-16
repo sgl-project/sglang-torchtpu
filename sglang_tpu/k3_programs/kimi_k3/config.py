@@ -50,6 +50,12 @@ class KernelConfig:
     # [16, K] product (as B64, B96 and B128 do) instead of a scalar scan of
     # the row bitmask. The source rows without local routes are zeroed first.
     b16_one_hot_staging: bool = False
+    # B16-B128 grouped routed experts (compact tiles): one copy of the
+    # eight-row passes serves an iteration's pair or tail of experts with more
+    # rows than a compact tile (a loop over its one or two experts) instead
+    # of three unrolled copies. The same products in the same order; the
+    # B16 expert-loop overlay then fits beside the KDA layer's path.
+    shared_expert_passes: bool = False
     shared_expert_finishers: bool = True
     compact_overflow: bool = True
     # Grouped routed experts at B8/B16: after routing, one SMEM table holds
