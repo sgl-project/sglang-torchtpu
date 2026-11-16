@@ -15,15 +15,16 @@ from __future__ import annotations
 import logging
 
 import jax.numpy as jnp
-
 from jax.experimental.pallas import tpu as pltpu
-
-def get_device_name():
-    return f"TPU v{pltpu.get_tpu_info().generation}"
 
 from .kernel import FusedMoEBlockConfig
 
 logger = logging.getLogger(__name__)
+
+
+def get_device_name():
+    return f"TPU v{pltpu.get_tpu_info().generation}"
+
 
 # Gather-compute overlap is unconditional for num_bt > 1 via the kernel's fixed-K
 # rotating gather banks (fixed_gather_banks, default 2): the K-deep sliding window
