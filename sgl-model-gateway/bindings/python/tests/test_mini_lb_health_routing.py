@@ -6,6 +6,7 @@ import logging
 import math
 import socket
 
+import aiohttp
 import pytest
 from aiohttp import web
 from sglang_router import mini_lb
@@ -406,6 +407,172 @@ def test_emptied_role_does_not_log_recovery(caplog):
             with pytest.raises(AssertionError, match="No decode servers"):
                 load_balancer.select_pair()
         assert not [r for r in caplog.records if "healthy backend again" in r.message]
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_requested_probe_skips_a_broken_decode_before_the_next_poll():
+    async def test(backends, prefill_urls, decode_urls):
+        healthy, broken = decode_urls
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=600)
+        backends.status[broken] = 503
+
+        load_balancer.request_health_probe(broken)
+        await _wait_for(lambda: broken in load_balancer._health.unhealthy)
+
+        assert _selected(load_balancer) == (set(prefill_urls), {healthy})
+        assert backends.probes == {prefill_urls[0]: 0, healthy: 0, broken: 1}
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_requested_probe_keeps_a_healthy_backend_routable():
+    # A transient break on a backend that still answers 200 must not take
+    # it out of rotation: the probe decides, not the break.
+    async def test(backends, prefill_urls, decode_urls):
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=600)
+
+        load_balancer.request_health_probe(decode_urls[0])
+        await _wait_for(lambda: backends.probes[decode_urls[0]] == 1)
+        await asyncio.gather(*list(mini_lb._background_tasks))
+
+        assert _selected(load_balancer) == (set(prefill_urls), set(decode_urls))
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_requested_probes_of_one_backend_do_not_pile_up():
+    async def test(backends, prefill_urls, decode_urls):
+        hung = decode_urls[0]
+        backends.hung.add(hung)
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=600)
+
+        for _ in range(3):
+            load_balancer.request_health_probe(hung)
+        await backends.probe_started[hung].wait()
+        backends.release.set()
+        await asyncio.gather(*list(mini_lb._background_tasks))
+
+        assert backends.probes[hung] == 1
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_poller_does_not_overlap_a_requested_probe():
+    async def test(backends, prefill_urls, decode_urls):
+        hung = decode_urls[0]
+        backends.hung.add(hung)
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=0.01)
+
+        load_balancer.request_health_probe(hung)
+        await backends.probe_started[hung].wait()
+        polling = load_balancer.start_health_polling()
+        try:
+            # Several poll intervals pass while the requested probe hangs.
+            await asyncio.sleep(0.1)
+            assert backends.probes[hung] == 1
+        finally:
+            polling.cancel()
+            await asyncio.gather(polling, return_exceptions=True)
+            backends.release.set()
+            await asyncio.gather(*list(mini_lb._background_tasks))
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_requested_probe_supersedes_a_periodic_probe_in_flight():
+    # The periodic probe may have been answered before the backend broke, so
+    # its verdict must not land; the requested probe's does.
+    async def test(backends, prefill_urls, decode_urls):
+        broken = decode_urls[0]
+        backends.hung.add(broken)
+        # The poller probes once at start, then not again during the test.
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=600)
+        polling = load_balancer.start_health_polling()
+        try:
+            await backends.probe_started[broken].wait()
+            backends.probe_started[broken].clear()
+            backends.hung.discard(broken)
+            backends.status[broken] = 503
+
+            load_balancer.request_health_probe(broken)
+            await _wait_for(lambda: broken in load_balancer._health.unhealthy)
+            # The periodic probe would now answer 200; it was cancelled, so
+            # that stale answer cannot flip the verdict back.
+            backends.status[broken] = 200
+            backends.release.set()
+            await asyncio.sleep(0.05)
+            assert broken in load_balancer._health.unhealthy
+            assert backends.probes[broken] == 2
+        finally:
+            polling.cancel()
+            await asyncio.gather(polling, return_exceptions=True)
+            await asyncio.gather(*list(mini_lb._background_tasks))
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_reregistered_backend_is_probed_while_its_old_probe_hangs():
+    async def test(backends, prefill_urls, decode_urls):
+        healthy, sick = decode_urls
+        backends.hung.add(sick)
+        load_balancer = _lb(prefill_urls, decode_urls, health_check_interval_secs=0.01)
+        polling = load_balancer.start_health_polling()
+        try:
+            await backends.probe_started[sick].wait()
+            load_balancer.remove_worker(sick)
+            backends.hung.discard(sick)
+            backends.status[sick] = 503
+            load_balancer.add_worker(sick, "decode")
+
+            await _wait_for(lambda: sick in load_balancer._health.unhealthy)
+            assert _selected(load_balancer)[1] == {healthy}
+        finally:
+            polling.cancel()
+            await asyncio.gather(polling, return_exceptions=True)
+
+    _run(test)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("policy", ["random", "session_affinity"])
+def test_refused_connect_requests_a_probe_of_that_backend(policy):
+    async def test(backends, prefill_urls, decode_urls):
+        dead = _refused_url()
+        load_balancer = _lb(
+            prefill_urls,
+            [decode_urls[0], dead],
+            policy,
+            health_check_interval_secs=600,
+        )
+
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises(aiohttp.ClientConnectionError):
+                await load_balancer._engine_request(
+                    dead, session.get, f"{dead}/generate"
+                )
+        await _wait_for(lambda: dead in load_balancer._health.unhealthy)
+
+        assert _selected(load_balancer) == (set(prefill_urls), {decode_urls[0]})
+
+    _run(test)
+
+
+@pytest.mark.unit
+def test_requested_probe_is_a_no_op_when_health_checks_are_off():
+    async def test(backends, prefill_urls, decode_urls):
+        load_balancer = _lb(prefill_urls, decode_urls, disable_health_check=True)
+
+        load_balancer.request_health_probe(decode_urls[0])
+        await asyncio.sleep(0.05)
+
+        assert sum(backends.probes.values()) == 0
 
     _run(test)
 
