@@ -1,8 +1,9 @@
 # Diffusion recipes on Cloud TPU (`torch_tpu`)
 
 Launch recipes for `sglang.multimodal_gen` on one tpu7x 2x2x1 host (8 TensorCores, `--num-gpus` counts cores).
-All recipes use the Pallas splash attention backend, torch.compile with the `tpu` backend, a TP-folded resident
-text encoder, the highest TPU clock and a 65536 KiB scoped-VMEM limit for XLA fusions (`LIBTPU_INIT_ARGS`), the full
+All recipes use torch.compile with the `tpu` backend, the Pallas splash attention backend (SANA-Video's DiT runs
+linear self-attention and SDPA cross-attention), a TP-folded resident text encoder, the highest TPU clock and a
+65536 KiB scoped-VMEM limit for XLA fusions (`LIBTPU_INIT_ARGS`), the full
 64 MiB of per-core VMEM on tpu7x (3% faster denoise on Z-Image-Turbo than without it); see `launch.sh`. The Wan
 recipes compile per transformer block (`--regional-compile`), which keeps each block's collectives inside its program,
 and run Ulysses across the two cores of a chip with a K/V all-gather ring across chips.
@@ -14,6 +15,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_ti2v_5b.sh` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
+| `sana_video.sh` | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | 2 or 1 | CFG 2, one branch per core |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -38,6 +40,9 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
+| SANA-Video 2B 720p | T2V 1280x704, 81 frames, 50 steps | 2 | 9.0 s | 0.136 s | 0.84 s | 41.4 GB |
+| SANA-Video 2B 720p | T2V 1280x704, 81 frames, 50 steps | 1 | 16.0 s | 0.271 s | 0.84 s | 43.9 GB |
+| SANA-Video 2B 720p | T2V 1280x704, 81 frames, 50 steps, `--vae-precision fp32` | 2 | 10.0 s | 0.136 s | 1.4 s | 77.2 GB |
 
 
 ## Example requests
@@ -70,5 +75,14 @@ Wan2.2-TI2V-5B (`wan22_ti2v_5b.sh`):
 curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
   "prompt": "A fluffy golden dog sits centered in frame against a soft pastel background, looking into the camera",
   "size": "1280x704", "num_frames": 121, "num_inference_steps": 20, "seed": 42
+}'
+```
+
+SANA-Video 2B 720p (`sana_video.sh`; the motion score ends the prompt, as in the model card):
+
+```bash
+curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
+  "prompt": "A fluffy golden dog sits centered in frame against a soft pastel background, looking into the camera. motion score: 30.",
+  "size": "1280x704", "num_frames": 81, "fps": 16, "num_inference_steps": 50, "guidance_scale": 6.0, "seed": 42
 }'
 ```

@@ -165,6 +165,9 @@ tpu:
       - 'python/sglang/multimodal_gen/runtime/models/dits/zimage.py'
       - 'python/sglang/multimodal_gen/test/unit/test_usp_*.py'
       - 'python/sglang/multimodal_gen/test/unit/test_wan_sp_padding.py'
+      # The SANA-Video configs its test checks.
+      - 'python/sglang/multimodal_gen/configs/pipeline_configs/sana_video.py'
+      - 'python/sglang/multimodal_gen/configs/sample/sana_video.py'
       - 'python/pyproject_tpu.toml'
       - 'benchmark/tpu/**'
       - 'docker/tpu.Dockerfile'
