@@ -11,11 +11,16 @@ engines disagree fails its requests instead (the raiden channel,
 from __future__ import annotations
 
 import inspect
-from typing import Any, List
+import logging
+from typing import Any, List, Optional
 
+from sglang.srt.environ import envs as core_envs
 from sglang_tpu.envs import envs as tpu_envs
 
+logger = logging.getLogger(__name__)
+
 _SWITCH = tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM
+_SKIP_RECLAIM = core_envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM
 
 
 class UnsupportedDramOffloadConfig(ValueError):
@@ -160,6 +165,26 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
     return problems
 
 
+def host_duplicate_reclaim_warning() -> Optional[str]:
+    """Why this engine's host pool will fill up under ``write_back``: core's
+    reclaim of host copies the device also holds is turned off. A session
+    loaded back from host RAM then keeps both copies, the host pool becomes
+    duplicates plus the offload's pins, device evictions cannot back their
+    victims up ("backup failed under host memory pressure but subtree drop
+    declined") and returning sessions lose hits. Supported, so a warning."""
+    from sglang.srt.runtime_context import get_memory
+
+    if get_memory().hicache_write_policy != "write_back" or not _SKIP_RECLAIM.get():
+        return None
+    return (
+        f"{_SKIP_RECLAIM.name}=1 with --hicache-write-policy write_back and "
+        f"{_SWITCH.name}=1: host copies of sessions loaded back to the device "
+        "are never reclaimed, so the host pool fills with duplicates, device "
+        "evictions are refused under host pressure and prefix hits drop; "
+        f"unset {_SKIP_RECLAIM.name}"
+    )
+
+
 def validate_engine_args(*, role: str, scheduler: Any) -> None:
     """Raise UnsupportedDramOffloadConfig for a setting the offload does not
     support. ``role`` is "prefill" or "decode". Called before the transfer
@@ -173,3 +198,6 @@ def validate_engine_args(*, role: str, scheduler: Any) -> None:
             + "; ".join(problems)
             + f" (change the setting or unset {_SWITCH.name})"
         )
+    warning = host_duplicate_reclaim_warning()
+    if warning:
+        logger.warning("%s", warning)

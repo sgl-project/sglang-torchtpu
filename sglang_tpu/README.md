@@ -130,6 +130,13 @@ roles:
 SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM=1
 ```
 
+Leave `SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM` unset under `write_back`.
+With it set to 1, host copies of sessions loaded back to the device are never
+reclaimed: the host pool fills with duplicates, device evictions are refused
+under host pressure (`backup failed under host memory pressure but subtree
+drop declined`) and returning sessions lose prefix hits. An engine started
+that way logs a warning.
+
 Unsupported settings are refused, never run without the offload. An engine
 stops at start, naming the setting, with: a GDN/Mamba model, the unified KV
 pool, pipeline parallelism (`--pp-size` above 1) or the Raiden pipeline
