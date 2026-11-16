@@ -1590,6 +1590,12 @@ class TpuSRTPlatform(SRTPlatform):
         return False
 
     def process_model_after_loading(self, model: torch.nn.Module) -> None:
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_USE_GLM_MOE_V2.get():
+            from sglang_tpu.moe.glm_moe_v2 import prepare_model
+
+            prepare_model(model)
         from sglang.srt.models.kimi_k3 import KimiK3LinearForCausalLM
 
         if not isinstance(model, KimiK3LinearForCausalLM):
