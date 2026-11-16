@@ -526,6 +526,17 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
 
 def prepare_model_for_fused_moe_decode(model: torch.nn.Module) -> int:
     """Prepare all eligible MoE modules in `model` after weight postprocessing."""
+    # DefaultModelLoader already calls this plugin entry after every quant
+    # method has finalized its layouts. Dispatch before the legacy decode-only
+    # gate: GLM's selected-route candidate covers prefill and verify as well.
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_USE_GLM_MOE_V2.get():
+        from sglang_tpu.moe.glm_moe_v2 import prepare_model
+
+        count = prepare_model(model)
+        if count is not None:
+            return count
     if not is_fused_moe_decode_enabled():
         return 0
 
