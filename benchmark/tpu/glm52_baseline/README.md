@@ -148,3 +148,10 @@ first experiment is terminal; kernel development proceeds on prod2 4-chip
 allocations. Keep the 6,900-second allocation bound below prod1's two-hour
 runtime policy, inspect failures promptly, and release this task's failed
 allocation if no concrete recovery is underway. Never stop unrelated runs.
+
+Candidate E2E manifests mount the old baseline measurements read-only and set
+`GLM52_FROZEN_INPUTS` to that directory. The client verifies and reuses the exact
+1,142,656 int32 natural-code input IDs and their SHA256. This avoids changing the
+workload when editable installation regenerates `python/sglang/_version.py`
+for each candidate commit. The old input manifest is retained with `reused_from`;
+all other checkpoint/tokenizer and workload checks still apply.
