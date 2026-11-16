@@ -155,9 +155,10 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             trace,
             specialization_key=specialization_key,
             model=self.model_runner.model,
-            model_extra_tensor_attrs=(
-                *self.get_model_extra_tensor_attrs(),
-                *model_extra_tensor_attrs,
+            model_extra_tensor_attrs=tuple(
+                dict.fromkeys(
+                    (*self.get_model_extra_tensor_attrs(), *model_extra_tensor_attrs)
+                )
             ),
             kv_pool=self.get_direct_compile_kv_pool(),
             ignored_argnames=self._ignored_argnames(),
