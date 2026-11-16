@@ -2,7 +2,9 @@
 
 HybridLinearAttnBackend has no forward_metadata of its own and the linear state
 lives outside the KV pool, so both children's metadata and the TpuMambaPool
-tensors are lifted here as graph inputs.
+tensors are lifted here as graph inputs, with the request-pool tensors a
+Qwen4-Exp PLE layer reads in its forward (slot mapping, short-conv state,
+n-gram context).
 """
 
 from __future__ import annotations
@@ -30,22 +32,68 @@ from sglang_tpu.attention_gdn_pallas import GdnTracedMetadata, TpuGDNAttnBackend
 from sglang_tpu.mamba_pool import TpuMambaPool
 
 
+# Request-pool tensors a model reads inside its forward, as (owner, attribute)
+# paths from the request pool: the Qwen4-Exp PLE layer maps request rows to
+# state slots there, and reads and writes its short-conv state and n-gram
+# context (HybridReqToTokenPool.short_conv_pool / ngram_pool).
+_REQ_POOL_SIDE_TENSORS = (
+    ((), "req_index_to_mamba_index_mapping"),
+    (("short_conv_pool",), "conv_state"),
+    (("ngram_pool",), "context"),
+)
+
+
+def _req_pool_side_tensors(req_to_token_pool: ReqToTokenPool) -> list[tuple]:
+    """(owner, attribute) of each side tensor the request pool holds, only for
+    models with PLE side state (others never read them inside the graph)."""
+    short_conv = getattr(req_to_token_pool, "short_conv_pool", None)
+    ngram = getattr(req_to_token_pool, "ngram_pool", None)
+    if not (
+        (short_conv is not None and short_conv.enabled)
+        or (ngram is not None and ngram.enabled)
+    ):
+        return []
+    owners = []
+    for path, attr in _REQ_POOL_SIDE_TENSORS:
+        owner = req_to_token_pool
+        for name in path:
+            owner = getattr(owner, name)
+        if isinstance(getattr(owner, attr, None), torch.Tensor):
+            owners.append((owner, attr))
+    return owners
+
+
 class HybridLinearKVPoolState:
-    """KVPool over the full-attention KV buffers followed by the linear-attention state."""
+    """KVPool over the full-attention KV buffers followed by the linear-attention
+    state and the request-pool side tensors the forward reads (PLE)."""
 
     def __init__(
-        self, *, full_kv_pool: MHATokenToKVPool, mamba_pool: TpuMambaPool
+        self,
+        *,
+        full_kv_pool: MHATokenToKVPool,
+        mamba_pool: TpuMambaPool,
+        side_tensors: list[tuple] = (),
     ) -> None:
         self._full_kv_pool = full_kv_pool
         self._mamba_pool = mamba_pool
+        self._side_tensors = list(side_tensors)
 
     def get_state(self) -> list[torch.Tensor]:
-        return [*self._full_kv_pool.get_state(), *self._mamba_pool.get_state()]
+        return [
+            *self._full_kv_pool.get_state(),
+            *self._mamba_pool.get_state(),
+            *(getattr(owner, attr) for owner, attr in self._side_tensors),
+        ]
 
     def set_state(self, state: list[torch.Tensor]) -> None:
         num_full = len(self._full_kv_pool.get_state())
+        num_mamba = len(self._mamba_pool.get_state())
         self._full_kv_pool.set_state(state[:num_full])
-        self._mamba_pool.set_state(state[num_full:])
+        self._mamba_pool.set_state(state[num_full : num_full + num_mamba])
+        side = state[num_full + num_mamba :]
+        assert len(side) == len(self._side_tensors), (len(side), self._side_tensors)
+        for (owner, attr), tensor in zip(self._side_tensors, side):
+            setattr(owner, attr, tensor)
 
 
 def hybrid_linear_kv_pool_state(
@@ -57,7 +105,11 @@ def hybrid_linear_kv_pool_state(
     assert isinstance(mamba_pool, TpuMambaPool), type(mamba_pool)
     full_kv_pool = kv_pool.full_kv_pool
     assert isinstance(full_kv_pool, MHATokenToKVPool), type(full_kv_pool)
-    return HybridLinearKVPoolState(full_kv_pool=full_kv_pool, mamba_pool=mamba_pool)
+    return HybridLinearKVPoolState(
+        full_kv_pool=full_kv_pool,
+        mamba_pool=mamba_pool,
+        side_tensors=_req_pool_side_tensors(req_to_token_pool),
+    )
 
 
 def has_linear_attention(model: nn.Module) -> bool:

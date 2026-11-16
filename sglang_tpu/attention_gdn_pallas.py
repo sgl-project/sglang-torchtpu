@@ -512,6 +512,9 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             and memo[0]() is req_pool_indices
             and memo[1] == req_pool_indices._version
             and memo[2] == table._version
+            # direct_compile can swap in a new table (a lifted request-pool
+            # tensor, see hybrid_linear_direct_compile), whose version restarts.
+            and memo[5]() is table
         ):
             return memo[3], memo[4]
         slots = self._translate_mamba_indices(pool.get_mamba_indices(req_pool_indices))
@@ -526,6 +529,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
                 table._version,
                 slots,
                 slots_i32,
+                weakref.ref(table),
             )
         return slots, slots_i32
 
