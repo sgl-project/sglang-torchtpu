@@ -833,6 +833,48 @@ if PHASE_SCOPES:
     )
 
 
+def _stage_singleton_row(
+    source, active_rows, destination, *, expert_input_size, block_select, row_select
+):
+    """Copy the one active row of ``source`` into ``destination`` [1, K]."""
+    batch_size = active_rows.shape[0]
+    if block_select and batch_size % 16 == 0:
+        active_index = jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
+        block = source[
+            pl.ds(pl.multiple_of(active_index // 16 * 16, 16), 16),
+            :expert_input_size,
+        ].astype(jnp.float32)
+        within = (
+            jax.lax.broadcasted_iota(jnp.int32, block.shape, 0) == active_index % 16
+        )
+        destination[...] = jnp.sum(
+            jnp.where(within, block, 0.0), axis=0, keepdims=True
+        ).astype(destination.dtype)
+        return
+    if row_select and batch_size == 8 and source.dtype == jnp.bfloat16:
+        # One select over the BF16 row tile instead of a branch per row. Only
+        # the active row keeps its bit pattern, so the integer sum over rows
+        # is that row's bits: every value stages exactly, with no float ops.
+        bits = jax.lax.bitcast_convert_type(
+            source[:batch_size, :expert_input_size], jnp.int16
+        ).astype(jnp.int32)
+        picked = jnp.sum(
+            jnp.where(active_rows[:, None], bits, 0), axis=0, keepdims=True
+        )
+        destination[...] = jax.lax.bitcast_convert_type(
+            picked.astype(jnp.int16), jnp.bfloat16
+        ).astype(destination.dtype)
+        return
+    active_index = jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
+    for row in range(batch_size):
+
+        @pl.when(active_index == row)
+        def copy_indexed_row(row=row):
+            destination[...] = source[row : row + 1, :expert_input_size].astype(
+                destination.dtype
+            )
+
+
 def _run_routed_expert_stream(
     source,
     selected_experts,
@@ -1083,27 +1125,14 @@ def _run_routed_expert_stream(
         second_single_source = second_compact_source_vmem
 
     def stage_singleton_source(active_rows, destination):
-        if singleton_block and batch_size % 16 == 0:
-            active_index = jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
-            block = source[
-                pl.ds(pl.multiple_of(active_index // 16 * 16, 16), 16),
-                :expert_input_size,
-            ].astype(jnp.float32)
-            within = (
-                jax.lax.broadcasted_iota(jnp.int32, block.shape, 0) == active_index % 16
-            )
-            destination[...] = jnp.sum(
-                jnp.where(within, block, 0.0), axis=0, keepdims=True
-            ).astype(destination.dtype)
-            return
-        active_index = jnp.sum(jnp.where(active_rows, jnp.arange(batch_size), 0))
-        for row in range(batch_size):
-
-            @pl.when(active_index == row)
-            def copy_indexed_row(row=row):
-                destination[...] = source[row : row + 1, :expert_input_size].astype(
-                    destination.dtype
-                )
+        _stage_singleton_row(
+            source,
+            active_rows,
+            destination,
+            expert_input_size=expert_input_size,
+            block_select=singleton_block,
+            row_select=B8_SINGLETON_SELECT,
+        )
 
     def row_bitmask_words(active_rows):
         """The active rows as scalar bit words (32 rows per word)."""
@@ -6724,9 +6753,11 @@ COMPACT_ROWS = 8
 # A routed expert used by one row (from B8) stages it via scalar compares and
 # updates only that output row. KernelConfig.singleton_block (batch a multiple
 # of 16) selects it from its aligned 16-row block instead of one branch per row;
-# it and stage_blocks default to on at B16-B128.
+# it and stage_blocks default to on at B16-B128. KernelConfig.b8_singleton_select
+# (off by default) selects it at B8 with one select over the 8-row tile.
 SINGLETON_BLOCK = _config().singleton_block
 STAGE_BLOCKS = _config().stage_blocks
+B8_SINGLETON_SELECT = _config().b8_singleton_select
 # MXFP4 tiles: single-expert contraction block (multiple of 1024: scale rows
 # stay 32-aligned), paired gate/up tile, and split MXU dot tile (multiple of
 # 128; 0 = unsplit); split tiles keep the scale-reduction order.

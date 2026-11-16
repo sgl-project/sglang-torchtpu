@@ -42,6 +42,9 @@ class KernelConfig:
     compact_only: bool = False
     singleton_block: bool | None = None  # None: at B16-B128
     stage_blocks: bool | None = None  # None: at B16-B128
+    # 8-row steps: stage a singleton route's active row with one select over
+    # the 8-row latent tile instead of a branch per row (the same bits).
+    b8_singleton_select: bool = False
     b16_compact_experts: bool = True
     shared_expert_finishers: bool = True
     compact_overflow: bool = True

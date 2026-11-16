@@ -1101,3 +1101,79 @@ class TestK31Draft(CustomTestCase):
             causal[0], alone[0], atol=1e-5
         )  # the first sees only itself
         self.assertFalse(np.allclose(causal[0], full[0], atol=1e-5))
+
+
+class TestSingletonRowStaging(CustomTestCase):
+    """A singleton route's row staging (``_stage_singleton_row``) in Pallas
+    interpret mode: at 8 rows, ``KernelConfig.b8_singleton_select`` (one select
+    over the row tile, no branch) stages the bits of the per-row copies for
+    every active row and every BF16 bit pattern (signed zeros, subnormals,
+    infinities, NaN payloads); other row counts keep the per-row copies."""
+
+    def test_select_matches_the_row_copies(self):
+        import jax
+        import jax.numpy as jnp
+        import ml_dtypes
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        width = 3584  # expert input columns of the [rows, 4096] latent tile
+        # -0, +0, -/+ smallest subnormal, -/+ largest finite, -/+ infinity,
+        # NaNs (quiet, signalling, payloads, negative), +/-1.
+        special = np.array(
+            [0x8000, 0x0000, 0x8001, 0x0001, 0xFF7F, 0x7F7F, 0xFF80, 0x7F80]
+            + [0x7FC0, 0x7F81, 0x7FC1, 0xFFC0, 0xFFFF, 0x7FFF, 0x3F80, 0xBF80],
+            np.uint16,
+        )
+
+        def staging(rows, row_select):
+            def kernel(routes_ref, source_ref, out_ref):
+                for case in range(rows):
+                    dmk._stage_singleton_row(
+                        source_ref,
+                        jnp.any(routes_ref[case] != 0, axis=1),
+                        out_ref.at[case],
+                        expert_input_size=width,
+                        block_select=False,
+                        row_select=row_select,
+                    )
+
+            return pl.pallas_call(
+                kernel,
+                out_shape=jax.ShapeDtypeStruct((rows, 1, width), jnp.bfloat16),
+                interpret=pltpu.InterpretParams(),
+            )
+
+        def inputs(rows):
+            bits = rng.integers(0, 1 << 16, (rows, 4096), dtype=np.uint16)
+            # Each row holds every special pattern; in each of those columns
+            # the other rows hold other ones.
+            for column in range(0, width, 448):
+                for row in range(rows):
+                    bits[row, column : column + 16] = np.roll(special, row)
+            # Case r: row r is the only row with a route to the expert.
+            routes = np.zeros((rows, rows, 16), np.int32)
+            for row in range(rows):
+                routes[row, row, rng.integers(0, 16)] = 1 + rng.integers(0, 128)
+            return bits, routes
+
+        def branches(call, *args):
+            return str(jax.make_jaxpr(call)(*args)).count("cond[")
+
+        rng = np.random.default_rng(0)
+        bits, routes = inputs(8)
+        source = bits.view(ml_dtypes.bfloat16)
+        copy, select = staging(8, False), staging(8, True)
+        self.assertEqual(branches(copy, routes, source), 8 * 8)
+        self.assertEqual(branches(select, routes, source), 0)
+        for call in (copy, select):
+            staged = np.asarray(call(routes, source)).view(np.uint16)
+            np.testing.assert_array_equal(staged[:, 0], bits[:, :width])
+        # Other row counts keep the per-row copies.
+        bits, routes = inputs(12)
+        source = bits.view(ml_dtypes.bfloat16)
+        self.assertEqual(branches(staging(12, True), routes, source), 12 * 12)
