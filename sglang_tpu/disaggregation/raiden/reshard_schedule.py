@@ -162,16 +162,16 @@ class ReshardGeometry:
     def heads_per_rank(self, tp: int) -> int:
         return max(1, self.total_kv_heads // tp)
 
-    def token_bytes(self, tp: int) -> int:
+    def _token_bytes(self, tp: int) -> int:
         """Per-token byte width of a rank's fused KV row at attention TP ``tp``:
         its ``2 * heads`` K/V slots rounded up to whole 32-bit packs."""
         packs = -(-2 * self.heads_per_rank(tp) // self.kv_packing)
         return packs * self.kv_packing * self.padded_head_dim * self.element_size
 
-    def check_token_bytes(self, tp: int, actual: int, what: str) -> None:
+    def check_token_bytes(self, *, tp: int, actual: int, what: str) -> None:
         """Fail loudly when a rank's real per-token width (``tensor.stride(1) *
         element_size``) is not what this geometry computes for it."""
-        expected = self.token_bytes(tp)
+        expected = self._token_bytes(tp)
         if int(actual) != expected:
             raise ValueError(
                 f"Raiden reshard geometry expects a {expected} B per-token KV row "
@@ -200,9 +200,9 @@ class ReshardGeometry:
         return (
             sh_start * self.hp_bytes,  # src_offset
             packed_heads * self.hp_bytes,  # size
-            self.token_bytes(self.src_tp),  # src_stride (src per-token width)
+            self._token_bytes(self.src_tp),  # src_stride (src per-token width)
             dh_start * self.hp_bytes,  # dst_offset
-            self.token_bytes(self.dst_tp),  # dst_stride (dst per-token width)
+            self._token_bytes(self.dst_tp),  # dst_stride (dst per-token width)
         )
 
     def check_decode_rank(self, decode_rank: int) -> None:

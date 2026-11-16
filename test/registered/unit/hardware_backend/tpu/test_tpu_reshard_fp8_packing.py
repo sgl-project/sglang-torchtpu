@@ -106,6 +106,8 @@ def _manager(tensor, local_tp):
     mgr = object.__new__(RaidenKVManager)
     mgr.attn_tp_rank = 0
     mgr.attn_tp_size = local_tp
+    mgr.is_mla_backend = False
+    mgr.is_hybrid_mla_backend = False
     mgr._kv_caches = [tensor]
     mgr._swa_kv_caches = []
     mgr.kv_args = SimpleNamespace(total_kv_head_num=TOTAL_KV_HEADS, page_size=PAGE_SIZE)
@@ -345,7 +347,7 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
     def test_geometry_requires_layout(self):
         """kv_packing / element_size have no bf16 defaults any more."""
         with self.assertRaises(TypeError):
-            rs.ReshardGeometry(8, 4, 512, 8)
+            rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8)
 
     def test_token_width_checked_against_strides(self):
         """A geometry whose computed per-token width disagrees with the local
@@ -353,11 +355,25 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
         pack (512 B) taken as one head."""
         decode_t = _fused_layer(torch.float8_e4m3fn, 2)
         row = decode_t.stride(1) * decode_t.element_size()
-        geometry = rs.ReshardGeometry(8, 4, 256, 8, kv_packing=4, element_size=1)
-        geometry.check_token_bytes(4, row, "decode")
-        wrong = rs.ReshardGeometry(8, 4, 512, 8, kv_packing=4, element_size=1)
+        geometry = rs.ReshardGeometry(
+            src_tp=8,
+            dst_tp=4,
+            hp_bytes=256,
+            total_kv_heads=8,
+            kv_packing=4,
+            element_size=1,
+        )
+        geometry.check_token_bytes(tp=4, actual=row, what="decode")
+        wrong = rs.ReshardGeometry(
+            src_tp=8,
+            dst_tp=4,
+            hp_bytes=512,
+            total_kv_heads=8,
+            kv_packing=4,
+            element_size=1,
+        )
         with self.assertRaisesRegex(ValueError, "per-token KV row"):
-            wrong.check_token_bytes(4, row, "decode")
+            wrong.check_token_bytes(tp=4, actual=row, what="decode")
 
     def test_bf16_entries_unchanged(self):
         """bf16 8->4 entries are byte-identical to the old geometry's."""

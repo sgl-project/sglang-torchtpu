@@ -18,7 +18,11 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVReceiver,
+    KVTransferError,
+    PrefillServerInfo,
+)
 from sglang.srt.environ import envs
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
@@ -1473,6 +1477,7 @@ class RaidenKVReceiver(CommonKVReceiver):
         bootstrap_room: Optional[int] = None,
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        self.prefill_info: Optional[PrefillServerInfo] = None
         self._started = False
         # Bounds the wait before send_metadata, see _check_handshake_timeout.
         self._handshake_start = time.time()
@@ -1490,8 +1495,9 @@ class RaidenKVReceiver(CommonKVReceiver):
         # A decode sharded finer than its prefill pulls ONE prefill rank's
         # whole pages (there is no head-slicing pull), which only holds this
         # rank's heads when the kv-heads are replicated.
-        prefill_info = getattr(self, "prefill_info", None)
-        prefill_tp = int(getattr(prefill_info, "attn_tp_size", 0) or 0)
+        prefill_tp = (
+            self.prefill_info.attn_tp_size if self.prefill_info is not None else 0
+        )
         reason = self.kv_mgr.finer_decode_refusal(prefill_tp)
         if reason is not None:
             logger.error(
