@@ -31,6 +31,10 @@ from sglang_tpu.k3_programs.kimi_k3.kernels.decode_megakernel import (
     MLA_LAYERS,
     decode_local,
 )
+from sglang_tpu.k3_programs.kimi_k3.layout import (
+    INDEX_SUBPAGE_ROWS,
+    INDEX_SUBPAGE_TOKENS,
+)
 
 
 def latent_rows_from_handoff(new_keys):
@@ -197,6 +201,301 @@ def commit_latent_rows(
             rows[:, layer].astype(pool.dtype), mode="drop"
         )
     return tuple(pools)
+
+
+# The fused DSA commit's runs (a verify's consecutive tokens) and the runs of
+# distinct blocks it keeps in flight together.
+_RUN_ROWS = 8
+_RUN_SLOTS = 8
+
+
+def _dsa_commit_fusable(pools, index_pools, rows, records, block_tables, pool_map):
+    """Whether :func:`_commit_dsa_rows_fused` takes these operands."""
+    packing = pools[0].shape[-2]
+    page_tokens = pools[0].shape[-3] * packing
+    index_shape = (page_tokens // INDEX_SUBPAGE_TOKENS * INDEX_SUBPAGE_ROWS, 4, 128)
+    return (
+        _config().dsa_fused_commit
+        and mla_dcp.GROUP == 32
+        and rows.shape[1:] == (len(pool_map), 640)
+        and records.shape == (rows.shape[0], len(pool_map), 2, 128)
+        and records.dtype == jnp.int32
+        and block_tables.ndim == 2
+        and block_tables.shape[0] >= rows.shape[0]
+        and len(index_pools) == len(pool_map)
+        and len(set(pool_map)) == len(pool_map)
+        and all(0 <= index < len(pools) for index in pool_map)
+        and page_tokens % INDEX_SUBPAGE_TOKENS == 0
+        and all(
+            pool.shape == pools[0].shape and pool.dtype == pools[0].dtype
+            for pool in pools
+        )
+        and pools[0].shape[0] > 0
+        and pools[0].shape[1:] == (128, packing, 640)
+        and all(
+            pool.shape == (index_pools[0].shape[0], *index_shape)
+            and pool.dtype == jnp.uint8
+            for pool in index_pools
+        )
+        and index_pools[0].shape[0] > 0
+    )
+
+
+def _commit_dsa_rows_fused(
+    pools,
+    index_pools,
+    rows,
+    records,
+    block_tables,
+    positions,
+    pool_map,
+    *,
+    owner_table=None,
+):
+    """Commit a Kimi-K3.1 step's latent rows (``commit_latent_rows``) and
+    index-key records (``dsa_dcp.commit_index_rows``, raw ``[batch, 24, 2,
+    128]`` int32) in one non-communicating kernel aliasing every pool.
+
+    Owned rows form runs: consecutive rows at consecutive positions in one
+    block and one 128-token index sub-page, at most ``_RUN_ROWS``. Per MLA
+    layer a run reads one window of latent rows, one of key rows (never the
+    scale row) and the scale row, merges its rows in VMEM and writes the
+    windows back. Up to ``_RUN_SLOTS`` runs with distinct blocks are in
+    flight together; a run whose block is in flight starts the next wave
+    after the writes land, so rows sharing a tile (repeated null-block
+    targets) land in row order."""
+    batch, layers = rows.shape[:2]
+    packing, dtype = pools[0].shape[-2], pools[0].dtype
+    block_rows = pools[0].shape[-3]
+    page_tokens = block_rows * packing
+    entries = block_tables.shape[-1]
+    run = min(batch, _RUN_ROWS)
+    slots = min(batch, _RUN_SLOTS)
+    lat_window = (run + packing - 2) // packing + 1
+    key_window = (run + 2) // 4 + 1
+    lat_blocks, idx_blocks = pools[0].shape[0], index_pools[0].shape[0]
+    sub_tokens, sub_rows = INDEX_SUBPAGE_TOKENS, INDEX_SUBPAGE_ROWS
+    lat_count, count = len(pools), len(pools) + len(index_pools)
+    group = mla_dcp.GROUP
+    global_pages = mla_dcp.GLOBAL_PAGES
+
+    def div(x, d):  # floor division and modulo (a shift / mask for 2^k)
+        return x >> (d.bit_length() - 1) if d & (d - 1) == 0 else x // d
+
+    def mod(x, d):
+        return x & (d - 1) if d & (d - 1) == 0 else x % d
+
+    def kernel(position_ref, table_ref, rows_hbm, records_hbm, *refs):
+        lat_out = refs[count : count + lat_count]
+        idx_out = refs[count + lat_count : 2 * count]
+        (lat_buf, key_buf, scale_buf, row_buf, record_buf) = refs[2 * count : -3]
+        # slot: the wave's runs (first row, rows, targets); wave: (runs, loaded)
+        slot, wave, sems = refs[-3:]
+        member = mla_dcp.owner_index(owner_table) % group
+        row_copy = tpu.make_async_copy(rows_hbm, row_buf, sems.at[3])
+        record_copy = tpu.make_async_copy(records_hbm, record_buf, sems.at[4])
+
+        def place(b):  # (position, block, owned) of row b, as the XLA commits
+            position = position_ref[b]
+            page = div(position, page_tokens)
+            entry = page if global_pages else div(page, group)
+            entry = jnp.where(entry < 0, entry + entries, entry)
+            entry = jnp.minimum(jnp.maximum(entry, 0), entries - 1)
+            return position, table_ref[b * entries + entry], mod(page, group) == member
+
+        def targets(block):  # the normalized latent / index block, else -1
+            def target(size):
+                normal = jnp.where(block < 0, block + size, block)
+                return jnp.where((normal >= 0) & (normal < size), normal, -1)
+
+            return target(lat_blocks), target(idx_blocks)
+
+        def windows(w):
+            first, lat, idx = slot[0, w], slot[2, w], slot[3, w]
+            offset = mod(position_ref[first], page_tokens)
+            sub = div(offset, sub_tokens) * sub_rows
+            lat_row = jnp.minimum(div(offset, packing), block_rows - lat_window)
+            key_row = sub + jnp.minimum(
+                div(mod(offset, sub_tokens), 4), sub_rows - 1 - key_window
+            )
+            return first, offset, sub, lat_row, key_row, lat, idx
+
+        def transfer(w, write):
+            _, _, sub, lat_row, key_row, lat, idx = windows(w)
+
+            def copy(hbm, vmem, sem):
+                return tpu.make_async_copy(
+                    *((vmem, hbm) if write else (hbm, vmem)), sems.at[sem]
+                )
+
+            @pl.when(lat >= 0)
+            def _():
+                for layer, index in enumerate(pool_map):
+                    copy(
+                        lat_out[index].at[lat, pl.ds(lat_row, lat_window)],
+                        lat_buf.at[w, layer],
+                        0,
+                    ).start()
+
+            @pl.when(idx >= 0)
+            def _():
+                for layer in range(layers):
+                    copy(
+                        idx_out[layer].at[idx, pl.ds(key_row, key_window)],
+                        key_buf.at[w, layer],
+                        1,
+                    ).start()
+                    copy(
+                        idx_out[layer].at[idx, sub + sub_rows - 1],
+                        scale_buf.at[w, layer],
+                        2,
+                    ).start()
+
+        def settle(w):  # a slot's copies, one wait per kind
+            _, _, _, _, _, lat, idx = windows(w)
+
+            @pl.when(lat >= 0)
+            def _():
+                tpu.make_async_copy(lat_buf.at[w], lat_buf.at[w], sems.at[0]).wait()
+
+            @pl.when(idx >= 0)
+            def _():
+                tpu.make_async_copy(key_buf.at[w], key_buf.at[w], sems.at[1]).wait()
+                tpu.make_async_copy(
+                    scale_buf.at[w], scale_buf.at[w], sems.at[2]
+                ).wait()
+
+        def merge(w):
+            first, offset, sub, lat_row, key_row, _, _ = windows(w)
+
+            @pl.loop(0, slot[1, w])
+            def _(i):
+                row, token = first + i, offset + i
+                pair = div(token, packing) - lat_row
+                lane = mod(token, sub_tokens)
+                key = sub + div(lane, 4) - key_row
+                half = jax.lax.broadcasted_iota(jnp.int32, (packing, 640), 0)
+                sublane = jax.lax.broadcasted_iota(jnp.int32, (4, 128), 0)
+                lanes = jax.lax.broadcasted_iota(jnp.int32, (4, 128), 1)
+                for layer in range(layers):
+                    lat_buf[w, layer, pair] = jnp.where(
+                        half == mod(token, packing),
+                        row_buf[row, layer][None, :],
+                        lat_buf[w, layer, pair],
+                    )
+                    key_buf[w, layer, key] = jnp.where(
+                        sublane == mod(token, 4),
+                        record_buf[row, layer, 0:1] & 0xFF,
+                        key_buf[w, layer, key].astype(jnp.int32),
+                    ).astype(jnp.uint8)
+                    scale_buf[w, layer] = jnp.where(
+                        (sublane == 0) & (lanes == lane),
+                        tpu.roll(record_buf[row, layer, 1:2] & 0xFF, lane, 1),
+                        scale_buf[w, layer].astype(jnp.int32),
+                    ).astype(jnp.uint8)
+
+        def commit_wave(waiting, loaded):
+            @pl.when(loaded == 0)
+            def _():
+                row_copy.start()
+                record_copy.start()
+
+            pl.loop(0, waiting)(lambda w: transfer(w, False))
+
+            @pl.when(loaded == 0)
+            def _():
+                row_copy.wait()
+                record_copy.wait()
+
+            pl.loop(0, waiting)(settle)
+            pl.loop(0, waiting)(merge)
+            pl.loop(0, waiting)(lambda w: transfer(w, True))
+            pl.loop(0, waiting)(settle)
+
+        def plan(b, carry):
+            # Rows extend the open run or close it; a closed run joins the
+            # wave unless its block is in flight or the wave is full (then
+            # the wave commits first). Rows batch, batch + 1 flush.
+            first, size, block, last = carry
+            position, row_block, owned = place(jnp.minimum(b, batch - 1))
+            owned = owned & (b < batch)
+            joins = (
+                (size > 0)
+                & owned
+                & (row_block == block)
+                & (position == last + 1)
+                & (mod(position, sub_tokens) != 0)
+                & (size < run)
+            )
+            closes = (size > 0) & ~joins
+            final = b == batch + 1
+
+            @pl.when(closes | final)
+            def _():
+                lat, idx = targets(block)
+                busy = final | (wave[0] == slots)
+                for w in range(slots):
+                    busy = busy | (
+                        (w < wave[0]) & ((slot[2, w] == lat) | (slot[3, w] == idx))
+                    )
+
+                @pl.when(busy & (wave[0] > 0))
+                def _():
+                    commit_wave(wave[0], wave[1])
+                    wave[0] = 0
+                    wave[1] = 1
+
+                @pl.when(closes)
+                def _():
+                    slot[0, wave[0]] = first
+                    slot[1, wave[0]] = size
+                    slot[2, wave[0]] = lat
+                    slot[3, wave[0]] = idx
+                    wave[0] = wave[0] + 1
+
+            first = jnp.where(joins, first, b)
+            size = jnp.where(joins, size + 1, owned.astype(jnp.int32))
+            block = jnp.where(joins, block, row_block)
+            return first, size, block, position
+
+        wave[0] = 0
+        wave[1] = 0
+        zero = jnp.int32(0)
+        jax.lax.fori_loop(0, batch + 2, plan, (zero,) * 4)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=tuple(
+            jax.ShapeDtypeStruct(p.shape, p.dtype) for p in (*pools, *index_pools)
+        ),
+        grid_spec=tpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=(pl.BlockSpec(memory_space=pl.ANY),) * (2 + count),
+            out_specs=(pl.BlockSpec(memory_space=pl.ANY),) * count,
+            scratch_shapes=(
+                tpu.VMEM((slots, layers, lat_window, packing, 640), dtype),
+                tpu.VMEM((slots, layers, key_window, 4, 128), jnp.uint8),
+                tpu.VMEM((slots, layers, 4, 128), jnp.uint8),
+                tpu.VMEM(rows.shape, dtype),
+                tpu.VMEM(records.shape, jnp.int32),
+                tpu.SMEM((4, slots), jnp.int32),
+                tpu.SMEM((2,), jnp.int32),
+                tpu.SemaphoreType.DMA((5,)),
+            ),
+        ),
+        input_output_aliases={4 + i: i for i in range(count)},
+        compiler_params=tpu.CompilerParams(
+            disable_bounds_checks=not _config().bounds_checks
+        ),
+        name="kimi_commit_dsa_pools",
+    )(
+        positions[:batch],
+        block_tables.reshape(-1),
+        rows.astype(dtype),
+        records,
+        *pools,
+        *index_pools,
+    )
 
 
 def _commit_kda_states(
@@ -410,14 +709,33 @@ def decode_paged(
             block_tables[group_rows],
             positions[group_rows],
         )
-    pool = commit_latent_rows(
-        pools,
-        latents,
-        block_tables,
-        positions,
-        dcp_pool_map,
-        owner_table=dcp_owner_table,
-    )
+    if (
+        index_pools is not None
+        and group_rows is None
+        and _dsa_commit_fusable(
+            pools, index_pools, latents, records[0], block_tables, dcp_pool_map
+        )
+    ):
+        pool = _commit_dsa_rows_fused(
+            pools,
+            index_pools,
+            latents,
+            records[0],
+            block_tables,
+            positions,
+            dcp_pool_map,
+            owner_table=dcp_owner_table,
+        )
+        index_pools = None  # committed with the latents
+    else:
+        pool = commit_latent_rows(
+            pools,
+            latents,
+            block_tables,
+            positions,
+            dcp_pool_map,
+            owner_table=dcp_owner_table,
+        )
     if index_pools is not None:
         from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
 
