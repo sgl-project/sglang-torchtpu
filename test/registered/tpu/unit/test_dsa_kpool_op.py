@@ -61,12 +61,14 @@ class TestKpoolServingOp(unittest.TestCase):
                     torch.tensor(
                         [0, 0, 2] if step == 0 else [2, 2, 2], dtype=torch.int32
                     ).to("tpu"),
+                    torch.zeros(2, dtype=torch.int32, device="tpu"),  # no raw ring
                     1.0,
                     64,
                     4,
                     128,
                     decode_width,
                     bound,
+                    0,
                 )
                 torch.accelerator.synchronize()
                 raw_cpu, pooled_cpu = raw.cpu(), pooled.cpu()

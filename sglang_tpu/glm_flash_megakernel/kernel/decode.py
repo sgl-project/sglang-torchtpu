@@ -53,6 +53,10 @@ def moe_ord(L):
     return L - 3
 
 
+# meta is [live requests, 7 reserved words, then one raw-ring base page per request].
+META_RAW_BASE = 8
+
+
 @dataclasses.dataclass(frozen=True)
 class KernelConfig:
     max_len: int
@@ -87,6 +91,10 @@ class KernelConfig:
     km_issue: int = 2
     embed_2d: bool = False
     init_streams: bool = False
+    # Pages per request slot of the pooled indexer's raw ring (kv_pool.kpool_raw_ring_pages);
+    # 0: raw rows share the page table. With a ring, meta[META_RAW_BASE + b] is request
+    # b's first ring page.
+    raw_ring_pages: int = 0
     # K-major weight tile width; the packed weights are shared by every bucket, so
     # a server sets it once (None: 512 for a one-row kernel, else 256).
     km_tile: int | None = None
@@ -1180,6 +1188,13 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             def page(b, pg):
                 return PL.page_of(tab_ref, b, pg, PPS)
 
+            RRP = cfg.raw_ring_pages
+
+            def raw_page(b, pg):
+                if not RRP:
+                    return page(b, pg)
+                return meta_ref[META_RAW_BASE + b] + pg % RRP
+
             def fresh_pool_keys(b, r0, p, last):
                 """Rotated keys of the pools this step closes, from the raw rows before `p`
                 (two 16-row page reads) and the step's own rows."""
@@ -1187,7 +1202,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 w0 = ((jnp.maximum(p - kp + 1, 0)) // 16) * 16
                 for j in range(2):
                     row0 = w0 + 16 * j
-                    pg, off = page(b, row0 // ps), pl.multiple_of(row0 % ps, 16)
+                    pg, off = raw_page(b, row0 // ps), pl.multiple_of(row0 % ps, 16)
                     PL.dispatch(
                         d_i,
                         n_dsa,

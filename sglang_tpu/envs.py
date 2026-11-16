@@ -207,6 +207,9 @@ class TpuEnvs:
     # Experimental: the kpool indexer's StreamIndex page table stays in HBM with
     # one row per sequence in SMEM, so a context past ~262k fits the 1 MiB SMEM.
     SGLANG_TPU_GLM_FLASH_PAGE_TABLE_HBM = EnvBool(False)
+    # Pooled DSA indexer: keep each request's raw key|gate rows in a ring of pages per
+    # request slot instead of one row per pool token; only the open pool is read back.
+    SGLANG_TPU_DSA_KPOOL_RAW_RING = EnvBool(False)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)

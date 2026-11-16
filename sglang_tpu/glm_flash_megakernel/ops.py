@@ -42,12 +42,19 @@ def _step_inputs_op(
     pages_per_seq: int,
     window_start: int,
     checkpoint_width: int,
+    raw_ring_pages: int,
+    meta_head: int,
 ):
     """The kernel's int32 SMEM inputs for one call's n requests (inputs already
     sliced to those rows), padded to `bucket` requests: one program instead of
     ~15 eager launches per call. Shapes depend on n only."""
     n = req_rows.shape[0]
     rows = bucket * q
+    # meta: n, reserved words up to meta_head, then each request's first raw-ring page.
+    head = torch.zeros(meta_head, dtype=torch.int32, device=req_rows.device)
+    head[0] = n
+    raw_base = _pad((req_rows * raw_ring_pages).to(torch.int32), bucket)
+    meta = torch.cat([head, raw_base])
     tok = _pad(input_ids.to(torch.int32), rows)
     pos = _pad(positions.to(torch.int32).reshape(n, q)[:, 0], bucket)
     tab = _pad(page_indices.to(torch.int32), bucket * pages_per_seq)
@@ -69,6 +76,7 @@ def _step_inputs_op(
     return (
         tok,
         pos,
+        meta,
         tab,
         _pad(srow.to(torch.int32), bucket),
         _pad(ckrow.to(torch.int32), rows),
@@ -148,6 +156,8 @@ class GlmFlashMegakernel:
         full = backend.full_attn_backend
         self._full, self._lin = full, backend.linear_attn_backend
         self._pool = full.token_to_kv_pool
+        self.raw_ring_pages = full.raw_ring_pages
+        self._meta_head = D.META_RAW_BASE
         self._req_pool = self._lin.req_to_token_pool
         self._mamba = self._req_pool.mamba_pool
         page_size = self._pool.page_size
@@ -202,6 +212,7 @@ class GlmFlashMegakernel:
                 unroll_periods=big,
                 single_slab=big or mid,
                 context_parallel=True,  # DSA phase split by score rows across the tp chips
+                raw_ring_pages=self.raw_ring_pages,
             )
 
         self.cfgs = {b: cfg_for(b) for b in _buckets(self.call_req)}
@@ -307,10 +318,6 @@ class GlmFlashMegakernel:
                 dtype=torch.bfloat16,
                 device=device,
             )
-        self._meta = {
-            b: torch.tensor([b] + [0] * 7, dtype=torch.int32, device=device)
-            for b in range(1, self.call_req + 1)
-        }
         # Set when the radix cache is on: only then does serving snapshot KDA state.
         self.radix_snapshots = False
         self._warmup_step_inputs(device)
@@ -353,6 +360,8 @@ class GlmFlashMegakernel:
             read_offsets=mamba.checkpoint_read_offsets,
             window_start=mamba.window_start or 0,
             checkpoint_width=mamba.checkpoint_width,
+            raw_ring_pages=self.raw_ring_pages,
+            meta_head=self._meta_head,
         )
 
     def _warmup_step_inputs(self, device) -> None:
@@ -393,7 +402,7 @@ class GlmFlashMegakernel:
                 zeros = lambda *shape, dtype=torch.int64: torch.zeros(
                     shape, dtype=dtype, device=device
                 )
-                tok, pos, tab, srow, ckrow = _step_inputs_op(
+                tok, pos, meta, tab, srow, ckrow = _step_inputs_op(
                     zeros(b * Q),
                     zeros(b * Q),
                     zeros(b * pps, dtype=torch.int32),
@@ -406,7 +415,7 @@ class GlmFlashMegakernel:
                 inputs = (
                     tok,
                     pos,
-                    self._meta[b],
+                    meta,
                     tab,
                     srow,
                     ckrow,
@@ -434,7 +443,7 @@ class GlmFlashMegakernel:
         # Views at offset 0 for the first call; later calls of a split batch clone.
         tab = self._full.forward_metadata.page_indices[b0 * pps : (b0 + n) * pps]
         with torch.no_grad():
-            tok, pos, tab, srow, ckrow = _step_inputs_op(
+            tok, pos, meta, tab, srow, ckrow = _step_inputs_op(
                 input_ids[r0:r1],
                 positions[r0:r1],
                 tab,
@@ -448,7 +457,7 @@ class GlmFlashMegakernel:
         return (
             tok,
             pos,
-            self._meta[n],
+            meta,
             tab,
             srow,
             ckrow,
