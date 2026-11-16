@@ -15,15 +15,21 @@ native host copy, and checks that every decode rank's (token, head, K/V,
 head-dim) element holds the right prefill value.
 """
 
+import collections
+import threading
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden import reshard_schedule as rs
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
+from sglang_tpu.disaggregation.raiden.receiver import RaidenKVReceiver
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -375,11 +381,6 @@ class TestTpuFinerDecodeRefusal(unittest.TestCase):
         self.assertIsNone(mgr.finer_decode_refusal(4))
 
     def test_receiver_fails_before_registering(self):
-        from unittest import mock
-
-        from sglang.srt.disaggregation.base.conn import KVPoll
-        from sglang_tpu.disaggregation.raiden.receiver import RaidenKVReceiver
-
         mgr = _manager(_fused_layer(torch.float8_e4m3fn, 1), 8)
         mgr.is_mla_backend = False
         mgr.record_failure = mock.Mock()
@@ -401,6 +402,67 @@ class TestTpuFinerDecodeRefusal(unittest.TestCase):
         # The prefill is told right away instead of waiting for its timeout.
         receiver._send_abort_notification.assert_called_once_with()
         self.assertTrue(receiver.abort_notified)
+
+    def test_pipeline_transfer_allows_finer_decode_tp(self):
+        """Pipeline transfers slice KV heads per decode rank on the PP producer,
+        so finer decode attention TP must register instead of failing the room."""
+        mgr = _manager(
+            tensor=_fused_layer(dtype=torch.float8_e4m3fn, heads=2), local_tp=8
+        )
+        mgr.kv_args = SimpleNamespace(
+            total_kv_head_num=16,
+            page_size=256,
+            engine_rank=0,
+            state_types=[],
+        )
+        mgr.is_mla_backend = False
+        mgr.is_hybrid_mla_backend = False
+        mgr.local_ip = "10.0.0.2"
+        mgr.rank_port = 31000
+        mgr._timeout_s = 120
+        mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr.request_status = {}
+        mgr._failed = set()
+        mgr._native_failed = set()
+        mgr._aborted = {}
+        mgr.addr_to_rooms_tracker = collections.defaultdict(set)
+        mgr.defer_decode_allocation = False
+        mgr._deferred_ack_targets = {}
+        mgr._deferred_ack_poisoned_rooms = set()
+        mgr._staging_outstanding = {}
+        sent = []
+        pipe = PipelineTransfer.__new__(PipelineTransfer)
+        pipe.manager = mgr
+        pipe.producer = False
+        pipe.lock = threading.RLock()
+        pipe.receives = {}
+        pipe._send = lambda peer, frames: sent.append((peer, frames))
+        mgr._pipeline_enabled = True
+        mgr._pipeline = pipe
+
+        receiver = RaidenKVReceiver(
+            mgr=mgr, bootstrap_addr="10.0.0.1:8998", bootstrap_room=77
+        )
+        receiver.prefill_info = SimpleNamespace(attn_tp_size=1, pp_size=2)
+        receiver.bootstrap_infos = [
+            {"pp_rank": 0, "rank_ip": "10.0.0.1", "rank_port": 30001},
+            {"pp_rank": 1, "rank_ip": "10.0.0.1", "rank_port": 30002},
+        ]
+        receiver._send_abort_notification = mock.Mock()
+
+        receiver.send_metadata(
+            kv_indices=np.array([10, 11], dtype=np.int32), state_indices=[]
+        )
+
+        self.assertEqual(mgr.failure_records, {})
+        self.assertIsNone(receiver.conclude_state)
+        self.assertEqual(mgr.request_status[77], KVPoll.WaitingForInput)
+        self.assertIn(77, pipe.receives)
+        self.assertEqual(len(sent), 2)
+        receiver._send_abort_notification.assert_not_called()
 
 
 if __name__ == "__main__":

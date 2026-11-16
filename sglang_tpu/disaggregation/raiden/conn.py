@@ -483,6 +483,8 @@ class RaidenKVManager(
         attn_tp = int(self.attn_tp_size)
         if not prefill_attn_tp or prefill_attn_tp >= attn_tp:
             return None
+        if self._pipeline is not None:
+            return None
         if getattr(self, "is_mla_backend", False) or getattr(
             self, "is_hybrid_mla_backend", False
         ):
