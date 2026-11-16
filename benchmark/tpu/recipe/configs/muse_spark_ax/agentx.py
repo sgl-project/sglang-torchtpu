@@ -19,12 +19,18 @@ SERVED_MODEL = "meta-models/Muse-Spark-Open-816B-A42B-NVFP4"
 
 # conc: (running requests, decode steps between prefill batches, compile batch sizes)
 PROFILES = {
+    1: (2, 128, [1, 2]),
     8: (8, 64, [1, 2, 4, 8]),
     16: (16, 64, [1, 2, 4, 8, 12, 16]),
     # the best single-host TP line peaks here (junyanxu q4mk sweeps)
     22: (22, 48, [1, 2, 4, 8, 12, 16, 22]),
     24: (24, 48, [1, 2, 4, 8, 12, 16, 24]),
+    24: (24, 48, [1, 2, 4, 8, 12, 16, 24]),
     32: (32, 40, [1, 2, 4, 8, 12, 16, 24, 32]),
+    # VR200 nov03 single-host points; past 64 running requests the KV pool, not the step,
+    # bounds the batch, so conc 96 caps admission at 64 (512-row verify steps)
+    48: (48, 32, [1, 2, 4, 8, 16, 24, 32, 48]),
+    96: (64, 32, [1, 2, 4, 8, 16, 32, 48, 64]),
 }
 
 EP_ENV = {
