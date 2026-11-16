@@ -39,7 +39,9 @@ class GlmSelectedEPMoE(DeepseekV2MoE):
         weights, ids, _ = selected
         # The baseline TPU model applies routed_scaling_factor after its MoE;
         # apply it only to routed coefficients, leaving the shared expert alone.
-        weights = weights.to(hidden_states.dtype).float() * self.routed_scaling_factor
+        weights = weights.to(hidden_states.dtype).float()
+        if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            weights = weights * self.routed_scaling_factor
         has_shared = self._glm_v2_shared and not skip_shared_experts
         op = self._glm_v2_op if has_shared else self._glm_v2_routed_op
         output = op(

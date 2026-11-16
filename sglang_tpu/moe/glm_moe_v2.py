@@ -32,6 +32,11 @@ def unsupported_reason(moe, parallel, exec_config):
         return "the GLM candidate currently uses unclamped SiLU"
     if layer.moe_runner_config.activation != "silu":
         return "requires SiLU activation"
+    if (
+        layer.moe_runner_config.apply_router_weight_on_input
+        or layer.moe_runner_config.no_combine
+    ):
+        return "requires output-weighted combined rows"
     return None
 
 
@@ -105,7 +110,7 @@ def prepare_model(model):
     if "GlmMoeDsaForCausalLM" not in model.config.architectures:
         logger.info("GLM fused EP MoE v2: skipping %s", type(model).__name__)
         return
-    from sglang_tpu.models.glm_moe_v2 import GlmSelectedEPMoE
+    from sglang_tpu.moe.glm_moe_v2_runtime import GlmSelectedEPMoE
 
     parallel = get_parallel()
     for name, moe in model.named_modules():
