@@ -98,11 +98,11 @@ from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
 logger = logging.getLogger(__name__)
 
 
-def _select_tpu_ep_sharded_loader(result, load_config, model_config=None):
+def _select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
     # The model-loader module is heavy; keep it out of plugin startup.
-    from sglang_tpu.ep_weight_shard import select_tpu_ep_sharded_loader
+    from sglang_tpu.ep_weight_shard import select_tpu_ep_local_runai_loader
 
-    return select_tpu_ep_sharded_loader(result, load_config, model_config)
+    return select_tpu_ep_local_runai_loader(result, load_config, model_config)
 
 
 # (target, hook, hook_type) triples.
@@ -356,7 +356,7 @@ HOOKS: list[tuple] = [
     ),
     (
         "sglang.srt.model_loader.loader.get_model_loader",
-        _select_tpu_ep_sharded_loader,
+        _select_tpu_ep_local_runai_loader,
         HookType.AFTER,
     ),
 ]

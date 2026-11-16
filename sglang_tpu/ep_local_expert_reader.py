@@ -47,6 +47,16 @@ _SAFETENSORS_DTYPES = {
 }
 
 
+def local_expert_id(name: str, expert_range: tuple[int, int]) -> int | None:
+    """Routed-expert id of a checkpoint tensor in ``expert_range``; -1 for an
+    expert outside it, None for a tensor that is not a routed expert."""
+    m = _EXPERT_ID_KEY_RE.match(name)
+    if m is None:
+        return None
+    eid = int(m.group(2))
+    return eid if expert_range[0] <= eid < expert_range[1] else -1
+
+
 def _log_whole_shards(reason: str) -> None:
     # An opted-in model reading whole shards can need far more host memory.
     log_info_on_rank0(
@@ -154,11 +164,7 @@ class EpLocalExpertReader:
         return cls(hf_weights_files, expert_range)
 
     def _local_expert_id(self, name: str) -> int | None:
-        m = _EXPERT_ID_KEY_RE.match(name)
-        if m is None:
-            return None
-        eid = int(m.group(2))
-        return eid if self.expert_range[0] <= eid < self.expert_range[1] else -1
+        return local_expert_id(name, self.expert_range)
 
     def handles(self, st_file: str) -> bool:
         return os.path.basename(st_file) in self.indexed_files

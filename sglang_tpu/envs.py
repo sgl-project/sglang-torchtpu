@@ -34,10 +34,6 @@ class TpuEnvs:
     SGLANG_TPU_BENCHMARK_TIMEOUT_SEC = EnvFloat(600.0)
     SGLANG_TPU_RELEASE_CHECKPOINT_PAGE_CACHE = EnvBool(True)
     SGLANG_TPU_RELEASE_COMPILE_ARTIFACTS = EnvBool(True)
-    # Fetch only this rank's routed-expert tensors with Run:AI when expert
-    # parallelism shards the checkpoint (ep_weight_shard.py). Set 0 to force
-    # the stock full-checkpoint stream.
-    SGLANG_TPU_EP_SHARDED_WEIGHT_LOAD = EnvBool(True)
     # Host heap (see host_heap_trim.py)
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
@@ -487,7 +483,7 @@ class TpuEnvs:
     # one-hot permute feeding the SparseCore combine gave wrong tokens.
     SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE = EnvBool(False)
     # Turn off EP-local expert reads (models that opt in read only their EP
-    # rank's routed experts with --weight-loader-disable-mmap).
+    # rank's routed experts with --weight-loader-disable-mmap or Run:AI).
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)

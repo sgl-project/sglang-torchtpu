@@ -1,231 +1,100 @@
 # SPDX-License-Identifier: Apache-2.0
 """Stream only this rank's routed-expert tensors with Run:AI.
 
-With expert parallelism every rank keeps ``num_experts / ep_size`` of the
-routed experts, but ``RunaiModelStreamerLoader`` fetches every expert tensor
-on every rank. This loader builds the fetch plan from the safetensors shard
-headers and hands Run:AI only the kept tensor names, so the skipped byte
-ranges are never requested from storage. Headers also name tensors a stale
-index omits, and they are read through Run:AI, so object-storage checkpoints
-take the same path.
-
-The filter is conservative: a tensor is skipped only when its name carries a
-numeric ``experts.<id>`` segment, ends in a per-expert weight or scale suffix,
-and the id is outside this rank's contiguous range. Every other tensor,
-including ``mtp`` layers, fused expert tensors without an id, and per-expert
-biases or input scales, is kept. Every expert layer must name the config's
-full expert set with uniform suffixes, otherwise the loader falls back to the
-stock full-checkpoint stream. Enabled by default for Run:AI loads under EP;
-set ``SGLANG_TPU_EP_SHARDED_WEIGHT_LOAD=0`` to force the stock stream.
+The Run:AI counterpart of ``ep_local_expert_reader``, which serves
+``DefaultModelLoader``: the same model opt-in
+(``supports_tpu_ep_local_expert_reads``), expert range
+(``tpu_local_routed_expert_range``), tensor-name rule (``local_expert_id``) and
+``SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS`` switch. Tensor names come from the
+safetensors shard headers, read through Run:AI, so object-storage checkpoints
+take the same path. Run:AI is handed only the kept names, so the skipped byte
+ranges are never requested.
 
 Hook header (AFTER ``get_model_loader``):
   Why: ``RunaiModelStreamerLoader`` fetches every routed expert on every rank;
        under EP each rank keeps ``1/ep_size`` of them, so startup reads
        ``ep_size`` times the bytes it needs.
-  How: AFTER ``get_model_loader`` swaps in
-       ``EPShardedRunaiModelStreamerLoader`` on Run:AI loads when EP is on,
-       experts are placed contiguously, and the checkpoint index names them.
-       ``SGLANG_TPU_EP_SHARDED_WEIGHT_LOAD=0`` keeps the stock stream.
-  Upstream PR or issue: not filed (plugin-only loader; SGLang core has no EP
-       weight filter).
-  Remove when: upstream SGLang's ``RunaiModelStreamerLoader`` accepts an EP
-       weight filter.
+  How: AFTER ``get_model_loader`` swaps in ``EPLocalRunaiModelStreamerLoader``
+       for Run:AI loads. It filters the primary source by the model's EP-local
+       expert range and takes the stock stream when the model has none.
+  Upstream PR or issue: not filed (plugin-only loader).
+  Remove when: upstream ``RunaiModelStreamerLoader`` takes a per-source expert
+       range like ``DefaultModelLoader.Source.local_expert_range``.
 """
 
 from __future__ import annotations
 
 import inspect
-import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 
 import msgspec
+import torch
 
 from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
 from sglang.srt.model_loader.weight_utils import (
     RUNAI_STREAMER_TENSOR_ATTR,
     maybe_add_mtp_safetensors,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang_tpu._logging import get_logger
-from sglang_tpu.envs import envs
+from sglang_tpu.ep_local_expert_reader import (
+    local_expert_id,
+    tpu_local_routed_expert_range,
+)
 
 logger = get_logger(__name__)
 
 INDEX_NAME = "model.safetensors.index.json"
-# A numeric segment after "experts." is the checkpoint's global routed-expert
-# id. "shared_experts" has no digit and fused tensors ("experts.gate_up_proj")
-# have no id, so both stay in every rank's plan. The greedy layer prefix makes
-# the last ".experts." segment win when a name contains more than one.
-_EXPERT_NAME = re.compile(r"^(?P<layer>.*)\.experts\.(?P<id>\d+)(?P<suffix>\..+)?$")
-# Checkpoint tensors of the multi-token-prediction head. Their expert layout
-# need not follow the target model's EP ownership.
-_MTP_NAME = re.compile(r"(?:^|\.)mtp\.")
-# Per-expert tensor suffixes that only the owning rank needs. Anything else
-# under experts.<id> (biases, input scales, router tensors, fused tensors) is
-# fetched by every rank; skipping an unknown suffix would drop a tensor the
-# model may need. ".scale" is the DeepSeek FP8 block scale next to ".weight".
-_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
 
 
 class ExpertFetchPlan(msgspec.Struct, frozen=True):
-    """Tensors to fetch and to skip, plus the local expert id range."""
+    """Checkpoint tensors one EP rank fetches and skips."""
 
-    kept: tuple[str, ...]
-    skipped: tuple[str, ...]
-    local_experts: tuple[int, int]
-
-
-def expert_id_of(name: str) -> int | None:
-    """Global routed-expert id encoded in a checkpoint tensor name."""
-    match = _EXPERT_NAME.match(name)
-    return int(match["id"]) if match else None
-
-
-def _validate_expert_layers(
-    layers: Mapping[str, Mapping[int, set[str]]], num_routed_experts: int
-) -> None:
-    """Reject a checkpoint whose expert ids or suffixes do not match the config.
-
-    A layer that names a subset of the config's experts (a different id space,
-    a fused per-group layout, or a different expert count) cannot be sharded
-    from the index alone; the caller then keeps the stock stream.
-    """
-    expected = set(range(num_routed_experts))
-    for layer, experts in layers.items():
-        if set(experts) != expected:
-            missing = sorted(expected - set(experts))
-            raise ValueError(
-                f"layer {layer} names {len(experts)} of {num_routed_experts} "
-                f"expert ids; first missing ids {missing[:4]}"
-            )
-        suffixes = next(iter(experts.values()))
-        if any(expert_suffixes != suffixes for expert_suffixes in experts.values()):
-            raise ValueError(f"layer {layer} names experts with different tensors")
+    kept: frozenset[str]
+    skipped: frozenset[str]
+    # This rank's routed-expert tensors; the load fails if one is not read.
+    local_experts: frozenset[str]
 
 
 def plan_expert_fetch(
-    names: Iterable[str],
-    *,
-    num_routed_experts: int,
-    ep_size: int,
-    ep_rank: int,
+    names: Iterable[str], expert_range: tuple[int, int] | None
 ) -> ExpertFetchPlan:
-    """Split the checkpoint's tensor names into this rank's and the rest.
-
-    ``names`` comes from the shard headers, not the index, so a tensor a
-    stale index omits is still kept. Experts are placed contiguously by EP
-    rank, as ``sglang.srt.layers.moe.utils.local_routed_expert_range``
-    assumes.
-    """
-    if num_routed_experts <= 0 or num_routed_experts % ep_size:
-        raise ValueError(
-            f"{num_routed_experts} routed experts do not divide EP size {ep_size}"
-        )
-    local = num_routed_experts // ep_size
-    start, end = ep_rank * local, (ep_rank + 1) * local
-    kept, skipped = [], []
-    layers: dict[str, dict[int, set[str]]] = {}
+    """Skip the routed experts outside ``expert_range``; None skips nothing."""
+    kept, skipped, local = set(), set(), set()
     for name in names:
-        if _MTP_NAME.search(name):
-            kept.append(name)
+        eid = None if expert_range is None else local_expert_id(name, expert_range)
+        if eid == -1:
+            skipped.add(name)
             continue
-        match = _EXPERT_NAME.match(name)
-        if match is None or not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
-            kept.append(name)
-            continue
-        expert = int(match["id"])
-        if expert >= num_routed_experts:
-            raise ValueError(
-                f"expert id {expert} of {name} is outside "
-                f"{num_routed_experts} routed experts"
-            )
-        layers.setdefault(match["layer"], {}).setdefault(expert, set()).add(
-            match["suffix"]
-        )
-        if start <= expert < end:
-            kept.append(name)
-        else:
-            skipped.append(name)
-    _validate_expert_layers(layers, num_routed_experts)
+        kept.add(name)
+        if eid is not None:
+            local.add(name)
     return ExpertFetchPlan(
-        kept=tuple(sorted(kept)),
-        skipped=tuple(sorted(skipped)),
-        local_experts=(start, end),
+        kept=frozenset(kept), skipped=frozenset(skipped), local_experts=frozenset(local)
     )
 
 
-def num_routed_experts_of(config) -> int | None:
-    """Routed-expert count of a text config, or None when it has none.
-
-    The field is named differently across checkpoints (DeepSeek, Qwen,
-    Mixtral, gpt-oss), so the known spellings are probed in order.
-    """
-    for name in (
-        "n_routed_experts",
-        "num_experts",
-        "num_local_experts",
-        "moe_num_experts",
-    ):
-        value = getattr(config, name, None)
-        if isinstance(value, int) and value > 0:
-            return value
-    return None
-
-
-def shardable(
-    *,
-    env_enabled: bool,
-    model_type: str | None,
-    is_draft_model: bool,
-    draft_model_idx: int | None,
-    ep_size: int,
-    num_routed_experts: int | None,
-    enable_eplb: bool,
-    redundant_experts: int,
-    init_expert_location: str,
-    ep_join_mode: str | None,
-) -> bool:
-    """Whether this rank may fetch a subset of the expert tensors."""
-    if not env_enabled or is_draft_model or draft_model_idx is not None:
-        return False
-    if model_type == "deepseek_v41":
-        # The V4.1 hook installs its own loader for the Engram row tables.
-        return False
-    if ep_size <= 1 or num_routed_experts is None:
-        return False
-    if num_routed_experts % ep_size:
-        return False
-    if ep_join_mode in ("scale", "recover"):
-        # An elastic-EP joiner may store experts on a widened storage rank
-        # offset; the checkpoint id no longer names this rank's slot.
-        return False
-    if enable_eplb or redundant_experts or init_expert_location != "trivial":
-        # A non-trivial expert location moves experts off their contiguous
-        # EP slot, so the checkpoint id no longer names this rank's storage.
-        return False
-    return True
-
-
-class EPShardedRunaiModelStreamerLoader(RunaiModelStreamerLoader):
+class EPLocalRunaiModelStreamerLoader(RunaiModelStreamerLoader):
     """Run:AI loader that requests only this rank's routed-expert tensors."""
 
-    def __init__(
-        self,
-        load_config,
-        model_config,
-        *,
-        num_routed_experts: int,
-        ep_size: int,
-        ep_rank: int,
-    ):
+    # A subclass that reads some tensors outside the stream (``_split_kept``)
+    # sets this so it plans even when the model has no EP-local range.
+    _plans_without_expert_range = False
+
+    def __init__(self, load_config):
         super().__init__(load_config)
+        self._primary_model_config = None
+        self._expert_range: tuple[int, int] | None = None
+
+    def _get_all_weights(self, model_config, model):
         self._primary_model_config = model_config
-        self._num_routed_experts = num_routed_experts
-        self._ep_size = ep_size
-        self._ep_rank = ep_rank
+        if self.load_config.draft_model_idx is None and not model_config.is_draft_model:
+            self._expert_range = tpu_local_routed_expert_range(model)
+        yield from super()._get_all_weights(model_config, model)
 
     def _get_weights_iterator(self, source):
-        if not self._is_primary_source(source):
+        if not self._is_primary_source(source) or (
+            self._expert_range is None and not self._plans_without_expert_range
+        ):
             yield from super()._get_weights_iterator(source)
             return
 
@@ -238,29 +107,54 @@ class EPShardedRunaiModelStreamerLoader(RunaiModelStreamerLoader):
             )
 
         with SafetensorsStreamer() as streamer:
-            plan = self._plan(streamer, files)
-            if plan is None:
+            shard_of = self._shard_of_names(streamer, files)
+            plan = (
+                None
+                if shard_of is None
+                else plan_expert_fetch(shard_of, self._expert_range)
+            )
+            streamed, extra = (
+                (None, iter(()))
+                if plan is None
+                else self._split_kept(kept=plan.kept, shard_of=shard_of)
+            )
+            if plan is None or (not plan.skipped and streamed == plan.kept):
+                # Nothing to skip: the stock stream, distributed if configured.
                 streamer.stream_files(
                     files,
                     device=self.target_device_str,
                     is_distributed=bool(self._is_distributed),
                 )
-            else:
-                if self._is_distributed:
-                    logger.info(
-                        "[ep-sharded-load] ignoring distributed streaming: "
-                        "per-rank fetch plans differ, so each rank streams "
-                        "independently"
-                    )
-                streamer.stream_files(
-                    files,
-                    device="cpu",
-                    is_distributed=False,
-                    tensor_names=set(plan.kept),
-                )
+                for name, tensor in streamer.get_tensors():
+                    setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+                    yield name, tensor
+                return
+            self._log_plan(plan=plan, streamed=streamed, num_files=len(files))
+            # Run:AI distributed streaming needs identical tensor_names on every
+            # rank, and EP ranks keep different experts.
+            streamer.stream_files(
+                files, device="cpu", is_distributed=False, tensor_names=streamed
+            )
+            seen = set()
             for name, tensor in streamer.get_tensors():
+                seen.add(name)
                 setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
                 yield name, tensor
+        missing = sorted((plan.local_experts & streamed) - seen)
+        if missing:
+            raise RuntimeError(
+                f"EP-local Run:AI read missed {len(missing)} local expert tensors, "
+                f"e.g. {missing[:3]}. SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS=1 "
+                "streams whole shards."
+            )
+        yield from extra
+
+    def _split_kept(
+        self, *, kept: frozenset[str], shard_of: Mapping[str, str]
+    ) -> tuple[frozenset[str], Iterator[tuple[str, torch.Tensor]]]:
+        """Names Run:AI streams, and the weights read after the stream."""
+        del shard_of
+        return kept, iter(())
 
     def _is_primary_source(self, source) -> bool:
         return (
@@ -269,12 +163,13 @@ class EPShardedRunaiModelStreamerLoader(RunaiModelStreamerLoader):
             and self.load_config.draft_model_idx is None
         )
 
-    def _plan(self, streamer, files) -> ExpertFetchPlan | None:
-        """The fetch plan from the shard headers, or None for the stock stream."""
+    def _shard_of_names(self, streamer, files: list[str]) -> dict[str, str] | None:
+        """Tensor name -> shard path from the shard headers; None for the stock
+        stream when this Run:AI cannot filter or the headers do not read."""
         if "tensor_names" not in inspect.signature(streamer.stream_files).parameters:
             logger.warning(
-                "[ep-sharded-load] this Run:AI has no tensor_names support; "
-                "using the stock full-checkpoint stream"
+                "[ep-local-runai] this Run:AI has no tensor_names support; "
+                "streaming whole shards"
             )
             return None
         try:
@@ -283,80 +178,36 @@ class EPShardedRunaiModelStreamerLoader(RunaiModelStreamerLoader):
             metas = sp.SafetensorsMetadata.from_files(
                 streamer.file_streamer, files, None
             )
-            names = [tensor.name for meta in metas for tensor in meta.tensors_metadata]
         except (ImportError, AttributeError, OSError, RuntimeError, ValueError) as exc:
             logger.warning(
-                "[ep-sharded-load] cannot read safetensors headers (%s); using "
-                "the stock full-checkpoint stream",
+                "[ep-local-runai] cannot read safetensors headers (%s); "
+                "streaming whole shards",
                 exc,
             )
             return None
-        try:
-            plan = plan_expert_fetch(
-                names,
-                num_routed_experts=self._num_routed_experts,
-                ep_size=self._ep_size,
-                ep_rank=self._ep_rank,
-            )
-        except ValueError as exc:
-            logger.warning(
-                "[ep-sharded-load] cannot shard this checkpoint (%s); using "
-                "the stock full-checkpoint stream",
-                exc,
-            )
-            return None
-        if not plan.skipped:
-            logger.info(
-                "[ep-sharded-load] no non-local expert tensors in the shards; "
-                "using the stock full-checkpoint stream"
-            )
-            return None
+        return {
+            tensor.name: path
+            for path, meta in zip(files, metas, strict=True)
+            for tensor in meta.tensors_metadata
+        }
+
+    def _log_plan(
+        self, *, plan: ExpertFetchPlan, streamed: frozenset[str], num_files: int
+    ) -> None:
         logger.info(
-            "[ep-sharded-load] fetching %d tensors from %d shards; skipping %d "
-            "non-local routed-expert tensors for experts [%d, %d) of %d",
-            len(plan.kept),
-            len(files),
+            "[ep-local-runai] streaming %d tensors from %d shards; skipping %d "
+            "routed-expert tensors outside experts %s; %d read outside the stream",
+            len(streamed),
+            num_files,
             len(plan.skipped),
-            plan.local_experts[0],
-            plan.local_experts[1],
-            self._num_routed_experts,
+            self._expert_range,
+            len(plan.kept - streamed),
         )
-        return plan
 
 
-def select_tpu_ep_sharded_loader(result, load_config, model_config=None):
-    """AFTER get_model_loader: swap in the EP-sharded Run:AI loader."""
-    if type(result) is not RunaiModelStreamerLoader or model_config is None:
+def select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
+    """AFTER get_model_loader: swap in the EP-local Run:AI loader."""
+    del model_config
+    if type(result) is not RunaiModelStreamerLoader:
         return result
-    if not envs.SGLANG_TPU_EP_SHARDED_WEIGHT_LOAD.get():
-        return result
-    parallel = get_parallel()
-    num_routed_experts = num_routed_experts_of(model_config.hf_text_config)
-    server_args = get_server_args()
-    if not shardable(
-        env_enabled=True,
-        model_type=model_config.hf_config.model_type,
-        is_draft_model=model_config.is_draft_model,
-        draft_model_idx=load_config.draft_model_idx,
-        ep_size=parallel.moe_ep_size,
-        num_routed_experts=num_routed_experts,
-        enable_eplb=server_args.enable_eplb,
-        redundant_experts=server_args.ep_num_redundant_experts,
-        init_expert_location=server_args.init_expert_location,
-        ep_join_mode=server_args.ep_join_mode,
-    ):
-        return result
-    local = num_routed_experts // parallel.moe_ep_size
-    logger.info(
-        "EP-sharded Run:AI weight streaming: experts [%d, %d) of %d on this rank.",
-        parallel.moe_ep_rank * local,
-        (parallel.moe_ep_rank + 1) * local,
-        num_routed_experts,
-    )
-    return EPShardedRunaiModelStreamerLoader(
-        load_config,
-        model_config,
-        num_routed_experts=num_routed_experts,
-        ep_size=parallel.moe_ep_size,
-        ep_rank=parallel.moe_ep_rank,
-    )
+    return EPLocalRunaiModelStreamerLoader(load_config)
