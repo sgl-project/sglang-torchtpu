@@ -23,8 +23,16 @@ def import_model(name):
     vllm.__path__ = []
     custom_ops = ModuleType("vllm._custom_ops")
     custom_ops.awq_dequantize = MagicMock()
-    with patch.dict(sys.modules, {"vllm": vllm, "vllm._custom_ops": custom_ops}):
+    # Remove only the stubs afterwards: patch.dict(sys.modules) would also
+    # evict every real module imported here, and C extensions such as
+    # ml_dtypes>=0.7 fail when imported a second time in one process.
+    stubs = {"vllm": vllm, "vllm._custom_ops": custom_ops}
+    sys.modules.update(stubs)
+    try:
         return importlib.import_module(f"sglang.srt.models.{name}")
+    finally:
+        for key in stubs:
+            sys.modules.pop(key, None)
 
 
 class StubModule(torch.nn.Module):
