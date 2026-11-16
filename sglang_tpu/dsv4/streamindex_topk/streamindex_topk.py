@@ -922,7 +922,10 @@ def streamindex_topk(
     """StreamIndex Top-K retrieval.
 
     ``selector="radix_v2"`` replaces only selection over the existing score
-    buffer on supported v7/K shapes. CP and return_scores retain sparsecore.
+    buffer on supported v7/K shapes with at most 64 query rows. Larger
+    prefill chunks, CP and return_scores retain sparsecore. ``radix_config``
+    is an internal (block, reconstruction threshold, reverse scan) override
+    for bounded measurements; it also bypasses the prefill fallback.
 
     ``page_table_in_hbm`` keeps the page table in HBM and copies one sequence's
     row into SMEM at its first KV block. Off, the table is a scalar-prefetch
@@ -1486,7 +1489,14 @@ def streamindex_topk(
                     branch_max_len=branch_max_len,
                 )
                 topk_scores_list.append(chunk_topk_scores)
-            elif selector == "radix_v2" and _radix_supported(k):
+            elif (
+                selector == "radix_v2"
+                and _radix_supported(k)
+                # Full-indexer tests found no prefill win with V2. Retain the
+                # incumbent there; an explicit config is for bounded manual
+                # measurements of the candidate, including those shapes.
+                and (chunk_len <= 64 or radix_config is not None)
+            ):
                 from sglang_tpu.attention.pallas.radix_topk import select_radix_topk
 
                 chunk_topk_idxs = select_radix_topk(
