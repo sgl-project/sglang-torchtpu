@@ -39,8 +39,8 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
-| Ming-Image | T2I 2048x2048, 12 steps | 8 | 2.73 s | 0.147 s | 0.47 s | 83.8 GB |
-| Ming-Image | T2I 1024x1024, 12 steps | 8 | 0.70 s | 0.037 s | 0.12 s | 62.2 GB |
+| Ming-Image | T2I 2048x2048, 12 steps | 8 | 2.7-3.4 s | 0.146 s | 0.47 s | 83.8 GB |
+| Ming-Image | T2I 1024x1024, 12 steps | 8 | 0.66-0.70 s | 0.034 s | 0.12 s | 62.3 GB |
 
 
 ## Example requests
