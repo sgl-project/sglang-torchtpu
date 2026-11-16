@@ -18,6 +18,20 @@ rows at the tail.
 The layout is deterministic from CPU lengths, so every rank computes the same
 per-rank row counts and the same token bucket without communication. Only
 numpy is used here; the torch glue lives in ``cp_forward``.
+
+Ring mode (``SGLANG_TPU_PCP_MODE=ring``, ``build_tpu_cp_ring_layout``) keeps
+the block ownership but makes the blocks page-aligned and rank-uniform, because
+the fused ring kernel reads the all-gathered chunk by page and every rank must
+run the same ring schedule:
+
+* block size ``C = align_up(ceil(length / (2 * cp_size)), page_size)``; the
+  blocks are filled in order, so trailing blocks are short or empty;
+* every rank reserves ``2 * C`` local rows per request -- its early block at
+  the request's local offset and its late block ``C`` rows later -- whether or
+  not the blocks hold tokens. Rows past a block's tokens are padding: they are
+  attention queries whose output is discarded, and they sit at chunk positions
+  at or past the request's length, so no row reads them as keys and they are
+  never written to the KV cache (``RingLayout`` below).
 """
 
 from __future__ import annotations
@@ -65,6 +79,42 @@ class TpuCpHostLayout(NamedTuple):
     last_rows: np.ndarray
     # 1 for requests whose last token lives on this rank, else 0.
     last_owner_mask: np.ndarray
+    # Ring mode only: the fused ring kernel's rows (None in gather mode).
+    ring: RingLayout | None = None
+
+
+class RingLayout(NamedTuple):
+    """Attention rows of one ring-mode extend batch as seen from ``cp_rank``.
+
+    Lengths and positions are global (unsharded) token counts; the kernel
+    derives each rank's page stripe from them and ``cp_rank``. Every array has
+    the same value on every rank except ``q_positions``.
+
+    New-token phase: two rows per request (early block, then late block), each
+    with ``C`` queries -- the block's tokens followed by padding queries. The new keys of a row are the request's whole chunk
+    (``new_kv_lens - kv_cache_lens`` tokens, the real ones only), read from the
+    rank-major all-gathered buffer through ``new_kv_page_indices``; the causal
+    mask comes from ``q_positions``.
+
+    Cache phase: one row per request over the same local query rows (both
+    blocks), attending the cached prefix only.
+    """
+
+    # --- new-token phase: the host layout's [2 * pad_b] attention rows
+    # (``pseudo_q_lens`` C, ``pseudo_kv_lens`` prefix + extend length), plus:
+    # Cached prefix of the row's request.
+    kv_cache_lens: np.ndarray
+    # Global position of the row's first query: prefix + block * C.
+    q_positions: np.ndarray
+    # [2 * pad_b, gathered_pages] page of the rank-major all-gathered buffer
+    # holding each page of the row's chunk; 0 past the chunk's 2 * cp * C rows.
+    new_kv_page_indices: np.ndarray
+    # Pages of the all-gathered buffer: cp_size * local_rows_padded / page_size.
+    gathered_pages: int
+    # --- cache phase, [pad_b] rows (num_reqs live) -------------------------
+    cache_q_lens: np.ndarray
+    # Cached prefix + the row's query length (the kernel subtracts the latter).
+    cache_kv_lens: np.ndarray
 
 
 def zigzag_block_sizes(length: int, cp_size: int) -> list[int]:
@@ -239,3 +289,179 @@ def warmup_request_lengths(
     num_reqs = min(max_reqs, units)
     base, rem = divmod(units, num_reqs)
     return [2 * cp_size * (base + 1 if i < rem else base) for i in range(num_reqs)]
+
+
+# ---------------------------------------------------------------------------
+# Ring mode: page-aligned, rank-uniform blocks
+# ---------------------------------------------------------------------------
+
+
+def ring_block_size(length: int, cp_size: int, page_size: int) -> int:
+    """Page-aligned zigzag block size of a request of ``length`` tokens."""
+    block = -(-int(length) // (2 * cp_size))
+    return -(-block // page_size) * page_size
+
+
+def ring_block_lens(length: int, cp_size: int, page_size: int) -> list[int]:
+    """Tokens in each of the ``2 * cp_size`` blocks, filled in order."""
+    block = ring_block_size(length, cp_size, page_size)
+    return [
+        min(max(int(length) - index * block, 0), block) for index in range(2 * cp_size)
+    ]
+
+
+def ring_local_rows(extend_lens: Sequence[int], cp_size: int, page_size: int) -> int:
+    """Local rows a ring-mode batch reserves on every rank (the bucketed
+    quantity): ``2 * C`` per request."""
+    return sum(
+        2 * ring_block_size(length, cp_size, page_size) for length in extend_lens
+    )
+
+
+def build_tpu_cp_ring_layout(
+    *,
+    extend_lens: Sequence[int],
+    prefix_lens: Sequence[int],
+    cp_size: int,
+    cp_rank: int,
+    pad_b: int,
+    local_rows_padded: int,
+    page_size: int,
+) -> TpuCpHostLayout:
+    """Build the ring-mode zigzag layout of one extend batch for ``cp_rank``."""
+    extend_lens = [int(x) for x in extend_lens]
+    prefix_lens = [int(x) for x in prefix_lens]
+    num_reqs = len(extend_lens)
+    if num_reqs > pad_b:
+        raise ValueError(f"{num_reqs} requests exceed the request bucket {pad_b}.")
+    if page_size < 16 or page_size % 16:
+        # The kernel hands the cache phase's softmax state to the new-token
+        # phase in 16-row units, so every row must start on one.
+        raise ValueError(
+            f"Ring-mode context parallelism needs a page size that is a multiple "
+            f"of 16, got {page_size}."
+        )
+    if local_rows_padded % page_size:
+        raise ValueError(
+            f"The local token bucket {local_rows_padded} is not a multiple of the "
+            f"page size {page_size}: ring-mode context parallelism reads the "
+            "all-gathered chunk by page."
+        )
+    reserved = ring_local_rows(extend_lens, cp_size, page_size)
+    if reserved > local_rows_padded:
+        raise ValueError(
+            f"ring-mode context parallelism reserves {reserved} local rows for "
+            f"{num_reqs} requests, above the local token bucket {local_rows_padded}."
+        )
+
+    early, late = owned_blocks(cp_size, cp_rank)
+    gathered_pages = cp_size * local_rows_padded // page_size
+    cu_extend = np.concatenate([[0], np.cumsum(extend_lens, dtype=np.int64)])
+
+    # Request and chunk offset of every row of the rank-major all-gathered
+    # buffer (-1 for padding), for the owner-restricted KV write.
+    gathered_req = np.full(cp_size * local_rows_padded, -1, dtype=np.int64)
+    gathered_pos = np.full(cp_size * local_rows_padded, -1, dtype=np.int64)
+    local_rows = np.full(local_rows_padded, -1, dtype=np.int64)
+    cache_q_lens = np.zeros(pad_b, dtype=np.int64)
+    padded_prefix = np.zeros(pad_b, dtype=np.int64)
+    new_q_lens = np.zeros(2 * pad_b, dtype=np.int64)
+    new_kv_lens = np.zeros(2 * pad_b, dtype=np.int64)
+    kv_cache_lens = np.zeros(2 * pad_b, dtype=np.int64)
+    q_positions = np.zeros(2 * pad_b, dtype=np.int64)
+    new_kv_page_indices = np.zeros((2 * pad_b, gathered_pages), dtype=np.int64)
+    last_rows = np.zeros(pad_b, dtype=np.int64)
+    last_owner_mask = np.zeros(pad_b, dtype=np.int64)
+
+    local_len = 0
+    local_start = 0
+    for i, (length, prefix) in enumerate(zip(extend_lens, prefix_lens)):
+        block = ring_block_size(length, cp_size, page_size)
+        lens = ring_block_lens(length, cp_size, page_size)
+        cache_q_lens[i] = 2 * block
+        padded_prefix[i] = prefix
+        for slot, index in enumerate((early, late)):
+            row = 2 * i + slot
+            start = local_start + slot * block
+            first = int(cu_extend[i]) + index * block
+            local_rows[start : start + lens[index]] = np.arange(
+                first, first + lens[index], dtype=np.int64
+            )
+            local_len += lens[index]
+            new_q_lens[row] = block
+            new_kv_lens[row] = prefix + length
+            kv_cache_lens[row] = prefix
+            q_positions[row] = prefix + index * block
+        # Page ``j`` of the chunk lies in block ``j // pages_per_block``, held by
+        # the rank that owns that block at this request's local offset.
+        pages_per_block = block // page_size
+        for index in range(2 * cp_size):
+            owner = index if index < cp_size else 2 * cp_size - 1 - index
+            slot = 0 if index < cp_size else 1
+            base = owner * local_rows_padded + local_start + slot * block
+            cols = slice(index * pages_per_block, (index + 1) * pages_per_block)
+            pages = base // page_size + np.arange(pages_per_block, dtype=np.int64)
+            new_kv_page_indices[2 * i, cols] = pages
+            new_kv_page_indices[2 * i + 1, cols] = pages
+            gathered_req[base : base + lens[index]] = i
+            gathered_pos[base : base + lens[index]] = index * block + np.arange(
+                lens[index], dtype=np.int64
+            )
+        last_block, last_offset = divmod(length - 1, block)
+        if last_block in (early, late):
+            slot = 0 if last_block == early else 1
+            last_rows[i] = local_start + slot * block + last_offset
+            last_owner_mask[i] = 1
+        local_start += 2 * block
+
+    # A padded request's rows stay all-zero (no queries, no keys).
+    cache_kv_lens = np.where(cache_q_lens > 0, padded_prefix + cache_q_lens, 0)
+
+    ring = RingLayout(
+        kv_cache_lens=kv_cache_lens,
+        q_positions=q_positions,
+        new_kv_page_indices=new_kv_page_indices,
+        gathered_pages=gathered_pages,
+        cache_q_lens=cache_q_lens,
+        cache_kv_lens=cache_kv_lens,
+    )
+    return TpuCpHostLayout(
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        num_reqs=num_reqs,
+        pad_b=pad_b,
+        local_rows_padded=local_rows_padded,
+        local_len=local_len,
+        local_rows=local_rows,
+        gathered_req=gathered_req,
+        gathered_pos=gathered_pos,
+        prefix_lens=padded_prefix,
+        pseudo_kv_lens=new_kv_lens,
+        pseudo_q_lens=new_q_lens,
+        row_reqs=np.arange(2 * pad_b, dtype=np.int64) // 2,
+        num_rows=2 * num_reqs,
+        last_rows=last_rows,
+        last_owner_mask=last_owner_mask,
+        ring=ring,
+    )
+
+
+def ring_warmup_request_lengths(
+    *, local_rows: int, cp_size: int, page_size: int, max_reqs: int
+) -> list[int]:
+    """Request lengths whose ring-mode blocks fill ``local_rows`` exactly.
+
+    A request reserves at least ``2 * page_size`` local rows, so the bucket
+    holds at most ``local_rows // (2 * page_size)`` requests; the first one
+    takes the pages the others leave.
+    """
+    pairs = local_rows // (2 * page_size)
+    if pairs < 1 or local_rows % (2 * page_size):
+        raise ValueError(
+            f"A ring-mode context-parallel token bucket must be a positive "
+            f"multiple of 2 x page size ({2 * page_size}), got {local_rows}."
+        )
+    num_reqs = max(1, min(max_reqs, pairs))
+    block_pages = [1] * num_reqs
+    block_pages[0] = pairs - (num_reqs - 1)
+    return [2 * cp_size * pages * page_size for pages in block_pages]
