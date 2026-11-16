@@ -2,8 +2,13 @@
 """Tests for sglang_tpu's LongCat-Image patches (sglang_tpu.multimodal_gen.longcat_image)."""
 
 import contextlib
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
+
+# CPU tensors throughout: on the CPU platform the distributed bootstrap opens
+# no TPU chip.
+os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cpu"
 
 import torch
 import transformers
@@ -28,6 +33,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits import longcat_image as dit
 from sglang.multimodal_gen.runtime.models.encoders import qwen2_5vl
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+    longcat_image as rewrite,
+)
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
@@ -38,9 +46,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.multimodal_gen import longcat_image, worker
 
-# Whole node, not chips=1: the parallel-state setup runs the TPU worker
-# bootstrap, which opens a chip outside the chip-parallel TPU_VISIBLE_CHIPS pin.
-register_tpu_ci(est_time=40, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=40, suite="stage-a-test-tpu-unit", chips=1)
 
 
 @contextlib.contextmanager
@@ -52,6 +58,7 @@ def _installed(backend="eager"):
             (qwen2_5vl.Qwen2_5_VLModel, "get_rope_index"),
             (qwen2_5vl, "create_causal_mask"),
             (dit.LongCatImageTransformer2DModel, "__call__"),
+            (rewrite.LongCatPromptRewriteStage, "forward"),
         ):
             stack.enter_context(patch.object(owner, name, getattr(owner, name)))
         stack.enter_context(patch.object(longcat_image, "_DEVICE_TYPES", ("cpu",)))
@@ -223,6 +230,28 @@ class TestLongCatPromptRewrite(_TestBase):
         mask[0] = 0
         with _installed(), self.assertRaisesRegex(ValueError, "a real token"):
             _generate(model, ids, 24, mask)
+
+    def test_rewrite_draws_follow_the_request_seed(self):
+        # Every SP rank decodes the rewrite, each from its own global RNG state.
+        model = _encoder()
+        ids = torch.randint(1, 290, (1, 9), generator=torch.Generator().manual_seed(3))
+
+        def decode(stage, batch, server_args):
+            return _generate(model, ids, 24, top_k=50, temperature=1.0, top_p=1.0)
+
+        def rank(seed, state):
+            torch.manual_seed(state)
+            batch = SimpleNamespace(seed=seed)
+            return rewrite.LongCatPromptRewriteStage.forward(None, batch, None)
+
+        with (
+            _installed(),
+            patch.object(longcat_image, "_STOCK_REWRITE_FORWARD", decode),
+        ):
+            ranks = [rank(42, state) for state in range(2)]
+            other_seed = rank(43, 0)
+        self.assertTrue(torch.equal(*ranks), ranks)
+        self.assertFalse(torch.equal(ranks[0], other_seed))
 
     def test_padded_prompt_encodes_as_stock(self):
         model = _encoder()

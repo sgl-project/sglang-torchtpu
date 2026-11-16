@@ -18,12 +18,14 @@ Runtime patch, tracked debt:
       column gives the row's first logits, as in stock. Each step's logits
       rows are selected on the host by the stock ``_select_next_token`` over
       the stock rows (padded prompt, then the generated tokens): greedy with
-      the repetition penalty for LongCat's generation config;
+      the repetition penalty for LongCat's generation config. Every SP rank
+      decodes the rewrite, so its host draws are seeded from the request seed:
+      the ranks pick the same tokens under any sampling config;
   (2) for encoders that honor the padding mask (LongCat's), computes the
       rope index and the causal and padding mask on the host, from the same
       values;
   (3) builds the DiT's RoPE tables on the host in float64 (as on CUDA), once
-      per image size, outside the compiled DiT;
+      per request, outside the compiled DiT;
   (4) gives the compiled DiT its prompt embeddings in their own contiguous
       storage: the backend guards every input's storage offset, and the
       embeddings are a slice of the encoder output on a conditioning-cache
@@ -44,12 +46,15 @@ from sglang.multimodal_gen.runtime.models.encoders import qwen2_5vl
 from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
     apply_qwen_vl_text_rope,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+    longcat_image as rewrite,
+)
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     build_torch_compile_kwargs,
 )
 from sglang.srt.layers.quantization import unquant
 
-CHUNK = 256
+_CHUNK = 256
 _CAPACITY_ALIGNMENT = 1024
 # Devices that take these paths.
 _DEVICE_TYPES = ("tpu",)
@@ -58,6 +63,7 @@ _STOCK_GENERATE = qwen2_5vl.Qwen2_5_VLForConditionalGeneration.generate
 _STOCK_ROPE_INDEX = qwen2_5vl.Qwen2_5_VLModel.get_rope_index
 _STOCK_CAUSAL_MASK = qwen2_5vl.create_causal_mask
 _STOCK_DIT_CALL = dit.LongCatImageTransformer2DModel.__call__
+_STOCK_REWRITE_FORWARD = rewrite.LongCatPromptRewriteStage.forward
 
 
 def _attend(q, keys, values, visible, scale):
@@ -156,13 +162,13 @@ class _Decoder:
     def _prefill(self, entries, cache):
         """Writes one row's entries into ``cache``; returns the last logits."""
         m = entries.shape[1]
-        padded = -(-m // CHUNK) * CHUNK
+        padded = -(-m // _CHUNK) * _CHUNK
         tail = torch.arange(m, padded, dtype=torch.int32)
         tail = torch.stack((torch.zeros_like(tail), tail, tail, tail))
         entries = torch.cat((entries, tail), 1)
-        for start in range(0, padded, CHUNK):
-            chunk = entries[:, start : start + CHUNK].contiguous()
-            last = torch.tensor([min(m - 1 - start, CHUNK - 1)], dtype=torch.int32)
+        for start in range(0, padded, _CHUNK):
+            chunk = entries[:, start : start + _CHUNK].contiguous()
+            last = torch.tensor([min(m - 1 - start, _CHUNK - 1)], dtype=torch.int32)
             logits = self.forward(chunk.to(self._device), last.to(self._device), *cache)
         return logits
 
@@ -185,7 +191,9 @@ class _Decoder:
         rows = [self._entries(*row) for row in zip(ids, mask, positions)]
         prompts, cache_starts, rope_starts = zip(*rows)
         longest = max(prompt.shape[1] for prompt in prompts)
-        capacity = max(-(-longest // CHUNK) * CHUNK, max(cache_starts) + max_new_tokens)
+        capacity = max(
+            -(-longest // _CHUNK) * _CHUNK, max(cache_starts) + max_new_tokens
+        )
         self.reserve(
             len(prompts), -(-capacity // _CAPACITY_ALIGNMENT) * _CAPACITY_ALIGNMENT
         )
@@ -267,14 +275,20 @@ def _generate(self, input_ids, attention_mask=None, *, max_new_tokens, **kwargs)
         )
 
 
-def _honors_padding(model) -> bool:
-    return getattr(model.language_model, "honor_cache_free_padding_mask", False)
+def _rewrite_forward(self, batch, server_args):
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(batch.seed)
+        return _STOCK_REWRITE_FORWARD(self, batch, server_args)
 
 
-def get_rope_index(self, input_ids=None, *args, attention_mask=None, **kwargs):
+def _get_rope_index(self, input_ids=None, *args, attention_mask=None, **kwargs):
     """``get_rope_index`` on the host, for encoders that honor the padding mask."""
     ref = input_ids if input_ids is not None else attention_mask
-    if ref is None or ref.device.type not in _DEVICE_TYPES or not _honors_padding(self):
+    if (
+        ref is None
+        or ref.device.type not in _DEVICE_TYPES
+        or not self.language_model.honor_cache_free_padding_mask
+    ):
         return _STOCK_ROPE_INDEX(
             self, input_ids, *args, attention_mask=attention_mask, **kwargs
         )
@@ -292,7 +306,7 @@ def get_rope_index(self, input_ids=None, *args, attention_mask=None, **kwargs):
     return positions.to(ref.device), deltas.to(ref.device)
 
 
-def causal_padding_mask(attention_mask, length):
+def _causal_padding_mask(attention_mask, length):
     """``[B, 1, L, L]`` bool, true where a query sees a key (no cache)."""
     causal = torch.ones(length, length, dtype=torch.bool).tril()
     return causal & attention_mask.bool()[:, None, None, :length]
@@ -309,7 +323,7 @@ def _causal_mask_on_host(**kwargs):
         or mask.dim() != 2
     ):
         return _STOCK_CAUSAL_MASK(**kwargs)
-    return causal_padding_mask(mask.cpu(), embeds.shape[1]).to(embeds.device)
+    return _causal_padding_mask(mask.cpu(), embeds.shape[1]).to(embeds.device)
 
 
 # One request's RoPE tables, keyed by its latent ids (the same tensor at every
@@ -371,6 +385,7 @@ def _dit_call(self, *args, **kwargs):
 
 def install() -> None:
     qwen2_5vl.Qwen2_5_VLForConditionalGeneration.generate = _generate
-    qwen2_5vl.Qwen2_5_VLModel.get_rope_index = get_rope_index
+    qwen2_5vl.Qwen2_5_VLModel.get_rope_index = _get_rope_index
     qwen2_5vl.create_causal_mask = _causal_mask_on_host
     dit.LongCatImageTransformer2DModel.__call__ = _dit_call
+    rewrite.LongCatPromptRewriteStage.forward = _rewrite_forward
