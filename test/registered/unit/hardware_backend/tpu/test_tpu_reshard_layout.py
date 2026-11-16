@@ -428,6 +428,11 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
         geometry = _manager(decode_t, 4)._make_geometry(8, 4)
         with self.assertRaisesRegex(ValueError, "splits a 4-slot pack"):
             geometry.check_decode_rank(0)
+        plan = geometry.decode_rank_plan(0)
+        self.assertFalse(plan[0].staged)
+        self.assertTrue(plan[1].staged)
+        self.assertEqual(plan[1].entry, (0, 512, 512, 0, 512))
+        self.assertEqual(geometry.merge_spec(0), ((0, 2, 2),))
 
     def test_register_reshard_request_refuses_partial_pack_without_sending(self):
         mgr = _manager(
@@ -555,19 +560,6 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
         mgr._swa_engine.register_active_plan.assert_called_once_with(
             1, mock.ANY, is_sender=False
         )
-
-    def test_strided_copy_alone_cannot_place_shared_fp8_packs(self):
-        """Without the staging merge the packed-word layout makes the old
-        strided placement impossible: the strict entry builder refuses it."""
-        decode_t = _fused_layer(FP8, 2)
-        geometry = _manager(decode_t, 4)._make_geometry(8, 4)
-        with self.assertRaisesRegex(ValueError, "splits a 4-slot pack"):
-            geometry.check_decode_rank(0)
-        plan = geometry.decode_rank_plan(0)
-        self.assertFalse(plan[0].staged)
-        self.assertTrue(plan[1].staged)
-        self.assertEqual(plan[1].entry, (0, 512, 512, 0, 512))
-        self.assertEqual(geometry.merge_spec(0), ((0, 2, 2),))
 
     # ---- geometry invariants -----------------------------------------------
 
