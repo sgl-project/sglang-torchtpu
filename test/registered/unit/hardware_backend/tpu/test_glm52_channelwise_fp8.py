@@ -6,6 +6,8 @@ The existing TPU MoE formatter is exercised on real CPU tensors as well.
 """
 
 import copy
+import importlib
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -692,6 +694,128 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
             self.assertIsNone(converted.weight_block_size)
             self.assertFalse(converted.quant_method.handles_moe_reduction)
             self.assertFalse(offline.quant_method.handles_moe_reduction)
+
+    def test_block_checkpoint_keeps_fused_rs_selection_and_reduction_ownership(self):
+        """Moving post-load dispatch must preserve the old auto/explicit RS path.
+
+        Real loading, formatting, eligibility and forward dispatch run on CPU;
+        only device compilation/collectives are replaced at their boundaries.
+        """
+        fixture = _expert_fixture()
+        parallel = SimpleNamespace(
+            pp_size=1,
+            tp_size=2,
+            tp_rank=0,
+            tp_group=SimpleNamespace(world_size=2),
+            moe_tp_size=1,
+            moe_tp_rank=0,
+            moe_ep_size=2,
+            moe_ep_rank=0,
+            attn_dp_size=1,
+            attn_dp_enabled=False,
+        )
+
+        def make_layer(offline=False):
+            layer = _moe(_config() if offline else _block_config())
+            if not offline:
+                self.assertIs(type(layer.quant_config), Fp8Config)
+            layer.num_experts = 4
+            layer.moe_ep_size = 2
+            layer.moe_tp_size = 1
+            layer.intermediate_size_per_partition = 4
+            layer.allow_backend_reduction = True
+            layer.moe_runner_config = SimpleNamespace(
+                is_gated=True,
+                activation="silu",
+                apply_router_weight_on_input=False,
+                no_combine=False,
+                swiglu_limit=None,
+            )
+            layer.quant_method.moe_runner_config = layer.moe_runner_config
+            _load_expert_fixture(layer, fixture, blockwise=not offline)
+            return layer
+
+        x = torch.ones(2, 4, dtype=torch.bfloat16)
+        dispatch = SimpleNamespace(
+            hidden_states=x,
+            topk_output=(
+                torch.ones(2, 1),
+                torch.zeros(2, 1, dtype=torch.int32),
+                None,
+            ),
+        )
+        self.enterContext(
+            patch.dict(
+                "sys.modules",
+                {"torch_tpu._internal.pallas": SimpleNamespace(jax_op=None)},
+            )
+        )
+        # Earlier import-boundary patches can leave stale parent-package attrs.
+        rs_op = importlib.import_module("sglang_tpu.moe.pallas.fused_moe_rs_op")
+        with (
+            get_context().override_server_args(tpu_fp8_runtime="channelwise"),
+            patch.object(fp8, "_is_tpu", True),
+            patch.object(fp8, "_is_cpu", False),
+            patch.dict(os.environ, WORLD_SIZE="2"),
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+            patch("sglang_tpu.fp8_moe.get_parallel", return_value=parallel),
+            patch(
+                "sglang_tpu.fp8_moe.current_platform.get_available_memory",
+                return_value=(4 * 1024**3, 8 * 1024**3),
+            ),
+            patch("torch.accelerator.synchronize"),
+            patch.object(rs_op, "_build_fused_moe_rs_op"),
+            patch(
+                "sglang_tpu.fp8_moe.apply_tpu_fp8_moe",
+                side_effect=AssertionError(
+                    "fused-RS silently fell back to ordinary MoE"
+                ),
+            ),
+        ):
+            for backend in (None, MoeRunnerBackend.PALLAS_TPU_FUSED_RS):
+                for offline in (False, True):
+                    with (
+                        self.subTest(backend=backend, offline=offline),
+                        get_flags().moe.override(runner_backend=backend),
+                    ):
+                        layer = make_layer(offline)
+                        layer.quant_method.process_weights_after_loading(layer)
+                        self.assertTrue(layer.quant_method.handles_moe_reduction)
+                        self.assertFalse(layer._tpu_fused_rs_expert_tp)
+                        self.assertEqual(layer._tpu_fused_rs_group_offset.tolist(), [0])
+                        for stem, (_, _, q, scales) in fixture.items():
+                            self.assertTrue(
+                                torch.equal(
+                                    getattr(layer, f"{stem}_weight").view(torch.uint8),
+                                    q.transpose(1, 2).contiguous().view(torch.uint8),
+                                )
+                            )
+                            torch.testing.assert_close(
+                                getattr(layer, f"{stem}_weight_scale").reshape(2, -1),
+                                scales.to(torch.bfloat16),
+                                rtol=0,
+                                atol=0,
+                            )
+                        with patch.object(
+                            rs_op,
+                            "fused_moe_rs_gather",
+                            return_value=x + 7,
+                        ):
+                            result = layer.quant_method.apply(layer, dispatch)
+                        torch.testing.assert_close(result.hidden_states, x + 7)
+
+            parallel.attn_dp_enabled = True
+            with get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.PALLAS_TPU_FUSED_RS
+            ):
+                with self.assertRaisesRegex(ValueError, "DP attention"):
+                    layer = make_layer()
+                    layer.quant_method.process_weights_after_loading(layer)
+            with get_flags().moe.override(runner_backend=None):
+                layer = make_layer()
+                layer.quant_method.process_weights_after_loading(layer)
+                self.assertFalse(layer.quant_method.handles_moe_reduction)
+                self.assertIn("DP attention", layer._tpu_fused_rs_unsupported_reason)
 
     def test_nextn_loads_channel_experts_and_preserves_exclusions_and_bridge(self):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
