@@ -7,14 +7,15 @@ sequence-parallel query shard), stock ``make_splash_mha`` for causal shapes,
 short query shards and fewer than 512 aligned keys (including zero-padded KV,
 whose padded keys must not take softmax weight), and the SDPA fallback.
 
-The numeric tests need the Pallas kernels (TPU v7x, torch_tpu, jax) and are
-skipped otherwise; each asserts which path ran, so a lane without the kernels
-cannot pass by comparing SDPA with SDPA.
+The numeric tests skip on chips other than TPU7x, as torch_tpu names the chip
+from PCI; on TPU7x the Pallas kernels must be available. Each asserts which
+path ran, so a lane without the kernels cannot pass by comparing SDPA with
+SDPA.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=150, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=170, suite="stage-a-test-tpu-unit", chips=1)
 
 import importlib.util
 import math
@@ -116,11 +117,25 @@ _PATH_CALLS = {"flash": (1, 0), "splash": (0, 1), "sdpa": (0, 0)}
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
 class TestTpuSplashAttentionNumerics(CustomTestCase):
     def _kernels(self):
-        """The backend module with its ops registered; skips without them."""
+        """The backend module with its ops registered; skips off TPU7x.
+
+        The chip is torch_tpu's PCI name ("TPU v7"; "7" also matches a
+        respelling such as "TPU v7x"), the raw name the backend maps to a
+        Pallas device kind. Read without the backend's jax imports and mapping,
+        a broken detection on TPU7x fails, not skips.
+        """
+        from torch_tpu._internal.utils.hardware import get_tpu_device_name
+
         from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
 
-        if not tsa._check_splash_available():
-            self.skipTest("Pallas kernels unavailable (needs TPU v7x and jax)")
+        chip = get_tpu_device_name()
+        if "7" not in chip:
+            self.skipTest(f"Pallas kernels are TPU7x-only, this chip is {chip!r}")
+        self.assertTrue(
+            tsa._check_splash_available(),
+            f"{chip}: Pallas kernels unavailable, tpu_splash_attn would run SDPA "
+            "(cause in the logged warning)",
+        )
         tsa._register_ops()
         return tsa
 
@@ -159,7 +174,11 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         self._assert_accurate(got.to("cpu"), q, k, v, scale, is_causal)
 
     def _assert_accurate(self, got, q, k, v, scale, is_causal):
-        """``got`` against float32 attention, within twice bf16 SDPA's error."""
+        """``got`` against float32 attention: rel-L2 < 1e-2, max abs < 2e-2.
+
+        The bounds are fixed, so only the kernel decides the verdict; torch_tpu
+        bf16 SDPA's error on the same inputs is reported for comparison.
+        """
         if k.shape[1] != q.shape[1]:
             k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
             v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
@@ -178,10 +197,9 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
             f"max abs {err:.3e} (sdpa {sdpa_err:.3e})"
         )
         # Relative L2 over the whole output: a padded key taking softmax weight
-        # stays under a max-abs bound but moves rel-L2 by ~1e-1. bf16 inputs
-        # bound the achievable accuracy, so allow twice bf16 SDPA's error.
-        self.assertLess(rel, max(1e-2, 2 * sdpa_rel), "rel-L2")
-        self.assertLess(err, max(2e-2, 2 * sdpa_err), "max abs")
+        # stays under a max-abs bound but moves rel-L2 by ~1e-1.
+        self.assertLess(rel, 1e-2, f"rel-L2 (bf16 SDPA {sdpa_rel:.3e})")
+        self.assertLess(err, 2e-2, f"max abs (bf16 SDPA {sdpa_err:.3e})")
 
     # Custom kernel: non-causal, q_seq >= 256, kv_seq >= 512.
     def test_custom_two_blocks_and_a_ragged_tail(self):
@@ -597,6 +615,65 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
         ring_op = ("diffusion_flash_attention_ring",)
         self.assertEqual(_kernel_calls(counter.graphs, ring_op), (2,))
         self.assertLess((got.float() - want).abs().max().item(), 2e-2)
+
+    def _live_length_impl(self):
+        tsa = self._kernels()
+        impl = tsa.TpuSplashAttentionImpl(
+            num_heads=7,
+            head_size=128,
+            causal=False,
+            softmax_scale=128**-0.5,
+            packed_trailing_padding=True,
+        )
+        self.assertTrue(impl.trailing_padding_on_device)
+        return tsa, impl
+
+    def test_live_length_varlen(self):
+        # MiniMax H3's packed [0, used, total] layout, read on device: one
+        # kernel call, padding rows zero, live rows attend live keys only.
+        tsa, impl = self._live_length_impl()
+        for total, used in ((512, 300), (2560, 1500), (2560, 2048), (4608, 4100)):
+            q, k, v = (
+                torch.randn(total, 7, 128, dtype=torch.bfloat16) for _ in range(3)
+            )
+            cu = torch.tensor([0, used, total], dtype=torch.int32)
+            with patch.object(
+                tsa, "_FLASH_LIVE_LENGTH_OP", wraps=tsa._FLASH_LIVE_LENGTH_OP
+            ) as kernel:
+                got = impl.forward_varlen(
+                    q.to("tpu"),
+                    k.to("tpu"),
+                    v.to("tpu"),
+                    cu_seqlens=cu.to("tpu"),
+                    max_seqlen=total,
+                ).to("cpu")
+            self.assertEqual(kernel.call_count, 1, (total, used))
+            self.assertEqual(got.shape, q.shape)
+            self.assertTrue((got[used:] == 0).all(), (total, used))
+            live = slice(0, used)
+            want = _reference(
+                q[None, live].transpose(1, 2),
+                k[None, live].transpose(1, 2),
+                v[None, live].transpose(1, 2),
+                128**-0.5,
+                False,
+            ).transpose(1, 2)[0]
+            err = (got[live].float() - want).abs().max().item()
+            self.assertLess(err, 2e-2, (total, used))
+
+    def test_live_length_varlen_with_host_bounds_uses_sdpa(self):
+        # A caller that passes host bounds (H3's token refiner) keeps SDPA.
+        tsa, impl = self._live_length_impl()
+        q, k, v = (
+            torch.randn(1024, 7, 128, dtype=torch.bfloat16).to("tpu") for _ in range(3)
+        )
+        cu = torch.tensor([0, 1024, 1024], dtype=torch.int32).to("tpu")
+        with patch.object(
+            tsa, "_FLASH_LIVE_LENGTH_OP", side_effect=AssertionError("kernel")
+        ):
+            impl.forward_varlen(
+                q, k, v, cu_seqlens=cu, max_seqlen=1024, cu_seqlens_host=(0, 1024, 1024)
+            )
 
     def test_backend_impl_layout(self):
         # The attention layer calls the impl with [B, S, H, D] tensors.
