@@ -8,6 +8,7 @@ export NUM_GPUS="${NUM_GPUS:-8}"
 if [[ "${NUM_GPUS}" -gt 1 ]]; then
   export PARALLEL_ARGS="${PARALLEL_ARGS---ulysses-degree ${NUM_GPUS}}"
 fi
-# The 7B DiT stays resident and whole on every core.
-export MODEL_ARGS="${MODEL_ARGS---dit-cpu-offload false --use-fsdp-inference false}"
+# The 7B DiT stays resident and whole on every core; its blocks compile as
+# spmd-safe regions.
+export MODEL_ARGS="${MODEL_ARGS---dit-cpu-offload false --use-fsdp-inference false --regional-compile}"
 exec bash "$(dirname "$0")/launch.sh" "$@"

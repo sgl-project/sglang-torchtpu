@@ -302,10 +302,10 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   `minimax_h3.py` (MiniMax-H3 packed sequences padded to a multiple of 512 rows,
   only the 50 DiT blocks compiled, the breakable-CUDA-graph break point skipped,
   regionally compiled blocks marked spmd-safe) and `qwen_image21.py` (Qwen-Image
-  2.1 prefix padded to 512 rows with its real length on device,
+  2.1 prefix padded to 512 rows with its real length and image rows on device,
   prefix-then-target resumable attention, pair-swap RoPE, prompt tokens padded
-  to 256, spmd-safe blocks); worker init also registers srt's ATen fallbacks
-  (`patches._register_aten_fallbacks`, e.g. `logaddexp`).
+  to 256, spmd-safe regional blocks); worker init also registers srt's ATen
+  fallbacks (`patches._register_aten_fallbacks`, e.g. `logaddexp`).
 
 Gates that take the OOT arm, with the same outcome as the built-in platform:
 
