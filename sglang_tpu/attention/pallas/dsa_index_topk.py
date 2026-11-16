@@ -180,6 +180,7 @@ def dsa_indexer_step(
     key_store: str = "xla",
     row_count: int = 0,
     selector: str = "sparsecore",
+    radix_config: tuple[int, int, bool] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Store this step's index keys, then pick the top-k keys for each query.
 
@@ -251,6 +252,7 @@ def dsa_indexer_step(
         segments=segments,
         enable_early_exit=False,
         selector=selector,
+        radix_config=radix_config,
         kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
         **(
             dict(row_start=row_start.reshape(()), row_count=row_count)
