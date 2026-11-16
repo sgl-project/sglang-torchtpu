@@ -281,8 +281,9 @@ def _generate(self, input_ids, attention_mask=None, *, max_new_tokens, **kwargs)
 
 
 def _rewrite_forward(self, batch, server_args):
+    seed = batch.seed[0] if isinstance(batch.seed, list) else batch.seed
     with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(batch.seed)
+        torch.manual_seed(seed)
         return _STOCK_REWRITE_FORWARD(self, batch, server_args)
 
 

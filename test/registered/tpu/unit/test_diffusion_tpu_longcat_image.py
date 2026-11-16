@@ -255,6 +255,15 @@ class TestLongCatPromptRewrite(_TestBase):
         self.assertTrue(torch.equal(*ranks), ranks)
         self.assertFalse(torch.equal(ranks[0], other_seed))
 
+    def test_rewrite_stage_takes_a_seed_list(self):
+        # The image API takes a seed or a list of seeds; the first one counts.
+        stage = rewrite.LongCatPromptRewriteStage(object(), None, torch.float32)
+        batch = SimpleNamespace(seed=[7, 8], enable_prompt_rewrite=False)
+        resident = lambda **_: contextlib.nullcontext(object())  # noqa: E731
+        with _installed(), patch.object(stage, "use_declared_component", resident):
+            stage.forward(batch, None)
+        self.assertEqual(batch.generator.initial_seed(), 7)
+
     def test_cfg_parallel_is_refused(self):
         args = SimpleNamespace(enable_cfg_parallel=True)
         with _installed(), self.assertRaisesRegex(ValueError, "CFG parallel"):
