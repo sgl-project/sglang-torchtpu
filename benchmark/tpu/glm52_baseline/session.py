@@ -231,6 +231,60 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                 if line.startswith("PHYSICAL_RANK=")
             )
         )
+        if os.environ.get("GLM52_MOE_PREFLIGHT") == "1":
+            seconds = min(1500, int(deadline - time.monotonic() - 1800))
+            assert seconds >= 60, "insufficient time for MoE preflight and E2E"
+            preflight_dir = art / "moe-preflight"
+            preflight_env = dict(os.environ)
+            for key, value in json.loads(config.read_text())["runtime_envs"].items():
+                if value is None:
+                    preflight_env.pop(key, None)
+                else:
+                    preflight_env[key] = str(value)
+            preflight_env["GLM52_RUNTIME_DIR"] = str(
+                preflight_dir / "actual-process-runtime"
+            )
+            with (art / "moe-preflight.log").open("wb", buffering=0) as log:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-u",
+                        "test/manual/kernels/glm_moe_v2_multihost_preflight.py",
+                        "--hosts",
+                        hosts,
+                        "--host-index",
+                        str(rank),
+                        "--output-dir",
+                        str(preflight_dir),
+                        "--source-commit",
+                        source,
+                        "--seconds",
+                        str(seconds),
+                    ],
+                    env=preflight_env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                    timeout=seconds + 30,
+                )
+            preflight = json.loads((preflight_dir / "result.json").read_text())
+            assert preflight["status"] == "SUCCEEDED", preflight
+            atomic(shared / f"moe-preflight-{rank}.json", preflight)
+            peer_deadline = min(deadline - 1800, time.monotonic() + 120)
+            while True:
+                try:
+                    verified = [
+                        json.loads((shared / f"moe-preflight-{r}.json").read_text())
+                        for r in range(2)
+                    ]
+                    assert all(
+                        r["status"] == "SUCCEEDED" and r["source"] == source
+                        for r in verified
+                    )
+                    break
+                except (FileNotFoundError, json.JSONDecodeError):
+                    assert time.monotonic() < peer_deadline, "peer MoE preflight timed out"
+                    time.sleep(2)
         recipe = json.loads(config.read_text())["server_args"]
         model = Path(recipe["model_path"])
         experts = json.loads((model / "config.json").read_text())["n_routed_experts"]

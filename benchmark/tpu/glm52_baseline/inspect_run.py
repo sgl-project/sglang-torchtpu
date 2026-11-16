@@ -40,6 +40,7 @@ def inspect(root, rank):
     if result["source"]:
         result["source"] = {k: v for k, v in result["source"].items() if k != "files"}
     for name in [
+        "moe-preflight.log",
         "host-preparation.log",
         "mtp-host-preparation.log",
         "cli-validation.log",
