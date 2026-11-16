@@ -109,6 +109,11 @@ class PrefixPull(WireMessage):
     room: int
     first_page: int
     num_pages: int
+    # A pipeline-parallel prefill: the stage that asks, for its own share of
+    # the pages in the pool the decode keeps in that stage's layout, and the
+    # stage's endpoint for the reply. -1 from a tensor-parallel prefill.
+    stage: int = -1
+    reply_endpoint: str = ""
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -163,6 +168,19 @@ class VictimPush(WireMessage, omit_defaults=True):
     swa_address: str = ""
     extra_key: Optional[str] = None
     cache_salt: Optional[str] = None
+    # A pipeline-parallel prefill (``stages`` > 0) pushes a branch as one
+    # message per stage to the decode rank that hosts the stage's pool, plus
+    # stage zero's to every rank. ``tokens`` come from stage zero only;
+    # ``uuid`` 0 carries no pages. ``layout`` is the stage's host block
+    # layout, per tensor of a page [dtype, page shape], and ``window_pages``
+    # the model's sliding window in pages.
+    stage: int = -1
+    stages: int = 0
+    window_pages: int = 0
+    layout: list = msgspec.field(default_factory=list)
+    page_bytes: int = 0
+    swa_layout: list = msgspec.field(default_factory=list)
+    swa_page_bytes: int = 0
 
 
 class VictimAck(WireMessage):
