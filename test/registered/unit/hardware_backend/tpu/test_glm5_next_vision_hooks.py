@@ -134,7 +134,9 @@ class TestGlm5NextVisionHooks(CustomTestCase):
             self.assertEqual(out_host.device.type, "cpu")
             self.assertTrue(torch.equal(out_host, raw))
 
-        meta_model = SimpleNamespace(visual=SimpleNamespace(device=torch.device("meta")))
+        meta_model = SimpleNamespace(
+            visual=SimpleNamespace(device=torch.device("meta"))
+        )
         with envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(True):
             out_dev = hooks.encode_glm5_next_vision_on_host(
                 lambda _m, _items: raw, meta_model, []

@@ -41,9 +41,7 @@ def _force_eager():
     )
 
 
-def attach_glm5_next_vision_runner(
-    result: None, visual: Any, *args, **kwargs
-) -> None:
+def attach_glm5_next_vision_runner(result: None, visual: Any, *args, **kwargs) -> None:
     """AFTER Glm5NextVisionModel.__init__: attach the TPU compile runner."""
     from sglang.srt.models import glm5_next
     from sglang_tpu.compilation.core_compile_annotations import (
@@ -60,14 +58,9 @@ def attach_glm5_next_vision_runner(
     annotate_core_compile_boundaries()
 
 
-def compile_glm5_next_decoder_only(
-    result: None, model: Any, *args, **kwargs
-) -> None:
+def compile_glm5_next_decoder_only(result: None, model: Any, *args, **kwargs) -> None:
     """AFTER Glm5NextForConditionalGeneration.__init__."""
-    if (
-        getattr(model, "visual", None) is None
-        or getattr(model, "model", None) is None
-    ):
+    if getattr(model, "visual", None) is None or getattr(model, "model", None) is None:
         return  # --language-model-only or encoder-only: keep default behavior.
     from sglang.srt.compilation.support_torch_compile import support_torch_compile
     from sglang_tpu.compilation.decoder_compile_policy import (

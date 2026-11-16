@@ -133,9 +133,7 @@ class TestGlm5NextVitTpuCompileRunner(CustomTestCase):
 
     def test_staged_runner_matches_unhooked_vision_model_across_padded_buckets(self):
         vit, runner = _build_vit()
-        grids = torch.tensor(
-            [[1, 4, 6], [1, 2, 2], [1, 8, 6]], dtype=torch.int32
-        )
+        grids = torch.tensor([[1, 4, 6], [1, 2, 2], [1, 8, 6]], dtype=torch.int32)
         total_patches = int(grids.prod(dim=1).sum())
         in_features = 3 * 1 * PATCH * PATCH
         pixels = torch.randn(total_patches, in_features, dtype=torch.float32)
@@ -193,9 +191,7 @@ class TestGlm5NextVitTpuCompileRunner(CustomTestCase):
         self.assertIsNone(
             runner.run_grid(pixels[:0], torch.tensor([[1, 0, 4]], dtype=torch.int32))
         )
-        empty_out = runner.run_grid(
-            pixels[:0], torch.zeros((0, 3), dtype=torch.int32)
-        )
+        empty_out = runner.run_grid(pixels[:0], torch.zeros((0, 3), dtype=torch.int32))
         self.assertIsNotNone(empty_out)
         self.assertEqual(empty_out.shape, (0, OUT_HIDDEN))
         with self.assertRaisesRegex(ValueError, "cannot stage"):
