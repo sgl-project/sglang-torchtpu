@@ -217,6 +217,12 @@ def run_worker(mode, padded_only=False):
     # Avoid the enormous custom-call config in native ERROR logs. The exception
     # is captured below, with its first compiler signature retained verbatim.
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    if os.environ.get("GLM52_ART"):
+        # Fresh workers share the allocation artifact root. Keep failure arrays
+        # from each implementation instead of overwriting the previous phase.
+        os.environ["GLM52_ART"] = str(
+            Path(os.environ["GLM52_ART"]) / f"diagnostic-{mode}"
+        )
     configure(mode)
     test = load_module(
         "glm_registered_bridge_test",
