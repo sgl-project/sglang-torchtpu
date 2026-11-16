@@ -875,10 +875,7 @@ class RaidenReceiverMixin:
         src_attn_tp = self.attn_tp_size * ratio
         r = self.kv_args.engine_rank % self.attn_tp_size
         source_ranks = list(range(r * ratio, (r + 1) * ratio))
-        # Refuse a head slice the KV layout cannot move before asking the
-        # prefill for anything, so the room fails with the reason instead of
-        # timing out (or, with an fp8 pool sized as bf16, landing heads in the
-        # wrong slots).
+        # Refuse unsupported head slices before messaging prefill so the room fails immediately.
         try:
             for swa in (False, True) if self._swa_kv_caches else (False,):
                 geometry = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=swa)
@@ -1492,9 +1489,8 @@ class RaidenKVReceiver(CommonKVReceiver):
     ):
         if self.conclude_state == KVPoll.Failed:
             return
-        # A decode sharded finer than its prefill pulls ONE prefill rank's
-        # whole pages (there is no head-slicing pull), which only holds this
-        # rank's heads when the kv-heads are replicated.
+        # Finer decode pulls one prefill rank's whole pages without head slicing;
+        # valid only when kv-heads are replicated.
         prefill_tp = (
             self.prefill_info.attn_tp_size if self.prefill_info is not None else 0
         )
@@ -1509,9 +1505,8 @@ class RaidenKVReceiver(CommonKVReceiver):
             self.kv_mgr.record_failure(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             self.conclude_state = KVPoll.Failed
-            # poll() now returns Failed without reaching _conclude_failed, so
-            # tell the prefill here; otherwise it holds the room until its
-            # bootstrap timeout.
+            # conclude_state is already Failed so poll() skips _conclude_failed;
+            # notify prefill here to avoid holding the room until bootstrap timeout.
             self._notify_prefill_abort()
             return
         self.kv_mgr.register_decode_request(

@@ -65,17 +65,15 @@ def source_ranks_for(decode_rank: int, ratio: int) -> List[int]:
 
 
 def head_bytes(fused_layer_tensor: FusedKVLayerTensor) -> int:
-    """Bytes of one kv-head's K+V values, padding slots excluded; the per-head
-    granule of a ReshardGeometry built with the tensor's kv_packing."""
+    """Bytes of one kv-head's K+V values, padding slots excluded;
+    the per-head granule of a ReshardGeometry built with the tensor's kv_packing."""
     shape = fused_layer_tensor.shape
     return 2 * int(shape[4]) * fused_layer_tensor.element_size()
 
 
 def per_rank_head_count(fused_layer_tensor: FusedKVLayerTensor) -> int:
-    """kv_heads_packed (``shape[2]``): the number of 32-bit packs per token of a
-    fused KV layer tensor. That equals this rank's kv-head count only for bf16
-    (one head per pack); an fp8 pack holds two heads, so for a kv-head count
-    use ``ReshardGeometry.heads_per_rank``."""
+    """``kv_heads_packed`` (32-bit packs per token, equal to kv-heads only in BF16);
+    an FP8 pack holds two heads, so use ``ReshardGeometry.heads_per_rank``."""
     return int(fused_layer_tensor.shape[2])
 
 
@@ -163,14 +161,10 @@ class ReshardGeometry:
         return max(1, self.total_kv_heads // tp)
 
     def _token_bytes(self, tp: int) -> int:
-        """Per-token byte width of a rank's fused KV row at attention TP ``tp``:
-        its ``2 * heads`` K/V slots rounded up to whole 32-bit packs."""
         packs = -(-2 * self.heads_per_rank(tp) // self.kv_packing)
         return packs * self.kv_packing * self.padded_head_dim * self.element_size
 
     def check_token_bytes(self, *, tp: int, actual: int, what: str) -> None:
-        """Fail loudly when a rank's real per-token width (``tensor.stride(1) *
-        element_size``) is not what this geometry computes for it."""
         expected = self._token_bytes(tp)
         if int(actual) != expected:
             raise ValueError(
@@ -206,8 +200,6 @@ class ReshardGeometry:
         )
 
     def check_decode_rank(self, decode_rank: int) -> None:
-        """Raise ``entry_bytes``' error for any source of ``decode_rank``, so a
-        decode can refuse an unsupported reshard before asking for the KV."""
         if self.src_tp >= self.dst_tp:
             sources = source_ranks_for(decode_rank % self.dst_tp, self.ratio)
         else:

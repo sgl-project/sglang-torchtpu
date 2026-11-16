@@ -138,14 +138,8 @@ PAGE_SIZE = 64
 NUM_PAGES = 6
 PAD = 0xFD  # a byte no KV value takes (values are < 251)
 
-# Byte layout of one token row inside the buffer Raiden copies:
-#   "packed": 32-bit words hold ``kv_packing`` slots of one head-dim lane
-#             (row = [pack][lane d][slot]), slot s in bits [8s*itemsize, ...).
-#             The native TPU layout: the RPA kernel bitcasts a pack row to
-#             uint32 lanes and shifts K/V out of each word, and the raw D2H/H2D
-#             host copies keep the device bytes.
-#   "contiguous": the torch-stride order (row = [pack][slot][lane d]); kept
-#             only to show which results depend on the packing.
+# Native RPA token-row layout is [pack][lane][slot] in 32-bit lane words,
+# preserved by raw D2H/H2D host copies.
 PHYSICAL_LAYOUT = "packed"
 
 
@@ -213,8 +207,6 @@ def _manager(tensor, local_tp):
 
 
 def _heads_of_rank(tp, rank):
-    """Global kv-heads a rank holds, in local slot order (sglang head sharding:
-    heads split evenly, replicated when the model has fewer heads than ranks)."""
     per_rank = max(1, TOTAL_KV_HEADS // tp)
     replicas = max(1, tp // TOTAL_KV_HEADS)
     first = (rank % tp) // replicas * per_rank
@@ -222,7 +214,6 @@ def _heads_of_rank(tp, rank):
 
 
 def _byte_offsets(tensor, layout):
-    """Byte offset within one page of every (token, slot, lane, byte)."""
     _, page, packs, packing, lanes = tensor.shape
     itemsize = tensor.element_size()
     token_width = tensor.stride(1) * itemsize
@@ -242,8 +233,6 @@ def _byte_offsets(tensor, layout):
 
 
 def _values(block, heads, kv_slots, itemsize):
-    """Expected byte of (token, slot, lane, byte) for global ``heads`` in page
-    ``block``; slot 2i is head i's K, 2i+1 its V, the rest padding."""
     t = np.arange(PAGE_SIZE)[:, None, None, None]
     d = np.arange(128)[None, None, :, None]
     b = np.arange(itemsize)[None, None, None, :]
@@ -277,12 +266,9 @@ def _apply(entry, source_pages, dest_pages):
 
 
 class TestTpuReshardFp8Packing(unittest.TestCase):
-    """Decode rank j must hold, at every token of every page, exactly the K/V
-    of its own kv-heads as written by the prefill ranks."""
+    """Raiden push resharding must place each prefill kv-head into its decode slot."""
 
-    # Paired pages: prefill page ids differ from decode page ids; the last page
-    # is partial (35 live tokens) so tokens 31/32 cross the half-page mark and
-    # 63 is the page's last slot on the full pages.
+    # Distinct src/dst page ids; the 35-token tail page crosses the half-page mark.
     SRC_BLOCKS = [1, 2, 4]
     DST_BLOCKS = [3, 5, 2]
     LIVE = [PAGE_SIZE, PAGE_SIZE, 35]
@@ -368,7 +354,6 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
                                 f"{want[token, slot, :4, 0].tolist()} "
                                 f"({len(bad)} bad bytes)"
                             )
-                # Spot-check the page-boundary tokens explicitly.
                 for token in (0, 31, 32, 63):
                     if token < live:
                         np.testing.assert_array_equal(
@@ -376,9 +361,8 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
                         )
 
     def test_fp8_fan_in_8_to_4(self):
-        """GPT-OSS-120B fp8, prefill TP8 -> decode TP8 DP2 (attention TP4).
-        One fp8 head per prefill rank cannot be placed into a decode pack it
-        shares with another rank's head by any strided copy: refuse it."""
+        """Refuse FP8 fan-in that mixes prefill ranks inside one 4-slot pack,
+        since no strided copy can interleave sub-pack slots."""
         with self.assertRaisesRegex(
             ValueError, "Partial FP8 head packs are unsupported"
         ):
@@ -433,14 +417,11 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
                 self._check(torch.bfloat16, src_tp, dst_tp)
 
     def test_geometry_requires_layout(self):
-        """kv_packing / element_size have no bf16 defaults any more."""
         with self.assertRaises(TypeError):
             rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8)
 
     def test_token_width_checked_against_strides(self):
-        """A geometry whose computed per-token width disagrees with the local
-        tensor's real row is refused -- here the old bf16-style sizing, a whole fp8
-        pack (512 B) taken as one head."""
+        """Refuse a geometry whose token byte width differs from the tensor stride."""
         decode_t = _fused_layer(torch.float8_e4m3fn, 2)
         row = decode_t.stride(1) * decode_t.element_size()
         geometry = rs.ReshardGeometry(
@@ -464,8 +445,7 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
             wrong.check_token_bytes(tp=4, actual=row, what="decode")
 
     def test_fp8_replicated_entry_unchanged(self):
-        """TP16 -> attention TP8 fp8 (1 head -> 1 head) keeps the whole padded
-        pack move it had before."""
+        """TP16 -> attention TP8 fp8 (1 -> 1 head) moves the whole 512 B padded pack."""
         decode_t = _fused_layer(torch.float8_e4m3fn, 1)
         geometry = _manager(decode_t, 8)._make_geometry(16, 8)
         for prefill_rank in (0, 1, 14, 15):
@@ -476,9 +456,8 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
 
 
 class TestTpuFinerDecodeRefusal(unittest.TestCase):
-    """A decode at a larger attention TP than its prefill pulls one prefill
-    rank's whole pages (no head slicing), so it is refused unless both hold
-    the same kv-heads."""
+    """Whole-page pulls at finer decode attention TP cannot slice heads,
+    so refuse them unless prefill and decode hold the same kv-heads."""
 
     def test_finer_decode_refusal(self):
         decode_t = _fused_layer(torch.float8_e4m3fn, 1)

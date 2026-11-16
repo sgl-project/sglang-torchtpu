@@ -452,7 +452,6 @@ class RaidenKVManager(
     def _check_reshard_layout(
         self, *, geometry, tensor, src_attn_tp: int, dst_attn_tp: int
     ) -> None:
-        """Verify that the tensor's actual stride matches the geometry's computed token width."""
         from sglang_tpu.disaggregation.raiden.pp_common import _FUSED_KV_RANK
 
         local_tp = int(self.attn_tp_size)
@@ -474,8 +473,8 @@ class RaidenKVManager(
                 f"with page_size {page_size}"
             )
         if tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get():
-            # Packed heads sit side by side along head_dim, so a kv-head is not
-            # a K/V slot pair the head-slice math can address.
+            # Packed heads sit side by side along head_dim,
+            # so a kv-head is not a K/V slot pair the head-slice math can address.
             raise ValueError(
                 "Raiden push resharding does not support SGLANG_TPU_KV_PACK_HEADS"
             )
@@ -486,7 +485,6 @@ class RaidenKVManager(
         )
 
     def finer_decode_refusal(self, prefill_attn_tp: int) -> Optional[str]:
-        """Return a refusal reason if decode attention TP exceeds prefill TP without head replication."""
         attn_tp = int(self.attn_tp_size)
         if not prefill_attn_tp or prefill_attn_tp >= attn_tp:
             return None
