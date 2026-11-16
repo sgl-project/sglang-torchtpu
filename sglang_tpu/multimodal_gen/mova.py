@@ -28,9 +28,6 @@ from sglang.multimodal_gen.runtime.models.dits import mova_audio_dit as audio
 from sglang.multimodal_gen.runtime.models.dits import mova_video_dit as video
 from sglang_tpu.multimodal_gen.rope import apply_rotary_embedding_pair_swap
 
-# Devices that take these paths.
-_DEVICE_TYPES = ("tpu",)
-
 _STOCK_COMPLEX_ROPE = rope_utils._apply_rotary_emb_complex
 _STOCK_VIDEO_INIT_FREQS = video.WanModel._init_freqs
 _STOCK_AUDIO_INIT_FREQS = audio.WanAudioModel._init_freqs

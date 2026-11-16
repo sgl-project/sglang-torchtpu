@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import math
 
 import torch
 import torch.nn as nn
@@ -292,12 +293,9 @@ class MOVADenoisingStage(PipelineStage):
             logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
 
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        if getattr(server_args, "regional_compile", False):
-            # The denoising loop calls the DiT blocks directly, past the
-            # module's own forward: compile the blocks themselves.
-            compile_matching_submodules(module, compile_kwargs=compile_kwargs)
-        else:
-            module.compile(**compile_kwargs)
+        # The denoising loop calls the DiT blocks directly, past the module's
+        # own forward: compile the blocks themselves.
+        compile_matching_submodules(module, compile_kwargs=compile_kwargs)
 
     def _maybe_compile_dits(self, server_args: ServerArgs):
         if self._torch_compiled or not server_args.enable_torch_compile:
@@ -328,6 +326,13 @@ class MOVADenoisingStage(PipelineStage):
         result.add_check(
             "num_inference_steps", batch.num_inference_steps, V.positive_int
         )
+        # Under SP the video-to-audio bridge keys stay sharded, so every rank
+        # needs an equal share of the video tokens.
+        result.add_check(
+            "video_tokens",
+            self._video_token_count(batch.latents),
+            V.divisible(get_sp_world_size()),
+        )
         result.add_check("guidance_scale", batch.guidance_scale, V.non_negative_float)
         result.add_check(
             "guidance_rescale", batch.guidance_rescale, V.non_negative_float
@@ -338,6 +343,11 @@ class MOVADenoisingStage(PipelineStage):
             V.bool_value,
         )
         return result
+
+    def _video_token_count(self, latents: torch.Tensor) -> int:
+        return math.prod(
+            n // p for n, p in zip(latents.shape[-3:], self.video_dit.patch_size)
+        )
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify denoising stage outputs."""
@@ -879,13 +889,8 @@ class MOVADenoisingStage(PipelineStage):
         # ranks' shards, tail padding included. The audio is short: the
         # audio-to-video conditioners take the real audio rows of every rank
         # and attend them without SP. The video keys of video-to-audio stay
-        # sharded, so their count must split evenly.
+        # sharded (verify_input checks that they split evenly).
         replicate_audio = get_sp_world_size() > 1
-        if replicate_audio and full_visual_seq_len % get_sp_world_size():
-            raise NotImplementedError(
-                f"MOVA under SP needs a video token count ({full_visual_seq_len}) "
-                f"that the SP degree ({get_sp_world_size()}) divides"
-            )
 
         # Build RoPE frequencies for cross-attention if needed (only used when SP == 1)
         # When SP > 1, we rebuild freqs inside the loop after gathering full sequences

@@ -6,5 +6,5 @@ set -euo pipefail
 export MODEL="${MODEL:-OpenMOSS-Team/MOVA-720p}"
 export NUM_GPUS="${NUM_GPUS:-8}"
 export PARALLEL_ARGS="${PARALLEL_ARGS---ulysses-degree 8}"
-export MODEL_ARGS="${MODEL_ARGS---regional-compile --dit-cpu-offload false --use-fsdp-inference false}"
+export MODEL_ARGS="${MODEL_ARGS---dit-cpu-offload false --use-fsdp-inference false}"
 exec bash "$(dirname "$0")/launch.sh" "$@"

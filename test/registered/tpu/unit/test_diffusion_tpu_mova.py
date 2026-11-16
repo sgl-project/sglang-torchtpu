@@ -50,7 +50,6 @@ def _installed():
             (audio.WanAudioModel, "_init_freqs"),
         ):
             stack.enter_context(patch.object(owner, name, getattr(owner, name)))
-        stack.enter_context(patch.object(mova, "_DEVICE_TYPES", ("cpu",)))
         mova.install()
         mova.install()  # idempotent
         yield
@@ -107,8 +106,8 @@ class TestMovaRope(CustomTestCase):
         self.assertTrue(torch.equal(got, want))
 
 
-class TestMovaRegionalCompile(CustomTestCase):
-    def test_regional_compile_compiles_the_blocks(self):
+class TestMovaCompile(CustomTestCase):
+    def test_torch_compile_compiles_the_blocks(self):
         class Dit(torch.nn.Module):
             _compile_conditions = video.WanModel._compile_conditions
             _compile_regions_spmd_safe = False
@@ -119,7 +118,8 @@ class TestMovaRegionalCompile(CustomTestCase):
 
         dit = Dit()
         denoise = stage.MOVADenoisingStage.__new__(stage.MOVADenoisingStage)
-        args = SimpleNamespace(enable_torch_compile=True, regional_compile=True)
+        # The denoising loop calls the blocks, never the DiT's own forward.
+        args = SimpleNamespace(enable_torch_compile=True)
         denoise._maybe_enable_torch_compile(dit, args)
         self.assertIsNotNone(dit.blocks[0]._compiled_call_impl)
         self.assertIsNone(dit._compiled_call_impl)
@@ -336,6 +336,21 @@ def _tiny_bridge():
     return bridge
 
 
+@contextlib.contextmanager
+def _sp2_without_exchange():
+    """Ulysses 2 for USPAttention, with every SP exchange failing."""
+
+    def exchange(*args, **kwargs):
+        raise AssertionError("SP exchange")
+
+    with (
+        patch.object(attention_layer, "get_sequence_parallel_world_size", lambda: 2),
+        patch.object(attention_layer, "get_ulysses_parallel_world_size", lambda: 2),
+        patch.object(attention_layer, "_usp_input_all_to_all_qkv", exchange),
+    ):
+        yield
+
+
 class TestMovaBridgeUnderSP(CustomTestCase):
     """Under SP the audio-to-video keys are every rank's real audio rows."""
 
@@ -356,6 +371,8 @@ class TestMovaBridgeUnderSP(CustomTestCase):
         server_args_module.set_global_server_args(self._previous_args)
 
     def test_replicated_audio_attends_without_sp(self):
+        # At Ulysses 2, each rank's video rows attended to the whole real audio
+        # match the full-sequence bridge on those rows, with no SP exchange.
         bridge = _tiny_bridge()
         gen = torch.Generator().manual_seed(1)
         visual = torch.randn(1, 8, 64, generator=gen)
@@ -363,23 +380,10 @@ class TestMovaBridgeUnderSP(CustomTestCase):
         freqs = bridge.build_aligned_freqs(
             24, self.GRID, self.AUDIO_LEN, "cpu", torch.float32
         )
-        stock_forward = attention_layer.USPAttention.forward
-        skips = []
-
-        def forward(attn, *args, skip_sequence_parallel_override=False, **kwargs):
-            skips.append(skip_sequence_parallel_override)
-            return stock_forward(
-                attn,
-                *args,
-                skip_sequence_parallel_override=skip_sequence_parallel_override,
-                **kwargs,
-            )
-
         with set_forward_context(current_timestep=0, attn_metadata=None):
             with torch.no_grad():
                 want, _ = bridge(0, visual, audio_x, x_freqs=freqs[0], y_freqs=freqs[1])
-                with patch.object(attention_layer.USPAttention, "forward", forward):
-                    # Each SP rank's video rows, with the whole real audio.
+                with _sp2_without_exchange():
                     for rows in (slice(0, 4), slice(4, 8)):
                         got = bridge.apply_conditional_control(
                             0,
@@ -391,7 +395,6 @@ class TestMovaBridgeUnderSP(CustomTestCase):
                             condition_replicated=True,
                         )
                         torch.testing.assert_close(got, want[:, rows])
-        self.assertEqual(skips, [True, True])
 
     def test_stage_passes_every_ranks_real_audio(self):
         audio_x = torch.randn(1, self.AUDIO_LEN, 32)
@@ -412,8 +415,14 @@ class TestMovaBridgeUnderSP(CustomTestCase):
         denoise.dual_tower_bridge = Bridge()
         denoise.audio_dit = SimpleNamespace(blocks=identity)
 
-        def run(visual_len):
-            return denoise.forward_dual_tower_dit(
+        with (
+            patch.object(stage, "get_sp_world_size", return_value=2),
+            patch.object(sp_shard_utils, "get_sp_world_size", return_value=2),
+            patch.object(sp_shard_utils, "get_sp_parallel_rank", return_value=1),
+            # The gathered audio: every rank's rows less the pad row.
+            patch.object(stage, "gather_seq", lambda x, n: audio_x[:, :n]),
+        ):
+            denoise.forward_dual_tower_dit(
                 visual_dit=SimpleNamespace(blocks=identity),
                 visual_x=torch.randn(1, 4, 64),
                 audio_x=audio_x[:, 3:],
@@ -425,20 +434,9 @@ class TestMovaBridgeUnderSP(CustomTestCase):
                 audio_freqs=None,
                 grid_size=self.GRID,
                 video_fps=24,
-                full_visual_seq_len=visual_len,
+                full_visual_seq_len=8,
                 full_audio_seq_len=self.AUDIO_LEN,
             )
-
-        with (
-            patch.object(stage, "get_sp_world_size", return_value=2),
-            patch.object(sp_shard_utils, "get_sp_world_size", return_value=2),
-            patch.object(sp_shard_utils, "get_sp_parallel_rank", return_value=1),
-            # The gathered audio: every rank's rows less the pad row.
-            patch.object(stage, "gather_seq", lambda x, n: audio_x[:, :n]),
-        ):
-            run(8)
-            with self.assertRaises(NotImplementedError):
-                run(7)
         full = Bridge.build_aligned_freqs(24, self.GRID, self.AUDIO_LEN)
         self.assertEqual(len(calls), 2)
         for kwargs in calls:
@@ -447,6 +445,28 @@ class TestMovaBridgeUnderSP(CustomTestCase):
                 self.assertTrue(torch.equal(got, want))
             # The sharded tables stay with the sharded rows (rank 1 of 2).
             self.assertTrue(torch.equal(kwargs["x_freqs"][0], full[0][0][:, 4:]))
+
+    def test_uneven_video_split_fails_verification(self):
+        denoise = stage.MOVADenoisingStage.__new__(stage.MOVADenoisingStage)
+        denoise.video_dit = SimpleNamespace(patch_size=(1, 2, 2))
+        tensor = torch.zeros(1)
+        batch = SimpleNamespace(
+            y=tensor,
+            paired_timesteps=tensor,
+            # 2 x 2 x 3 = 12 video tokens.
+            latents=torch.zeros(1, 4, 2, 4, 6),
+            audio_latents=tensor,
+            prompt_embeds=[tensor],
+            negative_prompt_embeds=[tensor],
+            do_classifier_free_guidance=True,
+            num_inference_steps=2,
+            guidance_scale=5.0,
+            guidance_rescale=0.0,
+        )
+        for sp, failed in ((1, []), (4, []), (8, ["video_tokens"])):
+            with patch.object(stage, "get_sp_world_size", return_value=sp):
+                result = denoise.verify_input(batch, None)
+            self.assertEqual(result.get_failed_fields(), failed, f"SP {sp}")
 
 
 if __name__ == "__main__":
