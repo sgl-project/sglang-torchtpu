@@ -141,7 +141,9 @@ class TestCfgNormalization(unittest.TestCase):
                 else:
                     expected = guided
                 req = SimpleNamespace(
-                    cfg_normalization=cfg_normalization, guidance_rescale=0.0
+                    cfg_normalization=cfg_normalization,
+                    guidance_rescale=0.0,
+                    did_sp_shard_latents=False,
                 )
                 with patch.object(torch.Tensor, "__bool__", _no_host_read):
                     out = CFGPolicy().combine([pos, neg], req, 5.0, config)

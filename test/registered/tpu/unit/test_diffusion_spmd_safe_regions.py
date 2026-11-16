@@ -15,6 +15,7 @@ import unittest
 from sglang.multimodal_gen.test.unit.test_spmd_safe_regions import (  # noqa: F401
     TestDrainAfterRequest,
     TestFusionBarrier,
+    TestReplicatedSuffixTracesOneGraph,
     TestSpmdSafeRegions,
     TestWanBlockCompilesAsOneGraph,
     TestWanBlockInputsAreRankInvariant,

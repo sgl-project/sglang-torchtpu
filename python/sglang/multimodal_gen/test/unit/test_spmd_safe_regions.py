@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.layers import layernorm
+from sglang.multimodal_gen.runtime.layers.attention import layer as attention_layer
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.managers import gpu_worker
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -339,6 +340,67 @@ class TestWanBlockCompilesAsOneGraph(unittest.TestCase):
                     torch.testing.assert_close(
                         model(latents, text, timestep), expected, rtol=0, atol=0
                     )
+
+
+class _DoubledAttention:
+    def forward(self, q, k, v, attn_metadata):
+        return q * 2
+
+
+class TestReplicatedSuffixTracesOneGraph(unittest.TestCase):
+    """Z-Image's caption rows are a replicated suffix of every attention in
+    its spmd-safe regions: each Ulysses rank must trace the same program."""
+
+    def setUp(self):
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+
+    def test_every_ulysses_rank_traces_the_same_graph(self):
+        world_size, num_rep = 2, 3
+
+        # Rank-free stand-ins for the head all-to-alls of [B, S, H, D] rows.
+        def input_all_to_all(x, head_dim):
+            return x[:, :, : x.shape[2] // world_size].repeat(1, world_size, 1, 1)
+
+        def output_all_to_all(x, head_dim):
+            return x[:, : x.shape[1] // world_size].repeat(1, 1, world_size, 1)
+
+        def all_gather(outputs, tensor, group=None):
+            for output in outputs:
+                output.copy_(tensor)
+
+        attention = attention_layer.USPAttention.__new__(attention_layer.USPAttention)
+        nn.Module.__init__(attention)  # without the backend setup
+        attention.attn_impl = _DoubledAttention()
+        q = torch.randn(1, 4 + num_rep, 4, 8)
+        graphs = []
+        for rank in range(world_size):
+            codes = []
+
+            def record(gm, example_inputs):
+                codes.append(gm.code)
+                return gm.forward
+
+            with (
+                patch.multiple(
+                    attention_layer,
+                    get_ulysses_parallel_rank=lambda: rank,
+                    get_ulysses_parallel_world_size=lambda: world_size,
+                    get_ring_parallel_world_size=lambda: 1,
+                    get_sp_group=lambda: SimpleNamespace(ulysses_group=None),
+                    _usp_input_all_to_all=input_all_to_all,
+                    _usp_output_all_to_all=output_all_to_all,
+                ),
+                patch.object(torch.distributed, "all_gather", all_gather),
+            ):
+                torch._dynamo.reset()
+                suffix = torch.compile(
+                    attention._forward_with_replicated_suffix, backend=record
+                )
+                suffix(q, q, q, None, num_rep)
+            graphs.append(codes)
+        self.assertTrue(graphs[0])
+        self.assertEqual(graphs[1], graphs[0])
 
 
 class TestDrainAfterRequest(unittest.TestCase):

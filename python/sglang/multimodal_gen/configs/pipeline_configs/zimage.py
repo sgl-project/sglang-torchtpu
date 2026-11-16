@@ -302,7 +302,7 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     def latent_shard_group(self, batch):
         # shard_latents_for_sp splits the latents into disjoint native slices,
         # and the transformer returns each rank's slice without padding.
-        if getattr(batch, "did_sp_shard_latents", False) and get_sp_world_size() > 1:
+        if batch.did_sp_shard_latents and get_sp_world_size() > 1:
             return get_sp_group()
         return None
 
