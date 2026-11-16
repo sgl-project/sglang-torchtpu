@@ -45,6 +45,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     is_qwen3_5_mtp_draft,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -855,17 +856,27 @@ def maybe_add_mtp_safetensors(
 
 
 def prepare_mtp_safetensors(
-    hf_weights_files: List[str], hf_folder: str, index_file: str, hf_config
+    hf_weights_files: List[str],
+    hf_folder: str,
+    index_file: str,
+    hf_config,
+    *,
+    allow_shard_filter: bool = True,
 ) -> List[str]:
-    """Resolve NextN shards before payload reads or startup prefetching.
+    """Optionally resolve NextN shards before reads or startup prefetching.
 
     These loaders consume model.layers.<N> and share embedding/head with the
     target. The index selects whole original shards, including any target
-    tensors co-located with MTP. Unknown layouts keep the complete file list.
+    tensors co-located with MTP. SGLANG_ENABLE_MTP_SHARD_FILTER opts in only
+    for audited, complete indexes; it is disabled by default. A partial index
+    can omit MTP tensors in a target shard.
+    Unknown layouts keep the complete file list even when opted in.
     """
     files = maybe_add_mtp_safetensors(
         hf_weights_files, hf_folder, index_file, hf_config
     )
+    if not allow_shard_filter or not envs.SGLANG_ENABLE_MTP_SHARD_FILTER.get():
+        return files
     architectures = getattr(hf_config, "architectures", None) or []
     config = getattr(hf_config, "text_config", hf_config)
     if not architectures or architectures[0] not in (

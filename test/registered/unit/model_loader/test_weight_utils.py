@@ -16,6 +16,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
@@ -250,10 +251,13 @@ class TestNextNShardSelection(CustomTestCase):
             model_config = SimpleNamespace(
                 model_path=folder, revision=None, hf_config=config
             )
-            with get_context().override_server_args(
-                device="cpu",
-                weight_loader_disable_mmap=True,
-                weight_loader_prefetch_checkpoints=False,
+            with (
+                envs.SGLANG_ENABLE_MTP_SHARD_FILTER.override(True),
+                get_context().override_server_args(
+                    device="cpu",
+                    weight_loader_disable_mmap=True,
+                    weight_loader_prefetch_checkpoints=False,
+                ),
             ):
                 for multithread in (False, True):
                     loader = DefaultModelLoader(
@@ -289,10 +293,24 @@ class TestNextNShardSelection(CustomTestCase):
                                     ),
                                     name,
                                 )
+                model = torch.nn.Module()
+                model.secondary_weights = (
+                    DefaultModelLoader.Source(
+                        model_or_path=folder,
+                        revision=None,
+                        prefix="aux.",
+                        model_config=model_config,
+                    ),
+                )
+                sources = loader.resolve_model_weights(model_config, model)
+                self.assertEqual(set(sources[1].weight_files), {target, mtp, mixed})
 
     def test_layout_guards_and_unindexed_sidecars(self):
         """Targets/unknown layouts retain all files; draft sidecars survive filtering."""
-        with tempfile.TemporaryDirectory() as folder:
+        with (
+            envs.SGLANG_ENABLE_MTP_SHARD_FILTER.override(True),
+            tempfile.TemporaryDirectory() as folder,
+        ):
             target = _touch(folder, "target.safetensors")
             draft = _touch(folder, "draft.safetensors")
             sidecar = _touch(folder, "mtp.safetensors")
@@ -341,6 +359,91 @@ class TestNextNShardSelection(CustomTestCase):
             self.assertEqual(
                 prepare_mtp_safetensors(files, folder, INDEX_NAME, config), files
             )
+
+    def test_disabled_filter_preserves_partial_index_weights(self):
+        """Default/disabled filtering must not hide an unindexed MTP tensor."""
+        with (
+            envs.SGLANG_ENABLE_MTP_SHARD_FILTER.override(False),
+            tempfile.TemporaryDirectory() as folder,
+        ):
+            target = os.path.join(folder, "target.safetensors")
+            draft = os.path.join(folder, "draft.safetensors")
+            hidden_norm = "model.layers.78.hnorm.weight"
+            tensors = {
+                "model.layers.0.weight": torch.ones(2),
+                hidden_norm: torch.ones(2),
+            }
+            safetensors.torch.save_file(tensors, target)
+            safetensors.torch.save_file(
+                {"model.layers.78.eh_proj.weight": torch.ones(2)}, draft
+            )
+            # File discovery still finds both shards, but this incomplete tensor
+            # index hides a draft norm in the apparently target-only shard.
+            _write_index(
+                folder,
+                {
+                    "model.layers.0.weight": "target.safetensors",
+                    "model.layers.78.eh_proj.weight": "draft.safetensors",
+                },
+            )
+            for arch in (
+                "GlmMoeDsaForCausalLMNextN",
+                "DeepseekV3ForCausalLMNextN",
+                "Glm4MoeForCausalLMNextN",
+                "Glm4MoeLiteForCausalLMNextN",
+            ):
+                config = SimpleNamespace(
+                    architectures=[arch],
+                    num_hidden_layers=78,
+                    num_nextn_predict_layers=1,
+                )
+                for quant in (
+                    None,
+                    {"quant_method": "fp8", "weight_block_size": [128, 128]},
+                    {"quant_method": "quark"},
+                ):
+                    config.quantization_config = quant
+                    self.assertEqual(
+                        prepare_mtp_safetensors(
+                            [target, draft], folder, INDEX_NAME, config
+                        ),
+                        [target, draft],
+                    )
+            model_config = SimpleNamespace(
+                model_path=folder,
+                revision=None,
+                hf_config=SimpleNamespace(
+                    architectures=["GlmMoeDsaForCausalLMNextN"],
+                    num_hidden_layers=78,
+                    num_nextn_predict_layers=1,
+                ),
+            )
+            with get_context().override_server_args(
+                device="cpu",
+                weight_loader_disable_mmap=True,
+                weight_loader_prefetch_checkpoints=False,
+            ):
+                loader = DefaultModelLoader(
+                    LoadConfig(
+                        load_format="safetensors",
+                        model_loader_extra_config={"enable_multithread_load": False},
+                    )
+                )
+                source = DefaultModelLoader.Source.init_new(
+                    model_config, torch.nn.Module()
+                )
+                resolved = loader.resolve_model_weights(
+                    model_config, torch.nn.Module()
+                )[0]
+                self.assertEqual(set(resolved.weight_files), {target, draft})
+                for resolution in (None, resolved):
+                    loaded = dict(
+                        loader._get_weights_iterator(source, resolved_source=resolution)
+                    )
+                    self.assertIn(hidden_norm, loaded)
+                    self.assertTrue(
+                        torch.equal(loaded[hidden_norm], tensors[hidden_norm])
+                    )
 
 
 if __name__ == "__main__":
