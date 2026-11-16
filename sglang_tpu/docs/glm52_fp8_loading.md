@@ -157,6 +157,17 @@ block-FP8 values with the same K extent and quantization rule.
 | Full target-only GLM serving | Historical experiments below | Current-head MTP serving or the requested long-context baselines |
 | Current-head GLM + NEXTN 5/6 | **Pending E2E smoke** | Do not claim serving support from component tests |
 
+At code revision `ae2a34f0c6a15a04eb8953f212d6700318b74566`, Falcon
+`exp-nf2lihmlu8` succeeded: 12 CPU loader tests plus the revised TPU component
+test passed (13 tests, 26 subtests). This covers exact block/offline FP8-byte and
+scale parity, eager/compiled execution, equal outputs across the two sources,
+and the FP32 sanity oracle. It does not run a full GLM model or MTP server.
+The actual test process recorded the source revision, absolute interpreter,
+imports, compiler settings and source-declared TPU stack versions. The first
+attempt used an oversized random fixture and failed only the FP32 oracle;
+the passing revision restores the original smoke's weight range with unchanged
+tolerances, loaders and kernels.
+
 `test_fp8_channelwise_loading.py` belongs to `stage-a-test-tpu-unit`. Such unit
 registrations are intentionally excluded from model serving rows by
 `scripts/ci/tpu/support_matrix.py`. Adding the `glm-5.2` vocabulary entry does
