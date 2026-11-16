@@ -302,12 +302,11 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   `ernie_image.py` (ERNIE-Image prompt rows padded to 512 with the real key
   counts on device, resumable attention over real keys, host-built RoPE, Ulysses
   over the DiT's own stream, prompt tokens padded to 256, spmd-safe blocks),
-  `minimax_h3.py` (MiniMax-H3 packed sequences padded to a multiple of 512 rows,
-  only the 50 DiT blocks compiled, the breakable-CUDA-graph break point skipped,
-  regionally compiled blocks marked spmd-safe) and `ministral3.py`
-  (ERNIE-Image's prompt enhancer decodes with a static KV cache in two compiled
-  shapes and draws on the host from the top 64 logits, seeded per request; the
-  text encoder's causal and padding mask is built on the host); worker init also
+  `minimax_h3.py` (MiniMax-H3 packed sequences padded to a multiple of 512
+  rows, only the 50 DiT blocks compiled, the breakable-CUDA-graph break point
+  skipped, regionally compiled blocks marked spmd-safe) and `ministral3.py`
+  (ERNIE-Image's prompt enhancer decoded on rank 0 with a static KV cache; the
+  text encoder's padding mask built on the host); worker init also
   registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
   `logaddexp`).
 
