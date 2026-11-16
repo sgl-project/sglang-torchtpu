@@ -47,8 +47,8 @@ from sglang_tpu.models.deepseek_v41.kernels.csa2.pipeline import (
     csa2_pipeline,
 )
 from sglang_tpu.models.deepseek_v41.kernels.paged_swa import write_swa_pages
+from sglang_tpu.models.deepseek_v41.memory_pool import SWA_PAGE_TOKENS as SWA_PAGE_SIZE
 
-SWA_PAGE_SIZE = 64
 SWA_WINDOW = 128
 HEAD_DIM = 512
 ROPE_DIM = 64

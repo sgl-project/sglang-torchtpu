@@ -37,21 +37,21 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang_tpu.compilation.compiled_forward_shim import _REAL_B_KEY
+
+# The pool owns the page layout the kernels read; the backend only indexes it.
+from sglang_tpu.models.deepseek_v41.memory_pool import (
+    FULL_PAGE_TOKENS,
+    LOW_RATIOS,
+    PAGE_RECORDS,
+    SWA_PAGE_TOKENS,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-FULL_PAGE_TOKENS = 256
-SWA_PAGE_TOKENS = 64
-INDEX_PAGE_RECORDS = 128
-# CSA2's fast main-record path reads exactly 512 selected ids per query.
-SELECTION_WIDTH = 512
-LOW_RATIOS = (1, 2)
-# compiled_forward_shim sets this on bucket-padded batches.
-_REAL_B_KEY = "_tpu_real_b"
 
 
 # =============================================================================
@@ -242,7 +242,7 @@ def _low_ratio_metadata(
             full_pages.to(torch.int32),
             full_page_size=FULL_PAGE_TOKENS,
             compress_ratio=ratio,
-            index_page_size=INDEX_PAGE_RECORDS,
+            index_page_size=PAGE_RECORDS,
         ).to(torch.int32),
     )
 
@@ -383,6 +383,13 @@ class DSV41TPUAttnBackend(AttentionBackend):
         # layer_id -> fp32 [cos | sin] table; forward only sees the RadixAttention.
         self.rope_tables: Dict[int, torch.Tensor] = {}
         self.csa2_ops, self.indexer_ops = self._register_ops()
+        # CSA2's fast main-record path reads exactly this many selected ids.
+        self.selection_width = self.csa2_ops.MAX_SELECTED
+        if self.index_topk > self.selection_width:
+            raise ValueError(
+                f"CSA2 attends at most {self.selection_width} compressed records, "
+                f"got index_topk={self.index_topk}"
+            )
         self._prewarm_model_caches()
         self._drop_text_only_image_mask(model_runner)
 
@@ -698,9 +705,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
             )
         if publish:
             metadata.candidates = blocks
-        if selected.shape[1] < SELECTION_WIDTH:
+        if selected.shape[1] < self.selection_width:
             selected = F.pad(
-                selected, (0, SELECTION_WIDTH - selected.shape[1]), value=-1
+                selected, (0, self.selection_width - selected.shape[1]), value=-1
             )
         metadata.selected[ratio] = selected
 
