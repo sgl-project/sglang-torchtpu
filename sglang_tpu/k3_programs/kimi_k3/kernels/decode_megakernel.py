@@ -1144,11 +1144,25 @@ def _run_routed_expert_stream(
         ]
 
     reuse_row_plan = stage_blocks and batch_size in (32, 48, 64, 80, 96, 128)
+    # KernelConfig.b16_one_hot_staging: B16 stages compact rows with a one-hot
+    # product. It reads every source row, and 0 x inf is NaN, so the rows
+    # without local routes (null serving slots among them) are zeroed first;
+    # no expert stages them.
+    one_hot_rows = (
+        B16_ONE_HOT_STAGING
+        and stage_blocks
+        and batch_size == 16
+        and compact_capacity > 1
+    )
+    if one_hot_rows:
+        source[:, :expert_input_size] = jnp.where(
+            (local_route_counts > 0)[:, None], source[:, :expert_input_size], 0
+        )
 
     def compact_row_positions(active_rows):
         # Counts and row indices are < 128, hence exact in FP32. This avoids
         # the split reductions used for unrestricted int32.
-        count_dtype = jnp.float32 if reuse_row_plan else jnp.int32
+        count_dtype = jnp.float32 if reuse_row_plan or one_hot_rows else jnp.int32
         index = jnp.arange(batch_size)
         return jnp.sum(
             jnp.where(
@@ -1159,14 +1173,18 @@ def _run_routed_expert_stream(
             axis=1,
         ).astype(jnp.int32)
 
-    def compact_row_plan(active_rows, offset=0, before=None):
+    def compact_row_selection(active_rows, offset=0, before=None):
+        """[C, batch]: whether compact row c holds batch row b."""
         if before is None:
             before = compact_row_positions(active_rows)
-        # One ordered index list serves both input staging and output
-        # selection. Invalid trailing entries must not select source row 0.
-        selected = active_rows[None, :] & (
+        return active_rows[None, :] & (
             before[None, :] == offset + jnp.arange(compact_capacity)[:, None]
         )
+
+    def compact_row_plan(active_rows, offset=0, before=None):
+        # One ordered index list serves both input staging and output
+        # selection. Invalid trailing entries must not select source row 0.
+        selected = compact_row_selection(active_rows, offset, before)
         indices = jnp.sum(
             jnp.where(
                 selected, jnp.arange(batch_size).astype(jnp.float32)[None, :], 0.0
@@ -1245,6 +1263,12 @@ def _run_routed_expert_stream(
             if row_plan is None:
                 row_plan = compact_row_plan(active_rows, offset)
             stage_planned_rows(row_plan, destination)
+            return
+        if one_hot_rows:
+            # The selection itself is the one-hot (exact: one BF16 term per
+            # entry; zero rows past the active ones).
+            one_hot = compact_row_selection(active_rows, offset).astype(jnp.bfloat16)
+            destination[...] = _dot(one_hot, source[:, :expert_input_size])
             return
         destination[...] = jnp.zeros(destination.shape, destination.dtype)
         if stage_blocks and batch_size == 16:
@@ -6777,6 +6801,9 @@ MXFP4_STATIC_TILE = _config().mxfp4_static_tile
 B16_COMPACT_EXPERTS = (
     _config().b16_compact_experts and _config().expert_gate_up == "mxfp4"
 )
+# KernelConfig.b16_one_hot_staging: B16 stages the compact tiles' rows with a
+# one-hot product, as B64, B96 and B128 do.
+B16_ONE_HOT_STAGING = _config().b16_one_hot_staging
 
 
 def _compact_rows(batch_size):
