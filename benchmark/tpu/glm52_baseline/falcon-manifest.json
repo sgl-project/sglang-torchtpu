@@ -1,0 +1,91 @@
+{
+  "name": "glm52-native-mtp-baseline-8chip",
+  "exp_type": "TRAINING",
+  "cluster_name": "gke-tpu-train-us-central1-1-prod",
+  "artifact_type": "GCS",
+  "tags": null,
+  "config": "{\"scope\": \"native MTP smoke and C16 cache-hit prefill / C64 90K decode baseline\", \"reference_experiments\": [\"exp-k0nnadpb6q\", \"exp-r188nvdf96\"]}",
+  "role_to_task_spec": {
+    "worker": {
+      "shared_memory_size": "256Gi",
+      "command": "exec bash /workspace/sglang-torchtpu/benchmark/tpu/glm52_baseline/allocation_runner.sh",
+      "replica": 2,
+      "image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
+      "device_count": 8,
+      "device_type": "v7x",
+      "device_topo": "2x2x2",
+      "envs": {
+        "SOURCE_COMMIT": "d8f342b878e566edce8ade0ebba3ae31e783c867",
+        "PYTHONUNBUFFERED": "1",
+        "TPU_TOPOLOGY": "2x2x2",
+        "GLM52_COMPILE_CACHE_ROOT": "/glm52-prior-compile-cache"
+      },
+      "mounts": [
+        {
+          "name": "torch-tpu-wheel",
+          "type": "gcs",
+          "bucket": "tpu-for-training-falcon-logs",
+          "prefix": "experiments/exp-h8vu1379oa/artifacts/art-6jnw46ypty/wheels/cp312-linux-x86_64",
+          "mount_path": "/wheels/torch-tpu",
+          "read_only": true,
+          "mount_options": [
+            "implicit-dirs"
+          ]
+        },
+        {
+          "name": "prepared",
+          "type": "gcs",
+          "bucket": "tpu-for-training-falcon-logs",
+          "prefix": "experiments/exp-8tku39alke/artifacts/art-hakzf5m8u1/glm53-prepared",
+          "mount_path": "/prepared",
+          "read_only": true,
+          "mount_options": [
+            "implicit-dirs"
+          ]
+        },
+        {
+          "name": "glm52-channelwise-model",
+          "type": "gcs",
+          "bucket": "inference-model-storage-poc-tpu-hns",
+          "prefix": "GLM5.2-fp8-channel-wise",
+          "mount_path": "/models/GLM5.2-fp8-channel-wise",
+          "read_only": true,
+          "mount_options": [
+            "implicit-dirs",
+            "metadata-cache:ttl-secs:-1",
+            "metadata-cache:stat-cache-max-size-mb:-1",
+            "metadata-cache:type-cache-max-size-mb:-1",
+            "file-system:kernel-list-cache-ttl-secs:-1",
+            "read:enable-buffered-read:true",
+            "read:block-size-mb:32",
+            "read:max-blocks-per-handle:64",
+            "read:global-max-blocks:2048",
+            "read_ahead_kb=1024"
+          ]
+        },
+        {
+          "name": "glm52-compile-cache",
+          "type": "gcs",
+          "bucket": "tpu-for-training-falcon-logs",
+          "prefix": "experiments/exp-jjzf5biomm/artifacts/art-tuqtvn2txw/glm52-e2e/compile-cache",
+          "mount_path": "/glm52-prior-compile-cache",
+          "read_only": false,
+          "mount_options": [
+            "implicit-dirs"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "name": "sglang-torchtpu",
+          "type": "git",
+          "repo": "https://github.com/sgl-project/sglang-torchtpu.git",
+          "ref": "codex/glm52-e2e-baseline-20261116",
+          "commit": "d8f342b878e566edce8ade0ebba3ae31e783c867",
+          "path": "/workspace/sglang-torchtpu"
+        }
+      ]
+    }
+  },
+  "model_version": "d8f342b878e566edce8ade0ebba3ae31e783c867"
+}
