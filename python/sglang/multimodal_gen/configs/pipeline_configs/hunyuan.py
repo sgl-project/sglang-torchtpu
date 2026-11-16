@@ -68,7 +68,8 @@ def llama_postprocess_text(
         attention_mask = attention_mask[
             :, crop_start : crop_start + last_hidden_state.shape[1]
         ]
-    seq_lens = [int(x) for x in attention_mask.to(torch.int64).sum(dim=1).tolist()]
+    # Counted on the host: an int64 reduction on the device is not portable.
+    seq_lens = [int(x) for x in attention_mask.cpu().sum(dim=1).tolist()]
     return TextConditioningOutput(last_hidden_state, attention_mask, seq_lens)
 
 
