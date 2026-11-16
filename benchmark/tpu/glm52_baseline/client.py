@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import statistics
 import time
 import uuid
@@ -98,12 +99,22 @@ def load_tokenizer(tokenizer_path):
     return AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
 
-def freeze_inputs(tokenizer_path, source, out, decode_prefix_mode):
+def freeze_inputs(tokenizer_path, source, out, decode_prefix_mode, frozen=None):
     import numpy as np
 
     tokenizer = load_tokenizer(tokenizer_path)
     decode_prefix_count = 1 if decode_prefix_mode == "shared" else 64
     need = 16 * (49152 + 4 * 4096) + decode_prefix_count * 89984 + 64 * 4 * 16
+    if frozen is not None:
+        frozen = Path(frozen)
+        manifest = json.loads((frozen / "input-manifest.json").read_text())
+        arr = np.load(frozen / "natural-code.npy", allow_pickle=False)
+        assert arr.dtype == np.int32 and arr.shape == (need,), (arr.dtype, arr.shape, need)
+        assert manifest["token_count"] == need
+        assert hashlib.sha256(arr.tobytes()).hexdigest() == manifest["token_ids_sha256"]
+        np.save(out / "natural-code.npy", arr)
+        save(out / "input-manifest.json", dict(manifest, reused_from=str(frozen)))
+        return tokenizer, arr.tolist()
     ids, files = [], []
     for path in sorted((source / "python/sglang").rglob("*.py")):
         raw = path.read_bytes()
@@ -405,7 +416,7 @@ async def main(a):
             ),
         )
         _, ids = await asyncio.to_thread(
-            freeze_inputs, a.model, a.source, a.output, decode_mode
+            freeze_inputs, a.model, a.source, a.output, decode_mode, a.frozen_inputs
         )
         all_summaries = []
         for scenario in ("prefill", "decode"):
@@ -504,6 +515,7 @@ def parse_args(argv=None):
     p.add_argument("--base-url", default="http://127.0.0.1:30000")
     p.add_argument("--model", default="/models/GLM5.2-fp8-channel-wise")
     p.add_argument("--source", type=Path, default=Path.cwd())
+    p.add_argument("--frozen-inputs", type=Path, default=os.environ.get("GLM52_FROZEN_INPUTS"))
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--smoke-only", action="store_true")
     p.add_argument(
