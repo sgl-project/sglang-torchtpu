@@ -73,6 +73,8 @@ class TestStealLayout(CustomTestCase):
         self.assertTrue(KernelConfig().replace(expert_steal="1").expert_steal)
         with self.assertRaises(ValueError):
             KernelConfig(expert_steal=True, decode_expert_parallel=16)
+        with self.assertRaises(ValueError):  # attention DP keeps the stock layout
+            KernelConfig(expert_steal=True, attention_dp=2)
 
 
 DENSE = (

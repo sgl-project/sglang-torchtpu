@@ -180,6 +180,8 @@ class KernelConfig:
             raise ValueError("decode_expert_parallel is 8 or 16")
         if self.expert_steal and self.decode_expert_parallel != 8:
             raise ValueError("expert_steal needs decode_expert_parallel=8")
+        if self.expert_steal and self.attention_dp != 1:
+            raise ValueError("expert_steal needs attention_dp=1")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
             raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):
