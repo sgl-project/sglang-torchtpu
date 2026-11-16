@@ -69,8 +69,9 @@ def build_benchmark_step(**kwargs):
     capacity_pages = 92160 // fixture["_PAGE_SIZE"]
     if table.shape[1] < capacity_pages:
         table = np.pad(table, ((0, 0), (0, capacity_pages - table.shape[1])))
-    step.page_indices = table[:, :capacity_pages].reshape(-1)
-    return step
+    return fixture["msgspec"].structs.replace(
+        step, page_indices=table[:, :capacity_pages].reshape(-1)
+    )
 
 
 def main():
