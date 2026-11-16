@@ -279,18 +279,18 @@ def _fused_ep_moe_kernel(
     w3_scale_hbm,  # None | (local_num_experts, H // quant_block_k, 1, I)
     topk_weights_hbm,  # (local_num_tokens, top_k)
     topk_ids_hbm,  # (local_num_tokens, top_k)
-    a2a_s_x2_hbm,  # (expert_buffer_count, ...) or (2, expert_buffer_count, ...)
-    a2a_s_acc_x2_hbm,  # (expert_buffer_count, ...) or (2, expert_buffer_count, ...)
-    a2a_g_hbm,  # (num_experts, bt, t_packing, h_per_t)
-    tokens_fp8_hbm,  # None | (local_num_tokens, t_packing, h_per_t) fp8
     w1_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w3_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w2_shared_hbm,  # None | (se_intermediate_size, hidden_size)
     w1_shared_scale_hbm,  # None | (1, se_intermediate_size) fp32 per-channel
     w3_shared_scale_hbm,  # None | (1, se_intermediate_size) fp32 per-channel
     w2_shared_scale_hbm,  # None | (1, hidden_size) fp32 per-channel
-    # --- HBM output ---
+    # --- HBM outputs: XLA owns each mutable workspace independently. ---
     output_hbm,  # (local_num_tokens, hidden_size)
+    a2a_s_x2_hbm,  # (expert_buffer_count, ...) or (2, expert_buffer_count, ...)
+    a2a_s_acc_x2_hbm,  # (expert_buffer_count, ...) or (2, expert_buffer_count, ...)
+    a2a_g_hbm,  # (num_experts, bt, t_packing, h_per_t)
+    tokens_fp8_hbm,  # None | (local_num_tokens, t_packing, h_per_t) fp8
     # --- SMEM scratch ---
     t2e_routing_x2_smem,  # (2, bt, padded_top_k)
     d2e_count_x2_smem,  # (2, num_devices, 1, padded_num_experts)
@@ -2837,6 +2837,19 @@ def fused_ep_moe_v2(
         ),  # scatter_local_prefix
     )
 
+    # Mutable HBM workspaces are custom-call outputs. Passing pl.empty arrays
+    # as inputs does not declare their writes. Outputs let XLA account for
+    # mutable lifetimes and keep simultaneously live workspaces distinct.
+    a2a_s_shape = (expert_buffer_count, a2a_max_tokens, t_packing, h_per_t)
+    if use_bt_banking:
+        a2a_s_shape = (num_bt_banks,) + a2a_s_shape
+    a2a_s_acc_shape = (expert_buffer_count, a2a_max_tokens, out_packing, h_per_out)
+    if use_bt_banking:
+        a2a_s_acc_shape = (num_bt_banks,) + a2a_s_acc_shape
+    a2a_g_shape = (num_experts, bt, out_packing, h_per_out)
+    if use_gather_bank:
+        a2a_g_shape = (num_bt_banks,) + a2a_g_shape
+
     fused_moe = jax.named_scope(scope_name)(
         pl.pallas_call(
             functools.partial(
@@ -2859,7 +2872,16 @@ def fused_ep_moe_v2(
                 bse=bse,
                 quant_block_k=quant_block_k,
             ),
-            out_shape=jax.ShapeDtypeStruct((local_num_tokens, hidden_size), out_dtype),
+            out_shape=(
+                jax.ShapeDtypeStruct((local_num_tokens, hidden_size), out_dtype),
+                jax.ShapeDtypeStruct(a2a_s_shape, t_dtype),
+                jax.ShapeDtypeStruct(a2a_s_acc_shape, out_dtype),
+                jax.ShapeDtypeStruct(a2a_g_shape, out_dtype),
+                (
+                    jax.ShapeDtypeStruct((local_num_tokens, t_packing, h_per_t), t_dtype)
+                    if enable_act_quant else None
+                ),
+            ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 in_specs=[
@@ -2872,10 +2894,6 @@ def fused_ep_moe_v2(
                     None if w3_scale is None else hbm_spec,  # w3_scale
                     hbm_spec,  # topk_weights
                     hbm_spec,  # topk_ids
-                    hbm_spec,  # a2a_s
-                    hbm_spec,  # a2a_s_acc
-                    hbm_spec,  # a2a_g
-                    None if not enable_act_quant else hbm_spec,  # tokens_fp8
                     None if w1_shared is None else hbm_spec,  # w1_shared
                     None if w3_shared is None else hbm_spec,  # w3_shared
                     None if w2_shared is None else hbm_spec,  # w2_shared
@@ -2883,7 +2901,10 @@ def fused_ep_moe_v2(
                     None if w3_shared_scale is None else hbm_spec,  # w3_shared_scale
                     None if w2_shared_scale is None else hbm_spec,  # w2_shared_scale
                 ],
-                out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                out_specs=(
+                    hbm_spec, hbm_spec, hbm_spec, hbm_spec,
+                    hbm_spec if enable_act_quant else None,
+                ),
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
@@ -2909,10 +2930,6 @@ def fused_ep_moe_v2(
             None if w3_scale is None else P((dp_axis_name, tp_axis_name)),  # w3_scale
             P((dp_axis_name, tp_axis_name)),  # topk_weights
             P((dp_axis_name, tp_axis_name)),  # topk_ids
-            P(),  # a2a_s
-            P(),  # a2a_s_acc
-            P(),  # a2a_g
-            None if not enable_act_quant else P(),  # tokens_fp8
             None if w1_shared is None else P(),  # w1_shared
             None if w3_shared is None else P(),  # w3_shared
             None if w2_shared is None else P(),  # w2_shared
@@ -2933,10 +2950,6 @@ def fused_ep_moe_v2(
         w3_scale_arg,
         topk_weights,
         topk_ids,
-        a2a_s_hbm_scratch,
-        a2a_s_acc_hbm_scratch,
-        a2a_g_hbm_scratch,
-        tokens_fp8_hbm_scratch=None,
         w1_shared=None,
         w3_shared=None,
         w2_shared=None,
@@ -2976,14 +2989,6 @@ def fused_ep_moe_v2(
             ),
             pltpu.with_memory_space_constraint(topk_weights, pltpu.HBM),
             pltpu.with_memory_space_constraint(topk_ids, pltpu.HBM),
-            pltpu.with_memory_space_constraint(a2a_s_hbm_scratch, pltpu.HBM),
-            pltpu.with_memory_space_constraint(a2a_s_acc_hbm_scratch, pltpu.HBM),
-            pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),
-            (
-                None
-                if tokens_fp8_hbm_scratch is None
-                else pltpu.with_memory_space_constraint(tokens_fp8_hbm_scratch, pltpu.HBM)
-            ),
             (
                 None
                 if w1_shared is None
@@ -3015,25 +3020,12 @@ def fused_ep_moe_v2(
                 else pltpu.with_memory_space_constraint(w2_shared_scale, pltpu.HBM)
             ),
         )
+        # The other call outputs are invocation-local communication workspaces.
+        # They must be outputs, even though only completed rows leave this function.
+        out = out[0]
         if pad_local > 0:
             out = out[:orig_local_num_tokens]
         return out
-
-    a2a_s_shape = (expert_buffer_count, a2a_max_tokens, t_packing, h_per_t)
-    if use_bt_banking:
-        a2a_s_shape = (num_bt_banks,) + a2a_s_shape
-    a2a_s_hbm_scratch = pl.empty(a2a_s_shape, t_dtype)
-    a2a_s_acc_shape = (expert_buffer_count, a2a_max_tokens, out_packing, h_per_out)
-    if use_bt_banking:
-        a2a_s_acc_shape = (num_bt_banks,) + a2a_s_acc_shape
-    a2a_s_acc_hbm_scratch = pl.empty(a2a_s_acc_shape, out_dtype)
-    a2a_g_shape = (num_experts, bt, out_packing, h_per_out)
-    if use_gather_bank:
-        a2a_g_shape = (num_bt_banks,) + a2a_g_shape
-    a2a_g_hbm_scratch = pl.empty(a2a_g_shape, out_dtype)
-    tokens_fp8_hbm_scratch = (
-        pl.empty((local_num_tokens, t_packing, h_per_t), t_dtype) if enable_act_quant else None
-    )
 
     return kernel(
         tokens,
@@ -3045,10 +3037,6 @@ def fused_ep_moe_v2(
         w3_scale,
         topk_weights,
         topk_ids,
-        a2a_s_hbm_scratch,
-        a2a_s_acc_hbm_scratch,
-        a2a_g_hbm_scratch,
-        tokens_fp8_hbm_scratch,
         w1_shared,
         w3_shared,
         w2_shared,
