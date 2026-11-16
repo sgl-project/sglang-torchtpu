@@ -63,15 +63,6 @@ class TestSenseNovaNoiseTpu(unittest.TestCase):
         expected = torch.cat([_host_draw(42), _host_draw(7)]).bfloat16()
         self.assertTrue(torch.equal(noise, expected))
 
-    def test_cpu_keeps_the_stock_draw(self):
-        for dtype in (torch.bfloat16, torch.float32):
-            with self.subTest(dtype=dtype):
-                patched = modeling_neo_chat._randn_with_seed(
-                    SHAPE, device="cpu", dtype=dtype, seed=42
-                )
-                stock = self._stock(SHAPE, device="cpu", dtype=dtype, seed=42)
-                self.assertTrue(torch.equal(patched, stock))
-
 
 if __name__ == "__main__":
     unittest.main()

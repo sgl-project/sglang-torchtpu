@@ -1,10 +1,10 @@
 # Diffusion recipes on Cloud TPU (`torch_tpu`)
 
 Launch recipes for `sglang.multimodal_gen` on one tpu7x 2x2x1 host (8 TensorCores, `--num-gpus` counts cores).
-All recipes run at the highest TPU clock with a 65536 KiB scoped-VMEM limit for XLA fusions (`LIBTPU_INIT_ARGS`),
-the full 64 MiB of per-core VMEM on tpu7x (3% faster denoise on Z-Image-Turbo than without it). The recipes built on
-`launch.sh` also use the Pallas splash attention backend, torch.compile with the `tpu` backend and a TP-folded resident
-text encoder; `sensenova_u1.sh` runs the SenseNova-U1.5 pipeline eagerly on one core with its own attention. The Wan
+All recipes run at the highest TPU clock with a 65536 KiB scoped-VMEM limit for XLA fusions (`LIBTPU_INIT_ARGS`), the
+full 64 MiB of per-core VMEM on tpu7x (3% faster denoise on Z-Image-Turbo than without it); see `launch.sh`. All but
+`sensenova_u1.sh` also use the Pallas splash attention backend, torch.compile with the `tpu` backend and a TP-folded
+resident text encoder (`SERVER_ARGS`); SenseNova-U1.5 runs eagerly on one core with its own attention. The Wan
 recipes compile per transformer block (`--regional-compile`), which keeps each block's collectives inside its program,
 and run Ulysses across the two cores of a chip with a K/V all-gather ring across chips.
 
@@ -17,10 +17,10 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
 | `sensenova_u1.sh` | `sensenova/SenseNova-U1.5-8B-MoT` | 1 | none |
 
-Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
-(an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags; `sensenova_u1.sh` takes `MODEL`, `HOST` and `PORT`).
-Flags in `LIBTPU_INIT_ARGS` are kept; the clock and scoped-VMEM defaults are benchmark settings, added unless it sets
-them. Extra arguments are passed to the server, e.g. `./ltx2.sh --warmup-resolutions 1280x720`.
+Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `SERVER_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the
+environment (an empty value drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
+scoped-VMEM defaults are benchmark settings, added unless it sets them. Extra arguments are passed to the server,
+e.g. `./ltx2.sh --warmup-resolutions 1280x720`.
 
 ## Performance
 

@@ -29,7 +29,6 @@ def install() -> None:
     )
 
     stock = modeling_neo_chat._randn_with_seed
-    stock = getattr(stock, "__wrapped__", stock)
 
     @functools.wraps(stock)
     def _randn_with_seed(shape, *, device, dtype, seed):
