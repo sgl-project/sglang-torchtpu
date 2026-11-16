@@ -117,6 +117,10 @@ class KernelConfig:
     # o_proj whole in VMEM at up to 8 rows and down_proj at up to 16 (attention
     # DP1) instead of streaming them one 896-column chunk at a time.
     draft_whole_weights: bool = False
+    # Decode MoE router (weight arena, unsharded top-k): every rank copies and
+    # projects both router halves, its own and its pair peer's (14 MiB of
+    # arena instead of 7), instead of exchanging score halves with the peer.
+    decode_router_both_halves: bool = False
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.

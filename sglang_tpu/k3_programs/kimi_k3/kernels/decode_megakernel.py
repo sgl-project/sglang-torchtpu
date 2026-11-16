@@ -128,6 +128,75 @@ def _gated_activation(gate, value):
     ).astype(jnp.bfloat16)
 
 
+def _project_routing_scores(
+    rank,
+    hidden_states,
+    routing_projection_vmem,
+    routing_scores_vmem,
+    send_semaphore,
+    receive_semaphore,
+    *,
+    after_scores=None,
+    after_score_send=None,
+    wait_for_projection_half=None,
+):
+    """Assemble the raw [batch_size, 1024] router score rows in
+    ``routing_scores_vmem``: the 896 expert scores, then 128 zeros.
+
+    Lane 0 of a rank pair owns scores 0-511 and lane 1 scores 512-895 (its
+    512 router columns end in 128 of padding). A [1, hidden, 512]
+    ``routing_projection_vmem`` holds this rank's half: the rank projects it
+    and the pair exchange their score halves. A [2, hidden, 512] one also
+    holds the pair peer's half (slot 1, in the peer's layout): the rank
+    projects both halves, its own first and each as its owner does, and
+    nothing is exchanged. ``wait_for_projection_half(slot)`` waits for a
+    slot's copy; ``after_score_send`` runs where the exchange would start.
+    """
+    batch_size = hidden_states.shape[0]
+    router_lane = rank % 2
+
+    def project_half(slot, lane):
+        scores = _dot(hidden_states, routing_projection_vmem[slot]).reshape(
+            batch_size, 512
+        )
+        # Lane 1's last 128 router columns are padding; in the shared arena
+        # they hold stale bytes, so zero their scores.
+        column = jax.lax.broadcasted_iota(jnp.int32, scores.shape, 1)
+        scores = jnp.where((lane == 0) | (column < 384), scores, 0.0)
+        score_half = routing_scores_vmem.at[:, pl.ds(lane * 512, 512)]
+        score_half[...] = scores
+        return score_half
+
+    if routing_projection_vmem.shape[0] == 2:
+        # A two-trip loop keeps one copy of the projection's code.
+        @pl.loop(0, 2)
+        def project_both_halves(slot):
+            wait_for_projection_half(slot)
+            project_half(slot, router_lane ^ slot)
+
+        if after_scores is not None:
+            after_scores()  # the router projection is consumed
+        if after_score_send is not None:
+            after_score_send()
+        return
+
+    score_half = project_half(0, router_lane)
+    if after_scores is not None:
+        after_scores()  # the router projection is consumed
+    copy = tpu.make_async_remote_copy(
+        score_half,
+        score_half,
+        send_semaphore,
+        receive_semaphore,
+        device_id=(rank ^ 1,),
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+    copy.start()
+    if after_score_send is not None:
+        after_score_send()
+    copy.wait()
+
+
 def _route_hidden_states(
     hidden_states,
     routing_projection_vmem,
@@ -144,14 +213,15 @@ def _route_hidden_states(
     after_scores=None,
     after_score_send=None,
     live_rows=None,
+    wait_for_projection_half=None,
 ):
     """Project and select local expert routes through one shared B1/B2 path.
 
     ``routing_scores_vmem`` is [batch_size, 1024]. Paired ranks exchange their
-    512-score halves directly in that padded workspace, then every top-k
-    iteration advances all batch rows together. Selected local routes are
-    returned as [batch_size, top_k] values for scalar SMEM materialization by
-    the caller.
+    512-score halves directly in that padded workspace (or each projects both;
+    ``_project_routing_scores``), then every top-k iteration advances all
+    batch rows together. Selected local routes are returned as
+    [batch_size, top_k] values for scalar SMEM materialization by the caller.
     """
     rank = jax.lax.axis_index("tp")
     batch_size = hidden_states.shape[0]
@@ -161,30 +231,17 @@ def _route_hidden_states(
     if routing_scores_vmem.shape[-1] != 1024:
         raise ValueError("Routing score workspace must have padded width 1024")
 
-    router_lane = rank % 2
-    local_scores = _dot(hidden_states, routing_projection_vmem[0]).reshape(
-        batch_size, 512
-    )
-    # Lane 1's last 128 router columns are padding; in the shared arena they
-    # hold stale bytes, so zero their scores.
-    column = jax.lax.broadcasted_iota(jnp.int32, local_scores.shape, 1)
-    local_scores = jnp.where((router_lane == 0) | (column < 384), local_scores, 0.0)
-    score_half = routing_scores_vmem.at[:, pl.ds(router_lane * 512, 512)]
-    score_half[...] = local_scores
-    if after_scores is not None:
-        after_scores()  # the router projection is consumed
-    copy = tpu.make_async_remote_copy(
-        score_half,
-        score_half,
+    _project_routing_scores(
+        rank,
+        hidden_states,
+        routing_projection_vmem,
+        routing_scores_vmem,
         send_semaphore,
         receive_semaphore,
-        device_id=(rank ^ 1,),
-        device_id_type=pl.DeviceIdType.MESH,
+        after_scores=after_scores,
+        after_score_send=after_score_send,
+        wait_for_projection_half=wait_for_projection_half,
     )
-    copy.start()
-    if after_score_send is not None:
-        after_score_send()
-    copy.wait()
 
     raw_scores = routing_scores_vmem[:, :expert_count]
     uncorrected_probabilities = jax.nn.sigmoid(raw_scores)
@@ -2332,7 +2389,9 @@ class MixtureOfExpertsWeights:
     """MoE parameters and persistent resources for asynchronous weight copies."""
 
     routing_projection: TensorLike  # [hidden_size, 896]
-    routing_projection_vmem: Any  # [1, hidden_size, 512]
+    # [1, hidden_size, 512]: this rank's router half; [2, ...]: then its pair
+    # peer's half (_project_routing_scores).
+    routing_projection_vmem: Any
     routing_copy_semaphores: Any  # [2]
     routing_bias: TensorLike  # [1, 896]
     latent_input_projection: TensorLike  # [hidden_size, 128]
@@ -2388,13 +2447,35 @@ class MixtureOfExpertsWeights:
             copy.wait() if wait else copy.start()
 
     def start_routing_projection_copy(self, *, initialize_padding: bool = True) -> None:
+        if self.routing_projection_vmem.shape[0] == 2:
+            _router_copy(
+                self.routing_projection,
+                self.routing_projection_vmem,
+                self.routing_copy_semaphores,
+                False,
+            )
+            return
         self._copy_routing_projection(
             wait=False,
             initialize_padding=initialize_padding,
         )
 
     def wait_for_routing_projection_copy(self) -> None:
+        # Two router slots are waited for one at a time by the projection.
+        assert self.routing_projection_vmem.shape[0] == 1
         self._copy_routing_projection(wait=True)
+
+    def wait_for_routing_projection_half(self, slot) -> None:
+        """Wait for one slot of a two-slot router copy (0: this rank's half)."""
+        lane = jax.lax.axis_index("tp") % 2
+        _router_half_copy(
+            self.routing_projection,
+            self.routing_projection_vmem,
+            self.routing_copy_semaphores,
+            slot,
+            lane ^ slot,
+            wait=True,
+        )
 
     def make_latent_output_copy(self):
         return tpu.make_async_copy(
@@ -2802,8 +2883,13 @@ def moe(
         raise ValueError("MoE output communication workspace has the wrong shape")
     if communication_workspace.latent_gather_vmem.shape != (batch_size, 4096):
         raise ValueError("MoE latent-gather workspace must match the batch size")
-    if weights.routing_projection_vmem.shape != (1, hidden_size, 512):
+    router_slots = weights.routing_projection_vmem.shape[0]
+    if weights.routing_projection_vmem.shape != (router_slots, hidden_size, 512) or (
+        router_slots not in (1, 2)
+    ):
         raise ValueError("MoE routing projection workspace has the wrong shape")
+    if router_slots == 2 and owned_hidden_ref is not None:
+        raise ValueError("Sharded routing projects one router half a rank")
 
     def slot_shape(stored, axis):
         shape = list(stored.shape[1:])
@@ -2985,7 +3071,8 @@ def moe(
         if shared_gate_up_stream is not None:
             shared_gate_up_stream.start()
 
-        weights.wait_for_routing_projection_copy()
+        if router_slots == 1:
+            weights.wait_for_routing_projection_copy()
         shared_route_prefix = jnp.int32(1)
         prefetched_expert_count = jnp.int32(0)
 
@@ -3113,6 +3200,11 @@ def moe(
                         overlap_router_score_exchange if overlap_router_latent else None
                     ),
                     live_rows=live_rows,
+                    wait_for_projection_half=(
+                        weights.wait_for_routing_projection_half
+                        if router_slots == 2
+                        else None
+                    ),
                 )
             )
         if half_experts:
@@ -6276,8 +6368,34 @@ def _gather_latent_host(x, sends, recvs):
         cp.wait()
 
 
+def _router_half_copy(weight, buffer, sems, slot, lane, wait):
+    """Start (or wait for) the copy of pair lane ``lane``'s router half into
+    ``buffer[slot]`` on ``sems[slot]``: lane 0's 512 columns, or lane 1's 384
+    (the slot's last 128 columns keep stale bytes)."""
+
+    @pl.when(lane == 0)
+    def full():
+        copy = tpu.make_async_copy(
+            weight.at[:, pl.ds(0, 512)], buffer.at[slot], sems.at[slot]
+        )
+        copy.wait() if wait else copy.start()
+
+    @pl.when(lane == 1)
+    def tail():
+        copy = tpu.make_async_copy(
+            weight.at[:, pl.ds(512, 384)], buffer.at[slot, :, :384], sems.at[slot]
+        )
+        copy.wait() if wait else copy.start()
+
+
 def _router_copy(weight, buffer, sems, wait, *, initialize_padding=True):
     lane = jax.lax.axis_index("tp") % 2
+    if buffer.shape[0] == 2:
+        # Both halves, this rank's first (decode_router_both_halves); the
+        # projection masks the padding columns.
+        _router_half_copy(weight, buffer, sems, 0, lane, wait)
+        _router_half_copy(weight, buffer, sems, 1, 1 - lane, wait)
+        return
 
     @pl.when(lane < 1)
     def full():
@@ -7168,6 +7286,9 @@ def _moe_scoped_scratch(
 # Shard the MoE router's top-k over the local rank pairs in the four-owner
 # token-scatter layout (KernelConfig.shard_routing=True).
 SHARD_ROUTING = _config().shard_routing
+# Every rank projects both router halves from the weight arena instead of
+# exchanging score halves (KernelConfig.decode_router_both_halves=True).
+ROUTER_BOTH_HALVES = _config().decode_router_both_halves
 
 
 def stack(
@@ -7495,6 +7616,8 @@ def stack(
     pool_managed = POOLED_WEIGHTS and (
         attention_dp == 1 or attention_schedule != "legacy"
     )
+    # Router halves a rank holds in the arena (2: its own and its pair peer's).
+    router_slots = 2 if ROUTER_BOTH_HALVES and pool_managed and not shard_routing else 1
     if blocks_block_major and not sequence_parallel_pre_attention:
         raise ValueError(
             "Above eight rows the decoder needs sequence-parallel pre-attention"
@@ -7822,13 +7945,17 @@ def stack(
         )
 
         def arena_router(offset):
-            return pool.view(offset, (1, hidden_size, 512), jnp.dtype(jnp.bfloat16))
+            return pool.view(
+                offset, (router_slots, hidden_size, 512), jnp.dtype(jnp.bfloat16)
+            )
 
         def request_router(index, predicate=None):
             """Queue layer ``index``'s router copy into the arena."""
             pool.request(
                 "router",
-                pool_alias.storage_size((1, hidden_size, 512), jnp.dtype(jnp.bfloat16)),
+                pool_alias.storage_size(
+                    (router_slots, hidden_size, 512), jnp.dtype(jnp.bfloat16)
+                ),
                 lambda offset, index: _router_copy(
                     layer_weights["router"].at[index - 1],
                     arena_router(offset),
@@ -10607,7 +10734,7 @@ def stack(
         # once the experts finish) fit without waiting for a release.
         # TODO: derive the demand from a dry-run trace of the requests.
         demand = pool_layout["attention_bytes"] + pool_alias.storage_size(
-            (1, hidden_size, 512), jnp.dtype(jnp.bfloat16)
+            (router_slots, hidden_size, 512), jnp.dtype(jnp.bfloat16)
         )
         shortfall = max(0, -(-(demand - pool_layout["arena_bytes"]) // 4096) * 4096)
         available = (
