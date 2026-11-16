@@ -327,6 +327,7 @@ class TestSparseIndexerKvLens(CustomTestCase):
             _index_topk_op=MagicMock(),
             _topk=4,
             _kpool_width=8,
+            raw_ring_pages=0,
             forward_metadata=SimpleNamespace(
                 kv_lens="kv_lens",
                 page_indices="page_indices",
@@ -334,6 +335,7 @@ class TestSparseIndexerKvLens(CustomTestCase):
                 distribution="distribution",
                 decode_query_size=1,
                 segments="all",
+                raw_page_base="raw_page_base",
             ),
             token_to_kv_pool=SimpleNamespace(
                 get_index_key_cache=lambda layer_id: f"index{layer_id}",
@@ -342,6 +344,9 @@ class TestSparseIndexerKvLens(CustomTestCase):
         )
         backend._kv_lens = functools.partial(
             TpuPallasSparseMlaAttnBackend._kv_lens, backend
+        )
+        backend._raw_ring_args = functools.partial(
+            TpuPallasSparseMlaAttnBackend._raw_ring_args, backend
         )
         # No split group here, so the indexer runs unsplit.
         backend._indexer_split_rows = functools.partial(
@@ -383,6 +388,27 @@ class TestSparseIndexerKvLens(CustomTestCase):
         )
         args = backend._index_topk_op.call_args.args
         self.assertEqual(args[5:8], ("raw2", "index2", "draft"))
+        # Without a raw ring the op ignores the base; kv_lens stands in.
+        self.assertEqual((args[11], args[-1]), ("kv_lens", 0))
+
+    def test_index_topk_kpool_passes_the_raw_ring(self):
+        backend = self._backend()
+        backend.raw_ring_pages = 66
+        t = torch.zeros(1)
+        TpuPallasSparseMlaAttnBackend.index_topk_kpool(
+            backend,
+            forward_batch=_forward_batch(),
+            layer_id=2,
+            query=t,
+            key=t,
+            gate=t,
+            head_weights=t,
+            ape=t,
+            weight_scale=1.0,
+            kpool=4,
+        )
+        args = backend._index_topk_op.call_args.args
+        self.assertEqual((args[11], args[-1]), ("raw_page_base", 66))
 
     def test_kpool_query_bound_tracks_the_compiled_metadata_mode(self):
         # Decode and uniform verify/draft extend take their static per-request
@@ -412,8 +438,10 @@ class TestSparseIndexerKvLens(CustomTestCase):
                     weight_scale=1.0,
                     kpool=4,
                 )
+                # (decode_query_size, query bound) sit before the trailing
+                # raw_ring_pages argument.
                 self.assertEqual(
-                    backend._index_topk_op.call_args.args[-2:], (width, bound)
+                    backend._index_topk_op.call_args.args[-3:-1], (width, bound)
                 )
 
 
