@@ -9,6 +9,7 @@ TPU has no QSA kernel yet, so the full-attention layers run dense
 indexer budget (2048 tokens), which bounds the context here.
 """
 
+import json
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.base import _FP8_BASE_CONFIG
@@ -38,7 +39,10 @@ CONFIG["server_args"].update(
         "max_mamba_cache_size": CONCURRENCY,
         "mem_fraction_static": 0.75,
         "watchdog_timeout": 3600,
-        "language_model_only": True,
+        # Text only: no vision tower, so a pipeline stage relays no multimodal
+        # embeddings. The server flag's architecture list omits Qwen4-Exp, but
+        # ModelConfig also honours the checkpoint's own language_model_only.
+        "json_model_override_args": json.dumps({"language_model_only": True}),
         "trust_remote_code": True,
         "tpu_compile_tracer": "direct",
     }
