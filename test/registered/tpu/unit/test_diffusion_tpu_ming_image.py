@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for sglang_tpu's Ming-Image patches (sglang_tpu.multimodal_gen.ming_image)."""
+"""On-TPU tests, and the test models, for sglang_tpu's Ming-Image patches."""
 
 import contextlib
 import importlib.util
@@ -10,10 +10,6 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.configs.models.dits.ming_image import (
-    MingImageArchConfig,
-    MingImageDitConfig,
-)
 from sglang.multimodal_gen.configs.models.encoders.ming_image import (
     MingImageEncoderArchConfig,
     MingImageEncoderConfig,
@@ -39,7 +35,7 @@ from sglang_tpu.multimodal_gen import ming_image, worker
 
 # Whole node, not chips=1: the parallel-state setup runs the TPU worker
 # bootstrap, which opens a chip outside the chip-parallel TPU_VISIBLE_CHIPS pin.
-register_tpu_ci(est_time=40, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=50, suite="stage-a-test-tpu-unit")
 
 IMAGE_TOKEN = 500
 
@@ -71,12 +67,8 @@ def _stock_reference(hidden_states, w13, w2, topk_output, config):
 
 
 @contextlib.contextmanager
-def _on_cpu(counting=None):
-    """The TPU paths on CPU: the Pallas MoE is the reference above, and each
-    compiled block is traced whole, then run eagerly."""
-    from sglang_tpu.moe.pallas import fused_moe_op
-
-    backend = counting or "eager"
+def _installed(backend):
+    """The patches installed, compiling with ``backend``, restored afterwards."""
     with contextlib.ExitStack() as stack:
         for owner, name in (
             (encoder, "fused_experts"),
@@ -87,21 +79,10 @@ def _on_cpu(counting=None):
             (USPAttention, "forward"),
         ):
             stack.enter_context(patch.object(owner, name, getattr(owner, name)))
-        stack.enter_context(patch.object(ming_image, "_DEVICE_TYPES", ("cpu",)))
-        stack.enter_context(
-            patch.object(ming_image, "_tpu_metadata", contextlib.nullcontext)
-        )
-        stack.enter_context(
-            patch.object(fused_moe_op, "fused_moe_call", _gmm_reference)
-        )
-        stack.enter_context(
-            patch.object(fused_moe_op, "_build_fused_moe_op", lambda: None)
-        )
+        compile_kwargs = {"backend": backend}
         stack.enter_context(
             patch.object(
-                ming_image,
-                "build_torch_compile_kwargs",
-                lambda mode: {"backend": backend},
+                ming_image, "build_torch_compile_kwargs", lambda mode: compile_kwargs
             )
         )
         ming_image._compiled_block.cache_clear()
@@ -112,7 +93,7 @@ def _on_cpu(counting=None):
 
 
 def _encoder(layers=3, connector_layers=2, moe_width=32):
-    torch.manual_seed(0)
+    gen = torch.Generator().manual_seed(0)
     llm = dict(
         hidden_size=256,
         num_attention_heads=2,
@@ -176,7 +157,7 @@ def _encoder(layers=3, connector_layers=2, moe_width=32):
     with patch.object(CustomOp, "dispatch_forward", lambda op: op.forward_tpu):
         model = encoder.MingImageEncoder(config)
     for param in model.parameters():
-        param.data.normal_(0, 0.05)
+        param.data.normal_(0, 0.05, generator=gen)
     return model.float().eval()
 
 
@@ -185,40 +166,7 @@ def _encoder_inputs(prompt_length):
     ids = [(7 * i + 3) % 400 for i in range(prompt_length)]
     ids += [401] + [IMAGE_TOKEN] * 4 + [402]
     positions = encoder.ming_position_ids(ids, [(1, 2, 8)], IMAGE_TOKEN)
-    return torch.tensor([ids]), positions
-
-
-def _dit():
-    torch.manual_seed(0)
-    arch = MingImageArchConfig(
-        dim=64,
-        num_layers=2,
-        n_refiner_layers=1,
-        num_attention_heads=2,
-        n_kv_heads=2,
-        cap_feat_dim=48,
-        in_channels=16,
-        axes_dims=(8, 12, 12),
-        alignment_padding_mode="zero_masked",
-        multi_frame_output=False,
-    )
-    with patch.object(CustomOp, "dispatch_forward", lambda op: op.forward_tpu):
-        model = dit.MingImageTransformer2DModel(
-            config=MingImageDitConfig(arch_config=arch), hf_config={}
-        )
-    for param in model.parameters():
-        param.data.normal_(0, 0.05)
-    return model.float().eval()
-
-
-def _dit_inputs(prompt_rows, size=8):
-    gen = torch.Generator().manual_seed(prompt_rows)
-    return dict(
-        hidden_states=torch.randn(1, 16, 1, size, size, generator=gen),
-        encoder_hidden_states=torch.randn(1, 4, 48, generator=gen),
-        timestep=torch.full((1,), 500.0),
-        direct_embeddings=torch.randn(1, prompt_rows, 64, generator=gen),
-    )
+    return dict(input_ids=torch.tensor([ids]), position_ids=positions)
 
 
 def _run(model, kwargs):
@@ -241,157 +189,18 @@ class _TestBase(CustomTestCase):
         set_global_server_args(self._previous_args)
 
 
-class TestMingImageEncoder(_TestBase):
-    def test_padded_compiled_encoder_matches_stock(self):
-        model = _encoder()
-        for prompt_length in (9, 300):  # one and two 256-token buckets
-            ids, positions = _encoder_inputs(prompt_length)
-            with patch.object(encoder, "fused_experts", _stock_reference):
-                expected = _run(model, dict(input_ids=ids, position_ids=positions))
-            with _on_cpu():
-                actual = _run(model, dict(input_ids=ids, position_ids=positions))
-                # The experts moved to the TPU layout once and stay there.
-                _run(model, dict(input_ids=ids, position_ids=positions))
-            # Undo the layout for the next stock pass.
-            for module in model.modules():
-                if getattr(module, "_tpu_layout", False):
-                    module.experts.w13_weight.data = (
-                        module.experts.w13_weight.data.transpose(1, 2).contiguous()
-                    )
-                    module.experts.w2.data = module.experts.w2.data.transpose(
-                        1, 2
-                    ).contiguous()
-                    module._tpu_layout = False
-            torch.testing.assert_close(
-                actual.last_hidden_state,
-                expected.last_hidden_state,
-                atol=1e-5,
-                rtol=1e-4,
-            )
-            torch.testing.assert_close(
-                actual.hidden_states[0], expected.hidden_states[0], atol=1e-5, rtol=1e-4
-            )
-
-    def test_padded_encoder_with_a_reference_image_matches_stock(self):
-        model = _encoder()
-        gen = torch.Generator().manual_seed(1)
-        grid = torch.tensor([[1, 4, 4]])  # 16 patches, 4 tokens after the merge
-        pixels = torch.randn(16, 3 * 2 * 14 * 14, generator=gen)
-        ids = [5, 6] + [401] + [IMAGE_TOKEN] * 4 + [402] + [7, 8, 9]
-        ids += [401] + [IMAGE_TOKEN] * 4 + [402]
-        positions = encoder.ming_position_ids(ids, [(1, 4, 4), (1, 2, 8)], IMAGE_TOKEN)
-        inputs = dict(
-            input_ids=torch.tensor([ids]),
-            position_ids=positions,
-            pixel_values=pixels,
-            image_grid_thw=grid,
-        )
-        with patch.object(encoder, "fused_experts", _stock_reference):
-            expected = _run(model, inputs)
-        with _on_cpu():
-            actual = _run(model, inputs)
-        torch.testing.assert_close(
-            actual.last_hidden_state, expected.last_hidden_state, atol=1e-5, rtol=1e-4
-        )
-        torch.testing.assert_close(
-            actual.hidden_states[0], expected.hidden_states[0], atol=1e-5, rtol=1e-4
-        )
-
-    def test_encoder_compiles_one_graph_per_block_kind(self):
-        model = _encoder(layers=6, connector_layers=3)
-        graphs = []
-
-        def counting(gm, example_inputs):
-            graphs.append(gm)
-            return gm.forward
-
-        with _on_cpu(counting):
-            for prompt_length in (9, 60):  # one 256-token bucket
-                ids, positions = _encoder_inputs(prompt_length)
-                _run(model, dict(input_ids=ids, position_ids=positions))
-        # The dense layer, the five MoE layers and the connector layers.
-        self.assertEqual(len(graphs), 3)
-
-    def test_experts_adapter_matches_the_stock_contract(self):
-        torch.manual_seed(1)
-        x = torch.randn(10, 32)
-        w13, w2 = torch.randn(4, 16, 32), torch.randn(4, 32, 8)
-        weights, ids = torch.randn(10, 4).softmax(-1).topk(2)
-        topk = SimpleNamespace(topk_weights=weights, topk_ids=ids.int())
-        config = SimpleNamespace(top_k=2, no_combine=True)
-        expected = _stock_reference(x, w13, w2, topk, config)
-        with _on_cpu():
-            actual = encoder.fused_experts(
-                x,
-                w13.transpose(1, 2).contiguous(),
-                w2.transpose(1, 2).contiguous(),
-                topk,
-                config,
-            )
-            with self.assertRaisesRegex(RuntimeError, "TPU layout"):
-                encoder.fused_experts(x, w13, w2, topk, config)
-        # The same products, summed in another order.
-        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
-
-
-class TestMingImageDiT(_TestBase):
-    def test_bucketed_caption_matches_stock(self):
-        model = _dit()
-        for prompt_rows in (5, 40):
-            kwargs = _dit_inputs(prompt_rows)
-            expected = _run(model, kwargs)
-            with _on_cpu():
-                actual = _run(model, kwargs)
-            torch.testing.assert_close(actual, expected, atol=2e-5, rtol=1e-4)
-
-    def test_whole_dit_compiles_once_across_caption_lengths(self):
-        model = _dit()
-        graphs = []
-
-        def counting(gm, example_inputs):
-            graphs.append(gm)
-            return gm.forward
-
-        with _on_cpu():
-            # An eager call first: fused_op resolves its backend lazily, and
-            # that global would add one recompile unrelated to the caption.
-            _run(model, _dit_inputs(5))
-            model.compile(backend=counting, dynamic=False)
-            for prompt_rows in (5, 40, 300):  # all in the 512-row caption bucket
-                _run(model, _dit_inputs(prompt_rows))
-        self.assertEqual(len(graphs), 1)
-
-
-def _has_tpu() -> bool:
-    if importlib.util.find_spec("torch_tpu") is None:
-        return False
-    try:
-        return torch.tpu.device_count() > 0
-    except Exception:
-        return False
-
-
-@unittest.skipUnless(_has_tpu(), "requires a TPU")
+@unittest.skipUnless(importlib.util.find_spec("torch_tpu"), "requires torch_tpu")
 class TestMingImageOnTpu(_TestBase):
     def test_compiled_moe_encoder_runs_on_tpu(self):
         model = _encoder(layers=2, moe_width=128)
-        ids, positions = _encoder_inputs(40)
-        inputs = dict(input_ids=ids, position_ids=positions)
+        inputs = _encoder_inputs(40)
         with patch.object(encoder, "fused_experts", _stock_reference):
             expected = _run(model, inputs).last_hidden_state
-        ming_image._compiled_block.cache_clear()
-        with contextlib.ExitStack() as stack:
-            for owner, name in (
-                (encoder, "fused_experts"),
-                (encoder.MingImageEncoder, "forward"),
-                (encoder.MingEncoderBlock, "forward"),
-            ):
-                stack.enter_context(patch.object(owner, name, getattr(owner, name)))
-            stack.callback(ming_image._compiled_block.cache_clear)
-            ming_image.install()
+        # torch_tpu's backend, as on a TPU worker.
+        with _installed("tpu"):
             model = model.bfloat16().to("tpu")
-            tpu_inputs = dict(input_ids=ids.to("tpu"), position_ids=positions.to("tpu"))
-            actual = _run(model, tpu_inputs).last_hidden_state.float().cpu()
+            actual = _run(model, {k: v.to("tpu") for k, v in inputs.items()})
+        actual = actual.last_hidden_state.float().cpu()
         self.assertTrue(torch.isfinite(actual).all())
         error = (actual - expected).norm() / expected.norm()
         self.assertLess(error.item(), 5e-2)
