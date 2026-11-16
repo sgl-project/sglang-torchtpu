@@ -2,11 +2,19 @@
 """TPU compile policy of ``DeepseekV4ForCausalLM`` (attached in
 ``sglang_tpu.compilation.core_compile_annotations``).
 
-When the model has Engram layers, after the batch is padded to its bucket and
-before attention planning, this rank's tokens are hashed on the host and their
-rows of the shared host table copied to the device (``engram_host``); the
-graph takes the staged rows and their int32 row ids instead of hashing and
-looking up. Without Engram layers (DeepSeek-V4) it is the plain decoder policy.
+After the batch is padded to its bucket and before attention planning, it
+stages the graph inputs the compiled forward reads:
+
+- Engram, when the model has Engram layers: this rank's tokens are hashed on
+  the host and their rows of the shared host table copied to the device
+  (``engram_host``); the graph takes the staged rows and their int32 row ids
+  instead of hashing and looking up.
+- Token embedding, under attention DP: looked up eagerly and passed in as
+  ``input_embeds``. Attention DP builds the embedding unsharded
+  (``enable_tp=not is_dp_attention_enabled()``), and inside the TP1/DP8
+  compiled graph that BF16 gather returns wrong rows, with int64 ids too,
+  while the same lookup outside the graph is exact (as vllm-torchtpu #1848
+  does). Remove once torch_tpu compiles that gather correctly.
 
 Warmup pads through the same ``prepare_forward_batch``, so precompiled and
 serving graphs share one signature.
@@ -19,12 +27,13 @@ from typing import Any
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.models.deepseek_v41 import engram_host
 
 
 class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
-    """Decoder policy that stages host Engram rows."""
+    """Decoder policy that stages host Engram rows and DP token embeddings."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -42,11 +51,16 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if self._engram_hasher is not None
             else ()
         )
+        self._embeds_outside_graph = get_parallel().attn_dp_size > 1
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         super().prepare_forward_batch(forward_batch)
         if self._engram_tables:
             self._stage_engram_rows(forward_batch)
+        if self._embeds_outside_graph and forward_batch.input_embeds is None:
+            embed_tokens = self.model_runner.model.get_input_embeddings()
+            with torch.no_grad():
+                forward_batch.input_embeds = embed_tokens(forward_batch.input_ids)
 
     def _stage_engram_rows(self, forward_batch: ForwardBatch) -> None:
         hasher = self._engram_hasher
