@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -101,7 +101,9 @@ class StagedFrame:
     segment_ids: torch.Tensor  # [1, B] int32
     real_patches: int
 
-    def args(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+    def args(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, ...]:
         return (
             self.pixels.to(device=device, dtype=dtype),
             self.rotary_pos_emb_cos.to(device=device),
@@ -196,9 +198,7 @@ class Glm5NextVitTpuCompileRunner:
             )
         return self._rotary_cos_sin_cache_cpu
 
-    def stage(
-        self, pixels: torch.Tensor, h: int, w: int, bucket: int
-    ) -> StagedFrame:
+    def stage(self, pixels: torch.Tensor, h: int, w: int, bucket: int) -> StagedFrame:
         """Host inputs for one ``h x w`` frame padded to ``bucket`` patches."""
         merge_size = self.vit.spatial_merge_size
         real = h * w
@@ -227,9 +227,7 @@ class Glm5NextVitTpuCompileRunner:
             self._patch_buckets = patch_buckets(self.vit.spatial_merge_size)
         return next((b for b in self._patch_buckets if b >= patches), None)
 
-    def run_grid(
-        self, pixels: torch.Tensor, grid_thw: Any
-    ) -> Optional[torch.Tensor]:
+    def run_grid(self, pixels: torch.Tensor, grid_thw: Any) -> Optional[torch.Tensor]:
         """Merged features for ``grid_thw``, or ``None`` if any frame exceeds the ladder."""
         return self._run_staged(pixels, grid_thw, self._bucket_for, self.forward)
 
@@ -269,9 +267,7 @@ class Glm5NextVitTpuCompileRunner:
         with torch.no_grad():
             for (h, w), bucket in zip(frames, buckets):
                 patches = h * w
-                staged = self.stage(
-                    pixels_cpu[start : start + patches], h, w, bucket
-                )
+                staged = self.stage(pixels_cpu[start : start + patches], h, w, bucket)
                 start += patches
                 result = fn(*staged.args(device, dtype))
                 # Unpad on the host so variable post-merge lengths never compile on TPU.
@@ -331,9 +327,7 @@ class Glm5NextVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         staged = runner.stage(pixels, grid, grid, patch_count)
         return staged.args(vit.device, vit.dtype)
 
-    def run_grid(
-        self, pixels: torch.Tensor, grid_thw: Any
-    ) -> Optional[torch.Tensor]:
+    def run_grid(self, pixels: torch.Tensor, grid_thw: Any) -> Optional[torch.Tensor]:
         runner = self._resolve_runner()
 
         def bucket_for(patches: int) -> Optional[int]:

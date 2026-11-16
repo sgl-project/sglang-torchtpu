@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.3-Flash's TPU vision runner matches Glm5NextVisionModel.forward."""
 
+import importlib.util
+import sys
+import types
 import unittest
 from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
-
-import importlib.util
-import sys
-import types
 
 if importlib.util.find_spec("torch_tpu") is None:
     _torch_tpu = types.ModuleType("torch_tpu")
@@ -69,12 +68,11 @@ def _unwrapped(fn):
 
 
 def _build_vit(use_data_parallel: bool = False):
+    from sglang.srt.layers.attention import vision
     from sglang.srt.layers.rotary_embedding import base as rope_base
     from sglang.srt.models import glm5_next
     from sglang.srt.runtime_context import get_parallel
     from sglang.test.test_utils import publish_build_topology
-
-    from sglang.srt.layers.attention import vision
 
     rope_base._is_tpu = True
     vision.apply_rotary_pos_emb = vision.apply_rotary_pos_emb_native_eager
