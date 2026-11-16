@@ -39,8 +39,10 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
-| Qwen-Image-2.1 | T2I 2048x2048, 40 steps | 8 | 5.06 s | 0.102 s | 0.59 s | 88.3 GB |
-| Qwen-Image-2.1 | T2I 1024x1024, 40 steps | 8 | 1.17 s | | | 44.7 GB |
+| Qwen-Image-2.1 | T2I 1024x1024, 40 steps | 8 | 1.31 s | 0.026 s | 0.16 s | 35.7 GB |
+| Qwen-Image-2.1 | T2I 2048x2048, 40 steps | 1 | 24.2 s | | | 93.6 GB |
+| Qwen-Image-2.1 | T2I 2048x2048, 40 steps | 8 | 5.19 s | 0.103 s | 0.59 s | 86.0 GB |
+| Qwen-Image-2.1 | Edit 1024x1024, 40 steps | 8 | 1.79 s | 0.034 s | 0.16 s | 41.8 GB |
 
 
 ## Example requests
