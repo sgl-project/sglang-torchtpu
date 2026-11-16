@@ -3,6 +3,7 @@
 
 import contextlib
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 # CPU tensors throughout, off the TPU chips.
@@ -12,6 +13,7 @@ import torch
 from transformers import GlmImageConfig, GlmImageForConditionalGeneration
 from transformers.generation import logits_process as lp
 
+from sglang.multimodal_gen.runtime.pipelines.glm_image import GlmImagePipeline
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.multimodal_gen import glm_image_ar
@@ -29,6 +31,13 @@ def _installed(backend="eager"):
                 GlmImageForConditionalGeneration,
                 "generate",
                 GlmImageForConditionalGeneration.generate,
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                GlmImagePipeline,
+                "create_pipeline_stages",
+                GlmImagePipeline.create_pipeline_stages,
             )
         )
         stack.enter_context(patch.object(glm_image_ar, "_DEVICE_TYPES", ("cpu",)))
@@ -148,6 +157,11 @@ class TestGlmImagePriorTokens(CustomTestCase):
         self.assertIsNone(glm_image_ar.device_sampling(processors))
         with _installed(), self.assertRaisesRegex(NotImplementedError, "top-p only"):
             _generate(_model(), _prompt(9, 0), temperature=0.9, min_p=0.1)
+
+    def test_cfg_parallel_is_refused(self):
+        args = SimpleNamespace(enable_cfg_parallel=True)
+        with _installed(), self.assertRaisesRegex(ValueError, "CFG parallel"):
+            GlmImagePipeline.create_pipeline_stages(None, args)
 
     def test_draws_follow_the_candidate_distribution(self):
         logits = torch.tensor([[2.0, 1.5, 1.0, 0.2, -1.0, -3.0]])

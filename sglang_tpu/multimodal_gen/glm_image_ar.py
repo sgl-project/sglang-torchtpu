@@ -16,6 +16,9 @@ Runtime patch, tracked debt:
     and an exponential-race draw over them, with the noise drawn on the host
     from torch's seeded generator. Only the token id returns to the host.
     Other processor lists raise.
+  - CFG parallel is refused at startup: the executor runs this rank-0 stage
+    on every CFG group's first rank, and their broadcasts to all ranks
+    collide (a gloo size mismatch aborts the workers).
 - Upstream PR or issue: none.
 - Remove when: torch_tpu lowers int64 reductions and the prior tokens come
   from a TPU decode engine.
@@ -32,6 +35,7 @@ from transformers.generation import logits_process
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.models.glm_image import modeling_glm_image as hf
 
+from sglang.multimodal_gen.runtime.pipelines import glm_image as pipeline
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     build_torch_compile_kwargs,
 )
@@ -42,6 +46,7 @@ _CAPACITY_ALIGNMENT = 1024
 _DEVICE_TYPES = ("tpu",)
 
 _STOCK_GENERATE = GlmImageForConditionalGeneration.generate
+_STOCK_CREATE_STAGES = pipeline.GlmImagePipeline.create_pipeline_stages
 
 
 def device_sampling(processors):
@@ -250,5 +255,16 @@ def _generate(self, input_ids=None, attention_mask=None, **kwargs):
         )
 
 
+def _create_pipeline_stages(self, server_args):
+    if server_args.enable_cfg_parallel:
+        raise ValueError(
+            "GLM-Image on TPU does not take CFG parallel: its prior-token stage "
+            "broadcasts from one rank to all. Serve with --ulysses-degree <cores> "
+            "(benchmark/tpu/diffusion/glm_image.sh)."
+        )
+    return _STOCK_CREATE_STAGES(self, server_args)
+
+
 def install() -> None:
     GlmImageForConditionalGeneration.generate = _generate
+    pipeline.GlmImagePipeline.create_pipeline_stages = _create_pipeline_stages
