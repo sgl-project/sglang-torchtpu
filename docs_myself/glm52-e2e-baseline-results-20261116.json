@@ -2972,16 +2972,22 @@
       }
     ],
     "attribution": "These four loader/model files are unchanged from the PR base; neither issue is established as introduced by PR2198. Successful baseline includes the reader fix and MTP view. No wrong FP8 bytes/channel scale mismatch was identified in the new adapter, but selected byte oracles and routed smoke are not full-checkpoint numerical equivalence.",
-    "incorporated_head": "ed78e85c42d4dcbfbd2f5caadc607909b682d36a",
+    "incorporated_head": "ffd83db8f6168e0752e0769f8947cffb308e724d",
     "follow_up_validation": {
-      "CPU_tests_passed": 104,
+      "CPU_tests_passed": 116,
       "python": "3.10.20",
       "torch": "2.14.1",
       "automatic_shard_selection_real_index": "original shards 270-274, 1569 MTP tensors",
       "full_8_chip_E2E_on_updated_PR_head": "not rerun",
       "PR_state": "ready",
       "base_CI_run": 43884646093,
-      "TPU_CI_run": 43884646347
+      "TPU_CI_run": 43884646347,
+      "MTP_shard_filter": {
+        "env": "SGLANG_ENABLE_MTP_SHARD_FILTER",
+        "default": false,
+        "case_use": "explicitly enabled only in the audited GLM-5.2 benchmark launch environment",
+        "scope": "default off preserves original model/quantization recipe read set; enabled mode assumes complete index; no SHA or fixed model/quantization gate"
+      }
     }
   }
 }
