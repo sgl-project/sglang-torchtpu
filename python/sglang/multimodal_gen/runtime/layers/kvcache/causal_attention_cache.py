@@ -35,6 +35,9 @@ class CausalSelfAttentionKVCache:
     global_sink_tokens: int = 0
     pinned_start: int = -1
     pinned_len: int = 0
+    # the global position of the chunk the DiT runs, set by the DiT forward
+    # for blocks passed current_start=None
+    chunk_start: int | None = None
 
     def __post_init__(self) -> None:
         if self.cache_size == 0:

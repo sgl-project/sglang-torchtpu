@@ -254,7 +254,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         freqs_cis: tuple[torch.Tensor, ...],
         block_mask,
         kv_cache: CausalSelfAttentionKVCache | None = None,
-        current_start: int = 0,
+        current_start: int | None = 0,
         cache_start: int | None = None,
         update_cache_only: bool = False,
     ):
@@ -275,23 +275,13 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             roped_query = roped_query.type_as(v)
             roped_key = roped_key.type_as(v)
         else:
-            roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
-            roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
-        forward_batch = get_forward_context().forward_batch
-        seq_splits = None
-        uniform_seq_splits = False
-        sequence_shard_enabled = (
-            kv_cache is not None
-            and forward_batch is not None
-            and getattr(forward_batch, "enable_sequence_shard", False)
-            and get_ulysses_parallel_world_size() > 1
-        )
-
+            # v's dtype only: v, a view of the fused QKV projection, stays out
+            # of a compiled region that ends at the KV-cache attention.
+            roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).to(
+                v.dtype
+            )
+            roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).to(v.dtype)
         if kv_cache is None:
-            if sequence_shard_enabled:
-                raise NotImplementedError(
-                    "LingBot causal sequence sharding currently requires kv_cache-backed inference."
-                )
             return super().forward(
                 q,
                 k,
@@ -302,6 +292,31 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 current_start,
                 cache_start,
             )
+        return self._attend_with_kv_cache(
+            roped_query, roped_key, v, kv_cache, current_start, update_cache_only
+        )
+
+    def _attend_with_kv_cache(
+        self,
+        roped_query,
+        roped_key,
+        v,
+        kv_cache,
+        current_start,
+        update_cache_only=False,
+    ):
+        """Write the chunk's roped K and V into ``kv_cache`` and attend to its
+        visible window; ``current_start=None`` reads ``kv_cache.chunk_start``."""
+        if current_start is None:
+            current_start = kv_cache.chunk_start
+        forward_batch = get_forward_context().forward_batch
+        seq_splits = None
+        uniform_seq_splits = False
+        sequence_shard_enabled = (
+            forward_batch is not None
+            and getattr(forward_batch, "enable_sequence_shard", False)
+            and get_ulysses_parallel_world_size() > 1
+        )
 
         if sequence_shard_enabled:
             seq_splits = getattr(forward_batch, "sequence_shard_splits", None)
@@ -1237,7 +1252,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         block_mask,
         kv_cache: CausalSelfAttentionKVCache | None = None,
         crossattn_cache: CrossAttentionKVCache | None = None,
-        current_start: int = 0,
+        current_start: int | None = 0,
         cache_start: int | None = None,
         c2ws_plucker_emb: torch.Tensor | None = None,
         cam_conditioner_scale_shift: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -1247,9 +1262,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             hidden_states = hidden_states.squeeze(1)
         orig_dtype = hidden_states.dtype
         e = self.scale_shift_table + temb.float()
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(
-            6, dim=2
-        )
+        shift_msa, scale_msa = e.chunk(6, dim=2)[:2]
         norm_hidden_states = self._fp32_norm(hidden_states, scale_msa, shift_msa)
         query, key, value = self._project_qkv(norm_hidden_states)
         if self.tp_rmsnorm:
@@ -1274,7 +1287,14 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             update_cache_only=update_cache_only,
         )
         if update_cache_only:
-            return hidden_states
+            # A traced op: dynamo resumes here after a graph break in attn1
+            # (TPU workers run the KV-cache attention eagerly), and it skips a
+            # resumed frame that traces no ops for good, the code below too.
+            return hidden_states.to(orig_dtype)
+        # Split after attn1: a graph break inside it (TPU workers run the
+        # KV-cache attention eagerly) then hands the rest of the block ``e``
+        # whole; torch_tpu guards each compiled input's storage offset.
+        _, _, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(6, dim=2)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -1604,10 +1624,8 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         if c2ws_plucker_emb is None:
             return None
 
-        forward_context = get_forward_context()
-        if forward_context.current_timestep < 0:
-            return None
-
+        # The context pass (current_timestep -1) takes the same cached
+        # entries, which its blocks would otherwise look up themselves.
         if not self._should_cache_cam_conditioner(forward_batch):
             return None
 
@@ -1728,6 +1746,10 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 post_patch_width=post_patch_width,
                 device=hidden_states.device,
             )
+        else:
+            # Token-major, as the sequence shards are (compiled blocks guard
+            # their input strides).
+            hidden_states = hidden_states.contiguous()
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self._prepare_condition_embeddings(
@@ -1752,6 +1774,11 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         cam_conditioner_scale_shifts = self._prepare_cam_conditioner_scale_shifts(
             c2ws_plucker_emb, forward_batch
         )
+        # The chunk start rides on the caches: a compiled block guards the
+        # ints it is passed, and this one changes every chunk.
+        for cache in kv_cache:
+            cache.chunk_start = current_start
+        current_start = None
 
         for block_index, block in enumerate(self.blocks):
             hidden_states = block(

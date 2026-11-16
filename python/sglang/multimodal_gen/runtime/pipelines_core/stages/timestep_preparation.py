@@ -251,7 +251,9 @@ class DMDTimestepPreparationStage(PipelineStage):
             )
             timesteps = scheduler_timesteps[num_train_timesteps - timesteps]
 
-        batch.timesteps = timesteps.to(get_local_torch_device())
+        # Left on the host: the LingBot-World denoising stage's
+        # _prepare_causal_dmd_timesteps places it.
+        batch.timesteps = timesteps
         batch.scheduler = scheduler
         if not batch.is_warmup:
             self.log_debug("DMD timesteps: %s", batch.timesteps)
