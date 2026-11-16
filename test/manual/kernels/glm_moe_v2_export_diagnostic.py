@@ -67,8 +67,64 @@ def configure(mode):
         pure_path.write_text(pure)
         candidate = load_module(f"glm_c948_pure_rank{rank}", pure_path)
         kernel.fused_ep_moe_v2 = candidate.fused_ep_moe_v2
-    elif mode != "port":
+    elif mode not in ("port", "manual"):
         raise ValueError(mode)
+
+    if mode == "manual":
+        import io
+        from jaxlib.mlir import ir
+
+        initialize = pallas_jax_op._CpuExportJaxCallable.__init__
+
+        def annotated_initialize(self, *args, **kwargs):
+            initialize(self, *args, **kwargs)
+            export = self.exported
+
+            def annotated_export(*export_args, **export_kwargs):
+                result = export(*export_args, **export_kwargs)
+                with jax.interpreters.mlir.make_ir_context():
+                    module = ir.Module.parse(result.mlir_module())
+                    count = 0
+
+                    def annotate(operation):
+                        nonlocal count
+                        if (
+                            operation.name == "stablehlo.custom_call"
+                            and "has_side_effect" in operation.attributes
+                            and str(operation.attributes["has_side_effect"]) == "true"
+                            and str(operation.attributes["call_target_name"])
+                            == '"tpu_custom_call"'
+                        ):
+                            operation.attributes["mhlo.sharding"] = ir.StringAttr.get(
+                                "{manual}"
+                            )
+                            count += 1
+                        for region in operation.regions:
+                            for block in region.blocks:
+                                for child in block.operations:
+                                    annotate(child.operation)
+
+                    annotate(module.operation)
+                    assert count > 0, "no side-effect Pallas custom call found"
+                    text = module.operation.get_asm(enable_debug_info=True)
+                    buffer = io.BytesIO()
+                    module.operation.write_bytecode(buffer)
+                    serialized = buffer.getvalue()
+
+                class AnnotatedExport:
+                    mlir_module_serialized = serialized
+
+                    def mlir_module(self):
+                        return text
+
+                    def __getattr__(self, name):
+                        return getattr(result, name)
+
+                return AnnotatedExport()
+
+            self.exported = annotated_export
+
+        pallas_jax_op._CpuExportJaxCallable.__init__ = annotated_initialize
 
     factory = pallas_jax_op.cpu_export_jax_op
 
@@ -157,7 +213,7 @@ def run_worker(mode):
             flush=True,
         )
         if not expected:
-            raise
+            raise RuntimeError(message[:1200]) from None
     else:
         if mode in ("source", "port"):
             raise AssertionError(
@@ -176,7 +232,12 @@ if __name__ == "__main__":
     else:
         python = shlex.quote(sys.executable)
         script = shlex.quote(str(Path(__file__).resolve()))
-        for mode in ("source", "port", "pure"):
+        modes = (
+            sys.argv[1].split("=", 1)[1].split(",")
+            if len(sys.argv) == 2 and sys.argv[1].startswith("--modes=")
+            else ("source", "port", "manual")
+        )
+        for mode in modes:
             command = (
                 "unset RANK LOCAL_RANK LOCAL_WORLD_SIZE WORLD_SIZE; "
                 f"eval $({python} -m torch.tpu.distributed); "
