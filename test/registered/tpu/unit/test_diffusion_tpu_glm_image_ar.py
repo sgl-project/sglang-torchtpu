@@ -2,7 +2,11 @@
 """Tests for sglang_tpu's GLM-Image prior-token generation (sglang_tpu.multimodal_gen.glm_image_ar)."""
 
 import contextlib
+import os
 from unittest.mock import patch
+
+# CPU tensors throughout, off the TPU chips.
+os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cpu"
 
 import torch
 from transformers import GlmImageConfig, GlmImageForConditionalGeneration
@@ -12,8 +16,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.multimodal_gen import glm_image_ar
 
-# Nightly: the stage-a unit suite is at its time budget.
-register_tpu_ci(est_time=30, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
 
 IMAGE_START, IMAGE_END, IMAGE_TOKEN = 290, 291, 292
 
@@ -138,11 +141,13 @@ class TestGlmImagePriorTokens(CustomTestCase):
             got = torch.zeros_like(want).scatter(-1, ids, probs)
             torch.testing.assert_close(got, want, atol=1e-6, rtol=1e-5)
 
-    def test_other_processors_use_the_full_row(self):
+    def test_other_processors_are_refused(self):
         processors = lp.LogitsProcessorList(
             [lp.TemperatureLogitsWarper(0.9), lp.MinPLogitsWarper(0.1)]
         )
         self.assertIsNone(glm_image_ar.device_sampling(processors))
+        with _installed(), self.assertRaisesRegex(NotImplementedError, "top-p only"):
+            _generate(_model(), _prompt(9, 0), temperature=0.9, min_p=0.1)
 
     def test_draws_follow_the_candidate_distribution(self):
         logits = torch.tensor([[2.0, 1.5, 1.0, 0.2, -1.0, -3.0]])

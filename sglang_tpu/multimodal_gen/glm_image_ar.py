@@ -11,12 +11,11 @@ Runtime patch, tracked debt:
   shapes are a 256-token prompt chunk and one token.
   - Positions are the stock ones (``get_rope_index`` and its decode grid
     positions), computed on the host; the RoPE tables are built on the host.
-  - When the logits processors are temperature, top-k and top-p (the
-    checkpoint's generation config), each step draws on the device: the top-k
-    logits, the top-p cut and an exponential-race draw over them, with the
-    noise drawn on the host from torch's seeded generator. Only the token id
-    returns to the host. Any other processor list runs Transformers'
-    processors on the host over the full row.
+  - With the checkpoint's sampling processors (temperature, top-k and
+    top-p), each step draws on the device: the top-k logits, the top-p cut
+    and an exponential-race draw over them, with the noise drawn on the host
+    from torch's seeded generator. Only the token id returns to the host.
+    Other processor lists raise.
 - Upstream PR or issue: none.
 - Remove when: torch_tpu lowers int64 reductions and the prior tokens come
   from a TPU decode engine.
@@ -180,6 +179,10 @@ class _Decoder:
             model_kwargs=model_kwargs,
         )
         sampling = device_sampling(processors) if config.do_sample else None
+        if sampling is None:
+            raise NotImplementedError(
+                "TPU generation samples with temperature, top-k and top-p only"
+            )
         eos = config.eos_token_id
         eos = set() if eos is None else {eos} if isinstance(eos, int) else set(eos)
 
@@ -208,16 +211,8 @@ class _Decoder:
             logits = self.forward(chunk.to(device), last.to(device))
         out = []
         for step in range(max_new_tokens):
-            if sampling is not None:
-                noise = torch.empty(1, sampling[1]).exponential_()
-                token = int(self.draw(logits, noise.to(device), sampling))
-            else:
-                history = torch.cat((ids, torch.tensor([out], dtype=ids.dtype)), -1)
-                scores = processors(history, logits.cpu())
-                if config.do_sample:
-                    token = int(torch.multinomial(scores.softmax(-1)[0], 1))
-                else:
-                    token = int(scores.argmax(-1))
+            noise = torch.empty(1, sampling[1]).exponential_()
+            token = int(self.draw(logits, noise.to(device), sampling))
             out.append(token)
             if token in eos:
                 break
