@@ -43,6 +43,11 @@ def select_radix_topk(scores, k, row_lengths, *, scheduling_group_id=None, confi
             tuned.reconstruct_threshold,
             True,
         )
+        # A bounded page64/capacity92160 sweep on v7 found this configuration
+        # least costly for GLM verify. It still did not beat the incumbent;
+        # keep the integration opt-in and do not force V2 for prefill.
+        if k == 2048 and scores.shape[-1] == 92160 and scores.shape[0] <= 64:
+            block_size, reconstruct_threshold, reverse_scan = 16384, 8192, False
     else:
         block_size, reconstruct_threshold, reverse_scan = config
     result = radix_topk_v2(
