@@ -422,6 +422,51 @@ def binder_loading_cases(ep, rank):
         group.destroy()
 
 
+def record_nonfinite(
+    got, expected, x, ids, coefficients, *, rank, local_rows, routing, shared
+):
+    """Keep invalid-slot diagnostics separate from the numerical tolerance."""
+    import json
+    import numpy as np
+
+    bad = ~got.isfinite().all(-1)
+    if not bad.any():
+        return
+    route_count = (ids >= 0).sum(-1)
+    rows = bad.nonzero().flatten().tolist()
+    directory = (
+        Path(os.environ.get("GLM52_ART", "/tmp/glm52-moe-failures"))
+        / "kernel-failure-dumps"
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"rank{rank}-rows{local_rows}-{routing}-shared{int(shared)}.npz"
+    np.savez_compressed(
+        path,
+        got=got.numpy(),
+        expected=expected.numpy(),
+        x=x.float().numpy(),
+        ids=ids.numpy(),
+        coefficients=coefficients.numpy(),
+    )
+    print(
+        json.dumps(
+            dict(
+                event="nonfinite_output",
+                rank=rank,
+                local_rows=local_rows,
+                routing=routing,
+                shared=shared,
+                rows=rows,
+                bad_valid_rows=int((bad & (route_count > 0)).sum()),
+                bad_invalid_rows=int((bad & (route_count == 0)).sum()),
+                route_count_at_bad_rows=route_count[bad].tolist(),
+                artifact=str(path),
+            )
+        ),
+        flush=True,
+    )
+
+
 def worker():
     import json
     import time
@@ -505,9 +550,11 @@ def worker():
         (12, "hot", False),
         (18, "zeros", False),
         (24, "padded", False),
+        (24, "partial", False),
         (65, "random", False),
         (6, "random", True),
         (24, "padded", True),
+        (24, "partial", True),
         (65, "hot", True),
     ]:
         rows = local_rows * ep - (3 if routing == "padded" else 0)
@@ -521,6 +568,10 @@ def worker():
             ids[:] = torch.arange(k)
         if routing == "zeros":
             weights.zero_()
+        if routing == "partial":
+            ids[::3, 0] = -1
+            ids[1::3, 1:3] = -1
+            weights[ids < 0] = 0
         if routing == "padded":
             ids[-7:] = -1
             weights[-7:] = 0
@@ -561,6 +612,17 @@ def worker():
         relative_l2 = float(
             torch.linalg.vector_norm(got - expected)
             / torch.linalg.vector_norm(expected).clamp_min(1e-8)
+        )
+        record_nonfinite(
+            got,
+            expected,
+            x,
+            ids,
+            weights,
+            rank=rank,
+            local_rows=local_rows,
+            routing=routing,
+            shared=has_shared,
         )
         assert torch.isfinite(got).all(), (local_rows, routing)
         assert relative_l2 < 0.15, (local_rows, routing, relative_l2)
