@@ -18,7 +18,11 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVReceiver,
+    KVTransferError,
+    PrefillServerInfo,
+)
 from sglang.srt.environ import envs
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
@@ -871,10 +875,7 @@ class RaidenReceiverMixin:
         src_attn_tp = self.attn_tp_size * ratio
         r = self.kv_args.engine_rank % self.attn_tp_size
         source_ranks = list(range(r * ratio, (r + 1) * ratio))
-        # Refuse a head slice the KV layout cannot move before asking the
-        # prefill for anything, so the room fails with the reason instead of
-        # timing out (or, with an fp8 pool sized as bf16, landing heads in the
-        # wrong slots).
+        # Refuse unsupported head slices before messaging prefill so the room fails immediately.
         # Writers whose heads share a decode pack with another writer's land
         # in staging pages and are merged in on completion.
         staging = None
@@ -1502,6 +1503,7 @@ class RaidenKVReceiver(CommonKVReceiver):
         bootstrap_room: Optional[int] = None,
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        self.prefill_info: Optional[PrefillServerInfo] = None
         self._started = False
         # Bounds the wait before send_metadata, see _check_handshake_timeout.
         self._handshake_start = time.time()
@@ -1516,11 +1518,11 @@ class RaidenKVReceiver(CommonKVReceiver):
     ):
         if self.conclude_state == KVPoll.Failed:
             return
-        # A decode sharded finer than its prefill pulls ONE prefill rank's
-        # whole pages (there is no head-slicing pull), which only holds this
-        # rank's heads when the kv-heads are replicated.
-        prefill_info = getattr(self, "prefill_info", None)
-        prefill_tp = int(getattr(prefill_info, "attn_tp_size", 0) or 0)
+        # Finer decode pulls one prefill rank's whole pages without head slicing;
+        # valid only when kv-heads are replicated.
+        prefill_tp = (
+            self.prefill_info.attn_tp_size if self.prefill_info is not None else 0
+        )
         reason = self.kv_mgr.finer_decode_refusal(prefill_tp)
         if reason is not None:
             logger.error(
@@ -1532,9 +1534,8 @@ class RaidenKVReceiver(CommonKVReceiver):
             self.kv_mgr.record_failure(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             self.conclude_state = KVPoll.Failed
-            # poll() now returns Failed without reaching _conclude_failed, so
-            # tell the prefill here; otherwise it holds the room until its
-            # bootstrap timeout.
+            # conclude_state is already Failed so poll() skips _conclude_failed;
+            # notify prefill here to avoid holding the room until bootstrap timeout.
             self._notify_prefill_abort()
             return
         self.kv_mgr.register_decode_request(

@@ -438,20 +438,24 @@ class RaidenKVManager(
         # set on both the prefill and decode KVArgs.
         total_kv_heads = int(self.kv_args.total_kv_head_num)
         geometry = ReshardGeometry(
-            src_attn_tp,
-            dst_attn_tp,
-            hp,
-            total_kv_heads,
+            src_tp=src_attn_tp,
+            dst_tp=dst_attn_tp,
+            hp_bytes=hp,
+            total_kv_heads=total_kv_heads,
             kv_packing=int(tensor.shape[3]),
             element_size=tensor.element_size(),
         )
-        self._check_reshard_layout(geometry, tensor, src_attn_tp, dst_attn_tp)
+        self._check_reshard_layout(
+            geometry=geometry,
+            tensor=tensor,
+            src_attn_tp=src_attn_tp,
+            dst_attn_tp=dst_attn_tp,
+        )
         return geometry
 
     def _check_reshard_layout(
-        self, geometry, tensor, src_attn_tp: int, dst_attn_tp: int
+        self, *, geometry, tensor, src_attn_tp: int, dst_attn_tp: int
     ) -> None:
-        """Verify that the tensor's actual stride matches the geometry's computed token width."""
         from sglang_tpu.disaggregation.raiden.pp_common import _FUSED_KV_RANK
 
         local_tp = int(self.attn_tp_size)
@@ -473,23 +477,24 @@ class RaidenKVManager(
                 f"with page_size {page_size}"
             )
         if tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get():
-            # Packed heads sit side by side along head_dim, so a kv-head is not
-            # a K/V slot pair the head-slice math can address.
+            # Packed heads sit side by side along head_dim,
+            # so a kv-head is not a K/V slot pair the head-slice math can address.
             raise ValueError(
                 "Raiden push resharding does not support SGLANG_TPU_KV_PACK_HEADS"
             )
         geometry.check_token_bytes(
-            local_tp, tensor.stride(1) * tensor.element_size(), "local"
+            tp=local_tp,
+            actual=tensor.stride(1) * tensor.element_size(),
+            what="local",
         )
 
     def finer_decode_refusal(self, prefill_attn_tp: int) -> Optional[str]:
-        """Return a refusal reason if decode attention TP exceeds prefill TP without head replication."""
         attn_tp = int(self.attn_tp_size)
         if not prefill_attn_tp or prefill_attn_tp >= attn_tp:
             return None
-        if getattr(self, "is_mla_backend", False) or getattr(
-            self, "is_hybrid_mla_backend", False
-        ):
+        if self._pipeline is not None:
+            return None
+        if self.is_mla_backend or self.is_hybrid_mla_backend:
             return None
         total_kv_heads = int(self.kv_args.total_kv_head_num)
         prefill_heads = max(1, total_kv_heads // prefill_attn_tp)
