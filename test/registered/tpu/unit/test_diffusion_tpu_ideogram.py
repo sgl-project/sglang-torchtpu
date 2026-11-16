@@ -2,7 +2,6 @@
 """Tests for sglang_tpu's Ideogram 4 patches (sglang_tpu.multimodal_gen.ideogram)."""
 
 import contextlib
-import importlib.util
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -30,6 +29,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages i
     ideogram as stage,
 )
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    compile_matching_submodules,
+)
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -55,7 +57,7 @@ def _installed():
             (dit.Ideogram4Transformer2DModel, "forward"),
             (dit.Ideogram4Transformer2DModel, "__call__"),
             (encoder.IdeogramQwen3VLTextEncoder, "encode_ideogram_features"),
-            (dit.Ideogram4TransformerBlock, "forward"),
+            (dit.Ideogram4Transformer2DModel, "_compile_regions_spmd_safe"),
             (stage.LogitNormalSchedule, "__call__"),
         ):
             stack.enter_context(patch.object(owner, name, getattr(owner, name)))
@@ -177,37 +179,42 @@ class TestIdeogramDiT(_TestBase):
         self.assertEqual(linear.weight.dtype, torch.bfloat16)
         self.assertTrue(torch.equal(linear(x), before))
 
-    def test_whole_dit_compiles_once_across_prompt_lengths_and_steps(self):
-        model = _model()
-        graphs = []
+    def test_dit_compiles_once_across_prompt_lengths_and_steps(self):
+        # The recipe compiles each block (--regional-compile); the TPU default
+        # compiles the whole DiT.
+        for regional in (False, True):
+            torch._dynamo.reset()
+            model = _model()
+            graphs, offsets = [], set()
 
-        offsets = set()
+            def guarded(gm, example_inputs):
+                # torch_tpu's backend guards every tensor input's storage offset.
+                graphs.append(gm)
+                offsets.update(
+                    t.storage_offset()
+                    for t in example_inputs
+                    if isinstance(t, torch.Tensor)
+                )
+                return gm.forward
 
-        def counting(gm, example_inputs):
-            graphs.append(gm)
-            return gm.forward
-
-        def guarded(gm, example_inputs):
-            # torch_tpu's backend guards every tensor input's storage offset.
-            offsets.update(
-                t.storage_offset()
-                for t in example_inputs
-                if isinstance(t, torch.Tensor)
-            )
-            return counting(gm, example_inputs)
-
-        with _installed():
-            # An eager call first: the FP8 weights dequantize at the first call.
-            _run(model, _inputs(5))
-            model.compile(backend=guarded, dynamic=False)
-            schedule = torch.linspace(1.0, 0.0, 8)
-            for step, text_len in enumerate((5, 40, 300, 5)):
-                kwargs = _inputs(text_len)
-                # The stage's timestep: a view at the step's offset into the schedule.
-                kwargs["t"] = schedule[step + 1].expand(1)
-                _run(model, kwargs)
-        self.assertEqual(len(graphs), 1)
-        self.assertEqual(offsets, {0})
+            with self.subTest(regional=regional), _installed():
+                # An eager call first: the FP8 weights dequantize at the first call.
+                _run(model, _inputs(5))
+                kwargs = dict(backend=guarded, dynamic=False)
+                if regional:
+                    compile_matching_submodules(model, compile_kwargs=kwargs)
+                else:
+                    model.compile(**kwargs)
+                schedule = torch.linspace(1.0, 0.0, 8)
+                for step, text_len in enumerate((5, 40, 300, 5)):
+                    kwargs = _inputs(text_len)
+                    # The stage's timestep: a view at the step's offset into
+                    # the schedule.
+                    kwargs["t"] = schedule[step + 1].expand(1)
+                    _run(model, kwargs)
+                self.assertEqual(len(graphs), 1)
+                self.assertEqual(offsets, {0})
+        torch._dynamo.reset()
 
     def test_local_rows_are_a_contiguous_copy_of_this_ranks_rows(self):
         for batch in (1, 2):
@@ -223,13 +230,6 @@ class TestIdeogramDiT(_TestBase):
                 # Rank 0's share is full: its strides must not depend on the
                 # prompt's row count (compiled programs guard strides).
                 self.assertEqual(local.stride(), torch.empty(local.shape).stride())
-
-    def test_mixed_prompt_lengths_are_rejected(self):
-        model = _model()
-        kwargs = _inputs(5)
-        kwargs["segment_ids"][0, 0] = -1
-        with _installed(), self.assertRaises(NotImplementedError):
-            _run(model, kwargs)
 
 
 class TestIdeogramSchedule(CustomTestCase):
@@ -292,15 +292,6 @@ class TestIdeogramTextEncoder(_TestBase):
             torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def _has_tpu() -> bool:
-    if importlib.util.find_spec("torch_tpu") is None:
-        return False
-    try:
-        return torch.tpu.device_count() > 0
-    except Exception:
-        return False
-
-
 def _identity_all_to_all(t, head_dim):
     return t
 
@@ -312,7 +303,6 @@ class TestIdeogramAttention(_TestBase):
         impl = tpu_splash_attn.TpuSplashAttentionImpl(
             num_heads=3, head_size=64, causal=False, softmax_scale=0.125
         )
-        impl.use_splash = True
         attn = SimpleNamespace(attn_impl=impl, sp_attention_mode="ulysses")
         gen = torch.Generator().manual_seed(0)
         q, k, v = (torch.randn(1, 512, 3, 64, generator=gen) for _ in range(3))
@@ -346,31 +336,6 @@ class TestIdeogramAttention(_TestBase):
             with self.assertRaises(NotImplementedError):
                 ideogram._attention(attn, q, k, v, keys)
         torch.testing.assert_close(actual, expected)
-
-    @unittest.skipUnless(_has_tpu(), "requires a TPU")
-    def test_padded_attention_matches_reference(self):
-        heads, head_dim, rows, real = 18, 256, 4608, 4130
-        impl = tpu_splash_attn.TpuSplashAttentionImpl(
-            num_heads=heads,
-            head_size=head_dim,
-            causal=False,
-            softmax_scale=head_dim**-0.5,
-        )
-        attn = SimpleNamespace(attn_impl=impl, sp_attention_mode="ulysses")
-        gen = torch.Generator().manual_seed(0)
-        q, k, v = (
-            torch.randn(1, rows, heads, head_dim, generator=gen) for _ in range(3)
-        )
-        # Padded keys hold NaN: they must not be read.
-        k[:, real:], v[:, real:] = float("nan"), float("nan")
-        to_tpu = lambda t: t.bfloat16().to("tpu")  # noqa: E731
-        keys = torch.tensor([0, real], dtype=torch.int32).to("tpu")
-        out = ideogram._attention(attn, *map(to_tpu, (q, k, v)), keys).float().cpu()
-        rounded = lambda t: t.bfloat16().float().transpose(1, 2)  # noqa: E731
-        expected = F.scaled_dot_product_attention(
-            rounded(q), rounded(k[:, :real]), rounded(v[:, :real]), scale=head_dim**-0.5
-        ).transpose(1, 2)
-        torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":

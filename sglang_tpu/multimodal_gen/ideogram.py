@@ -28,7 +28,9 @@ Runtime patch, tracked debt:
   (5) runs the text encoder over the prompt's rows, found on the host and
       right-padded to a multiple of 256. The encoder is causal, so real
       tokens never see the padding;
-  (6) marks the blocks spmd-safe, one program per block;
+  (6) marks the DiT's regionally compiled blocks spmd-safe
+      (``_compile_regions_spmd_safe``): each block is one program whose
+      all-to-alls stay inside it (``--regional-compile``);
   (7) computes the logit-normal timestep schedule on the host: it runs in
       float64 with ``torch.special.ndtri``, which torch_tpu does not
       implement, and every request failed there.
@@ -65,7 +67,7 @@ from sglang.multimodal_gen.runtime.models.encoders import ideogram as encoder
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
     ideogram as stage,
 )
-from sglang_tpu.compile_cache import append_compile_cache_key_tag
+from sglang_tpu.multimodal_gen.tpu_splash_attn import TpuSplashAttentionImpl
 
 # Packed rows pad to this multiple: prompts of up to 512 tokens share a graph
 # per image size, and the kernel step needs >= 512 keys.
@@ -160,11 +162,15 @@ def _layout(model, position_ids, indicator, segment_ids, dtype, device) -> Layou
     )
 
 
+# DiTs whose FP8 weights were dequantized (or left, with the cache off).
+_FP8_DECIDED: weakref.WeakSet = weakref.WeakSet()
+
+
 def _dequantize_fp8_weights(model, dtype) -> None:
     """Each FP8 linear's weight, dequantized once (``_maybe_promote_fp8_weight``)."""
-    if getattr(model, "_tpu_fp8_weights_decided", False):
+    if model in _FP8_DECIDED:
         return
-    model._tpu_fp8_weights_decided = True
+    _FP8_DECIDED.add(model)
     if not envs.SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE:
         return
     for module in model.modules():
@@ -309,7 +315,7 @@ def _attention(usp, q, k, v, keys):
     # Ulysses gathers the ranks' rows in order: the padding stays at the tail.
     q, k, v = (t.transpose(1, 2) for t in (q, k, v))
     impl = usp.attn_impl
-    if getattr(impl, "use_splash", False) and q.device.type in _DEVICE_TYPES:
+    if isinstance(impl, TpuSplashAttentionImpl) and q.device.type in _DEVICE_TYPES:
         # The kernel step; shapes it does not take run its float32 reference.
         out, _ = impl.forward_ring_resume(q, k, v, keys, None)
     else:
@@ -404,26 +410,6 @@ def schedule_call(self, t: torch.Tensor) -> torch.Tensor:
     return _STOCK_SCHEDULE(self, t.cpu()).to(t.device)
 
 
-# The annotation is not part of torch's compile cache key.
-_SPMD_SAFE_CACHE_TAG = "ideogram4-spmd-safe-blocks-v1"
-
-
-def _mark_blocks_spmd_safe(block_cls) -> None:
-    # The whole DiT compiles as one module, outside the regional-compile path
-    # that applies the platform's spmd-safe wrapper.
-    try:
-        from torch_tpu._internal.distributed.spmd_util import spmd_safe
-    except ImportError:
-        # A private torch_tpu API: without it, blocks keep split collectives.
-        return
-    if getattr(block_cls.forward, "__spmd_safe_for_tpu__", False):
-        return
-    wrapped = spmd_safe(block_cls.forward)
-    wrapped.__spmd_safe_for_tpu__ = True
-    block_cls.forward = wrapped
-    append_compile_cache_key_tag(_SPMD_SAFE_CACHE_TAG)
-
-
 def install() -> None:
     dit.Ideogram4Attention.forward = attention_forward
     dit.Ideogram4Transformer2DModel.forward = forward
@@ -432,4 +418,6 @@ def install() -> None:
         encode_ideogram_features
     )
     stage.LogitNormalSchedule.__call__ = schedule_call
-    _mark_blocks_spmd_safe(dit.Ideogram4TransformerBlock)
+    # Every rank runs the same block program: the rank only picks host-built
+    # rows in _dit_call.
+    dit.Ideogram4Transformer2DModel._compile_regions_spmd_safe = True
