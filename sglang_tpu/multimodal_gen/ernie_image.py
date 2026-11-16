@@ -14,8 +14,8 @@ Runtime patch, tracked debt:
       compiled module: the prompt rows pad with zeros to a multiple of 512,
       then of the SP degree; the stock RoPE cos/sin are built on the host,
       padded rows taking the identity rotation; the real image and prompt key
-      counts go in as device int32 tensors. Under Ulysses it gathers the image
-      rows after the call;
+      counts, and this rank's row indices, go in as device int32 tensors.
+      Under Ulysses it gathers the image rows after the call;
   (2) replaces the DiT's ``forward`` on those inputs: the same layers, each
       Ulysses rank taking its share of the image rows (padded at the tail) and
       of the prompt rows;
@@ -25,12 +25,12 @@ Runtime patch, tracked debt:
       keys are never read;
   (4) right-pads the prompt tokens to a multiple of 256. The encoder is causal,
       so real tokens never see the padding, and only real rows reach the DiT;
-  (5) keeps the latents whole under SP (the DiT shards its own stream) and
-      marks the blocks spmd-safe, one program per block.
+  (5) keeps the latents whole under SP (the DiT shards its own stream), and
+      declares the blocks as spmd-safe regions for ``--regional-compile``;
+  (6) runs requests one at a time: a batch takes one prompt length.
 - Upstream PR or issue: none.
 - Remove when: the DiT takes a platform-provided prompt bucket and key counts
-  and shards its own stream under SP, and the whole-DiT compile marks
-  spmd-safe regions.
+  and shards its own stream under SP.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ import functools
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.configs.models.fsdp import is_layer
 from sglang.multimodal_gen.configs.pipeline_configs import ernie_image as config
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
@@ -52,13 +53,13 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_output_all_to_all,
 )
 from sglang.multimodal_gen.runtime.models.dits import ernie_image as dit
-from sglang_tpu.compile_cache import append_compile_cache_key_tag
 from sglang_tpu.multimodal_gen import tpu_splash_attn
 
 # Prompts stay within one bucket; the kernel's prompt step needs >= 512 keys.
 TEXT_ALIGNMENT = 512
 PROMPT_TOKEN_ALIGNMENT = 256
 
+_STOCK_TOKENIZE = config.ErnieImagePipelineConfig.tokenize_prompt
 _STOCK_FORWARD = dit.ErnieImageTransformer2DModel.forward
 _STOCK_ATTENTION_FORWARD = dit.ErnieImageSelfAttention.forward
 
@@ -69,10 +70,12 @@ def _counts(real: int, device) -> torch.Tensor:
 
 @functools.lru_cache(maxsize=16)
 def _layout(pos_embed, shape, dtype, device):
-    """This rank's RoPE rows and the real key counts, built on the host.
+    """This rank's rows, RoPE and the real key counts, built on the host.
 
-    Rows run [image share | prompt share] (see :func:`forward`), repeated per
-    batch row as the stock tables are; padded rows take the identity rotation.
+    Rows run [image share | prompt share] (see :func:`forward`), indexing
+    [image padded to ``sp`` shares | prompt bucket]; the RoPE tables repeat
+    them per batch row as the stock tables do, padded rows taking the identity
+    rotation.
     """
     hp, wp, text_len, bucket, batch, sp, rank = shape
     n_img = hp * wp
@@ -93,19 +96,22 @@ def _layout(pos_embed, shape, dtype, device):
     )
     tables = dit._precompute_rope_cos_sin(pos_embed(ids[None]), dtype)
     image_rows, text_rows = -(-n_img // sp), bucket // sp
+    rows = torch.cat(
+        (
+            torch.arange(image_rows) + rank * image_rows,
+            torch.arange(text_rows) + image_rows * sp + rank * text_rows,
+        )
+    )
 
     def local(table, identity):
         image, text = table.split((n_img, text_len))
         image = F.pad(image, (0, 0, 0, image_rows * sp - n_img), value=identity)
         text = F.pad(text, (0, 0, 0, bucket - text_len), value=identity)
-        rows = (
-            image.narrow(0, rank * image_rows, image_rows),
-            text.narrow(0, rank * text_rows, text_rows),
-        )
-        return torch.cat(rows).repeat(batch, 1).to(device)
+        return torch.cat((image, text))[rows].repeat(batch, 1).to(device)
 
     rope = (local(tables[0], 1.0), local(tables[1], 0.0))
-    return rope, (_counts(n_img, device), _counts(text_len, device))
+    keys = (_counts(n_img, device), _counts(text_len, device))
+    return rope, keys, rows.to(torch.int32).to(device)
 
 
 def _dit_call(self, *args, **kwargs):
@@ -133,13 +139,14 @@ def _dit_call(self, *args, **kwargs):
     hp, wp = height // p, width // p
     rank = get_sp_parallel_rank() if sp > 1 else 0
     shape = (hp, wp, text_len, bucket, batch, sp, rank)
-    rope, keys = _layout(self.pos_embed, shape, latents.dtype, latents.device)
+    rope, keys, rows = _layout(self.pos_embed, shape, latents.dtype, latents.device)
     kwargs.update(
         encoder_hidden_states=F.pad(text, (0, 0, 0, bucket - text_len)),
         encoder_hidden_states_mask=None,
         txt_seq_lens=[bucket] * batch,
         tpu_rope=rope,
         tpu_keys=keys,
+        tpu_rows=rows,
     )
     patches = gather_seq(torch.nn.Module.__call__(self, **kwargs), hp * wp)
     # The stock unpatchify.
@@ -184,13 +191,9 @@ def forward(
         text = self.text_proj(text)
     sp = get_sp_world_size()
     image_rows, text_rows = -(-image.shape[1] // sp), text.shape[1] // sp
-    if sp > 1:
-        # Each rank's share of the image (padded at its tail) and of the prompt.
-        rank = get_sp_parallel_rank()
-        image = F.pad(image, (0, 0, 0, image_rows * sp - image.shape[1]))
-        image = image.narrow(1, rank * image_rows, image_rows)
-        text = text.narrow(1, rank * text_rows, text_rows)
-    x = torch.cat((image, text), 1)
+    image = F.pad(image, (0, 0, 0, image_rows * sp - image.shape[1]))
+    # This rank's rows by device index, so every rank runs the same program.
+    x = torch.cat((image, text), 1).index_select(1, kwargs["tpu_rows"])
     c = self.time_embedding(self.time_proj(timestep.to(dtype)).to(dtype))
     # As the stock: the fused residual-gate kernel needs dense inputs.
     modulation = [
@@ -207,7 +210,9 @@ def forward(
 
 
 def _uses_kernel(impl, q, keys) -> bool:
-    if not getattr(impl, "use_splash", False) or q.device.type != "tpu":
+    if not isinstance(impl, tpu_splash_attn.TpuSplashAttentionImpl):
+        return False
+    if not impl.use_splash or q.device.type != "tpu":
         return False
     # Every step takes the kernel or none does: their carries differ.
     return all(
@@ -317,13 +322,12 @@ def _pad_tokens(inputs, tokenizer):
     return inputs
 
 
-def _padded_tokenize(tokenize):
-    @functools.wraps(tokenize)
-    def wrapped(self, prompts, tokenizer, tok_kwargs):
-        return _pad_tokens(tokenize(self, prompts, tokenizer, tok_kwargs), tokenizer)
+def _tokenize(self, prompts, tokenizer, tok_kwargs):
+    return _pad_tokens(_STOCK_TOKENIZE(self, prompts, tokenizer, tok_kwargs), tokenizer)
 
-    wrapped.__wrapped_for_tpu__ = True
-    return wrapped
+
+def _unbatched(self, batch) -> bool:
+    return False
 
 
 def _whole_latents(self, batch, latents):
@@ -331,34 +335,15 @@ def _whole_latents(self, batch, latents):
     return latents, False
 
 
-# The annotation is not part of torch's compile cache key.
-_SPMD_SAFE_CACHE_TAG = "ernie-image-spmd-safe-blocks-v1"
-
-
-def _mark_blocks_spmd_safe(block_cls) -> None:
-    # The whole DiT compiles as one module, outside the regional-compile path
-    # that applies the platform's spmd-safe wrapper.
-    try:
-        from torch_tpu._internal.distributed.spmd_util import spmd_safe
-    except ImportError:
-        # A private torch_tpu API: without it, blocks keep split collectives.
-        return
-    if getattr(block_cls.forward, "__spmd_safe_for_tpu__", False):
-        return
-    forward = spmd_safe(block_cls.forward)
-    forward.__spmd_safe_for_tpu__ = True
-    block_cls.forward = forward
-    append_compile_cache_key_tag(_SPMD_SAFE_CACHE_TAG)
-
-
 def install() -> None:
     pipeline_config = config.ErnieImagePipelineConfig
-    if not getattr(pipeline_config.tokenize_prompt, "__wrapped_for_tpu__", False):
-        pipeline_config.tokenize_prompt = _padded_tokenize(
-            pipeline_config.tokenize_prompt
-        )
+    pipeline_config.tokenize_prompt = _tokenize
     pipeline_config.shard_latents_for_sp = _whole_latents
+    pipeline_config.supports_dynamic_batching_for_request = _unbatched
     dit.ErnieImageSelfAttention.forward = attention_forward
-    dit.ErnieImageTransformer2DModel.forward = forward
-    dit.ErnieImageTransformer2DModel.__call__ = _dit_call
-    _mark_blocks_spmd_safe(dit.ErnieImageSharedAdaLNBlock)
+    model = dit.ErnieImageTransformer2DModel
+    model.forward = forward
+    model.__call__ = _dit_call
+    # Under --regional-compile each block is one spmd-safe program.
+    model._compile_conditions = [is_layer]
+    model._compile_regions_spmd_safe = True

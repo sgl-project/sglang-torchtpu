@@ -2,13 +2,14 @@
 """Tests for sglang_tpu's ERNIE-Image patches (sglang_tpu.multimodal_gen.ernie_image)."""
 
 import contextlib
+import functools
 import importlib.util
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-import torch.compiler.config as compiler_config
+import torch.nn.functional as F
 from transformers import BatchEncoding, MistralConfig
 
 from sglang.multimodal_gen.configs.models.dits.ernie_image import (
@@ -17,26 +18,36 @@ from sglang.multimodal_gen.configs.models.dits.ernie_image import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs import ernie_image as config
 from sglang.multimodal_gen.runtime import server_args as server_args_module
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
+from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits import ernie_image as dit
 from sglang.multimodal_gen.runtime.models.encoders.mistral_3 import MistralModel
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
+from sglang.multimodal_gen.runtime.utils import torch_compile
 from sglang.multimodal_gen.test.unit.conftest import _make_unit_server_args
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.multimodal_gen import ernie_image, worker
+from sglang_tpu.multimodal_gen import ernie_image
 
-# Whole node, not chips=1: the parallel-state setup runs the TPU worker
-# bootstrap, which opens a chip outside the chip-parallel TPU_VISIBLE_CHIPS pin.
-register_tpu_ci(est_time=40, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
+
+
+@contextlib.contextmanager
+def _sp(rank=0, world_size=1):
+    """Tensor parallel 1 and one Ulysses rank, without process groups."""
+    tp = SimpleNamespace(world_size=1, rank_in_group=0, all_gather=lambda x, dim: x)
+    sp = SimpleNamespace(
+        world_size=world_size,
+        rank_in_group=rank,
+        ulysses_world_size=world_size,
+        ring_world_size=1,
+    )
+    with (
+        patch.object(parallel_state, "_TP", tp),
+        patch.object(parallel_state, "_SP", sp),
+    ):
+        yield
 
 
 @contextlib.contextmanager
@@ -46,11 +57,12 @@ def _installed():
         for owner, name in (
             (config.ErnieImagePipelineConfig, "tokenize_prompt"),
             (config.ErnieImagePipelineConfig, "shard_latents_for_sp"),
+            (config.ErnieImagePipelineConfig, "supports_dynamic_batching_for_request"),
             (dit.ErnieImageSelfAttention, "forward"),
             (dit.ErnieImageTransformer2DModel, "forward"),
             (dit.ErnieImageTransformer2DModel, "__call__"),
-            (dit.ErnieImageSharedAdaLNBlock, "forward"),
-            (compiler_config, "cache_key_tag"),
+            (dit.ErnieImageTransformer2DModel, "_compile_conditions"),
+            (dit.ErnieImageTransformer2DModel, "_compile_regions_spmd_safe"),
         ):
             stack.enter_context(patch.object(owner, name, getattr(owner, name)))
         ernie_image.install()
@@ -58,11 +70,11 @@ def _installed():
         yield
 
 
-def _model():
+def _model(heads=2):
     torch.manual_seed(0)
     arch = ErnieImageArchConfig(
         num_layers=2,
-        num_attention_heads=2,
+        num_attention_heads=heads,
         attention_head_dim=64,
         ffn_hidden_size=128,
         text_in_dim=48,
@@ -105,17 +117,9 @@ def _run(model, kwargs):
 
 class _TestBase(CustomTestCase):
     def setUp(self):
-        self._previous_args = server_args_module._global_server_args
+        self.addCleanup(set_global_server_args, server_args_module._global_server_args)
         set_global_server_args(_make_unit_server_args())
-        if not model_parallel_is_initialized():
-            ensure_distributed_env_defaults()
-            with patch.object(worker, "install_runtime_patches"):
-                maybe_init_distributed_environment_and_model_parallel(
-                    tp_size=1, sp_size=1
-                )
-
-    def tearDown(self):
-        set_global_server_args(self._previous_args)
+        self.enterContext(_sp())
 
 
 class TestErnieImageDenoise(_TestBase):
@@ -150,25 +154,97 @@ class TestErnieImageDenoise(_TestBase):
         model = _model()
         kwargs = _inputs(5, batch=2)
         kwargs["txt_seq_lens"] = [5, 3]
-        with _installed(), self.assertRaises(NotImplementedError):
-            _run(model, kwargs)
+        with _installed():
+            # The scheduler never batches requests, whose prompt lengths differ.
+            pipeline_config = config.ErnieImagePipelineConfig()
+            self.assertFalse(
+                pipeline_config.supports_dynamic_batching_for_request(None)
+            )
+            with self.assertRaises(NotImplementedError):
+                _run(model, kwargs)
 
-    def test_whole_dit_compiles_once_across_prompt_lengths(self):
-        model = _model()
-        graphs = []
+    def test_dit_compiles_once_across_prompt_lengths(self):
+        wrapped = []
+
+        def wrap_region(forward):
+            wrapped.append(forward)
+            return forward
+
+        for regional in (False, True):
+            model, graphs, counts = _model(), [], []
+
+            def counting_backend(graph_module, example_inputs):
+                graphs.append(graph_module)
+                return graph_module.forward
+
+            kwargs = dict(backend=counting_backend, dynamic=False)
+            with (
+                self.subTest(regional=regional),
+                _installed(),
+                patch.object(
+                    torch_compile.current_platform,
+                    "prepare_spmd_region_wrapper",
+                    return_value=wrap_region,
+                ),
+            ):
+                if regional:  # --regional-compile: each block, spmd-safe
+                    torch_compile.compile_matching_submodules(
+                        model, compile_kwargs=kwargs
+                    )
+                else:  # the TPU default compiles the whole DiT
+                    model.compile(**kwargs)
+                for text_len in (5, 5, 37, 300):
+                    _run(model, _inputs(text_len))
+                    counts.append(len(graphs))
+                self.assertEqual(counts[2:], [counts[1]] * 2)
+        self.assertEqual(len(wrapped), len(model.layers))
+
+    def test_one_program_serves_every_rank(self):
+        # Ulysses 4 without process groups: stand-ins keep the collectives'
+        # shapes, so each rank runs the compiled DiT on its own rows.
+        sp, model, graphs = 4, _model(heads=4), []
 
         def counting_backend(graph_module, example_inputs):
             graphs.append(graph_module)
             return graph_module.forward
 
-        counts = []
-        with _installed():
-            # The TPU default (no --regional-compile) compiles the whole DiT.
+        with (
+            _installed(),
+            patch.multiple(
+                ernie_image,
+                _usp_input_all_to_all=lambda t, head_dim: t.repeat(1, sp, 1, 1)[
+                    :, :, : t.shape[2] // sp
+                ],
+                _usp_output_all_to_all=lambda t, head_dim: t[
+                    :, : t.shape[1] // sp
+                ].repeat(1, 1, sp, 1),
+                gather_seq=lambda t, n: t.repeat(1, sp, 1)[:, :n],
+            ),
+        ):
             model.compile(backend=counting_backend, dynamic=False)
-            for text_len in (5, 5, 37, 300):
-                _run(model, _inputs(text_len))
-                counts.append(len(graphs))
-        self.assertEqual(counts[2:], [counts[1]] * 2)
+            for rank in range(sp):
+                with _sp(rank, sp):
+                    _run(model, _inputs(37, 3, 5))
+        self.assertEqual(len(graphs), 1)
+
+    def test_rank_rows_tile_the_whole_layout(self):
+        pos_embed, shape = _model(heads=4).pos_embed, (3, 5, 37, 512, 1)
+        layout = functools.partial(
+            ernie_image._layout, pos_embed, dtype=torch.float32, device="cpu"
+        )
+        whole = layout((*shape, 1, 0))[0]
+        shares = [layout((*shape, 4, rank))[0] for rank in range(4)]
+        # 15 image rows pad to 4 per rank; Ulysses gathers the image shares,
+        # then the prompt shares, in rank order.
+        for i, identity in enumerate((1.0, 0.0)):
+            image, text = whole[i].split((15, 512))
+            image = F.pad(image, (0, 0, 0, 1), value=identity)
+            got = [share[i][:4] for share in shares] + [
+                share[i][4:] for share in shares
+            ]
+            torch.testing.assert_close(
+                torch.cat(got), torch.cat((image, text)), rtol=0, atol=0
+            )
 
 
 def _causal_hidden(input_ids):
