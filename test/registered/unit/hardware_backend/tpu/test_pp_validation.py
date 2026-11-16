@@ -104,7 +104,7 @@ def _apply(args):
     with (
         patch("sglang_tpu.patches._prepare_tpu_env") as prepare_tpu_env,
         patch(
-            "sglang.srt.utils.hf_transformers.config.get_config",
+            "sglang.srt.hf_transformers.config.get_config",
             return_value=SimpleNamespace(architectures=["GptOssForCausalLM"]),
         ),
     ):

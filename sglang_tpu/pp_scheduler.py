@@ -196,13 +196,14 @@ def decode_transfer_status(
         if queue.enable_staging
         else queue._poll_with_metadata_gate()
     )
+    items = list(queue.queue.items())
     terminal_rids = [
         item.req.rid
-        for item, poll in zip(queue.queue, polls)
+        for item, poll in zip(items, polls)
         if poll in (KVPoll.Success, KVPoll.Failed)
     ]
     failed_rids = [
-        item.req.rid for item, poll in zip(queue.queue, polls) if poll == KVPoll.Failed
+        item.req.rid for item, poll in zip(items, polls) if poll == KVPoll.Failed
     ]
     if previous is not None:
         terminal_rids = sorted(set(previous.terminal_rids) & set(terminal_rids))
@@ -213,7 +214,7 @@ def decode_transfer_status(
 def abort_failed_receivers(queue: Any, failed_rids: List[str]) -> None:
     """Fail this stage's copies of transfers that failed on any stage."""
     failed = set(failed_rids)
-    for decode_req in queue.queue:
+    for decode_req in queue.queue.items():
         if decode_req.req.rid not in failed:
             continue
         receiver = decode_req.kv_receiver

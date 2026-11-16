@@ -51,24 +51,15 @@ forward_tpu_dsv4_hash_topk_torch, forward_tpu_dsv4_hash_topk
        static-shape torch.where padded-token masking upstream.
 
 tpu_dsv4_silu_and_mul_clamp
-  Why: sglang.kernels.ops.moe.dsv4.silu_and_mul_clamp dispatches to sgl_kernel
-       on XPU or a CUDA JIT kernel otherwise, which cannot compile or run on TPU.
-  How: AROUND sglang.kernels.ops.moe.dsv4.silu_and_mul_clamp and
-       sglang.srt.models.deepseek_v2.silu_and_mul_clamp computes clamped SwiGLU
+  Why: sglang.kernels.ops.activation.silu_and_mul_clamp.silu_and_mul_clamp
+       dispatches to sgl_kernel on XPU or a CUDA JIT kernel otherwise, which
+       cannot compile or run on TPU.
+  How: AROUND sglang.kernels.ops.activation.silu_and_mul_clamp.silu_and_mul_clamp
+       and sglang.srt.models.deepseek_v2.silu_and_mul_clamp computes clamped SwiGLU
        in float32 PyTorch ops and copies the result into output.
   Upstream PR or issue: sgl-project/sglang-torchtpu#1119.
   Remove when: silu_and_mul_clamp is converted to a BaseFusedOp with a
        forward_native fallback.
-
-tpu_dsv4_current_mhc_post_fusion
-  Why: sglang.srt.layers.moe.mhc_post_fusion.current_mhc_post_fusion reads a
-       ContextVar that causes a Dynamo graph break under torch.compile(fullgraph=True)
-       on TPU, and CUDA/HIP stream-overlap MHC post-fusion is unused on TPU.
-  How: AROUND sglang.srt.layers.moe.mhc_post_fusion.current_mhc_post_fusion
-       returns None when torch.compiler.is_compiling().
-  Upstream PR or issue: sgl-project/sglang-torchtpu#1119.
-  Remove when: current_mhc_post_fusion is marked constant or skipped when
-       compiling without MHC post-fusion enabled.
 
 disable_tpu_dsv4_wo_a_fp8_gemm, get_tpu_dsv4_kernel_num_heads,
 skip_tpu_dsv4_prewarm_mhc_kernels
@@ -260,12 +251,6 @@ def tpu_dsv4_silu_and_mul_clamp(
     output.copy_(res.to(output.dtype))
 
 
-def tpu_dsv4_current_mhc_post_fusion(original):
-    if torch.compiler.is_compiling():
-        return None
-    return original()
-
-
 def disable_tpu_dsv4_wo_a_fp8_gemm(original, quant_config) -> bool:
     del original, quant_config
     return False
@@ -396,18 +381,13 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
-            "sglang.kernels.ops.moe.dsv4.silu_and_mul_clamp",
+            "sglang.kernels.ops.activation.silu_and_mul_clamp.silu_and_mul_clamp",
             tpu_dsv4_silu_and_mul_clamp,
             HookType.AROUND,
         ),
         (
             "sglang.srt.models.deepseek_v2.silu_and_mul_clamp",
             tpu_dsv4_silu_and_mul_clamp,
-            HookType.AROUND,
-        ),
-        (
-            "sglang.srt.layers.moe.mhc_post_fusion.current_mhc_post_fusion",
-            tpu_dsv4_current_mhc_post_fusion,
             HookType.AROUND,
         ),
         (

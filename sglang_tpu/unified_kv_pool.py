@@ -10,6 +10,7 @@ reserved as the dummy-write sink for padded tokens.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
 import math
@@ -235,8 +236,9 @@ def _unsupported_reason(kvc) -> Optional[str]:
             "does not support --disaggregation-decode-retraction-backup host_pool.",
         ),
         (
-            getattr(disagg, "disaggregation_decode_host_receive_threshold", 0.0) > 0,
-            "does not support --disaggregation-decode-host-receive-threshold > 0.",
+            # Upstream inverted the knob: 1 disables host receive, < 1 enables it.
+            getattr(disagg, "disaggregation_decode_host_receive_threshold", 1.0) < 1,
+            "does not support --disaggregation-decode-host-receive-threshold < 1.",
         ),
         (
             disagg_mode != "null" and tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get(),
@@ -680,6 +682,176 @@ class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
         self.allocated_pages = 0
 
 
+@functools.cache
+def _shared_swa_prefill_budget_cls() -> type:
+    """FULL+SWA prefill budget over one shared byte pool.
+
+    Upstream dropped ``SharedSWAPrefillBudget`` for the chain budget, which
+    needs the unified chain allocator; this keeps the joint FULL/SWA admission
+    the TPU unified allocator answers through ``can_reserve``.
+    """
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+    from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+
+    class SharedSWAPrefillBudget(SWAPrefillBudget):
+        """FULL and SWA reservations compete for the same physical byte budget."""
+
+        def __init__(self, *args, num_mixed_decode_tokens=0, **kwargs):
+            super().__init__(
+                *args, num_mixed_decode_tokens=num_mixed_decode_tokens, **kwargs
+            )
+            self.swa_offset = num_mixed_decode_tokens
+            self.additive_chunk = False
+
+        def _fits(self, full_tokens, swa_tokens, *, empty_pool=False):
+            return self.allocator.can_reserve(
+                full_tokens + (0 if empty_pool else self.total_offset),
+                swa_tokens + (0 if empty_pool else self.swa_offset),
+                full_evictable_tokens=0
+                if empty_pool
+                else self.tree_cache.full_evictable_size(),
+                swa_evictable_tokens=0 if empty_pool else self._window_evictable(),
+                empty_pool=empty_pool,
+                require_token_slack=empty_pool,
+            )
+
+        def prepare_load_back(
+            self,
+            *,
+            full_tokens: int,
+            extend_input_len: int,
+            max_new_tokens: int,
+            chunk_limit: int | None,
+            window_host_hit_lengths=None,
+            state_slots: int = 0,
+            request_rows: int = 0,
+        ) -> bool:
+            # H2D pins both bands. Realize the selected joint budget while their
+            # holes can still be compacted, including pending prefill/decode demand.
+            full_tokens = int(self.ceil_paged_tokens(full_tokens + self.total_offset))
+            swa_tokens = int(
+                self.ceil_paged_tokens(
+                    self.swa_tokens(
+                        extend_input_len,
+                        max_new_tokens,
+                        chunk_limit=chunk_limit,
+                        window_host_hit_lengths=window_host_hit_lengths,
+                    )
+                    + self.swa_offset
+                )
+            )
+            return (
+                self.allocator.reclaim_for_prealloc(
+                    self.tree_cache,
+                    KVDemand(
+                        full_tokens=full_tokens,
+                        window_tokens={BaseSWAKVPool.WINDOW_SUB_POOL: swa_tokens},
+                    ),
+                )
+                is None
+            )
+
+        def _joint_chunk_cap(
+            self, *, max_chunk_tokens, chunk_limit, window_host_hit_lengths=None
+        ):
+            lo, hi = 0, max(0, max_chunk_tokens) // self.page_size
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                tokens = mid * self.page_size
+                if self._fits(
+                    tokens + self.page_size,
+                    self.swa_tokens(
+                        tokens,
+                        0,
+                        chunk_limit=chunk_limit,
+                        window_host_hit_lengths=window_host_hit_lengths,
+                    ),
+                ):
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo * self.page_size
+
+        def check_prefill(
+            self,
+            *,
+            extend_input_len: int,
+            total_tokens: int,
+            max_new_tokens: int,
+            input_tokens: int,
+            chunk_limit: int | None,
+            window_host_hit_lengths=None,
+            **_,
+        ) -> tuple[bool, int | None]:
+            needed = self.swa_tokens(
+                extend_input_len,
+                max_new_tokens,
+                chunk_limit=chunk_limit,
+                window_host_hit_lengths=window_host_hit_lengths,
+            )
+            if self._fits(total_tokens, needed):
+                return True, chunk_limit
+            if chunk_limit is None or self._fits(
+                input_tokens + max_new_tokens + self.page_size,
+                self.swa_tokens(input_tokens, max_new_tokens, chunk_limit=chunk_limit),
+                empty_pool=True,
+            ):
+                return False, None
+            cap = self._joint_chunk_cap(
+                max_chunk_tokens=min(chunk_limit, max(0, extend_input_len - 1)),
+                chunk_limit=chunk_limit,
+                window_host_hit_lengths=window_host_hit_lengths,
+            )
+            return (True, min(chunk_limit, cap)) if cap > 0 else (False, None)
+
+        def has_capacity(self) -> bool:
+            return self._fits(0, 0)
+
+        def available_chunk_tokens(self, chunk_limit: int) -> int | None:
+            return chunk_limit if chunk_limit > 0 else None
+
+        def fit_chunk(
+            self,
+            req,
+            *,
+            extend_input_len: int,
+            max_new_tokens: int,
+            chunk_limit: int,
+            **_,
+        ) -> int | None:
+            candidate = min(extend_input_len, chunk_limit)
+            finishes = candidate >= extend_input_len
+            headroom = max_new_tokens if finishes else 0
+            if self._fits(
+                candidate + headroom + self.page_size,
+                self.swa_tokens(candidate, headroom, chunk_limit=chunk_limit),
+            ):
+                return chunk_limit
+            cap = self._joint_chunk_cap(
+                max_chunk_tokens=max(0, candidate - 1) if finishes else candidate,
+                chunk_limit=chunk_limit,
+            )
+            return min(chunk_limit, cap) if cap > 0 else None
+
+        def can_allocate_prefill(
+            self,
+            *,
+            paged_input: int,
+            extend_input_len: int,
+            max_new_tokens: int,
+            chunk_limit: int | None,
+            **_,
+        ) -> bool:
+            return self._fits(
+                extend_input_len + max_new_tokens + self.page_size,
+                self.swa_tokens(
+                    extend_input_len, max_new_tokens, chunk_limit=chunk_limit
+                ),
+            )
+
+    return SharedSWAPrefillBudget
+
+
 class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """Logical-to-Physical Unified KV allocator for Full + SWA attention on TPU."""
 
@@ -796,9 +968,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
     def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
-        from sglang.srt.mem_cache.prefill_budget import SharedSWAPrefillBudget
-
-        return SharedSWAPrefillBudget(
+        return _shared_swa_prefill_budget_cls()(
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
@@ -809,38 +979,38 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             <= self._free_page_count()
         )
 
-    def prealloc_fits_assumes_reclaim(self) -> bool:
-        """Whether ``prealloc_fits`` already accounts for evictable RadixCache pages via ``can_reserve``."""
-        return True
+    def _demand_tokens(self, demand) -> Tuple[int, int]:
+        """(full, swa) tokens of an upstream ``KVDemand``."""
+        demand = demand.completed(self.window_pool_names())
+        return demand.full_tokens, demand.window_tokens[BaseSWAKVPool.WINDOW_SUB_POOL]
 
-    def prealloc_ceiling_fits(
-        self, full_tokens: int | float, swa_tokens: int | float
-    ) -> bool:
-        """Return True if a request needing ``(full_tokens, swa_tokens)`` can ever fit in an empty pool."""
+    def prealloc_ceiling_fits(self, demand) -> bool:
+        """Return True if ``demand``'s (full, swa) tokens can ever fit in an empty pool."""
+        full_tokens, swa_tokens = self._demand_tokens(demand)
         return self.can_reserve(
             full_tokens, swa_tokens, empty_pool=True, require_token_slack=True
         )
 
     def prealloc_fits(
         self,
-        tree_cache,
-        full_tokens: int,
-        swa_tokens: int,
+        demand,
         *,
+        evictable,
         full_budget_tokens: int,
-        swa_budget_tokens: int | None = None,
+        window_budget_tokens=None,
     ) -> bool:
         """Price Full and SWA preallocation together against the shared page store."""
+        full_tokens, swa_tokens = self._demand_tokens(demand)
+        swa_budget_tokens = (window_budget_tokens or {}).get(
+            BaseSWAKVPool.WINDOW_SUB_POOL
+        )
         if full_tokens > full_budget_tokens or (
             swa_budget_tokens is not None and swa_tokens > swa_budget_tokens
         ):
             return False
-        full_evictable_tokens = (
-            0 if tree_cache is None else tree_cache.full_evictable_size()
-        )
-        swa_evictable_tokens = (
-            0 if tree_cache is None else tree_cache.swa_evictable_size()
-        )
+        owner, _, _ = self.sub_pool_roles()
+        full_evictable_tokens = evictable.get(owner, 0)
+        swa_evictable_tokens = evictable.get(BaseSWAKVPool.WINDOW_SUB_POOL, 0)
         full_tokens += max(
             0, self.full_available_size() + full_evictable_tokens - full_budget_tokens
         )
@@ -855,6 +1025,13 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             full_evictable_tokens=full_evictable_tokens,
             swa_evictable_tokens=swa_evictable_tokens,
         )
+
+    def admit_preallocation(self, tree_cache, admission, take, **budgets) -> bool:
+        # prealloc_fits credits evictable pages (can_reserve), so the rows the
+        # take needs must be reclaimed before they are handed out.
+        if not self.prealloc_fits(admission, **budgets):
+            return False
+        return self.reclaim_for_prealloc(tree_cache, take) is None
 
     def alloc_decode(
         self,
@@ -915,7 +1092,9 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         token_capacity: int,
         sliding_window_size: int | None,
         chunk_size: int | None,
+        **_,
     ) -> int | None:
+        # The window retirement inputs upstream added are not modeled here.
         del token_capacity
         from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 
@@ -957,22 +1136,22 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         needed_pages = self._page_ids_needed(need_f, need_s)
         short = needed_pages - self._free_page_count()
         if short > 0:
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=short * ps, swa_num_tokens=0)
-            )
+            tree_cache.evict(EvictParams(num_tokens=short * ps))
         short = needed_pages - self._free_page_count()
         if short > 0:
-            tree_cache.evict_for_alloc(
+            tree_cache.evict(
                 EvictParams(
                     num_tokens=0,
-                    swa_num_tokens=_cdiv(short, self._swa_groups) * ps,
+                    window_num_tokens={
+                        BaseSWAKVPool.WINDOW_SUB_POOL: _cdiv(short, self._swa_groups)
+                        * ps
+                    },
                 )
             )
         return self.new_pages_available(need_f, need_s)
 
-    def reclaim_for_prealloc(
-        self, tree_cache, full_tokens: int, swa_tokens: int
-    ) -> str | None:
+    def reclaim_for_prealloc(self, tree_cache, demand) -> str | None:
+        full_tokens, swa_tokens = self._demand_tokens(demand)
         ready = self.evict_to_free_tokens(
             tree_cache, full_tokens, swa_num_tokens=swa_tokens
         )

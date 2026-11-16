@@ -13,7 +13,7 @@
 # ==============================================================================
 """One forward's residual and its producer's outstanding contribution."""
 
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 
@@ -26,14 +26,20 @@ from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
 
 
 class DeclaredSum:
-    """A sum every output of this producer owes to its declared input edge."""
+    """A sum every output owes to its declared input edge. complete_sum is
+    the producer's custom implementation bound to this invocation, or None
+    for the ordinary group all-reduce."""
 
-    __slots__ = ("group",)
+    __slots__ = ("group", "complete_sum")
 
-    def __init__(self, group: SumGroup):
+    # The forward passes every field explicitly (see UnreducedOutput).
+    def __init__(self, group: SumGroup, complete_sum: Optional[Callable] = None):
         self.group = group
+        self.complete_sum = complete_sum
 
     def complete(self, value):
+        if self.complete_sum is not None:
+            return self.complete_sum(value)
         return _sum_group(self.group).all_reduce(value)
 
 
@@ -56,7 +62,7 @@ class Contribution:
     def __init__(
         self,
         value: Optional[torch.Tensor],
-        update: ResidualUpdate,
+        update: Optional[ResidualUpdate],
         owed: Union[UnreducedOutput, DeclaredSum, DeferredFinalize, None] = None,
     ):
         self.value = value
@@ -80,9 +86,10 @@ class Contribution:
         return value
 
     def release(self):
-        """Drop the tensors of a contribution its consumer has taken."""
+        """Drop a consumed contribution and its per-invocation update state."""
         self.value = None
         self.owed = None
+        self.update = None
 
 
 class OwedOutput:
@@ -112,22 +119,22 @@ class ResidualStream:
     selection live on the bound stage, not on tensor values.
     """
 
-    __slots__ = ("residual", "pending")
+    __slots__ = ("residual", "pending", "transport")
 
     def __init__(self, residual=None):
         self.residual = residual
         self.pending = None
+        self.transport = None
 
     @classmethod
-    def from_handoff(cls, hidden, residual, update, *, declared_sum=None):
+    def from_handoff(cls, hidden, residual, update):
         """Reconstruct a stream from a tensor handoff, including a TBO microbatch.
 
         Args:
-            hidden: Received output or already-written residual tensor.
+            hidden: Received output, complete, or already-written residual tensor.
             residual: Separate residual tensor. None means hidden already holds
                 the written residual, rather than an uninitialized stack.
             update: Producer operation for a separate contribution/residual pair.
-            declared_sum: Static sum owed by hidden when residual is separate.
 
         Returns:
             (handle, stream). Use start() for a fresh, uninitialized stack instead.
@@ -135,7 +142,7 @@ class ResidualStream:
         stream = cls(residual)
         if residual is None:
             return stream.write(hidden), stream
-        return stream.record(hidden, update, declared_sum=declared_sum), stream
+        return stream.record(hidden, update), stream
 
     def write(self, residual):
         if self.pending is not None:
@@ -152,7 +159,8 @@ class ResidualStream:
         Args:
             output: Complete tensor, UnreducedOutput, or producer-specific DeferredFinalize.
             update: Producer operation that the next boundary must apply.
-            declared_sum: SumGroup statically owed by a raw tensor, or None. Cannot
+            declared_sum: The producer's outstanding sum contract,
+                statically owed by a raw tensor; None when complete. Cannot
                 be combined with another output wrapper's completion contract.
 
         Returns:
@@ -164,13 +172,23 @@ class ResidualStream:
         if declared_sum is not None:
             if not isinstance(output, torch.Tensor):
                 raise RuntimeError("a declared sum cannot carry another completion")
-            contribution = Contribution(output, update, DeclaredSum(declared_sum))
+            owed = (
+                declared_sum
+                if isinstance(declared_sum, DeclaredSum)
+                else DeclaredSum(declared_sum, None)
+            )
+            contribution = Contribution(output, update, owed)
         elif isinstance(output, UnreducedOutput):
             contribution = Contribution(output.partial, update, output)
         elif isinstance(output, DeferredFinalize):
             contribution = Contribution(None, update, output)
         else:
             contribution = Contribution(output, update, None)
+        bind = update.bind
+        if bind is not None:
+            raise RuntimeError(
+                "bind an invocation update at the stage before recording it"
+            )
         self.pending = contribution
         return OwedOutput(contribution) if contribution.owed is not None else output
 
@@ -223,25 +241,21 @@ class ResidualStream:
             raise NotImplementedError("a finalize handoff requires main-output capture")
         return value.clone() if self.residual is None else value + self.residual
 
-    def export(self, hidden, *, takes_handoff=False, preserve_declared=False):
+    def export(self, hidden, *, takes_handoff=False):
         """Export the output/residual pair without closing or consuming the stream.
 
         Args:
             hidden: Current stream tensor or opaque owed handle.
             takes_handoff: Pass a producer-specific finalize handoff through for a
                 terminal adapter that can consume it; otherwise complete it here.
-            preserve_declared: Export a raw declared partial sum for a receiver
-                whose incoming contract reconstructs that sum (for example PP).
 
         Returns:
-            (output, residual), completing outstanding work unless explicitly
-            preserved. Does not apply the pending residual update.
+            (output, residual), completing outstanding work. Does not apply the
+            pending residual update.
         """
         self.check(hidden)
         if self.pending is None:
             return hidden, None
-        if preserve_declared and isinstance(self.pending.owed, DeclaredSum):
-            return self.pending.value, self.residual
         if takes_handoff and isinstance(self.pending.owed, DeferredFinalize):
             return self.pending.owed, self.residual
         return self.pending.complete(), self.residual

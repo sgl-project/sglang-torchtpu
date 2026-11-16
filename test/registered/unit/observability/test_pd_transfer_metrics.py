@@ -7,10 +7,14 @@ from unittest.mock import Mock, patch
 
 import prometheus_client
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
+)
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
 )
 from sglang.srt.observability.metrics_collector import (
     QueueCount,
@@ -37,16 +41,24 @@ class TestPDTransferMetrics(CustomTestCase):
         self.reporter.stats = SchedulerStats()
         self.reporter.scheduler = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.PREFILL,
-            disagg_prefill_inflight_queue=[],
+            disagg_prefill_transfer_queue=[],
             disagg_decode_transfer_queue=SimpleNamespace(
-                queue=[], num_pending_deferred_releases=lambda: 0
+                queue=self._decode_transfer_list([]),
+                num_pending_deferred_releases=lambda: 0,
             ),
         )
+
+    @staticmethod
+    def _decode_transfer_list(decode_reqs):
+        queue = IndexedReqList(ListKind.PD_RECEIVING, req_of=lambda d: d.req)
+        queue._join(decode_reqs)
+        return queue
 
     def set_queue(self, mode, times):
         self.reporter.scheduler.disaggregation_mode = mode
         requests = [
             SimpleNamespace(
+                owner_list=None,
                 time_stats=SimpleNamespace(
                     prefill_transfer_queue_entry_time=(
                         ts if mode == DisaggregationMode.PREFILL else 0
@@ -54,17 +66,19 @@ class TestPDTransferMetrics(CustomTestCase):
                     decode_transfer_queue_entry_time=(
                         ts if mode == DisaggregationMode.DECODE else 0
                     ),
-                )
+                ),
             )
             for ts in times
         ]
         if mode == DisaggregationMode.PREFILL:
-            self.reporter.scheduler.disagg_prefill_inflight_queue = requests
+            self.reporter.scheduler.disagg_prefill_transfer_queue = requests
         else:
             # No transport poller or status is needed to measure waiting rooms.
-            self.reporter.scheduler.disagg_decode_transfer_queue.queue = [
-                SimpleNamespace(req=req) for req in requests
-            ]
+            self.reporter.scheduler.disagg_decode_transfer_queue.queue = (
+                self._decode_transfer_list(
+                    [SimpleNamespace(req=req, host_staged=False) for req in requests]
+                )
+            )
 
     def age_at(self, now):
         with patch(f"{REPORTER}.time.perf_counter", return_value=now):
@@ -120,11 +134,25 @@ class TestPDTransferMetrics(CustomTestCase):
         scheduler.max_total_num_tokens = 1000
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
-            queue=[], retracted_queue=[], num_tokens_pre_allocated=0
+            queue=[],
+            retracted_queue=[],
+            num_tokens_pre_allocated=0,
+            num_tokens_pending_prealloc=0,
+            pre_allocated_token_counts=lambda sub_pools: (0, {}),
         )
+        scheduler.enable_fpm = False
+        scheduler.request_lists = lambda: {
+            ListKind.WAITING: scheduler.waiting_queue,
+            ListKind.GRAMMAR: [],
+            ListKind.PD_BOOTSTRAP: scheduler.disagg_prefill_bootstrap_queue.queue,
+            ListKind.PD_SENDING: scheduler.disagg_prefill_transfer_queue,
+        }
         pool = Mock()
         pool.get_prefill_usage_msg_parts.return_value = []
         pool.get_decode_usage_msg_parts.return_value = []
+        pool.windows = ()
+        pool.full_capacity = 0
+        pool.target_window_stats.return_value = None
         scheduler.pool_stats_observer = Mock()
         scheduler.pool_stats_observer.get_pool_stats.return_value = pool
         scheduler.pool_stats_observer.streaming_session_count.return_value = 0

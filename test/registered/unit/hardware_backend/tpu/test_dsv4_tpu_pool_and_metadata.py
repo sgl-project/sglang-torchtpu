@@ -42,7 +42,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.dsv4.dsv4_attention_backend import (
     DSV4TPUAttnBackend,
@@ -627,7 +627,7 @@ class TestDSV4TPUPatches(CustomTestCase):
 
         from sglang.srt.arg_groups import model_override_base, resolution_hooks
         from sglang.srt.environ import envs
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang_tpu.hooks.dsv4 import (
             _tpu_deepseek_v4_env_adjustments,
             _tpu_deepseek_v4_overrides,
@@ -719,18 +719,12 @@ class TestDSV4TPUPatches(CustomTestCase):
 
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.hash_topk import HashTopK
-        from sglang.srt.layers.moe.mhc_post_fusion import (
-            MhcPostFusion,
-            current_mhc_post_fusion,
-            use_mhc_post_fusion,
-        )
         from sglang_tpu.hooks.dsv4 import (
             disable_tpu_dsv4_wo_a_fp8_gemm,
             forward_tpu_dsv4_hash_topk,
             forward_tpu_dsv4_hash_topk_torch,
             get_tpu_dsv4_kernel_num_heads,
             skip_tpu_dsv4_prewarm_mhc_kernels,
-            tpu_dsv4_current_mhc_post_fusion,
             tpu_dsv4_silu_and_mul_clamp,
         )
 
@@ -738,7 +732,6 @@ class TestDSV4TPUPatches(CustomTestCase):
         topk = HashTopK(
             topk=2,
             num_experts=8,
-            num_fused_shared_experts=0,
             vocab_size=16,
             scoring_func="sqrtsoftplus",
         )
@@ -780,20 +773,7 @@ class TestDSV4TPUPatches(CustomTestCase):
         expected = (torch.nn.functional.silu(g_ref) * u_ref).to(torch.bfloat16)
         torch.testing.assert_close(x_out, expected)
 
-        # 3. current_mhc_post_fusion hook
-        dummy_state = MhcPostFusion(
-            residual=torch.zeros(1), post=None, comb=None, stats_stream=None
-        )
-        with use_mhc_post_fusion(dummy_state):
-            self.assertIs(
-                tpu_dsv4_current_mhc_post_fusion(current_mhc_post_fusion), dummy_state
-            )
-            with patch("torch.compiler.is_compiling", return_value=True):
-                self.assertIsNone(
-                    tpu_dsv4_current_mhc_post_fusion(current_mhc_post_fusion)
-                )
-
-        # 4. deepseek_v4 model hooks
+        # 3. deepseek_v4 model hooks
         self.assertFalse(disable_tpu_dsv4_wo_a_fp8_gemm(None, object()))
         attn_stub = SimpleNamespace(n_local_heads=16, attn_tp_size=8, n_heads=128)
         self.assertEqual(get_tpu_dsv4_kernel_num_heads(None, attn_stub, 4), 16)

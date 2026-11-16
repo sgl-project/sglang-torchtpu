@@ -47,7 +47,7 @@ def tpu_clip_cached_prefix_send_end(
     before the first conflicting page, or keeps the proposed end if none match.
     """
     return _find_safe_prefix_send_end(
-        prefix_indices=req.prefix_indices,
+        prefix_indices=_prefix_slots(scheduler, req),
         start_send_idx=req.start_send_idx,
         candidate_send_end=candidate_send_end,
         inflight_write_page_ids=scheduler.tpu_inflight_kv_write_page_ids,
@@ -85,12 +85,20 @@ def tpu_clip_hicache_load_send_end(
     the batch about to launch. Same contract as ``tpu_clip_cached_prefix_send_end``.
     """
     return _find_safe_prefix_send_end(
-        prefix_indices=req.prefix_indices,
+        prefix_indices=_prefix_slots(scheduler, req),
         start_send_idx=req.start_send_idx,
         candidate_send_end=candidate_send_end,
         inflight_write_page_ids=hicache_load_page_ids,
         page_size=scheduler.token_to_kv_pool_allocator.page_size,
     )
+
+
+def _prefix_slots(scheduler: Scheduler, req: Req) -> torch.Tensor:
+    """KV slots of req's matched prefix; the early send runs after allocation
+    has written them into the request's req_to_token row."""
+    return scheduler.req_to_token_pool.req_to_token[
+        req.kv.req_pool_idx, : req.prefix_len
+    ]
 
 
 def tpu_update_inflight_kv_write_pages(
@@ -171,16 +179,16 @@ def _collect_prefill_write_page_ids(
     """
     rows = []
     for req in reqs:
-        rng = req.extend_range
-        if rng is None or rng.end <= rng.start:
+        start, end = req.prefix_len, req.extend_end
+        if end is None or end <= start:
             continue
         # Sample the first token in the range, then each later page boundary.
         # This includes an unaligned first page without scanning every token.
         # Example: page_size=4, range [2, 9) samples positions [2, 4, 8].
         # If their KV slots are [14, 24, 32], the page IDs are [3, 6, 8].
-        first_boundary = (rng.start // page_size + 1) * page_size
+        first_boundary = (start // page_size + 1) * page_size
         positions = torch.tensor(
-            [rng.start, *range(first_boundary, rng.end, page_size)],
+            [start, *range(first_boundary, end, page_size)],
             device=req_to_token_table.device,
         )
         rows.append(req_to_token_table[req.kv.req_pool_idx, positions])

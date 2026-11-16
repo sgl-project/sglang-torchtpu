@@ -17,7 +17,7 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-from sglang.utils import LazyImport
+from sglang._lazy_import import LazyImport
 
 logger = logging.getLogger(__name__)
 _active_session: ReplicaSession | None = None

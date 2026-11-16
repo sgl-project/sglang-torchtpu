@@ -42,11 +42,8 @@ from sglang.srt.managers.mm_utils import (  # noqa: E402
     ShmPointerMMData,
     wrap_shm_features,
 )
-from sglang.srt.managers.schedule_batch import (  # noqa: E402
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalProcessorOutput  # noqa: E402
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.managers.scheduler_components import node_fanout  # noqa: E402
 from sglang.srt.managers.scheduler_components.node_fanout import (  # noqa: E402
     node_fanout_enabled,
@@ -54,6 +51,7 @@ from sglang.srt.managers.scheduler_components.node_fanout import (  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.utils import broadcast_pyobj  # noqa: E402
 

@@ -48,8 +48,8 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     get_kv_transfer_buf_infos,
     setup_state_kv_args,
 )

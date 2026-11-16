@@ -26,7 +26,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.utils.common import ceil_align, next_power_of_2, print_warning_once
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.log_utils import print_warning_once
+from sglang.srt.utils.triton_utils import next_power_of_2
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.bucketer import (
     Bucketer,

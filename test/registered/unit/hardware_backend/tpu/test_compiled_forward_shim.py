@@ -11,13 +11,11 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel, get_schedule
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -231,7 +229,9 @@ class TestHostStagedPrefillInputs(CustomTestCase):
         runner = SimpleNamespace(
             device="meta",
             is_draft_worker=False,
-            kv_index_translator=SimpleNamespace(rebind_write_loc=lambda _: None),
+            runner_ids=SimpleNamespace(
+                own_plan=lambda _: SimpleNamespace(bind=lambda *_, **__: None)
+            ),
             ngram_embedding_manager=SimpleNamespace(enabled=False),
             model_config=SimpleNamespace(
                 model_is_mrope=True, requires_mm_token_modalities=False
@@ -260,8 +260,8 @@ class TestHostStagedPrefillInputs(CustomTestCase):
                         "0", "", array("q", range(n + 3)), SamplingParams(), False
                     )
                     req.refresh_fill_ids()
-                    req.prefix_indices = torch.arange(3)
-                    req.set_extend_range(3, n + 3)
+                    req.prefix_len = 3
+                    req.extend_end = n + 3
                     expected_mrope = torch.arange(3, n + 3).repeat(3, 1)
                     if has_image:
                         spatial_offsets = torch.tensor([[0], [10], [20]])

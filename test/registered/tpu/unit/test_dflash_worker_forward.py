@@ -18,12 +18,10 @@ import sglang.srt.speculative.spec_utils as spec_utils
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.managers.scheduler import GenerationBatchResult
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardMode,
-)
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -293,10 +291,15 @@ def _create_dflash_worker_for_tpu(
     target_model_runner = SimpleNamespace(
         # Read by ForwardBatch.init_new: no LoRA, no KV index translation.
         is_draft_worker=False,
-        kv_index_translator=KVIndexTranslator(
+        runner_ids=RunnerIds(
             req_to_token=req_to_token_table,
             token_to_kv_pool_allocator=None,
-            token_to_kv_pool=None,
+            # A plain pool's own ids: only id_spaces() is read without an allocator.
+            token_to_kv_pool=SimpleNamespace(
+                id_spaces=lambda: {
+                    IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))
+                }
+            ),
             page_size=16,
             device=dev,
         ),
@@ -370,12 +373,13 @@ def _create_dflash_worker_for_tpu(
 
     draft_model_runner = SimpleNamespace(
         is_draft_worker=True,
-        kv_index_translator=KVIndexTranslator(
+        runner_ids=RunnerIds(
             req_to_token=draft_r2t_table,
             token_to_kv_pool_allocator=None,
             token_to_kv_pool=draft_token_to_kv_pool,
             page_size=16,
             device=dev,
+            is_draft_worker=True,
         ),
         lora_manager=None,
         ngram_embedding_manager=SimpleNamespace(enabled=False),

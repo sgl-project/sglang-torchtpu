@@ -39,7 +39,7 @@ from google.protobuf.wrappers_pb2 import Int64Value
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.common import (

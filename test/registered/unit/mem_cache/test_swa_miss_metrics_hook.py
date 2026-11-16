@@ -8,14 +8,15 @@ from types import SimpleNamespace
 from unittest import mock
 
 import prometheus_client
-import test_unified_radix_cache_unittest as radix_fixture
-from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.session.streaming_session import _VirtualNode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kits.unified_radix_cache import fixtures as radix_fixture
+from sglang.test.kits.unified_radix_cache.config import CacheConfig
+from sglang.test.kits.unified_radix_cache.fixtures import build_fixture
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.hooks import HOOKS, swa_miss_metrics
 from sglang_tpu.hooks.swa_miss_metrics import SwaPrefixMatch, swa_miss_range
@@ -29,7 +30,7 @@ class _Req:
     def __init__(self, start=0, end=0, retracted=False):
         self.session = None
         self.retracted_stain = retracted
-        self.extend_range = SimpleNamespace(start=start, end=end)
+        self.prefix_len, self.extend_end = start, end
 
 
 class _Adder:
@@ -136,7 +137,7 @@ class TestSwaMissCharging(CustomTestCase):
         self.assertEqual(swa_miss_metrics._adder_tokens[adder], 8)
 
         def schedule(adder, req):
-            req.extend_range = SimpleNamespace(start=8, end=32)
+            req.prefix_len, req.extend_end = 8, 32
             adder.can_run_list.append(req)
 
         swa_miss_metrics.charge_continuation_chunk(schedule, adder, req)

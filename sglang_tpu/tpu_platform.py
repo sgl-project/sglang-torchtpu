@@ -14,11 +14,11 @@ from typing import TYPE_CHECKING, Any, Optional, Type
 
 import torch
 
+from sglang._lazy_import import LazyImport
 from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
-from sglang.utils import LazyImport
 from sglang_tpu import shared_slice
 from sglang_tpu._logging import get_logger
 from sglang_tpu.dp_replicas import (
@@ -243,7 +243,7 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
         raise NotImplementedError(
             f"{feature} requires --cp-strategy zigzag, got {cfg.cp_strategy!r}."
         )
-    from sglang.srt.utils.hf_transformers.config import get_config
+    from sglang.srt.hf_transformers.config import get_config
 
     hf_config = get_config(
         cfg.model_path, trust_remote_code=cfg.trust_remote_code, revision=cfg.revision
@@ -698,7 +698,7 @@ def _validate_dsa(server_args) -> None:
     """Reject the sparse-attention (DSA) setups that TPU cannot serve correctly."""
     from sglang.srt.arg_groups.overrides import resolving_view
     from sglang.srt.configs.model_config import is_deepseek_dsa
-    from sglang.srt.utils.hf_transformers.config import get_config
+    from sglang.srt.hf_transformers.config import get_config
 
     cfg = resolving_view(server_args)
     try:
@@ -865,7 +865,7 @@ def _resolve_num_hidden_layers(server_args) -> int:
     unresolvable — an unloadable model fails later with its real error, and
     the prefetch containment stays off rather than guessing."""
     try:
-        from sglang.srt.utils.hf_transformers.config import get_config
+        from sglang.srt.hf_transformers.config import get_config
 
         hf_config = get_config(
             server_args.model_path,
@@ -1392,7 +1392,7 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
         from sglang.srt.mem_cache.pool_host.base import (
-            host_memory_budget_bytes,
+            host_memory_budget_plain_hugetlb,
             host_memory_budget_scope,
         )
         from sglang.srt.runtime_context import get_memory
@@ -1400,7 +1400,7 @@ class TpuSRTPlatform(SRTPlatform):
         if not is_tpu_dma_hicache_backend(get_memory().hicache_io_backend):
             return super().get_hicache_explicit_size_context()
         # Full, SWA, and draft pools must fit within one combined RAM budget.
-        return host_memory_budget_scope(host_memory_budget_bytes())
+        return host_memory_budget_scope(host_memory_budget_plain_hugetlb())
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -1442,6 +1442,15 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
 
         return TpuSplitMLATokenToKVPool
+
+    def get_kv_pool_cls(self, *, kind):
+        if kind == "mha":
+            return self.get_mha_kv_pool_cls()
+        if kind == "mla":
+            return self.get_mla_kv_pool_cls()
+        # The TPU DSA pool is an MLA pool plus index-key caches, not a
+        # DSATokenToKVPool; the TPU DSA builder asks get_dsa_kv_pool_cls().
+        return None
 
     def get_zigzag_cp_strategy_cls(self) -> type:
         from sglang_tpu.cp_strategy import TpuZigzagCPStrategy
@@ -1509,7 +1518,7 @@ class TpuSRTPlatform(SRTPlatform):
     def get_batch_input_device(self, batch) -> str | None:
         """Keep eligible prefill inputs on CPU until backend padding."""
         from sglang.srt.layers.cp.base import get_cp_strategy
-        from sglang.srt.utils.common import print_warning_once
+        from sglang.srt.utils.log_utils import print_warning_once
         from sglang_tpu.allocator_tpu import host_return_allocators
         from sglang_tpu.host_padding import _can_stage_forward_metadata
 
@@ -1558,12 +1567,6 @@ class TpuSRTPlatform(SRTPlatform):
         return is_experimental_spec(SpeculativeAlgorithm.from_string(algorithm))
 
     def is_pin_memory_available(self, device=None) -> bool:
-        return False
-
-    def support_cuda_graph(self) -> bool:
-        return False
-
-    def support_piecewise_cuda_graph(self) -> bool:
         return False
 
     def supports_decode_context_parallel(self) -> bool:

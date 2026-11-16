@@ -113,12 +113,12 @@ class TestPrefillTransferStageEndsAtRaidenFinish(CustomTestCase):
 
     def setUp(self):
         mixin = SchedulerDisaggregationPrefillMixin
-        orig_poll = mixin.process_disagg_prefill_inflight_queue
+        orig_poll = mixin.process_disagg_prefill_transfer_queue
         self.shared_poll = orig_poll
         orig_set = rts.SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time
 
         def restore():
-            mixin.process_disagg_prefill_inflight_queue = orig_poll
+            mixin.process_disagg_prefill_transfer_queue = orig_poll
             rts.SchedulerReqTimeStats.set_prefill_kv_transfer_finish_time = orig_set
             patches._prefill_transfer_finish_from_raiden_patched = False
 
@@ -126,11 +126,11 @@ class TestPrefillTransferStageEndsAtRaidenFinish(CustomTestCase):
 
         # Minimal stand-in for the shared poll: stamps each finished request.
         def poll(self, rids_to_check=None):
-            for req in self.disagg_prefill_inflight_queue:
+            for req in self.disagg_prefill_transfer_queue:
                 req.time_stats.set_prefill_kv_transfer_finish_time()
-            return list(self.disagg_prefill_inflight_queue)
+            return list(self.disagg_prefill_transfer_queue)
 
-        mixin.process_disagg_prefill_inflight_queue = poll
+        mixin.process_disagg_prefill_transfer_queue = poll
         patches._prefill_transfer_finish_from_raiden_patched = False
         patches._patch_prefill_transfer_finish_from_raiden()
 
@@ -140,12 +140,12 @@ class TestPrefillTransferStageEndsAtRaidenFinish(CustomTestCase):
         stats.metrics_collector = MagicMock()
         stats.set_prefill_transfer_queue_entry_time(self.ENTRY)
         scheduler = SimpleNamespace(
-            disagg_prefill_inflight_queue=[
+            disagg_prefill_transfer_queue=[
                 SimpleNamespace(time_stats=stats, disagg_kv_sender=sender)
             ]
         )
         with patch.object(rts.time, "perf_counter", return_value=self.POLL_TIME):
-            SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+            SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue(
                 scheduler
             )
         observe = stats.metrics_collector.observe_per_stage_req_latency

@@ -224,22 +224,24 @@ class TestWanSequenceShardPadding(unittest.TestCase):
         self.assertEqual(kv_real_lens, [27] * _SP_SIZE)
 
     def test_ring_backends_without_tail_support_attend_the_pad_keys(self):
-        # A sage_attn ring has no real-length clamp, and FA's clamps batch 1
-        # only: they get no meta and attend to the pad keys through the
-        # unmasked ring, as before the padding was masked.
-        for backend, batch_size in (
-            (AttentionBackendEnum.SAGE_ATTN, 1),
-            (AttentionBackendEnum.FA, 2),
-        ):
-            with self.subTest(backend=backend.name, batch_size=batch_size):
-                (call,) = self._self_attention_calls(
-                    _PADDED, 1, backend, ulysses=2, batch_size=batch_size
-                )
-                self.assertEqual(call, {})
+        # A sage_attn ring has no real-length clamp: it gets no meta and
+        # attends to the pad keys through the unmasked ring, as before the
+        # padding was masked.
         (call,) = self._self_attention_calls(
-            _PADDED, 1, AttentionBackendEnum.FA, ulysses=2
+            _PADDED, 1, AttentionBackendEnum.SAGE_ATTN, ulysses=2
         )
-        self.assertEqual(call["attn_mask_meta"]["pad_start"], 27)
+        self.assertEqual(call, {})
+        # FA's ring clamps the real length at any batch size (non-causal).
+        for batch_size in (1, 2):
+            with self.subTest(backend="FA", batch_size=batch_size):
+                (call,) = self._self_attention_calls(
+                    _PADDED,
+                    1,
+                    AttentionBackendEnum.FA,
+                    ulysses=2,
+                    batch_size=batch_size,
+                )
+                self.assertEqual(call["attn_mask_meta"]["pad_start"], 27)
 
 
 if __name__ == "__main__":

@@ -110,7 +110,7 @@ def _select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
 
 HOOKS: list[tuple] = [
     (
-        "sglang.srt.utils.common.set_gpu_proc_affinity",
+        "sglang.srt.utils.process.set_gpu_proc_affinity",
         bind_rank_cpu_set,
         HookType.AROUND,
     ),

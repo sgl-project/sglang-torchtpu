@@ -308,6 +308,7 @@ def reclaim_full_host_duplicates(cache: Any, num_tokens: int) -> int:
     tracker: dict = defaultdict(int)
     device_frees: dict = defaultdict(list)
     host_frees: dict = defaultdict(list)
+    cache_actions: list = []
     taken = set()
     # Taking a tip makes its parent eligible: repeat the LRU pass until the
     # target is met or a pass takes nothing.
@@ -328,14 +329,19 @@ def reclaim_full_host_duplicates(cache: Any, num_tokens: int) -> int:
                 )
             ):
                 continue
-            core._release_full_host_duplicate(node, tracker, device_frees, host_frees)
+            core._release_full_host_duplicate(
+                node, tracker, device_frees, host_frees, cache_actions=cache_actions
+            )
             taken.add(node.id)
             progress = True
         if not progress:
             break
     for node_id in taken:
         core.full_host_duplicates.pop(node_id, None)
-    cache._free_values(device_frees, host_frees)
+    try:
+        cache._free_values(device_frees, host_frees)
+    finally:
+        cache._apply_cache_actions(cache_actions)
     return int(tracker[_FULL])
 
 

@@ -51,7 +51,7 @@ tpu_dsv41_hc_combine
   Why: the shifted-mHC forward (DeepseekV4DecoderLayer._hc_combine and the
        model's final hc_head) calls the Triton hc_combine with no device
        guard; Dynamo cannot trace a Triton launch on TPU.
-  How: AROUND sglang.kernels.ops.layernorm.mhc.hc_combine computes the same
+  How: AROUND sglang.kernels.ops.layernorm.mhc.mhc_combine computes the same
        fp32 weighted sum of the hc_mult copies in torch for non-CUDA tensors.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: hc_combine dispatches on device like the other mHC kernels.
@@ -301,7 +301,7 @@ def hook_specs():
             HookType.AROUND,
         ),
         (
-            "sglang.kernels.ops.layernorm.mhc.hc_combine",
+            "sglang.kernels.ops.layernorm.mhc.mhc_combine",
             tpu_dsv41_hc_combine,
             HookType.AROUND,
         ),

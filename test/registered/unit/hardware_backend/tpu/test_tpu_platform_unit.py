@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.compiler.config as compiler_config
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.parallel_hook import handle_elastic_ep
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.arg_groups.serving_hook import handle_other_validations
@@ -144,8 +144,8 @@ class TestTpuPlatformIdentity(CustomTestCase):
         self.assertFalse(self.platform.is_pin_memory_available())
 
     def test_cuda_graph_disabled(self):
-        self.assertFalse(self.platform.support_cuda_graph())
-        self.assertFalse(self.platform.support_piecewise_cuda_graph())
+        self.assertFalse(self.platform.capabilities.graph_capture)
+        self.assertFalse(self.platform.capabilities.piecewise_graph)
 
     def test_decode_context_parallel_shards_every_kv_pool(self):
         self.assertTrue(self.platform.supports_decode_context_parallel())
@@ -749,7 +749,7 @@ class TestPrefillContextParallelValidation(CustomTestCase):
         args = self._args(**fields)
         hf_config = SimpleNamespace(architectures=list(architectures))
         with patch(
-            "sglang.srt.utils.hf_transformers.config.get_config",
+            "sglang.srt.hf_transformers.config.get_config",
             return_value=hf_config,
         ):
             self._apply(args)
@@ -871,7 +871,7 @@ class TestDsaValidation(CustomTestCase):
             **config_fields,
         )
         with patch(
-            "sglang.srt.utils.hf_transformers.config.get_config",
+            "sglang.srt.hf_transformers.config.get_config",
             return_value=hf_config,
         ):
             self._apply(args)

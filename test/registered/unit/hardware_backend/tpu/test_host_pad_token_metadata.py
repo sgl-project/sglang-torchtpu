@@ -8,7 +8,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.model_executor import forward_batch_info
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -279,11 +279,11 @@ class TestHostPadFieldSelection(CustomTestCase):
         policy.model_runner.device = "meta"
         decode = self._decode_batch()
         decode.input_ids = decode.input_ids.to("meta")
-        with self.assertNoLogs("sglang.srt.utils.common", level="WARNING"):
+        with self.assertNoLogs("sglang.srt.utils.log_utils", level="WARNING"):
             policy.prepare_forward_batch(decode)
         prefill = self._extend_batch()
         prefill.input_ids = prefill.input_ids.to("meta")
-        with self.assertLogs("sglang.srt.utils.common", level="WARNING"):
+        with self.assertLogs("sglang.srt.utils.log_utils", level="WARNING"):
             policy.prepare_forward_batch(prefill)
 
     def test_extend_mrope_follows_the_extend_metadata_placement(self):
@@ -631,7 +631,7 @@ class TestHostPadFieldSelection(CustomTestCase):
         from unittest.mock import MagicMock
 
         from sglang.srt.managers.schedule_batch import ScheduleBatch
-        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         def make_batch(lengths, originals, indices):
@@ -726,8 +726,8 @@ class TestHostPadFieldSelection(CustomTestCase):
 
         req = SimpleNamespace(
             kv=SimpleNamespace(req_pool_idx=1),
-            prefix_indices=[0, 1],
-            extend_range=SimpleNamespace(length=3),
+            prefix_len=2,
+            extend_len=3,
             origin_input_ids=[10, 11, 12, 13, 14],
             output_ids=[],
             retracted_stain=True,

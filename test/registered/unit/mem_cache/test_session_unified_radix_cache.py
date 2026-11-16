@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import unittest
 from array import array
@@ -13,7 +13,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
     EvictParams,
     InsertParams,
     MatchPrefixParams,
@@ -26,6 +25,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.session.streaming_session import SessionSlot
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 
 def make_params(enable_session: bool) -> CacheInitParams:
@@ -60,7 +60,7 @@ def make_params(enable_session: bool) -> CacheInitParams:
         page_size=1,
         eviction_policy="lru",
         enable_session_radix_cache=enable_session,
-        tree_components=(ComponentType.FULL,),
+        tree_slots=tree_slots_of((ComponentType.FULL,)),
     )
 
 
@@ -77,11 +77,9 @@ def insert(cache, token_ids):
 
 
 def match_len(cache, token_ids) -> int:
-    return len(
-        cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", token_ids)))
-        ).device_indices
-    )
+    return cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+    ).device_prefix_len
 
 
 def register(cache, token_ids, session_id, generation=None):
@@ -123,10 +121,11 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         cache.sanity_check()
 
     def test_swa_lock_release_on_streaming_session_node_is_a_noop(self):
-        """A later streaming-session turn locks the slot's virtual node; releasing
-        its SWA lock must be a no-op like its other locks, not a tree lookup."""
-        node = SessionSlot().virtual_node
-        self.cache.dec_swa_lock_only(node, DecLockRefParams())
+        """A later streaming-session turn locks the slot's virtual node; that
+        lock, and so releasing its SWA part, is a no-op, not a tree lookup."""
+        lock = self.cache.lock(SessionSlot().virtual_node)
+        self.assertIsNone(lock)
+        self.cache.release_swa(lock)
         self.cache.sanity_check()
 
     def test_register_and_release_update_full_component_reference(self):

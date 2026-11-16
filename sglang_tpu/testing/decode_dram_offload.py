@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.tree_slots import tree_slots_of
 from sglang_tpu.disaggregation.decode_dram_offload import (
     decode_dram_victim_receiver,
     prefill_dram_victim_pusher,
@@ -242,7 +243,7 @@ def full_cache(*, kv_size=64, host_capacity=64):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             page_size=1,
-            tree_components=(FULL,),
+            tree_slots=tree_slots_of((FULL,)),
             tree_core_backend="python",
         )
     )
@@ -277,7 +278,7 @@ def hybrid_cache(*, window=128):
             token_to_kv_pool_allocator=allocator,
             page_size=HYBRID_PAGE,
             sliding_window_size=window,
-            tree_components=(FULL, ComponentType.SWA),
+            tree_slots=tree_slots_of((FULL, ComponentType.SWA), window=window),
             tree_core_backend="python",
         )
     )
@@ -313,7 +314,7 @@ def insert_tokens(cache, allocator, tokens):
 
 def device_hit(cache, tokens) -> int:
     match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
-    return len(match.device_indices)
+    return match.device_prefix_len
 
 
 def root_node(cache, first_token):
