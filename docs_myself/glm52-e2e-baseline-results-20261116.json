@@ -1,0 +1,2889 @@
+{
+  "exp_id": "exp-6mtkc6t2qi",
+  "job_id": "job-agyoxxt6mj",
+  "artifact_id": "art-tfqylgfhvw",
+  "artifact_uri": "gs://tpu-for-training-falcon-logs/experiments/exp-6mtkc6t2qi/artifacts/art-tfqylgfhvw/",
+  "artifact_view_uri": "https://falcon.infiscale-infra.org/v1/experiments/exp-6mtkc6t2qi/artifacts/art-tfqylgfhvw/view",
+  "status": "SUCCEEDED",
+  "running_started_at": "2026-11-16T12:02:21.833398Z",
+  "terminal_at": "2026-11-16T12:38:56.975851830Z",
+  "implementation_commit": "811865ca48ca23aa14dc74c9dbebaf5b380279dc",
+  "analysis_id": "an-a841nyzdcg",
+  "analysis_outputs": [
+    {
+      "path": "inventory.json",
+      "type": "json",
+      "required": true,
+      "plugin_name": "glm52-native-mtp-final-evidence-v2"
+    },
+    {
+      "path": "evidence.json",
+      "type": "json",
+      "required": true,
+      "plugin_name": "glm52-native-mtp-final-evidence-v2"
+    },
+    {
+      "path": "summary.json",
+      "type": "json",
+      "required": true,
+      "plugin_name": "glm52-native-mtp-final-evidence-v2"
+    },
+    {
+      "path": "request-metadata.json",
+      "type": "json",
+      "required": true,
+      "plugin_name": "glm52-native-mtp-final-evidence-v2"
+    },
+    {
+      "path": "load-audit.json",
+      "type": "json",
+      "required": true,
+      "plugin_name": "glm52-native-mtp-final-evidence-v2"
+    },
+    {
+      "path": "log-audit.json",
+      "type": "json",
+      "required": true,
+      "plugin_name": "glm52-native-mtp-final-evidence-v2"
+    },
+    {
+      "path": "checks.json",
+      "type": "json",
+      "required": true,
+      "plugin_name": "glm52-native-mtp-final-evidence-v2"
+    },
+    {
+      "path": "server-rank-0-tail.txt",
+      "type": "text",
+      "required": true,
+      "plugin_name": "glm52-native-mtp-final-evidence-v2"
+    },
+    {
+      "path": "server-rank-1-tail.txt",
+      "type": "text",
+      "required": true,
+      "plugin_name": "glm52-native-mtp-final-evidence-v2"
+    },
+    {
+      "path": "output.log",
+      "type": "text",
+      "plugin_name": "glm52-native-mtp-final-evidence-v2"
+    },
+    {
+      "path": "_falcon/source-provenance.json",
+      "type": "json"
+    }
+  ],
+  "checks": {
+    "rank_results": "SUCCEEDED on both ranks",
+    "allocation_generation": 1,
+    "client_attempt": 1,
+    "client_attention": {
+      "status": "RESOLVED",
+      "attempt": 1,
+      "measurements": "/gcs/experiments/exp-6mtkc6t2qi/artifacts/art-tfqylgfhvw/application-attempts/1/glm52-e2e/measurements/attempt-1"
+    },
+    "total_requests": 368,
+    "routed_smoke_requests": 16,
+    "smoke_scope": "all outputs start with 4; forced 16 tokens and ignore_eos may continue beyond answer; no general accuracy claim",
+    "measured_rounds": 6,
+    "all_routing_receipts_match": true,
+    "all_request_retractions_zero": true,
+    "all_no_abort": true,
+    "exact_measured_output_lengths": true,
+    "cache_hits_within_one_64_token_page": true,
+    "C64_common_window_full_16_DP_4_requests_each": "client summarize asserted all sampled rows; see pinned client.py and retained *-loads.json",
+    "audit_file_absence_check_correction": "collector no-client-attention=False because the normal RESOLVED success receipt exists; confirmed status RESOLVED, attempt=1, not a failure"
+  },
+  "provenance": {
+    "0": {
+      "result": {
+        "status": "SUCCEEDED",
+        "rank": 0,
+        "measurements": "/gcs/experiments/exp-6mtkc6t2qi/artifacts/art-tfqylgfhvw/application-attempts/1/glm52-e2e/measurements/attempt-1"
+      },
+      "source": {
+        "kind": "source-tree",
+        "sha256": "a77e8a33f1edcc6140619e7f729bbcb8f7fdf3630a4965cfeeda3906ec9369d3"
+      },
+      "checkpoint": {
+        "config.json": {
+          "sha256": "0735624bbd5666283a1f135c59ff4c15e8b51c56fc50e022181525253f29463b",
+          "bytes": 3876
+        },
+        "model.safetensors.index.json": {
+          "sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+          "bytes": 11359252
+        },
+        "tokenizer_config.json": {
+          "sha256": "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc",
+          "bytes": 761
+        }
+      },
+      "physical_rank": 1,
+      "resolved_args": {
+        "tp_size": 16,
+        "attn_dp_size": 16,
+        "ep_size": 16,
+        "speculative_algorithm": "EAGLE",
+        "speculative_num_steps": 5,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 6,
+        "kv_cache_dtype": "fp8_e4m3",
+        "attention_backend": "pallas_tpu_mla_sparse",
+        "moe_runner_backend": "pallas_tpu",
+        "quantization": "fp8",
+        "chunked_prefill_size": 2048,
+        "enable_dp_lm_head": true,
+        "context_length": 92160,
+        "mem_fraction_static": 0.85,
+        "enable_eplb": false,
+        "disable_radix_cache": false
+      },
+      "serving_runtime_records": [
+        "rank-0/actual-process-runtime/pid-1802.json",
+        "rank-0/actual-process-runtime/pid-2897.json",
+        "rank-0/actual-process-runtime/pid-2898.json",
+        "rank-0/actual-process-runtime/pid-2899.json",
+        "rank-0/actual-process-runtime/pid-2900.json",
+        "rank-0/actual-process-runtime/pid-2901.json",
+        "rank-0/actual-process-runtime/pid-2902.json",
+        "rank-0/actual-process-runtime/pid-2903.json",
+        "rank-0/actual-process-runtime/pid-2904.json"
+      ],
+      "serving_process_count": 9,
+      "executable": "/tmp/glm52-baseline-runtime/venv/bin/python",
+      "versions": {
+        "torch": "2.11.0+cpu",
+        "torch_tpu": "0.2.1.dev20261028201649",
+        "jax": "0.11.2",
+        "jaxlib": "0.11.2",
+        "libtpu": "0.0.50",
+        "tpu-sync-torch": "0.0.1.dev20261112081648",
+        "torchvision": "0.26.0+cpu"
+      },
+      "imports": {
+        "torch": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch/__init__.py",
+        "torch_tpu": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/__init__.py",
+        "jax": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/jax/__init__.py",
+        "jaxlib": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/jaxlib/__init__.py",
+        "libtpu": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/libtpu/__init__.py"
+      },
+      "all_mapped_libtpu": true,
+      "worker_compiler_env": {
+        "TPU_TOPOLOGY": "2x2x2",
+        "TPU_WORKER_ID": "0",
+        "TPU_SKIP_MDS_QUERY": "true",
+        "TPU_TOPOLOGY_WRAP": "false,false,false",
+        "TPU_PROCESS_PORT": "8471",
+        "TPU_LOG_DIR": "/tmp/tpu_logs/task",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+        "TPU_RUNTIME_METRICS_PORTS": "8431,8432,8433,8434,8435,8436,8437,8438",
+        "LIBTPU_INIT_ARGS": "--xla_tpu_enable_async_collective_fusion=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_latency_hiding_scheduler=true --xla_latency_hiding_scheduler_rerun=10 --xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_buffer_assignment_enable_fast_merge_fallback=false --xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false",
+        "TPU_LIBRARY_PATH": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/libtpu/libtpu.so",
+        "TORCH_TPU_DEVICES_PER_HOST": "8",
+        "TORCH_TPU_BASE_PORT": "8070",
+        "TORCH_TPU_TIER2_NAME": "glm52_c286_jax0112_libtpu0050_tp16_dp16_mtp5",
+        "TORCH_TPU_TIER3_ROOT": "/glm52-prior-compile-cache",
+        "SGLANG_TPU_CHECK_RECOMPILATION": "1",
+        "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
+        "SGLANG_TPU_PRELOAD_TELEMETRY_STUB": "1",
+        "TPU_ENABLE_DIAGNOSTIC_COORDINATOR": "0",
+        "TPU_DISABLE_DIAGNOSTIC_COORDINATOR": "1",
+        "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE": "glm52_c286_jax0112_libtpu0050_tp16_dp16_mtp5",
+        "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT": "/glm52-prior-compile-cache",
+        "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK": "1",
+        "TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS": "1",
+        "TPU_ML_PLATFORM": "JAX",
+        "TPU_ML_PLATFORM_VERSION": "0.11.2",
+        "TORCH_TPU_TIER2_COMPILATION_CACHE": "glm52_c286_jax0112_libtpu0050_tp16_dp16_mtp5",
+        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": "/glm52-prior-compile-cache",
+        "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1",
+        "SGLANG_TPU_TOPOLOGY_BOOTSTRAP_PORT": "10012",
+        "SGLANG_TPU_CACHE_DP_SCOPE": "dp16_dprank8_tp16",
+        "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": "false",
+        "TPU_PREMAPPED_BUFFER_SIZE": "4294967296",
+        "TORCH_TPU_TOPOLOGY": "2,2,2,2"
+      },
+      "mapped_libraries": [
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/libtpu/libtpu.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch/lib/libtorch.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch/lib/libtorch_global_deps.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/compile/tpu_torch_compile_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/device/_device_ops_backend_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/device_utils/annotations_py_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/distributed/tpu_distributed_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/env_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/execution_mode/execution_mode_impl_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/pallas/tpu_torch_pallas_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/precision/precision_impl_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/profiler/_profiler_backend_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/sync/_tpu_torch_sync_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/tracing/_tpu_torch_tracing_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/utils/_hardware_backend_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/warnings_impl_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/csrc/common/glue_2_11_0/libpywrap_2_11_0_common.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/csrc/common/libxla_base.so"
+      ]
+    },
+    "1": {
+      "result": {
+        "status": "SUCCEEDED",
+        "rank": 1
+      },
+      "source": {
+        "kind": "source-tree",
+        "sha256": "a77e8a33f1edcc6140619e7f729bbcb8f7fdf3630a4965cfeeda3906ec9369d3"
+      },
+      "checkpoint": {
+        "config.json": {
+          "sha256": "0735624bbd5666283a1f135c59ff4c15e8b51c56fc50e022181525253f29463b",
+          "bytes": 3876
+        },
+        "model.safetensors.index.json": {
+          "sha256": "0ee9d61ce4e0ca912c2a5b8220f57b1060fb95ec09304da77c85a43d56aeb2a0",
+          "bytes": 11359252
+        },
+        "tokenizer_config.json": {
+          "sha256": "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc",
+          "bytes": 761
+        }
+      },
+      "physical_rank": 0,
+      "resolved_args": {
+        "tp_size": 16,
+        "attn_dp_size": 16,
+        "ep_size": 16,
+        "speculative_algorithm": "EAGLE",
+        "speculative_num_steps": 5,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 6,
+        "kv_cache_dtype": "fp8_e4m3",
+        "attention_backend": "pallas_tpu_mla_sparse",
+        "moe_runner_backend": "pallas_tpu",
+        "quantization": "fp8",
+        "chunked_prefill_size": 2048,
+        "enable_dp_lm_head": true,
+        "context_length": 92160,
+        "mem_fraction_static": 0.85,
+        "enable_eplb": false,
+        "disable_radix_cache": false
+      },
+      "serving_runtime_records": [
+        "rank-1/actual-process-runtime/pid-1801.json",
+        "rank-1/actual-process-runtime/pid-3015.json",
+        "rank-1/actual-process-runtime/pid-3016.json",
+        "rank-1/actual-process-runtime/pid-3017.json",
+        "rank-1/actual-process-runtime/pid-3018.json",
+        "rank-1/actual-process-runtime/pid-3019.json",
+        "rank-1/actual-process-runtime/pid-3020.json",
+        "rank-1/actual-process-runtime/pid-3021.json",
+        "rank-1/actual-process-runtime/pid-3022.json"
+      ],
+      "serving_process_count": 9,
+      "executable": "/tmp/glm52-baseline-runtime/venv/bin/python",
+      "versions": {
+        "torch": "2.11.0+cpu",
+        "torch_tpu": "0.2.1.dev20261028201649",
+        "jax": "0.11.2",
+        "jaxlib": "0.11.2",
+        "libtpu": "0.0.50",
+        "tpu-sync-torch": "0.0.1.dev20261112081648",
+        "torchvision": "0.26.0+cpu"
+      },
+      "imports": {
+        "torch": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch/__init__.py",
+        "torch_tpu": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/__init__.py",
+        "jax": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/jax/__init__.py",
+        "jaxlib": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/jaxlib/__init__.py",
+        "libtpu": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/libtpu/__init__.py"
+      },
+      "all_mapped_libtpu": true,
+      "worker_compiler_env": {
+        "TPU_TOPOLOGY": "2x2x2",
+        "TPU_WORKER_ID": "1",
+        "TPU_SKIP_MDS_QUERY": "true",
+        "TPU_TOPOLOGY_WRAP": "false,false,false",
+        "TPU_PROCESS_PORT": "8471",
+        "TPU_LOG_DIR": "/tmp/tpu_logs/task",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+        "TPU_RUNTIME_METRICS_PORTS": "8431,8432,8433,8434,8435,8436,8437,8438",
+        "LIBTPU_INIT_ARGS": "--xla_tpu_enable_async_collective_fusion=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_latency_hiding_scheduler=true --xla_latency_hiding_scheduler_rerun=10 --xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_buffer_assignment_enable_fast_merge_fallback=false --xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_use_associative_scan_emitter=false --xla_tpu_save_original_hlo_module=false",
+        "TPU_LIBRARY_PATH": "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/libtpu/libtpu.so",
+        "TORCH_TPU_DEVICES_PER_HOST": "8",
+        "TORCH_TPU_BASE_PORT": "8070",
+        "TORCH_TPU_TIER2_NAME": "glm52_c286_jax0112_libtpu0050_tp16_dp16_mtp5",
+        "TORCH_TPU_TIER3_ROOT": "/glm52-prior-compile-cache",
+        "SGLANG_TPU_CHECK_RECOMPILATION": "1",
+        "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
+        "SGLANG_TPU_PRELOAD_TELEMETRY_STUB": "1",
+        "TPU_ENABLE_DIAGNOSTIC_COORDINATOR": "0",
+        "TPU_DISABLE_DIAGNOSTIC_COORDINATOR": "1",
+        "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE": "glm52_c286_jax0112_libtpu0050_tp16_dp16_mtp5",
+        "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT": "/glm52-prior-compile-cache",
+        "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK": "1",
+        "TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS": "1",
+        "TPU_ML_PLATFORM": "JAX",
+        "TPU_ML_PLATFORM_VERSION": "0.11.2",
+        "TORCH_TPU_TIER2_COMPILATION_CACHE": "glm52_c286_jax0112_libtpu0050_tp16_dp16_mtp5",
+        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": "/glm52-prior-compile-cache",
+        "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1",
+        "SGLANG_TPU_TOPOLOGY_BOOTSTRAP_PORT": "10012",
+        "SGLANG_TPU_CACHE_DP_SCOPE": "dp16_dprank0_tp16",
+        "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": "false",
+        "TPU_PREMAPPED_BUFFER_SIZE": "4294967296",
+        "TORCH_TPU_TOPOLOGY": "2,2,2,2"
+      },
+      "mapped_libraries": [
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/libtpu/libtpu.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch/lib/libtorch.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch/lib/libtorch_global_deps.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch/lib/libtorch_python.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/compile/tpu_torch_compile_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/device/_device_ops_backend_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/device_utils/annotations_py_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/distributed/tpu_distributed_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/env_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/execution_mode/execution_mode_impl_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/pallas/tpu_torch_pallas_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/precision/precision_impl_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/profiler/_profiler_backend_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/sync/_tpu_torch_sync_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/tracing/_tpu_torch_tracing_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/utils/_hardware_backend_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/_internal/warnings_impl_2_11_0.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/csrc/common/glue_2_11_0/libpywrap_2_11_0_common.so",
+        "/tmp/glm52-baseline-runtime/venv/lib/python3.12/site-packages/torch_tpu/csrc/common/libxla_base.so"
+      ]
+    }
+  },
+  "client_identity": {
+    "client_sha256": "443049db573c97aa1a86ad3401ef564a97046836247e078839782d9d389bd598",
+    "implementation_commit": "811865ca48ca23aa14dc74c9dbebaf5b380279dc",
+    "benchmark_source_sha256": "a77e8a33f1edcc6140619e7f729bbcb8f7fdf3630a4965cfeeda3906ec9369d3"
+  },
+  "input_manifest": {
+    "input_mode": "natural-code",
+    "token_count": 1142656,
+    "token_ids_sha256": "607d4dc372753216266489042597330f2fc66c94b5e0fd6a760181a10162b3c6",
+    "construction": "sorted UTF-8 python/sglang/*.py; concatenate encoded source; no repeated filling"
+  },
+  "prefix_decision": {
+    "mode": "shared",
+    "minimum_capacity": 219008,
+    "unique_slots_lower_bound": 364288,
+    "shared_prefix_tokens": 89984,
+    "reason": "share prefix within each DP to reduce KV slots"
+  },
+  "capacity": {
+    "timestamp": "2026-11-16T12:34:13.393565+00:00",
+    "version": "0.0.0.dev1+g811865ca4.d20261116",
+    "accelerator": "TPU v7",
+    "num_accelerators": 1,
+    "loads": [
+      {
+        "timestamp": 1794832453.3905406,
+        "dp_rank": 0,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 26,
+        "total_prefill_busy_us": 1340577,
+        "decode_moments": [
+          7.0,
+          7.0,
+          499061.0,
+          7.0,
+          499061.0,
+          22.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.111,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 2.9,
+          "accept_rate": 0.2
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.3905172,
+        "dp_rank": 1,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 26,
+        "total_prefill_busy_us": 1000717,
+        "decode_moments": [
+          10.0,
+          10.0,
+          652208.0,
+          10.0,
+          652208.0,
+          28.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 2.6153846153846154,
+          "accept_rate": 0.8
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.3903744,
+        "dp_rank": 2,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 26,
+        "total_prefill_busy_us": 1007199,
+        "decode_moments": [
+          10.0,
+          10.0,
+          648865.0,
+          10.0,
+          648865.0,
+          19.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 2.230769230769231,
+          "accept_rate": 0.4
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.390306,
+        "dp_rank": 3,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 26,
+        "total_prefill_busy_us": 968429,
+        "decode_moments": [
+          8.0,
+          8.0,
+          519280.0,
+          8.0,
+          519280.0,
+          22.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 2.5454545454545454,
+          "accept_rate": 0.4
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.390238,
+        "dp_rank": 4,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 26,
+        "total_prefill_busy_us": 984766,
+        "decode_moments": [
+          8.0,
+          8.0,
+          541173.0,
+          8.0,
+          541173.0,
+          30.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 3.272727272727273,
+          "accept_rate": 1.0
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.3901582,
+        "dp_rank": 5,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 26,
+        "total_prefill_busy_us": 994551,
+        "decode_moments": [
+          10.0,
+          10.0,
+          677482.0,
+          10.0,
+          677482.0,
+          22.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 2.076923076923077,
+          "accept_rate": 0.6
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.3900776,
+        "dp_rank": 6,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 26,
+        "total_prefill_busy_us": 985883,
+        "decode_moments": [
+          8.0,
+          8.0,
+          538555.0,
+          8.0,
+          538555.0,
+          28.0
+        ],
+        "memory": {
+          "weight_gb": 59.583,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 3.090909090909091,
+          "accept_rate": 1.0
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.3901103,
+        "dp_rank": 7,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 26,
+        "total_prefill_busy_us": 984438,
+        "decode_moments": [
+          8.0,
+          8.0,
+          529282.0,
+          8.0,
+          529282.0,
+          26.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 2.8181818181818183,
+          "accept_rate": 0.4
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.3900895,
+        "dp_rank": 8,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 20,
+        "total_prefill_busy_us": 164720,
+        "decode_moments": [
+          8.0,
+          8.0,
+          505264.0,
+          8.0,
+          505264.0,
+          21.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 2.8181818181818183,
+          "accept_rate": 0.6
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.390187,
+        "dp_rank": 9,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 20,
+        "total_prefill_busy_us": 158639,
+        "decode_moments": [
+          9.0,
+          9.0,
+          578755.0,
+          9.0,
+          578755.0,
+          23.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 2.4166666666666665,
+          "accept_rate": 0.2
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.39029,
+        "dp_rank": 10,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 20,
+        "total_prefill_busy_us": 158966,
+        "decode_moments": [
+          7.0,
+          7.0,
+          430375.0,
+          7.0,
+          430375.0,
+          20.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 3.0,
+          "accept_rate": 0.2
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.390275,
+        "dp_rank": 11,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 20,
+        "total_prefill_busy_us": 157127,
+        "decode_moments": [
+          9.0,
+          9.0,
+          586165.0,
+          9.0,
+          586165.0,
+          26.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 2.6666666666666665,
+          "accept_rate": 1.0
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.3903978,
+        "dp_rank": 12,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 20,
+        "total_prefill_busy_us": 179733,
+        "decode_moments": [
+          8.0,
+          8.0,
+          565104.0,
+          8.0,
+          565104.0,
+          25.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 2.8181818181818183,
+          "accept_rate": 1.0
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.3903918,
+        "dp_rank": 13,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 20,
+        "total_prefill_busy_us": 172420,
+        "decode_moments": [
+          7.0,
+          7.0,
+          444560.0,
+          7.0,
+          444560.0,
+          26.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 3.6,
+          "accept_rate": 1.0
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.3904884,
+        "dp_rank": 14,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 20,
+        "total_prefill_busy_us": 167245,
+        "decode_moments": [
+          8.0,
+          8.0,
+          525880.0,
+          8.0,
+          525880.0,
+          25.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 2.8181818181818183,
+          "accept_rate": 0.0
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      },
+      {
+        "timestamp": 1794832453.3904881,
+        "dp_rank": 15,
+        "num_running_reqs": 0,
+        "num_waiting_reqs": 0,
+        "num_waiting_uncached_tokens": 0,
+        "num_used_tokens": 0,
+        "num_total_tokens": 0,
+        "num_active_tokens": 0,
+        "num_prealloc_ready_tokens": 0,
+        "max_total_num_tokens": 219008,
+        "max_running_requests": 4,
+        "token_usage": 0.0,
+        "gen_throughput": 0.0,
+        "cache_hit_rate": 0.0,
+        "utilization": 0.0,
+        "total_prefill_uncached_tokens": 20,
+        "total_prefill_busy_us": 173354,
+        "decode_moments": [
+          8.0,
+          8.0,
+          503365.0,
+          8.0,
+          503365.0,
+          26.0
+        ],
+        "memory": {
+          "weight_gb": 59.581,
+          "kv_cache_gb": 11.282,
+          "graph_gb": 2.085,
+          "token_capacity": 219008
+        },
+        "speculative": {
+          "accept_length": 3.272727272727273,
+          "accept_rate": 1.0
+        },
+        "disaggregation": {
+          "mode": "null",
+          "prefill_bootstrap_queue_reqs": 0,
+          "prefill_inflight_queue_reqs": 0,
+          "decode_prealloc_queue_reqs": 0,
+          "decode_transfer_queue_reqs": 0,
+          "decode_retracted_queue_reqs": 0,
+          "kv_transfer_speed_gb_s": 0.0,
+          "kv_transfer_latency_ms": 0.0
+        },
+        "queues": {
+          "waiting": 0,
+          "grammar": 0,
+          "paused": 0,
+          "retracted": 0,
+          "prealloc_ready": 0
+        }
+      }
+    ]
+  },
+  "rounds": [
+    {
+      "label": "prefill-unique-round1",
+      "physical_chips": 8,
+      "requests": 16,
+      "requests_per_dp": 1,
+      "expected_cached_tokens": 49152,
+      "observed_cached_tokens": [
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49152,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088
+      ],
+      "ttft_ms_median": 6327.231901232153,
+      "client_tpot_ms_median": 17.57081151008606,
+      "mtp_verify_count": 61,
+      "mtp_correct_drafts": 215,
+      "full_concurrency_load_samples": 23,
+      "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)",
+      "mtp_proposed_drafts": 305,
+      "mtp_accept_rate": 0.7049180327868853,
+      "output_tokens_per_verify": 4.19672131147541
+    },
+    {
+      "label": "prefill-unique-round2",
+      "physical_chips": 8,
+      "requests": 16,
+      "requests_per_dp": 1,
+      "expected_cached_tokens": 49152,
+      "observed_cached_tokens": [
+        49088,
+        49088,
+        49152,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49152
+      ],
+      "ttft_ms_median": 6301.600041799247,
+      "client_tpot_ms_median": 20.00091051061948,
+      "mtp_verify_count": 68,
+      "mtp_correct_drafts": 205,
+      "full_concurrency_load_samples": 24,
+      "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)",
+      "mtp_proposed_drafts": 340,
+      "mtp_accept_rate": 0.6029411764705882,
+      "output_tokens_per_verify": 3.764705882352941
+    },
+    {
+      "label": "prefill-unique-round3",
+      "physical_chips": 8,
+      "requests": 16,
+      "requests_per_dp": 1,
+      "expected_cached_tokens": 49152,
+      "observed_cached_tokens": [
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49088,
+        49152,
+        49088,
+        49088
+      ],
+      "ttft_ms_median": 6302.241573575884,
+      "client_tpot_ms_median": 20.277877803891897,
+      "mtp_verify_count": 74,
+      "mtp_correct_drafts": 193,
+      "full_concurrency_load_samples": 30,
+      "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)",
+      "mtp_proposed_drafts": 370,
+      "mtp_accept_rate": 0.5216216216216216,
+      "output_tokens_per_verify": 3.4594594594594597
+    },
+    {
+      "label": "decode-shared-round1",
+      "physical_chips": 8,
+      "requests": 64,
+      "requests_per_dp": 4,
+      "expected_cached_tokens": 89984,
+      "observed_cached_tokens": [
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89984,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89984,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920
+      ],
+      "ttft_ms_median": 5234.916670713574,
+      "client_tpot_ms_median": 18.849124448266487,
+      "mtp_verify_count": 12591,
+      "mtp_correct_drafts": 53030,
+      "full_concurrency_load_samples": 707,
+      "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)",
+      "steady_start": 5051478.42749845,
+      "steady_end": 5051492.517179571,
+      "steady_output_tokens": 49481,
+      "steady_output_tokens_per_second": 3511.8608840921393,
+      "steady_output_tokens_per_second_per_chip": 438.9826105115174,
+      "tail_seconds": 6.036532103084028,
+      "mtp_proposed_drafts": 62955,
+      "mtp_accept_rate": 0.8423477086808038,
+      "output_tokens_per_verify": 5.2049876896195695
+    },
+    {
+      "label": "decode-shared-round2",
+      "physical_chips": 8,
+      "requests": 64,
+      "requests_per_dp": 4,
+      "expected_cached_tokens": 89984,
+      "observed_cached_tokens": [
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89984,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89984,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920
+      ],
+      "ttft_ms_median": 5469.176242593676,
+      "client_tpot_ms_median": 18.225220800855382,
+      "mtp_verify_count": 12684,
+      "mtp_correct_drafts": 52924,
+      "full_concurrency_load_samples": 732,
+      "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)",
+      "steady_start": 5051507.9883269,
+      "steady_end": 5051521.36223452,
+      "steady_output_tokens": 48523,
+      "steady_output_tokens_per_second": 3628.1841761131727,
+      "steady_output_tokens_per_second_per_chip": 453.5230220141466,
+      "tail_seconds": 6.053788024932146,
+      "mtp_proposed_drafts": 63420,
+      "mtp_accept_rate": 0.8345001576789656,
+      "output_tokens_per_verify": 5.166824345632293
+    },
+    {
+      "label": "decode-shared-round3",
+      "physical_chips": 8,
+      "requests": 64,
+      "requests_per_dp": 4,
+      "expected_cached_tokens": 89984,
+      "observed_cached_tokens": [
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89984,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89984,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89984,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89920,
+        89984
+      ],
+      "ttft_ms_median": 5640.267510898411,
+      "client_tpot_ms_median": 19.39315679423941,
+      "mtp_verify_count": 12822,
+      "mtp_correct_drafts": 52778,
+      "full_concurrency_load_samples": 768,
+      "timing_scope": "client SSE; TTFT includes HTTP and scheduling; TPOT = first-to-last / (tokens-1)",
+      "steady_start": 5051537.002963528,
+      "steady_end": 5051551.444215051,
+      "steady_output_tokens": 48643,
+      "steady_output_tokens_per_second": 3368.3368732270214,
+      "steady_output_tokens_per_second_per_chip": 421.0421091533777,
+      "tail_seconds": 5.681739584542811,
+      "mtp_proposed_drafts": 64110,
+      "mtp_accept_rate": 0.823241304008735,
+      "output_tokens_per_verify": 5.11121509904851
+    }
+  ],
+  "aggregate": {
+    "prefill": {
+      "metric": "ttft_ms_median",
+      "median": 6302.241573575884,
+      "minimum": 6301.600041799247,
+      "maximum": 6327.231901232153
+    },
+    "decode": {
+      "ttft_ms_median": {
+        "median": 5469.176242593676,
+        "minimum": 5234.916670713574,
+        "maximum": 5640.267510898411
+      },
+      "client_tpot_ms_median": {
+        "median": 18.849124448266487,
+        "minimum": 18.225220800855382,
+        "maximum": 19.39315679423941
+      },
+      "steady_output_tokens_per_second": {
+        "median": 3511.8608840921393,
+        "minimum": 3368.3368732270214,
+        "maximum": 3628.1841761131727
+      },
+      "steady_output_tokens_per_second_per_chip": {
+        "median": 438.9826105115174,
+        "minimum": 421.0421091533777,
+        "maximum": 453.5230220141466
+      }
+    },
+    "decode_mtp": {
+      "verify_count": 38097,
+      "correct_drafts": 158732,
+      "proposed_drafts": 190485,
+      "accept_rate": 0.8333044596687403,
+      "output_tokens_per_verify": 5.160721316639106,
+      "scope": "native response counters; accepted draft counters may include the final verified run before max_new_tokens clipping"
+    }
+  },
+  "serving_compilation": {
+    "freeze_time_utc": "2026-11-16T12:33:43Z",
+    "torch_compile_fail_on_recompile": true,
+    "XLA_new_program_count": 128,
+    "individual_compile_ms_range": [
+      25,
+      46
+    ],
+    "summed_rank_ms": 4029,
+    "maximum_log_group_ms": 222,
+    "rounds": {
+      "prefill-unique-round1": {
+        "records": 0,
+        "programs": 0,
+        "summed_rank_ms": 0
+      },
+      "prefill-unique-round2": {
+        "records": 0,
+        "programs": 0,
+        "summed_rank_ms": 0
+      },
+      "prefill-unique-round3": {
+        "records": 0,
+        "programs": 0,
+        "summed_rank_ms": 0
+      },
+      "decode-shared-round1": {
+        "records": 21,
+        "programs": 27,
+        "summed_rank_ms": 804
+      },
+      "decode-shared-round2": {
+        "records": 8,
+        "programs": 14,
+        "summed_rank_ms": 432
+      },
+      "decode-shared-round3": {
+        "records": 0,
+        "programs": 0,
+        "summed_rank_ms": 0
+      }
+    },
+    "C64_common_window_compile_records": 0,
+    "alignment_scope": "server wall timestamps to request_received_ts and client monotonic offsets; conservative 1s window tolerance; log-based evidence, not device profiler",
+    "cache_load_time_measured": false,
+    "server_logs": {
+      "0": {
+        "bytes": 4815685,
+        "sha256": "89afb1356cf334a2df76d47f3c52280fff461f77bf7a13aacff8c5b7e43c7549",
+        "lines": 26446,
+        "ready_markers": [
+          {
+            "line": 20105,
+            "text": "[2026-11-16 12:33:43 DP9 TP9 EP9] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20106,
+            "text": "[2026-11-16 12:33:43 DP15 TP15 EP15] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20107,
+            "text": "[2026-11-16 12:33:43 DP8 TP8 EP8] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20108,
+            "text": "[2026-11-16 12:33:43 DP10 TP10 EP10] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20109,
+            "text": "[2026-11-16 12:33:43 DP12 TP12 EP12] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20110,
+            "text": "[2026-11-16 12:33:43 DP11 TP11 EP11] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20111,
+            "text": "[2026-11-16 12:33:43 DP13 TP13 EP13] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20112,
+            "text": "[2026-11-16 12:33:43 DP14 TP14 EP14] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          }
+        ]
+      },
+      "1": {
+        "bytes": 5667311,
+        "sha256": "8d7c4216f73c52e64ab93aa9608a7f26dc048cce4951f8959e53abff9f8ce53c",
+        "lines": 36909,
+        "ready_markers": [
+          {
+            "line": 18874,
+            "text": "[2026-11-16 12:32:29] INFO:     Application startup complete."
+          },
+          {
+            "line": 18875,
+            "text": "[2026-11-16 12:32:29] INFO:     Uvicorn running on http://0.0.0.0:30000 (Press CTRL+C to quit)"
+          },
+          {
+            "line": 20330,
+            "text": "[2026-11-16 12:33:43 DP7 TP7 EP7] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20331,
+            "text": "[2026-11-16 12:33:43 DP6 TP6 EP6] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20332,
+            "text": "[2026-11-16 12:33:43 DP3 TP3 EP3] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20333,
+            "text": "[2026-11-16 12:33:43 DP2 TP2 EP2] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20334,
+            "text": "[2026-11-16 12:33:43 DP5 TP5 EP5] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20335,
+            "text": "[2026-11-16 12:33:43 DP1 TP1 EP1] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20336,
+            "text": "[2026-11-16 12:33:43 DP4 TP4 EP4] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20337,
+            "text": "[2026-11-16 12:33:43 DP0 TP0 EP0] [TPU] [tpu] Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
+          },
+          {
+            "line": 20338,
+            "text": "[2026-11-16 12:33:43] The server is fired up and ready to roll!"
+          }
+        ]
+      }
+    },
+    "details": {
+      "rounds": [
+        {
+          "label": "prefill-unique-round1",
+          "start": 1794832510.4266505,
+          "end": 1794832517.3367083,
+          "utc_start": "2026-11-16T12:35:10.426651+00:00",
+          "utc_end": "2026-11-16T12:35:17.336708+00:00"
+        },
+        {
+          "label": "prefill-unique-round2",
+          "start": 1794832518.679376,
+          "end": 1794832525.5769868,
+          "utc_start": "2026-11-16T12:35:18.679376+00:00",
+          "utc_end": "2026-11-16T12:35:25.576987+00:00"
+        },
+        {
+          "label": "prefill-unique-round3",
+          "start": 1794832526.7354417,
+          "end": 1794832533.760319,
+          "utc_start": "2026-11-16T12:35:26.735442+00:00",
+          "utc_end": "2026-11-16T12:35:33.760319+00:00"
+        },
+        {
+          "label": "decode-shared-round1",
+          "start": 1794832624.6077807,
+          "end": 1794832651.8826022,
+          "utc_start": "2026-11-16T12:37:04.607781+00:00",
+          "utc_end": "2026-11-16T12:37:31.882602+00:00",
+          "steady_start": 1794832632.154245,
+          "steady_end": 1794832646.243926,
+          "utc_steady_start": "2026-11-16T12:37:12.154245+00:00",
+          "utc_steady_end": "2026-11-16T12:37:26.243926+00:00"
+        },
+        {
+          "label": "decode-shared-round2",
+          "start": 1794832653.379912,
+          "end": 1794832680.7441666,
+          "utc_start": "2026-11-16T12:37:33.379912+00:00",
+          "utc_end": "2026-11-16T12:38:00.744167+00:00",
+          "steady_start": 1794832661.8708777,
+          "steady_end": 1794832675.2447855,
+          "utc_steady_start": "2026-11-16T12:37:41.870878+00:00",
+          "utc_steady_end": "2026-11-16T12:37:55.244786+00:00"
+        },
+        {
+          "label": "decode-shared-round3",
+          "start": 1794832682.3784173,
+          "end": 1794832710.4548247,
+          "utc_start": "2026-11-16T12:38:02.378417+00:00",
+          "utc_end": "2026-11-16T12:38:30.454825+00:00",
+          "steady_start": 1794832691.1747751,
+          "steady_end": 1794832705.6160266,
+          "utc_steady_start": "2026-11-16T12:38:11.174775+00:00",
+          "utc_steady_end": "2026-11-16T12:38:25.616027+00:00"
+        }
+      ],
+      "compiles": [
+        {
+          "rank": "0",
+          "dp": 9,
+          "line": 20117,
+          "utc": "2026-11-16 12:33:54",
+          "durations_ms": [
+            34
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:33:54 DP9 TP9 EP9] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q20,b1 pad=q64,b4]: durations_ms=[34] (total 34 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 10,
+          "line": 20118,
+          "utc": "2026-11-16 12:33:54",
+          "durations_ms": [
+            29
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:33:54 DP10 TP10 EP10] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q20,b1 pad=q64,b4]: durations_ms=[29] (total 29 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 15,
+          "line": 20120,
+          "utc": "2026-11-16 12:33:54",
+          "durations_ms": [
+            42,
+            32,
+            30,
+            29,
+            29
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:33:54 DP15 TP15 EP15] [TPU] [recompilation checker] 5 new XLA program(s) compiled at serving time [GlmMoeDsaForCausalLM EXTEND real=q20,b1 pad=q64,b4]: durations_ms=[42, 32, 30, 29, 29] (total 162 ms), plus 2 loaded from the persistent compile cache (load time not measured). Compiles this slow leave the TPU idle and should have been covered by precompile."
+        },
+        {
+          "rank": "0",
+          "dp": 15,
+          "line": 20199,
+          "utc": "2026-11-16 12:34:20",
+          "durations_ms": [
+            29,
+            28,
+            25
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:34:20 DP15 TP15 EP15] [TPU] [recompilation checker] 3 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q2048,b1 pad=q2048,b4]: durations_ms=[29, 28, 25] (total 82 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 9,
+          "line": 20200,
+          "utc": "2026-11-16 12:34:20",
+          "durations_ms": [
+            46
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:34:20 DP9 TP9 EP9] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q2048,b1 pad=q2048,b4]: durations_ms=[46] (total 46 ms, below the 100 ms warning threshold), plus 3 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 15,
+          "line": 20205,
+          "utc": "2026-11-16 12:34:20",
+          "durations_ms": [
+            44
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:34:20 DP15 TP15 EP15] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN EXTEND real=q2048,b1 pad=q2048,b4]: durations_ms=[44] (total 44 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "0",
+          "dp": 10,
+          "line": 21107,
+          "utc": "2026-11-16 12:36:56",
+          "durations_ms": [
+            36,
+            29,
+            26
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:56 DP10 TP10 EP10] [TPU] [recompilation checker] 3 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q80,b1 pad=q2048,b4]: durations_ms=[36, 29, 26] (total 91 ms, below the 100 ms warning threshold), plus 4 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 9,
+          "line": 21109,
+          "utc": "2026-11-16 12:36:56",
+          "durations_ms": [
+            34
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:56 DP9 TP9 EP9] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q80,b1 pad=q2048,b4]: durations_ms=[34] (total 34 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 15,
+          "line": 21113,
+          "utc": "2026-11-16 12:36:56",
+          "durations_ms": [
+            43,
+            29,
+            28
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:56 DP15 TP15 EP15] [TPU] [recompilation checker] 3 new XLA program(s) compiled at serving time [GlmMoeDsaForCausalLM EXTEND real=q80,b1 pad=q2048,b4]: durations_ms=[43, 29, 28] (total 100 ms), plus 4 loaded from the persistent compile cache (load time not measured). Compiles this slow leave the TPU idle and should have been covered by precompile."
+        },
+        {
+          "rank": "0",
+          "dp": 12,
+          "line": 21118,
+          "utc": "2026-11-16 12:36:57",
+          "durations_ms": [
+            34
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:57 DP12 TP12 EP12] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q320,b4 pad=q2048,b4]: durations_ms=[34] (total 34 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "0",
+          "dp": 10,
+          "line": 21123,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            33,
+            29,
+            29
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP10 TP10 EP10] [TPU] [recompilation checker] 3 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q240,b1 pad=q2048,b4]: durations_ms=[33, 29, 29] (total 91 ms, below the 100 ms warning threshold), plus 4 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 9,
+          "line": 21125,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            32
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP9 TP9 EP9] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q240,b1 pad=q2048,b4]: durations_ms=[32] (total 32 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 15,
+          "line": 21129,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            29,
+            28
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP15 TP15 EP15] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q240,b1 pad=q2048,b4]: durations_ms=[29, 28] (total 57 ms, below the 100 ms warning threshold), plus 5 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 13,
+          "line": 21130,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            43
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP13 TP13 EP13] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q240,b1 pad=q2048,b4]: durations_ms=[43] (total 43 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 10,
+          "line": 21141,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            29
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP10 TP10 EP10] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[29] (total 29 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "0",
+          "dp": 10,
+          "line": 21147,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            26
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP10 TP10 EP10] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[26] (total 26 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 9,
+          "line": 21149,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            31
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP9 TP9 EP9] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[31] (total 31 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 10,
+          "line": 21261,
+          "utc": "2026-11-16 12:37:01",
+          "durations_ms": [
+            35
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:01 DP10 TP10 EP10] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[35] (total 35 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 12,
+          "line": 21263,
+          "utc": "2026-11-16 12:37:01",
+          "durations_ms": [
+            40,
+            32
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:01 DP12 TP12 EP12] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[40, 32] (total 72 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "0",
+          "dp": 13,
+          "line": 21264,
+          "utc": "2026-11-16 12:37:01",
+          "durations_ms": [
+            29
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:01 DP13 TP13 EP13] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[29] (total 29 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 14,
+          "line": 21273,
+          "utc": "2026-11-16 12:37:01",
+          "durations_ms": [
+            36,
+            30
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:01 DP14 TP14 EP14] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[36, 30] (total 66 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "0",
+          "dp": 9,
+          "line": 22904,
+          "utc": "2026-11-16 12:37:29",
+          "durations_ms": [
+            29
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:29 DP9 TP9 EP9] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q18,b3 pad=q18,b3]: durations_ms=[29] (total 29 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 8,
+          "line": 22907,
+          "utc": "2026-11-16 12:37:29",
+          "durations_ms": [
+            35
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:29 DP8 TP8 EP8] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q18,b3 pad=q18,b3]: durations_ms=[35] (total 35 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 13,
+          "line": 22912,
+          "utc": "2026-11-16 12:37:29",
+          "durations_ms": [
+            27
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:29 DP13 TP13 EP13] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q18,b3 pad=q18,b3]: durations_ms=[27] (total 27 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 9,
+          "line": 22918,
+          "utc": "2026-11-16 12:37:29",
+          "durations_ms": [
+            29
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:29 DP9 TP9 EP9] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q18,b3 pad=q18,b3]: durations_ms=[29] (total 29 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 10,
+          "line": 22928,
+          "utc": "2026-11-16 12:37:29",
+          "durations_ms": [
+            35,
+            29
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:29 DP10 TP10 EP10] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q18,b3 pad=q18,b3]: durations_ms=[35, 29] (total 64 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "0",
+          "dp": 15,
+          "line": 22929,
+          "utc": "2026-11-16 12:37:29",
+          "durations_ms": [
+            32,
+            27
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:29 DP15 TP15 EP15] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q18,b3 pad=q18,b3]: durations_ms=[32, 27] (total 59 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "0",
+          "dp": 9,
+          "line": 22960,
+          "utc": "2026-11-16 12:37:30",
+          "durations_ms": [
+            31
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:30 DP9 TP9 EP9] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q12,b2 pad=q12,b2]: durations_ms=[31] (total 31 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 8,
+          "line": 22961,
+          "utc": "2026-11-16 12:37:30",
+          "durations_ms": [
+            31
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:30 DP8 TP8 EP8] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q12,b2 pad=q12,b2]: durations_ms=[31] (total 31 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 12,
+          "line": 22966,
+          "utc": "2026-11-16 12:37:30",
+          "durations_ms": [
+            29
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:30 DP12 TP12 EP12] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q12,b2 pad=q12,b2]: durations_ms=[29] (total 29 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 9,
+          "line": 22968,
+          "utc": "2026-11-16 12:37:30",
+          "durations_ms": [
+            31
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:30 DP9 TP9 EP9] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q12,b2 pad=q12,b2]: durations_ms=[31] (total 31 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 15,
+          "line": 22981,
+          "utc": "2026-11-16 12:37:30",
+          "durations_ms": [
+            34,
+            28
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:30 DP15 TP15 EP15] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q12,b2 pad=q12,b2]: durations_ms=[34, 28] (total 62 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "0",
+          "dp": 9,
+          "line": 23015,
+          "utc": "2026-11-16 12:37:39",
+          "durations_ms": [
+            30
+          ],
+          "rounds": [
+            "decode-shared-round2"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:39 DP9 TP9 EP9] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q160,b1 pad=q2048,b4]: durations_ms=[30] (total 30 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 15,
+          "line": 23020,
+          "utc": "2026-11-16 12:37:39",
+          "durations_ms": [
+            41
+          ],
+          "rounds": [
+            "decode-shared-round2"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:39 DP15 TP15 EP15] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q160,b1 pad=q2048,b4]: durations_ms=[41] (total 41 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 13,
+          "line": 23021,
+          "utc": "2026-11-16 12:37:39",
+          "durations_ms": [
+            28
+          ],
+          "rounds": [
+            "decode-shared-round2"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:39 DP13 TP13 EP13] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q160,b1 pad=q2048,b4]: durations_ms=[28] (total 28 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "0",
+          "dp": 10,
+          "line": 23022,
+          "utc": "2026-11-16 12:37:39",
+          "durations_ms": [
+            32,
+            29,
+            29,
+            26
+          ],
+          "rounds": [
+            "decode-shared-round2"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:39 DP10 TP10 EP10] [TPU] [recompilation checker] 4 new XLA program(s) compiled at serving time [GlmMoeDsaForCausalLM EXTEND real=q160,b1 pad=q2048,b4]: durations_ms=[32, 29, 29, 26] (total 116 ms), plus 3 loaded from the persistent compile cache (load time not measured). Compiles this slow leave the TPU idle and should have been covered by precompile."
+        },
+        {
+          "rank": "1",
+          "dp": 6,
+          "line": 20343,
+          "utc": "2026-11-16 12:33:54",
+          "durations_ms": [
+            31,
+            30,
+            29,
+            28
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:33:54 DP6 TP6 EP6] [TPU] [recompilation checker] 4 new XLA program(s) compiled at serving time [GlmMoeDsaForCausalLM EXTEND real=q20,b1 pad=q64,b4]: durations_ms=[31, 30, 29, 28] (total 118 ms), plus 3 loaded from the persistent compile cache (load time not measured). Compiles this slow leave the TPU idle and should have been covered by precompile."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 20346,
+          "utc": "2026-11-16 12:33:54",
+          "durations_ms": [
+            31
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:33:54 DP3 TP3 EP3] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q20,b1 pad=q64,b4]: durations_ms=[31] (total 31 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 4,
+          "line": 20347,
+          "utc": "2026-11-16 12:33:54",
+          "durations_ms": [
+            43,
+            26
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:33:54 DP4 TP4 EP4] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q20,b1 pad=q64,b4]: durations_ms=[43, 26] (total 69 ms, below the 100 ms warning threshold), plus 5 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 7,
+          "line": 20566,
+          "utc": "2026-11-16 12:34:20",
+          "durations_ms": [
+            33,
+            31,
+            28
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:34:20 DP7 TP7 EP7] [TPU] [recompilation checker] 3 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q2048,b1 pad=q2048,b4]: durations_ms=[33, 31, 28] (total 92 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 20570,
+          "utc": "2026-11-16 12:34:20",
+          "durations_ms": [
+            43
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:34:20 DP3 TP3 EP3] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q2048,b1 pad=q2048,b4]: durations_ms=[43] (total 43 ms, below the 100 ms warning threshold), plus 3 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 6,
+          "line": 20577,
+          "utc": "2026-11-16 12:34:20",
+          "durations_ms": [
+            44
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:34:20 DP6 TP6 EP6] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN EXTEND real=q2048,b1 pad=q2048,b4]: durations_ms=[44] (total 44 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "1",
+          "dp": 0,
+          "line": 27737,
+          "utc": "2026-11-16 12:36:49",
+          "durations_ms": [
+            45,
+            35,
+            34,
+            28,
+            28,
+            27,
+            25
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:49 DP0 TP0 EP0] [TPU] [recompilation checker] 7 new XLA program(s) compiled at serving time [GlmMoeDsaForCausalLM EXTEND real=q1920,b1 pad=q2048,b4]: durations_ms=[45, 35, 34, 28, 28, 27, 25] (total 222 ms). Compiles this slow leave the TPU idle and should have been covered by precompile."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 27911,
+          "utc": "2026-11-16 12:36:56",
+          "durations_ms": [
+            32
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:56 DP3 TP3 EP3] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q80,b1 pad=q2048,b4]: durations_ms=[32] (total 32 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 4,
+          "line": 27914,
+          "utc": "2026-11-16 12:36:56",
+          "durations_ms": [
+            28
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:56 DP4 TP4 EP4] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q80,b1 pad=q2048,b4]: durations_ms=[28] (total 28 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 6,
+          "line": 27915,
+          "utc": "2026-11-16 12:36:56",
+          "durations_ms": [
+            42,
+            33,
+            30,
+            29,
+            28
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:56 DP6 TP6 EP6] [TPU] [recompilation checker] 5 new XLA program(s) compiled at serving time [GlmMoeDsaForCausalLM EXTEND real=q80,b1 pad=q2048,b4]: durations_ms=[42, 33, 30, 29, 28] (total 162 ms), plus 2 loaded from the persistent compile cache (load time not measured). Compiles this slow leave the TPU idle and should have been covered by precompile."
+        },
+        {
+          "rank": "1",
+          "dp": 2,
+          "line": 27988,
+          "utc": "2026-11-16 12:36:57",
+          "durations_ms": [
+            32
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:57 DP2 TP2 EP2] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q320,b4 pad=q2048,b4]: durations_ms=[32] (total 32 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "1",
+          "dp": 0,
+          "line": 27992,
+          "utc": "2026-11-16 12:36:57",
+          "durations_ms": [
+            43,
+            32,
+            32,
+            30,
+            28,
+            27,
+            25
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:57 DP0 TP0 EP0] [TPU] [recompilation checker] 7 new XLA program(s) compiled at serving time [GlmMoeDsaForCausalLM EXTEND real=q320,b1 pad=q2048,b4]: durations_ms=[43, 32, 32, 30, 28, 27, 25] (total 217 ms). Compiles this slow leave the TPU idle and should have been covered by precompile."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 28069,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            31,
+            31,
+            30,
+            28
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP3 TP3 EP3] [TPU] [recompilation checker] 4 new XLA program(s) compiled at serving time [GlmMoeDsaForCausalLM EXTEND real=q240,b1 pad=q2048,b4]: durations_ms=[31, 31, 30, 28] (total 120 ms), plus 3 loaded from the persistent compile cache (load time not measured). Compiles this slow leave the TPU idle and should have been covered by precompile."
+        },
+        {
+          "rank": "1",
+          "dp": 4,
+          "line": 28070,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            44,
+            28
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP4 TP4 EP4] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q240,b1 pad=q2048,b4]: durations_ms=[44, 28] (total 72 ms, below the 100 ms warning threshold), plus 5 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 7,
+          "line": 28072,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            32
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP7 TP7 EP7] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q240,b1 pad=q2048,b4]: durations_ms=[32] (total 32 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 0,
+          "line": 28073,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            29
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP0 TP0 EP0] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q240,b3 pad=q2048,b4]: durations_ms=[29] (total 29 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 28093,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            30
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP3 TP3 EP3] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[30] (total 30 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 28100,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            27
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP3 TP3 EP3] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[27] (total 27 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 5,
+          "line": 28105,
+          "utc": "2026-11-16 12:36:59",
+          "durations_ms": [
+            33
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:36:59 DP5 TP5 EP5] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[33] (total 33 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 1,
+          "line": 28261,
+          "utc": "2026-11-16 12:37:01",
+          "durations_ms": [
+            31
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:01 DP1 TP1 EP1] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[31] (total 31 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 28263,
+          "utc": "2026-11-16 12:37:01",
+          "durations_ms": [
+            35
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:01 DP3 TP3 EP3] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[35] (total 35 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 1,
+          "line": 28297,
+          "utc": "2026-11-16 12:37:01",
+          "durations_ms": [
+            35,
+            30
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:01 DP1 TP1 EP1] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[35, 30] (total 65 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 28314,
+          "utc": "2026-11-16 12:37:01",
+          "durations_ms": [
+            33,
+            29
+          ],
+          "rounds": [],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:01 DP3 TP3 EP3] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q24,b4 pad=q24,b4]: durations_ms=[33, 29] (total 62 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 31033,
+          "utc": "2026-11-16 12:37:29",
+          "durations_ms": [
+            31
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:29 DP3 TP3 EP3] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q18,b3 pad=q18,b3]: durations_ms=[31] (total 31 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 0,
+          "line": 31041,
+          "utc": "2026-11-16 12:37:29",
+          "durations_ms": [
+            28
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:29 DP0 TP0 EP0] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q18,b3 pad=q18,b3]: durations_ms=[28] (total 28 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 31044,
+          "utc": "2026-11-16 12:37:29",
+          "durations_ms": [
+            30
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:29 DP3 TP3 EP3] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q18,b3 pad=q18,b3]: durations_ms=[30] (total 30 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 0,
+          "line": 31058,
+          "utc": "2026-11-16 12:37:29",
+          "durations_ms": [
+            31,
+            27
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:29 DP0 TP0 EP0] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q18,b3 pad=q18,b3]: durations_ms=[31, 27] (total 58 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "1",
+          "dp": 5,
+          "line": 31064,
+          "utc": "2026-11-16 12:37:29",
+          "durations_ms": [
+            33,
+            28
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:29 DP5 TP5 EP5] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q18,b3 pad=q18,b3]: durations_ms=[33, 28] (total 61 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 31103,
+          "utc": "2026-11-16 12:37:30",
+          "durations_ms": [
+            29
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:30 DP3 TP3 EP3] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q12,b2 pad=q12,b2]: durations_ms=[29] (total 29 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 6,
+          "line": 31106,
+          "utc": "2026-11-16 12:37:30",
+          "durations_ms": [
+            30
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:30 DP6 TP6 EP6] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q12,b2 pad=q12,b2]: durations_ms=[30] (total 30 ms, below the 100 ms warning threshold), plus 3 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 31114,
+          "utc": "2026-11-16 12:37:30",
+          "durations_ms": [
+            29
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:30 DP3 TP3 EP3] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q12,b2 pad=q12,b2]: durations_ms=[29] (total 29 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 6,
+          "line": 31115,
+          "utc": "2026-11-16 12:37:30",
+          "durations_ms": [
+            26
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:30 DP6 TP6 EP6] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [draft GlmMoeDsaForCausalLMNextN TARGET_VERIFY real=q12,b2 pad=q12,b2]: durations_ms=[26] (total 26 ms, below the 100 ms warning threshold), plus 1 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 6,
+          "line": 31139,
+          "utc": "2026-11-16 12:37:30",
+          "durations_ms": [
+            30,
+            25
+          ],
+          "rounds": [
+            "decode-shared-round1"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:30 DP6 TP6 EP6] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM TARGET_VERIFY real=q12,b2 pad=q12,b2]: durations_ms=[30, 25] (total 55 ms, below the 100 ms warning threshold)."
+        },
+        {
+          "rank": "1",
+          "dp": 4,
+          "line": 31468,
+          "utc": "2026-11-16 12:37:39",
+          "durations_ms": [
+            28
+          ],
+          "rounds": [
+            "decode-shared-round2"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:39 DP4 TP4 EP4] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q160,b1 pad=q2048,b4]: durations_ms=[28] (total 28 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 6,
+          "line": 31470,
+          "utc": "2026-11-16 12:37:39",
+          "durations_ms": [
+            32
+          ],
+          "rounds": [
+            "decode-shared-round2"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:39 DP6 TP6 EP6] [TPU] [recompilation checker] 1 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q160,b1 pad=q2048,b4]: durations_ms=[32] (total 32 ms, below the 100 ms warning threshold), plus 6 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 3,
+          "line": 31471,
+          "utc": "2026-11-16 12:37:39",
+          "durations_ms": [
+            29,
+            27
+          ],
+          "rounds": [
+            "decode-shared-round2"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:39 DP3 TP3 EP3] [TPU] [recompilation checker] 2 cheap XLA compile(s) at serving time [GlmMoeDsaForCausalLM EXTEND real=q160,b1 pad=q2048,b4]: durations_ms=[29, 27] (total 56 ms, below the 100 ms warning threshold), plus 5 loaded from the persistent compile cache (load time not measured)."
+        },
+        {
+          "rank": "1",
+          "dp": 1,
+          "line": 31474,
+          "utc": "2026-11-16 12:37:39",
+          "durations_ms": [
+            42,
+            31,
+            28
+          ],
+          "rounds": [
+            "decode-shared-round2"
+          ],
+          "steady_windows": [],
+          "text": "[2026-11-16 12:37:39 DP1 TP1 EP1] [TPU] [recompilation checker] 3 new XLA program(s) compiled at serving time [GlmMoeDsaForCausalLM EXTEND real=q160,b1 pad=q2048,b4]: durations_ms=[42, 31, 28] (total 101 ms), plus 4 loaded from the persistent compile cache (load time not measured). Compiles this slow leave the TPU idle and should have been covered by precompile."
+        }
+      ]
+    }
+  },
+  "post_measurement_cleanup": {
+    "last_request_finished_utc": "2026-11-16T12:38:30.454825+00:00",
+    "messages": {
+      "0": [],
+      "1": [
+        {
+          "line": 36773,
+          "text": "[2026-11-16 12:38:37 DP3 TP3 EP3] Scheduler hit an exception: Traceback (most recent call last):"
+        },
+        {
+          "line": 36812,
+          "text": "RuntimeError: [/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:547] Connection closed by peer [10.228.6.33]:49568"
+        },
+        {
+          "line": 36814,
+          "text": "[2026-11-16 12:38:37 DP7 TP7 EP7] Scheduler hit an exception: Traceback (most recent call last):"
+        },
+        {
+          "line": 36853,
+          "text": "RuntimeError: [/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:547] Connection closed by peer [10.228.6.33]:50065"
+        },
+        {
+          "line": 36855,
+          "text": "[2026-11-16 12:38:38 DP1 TP1 EP1] Scheduler hit an exception: Traceback (most recent call last):"
+        },
+        {
+          "line": 36894,
+          "text": "RuntimeError: [/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:547] Connection closed by peer [10.228.6.33]:37760"
+        }
+      ]
+    },
+    "scope": "SIGTERM starts after measurements; peer-closed Gloo exceptions during teardown on rank 1; clean graceful shutdown not established"
+  },
+  "raw_outputs_sha256": {
+    "summary.json": "329a1b7b011fc969138f78fe0181299e1c78fda153bb2c1a2bb7e92f4a4736e9",
+    "evidence.json": "c6addfa938efb10e4b896f86fa168c65f32a4a938589b01b64a6039dfeddf9f6",
+    "request-metadata.json": "3becb6b2bbc2513fc2deadbc327a4b3dcfb14de248c9635af5420b9c43d4d0f5",
+    "load-audit.json": "e107c1de231f984a30ca7f9dcf9a048c4a264d89aca1f695147c46ea6e5f7ec8",
+    "log-audit.json": "bf4ff027eab508efe9c908eb1e9fdbb479bd6d9f60e00638832db8b3b90ae3e2",
+    "checks.json": "6a3a379cb28333b36b66fbe094e4212dcef2c80846a1ee3afbc635f7559e8e8a"
+  }
+}

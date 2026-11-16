@@ -1,6 +1,47 @@
 # GLM-5.2 native MTP baseline 执行记录
 
-当前状态：已按用户“一次启动完成全流程、失败保留现场”的原则重新预检并获配，完整任务`exp-6mtkc6t2qi`正在运行。完整target/draft加载、全部启动图及原生MTP生成warmup已通过；显式routed chat和两组正式性能场景尚未验收，不能宣称完整E2E基线完成。
+当前状态：`exp-6mtkc6t2qi` 已完成 8-chip native MTP E2E 基线。两 rank 均为 `SUCCEEDED`，16-DP routed smoke、两组 workload warmup 和六轮正式测量全部完成。同一 allocation / application generation 1 / client attempt 1 跑完环境、加载、编译和全部请求，未重启或重试。Decode 使用用户授权的 shared prefix。以下是实际 TPU 结果；后半部分保留此前排障历史。
+
+## 最终实测结果（2026-11-16）
+
+| 场景 | 轮次 | TTFT 中位数 ms | Client TPOT 中位数 ms | 稳态 output token/s（总计） | output token/s / 物理 chip |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| C16：49,152 cached + 4,096 extend，输出16 | 1 | 6327.23 | 17.57 | — | — |
+| 同上 | 2 | 6301.60 | 20.00 | — | — |
+| 同上 | 3 | 6302.24 | 20.28 | — | — |
+| C64 shared：90,000 input，输出1,024 | 1 | 5234.92 | 18.85 | 3511.86 | 438.98 |
+| 同上 | 2 | 5469.18 | 18.23 | 3628.18 | 453.52 |
+| 同上 | 3 | 5640.27 | 19.39 | 3368.34 | 421.04 |
+
+- 取三轮各自中位数的中位数：prefill TTFT **6302.24 ms**；decode TTFT **5469.18 ms**、TPOT **18.849 ms**。Decode 稳态吞吐中位数 **3511.86 output token/s**，按 **8 个物理 chips** 归一化为 **438.98 token/s/chip**；三轮范围 421.04–453.52。不是按16个逻辑 devices 归一化，也不是把请求平均 TPOT 倒数当作总吞吐。
+- TTFT 是 client 发出 HTTP 请求至首个有输出的 SSE event，包含 HTTP、调度和 prefill。TPOT 是首末输出 event 的间隔除以 `completion_tokens - 1`，不是 TPU 单步时间。前置 prefix priming、workload round0 warmup 和启动编译不计入六轮正式结果。
+- C64 稳态窗口取所有请求达到64个输出后、任何请求达到960个输出前的公共区间；三轮分别 **14.090 / 13.374 / 14.441 秒**。每个窗口内所有 `/v1/loads` 采样均通过16 DP、每 DP 4条 running requests 检查。整个轮次的满并发采样数分别707 / 732 / 768；C16分别23 / 24 / 30。吞吐按公共窗口内实际 SSE 累积 token 增量计算，剔除了尾部批量下降阶段。
+
+### Cache、MTP 与验证范围
+
+- 16 DP 的真实 KV 容量均为 **219,008 tokens/DP**，FP8 `torch.float8_e4m3fn`；target KV 11.282 GB/DP。4条独立90K请求含输出和 speculative/page 余量的 slots 下限为 **364,288/DP**，因此选择 shared prefix；没有降低 C64、90K 输入、1,024 输出或 MTP 配置。
+- Decode 的89,984-token相同 prefix 先在每个 DP 各 prime 一次；每 DP 内4条请求共享，后缀16 tokens各自不同。Prefix KV 仍在不同 DP 上分别驻留。该结果不证明4条独立90K prefix/DP能装入 KV。
+- C16 的48条正式请求全部 `prompt_tokens=53,248`、`completion_tokens=16`，实际 cached 为49,088–49,152；C64 的192条正式请求全部 `prompt_tokens=90,000`、`completion_tokens=1,024`，实际 cached 为89,920–89,984。最多重算末尾一个64-token page，已计入实测 TTFT。
+- 全部368条请求的 DP receipt 与指定 rank 相符，`num_retractions=0`，没有 abort。16条 chat smoke 覆盖 DP0–15，使用 checkpoint chat template，输出均以 `4` 开头。Smoke 强制16输出并 `ignore_eos=True`，答案后的续写不用于指令遵循/模型质量结论；这不是广泛准确率验收。
+- 三轮 decode native counters：verify **38,097**，correct drafts **158,732**，proposed drafts **190,485**；接受率 `correct/proposed` = **83.330%**，三轮分别84.235% / 83.450% / 82.324%。按 native 输出口径 `196608 / verify` = **5.161 output tokens/verify**。计数器可能包含最后一次 verify 在输出长度裁剪前的 accepted run，不把它等同于逐 token 无裁剪计数。所有正式请求均有非零 MTP verify。
+- 输入为排序后的真实 UTF-8 `python/sglang/*.py` source 经 checkpoint tokenizer 编码并冻结，未循环填充；1,142,656个 token IDs，SHA256 `607d4dc372753216266489042597330f2fc66c94b5e0fd6a760181a10162b3c6`。这是自然代码输入的缓存性能口径。
+
+### 运行身份和服务期间编译
+
+- 实验：`exp-6mtkc6t2qi` / `job-agyoxxt6mj` / `art-tfqylgfhvw`；1-prod，8 physical v7x chips / 2 hosts / 16 visible devices。Running 12:02:21.833 UTC，Falcon terminal success 12:38:56.976 UTC。原始 artifact：[Falcon view](https://falcon.infiscale-infra.org/v1/experiments/exp-6mtkc6t2qi/artifacts/art-tfqylgfhvw/view)。相对根目录：`application-attempts/1/glm52-e2e/`，正式数据在 `measurements/attempt-1/`。
+- 实际源码 `811865ca48ca23aa14dc74c9dbebaf5b380279dc`，两 host benchmark source SHA256 均为 `a77e8a33f1edcc6140619e7f729bbcb8f7fdf3630a4965cfeeda3906ec9369d3`；client SHA256 `443049db573c97aa1a86ad3401ef564a97046836247e078839782d9d389bd598`。模型/reader/依赖相对 reader fix `1879b469580f6a78fb8356c53c526a0dc79dec63` 未变。两 rank checkpoint config/index/tokenizer_config SHA一致，与下文模型身份一致。
+- 每 host 9份真实 serving-process runtime 文件（launcher + 8 workers），共18份；另两份 validation probe 文件未混入 serving 证据。全部实际解释器 `/tmp/glm52-baseline-runtime/venv/bin/python`，均记录实际 imports 和已映射 `libtpu.so`：Torch `2.11.0+cpu`、torchvision `0.26.0+cpu`、torch_tpu `0.2.1.dev20261028201649`、JAX/JAXLIB `0.11.2`、libtpu `0.0.50`、tpu-sync-torch `0.0.1.dev20261112081648`。
+- 两 rank resolved args 均为 TP16 / attention-DP16 / EP16、attention backend `pallas_tpu_mla_sparse`、MoE `pallas_tpu`、quantization `fp8`、FP8 KV、每 DP chunk2048、DP lm_head=true。Native `NEXTN` 规范化为 `EAGLE`，5 steps / topk1 / 6 draft tokens。未改动模型、并行或 MTP 参数。
+- 16 DP 在12:33:43完成 native warmup 并设置 Torch `fail_on_recompile`。**这不等于 XLA 服务期零编译**：其后日志记录128个新 XLA programs，每个25–46 ms；跨 ranks累计4029 ms，最大单条日志的 program 组222 ms，不能将跨 rank 累计当作 wall-clock 停顿。另有 persistent-cache loads，其加载耗时未测。
+- 按 server 秒级时间戳与 request wall/monotonic 时间对齐（窗口边界保守扩1秒）：prefill三轮未见新 compile；decode round1尾部记录27个 programs（跨 ranks累计804 ms），round2 TTFT阶段14个（432 ms），round3无。三个 C64公共满载窗口内均未见新 XLA compile 记录。端到端 TTFT/TPOT 保留这些真实开销，未事后扣除；不宣称整个 serving 过程零编译。
+- 最后一个测量 request 于12:38:30.455完成。12:38:33后 supervisor 退出清理触发 SIGTERM；rank1 在12:38:37–38出现 Gloo `Connection closed by peer` 和 scheduler teardown traceback。异常晚于全部请求完成，两个应用结果均 `SUCCEEDED`；本轮不证明无异常的 graceful shutdown。
+
+### 取证与交付
+
+- 通过 Falcon CLI 离线 CPU analyzer `an-a841nyzdcg` 成功取回声明 outputs，核对原始 summary、368份 request metadata、两 rank results/provenance、18份 serving runtime、完整日志匹配与 load audit；未为取证另起 TPU。前一个显式 TPU image 的 analyzer `an-sj4ul6hzue` 未成功启动，改用 Falcon 默认 analyzer image 后完成；不计作模型失败或硬件实验。
+- 收集器的 `no-client-attention=False` 仅因成功路径也会保留 `client-attention.json`。实际内容是 **RESOLVED / attempt=1**，源码成功路径明确写入该 receipt；没有 client retry。该文件存在不能解释为 client 失败。
+- 可读汇总及完整数字、provenance、逐条服务期编译和结果文件 SHA256：[glm52-e2e-baseline-results-20261116.json](glm52-e2e-baseline-results-20261116.json)。原始 streams、load snapshots、输入 manifest 和 source hashes 保留在上述 Falcon artifact；CPU fixtures、此前 holding 和 native warmup 均未计入正式结果。
+- 本次正式基线已完成；停止该任务的定时跟进，不再为消除上述编译或退出清理日志自动启动实验。
 
 ## 固定目标
 
@@ -38,7 +79,7 @@
 - Native CLI 已解析验证：每 DP chunk=2,048，local compile BS=[1,2,3,4]，NEXTN 被原生 resolver 规范化为 EAGLE，steps=5、draft tokens=6、draft quantization=fp8、DP lm_head 开启。
 - Client transport 测试已验证 16 routed HTTP requests、fragmented SSE、pause/resume ingress 和 completion/MTP metadata；这是 transport 验证，不是模型通过证据。
 
-## 当前模型启动证据
+## 前轮模型启动证据（历史）
 
 - MTP-only 视图运行：`session-readerfix-1879-mtp-view`，implementation `1879b469580f6a78fb8356c53c526a0dc79dec63`，bundle SHA256 `22a3cbc8be05e5e8cd23bf1ea976d5184c874e6edc87f469215da4a62f52bb9f`。
 - target 本轮 host0 各 DP 加载29.63–42.39秒；draft 5个 shard 的 iterator 232秒完成，TARGET_VERIFY BS1/2/3/4全部完成，分别181.6/182.6/195.9/197.2秒；BS4覆盖24个verify rows。EXTEND(FULL)的64-token无/有spec info两档分别194.4/58.3秒完成，2K无spec info档494.3秒完成，其余档也已完成；target共4个verify及4个extend shapes通过，正在native EAGLE FUSED DRAFT chain预编译。
@@ -71,12 +112,12 @@
 - 78 target layers，index 包含第78层 MTP；282 indexed shards。
 - 抽查7个 header：target/MTP FP8 weights、[N] F32 scales、BF16 bridge/head/norm；保留实际 quantization_config 并补入 `weight_scale_granularity=channel`。
 
-## 失败和未完成项
+## 此前失败和当时待办（历史）
 
 - `exp-wgzfz1wtp6`、`exp-v7sl08xwpe` 在 pip 安装阶段失败，未进入模型；第二轮日志证实 ENOSPC。
 - CPU helper 未获资源，已终止；两个 custom analysis preflight 未产出可读启动日志，未作为任何验证依据。
 - `exp-jjzf5biomm` 内原 c286 的慢加载已主动停止并归档到 `glm52-e2e/rank-*/pre-fix-whole-shard-load/`；allocation 保留。
-- 下一步：等待`exp-7eqnrujaw6`获配；runner将固定源码自动完成16-DP routed chat与至少3轮目标测量，记录实际KV容量、cache hits、active batch、接受统计和重编译。当前无可报告的正式TTFT/TPOT/吞吐结果。
+- 当时待办是等待`exp-7eqnrujaw6`获配并完成正式测量；此后该任务的 runner 打包问题及最终成功任务见下文和本文开头。此条不代表当前状态。
 
 ## 2026-11-16 原生runner完整预检与资源保留
 

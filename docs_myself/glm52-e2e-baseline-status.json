@@ -4,7 +4,7 @@
   "artifact_id": "art-tfqylgfhvw",
   "artifact_uri": "gs://tpu-for-training-falcon-logs/experiments/exp-6mtkc6t2qi/artifacts/art-tfqylgfhvw/",
   "source_commit": "811865ca48ca23aa14dc74c9dbebaf5b380279dc",
-  "phase": "RUNNING",
+  "phase": "SUCCEEDED",
   "preflight": "docs_myself/glm52-runner-preflight-20261116.json",
   "previous_exp_id": "exp-7eqnrujaw6",
   "previous_failure": "native runner required an absent manually uploaded tar; fixed by actual source-tree identity",
@@ -12,5 +12,23 @@
   "running_started_at": "2026-11-16T12:02:21.833398Z",
   "running_deadline_at": "2026-11-16T14:02:21.833398Z",
   "heartbeat_id": "glm52-8-chip",
-  "last_verified_progress": "Both allocation supervisors RUNNING; rank 0 passed bootstrap and checkpoint metadata and recorded source-tree SHA256; no tar dependency"
+  "last_verified_progress": "Both rank results SUCCEEDED; one allocation/application generation/client attempt; all 368 requests completed, 16-DP routed smoke PASS, both workload warmups and six measured rounds verified through Falcon analysis. Shared-prefix C64: median TPOT 18.849 ms, steady total throughput 3511.86 output token/s (438.98 per physical chip); C16 TTFT 6302.24 ms. No request retractions. Serving-time XLA compiles and post-measurement teardown Gloo peer-close traces documented.",
+  "last_checked_utc": "2026-11-16T12:52:10.905825+00:00",
+  "terminal_at": "2026-11-16T12:38:56.975851830Z",
+  "analysis_id": "an-a841nyzdcg",
+  "analysis_status": "SUCCEEDED",
+  "heartbeat_status": "DELETED",
+  "heartbeat_deleted_at": "2026-11-16T12:51:50Z",
+  "results": "docs_myself/glm52-e2e-baseline-results-20261116.json",
+  "report": "docs_myself/glm52-e2e-baseline-report-20261116.md",
+  "allocation_generation": 1,
+  "client_attempt": 1,
+  "completed_measurement_rounds": 6,
+  "decode_prefix": "shared",
+  "limitations": [
+    "Shared-prefix decode does not establish independent-prefix C64 KV capacity.",
+    "Serving-time XLA compilation exists; no new compile records in the three common C64 windows under log timestamp alignment.",
+    "Gloo peer-close exceptions after the last request during teardown; clean graceful shutdown not established.",
+    "16 routed arithmetic smoke requests are not broad model accuracy validation."
+  ]
 }
