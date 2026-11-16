@@ -30,6 +30,15 @@ Protocol per layer, the same code on both cores (:class:`ExpertSteal`):
 
 Staging slots are reused next layer only after the layer's reduction, which
 orders the two cores (every rank waits for its sibling's partial).
+
+In the decode megakernel (variant B, ``KernelConfig.expert_steal`` at the
+grouped B8/B16 steps) the receiver runs the stolen experts as local experts
+``local_expert_count + slot`` after its own (:func:`steal_routes`), each into
+its own FP32 accumulator, and returns those weighted outputs
+(:meth:`ExpertSteal.send_returns`); the giver adds them after its own experts
+in ascending id order. The given experts are its highest-id ones, so every
+row adds the same terms in the same order as without the steal: the outputs
+are bit-identical to the steal layout alone.
 """
 
 from __future__ import annotations
@@ -120,6 +129,12 @@ def _side(used, count):
     return moved, higher
 
 
+def steal_slots(batch_size: int) -> int:
+    """Staging slots (the most experts one core gives its sibling a layer):
+    2 at 8 rows, 4 at 16."""
+    return 2 if batch_size <= 8 else 4
+
+
 def steal_plan(winners, live_rows, group, local_expert_count, slots):
     """Both cores' identical plan from every row's routed experts.
 
@@ -169,6 +184,64 @@ def plan_packet(moved, moved_slots, count, layer, slots):
     ).astype(jnp.int32)
 
 
+def steal_routes(
+    winners,
+    probabilities,
+    live_rows,
+    group,
+    local_expert_count,
+    given,
+    taken_ids,
+    taken_count,
+):
+    """The local routes under the steal, in the router's layout.
+
+    ``winners`` / ``probabilities`` [batch, top_k] are every row's selections
+    in top-k order. A route is local when its expert is one of ``group``'s
+    except the ``given`` ones ([1, 128] mask of local ids; it keeps its local
+    id), or the sibling group's expert in staging slot ``j < taken_count``
+    (``taken_ids`` [1, 128]: lane j the expert's sibling-local id), which runs
+    as local id ``local_expert_count + j``. Routes fill each row's slots in
+    selection order. Returns (selected experts [batch, top_k], probabilities,
+    route counts [batch]); with nothing given or taken they equal the
+    router's own ownership pass.
+    """
+    batch_size, route_count = winners.shape
+    lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
+    route_slots = jnp.arange(route_count)[None, :]
+    given_lanes = given.astype(jnp.float32)
+    taken_lanes = jnp.where(lanes < taken_count, taken_ids, -1)
+    lane_values = lanes.astype(jnp.float32)
+    selected_experts = jnp.zeros((batch_size, route_count), jnp.int32)
+    selected_probabilities = jnp.zeros((batch_size, route_count), jnp.float32)
+    route_counts = jnp.zeros((batch_size,), jnp.int32)
+    for route in range(route_count):
+        column = winners[:, route]
+        expert_group = column // local_expert_count
+        local = column % local_expert_count
+        # Lane sums of 0/1 terms and lane ids (< 128): exact in FP32.
+        given_hit = (
+            jnp.sum(jnp.where(local[:, None] == lanes, given_lanes, 0.0), axis=1) > 0
+        )
+        slot_hit = local[:, None] == taken_lanes
+        taken_hit = jnp.sum(jnp.where(slot_hit, 1.0, 0.0), axis=1) > 0
+        taken_slot = jnp.sum(jnp.where(slot_hit, lane_values, 0.0), axis=1).astype(
+            jnp.int32
+        )
+        own = expert_group == group
+        owned = (own & ~given_hit) | ((expert_group == (group ^ 1)) & taken_hit)
+        if live_rows is not None:
+            owned &= live_rows
+        expert = jnp.where(own, local, local_expert_count + taken_slot)
+        destination = owned[:, None] & (route_slots == route_counts[:, None])
+        selected_experts = jnp.where(destination, expert[:, None], selected_experts)
+        selected_probabilities = jnp.where(
+            destination, probabilities[:, route][:, None], selected_probabilities
+        )
+        route_counts = route_counts + owned.astype(jnp.int32)
+    return selected_experts, selected_probabilities, route_counts
+
+
 class ExpertSteal:
     """One core's side of the per-layer steal protocol.
 
@@ -179,6 +252,11 @@ class ExpertSteal:
     [2, 8, 128] int32 copies of them; ``semaphores``: DMA semaphores
     (packet send, packet receive, slab send, the packet table copies [2],
     slab receives [slots]); ``errors``: SMEM int32 [1] mismatch counter.
+
+    Variant B (the decode megakernel) adds ``ready`` (SMEM int32 [slots]:
+    staging slot j waited for this layer, :meth:`stage`), ``returns`` (VMEM
+    [slots, ...] FP32, the sibling's returned outputs of this core's given
+    experts) and ``return_semaphores`` (send, receive).
     """
 
     def __init__(
@@ -190,6 +268,10 @@ class ExpertSteal:
         packet_tables,
         semaphores,
         errors,
+        *,
+        ready=None,
+        returns=None,
+        return_semaphores=(None, None),
     ):
         self.sibling = sibling
         self.sources = tuple(sources)
@@ -205,6 +287,9 @@ class ExpertSteal:
         ) = semaphores
         self.errors = errors
         self.slots = self.staging[0].shape[0]
+        self.ready = ready
+        self.returns = returns
+        self.return_send, self.return_receive = return_semaphores
 
     def _packet_copy(self):
         return tpu.make_async_remote_copy(
@@ -238,6 +323,9 @@ class ExpertSteal:
 
     def begin(self, plan, layer):
         """Send the plan packet, then push the given experts' slabs."""
+        if self.ready is not None:
+            for slot in range(self.slots):
+                self.ready[slot] = 0
         self.packets[0] = plan_packet(
             plan.given, plan.given_slots, plan.give, layer, self.slots
         )
@@ -270,8 +358,51 @@ class ExpertSteal:
         for copy in self._slab_copies(0, slot):
             copy.wait_recv()
 
+    def stage(self, slot):
+        """Wait for staging slot ``slot``'s bytes once a layer (``ready``)."""
+
+        @pl.when(self.ready[slot] == 0)
+        def _():
+            self.wait_slab(slot)
+            self.ready[slot] = 1
+
+    def _return_copy(self, outputs, slot):
+        return tpu.make_async_remote_copy(
+            outputs.at[slot],
+            self.returns.at[slot],
+            self.return_send,
+            self.return_receive,
+            device_id=(self.sibling,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    def send_returns(self, count, outputs):
+        """Return the stolen experts' outputs (``outputs[j]``, j < ``count``,
+        the received packet's count) into the sibling's ``returns``. A slot
+        the stream did not stage (only after a plan mismatch) is waited for
+        and returned as zeros."""
+        assert outputs.shape[1:] == self.returns.shape[1:], "return shapes"
+
+        @pl.loop(0, count)
+        def _(slot):
+            @pl.when(self.ready[slot] == 0)
+            def unstaged():
+                self.wait_slab(slot)
+                self.ready[slot] = 1
+                outputs.at[slot][...] = jnp.zeros(outputs.shape[1:], outputs.dtype)
+
+            self._return_copy(outputs, slot).start()
+
+    def wait_returns(self, give):
+        """Wait for the sibling's returns of this core's ``give`` experts."""
+
+        @pl.loop(0, give)
+        def _(slot):
+            self._return_copy(self.returns, slot).wait_recv()
+
     def finish(self):
-        """Wait for this core's sends (the packet and its pushed slabs)."""
+        """Wait for this core's sends (the packet, its pushed slabs and, with
+        returns, the received packet's returned outputs)."""
         self._packet_copy().wait_send()
         give = self.packet_tables[0, HEADER_ROW, GIVE_LANE]
 
@@ -279,6 +410,12 @@ class ExpertSteal:
         def _(slot):
             for copy in self._slab_copies(0, slot):
                 copy.wait_send()
+
+        if self.returns is not None:
+
+            @pl.loop(0, self.packet_tables[1, HEADER_ROW, GIVE_LANE])
+            def _(slot):
+                self._return_copy(self.returns, slot).wait_send()
 
 
 def scratch_shapes(slots):
@@ -293,4 +430,16 @@ def scratch_shapes(slots):
         tpu.SemaphoreType.DMA((2,)),
         tpu.SemaphoreType.DMA((slots,)),
         tpu.SMEM((1,), jnp.int32),
+    ]
+
+
+def return_scratch_shapes(slots, batch_size, width):
+    """Variant B's scratch after :func:`scratch_shapes`: the ready flags, the
+    returned outputs ([slots, batch, width] FP32) and the return semaphores
+    (send, receive)."""
+    return [
+        tpu.SMEM((slots,), jnp.int32),
+        tpu.VMEM((slots, batch_size, width), jnp.float32),
+        tpu.SemaphoreType.DMA(()),
+        tpu.SemaphoreType.DMA(()),
     ]

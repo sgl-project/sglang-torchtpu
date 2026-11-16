@@ -203,8 +203,20 @@ def _project_routing_scores(
 
 
 # EP8/TP4 routed experts in the sibling-steal layout (KernelConfig.expert_steal):
-# the router's ownership test uses expert_steal.owned_expert_group.
+# the router's ownership test uses expert_steal.owned_expert_group. The
+# scheduled B8/B16 steps also run the steal itself (_ExpertStealStep).
 EXPERT_STEAL = _config().expert_steal
+# The steal's persistent scratch (expert_steal.scratch_shapes).
+STEAL_PERSISTENT_NAMES = (
+    "steal packets",
+    "steal packet tables",
+    "steal packet send",
+    "steal packet receive",
+    "steal slab send",
+    "steal table copies",
+    "steal slab receives",
+    "steal errors",
+)
 
 
 def _route_hidden_states(
@@ -224,6 +236,7 @@ def _route_hidden_states(
     after_score_send=None,
     live_rows=None,
     wait_for_projection_half=None,
+    defer_ownership=False,
 ):
     """Project and select local expert routes through one shared B1/B2 path.
 
@@ -232,6 +245,11 @@ def _route_hidden_states(
     ``_project_routing_scores``), then every top-k iteration advances all
     batch rows together. Selected local routes are returned as
     [batch_size, top_k] values for scalar SMEM materialization by the caller.
+
+    ``defer_ownership`` (the expert steal, which plans from every row's
+    experts first) returns every row's selections instead: (global expert ids
+    [batch_size, top_k], their probabilities, probability totals), with no
+    ``on_local_selection`` calls.
     """
     rank = jax.lax.axis_index("tp")
     batch_size = hidden_states.shape[0]
@@ -264,6 +282,7 @@ def _route_hidden_states(
     probability_totals = jnp.zeros((batch_size,), jnp.float32)
     expert_ids = jnp.arange(expert_count)[None, :]
     route_slots = jnp.arange(selected_expert_count)[None, :]
+    winners_by_slot, probabilities_by_slot = [], []
     # Only top-k rank is sequential. Every score reduction and ownership
     # operation carries the leading batch dimension with no per-row control.
     for selection in range(selected_expert_count):
@@ -278,6 +297,11 @@ def _route_hidden_states(
         routing_scores_vmem[:, :expert_count] = jnp.where(
             winner_mask, -jnp.inf, routing_scores_vmem[:, :expert_count]
         )
+        if defer_ownership:
+            winners_by_slot.append(winners)
+            probabilities_by_slot.append(probabilities)
+            after_selection(selection)
+            continue
 
         counts_before_selection = local_route_counts
         owned_locally = (
@@ -307,13 +331,19 @@ def _route_hidden_states(
         )
         after_selection(selection)
 
+    if live_rows is not None:
+        probability_totals = jnp.where(live_rows, probability_totals, 1.0)
+    if defer_ownership:
+        return (
+            jnp.stack(winners_by_slot, axis=1),
+            jnp.stack(probabilities_by_slot, axis=1),
+            probability_totals,
+        )
     return (
         selected_experts,
         selected_probabilities,
         local_route_counts,
-        probability_totals
-        if live_rows is None
-        else jnp.where(live_rows, probability_totals, 1.0),
+        probability_totals,
     )
 
 
@@ -477,11 +507,15 @@ def _start_initial_expert_weight_copies(
     slot_count,
     already_started,
     group_pending_routes,
+    first_staged_expert=None,
 ):
     """Prefetch the first routed experts in their execution order.
 
     This uses the same cross-row ordering as the expert stream, so it works for
     both shared and divergent routes without specializing on batch size.
+    Experts from ``first_staged_expert`` on (stolen experts, read from the
+    steal's staging slots) are left to the stream, which waits for their
+    slabs first.
     """
     selected_expert_count = selected_experts.shape[1]
     route_slots = jnp.arange(selected_expert_count)[None, :]
@@ -523,8 +557,11 @@ def _start_initial_expert_weight_copies(
 
     for slot in range(slot_count):
         expert, consumed, has_expert = next_expert(processed)
+        start = has_expert & (slot >= already_started)
+        if first_staged_expert is not None:
+            start &= expert < first_staged_expert
 
-        @pl.when(has_expert & (slot >= already_started))
+        @pl.when(start)
         def start_copy(expert=expert, slot=slot):
             _start_async_copies(copy_expert(expert, slot))
 
@@ -1073,6 +1110,7 @@ def _run_routed_expert_stream(
     group_pending_routes,
     progress=None,
     expert_schedule=None,
+    stolen=None,
 ):
     """Execute the next route shared by any ready batch rows.
 
@@ -1085,8 +1123,25 @@ def _run_routed_expert_stream(
     started by _start_expert_schedule) supplies each pair's experts, row
     counts, single rows and row masks from SMEM; ``processed_routes_vmem``
     is its staging buffer then.
+
+    ``stolen`` (the expert steal, with the schedule): local experts from
+    ``stolen.first_expert`` on are the sibling's, in staging slot ``expert -
+    first_expert``. The stream copies them in without prefetching, after
+    ``stolen.stage(slot)`` (waits for the slot's slab), and adds each one's
+    output to its own FP32 accumulator ``stolen.accumulators[1 + slot]``
+    (``accumulators[0]`` is ``expert_output``).
     """
     batch_size, selected_expert_count = selected_experts.shape
+    if stolen is not None and expert_schedule is None:
+        raise ValueError("Stolen experts run on the expert schedule")
+
+    def accumulator(expert):
+        """The FP32 output ``expert``'s weighted rows are added to."""
+        if stolen is None:
+            return expert_output
+        first = stolen.first_expert
+        return stolen.accumulators.at[jnp.where(expert >= first, expert - first + 1, 0)]
+
     # Narrow masked products avoid zero MACs and register spills while keeping
     # the unsplit scale reduction tree. KernelConfig.mxfp4_dot_tile overrides
     # the per-batch default (0: unsplit dots).
@@ -1199,7 +1254,13 @@ def _run_routed_expert_stream(
         return expert, active_rows, current_slot_mask, consumed, has_expert
 
     def finish_expert(
-        active_rows, current_slot_mask, copies, column, slot, output_weights=None
+        active_rows,
+        current_slot_mask,
+        copies,
+        column,
+        slot,
+        output_weights=None,
+        expert=None,
     ):
         gate_up = (
             gate_up_accumulator[
@@ -1241,7 +1302,7 @@ def _run_routed_expert_stream(
                 / probability_totals
             )
             output_weights = jnp.where(active_rows, route_probabilities, jnp.float32(0))
-        expert_output[:, :expert_output_size] += (
+        accumulator(expert)[:, :expert_output_size] += (
             down_accumulator[...].astype(jnp.bfloat16).astype(jnp.float32)
             * output_weights[:, None]
         )
@@ -1254,6 +1315,7 @@ def _run_routed_expert_stream(
         column,
         slot,
         active_row=None,
+        expert=None,
     ):
         """Finish one expert whose route is active for exactly one batch row
         (``active_row``, if known as a scalar)."""
@@ -1302,7 +1364,7 @@ def _run_routed_expert_stream(
         probability = jnp.sum(
             jnp.where(active_rows, route_probabilities, jnp.float32(0))
         )
-        output_row = expert_output.at[pl.ds(row, 1), :expert_output_size]
+        output_row = accumulator(expert).at[pl.ds(row, 1), :expert_output_size]
         output_row[...] += singleton_output * probability
 
     compact_capacity = first_compact_source_vmem.shape[0]
@@ -1583,6 +1645,7 @@ def _run_routed_expert_stream(
         offset=0,
         wait_down=True,
         route_data=None,
+        expert=None,
     ):
         """Finish one expert whose active rows offset .. offset + C - 1 sit
         compacted in accumulator rows [first_row, first_row + C)."""
@@ -1624,7 +1687,9 @@ def _run_routed_expert_stream(
             selector,
             down_accumulator[:compact_capacity].astype(jnp.bfloat16),
         )
-        expert_output[:, :expert_output_size] += selected * output_weights[:, None]
+        accumulator(expert)[:, :expert_output_size] += (
+            selected * output_weights[:, None]
+        )
 
     compact_overflow = _use_compact_overflow(
         batch_size, expert_gate_up_vmem.dtype, group_pending_routes=group_pending_routes
@@ -1652,6 +1717,7 @@ def _run_routed_expert_stream(
         slot,
         paired_gate=False,
         row_words=None,
+        expert=None,
     ):
         """One expert with more than C rows, C rows per pass."""
         copies.gate_up.wait()
@@ -1704,6 +1770,7 @@ def _run_routed_expert_stream(
                 route_data=compact_route_data(
                     active_rows, current_slot_mask, offset, row_plan
                 ),
+                expert=expert,
             )
 
     valid_routes = route_slots < local_route_counts[:, None]
@@ -1956,6 +2023,9 @@ def _run_routed_expert_stream(
 
                 should_prefetch_third = has_third & (iteration != 0)
                 should_prefetch_fourth = has_fourth & (iteration != 0)
+                if stolen is not None:
+                    should_prefetch_third &= third_expert < stolen.first_expert
+                    should_prefetch_fourth &= fourth_expert < stolen.first_expert
 
                 @pl.when(should_prefetch_third)
                 def prefetch_third():
@@ -1964,6 +2034,19 @@ def _run_routed_expert_stream(
                 @pl.when(should_prefetch_fourth)
                 def prefetch_fourth():
                     _start_async_copies(fourth_copies)
+
+                if stolen is not None:
+                    # A stolen expert is copied in when it runs, once its slab
+                    # has landed in staging (never prefetched).
+                    for expert, has_expert, copies in (
+                        (first_expert, has_first, first_copies),
+                        (second_expert, has_second, second_copies),
+                    ):
+
+                        @pl.when(has_expert & (expert >= stolen.first_expert))
+                        def start_stolen(expert=expert, copies=copies):
+                            stolen.stage(expert - stolen.first_expert)
+                            _start_async_copies(copies)
 
                 _phase_end(select_scope)
 
@@ -1988,6 +2071,7 @@ def _run_routed_expert_stream(
                             first_copies,
                             0,
                             current_base_slot,
+                            expert=first_expert,
                         )
                         finish_expert(
                             second_rows,
@@ -1995,6 +2079,7 @@ def _run_routed_expert_stream(
                             second_copies,
                             2 * expert_width,
                             current_base_slot + 1,
+                            expert=second_expert,
                         )
 
                 def execute_full_tail():
@@ -2015,6 +2100,7 @@ def _run_routed_expert_stream(
                             first_copies,
                             0,
                             current_base_slot,
+                            expert=first_expert,
                         )
 
                 # From B8, staging a singleton route's one active row is cheaper
@@ -2071,6 +2157,7 @@ def _run_routed_expert_stream(
                             0,
                             current_base_slot,
                             first_row,
+                            expert=first_expert,
                         )
                         finish_singleton_expert(
                             second_rows,
@@ -2080,6 +2167,7 @@ def _run_routed_expert_stream(
                             2 * expert_width,
                             current_base_slot + 1,
                             second_row,
+                            expert=second_expert,
                         )
 
                     if compact_capacity > 1:
@@ -2148,6 +2236,7 @@ def _run_routed_expert_stream(
                                     0,
                                     0,
                                     current_base_slot,
+                                    expert=first_expert,
                                 )
                                 finish_compact_expert(
                                     second_rows,
@@ -2156,6 +2245,7 @@ def _run_routed_expert_stream(
                                     compact_capacity,
                                     2 * expert_width,
                                     current_base_slot + 1,
+                                    expert=second_expert,
                                 )
                     else:
                         multi_pair = jnp.bool_(False)
@@ -2172,6 +2262,7 @@ def _run_routed_expert_stream(
                                 current_base_slot,
                                 paired_gate=compact_overflow,
                                 row_words=scheduled_row_words(0),
+                                expert=first_expert,
                             )
                             run_expert_in_passes(
                                 second_rows,
@@ -2181,6 +2272,7 @@ def _run_routed_expert_stream(
                                 current_base_slot + 1,
                                 paired_gate=compact_overflow,
                                 row_words=scheduled_row_words(1),
+                                expert=second_expert,
                             )
                         else:
                             execute_full_pair()
@@ -2212,6 +2304,7 @@ def _run_routed_expert_stream(
                             0,
                             current_base_slot,
                             first_row,
+                            expert=first_expert,
                         )
 
                     if compact_capacity > 1:
@@ -2250,6 +2343,7 @@ def _run_routed_expert_stream(
                                     0,
                                     0,
                                     current_base_slot,
+                                    expert=first_expert,
                                 )
                     else:
                         multi_tail = jnp.bool_(False)
@@ -2266,6 +2360,7 @@ def _run_routed_expert_stream(
                                 first_row_count,
                                 current_base_slot,
                                 row_words=scheduled_row_words(0),
+                                expert=first_expert,
                             )
                         else:
                             execute_full_tail()
@@ -2314,6 +2409,7 @@ def _run_routed_expert_stream(
                                     index * 2 * expert_width,
                                     slot,
                                     output_weights,
+                                    expert=expert,
                                 )
 
                     if share_compact_finish:
@@ -2351,6 +2447,7 @@ def _run_routed_expert_stream(
                                         index * 2 * expert_width,
                                         slot,
                                         route_data=(selector, output_weights),
+                                        expert=expert,
                                     )
 
                             finish_selected()
@@ -2571,6 +2668,151 @@ def _start_async_copies(copies: SimpleNamespace) -> None:
             copy.start()
 
 
+class _StagedCopy:
+    """An expert weight family's copy into its slot from this core's HBM, or
+    for a stolen expert (``staged``) from its steal staging slot (built by
+    ``make_staging`` when started). Both land in the same slot with the same
+    semaphore and size, so either waits."""
+
+    def __init__(self, staged, local, make_staging):
+        self.staged, self.local, self.make_staging = staged, local, make_staging
+
+    def start(self):
+        @pl.when(self.staged)
+        def from_staging():
+            self.make_staging().start()
+
+        @pl.when(~self.staged)
+        def from_hbm():
+            self.local.start()
+
+    def wait(self):
+        self.local.wait()
+
+
+def _steal_copy_expert(weights, staging, local_expert_count):
+    """``copy_expert`` under the expert steal: local ids from
+    ``local_expert_count`` on are stolen experts, read from staging slot
+    ``expert - local_expert_count`` (``weights.make_staged_expert_copies``)."""
+    slots = staging[0].shape[0]
+
+    def copy_expert(expert, slot, *, gate_up=True, down=True):
+        staged = expert >= local_expert_count
+        local = weights.make_expert_copies(
+            jnp.minimum(expert, local_expert_count - 1),
+            slot,
+            gate_up=gate_up,
+            down=down,
+        )
+        index = jnp.clip(expert - local_expert_count, 0, slots - 1)
+        return SimpleNamespace(
+            **{
+                name: None
+                if copy is None
+                else _StagedCopy(
+                    staged,
+                    copy,
+                    functools.partial(
+                        weights.make_staged_expert_copy, staging, kind, index, slot
+                    ),
+                )
+                for kind, (name, copy) in enumerate(vars(local).items())
+            }
+        )
+
+    return copy_expert
+
+
+class _ExpertStealStep:
+    """One MoE layer of the sibling expert steal on one core (variant B of
+    kernels/expert_steal.py, ``KernelConfig.expert_steal``, grouped B8/B16
+    steps on the expert schedule).
+
+    ``begin`` (after routing, from every row's selections) plans, sends the
+    plan packet, pushes the given slabs and returns the local routes for the
+    expected packet: this group's experts except the given ones, then the
+    sibling's experts this core expects as local ids ``local_expert_count +
+    slot``. ``receive`` (before the expert stream) waits for the sibling's
+    packet; if it differs from the expected one, the routes are rebuilt from
+    it (``replace_routes``), so the slabs waited for and the experts run are
+    always the ones the sibling sent. The stream runs the stolen experts after
+    the own ones, each into ``accumulators[1 + slot]`` (``stream_hooks``).
+    ``combine`` returns those outputs, waits for this core's returned outputs
+    and adds them to ``routed_outputs`` in ascending expert id order (slot 0
+    holds the highest), then waits for this core's sends.
+    """
+
+    def __init__(self, protocol, *, group, local_expert_count, live_rows, accumulators):
+        self.protocol = protocol
+        self.group = group
+        self.local_expert_count = local_expert_count
+        self.live_rows = live_rows
+        self.accumulators = accumulators
+        self.slots = protocol.slots
+
+    def routes(self, taken_ids, taken_count):
+        return expert_steal.steal_routes(
+            self.winners,
+            self.probabilities,
+            self.live_rows,
+            self.group,
+            self.local_expert_count,
+            self.plan.given,
+            taken_ids,
+            taken_count,
+        )
+
+    def begin(self, winners, probabilities, tag, plan=None):
+        """``plan``: an override (tests perturb one core's plan)."""
+        if plan is None:
+            plan = expert_steal.steal_plan(
+                winners, self.live_rows, self.group, self.local_expert_count, self.slots
+            )
+        self.winners, self.probabilities, self.plan = winners, probabilities, plan
+        self.protocol.begin(plan, tag)
+        self.expected = expert_steal.plan_packet(
+            plan.taken, plan.taken_slots, plan.take, tag, self.slots
+        )
+        ids = expert_steal.IDS_ROW
+        return self.routes(self.expected[ids : ids + 1], plan.take)
+
+    def receive(self, replace_routes):
+        count, _ = self.protocol.receive(self.expected)
+        received = self.protocol.packets[1]
+
+        @pl.when(jnp.any(received != self.expected))
+        def follow_the_sender():
+            ids = expert_steal.IDS_ROW
+            replace_routes(self.routes(received[ids : ids + 1], count))
+
+    def stream_hooks(self):
+        def stage(slot):
+            self.protocol.stage(slot)
+            stolen = self.accumulators.at[1 + slot]
+            stolen[...] = jnp.zeros(stolen.shape, stolen.dtype)
+
+        return SimpleNamespace(
+            first_expert=self.local_expert_count,
+            accumulators=self.accumulators,
+            stage=stage,
+        )
+
+    def combine(self, routed_outputs, width):
+        protocol = self.protocol
+        tables = protocol.packet_tables
+        count = tables[1, expert_steal.HEADER_ROW, expert_steal.GIVE_LANE]
+        give = tables[0, expert_steal.HEADER_ROW, expert_steal.GIVE_LANE]
+        protocol.send_returns(count, self.accumulators.at[pl.ds(1, self.slots)])
+        protocol.wait_returns(give)
+
+        @pl.loop(0, give)
+        def add_returned(index):
+            returned = protocol.returns.at[give - 1 - index]
+            routed_outputs[:, :width] += returned[:, :width]
+
+        protocol.finish()
+
+
 def _gather_output_shards(
     output_vmem,
     send_semaphores,
@@ -2756,6 +2998,23 @@ class MixtureOfExpertsWeights:
             ),
         )
 
+    def make_staged_expert_copy(self, staging, kind, index, slot):
+        """``make_expert_copies``'s family ``kind`` (0 gate/up, 1 its scales,
+        2 down, 3 its scales) copied from steal staging slot ``index``
+        (``staging``: the four [slots, ...] HBM families) into expert slot
+        ``slot``."""
+        destination = (
+            self.expert_gate_up_projection_vmem,
+            self.expert_gate_up_scales_vmem,
+            self.expert_down_projection_vmem,
+            self.expert_down_scales_vmem,
+        )[kind]
+        return tpu.make_async_copy(
+            staging[kind].at[index],
+            destination.at[slot],
+            self.expert_copy_semaphores.at[slot, kind],
+        )
+
     def make_half_expert_copies(self, expert, slot, *, gate_up=True, down=True):
         """Virtual expert ``expert``'s copies (see HALF_EXPERT_LOCAL_COUNT)."""
         whole, half = expert // 2, expert % 2
@@ -2908,6 +3167,7 @@ def moe(
     token_scatter_owners: int = 4,
     owned_hidden_ref=None,
     live_rows=None,
+    steal=None,
 ) -> None:
     """Execute one mixture-of-experts layer inside a Pallas program.
 
@@ -2922,6 +3182,13 @@ def moe(
     ``prepare_weights_vmem`` optionally supplies caller-owned VMEM for the
     latent-down, shared gate/up and shared down projections instead of a
     scoped allocation.
+
+    ``steal`` (``KernelConfig.expert_steal``, grouped B8/B16 routes on the
+    expert schedule) runs the sibling expert steal (_ExpertStealStep): the
+    staging families, the protocol's scratch (expert_steal.scratch_shapes and
+    return_scratch_shapes), the tag both cores put in their packets and
+    ``accumulators`` [1 + slots, batch_size, latent_size] FP32 whose first
+    entry is ``workspace.routed_outputs_vmem``.
     """
     batch_size, hidden_size = hidden_ref.shape
     expert_count = weights.routing_projection.shape[1]
@@ -3203,6 +3470,44 @@ def moe(
             down=down,
         )
 
+    steal_step = None
+    if steal is not None:
+        if not (
+            EXPERT_STEAL
+            and expert_tensor_parallel == 4
+            and not half_experts
+            and group_pending_expert_routes
+            and workspace.expert_schedule_smem is not None
+            and owned_hidden_ref is None
+        ):
+            raise ValueError(
+                "The expert steal runs EP8/TP4 grouped routes on the expert schedule"
+            )
+        steal_step = _ExpertStealStep(
+            expert_steal.ExpertSteal(
+                rank ^ 1,
+                (
+                    weights.expert_gate_up_projection,
+                    weights.expert_gate_up_scales,
+                    weights.expert_down_projection,
+                    weights.expert_down_scales,
+                ),
+                steal.staging,
+                steal.packets,
+                steal.packet_tables,
+                steal.semaphores,
+                steal.errors,
+                ready=steal.ready,
+                returns=steal.returns,
+                return_semaphores=steal.return_semaphores,
+            ),
+            group=expert_steal.expert_group(rank),
+            local_expert_count=local_expert_count,
+            live_rows=live_rows,
+            accumulators=steal.accumulators,
+        )
+        copy_expert = _steal_copy_expert(weights, steal.staging, local_expert_count)
+
     if not routing_projection_is_prefetched:
         weights.start_routing_projection_copy()
     latent_output_copy = weights.make_latent_output_copy()
@@ -3388,6 +3693,35 @@ def moe(
                     latent_input_copy,
                 )
 
+        def route_for_steal():
+            winners, winner_probabilities, probability_totals = _route_hidden_states(
+                hidden,
+                weights.routing_projection_vmem,
+                weights.routing_bias,
+                workspace.routing_scores_vmem,
+                send_semaphores.at[0],
+                receive_semaphores.at[0],
+                selected_expert_count=selected_expert_count,
+                local_expert_count=local_expert_count,
+                expert_tensor_parallel=expert_tensor_parallel,
+                on_local_selection=prefetch_shared_route_prefix,
+                after_selection=overlap_routing_with_latent_gather,
+                after_scores=after_routing_scores,
+                after_score_send=(
+                    overlap_router_score_exchange if overlap_router_latent else None
+                ),
+                live_rows=live_rows,
+                wait_for_projection_half=(
+                    weights.wait_for_routing_projection_half
+                    if router_slots == 2
+                    else None
+                ),
+                defer_ownership=True,
+            )
+            # Plan, send the packet and push the given slabs first.
+            routes = steal_step.begin(winners, winner_probabilities, steal.tag)
+            return (*routes, probability_totals)
+
         with _phase("p3_route"):
             (
                 selected_experts,
@@ -3395,7 +3729,9 @@ def moe(
                 local_route_counts,
                 selected_probability_totals,
             ) = (
-                _route_owned_rows(
+                route_for_steal()
+                if steal_step is not None
+                else _route_owned_rows(
                     owned_hidden_ref,
                     batch_size,
                     weights.routing_projection_vmem,
@@ -3447,17 +3783,20 @@ def moe(
                 (selected_probabilities, selected_probabilities), axis=2
             ).reshape(batch_size, route_columns)
             local_route_counts = 2 * local_route_counts
-        selected_experts_vmem[...] = jnp.pad(
-            selected_experts,
-            ((0, 0), (0, 128 - route_columns)),
-        )
-        selected_probabilities_vmem[...] = jnp.pad(
-            selected_probabilities,
-            ((0, 0), (0, 128 - route_columns)),
-        )
-        local_route_counts_vmem[...] = jnp.broadcast_to(
-            local_route_counts[:, None], local_route_counts_vmem.shape
-        )
+        def store_routes(selected_experts, selected_probabilities, local_route_counts):
+            selected_experts_vmem[...] = jnp.pad(
+                selected_experts,
+                ((0, 0), (0, 128 - route_columns)),
+            )
+            selected_probabilities_vmem[...] = jnp.pad(
+                selected_probabilities,
+                ((0, 0), (0, 128 - route_columns)),
+            )
+            local_route_counts_vmem[...] = jnp.broadcast_to(
+                local_route_counts[:, None], local_route_counts_vmem.shape
+            )
+
+        store_routes(selected_experts, selected_probabilities, local_route_counts)
         probability_totals_vmem[...] = jnp.broadcast_to(
             selected_probability_totals[:, None],
             probability_totals_vmem.shape,
@@ -3469,6 +3808,7 @@ def moe(
             slot_count=expert_prefetch_slot_count,
             already_started=prefetched_expert_count,
             group_pending_routes=group_pending_expert_routes,
+            first_staged_expert=None if steal_step is None else local_expert_count,
         )
         if expert_schedule is not None:
             # After the first expert copies, ahead of the shared expert.
@@ -3487,6 +3827,16 @@ def moe(
             dense_copies.down.wait()
         else:
             prepare_shared_compute()
+
+        if steal_step is not None:
+            # The sibling's packet (sent when it planned) arrived during the
+            # shared expert. After a mismatch, run what it sent.
+            def replace_routes(routes):
+                store_routes(*routes)
+                expert_schedule.copy.wait()
+                _start_expert_schedule(expert_schedule, routes[0], routes[2])
+
+            steal_step.receive(replace_routes)
 
     if prepare_weights_vmem is not None:
         latent_down_vmem, shared_gate_up_vmem, shared_down_vmem = prepare_weights_vmem
@@ -3987,6 +4337,7 @@ def moe(
                 group_pending_routes=group_pending_expert_routes,
                 progress=poll_shared,
                 expert_schedule=expert_schedule,
+                stolen=None if steal_step is None else steal_step.stream_hooks(),
             )
 
         @pl.when(progress_state[0] == 0)
@@ -4024,6 +4375,7 @@ def moe(
                 group_pending_routes=group_pending_expert_routes,
                 progress=None,
                 expert_schedule=expert_schedule,
+                stolen=None if steal_step is None else steal_step.stream_hooks(),
             )
 
     def consume_routed_chunk(first, rows):
@@ -4057,6 +4409,9 @@ def moe(
             # storage is disjoint from the still-live routed gather packets.
             latent_vmem[row_slice, :1024] = local_output
 
+    if steal_step is not None:
+        # Before the reductions: the given experts' outputs after the own.
+        steal_step.combine(routed_outputs_vmem, expert_output_size)
     finish_reductions(
         routed_outputs_vmem[...],
         routed_outputs_vmem,
@@ -7466,8 +7821,13 @@ def _moe_scoped_scratch(
     token_scatter_owners: int = 4,
     shard_routing: bool = False,
     group_pending_routes: bool = False,
+    steal_slots: int = 0,
 ):
-    """Transient MoE resources not held in the shared projection/expert pool."""
+    """Transient MoE resources not held in the shared projection/expert pool.
+
+    ``steal_slots`` (the expert steal): the routed outputs gain the stolen
+    experts' accumulators ([1 + slots, batch, latent]) and the steal's return
+    scratch (expert_steal.return_scratch_shapes) follows the rest."""
     gate_up = local_weights["expert_gu"]
     down = local_weights["expert_down"]
     latent_size = local_weights["latent_norm"].shape[-1]
@@ -7520,7 +7880,12 @@ def _moe_scoped_scratch(
         tpu.VMEM(
             (batch_size, 1024 if _shared_shards(batch_size) else 7168), jnp.float32
         ),
-        tpu.VMEM((batch_size, latent_size), jnp.float32),
+        tpu.VMEM(
+            (1 + steal_slots, batch_size, latent_size)
+            if steal_slots
+            else (batch_size, latent_size),
+            jnp.float32,
+        ),
         tpu.VMEM((accumulator_rows[0], 4 * expert_width), jnp.float32),
         tpu.VMEM((accumulator_rows[1], expert_output_size), jnp.float32),
         tpu.VMEM((batch_size, 128), jnp.int32),
@@ -7549,6 +7914,11 @@ def _moe_scoped_scratch(
             if _use_expert_schedule(
                 batch_size, group_pending_routes=group_pending_routes
             )
+            else ()
+        ),
+        *(
+            expert_steal.return_scratch_shapes(steal_slots, batch_size, latent_size)
+            if steal_slots
             else ()
         ),
     )
@@ -8010,6 +8380,15 @@ def stack(
     expert_schedule = _use_expert_schedule(
         batch_size, group_pending_routes=group_pending_expert_routes
     )
+    # KernelConfig.expert_steal: the sibling expert steal at the scheduled
+    # B8/B16 steps with the replicated router (_ExpertStealStep); other steps
+    # run the steal layout alone.
+    steal_slots = (
+        expert_steal.steal_slots(batch_size)
+        if EXPERT_STEAL and expert_schedule and not shard_routing
+        else 0
+    )
+    steal_families = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
     moe_scoped_scratch = _moe_scoped_scratch(
         local_weights,
         batch_size=batch_size,
@@ -8018,6 +8397,7 @@ def stack(
         token_scatter_owners=sp_owners,
         shard_routing=shard_routing,
         group_pending_routes=group_pending_expert_routes,
+        steal_slots=steal_slots,
     )
 
     def body(position_ref, state_row_ref, *refs):
@@ -8062,6 +8442,16 @@ def stack(
             records_output_ref, keys_output_ref = refs[
                 state_start + state_count + 7 : state_start + state_count + 9
             ]
+        steal_staging = ()
+        if steal_slots:
+            # The steal's staging families (HBM outputs the sibling writes).
+            steal_staging = refs[
+                state_start + state_count + output_count : state_start
+                + state_count
+                + output_count
+                + len(steal_families)
+            ]
+            output_count += len(steal_families)
         (
             output_ref,
             blocks_output_ref,
@@ -8119,6 +8509,10 @@ def stack(
         if dsa:
             dsa_persistent = tuple(common[: len(dsa_decode.PERSISTENT_NAMES)])
             common = common[len(dsa_decode.PERSISTENT_NAMES) :]
+        steal_persistent = ()
+        if steal_slots:
+            steal_persistent = tuple(common[: len(STEAL_PERSISTENT_NAMES)])
+            common = common[len(STEAL_PERSISTENT_NAMES) :]
         if _config().vmem_pad_kb:
             headroom_pad = common[-1]
             headroom_pad[...] = jnp.zeros(headroom_pad.shape, jnp.float32)
@@ -10089,6 +10483,12 @@ def stack(
                     gate_up_vmem, down_vmem = layer_expert_vmem
                     gate_up_scales_vmem, down_scales_vmem = resources[3:5]
                     workspace_resources = resources[5:]
+                steal_scoped = ()
+                if steal_slots:
+                    workspace_resources, steal_scoped = (
+                        workspace_resources[:-4],
+                        workspace_resources[-4:],
+                    )
                 schedule_resources = {}
                 if expert_schedule:
                     *workspace_resources, schedule_smem, schedule_semaphore = (
@@ -10101,6 +10501,38 @@ def stack(
                 mixture_output_vmem = (
                     owned_rows_vmem if moe_token_scatter_output else mixture_vmem
                 )
+                moe_workspace = MixtureOfExpertsWorkspace(
+                    *workspace_resources, **schedule_resources
+                )
+                steal = None
+                if steal_slots:
+                    (
+                        steal_packets,
+                        steal_tables,
+                        *steal_semaphores,
+                        steal_errors,
+                    ) = steal_persistent
+                    steal_ready, steal_returns, *steal_return_semaphores = (
+                        steal_scoped
+                    )
+                    accumulators = moe_workspace.routed_outputs_vmem
+                    moe_workspace = dataclasses.replace(
+                        moe_workspace, routed_outputs_vmem=accumulators.at[0]
+                    )
+                    steal = SimpleNamespace(
+                        staging=tuple(
+                            ref for ref in steal_staging
+                        ),
+                        packets=steal_packets,
+                        packet_tables=steal_tables,
+                        semaphores=tuple(steal_semaphores),
+                        errors=steal_errors,
+                        ready=steal_ready,
+                        returns=steal_returns,
+                        return_semaphores=tuple(steal_return_semaphores),
+                        accumulators=accumulators,
+                        tag=layer_index,
+                    )
                 moe(
                     normalized_vmem,
                     mixture_output_vmem,
@@ -10126,9 +10558,7 @@ def stack(
                         down_scales_vmem,
                         expert_semaphores,
                     ),
-                    workspace=MixtureOfExpertsWorkspace(
-                        *workspace_resources, **schedule_resources
-                    ),
+                    workspace=moe_workspace,
                     communication_workspace=communication_workspace,
                     epsilon=eps,
                     synchronize_devices=False,
@@ -10165,6 +10595,7 @@ def stack(
                     token_scatter_owners=sp_owners,
                     owned_hidden_ref=owned_rows_vmem if shard_routing else None,
                     live_rows=active_rows,
+                    steal=steal,
                 )
 
             def run_dense_mlp():
@@ -10625,6 +11056,14 @@ def stack(
             if dsa
             else ()
         ),
+        # The steal's staging slots (scratch; unused by the caller).
+        *(
+            jax.ShapeDtypeStruct(
+                (steal_slots, *local_weights[name].shape[1:]),
+                local_weights[name].dtype,
+            )
+            for name in (steal_families if steal_slots else ())
+        ),
     )
     pooled_expert_names = (
         ("expert_gu", "expert_gus", "expert_down", "expert_ds")
@@ -10779,6 +11218,9 @@ def stack(
             sequence_rows=sequence_rows,
         ),
         *(dsa_decode.persistent_scratch(batch_size) if dsa else ()),
+        # The steal's packets and semaphores the sibling signals (it may run
+        # ahead into the next layer's MoE).
+        *(expert_steal.scratch_shapes(steal_slots) if steal_slots else ()),
         *communication_scratch(batch_size, attention_dp)[:-1],
         tpu.VMEM((batch_size, 4096), jnp.bfloat16),
         *projection_staging_scratch(batch_size, attention_dp),
@@ -10831,6 +11273,7 @@ def stack(
         ),
         *mla_dcp.PERSISTENT_NAMES,
         *(dsa_decode.PERSISTENT_NAMES if dsa else ()),
+        *(STEAL_PERSISTENT_NAMES if steal_slots else ()),
         "shared_local_reduction",
         "expert_local_reduction",
         "shared_host_reduction",
@@ -11000,6 +11443,16 @@ def stack(
                             if expert_schedule
                             else ()
                         ),
+                        *(
+                            (
+                                "steal ready",
+                                "steal returns",
+                                "steal return send",
+                                "steal return receive",
+                            )
+                            if steal_slots
+                            else ()
+                        ),
                     ),
                     moe_scoped_scratch,
                     strict=True,
@@ -11080,7 +11533,7 @@ def stack(
             f"The decoder's VMEM plan leaves less than the spill reserve:\n{vmem_report}",
             stacklevel=2,
         )
-    return pl.pallas_call(
+    outputs = pl.pallas_call(
         body,
         name="kimi_decoder_stack",
         out_shape=output_shapes,
@@ -11091,7 +11544,12 @@ def stack(
             out_specs=[
                 pl.BlockSpec(memory_space=tpu.HBM),
                 pl.BlockSpec(memory_space=tpu.VMEM),
-                *(pl.BlockSpec(memory_space=tpu.HBM) for _ in range(7 if dsa else 5)),
+                *(
+                    pl.BlockSpec(memory_space=tpu.HBM)
+                    for _ in range(
+                        (7 if dsa else 5) + (len(steal_families) if steal_slots else 0)
+                    )
+                ),
             ],
             scratch_shapes=scratch,
         ),
@@ -11122,6 +11580,9 @@ def stack(
         ),
         *args,
     )
+    if steal_slots:
+        outputs = outputs[: len(outputs) - len(steal_families)]
+    return outputs
 
 
 def decode_local(
