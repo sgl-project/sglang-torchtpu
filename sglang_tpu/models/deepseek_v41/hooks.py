@@ -71,11 +71,13 @@ tpu_dsv41_int32_graph_inputs
        halves, which TPU lowering rejects ("Unsupported conversion from
        vmreg/vreg to U64"). A cast inside the forward still leaves the
        int64 parameter in the graph.
-  How: AROUND CompiledForwardShim._forward casts them to int32 before the
-       compiled call for V4.1 on non-CUDA devices and restores the batch
-       fields afterwards; token ids, positions and pool rows fit in int32.
-       Engram rows are hashed and gathered here on the host (engram_host), so
-       the graph takes staged rows instead of hashing and looking up tables.
+  How: AROUND CompiledForwardShim._forward passes int32 copies of input_ids
+       and positions as the compiled call's arguments for V4.1 on non-CUDA
+       devices; the batch fields keep the caller's dtype, so the shim's
+       unpadding stays the only change to their shape. Engram rows are hashed
+       and gathered here on the host (engram_host) and enter the graph as int32
+       staged row ids; the backend metadata (positions, request rows, slots) is
+       built in int32 on the host, so no int64 index reaches the graph.
        With attention DP the token embedding is looked up eagerly here and
        passed in as input_embeds (input_ids still go in for Engram and MoE
        routing), as vllm-torchtpu #1848 does: inside the TP1/DP8 compiled
@@ -242,9 +244,6 @@ def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
     return original(hasher, input_ids, forward_batch)
 
 
-_INT32_BATCH_FIELDS = ("input_ids", "positions", "req_pool_indices")
-
-
 def _int32(t):
     if isinstance(t, torch.Tensor) and t.dtype == torch.int64 and not t.is_cuda:
         return t.to(torch.int32)
@@ -258,7 +257,7 @@ def tpu_dsv41_int32_graph_inputs(
     config = shim.policy.model_runner.model_config.hf_config
     if config.model_type != "deepseek_v41":
         return original(shim, fn, input_ids, positions, forward_batch, *args, **kwargs)
-    names = _INT32_BATCH_FIELDS
+    names = ()
     model = shim.policy.model_runner.model
     hasher = model.model.engram_hasher
     host_tables = ()
@@ -286,8 +285,6 @@ def tpu_dsv41_int32_graph_inputs(
         embed_tokens = shim.policy.model_runner.model.get_input_embeddings()
         with torch.no_grad():
             forward_batch.input_embeds = embed_tokens(input_ids)
-    for name in _INT32_BATCH_FIELDS:
-        setattr(forward_batch, name, _int32(saved[name]))
     try:
         return original(
             shim,
@@ -299,6 +296,8 @@ def tpu_dsv41_int32_graph_inputs(
             **kwargs,
         )
     finally:
+        # Only fields this hook set (None before it ran) are restored; the shim
+        # owns the shape of every other batch field.
         for name, value in saved.items():
             setattr(forward_batch, name, value)
 
