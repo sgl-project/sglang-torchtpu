@@ -2,6 +2,7 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
+from sglang.multimodal_gen.runtime.distributed import get_world_group
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -411,4 +412,22 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             batch.do_classifier_free_guidance = original_do_cfg
             batch.ltx2_ti2v_clean_latent_background = original_clean_latent_background
 
+        self._share_main_rank_latents(batch)
         return batch
+
+    def _share_main_rank_latents(self, batch: Req) -> None:
+        """Give every rank rank 0's stage-2 latents when every CFG rank ran
+        stage 2 and the decoder spreads one sample across the ranks, so the
+        decode does not rely on the CFG halves matching bit for bit. Every rank
+        runs this stage then, so each issues the broadcast."""
+        if not (
+            self.server_args.enable_cfg_parallel
+            and not current_platform.supports_rank_subset_collectives()
+            and decode_uses_every_rank(self.vae)
+        ):
+            return
+        world = get_world_group()
+        for name in ("latents", "audio_latents"):
+            value = getattr(batch, name, None)
+            if isinstance(value, torch.Tensor):
+                setattr(batch, name, world.broadcast(value.contiguous(), src=0))
