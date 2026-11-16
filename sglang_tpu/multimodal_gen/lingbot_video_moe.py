@@ -7,13 +7,13 @@ Runtime patch, tracked debt:
   reduction and rebuilds its RoPE table on the device from ``tolist()``
   positions every step. Its joint sequence has the prompt's length, so every
   prompt compiles the block region again, and the positive and negative
-  prompts of one request need two programs (CFG-parallel ranks would run
-  different ones). Stock sequence parallelism shards the latent frames, so
+  prompts of one request need two programs. Stock sequence parallelism
+  shards the latent frames, so
   requests round their frame count up to a multiple of ``--num-gpus``; each
   rank appends the whole text, not marked as replicated, and numbers its
   frames from 0. The Qwen3-VL text stage reads the real length and the MRoPE
   positions from int64 device reductions of the attention mask.
-- How: :func:`install`, in the workers and the server process
+- How: :func:`install`, in the workers,
   (1) runs the routed experts through sglang_tpu's Pallas ``fused_moe_call``,
       with expert weights moved once to its ``(experts, in, out)`` layout;
   (2) pads the joint sequence to a bucket of 512 tokens shared by both CFG
@@ -25,6 +25,9 @@ Runtime patch, tracked debt:
   (5) runs the text encoder over prompt tokens right-padded to a multiple of
       256 (causal: real tokens never see the padding), with int32 positions
       built on the host, no KV cache and only the last token's logits.
+  :func:`install_server_patches`, also in the server process, keeps the
+  requested frame count and runs CFG serially: CFG 2 x Ulysses 4 gave
+  run-to-run different videos on TPU.
 - Upstream PR or issue: none.
 - Remove when: the DiT takes a platform MoE runner, a host-built RoPE table and
   a length bucket with the key count as data, and the text stage builds its
@@ -33,6 +36,7 @@ Runtime patch, tracked debt:
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import math
 
@@ -81,6 +85,7 @@ _STOCK_DIT_FORWARD = dit.LingBotVideoTransformer3DModel.forward
 _STOCK_ENCODE_INPUTS = LingBotVideoTextEncodingStage._encode_inputs
 _STOCK_SHARD_LATENTS = LingBotVideoMoEPipelineConfig.shard_latents_for_sp
 _STOCK_SAMPLING_POST_INIT = LingBotVideoMoESamplingParams.__post_init__
+_STOCK_DEPLOYMENT_CONFIG = LingBotVideoMoEPipelineConfig.get_model_deployment_config
 
 
 # --- MoE -------------------------------------------------------------------
@@ -171,14 +176,12 @@ def _bucket(n_video: int, text_len: int, sp: int) -> int:
     lengths = [text_len]
     context = get_forward_context_or_none()
     batch = context.forward_batch if context is not None else None
-    for embeds in (
-        getattr(batch, "prompt_embeds", None),
-        getattr(batch, "negative_prompt_embeds", None),
-    ):
-        if isinstance(embeds, (list, tuple)):
-            embeds = embeds[0] if embeds else None
-        if embeds is not None:
-            lengths.append(embeds.shape[1])
+    if batch is not None:
+        for embeds in (batch.prompt_embeds, batch.negative_prompt_embeds):
+            if isinstance(embeds, (list, tuple)):
+                embeds = embeds[0] if embeds else None
+            if embeds is not None:
+                lengths.append(embeds.shape[1])
     alignment = math.lcm(SEQUENCE_ALIGNMENT, sp)
     return -(-(n_video + max(lengths)) // alignment) * alignment
 
@@ -193,7 +196,7 @@ def _layout(rotary_emb, grid, text_len, bucket, sp, rank, device):
     )
     rows = bucket // sp
     cos, sin = (
-        table[rank * rows : (rank + 1) * rows].to(device)
+        table[rank * rows : (rank + 1) * rows].float().to(device)
         for table in rotary_emb.forward_uncached(positions)
     )
     kv_info = torch.tensor([0, n_video + text_len], dtype=torch.int32).to(device)
@@ -207,7 +210,7 @@ def dit_forward(self, hidden_states, timestep, encoder_hidden_states, *rest, **k
             self, hidden_states, timestep, encoder_hidden_states, *rest, **kwargs
         )
     args = get_global_server_args()
-    if getattr(args, "enable_torch_compile", False) and not args.regional_compile:
+    if args.enable_torch_compile and not args.regional_compile:
         # The forward builds host tables and re-lays out weights eagerly.
         raise ValueError(
             "LingBot-Video-MoE on TPU compiles per block: add --regional-compile"
@@ -278,6 +281,13 @@ def sampling_post_init(self) -> None:
     self.adjust_frames = False
 
 
+def deployment_config(self):
+    """``get_model_deployment_config`` without CFG parallelism."""
+    return dataclasses.replace(
+        _STOCK_DEPLOYMENT_CONFIG(self), supports_cfg_parallel=False
+    )
+
+
 # --- Text encoder ----------------------------------------------------------
 
 
@@ -322,7 +332,14 @@ def encode_inputs(self, inputs, device, dtype):
     return prompt_embeds.to(dtype=dtype), prompt_mask.to(device)
 
 
+def install_server_patches() -> None:
+    LingBotVideoMoESamplingParams.__post_init__ = sampling_post_init
+    # ServerArgs then rejects --cfg-parallel-size > 1 and the auto-CFG layout.
+    LingBotVideoMoEPipelineConfig.get_model_deployment_config = deployment_config
+
+
 def install() -> None:
+    install_server_patches()
     LingBotVideoSparseMoeBlock._run_sglang_triton_experts = run_experts
     dit.LingBotVideoAttention.forward = attention_forward
     dit.LingBotVideoTransformer3DModel.forward = dit_forward
@@ -330,5 +347,4 @@ def install() -> None:
     # with the key count as device data.
     dit.LingBotVideoTransformer3DModel._compile_regions_spmd_safe = True
     LingBotVideoMoEPipelineConfig.shard_latents_for_sp = shard_latents_for_sp
-    LingBotVideoMoESamplingParams.__post_init__ = sampling_post_init
     LingBotVideoTextEncodingStage._encode_inputs = encode_inputs

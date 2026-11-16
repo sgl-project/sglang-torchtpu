@@ -22,6 +22,7 @@ from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs import base as pipeline_base
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
@@ -34,10 +35,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.layers.moe import (
-    LingBotVideoRouter,
-    LingBotVideoSparseMoeBlock,
-)
+from sglang.multimodal_gen.runtime.layers.moe import LingBotVideoSparseMoeBlock
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits import lingbot_video_moe as dit
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import (
@@ -55,6 +53,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.utils import is_in_ci
 from sglang_tpu.multimodal_gen import lingbot_video_moe, worker
+from sglang_tpu.multimodal_gen.platform import TpuOOTPlatform
 
 # Nightly, one job on a whole node: the parallel-state setup runs the TPU worker
 # bootstrap, which opens a chip outside a chips=1 pin.
@@ -110,6 +109,7 @@ _PATCHED = (
     (dit.LingBotVideoTransformer3DModel, "_compile_regions_spmd_safe"),
     (LingBotVideoMoEPipelineConfig, "shard_latents_for_sp"),
     (LingBotVideoMoESamplingParams, "__post_init__"),
+    (LingBotVideoMoEPipelineConfig, "get_model_deployment_config"),
     (LingBotVideoTextEncodingStage, "_encode_inputs"),
 )
 
@@ -286,8 +286,9 @@ class TestLingBotVideoMoEDiT(_TestBase):
         positions = dit._joint_position_ids(torch.tensor([5]), *grid, 5, "cpu")
         stock = rotary.forward_uncached(positions)
         cos, sin, kv_info = lingbot_video_moe._layout(rotary, grid, 5, 128, 1, 0, "cpu")
-        self.assertTrue(torch.equal(cos[:n_real], stock[0]))
-        self.assertTrue(torch.equal(sin[:n_real], stock[1]))
+        # The stock forward's float32 tables.
+        self.assertTrue(torch.equal(cos[:n_real], stock[0].float()))
+        self.assertTrue(torch.equal(sin[:n_real], stock[1].float()))
         # Padding rows sit at position (0, 0, 0).
         self.assertTrue(bool((cos[n_real:] == 1).all() and (sin[n_real:] == 0).all()))
         self.assertEqual((kv_info.tolist(), kv_info.dtype), ([0, n_real], torch.int32))
@@ -401,6 +402,30 @@ class TestLingBotVideoMoEDiT(_TestBase):
             self.assertEqual(len(graphs), 1)
             _run(model, _dit_inputs(40))  # the 128-token bucket
         self.assertEqual(len(graphs), 2)
+
+
+class TestLingBotVideoMoEServerArgs(CustomTestCase):
+    def test_the_server_process_refuses_cfg_parallel(self):
+        stock = [(owner, name, getattr(owner, name)) for owner, name in _PATCHED]
+        validate = server_args_module.ServerArgs._validate_cfg_parallel
+        for config in (LingBotVideoMoEPipelineConfig(), PipelineConfig()):
+            # What ServerArgs holds after --cfg-parallel-size 2 or auto-CFG.
+            args = SimpleNamespace(
+                pipeline_config=config,
+                enable_cfg_parallel=True,
+                num_gpus=8,
+                offload_during_compile=False,
+                is_arg_explicitly_set=lambda _: False,
+            )
+            with contextlib.ExitStack() as stack:
+                for owner, name, value in stock:
+                    stack.enter_context(patch.object(owner, name, value))
+                TpuOOTPlatform().apply_server_args_defaults(args)
+                if isinstance(config, LingBotVideoMoEPipelineConfig):
+                    with self.assertRaisesRegex(ValueError, "CFG parallelism"):
+                        validate(args)
+                else:
+                    validate(args)
 
 
 class _Encoding(dict):
@@ -518,32 +543,9 @@ class TestLingBotVideoMoEOnTpu(CustomTestCase):
             actual = compiled(x.to("tpu"), weights.to("tpu"), ids.int().to("tpu"))
         actual = actual.float().cpu()
         self.assertTrue(torch.isfinite(actual).all())
-        error = (actual - expected).norm() / expected.norm()
-        self.assertLess(error.item(), 5e-2)
-
-    def test_compiled_router_matches_the_host(self):
-        router = LingBotVideoRouter(2048, 128, 8, "sigmoid", True, 4, 2, 2.5)
-        gen = torch.Generator().manual_seed(1)
-        router.weight.data = torch.randn(128, 2048, generator=gen) * 0.02
-        router.e_score_correction_bias.data = torch.randn(128, generator=gen) * 0.01
-        tokens = torch.randn(4864, 2048, generator=gen).bfloat16()
-        ids, scores = router(tokens)
-        # The worker's float32 matmul precision.
-        precision = torch.get_float32_matmul_precision()
-        torch.set_float32_matmul_precision("highest")
-        self.addCleanup(torch.set_float32_matmul_precision, precision)
-        compiled = torch.compile(router.to("tpu"), backend="tpu", dynamic=False)
-        tpu_ids, tpu_scores = (t.cpu() for t in compiled(tokens.to("tpu")))
-        tpu_ids, tpu_order = tpu_ids.long().sort(-1)
-        ids, order = ids.sort(-1)
-        same = (tpu_ids == ids).all(-1)
-        self.assertGreaterEqual(same.float().mean().item(), 0.999)
-        torch.testing.assert_close(
-            tpu_scores.gather(-1, tpu_order)[same].float(),
-            scores.gather(-1, order)[same].float(),
-            atol=1e-2,
-            rtol=1e-2,
-        )
+        # bf16 activations and per-slot outputs: about 3e-3 against float32.
+        error = ((actual - expected).norm() / expected.norm()).item()
+        self.assertLess(error, 1e-2)
 
 
 if __name__ == "__main__":

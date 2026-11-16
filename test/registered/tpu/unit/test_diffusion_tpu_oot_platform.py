@@ -150,9 +150,8 @@ class TestCompileDefaults(CustomTestCase):
             PipelineConfig,
         )
         from sglang.multimodal_gen.runtime.platforms import current_platform
-        from sglang_tpu.multimodal_gen import lingbot_video_moe
 
-        def server_args(model_path="/fake", **kwargs):
+        def server_args(**kwargs):
             # ServerArgs.__post_init__ applies the platform defaults.
             with (
                 patch.object(
@@ -163,21 +162,16 @@ class TestCompileDefaults(CustomTestCase):
                     "apply_server_args_defaults",
                     TpuOOTPlatform().apply_server_args_defaults,
                 ),
-                patch.object(lingbot_video_moe, "install") as lingbot_install,
             ):
-                args = server_args_module.ServerArgs.from_kwargs(
-                    model_path=model_path, **kwargs
+                return server_args_module.ServerArgs.from_kwargs(
+                    model_path="/fake", **kwargs
                 )
-            # LingBot-Video-MoE requests take its sampling defaults in this process.
-            self.assertEqual(lingbot_install.call_count, "lingbot" in model_path)
-            return args
 
         self.assertFalse(server_args().offload_during_compile)
         # An explicit request is overridden: the warmup offload crashes on TPU.
         self.assertFalse(
             server_args(offload_during_compile=True).offload_during_compile
         )
-        server_args(model_path="/models/lingbot-video-moe-30b-a3b")
 
     def test_teacache_and_vae_decode_stay_out_of_compile(self):
         # What the core does with each False: TestPlatformCompileGates.

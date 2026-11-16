@@ -303,10 +303,10 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   only the 50 DiT blocks compiled, the breakable-CUDA-graph break point skipped,
   regionally compiled blocks marked spmd-safe) and `lingbot_video_moe.py`
   (LingBot-Video-MoE: experts on the Pallas fused MoE, a joint sequence in
-  512-token buckets sharded across Ulysses ranks, the requested frame count; the
-  server process installs it for LingBot models); worker init also registers
-  srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
-  `logaddexp`).
+  512-token buckets sharded across Ulysses ranks, the requested frame count,
+  serial CFG; the server process takes the last two for LingBot-Video-MoE
+  configs); worker init also registers srt's ATen fallbacks
+  (`patches._register_aten_fallbacks`, e.g. `logaddexp`).
 
 Gates that take the OOT arm, with the same outcome as the built-in platform:
 
