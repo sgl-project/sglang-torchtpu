@@ -229,3 +229,23 @@ local backend emits deferred DispatchOps/StableHLO. The new load-only drain
 bounds retained old layouts and reports observed post-drain HBM use without
 claiming an instantaneous peak. Model E2E and EP16 acceptance remain separate
 from the completed EP8 kernel test.
+
+## EP16 before model loading
+
+The mandatory preflight inside `exp-0ppqh107uo` / `art-gvokyz9112` succeeded on
+both hosts at measurement `9c7eedd3a2ca16ba6f906900fa6b3a1393072259` (including
+loader/Parameter-reader commit `73886400f0`). Host indices 0/1 normalized to
+node ranks 1/0 and returned genuine `SUCCEEDED` in 98.22/98.20 seconds. Complete
+records cover ranks 0–15 exactly once, each with 18 cases: ten small cases,
+compiled idle DP 16→8→1→16, and four full checkpoint geometries. Actual worker
+runtime and committed-production source/effect records cover all sixteen ranks.
+This version directly feeds TPU Parameter pack/replace results into the kernel;
+the collective loading checks also pass. No temporary kernel is used.
+
+At local rows 6/24/64/2048, full-shape relative L2 was respectively 0.0346758,
+0.0456949, 0.0427902 and 0.0437905. Across sixteen ranks, host-observed median
+latency ranges were 1.025–1.097, 1.122–1.153, 1.157–1.198 and 10.742–12.248 ms.
+EP8 and EP16 have different physical chip counts and tuning; these values do not
+establish a cross-topology speedup. The full parsed records remain with the
+Falcon artifact and local result JSON; model load/compile/E2E acceptance follows
+this gate and is not implied by preflight success.
