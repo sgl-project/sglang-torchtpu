@@ -15,8 +15,8 @@ logits and packed gate/up rather than GLM's existing selected ids/coefficients.
 
 Set `SGLANG_TPU_USE_GLM_MOE_V2=1` before model load. The default remains the
 existing backend. Eligible target GLM DSA MoE blocks use this candidate;
-`is_nextn` draft blocks keep their ordinary attention-TP backend. Unsupported
-layouts retain that backend with a diagnostic. Required layout: PP1, EP=TP,
+`is_nextn` draft blocks keep their ordinary attention-TP backend. An opted-in target fails at load if any routed MoE cannot be prepared;
+unrelated architectures retain their established backend. Required layout: PP1, EP=TP,
 expert TP1, attention-DP=TP, selected-route SiLU, channelwise FP8, no EPLB or
 external all-to-all. MTP remains enabled.
 
@@ -28,8 +28,10 @@ projection is gathered along K, while its output-channel scales are replicated.
 The additional replicated shared weights cost about `3*H*I` bytes per layer
 plus scales. Unsupported shared formats retain their external MLP.
 
-The platform's existing `process_model_after_loading` seam binds a plugin
-subclass of `DeepseekV2MoE`. Its original gate/TopK computes the selected routes,
+The loader's existing plugin finalization entry,
+`prepare_model_for_fused_moe_decode`, dispatches this candidate before its legacy
+decode-only gate, after all quantization methods finish weight postprocessing.
+It binds a plugin subclass of `DeepseekV2MoE`. Its original gate/TopK computes the selected routes,
 including bias correction, grouping, renormalization and the original selected
 ids. Routed scaling applies only to routed coefficients. The subclass's
 existing `use_tpu_fused_moe_decode` contract tells the FFN boundary that the
@@ -151,3 +153,15 @@ is mutated. The compute, DMA, semaphore and drain body is unchanged by this
 buffer-interface adaptation. This follows the existing fused EP kernel's
 output-workspace pattern; sequential-shape, idle and full-geometry device
 validation remain necessary.
+
+The binder counts actual routed MoE modules (75 in the 78-layer checkpoint,
+whose first three layers are dense), requires every target module to be bound,
+and logs `GLM_MOE_V2_PREPARED` with expected/prepared/shared counts. The separate
+NextN model logs `GLM_MOE_V2_DRAFT_KEEP_BASELINE`. SBO/TBO decomposed forwards and
+non-`pallas_tpu` backends are rejected for an opted-in target. A load-only fence
+after each layer's packing/shared gathers bounds retained old layouts; recorded
+post-drain HBM usage is a boundary observation, not an instantaneous peak.
+`GLM_MOE_V2_EXPORT` identifies actual JAX custom-call shape exports without
+adding a per-token host counter. Numerical preflight operands now directly
+consume TPU Parameters after pack/`_replace_data`, matching the loader reader
+path instead of using a separate CPU-packed tensor.

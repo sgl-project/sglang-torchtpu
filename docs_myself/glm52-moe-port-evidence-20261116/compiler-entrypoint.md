@@ -187,3 +187,45 @@ finite amax in approximately [0.516, 0.949], ordinary FP32 scale exponents, and
 no `7f`/`ff` FP8-NaN byte in their embedded-scale bit patterns. This correlation
 narrows the failure beyond invalid routing or a tiny precision difference, but
 does not alone prove buffer aliasing or any other unique cause.
+
+## Full sequential device acceptance
+
+`exp-rjhbw8wnjp` / `art-u4z6fu8rww`, measurement
+`00a14356a881e5dfaff5bc0c00aeba779a920fc2` (kernel `4924817ec2`), succeeded
+with `MOE_PRODUCTION_SEQUENCE_PASS` and complete records from all eight ranks.
+Each rank passed ten small routed/shared/partial-slot cases, the compiled
+64-row idle DP drain/refill (8→4→1→8), and four real H6144/I2048/E256/TopK8
+cases at local 6/24/64/2048 rows. All outputs were finite. Full-shape dense
+reference relative L2 was respectively 0.0425229, 0.0449509, 0.0525455 and
+0.0449743. Rank-0 host-observed post-warmup medians were 1.409, 1.533, 2.195 and
+35.049 ms; these are bridge measurements, not model speedups. The large-bt
+scale-folding math remains intact. Passing this sequence after the explicit
+workspace-output adaptation supports that contract correction without proving
+a unique mechanism for every prior NaN.
+
+## Actual loader caller and retained pack buffers
+
+The original binder connection to `SRTPlatform.process_model_after_loading`
+was unreachable for GLM: its only model caller was Kimi K3. GLM inherits the
+Deepseek loader; its own `post_load_weights` runs *before* the generic quant
+postprocessing pass. The candidate now dispatches through the existing plugin
+`prepare_model_for_fused_moe_decode` entry, called at the end of
+`DefaultModelLoader.postprocess_weights`, before that entry's legacy backend
+flag returns early. No new core branch or hook is added. Target routed-module
+counts are checked (75 for the actual checkpoint); NextN retains its old path.
+SBO/TBO decomposed forwards are rejected because they bypass this module's
+ordinary `forward` and summed-by-compute boundary contract.
+
+The current local TorchTPU checkout (`dd6e5886`, not proof of target-wheel
+source) implements storage resize-to-zero by replacing its DeviceBufferRef.
+DeferredOp owns copies of its input DeviceBufferRefs, explicitly retaining their
+underlying buffers. This argues against inferring use-after-free from resize
+alone. Real TPU pack/replace plus bit-exact CPU reads already passed; the next
+preflight also feeds those actual replaced Parameters into the kernel. Since
+this model-level conversion pass is outside the loader's per-quant-module
+transient drain, each converted layer now synchronizes once before the next.
+Native GroupCoordinator all-gather contains no explicit completion fence; the
+local backend emits deferred DispatchOps/StableHLO. The new load-only drain
+bounds retained old layouts and reports observed post-drain HBM use without
+claiming an instantaneous peak. Model E2E and EP16 acceptance remain separate
+from the completed EP8 kernel test.
