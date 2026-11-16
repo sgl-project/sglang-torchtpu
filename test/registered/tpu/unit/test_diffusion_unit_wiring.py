@@ -1,11 +1,16 @@
-"""Core diffusion test modules a TPU wrapper imports have every class wired.
+"""Core diffusion test files the TPU path filter matches run in the TPU lane.
 
 Fork CI runs python/sglang/multimodal_gen/test/unit only through the
-test/registered wrappers, which import test classes by name: a class added to a
-wrapped module runs nowhere until a wrapper imports it. Reads source only.
+test/registered wrappers, which import test classes by name: a file nobody
+wraps, or a class added to a wrapped module, runs nowhere until a wrapper
+imports it. Every core test file the TPU path filter matches is wrapped or
+exempted with a reason, and every class of a wrapped module is imported unless
+the module is only partly wired. Reads source only.
 """
 
 import ast
+import fnmatch
+import re
 import unittest
 from pathlib import Path
 
@@ -20,37 +25,38 @@ _TPU_WRAPPERS = _REGISTERED / "tpu" / "unit"
 _UNIT_PACKAGE = "sglang.multimodal_gen.test.unit"
 _UNIT_DIR = _REPO / "python" / Path(*_UNIT_PACKAGE.split("."))
 
-# Test classes of wrapped modules that no registered file imports, with why.
-_NOT_WIRED = {
-    # Upstream ServerArgs cases; each mocks a CUDA platform or has no platform
-    # branch.
-    "test_server_args": {
-        "TestDiffusionModelDetection",
-        "TestDirectGpuWeightLoading",
-        "TestDisaggTimeoutArgs",
-        "TestDisaggTransferBackendArgs",
-        "TestFSDPShardConditions",
-        "TestKVGatherDegree",
-        "TestLayerwiseResidencyLifetime",
-        "TestMiniMaxH3Routing",
-        "TestModelIdResolution",
-        "TestNcclNvlsArgs",
-        "TestOffloadDefaults",
-        "TestPerRoleParallelism",
-        "TestPipelineResolutionCliOverride",
-        "TestPlatformLifecycleHooks",
-        "TestSchedulerRpcTimeoutArgs",
-        "TestServerArgsPathExpansion",
-        "TestWarmupImageIsModelValid",
-        "TestWarmupModeNormalization",
-    },
-    # Upstream component-loader scoping; no platform branch.
-    "test_attention_backend_selector": {"TestComponentAttentionBackendScope"},
-    # Upstream CUDA detection.
-    "test_platform_detection": {"TestCudaPlatformDetection"},
-    # Upstream encoder device under CPU offload, on a mocked CUDA device.
-    "test_minimax_h3_encoder_device": {"TestMiniMaxH3EncoderDevice"},
+_TPU_PATH_FILTER = _REPO / ".github" / "workflows" / "pr-test-tpu.yml"
+
+# Upstream modules a TPU wrapper takes only some classes from, with why the rest
+# stay off TPU. The wrappers' imports declare the wired classes and fail if one
+# is renamed or removed; classes an upstream sync adds here need no edit.
+_PARTLY_WIRED = {
+    "test_server_args": "upstream ServerArgs cases; the rest mock a CUDA platform "
+    "or have no platform branch",
+    "test_attention_backend_selector": "upstream component-loader scoping has no "
+    "platform branch",
+    "test_platform_detection": "the rest are upstream CUDA detection",
+    "test_minimax_h3_encoder_device": "the rest check the encoder device under "
+    "CPU offload on a mocked CUDA device",
 }
+
+# Core test files the TPU path filter matches that no TPU wrapper runs, with why.
+_NOT_WRAPPED = {
+    "test_usp_ipc_a2a_guard": "the CUDA IPC all-to-all staging path, which TPU "
+    "never takes",
+    "test_usp_packed_qkv_a2a": "every case needs CUDA (skipUnless cuda)",
+}
+
+
+def _path_filtered_modules() -> set[str]:
+    """Core test modules a glob in the TPU workflow's path filter matches."""
+    prefix = "python/sglang/multimodal_gen/test/unit/"
+    globs = re.findall(rf"- '({re.escape(prefix)}[^']+)'", _TPU_PATH_FILTER.read_text())
+    return {
+        path.stem
+        for path in _UNIT_DIR.glob("*.py")
+        if any(fnmatch.fnmatch(prefix + path.name, glob) for glob in globs)
+    }
 
 
 def _unit_imports(path: Path) -> dict[str, set[str]]:
@@ -120,29 +126,38 @@ class TestDiffusionUnitWiring(unittest.TestCase):
                 if path.parent == _TPU_WRAPPERS:
                     cls.wrapped.add(module)
 
+    def test_every_path_filtered_file_is_wrapped_or_exempt(self):
+        missing = sorted(_path_filtered_modules() - self.wrapped - set(_NOT_WRAPPED))
+        self.assertEqual(
+            missing,
+            [],
+            "the TPU path filter matches these core test files but no TPU wrapper "
+            "imports them: wrap each, or add it to _NOT_WRAPPED with why",
+        )
+
     def test_every_test_class_of_a_wrapped_module_is_imported(self):
         unwired = sorted(
             f"{module}.{name}"
-            for module in self.wrapped
-            for name in _test_classes(module)
-            - self.imported[module]
-            - _NOT_WIRED.get(module, set())
+            for module in self.wrapped - set(_PARTLY_WIRED)
+            for name in _test_classes(module) - self.imported[module]
         )
         self.assertEqual(
             unwired,
             [],
             "no registered file imports these: add each to a TPU wrapper, or "
-            "to _NOT_WIRED with why",
+            "the module to _PARTLY_WIRED with why",
         )
 
-    def test_not_wired_lists_only_unimported_test_classes(self):
+    def test_exemptions_are_current(self):
         stale = sorted(
-            f"{module}.{name}"
-            for module, names in _NOT_WIRED.items()
-            for name in names
-            - (_test_classes(module) - self.imported.get(module, set()))
+            [f"_PARTLY_WIRED: {m}" for m in _PARTLY_WIRED if m not in self.wrapped]
+            + [
+                f"_NOT_WRAPPED: {m}"
+                for m in _NOT_WRAPPED
+                if m in self.wrapped or m not in _path_filtered_modules()
+            ]
         )
-        self.assertEqual(stale, [], "imported or gone: drop these from _NOT_WIRED")
+        self.assertEqual(stale, [], "drop these: no longer partly wired or exempt")
 
 
 if __name__ == "__main__":
