@@ -25,6 +25,9 @@ fixture_module = importlib.util.module_from_spec(fixture_spec)
 sys.modules[fixture_spec.name] = fixture_module
 fixture_spec.loader.exec_module(fixture_module)
 fixture = vars(fixture_module)
+# The frozen GLM-5.2 E2E uses page_size=64, whereas the generic DSA unit
+# fixture defaults to 128. Construct the benchmark's physical pages at 64.
+fixture["_PAGE_SIZE"] = 64
 
 import jax
 import jax.numpy as jnp
@@ -197,6 +200,7 @@ def main():
                     context=context,
                     cache_bytes=step.cache.nbytes,
                     writer_and_score_included=True,
+                    page_size=fixture["_PAGE_SIZE"],
                     output_rows=list(output.shape),
                     **timing,
                 )
