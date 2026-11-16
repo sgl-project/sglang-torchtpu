@@ -289,7 +289,7 @@ class TestBlockMajorRaidenGroups(CustomTestCase):
         self.assertEqual((groups.full_layer_ids, groups.swa_layer_ids), ([1], [0]))
 
     def test_pipeline_manifest_names_each_bundle_by_its_layers(self):
-        from sglang_tpu.disaggregation.raiden.pipeline import pool_manifest
+        from sglang_tpu.disaggregation.raiden.pool_transfer import pool_manifest
 
         stage = get_raiden_kv_caches(_swa_pool(TpuBlockMajorMHATokenToKVPool))
         self.assertEqual(

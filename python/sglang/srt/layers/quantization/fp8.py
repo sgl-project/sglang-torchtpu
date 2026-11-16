@@ -1091,17 +1091,25 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        if self.block_quant:
-            self.process_weights_after_loading_block_quant(layer)
-            if _is_tpu and not self.use_mxfp8:
-                from sglang_tpu.fp8_linear import (
-                    prepare_tpu_fp8_linear_weights,
-                )
+        if _is_tpu and not self.use_mxfp8:
+            from sglang_tpu.fp8_linear import (
+                prepare_tpu_fp8_linear_weights,
+                prepare_tpu_online_fp8_linear_weights,
+            )
 
+            if self.block_quant:
+                self.process_weights_after_loading_block_quant(layer)
                 prepare_tpu_fp8_linear_weights(
                     layer,
                     weight_block_size=self.quant_config.weight_block_size,
                 )
+                return
+            if not self.is_checkpoint_fp8_serialized:
+                prepare_tpu_online_fp8_linear_weights(layer)
+                return
+
+        if self.block_quant:
+            self.process_weights_after_loading_block_quant(layer)
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
