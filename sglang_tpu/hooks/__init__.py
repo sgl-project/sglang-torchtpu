@@ -42,6 +42,7 @@ from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm5_next_vision import (
     attach_glm5_next_vision_runner,
     compile_glm5_next_decoder_only,
+    defer_host_staged_mm_feature_move,
     encode_glm5_next_vision_on_host,
     encode_with_glm5_next_vision_runner,
 )
@@ -260,6 +261,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.get_video_feature",
         encode_glm5_next_vision_on_host,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.managers.mm_schedule._can_skip_pre_embed_feature_move",
+        defer_host_staged_mm_feature_move,
         HookType.AROUND,
     ),
     (

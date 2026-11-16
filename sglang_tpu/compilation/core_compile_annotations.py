@@ -91,11 +91,13 @@ CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
         policy=_kimi_k3_vision_policy,
     ),
     # GLM-5.3-Flash's vision encoder. Its block loop and 2x2 patch merger run
-    # on the TPU runner attached by sglang_tpu.hooks.glm5_next_vision; when
-    # model.visual is instantiated, compile_glm5_next_decoder_only annotates
-    # model.model (Glm5NextModel) with Qwen3VLDecoderTpuCompilePolicy, while
-    # --language-model-only skips instantiating Glm5NextVisionModel and keeps
-    # TpuGraphRunner's whole-model fallback.
+    # on the TPU runner attached by sglang_tpu.hooks.glm5_next_vision. Unless
+    # mm_config.language_model_only or --enable-dp-attention is set,
+    # compile_glm5_next_decoder_only annotates model.model (Glm5NextModel) with
+    # Qwen3VLDecoderTpuCompilePolicy (covering both standard multimodal and EPD
+    # language-only servers); under --language-model-only or
+    # --enable-dp-attention both boundaries decline, keeping TpuGraphRunner's
+    # whole-model fallback.
     _CoreCompileBoundary(
         module="sglang.srt.models.glm5_next",
         class_name="Glm5NextVisionModel",

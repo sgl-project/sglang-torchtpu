@@ -34,7 +34,10 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.environ import envs as sglang_envs
-from sglang.srt.layers.dp_attention import multimodal_encoder_runs_here
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+    multimodal_encoder_runs_here,
+)
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     VisionTpuCompilePolicy,
@@ -303,6 +306,7 @@ class Glm5NextVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         return (
             is_multimodal
             and multimodal_encoder_runs_here()
+            and not is_dp_attention_enabled()
             and bool(getattr(runner, "ready", False))
         )
 
