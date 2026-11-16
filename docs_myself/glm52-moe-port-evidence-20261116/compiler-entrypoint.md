@@ -142,3 +142,21 @@ source's small-bt sequential gate/up branch at all bt sizes. The latter isolates
 the larger-bt raw-dot/channel-scale folding branch and is not a production fix
 or an acceptance pass. Phases run in fresh processes; all phases are attempted
 and any unexpected failure keeps the diagnostic's overall exit nonzero.
+
+The next candidate makes mutable HBM workspaces explicit Pallas call outputs,
+following the existing fused EP backend. The source passed `pl.empty` buffers
+as inputs and mutated them without returning or aliasing those inputs. That is
+not the same buffer contract as the native pure ring (DMA into an output) or
+the existing fused EP (HBM staging/recv/contrib outputs). The new interface
+retains identical shapes, memory spaces and all four workspaces; it removes
+their JAX input operands and returns them from the opaque Pallas call instead.
+Only completed token rows leave the enclosing JAX function. No caller input
+is modified, so no input/output alias is requested.
+
+A local AST comparison confirms the entire `_fused_ep_moe_kernel` body, including
+all math, DMA, barriers, semaphore waits and drain, is unchanged from `04ba952921`;
+only its reference argument order changes from 19 inputs + 1 output to 15 inputs
++ 5 outputs. The exact-source reverse SHA remains checked. This is a compiler
+buffer-interface adaptation, not evidence that aliasing caused the observed
+NaNs; actual sequential-shape device validation is still required. The bt24
+scale-folding math and every tuning choice are retained.
