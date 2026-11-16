@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=420, suite="base-a-test-cpu")
+register_cpu_ci(est_time=540, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -1101,3 +1101,134 @@ class TestK31Draft(CustomTestCase):
             causal[0], alone[0], atol=1e-5
         )  # the first sees only itself
         self.assertFalse(np.allclose(causal[0], full[0], atol=1e-5))
+
+
+class TestExpertSchedule(CustomTestCase):
+    """The grouped routed-expert stream (``_run_routed_expert_stream``) at B8
+    and B16 in Pallas interpret mode, on random MXFP4 experts and routings
+    (single-row and multi-row experts, more rows than a compact tile, odd
+    expert counts, empty rows, expert 0, no experts): reading each pair from
+    the SMEM schedule (``KernelConfig.expert_schedule``) gives bit-identical
+    outputs to reducing the pending routes every iteration."""
+
+    SCRIPT = """
+        import os
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        from types import SimpleNamespace
+        import numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk
+
+        E, K, IN, WIDTH, OUT = 112, 16, 512, 768, 128
+
+        def stream(B, scheduled):
+            rows = dmk._expert_accumulator_rows(B, jnp.uint32, group_pending_routes=True)
+            compact = dmk._compact_rows(B)
+
+            def kernel(sel_ref, prob_ref, count_ref, total_ref, source_ref, gu_hbm, gus_hbm,
+                       down_hbm, ds_hbm, out_ref, gu, gus, down, ds, semaphores, gate_up_acc,
+                       down_acc, processed, first_compact, second_compact, table, table_semaphore):
+                selected, counts = sel_ref[:, :K], count_ref[:, 0]
+
+                def copy_expert(expert, slot, *, gate_up=True, down=True):
+                    def copy(hbm, vmem, kind, wanted):
+                        return (pltpu.make_async_copy(hbm.at[expert], vmem.at[slot],
+                                                      semaphores.at[slot, kind]) if wanted else None)
+                    return SimpleNamespace(
+                        gate_up=copy(gu_hbm, gu, 0, gate_up), gate_up_scales=copy(gus_hbm, gus, 1, gate_up),
+                        down=copy(down_hbm, down_slots, 2, down), down_scales=copy(ds_hbm, ds, 3, down))
+
+                down_slots = down
+                dmk._start_initial_expert_weight_copies(
+                    selected, counts, copy_expert, slot_count=4, already_started=jnp.int32(0),
+                    group_pending_routes=True)
+                schedule = None
+                if scheduled:
+                    schedule = dmk._expert_schedule(processed.at[:8], table, table_semaphore)
+                    dmk._start_expert_schedule(schedule, selected, counts)
+                dmk._run_routed_expert_stream(
+                    source_ref, selected, prob_ref[:, :K], counts, total_ref[:, 0], gu, gus, down_slots,
+                    ds, out_ref, gate_up_acc, down_acc, processed, first_compact, second_compact,
+                    copy_expert, expert_input_size=IN, expert_width=WIDTH, expert_output_size=OUT,
+                    group_pending_routes=True, expert_schedule=schedule)
+
+            sources = ((pltpu.VMEM((compact, IN), jnp.float32),) * 2 if compact
+                       else (pltpu.VMEM((1, IN), jnp.bfloat16),) * 2)
+            return jax.jit(pl.pallas_call(
+                kernel, out_shape=jax.ShapeDtypeStruct((B, OUT), jnp.float32),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 5
+                + [pl.BlockSpec(memory_space=pl.ANY)] * 4,
+                out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                scratch_shapes=[
+                    pltpu.VMEM((4, IN // 8, 2 * WIDTH), jnp.uint32),
+                    pltpu.VMEM((4, IN // 32, 2 * WIDTH), jnp.uint8),
+                    pltpu.VMEM((4, WIDTH // 8, OUT), jnp.uint32),
+                    pltpu.VMEM((4, WIDTH // 32, OUT), jnp.uint8),
+                    pltpu.SemaphoreType.DMA((4, 4)),
+                    pltpu.VMEM((rows[0], 4 * WIDTH), jnp.float32),
+                    pltpu.VMEM((rows[1], OUT), jnp.float32),
+                    pltpu.VMEM((B, 128), jnp.int32), *sources,
+                    pltpu.SMEM((8, 128), jnp.int32), pltpu.SemaphoreType.DMA],
+                interpret=pltpu.InterpretParams()))
+
+        rng = np.random.default_rng(0)
+        weights = (rng.integers(0, 2**32, (E, IN // 8, 2 * WIDTH), dtype=np.uint32),
+                   rng.integers(122, 128, (E, IN // 32, 2 * WIDTH), dtype=np.uint8),
+                   rng.integers(0, 2**32, (E, WIDTH // 8, OUT), dtype=np.uint32),
+                   rng.integers(122, 128, (E, WIDTH // 32, OUT), dtype=np.uint8))
+
+        def routing(B, seed, pool, most):
+            # Rows pick up to `most` distinct experts of a pool holding expert 0
+            # (row 0 the most, others 0..most); slots past a row's count hold
+            # expert 0, as after routing.
+            r = np.random.default_rng(seed)
+            experts = r.choice(E, pool, replace=False)
+            experts[0] = 0
+            sel = np.zeros((B, 128), np.int32)
+            prob = np.zeros((B, 128), np.float32)
+            cnt = np.zeros((B, 128), np.int32)
+            for b in range(B):
+                n = int(r.integers(0, min(most, pool) + 1)) if b else min(most, pool)
+                sel[b, :n] = r.choice(experts, n, replace=False)
+                prob[b, :n] = r.uniform(0.01, 1.0, n)
+                cnt[b] = n
+            total = np.broadcast_to(prob.sum(1, keepdims=True) + r.uniform(0.5, 2.0, (B, 1)), (B, 128))
+            source = r.standard_normal((B, IN)).astype(jnp.bfloat16)
+            return sel, prob, cnt, np.ascontiguousarray(total, np.float32), source
+
+        CASES = {8: [(1, 112, 4), (3, 9, 5), (4, 1, 1), (8, 5, 0)],
+                 16: [(11, 112, 3), (12, 12, 12), (13, 20, 6)]}
+        for B, cases in CASES.items():
+            old, new = stream(B, False), stream(B, True)
+            for seed, pool, most in cases:
+                sel, prob, cnt, total, source = routing(B, seed, pool, most)
+                a = np.asarray(old(sel, prob, cnt, total, source, *weights))
+                b = np.asarray(new(sel, prob, cnt, total, source, *weights))
+                used = {int(sel[r, s]) for r in range(B) for s in range(cnt[r, 0])}
+                rows_per_expert = [sum(e in sel[r, :cnt[r, 0]] for r in range(B)) for e in sorted(used)]
+                assert np.isfinite(a).all() and (np.abs(a).sum(1) > 0).sum() == (cnt[:, 0] > 0).sum()
+                assert np.array_equal(a.view(np.uint32), b.view(np.uint32)), (B, seed)
+                print(f"B{B} seed {seed}: rows per expert {rows_per_expert} bit-identical")
+        print("OK")
+    """
+
+    def test_schedule_matches_the_pending_route_loop(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1800,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])

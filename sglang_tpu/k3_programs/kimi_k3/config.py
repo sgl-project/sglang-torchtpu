@@ -45,6 +45,11 @@ class KernelConfig:
     b16_compact_experts: bool = True
     shared_expert_finishers: bool = True
     compact_overflow: bool = True
+    # Grouped routed experts at B8/B16: after routing, one SMEM table holds
+    # the ascending expert schedule (ids, row counts, single rows, row masks);
+    # the expert loop reads it with scalar loads instead of reducing the
+    # pending routes every iteration.
+    expert_schedule: bool = False
     b4_attention_gather: bool = True
     # Serving batches beyond the powers of two, by request count: plain
     # decode and three-draft verifies (e.g. "48" / "12"; multiples of 16 rows
