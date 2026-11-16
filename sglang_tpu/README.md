@@ -294,12 +294,15 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   default under ring; an automatic selection may give it to any layer that takes
   `torch_sdpa`. The built-in platform has no ring-capable backend.
 - Runtime patches applied at worker init (`multimodal_gen/worker.py`), each with
-  the debt header: `rope.py` (RoPE without stride-2 lane access) and
+  the debt header: `rope.py` (RoPE without stride-2 lane access),
   `minimax_h3.py` (MiniMax-H3 packed sequences padded to a multiple of 512
   rows, only the 50 DiT blocks compiled, the breakable-CUDA-graph break point
-  skipped, regionally compiled blocks marked spmd-safe); worker init also
-  registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
-  `logaddexp`).
+  skipped, regionally compiled blocks marked spmd-safe) and `joy_image.py`
+  (JoyAI-Image-Edit prompt rows padded to a multiple of 256 and sharded over
+  the Ulysses ranks, the real key counts on device, resumable attention over
+  the real image and prompt keys, host-built pair-swap image RoPE, prompt
+  tokens padded to 256, spmd-safe blocks); worker init also registers srt's
+  ATen fallbacks (`patches._register_aten_fallbacks`, e.g. `logaddexp`).
 
 Gates that take the OOT arm, with the same outcome as the built-in platform:
 

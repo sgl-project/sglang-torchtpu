@@ -169,6 +169,37 @@ class TestCompileDefaults(CustomTestCase):
             server_args(offload_during_compile=True).offload_during_compile
         )
 
+    def test_pipeline_configs_leave_the_compile_flag_to_server_args(self):
+        # update_config_from_dict moves every argument a pipeline config
+        # declares onto the config and drops it from the server arguments, so
+        # a config field named enable_torch_compile turns torch.compile off.
+        import dataclasses
+        import importlib
+        import pkgutil
+
+        from sglang.multimodal_gen.configs import pipeline_configs
+        from sglang.multimodal_gen.configs.pipeline_configs.base import (
+            PipelineConfig,
+        )
+        from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
+            JoyImageEditPipelineConfig,
+        )
+
+        for module in pkgutil.iter_modules(pipeline_configs.__path__):
+            importlib.import_module(f"{pipeline_configs.__name__}.{module.name}")
+        pending, configs = [PipelineConfig], []
+        while pending:
+            configs.append(pending.pop())
+            pending.extend(configs[-1].__subclasses__())
+        for config in configs:
+            with self.subTest(config.__name__):
+                fields = {f.name for f in dataclasses.fields(config)}
+                self.assertNotIn("enable_torch_compile", fields)
+
+        args = {"enable_torch_compile": True}
+        JoyImageEditPipelineConfig().update_config_from_dict(args)
+        self.assertEqual(args, {"enable_torch_compile": True})
+
     def test_teacache_and_vae_decode_stay_out_of_compile(self):
         # What the core does with each False: TestPlatformCompileGates.
         self.assertFalse(TpuOOTPlatform().supports_teacache_with_torch_compile())
@@ -293,17 +324,19 @@ class TestWorkerRuntimePatches(CustomTestCase):
         # Ring attention merges replicated-token partials with logaddexp, which
         # torch_tpu has no kernel for (test_aten_fallbacks_tpu checks the kernel).
         from sglang_tpu import patches
-        from sglang_tpu.multimodal_gen import minimax_h3, rope, worker
+        from sglang_tpu.multimodal_gen import joy_image, minimax_h3, rope, worker
 
         with (
             patch.object(patches, "_register_aten_fallbacks") as aten_fallbacks,
             patch.object(rope, "install") as rope_install,
             patch.object(minimax_h3, "install") as minimax_h3_install,
+            patch.object(joy_image, "install") as joy_image_install,
         ):
             worker.install_runtime_patches()
         aten_fallbacks.assert_called_once_with()
         rope_install.assert_called_once_with()
         minimax_h3_install.assert_called_once_with()
+        joy_image_install.assert_called_once_with()
 
 
 if __name__ == "__main__":
