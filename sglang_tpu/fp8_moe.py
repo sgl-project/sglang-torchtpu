@@ -529,23 +529,20 @@ def prepare_tpu_fp8_moe_weights(
     # after this layer's process_weights_after_loading returns.
 
 
-def prepare_tpu_fp8_moe(
-    layer: torch.nn.Module,
-    *,
-    block_quant: bool,
-    weight_block_size: list[int] | tuple[int, int] | None,
-    use_mxfp8: bool,
-    is_fp4_expert: bool,
-) -> bool:
-    """Shared post-load formatting and backend selection for all FP8 sources."""
+def prepare_tpu_fp8_moe(layer: torch.nn.Module) -> bool:
+    """Adapt offline channel scales to the existing layout and MoE backend.
+
+    The ordinary block-FP8 path keeps its original core post-load method.
+    This adapter does not requantize the offline FP8 weights.
+    """
     from sglang.srt.layers.moe import get_moe_runner_backend
 
     prepare_tpu_fp8_moe_weights(
         layer,
-        block_quant=block_quant,
-        weight_block_size=weight_block_size,
-        use_mxfp8=use_mxfp8,
-        is_fp4_expert=is_fp4_expert,
+        block_quant=False,
+        weight_block_size=None,
+        use_mxfp8=False,
+        is_fp4_expert=False,
     )
     backend = get_moe_runner_backend()
     if not (backend.is_auto() or backend.is_pallas_tpu_fused_rs()):

@@ -238,10 +238,4 @@ class TpuChannelwiseFp8MoEMethod(Fp8MoEMethod):
                 )
             layer.register_parameter(f"{stem}_weight_scale", scale)
 
-        self.handles_moe_reduction = prepare_tpu_fp8_moe(
-            layer,
-            block_quant=False,
-            weight_block_size=None,
-            use_mxfp8=False,
-            is_fp4_expert=False,
-        )
+        self.handles_moe_reduction = prepare_tpu_fp8_moe(layer)
