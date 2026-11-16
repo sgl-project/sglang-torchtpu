@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=420, suite="base-a-test-cpu")
+register_cpu_ci(est_time=540, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -323,6 +323,202 @@ class TestIndexCommit(CustomTestCase):
                         self.assertEqual(int(gexp[t, 0]), int(wexp[0, 0]))
                     else:
                         self.assertFalse(np.asarray(pools[m][block]).any())
+
+
+class TestFusedDsaCommit(CustomTestCase):
+    """The fused K3.1 epilogue commit (``paged._commit_dsa_rows_fused``, Pallas
+    interpret mode) writes the bytes of the latent commit kernel and the XLA
+    index scatters: runs inside a sub-page and across sub-pages and pages,
+    other ranks' rows, two sequences, full waves, out-of-range and negative
+    blocks; repeated null-block targets land in row order."""
+
+    def _commit(self, positions, tables, members, layers=3, blocks=6, cache="fp8"):
+        import functools
+        from unittest import mock
+
+        import jax
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp, mla_dcp, paged
+        from sglang_tpu.k3_programs.kimi_k3.layout import (
+            cache_layout,
+            index_block_shape,
+        )
+
+        layout = cache_layout(cache)
+        rng = np.random.default_rng(len(positions) + int(np.sum(positions)) % 997)
+        batch, packing = len(positions), layout.block_shape[1]
+        page_tokens = layout.tokens_per_block
+        dtype, bits = (
+            (jnp.bfloat16, np.uint16)
+            if layout.dtype == "bfloat16"
+            else (jnp.float8_e4m3fn, np.uint8)
+        )
+        pool_map = tuple(int(i) for i in rng.permutation(layers + 1)[:layers])
+        # Random bytes; finite BF16 values (interpret-mode BF16 selects
+        # canonicalize NaN payloads, which the TPU's do not).
+        lat = [
+            rng.integers(0, 256, (blocks, *layout.block_shape), dtype=np.uint8)
+            if bits is np.uint8
+            else np.asarray(
+                jnp.asarray(
+                    rng.standard_normal((blocks, *layout.block_shape)), jnp.bfloat16
+                )
+            ).view(np.uint16)
+            for _ in range(layers + 1)
+        ]
+        idx = [
+            rng.integers(0, 256, (blocks, *index_block_shape(layout)), dtype=np.uint8)
+            for _ in range(layers)
+        ]
+        latents = jnp.asarray(rng.standard_normal((batch, layers, 640)), jnp.bfloat16)
+        records = rng.integers(0, 256, (batch, layers, 2, 128)).astype(np.int32)
+        cast = lambda x: jax.lax.bitcast_convert_type(jnp.asarray(x), dtype)
+        raw = lambda x: np.asarray(
+            jax.lax.bitcast_convert_type(x, bits) if x.dtype == dtype else x
+        )
+        row_bytes = raw(latents.astype(dtype))
+        tables_, positions_ = jnp.asarray(tables, jnp.int32), jnp.asarray(positions)
+        interpret = functools.partial(
+            pl.pallas_call, interpret=pltpu.InterpretParams()
+        )
+        for member in members:
+            want_lat = [x.copy() for x in lat]
+            want_idx = [x.copy() for x in idx]
+            for b, p in enumerate(positions):  # row order
+                page, t = p // page_tokens, p % page_tokens
+                block = tables[b][page // 32]
+                block = block + blocks if block < 0 else block
+                if page % 32 != member or not 0 <= block < blocks:
+                    continue
+                (key_row, sub), (scale_row, lane) = dsa_dcp.record_place(t)
+                for m in range(layers):
+                    want_lat[pool_map[m]][block, t // packing, t % packing] = (
+                        row_bytes[b, m]
+                    )
+                    want_idx[m][block, key_row, sub] = records[b, m, 0]
+                    want_idx[m][block, scale_row, 0, lane] = records[b, m, 1, 0]
+            with (
+                mock.patch.object(mla_dcp, "owner_index", return_value=member),
+                mock.patch.object(paged.pl, "pallas_call", interpret),
+            ):
+                pools = tuple(cast(x) for x in lat)
+                index_pools = tuple(jnp.asarray(x) for x in idx)
+                fused = paged._commit_dsa_rows_fused(
+                    pools,
+                    index_pools,
+                    latents,
+                    jnp.asarray(records),
+                    tables_,
+                    positions_,
+                    pool_map,
+                )
+                old = paged.commit_latent_rows(
+                    pools, latents, tables_, positions_, pool_map
+                ) + dsa_dcp.commit_index_rows(
+                    index_pools,
+                    jnp.concatenate(
+                        (records[:, :, 0], records[:, :, 1, :1]), axis=-1
+                    ).astype(jnp.uint8),
+                    tables_,
+                    positions_,
+                    group=32,
+                )
+            for got, base, want in zip(fused, old, want_lat + want_idx, strict=True):
+                np.testing.assert_array_equal(raw(got), want)
+                np.testing.assert_array_equal(raw(got), raw(base))
+
+    @staticmethod
+    def _interpretable():
+        try:
+            from jax.experimental.pallas import tpu as pltpu
+
+            pltpu.InterpretParams()
+        except (ImportError, AttributeError):
+            return False
+        return True
+
+    def test_verify_runs(self):
+        """One sequence's eight verify rows: inside a sub-page, across a
+        sub-page, across a page (the next page's owner commits the rest)."""
+        if not self._interpretable():
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        tables = np.tile(np.array([[3, 1, 4, 2]], np.int32), (8, 1))
+        for start in (0, 3, 29, 116, 125, 508):
+            with self.subTest(start=start):
+                base = 512 * 37 + start  # page 37: member 5's local entry 1
+                positions = base + np.arange(8, dtype=np.int32)
+                members = (5, 6, 7) if start == 508 else (5,)
+                self._commit(positions, tables, members=members)
+
+    def test_two_sequences_and_full_waves(self):
+        """B2x7 (two sequences at one context: one owner, two blocks), then
+        sixteen rows on sixteen blocks of one owner (two full waves)."""
+        if not self._interpretable():
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        positions = np.tile(512 * 70 + 250 + np.arange(8, dtype=np.int32), 2)
+        tables = np.repeat(np.array([[0, 0, 2, 0], [0, 0, 5, 0]], np.int32), 8, axis=0)
+        self._commit(positions, tables, members=(6, 7))
+        positions = (512 * 32 * np.arange(16) + 512 * 3 + 7).astype(np.int32)
+        tables = np.zeros((16, 16), np.int32)
+        tables[np.arange(16), np.arange(16)] = np.arange(16)
+        self._commit(positions, tables, members=(3,), blocks=17)
+
+    def test_plain_rows_padding_and_bounds(self):
+        """Plain decode rows: rows sharing blocks out of order, padding rows
+        on null block 0, an out-of-range block, a negative block next to its
+        normalized twin; then the BF16 layout's runs."""
+        if not self._interpretable():
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        positions = np.array(
+            [512 * 33 + 5, 0, 512 * 33 + 9, 0, 512 * 65 + 130, 512 + 511]
+            + [512 * 65 + 131, 512 * 33 + 6],
+            np.int32,
+        )
+        tables = np.zeros((8, 4), np.int32)
+        tables[[0, 2, 7], 1] = 4
+        tables[[4, 6], 2] = -1, 5
+        tables[5, 0] = 9
+        self._commit(positions, tables, members=(0, 1))
+        tables = np.tile(np.array([[3, 1, 4, 2]], np.int32), (8, 1))
+        for start in (2, 124, 252):
+            with self.subTest(cache="bf16", start=start):
+                positions = 256 * 37 + start + np.arange(8, dtype=np.int32)
+                self._commit(positions, tables, members=(5,), cache="bfloat16")
+
+    def test_mla_layers_and_dispatch(self):
+        """All 24 MLA layers; the decode step takes the fused commit only
+        with ``dsa_fused_commit``."""
+        if not self._interpretable():
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        from unittest import mock
+
+        import jax
+        import jax.numpy as jnp
+
+        from sglang_tpu.k3_programs.kimi_k3.config import KernelConfig
+        from sglang_tpu.k3_programs.kimi_k3.kernels import paged
+
+        positions = 512 * 40 + 61 + np.arange(8, dtype=np.int32)
+        tables = np.tile(np.array([[0, 2, 0]], np.int32), (8, 1))
+        self._commit(positions, tables, members=(8,), layers=24, blocks=3)
+        pools = (jax.ShapeDtypeStruct((4, 128, 4, 640), jnp.float8_e4m3fn),) * 24
+        index_pools = (jax.ShapeDtypeStruct((4, 132, 4, 128), jnp.uint8),) * 24
+        rows = jax.ShapeDtypeStruct((8, 24, 640), jnp.bfloat16)
+        records = jax.ShapeDtypeStruct((8, 24, 2, 128), jnp.int32)
+        tables = jax.ShapeDtypeStruct((8, 64), jnp.int32)
+        for enabled in (False, True):
+            with mock.patch.object(
+                paged, "_config", return_value=KernelConfig(dsa_fused_commit=enabled)
+            ):
+                self.assertEqual(
+                    paged._dsa_commit_fusable(
+                        pools, index_pools, rows, records, tables, tuple(range(24))
+                    ),
+                    enabled,
+                )
 
 
 class TestIndexSelect(CustomTestCase):

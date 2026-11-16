@@ -96,6 +96,10 @@ class KernelConfig:
     # many slots, folded once when full and at each row's last step (instead
     # of one fold a step). 0: fold every compact step.
     dsa_compact_window: int = 0
+    # Kimi-K3.1 decode epilogue: commit the step's latent rows and DSA
+    # index keys in one kernel (paged._commit_dsa_rows_fused) instead of the
+    # latent commit kernel and 48 XLA scatters.
+    dsa_fused_commit: bool = False
     # Decode layer loop: test KDA first in the layer-type branch, so the
     # instruction overlays place the post-join code for the 68 KDA layers.
     decode_kda_branch_first: bool = True
