@@ -62,6 +62,17 @@ def latency(fn, *args, repeats):
     }
 
 
+def build_benchmark_step(**kwargs):
+    """Use the E2E's fixed 92,160-token page-table capacity at every context."""
+    step = fixture["_build_step"](**kwargs, reference_scores=False)
+    table = step.page_indices.reshape(len(step.kv_lens), -1)
+    capacity_pages = 92160 // fixture["_PAGE_SIZE"]
+    if table.shape[1] < capacity_pages:
+        table = np.pad(table, ((0, 0), (0, capacity_pages - table.shape[1])))
+    step.page_indices = table[:, :capacity_pages].reshape(-1)
+    return step
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-v2")
@@ -161,7 +172,7 @@ def main():
                 "mixed",
             ),
         ):
-            step = fixture["_build_step"](**build, reference_scores=False)
+            step = build_benchmark_step(**build)
             values = tuple(
                 jnp.asarray(getattr(step, field))
                 for field in (
@@ -201,6 +212,7 @@ def main():
                     cache_bytes=step.cache.nbytes,
                     writer_and_score_included=True,
                     page_size=fixture["_PAGE_SIZE"],
+                    score_width_capacity=92160,
                     output_rows=list(output.shape),
                     **timing,
                 )
