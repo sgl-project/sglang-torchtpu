@@ -43,6 +43,10 @@ class KernelConfig:
     singleton_block: bool | None = None  # None: at B16-B128
     stage_blocks: bool | None = None  # None: at B16-B128
     b16_compact_experts: bool = True
+    # B16 compact experts: stage each tile's rows with a one-hot [8, 16] x
+    # [16, K] product (as B64, B96 and B128 do) instead of a scalar scan of
+    # the row bitmask. The source rows without local routes are zeroed first.
+    b16_one_hot_staging: bool = False
     shared_expert_finishers: bool = True
     compact_overflow: bool = True
     b4_attention_gather: bool = True
