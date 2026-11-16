@@ -84,27 +84,45 @@ def _gather_page_ids_kernel(windows_ref, logical_ref, out_ref, *, num_chunks):
     out_ref[...] = out
 
 
-# Cost of one dynamic fori_loop iteration (scalar trip count, loop-carried output) relative to
-# one chunk step of the loop body, measured with gather_page_ids on tpu7x (4096 tokens x top-k
-# 2048: ~33 us per iteration vs ~20 us per chunk step across 512 token blocks).
-_GATHER_PAGE_LOOP_ITERATION_COST_IN_CHUNKS = 1.6
-# Fixed cost of one token-block grid step (DMA of the block + pipeline step, ~0.6 us) relative
-# to one chunk step of the unrolled kernel (~0.06 us per block), same measurement. While the
-# table is narrower than this the unrolled kernel is bound by the fixed cost, not by the chunk
-# loop, so bounding the loop cannot save time and only adds loop overhead.
-_GATHER_PAGE_BLOCK_STEP_COST_IN_CHUNKS = 10
+# Cycle costs of the bounded loop, read from the TensorCore LLO schedule on tpu7x.
+# A chunk step is bound by the cross-lane unit (XLU), not the VALU: it does one lane gather per
+# (8, 128) vreg of the block's top-k indices, and each XLU issues them back to back
+# (vset.pattern + vperm.lane, 4 + 4 cycles).
+_XLU_LANE_GATHER_CYCLES = 8
+_NUM_XLUS = 2
+# Fill/drain of one fori_loop iteration: the body is scheduled on its own, so its gather chains
+# and the loop-carried output do not overlap the next iteration. Read from the 8-chunk body
+# (641 bundles, of which 8 x 64 are chunk steps); bodies of 16+ chunks also spill, which
+# roughly doubles it, but that does not change the chosen iteration count at 1M context.
+_GATHER_PAGE_LOOP_ITERATION_CYCLES = 129
+# A grid step waits on its DMAs (the block's top-k tile in, its page-table row in, its output
+# tile out): main's 1-chunk kernel has a 154-bundle body but takes this many cycles per step.
+_GATHER_PAGE_BLOCK_STEP_FLOOR_CYCLES = 1040
+# One chunk step of the fully unrolled kernel: the XLU-bound step plus register spills, which
+# grow with the unrolled width (main's 16-chunk body: 1512 bundles vs 154 for 1 chunk).
+_GATHER_PAGE_UNROLLED_CHUNK_STEP_CYCLES = 90
 
 
-def _gather_page_chunks_per_iteration(num_chunks: int) -> int:
+def _gather_page_chunk_step_cycles(block_tokens: int, topk: int) -> float:
+    """Cycles of one chunk step for one token block: its lane gathers spread over the XLUs."""
+    num_vregs = cdiv(block_tokens, 8) * cdiv(topk, _GATHER_PAGE_CHUNK)
+    return num_vregs * _XLU_LANE_GATHER_CYCLES / _NUM_XLUS
+
+
+def _gather_page_chunks_per_iteration(
+    num_chunks: int, block_tokens: int, topk: int
+) -> int:
     """Chunks the bounded kernel unrolls per loop iteration.
 
-    A block that needs ``c`` chunks costs about ``ceil(c / g) * (o + g * u)``: ``o`` per loop
-    iteration, ``u`` per chunk step, with on average ``(g - 1) / 2`` wasted tail steps.
-    Minimizing ``c * o / g + g * u / 2`` gives ``g = sqrt(2 * c * o / u)``, with ``c`` taken as
-    the table width. ``g`` is then evened out over the table, so a full-length block runs
-    ``ceil(c / g)`` iterations with fewer than one wasted step per iteration.
+    A block that needs ``c`` chunks costs about ``ceil(c / g) * (o + g * u)``: ``o`` cycles per
+    loop iteration, ``u`` cycles per chunk step, with on average ``(g - 1) / 2`` wasted tail
+    steps. Minimizing ``c * o / g + g * u / 2`` gives ``g = sqrt(2 * c * o / u)``, with ``c``
+    taken as the table width. ``g`` is then evened out over the table, so a full-length block
+    runs ``ceil(c / g)`` iterations with fewer than one wasted step per iteration.
     """
-    g = math.sqrt(2 * num_chunks * _GATHER_PAGE_LOOP_ITERATION_COST_IN_CHUNKS)
+    o = _GATHER_PAGE_LOOP_ITERATION_CYCLES
+    u = _gather_page_chunk_step_cycles(block_tokens, topk)
+    g = math.sqrt(2 * num_chunks * o / u)
     num_iterations = max(1, round(num_chunks / g))
     return -(-num_chunks // num_iterations)
 
@@ -163,10 +181,15 @@ def gather_page_ids(
         windows = jnp.pad(windows, ((0, pad), (0, 0)))
         logical = jnp.pad(logical, ((0, pad), (0, 0)))
 
-    chunks_per_iteration = _gather_page_chunks_per_iteration(num_chunks)
+    chunks_per_iteration = _gather_page_chunks_per_iteration(
+        num_chunks, block_tokens, topk
+    )
     # One iteration covering the whole table is the unrolled kernel without the loop.
     if (
-        num_chunks > _GATHER_PAGE_BLOCK_STEP_COST_IN_CHUNKS
+        # Below the floor the unrolled kernel's chunk loop hides under the DMA wait, so
+        # bounding it saves nothing and only adds loop overhead.
+        num_chunks * _GATHER_PAGE_UNROLLED_CHUNK_STEP_CYCLES
+        > _GATHER_PAGE_BLOCK_STEP_FLOOR_CYCLES
         and chunks_per_iteration < num_chunks
     ):
         nblocks = padded_tokens // block_tokens

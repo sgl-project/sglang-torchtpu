@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """gather_page_ids matches a direct page-table lookup on a TPU (JAX only).
 
-Covers the unrolled kernel (page table of at most 10 chunks of 128 pages) and the
+Covers the unrolled kernel (page table of at most 11 chunks of 128 pages) and the
 bounded-loop kernel used for wider tables (256k and 1M context at page 128).
 """
 
@@ -44,7 +44,7 @@ def _reference(page_indices, seq_page_ids, seq_ids, max_num_seqs):
 @pytest.mark.parametrize("num_tokens", [64, 1003])
 def test_matches_reference(pages_per_seq, seq_pages, num_tokens):
     rng = np.random.default_rng(pages_per_seq + num_tokens)
-    max_num_seqs, topk = 5, 256
+    max_num_seqs, topk = 5, 2048
     page_indices = rng.integers(
         0, 1 << 20, size=(max_num_seqs * pages_per_seq,), dtype=np.int32
     )
