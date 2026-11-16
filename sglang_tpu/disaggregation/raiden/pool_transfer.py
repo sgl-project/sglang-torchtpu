@@ -32,6 +32,7 @@ from sglang_tpu.disaggregation.raiden.pool_spans import (
     _kv_rank,
     _new_transfer_state,
     group_ranks,
+    is_state_pool,
     is_swa_pool,
     parse_req_id,
     part_destination_blocks,
@@ -42,6 +43,7 @@ from sglang_tpu.disaggregation.raiden.pool_spans import (
     stage_group,
     stage_req_id,
     stage_uuid,
+    state_page_shape,
 )
 from sglang_tpu.disaggregation.raiden.serde import (
     MessageTag,
@@ -58,8 +60,31 @@ _MISSING_REGISTRATION = "Missing producer block registration"
 _EARLY_COMPLETION = "Only an empty producer registration may complete before"
 
 
+def _pool_entry(tag: str, tensor: Any, storage_index: int) -> dict:
+    """The native pool record of one tensor whose major axis is the block."""
+    size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
+    return dict(
+        tag=tag,
+        storage_index=storage_index,
+        base_offset_bytes=0,
+        block_stride_bytes=size,
+        num_blocks=int(tensor.shape[0]),
+        dtype_tag=str(tensor.dtype).removeprefix("torch."),
+        regions=[
+            dict(
+                name="kv",
+                offset_bytes=0,
+                stride_bytes=size,
+                unit_bytes=size,
+                num_units=1,
+            )
+        ],
+    )
+
+
 def pool_manifest(groups: Any) -> list[dict]:
-    """Name each local full-attention or sliding-window tensor by model layer.
+    """Name each local full-attention or sliding-window tensor by model layer,
+    and each request-state tensor by its tag (common.pipeline_state_entries).
 
     A block-major bundle is one pool whose block is the whole row,
     ``<kind>.l<first>+<count>``; it pairs only with a bundle of the same layers.
@@ -90,26 +115,10 @@ def pool_manifest(groups: Any) -> list[dict]:
             tag = f"{tag_kind}.l{int(layer)}"
             if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
                 tag += f"+{int(tensor.shape[1])}"
-            size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
-            pools.append(
-                dict(
-                    tag=tag,
-                    storage_index=len(pools),
-                    base_offset_bytes=0,
-                    block_stride_bytes=size,
-                    num_blocks=int(tensor.shape[0]),
-                    dtype_tag=str(tensor.dtype).removeprefix("torch."),
-                    regions=[
-                        dict(
-                            name="kv",
-                            offset_bytes=0,
-                            stride_bytes=size,
-                            unit_bytes=size,
-                            num_units=1,
-                        )
-                    ],
-                )
-            )
+            pools.append(_pool_entry(tag, tensor, len(pools)))
+    # Request state (GDN, PLE): one block per request, its committed state row.
+    for tag, tensor in getattr(groups, "pipeline_state", ()):
+        pools.append(_pool_entry(tag, tensor, len(pools)))
     if not groups.full:
         raise ValueError(
             "Raiden pipeline transfer needs full-attention KV in every stage"
@@ -155,7 +164,10 @@ def layout_fingerprint(
         if layout is None:
             raise ValueError("Raiden pipeline KV must have a materialized TPU layout")
         major, tiles, bits = layout
-        if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
+        if is_state_pool(pool["tag"]):
+            # The attention-TP-sharded axis is left out, as for kv-heads.
+            page_shape = state_page_shape(pool["tag"], tensor)
+        elif _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             # Axis 1, the per-rank 2 * kv_heads, is left out.
             schema = "sglang-rpa-seq-kv-v1"
             page_shape = [int(tensor.shape[2]), int(tensor.shape[3])]
@@ -361,6 +373,8 @@ class RaidenPoolTransfer:
         self.lock = threading.RLock()
         self.draft_kv_heads = getattr(groups, "draft_kv_head_num", None)
         self.draft_swa_kv_heads = getattr(groups, "draft_swa_kv_head_num", None)
+        # The GDN conv state's [q | k | v] widths, to slice it per decode rank.
+        self.state_conv_shard_groups = getattr(groups, "state_conv_shard_groups", None)
         # A pool family with another block count gets an engine of its own.
         self.pools, side_pools = pool_side_engine.split_manifest(pool_manifest(groups))
         family = pool_side_engine.family_of(side_pools)
@@ -551,11 +565,13 @@ class RaidenPoolTransfer:
         # Rank 0 decides from its own layers; every worker must agree with it.
         local = side is not None
         if local != (len(addresses) == 4):
+            label = side.label if side is not None else "second-engine"
             raise ValueError(
-                "Raiden pipeline workers disagree on the sliding-window engine: "
-                f"rank {self.rank} has {'' if local else 'no '}sliding-window "
-                f"layers but rank 0 has {'none' if local else 'some'}; with hybrid "
-                "SWA memory every pipeline stage needs sliding-window layers, so "
+                f"Raiden pipeline workers disagree on the {label} engine: "
+                f"rank {self.rank} has {'' if local else 'no '}{label} "
+                f"pools but rank 0 has {'none' if local else 'some'}; every "
+                "pipeline stage needs layers of that family (sliding-window "
+                "layers with hybrid SWA memory, or linear-attention layers), so "
                 "pick a stage layout that gives each stage some, or "
                 f"{pool_side_engine.DISABLE_HYBRID_SWA}"
             )

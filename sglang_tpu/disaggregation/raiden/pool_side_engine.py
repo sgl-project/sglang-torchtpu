@@ -49,15 +49,19 @@ import time
 from types import SimpleNamespace
 from typing import Any, Optional
 
+from sglang_tpu.disaggregation.raiden.common import STATE_PORT_OFFSET
 from sglang_tpu.disaggregation.raiden.host_pool import slot_host_bytes
 from sglang_tpu.disaggregation.raiden.pool_spans import (
     _derived_uuid,
     _new_transfer_state,
+    is_state_pool,
     is_swa_pool,
     parse_req_id,
     part_destination_blocks,
     part_spans,
     stage_req_id,
+    state_destination_blocks,
+    state_slice_spans,
 )
 
 logger = logging.getLogger(__name__)
@@ -175,9 +179,70 @@ class SwaFamily(Family):
         )
 
 
+class StateFamily(Family):
+    """Per-request recurrent state of a hybrid linear-attention model: GDN conv
+    and recurrent state and the Qwen4-Exp PLE side states, one block per
+    request (its committed state row) in pools of mamba slots, whose count
+    differs from the full-attention pages'. The state settles with the final
+    chunk, so like the window it rides only on closing and stage-group
+    transfers."""
+
+    name = "state"
+    label = "request-state"
+    cargo = "GDN / PLE request state"
+    twin_prefix = "state:"
+    store_name = "pipeline-state"
+    port_offset = STATE_PORT_OFFSET
+    count_key = "state"
+    controller_key = "state_controller"
+    unit_key = "state_unit"
+    remedy = "serve the hybrid linear-attention model without pipeline parallelism"
+    agreement = "serve the same hybrid linear-attention model on both"
+    no_side_block = "the decode holds no state row for the producer's request state"
+    no_full_page = "the decode holds no full-attention page for a request-state twin"
+
+    @staticmethod
+    def owns(tag: str) -> bool:
+        return is_state_pool(tag)
+
+    @staticmethod
+    def tensors(groups) -> list[Any]:
+        return [tensor for _, tensor in groups.pipeline_state]
+
+    @staticmethod
+    def max_blocks(manager) -> int:
+        return 1
+
+    @staticmethod
+    def sent_blocks(manager, room: int) -> list[int]:
+        """The producer stage's committed state row of the room."""
+        return list(manager._prefill.send_state_rows.get(room, []))
+
+    @staticmethod
+    def spans(transfer, link, blocks: list[int], dst_attn_tp: int) -> list[Any]:
+        """Spans of ``blocks``, the producer's state row, to each decode rank's
+        shard of it."""
+        return state_slice_spans(
+            link.pools,
+            link.tensors,
+            blocks,
+            dst_attn_tp,
+            transfer.state_conv_shard_groups,
+        )
+
+    @staticmethod
+    def destination(link, blocks: list[int], count: int, only_tags=None) -> dict:
+        """The decode's state row (``blocks``) for a twin of ``count`` source
+        rows: every stage registers its own row of one request."""
+        return state_destination_blocks(
+            link.pools, list(blocks)[: max(1, count)], only_tags=only_tags
+        )
+
+
 SWA = SwaFamily()
+STATE = StateFamily()
 # Every family a second engine can carry; a worker's pools belong to one at most.
-FAMILIES = (SWA,)
+FAMILIES = (SWA, STATE)
 
 
 def family_of(pools: list[dict]):

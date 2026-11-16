@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -105,6 +105,52 @@ class RaidenKVCacheGroups:
     unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
     # True when any KV pool uses the 5D token-minor SEQ_ALONG_LANE layout.
     seq_along_lane: bool = False
+    # Request state the Raiden pipeline transfer moves as named pools, one
+    # (tag, [slots + 1, ...] tensor) per layer: GDN conv and recurrent state and
+    # the Qwen4-Exp PLE side states (pipeline_state_entries).
+    pipeline_state: List[Tuple[str, torch.Tensor]] = field(default_factory=list)
+    # Full (unsharded) widths of the GDN conv state's [q | k | v] sub-blocks,
+    # each head-sharded independently across attention TP.
+    state_conv_shard_groups: Optional[List[int]] = None
+
+
+def pipeline_state_entries(mamba_pool: Any) -> List[Tuple[str, torch.Tensor]]:
+    """(tag, tensor) of each per-layer request-state tensor, slot-major.
+
+    GDN conv state is tagged ``gdn.conv.l<layer>`` ([slots + 1, K - 1, 1,
+    conv_dim]), recurrent state ``gdn.ssm.l<layer>`` ([slots + 1, n_v, d_k,
+    d_v]); both are sharded across attention TP. The Qwen4-Exp PLE side states
+    are replicated: short-conv state ``ple.sc.l<layer>`` and the request's
+    n-gram context ``ple.ngram.l0``. Only a stage holding a PLE layer
+    advertises the n-gram context, so exactly one pipeline stage sends it.
+    """
+    from sglang_tpu.disaggregation.raiden.pool_spans import (
+        GDN_CONV_KIND,
+        GDN_SSM_KIND,
+        PLE_NGRAM_KIND,
+        PLE_SHORT_CONV_KIND,
+    )
+
+    entries: List[Tuple[str, torch.Tensor]] = []
+    for name, tensor, _, layer_id in mamba_pool._iter_transfer_state_entries():
+        kind = GDN_CONV_KIND if name == "conv" else GDN_SSM_KIND
+        entries.append((f"{kind}.l{int(layer_id)}", tensor))
+    ple: List[Tuple[str, torch.Tensor]] = []
+    ngram: List[Tuple[str, torch.Tensor]] = []
+    for sibling in getattr(mamba_pool, "_slot_siblings", ()):
+        for name, tensor, _, layer_id in sibling.iter_transfer_state_entries():
+            if name == "ple_short_conv":
+                ple.append((f"{PLE_SHORT_CONV_KIND}.l{int(layer_id)}", tensor))
+            elif name == "ple_ngram":
+                ngram.append((f"{PLE_NGRAM_KIND}.l0", tensor))
+            else:
+                raise NotImplementedError(
+                    f"Raiden pipeline transfer cannot move request state {name!r}"
+                )
+    entries.extend(ple)
+    if ple:
+        entries.extend(ngram)
+    return entries
 
 
 def _is_seq_along_lane_pool(pool: Optional[KVCache]) -> bool:
@@ -321,6 +367,8 @@ def get_raiden_kv_caches(
         num_hidden_full = 1
 
     state: List[torch.Tensor] = []
+    pipeline_state: List[Tuple[str, torch.Tensor]] = []
+    state_conv_shard_groups: Optional[List[int]] = None
     state_type = StateType.MAMBA
     state_max_blocks = 1
     committed_state_row = None
@@ -340,8 +388,16 @@ def get_raiden_kv_caches(
     elif isinstance(pool, HybridLinearKVPool) and isinstance(
         pool.mamba_pool, TpuMambaPool
     ):
-        state = pool.mamba_pool.get_state()
+        pipeline_state = pipeline_state_entries(pool.mamba_pool)
+        # The Qwen4-Exp PLE side states are slot rows too, replicated across
+        # attention TP; the equal-TP state engine copies them whole.
+        state = pool.mamba_pool.get_state() + [
+            tensor
+            for tag, tensor in pipeline_state
+            if tag.startswith(("ple.sc.", "ple.ngram."))
+        ]
         committed_state_row = pool.mamba_pool.committed_row
+        state_conv_shard_groups = pool.mamba_pool.conv_shard_groups
 
     for name, group in (("full KV", full), ("SWA KV", swa), ("GDN state", state)):
         block_counts = {int(buf.shape[0]) for buf in group}
@@ -368,4 +424,6 @@ def get_raiden_kv_caches(
         write_state_meta=write_state_meta,
         unified_swa_pool=groups.unified_swa_pool,
         seq_along_lane=seq_along_lane,
+        pipeline_state=pipeline_state,
+        state_conv_shard_groups=state_conv_shard_groups,
     )

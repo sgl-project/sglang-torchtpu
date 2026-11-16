@@ -194,6 +194,8 @@ class RaidenKVManager(
     _state_type: StateType = StateType.MAMBA
     _state_max_blocks: int = 1
     _state_engine_max_blocks = 0
+    # The pipeline transfer moves request state as named pools (no state engine).
+    _pipeline_moves_state = False
     _committed_state_row: Optional[Callable[[int], int]] = None
     _read_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     _write_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
@@ -485,13 +487,16 @@ class RaidenKVManager(
                     "(--enable-unified-memory); disable pipeline parallelism and "
                     f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
                 )
-            if self._state_kv_caches:
+            if self._state_kv_caches and not kv_caches.pipeline_state:
                 raise NotImplementedError(
-                    "Raiden pipeline transfer does not move GDN (linear-attention) "
-                    "state yet; serve hybrid linear-attention models without "
-                    "pipeline parallelism or "
+                    "Raiden pipeline transfer moves only GDN (linear-attention) "
+                    f"and PLE request state, not {self._state_type}; serve the "
+                    "model without pipeline parallelism or "
                     f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
                 )
+            # GDN / PLE state rides a second engine as named pools
+            # (pool_side_engine.StateFamily), one committed row per request.
+            self._pipeline_moves_state = bool(kv_caches.pipeline_state)
             from sglang_tpu.disaggregation.raiden.pool_transfer import (
                 RaidenPoolTransfer,
             )
@@ -1318,7 +1323,7 @@ class RaidenKVManager(
         self, state_indices: Optional[List]
     ) -> List[int]:
         """The committed state row/pages of the request's state slot."""
-        if self._state_engine is None:
+        if self._state_engine is None and not self._pipeline_moves_state:
             return []
         try:
             index = self.kv_args.state_types.index(self._state_type)

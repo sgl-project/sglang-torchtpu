@@ -242,8 +242,11 @@ class RaidenReceiverMixin:
         local_state_rows: Sequence[int] = (),
     ) -> None:
         if self._pipeline is not None:
+            # The pipeline's second engine carries one family: the window's
+            # pages, or the request's state row (pool_side_engine.StateFamily).
+            side = local_state_rows if self._pipeline_moves_state else local_swa_blocks
             self._pipeline.register_decode(
-                room, local_blocks, local_swa_blocks, aux_index, bootstrap_infos
+                room, local_blocks, side, aux_index, bootstrap_infos
             )
             return
         if len(bootstrap_infos) != 1:
