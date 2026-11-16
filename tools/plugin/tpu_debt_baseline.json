@@ -101,7 +101,7 @@
     "python/sglang/srt/layers/moe/fused_moe_triton/layer.py": 1,
     "python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py": 1,
     "python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16_moe.py": 2,
-    "python/sglang/srt/layers/quantization/fp8.py": 6,
+    "python/sglang/srt/layers/quantization/fp8.py": 7,
     "python/sglang/srt/layers/quantization/fp8_utils.py": 1,
     "python/sglang/srt/layers/quantization/modelopt_quant.py": 4,
     "python/sglang/srt/layers/quantization/unquant.py": 1,

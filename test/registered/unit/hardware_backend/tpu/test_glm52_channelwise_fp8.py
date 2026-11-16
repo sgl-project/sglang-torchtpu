@@ -696,7 +696,7 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
             self.assertFalse(offline.quant_method.handles_moe_reduction)
 
     def test_block_checkpoint_keeps_fused_rs_selection_and_reduction_ownership(self):
-        """Moving post-load dispatch must preserve the old auto/explicit RS path.
+        """Offline loading must preserve the old block-FP8 auto/explicit RS path.
 
         Real loading, formatting, eligibility and forward dispatch run on CPU;
         only device compilation/collectives are replaced at their boundaries.
@@ -757,6 +757,7 @@ class TestBlockChannelwiseAndDraft(CustomTestCase):
             patch.object(fp8, "_is_tpu", True),
             patch.object(fp8, "_is_cpu", False),
             patch.dict(os.environ, WORLD_SIZE="2"),
+            patch.object(fp8, "get_parallel", return_value=parallel),
             patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
             patch("sglang_tpu.fp8_moe.get_parallel", return_value=parallel),
             patch(
