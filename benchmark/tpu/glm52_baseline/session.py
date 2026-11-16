@@ -149,6 +149,31 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                 check=True,
                 timeout=900,
             )
+        # The native draft loader reads every tensor in its five shards, so
+        # prepare their full host union once rather than cold-reading the other
+        # host's expert half independently in each of eight draft processes.
+        draft_path = json.loads(config.read_text())["server_args"][
+            "speculative_draft_model_path"
+        ]
+        with (art / "mtp-host-preparation.log").open("wb") as log:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-u",
+                    "-m",
+                    "benchmark.tpu.glm52_baseline.prepare_host_checkpoint",
+                    draft_path,
+                    "--expert-start",
+                    "0",
+                    "--expert-end",
+                    "256",
+                    "--execute",
+                ],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=True,
+                timeout=180,
+            )
         atomic(
             shared / f"prepared-{rank}.json",
             dict(rank=rank, physical_rank=physical_rank),

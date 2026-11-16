@@ -86,11 +86,16 @@ async def generate(
     return result
 
 
-def freeze_inputs(tokenizer_path, source, out, decode_prefix_mode):
-    import numpy as np
+def load_tokenizer(tokenizer_path):
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    return AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+
+
+def freeze_inputs(tokenizer_path, source, out, decode_prefix_mode):
+    import numpy as np
+
+    tokenizer = load_tokenizer(tokenizer_path)
     decode_prefix_count = 1 if decode_prefix_mode == "shared" else 64
     need = 16 * (49152 + 4 * 4096) + decode_prefix_count * 89984 + 64 * 4 * 16
     ids, files = [], []
@@ -312,9 +317,10 @@ async def main(a):
         assert all(info.get(k) == v for k, v in expected.items()), {
             k: info.get(k) for k in expected
         }
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
+        # Keep the loop alive while imports/tokenization run: otherwise an idle
+        # HTTP connection can expire on the server while aiohttp still sees it
+        # as reusable, making the next POST fail with ServerDisconnectedError.
+        tokenizer = await asyncio.to_thread(load_tokenizer, a.model)
         assert tokenizer.chat_template
         checks = []
         for rank in range(16):
@@ -366,7 +372,9 @@ async def main(a):
                 else "share prefix within each DP to reduce KV slots",
             ),
         )
-        _, ids = freeze_inputs(a.model, a.source, a.output, decode_mode)
+        _, ids = await asyncio.to_thread(
+            freeze_inputs, a.model, a.source, a.output, decode_mode
+        )
         all_summaries = []
         for scenario in ("prefill", "decode"):
             prefix_len, extend, count = (
