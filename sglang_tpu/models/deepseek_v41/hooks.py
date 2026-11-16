@@ -267,7 +267,9 @@ def tpu_dsv41_engram_worker_forward(original, worker, batch, *args, **kwargs):
         if prepared is not None:
             requests, positions = prepared
             coordinator.remember(requests, positions, result)
-        elif not is_verify:
+        elif is_verify:
+            coordinator.pending = None
+        else:
             coordinator.remember_fallback_if_applicable(batch, result)
         return result
     finally:

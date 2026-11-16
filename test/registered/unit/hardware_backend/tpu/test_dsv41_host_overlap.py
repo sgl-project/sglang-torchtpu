@@ -235,6 +235,8 @@ def _batch(
     starts=None,
     lengths=None,
     spec_none=True,
+    req_pool_indices_cpu=None,
+    seq_lens_cpu=None,
 ):
     mode = SimpleNamespace(
         is_decode=lambda: decode,
@@ -243,13 +245,16 @@ def _batch(
         is_target_verify=lambda: False,
         is_idle=lambda: idle,
     )
+    if seq_lens_cpu is None and decode and starts is not None:
+        seq_lens_cpu = torch.tensor([s + 1 for s in starts])
     return SimpleNamespace(
         reqs=requests,
         spec_algorithm=SimpleNamespace(is_none=lambda: spec_none),
         forward_mode=mode,
         prefix_lens=starts,
         extend_lens=lengths,
-        seq_lens_cpu=torch.tensor([s + 1 for s in starts]) if decode else None,
+        seq_lens_cpu=seq_lens_cpu,
+        req_pool_indices_cpu=req_pool_indices_cpu,
     )
 
 
@@ -489,12 +494,24 @@ def test_prepared_engram_upload_dma_lifecycle_and_slot_ping_pong():
     coordinator.record_consumers(uploads3, [torch.tensor([30])])
     coordinator.clear_step()
 
-    # Switching buckets releases consumers on the old bucket so HBM is not pinned.
+    # Switching buckets does NOT stall on the previous bucket's in-flight consumers;
+    # consumer waits happen lazily in start() only when a slot is actually reused.
     req4 = _request([1, 2])
     coordinator.prepare(_batch([req4], starts=[0], lengths=[2]))
     _, uploads4, _ = coordinator.stage_all(8)
-    assert len(synced) == 6  # both slots across both layers on bucket 4 released
+    assert len(synced) == 2  # no cross-bucket wait
     coordinator.record_consumers(uploads4, [torch.tensor([40])])
+    coordinator.clear_step()
+
+    # Returning to bucket 4 picks the older alternate slot (Step 2) and waits on
+    # Step 2's consumer in start(), leaving Step 3's consumer untouched until next reuse.
+    req5 = _request([3, 4, 5, 6])
+    coordinator.prepare(_batch([req5], starts=[0], lengths=[4]))
+    staged5, uploads5, _ = coordinator.stage_all(4)
+    assert len(synced) == 4
+    assert all(s[0][0] is step2_out and s[1] is True for s in synced[2:])
+    assert staged5[0] is not slot0_step1 and staged5[1] is not slot1_step1
+    coordinator.record_consumers(uploads5, [torch.tensor([50])])
     coordinator.clear_step()
 
 
@@ -808,6 +825,292 @@ def test_hooks_end_to_end_overlap_fallback_idle_and_pending_call():
         coordinator.record_consumers(uploads_ced, [torch.tensor([1])])
         coordinator.clear_step()
         assert len(staged_ced) == 2
+
+
+def test_fallback_decode_updates_pending_and_clears_stale_pending():
+    coordinator, _, hasher = _coordinator()
+    model = SimpleNamespace(
+        model=SimpleNamespace(engram_hasher=hasher, layers=[]),
+        _tpu_host_engram_coordinator=coordinator,
+    )
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            model_config=SimpleNamespace(use_engram=True),
+            is_draft_worker=False,
+            model=model,
+            device=torch.device("cpu"),
+        )
+    )
+    fake_parallel = SimpleNamespace(pp_size=1, attn_cp_size=1, attn_dcp_size=1)
+    fake_exec = SimpleNamespace(
+        features=SimpleNamespace(enable_encoder_swa_bounded_replay=False)
+    )
+
+    req_a = _request([1, 2, 3])
+    beam_req = _request([4, 5, 6, 7], beam_group=object())
+
+    with (
+        patch("sglang.srt.runtime_context.get_parallel", return_value=fake_parallel),
+        patch("sglang.srt.runtime_context.get_exec", return_value=fake_exec),
+    ):
+        # Step N-2: fast-path extend on req_a -> samples token 5 at position 3.
+        ext_b = _batch([req_a], starts=[0], lengths=[3])
+        res_n2, _ = _result([5])
+        hooks.tpu_dsv41_engram_worker_forward(lambda w, b: res_n2, worker, ext_b)
+
+        # Step N-1: fallback decode sharing a batch with a beam_group request
+        # (including appended beam_tail rows in seq_lens_cpu).
+        # Under overlap, token 5 is now committed to req_a.output_ids? Not yet for
+        # step N-1, and step N-1 samples token 6 at position 4 (seq_len=4).
+        # Next_token_ids is sliced to base rows [beam_req, req_a] -> [7, 6].
+        beam_dec_b = _batch(
+            [beam_req, req_a],
+            decode=True,
+            seq_lens_cpu=torch.tensor([5, 4, 5, 5]),
+        )
+        res_n1, ev_n1 = _result([7, 6])
+        hooks.tpu_dsv41_engram_worker_forward(lambda w, b: res_n1, worker, beam_dec_b)
+        assert not coordinator.started
+
+        # Step N: beam_req finished; req_a returns to fast-path decode at start=4.
+        # Under overlap, req_a.output_ids has step N-2's token [5] (known_end=4),
+        # while step N-1's token 6 (pos 4) is still in flight in res_n1.
+        req_a.output_ids.append(5)
+        dec_n = _batch([req_a], decode=True, starts=[4])
+        prepared = coordinator.prepare_if_supported(dec_n, parallel=fake_parallel)
+        assert prepared == ([req_a], [5])
+        ev_n1.synchronize.assert_not_called()
+        hashes = coordinator.resolve()
+        ev_n1.synchronize.assert_called_once()
+        expected = hash_on_host(
+            HostEngramInputs(
+                tokens=np.asarray([[6, 5, 3]], dtype=np.int64),
+                positions=np.asarray([4], dtype=np.int64),
+            ),
+            **_tables(),
+        )
+        assert torch.equal(hashes, expected)
+        coordinator.clear_step()
+
+        # Non-recordable fallback (e.g. verify or missing seq_lens_cpu) clears
+        # stale PendingTokens rather than keeping an old step's positions.
+        assert coordinator.pending is not None
+        hooks.tpu_dsv41_engram_worker_forward(
+            lambda w, b, is_verify=False: SimpleNamespace(
+                copy_done=None, next_token_ids=None
+            ),
+            worker,
+            dec_n,
+            is_verify=True,
+        )
+        assert coordinator.pending is None
+
+        coordinator.remember([req_a], [5], res_n1)
+        no_lens_b = _batch([beam_req], decode=True, seq_lens_cpu=None)
+        no_lens_b.seq_lens_cpu = None
+        hooks.tpu_dsv41_engram_worker_forward(lambda w, b: res_n1, worker, no_lens_b)
+        assert coordinator.pending is None
+
+
+def test_fast_path_commits_hasher_history_for_fallback_decode():
+    from sglang.srt.layers.engram import EngramHasher
+    from sglang_tpu.models.deepseek_v41.engram_host import host_hash_ids
+
+    tables = _tables()
+
+    def make_real_hasher():
+        # Build a lightweight EngramHasher without loading an HF tokenizer.
+        h = EngramHasher.__new__(EngramHasher)
+        torch.nn.Module.__init__(h)
+        h.max_ngram_size = NGRAM
+        h.pad_id = tables["pad_id"]
+        h.image_token_id = 7
+        for k in ("token_map", "multipliers", "primes", "offsets"):
+            h.register_buffer(k, torch.as_tensor(tables[k], dtype=torch.int64))
+        h.history = None
+        h.pad_row = 0
+        h.init_history(num_req_slots=16, device="cpu")
+        return h
+
+    fast_hasher = make_real_hasher()
+    ref_hasher = make_real_hasher()
+    # Poison fast_hasher.history with stale tokens from prior slot occupants.
+    fast_hasher.history.fill_(5)
+    # Slot 9 belongs to a beam request that stays on the fallback path.
+    fast_hasher.history[9] = torch.tensor([2, 6], dtype=torch.int32)
+    ref_hasher.history[9] = torch.tensor([2, 6], dtype=torch.int32)
+
+    embeddings = []
+    for layer in (0, 1):
+        weight, scale = _table(rows=130, seed=layer + 3)
+        embeddings.append(
+            (
+                layer,
+                SimpleNamespace(
+                    weight=weight,
+                    scale=scale,
+                    dim=weight.shape[1],
+                    row_start=0,
+                    _shared=True,
+                    host_table=SimpleNamespace(layout="shared"),
+                    tpu_hash_index=layer,
+                ),
+            )
+        )
+    coordinator = HostEngramCoordinator(fast_hasher, embeddings, "cpu")
+
+    # 4 requests exercising: normal prompt (A), 1-token prompt pos<n-1 (B),
+    # 2-chunk prefill with prefetch hit (C), and wide 62-bit MM pad sentinel (D).
+    wide_mm_pad = (1 << 50) + 4
+    req_a = _request([1, 2, 3, 4])
+    req_b = _request([6])
+    req_c = _request([0, 1, 2, 3, 4, 5, 6, 7])
+    req_d = _request([1, wide_mm_pad, 5])
+    slots = [1, 2, 3, 4]
+
+    # Step 1: fast-path prefill for A, B, D + chunk 1 of C ([0:4]).
+    b1 = _batch(
+        [req_a, req_b, req_c, req_d],
+        starts=[0, 0, 0, 0],
+        lengths=[4, 1, 4, 3],
+        req_pool_indices_cpu=torch.tensor(slots, dtype=torch.int64),
+    )
+    coordinator.prepare(b1)
+    _, uploads1, _ = coordinator.stage_all(16)
+    coordinator.record_consumers(uploads1, [torch.tensor([1])])
+    coordinator.clear_step()
+
+    # Step 2: chunked prefill on C: chunk 1 ([0:4]) -> prefetch -> chunk 2 ([4:8]).
+    b_c1 = _batch(
+        [req_c],
+        starts=[0],
+        lengths=[4],
+        req_pool_indices_cpu=torch.tensor([3], dtype=torch.int64),
+    )
+    coordinator.prepare(b_c1)
+    _, uploads_c1, _ = coordinator.stage_all(4)
+    coordinator.record_consumers(uploads_c1, [torch.tensor([2])])
+    coordinator.finish_forward(4)
+    coordinator.clear_step()
+
+    b_c2 = _batch(
+        [req_c],
+        starts=[4],
+        lengths=[4],
+        req_pool_indices_cpu=torch.tensor([3], dtype=torch.int64),
+    )
+    coordinator.prepare(b_c2)
+    assert coordinator._staged_uploads  # prefetch hit
+    _, uploads_c2, _ = coordinator.stage_all(4)
+    coordinator.record_consumers(uploads_c2, [torch.tensor([3])])
+    coordinator.clear_step()
+
+    # Step 3: fast-path overlap decode on A (token 7 at pos 4) and B (token 2 at pos 1).
+    res_prev, _ = _result([7, 2])
+    coordinator.remember([req_a, req_b], [4, 1], res_prev)
+    b_dec_fast = _batch(
+        [req_a, req_b],
+        decode=True,
+        starts=[4, 1],
+        req_pool_indices_cpu=torch.tensor([1, 2], dtype=torch.int64),
+    )
+    coordinator.prepare(b_dec_fast)
+    _, uploads_df, _ = coordinator.stage_all(4)
+    coordinator.record_consumers(uploads_df, [torch.tensor([4])])
+    coordinator.clear_step()
+
+    # Set up reference hasher history identically from the true token histories:
+    # A ended at [..., 4, 7]; B ended at [0, 6, 2] -> last 2 = [6, 2];
+    # C ended at [..., 6, 7]; D ended at [..., wide_mm_pad, 5] (clamped to MM_PAD).
+    ref_hasher.history[1] = torch.tensor([4, 7], dtype=torch.int32)
+    ref_hasher.history[2] = torch.tensor([6, 2], dtype=torch.int32)
+    ref_hasher.history[3] = torch.tensor([6, 7], dtype=torch.int32)
+    ref_hasher.history[4] = torch.tensor(
+        ref_hasher.history_row([wide_mm_pad, 5]), dtype=torch.int32
+    )
+
+    # Step 4: fallback decode batch (e.g. beam request at slot 9 joined A, B, C, D).
+    decode_mode = SimpleNamespace(
+        is_decode=lambda: True,
+        is_target_verify=lambda: False,
+        is_extend=lambda: False,
+    )
+    fallback_fb = SimpleNamespace(
+        forward_mode=decode_mode,
+        spec_info=None,
+        positions=torch.tensor([5, 2, 8, 3, 10, 0], dtype=torch.int64),
+        req_pool_indices=torch.tensor([1, 2, 3, 4, 9, 0], dtype=torch.int64),
+        out_cache_loc=torch.tensor([10, 11, 12, 13, 14, 0], dtype=torch.int64),
+        extend_seq_lens=None,
+        extend_start_loc=None,
+        engram_history=None,
+    )
+    next_ids = torch.tensor([3, 5, 1, 2, 4, 0], dtype=torch.int64)
+    fast_out = host_hash_ids(fast_hasher, next_ids, fallback_fb)
+    ref_out = host_hash_ids(ref_hasher, next_ids, fallback_fb)
+    assert torch.equal(fast_out, ref_out)
+    assert torch.equal(
+        fast_hasher.history[[1, 2, 3, 4, 9]], ref_hasher.history[[1, 2, 3, 4, 9]]
+    )
+
+
+def test_direct_tracer_carrying_packed_engram_tensors_end_to_end():
+    """Direct tracer carries packed int32 staged tensors via attention metadata."""
+    from unittest import mock
+
+    from sglang_tpu.models.deepseek_v41 import compile_policy, hooks
+    from sglang_tpu.models.deepseek_v41.engram_host import (
+        local_row_ids,
+        pack_rows,
+        unpack_rows,
+    )
+
+    weight, scale = _table(rows=40, seed=19)
+    indices = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.int64)
+    packed = pack_rows(weight, scale, indices, row_start=0, padded_tokens=4)
+    ids = local_row_ids(4, 1, 4, "cpu")
+    metadata = SimpleNamespace(engram=None)
+    ctx = SimpleNamespace(attn_backend=SimpleNamespace(forward_metadata=metadata))
+    embedding = SimpleNamespace(
+        dim=weight.shape[1],
+        tpu_hash_index=0,
+        host_table=SimpleNamespace(layout="shared"),
+    )
+
+    def fake_compiled_fn(input_ids, positions, forward_batch):
+        # Direct tracer rebuilds ForwardBatch from dataclass fields only,
+        # dropping the non-dataclass staging attributes.
+        rebuilt = SimpleNamespace(tpu_engram_local_ids=None, tpu_engram_staged=None)
+        got_ids = hooks.tpu_dsv41_hasher_forward(
+            lambda *a, **k: None, "hasher", input_ids, rebuilt
+        )
+        # Simulate non-CPU device check by calling staged_lookup through hook
+        # with metadata fallback (rebuilt has None staging attrs).
+        out = hooks.tpu_dsv41_engram_embed_forward(
+            lambda *a, **k: None, embedding, ids[:, 0], rebuilt
+        )
+        return got_ids, out
+
+    carried = compile_policy._carrying_engram(fake_compiled_fn)
+    fb = SimpleNamespace(tpu_engram_local_ids=ids, tpu_engram_staged=(packed,))
+    with (
+        mock.patch.object(compile_policy, "get_forward_context", return_value=ctx),
+        mock.patch(
+            "sglang.srt.model_executor.forward_context.has_forward_context",
+            return_value=True,
+        ),
+        mock.patch(
+            "sglang.srt.model_executor.forward_context.get_forward_context",
+            return_value=ctx,
+        ),
+    ):
+        _, out = carried(torch.zeros(4, dtype=torch.int64), torch.arange(4), fb)
+
+    assert metadata.engram is not None
+    assert metadata.engram[0] is ids
+    assert metadata.engram[1] == (packed,)
+    assert metadata.engram[1][0] is packed
+    assert torch.equal(out, unpack_rows(packed, tokens=4, heads=4, dim=weight.shape[1]))
 
 
 if __name__ == "__main__":
