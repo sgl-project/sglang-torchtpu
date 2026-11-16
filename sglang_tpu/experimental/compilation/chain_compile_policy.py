@@ -231,11 +231,20 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         return call
 
     def _draft_forward_specialization_key(
-        self, *args: Any, **kwargs: Any
+        self,
+        attention_metadata: Any,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *args: Any,
+        **kwargs: Any,
     ) -> tuple[Any, ...]:
-        forward_batch = kwargs.get("forward_batch", args[3] if len(args) > 3 else None)
+        # Same arguments as trace(): (attention_metadata, input_ids, positions,
+        # forward_batch, ...).
         return (
-            *self._direct_compile_specialization_key(*args, **kwargs),
+            *self._direct_compile_specialization_key(
+                attention_metadata, input_ids, positions, forward_batch, *args, **kwargs
+            ),
             kwargs.get("input_embeds") is not None,
             _publishes_dsa_topk(forward_batch),
         )

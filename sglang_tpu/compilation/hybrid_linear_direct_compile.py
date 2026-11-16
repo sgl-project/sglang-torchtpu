@@ -98,7 +98,7 @@ def _conv_weight_owners(
             # direct_compile already reparametrizes; nothing to re-derive.
             continue
         parent = modules[name.rpartition(".")[0]]
-        # GDN models call it conv1d; GLM-5.3-Flash's KDA layer fuses q/k/v into qkv_conv1d.
+        # GDN layers call it conv1d; KDA layers fuse q/k/v into qkv_conv1d.
         conv_name = next(
             (n for n in _CONV_SUBMODULE_NAMES if hasattr(parent, n)), None
         )

@@ -644,7 +644,7 @@ class CompiledFunction:
         for input_index in range(kv_pool_input_start, kv_pool_input_stop):
             trace_inputs[input_index] = graph_inputs[input_index].clone()
         kv_pool_trace_inputs = trace_inputs[kv_pool_input_start:kv_pool_input_stop]
-        mutated_leaf_positions: list[int] = []
+        mutated_leaf_positions: set[int] = set()
         for position, (input_index, leaf_index) in enumerate(
             zip(
                 range(kv_pool_input_stop, kv_pool_input_stop + len(tensor_leaf_indices)),
@@ -655,7 +655,7 @@ class CompiledFunction:
                 # Trace in-place writes on a clone: a mutated placeholder would
                 # carry deferred ops into argument binding.
                 trace_inputs[input_index] = graph_inputs[input_index].clone()
-                mutated_leaf_positions.append(position)
+                mutated_leaf_positions.add(position)
             trace_leaves[leaf_index] = trace_inputs[input_index]
         explicit_trace_inputs = trace_inputs[
             kv_pool_input_stop : kv_pool_input_stop + len(tensor_leaf_indices)
@@ -763,11 +763,13 @@ class CompiledFunction:
                 spmd_compiler=spmd_compiler,
                 graph=graph,
             )
+        # Paths and graph outputs must line up; keep them in input order.
+        ordered_mutated_positions = sorted(mutated_leaf_positions)
         mutated_input_paths = tuple(
-            tensor_inputs_key_paths[position] for position in mutated_leaf_positions
+            tensor_inputs_key_paths[position] for position in ordered_mutated_positions
         )
         mutated_trace_inputs = [
-            explicit_trace_inputs[position] for position in mutated_leaf_positions
+            explicit_trace_inputs[position] for position in ordered_mutated_positions
         ]
 
         output_leaves, output_treespec = tree_util.tree_flatten(outputs)
