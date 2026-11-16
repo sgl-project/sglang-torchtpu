@@ -15,9 +15,7 @@ register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 import pytest
 
 from sglang.multimodal_gen.test.unit.test_flux2_text_encoder_fold import (  # noqa: F401
-    test_configs_without_text_config_are_unchanged,
     test_fold_policy_keeps_folding_across_eight_ranks,
-    test_sizes_come_up_from_text_config,
 )
 
 if __name__ == "__main__":

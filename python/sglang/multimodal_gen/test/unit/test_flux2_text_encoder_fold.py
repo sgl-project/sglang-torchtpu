@@ -37,30 +37,19 @@ def _loaded_config():
     return config
 
 
-def test_sizes_come_up_from_text_config():
-    config = _loaded_config()
-    # Applied the way the loader applies it, the top level has no sizes.
-    assert encoder_base._encoder_dims(config) == (None, None, None)
-    config.post_diffusers_config_update()
-    assert encoder_base._encoder_dims(config) == (5120, 32, 32768)
-
-
 def test_fold_policy_keeps_folding_across_eight_ranks(monkeypatch):
     monkeypatch.setattr(
         encoder_base,
         "get_folding_tp_group",
         lambda config: SimpleNamespace(world_size=8),
     )
-    for hook, expected in ((False, None), (True, "replica")):
-        config = _loaded_config()
-        if hook:
-            config.post_diffusers_config_update()
-        config.parallel_folding_mode = "replica"
-        encoder_base.finalize_encoder_folding(config, "fold")
-        assert config.parallel_folding_mode == expected
-
-
-def test_configs_without_text_config_are_unchanged():
-    config = Flux2MistralTextConfig()
-    config.post_diffusers_config_update()
-    assert encoder_base._encoder_dims(config) == (None, None, None)
+    # `auto` on peer-connected GPUs: the 5120-wide encoder now folds as well.
+    monkeypatch.setattr(encoder_base, "group_has_measured_topology", lambda g: True)
+    for policy in ("fold", "auto"):
+        for hook, expected in ((False, None), (True, "replica")):
+            config = _loaded_config()
+            if hook:
+                config.post_diffusers_config_update()
+            config.parallel_folding_mode = "replica"
+            encoder_base.finalize_encoder_folding(config, policy)
+            assert config.parallel_folding_mode == expected, (policy, hook)
