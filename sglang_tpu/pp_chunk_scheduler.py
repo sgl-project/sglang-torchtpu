@@ -28,6 +28,7 @@ from sglang_tpu.pp_chunks import (
     chunk_granularity,
     longest_prompt,
     profile_points,
+    stage_min_samples,
     uses_dynamic_chunks,
 )
 
@@ -43,8 +44,10 @@ def pending_step_limit(scheduler: Scheduler) -> int:
     Outstanding work is the unscheduled tokens of waiting and partial
     requests plus the chunks launched into the pipeline whose results have
     not come back. A lone prompt still splits into one chunk per stage; under
-    load the chunks grow with the work already in flight, since every stage
-    advances in lockstep at the pace of the largest chunk in the pipeline.
+    load the chunks grow with the work already in flight. Every stage runs
+    every chunk, so a costly chunk already in the pipeline lengthens the
+    pipeline's fill and drain; under the lockstep wave the slowest forward of
+    each wave also holds back the other stages.
     """
     cost = scheduler._tpu_pp_chunk_cost
     requests = list(scheduler.waiting_queue)
@@ -239,17 +242,21 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
             policy._run_one(**kwargs)
             elapsed = min(policy._run_one(**kwargs) for _ in range(2))
             samples.append((tokens, prefix, elapsed))
-    # Every rank fits one model from every rank's samples, so the devices of a
-    # multi-device stage admit the same chunks.
+    # Every rank fits one model from every rank's samples (the fastest device of
+    # each stage, then the slowest stage), so the devices of a multi-device stage
+    # admit the same chunks.
     # TODO(yinlin09): all schedulers of a stage must pick identical chunks each step;
     # let the stage leader decide and broadcast, or check agreement in the stage.
     reports = [None] * scheduler.world_group.world_size
     torch.distributed.all_gather_object(
-        reports, (samples, schedule), group=scheduler.world_group.cpu_group
+        reports,
+        (get_parallel().pp_rank, samples, schedule),
+        group=scheduler.world_group.cpu_group,
     )
-    schedules = [report[1] for report in reports if report[1] is not None]
+    schedules = [report[2] for report in reports if report[2] is not None]
+    stage_samples = stage_min_samples([(stage, timed) for stage, timed, _ in reports])
     cost = StepCostModel.fit(
-        [report[0] for report in reports],
+        stage_samples,
         envs.SGLANG_TPU_PP_CHUNK_SLACK.get(),
         granularity,
         min(schedules) if schedules else None,
@@ -268,4 +275,11 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     scheduler._tpu_pp_chunk_cost = cost
     # Cached prefix tokens of each waiting request, matched once.
     scheduler._tpu_pp_cached_prefix = {}
-    logger.info("TPU pipeline chunks: %s; stage samples %s", cost.describe(), samples)
+    if get_parallel().pp_rank == 0 and get_parallel().tp_rank == 0:
+        # Every rank installs the same model.
+        logger.info(
+            "TPU pipeline chunks: %s; stage samples %s", cost.describe(), stage_samples
+        )
+        logger.debug(
+            "TPU pipeline chunks: (stage, samples, schedule) per rank %s", reports
+        )
