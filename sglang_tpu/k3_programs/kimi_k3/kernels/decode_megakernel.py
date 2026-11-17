@@ -2765,7 +2765,9 @@ class AttentionCommunicationWorkspace:
     latent_gather_vmem: Any  # [batch_size, 4096]
     projection_staging_vmem: Any = None  # above B32: [2, 4 * payload, 128] BF16
     routed_send_vmem: Any = None  # above B32: [8 * lane payload, 128] FP32
-    attention_gather_vmem: Any = None  # B4: private final-gather packets
+    # B4: private final-gather packets; rank rows at B8: the MoE input
+    # gather's wires ([8, 32, 128] FP32).
+    attention_gather_vmem: Any = None
 
 
 class _ScopedWait:
@@ -5362,6 +5364,7 @@ def kda(
     synchronize_devices: bool = True,
     weights_are_prefetched: bool = False,
     token_scatter_output: bool = False,
+    rank_rows: bool = False,
     sequence_rows: int = 1,
     wait_for_state=None,
     on_state_updated=None,
@@ -5381,6 +5384,9 @@ def kda(
 
     ``streams`` optionally maps "input" and "output" to ChunkedWeightStreams
     that own the copies of those projections.
+
+    ``rank_rows`` (token scatter at 8 and 16 rows): the output projection
+    leaves each rank its own half of its pair's rows (_project_attention_2d).
 
     Attention DP runs one call per held TP32 shard (``shard_index``);
     ``attended_out`` ([batch, 384]) receives its gated features for the
@@ -5876,6 +5882,7 @@ def kda(
                 communication_workspace.reduction_phase,
                 _dot,
                 token_scatter_output=token_scatter_output,
+                rank_rows=rank_rows,
                 weight_stream=output_stream,
                 staging=communication_workspace.projection_staging_vmem,
                 gather_wire=communication_workspace.attention_gather_vmem,
@@ -6007,6 +6014,7 @@ def mla(
     synchronize_devices: bool = True,
     weights_are_prefetched: bool = False,
     token_scatter_output: bool = False,
+    rank_rows: bool = False,
     sequence_rows: int = 1,
     output_projection_after_query_down: bool = False,
     streams: dict | None = None,
@@ -6024,6 +6032,7 @@ def mla(
 
     ``streams`` optionally maps "query_up", "key_value_up", "output_gate" and
     "output" to ChunkedWeightStreams that own those projections' copies.
+    ``rank_rows``: as for :func:`kda`.
 
     Attention DP runs :func:`mla_dcp_shards` instead.
 
@@ -6384,6 +6393,7 @@ def mla(
                 communication_workspace.reduction_phase,
                 _dot,
                 token_scatter_output=token_scatter_output,
+                rank_rows=rank_rows,
                 weight_stream=output_stream,
                 staging=communication_workspace.projection_staging_vmem,
                 gather_wire=communication_workspace.attention_gather_vmem,
@@ -6569,6 +6579,18 @@ B4_ATTENTION_GATHER = _config().b4_attention_gather
 # (KernelConfig.attention_host_bf16). Each rank rounds its own host's slot
 # as well, so all four hosts add the same BF16 values in the same order.
 ATTENTION_HOST_BF16 = _config().attention_host_bf16
+# Token-scattered 8- and 16-row steps with four row owners: each rank reduces
+# its own half of its pair's rows (KernelConfig.attention_rank_rows; the stack
+# decides per step and passes ``rank_rows``).
+ATTENTION_RANK_ROWS = _config().attention_rank_rows
+# Communication-workspace DMA semaphores of the rank-row layout, each signalled
+# by one round only: the output projection's local round, the eight-rank MoE
+# input gather and the prefix rows' copy to the pair peer (q9 to q0). The
+# other rounds of these steps use 0..11 (12..15 serve only the unscattered
+# and attention DP paths).
+RANK_ROWS_LOCAL_SEMAPHORE = 12
+RANK_ROWS_GATHER_SEMAPHORE = 13
+RANK_ROWS_PREFIX_SEMAPHORE = 14
 
 
 def _project_attention_2d(
@@ -6586,18 +6608,32 @@ def _project_attention_2d(
     dot,
     *,
     token_scatter_output=False,
+    rank_rows=False,
     weight_stream=None,
     staging=None,
     gather_wire=None,
 ):
     """``weight_stream`` (optional) is a row ChunkedWeightStream of ``weight``
-    whose positions 0 and 1 are this rank's and its pair peer's feature rows."""
+    whose positions 0 and 1 are this rank's and its pair peer's feature rows.
+
+    ``rank_rows`` (token scatter at 8 or 16 rows): rank ``2p + q`` of a host
+    ends with rows ``q r .. q r + r - 1`` of pair ``p``'s ``2 r`` rows at full
+    width in ``output_backing`` (``r`` = batch / 8) instead of all of the
+    pair's rows. Its local round sends each local rank that rank's rows of
+    this rank's column half (seven copies on one semaphore), so each rank adds
+    both halves' four pair partials for its own rows; the host round is
+    unchanged and the pair half-swap is dropped. Every element sums the same
+    BF16 partials in the same pair and host order."""
     rank = jax.lax.axis_index("tp")
     slot = phase[0] % 2
     batch_size = attended.shape[0]
     ordered_full_output = (
         B4_ATTENTION_GATHER and batch_size == 4 and not token_scatter_output
     )
+    if rank_rows and not (
+        token_scatter_output and batch_size in (8, 16) and staging is None
+    ):
+        raise ValueError("Rank rows are token-scattered 8- and 16-row steps")
     width = attended.shape[-1]
     g = weight.shape[0] // width
     assert g == 2
@@ -6675,8 +6711,10 @@ def _project_attention_2d(
                 .reshape(4, payload_rows, 128)
             )
             # ``output`` is backed by a native 16-row allocation; only the
-            # rows owned by this local pair are live during the reduction.
-            owned_output = _bf16_rows_view(output_backing, tokens_per_pair, h)
+            # rows owned by this local pair (or rank) are live during the
+            # reduction.
+            owned_rows = tokens_per_pair // 2 if rank_rows else tokens_per_pair
+            owned_output = _bf16_rows_view(output_backing, owned_rows, h)
             for target_pair in range(4):
                 if tokens_per_pair == 1:
                     partial = comm[target_pair, :half][None, :]
@@ -6688,22 +6726,54 @@ def _project_attention_2d(
                 local_send[target_pair] = partial.astype(jnp.bfloat16).reshape(
                     payload_rows, 128
                 )
-            local_receive[pair] = local_send[pair]
-            local_copies = []
-            for offset in range(3, 0, -1):
-                target_pair = pair ^ offset
-                copy = tpu.make_async_remote_copy(
-                    local_send.at[target_pair],
-                    local_receive.at[pair],
-                    sends.at[offset - 1],
-                    recvs.at[offset - 1],
-                    device_id=(rank ^ (2 * offset),),
-                    device_id_type=pl.DeviceIdType.MESH,
-                )
-                copy.start()
-                local_copies.append(copy)
-            for copy in local_copies:
-                copy.wait()
+            if rank_rows:
+                # Target pair p's slot holds its rows in order; rank 2p + q
+                # owns the q-th half of them. Each rank receives, from every
+                # local rank, its own rows of the sender's column half: source
+                # pair, then the sender's half (lane_payload rows each), so
+                # the four-pair sum gives the rows' halves in column order.
+                lane_payload = payload_rows // 2
+                for lane in range(2):
+
+                    @pl.when(parity == lane)
+                    def send_rank_rows(lane=lane):
+                        own = pl.ds(lane * lane_payload, lane_payload)
+                        local_receive[pair, own, :] = local_send[pair, own, :]
+                        copies = []
+                        for offset in range(7, 0, -1):
+                            target_half = pl.ds(
+                                (lane ^ (offset & 1)) * lane_payload, lane_payload
+                            )
+                            copy = tpu.make_async_remote_copy(
+                                local_send.at[pair ^ (offset >> 1), target_half],
+                                local_receive.at[pair, own],
+                                sends.at[RANK_ROWS_LOCAL_SEMAPHORE],
+                                recvs.at[RANK_ROWS_LOCAL_SEMAPHORE],
+                                device_id=(rank ^ offset,),
+                                device_id_type=pl.DeviceIdType.MESH,
+                            )
+                            copy.start()
+                            copies.append(copy)
+                        for copy in copies:
+                            copy.wait()
+
+            else:
+                local_receive[pair] = local_send[pair]
+                local_copies = []
+                for offset in range(3, 0, -1):
+                    target_pair = pair ^ offset
+                    copy = tpu.make_async_remote_copy(
+                        local_send.at[target_pair],
+                        local_receive.at[pair],
+                        sends.at[offset - 1],
+                        recvs.at[offset - 1],
+                        device_id=(rank ^ (2 * offset),),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    copy.start()
+                    local_copies.append(copy)
+                for copy in local_copies:
+                    copy.wait()
 
             if ordered_full_output:
                 # Host h owns rank-pair lanes 4*h .. 4*h+3. Transport those
@@ -6758,32 +6828,48 @@ def _project_attention_2d(
                         jnp.bfloat16,
                     ).astype(jnp.float32)
                 reduced_half = jnp.sum(host_sums, axis=0).astype(jnp.bfloat16)
-            pair_send = local.at[2].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]
-            pair_receive = (
-                local.at[3].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]
-            )
-            pair_send[...] = reduced_half
-            pair_copy = tpu.make_async_remote_copy(
-                pair_send,
-                pair_receive,
-                sends.at[6],
-                recvs.at[6],
-                device_id=(rank ^ 1,),
-                device_id_type=pl.DeviceIdType.MESH,
-            )
-            pair_copy.start()
-            pair_copy.wait()
-            sent_half = pair_send[...].reshape(tokens_per_pair, half)
-            received_half = pair_receive[...].reshape(tokens_per_pair, half)
-            owned_output[:, :half] = jnp.where(parity == 0, sent_half, received_half)
-            owned_output[:, half:] = jnp.where(parity == 0, received_half, sent_half)
-            if ordered_full_output:
-                # Full-batch rows for residual mixing and MoE; the packets are
-                # private since peers may be a phase apart.
-                assert gather_wire is not None
-                _gather_local_pair_rows(
-                    owned_output, out, sends, recvs, gather_wire, owners=4
+            if rank_rows:
+                # This rank's rows: column half 0, then half 1.
+                lane_payload = payload_rows // 2
+                owned_output[:, :half] = reduced_half[:lane_payload].reshape(
+                    owned_rows, half
                 )
+                owned_output[:, half:] = reduced_half[lane_payload:].reshape(
+                    owned_rows, half
+                )
+            else:
+                pair_send = (
+                    local.at[2].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]
+                )
+                pair_receive = (
+                    local.at[3].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]
+                )
+                pair_send[...] = reduced_half
+                pair_copy = tpu.make_async_remote_copy(
+                    pair_send,
+                    pair_receive,
+                    sends.at[6],
+                    recvs.at[6],
+                    device_id=(rank ^ 1,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                pair_copy.start()
+                pair_copy.wait()
+                sent_half = pair_send[...].reshape(tokens_per_pair, half)
+                received_half = pair_receive[...].reshape(tokens_per_pair, half)
+                owned_output[:, :half] = jnp.where(
+                    parity == 0, sent_half, received_half
+                )
+                owned_output[:, half:] = jnp.where(
+                    parity == 0, received_half, sent_half
+                )
+                if ordered_full_output:
+                    # Full-batch rows for residual mixing and MoE; the packets are
+                    # private since peers may be a phase apart.
+                    assert gather_wire is not None
+                    _gather_local_pair_rows(
+                        owned_output, out, sends, recvs, gather_wire, owners=4
+                    )
         else:
             rows = ((half + 255) // 256) * 2
             payload = rows // 2
@@ -7472,20 +7558,37 @@ def _gather_sp8_dp_moe_rows(row, owned_out, out, local, sends, recvs):
 
 
 def _gather_local_pair_rows(
-    source, destination, sends, recvs, scratch=None, owners=4, *, packed=False
+    source,
+    destination,
+    sends,
+    recvs,
+    scratch=None,
+    owners=4,
+    *,
+    packed=False,
+    semaphore=None,
+    transpose_wires=False,
 ):
     """All-gather the token shards of the ``owners`` local row owners.
 
     Owner o (4: the local rank pairs; 8: the local ranks) holds rows
     o * r .. o * r + r - 1 in ``source`` [r, hidden]; every rank ends with all
     of them in ``destination``. Each rank sends to its counterpart in every
-    other owner (rank ^ k * 8 / owners). ``packed`` stages through flat
-    transport wires when a source row slice crosses a native BF16 tile.
+    other owner (rank ^ k * 8 / owners) on semaphore k - 1, or on the one
+    ``semaphore`` given. ``packed`` stages through flat transport wires when a
+    source row slice crosses a native BF16 tile. ``transpose_wires`` assembles
+    one-row wires through FP32 (one owner's 128 columns a vreg row, then an
+    owner/column swap) instead of BF16 reshapes: fewer sublane permutes, the
+    same bits.
     """
     rank = jax.lax.axis_index("tp")
     stride = 8 // owners
     owner = (rank % 8) // stride
     rows_per_owner = source.shape[0]
+
+    def semaphore_index(offset):
+        return offset - 1 if semaphore is None else semaphore
+
     # One row, or a row count whose slice is not tile-aligned for a DMA
     # (3, 5, 6, 7 rows at B12..B28): send a flattened wire through the
     # transport scratch and assemble the destination from values.
@@ -7501,8 +7604,8 @@ def _gather_local_pair_rows(
             copy = tpu.make_async_remote_copy(
                 source_wire,
                 source_wire,
-                sends.at[offset - 1],
-                recvs.at[offset - 1],
+                sends.at[semaphore_index(offset)],
+                recvs.at[semaphore_index(offset)],
                 device_id=(rank ^ (stride * offset),),
                 device_id_type=pl.DeviceIdType.MESH,
             )
@@ -7514,7 +7617,16 @@ def _gather_local_pair_rows(
             scratch.at[source_owner].bitcast(jnp.bfloat16)[:payload_rows]
             for source_owner in range(owners)
         )
-        if rows_per_owner == 1:
+        if rows_per_owner == 1 and transpose_wires:
+            # [owners, payload_rows, 128] -> [payload_rows, owners, 128]: each
+            # 128-column block of the destination is one vreg of every row.
+            columns = jnp.swapaxes(
+                jnp.stack(tuple(wire.astype(jnp.float32) for wire in wires)), 0, 1
+            )
+            destination[...] = jnp.concatenate(
+                tuple(columns[block] for block in range(payload_rows)), axis=1
+            ).astype(destination.dtype)
+        elif rows_per_owner == 1:
             destination[...] = jnp.stack(
                 tuple(wire.reshape(source.shape[1]) for wire in wires)
             )
@@ -7535,8 +7647,8 @@ def _gather_local_pair_rows(
                 copy = tpu.make_async_remote_copy(
                     source,
                     destination.at[row_slice],
-                    sends.at[offset - 1],
-                    recvs.at[offset - 1],
+                    sends.at[semaphore_index(offset)],
+                    recvs.at[semaphore_index(offset)],
                     device_id=(rank ^ (stride * offset),),
                     device_id_type=pl.DeviceIdType.MESH,
                 )
@@ -8370,6 +8482,25 @@ def stack(
     # The router splits its columns over each rank pair, so the top-k shards
     # over pairs: four row owners.
     shard_routing = shard_routing and moe_token_scatter_output and sp_owners == 4
+    # KernelConfig.attention_rank_rows: with four row owners at 8 and 16 rows,
+    # each rank of a pair reduces, mixes and normalizes its own owned_rows / 2
+    # of the pair's rows (the output projection drops the pair half-swap), the
+    # MoE input gathers from the eight local ranks, and each rank sends its
+    # updated prefix rows to its pair peer for the MoE output's addition. The
+    # MoE, the pre-attention rows and the epilogue keep the pair layout (the
+    # sharded router reads the pair's mixed rows, so it keeps the pair path).
+    attention_rank_rows = (
+        ATTENTION_RANK_ROWS
+        and attention_token_scatter
+        and moe_token_scatter_output
+        and sequence_parallel_pre_attention
+        and attention_dp == 1
+        and sp_owners == 4
+        and batch_size in (8, 16)
+        and not shard_routing
+    )
+    # One row a rank (8 rows): the gather's rows travel as flat wires.
+    rank_row_wires = attention_rank_rows and owned_rows == 2
     if attention_schedule not in ("auto", "pooled", "legacy", "overlap"):
         raise ValueError("attention_schedule must be auto, pooled, legacy, or overlap")
     if attention_dp not in (1, 2, 4):
@@ -8493,7 +8624,9 @@ def stack(
     # Only where the pair peer's t10 gather cannot still be reading the
     # shared-reduction buffer this rank writes next (the score exchange's wait
     # ordered it): attention DP1 without token scatter, or token scatter with a
-    # power-of-two count of at least two rows per owner (the direct t10 path).
+    # power-of-two count of at least two rows per owner (the direct t10 path;
+    # with rank rows, the eight-rank gather lands in place at 16 rows and its
+    # 8-row wires are private storage).
     both_halves_ordered = attention_dp == 1 and (
         not attention_token_scatter
         or (owned_rows >= 2 and owned_rows & (owned_rows - 1) == 0)
@@ -8752,7 +8885,7 @@ def stack(
         else:
             headroom_pad = None
         gather_wire = None
-        if b4_attention_gather:
+        if b4_attention_gather or rank_row_wires:
             *common, gather_wire = common
         communication_workspace = AttentionCommunicationWorkspace(
             *common, attention_gather_vmem=gather_wire
@@ -9040,6 +9173,67 @@ def stack(
                 row = row % block_rows_held  # owned rows are held locally
                 return blocks_vmem[row // 2, pl.ds((row % 2) * 8, count)]
             return blocks_vmem[row] if count == 8 else blocks_vmem[row, :count]
+
+        # KernelConfig.attention_rank_rows: this rank's owned_rows / 2 rows of
+        # its pair's. The projection leaves them at the start of the attention
+        # output; their mixed and normalized MoE input rows replace them there
+        # at 8 rows (one row) and take owned_rows_vmem's first rows at 16 (one
+        # row stored at a time, as the pair layout does). At 8 rows the pair
+        # peer's row pair (its own row updated) lands in the attention output's
+        # last native row pair, which 8-row steps leave unused.
+        rank_attention_vmem = rank_mixed_vmem = rank_prefix_wire = None
+        if attention_rank_rows:
+            attention_output = communication_workspace.attention_output_vmem
+            rank_attention_vmem = _bf16_rows_view(
+                attention_output, owned_rows // 2, hidden_size
+            )
+            if rank_row_wires:
+                rank_mixed_vmem = rank_attention_vmem
+                rank_prefix_wire = attention_output.at[pl.ds(14, 2)]
+            else:
+                rank_mixed_vmem = owned_rows_vmem
+
+        def rank_prefix_copy(source):
+            """This rank's updated prefix rows to its pair peer (semaphore
+            RANK_ROWS_PREFIX_SEMAPHORE, waited before the MoE output's
+            addition): two rows in place; one row as the pair's native row
+            pair into the peer's prefix wire."""
+            return tpu.make_async_remote_copy(
+                source,
+                rank_prefix_wire if rank_row_wires else source,
+                communication_workspace.send_semaphores.at[RANK_ROWS_PREFIX_SEMAPHORE],
+                communication_workspace.receive_semaphores.at[
+                    RANK_ROWS_PREFIX_SEMAPHORE
+                ],
+                device_id=(jax.lax.axis_index("tp") ^ 1,),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+
+        def wait_rank_prefix_copy():
+            view = (
+                rank_prefix_wire
+                if rank_row_wires
+                else prefix_vmem.at[pl.ds(0, owned_rows // 2)]
+            )
+            for semaphores in (
+                communication_workspace.send_semaphores,
+                communication_workspace.receive_semaphores,
+            ):
+                tpu.make_async_copy(
+                    view, view, semaphores.at[RANK_ROWS_PREFIX_SEMAPHORE]
+                ).wait()
+
+        def rank_block_rows(owner_pair, parity, local_row):
+            """The snapshots of this rank's ``local_row``-th row (the pair's row
+            ``parity * owned_rows / 2 + local_row``; block-major above 8 rows,
+            where a rank's two rows share one block row)."""
+            rows = owned_rows // 2
+            if blocks_block_major:
+                return blocks_vmem[
+                    (owner_pair * owned_rows + local_row) // 2 + parity * (rows // 2),
+                    pl.ds((local_row % 2) * 8, 8),
+                ]
+            return blocks_vmem[owner_pair * owned_rows + parity * rows + local_row]
 
         def residual(destination, folded, active_block_count):
             _residual_mixture_by_row(
@@ -9956,6 +10150,7 @@ def stack(
                             synchronize_devices=False,
                             weights_are_prefetched=True,
                             token_scatter_output=attention_token_scatter,
+                            rank_rows=attention_rank_rows,
                             sequence_rows=sequence_rows,
                             wait_for_state=(
                                 wait_for_state if overlap_kda_state_reads else None
@@ -10165,6 +10360,7 @@ def stack(
                             synchronize_devices=False,
                             weights_are_prefetched=True,
                             token_scatter_output=attention_token_scatter,
+                            rank_rows=attention_rank_rows,
                             sequence_rows=sequence_rows,
                             streams=kda_streams(state_index, attention_base),
                             state_stream=state_stream,
@@ -10346,6 +10542,7 @@ def stack(
                         synchronize_devices=False,
                         weights_are_prefetched=True,
                         token_scatter_output=attention_token_scatter,
+                        rank_rows=attention_rank_rows,
                         sequence_rows=sequence_rows,
                     )
                     if attention_dp > 1:
@@ -10510,6 +10707,106 @@ def stack(
                 _phase_end(post_scope)
                 with _phase("t10_moe_input_gather"):
                     gather_dp_rows(normalized_vmem, split=sp8_residual)
+            elif attention_rank_rows:
+                rank = jax.lax.axis_index("tp")
+                pair, parity = (rank % 8) // 2, rank % 2
+                rows = owned_rows // 2
+
+                for owner_pair in owner_indices(pair):
+
+                    @owner_when(pair, owner_pair)
+                    def prepare_rank_rows(owner_pair=owner_pair):
+                        # This rank's rows of the pair's: the projection's
+                        # rows, the prefix rows (both pair rows are held).
+                        pair_slice = pl.ds(owner_pair * owned_rows, owned_rows)
+                        prefix_pair = prefix_vmem[pair_slice]
+                        prefix_rows = jnp.where(
+                            parity == 0, prefix_pair[:rows], prefix_pair[rows:]
+                        )
+                        attention_rows = rank_attention_vmem[...]
+                        updated_prefix = jnp.where(
+                            layer_index % 12 == 0,
+                            attention_rows,
+                            prefix_rows + attention_rows,
+                        ).astype(jnp.bfloat16)
+                        if rank_row_wires:
+                            # One row: rewrite the pair's native row pair and
+                            # send it whole; the peer keeps the other row.
+                            row_indices = jax.lax.broadcasted_iota(
+                                jnp.int32, prefix_pair.shape, 0
+                            )
+                            prefix_vmem[pair_slice] = jnp.where(
+                                row_indices == parity,
+                                jnp.broadcast_to(updated_prefix, prefix_pair.shape),
+                                prefix_pair,
+                            )
+                            rank_prefix_copy(prefix_vmem.at[pair_slice]).start()
+                        else:
+                            for lane in range(2):
+
+                                @pl.when(parity == lane)
+                                def store_rank_prefix(lane=lane):
+                                    own = pl.ds(
+                                        owner_pair * owned_rows + lane * rows, rows
+                                    )
+                                    prefix_vmem[own] = updated_prefix
+                                    rank_prefix_copy(prefix_vmem.at[own]).start()
+
+                        def mix_row(local_row):
+                            if rank_row_wires:
+                                prefix_row = updated_prefix
+                            else:
+                                # Stored above; re-read inside the row region.
+                                first = owner_pair * owned_rows + local_row
+                                prefix_row = jnp.where(
+                                    parity == 0,
+                                    prefix_vmem[pl.ds(first, 1)],
+                                    prefix_vmem[pl.ds(first + rows, 1)],
+                                )
+                            return _residual_mixture_row(
+                                rank_block_rows(owner_pair, parity, local_row),
+                                prefix_row,
+                                mlp_residual_vmem,
+                                layer_index // 12 + 1,
+                                epsilon=eps,
+                                relaxed_reduction_order=(
+                                    residual_reduction_order == "relaxed"
+                                ),
+                            )
+
+                        with _phase("q9b_post_rows"):
+                            if rank_row_wires:
+                                store_mixed_rows(mix_row, rank_mixed_vmem)
+                            else:
+                                # Two rows: each in its own region, as the pair
+                                # layout does above two rows (one row's
+                                # snapshots live at a time).
+                                for local_row in range(rows):
+
+                                    @pl.when(
+                                        communication_workspace.reduction_phase[0] >= 0
+                                    )
+                                    def store_rank_row(local_row=local_row):
+                                        rank_mixed_vmem[pl.ds(local_row, 1)] = mix_row(
+                                            local_row
+                                        )
+
+                # At 16 rows the norm covers owned_rows_vmem's spare rows too
+                # (per-row; they are never sent).
+                normalize(rank_mixed_vmem, ffn_norm_vmem)
+                _phase_end(post_scope)
+                t10 = _phase_start("t10_moe_input_gather")
+                _gather_local_pair_rows(
+                    rank_mixed_vmem if rank_row_wires else owned_rows_vmem.at[:rows],
+                    normalized_vmem,
+                    communication_workspace.send_semaphores,
+                    communication_workspace.receive_semaphores,
+                    communication_workspace.attention_gather_vmem,
+                    owners=8,
+                    semaphore=RANK_ROWS_GATHER_SEMAPHORE,
+                    transpose_wires=True,
+                )
+                _phase_end(t10)
             elif attention_token_scatter:
                 rank = jax.lax.axis_index("tp")
                 pair = (rank % 8) // (8 // sp_owners)
@@ -11062,6 +11359,9 @@ def stack(
                 scattered_mixture = (
                     owned_rows_vmem[...] if moe_token_scatter_output else None
                 )
+                if attention_rank_rows:
+                    # The pair peer's updated prefix rows (sent in q9).
+                    wait_rank_prefix_copy()
                 if owned_rows == 1:
                     prefix_values = prefix_vmem[...]
                     if not moe_token_scatter_output:
@@ -11083,8 +11383,19 @@ def stack(
                             ).astype(jnp.bfloat16)
                         else:
                             row_slice = pl.ds(owner_start(row_offset), owned_rows)
+                            prefix_rows = prefix_vmem[row_slice]
+                            if rank_row_wires:
+                                # The peer's row from its row pair.
+                                row_indices = jax.lax.broadcasted_iota(
+                                    jnp.int32, prefix_rows.shape, 0
+                                )
+                                prefix_rows = jnp.where(
+                                    row_indices == rank % 2,
+                                    prefix_rows,
+                                    rank_prefix_wire[...],
+                                )
                             finished_prefix = (
-                                prefix_vmem[row_slice]
+                                prefix_rows
                                 + (
                                     scattered_mixture
                                     if moe_token_scatter_output
@@ -11470,8 +11781,15 @@ def stack(
         *projection_staging_scratch(batch_size, attention_dp),
         *routed_send_scratch(batch_size),
         # Four 7168-element BF16 wires, padded to 64 BF16 transport rows.
-        # Private storage (see B4_ATTENTION_GATHER).
-        *((tpu.VMEM((4, 32, 128), jnp.float32),) if b4_attention_gather else ()),
+        # Private storage (see B4_ATTENTION_GATHER). Rank rows at 8 rows: the
+        # eight-rank MoE input gather's one-row wires, also private.
+        *(
+            (tpu.VMEM((4, 32, 128), jnp.float32),)
+            if b4_attention_gather
+            else (tpu.VMEM((8, 32, 128), jnp.float32),)
+            if rank_row_wires
+            else ()
+        ),
         # Diagnostic: vmem_pad_kb reserves unused VMEM to probe headroom.
         *(
             (tpu.VMEM((_config().vmem_pad_kb * 2, 128), jnp.float32),)
@@ -11529,7 +11847,7 @@ def stack(
         "reduction_phase",
         "latent_gather",
         *(("projection_staging", "routed_send") if batch_size > 32 else ()),
-        *(("attention_gather",) if b4_attention_gather else ()),
+        *(("attention_gather",) if b4_attention_gather or rank_row_wires else ()),
         "headroom_pad",
     )
     persistent = [

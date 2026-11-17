@@ -70,6 +70,15 @@ class KernelConfig:
     # too and adds the four hosts in the same order, so the host copies of a
     # row stay bitwise equal. Changes numerics: one more BF16 rounding.
     attention_host_bf16: bool = False
+    # Token-scattered decode attention at 8 and 16 rows (attention DP1, four
+    # row owners): each rank of a pair reduces its own half of the pair's rows
+    # at full width (the local round gives each rank both column halves' pair
+    # partials of its own rows), so the output projection ends without the
+    # pair's half-swap. The post-attention mixture runs on those rows, the MoE
+    # input gathers from all eight local ranks, and each rank's updated prefix
+    # rows reach its pair peer before the MoE output is added. The same sums
+    # in the same order (bit-identical).
+    attention_rank_rows: bool = False
     # Token-scattered decode MoE with the routed and shared reduce-scatters
     # (B6-B28 rows, pooled weights): before the experts only the shared
     # expert's gate/up projection runs; its down projection and the start of
