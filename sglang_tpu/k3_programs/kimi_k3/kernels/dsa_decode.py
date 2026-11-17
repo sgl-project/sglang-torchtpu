@@ -572,11 +572,19 @@ class DecodeIndexer:
             active=s["active"],
             steps=steps,
         )
+        # KernelConfig.dsa_exchange_fill: the dense regime's step activity
+        # (no threshold needed) in the first count exchange's wait.
+        filled = dsa_dcp.exchange_fill()
         select.select(
             in_exchange,
             None if keys_ready is None else lambda: keys_ready(selection),
+            fill=(lambda: select.dense_activity(span_rows, s["active"], steps))
+            if filled
+            else None,
         )
-        select.step_activity(span_rows, s["active"], steps)
+        select.step_activity(
+            span_rows, s["active"], steps, part="scan" if filled else "all"
+        )
         record_copy.wait()
         return selection
 
