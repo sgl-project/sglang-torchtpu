@@ -328,9 +328,7 @@ class SRTPlatform(DeviceMixin):
 
     def pcp_ring_enabled(self) -> bool:
         """Whether prefill context parallelism runs in ring mode: the KV cache
-        is striped like DCP over the attention context-parallel group, whose
-        ranks lie outside attention TP, so KV heads shard over attention TP
-        alone (``dcp_size`` does not divide it)."""
+        is striped like DCP over the attention cp group."""
         return False
 
     def dcp_replicates_q_heads(self) -> bool:
