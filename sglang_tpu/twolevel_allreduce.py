@@ -465,12 +465,18 @@ def _check_ranks_agree(enabled: bool) -> None:
 
     from sglang.srt.distributed.parallel_state import get_world_group
 
-    _check_flag_agrees("SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE", enabled)
     world_group = get_world_group()
     if world_group.world_size <= 1:
         return
-    # The barrier protocol (signal weights) must match too.
     seen = [None] * world_group.world_size
+    dist.all_gather_object(seen, bool(enabled), group=world_group.cpu_group)
+    if len(set(seen)) > 1:
+        on = [rank for rank, flag in enumerate(seen) if flag]
+        raise RuntimeError(
+            "SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE must be set the same on every "
+            f"rank; it is on for ranks {on} only."
+        )
+    # The barrier protocol (signal weights) must match too.
     split = bool(tpu_envs.SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER.get())
     dist.all_gather_object(seen, split, group=world_group.cpu_group)
     if len(set(seen)) > 1:
@@ -501,9 +507,8 @@ def register_from_parallel_state() -> None:
 
 
 def _register_twoshot_from_parallel_state() -> None:
-    """Build the two-shot op when TP spans one host; every rank must agree.
-    Left at its default (on), the op is built only with MoE expert parallelism,
-    setting the flag explicitly overrides that."""
+    """Build the two-shot op when TP spans one host (every rank decides the
+    same from the parallel state)."""
     global _TWOSHOT_WORLD
     import torch.distributed as dist
 
@@ -512,12 +517,6 @@ def _register_twoshot_from_parallel_state() -> None:
     )
     from sglang.srt.runtime_context import get_server_args
     from sglang_tpu.twoshot_all_reduce import get_twoshot_all_reduce_op
-
-    flag = tpu_envs.SGLANG_TPU_ENABLE_TWOSHOT_TP_ALLREDUCE
-    enabled = bool(flag.get()) and (flag.is_set() or get_server_args().ep_size > 1)
-    _check_flag_agrees("SGLANG_TPU_ENABLE_TWOSHOT_TP_ALLREDUCE", enabled)
-    if not enabled:
-        return
 
     world = get_tensor_model_parallel_world_size()
     # The kernel's mesh is the whole world and its exchange is host-local.
@@ -536,22 +535,6 @@ def _register_twoshot_from_parallel_state() -> None:
         "Two-shot TP all-reduce on: bf16 TP all-reduces up to %d KB per rank.",
         TWOSHOT_TP_ALLREDUCE_MAX_BYTES // 1024,
     )
-
-
-def _check_flag_agrees(name: str, enabled: bool) -> None:
-    """A rank off the Pallas path would leave the others waiting in its barrier."""
-    import torch.distributed as dist
-
-    from sglang.srt.distributed.parallel_state import get_world_group
-
-    world_group = get_world_group()
-    if world_group.world_size <= 1:
-        return
-    seen = [None] * world_group.world_size
-    dist.all_gather_object(seen, enabled, group=world_group.cpu_group)
-    if len(set(seen)) > 1:
-        on = [rank for rank, flag in enumerate(seen) if flag]
-        raise RuntimeError(f"{name} must be set the same on every rank; on for {on}.")
 
 
 def _register_twolevel_from_parallel_state() -> None:

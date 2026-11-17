@@ -5,7 +5,6 @@ eligibility gate, the fallbacks to the original collective and
 the default (concatenating) merged_moe_all_reduce.
 """
 
-import os
 import unittest
 from unittest import mock
 
@@ -230,64 +229,39 @@ class TestTwoShotRoute(CustomTestCase):
         row = torch.zeros(1, 4096, dtype=torch.bfloat16)
         self.assertEqual(self._dispatch(row, ready=True)[0], "twolevel")
 
-    def _register(self, enabled, *, world=8, nnodes=1, ep_size=8, seen=None):
-        """``enabled=None`` leaves the flag unset (its default)."""
-
-        def gather(out, value, group=None):
-            out[:] = seen if seen is not None else [value] * len(out)
-
-        flag = tpu_envs.SGLANG_TPU_ENABLE_TWOSHOT_TP_ALLREDUCE
-        env = mock.patch.dict(os.environ) if enabled is None else flag.override(enabled)
+    def _register(self, *, world=8, tp=None, nnodes=1):
         with (
             mock.patch.object(tl, "_TWOSHOT_WORLD", 0),
-            env,
-            mock.patch(
-                "sglang.srt.distributed.parallel_state.get_world_group",
-                return_value=mock.Mock(world_size=world, cpu_group="cpu"),
-            ),
-            mock.patch("torch.distributed.all_gather_object", side_effect=gather),
             mock.patch("torch.distributed.get_world_size", return_value=world),
             mock.patch(
                 "sglang.srt.distributed.parallel_state."
                 "get_tensor_model_parallel_world_size",
-                return_value=world,
+                return_value=world if tp is None else tp,
             ),
             mock.patch(
                 "sglang.srt.runtime_context.get_server_args",
-                return_value=mock.Mock(nnodes=nnodes, ep_size=ep_size),
+                return_value=mock.Mock(nnodes=nnodes),
             ),
             mock.patch(
                 "sglang_tpu.twoshot_all_reduce.get_twoshot_all_reduce_op"
             ) as build,
         ):
-            if enabled is None:
-                os.environ.pop(flag.name, None)
             tl._register_twoshot_from_parallel_state()
             return tl._TWOSHOT_WORLD, build
 
-    def test_registration(self):
-        world, build = self._register(False)
-        self.assertEqual(world, 0)
-        build.assert_not_called()
-        world, build = self._register(True)
+    def test_registration_needs_tp_on_one_host(self):
+        world, build = self._register()
         self.assertEqual(world, 8)
         build.assert_called_once_with(8)
-        world, build = self._register(True, world=32, nnodes=4)
-        self.assertEqual(world, 0)  # the exchange is host-local
-        build.assert_not_called()
-
-    def test_default_follows_expert_parallelism(self):
-        """Unset, the op is built with MoE expert parallelism only (like vllm's
-        TPU_SMALL_ALL_REDUCE); an explicit 1 builds it without."""
-        self.assertEqual(self._register(None, ep_size=8)[0], 8)
-        world, build = self._register(None, ep_size=1)
-        self.assertEqual(world, 0)
-        build.assert_not_called()
-        self.assertEqual(self._register(True, ep_size=1)[0], 8)
-
-    def test_ranks_must_agree(self):
-        with self.assertRaisesRegex(RuntimeError, "same on every rank"):
-            self._register(True, seen=[True] * 7 + [False])
+        for kwargs in (
+            dict(world=32, nnodes=4),  # the exchange is host-local
+            dict(world=8, tp=4),  # the kernel's mesh is the whole world
+            dict(world=1),
+        ):
+            with self.subTest(**kwargs):
+                world, build = self._register(**kwargs)
+                self.assertEqual(world, 0)
+                build.assert_not_called()
 
 
 if __name__ == "__main__":
