@@ -157,7 +157,6 @@ def main() -> None:
                 topk=TOP_K,
                 activation="silu",
                 has_post_expert_norm=post_norm,
-                fp8_direct_write=False,
                 expert_tp=True,
             )
             for s, n in chunks(x.shape[0])

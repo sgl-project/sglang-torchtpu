@@ -95,9 +95,6 @@ def main():
     test_divergent_ids = (
         os.environ.get("SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_IDS", "0") == "1"
     )
-    fp8_direct_write = (
-        os.environ.get("SGLANG_TPU_FUSED_RS_TEST_FP8_DIRECT_WRITE", "0") == "1"
-    )
     layers = args.layers
     skewed_routing = args.skewed_routing
     assert layers >= 1
@@ -210,7 +207,6 @@ def main():
                     topk=topk,
                     activation="silu",
                     has_post_expert_norm=test_post_expert_norm,
-                    fp8_direct_write=fp8_direct_write,
                 )
             )
         return outputs[0] if layers == 1 else tuple(outputs)
@@ -266,7 +262,7 @@ def main():
         f"shape={tuple(actual.shape)} post_norm={test_post_expert_norm} "
         f"blockwise={test_blockwise} divergent_ids={test_divergent_ids} "
         f"divergent_weights={test_divergent_weights} "
-        f"fp8_direct_write={fp8_direct_write} layers={layers} "
+        f"layers={layers} "
         f"skewed_routing={skewed_routing}"
     )
     dist.destroy_process_group()

@@ -704,7 +704,6 @@ class TestNvfp4Block512Contract(CustomTestCase):
             )
 
         call = fused_moe_rs_gather.call_args.kwargs
-        self.assertFalse(call["fp8_direct_write"])
         self.assertFalse(call["has_post_expert_norm"])
         self.assertNotIn("collective_id", call)
         self.assertEqual(call["topk_ids"][1, 1].item(), 0)

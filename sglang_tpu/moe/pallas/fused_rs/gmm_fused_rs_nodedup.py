@@ -130,7 +130,6 @@ def _select_fused_rs_block_sizes(
     quant_block_size: int | None,
     act_fn: str | None,
     vmem_limit_bytes: int | None = None,
-    fp8_direct_write: bool = False,
 ) -> FusedRsBlockSizes:
     """Deterministic selection of all tile/block sizes for fused_rs.
 
@@ -254,7 +253,6 @@ def _select_fused_rs_block_sizes(
             quant_block_size if quant_block_size else None,
             default_tiles,
             fuse_act=act_fn,
-            fp8_direct_write=fp8_direct_write,
         )
     )
     # --- Step 4b: bound the W1/W2 VMEM buffers by their real element width ---
@@ -310,13 +308,6 @@ def _select_fused_rs_block_sizes(
         while tk2_adj > num_lanes and padded_k2 % tk2_adj != 0:
             tk2_adj -= num_lanes
         tile_k2 = tk2_adj if (tk2_adj > 0 and padded_k2 % tk2_adj == 0) else padded_k2
-
-    # NOTE: fp8 direct-write tile_m sizing is now handled in Step 4
-    # (get_fused_rs_tuned_block_sizes, called with fp8_direct_write): dedicated
-    # fp8-comm entries carry VMEM-safe tiles, and shapes without one fall back
-    # to the bf16 tile clamped to tile_m<=64. Both the host
-    # max-gm calc and the kernel call this helper, so their loop bounds stay
-    # aligned. (Replaces the former unconditional ``tile_m = min(tile_m, 64)``.)
 
     # --- Step 6: Assertions ---
     assert size_k1 % tile_k1 == 0, f"tile_k1={tile_k1} must divide size_k1={size_k1}"
@@ -517,12 +508,6 @@ def kernel_main_fused_rs(
     send_sems_ref,  # DMA(3,) per-staging-slot send sems
     local_write_sems_ref,  # DMA(3,) per-staging-slot local write sems
     recv_sem_ref,  # DMA(1,) for incoming remote writes
-    scale_send_sems_ref=None,  # Optional DMA(3,) for FP8 row-scale sends.
-    scale_local_write_sems_ref=None,  # Optional DMA(3,) for FP8 row-scale local writes.
-    scale_recv_sem_ref=None,  # Optional DMA(1,) for incoming FP8 row-scale writes.
-    scatter_fp8_staging_3x_ref=None,  # Optional VMEM staging for FP8 payload rows.
-    scatter_scale_3x_ref=None,  # Optional VMEM staging for per-row FP8 scales.
-    out_scale_ref=None,  # Optional HBM output for per-row FP8 activation scales.
     *,
     fused_dims: FusedDims,
     tile_m: int,
@@ -541,7 +526,6 @@ def kernel_main_fused_rs(
     ep_axis_name: str,
     top_k: int,
     pack_indices: bool = True,
-    fp8_direct_write: bool = False,
     defer_writes: bool = False,
     skip_out_zero: bool = False,
     weight_pingpong: bool = False,
@@ -581,15 +565,13 @@ def kernel_main_fused_rs(
     """
     dims = fused_dims
     num_lanes = pltpu.get_tpu_info().num_lanes
-    # GMM2 writes the staging slot itself (one k step, quantized RHS without bias, no fp8
-    # write path); the slot's previous writes are then awaited before GMM2 instead of
-    # before the relayout.
+    # GMM2 writes the staging slot itself (one k step, quantized RHS without bias); the
+    # slot's previous writes are then awaited before GMM2 instead of before the relayout.
     gmm2_row_out = (
         gmm2_row_out
         and dims.size_k2 // tile_k2 == 1
         and cfgs2.rhs_cfgs.quant_dtype is not None
         and not cfgs2.rhs_cfgs.has_bias
-        and not fp8_direct_write
     )
     my_rank = group_offset_ref[0] // dims.size_group
     my_id = my_rank
@@ -667,11 +649,7 @@ def kernel_main_fused_rs(
     # peers) and WAIT for it BEFORE signaling the entry barrier. A peer only
     # issues its remote writes after its barrier releases, guaranteeing
     # no remote write lands in an out_buf that is still being zeroed.
-    zero_src = (
-        scatter_fp8_staging_3x_ref.at[0]
-        if fp8_direct_write
-        else scatter_staging_3x_ref.at[0]
-    )
+    zero_src = scatter_staging_3x_ref.at[0]
     # Expert TP writes every out_buf row exactly once: each device sends its
     # slice of every routed (token, slot) row, padding tokens included.
     if not skip_out_zero:
@@ -1090,14 +1068,10 @@ def kernel_main_fused_rs(
         @pl.when(pending_local > 0)
         def _():
             pl.semaphore_wait(local_write_sems_ref.at[slot], pending_local)
-            if fp8_direct_write:
-                pl.semaphore_wait(scale_local_write_sems_ref.at[slot], pending_local)
 
         @pl.when(pending_send > 0)
         def _():
             pl.semaphore_wait(send_sems_ref.at[slot], pending_send)
-            if fp8_direct_write:
-                pl.semaphore_wait(scale_send_sems_ref.at[slot], pending_send)
 
         gm_id_ref[1 + slot] = jnp.int32(0)
         gm_id_ref[1 + staging_slots + slot] = jnp.int32(0)
@@ -1611,105 +1585,29 @@ def kernel_main_fused_rs(
                         write_pos = local_row * top_k + topk_idx
                     is_local = dest_chip == my_id
 
-                    if fp8_direct_write:
-                        # Quantize each completed expert row before the direct
-                        # write. Remote ICI then moves FP8 payload plus one
-                        # fp32 row scale instead of the full bf16 activation row.
-                        row_f32 = scatter_staging_3x_ref[stg_id, row_idx, :, :].astype(
-                            jnp.float32
-                        )
-                        valid_n2 = (
-                            jnp.arange(row_f32.shape[0])[:, None] * row_f32.shape[1]
-                            + jnp.arange(row_f32.shape[1])[None, :]
-                            < dims.original_n2
-                        )
-                        fp8_max = jnp.array(
-                            jnp.finfo(jnp.float8_e4m3fn).max, dtype=jnp.float32
-                        )
-                        row_scale = (
-                            jnp.maximum(
-                                jnp.max(jnp.where(valid_n2, jnp.abs(row_f32), 0.0)),
-                                jnp.array(1e-6, dtype=jnp.float32),
-                            )
-                            / fp8_max
-                        )
-                        scatter_scale_3x_ref[stg_id, row_idx, :] = (
-                            row_scale + jnp.zeros((128,), dtype=jnp.float32)
-                        )
-                        scatter_fp8_staging_3x_ref[stg_id, row_idx, :, :] = jnp.where(
-                            valid_n2,
-                            jnp.clip(row_f32 / row_scale, -fp8_max, fp8_max),
-                            0.0,
-                        ).astype(jnp.float8_e4m3fn)
+                    @pl.when(~is_local)
+                    def _():
+                        target_device_id = dest_chip
+                        pltpu.make_async_remote_copy(
+                            src_ref=scatter_staging_3x_ref.at[
+                                stg_id, pl.ds(row_idx, 1), :, :
+                            ],
+                            dst_ref=out_buf_ref.at[pl.ds(write_pos, 1), :, :],
+                            send_sem=send_sems_ref.at[stg_id],
+                            recv_sem=recv_sem_ref.at[0],
+                            device_id={ep_axis_name: target_device_id},
+                            device_id_type=pl.DeviceIdType.MESH,
+                        ).start()
 
-                        @pl.when(~is_local)
-                        def _():
-                            target_device_id = dest_chip
-                            pltpu.make_async_remote_copy(
-                                src_ref=scatter_fp8_staging_3x_ref.at[
-                                    stg_id, pl.ds(row_idx, 1), :, :
-                                ],
-                                dst_ref=out_buf_ref.at[pl.ds(write_pos, 1), :, :],
-                                send_sem=send_sems_ref.at[stg_id],
-                                recv_sem=recv_sem_ref.at[0],
-                                device_id={ep_axis_name: target_device_id},
-                                device_id_type=pl.DeviceIdType.MESH,
-                            ).start()
-                            if fp8_direct_write:
-                                pltpu.make_async_remote_copy(
-                                    src_ref=scatter_scale_3x_ref.at[
-                                        stg_id, pl.ds(row_idx, 1), :
-                                    ],
-                                    dst_ref=out_scale_ref.at[pl.ds(write_pos, 1), :],
-                                    send_sem=scale_send_sems_ref.at[stg_id],
-                                    recv_sem=scale_recv_sem_ref.at[0],
-                                    device_id={ep_axis_name: target_device_id},
-                                    device_id_type=pl.DeviceIdType.MESH,
-                                ).start()
-
-                        @pl.when(is_local)
-                        def _():
-                            pltpu.make_async_copy(
-                                src_ref=scatter_fp8_staging_3x_ref.at[
-                                    stg_id, pl.ds(row_idx, 1), :, :
-                                ],
-                                dst_ref=out_buf_ref.at[pl.ds(write_pos, 1), :, :],
-                                sem=local_write_sems_ref.at[stg_id],
-                            ).start()
-                            if fp8_direct_write:
-                                pltpu.make_async_copy(
-                                    src_ref=scatter_scale_3x_ref.at[
-                                        stg_id, pl.ds(row_idx, 1), :
-                                    ],
-                                    dst_ref=out_scale_ref.at[pl.ds(write_pos, 1), :],
-                                    sem=scale_local_write_sems_ref.at[stg_id],
-                                ).start()
-
-                    else:
-
-                        @pl.when(~is_local)
-                        def _():
-                            target_device_id = dest_chip
-                            pltpu.make_async_remote_copy(
-                                src_ref=scatter_staging_3x_ref.at[
-                                    stg_id, pl.ds(row_idx, 1), :, :
-                                ],
-                                dst_ref=out_buf_ref.at[pl.ds(write_pos, 1), :, :],
-                                send_sem=send_sems_ref.at[stg_id],
-                                recv_sem=recv_sem_ref.at[0],
-                                device_id={ep_axis_name: target_device_id},
-                                device_id_type=pl.DeviceIdType.MESH,
-                            ).start()
-
-                        @pl.when(is_local)
-                        def _():
-                            pltpu.make_async_copy(
-                                src_ref=scatter_staging_3x_ref.at[
-                                    stg_id, pl.ds(row_idx, 1), :, :
-                                ],
-                                dst_ref=out_buf_ref.at[pl.ds(write_pos, 1), :, :],
-                                sem=local_write_sems_ref.at[stg_id],
-                            ).start()
+                    @pl.when(is_local)
+                    def _():
+                        pltpu.make_async_copy(
+                            src_ref=scatter_staging_3x_ref.at[
+                                stg_id, pl.ds(row_idx, 1), :, :
+                            ],
+                            dst_ref=out_buf_ref.at[pl.ds(write_pos, 1), :, :],
+                            sem=local_write_sems_ref.at[stg_id],
+                        ).start()
 
                     return (
                         send_sz + lax.select(~is_local, jnp.int32(1), jnp.int32(0)),
@@ -1747,16 +1645,10 @@ def kernel_main_fused_rs(
                 @pl.when(jnp.logical_and(local_sz > 0, not defer_writes))
                 def _():
                     pl.semaphore_wait(local_write_sems_ref.at[stg_id], local_sz)
-                    if fp8_direct_write:
-                        pl.semaphore_wait(
-                            scale_local_write_sems_ref.at[stg_id], local_sz
-                        )
 
                 @pl.when(jnp.logical_and(send_sz > 0, not defer_writes))
                 def _():
                     pl.semaphore_wait(send_sems_ref.at[stg_id], send_sz)
-                    if fp8_direct_write:
-                        pl.semaphore_wait(scale_send_sems_ref.at[stg_id], send_sz)
 
             if not pair_exchange:
                 _do_direct_write()
@@ -1789,160 +1681,9 @@ def kernel_main_fused_rs(
     @pl.when(total_recv > 0)
     def _():
         pl.semaphore_wait(recv_sem_ref.at[0], total_recv)
-        if fp8_direct_write:
-            pl.semaphore_wait(scale_recv_sem_ref.at[0], total_recv)
 
     # All ICI DMA writes go directly to out_buf_ref (the pallas_call output).
     # No input_output_aliases needed — avoids XLA tiling copy on weight inputs.
-
-
-def kernel_main_fused_rs_fp8(
-    lhs_group_sizes_ref,
-    group_offset_ref,
-    group_start_ref,
-    lhs_indices_ref,
-    topk_indices_ref,
-    max_num_gm_ref,
-    w1_gs_gate_ref,
-    w1_gs_up_ref,
-    w2_gs_ref,
-    hidden_states_ref,
-    w1_ref,
-    w2_ref,
-    w1_scale_ref,
-    w2_scale_ref,
-    w1_bias_ref,
-    w2_bias_ref,
-    out_buf_ref,
-    out_scale_ref,
-    metadata_ref,
-    fused_metadata_ref,
-    gathered_lhs_2x_ref,
-    gmm1_out_ref,
-    intermediate_ref,
-    tiled_out_2x_ref,
-    scatter_staging_3x_ref,
-    partial_out1_ref,
-    partial_out2_ref,
-    shared_acc_ref,
-    gather_sem_ref,
-    staging_sem_ref,
-    zero_sem_ref,
-    gm_id_ref,
-    w1_buf_ref,
-    w2_buf_ref,
-    w1_scale_buf_ref,
-    w2_scale_buf_ref,
-    w1_bias_buf_ref,
-    w2_bias_buf_ref,
-    w1_sem_ref,
-    w2_sem_ref,
-    output_sem_ref,
-    send_sems_ref,
-    local_write_sems_ref,
-    recv_sem_ref,
-    scale_send_sems_ref,
-    scale_local_write_sems_ref,
-    scale_recv_sem_ref,
-    scatter_fp8_staging_3x_ref,
-    scatter_scale_3x_ref,
-    *,
-    fused_dims: FusedDims,
-    tile_m: int,
-    tile_k1: int,
-    tile_k2: int,
-    tile_n1: int,
-    tile_n2: int,
-    num_w1_bufs: int,
-    num_w2_bufs: int,
-    act_fn: str,
-    out_dtype: jnp.dtype,
-    cfgs1: GmmConfigs,
-    cfgs2: GmmConfigs,
-    ep_size: int,
-    chunk_size: int,
-    ep_axis_name: str,
-    top_k: int,
-    pack_indices: bool = True,
-    defer_writes: bool = False,
-    skip_out_zero: bool = False,
-    row_loop_unroll: int = 1,
-    staging_slots: int = 3,
-):
-    """FP8 direct-write wrapper with output refs ordered for pallas_call."""
-    return kernel_main_fused_rs(
-        lhs_group_sizes_ref,
-        group_offset_ref,
-        group_start_ref,
-        lhs_indices_ref,
-        topk_indices_ref,
-        max_num_gm_ref,
-        w1_gs_gate_ref,
-        w1_gs_up_ref,
-        w2_gs_ref,
-        hidden_states_ref,
-        w1_ref,
-        w2_ref,
-        w1_scale_ref,
-        w2_scale_ref,
-        w1_bias_ref,
-        w2_bias_ref,
-        out_buf_ref,
-        metadata_ref,
-        fused_metadata_ref,
-        gathered_lhs_2x_ref,
-        gmm1_out_ref,
-        intermediate_ref,
-        tiled_out_2x_ref,
-        scatter_staging_3x_ref,
-        partial_out1_ref,
-        partial_out2_ref,
-        shared_acc_ref,
-        gather_sem_ref,
-        staging_sem_ref,
-        zero_sem_ref,
-        gm_id_ref,
-        w1_buf_ref,
-        w2_buf_ref,
-        w1_scale_buf_ref,
-        w2_scale_buf_ref,
-        w1_bias_buf_ref,
-        w2_bias_buf_ref,
-        w1_sem_ref,
-        w2_sem_ref,
-        output_sem_ref,
-        send_sems_ref,
-        local_write_sems_ref,
-        recv_sem_ref,
-        scale_send_sems_ref,
-        scale_local_write_sems_ref,
-        scale_recv_sem_ref,
-        scatter_fp8_staging_3x_ref,
-        scatter_scale_3x_ref,
-        out_scale_ref,
-        fused_dims=fused_dims,
-        tile_m=tile_m,
-        tile_k1=tile_k1,
-        tile_k2=tile_k2,
-        tile_n1=tile_n1,
-        tile_n2=tile_n2,
-        num_w1_bufs=num_w1_bufs,
-        num_w2_bufs=num_w2_bufs,
-        act_fn=act_fn,
-        out_dtype=out_dtype,
-        cfgs1=cfgs1,
-        cfgs2=cfgs2,
-        ep_size=ep_size,
-        chunk_size=chunk_size,
-        ep_axis_name=ep_axis_name,
-        top_k=top_k,
-        pack_indices=pack_indices,
-        fp8_direct_write=True,
-        defer_writes=defer_writes,
-        skip_out_zero=skip_out_zero,
-        row_loop_unroll=row_loop_unroll,
-        staging_slots=staging_slots,
-    )
 
 
 def _pair_exchange_metadata(
@@ -2017,7 +1758,6 @@ def _pair_targets(my_id, ep_size: int):
         "ep_size",
         "ep_axis_name",
         "top_k",
-        "fp8_direct_write",
         "caller_tile_m",
         "expert_tp",
         "fp4_w4a16",
@@ -2049,7 +1789,6 @@ def gmm_v2_fused_rs(
     max_num_gm: jax.Array,
     caller_tile_m: int | None = None,
     top_k: int,
-    fp8_direct_write: bool = False,
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
     pair_exchange: bool = False,
@@ -2160,7 +1899,6 @@ def gmm_v2_fused_rs(
         quant_block_size=quant_block_size,
         act_fn=act_fn,
         vmem_limit_bytes=vmem_limit_bytes,
-        fp8_direct_write=fp8_direct_write,
     )
     tile_m = block_sizes.tile_m
     # The caller sizes max_num_gm from an independent block-size lookup. A
@@ -2171,7 +1909,7 @@ def gmm_v2_fused_rs(
         raise ValueError(
             f"caller computed max_num_gm with tile_m={caller_tile_m}, but the "
             f"kernel selected tile_m={tile_m}; check that quantization, "
-            "activation, variant, and FP8 direct-write lookup keys agree"
+            "activation and variant lookup keys agree"
         )
     tile_k1 = block_sizes.tile_k1
     tile_n1 = block_sizes.tile_n1
@@ -2524,16 +2262,10 @@ def gmm_v2_fused_rs(
     w2_bias_input = w2_bias if has_bias else jnp.zeros((1, 1, 1), jnp.float32)
     max_num_gm_arr = jnp.array([max_num_gm], dtype=jnp.int32)
 
-    # Output buffer — also serves as ICI DMA target. In the FP8 direct-write
-    # path this stores quantized payload rows; row scales are returned as a
-    # second output and dequantized immediately after the kernel.
-    payload_dtype = jnp.float8_e4m3fn if fp8_direct_write else out_dtype
+    # Output buffer — also serves as ICI DMA target.
     out_buf_init = jax.ShapeDtypeStruct(
-        (chunk_size * top_k, n2_cols, num_lanes), payload_dtype
+        (chunk_size * top_k, n2_cols, num_lanes), out_dtype
     )
-    # TPU VMEM vector slices must be tile-aligned. Store the scalar row scale
-    # as a padded 128-wide row and use column 0 when dequantizing.
-    out_scale_init = jax.ShapeDtypeStruct((chunk_size * top_k, 128), jnp.float32)
 
     # Decide whether to pack lhs_indices + topk_slot_indices into a single
     # SMEM scalar prefetch. Packing's per-row unpack (1 mod + 1 div via the
@@ -2594,7 +2326,7 @@ def gmm_v2_fused_rs(
         num_pair_blocks = ep_size // 2 + 1
         out_buf_init = jax.ShapeDtypeStruct(
             (num_pair_blocks * chunk_size * (top_k // ep_size), n2_cols, num_lanes),
-            payload_dtype,
+            out_dtype,
         )
 
     pallas_inputs = (
@@ -2641,7 +2373,7 @@ def gmm_v2_fused_rs(
         pack_indices=pack_indices,
         defer_writes=expert_tp,
         # Expert TP's per-row writes (and pair exchange's) cover every out_buf row once.
-        skip_out_zero=expert_tp and not fp8_direct_write,
+        skip_out_zero=expert_tp,
         weight_pingpong=expert_tp,
         gmm2_row_out=expert_tp,
         row_loop_unroll=row_loop_unroll,
@@ -2660,50 +2392,9 @@ def gmm_v2_fused_rs(
         pl.BlockSpec(memory_space=pltpu.HBM),  # w2_bias
     ]
 
-    if fp8_direct_write:
-        fp8_scratch_shapes = scratch_shapes + [
-            pltpu.SemaphoreType.REGULAR((staging_slots,)),
-            pltpu.SemaphoreType.REGULAR((staging_slots,)),
-            pltpu.SemaphoreType.REGULAR((1,)),
-            pltpu.VMEM((staging_slots, tile_m, n2_cols, num_lanes), jnp.float8_e4m3fn),
-            pltpu.VMEM((staging_slots, tile_m, 128), jnp.float32),
-        ]
-        payload, row_scales = pl.pallas_call(
-            functools.partial(
-                kernel_main_fused_rs_fp8,
-                **{
-                    k: v
-                    for k, v in kernel_kwargs.items()
-                    if k
-                    not in (
-                        "weight_pingpong",
-                        "gmm2_row_out",
-                        "pair_exchange",
-                        "pair_meta_base",
-                        "pair_meta_stride",
-                    )
-                },
-            ),
-            out_shape=(out_buf_init, out_scale_init),
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=9,
-                in_specs=in_specs,
-                out_specs=[
-                    pl.BlockSpec(memory_space=pltpu.HBM),
-                    pl.BlockSpec(memory_space=pltpu.HBM),
-                ],
-                scratch_shapes=fp8_scratch_shapes,
-            ),
-            compiler_params=compiler_params,
-            name=f"{pallas_name}-fp8-direct-write",
-        )(*pallas_inputs)
-        payload_2d = payload.reshape(chunk_size * top_k, aligned_n2).astype(jnp.float32)
-        return (payload_2d * row_scales[:, :1]).astype(out_dtype)[:, :size_n2]
-
     kernel_fn = functools.partial(kernel_main_fused_rs, **kernel_kwargs)
     if pair_exchange:
-        # Appended after the base scratch; passed by keyword since the fp8 refs
-        # occupy the optional positional slots.
+        # Appended after the base scratch, passed by keyword.
         scratch_shapes = scratch_shapes + [
             pltpu.VMEM((_PAIR_RING, tile_m, n2_cols, num_lanes), out_dtype),
             pltpu.VMEM((staging_slots, tile_m, n2_cols, num_lanes), out_dtype),
@@ -2734,7 +2425,7 @@ def gmm_v2_fused_rs(
         name=pallas_name,
     )(*pallas_inputs)
 
-    if expert_tp and not fp8_direct_write and aligned_n2 == size_n2:
+    if expert_tp and aligned_n2 == size_n2:
         return result
     return result.reshape(result.shape[0], aligned_n2)[:, :size_n2]
 

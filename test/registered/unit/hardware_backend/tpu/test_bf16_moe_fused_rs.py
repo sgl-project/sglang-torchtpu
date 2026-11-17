@@ -140,7 +140,6 @@ class TestBf16MoeFusedRs(CustomTestCase):
         self.assertIsNone(args["w2_scale"])
         self.assertTrue(args["has_post_expert_norm"])
         self.assertTrue(args["expert_tp"])
-        self.assertFalse(args["fp8_direct_write"])
 
     def test_auto_keeps_standard_bf16_for_unsupported_pipeline_layout(self):
         layer = _layer()
