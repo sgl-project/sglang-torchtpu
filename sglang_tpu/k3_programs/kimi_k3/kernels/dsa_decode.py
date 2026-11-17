@@ -525,10 +525,19 @@ class DecodeIndexer:
             lambda first: s["q8"][pl.ds(first, S)].reshape(S * HEADS, DIM),
             pages_started=early,
         )
-        select.select()
         span_rows = s["attend_keys"].shape[2]
         steps = self.keys.shape[1] // span_rows
-        select.step_activity(span_rows, s["active"], steps)
+        # KernelConfig.dsa_exchange_fill: the dense regime's step activity
+        # (no threshold needed) in the first count exchange's wait.
+        filled = dsa_dcp.exchange_fill()
+        select.select(
+            fill=(lambda: select.dense_activity(span_rows, s["active"], steps))
+            if filled
+            else None
+        )
+        select.step_activity(
+            span_rows, s["active"], steps, part="scan" if filled else "all"
+        )
         record_copy.wait()
         return mla_dcp.DcpSelection(
             self.keys,

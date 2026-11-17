@@ -166,6 +166,25 @@ class KernelConfig:
     # scoring ring's first index-page copies while the index query/key gather
     # is in flight (neither needs the gathered queries) instead of after it.
     dsa_early_plan: bool = False
+    # Kimi-K3.1 decode selection: the first count exchange's wait (its remote
+    # copies in flight) runs the work that needs no threshold instead of the
+    # end of the rounds: the dense step activity's fill (every attention step
+    # marked), each row's own in-flight key and the bin selection's p_tie
+    # (lane extractions into SMEM) and the resident keys' copy wait. The same
+    # SMEM values and copies (bit-identical).
+    dsa_exchange_fill: bool = False
+    # Kimi-K3.1 decode selection scoring loop: each in-flight token's keys go
+    # into its page for all of the sequence's rows with one lane rotation and
+    # a masked select (instead of a lane sum per row and token). The same
+    # keys (bit-identical).
+    dsa_vector_patch: bool = False
+    # Kimi-K3.1 decode selection scoring loop, sequences of 4+ rows: on a page
+    # holding the sequence's in-flight tokens only the products of its parts
+    # (a subpage at 8 rows a sequence, two at 4) below the sequence's last
+    # position run (one loop over them); the subpages past it take INT_MIN
+    # keys, the value the masked products give them. Other pages keep one
+    # straight-line body. The same keys (bit-identical).
+    dsa_skip_empty_subpages: bool = False
     # MLA DCP combine of unchunked one-group calls with three heads a rank
     # (B1, B4, B8 and the 8-row verifies) in two stages: the chip's two
     # cores (members 2k, 2k + 1) first merge their partials on-chip, each

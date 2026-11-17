@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=2300, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3200, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -973,6 +973,134 @@ class TestIndexSelectScoringKnobs(CustomTestCase):
         self._runs(8, (self.RESIDENT,))
 
 
+class TestIndexSelectFillsAndPatch(TestIndexSelectScoringKnobs):
+    """``KernelConfig.dsa_exchange_fill`` (own keys, p_tie and the resident
+    keys' copy wait in the first count exchange's wait),
+    ``dsa_vector_patch`` and ``dsa_skip_empty_subpages`` leave the selection
+    bit for bit unchanged: ``select_call`` in interpret mode on a 4-rank
+    group, with the defaults and with the knobs over the resident chunks and
+    over the stage ring, must give the same thresholds, own flags and every
+    key of each row's pages (the masked tail of the last page too). The
+    in-flight tokens sit at a page's start (three empty subpages), across a
+    subpage and a page (rank) boundary, at gapped and repeated positions
+    (the patch's row order), in one-row and four-row sequences and in the
+    resident keys' second chunk; one sequence holds at most ``topk`` tokens
+    (p_tie -1); exact rounds keep p_tie from the tie rounds."""
+
+    SCRIPT = """
+        import os, sys
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        from sglang_tpu.k3_programs.kimi_k3 import config as kc
+        knobs = dict(kv.split("=") for kv in os.environ["KNOBS"].split(",") if kv)
+        kc.install(kc.KernelConfig().replace(**knobs))
+        import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3 import dsa
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
+
+        G, T, INT_MIN = 4, 512, -(2**31)
+        ROUNDS = kc.active().dsa_select_rounds
+        outputs = {}
+
+        def case(name, firsts, S, topk, seed, chunk=128, ties=False, offsets=None):
+            dsa_dcp.WIDE_CHUNK_ROWS = chunk
+            rng = np.random.default_rng(seed)
+            B = len(firsts) * S
+            offsets = list(range(S)) if offsets is None else offsets  # row r at p0 + offsets[r]
+            positions = np.array([p0 + offsets[r] for p0 in firsts for r in range(S)], np.int32)
+            pages = max(-(-((p + T) // T) // G) for p in positions) + 1
+            pools = rng.integers(0, 256, (G, 1 + len(firsts) * pages, 132, 4, 128), dtype=np.uint8)
+            tables = np.zeros((G, B, pages), np.int32)
+            new_k8 = np.zeros((B, 128), np.float32); new_exp = np.zeros(B, np.int32)
+            for s, p0 in enumerate(firsts):
+                L = p0 + S
+                raw = rng.standard_normal((L, 128)).astype(np.float32)
+                if ties:  # five distinct keys: ties at the threshold
+                    raw = rng.standard_normal((5, 128)).astype(np.float32)[rng.integers(0, 5, L)]
+                k8, kexp = dsa.quantize_fp8(raw)
+                rec = np.asarray(dsa_dcp.key_records(jnp.asarray(raw)))
+                for r in range(S):
+                    tables[:, s * S + r] = 1 + s * pages + np.arange(pages)
+                    new_k8[s * S + r] = k8[p0 + r]; new_exp[s * S + r] = rec[p0 + r, 128]
+                for t in range(p0):
+                    page = t // T
+                    blk = tables[page % G, s * S, page // G]
+                    (row, sub), (srow, lane) = dsa_dcp.record_place(t % T)
+                    pools[page % G, blk, row, sub] = rec[t, :128]
+                    pools[page % G, blk, srow, 0, lane] = rec[t, 128]
+            q8 = np.zeros((B, 32, 128), np.float32); w = np.zeros((B, 32), np.float32)
+            for b in range(B):
+                q8[b], w[b] = dsa.index_query(rng.standard_normal(4096).astype(np.float32),
+                                              rng.standard_normal(32).astype(np.float32))
+            w_t = np.zeros((32, 128), np.float32); w_t[:, :B] = w.T
+            mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+            def body(q8, w_t, pool, tables, positions, new_k8, new_exp):
+                out = dsa_dcp.select_call(q8, w_t, new_k8, pool[0], tables[0], positions, new_exp,
+                                          pages=pages, topk=topk, group=G, max_local_pages=pages,
+                                          sequence_rows=S, interpret=pltpu.InterpretParams())
+                return tuple(x[None] for x in out)
+            f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P(), P("tp"), P("tp"), P(), P(), P()),
+                                      out_specs=(P("tp"),) * 4, check_vma=False))
+            tau, ptie, own, keys = (np.asarray(x) for x in f(
+                q8.astype(ml_dtypes.float8_e4m3fn), w_t, pools, tables.reshape(G, -1), positions, new_k8, new_exp))
+            row_keys = []
+            for b in range(B):
+                L, first = positions[b] + 1, b - b % S
+                span = -(-(positions[first:first + S].max() + 1) // T) * T  # the sequence's pages
+                t = np.arange(span)
+                kk = keys[(t // T) % G, b, (t // T) // G * (T // 128) + (t % T) // 128, t % 128].astype(np.int64)
+                row_keys.append(kk)
+                for v in (tau, ptie, own):
+                    assert len(set(v[:, b])) == 1, (name, b)
+                if offsets != list(range(S)):
+                    continue  # gapped positions: compared across the knob sets only
+                assert np.all(kk[L:] == INT_MIN), (name, b)
+                kk, t = kk[:L], t[:L]
+                if ROUNDS == 8:
+                    want = dsa.topk_mask(kk, t, topk)
+                elif L <= topk:
+                    want = kk > INT_MIN
+                else:
+                    kth = np.sort(kk)[::-1][topk - 1]
+                    drop = 32 - 4 * ROUNDS
+                    unsigned = (int(kth) ^ INT_MIN) & 0xFFFFFFFF
+                    bound = ((unsigned >> drop) << drop) ^ (1 << 31)
+                    want = kk >= (bound - (1 << 32) if bound >= (1 << 31) else bound)
+                np.testing.assert_array_equal(dsa_dcp.selected(kk, t, tau[0, b], ptie[0, b]), want)
+                assert bool(own[0, b]) == bool(want[-1]), (name, b)
+            for key, v in (("tau", tau), ("ptie", ptie), ("own", own), ("keys", np.concatenate(row_keys))):
+                outputs[f"{name}_{key}"] = v
+
+        if ROUNDS == 8:
+            case("ties", [1500, 2600], 2, 300, 1, ties=True)
+            case("ties8", [3069], 8, 400, 6, ties=True)
+        else:
+            case("b8s8", [6 * T - 3], 8, 400, 2)  # in-flight tokens on two pages (ranks)
+            case("b8s8p", [4 * T], 8, 400, 7)  # a page's first tokens: three empty subpages
+            case("b8s8m", [5 * T + 250], 8, 400, 8)  # across a subpage boundary
+            case("b8s8d", [5 * T + 250], 8, 400, 9, offsets=[0, 1, 1, 3, 3, 4, 6, 7])
+            case("b8s1", [300, 2500, 1100, 3600, 700, 2049, 1500, 3000], 1, 256, 3)
+            case("b8s4", [2 * T + 125, 3 * T + 380], 4, 300, 10)  # two-subpage products
+            case("short", [100, 2600], 4, 300, 11)  # at most topk tokens: p_tie -1
+            case("two24", [9500], 8, 300, 4, chunk=16)  # the second chunk, clamped
+        np.savez(os.environ["OUT"], **outputs)
+        print("OK")
+    """
+
+    FILLS = "dsa_exchange_fill=1,dsa_vector_patch=1,dsa_skip_empty_subpages=1"
+    # Over the stage ring (depths not powers of two), then the resident keys.
+    KNOBS = "dsa_stage_slots=3,dsa_page_slots=6," + FILLS
+    RESIDENT = "dsa_page_slots=8,dsa_resident_keys=1,dsa_patch_loop=1," + FILLS
+
+    def test_bin_selection_is_unchanged(self):
+        self._runs(5, (self.KNOBS, self.RESIDENT))
+
+    def test_exact_selection_with_ties_is_unchanged(self):
+        self._runs(8, (self.RESIDENT,))
+
+
 class TestSelectedAttention(CustomTestCase):
     """The DCP attention with a DSA selection (``mla_dcp.DcpSelection``) in
     Pallas interpret mode on a 4-rank group: each row attends exactly its
@@ -1712,6 +1840,75 @@ class TestDecodeIndexer(CustomTestCase):
                 if case.get("GATHER"):  # the gather finish ran (on every rank)
                     self.assertGreaterEqual(
                         result.stdout.count("GATHER at round"), 4, result.stdout[-2000:]
+                    )
+
+
+class TestDecodeIndexerExchangeFill(CustomTestCase):
+    """``KernelConfig.dsa_exchange_fill`` inside the decode indexer: the
+    dense regime's step activity marked in the first count exchange's wait
+    (with the own keys, p_tie and the resident keys' copy wait), and the
+    scan regime after the rounds from the keys that wait completed, give bit
+    for bit the indexer's outputs without it (records, keys, thresholds, own
+    flags, step activity; each run also checks ``TestDecodeIndexer``'s
+    reference)."""
+
+    SCORING = (
+        "dsa_stage_slots=4,dsa_page_slots=8,dsa_resident_keys=1,"
+        "dsa_patch_loop=1,dsa_early_plan=1"
+    )
+
+    def test_same_outputs_with_the_fills(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        script = TestDecodeIndexer.SCRIPT.replace(
+            'print("OK" if ok else "FAIL")',
+            'np.savez(os.environ["OUT"], tau=tau, ptie=ptie, own=own, act=act, rec=rec, keys=keys)\n'
+            'print("OK" if ok else "FAIL")',
+        )
+        fills = "dsa_exchange_fill=1,dsa_vector_patch=1,dsa_skip_empty_subpages=1"
+        bins = {"S": "8", "TOPK": "400", "POS": "3069", "ROUNDS": "5"}
+        exact = {"S": "4", "TOPK": "200", "POS": "1500,3000", "ROUNDS": "8"}
+        cases = (
+            {**bins, "ACTIVITY_MIN_STEPS": "16"},  # dense: marked in the wait
+            {**bins, "ACTIVITY_MIN_STEPS": "0"},  # scanned after the rounds
+            {**exact, "ACTIVITY_MIN_STEPS": "16"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, case in enumerate(cases):
+                runs = []
+                for knobs in (self.SCORING, f"{self.SCORING},{fills}"):
+                    out = f"{tmp}/case{i}_{len(runs)}.npz"
+                    env = dict(
+                        os.environ,
+                        PYTHONPATH=os.pathsep.join(sys.path),
+                        KNOBS=knobs,
+                        OUT=out,
+                        **case,
+                    )
+                    result = subprocess.run(
+                        [sys.executable, "-c", script],
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=900,
+                    )
+                    self.assertIn(
+                        "OK",
+                        result.stdout,
+                        f"{case} {knobs}: {result.stdout[-2000:]}{result.stderr[-3000:]}",
+                    )
+                    runs.append(np.load(out))
+                base, other = runs
+                self.assertEqual(sorted(base.files), sorted(other.files))
+                for name in base.files:
+                    np.testing.assert_array_equal(
+                        base[name], other[name], err_msg=f"{case}: {name}"
                     )
 
 
