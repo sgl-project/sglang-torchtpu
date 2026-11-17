@@ -322,9 +322,7 @@ def all_gather_and_write_kv(
     here would re-lay out the whole pool around it on every layer.
 
     For an fp8 pool ``k``/``v`` are the compute-dtype tensors and ``quantize``
-    maps the gathered K/V to the pool dtype. Returns the gathered K/V (pool
-    dtype), which ring mode attends; its segments cover only the pages this
-    rank owns, at their slots in its page stripe.
+    maps the gathered K/V to the pool dtype. Returns the gathered K/V.
     """
     if quantize is None and kv_cache.dtype in (*_FP8_DTYPES, torch.uint8):
         raise ValueError(
