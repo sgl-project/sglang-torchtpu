@@ -526,6 +526,15 @@ def prepare_moe_layer_for_fused_decode(moe_layer: torch.nn.Module) -> bool:
 
 def prepare_model_for_fused_moe_decode(model: torch.nn.Module) -> int:
     """Prepare all eligible MoE modules in `model` after weight postprocessing."""
+    from sglang_tpu.envs import envs
+
+    if envs.SGLANG_TPU_USE_GLM_MOE_V2.get():
+        from sglang_tpu.moe.glm_moe_v2 import prepare_model as prepare_glm_moe_v2
+
+        prepared_glm = prepare_glm_moe_v2(model)
+        if prepared_glm is not None:
+            return prepared_glm
+
     if not is_fused_moe_decode_enabled():
         return 0
 

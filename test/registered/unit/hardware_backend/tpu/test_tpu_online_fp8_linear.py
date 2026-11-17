@@ -2,9 +2,8 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -13,7 +12,13 @@ from torch import nn
 from sglang.srt.layers.quantization import fp8
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.fp8_linear import prepare_tpu_online_fp8_linear_weights
+from sglang_tpu.fp8_linear import (
+    _set_channelwise_fp8_weight,
+    prepare_tpu_online_fp8_linear_weights,
+)
+from sglang_tpu.moe.glm_moe_v2 import _prepare_shared
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _FP8 = torch.float8_e4m3fn
 
@@ -112,6 +117,82 @@ class TestTpuOnlineFp8Linear(CustomTestCase):
         dequant = layer.weight.t().float() * layer.weight_scale
         relative_error = (dequant - weight).abs().max() / weight.abs().max()
         self.assertLess(relative_error.item(), 0.07)
+
+
+class TestGlmSharedChannelwiseGather(CustomTestCase):
+    def test_down_shards_keep_their_dequantized_values_after_replication(self):
+        """Different TP channel scales must survive shared-weight replication."""
+        down_weights = [
+            torch.tensor([[448.0, -224.0], [112.0, 448.0]]).to(_FP8),
+            torch.tensor([[224.0, 448.0], [-448.0, 112.0]]).to(_FP8),
+        ]
+        down_scales = [torch.tensor([0.01, 0.03]), torch.tensor([0.04, 0.015])]
+        expected_down = torch.cat(
+            [weight.float() * scale for weight, scale in zip(down_weights, down_scales)]
+        )
+        reference = nn.Module()
+        _set_channelwise_fp8_weight(reference, expected_down.t(), _FP8)
+        gate_up = [
+            (torch.arange(8).reshape(2, 4) + rank * 8).to(_FP8) for rank in range(2)
+        ]
+        gate_up_scales = [torch.arange(1, 5).float() * (rank + 1) for rank in range(2)]
+        expected_gate_up = torch.stack(
+            [
+                torch.cat(
+                    [weight[:, branch * 2 : (branch + 1) * 2] for weight in gate_up],
+                    dim=1,
+                )
+                for branch in range(2)
+            ]
+        )
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                peer = 1 - rank
+                # Only the collective boundary is simulated. Every returned
+                # tensor includes the actual local value produced by the binder.
+                peers = iter(
+                    [
+                        gate_up[peer][:, :2],
+                        gate_up[peer][:, 2:],
+                        gate_up_scales[peer][:2],
+                        gate_up_scales[peer][2:],
+                        down_scales[peer],
+                        reference.weight.data[peer * 2 : (peer + 1) * 2],
+                    ]
+                )
+
+                def gather(value, dim):
+                    other = next(peers)
+                    return torch.cat(
+                        [value, other] if rank == 0 else [other, value], dim=dim
+                    )
+
+                shared = SimpleNamespace(
+                    gate_up_proj=SimpleNamespace(
+                        weight=gate_up[rank],
+                        weight_scale=gate_up_scales[rank],
+                        weight_scale_inv=None,
+                    ),
+                    down_proj=SimpleNamespace(
+                        weight=down_weights[rank],
+                        weight_scale=down_scales[rank],
+                        weight_scale_inv=None,
+                    ),
+                )
+                moe = SimpleNamespace(shared_experts=shared, _shared_expert_tp1=False)
+                parallel = SimpleNamespace(
+                    tp_size=2, tp_group=SimpleNamespace(all_gather=gather)
+                )
+                self.assertTrue(_prepare_shared(moe, parallel))
+                actual_down = moe._glm_v2_sw2.float() * moe._glm_v2_ss2
+                relative_l2 = torch.linalg.vector_norm(
+                    actual_down - expected_down
+                ) / torch.linalg.vector_norm(expected_down)
+                self.assertLess(float(relative_l2), 0.04)
+                self.assertTrue(torch.isfinite(actual_down).all())
+                torch.testing.assert_close(
+                    moe._glm_v2_sw13.float(), expected_gate_up.float(), rtol=0, atol=0
+                )
 
 
 if __name__ == "__main__":
