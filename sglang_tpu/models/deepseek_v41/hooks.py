@@ -22,7 +22,11 @@ select_tpu_dsv41_loader
   How: AFTER get_model_loader swaps in DSV41RunaiModelStreamerLoader for a
        target model with Engram layers. Routed experts take the generic
        EP-local Run:AI read (sglang_tpu.ep_weight_shard); Engram tables leave
-       the stream and are read as this rank's row range.
+       the stream and are read as this rank's row range. With
+       SGLANG_TPU_DSV41_DEFERRED_LOAD it wraps the chosen loader in
+       DSV41DeferredDummyLoader, which boots on dummy weights and has
+       deferred_load load the real ones while the direct-tracer compile runs
+       (see deferred_load.py).
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: EngramEmbedding loads a pre-sliced row range from a
        model-owned checkpoint tensor filter.
@@ -122,6 +126,17 @@ def get_tpu_dsv41_bytes_per_full_token(original, configurator) -> float:
 
 
 def select_tpu_dsv41_loader(result, load_config, model_config=None):
+    from sglang_tpu.models.deepseek_v41 import deferred_load
+
+    result = _engram_row_loader(result, load_config, model_config)
+    if deferred_load.should_defer(model_config, load_config):
+        from sglang_tpu.models.deepseek_v41.loader import DSV41DeferredDummyLoader
+
+        return DSV41DeferredDummyLoader(load_config, result)
+    return result
+
+
+def _engram_row_loader(result, load_config, model_config):
     from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
     from sglang_tpu.ep_weight_shard import EPLocalRunaiModelStreamerLoader
 
