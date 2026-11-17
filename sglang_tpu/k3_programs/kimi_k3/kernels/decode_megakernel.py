@@ -7087,6 +7087,9 @@ def mla(
         and not mla_dcp.chunked(batch_size)  # chunked calls send per chunk (not prototyped)
         and "gather_late" not in dcp_skip
     )
+    # KernelConfig.dsa_prologue_in_select: the attention's gather wait, query
+    # unpack and state reset run in the selection's second exchange round.
+    queries_staged = queries_sent and bool(_config().dsa_prologue_in_select)
 
     def project_and_select():
         """q6: the projections, the new latent row's hand-out and (DSA) the
@@ -7189,6 +7192,14 @@ def mla(
                     absorbed_queries(), new_latent.astype(jnp.float32), dcp[0].layer % 2
                 )
 
+            def stage_queries():
+                make_attention(prime=False).stage_queries(dcp[0].layer % 2)
+
+            def prime_keys_early(selection):
+                # The staged prologue no longer covers the first key copies'
+                # latency: they start once the keys scratch is complete.
+                pl.when(early_prime)(make_attention(selection, prime=False).prime_keys)
+
             dcp_attention = make_attention(
                 dsa.selection(
                     dcp[0],
@@ -7197,10 +7208,13 @@ def mla(
                     query_latent,
                     dcp[0].layer % 2,
                     after_gather=send_queries_early if queries_sent else None,
+                    in_exchange=stage_queries if queries_staged else None,
+                    keys_ready=prime_keys_early if queries_staged else None,
                 ),
                 prime=False,
             )
-            pl.when(early_prime)(dcp_attention.prime_keys)
+            if not queries_staged:
+                pl.when(early_prime)(dcp_attention.prime_keys)
             pl.when(jnp.logical_not(early_prime))(dcp_attention.prime)
 
         _phase_end(mla_scope.pop())
@@ -7250,6 +7264,7 @@ def mla(
                 new_latent.astype(jnp.float32),
                 dcp[0].layer % 2,
                 queries_sent=True,
+                queries_staged=queries_staged,
                 while_combining=output_gate,
             )
         else:

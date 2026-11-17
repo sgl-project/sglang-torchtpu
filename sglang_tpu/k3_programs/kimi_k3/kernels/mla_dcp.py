@@ -731,7 +731,15 @@ class DcpAttention:
                 )
             return row, step - self.ws.lookup_bounds[row], self.ws.lookup_counts[row]
         row, first, count = 0, 0, self.counts[0]
-        for b in range(1, self.batch):
+        rows = range(1, self.batch)
+        if _config().dcp_shift_scalars and self.shared and not isinstance(step, int):
+            # A shared sequence's later rows own no steps (their starts are the
+            # next sequence's), so a step below the total is in the last
+            # sequence whose first row starts at or before it. (Static steps,
+            # the primes', keep the full search: their local steps stay traced,
+            # as the copies past a row's steps are never issued.)
+            rows = range(self.sequence_rows, self.batch, self.sequence_rows)
+        for b in rows:
             later = step >= self.starts[b]
             row = jnp.where(later, b, row)
             first = jnp.where(later, self.starts[b], first)
@@ -756,8 +764,38 @@ class DcpAttention:
             return True
         return sel.active[row * sel.steps + local_step] != 0
 
+    def _div(self, x, d):
+        """``x // d`` for a static ``d`` (``KernelConfig.dcp_shift_scalars``: a
+        power of two as an arithmetic shift, floor division for every int32)."""
+        if _config().dcp_shift_scalars and d & (d - 1) == 0 and not isinstance(x, int):
+            return x >> (d.bit_length() - 1)
+        return x // d
+
+    def _mod(self, x, d):
+        """``x % d`` for a static ``d`` (``dcp_shift_scalars``: a power of two as
+        a mask, the floor remainder for every int32)."""
+        if _config().dcp_shift_scalars and d & (d - 1) == 0 and not isinstance(x, int):
+            return x & (d - 1)
+        return x % d
+
+    def _slot(self, step):
+        """Page buffer of step ``step`` (``dcp_shift_scalars``: steps are
+        nonnegative, so a remainder needs no sign fixup)."""
+        if not _config().dcp_shift_scalars or isinstance(step, int):
+            return step % self.buffers
+        if self.buffers & (self.buffers - 1) == 0:
+            return step & (self.buffers - 1)
+        return jax.lax.rem(step, jnp.int32(self.buffers))
+
+    def _step_token(self, local_step, offset):
+        """Global positions of a step's token offsets ``offset`` (int32)."""
+        page = (
+            local_step * self.span + self._div(offset, self.page_tokens)
+        ) * self.group + self.owner
+        return page * self.page_tokens + self._mod(offset, self.page_tokens)
+
     def _start_copies(self, step, row, local_step, count):
-        slot = step % self.buffers
+        slot = self._slot(step)
         if self.selection is not None:
             sel = self.selection
             rows = sel.key_buf.shape[1]
@@ -805,7 +843,7 @@ class DcpAttention:
             # zero weights): a slot's first use in the layer may hold another scoped
             # region's bytes, which can read as NaN. Later uses hold loaded pages.
             pl.when(jnp.logical_not(active) & (step < self.buffers))(
-                lambda: self._zero_slot(step % self.buffers)
+                lambda: self._zero_slot(self._slot(step))
             )
             return
         self._wait_copies(step)
@@ -827,7 +865,7 @@ class DcpAttention:
             )
 
     def _wait_copies(self, step):
-        slot = step % self.buffers
+        slot = self._slot(step)
         tpu.make_async_copy(
             self.ws.pages.at[slot],
             self.ws.pages.at[slot],
@@ -848,10 +886,7 @@ class DcpAttention:
             axis=1,
         )  # [1, span * page_tokens]: tokens on lanes
         offset = jax.lax.broadcasted_iota(jnp.int32, keys.shape, 1)
-        page = (
-            local_step * self.span + offset // self.page_tokens
-        ) * self.group + self.owner
-        token = page * self.page_tokens + offset % self.page_tokens
+        token = self._step_token(local_step, offset)
         mask = dsa_dcp.selected(keys, token, sel.tau[row + r], sel.p_tie[row + r])
         if (
             sel.active is not None
@@ -989,30 +1024,46 @@ class DcpAttention:
                 & (local_page < self.span)
             )
 
+        if _config().dcp_shift_scalars:
+            first_step, last_step = self._cached_row_steps(row)
+            cached = (local_step == first_step) | (local_step == last_step)
+        else:
+            cached = in_step(self.position_ref[row]) | in_step(
+                self.position_ref[row + self.sequence_rows - 2]
+            )
+
         # Only the step holding the cached verify rows' pages writes them.
-        @pl.when(
-            in_step(self.position_ref[row])
-            | in_step(self.position_ref[row + self.sequence_rows - 2])
-        )
+        @pl.when(cached)
         def cache_rows():
             @pl.loop(0, self.sequence_rows - 1)
             def cache(r):
-                self._cache_verify_row(step % self.buffers, local_step, row + r)
+                self._cache_verify_row(self._slot(step), local_step, row + r)
 
         offset = jax.lax.broadcasted_iota(
             jnp.int32, (1, self.span * self.page_tokens), 1
         )
-        page = (
-            local_step * self.span + offset // self.page_tokens
-        ) * self.group + self.owner
-        token = page * self.page_tokens + offset % self.page_tokens
-        slot = step % self.buffers
+        token = self._step_token(local_step, offset)
+        slot = self._slot(step)
         if _grouped_spec(self.batch, self.group, self.heads, self.sequence_rows):
 
             def dense():
                 if self._compact_steps():
                     self._zero_step_pad_lanes(slot)
                 for first in range(0, self.sequence_rows, 4):
+                    if _config().dsa_row_block_masks:
+                        row_visible = []
+                        for i in range(4):
+                            visible = token < self.position_ref[row] + first + i
+                            if self.selection is not None:
+                                visible = visible & self._selected(
+                                    slot, local_step, row, first + i
+                                )
+                            row_visible.append(visible)
+                        score = self._group_scores_rows(
+                            load, row_visible, row - base + first
+                        )
+                        self._group_fold(score, load, row - base + first, 4)
+                        continue
                     query = (
                         jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0)
                         // self.tile
@@ -1071,7 +1122,7 @@ class DcpAttention:
                 low = tier
             pl.when(count > compact)(dense)
             # ``_locate``'s count is the row's local pages: its last step folds the window.
-            last_step = (row_pages + self.span - 1) // self.span - 1
+            last_step = self._div(row_pages + self.span - 1, self.span) - 1
             pl.when(local_step == last_step)(lambda: self._flush_window(row - base))
         else:
 
@@ -1081,6 +1132,40 @@ class DcpAttention:
                 if self.selection is not None:
                     visible = visible & self._selected(slot, local_step, row, r)
                 self._fold_pages(load, visible, row - base + r)
+
+    def _row_steps(self, row):
+        """This rank's local steps holding the pages of sequence ``row``'s first
+        and last cached verify rows (-1: another rank's page; local steps are
+        nonnegative). A step holds position ``p`` when ``p``'s page is this
+        owner's and ``local_step * span <= page // group < (local_step + 1)
+        * span``, i.e. ``local_step == page // group // span`` (``in_step``)."""
+
+        def holder(position):
+            page = self._div(position, self.page_tokens)
+            return jnp.where(
+                self._mod(page, self.group) == self.owner,
+                self._div(self._div(page, self.group), self.span),
+                -1,
+            )
+
+        return (
+            holder(self.position_ref[row]),
+            holder(self.position_ref[row + self.sequence_rows - 2]),
+        )
+
+    def _cached_row_steps(self, row):
+        """``_row_steps`` of the step's sequence ``row``: from the values found
+        before the step loop (``_step_loop``) if it has them."""
+        hoisted = getattr(self, "_hoisted_steps", None)
+        if not hoisted:
+            return self._row_steps(row)
+        _, steps = hoisted[0]
+        for first, other in hoisted[1:]:
+            steps = tuple(
+                jnp.where(row == first, value, kept)
+                for value, kept in zip(other, steps, strict=True)
+            )
+        return steps
 
     def _compact_tokens(self):
         """Slots of a compact verify step (``KernelConfig.dsa_compact_tokens``;
@@ -1100,10 +1185,7 @@ class DcpAttention:
         offset = jax.lax.broadcasted_iota(
             jnp.int32, keys.shape, 0
         ) * 128 + jax.lax.broadcasted_iota(jnp.int32, keys.shape, 1)
-        page = (
-            local_step * self.span + offset // self.page_tokens
-        ) * self.group + self.owner
-        token = page * self.page_tokens + offset % self.page_tokens
+        token = self._step_token(local_step, offset)
         mask = dsa_dcp.selected(keys, token, sel.tau[row + r], sel.p_tie[row + r])
         mask = mask & (token < self.position_ref[row] + r)
         if sel.active is not None:  # a skipped step's buffers hold an earlier step's bytes
@@ -1167,6 +1249,15 @@ class DcpAttention:
         """Grouped QK / fold of gathered slots (``slot_load(lanes)``) with the
         rows' slot masks ``slot_visible`` [rows, slots] (1.0 visible)."""
         slots = slot_visible.shape[1]
+        if _config().dsa_row_block_masks:
+            for first in range(0, self.sequence_rows, 4):
+                score = self._group_scores_rows(
+                    slot_load,
+                    [slot_visible[first + i : first + i + 1] > 0.5 for i in range(4)],
+                    held + first,
+                )
+                self._group_fold(score, slot_load, held + first, 4)
+            return
         for first in range(0, self.sequence_rows, 4):
             query = (
                 jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0)
@@ -1196,7 +1287,7 @@ class DcpAttention:
             (((1,), (1,)), ((), ())),
             preferred_element_type=jnp.float32,
         )  # [compact, rows]
-        fill[0] = fill[0] + (count + 31) // 32 * 32
+        fill[0] = fill[0] + self._div(count + 31, 32) * 32
 
     def _flush_window(self, held):
         """Fold the window's slots into row ``held``'s state and empty it."""
@@ -1221,6 +1312,18 @@ class DcpAttention:
             window //= 2
         if window:
             window = max(window, self._compact_tokens())  # a step's slots always fit
+        if self.cache_verify_rows and _config().dcp_shift_scalars:
+            # The steps holding each sequence's cached verify rows, once a call
+            # (or chunk) rather than from the positions every step.
+            rows = (
+                chunk_layout(self.batch, self.heads, chunk_rows=self.chunk_rows)[0]
+                if chunked(self.batch, self.force_chunked)
+                else self.batch
+            )
+            self._hoisted_steps = [
+                (base + j, self._row_steps(base + j))
+                for j in range(0, rows, self.sequence_rows)
+            ]
         if not (
             window
             and self.cache_verify_rows
@@ -1234,6 +1337,7 @@ class DcpAttention:
                 pl.when(first < end)(lambda: self._attend_step(end - 1, base=base))
                 return
             pl.loop(first, end)(lambda step: self._attend_step(step, base=base))
+            self._hoisted_steps = None
             return
 
         def run(tokens, visible, fill):
@@ -1250,6 +1354,7 @@ class DcpAttention:
             tpu.VMEM((window, self.sequence_rows), jnp.float32),
             tpu.SMEM((1,), jnp.int32),
         )
+        self._hoisted_steps = None
 
     def _step_pages(self, step, *, interior=False):
         """Step ``step``'s row, the mask of its visible tokens and a reader of
@@ -1263,12 +1368,9 @@ class DcpAttention:
         offset = jax.lax.broadcasted_iota(
             jnp.int32, (1, self.span * self.page_tokens), 1
         )  # tokens on lanes
-        global_page = (
-            local_step * self.span + offset // self.page_tokens
-        ) * self.group + self.owner
-        token = global_page * self.page_tokens + offset % self.page_tokens
+        token = self._step_token(local_step, offset)
         visible = token < self._limit(row)
-        slot = step % self.buffers
+        slot = self._slot(step)
         if self.selection is not None and not self.shared:
             visible = visible & self._selected(slot, local_step, row)
         self._clean_step(slot, row, local_step, pad=not self._compact_steps())
@@ -1398,7 +1500,7 @@ class DcpAttention:
         def prefetch():
             self._start_step(step + self.buffers - 1)
 
-        held, slot = row - base, step % self.buffers
+        held, slot = row - base, self._slot(step)
         local_step, pages = count // self.span, count % self.span
         part_pages = self.span // self.folds
         self._clean_step(
@@ -1484,7 +1586,7 @@ class DcpAttention:
                         self._wait_step(step + 1)
 
                     upcoming = scores(jnp.minimum(step + 1, end - 1))
-                self._fold_scores(score, self._pages(step % self.buffers), row - base)
+                self._fold_scores(score, self._pages(self._slot(step)), row - base)
 
                 @pl.when((True if peel else more) & (step + self.buffers < self.total))
                 def prefetch():
@@ -1495,9 +1597,7 @@ class DcpAttention:
             carry = jax.lax.fori_loop(first, end - int(peel), fold, scores(first))
             if peel:
                 score, row = carry
-                self._fold_scores(
-                    score, self._pages((end - 1) % self.buffers), row - base
-                )
+                self._fold_scores(score, self._pages(self._slot(end - 1)), row - base)
 
     def _store_query(self, held, query):
         """Quantize once per query, outside the streamed page loop.
@@ -1530,6 +1630,36 @@ class DcpAttention:
         if visible is None:
             return score * scales
         return jnp.where(visible, score * scales, -jnp.inf)
+
+    def _group_scores_rows(self, load, row_visible, held):
+        """``_group_scores`` of ``len(row_visible)`` queries whose masks are
+        rows (``[1, tokens]`` each): query ``i``'s mask applies to its own
+        ``tile``-row block of the grouped scores (the same masked scores as a
+        ``[count tile, tokens]`` mask)."""
+        count, tile = len(row_visible), self.tile
+        query = jnp.concatenate(
+            [self.ws.queries[held + i] for i in range(count)], axis=0
+        )
+        scales = jnp.concatenate(
+            [self.ws.query_scale[held + i] for i in range(count)], axis=0
+        )
+        latent = load(pl.ds(0, LANES))
+        score = (
+            jax.lax.dot_general(
+                query,
+                latent,
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            * scales
+        )
+        return jnp.concatenate(
+            [
+                jnp.where(row_visible[i], score[i * tile : (i + 1) * tile], -jnp.inf)
+                for i in range(count)
+            ],
+            axis=0,
+        )
 
     def _group_fold(self, score, load, held, count):
         """Fold grouped PV back into each query's own online state (under
@@ -2090,6 +2220,60 @@ class DcpAttention:
             others, others, ws.combine_semaphores.at[1, parity, 0]
         ).wait()
 
+    def _reset_state(self):
+        """The rows' online softmax state before the local attention."""
+        ws = self.ws
+        ws.maximum[...] = jnp.full(ws.maximum.shape, -jnp.inf, jnp.float32)
+        ws.denominator[...] = jnp.zeros(ws.denominator.shape, jnp.float32)
+        ws.accumulator[...] = jnp.zeros(ws.accumulator.shape, jnp.float32)
+
+    def _wait_gather(self, parity, g):
+        """Row group ``g``'s query gather: this rank's sends left, the peers'
+        queries arrived."""
+        ws, group = self.ws, self.group
+        first, end = self.row_groups()[g]
+        rows = pl.ds(self.slots * first, self.slots * (end - first))
+        others = ws.gathered.at[parity, pl.ds(0, group - 1), rows]
+        if "gather" not in self.skip:
+            with self._scope("gather_wait"):
+                tpu.make_async_copy(
+                    others, others, ws.gather_semaphores.at[0, parity, g]
+                ).wait()
+                tpu.make_async_copy(
+                    others, others, ws.gather_semaphores.at[1, parity, g]
+                ).wait()
+
+    def _unpack_queries(self, parity, first, end):
+        """Rows ``first .. end``'s gathered queries into the score tiles."""
+        ws, heads = self.ws, self.group * self.slots
+        for b in range(first, end):
+            # [G, slots, 640] -> [slots G, 640] (slot `slots` d + h is member
+            # d's head h), padded to the tile's rows.
+            gathered = ws.gathered[
+                parity, :, pl.ds(self.slots * b, self.slots), :
+            ].reshape(heads, LANES)
+            padding = ((0, self.tile - heads), (0, 0))
+            if ws.gathered.dtype == jnp.uint8:
+                query, scale = _unpack_fp8_query(gathered)
+                ws.queries[b] = jnp.pad(query, padding)
+                ws.query_scale[b] = jnp.pad(scale, padding, constant_values=1)
+            else:
+                self._store_query(b, jnp.pad(gathered.astype(jnp.float32), padding))
+
+    def stage_queries(self, parity):
+        """``attend``'s prologue ahead of it, once ``send_queries`` has sent
+        this rank's queries (``KernelConfig.dsa_prologue_in_select``: inside
+        the selection's exchange wait): the state reset, every row group's
+        gather wait and query unpack. ``attend`` then runs with
+        ``queries_sent=True, queries_staged=True`` on the same workspace;
+        nothing else writes these buffers in between."""
+        if chunked(self.batch, self.force_chunked):
+            raise ValueError("chunked calls gather queries per chunk")
+        self._reset_state()
+        for g, (first, end) in enumerate(self.row_groups()):
+            self._wait_gather(parity, g)
+            self._unpack_queries(parity, first, end)
+
     def attend(
         self,
         queries,
@@ -2100,6 +2284,7 @@ class DcpAttention:
         keys=None,
         key_valid=None,
         queries_sent=False,
+        queries_staged=False,
         while_combining: Callable[[], None] | None = None,
     ):
         """``queries`` [B, heads, 640] FP32 absorbed (scale folded in),
@@ -2113,6 +2298,9 @@ class DcpAttention:
         rank holding all of them) where ``key_valid[s]`` ([sequences, 1, K]
         int32) is nonzero (``new_latents`` is then unused). A row sees at
         least one valid key.
+
+        ``queries_staged`` (with ``queries_sent``): ``stage_queries`` already
+        waited for the gather, unpacked the queries and reset the state.
 
         The rows run in groups (``row_groups``): every group's queries go out
         first; then per group, in order, its gather is awaited, its pages
@@ -2132,7 +2320,6 @@ class DcpAttention:
             self.base,
             self.batch,
         )
-        heads = group * self.slots
         groups = self.row_groups()
         pair = self._pair_combine(keys)
 
@@ -2147,35 +2334,18 @@ class DcpAttention:
 
         if between is not None:
             between()
-        ws.maximum[...] = jnp.full(ws.maximum.shape, -jnp.inf, jnp.float32)
-        ws.denominator[...] = jnp.zeros(ws.denominator.shape, jnp.float32)
-        ws.accumulator[...] = jnp.zeros(ws.accumulator.shape, jnp.float32)
+        if queries_staged and not queries_sent:
+            raise ValueError("staged queries are sent early (send_queries)")
+        if not queries_staged:
+            self._reset_state()
 
         for g, (first, end) in enumerate(groups):
-            others = ws.gathered.at[parity, pl.ds(0, group - 1), rows_of(g)]
-            if "gather" not in self.skip:
-                with self._scope("gather_wait"):
-                    tpu.make_async_copy(
-                        others, others, ws.gather_semaphores.at[0, parity, g]
-                    ).wait()
-                    tpu.make_async_copy(
-                        others, others, ws.gather_semaphores.at[1, parity, g]
-                    ).wait()
+            if not queries_staged:
+                self._wait_gather(parity, g)
             local_scope = self._scope("local")
             local_scope.__enter__()
-            for b in range(first, end):
-                # [G, slots, 640] -> [slots G, 640] (slot `slots` d + h is member
-                # d's head h), padded to the tile's rows.
-                gathered = ws.gathered[
-                    parity, :, pl.ds(self.slots * b, self.slots), :
-                ].reshape(heads, LANES)
-                padding = ((0, self.tile - heads), (0, 0))
-                if ws.gathered.dtype == jnp.uint8:
-                    query, scale = _unpack_fp8_query(gathered)
-                    ws.queries[b] = jnp.pad(query, padding)
-                    ws.query_scale[b] = jnp.pad(scale, padding, constant_values=1)
-                else:
-                    self._store_query(b, jnp.pad(gathered.astype(jnp.float32), padding))
+            if not queries_staged:
+                self._unpack_queries(parity, first, end)
 
             # 2. Local attention over this rank's pages (the group's steps).
             # Attention DP's group rows pipeline the fold as chunked calls do.
@@ -2568,9 +2738,23 @@ def _pack_fp8_query(query):
 
 
 def _unpack_fp8_query(packet):
-    """Recover the exact query/scale and clear metadata before the QK dot."""
+    """Recover the exact query/scale and clear metadata before the QK dot
+    (``KernelConfig.dcp_query_tail_unpack``: lanes 0:512 pass through as
+    bytes and only the last lane tile is widened)."""
+    if _config().dcp_query_tail_unpack:
+        head = jax.lax.bitcast_convert_type(packet[:, :LATENT], jnp.float8_e4m3fn)
+        tail, scale = _unpack_fp8_lanes(packet[:, LATENT:], LATENT)
+        return jnp.concatenate([head, tail], axis=1), scale
+    return _unpack_fp8_lanes(packet)
+
+
+def _unpack_fp8_lanes(packet, first_lane=0):
+    """``_unpack_fp8_query`` of a packet's lanes ``first_lane ..``: the query
+    bytes below 576, the scale from the bytes in 576:580, zeros from 576."""
     packet = packet.astype(jnp.uint32)
     lanes = jax.lax.broadcasted_iota(jnp.int32, packet.shape, 1)
+    if first_lane:
+        lanes = lanes + first_lane
     # Reassemble the scale with a lane reduction; narrow byte slices lose bits on TPU.
     words = packet << (((lanes - 576) % 4) * 8)
     bits = jnp.sum(

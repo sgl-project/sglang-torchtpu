@@ -185,6 +185,20 @@ class KernelConfig:
     # many slots, folded once when full and at each row's last step (instead
     # of one fold a step). 0: fold every compact step.
     dsa_compact_window: int = 0
+    # Grouped FP8 verify folds (compact steps, window flushes, dense steps):
+    # each query row's 96-row block of the four-row score tile is masked by
+    # that row's own token mask, instead of a [4 x 96, tokens] mask built by
+    # a select chain over the row index. The same masked scores.
+    dsa_row_block_masks: bool = False
+    # Kimi-K3.1 decode attention whose query gather leaves during the indexer
+    # (unchunked DSA calls, up to 8 rows): the gather wait, the FP8 query
+    # unpack and the softmax state reset run inside the selection's second
+    # exchange round (between its sends and its wait; seeded window: the
+    # round after the window round) instead of at the start of the
+    # attention, and the first steps' key copies start once the keys scratch
+    # is complete (dsa_exchange_fill: in the first exchange's wait). The same
+    # values in the same buffers, earlier.
+    dsa_prologue_in_select: bool = False
     # Kimi-K3.1 decode epilogue: commit the step's latent rows and DSA
     # index keys in one kernel (paged._commit_dsa_rows_fused) instead of the
     # latent commit kernel and 48 XLA scatters.
@@ -227,6 +241,26 @@ class KernelConfig:
     # instead of eight (a 1M-context table's 128-row chunk: 64 loads and 56
     # ORs a count block instead of 16 and 8). The same keys and counts.
     dsa_odd_stride: bool = False
+    # Kimi-K3.1 decode selection: the first count exchange's wait (its remote
+    # copies in flight) runs the work that needs no threshold instead of the
+    # end of the rounds: the dense step activity's fill (every attention step
+    # marked), each row's own in-flight key and the bin selection's p_tie
+    # (lane extractions into SMEM) and the resident keys' copy wait (with
+    # dsa_prologue_in_select, then the attention's first key copies). The
+    # same SMEM values and copies (bit-identical).
+    dsa_exchange_fill: bool = False
+    # Kimi-K3.1 decode selection scoring loop: each in-flight token's keys go
+    # into its page for all of the sequence's rows with one lane rotation and
+    # a masked select (instead of a lane sum per row and token). The same
+    # keys (bit-identical).
+    dsa_vector_patch: bool = False
+    # Kimi-K3.1 decode selection scoring loop, sequences of 4+ rows: on a page
+    # holding the sequence's in-flight tokens only the products of its parts
+    # (a subpage at 8 rows a sequence, two at 4) below the sequence's last
+    # position run (one loop over them); the subpages past it take INT_MIN
+    # keys, the value the masked products give them. Other pages keep one
+    # straight-line body. The same keys (bit-identical).
+    dsa_skip_empty_subpages: bool = False
     # MLA DCP combine of unchunked one-group calls with three heads a rank
     # (B1, B4, B8 and the 8-row verifies) in two stages: the chip's two
     # cores (members 2k, 2k + 1) first merge their partials on-chip, each
@@ -234,6 +268,16 @@ class KernelConfig:
     # partial per chip -- half the cross-chip combine bytes. Merged partials
     # round to BF16 once more.
     dcp_pair_combine: bool = False
+    # DCP attention step loop: power-of-two divisions and remainders of
+    # positions, pages and steps as arithmetic shifts and masks (floor
+    # division for every int32, without the sign fixups), and the step that
+    # writes a verify sequence's cached rows found once before the loop
+    # instead of from its positions every step. Bit-identical.
+    dcp_shift_scalars: bool = False
+    # FP8 query packets (DCP query gather): unpack only the last 128-lane
+    # tile through 32-bit lanes (the scale's bytes, the zeroed pad lanes);
+    # lanes 0:512 pass through as bytes. The same query bytes and scale bits.
+    dcp_query_tail_unpack: bool = False
     # Decode layer loop: test KDA first in the layer-type branch, so the
     # instruction overlays place the post-join code for the 68 KDA layers.
     decode_kda_branch_first: bool = True
