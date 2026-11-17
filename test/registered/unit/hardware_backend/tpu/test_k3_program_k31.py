@@ -363,9 +363,6 @@ print("OK")
         self.assertNotIn("non-zero count", result.stdout + result.stderr)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestDsaReference(CustomTestCase):
     """The host reference of the DSA selection, including the distributed
@@ -5376,3 +5373,7 @@ class TestIndexSelectSeededWindow(CustomTestCase):
             self.assertEqual(sorted(base.files), sorted(seeded.files))
             for name in base.files:
                 np.testing.assert_array_equal(base[name], seeded[name], err_msg=name)
+
+
+if __name__ == "__main__":
+    unittest.main()
