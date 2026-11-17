@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="960" viewBox="0 0 1440 960" font-family="'Helvetica Neue',Arial,sans-serif" font-size="14">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <rect width="1440" height="960" fill="#ffffff"/>
+  <text x="720" y="34" text-anchor="middle" font-size="22" font-weight="bold">PR #2014 --session-leaf-at-prompt-end: three turns of one agentic session in the radix tree</text>
+
+  <!-- ============ Legend: what each label means ============ -->
+  <rect x="20" y="55" width="620" height="270" rx="8" fill="#fafafa" stroke="#ccc"/>
+  <text x="36" y="80" font-size="16" font-weight="bold">Labels</text>
+  <rect x="36" y="94" width="26" height="18" fill="#cfe2ff" stroke="#3d6fb6"/><text x="72" y="108"><tspan font-weight="bold">SYS</tspan>: system prompt + tool definitions (prefix shared by every session)</text>
+  <rect x="36" y="122" width="26" height="18" fill="#cfe2ff" stroke="#3d6fb6"/><text x="72" y="136"><tspan font-weight="bold">P1</tspan>: turn-1 user input; <tspan font-weight="bold">Pk</tspan> = the full prompt the client sends in turn k</text>
+  <rect x="36" y="150" width="26" height="18" fill="#e9d8fd" stroke="#7b4bc4"/><text x="72" y="164"><tspan font-weight="bold">Ok</tspan>: output tokens the model generated in turn k (as cached by the server)</text>
+  <rect x="36" y="178" width="26" height="18" fill="#ffe0b2" stroke="#d9822b"/><text x="72" y="192"><tspan font-weight="bold">Rk</tspan>: Ok as the client resends it next turn, re-rendered as text</text>
+  <text x="72" y="210" fill="#b23c17">(same text, different tokens after re-tokenization / chat template, so the tree branches here)</text>
+  <rect x="36" y="222" width="26" height="18" fill="#d3f2d9" stroke="#2f8f46"/><text x="72" y="236"><tspan font-weight="bold">Uk</tspan>: user / tool-result messages appended in turn k</text>
+  <text x="36" y="266" font-weight="bold">Relation:</text>
+  <text x="112" y="266">P2 = SYS+P1 + R1 + U2, P3 = P2 + R2 + U3 (every turn resends the whole history)</text>
+  <text x="36" y="292" font-weight="bold">leaf:</text>
+  <text x="112" y="292">the session's resume point; the path from root to it is covered and evicted last</text>
+  <text x="36" y="314" fill="#666">★ = current session leaf; dashed flag = former leaf, retired by the next turn's leaf</text>
+
+  <!-- ============ Token strips: what the client sends each turn ============ -->
+  <rect x="660" y="55" width="760" height="270" rx="8" fill="#fafafa" stroke="#ccc"/>
+  <text x="676" y="80" font-size="16" font-weight="bold">Token sequence per turn (server view)</text>
+  <!-- turn 1 -->
+  <text x="676" y="122" font-weight="bold">Turn 1</text>
+  <rect x="740" y="104" width="160" height="28" fill="#cfe2ff" stroke="#3d6fb6"/><text x="820" y="123" text-anchor="middle">SYS+P1</text>
+  <rect x="900" y="104" width="90" height="28" fill="#e9d8fd" stroke="#7b4bc4"/><text x="945" y="123" text-anchor="middle">O1 (output)</text>
+  <!-- turn 2 -->
+  <text x="676" y="182" font-weight="bold">Turn 2</text>
+  <rect x="740" y="164" width="160" height="28" fill="#cfe2ff" stroke="#3d6fb6"/><text x="820" y="183" text-anchor="middle">SYS+P1</text>
+  <rect x="900" y="164" width="90" height="28" fill="#ffe0b2" stroke="#d9822b"/><text x="945" y="183" text-anchor="middle">R1</text>
+  <rect x="990" y="164" width="80" height="28" fill="#d3f2d9" stroke="#2f8f46"/><text x="1030" y="183" text-anchor="middle">U2</text>
+  <rect x="1070" y="164" width="90" height="28" fill="#e9d8fd" stroke="#7b4bc4"/><text x="1115" y="183" text-anchor="middle">O2 (output)</text>
+  <text x="1170" y="183" fill="#666">← prompt = P2</text>
+  <!-- turn 3 -->
+  <text x="676" y="242" font-weight="bold">Turn 3</text>
+  <rect x="740" y="224" width="160" height="28" fill="#cfe2ff" stroke="#3d6fb6"/><text x="820" y="243" text-anchor="middle">SYS+P1</text>
+  <rect x="900" y="224" width="90" height="28" fill="#ffe0b2" stroke="#d9822b"/><text x="945" y="243" text-anchor="middle">R1</text>
+  <rect x="990" y="224" width="80" height="28" fill="#d3f2d9" stroke="#2f8f46"/><text x="1030" y="243" text-anchor="middle">U2</text>
+  <rect x="1070" y="224" width="90" height="28" fill="#ffe0b2" stroke="#d9822b"/><text x="1115" y="243" text-anchor="middle">R2</text>
+  <rect x="1160" y="224" width="80" height="28" fill="#d3f2d9" stroke="#2f8f46"/><text x="1200" y="243" text-anchor="middle">U3</text>
+  <rect x="1240" y="224" width="90" height="28" fill="#e9d8fd" stroke="#7b4bc4"/><text x="1285" y="243" text-anchor="middle">O3 (output)</text>
+  <!-- divergence lines -->
+  <line x1="900" y1="96" x2="900" y2="262" stroke="#b23c17" stroke-width="2" stroke-dasharray="5,4"/>
+  <line x1="1070" y1="156" x2="1070" y2="262" stroke="#b23c17" stroke-width="2" stroke-dasharray="5,4"/>
+  <text x="900" y="282" text-anchor="middle" fill="#b23c17">branch = end of P1</text>
+  <text x="1070" y="282" text-anchor="middle" fill="#b23c17">branch = end of P2</text>
+  <text x="676" y="310" fill="#b23c17">Each turn diverges from the cached O at the previous prompt's end: O1, O2 are never hit again.</text>
+
+  <!-- ============ Left tree: without flag ============ -->
+  <rect x="20" y="345" width="690" height="440" rx="8" fill="#fff" stroke="#999"/>
+  <text x="365" y="372" text-anchor="middle" font-size="17" font-weight="bold">Without the flag: leaf at the output end</text>
+  <circle cx="45" cy="520" r="10" fill="#444"/><text x="45" y="548" text-anchor="middle" font-size="12">root</text>
+  <line x1="55" y1="520" x2="75" y2="520" stroke="#555" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="78" y="498" width="120" height="44" rx="6" fill="#cfe2ff" stroke="#3d6fb6"/><text x="138" y="525" text-anchor="middle">SYS+P1</text>
+  <!-- O1 -->
+  <line x1="198" y1="520" x2="238" y2="440" stroke="#555" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="240" y="418" width="110" height="44" rx="6" fill="#e9d8fd" stroke="#c0392b" stroke-width="4"/><text x="295" y="445" text-anchor="middle">O1</text>
+  <text x="295" y="408" text-anchor="middle" fill="#c0392b" font-weight="bold">★ T1 leaf</text>
+  <!-- R1+U2 -->
+  <line x1="198" y1="520" x2="238" y2="600" stroke="#555" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="240" y="578" width="110" height="44" rx="6" fill="#ffe0b2" stroke="#d9822b"/><text x="295" y="605" text-anchor="middle">R1+U2</text>
+  <!-- O2 -->
+  <line x1="350" y1="600" x2="390" y2="530" stroke="#555" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="392" y="508" width="110" height="44" rx="6" fill="#e9d8fd" stroke="#c0392b" stroke-width="4"/><text x="447" y="535" text-anchor="middle">O2</text>
+  <text x="447" y="498" text-anchor="middle" fill="#c0392b" font-weight="bold">★ T2 leaf</text>
+  <!-- R2+U3 -->
+  <line x1="350" y1="600" x2="390" y2="670" stroke="#555" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="392" y="648" width="110" height="44" rx="6" fill="#ffe0b2" stroke="#d9822b"/><text x="447" y="675" text-anchor="middle">R2+U3</text>
+  <!-- O3 -->
+  <line x1="502" y1="670" x2="542" y2="670" stroke="#555" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="544" y="648" width="110" height="44" rx="6" fill="#e9d8fd" stroke="#c0392b" stroke-width="4"/><text x="599" y="675" text-anchor="middle">O3</text>
+  <text x="599" y="638" text-anchor="middle" fill="#c0392b" font-weight="bold">★ T3 leaf</text>
+  <text x="40" y="728" font-weight="bold">session leaves = {O1, O2, O3}: only grows</text>
+  <text x="40" y="750">• O2 is not a descendant of O1 (they split at the end of P1), so coverage cannot advance; a leaf is added</text>
+  <text x="40" y="772" fill="#c0392b">• Coverage protects O branches nobody will hit; the P end the next turn resumes from is not a leaf</text>
+
+  <!-- ============ Right tree: with flag ============ -->
+  <rect x="730" y="345" width="690" height="440" rx="8" fill="#fff" stroke="#999"/>
+  <text x="1075" y="372" text-anchor="middle" font-size="17" font-weight="bold">With --session-leaf-at-prompt-end: leaf at the prompt end</text>
+  <circle cx="755" cy="520" r="10" fill="#444"/><text x="755" y="548" text-anchor="middle" font-size="12">root</text>
+  <line x1="765" y1="520" x2="785" y2="520" stroke="#555" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="788" y="498" width="120" height="44" rx="6" fill="#cfe2ff" stroke="#3d6fb6" stroke-width="3"/><text x="848" y="525" text-anchor="middle">SYS+P1</text>
+  <!-- withdrawn T1 flag on SYS+P1 end -->
+  <line x1="908" y1="498" x2="908" y2="476" stroke="#999" stroke-width="2" stroke-dasharray="4,3"/>
+  <text x="903" y="488" text-anchor="end" fill="#999" font-size="13">T1 leaf (retired)</text>
+  <!-- O1 -->
+  <line x1="908" y1="520" x2="948" y2="440" stroke="#bbb" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="950" y="418" width="110" height="44" rx="6" fill="#eeeeee" stroke="#aaa" stroke-dasharray="5,3"/><text x="1005" y="445" text-anchor="middle" fill="#777">O1</text>
+  <text x="1005" y="408" text-anchor="middle" fill="#777" font-size="12">uncovered, evicted first</text>
+  <!-- R1+U2 -->
+  <line x1="908" y1="520" x2="948" y2="600" stroke="#555" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="950" y="578" width="110" height="44" rx="6" fill="#ffe0b2" stroke="#d9822b" stroke-width="3"/><text x="1005" y="605" text-anchor="middle">R1+U2</text>
+  <line x1="1060" y1="622" x2="1060" y2="648" stroke="#999" stroke-width="2" stroke-dasharray="4,3"/>
+  <text x="1054" y="660" text-anchor="end" fill="#999" font-size="13">T2 leaf (retired)</text>
+  <!-- O2 -->
+  <line x1="1060" y1="600" x2="1100" y2="530" stroke="#bbb" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="1102" y="508" width="110" height="44" rx="6" fill="#eeeeee" stroke="#aaa" stroke-dasharray="5,3"/><text x="1157" y="535" text-anchor="middle" fill="#777">O2</text>
+  <text x="1157" y="498" text-anchor="middle" fill="#777" font-size="12">uncovered, evicted first</text>
+  <!-- R2+U3 (leaf) -->
+  <line x1="1060" y1="600" x2="1100" y2="690" stroke="#555" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="1102" y="668" width="110" height="44" rx="6" fill="#ffe0b2" stroke="#c0392b" stroke-width="4"/><text x="1157" y="695" text-anchor="middle">R2+U3</text>
+  <text x="1157" y="730" text-anchor="middle" fill="#c0392b" font-weight="bold">★ T3 leaf (only one)</text>
+  <!-- O3 -->
+  <line x1="1212" y1="690" x2="1252" y2="690" stroke="#bbb" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="1254" y="668" width="110" height="44" rx="6" fill="#eeeeee" stroke="#aaa" stroke-dasharray="5,3"/><text x="1309" y="695" text-anchor="middle" fill="#777">O3</text>
+  <text x="1309" y="658" text-anchor="middle" fill="#777" font-size="12">uncovered, evicted first</text>
+  <text x="750" y="750" font-weight="bold">session leaves = {end of P3}: advances one turn at a time, old leaf retired</text>
+  <text x="750" y="772" fill="#2f8f46">• Bold path SYS+P1 → R1+U2 → R2+U3 = the prefix the next turn hits; covered</text>
+
+  <!-- ============ Footer ============ -->
+  <rect x="20" y="805" width="1400" height="140" rx="8" fill="#fafafa" stroke="#ccc"/>
+  <text x="36" y="832" font-size="16" font-weight="bold">Why it matters for AgentX</text>
+  <text x="36" y="858">• Right: capacity goes to the P end the next turn hits; O branches go first. An idle session resumes by loading its prefix back from host instead of re-prefilling up to ~1M tokens.</text>
+  <text x="36" y="882">• SWA coverage keeps only the last window above the leaf: with the leaf at O_k it keeps O_k's window, not the window at the end of P_k that the next turn needs (inferred from SWA coverage semantics).</text>
+  <text x="36" y="906">• Leaf choice: walk the inserted path from root and take the deepest node ending at or below the page-aligned prompt length (unified_radix_cache.py: finished_session_leaf).</text>
+  <text x="36" y="930" fill="#666">• Still adds a leaf: a helper call (different system prompt) or an edited context (both covered by TestSessionLeafAtPromptEnd).</text>
+</svg>
