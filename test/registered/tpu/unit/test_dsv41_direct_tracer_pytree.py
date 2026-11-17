@@ -41,6 +41,11 @@ def _engram():
     return torch.zeros(3, 2, 2, dtype=torch.int32), staged
 
 
+def _packed_engram():
+    staged = tuple(torch.zeros(16, dtype=torch.int32) for _ in range(2))
+    return torch.zeros(3, 2, 2, dtype=torch.int32), staged
+
+
 class TestDSV41MetadataPytree(CustomTestCase):
     def test_input_fields_are_the_host_built_fields(self):
         required = [
@@ -76,21 +81,22 @@ class TestDSV41MetadataPytree(CustomTestCase):
     def test_key_paths_resolve_like_direct_compile(self):
         """A deferred direct_compile call fetches each leaf by its key path and
         accepts only GetAttr / Dict / Sequence keys (direct_compile._get_path)."""
-        metadata = _metadata(engram=_engram())
         supported = (tree_util.GetAttrKey, tree_util.DictKey, tree_util.SequenceKey)
-        paths = tree_util.tree_flatten_with_path(metadata)[0]
-        self.assertEqual(len(paths), len(tree_util.tree_leaves(metadata)))
-        for path, leaf in paths:
-            value = metadata
-            for key in path:
-                self.assertIsInstance(key, supported, msg=str(path))
-                if isinstance(key, tree_util.GetAttrKey):
-                    value = getattr(value, key.name)
-                elif isinstance(key, tree_util.DictKey):
-                    value = value[key.key]
-                else:
-                    value = value[key.idx]
-            self.assertIs(value, leaf)
+        for engram in (_engram(), _packed_engram()):
+            metadata = _metadata(engram=engram)
+            paths = tree_util.tree_flatten_with_path(metadata)[0]
+            self.assertEqual(len(paths), len(tree_util.tree_leaves(metadata)))
+            for path, leaf in paths:
+                value = metadata
+                for key in path:
+                    self.assertIsInstance(key, supported, msg=str(path))
+                    if isinstance(key, tree_util.GetAttrKey):
+                        value = getattr(value, key.name)
+                    elif isinstance(key, tree_util.DictKey):
+                        value = value[key.key]
+                    else:
+                        value = value[key.idx]
+                self.assertIs(value, leaf)
 
 
 if __name__ == "__main__":

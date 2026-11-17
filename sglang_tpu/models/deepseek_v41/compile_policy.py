@@ -279,7 +279,7 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
             prepare_direct_compile(self)
         call, warmup_async = super()._direct_compile(fn)
-        if self._engram_hasher is None or not engram_host.engram_host_tables(
+        if self._engram_hasher is None or not engram_host.shared_host_tables(
             self.model_runner.model
         ):
             return call, warmup_async

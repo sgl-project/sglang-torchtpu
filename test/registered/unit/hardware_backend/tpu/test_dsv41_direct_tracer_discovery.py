@@ -127,7 +127,7 @@ class TestPrepareDirectCompile(CustomTestCase):
 
 
 class TestDeepseekV4Policy(CustomTestCase):
-    def _policy(self, model_type):
+    def _policy(self, model_type, *, model=None, use_engram=False):
         from sglang_tpu.compilation.decoder_compile_policy import (
             DecoderTpuCompilePolicy,
         )
@@ -137,10 +137,11 @@ class TestDeepseekV4Policy(CustomTestCase):
         )
 
         runner = SimpleNamespace(
-            model=SimpleNamespace(),
+            model=SimpleNamespace() if model is None else model,
             is_draft_worker=False,
             model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(model_type=model_type), use_engram=False
+                hf_config=SimpleNamespace(model_type=model_type),
+                use_engram=use_engram,
             ),
         )
 
@@ -162,6 +163,93 @@ class TestDeepseekV4Policy(CustomTestCase):
         v4 = self._policy("deepseek_v4")
         self.assertFalse(v4.spmd_safe)
         self.assertFalse(v4.is_v41)
+
+    def test_direct_compile_wraps_call_and_warmup_when_shared_host_tables_present(self):
+        from sglang_tpu.compilation.decoder_compile_policy import (
+            DecoderTpuCompilePolicy,
+        )
+        from sglang_tpu.models.deepseek_v41 import compile_policy
+
+        embed = SimpleNamespace(
+            _shared=True,
+            weight=torch.zeros(8, 16, dtype=torch.uint8),
+            scale=torch.zeros(8, 1, dtype=torch.uint8),
+        )
+        layer = SimpleNamespace(engram=SimpleNamespace(embed=embed, layer_hash_index=0))
+        model = SimpleNamespace(
+            model=SimpleNamespace(engram_hasher=object(), layers=[layer])
+        )
+        policy = self._policy("deepseek_v41", model=model, use_engram=True)
+        policy.name = "target/forward"
+        policy.model_extra_tensor_attrs = ()
+        policy.get_model_extra_tensor_attrs = lambda: policy.model_extra_tensor_attrs
+        policy.direct_compile_prune_unused_inputs = False
+
+        base_call = mock.Mock(return_value="call_out")
+        base_warmup = mock.Mock(return_value="warmup_out")
+        with (
+            mock.patch.object(
+                direct_tracer,
+                "discover_extra_tensor_attrs",
+                return_value=((), ()),
+            ),
+            mock.patch.object(
+                direct_tracer,
+                "host_resident_tensors",
+                return_value=[],
+            ),
+            mock.patch.object(
+                DecoderTpuCompilePolicy,
+                "_direct_compile",
+                return_value=(base_call, base_warmup),
+            ),
+        ):
+            call, warmup_async = policy._direct_compile(lambda *a, **k: None)
+
+        self.assertTrue(policy.direct_compile_prune_unused_inputs)
+        self.assertEqual(embed.tpu_hash_index, 0)
+        self.assertIsNot(call, base_call)
+        self.assertIsNot(warmup_async, base_warmup)
+
+        ids = torch.zeros(4, 1, 2, dtype=torch.int32)
+        packed = torch.zeros(12, dtype=torch.int32)
+        batch = SimpleNamespace(
+            tpu_engram_local_ids=ids,
+            tpu_engram_staged=(packed,),
+        )
+        for wrapped, underlying, expected in (
+            (call, base_call, "call_out"),
+            (warmup_async, base_warmup, "warmup_out"),
+        ):
+            metadata = SimpleNamespace(engram=None)
+            ctx = SimpleNamespace(
+                attn_backend=SimpleNamespace(forward_metadata=metadata)
+            )
+            with mock.patch.object(
+                compile_policy, "get_forward_context", return_value=ctx
+            ):
+                self.assertEqual(wrapped("ids", "pos", batch), expected)
+            underlying.assert_called_once_with("ids", "pos", batch)
+            self.assertIs(metadata.engram[0], ids)
+            self.assertEqual(len(metadata.engram[1]), 1)
+            self.assertIs(metadata.engram[1][0], packed)
+
+    def test_direct_compile_skips_engram_wrapper_without_engram(self):
+        from sglang_tpu.compilation.decoder_compile_policy import (
+            DecoderTpuCompilePolicy,
+        )
+
+        policy = self._policy("deepseek_v4", use_engram=False)
+        base_call = object()
+        base_warmup = object()
+        with mock.patch.object(
+            DecoderTpuCompilePolicy,
+            "_direct_compile",
+            return_value=(base_call, base_warmup),
+        ):
+            call, warmup_async = policy._direct_compile(lambda *a, **k: None)
+        self.assertIs(call, base_call)
+        self.assertIs(warmup_async, base_warmup)
 
 
 class TestHostResidentTensors(CustomTestCase):
