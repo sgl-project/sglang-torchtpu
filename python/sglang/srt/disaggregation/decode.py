@@ -775,10 +775,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.server_args,
             self.is_mla_backend,
         )
-        # TPU backend scatters received KV pages into its own pool tensors
-        # (H2D); hand it the pool so it can index_copy_ into the buffers.
-        if hasattr(kv_manager, "attach_kv_pool"):
-            kv_manager.attach_kv_pool(self.token_to_kv_pool)
         if (
             get_disagg().disaggregation_decode_host_receive_threshold > 0
             and not kv_manager.supports_host_destination
