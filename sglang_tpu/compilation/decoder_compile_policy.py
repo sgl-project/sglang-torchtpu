@@ -616,10 +616,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return get_cp_strategy()
 
     def _init_cp_ring_bucketer(self) -> None:
-        """Ring-mode prefill CP (SGLANG_TPU_PCP_MODE=ring) reserves two
-        page-aligned blocks per request on every rank and reads the gathered
-        chunk by page, so its local token buckets are the token buckets that
-        are multiples of 2 x page size (and at least the extend batch cap)."""
+        """Ring-mode PCP (SGLANG_TPU_PCP_MODE=ring)require token buckets that
+        are multiples of 2 x page size."""
         if not current_platform.pcp_ring_enabled():
             return
         page_size = self.model_runner.page_size
