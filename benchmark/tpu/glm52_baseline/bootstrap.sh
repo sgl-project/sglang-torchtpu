@@ -53,7 +53,7 @@ fi
 export TPU_LIBRARY_PATH
 TPU_LIBRARY_PATH=$("$PY" -c 'import libtpu; print(libtpu.get_library_path())')
 export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_buffer_assignment_enable_fast_merge_fallback=false"
-export SGLANG_PLATFORM=tpu_oot
+export SGLANG_PLATFORM=tpu
 export GLM52_ART="$ART"
 "$PY" - <<'PY'
 import hashlib, importlib.metadata as m, json, os, pathlib, socket, sys, tomllib
@@ -78,7 +78,7 @@ cat > "$RUN_DIR/setup.sh" <<EOF
 export SRC='$SRC' PY='$PY' GLM52_ART='$ART'
 export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export TMPDIR='$RUN_DIR/tmp' XLA_PYTHON_CLIENT_PREALLOCATE=false
-export TPU_LIBRARY_PATH='$TPU_LIBRARY_PATH' LIBTPU_INIT_ARGS='$LIBTPU_INIT_ARGS' SGLANG_PLATFORM=tpu_oot
+export TPU_LIBRARY_PATH='$TPU_LIBRARY_PATH' LIBTPU_INIT_ARGS='$LIBTPU_INIT_ARGS' SGLANG_PLATFORM=tpu
 cd '$SRC'
 EOF
 touch "$RUN_DIR/SETUP_READY"

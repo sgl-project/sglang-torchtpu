@@ -22,6 +22,10 @@ def main():
     from sglang.srt.server_args import prepare_server_args
 
     load_plugins()
+    from sglang.srt.platforms import current_platform
+
+    # Fail before loading 756 GB if this platform does not support the DSA pool.
+    current_platform.get_dsa_kv_pool_cls()
     args = prepare_server_args(server_args_to_cli(cfg.server_args))
     args.resolve_once()
     resolved = args.resolved_dict()

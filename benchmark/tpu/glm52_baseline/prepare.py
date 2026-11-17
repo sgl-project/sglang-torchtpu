@@ -122,7 +122,7 @@ def prepare(model: Path, output: Path):
         tpu_fp8_runtime="channelwise",
     )
     env = dict(
-        SGLANG_PLATFORM="tpu_oot",
+        SGLANG_PLATFORM="tpu",
         PYTHONUNBUFFERED="1",
         SGLANG_TPU_CHECK_RECOMPILATION="1",
         SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER="1",
