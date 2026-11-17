@@ -401,9 +401,73 @@ class MlaDsparkDraft:
             return self._ops[key]
         dspark, rows, names = self.dspark, self.dspark.ROWS, self.names
         count, layers, pages = len(names), self.config.layers, control.pages
+        epilogue = None
+        if kernel_config.active().draft_fused_epilogue and self.attention_dp == 1:
+            epilogue = self.kernel.SingleEpilogue(
+                slots=control.slots,
+                reset=control.plan_start + control.RESET,
+                state_size=control.size,
+                ids_size=3 * rows + 1 + rows * pages,
+            )
         fused = self.kernel.fused_draft_local(
-            self.config, requests=1, pages=pages, owner_table=self.owner_table
+            self.config,
+            requests=1,
+            pages=pages,
+            owner_table=self.owner_table,
+            single=epilogue,
         )
+
+        def fused_body(*args):
+            # KernelConfig.draft_fused_epilogue: the fused kernel reads the
+            # ids and decisions; the commit kernel (not communicating, so its
+            # outputs leave the program uncopied) reads the rows' positions
+            # and table from the ids and writes the step's outputs.
+            import jax
+            import jax.numpy as jnp
+            from jax.experimental import pallas as pl
+
+            weights = {name: args[i][0] for i, name in enumerate(names)}
+            # The layer-norm stacks: [layers, 1, width] -> [layers, width].
+            for name in self.kernel.LEADING_NAMES:
+                weights[name] = weights[name].reshape(layers, -1)
+            pools = args[count : count + layers]
+            aux, logits, previous, ids, state, decisions = args[count + layers :]
+            vector, latents = fused(
+                weights, pools, aux, logits, previous, ids, decisions
+            )
+
+            def step_outputs(ids_ref, vector_ref, state_ref, vector_out, *outs):
+                @pl.loop(0, 128)
+                def copy_vector(k):
+                    vector_out[0, k] = vector_ref[0, k]
+
+                self.kernel.single_epilogue(
+                    epilogue, rows, ids_ref, state_ref, vector_ref, *outs
+                )
+
+            int32 = jnp.int32
+            *pools, vector, emitted, following_ids, state = (
+                self.paged.commit_draft_rows(
+                    pools,
+                    latents,
+                    ids,
+                    rows,
+                    pages,
+                    tuple(range(layers)),
+                    owner_table=self.owner_table,
+                    epilogue=(
+                        (vector, state),
+                        (
+                            jax.ShapeDtypeStruct((1, 128), int32),
+                            jax.ShapeDtypeStruct((1, rows), int32),
+                            jax.ShapeDtypeStruct((epilogue.ids_size,), int32),
+                            jax.ShapeDtypeStruct((epilogue.state_size,), int32),
+                        ),
+                        step_outputs,
+                    ),
+                )
+            )
+            return (vector, *pools, emitted, following_ids, state)
 
         def body(*args):
             import jax.numpy as jnp
@@ -462,7 +526,7 @@ class MlaDsparkDraft:
         self._ops[key] = register_op(
             "pallas::k3_dspark_mla_draft_single",
             self.mesh,
-            body,
+            body if epilogue is None else fused_body,
             in_specs,
             out_specs,
             donate_argnums=tuple(range(count, count + layers)),
