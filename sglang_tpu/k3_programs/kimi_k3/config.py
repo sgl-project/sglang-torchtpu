@@ -186,6 +186,20 @@ class KernelConfig:
     # 8- and 16-row decode steps: keep the small embedding all-reduce on the
     # TensorCore instead of the SparseCore collective offload.
     decode_tc_all_reduce: bool = False
+    # Decode steps of up to 32 rows (the DSpark verifies included): the rank
+    # holding a token's embedding row reads it and sends it to the other
+    # ranks in one kernel (kernels.token_kernels.owner_embedding) instead of
+    # the local gather and the FP32 psum of the rows. The psum adds the
+    # owner's BF16 value to zeros, which only turns -0.0 into +0.0; the
+    # kernel's one-hot row sum does the same (bit-identical).
+    decode_embedding_broadcast: bool = False
+    # DSpark verify ops: the greedy decisions (each row's vocabulary argmax,
+    # the accepted count and the bonus token) in one kernel with a single
+    # exchange of per-shard maxima (kernels.token_kernels.greedy_decisions)
+    # instead of jnp.argmax, an all_gather and ~20 small XLA ops. The same
+    # first-index maxima and lowest-rank ties, NaN counting as the maximum
+    # (bit-identical decisions).
+    verify_greedy_kernel: bool = False
     # 16-row decode steps: records in the instruction-overlay allocation table
     # (XLA's xla_tpu_overlay_allocation_table_size; 0: the compiler's 10). At
     # 16 rows the KDA layers' overlays are larger than IMEM. With 2 records

@@ -2690,6 +2690,277 @@ class TestK31DraftVerifyPacket(CustomTestCase):
         self._run(self.HOST)
 
 
+class TestOwnerEmbedding(CustomTestCase):
+    """``KernelConfig.decode_embedding_broadcast`` in Pallas interpret mode on
+    four host devices (race detection on): ``decode_megakernel.decode_local``
+    up to its fused stack (stubbed to record the embedding it is given) with
+    the knob on runs ``token_kernels.owner_embedding`` and hands the stack the
+    rows the gather + ``tp_sum`` gives (batched and per row), bit for bit, on
+    every rank: tables with -0.0 (+0.0 out), +-inf and the smallest normal,
+    ids at shard and 16-row block edges, one owner of every row, duplicates,
+    ids outside the vocabulary (zero rows), 1 to 32 rows, 512 and 7168 wide."""
+
+    SCRIPT = """
+        import os
+        N = 4
+        os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={N}"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import dataclasses
+        import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call as interpreter
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk, token_kernels
+
+        called, captured = [], []
+        stock = pl.pallas_call
+
+        def interpret(*a, **k):
+            called.append(k.get("name"))
+            return stock(*a, **{"interpret": pltpu.InterpretParams(detect_races=True), **k})
+
+        token_kernels.pl.pallas_call = interpret
+
+        def stack(prefix, embedding, weights, states, positions, **kwargs):
+            captured.append(embedding)
+            return (prefix, None, states[0], states[1], None, None, None)
+
+        dmk.stack = stack
+        base = dmk._config()
+        mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+
+        def embed(tokens, table, knob, batched):
+            config = dataclasses.replace(base, decode_embedding_broadcast=knob)
+            dmk._config = lambda: config
+            try:
+                def body(tokens, table):
+                    captured.clear()
+                    weights = {"embedding": table[0], "lm_head": jnp.zeros((table.shape[-1], 8), jnp.bfloat16)}
+                    dmk.decode_local(weights, (jnp.zeros(1), jnp.zeros(1)), tokens, jnp.zeros_like(tokens),
+                                     batch_size=tokens.shape[0], sequence_parallel_pre_attention=True,
+                                     batched_decoder_boundaries=batched)
+                    return captured[0][None]
+                f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P("tp")), out_specs=P("tp"),
+                                          check_vma=False))
+                return np.asarray(f(jnp.asarray(tokens, jnp.int32), table)).view(np.uint16)
+            finally:
+                dmk._config = lambda: base
+
+        rng = np.random.default_rng(0)
+        for W, H in ((64, 512), (32, 7168)):
+            V = N * W
+            table = rng.standard_normal((N, W, H)).astype(ml_dtypes.bfloat16)
+            bits = table.view(np.uint16)
+            bits[rng.random(bits.shape) < 0.05] = 0x8000  # -0.0
+            bits[rng.random(bits.shape) < 0.05] = 0x0000
+            bits[:, :, :3] = [0x7F80, 0xFF80, 0x0080]  # +inf, -inf, the smallest normal
+            flat = table.reshape(V, H).view(np.uint16)
+            assert (flat == 0x8000).any()
+            table = jnp.asarray(table)
+            edges = [r * W + d for r in range(N) for d in (0, 15, 16, W - 1)]
+            cases = [
+                [5],
+                [V - 1, 0, -1, V, W, 2 * W - 1, -2**31, 2**31 - 1],  # shard edges, outside
+                edges[:16],
+                [3, 3, 4, 19, 3, 2, 1, 0],  # one owner, duplicates, one 16-row block
+                list(rng.integers(-W, V + W, 32)),
+                [-5] * 4,  # nothing owned: zero rows
+            ]
+            for tokens in cases:
+                want = embed(tokens, table, False, True)
+                assert np.array_equal(want, embed(tokens, table, False, False))  # both XLA paths
+                assert all(np.array_equal(want[0], want[r]) for r in range(N))
+                called.clear()
+                got = embed(tokens, table, True, len(tokens) % 2 == 0)
+                assert called == ["kimi_owner_embedding"], called
+                assert np.array_equal(got, want), (W, H, tokens)
+                for b, t in enumerate(tokens):  # in range: the row, -0.0 as +0.0; else zeros
+                    row = flat[t] if 0 <= t < V else np.zeros(H, np.uint16)
+                    assert np.array_equal(got[0, b], np.where(row == 0x8000, 0, row)), (b, t)
+        assert not interpreter.races.races_found
+        print("OK")
+    """
+
+    def test_owner_rows_match_the_tp_sum(self):
+        _run_script(self, self.SCRIPT)
+
+
+class TestVerifyGreedyKernel(CustomTestCase):
+    """``KernelConfig.verify_greedy_kernel`` in Pallas interpret mode on four
+    host devices (race detection on): ``sampling.verify_acceptance`` with the
+    knob on runs ``token_kernels.greedy_decisions`` and returns the knob-off
+    decisions (``jnp.argmax`` + ``all_gather``) bit for bit on every rank --
+    greedy steps through ``lax.cond``, verify mode 0, synthetic rates and
+    mixed sampled / greedy requests, 1x8, 2x8 and 3x4 rows -- on logits with
+    ties of the maximum within and across shards, maxima of -0.0 and +0.0,
+    rows of -inf, +inf at shard edges and NaNs (the maximum; the first one
+    wins), and drafts matching their targets for 0 to all rows; the greedy
+    rows' decisions are also numpy's first maxima. The kernel alone gives the
+    XLA expression's ``take_along_axis`` fill for forced counts past the rows."""
+
+    SCRIPT = """
+        import os
+        N = 4
+        os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={N}"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import dataclasses
+        import numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call as interpreter
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3 import config as kconfig, sampling
+        from sglang_tpu.k3_programs.kimi_k3.kernels import token_kernels
+
+        called = []
+        stock = pl.pallas_call
+
+        def interpret(*a, **k):
+            called.append(k.get("name"))
+            return stock(*a, **{"interpret": pltpu.InterpretParams(detect_races=True), **k})
+
+        token_kernels.pl.pallas_call = interpret
+        base = kconfig.active()
+        mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+        W = 128
+        V = N * W
+        NAN, INF, ZERO = np.float32(np.nan), np.float32(np.inf), np.float32(0.0)
+        compiled = {}
+
+        def decide(logits, tokens, modes, temperature, rates, knob):
+            R, rows = tokens.shape
+            config = dataclasses.replace(base, verify_greedy_kernel=knob)
+            kconfig.active = lambda: config  # read when the op traces (its first call)
+            try:
+                traced = (R, rows, rates, knob) not in compiled
+                if traced:
+                    def body(logits, tokens, positions, modes, t, p, k, s):
+                        return sampling.verify_acceptance(logits[0], tokens, positions, modes, (t, p, k, s),
+                                                          synthetic_rates=rates, single=R == 1)[None]
+                    compiled[R, rows, rates, knob] = jax.jit(jax.shard_map(
+                        body, mesh=mesh, in_specs=(P("tp"),) + (P(),) * 7, out_specs=P("tp"), check_vma=False))
+                    called.clear()
+                shards = np.ascontiguousarray(logits.reshape(R * rows, N, W).transpose(1, 0, 2))
+                args = (shards, tokens, np.arange(R, dtype=np.int32) * 97 + 5, modes, temperature,
+                        np.full(R, 0.9, np.float32), np.zeros(R, np.int32), np.arange(R, dtype=np.int32) + 11)
+                out = np.asarray(compiled[R, rows, rates, knob](*map(jnp.asarray, args)))
+                if traced:  # the knob-on op runs the kernel, the knob-off op does not
+                    assert ("kimi_greedy_decisions" in called) == knob, (knob, called)
+                return out
+            finally:
+                kconfig.active = lambda: base
+
+        def first_max(row):  # NaN is the maximum and the first one wins, as jnp.argmax
+            nan = np.flatnonzero(np.isnan(row))
+            return int(nan[0]) if nan.size else int(np.argmax(row))
+
+        rng = np.random.default_rng(0)
+        ids = np.arange(V)
+
+        def adversarial(T, ordered=False):
+            x = rng.integers(-4, 3, (T, V)).astype(np.float32)  # ties of the maximum
+            low = lambda r: -np.abs(r) - 1
+            kinds = [
+                lambda r: r,
+                lambda r: np.where(r == r.max(), r, r - 9),
+                lambda r: np.full_like(r, -INF),  # all -inf: id 0
+                lambda r: np.where(ids % W == W - 1, -ZERO, low(r)),  # -0.0 maxima on every rank
+                lambda r: np.where(ids == 2 * W + 5, ZERO, np.where(ids == W + 9, -ZERO, low(r))),
+                lambda r: np.where(ids == 2 * W + 5, -ZERO, np.where(ids == W + 9, ZERO, low(r))),
+                lambda r: np.where(ids == W + 3, -ZERO, np.where(ids == W + 7, ZERO, low(r))),
+                lambda r: np.where(np.isin(ids, [W - 1, W, 3 * W]), INF, r),  # +inf at shard edges
+                lambda r: np.where(ids == V - 1, NAN, r),  # one NaN, the last id
+                lambda r: np.where(np.isin(ids, [2 * W + 7, W + 100, V - 1]), NAN, np.where(ids == 0, INF, r)),
+                lambda r: np.where(ids % 3 == 1, NAN, r),
+                lambda r: np.where(ids == W, NAN, r),  # a NaN at a shard's first id
+                lambda r: rng.standard_normal(V).astype(np.float32) * 10,
+            ]
+            pick = (lambda t: t) if ordered else (lambda t: t + int(rng.integers(len(kinds))))
+            return np.stack([kinds[pick(t) % len(kinds)](x[t]) for t in range(T)]).astype(np.float32)
+
+        for R, rows in ((1, 8), (2, 8), (3, 4)):
+            T = R * rows
+            rates = (0.9, 0.7, 0.6, 0.4, 0.3, 0.2, 0.1)[: rows - 1]
+            for trial in range(3):
+                logits = adversarial(T)
+                targets = np.array([first_max(logits[t]) for t in range(T)]).reshape(R, rows)
+                tokens = rng.integers(0, V, (R, rows)).astype(np.int32)
+                for r in range(R):  # request r's drafts match their targets for k leading rows
+                    k = (r + trial * 3) % rows
+                    tokens[r, 1 : k + 1] = targets[r, :k]
+                    if k + 1 < rows and tokens[r, k + 1] == targets[r, k]:
+                        tokens[r, k + 1] = (targets[r, k] + 1) % V
+                for modes, temperature, synthetic in (
+                    (np.ones(R, np.int32), np.zeros(R, np.float32), None),  # greedy: lax.cond
+                    ((np.arange(R) % 2).astype(np.int32), np.zeros(R, np.float32), None),  # mode 0
+                    (np.ones(R, np.int32), np.zeros(R, np.float32), rates),  # synthetic: no cond
+                    (np.ones(R, np.int32), np.where(np.arange(R) % 2, 0.8, 0.0).astype(np.float32), None),
+                ):
+                    if temperature.any() and np.isnan(logits).any():
+                        continue  # sampled rows of NaN logits
+                    want = decide(logits, tokens, modes, temperature, synthetic, False)
+                    got = decide(logits, tokens, modes, temperature, synthetic, True)
+                    assert all(np.array_equal(got[0], got[r]) for r in range(N))
+                    assert np.array_equal(got, want), (R, rows, trial, modes, temperature, got[0], want[0])
+                    for r in np.flatnonzero((temperature == 0) & (modes == 1) & (synthetic is None)):
+                        miss = np.flatnonzero(tokens[r, 1:] != targets[r, :-1])
+                        count = int(miss[0]) if miss.size else rows - 1
+                        assert got[0][r].tolist() == [count, targets[r, count]], (r, got[0][r], count)
+
+        def xla(logits, tokens, forced):  # verify_acceptance's greedy expression
+            R, rows = tokens.shape
+            targets = sampling.greedy(logits).reshape(R, rows)
+            match = tokens[:, 1:] == targets[:, :-1]
+            first = jnp.min(jnp.where(match, rows - 1, jnp.arange(rows - 1)), axis=1)
+            count = jnp.where(forced >= 0, forced, first)
+            return jnp.stack((count, jnp.take_along_axis(targets, count[:, None], axis=1)[:, 0]), axis=1)
+
+        # Every row's target (every kind of row) through the bonus of a forced count, and
+        # counts past the rows.
+        R, rows = 4, 8
+        logits = adversarial(R * rows, ordered=True)
+        shards = jnp.asarray(np.ascontiguousarray(logits.reshape(R * rows, N, W).transpose(1, 0, 2)))
+        tokens = jnp.asarray(rng.integers(0, V, (R, rows)).astype(np.int32))
+        ops = [jax.jit(jax.shard_map(lambda l, t, c, fn=fn: fn(l[0], t, c)[None], mesh=mesh,
+                                     in_specs=(P("tp"), P(), P()), out_specs=P("tp"), check_vma=False))
+               for fn in (xla, token_kernels.greedy_decisions)]
+        for k in range(rows + 1):
+            forced = jnp.asarray(np.array([k, k, k + rows, -1], np.int32))
+            want, got = (np.asarray(op(shards, tokens, forced)) for op in ops)
+            assert np.array_equal(want, got), (k, want[0], got[0])
+            if k < rows:
+                assert got[0, 0, 1] == first_max(logits[k]) and got[0, 1, 1] == first_max(logits[rows + k])
+            assert (got[:, 2, 1] == -2**31).all() and (k < rows or (got[:, :2, 1] == -2**31).all())
+        assert not interpreter.races.races_found
+        print("OK")
+    """
+
+    def test_kernel_decisions_match_the_xla_decisions(self):
+        _run_script(self, self.SCRIPT)
+
+
+def _run_script(case, script):
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    from jax.experimental.pallas import tpu as pltpu
+
+    if not hasattr(pltpu, "InterpretParams"):
+        case.skipTest("Pallas TPU interpret mode unavailable")
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=1800,
+    )
+    case.assertIn("OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:])
+
+
 class TestB16OneHotStaging(CustomTestCase):
     """KernelConfig.b16_one_hot_staging: the B16 routed-expert stream stages
     its compact rows with a one-hot product instead of a scalar row scan. In

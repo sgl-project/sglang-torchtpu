@@ -25,6 +25,7 @@ from sglang_tpu.k3_programs.kimi_k3.kernels import (
     dsa_decode,
     expert_steal,
     mla_dcp,
+    token_kernels,
 )
 from sglang_tpu.k3_programs.kimi_k3.layout import CONV_HEAD_ROWS
 
@@ -12309,7 +12310,13 @@ def decode_local(
     rank = jax.lax.axis_index("tp")
     vocabulary = weights["embedding"].shape[0]
 
-    if batched_decoder_boundaries:
+    if (
+        _config().decode_embedding_broadcast
+        and batch_size <= token_kernels.EMBEDDING_MAX_ROWS
+    ):
+        # The owners send their rows: the tp_sum's bits (see owner_embedding).
+        embedding = token_kernels.owner_embedding(tokens, weights["embedding"])
+    elif batched_decoder_boundaries:
         local_ids = tokens - rank * vocabulary
         local_embeddings = weights["embedding"][jnp.clip(local_ids, 0, vocabulary - 1)]
         embedding = kimi.tp_sum(
