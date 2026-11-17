@@ -352,8 +352,13 @@ def _check_inputs(
     kv_c_normed: jax.Array,
     nope_spec: SparseMLAKVCacheSpec,
     rope_spec: SparseMLAKVCacheSpec,
+    check_rope_shape: bool = True,
 ) -> None:
-    """Assert the caches were allocated from the specs they are written with."""
+    """Assert the caches were allocated from the specs they are written with.
+
+    ``check_rope_shape=False`` accepts any rope cache shape, for a caller that
+    does not write the rope cache (a placeholder for a model without rope).
+    """
     assert kv_c_normed.dtype == jnp.float8_e4m3fn, (
         f"sparse MLA kernel requires --kv-cache-dtype fp8 (got {kv_c_normed.dtype})"
     )
@@ -368,7 +373,7 @@ def _check_inputs(
     assert kv_cache_nope.shape == nope_spec.shape, (
         f"nope cache {kv_cache_nope.shape} does not match its spec {nope_spec.shape}"
     )
-    assert kv_cache_rope.shape == rope_spec.shape, (
+    assert not check_rope_shape or kv_cache_rope.shape == rope_spec.shape, (
         f"rope cache {kv_cache_rope.shape} does not match its spec {rope_spec.shape}"
     )
     assert nope_spec.page_size == rope_spec.page_size, (
@@ -415,7 +420,14 @@ def update_sparse_mla_kv_cache(
     Returns:
       The updated (nope, rope) kv caches, same shapes/dtypes as the inputs.
     """
-    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
+    _check_inputs(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        nope_spec,
+        rope_spec,
+        check_rope_shape=write_rope,
+    )
     page, slot = get_page_and_slot(
         kv_c_normed.shape[0],
         seq_lens,
