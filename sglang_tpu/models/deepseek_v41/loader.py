@@ -89,8 +89,13 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
         from runai_model_streamer import SafetensorsStreamer
 
         from sglang.srt.model_loader.weight_utils import RUNAI_STREAMER_TENSOR_ATTR
+        from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
         folder, files = self._prepare_weights(source.model_or_path, source.revision)
+        # An object-storage checkpoint's index sits in the local metadata cache, as
+        # the core Run:AI loader reads it.
+        if is_runai_obj_uri(folder):
+            folder = ObjectStorageModel.get_path(folder)
         weight_map = json.loads((Path(folder) / INDEX_NAME).read_text())["weight_map"]
         names = {n for n in weight_map if n.startswith(_MTP_PREFIX)}
         if not names:
