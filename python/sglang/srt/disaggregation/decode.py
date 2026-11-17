@@ -3305,6 +3305,12 @@ class SchedulerDisaggregationDecodeMixin:
         if len(self.waiting_queue) == 0:
             return None
 
+        # An idle probe can still be decoding when a user's KV transfer
+        # finishes. Let its tiny forward finish alone: merging the user into
+        # it would change the user's decode batch shape solely for liveness.
+        if any(is_health_check_req(req) for req in running_batch.reqs):
+            return None
+
         if self.enable_priority_scheduling:
             self.policy.calc_priority(self.waiting_queue, running_batch)
 
@@ -3317,11 +3323,19 @@ class SchedulerDisaggregationDecodeMixin:
         # pop req from waiting queue
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
+        has_traffic = not running_batch.is_empty() or any(
+            not is_health_check_req(req) for req in self.waiting_queue
+        )
 
-        for i in range(len(self.waiting_queue)):
-            req = self.waiting_queue[i]
+        for req in self.waiting_queue:
+            # A previously admitted probe may reach this queue after traffic
+            # starts. Keep it queued for the normal completion acknowledgement
+            # and cancellation instead of adding an inference row of its own.
+            if has_traffic and is_health_check_req(req):
+                waiting_queue.append(req)
+                continue
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+            if len(can_run_list) < num_not_used_batch:
                 can_run_list.append(req)
                 # `pop_preallocated` matched and locked new requests; a retracted or
                 # rebootstrapped one owns its row, and a re-match here takes no lock.

@@ -11,7 +11,7 @@ failed result processing acknowledge nothing.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -369,6 +369,88 @@ class TestSchedulerHealthWiring(CustomTestCase):
         scheduler.waiting_queue.clear()
         scheduler.process_batch_result(_batch(probe, extend_num_tokens=1), Mock())
         self.assertEqual(self.acks(), [(PROBE_RID, PROBE_IPC, 1)])
+
+    def _prebuilt(self, scheduler, running=()):
+        scheduler.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        scheduler.enable_priority_scheduling = False
+        scheduler.req_to_token_pool = SimpleNamespace(size=2)
+        scheduler.max_running_requests = 2
+        scheduler.token_to_kv_pool_allocator = Mock()
+        scheduler.model_config = Mock()
+        scheduler.spec_algorithm = Mock()
+        scheduler.tree_cache = Mock()
+        batch = SimpleNamespace(
+            reqs=list(running),
+            batch_size=lambda: len(running),
+            is_empty=lambda: not running,
+        )
+        for req in scheduler.waiting_queue:
+            req.last_node = Mock()
+            req.kv = SimpleNamespace(kv_committed_len=None)
+            req.init_next_round_input = Mock()
+        with (
+            patch("sglang.srt.disaggregation.decode.ScheduleBatch.init_new") as build,
+            patch("sglang.srt.disaggregation.decode.set_time_batch"),
+        ):
+            result = scheduler._get_new_prebuilt_batch(batch)
+        selected = build.call_args.args[0] if build.called else []
+        return result, selected
+
+    def test_decode_probe_finishes_before_new_traffic_is_admitted(self):
+        scheduler = self._scheduler(mode=DisaggregationMode.DECODE)
+        probe = _req(PROBE_RID, PROBE_IPC)
+        user = _req("user")
+        scheduler.waiting_queue = [user]
+        result, selected = self._prebuilt(scheduler, running=[probe])
+        self.assertIsNone(result)
+        self.assertEqual(selected, [])
+        self.assertEqual(scheduler.waiting_queue, [user])
+        user.init_next_round_input.assert_not_called()
+
+        # After the probe drains, the user's first decode stays a user-only batch.
+        result, selected = self._prebuilt(scheduler)
+        self.assertIsNotNone(result)
+        self.assertEqual(selected, [user])
+        self.assertEqual(scheduler.waiting_queue, [])
+
+    def test_decode_queued_probe_does_not_take_a_users_batch_slot(self):
+        scheduler = self._scheduler(mode=DisaggregationMode.DECODE)
+        probe = _req(PROBE_RID, PROBE_IPC)
+        first, second = _req("first"), _req("second")
+        scheduler.waiting_queue = [probe, first, second]
+        result, selected = self._prebuilt(scheduler)
+        self.assertIsNotNone(result)
+        self.assertEqual(selected, [first, second])
+        self.assertEqual(scheduler.waiting_queue, [probe])
+        probe.init_next_round_input.assert_not_called()
+
+    def test_decode_running_traffic_acknowledges_queued_probe_without_admitting_it(
+        self,
+    ):
+        scheduler = self._scheduler(mode=DisaggregationMode.DECODE)
+        probe = _req(PROBE_RID, PROBE_IPC)
+        user = _req("user")
+        scheduler.health_monitor.register(_recv(PROBE_RID, PROBE_IPC), admitted=True)
+        scheduler.waiting_queue = [probe]
+        result, selected = self._prebuilt(scheduler, running=[user])
+        self.assertIsNone(result)
+        self.assertEqual(selected, [])
+        self.assertEqual(scheduler.waiting_queue, [probe])
+        probe.init_next_round_input.assert_not_called()
+        scheduler.health_monitor.on_batch_completed(
+            _batch(user, forward_mode=ForwardMode.DECODE, extend_num_tokens=None)
+        )
+        self.assertEqual(self.acks(), [(PROBE_RID, PROBE_IPC, 1)])
+
+    def test_decode_idle_probe_still_reaches_prebuilt(self):
+        scheduler = self._scheduler(mode=DisaggregationMode.DECODE)
+        probe = _req(PROBE_RID, PROBE_IPC)
+        scheduler.waiting_queue = [probe]
+        result, selected = self._prebuilt(scheduler)
+        self.assertIsNotNone(result)
+        self.assertEqual(selected, [probe])
+        self.assertEqual(scheduler.waiting_queue, [])
+        result.prepare_for_prebuilt.assert_called_once_with()
 
 
 if __name__ == "__main__":
