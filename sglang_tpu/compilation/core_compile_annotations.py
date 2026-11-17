@@ -111,7 +111,8 @@ CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
     # mm_config.language_model_only or --enable-dp-attention is set,
     # compile_glm5_next_decoder_only annotates model.model (Glm5NextModel) with
     # Qwen3VLDecoderTpuCompilePolicy (covering both standard multimodal and EPD
-    # language-only servers); under --language-model-only or
+    # language-only servers); under --language-model-only it annotates the
+    # whole model with Glm5NextDecoderTpuCompilePolicy, and under
     # --enable-dp-attention both boundaries decline, keeping TpuGraphRunner's
     # whole-model fallback.
     _CoreCompileBoundary(
