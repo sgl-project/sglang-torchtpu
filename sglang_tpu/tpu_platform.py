@@ -43,9 +43,6 @@ logger = get_logger(__name__)
 # Platform discovery runs before worker bootstrap configures torch_tpu.
 rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
 traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
-_TpuSchedulerProfilerManager = LazyImport(
-    "sglang_tpu.scheduler_profiler", "TpuSchedulerProfilerManager"
-)
 _ReplicaGroupCoordinator = LazyImport(
     "sglang_tpu.replica_group", "ReplicaGroupCoordinator"
 )
@@ -1277,11 +1274,6 @@ class TpuSRTPlatform(SRTPlatform):
         # don't pull in jax/torch_tpu.
         # Override to the reference path with `--attention-backend torch_native`.
         return "pallas_tpu_rpa_v3"
-
-    def get_scheduler_profiler_manager_cls(self) -> type | None:
-        if envs.SGLANG_PROFILE_V2.get():
-            return None
-        return _TpuSchedulerProfilerManager
 
     def get_graph_runner_cls(self) -> type:
         from sglang_tpu.graph_runner.tpu_graph_runner import TpuGraphRunner

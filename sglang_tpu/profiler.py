@@ -7,16 +7,21 @@ from pathlib import Path
 
 import msgspec
 
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
+from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs
 
 logger = get_logger(__name__)
+tpu_profiler = LazyImport("torch_tpu._internal.profiler", "_impl")
 
 
-def start_tpu_profile(*, output_dir: Path, with_cpu: bool = True) -> _TpuTrace:
+def start_tpu_profile(*, output_dir: Path, with_cpu: bool = True) -> _TpuTrace | None:
     """Start an xprof capture writing to ``output_dir``.
 
-    Returns a handle. Pass it to :func:`stop_tpu_profile` to end the session.
+    Returns a handle on rank 0, otherwise None. Pass the handle to
+    :func:`stop_tpu_profile` to end the session.
     ``with_cpu`` selects the host plane.
 
     Goes through _impl.start_trace rather than torch_tpu's own profile()
@@ -25,20 +30,23 @@ def start_tpu_profile(*, output_dir: Path, with_cpu: bool = True) -> _TpuTrace:
     profiler_api -> _api between the 0817 and 0913 pins, while _impl.py was
     byte-identical across both.
     """
-    # start_trace/stop_trace live in _impl; the package root re-exports only
-    # profile, xprof_trace_handler and the remote-capture server.
-    from torch_tpu._internal.profiler import _impl as tpu_profiler
+    parallel = get_parallel()
+    if any(
+        (parallel.tp_rank, parallel.dp_rank, parallel.pp_rank, parallel.moe_ep_rank)
+    ):
+        return None
 
     output_dir.mkdir(parents=True, exist_ok=True)
     tpu_profiler.start_trace(str(output_dir), _tpu_profile_options(with_cpu=with_cpu))
     return _TpuTrace(output_dir=output_dir)
 
 
-def stop_tpu_profile(trace: _TpuTrace) -> None:
+def stop_tpu_profile(trace: _TpuTrace | None) -> None:
     """Stop an xprof session started by :func:`start_tpu_profile`."""
-    del trace  # the session is process-global; only one may run at a time
-    from torch_tpu._internal.profiler import _impl as tpu_profiler
-
+    if trace is None:
+        return
+    # Non-staged/manual stops must also capture queued device work.
+    current_platform.synchronize()
     tpu_profiler.stop_trace()
 
 
@@ -50,8 +58,6 @@ class _TpuTrace(msgspec.Struct, frozen=True):
 
 def _tpu_profile_options(*, with_cpu: bool):
     """Build libtpu trace options, or None to fall back to backend defaults."""
-    from torch_tpu._internal.profiler import _impl as tpu_profiler
-
     # torch_tpu's profile() derives these from the activity list; start_trace
     # does not, and an unset level takes the backend default (host 2, device 1,
     # python 0). python_tracer_level is the expensive one -- profile() turns it
