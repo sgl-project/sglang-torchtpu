@@ -610,6 +610,7 @@ class RaidenReceiverMixin:
                     pairs.extend(zip(remote_swa, local_swa))
                 if (
                     closing
+                    and self._draft_engine is not None
                     and not pairs
                     and local
                     and self._decode.remote_blocks.get(room)
@@ -656,6 +657,8 @@ class RaidenReceiverMixin:
                         swa_pages, self._swa_engine_max_blocks
                     )
                 if closing and self._draft_engine is not None:
+                    # Full-attention draft KV is pulled on the closing read as a
+                    # first step rather than overlapped across prefill chunks.
                     remote_draft, local_draft = self._pair_blocks(
                         list(
                             self._decode.remote_draft_swa_blocks.get(room, [])

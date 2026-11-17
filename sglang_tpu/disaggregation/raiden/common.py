@@ -37,7 +37,7 @@ from sglang_tpu.kv_pool import (
     TpuSplitMLATokenToKVPool,
 )
 from sglang_tpu.mamba_pool import TpuMambaPool
-from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool, _DraftSwaSidecar
 
 # One logger for the whole package, deliberately keeping the name of the module
 # this code used to live in: emitted record names and the existing test
@@ -56,7 +56,7 @@ SWA_PORT_OFFSET = 2
 STATE_PORT_OFFSET = 4
 DRAFT_PORT_OFFSET = 6
 
-# Base of the per-rank control ports (`base + 6*local_rank`). Not 30000: that
+# Base of the per-rank control ports (`base + 8*local_rank`). Not 30000: that
 # puts rank 0 on the default HTTP serving port, and the engine wins the bind --
 # uvicorn then dies with EADDRINUSE and takes the server down before any
 # transfer is attempted.
@@ -105,9 +105,9 @@ class RaidenKVCacheGroups:
     # Shared-buffer Full+SWA pool: SWA rides on the single full engine via companion pages.
     unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
     # Separate homogeneous draft KV tensor group when the target uses TpuUnifiedSWAKVPool.
-    draft: List[Any] = field(default_factory=list)
+    draft: List[torch.Tensor] = field(default_factory=list)
     draft_is_swa: bool = False
-    draft_swa_sidecar: Optional[Any] = None
+    draft_swa_sidecar: Optional[_DraftSwaSidecar] = None
     # True when any KV pool uses the 5D token-minor SEQ_ALONG_LANE layout.
     seq_along_lane: bool = False
 
@@ -310,9 +310,9 @@ def get_raiden_kv_caches(
     num_draft_full = num_draft_swa = num_hidden_full = 0
     draft_kv_head_num: Optional[int] = None
     draft_swa_kv_head_num: Optional[int] = None
-    draft: List[Any] = []
+    draft: List[torch.Tensor] = []
     draft_is_swa = False
-    draft_swa_sidecar: Optional[Any] = None
+    draft_swa_sidecar: Optional[_DraftSwaSidecar] = None
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
         if groups.unified_swa_pool is not None:
@@ -323,7 +323,7 @@ def get_raiden_kv_caches(
                 )
             draft_is_swa = bool(draft_groups.swa)
             draft = list(draft_groups.swa if draft_is_swa else draft_groups.full)
-            draft_swa_sidecar = getattr(pool, "_draft_swa_sidecar", None)
+            draft_swa_sidecar = groups.unified_swa_pool.draft_swa_sidecar
             _assert_root_buffers("unified draft KV", draft)
         else:
             num_draft_full, num_draft_swa = (

@@ -196,6 +196,29 @@ class TestUnifiedSpecRaidenPD(_raiden_ut.RaidenRendezvousTestCase):
             ):
                 self.assertTrue(ukp.unified_kv_pool_enabled(kvc))
 
+        # Thread #3: public draft_swa_sidecar property & typed RaidenKVCacheGroups.
+        tp_s, ta_s = _hc_ut.make_target(size=64)
+        dp_s = _hc_ut.attach_draft(ta_s, (), (0, 1))
+        self.assertIs(tp_s.draft_swa_sidecar, ta_s.draft_swa_sidecar)
+        grps = r_common.get_raiden_kv_caches(tp_s, draft_pool=dp_s)
+        self.assertIs(grps.draft_swa_sidecar, ta_s.draft_swa_sidecar)
+        self.assertTrue(all(isinstance(t, torch.Tensor) for t in grps.draft))
+
+        # Thread #1: non-spec rooms (_draft_engine is None) skip empty closing reads.
+        _, dec_ns, *_ = self._pair(swa_draft=False)
+        dec_ns._draft_engine = None
+        dec_ns._unified_swa_pool = None
+        room_ns = 9903
+        dec_ns._decode.local_blocks[room_ns] = [20]
+        dec_ns._decode.remote_blocks[room_ns] = [10, 11]
+        dec_ns._decode.remote_total[room_ns] = 2
+        dec_ns._decode.chunk_queue[room_ns] = [
+            (str(room_ns), room_ns, [0], [10], "tcp://p")
+        ]
+        self.assertFalse(dec_ns._start_chunked_pull(room_ns))
+        self.assertEqual(dec_ns._engine.started, [])
+        self.assertEqual(dec_ns._decode.chunk_queue[room_ns], [])
+
 
 if __name__ == "__main__":
     unittest.main()
