@@ -52,6 +52,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.state_capturer.base import BaseDeviceCache
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils.common import round_up
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation import aot_fast_runtime_wrapper
 from sglang_tpu.compilation.attention_rank_inputs import (
@@ -599,7 +600,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
-        # Ring-mode prefill CP only: the local token buckets its layout can use.
         self.cp_t_bucketer: Bucketer | None = None
         self.tracer = tracer
         self.extend_bs: int | None = None
@@ -616,32 +616,46 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return get_cp_strategy()
 
     def _configure_cp_ring(self) -> None:
-        """Ring-mode PCP (SGLANG_TPU_PCP_MODE=ring) requires token buckets that
-        are multiples of 2 x page size; the zigzag strategy admits batches up
-        to the largest. Idempotent: runs at setup and again at warmup, as the
-        strategy may initialize later."""
-        if self.cp_t_bucketer is None:
-            self.cp_t_bucketer = self._build_cp_ring_bucketer()
+        """Tell the zigzag strategy the largest local bucket, which caps the
+        batches ring mode admits. Idempotent: runs at setup and again at
+        warmup, as the strategy may initialize later."""
         if self._cp_strategy is not None:
-            self._cp_strategy.set_ring_capacity(self.cp_t_bucketer.max_val)
+            self._cp_strategy.set_ring_capacity(self._cp_local_bucketer().max_val)
 
-    def _build_cp_ring_bucketer(self) -> Bucketer:
-        page_size = self.model_runner.page_size
+    def _cp_local_bucketer(self) -> Bucketer:
+        """Local token buckets of the context-parallel extend program.
+
+        The token buckets of at least the extend batch cap, each rounded up to
+        a multiple of the layout's row unit and capped at the largest bucket
+        (rounded down), so the program never exceeds the planned token budget.
+        The row unit is 1 in gather mode; in ring mode it is 2 x page size,
+        because every request reserves two whole-page blocks on every rank
+        (``cp_layout.ring_max_local_rows``), so any other bucket would end in
+        rows that are always padding.
+        """
+        if self.cp_t_bucketer is not None:
+            return self.cp_t_bucketer
         assert self.t_bucketer is not None
+        ring = current_platform.pcp_ring_enabled()
+        row_unit = 2 * self.model_runner.page_size if ring else 1
         cap = self._extend_compile_cap()
-        buckets = [
-            bucket
-            for bucket in self.t_bucketer.buckets
-            if bucket % (2 * page_size) == 0 and bucket >= cap
-        ]
-        if not buckets:
+        # The largest multiple of row_unit that still fits the token budget
+        # (e.g. 8000 tokens, row_unit 512 -> 7680).
+        max_bucket = (self.t_bucketer.max_val // row_unit) * row_unit
+        buckets = set()
+        for bucket in self.t_bucketer.buckets:
+            if bucket < cap:
+                continue 
+            # Round up to whole row units, but not past max_bucket. 
+            buckets.add(min(round_up(bucket, row_unit), max_bucket))
+        if max_bucket < cap or not buckets:
             raise ValueError(
-                "Ring-mode prefill context parallelism (SGLANG_TPU_PCP_MODE=ring) "
-                f"needs a prefill token bucket that is a multiple of 2 x page size "
-                f"({2 * page_size}) and at least the extend batch cap {cap}; got "
-                f"buckets {list(self.t_bucketer.buckets)}."
+                "Prefill context parallelism needs a prefill token bucket of at "
+                f"least the extend batch cap {cap} and of {row_unit} tokens (the "
+                f"layout's row unit); got buckets {list(self.t_bucketer.buckets)}."
             )
-        return Bucketer(name="CpRingTokenBucketer", buckets=buckets)
+        self.cp_t_bucketer = Bucketer(name="CpLocalTokenBucketer", buckets=buckets)
+        return self.cp_t_bucketer
 
     def _record_compile_step(
         self,
@@ -752,13 +766,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return []
         assert self.t_bucketer is not None
         cap = self._extend_compile_cap()
-        if self.cp_t_bucketer is not None:
-            return [(num_tokens, cap) for num_tokens in self.cp_t_bucketer.buckets]
-        return [
-            (num_tokens, cap)
-            for num_tokens in self.t_bucketer.buckets
-            if num_tokens >= cap
-        ]
+        return [(num_tokens, cap) for num_tokens in self._cp_local_bucketer().buckets]
 
     def _extend_compile_shapes(self) -> list[tuple[int, int]]:
         return list(
@@ -1225,7 +1233,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if self._cp_batch_active(forward_batch):
             real_q, real_b = prepare_tpu_cp_forward_batch(
                 forward_batch,
-                t_bucketer=self.cp_t_bucketer or self.t_bucketer,
+                t_bucketer=self._cp_local_bucketer(),
                 b_bucketer=self.b_bucketer,
                 extend_bs=self.extend_bs,
                 cp_size=self._cp_strategy.cp_size,
@@ -1787,7 +1795,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         the way serving builds it."""
         assert self._cp_strategy is not None
         page_size, prefix_len = 1, 0
-        if self.cp_t_bucketer is not None:
+        if current_platform.pcp_ring_enabled():
             self._configure_cp_ring()
             page_size = self.model_runner.page_size
             # One program serves first chunks and cached prefixes alike; warming
