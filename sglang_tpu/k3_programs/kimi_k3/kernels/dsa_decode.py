@@ -409,6 +409,7 @@ class DecodeIndexer:
         after_gather=None,
         in_exchange=None,
         keys_ready=None,
+        during_gather=None,
     ) -> mla_dcp.DcpSelection:
         """``hidden`` [B, hidden] and ``query_latent`` [B, 1536] (normalized,
         BF16) values; ``cache`` the layer's ``mla_dcp.DcpCache``.
@@ -417,7 +418,11 @@ class DecodeIndexer:
         ``in_exchange``: runs in the selection's second exchange round
         (``dsa_dcp.IndexSelect.select``), e.g. the attention's prologue;
         ``keys_ready(selection)``: once the keys scratch is complete, before
-        the thresholds and the step activity, e.g. the first key copies."""
+        the thresholds and the step activity, e.g. the first key copies.
+        ``during_gather`` (KernelConfig.dsa_gather_overlap): runs while the
+        index query gather is in flight, after the early plan's page copies
+        and before the head gates (e.g. the MLA projections the indexer does
+        not read)."""
         with dsa_dcp._scope("d_indexer"):
             return self._selection(
                 cache,
@@ -428,6 +433,7 @@ class DecodeIndexer:
                 after_gather,
                 in_exchange,
                 keys_ready,
+                during_gather,
             )
 
     def _selection(
@@ -440,6 +446,7 @@ class DecodeIndexer:
         after_gather=None,
         in_exchange=None,
         keys_ready=None,
+        during_gather=None,
     ) -> mla_dcp.DcpSelection:
         s, batch = self.scoped, hidden.shape[0]
         group = cache.group
@@ -485,7 +492,8 @@ class DecodeIndexer:
 
         # 2. The head gates while the gather is in flight (KernelConfig.
         # dsa_early_plan: also the selection's plan and its first index-page
-        # copies); the rows' new keys (records): the slabs' sum.
+        # copies; then ``during_gather``); the rows' new keys (records): the
+        # slabs' sum.
         early, select = dsa_dcp.early_plan(), None
         if early:
             select = self._index_select(
@@ -493,6 +501,8 @@ class DecodeIndexer:
             )
             select.plan()
             select.start_pages()
+        if during_gather is not None:
+            during_gather()
         gate_t = self._gate(x)
         others = gather.at[pl.ds(0, group - 1)]
         pltpu.make_async_copy(others, others, gather_sems.at[0]).wait()

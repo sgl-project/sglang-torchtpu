@@ -7123,79 +7123,133 @@ def mla(
             def prime_pages():
                 make_attention()
 
-        if "query_down" in streams:
-            query_latent = (
-                streams["query_down"]
-                .dot(hidden_ref[...], communication_workspace.reduction_phase[0] >= 0)
-                .astype(jnp.bfloat16)
-                .astype(jnp.float32)
-            )
-        else:
-            weight_copies.query_down.wait()
-            query_latent = (
-                _dot(hidden_ref[...], weights.query_down_projection_vmem[...])
-                .astype(jnp.bfloat16)
-                .astype(jnp.float32)
-            )
-        if output_projection_after_query_down:
-            # The pool views are reinterpret casts, so the compiler need not see
-            # that this copy aliases the q-down loads above; a region (on a runtime
-            # condition that is never false) keeps it from being hoisted over them.
-            @pl.when(communication_workspace.reduction_phase[0] >= 0)
-            def start_output_projection_copy():
-                start_copy("output")
-
-        query_latent = (
-            query_latent
-            * jax.lax.rsqrt(
-                jnp.mean(query_latent * query_latent, axis=1, keepdims=True) + epsilon
-            )
-            * weights.query_normalization[...]
-        ).astype(jnp.bfloat16)
-
-        weight_copies.key_value_down.wait()
-        compressed = _dot(
-            hidden_ref[...], weights.key_value_down_projection_vmem[...]
-        ).astype(jnp.bfloat16)
-        key_value_latent = compressed[:, :512].astype(jnp.float32)
-        key_value_latent = (
-            key_value_latent
-            * jax.lax.rsqrt(
-                jnp.mean(
-                    key_value_latent * key_value_latent,
-                    axis=1,
-                    keepdims=True,
+        def query_down():
+            """q-down and its norm: the normalized q-latent (BF16)."""
+            if "query_down" in streams:
+                query_latent = (
+                    streams["query_down"]
+                    .dot(
+                        hidden_ref[...],
+                        communication_workspace.reduction_phase[0] >= 0,
+                    )
+                    .astype(jnp.bfloat16)
+                    .astype(jnp.float32)
                 )
-                + epsilon
-            )
-            * weights.key_value_normalization[...]
-        ).astype(jnp.bfloat16)
-        workspace.query_vmem[...] = (
-            projection("query_up", query_latent)
-            .astype(jnp.bfloat16)
-            .reshape(batch_size, 3, 256)
-        )
+            else:
+                weight_copies.query_down.wait()
+                query_latent = (
+                    _dot(hidden_ref[...], weights.query_down_projection_vmem[...])
+                    .astype(jnp.bfloat16)
+                    .astype(jnp.float32)
+                )
+            if output_projection_after_query_down:
+                # The pool views are reinterpret casts, so the compiler need not
+                # see that this copy aliases the q-down loads above; a region (on
+                # a runtime condition that is never false) keeps it from being
+                # hoisted over them.
+                @pl.when(communication_workspace.reduction_phase[0] >= 0)
+                def start_output_projection_copy():
+                    start_copy("output")
 
-        # The new token's latent row, handed out for the owner's commit.
-        new_latent = jnp.concatenate(
-            (
-                key_value_latent,
-                compressed[:, 512:576],
-                jnp.zeros((batch_size, 64), jnp.bfloat16),
-            ),
-            axis=1,
+            return (
+                query_latent
+                * jax.lax.rsqrt(
+                    jnp.mean(query_latent * query_latent, axis=1, keepdims=True)
+                    + epsilon
+                )
+                * weights.query_normalization[...]
+            ).astype(jnp.bfloat16)
+
+        # KernelConfig.dsa_gather_overlap (8-row verify calls): the indexer
+        # reads only the normalized q-latent and the hidden rows, so its query
+        # gather leaves first and the rest of q6 (with the attention's query
+        # packet) runs under its flight; the packet's remote copies leave once
+        # it has landed, as without the knob.
+        overlap = (
+            dsa is not None
+            and bool(_config().dsa_gather_overlap)
+            and batch_size == sequence_rows == 8
         )
-        new_key_ref[:, 0] = new_latent[:, :256]
-        new_key_ref[:, 1] = new_latent[:, 256:512]
-        new_key_ref[:, 2] = jnp.concatenate(
-            (new_latent[:, 512:], jnp.zeros((batch_size, 128), jnp.bfloat16)), axis=1
-        )
-        new_value_ref[:, :3] = jnp.zeros((batch_size, 3, 128), jnp.bfloat16)
-        if hand_out is not None:
-            hand_out()
+        if overlap:
+            # q-down alone in a block (a loop of one trip, the count read at
+            # run time): the compiler's MXU assignment splits a product's f32
+            # accumulation by what else shares its region, and alone each
+            # q-down column tile stays one chain of K-steps in order, as in
+            # the knob-off program. kv-down, now beside q-up and the head
+            # gates, sums its second column tile as two chains (see
+            # KernelConfig.dsa_gather_overlap).
+            query_latent = pl.loop(
+                0,
+                (communication_workspace.reduction_phase[0] >= 0).astype(jnp.int32),
+                init_carry=jnp.zeros((batch_size, 1536), jnp.bfloat16),
+            )(lambda _, carry: query_down())
+        else:
+            query_latent = query_down()
+
+        def latent_row():
+            """kv-down and its norm, q-up (the attention's queries) and the
+            new token's latent row, handed out for the owner's commit."""
+            weight_copies.key_value_down.wait()
+            compressed = _dot(
+                hidden_ref[...], weights.key_value_down_projection_vmem[...]
+            ).astype(jnp.bfloat16)
+            key_value_latent = compressed[:, :512].astype(jnp.float32)
+            key_value_latent = (
+                key_value_latent
+                * jax.lax.rsqrt(
+                    jnp.mean(
+                        key_value_latent * key_value_latent,
+                        axis=1,
+                        keepdims=True,
+                    )
+                    + epsilon
+                )
+                * weights.key_value_normalization[...]
+            ).astype(jnp.bfloat16)
+            workspace.query_vmem[...] = (
+                projection("query_up", query_latent)
+                .astype(jnp.bfloat16)
+                .reshape(batch_size, 3, 256)
+            )
+            new_latent = jnp.concatenate(
+                (
+                    key_value_latent,
+                    compressed[:, 512:576],
+                    jnp.zeros((batch_size, 64), jnp.bfloat16),
+                ),
+                axis=1,
+            )
+            new_key_ref[:, 0] = new_latent[:, :256]
+            new_key_ref[:, 1] = new_latent[:, 256:512]
+            new_key_ref[:, 2] = jnp.concatenate(
+                (new_latent[:, 512:], jnp.zeros((batch_size, 128), jnp.bfloat16)),
+                axis=1,
+            )
+            new_value_ref[:, :3] = jnp.zeros((batch_size, 3, 128), jnp.bfloat16)
+            if hand_out is not None:
+                hand_out()
+            return new_latent
+
+        in_gather = {}
+        if not overlap:
+            new_latent = latent_row()
         if dsa is not None:
 
+            def during_gather():
+                with _phase("q6_in_gather"):
+                    in_gather["latent"] = latent_row()
+                    if queries_sent:
+                        sender = in_gather["sender"] = make_attention(prime=False)
+                        sender.pack_queries(
+                            absorbed_queries(),
+                            in_gather["latent"].astype(jnp.float32),
+                            dcp[0].layer % 2,
+                        )
+
             def send_queries_early():
+                if overlap:
+                    in_gather["sender"].start_query_sends(dcp[0].layer % 2)
+                    return
                 make_attention(prime=False).send_queries(
                     absorbed_queries(), new_latent.astype(jnp.float32), dcp[0].layer % 2
                 )
@@ -7218,9 +7272,12 @@ def mla(
                     after_gather=send_queries_early if queries_sent else None,
                     in_exchange=stage_queries if queries_staged else None,
                     keys_ready=prime_keys_early if queries_staged else None,
+                    during_gather=during_gather if overlap else None,
                 ),
                 prime=False,
             )
+            if overlap:
+                new_latent = in_gather["latent"]
             if not queries_staged:
                 pl.when(early_prime)(dcp_attention.prime_keys)
             pl.when(jnp.logical_not(early_prime))(dcp_attention.prime)

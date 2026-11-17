@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=5200, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5400, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -6753,13 +6753,18 @@ class TestMlaQ6Knobs(CustomTestCase):
     selection, attention and prologue knobs, under its q6 knobs:
     ``KernelConfig.decode_mla_early_handout`` (the new rows' hand-out copies
     start once q6 has written them and are waited after the layer, as q8
-    does), also inside the one-trip prefix region (``decode_mla_prefix_region``).
+    does) and ``dsa_gather_overlap`` (the index query gather leaves before
+    kv-down, q-up, the new rows' hand-out and the attention's query packet,
+    which run under it; the packet's remote copies leave once it has landed),
+    also inside the one-trip prefix region (``decode_mla_prefix_region``).
     The layer's output, handed-out rows, index keys and records and the
     selection equal the knobs-off layer's bit for bit, with eager and with
     on-wait DMA execution (a copy started before its source is written, or a
     source written after its copy started, reads different bytes in the two
-    modes). The output projection's TP reduction is a local product in every
-    run."""
+    modes). Interpret mode sums every product in program order, so this
+    checks the moved operations and the buffers they share, not the compiled
+    program's MXU accumulation order. The output projection's TP reduction is
+    a local product in every run."""
 
     SCRIPT = r"""
 import dataclasses, os
@@ -6996,16 +7001,19 @@ print("OK" if ok else "FAIL")
             self.skipTest("Pallas TPU interpret mode unavailable")
         handout = "decode_mla_early_handout=1"
         prefix = "decode_mla_prefix_region=1"
+        overlap = "dsa_gather_overlap=1"
         for case in (
             # The B1 x7 verify shape, dense regime (every step active).
             {"S": "8", "POS": "3000", "TOPK": "200", "ACTIVITY": "16", "MODE": "eager",
-             "VARIANTS": f";{handout};{prefix},{handout}"},
+             "VARIANTS": f";{handout};{prefix},{handout};{overlap};{overlap},{prefix},{handout};"
+                         f"{overlap},{handout}"},
             # Selection-driven step activity, copies executed at their waits.
             {"S": "8", "POS": "3000", "TOPK": "200", "ACTIVITY": "0", "MODE": "on_wait",
-             "VARIANTS": f";{prefix},{handout}"},
-            # Two 8-row sequences (B2 x7): chunked attention.
+             "VARIANTS": f";{prefix},{handout};{overlap},{prefix},{handout}"},
+            # Two 8-row sequences (B2 x7): chunked attention; the gather
+            # overlap stays off (8-row verify calls only).
             {"S": "8", "POS": "1500,3000", "TOPK": "200", "ACTIVITY": "16", "MODE": "eager",
-             "VARIANTS": f";{prefix},{handout}"},
+             "VARIANTS": f";{overlap},{prefix},{handout}"},
         ):  # fmt: skip
             with self.subTest(**case):
                 env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), **case)

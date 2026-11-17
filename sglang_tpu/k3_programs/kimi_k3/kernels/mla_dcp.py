@@ -2089,14 +2089,14 @@ class DcpAttention:
         remote copies to every peer -- so it can run early (e.g. right after
         the indexer's own query gather, under its scoring); ``attend`` then
         runs with ``queries_sent=True`` on the same workspace."""
-        ws, group, member, base, batch = (
-            self.ws,
-            self.group,
-            self.member,
-            self.base,
-            self.batch,
-        )
-        groups = self.row_groups()
+        self.pack_queries(queries, new_latents, parity)
+        self.start_query_sends(parity)
+
+    def pack_queries(self, queries, new_latents, parity):
+        """``send_queries`` without its remote copies: the rows' own queries
+        and new latents staged and this rank's query slot packed;
+        ``start_query_sends`` sends the slot later."""
+        ws, member, batch = self.ws, self.member, self.batch
         ws.own_rows[...] = jnp.zeros(ws.own_rows.shape, jnp.float32)
         ws.new_rows[...] = jnp.zeros(ws.new_rows.shape, jnp.float32)
         for b in range(batch):
@@ -2104,16 +2104,21 @@ class DcpAttention:
             ws.new_rows[pl.ds(self.slots * b, self.heads), :] = jnp.broadcast_to(
                 new_latents[b][None, :], (self.heads, LANES)
             )
-
-        def rows_of(g):
-            first, end = groups[g]
-            return pl.ds(self.slots * first, self.slots * (end - first))
-
         ws.gathered[parity, member] = (
             _pack_fp8_query(ws.own_rows[...])
             if ws.gathered.dtype == jnp.uint8
             else ws.own_rows[...].astype(jnp.bfloat16)
         )
+
+    def start_query_sends(self, parity):
+        """``send_queries``' remote copies of the slot ``pack_queries`` packed."""
+        ws, group, member, base = self.ws, self.group, self.member, self.base
+        groups = self.row_groups()
+
+        def rows_of(g):
+            first, end = groups[g]
+            return pl.ds(self.slots * first, self.slots * (end - first))
+
         for g in range(len(groups)):
             for peer in range(0 if "gather" in self.skip else group):
 
