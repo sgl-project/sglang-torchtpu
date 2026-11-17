@@ -232,9 +232,9 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                 check=True,
                 timeout=900,
             )
-        # The native draft loader reads every tensor in its five shards, so
-        # prepare their full host union once rather than cold-reading the other
-        # host's expert half independently in each of eight draft processes.
+        # This attention-DP recipe replicates the native draft (EP1), so each
+        # draft needs every expert. Prepare its full shard union once per host
+        # instead of independently cold-reading it in eight draft processes.
         draft_path = json.loads(config.read_text())["server_args"][
             "speculative_draft_model_path"
         ]
