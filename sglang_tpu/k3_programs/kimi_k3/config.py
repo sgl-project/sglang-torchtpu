@@ -252,6 +252,14 @@ class KernelConfig:
     # first-index maxima and lowest-rank ties, NaN counting as the maximum
     # (bit-identical decisions).
     verify_greedy_kernel: bool = False
+    # Kimi-K3.1 DSpark verify ops (attention DP1, with dsa_fused_commit): the
+    # accepted KDA states, latent rows and DSA index keys commit in one
+    # kernel (paged.commit_verify_tail) instead of the KDA state commit and
+    # the fused DSA commit. It builds the FP8 latent rows from the decoder's
+    # BF16 handoff in VMEM (no XLA convert, slices and concatenation) and
+    # runs the DSA commit under the first KDA post-state's reads. The same
+    # bytes (bit-identical).
+    verify_fused_tail: bool = False
     # 16-row decode steps: records in the instruction-overlay allocation table
     # (XLA's xla_tpu_overlay_allocation_table_size; 0: the compiler's 10). At
     # 16 rows the KDA layers' overlays are larger than IMEM. With 2 records
@@ -340,6 +348,19 @@ class KernelConfig:
     # prefill keeps its own BF16 input projection (colocated programs no
     # longer share it). Changes numerics: weight quantization.
     kda_fp8_projections: bool = False
+    # Decode weights in shapes XLA passes to the megakernel without a relayout
+    # copy (attention DP1), converted at load: the BF16 norm stacks
+    # (attn_norm, ffn_norm, m_qnorm, m_knorm [layers, 1, width] and
+    # final_norm) as FP32, and the KDA short-conv filter, decay rate and
+    # time-step bias as FP32 [layers, 1, width] rows (filter: 4608 lanes in
+    # (tap, q/k/v, head, channel) order; decay rate and bias: head h at lanes
+    # 128 h.., the decay rate repeated over its head's lanes). XLA lays out a
+    # BF16 [layers, 1, width] parameter with the layers as the tiled rows and
+    # the other KDA shapes with their own tiled dims, so each of these 8
+    # families was relaid out on every step (~23 us of an 8-row verify). The
+    # norms multiply in FP32 either way and the KDA values are the same:
+    # bit-identical. The prefill keeps its own BF16 copies.
+    decode_copy_free_weights: bool = False
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
@@ -385,6 +406,8 @@ class KernelConfig:
             raise ValueError("expert_steal needs attention_dp=1")
         if self.kda_fp8_projections and self.attention_dp != 1:
             raise ValueError("kda_fp8_projections needs attention_dp=1")
+        if self.decode_copy_free_weights and self.attention_dp != 1:
+            raise ValueError("decode_copy_free_weights needs attention_dp=1")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
             raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):

@@ -720,6 +720,293 @@ class TestFusedDsaCommit(CustomTestCase):
                 )
 
 
+class TestVerifyFusedTail(CustomTestCase):
+    """``paged.commit_verify_tail`` (KernelConfig.verify_fused_tail, Pallas
+    interpret mode): from the decoder's BF16 new-key handoff it writes the
+    pools, index pools and KDA banks of the knob-off commits -- the XLA
+    latent rows and FP8 convert into ``_commit_dsa_rows_fused``, and the
+    selected post-states copied in row order (``_commit_kda_states``) --
+    for a verify's runs on their owners and on other ranks, two sequences
+    and repeated null-slot targets."""
+
+    def _tail(self, positions, tables, members, targets, sources, heads=3, layers=3):
+        import functools
+        from unittest import mock
+
+        import jax
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import mla_dcp, paged
+        from sglang_tpu.k3_programs.kimi_k3.layout import (
+            cache_layout,
+            index_block_shape,
+        )
+
+        layout = cache_layout("fp8")
+        blocks, slots = 6, 5
+        batch = len(positions)
+        rng = np.random.default_rng(batch + int(np.sum(positions)) % 991)
+        pool_map = tuple(int(i) for i in rng.permutation(layers + 1)[:layers])
+        lat = [
+            rng.integers(0, 256, (blocks, *layout.block_shape), dtype=np.uint8)
+            for _ in range(layers + 1)
+        ]
+        idx = [
+            rng.integers(0, 256, (blocks, *index_block_shape(layout)), dtype=np.uint8)
+            for _ in range(layers)
+        ]
+        # The handoff's three latent rows (finite, past FP8's range too) and
+        # stale padding rows.
+        handoff = jnp.asarray(
+            rng.standard_normal((batch, layers, heads, 256)) * 100, jnp.bfloat16
+        )
+        records = jnp.asarray(rng.integers(0, 256, (batch, layers, 2, 128)), jnp.int32)
+        conv_banks = jnp.asarray(
+            rng.standard_normal((slots, 3, 2, 4, 128)), jnp.bfloat16
+        )
+        state_banks = jnp.asarray(rng.standard_normal((slots, 3, 2, 128)), jnp.float32)
+        new_conv = jnp.asarray(rng.standard_normal((batch, 3, 2, 4, 128)), jnp.bfloat16)
+        new_state = jnp.asarray(rng.standard_normal((batch, 3, 2, 128)), jnp.float32)
+        targets_ = jnp.asarray(targets, jnp.int32)
+        sources_ = jnp.asarray(sources, jnp.int32)
+        f8 = jnp.float8_e4m3fn
+        cast = lambda x: jax.lax.bitcast_convert_type(jnp.asarray(x), f8)
+        raw = lambda x: np.asarray(
+            jax.lax.bitcast_convert_type(x, np.uint8) if x.dtype == f8 else x
+        )
+        bits = lambda x: np.asarray(x).view(
+            {2: np.uint16, 4: np.uint32}[np.asarray(x).dtype.itemsize]
+        )
+        tables_, positions_ = jnp.asarray(tables, jnp.int32), jnp.asarray(positions)
+        interpret = functools.partial(pl.pallas_call, interpret=pltpu.InterpretParams())
+        want_conv, want_state = np.array(conv_banks), np.array(state_banks)
+        for t, src in zip(targets, sources):  # row order
+            want_conv[t], want_state[t] = (
+                np.asarray(new_conv[src]),
+                np.asarray(new_state[src]),
+            )
+        for member in members:
+            with (
+                mock.patch.object(mla_dcp, "owner_index", return_value=member),
+                mock.patch.object(paged.pl, "pallas_call", interpret),
+            ):
+                pools = tuple(cast(x) for x in lat)
+                index_pools = tuple(jnp.asarray(x) for x in idx)
+                conv, state, *got = paged.commit_verify_tail(
+                    conv_banks,
+                    state_banks,
+                    new_conv,
+                    new_state,
+                    targets_,
+                    sources_,
+                    pools,
+                    index_pools,
+                    handoff,
+                    records,
+                    tables_,
+                    positions_,
+                    pool_map,
+                )
+                old = paged._commit_dsa_rows_fused(
+                    pools,
+                    index_pools,
+                    paged.latent_rows_from_handoff(handoff),
+                    records,
+                    tables_,
+                    positions_,
+                    pool_map,
+                )
+            self.assertEqual(len(got), len(old))
+            changed = 0
+            for g, o, base in zip(got, old, (*lat, *idx), strict=True):
+                np.testing.assert_array_equal(raw(g), raw(o))
+                changed += int(not np.array_equal(raw(o), base))
+            np.testing.assert_array_equal(bits(conv), bits(want_conv))
+            np.testing.assert_array_equal(bits(state), bits(want_state))
+            yield member, changed
+
+    @staticmethod
+    def _interpretable():
+        try:
+            from jax.experimental.pallas import tpu as pltpu
+
+            pltpu.InterpretParams()
+        except (ImportError, AttributeError):
+            return False
+        return True
+
+    def test_verify_runs_and_other_ranks(self):
+        """One sequence's eight rows inside a sub-page and across a page (the
+        next page's owner commits the rest); a rank owning none of them still
+        commits the KDA row; repeated null-slot targets land in row order."""
+        if not self._interpretable():
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        tables = np.tile(np.array([[3, 1, 4, 2]], np.int32), (8, 1))
+        for start, members, layers in (
+            (29, (5,), 24),
+            (29, (5, 9), 3),
+            (508, (5, 6), 3),
+        ):
+            with self.subTest(start=start, layers=layers):
+                positions = 512 * 37 + start + np.arange(8, dtype=np.int32)
+                changed = dict(
+                    self._tail(positions, tables, members, [3], [6], layers=layers)
+                )
+                self.assertGreater(changed[5], 0)  # the owner commits rows
+                if 9 in changed:
+                    self.assertEqual(changed[9], 0)  # another rank: none
+        positions = np.tile(512 * 70 + 250 + np.arange(8, dtype=np.int32), 2)
+        tables = np.repeat(np.array([[0, 0, 2, 0], [0, 0, 5, 0]], np.int32), 8, axis=0)
+        list(self._tail(positions, tables, (6,), targets=[0, 0], sources=[7, 12]))
+        list(
+            self._tail(positions, tables, (6,), targets=[2, 4], sources=[3, 9], heads=8)
+        )
+
+
+class TestVerifyFusedTailOps(CustomTestCase):
+    """The verify ops' plumbing for KernelConfig.verify_fused_tail (Pallas
+    interpret mode, three MLA layers): ``decode_paged``'s deferred latent
+    commit goes to ``DecodeOps._finish_verify``, which commits it with the
+    accepted KDA row into the op's pools (window centres untouched) -- the
+    bytes of the knob-off commits."""
+
+    def test_finish_verify_commits_the_pending_rows(self):
+        import functools
+        from unittest import mock
+
+        import jax
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        from sglang_tpu.k3_programs.kimi_k3 import config as kernel_config
+        from sglang_tpu.k3_programs.kimi_k3 import decode_ops, sampling
+        from sglang_tpu.k3_programs.kimi_k3.kernels import mla_dcp, paged
+        from sglang_tpu.k3_programs.kimi_k3.layout import (
+            cache_layout,
+            index_block_shape,
+        )
+
+        layout, layers, blocks, rows = cache_layout("fp8"), 3, 4, 8
+        rng = np.random.default_rng(7)
+        pool_map = (2, 0, 3)
+        f8 = jnp.float8_e4m3fn
+        lat = tuple(
+            jax.lax.bitcast_convert_type(
+                jnp.asarray(
+                    rng.integers(0, 256, (blocks, *layout.block_shape)), jnp.uint8
+                ),
+                f8,
+            )
+            for _ in range(layers + 1)
+        )
+        idx = tuple(
+            jnp.asarray(
+                rng.integers(0, 256, (blocks, *index_block_shape(layout))), jnp.uint8
+            )
+            for _ in range(layers)
+        )
+        centres = jnp.asarray(rng.integers(0, 99, (1, 5, layers, rows)), jnp.int32)
+        handoff = jnp.asarray(
+            rng.standard_normal((rows, layers, 3, 256)) * 9, jnp.bfloat16
+        )
+        records = jnp.asarray(rng.integers(0, 256, (rows, layers, 2, 128)), jnp.int32)
+        positions = jnp.asarray(512 * 41 + 100 + np.arange(rows), jnp.int32)
+        tables = jnp.tile(jnp.asarray([[0, 3, 0]], jnp.int32), (rows, 1))
+        slot = 2
+        slots = jnp.full((rows,), slot, jnp.int32)
+        conv = jnp.asarray(rng.standard_normal((4, 3, 2, 4, 128)), jnp.bfloat16)
+        state = jnp.asarray(rng.standard_normal((4, 3, 2, 128)), jnp.float32)
+        new_conv = jnp.asarray(rng.standard_normal((rows, 3, 2, 4, 128)), jnp.bfloat16)
+        new_state = jnp.asarray(rng.standard_normal((rows, 3, 2, 128)), jnp.float32)
+        decisions = jnp.asarray([[5, 77]], jnp.int32)  # 5 accepted: post-state row 5
+
+        ops = object.__new__(decode_ops.DecodeOps)
+        ops.paged, ops.attention_dp, ops.dsa_pools = paged, 1, layers
+        ops.unified_pools = [None] * (2 * layers + 1)
+        ops.pool_map, ops.owner_table = pool_map, None
+        for enabled in (False, True):
+            with mock.patch.object(
+                kernel_config,
+                "active",
+                return_value=kernel_config.KernelConfig(verify_fused_tail=enabled),
+            ):
+                self.assertEqual(
+                    ops._fused_tail_options(),
+                    {"defer_latent_commit": True} if enabled else {},
+                )
+        outputs = ("logits", "aux", "conv", "state", ("pools",), "pending")
+        self.assertEqual(
+            ops._pending_commit(outputs, {"defer_latent_commit": True}),
+            (outputs[:-1], "pending"),
+        )
+        self.assertEqual(ops._pending_commit(outputs[:-1], {}), (outputs[:-1], None))
+
+        interpret = functools.partial(pl.pallas_call, interpret=pltpu.InterpretParams())
+        control = mock.Mock()
+        raw = lambda x: np.asarray(
+            jax.lax.bitcast_convert_type(x, np.uint8) if x.dtype == f8 else x
+        )
+        with (
+            mock.patch.object(mla_dcp, "owner_index", return_value=41 % 32),
+            mock.patch.object(paged.pl, "pallas_call", interpret),
+            mock.patch.object(sampling, "verify_acceptance", return_value=decisions),
+        ):
+            got = ops._finish_verify(
+                control,
+                conv,
+                state,
+                new_conv,
+                new_state,
+                None,
+                slots,
+                positions,
+                slots,
+                None,
+                jnp.zeros((1,), jnp.int32),
+                None,
+                True,
+                pool=(*lat, *idx, centres),
+                pending=(handoff, records, tables, positions),
+            )
+            want_pools = paged._commit_dsa_rows_fused(
+                lat,
+                idx,
+                paged.latent_rows_from_handoff(handoff),
+                records,
+                tables,
+                positions,
+                pool_map,
+            )
+        out_decisions, out_conv, out_state, out_pool = got
+        np.testing.assert_array_equal(np.asarray(out_decisions), np.asarray(decisions))
+        self.assertEqual(len(out_pool), 2 * layers + 2)
+        for g, w in zip(out_pool[:-1], want_pools, strict=True):
+            np.testing.assert_array_equal(raw(g), raw(w))
+        self.assertTrue(
+            any(
+                not np.array_equal(raw(g), raw(b))
+                for g, b in zip(out_pool, (*lat, *idx))
+            )
+        )
+        np.testing.assert_array_equal(np.asarray(out_pool[-1]), np.asarray(centres))
+        want_conv, want_state = np.array(conv), np.array(state)
+        want_conv[slot], want_state[slot] = (
+            np.asarray(new_conv[5]),
+            np.asarray(new_state[5]),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(out_conv).view(np.uint16), want_conv.view(np.uint16)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(out_state).view(np.uint32), want_state.view(np.uint32)
+        )
+
+
 class TestIndexSelect(CustomTestCase):
     """The decode selection kernel (``dsa_dcp.select_call``) in Pallas
     interpret mode on a 4-rank DCP group of host devices: every rank's keys
@@ -5097,6 +5384,171 @@ print("OK")
         self.assertIn(
             "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
         )
+
+
+class TestCopyFreeWeights(CustomTestCase):
+    """KernelConfig.decode_copy_free_weights: ``rank_loader.copy_free_families``
+    holds the norm stacks' BF16 values in FP32 and the KDA filter, decay rate
+    and time-step bias as FP32 [layers, 1, width] rows; in Pallas interpret
+    mode the kernel's reads of those rows (``_kda_filter``, ``_kda_heads``)
+    and its FP32 norm products give the knob-off values bit for bit."""
+
+    def _families(self, rng):
+        import ml_dtypes
+
+        bf16 = ml_dtypes.bfloat16
+        return {
+            "attn_norm": rng.standard_normal((5, 1, 7168)).astype(bf16),
+            "ffn_norm": rng.standard_normal((5, 1, 7168)).astype(bf16),
+            "m_qnorm": rng.standard_normal((2, 1, 1536)).astype(bf16),
+            "m_knorm": rng.standard_normal((2, 1, 512)).astype(bf16),
+            "final_norm": rng.standard_normal((1, 7168)).astype(bf16),
+            "k_conv": rng.standard_normal((3, 4, 3, 3, 128)).astype(np.float32),
+            "k_a_log": rng.uniform(-1, 1, (3, 3, 1)).astype(np.float32),
+            "k_dt": rng.uniform(-2, 2, (3, 3, 128)).astype(np.float32),
+            "k_norm": rng.standard_normal((3, 8, 128)).astype(bf16),
+        }
+
+    def test_families_hold_the_same_values(self):
+        from sglang_tpu.k3_programs.kimi_k3.kernels import rank_loader
+
+        families = self._families(np.random.default_rng(0))
+        got = rank_loader.copy_free_families(families)
+        self.assertEqual(
+            set(got), set(rank_loader.COPY_FREE_NORMS + rank_loader.COPY_FREE_KDA)
+        )
+        for name in rank_loader.COPY_FREE_NORMS:
+            self.assertEqual(got[name].dtype, np.float32)
+            self.assertEqual(got[name].shape, families[name].shape)
+            np.testing.assert_array_equal(got[name], families[name].astype(np.float32))
+        self.assertEqual(got["k_conv"].shape, (3, 1, 4608))
+        self.assertEqual(got["k_dt"].shape, (3, 1, 384))
+        self.assertEqual(got["k_a_log"].shape, (3, 1, 384))
+        for layer in range(3):
+            for tap, part, head in np.ndindex(4, 3, 3):
+                lanes = 128 * (9 * tap + 3 * part + head)
+                np.testing.assert_array_equal(
+                    got["k_conv"][layer, 0, lanes : lanes + 128],
+                    families["k_conv"][layer, tap, part, head],
+                )
+            for head in range(3):
+                lanes = slice(128 * head, 128 * (head + 1))
+                np.testing.assert_array_equal(
+                    got["k_dt"][layer, 0, lanes], families["k_dt"][layer, head]
+                )
+                np.testing.assert_array_equal(
+                    got["k_a_log"][layer, 0, lanes],
+                    np.full(128, families["k_a_log"][layer, head, 0]),
+                )
+
+    def test_kernel_reads_match_bit_for_bit(self):
+        """The KDA layer's filter product and decay (as ``kda`` computes
+        them), and the norms' FP32 products (``normalize`` and the MLA q/kv
+        norms), from both representations."""
+        import functools
+
+        import jax
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk
+        from sglang_tpu.k3_programs.kimi_k3.kernels import rank_loader
+
+        rng = np.random.default_rng(1)
+        families = self._families(rng)
+        flat = rank_loader.copy_free_families(families)
+        rows = 8
+        window = jnp.asarray(
+            rng.standard_normal((rows, 4, 3, 3, 128)) * 2, jnp.bfloat16
+        )
+        gate = jnp.asarray(rng.standard_normal((rows, 384)) * 3, jnp.bfloat16)
+        hidden = jnp.asarray(rng.standard_normal((rows, 7168)) * 2, jnp.bfloat16)
+        latent = jnp.asarray(rng.standard_normal((rows, 1536)), jnp.float32)
+
+        def kernel(
+            window_ref,
+            gate_ref,
+            hidden_ref,
+            latent_ref,
+            conv_ref,
+            decay_ref,
+            bias_ref,
+            norm_ref,
+            qnorm_ref,
+            filtered_out,
+            decay_out,
+            filter_out,
+            normalized_out,
+            query_out,
+        ):
+            convolution_filter = dmk._kda_filter(conv_ref).astype(jnp.float32)
+            filter_out[...] = convolution_filter
+            filtered_out[...] = jax.nn.silu(
+                jnp.sum(
+                    window_ref[...].astype(jnp.float32) * convolution_filter[None],
+                    axis=1,
+                )
+            ).astype(jnp.bfloat16)
+            decay_out[...] = -5.0 * jax.nn.sigmoid(
+                jnp.exp(dmk._kda_heads(decay_ref))[None]
+                * (
+                    gate_ref[...].reshape(rows, 3, 128).astype(jnp.float32)
+                    + dmk._kda_heads(bias_ref)[None]
+                )
+            )
+            value = hidden_ref[...].astype(jnp.float32)
+            normalized_out[...] = (
+                value
+                * jax.lax.rsqrt(jnp.mean(value * value, axis=1, keepdims=True) + 1e-5)
+                * norm_ref[...]
+            ).astype(jnp.bfloat16)
+            query = latent_ref[...]
+            query_out[...] = (
+                query
+                * jax.lax.rsqrt(jnp.mean(query * query, axis=1, keepdims=True) + 1e-5)
+                * qnorm_ref[...]
+            ).astype(jnp.bfloat16)
+
+        call = functools.partial(
+            pl.pallas_call,
+            kernel,
+            out_shape=(
+                jax.ShapeDtypeStruct((rows, 3, 3, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((rows, 3, 128), jnp.float32),
+                jax.ShapeDtypeStruct((4, 3, 3, 128), jnp.float32),
+                jax.ShapeDtypeStruct((rows, 7168), jnp.bfloat16),
+                jax.ShapeDtypeStruct((rows, 1536), jnp.bfloat16),
+            ),
+            interpret=pltpu.InterpretParams(),
+        )
+
+        def run(source, layer):
+            return [
+                np.asarray(x)
+                for x in call()(
+                    window,
+                    gate,
+                    hidden,
+                    latent,
+                    jnp.asarray(source["k_conv"][layer]),
+                    jnp.asarray(source["k_a_log"][layer]),
+                    jnp.asarray(source["k_dt"][layer]),
+                    jnp.asarray(source["attn_norm"][layer]),
+                    jnp.asarray(source["m_qnorm"][layer % 2]),
+                )
+            ]
+
+        for layer in (0, 2):
+            want, got = run(families, layer), run(flat, layer)
+            np.testing.assert_array_equal(
+                want[2], families["k_conv"][layer].astype(np.float32)
+            )
+            for w, g in zip(want, got, strict=True):
+                bits = {2: np.uint16, 4: np.uint32}[w.dtype.itemsize]
+                np.testing.assert_array_equal(g.view(bits), w.view(bits))
 
 
 class TestSeededWindowMath(CustomTestCase):
