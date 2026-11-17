@@ -58,7 +58,6 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
 from sglang_tpu.attention_pallas_rpa_pcp import (
     PcpRingMetadata,
     build_pcp_ring_metadata,
-    check_pcp_ring_layer,
     dcp_stripe_group,
     forward_pcp_ring,
     init_pcp_ring_op,
@@ -168,7 +167,7 @@ class PallasForwardMetadata:
     # Pooled DSA indexer with a raw ring (kv_pool.kpool_raw_ring_pages) only:
     # i32[max_num_seqs]  first ring page of each row's request slot
     raw_page_base: torch.Tensor | None = None
-    #Prefill context parallelism using ring attention (SGLANG_TPU_PCP_MODE=ring)
+    # Prefill context parallelism using ring attention (SGLANG_TPU_PCP_MODE=ring)
     cp_ring: PcpRingMetadata | None = None
 
 
@@ -1712,8 +1711,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         if is_swa_layer and self.forward_metadata.cp_swa_write_segments is not None:
             cp_write_segments = self.forward_metadata.cp_swa_write_segments
             cp_write_num_segments = self.forward_metadata.cp_swa_write_num_segments
-        if cp_write_segments is not None and self.forward_metadata.cp_ring is None:
-            all_gather_and_write_kv(
+        k_all = v_all = None
+        if cp_write_segments is not None:
+            k_all, v_all = all_gather_and_write_kv(
                 kv_cache=kv_cache,
                 k=k if quantize_kv is None else k_compute,
                 v=v if quantize_kv is None else v_compute,
@@ -1725,23 +1725,19 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
         kv_lens = self._kv_lens(forward_batch)
         if self.forward_metadata.cp_ring is not None:
-            check_pcp_ring_layer(
+            out = forward_pcp_ring(
+                self.forward_metadata,
+                self._pcp_ring_op,
                 layer,
+                q,
+                k_all,
+                v_all,
+                kv_cache,
                 sinks=sinks,
                 sliding_window=sliding_window,
                 soft_cap=soft_cap,
                 causal=use_causal_mask,
                 pack=pack,
-            )
-            out = forward_pcp_ring(
-                self.forward_metadata,
-                self._pcp_ring_op,
-                q,
-                k if quantize_kv is None else k_compute,
-                v if quantize_kv is None else v_compute,
-                kv_cache,
-                quantize_kv=quantize_kv,
-                sm_scale=float(layer.scaling),
                 k_scale=k_scale,
                 v_scale=v_scale,
             )

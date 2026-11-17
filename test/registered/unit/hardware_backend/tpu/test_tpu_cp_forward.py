@@ -26,6 +26,7 @@ from sglang_tpu.attention_pallas_rpa_pcp import (
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.cp_forward import (
     TpuCpBatchLayout,
+    all_gather_and_write_kv,
     cp_last_token_rows,
     get_tpu_cp_layout,
     install_cp_logits_forward,
@@ -985,22 +986,32 @@ class TestRingForward(CustomTestCase):
             cp_ring=ring,
         )
         q = torch.ones(tokens, 4, dim)
-        parallel = SimpleNamespace(attn_cp_group=group)
-        with patch(
-            "sglang_tpu.attention_pallas_rpa_pcp.get_parallel", return_value=parallel
-        ):
-            out = forward_pcp_ring(
-                metadata,
-                ring_op,
-                q,
-                k,
-                v,
-                kv_cache,
-                quantize_kv=quantize,
-                sm_scale=0.25,
-                k_scale=0.5,
-                v_scale=2.0,
-            )
+        # As the backend forward does: gather + write, then the ring op.
+        k_all, v_all = all_gather_and_write_kv(
+            kv_cache=kv_cache,
+            k=k,
+            v=v,
+            write_segments=metadata.cp_write_segments,
+            write_num_segments=metadata.cp_write_num_segments,
+            group=group,
+            quantize=quantize,
+        )
+        out = forward_pcp_ring(
+            metadata,
+            ring_op,
+            SimpleNamespace(layer_id=0, scaling=0.25),
+            q,
+            k_all,
+            v_all,
+            kv_cache,
+            sinks=None,
+            sliding_window=None,
+            soft_cap=None,
+            causal=True,
+            pack=1,
+            k_scale=0.5,
+            v_scale=2.0,
+        )
 
         self.assertEqual(events, ["gather", "gather", "quantize", "op"])
         self.assertTrue(torch.equal(out, q + 1))
