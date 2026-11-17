@@ -28,6 +28,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
         blockwise: bool = False,
         divergent_ids: bool = False,
         divergent_weights: bool = False,
+        fp8_direct_write: bool = False,
         layers: int = 1,
         skewed_routing: bool = False,
     ):
@@ -58,6 +59,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
         env["SGLANG_TPU_FUSED_RS_TEST_TOPK"] = str(topk)
         env["SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_IDS"] = str(int(divergent_ids))
         env["SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_WEIGHTS"] = str(int(divergent_weights))
+        env["SGLANG_TPU_FUSED_RS_TEST_FP8_DIRECT_WRITE"] = str(int(fp8_direct_write))
 
         try:
             result = subprocess.run(
@@ -90,6 +92,10 @@ class TestFp8FusedRsKernel(CustomTestCase):
         )
         self.assertEqual(
             result.stdout.count(f"divergent_weights={divergent_weights}"),
+            8,
+        )
+        self.assertEqual(
+            result.stdout.count(f"fp8_direct_write={fp8_direct_write}"),
             8,
         )
         self.assertEqual(result.stdout.count(f"layers={layers}"), 8)
@@ -138,6 +144,14 @@ class TestFp8FusedRsKernel(CustomTestCase):
             blockwise=True,
         )
 
+    def test_compiled_tp8_fp8_direct_write_matches_reference(self):
+        self._run_compiled_tp8_kernel(
+            post_expert_norm=False,
+            tokens=8,
+            topk=1,
+            fp8_direct_write=True,
+        )
+
     def test_compiled_tp8_stacked_skewed_routing_does_not_leak_dma_semaphores(self):
         """Stacked skewed calls must not halt when faster ranks finish first.
 
@@ -149,6 +163,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
             post_expert_norm=False,
             tokens=4096,
             topk=1,
+            fp8_direct_write=True,
             layers=10,
             skewed_routing=True,
         )

@@ -138,6 +138,7 @@ def _build_fused_moe_rs_op():
         topk: int,
         activation: str,
         has_post_expert_norm: bool,
+        fp8_direct_write: bool,
         expert_tp: bool,
         fp4_w4a16: bool,
     ) -> jax.Array:
@@ -171,6 +172,7 @@ def _build_fused_moe_rs_op():
             post_expert_norm_weight=(
                 post_expert_norm_weight if has_post_expert_norm else None
             ),
+            fp8_direct_write=fp8_direct_write,
             expert_tp=expert_tp,
             fp4_w4a16=fp4_w4a16,
         )
@@ -185,7 +187,7 @@ def _build_fused_moe_rs_op():
         _FUSED_MOE_RS_OP_NAME,
         _wrapped,
         mesh=mesh,
-        input_partition_specs=(P(),) * 9 + (None,) * 5,
+        input_partition_specs=(P(),) * 9 + (None,) * 6,
         output_partition_specs=(P(),),
     )
 
@@ -202,6 +204,7 @@ def _build_fused_moe_rs_op():
         topk: int,
         activation: str,
         has_post_expert_norm: bool,
+        fp8_direct_write: bool,
         expert_tp: bool,
         fp4_w4a16: bool,
     ) -> torch.Tensor:
@@ -231,6 +234,7 @@ def fused_moe_rs_call(
     topk: int,
     activation: str,
     has_post_expert_norm: bool,
+    fp8_direct_write: bool,
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
 ) -> torch.Tensor:
@@ -247,6 +251,7 @@ def fused_moe_rs_call(
         topk,
         activation,
         has_post_expert_norm,
+        fp8_direct_write,
         expert_tp,
         fp4_w4a16,
     )
@@ -266,6 +271,7 @@ def fused_moe_rs_gather(
     topk: int,
     activation: str,
     has_post_expert_norm: bool,
+    fp8_direct_write: bool,
     world_size: int,
     keep_token_shard: bool = False,
     expert_tp: bool = False,
@@ -298,6 +304,7 @@ def fused_moe_rs_gather(
                         topk=topk,
                         activation=activation,
                         has_post_expert_norm=has_post_expert_norm,
+                        fp8_direct_write=fp8_direct_write,
                         world_size=world_size,
                         expert_tp=True,
                         oneshot_rank=oneshot_rank,
@@ -350,6 +357,7 @@ def fused_moe_rs_gather(
         topk=topk,
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
+        fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
         fp4_w4a16=fp4_w4a16,
     )

@@ -14,7 +14,9 @@ the top-k weighted reduction.
 
 When SP is disabled the kernel returns the per-chip reduce-scattered token
 shard (sharded over the expert axis); the model (forward_tpu_moe) gathers it
-back to the full replicated batch. Per-expert post-normalization is applied
+back to the full replicated batch. The kernel can additionally quantize the
+in-kernel ICI reduce-scatter payload to ``float8_e4m3fn`` on device, reducing
+ICI traffic without a host roundtrip. Per-expert post-normalization is applied
 before the post-kernel top-k weighted reduction.
 """
 
@@ -232,6 +234,7 @@ def moe_gmm_local_rs_nodedup(
     ep_axis_name=EXPERT,
     has_post_norm: bool = False,
     sp_enabled: bool = True,
+    fp8_direct_write: bool = False,
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
     allow_twolevel_rs: bool = False,
@@ -350,6 +353,7 @@ def moe_gmm_local_rs_nodedup(
             else None
         ),
         act_fn=activation,
+        fp8_direct_write=fp8_direct_write,
     )
     tile_m = block_sizes.tile_m
     # Every device must execute the same padded GM loop. Use a static upper
@@ -376,7 +380,12 @@ def moe_gmm_local_rs_nodedup(
     padded_hidden = (
         has_post_norm and post_expert_norm_weight_input.shape[0] < hidden_size
     )
-    twolevel_rs = allow_twolevel_rs and num_tokens >= 4096 and not padded_hidden
+    twolevel_rs = (
+        allow_twolevel_rs
+        and num_tokens >= 4096
+        and not fp8_direct_write
+        and not padded_hidden
+    )
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
         w1,
@@ -400,6 +409,7 @@ def moe_gmm_local_rs_nodedup(
         max_num_gm=max_num_gm,
         caller_tile_m=tile_m,
         top_k=kernel_topk,
+        fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
         fp4_w4a16=fp4_w4a16,
         twolevel_rs=twolevel_rs,
@@ -503,6 +513,7 @@ def expert_parallel_gmm_rs(
     post_expert_norm_weight: jax.Array | None = None,
     w1_global_scale: jax.Array | None = None,
     w2_global_scale: jax.Array | None = None,
+    fp8_direct_write: bool = False,
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
 ) -> jax.Array:
@@ -521,6 +532,12 @@ def expert_parallel_gmm_rs(
     hidden_in_spec = data_p_spec if sp_enabled else P()
     moe_out_spec = (
         P(combine_partition_axes(MLP_DATA, expert_axis)) if sp_enabled else P()
+    )
+    fp8_direct_write = (
+        (not sp_enabled)
+        and w1_scale is not None
+        and w2_scale is not None
+        and fp8_direct_write
     )
     # When SP off, replicate the routing tensors too (consistent with the
     # replicated hidden in/out) so XLA needs no per-tensor reshard; the body
@@ -567,6 +584,7 @@ def expert_parallel_gmm_rs(
             ep_axis_name=expert_axis,
             has_post_norm=_has_pn_rs,
             sp_enabled=sp_enabled,
+            fp8_direct_write=fp8_direct_write,
             expert_tp=expert_tp,
             fp4_w4a16=fp4_w4a16,
             allow_twolevel_rs=(
@@ -627,6 +645,7 @@ def expert_parallel_gmm_rs(
         "mesh",
         "activation",
         "scoring_fn",
+        "fp8_direct_write",
         "expert_tp",
         "fp4_w4a16",
     ),
@@ -652,6 +671,7 @@ def fused_moe_func_rs(
     topk_weights: jax.Array | None = None,
     topk_indices: jax.Array | None = None,
     group_offset_input: jax.Array | None = None,
+    fp8_direct_write: bool = False,
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
 ) -> jax.Array:
@@ -713,6 +733,7 @@ def fused_moe_func_rs(
         topk=topk,
         mesh=mesh,
         post_expert_norm_weight=post_expert_norm_weight,
+        fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
         fp4_w4a16=fp4_w4a16,
     )

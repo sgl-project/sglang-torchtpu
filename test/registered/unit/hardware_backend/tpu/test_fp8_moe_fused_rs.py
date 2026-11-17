@@ -191,6 +191,41 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertEqual(actual.hidden_states.shape, x.shape)
         self.assertIs(fused.call_args.kwargs["w1_scale"], w13_scale_inv)
         self.assertIs(fused.call_args.kwargs["w2_scale"], w2_scale_inv)
+        self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
+
+    def test_large_fused_prefill_uses_bf16_direct_write(self):
+        tokens, hidden, topk = 8192, 4, 8
+        x = torch.zeros(tokens, hidden)
+        dispatch_output = SimpleNamespace(
+            hidden_states=x,
+            topk_output=(
+                torch.ones(tokens, topk),
+                torch.zeros(tokens, topk, dtype=torch.int32),
+                None,
+            ),
+        )
+        layer = SimpleNamespace(
+            weight_block_size=None,
+            w13_weight=torch.zeros(1, hidden, 2 * hidden),
+            w2_weight=torch.zeros(1, hidden, hidden),
+            w13_weight_scale=torch.ones(1, 1, 1, 2 * hidden),
+            w2_weight_scale=torch.ones(1, 1, 1, hidden),
+            moe_ep_size=8,
+            moe_runner_config=SimpleNamespace(routed_scaling_factor=None),
+            _tpu_fused_rs_group_offset=torch.tensor([0], dtype=torch.int32),
+        )
+
+        with patch(
+            "sglang_tpu.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            return_value=torch.zeros_like(x),
+        ) as fused:
+            apply_fp8_fused_rs(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+            )
+
+        self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
         # The dwdp and replicated-expert gates read the published parallel

@@ -183,6 +183,7 @@ def _make_fused_rs_kernel(
             topk=topk,
             activation=activation,
             has_post_expert_norm=False,
+            fp8_direct_write=False,
         )
 
     return kernel

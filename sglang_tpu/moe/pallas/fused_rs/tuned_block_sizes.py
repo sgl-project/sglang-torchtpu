@@ -8,7 +8,10 @@ import jax.numpy as jnp
 
 from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
 
-from .v2_fused_rs_tuned_block_sizes import FUSED_RS_TUNED_BLOCK_SIZES
+from .v2_fused_rs_tuned_block_sizes import (
+    FUSED_RS_TUNED_BLOCK_SIZES,
+    FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,7 @@ def get_fused_rs_tuned_block_sizes(
     rhs_quant_block_size: int | None,
     default_block_sizes: tuple[int, int, int, int, int, int, int],
     fuse_act: str | None = None,
+    fp8_direct_write: bool = False,
 ) -> tuple[int, int, int, int, int, int, int]:
     device_name = _device_kind()
     dtype_key = _dtype_key(lhs_dtype, rhs_dtype)
@@ -79,6 +83,14 @@ def get_fused_rs_tuned_block_sizes(
     )
     m_key = f"{m}_{act_key}"
 
+    if fp8_direct_write:
+        try:
+            return FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM[device_name][dtype_key][
+                joint_key
+            ][m_key]
+        except KeyError:
+            pass
+
     try:
         result = FUSED_RS_TUNED_BLOCK_SIZES[device_name][dtype_key][joint_key][m_key]
         logger.info(
@@ -99,4 +111,7 @@ def get_fused_rs_tuned_block_sizes(
             default_block_sizes,
         )
         result = default_block_sizes
+
+    if fp8_direct_write and result[0] > 64:
+        result = (64,) + tuple(result[1:])
     return result

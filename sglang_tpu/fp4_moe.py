@@ -462,6 +462,9 @@ def apply_tpu_nvfp4_moe(
                 topk=int(topk_ids.shape[-1]),
                 activation=activation,
                 has_post_expert_norm=has_post_expert_norm,
+                # Blocks 16-128 use W4A16; block-256/512 already quantize the
+                # GMM activation. A direct FP8 write would add another loss.
+                fp8_direct_write=False,
                 world_size=tp_world_size,
                 keep_token_shard=keep_output_shard,
                 expert_tp=expert_tp,

@@ -270,6 +270,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 topk=8,
                 activation="silu",
                 has_post_expert_norm=False,
+                fp8_direct_write=False,
                 world_size=8,
                 expert_tp=True,
             )
@@ -311,6 +312,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 topk=1,
                 activation="silu",
                 has_post_expert_norm=False,
+                fp8_direct_write=True,
                 world_size=8,
             )
 
@@ -345,6 +347,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 topk=8,
                 activation="silu",
                 has_post_expert_norm=False,
+                fp8_direct_write=False,
                 world_size=8,
                 keep_token_shard=True,
             )
@@ -376,6 +379,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 topk=1,
                 activation="silu",
                 has_post_expert_norm=False,
+                fp8_direct_write=False,
                 world_size=8,
                 keep_token_shard=True,
             )

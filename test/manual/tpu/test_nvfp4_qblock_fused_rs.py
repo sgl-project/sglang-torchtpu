@@ -230,6 +230,7 @@ def main() -> None:
             topk=TOP_K,
             activation="silu",
             has_post_expert_norm=True,
+            fp8_direct_write=False,
             expert_tp=True,
             fp4_w4a16=True,
         )

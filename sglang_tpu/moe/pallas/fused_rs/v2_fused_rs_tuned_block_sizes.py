@@ -70,8 +70,13 @@ where total_w*_steps = (size_n* / tile_n*) * (size_k* / tile_k*).
 _H4096_I4096_FP8 = (112, 4096, 4096, 4096, 4096, 1, 1)
 # fp8 DECODE (M<=2048, HBM-bandwidth-bound): tile_m=32 + half-N + double-buffered
 # weights. ~10% faster than the per-tensor default (112, full-N, 1 buf) across
-# decode batch sizes (16-256 seqs).
+# decode batch sizes (16-256 seqs). Used for both bf16 and fp8 output comm.
 _H4096_I4096_FP8_DECODE = (32, 4096, 2048, 4096, 2048, 2, 2)
+# fp8 direct-write prefill:
+# fp8 direct-write adds VMEM staging tiles, so the bf16 tile_m=112 OOMs.
+# tile_m=96 full-N is the largest that fits and is ~7% faster than the old
+# unconditional min(tile_m, 64) clamp.
+_H4096_I4096_FP8_FP8COMM_PREFILL = (96, 4096, 4096, 4096, 4096, 1, 1)
 # H3072-I3072 fp8: TWO configs needed.
 # - At small M (< 1024 tokens, < ~1 m-tile per expert): caching gives no
 #   benefit since each expert is visited once. The smaller per-tile work
@@ -394,6 +399,24 @@ def _h4096_i4096_fp8_kblock2_size_dependent():
     return out
 
 
+def _h4096_i4096_fp8_fp8comm_size_dependent():
+    """H4096-I4096 fp8 WITH fp8 output comm (fp8_direct_write).
+
+    Decode (M<=2048): tile_m=32 (well under the fp8-staging VMEM ceiling).
+    Prefill (M>=4096): tile_m=96 full-N — the largest that fits with the fp8
+    staging tiles (tile_m=112 OOMs), ~7% faster than the old tile_m<=64 clamp.
+    """
+    out = {}
+    for m_key in _ALL_M_KEYS:
+        m_val = int(m_key.split("_")[0])
+        out[m_key] = (
+            _H4096_I4096_FP8_DECODE
+            if m_val <= 2048
+            else _H4096_I4096_FP8_FP8COMM_PREFILL
+        )
+    return out
+
+
 # =============================================================================
 # Table — keyed by (device_name → dtype_key → joint_model_key → m_key)
 # =============================================================================
@@ -598,4 +621,32 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
             "k-3072_n-6144_g-32+k-3072_n-3072_g-32": _all_m(_H3072_I3072_BF16),
         },
     }
+}
+
+
+# =============================================================================
+# fp8 OUTPUT-COMM table.
+#
+# Selected by get_fused_rs_tuned_block_sizes(fp8_direct_write=True). Kept
+# separate from the table above because fp8 direct-write adds VMEM staging tiles (an FP8
+# DMA tile + per-row scale staging), which changes the optimal tile -- notably a
+# lower prefill tile_m. Entries here are sized to fit that VMEM budget, so the
+# selector returns them directly (no tile_m clamp). Shapes WITHOUT an entry here
+# fall back to the bf16 table with tile_m clamped to <=64 for VMEM safety.
+# =============================================================================
+FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM = {
+    "TPU7x": {
+        "lhs_bfloat16_rhs_float8_e4m3fn": {
+            # H4096-I4096 per-tensor fp8, EP=16 -> g=16 (multi-host).
+            (
+                "k-4096_n-8192_g-16_lhs_quant_rhs_bs-4096"
+                "+k-4096_n-4096_g-16_lhs_quant_rhs_bs-4096"
+            ): _h4096_i4096_fp8_fp8comm_size_dependent(),
+            # H4096-I4096 per-tensor fp8, EP=8 -> g=32 (single-host).
+            (
+                "k-4096_n-8192_g-32_lhs_quant_rhs_bs-4096"
+                "+k-4096_n-4096_g-32_lhs_quant_rhs_bs-4096"
+            ): _h4096_i4096_fp8_fp8comm_size_dependent(),
+        },
+    },
 }

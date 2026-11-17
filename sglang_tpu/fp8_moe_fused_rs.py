@@ -302,6 +302,10 @@ def _apply_fp8_fused_rs(
         topk=topk,
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
+        # Keep the fused-RS payload in BF16 for both the legacy all-gather and
+        # sequence-parallel local-shard paths. A direct FP8 write would add row
+        # quantization and scale DMAs before a BF16 consumer.
+        fp8_direct_write=False,
         # Expert TP runs with moe_ep_size == 1 and shards over the MoE TP ranks.
         world_size=layer.moe_tp_size if expert_tp else layer.moe_ep_size,
         keep_token_shard=keep_output_shard,
