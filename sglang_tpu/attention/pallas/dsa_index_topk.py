@@ -24,11 +24,14 @@ import jax.numpy as jnp
 from sglang_tpu.attention.pallas.dsa_key_store import store_keys_pallas
 from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils
 from sglang_tpu.attention.pallas.util import align_to, quantize_fp8_ue8m0
+from sglang_tpu.dsv4.sparsecore_topk import BITS_NEG_INF, sparsecore_topk
 from sglang_tpu.dsv4.streamindex_topk import (
     KVLayout,
+    cp_local_to_global,
     streamindex_topk,
 )
 from sglang_tpu.dsv4.streamindex_topk.streamindex_topk import (
+    _select_owned_winners,
     get_kv_cache_shape,
 )
 
@@ -71,7 +74,29 @@ def _store_keys(
     distribution: jax.Array,
 ) -> jax.Array:
     """Write this step's keys into the index-key cache and return the cache."""
-    num_tokens, index_head_dim = key.shape
+    records = _key_records(cache_k, key, key_scale_byte)
+    page_size = cache_k.shape[1] * cache_k.shape[2]
+    # A batch is padded to a fixed number of rows. A padded row still carries
+    # one query token, but it is not a real request, so its key must not be
+    # stored. distribution[2] is the number of real requests; clipping
+    # cu_q_lens there makes every token after them count as "not in the batch".
+    active_cu_q_lens = jnp.minimum(cu_q_lens, cu_q_lens[distribution[2]])
+    # Find each token's page and slot the same way the KV writer does, so a
+    # token's key and its KV entry always sit at the same position.
+    page, slot = kv_cache_utils.get_page_and_slot(
+        key.shape[0], kv_lens, page_indices, active_cu_q_lens, page_size
+    )
+    return _scatter_whole_rows(cache_k, records, page, slot)
+
+
+def _key_records(
+    cache_k: jax.Array,  # u8[num_pages, page_size // 4, 4, record_bytes]
+    key: jax.Array,  # fp8[max_num_tokens, index_head_dim]
+    key_scale_byte: jax.Array,  # u8[max_num_tokens, 1]
+) -> jax.Array:  # u8[max_num_tokens, record_bytes]
+    """One cache record per token: key bytes padded to whole lanes, the scale
+    byte, then zeros up to the record size."""
+    index_head_dim = key.shape[1]
     num_pages, rows_per_page, tokens_per_row, record_bytes = cache_k.shape
     page_size = rows_per_page * tokens_per_row
     # The pool allocates this buffer without importing the kernel, so check
@@ -89,19 +114,7 @@ def _store_keys(
     key_lanes = align_to(index_head_dim, kv_cache_utils.TILE_LANE_BYTES)
     key_bytes = jnp.pad(key_bytes, ((0, 0), (0, key_lanes - index_head_dim)))
     records = jnp.concatenate([key_bytes, key_scale_byte], axis=-1)
-    records = jnp.pad(records, ((0, 0), (0, record_bytes - records.shape[-1])))
-
-    # A batch is padded to a fixed number of rows. A padded row still carries
-    # one query token, but it is not a real request, so its key must not be
-    # stored. distribution[2] is the number of real requests; clipping
-    # cu_q_lens there makes every token after them count as "not in the batch".
-    active_cu_q_lens = jnp.minimum(cu_q_lens, cu_q_lens[distribution[2]])
-    # Find each token's page and slot the same way the KV writer does, so a
-    # token's key and its KV entry always sit at the same position.
-    page, slot = kv_cache_utils.get_page_and_slot(
-        num_tokens, kv_lens, page_indices, active_cu_q_lens, page_size
-    )
-    return _scatter_whole_rows(cache_k, records, page, slot)
+    return jnp.pad(records, ((0, 0), (0, record_bytes - records.shape[-1])))
 
 
 def _scatter_whole_rows(
@@ -257,3 +270,140 @@ def dsa_indexer_step(
         ),
     )
     return topk_indices, cache_k
+
+
+def store_index_keys_dcp(
+    key: jax.Array,  # float[max_num_tokens, index_head_dim]
+    cache_k: jax.Array,  # u8[num_pages, page_size // 4, 4, record_bytes]; this rank's shard
+    seq_lens: jax.Array,  # i32[max_num_seqs]; global, counts this step's tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]; widened pages
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    dcp_rank: jax.Array,  # i32[1]
+    *,
+    dcp_size: int,
+    interleave_size: int,
+) -> jax.Array:
+    """Store the keys of this step this rank owns in its index-key shard, at
+    the (page, slot) the MLA latent writer uses for them."""
+    k_fp8, _, k_scale_byte = quantize_fp8_ue8m0(key)
+    records = _key_records(cache_k, k_fp8, k_scale_byte)
+    active_cu_q_lens = jnp.minimum(cu_q_lens, cu_q_lens[distribution[2]])
+    page, slot = kv_cache_utils.get_dcp_page_and_slot(
+        key.shape[0],
+        seq_lens,
+        page_indices,
+        active_cu_q_lens,
+        dcp_rank.reshape(()),
+        page_size=cache_k.shape[1] * cache_k.shape[2],
+        num_pages=cache_k.shape[0],
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    return _scatter_whole_rows(cache_k, records, page, slot)
+
+
+def dsa_indexer_step_dcp(
+    query: jax.Array,  # float[max_num_tokens, index_n_heads, index_head_dim]
+    key: jax.Array,  # float[max_num_tokens, index_head_dim]
+    head_weights: jax.Array,  # float[max_num_tokens, index_n_heads]
+    cache_k: jax.Array,  # u8[num_pages, page_size // 4, 4, record_bytes]; this rank's shard
+    seq_lens: jax.Array,  # i32[max_num_seqs]; global, counts this step's tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]; widened pages
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    dcp_rank: jax.Array,  # i32[1]
+    *,
+    weight_scale: float,
+    topk: int,
+    dcp_size: int,
+    interleave_size: int,
+    segments: str = "all",
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``dsa_indexer_step`` over a DCP position-sharded index-key cache.
+
+    Each rank stores only the keys it owns (``get_dcp_page_and_slot``, the
+    rule the MLA latent writer uses) and scores only its shard, so its top-k
+    is the best ``topk`` of the keys it owns. Every key of the global top-k is
+    in the top-k of its owner, so ``merge_dcp_topk`` over all ranks'
+    candidates recovers the global top-k.
+
+    Returns ``(global_indices, scores, cache_k)``: ``i32[max_num_tokens,
+    topk]`` positions counted from the start of the token's sequence (-1
+    padded), their scores as ``i32`` f32 bits, and the updated shard.
+    """
+    rank = dcp_rank.reshape(())
+    q_fp8, q_scale, _ = quantize_fp8_ue8m0(query)
+    cache_k = store_index_keys_dcp(
+        key,
+        cache_k,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        dcp_rank,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+
+    weights = head_weights.astype(jnp.float32) * q_scale[..., 0] * weight_scale
+    local_indices, scores = streamindex_topk(
+        q_fp8,
+        weights,
+        cache_k,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        k=topk,
+        compression_ratio=1,
+        num_kv_pages_per_block=_NUM_KV_PAGES_PER_BLOCK,
+        num_queries_per_block=_NUM_QUERIES_PER_BLOCK,
+        segments=segments,
+        enable_early_exit=False,
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+        cp_size=dcp_size,
+        cp_rank=rank,
+        interleave_size=interleave_size,
+        return_scores=True,
+    )
+    # streamindex_topk returns the shard's rank-local positions under cp_size > 1.
+    global_indices = jnp.where(
+        local_indices >= 0,
+        cp_local_to_global(local_indices, rank, dcp_size, interleave_size),
+        -1,
+    )
+    return global_indices, scores, cache_k
+
+
+def merge_dcp_topk(
+    cand_indices: jax.Array,  # i32[dcp_size, max_num_tokens, topk]; global, -1 padded
+    cand_scores: jax.Array,  # i32[dcp_size, max_num_tokens, topk]; f32 bits
+    dcp_rank: jax.Array,  # i32[1]
+    *,
+    topk: int,
+    dcp_size: int,
+    interleave_size: int,
+) -> jax.Array:  # i32[max_num_tokens, topk]
+    """The global top-k of every rank's candidates, as this rank's rows.
+
+    Returns the winners this rank owns, left-packed as rank-local positions
+    (the coordinates its shard and the sparse kernel use), -1 after them.
+    Same algorithm as ``streamindex_topk_dcp``, with the candidates gathered
+    by the caller.
+    """
+    num_tokens = cand_indices.shape[1]
+    indices = jnp.moveaxis(cand_indices, 0, 1).reshape(num_tokens, dcp_size * topk)
+    scores = jnp.moveaxis(cand_scores, 0, 1).reshape(num_tokens, dcp_size * topk)
+    scores = jnp.where(indices >= 0, scores, jnp.int32(BITS_NEG_INF))
+    slots = sparsecore_topk(
+        scores,
+        topk,
+        row_lengths=jnp.full((num_tokens,), dcp_size * topk, dtype=jnp.int32),
+        write_empty_rows=True,
+    )
+    merged = jnp.take_along_axis(indices, jnp.maximum(slots, 0), axis=1)
+    merged = jnp.where(slots >= 0, merged, -1)
+    return _select_owned_winners(
+        merged, dcp_size, interleave_size, dcp_rank.reshape(())
+    )

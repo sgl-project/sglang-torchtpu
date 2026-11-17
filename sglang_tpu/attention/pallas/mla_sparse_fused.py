@@ -275,6 +275,99 @@ def sparse_mla_attention_fused(
     return out[..., :NOPE_DIM], cache_nope, cache_rope
 
 
+def store_sparse_mla_kv_dcp(
+    new_kv_c: jax.Array,  # fp8[max_num_tokens, 512]
+    new_k_pe: jax.Array,  # fp8[max_num_tokens, 64]
+    cache_nope: jax.Array,  # u8[num_pages, page_size, 4, 128]; this rank's shard
+    cache_rope: jax.Array,  # u8[num_pages, page_size // 4, 4, 128]
+    seq_lens: jax.Array,  # i32[max_num_seqs]; global, counts this step's tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]; widened pages
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    dcp_rank: jax.Array,  # i32[1]
+    *,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Store the tokens of this step this rank owns in its NoPE/RoPE shards."""
+    num_pages, page_size = cache_nope.shape[:2]
+    nope_spec, rope_spec = _split_specs(num_pages, page_size)
+    active_cu_q_lens = jnp.minimum(cu_q_lens, cu_q_lens[distribution[2]])
+    return kv_cache_utils.update_sparse_mla_kv_cache_dcp(
+        cache_nope,
+        cache_rope,
+        new_kv_c,
+        new_k_pe,
+        seq_lens,
+        page_indices,
+        active_cu_q_lens,
+        dcp_rank.reshape(()),
+        nope_spec=nope_spec,
+        rope_spec=rope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+
+
+def sparse_mla_attention_fused_dcp(
+    ql_nope: jax.Array,  # bf16[max_num_tokens, num_q_heads, 512]; the DCP group's heads
+    q_pe: jax.Array,  # bf16[max_num_tokens, num_q_heads, 64]
+    new_kv_c: jax.Array,  # fp8[max_num_tokens, 512]
+    new_k_pe: jax.Array,  # fp8[max_num_tokens, 64]
+    cache_nope: jax.Array,  # u8[num_pages, page_size, 4, 128]; this rank's shard
+    cache_rope: jax.Array,  # u8[num_pages, page_size // 4, 4, 128]
+    seq_lens: jax.Array,  # i32[max_num_seqs]; global, counts this step's tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]; widened pages
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    dcp_rank: jax.Array,  # i32[1]
+    topk_indices: jax.Array,  # i32[max_num_tokens, index_topk]; rank-local, from merge_dcp_topk
+    *,
+    sm_scale: float,
+    k_scale: float,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``sparse_mla_attention_fused`` over a DCP position-sharded cache.
+
+    Stores only the tokens this rank owns, then attends over the winners it
+    owns. Returns ``(output, lse, cache_nope, cache_rope)``: the partial
+    output ``[max_num_tokens, num_q_heads, 512]`` and its natural-log
+    ``lse`` ``f32[max_num_tokens, num_q_heads]``, which the caller merges
+    across the group. A row with no owned winner has a non-finite ``lse``.
+    """
+    cache_nope, cache_rope = store_sparse_mla_kv_dcp(
+        new_kv_c,
+        new_k_pe,
+        cache_nope,
+        cache_rope,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        dcp_rank,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    out, lse = sparse_ragged_paged_attention(
+        jnp.concatenate([ql_nope, q_pe], axis=-1),
+        cache_nope,
+        cache_rope,
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        cache_layout=TENSORCORE_CACHE_LAYOUT,
+        gather_and_attention_chunk_size=min(
+            DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE, max(64, ql_nope.shape[0])
+        ),
+        return_lse=True,
+    )
+    return out[..., :NOPE_DIM], lse, cache_nope, cache_rope
+
+
 def qblock_tokens_supported(
     num_tokens: int, pages_per_seq: int, page_size: int
 ) -> bool:
