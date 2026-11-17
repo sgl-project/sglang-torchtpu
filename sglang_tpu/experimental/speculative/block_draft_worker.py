@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import dataclasses
+import math
 from abc import abstractmethod
 from collections.abc import Callable
 from typing import NamedTuple
@@ -12,14 +15,19 @@ from torch import nn
 
 from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.lora.layers import unwrap_lora_layer
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.models.dflash import DFlashDraftModel
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang_tpu.dflash_draft_kv_write import dflash_write_draft_kv
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.compilation.block_compile_policy import (
     TpuBlockSpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.experimental.speculative.dflash.draft_kv_ring import DraftKvRing
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import sample_tokens
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -80,6 +88,70 @@ class TpuBlockDraftWorker(TpuDraftWorker):
 
     block_width: int
     mask_token_id: int
+    # Set by alloc_memory_pool when the draft KV lives in a per-request ring.
+    kv_ring: DraftKvRing | None = None
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config: MemoryPoolConfig | None = None,
+        req_to_token_pool: ReqToTokenPool | None = None,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator | None = None,
+    ) -> None:
+        if not tpu_envs.SGLANG_TPU_DFLASH_DRAFT_KV_RING.get():
+            super().alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+            return
+        assert memory_pool_config is not None and req_to_token_pool is not None
+        self.kv_ring = self._create_kv_ring()
+        num_req_rows, width = req_to_token_pool.req_to_token.shape
+        # The draft never allocates rows; it only reads its own page table.
+        draft_req_pool = copy.copy(req_to_token_pool)
+        draft_req_pool.req_to_token = self.kv_ring.req_to_token(
+            num_req_rows=num_req_rows, width=width
+        )
+        # The configurator widens a DCP draft pool by dcp_size; undo it here.
+        loc_scale = max(get_parallel().attn_dcp_size, 1)
+        ring_config = dataclasses.replace(
+            memory_pool_config,
+            max_total_num_tokens=math.ceil(
+                self.kv_ring.num_tokens(num_req_rows) / loc_scale
+            ),
+        )
+        super().alloc_memory_pool(
+            memory_pool_config=ring_config,
+            req_to_token_pool=draft_req_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        if isinstance(self.model_runner.token_to_kv_pool, SWAKVPool):
+            # Its page table goes through full_to_swa, which would map the
+            # constant ring pages to unrelated SWA slots.
+            raise NotImplementedError(
+                "SGLANG_TPU_DFLASH_DRAFT_KV_RING does not support a hybrid-SWA "
+                "draft KV pool."
+            )
+        assert self.model_runner.token_to_kv_pool.size >= self.kv_ring.num_tokens(
+            num_req_rows
+        ), (self.model_runner.token_to_kv_pool.size, self.kv_ring)
+
+    def _create_kv_ring(self) -> DraftKvRing:
+        hf_config = self.model_runner.model_config.hf_config
+        layer_types = hf_config.layer_types
+        window = hf_config.sliding_window
+        if not window or any(t != "sliding_attention" for t in layer_types):
+            raise ValueError(
+                "SGLANG_TPU_DFLASH_DRAFT_KV_RING needs every draft layer to use a "
+                f"sliding window; got layer_types={layer_types}, window={window}."
+            )
+        if get_disagg().disaggregation_mode in ("prefill", "decode"):
+            raise NotImplementedError("The draft KV ring does not ship P/D hidden.")
+        return DraftKvRing.create(
+            window=window,
+            verify_width=get_spec().speculative_num_draft_tokens,
+            page_size=get_schedule().page_size,
+        )
 
     @abstractmethod
     def sample_drafts(
