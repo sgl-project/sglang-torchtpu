@@ -149,6 +149,10 @@ class FakeHostPool:
     def _to_page_ids(self, indices):
         return [int(i) // self.page_size for i in indices[:: self.page_size]]
 
+    @property
+    def page_num(self):
+        return self.capacity // self.page_size
+
     def available_size(self) -> int:
         return self.capacity - self.used
 
@@ -354,6 +358,7 @@ def push_channel(host, swa_host=None):
     channel = MagicMock()
     # The transfer of each read, by request id.
     transfers = {}
+    channel.export_host_metadata.return_value = []
 
     def register(req_id, uuid, pages, *, swa=False):
         transfer = (swa_host if swa else host).transfer
@@ -753,7 +758,9 @@ def with_offload(mgr):
     mgr._send_multipart_locked = Mock()
     mgr.dram_offload_channel = DramOffloadChannel(mgr)
     mgr._message_handlers.update(mgr.dram_offload_channel.message_handlers())
-    mgr.dram_offload_channel.bind_host_pools(SimpleNamespace(transfer=transfer))
+    host = FakeHostPool(64)
+    host.transfer = transfer
+    mgr.dram_offload_channel.bind_host_pools(host)
     return mgr
 
 

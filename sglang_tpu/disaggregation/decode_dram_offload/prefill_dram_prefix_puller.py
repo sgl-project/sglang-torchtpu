@@ -13,6 +13,7 @@ staging slot on either role.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import msgspec
@@ -45,6 +46,8 @@ from sglang_tpu.disaggregation.raiden.dram_offload_channel import (
 # Arbitrary: the share of the prefill's host pool that landings of in-flight
 # recalls may hold, leaving the rest for the prefill's own backups.
 _MAX_INFLIGHT_POOL_FRACTION = 0.5
+
+logger = logging.getLogger(__name__)
 
 
 class _PullProposal(msgspec.Struct, frozen=True):
@@ -85,6 +88,7 @@ class DramPrefixPullPlan(msgspec.Struct):
     started: bool = False
     # Set once every rank saw the read settle: True only if it succeeded everywhere.
     agreed_done: Optional[bool] = None
+    ready: Optional[PrefixRegistration] = None
 
 
 class _RecalledPrefixPin(msgspec.Struct, frozen=True):
@@ -333,6 +337,26 @@ class PrefillDramPrefixPuller:
             self.stats["failed"] += 1
             self._discard_plan(plan)
             return False
+        restored = False
+        try:
+            self._channel.restore_host_metadata(
+                host_page_ids(self._host_pool, plan.new_indices),
+                plan.ready.page_metadata,
+            )
+            self._channel.restore_host_metadata(
+                host_page_ids(self._swa_host_pool, plan.swa_indices)
+                if plan.swa_indices is not None
+                else [],
+                plan.ready.swa_page_metadata,
+                swa=True,
+            )
+            restored = True
+        except Exception:  # noqa: BLE001 - decline on every rank before insertion
+            logger.exception("Cannot restore recalled host page metadata")
+        if not self._lockstep.all(restored):
+            self.stats["failed"] += 1
+            self._discard_plan(plan)
+            return False
         node, _ = insert_host_prefix(
             self._cache,
             prefix_radix_key(
@@ -466,6 +490,7 @@ class PrefillDramPrefixPuller:
             return False
         if ready.has_window != bool(plan.swa_remote):
             return False
+        plan.ready = ready
         # A read that started keeps its landing owned also when the other one
         # of the pull does not start.
         if not self._start_full_read(room, plan, ready):

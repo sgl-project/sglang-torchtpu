@@ -47,6 +47,15 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
+    def test_metadata_export_failure_declines_before_native_registration(self):
+        self.mgr.export_host_metadata.side_effect = RuntimeError("unsealed source")
+        self.pusher.advance(serving=True)
+        self.mgr.send_victim_push.assert_not_called()
+        self.assertFalse(self.host.transfer.registrations)
+        self.pusher.retire_settled_pushes()
+        self.assertFalse(self.pusher.has_pushes_in_flight())
+        self.assertEqual(self.pusher.stats["declined"], 1)
+
     def test_stored_victim_path_evicts_in_the_same_order_on_every_rank(self):
         """A stored victim's path must take unique access stamps, each older
         than every live node. Stamping the whole path with one value tied the
@@ -191,6 +200,16 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
 
 
 class TestDecodeReceiver(DecodeReceiverFixture, CustomTestCase):
+    def test_metadata_restore_failure_frees_settled_landing_without_inserting(self):
+        self.granted()
+        self.mgr.restore_host_metadata.side_effect = ValueError("wrong page count")
+        self.host.transfer.complete("received")
+        self.round()
+        self.assertFalse(self.answered())
+        self.assertEqual(self.host.used, 0)
+        self.assertEqual(host_hit(self.cache, self.c), 0)
+        self.assertEqual(self.receiver.stats["failed"], 1)
+
     def test_push_is_inserted_and_answered_once_its_read_has_landed(self):
         self.granted()
         self.round()

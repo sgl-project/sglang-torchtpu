@@ -131,6 +131,8 @@ class PrefixReady(WireMessage, omit_defaults=True):
     # full-only models and on a refusal.
     swa_uuid: int = 0
     swa_endpoint: str = ""
+    page_metadata: list[bytes] = msgspec.field(default_factory=list)
+    swa_page_metadata: list[bytes] = msgspec.field(default_factory=list)
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -163,6 +165,8 @@ class VictimPush(WireMessage, omit_defaults=True):
     swa_address: str = ""
     extra_key: Optional[str] = None
     cache_salt: Optional[str] = None
+    page_metadata: list[bytes] = msgspec.field(default_factory=list)
+    swa_page_metadata: list[bytes] = msgspec.field(default_factory=list)
 
 
 class VictimAck(WireMessage):
