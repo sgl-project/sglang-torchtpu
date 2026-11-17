@@ -228,7 +228,11 @@ class ReshardGeometry:
         slices = {}
         for prefill_rank in self._sources_of(decode_rank):
             sh, n, dh, src_hpr, _ = head_slice_params(
-                self.src_tp, self.dst_tp, prefill_rank, decode_rank, self.total_kv_heads
+                src_tp=self.src_tp,
+                dst_tp=self.dst_tp,
+                src_rank=prefill_rank,
+                dst_rank=decode_rank,
+                total_kv_heads=self.total_kv_heads,
             )
             slices[prefill_rank] = (sh, n, dh)
             packed = -(-n // heads_per_pack) * heads_per_pack

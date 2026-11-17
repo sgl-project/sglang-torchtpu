@@ -277,7 +277,7 @@ def _apply(entry, source_pages, dest_pages):
     dst[dst_idx.reshape(-1)] = src[src_idx.reshape(-1)]
 
 
-def _apply_merge(dest_pages, decode_t, layout, real_pages, staging_pages, merges):
+def _apply_merge(*, dest_pages, decode_t, layout, real_pages, staging_pages, merges):
     offsets = _byte_offsets(decode_t, layout)
     for real, stage in zip(real_pages, staging_pages):
         for stage_slot, decode_slot, num_slots in merges:
@@ -368,7 +368,12 @@ class TestTpuReshardFp8Packing(unittest.TestCase):
                     _apply(entry, source_pages, dest_pages)
             merges = receiver_geom.merge_spec(decode_rank)
             _apply_merge(
-                dest_pages, decode_t, layout, self.DST_BLOCKS, self.STAGING, merges
+                dest_pages=dest_pages,
+                decode_t=decode_t,
+                layout=layout,
+                real_pages=self.DST_BLOCKS,
+                staging_pages=self.STAGING,
+                merges=merges,
             )
             results[decode_rank] = (dest_pages, decode_t)
         return results
@@ -785,8 +790,8 @@ class TestTpuReshardMerge(unittest.TestCase):
         )
 
     def test_merge_synchronizes_tpu_after_default_page_writes(self):
-        """TPU merges must synchronize after writing all layers so callers can
-        free staging pages without racing unordered Raiden DMAs."""
+        """TPU merges must synchronize after writing all layers,
+        so freeing staging pages cannot race unordered Raiden DMAs."""
         import sglang_tpu.kv_page_write as kv_page_write
 
         tpu_device = SimpleNamespace(type="tpu")
@@ -929,7 +934,7 @@ class _FakeTreeCache:
 class TestTpuReshardStagingLifecycle(unittest.TestCase):
     """Staged rooms must allocate, merge, and free staging pages at most once."""
 
-    def _decode_manager(self, allocator, src_tp=8, dst_tp=4):
+    def _decode_manager(self, allocator, *, src_tp=8, dst_tp=4):
         decode_t = _fused_layer(FP8, max(1, TOTAL_KV_HEADS // dst_tp), num_pages=16)
         mgr = _manager(decode_t, dst_tp)
         mgr.kv_args.engine_rank = 0
@@ -980,15 +985,21 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
     def _infos(n):
         return [{"rank_ip": "10.0.0.1", "rank_port": 100 + i} for i in range(n)]
 
-    def _register(self, mgr, room, blocks):
-        mgr._register_reshard_request(room, blocks, [], None, self._infos(2))
+    def _register(self, *, mgr, room, blocks):
+        mgr._register_reshard_request(
+            room=room,
+            local_blocks=blocks,
+            local_swa_blocks=[],
+            aux_index=None,
+            bootstrap_infos=self._infos(2),
+        )
 
     def test_staged_room_allocates_sends_merges_and_frees_once(self):
         from sglang_tpu.disaggregation.raiden.serde import ReshardReq
 
         allocator = _FakeAllocator(range(10, 16))
         mgr, decode_t = self._decode_manager(allocator)
-        self._register(mgr, 42, [3, 4, 5])
+        self._register(mgr=mgr, room=42, blocks=[3, 4, 5])
         self.assertEqual(allocator.allocs, 1)
         staging = mgr._decode.reshard_staging[42]
         self.assertEqual(len(staging.pages), 3)
@@ -1020,10 +1031,10 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         allocator = _FakeAllocator(range(10, 16))
         mgr, _ = self._decode_manager(allocator)
         # Abort, timeout, and failure all end in clear_room before merge.
-        self._register(mgr, 1, [3, 4])
-        self._register(mgr, 2, [5, 6])
+        self._register(mgr=mgr, room=1, blocks=[3, 4])
+        self._register(mgr=mgr, room=2, blocks=[5, 6])
         self.assertEqual(len(allocator.free_pages), 2)
-        self._register(mgr, 3, [7, 8, 9])
+        self._register(mgr=mgr, room=3, blocks=[7, 8, 9])
         self.assertIn("3", mgr._failed)
         self.assertIn("free KV pages", mgr.failure_records[3])
         self.assertNotIn(3, mgr._decode.reshard_staging)
@@ -1035,14 +1046,14 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
     def test_unstaged_room_allocates_nothing(self):
         allocator = _FakeAllocator(range(10, 16))
         mgr, _ = self._decode_manager(allocator, src_tp=16, dst_tp=8)
-        self._register(mgr, 7, [3, 4])
+        self._register(mgr=mgr, room=7, blocks=[3, 4])
         self.assertEqual(allocator.allocs, 0)
         self.assertNotIn(7, mgr._decode.reshard_staging)
         mgr.merge_reshard_staging(7)  # no-op
         mgr.clear_room(7)
         self.assertEqual(allocator.frees, 0)
 
-    def _hybrid_swa_allocator(self, full_pages, swa_pages):
+    def _hybrid_swa_allocator(self, *, full_pages, swa_pages):
         from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
@@ -1070,13 +1081,19 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         staged resharding must stage, merge, and free both full and SWA pools."""
         from sglang_tpu.disaggregation.raiden.serde import ReshardReq
 
-        allocator = self._hybrid_swa_allocator(15, 15)
+        allocator = self._hybrid_swa_allocator(full_pages=15, swa_pages=15)
         full, swa = allocator.full_attn_allocator, allocator.swa_attn_allocator
         full_free, swa_free = full.available_size(), swa.available_size()
         mgr, decode_t = self._decode_manager(allocator)
         swa_t = _fused_layer(FP8, 2, num_pages=16)
         mgr._swa_kv_caches = [swa_t]
-        mgr._register_reshard_request(42, [3, 4, 5], [6, 7], None, self._infos(2))
+        mgr._register_reshard_request(
+            room=42,
+            local_blocks=[3, 4, 5],
+            local_swa_blocks=[6, 7],
+            aux_index=None,
+            bootstrap_infos=self._infos(2),
+        )
         staging = mgr._decode.reshard_staging[42]
         self.assertEqual((len(staging.pages), len(staging.swa_pages)), (3, 2))
         self.assertEqual(full.available_size(), full_free - 3 * PAGE_SIZE)
@@ -1101,7 +1118,7 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         self.assertEqual(swa.available_size(), swa_free)
 
     def test_paged_hybrid_swa_allocator_rolls_back_partial_allocation(self):
-        allocator = self._hybrid_swa_allocator(15, 1)
+        allocator = self._hybrid_swa_allocator(full_pages=15, swa_pages=1)
         full, swa = allocator.full_attn_allocator, allocator.swa_attn_allocator
         full_free, swa_free = full.available_size(), swa.available_size()
         mgr, _ = self._decode_manager(allocator)
@@ -1110,7 +1127,7 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
 
         mgr.kv_args.state_types = [StateType.SWA]
 
-        req = RaidenKVReceiver(mgr, "10.0.0.1", 9)
+        req = RaidenKVReceiver(mgr=mgr, bootstrap_addr="10.0.0.1", bootstrap_room=9)
         req.bootstrap_infos = self._infos(2)
         req._send_abort_notification = lambda: setattr(req, "abort_notified", True)
         req.abort_notified = False
@@ -1126,7 +1143,7 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         allocator = _FakeAllocator(range(10, 14))
         mgr, _ = self._decode_manager(allocator)
 
-        req = RaidenKVReceiver(mgr, "10.0.0.1", 42)
+        req = RaidenKVReceiver(mgr=mgr, bootstrap_addr="10.0.0.1", bootstrap_room=42)
         req.bootstrap_infos = self._infos(2)
 
         req._send_abort_notification = lambda: setattr(req, "abort_notified", True)
@@ -1135,7 +1152,7 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         self.assertEqual(allocator.allocs, 1)
         self.assertEqual(req.poll(), KVPoll.WaitingForInput)
 
-        req2 = RaidenKVReceiver(mgr, "10.0.0.1", 43)
+        req2 = RaidenKVReceiver(mgr=mgr, bootstrap_addr="10.0.0.1", bootstrap_room=43)
         req2.bootstrap_infos = self._infos(2)
         req2._send_abort_notification = lambda: setattr(req2, "abort_notified", True)
         req2.abort_notified = False
@@ -1147,7 +1164,7 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         self.assertEqual(allocator.frees, 0)
         mgr.clear_room(42)
         self.assertEqual(allocator.frees, 1)
-        req3 = RaidenKVReceiver(mgr, "10.0.0.1", 44)
+        req3 = RaidenKVReceiver(mgr=mgr, bootstrap_addr="10.0.0.1", bootstrap_room=44)
         req3.bootstrap_infos = self._infos(2)
         req3.send_metadata(np.array([7, 8, 9], dtype=np.int32), state_indices=[])
         self.assertEqual(req3.poll(), KVPoll.WaitingForInput)
@@ -1161,7 +1178,7 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
 
         mgr.kv_args.state_types = [StateType.SWA]
 
-        req = RaidenKVReceiver(mgr, "10.0.0.1", 42)
+        req = RaidenKVReceiver(mgr=mgr, bootstrap_addr="10.0.0.1", bootstrap_room=42)
         req.bootstrap_infos = self._infos(2)
         req._send_abort_notification = lambda: setattr(req, "abort_notified", True)
         req.abort_notified = False
@@ -1201,8 +1218,8 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         return req
 
     def test_staging_evicts_radix_cache_shortfall(self):
-        """Staged resharding must evict unlocked radix-cache pages to cover any
-        staging shortfall, without evicting when free pages already suffice."""
+        """Staged resharding must evict unlocked radix-cache pages on shortfall,
+        without evicting when free pages already suffice."""
         allocator = _FakeAllocator(range(10, 15))
         cached = [allocator.alloc(PAGE_SIZE) for _ in range(4)]
         tree_cache = _FakeTreeCache(full_alloc=allocator, full_cached=cached)

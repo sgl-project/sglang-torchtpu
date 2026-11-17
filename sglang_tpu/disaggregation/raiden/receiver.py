@@ -1283,7 +1283,9 @@ class RaidenReceiverMixin:
             )
             self._swa_engine.register_active_plan(room, req, is_sender=False)
         except Exception as e:
-            self._fail_reshard_plan_build(room, self._swa_req_id(room), e)
+            self._fail_reshard_plan_build(
+                room=room, req_id=self._swa_req_id(room), exc=e
+            )
             return False
         with self._state_lock:
             if room not in self._decode.reshard_meta or room in self._aborted:

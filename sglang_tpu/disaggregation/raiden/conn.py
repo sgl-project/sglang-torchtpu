@@ -660,7 +660,9 @@ class RaidenKVManager(
                 pools.append((False, self._kv_caches, swa_blocks, staging.swa_pages))
             src_attn_tp = meta["src_attn_tp"]
         for swa, bufs, real_pages, staging_pages in pools:
-            geometry = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=swa)
+            geometry = self._make_geometry(
+                src_attn_tp=src_attn_tp, dst_attn_tp=self.attn_tp_size, swa=swa
+            )
             # The receive plans were built for decode_rank=self.attn_tp_rank.
             merges = geometry.merge_spec(self.attn_tp_rank)
             merge_staged_pages(
