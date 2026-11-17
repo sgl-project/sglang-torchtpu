@@ -109,9 +109,24 @@ than the previous run; target loading did not improve. These are successive
 iteration results, not a controlled A/B. No quantization math or expert mapping
 was changed. The direct-compile and SPMD settings are unchanged.
 
-Result extraction is tracked by `an-dtjygnuy2w`; its final serving metrics are
-not yet available at the time of this update. The experiment runner only exits
-successfully after the serving client and both host results pass.
+Analysis `an-dtjygnuy2w` succeeded. Both host results and all six measured
+serving rounds passed (240 requests); all 22 actual-process runtime records
+match the pinned source/dependencies and show host staging enabled.
+
+- C16 median TTFT: 6,185.14 ms.
+- C64 median client TPOT: 16.862 ms/token.
+- C64 median steady throughput: 4,007.84 token/s, 500.98 token/s/chip
+  (rounds: 4,070.11 / 4,007.84 / 3,952.72 token/s).
+
+Steady throughput was about 1.9% below the preceding run; this single iteration
+does not establish a serving-performance improvement or regression. The
+physical rank-0 log records no new direct model specialization after ready,
+while small eager XLA compilation/cache loads remain.
+
+```sh
+falcon workflow analysis cat an-dtjygnuy2w summary.json --output json
+falcon workflow analysis cat an-dtjygnuy2w rank-1-startup.txt --output json
+```
 
 Remaining work is draft asynchronous compilation (including deferred KV/DSA
 output ownership) and GLM target SPMD graph/layout verification. The current
