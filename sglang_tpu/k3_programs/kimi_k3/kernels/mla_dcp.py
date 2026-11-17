@@ -2286,10 +2286,14 @@ class DcpAttention:
         queries_sent=False,
         queries_staged=False,
         while_combining: Callable[[], None] | None = None,
+        before_merge: Callable[[], None] | None = None,
     ):
         """``queries`` [B, heads, 640] FP32 absorbed (scale folded in),
         ``new_latents`` [B, 640] FP32, ``parity`` alternating per invocation
-        (MLA layer). ``between`` runs while the query gather is in flight.
+        (MLA layer). ``between`` runs while the query gather is in flight,
+        ``before_merge`` once this rank's partials have left, before the
+        combine is awaited (e.g. writing ``keys``; calls that merge only
+        after their last chunk).
         Returns the merged latent-space output [B, heads, 512] FP32.
 
         ``keys`` / ``key_valid`` (``sequence_rows > 1`` only) replace the
@@ -2311,7 +2315,12 @@ class DcpAttention:
             raise ValueError("explicit new keys need multi-row sequences")
         if chunked(self.batch, self.force_chunked):
             return self._attend_chunked(
-                queries, new_latents, between, keys=keys, key_valid=key_valid
+                queries,
+                new_latents,
+                between,
+                keys=keys,
+                key_valid=key_valid,
+                before_merge=before_merge,
             )
         ws, group, member, base, batch = (
             self.ws,
@@ -2388,6 +2397,8 @@ class DcpAttention:
             local_scope.__exit__(None, None, None)
         if while_combining is not None:  # PROTOTYPE: independent work under the combine
             while_combining()
+        if before_merge is not None:
+            before_merge()
         with self._scope("combine_wait"):
             for g in range(len(groups)):
                 if pair:
@@ -2767,7 +2778,9 @@ def _unpack_fp8_lanes(packet, first_lane=0):
     return jax.lax.bitcast_convert_type(payload, jnp.float8_e4m3fn), scale
 
 
-def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid=None):
+def _attend_chunked(
+    self, queries, new_latents, between, *, keys=None, key_valid=None, before_merge=None
+):
     """``attend`` for a batch of ``C`` chunks (``chunk_layout``), pipelined:
     queries run two chunks ahead with four ring slots, else one; earlier
     chunks' combines overlap the current chunk's page attention. Packets
@@ -2798,6 +2811,8 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
     # The two-stage combine sends a chunk's merged partials a chunk later:
     # queries one chunk ahead leave its final merge three chunks behind.
     lookahead = 2 if ring_slots == 4 and not hier else 1
+    if before_merge is not None and count - 1 + lookahead >= ring_slots:
+        raise ValueError("before_merge: a chunk merges inside the chunk loop")
     self._lane_major = hier
     if hier:
         if (
@@ -3169,6 +3184,8 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
         if pairs:
             pl.when(c == count - 1)(lambda: pair_stage(c))
 
+    if before_merge is not None:
+        before_merge()
     if hier:
         with self._scope("host_wait"):
             wait_received(count - 1, pairs)
