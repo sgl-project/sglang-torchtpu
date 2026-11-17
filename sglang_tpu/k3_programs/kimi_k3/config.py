@@ -70,6 +70,15 @@ class KernelConfig:
     # too and adds the four hosts in the same order, so the host copies of a
     # row stay bitwise equal. Changes numerics: one more BF16 rounding.
     attention_host_bf16: bool = False
+    # Token-scattered decode MoE with the routed and shared reduce-scatters
+    # (B6-B28 rows, pooled weights): before the experts only the shared
+    # expert's gate/up projection runs; its down projection and the start of
+    # the shared reduce-scatter run after the routed send, in the routed
+    # reduction's waits (the shared shards leave from spare rows of the
+    # shared receive buffer), and the first two expert slots' gate/up copies
+    # are issued before their down copies. The same products, sums and
+    # rounding points (bit-identical).
+    decode_late_shared_down: bool = False
     # Serving batches beyond the powers of two, by request count: plain
     # decode and three-draft verifies (e.g. "48" / "12"; multiples of 16 rows
     # take the staged MoE paths).

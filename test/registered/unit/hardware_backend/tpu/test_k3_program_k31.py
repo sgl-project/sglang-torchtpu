@@ -2456,3 +2456,118 @@ print("OK")
         self.assertIn(
             "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
         )
+
+
+class TestFirstPairGateUpCopies(CustomTestCase):
+    """The initial routed-expert copies with ``gate_up_first_pair``
+    (``KernelConfig.decode_late_shared_down``) in Pallas interpret mode: on
+    random grouped and per-slot routings at B8 and B16 (with prefetched slots
+    and rows without routes), every slot copies the same expert's same weight
+    families as the slot-by-slot order, and the copies run in the order
+    first two slots' gate/up and scales, their down and scales, then the
+    remaining slots."""
+
+    SCRIPT = """
+        import os
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        from types import SimpleNamespace
+        import numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk
+
+        FAMILIES = ("gate_up", "gate_up_scales", "down", "down_scales")
+
+        class Copy:
+            def __init__(self, experts, order, counter, slot, family, expert):
+                self.refs = experts, order, counter
+                self.at = slot, family
+                self.expert = expert
+
+            def start(self):
+                experts, order, counter = self.refs
+                slot, family = self.at
+                experts[slot, family] = self.expert + 1
+                order[slot, family] = counter[0]
+                counter[0] = counter[0] + 1
+
+        def run(experts_in, counts_in, grouped, started, first_pair):
+            def kernel(experts_ref, counts_ref, experts_out, order_out, counter):
+                experts_out[...] = jnp.zeros(experts_out.shape, jnp.int32)
+                order_out[...] = jnp.full(order_out.shape, -1, jnp.int32)
+                counter[0] = 0
+
+                def copy_expert(expert, slot, *, gate_up=True, down=True):
+                    wanted = (gate_up, gate_up, down, down)
+                    return SimpleNamespace(**{
+                        name: Copy(experts_out, order_out, counter, slot, family, expert)
+                        if wanted[family] else None
+                        for family, name in enumerate(FAMILIES)})
+
+                dmk._start_initial_expert_weight_copies(
+                    experts_ref[...], counts_ref[...][:, 0], copy_expert, slot_count=4,
+                    already_started=started, group_pending_routes=grouped,
+                    gate_up_first_pair=first_pair)
+
+            smem = pltpu.SMEM
+            return [np.asarray(x) for x in pl.pallas_call(
+                kernel,
+                out_shape=(jax.ShapeDtypeStruct((4, 4), jnp.int32),
+                           jax.ShapeDtypeStruct((4, 4), jnp.int32)),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+                out_specs=[pl.BlockSpec(memory_space=smem)] * 2,
+                scratch_shapes=[smem((1,), jnp.int32)],
+                interpret=pltpu.InterpretParams(),
+            )(experts_in, counts_in)]
+
+        rng = np.random.default_rng(0)
+        cases = 0
+        for B in (8, 16):
+            for trial in range(6):
+                pool = rng.choice(112, size=rng.integers(2, 12), replace=False)
+                experts = rng.choice(pool, size=(B, 16)).astype(np.int32)
+                counts = rng.integers(0, 4, size=B).astype(np.int32)
+                counts[rng.integers(B)] = 0
+                counts = np.broadcast_to(counts[:, None], (B, 128)).copy()
+                for grouped in (True, False):
+                    for started in (0, 1):
+                        plain = run(experts, counts, grouped, started, False)
+                        paired = run(experts, counts, grouped, started, True)
+                        assert np.array_equal(plain[0], paired[0]), (B, trial, grouped)
+                        live = paired[1] >= 0
+                        assert np.array_equal(live, plain[1] >= 0)
+                        # Each slot copies all four families or none.
+                        assert all(row.all() or not row.any() for row in live)
+                        slots = [s for s in range(4) if live[s].all()]
+                        want = [(s, f) for s in slots[:2] if s < 2 for f in (0, 1)]
+                        want += [(s, f) for s in slots[:2] if s < 2 for f in (2, 3)]
+                        want += [(s, f) for s in slots if s >= 2 for f in range(4)]
+                        got = sorted(want, key=lambda sf: paired[1][sf])
+                        assert got == want, (got, want)
+                        assert sorted(paired[1][live]) == list(range(len(want)))
+                        cases += 1
+        print("cases", cases)
+        print("OK")
+    """
+
+    def test_same_copies_first_pair_gate_up_first(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
