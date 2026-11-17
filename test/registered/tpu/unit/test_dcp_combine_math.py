@@ -3,7 +3,8 @@
 Four pieces, each checked against a reference built from a plain dense softmax:
 
 * ``merge_across_ranks`` merges one partial (output, LSE) pair per rank into
-  the full-sequence result and hands each rank back its own head block.
+  the full-sequence result; ``own_heads`` then hands each rank back its own
+  head block when the ranks hold different heads.
 * ``sink_fold`` applies the attention sink once, after the merge, as
   ``out * sigmoid(lse - sink)``.
 * ``merge_lse`` joins the cached-prefix pass with the chunk-local pass of an
@@ -37,6 +38,7 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
     gather_heads,
     merge_across_ranks,
     merge_lse,
+    own_heads,
     sink_fold,
 )
 
@@ -102,18 +104,25 @@ def _rank_tensors(world_size, rank):
 
 
 def _run_cp_merge(partial_outs, partial_lses):
-    """Run ``merge_across_ranks`` on every rank; return each rank's result."""
+    """Run ``merge_across_ranks`` on every rank and keep the rank's own head
+    block (ranks holding different heads); return each rank's result."""
     world = len(partial_lses)
-    return _simulate_group(
-        world,
-        lambda group: merge_across_ranks(
+
+    def run(group):
+        rank_mask, rank_index = _rank_tensors(world, group.rank_in_group)
+        out, lse = merge_across_ranks(
             partial_outs[group.rank_in_group].clone(),
             partial_lses[group.rank_in_group].clone(),
             group,
             group.world_size,
-            *_rank_tensors(world, group.rank_in_group),
-        ),
-    )
+            rank_mask,
+        )
+        return (
+            own_heads(out, world, rank_index),
+            own_heads(lse, world, rank_index),
+        )
+
+    return _simulate_group(world, run)
 
 
 def _softmax_over(scores, values, keys):
@@ -216,7 +225,7 @@ class TestCpLseAgOutRsMha(CustomTestCase):
         lse = torch.randn(2, 3)
         group = _FakeDcpGroup(1, 0, None, [])
         merged, merged_lse = merge_across_ranks(
-            out, lse, group, group.world_size, *_rank_tensors(1, 0)
+            out, lse, group, group.world_size, _rank_tensors(1, 0)[0]
         )
         self.assertIs(merged, out)
         self.assertIs(merged_lse, lse)
@@ -408,8 +417,7 @@ class TestAllHeadsLocal(CustomTestCase):
                             partials[group.rank_in_group][1].clone(),
                             group,
                             group.world_size,
-                            *_rank_tensors(cp, group.rank_in_group),
-                            replicated_o_proj=True,
+                            _rank_tensors(cp, group.rank_in_group)[0],
                         ),
                     )
                     for out, lse in results:
@@ -419,8 +427,8 @@ class TestAllHeadsLocal(CustomTestCase):
                         torch.testing.assert_close(out, ref_out, atol=1e-5, rtol=1e-5)
                         torch.testing.assert_close(lse, ref_lse, atol=1e-5, rtol=1e-5)
 
-    def test_default_merge_is_unchanged(self):
-        """Without the flag the merge still crops to the rank's head block."""
+    def test_own_heads_crops_the_merge_to_the_rank_block(self):
+        """Ranks holding different heads keep their own block of the merge."""
         cp = 2
         scores, values, partials = self._partials(cp, 3, 9, seed=3)
         ref_out, _ = _softmax_over(scores, values, torch.ones_like(scores).bool())
@@ -434,11 +442,12 @@ class TestAllHeadsLocal(CustomTestCase):
                 rtol=1e-5,
             )
 
-    def _backend(self, cp, rank, group, dcp_op, replicates_qo=True):
+    def _backend(self, cp, rank, group, dcp_op):
         backend = object.__new__(TpuPallasRpaBatchedAttnBackend)
         backend._dcp = cp
         backend._dcp_group = group
-        backend._dcp_replicates_qo = replicates_qo
+        # Every rank holds the same heads (attention TP 1 or ring mode).
+        backend._dcp_head_blocks = 1
         backend._dcp_op = dcp_op
         backend._cp_rank_mask, backend._cp_rank_index = _rank_tensors(cp, rank)
         tensor = torch.zeros(1, dtype=torch.int32)

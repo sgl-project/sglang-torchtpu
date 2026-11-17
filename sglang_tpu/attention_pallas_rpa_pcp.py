@@ -107,26 +107,25 @@ class PcpRingMetadata:
 
 
 def dcp_stripe_group(parallel, *, pcp_ring: bool):
-    """``(stripe rank, stripe group, replicates_qo)`` of the page-striped KV cache.
+    """``(stripe rank, stripe group, head blocks)`` of the page-striped KV cache.
 
     Plain DCP stripes over SGLang's DCP group (consecutive ranks inside the
     TP group). Ring-mode prefill CP stripes over the attention-CP group
     instead: with attention TP ``t`` that is ranks ``r, r + t, ...``, which
     share one attention-TP head shard and differ only in tokens, so the
     attention-CP rank owns the stripe and decode merges over that group.
-    ``replicates_qo``: q and o_proj heads are replicated across the group
-    (attention TP 1, or ring mode at any attention TP; every rank computes the
-    same q heads and needs them all for its o_proj), so the striped kernels run
-    on this rank's own heads, q is not gathered and the merge does not crop.
-    TODO: replace with ``--dcp-replicate-q-proj`` plus a new
-    ``--dcp-replicate-o-proj`` once both handle a DCP group that spans the
-    attention-CP axis.
+
+    ``head blocks`` is the number of distinct query-head blocks the group's
+    ranks hold: 1 when every rank holds the same heads (attention TP 1, or ring
+    mode at any attention TP), the group size when each rank holds its own
+    attention-TP shard (plain DCP at attention TP > 1).
     """
     if parallel.attn_dcp_size <= 1:
-        return 0, None, False
+        return 0, None, 1
     if pcp_ring:
-        return parallel.attn_cp_rank, parallel.attn_cp_group, True
-    return parallel.attn_dcp_rank, parallel.dcp_group, parallel.attn_tp_size == 1
+        return parallel.attn_cp_rank, parallel.attn_cp_group, 1
+    head_blocks = 1 if parallel.attn_tp_size == 1 else parallel.attn_dcp_size
+    return parallel.attn_dcp_rank, parallel.dcp_group, head_blocks
 
 
 def init_pcp_ring_op(backend, device: str):

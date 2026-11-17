@@ -647,7 +647,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         parallel = get_parallel()
         pcp_ring = current_platform.pcp_ring_enabled()
         self._dcp = parallel.attn_dcp_size
-        self._dcp_rank, self._dcp_group, self._dcp_replicates_qo = dcp_stripe_group(
+        # Distinct query-head blocks across the stripe group (1 or its size).
+        self._dcp_rank, self._dcp_group, self._dcp_head_blocks = dcp_stripe_group(
             parallel, pcp_ring=pcp_ring
         )
         self._page_stride = self.page_size * self._dcp
@@ -1917,15 +1918,21 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         cp = self._dcp
         group = self._dcp_group
 
-        replicates_qo = self._dcp_replicates_qo
-        if q.shape[1] == cp * layer_q_heads or replicates_qo:
-            # --dcp-replicate-q-proj: the layer projected the group's heads.
-            # replicates_qo (attention TP 1, ring-mode prefill CP): q and o_proj
-            # heads are replicated across the group, so the kernel runs on this
-            # rank's own queries and the merge below keeps all heads.
+        # The kernels run on every query head the group holds; each rank then
+        # keeps its own ``layer_q_heads`` of the result.
+        group_q_heads = layer_q_heads * self._dcp_head_blocks
+        if q.shape[1] == group_q_heads:
+            # Every rank holds the same heads, or the layer already projected
+            # the whole group's (--dcp-replicate-q-proj).
             q_all = q.contiguous()
         else:
             q_all = gather_heads(q.contiguous(), group, cp, self._cp_rank_mask)
+
+        def keep_own_heads(x: torch.Tensor) -> torch.Tensor:
+            if x.shape[1] == layer_q_heads:
+                return x
+            return own_heads(x, cp, self._cp_rank_index)
+
         if forward_batch.forward_mode.is_decode():
             # ``md.kv_lens`` is this rank's page-striped share of seq_len (the
             # new token included iff this rank owns its page); the page table
@@ -1956,14 +1963,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 1,  # rpa_cases: DECODE only
             )
             out, lse = merge_across_ranks(
-                out_p.float(),
-                lse_p,
-                group,
-                cp,
-                self._cp_rank_mask,
-                self._cp_rank_index,
-                replicated_o_proj=replicates_qo,
+                out_p.float(), lse_p, group, cp, self._cp_rank_mask
             )
+            out, lse = keep_own_heads(out), keep_own_heads(lse)
             if sinks is not None:
                 out = sink_fold(out, lse, sinks)
             return out.to(q.dtype)
@@ -2026,20 +2028,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             0 if is_mixed else 2,  # rpa_cases: DECODE + MIXED / MIXED only
         )
         out_prefix, lse_prefix = merge_across_ranks(
-            out_prefix.float(),
-            lse_prefix,
-            group,
-            cp,
-            self._cp_rank_mask,
-            self._cp_rank_index,
-            replicated_o_proj=replicates_qo,
+            out_prefix.float(), lse_prefix, group, cp, self._cp_rank_mask
         )
-
-        if replicates_qo:
-            out_chunk = out_chunk.float()
-        else:
-            out_chunk = own_heads(out_chunk, cp, self._cp_rank_index).float()
-            lse_chunk = own_heads(lse_chunk, cp, self._cp_rank_index)
+        out_prefix, lse_prefix = keep_own_heads(out_prefix), keep_own_heads(lse_prefix)
+        out_chunk = keep_own_heads(out_chunk).float()
+        lse_chunk = keep_own_heads(lse_chunk)
         # A single-token row attended its token in the prefix pass; the chunk
         # pass leaves such rows (and a mixed batch's decode rows, outside its
         # range) unprocessed, with LSE -inf, so the merge weighs them zero.
