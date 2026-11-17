@@ -217,8 +217,15 @@ def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value)
 
 def tpu_dsv41_hasher_forward(original, hasher, input_ids, forward_batch):
     """AROUND EngramHasher.forward: in the TPU graph, the host-staged row ids."""
-    if forward_batch.tpu_engram_local_ids is not None:
-        return forward_batch.tpu_engram_local_ids
+    if input_ids.device.type == "cpu":
+        # The V4 compile policy hashing on the host (engram_host.host_hash_ids):
+        # the metadata may still carry the previous forward's staged ids.
+        return original(hasher, input_ids, forward_batch)
+    from sglang_tpu.models.deepseek_v41.engram_host import staged_inputs
+
+    local_ids, _ = staged_inputs(forward_batch)
+    if local_ids is not None:
+        return local_ids
     return original(hasher, input_ids, forward_batch)
 
 
@@ -249,15 +256,19 @@ def tpu_dsv41_engram_embed_forward(
     """AROUND EngramEmbedding.forward: dequantize the host-staged rows."""
     if indices.is_cuda or embedding.host_table is None:
         return original(embedding, indices, forward_batch, **kwargs)
-    from sglang_tpu.models.deepseek_v41.engram_host import staged_lookup
+    from sglang_tpu.models.deepseek_v41.engram_host import (
+        staged_inputs,
+        staged_lookup,
+    )
 
     # The core host-table lookup reads a raw host pointer from the device.
-    if forward_batch is None or forward_batch.tpu_engram_staged is None:
+    _, staged = staged_inputs(forward_batch)
+    if staged is None:
         raise RuntimeError(
-            "DeepSeek-V4.1 Engram on TPU reads rows staged by the compiled-forward "
-            "shim; this forward did not stage them"
+            "DeepSeek-V4.1 Engram on TPU reads rows staged by the V4 compile "
+            "policy; this forward did not stage them"
         )
-    return staged_lookup(embedding, indices, forward_batch)
+    return staged_lookup(embedding, indices, staged)
 
 
 def hook_specs():
