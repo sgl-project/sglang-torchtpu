@@ -136,6 +136,14 @@ def _prefill_sp_min_tokens() -> Optional[int]:
     return tpu_envs.SGLANG_TPU_MUSE_PREFILL_SP_MIN_TOKENS.get()
 
 
+def _muse_moe_mode_is_ep() -> bool:
+    """SGLANG_TPU_MUSE_MOE_MODE (tp | ep | auto; auto: ep when the server's EP size > 1)."""
+    mode = tpu_envs.SGLANG_TPU_MUSE_MOE_MODE.get()
+    if mode not in ("tp", "ep", "auto"):
+        raise ValueError(f"SGLANG_TPU_MUSE_MOE_MODE={mode!r}: tp, ep or auto")
+    return mode == "ep" or (mode == "auto" and get_parallel().moe_ep_size > 1)
+
+
 def _gather_tokens(shard: torch.Tensor) -> torch.Tensor:
     """This rank's [T / tp, ...] token block -> [T, ...] on every rank."""
     return get_parallel().tp_group.all_gather(shard.contiguous(), dim=0)
@@ -1093,6 +1101,8 @@ class MuseSparkForConditionalGeneration(nn.Module):
             tpu_envs.SGLANG_TPU_MUSE_MEGAKERNEL.get() and self.pp_group.world_size == 1
         )
         self._megakernel = None
+        # SGLANG_TPU_MUSE_MOE_MODE=ep: the megakernel is muse_megakernel_v2's EP stack.
+        self._megakernel_ep = False
 
     @property
     def start_layer(self) -> int:
@@ -1108,6 +1118,19 @@ class MuseSparkForConditionalGeneration(nn.Module):
         if not self._megakernel_enabled:
             return
         from sglang_tpu.fp8_lm_head import TpuFp8LmHeadMethod
+
+        if _muse_moe_mode_is_ep():
+            from sglang_tpu.muse_megakernel_v2.ops import MuseMegakernel as EpMegakernel
+
+            if tpu_envs.SGLANG_TPU_MUSE_SHARED_DENSE.get():
+                raise NotImplementedError(
+                    "SGLANG_TPU_MUSE_SHARED_DENSE: not supported by the Muse EP megakernel"
+                )
+            self._megakernel = EpMegakernel.from_model(self)
+            self._megakernel_ep = True
+            self.lm_head.quant_method = TpuFp8LmHeadMethod(self.lm_head)
+            torch.accelerator.synchronize()
+            return
         from sglang_tpu.muse_megakernel.ops import MuseMegakernel
 
         self._megakernel = MuseMegakernel.from_model(self)
@@ -1157,6 +1180,13 @@ class MuseSparkForConditionalGeneration(nn.Module):
             )
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        if megakernel is not None and self._megakernel_ep:
+            # the experts hold the EP megakernel layout, which no native MoE reads
+            raise RuntimeError(
+                f"Muse EP serving: a {forward_batch.forward_mode.name} step of "
+                f"{input_ids.shape[0]} tokens fell outside the EP programs (decode/verify up "
+                "to SGLANG_TPU_MUSE_MK_MAX_ROWS rows, extend through prefill/spep)"
             )
         hidden_states = self.model(
             input_ids,

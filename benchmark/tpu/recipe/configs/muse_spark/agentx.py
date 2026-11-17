@@ -18,10 +18,17 @@ slots. Acceptance is pinned to the AgentX golden acceptance length.
 Print any profile, swept or not, as a launcher JSON config:
 
     python3 -m benchmark.tpu.recipe.configs.muse_spark.agentx --conc 22
+
+MOE_MODE=ep: the same profile on the EP megakernel (sglang_tpu/muse_megakernel_v2, PR #2231):
+EP8 experts, extend on prefill/spep, decode and verify on decode/spep, 8-token verify.
+EP_ARM picks gather / a2a / mixed (default mixed).
+
+    MOE_MODE=ep python3 -m benchmark.tpu.recipe.configs.muse_spark.agentx --conc 22 --mk-prefill
 """
 
 import argparse
 import json
+import os
 from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.muse_spark.agentx_base import CONFIG as AGENTIC_CONFIG
@@ -111,6 +118,37 @@ MK_PREFILL_ENV = {
 }
 
 
+# MOE_MODE=ep: the env PR #2231's _check_ep_serving requires; KPERM and the e4m3 prefill
+# gathers are TP-layout knobs the EP programs refuse.
+EP_ENV = {
+    "SGLANG_TPU_MUSE_MOE_MODE": "ep",
+    "SGLANG_TPU_MUSE_MK_QBLOCK": "256",
+    "SGLANG_TPU_MUSE_MK_EXPERT_GROUP": "0",
+    "SGLANG_TPU_MUSE_MK_PREFILL": "1",
+    "SGLANG_TPU_MUSE_MK_PREFILL_SP": "1",
+    "SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT": "1",
+}
+EP_DROPPED_ENV = ("SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER", "SGLANG_TPU_MUSE_MK_KPERM")
+EP_VERIFY = 8
+
+
+def apply_ep(config, *, running, adaptive, simulate_acceptance, ep_arm):
+    """The profile on the EP megakernel: only the EP layout, an 8-token verify and its rows."""
+    if adaptive:
+        raise ValueError("MOE_MODE=ep: no adaptive verify width")
+    args, env = config["server_args"], config["runtime_env"]
+    args["ep_size"] = 8
+    args["speculative_num_draft_tokens"] = EP_VERIFY
+    for name in EP_DROPPED_ENV:
+        env.pop(name, None)
+    env.update(EP_ENV)
+    env["SGLANG_TPU_MUSE_MK_EP_ARM"] = ep_arm
+    env["SGLANG_TPU_MUSE_MK_MAX_ROWS"] = str(-(-running * EP_VERIFY // 16) * 16)
+    if simulate_acceptance:
+        env["SGLANG_SIMULATE_ACC_LEN"] = GOLDEN_AL[EP_VERIFY - 1]
+    return config
+
+
 def compile_bs(running, verify, adaptive):
     """Batch buckets: 1, the request cap, and every count whose verify step fills
     the megakernel's 8-row tiles exactly (above 8 requests only multiples of 4);
@@ -145,6 +183,8 @@ def config_for(
     mk_prefill=False,
     mk_decode=False,
     mk_qblock=0,
+    moe_mode="tp",
+    ep_arm="mixed",
 ):
     """The server config for one AgentX concurrency.
 
@@ -347,6 +387,16 @@ def config_for(
         # Block-256 requantized fp4 experts (main #2131) and the key-column mask.
         env["SGLANG_TPU_MUSE_MK_QBLOCK"] = str(mk_qblock)
         env["SGLANG_TPU_MUSE_MK_ATTN_COL_MASK"] = "1"
+    if moe_mode == "ep":
+        apply_ep(
+            config,
+            running=running,
+            adaptive=adaptive,
+            simulate_acceptance=simulate_acceptance,
+            ep_arm=ep_arm,
+        )
+    elif moe_mode != "tp":
+        raise ValueError(f"MOE_MODE={moe_mode!r}: tp or ep")
     return config
 
 
@@ -383,6 +433,8 @@ def main(argv=None):
         mk_prefill=args.mk_prefill,
         mk_decode=args.mk_decode,
         mk_qblock=args.mk_qblock,
+        moe_mode=os.environ.get("MOE_MODE", "tp"),
+        ep_arm=os.environ.get("EP_ARM", "mixed"),
     )
     print(json.dumps(config, indent=2))
 

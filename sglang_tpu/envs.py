@@ -759,6 +759,32 @@ class TpuEnvs:
     # (e.g. bq=1024, bkv=1536 on Muse Spark global layers and 512:512 on window=2048).
     SGLANG_TPU_FORCE_RPA_PREFILL_BQ = EnvInt(None)
     SGLANG_TPU_FORCE_RPA_PREFILL_BQ_C = EnvInt(None)
+    # Muse EP serving stack (sglang_tpu/muse_megakernel_v2/, ported from PR #2231); the TP
+    # megakernel (sglang_tpu/muse_megakernel/) reads none of these.
+    # Muse expert layout: tp | ep | auto (auto: ep when the server's EP size > 1).
+    SGLANG_TPU_MUSE_MOE_MODE = EnvStr("auto")
+    # fp4 experts requantized at load to one bf16 scale per this many K rows (0 off, 256).
+    SGLANG_TPU_MUSE_MK_QBLOCK = EnvInt(0)
+    # Prefill program in the sequence-parallel layout (prefill/spep).
+    SGLANG_TPU_MUSE_MK_PREFILL_SP = EnvBool(False)
+    # prefill/spep reads decode EP's weight layout (one shared copy).
+    SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT = EnvBool(False)
+    # Kernel-sweep knobs; unset = the tuned default (dev_int).
+    SGLANG_TPU_MUSE_MK_DEV_ROW_TILE = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_PAIR_Y = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_EXPERT_CHUNK = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILE_LOOPS_BUDGET_MIB = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH = EnvInt(None)
+    # EP decode paradigm: gather | a2a | mixed (gather up to 128 rows, a2a above).
+    SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("gather")
+    # a2a arm: up to this many rows pool / unpool read a 1/tp column slice. 0: off.
+    SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS = EnvInt(16)
+    # EP megakernel without Pallas bounds checks.
+    SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
+    # Rows up to which global-layer chunk loops are hoisted per global layer (0: shared loop).
+    SGLANG_TPU_MUSE_MK_ATTN_HOIST_MAX_ROWS = EnvInt(0)
 
     @classmethod
     def names(cls) -> list[str]:
