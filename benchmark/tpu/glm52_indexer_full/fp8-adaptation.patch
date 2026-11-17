@@ -1,0 +1,181 @@
+--- source/kernels/dsa/indexer.py
++++ fp8/kernels/dsa/indexer.py
+@@ -285,7 +285,7 @@
+             and page_size <= 2048
+             and q_idx.dtype in (jnp.bfloat16, jnp.float32)
+             and idx_weights.dtype in (jnp.bfloat16, jnp.float32)
+-            and index_key_cache.dtype in (jnp.bfloat16, jnp.float32)
++            and index_key_cache.dtype in (jnp.bfloat16, jnp.float32, jnp.uint8)
+         )
+         if jax.default_backend() == "tpu" and pallas_compatible:
+             batched_scores = paged_decode_scores_pallas(
+@@ -421,7 +421,7 @@
+         and query_block_size <= _INDEXER_QUERY_BLOCK_SIZE
+         and q_idx.dtype in (jnp.bfloat16, jnp.float32)
+         and idx_weights.dtype in (jnp.bfloat16, jnp.float32)
+-        and index_key_cache.dtype in (jnp.bfloat16, jnp.float32)
++        and index_key_cache.dtype in (jnp.bfloat16, jnp.float32, jnp.uint8)
+     )
+     score_tile_scope = "PagedScoreTile" if use_paged_score else "ScoreTile"
+     pipeline_scope = "ScoreTopKMappingPipeline" if output_physical_slots else "ScoreTopKPipeline"
+@@ -655,7 +655,7 @@
+         and topk_impl == "radix"
+         and q_idx.dtype in (jnp.bfloat16, jnp.float32)
+         and idx_weights.dtype in (jnp.bfloat16, jnp.float32)
+-        and index_key_cache.dtype in (jnp.bfloat16, jnp.float32)
++        and index_key_cache.dtype in (jnp.bfloat16, jnp.float32, jnp.uint8)
+     )
+ 
+ 
+--- source/kernels/dsa/paged_score.py
++++ fp8/kernels/dsa/paged_score.py
+@@ -9,6 +9,19 @@
+ from jax import lax
+ from jax.experimental import pallas as pl
+ from jax.experimental.pallas import tpu as pltpu
++
++def _cache_keys(keys, dtype):
++    """Read the existing 256-byte Torch index record after its bounded page DMA.
++
++    Byte 0:128 is E4M3; byte 128 is UE8M0. No whole-cache conversion or
++    additional HBM key tensor is introduced. The source page prefetch remains.
++    """
++    if keys.dtype != jnp.uint8:
++        return keys.astype(dtype)
++    fp8 = lax.bitcast_convert_type(keys[..., :128], jnp.float8_e4m3fn)
++    scale = lax.bitcast_convert_type(keys[..., 128].astype(jnp.int32) << 23, jnp.float32)
++    return (fp8.astype(jnp.float32) * scale[..., None]).astype(dtype)
++
+ 
+ _NEG_INF = float("-inf")
+ _DEFAULT_BLOCK_K = 22528
+@@ -225,13 +238,13 @@
+             keys = keys_x2_vmem_ref[buffer]
+             if coalesce_page_dma:
+                 keys = keys.reshape(block_k, keys_x2_vmem_ref.shape[-1])
+-            keys = keys.astype(jnp.bfloat16)
++            keys = _cache_keys(keys, jnp.bfloat16)
+         else:
+             query = q_vmem_ref[0]
+             keys = keys_x2_vmem_ref[buffer]
+             if coalesce_page_dma:
+                 keys = keys.reshape(block_k, keys_x2_vmem_ref.shape[-1])
+-            keys = keys.astype(query.dtype)
++            keys = _cache_keys(keys, query.dtype)
+         # Match the two reference einsums exactly. A plain FP32 multiply plus
+         # reduce for the head mixture uses a different TPU numerical path and
+         # can perturb candidates around the top-k boundary.
+@@ -321,13 +334,13 @@
+             keys = keys_vmem_ref[:, buffer]
+             if coalesce_page_dma:
+                 keys = keys.reshape(2, block_k, keys_vmem_ref.shape[-1])
+-            keys = keys.astype(jnp.bfloat16)
++            keys = _cache_keys(keys, jnp.bfloat16)
+         else:
+             query = q_vmem_ref[...]
+             keys = keys_vmem_ref[:, buffer]
+             if coalesce_page_dma:
+                 keys = keys.reshape(2, block_k, keys_vmem_ref.shape[-1])
+-            keys = keys.astype(query.dtype)
++            keys = _cache_keys(keys, query.dtype)
+         scores = _weighted_relu_scores(
+             query,
+             weights_vmem_ref[:, 0].astype(jnp.float32),
+@@ -462,10 +475,10 @@
+             keys = keys.reshape(block_k, keys_x2_vmem_ref.shape[-1])
+         if first_dot_bf16:
+             query = q_vmem_ref[...].astype(jnp.bfloat16)
+-            keys = keys.astype(jnp.bfloat16)
++            keys = _cache_keys(keys, jnp.bfloat16)
+         else:
+             query = q_vmem_ref[...]
+-            keys = keys.astype(query.dtype)
++            keys = _cache_keys(keys, query.dtype)
+         scores = _weighted_relu_scores(
+             query,
+             weights_vmem_ref[...],
+@@ -583,9 +596,9 @@
+             keys = keys.reshape(num_sequences, block_k, keys_vmem_ref.shape[-1])
+         if first_dot_bf16:
+             query = query.astype(jnp.bfloat16)
+-            keys = keys.astype(jnp.bfloat16)
++            keys = _cache_keys(keys, jnp.bfloat16)
+         else:
+-            keys = keys.astype(query.dtype)
++            keys = _cache_keys(keys, query.dtype)
+         scores = _weighted_relu_scores_packed_sequences(query, weights, keys)
+         positions = block_id * block_k + jnp.arange(block_k, dtype=jnp.int32)
+         # Prefetched scalar inputs live in SMEM, where Mosaic only permits
+@@ -655,7 +668,7 @@
+         raise ValueError(
+             f"page_indices must have shape {(pages_per_seq,)}, got {page_indices.shape}"
+         )
+-    if index_key_cache.shape[-1] != head_dim:
++    if index_key_cache.shape[-1] != (256 if index_key_cache.dtype == jnp.uint8 else head_dim):
+         raise ValueError(
+             f"cache head dim {index_key_cache.shape[-1]} does not match q head dim {head_dim}"
+         )
+@@ -676,7 +689,7 @@
+     num_k_blocks = max_kv // block_k
+ 
+     key_shape = (
+-        (2, pages_per_block, page_size, head_dim) if coalesce_page_dma else (2, block_k, head_dim)
++        (2, pages_per_block, page_size, index_key_cache.shape[-1]) if coalesce_page_dma else (2, block_k, index_key_cache.shape[-1])
+     )
+     scores = pl.pallas_call(
+         functools.partial(
+@@ -768,7 +781,7 @@
+         )
+     if page_indices.ndim != 1:
+         raise ValueError(f"page_indices must be rank 1, got {page_indices.shape}")
+-    if index_key_cache.ndim != 3 or index_key_cache.shape[-1] != head_dim:
++    if index_key_cache.ndim != 3 or index_key_cache.shape[-1] != (256 if index_key_cache.dtype == jnp.uint8 else head_dim):
+         raise ValueError(
+             "index_key_cache must have shape [P, page_size, D] matching q_idx, "
+             f"got {index_key_cache.shape} and {q_idx.shape}"
+@@ -794,9 +807,9 @@
+     num_k_blocks = max_kv // block_k
+     rows_per_sequence = num_queries // num_sequences
+     key_shape = (
+-        (num_sequences, num_buffers, pages_per_block, page_size, head_dim)
++        (num_sequences, num_buffers, pages_per_block, page_size, index_key_cache.shape[-1])
+         if coalesce_page_dma
+-        else (num_sequences, num_buffers, block_k, head_dim)
++        else (num_sequences, num_buffers, block_k, index_key_cache.shape[-1])
+     )
+ 
+     scores = pl.pallas_call(
+@@ -1066,7 +1079,7 @@
+             "decode scorer requires one query per sequence, "
+             f"got q_idx.shape[0]={num_queries} and seq_lens.shape={seq_lens.shape}"
+         )
+-    if index_key_cache.shape[-1] != head_dim:
++    if index_key_cache.shape[-1] != (256 if index_key_cache.dtype == jnp.uint8 else head_dim):
+         raise ValueError(
+             f"cache head dim {index_key_cache.shape[-1]} does not match q head dim {head_dim}"
+         )
+@@ -1129,10 +1142,10 @@
+                 2,
+                 pages_per_block,
+                 page_size,
+-                head_dim,
++                index_key_cache.shape[-1],
+             )
+             if coalesce_page_dma
+-            else (_DECODE_SEQS_PER_GROUP, 2, block_k, head_dim)
++            else (_DECODE_SEQS_PER_GROUP, 2, block_k, index_key_cache.shape[-1])
+         )
+         scratch_shapes = [
+             pltpu.VMEM(persistent_key_shape, index_key_cache.dtype),
+@@ -1161,9 +1174,9 @@
+             lambda seq_id, *_: (seq_id, 0, 0),
+         )
+         key_shape = (
+-            (2, pages_per_block, page_size, head_dim)
++            (2, pages_per_block, page_size, index_key_cache.shape[-1])
+             if coalesce_page_dma
+-            else (2, block_k, head_dim)
++            else (2, block_k, index_key_cache.shape[-1])
+         )
+         scratch_shapes = [
+             pltpu.VMEM(key_shape, index_key_cache.dtype),
