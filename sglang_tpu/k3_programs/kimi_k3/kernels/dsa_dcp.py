@@ -1460,9 +1460,10 @@ class IndexSelect:
             others, others, self.refs["exchange_sems"].at[0, parity]
         ).wait()
 
-    def _all_reduce(self, local, parity, pending=False):
+    def _all_reduce(self, local, parity, pending=False, in_exchange=None):
         """The counts summed over the group (``pending``: this slot's sends of
-        two rounds earlier are still out; wait for them before rewriting it)."""
+        two rounds earlier are still out; wait for them before rewriting it;
+        ``in_exchange`` runs between the sends and the wait)."""
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
 
@@ -1487,6 +1488,8 @@ class IndexSelect:
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
+        if in_exchange is not None:
+            in_exchange()
         others = refs["exchange"].at[parity, pl.ds(0, group - 1), pl.ds(0, rows)]
         pltpu.make_async_copy(
             others, others, refs["exchange_sems"].at[1, parity]
@@ -1559,8 +1562,9 @@ class IndexSelect:
             _POSITION : _POSITION + 1
         ] + (digit << shift)
 
-    def _key_round(self, shift, parity, pending, first):
-        """One distributed key round (``shift`` / ``parity`` may be traced)."""
+    def _key_round(self, shift, parity, pending, first, in_exchange=None):
+        """One distributed key round (``shift`` / ``parity`` may be traced;
+        ``in_exchange``: see ``_all_reduce``)."""
         refs = self.refs
         self._row_scalars(_PREFIX, "row_prefix")
         counts = self._count(
@@ -1568,10 +1572,12 @@ class IndexSelect:
             self._key_digits(shift),
             first=first,
         )
-        total = self._all_reduce(counts, parity, pending=pending)
+        total = self._all_reduce(
+            counts, parity, pending=pending, in_exchange=in_exchange
+        )
         self._key_update(total, shift)
 
-    def _key_round_wide(self, shift, width, parity, pending, first):
+    def _key_round_wide(self, shift, width, parity, pending, first, in_exchange=None):
         """A key round of a ``width``-bit digit (bin selection, up to
         ``WIDE_MAX_BATCH`` rows; ``digit_widths``). Counts travel transposed:
         ``[8 groups, LANES]`` with row ``b`` at sublane ``b`` and candidate
@@ -1579,12 +1585,13 @@ class IndexSelect:
         nothing is packed or unpacked and a row's digit is one lane sum."""
         bins = 1 << width
         counts = self._count_groups_wide(self._key_digits(shift, width), bins, first)
-        total = self._exchange_wide(counts, parity, pending)
+        total = self._exchange_wide(counts, parity, pending, in_exchange)
         self._wide_update(total, shift, bins - 1)
 
-    def _exchange_wide(self, counts, parity, pending):
+    def _exchange_wide(self, counts, parity, pending, in_exchange=None):
         """A wide round's counts ``[8 groups, LANES]`` summed over the group
-        (``parity`` may be traced: then both slots' sends are of these rows)."""
+        (``parity`` may be traced: then both slots' sends are of these rows;
+        ``in_exchange``: see ``_all_reduce``)."""
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
 
@@ -1611,6 +1618,8 @@ class IndexSelect:
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
+        if in_exchange is not None:
+            in_exchange()
         others = refs["exchange"].at[parity, pl.ds(0, group - 1), pl.ds(0, rows)]
         pltpu.make_async_copy(
             others, others, refs["exchange_sems"].at[1, parity]
@@ -1694,11 +1703,14 @@ class IndexSelect:
         misses = jnp.sum((self._active_rows() & (fine == 0)).astype(jnp.int32))
         refs["window"][0] = (misses == 0).astype(jnp.int32)
 
-    def _seeded_rounds(self):
+    def _seeded_rounds(self, in_exchange=None):
         """The seeded window's rounds (``seeded_window``): the window round,
         then one 7-bit round at shift 12 when every active row's bin is fine
         (``_window_update``), else rounds at shifts 19 and 12 -- one loop body
-        (the 7-bit count code once), its shift and exchange slot traced."""
+        (the 7-bit count code once), its shift and exchange slot traced.
+        ``in_exchange`` (``select``) runs in the second exchange, the loop's
+        first round (which every path runs), between its sends and its
+        wait."""
         refs = self.refs
         bins = 1 << MAX_DIGIT_BITS
         counts = self._count_groups_wide(
@@ -1719,7 +1731,13 @@ class IndexSelect:
             counts = self._count_groups_wide(
                 self._key_digits(shift, MAX_DIGIT_BITS, positive=True), bins, False
             )
-            total = self._exchange_wide(counts, (i + 1) % 2, False)
+            during = None
+            if in_exchange is not None:
+
+                def during():
+                    pl_when(i == 0)(in_exchange)
+
+            total = self._exchange_wide(counts, (i + 1) % 2, False, during)
             self._wide_update(total, shift, bins - 1)
             return carry
 
@@ -2166,8 +2184,12 @@ class IndexSelect:
         self._sent(0)  # the count rounds' last two sends
         self._sent(1)
 
-    def select(self):
-        """The rounds; ``tau`` / ``p_tie`` per row into SMEM."""
+    def select(self, in_exchange=None, keys_ready=None):
+        """The rounds; ``tau`` / ``p_tie`` per row into SMEM. ``in_exchange``
+        (independent work, e.g. the attention's prologue) runs once, in the
+        second exchange round between its sends and its wait; ``keys_ready``
+        once the HBM keys scratch is complete (e.g. the attention's first key
+        copies), before the thresholds are extracted."""
         refs, topk = self.refs, self.topk
         cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
         rounds = select_rounds()
@@ -2180,24 +2202,33 @@ class IndexSelect:
             # above the bin's lower bound, a superset of the top-k; its prefix
             # bits in ``digit_widths`` exchange rounds (seeded: two or three).
             if self.seeded:
-                self._seeded_rounds()
+                self._seeded_rounds(in_exchange)
             else:
                 shift = 32
                 for round_, width in enumerate(digit_widths(self.batch, rounds)):
                     shift -= width
+                    during = in_exchange if round_ == 1 else None
                     if width == DIGIT_BITS:
-                        self._key_round(shift, round_ % 2, round_ >= 2, round_ == 0)
+                        self._key_round(
+                            shift, round_ % 2, round_ >= 2, round_ == 0, during
+                        )
                     else:
                         self._key_round_wide(
-                            shift, width, round_ % 2, round_ >= 2, round_ == 0
+                            shift, width, round_ % 2, round_ >= 2, round_ == 0, during
                         )
             self._sent(0)
             self._sent(1)
-            self._finish_tau(bin_only=True)
+            self._finish_tau(bin_only=True, keys_ready=keys_ready)
             return
         parity = 0
         for round_, shift in enumerate(KEY_SHIFTS[:static_rounds]):
-            self._key_round(shift, parity, round_ >= 2, round_ == 0)
+            self._key_round(
+                shift,
+                parity,
+                round_ >= 2,
+                round_ == 0,
+                in_exchange if round_ == 1 else None,
+            )
             parity ^= 1
         if gather:
             # Later rounds as a loop: before each, the gather finish once every
@@ -2264,19 +2295,21 @@ class IndexSelect:
             distributed_finish()
 
         del cand
-        self._finish_tau()
+        self._finish_tau(keys_ready=keys_ready)
 
-    def _finish_tau(self, bin_only=False):
+    def _finish_tau(self, bin_only=False, keys_ready=None):
         """``tau`` / ``p_tie`` / ``own`` per row from the state (``bin_only``:
         the prefix bin's lower bound, no tie position). With resident keys,
         first the HBM keys' copies (the step activity and the attention read
-        them; the next layer's scoring rewrites the chunks). With centres
-        (``self.centres``) each row's next centre: seeded, an active row's
-        ``tau`` with bit 0 set when the window round hit (``tau``'s low 12
-        bits are zero; ``window_start`` drops them); otherwise the row's
-        centre unchanged."""
+        them; the next layer's scoring rewrites the chunks); then
+        ``keys_ready``. With centres (``self.centres``) each row's next
+        centre: seeded, an active row's ``tau`` with bit 0 set when the window
+        round hit (``tau``'s low 12 bits are zero; ``window_start`` drops
+        them); otherwise the row's centre unchanged."""
         if self.resident:
             self._keys_out(start=False)
+        if keys_ready is not None:
+            keys_ready()
         refs, topk = self.refs, self.topk
         state = refs["state"]
         active = self._active_rows()

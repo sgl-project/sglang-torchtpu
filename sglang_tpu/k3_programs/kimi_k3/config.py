@@ -157,6 +157,17 @@ class KernelConfig:
     # many slots, folded once when full and at each row's last step (instead
     # of one fold a step). 0: fold every compact step.
     dsa_compact_window: int = 0
+    # Grouped FP8 verify folds (compact steps, window flushes, dense steps):
+    # each query row's 96-row block of the four-row score tile is masked by
+    # that row's own token mask, instead of a [4 x 96, tokens] mask built by
+    # a select chain over the row index. The same masked scores.
+    dsa_row_block_masks: bool = False
+    # Kimi-K3.1 decode attention whose query gather leaves during the indexer
+    # (unchunked DSA calls, up to 8 rows): the gather wait, the FP8 query
+    # unpack and the softmax state reset run inside the selection's second
+    # exchange round (between its sends and its wait) instead of at the
+    # start of the attention. The same values in the same buffers, earlier.
+    dsa_prologue_in_select: bool = False
     # Kimi-K3.1 decode epilogue: commit the step's latent rows and DSA
     # index keys in one kernel (paged._commit_dsa_rows_fused) instead of the
     # latent commit kernel and 48 XLA scatters.
@@ -206,6 +217,16 @@ class KernelConfig:
     # partial per chip -- half the cross-chip combine bytes. Merged partials
     # round to BF16 once more.
     dcp_pair_combine: bool = False
+    # DCP attention step loop: power-of-two divisions and remainders of
+    # positions, pages and steps as arithmetic shifts and masks (floor
+    # division for every int32, without the sign fixups), and the step that
+    # writes a verify sequence's cached rows found once before the loop
+    # instead of from its positions every step. Bit-identical.
+    dcp_shift_scalars: bool = False
+    # FP8 query packets (DCP query gather): unpack only the last 128-lane
+    # tile through 32-bit lanes (the scale's bytes, the zeroed pad lanes);
+    # lanes 0:512 pass through as bytes. The same query bytes and scale bits.
+    dcp_query_tail_unpack: bool = False
     # Decode layer loop: test KDA first in the layer-type branch, so the
     # instruction overlays place the post-join code for the 68 KDA layers.
     decode_kda_branch_first: bool = True
