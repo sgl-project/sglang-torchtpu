@@ -30,9 +30,7 @@ from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang_tpu.cp_layout import (
     TpuCpHostLayout,
     build_tpu_cp_layout,
-    build_tpu_cp_ring_layout,
     max_local_rows,
-    ring_local_rows,
 )
 from sglang_tpu.kv_row_write import write_rows_torch
 
@@ -87,8 +85,7 @@ def prepare_tpu_cp_forward_batch(
     the compiled-forward shim gathers the local rows from them.
 
     Ring mode (``SGLANG_TPU_PCP_MODE=ring``) uses the page-aligned layout,
-    whose bucketed quantity is ``cp_layout.ring_local_rows``; its caller
-    passes the ring-mode token bucketer.
+    (``page_size``); its caller passes the ring-mode token bucketer.
 
     Returns the real (global) token count and the real request count.
     """
@@ -117,25 +114,21 @@ def prepare_tpu_cp_forward_batch(
             f"{real_q} rows; context parallelism needs a pure extend batch."
         )
 
-    ring = current_platform.pcp_ring_enabled()
-    if ring:
-        page_size = get_schedule().page_size
-        rows = ring_local_rows(extend_lens, cp_size, page_size)
-    else:
-        rows = max_local_rows(extend_lens, cp_size)
-    local_rows_padded = t_bucketer.next_bucket(max(rows, pad_b))
-    layout_args = dict(
+    page_size = (
+        get_schedule().page_size if current_platform.pcp_ring_enabled() else None
+    )
+    local_rows_padded = t_bucketer.next_bucket(
+        max(max_local_rows(extend_lens, cp_size, page_size), pad_b)
+    )
+    host = build_tpu_cp_layout(
         extend_lens=extend_lens,
         prefix_lens=prefix_lens,
         cp_size=cp_size,
         cp_rank=cp_rank,
         pad_b=pad_b,
         local_rows_padded=local_rows_padded,
+        page_size=page_size,
     )
-    if ring:
-        host = build_tpu_cp_ring_layout(**layout_args, page_size=page_size)
-    else:
-        host = build_tpu_cp_layout(**layout_args)
     local_rows = torch.from_numpy(np.clip(host.local_rows, 0, None)).to(
         device, non_blocking=True
     )

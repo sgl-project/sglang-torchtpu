@@ -82,7 +82,7 @@ from sglang_tpu.cp_forward import (
     prepare_tpu_cp_forward_batch,
     wrap_cp_embedding_forward,
 )
-from sglang_tpu.cp_layout import ring_warmup_request_lengths, warmup_request_lengths
+from sglang_tpu.cp_layout import warmup_request_lengths
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.host_padding import (
@@ -1784,25 +1784,21 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         rows on every context-parallel rank, with the CP-v2 metadata built
         the way serving builds it."""
         assert self._cp_strategy is not None
-        if self.cp_t_bucketer is None:
-            request_lens = warmup_request_lengths(
-                local_rows=local_tokens, cp_size=self._cp_strategy.cp_size, max_reqs=bs
-            )
-            prefix_len = 0
-        else:
+        page_size, prefix_len = 1, 0
+        if self.cp_t_bucketer is not None:
             self._configure_cp_ring()
             page_size = self.model_runner.page_size
-            request_lens = ring_warmup_request_lengths(
-                local_rows=local_tokens,
-                cp_size=self._cp_strategy.cp_size,
-                page_size=page_size,
-                max_reqs=bs,
-            )
             # One program serves first chunks and cached prefixes alike; warming
             # it with a cached logical page (the reserved page 0 on every rank)
             # makes the warmup run the ring's remote DMAs, not just its barrier,
             # so a ring that cannot rotate fails at startup.
             prefix_len = page_size * self._cp_strategy.cp_size
+        request_lens = warmup_request_lengths(
+            local_rows=local_tokens,
+            cp_size=self._cp_strategy.cp_size,
+            max_reqs=bs,
+            page_size=page_size,
+        )
         layout = _DummyForwardBatchFields.cp_extend(
             request_lens,
             device=self.model_runner.device,
