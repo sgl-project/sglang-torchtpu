@@ -147,7 +147,18 @@ class KVPool(Protocol):
 
 # These objects cross the compiled decoder boundary. Registering them lets JAX
 # flatten their tensor fields and reconstruct the same objects for tracing.
-tree_util.register_dataclass(ForwardBatch)
+# Cache handles identify host-side request lifetimes, never model inputs. Drop
+# them for every compile policy (including draft paths), not just the decoder.
+tree_util.register_dataclass(
+    ForwardBatch,
+    data_fields=tuple(
+        field.name
+        for field in fields(ForwardBatch)
+        if field.name != "cache_request_handles"
+    ),
+    meta_fields=(),
+    drop_fields=("cache_request_handles",),
+)
 tree_util.register_dataclass(PallasForwardMetadata)
 tree_util.register_dataclass(LogitsProcessorOutput)
 # Pipeline stages exchange PPProxyTensors as the compiled input and output.
