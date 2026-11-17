@@ -35,6 +35,15 @@ load_ple_table_on_host
        rows in host memory, and upload the table once after the load.
   Upstream PR or issue: not filed.
   Remove when: TPU loads large row-sharded tables without whole-table copies.
+
+gather_fp8_ple_rows
+  Why: a TP=1 stage's PLE lookup F.embedding(ids, fp8_table).to(bf16)
+       compiled to a whole-table conversion (140.98G of HLO temporaries on
+       PP0 of Qwen3.8-Flash-Next).
+  How: AROUND Qwen4ExpNGramEmbedding._embed_ngram_ids: at TP=1 with an fp8
+       table, index_select the rows of a uint8 view and convert only those.
+  Upstream PR or issue: not filed.
+  Remove when: TPU lowers fp8 gathers without converting the operand.
 """
 
 from __future__ import annotations
@@ -180,3 +189,44 @@ def load_ple_table_on_host(original: Any, model: Any, weights: Any, *args, **kwa
         )
     tables.clear()
     return loaded_params
+
+
+def gather_fp8_ple_rows(
+    original: Any,
+    ngram: Any,
+    ngram_ids: Any,
+    forward_batch: Any,
+    physical_tokens: int,
+    *args,
+    **kwargs,
+):
+    """AROUND Qwen4ExpNGramEmbedding._embed_ngram_ids.
+
+    With the whole fp8 PLE table on one device (a TP=1 pipeline stage), the
+    core lookup ``F.embedding(ids, fp8_table).to(bf16)`` compiles to a
+    whole-table conversion on TPU: the stage-0 forward needed 140.98G of HLO
+    temporaries for a 51.2 GB table. Gather the rows through a uint8 view of the
+    table, which moves bytes only, and convert just the gathered rows.
+    """
+    import torch
+
+    emb = ngram.ngram_embedding
+    weight = getattr(emb, "weight", None)
+    if (
+        not isinstance(weight, torch.Tensor)
+        or weight.dtype != torch.float8_e4m3fn
+        or getattr(emb, "tp_size", 1) != 1
+        or weight.device.type == "meta"
+    ):
+        return original(ngram, ngram_ids, forward_batch, physical_tokens, *args, **kwargs)
+    lookup_ids, semantic_tokens = ngram._prepare_embedding_lookup(
+        ngram_ids, forward_batch, physical_tokens
+    )
+    flat = lookup_ids.reshape(-1).to(torch.int32)
+    rows = torch.index_select(weight.view(torch.uint8), 0, flat)
+    embeddings = rows.view(torch.float8_e4m3fn).to(emb.output_dtype or torch.bfloat16)
+    embeddings = embeddings.reshape(*lookup_ids.shape, weight.shape[-1])
+    embeddings = embeddings * emb.weight_scale
+    return ngram._finish_embedding_lookup(
+        embeddings, semantic_tokens, forward_batch, physical_tokens
+    )
