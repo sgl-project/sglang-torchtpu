@@ -59,6 +59,13 @@ def add_arguments(parser, profile: bool = False) -> None:
         help="slot layout as serving (default: max batch)",
     )
     decode.add_argument(
+        "--min-pages",
+        type=int,
+        default=0,
+        help="block tables at least this many pages wide (serving compiles 64 "
+        "for a 1M context; default: the longest case's)",
+    )
+    decode.add_argument(
         "--dspark",
         default="",
         metavar="CHECKPOINT",
@@ -184,6 +191,7 @@ def run_decode(args, records: harness.Records) -> None:
     max_num_seqs = args.max_num_seqs or rows
     sub_base = 2 * max_num_seqs + 1
     pages = -(-(max_context + 8 * args.steps * args.repeats + 64) // k3.logical()) + 1
+    pages = max(pages, args.min_pages)
     # Under attention DP a rank's pools hold only its own group's requests.
     dp = config.active().attention_dp
     blocks = 1 + -(-rows // dp) * pages
