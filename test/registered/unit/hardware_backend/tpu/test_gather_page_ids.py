@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """gather_page_ids matches a direct page-table lookup on a TPU (JAX only).
 
-Covers the unrolled kernel (page table of at most 11 chunks of 128 pages) and the
+Covers the unrolled kernel (page table of at most 13 chunks of 128 pages) and the
 bounded-loop kernel used for wider tables (256k and 1M context at page 128).
 """
 

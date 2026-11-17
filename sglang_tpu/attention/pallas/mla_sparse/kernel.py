@@ -69,44 +69,75 @@ def _largest_divisor(x: int, cap: int) -> int:
 _GATHER_PAGE_CHUNK = 128
 
 
+def _lane_gather(window_chunk: jax.Array, lane: jax.Array) -> jax.Array:
+    """``out[t, j] = window_chunk[t, lane[t, j]]``: one XLU lane gather per (8, 128) vreg.
+
+    ``lane`` is promised to be in ``[0, 128)``, so no clamping or negative-index wrap is emitted.
+    """
+    dimension_numbers = lax.GatherDimensionNumbers(
+        offset_dims=(),
+        collapsed_slice_dims=(1,),
+        start_index_map=(1,),
+        operand_batching_dims=(0,),
+        start_indices_batching_dims=(0,),
+    )
+    return lax.gather(
+        window_chunk,
+        lane[..., None],
+        dimension_numbers,
+        slice_sizes=(1, 1),
+        mode=lax.GatherScatterMode.PROMISE_IN_BOUNDS,
+    )
+
+
+def _split_logical_pages(logical: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Splits logical page ids into (lane within a 128-page chunk, chunk index).
+
+    Done once per token block, so each chunk step is just a gather and a compare-select, and
+    nothing but the output has to stay live across the gather.
+    """
+    return (
+        logical & (_GATHER_PAGE_CHUNK - 1),
+        logical >> (_GATHER_PAGE_CHUNK.bit_length() - 1),
+    )
+
+
 def _gather_page_ids_kernel(windows_ref, logical_ref, out_ref, *, num_chunks):
-    logical = logical_ref[...]  # i32[block_tokens, topk]
-    out = jnp.zeros_like(logical)
+    lane, chunk = _split_logical_pages(logical_ref[...])  # i32[block_tokens, topk]
+    out = jnp.zeros_like(lane)
     for c in range(num_chunks):
         window_chunk = windows_ref[
             :, c * _GATHER_PAGE_CHUNK : (c + 1) * _GATHER_PAGE_CHUNK
         ]  # i32[block_tokens, 128]
-        local = logical - c * _GATHER_PAGE_CHUNK
-        gathered = jnp.take_along_axis(
-            window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
-        )
-        out = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, out)
+        out = jnp.where(chunk == c, _lane_gather(window_chunk, lane), out)
     out_ref[...] = out
 
 
-# Cycle costs of the bounded loop, read from the TensorCore LLO schedule on tpu7x.
-# A chunk step is bound by the cross-lane unit (XLU), not the VALU: it does one lane gather per
-# (8, 128) vreg of the block's top-k indices, and each XLU issues them back to back
-# (vset.pattern + vperm.lane, 4 + 4 cycles).
-_XLU_LANE_GATHER_CYCLES = 8
-_NUM_XLUS = 2
-# Fill/drain of one fori_loop iteration: the body is scheduled on its own, so its gather chains
-# and the loop-carried output do not overlap the next iteration. Read from the 8-chunk body
-# (641 bundles, of which 8 x 64 are chunk steps); bodies of 16+ chunks also spill, which
-# roughly doubles it, but that does not change the chosen iteration count at 1M context.
-_GATHER_PAGE_LOOP_ITERATION_CYCLES = 129
+# Cycle costs of a chunk step and of the loop, from the TensorCore LLO schedule on tpu7x.
+# A chunk step is bound by the cross-lane unit (XLU): one lane gather per (8, 128) vreg of the
+# block's top-k indices. The permute reserves an XLU for 4 cycles and the all-sublanes
+# set-pattern for 4 more, but every chunk gathers with the same lane indices, so the compiler
+# reuses about a quarter of the patterns (187 set-patterns for 256 gathers in a 16-chunk body):
+# ~7 cycles per gather.
+_XLU_LANE_GATHER_CYCLES = 7
+# Share of the gathers that lands on the busier of the two XLUs: the compiler assigns these
+# independent gathers about 1:2, which makes the busier XLU the critical path.
+# NOTE(b/586649669): 1/2 once the assignment is balanced.
+_BUSIER_XLU_GATHER_SHARE = 2 / 3
+# Per-iteration overhead of the fori_loop: the last gather's push-to-pop latency plus the final
+# select and copies (44-49 bundles after the last XLU issue in every loop body), plus about as
+# much loop control that the static schedule does not show (per-iteration time over 8, 11, 16
+# and 22 chunks per iteration fits this + 73 cycles per chunk).
+_GATHER_PAGE_LOOP_ITERATION_CYCLES = 100
 # A grid step waits on its DMAs (the block's top-k tile in, its page-table row in, its output
-# tile out): main's 1-chunk kernel has a 154-bundle body but takes this many cycles per step.
+# tile out): the 1-chunk kernel has a ~120-bundle body but takes this many cycles per step.
 _GATHER_PAGE_BLOCK_STEP_FLOOR_CYCLES = 1040
-# One chunk step of the fully unrolled kernel: the XLU-bound step plus register spills, which
-# grow with the unrolled width (main's 16-chunk body: 1512 bundles vs 154 for 1 chunk).
-_GATHER_PAGE_UNROLLED_CHUNK_STEP_CYCLES = 90
 
 
 def _gather_page_chunk_step_cycles(block_tokens: int, topk: int) -> float:
-    """Cycles of one chunk step for one token block: its lane gathers spread over the XLUs."""
+    """Cycles of one chunk step for one token block: its lane gathers on the busier XLU."""
     num_vregs = cdiv(block_tokens, 8) * cdiv(topk, _GATHER_PAGE_CHUNK)
-    return num_vregs * _XLU_LANE_GATHER_CYCLES / _NUM_XLUS
+    return num_vregs * _BUSIER_XLU_GATHER_SHARE * _XLU_LANE_GATHER_CYCLES
 
 
 def _gather_page_chunks_per_iteration(
@@ -135,7 +166,7 @@ def _gather_page_ids_bounded_kernel(
     ``chunks_per_iteration`` chunks are unrolled per loop iteration so the loop overhead is
     amortized; tail steps past the table repeat its last chunk, which selects the same values.
     """
-    logical = logical_ref[...]  # i32[block_tokens, topk]
+    lane, chunk = _split_logical_pages(logical_ref[...])  # i32[block_tokens, topk]
     g = chunks_per_iteration
 
     def body(i, out):
@@ -143,15 +174,11 @@ def _gather_page_ids_bounded_kernel(
             c = jnp.minimum(i * g + j, num_chunks - 1)
             start = pl.multiple_of(c * _GATHER_PAGE_CHUNK, _GATHER_PAGE_CHUNK)
             window_chunk = windows_ref[:, pl.ds(start, _GATHER_PAGE_CHUNK)]
-            local = logical - c * _GATHER_PAGE_CHUNK
-            gathered = jnp.take_along_axis(
-                window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
-            )
-            out = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, out)
+            out = jnp.where(chunk == c, _lane_gather(window_chunk, lane), out)
         return out
 
     num_iterations = (nchunks_ref[pl.program_id(0)] + g - 1) // g
-    out_ref[...] = lax.fori_loop(0, num_iterations, body, jnp.zeros_like(logical))
+    out_ref[...] = lax.fori_loop(0, num_iterations, body, jnp.zeros_like(lane))
 
 
 def gather_page_ids(
@@ -188,7 +215,7 @@ def gather_page_ids(
     if (
         # Below the floor the unrolled kernel's chunk loop hides under the DMA wait, so
         # bounding it saves nothing and only adds loop overhead.
-        num_chunks * _GATHER_PAGE_UNROLLED_CHUNK_STEP_CYCLES
+        num_chunks * _gather_page_chunk_step_cycles(block_tokens, topk)
         > _GATHER_PAGE_BLOCK_STEP_FLOOR_CYCLES
         and chunks_per_iteration < num_chunks
     ):
