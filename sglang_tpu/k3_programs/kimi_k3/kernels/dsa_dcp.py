@@ -254,6 +254,42 @@ def early_plan() -> bool:
     return bool(active().dsa_early_plan)
 
 
+def live_activity() -> bool:
+    """``KernelConfig.dsa_live_activity``."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    return bool(active().dsa_live_activity)
+
+
+def live_activity_steps(longest, subpages: int, span_rows: int, steps: int):
+    """The step activity entries a sequence's first row needs
+    (``KernelConfig.dsa_live_activity``): the steps of the selection's
+    longest row (``longest`` local pages) and one more, at most ``steps``.
+    The attention reads a row's steps below its own page count, from its
+    limit: the row's position (plain rows, below the selection's ``position
+    + 1``) or, for a sequence of ``S`` cached verify rows, its first row's
+    position ``+ S - 1``, at most ``S - 2`` tokens past the first row's
+    selection limit: one page, so one step, more."""
+    return jnp.minimum((longest * subpages + span_rows - 1) // span_rows + 1, steps)
+
+
+def odd_stride() -> bool:
+    """``KernelConfig.dsa_odd_stride``."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    return bool(active().dsa_odd_stride)
+
+
+def group_stride(chunk: int) -> int:
+    """Rows between two rows' chunks in the grouped count buffer with
+    ``KernelConfig.dsa_odd_stride``: an odd number of 8-row tiles (``chunk``,
+    or ``chunk + 8`` when ``chunk / 8`` is even). A key row's strided load of
+    the group's 8 rows (``pl.ds(k, 8, stride)``) is then two VMEM loads of 4
+    sublanes; 2 mod 4 tiles apart it is four loads, 0 mod 4 (e.g. 128 rows,
+    the chunk of a 1M-context table) eight, each OR-ed into the vreg."""
+    return chunk + 8 if chunk // 8 % 2 == 0 else chunk
+
+
 COUNT_ROWS = 16  # candidate sublanes of the count exchange
 BINS = 16  # a round's digit values (DIGIT_BITS = 4)
 # State rows (lanes: batch rows).
@@ -472,7 +508,13 @@ class IndexSelect:
         # Below WIDE_CHUNK_BATCH rows the count passes read 8 rows a step (select_scratch).
         self.grouped = "group_buf" in refs
         self.groups = -(-batch // 8)
-        self.gchunk = refs["group_buf"].shape[1] // 8 if self.grouped else 0
+        self.gchunk = self.chunk if self.grouped else 0
+        # Rows between two rows' chunks in the count buffer (group_stride).
+        self.gstride = refs["group_buf"].shape[1] // 8 if self.grouped else 0
+        if self.gstride not in (self.gchunk, group_stride(self.gchunk)):
+            raise ValueError(
+                "the count buffer's rows are chunk or group_stride rows apart"
+            )
         self.group_rows = min(
             8, batch
         )  # rows a group holds (batches: 1, 2, 4 or multiples of 8)
@@ -484,7 +526,7 @@ class IndexSelect:
             )
         self.stage_slots = refs["stage"].shape[0]
         # KernelConfig.dsa_resident_keys: the scoring writes key row j of row
-        # r into the count chunks, slot j >= gchunk at r * gchunk + j - its
+        # r into the count chunks, slot j >= gchunk at r * gstride + j - its
         # chunk's first row (the count passes' _group_copy layout).
         self.resident = self.grouped and resident_keys(
             batch, self.key_rows, sequence_rows
@@ -711,20 +753,20 @@ class IndexSelect:
             )
             if resident:
                 # The page's key rows j0 .. in the count chunks (row r of the
-                # sequence at base + r * gchunk); no stage ring.
-                gchunk, j0 = self.gchunk, local * self.subpages
+                # sequence at base + r * gstride); no stage ring.
+                gchunk, gstride, j0 = self.gchunk, self.gstride, local * self.subpages
                 if self.key_rows > gchunk:
                     second = (j0 >= gchunk).astype(jnp.int32)
                     held = refs["group_buf"].at[second]
-                    base = first_row * gchunk + j0 - second * self.second_start
+                    base = first_row * gstride + j0 - second * self.second_start
                 else:
-                    held, base = refs["group_buf"].at[0], first_row * gchunk + j0
+                    held, base = refs["group_buf"].at[0], first_row * gstride + j0
 
                 def put(r, sub, key):
-                    held[pl_ds(base + r * gchunk + sub, 1), :] = key
+                    held[pl_ds(base + r * gstride + sub, 1), :] = key
 
                 def get(r, sub):
-                    return held[pl_ds(base + r * gchunk + sub, 1), :]
+                    return held[pl_ds(base + r * gstride + sub, 1), :]
 
             else:
                 pl_when(step >= stages)(lambda: self._stage_copy(stage).wait())
@@ -854,6 +896,7 @@ class IndexSelect:
         from jax.experimental.pallas import tpu as pltpu
 
         refs, chunk, rows = self.refs, self.gchunk, self.second_start
+        stride = self.gstride
         held, sems = refs["group_buf"], refs["group_sems"]
         if not start:
             first = held.at[0, pl_ds(0, self.batch * chunk)]
@@ -866,7 +909,7 @@ class IndexSelect:
             return
         for r in range(self.batch):
             pltpu.make_async_copy(
-                held.at[0, pl_ds(r * chunk, chunk)],
+                held.at[0, pl_ds(r * stride, chunk)],
                 refs["keys"].at[r, pl_ds(0, chunk)],
                 sems.at[0],
             ).start()
@@ -876,7 +919,7 @@ class IndexSelect:
             def rest():
                 for r in range(self.batch):
                     pltpu.make_async_copy(
-                        held.at[1, pl_ds(r * chunk + chunk - rows, rows)],
+                        held.at[1, pl_ds(r * stride + chunk - rows, rows)],
                         refs["keys"].at[r, pl_ds(chunk, rows)],
                         sems.at[1],
                     ).start()
@@ -1085,7 +1128,7 @@ class IndexSelect:
 
     def _group_copy(self, step):
         """Group step ``step``'s chunk of its rows' keys into slot ``step % 2``
-        (row ``r`` at slot rows ``[r * chunk, (r + 1) * chunk)``)."""
+        (row ``r`` at slot rows ``[r * gstride, r * gstride + chunk)``)."""
         from jax.experimental.pallas import tpu as pltpu
 
         refs, chunk = self.refs, self.gchunk
@@ -1094,7 +1137,7 @@ class IndexSelect:
         for r in range(self.group_rows):
             pltpu.make_async_copy(
                 refs["keys"].at[8 * g + r, pl_ds(start, chunk)],
-                refs["group_buf"].at[step % 2, pl_ds(r * chunk, chunk)],
+                refs["group_buf"].at[step % 2, pl_ds(r * self.gstride, chunk)],
                 refs["group_sems"].at[step % 2],
             ).start()
 
@@ -1178,7 +1221,7 @@ class IndexSelect:
                 low = high = jnp.zeros((8, LANES), jnp.int32)
                 for i in range(8):
                     k = pl.multiple_of(b * 8, 8) + i
-                    key = slot[pl.ds(k, 8, stride=chunk), :]  # [8 rows, 128]
+                    key = slot[pl.ds(k, 8, stride=self.gstride), :]  # [8 rows, 128]
                     key_row = start + k
                     valid = (k >= first_row) & (key_row < limit)
                     page = key_row // self.subpages
@@ -1517,7 +1560,7 @@ class IndexSelect:
                 narrow = [jnp.zeros((8, LANES), jnp.int32) for _ in range(nibbles)]
                 for i in range(8):
                     k = pl.multiple_of(b * 8, 8) + i
-                    key = slot[pl.ds(k, 8, stride=chunk), :]  # [8 rows, 128]
+                    key = slot[pl.ds(k, 8, stride=self.gstride), :]  # [8 rows, 128]
                     valid = (k >= first_row) & (start + k < limit)
                     digit, counted = digits(params, key, None, valid)
                     one = jnp.where(
@@ -1773,7 +1816,7 @@ class IndexSelect:
 
                     @pl_when(8 * g + r < self.batch)
                     def one_row(r=r, row=row):
-                        scan_chunk(row, slot, r * gchunk, gchunk, local, start)
+                        scan_chunk(row, slot, r * self.gstride, gchunk, local, start)
 
                 return carry
 
@@ -2031,7 +2074,10 @@ def _step_activity(self, span_rows: int, active_ref, steps: int):
     ``[s span_rows, (s + 1) span_rows)``) of row ``b``'s sequence (``b`` its
     first row) holds a selected token of any of its rows; after ``select``.
     When no row has more than ``ACTIVITY_MIN_STEPS`` local steps every step
-    is marked (the attention masks the tokens either way)."""
+    is marked (the attention masks the tokens either way).
+    ``KernelConfig.dsa_live_activity``: only each sequence's first row's
+    steps up to ``live_activity_steps`` are written (all the attention
+    reads); the rest keep stale values."""
     refs, chunk = self.refs, self.chunk
     if chunk % span_rows or self.key_rows % span_rows:
         raise ValueError("attention steps must tile the key chunks")
@@ -2041,6 +2087,18 @@ def _step_activity(self, span_rows: int, active_ref, steps: int):
             active_ref[i] = value
             return carry
 
+        if live_activity():
+            live = live_activity_steps(longest, self.subpages, span_rows, steps)
+
+            def sequence(seq, carry):
+                first = seq * (self.S * steps)
+                return jax.lax.fori_loop(first, first + live, one, carry)
+
+            if self.batch == self.S:
+                sequence(0, 0)
+            else:
+                jax.lax.fori_loop(0, self.batch // self.S, sequence, 0)
+            return
         jax.lax.fori_loop(0, self.batch * steps, one, 0)
 
     longest = refs["counts"][0]
@@ -2202,10 +2260,11 @@ def _group_scratch(batch, key_rows, sequence_rows=1):
     from jax.experimental.pallas import tpu as pltpu
 
     groups, chunk = -(-batch // 8), min(chunk_rows(batch, sequence_rows), key_rows)
+    stride = group_stride(chunk) if odd_stride() else chunk
     return {
         "group_buf": pltpu.VMEM(
-            (2, 8 * chunk, LANES), jnp.int32
-        ),  # row r's chunk at r * chunk
+            (2, 8 * stride, LANES), jnp.int32
+        ),  # row r's chunk at r * stride
         "group_sems": pltpu.SemaphoreType.DMA((2,)),
         "group_rows": pltpu.SMEM((groups,), jnp.int32),
         "gstep_starts": pltpu.SMEM((groups + 1,), jnp.int32),

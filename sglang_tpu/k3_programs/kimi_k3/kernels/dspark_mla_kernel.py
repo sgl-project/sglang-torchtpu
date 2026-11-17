@@ -179,13 +179,12 @@ def single_epilogue(
         put_ids(2 * rows + r, ids[2 * rows + r])
     put_ids(3 * rows, accepted)
 
-    @pl.loop(3 * rows + 1, spec.ids_size)
-    def copy_tables(k):
-        put_ids(k, ids[k])
+    copy_words(3 * rows + 1, spec.ids_size, lambda k: put_ids(k, ids[k]))
 
-    @pl.loop(0, spec.state_size)
     def copy_state(k):
         state_out[k] = state_in[k]
+
+    copy_words(0, spec.state_size, copy_state)
 
     def put(index, value):
         index = jnp.where(index < 0, index + spec.state_size, index)
@@ -202,6 +201,29 @@ def single_epilogue(
         for f in range(spec.fields):
             packet[spec.ids_size + f] = state_out[spec.plan + f]
         packet[spec.ids_size + spec.fields] = jnp.int32(1)
+
+
+def copy_words(lo, hi, copy):
+    """``copy(k)`` for ``k`` in ``[lo, hi)`` (static bounds), SMEM scalar
+    code: a loop of a word an iteration, or with
+    ``KernelConfig.draft_epilogue_unroll`` that many words an iteration
+    (the rest unrolled after it) -- each iteration pays the loop's exit
+    test and branch."""
+    unroll = max(1, _config().draft_epilogue_unroll)
+    if unroll == 1:
+        pl.loop(lo, hi)(copy)
+        return
+    blocks = (hi - lo) // unroll
+    if blocks:
+
+        @pl.loop(0, blocks)
+        def block(i):
+            first = lo + i * unroll
+            for j in range(unroll):
+                copy(first + j)
+
+    for k in range(lo + blocks * unroll, hi):
+        copy(k)
 
 
 class _Scalars:

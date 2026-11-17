@@ -166,6 +166,20 @@ class KernelConfig:
     # scoring ring's first index-page copies while the index query/key gather
     # is in flight (neither needs the gathered queries) instead of after it.
     dsa_early_plan: bool = False
+    # Kimi-K3.1 decode selection: the step activity writes only the entries
+    # the attention reads -- each sequence's first row's steps, up to the
+    # longest row's live steps and one more -- instead of every row's steps
+    # of the whole block table (the scalar loop ran batch x the table's
+    # steps a layer: 8 x 32 at a 1M-context table, for ~11 live steps at
+    # 344k). The attention reads the same values (bit-identical).
+    dsa_live_activity: bool = False
+    # Kimi-K3.1 decode selection, grouped count passes (up to 8 rows a
+    # group): the count buffer holds its rows' key chunks an odd number of
+    # 8-row tiles apart (a chunk of an even number of tiles padded by 8
+    # rows), so a key row's strided load of the 8 rows is two VMEM loads
+    # instead of eight (a 1M-context table's 128-row chunk: 64 loads and 56
+    # ORs a count block instead of 16 and 8). The same keys and counts.
+    dsa_odd_stride: bool = False
     # MLA DCP combine of unchunked one-group calls with three heads a rank
     # (B1, B4, B8 and the 8-row verifies) in two stages: the chip's two
     # cores (members 2k, 2k + 1) first merge their partials on-chip, each
@@ -207,6 +221,13 @@ class KernelConfig:
     # ids and control state. The op runs two kernels and one convert instead
     # of ~35 small XLA ops. The same integers and cache bytes (bit-identical).
     draft_fused_epilogue: bool = False
+    # draft_fused_epilogue's scalar copies (the output vector, the next ids'
+    # block tables and the control state; all a request's table entries
+    # whatever its context): this many words a loop iteration (0 or 1: one).
+    # A word an iteration pays the loop's exit test and branch: 7-8 bundles a
+    # word, ~7.2K a step at a 1M-context table (8 x 64 entries in the ids).
+    # The same words.
+    draft_epilogue_unroll: int = 0
     # DSpark verify operand packing (DecodeOps._build_verify_metadata: the
     # ids, the plan rows and the verify modes in one operand) folded into the
     # op before the verify: the MLA single-request draft op also returns the
