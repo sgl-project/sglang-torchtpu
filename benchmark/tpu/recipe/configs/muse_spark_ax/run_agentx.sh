@@ -102,7 +102,7 @@ aiperf_command() {  # conc out_dir: the replay, as the AgentX harness builds it
     AIPERF_CMD=(
         "$AIPERF_VENV/bin/aiperf" profile --scenario inferencex-agentx-mvp
         --url "http://localhost:$PORT" --endpoint /v1/chat/completions --endpoint-type chat
-        --streaming --model "$SERVED_MODEL_NAME" --tokenizer "$MODEL"
+        --streaming --model "$SERVED_MODEL_NAME" --tokenizer "${TOKENIZER:-$MODEL}"
         --concurrency "$conc" --benchmark-duration "$DURATION" --stats-interval 30
         --random-seed 42 --failed-request-threshold 0.10
         --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75
