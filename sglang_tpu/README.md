@@ -54,6 +54,14 @@ Unreachable today: MLA with hybrid SWA or an FP4 KV cache takes the plain OOT
 MLA builder in mode B and the generic builders in mode A; no TPU model uses
 either.
 
+## Profiling
+
+The default TPU xprof path records and exports on global rank 0. In unified
+serving, staged profiling produces one `MIXED` capture through prefill and the
+requested decode steps, then drains device work and exports once. Separate
+prefill/decode engines retain single-stage captures. Explicitly selecting
+`SGLANG_PROFILE_V2=1` retains the separate V2 implementation described above.
+
 ## Layout
 
 ```

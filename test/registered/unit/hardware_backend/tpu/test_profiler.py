@@ -23,6 +23,7 @@ from sglang_tpu.profiler import (
     start_tpu_profile,
     stop_tpu_profile,
 )
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 # Pure-logic tests. torch_tpu is faked via sys.modules, so this runs on the
 # CPU CI runner (no TPU required).
@@ -319,9 +320,8 @@ class TestContinuousTpuProfile(CustomTestCase):
         )
         for context in patches:
             self.enterContext(context)
-        self.manager = tpu_scheduler_profiler.TpuSchedulerProfilerManager(
-            get_forward_ct=lambda: 0
-        )
+        manager_cls = TpuSRTPlatform().get_scheduler_profiler_manager_cls()
+        self.manager = manager_cls(get_forward_ct=lambda: 0)
 
     def _start(self, *, output_dir, with_cpu):
         self.calls.append(("start", output_dir.name))
@@ -405,6 +405,24 @@ class TestContinuousTpuProfile(CustomTestCase):
             self._batch(ForwardMode.EXTEND)
         self.assertIn("-EXTEND-", self.calls[0][1])
         self.assertEqual(self.calls[1:], ["drain", "export"])
+
+    def test_explicit_v2_uses_shared_profiler(self):
+        with (
+            envs.SGLANG_PROFILE_V2.override(True),
+            patch.object(scheduler_profiler, "ProfileManager") as profile_manager,
+        ):
+            manager_cls = (
+                TpuSRTPlatform().get_scheduler_profiler_manager_cls()
+                or scheduler_profiler.SchedulerProfilerManager
+            )
+            manager = manager_cls(get_forward_ct=lambda: 0)
+            manager._profile_batch_predicate(
+                types.SimpleNamespace(forward_mode=ForwardMode.DECODE)
+            )
+            profile_manager.return_value.step.assert_called_once_with(
+                forward_mode=ForwardMode.DECODE
+            )
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":

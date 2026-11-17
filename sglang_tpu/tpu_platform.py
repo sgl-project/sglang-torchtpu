@@ -27,7 +27,6 @@ from sglang_tpu.dp_replicas import (
     prepare_host_session,
     validate_dp_replicas,
 )
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_dma_hicache import (
     is_tpu_dma_hicache_backend,
     tpu_dma_hicache_backends,
@@ -1280,9 +1279,9 @@ class TpuSRTPlatform(SRTPlatform):
         return "pallas_tpu_rpa_v3"
 
     def get_scheduler_profiler_manager_cls(self) -> type | None:
-        if tpu_envs.SGLANG_TPU_PROFILE_CONTINUOUS.get():
-            return _TpuSchedulerProfilerManager
-        return None
+        if envs.SGLANG_PROFILE_V2.get():
+            return None
+        return _TpuSchedulerProfilerManager
 
     def get_graph_runner_cls(self) -> type:
         from sglang_tpu.graph_runner.tpu_graph_runner import TpuGraphRunner
