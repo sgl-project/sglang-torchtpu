@@ -1860,6 +1860,312 @@ class TestK31DraftWholeWeights(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+class TestK31DraftFusedEpilogue(CustomTestCase):
+    """``KernelConfig.draft_fused_epilogue`` and ``draft_lm_prefetch`` in
+    Pallas interpret mode, against the XLA code they replace, bitwise:
+
+    * ``paged.commit_draft_rows`` (one tile read / write per touched tile)
+      lands the bytes of ``commit_latent_rows``'s scatter on a 4-rank group:
+      rows within one tile, across tiles, across a page (two owners), into
+      the next table entry, a negative block, a dropped block and entries
+      past the table.
+    * ``dspark_mla_kernel.single_epilogue`` gives ``_build_single``'s emitted
+      tokens, next ids and control state, slot indices that wrap or drop
+      included.
+    * ``dspark_mla_kernel.stream_chunks``: the LM head through six slots
+      (four started early) gives the two-slot ring's logits, race-free.
+    * ``MlaDsparkDraft._build_single``'s op with the knob (the fused kernel
+      stubbed) returns the knob-off op's vector, pools, emitted tokens, next
+      ids and control state."""
+
+    COMMIT = """
+        import os
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import dataclasses
+        import numpy as np, ml_dtypes, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3.kernels import paged
+
+        G, ROWS, PAGES, L, BLOCKS, PT = 4, 8, 6, 5, 7, 512
+        base_config = paged._config()
+        scatter_config = dataclasses.replace(base_config, fused_cache_commit=False)
+        stock = pl.pallas_call
+        paged.pl.pallas_call = lambda *a, **k: stock(*a, **{"interpret": pltpu.InterpretParams(), **k})
+        mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+
+        def new(pools, latents, ids):
+            return paged.commit_draft_rows(tuple(pools), latents.astype(jnp.float8_e4m3fn), ids, ROWS, PAGES,
+                                           tuple(range(L)), group=G, global_pages=False)
+
+        def old(pools, latents, ids):
+            paged._config = lambda: scatter_config
+            try:
+                table = ids[3 * ROWS + 1 : 3 * ROWS + 1 + PAGES]
+                positions = ids[ROWS] + jnp.arange(ROWS, dtype=jnp.int32)
+                return paged.commit_latent_rows(tuple(pools), latents.transpose(1, 0, 2),
+                                                jnp.broadcast_to(table[None], (ROWS, PAGES)), positions,
+                                                tuple(range(L)), group=G, global_pages=False)
+            finally:
+                paged._config = lambda: base_config
+
+        def run(base, table, seed):
+            rng = np.random.default_rng(seed)
+            pools = (rng.integers(0, 256, (L, G * BLOCKS, 128, 4, 640), dtype=np.uint8) & 0x7E).view(
+                ml_dtypes.float8_e4m3fn)
+            latents = (rng.standard_normal((L, ROWS, 640)) * 2).astype(ml_dtypes.bfloat16)
+            ids = rng.integers(0, 100, 3 * ROWS + 1 + ROWS * PAGES).astype(np.int32)
+            ids[ROWS] = base
+            ids[3 * ROWS + 1 : 3 * ROWS + 1 + PAGES] = table
+            outs = []
+            for fn in (new, old):
+                f = jax.jit(jax.shard_map(lambda *a, fn=fn: fn(a[:L], *a[L:]), mesh=mesh,
+                                          in_specs=(P("tp"),) * L + (P(), P()), out_specs=(P("tp"),) * L,
+                                          check_vma=False))
+                outs.append([np.asarray(x).view(np.uint8) for x in f(*map(jnp.asarray, pools),
+                                                                    jnp.asarray(latents), jnp.asarray(ids))])
+            assert all(np.array_equal(a, b) for a, b in zip(*outs)), (base, table)
+            return sum(int((a != p.view(np.uint8)).sum()) for a, p in zip(outs[1], pools))
+
+        written = [
+            run(5, [1, 2, 3, 4, 5, 6], 0),  # one tile
+            run(28, [3, 1, 2, 4, 5, 6], 1),  # two tiles
+            run(PT - 3, [2, 5, 1, 1, 1, 1], 2),  # two pages, two owners
+            run(4 * PT - 4, [1, 6, 2, 3, 4, 5], 3),  # the next table entry
+            run(3 * PT + 100, [-1, 2, 3, 4, 5, 6], 4),  # a negative block
+            run(30 * PT + 500, [1, 2, 3, 4, 5, 6], 6),  # entries past the table (clamped)
+        ]
+        assert min(written) > 0
+        assert run(2 * PT + 7, [G * BLOCKS + 3, 2, 3, 1, 1, 1], 5) == 0  # out of range: dropped
+        print("OK")
+    """
+
+    EPILOGUE = """
+        import os
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark_mla_kernel as kern
+        from sglang_tpu.k3_programs.kimi_k3.kernels.dspark import OUT_BONUS, OUT_COUNT, OUT_DRAFTS
+
+        ROWS = 8
+
+        def reference(vector, ids, state, slots, reset):  # MlaDsparkDraft._build_single's XLA epilogue
+            rows = ROWS
+            tokens, base, slot = ids[:rows], ids[rows], ids[2 * rows]
+            accepted, bonus = vector[0, OUT_COUNT], vector[0, OUT_BONUS]
+            row = jnp.arange(rows, dtype=jnp.int32)
+            emitted = jnp.where(row < accepted, tokens[jnp.minimum(row + 1, rows - 1)],
+                                jnp.where(row == accepted, bonus, -1)).astype(jnp.int32)
+            following = jnp.concatenate((bonus[None], vector[0, OUT_DRAFTS : OUT_DRAFTS + rows - 1]))
+            following_ids = jnp.concatenate((following, base + accepted + 1 + row, ids[2 * rows : 3 * rows],
+                                             accepted[None], ids[3 * rows + 1 :])).astype(jnp.int32)
+            state = state.at[slot].set(bonus)
+            state = state.at[slots + slot].set(base + accepted + 1)
+            state = state.at[2 * slots + slot].set(accepted)
+            state = state.at[reset].set(jnp.where(slot != 0, 0, state[reset]))
+            return emitted[None], following_ids, state
+
+        def kernel_outputs(spec, vector, ids, state):
+            def kernel(ids_ref, state_ref, vector_ref, *outs):
+                kern.single_epilogue(spec, ROWS, ids_ref, state_ref, vector_ref, *outs)
+            return pl.pallas_call(
+                kernel,
+                out_shape=(jax.ShapeDtypeStruct((1, ROWS), jnp.int32),
+                           jax.ShapeDtypeStruct((spec.ids_size,), jnp.int32),
+                           jax.ShapeDtypeStruct((spec.state_size,), jnp.int32)),
+                grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=3, in_specs=[],
+                                                       out_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)] * 3),
+                interpret=pltpu.InterpretParams(),
+            )(ids, state, vector)
+
+        rng = np.random.default_rng(0)
+        for slots, plan_rows, pages in ((3, 1, 26), (9, 4, 7)):
+            size = 3 * slots + plan_rows * (8 + pages)
+            spec = kern.SingleEpilogue(slots=slots, reset=3 * slots + 1, state_size=size,
+                                       ids_size=3 * ROWS + 1 + ROWS * pages)
+            for accepted in (-1, 0, 3, 7, 8):
+                for slot in (0, 1, -1, slots + 2, size + 5):
+                    vector = rng.integers(-2**31, 2**31 - 1, (8, 128), dtype=np.int64).astype(np.int32)
+                    vector[0, OUT_COUNT] = accepted
+                    ids = rng.integers(0, 200000, spec.ids_size).astype(np.int32)
+                    ids[2 * ROWS] = slot
+                    state = rng.integers(-1000, 1000, size).astype(np.int32)
+                    got = kernel_outputs(spec, *map(jnp.asarray, (vector, ids, state)))
+                    want = reference(jnp.asarray(vector[:1]), jnp.asarray(ids), jnp.asarray(state), slots,
+                                     spec.reset)
+                    for g, w in zip(got, want):
+                        assert np.array_equal(np.asarray(g), np.asarray(w)), (slots, accepted, slot)
+        print("OK")
+    """
+
+    LM_RING = """
+        import os
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call as interpreter
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark_mla_kernel as kern
+
+        H, CH, N, T = 512, kern.LM_CHUNK, 9, 8
+
+        def logits(hidden, lm_head, early):
+            def kernel(hidden_ref, lm_hbm, out_ref, gate, up, a, b, sems):
+                def copy(k, slot, slots, sem_of):
+                    return pltpu.make_async_copy(lm_hbm.at[:, pl.ds(k * CH, CH)], slots[slot],
+                                                 sems.at[sem_of[slot]])
+                if early:  # as the kernel: four gate / up halves started first, then the two scoped slots
+                    slots = [buf.at[:, pl.ds(h * CH, CH)] for buf in (gate, up) for h in range(2)] + [a, b]
+                    sem_of = (0, 1, 2, 3, 4, 5)
+                    for k in range(4):
+                        copy(k, k, slots, sem_of).start()
+                else:
+                    slots, sem_of = [a, b], (4, 5)
+                chunks = kern.stream_chunks(lambda k, s: copy(k, s, slots, sem_of), slots, N,
+                                            started=4 if early else 0)
+                for k, slot in chunks:
+                    out_ref[:, pl.ds(k * CH, CH)] = kern._f32(kern._bf16(kern._dot(hidden_ref[...], slot[...])))
+            return np.asarray(pl.pallas_call(
+                kernel,
+                out_shape=jax.ShapeDtypeStruct((T, N * CH), jnp.float32),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM), pl.BlockSpec(memory_space=pl.ANY)],
+                out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                scratch_shapes=[pltpu.VMEM((H, 2 * CH), jnp.bfloat16), pltpu.VMEM((H, 2 * CH), jnp.bfloat16),
+                                pltpu.VMEM((H, CH), jnp.bfloat16), pltpu.VMEM((H, CH), jnp.bfloat16),
+                                pltpu.SemaphoreType.DMA((6,))],
+                interpret=pltpu.InterpretParams(detect_races=True),
+            )(hidden, lm_head))
+
+        rng = np.random.default_rng(0)
+        hidden = jnp.asarray(rng.standard_normal((T, H)), jnp.bfloat16)
+        lm_head = jnp.asarray(rng.standard_normal((H, N * CH)), jnp.bfloat16)
+        two, six = logits(hidden, lm_head, False), logits(hidden, lm_head, True)
+        assert not interpreter.races.races_found
+        assert np.array_equal(two.view(np.uint32), six.view(np.uint32))
+        print("OK")
+    """
+
+    OP = """
+        import os
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import contextlib, dataclasses, sys, types
+        import numpy as np, ml_dtypes, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+
+        # The op bodies as MlaDsparkDraft._build_single registers them (bridge stubbed), the fused kernel a stub
+        # returning one vector and latents: knob on and off must return the same vector, pools, tokens, ids, state.
+        captured = []
+        bridge = types.ModuleType("sglang_tpu.k3_programs.bridge")
+        bridge.register_op = lambda name, mesh, body, ins, outs, donate_argnums=(), export_key=None: (
+            captured.append((body, ins, outs)) or body)
+        bridge.hbm = bridge.kernel_mesh = bridge.materialize = bridge.upload = lambda *a, **k: None
+        sys.modules["sglang_tpu.k3_programs.bridge"] = bridge
+        from sglang_tpu.k3_programs.kimi_k3 import config as kconfig, draft_mla
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark, dspark_mla_kernel as kern, mla_dcp, paged
+
+        G, ROWS, PAGES, L, BLOCKS, PT, SLOTS = 4, 8, 6, 5, 7, 512, 3
+        mla_dcp.GROUPS = (G, 8, 16, 32)
+        stock = pl.pallas_call
+        paged.pl.pallas_call = lambda *a, **k: stock(*a, **{"interpret": pltpu.InterpretParams(), **k})
+        base_config = kconfig.active()
+        for fn in (paged.commit_latent_rows, paged.commit_draft_rows):
+            fn.__kwdefaults__["group"] = G
+
+        class Control:
+            FIELDS, SLOT, RESET = 8, 0, 1
+            def __init__(self, slots, rows, pages):
+                self.slots, self.rows, self.pages = slots, rows, pages
+                self.plan_start = 3 * slots
+                self.size = self.plan_start + rows * (self.FIELDS + pages)
+            def key(self):
+                return self.slots, self.rows, self.pages
+
+        @dataclasses.dataclass(frozen=True)
+        class DraftConfig:
+            layers: int = L
+
+        def run(knob, vector, latents, pools, ids, state, decisions):
+            # The scatter commit as the reference (interpret mode has no aliased HBM refs).
+            config = dataclasses.replace(base_config, draft_fused_epilogue=knob, fused_cache_commit=False)
+            kconfig.active = paged._config = lambda: config
+            stub = types.SimpleNamespace(**{n: getattr(kern, n) for n in (
+                "WEIGHT_NAMES", "LEADING_NAMES", "SingleEpilogue", "single_epilogue")})
+            stub.fused_draft_local = lambda *a, **k: (lambda *args: (jnp.asarray(vector), jnp.asarray(latents)))
+            d = object.__new__(draft_mla.MlaDsparkDraft)
+            d.dspark, d.kernel, d.paged, d.config = dspark, stub, paged, DraftConfig()
+            d.attention_dp, d.max_position, d.owner_table, d._ops, d.mesh = 1, 1 << 20, None, {}, None
+            d.names = ("ln1", "ln2", "q_norm", "kv_norm", "rot")
+            captured.clear()
+            d._build_single(Control(SLOTS, 1, PAGES))
+            body, ins, outs = captured[0]
+            weights = [np.zeros((G, L, 1, 64), ml_dtypes.bfloat16)] * 4 + [np.zeros((G, 64, 64), ml_dtypes.bfloat16)]
+            rest = (np.zeros((3, ROWS, 64), ml_dtypes.bfloat16), np.zeros((G, ROWS, 128), np.float32),
+                    np.zeros((1, 128), np.int32), ids, state, decisions)
+            mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+            f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=ins, out_specs=outs, check_vma=False))
+            out = f(*map(jnp.asarray, (*weights, *pools, *rest)))
+            return [np.asarray(x).view(np.uint8) if x.dtype == jnp.float8_e4m3fn else np.asarray(x) for x in out]
+
+        rng = np.random.default_rng(0)
+        for base, accepted, slot in ((5, 3, 1), (PT - 3, 7, 2), (28, 0, 0), (4 * PT - 4, 5, -1)):
+            vector = rng.integers(0, 160000, (1, 128)).astype(np.int32)
+            vector[0, dspark.OUT_COUNT] = accepted
+            latents = (rng.standard_normal((L, ROWS, 640)) * 2).astype(ml_dtypes.bfloat16)
+            pools = [(rng.integers(0, 256, (G * BLOCKS, 128, 4, 640), dtype=np.uint8) & 0x7E).view(
+                ml_dtypes.float8_e4m3fn) for _ in range(L)]
+            ids = rng.integers(1, BLOCKS, 3 * ROWS + 1 + ROWS * PAGES).astype(np.int32)
+            ids[ROWS], ids[2 * ROWS] = base, slot
+            state = rng.integers(-50, 50, 3 * SLOTS + 8 + PAGES).astype(np.int32)
+            decisions = np.array([[-1, -1]], np.int32)
+            old = run(False, vector, latents, pools, ids, state, decisions)
+            new = run(True, vector, latents, pools, ids, state, decisions)
+            assert len(old) == len(new) == 1 + L + 3
+            for k, (a, b) in enumerate(zip(old, new)):
+                assert a.shape == b.shape and np.array_equal(a, b), (base, k)
+            assert any((o != p.view(np.uint8)).any() for o, p in zip(old[1 : 1 + L], pools))
+        print("OK")
+    """
+
+    def _run(self, script):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(script)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
+
+    def test_single_op_matches_the_xla_op(self):
+        self._run(self.OP)
+
+    def test_commit_draft_rows_matches_the_scatter(self):
+        self._run(self.COMMIT)
+
+    def test_single_epilogue_matches_the_xla_epilogue(self):
+        self._run(self.EPILOGUE)
+
+    def test_lm_ring_matches_two_slots(self):
+        self._run(self.LM_RING)
+
+
 class TestB16OneHotStaging(CustomTestCase):
     """KernelConfig.b16_one_hot_staging: the B16 routed-expert stream stages
     its compact rows with a one-hot product instead of a scalar row scan. In

@@ -156,6 +156,21 @@ class KernelConfig:
     # o_proj whole in VMEM at up to 8 rows and down_proj at up to 16 (attention
     # DP1) instead of streaming them one 896-column chunk at a time.
     draft_whole_weights: bool = False
+    # MLA DSpark single-request draft op (attention DP1): the fused draft
+    # kernel reads the verify's packed ids and the decisions directly (scalar
+    # prefetch) and the layer-norm stacks as [layers, width] (no relayout
+    # copies); one commit kernel reads the rows' positions and block table
+    # from the ids, writes each latent tile its rows touch once
+    # (paged.commit_draft_rows) and computes the step's emitted tokens, next
+    # ids and control state. The op runs two kernels and one convert instead
+    # of ~35 small XLA ops. The same integers and cache bytes (bit-identical).
+    draft_fused_epilogue: bool = False
+    # MLA DSpark drafts: the LM head streams through six chunk slots instead
+    # of two -- the gate / up buffers' halves join the two scoped ones once
+    # the last layer's gate and up products have read them, and the first
+    # four chunks start right then (under the last down_proj all-reduce).
+    # The same products in the same order (bit-identical).
+    draft_lm_prefetch: bool = False
     # Decode MoE router (weight arena, unsharded top-k): every rank copies and
     # projects both router halves, its own and its pair peer's (14 MiB of
     # arena instead of 7), instead of exchanging score halves with the peer.

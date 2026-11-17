@@ -203,6 +203,154 @@ def commit_latent_rows(
     return tuple(pools)
 
 
+def commit_draft_rows(
+    pools,
+    rows,
+    ids,
+    rows_per,
+    pages,
+    pool_map,
+    *,
+    group=mla_dcp.GROUP,
+    owner_table=None,
+    global_pages=None,
+    epilogue=None,
+):
+    """:func:`commit_latent_rows` for one request's DSpark verify rows, read
+    from its packed ids (``MlaDsparkDraft._build_single``): ``rows``
+    ``[layers, rows_per, 640]`` (cast to the pool dtype), row ``r`` at
+    position ``ids[rows_per] + r`` on the block table ``ids[3 rows_per + 1
+    :][:pages]``.
+
+    One non-communicating kernel aliasing the pools computes each row's
+    block and owner as the XLA commit does, reads each latent tile (8 pool
+    rows, ``8 packing`` tokens) its owned rows touch once, merges those rows
+    in VMEM in row order and writes the tile back once -- the bytes
+    ``_commit_latent_rows_fused`` writes with a read, merge and write per
+    row (a verify's consecutive rows share one or two tiles).
+
+    ``epilogue``: ``(scalars, out_shapes, fn)`` -- more scalar operands
+    (SMEM, after ``ids``), SMEM outputs (after the pools) and ``fn(ids,
+    *scalars, *outputs)`` run after the commit; returns ``(*pools,
+    *outputs)``. (XLA copies a communicating kernel's outputs once more on
+    their way out of the program; this kernel's leave as they are.)"""
+    if global_pages is None:
+        global_pages = mla_dcp.GLOBAL_PAGES
+    pools = tuple(pools)
+    layers = len(pool_map)
+    count = len(pools)
+    packing, dtype = pools[0].shape[-2], pools[0].dtype
+    page_tokens = pools[0].shape[-3] * packing
+    tile_tokens = 8 * packing
+    size = pools[0].shape[0]
+    table_start = 3 * rows_per + 1
+    if (
+        rows.shape != (layers, rows_per, 640)
+        or len(set(pool_map)) != layers
+        or not all(0 <= index < count for index in pool_map)
+        or any(pool.shape != pools[0].shape or pool.dtype != dtype for pool in pools)
+        or pools[0].shape[1:] != (128, packing, 640)
+        or ids.shape[0] < table_start + pages
+    ):
+        raise ValueError("commit_draft_rows: unexpected operand shapes")
+
+    scalars, out_shapes, epilogue_fn = epilogue or ((), (), None)
+    extra = len(scalars)
+
+    def kernel(ids_ref, *refs):
+        scalar_refs, (values, *refs) = refs[:extra], refs[extra:]
+        outputs = refs[count : 2 * count]
+        epilogue_out = refs[2 * count : 2 * count + len(out_shapes)]
+        tiles, held, semaphores = refs[2 * count + len(out_shapes) :]
+        member = mla_dcp.owner_index(owner_table) % group
+
+        def tile_copies(target, first, write):
+            copies = []
+            for layer, index in enumerate(pool_map):
+                window = outputs[index].at[target, pl.ds(first, 8)]
+                source, destination = (
+                    (tiles.at[layer], window) if write else (window, tiles.at[layer])
+                )
+                copies.append(
+                    tpu.make_async_copy(source, destination, semaphores.at[layer])
+                )
+            return copies
+
+        def transfer(target, first, write):
+            copies = tile_copies(target, first, write)
+            for item in copies:
+                item.start()
+            for item in copies:
+                item.wait()
+
+        def flush():  # write the held tile back
+            @pl.when(held[0] != 0)
+            def write_back():
+                transfer(held[1], held[2], True)
+                held[0] = 0
+
+        held[0] = 0
+        base = ids_ref[rows_per]
+        token = packing * jax.lax.broadcasted_iota(
+            jnp.int32, (8, packing, 640), 0
+        ) + jax.lax.broadcasted_iota(jnp.int32, (8, packing, 640), 1)
+        for r in range(rows_per):
+            position = base + r
+            page = position // page_tokens
+            entry = page if global_pages else page // group
+            # As XLA's gather, an entry past the table reads its last.
+            entry = jnp.minimum(jnp.maximum(entry, 0), pages - 1)
+            block = ids_ref[table_start + entry]
+            target = jnp.where(block < 0, block + size, block)
+            owned = (page % group == member) & (target >= 0) & (target < size)
+            first = pl.multiple_of(position % page_tokens // tile_tokens * 8, 8)
+
+            @pl.when(owned)
+            def merge_row(r=r, position=position, target=target, first=first):
+                same = (held[0] != 0) & (held[1] == target) & (held[2] == first)
+
+                @pl.when(jnp.logical_not(same))
+                def load():
+                    flush()
+                    transfer(target, first, False)
+                    held[0] = 1
+                    held[1] = target
+                    held[2] = first
+
+                for layer in range(layers):
+                    tiles[layer] = jnp.where(
+                        token == position % tile_tokens,
+                        values[layer, r][None, None, :],
+                        tiles[layer],
+                    )
+
+        flush()
+        if epilogue_fn is not None:
+            epilogue_fn(ids_ref, *scalar_refs, *epilogue_out)
+
+    return tuple(
+        pl.pallas_call(
+            kernel,
+            out_shape=tuple(jax.ShapeDtypeStruct(p.shape, p.dtype) for p in pools)
+            + tuple(out_shapes),
+            grid_spec=tpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1 + extra,
+                in_specs=(pl.BlockSpec(memory_space=tpu.VMEM),)
+                + (pl.BlockSpec(memory_space=pl.ANY),) * count,
+                out_specs=(pl.BlockSpec(memory_space=pl.ANY),) * count
+                + (pl.BlockSpec(memory_space=tpu.SMEM),) * len(out_shapes),
+                scratch_shapes=(
+                    tpu.VMEM((layers, 8, packing, 640), dtype),
+                    tpu.SMEM((3,), jnp.int32),
+                    tpu.SemaphoreType.DMA((layers,)),
+                ),
+            ),
+            input_output_aliases={2 + extra + i: i for i in range(count)},
+            name="kimi_commit_draft_rows",
+        )(ids, *scalars, rows.astype(dtype), *pools)
+    )
+
+
 # The fused DSA commit's runs (a verify's consecutive tokens) and the runs of
 # distinct blocks it keeps in flight together.
 _RUN_ROWS = 8

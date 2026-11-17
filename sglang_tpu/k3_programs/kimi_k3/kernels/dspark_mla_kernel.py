@@ -32,6 +32,7 @@ pools (``paged.commit_latent_rows``).
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import jax
@@ -111,6 +112,76 @@ HBM_NAMES = (
 )
 WEIGHT_NAMES = VMEM_NAMES + HBM_NAMES
 SMALL_NAMES = ("aux", "previous") + VMEM_NAMES
+# The layer-norm stacks ``[layers, 1, width]``. XLA lays their unit axis out
+# of the tiled dims, so passing them as such costs a relayout copy per weight
+# per call; a single-request op (``SingleEpilogue``) passes them as ``[layers,
+# width]`` (a bitcast of that layout) and the kernel reads row ``layer``.
+LEADING_NAMES = ("ln1", "ln2", "q_norm", "kv_norm")
+
+
+@dataclasses.dataclass(frozen=True)
+class SingleEpilogue:
+    """A single-request draft op's control layout (``decode_ops.Control``,
+    plan row 0). With it the fused kernel reads ``MlaDsparkDraft.
+    _build_single``'s packed ``ids`` (``[tokens | positions | slots |
+    accepted | tables]``, one entry per verify row, then a block-table row
+    each) and the decisions directly, and ``single_epilogue`` computes the
+    op's emitted tokens, next ids and control state in a kernel (the draft
+    commit's, ``paged.commit_draft_rows``)."""
+
+    slots: int  # control banks: tokens | positions | rows, one entry a slot
+    reset: int  # the control state index of plan row 0's reset flag
+    state_size: int
+    ids_size: int
+
+
+def single_epilogue(spec, rows, ids, state_in, vector, emitted, following, state_out):
+    """``MlaDsparkDraft._build_single``'s step outputs as SMEM scalar code:
+    ``ids`` and ``state_in`` the op's packed ids and control state, ``vector``
+    the step's output vector ``[1+, 128]`` (``OUT_*`` lanes); writes
+    ``emitted`` ``[1, rows]`` (the accepted drafts, then the bonus token,
+    then -1), ``following`` (the next verify's ids: the bonus and the drafts,
+    their positions, the slots, the accepted count, the tables) and
+    ``state_out`` (the slot's token, position and row entries; plan row 0's
+    reset flag cleared on a live slot). The control writes are XLA's
+    ``.at[i].set``: a negative slot index wraps, one out of range is dropped,
+    and they land in the same order."""
+    accepted = vector[0, OUT_COUNT]
+    bonus = vector[0, OUT_BONUS]
+    base, slot = ids[rows], ids[2 * rows]
+    for r in range(rows):
+        emitted[0, r] = jnp.where(
+            r < accepted,
+            ids[min(r + 1, rows - 1)],
+            jnp.where(r == accepted, bonus, jnp.int32(-1)),
+        )
+    following[0] = bonus
+    for j in range(rows - 1):
+        following[1 + j] = vector[0, OUT_DRAFTS + j]
+    for r in range(rows):
+        following[rows + r] = base + accepted + 1 + r
+        following[2 * rows + r] = ids[2 * rows + r]
+    following[3 * rows] = accepted
+
+    @pl.loop(3 * rows + 1, spec.ids_size)
+    def copy_tables(k):
+        following[k] = ids[k]
+
+    @pl.loop(0, spec.state_size)
+    def copy_state(k):
+        state_out[k] = state_in[k]
+
+    def put(index, value):
+        index = jnp.where(index < 0, index + spec.state_size, index)
+
+        @pl.when((index >= 0) & (index < spec.state_size))
+        def store():
+            state_out[index] = value
+
+    put(slot, bonus)
+    put(spec.slots + slot, base + accepted + 1)
+    put(2 * spec.slots + slot, accepted)
+    state_out[spec.reset] = jnp.where(slot != 0, 0, state_out[spec.reset])
 
 
 class _Scalars:
@@ -122,6 +193,24 @@ class _Scalars:
 
     def __getitem__(self, index):
         return self.ref[self.offset + (index // self.rows if self.rows > 1 else index)]
+
+
+def stream_chunks(chunk_copy, slots, chunks, started=0):
+    """Stream ``chunks`` weight chunks through the ``slots`` ring: chunk ``k``
+    lands in slot ``k % len(slots)`` (``chunk_copy(k, slot)``: its copy; the
+    first ``started`` copies are already in flight). Yields ``(k, slot ref)``
+    once chunk ``k`` has landed and refills that slot with chunk ``k +
+    len(slots)`` when the consumer resumes it (after its reads)."""
+    ring = len(slots)
+    copies = [chunk_copy(k, k % ring) for k in range(min(ring, chunks))]
+    for item in copies[started:]:
+        item.start()
+    for k in range(chunks):
+        copies[k % ring].wait()
+        yield k, slots[k % ring]
+        if k + ring < chunks:
+            copies[k % ring] = chunk_copy(k + ring, k % ring)
+            copies[k % ring].start()
 
 
 def _rope(x_bf16, rot_bf16, cos32, sin32):
@@ -200,6 +289,7 @@ def _make_body(
     owner_table,
     plan: dict,
     dp: int = 1,
+    single: SingleEpilogue | None = None,
 ):
     R = requests
     T = R * rows
@@ -220,6 +310,7 @@ def _make_body(
     n_scoped = len(mla_dcp.SCOPED_NAMES)
 
     SEM_FC, SEM_W2T, SEM_OWN, SEM_LM = 1, 8, 9, 11  # 10: unused
+    lm_prefetch = _config().draft_lm_prefetch
     SEM_EMBED = 12  # + j
     SEM_ROPE = 12 + R  # + 2 j (+1)
     SEM_W1 = 12 + 3 * R  # + slot R + j
@@ -232,8 +323,12 @@ def _make_body(
         18 + 5 * R,
     )  # streamed o / down: the second chunk slot
 
-    def body(scalars, aux_hbm, logits_hbm, previous_hbm, *refs):
-        refs = list(refs)
+    def body(*args):
+        if single is None:
+            scalars, aux_hbm, logits_hbm, previous_hbm, *refs = args
+            ids = decisions = None
+        else:
+            ids, decisions, aux_hbm, logits_hbm, previous_hbm, *refs = args
         weights = dict(zip(WEIGHT_NAMES, refs[: len(WEIGHT_NAMES)], strict=True))
         refs = refs[len(WEIGHT_NAMES) :]
         pools = tuple(refs[:L])
@@ -242,6 +337,13 @@ def _make_body(
         scratch = refs[2:]
         small = dict(zip(SMALL_NAMES, scratch[: len(SMALL_NAMES)], strict=True))
         scratch = scratch[len(SMALL_NAMES) :]
+
+        def norm_row(name, layer):
+            """Layer ``layer``'s ``[1, width]`` row of a layer-norm stack
+            (``[layers, 1, width]``, or ``[layers, width]``: LEADING_NAMES)."""
+            ref = small[name]
+            return ref[layer] if len(ref.shape) == 3 else ref[layer : layer + 1, :]
+
         persistent = scratch[:n_persist]
         dcp_scoped = scratch[n_persist : n_persist + n_scoped]
         (
@@ -304,11 +406,18 @@ def _make_body(
                 [jnp.where(data_group == g, value, zeros) for g in range(dp)], axis=0
             )
 
-        new_position = jnp.stack(
-            [scalars[j] for j in range(R)]
-        )  # [R]: the verify's first position
-        forced_count = jnp.stack([scalars[R + j] for j in range(R)])
-        forced_anchor = jnp.stack([scalars[2 * R + j] for j in range(R)])
+        if single is None:
+            new_position = jnp.stack(
+                [scalars[j] for j in range(R)]
+            )  # [R]: the verify's first position
+            forced_count = jnp.stack([scalars[R + j] for j in range(R)])
+            forced_anchor = jnp.stack([scalars[2 * R + j] for j in range(R)])
+            table_scalars = _Scalars(scalars, 3 * R)
+        else:  # one request: the packed ids and decisions
+            new_position = jnp.stack([ids[rows]])
+            forced_count = jnp.stack([decisions[0, 0]])
+            forced_anchor = jnp.stack([decisions[0, 1]])
+            table_scalars = _Scalars(ids, 3 * rows + 1)
 
         # ---------------- DMA and collective helpers ----------------
         def copy(src, dst, sem):
@@ -773,7 +882,7 @@ def _make_body(
         def latent_rows(kv_bf16, layer, cos32, sin32):
             """``[T, 640]`` BF16 cache rows: kv_a_layernorm(c_kv) | RoPE(k_pe) | 0."""
             c_kv = _rms_norm(
-                kv_bf16[:, : c.kv_lora], small["kv_norm"][layer][:, : c.kv_lora], eps
+                kv_bf16[:, : c.kv_lora], norm_row("kv_norm", layer)[:, : c.kv_lora], eps
             )
             k_pe = _rope(
                 kv_bf16[:, c.kv_lora : c.latent], small["rot"][...], cos32, sin32
@@ -804,13 +913,18 @@ def _make_body(
         # ---------------- DCP attention over the draft pools ----------------
         # Attention DP: the group's rows over its pages (DCP over the group).
         first_request = data_group * group_requests if dp > 1 else 0
+        position_scalars = (
+            _Scalars(scalars, first_request, rows)
+            if single is None
+            else _Scalars(ids, rows, rows)  # one request: its verify's first position
+        )
         page_owner = None
         if owner_table is not None:
             page_owner = mla_dcp.owner_index(owner_table)
             page_owner = page_owner % mla_dcp.GROUP if dp > 1 else page_owner
         cache = mla_dcp.DcpCache(
             pool_ref=pools,
-            table_ref=_Scalars(scalars, 3 * R),
+            table_ref=table_scalars,
             pages=pages,
             layer=jnp.int32(0),
             group=mla_dcp.GROUP,
@@ -859,10 +973,32 @@ def _make_body(
             if layer + 1 < L:
                 pending[name] = layer_copy(name, layer + 1)
 
+        # KernelConfig.draft_lm_prefetch: the LM head's chunk slots beyond the
+        # two scoped ones -- the gate / up buffers' halves ([hidden, 512]
+        # each, two chunks), each on a semaphore idle after the last layer's
+        # loads (gate, up; 10 is unused; q_b's).
+        early_slots = (
+            [
+                buffer.at[:, pl.ds(half * LM_CHUNK, LM_CHUNK)]
+                for buffer in (gate_buf, up_buf)
+                for half in range(MLP_PADDED // LM_CHUNK)
+            ]
+            if lm_prefetch
+            else []
+        )
+        early_sems = (6, 10, 7, 2)[: len(early_slots)]
+
+        def lm_slot_copy(k, slots, sems=early_sems):
+            return copy(
+                weights["lm_head"].at[:, pl.ds(k * LM_CHUNK, LM_CHUNK)],
+                slots[k % len(slots)],
+                sems[k % len(slots)],
+            )
+
         _phase_end(scope)
         for layer in range(L):
             scope = _phase_start("d_qkv")
-            h = _rms_norm(x, small["ln1"][layer], eps)
+            h = _rms_norm(x, norm_row("ln1", layer), eps)
             slot = layer % 2
             tile_copies[slot].wait()
             tiles = gather_tiles(
@@ -874,7 +1010,7 @@ def _make_body(
             q_a = _bf16(jnp.concatenate(tiles[:Q_TILES], axis=1))  # [T, 1536]
             block_kv = _bf16(jnp.concatenate(tiles[Q_TILES:], axis=1))  # [T, 640]
             q_c = own_group(
-                _rms_norm(q_a, small["q_norm"][layer], eps)
+                _rms_norm(q_a, norm_row("q_norm", layer), eps)
             )  # [group rows, 1536]
             block_latents = own_group(
                 latent_rows(block_kv, layer, cos_block, sin_block)
@@ -928,7 +1064,7 @@ def _make_body(
             attention = mla_dcp.DcpAttention(
                 dataclasses_replace(cache, layer=jnp.int32(layer)),
                 workspace,
-                _Scalars(scalars, first_request, rows),
+                position_scalars,
                 group_rows,
                 sequence_rows=rows,
                 heads=heads,
@@ -977,13 +1113,18 @@ def _make_body(
 
             _phase_end(scope)
             scope = _phase_start("d_mlp")
-            h2 = _rms_norm(x, small["ln2"][layer], eps)
+            h2 = _rms_norm(x, norm_row("ln2", layer), eps)
             pending["gate"].wait()
             pending["up"].wait()
             gate = _f32(_bf16(_dot(h2, gate_buf[...])))
             up = _bf16(_dot(h2, up_buf[...]))
             refill("gate", layer)
             refill("up", layer)
+            if lm_prefetch and layer == L - 1:
+                # KernelConfig.draft_lm_prefetch: the LM head's first chunks
+                # into the gate / up halves, now free.
+                for k in range(len(early_slots)):
+                    lm_slot_copy(k, early_slots).start()
             activation = _bf16(_f32(_bf16(gate * jax.nn.sigmoid(gate))) * _f32(up))
             _phase_end(scope)
             scope = _phase_start("d_down")
@@ -1019,8 +1160,22 @@ def _make_body(
                     copies[k % 2] = chunk_copy(k + 2)
                 logits_vmem[:, pl.ds(k * LM_CHUNK, LM_CHUNK)] = logits
 
+        def lm_ring_phase(chunk_a, chunk_b):
+            # Six slots: the four early ones (in flight since the last
+            # layer's MLP), then the two scoped ones; chunk k in slot k % 6.
+            slots = early_slots + [chunk_a, chunk_b]
+            sems = early_sems + (SEM_LM, SEM_LM2)
+            for k, slot in stream_chunks(
+                lambda k, _: lm_slot_copy(k, slots, sems),
+                slots,
+                LM_CHUNKS,
+                started=len(early_slots),
+            ):
+                logits = _f32(_bf16(_dot(hidden_rows, slot[...])))
+                logits_vmem[:, pl.ds(k * LM_CHUNK, LM_CHUNK)] = logits
+
         pl.run_scoped(
-            lm_phase,
+            lm_ring_phase if lm_prefetch else lm_phase,
             tpu.VMEM((hidden, LM_CHUNK), jnp.bfloat16),
             tpu.VMEM((hidden, LM_CHUNK), jnp.bfloat16),
         )
@@ -1100,11 +1255,17 @@ def fused_draft_local(
     rows: int = ROWS,
     owner_table=None,
     attention_dp: int = 1,
+    single: SingleEpilogue | None = None,
 ):
     """The per-shard fused draft (call inside a TP32 ``shard_map``):
     ``(weights, pools, aux, logits, previous, positions0, forced_counts,
     forced_anchors, tables)`` -> ``(vectors [R, 128] int32, latents [layers,
     T, 640] bf16)``.
+
+    ``single`` (one request, attention DP1; ``KernelConfig.
+    draft_fused_epilogue``): ``(weights, pools, aux, logits, previous, ids,
+    decisions)`` (the op's packed ids, see ``SingleEpilogue``), the
+    layer-norm stacks (``LEADING_NAMES``) as ``[layers, width]``.
 
     Under ``attention_dp`` (DCP over each group, ``mla_dcp.GROUP``) the first
     ``R / dp`` requests are group 0's, and so on: a rank attends its group's
@@ -1134,6 +1295,8 @@ def fused_draft_local(
         raise ValueError(
             f"attention DP{dp}: {R} requests over DCP{mla_dcp.GROUP} groups"
         )
+    if single is not None and (R != 1 or dp != 1):
+        raise ValueError("the single-request epilogue takes one request at DP1")
     heads, group_rows = c.heads_per_rank * dp, T // dp
     packed = T * CHUNK // 256
     # The body streams o / down iff their buffers hold two chunk slots.
@@ -1141,17 +1304,11 @@ def fused_draft_local(
         c, T, dp, _config().draft_whole_weights
     )
 
-    def call(
-        weights,
-        pools,
-        aux,
-        logits,
-        previous,
-        position,
-        forced_count,
-        forced_anchor,
-        tables,
-    ):
+    def call(weights, pools, aux, logits, previous, *operands):
+        if single is None:
+            position, forced_count, forced_anchor, tables = operands
+        else:
+            ids, decisions = operands
         pools = tuple(pools)
         logits = logits.reshape(T, c.vocab // RANKS).astype(jnp.float32)
         cache_dtype = pools[0].dtype
@@ -1162,9 +1319,14 @@ def fused_draft_local(
         plan = mla_dcp.page_plan(
             group_rows, heads, rows, cache_dtype, force_chunks=chunks
         )
-        scalars = jnp.concatenate(
-            (position, forced_count, forced_anchor, tables.reshape(-1))
-        ).astype(jnp.int32)
+        if single is None:
+            prefetch = (
+                jnp.concatenate(
+                    (position, forced_count, forced_anchor, tables.reshape(-1))
+                ).astype(jnp.int32),
+            )
+        else:
+            prefetch = (ids, decisions)
         small_shapes = {"aux": aux, "previous": previous, **weights}
         # FP8 caches: FP8 query packets (the operand the receiver would
         # quantize to anyway), half the gather's bytes.
@@ -1254,28 +1416,32 @@ def fused_draft_local(
             tpu.SemaphoreType.DMA((2 * SEMS_PER_SLOT,)),
             tpu.SemaphoreType.DMA((2 * SEMS_PER_SLOT,)),
         )
-        body = _make_body(c, block, R, rows, pages, owner_table, plan, dp)
+        out_shape = (
+            jax.ShapeDtypeStruct((R, 128), jnp.int32),
+            jax.ShapeDtypeStruct((c.layers, T, LANES), jnp.bfloat16),
+        )
+        out_specs = [
+            pl.BlockSpec(memory_space=tpu.HBM),
+            pl.BlockSpec(memory_space=tpu.HBM),
+        ]
+        if single is not None and ids.shape != (single.ids_size,):
+            raise ValueError("the single-request ids size")
+        body = _make_body(c, block, R, rows, pages, owner_table, plan, dp, single)
         operands = (aux, logits, previous, *[weights[n] for n in WEIGHT_NAMES], *pools)
         in_specs = [pl.BlockSpec(memory_space=tpu.HBM) for _ in operands]
         return pl.pallas_call(
             body,
             name="dspark_mla_fused_draft",
-            out_shape=(
-                jax.ShapeDtypeStruct((R, 128), jnp.int32),
-                jax.ShapeDtypeStruct((c.layers, T, LANES), jnp.bfloat16),
-            ),
+            out_shape=out_shape,
             grid_spec=tpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=1,
+                num_scalar_prefetch=len(prefetch),
                 in_specs=in_specs,
-                out_specs=[
-                    pl.BlockSpec(memory_space=tpu.HBM),
-                    pl.BlockSpec(memory_space=tpu.HBM),
-                ],
+                out_specs=out_specs,
                 scratch_shapes=scratch,
             ),
             compiler_params=tpu.CompilerParams(
                 collective_id=26, vmem_limit_bytes=64 * 1024**2
             ),
-        )(scalars, *operands)
+        )(*prefetch, *operands)
 
     return call
