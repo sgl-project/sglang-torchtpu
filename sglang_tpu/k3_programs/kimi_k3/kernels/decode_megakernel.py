@@ -206,6 +206,14 @@ def _project_routing_scores(
 # the router's ownership test uses expert_steal.owned_expert_group. The
 # scheduled B8/B16 steps also run the steal itself (_ExpertStealStep).
 EXPERT_STEAL = _config().expert_steal
+# The steal plan's timing model (expert_steal.modelled_moves) per batch size,
+# in tenths of one expert's stream time: a slab's push to the sibling, the
+# plan-to-stream lead, a slab's staging copy, the returns' latency. B8 from
+# the B1 x7 profile (an expert ~2.45 us; two slabs land 14.2 us after the
+# plan, the stream starts ~3.1 us after it, a staging copy ~1.2 us, the
+# returns reach the giver ~1.5 us after the receiver's stream); B16 scaled
+# to its ~3 us experts (four slabs land in 26.7 us; four returns).
+STEAL_TIMING = {8: (29, 13, 5, 6), 16: (22, 11, 4, 8)}
 # The steal's persistent scratch (expert_steal.scratch_shapes).
 STEAL_PERSISTENT_NAMES = (
     "steal packets",
@@ -2785,6 +2793,7 @@ class _ExpertStealStep:
             self.group,
             self.local_expert_count,
             self.slots,
+            STEAL_TIMING.get(batch_size),
         )
 
     def begin(self, planner, tag, plan=None):

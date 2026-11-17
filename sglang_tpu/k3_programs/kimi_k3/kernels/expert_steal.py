@@ -143,9 +143,19 @@ class StealPlanner:
     :meth:`routes` gives the local routes from the codes with elementwise ops.
     """
 
-    def __init__(self, batch_size, top_k, live_rows, group, local_expert_count, slots):
+    def __init__(
+        self,
+        batch_size,
+        top_k,
+        live_rows,
+        group,
+        local_expert_count,
+        slots,
+        timing=None,
+    ):
         self.top_k, self.live_rows, self.group = top_k, live_rows, group
         self.local_expert_count, self.slots = local_expert_count, slots
+        self.timing = timing
         self.lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
         self.route_slots = jax.lax.broadcasted_iota(jnp.int32, (1, top_k), 1)
         self.mine = jnp.zeros((batch_size, 128), jnp.bool_)
@@ -181,7 +191,9 @@ class StealPlanner:
 
     def plan(self):
         """The core whose group routes more distinct experts gives its
-        ``(D_mine - D_sibling) // 2`` highest-id ones (at most ``slots``)."""
+        highest-id ones: ``(D_mine - D_sibling) // 2`` (at most ``slots``),
+        or with ``timing`` the count that its timing model finishes first
+        (:func:`modelled_moves`)."""
         lanes = self.lanes.astype(jnp.float32)
         # Lane counts and ids below 128: exact FP32 reductions.
         used_mine = jnp.any(self.mine, axis=0, keepdims=True).astype(jnp.float32)
@@ -189,7 +201,7 @@ class StealPlanner:
         d_mine = jnp.sum(used_mine).astype(jnp.int32)
         d_theirs = jnp.sum(used_theirs).astype(jnp.int32)
         difference = d_mine - d_theirs
-        moved = jnp.minimum(jnp.abs(difference) // 2, self.slots)
+        moved = modelled_moves(d_mine, d_theirs, self.slots, self.timing)
         giving = (difference > 0).astype(jnp.float32)
         heavy = used_theirs + giving * (used_mine - used_theirs)
         candidates = jnp.where(heavy > 0, lanes, -1.0)
@@ -236,6 +248,37 @@ class StealPlanner:
         )
         counts = jnp.where(jnp.any(owned, axis=1), self.top_k, 0)
         return experts, self.probabilities, counts
+
+
+def modelled_moves(d_mine, d_theirs, slots, timing=None):
+    """How many experts the heavier core gives (works on scalars or numpy).
+
+    Without ``timing``: ``|D_mine - D_theirs| // 2``, at most ``slots``. With
+    ``timing`` = (slab, lead, copy, back), in tenths of one expert's stream
+    time: the k <= that bound whose modelled layer end is earliest, fewer on
+    ties. The giver ends after ``D_heavy - k`` experts; the receiver after
+    its ``D_light`` own experts or, if later, when the k slabs have landed
+    (``slab * k`` after the plan, ``lead`` of it before its stream starts)
+    and been copied in (``copy * k``), then the k stolen experts, and its
+    returns reach the giver ``back`` after that."""
+    bound = abs(d_mine - d_theirs) // 2
+    moved = min(bound, slots) if isinstance(bound, int) else jnp.minimum(bound, slots)
+    if timing is None:
+        return moved
+    slab, lead, copy, back = timing
+    maximum, minimum, where = (
+        (max, min, lambda c, a, b: a if c else b)
+        if isinstance(bound, int)
+        else (jnp.maximum, jnp.minimum, jnp.where)
+    )
+    light, heavy = minimum(d_mine, d_theirs), maximum(d_mine, d_theirs)
+    moved, best = 0, 10 * heavy
+    for count in range(1, slots + 1):
+        receiver = maximum(10 * light, (slab + copy) * count - lead)
+        cost = maximum(receiver + 10 * count + back, 10 * (heavy - count))
+        better = (count <= bound) & (cost < best)
+        moved, best = where(better, count, moved), where(better, cost, best)
+    return moved
 
 
 def steal_plan(winners, live_rows, group, local_expert_count, slots):

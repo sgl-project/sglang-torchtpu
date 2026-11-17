@@ -93,17 +93,20 @@ def _routing(batch, seed):
     return winners, probabilities, totals, live, latents
 
 
-def _plan(winners, live, group, slots):
+def _plan(winners, live, group, slots, timing):
     """The host plan of one core: (distinct own, distinct sibling, give, take,
-    given ids ascending)."""
+    given ids ascending), with the decode megakernel's timing model."""
+    from sglang_tpu.k3_programs.kimi_k3.kernels import expert_steal as es
+
     routed = winners[live > 0].ravel()
     used = [
         sorted({int(e) % GROUP_EXPERTS for e in routed if e // GROUP_EXPERTS == g})
         for g in (group, group ^ 1)
     ]
     d_mine, d_theirs = len(used[0]), len(used[1])
-    give = min(max(d_mine - d_theirs, 0) // 2, slots)
-    take = min(max(d_theirs - d_mine, 0) // 2, slots)
+    moved = es.modelled_moves(d_mine, d_theirs, slots, timing)
+    give = moved if d_mine > d_theirs else 0
+    take = moved if d_theirs > d_mine else 0
     return d_mine, d_theirs, give, take, used[0][len(used[0]) - give :]
 
 
@@ -341,7 +344,10 @@ def _child(mode, batch):
     print(f"reference routes match the router's ownership: {ok}", flush=True)
     coverage = set()
     for layer in range(LAYERS):
-        plans = [_plan(winners[layer], live[layer], core, slots) for core in (0, 1)]
+        plans = [
+            _plan(winners[layer], live[layer], core, slots, dmk.STEAL_TIMING[batch])
+            for core in (0, 1)
+        ]
         gives = [int(info[core, layer, 0]) for core in (0, 1)]
         received = [int(info[core, layer, 1]) for core in (0, 1)]
         exact = all(
