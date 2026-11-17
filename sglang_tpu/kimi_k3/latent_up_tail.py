@@ -52,8 +52,9 @@ def active() -> bool:
 
 
 def record_aggregation(bank: torch.Tensor, nvb: int) -> None:
-    _STATE.agg.clear()
-    _STATE.agg.append((bank, nvb))
+    # Replace the previous record without reading its list state. Mutating it
+    # makes Dynamo specialize on empty at warmup and nonempty on the next call.
+    _STATE.agg = [(bank, nvb)]
 
 
 def take_normed(prefix_a, prefix_b, nvb, out_norm) -> Optional[torch.Tensor]:

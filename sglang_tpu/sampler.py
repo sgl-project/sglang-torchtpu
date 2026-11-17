@@ -609,8 +609,13 @@ class TpuSampler(Sampler):
             tp_group = parallel.attn_tp_group
         else:
             tp_group = parallel.tp_group
-        # Broadcast, not MIN all-reduce: TPU has no MIN all-reduce.
-        tp_group.broadcast(batch_next_token_ids, src=0)
+        # As in SpecTpSync, deferred in-place broadcasts can return corrupted
+        # tokens or hang. Materialize this collective without changing the
+        # surrounding sampling mode, tensor dtype, or caller-owned storage.
+        from torch_tpu._internal import execution_mode
+
+        with execution_mode.set_eager_mode(execution_mode.EagerMode.DEFER_NEVER):
+            tp_group.broadcast(batch_next_token_ids, src=0)
 
     def _sample_from_probs(
         self,
