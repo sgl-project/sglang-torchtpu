@@ -133,9 +133,16 @@ class SingleEpilogue:
     reset: int  # the control state index of plan row 0's reset flag
     state_size: int
     ids_size: int
+    # KernelConfig.draft_verify_packet: plan row 0's ``fields`` control
+    # entries from index ``plan``, which the next verify's packet carries
+    # after the ids (``fields`` 0: no packet).
+    plan: int = 0
+    fields: int = 0
 
 
-def single_epilogue(spec, rows, ids, state_in, vector, emitted, following, state_out):
+def single_epilogue(
+    spec, rows, ids, state_in, vector, emitted, following, state_out, packet=None
+):
     """``MlaDsparkDraft._build_single``'s step outputs as SMEM scalar code:
     ``ids`` and ``state_in`` the op's packed ids and control state, ``vector``
     the step's output vector ``[1+, 128]`` (``OUT_*`` lanes); writes
@@ -145,7 +152,10 @@ def single_epilogue(spec, rows, ids, state_in, vector, emitted, following, state
     ``state_out`` (the slot's token, position and row entries; plan row 0's
     reset flag cleared on a live slot). The control writes are XLA's
     ``.at[i].set``: a negative slot index wraps, one out of range is dropped,
-    and they land in the same order."""
+    and they land in the same order. ``packet`` (``spec.fields``): the next
+    verify's packed operand as ``DecodeOps._build_verify_metadata`` builds
+    it from ``following``, ``state_out`` and verify mode 1 -- ``following``,
+    then ``state_out``'s plan row 0, then 1."""
     accepted = vector[0, OUT_COUNT]
     bonus = vector[0, OUT_BONUS]
     base, slot = ids[rows], ids[2 * rows]
@@ -155,17 +165,23 @@ def single_epilogue(spec, rows, ids, state_in, vector, emitted, following, state
             ids[min(r + 1, rows - 1)],
             jnp.where(r == accepted, bonus, jnp.int32(-1)),
         )
-    following[0] = bonus
+    outs = (following,) if packet is None else (following, packet)
+
+    def put_ids(index, value):
+        for out in outs:
+            out[index] = value
+
+    put_ids(0, bonus)
     for j in range(rows - 1):
-        following[1 + j] = vector[0, OUT_DRAFTS + j]
+        put_ids(1 + j, vector[0, OUT_DRAFTS + j])
     for r in range(rows):
-        following[rows + r] = base + accepted + 1 + r
-        following[2 * rows + r] = ids[2 * rows + r]
-    following[3 * rows] = accepted
+        put_ids(rows + r, base + accepted + 1 + r)
+        put_ids(2 * rows + r, ids[2 * rows + r])
+    put_ids(3 * rows, accepted)
 
     @pl.loop(3 * rows + 1, spec.ids_size)
     def copy_tables(k):
-        following[k] = ids[k]
+        put_ids(k, ids[k])
 
     @pl.loop(0, spec.state_size)
     def copy_state(k):
@@ -182,6 +198,10 @@ def single_epilogue(spec, rows, ids, state_in, vector, emitted, following, state
     put(spec.slots + slot, base + accepted + 1)
     put(2 * spec.slots + slot, accepted)
     state_out[spec.reset] = jnp.where(slot != 0, 0, state_out[spec.reset])
+    if packet is not None:
+        for f in range(spec.fields):
+            packet[spec.ids_size + f] = state_out[spec.plan + f]
+        packet[spec.ids_size + spec.fields] = jnp.int32(1)
 
 
 class _Scalars:

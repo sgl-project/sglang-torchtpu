@@ -198,6 +198,14 @@ class KernelConfig:
     # ids and control state. The op runs two kernels and one convert instead
     # of ~35 small XLA ops. The same integers and cache bytes (bit-identical).
     draft_fused_epilogue: bool = False
+    # DSpark verify operand packing (DecodeOps._build_verify_metadata: the
+    # ids, the plan rows and the verify modes in one operand) folded into the
+    # op before the verify: the MLA single-request draft op also returns the
+    # next verify's packet with verify mode 1 (a continuing request whose
+    # plan is unchanged and whose scheduler took all eight rows verifies
+    # from it), and the batched enter op returns its packet beside the ids.
+    # One small program fewer a step; the same packet (bit-identical).
+    draft_verify_packet: bool = False
     # MLA DSpark drafts: the LM head streams through six chunk slots instead
     # of two -- the gate / up buffers' halves join the two scoped ones once
     # the last layer's gate and up products have read them, and the first
