@@ -1394,7 +1394,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     moe_runner_backend = view.moe_runner_backend
     if (
         moe_runner_backend
-        in ("pallas_tpu", "pallas_tpu_fused_rs", "pallas_tpu_fused_decode")
+        in (
+            "pallas_tpu",
+            "pallas_tpu_fused_rs",
+            "pallas_tpu_fused_decode",
+            "pallas_tpu_fused_ep_push",
+        )
         and view.device != "tpu"
     ):
         raise ValueError(

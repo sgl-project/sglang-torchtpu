@@ -37,6 +37,19 @@ CONFIG["server_args"].update(
         # 1024-token prefills stall all 8 ranks' spec decode; batching them
         # takes c64 from 1004 to 1900 tok/s.
         "enable_prefill_delayer": True,
+        # Target MoE on the push-dispatch fused EP kernel (fused_ep_push_moe.py).
+        "moe_runner_backend": "pallas_tpu_fused_ep_push",
+        # The draft's MoE stays on gmm_v2; push is not validated for it yet.
+        "speculative_moe_runner_backend": "pallas_tpu",
     }
 )
-CONFIG["runtime_env"].update({"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1"})
+CONFIG["runtime_env"].update(
+    {
+        "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
+        # The push kernel's SparseCore pre-push and in-kernel remote DMAs need
+        # these at libtpu startup (test_fused_ep_moe_push.py sets the same).
+        "LIBTPU_INIT_ARGS": CONFIG["runtime_env"]["LIBTPU_INIT_ARGS"]
+        + " --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0"
+        " --xla_mosaic_unsafe_allow_multicore_remote_dma=true",
+    }
+)
