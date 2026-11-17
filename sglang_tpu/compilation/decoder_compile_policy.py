@@ -645,8 +645,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         buckets = set()
         for bucket in self.t_bucketer.buckets:
             if bucket < cap:
-                continue 
-            # Round up to whole row units, but not past max_bucket. 
+                continue
+            # Round up to whole row units, but not past max_bucket.
             buckets.add(min(round_up(bucket, row_unit), max_bucket))
         if max_bucket < cap or not buckets:
             raise ValueError(
