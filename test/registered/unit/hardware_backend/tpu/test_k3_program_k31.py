@@ -4233,6 +4233,171 @@ print("OK")
         )
 
 
+class TestCopyFreeWeights(CustomTestCase):
+    """KernelConfig.decode_copy_free_weights: ``rank_loader.copy_free_families``
+    holds the norm stacks' BF16 values in FP32 and the KDA filter, decay rate
+    and time-step bias as FP32 [layers, 1, width] rows; in Pallas interpret
+    mode the kernel's reads of those rows (``_kda_filter``, ``_kda_heads``)
+    and its FP32 norm products give the knob-off values bit for bit."""
+
+    def _families(self, rng):
+        import ml_dtypes
+
+        bf16 = ml_dtypes.bfloat16
+        return {
+            "attn_norm": rng.standard_normal((5, 1, 7168)).astype(bf16),
+            "ffn_norm": rng.standard_normal((5, 1, 7168)).astype(bf16),
+            "m_qnorm": rng.standard_normal((2, 1, 1536)).astype(bf16),
+            "m_knorm": rng.standard_normal((2, 1, 512)).astype(bf16),
+            "final_norm": rng.standard_normal((1, 7168)).astype(bf16),
+            "k_conv": rng.standard_normal((3, 4, 3, 3, 128)).astype(np.float32),
+            "k_a_log": rng.uniform(-1, 1, (3, 3, 1)).astype(np.float32),
+            "k_dt": rng.uniform(-2, 2, (3, 3, 128)).astype(np.float32),
+            "k_norm": rng.standard_normal((3, 8, 128)).astype(bf16),
+        }
+
+    def test_families_hold_the_same_values(self):
+        from sglang_tpu.k3_programs.kimi_k3.kernels import rank_loader
+
+        families = self._families(np.random.default_rng(0))
+        got = rank_loader.copy_free_families(families)
+        self.assertEqual(
+            set(got), set(rank_loader.COPY_FREE_NORMS + rank_loader.COPY_FREE_KDA)
+        )
+        for name in rank_loader.COPY_FREE_NORMS:
+            self.assertEqual(got[name].dtype, np.float32)
+            self.assertEqual(got[name].shape, families[name].shape)
+            np.testing.assert_array_equal(got[name], families[name].astype(np.float32))
+        self.assertEqual(got["k_conv"].shape, (3, 1, 4608))
+        self.assertEqual(got["k_dt"].shape, (3, 1, 384))
+        self.assertEqual(got["k_a_log"].shape, (3, 1, 384))
+        for layer in range(3):
+            for tap, part, head in np.ndindex(4, 3, 3):
+                lanes = 128 * (9 * tap + 3 * part + head)
+                np.testing.assert_array_equal(
+                    got["k_conv"][layer, 0, lanes : lanes + 128],
+                    families["k_conv"][layer, tap, part, head],
+                )
+            for head in range(3):
+                lanes = slice(128 * head, 128 * (head + 1))
+                np.testing.assert_array_equal(
+                    got["k_dt"][layer, 0, lanes], families["k_dt"][layer, head]
+                )
+                np.testing.assert_array_equal(
+                    got["k_a_log"][layer, 0, lanes],
+                    np.full(128, families["k_a_log"][layer, head, 0]),
+                )
+
+    def test_kernel_reads_match_bit_for_bit(self):
+        """The KDA layer's filter product and decay (as ``kda`` computes
+        them), and the norms' FP32 products (``normalize`` and the MLA q/kv
+        norms), from both representations."""
+        import functools
+
+        import jax
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk
+        from sglang_tpu.k3_programs.kimi_k3.kernels import rank_loader
+
+        rng = np.random.default_rng(1)
+        families = self._families(rng)
+        flat = rank_loader.copy_free_families(families)
+        rows = 8
+        window = jnp.asarray(
+            rng.standard_normal((rows, 4, 3, 3, 128)) * 2, jnp.bfloat16
+        )
+        gate = jnp.asarray(rng.standard_normal((rows, 384)) * 3, jnp.bfloat16)
+        hidden = jnp.asarray(rng.standard_normal((rows, 7168)) * 2, jnp.bfloat16)
+        latent = jnp.asarray(rng.standard_normal((rows, 1536)), jnp.float32)
+
+        def kernel(
+            window_ref,
+            gate_ref,
+            hidden_ref,
+            latent_ref,
+            conv_ref,
+            decay_ref,
+            bias_ref,
+            norm_ref,
+            qnorm_ref,
+            filtered_out,
+            decay_out,
+            filter_out,
+            normalized_out,
+            query_out,
+        ):
+            convolution_filter = dmk._kda_filter(conv_ref).astype(jnp.float32)
+            filter_out[...] = convolution_filter
+            filtered_out[...] = jax.nn.silu(
+                jnp.sum(
+                    window_ref[...].astype(jnp.float32) * convolution_filter[None],
+                    axis=1,
+                )
+            ).astype(jnp.bfloat16)
+            decay_out[...] = -5.0 * jax.nn.sigmoid(
+                jnp.exp(dmk._kda_heads(decay_ref))[None]
+                * (
+                    gate_ref[...].reshape(rows, 3, 128).astype(jnp.float32)
+                    + dmk._kda_heads(bias_ref)[None]
+                )
+            )
+            value = hidden_ref[...].astype(jnp.float32)
+            normalized_out[...] = (
+                value
+                * jax.lax.rsqrt(jnp.mean(value * value, axis=1, keepdims=True) + 1e-5)
+                * norm_ref[...]
+            ).astype(jnp.bfloat16)
+            query = latent_ref[...]
+            query_out[...] = (
+                query
+                * jax.lax.rsqrt(jnp.mean(query * query, axis=1, keepdims=True) + 1e-5)
+                * qnorm_ref[...]
+            ).astype(jnp.bfloat16)
+
+        call = functools.partial(
+            pl.pallas_call,
+            kernel,
+            out_shape=(
+                jax.ShapeDtypeStruct((rows, 3, 3, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((rows, 3, 128), jnp.float32),
+                jax.ShapeDtypeStruct((4, 3, 3, 128), jnp.float32),
+                jax.ShapeDtypeStruct((rows, 7168), jnp.bfloat16),
+                jax.ShapeDtypeStruct((rows, 1536), jnp.bfloat16),
+            ),
+            interpret=pltpu.InterpretParams(),
+        )
+
+        def run(source, layer):
+            return [
+                np.asarray(x)
+                for x in call()(
+                    window,
+                    gate,
+                    hidden,
+                    latent,
+                    jnp.asarray(source["k_conv"][layer]),
+                    jnp.asarray(source["k_a_log"][layer]),
+                    jnp.asarray(source["k_dt"][layer]),
+                    jnp.asarray(source["attn_norm"][layer]),
+                    jnp.asarray(source["m_qnorm"][layer % 2]),
+                )
+            ]
+
+        for layer in (0, 2):
+            want, got = run(families, layer), run(flat, layer)
+            np.testing.assert_array_equal(
+                want[2], families["k_conv"][layer].astype(np.float32)
+            )
+            for w, g in zip(want, got, strict=True):
+                bits = {2: np.uint16, 4: np.uint32}[w.dtype.itemsize]
+                np.testing.assert_array_equal(g.view(bits), w.view(bits))
+
+
 class TestSeededWindowMath(CustomTestCase):
     """``KernelConfig.dsa_seeded_window``'s arithmetic against brute force:
     lane ``j`` of ``dsa_dcp.window_thresholds`` holds the ``(j + 1)``-th

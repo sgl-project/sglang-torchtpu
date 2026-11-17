@@ -5355,6 +5355,44 @@ def _kda_row_chunk(batch_size: int, attention_dp: int = 1) -> int:
     return 8 if batch_size < 128 or attention_dp == 2 and batch_size == 128 else 4
 
 
+# KernelConfig.decode_copy_free_weights: a KDA layer's filter, decay rate and
+# time-step bias as FP32 rows (rank_loader.copy_free_families).
+COPY_FREE_FILTER = (1, 4 * 3 * 3 * 128)
+COPY_FREE_HEADS = (1, 3 * 128)
+
+
+def _lane_rows(ref, rows, start=0):
+    """``[rows, 128]``: row ``r`` is lanes ``start + 128 r ..`` (128 lanes)
+    of the ``[1, width]`` ref."""
+    return jnp.concatenate(
+        [ref[:, start + 128 * r : start + 128 * (r + 1)] for r in range(rows)],
+        axis=0,
+    )
+
+
+def _kda_filter(ref):
+    """The short-conv filter ``[4, 3, 3, 128]`` (tap, q/k/v, head, channel)
+    from its ref, held as such or as a copy-free row (``COPY_FREE_FILTER``)."""
+    if tuple(ref.shape) != COPY_FREE_FILTER:
+        return ref[...]
+    return jnp.stack(
+        [
+            jnp.stack([_lane_rows(ref, 3, 384 * (3 * tap + part)) for part in range(3)])
+            for tap in range(4)
+        ]
+    )
+
+
+def _kda_heads(ref):
+    """A per-head KDA weight from its ref: the decay rate ``[3, 1]`` and
+    time-step bias ``[3, 128]`` as held, or ``[3, 128]`` from a copy-free row
+    (``COPY_FREE_HEADS``; the decay rate repeated over its head's lanes,
+    which gives the same products)."""
+    if tuple(ref.shape) != COPY_FREE_HEADS:
+        return ref[...]
+    return _lane_rows(ref, 3)
+
+
 def kda(
     hidden_ref: TensorLike,  # [batch_size, hidden_size]
     output_ref: TensorLike,  # [batch_size, hidden_size]
@@ -5428,7 +5466,7 @@ def kda(
         or weights.input_projection.shape[0] != hidden_size
         or weights.input_projection.shape[1] % 1664
         or (shard_index is None and weights.input_projection.shape[1] != 1664)
-        or weights.exp_log_decay_rate.shape != (3, 1)
+        or tuple(weights.exp_log_decay_rate.shape) not in ((3, 1), COPY_FREE_HEADS)
         or convolution_history_ref.shape != history_shape
         or recurrent_state_ref.shape != state_shape
     ):
@@ -5578,12 +5616,12 @@ def kda(
                 lambda index: (
                     decay_lower_bound
                     * jax.nn.sigmoid(
-                        jnp.exp(weights.exp_log_decay_rate[...])[None]
+                        jnp.exp(_kda_heads(weights.exp_log_decay_rate))[None]
                         * (
                             gate_vmem[index]
                             .reshape(row_chunk, head_count, channels_per_head)
                             .astype(jnp.float32)
-                            + weights.time_step_bias[...][None]
+                            + _kda_heads(weights.time_step_bias)[None]
                         )
                     )
                 )
@@ -5615,12 +5653,12 @@ def kda(
                 lambda rows: (
                     decay_lower_bound
                     * jax.nn.sigmoid(
-                        jnp.exp(weights.exp_log_decay_rate[...])[None]
+                        jnp.exp(_kda_heads(weights.exp_log_decay_rate))[None]
                         * (
                             gate_vmem[rows]
                             .reshape(chunk_rows(rows), head_count, channels_per_head)
                             .astype(jnp.float32)
-                            + weights.time_step_bias[...][None]
+                            + _kda_heads(weights.time_step_bias)[None]
                         )
                     )
                 )
@@ -5643,8 +5681,8 @@ def kda(
             if wait_for_state is not None:
                 wait_for_state()
             decay = decay_lower_bound * jax.nn.sigmoid(
-                jnp.exp(weights.exp_log_decay_rate[...])[None]
-                * (raw_recurrent_gate + weights.time_step_bias[...][None])
+                jnp.exp(_kda_heads(weights.exp_log_decay_rate))[None]
+                * (raw_recurrent_gate + _kda_heads(weights.time_step_bias)[None])
             )
         if sequence_rows == 1:
 
@@ -5665,7 +5703,9 @@ def kda(
                 filtered_queries_keys_values = jax.nn.silu(
                     jnp.sum(
                         convolution_window.astype(jnp.float32)
-                        * weights.convolution_filter[...].astype(jnp.float32)[None],
+                        * _kda_filter(weights.convolution_filter).astype(jnp.float32)[
+                            None
+                        ],
                         axis=1,
                     )
                 ).astype(jnp.bfloat16)
@@ -5749,7 +5789,9 @@ def kda(
                     state_stream.finish()
                 attended = attended_vmem[...]
         else:
-            convolution_filter = weights.convolution_filter[...].astype(jnp.float32)
+            convolution_filter = _kda_filter(weights.convolution_filter).astype(
+                jnp.float32
+            )
 
             def run_sequence(first, history, state, store):
                 """The rows of the sequence at ``first`` from its input conv
@@ -8408,6 +8450,22 @@ def stack(
         raise ValueError(
             "FP8 KDA projections take FP8 k_projection and k_o with their column "
             "scales, without attention DP"
+        )
+    # Copy-free KDA rows and FP32 norm stacks (KernelConfig.
+    # decode_copy_free_weights): the final norm lands in the attention norm's
+    # VMEM row, so the two share a dtype.
+    copy_free_kda = tuple(weights["k_dt"].shape[1:]) == COPY_FREE_HEADS
+    if weights["final_norm"].dtype != weights["attn_norm"].dtype or (
+        copy_free_kda
+        and (
+            attention_dp != 1
+            or tuple(weights["k_a_log"].shape[1:]) != COPY_FREE_HEADS
+            or tuple(weights["k_conv"].shape[1:]) != COPY_FREE_FILTER
+        )
+    ):
+        raise ValueError(
+            "final_norm takes attn_norm's dtype; copy-free KDA rows (k_conv, "
+            "k_a_log and k_dt together) need attention DP1"
         )
     if dsa and (
         len(index_pools) != MLA_LAYERS or any(name not in weights for name in dsa_names)

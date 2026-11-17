@@ -375,6 +375,8 @@ def iter_decode_rank(
                 families.update(decode_indexer_families(families, rank))
             if _config().kda_fp8_projections:
                 families.update(kda_fp8_families(families))
+            if _config().decode_copy_free_weights:
+                families.update(copy_free_families(families))
             if attention_dp > 1:
                 families.update(
                     attention_dp_families(
@@ -420,6 +422,37 @@ def kda_fp8_families(families: dict) -> dict:
         for layer in range(weight.shape[0]):
             values[layer], scales[layer] = quantize_columns_fp8(weight[layer])
         result[name], result[f"{name}_scale"] = values, scales
+    return result
+
+
+# KernelConfig.decode_copy_free_weights: the decode families converted at
+# load, the norm stacks to FP32 and the KDA filter, decay rate and time-step
+# bias to FP32 [layers, 1, width] rows (copy_free_families).
+COPY_FREE_NORMS = ("attn_norm", "ffn_norm", "m_qnorm", "m_knorm", "final_norm")
+COPY_FREE_KDA = ("k_conv", "k_a_log", "k_dt")
+
+
+def copy_free_families(families: dict) -> dict:
+    """The decode's copy-free families (KernelConfig.decode_copy_free_weights)
+    from the pre-shard's: the norm stacks (``COPY_FREE_NORMS``) as FP32, the
+    KDA filter ``k_conv [layers, 4, 3, 3, 128]`` as ``[layers, 1, 4608]``,
+    the time-step bias ``k_dt [layers, 3, 128]`` as ``[layers, 1, 384]`` and
+    the decay rate ``k_a_log [layers, 3, 1]`` as ``[layers, 1, 384]`` with
+    each head's value on its 128 lanes, all FP32 (the same values)."""
+    result = {
+        name: np.ascontiguousarray(families[name], np.float32)
+        for name in COPY_FREE_NORMS
+        if name in families
+    }
+    for name in ("k_conv", "k_dt"):
+        if name in families:
+            value = np.ascontiguousarray(families[name], np.float32)
+            result[name] = value.reshape(value.shape[0], 1, -1)
+    if "k_a_log" in families:
+        decay = np.asarray(families["k_a_log"], np.float32)
+        result["k_a_log"] = np.ascontiguousarray(
+            np.repeat(decay.reshape(decay.shape[0], 1, -1), 128, axis=-1)
+        )
     return result
 
 

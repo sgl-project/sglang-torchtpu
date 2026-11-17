@@ -49,13 +49,26 @@ def shared_dense() -> dict[str, tuple[str, ...]]:
     attention DP the decode holds several head shards of some KDA and MLA
     families (``ATTENTION_DP_WEIGHTS``), so the prefill keeps its own; with
     ``kda_fp8_projections`` the decode's KDA input projection is FP8, so the
-    prefill loads its own BF16 one."""
+    prefill loads its own BF16 one; with ``decode_copy_free_weights`` the
+    decode's norm stacks and KDA filter, decay rate and time-step bias are
+    converted (``rank_loader.copy_free_families``), so the prefill loads its
+    own."""
     from sglang_tpu.k3_programs.kimi_k3.config import active
 
     if getattr(active(), "attention_dp", 1) == 1:
+        own = set()
         if getattr(active(), "kda_fp8_projections", False):
+            own.add("k_projection")
+        if getattr(active(), "decode_copy_free_weights", False):
+            from sglang_tpu.k3_programs.kimi_k3.kernels.rank_loader import (
+                COPY_FREE_KDA,
+                COPY_FREE_NORMS,
+            )
+
+            own.update(COPY_FREE_NORMS + COPY_FREE_KDA)
+        if own:
             return {
-                group: tuple(n for n in names if n != "k_projection")
+                group: tuple(n for n in names if n not in own)
                 for group, names in SHARED_DENSE.items()
             }
         return SHARED_DENSE
