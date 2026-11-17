@@ -17,7 +17,6 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel - GLM5.2 DeepSeek Sparse Attention."""
 
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -129,9 +128,15 @@ _BUSIER_XLU_GATHER_SHARE = 2 / 3
 # much loop control that the static schedule does not show (per-iteration time over 8, 11, 16
 # and 22 chunks per iteration fits this + 73 cycles per chunk).
 _GATHER_PAGE_LOOP_ITERATION_CYCLES = 100
-# A grid step waits on its DMAs (the block's top-k tile in, its page-table row in, its output
-# tile out): the 1-chunk kernel has a ~120-bundle body but takes this many cycles per step.
-_GATHER_PAGE_BLOCK_STEP_FLOOR_CYCLES = 1040
+# Per-step work outside the chunk steps: load and split the block's top-k tile, store its
+# output tile, drain the last gathers (both kernels' time fits this + chunk steps).
+_GATHER_PAGE_STEP_FIXED_CYCLES = 330
+# A grid step also waits on its DMAs (top-k tile in, page-table row in, output tile out): a
+# 1-chunk step takes this long although its body is ~120 bundles ...
+_GATHER_PAGE_STEP_FLOOR_CYCLES = 1030
+# ... plus the page-table row, 4 KB per 128-page chunk per block (the floor is ~1700 cycles at
+# 64 chunks).
+_GATHER_PAGE_ROW_DMA_CYCLES_PER_CHUNK = 10
 
 
 def _gather_page_chunk_step_cycles(block_tokens: int, topk: int) -> float:
@@ -142,20 +147,37 @@ def _gather_page_chunk_step_cycles(block_tokens: int, topk: int) -> float:
 
 def _gather_page_chunks_per_iteration(
     num_chunks: int, block_tokens: int, topk: int
-) -> int:
-    """Chunks the bounded kernel unrolls per loop iteration.
+) -> int | None:
+    """Chunks per loop iteration for the bounded kernel, or None to use the unrolled kernel.
 
-    A block that needs ``c`` chunks costs about ``ceil(c / g) * (o + g * u)``: ``o`` cycles per
-    loop iteration, ``u`` cycles per chunk step, with on average ``(g - 1) / 2`` wasted tail
-    steps. Minimizing ``c * o / g + g * u / 2`` gives ``g = sqrt(2 * c * o / u)``, with ``c``
-    taken as the table width. ``g`` is then evened out over the table, so a full-length block
-    runs ``ceil(c / g)`` iterations with fewer than one wasted step per iteration.
+    Picks the option with the lowest expected cycles per token block, assuming the number of
+    chunks ``c`` a block needs is uniform over ``1..num_chunks``. Both kernels wait at least
+    for the step's DMAs (``floor``); on top of a fixed part, the unrolled kernel runs every
+    chunk step and the bounded kernel runs ``ceil(c / g)`` iterations of ``g`` steps:
+
+      unrolled: max(floor, fixed + num_chunks * u)
+      bounded:  max(floor, fixed + ceil(c / g) * (o + g * u))
     """
-    o = _GATHER_PAGE_LOOP_ITERATION_CYCLES
     u = _gather_page_chunk_step_cycles(block_tokens, topk)
-    g = math.sqrt(2 * num_chunks * o / u)
-    num_iterations = max(1, round(num_chunks / g))
-    return -(-num_chunks // num_iterations)
+    o = _GATHER_PAGE_LOOP_ITERATION_CYCLES
+    fixed = _GATHER_PAGE_STEP_FIXED_CYCLES
+    floor = (
+        _GATHER_PAGE_STEP_FLOOR_CYCLES
+        + num_chunks * _GATHER_PAGE_ROW_DMA_CYCLES_PER_CHUNK
+    )
+    best_cycles = max(floor, fixed + num_chunks * u)
+    best_g = None
+    for g in range(1, num_chunks):
+        cycles = (
+            sum(
+                max(floor, fixed + -(-c // g) * (o + g * u))
+                for c in range(1, num_chunks + 1)
+            )
+            / num_chunks
+        )
+        if cycles < best_cycles:
+            best_cycles, best_g = cycles, g
+    return best_g
 
 
 def _gather_page_ids_bounded_kernel(
@@ -211,14 +233,7 @@ def gather_page_ids(
     chunks_per_iteration = _gather_page_chunks_per_iteration(
         num_chunks, block_tokens, topk
     )
-    # One iteration covering the whole table is the unrolled kernel without the loop.
-    if (
-        # Below the floor the unrolled kernel's chunk loop hides under the DMA wait, so
-        # bounding it saves nothing and only adds loop overhead.
-        num_chunks * _gather_page_chunk_step_cycles(block_tokens, topk)
-        > _GATHER_PAGE_BLOCK_STEP_FLOOR_CYCLES
-        and chunks_per_iteration < num_chunks
-    ):
+    if chunks_per_iteration is not None:
         nblocks = padded_tokens // block_tokens
         nchunks = (
             logical.reshape(nblocks, block_tokens * topk).max(axis=1)

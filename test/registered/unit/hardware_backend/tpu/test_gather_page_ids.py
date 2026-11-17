@@ -31,14 +31,17 @@ def _reference(page_indices, seq_page_ids, seq_ids, max_num_seqs):
 @pytest.mark.parametrize(
     "pages_per_seq,seq_pages",
     [
-        (2048, [2048, 300]),  # bounded: 16 chunks, 8 per loop iteration
+        (
+            2048,
+            [2048, 300],
+        ),  # bounded: 16 chunks, 5 per loop iteration (last one clamps)
         (1000, [1000, 7]),  # unrolled: 8 chunks, page table not a multiple of 128
         (8192, [256, 1170]),  # bounded: short prefixes in a 1M-context table
         (8192, [8192, 5000]),  # bounded: full-length prefix
         (
             8000,
             [8000, 900],
-        ),  # bounded: 63 chunks, last iteration repeats the last chunk
+        ),  # bounded: 63 chunks, table not a multiple of 128 pages
     ],
 )
 @pytest.mark.parametrize("num_tokens", [64, 1003])
