@@ -44,6 +44,16 @@ gather_fp8_ple_rows
        table, index_select the rows of a uint8 view and convert only those.
   Upstream PR or issue: not filed.
   Remove when: TPU lowers fp8 gathers without converting the operand.
+
+hash_ngrams_int32
+  Why: the PLE n-gram hash multiplies and XORs int64 values; it compiled for
+       prefill, but decode-sized graphs aborted the TPU compiler
+       (lowering_util.cc "Unsupported conversion from vmreg/vreg to U64").
+  How: AROUND Qwen4ExpNGramEmbedding._hash_contexts: the same hash in int32
+       limbs (bit-exact; products stay below 2^63 by construction) with a
+       Horner reduction modulo each head's prime vocab size.
+  Upstream PR or issue: not filed.
+  Remove when: TPU compiles 64-bit integer vector arithmetic at every shape.
 """
 
 from __future__ import annotations
@@ -230,3 +240,118 @@ def gather_fp8_ple_rows(
     return ngram._finish_embedding_lookup(
         embeddings, semantic_tokens, forward_batch, physical_tokens
     )
+
+
+def _ngram_hash_limb_plan(ngram: Any) -> dict:
+    """Host constants of the int32 n-gram hash, cached on the module.
+
+    Products token * multiplier stay below 2^63 by construction (each
+    multiplier is at most int64_max // vocab), so they are split into
+    ``bits``-bit limbs small enough that token * limb + carry fits int32.
+    """
+    import math
+
+    import torch
+
+    plan = getattr(ngram, "_tpu_hash_plan", None)
+    if plan is not None:
+        return plan
+    vocab = int(ngram.unigram_vocab_size)
+    token_bits = max(1, math.ceil(math.log2(vocab + 1)))
+    bits = 30 - token_bits
+    if bits < 6:
+        raise NotImplementedError(f"vocab {vocab} is too large for the int32 n-gram hash")
+    multipliers = [int(m) for m in ngram.layer_multipliers.cpu().tolist()]
+    num_m = max(1, math.ceil(max(m.bit_length() for m in multipliers) / bits))
+    num_p = math.ceil(63 / bits) + 1
+    mask = (1 << bits) - 1
+    m_limbs = [[(m >> (bits * k)) & mask for k in range(num_m)] for m in multipliers]
+    sizes = [int(v) for v in ngram.ngram_heads_vocab_sizes.cpu().tolist()]
+    offsets = [int(o) for o in ngram.ngram_heads_offsets.cpu().tolist()]
+    if max(sizes) >= 1 << 25 or max(o + s for o, s in zip(offsets, sizes)) >= 1 << 31:
+        raise NotImplementedError("n-gram head vocab too large for the int32 n-gram hash")
+    plan = dict(
+        bits=bits,
+        mask=mask,
+        num_p=num_p,
+        m_limbs=m_limbs,
+        sizes=torch.tensor(sizes, dtype=torch.int32),
+        offsets=torch.tensor(offsets, dtype=torch.int32),
+    )
+    ngram._tpu_hash_plan = plan
+    return plan
+
+
+def ngram_hash_int32(ngram: Any, contexts: Any) -> Any:
+    """Qwen4ExpNGramEmbedding._hash_contexts in int32 arithmetic only.
+
+    Matches the int64 reference exactly: for n-gram order g the hash of a
+    window is XOR_{k<g} tok_k * m_k (tok_k the token k positions before the
+    window's last, or EOS when an EOS lies between), reduced mod each head's
+    vocab size plus the head's offset.
+    """
+    import torch
+
+    plan = _ngram_hash_limb_plan(ngram)
+    device = contexts.device
+    eos = int(ngram.eos_token_id)
+    ctx = contexts.to(torch.int32)
+    last = ctx.shape[1] - 1
+    bits, mask, num_p = plan["bits"], plan["mask"], plan["num_p"]
+
+    # tok_k: the token k back from the last, or EOS when an EOS lies in
+    # positions last-k+1 .. last-1 (the reference's segment rule; an EOS at
+    # last-k itself yields EOS either way).
+    tokens = [ctx[:, last]]
+    blocked = torch.zeros_like(ctx[:, last], dtype=torch.bool)
+    for k in range(1, ngram.ngram_size):
+        if k > 1:
+            blocked = blocked | (ctx[:, last - k + 1] == eos)
+        src = ctx[:, last - k]
+        tokens.append(torch.where(blocked, torch.full_like(src, eos), src))
+
+    def product_limbs(token, m_limbs):
+        limbs, carry = [], torch.zeros_like(token)
+        for k in range(num_p):
+            acc = carry + (token * m_limbs[k] if k < len(m_limbs) else 0)
+            limbs.append(acc & mask)
+            carry = acc >> bits
+        return limbs
+
+    sizes = plan["sizes"].to(device)
+    offsets = plan["offsets"].to(device)
+    blocks = []
+    mixed = None
+    for pos in range(ngram.ngram_size):
+        limbs = product_limbs(tokens[pos], plan["m_limbs"][pos])
+        mixed = limbs if mixed is None else [a ^ b for a, b in zip(mixed, limbs)]
+        if pos == 0:
+            continue
+        g = pos + 1
+        start = (g - 2) * ngram.heads_per_ngram
+        end = start + ngram.heads_per_ngram
+        v = sizes[start:end].view(1, -1)
+        r = torch.zeros((ctx.shape[0], end - start), dtype=torch.int32, device=device)
+        # Horner over 6-bit chunks, most significant first: r < v < 2^25.
+        chunks_per_limb = bits // 6 if bits % 6 == 0 else None
+        for limb in reversed(mixed):
+            if chunks_per_limb is not None:
+                parts = [(limb >> (6 * c)) & 63 for c in reversed(range(chunks_per_limb))]
+                widths = [6] * chunks_per_limb
+            else:
+                parts = [(limb >> b) & 1 for b in reversed(range(bits))]
+                widths = [1] * bits
+            for part, width in zip(parts, widths):
+                r = torch.remainder((r << width) | part.view(-1, 1), v)
+        blocks.append(r + offsets[start:end].view(1, -1))
+    return torch.cat(blocks, dim=-1)
+
+
+def hash_ngrams_int32(original: Any, ngram: Any, contexts: Any, *args, **kwargs):
+    """AROUND Qwen4ExpNGramEmbedding._hash_contexts: the int32 hash on TPU.
+
+    The int64 reference compiled for prefill but aborted the TPU compiler on
+    decode-sized graphs (lowering_util.cc 'Unsupported conversion from
+    vmreg/vreg to U64'); int32 limbs avoid 64-bit vector values entirely.
+    """
+    return ngram_hash_int32(ngram, contexts)
