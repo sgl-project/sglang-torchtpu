@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TorchTPU bridge for the selected-route GLM fused EP kernel.
+"""TorchTPU bridge for the selected-route GLM A2A fused kernel.
 
 The FFN boundary has already gathered DP rows. Split that replica into disjoint
 mesh-index slices, run the kernel's dispatch/combine, then recover the replica.
@@ -27,7 +27,7 @@ def validate_source_environment():
     inherited = [name for name in _SOURCE_DEBUG_ENVS if name in os.environ]
     if inherited:
         raise ValueError(
-            "GLM MoE v2 requires the safe source defaults; unset "
+            "A2A fused MoE V2 requires the safe source defaults; unset "
             + ", ".join(inherited)
             + ". Prequantization is required, TopK padding is 128, "
             "and the route-SMEM-only debug path is disabled."
@@ -54,9 +54,9 @@ def get_op(ep_size: int, has_shared: bool):
     from jax.sharding import PartitionSpec as P
     from torch_tpu._internal.pallas import get_pallas_mesh
 
-    from sglang_tpu.moe.pallas.glm_moe_v2.kernel import fused_ep_moe_v2
-    from sglang_tpu.moe.pallas.glm_moe_v2.tuned_block_configs import (
-        get_tuned_fused_moe_v2_block_config,
+    from sglang_tpu.moe.pallas.a2a_fused_moe_v2.kernel import a2a_fused_moe_v2
+    from sglang_tpu.moe.pallas.a2a_fused_moe_v2.tuned_block_configs import (
+        get_tuned_a2a_fused_moe_v2_block_config,
     )
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
@@ -118,7 +118,7 @@ def get_op(ep_size: int, has_shared: bool):
         # This runs while exporting a shape's actual custom-call graph, not
         # once per decode step; it gives E2E an operator/shape provenance marker.
         logger.info(
-            "GLM_MOE_V2_EXPORT op=glm_ep_moe_v2_ep%d_shared%d rows=%d hidden=%d",
+            "A2A_FUSED_MOE_V2_EXPORT op=a2a_fused_moe_v2_ep%d_shared%d rows=%d hidden=%d",
             ep_size,
             int(has_shared),
             original_rows,
@@ -150,7 +150,7 @@ def get_op(ep_size: int, has_shared: bool):
                 w3_shared_scale=ss13[1, None, :],
                 w2_shared_scale=ss2.reshape(1, -1),
             )
-        config = get_tuned_fused_moe_v2_block_config(
+        config = get_tuned_a2a_fused_moe_v2_block_config(
             num_tokens=x.shape[0],
             num_experts=w2.shape[0],
             top_k=ids.shape[1],
@@ -164,7 +164,7 @@ def get_op(ep_size: int, has_shared: bool):
             enable_act_quant=True,
             quant_mode="per_channel",
         )
-        y = fused_ep_moe_v2(
+        y = a2a_fused_moe_v2(
             mesh,
             x,
             w1,
@@ -191,7 +191,7 @@ def get_op(ep_size: int, has_shared: bool):
 
     specs = (sharded,) * 3 + (packed, sharded, packed, sharded, sharded) + (P(),) * 4
     return cpu_export_jax_op(
-        f"sglang_tpu_pallas::glm_ep_moe_v2_ep{ep_size}_shared{int(has_shared)}",
+        f"sglang_tpu_pallas::a2a_fused_moe_v2_ep{ep_size}_shared{int(has_shared)}",
         run,
         mesh=mesh,
         input_partition_specs=specs,

@@ -1,4 +1,4 @@
-# GLM selected-route fused EP MoE V2
+# A2A fused MoE V2
 
 The kernel and tuning table originate from `sgl-project/sglang-jax` revision
 `c948bdda95208e68a474c8088937347d08fe8937`, under
@@ -44,19 +44,19 @@ correctness checks and the other independent MoE implementations.
 
 ## Model integration
 
-Set `SGLANG_TPU_USE_GLM_MOE_V2=1` before model load, with
+Set `SGLANG_TPU_USE_A2A_FUSED_MOE_V2=1` before model load, with
 `--moe-runner-backend pallas_tpu --tpu-fp8-runtime channelwise`.
 The existing loader finalization entry
 `prepare_model_for_fused_moe_decode` binds eligible target GLM MoE blocks to
-`GlmSelectedEPMoE` after quantization preparation. The native MTP draft keeps
+`GlmA2AFusedMoEV2` after quantization preparation. The native MTP draft keeps
 its attention-TP path. The shared expert is fused by default, controlled by
-`SGLANG_TPU_GLM_MOE_V2_SHARED`.
+`SGLANG_TPU_A2A_FUSED_MOE_V2_SHARED`.
 
 The binding requires PP1, EP=TP, attention-DP=TP, unsharded routed experts,
 channelwise FP8, SiLU, ordinary selected routes, and external shared-expert
 slots. SBO/TBO and EPLB are excluded by eligibility checks. The target model
-logs `GLM_MOE_V2_PREPARED` and the exported row shapes log
-`GLM_MOE_V2_EXPORT`. The FFN `summed_by_compute` contract consumes the
+logs `A2A_FUSED_MOE_V2_PREPARED` and the exported row shapes log
+`A2A_FUSED_MOE_V2_EXPORT`. The FFN `summed_by_compute` contract consumes the
 already-combined output once.
 
 PR #2238's block-to-channel conversion stores dense shared-expert channel

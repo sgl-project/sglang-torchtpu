@@ -7,7 +7,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.runtime_context import get_parallel
 
 
-class GlmSelectedEPMoE(DeepseekV2MoE):
+class GlmA2AFusedMoEV2(DeepseekV2MoE):
     def use_tpu_fused_moe_decode(
         self, hidden_states, forward_batch, skip_shared_experts=False
     ):
@@ -42,8 +42,8 @@ class GlmSelectedEPMoE(DeepseekV2MoE):
         weights = weights.to(hidden_states.dtype).float()
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             weights = weights * self.routed_scaling_factor
-        has_shared = self._glm_v2_shared and not skip_shared_experts
-        op = self._glm_v2_op if has_shared else self._glm_v2_routed_op
+        has_shared = self._a2a_moe_v2_shared and not skip_shared_experts
+        op = self._a2a_moe_v2_op if has_shared else self._a2a_moe_v2_routed_op
         output = op(
             hidden_states,
             ids.to(torch.int32),
@@ -52,11 +52,11 @@ class GlmSelectedEPMoE(DeepseekV2MoE):
             self.experts.w2_weight,
             self.experts.w13_weight_scale,
             self.experts.w2_weight_scale,
-            self._glm_v2_rank,
-            self._glm_v2_sw13,
-            self._glm_v2_sw2,
-            self._glm_v2_ss13,
-            self._glm_v2_ss2,
+            self._a2a_moe_v2_rank,
+            self._a2a_moe_v2_sw13,
+            self._a2a_moe_v2_sw2,
+            self._a2a_moe_v2_ss13,
+            self._a2a_moe_v2_ss2,
         )
         if (
             not has_shared

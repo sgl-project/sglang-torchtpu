@@ -66,7 +66,7 @@ def _prepare_shared(moe, parallel):
         or down.weight.dtype != torch.float8_e4m3fn
     ):
         logger.warning(
-            "GLM fused EP shared expert keeps external MLP: requires FP8 weights"
+            "GLM A2A fused shared expert keeps external MLP: requires FP8 weights"
         )
         return False
     if (
@@ -74,7 +74,7 @@ def _prepare_shared(moe, parallel):
         or getattr(down, "weight_block_size", None) is not None
     ):
         logger.warning(
-            "GLM fused EP shared expert keeps external MLP: requires channel scales"
+            "GLM A2A fused shared expert keeps external MLP: requires channel scales"
         )
         return False
     gate, up = gate_up.weight.data.chunk(2, dim=1)
@@ -100,10 +100,10 @@ def _prepare_shared(moe, parallel):
         )
         down_weight = group.all_gather(down_weight.contiguous(), dim=0)
         down_scale = common_scale
-    moe._glm_v2_sw13 = torch.stack((gate, up)).contiguous()
-    moe._glm_v2_sw2 = down_weight.contiguous()
-    moe._glm_v2_ss13 = torch.stack((gate_scale, up_scale)).float().contiguous()
-    moe._glm_v2_ss2 = down_scale.contiguous()
+    moe._a2a_moe_v2_sw13 = torch.stack((gate, up)).contiguous()
+    moe._a2a_moe_v2_sw2 = down_weight.contiguous()
+    moe._a2a_moe_v2_ss13 = torch.stack((gate_scale, up_scale)).float().contiguous()
+    moe._a2a_moe_v2_ss2 = down_scale.contiguous()
     return True
 
 
@@ -116,13 +116,13 @@ def prepare_model(model):
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
     from sglang.srt.runtime_context import get_exec, get_parallel
     from sglang_tpu.envs import envs
-    from sglang_tpu.moe.pallas.glm_moe_v2.op import (
+    from sglang_tpu.moe.pallas.a2a_fused_moe_v2.op import (
         get_op,
         pack_gate_up,
         pack_gate_up_scale,
     )
 
-    if not envs.SGLANG_TPU_USE_GLM_MOE_V2.get():
+    if not envs.SGLANG_TPU_USE_A2A_FUSED_MOE_V2.get():
         return
     # This adapter targets the GLM DSA model; unrelated models retain their
     # established backend even if the process-level expert toggle is inherited.
@@ -131,12 +131,12 @@ def prepare_model(model):
         "GlmMoeDsaForCausalLMNextN" in architectures
         or type(model).__name__ == "GlmMoeDsaForCausalLMNextN"
     ):
-        logger.info("GLM_MOE_V2_DRAFT_KEEP_BASELINE %s", type(model).__name__)
+        logger.info("A2A_FUSED_MOE_V2_DRAFT_KEEP_BASELINE %s", type(model).__name__)
         return 0
     if "GlmMoeDsaForCausalLM" not in architectures:
-        logger.info("GLM fused EP MoE v2: skipping %s", type(model).__name__)
+        logger.info("GLM A2A fused MoE v2: skipping %s", type(model).__name__)
         return
-    from sglang_tpu.moe.glm_moe_v2_runtime import GlmSelectedEPMoE
+    from sglang_tpu.moe.glm_a2a_fused_moe_v2_runtime import GlmA2AFusedMoEV2
 
     parallel = get_parallel()
     modules = [
@@ -147,18 +147,20 @@ def prepare_model(model):
     draft = sum(bool(moe.is_nextn) for _, moe in modules)
     candidates = [(name, moe) for name, moe in modules if not moe.is_nextn]
     if candidates and not get_moe_runner_backend().is_pallas_tpu():
-        raise ValueError("GLM MoE v2 requires --moe-runner-backend pallas_tpu")
+        raise ValueError("A2A fused MoE V2 requires --moe-runner-backend pallas_tpu")
     if candidates and (is_sbo_enabled() or is_tbo_enabled()):
-        raise ValueError("GLM MoE v2 does not support decomposed SBO/TBO forwards")
+        raise ValueError(
+            "A2A fused MoE V2 does not support decomposed SBO/TBO forwards"
+        )
     prepared = shared_count = max_post_drain_used = 0
     for name, moe in candidates:
-        if isinstance(moe, GlmSelectedEPMoE):
+        if isinstance(moe, GlmA2AFusedMoEV2):
             prepared += 1
-            shared_count += int(moe._glm_v2_shared)
+            shared_count += int(moe._a2a_moe_v2_shared)
             continue
         reason = unsupported_reason(moe, parallel, get_exec())
         if reason:
-            logger.warning("GLM fused EP MoE v2 skips %s: %s", name, reason)
+            logger.warning("GLM A2A fused MoE v2 skips %s: %s", name, reason)
             continue
         layer = moe.experts
         w13 = pack_gate_up(layer.w13_weight.data)
@@ -167,7 +169,7 @@ def prepare_model(model):
         _replace_data(layer.w13_weight_scale, s13)
         layer.w13_weight_scale_inv = layer.w13_weight_scale
         moe.register_buffer(
-            "_glm_v2_rank",
+            "_a2a_moe_v2_rank",
             torch.tensor(
                 [parallel.moe_ep_rank],
                 device=layer.w13_weight.device,
@@ -175,22 +177,22 @@ def prepare_model(model):
             ),
             persistent=False,
         )
-        moe._glm_v2_ep_size = parallel.moe_ep_size
-        moe._glm_v2_shared = False
+        moe._a2a_moe_v2_ep_size = parallel.moe_ep_size
+        moe._a2a_moe_v2_shared = False
         # Stable placeholders keep the custom op schema independent of fusion.
         for attr in ("sw13", "sw2", "ss13", "ss2"):
             moe.register_buffer(
-                f"_glm_v2_{attr}",
+                f"_a2a_moe_v2_{attr}",
                 torch.empty(0, device=layer.w13_weight.device, dtype=torch.float32),
                 persistent=False,
             )
-        moe._glm_v2_routed_op = get_op(parallel.moe_ep_size, False)
-        moe._glm_v2_op = moe._glm_v2_routed_op
-        moe.__class__ = GlmSelectedEPMoE
-        if envs.SGLANG_TPU_GLM_MOE_V2_SHARED.get():
-            moe._glm_v2_shared = _prepare_shared(moe, parallel)
-            if moe._glm_v2_shared:
-                moe._glm_v2_op = get_op(parallel.moe_ep_size, True)
+        moe._a2a_moe_v2_routed_op = get_op(parallel.moe_ep_size, False)
+        moe._a2a_moe_v2_op = moe._a2a_moe_v2_routed_op
+        moe.__class__ = GlmA2AFusedMoEV2
+        if envs.SGLANG_TPU_A2A_FUSED_MOE_V2_SHARED.get():
+            moe._a2a_moe_v2_shared = _prepare_shared(moe, parallel)
+            if moe._a2a_moe_v2_shared:
+                moe._a2a_moe_v2_op = get_op(parallel.moe_ep_size, True)
         # This full-model pass is outside the loader's per-quant-module drain.
         # Materialize this layer's pack/gathers before the next layer retains
         # another old layout through its deferred DeviceBufferRef readers.
@@ -198,12 +200,12 @@ def prepare_model(model):
         free, total = torch.accelerator.get_memory_info(layer.w13_weight.device)
         max_post_drain_used = max(max_post_drain_used, int(total - free))
         prepared += 1
-        shared_count += int(moe._glm_v2_shared)
+        shared_count += int(moe._a2a_moe_v2_shared)
         logger.info(
-            "GLM fused EP MoE v2 prepared %s: EP%d, shared=%s",
+            "GLM A2A fused MoE v2 prepared %s: EP%d, shared=%s",
             name,
             parallel.moe_ep_size,
-            moe._glm_v2_shared,
+            moe._a2a_moe_v2_shared,
         )
     summary = dict(
         expected=len(candidates),
@@ -212,8 +214,10 @@ def prepare_model(model):
         draft_skipped=draft,
         max_observed_post_drain_used_bytes=max_post_drain_used,
     )
-    model._glm_v2_preparation_summary = summary
-    logger.info("GLM_MOE_V2_PREPARED %s", summary)
+    model._a2a_moe_v2_preparation_summary = summary
+    logger.info("A2A_FUSED_MOE_V2_PREPARED %s", summary)
     if prepared != len(candidates):
-        raise RuntimeError(f"GLM MoE v2 did not bind every target MoE layer: {summary}")
+        raise RuntimeError(
+            f"A2A fused MoE V2 did not bind every target MoE layer: {summary}"
+        )
     return prepared

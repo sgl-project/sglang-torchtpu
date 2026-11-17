@@ -5,7 +5,7 @@
 """Auto-tuned block configs for fused_moe v2.
 
 Same lookup approach as v1/tuned_block_configs.py but with v2's simpler
-5-field FusedMoEBlockConfig (bt, bf, btc, bse, bts).
+5-field A2AFusedMoEV2BlockConfig (bt, bf, btc, bse, bts).
 """
 
 # ruff: noqa: E501
@@ -17,7 +17,7 @@ import logging
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from .kernel import FusedMoEBlockConfig
+from .kernel import A2AFusedMoEV2BlockConfig
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +222,7 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
 }
 # fmt: on
 
-DEFAULT_V2_BLOCK_CONFIG = FusedMoEBlockConfig(
+DEFAULT_V2_BLOCK_CONFIG = A2AFusedMoEV2BlockConfig(
     bt=32,
     bf=512,
     btc=32,
@@ -230,7 +230,7 @@ DEFAULT_V2_BLOCK_CONFIG = FusedMoEBlockConfig(
 )
 
 
-def should_interleave_fused_moe_v2_bt(*, num_tokens: int, ep_size: int) -> bool:
+def should_interleave_a2a_fused_moe_v2_bt(*, num_tokens: int, ep_size: int) -> bool:
     """Deprecated shim: gather overlap is now unconditional for num_bt > 1 via
     the kernel's fixed-K gather banks, so there is no token-count gate. Retained
     only to validate inputs for callers that still probe it; always returns True.
@@ -284,7 +284,7 @@ def get_simplified_key(
     )
 
 
-def get_tuned_fused_moe_v2_block_config(
+def get_tuned_a2a_fused_moe_v2_block_config(
     *,
     num_tokens: int,
     num_experts: int,
@@ -298,7 +298,7 @@ def get_tuned_fused_moe_v2_block_config(
     use_grouped_topk: bool = False,
     enable_act_quant: bool = False,
     quant_mode: str | None = None,
-) -> FusedMoEBlockConfig:
+) -> A2AFusedMoEV2BlockConfig:
     keys = get_simplified_key(
         dtype=dtype,
         weight_dtype=weight_dtype,
@@ -349,4 +349,4 @@ def get_tuned_fused_moe_v2_block_config(
         bts,
     )
 
-    return FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
+    return A2AFusedMoEV2BlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)

@@ -1,7 +1,5 @@
 """Online fp8 quantization of dense linear weights on TPU (#1767)."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,12 +9,13 @@ from torch import nn
 
 from sglang.srt.layers.quantization import fp8
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.fp8_linear import (
     _set_channelwise_fp8_weight,
     prepare_tpu_online_fp8_linear_weights,
 )
-from sglang_tpu.moe.glm_moe_v2 import _prepare_shared
+from sglang_tpu.moe.glm_a2a_fused_moe_v2 import _prepare_shared
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -184,14 +183,17 @@ class TestGlmSharedChannelwiseGather(CustomTestCase):
                     tp_size=2, tp_group=SimpleNamespace(all_gather=gather)
                 )
                 self.assertTrue(_prepare_shared(moe, parallel))
-                actual_down = moe._glm_v2_sw2.float() * moe._glm_v2_ss2
+                actual_down = moe._a2a_moe_v2_sw2.float() * moe._a2a_moe_v2_ss2
                 relative_l2 = torch.linalg.vector_norm(
                     actual_down - expected_down
                 ) / torch.linalg.vector_norm(expected_down)
                 self.assertLess(float(relative_l2), 0.04)
                 self.assertTrue(torch.isfinite(actual_down).all())
                 torch.testing.assert_close(
-                    moe._glm_v2_sw13.float(), expected_gate_up.float(), rtol=0, atol=0
+                    moe._a2a_moe_v2_sw13.float(),
+                    expected_gate_up.float(),
+                    rtol=0,
+                    atol=0,
                 )
 
 

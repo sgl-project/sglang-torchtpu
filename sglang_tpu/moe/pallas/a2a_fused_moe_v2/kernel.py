@@ -43,7 +43,7 @@ cdiv = pl.cdiv
 
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
-class FusedMoEBlockConfig:
+class A2AFusedMoEV2BlockConfig:
     bt: int
     bf: int
     btc: int
@@ -55,7 +55,7 @@ class FusedMoEBlockConfig:
         *,
         num_tokens: int,
         ep_size: int,
-    ) -> FusedMoEBlockConfig:
+    ) -> A2AFusedMoEV2BlockConfig:
         if ep_size <= 0:
             raise ValueError(f"Expected {ep_size=} > 0.")
         if num_tokens % ep_size != 0:
@@ -70,7 +70,7 @@ class FusedMoEBlockConfig:
         if bts % btc != 0:
             raise ValueError(f"Expected {bts=} divisible by {btc=}.")
         bse = self.bf if self.bse is None else self.bse
-        return FusedMoEBlockConfig(bt=bt, bf=self.bf, btc=btc, bse=bse, bts=bts)
+        return A2AFusedMoEV2BlockConfig(bt=bt, bf=self.bf, btc=btc, bse=bse, bts=bts)
 
     def tree_flatten(self):
         bts = 0 if self.bts is None else int(self.bts)
@@ -236,7 +236,7 @@ def validate_fused_moe_block_config(
     intermediate_size: int,
     dtype: jnp.dtype,
     ep_size: int,
-    block_config: FusedMoEBlockConfig,
+    block_config: A2AFusedMoEV2BlockConfig,
 ):
     bc = block_config.effective_for(num_tokens=num_tokens, ep_size=ep_size)
     bt, bf, btc, bse = bc.bt, bc.bf, bc.btc, bc.bse
@@ -2457,7 +2457,7 @@ def _fused_ep_moe_kernel(
         "enable_act_quant",
     ],
 )
-def fused_ep_moe_v2(
+def a2a_fused_moe_v2(
     mesh: jax.sharding.Mesh,
     tokens: jax.Array,
     w1: jax.Array,
@@ -2487,7 +2487,7 @@ def fused_ep_moe_v2(
     w1_scale: jax.Array | None = None,
     w2_scale: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
-    block_config: FusedMoEBlockConfig | None = None,
+    block_config: A2AFusedMoEV2BlockConfig | None = None,
     direct_scaled_dot: bool = False,
     cross_expert_prefetch_mode: str = "full",
     # Number of rotating gather banks (K) for the gather-compute overlap software
@@ -2558,7 +2558,7 @@ def fused_ep_moe_v2(
         num_tokens = local_num_tokens * ep_size
 
     if block_config is None:
-        block_config = FusedMoEBlockConfig(
+        block_config = A2AFusedMoEV2BlockConfig(
             bt=min(16, local_num_tokens),
             bf=256,
             btc=128,
