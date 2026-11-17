@@ -309,7 +309,7 @@ class TestExperimentalEagle3(CustomTestCase):
         )
         kept, trimmed = outputs(), outputs()
         with patch(
-            "sglang_tpu.experimental.sampling.sampling_batch_info.is_host_padded",
+            "sglang_tpu.hooks.experimental_spec.is_host_padded",
             side_effect=lambda info: info is batch.sampling_info,
         ):
             keep_host_padded_extend_outputs(trim, batch, kept)

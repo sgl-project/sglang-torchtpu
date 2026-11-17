@@ -111,7 +111,6 @@ from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import SettledTransfer
 
-
 # Re-exported so that "from …raiden.conn import X" keeps resolving for the
 # callers and tests that predate the split into common/sender/receiver.
 __all__ = [
@@ -183,6 +182,11 @@ class RaidenKVManager(
     # Whether an engine stages through fewer host buffers than device layers.
     _bounded_staging = False
     _listener_start_read = False
+    # Seconds between decode listener sweeps, from
+    # SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.
+    _listener_sweep_interval_s = 1.0
+    _stop_listener: Optional[threading.Event] = None
+    _last_scheduler_drain = float("-inf")
     # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
     kv_layout: str = PER_LAYER_KV_LAYOUT
     # Shared-buffer Full+SWA pool when --enable-unified-memory is active.
@@ -352,6 +356,8 @@ class RaidenKVManager(
         # skipped -- its pages then ride the closing transfer.
         self._announce_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._drain_lock = threading.Lock()
+        self._stop_listener = threading.Event()
 
         self._prefill: Optional[PrefillState] = None
         self._decode: Optional[DecodeState] = None
@@ -366,6 +372,7 @@ class RaidenKVManager(
             self._start_heartbeat_checker_thread()
             self._decode = DecodeState()
             self._listener_start_read = tpu_envs.SGLANG_RAIDEN_LISTENER_START_READ.get()
+            self._listener_sweep_interval_s = self._read_listener_sweep_interval()
 
         # Native I/O tracking stays on the manager: it survives room cleanup.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -870,8 +877,35 @@ class RaidenKVManager(
         return start, tail
 
     def _drain_engine(self) -> None:
+        """Take the engines' settled transfers into the room tables.
+
+        The scheduler's poll and the listener's stall sweep both drain here;
+        the lock keeps two callers from interleaving one engine's poll with
+        the bookkeeping of another. Host reads of the DRAM offload channel
+        drain only here, on the scheduler: HiCache's wrapper owns their
+        native reports, and the listener sweep must not poll it.
+        """
         if self.dram_offload_channel is not None:
             self.dram_offload_channel.drain_host_reads()
+        self._last_scheduler_drain = time.monotonic()
+        with self._drain_lock:
+            self._drain_engine_serialized()
+
+    def _try_drain_engine(self) -> bool:
+        """Drain settled transfers unless another caller is already draining.
+
+        Used by the decode listener sweep so a scheduler blocked inside a
+        native poll or unregister cannot stall listener message dispatch.
+        """
+        if not self._drain_lock.acquire(blocking=False):
+            return False
+        try:
+            self._drain_engine_serialized()
+        finally:
+            self._drain_lock.release()
+        return True
+
+    def _drain_engine_serialized(self) -> None:
         if self._pipeline is not None:
             sent, received, failed = self._pipeline.poll()
             with self._state_lock:
@@ -991,13 +1025,15 @@ class RaidenKVManager(
         """One engine's sent, received and failed transfers, or None if the
         poll raised.
 
-        Runs inside the scheduler's poll, so an escaping exception would take
-        down every request on this worker. Raiden raises from
-        ``poll_stats_with_details`` only before it takes any completion, so a
-        failed poll loses nothing and the next one reports it. Raiden's
-        transfer deadlines are reported through it too: once polls have failed
-        for longer than one deadline no transfer can settle, and that is raised
-        rather than left to hang every request with its pages held.
+        Runs inside ``_drain_engine_serialized`` on both the scheduler's poll
+        and the decode listener's stall sweep. In the scheduler's poll, an
+        escaping exception takes down every request on this worker. Raiden
+        raises from ``poll_stats_with_details`` only before it takes any
+        completion, so a failed poll loses nothing and the next one reports
+        it. Raiden's transfer deadlines are reported through it too: once
+        polls have failed for longer than one deadline no transfer can settle,
+        and that raises ``RuntimeError`` (fatal on the scheduler's poll;
+        logged and retried on the listener sweep until the scheduler polls).
         """
         try:
             stats = engine.poll_stats_with_details()
@@ -1216,17 +1252,51 @@ class RaidenKVManager(
 
     # ----- rendezvous (ZMQ over the existing per-rank PULL socket) -----------
 
+    def _read_listener_sweep_interval(self) -> float:
+        """SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S, checked against the chunk
+        transfer deadline: a sweep that comes later than the deadline cannot
+        save a read the stalled scheduler is holding."""
+        interval = tpu_envs.SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.get()
+        if not (math.isfinite(interval) and 0 < interval < self._timeout_s):
+            raise ValueError(
+                f"{tpu_envs.SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.name} must be "
+                f"> 0 and below {tpu_envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.name}"
+                f" ({self._timeout_s:g} s), got {interval!r}"
+            )
+        return interval
+
     def _listen(self) -> None:
-        while True:
+        # chunked_transfer and _pipeline are only known after set_kv_caches,
+        # which runs after this thread starts; _sweep_pulls checks them per sweep.
+        sweeps = self._decode is not None and self._listener_start_read
+        stop = self._stop_listener
+        next_sweep = time.monotonic() + self._listener_sweep_interval_s
+        while stop is None or not stop.is_set():
             try:
-                msg = self.server_socket.recv_multipart()
+                ready = not sweeps or self.server_socket.poll(
+                    max(0, int((next_sweep - time.monotonic()) * 1000))
+                )
+                if stop is not None and stop.is_set():
+                    break
+                msg = self.server_socket.recv_multipart() if ready else None
             except Exception as e:
                 logger.error("RaidenKVManager listener error: %s", e)
                 continue
-            try:
-                self._dispatch(msg)
-            except Exception as e:
-                logger.error("RaidenKVManager message handling error: %s", e)
+            if msg is not None:
+                try:
+                    self._dispatch(msg)
+                except Exception as e:
+                    logger.error("RaidenKVManager message handling error: %s", e)
+            if sweeps and time.monotonic() >= next_sweep:
+                now = time.monotonic()
+                interval = self._listener_sweep_interval_s
+                next_sweep = now + interval
+                if now - self._last_scheduler_drain < interval:
+                    continue
+                try:
+                    self._sweep_pulls()
+                except Exception as e:
+                    logger.error("RaidenKVManager pull sweep error: %s", e)
 
     def _dispatch(self, msg: List[bytes]) -> None:
         """Route one multipart message from the per-rank PULL socket by its tag."""
