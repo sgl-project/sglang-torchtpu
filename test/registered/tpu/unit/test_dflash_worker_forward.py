@@ -453,6 +453,7 @@ def _make_schedule_batch(
             multi_item_delimiter_indices=None,
             dllm_block_offset=0,
             bootstrap_room=None,
+            cache_request_handle=None,
         )
         for i in range(len(seq_lens))
     ]

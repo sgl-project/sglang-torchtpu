@@ -194,6 +194,10 @@ class TpuEnvs:
     # token reads its history there instead of gathering it at every chunk.
     # Each slot holds max-context latents and index keys; 0 gathers always.
     SGLANG_TPU_DCP_PREFILL_SCRATCH = EnvInt(0)
+    # Gathered sparse MLA DCP prefill: gather the group's pages with a DMA
+    # all-gather (kernels/dcp_group_all_gather.py) instead of the zero-padded
+    # all-reduce, which sends dcp_size times the payload.
+    SGLANG_TPU_DCP_PREFILL_ALL_GATHER = EnvBool(False)
     # That all-reduce: the most rows (decode batch size) it takes; larger
     # batches keep XLA's all-reduce. 1 = single-token decode only, where it
     # was measured; the kernel packs up to MAX_ELEMS elements.

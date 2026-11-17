@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
 )
@@ -58,6 +59,7 @@ from sglang_tpu.dsa_indexer_tpu import (
 )
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import _zeros_kv_buffer
+from sglang_tpu.oneshot_collectives import get_dcp_group_all_gather_op
 from sglang_tpu.pallas_export import (
     argnums,
     tpu_info_for_cpu_export,
@@ -373,6 +375,17 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # Prefill under DCP: gather an unsharded cache, or the decode path.
         self._dcp_gathers_prefill = (
             self._dcp > 1 and not tpu_envs.SGLANG_TPU_DCP_PREFILL_HEAD_PARALLEL.get()
+        )
+        self._dcp_all_gather = (
+            self._dcp_gathers_prefill
+            and tpu_envs.SGLANG_TPU_DCP_PREFILL_ALL_GATHER.get()
+        )
+        # The DMA all-gather addresses peers by position on the attention-TP mesh.
+        # Built here: the op registry takes a lock, which traced code cannot.
+        self._dcp_all_gather_op = (
+            get_dcp_group_all_gather_op(get_parallel().attn_tp_size, self._dcp)
+            if self._dcp_all_gather
+            else None
         )
         self._dcp_scratch_slots = (
             tpu_envs.SGLANG_TPU_DCP_PREFILL_SCRATCH.get()
@@ -729,22 +742,24 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         state = self._dcp_scratch_state
         if self._dcp_gather_bucket_override == _DCP_SCRATCH_BUCKET:
             return list(range(len(need))) if len(need) <= len(state) else None
-        rids = forward_batch.rids
+        owners = forward_batch.cache_request_handles
         prefix = forward_batch.extend_prefix_lens_cpu
         if (
             not state
             or self._dcp_gather_bucket_override is not None
-            or rids is None
+            or owners is None
             or prefix is None
         ):
             return None
-        rows = len(rids)
-        # Rows past the requests are padding and must read nothing.
-        if rows > len(need) or any(need[rows:]):
+        rows = len(owners)
+        # Rows past the requests are padding and must read nothing. Warmup
+        # compiles the scratch variant only for padded batches that fit the
+        # slots (dcp_gather_buckets); a wider one gathers.
+        if rows > len(need) or any(need[rows:]) or len(need) > len(state):
             return None
         slots = plan_scratch_slots(
             state,
-            rids=rids,
+            owners=owners,
             prefix_lens=[int(n) for n in prefix[:rows]],
             seq_lens=seq_lens[:rows],
         )
@@ -820,8 +835,8 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             # Only a warmup bucket below the need truncates (its rows are dummies).
             n = max(0, min(n, size - offset))
             gather[offset : offset + n] = row * pages_per_seq + torch.arange(n)
-            dense[row, : n * self._dcp] = offset * self._dcp + torch.arange(
-                n * self._dcp, dtype=torch.int32
+            dense[row, : n * self._dcp] = self._dcp_dense_page_ids(
+                first=offset, count=n, gathered=size
             )
             offset += n
         md.dcp_gather_index = self._value_metadata(
@@ -843,10 +858,26 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         md = self.forward_metadata
         return md.page_indices.index_select(0, md.dcp_gather_index).to(torch.int32)
 
+    def _dcp_dense_page_ids(
+        self, *, first: int, count: int, gathered: int
+    ) -> torch.Tensor:
+        """i32[count * dcp]: where _dcp_dense_cache puts the unsharded pages of
+        gathered widened pages ``[first, first + count)``, in position order
+        (widened page, then rank). The all-reduce gather is page-major, the DMA
+        all-gather member-major over all ``gathered`` listed pages."""
+        j = torch.arange(count * self._dcp, dtype=torch.int32)
+        if self._dcp_all_gather:
+            return (j % self._dcp) * gathered + first + j // self._dcp
+        return first * self._dcp + j
+
     def _dcp_dense_cache(self, pages: torch.Tensor) -> torch.Tensor:
         """The group's pages put together unsharded, at the page table
-        ``dcp_dense_pages``: dense page ``g * dcp + r`` is rank r's ``pages[g]``,
-        rank r's run of the g-th listed widened page."""
+        ``dcp_dense_pages`` (_dcp_dense_page_ids): rank r's ``pages[g]`` is rank
+        r's run of the g-th listed widened page."""
+        if self._dcp_all_gather:
+            # Rank-major [dcp, G, ...]: every page buffer is whole 128-byte lanes.
+            gathered = self._dcp_all_gather_op(pages.reshape(-1, 128), self._cp_rank_t)
+            return gathered.reshape(self._dcp * pages.shape[0], *pages.shape[1:])
         # Zero-padded int32 sums are exact; bytes are summed as words.
         words = pages.view(torch.int32)
         gathered = _all_reduce_gather(
