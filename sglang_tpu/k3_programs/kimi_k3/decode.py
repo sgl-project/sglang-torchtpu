@@ -20,6 +20,12 @@ host's tokens lag (async scheduling). A step is one of:
   structured-output request decodes (grammar masks: the verify ops do not
   mask, so the whole batch steps plain, without drafts).
 
+A new request's first verify carries placeholder drafts (none accepted: one
+token), unless the colocated prefill left the aux streams of its prompt's last
+position (``first_aux``, first-step drafts): then the draft op runs once on
+them before that verify (none accepted, the prefill's token as the bonus) and
+the verify takes its drafts as a continuing request's.
+
 The verify ops decide acceptance and commit only the selected KDA post-state.
 Under attention DP a request's pages and KDA state live on the DP group its MLA
 block ids name (``megakernel.dp_blocks``), and it takes one of that group's
@@ -57,6 +63,7 @@ from sglang_tpu.k3_programs.kimi_k3.pools import (
 )
 from sglang_tpu.k3_programs.kimi_k3.program import (
     DP_SPEC_BATCHES,
+    TP_SIZE,
     VOCAB,
     compiled_spec_batches,
     draft_rows,
@@ -82,6 +89,10 @@ class KimiDecoder:
     holds the compiled (padded request count, verify rows per request) pairs."""
 
     WIDTH = DecodeOps.VERIFY_ROWS  # tokens per row of a step's result
+    # First-step drafts off unless sglang_colocated.share_first_aux sets the
+    # dict (also for decoders built without __init__).
+    first_aux: dict[str, torch.Tensor] | None = None
+    _predraft_logits: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -115,6 +126,12 @@ class KimiDecoder:
         self.next_packet: torch.Tensor | None = None
         # Rings the prefill computed, per request, for its first speculation.
         self._offered: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Colocated, with first-step drafts (sglang_colocated.share_first_aux):
+        # each new request's aux operand for the draft op the prefill left
+        # (its last prompt position's aux streams), by request id; shared with
+        # the prefill program. None: first steps verify placeholder rows.
+        self.first_aux: dict[str, torch.Tensor] | None = None
+        self._predraft_logits: torch.Tensor | None = None
         # With a draft, the schedule (vLLM's per-batch-size draft count,
         # validated in kimi_k3.program) says which batch sizes speculate; every
         # compiled verifier/drafter shape is derived from it.
@@ -170,6 +187,7 @@ class KimiDecoder:
             "packets": 0,
             "plain": 0,
             "batched": 0,
+            "predrafts": 0,
         }
         self._group: dict[str, tuple[int, int]] = {}  # request -> (DP group, context)
         # Import each transferred request's DSpark ring: with a DSpark
@@ -629,6 +647,8 @@ class KimiDecoder:
             self._offered.pop(req, None)
             self._drafts.pop(req, None)
             self._fresh.pop(req, None)
+            if self.first_aux is not None:
+                self.first_aux.pop(req, None)
         if self.spec_req in finished:
             self.spec_req, self.draft_state, self.next_ids = None, None, None
             self.next_packet = None
@@ -833,6 +853,12 @@ class KimiDecoder:
             self._park_single()
             self.spec_req = request.req_id
             self.draft_state = self._take_state(request.req_id)
+            aux = self._first_aux_for(request, entries[0]) if reset else None
+            if aux is not None:
+                # Drafts after the prefill's token: this step verifies them as
+                # a continuing request's (chained, mode 1).
+                self._predraft(entries[0], tables[0], request, aux)
+                continuing, changed = True, False
         assert self.draft_state is not None and self.layout is not None
         chained = continuing and not changed
         if chained:
@@ -878,6 +904,97 @@ class KimiDecoder:
             self.device_plan = self.layout.consumed(self.device_plan, 1)
         self._fresh[request.req_id] = self.WIDTH
         return emitted
+
+    def _first_aux_for(self, request: RequestInput, entry) -> torch.Tensor | None:
+        """``request``'s first-speculation aux operand (``first_aux``), when
+        its first step can verify drafts made from it: the prefill computed
+        the whole prompt and nothing else (the step's input is the prefill's
+        token at the prompt's end) and the step schedules every verify row."""
+        if self.first_aux is None:
+            return None
+        aux = self.first_aux.pop(request.req_id, None)
+        position = entry[3]
+        if (
+            aux is None
+            or request.scheduled != self.WIDTH
+            or request.computed != request.num_prompt_tokens
+            or position != request.computed
+            or position < 1
+        ):
+            return None
+        return aux
+
+    def predraft_ids(
+        self, slot: int, token: int, position: int, previous: int, table
+    ) -> np.ndarray:
+        """The single draft op's packed operand (``_enter``'s layout:
+        tokens, positions, slots, the state row, the table per row) for a
+        verify at ``position - 1`` whose input was ``previous`` (the last
+        prompt token) and whose bonus is ``token`` at ``position``: the op
+        drafts after ``token`` from the context before ``position``."""
+        layout = self.layout
+        assert layout is not None
+        rows, pages = self.WIDTH, layout.pages
+        row = np.zeros(pages, np.int32)
+        width = min(pages, len(table))
+        row[:width] = np.asarray(table[:width], np.int32)
+        tokens = np.full(rows, token, np.int32)
+        tokens[0] = previous
+        return np.concatenate(
+            (
+                tokens,
+                position - 1 + np.arange(rows, dtype=np.int32),
+                np.full(rows, slot, np.int32),
+                np.zeros(1, np.int32),  # state row: the slot's own (a new request)
+                np.tile(row, rows),
+            )
+        ).astype(np.int32)
+
+    def _predraft(self, entry, table, request: RequestInput, aux) -> None:
+        """Drafts for a new request's first verify: the draft op on the
+        prompt's last position (``aux``: its aux streams, from the prefill),
+        no draft accepted and the prefill's token as the bonus. It writes the
+        draft's context at that position (as the prefill did) and leaves the
+        control, the draft state and the next verify's operand as after a
+        step that emitted the prefill's token."""
+        slot, _, token, position, _ = entry
+        previous = int(request.token_ids[position - 1])
+        self._run_predraft(slot, int(token), int(position), previous, table, aux)
+        self.stats["predrafts"] += 1
+
+    def _run_predraft(
+        self, slot: int, token: int, position: int, previous: int, table, aux
+    ) -> None:
+        assert self.draft is not None and self.layout is not None
+        assert self.control is not None
+        device = self.control.device
+        if self._predraft_logits is None:
+            # The op's acceptance is forced (none accepted, the given bonus):
+            # the verify logits it would read only fill the vector's target
+            # lanes, which nothing reads.
+            self._predraft_logits = torch.zeros(
+                (1, self.WIDTH, self.draft.config.vocab // TP_SIZE),
+                dtype=torch.float32,
+            ).to(device)
+        ids = torch.from_numpy(
+            self.predraft_ids(slot, token, position, previous, table)
+        ).to(device)
+        decisions = torch.tensor([[0, token]], dtype=torch.int32).to(device)
+        self.draft_state, _, self.next_ids, self.control, *packets = (
+            self.draft.step_single(
+                self.draft_state,
+                aux,
+                self._predraft_logits,
+                ids,
+                self.control,
+                decisions,
+                self.layout,
+            )
+        )
+        self.next_packet = packets[0] if packets else None
+        if self.device_plan is not None:
+            # The op consumed the plan row's reset (the slot now continues).
+            self.device_plan = self.layout.consumed(self.device_plan, 1)
 
     def _speculate_batched(
         self, decoding, entries, tables, sampled: bool, compiled: int, groups
@@ -1135,6 +1252,52 @@ class KimiDecoder:
                 packet = packets[0] if packets else None
             materialize(emitted)
 
+        def speculate_predrafted(sampled: bool) -> None:
+            """First-step drafts: a new request's first verify takes the
+            drafts the draft op made after its prefill token (the op on an
+            aux operand another op produced, as the prefill's export is),
+            then it continues."""
+            params = (0.7, 0.9, 20, 1) if sampled else GREEDY
+            self.device_plan = None
+            self._sync_plan([(0, True, 0, 1, params)], [null])
+            self.draft_state = self.draft.new_state(self._zero)
+            (ids,) = self._enter()(
+                self.control, self.draft_state.vector, self._modes[0]
+            )
+            _, aux, _ = self.ops.verify_packed(
+                ids,
+                self.draft.aux_layers,
+                self.layout,
+                self.control,
+                self._modes[0],
+                self.draft._synthetic_rates(self.WIDTH - 1),
+            )
+            self._run_predraft(0, 0, 1, 0, null, aux)
+            ids, packet, emitted = self.next_ids, self.next_packet, None
+            for _ in range(2):
+                sharded, aux, decisions = self.ops.verify_packed(
+                    ids,
+                    self.draft.aux_layers,
+                    self.layout,
+                    self.control,
+                    self._modes[1],
+                    self.draft._synthetic_rates(self.WIDTH - 1),
+                    packet=packet,
+                )
+                self.draft_state, emitted, ids, self.control, *packets = (
+                    self.draft.step_single(
+                        self.draft_state,
+                        aux,
+                        sharded,
+                        ids,
+                        self.control,
+                        decisions,
+                        self.layout,
+                    )
+                )
+                packet = packets[0] if packets else None
+            materialize(emitted)
+
         def speculate_batched(
             sampled: bool, requests: int, rows_per: int, offered=None, states=None
         ) -> list:
@@ -1183,6 +1346,9 @@ class KimiDecoder:
                     speculate(sampled)
                     if ring is not None:
                         speculate(sampled, ring())
+                    if self.first_aux is not None and ring is None:
+                        speculate_predrafted(sampled)
+                        speculate(sampled)
                 for requests, rows_per in self.spec_shapes:
                     speculate_batched(sampled, requests, rows_per)
                     if ring is not None:

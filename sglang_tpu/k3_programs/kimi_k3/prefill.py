@@ -84,6 +84,9 @@ PAGE_TOKENS = 256
 SLOTS = 16  # sequences per window, at most (and at most one per page)
 GROUP_PAIRS = 11  # regular 8-layer groups: layers 4..91
 COPY_PAIRS = 8  # copy-on-write block copies per PoolWriter.copy_blocks call
+# First-step drafts: requests' aux operands kept for the decoder at most (each
+# is taken on the request's first decode step; ~0.6 MiB a rank).
+FIRST_AUX_KEPT = 8
 
 
 def live_slots(used: int, slots: int) -> int:
@@ -238,6 +241,20 @@ def pack_windows(
 # expert operand in every fused MoE call. No padding or device-side copies.
 _EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
 _EXPERT_BANK_SIZES = (3,) + (8,) * 11 + (1,)
+
+
+def last_prompt_rows(rows, members, order: np.ndarray, count: int):
+    """Each of a packed window's ``count`` slots' last prompt row in
+    ownership order (``order``: ``PrefillProgram.sp_order``, the window rows
+    the ranks hold, rank-major), -1 for a sequence whose prompt continues past
+    the window (or an unused slot); None when no sequence finishes its prompt
+    in the window. ``members`` are the window's ``(piece, offset)``."""
+    inverse = np.argsort(order)
+    picked = np.full(count, -1, np.int32)
+    for s, (piece, offset) in enumerate(members):
+        if piece.end >= rows[piece.row].num_prompt_tokens and piece.length:
+            picked[s] = inverse[offset + piece.length - 1]
+    return picked if (picked >= 0).any() else None
 
 
 def _bank_expert_weights(iterator):
@@ -1293,6 +1310,10 @@ class KimiPrefiller:
         # With the MLA DSpark draft (Inferact/Kimi-K3-DSpark): each window's
         # draft context latents, written to the draft's KV cache layers.
         self.draft_latents = None
+        # Colocated, with first-step drafts (sglang_colocated.share_first_aux):
+        # the decode's first-speculation aux operand of each request that
+        # finished its prompt, by request id (shared with the decoder).
+        self.first_aux: dict[str, torch.Tensor] | None = None
         if draft_checkpoint is not None:
             (mla,) = kernel_modules("dspark_mla")
             if mla.is_mla_draft(Path(draft_checkpoint)):
@@ -1664,6 +1685,7 @@ class KimiPrefiller:
         ids, local_bases, write_table = self._cp_operands(rows, by_row, window, members)
         order = self.program.sp_order(window)  # the ranks' rows, rank-major
         ring_hook, ring_out = None, {}
+        picked = None
         if self.draft_latents is not None:
             draft_positions = np.full(window, -1, np.int32)
             for piece, offset in members:
@@ -1671,11 +1693,21 @@ class KimiPrefiller:
                     piece.start, piece.end
                 )
 
+            # First-step drafts: each sequence finishing its prompt here keeps
+            # the aux streams of its last position, the row the decode's first
+            # speculation drafts from.
+            if self.first_aux is not None:
+                picked = last_prompt_rows(rows, members, order, count)
+
             def ring_hook(blocks, prefix, middle, entering):
                 assert self.draft_latents is not None
                 ring_out["draft"] = self.draft_latents.latents(
                     window, blocks, entering, draft_positions, order
                 )
+                if picked is not None:
+                    ring_out["first_aux"] = self.draft_latents.first_aux(
+                        window, blocks, entering, picked
+                    )
 
         if self.ring is not None:
             positions = np.full(window, -1, np.int32)
@@ -1741,6 +1773,12 @@ class KimiPrefiller:
             self.draft_latents.write(
                 ring_out["draft"], write_table, self._writer.layout.block_shape
             )
+        if "first_aux" in ring_out:
+            for s, (piece, _) in enumerate(members):
+                if picked is not None and picked[s] >= 0:
+                    self._keep_first_aux(
+                        by_row[piece.row][0].req_id, ring_out["first_aux"][s]
+                    )
         for s, ((piece, _), pair) in enumerate(
             zip(members, self.program.split_states(recurrent, conv))
         ):
@@ -1759,6 +1797,16 @@ class KimiPrefiller:
                 ),
             )
         return logits
+
+    def _keep_first_aux(self, req_id: str, aux: torch.Tensor) -> None:
+        """``req_id``'s first-speculation aux operand for the decoder, which
+        takes it on the request's first decode step; a request that never
+        decodes (it ends at its first token) leaves it to the cap."""
+        assert self.first_aux is not None
+        self.first_aux.pop(req_id, None)
+        self.first_aux[req_id] = aux
+        while len(self.first_aux) > FIRST_AUX_KEPT:
+            del self.first_aux[next(iter(self.first_aux))]
 
     def _cp_operands(
         self, rows: Sequence[RequestInput], by_row, window: int, members
@@ -2021,6 +2069,7 @@ class KimiPrefiller:
                     window=window,
                     order=order,
                     ring_out=ring_out,
+                    count=count,
                 ):
                     assert self.draft_latents is not None
                     ring_out["draft"] = self.draft_latents.latents(
@@ -2030,6 +2079,11 @@ class KimiPrefiller:
                         np.full(window, -1, np.int32),
                         order,
                     )
+                    if self.first_aux is not None:
+                        # Compiled here, not on a request's last chunk.
+                        ring_out["first_aux"] = self.draft_latents.first_aux(
+                            window, blocks, entering, np.zeros(count, np.int32)
+                        )
 
             logits, latents, recurrent, conv, recurrent_at, conv_at = (
                 self.program.run_packed(
@@ -2068,6 +2122,7 @@ class KimiPrefiller:
                     _rank_zeros_i32(window // self.page_tokens),
                     writer.layout.block_shape,
                 )
+            outputs += list(ring_out.get("first_aux", ()))
         count = self.slots  # a hit-state read's sequences (_read_hit_states)
         outputs.append(writer.read_states(_zeros_i32(count * KDA_LAYERS))[0])
         if self.ring is not None:
