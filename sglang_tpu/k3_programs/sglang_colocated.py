@@ -47,10 +47,17 @@ SHARED_DENSE = {
 def shared_dense() -> dict[str, tuple[str, ...]]:
     """The dense families the prefill takes from the decode program: under
     attention DP the decode holds several head shards of some KDA and MLA
-    families (``ATTENTION_DP_WEIGHTS``), so the prefill keeps its own."""
+    families (``ATTENTION_DP_WEIGHTS``), so the prefill keeps its own; with
+    ``kda_fp8_projections`` the decode's KDA input projection is FP8, so the
+    prefill loads its own BF16 one."""
     from sglang_tpu.k3_programs.kimi_k3.config import active
 
     if getattr(active(), "attention_dp", 1) == 1:
+        if getattr(active(), "kda_fp8_projections", False):
+            return {
+                group: tuple(n for n in names if n != "k_projection")
+                for group, names in SHARED_DENSE.items()
+            }
         return SHARED_DENSE
     from sglang_tpu.k3_programs.kimi_k3.kernels.decode_megakernel import (
         ATTENTION_DP_WEIGHTS,

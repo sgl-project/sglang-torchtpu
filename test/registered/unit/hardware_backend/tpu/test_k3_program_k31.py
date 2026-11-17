@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=1850, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2300, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -3501,6 +3501,361 @@ class TestFirstPairGateUpCopies(CustomTestCase):
             text=True,
             env=env,
             timeout=900,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
+
+
+class TestKdaFp8Families(CustomTestCase):
+    """KernelConfig.kda_fp8_projections at load: each column of the decode's
+    KDA input and output projections becomes FP8 e4m3 of the column divided by
+    its absolute maximum / 448 (rounded to nearest), with that FP32 scale."""
+
+    def test_columns_scale_to_448_and_round_to_nearest(self):
+        import ml_dtypes
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import rank_loader
+
+        rng = np.random.default_rng(0)
+        weight = (rng.standard_normal((256, 384)) * rng.uniform(1e-3, 1, 384)).astype(
+            ml_dtypes.bfloat16
+        )
+        weight[:, 5] = 0
+        values, scale = rank_loader.quantize_columns_fp8(weight)
+        self.assertEqual(values.dtype, ml_dtypes.float8_e4m3fn)
+        self.assertEqual((values.shape, scale.shape), ((256, 384), (1, 384)))
+        self.assertEqual(scale.dtype, np.float32)
+        exact = weight.astype(np.float32)
+        peak = np.abs(exact).max(axis=0)
+        np.testing.assert_array_equal(scale[0, 5], 1)
+        np.testing.assert_array_equal(values[:, 5].astype(np.float32), 0)
+        live = peak > 0
+        np.testing.assert_array_equal(scale[0, live], peak[live] / np.float32(448))
+        # The column maximum lands on 448; every value is the nearest FP8.
+        decoded = values.astype(np.float32)
+        np.testing.assert_array_equal(np.abs(decoded[:, live]).max(axis=0), 448)
+        np.testing.assert_array_equal(
+            decoded, (exact / scale).astype(ml_dtypes.float8_e4m3fn).astype(np.float32)
+        )
+        # Normal-range values are within half an FP8 ulp (2^-4 relative).
+        normal = np.abs(exact / scale) >= 2.0**-6
+        error = np.abs(decoded * scale - exact)[normal] / np.abs(exact)[normal]
+        self.assertLessEqual(error.max(), 2.0**-4 + 1e-6)
+
+    def test_families_replace_both_projections_per_layer(self):
+        import ml_dtypes
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import rank_loader
+
+        rng = np.random.default_rng(1)
+        families = {
+            "k_projection": (rng.standard_normal((3, 64, 256)) * 0.02).astype(
+                ml_dtypes.bfloat16
+            ),
+            "k_o": (rng.standard_normal((3, 96, 128)) * 0.02).astype(
+                ml_dtypes.bfloat16
+            ),
+            "k_gate": np.ones((3, 64, 128), ml_dtypes.bfloat16),
+        }
+        sources = {name: families[name].copy() for name in ("k_projection", "k_o")}
+        converted = rank_loader.kda_fp8_families(families)
+        self.assertEqual(sorted(families), ["k_gate"])  # BF16 sources popped
+        self.assertEqual(
+            sorted(converted),
+            ["k_o", "k_o_scale", "k_projection", "k_projection_scale"],
+        )
+        for name, source in sources.items():
+            values, scale = converted[name], converted[f"{name}_scale"]
+            self.assertEqual(values.dtype, ml_dtypes.float8_e4m3fn)
+            self.assertEqual(scale.shape, (3, 1, source.shape[-1]))
+            for layer in range(3):
+                want_values, want_scale = rank_loader.quantize_columns_fp8(
+                    source[layer]
+                )
+                np.testing.assert_array_equal(
+                    values[layer].view(np.uint8), want_values.view(np.uint8)
+                )
+                np.testing.assert_array_equal(scale[layer], want_scale)
+
+    def test_fp8_families_upload_as_torch_fp8(self):
+        import ml_dtypes
+        import torch
+
+        from sglang_tpu.k3_programs import bridge
+
+        values = np.linspace(-448, 448, 64, dtype=np.float32).astype(
+            ml_dtypes.float8_e4m3fn
+        )
+        tensor = bridge.host_tensor(values.reshape(8, 8))
+        self.assertEqual(tensor.dtype, torch.float8_e4m3fn)
+        np.testing.assert_array_equal(
+            tensor.view(torch.uint8).numpy().reshape(-1), values.view(np.uint8)
+        )
+        halves = np.ones(4, ml_dtypes.bfloat16)
+        self.assertEqual(bridge.host_tensor(halves).dtype, torch.bfloat16)
+
+    def test_colocated_prefill_keeps_its_bf16_input_projection(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from sglang_tpu.k3_programs import sglang_colocated as colocated
+
+        for fp8 in (False, True):
+            config = SimpleNamespace(attention_dp=1, kda_fp8_projections=fp8)
+            with mock.patch(
+                "sglang_tpu.k3_programs.kimi_k3.config.active", return_value=config
+            ):
+                kda = colocated.shared_dense()["kda"]
+            self.assertEqual("k_projection" in kda, not fp8)
+            self.assertIn("k_gate", kda)
+
+
+class TestKdaFp8OutputProjection(CustomTestCase):
+    """The token-scattered attention output projection
+    (``_project_attention_2d``) with FP8 weights and FP32 column scales
+    (KernelConfig.kda_fp8_projections, rank_loader.quantize_columns_fp8) at B8
+    and B16 in Pallas interpret mode on 32 host devices: every rank's FP32
+    partial is the FP64 product of the dequantized weights (own and peer
+    halves, columns scaled ~10x apart) to FP32 accuracy, and its owned rows
+    are, bit for bit, the reduction's rounding points applied to those
+    partials (as TestAttentionHostBf16 checks for BF16 weights)."""
+
+    MAIN = r"""
+
+def project_scaled(attended, weight, scale):
+    B = attended.shape[1]
+    dmk.ATTENTION_HOST_BF16 = False
+    scratch = dmk.communication_scratch(B)
+    backing = max(16, -(-B // 16) * 16)
+
+    def kernel(attended_ref, weight_ref, scale_ref, owned_out, partial_out, out, comm,
+               local, host, features, outputs, sends, recvs, phase):
+        phase[0] = 0
+        local[...] = jnp.full(local.shape, jnp.nan, jnp.float32)
+        host[...] = jnp.full(host.shape, jnp.nan, jnp.float32)
+        features[...] = jnp.full(features.shape, jnp.nan, jnp.bfloat16)
+        outputs[...] = jnp.full(outputs.shape, jnp.nan, jnp.bfloat16)
+        dmk._project_attention_2d(
+            attended_ref[...], weight_ref, out, comm, local, host, features, outputs,
+            sends, recvs, phase, dmk._dot, token_scatter_output=True,
+            weight_scale=scale_ref)
+        owned_out[...] = outputs[...]
+        partial_out[...] = comm[...]
+
+    vmem = pltpu.VMEM
+
+    def body(attended, weight, scale):
+        owned, partial = pl.pallas_call(
+            kernel,
+            out_shape=(jax.ShapeDtypeStruct((backing, H), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((B, 8192), jnp.float32)),
+            in_specs=[pl.BlockSpec(memory_space=vmem)] * 3,
+            out_specs=[pl.BlockSpec(memory_space=vmem)] * 2,
+            scratch_shapes=[vmem((B, H), jnp.bfloat16), vmem((B, 8192), jnp.float32),
+                            scratch[0], scratch[2], vmem((backing, 1024), jnp.bfloat16),
+                            vmem((backing, H), jnp.bfloat16), pltpu.SemaphoreType.DMA((16,)),
+                            pltpu.SemaphoreType.DMA((16,)), pltpu.SMEM((1,), jnp.int32)],
+            compiler_params=pltpu.CompilerParams(has_side_effects=True),
+            interpret=pltpu.InterpretParams(),
+        )(attended[0], weight[0], scale[0])
+        return owned[None], partial[None]
+
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("tp"),) * 3,
+                              out_specs=(P("tp"), P("tp")), check_vma=False))
+    return [np.asarray(x) for x in f(attended, weight, scale)]
+
+
+F8 = ml_dtypes.float8_e4m3fn
+rng = np.random.default_rng(0)
+for B in (8, 16):
+    tpp = B // 4
+    attended = (rng.standard_normal((32, B, W)) * rng.uniform(0.2, 2.0, (32, 1, W))
+                / (1 + np.exp(-rng.standard_normal((32, B, W))))).astype(BF16)
+    full = (rng.standard_normal((32 * W, H)) * 0.01 * rng.uniform(0.3, 3, H)).astype(BF16)
+    # Rank r's shard: its pair's 768 features x its lane's output half.
+    weight = np.stack([full[768 * (r // 2):768 * (r // 2 + 1), (r % 2) * HALF:(r % 2 + 1) * HALF]
+                       for r in range(32)]).astype(np.float32)
+    peak = np.abs(weight).max(axis=1, keepdims=True)
+    scale = (peak / np.float32(448)).astype(np.float32)
+    values = (weight / scale).astype(F8)
+    owned, partial = project_scaled(attended, values, scale)
+    a = attended.astype(np.float64)
+    for r in range(32):
+        w = values[r].astype(np.float64) * scale[r].astype(np.float64)
+        own, peer = (r % 2) * W, (r % 2 ^ 1) * W
+        want = a[r] @ w[own:own + W] + a[r ^ 1] @ w[peer:peer + W]
+        err = np.abs(partial[r, :, :HALF] - want).max() / np.abs(want).max()
+        assert err < 1e-5, (B, r, err)
+    got = owned[:, :tpp]
+    assert np.array_equal(got.view(np.uint16), reference(partial, B, False).view(np.uint16)), B
+    for r in range(32):  # the four hosts' copies
+        for offset in (8, 16, 24):
+            assert np.array_equal(got[r].view(np.uint16), got[r ^ offset].view(np.uint16))
+    print(f"B{B}: FP64 partials, bit-exact rows")
+print("OK")
+"""
+
+    def test_fp8_partials_and_rows_match_the_dequantized_weights(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        harness = TestAttentionHostBf16.SCRIPT.split("rng = np.random.default_rng(0)")[0]
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [sys.executable, "-c", harness + self.MAIN],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1200,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
+
+
+
+class TestKdaFp8Layer(CustomTestCase):
+    """A KDA decode layer (``kda``: gate, input projection, short conv,
+    delta-rule recurrence, gated norm, token-scattered output projection) at
+    B8, as one 8-row verify sequence and as 8 plain rows, in Pallas interpret
+    mode on 32 host devices, with FP8 input and output projections and
+    power-of-two column scales (KernelConfig.kda_fp8_projections): every
+    rank's owned output rows and post-states equal, bit for bit, the layer
+    with FP32 copies of the dequantized weights (the interpret mode's
+    mixed-dtype products run in FP32 for both, and each scaled product is
+    exact)."""
+
+    MAIN = r"""
+from sglang_tpu.k3_programs.kimi_k3.layout import CONV_HEAD_ROWS
+
+F8 = ml_dtypes.float8_e4m3fn
+B = 8
+
+
+def layer(hidden, gate, inputs, fb, output, aux, history, state, scales, sequence_rows):
+    comm = dmk.communication_scratch(B)
+    in_dtype, out_dtype = inputs.dtype, output.dtype
+
+    def kernel(hidden_ref, gate_ref, input_ref, fb_ref, output_ref, conv_ref, decay_ref,
+               bias_ref, norm_ref, history_ref, state_ref, input_scale_ref, output_scale_ref,
+               history_out, state_out, owned_out, out, gate_vmem, input_vmem, fb_vmem,
+               output_vmem, copy_sems, *workspace):
+        ws = dmk.AttentionCommunicationWorkspace(*workspace)
+        ws.reduction_phase[0] = 0
+        for buffer in workspace[:4]:
+            buffer[...] = jnp.full(buffer.shape, jnp.nan, jnp.float32)
+        ws.attention_features_vmem[...] = jnp.full(ws.attention_features_vmem.shape, jnp.nan, jnp.bfloat16)
+        ws.attention_output_vmem[...] = jnp.full(ws.attention_output_vmem.shape, jnp.nan, jnp.bfloat16)
+        dmk.kda(
+            hidden_ref, out, history_out, state_out,
+            weights=dmk.KimiDeltaAttentionWeights(
+                gate_ref, gate_vmem, input_ref, input_vmem, fb_ref, fb_vmem, output_ref,
+                output_vmem, conv_ref, decay_ref, bias_ref, norm_ref, copy_sems,
+                input_projection_scale=input_scale_ref if scales else None,
+                output_projection_scale=output_scale_ref if scales else None),
+            convolution_history_ref=history_ref, recurrent_state_ref=state_ref,
+            communication_workspace=ws, synchronize_devices=False,
+            weights_are_prefetched=False, token_scatter_output=True,
+            sequence_rows=sequence_rows)
+        owned_out[...] = ws.attention_output_vmem[...]
+
+    vmem, anywhere = pltpu.VMEM, pl.ANY
+    spaces = [vmem, anywhere, anywhere, anywhere, anywhere] + [vmem] * 8
+
+    def body(*args):
+        outs = pl.pallas_call(
+            kernel,
+            out_shape=(jax.ShapeDtypeStruct(history.shape[1:], jnp.bfloat16),
+                       jax.ShapeDtypeStruct(state.shape[1:], jnp.float32),
+                       jax.ShapeDtypeStruct((16, H), jnp.bfloat16)),
+            in_specs=[pl.BlockSpec(memory_space=s) for s in spaces],
+            out_specs=[pl.BlockSpec(memory_space=vmem)] * 3,
+            scratch_shapes=[vmem((B, H), jnp.bfloat16), vmem((H, 128), jnp.bfloat16),
+                            vmem((H, 1664), in_dtype), vmem((128, 384), jnp.bfloat16),
+                            vmem((768, HALF), out_dtype), pltpu.SemaphoreType.DMA((4,)), *comm],
+            compiler_params=pltpu.CompilerParams(has_side_effects=True),
+            interpret=pltpu.InterpretParams(),
+        )(*(a[0] for a in args))
+        return tuple(o[None] for o in outs)
+
+    operands = (hidden, gate, inputs, fb, output, *aux, history, state, *scales_or_ones(scales))
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("tp"),) * len(operands),
+                              out_specs=(P("tp"),) * 3, check_vma=False))
+    return [np.asarray(x) for x in f(*operands)]
+
+
+def scales_or_ones(scales):
+    if scales:
+        return scales
+    return (np.ones((32, 1, 1664), np.float32), np.ones((32, 1, HALF), np.float32))
+
+
+def pow2_fp8(weight):
+    # FP8 values and power-of-two column scales; values x scales is exact in FP32.
+    exponent = np.floor(np.log2(np.abs(weight).max(axis=-2, keepdims=True) / 448)) + 1
+    scale = np.exp2(exponent).astype(np.float32)
+    values = (weight / scale).astype(F8)
+    exact = values.astype(np.float32) * scale
+    assert np.array_equal(exact.astype(np.float64), values.astype(np.float64) * scale)
+    return values, scale, exact
+
+
+rng = np.random.default_rng(0)
+rep = lambda x: np.broadcast_to(x, (32, *x.shape)).copy()
+hidden = rep((rng.standard_normal((B, H)) * rng.uniform(0.3, 3, H)).astype(BF16))
+gate = (rng.standard_normal((32, H, 128)) * 0.02).astype(BF16)
+inputs = (rng.standard_normal((32, H, 1664)) * 0.02 * rng.uniform(0.2, 5, (32, 1, 1664))).astype(np.float32)
+fb = (rng.standard_normal((32, 128, 384)) * 0.1).astype(BF16)
+output = (rng.standard_normal((32, 768, HALF)) * 0.02 * rng.uniform(0.2, 5, (32, 1, HALF))).astype(np.float32)
+aux = ((rng.standard_normal((32, 4, 3, 3, 128)) * 0.5).astype(BF16),
+       rng.uniform(-1, 1, (32, 3, 1)).astype(np.float32),
+       rng.uniform(-2, 2, (32, 3, 128)).astype(np.float32),
+       (1 + 0.1 * rng.standard_normal((32, 8, 128))).astype(BF16))
+history = (rng.standard_normal((32, B, 3, 3, CONV_HEAD_ROWS, 128))).astype(BF16)
+state = (rng.standard_normal((32, B, 3, 128, 128)) * 0.1).astype(np.float32)
+in8, in_scale, in32 = pow2_fp8(inputs)
+out8, out_scale, out32 = pow2_fp8(output)
+for sequence_rows in (8, 1):
+    got = layer(hidden, gate, in8, fb, out8, aux, history, state, (in_scale, out_scale), sequence_rows)
+    want = layer(hidden, gate, in32, fb, out32, aux, history, state, None, sequence_rows)
+    for g, w, name in zip(got, want, ("history", "state", "rows")):
+        if name == "history":  # the three real heads of the four head rows
+            g, w = g[..., :3, :], w[..., :3, :]
+        if name == "rows":
+            g, w = g[:, :B // 4], w[:, :B // 4]
+        assert np.isfinite(g.astype(np.float32)).all(), name
+        bits = np.uint16 if g.dtype.itemsize == 2 else np.uint32
+        assert np.array_equal(g.view(bits), w.view(bits)), (sequence_rows, name)
+    # Without the scales the same FP8 values give a different layer.
+    unscaled = layer(hidden, gate, in8, fb, out8, aux, history, state, None, sequence_rows)
+    assert not np.array_equal(unscaled[2][:, :B // 4].view(np.uint16), want[2][:, :B // 4].view(np.uint16))
+    print(f"sequence_rows={sequence_rows}: bit-exact")
+print("OK")
+"""
+
+    def test_fp8_layer_matches_the_dequantized_weights(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        harness = TestAttentionHostBf16.SCRIPT.split("rng = np.random.default_rng(0)")[0]
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [sys.executable, "-c", harness + self.MAIN],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1800,
         )
         self.assertIn(
             "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
