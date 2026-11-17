@@ -1918,6 +1918,7 @@ class TpuSRTPlatform(SRTPlatform):
             arm_recompilation_checker,
             maybe_enable_site_tracing,
         )
+
         if get_exec().graph.enable_torch_compile:
             arm_recompilation_checker(reset_counters=False, overwrite_baseline=False)
         # Dispatch modes are thread-local; this runs on the scheduler thread.
