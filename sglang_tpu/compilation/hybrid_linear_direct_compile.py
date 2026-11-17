@@ -36,16 +36,19 @@ from sglang_tpu.mamba_pool import TpuMambaPool
 # paths from the request pool: the Qwen4-Exp PLE layer maps request rows to
 # state slots there, and reads and writes its short-conv state and n-gram
 # context (HybridReqToTokenPool.short_conv_pool / ngram_pool).
+# A tensor attribute or a list of them (TpuShortConvPool.layer_states).
 _REQ_POOL_SIDE_TENSORS = (
     ((), "req_index_to_mamba_index_mapping"),
     (("short_conv_pool",), "conv_state"),
+    (("short_conv_pool",), "layer_states"),
     (("ngram_pool",), "context"),
 )
 
 
 def _req_pool_side_tensors(req_to_token_pool: ReqToTokenPool) -> list[tuple]:
-    """(owner, attribute) of each side tensor the request pool holds, only for
-    models with PLE side state (others never read them inside the graph)."""
+    """(owner, attribute, list index or None) of each side tensor the request
+    pool holds, only for models with PLE side state (others never read them
+    inside the graph)."""
     short_conv = getattr(req_to_token_pool, "short_conv_pool", None)
     ngram = getattr(req_to_token_pool, "ngram_pool", None)
     if not (
@@ -58,9 +61,24 @@ def _req_pool_side_tensors(req_to_token_pool: ReqToTokenPool) -> list[tuple]:
         owner = req_to_token_pool
         for name in path:
             owner = getattr(owner, name)
-        if isinstance(getattr(owner, attr, None), torch.Tensor):
-            owners.append((owner, attr))
+        value = getattr(owner, attr, None)
+        if isinstance(value, torch.Tensor):
+            owners.append((owner, attr, None))
+        elif isinstance(value, list):
+            owners.extend((owner, attr, i) for i in range(len(value)))
     return owners
+
+
+def _get_side(owner: Any, attr: str, index: int | None) -> torch.Tensor:
+    value = getattr(owner, attr)
+    return value if index is None else value[index]
+
+
+def _set_side(owner: Any, attr: str, index: int | None, tensor: torch.Tensor) -> None:
+    if index is None:
+        setattr(owner, attr, tensor)
+    else:
+        getattr(owner, attr)[index] = tensor
 
 
 class HybridLinearKVPoolState:
@@ -82,7 +100,7 @@ class HybridLinearKVPoolState:
         return [
             *self._full_kv_pool.get_state(),
             *self._mamba_pool.get_state(),
-            *(getattr(owner, attr) for owner, attr in self._side_tensors),
+            *(_get_side(*side) for side in self._side_tensors),
         ]
 
     def set_state(self, state: list[torch.Tensor]) -> None:
@@ -92,8 +110,8 @@ class HybridLinearKVPoolState:
         self._mamba_pool.set_state(state[num_full : num_full + num_mamba])
         side = state[num_full + num_mamba :]
         assert len(side) == len(self._side_tensors), (len(side), self._side_tensors)
-        for (owner, attr), tensor in zip(self._side_tensors, side):
-            setattr(owner, attr, tensor)
+        for entry, tensor in zip(self._side_tensors, side):
+            _set_side(*entry, tensor)
 
 
 def hybrid_linear_kv_pool_state(

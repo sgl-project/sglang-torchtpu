@@ -90,6 +90,7 @@ from sglang_tpu.hooks.qwen4_exp import (
     load_ple_table_on_host,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+from sglang_tpu.ple_state_pool import TpuShortConvPool
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.swa_miss_metrics import hook_specs as swa_miss_metrics_hooks
@@ -116,6 +117,11 @@ def _select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
 # (target, hook, hook_type) triples.
 
 HOOKS: list[tuple] = [
+    (
+        "sglang.srt.mem_cache.ple_state_pool.ShortConvPool",
+        TpuShortConvPool,
+        HookType.REPLACE,
+    ),
     (
         "sglang.srt.utils.hf_transformers.config.get_config",
         dense_qsa_config,
