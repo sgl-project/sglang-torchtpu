@@ -1884,11 +1884,15 @@ class TpuSRTPlatform(SRTPlatform):
     @contextmanager
     def weight_loading_context(self, weights):
         from sglang.srt.runtime_context import get_parallel
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.expert_loading import (
             expert_loading_context,
         )
 
-        if get_parallel().pp_size > 1:
+        if (
+            get_parallel().pp_size > 1
+            or tpu_envs.SGLANG_TPU_ENABLE_EXPERT_HOST_STAGING.get()
+        ):
             with expert_loading_context():
                 yield _sync_weight_stream(weights)
             return

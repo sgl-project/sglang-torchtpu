@@ -156,6 +156,7 @@ def run():
             TORCH_TPU_DEVICES_PER_HOST="8",
             TORCH_TPU_BASE_PORT="8070",
             SGLANG_USE_RAY="0",
+            SGLANG_TPU_ENABLE_EXPERT_HOST_STAGING="1",
             GLM52_BENCHMARK_SHA256=benchmark_sha,
             XDG_CACHE_HOME=str(root / "cache"),
             TMPDIR=str(root / "tmp"),

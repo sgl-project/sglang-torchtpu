@@ -10,6 +10,7 @@ bash benchmark/tpu/glm52_baseline/bootstrap.sh
 source /tmp/glm52-baseline-runtime/setup.sh
 # Fail before allocating model weights if selective-reader regression tests fail.
 SGLANG_PLATFORM=tpu "$PY" -m unittest discover -s test/registered/unit/hardware_backend/tpu -p test_ep_local_expert_reader.py -v > "$GLM52_ART/reader-tests.log" 2>&1
+SGLANG_PLATFORM=tpu "$PY" -m unittest discover -s test/registered/unit/hardware_backend/tpu -p test_expert_loading.py -v > "$GLM52_ART/staging-tests.log" 2>&1
 export GLM52_RUN_ID="${GLM52_RUN_ID:-${FALCON_EXP_ID:-baseline}}"
 "$PY" -m benchmark.tpu.glm52_baseline.prepare --model "$GLM52_MODEL_PATH" --output /tmp/glm52-baseline-runtime/recipe
 exec "$PY" -u -m benchmark.tpu.glm52_baseline.session
