@@ -27,6 +27,11 @@ spec.loader.exec_module(helper)
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+# CPU exists only for the untimed diagnostic callback. All measured inputs
+# are explicitly placed on the first TPU device.
+jax.config.update("jax_platforms", "tpu,cpu")
+assert jax.devices("cpu"), "diagnostic callback requires a CPU backend"
 from sglang_tpu.attention.pallas import radix_topk as port
 from sglang_tpu.dsv4.sparsecore_topk import sparsecore_topk
 from sglang_tpu.dsv4.streamindex_topk.streamindex_topk import streamindex_topk
