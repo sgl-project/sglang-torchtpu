@@ -187,6 +187,10 @@ class TpuEnvs:
     SGLANG_TPU_KEEPALIVE_SECONDS = EnvFloat(0.0)
     # Arbitrary: tpuq's reclaimer ignored a ~0.003% load and kept a 20% one.
     SGLANG_TPU_KEEPALIVE_DUTY = EnvFloat(0.2)
+    # Sparse MLA DCP: merge the group's DSA top-k by a score threshold, so only
+    # scores cross the group and no rank gathers another rank's indices; the
+    # index-gathering merge costs ~1 ms per DSA layer at 64 rows on tpu7x.
+    SGLANG_TPU_DCP_TOPK_THRESHOLD_MERGE = EnvBool(False)
     # Sparse MLA DCP prefill (EXTEND / MIXED) on the decode path: each rank scores and
     # attends over its own shard with the group's query heads, and the group merges
     # the top-k candidates and the partial outputs. Per-chunk traffic depends on the

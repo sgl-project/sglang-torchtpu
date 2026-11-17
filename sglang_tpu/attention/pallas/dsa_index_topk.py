@@ -30,6 +30,7 @@ from sglang_tpu.dsv4.streamindex_topk import (
     cp_local_to_global,
     streamindex_topk,
 )
+from sglang_tpu.dsv4.streamindex_topk.metadata import cp_global_to_local
 from sglang_tpu.dsv4.streamindex_topk.streamindex_topk import (
     _select_owned_winners,
     get_kv_cache_shape,
@@ -407,3 +408,70 @@ def merge_dcp_topk(
     return _select_owned_winners(
         merged, dcp_size, interleave_size, dcp_rank.reshape(())
     )
+
+
+def _sortable_u32(score_bits: jax.Array) -> jax.Array:
+    """f32 bits (as i32) to u32 keys whose unsigned order is the float order."""
+    flipped = jnp.where(score_bits < 0, score_bits ^ jnp.int32(0x7FFFFFFF), score_bits)
+    return jax.lax.bitcast_convert_type(flipped, jnp.uint32) ^ jnp.uint32(0x80000000)
+
+
+def merge_dcp_topk_threshold(
+    all_scores: jax.Array,  # i32[dcp_size, max_num_tokens, topk]; f32 bits, every rank
+    own_indices: jax.Array,  # i32[max_num_tokens, topk]; this rank's, global, -1 padded
+    own_scores: jax.Array,  # i32[max_num_tokens, topk]; this rank's f32 bits
+    dcp_rank: jax.Array,  # i32[1]
+    *,
+    topk: int,
+    dcp_size: int,
+    interleave_size: int,
+) -> jax.Array:  # i32[max_num_tokens, topk]
+    """``merge_dcp_topk`` without gathering the candidates' indices.
+
+    The global top-k is every candidate above the k-th largest score ``t``
+    plus as many ties at ``t`` as fill k, ties taken in (rank, slot) order.
+    ``t`` comes from a 32-step bitwise search over counts, so no rank needs
+    another rank's indices: each keeps its own winners and left-packs them
+    as rank-local positions. Every rank must gather its scores with -inf at
+    its invalid (-1) candidates, since the merge never sees another rank's
+    indices.
+    """
+    rank = dcp_rank.reshape(())
+    neg_inf = jnp.int32(BITS_NEG_INF)
+    own_valid = own_indices >= 0
+    own_keys = _sortable_u32(jnp.where(own_valid, own_scores, neg_inf))
+    keys = _sortable_u32(all_scores)  # [dcp, T, k]
+    keys = jnp.moveaxis(keys, 0, 1).reshape(keys.shape[1], dcp_size * topk)
+
+    def bit_step(bit, threshold):
+        candidate = threshold | (jnp.uint32(1) << (31 - bit).astype(jnp.uint32))
+        count = jnp.sum(keys >= candidate[:, None], axis=1, dtype=jnp.int32)
+        return jnp.where(count >= topk, candidate, threshold)
+
+    threshold = jax.lax.fori_loop(
+        0, 32, bit_step, jnp.zeros((keys.shape[0],), jnp.uint32)
+    )[:, None]
+    above = jnp.sum(keys > threshold, axis=1, dtype=jnp.int32)[:, None]
+    ties_needed = topk - above
+    per_rank_ties = jnp.sum(
+        (keys == threshold).reshape(keys.shape[0], dcp_size, topk),
+        axis=2,
+        dtype=jnp.int32,
+    )  # [T, dcp]
+    lower = jnp.arange(dcp_size, dtype=jnp.int32)[None, :] < rank
+    ties_before = jnp.sum(jnp.where(lower, per_rank_ties, 0), axis=1, keepdims=True)
+    own_tie = own_valid & (own_keys == threshold)
+    tie_slot = jnp.cumsum(own_tie, axis=1, dtype=jnp.int32) - own_tie
+    mine = own_valid & (
+        (own_keys > threshold) | (own_tie & (ties_before + tie_slot < ties_needed))
+    )
+    local = cp_global_to_local(jnp.maximum(own_indices, 0), dcp_size, interleave_size)
+    # Left-pack with a stable two-operand sort: an XLA scatter or gather of
+    # these [T, topk] rows costs ~0.5-1 ms per layer on TPU at T = 64.
+    _, packed = jax.lax.sort(
+        (jnp.where(mine, 0, 1).astype(jnp.int32), jnp.where(mine, local, -1)),
+        dimension=1,
+        is_stable=True,
+        num_keys=1,
+    )
+    return packed

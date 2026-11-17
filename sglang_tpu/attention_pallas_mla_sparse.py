@@ -40,9 +40,11 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
     gather_heads,
     merge_across_ranks,
 )
+from sglang_tpu.dcp_prefill_scratch import SlotState, plan_scratch_slots
 from sglang_tpu.dsa_dcp_ops import (
     build_dsa_index_topk_dcp_op,
     build_dsa_topk_merge_dcp_op,
+    build_dsa_topk_threshold_merge_dcp_op,
     build_index_key_store_gather_dcp_op,
     build_sparse_mla_attention_dcp_op,
     build_sparse_mla_kv_store_gather_dcp_op,
@@ -56,10 +58,9 @@ from sglang_tpu.dsa_indexer_tpu import (
     indexer_forward,
     kpool_indexer_forward,
 )
-from sglang_tpu.dcp_prefill_scratch import SlotState, plan_scratch_slots
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.oneshot_collectives import get_dcp_group_all_gather_op
 from sglang_tpu.kv_pool import _zeros_kv_buffer
+from sglang_tpu.oneshot_collectives import get_dcp_group_all_gather_op
 from sglang_tpu.pallas_export import (
     argnums,
     tpu_info_for_cpu_export,
@@ -341,6 +342,13 @@ def _split_pool(pool):
 
 # dcp_gather_buckets() entry that warms the scratch prefill instead of a gather.
 _DCP_SCRATCH_BUCKET = -1
+# Rows up to which the DCP top-k merge goes by score threshold: decode and
+# verify (bs * draft rows). Measured at 64 rows; its 32 count passes over
+# rows x dcp x topk keys are untested at prefill-sized chunks.
+_DCP_THRESHOLD_MERGE_MAX_ROWS = 1024
+# sparsecore_topk.BITS_NEG_INF (f32 -inf as int32 bits), not imported so the
+# backend does not load the SparseCore kernels at import.
+_BITS_NEG_INF = -8388608
 
 
 class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
@@ -477,6 +485,11 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         )
         self._topk_merge_dcp_op = build_dsa_topk_merge_dcp_op(
             self._dcp, self._dcp_interleave
+        )
+        self._topk_threshold_merge_dcp_op = (
+            build_dsa_topk_threshold_merge_dcp_op(self._dcp, self._dcp_interleave)
+            if tpu_envs.SGLANG_TPU_DCP_TOPK_THRESHOLD_MERGE.get()
+            else None
         )
         self._attention_dcp_op = build_sparse_mla_attention_dcp_op(
             self._dcp, self._dcp_interleave
@@ -792,7 +805,9 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         bs = md.cu_q_lens.shape[0] - 1
         pages_per_seq = md.page_indices.shape[0] // bs
         seq_lens = forward_batch.seq_lens_cpu
-        seq_lens = (list(seq_lens) if isinstance(seq_lens, list) else seq_lens.tolist())[:bs]
+        seq_lens = (
+            list(seq_lens) if isinstance(seq_lens, list) else seq_lens.tolist()
+        )[:bs]
         need = [-(-int(n) // self._page_stride) for n in seq_lens]
         device = md.page_indices.device
         slots = self._dcp_scratch_plan(forward_batch, need, seq_lens)
@@ -850,7 +865,9 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         md = self.forward_metadata
         return md.page_indices.index_select(0, md.dcp_gather_index).to(torch.int32)
 
-    def _dcp_dense_page_ids(self, *, first: int, count: int, gathered: int) -> torch.Tensor:
+    def _dcp_dense_page_ids(
+        self, *, first: int, count: int, gathered: int
+    ) -> torch.Tensor:
         """i32[count * dcp]: where _dcp_dense_cache puts the unsharded pages of
         gathered widened pages ``[first, first + count)``, in position order
         (widened page, then rank). The all-reduce gather is page-major, the DMA
@@ -975,6 +992,22 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._topk,
             metadata.segments,
         )
+        if (
+            self._topk_threshold_merge_dcp_op is not None
+            and query.shape[0] <= _DCP_THRESHOLD_MERGE_MAX_ROWS
+        ):
+            # Only the scores cross the group; each rank keeps its own indices.
+            scores = torch.where(indices >= 0, scores, _BITS_NEG_INF)
+            all_scores = _all_reduce_gather(
+                scores.unsqueeze(0),
+                self._dcp_group,
+                self._dcp,
+                self._cp_rank_mask,
+                dim=0,
+            )  # i32[dcp, num_tokens, topk]
+            return self._topk_threshold_merge_dcp_op(
+                all_scores, indices, scores, self._cp_rank_t, self._topk
+            )
         # One gather for both: int32 sums of zero-padded blocks are exact.
         candidates = _all_reduce_gather(
             torch.stack([indices, scores]).unsqueeze(0),
@@ -1401,9 +1434,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         )
         # A row with no owned winner (or a padding row) has l = 0: its lse is
         # -inf or NaN. NaN would poison the group-wide max, so pin it to -inf.
-        lse = torch.where(
-            torch.isfinite(lse), lse, torch.full_like(lse, float("-inf"))
-        )
+        lse = torch.where(torch.isfinite(lse), lse, torch.full_like(lse, float("-inf")))
         merged, _ = merge_across_ranks(
             out.float(), lse, group, cp, rank_mask, self._cp_rank_index
         )

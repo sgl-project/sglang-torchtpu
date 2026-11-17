@@ -7,7 +7,9 @@ index-key, NoPE and RoPE shards and runs the DCP ops with its rank. Checks:
 * every key and latent lands, byte for byte, in its owner's shard at the slot
   the unsharded cache holds it (page-striped, one page_size run per rank);
 * the union of the ranks' merged top-k winners is the unsharded indexer's
-  top-k, row by row;
+  top-k, row by row, for both merges (gathered indices and score threshold);
+* the threshold merge keeps exactly k winners when scores tie at the k-th
+  value, and every valid candidate when fewer than k are valid;
 * the ranks' partial attention outputs, merged by log-sum-exp, match the
   unsharded sparse attention.
 
@@ -40,6 +42,7 @@ from sglang_tpu.attention.pallas.dsa_index_topk import (
     dsa_indexer_step_dcp,
     index_key_cache_shape,
     merge_dcp_topk,
+    merge_dcp_topk_threshold,
 )
 from sglang_tpu.attention.pallas.mla_sparse_fused import (
     NOPE_DIM,
@@ -47,7 +50,11 @@ from sglang_tpu.attention.pallas.mla_sparse_fused import (
     sparse_mla_attention_fused,
     sparse_mla_attention_fused_dcp,
 )
-from sglang_tpu.dsv4.streamindex_topk.metadata import cp_local_to_global
+from sglang_tpu.dsv4.sparsecore_topk import BITS_NEG_INF
+from sglang_tpu.dsv4.streamindex_topk.metadata import (
+    cp_global_to_local,
+    cp_local_to_global,
+)
 
 _DCP = 4
 _PAGE_SIZE = 128
@@ -194,6 +201,19 @@ class TestDsaDcp(CustomTestCase):
             cands.append((idx, scores))
         cand_idx = jnp.stack([c[0] for c in cands])
         cand_scores = jnp.stack([c[1] for c in cands])
+        masked_scores = jnp.where(cand_idx >= 0, cand_scores, BITS_NEG_INF)
+        cls.threshold_local_rows = [
+            merge_dcp_topk_threshold(
+                masked_scores,
+                cand_idx[r],
+                masked_scores[r],
+                jnp.asarray([r], jnp.int32),
+                topk=_TOPK,
+                dcp_size=_DCP,
+                interleave_size=_PAGE_SIZE,
+            )  # fmt: skip
+            for r in range(_DCP)
+        ]
         cls.dcp_local_rows, outs, lses = [], [], []
         for r in range(_DCP):
             rank = jnp.asarray([r], jnp.int32)
@@ -243,9 +263,16 @@ class TestDsaDcp(CustomTestCase):
             )
 
     def test_merged_topk_equals_unsharded(self):
+        self._assert_union_is_unsharded_topk(self.dcp_local_rows)
+
+    def test_threshold_merge_equals_unsharded(self):
+        """The score-threshold merge keeps the same global winners."""
+        self._assert_union_is_unsharded_topk(self.threshold_local_rows)
+
+    def _assert_union_is_unsharded_topk(self, local_rows):
         ref = np.asarray(self.ref_topk)
         winners = [set() for _ in range(ref.shape[0])]
-        for r, local in enumerate(self.dcp_local_rows):
+        for r, local in enumerate(local_rows):
             local = np.asarray(local)
             glob = np.asarray(
                 cp_local_to_global(jnp.asarray(local), r, _DCP, _PAGE_SIZE)
@@ -269,6 +296,84 @@ class TestDsaDcp(CustomTestCase):
         diff = np.abs(got - want)
         self.assertLess(float(diff.max()), _MAX_ABS_DIFF)
         self.assertLess(float(diff.mean()), _MEAN_ABS_DIFF)
+
+
+class TestThresholdMergeTies(CustomTestCase):
+    """merge_dcp_topk_threshold where scores tie at the k-th value or fewer
+    than k candidates are valid. The group must keep exactly k winners: all
+    above the k-th score and, from the ties, as many as fill k (none twice).
+    Each rank left-packs its own winners as rank-local positions."""
+
+    _ROWS, _K, _IL = 16, 64, 4
+
+    def _merge(self, scores_f32, valid, rng):
+        dcp, rows, k = _DCP, self._ROWS, self._K
+        idx = np.full((dcp, rows, k), -1, np.int32)
+        for r in range(dcp):
+            owned = [p for p in range(4096) if (p // self._IL) % dcp == r]
+            for t in range(rows):
+                idx[r, t] = np.where(
+                    valid[r, t], rng.choice(owned, k, replace=False), -1
+                )
+        bits = np.where(idx >= 0, scores_f32.view(np.int32), np.int32(BITS_NEG_INF))
+        outs = [
+            np.asarray(
+                merge_dcp_topk_threshold(
+                    jnp.asarray(bits),
+                    jnp.asarray(idx[r]),
+                    jnp.asarray(bits[r]),
+                    jnp.asarray([r], jnp.int32),
+                    topk=k,
+                    dcp_size=dcp,
+                    interleave_size=self._IL,
+                )  # fmt: skip
+            )
+            for r in range(dcp)
+        ]
+        return idx, outs
+
+    def _check(self, scores_f32, valid):
+        rng = np.random.default_rng(1)
+        idx, outs = self._merge(scores_f32, valid, rng)
+        for t in range(self._ROWS):
+            cand = sorted(
+                (
+                    (float(scores_f32[r, t, j]), r, int(idx[r, t, j]))
+                    for r in range(_DCP)
+                    for j in range(self._K)
+                    if idx[r, t, j] >= 0
+                ),
+                reverse=True,
+            )
+            got = set()
+            for r, out in enumerate(outs):
+                n = int((out[t] >= 0).sum())
+                np.testing.assert_array_equal(out[t][n:], -1, f"row {t} rank {r}")
+                got |= {(r, int(x)) for x in out[t][:n]}
+
+            def local(r, g):
+                return int(cp_global_to_local(np.int32(g), _DCP, self._IL))
+
+            if len(cand) <= self._K:
+                self.assertEqual(got, {(r, local(r, g)) for _, r, g in cand}, t)
+                continue
+            kth = cand[self._K - 1][0]
+            must = {(r, local(r, g)) for s, r, g in cand if s > kth}
+            ties = {(r, local(r, g)) for s, r, g in cand if s == kth}
+            self.assertEqual(len(got), self._K, f"row {t}")
+            self.assertTrue(must <= got <= must | ties, f"row {t}")
+
+    def test_ties_at_kth_score(self):
+        rng = np.random.default_rng(0)
+        # Rounded to integers: many ties, including negatives and zero.
+        scores = np.round(rng.standard_normal((_DCP, self._ROWS, self._K)) * 2)
+        self._check(scores.astype(np.float32), np.ones(scores.shape, bool))
+
+    def test_fewer_valid_than_k(self):
+        rng = np.random.default_rng(2)
+        scores = -np.abs(rng.standard_normal((_DCP, self._ROWS, self._K)))
+        valid = rng.random(scores.shape) > 0.9
+        self._check(scores.astype(np.float32), valid)
 
 
 class TestDsaDcpDensePrefill(CustomTestCase):
@@ -300,7 +405,10 @@ class TestDsaDcpDensePrefill(CustomTestCase):
             sm_scale=_SM_SCALE, k_scale=1.0,
         )  # fmt: skip
 
-        dense = [_dense_cache([s[i] for s in base.shards], base.layout.dcp_pages) for i in range(3)]
+        dense = [
+            _dense_cache([s[i] for s in base.shards], base.layout.dcp_pages)
+            for i in range(3)
+        ]
         dense_pages = jnp.arange(len(base.layout.dcp_pages) * _DCP, dtype=jnp.int32)
         rows, _ = dsa_indexer_step(
             x["query"], x["key"], x["head_weights"], dense[0],
