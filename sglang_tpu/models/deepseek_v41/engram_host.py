@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -39,7 +39,7 @@ import msgspec
 import numpy as np
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 # Per-call inputs the host stage sets; None outside a staged V4.1 forward.
 ForwardBatch.tpu_engram_local_ids = None
@@ -545,11 +545,15 @@ class HostEngramCoordinator:
         self._hasher = hasher
         self.ngram = hasher.max_ngram_size
         self.tables = {
-            name: np.asarray(getattr(hasher, name).detach().cpu(), dtype=np.int64)
-            for name in ("token_map", "multipliers", "primes", "offsets")
+            "token_map": np.asarray(hasher.token_map.detach().cpu(), dtype=np.int64),
+            "multipliers": np.asarray(
+                hasher.multipliers.detach().cpu(), dtype=np.int64
+            ),
+            "primes": np.asarray(hasher.primes.detach().cpu(), dtype=np.int64),
+            "offsets": np.asarray(hasher.offsets.detach().cpu(), dtype=np.int64),
         }
         self.pad_id = hasher.pad_id
-        self.image_token_id = getattr(hasher, "image_token_id", None)
+        self.image_token_id = hasher.image_token_id
         self.embeddings = list(embeddings)
         self.by_layer = dict(embeddings)
         self.device = torch.device(device)
@@ -661,19 +665,15 @@ class HostEngramCoordinator:
 
     @staticmethod
     def _batch_req_slots(batch, requests: list[Any]) -> list[int | None]:
-        raw = getattr(batch, "req_pool_indices_cpu", None)
+        raw = batch.req_pool_indices_cpu
         if raw is not None:
             values = raw.tolist() if isinstance(raw, torch.Tensor) else list(raw)
             if len(values) >= len(requests):
                 return [int(v) for v in values[: len(requests)]]
-        slots: list[int | None] = []
-        for req in requests:
-            kv = getattr(req, "kv", None)
-            slot = getattr(kv, "req_pool_idx", None) if kv is not None else None
-            if slot is None:
-                slot = getattr(req, "req_pool_idx", None)
-            slots.append(None if slot is None else int(slot))
-        return slots
+        return [
+            None if req.kv.req_pool_idx is None else int(req.kv.req_pool_idx)
+            for req in requests
+        ]
 
     def _commit_history(self) -> None:
         """Mirror fast-path n-1 token tails into ``hasher.history`` on CPU.
@@ -684,7 +684,7 @@ class HostEngramCoordinator:
         """
         if not self._history_commit or self._step_inputs is None:
             return
-        history = getattr(self._hasher, "history", None)
+        history = self._hasher.history
         if history is None:
             return
         n1 = self.ngram - 1
@@ -717,7 +717,7 @@ class HostEngramCoordinator:
             raise NotImplementedError(
                 "Host Engram does not yet support speculative decode"
             )
-        if any(getattr(req, "beam_group", None) is not None for req in batch.reqs):
+        if any(req.beam_group is not None for req in batch.reqs):
             raise NotImplementedError("Host Engram does not yet support beam search")
         mode = batch.forward_mode
         if mode.is_decode():
@@ -784,32 +784,29 @@ class HostEngramCoordinator:
         if batch is None:
             self._reset_step_inputs()
             return None
-        if parallel is not None and any(
-            getattr(parallel, name, 1) != 1
-            for name in ("pp_size", "attn_cp_size", "attn_dcp_size")
+        if parallel is not None and (
+            parallel.pp_size != 1
+            or parallel.attn_cp_size != 1
+            or parallel.attn_dcp_size != 1
         ):
             self._reset_step_inputs()
             return None
-        spec_algorithm = getattr(batch, "spec_algorithm", None)
-        if spec_algorithm is not None and not spec_algorithm.is_none():
+        if batch.spec_algorithm is not None and not batch.spec_algorithm.is_none():
             self._reset_step_inputs()
             return None
-        reqs = getattr(batch, "reqs", None)
-        if reqs is None or any(
-            getattr(req, "beam_group", None) is not None for req in reqs
-        ):
+        if batch.reqs is None or any(req.beam_group is not None for req in batch.reqs):
             self._reset_step_inputs()
             return None
         mode = batch.forward_mode
         if mode.is_decode():
-            if getattr(batch, "seq_lens_cpu", None) is None:
+            if batch.seq_lens_cpu is None:
                 self._reset_step_inputs()
                 return None
         elif mode.is_extend_without_speculative():
             if (
                 enable_encoder_swa_bounded_replay
-                or getattr(batch, "prefix_lens", None) is None
-                or getattr(batch, "extend_lens", None) is None
+                or batch.prefix_lens is None
+                or batch.extend_lens is None
             ):
                 self._reset_step_inputs()
                 return None
@@ -954,15 +951,14 @@ class HostEngramCoordinator:
         self.pending = None
         if batch is None or result is None:
             return
-        spec_algorithm = getattr(batch, "spec_algorithm", None)
-        if spec_algorithm is not None and not spec_algorithm.is_none():
+        if batch.spec_algorithm is not None and not batch.spec_algorithm.is_none():
             return
-        reqs = getattr(batch, "reqs", None)
+        reqs = batch.reqs
         if reqs is None:
             return
         mode = batch.forward_mode
         if mode.is_decode():
-            seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
+            seq_lens_cpu = batch.seq_lens_cpu
             if seq_lens_cpu is None:
                 return
             seq_lens = (
@@ -975,8 +971,8 @@ class HostEngramCoordinator:
                 return
             positions = [int(n) for n in seq_lens[: len(reqs)]]
         elif mode.is_extend_without_speculative():
-            prefix_lens = getattr(batch, "prefix_lens", None)
-            extend_lens = getattr(batch, "extend_lens", None)
+            prefix_lens = batch.prefix_lens
+            extend_lens = batch.extend_lens
             if (
                 prefix_lens is None
                 or extend_lens is None
@@ -1115,13 +1111,12 @@ def collect_output_tensors(
             for item in value.values():
                 _visit(item)
             return
-        if hasattr(value, "__dataclass_fields__"):
+        if is_dataclass(value) and not isinstance(value, type):
             for field in value.__dataclass_fields__:
-                _visit(getattr(value, field, None))
+                _visit(getattr(value, field))
             return
-        inner = getattr(value, "tensors", None)
-        if isinstance(inner, dict):
-            _visit(inner)
+        if isinstance(value, PPProxyTensors):
+            _visit(value.tensors)
 
     _visit(obj)
     return tensors

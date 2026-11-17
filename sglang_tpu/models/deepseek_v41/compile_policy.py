@@ -47,8 +47,6 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.models.deepseek_v41 import engram_host
 
-_ENGRAM_STAGED_FIELDS = ("tpu_engram_local_ids", "tpu_engram_staged")
-
 
 def _stage_host_engram(coordinator, hasher, input_ids, forward_batch):
     """Pack and stage this rank's Engram rows on the host via ``coordinator``."""
@@ -82,7 +80,7 @@ class _EngramCompiledForwardShim(CompiledForwardShim):
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        hasher = getattr(self.policy, "_engram_hasher", None)
+        hasher = self.policy._engram_hasher
         if hasher is None or torch.compiler.is_compiling():
             return super()._forward(
                 fn, input_ids, positions, forward_batch, *args, **kwargs
@@ -98,7 +96,8 @@ class _EngramCompiledForwardShim(CompiledForwardShim):
             return super()._forward(
                 fn, input_ids, positions, forward_batch, *args, **kwargs
             )
-        saved = {name: getattr(forward_batch, name) for name in _ENGRAM_STAGED_FIELDS}
+        saved_ids = forward_batch.tpu_engram_local_ids
+        saved_staged = forward_batch.tpu_engram_staged
         active_uploads = None
         padded_tokens = input_ids.shape[0] if isinstance(input_ids, torch.Tensor) else 0
         try:
@@ -135,23 +134,21 @@ class _EngramCompiledForwardShim(CompiledForwardShim):
                 # multiple queued warmup variants on the same token bucket can
                 # stage without clashing, and re-pin staged fields at wait().
                 coordinator.record_consumers(active_uploads, [])
-                staged_fields = {
-                    name: getattr(forward_batch, name) for name in _ENGRAM_STAGED_FIELDS
-                }
+                staged_ids = forward_batch.tpu_engram_local_ids
+                staged_rows = forward_batch.tpu_engram_staged
                 uploads_for_call = active_uploads
                 active_uploads = None
 
                 def _run_pending():
-                    prev = {
-                        name: getattr(forward_batch, name) for name in staged_fields
-                    }
-                    for name, val in staged_fields.items():
-                        setattr(forward_batch, name, val)
+                    prev_ids = forward_batch.tpu_engram_local_ids
+                    prev_staged = forward_batch.tpu_engram_staged
+                    forward_batch.tpu_engram_local_ids = staged_ids
+                    forward_batch.tpu_engram_staged = staged_rows
                     try:
                         res = out.wait()
                     finally:
-                        for name, val in prev.items():
-                            setattr(forward_batch, name, val)
+                        forward_batch.tpu_engram_local_ids = prev_ids
+                        forward_batch.tpu_engram_staged = prev_staged
                     consumers = raw_consumers or engram_host.collect_output_tensors(
                         res, device=device
                     )
@@ -174,8 +171,8 @@ class _EngramCompiledForwardShim(CompiledForwardShim):
         finally:
             if active_uploads:
                 coordinator.record_consumers(active_uploads, [])
-            for name, value in saved.items():
-                setattr(forward_batch, name, value)
+            forward_batch.tpu_engram_local_ids = saved_ids
+            forward_batch.tpu_engram_staged = saved_staged
 
 
 def is_deepseek_v41(model_runner) -> bool:
@@ -231,7 +228,8 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     def _embed_outside_graph(self, forward_batch: ForwardBatch) -> None:
         model = self.model_runner.model
         has_mm_inputs = (
-            getattr(model, "vision", None) is not None
+            not self.model_runner.is_draft_worker
+            and model.vision is not None
             and not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.mm_inputs is not None
@@ -246,12 +244,15 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         ):
             return
         config = self.model_runner.model_config.hf_config
-        image_token_id = getattr(config, "image_token_id", None)
-        vocab_size = getattr(config, "vocab_size", 0)
+        image_token_id = (
+            config.image_token_id
+            if config.model_type == "deepseek_v41" and config.vision_n_layers > 0
+            else None
+        )
         fallback_id = (
             image_token_id
-            if image_token_id is not None and 0 <= image_token_id < vocab_size
-            else getattr(config, "engram_pad_token_id", 0)
+            if image_token_id is not None and 0 <= image_token_id < config.vocab_size
+            else config.engram_pad_token_id
         )
         embed_tokens = model.get_input_embeddings()
         with torch.no_grad():
