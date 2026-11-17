@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """TpuBlockSpecWorker drafter for the DeepSeek-V4.1 DSpark MoE draft.
 
+TpuDsparkDraftWorker already drives any DSpark draft through the interface
+core DSparkWorkerV2 uses; this adds what the MoE draft needs on the CSA2
+backend: the target's EP placement, CSA2's block limit, the SWA draft KV
+writer, the eager draft embedding under attention DP, rank-local base logits
+and the target's Engram history commit.
+
 Imported lazily by the drafter factory (hooks.py), so loading the plugin does
 not import the experimental speculative package.
 """
@@ -8,25 +14,20 @@ not import the experimental speculative package.
 from __future__ import annotations
 
 import torch
+from torch import nn
 
-from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
-    resolve_runtime_config,
+    DSparkRuntimeConfig,
 )
-from sglang_tpu.experimental.speculative.block_draft_worker import (
-    DraftLattice,
-    DraftSampler,
-    SampledDrafts,
-    TpuBlockDraftWorker,
-    target_input_embedding,
+from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
+    TpuDsparkDraftWorker,
 )
 from sglang_tpu.experimental.speculative.spec_types import AcceptResult, SpecState
 from sglang_tpu.models.deepseek_v41 import engram_host
 from sglang_tpu.models.deepseek_v41.dspark import (
-    block_width,
     draft_base_logits,
     embed_draft_tokens_outside_graph,
     swa_commit_records,
@@ -37,43 +38,37 @@ from sglang_tpu.models.deepseek_v41.dspark import (
 _MAX_BLOCK_ROWS = 64
 
 
-class TpuDsv41DsparkDraftWorker(TpuBlockDraftWorker):
+class TpuDsv41DsparkDraftWorker(TpuDsparkDraftWorker):
     # The draft stages are DeepseekV4DecoderLayers: under attention DP they gather
     # tokens across DP ranks and run EP MoE like the target (vllm-torchtpu
     # epic/dsv41 builds them with the target's EP). Idle DP ranks already enter
     # the draft forward through _forward_idle_decode.
     _keeps_target_placement = True
 
-    def __init__(self, target_runner: ModelRunner) -> None:
-        super().__init__(target_runner)
-        model = self.model_runner.model
-        if not isinstance(model, DeepseekV4ForCausalLMDSpark):
-            raise TypeError(f"Expected the V4 DSpark MoE draft, got {type(model)}.")
-        runtime = resolve_runtime_config(
-            draft_hf_config=self.model_runner.model_config.hf_config,
-            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
-            target_vocab_size=target_runner.model_config.vocab_size,
-        )
-        if model.gamma != runtime.gamma:
-            raise ValueError(
-                f"Draft config gamma={model.gamma} != runtime gamma={runtime.gamma}."
+    def _check_draft_model(self, draft_model: nn.Module) -> None:
+        if not isinstance(draft_model, DeepseekV4ForCausalLMDSpark):
+            raise TypeError(
+                f"Expected the V4 DSpark MoE draft, got {type(draft_model)}."
             )
-        self.num_drafts = runtime.gamma
-        self.block_width = block_width(model)
-        window = int(model.config.sliding_window)
-        if runtime.verify_num_draft_tokens > min(window, _MAX_BLOCK_ROWS):
+
+    def _check_runtime_config(self, runtime_config: DSparkRuntimeConfig) -> None:
+        window = int(self._dspark_model.config.sliding_window)
+        rows = runtime_config.verify_num_draft_tokens
+        if rows > min(window, _MAX_BLOCK_ROWS):
             raise ValueError(
-                f"DSpark block of {runtime.verify_num_draft_tokens} rows exceeds "
-                f"the sliding window {window} or {_MAX_BLOCK_ROWS} CSA2 queries."
+                f"DSpark block of {rows} rows exceeds the sliding window {window} "
+                f"or {_MAX_BLOCK_ROWS} CSA2 queries."
             )
-        self.mask_token_id = runtime.mask_token_id
-        self._dspark_model = model
-        target_model = target_runner.model
+
+    def _attach_target_vocab(self, target_runner: ModelRunner) -> None:
+        # attach_shared_modules also shards the Markov head over the draft's TP group.
         with self.draft_context():
-            model.attach_shared_modules(
-                embed_tokens=target_input_embedding(target_model),
-                lm_head=unwrap_lora_layer(target_model.lm_head),
-            )
+            super()._attach_target_vocab(target_runner)
+
+    def _base_logits(self, draft_hidden: torch.Tensor) -> torch.Tensor:
+        # Rank-local at attention TP 1; core's compute_base_logits gathers over
+        # the full TP group.
+        return draft_base_logits(self._dspark_model, draft_hidden)
 
     @property
     def full_to_swa(self) -> torch.Tensor:
@@ -110,31 +105,6 @@ class TpuDsv41DsparkDraftWorker(TpuBlockDraftWorker):
             accept_lens=accept.accept_lens,
             req_pool_indices=state.req_pool_indices,
         )
-
-    def sample_drafts(
-        self,
-        *,
-        block_hidden: torch.Tensor,
-        bonus_tokens: torch.Tensor,
-        draft_lattice: DraftLattice | None,
-        sampler: DraftSampler,
-    ) -> SampledDrafts:
-        del draft_lattice
-        model = self._dspark_model
-        bs = block_hidden.shape[0]
-        draft_hidden = block_hidden if model.sample_from_anchor else block_hidden[:, 1:]
-        with torch.no_grad():
-            base_logits = draft_base_logits(
-                model, draft_hidden.reshape(bs * self.num_drafts, -1)
-            )
-        draft_tokens, draft_logits = model.markov_head.sample_block(
-            base_logits.view(bs, self.num_drafts, -1),
-            first_prev_tokens=bonus_tokens,
-            hidden_states=draft_hidden,
-            sampler=sampler,
-            collect_corrected=True,
-        )
-        return SampledDrafts(draft_tokens, draft_logits, None)
 
     def _draft_model(self):
         return self._dspark_model

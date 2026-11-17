@@ -435,6 +435,46 @@ class TestDraftPlacement(CustomTestCase):
         self.assertTrue(TpuDsv41DsparkDraftWorker._keeps_target_placement)
 
 
+class TestSharedDsparkDrafter(CustomTestCase):
+    def test_v41_drafts_sample_from_rank_local_logits(self):
+        """The V4.1 drafter shares TpuDsparkDraftWorker.sample_drafts, whose default
+        base logits are core compute_base_logits. Under attention DP that gathers
+        over the full TP group and keeps TP rank 0's rows on every rank, so all
+        ranks drafted rank 0's tokens; the V4.1 drafter must keep its rank-local
+        draft_base_logits override."""
+        from sglang_tpu.models.deepseek_v41 import dspark_drafter
+
+        bs, gamma, hidden, vocab = 2, 3, 4, 5
+        markov_head = mock.MagicMock()
+        markov_head.sample_block.return_value = ("tokens", "logits")
+        model = SimpleNamespace(
+            sample_from_anchor=False,
+            markov_head=markov_head,
+            compute_base_logits=mock.MagicMock(
+                side_effect=AssertionError("core gather path")
+            ),
+        )
+        drafter = object.__new__(dspark_drafter.TpuDsv41DsparkDraftWorker)
+        drafter._dspark_model = model
+        drafter.num_drafts = gamma
+        local = torch.randn(bs * gamma, vocab)
+        block_hidden = torch.randn(bs, gamma + 1, hidden)
+        with mock.patch.object(
+            dspark_drafter, "draft_base_logits", return_value=local
+        ) as base:
+            out = drafter.sample_drafts(
+                block_hidden=block_hidden,
+                bonus_tokens=torch.zeros(bs, dtype=torch.long),
+                draft_lattice=None,
+                sampler=None,
+            )
+        self.assertEqual(base.call_args.args[1].shape, (bs * gamma, hidden))
+        torch.testing.assert_close(
+            markov_head.sample_block.call_args.args[0], local.view(bs, gamma, vocab)
+        )
+        self.assertEqual(out.draft_tokens, "tokens")
+
+
 class TestGetLastLocOffCuda(CustomTestCase):
     def test_host_tensors_skip_the_triton_kernel(self):
         """Spec decode allocation on TPU called the Triton get_last_loc
