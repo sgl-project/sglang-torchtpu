@@ -28,6 +28,7 @@ import jax.numpy as jnp
 from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils
 from sglang_tpu.attention.pallas.mla_sparse.kernel import (
     DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+    SPARSECORE_CACHE_LAYOUT,
     TENSORCORE_CACHE_LAYOUT,
     sparse_ragged_paged_attention,
 )
@@ -108,8 +109,44 @@ def qblock_query_block(
     )
 
 
+# SparseCore cache layout (uint32 rows, native SparseCore gather): the PR 2198
+# sweep's fastest extend setting (exp-cdkg2zm04b: chunk 128, 16 atoms,
+# overlap_rope; 3577 vs 4329 us at extend 2048 on a 49K prefix).
+SPARSECORE_GATHER_CHUNK_TOKENS = 128
+SPARSECORE_ATOMS_PER_BATCH = 16
+
+
+def _sparsecore_atoms(num_tokens: int, chunk_tokens: int, topk: int) -> int:
+    """Largest power of two <= SPARSECORE_ATOMS_PER_BATCH the native gather can
+    take for every chunk: each chunk's ``tokens * topk`` rows must split into
+    whole owner batches of ``num_owners * 64 * atoms`` (verify's 24 tokens x
+    2048 picks take 8, not 16; exp-cdkg2zm04b)."""
+    from sglang_tpu.attention.pallas.mla_sparse import native_sc_gather as nsc
+
+    owners = nsc.NUM_CORES * nsc.NUM_SUBCORES
+    sizes = {min(chunk_tokens, num_tokens)}
+    if num_tokens % chunk_tokens:
+        sizes.add(num_tokens % chunk_tokens)
+    atoms = SPARSECORE_ATOMS_PER_BATCH
+    while atoms > 1 and any(
+        (n * topk) % (owners * nsc.OCCURRENCES_PER_ATOM * atoms) for n in sizes
+    ):
+        atoms //= 2
+    return atoms
+
+
+def cache_layout_of(cache_nope: jax.Array) -> KVCacheLayout:
+    """The layout a NoPE buffer was allocated in: uint32 is SparseCore, uint8
+    TensorCore (``TpuSplitMLATokenToKVPool``, SGLANG_TPU_DSA_SPARSECORE_KV_CACHE)."""
+    if cache_nope.dtype == jnp.uint32:
+        return KVCacheLayout.SPARSECORE
+    return KVCacheLayout.TENSORCORE
+
+
 def _split_specs(
-    num_pages: int, page_size: int
+    num_pages: int,
+    page_size: int,
+    layout: KVCacheLayout = KVCacheLayout.TENSORCORE,
 ) -> tuple[SparseMLAKVCacheSpec, SparseMLAKVCacheSpec]:
     """Describe one layer's NoPE and RoPE buffers.
 
@@ -118,10 +155,10 @@ def _split_specs(
     """
     return (
         SparseMLAKVCacheSpec.create(
-            KVCacheType.NOPE, KVCacheLayout.TENSORCORE, num_pages, page_size, NOPE_DIM
+            KVCacheType.NOPE, layout, num_pages, page_size, NOPE_DIM
         ),
         SparseMLAKVCacheSpec.create(
-            KVCacheType.ROPE, KVCacheLayout.TENSORCORE, num_pages, page_size, ROPE_DIM
+            KVCacheType.ROPE, layout, num_pages, page_size, ROPE_DIM
         ),
     )
 
@@ -146,7 +183,7 @@ def _store_step(
     # below checks them against these specs, so a buffer with the wrong shape
     # or dtype fails here instead of being written with a wrong layout.
     num_pages, page_size = cache_nope.shape[:2]
-    nope_spec, rope_spec = _split_specs(num_pages, page_size)
+    nope_spec, rope_spec = _split_specs(num_pages, page_size, cache_layout_of(cache_nope))
     # A batch is padded to a fixed number of rows. A padded row still carries
     # one query token, but it is not a real request, so its token must not be
     # stored. distribution[2] is the number of real requests; clipping
@@ -184,12 +221,18 @@ def sparse_mla_attention_fused(
     qblock_kpool: int = 0,
     gather_chunk_tokens: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
     zero_rope: bool = False,
+    topk_is_physical: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run one step: store the new tokens in the cache, then attend.
 
     Each row of ``topk_indices`` lists the key positions one query token may
     attend to, counted from the start of its own sequence. The valid positions
     come first and the rest of the row is ``-1``.
+
+    ``topk_is_physical``: the rows are flat cache slots (``page * page_size +
+    offset``) instead, as a physical-slot indexer emits them. The attention then
+    skips the page-table lookup (``gather_page_ids``). Same layout otherwise:
+    valid slots first, ``-1`` padded. The query-blocked prefill is not taken.
 
     ``zero_rope`` is for a model without rope, whose rope lane (``q_pe`` and
     ``new_k_pe``) is identically zero. The rope cache is allocated zeroed, so
@@ -224,8 +267,12 @@ def sparse_mla_attention_fused(
         pages_per_seq=pages_per_seq,
         dtype=ql_nope.dtype,
     )
+    sparsecore = cache_layout_of(cache_nope) is KVCacheLayout.SPARSECORE
     if (
         qblock_kpool
+        and not topk_is_physical
+        # The query-blocked kernel DMAs uint8 TensorCore pages.
+        and not sparsecore
         and query_block is not None
         and ql_nope.shape[0] >= QBLOCK_MIN_TOKENS
         and pages_per_seq <= QBLOCK_MAX_PAGES_PER_SEQ
@@ -259,16 +306,33 @@ def sparse_mla_attention_fused(
         cache_nope,
         cache_rope,
         topk_indices,
-        page_indices,
+        # None: the rows are already flat cache slots (prepare_gather_indices).
+        None if topk_is_physical else page_indices,
         cu_q_lens,
         distribution,
         sm_scale=sm_scale,
         k_scale=k_scale,
-        cache_layout=TENSORCORE_CACHE_LAYOUT,
-        gather_and_attention_chunk_size=min(
-            gather_chunk_tokens, max(64, ql_nope.shape[0])
-        ),
         gather_rope=not zero_rope,
+        **(
+            dict(
+                cache_layout=SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=min(
+                    SPARSECORE_GATHER_CHUNK_TOKENS, max(64, ql_nope.shape[0])
+                ),
+                sparsecore_atoms_per_batch=_sparsecore_atoms(
+                    ql_nope.shape[0],
+                    min(SPARSECORE_GATHER_CHUNK_TOKENS, max(64, ql_nope.shape[0])),
+                    topk_indices.shape[1],
+                ),
+            )
+            if sparsecore
+            else dict(
+                cache_layout=TENSORCORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=min(
+                    gather_chunk_tokens, max(64, ql_nope.shape[0])
+                ),
+            )
+        ),
     )
     # The kernel returns 512 NoPE + 64 RoPE values per head. Only the NoPE part
     # is the attention output.
@@ -318,6 +382,12 @@ def sparse_mla_prefill_window(
     Returns ``(output, cache_nope, cache_rope)``: ``[window, all heads, 512]``
     and the two updated buffers.
     """
+    if cache_layout_of(cache_nope) is not KVCacheLayout.TENSORCORE:
+        # The window op's gather reads uint8 TensorCore pages only.
+        raise ValueError(
+            "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT needs the TensorCore KV "
+            "layout; unset SGLANG_TPU_DSA_SPARSECORE_KV_CACHE."
+        )
     cache_nope, cache_rope = _store_step(
         cache_nope,
         cache_rope,
@@ -375,7 +445,11 @@ def sparse_mla_prefill_fused_tokens(
     num_tokens = ql_nope.shape[1]
     page_size = cache_nope.shape[1]
     pages_per_seq = page_indices.shape[0] // (cu_q_lens.shape[0] - 1)
-    if qblock_tokens_supported(num_tokens, pages_per_seq, page_size):
+    if (
+        qblock_tokens_supported(num_tokens, pages_per_seq, page_size)
+        # The query-blocked kernel DMAs uint8 TensorCore pages.
+        and cache_layout_of(cache_nope) is KVCacheLayout.TENSORCORE
+    ):
         cache_nope, cache_rope = _store_step(
             cache_nope,
             cache_rope,

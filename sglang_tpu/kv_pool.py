@@ -1409,26 +1409,43 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         key_bytes = _cdiv(index_head_dim, lane) * lane
         return _cdiv(key_bytes + key_bytes // lane, lane) * lane
 
+    @staticmethod
+    def sparsecore_kv_layout() -> bool:
+        """Whether NoPE / RoPE use the SparseCore layout (SGLANG_TPU_DSA_SPARSECORE_KV_CACHE)."""
+        from sglang_tpu.envs import envs as tpu_envs
+
+        return tpu_envs.SGLANG_TPU_DSA_SPARSECORE_KV_CACHE.get()
+
     def _create_buffers(self):
         rows_per_page = self.page_size // self.TOKENS_PER_ROW
-        nope_shape = (
-            self.num_pages,
-            self.page_size,
-            self.NOPE_BYTES // self.LANE_BYTES,
-            self.LANE_BYTES,
-        )
-        if self.qk_rope_head_dim > 0:
-            rope_shape = (
+        if self.sparsecore_kv_layout():
+            # SparseCore layout (kv_cache_utils.SparseMLAKVCacheSpec, SPARSECORE):
+            # one uint32 word holds 4 bytes, so a token's 512 NoPE bytes are one
+            # 128-word row and four tokens' 128-byte RoPE rows share one. Same
+            # bytes per token as below, so bytes_per_token is unchanged.
+            kv_dtype = torch.uint32
+            nope_shape = (self.num_pages, self.page_size, self.NOPE_BYTES // 4)
+            rope_shape = (self.num_pages, rows_per_page, self.LANE_BYTES)
+        else:
+            kv_dtype = torch.uint8
+            nope_shape = (
                 self.num_pages,
-                rows_per_page,
-                self.TOKENS_PER_ROW,
+                self.page_size,
+                self.NOPE_BYTES // self.LANE_BYTES,
                 self.LANE_BYTES,
             )
-        else:
-            # No RoPE dims: the ops neither write nor read the rope cache
-            # (zero_rope), so one row stands in for it. It is not a page
-            # buffer: P/D transfer and HiCache leave it out.
-            rope_shape = (1, 1, self.TOKENS_PER_ROW, self.LANE_BYTES)
+            if self.qk_rope_head_dim > 0:
+                rope_shape = (
+                    self.num_pages,
+                    rows_per_page,
+                    self.TOKENS_PER_ROW,
+                    self.LANE_BYTES,
+                )
+            else:
+                # No RoPE dims: the ops neither write nor read the rope cache
+                # (zero_rope), so one row stands in for it. It is not a page
+                # buffer: P/D transfer and HiCache leave it out.
+                rope_shape = (1, 1, self.TOKENS_PER_ROW, self.LANE_BYTES)
         index_key_shape = (
             self.num_pages,
             rows_per_page // self._index_kpool,
@@ -1436,9 +1453,10 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             self.index_key_record_bytes(self._index_head_dim),
         )
         logger.info(
-            "Allocating split TPU MLA KV buffers: layers=%d, nope=%s, rope=%s, "
+            "Allocating split TPU MLA KV buffers: layers=%d, %s nope=%s, rope=%s, "
             "index keys=%s on %d layers",
             self.layer_num,
+            kv_dtype,
             nope_shape,
             rope_shape,
             index_key_shape,
@@ -1447,11 +1465,11 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         # One whole uint8 tensor per layer and buffer, not views of a shared
         # tensor: an op can only update a whole tensor in place.
         self.nope_buffer = [
-            _zeros_kv_buffer(nope_shape, torch.uint8, self.device)
+            _zeros_kv_buffer(nope_shape, kv_dtype, self.device)
             for _ in range(self.layer_num)
         ]
         self.rope_buffer = [
-            _zeros_kv_buffer(rope_shape, torch.uint8, self.device)
+            _zeros_kv_buffer(rope_shape, kv_dtype, self.device)
             for _ in range(self.layer_num)
         ]
         self.index_key_buffer = [

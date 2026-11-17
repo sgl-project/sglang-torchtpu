@@ -23,6 +23,7 @@ from sglang_tpu.attention_pallas_mla_sparse import (
 from sglang_tpu.attention_pallas_rpa_base import (
     _quantize_kv_to_fp8,
 )
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import (
     TpuFusedMLATokenToKVPool,
     TpuSplitMLATokenToKVPool,
@@ -136,6 +137,40 @@ class TestZerosKvBuffer(CustomTestCase):
                         * pool.page_size
                         + placeholder_bytes,
                     )
+
+    def _split_pool(self):
+        return TpuSplitMLATokenToKVPool(
+            size=64,
+            page_size=32,
+            dtype=FP8,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            index_head_dim=128,
+            index_key_layers=[True, True],
+        )
+
+    def test_split_pool_sparsecore_layout_is_uint32_with_the_same_bytes(self):
+        # The sparse kernel picks the native SparseCore gather from the NoPE
+        # dtype (mla_sparse_fused.cache_layout_of), and the KV budget assumes
+        # bytes_per_token, so the u32 layout must hold the same bytes per token.
+        with tpu_envs.SGLANG_TPU_DSA_SPARSECORE_KV_CACHE.override(True):
+            pool = self._split_pool()
+        tensorcore = self._split_pool()
+        for layer_id in range(2):
+            nope, rope = pool.get_nope_cache(layer_id), pool.get_rope_cache(layer_id)
+            self.assertEqual(tuple(nope.shape), (pool.num_pages, 32, 128))
+            self.assertEqual(tuple(rope.shape), (pool.num_pages, 8, 128))
+            for buf, ref in (
+                (nope, tensorcore.get_nope_cache(layer_id)),
+                (rope, tensorcore.get_rope_cache(layer_id)),
+            ):
+                self.assertEqual(buf.dtype, torch.uint32)
+                self.assertIsNone(buf._base)
+                self.assertEqual(buf.nbytes, ref.nbytes)
+        self.assertEqual(pool.get_kv_size_bytes(), tensorcore.get_kv_size_bytes())
 
 
 class TestQuantizeKvToFp8(CustomTestCase):

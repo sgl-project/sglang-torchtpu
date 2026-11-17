@@ -252,6 +252,56 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             atol=2e-2,
         )
 
+    def test_sparsecore_layout_matches_across_chunks(self):
+        """Four chunks (128, 128, 128, 64 tokens) of native SparseCore gathers in
+        one program, the last one shorter. Every chunk must attend to its own
+        gathered rows, not an earlier chunk's output buffer."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        problem = _build_problem(
+            np.random.default_rng(20261117), k_scale=1.0, query_tokens=448
+        )
+        problem["cu_q_lens"] = jnp.array([0, 448], jnp.int32)
+        kwargs = {
+            "sm_scale": 0.125,
+            "gather_and_attention_chunk_size": 128,
+            "attention_kernel_batch_size": 16,
+        }
+
+        tensorcore_out = sparse_mla.sparse_ragged_paged_attention(
+            problem["q"],
+            problem["tensorcore_nope"],
+            problem["tensorcore_rope"],
+            problem["topk"],
+            problem["page_table"],
+            problem["cu_q_lens"],
+            problem["distribution"],
+            **kwargs,
+        )
+        sparsecore_out = sparse_mla.sparse_ragged_paged_attention(
+            problem["q"],
+            problem["sparsecore_nope"],
+            problem["sparsecore_rope"],
+            problem["topk"],
+            problem["page_table"],
+            problem["cu_q_lens"],
+            problem["distribution"],
+            cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            # 64 x 256 rows of the last chunk split into whole 8-atom owner batches.
+            sparsecore_atoms_per_batch=8,
+            **kwargs,
+        )
+        tensorcore_out, sparsecore_out = jax.block_until_ready(
+            (tensorcore_out, sparsecore_out)
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(sparsecore_out, dtype=np.float32),
+            np.asarray(tensorcore_out, dtype=np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
     @parameterized.product(real_tokens=(1, 5, 16), return_lse=(False, True))
     def test_decode_bucket_real_rows_match_reference(self, real_tokens, return_lse):
         """The decode bucket (T=16, topk=2048) with only `real_tokens` live.
