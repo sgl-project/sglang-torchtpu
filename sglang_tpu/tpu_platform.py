@@ -340,16 +340,6 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
 _PREFILL_CP_RING_ARCHITECTURES = ("Qwen3MoeForCausalLM",)
 
 
-def _is_pcp_ring_topology(cfg) -> bool:
-    """Whether ``cfg`` is ring-mode PCP with its KV cache striped like DCP over
-    each attention-CP group (``--dcp-size == --attn-cp-size``)."""
-    return (
-        TpuSRTPlatform.pcp_ring_enabled()
-        and bool(cfg.enable_prefill_cp)
-        and cfg.dcp_size == cfg.attn_cp_size > 1
-    )
-
-
 def _validate_prefill_context_parallel_ring(
     server_args: ServerArgs, architectures: list[str]
 ) -> None:
@@ -1046,7 +1036,9 @@ def _validate_decode_context_parallel(server_args) -> None:
     # Ring-mode prefill context parallelism is the one prefill-CP configuration
     # that runs with DCP: it stripes the KV cache the same way and decodes on
     # this path (see _validate_prefill_context_parallel_ring).
-    pcp_ring = _is_pcp_ring_topology(cfg)
+    # _validate_prefill_context_parallel ran first: in ring mode prefill CP is
+    # on and --dcp-size == --attn-cp-size.
+    pcp_ring = TpuSRTPlatform.pcp_ring_enabled()
     if cfg.attn_cp_size > 1 and not pcp_ring:
         raise ValueError(
             "--attention-context-parallel-size > 1 is not supported with "
@@ -1255,7 +1247,7 @@ class TpuSRTPlatform(SRTPlatform):
         if (
             cfg.dcp_size > 1
             and cfg.kv_cache_dtype == "auto"
-            and not _is_pcp_ring_topology(cfg)
+            and not TpuSRTPlatform.pcp_ring_enabled()
         ):
             declare_resolution(
                 server_args,

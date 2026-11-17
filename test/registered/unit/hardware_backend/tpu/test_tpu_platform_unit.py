@@ -988,7 +988,8 @@ class TestPrefillContextParallelRingValidation(CustomTestCase):
         self._apply_ring(page_size=256, chunked_prefill_size=2048)
 
     def test_dcp_validation_admits_only_the_ring_topology(self):
-        """The DCP gate lets prefill CP through for ring mode with dcp == cp."""
+        """The DCP gate lets prefill CP through in ring mode (dcp == cp); a ring
+        config without that topology is refused earlier on the real path."""
 
         def dcp_args(**overrides):
             fields = dict(tp_size=8, dcp_size=8, attn_cp_size=8, enable_prefill_cp=True)
@@ -999,14 +1000,14 @@ class TestPrefillContextParallelRingValidation(CustomTestCase):
         with patch.dict(os.environ, env):
             _validate_decode_context_parallel(dcp_args())
             _validate_decode_context_parallel(dcp_args(dcp_size=4, attn_cp_size=4))
-            for overrides in (
-                dict(dcp_size=4),
-                dict(attn_cp_size=4),
-                dict(enable_prefill_cp=False),
-            ):
-                with self.subTest(overrides=overrides):
-                    with self.assertRaisesRegex(ValueError, "ring-mode"):
-                        _validate_decode_context_parallel(dcp_args(**overrides))
+        for overrides, message in (
+            (dict(dcp_size=4), "requires --dcp-size 8"),
+            (dict(attn_cp_size=4, moe_dp_size=4, dcp_size=8), "requires --dcp-size 4"),
+            (dict(enable_prefill_cp=False), "requires --enable-prefill-cp"),
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(NotImplementedError, message):
+                    self._apply_ring(**overrides)
         with patch.dict(os.environ, {**env, "SGLANG_TPU_PCP_MODE": "gather"}):
             with self.assertRaisesRegex(ValueError, "ring-mode"):
                 _validate_decode_context_parallel(dcp_args())
