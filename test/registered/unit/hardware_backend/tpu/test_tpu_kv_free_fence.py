@@ -829,7 +829,7 @@ class TestPPFenceGate(CustomTestCase):
     def test_gate(self):
         def needs(pp_size=2, **kwargs):
             with get_parallel().override(pp_size=pp_size):
-                return self._scheduler(**kwargs)._needs_pp_kv_free_fence()
+                return self._scheduler(**kwargs)._needs_kv_free_fence()
 
         self.assertTrue(needs(mode="prefill"))
         self.assertTrue(needs(mode="null"))

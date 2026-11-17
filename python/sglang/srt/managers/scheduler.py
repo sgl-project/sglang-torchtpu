@@ -1172,7 +1172,7 @@ class Scheduler(
         # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
         forward_stream = (
             model_runner.forward_stream
-            if self.enable_overlap or get_parallel().pp_size > 1 or use_mlx()
+            if self._forward_may_outlive_scheduling() or use_mlx()
             else self.schedule_stream
         )
         with device_module.stream(forward_stream):
@@ -1782,38 +1782,28 @@ class Scheduler(
             get_memory().hicache_io_backend
         )
 
-    def _needs_kv_free_fence(self) -> bool:
-        """Whether unordered DMAs can write pages an in-flight forward writes:
-        TPU DMA HiCache loads, or KV arriving on a PD decode server."""
-        return (
-            self.device == "tpu"
-            and self.enable_overlap
-            and (
-                self._uses_tpu_dma_hicache()
-                or self.disaggregation_mode == DisaggregationMode.DECODE
-            )
-        )
+    def _forward_may_outlive_scheduling(self) -> bool:
+        """Whether a launched forward can still run while the scheduler frees
+        pages and forms the next batch: under overlap, and in the PP stage loops."""
+        return self.enable_overlap or get_parallel().pp_size > 1
 
-    def _needs_pp_kv_free_fence(self) -> bool:
-        """Whether a PP stage's unordered DMAs can touch pages its in-flight
-        forwards use: a chunk checkpoint inserts a running chunk (its backup
-        reads it) and frees pages that chunk still uses (a load can land in them)."""
-        return (
-            self.device == "tpu"
-            and get_parallel().pp_size > 1
-            # Only the unified and PD prefill PP loops drive this fence.
-            and self.disaggregation_mode
-            in (DisaggregationMode.NULL, DisaggregationMode.PREFILL)
-            and self._uses_tpu_dma_hicache()
-        )
+    def _needs_kv_free_fence(self) -> bool:
+        """Whether unordered DMAs can touch pages an in-flight forward uses:
+        TPU DMA HiCache loads and backups, or KV arriving on a PD decode server."""
+        if self.device != "tpu" or not self._forward_may_outlive_scheduling():
+            return False
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # The PP decode loop drives no fence hooks.
+            return get_parallel().pp_size == 1
+        return self._uses_tpu_dma_hicache()
 
     def maybe_init_kv_free_fence(self):
         """Hold KV pages freed under overlap or PP back from DMA write targets,
         and defer HiCache backups behind in-flight forwards. Raises if the fence
         cannot cover every KV write of this server."""
-        pp = self._needs_pp_kv_free_fence()
-        if not (pp or self._needs_kv_free_fence()):
+        if not self._needs_kv_free_fence():
             return
+        pp = get_parallel().pp_size > 1
         from sglang_tpu.kv_free_fence import (
             fence_hicache_backups,
             install_kv_free_fence,
@@ -2123,9 +2113,7 @@ class Scheduler(
 
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        elif (is_cuda() or _is_hip) and (
-            self.enable_overlap or get_parallel().pp_size > 1
-        ):
+        elif (is_cuda() or _is_hip) and self._forward_may_outlive_scheduling():
             # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
