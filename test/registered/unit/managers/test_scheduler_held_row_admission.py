@@ -71,7 +71,6 @@ class TestHeldRowAdmission(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s._tpu_pp_chunk_cost = None
-        s._dynamic_first_chunk_cap = lambda req: None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
