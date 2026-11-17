@@ -44,7 +44,6 @@ import torch
 
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import cdiv
-from sglang_tpu.cp_forward import all_gather_and_write_kv
 from sglang_tpu.kv_row_write import kv_write_segments, write_run_bound
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
@@ -312,32 +311,43 @@ def check_pcp_ring_layer(layer, *, sinks, sliding_window, soft_cap, causal, pack
 
 
 def forward_pcp_ring(
-    md, op, q, k, v, kv_cache, *, quantize_kv, sm_scale, k_scale, v_scale
+    md,
+    op,
+    layer,
+    q,
+    k_all,
+    v_all,
+    kv_cache,
+    *,
+    sinks,
+    sliding_window,
+    soft_cap,
+    causal,
+    pack,
+    k_scale,
+    v_scale,
 ) -> torch.Tensor:
     """One layer of a ring-mode context-parallel extend, ``[T, H, D]``.
 
-    ``q``/``k``/``v`` are this rank's zigzag rows in the compute dtype.
-    The chunk's K/V are all-gathered over the group and, for an fp8 pool,
-    quantized after the gather, as in gather mode. The fused kernel attends
-    the striped cached prefix around the ring and then the gathered chunk;
-    it only reads the pool. The new pages this rank owns are written from
-    the gathered rows by the local in-place writer *before* the kernel:
-    the kernel reads cached positions only, so the order does not change
-    its result, and writing after a read of the same buffer made XLA copy
-    the whole per-layer pool ahead of the in-place write (one pool-sized
-    HBM copy per layer, growing with --max-total-tokens).
+    ``q`` is this rank's zigzag rows. ``k_all``/``v_all`` are the chunk's K/V
+    from ``all_gather_and_write_kv`` (rank-major, quantized for an fp8 pool),
+    which also wrote the new pages this rank owns into its stripe before this
+    call: the kernel reads cached positions only, and writing after a read of
+    the same buffer made XLA copy the whole per-layer pool. The fused kernel
+    attends the striped cached prefix around the ring and then the gathered
+    chunk; it only reads the pool.
     """
-    k_all, v_all = all_gather_and_write_kv(
-        kv_cache=kv_cache,
-        k=k,
-        v=v,
-        write_segments=md.cp_write_segments,
-        write_num_segments=md.cp_write_num_segments,
-        group=get_parallel().attn_cp_group,
-        quantize=quantize_kv,
+    check_pcp_ring_layer(
+        layer,
+        sinks=sinks,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        causal=causal,
+        pack=pack,
     )
     ring = md.cp_ring
     operands = [getattr(ring, field.name) for field in fields(ring)]
+    sm_scale = float(layer.scaling)
     return op(q, k_all, v_all, kv_cache, *operands, sm_scale, k_scale, v_scale)
 
 
