@@ -367,6 +367,19 @@ class KernelConfig:
     # from it), and the batched enter op returns its packet beside the ids.
     # One small program fewer a step; the same packet (bit-identical).
     draft_verify_packet: bool = False
+    # MLA DSpark single-request steps (attention DP1): the verify and the
+    # draft after it run as one op, one program a step instead of two (no
+    # program boundary between the verify's last kernel and the draft
+    # kernel). The op takes both ops' operands (the target's LM head and
+    # embedding once), packs the verify operand from the ids, the control and
+    # the verify mode itself (no packing op, so draft_verify_packet acts on
+    # the batched path only), donates both ops' pools and returns both ops'
+    # outputs except the verify's logits, aux hidden states and decisions,
+    # which stay inside (Kimi-K3.1's window centres, dsa_seeded_window, like
+    # the verify's: operand, donated, output). First-step drafts still run
+    # the draft op alone before a request's first verify. The same kernels
+    # on the same operands (bit-identical).
+    draft_with_verify: bool = False
     # MLA DSpark drafts' two-stage DCP combine (host merge, then cross-host;
     # mla_dcp.DcpAttention.host_combine) with a core-pair stage first on a
     # call's last chunk (an earlier chunk's stage one is in flight under the

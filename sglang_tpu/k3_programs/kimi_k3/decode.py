@@ -13,7 +13,8 @@ continuing request's next input, so nothing is uploaded per step while the
 host's tokens lag (async scheduling). A step is one of:
 
 * one request, seven drafts: :meth:`DecodeOps.verify_packed`, then
-  :meth:`DsparkDraft.step_single`;
+  :meth:`DsparkDraft.step_single` (KernelConfig.draft_with_verify: both in
+  one op, :meth:`DecodeOps.verify_and_draft`);
 * three drafts alone, or several requests: :meth:`DecodeOps.verify_batched`,
   then :meth:`DsparkDraft.step_batched` (each request keeps its own ring);
 * otherwise a plain step (:meth:`DecodeOps.plain_step`), also whenever a
@@ -879,16 +880,57 @@ class KimiDecoder:
         packet = self.next_packet if chained and accept else None
         if packet is not None:
             self.stats["packets"] += 1
+        emitted, self.next_ids, self.next_packet = self._verify_then_draft(
+            ids, self._modes[1 if accept else 0], packet
+        )
+        if self.device_plan is not None:
+            self.device_plan = self.layout.consumed(self.device_plan, 1)
+        self._fresh[request.req_id] = self.WIDTH
+        return emitted
+
+    def _one_program(self) -> bool:
+        """KernelConfig.draft_with_verify for this decoder's draft (the MLA
+        draft's single-request op runs inside the verify's)."""
+        return kernel_config.active().draft_with_verify and hasattr(
+            self.draft, "single_parts"
+        )
+
+    def _verify_then_draft(
+        self, ids: torch.Tensor, mode: torch.Tensor, packet: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """The single-request verify of ``ids`` at verify ``mode`` (``packet``:
+        its packed operand from the last draft op, or None) and the draft
+        after it; advances the draft state and the control. Returns
+        ``(emitted, next ids, next packet or None)``. With
+        KernelConfig.draft_with_verify one op runs both (it packs the
+        verify's operand itself: no packets)."""
+        assert self.draft is not None and self.draft_state is not None
+        rates = self.draft._synthetic_rates(self.WIDTH - 1)
+        if self._one_program():
+            outputs = self.ops.verify_and_draft(
+                self.draft,
+                ids,
+                self.draft.aux_layers,
+                self.layout,
+                self.control,
+                mode,
+                self.draft_state.vector,
+                rates,
+            )
+            self.draft_state, emitted, next_ids, self.control = (
+                self.draft.finish_single(outputs)
+            )
+            return emitted, next_ids, None
         sharded, aux, decisions = self.ops.verify_packed(
             ids,
             self.draft.aux_layers,
             self.layout,
             self.control,
-            self._modes[1 if accept else 0],
-            self.draft._synthetic_rates(self.WIDTH - 1),
+            mode,
+            rates,
             packet=packet,
         )
-        self.draft_state, emitted, self.next_ids, self.control, *packets = (
+        self.draft_state, emitted, next_ids, self.control, *packets = (
             self.draft.step_single(
                 self.draft_state,
                 aux,
@@ -899,11 +941,7 @@ class KimiDecoder:
                 self.layout,
             )
         )
-        self.next_packet = packets[0] if packets else None
-        if self.device_plan is not None:
-            self.device_plan = self.layout.consumed(self.device_plan, 1)
-        self._fresh[request.req_id] = self.WIDTH
-        return emitted
+        return emitted, next_ids, packets[0] if packets else None
 
     def _first_aux_for(self, request: RequestInput, entry) -> torch.Tensor | None:
         """``request``'s first-speculation aux operand (``first_aux``), when
@@ -991,7 +1029,9 @@ class KimiDecoder:
                 self.layout,
             )
         )
-        self.next_packet = packets[0] if packets else None
+        # KernelConfig.draft_with_verify: the next verify's op packs its
+        # operand itself (no packet).
+        self.next_packet = packets[0] if packets and not self._one_program() else None
         if self.device_plan is not None:
             # The op consumed the plan row's reset (the slot now continues).
             self.device_plan = self.layout.consumed(self.device_plan, 1)
@@ -1081,6 +1121,33 @@ class KimiDecoder:
         )
         return states, emitted
 
+    def _warm_aux(self) -> Any:
+        """``(zero) -> aux``: a zero aux operand of the single draft op
+        (``[aux layers, WIDTH, hidden]``, replicated) out of an op, for the
+        warm-up's first-step drafts with KernelConfig.draft_with_verify."""
+        assert self.draft is not None
+        shape = (len(self.draft.aux_layers), self.WIDTH, self.draft.config.hidden)
+        key = ("warm_aux", shape)
+
+        def build():
+            import jax.numpy as jnp
+
+            from sglang_tpu.k3_programs.bridge import register_op
+
+            def fn(zero):
+                return (jnp.zeros(shape, jnp.bfloat16) + zero[0].astype(jnp.bfloat16),)
+
+            return register_op(
+                "pallas::k3_decode_warm_aux",
+                self.ops.mesh,
+                fn,
+                (P(),),
+                (P(),),
+                export_key=repr(key),
+            )
+
+        return self.ops.cached_op(key, build)
+
     def _pad_rows(self, requests: int, rows: int, padded: int) -> Any:
         """``(logits, aux) -> (logits, aux)`` with ``padded`` rows a request:
         its ``rows`` rows, then its last row repeated."""
@@ -1162,6 +1229,10 @@ class KimiDecoder:
                 ],
                 wait=False,
             )
+            # KernelConfig.draft_with_verify: the single verify's op runs the
+            # single draft op too (the draft compiles its batched ops only,
+            # and with first-step drafts its single op, which they run alone).
+            one_program = self.draft is not None and self._one_program()
             calls = self.ops.compilation_calls(
                 self.layout,
                 self.sub_base,
@@ -1170,11 +1241,15 @@ class KimiDecoder:
                 self.spec_shapes,
                 self.draft._synthetic_rates if self.draft is not None else None,
                 masked_ops=True,
+                draft=self.draft if one_program else None,
             )
             if self.draft is not None:
                 calls.extend(
                     self.draft.compilation_calls(
-                        self.layout, self.spec_alone, self.spec_shapes
+                        self.layout,
+                        self.spec_alone
+                        and (self.first_aux is not None or not one_program),
+                        self.spec_shapes,
                     )
                 )
             calls.sort(key=lambda call: call.priority, reverse=True)
@@ -1235,27 +1310,9 @@ class KimiDecoder:
                 # Steps 1 and 3 continue (verify mode 1): with
                 # KernelConfig.draft_verify_packet their packed operand is
                 # the draft op's, as in serving (another operand history).
-                sharded, aux, decisions = self.ops.verify_packed(
-                    ids,
-                    self.draft.aux_layers,
-                    self.layout,
-                    self.control,
-                    self._modes[min(step, 1)],
-                    self.draft._synthetic_rates(self.WIDTH - 1),
-                    packet=packet,
+                emitted, ids, packet = self._verify_then_draft(
+                    ids, self._modes[min(step, 1)], packet
                 )
-                self.draft_state, emitted, ids, self.control, *packets = (
-                    self.draft.step_single(
-                        self.draft_state,
-                        aux,
-                        sharded,
-                        ids,
-                        self.control,
-                        decisions,
-                        self.layout,
-                    )
-                )
-                packet = packets[0] if packets else None
             materialize(emitted)
 
         def speculate_predrafted(sampled: bool) -> None:
@@ -1267,41 +1324,29 @@ class KimiDecoder:
             self.device_plan = None
             self._sync_plan([(0, True, 0, 1, params)], [null])
             self.draft_state = self.draft.new_state(self._zero)
-            (ids,) = self._enter()(
-                self.control, self.draft_state.vector, self._modes[0]
-            )
-            _, aux, _ = self.ops.verify_packed(
-                ids,
-                self.draft.aux_layers,
-                self.layout,
-                self.control,
-                self._modes[0],
-                self.draft._synthetic_rates(self.WIDTH - 1),
-            )
-            self._run_predraft(0, 0, 1, 0, null, aux)
-            ids, packet, emitted = self.next_ids, self.next_packet, None
-            for _ in range(2):
-                sharded, aux, decisions = self.ops.verify_packed(
+            if self._one_program():
+                # No separate verify runs (KernelConfig.draft_with_verify):
+                # the aux operand from a small op, the decoder's pools from
+                # the last step, as in serving.
+                (aux,) = self._warm_aux()(self._zero)
+            else:
+                (ids,) = self._enter()(
+                    self.control, self.draft_state.vector, self._modes[0]
+                )
+                _, aux, _ = self.ops.verify_packed(
                     ids,
                     self.draft.aux_layers,
                     self.layout,
                     self.control,
-                    self._modes[1],
+                    self._modes[0],
                     self.draft._synthetic_rates(self.WIDTH - 1),
-                    packet=packet,
                 )
-                self.draft_state, emitted, ids, self.control, *packets = (
-                    self.draft.step_single(
-                        self.draft_state,
-                        aux,
-                        sharded,
-                        ids,
-                        self.control,
-                        decisions,
-                        self.layout,
-                    )
+            self._run_predraft(0, 0, 1, 0, null, aux)
+            ids, packet, emitted = self.next_ids, self.next_packet, None
+            for _ in range(2):
+                emitted, ids, packet = self._verify_then_draft(
+                    ids, self._modes[1], packet
                 )
-                packet = packets[0] if packets else None
             materialize(emitted)
 
         def speculate_batched(
@@ -1350,6 +1395,10 @@ class KimiDecoder:
             if speculating:
                 if self.spec_alone:
                     speculate(sampled)
+                    if self._one_program():
+                        # A request entering right after another's step: the
+                        # one op takes the verify's and the draft's histories.
+                        speculate(sampled)
                     if ring is not None:
                         speculate(sampled, ring())
                     if self.first_aux is not None and ring is None:
