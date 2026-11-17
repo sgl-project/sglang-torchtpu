@@ -277,6 +277,37 @@ def streamed_weights(
     return o, down
 
 
+def markov_row_windows(c: MlaDraftConfig, rows: int, dp: int = 1) -> int:
+    """``KernelConfig.draft_markov_rows``: the ``[heads * v_head, markov_rank]``
+    column windows of the whole o buffer that hold this rank's vocabulary rows
+    of w1 for a call over ``rows`` rows (0: knob off, o streamed or no fit)."""
+    if not _config().draft_markov_rows:
+        return 0
+    streamed_o = streamed_weights(c, rows, dp, _config().draft_whole_weights)[0]
+    vocab, height = c.vocab // RANKS, c.heads_per_rank * dp * c.v_head
+    windows = -(-vocab // height)
+    if streamed_o or windows * c.markov_rank > c.hidden or c.markov_rank % 256:
+        return 0
+    return windows if vocab % 16 == 0 and height % 16 == 0 else 0
+
+
+def prologue_overlap(c: MlaDraftConfig, rows: int, dp: int = 1) -> bool:
+    """``KernelConfig.draft_prologue_overlap`` for a call over ``rows`` rows,
+    where VMEM allows it: down_proj held whole (``draft_whole_weights``: up to
+    16 rows at attention DP1). The Markov w2t then moves into the down buffer
+    after the last layer's down products, and its own buffer's VMEM holds the
+    fc scope over the first layer. Calls that stream down_proj (three or four
+    requests at 8 rows: that scope beside a whole w2t buffer is over VMEM)
+    keep the sequential prologue."""
+    whole_down = not streamed_weights(c, rows, dp, _config().draft_whole_weights)[1]
+    return bool(
+        _config().draft_prologue_overlap
+        and whole_down
+        and c.markov_rank <= MLP_PADDED
+        and c.vocab // RANKS <= c.hidden
+    )
+
+
 class _ChunkedWeight:
     """A ``[layers, K, 7168]`` o / down weight (chunk-permuted, see
     ``all_reduce``) through ``buffer``: whole (``[K, 7168]``) or streamed one
@@ -287,15 +318,16 @@ class _ChunkedWeight:
         self.weight, self.buffer, self.sems, self.copy = weight, buffer, sems, copy
         self.streamed = len(buffer.shape) == 3
 
-    def load(self, layer):
+    def load(self, layer, start=True):
         """Start ``layer``'s copy: the whole weight, or streamed its chunk 0
-        into slot 0."""
+        into slot 0 (``start`` False: only its descriptor)."""
         item = self.copy(
             self.weight.at[layer, :, pl.ds(0, self.buffer.shape[-1])],
             self.buffer.at[0] if self.streamed else self.buffer,
             self.sems[0],
         )
-        item.start()
+        if start:
+            item.start()
         return item
 
     def chunks(self, layer):
@@ -353,6 +385,13 @@ def _make_body(
 
     SEM_FC, SEM_W2T, SEM_OWN, SEM_LM = 1, 8, 9, 11  # 10: unused
     lm_prefetch = _config().draft_lm_prefetch
+    # KernelConfig.draft_prologue_overlap (calls holding down_proj whole, w2t
+    # then in the down buffer); its acceptance exchange runs on a third
+    # semaphore slot (the first two serve the layers' exchanges).
+    overlap = prologue_overlap(c, T, dp)
+    TARGET_SLOT = 2
+    # KernelConfig.draft_markov_rows: w1 windows in the o buffer (0: off).
+    w1_windows = markov_row_windows(c, T, dp)
     SEM_EMBED = 12  # + j
     SEM_ROPE = 12 + R  # + 2 j (+1)
     SEM_W1 = 12 + 3 * R  # + slot R + j
@@ -424,6 +463,9 @@ def _make_body(
             recvs,
             *pair_sems,  # KernelConfig.draft_pair_combine: the combine's pair stage
         ) = scratch[n_persist + n_scoped :]
+        # KernelConfig.draft_prologue_overlap: the deferred acceptance
+        # exchange's receive buffer (last).
+        targets_recv = pair_sems.pop() if overlap else None
 
         rank = jax.lax.axis_index("tp")
         lane = rank % 8
@@ -461,6 +503,16 @@ def _make_body(
             forced_count = jnp.stack([decisions[0, 0]])
             forced_anchor = jnp.stack([decisions[0, 1]])
             table_scalars = _Scalars(ids, 3 * rows + 1)
+        if overlap:  # (count, anchor, verify position) scalars a request
+            if single is None:
+                decided = [
+                    (scalars[R + j], scalars[2 * R + j], scalars[j]) for j in range(R)
+                ]
+            else:
+                decided = [(decisions[0, 0], decisions[0, 1], ids[rows])]
+            forced_all = decided[0][0] >= 0
+            for count_j, anchor_j, _ in decided:
+                forced_all = forced_all & (count_j >= 0) & (anchor_j >= 0)
 
         # ---------------- DMA and collective helpers ----------------
         def copy(src, dst, sem):
@@ -476,14 +528,14 @@ def _make_body(
                 device_id_type=pl.DeviceIdType.MESH,
             )
 
-        def exchange(src_of, dst_of, offsets, base, slot):
+        def exchange(src_of, dst_of, offsets, base, slot, start=True, wait=True):
             copies = [
                 remote(src_of(o), dst_of(o), slot * SEMS_PER_SLOT + base + o, rank ^ o)
                 for o in offsets
             ]
-            for item in copies:
+            for item in copies if start else ():
                 item.start()
-            for item in copies:
+            for item in copies if wait else ():
                 item.wait()
 
         def host_reduce_gather(chunk32, slot, tag="fc"):
@@ -515,12 +567,13 @@ def _make_body(
             _phase_end(scope)
             return result
 
-        def all_reduce(lhs_bf16, chunks, slot, tag=""):
+        def all_reduce(lhs_bf16, chunks, slot, tag="", after_local=None):
             """``lhs @ W`` (a chunk-permuted ``[K, 7168]`` weight: memory chunk
             k is logical chunk ``lane ^ k``; ``chunks``: its memory chunks in
             order, ``_ChunkedWeight.chunks``) summed over the 32 ranks: the
             host-local reduce-scatter chunk by chunk, then the cross-host
-            reduction and gather."""
+            reduction and gather (``after_local`` runs once the chunks are
+            read)."""
             scope = _phase_start(f"ar_{tag}_local")
             copies = []
             own = None
@@ -539,6 +592,8 @@ def _make_body(
                     )
                     item.start()
                     copies.append(item)
+            if after_local is not None:
+                after_local()
             _phase_end(scope)
             scope = _phase_start(f"ar_{tag}_rs")
             for item in copies:
@@ -549,9 +604,10 @@ def _make_body(
             _phase_end(scope)
             return host_reduce_gather(chunk, slot, tag)
 
-        def gather_tiles(tile_bf16, slot, count):
+        def gather_tiles(tile_bf16, slot, count, during=None):
             """This rank's ``[T, 128]`` projection tile to every rank; returns
-            ranks ``0 .. count - 1``'s tiles (BF16, as FP32 ``[T, 128]``)."""
+            ranks ``0 .. count - 1``'s tiles (BF16, as FP32 ``[T, 128]``;
+            ``during`` runs while they are in flight)."""
             tile_recv[slot, rank] = pack(tile_bf16)
             # Only ranks below ``count`` hold a tile: they send, and each rank
             # waits for those peers only.
@@ -570,6 +626,8 @@ def _make_body(
                 for item in copies:
                     item.start()
 
+            if during is not None:
+                during()
             for o, item in zip(range(1, 32), copies, strict=True):
                 pl.when((rank ^ o) < count)(item.wait_recv)
 
@@ -584,6 +642,12 @@ def _make_body(
             return copy(source, tile_buf.at[slot], SEM_TILE + slot)
 
         def tiny_exchange(row_i32, slot):
+            width = row_i32.shape[1]
+            if width < tiny_recv.shape[-1]:  # draft_markov_rows: a slot without rows
+                part = tiny_recv.at[slot, rank, :, pl.ds(0, width)]
+                part[...] = row_i32
+                exchange(lambda o: part, lambda o: part, range(1, 32), SEM_TINY, slot)
+                return tiny_recv[slot, :, :, pl.ds(0, width)]
             tiny_recv[slot, rank] = row_i32
             exchange(
                 lambda o: tiny_recv.at[slot, rank],
@@ -592,10 +656,13 @@ def _make_body(
                 SEM_TINY,
                 slot,
             )
+            if width > 128:  # draft_markov_rows: the w1 rows are read by winner
+                return tiny_recv[slot, :, :, pl.ds(0, 128)]
             return tiny_recv[slot]
 
         # ---------------- prologue ----------------
-        collectives32.barrier()
+        if not overlap:
+            collectives32.barrier()
         sources = {
             "aux": aux_hbm,
             "previous": previous_hbm,
@@ -609,14 +676,59 @@ def _make_body(
             item.start()
         logits_copy = copy(logits_hbm, logits_vmem, 0)
         logits_copy.start()
-        w2t_copy = copy(weights["w2t"], w2t_buf, SEM_W2T)
-        w2t_copy.start()
+        # (draft_prologue_overlap: w2t into down_buf, held whole, once the
+        # last layer's down products have read it)
+        w2t_view = (
+            down_buf.at[pl.ds(0, c.markov_rank), pl.ds(0, vocab)]
+            if overlap
+            else w2t_buf
+        )
+        w2t_copy = copy(weights["w2t"], w2t_view, SEM_W2T)
+        if not overlap:
+            w2t_copy.start()
         tile_copies = [
             tile_copy(weights["qkv_tile"].at[0], 0),
             tile_copy(weights["context_tile"], 1),
         ]
         for item in tile_copies:
             item.start()
+        early = {}  # draft_prologue_overlap: the first layer's q_b / w_uk copies
+        if overlap:
+            for name, buffer, sem in (("q_b", q_buf, 2), ("w_uk", w_uk_buf, 3)):
+                early[name] = copy(weights[name].at[0], buffer, sem)
+                early[name].start()
+
+            @pl.when(forced_all)
+            def forced_rows():  # the anchors' w1 / RoPE rows, the first one's embedding
+                for j, (count_j, anchor_j, position_j) in enumerate(decided):
+                    copy(
+                        weights["w1"].at[
+                            pl.ds(pl.multiple_of(anchor_j // 16 * 16, 16), 16)
+                        ],
+                        w1_blk.at[0, j],
+                        SEM_W1 + j,
+                    ).start()
+                    for k, first in enumerate((position_j + count_j + 1, position_j)):
+                        copy(
+                            weights["rope"].at[
+                                pl.ds(pl.multiple_of(first // 8 * 8, 8), 16)
+                            ],
+                            rope_blk.at[k, j],
+                            SEM_ROPE + 2 * j + k,
+                        ).start()
+                anchor_0 = decided[0][1]
+                local_0 = anchor_0 - anchor_0 // vocab * vocab
+                pl.when(rank == anchor_0 // vocab)(
+                    copy(
+                        weights["embed"].at[
+                            pl.ds(pl.multiple_of(local_0 // 16 * 16, 16), 16)
+                        ],
+                        embed_blk,
+                        SEM_EMBED,
+                    ).start
+                )
+
+            collectives32.barrier()
 
         # ---------------- verify acceptance (as kernels.dspark) ----------------
         scope = _phase_start("d_accept")
@@ -652,41 +764,57 @@ def _make_body(
         # best, id, second), not [T, 128].
         square = jnp.pad(packet, ((0, 128 - T), (0, 0)))
         argmax_recv[rank] = jnp.transpose(square)[:8]
-        exchange(
-            lambda o: argmax_recv.at[rank],
-            lambda o: argmax_recv.at[rank],
-            range(1, 32),
-            SEM_TINY,
-            1,
-        )
-        gathered = argmax_recv[...]  # [RANKS, 8, 128]
-        rank_iota3 = jax.lax.broadcasted_iota(jnp.int32, (RANKS, 1, 128), 0)
-        bests = jax.lax.bitcast_convert_type(gathered[:, 0:1, :], jnp.float32)
-        seconds = jax.lax.bitcast_convert_type(gathered[:, 2:3, :], jnp.float32)
-        best = jnp.max(bests, axis=0)  # [1, 128]
-        winner = jnp.min(jnp.where(bests == best[None], rank_iota3, RANKS), axis=0)
-        target_lanes = jnp.sum(
-            jnp.where(rank_iota3 == winner[None], gathered[:, 1:2, :], 0), axis=0
-        )
-        runner_up = jnp.maximum(
-            jnp.max(seconds, axis=0),
-            jnp.max(jnp.where(rank_iota3 == winner[None], NEG, bests), axis=0),
-        )
-        lanes_back = jnp.concatenate(
-            (
-                target_lanes,
-                jax.lax.bitcast_convert_type(best - runner_up, jnp.int32),
-                jnp.zeros((126, 128), jnp.int32),
-            ),
-            axis=0,
-        )
-        rows_back = jnp.transpose(lanes_back)[
-            :T
-        ]  # [T, 128]: lane 0 target, lane 1 margin
-        targets = rows_back[:, 0:1].reshape(R, rows, 1)
-        margins = jax.lax.bitcast_convert_type(rows_back[:, 1:2], jnp.float32).reshape(
-            R, rows, 1
-        )
+
+        def target_exchange(destination=argmax_recv, start=True, wait=True):
+            exchange(
+                lambda o: argmax_recv.at[rank],
+                lambda o: destination.at[rank],
+                range(1, 32),
+                SEM_TINY,
+                TARGET_SLOT if overlap else 1,
+                start,
+                wait,
+            )
+
+        if overlap:
+            # Forced calls (serving) skip it here: count and anchor are given,
+            # and the lanes below are rebuilt at the end from the exchange
+            # into targets_recv (started after the anchor broadcast).
+            pl.when(~forced_all)(target_exchange)
+        else:
+            target_exchange()
+
+        def targets_of(gathered):  # [RANKS, 8, 128]: (targets, margins) [R, rows, 1]
+            rank_iota3 = jax.lax.broadcasted_iota(jnp.int32, (RANKS, 1, 128), 0)
+            bests = jax.lax.bitcast_convert_type(gathered[:, 0:1, :], jnp.float32)
+            seconds = jax.lax.bitcast_convert_type(gathered[:, 2:3, :], jnp.float32)
+            best = jnp.max(bests, axis=0)  # [1, 128]
+            winner = jnp.min(jnp.where(bests == best[None], rank_iota3, RANKS), axis=0)
+            target_ids = jnp.sum(
+                jnp.where(rank_iota3 == winner[None], gathered[:, 1:2, :], 0), axis=0
+            )
+            runner_up = jnp.maximum(
+                jnp.max(seconds, axis=0),
+                jnp.max(jnp.where(rank_iota3 == winner[None], NEG, bests), axis=0),
+            )
+            lanes_back = jnp.concatenate(
+                (
+                    target_ids,
+                    jax.lax.bitcast_convert_type(best - runner_up, jnp.int32),
+                    jnp.zeros((126, 128), jnp.int32),
+                ),
+                axis=0,
+            )
+            rows_back = jnp.transpose(lanes_back)[
+                :T
+            ]  # [T, 128]: lane 0 target, lane 1 margin
+            targets = rows_back[:, 0:1].reshape(R, rows, 1)
+            margins = jax.lax.bitcast_convert_type(
+                rows_back[:, 1:2], jnp.float32
+            ).reshape(R, rows, 1)
+            return targets, margins
+
+        targets, margins = targets_of(argmax_recv[...])
         previous_vector = small["previous"][...]  # [R, 128]
         row_iota_col = jax.lax.broadcasted_iota(jnp.int32, (R, rows, 1), 1)
         proposals = jnp.sum(
@@ -713,31 +841,38 @@ def _make_body(
         )
         anchor_token = jnp.where(forced_anchor >= 0, forced_anchor, anchor_token)
         anchor_position = new_position + count + 1  # [R]
+
+        def target_lanes(targets, margins, result_lane, result=None):
+            """``result`` (default -1) with the target / margin lanes."""
+            field_row = jax.lax.broadcasted_iota(jnp.int32, (R, rows, 128), 1)
+            field_lane = jax.lax.broadcasted_iota(jnp.int32, (R, rows, 128), 2)
+            targets_row = jnp.sum(
+                jnp.where(field_lane == field_row + OUT_TARGETS, targets, 0), axis=1
+            )
+            margins_row = jnp.sum(
+                jnp.where(
+                    field_lane == field_row + OUT_MARGINS,
+                    jax.lax.bitcast_convert_type(margins, jnp.int32),
+                    0,
+                ),
+                axis=1,
+            )
+            if result is None:
+                result = jnp.zeros((R, 128), jnp.int32) - 1
+            result = jnp.where(
+                (result_lane >= OUT_TARGETS) & (result_lane < OUT_TARGETS + rows),
+                targets_row,
+                result,
+            )
+            result = jnp.where(
+                (result_lane >= OUT_MARGINS) & (result_lane < OUT_MARGINS + rows),
+                margins_row,
+                result,
+            )
+            return result
+
         result_lane = jax.lax.broadcasted_iota(jnp.int32, (R, 128), 1)
-        field_row = jax.lax.broadcasted_iota(jnp.int32, (R, rows, 128), 1)
-        field_lane = jax.lax.broadcasted_iota(jnp.int32, (R, rows, 128), 2)
-        targets_row = jnp.sum(
-            jnp.where(field_lane == field_row + OUT_TARGETS, targets, 0), axis=1
-        )
-        margins_row = jnp.sum(
-            jnp.where(
-                field_lane == field_row + OUT_MARGINS,
-                jax.lax.bitcast_convert_type(margins, jnp.int32),
-                0,
-            ),
-            axis=1,
-        )
-        result = jnp.zeros((R, 128), jnp.int32) - 1
-        result = jnp.where(
-            (result_lane >= OUT_TARGETS) & (result_lane < OUT_TARGETS + rows),
-            targets_row,
-            result,
-        )
-        result = jnp.where(
-            (result_lane >= OUT_MARGINS) & (result_lane < OUT_MARGINS + rows),
-            margins_row,
-            result,
-        )
+        result = target_lanes(targets, margins, result_lane)
         result = jnp.where(result_lane == OUT_COUNT, count[:, None], result)
         result = jnp.where(result_lane == OUT_BONUS, anchor_token[:, None], result)
         tokens_v[...] = result
@@ -762,7 +897,7 @@ def _make_body(
         # ---------------- Markov w1 rows, RoPE rows, anchor embeddings ----------------
         w1_copies: list[list[Any]] = [[None] * R, [None] * R]
 
-        def start_w1(tokens, slot):
+        def start_w1(tokens, slot, when=None):
             for j in range(R):
                 start = pl.multiple_of((tokens[j] // 16) * 16, 16)
                 item = copy(
@@ -770,7 +905,7 @@ def _make_body(
                     w1_blk.at[slot, j],
                     SEM_W1 + slot * R + j,
                 )
-                item.start()
+                item.start() if when is None else pl.when(when)(item.start)
                 w1_copies[slot][j] = item
 
         def w1_rows_for(tokens, slot):
@@ -782,7 +917,63 @@ def _make_body(
                 axis=0,
             )
 
-        start_w1(anchor_token, 0)
+        # KernelConfig.draft_markov_rows: this rank's vocabulary rows of w1 in
+        # o_buf (whole o), window k (columns k markov_rank on) rows k height on.
+        height, half = heads * c.v_head, c.markov_rank // 2
+
+        def w1_row_copies():
+            return [
+                copy(
+                    weights["w1"].at[
+                        pl.ds(
+                            rank * vocab + k * height, min(height, vocab - k * height)
+                        )
+                    ],
+                    o_buf.at[
+                        pl.ds(0, min(height, vocab - k * height)),
+                        pl.ds(k * c.markov_rank, c.markov_rank),
+                    ],
+                    5,  # o's, idle after the last layer's o copy
+                )
+                for k in range(w1_windows)
+            ]
+
+        def start_w1_rows():
+            for item in w1_row_copies():
+                item.start()
+
+        def w1_words(local_ids):
+            """[R, 1] local token ids -> their w1 rows as BF16 pairs [R, half]
+            int32 (high halves: the first ``half`` columns)."""
+            words = []
+            for j in range(R):
+                local = local_ids[j, 0]
+                window, first = (
+                    local // height,
+                    pl.multiple_of(local % height // 16 * 16, 16),
+                )
+                block16 = o_buf[pl.ds(first, 16), pl.ds(0, c.markov_rank)]
+                for k in range(1, w1_windows):
+                    block16 = jnp.where(
+                        window == k,
+                        o_buf[
+                            pl.ds(first, 16), pl.ds(k * c.markov_rank, c.markov_rank)
+                        ],
+                        block16,
+                    )
+                bits = jax.lax.bitcast_convert_type(
+                    _select_rows(_f32(block16), local % 16, 1), jnp.int32
+                )  # BF16 values: low halves zero
+                words.append(bits[:, :half] | ((bits[:, half:] >> 16) & 0xFFFF))
+            return jnp.concatenate(words, axis=0)
+
+        def words_w1(words):  # w1_words' inverse: [R, markov_rank] BF16
+            high = jax.lax.bitcast_convert_type(words & -65536, jnp.float32)
+            low = jax.lax.bitcast_convert_type(words << 16, jnp.float32)
+            return _bf16(jnp.concatenate((high, low), axis=1))
+
+        # draft_prologue_overlap: forced calls started these before the barrier.
+        start_w1(anchor_token, 0, ~forced_all if overlap else None)
         rope_copies = []
         for j in range(R):
             block_start = pl.multiple_of((anchor_position[j] // 8) * 8, 8)
@@ -799,9 +990,12 @@ def _make_body(
                     SEM_ROPE + 2 * j + 1,
                 ),
             )
-        for item in rope_copies:
-            item.start()
 
+        def start_rope():
+            for item in rope_copies:
+                item.start()
+
+        pl.when(~forced_all)(start_rope) if overlap else start_rope()
         owner = anchor_token // vocab
         for j in range(R):
 
@@ -815,7 +1009,10 @@ def _make_body(
                     embed_blk,
                     SEM_EMBED + j,
                 )
-                item.start()
+                if overlap and j == 0:
+                    pl.when(~forced_all)(item.start)
+                else:
+                    item.start()
                 item.wait()
                 bcast_buf[j] = pack(
                     _bf16(_select_rows(_f32(embed_blk[...]), local_id % 16, 1))
@@ -829,6 +1026,9 @@ def _make_body(
                 for item in copies:
                     item.wait_send()
 
+        if overlap:  # forced: the acceptance exchange for the output lanes only
+            targets_recv[rank] = argmax_recv[rank]
+            pl.when(forced_all)(lambda: target_exchange(targets_recv, wait=False))
         _phase_end(scope)
 
         # ---------------- context features ----------------
@@ -849,12 +1049,16 @@ def _make_body(
         fc_parts = 2
         part_rows = FC_IN // fc_parts
 
-        def fc_phase(fc_buf):
-            for p in range(fc_parts):
-                item = copy(
-                    weights["fc"].at[pl.ds(p * part_rows, part_rows)], fc_buf, SEM_FC
-                )
-                item.start()
+        def fc_copy(fc_buf, p):
+            return copy(
+                weights["fc"].at[pl.ds(p * part_rows, part_rows)], fc_buf, SEM_FC
+            )
+
+        def fc_phase(fc_buf, parts=range(fc_parts), started=False):
+            for p in parts:
+                item = fc_copy(fc_buf, p)
+                if not started:
+                    item.start()
                 item.wait()
                 for h in range(4):
 
@@ -878,11 +1082,16 @@ def _make_body(
                         if total is not None:
                             fc_part[...] = total
 
-        pl.run_scoped(fc_phase, tpu.VMEM((part_rows, CHUNK), jnp.bfloat16))
-        context = _rms_norm(
-            _bf16(host_reduce_gather(fc_part[...], 0)), small["context_norm"][...], eps
-        )  # [T, 7168]
+        def context_rows():  # [T, 7168]
+            return _rms_norm(
+                _bf16(host_reduce_gather(fc_part[...], 0)),
+                small["context_norm"][...],
+                eps,
+            )
 
+        if not overlap:  # (draft_prologue_overlap: under the first layer)
+            pl.run_scoped(fc_phase, tpu.VMEM((part_rows, CHUNK), jnp.bfloat16))
+            context = context_rows()
         _phase_end(scope)
 
         # ---------------- RoPE rows and block input ----------------
@@ -934,24 +1143,30 @@ def _make_body(
                 (c_kv, k_pe, jnp.zeros((T, LANES - c.latent), jnp.bfloat16)), axis=1
             )
 
-        # The context rows' kv_a for every layer: one tile per rank, one exchange.
-        tile_copies[1].wait()
-        context_tiles = gather_tiles(
-            _bf16(_dot(context, tile_buf[1])), 0, L * CONTEXT_TILES
-        )
-        if L > 1:
-            tile_copies[1] = tile_copy(weights["qkv_tile"].at[1], 1)
-            tile_copies[1].start()
-        for layer in range(L):
-            context_kv = _bf16(
-                jnp.concatenate(
-                    context_tiles[layer * CONTEXT_TILES : (layer + 1) * CONTEXT_TILES],
-                    axis=1,
+        def context_latents(context):
+            # The context rows' kv_a for every layer: one tile per rank, one exchange.
+            tile_copies[1].wait()
+            context_tiles = gather_tiles(
+                _bf16(_dot(context, tile_buf[1])), 0, L * CONTEXT_TILES
+            )
+            if L > 1:
+                tile_copies[1] = tile_copy(weights["qkv_tile"].at[1], 1)
+                tile_copies[1].start()
+            for layer in range(L):
+                context_kv = _bf16(
+                    jnp.concatenate(
+                        context_tiles[
+                            layer * CONTEXT_TILES : (layer + 1) * CONTEXT_TILES
+                        ],
+                        axis=1,
+                    )
                 )
-            )
-            latents_vmem[layer] = latent_rows(
-                context_kv, layer, cos_context, sin_context
-            )
+                latents_vmem[layer] = latent_rows(
+                    context_kv, layer, cos_context, sin_context
+                )
+
+        if not overlap:
+            context_latents(context)
 
         # ---------------- DCP attention over the draft pools ----------------
         # Attention DP: the group's rows over its pages (DCP over the group).
@@ -986,9 +1201,9 @@ def _make_body(
             ),
         }
 
-        def layer_copy(name, layer):
+        def layer_copy(name, layer, start=True):
             if name in chunked:
-                return chunked[name].load(layer)
+                return chunked[name].load(layer, start)
             buffers = {
                 "q_b": (weights["q_b"].at[layer], q_buf, 2),
                 "w_uk": (weights["w_uk"].at[layer], w_uk_buf, 3),
@@ -997,7 +1212,8 @@ def _make_body(
                 "up": (weights["up"].at[layer], up_buf, 7),
             }
             item = copy(*buffers[name])
-            item.start()
+            if start:
+                item.start()
             return item
 
         # o / down held whole by KernelConfig.draft_whole_weights (more than
@@ -1006,10 +1222,20 @@ def _make_body(
         deferred = [
             name for name, weight in chunked.items() if per > 2 and not weight.streamed
         ]
+        # draft_prologue_overlap: the first layer's other copies start once
+        # the fc weight halves (the context path's, under its exchanges) have
+        # landed -- w_uv / gate / up (o streamed: its first chunk) after the
+        # first half, the deferred o / down after the second -- so that they
+        # do not share HBM with them; they land under its attention.
+        after_fc = (
+            [[n for n in ("w_uv", "o", "gate", "up") if n not in deferred], deferred]
+            if overlap
+            else [[], []]
+        )
         pending = {
-            name: layer_copy(name, 0)
+            name: early[name] if name in early else layer_copy(name, 0)
             for name in ("q_b", "w_uk", "w_uv", "o", "gate", "up", "down")
-            if name not in deferred
+            if name not in deferred and name not in after_fc[0]
         }
 
         def refill(name, layer):
@@ -1039,13 +1265,27 @@ def _make_body(
             )
 
         _phase_end(scope)
-        for layer in range(L):
+
+        def fc_first_half(fc_buf):  # draft_prologue_overlap: under the tile exchange
+            fc_phase(fc_buf, (0,), started=True)
+            fc_copy(fc_buf, 1).start()
+            for name in after_fc[0]:
+                pending[name] = layer_copy(name, 0)
+
+        def layer_step(layer, x, fc_buf=None):
+            """Layer ``layer`` on ``x``; ``fc_buf`` (draft_prologue_overlap's
+            first layer): the context path's fc weight half (VMEM)."""
+            if fc_buf is not None:
+                fc_copy(fc_buf, 0).start()
             scope = _phase_start("d_qkv")
             h = _rms_norm(x, norm_row("ln1", layer), eps)
             slot = layer % 2
             tile_copies[slot].wait()
             tiles = gather_tiles(
-                _bf16(_dot(h, tile_buf[slot])), (layer + 1) % 2, QKV_TILES
+                _bf16(_dot(h, tile_buf[slot])),
+                (layer + 1) % 2,
+                QKV_TILES,
+                during=None if fc_buf is None else lambda: fc_first_half(fc_buf),
             )
             if layer + 2 < L:
                 tile_copies[slot] = tile_copy(weights["qkv_tile"].at[layer + 2], slot)
@@ -1055,23 +1295,48 @@ def _make_body(
             q_c = own_group(
                 _rms_norm(q_a, norm_row("q_norm", layer), eps)
             )  # [group rows, 1536]
-            block_latents = own_group(
-                latent_rows(block_kv, layer, cos_block, sin_block)
-            )
-            context_latents = own_group(latents_vmem[layer])
-            for j in range(group_requests):
-                keys_vmem[j] = jnp.concatenate(
-                    (
-                        _f32(context_latents[j * rows : (j + 1) * rows]),
-                        _f32(block_latents[j * rows : (j + 1) * rows]),
-                    ),
-                    axis=0,
-                )
 
+            def block_keys():
+                block_latents = own_group(
+                    latent_rows(block_kv, layer, cos_block, sin_block)
+                )
+                context_keys = own_group(latents_vmem[layer])
+                for j in range(group_requests):
+                    keys_vmem[j] = jnp.concatenate(
+                        (
+                            _f32(context_keys[j * rows : (j + 1) * rows]),
+                            _f32(block_latents[j * rows : (j + 1) * rows]),
+                        ),
+                        axis=0,
+                    )
+
+            # draft_prologue_overlap: the context path's rest under the query
+            # gather; a call of one chunk (merged after its partials leave)
+            # gathers the context tiles and builds the keys under the
+            # combine's wait instead.
+            late = overlap and group_requests == 1
+            context = []
+
+            def between():
+                if fc_buf is not None:
+                    fc_phase(fc_buf, (1,), started=True)
+                    for name in after_fc[1]:
+                        pending[name] = layer_copy(name, 0)
+                    context.append(context_rows())
+                if not late:
+                    keys_rest()
+
+            def keys_rest():
+                if context:
+                    context_latents(context.pop())
+                block_keys()
+
+            if not overlap:
+                block_keys()
             _phase_end(scope)
             scope = _phase_start("d_query")
             pending["q_b"].wait()
-            if layer == 0:
+            if layer == 0 and not overlap:  # (overlap: after the second fc half)
                 for name in deferred:
                     pending[name] = layer_copy(name, 0)
             q = _bf16(
@@ -1131,8 +1396,10 @@ def _make_body(
                 queries,
                 jnp.zeros((group_rows, LANES), jnp.float32),
                 layer % 2,
+                between if overlap else None,
                 keys=keys_vmem,
                 key_valid=valid_vmem,
+                before_merge=keys_rest if late else None,
             )  # [group rows, heads, 512]
             _phase_end(scope)
             scope = _phase_start("d_o")
@@ -1151,8 +1418,11 @@ def _make_body(
             refill("w_uv", layer)
             pending["o"].wait()
             _phase_end(wuv_scope)
+            # draft_markov_rows: the w1 rows go into o_buf once it is read.
+            after_o = start_w1_rows if w1_windows and layer == L - 1 else None
             x = _bf16(
-                _f32(x) + all_reduce(attended, chunked["o"].chunks(layer), 1, tag="o")
+                _f32(x)
+                + all_reduce(attended, chunked["o"].chunks(layer), 1, "o", after_o)
             )
             refill("o", layer)
 
@@ -1174,13 +1444,43 @@ def _make_body(
             _phase_end(scope)
             scope = _phase_start("d_down")
             pending["down"].wait()
-            mlp = all_reduce(activation, chunked["down"].chunks(layer), 0, tag="down")
+            after_down = w2t_copy.start if overlap and layer == L - 1 else None
+            mlp = all_reduce(
+                activation, chunked["down"].chunks(layer), 0, "down", after_down
+            )
             refill("down", layer)
             x = _bf16(_f32(x) + mlp)
             _phase_end(scope)
+            return x
+
+        for layer in range(L):
+            if overlap and layer == 0:
+                x = pl.run_scoped(
+                    lambda fc_buf: layer_step(0, x, fc_buf),
+                    tpu.VMEM((part_rows, CHUNK), jnp.bfloat16),
+                )
+                # The next layers wait for the copies the scope started on
+                # descriptors built out of it (in it, the refs are its own).
+                for name in pending if L > 1 else ():
+                    pending[name] = layer_copy(name, 1, start=False)
+                for slot in range(min(L - 1, 2)):  # qkv_tile 1 (slot 1), 2 (slot 0)
+                    tile_copies[1 - slot] = tile_copy(
+                        weights["qkv_tile"].at[1 + slot], 1 - slot
+                    )
+            else:
+                x = layer_step(layer, x)
         scope = _phase_start("d_lm")
         latents_copy = copy(latents_vmem, latents_out, SEM_LAT)
         latents_copy.start()
+        if overlap:  # forced calls: the target / margin lanes from the exchange
+
+            @pl.when(forced_all)
+            def forced_target_lanes():
+                target_exchange(targets_recv, start=False)
+                targets, margins = targets_of(targets_recv[...])
+                tokens_v[...] = target_lanes(
+                    targets, margins, result_lane, tokens_v[...]
+                )
 
         # ---------------- LM head (the target's, vocabulary sharded) ----------------
         hidden_rows = _rms_norm(x, small["final_norm"][...], eps)
@@ -1235,10 +1535,17 @@ def _make_body(
         token_lane = jax.lax.broadcasted_iota(jnp.int32, (R, 128), 1)
         rank_iota = jax.lax.broadcasted_iota(jnp.int32, (RANKS, R, 128), 0)
         previous = anchor_token
+        for item in w1_row_copies():  # (draft_markov_rows)
+            item.wait()
+        carried = None  # draft_markov_rows: this slot's w1 rows from the packets
         for slot in range(block):
-            for item in w1_copies[slot % 2]:
-                item.wait()
-            bias = _dot(w1_rows_for(previous, slot % 2), w2t_buf[...])  # [R, 5120]
+            if carried is None:
+                for item in w1_copies[slot % 2]:
+                    item.wait()
+                w1_rows = w1_rows_for(previous, slot % 2)
+            else:
+                w1_rows = carried
+            bias = _dot(w1_rows, w2t_view[...])  # [R, 5120]
             scores = (
                 jnp.concatenate(
                     [
@@ -1260,6 +1567,9 @@ def _make_body(
                 jax.lax.bitcast_convert_type(best_value, jnp.int32),
                 jnp.where(token_lane == 1, best_id + rank * vocab, 0),
             )
+            carry = w1_windows and slot + 1 < block
+            if carry:  # the next slot's w1 row of this rank's best token
+                row = jnp.concatenate((row, w1_words(best_id)), axis=1)
             gathered = tiny_exchange(row, slot % 2)
             maxima = jax.lax.bitcast_convert_type(gathered[:, :, 0:1], jnp.float32)
             top = jnp.max(maxima, axis=0, keepdims=True)
@@ -1273,7 +1583,48 @@ def _make_body(
             ]  # [R, 1]
             tokens = jnp.where(token_lane == OUT_DRAFTS + slot, token, tokens)
             previous = token[:, 0]
-            if slot + 1 < block:
+            if carry:  # the winner's row, from its packet
+                packet_rows = words_w1(
+                    jnp.concatenate(
+                        [
+                            tiny_recv[
+                                slot % 2,
+                                jnp.minimum(win[0, j, 0], RANKS - 1),  # (NaN scores)
+                                pl.ds(j, 1),
+                                pl.ds(128, half),
+                            ]
+                            for j in range(R)
+                        ],
+                        axis=0,
+                    )
+                )
+                no_winner = win[0, 0, 0] >= RANKS
+                for j in range(1, R):
+                    no_winner = no_winner | (win[0, j, 0] >= RANKS)
+
+                def token_zero_rows(landing=(slot + 1) % 2):
+                    # A request whose scores hold a NaN has no winner: its
+                    # token is 0, whose w1 row knob off copies from HBM (here
+                    # too, through the same block).
+                    for j in range(R):
+                        item = copy(
+                            weights["w1"].at[pl.ds(0, 16)],
+                            w1_blk.at[landing, j],
+                            SEM_W1 + landing * R + j,
+                        )
+                        item.start()
+                        item.wait()
+                    zero_rows = jnp.concatenate(
+                        [
+                            _bf16(_select_rows(_f32(w1_blk[landing, j]), 0, 1))
+                            for j in range(R)
+                        ],
+                        axis=0,
+                    )
+                    return jnp.where(win[0] >= RANKS, zero_rows, packet_rows)
+
+                carried = jax.lax.cond(no_winner, token_zero_rows, lambda: packet_rows)
+            elif slot + 1 < block:
                 start_w1(previous, (slot + 1) % 2)
         tokens_v[...] = tokens
         out = tpu.make_async_copy(tokens_v, tokens_out, small_sems.at[0])
@@ -1348,6 +1699,12 @@ def fused_draft_local(
     streamed_o, streamed_down = streamed_weights(
         c, T, dp, _config().draft_whole_weights
     )
+    # draft_prologue_overlap (where it fits, see prologue_overlap): a third
+    # exchange slot and the targets' buffer, w2t in the down buffer;
+    # draft_markov_rows: the Markov packets carry a w1 row (BF16 pairs).
+    overlap = prologue_overlap(c, T, dp)
+    sem_slots = 3 if overlap else 2
+    w1_lanes = c.markov_rank // 2 if markov_row_windows(c, T, dp) else 0
 
     def call(weights, pools, aux, logits, previous, *operands):
         if single is None:
@@ -1430,7 +1787,10 @@ def fused_draft_local(
                 (2, MLP_PADDED, CHUNK) if streamed_down else (MLP_PADDED, c.hidden),
                 jnp.bfloat16,
             ),  # down_buf
-            tpu.VMEM((c.markov_rank, c.vocab // RANKS), jnp.bfloat16),  # w2t_buf
+            tpu.VMEM(
+                (16, 128) if overlap else (c.markov_rank, c.vocab // RANKS),
+                jnp.bfloat16,
+            ),  # w2t_buf (overlap: unused, w2t goes into down_buf)
             tpu.VMEM((2, R, 16, c.markov_rank), jnp.bfloat16),  # w1_blk
             tpu.VMEM((16, c.hidden), jnp.bfloat16),  # embed_blk
             tpu.VMEM((R, ROW_PACKED, 128), jnp.float32),  # bcast_buf
@@ -1442,7 +1802,7 @@ def fused_draft_local(
             tpu.VMEM((2, 8, packed, 128), jnp.float32),  # local_recv
             tpu.VMEM((2, 4, packed, 128), jnp.float32),  # host_packed
             tpu.VMEM((2, 8, packed, 128), jnp.float32),  # gather_recv
-            tpu.VMEM((2, RANKS, R, 128), jnp.int32),  # tiny_recv
+            tpu.VMEM((2, RANKS, R, 128 + w1_lanes), jnp.int32),  # tiny_recv (+ w1 rows)
             tpu.VMEM((RANKS, 8, 128), jnp.int32),  # argmax_recv: rows along lanes
             tpu.VMEM(
                 (R // dp, 2 * rows, LANES), jnp.float32
@@ -1466,11 +1826,13 @@ def fused_draft_local(
             tpu.SemaphoreType.DMA((2, ring)),  # stage2_sems
             tpu.SemaphoreType.DMA((19 + 5 * R,)),
             tpu.SemaphoreType.DMA((len(SMALL_NAMES),)),
-            tpu.SemaphoreType.DMA((2 * SEMS_PER_SLOT,)),
-            tpu.SemaphoreType.DMA((2 * SEMS_PER_SLOT,)),
+            tpu.SemaphoreType.DMA((sem_slots * SEMS_PER_SLOT,)),
+            tpu.SemaphoreType.DMA((sem_slots * SEMS_PER_SLOT,)),
         )
         if chunks and _config().draft_pair_combine:
             scratch += (tpu.SemaphoreType.DMA((2, ring)),)  # the pair stage's
+        if overlap:
+            scratch += (tpu.VMEM((RANKS, 8, 128), jnp.int32),)  # targets_recv
         out_shape = (
             jax.ShapeDtypeStruct((R, 128), jnp.int32),
             jax.ShapeDtypeStruct((c.layers, T, LANES), jnp.bfloat16),

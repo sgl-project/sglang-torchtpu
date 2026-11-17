@@ -411,6 +411,35 @@ class KernelConfig:
     # once before the normalization (a power of two: the accumulator holds
     # exactly 256 times its value at every step). Bit-identical.
     draft_step_trims: bool = False
+    # MLA DSpark drafts holding down_proj whole (draft_whole_weights: up to 16
+    # rows at attention DP1; larger calls keep today's prologue, as VMEM
+    # requires): the kernel prologue starts from the caller's forced
+    # acceptance decisions (every serving path passes the verify's count and
+    # bonus): the anchors' w1 / RoPE / embedding rows and the first layer's
+    # q_b / w_uk are copied before the start barrier; then the anchor rows'
+    # broadcast, the first layer's q_a | kv_a tile exchange and its queries
+    # run first. The context path runs under the first layer's attention:
+    # the fc products under its tile exchange and query gather, their host
+    # reduction and gather under the query gather, and (one request) the
+    # context rows' kv_a tile exchange, latents and keys once its partials
+    # have left; later layers build their block keys under their query
+    # gather. The first layer's other weight copies start once the fc halves
+    # have landed. The Markov w2t moves into the down buffer after the last
+    # layer's down products (its own buffer's VMEM holds the fc scope). The
+    # acceptance exchange (only the output vector's target / margin lanes
+    # then read it) runs on its own semaphores and is awaited at the LM head.
+    # Calls whose decisions are not all forced run the acceptance first, as
+    # before. The same operations on the same operands (bit-identical).
+    draft_prologue_overlap: bool = False
+    # MLA DSpark drafts holding o_proj whole (draft_whole_weights: up to 8
+    # rows at attention DP1): after the last layer's o_proj products, this
+    # rank's vocabulary rows of the Markov w1 are copied into the o buffer;
+    # each Markov slot's exchange packet carries the rank's best token's w1
+    # row, so the next slot's bias reads the winner's row from the packets
+    # instead of copying it from HBM after the exchange (a slot without a
+    # winner, NaN scores, copies token 0's row as before). The same w1 bits
+    # in the same products (bit-identical).
+    draft_markov_rows: bool = False
     # Decode MoE router (weight arena, unsharded top-k): every rank copies and
     # projects both router halves, its own and its pair peer's (14 MiB of
     # arena instead of 7), instead of exchanging score halves with the peer.

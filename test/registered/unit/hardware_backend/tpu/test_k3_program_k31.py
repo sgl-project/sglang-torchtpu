@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=5400, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7400, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -7554,6 +7554,237 @@ print("OK" if ok else "FAIL")
                 self.assertIn(
                     "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
                 )
+
+
+class TestK31DraftPrologueOverlap(CustomTestCase):
+    """``KernelConfig.draft_prologue_overlap`` and ``draft_markov_rows``: the
+    fused MLA draft kernel in Kimi-K3.1's shape (three heads a rank, causal
+    block rows; shrunk to hidden 1024, 512 vocabulary rows a rank, two layers
+    and Markov rank and MLP lanes 256, so that w2t fits the down buffer as
+    Kimi-K3.1's 512 do) on 32 devices in Pallas interpret mode, with
+    draft_whole_weights and draft_lm_prefetch, returns the knob-off kernel's
+    output vector and context latents on every rank, bit for bit:
+
+    - the single-request op (B1: the overlap with w2t in the down buffer, the
+      w1 rows in the o buffer) with forced decisions (the serving path), and
+      with NaNs in the anchor's and token 0's w1 rows (no Markov slot has a
+      winner: each drafts token 0, and the next slot reads its row from HBM
+      as knob off does), its knob-on runs under the race detector with every
+      DMA executed at its start;
+    - two requests through the scalar operands, both forced with anchors one
+      rank owns, or the second's decisions unforced (the acceptance first);
+      16 rows: o streams, so the Markov rows stay off.
+
+    Three requests at 8 rows stream down_proj and keep the sequential
+    prologue (VMEM). The cached pages hold O(1) latents (FP8 of N(0, 1/4)),
+    so the attention output, the MLP's and the new keys all reach the drafts
+    (a layer keeping layer 0's block keys, or a zeroed MLP output, changes
+    them)."""
+
+    SCRIPT = """
+        import os, sys
+        G = 32
+        os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={G}"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call as interpreter
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3 import config as kconfig
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dspark_mla as mla, dspark_mla_kernel as kern, mla_dcp
+        from sglang_tpu.k3_programs.kimi_k3.kernels.dspark import OUT_DRAFTS
+
+        L, H, V, MLP, MARKOV, ROWS, PAGES, BLOCKS, LANES = 2, 1024, 512, 256, 256, 8, 2, 3, mla_dcp.LANES
+        kern.CHUNK, kern.FC_IN, kern.ROW_PACKED = H // 8, 5 * H // 4, H // 256
+        kern.LM_CHUNK, kern.LM_CHUNKS, kern.MLP_PADDED = 128, V // 128, MLP
+        c = mla.MlaDraftConfig(hidden=H, layers=L, heads=96, vocab=G * V, markov_rank=MARKOV, causal=True)
+        BASE = kconfig.KernelConfig(draft_whole_weights=True, draft_lm_prefetch=True)
+        KNOBS = {"draft_prologue_overlap": True, "draft_markov_rows": True}
+        kern._config = lambda: BASE.replace(**KNOBS)
+        # Where the knobs apply: the overlap with down_proj whole (up to 16 rows), the w1 rows with o whole (8).
+        assert c.heads_per_rank == 3
+        assert [kern.prologue_overlap(c, T) for T in (8, 16, 24, 32)] == [True, True, False, False]
+        assert [kern.markov_row_windows(c, T) for T in (8, 16)] == [2, 0]
+        kern._config = lambda: BASE
+        assert not kern.prologue_overlap(c, 8) and kern.markov_row_windows(c, 8) == 0
+        stock = pl.pallas_call
+        interpret = [None]
+        pl.pallas_call = lambda *a, **k: stock(*a, **{"interpret": interpret[0], **k})
+
+        def tokens(x):  # interpret mode has no ref bitcasts (see TestDraftPairCombine)
+            return (jax.lax.broadcasted_iota(jnp.int32, x.shape, 0) * x.shape[1]
+                    + jax.lax.broadcasted_iota(jnp.int32, x.shape, 1))
+
+        def _pages(self, slot):
+            def load(lanes, tokens=None):
+                x = self.ws.pages[slot]
+                x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+                if hasattr(lanes, "size"):
+                    return jax.lax.dynamic_slice_in_dim(x, lanes.start, lanes.size, 1)
+                return x[:, lanes]
+            return load
+
+        def _clean_step(self, slot, row, local_step, tokens_=None, end=None, pad=True):
+            x = self.ws.pages[slot]
+            cut = 0
+            for k in range(self.span):
+                first = ((local_step * self.span + k) * self.group + self.owner) * self.page_tokens
+                cut = cut + jnp.clip(self._limit(row) - first, 0, self.page_tokens)
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+            keep = (tokens(x) < cut) & ((lane < 576) if pad else True)
+            self.ws.pages[slot] = jnp.where(keep, x, jnp.zeros((), x.dtype))
+
+        def _zero_step_pad_lanes(self, slot):
+            x = self.ws.pages[slot]
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+            self.ws.pages[slot] = jnp.where(lane < 576, x, jnp.zeros((), x.dtype))
+
+        def _zero_slot(self, slot):
+            self.ws.pages[slot] = jnp.zeros(self.ws.pages.shape[1:], self.ws.pages.dtype)
+
+        mla_dcp.DcpAttention._pages = _pages
+        mla_dcp.DcpAttention._clean_step = _clean_step
+        mla_dcp.DcpAttention._zero_slot = _zero_slot
+        mla_dcp.DcpAttention._zero_step_pad_lanes = _zero_step_pad_lanes
+
+        rng = np.random.default_rng(0)
+        bf = ml_dtypes.bfloat16
+        per = c.heads_per_rank
+        SHAPES = {"ln1": (L, 1, H), "ln2": (L, 1, H), "q_norm": (L, 1, c.q_lora), "kv_norm": (L, 1, LANES),
+                  "context_norm": (1, H), "final_norm": (1, H), "mask_embed": (1, H), "rot": (c.rope, c.rope),
+                  "qkv_tile": (L, H, 128), "context_tile": (H, 128), "q_b": (L, c.q_lora, per * 256),
+                  "w_uk": (L, per, 128, 512), "w_uv": (L, per, 512, 128), "o": (L, per * 128, H),
+                  "gate": (L, H, MLP), "up": (L, H, MLP), "down": (L, MLP, H), "fc": (kern.FC_IN, kern.CHUNK),
+                  "w2t": (MARKOV, V), "lm_head": (H, V), "embed": (V, H)}
+        weights = {}
+        for name in kern.WEIGHT_NAMES:
+            if name == "w1":
+                w1 = rng.standard_normal((c.vocab, MARKOV)).astype(bf)
+                w1[rng.random(w1.shape) < 0.01] = -0.0  # signed zeros through the packets
+                weights[name] = w1  # w1 and rope: replicated
+            elif name == "rope":
+                weights[name] = rng.uniform(-1, 1, (4096, 128)).astype(np.float32)
+            else:
+                shape = SHAPES[name]
+                scale = 1.0 if len(shape) < 3 or name in ("ln1", "ln2", "q_norm", "kv_norm") else shape[-2] ** -0.5
+                if name in kern.VMEM_NAMES:  # the norms, mask row and rotation: the same on every rank
+                    weights[name] = np.broadcast_to((rng.standard_normal(shape) * scale).astype(bf), (G, *shape))
+                else:
+                    weights[name] = (rng.standard_normal((G, *shape)) * scale).astype(bf)
+
+        def inputs(R, single, firsts, decisions, no_winner=False):
+            r = np.random.default_rng(R)
+            pools = [(r.standard_normal((G * BLOCKS, 128, 4, LANES), np.float32) * 0.5).astype(
+                ml_dtypes.float8_e4m3fn) for _ in range(L)]
+            aux = r.standard_normal((5, R * ROWS, H)).astype(bf)
+            logits = r.standard_normal((G, R, ROWS, V)).astype(np.float32)
+            target = logits.transpose(1, 2, 0, 3).reshape(R, ROWS, G * V).argmax(-1)
+            previous = np.full((R, 128), -1, np.int32)
+            previous[:, OUT_DRAFTS : OUT_DRAFTS + 3] = target[:, :3]  # an unforced count of 3
+            table = 1 + np.arange(PAGES, dtype=np.int32)
+            if single:
+                ids = np.zeros(3 * ROWS + 1 + ROWS * PAGES, np.int32)
+                ids[ROWS : 2 * ROWS] = firsts[0] + np.arange(ROWS)
+                ids[3 * ROWS + 1 : 3 * ROWS + 1 + PAGES] = table
+                operands = (ids, np.asarray(decisions, np.int32))
+            else:
+                d = np.asarray(decisions, np.int32)
+                operands = (np.asarray(firsts, np.int32), d[:, 0], d[:, 1], np.tile(table, (R, 1)))
+            w1 = weights["w1"]
+            if no_winner:  # a NaN in the anchor's and token 0's w1 rows: no Markov slot has a winner
+                w1 = w1.copy()
+                w1[[decisions[0][1], 0], 7] = np.nan
+            return w1, (*pools, aux, logits, previous, *operands)
+
+        def build(knobs, R, single, races=False):
+            # The config and interpret mode are read when the kernel traces (the first call).
+            config = BASE.replace(**knobs)
+            kern._config = lambda: config
+            interpret[0] = (pltpu.InterpretParams(detect_races=True, dma_execution_mode="eager") if races
+                            else pltpu.InterpretParams())
+            ids_size = 3 * ROWS + 1 + ROWS * PAGES
+            spec = kern.SingleEpilogue(slots=3, reset=10, state_size=40, ids_size=ids_size) if single else None
+            fused = kern.fused_draft_local(c, requests=R, pages=PAGES, rows=ROWS, single=spec)
+            n = len(kern.WEIGHT_NAMES)
+
+            def body(*a):
+                w = {name: a[i] if name in ("w1", "rope") else a[i][0] for i, name in enumerate(kern.WEIGHT_NAMES)}
+                for name in kern.LEADING_NAMES if single else ():
+                    w[name] = w[name].reshape(L, -1)
+                vector, latents = fused(w, a[n : n + L], *a[n + L :])
+                return vector[None], latents[None]
+
+            operands = 2 if single else 4
+            specs = (*(P() if name in ("w1", "rope") else P("tp") for name in kern.WEIGHT_NAMES), *(P("tp"),) * L,
+                     P(), P("tp"), P(), *(P(),) * operands)
+            f = jax.jit(jax.shard_map(body, mesh=Mesh(np.asarray(jax.devices()), ("tp",)), in_specs=specs,
+                                      out_specs=(P("tp"), P("tp")), check_vma=False))
+
+            def run(data):
+                w1, rest = data
+                out = f(*(w1 if name == "w1" else weights[name] for name in kern.WEIGHT_NAMES), *rest)
+                return [np.asarray(x).view(np.uint32 if x.dtype == jnp.int32 else np.uint16) for x in out]
+
+            return run
+
+        CASES = {"single": (1, True, [1400], {"forced": [[5, 7 * V + 33]], "no_winner": [[5, 7 * V + 33]]}),
+                 "two": (2, False, [1500, 2600], {"forced": [[2, 3 * V + 401], [6, 3 * V + 7]],  # one owner
+                                                  "mixed": [[2, 3 * V + 401], [-1, -1]]})}  # (unforced count 3)
+        R, single, firsts, decisions = CASES[os.environ["CASE"]]
+        data = {name: inputs(R, single, firsts, d, name == "no_winner") for name, d in decisions.items()}
+        off_run = build({}, R, single)
+        off = {name: off_run(x) for name, x in data.items()}
+        for name, out in off.items():
+            drafts = out[0].view(np.int32)[0, :, OUT_DRAFTS : OUT_DRAFTS + ROWS - 1]
+            assert all(np.array_equal(out[k][0], out[k][g]) for k in range(2) for g in range(G))
+            if name == "no_winner":  # knob off drafts token 0 at every slot (and so reads its row)
+                assert not drafts.any(), drafts
+            else:
+                assert all(len(set(row.tolist())) > 1 for row in drafts), drafts
+            assert np.isfinite(out[1].view(bf).astype(np.float32)).all()
+        on_run = build(KNOBS, R, single, races=single)
+        for name, x in data.items():
+            on = on_run(x)
+            same = [np.array_equal(a, b) for a, b in zip(on, off[name])]
+            print(name, "vector, latents identical:", same, flush=True)
+            assert all(same), (on[0].view(np.int32)[0, 0, :32], off[name][0].view(np.int32)[0, 0, :32])
+            # (the detector's state is the last kernel run's: each run starts a new one)
+            assert not (single and interpreter.races.races_found), name
+        print("OK")
+    """
+
+    def _run(self, case):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        # 32 interpret devices block in callbacks: give the CPU client enough
+        # threads (XLA reads NPROC for its pool size).
+        env = dict(
+            os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128", CASE=case
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=3600,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
+
+    def test_single_request_matches_knob_off_without_races(self):
+        self._run("single")
+
+    def test_two_requests_match_knob_off(self):
+        self._run("two")
 
 
 if __name__ == "__main__":
