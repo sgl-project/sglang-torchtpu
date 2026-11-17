@@ -13,13 +13,23 @@ mis-split a degenerate flat grid. No server / GPU / weight loading involved.
 
 import pickle
 import unittest
+from array import array
 from unittest.mock import patch
 
 import numpy as np
 import torch
 
-from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    MultiModalityDataPaddingPatternTokenPairs,
+    get_new_expanded_mm_items,
+)
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -227,6 +237,47 @@ class TestGetNewExpandedMMItems(CustomTestCase):
             for protocol in (pickle.DEFAULT_PROTOCOL, pickle.HIGHEST_PROTOCOL):
                 payload = pickle.dumps(items, protocol=protocol)
                 self.assertLess(len(payload), logical_bytes * 1.2)
+
+
+class TestWidePadSentinelPadding(CustomTestCase):
+    """Padding writes every wide sentinel of an item, so images whose hashes share
+    their low 30 bits still get different radix keys."""
+
+    def _item(self, item_hash, offsets):
+        item = MultimodalDataItem(modality=Modality.IMAGE, offsets=offsets)
+        item.set_hash(item_hash)
+        return item
+
+    def test_token_pair_padding_writes_every_sentinel(self):
+        start, end = 90, 91
+        item = self._item(0x1234_5678, [(1, 7)])
+        pattern = MultiModalityDataPaddingPatternTokenPairs([(start, end)])
+        input_ids = array("q", [1, start] + [9] * 6 + [end, 2])
+        padded = pattern.pad_input_tokens(input_ids, MultimodalInputs(mm_items=[item]))
+        self.assertEqual(list(padded[2:8]), item.padding_sequence(6))
+        self.assertEqual(len(set(padded[2:8])), 4)
+
+    def test_multimodal_token_padding_writes_every_sentinel(self):
+        image_token = 9
+        item = self._item(0x1234_5678, [(1, 6)])
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        padded = pattern.pad_input_tokens(
+            array("q", [1] + [image_token] * 6 + [2]),
+            MultimodalInputs(mm_items=[item], im_token_id=image_token),
+        )
+        self.assertEqual(list(padded[1:7]), item.padding_sequence(6))
+
+    def test_padding_clips_a_span_cut_by_truncation(self):
+        # Auto-truncation can shorten input_ids without clipping item offsets.
+        image_token = 9
+        item = self._item(0x1234_5678, [(1, 6)])
+        truncated = array("q", [1] + [image_token] * 3)
+        padded = MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+            truncated, MultimodalInputs(mm_items=[item], im_token_id=image_token)
+        )
+        self.assertEqual(list(padded), [1] + item.padding_sequence(3))
+        built = MultimodalProcessorOutput.build_padded_input_ids([1, 9, 9, 9], [item])
+        self.assertEqual(built, [1] + item.padding_sequence(3))
 
 
 if __name__ == "__main__":
