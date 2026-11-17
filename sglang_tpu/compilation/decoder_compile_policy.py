@@ -80,7 +80,6 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.cp_forward import (
     install_cp_logits_forward,
     prepare_tpu_cp_forward_batch,
-    ring_token_buckets,
     wrap_cp_embedding_forward,
 )
 from sglang_tpu.cp_layout import ring_warmup_request_lengths, warmup_request_lengths
@@ -600,6 +599,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
+        # Ring-mode prefill CP only: the local token buckets its layout can use.
+        self.cp_t_bucketer: Bucketer | None = None
         self.tracer = tracer
         self.extend_bs: int | None = None
         self.compiled_forward_shim: CompiledForwardShim | None = None
@@ -614,21 +615,20 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         cached, since the strategy may initialize after this policy is built."""
         return get_cp_strategy()
 
-    def _cp_ring(self) -> bool:
-        """Whether prefill context parallelism runs in ring mode
-        (SGLANG_TPU_PCP_MODE=ring)."""
-        return self._cp_strategy is not None and current_platform.pcp_ring_enabled()
-
-    def _cp_ring_token_buckets(self) -> list[int]:
-        """Local token buckets the ring-mode layout can use (multiples of two
-        pages, at least the extend batch cap)."""
+    def _init_cp_ring_bucketer(self) -> None:
+        """Ring-mode prefill CP (SGLANG_TPU_PCP_MODE=ring) reserves two
+        page-aligned blocks per request on every rank and reads the gathered
+        chunk by page, so its local token buckets are the token buckets that
+        are multiples of 2 x page size (and at least the extend batch cap)."""
+        if not current_platform.pcp_ring_enabled():
+            return
         page_size = self.model_runner.page_size
         assert self.t_bucketer is not None
         cap = self._extend_compile_cap()
         buckets = [
             bucket
-            for bucket in ring_token_buckets(self.t_bucketer, page_size)
-            if bucket >= cap
+            for bucket in self.t_bucketer.buckets
+            if bucket % (2 * page_size) == 0 and bucket >= cap
         ]
         if not buckets:
             raise ValueError(
@@ -637,13 +637,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 f"({2 * page_size}) and at least the extend batch cap {cap}; got "
                 f"buckets {list(self.t_bucketer.buckets)}."
             )
-        return buckets
+        self.cp_t_bucketer = Bucketer(name="CpRingTokenBucketer", buckets=buckets)
 
     def _configure_cp_ring(self) -> None:
         """Tell the zigzag strategy the ring-mode capacity rule. Every rank runs
         this with the same buckets, so admission stays identical across ranks."""
-        if self._cp_ring():
-            self._cp_strategy.ring_max_local_rows = self._cp_ring_token_buckets()[-1]
+        if self.cp_t_bucketer is not None and self._cp_strategy is not None:
+            self._cp_strategy.ring_max_local_rows = self.cp_t_bucketer.max_val
 
     def _record_compile_step(
         self,
@@ -754,8 +754,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return []
         assert self.t_bucketer is not None
         cap = self._extend_compile_cap()
-        if self._cp_ring():
-            return [(num_tokens, cap) for num_tokens in self._cp_ring_token_buckets()]
+        if self.cp_t_bucketer is not None:
+            return [(num_tokens, cap) for num_tokens in self.cp_t_bucketer.buckets]
         return [
             (num_tokens, cap)
             for num_tokens in self.t_bucketer.buckets
@@ -859,6 +859,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
         if not is_draft_worker:
             # Needs the buckets above; before any batch is admitted.
+            self._init_cp_ring_bucketer()
             self._configure_cp_ring()
 
         outer_model = self.model_runner.model
@@ -1226,7 +1227,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if self._cp_batch_active(forward_batch):
             real_q, real_b = prepare_tpu_cp_forward_batch(
                 forward_batch,
-                t_bucketer=self.t_bucketer,
+                t_bucketer=self.cp_t_bucketer or self.t_bucketer,
                 b_bucketer=self.b_bucketer,
                 extend_bs=self.extend_bs,
                 cp_size=self._cp_strategy.cp_size,
@@ -1787,7 +1788,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         rows on every context-parallel rank, with the CP-v2 metadata built
         the way serving builds it."""
         assert self._cp_strategy is not None
-        if not self._cp_ring():
+        if self.cp_t_bucketer is None:
             request_lens = warmup_request_lengths(
                 local_rows=local_tokens, cp_size=self._cp_strategy.cp_size, max_reqs=bs
             )

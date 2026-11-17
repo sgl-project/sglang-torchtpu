@@ -49,16 +49,6 @@ class TpuCpBatchLayout(NamedTuple):
     local_rows: torch.Tensor
 
 
-def ring_token_buckets(t_bucketer: Any, page_size: int) -> list[int]:
-    """Token buckets a ring-mode context-parallel extend can use.
-
-    A request reserves two page-aligned blocks on every rank and the fused
-    kernel reads the rank-major gathered chunk by page, so a usable bucket is a
-    multiple of ``2 * page_size``.
-    """
-    return [bucket for bucket in t_bucketer.buckets if bucket % (2 * page_size) == 0]
-
-
 def get_tpu_cp_layout(forward_batch: Any) -> TpuCpBatchLayout | None:
     """Layout attached by ``prepare_tpu_cp_forward_batch``; None otherwise."""
     return getattr(forward_batch, _LAYOUT_ATTR, None)
@@ -97,7 +87,8 @@ def prepare_tpu_cp_forward_batch(
     the compiled-forward shim gathers the local rows from them.
 
     Ring mode (``SGLANG_TPU_PCP_MODE=ring``) uses the page-aligned layout,
-    whose bucketed quantity is ``cp_layout.ring_local_rows``.
+    whose bucketed quantity is ``cp_layout.ring_local_rows``; its caller
+    passes the ring-mode token bucketer.
 
     Returns the real (global) token count and the real request count.
     """
@@ -126,39 +117,25 @@ def prepare_tpu_cp_forward_batch(
             f"{real_q} rows; context parallelism needs a pure extend batch."
         )
 
-    if not current_platform.pcp_ring_enabled():
-        local_rows_padded = t_bucketer.next_bucket(
-            max(max_local_rows(extend_lens, cp_size), pad_b)
-        )
-        host = build_tpu_cp_layout(
-            extend_lens=extend_lens,
-            prefix_lens=prefix_lens,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-            pad_b=pad_b,
-            local_rows_padded=local_rows_padded,
-        )
-    else:
+    ring = current_platform.pcp_ring_enabled()
+    if ring:
         page_size = get_schedule().page_size
-        rows = max(ring_local_rows(extend_lens, cp_size, page_size), pad_b)
-        fitting = [b for b in ring_token_buckets(t_bucketer, page_size) if b >= rows]
-        if not fitting:
-            raise ValueError(
-                f"Ring-mode context parallelism needs {rows} local rows, above "
-                f"every usable token bucket of {list(t_bucketer.buckets)} "
-                f"(multiples of {2 * page_size}); the batch should have run the "
-                "striped extend path."
-            )
-        local_rows_padded = fitting[0]
-        host = build_tpu_cp_ring_layout(
-            extend_lens=extend_lens,
-            prefix_lens=prefix_lens,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-            pad_b=pad_b,
-            local_rows_padded=local_rows_padded,
-            page_size=page_size,
-        )
+        rows = ring_local_rows(extend_lens, cp_size, page_size)
+    else:
+        rows = max_local_rows(extend_lens, cp_size)
+    local_rows_padded = t_bucketer.next_bucket(max(rows, pad_b))
+    layout_args = dict(
+        extend_lens=extend_lens,
+        prefix_lens=prefix_lens,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        pad_b=pad_b,
+        local_rows_padded=local_rows_padded,
+    )
+    if ring:
+        host = build_tpu_cp_ring_layout(**layout_args, page_size=page_size)
+    else:
+        host = build_tpu_cp_layout(**layout_args)
     local_rows = torch.from_numpy(np.clip(host.local_rows, 0, None)).to(
         device, non_blocking=True
     )
