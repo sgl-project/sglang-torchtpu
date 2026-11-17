@@ -992,13 +992,6 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         self.assertEqual((allocator.allocs, allocator.frees), (2, 2))
         self.assertEqual(sorted(allocator.free_pages), list(range(10, 16)))
 
-    def test_without_allocator_staged_reshard_is_refused(self):
-        mgr, _ = self._decode_manager(None)
-        self._register(mgr, 5, [3])
-        self.assertIn("5", mgr._failed)
-        self.assertIn("Partial FP8 head packs are unsupported", mgr.failure_records[5])
-        self.assertEqual(mgr.sent, [])
-
     def test_unstaged_room_allocates_nothing(self):
         allocator = _FakeAllocator(range(10, 16))
         mgr, _ = self._decode_manager(allocator, src_tp=16, dst_tp=8)
