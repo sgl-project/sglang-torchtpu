@@ -117,6 +117,13 @@ def _gather_page_chunk_step_cycles(block_tokens: int, topk: int) -> float:
 
     A chunk step is bound by the cross-lane unit (XLU): one lane gather per (8, 128) vreg of the
     block's top-k indices.
+
+    Args:
+      block_tokens: Query tokens per grid step.
+      topk: Top-k page ids per query token.
+
+    Returns:
+      Cycles the busier XLU spends on one 128-page chunk step of one token block.
     """
     num_vregs = cdiv(block_tokens, 8) * cdiv(topk, _GATHER_PAGE_CHUNK)
     # The permute reserves an XLU for 4 cycles and the all-sublanes set-pattern for 4 more, but
@@ -142,6 +149,16 @@ def _gather_page_chunks_per_iteration(
 
       unrolled: max(floor, fixed + num_chunks * u)
       bounded:  max(floor, fixed + ceil(c / g) * (o + g * u))
+
+    Args:
+      num_chunks: Width of a page-table row in 128-page chunks (static, from
+        ``context_length``).
+      block_tokens: Query tokens per grid step.
+      topk: Top-k page ids per query token.
+
+    Returns:
+      The number of chunk steps to unroll per ``fori_loop`` iteration of the bounded kernel,
+      or None if the unrolled kernel is expected to be cheaper.
     """
     u = _gather_page_chunk_step_cycles(block_tokens, topk)
     # Per-iteration overhead of the fori_loop: the last gather's push-to-pop latency plus the
