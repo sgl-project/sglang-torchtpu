@@ -3597,6 +3597,391 @@ def _consume_completed_routed_chunks(
 # (KernelConfig.decode_late_shared_down).
 LATE_SHARED_DOWN = _config().decode_late_shared_down
 
+# The token-parallel MoE latent-up (KernelConfig.moe_token_parallel_up).
+TOKEN_PARALLEL_UP = _config().moe_token_parallel_up
+# Its output round's peers (XOR rank offsets): the rank pair on every host.
+_TOKEN_PARALLEL_PEERS = (25, 24, 17, 16, 9, 8, 1)
+# The routed pair round's seven messages count on one semaphore that none of
+# the next layer's first rounds signals (the pre-attention gather uses 0..2):
+# a rank whose MoE ends early may start those before this one's pair round is
+# drained, as it no longer waits for this rank after the round.
+_TOKEN_PARALLEL_ROUTED_SEMAPHORE = 3
+
+
+def _token_parallel_peer_slot(offset):
+    """Output semaphore of a peer offset (1, 8, 9, ..., 25 -> 0..6)."""
+    return 2 * (offset // 8) + offset % 2 - 1
+
+
+@dataclasses.dataclass(frozen=True)
+class _TokenParallelUp:
+    """The token-scattered MoE tail of KernelConfig.moe_token_parallel_up (8 or
+    16 rows, rank-pair owners, routed and shared reduce-scatters).
+
+    The routed reduce-scatter sends each lane its rank pair's tokens instead of
+    one token shard, so after the host round both cores of a chip hold their
+    pair's ``tokens`` latent sums on every host: the eight ranks owning those
+    tokens' rows. Rank (host h, core c) projects them through latent_up block
+    2h + c (``latent_up_tp``: latent_up's 1024-column lane blocks indexed by
+    host and core; block 7 is zero padding), adds the same block of the
+    shared-expert output (reduce-scattered to these (tokens, block) owners
+    instead of lane blocks of every token) and sends the BF16 result straight
+    to the tokens' other seven owners in one round. That replaces the routed
+    all-gather and the lane-to-owner transpose.
+
+    Bit-identical to the lane-block tail: the transports carry the same BF16
+    values; every sum adds the same operands in the same order (eight lanes in
+    lane order, BF16, four hosts in host order) with the lane-block tail's
+    reduction shapes (the pair's two lane-sized token shards, all four shared
+    blocks' rows); the latent RMS norm runs on the same [batch, padded latent]
+    tile (the pair's tokens repeated over its rows); and the latent-up product
+    is the same [batch, latent] x [latent, 1024] product on the same block.
+    """
+
+    batch_size: int
+    latent: int  # routed latent features (the expert output width)
+    rank: Any
+    shared_local: Any  # [8, rows, 128] FP32 (communication workspace)
+    shared_host: Any  # [4, rows, 128] FP32
+    expert_local: Any  # [8, rows, 128] FP32
+    expert_host: Any  # [4, rows, 128] FP32
+    shared_send_semaphores: Any  # [10]
+    shared_receive_semaphores: Any  # [10]
+    send_semaphores: Any  # [16]
+    receive_semaphores: Any  # [16]
+    output_vmem: Any  # [12, batch / 4 * 8, 128] BF16
+    output_send_semaphores: Any  # [7]
+    output_receive_semaphores: Any  # [7]
+
+    block = 1024  # latent_up / shared-expert columns of a lane block
+    hidden = 7168  # seven blocks; the eighth is padding
+
+    def __post_init__(self):
+        if self.batch_size not in (8, 16) or self.latent % 256:
+            raise ValueError("The token-parallel latent-up runs at 8 or 16 rows")
+        # The routed send storage holds every token (and later the shared host
+        # sums); the shared sends leave from the rows past the receive views.
+        assert self.expert_local.shape[1] >= max(
+            4 * self.routed_rows, 8 * self.block_rows
+        )
+        assert self.expert_host.shape[1] >= self.routed_rows
+        assert self.shared_local.shape[1] >= 2 * self.shared_rows
+        assert self.shared_host.shape[1] >= 4 * self.block_rows
+        assert self.output_vmem.shape == (12, self.piece_rows, 128)
+
+    @property
+    def tokens(self):
+        """The rank pair's tokens (its owned rows)."""
+        return self.batch_size // 4
+
+    @property
+    def routed_rows(self):
+        """FP32 transport rows of the pair's routed latents."""
+        return self.tokens * self.latent // 256
+
+    @property
+    def shard_rows(self):
+        """FP32 transport rows of a lane's token shard in the lane-block tail
+        (batch / 8 tokens): the pair's routed sums run as its two shards, on
+        the lane-block reductions' shapes."""
+        return self.routed_rows // 2
+
+    @property
+    def shared_rows(self):
+        """FP32 transport rows of four blocks of the pair's tokens."""
+        return self.tokens * 4 * self.block // 256
+
+    @property
+    def block_rows(self):
+        """FP32 transport rows of one block of the pair's tokens."""
+        return self.tokens * self.block // 256
+
+    @property
+    def piece_rows(self):
+        """BF16 rows of 128 of one block of the pair's tokens."""
+        return self.tokens * self.block // 128
+
+    @property
+    def lane(self):
+        return self.rank % 8
+
+    @property
+    def host(self):
+        return self.rank // 8
+
+    @property
+    def pair(self):
+        return self.lane // 2
+
+    @property
+    def producer(self):
+        """The latent_up block this rank projects: 2 * host + core."""
+        return 2 * self.host + self.rank % 2
+
+    @staticmethod
+    def _encode(value, rows):
+        """FP32 values -> the MoE transport's FP32 words of their BF16 rows of
+        128, ``rows`` words (as moe()'s encode_expert / encode_shared_shard)."""
+        bits = tpu.bitcast(
+            value.reshape(2 * rows, 128).astype(jnp.bfloat16), jnp.uint32
+        )
+        return jax.lax.bitcast_convert_type(bits, jnp.float32)
+
+    @staticmethod
+    def _decode(value):
+        """The MoE transport's FP32 words -> their BF16 values in FP32."""
+        return tpu.bitcast(
+            jax.lax.bitcast_convert_type(value, jnp.uint32), jnp.bfloat16
+        ).astype(jnp.float32)
+
+    def _groups(self):
+        """Row offsets of the batch tile's groups of ``tokens`` rows: row r
+        holds the pair's token r % tokens."""
+        return range(0, self.batch_size, self.tokens)
+
+    # Routed experts: reduce the pair's tokens over the 32 ranks.
+    def _routed_storage(self):
+        # moe()'s routed send storage: every token's rows in token order, so
+        # pair p's tokens are its p-th quarter.
+        return self.expert_local.at[self.lane, : 4 * self.routed_rows, :]
+
+    def _routed_send_view(self, target_pair):
+        return self._routed_storage().reshape(4, self.routed_rows, 128).at[target_pair]
+
+    def _routed_local_copy(self, offset):
+        return tpu.make_async_remote_copy(
+            self._routed_send_view((self.lane ^ offset) // 2),
+            self.expert_local.at[self.lane, : self.routed_rows, :],
+            self.send_semaphores.at[_TOKEN_PARALLEL_ROUTED_SEMAPHORE],
+            self.receive_semaphores.at[_TOKEN_PARALLEL_ROUTED_SEMAPHORE],
+            device_id=(self.rank ^ offset,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    def _routed_host_copy(self, offset):
+        view = self.expert_host.at[self.host, : self.routed_rows, :]
+        return tpu.make_async_remote_copy(
+            view,
+            view,
+            self.send_semaphores.at[6 + offset],
+            self.receive_semaphores.at[6 + offset],
+            device_id=(self.rank ^ (8 * offset),),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    def routed_send(self, local_expert_outputs):
+        """Encode this rank's routed partials [batch, >= latent] and send each
+        lane its pair's tokens."""
+        self._routed_storage()[...] = self._encode(
+            local_expert_outputs[:, : self.latent], 4 * self.routed_rows
+        )
+        for offset in range(7, 0, -1):
+            self._routed_local_copy(offset).start()
+
+    def routed_local_reduce(self):
+        """The pair's eight-lane sum, BF16, into this host's slot."""
+        view = self.expert_local.at[pl.ds(0, 7), pl.ds(0, self.routed_rows), :]
+        for semaphores in (self.send_semaphores, self.receive_semaphores):
+            tpu.make_async_copy(
+                view, view, semaphores.at[_TOKEN_PARALLEL_ROUTED_SEMAPHORE]
+            ).wait()
+        receive = self.expert_local.at[self.lane, : self.routed_rows, :]
+        receive[...] = self._routed_send_view(self.pair)[...]
+        for shard in range(2):
+            rows = pl.ds(shard * self.shard_rows, self.shard_rows)
+            local = jnp.sum(self._decode(self.expert_local[:, rows, :]), axis=0)
+            self.expert_host.at[self.host, rows, :][...] = self._encode(
+                local, self.shard_rows
+            )
+
+    def start_routed_host(self):
+        for offset in range(3, 0, -1):
+            self._routed_host_copy(offset).start()
+
+    def routed_host_reduce(self, tile):
+        """The pair's latents summed over the four hosts, FP32, into every
+        group of ``tile`` [batch, >= latent] (row r: token r % tokens)."""
+        for offset in range(3, 0, -1):
+            self._routed_host_copy(offset).wait()
+        per_shard = self.tokens // 2
+        for shard in range(2):
+            view = self.expert_host[
+                :, pl.ds(shard * self.shard_rows, self.shard_rows), :
+            ]
+            sums = jnp.sum(self._decode(view), axis=0).reshape(per_shard, self.latent)
+            for group in self._groups():
+                first = group + shard * per_shard
+                tile[first : first + per_shard, : self.latent] = sums
+
+    # Shared expert: reduce-scatter to (tokens, block) owners.
+    def _shared_send_view(self, target_lane):
+        # decode_late_shared_down's spare rows past the receive views.
+        return self.shared_local.at[
+            target_lane, pl.ds(self.shared_rows, self.shared_rows), :
+        ]
+
+    def _shared_receive_view(self, source_lane):
+        return self.shared_local.at[source_lane, : self.shared_rows, :]
+
+    def _shared_local_copy(self, offset):
+        return tpu.make_async_remote_copy(
+            self._shared_send_view(self.lane ^ offset),
+            self._shared_receive_view(self.lane),
+            self.shared_send_semaphores.at[offset - 1],
+            self.shared_receive_semaphores.at[offset - 1],
+            device_id=(self.rank ^ offset,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    def _shared_host_copy(self, offset):
+        # The block for host h' leaves and lands in the sender's host slot.
+        rows = pl.ds(
+            pl.multiple_of((self.host ^ offset) * self.block_rows, 8), self.block_rows
+        )
+        view = self.shared_host.at[self.host, rows, :]
+        return tpu.make_async_remote_copy(
+            view,
+            view,
+            self.shared_send_semaphores.at[6 + offset],
+            self.shared_receive_semaphores.at[6 + offset],
+            device_id=(self.rank ^ (8 * offset),),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    def begin_shared(self, shared_outputs):
+        """Send lane m its pair's tokens' blocks 2h + m % 2 (h = 0..3) of this
+        rank's shared-expert partial ``shared_outputs`` [batch, hidden] FP32
+        (block 7, past the hidden columns, as zeros)."""
+        for target_lane in range(8):
+            first = target_lane // 2 * self.tokens
+            blocks = []
+            for host in range(4):
+                block = 2 * host + target_lane % 2
+                blocks.append(
+                    jnp.zeros((self.tokens, self.block), jnp.float32)
+                    if (block + 1) * self.block > self.hidden
+                    else shared_outputs[
+                        first : first + self.tokens,
+                        block * self.block : (block + 1) * self.block,
+                    ]
+                )
+            self._shared_send_view(target_lane)[...] = self._encode(
+                jnp.concatenate(blocks, axis=1), self.shared_rows
+            )
+        self._shared_receive_view(self.lane)[...] = self._shared_send_view(self.lane)[
+            ...
+        ]
+        for offset in range(7, 0, -1):
+            self._shared_local_copy(offset).start()
+
+    def finish_shared_local(self):
+        """Sum the eight lanes (then BF16) and start the host round: host h'
+        gets block 2h' + core of the pair's tokens."""
+        for offset in range(7, 0, -1):
+            self._shared_local_copy(offset).wait()
+        local = jnp.sum(
+            self._decode(self.shared_local[:, : self.shared_rows, :]), axis=0
+        ).reshape(self.tokens, 4 * self.block)
+        for host in range(4):
+            self.shared_host.at[
+                self.host, pl.ds(host * self.block_rows, self.block_rows), :
+            ][...] = self._encode(
+                local[:, host * self.block : (host + 1) * self.block], self.block_rows
+            )
+        for offset in range(3, 0, -1):
+            self._shared_host_copy(offset).start()
+
+    def finish_shared_host(self, tile):
+        """This rank's block of its pair's tokens' shared-expert output summed
+        over the four hosts, FP32, into every group of ``tile[:, :1024]``."""
+        for offset in range(3, 0, -1):
+            self._shared_host_copy(offset).wait()
+        # The sum runs over every host block's rows, the lane-block shared sum's
+        # shape; only this host's block holds all four hosts' rows. The routed
+        # send storage (free since t3) holds the sums for this host's block.
+        sums = self.expert_local.at[self.lane, : 8 * self.block_rows, :]
+        sums[...] = jnp.sum(
+            self._decode(self.shared_host[:, : 4 * self.block_rows, :]), axis=0
+        )
+        mine = (
+            sums.reshape(4, 2 * self.block_rows, 128)
+            .at[self.host][...]
+            .reshape(self.tokens, self.block)
+        )
+        for group in self._groups():
+            tile[group : group + self.tokens, : self.block] = mine
+
+    def project(
+        self,
+        tile,
+        latent_normalization,
+        latent_up_vmem,
+        latent_up_copy,
+        *,
+        epsilon,
+        latent_feature_count,
+    ):
+        """The latent norm on the [batch, padded latent] ``tile`` of the pair's
+        tokens and its latent_up block product: [batch, 1024] FP32 (row r:
+        token r % tokens)."""
+        # Columns past the latent keep the expert stream's zeros; the BF16
+        # rounding is the routed gather's transport.
+        routed = tile[...].astype(jnp.bfloat16).astype(jnp.float32)
+        normalized = (
+            routed
+            * jax.lax.rsqrt(
+                jnp.sum(routed * routed, axis=1, keepdims=True) / latent_feature_count
+                + epsilon
+            )
+            * latent_normalization[...]
+        ).astype(jnp.bfloat16)
+        latent_up_copy.wait()
+        return _dot(normalized[:, : self.latent], latent_up_vmem[...])
+
+    def send_outputs(self, up, tile, output_ref):
+        """Add the shared block (``tile[:, :1024]``) to the product ``up``
+        [batch, 1024], send this rank's BF16 block of the pair's tokens to
+        their other seven owners and assemble the owned rows [tokens, hidden]
+        in ``output_ref``."""
+        # The lane-block tail's ``(up + shared).astype(bf16)``: the compiler
+        # picks the product's MXU accumulation (result-buffer or popped and
+        # added per pass) by how the product is used, so it is used the same
+        # way here (as AOT bundles of both tails show at 8 and 16 rows).
+        local_output = (up + tile[:, : self.block]).astype(jnp.bfloat16)
+        # Every row of the product is stored (the send slots repeat the
+        # pair's tokens), as the lane-block transpose stores every row.
+        for slot in range(4):
+            self.output_vmem[slot] = local_output[
+                slot * self.tokens : (slot + 1) * self.tokens
+            ].reshape(self.piece_rows, 128)
+        send = self.output_vmem.at[0]
+        receive = self.output_vmem.at[pl.ds(4, 8)]
+        receive[self.producer] = send[...]
+        # Block 7's rank sends its zeros too, so each rank's MoE ends only once
+        # all eight owners of its pair's tokens have sent here. The next
+        # layer's attention input takes rows from every pair, so no rank
+        # reaches that layer's attention rounds (into this rank's shared
+        # buffers) before this rank has sent, past its last read of them.
+        copies = []
+        for offset in _TOKEN_PARALLEL_PEERS:
+            slot = _token_parallel_peer_slot(offset)
+            copy = tpu.make_async_remote_copy(
+                send,
+                receive.at[self.producer],
+                self.output_send_semaphores.at[slot],
+                self.output_receive_semaphores.at[slot],
+                device_id=(self.rank ^ offset,),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            copy.start()
+            copies.append(copy)
+        for copy in copies:
+            copy.wait()
+        for block in range(self.hidden // self.block):
+            output_ref[:, pl.ds(block * self.block, self.block)] = receive[
+                block
+            ].reshape(self.tokens, self.block)
+
 
 def moe(
     hidden_ref: TensorLike,  # [batch_size, hidden_size]
@@ -3624,6 +4009,7 @@ def moe(
     owned_hidden_ref=None,
     live_rows=None,
     steal=None,
+    token_parallel_up: bool = False,
 ) -> None:
     """Execute one mixture-of-experts layer inside a Pallas program.
 
@@ -3645,6 +4031,10 @@ def moe(
     return_scratch_shapes), the tag both cores put in their packets and
     ``accumulators`` [1 + slots, batch_size, latent_size] FP32 whose first
     entry is ``workspace.routed_outputs_vmem``.
+
+    ``token_parallel_up`` (KernelConfig.moe_token_parallel_up): the
+    token-scattered tail of _TokenParallelUp; ``weights`` then carries the
+    rank's ``latent_up_tp`` block, whose copy starts with the last expert pair.
     """
     batch_size, hidden_size = hidden_ref.shape
     expert_count = weights.routing_projection.shape[1]
@@ -3910,6 +4300,42 @@ def moe(
     reduction_phase = communication_workspace.reduction_phase
     latent_vmem = communication_workspace.latent_gather_vmem
     rank = jax.lax.axis_index("tp")
+    token_parallel = None
+    if token_parallel_up:
+        if not (
+            TOKEN_PARALLEL_UP
+            and batch_size in (8, 16)
+            and hidden_size == _TokenParallelUp.hidden
+            and token_scatter_output
+            and routed_reduce_scatter
+            and token_scatter_owners == 4
+            and group_pending_expert_routes
+            and not token_pipeline
+            and not overlap_shared_reduction
+            and not shared_sharded
+            and routed_send_vmem is None
+            and workspace.expert_schedule_smem is not None
+        ):
+            raise ValueError(
+                "The token-parallel latent-up runs at B8/B16 with the pair-owned "
+                "routed and shared reduce-scatters and the expert schedule"
+            )
+        token_parallel = _TokenParallelUp(
+            batch_size,
+            expert_output_size,
+            rank,
+            shared_local_reduction_vmem,
+            shared_host_reduction_vmem,
+            expert_local_reduction_vmem,
+            expert_host_reduction_vmem,
+            shared_send_semaphores,
+            shared_receive_semaphores,
+            send_semaphores,
+            receive_semaphores,
+            output_vmem,
+            output_send_semaphores,
+            output_receive_semaphores,
+        )
     if synchronize_devices:
         collectives32.barrier()
         reduction_phase[0] = 0
@@ -4836,6 +5262,8 @@ def moe(
         begin_shared_reduction(
             routed_outputs_vmem[:, :shared_width].astype(jnp.bfloat16)
         )
+    elif token_parallel is not None and not late_shared_down:
+        token_parallel.begin_shared(shared_outputs_vmem)
     elif not late_shared_down:
         begin_shared_reduction(shared_outputs_vmem[...])
     if overlap_latent_gather:
@@ -4902,11 +5330,7 @@ def moe(
                 finish_shared_reduction(payload)
             progress_state[0] = 1
 
-    if overlap_shared_reduction:
-        pl.run_scoped(
-            run_with_shared_progress, progress_state=tpu.SMEM((1,), jnp.int32)
-        )
-    else:
+    def run_expert_stream(progress=None):
         with _phase("p4_experts"):
             _run_routed_expert_stream(
                 latent_vmem,
@@ -4929,10 +5353,44 @@ def moe(
                 expert_width=expert_width,
                 expert_output_size=expert_output_size,
                 group_pending_routes=group_pending_expert_routes,
-                progress=None,
+                progress=progress,
                 expert_schedule=expert_schedule,
                 stolen=None if steal_step is None else steal_step.stream_hooks(),
             )
+
+    def run_with_latent_up_copy(started):
+        # The token-parallel tail leaves the latent-up copy no routed gather
+        # to land behind, and its region-B storage holds the routing weights
+        # until the stream: start it with the last expert pair (whose slabs
+        # were issued a pair or more earlier), clear of the first pairs' slabs
+        # and of the next layer's weights issued after the stream.
+        started[0] = 0
+
+        def start_with_last_pair(iteration):
+            last_pair = (
+                2 * iteration + 2 >= expert_schedule.table[SCHEDULE_EXPERT_COUNT, 0]
+            )
+
+            @pl.when(last_pair & (started[0] == 0))
+            def start():
+                latent_output_copy.start()
+                started[0] = 1
+
+        run_expert_stream(start_with_last_pair)
+
+        @pl.when(started[0] == 0)
+        def start_without_pairs():
+            # No pair ran (no local routes, or every row's routes alike).
+            latent_output_copy.start()
+
+    if overlap_shared_reduction:
+        pl.run_scoped(
+            run_with_shared_progress, progress_state=tpu.SMEM((1,), jnp.int32)
+        )
+    elif token_parallel is not None:
+        pl.run_scoped(run_with_latent_up_copy, tpu.SMEM((1,), jnp.int32))
+    else:
+        run_expert_stream()
 
     def consume_routed_chunk(first, rows):
         with _phase("t7_pipeline_latent_up"):
@@ -4968,6 +5426,50 @@ def moe(
     if steal_step is not None:
         # Before the reductions: the given experts' outputs after the own.
         steal_step.combine(routed_outputs_vmem, expert_output_size)
+    if token_parallel is not None:
+        with _phase("t1_routed_send"):
+            token_parallel.routed_send(routed_outputs_vmem[...])
+        if after_experts is not None:
+            after_experts()
+        if late_shared_down:
+            with _phase("t2_shared_down"):
+                shared_outputs_vmem[...] = _dot(
+                    shared_outputs_vmem[:, :shared_width].astype(jnp.bfloat16),
+                    shared_down_weights[...],
+                )
+                token_parallel.begin_shared(shared_outputs_vmem)
+        else:
+            with _phase("t2_shared_local"):
+                token_parallel.finish_shared_local()
+        with _phase("t3_routed_local"):
+            token_parallel.routed_local_reduce()
+        t4 = _phase_start("t4_routed_host")
+        token_parallel.start_routed_host()
+        if late_shared_down:
+            # The shared local round lands during the cross-host wait.
+            with _phase("t2_shared_local"):
+                token_parallel.finish_shared_local()
+        # The routed outputs (sent in t1) hold the norm's tile from here on.
+        token_parallel.routed_host_reduce(routed_outputs_vmem)
+        _phase_end(t4)
+        with _phase("t7_latent_up"):
+            up = token_parallel.project(
+                routed_outputs_vmem,
+                weights.latent_normalization,
+                weights.latent_output_projection_vmem,
+                latent_output_copy,
+                epsilon=epsilon,
+                latent_feature_count=latent_feature_count,
+            )
+        with _phase("t6_shared_host"):
+            # Started in t4, the shared host round lands during the product
+            # (no routed gather to hide it behind).
+            token_parallel.finish_shared_host(routed_outputs_vmem)
+        with _phase("t8_output_transport"):
+            token_parallel.send_outputs(up, routed_outputs_vmem, output_ref)
+        # The lane-block tail's three reduction phases.
+        reduction_phase[0] += 3
+        return
     finish_reductions(
         routed_outputs_vmem[...],
         routed_outputs_vmem,
@@ -9178,6 +9680,32 @@ def stack(
         if EXPERT_STEAL and expert_schedule and not shard_routing
         else 0
     )
+    # KernelConfig.moe_token_parallel_up on the programs it covers (they read
+    # latent_up_tp); the rest keep the lane-block tail. 8-row steps only: at
+    # 16 rows the tail's extra register spills overflow VMEM (~250 KB).
+    token_parallel_up = bool(
+        TOKEN_PARALLEL_UP
+        and batch_size == 8
+        and moe_token_scatter_output
+        and moe_routed_reduce_scatter
+        and sp_owners == 4
+        and attention_dp == 1
+        and not moe_token_pipeline
+        and group_pending_expert_routes
+        and expert_schedule
+        and POOLED_WEIGHTS
+        and not _shared_shards(batch_size)
+    )
+    if token_parallel_up:
+        if (
+            "latent_up_tp" not in weights
+            or weights["latent_up_tp"].shape != weights["latent_up"].shape
+        ):
+            raise ValueError(
+                "moe_token_parallel_up needs the latent_up_tp weight family "
+                "(latent_up's shape)"
+            )
+        layer_names = (*layer_names, "latent_up_tp")
     steal_families = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
     moe_scoped_scratch = _moe_scoped_scratch(
         local_weights,
@@ -11537,7 +12065,9 @@ def stack(
                         router_semaphores,
                         bias_vmem,
                         layer_weights["latent_down"].at[layer_index - 1],
-                        layer_weights["latent_up"].at[layer_index - 1],
+                        layer_weights[
+                            "latent_up_tp" if token_parallel_up else "latent_up"
+                        ].at[layer_index - 1],
                         latent_output_vmem,
                         latent_output_semaphore,
                         latent_norm_vmem,
@@ -11591,6 +12121,7 @@ def stack(
                     owned_hidden_ref=owned_rows_vmem if shard_routing else None,
                     live_rows=active_rows,
                     steal=steal,
+                    token_parallel_up=token_parallel_up,
                 )
 
             def run_dense_mlp():

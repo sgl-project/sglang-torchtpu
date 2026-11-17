@@ -516,6 +516,8 @@ class Checkpoint:
           ``[3584, 1024]``.
         * ``shared_gu``/``shared_down``: the rank's 192 shared channels without
           the 256 padding -> ``[hidden, 384]`` / ``[192, hidden]``.
+        * ``latent_up_tp`` (``KernelConfig.moe_token_parallel_up``): latent_up's
+          block :func:`token_parallel_up_block` instead of ``r % 8``.
         """
         base = f"{PREFIX}layers.{layer}."
         hidden = self.config.dim
@@ -529,8 +531,8 @@ class Checkpoint:
                 ),
             )
             return value.T.copy()
-        if name == "latent_up":
-            block = rank % 8
+        if name in ("latent_up", "latent_up_tp"):
+            block = rank % 8 if name == "latent_up" else token_parallel_up_block(rank)
             if (block + 1) * 1024 > hidden:
                 return np.zeros((self.config.latent, 1024), BF16)
             value = self.read(
@@ -556,6 +558,21 @@ class Checkpoint:
                 (slice(None), slice(rank * 192, (rank + 1) * 192)),
             ).T.copy()
         return self.dense(name, layer, rank)
+
+
+def token_parallel_up_block(rank: int) -> int:
+    """The latent_up block (1024 hidden columns) rank ``rank`` projects under
+    ``KernelConfig.moe_token_parallel_up``: ``2 * host + core`` (block 7 is
+    zero padding past 7168)."""
+    return 2 * (rank // 8) + rank % 2
+
+
+def _token_parallel_up() -> bool:
+    """The installed KernelConfig.moe_token_parallel_up (off before any
+    install; reading it installs nothing)."""
+    from sglang_tpu.k3_programs.kimi_k3 import config
+
+    return config._ACTIVE is not None and config._ACTIVE.moe_token_parallel_up
 
 
 def selected_local_shapes(layers=93, hidden=7168, *, vocab=163840, dsa=False):
@@ -610,6 +627,8 @@ def selected_local_shapes(layers=93, hidden=7168, *, vocab=163840, dsa=False):
         output_res=(1, hidden),
         final_norm=(1, hidden),
     )
+    if _token_parallel_up():
+        shapes["latent_up_tp"] = shapes["latent_up"]
     if dsa:
         shapes.update(
             d_wqb=(m, 1536, 128),
@@ -639,6 +658,7 @@ def _family_layers(config, name, layers):
         "router_bias",
         "latent_down",
         "latent_up",
+        "latent_up_tp",
         "latent_norm",
         "shared_gu",
         "shared_down",

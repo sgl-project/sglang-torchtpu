@@ -381,10 +381,25 @@ def iter_decode_rank(
                         families, presharded, rank, layers, attention_dp
                     )
                 )
+            if _config().moe_token_parallel_up:
+                families["latent_up_tp"] = token_parallel_up_family(
+                    presharded, rank, layers
+                )
             for name, family in families.items():
                 yield "decode", name, family
         else:
             yield "decode", key, value
+
+
+def token_parallel_up_family(presharded, rank: int, layers: int = 93) -> np.ndarray:
+    """``latent_up_tp`` (KernelConfig.moe_token_parallel_up) for ``rank``:
+    latent_up block ``2 * host + core``, the pre-shard's host-0 rank of that
+    lane."""
+    from sglang_tpu.k3_programs.kimi_k3.kernels.load import token_parallel_up_block
+
+    return RankDir(presharded, token_parallel_up_block(rank), layers).read_dense(
+        "latent_up"
+    )
 
 
 FP8_E4M3_MAX = 448.0
