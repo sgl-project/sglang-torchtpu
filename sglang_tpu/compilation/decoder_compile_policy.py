@@ -138,6 +138,46 @@ _COMPILE_BAR_FORMAT = (
 _DISTRIBUTED_TOP_K_WARMUP_K = 50
 
 
+def _moe_topk_extra_tensor_attrs(model: torch.nn.Module) -> tuple[str, ...]:
+    """Paths of MoE router correction biases held by TopK's plain config.
+
+    TopK keeps ``correction_bias`` (DeepSeek-style ``e_score_correction_bias``)
+    on its ``topk_config`` dataclass, which direct_compile does not traverse,
+    so it must be lifted explicitly.
+    """
+    return tuple(
+        f"{name}.topk_config.correction_bias"
+        for name, module in model.named_modules()
+        if isinstance(
+            getattr(getattr(module, "topk_config", None), "correction_bias", None),
+            torch.Tensor,
+        )
+    )
+
+
+def _module_plain_tensor_attrs(model: torch.nn.Module) -> tuple[str, ...]:
+    """Paths of Tensors stored as plain attributes directly on submodules.
+
+    Some layers keep derived weights outside ``_parameters``/``_buffers``
+    (e.g. MLA ``w_kc``/``w_vc`` assigned in ``post_load_weights``), which
+    direct_compile cannot see unless they are lifted explicitly.
+    """
+    paths = []
+    for name, module in model.named_modules():
+        for attr, value in vars(module).items():
+            # Views (e.g. GDN conv_weights) share storage with a parameter and
+            # are re-derived by bind_traced_conv_weights; lifting them breaks
+            # the _base check and direct_compile requires base buffers.
+            if (
+                isinstance(value, torch.Tensor)
+                and not isinstance(value, torch.nn.Parameter)
+                and not value.is_meta
+                and value._base is None
+            ):
+                paths.append(f"{name}.{attr}" if name else attr)
+    return tuple(paths)
+
+
 def forward_bucketers(server_args: Any, *, context_len: int) -> tuple[Any, Any]:
     """The token and batch buckets a decoder forward is padded to. Computed
     from the server arguments alone, so the KV budget can size what depends
@@ -961,7 +1001,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         Example: ("foo.bar.baz",).
         """
-        return self.model_extra_tensor_attrs
+        from sglang_tpu.compilation.hybrid_linear_direct_compile import (
+            linear_attention_extra_tensor_attrs,
+        )
+
+        model = self.model_runner.model
+        extras = (
+            *linear_attention_extra_tensor_attrs(model),
+            *_moe_topk_extra_tensor_attrs(model),
+            *_module_plain_tensor_attrs(model),
+        )
+        return tuple(dict.fromkeys((*self.model_extra_tensor_attrs, *extras)))
 
     def _direct_compile_specialization_key(
         self,

@@ -316,6 +316,17 @@ class CompiledFunction:
             self._model_extra_tensor_attrs
         ):
             raise ValueError("model_extra_tensor_attrs contains duplicate paths")
+        if self._model_extra_tensor_attrs:
+            err = getattr(self._model, "_derived_weight_cache_error", None)
+            if not err:
+                # Compiled artifacts retain load-time extra tensors; load_weights
+                # rebinds plain attributes to new tensors, leaving graphs stale.
+                self._model._derived_weight_cache_error = (
+                    "Online weight updates are not supported with "
+                    "--tpu-compile-tracer direct when model_extra_tensor_attrs "
+                    "are bound at compile time. Restart the server or use "
+                    "--tpu-compile-tracer dynamo to update weights online."
+                )
         self._kv_pool = kv_pool
         self._ignored_argnames = ignored_argnames
         self._prune_unused_inputs = prune_unused_inputs
@@ -326,6 +337,10 @@ class CompiledFunction:
         self._spmd_safe = spmd_safe
         self._lift_rank = lift_rank
         self._rank_input: torch.Tensor | None = None
+        # Explicit tensor inputs the traced fn writes in place (e.g. a capture
+        # buffer the forward fills). Learned on first trace; traced on clones and
+        # copied back after each execute, like KV state.
+        self._mutated_input_paths: set[tree_util.KeyPath] = set()
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         artifact = self._get_artifact(args, kwargs)
@@ -640,10 +655,25 @@ class CompiledFunction:
         for input_index in range(kv_pool_input_start, kv_pool_input_stop):
             trace_inputs[input_index] = graph_inputs[input_index].clone()
         kv_pool_trace_inputs = trace_inputs[kv_pool_input_start:kv_pool_input_stop]
-        for input_index, leaf_index in enumerate(
-            tensor_leaf_indices, start=kv_pool_input_stop
+        mutated_leaf_positions: set[int] = set()
+        for position, (input_index, leaf_index) in enumerate(
+            zip(
+                range(
+                    kv_pool_input_stop, kv_pool_input_stop + len(tensor_leaf_indices)
+                ),
+                tensor_leaf_indices,
+            )
         ):
+            if tensor_inputs_key_paths[position] in self._mutated_input_paths:
+                # Trace in-place writes on a clone: a mutated placeholder would
+                # carry deferred ops into argument binding.
+                trace_inputs[input_index] = graph_inputs[input_index].clone()
+                mutated_leaf_positions.add(position)
             trace_leaves[leaf_index] = trace_inputs[input_index]
+        explicit_trace_inputs = trace_inputs[
+            kv_pool_input_stop : kv_pool_input_stop + len(tensor_leaf_indices)
+        ]
+        explicit_versions = [_tensor_version(t) for t in explicit_trace_inputs]
 
         rng_device = flat_inputs[0].device if self._uses_rng else None
         rng_output = None
@@ -719,10 +749,46 @@ class CompiledFunction:
             if rng_device is not None:
                 rng_output = tpu_torch_compile.get_device_state_tensor(trace_generator)
 
+        newly_mutated = {
+            tensor_inputs_key_paths[position]
+            for position, (tensor, version) in enumerate(
+                zip(explicit_trace_inputs, explicit_versions, strict=True)
+            )
+            if position not in mutated_leaf_positions
+            and version is not None
+            and _tensor_version(tensor) != version
+        }
+        if newly_mutated:
+            if spmd_compiler is not None:
+                raise NotImplementedError(
+                    "Shared TPU compilation does not support in-place writes to "
+                    f"explicit inputs: {[tree_util.keystr(p) for p in newly_mutated]}"
+                )
+            logger.info(
+                "[direct_compile] retracing: fn writes explicit inputs in place: %s",
+                [tree_util.keystr(p) for p in newly_mutated],
+            )
+            self._mutated_input_paths |= newly_mutated
+            return self._compile(
+                args,
+                kwargs,
+                async_compile=async_compile,
+                spmd_compiler=spmd_compiler,
+                graph=graph,
+            )
+        # Paths and graph outputs must line up; keep them in input order.
+        ordered_mutated_positions = sorted(mutated_leaf_positions)
+        mutated_input_paths = tuple(
+            tensor_inputs_key_paths[position] for position in ordered_mutated_positions
+        )
+        mutated_trace_inputs = [
+            explicit_trace_inputs[position] for position in ordered_mutated_positions
+        ]
+
         output_leaves, output_treespec = tree_util.tree_flatten(outputs)
         if not all(_is_tpu_tensor(leaf) for leaf in output_leaves):
             raise TypeError("All direct_compile output leaves must be TPU tensors")
-        result_tensors = output_leaves + kv_pool_trace_inputs
+        result_tensors = output_leaves + kv_pool_trace_inputs + mutated_trace_inputs
         # Forward hooks see Torch tensors here, not JAX values, and JAX export
         # cannot serialize host callbacks. Preserve callback values as extra
         # executable outputs, then invoke their Python callbacks after execute.
@@ -768,7 +834,7 @@ class CompiledFunction:
             "and %d callbacks",
             len(graph_inputs),
             len(output_leaves),
-            len(kv_pool_inputs),
+            len(kv_pool_inputs) + len(mutated_trace_inputs),
             len(inserted_callbacks),
         )
         # Placeholders do not retain the physical layout of their buffers.
@@ -850,10 +916,19 @@ class CompiledFunction:
             ),
             output_treespec=output_treespec,
             output_count=len(output_leaves),
+            mutated_input_paths=mutated_input_paths,
             callbacks=callbacks,
             pending_compile=pending_compile,
             rng_device=rng_device,
         )
+
+
+def _tensor_version(tensor: torch.Tensor) -> int | None:
+    """The in-place version counter, or None when the tensor has none."""
+    try:
+        return tensor._version
+    except RuntimeError:  # Inference tensors carry no version counter.
+        return None
 
 
 def _tensor_specs(tensors: Sequence[torch.Tensor]) -> tuple[InputSpec, ...]:
@@ -880,6 +955,7 @@ class _CompiledArtifact:
     tensor_inputs_traced_shapes: tuple[tuple[int, ...], ...]
     output_treespec: Any
     output_count: int
+    mutated_input_paths: tuple[tree_util.KeyPath, ...] = ()
     callbacks: tuple[Callable[[torch.Tensor], None], ...] = ()
     pending_compile: Any | None = None
     rng_device: torch.device | None = None
@@ -950,8 +1026,17 @@ class _CompiledArtifact:
                 kv_pool_inputs, outputs[self.output_count :]
             ):
                 tensor.copy_(replacement)
+            mutated_start = self.output_count + len(kv_pool_inputs)
+            for path, replacement in zip(
+                self.mutated_input_paths,
+                outputs[mutated_start : mutated_start + len(self.mutated_input_paths)],
+                strict=True,
+            ):
+                _get_path(call, path).copy_(replacement)
 
-        callback_outputs = outputs[self.output_count + len(kv_pool_inputs) :]
+        callback_outputs = outputs[
+            self.output_count + len(kv_pool_inputs) + len(self.mutated_input_paths) :
+        ]
         if len(callback_outputs) != len(self.callbacks):
             raise RuntimeError(
                 "direct_compile callback output count changed: "
