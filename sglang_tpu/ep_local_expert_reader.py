@@ -7,6 +7,7 @@ import os
 import re
 import struct
 import threading
+import time
 
 import safetensors
 import torch
@@ -66,9 +67,18 @@ def _log_whole_shards(reason: str) -> None:
 
 # Core model classes opted in from the plugin, so core carries no TPU-only flag.
 # Every `.experts.<id>.` checkpoint key of these loads into FusedMoE expert <id>.
-_PLUGIN_EP_LOCAL_EXPERT_READ_MODELS = frozenset(
-    {"sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM"}
-)
+_PLUGIN_EP_LOCAL_EXPERT_READ_MODELS = {
+    "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM"
+}
+
+
+def register_ep_local_expert_read_model(class_path: str) -> None:
+    """Opt in an exact model class during backend initialization.
+
+    The owning model adapter must establish that checkpoint expert IDs map
+    directly to FusedMoE IDs. Subclasses are not implicitly opted in.
+    """
+    _PLUGIN_EP_LOCAL_EXPERT_READ_MODELS.add(class_path)
 
 
 def _supports_ep_local_expert_reads(model: torch.nn.Module) -> bool:
@@ -152,6 +162,14 @@ class EpLocalExpertReader:
         }
         self.seen: set[str] = set()
         self._seen_lock = threading.Lock()
+        self.stats = dict(
+            shards=0,
+            kept_tensors=0,
+            skipped_tensors=0,
+            kept_tensor_bytes=0,
+            readinto_bytes=0,
+            read_seconds=0.0,
+        )
 
     @classmethod
     def maybe_create(
@@ -186,6 +204,9 @@ class EpLocalExpertReader:
         return os.path.basename(st_file) in self.indexed_files
 
     def read(self, st_file: str) -> dict[str, torch.Tensor]:
+        started = time.perf_counter()
+        readinto_bytes = 0
+        skipped_tensors = 0
         with open(st_file, "rb") as f:
             header_len = struct.unpack("<Q", f.read(8))[0]
             header = json.loads(f.read(header_len))
@@ -201,6 +222,7 @@ class EpLocalExpertReader:
             kept, unviewable = [], []
             for name, meta in header.items():
                 if self._local_expert_id(name) == -1:
+                    skipped_tensors += 1
                     continue
                 if meta["dtype"] not in _SAFETENSORS_DTYPES:
                     unviewable.append(name)
@@ -227,6 +249,7 @@ class EpLocalExpertReader:
                     if not n:
                         raise IOError(f"{st_file} shrank while being read")
                     pos += n
+                    readinto_bytes += n
                 for start, end, name, meta in items:
                     dtype = _SAFETENSORS_DTYPES[meta["dtype"]]
                     if end == start:
@@ -256,9 +279,25 @@ class EpLocalExpertReader:
                     result[name] = sf.get_tensor(name)
         with self._seen_lock:  # read() runs on loader threads
             self.seen.update(result)
+            self.stats["shards"] += 1
+            self.stats["kept_tensors"] += len(result)
+            self.stats["skipped_tensors"] += skipped_tensors
+            self.stats["kept_tensor_bytes"] += sum(
+                t.numel() * t.element_size() for t in result.values()
+            )
+            self.stats["readinto_bytes"] += readinto_bytes
+            self.stats["read_seconds"] += time.perf_counter() - started
         return result
 
     def verify(self) -> None:
+        # readinto_bytes includes merged gaps, excludes headers and mmap fallback.
+        # This is application I/O, not physical GCS traffic (filesystem caches
+        # and read-ahead may change that). Thread times are summed, not wall time.
+        logger.info(
+            "EP-local expert read summary: range=%s stats=%s",
+            self.expert_range,
+            self.stats,
+        )
         missing = sorted(self.expected - self.seen)
         if missing:
             raise RuntimeError(

@@ -875,6 +875,10 @@ def _register_models() -> None:
     # Preserve the external-model fast path without importing unused catalogs.
     ModelRegistry.register_lazy("sglang_tpu.models")
 
+    from sglang_tpu.glm import register_loading_capabilities
+
+    register_loading_capabilities()
+
 
 def _resolve_num_hidden_layers(server_args) -> int:
     """Layer count from the model's HF config (lru-cached load), 0 when
