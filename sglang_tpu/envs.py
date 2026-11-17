@@ -316,8 +316,8 @@ class TpuEnvs:
     # XLA path); False keeps the XLA whole-row scatter for every batch.
     SGLANG_TPU_DSA_PALLAS_KEY_STORE = EnvBool(True)
     # DSA sparse MLA KV cache in the SparseCore layout (uint32 rows): the split pool
-    # allocates NoPE uint32[P, page, 128] and RoPE uint32[P, page // 4, 128] (same bytes
-    # per token as the uint8 TensorCore layout) and the per-query kernel uses the native
+    # allocates NoPE and RoPE in the shapes of kv_cache_utils.SparseMLAKVCacheSpec
+    # (bytes_per_token follows them) and the per-query kernel uses the native
     # SparseCore gather (mla_sparse_fused.SPARSECORE_*). The query-blocked prefill is
     # not taken.
     SGLANG_TPU_DSA_SPARSECORE_KV_CACHE = EnvBool(False)

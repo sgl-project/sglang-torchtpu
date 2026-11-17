@@ -1382,13 +1382,23 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         index_kpool: int,
         raw_ring: bool = False,
         qk_rope_head_dim: int = 64,
+        page_size: Optional[int] = None,
     ) -> int:
         """Bytes one token takes across all layers' buffers, as allocated.
-        A raw ring is sized by request slots, not tokens, so it is not counted."""
+        A raw ring is sized by request slots, not tokens, so it is not counted.
+        ``page_size`` is needed under the SparseCore layout, whose RoPE bytes
+        per token depend on it."""
         index_bytes = cls.index_key_record_bytes(index_head_dim) // index_kpool
         if index_kpool > 1 and not raw_ring:
             index_bytes += 2 * index_head_dim * torch.bfloat16.itemsize
-        layer_bytes = cls.NOPE_BYTES + cls.rope_bytes_per_token(qk_rope_head_dim)
+        rope_bytes = cls.rope_bytes_per_token(qk_rope_head_dim)
+        if rope_bytes and cls.sparsecore_kv_layout():
+            if page_size is None:
+                raise ValueError(
+                    "bytes_per_token needs page_size under the SparseCore layout"
+                )
+            rope_bytes = cls._sparsecore_specs(1, page_size)[1].token_bytes
+        layer_bytes = cls.NOPE_BYTES + rope_bytes
         return len(index_key_layers) * layer_bytes + sum(index_key_layers) * index_bytes
 
     @classmethod
@@ -1416,16 +1426,28 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
         return tpu_envs.SGLANG_TPU_DSA_SPARSECORE_KV_CACHE.get()
 
+    @staticmethod
+    def _sparsecore_specs(num_pages: int, page_size: int):
+        """The SparseCore NoPE / RoPE specs the sparse kernel checks its buffers
+        against; the RoPE packing (tokens per row) depends on page_size."""
+        from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
+            KVCacheLayout,
+        )
+        from sglang_tpu.attention.pallas.mla_sparse_fused import _split_specs
+
+        return _split_specs(num_pages, page_size, KVCacheLayout.SPARSECORE)
+
     def _create_buffers(self):
         rows_per_page = self.page_size // self.TOKENS_PER_ROW
-        if self.sparsecore_kv_layout():
-            # SparseCore layout (kv_cache_utils.SparseMLAKVCacheSpec, SPARSECORE):
-            # one uint32 word holds 4 bytes, so a token's 512 NoPE bytes are one
-            # 128-word row and four tokens' 128-byte RoPE rows share one. Same
-            # bytes per token as below, so bytes_per_token is unchanged.
-            kv_dtype = torch.uint32
-            nope_shape = (self.num_pages, self.page_size, self.NOPE_BYTES // 4)
-            rope_shape = (self.num_pages, rows_per_page, self.LANE_BYTES)
+        # As bytes_per_token: a model without RoPE dims keeps the TensorCore
+        # layout and its one-row RoPE stand-in.
+        if self.qk_rope_head_dim > 0 and self.sparsecore_kv_layout():
+            nope_spec, rope_spec = self._sparsecore_specs(
+                self.num_pages, self.page_size
+            )
+            kv_dtype = nope_spec.torch_dtype
+            nope_shape = nope_spec.shape
+            rope_shape = rope_spec.shape
         else:
             kv_dtype = torch.uint8
             nope_shape = (

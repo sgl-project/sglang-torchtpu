@@ -152,25 +152,38 @@ class TestZerosKvBuffer(CustomTestCase):
             index_key_layers=[True, True],
         )
 
-    def test_split_pool_sparsecore_layout_is_uint32_with_the_same_bytes(self):
-        # The sparse kernel picks the native SparseCore gather from the NoPE
-        # dtype (mla_sparse_fused.cache_layout_of), and the KV budget assumes
-        # bytes_per_token, so the u32 layout must hold the same bytes per token.
+    def test_split_pool_sparsecore_layout_matches_the_kernel_specs(self):
+        # The sparse kernel checks its buffers against SparseMLAKVCacheSpec and
+        # picks the native SparseCore gather from the NoPE dtype; the KV budget
+        # divides free memory by bytes_per_token. The RoPE packing (tokens per
+        # row) depends on page_size, so both must follow the specs, not a copy.
+        from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
+            KVCacheLayout,
+        )
+        from sglang_tpu.attention.pallas.mla_sparse_fused import _split_specs
+
         with tpu_envs.SGLANG_TPU_DSA_SPARSECORE_KV_CACHE.override(True):
             pool = self._split_pool()
-        tensorcore = self._split_pool()
+            per_token = TpuSplitMLATokenToKVPool.bytes_per_token(
+                index_head_dim=128,
+                index_key_layers=[True, True],
+                index_kpool=1,
+                page_size=pool.page_size,
+            )
+            with self.assertRaisesRegex(ValueError, "needs page_size"):
+                TpuSplitMLATokenToKVPool.bytes_per_token(
+                    index_head_dim=128, index_key_layers=[True, True], index_kpool=1
+                )
+        specs = _split_specs(pool.num_pages, pool.page_size, KVCacheLayout.SPARSECORE)
         for layer_id in range(2):
-            nope, rope = pool.get_nope_cache(layer_id), pool.get_rope_cache(layer_id)
-            self.assertEqual(tuple(nope.shape), (pool.num_pages, 32, 128))
-            self.assertEqual(tuple(rope.shape), (pool.num_pages, 8, 128))
-            for buf, ref in (
-                (nope, tensorcore.get_nope_cache(layer_id)),
-                (rope, tensorcore.get_rope_cache(layer_id)),
-            ):
+            bufs = (pool.get_nope_cache(layer_id), pool.get_rope_cache(layer_id))
+            for buf, spec in zip(bufs, specs):
+                self.assertEqual(tuple(buf.shape), tuple(spec.shape))
                 self.assertEqual(buf.dtype, torch.uint32)
                 self.assertIsNone(buf._base)
-                self.assertEqual(buf.nbytes, ref.nbytes)
-        self.assertEqual(pool.get_kv_size_bytes(), tensorcore.get_kv_size_bytes())
+        self.assertEqual(
+            pool.get_kv_size_bytes(), per_token * pool.num_pages * pool.page_size
+        )
 
 
 class TestQuantizeKvToFp8(CustomTestCase):
