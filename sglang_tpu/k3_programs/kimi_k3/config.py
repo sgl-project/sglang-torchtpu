@@ -88,6 +88,18 @@ class KernelConfig:
     # are issued before their down copies. The same products, sums and
     # rounding points (bit-identical).
     decode_late_shared_down: bool = False
+    # Token-scattered decode MoE at 8 and 16 rows (rank-pair row owners, both
+    # reduce-scatters, expert schedule, pooled weights): the routed
+    # reduce-scatter gives each lane its rank pair's tokens, so the pair's two
+    # cores on every host hold them after the host round, and rank (host h,
+    # core c) projects them through latent-up lane block 2h + c and sends the
+    # result straight to the tokens' other owners: no routed all-gather, and
+    # the output round replaces the lane-to-owner transpose. The shared expert
+    # reduce-scatters to the same (tokens, block) owners, and the latent-up
+    # copy starts with the last expert pair. Programs that take it read
+    # ``latent_up_tp`` (the latent_up blocks indexed by host and core). The
+    # same products, sums and rounding points (bit-identical).
+    moe_token_parallel_up: bool = False
     # Serving batches beyond the powers of two, by request count: plain
     # decode and three-draft verifies (e.g. "48" / "12"; multiples of 16 rows
     # take the staged MoE paths).
