@@ -882,8 +882,48 @@ class _FakeAllocator:
         self.free_pages.extend(pages)
         self.frees += 1
 
+    def available_size(self):
+        return len(self.free_pages) * PAGE_SIZE
+
     def translate_kv_indices_for_transfer(self, kv_indices):
         return kv_indices
+
+
+class _FakeTreeCache:
+    def __init__(self, *, full_alloc, full_cached=(), swa_alloc=None, swa_cached=()):
+        self.full_cached = list(full_cached)
+        self.swa_cached = list(swa_cached)
+        self._full_alloc = full_alloc
+        self._swa_alloc = swa_alloc
+        self.calls = []
+
+    def evict_for_alloc(self, params):
+        from sglang.srt.mem_cache.base_prefix_cache import EvictResult
+
+        self.calls.append((params.num_tokens, params.swa_num_tokens))
+        full_evicted = self._evict_pool(
+            alloc=self._full_alloc,
+            cached=self.full_cached,
+            need_tokens=params.num_tokens,
+        )
+        swa_evicted = self._evict_pool(
+            alloc=self._swa_alloc,
+            cached=self.swa_cached,
+            need_tokens=params.swa_num_tokens,
+        )
+        return EvictResult(
+            num_tokens_evicted=full_evicted,
+            swa_num_tokens_evicted=swa_evicted,
+        )
+
+    @staticmethod
+    def _evict_pool(*, alloc, cached, need_tokens):
+        evicted = 0
+        while evicted < need_tokens and cached:
+            indices = cached.pop(0)
+            alloc.free(indices)
+            evicted += int(indices.numel())
+        return evicted
 
 
 class TestTpuReshardStagingLifecycle(unittest.TestCase):
@@ -1133,6 +1173,102 @@ class TestTpuReshardStagingLifecycle(unittest.TestCase):
         self.assertTrue(req.abort_notified)
         self.assertIn("42", mgr._failed)
         self.assertIn("has no sliding-window pool", mgr.failure_records[42])
+
+    @staticmethod
+    def _attach_via_hook(*, mgr, allocator, tree_cache):
+        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+        from sglang_tpu.patches import _patch_raiden_reshard_staging_allocator
+
+        with mock.patch.object(
+            DecodePreallocQueue, "_init_kv_manager", lambda queue: mgr
+        ):
+            _patch_raiden_reshard_staging_allocator()
+            queue = SimpleNamespace(
+                token_to_kv_pool_allocator=allocator,
+                tree_cache=tree_cache,
+            )
+            return DecodePreallocQueue._init_kv_manager(queue)
+
+    def _send_staged(self, *, mgr, room, kv_pages, state_indices=()):
+        req = RaidenKVReceiver(mgr=mgr, bootstrap_addr="10.0.0.1", bootstrap_room=room)
+        req.bootstrap_infos = self._infos(2)
+        req._send_abort_notification = lambda: setattr(req, "abort_notified", True)
+        req.abort_notified = False
+        req.send_metadata(
+            kv_indices=np.array(kv_pages, dtype=np.int32),
+            state_indices=list(state_indices),
+        )
+        return req
+
+    def test_staging_evicts_radix_cache_shortfall(self):
+        """Staged resharding must evict unlocked radix-cache pages to cover any
+        staging shortfall, without evicting when free pages already suffice."""
+        allocator = _FakeAllocator(range(10, 15))
+        cached = [allocator.alloc(PAGE_SIZE) for _ in range(4)]
+        tree_cache = _FakeTreeCache(full_alloc=allocator, full_cached=cached)
+        mgr, _ = self._decode_manager(None)
+        self._attach_via_hook(mgr=mgr, allocator=allocator, tree_cache=tree_cache)
+
+        req_fit = self._send_staged(mgr=mgr, room=41, kv_pages=[1])
+        self.assertEqual(req_fit.poll(), KVPoll.WaitingForInput)
+        self.assertEqual(tree_cache.calls, [])
+        mgr.clear_room(41)
+
+        req_evict = self._send_staged(mgr=mgr, room=42, kv_pages=[1, 2, 3])
+        self.assertEqual(req_evict.poll(), KVPoll.WaitingForInput)
+        self.assertEqual(tree_cache.calls, [(2 * PAGE_SIZE, 0)])
+        self.assertEqual(len(tree_cache.full_cached), 2)
+
+        req_short = self._send_staged(mgr=mgr, room=43, kv_pages=[4, 5, 6])
+        self.assertEqual(req_short.poll(), KVPoll.Failed)
+        self.assertIn("needs 3 free KV pages", mgr.failure_records[43])
+        mgr.clear_room(42)
+        mgr.clear_room(43)
+
+        swa_alloc = self._hybrid_swa_allocator(full_pages=4, swa_pages=4)
+        full, swa = swa_alloc.full_attn_allocator, swa_alloc.swa_attn_allocator
+        swa_cache = _FakeTreeCache(
+            full_alloc=full,
+            full_cached=[full.alloc(PAGE_SIZE) for _ in range(3)],
+            swa_alloc=swa,
+            swa_cached=[swa.alloc(PAGE_SIZE) for _ in range(3)],
+        )
+        swa_mgr, _ = self._decode_manager(None)
+        swa_mgr._swa_kv_caches = [_fused_layer(dtype=FP8, heads=2, num_pages=16)]
+        swa_mgr.kv_args.state_types = [StateType.SWA]
+        self._attach_via_hook(mgr=swa_mgr, allocator=swa_alloc, tree_cache=swa_cache)
+        swa_req = self._send_staged(
+            mgr=swa_mgr, room=44, kv_pages=[3, 4, 5], state_indices=[[6, 7]]
+        )
+        self.assertEqual(swa_req.poll(), KVPoll.WaitingForInput)
+        self.assertEqual(swa_cache.calls, [(2 * PAGE_SIZE, 0), (0, PAGE_SIZE)])
+        self.assertEqual(
+            (len(swa_cache.full_cached), len(swa_cache.swa_cached)), (1, 2)
+        )
+        swa_mgr.clear_room(44)
+
+        uni_helper = TestTpuUnifiedSwaReshardStaging()
+        ps = uni_helper.PAGE_SIZE
+        uni_pool, uni_alloc = uni_helper._build_unified_pool_and_allocator(
+            num_phys_pages=21
+        )
+        f_page = int(uni_alloc.full_attn_allocator.alloc(ps)[0].item()) // ps
+        s_page = int(uni_alloc.swa_attn_allocator.alloc(ps)[0].item()) // ps
+        uni_swa_cached = [uni_alloc.swa_attn_allocator.alloc(ps) for _ in range(2)]
+        uni_cache = _FakeTreeCache(
+            full_alloc=uni_alloc.full_attn_allocator,
+            swa_alloc=uni_alloc.swa_attn_allocator,
+            swa_cached=uni_swa_cached,
+        )
+        uni_mgr = uni_helper._build_decode_mgr(pool=uni_pool, allocator=uni_alloc)
+        self._attach_via_hook(mgr=uni_mgr, allocator=uni_alloc, tree_cache=uni_cache)
+        uni_req = self._send_staged(
+            mgr=uni_mgr, room=45, kv_pages=[f_page], state_indices=[[s_page]]
+        )
+        self.assertEqual(uni_req.poll(), KVPoll.WaitingForInput)
+        self.assertEqual(uni_cache.calls, [(5 * ps, 0), (0, ps)])
+        self.assertEqual(len(uni_cache.swa_cached), 1)
+        uni_mgr.clear_room(45)
 
 
 class TestTpuUnifiedSwaReshardStaging(unittest.TestCase):

@@ -198,6 +198,7 @@ class RaidenKVManager(
     _write_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     state_raiden_endpoint: Optional[str] = None
     _token_allocator: Optional[Any] = None
+    _tree_cache: Optional[Any] = None
 
     def __init__(
         self,
@@ -228,6 +229,7 @@ class RaidenKVManager(
         self._kv_caches: Optional[list] = None
         self._swa_kv_caches: Optional[list] = None
         self._token_allocator: Optional[Any] = None
+        self._tree_cache: Optional[Any] = None
         self.raiden_endpoint: Optional[str] = None
         self.swa_raiden_endpoint: Optional[str] = None
         self._pipeline = None
@@ -511,12 +513,40 @@ class RaidenKVManager(
 
     # ----- reshard staging --------------------------------------------------
 
-    def attach_token_allocator(self, allocator: Any) -> None:
+    def attach_token_allocator(self, allocator: Any, *, tree_cache: Any = None) -> None:
         self._token_allocator = allocator
+        self._tree_cache = tree_cache
 
     @property
     def _staging_allocator(self) -> Any:
         return self._token_allocator
+
+    def _evict_staging_shortfall(
+        self, *, pool_alloc: Any, need_tokens: int, swa: bool = False
+    ) -> None:
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        tree_cache = self._tree_cache
+        if tree_cache is None:
+            return
+        shortfall = need_tokens - pool_alloc.available_size()
+        if shortfall <= 0:
+            return
+        if swa and self._unified_swa_pool is None:
+            tree_cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
+            return
+        tree_cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
+        if self._unified_swa_pool is not None:
+            shortfall = need_tokens - pool_alloc.available_size()
+            if shortfall > 0:
+                page_size = int(self.kv_args.page_size)
+                groups = self._unified_swa_pool.layout.num_swa_groups
+                short_pages = -(-shortfall // page_size)
+                # Each evicted SWA page returns num_swa_groups physical pages.
+                swa_pages = -(-short_pages // groups)
+                tree_cache.evict_for_alloc(
+                    EvictParams(swa_num_tokens=swa_pages * page_size)
+                )
 
     def _alloc_reshard_staging(
         self, *, n_pages: int, n_swa_pages: int
@@ -542,6 +572,7 @@ class RaidenKVManager(
         # Attention-TP ranks allocate and free in lockstep, keeping allocators aligned.
         allocator = self._staging_allocator
         page_size = int(self.kv_args.page_size)
+        full_need = n_pages * page_size
         if (
             isinstance(allocator, SWATokenToKVPoolAllocator)
             and type(allocator).alloc is SWATokenToKVPoolAllocator.alloc
@@ -554,13 +585,18 @@ class RaidenKVManager(
                 if self._unified_swa_pool is not None
                 else allocator.swa_attn_allocator
             )
-            full = full_alloc.alloc(n_pages * page_size)
+            self._evict_staging_shortfall(pool_alloc=full_alloc, need_tokens=full_need)
+            full = full_alloc.alloc(full_need)
             if full is None:
                 raise no_pages(n=n_pages, what="full-attention")
             frees = [(full_alloc, full)]
             swa_pages: Tuple[int, ...] = ()
             if n_swa_pages:
-                swa = swa_alloc.alloc(n_swa_pages * page_size)
+                swa_need = n_swa_pages * page_size
+                self._evict_staging_shortfall(
+                    pool_alloc=swa_alloc, need_tokens=swa_need, swa=True
+                )
+                swa = swa_alloc.alloc(swa_need)
                 if swa is None:
                     full_alloc.free(full)
                     raise no_pages(n=n_swa_pages, what="sliding-window")
@@ -569,7 +605,8 @@ class RaidenKVManager(
             return ReshardStaging(
                 pages=page_ids(full), swa_pages=swa_pages, frees=tuple(frees)
             )
-        indices = allocator.alloc(n_pages * page_size)
+        self._evict_staging_shortfall(pool_alloc=allocator, need_tokens=full_need)
+        indices = allocator.alloc(full_need)
         if indices is None:
             raise no_pages(n=n_pages, what="")
         full = allocator.translate_kv_indices_for_transfer(indices)

@@ -1038,12 +1038,12 @@ def _patch_scheduler_reject_unservable_requests() -> None:
 
 
 def _patch_raiden_reshard_staging_allocator() -> None:
-    """Hand the decode token allocator to RaidenKVManager for staged FP8 resharding.
+    """Hand the decode token allocator and tree cache to RaidenKVManager for staged FP8 resharding.
 
     Why: core DecodePreallocQueue._init_kv_manager attaches only token_to_kv_pool.
-    How: wrap _init_kv_manager to call RaidenKVManager.attach_token_allocator.
+    How: wrap _init_kv_manager to pass token_to_kv_pool_allocator and tree_cache to RaidenKVManager.attach_token_allocator.
     Upstream PR or issue: not filed yet.
-    Remove when: core _init_kv_manager passes or attaches the token allocator.
+    Remove when: core _init_kv_manager passes or attaches the token allocator and tree cache.
     """
     from sglang.srt.disaggregation.decode import DecodePreallocQueue
 
@@ -1057,7 +1057,10 @@ def _patch_raiden_reshard_staging_allocator() -> None:
 
         kv_manager = original(self)
         if isinstance(kv_manager, RaidenKVManager):
-            kv_manager.attach_token_allocator(self.token_to_kv_pool_allocator)
+            kv_manager.attach_token_allocator(
+                allocator=self.token_to_kv_pool_allocator,
+                tree_cache=self.tree_cache,
+            )
         return kv_manager
 
     _init_kv_manager._tpu_reshard_staging_allocator = True
