@@ -624,6 +624,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # rank: rank r's physical page holds the r-th page_size run of it.
         parallel = get_parallel()
         self._dcp = parallel.attn_dcp_size
+        if self._dcp > 1 and model_runner.is_draft_worker:
+            # A draft does not join the DCP group: its pool is unsharded and
+            # spans the allocator's widened locs (kv_cache_configurator
+            # loc_space_scale) at the plain page size.
+            self._dcp = 1
         self._dcp_rank = parallel.attn_dcp_rank if self._dcp > 1 else 0
         self._dcp_group = parallel.dcp_group if self._dcp > 1 else None
         self._page_stride = self.page_size * self._dcp
@@ -1131,16 +1136,16 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         Under DCP ``kv_lens`` becomes this rank's shard of each sequence and the
         page table is read at the widened logical page stride.
         """
-        if self._dcp > 1 and forward_batch.forward_mode not in (
-            ForwardMode.DECODE,
-            ForwardMode.EXTEND,
-            ForwardMode.MIXED,
-        ):
+        dcp_modes = (ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.MIXED)
+        if self._dcp_owns_forward:
+            # The sparse MLA backend runs verify rows on its sharded decode path.
+            dcp_modes += (ForwardMode.TARGET_VERIFY,)
+        if self._dcp > 1 and forward_batch.forward_mode not in dcp_modes:
             raise ValueError(
                 "Decode context parallelism supports plain decode, extend and "
-                f"mixed batches only; got {forward_batch.forward_mode.name}. "
-                "Speculative decoding and split prefill are not "
-                "supported on the TPU DCP path."
+                "mixed batches (and target verify on the sparse MLA backend) "
+                f"only; got {forward_batch.forward_mode.name}. Split prefill "
+                "is not supported on the TPU DCP path."
             )
 
         kv_len_bump = 0

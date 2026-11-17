@@ -489,7 +489,9 @@ class KVCacheConfigurator:
     # Note(kpham-sgl):
     # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools
     #    span and page that space; the sharded target translates and stays per-rank.
-    # 2. A pool must page as its allocator does, or its last page falls short.
+    # 2. A pool must page as its allocator does, or its last page falls short;
+    #    a platform may page a draft pool at page_size instead, which divides
+    #    the widened space evenly (dcp_draft_pool_uses_token_pages).
     @property
     def loc_space_scale(self) -> int:
         dcp_size = get_parallel().attn_dcp_size
@@ -497,6 +499,11 @@ class KVCacheConfigurator:
 
     @property
     def pool_page_size(self) -> int:
+        if (
+            self.loc_space_scale > 1
+            and current_platform.dcp_draft_pool_uses_token_pages()
+        ):
+            return get_schedule().page_size
         return get_schedule().page_size * self.loc_space_scale
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:

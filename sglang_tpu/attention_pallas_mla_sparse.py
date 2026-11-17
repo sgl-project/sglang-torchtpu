@@ -19,7 +19,7 @@ layout the sparse kernels read.
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Optional
 
 import torch
 
@@ -351,6 +351,16 @@ _DCP_THRESHOLD_MERGE_MAX_ROWS = 1024
 _BITS_NEG_INF = -8388608
 
 
+class _DcpRows(NamedTuple):
+    """Per-sequence inputs of the sharded DCP ops (see _dcp_rows)."""
+
+    seq_lens: torch.Tensor  # i32[num_seqs]; unsharded, counts this step's tokens
+    page_indices: torch.Tensor  # i32[num_seqs * pages_per_seq]; widened pages
+    cu_q_lens: torch.Tensor  # i32[num_seqs + 1]
+    distribution: torch.Tensor  # i32[3]
+    segments: str
+
+
 class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     """``pallas_tpu_mla`` with sparse attention: it runs the DSA indexer too."""
 
@@ -443,7 +453,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         super().init_forward_metadata(forward_batch)
         if self.raw_ring_pages_cnt:
             self.forward_metadata.raw_page_base = self._raw_page_base(forward_batch)
-        if self._dcp_gathers_prefill and not forward_batch.forward_mode.is_decode():
+        if self._dcp_gathered(forward_batch):
             self._add_dcp_gather_metadata(forward_batch)
 
     def _raw_page_base(self, forward_batch: ForwardBatch) -> torch.Tensor:
@@ -680,7 +690,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         positions, counted from the start of the token's own sequence. The
         chosen positions come first and the rest of the row is ``-1``.
         """
-        if self._dcp_gathers_prefill and not forward_batch.forward_mode.is_decode():
+        if self._dcp_gathered(forward_batch):
             return self._index_topk_dcp_dense(
                 forward_batch=forward_batch,
                 seq_lens=self._dcp_seq_lens(forward_batch),
@@ -692,7 +702,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             )
         if self._dcp > 1:
             return self._index_topk_dcp(
-                seq_lens=self._dcp_seq_lens(forward_batch),
+                forward_batch=forward_batch,
                 layer_id=layer_id,
                 query=query,
                 key=key,
@@ -741,6 +751,11 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # a cold compile), for at most 4x the gathered pages.
         buckets = [4**i for i in range(cap.bit_length()) if 4**i < cap]
         scratch = [_DCP_SCRATCH_BUCKET] if batch_size <= self._dcp_scratch_slots else []
+        if tpu_envs.SGLANG_TPU_DCP_PREFILL_GATHER_CAP_ONLY.get():
+            # One gathered variant: every gather bucket is another prefill
+            # graph to compile (each 10+ minutes cold for 93-layer K3.1 with
+            # hidden capture), and cached-prefix histories mostly need the cap.
+            return scratch + [cap]
         return scratch + buckets + [cap]
 
     def _dcp_scratch_plan(
@@ -853,10 +868,62 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             name="dcp_dense_pages", value=dense.reshape(-1), device=device
         )
 
+    def _dcp_gathered(self, forward_batch: ForwardBatch) -> bool:
+        """True when this forward takes the gathered DCP prefill; decode and
+        target verify stay on the sharded decode path."""
+        mode = forward_batch.forward_mode
+        return (
+            self._dcp_gathers_prefill
+            and not mode.is_decode()
+            and not mode.is_target_verify()
+        )
+
+    def _dcp_rows(self, forward_batch: ForwardBatch) -> _DcpRows:
+        """Sequence metadata of the sharded DCP ops for this forward.
+
+        Target verify has W rows per request, and the shard-scoring kernel
+        takes one query row per sequence under DCP. So each verify row enters
+        as its own one-token sequence sharing its request's page table: row i
+        has length ``seq_len + i + 1``, which puts its key and latent at
+        position ``seq_len + i`` and lets it see the rows before it, as the
+        unsharded verify does.
+        """
+        md = self.forward_metadata
+        if not forward_batch.forward_mode.is_target_verify():
+            return _DcpRows(
+                seq_lens=self._dcp_seq_lens(forward_batch),
+                page_indices=md.page_indices,
+                cu_q_lens=md.cu_q_lens,
+                distribution=md.distribution,
+                segments=md.segments,
+            )
+        assert forward_batch.spec_info is not None
+        width = forward_batch.spec_info.num_tokens_per_req
+        num_seqs = md.cu_q_lens.shape[0] - 1
+        device = md.page_indices.device
+        steps = torch.arange(1, width + 1, dtype=torch.int32, device=device)
+        seq_lens = forward_batch.seq_lens.to(torch.int32)[:num_seqs]
+        pages = md.page_indices.reshape(num_seqs, 1, -1)
+        return _DcpRows(
+            seq_lens=(seq_lens[:, None] + steps[None, :]).reshape(-1).contiguous(),
+            page_indices=pages.expand(num_seqs, width, pages.shape[-1])
+            .reshape(-1)
+            .contiguous(),
+            cu_q_lens=torch.arange(
+                num_seqs * width + 1, dtype=torch.int32, device=device
+            ),
+            # distribution[2] counts the live requests in both the decode
+            # ([n, n, n]) and the mixed ([0, 0, n]) encoding; every expanded
+            # row is a one-token decode sequence.
+            distribution=(md.distribution[2:] * width).expand(3).to(torch.int32),
+            segments="decode",
+        )
+
     @staticmethod
     def _dcp_seq_lens(forward_batch: ForwardBatch) -> torch.Tensor:
         """Unsharded KV length per sequence, counting this step's tokens: the
-        kv_lens of an unsharded forward (DCP rejects speculative modes)."""
+        kv_lens of an unsharded decode or extend forward (verify rows get their
+        own lengths from _dcp_rows)."""
         return forward_batch.seq_lens.to(torch.int32)
 
     def _dcp_gather_page_ids(self) -> torch.Tensor:
@@ -968,7 +1035,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     def _index_topk_dcp(
         self,
         *,
-        seq_lens: torch.Tensor,
+        forward_batch: ForwardBatch,
         layer_id: int,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -977,20 +1044,20 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     ) -> torch.Tensor:
         """index_topk under DCP: this rank's rows of the global top-k, as
         rank-local positions (what _forward_mla_dcp hands the kernel)."""
-        metadata = self.forward_metadata
+        rows = self._dcp_rows(forward_batch)
         indices, scores = self._index_topk_dcp_op(
             query.contiguous(),
             key.contiguous(),
             head_weights.contiguous(),
             self.token_to_kv_pool.get_index_key_cache(layer_id),
-            seq_lens,
-            metadata.page_indices,
-            metadata.cu_q_lens,
-            metadata.distribution,
+            rows.seq_lens,
+            rows.page_indices,
+            rows.cu_q_lens,
+            rows.distribution,
             self._cp_rank_t,
             weight_scale,
             self._topk,
-            metadata.segments,
+            rows.segments,
         )
         if (
             self._topk_threshold_merge_dcp_op is not None
@@ -1247,13 +1314,17 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             k_rope=k_rope,
         )
         if self._dcp > 1:
-            seq_lens = self._dcp_seq_lens(forward_batch)
-            if self._dcp_gathers_prefill and not forward_batch.forward_mode.is_decode():
+            if self._dcp_gathered(forward_batch):
                 out = self._forward_mla_dcp_dense(
-                    args, topk_indices, seq_lens, layer.layer_id
+                    args,
+                    topk_indices,
+                    self._dcp_seq_lens(forward_batch),
+                    layer.layer_id,
                 )
             else:
-                out = self._forward_mla_dcp(args, topk_indices, seq_lens)
+                out = self._forward_mla_dcp(
+                    args, topk_indices, self._dcp_rows(forward_batch)
+                )
             return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         split_rows = self._attention_split_rows(forward_batch, q.shape[0])
         if split_rows:
@@ -1387,7 +1458,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         )
 
     def _forward_mla_dcp(
-        self, args: tuple, topk_indices: torch.Tensor, seq_lens: torch.Tensor
+        self, args: tuple, topk_indices: torch.Tensor, rows: _DcpRows
     ) -> torch.Tensor:
         """Attend with the DCP group's heads over this rank's winners, then
         merge the group's partials by log-sum-exp and keep this rank's heads.
@@ -1402,15 +1473,14 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             cache_nope,
             cache_rope,
             _kv_lens,
-            page_indices,
-            cu_q_lens,
+            _page_indices,
+            _cu_q_lens,
             _cu_kv_lens,
-            distribution,
+            _distribution,
             sm_scale,
             k_scale,
             _v_scale,
         ) = args
-        md = self.forward_metadata
         group, cp, rank_mask = self._dcp_group, self._dcp, self._cp_rank_mask
         nope_dim = ql_nope.shape[-1]
         q_all = gather_heads(
@@ -1423,10 +1493,10 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             new_k_pe,
             cache_nope,
             cache_rope,
-            seq_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
+            rows.seq_lens,
+            rows.page_indices,
+            rows.cu_q_lens,
+            rows.distribution,
             self._cp_rank_t,
             topk_indices,
             sm_scale,

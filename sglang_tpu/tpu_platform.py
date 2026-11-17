@@ -916,6 +916,7 @@ def _validate_decode_context_parallel(server_args) -> None:
     """
     from sglang.srt.arg_groups.overrides import resolving_view
     from sglang.srt.environ import envs
+    from sglang_tpu.envs import envs as tpu_envs
 
     cfg = resolving_view(server_args)
     dcp_size = cfg.dcp_size
@@ -941,11 +942,15 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--pipeline-parallel-size > 1 is not supported with "
             f"--decode-context-parallel-size > 1 on TPU (got pp_size={cfg.pp_size})."
         )
-    if cfg.speculative_algorithm is not None:
+    if (
+        cfg.speculative_algorithm is not None
+        and not tpu_envs.SGLANG_TPU_DCP_SPEC_VERIFY.get()
+    ):
         raise ValueError(
             "--speculative-algorithm is not supported with "
             "--decode-context-parallel-size > 1 on TPU (got "
-            f"{cfg.speculative_algorithm!r})."
+            f"{cfg.speculative_algorithm!r}); the sparse MLA backend has an "
+            "experimental path behind SGLANG_TPU_DCP_SPEC_VERIFY=1."
         )
     if cfg.attn_dp_size > 1:
         raise ValueError(
@@ -1619,6 +1624,11 @@ class TpuSRTPlatform(SRTPlatform):
     def dcp_shards_every_kv_pool(self) -> bool:
         # The batched RPA DCP path addresses every pool through the widened
         # location space and replicates K/V heads within a DCP group.
+        return True
+
+    def dcp_draft_pool_uses_token_pages(self) -> bool:
+        # The DFlash draft KV writer holds a whole pool page in VMEM; at
+        # page_size * dcp_size it exceeds the 64 MiB scoped limit.
         return True
 
     def dcp_replicates_q_heads(self) -> bool:
