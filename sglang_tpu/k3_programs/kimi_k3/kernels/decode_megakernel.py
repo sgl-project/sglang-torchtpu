@@ -9299,10 +9299,11 @@ def stack(
         else 0
     )
     # KernelConfig.moe_token_parallel_up on the programs it covers (they read
-    # latent_up_tp); the rest keep the lane-block tail.
+    # latent_up_tp); the rest keep the lane-block tail. 8-row steps only: at
+    # 16 rows the tail's extra register spills overflow VMEM (~250 KB).
     token_parallel_up = bool(
         TOKEN_PARALLEL_UP
-        and batch_size in (8, 16)
+        and batch_size == 8
         and moe_token_scatter_output
         and moe_routed_reduce_scatter
         and sp_owners == 4

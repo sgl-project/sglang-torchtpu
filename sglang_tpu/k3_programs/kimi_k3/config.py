@@ -88,7 +88,7 @@ class KernelConfig:
     # are issued before their down copies. The same products, sums and
     # rounding points (bit-identical).
     decode_late_shared_down: bool = False
-    # Token-scattered decode MoE at 8 and 16 rows (rank-pair row owners, both
+    # Token-scattered decode MoE at 8 rows (rank-pair row owners, both
     # reduce-scatters, expert schedule, pooled weights): the routed
     # reduce-scatter gives each lane its rank pair's tokens, so the pair's two
     # cores on every host hold them after the host round, and rank (host h,
