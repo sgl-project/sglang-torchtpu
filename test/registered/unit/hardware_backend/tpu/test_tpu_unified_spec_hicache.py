@@ -452,6 +452,58 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
                 torch.all(dp_meta.full_to_swa_index_mapping[out_cpu.long()] > 0)
             )
 
+    def test_hicache_draft_swa_window_sizing_and_multiplier_env(self):
+        from contextlib import nullcontext
+
+        from sglang.srt.runtime_context import get_context, get_parallel
+        from sglang_tpu.envs import envs as tpu_envs
+
+        self.assertEqual(
+            tpu_envs.SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER.get(), 4.0
+        )
+        for mult, expected in ((None, 192), (6.0, 272), (2.5, 136)):
+            env_ctx = (
+                nullcontext()
+                if mult is None
+                else tpu_envs.SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER.override(mult)
+            )
+            with (
+                env_ctx,
+                get_context().override_server_args(
+                    enable_hierarchical_cache=True,
+                    max_running_requests=4,
+                    speculative_num_draft_tokens=8,
+                    chunked_prefill_size=4096,
+                    page_size=256,
+                ),
+                get_parallel().override(attn_dp_size=1),
+            ):
+                pages = ukp._compute_draft_swa_pages(
+                    10000,
+                    page_size=256,
+                    num_swa_groups=3,
+                    sliding_window_size=2048,
+                )
+                self.assertEqual(pages, expected)
+                if mult is None:
+                    self.assertEqual(
+                        ukp._compute_draft_swa_pages(
+                            400,
+                            page_size=256,
+                            num_swa_groups=3,
+                            sliding_window_size=2048,
+                        ),
+                        96,
+                    )
+
+        with tpu_envs.SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER.override(0.0):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER"
+            ):
+                ukp._compute_draft_swa_pages(
+                    1000, page_size=256, num_swa_groups=3, sliding_window_size=2048
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
