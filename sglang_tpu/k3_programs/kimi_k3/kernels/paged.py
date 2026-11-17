@@ -747,6 +747,7 @@ def decode_paged(
     state_row=None,
     defer_kda_commit=False,
     dsa_pools=0,
+    dsa_centres=None,
     **decode_options,
 ):
     """One decode step on this rank (inside a ``tp`` shard_map).
@@ -771,6 +772,15 @@ def decode_paged(
     are the MLA layers' DSA index-key pools; the kernel selects each row's
     tokens from them and every row's new index keys are committed beside its
     latents (returned in ``pool``'s order).
+
+    ``dsa_centres`` (``KernelConfig.dsa_seeded_window``): int32 ``[S, 24,
+    R]``, the selection's window centres per KDA slot, MLA layer and row of
+    the request's step (``b % sequence_rows``; plain steps row 0), returned
+    updated after the other outputs (every row of a live slot; the null slot
+    0 is never written, so every rank keeps the same array). Any values give
+    the same selection: they only decide whether the selection takes two
+    count exchanges or three. Without ``dsa_centres`` a seeded selection
+    starts every row from the constant centre 0.
     """
     if (
         tokens.shape != (batch_size,)
@@ -816,6 +826,17 @@ def decode_paged(
     index_pools = None
     if dsa_pools:
         pools, index_pools = pools[:-dsa_pools], pools[-dsa_pools:]
+    from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
+
+    seeded = bool(dsa_pools) and dsa_dcp.seeded_window(batch_size)
+    centres_in = None
+    sequence_rows = decode_options.get("sequence_rows", 1)
+    if seeded:
+        centres_in = (
+            jnp.zeros((dsa_pools * batch_size,), jnp.int32)
+            if dsa_centres is None
+            else dsa_dcp.gather_centres(dsa_centres, slots, sequence_rows)
+        )
     result = decode_local(
         weights,
         (conv, recurrent, *pools),
@@ -829,6 +850,7 @@ def decode_paged(
         state_slots=state_index if in_place else None,
         live_rows=slots != 0,
         index_pools=index_pools,
+        dsa_centres=centres_in,
         **decode_options,
     )
     aux = None
@@ -836,6 +858,12 @@ def decode_paged(
         logits, aux, (conv, recurrent, new_keys, new_values, *records) = result
     else:
         logits, (conv, recurrent, new_keys, new_values, *records) = result
+    if seeded:
+        *records, centres_out = records
+        if dsa_centres is not None:
+            dsa_centres = dsa_dcp.scatter_centres(
+                dsa_centres, slots, sequence_rows, centres_out
+            )
     # DP2 returns shard-major rows; commit each to its shard-bank index,
     # preserving untouched slots and ordered null-slot writes.
     if defer_kda_commit:
@@ -885,8 +913,6 @@ def decode_paged(
             owner_table=dcp_owner_table,
         )
     if index_pools is not None:
-        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
-
         (records,) = records  # [batch, 24, 2, 128] int32: key bytes | UE8M0 byte
         records = jnp.concatenate(
             (records[:, :, 0, :], records[:, :, 1, :1]), axis=-1
@@ -901,6 +927,7 @@ def decode_paged(
             global_pages=mla_dcp.GLOBAL_PAGES,
         )
         pool = (*pool, *index_pools)
+    extra = () if dsa_centres is None else (dsa_centres,)
     if aux is not None:
-        return logits[0], aux, conv_slots, recurrent_slots, pool
-    return logits[0], conv_slots, recurrent_slots, pool
+        return logits[0], aux, conv_slots, recurrent_slots, pool, *extra
+    return logits[0], conv_slots, recurrent_slots, pool, *extra

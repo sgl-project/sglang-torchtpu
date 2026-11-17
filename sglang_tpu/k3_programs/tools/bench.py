@@ -287,6 +287,8 @@ def run_decode(args, records: harness.Records) -> None:
     for batch, context in cases:
         label = context if not isinstance(context, list) else "mix " + args.mix
         tag = f"b{batch}c{context if not isinstance(context, list) else 'mix'}"
+        if ops.dsa_centres is not None:
+            ops.dsa_centres.zero_()  # window hits below count this case's rows only
         # First step: rows reset at the context.
         decoder.step(rows_for(batch, context, True, tag))
         bridge.materialize(decoder.step(rows_for(batch, context, False, tag)).tokens)
@@ -314,6 +316,13 @@ def run_decode(args, records: harness.Records) -> None:
         else:
             rate = batch * 1e3 / ms
             line = f"B{batch} ctx {label}: {ms:.2f} ms per step, {rate:.1f} tok/s"
+        if ops.dsa_centres is not None:
+            # KernelConfig.dsa_seeded_window: bit 0 of a written centre is set
+            # when its layer's last selection took two count exchanges.
+            centres = ops.dsa_centres.cpu().numpy()[0, 1:]
+            written = centres != 0
+            hits = int(((centres & 1) != 0)[written].sum())
+            line += f", window hits {hits}/{int(written.sum())} (last step)"
         harness.log(f"{line}  (repeats {[round(t, 2) for t in times]})")
         records.add(
             case=tag,

@@ -3960,3 +3960,429 @@ print("OK")
         self.assertIn(
             "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
         )
+
+
+class TestSeededWindowMath(CustomTestCase):
+    """``KernelConfig.dsa_seeded_window``'s arithmetic against brute force:
+    lane ``j`` of ``dsa_dcp.window_thresholds`` holds the ``(j + 1)``-th
+    smallest of the 63 coarse and 64 fine thresholds (centres at the int32
+    ends, garbage, a coarse threshold on, beside and between fine ones), a
+    key's ``window_digit`` counts the thresholds at or below it, and the
+    kernel's search (the seeded round's bin, one or two 7-bit rounds from
+    its lower bound) finds the 20-bit prefix of the topk-th key whatever the
+    centre (ties, int32 extremes, tiny and large selections). Also the decode
+    step's centre gather and scatter (``gather_centres`` / ``scatter_centres``)."""
+
+    INT_MIN = -(2**31)
+
+    def _centres(self, rng, randoms):
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
+
+        INT_MIN = self.INT_MIN
+        centres = [INT_MIN, INT_MIN + 1, -1, 0, 1, 2**31 - 1, 2**31 - 4096, 12345]
+        centres += [dsa_dcp.CENTRE_LOW + d for d in (-4096, -1, 0, 1)]
+        centres += [dsa_dcp.CENTRE_HIGH + d for d in (-1, 0, 1, 4096)]
+        for c in range(1, 64):  # a coarse threshold inside, at and beside the window
+            for off in (
+                -(2**24),
+                -(2**24) + 4096,
+                -(2**24) - 4096,
+                0,
+                2**24 - 4096,
+                -(2**19),
+                2**19,
+                -(2**25),
+                2**25,
+                5 * 2**19 + 4096,
+            ):
+                v = (c << 26) + INT_MIN + off
+                if INT_MIN <= v < 2**31:
+                    centres.append(v)
+        centres += list(rng.integers(INT_MIN, 2**31, randoms, dtype=np.int64))
+        return np.array(centres, np.int64).astype(np.int32)
+
+    def _union(self, start):
+        """The coarse and fine thresholds, sorted (unsigned bits, int64)."""
+        first = int(start) + (1 << 19) - self.INT_MIN
+        return np.array(
+            sorted(
+                [c << 26 for c in range(1, 64)] + [first + (k << 19) for k in range(64)]
+            ),
+            np.int64,
+        )
+
+    def test_thresholds_and_digits(self):
+        import jax.numpy as jnp
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
+
+        rng = np.random.default_rng(0)
+        centres = self._centres(rng, 300)
+        starts = np.asarray(dsa_dcp.window_start(jnp.asarray(centres)))
+        lane = jnp.arange(128, dtype=jnp.int32)
+        table = np.asarray(
+            dsa_dcp.window_thresholds(jnp.asarray(starts)[:, None], lane[None])
+        )
+        for i, start in enumerate(starts):
+            first = int(start) + (1 << 19) - self.INT_MIN
+            self.assertTrue((1 << 19) <= first <= (1 << 32) - (1 << 25), centres[i])
+            self.assertEqual(first % 4096, 0)
+            union = self._union(start)
+            got = table[i, :127].astype(np.int64) - self.INT_MIN
+            np.testing.assert_array_equal(got, union, err_msg=str(centres[i]))
+            self.assertEqual(table[i, 127], self.INT_MIN)  # 2^32
+            if i % 5:
+                continue
+            keys = np.concatenate(
+                [
+                    union - 1,
+                    union,
+                    union + 1,
+                    [0, 1, 2**32 - 2, 2**32 - 1],
+                    rng.integers(0, 2**32, 300),
+                ]
+            )
+            keys = np.clip(keys, 0, 2**32 - 1)
+            digit = dsa_dcp.window_digit(
+                jnp.asarray((keys + self.INT_MIN).astype(np.int32)), jnp.int32(start)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(digit),
+                np.searchsorted(union, keys, side="right"),
+                err_msg=str(centres[i]),
+            )
+
+    def test_search_finds_the_prefix_for_any_centre(self):
+        import jax.numpy as jnp
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
+
+        INT_MIN, lane = self.INT_MIN, jnp.arange(128, dtype=jnp.int32)
+        rng = np.random.default_rng(1)
+
+        def search(keys, topk, centre):
+            """IndexSelect._window_update and _seeded_rounds, in numpy."""
+            start = jnp.int32(np.asarray(dsa_dcp.window_start(jnp.int32(centre))))
+            digit = np.asarray(dsa_dcp.window_digit(jnp.asarray(keys), start))
+            counts = np.bincount(digit, minlength=128)[::-1].cumsum()[::-1][1:]
+            d = int((counts >= topk).sum())
+            table = np.asarray(dsa_dcp.window_thresholds(start, lane)).astype(np.int64)
+            lo = INT_MIN if d == 0 else int(table[d - 1])
+            fine = (int(table[d]) - lo) % 2**32 <= 2**19  # int32 differences wrap
+            prefix, u = lo - INT_MIN, keys.astype(np.int64) - INT_MIN
+            for shift in [12] if fine else [19, 12]:
+                above = np.minimum((u[u >= prefix] - prefix) >> shift, 127)
+                count = np.bincount(above, minlength=128)[::-1].cumsum()[::-1][1:]
+                prefix += int((count >= topk).sum()) << shift
+            return prefix, fine
+
+        hits = misses = 0
+        for trial in range(150):
+            n = int(rng.integers(2, 5000))
+            topk = int(rng.integers(1, n + 1)) if trial % 3 else min(n, 2048)
+            kind = trial % 5
+            if kind == 0:  # scores over a few binades
+                keys = rng.lognormal(0, 1.5, n).astype(np.float32).view(np.int32)
+            elif kind == 1:  # five distinct keys: ties
+                keys = rng.choice(rng.integers(INT_MIN, 2**31, 5, dtype=np.int64), n)
+            elif kind == 2:
+                keys = rng.integers(INT_MIN, 2**31, n, dtype=np.int64)
+            elif kind == 3:  # around a coarse threshold
+                c = int(rng.integers(1, 64))
+                keys = (c << 26) + INT_MIN + rng.integers(-(2**21), 2**21, n)
+            else:  # int32 extremes
+                keys = rng.choice(np.array([INT_MIN, INT_MIN + 1, -1, 0, 2**31 - 1]), n)
+            keys = np.asarray(keys).astype(np.int32)
+            kth = int(np.sort(keys.astype(np.int64) - INT_MIN)[::-1][topk - 1])
+            want = (kth >> 12) << 12
+            for centre in (
+                want + INT_MIN,
+                want + INT_MIN + (int(rng.integers(-40, 40)) << 19),
+                int(rng.integers(INT_MIN, 2**31)),
+                INT_MIN,
+                2**31 - 1,
+            ):
+                got, fine = search(keys, topk, int(np.clip(centre, INT_MIN, 2**31 - 1)))
+                self.assertEqual(got, want, (trial, kind, n, topk, centre))
+                hits, misses = hits + fine, misses + (not fine)
+        self.assertGreater(hits, 100)
+        self.assertGreater(misses, 100)
+
+    def test_centre_slots(self):
+        import jax.numpy as jnp
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
+
+        centres = np.arange(5 * 3 * 4, dtype=np.int32).reshape(
+            5, 3, 4
+        )  # [slots, layers, rows]
+        slots = np.array(
+            [2, 2, 2, 2, 0, 0, 3, 3], np.int32
+        )  # rows of 4: padding on slot 0
+        got = np.asarray(
+            dsa_dcp.gather_centres(jnp.asarray(centres), jnp.asarray(slots), 4)
+        )
+        want = [centres[slots[b], m, b % 4] for m in range(3) for b in range(8)]
+        np.testing.assert_array_equal(got, want)
+        new = 1000 + np.arange(24, dtype=np.int32)
+        out = np.asarray(
+            dsa_dcp.scatter_centres(
+                jnp.asarray(centres), jnp.asarray(slots), 4, jnp.asarray(new)
+            )
+        )
+        expect = centres.copy()
+        for m in range(3):
+            for b in range(8):
+                if slots[b]:
+                    expect[slots[b], m, b % 4] = new[m * 8 + b]
+        np.testing.assert_array_equal(out, expect)  # slot 0 unchanged
+
+
+class TestIndexSelectSeededWindow(CustomTestCase):
+    """``KernelConfig.dsa_seeded_window``: ``select_call`` in interpret mode
+    on a 4-rank group over multi-step streams, each step's centres the last
+    step's output: 8 rows of one growing sequence (B1 x7), 8 single-row
+    sequences of mixed lengths (inactive rows, a row crossing topk, rows
+    taking other requests) and two 8-row sequences (16 rows, two groups),
+    with score scale jumps, garbage and edge-of-window centres, new requests
+    with ties. Every step matches the reference (the topk-th key's 20-bit
+    prefix bin) and the knob-off run bit for bit (thresholds, tie positions,
+    own flags, keys); both window hits and misses occur, active rows' next
+    centres are their thresholds (bit 0: the hit), inactive rows keep
+    theirs, and every rank runs two count exchanges a hit and three a miss."""
+
+    SCRIPT = """
+        import os, sys
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        from sglang_tpu.k3_programs.kimi_k3 import config as kc
+        knobs = dict(kv.split("=") for kv in os.environ["KNOBS"].split(",") if kv)
+        kc.install(kc.KernelConfig().replace(**knobs))
+        import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3 import dsa
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp
+
+        SEEDED = kc.active().dsa_seeded_window
+        _exchange = dsa_dcp.IndexSelect._exchange_wide
+        def _counted(self, counts, parity, pending):
+            pl.debug_print("ROUND_EXCHANGE")
+            return _exchange(self, counts, parity, pending)
+        dsa_dcp.IndexSelect._exchange_wide = _counted
+
+        G, T, INT_MIN, TOPK = 4, 512, -(2**31), 300
+        mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+        outputs, flags, steps = {}, [], [0]
+
+        def stream(name, S, plan, seed, max_len):
+            # plan: per step, (lengths of each sequence's first in-flight position, w scale
+            # exponent per sequence, centre override or None); sequences keep their keys
+            # (append-only) unless a step gives a sequence a new seed (a new request).
+            rng = np.random.default_rng(seed)
+            nseq = len(plan[0][0])
+            B = nseq * S
+            pages = -(-(max_len + T) // T) // G + 2
+            blocks = 1 + nseq * pages
+            calls = {}
+            def kernel(centred):
+                if centred in calls:
+                    return calls[centred]
+                def body(q8, w_t, pool, tables, positions, new_k8, new_exp, centres):
+                    out = dsa_dcp.select_call(q8, w_t, new_k8, pool[0], tables[0], positions, new_exp,
+                                              pages=pages, topk=TOPK, group=G, max_local_pages=pages,
+                                              sequence_rows=S, interpret=pltpu.InterpretParams(),
+                                              centres=centres if centred else None)
+                    return tuple(x[None] for x in out)
+                n_out = 5 if centred else 4
+                f = jax.jit(jax.shard_map(body, mesh=mesh,
+                                          in_specs=(P(), P(), P("tp"), P("tp"), P(), P(), P(), P()),
+                                          out_specs=(P("tp"),) * n_out, check_vma=False))
+                calls[centred] = f
+                return f
+            seqs = []
+            def new_seq(s, kind, step):
+                r = np.random.default_rng(seed * 1000 + s * 17 + step)
+                if kind == "ties":  # few distinct keys: ties at the threshold
+                    raw = r.standard_normal((7, 128)).astype(np.float32)[r.integers(0, 7, max_len + S)]
+                else:
+                    raw = r.standard_normal((max_len + S, 128)).astype(np.float32)
+                q = [dsa.index_query(r.standard_normal(4096).astype(np.float32),
+                                     r.standard_normal(32).astype(np.float32)) for _ in range(S)]
+                return dict(raw=raw, k8=dsa.quantize_fp8(raw), rec=np.asarray(dsa_dcp.key_records(jnp.asarray(raw))), q=q)
+            centres = np.zeros(B, np.int32)
+            for step, (firsts, scales, kinds, override) in enumerate(plan):
+                for s, kind in enumerate(kinds):
+                    if step == 0 or kind is not None:
+                        if len(seqs) <= s:
+                            seqs.append(None)
+                        seqs[s] = new_seq(s, kind or "plain", step)
+                positions = np.array([p0 + r for p0 in firsts for r in range(S)], np.int32)
+                pools = rng.integers(0, 256, (G, blocks, 132, 4, 128), dtype=np.uint8)
+                tables = np.zeros((G, B, pages), np.int32)
+                new_k8 = np.zeros((B, 128), np.float32); new_exp = np.zeros(B, np.int32)
+                q8 = np.zeros((B, 32, 128), np.float32); w = np.zeros((B, 32), np.float32)
+                for s, p0 in enumerate(firsts):
+                    sq = seqs[s]
+                    k8, _ = sq["k8"]
+                    rec = sq["rec"]
+                    for r in range(S):
+                        b = s * S + r
+                        tables[:, b] = 1 + s * pages + np.arange(pages)
+                        new_k8[b] = k8[p0 + r]; new_exp[b] = rec[p0 + r, 128]
+                        q8[b], w[b] = sq["q"][r]
+                        w[b] *= np.float32(2.0) ** scales[s]
+                    t = np.arange(p0)
+                    page = t // T
+                    blk = tables[page % G, s * S, page // G]
+                    (row, sub), (srow, lane) = dsa_dcp.record_place(t % T)
+                    pools[page % G, blk, row, sub] = rec[t, :128]
+                    pools[page % G, blk, srow, 0, lane] = rec[t, 128]
+                w_t = np.zeros((32, 128), np.float32); w_t[:, :B] = w.T
+                if override is not None:
+                    centres = np.asarray(override(centres), np.int32)
+                args = (q8.astype(ml_dtypes.float8_e4m3fn), w_t, pools, tables.reshape(G, -1), positions,
+                        new_k8, new_exp, centres)
+                out = [np.asarray(x) for x in kernel(SEEDED)(*args)]
+                tau, ptie, own, keys = out[:4]
+                for b in range(B):
+                    L = positions[b] + 1
+                    t = np.arange(L)
+                    kk = keys[(t // T) % G, b, (t // T) // G * (T // 128) + (t % T) // 128, t % 128].astype(np.int64)
+                    for v in out[:3] + out[4:]:
+                        assert len(set(v[:, b])) == 1, (name, step, b)
+                    if L <= TOPK:
+                        want_tau, want = INT_MIN, kk > INT_MIN
+                    else:
+                        kth = np.sort(kk)[::-1][TOPK - 1]
+                        unsigned = (int(kth) ^ INT_MIN) & 0xFFFFFFFF
+                        bound = ((unsigned >> 12) << 12) ^ (1 << 31)
+                        want_tau = bound - (1 << 32) if bound >= (1 << 31) else bound
+                        want = kk >= want_tau
+                    assert tau[0, b] == want_tau, (name, step, b, tau[0, b], want_tau)
+                    np.testing.assert_array_equal(dsa_dcp.selected(kk, t, tau[0, b], ptie[0, b]), want)
+                    assert bool(own[0, b]) == bool(want[-1]), (name, step, b)
+                    outputs[f"{name}_{step}_keys_{b}"] = kk
+                for key, v in (("tau", tau), ("ptie", ptie), ("own", own)):
+                    outputs[f"{name}_{step}_{key}"] = v[0]
+                if SEEDED:
+                    new = out[4][0]
+                    active = positions + 1 > TOPK
+                    # Active rows: tau | the window round's hit; others keep their centre.
+                    hit = int(new[np.argmax(active)] & 1) if active.any() else 0
+                    np.testing.assert_array_equal(new[active], tau[0][active] | hit)
+                    np.testing.assert_array_equal(new[~active], centres[~active])
+                    flags.append((name, step, int(active.any()), hit))
+                    centres = new
+                steps[0] += 1
+                print(name, step, "taus", tau[0][:4], flush=True)
+
+        # 8 rows of one sequence (B1 x7): the stream grows; the head weights scale by
+        # 2^6 at step 3 and back at step 4 (misses); garbage centres at step 5; a new
+        # request (ties) at step 6 keeping the old centres.
+        garbage = lambda c: np.array([INT_MIN, 2**31 - 1, -1, 0, 1, dsa_dcp.CENTRE_HIGH + 1, 12345, -98765], np.int64).astype(np.int32)
+        edge = lambda c: c + (np.array([31, 32, -32, -33, 30, -31, 33, 0]) << 19)
+        plain = [None]
+        plan8 = [
+            ([2800], [0], plain, None),
+            ([2803], [0], [None], None),
+            ([2808], [0], [None], None),
+            ([2811], [6], [None], None),
+            ([2815], [0], [None], None),
+            ([2820], [0], [None], garbage),
+            ([2560], [0], ["ties"], None),
+            ([2563], [0], [None], edge),
+            ([2568], [-1], [None], None),
+        ]
+        stream("b8s8", 8, plan8, 0, 2900)
+        # 8 single-row sequences, mixed lengths (some at most topk: inactive), a row
+        # crossing topk, rows exchanging requests (centres stay with the rows).
+        lens = [100, 299, 300, 700, 1500, 2100, 2600, 3000]
+        plan1 = [
+            (lens, [0] * 8, [None] * 8, None),
+            ([l + 1 for l in lens], [0] * 8, [None] * 8, None),
+            ([l + 2 for l in lens], [0] * 8, [None] * 8, None),
+            ([l + 3 for l in lens], [0, 0, 0, 0, 0, 0, 0, 3], [None] * 8, None),
+            ([lens[(i + 3) % 8] + 4 for i in range(8)], [0] * 8, [None] * 8, None),
+            ([l + 5 for l in lens], [0] * 8, [None, None, "ties", None, None, None, None, "plain"], edge),
+            ([l + 6 for l in lens], [0] * 8, [None] * 8, None),
+        ]
+        stream("b8s1", 1, plan1, 1, 3200)
+        # Two 8-row sequences (B2 x7: 16 rows, two groups): one hits, one misses.
+        plan16 = [
+            ([1200, 2600], [0, 0], [None, None], None),
+            ([1205, 2604], [0, 0], [None, None], None),
+            ([1208, 2610], [0, -5], [None, None], None),
+            ([1211, 2612], [0, -5], [None, None], None),
+        ]
+        stream("b16s8", 8, plan16, 2, 2700)
+        np.savez(os.environ["OUT"], **outputs)
+        # Exchanges a rank runs: three a selection, seeded two when the window hit
+        # (or no row is active).
+        expect = 3 * steps[0]
+        if SEEDED:
+            live = [f for f in flags if f[2]]
+            print("flags", flags)
+            print("WINDOW hits", sum(f[3] for f in live), "misses", sum(1 - f[3] for f in live))
+            expect = sum(2 if hit or not active else 3 for _, _, active, hit in flags)
+        print("EXPECT", expect)
+        print("OK")
+    """
+
+    # The production scoring knobs (16 rows: no resident keys).
+    KNOBS = (
+        "dsa_select_rounds=5,dsa_page_slots=8,dsa_resident_keys=1,"
+        "dsa_patch_loop=1,dsa_stage_slots=4,dsa_early_plan=1"
+    )
+
+    def test_seeded_window_matches_three_rounds_bit_for_bit(self):
+        import os
+        import re
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        stdout = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, knobs in (
+                ("base", self.KNOBS),
+                ("seeded", self.KNOBS + ",dsa_seeded_window=1"),
+            ):
+                env = dict(
+                    os.environ,
+                    PYTHONPATH=os.pathsep.join(sys.path),
+                    KNOBS=knobs,
+                    OUT=f"{tmp}/{name}.npz",
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=2400,
+                )
+                self.assertIn(
+                    "OK",
+                    result.stdout,
+                    f"{name}: {result.stdout[-2000:]}{result.stderr[-3000:]}",
+                )
+                expect = int(re.search(r"^EXPECT (\d+)$", result.stdout, re.M)[1])
+                self.assertEqual(
+                    result.stdout.count("ROUND_EXCHANGE"), 4 * expect, name
+                )
+                stdout[name] = result.stdout
+            hits, misses = map(
+                int,
+                re.search(r"WINDOW hits (\d+) misses (\d+)", stdout["seeded"]).groups(),
+            )
+            self.assertGreaterEqual(hits, 5, stdout["seeded"][-1500:])
+            self.assertGreaterEqual(misses, 5, stdout["seeded"][-1500:])
+            base, seeded = np.load(f"{tmp}/base.npz"), np.load(f"{tmp}/seeded.npz")
+            self.assertEqual(sorted(base.files), sorted(seeded.files))
+            for name in base.files:
+                np.testing.assert_array_equal(base[name], seeded[name], err_msg=name)

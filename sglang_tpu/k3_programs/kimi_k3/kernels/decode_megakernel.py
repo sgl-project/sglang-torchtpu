@@ -8346,6 +8346,7 @@ def stack(
     live_rows=None,
     index_pools=None,
     dsa_topk: int = 2048,
+    dsa_centres=None,
 ):
     """Fuse the decoder layers while keeping a native batch tile in VMEM.
 
@@ -8379,6 +8380,11 @@ def stack(
     ``state_slots[state_row]``), instead of the caller gathering the rows
     first. The updated states are still returned per row. Needs
     ``state_row`` or ``batch_size`` > 4 with DP1, or B2..B128 with DP2.
+
+    ``dsa_centres`` (Kimi-K3.1, ``KernelConfig.dsa_seeded_window``): int32
+    ``[24 * batch_size]``, MLA layer ``m``'s row ``b`` window centre at ``m *
+    batch_size + b``; the rows' next centres (same layout) follow the
+    selection keys in the outputs.
     """
     if not 1 <= batch_size <= MAX_BATCH:
         raise ValueError(
@@ -8410,6 +8416,11 @@ def stack(
         )
     if dsa and (attention_dp != 1 or mla_dcp.GROUP != 32):
         raise ValueError("The DSA indexer runs with DCP32 and no attention DP")
+    seeded = dsa and dsa_centres is not None
+    if seeded and not dsa_dcp.seeded_window(batch_size):
+        raise ValueError(
+            "dsa_centres needs KernelConfig.dsa_seeded_window and its bin selection"
+        )
     if include_layer_zero and any(name not in weights for name in DENSE):
         raise ValueError("include_layer_zero needs the dense MLP weights")
     select_state_row = state_row is not None
@@ -8819,6 +8830,9 @@ def stack(
             # Stack scalar integers before comparison: Mosaic cannot concatenate
             # scalar predicates into a vector through bitcast_vreg.
             active_rows = jnp.stack([live_ref[b] for b in range(batch_size)]) != 0
+        centres_ref = None
+        if seeded:
+            centres_ref, *refs = refs
         prefix_ref, embedding_ref, *refs = refs
         layer_weights = dict(zip(layer_names, refs[: len(layer_names)], strict=True))
         output_residual_ref, final_normalization_ref = refs[
@@ -8845,11 +8859,14 @@ def stack(
             state_count += MLA_LAYERS  # the index pools follow the states
         output_count = 9 if dsa else 7
         output_refs = refs[state_start + state_count : state_start + state_count + 7]
-        records_output_ref = keys_output_ref = None
+        records_output_ref = keys_output_ref = centres_output_ref = None
         if dsa:
             records_output_ref, keys_output_ref = refs[
                 state_start + state_count + 7 : state_start + state_count + 9
             ]
+        if seeded:
+            centres_output_ref = refs[state_start + state_count + output_count]
+            output_count += 1
         steal_staging = ()
         if steal_slots:
             # The steal's staging families (HBM outputs the sibling writes).
@@ -10535,6 +10552,9 @@ def stack(
                             topk=dsa_topk,
                             eps=eps,
                             sequence_rows=sequence_rows,
+                            centres=(
+                                (centres_ref, centres_output_ref) if seeded else None
+                            ),
                         )
                     count = len(mla_dcp.SCOPED_NAMES)
                     workspace, dcp_scoped = workspace[:-count], workspace[-count:]
@@ -11674,6 +11694,12 @@ def stack(
             if dsa
             else ()
         ),
+        # The rows' next window centres (KernelConfig.dsa_seeded_window).
+        *(
+            (jax.ShapeDtypeStruct((MLA_LAYERS * batch_size,), jnp.int32),)
+            if seeded
+            else ()
+        ),
         # The steal's staging slots (scratch; unused by the caller).
         *(
             jax.ShapeDtypeStruct(
@@ -12184,16 +12210,19 @@ def stack(
         out_shape=output_shapes,
         input_output_aliases={},
         grid_spec=tpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3 + int(slot_reads) + int(live_rows is not None),
+            num_scalar_prefetch=3
+            + int(slot_reads)
+            + int(live_rows is not None)
+            + int(seeded),
             in_specs=[pl.BlockSpec(memory_space=tpu.HBM) for _ in range(len(args))],
             out_specs=[
                 pl.BlockSpec(memory_space=tpu.HBM),
                 pl.BlockSpec(memory_space=tpu.VMEM),
+                *(pl.BlockSpec(memory_space=tpu.HBM) for _ in range(7 if dsa else 5)),
+                *((pl.BlockSpec(memory_space=tpu.SMEM),) if seeded else ()),
                 *(
                     pl.BlockSpec(memory_space=tpu.HBM)
-                    for _ in range(
-                        (7 if dsa else 5) + (len(steal_families) if steal_slots else 0)
-                    )
+                    for _ in range(len(steal_families) if steal_slots else 0)
                 ),
             ],
             scratch_shapes=scratch,
@@ -12221,6 +12250,11 @@ def stack(
         *(
             (jnp.asarray(live_rows, jnp.int32).reshape(batch_size),)
             if live_rows is not None
+            else ()
+        ),
+        *(
+            (jnp.asarray(dsa_centres, jnp.int32).reshape(MLA_LAYERS * batch_size),)
+            if seeded
             else ()
         ),
         *args,
@@ -12268,6 +12302,7 @@ def decode_local(
     live_rows=None,
     index_pools=None,
     dsa_topk: int = 2048,
+    dsa_centres=None,
 ):
     """Decode one native batch tile with local TP32 weights and caches.
 
@@ -12394,6 +12429,7 @@ def decode_local(
         live_rows=live_rows,
         index_pools=index_pools,
         dsa_topk=dsa_topk,
+        dsa_centres=dsa_centres,
     )
 
     if sequence_parallel_pre_attention and batched_decoder_boundaries:
@@ -12434,8 +12470,10 @@ def decode_local(
         recurrent_states,
         new_keys,
         new_values,
-        # Kimi-K3.1: each row's new index-key records [batch, 24, 2, 128].
+        # Kimi-K3.1: each row's new index-key records [batch, 24, 2, 128]
+        # (with dsa_centres, then the rows' next window centres [24 * batch]).
         *dsa_outputs[:1],
+        *dsa_outputs[2:3],
     )
     if aux_hidden_layers:
         return logits[None], aux_hidden, new_states

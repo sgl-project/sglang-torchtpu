@@ -292,8 +292,8 @@ def group_stride(chunk: int) -> int:
 
 COUNT_ROWS = 16  # candidate sublanes of the count exchange
 BINS = 16  # a round's digit values (DIGIT_BITS = 4)
-# State rows (lanes: batch rows).
-_PREFIX, _UPPER, _LOWER, _POSITION, _LIMIT, _KEY_ROWS = range(6)
+# State rows (lanes: batch rows). _WINDOW: the seeded window's start - 2^19.
+_PREFIX, _UPPER, _LOWER, _POSITION, _LIMIT, _KEY_ROWS, _WINDOW = range(7)
 # Gather finish (KernelConfig.dsa_gather_finish): once every row's threshold bin
 # holds at most GATHER_SLOTS keys over the group, each rank sends its keys in the
 # bin (with their positions) and every rank finishes the rounds on them locally.
@@ -337,6 +337,114 @@ def digit_widths(batch: int, rounds: int | None = None) -> tuple[int, ...]:
     count = -(-bits // MAX_DIGIT_BITS)
     width, extra = divmod(bits, count)
     return tuple(width + 1 if i < extra else width for i in range(count))
+
+
+# Seeded window (KernelConfig.dsa_seeded_window), in the 20-bit bin selection
+# of up to WIDE_MAX_BATCH rows (digit widths 7, 7, 6). Keys as unsigned bits
+# u = key ^ INT_MIN: the first round counts 63 coarse thresholds c << 26 (c =
+# 1 .. 63) and 64 fine ones F + k << 19 (k = 0 .. 63) from a row's window
+# start F (its centre - 32 << 19, 2^12-aligned, inside [2^19, 2^32 - 2^25]).
+# A key's digit -- the thresholds at or below it -- is u >> 26 plus its fine
+# count, so the candidate counts are the counts at the sorted thresholds and
+# the round's digit names the bin between two of them that holds the
+# topk-th key. When every active row's bin is at most 2^19 wide one 7-bit
+# round at shift 12 resolves the 20-bit prefix (two exchanges); otherwise
+# rounds at shifts 19 and 12 do (three; every bin is at most 2^26 wide). The
+# prefix is the largest 20-bit p with count(u >= p << 12) >= topk either way.
+WINDOW_WIDTHS = (7, 7, 6)
+COARSE_SHIFT = 26
+FINE_SHIFT = 19
+FINE_THRESHOLDS = 64
+# A centre's window start - 2^19 stays in [INT_MIN, 2^31 - 2^25 - 2^19]:
+# centres clamp to [INT_MIN + 2^19 + 2^24, 2^31 - 2^24] (multiples of 2^19).
+CENTRE_LOW = INT_MIN + (1 << FINE_SHIFT) + (1 << 24)
+CENTRE_HIGH = (1 << 31) - (1 << 24)
+
+
+def seeded_window(batch: int, rounds: int | None = None) -> bool:
+    """Whether a ``batch``-row selection takes the seeded window
+    (``KernelConfig.dsa_seeded_window`` with the (7, 7, 6) bin selection)."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    config = active()
+    return bool(
+        config is not None
+        and config.dsa_seeded_window
+        and digit_widths(batch, rounds) == WINDOW_WIDTHS
+    )
+
+
+def window_start(centre):
+    """A row's window start - 2^19 (signed key space) from its centre (any
+    int32; scalar or array): ``centre`` without its low 12 bits, clamped,
+    less 32 fine steps and one."""
+    centre = jnp.clip(centre & jnp.int32(-4096), CENTRE_LOW, CENTRE_HIGH)
+    return centre - jnp.int32((1 << 24) + (1 << FINE_SHIFT))
+
+
+def window_digit(key, start):
+    """The seeded round's digit of a key (signed, any shape): the coarse
+    thresholds at or below it, ``u >> 26`` (``key >> 26`` + 32), plus the fine
+    ones, ``clamp(key, start, start + 65 << 19 - 1) - start >> 19`` with
+    ``start`` the window start - 2^19 (no int32 overflow: ``window_start``)."""
+    span = ((FINE_THRESHOLDS + 1) << FINE_SHIFT) - 1
+    coarse = (key >> COARSE_SHIFT) + 32
+    fine = (jnp.clip(key, start, start + span) - start) >> FINE_SHIFT
+    return coarse + fine
+
+
+def window_thresholds(start, lane):
+    """The seeded round's sorted thresholds (signed): lane ``j`` (``lane`` an
+    iota, ``start`` the rows' window starts - 2^19 broadcastable against it)
+    holds the ``(j + 1)``-th smallest of the coarse and fine thresholds, lane
+    127 ``INT_MIN`` (2^32: the top bin's end). With ``a`` coarse thresholds
+    below the window and ``f`` fine ones below the next coarse one ``e``:
+    lanes ``< a`` coarse, ``a .. a + f - 1`` fine, ``a + f`` ``e``, then the
+    other fine ones up to lane ``a + 64``, then coarse."""
+    w = start + jnp.int32(1 << FINE_SHIFT)  # the first fine threshold
+    a = ((w - 1) >> COARSE_SHIFT) + 32  # coarse thresholds below it, 0 .. 63
+    e = (a - 31) << COARSE_SHIFT  # coarse threshold a + 1 (a = 63: INT_MIN)
+    f = jnp.where(
+        a == 63,
+        FINE_THRESHOLDS,
+        jnp.minimum((e - w + ((1 << FINE_SHIFT) - 1)) >> FINE_SHIFT, FINE_THRESHOLDS),
+    )
+    return jnp.where(
+        lane < a,
+        (lane - 31) << COARSE_SHIFT,
+        jnp.where(
+            lane < a + f,
+            w + ((lane - a) << FINE_SHIFT),
+            jnp.where(
+                lane == a + f,
+                e,
+                jnp.where(
+                    lane <= a + FINE_THRESHOLDS,
+                    w + ((lane - a - 1) << FINE_SHIFT),
+                    (lane - 95) << COARSE_SHIFT,
+                ),
+            ),
+        ),
+    )
+
+
+def gather_centres(centres, slots, sequence_rows):
+    """The decode kernel's window centres ``[L * B]`` (MLA layer ``m``'s row
+    ``b`` at ``m B + b``) from the slot array ``centres [S, L, R]``: row ``b``
+    reads slot ``slots[b]``, row ``b % sequence_rows`` of its request."""
+    rows = jnp.arange(slots.shape[0]) % sequence_rows
+    return centres[slots, :, rows].T.reshape(-1)
+
+
+def scatter_centres(centres, slots, sequence_rows, new):
+    """``gather_centres``' inverse for the kernel's next centres ``new``: every
+    row's into its slot, except the null slot 0's (padding rows may share it;
+    dropping their writes keeps the array the same on every rank)."""
+    rows = jnp.arange(slots.shape[0]) % sequence_rows
+    target = jnp.where(slots != 0, slots, centres.shape[0])
+    return centres.at[target, :, rows].set(
+        new.reshape(centres.shape[1], slots.shape[0]).T, mode="drop"
+    )
 
 
 def gather_finish(batch: int) -> bool:
@@ -469,7 +577,13 @@ class IndexSelect:
         sequence_rows=1,
         global_pages=False,
         table_row=None,
+        centres=None,
     ):
+        # KernelConfig.dsa_seeded_window: ``(centres_in, centres_out, base)``,
+        # SMEM refs holding row b's window centre at base + b (in: the previous
+        # step's threshold; out: this step's, see _finish_tau).
+        self.centres = centres
+        self.seeded = centres is not None and seeded_window(batch)
         self.pools, self.layer, self.table_ref, self.pages = (
             tuple(pools),
             layer,
@@ -560,6 +674,13 @@ class IndexSelect:
             state = jnp.where(
                 (lane == b) & (sub == _LOWER), INT_MAX, state
             )  # no bin yet
+            if self.seeded:
+                centres_in, _, centre_base = self.centres
+                state = jnp.where(
+                    (lane == b) & (sub == _WINDOW),
+                    window_start(centres_in[centre_base + b]),
+                    state,
+                )
             # Scoring steps go by sequence (its rows share their pages): its
             # longest row's page count.
             seq_count = count if b % self.S == 0 else jnp.maximum(seq_count, count)
@@ -1382,17 +1503,20 @@ class IndexSelect:
         for b in range(self.batch):
             self.refs[name][b] = _row_scalar(vector, b)
 
-    def _key_digits(self, shift, width=DIGIT_BITS):
+    def _key_digits(self, shift, width=DIGIT_BITS, positive=False):
         """A key round's ``digits`` (see ``_count``): candidate ``j``'s threshold is
         ``base + (j + 1) << shift``; a key's digit is ``(key - base) >> shift``, 15 for
-        all above the round's range (``shift`` may be traced)."""
+        all above the round's range (``shift`` may be traced; ``positive``: a
+        traced shift that is never 0)."""
 
         top = (1 << width) - 1
 
         def key_digits(params, key, position, valid):
             (base,) = params
             diff = key - base  # wraps only from 2^31 above base: far above the range
-            if isinstance(shift, int):
+            if positive:
+                digit = jnp.minimum(jax.lax.shift_right_logical(diff, shift), top)
+            elif isinstance(shift, int):
                 if shift:
                     digit = jnp.minimum(jax.lax.shift_right_logical(diff, shift), top)
                 else:
@@ -1453,15 +1577,25 @@ class IndexSelect:
         ``[8 groups, LANES]`` with row ``b`` at sublane ``b`` and candidate
         ``j`` (keys at or above ``base + (j + 1) << shift``) at lane ``j``, so
         nothing is packed or unpacked and a row's digit is one lane sum."""
+        bins = 1 << width
+        counts = self._count_groups_wide(self._key_digits(shift, width), bins, first)
+        total = self._exchange_wide(counts, parity, pending)
+        self._wide_update(total, shift, bins - 1)
+
+    def _exchange_wide(self, counts, parity, pending):
+        """A wide round's counts ``[8 groups, LANES]`` summed over the group
+        (``parity`` may be traced: then both slots' sends are of these rows)."""
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
 
-        refs, group, member, topk = self.refs, self.group, self.member, self.topk
-        bins, rows = 1 << width, 8 * self.groups
-        counts = self._count_groups_wide(self._key_digits(shift, width), bins, first)
+        refs, group, member = self.refs, self.group, self.member
+        rows = 8 * self.groups
         if pending:
             self._sent(parity)
-        self._sent_rows[parity] = rows
+        if isinstance(parity, int):
+            self._sent_rows[parity] = rows
+        else:
+            self._sent_rows[0] = self._sent_rows[1] = rows
         mine = refs["exchange"].at[parity, member, pl.ds(0, rows)]
         mine[...] = counts
         for peer in range(group):
@@ -1481,11 +1615,14 @@ class IndexSelect:
         pltpu.make_async_copy(
             others, others, refs["exchange_sems"].at[1, parity]
         ).wait()
-        total = jnp.sum(refs["exchange"][parity, :, pl.ds(0, rows)], axis=0)
-        # The digit: the largest candidate whose count still reaches topk.
+        return jnp.sum(refs["exchange"][parity, :, pl.ds(0, rows)], axis=0)
+
+    def _wide_update(self, total, shift, candidates):
+        """Extend every row's prefix by a wide round's digit (``shift`` may be
+        traced): the largest candidate whose count still reaches topk."""
+        refs, topk = self.refs, self.topk
         lane = jax.lax.broadcasted_iota(jnp.int32, total.shape, 1)
         sub = jax.lax.broadcasted_iota(jnp.int32, total.shape, 0)
-        candidates = bins - 1
         digit = jnp.sum(
             ((total >= topk) & (lane < candidates)).astype(jnp.int32),
             axis=1,
@@ -1509,7 +1646,86 @@ class IndexSelect:
             digit >= 1, lower, state[_LOWER : _LOWER + 1]
         )
 
-    def _count_groups_wide(self, digits, bins, first):
+    def _window_update(self, total):
+        """The seeded round's digit -> each row's bin ``[lo, hi)`` between two
+        sorted thresholds (``window_thresholds``; ``lo`` ``INT_MIN`` below the
+        first): the prefix becomes ``lo`` (2^12-aligned) and
+        ``refs["window"][0]`` 1 when every active row's bin is at most 2^19
+        wide (the same on every rank: summed counts, the same centres)."""
+        refs, topk = self.refs, self.topk
+        lane = jax.lax.broadcasted_iota(jnp.int32, total.shape, 1)
+        sub = jax.lax.broadcasted_iota(jnp.int32, total.shape, 0)
+        state = refs["state"]
+        start = jnp.sum(
+            jnp.where(sub == lane, state[_WINDOW : _WINDOW + 1], 0),
+            axis=1,
+            keepdims=True,
+        )  # [rows, 1] row b's window start - 2^19
+        thresholds = window_thresholds(start, lane)
+        candidates = (1 << MAX_DIGIT_BITS) - 1
+        digit = jnp.sum(
+            ((total >= topk) & (lane < candidates)).astype(jnp.int32),
+            axis=1,
+            keepdims=True,
+        )  # [rows, 1]
+        lo = jnp.where(
+            digit == 0,
+            INT_MIN,
+            jnp.sum(jnp.where(lane == digit - 1, thresholds, 0), axis=1, keepdims=True),
+        )
+        hi = jnp.sum(jnp.where(lane == digit, thresholds, 0), axis=1, keepdims=True)
+        # The bin's width (lane 127's INT_MIN is 2^32: int32 differences wrap).
+        fine = (hi - lo <= (1 << FINE_SHIFT)).astype(jnp.int32)
+        upper = jnp.sum(jnp.where(lane == digit, total, 0), axis=1, keepdims=True)
+        lower = jnp.sum(jnp.where(lane == digit - 1, total, 0), axis=1, keepdims=True)
+
+        def to_lanes(column):  # [rows, 1] -> [1, LANES] (row b at lane b)
+            return jnp.sum(jnp.where(sub == lane, column, 0), axis=0, keepdims=True)
+
+        digit, lo, fine = to_lanes(digit), to_lanes(lo), to_lanes(fine)
+        upper, lower = to_lanes(upper), to_lanes(lower)
+        state[_PREFIX : _PREFIX + 1] = lo ^ INT_MIN  # unsigned bits
+        state[_UPPER : _UPPER + 1] = jnp.where(
+            digit < candidates, upper, state[_UPPER : _UPPER + 1]
+        )
+        state[_LOWER : _LOWER + 1] = jnp.where(
+            digit >= 1, lower, state[_LOWER : _LOWER + 1]
+        )
+        misses = jnp.sum((self._active_rows() & (fine == 0)).astype(jnp.int32))
+        refs["window"][0] = (misses == 0).astype(jnp.int32)
+
+    def _seeded_rounds(self):
+        """The seeded window's rounds (``seeded_window``): the window round,
+        then one 7-bit round at shift 12 when every active row's bin is fine
+        (``_window_update``), else rounds at shifts 19 and 12 -- one loop body
+        (the 7-bit count code once), its shift and exchange slot traced."""
+        refs = self.refs
+        bins = 1 << MAX_DIGIT_BITS
+        counts = self._count_groups_wide(
+            lambda params, key, position, valid: (window_digit(key, params[0]), valid),
+            bins,
+            True,
+            window=True,
+        )
+        total = self._exchange_wide(counts, 0, False)
+        self._window_update(total)
+        later = 2 - refs["window"][0]  # 7-bit rounds left
+        last_shift = FINE_SHIFT - MAX_DIGIT_BITS  # 12: the 20-bit prefix's last bit
+
+        def round_(i, carry):
+            shift = jnp.where(i == later - 1, last_shift, FINE_SHIFT)
+            # Rounds 1, 2 use slots 1, 0; round 2 rewrites the window round's.
+            pl_when(i > 0)(lambda: self._sent(0))
+            counts = self._count_groups_wide(
+                self._key_digits(shift, MAX_DIGIT_BITS, positive=True), bins, False
+            )
+            total = self._exchange_wide(counts, (i + 1) % 2, False)
+            self._wide_update(total, shift, bins - 1)
+            return carry
+
+        jax.lax.fori_loop(0, later, round_, 0)
+
+    def _count_groups_wide(self, digits, bins, first, window=False):
         """This rank's transposed counts of a wide key round (see
         ``_key_round_wide``), reading 8 rows a step like ``_count_groups``. A
         block of 8 key rows histograms into ``bins / 8`` accumulators of 4-bit
@@ -1520,7 +1736,8 @@ class IndexSelect:
         lane scan turns the bins into candidate counts, added to the group's
         sublanes of ``refs["wide_local"]`` (counts are linear in the keys).
         A step's rows' prefixes and key-row counts come straight from the
-        state rows (lanes -> sublanes), not through SMEM scalars."""
+        state rows (lanes -> sublanes), not through SMEM scalars (``window``:
+        the rows' window starts, for ``window_digit``)."""
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
 
@@ -1551,7 +1768,9 @@ class IndexSelect:
                 pl_when(load & (step + 1 < total))(lambda: self._group_copy(step + 1))
             start = jnp.minimum(part * chunk, self.key_rows - chunk)
             limit = rows_of(_KEY_ROWS, g)  # zero past the batch's rows
-            params = (rows_of(_PREFIX, g) ^ INT_MIN,)
+            params = (
+                (rows_of(_WINDOW, g),) if window else (rows_of(_PREFIX, g) ^ INT_MIN,)
+            )
             first_row = part * chunk - start
             end_row = jnp.minimum(refs["group_rows"][g], (part + 1) * chunk) - start
             slot = refs["group_buf"].at[step % 2]
@@ -1959,16 +2178,19 @@ class IndexSelect:
         if rounds < len(KEY_SHIFTS):
             # Bin selection (KernelConfig.dsa_select_rounds): every key at or
             # above the bin's lower bound, a superset of the top-k; its prefix
-            # bits in ``digit_widths`` exchange rounds.
-            shift = 32
-            for round_, width in enumerate(digit_widths(self.batch, rounds)):
-                shift -= width
-                if width == DIGIT_BITS:
-                    self._key_round(shift, round_ % 2, round_ >= 2, round_ == 0)
-                else:
-                    self._key_round_wide(
-                        shift, width, round_ % 2, round_ >= 2, round_ == 0
-                    )
+            # bits in ``digit_widths`` exchange rounds (seeded: two or three).
+            if self.seeded:
+                self._seeded_rounds()
+            else:
+                shift = 32
+                for round_, width in enumerate(digit_widths(self.batch, rounds)):
+                    shift -= width
+                    if width == DIGIT_BITS:
+                        self._key_round(shift, round_ % 2, round_ >= 2, round_ == 0)
+                    else:
+                        self._key_round_wide(
+                            shift, width, round_ % 2, round_ >= 2, round_ == 0
+                        )
             self._sent(0)
             self._sent(1)
             self._finish_tau(bin_only=True)
@@ -2048,7 +2270,11 @@ class IndexSelect:
         """``tau`` / ``p_tie`` / ``own`` per row from the state (``bin_only``:
         the prefix bin's lower bound, no tie position). With resident keys,
         first the HBM keys' copies (the step activity and the attention read
-        them; the next layer's scoring rewrites the chunks)."""
+        them; the next layer's scoring rewrites the chunks). With centres
+        (``self.centres``) each row's next centre: seeded, an active row's
+        ``tau`` with bit 0 set when the window round hit (``tau``'s low 12
+        bits are zero; ``window_start`` drops them); otherwise the row's
+        centre unchanged."""
         if self.resident:
             self._keys_out(start=False)
         refs, topk = self.refs, self.topk
@@ -2067,6 +2293,16 @@ class IndexSelect:
             refs["own"][b] = selected(
                 own_key, self.position_ref[b], tau_b, p_tie_b
             ).astype(jnp.int32)
+            if self.centres is not None:
+                centres_in, centres_out, centre_base = self.centres
+                centre = centres_in[centre_base + b]
+                if self.seeded:
+                    centre = jnp.where(
+                        self.position_ref[b] + 1 > topk,
+                        tau_b | refs["window"][0],
+                        centre,
+                    )
+                centres_out[centre_base + b] = centre
 
 
 def _step_activity(self, span_rows: int, active_ref, steps: int):
@@ -2236,6 +2472,8 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
             if max(digit_widths(batch)) > DIGIT_BITS
             else {}
         ),
+        # Seeded window: 1 when the window round hit (two exchanges).
+        **({"window": pltpu.SMEM((1,), jnp.int32)} if seeded_window(batch) else {}),
     }
 
 
@@ -2289,10 +2527,13 @@ def dsa_select(
     owner_table=None,
     interpret=None,
     axis: str = "tp",
+    centres=None,
 ):
     """``IndexSelect`` as its own kernel (per rank, inside ``shard_map`` over
     ``axis``): ``(tau i32 [B], p_tie i32 [B], own i32 [B], keys i32 [B,
-    key_rows_for(max_local_pages, T), 128])``.
+    key_rows_for(max_local_pages, T), 128])``; with ``centres`` (i32 ``[B]``,
+    ``KernelConfig.dsa_seeded_window``: the rows' window centres, e.g. the
+    previous step's output) the rows' next centres i32 ``[B]`` too.
 
     ``q8`` ``[B, 32, 128]`` fp8-valued index queries, ``w`` f32 ``[B, 32]``
     head weights (incl. the queries' scales, 32^-0.5 and 128^-0.5), ``pool``
@@ -2322,6 +2563,7 @@ def dsa_select(
         owner_table=owner_table,
         interpret=interpret,
         axis=axis,
+        centres=centres,
     )
 
 
@@ -2342,10 +2584,11 @@ def select_call(
     owner_table=None,
     interpret=None,
     axis: str = "tp",
+    centres=None,
 ):
     """``dsa_select``'s kernel on prepared inputs: ``q8`` fp8, ``w_t`` f32
     ``[32, 128]`` (column ``b``: row ``b``'s head weights), ``new_k8`` f32,
-    ``tables`` flat ``[B * pages]``."""
+    ``tables`` flat ``[B * pages]``; ``centres``: as ``dsa_select``'s."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
@@ -2358,21 +2601,19 @@ def select_call(
     key_rows = key_rows_for(max_local_pages, page_tokens)
     scratch = select_scratch(batch, block_shape, key_rows, group, sequence_rows)
     names = list(scratch)
+    seeded = centres is not None
 
-    def kernel(
-        positions_ref,
-        exp_ref,
-        tables_ref,
-        q8_ref,
-        w_t_ref,
-        new_k8_ref,
-        pool_ref,
-        tau_ref,
-        ptie_ref,
-        own_ref,
-        keys_ref,
-        *scratch_refs,
-    ):
+    def kernel(positions_ref, exp_ref, tables_ref, *refs):
+        centres_ref = None
+        if seeded:
+            centres_ref, *refs = refs
+        q8_ref, w_t_ref, new_k8_ref, pool_ref, tau_ref, ptie_ref, own_ref, keys_ref = (
+            refs[:8]
+        )
+        centres_out = None
+        if seeded:
+            centres_out = refs[8]
+        scratch_refs = refs[8 + int(seeded) :]
         rank = jax.lax.axis_index(axis)
         member = rank % group
         owner = (
@@ -2401,6 +2642,7 @@ def select_call(
             topk=topk,
             refs=refs,
             sequence_rows=sequence_rows,
+            centres=(centres_ref, centres_out, 0) if seeded else None,
         )
         select.plan()
         select.in_flight(lambda row: q8_ref[row], w_t_ref, new_k8_ref)
@@ -2421,9 +2663,10 @@ def select_call(
             jax.ShapeDtypeStruct((batch,), jnp.int32),
             jax.ShapeDtypeStruct((batch,), jnp.int32),
             jax.ShapeDtypeStruct((batch, key_rows, LANES), jnp.int32),
+            *((jax.ShapeDtypeStruct((batch,), jnp.int32),) if seeded else ()),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=3 + int(seeded),
             in_specs=[
                 pl.BlockSpec(memory_space=vmem),
                 pl.BlockSpec(memory_space=vmem),
@@ -2435,12 +2678,22 @@ def select_call(
                 pl.BlockSpec(memory_space=pltpu.SMEM),
                 pl.BlockSpec(memory_space=pltpu.SMEM),
                 pl.BlockSpec(memory_space=pl.ANY),
+                *((pl.BlockSpec(memory_space=pltpu.SMEM),) if seeded else ()),
             ],
             scratch_shapes=[scratch[name] for name in names],
         ),
         compiler_params=pltpu.CompilerParams(has_side_effects=True),
         interpret=interpret,
-    )(positions, new_exp, tables, q8, w_t, new_k8, pool)
+    )(
+        positions,
+        new_exp,
+        tables,
+        *((jnp.asarray(centres, jnp.int32),) if seeded else ()),
+        q8,
+        w_t,
+        new_k8,
+        pool,
+    )
 
 
 def _scoped(name, fn):

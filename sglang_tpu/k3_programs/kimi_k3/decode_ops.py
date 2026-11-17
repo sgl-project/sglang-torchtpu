@@ -179,6 +179,10 @@ class DecodeOps:
         self.slots: list[torch.Tensor] = []
         self.unified_pools: list[torch.Tensor] = []  # bound by use_unified_pools
         self.dsa_pools = 0  # Kimi-K3.1: the index-key pools ending unified_pools
+        # Kimi-K3.1, KernelConfig.dsa_seeded_window: the selection's window
+        # centres [1, slots, 24, VERIFY_ROWS] int32 (paged.decode_paged), an
+        # operand and output of every step op after the pools.
+        self.dsa_centres: torch.Tensor | None = None
         self.pool_map: tuple[int, ...] | None = None  # MLA layer -> unified pool index
         # Mesh position -> page owner (vLLM TP rank).
         self.owner_table: tuple[int, ...] | None = None
@@ -268,6 +272,14 @@ class DecodeOps:
             tuple(int(i) for i in pool_map),
         )
         self.dsa_pools = len(index_pools)
+        self.dsa_centres = None
+        if self.dsa_pools and kernel_config.active().dsa_seeded_window:
+            # Any centres give the same selections (only its exchange count
+            # changes), so a slot's new request starts from its last one's.
+            slots = group_slots(self.num_slots, self.attention_dp) * self.attention_dp
+            self.dsa_centres = torch.zeros(
+                (1, slots, self.dsa_pools, self.VERIFY_ROWS), dtype=torch.int32
+            ).to("tpu")
         self.owner_table = (
             None if owner_table is None else tuple(int(i) for i in owner_table)
         )
@@ -286,13 +298,27 @@ class DecodeOps:
             *(self.weights[n] for n in self.names),
             *self.slots,
             *self.unified_pools,
+            *self.centre_operands(),
         )
+
+    def centre_operands(self) -> tuple[torch.Tensor, ...]:
+        """The window centres operand (``dsa_centres``; none when off)."""
+        return () if self.dsa_centres is None else (self.dsa_centres,)
 
     def _adopt(self, conv, recurrent, pools) -> None:
         self.slots = [conv, recurrent]
+        if self.dsa_centres is not None:
+            *pools, self.dsa_centres = pools
         for old, fresh in zip(self.unified_pools, pools, strict=True):
             if fresh is not old:
                 old.set_(fresh)  # keep vLLM's and the connector's tensor identity
+
+    def _step_outputs(self, outputs):
+        """A step body's ``decode_paged`` result -> its pools tuple with the
+        updated centres after them (as ``_adopt`` takes them)."""
+        if self.dsa_centres is None:
+            return outputs[:-1], tuple(outputs[-1])
+        return outputs[:-2], (*outputs[-2], outputs[-1][None])
 
     def _build_plain(
         self, batch: int, control: Any, sub_base: int, sampled: bool, masked: bool
@@ -322,13 +348,15 @@ class DecodeOps:
         options = decode_options(batch)
         pool_map, owner_table = self.pool_map, self.owner_table
         pools = len(self.unified_pools)
+        centres = len(self.centre_operands())
         width = self.VERIFY_ROWS
 
         def body(*args):
             weights = {name: args[i][0] for i, name in enumerate(names)}
             conv, recurrent = args[count][0], args[count + 1][0]
             pool = args[count + 2 : count + 2 + pools]
-            state = args[count + 2 + pools]
+            extra = {"dsa_centres": args[count + 2 + pools][0]} if centres else {}
+            state = args[count + 2 + pools + centres]
             mask = None
             if masked:
                 state, mask = (
@@ -337,7 +365,7 @@ class DecodeOps:
                 )
             slot, token, position, row, plan, tables = control.inputs(state, batch)
             state_slot = control.state_slot(slot, row)
-            logits, conv, recurrent, pool = paged.decode_paged(
+            outputs = paged.decode_paged(
                 weights,
                 conv,
                 recurrent,
@@ -351,8 +379,10 @@ class DecodeOps:
                 dcp_pool_map=pool_map,
                 dcp_owner_table=owner_table,
                 dsa_pools=self.dsa_pools,
+                **extra,
                 **options,
             )
+            (logits, conv, recurrent), pool = self._step_outputs(outputs)
             if masked:
                 logits = sampling.apply_grammar_mask(logits, mask)
             chosen = sampling.greedy(logits)
@@ -371,8 +401,8 @@ class DecodeOps:
             state = control.advance(state, batch, slot, chosen, position + 1, row)
             return (emitted, state, conv[None], recurrent[None], *pool)
 
-        in_specs = (P(AXIS),) * (count + 2 + pools) + (P(),)
-        out_specs = (P(), P(), P(AXIS), P(AXIS)) + (P(AXIS),) * pools
+        in_specs = (P(AXIS),) * (count + 2 + pools + centres) + (P(),)
+        out_specs = (P(), P(), P(AXIS), P(AXIS)) + (P(AXIS),) * (pools + centres)
         name = (
             f"pallas::k3_decode_owned_b{batch}"
             f"{'_sampled' if sampled else ''}{'_masked' if masked else ''}"
@@ -391,6 +421,7 @@ class DecodeOps:
                 sampled,
             )
             + (("masked",) if masked else ())
+            + (("centres",) if centres else ())
         )
         self._ops[key] = register_op(
             name,
@@ -398,7 +429,7 @@ class DecodeOps:
             body,
             in_specs,
             out_specs,
-            donate_argnums=tuple(range(count, count + 2 + pools)),
+            donate_argnums=tuple(range(count, count + 2 + pools + centres)),
             export_key=export_key,
         )
         return self._ops[key]
@@ -605,12 +636,14 @@ class DecodeOps:
         )
         pool_map, owner_table = self.pool_map, self.owner_table
         pools = len(self.unified_pools)
+        centres = len(self.centre_operands())
 
         def body(*args):
             weights = {name: args[i][0] for i, name in enumerate(names)}
             conv, recurrent = args[count][0], args[count + 1][0]
             pool = args[count + 2 : count + 2 + pools]
-            (packet,) = args[count + 2 + pools :]
+            extra = {"dsa_centres": args[count + 2 + pools][0]} if centres else {}
+            (packet,) = args[count + 2 + pools + centres :]
             ids, plan, modes = self._unpack_verify_metadata(packet, control, 1)
             old_conv, old_recurrent = conv, recurrent
             tokens, positions, slots = (
@@ -619,7 +652,7 @@ class DecodeOps:
                 ids[2 * rows : 3 * rows],
             )
             state_row, table = ids[3 * rows], ids[3 * rows + 1 :]
-            logits, aux, conv, recurrent, pool = paged.decode_paged(
+            outputs = paged.decode_paged(
                 weights,
                 conv,
                 recurrent,
@@ -634,8 +667,10 @@ class DecodeOps:
                 dcp_owner_table=owner_table,
                 dsa_pools=self.dsa_pools,
                 state_row=state_row,
+                **extra,
                 **options,
             )
+            (logits, aux, conv, recurrent), pool = self._step_outputs(outputs)
             decisions, conv, recurrent = self._finish_verify(
                 control,
                 old_conv,
@@ -653,8 +688,10 @@ class DecodeOps:
             )
             return (logits[None], aux, decisions, conv[None], recurrent[None], *pool)
 
-        in_specs = (P(AXIS),) * (count + 2 + pools) + (P(),)
-        out_specs = (P(AXIS), P(), P(), P(AXIS), P(AXIS)) + (P(AXIS),) * pools
+        in_specs = (P(AXIS),) * (count + 2 + pools + centres) + (P(),)
+        out_specs = (P(AXIS), P(), P(), P(AXIS), P(AXIS)) + (P(AXIS),) * (
+            pools + centres
+        )
         export_key = repr(
             (
                 "verify",
@@ -667,6 +704,7 @@ class DecodeOps:
                 pool_map,
                 owner_table,
             )
+            + (("centres",) if centres else ())
         )
         self._ops[key] = register_op(
             f"pallas::k3_decode_verify{rows}",
@@ -674,7 +712,7 @@ class DecodeOps:
             body,
             in_specs,
             out_specs,
-            donate_argnums=tuple(range(count, count + 2 + pools)),
+            donate_argnums=tuple(range(count, count + 2 + pools + centres)),
             export_key=export_key,
         )
         return self._ops[key]
@@ -728,6 +766,7 @@ class DecodeOps:
         )
         pool_map, owner_table = self.pool_map, self.owner_table
         pools = len(self.unified_pools)
+        centres = len(self.centre_operands())
         placed = order = None
         if self.attention_dp > 1:
             placed = dp_group_rows(rows, self.attention_dp)
@@ -737,7 +776,8 @@ class DecodeOps:
             weights = {name: args[i][0] for i, name in enumerate(names)}
             conv, recurrent = args[count][0], args[count + 1][0]
             pool = args[count + 2 : count + 2 + pools]
-            (packet,) = args[count + 2 + pools :]
+            extra = {"dsa_centres": args[count + 2 + pools][0]} if centres else {}
+            (packet,) = args[count + 2 + pools + centres :]
             ids, plan, modes = self._unpack_verify_metadata(packet, control, requests)
             old_conv, old_recurrent = conv, recurrent
             tokens, positions, slots = (
@@ -749,7 +789,7 @@ class DecodeOps:
             operands = (tokens, positions, tables, slots)
             if order is not None:
                 operands = tuple(operand[order] for operand in operands)
-            logits, aux, conv, recurrent, pool = paged.decode_paged(
+            outputs = paged.decode_paged(
                 weights,
                 conv,
                 recurrent,
@@ -760,8 +800,10 @@ class DecodeOps:
                 dcp_pool_map=pool_map,
                 dcp_owner_table=owner_table,
                 dsa_pools=self.dsa_pools,
+                **extra,
                 **options,
             )
+            (logits, aux, conv, recurrent), pool = self._step_outputs(outputs)
             if placed is not None:
                 logits, aux = logits[placed], aux[:, placed]
             decisions, conv, recurrent = self._finish_verify(
@@ -781,8 +823,10 @@ class DecodeOps:
             )
             return (logits[None], aux, decisions, conv[None], recurrent[None], *pool)
 
-        in_specs = (P(AXIS),) * (count + 2 + pools) + (P(),)
-        out_specs = (P(AXIS), P(), P(), P(AXIS), P(AXIS)) + (P(AXIS),) * pools
+        in_specs = (P(AXIS),) * (count + 2 + pools + centres) + (P(),)
+        out_specs = (P(AXIS), P(), P(), P(AXIS), P(AXIS)) + (P(AXIS),) * (
+            pools + centres
+        )
         export_key = repr(
             (
                 "verify_batched",
@@ -796,6 +840,7 @@ class DecodeOps:
                 pool_map,
                 owner_table,
             )
+            + (("centres",) if centres else ())
         )
         self._ops[key] = register_op(
             f"pallas::k3_decode_verify{requests}x{rows_per}",
@@ -803,7 +848,7 @@ class DecodeOps:
             body,
             in_specs,
             out_specs,
-            donate_argnums=tuple(range(count, count + 2 + pools)),
+            donate_argnums=tuple(range(count, count + 2 + pools + centres)),
             export_key=export_key,
         )
         return self._ops[key]

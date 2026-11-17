@@ -220,7 +220,9 @@ class DecodeIndexer:
     ``pools`` are the 24 index-key pools (picked by the traced ``layer``);
     ``keys`` the HBM keys scratch ``[B, key_rows, 128]`` int32 and
     ``records_out`` the HBM record handoff ``[B, 24, 2, 128]`` int32 (kernel
-    outputs); ``persistent`` / ``scoped`` the scratch above."""
+    outputs); ``persistent`` / ``scoped`` the scratch above. ``centres``
+    (``KernelConfig.dsa_seeded_window``): SMEM ``(in, out)`` refs of the
+    rows' window centres, MLA layer ``m``'s row ``b`` at ``m * B + b``."""
 
     weights: dict
     pools: tuple
@@ -232,6 +234,7 @@ class DecodeIndexer:
     topk: int = 2048
     eps: float = 1e-5
     sequence_rows: int = 1
+    centres: tuple | None = None
 
     def _plan(self):
         """The weight stream: ``(family, row chunk, head)`` in consumption
@@ -370,6 +373,11 @@ class DecodeIndexer:
             sequence_rows=self.sequence_rows,
             global_pages=cache.global_pages,
             table_row=cache.table_row,
+            centres=(
+                (*self.centres, self.layer * batch)
+                if self.centres is not None
+                else None
+            ),
         )
 
     def dense_attention(self, cache, position_ref, batch):
