@@ -149,18 +149,18 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
 
     def init_forward_metadata(self, forward_batch):
         cp_layout = get_tpu_cp_layout(forward_batch)
-        if cp_layout is not None and cp_layout.host.ring is not None:
-            from sglang_tpu.attention_pallas_rpa_pcp import check_pcp_ring_schedule
+        if cp_layout is not None: 
+            if cp_layout.host.ring is not None:
+                from sglang_tpu.attention_pallas_rpa_pcp import check_pcp_ring_schedule
 
-            # The fused ring kernel schedules its two phases itself.
-            check_pcp_ring_schedule(self._cp_schedule_runner, self, cp_layout.host)
-        elif cp_layout is not None:
-            from sglang_tpu.pp_attention_capacity import (
-                check_cp_schedule,
-            )
+                check_pcp_ring_schedule(self._cp_schedule_runner, self, cp_layout.host)
+            else:
+                from sglang_tpu.pp_attention_capacity import (
+                    check_cp_schedule,
+                )
 
-            # The kernel runs the context-parallel rows, not the global lengths.
-            check_cp_schedule(self._cp_schedule_runner, self, cp_layout.host)
+                # The kernel runs the context-parallel rows, not the global lengths.
+                check_cp_schedule(self._cp_schedule_runner, self, cp_layout.host)
         elif self._pp_schedule_runner is not None:
             from sglang_tpu.pp_attention_capacity import (
                 check_batch_schedule,
