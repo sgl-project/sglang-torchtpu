@@ -380,6 +380,7 @@ def _route_hidden_states(
     wait_for_projection_half=None,
     steal_planner=None,
     presorted=False,
+    routing_scale_ref=None,
 ):
     """Project and select local expert routes through one shared B1/B2 path.
 
@@ -402,6 +403,10 @@ def _route_hidden_states(
     top-k. With ``steal_planner`` the planner takes the winners and a
     function is returned that sums the probabilities (the argmax loop's sums
     in its order), gives them to the planner and returns the totals.
+
+    ``routing_scale_ref`` (KernelConfig.decode_router_fp8: an FP8 router
+    projection) holds the [1, 896] FP32 expert scales; they multiply the
+    FP32 products before the sigmoid.
     """
     rank = jax.lax.axis_index("tp")
     batch_size = hidden_states.shape[0]
@@ -424,6 +429,8 @@ def _route_hidden_states(
     )
 
     raw_scores = routing_scores_vmem[:, :expert_count]
+    if routing_scale_ref is not None:
+        raw_scores = raw_scores * routing_scale_ref[...]
     uncorrected_probabilities = jax.nn.sigmoid(raw_scores)
     routing_scores_vmem[:, :expert_count] = (
         uncorrected_probabilities + routing_bias_ref[...]
@@ -3325,6 +3332,9 @@ class MixtureOfExpertsWeights:
     expert_down_scales: TensorLike
     expert_down_scales_vmem: Any  # [4, ...]
     expert_copy_semaphores: Any  # [4, 4]
+    # FP8 routing_projection (KernelConfig.decode_router_fp8): its [1, 896]
+    # FP32 expert scales in VMEM.
+    routing_scale: Any = None
 
     def _copy_routing_projection(
         self,
@@ -3348,7 +3358,7 @@ class MixtureOfExpertsWeights:
             if not wait and initialize_padding:
                 self.routing_projection_vmem[0, :, 384:] = jnp.zeros(
                     (self.routing_projection.shape[0], 128),
-                    jnp.bfloat16,
+                    self.routing_projection_vmem.dtype,
                 )
             copy = tpu.make_async_copy(
                 self.routing_projection.at[:, pl.ds(512, 384)],
@@ -4222,6 +4232,19 @@ def moe(
         raise ValueError("MoE routing projection workspace has the wrong shape")
     if router_slots == 2 and owned_hidden_ref is not None:
         raise ValueError("Sharded routing projects one router half a rank")
+    # KernelConfig.decode_router_fp8: an FP8 router with its expert scales
+    # (the replicated top-k, _route_hidden_states).
+    router_fp8 = weights.routing_projection.dtype == jnp.float8_e4m3fn
+    if (
+        weights.routing_projection_vmem.dtype != weights.routing_projection.dtype
+        or router_fp8 != (weights.routing_scale is not None)
+        or (router_fp8 and weights.routing_scale.shape != (1, expert_count))
+        or (router_fp8 and owned_hidden_ref is not None)
+    ):
+        raise ValueError(
+            "The router workspace takes the router's dtype; an FP8 router takes "
+            "its [1, experts] scales and the replicated top-k"
+        )
 
     def slot_shape(stored, axis):
         shape = list(stored.shape[1:])
@@ -4635,6 +4658,7 @@ def moe(
                 ),
                 steal_planner=planner,
                 presorted=presorted_routing,
+                routing_scale_ref=weights.routing_scale,
             )
             if presorted_routing:
                 # Plan, start the copies and the schedule with one batch of
@@ -4704,6 +4728,7 @@ def moe(
                         else None
                     ),
                     presorted=presorted_routing,
+                    routing_scale_ref=weights.routing_scale,
                 )
             )
         if half_experts:
@@ -8419,7 +8444,7 @@ def _router_copy(weight, buffer, sems, wait, *, initialize_padding=True):
     @pl.when(lane == 1)
     def tail():
         if not wait and initialize_padding:
-            buffer[0, :, 384:] = jnp.zeros((weight.shape[0], 128), jnp.bfloat16)
+            buffer[0, :, 384:] = jnp.zeros((weight.shape[0], 128), buffer.dtype)
         copy = tpu.make_async_copy(
             weight.at[:, pl.ds(512, 384)], buffer.at[0, :, :384], sems.at[0]
         )
@@ -8782,6 +8807,9 @@ MLA = ("m_qa", "m_ka", "m_qb", "m_kb", "m_gate", "m_o", "m_qnorm", "m_knorm")
 # FP8 KDA input and output projections (KernelConfig.kda_fp8_projections):
 # their FP32 column scales, [layers, 1, columns] decode weight families.
 KDA_FP8_SCALES = ("k_projection_scale", "k_o_scale")
+# FP8 MoE router (KernelConfig.decode_router_fp8): its FP32 expert scales, a
+# [layers - 1, 1, 896] decode weight family.
+ROUTER_FP8_SCALES = ("router_scale",)
 NORMS = ("attn_res", "mlp_res", "attn_norm", "ffn_norm")
 EPILOGUE = ("output_res", "final_norm")
 DENSE = (
@@ -9484,7 +9512,12 @@ def stack(
     # (rank_loader.kda_fp8_families).
     kda_fp8 = weights["k_projection"].dtype == jnp.float8_e4m3fn
     kda_scale_names = KDA_FP8_SCALES if kda_fp8 else ()
-    layer_names = NAMES + dsa_names + kda_scale_names
+    # FP8 MoE router with its expert scales (rank_loader.router_fp8_families):
+    # its VMEM slots take its dtype; the scales follow the router bias.
+    router_fp8 = weights["router"].dtype == jnp.float8_e4m3fn
+    router_scale_names = ROUTER_FP8_SCALES if router_fp8 else ()
+    router_dtype = jnp.dtype(weights["router"].dtype)
+    layer_names = NAMES + dsa_names + kda_scale_names + router_scale_names
     if kda_fp8 and (
         weights["k_o"].dtype != jnp.float8_e4m3fn
         or any(name not in weights for name in KDA_FP8_SCALES)
@@ -9493,6 +9526,13 @@ def stack(
         raise ValueError(
             "FP8 KDA projections take FP8 k_projection and k_o with their column "
             "scales, without attention DP"
+        )
+    if router_fp8 and (
+        any(name not in weights for name in ROUTER_FP8_SCALES) or attention_dp != 1
+    ):
+        raise ValueError(
+            "An FP8 router takes its expert scales (router_scale), without "
+            "attention DP"
         )
     # Copy-free KDA rows and FP32 norm stacks (KernelConfig.
     # decode_copy_free_weights): the final norm lands in the attention norm's
@@ -10083,6 +10123,8 @@ def stack(
             common = common[len(STEAL_PERSISTENT_NAMES) :]
         kda_scale_vmem = tuple(common[: len(kda_scale_names)])
         common = common[len(kda_scale_names) :]
+        router_scale_vmem = common[0] if router_fp8 else None
+        common = common[len(router_scale_names) :]
         # FP8 KDA projections: the layer's column scales (aux semaphores 6, 7).
         kda_scale_slots = tuple(
             (name, vmem, slot)
@@ -10213,17 +10255,13 @@ def stack(
         )
 
         def arena_router(offset):
-            return pool.view(
-                offset, (router_slots, hidden_size, 512), jnp.dtype(jnp.bfloat16)
-            )
+            return pool.view(offset, (router_slots, hidden_size, 512), router_dtype)
 
         def request_router(index, predicate=None):
             """Queue layer ``index``'s router copy into the arena."""
             pool.request(
                 "router",
-                pool_alias.storage_size(
-                    (router_slots, hidden_size, 512), jnp.dtype(jnp.bfloat16)
-                ),
+                pool_alias.storage_size((router_slots, hidden_size, 512), router_dtype),
                 lambda offset, index: _router_copy(
                     layer_weights["router"].at[index - 1],
                     arena_router(offset),
@@ -10259,6 +10297,15 @@ def stack(
             routing_biases_vmem,
             latent_norms_vmem,
         )
+
+        def router_scale_copy(index, buffer_slot):
+            """MoE layer ``index``'s FP8 router scales into their buffer slot
+            (KernelConfig.decode_router_fp8; metadata semaphore 4)."""
+            return tpu.make_async_copy(
+                layer_weights["router_scale"].at[index - 1],
+                router_scale_vmem.at[buffer_slot],
+                metadata_semaphores.at[buffer_slot, 4],
+            )
 
         collectives32.barrier()
         communication_workspace.reduction_phase[0] = 0
@@ -10953,6 +11000,8 @@ def stack(
                     metadata_vmem[slot].at[buffer_slot],
                     metadata_semaphores.at[buffer_slot, slot],
                 ).start()
+            if router_fp8:
+                router_scale_copy(index, buffer_slot).start()
 
         def prefetch_router(index, *, initialize_padding=False):
             if pool_managed:
@@ -10976,7 +11025,7 @@ def stack(
                 @pl.when(jax.lax.axis_index("tp") % 2 == 1)
                 def initialize_router_padding():
                     router_vmem[0, :, 384:] = jnp.zeros(
-                        (router_vmem.shape[1], 128), jnp.bfloat16
+                        (router_vmem.shape[1], 128), router_vmem.dtype
                     )
         else:
             prefetch_router(jnp.int32(1), initialize_padding=True)
@@ -12251,6 +12300,11 @@ def stack(
                         latent_norm_vmem,
                         metadata_semaphores.at[buffer_slot, 3],
                     ),
+                    *(
+                        (router_scale_copy(layer_index, buffer_slot),)
+                        if router_fp8
+                        else ()
+                    ),
                 )
                 for copy in metadata_copies:
                     copy.wait()
@@ -12364,6 +12418,9 @@ def stack(
                         layer_weights["expert_ds"].at[layer_index - 1],
                         down_scales_vmem,
                         expert_semaphores,
+                        routing_scale=(
+                            router_scale_vmem.at[buffer_slot] if router_fp8 else None
+                        ),
                     ),
                     workspace=moe_workspace,
                     communication_workspace=communication_workspace,
@@ -13004,7 +13061,11 @@ def stack(
         ),
         *(tpu.VMEM((1, hidden_size), weights[name].dtype) for name in NORMS),
         # With the router in the arena this persistent slot is a stub.
-        tpu.VMEM((8, 128) if pool_managed else (1, hidden_size, 512), jnp.bfloat16),
+        (
+            tpu.VMEM((8, 128), jnp.bfloat16)
+            if pool_managed
+            else tpu.VMEM((1, hidden_size, 512), router_dtype)
+        ),
         tpu.SemaphoreType.DMA((2,)),
         tpu.VMEM((pool_bytes // 128, 128), jnp.uint8),
         tpu.SemaphoreType.DMA((6,)),
@@ -13031,7 +13092,9 @@ def stack(
             tpu.VMEM((2, *local_weights[name].shape), local_weights[name].dtype)
             for name in ("m_qnorm", "m_knorm", "router_bias", "latent_norm")
         ),
-        tpu.SemaphoreType.DMA((2, 4)),
+        # MLA norms (0, 1), router bias (2), latent norm (3), FP8 router
+        # scales (4).
+        tpu.SemaphoreType.DMA((2, 4 + len(router_scale_names))),
         tpu.VMEM(
             (owned_rows, hidden_size) if attention_token_scatter else (1,),
             jnp.bfloat16,
@@ -13068,6 +13131,11 @@ def stack(
         *(
             tpu.VMEM(local_weights[name].shape, local_weights[name].dtype)
             for name in kda_scale_names
+        ),
+        # The FP8 router's expert scales (two MoE layers', as the router bias).
+        *(
+            tpu.VMEM((2, *local_weights[name].shape), local_weights[name].dtype)
+            for name in router_scale_names
         ),
         *communication_scratch(batch_size, attention_dp)[:-1],
         tpu.VMEM((batch_size, 4096), jnp.bfloat16),
@@ -13130,6 +13198,7 @@ def stack(
         *(dsa_decode.PERSISTENT_NAMES if dsa else ()),
         *(STEAL_PERSISTENT_NAMES if steal_slots else ()),
         *kda_scale_names,
+        *router_scale_names,
         "shared_local_reduction",
         "expert_local_reduction",
         "shared_host_reduction",
@@ -13345,7 +13414,7 @@ def stack(
         # once the experts finish) fit without waiting for a release.
         # TODO: derive the demand from a dry-run trace of the requests.
         demand = pool_layout["attention_bytes"] + pool_alias.storage_size(
-            (router_slots, hidden_size, 512), jnp.dtype(jnp.bfloat16)
+            (router_slots, hidden_size, 512), router_dtype
         )
         shortfall = max(0, -(-(demand - pool_layout["arena_bytes"]) // 4096) * 4096)
         available = (
