@@ -1906,12 +1906,15 @@ def _run_routed_expert_stream(
         expert_schedule.copy.wait()
         schedule = expert_schedule.table
         pair_count = (schedule[SCHEDULE_EXPERT_COUNT, 0] + 1) // 2
+        if stolen is not None:
+            # The schedule was built with first_stolen (SCHEDULE_OWN_COUNT).
+            own = schedule[SCHEDULE_OWN_COUNT, 0]
+            moved = schedule[SCHEDULE_EXPERT_COUNT, 0] - own
+            stolen_here = moved > 0
         if stolen is not None and stolen.timing is not None:
             # The stolen experts run just before the last own pair when that
             # pair starts past the initial copies and the timing model has
             # their slabs landed by then: their returns cross while it runs.
-            own = schedule[SCHEDULE_OWN_COUNT, 0]
-            moved = schedule[SCHEDULE_EXPERT_COUNT, 0] - own
             slab, lead, copy, _ = stolen.timing
             first_moved = own - 2
             hoist = (
@@ -1922,10 +1925,10 @@ def _run_routed_expert_stream(
 
             def column(position):
                 early = hoist & (position >= first_moved)
-                stolen_here = early & (position < first_moved + moved)
-                own_after = early & ~stolen_here & (position < own + moved)
+                stolen_block = early & (position < first_moved + moved)
+                own_after = early & ~stolen_block & (position < own + moved)
                 return jnp.where(
-                    stolen_here,
+                    stolen_block,
                     position + 2,
                     jnp.where(own_after, position - moved, position),
                 )
@@ -2088,7 +2091,7 @@ def _run_routed_expert_stream(
                     # have landed. Schedule position p uses slot p % 4.
                     @pl.loop(
                         jnp.where(iteration == 0, 0, 2 * iteration),
-                        2 * iteration + 4,
+                        jnp.where(stolen_here, 2 * iteration + 4, 0),
                     )
                     def start_stolen(position):
                         expert, has_expert, _ = scheduled_expert(position)
@@ -2564,7 +2567,9 @@ def _run_routed_expert_stream(
 
                 if stolen is not None:
                     # This pair's stolen experts are done: return them now.
-                    @pl.loop(2 * iteration, 2 * iteration + 2)
+                    @pl.loop(
+                        2 * iteration, jnp.where(stolen_here, 2 * iteration + 2, 0)
+                    )
                     def return_stolen(position):
                         expert, has_expert, _ = scheduled_expert(position)
 
