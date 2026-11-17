@@ -183,7 +183,9 @@ def _store_step(
     # below checks them against these specs, so a buffer with the wrong shape
     # or dtype fails here instead of being written with a wrong layout.
     num_pages, page_size = cache_nope.shape[:2]
-    nope_spec, rope_spec = _split_specs(num_pages, page_size, cache_layout_of(cache_nope))
+    nope_spec, rope_spec = _split_specs(
+        num_pages, page_size, cache_layout_of(cache_nope)
+    )
     # A batch is padded to a fixed number of rows. A padded row still carries
     # one query token, but it is not a real request, so its token must not be
     # stored. distribution[2] is the number of real requests; clipping
