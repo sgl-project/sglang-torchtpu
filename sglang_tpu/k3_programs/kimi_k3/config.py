@@ -124,6 +124,30 @@ class KernelConfig:
     # index keys in one kernel (paged._commit_dsa_rows_fused) instead of the
     # latent commit kernel and 48 XLA scatters.
     dsa_fused_commit: bool = False
+    # Kimi-K3.1 decode selection scoring loop: slots of the key stage ring
+    # (each index page's keys reach the HBM keys scratch through it; a slot's
+    # copy is waited this many pages after it starts, so two leave one page
+    # step for a copy's latency).
+    dsa_stage_slots: int = 2
+    # Kimi-K3.1 decode selection scoring loop, selections of up to 8 rows:
+    # index pages in flight (0: dsa_dcp.PAGE_SLOTS). The ring's first copies
+    # start from a loop (one copy of the issue code whatever the depth).
+    dsa_page_slots: int = 0
+    # Kimi-K3.1 decode selection, up to 8 rows whose keys fit the count
+    # passes' two resident chunks: the scoring loop writes each page's keys
+    # straight into that buffer (no stage ring and no copy a page); the count
+    # passes read them in place (the first pass copies nothing back from
+    # HBM) and the HBM keys scratch is filled by one copy a row, in flight
+    # under the exchange rounds. The same keys and thresholds.
+    dsa_resident_keys: bool = False
+    # Kimi-K3.1 decode selection scoring loop: score the in-flight tokens on
+    # a page in one loop over the sequence's tokens (a row's update a step)
+    # instead of a branch per (row, token): the same keys in less code.
+    dsa_patch_loop: bool = False
+    # Kimi-K3.1 decode indexer: plan the selection's steps and start the
+    # scoring ring's first index-page copies while the index query/key gather
+    # is in flight (neither needs the gathered queries) instead of after it.
+    dsa_early_plan: bool = False
     # MLA DCP combine of unchunked one-group calls with three heads a rank
     # (B1, B4, B8 and the 8-row verifies) in two stages: the chip's two
     # cores (members 2k, 2k + 1) first merge their partials on-chip, each

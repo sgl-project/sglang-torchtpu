@@ -191,11 +191,67 @@ def chunk_rows(batch: int, sequence_rows: int = 1) -> int:
 
 def ring_slots(batch: int) -> tuple[int, int]:
     """(page ring, key ring) depths of a ``batch``-row selection."""
-    return (
-        (PAGE_SLOTS, KEY_SLOTS)
-        if batch < WIDE_BATCH
-        else (min(PAGE_SLOTS, 3), min(KEY_SLOTS, 4))
-    )
+    if batch >= WIDE_BATCH:
+        return min(PAGE_SLOTS, 3), min(KEY_SLOTS, 4)
+    return deep_page_slots(batch) or PAGE_SLOTS, KEY_SLOTS
+
+
+# Selections up to this many rows may take a deeper page ring
+# (KernelConfig.dsa_page_slots): their decode VMEM has room for it.
+DEEP_PAGE_MAX_BATCH = 8
+
+
+def deep_page_slots(batch: int) -> int:
+    """``KernelConfig.dsa_page_slots`` where it applies (``batch`` up to
+    ``DEEP_PAGE_MAX_BATCH`` rows), else 0."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    slots = active().dsa_page_slots
+    if slots and slots < 2:
+        raise ValueError("dsa_page_slots is 0 (the default ring) or at least 2")
+    return slots if batch <= DEEP_PAGE_MAX_BATCH else 0
+
+
+def stage_slots() -> int:
+    """Slots of the scoring loop's key stage ring (``KernelConfig.dsa_stage_slots``)."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    slots = active().dsa_stage_slots
+    if slots < 2:
+        raise ValueError("dsa_stage_slots is at least 2")
+    return slots
+
+
+# The resident-keys scoring (KernelConfig.dsa_resident_keys) holds one group
+# of rows: selections of up to 8.
+RESIDENT_MAX_BATCH = 8
+
+
+def resident_keys(batch: int, key_rows: int, sequence_rows: int = 1) -> bool:
+    """Whether a selection's scoring writes its keys straight into the count
+    passes' chunks (``KernelConfig.dsa_resident_keys``): up to
+    ``RESIDENT_MAX_BATCH`` rows whose key rows fit the buffer's two chunks
+    (then every count pass reads them in place)."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    if not active().dsa_resident_keys or batch > RESIDENT_MAX_BATCH:
+        return False
+    chunk = min(chunk_rows(batch, sequence_rows), key_rows)
+    return batch < WIDE_CHUNK_BATCH and key_rows <= 2 * chunk
+
+
+def patch_loop() -> bool:
+    """``KernelConfig.dsa_patch_loop``."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    return bool(active().dsa_patch_loop)
+
+
+def early_plan() -> bool:
+    """``KernelConfig.dsa_early_plan``."""
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    return bool(active().dsa_early_plan)
 
 
 COUNT_ROWS = 16  # candidate sublanes of the count exchange
@@ -426,6 +482,14 @@ class IndexSelect:
             raise ValueError(
                 "index selection: batch <= 128, key rows in whole vregs, whole sequences"
             )
+        self.stage_slots = refs["stage"].shape[0]
+        # KernelConfig.dsa_resident_keys: the scoring writes key row j of row
+        # r into the count chunks, slot j >= gchunk at r * gchunk + j - its
+        # chunk's first row (the count passes' _group_copy layout).
+        self.resident = self.grouped and resident_keys(
+            batch, self.key_rows, sequence_rows
+        )
+        self.second_start = min(self.gchunk, self.key_rows - self.gchunk)
 
     # ------------------------------------------------------------------ plan
     def plan(self):
@@ -596,14 +660,32 @@ class IndexSelect:
             self.refs["stage_sems"].at[slot],
         )
 
-    def score(self, query, w_t_ref, query_rows=None):
+    def start_pages(self):
+        """The scoring ring's first index-page copies (after ``plan``; they
+        need neither the queries nor the in-flight keys)."""
+        total = self.refs["page_starts"][self.batch // self.S]
+        if deep_page_slots(self.batch):
+            # The ring's first copies from one loop (the issue code once).
+            def first_copies(step, carry):
+                self._page_copy(step)
+                return carry
+
+            jax.lax.fori_loop(
+                0, jnp.minimum(total, self.page_slots - 1), first_copies, 0
+            )
+        else:
+            for step in range(self.page_slots - 1):
+                pl_when(step < total)(lambda step=step: self._page_copy(step))
+
+    def score(self, query, w_t_ref, query_rows=None, pages_started=False):
         """``query(row)``: the row's fp8 ``[32, 128]`` index query heads
         (``row`` traced or not); ``query_rows(first)``: the ``S`` rows of the
         sequence starting at row ``first`` as one ``[S * 32, 128]`` block
         (default: ``query``'s, concatenated); ``w_t_ref`` f32 ``[32, 128]``
         head weights (column ``b``: row ``b``); after ``in_flight``. A
         sequence's rows share its pages: each page is copied and scored once
-        for all of them (one ``[S * 32, 128] x [128, 128]`` product a subpage)."""
+        for all of them (one ``[S * 32, 128] x [128, 128]`` product a subpage).
+        ``pages_started``: ``start_pages`` already ran."""
         refs, T, S = self.refs, self.T, self.S
         sequences = self.batch // S
         if query_rows is None:
@@ -614,19 +696,45 @@ class IndexSelect:
                 return query(first)
 
         total = refs["page_starts"][sequences]
-        for step in range(self.page_slots - 1):
-            pl_when(step < total)(lambda step=step: self._page_copy(step))
+        stages, resident = self.stage_slots, self.resident
+        if not pages_started:
+            self.start_pages()
         lane_row = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
 
         def page_step(step, carry):
             seq, local = refs["page_seq"][step], refs["page_local"][step]
             first_row = seq * S
-            slot, stage = step % self.page_slots, step % 2
+            slot, stage = step % self.page_slots, step % stages
             self._wait_page(step)
             pl_when(step + self.page_slots - 1 < total)(
                 lambda: self._page_copy(step + self.page_slots - 1)
             )
-            pl_when(step >= 2)(lambda: self._stage_copy(stage).wait())
+            if resident:
+                # The page's key rows j0 .. in the count chunks (row r of the
+                # sequence at base + r * gchunk); no stage ring.
+                gchunk, j0 = self.gchunk, local * self.subpages
+                if self.key_rows > gchunk:
+                    second = (j0 >= gchunk).astype(jnp.int32)
+                    held = refs["group_buf"].at[second]
+                    base = first_row * gchunk + j0 - second * self.second_start
+                else:
+                    held, base = refs["group_buf"].at[0], first_row * gchunk + j0
+
+                def put(r, sub, key):
+                    held[pl_ds(base + r * gchunk + sub, 1), :] = key
+
+                def get(r, sub):
+                    return held[pl_ds(base + r * gchunk + sub, 1), :]
+
+            else:
+                pl_when(step >= stages)(lambda: self._stage_copy(stage).wait())
+
+                def put(r, sub, key):
+                    refs["stage"][stage, r, pl_ds(sub, 1), :] = key
+
+                def get(r, sub):
+                    return refs["stage"][stage, r, pl_ds(sub, 1), :]
+
             q = query_rows(first_row)  # [S * 32, 128] fp8
             if S > 1:
                 # The rows' head weights, lane-broadcast once a sequence (its
@@ -702,7 +810,7 @@ class IndexSelect:
                         key = jnp.where(
                             position < limits[r], _monotone(piece * scales[i]), INT_MIN
                         )
-                        refs["stage"][stage, r, pl_ds(sp, 1), :] = key
+                        put(r, sp, key)
 
             # The sequence's in-flight tokens span at most two pages: one test
             # skips every row's patch on the others.
@@ -711,22 +819,72 @@ class IndexSelect:
                 & (self.position_ref[first_row + S - 1] >= first)
             )
             def patch_rows():
+                if patch_loop():
+                    self._patch_tokens(first_row, first, get, put)
+                    return
                 for r in range(S):
-                    self._patch_in_flight(first_row + r, stage, first, r)
+                    self._patch_in_flight(first_row + r, first, r, get, put)
 
-            self._stage_copy(stage, first_row, local).start()
+            if not resident:
+                self._stage_copy(stage, first_row, local).start()
             return carry
 
         jax.lax.fori_loop(0, total, page_step, 0)
+        if resident:
+            self._keys_out(start=True)
+            return
+        if stages > 2:
+
+            def drain(step, carry):
+                self._stage_copy(step % stages).wait()
+                return carry
+
+            jax.lax.fori_loop(jnp.maximum(total - stages, 0), total, drain, 0)
+            return
         for back in (1, 2):
             pl_when(total >= back)(
                 lambda back=back: self._stage_copy((total - back) % 2).wait()
             )
 
-    def _patch_in_flight(self, row, stage, first, stage_row=0):
+    def _keys_out(self, start):
+        """The resident chunks into the HBM keys scratch (``start``: start the
+        copies, else wait for them), one copy a row and chunk: slot 0 holds key
+        rows ``0 .. gchunk - 1``; slot 1, when a row has more, rows ``gchunk ..
+        key_rows - 1`` at its last ``second_start`` rows."""
+        from jax.experimental.pallas import tpu as pltpu
+
+        refs, chunk, rows = self.refs, self.gchunk, self.second_start
+        held, sems = refs["group_buf"], refs["group_sems"]
+        if not start:
+            first = held.at[0, pl_ds(0, self.batch * chunk)]
+            pltpu.make_async_copy(first, first, sems.at[0]).wait()
+            if self.key_rows > chunk:
+                rest = held.at[1, pl_ds(0, self.batch * rows)]
+                pl_when(refs["group_rows"][0] > chunk)(
+                    lambda: pltpu.make_async_copy(rest, rest, sems.at[1]).wait()
+                )
+            return
+        for r in range(self.batch):
+            pltpu.make_async_copy(
+                held.at[0, pl_ds(r * chunk, chunk)],
+                refs["keys"].at[r, pl_ds(0, chunk)],
+                sems.at[0],
+            ).start()
+        if self.key_rows > chunk:
+
+            @pl_when(refs["group_rows"][0] > chunk)
+            def rest():
+                for r in range(self.batch):
+                    pltpu.make_async_copy(
+                        held.at[1, pl_ds(r * chunk + chunk - rows, rows)],
+                        refs["keys"].at[r, pl_ds(chunk, rows)],
+                        sems.at[1],
+                    ).start()
+
+    def _patch_in_flight(self, row, first, stage_row, get, put):
         """Keys of the row's sequence's in-flight tokens (up to its own) that
-        fall on this page, from ``refs["in_flight"]`` (into the stage's
-        ``stage_row``)."""
+        fall on this page, from ``refs["in_flight"]`` (``get(stage_row, sub)``
+        / ``put(stage_row, sub, key)``: the page's key row ``sub`` of the row)."""
         refs, S = self.refs, self.S
         seq_first = row - row % S if S > 1 else row
         lane_row = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
@@ -743,12 +901,44 @@ class IndexSelect:
                 def one(n=n, position=position):
                     key = jnp.full((1, LANES), _row_scalar(table, n), jnp.int32)
                     offset = position - lo
-                    at = pl_ds(offset // INDEX_SUBPAGE_TOKENS, 1)
-                    refs["stage"][stage, stage_row, at, :] = jnp.where(
-                        lane_row == offset % INDEX_SUBPAGE_TOKENS,
-                        key,
-                        refs["stage"][stage, stage_row, at, :],
+                    sub = offset // INDEX_SUBPAGE_TOKENS
+                    put(
+                        stage_row,
+                        sub,
+                        jnp.where(
+                            lane_row == offset % INDEX_SUBPAGE_TOKENS,
+                            key,
+                            get(stage_row, sub),
+                        ),
                     )
+
+    def _patch_tokens(self, first_row, first, get, put):
+        """``_patch_in_flight`` for every row of the sequence starting at
+        ``first_row`` in one loop over its in-flight tokens
+        (``KernelConfig.dsa_patch_loop``): token ``n`` on this page updates
+        rows ``n ..`` (each row's tokens in the same order, so the same keys)."""
+        refs, S = self.refs, self.S
+        lane = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
+
+        def token(n, carry):
+            position = self.position_ref[first_row + n]
+
+            @pl_when((position >= first) & (position < first + self.T))
+            def on_page():
+                offset = position - first
+                sub = offset // INDEX_SUBPAGE_TOKENS
+                hit = lane == offset % INDEX_SUBPAGE_TOKENS
+                for r in range(S):
+                    table = refs["in_flight"][pl_ds(first_row + r, 1), :]
+                    key = jnp.broadcast_to(
+                        jnp.sum(jnp.where(lane == n, table, 0), axis=1, keepdims=True),
+                        (1, LANES),
+                    )  # row r's key of token n
+                    put(r, sub, jnp.where(hit & (n <= r), key, get(r, sub)))
+
+            return carry
+
+        jax.lax.fori_loop(0, S, token, 0)
 
     # ------------------------------------------------------------------ selection
     def _chunk_copy(self, step):
@@ -885,6 +1075,14 @@ class IndexSelect:
         jax.lax.fori_loop(0, total, step_fn, zeros)
         return refs["local"][...]
 
+    def _group_loads(self, first, total):
+        """Whether a grouped pass copies its chunks: the selection's first pass
+        (unless the scoring left them resident: ``self.resident``); later
+        passes only when the group steps outnumber the buffer's two slots."""
+        if self.resident:
+            return False
+        return True if first else total > 2
+
     def _group_copy(self, step):
         """Group step ``step``'s chunk of its rows' keys into slot ``step % 2``
         (row ``r`` at slot rows ``[r * chunk, (r + 1) * chunk)``)."""
@@ -921,8 +1119,9 @@ class IndexSelect:
         refs, chunk, batch = self.refs, self.gchunk, self.batch
         total = refs["gstep_starts"][self.groups]
         refs["local"][...] = jnp.zeros((COUNT_ROWS, LANES), jnp.int32)
-        load = True if first else total > 2
-        pl_when(load & (total > 0))(lambda: self._group_copy(0))
+        load = self._group_loads(first, total)
+        if load is not False:
+            pl_when(load & (total > 0))(lambda: self._group_copy(0))
         col = jax.lax.broadcasted_iota(jnp.int32, (8, 1), 0)
         sub8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 0)
         lane8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 1)
@@ -947,8 +1146,9 @@ class IndexSelect:
 
         def step_fn(step, bins):
             g, local = refs["gstep_group"][step], refs["gstep_local"][step]
-            pl_when(load)(lambda: self._group_wait(step))
-            pl_when(load & (step + 1 < total))(lambda: self._group_copy(step + 1))
+            if load is not False:
+                pl_when(load)(lambda: self._group_wait(step))
+                pl_when(load & (step + 1 < total))(lambda: self._group_copy(step + 1))
             start = jnp.minimum(local * chunk, self.key_rows - chunk)
             bins = [jnp.where(local == 0, 0, a) for a in bins]
             rows = [jnp.minimum(8 * g + r, batch - 1) for r in range(8)]
@@ -1288,8 +1488,9 @@ class IndexSelect:
         local = refs["wide_local"].at[pl.ds(0, rows)]
         local[...] = jnp.zeros((rows, LANES), jnp.int32)
         total = refs["gstep_starts"][self.groups]
-        load = True if first else total > 2
-        pl_when(load & (total > 0))(lambda: self._group_copy(0))
+        load = self._group_loads(first, total)
+        if load is not False:
+            pl_when(load & (total > 0))(lambda: self._group_copy(0))
         sub8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 0)
         lane8 = jax.lax.broadcasted_iota(jnp.int32, (8, LANES), 1)
         state = refs["state"]
@@ -1302,8 +1503,9 @@ class IndexSelect:
 
         def step_fn(step, carry):
             g, part = refs["gstep_group"][step], refs["gstep_local"][step]
-            pl_when(load)(lambda: self._group_wait(step))
-            pl_when(load & (step + 1 < total))(lambda: self._group_copy(step + 1))
+            if load is not False:
+                pl_when(load)(lambda: self._group_wait(step))
+                pl_when(load & (step + 1 < total))(lambda: self._group_copy(step + 1))
             start = jnp.minimum(part * chunk, self.key_rows - chunk)
             limit = rows_of(_KEY_ROWS, g)  # zero past the batch's rows
             params = (rows_of(_PREFIX, g) ^ INT_MIN,)
@@ -1801,7 +2003,11 @@ class IndexSelect:
 
     def _finish_tau(self, bin_only=False):
         """``tau`` / ``p_tie`` / ``own`` per row from the state (``bin_only``:
-        the prefix bin's lower bound, no tie position)."""
+        the prefix bin's lower bound, no tie position). With resident keys,
+        first the HBM keys' copies (the step activity and the attention read
+        them; the next layer's scoring rewrites the chunks)."""
+        if self.resident:
+            self._keys_out(start=False)
         refs, topk = self.refs, self.topk
         state = refs["state"]
         active = self._active_rows()
@@ -1922,11 +2128,13 @@ def select_scratch(batch, pool_block_shape, key_rows, group=32, sequence_rows=1)
     vmem = pltpu.VMEM
     subpages = pool_block_shape[0] // INDEX_SUBPAGE_ROWS
     page_slots, key_slots = ring_slots(batch)
+    # Resident-key scorings use no stage ring (the slots stay at two).
+    stages = 2 if resident_keys(batch, key_rows, sequence_rows) else stage_slots()
     return {
         "page_buf": vmem((page_slots, *pool_block_shape), jnp.uint8),
         "page_sems": pltpu.SemaphoreType.DMA((page_slots,)),
-        "stage": vmem((2, sequence_rows, subpages, LANES), jnp.int32),
-        "stage_sems": pltpu.SemaphoreType.DMA((2,)),
+        "stage": vmem((stages, sequence_rows, subpages, LANES), jnp.int32),
+        "stage_sems": pltpu.SemaphoreType.DMA((stages,)),
         "key_buf": vmem(
             (key_slots, min(chunk_rows(batch, sequence_rows), key_rows), LANES),
             jnp.int32,
@@ -2190,6 +2398,7 @@ for _name, _method in (
     ("d0_plan", "plan"),
     ("d0_in_flight", "in_flight"),
     ("d1_score", "score"),
+    ("d1_pages", "start_pages"),
     ("d2_count", "_count"),
     ("d2_count", "_count_groups_wide"),
     ("d3_exchange", "_all_reduce"),

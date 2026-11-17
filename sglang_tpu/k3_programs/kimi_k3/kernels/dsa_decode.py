@@ -335,6 +335,43 @@ class DecodeIndexer:
         )
         return self._blocked_product(x, first, HEADS, transposed=True)
 
+    def _index_select(self, cache, position_ref, batch, owner, member, base):
+        """The layer's ``dsa_dcp.IndexSelect`` over the scoped scratch."""
+        s = self.scoped
+        _, _, exchange, exchange_sems = self.persistent
+        refs = {
+            name: s[name]
+            for name in dsa_dcp.select_scratch(1, (33, 4, 128), 8)
+            if name in s
+        }
+        refs.update(
+            exchange=exchange,
+            exchange_sems=exchange_sems,
+            keys=self.keys,
+            tau=s["tau"],
+            p_tie=s["p_tie"],
+            own=s["own"],
+        )
+        return dsa_dcp.IndexSelect(
+            pools=self.pools,
+            layer=self.layer,
+            table_ref=cache.table_ref,
+            pages=cache.pages,
+            page_tokens=cache.page_tokens,
+            group=cache.group,
+            owner=owner,
+            member=member,
+            base=base,
+            position_ref=position_ref,
+            new_exp_ref=s["new_exp"],
+            batch=batch,
+            topk=self.topk,
+            refs=refs,
+            sequence_rows=self.sequence_rows,
+            global_pages=cache.global_pages,
+            table_row=cache.table_row,
+        )
+
     def dense_attention(self, cache, position_ref, batch):
         """Whether the selection will mark every attention step of every row
         (``dsa_dcp`` step activity: no row has more than
@@ -378,7 +415,7 @@ class DecodeIndexer:
         member = rank % group
         base = rank - member
         owner = member if cache.owner is None else cache.owner
-        gather, gather_sems, exchange, exchange_sems = self.persistent
+        gather, gather_sems = self.persistent[:2]
 
         # 1. This rank's index heads, key dims and gate heads of every row, out to
         # every peer's slot (the key / gate parts each in their own slab lanes).
@@ -411,8 +448,16 @@ class DecodeIndexer:
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
-        # 2. The head gates while the gather is in flight; the rows' new keys
-        # (records): the slabs' sum.
+        # 2. The head gates while the gather is in flight (KernelConfig.
+        # dsa_early_plan: also the selection's plan and its first index-page
+        # copies); the rows' new keys (records): the slabs' sum.
+        early, select = dsa_dcp.early_plan(), None
+        if early:
+            select = self._index_select(
+                cache, position_ref, batch, owner, member, base
+            )
+            select.plan()
+            select.start_pages()
         gate_t = self._gate(x)
         others = gather.at[pl.ds(0, group - 1)]
         pltpu.make_async_copy(others, others, gather_sems.at[0]).wait()
@@ -462,49 +507,23 @@ class DecodeIndexer:
         s["w_t"][...] = w_t
 
         # 4. The selection.
-        refs = {
-            name: s[name]
-            for name in dsa_dcp.select_scratch(1, (33, 4, 128), 8)
-            if name in s
-        }
-        refs.update(
-            exchange=exchange,
-            exchange_sems=exchange_sems,
-            keys=self.keys,
-            tau=s["tau"],
-            p_tie=s["p_tie"],
-            own=s["own"],
-        )
-        select = dsa_dcp.IndexSelect(
-            pools=self.pools,
-            layer=self.layer,
-            table_ref=cache.table_ref,
-            pages=cache.pages,
-            page_tokens=cache.page_tokens,
-            group=group,
-            owner=owner,
-            member=member,
-            base=base,
-            position_ref=position_ref,
-            new_exp_ref=s["new_exp"],
-            batch=batch,
-            topk=self.topk,
-            refs=refs,
-            sequence_rows=self.sequence_rows,
-            global_pages=cache.global_pages,
-            table_row=cache.table_row,
-        )
+        if select is None:
+            select = self._index_select(
+                cache, position_ref, batch, owner, member, base
+            )
 
         def query(row):  # [32, 128] FP8 query heads of a row (traced or not)
             return s["q8"][row]
 
         S = self.sequence_rows
-        select.plan()
+        if not early:
+            select.plan()
         select.in_flight(query, s["w_t"], s["new_k8"])
         select.score(
             query,
             s["w_t"],
             lambda first: s["q8"][pl.ds(first, S)].reshape(S * HEADS, DIM),
+            pages_started=early,
         )
         select.select()
         span_rows = s["attend_keys"].shape[2]
