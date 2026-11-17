@@ -98,12 +98,16 @@ def load_tokenizer(tokenizer_path):
     return AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
 
-def freeze_inputs(tokenizer_path, source, out, decode_prefix_mode):
+def freeze_inputs(tokenizer_path, source, out, decode_prefix_mode, dp_size):
     import numpy as np
 
     tokenizer = load_tokenizer(tokenizer_path)
-    decode_prefix_count = 1 if decode_prefix_mode == "shared" else 64
-    need = 16 * (49152 + 4 * 4096) + decode_prefix_count * 89984 + 64 * 4 * 16
+    decode_prefix_count = 1 if decode_prefix_mode == "shared" else 4 * dp_size
+    need = (
+        dp_size * (49152 + 4 * 4096)
+        + decode_prefix_count * 89984
+        + 4 * dp_size * 4 * 16
+    )
     ids, files = [], []
     for path in sorted((source / "python/sglang").rglob("*.py")):
         raw = path.read_bytes()
@@ -220,7 +224,7 @@ async def batch(session, base, inputs, output_len, out, label, synchronized=Fals
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def summarize(records, loads, cached, per_dp, out, label):
+def summarize(records, loads, cached, per_dp, out, label, dp_size):
     for record in records:
         assert record["meta"]["prompt_tokens"] == cached + (4096 if per_dp == 1 else 16)
         # The final cached page can require recomputing one page for the logits.
@@ -239,13 +243,13 @@ def summarize(records, loads, cached, per_dp, out, label):
     full = [
         s
         for s in loads
-        if len(s.get("loads", [])) == 16
+        if len(s.get("loads", [])) == dp_size
         and all(r["num_running_reqs"] == per_dp for r in s["loads"])
     ]
     assert full, "no load snapshot proves the requested per-DP active batch"
     result = dict(
         label=label,
-        physical_chips=8,
+        physical_chips=dp_size // 2,
         requests=len(records),
         requests_per_dp=per_dp,
         expected_cached_tokens=cached,
@@ -282,10 +286,10 @@ def summarize(records, loads, cached, per_dp, out, label):
         assert end > start, "no common steady-state decode window"
         samples = [s for s in loads if start <= s["time"] <= end]
         assert len(samples) >= 2 and all(
-            len(s.get("loads", [])) == 16
+            len(s.get("loads", [])) == dp_size
             and all(r["num_running_reqs"] == 4 for r in s["loads"])
             for s in samples
-        ), "C64 not sustained"
+        ), f"C{4 * dp_size} not sustained"
 
         def count_at(record, timestamp):
             return max(
@@ -303,7 +307,9 @@ def summarize(records, loads, cached, per_dp, out, label):
             steady_end=end,
             steady_output_tokens=tokens,
             steady_output_tokens_per_second=tokens / (end - start),
-            steady_output_tokens_per_second_per_chip=tokens / (end - start) / 8,
+            steady_output_tokens_per_second_per_chip=tokens
+            / (end - start)
+            / (dp_size // 2),
             tail_seconds=max(r["ended"] for r in records) - end,
         )
     save(out / f"{label}-summary.json", result)
@@ -311,6 +317,7 @@ def summarize(records, loads, cached, per_dp, out, label):
 
 
 async def main(a):
+    dp_size = a.dp_size
     a.output.mkdir(parents=True, exist_ok=False)
     await asyncio.to_thread(
         save,
@@ -330,9 +337,9 @@ async def main(a):
         info = await api(session, a.base_url, "/server_info")
         await asyncio.to_thread(save, a.output / "server-info.json", info)
         expected = dict(
-            tp_size=16,
-            attn_dp_size=16,
-            ep_size=16,
+            tp_size=dp_size,
+            attn_dp_size=dp_size,
+            ep_size=dp_size,
             speculative_algorithm="EAGLE",
             speculative_num_steps=5,
             speculative_num_draft_tokens=6,
@@ -350,7 +357,7 @@ async def main(a):
         tokenizer = await asyncio.to_thread(load_tokenizer, a.model)
         assert tokenizer.chat_template
         checks = []
-        for rank in range(16):
+        for rank in range(dp_size):
             text = tokenizer.apply_chat_template(
                 [
                     dict(
@@ -383,7 +390,7 @@ async def main(a):
         await asyncio.to_thread(
             save, a.output / "capacity-before-workload.json", capacities
         )
-        assert len(capacities["loads"]) == 16
+        assert len(capacities["loads"]) == dp_size
         minimum_capacity = min(
             row["max_total_num_tokens"] for row in capacities["loads"]
         )
@@ -399,42 +406,46 @@ async def main(a):
                 minimum_capacity=minimum_capacity,
                 unique_slots_lower_bound=unique_slots,
                 shared_prefix_tokens=89984,
-                reason="independent 90K/C64 requests fit"
+                reason=f"independent 90K/C{4 * dp_size} requests fit"
                 if decode_mode == "unique"
                 else "share prefix within each DP to reduce KV slots",
             ),
         )
         _, ids = await asyncio.to_thread(
-            freeze_inputs, a.model, a.source, a.output, decode_mode
+            freeze_inputs, a.model, a.source, a.output, decode_mode, dp_size
         )
         all_summaries = []
         for scenario in ("prefill", "decode"):
             prefix_len, extend, count = (
-                (49152, 4096, 16) if scenario == "prefill" else (89984, 16, 64)
+                (49152, 4096, dp_size)
+                if scenario == "prefill"
+                else (89984, 16, 4 * dp_size)
             )
             await api(session, a.base_url, "/flush_cache")
             stride = 49152 + 4 * 4096
             shared = decode_mode == "shared" and scenario == "decode"
-            decode_start = 16 * stride
+            decode_start = dp_size * stride
             if scenario == "prefill":
                 prefixes = [
-                    ids[r * stride : r * stride + prefix_len] for r in range(16)
+                    ids[r * stride : r * stride + prefix_len] for r in range(dp_size)
                 ]
             elif shared:
-                prefixes = [ids[decode_start : decode_start + prefix_len]] * 64
+                prefixes = [ids[decode_start : decode_start + prefix_len]] * (
+                    4 * dp_size
+                )
             else:
                 prefixes = [
                     ids[
                         decode_start + i * prefix_len : decode_start
                         + (i + 1) * prefix_len
                     ]
-                    for i in range(64)
+                    for i in range(4 * dp_size)
                 ]
-            priming_count = 16 if shared else count
+            priming_count = dp_size if shared else count
             await batch(
                 session,
                 a.base_url,
-                [(i % 16, prefixes[i]) for i in range(priming_count)],
+                [(i % dp_size, prefixes[i]) for i in range(priming_count)],
                 1,
                 a.output,
                 f"{scenario}-prefix",
@@ -442,12 +453,12 @@ async def main(a):
             for iteration in range(4):
                 inputs = []
                 for i in range(count):
-                    rank = i % 16
+                    rank = i % dp_size
                     offset = (
                         rank * stride + prefix_len + iteration * extend
                         if scenario == "prefill"
                         else decode_start
-                        + (1 if shared else 64) * 89984
+                        + (1 if shared else 4 * dp_size) * 89984
                         + (iteration * count + i) * 16
                     )
                     inputs.append((rank, prefixes[i] + ids[offset : offset + extend]))
@@ -471,9 +482,10 @@ async def main(a):
                             records,
                             loads,
                             prefix_len,
-                            count // 16,
+                            count // dp_size,
                             a.output,
                             label,
+                            dp_size,
                         )
                     )
             # Raw metrics and logs remain authoritative for retraction/eviction checks.
@@ -506,6 +518,7 @@ def parse_args(argv=None):
     p.add_argument("--source", type=Path, default=Path.cwd())
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--smoke-only", action="store_true")
+    p.add_argument("--dp-size", type=int, choices=[16, 32], default=16)
     p.add_argument(
         "--decode-prefix", choices=["auto", "shared", "unique"], default="auto"
     )

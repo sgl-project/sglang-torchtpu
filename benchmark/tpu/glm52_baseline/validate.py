@@ -30,16 +30,18 @@ def main():
     args.resolve_once()
     resolved = args.resolved_dict()
     a.output.write_text(json.dumps(resolved, indent=2, default=str) + "\n")
+    parallel = cfg.server_args["tp_size"]
+    assert parallel in (16, 32), parallel
     expected = dict(
         tpu_fp8_runtime="channelwise",
         tpu_compile_tracer="direct",
         weight_loader_disable_mmap=True,
         chunked_prefill_size=2048,
-        max_running_requests=64,
-        tp_size=16,
-        attn_dp_size=16,
-        ep_size=16,
-        nnodes=2,
+        max_running_requests=4 * parallel,
+        tp_size=parallel,
+        attn_dp_size=parallel,
+        ep_size=parallel,
+        nnodes=parallel // 8,
         speculative_algorithm="EAGLE",
         speculative_num_steps=5,
         speculative_num_draft_tokens=6,

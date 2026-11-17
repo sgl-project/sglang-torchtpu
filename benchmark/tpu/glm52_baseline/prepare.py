@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import struct
 from pathlib import Path
 
@@ -75,6 +76,8 @@ def prepare(model: Path, output: Path):
     }
     (output / "checkpoint-audit.json").write_text(json.dumps(evidence, indent=2) + "\n")
     draft = prepare_draft_view(model, output / "native-mtp-shards")
+    parallel = int(os.environ.get("GLM52_EP_SIZE", "16"))
+    assert parallel in (16, 32), parallel
     args = dict(
         model_path=str(model),
         device="tpu",
@@ -84,18 +87,18 @@ def prepare(model: Path, output: Path):
         trust_remote_code=True,
         host="0.0.0.0",
         port=30000,
-        tp_size=16,
-        attn_dp_size=16,
-        ep_size=16,
-        nnodes=2,
+        tp_size=parallel,
+        attn_dp_size=parallel,
+        ep_size=parallel,
+        nnodes=parallel // 8,
         attention_backend="pallas_tpu_mla_sparse",
         moe_runner_backend="pallas_tpu",
         kv_cache_dtype="fp8_e4m3",
         page_size=64,
         context_length=92160,
-        chunked_prefill_size=32768,
-        max_prefill_tokens=32768,
-        max_running_requests=64,
+        chunked_prefill_size=2048 * parallel,
+        max_prefill_tokens=2048 * parallel,
+        max_running_requests=4 * parallel,
         torch_compile_max_bs=4,
         tpu_compile_bs=[1, 2, 3, 4],
         tpu_compile_tokens=[64, 2048],

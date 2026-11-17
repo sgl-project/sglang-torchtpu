@@ -1,4 +1,4 @@
-"""Supervise both native server launchers within one bounded Falcon allocation."""
+"""Supervise the native server launchers within one bounded Falcon allocation."""
 
 import hashlib
 import json
@@ -30,7 +30,7 @@ def benchmark_identity():
     return dict(kind="source-tree", sha256=digest, files=files)
 
 
-def run_client(proc, command, out, art, shared, deadline):
+def run_client(proc, command, out, art, shared, deadline, dp_size):
     """A client failure retains the live server until an explicit retry or deadline."""
     attempt = 1
     request = shared / "retry-client.json"
@@ -49,7 +49,9 @@ def run_client(proc, command, out, art, shared, deadline):
                 summary = json.loads((destination / "summary.json").read_text())
                 smoke = json.loads((destination / "smoke-summary.json").read_text())
                 assert len(summary["rounds"]) == 6 and smoke["status"] == "PASS"
-                assert {row["dp_rank"] for row in smoke["checks"]} == set(range(16))
+                assert {row["dp_rank"] for row in smoke["checks"]} == set(
+                    range(dp_size)
+                )
                 atomic(
                     shared / "client-attention.json",
                     dict(
@@ -92,6 +94,10 @@ def run():
     rank = int(os.environ["FALCON_RANK"])
     root = Path(os.environ.get("GLM52_RUN_ROOT", "/tmp/glm52-baseline-runtime"))
     out = Path(os.environ["ARTIFACT_LOCAL_DIR"]) / "glm52-e2e"
+    recipe = json.loads((root / "recipe/server.json").read_text())["server_args"]
+    nnodes = recipe["nnodes"]
+    dp_size = recipe["attn_dp_size"]
+    topology = (2, 2, nnodes, 2)
     identity = benchmark_identity()
     benchmark_sha = identity["sha256"]
     shared = out / ("session-" + os.environ.get("GLM52_RUN_ID", benchmark_sha[:12]))
@@ -133,14 +139,14 @@ def run():
             try:
                 peers = [
                     json.loads((shared / f"peer-{r}.json").read_text())
-                    for r in range(2)
+                    for r in range(nnodes)
                 ]
-                assert [p["rank"] for p in peers] == [0, 1]
+                assert [p["rank"] for p in peers] == list(range(nnodes))
                 assert all(
                     p["source"] == source and p["benchmark_sha256"] == benchmark_sha
                     for p in peers
                 )
-                assert peers[0]["ip"] != peers[1]["ip"]
+                assert len({p["ip"] for p in peers}) == nnodes
                 break
             except (FileNotFoundError, json.JSONDecodeError):
                 assert time.monotonic() < peer_deadline, "peer bootstrap exceeded 300s"
@@ -152,7 +158,7 @@ def run():
             TPU_WORKER_HOSTNAMES=hosts,
             RANK0_HOST=peers[0]["ip"],
             DIST_INIT_ADDR=peers[0]["ip"] + ":10011",
-            TORCH_TPU_TOPOLOGY="2,2,2,2",
+            TORCH_TPU_TOPOLOGY=",".join(map(str, topology)),
             TORCH_TPU_DEVICES_PER_HOST="8",
             TORCH_TPU_BASE_PORT="8070",
             SGLANG_USE_RAY="0",
@@ -191,7 +197,7 @@ def run():
         # native normalization timeout. Physical host order can differ from Falcon order.
         query = """import os
 from sglang_tpu.node_normalization import TopologyConfig, query_node_rank
-cfg=TopologyConfig(hosts=tuple(os.environ['TPU_WORKER_HOSTNAMES'].split(',')),topology=(2,2,2,2))
+cfg=TopologyConfig(hosts=tuple(os.environ['TPU_WORKER_HOSTNAMES'].split(',')),topology=tuple(map(int,os.environ['TORCH_TPU_TOPOLOGY'].split(','))))
 print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),180)))
 """
         probe = subprocess.run(
@@ -213,7 +219,7 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
         recipe = json.loads(config.read_text())["server_args"]
         model = Path(recipe["model_path"])
         experts = json.loads((model / "config.json").read_text())["n_routed_experts"]
-        assert experts == 256 and physical_rank in (0, 1)
+        assert experts == 256 and physical_rank in range(nnodes)
         with (art / "host-preparation.log").open("wb") as log:
             subprocess.run(
                 [
@@ -223,9 +229,9 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                     "benchmark.tpu.glm52_baseline.prepare_host_checkpoint",
                     str(model),
                     "--expert-start",
-                    str(physical_rank * 128),
+                    str(physical_rank * (experts // nnodes)),
                     "--expert-end",
-                    str((physical_rank + 1) * 128),
+                    str((physical_rank + 1) * (experts // nnodes)),
                     "--execute",
                 ],
                 stdout=log,
@@ -267,9 +273,9 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
             try:
                 prepared = [
                     json.loads((shared / f"prepared-{r}.json").read_text())
-                    for r in range(2)
+                    for r in range(nnodes)
                 ]
-                assert {p["physical_rank"] for p in prepared} == {0, 1}
+                assert {p["physical_rank"] for p in prepared} == set(range(nnodes))
                 break
             except (FileNotFoundError, json.JSONDecodeError):
                 assert time.monotonic() < preparation_deadline, (
@@ -342,9 +348,10 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                     except (OSError, TimeoutError):
                         pass
                     assert time.monotonic() < deadline, "server readiness timed out"
-                    peer_failure = shared / "result-1.json"
-                    if peer_failure.exists():
-                        raise RuntimeError(peer_failure.read_text())
+                    for peer_rank in range(1, nnodes):
+                        peer_failure = shared / f"result-{peer_rank}.json"
+                        if peer_failure.exists():
+                            raise RuntimeError(peer_failure.read_text())
                     time.sleep(5)
                 client = [
                     sys.executable,
@@ -357,8 +364,12 @@ print('PHYSICAL_RANK='+str(query_node_rank(cfg,int(os.environ['FALCON_RANK']),18
                     str(model),
                     "--decode-prefix",
                     "shared",
+                    "--dp-size",
+                    str(dp_size),
                 ]
-                measurements = run_client(proc, client, out, art, shared, deadline)
+                measurements = run_client(
+                    proc, client, out, art, shared, deadline, dp_size
+                )
                 result.update(status="SUCCEEDED", measurements=str(measurements))
             else:
                 while not (shared / "result-0.json").exists():
