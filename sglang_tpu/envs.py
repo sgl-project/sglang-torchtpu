@@ -117,6 +117,12 @@ class TpuEnvs:
     # all-reduce buffer, [attn_tp, rows, topk] int32 per DSA layer, grows with
     # the chunk); decode and verify keep the replicated path.
     SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MIN_TOKENS = EnvInt(1024)
+    # Sparse MLA, on top of the indexer token split: each rank attends only the
+    # rows it selected, with every head, so each selected cache row is gathered
+    # by one rank instead of all; a Pallas all-to-all (kernels/oneshot_all_to_all.py)
+    # moves queries and outputs, and the rows' all-reduce is skipped. Plain DSA
+    # prefill batches of the per-query kernel; attention TP must span the world.
+    SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT = EnvBool(False)
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
@@ -489,7 +495,7 @@ class TpuEnvs:
     # one-hot permute feeding the SparseCore combine gave wrong tokens.
     SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE = EnvBool(False)
     # Turn off EP-local expert reads (models that opt in read only their EP
-    # rank's routed experts with --weight-loader-disable-mmap).
+    # rank's routed experts with --weight-loader-disable-mmap or Run:AI).
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
