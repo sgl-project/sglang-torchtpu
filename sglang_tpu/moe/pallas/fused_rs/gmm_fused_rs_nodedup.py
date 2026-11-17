@@ -47,9 +47,9 @@ from sglang_tpu.moe.pallas.fused_rs.tuned_block_sizes import (
 )
 from sglang_tpu.moe.pallas.gmm_v2 import recover_quant_block_size
 
-# Ring slots for the sibling's partial tiles in pair exchange; a sender waits for
-# a credit before reusing a slot, so 2 is enough for the cores' lockstep tiles.
-_PAIR_RING = 2
+# Ring slots for the sibling's partial tiles in the two-level reduce-scatter; a sender
+# waits for a credit before reusing a slot, so 2 is enough for the cores' lockstep tiles.
+_TWOLEVEL_RING = 2
 
 # =============================================================================
 # Phase 1: Pre-kernel metadata computation (JAX level)
@@ -532,13 +532,13 @@ def kernel_main_fused_rs(
     gmm2_row_out: bool = False,
     row_loop_unroll: int = 1,
     staging_slots: int = 3,
-    pair_exchange: bool = False,
-    pair_meta_base: int = 0,  # group_start offset of per-(tile, owner) run lengths [S * ep]
-    pair_meta_stride: int = 0,  # run ranks follow the lengths at this offset
-    pair_ring_ref=None,  # VMEM (_PAIR_RING, tile_m, N2//NL, NL): the sibling's partial tiles
-    pair_sum_ref=None,  # VMEM (staging_slots, tile_m, N2//NL, NL): own + sibling partials per slot
-    pair_recv_sem_ref=None,  # REGULAR (_PAIR_RING,): sibling pieces landed in a ring slot
-    pair_credit_ref=None,  # REGULAR (1,): ring slots the sibling has freed
+    twolevel_rs: bool = False,
+    twolevel_meta_base: int = 0,  # group_start offset of per-(tile, owner) run lengths [S * ep]
+    twolevel_meta_stride: int = 0,  # run ranks follow the lengths at this offset
+    twolevel_ring_ref=None,  # VMEM (_TWOLEVEL_RING, tile_m, N2//NL, NL): the sibling's partial tiles
+    twolevel_sum_ref=None,  # VMEM (staging_slots, tile_m, N2//NL, NL): own + sibling partials per slot
+    twolevel_recv_sem_ref=None,  # REGULAR (_TWOLEVEL_RING,): sibling pieces landed in a ring slot
+    twolevel_credit_ref=None,  # REGULAR (1,): ring slots the sibling has freed
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -623,7 +623,7 @@ def kernel_main_fused_rs(
                 jnp.int32(0),
             )
 
-    if pair_exchange:
+    if twolevel_rs:
         sibling = jnp.bitwise_xor(my_id, 1)
 
     @jax.named_scope("sync_barrier_signal")
@@ -1076,26 +1076,29 @@ def kernel_main_fused_rs(
         gm_id_ref[1 + slot] = jnp.int32(0)
         gm_id_ref[1 + staging_slots + slot] = jnp.int32(0)
 
-    pair_pieces = [b for b in (512, 256, 128, 64, 32, 16, 8, 4, 2, 1) if b <= tile_m]
-    _sls_pair = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
+    twolevel_pieces = [
+        b for b in (512, 256, 128, 64, 32, 16, 8, 4, 2, 1) if b <= tile_m
+    ]
+    _sls_twolevel = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
 
-    def _pair_count_pieces(num_valid):
+    def _twolevel_count_pieces(num_valid):
         n = jnp.int32(0)
-        for b in pair_pieces:
+        for b in twolevel_pieces:
             n = n + ((num_valid & b) != 0).astype(jnp.int32)
         return n
 
-    @jax.named_scope("pair_send")
-    def _pair_send(gm_id, stg_id, row0, num_valid):
+    @jax.named_scope("twolevel_send")
+    def _twolevel_send(gm_id, stg_id, row0, num_valid):
         """Ship tile gm_id's valid partial rows to the sibling's ring slot (power-of-two DMAs)."""
-        ring_slot = gm_id % _PAIR_RING
+        ring_slot = gm_id % _TWOLEVEL_RING
 
-        @pl.when(gm_id >= _PAIR_RING)
+        @pl.when(gm_id >= _TWOLEVEL_RING)
         def _():
-            pl.semaphore_wait(pair_credit_ref.at[0], 1)  # the sibling freed this slot
+            # the sibling freed this slot
+            pl.semaphore_wait(twolevel_credit_ref.at[0], 1)
 
         off = jnp.int32(0)
-        for b in pair_pieces:
+        for b in twolevel_pieces:
             has = (num_valid & b) != 0
 
             @pl.when(has)
@@ -1104,17 +1107,19 @@ def kernel_main_fused_rs(
                     src_ref=scatter_staging_3x_ref.at[
                         stg_id, pl.ds(row0 + off, b), :, :
                     ],
-                    dst_ref=pair_ring_ref.at[ring_slot, pl.ds(row0 + off, b), :, :],
+                    dst_ref=twolevel_ring_ref.at[ring_slot, pl.ds(row0 + off, b), :, :],
                     send_sem=send_sems_ref.at[stg_id],
-                    recv_sem=pair_recv_sem_ref.at[ring_slot],
+                    recv_sem=twolevel_recv_sem_ref.at[ring_slot],
                     device_id={ep_axis_name: sibling},
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
             off = off + jnp.where(has, b, 0)
-        gm_id_ref[1 + stg_id] = gm_id_ref[1 + stg_id] + _pair_count_pieces(num_valid)
+        gm_id_ref[1 + stg_id] = gm_id_ref[1 + stg_id] + _twolevel_count_pieces(
+            num_valid
+        )
 
-    # Row windows for the pair add: rows are the untiled leading dim of a slot, so any
+    # Row windows for the chip-sum add: rows are the untiled leading dim of a slot, so any
     # window size and start work; pick the smallest that covers the rows needed.
     window_rows = [b for b in (8, 16, 32, 64, 128, 256, 512) if b < tile_m] + [tile_m]
 
@@ -1126,47 +1131,48 @@ def kernel_main_fused_rs(
         lax.switch(idx, [(lambda b=b: (fn(b), jnp.int32(0))[1]) for b in window_rows])
 
     num_chips = ep_size // 2
-    # Per tile: own rows, the sibling's, then one run per other chip (_pair_targets order).
+    # Per tile: own rows, the sibling's, then one run per other chip (_twolevel_targets order).
     n_targets = num_chips + 1
 
-    def _pair_run(g, t):
+    def _twolevel_run(g, t):
         """(length, offset in the tile, rank among the owner's rows) of tile g's run t."""
-        at = pair_meta_base + g * n_targets + t
+        at = twolevel_meta_base + g * n_targets + t
         return (
             group_start_ref[at],
-            group_start_ref[at + pair_meta_stride],
-            group_start_ref[at + 2 * pair_meta_stride],
+            group_start_ref[at + twolevel_meta_stride],
+            group_start_ref[at + 2 * twolevel_meta_stride],
         )
 
-    @jax.named_scope("pair_add")
-    def _pair_add(g, stg, ring_slot, row0):
-        """Pair sums for the rows this core forwards to other chips (runs 2..), one row
-        window per run; rows a window covers beyond its run get correct sums too."""
+    @jax.named_scope("twolevel_add")
+    def _twolevel_add(g, stg, ring_slot, row0):
+        """Chip sums (own + sibling partial) for the rows this core forwards to other chips
+        (runs 2..), one row window per run; rows a window covers beyond its run get correct
+        sums too."""
         for t in range(2, n_targets):
-            run_len, src_off, _ = _pair_run(g, t)
+            run_len, src_off, _ = _twolevel_run(g, t)
             lo = row0 + src_off
 
             def _add(b, lo=lo):
                 start = jnp.minimum(lo, tile_m - b)
-                pair_sum_ref[stg, pl.ds(start, b)] = (
+                twolevel_sum_ref[stg, pl.ds(start, b)] = (
                     scatter_staging_3x_ref[stg, pl.ds(start, b)].astype(jnp.float32)
-                    + pair_ring_ref[ring_slot, pl.ds(start, b)].astype(jnp.float32)
-                ).astype(pair_sum_ref.dtype)
+                    + twolevel_ring_ref[ring_slot, pl.ds(start, b)].astype(jnp.float32)
+                ).astype(twolevel_sum_ref.dtype)
 
             @pl.when(run_len > 0)
             def _(run_len=run_len, _add=_add):
                 _row_window(run_len, _add)
 
-    @jax.named_scope("pair_issue")
-    def _pair_issue(g, stg, row0):
+    @jax.named_scope("twolevel_issue")
+    def _twolevel_issue(g, stg, row0):
         """Issue tile g's runs: own and sibling rows carry this core's partial; the run
-        for chip my_chip + k carries the pair sum to the core of this parity there, into
+        for chip my_chip + k carries the chip sum to the core of this parity there, into
         that owner's receive block 1 + (num_chips - k) % num_chips."""
         my_chip = my_id // 2
         rows_per_block = out_buf_ref.shape[0] // n_targets
         sent = jnp.int32(0)
         for t in range(n_targets):
-            run_len, src_off, rank = _pair_run(g, t)
+            run_len, src_off, rank = _twolevel_run(g, t)
             if t == 0:
                 d, block, src = my_id, 0, scatter_staging_3x_ref
             elif t == 1:
@@ -1175,7 +1181,7 @@ def kernel_main_fused_rs(
                 k = t - 1
                 d = 2 * ((my_chip + k) % num_chips) + my_id % 2
                 block = 1 + (num_chips - k) % num_chips
-                src = pair_sum_ref
+                src = twolevel_sum_ref
             dst0 = block * rows_per_block + rank
 
             def _pieces(
@@ -1201,8 +1207,8 @@ def kernel_main_fused_rs(
                     n = n + has.astype(jnp.int32)
                 return n
 
-            big = [b for b in pair_pieces if b >= 32]
-            small = [b for b in pair_pieces if b < 32]
+            big = [b for b in twolevel_pieces if b >= 32]
+            small = [b for b in twolevel_pieces if b < 32]
             if big:
                 # most runs are a few dozen rows: test the large pieces only when needed
                 sent = sent + lax.cond(
@@ -1211,33 +1217,33 @@ def kernel_main_fused_rs(
             sent = sent + _pieces(small)
         gm_id_ref[1 + stg] = gm_id_ref[1 + stg] + sent
 
-    @jax.named_scope("pair_finish")
-    def _pair_finish(g):
+    @jax.named_scope("twolevel_finish")
+    def _twolevel_finish(g):
         """Tile g: add the sibling's partial rows, free its ring slot, write each owner's run.
 
         Rows of a tile are token-sorted, so the rows of each owner form one run whose ranks
         among that owner's rows are consecutive. A run goes to the owner's receive block
         for this source: own rows (block 0) and the sibling's (block 1) carry one core's
-        partial; another chip's run carries the pair sum from the core of the owner's parity.
+        partial; another chip's run carries the chip sum from the core of the owner's parity.
         """
         stg = g % staging_slots
-        ring_slot = g % _PAIR_RING
+        ring_slot = g % _TWOLEVEL_RING
         m_st = metadata_ref.gm_id_to_m_offset[g]
         m_en = metadata_ref.gm_id_to_m_offset[g + 1]
-        row0 = m_st % _sls_pair
-        n_pieces = _pair_count_pieces(m_en - m_st)
+        row0 = m_st % _sls_twolevel
+        n_pieces = _twolevel_count_pieces(m_en - m_st)
 
         @pl.when(n_pieces > 0)
         def _():
-            pl.semaphore_wait(pair_recv_sem_ref.at[ring_slot], n_pieces)
+            pl.semaphore_wait(twolevel_recv_sem_ref.at[ring_slot], n_pieces)
 
-        _pair_add(g, stg, ring_slot, row0)
+        _twolevel_add(g, stg, ring_slot, row0)
         pl.semaphore_signal(
-            pair_credit_ref.at[0],
+            twolevel_credit_ref.at[0],
             device_id={ep_axis_name: sibling},
             device_id_type=pl.DeviceIdType.MESH,
         )
-        _pair_issue(g, stg, row0)
+        _twolevel_issue(g, stg, row0)
 
     @jax.named_scope("gm_loop_body")
     def gm_loop_body(gm_id, _):
@@ -1549,13 +1555,13 @@ def kernel_main_fused_rs(
             # wasted iterations on padding rows.
             num_valid = m_en - m_st
 
-            if pair_exchange:
+            if twolevel_rs:
                 # tile g's rows go to the sibling now; tile g-1 completes while they fly
-                _pair_send(gm_id, stg_id, _ml, num_valid)
+                _twolevel_send(gm_id, stg_id, _ml, num_valid)
 
                 @pl.when(gm_id >= 1)
                 def _():
-                    _pair_finish(gm_id - 1)
+                    _twolevel_finish(gm_id - 1)
 
             @jax.named_scope("direct_write_rows")
             def _do_direct_write():
@@ -1650,28 +1656,28 @@ def kernel_main_fused_rs(
                 def _():
                     pl.semaphore_wait(send_sems_ref.at[stg_id], send_sz)
 
-            if not pair_exchange:
+            if not twolevel_rs:
                 _do_direct_write()
 
         return _
 
     lax.fori_loop(0, max_num_gm, gm_loop_body, None)
-    if pair_exchange:
+    if twolevel_rs:
 
         @pl.when(local_num_gm > 0)
         def _():
-            _pair_finish(local_num_gm - 1)
+            _twolevel_finish(local_num_gm - 1)
 
     if defer_writes:
         # A kernel must not exit with DMAs or semaphores outstanding.
         for _s in range(staging_slots):
             wait_staging_slot_writes(_s)
-    if pair_exchange:
-        # one credit per tile the sibling consumed; the first _PAIR_RING were never waited
+    if twolevel_rs:
+        # one credit per tile the sibling consumed; the first _TWOLEVEL_RING were never waited
         @pl.when(local_num_gm > 0)
         def _():
             pl.semaphore_wait(
-                pair_credit_ref.at[0], jnp.minimum(local_num_gm, _PAIR_RING)
+                twolevel_credit_ref.at[0], jnp.minimum(local_num_gm, _TWOLEVEL_RING)
             )
 
     # Post-Scatter Cross-Rank Optical Barrier
@@ -1686,7 +1692,7 @@ def kernel_main_fused_rs(
     # No input_output_aliases needed — avoids XLA tiling copy on weight inputs.
 
 
-def _pair_exchange_metadata(
+def _twolevel_metadata(
     group_start: jax.Array,
     local_idx: jax.Array,
     *,
@@ -1698,7 +1704,7 @@ def _pair_exchange_metadata(
     ep_size: int,
     num_slots: int,
 ) -> tuple[jax.Array, int, int]:
-    """Append each tile's runs to the local-rows metadata, in _pair_targets order:
+    """Append each tile's runs to the local-rows metadata, in _twolevel_targets order:
     (length, offset in the tile, rank among the owner's rows).
 
     A local row's owner is its token's rank; rows are expert-sorted then token-sorted,
@@ -1725,7 +1731,7 @@ def _pair_exchange_metadata(
         ((my_len & b) != 0).astype(jnp.int32)
         for b in (512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
     )
-    targets = _pair_targets(my_rank, ep_size)
+    targets = _twolevel_targets(my_rank, ep_size)
     total_recv = len(targets) * jnp.sum(pieces)
     head = group_start.at[2].set(total_recv.astype(jnp.int32))
     base = head.shape[0]
@@ -1736,9 +1742,9 @@ def _pair_exchange_metadata(
     return meta.astype(jnp.int32), base, stride
 
 
-def _pair_targets(my_id, ep_size: int):
-    """Owners a rank sends runs to under pair exchange: itself, its sibling, then the core
-    of its parity on chip (my_chip + k) % num_chips for k = 1.. num_chips - 1."""
+def _twolevel_targets(my_id, ep_size: int):
+    """Owners a rank sends runs to in the two-level reduce-scatter: itself, its sibling,
+    then the core of its parity on chip (my_chip + k) % num_chips for k = 1.. num_chips - 1."""
     num_chips = ep_size // 2
     my_chip, parity = my_id // 2, my_id % 2
     return jnp.stack(
@@ -1763,7 +1769,7 @@ def _pair_targets(my_id, ep_size: int):
         "caller_tile_m",
         "expert_tp",
         "fp4_w4a16",
-        "pair_exchange",
+        "twolevel_rs",
     ],
 )
 def gmm_v2_fused_rs(
@@ -1793,16 +1799,16 @@ def gmm_v2_fused_rs(
     top_k: int,
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
-    pair_exchange: bool = False,
+    twolevel_rs: bool = False,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
     fp4_w4a16: block-256 fp4 experts take bf16 rows, each block's scale applied after its
     dot (requantized NVFP4), instead of fp8-quantized rows.
 
-    ``pair_exchange`` (expert TP, logical ranks 2c and 2c+1 on one chip): for a row
+    ``twolevel_rs`` (expert TP, logical ranks 2c and 2c+1 on one chip): for a row
     owned on another chip, the core of the owner's parity adds its sibling's partial
-    (sent on-chip into a VMEM ring) to its own and sends the pair sum; the other
+    (sent on-chip into a VMEM ring) to its own and sends the chip sum; the other
     core sends nothing for that row; every receive row is written exactly once.
 
     ``expert_tp``: the scalar-prefetched row indices hold just this device's
@@ -1820,9 +1826,9 @@ def gmm_v2_fused_rs(
     chunk_size = output_size // ep_size
     # Expert-TP schedule, each exact and measured on TPU7x fp4 and fp8 expert TP: 8-row
     # DMA loops (-8..-15% at 4096 tokens), weight ping-pong (-16..-20% at 64), per-row
-    # output stores; pair exchange keeps more tiles' writes in flight (-21..-32% vs 3).
+    # output stores; the two-level path keeps more tiles' writes in flight (-21..-32% vs 3).
     row_loop_unroll = 8 if expert_tp else 1
-    staging_slots = 8 if pair_exchange else 3
+    staging_slots = 8 if twolevel_rs else 3
 
     is_quantized = w1_scale is not None
     if is_quantized:
@@ -2311,9 +2317,9 @@ def gmm_v2_fused_rs(
         primary_idx_ref = lhs_indices
         secondary_idx_ref = topk_indices
 
-    pair_meta_base = pair_meta_stride = 0
-    if pair_exchange:
-        group_start, pair_meta_base, pair_meta_stride = _pair_exchange_metadata(
+    twolevel_meta_base = twolevel_meta_stride = 0
+    if twolevel_rs:
+        group_start, twolevel_meta_base, twolevel_meta_stride = _twolevel_metadata(
             group_start,
             primary_idx_ref,
             group_offset=group_offset,
@@ -2325,9 +2331,9 @@ def gmm_v2_fused_rs(
             num_slots=max_num_gm_static,
         )
         # Receive blocks: own, sibling, then one per other chip.
-        num_pair_blocks = ep_size // 2 + 1
+        num_twolevel_blocks = ep_size // 2 + 1
         out_buf_init = jax.ShapeDtypeStruct(
-            (num_pair_blocks * chunk_size * (top_k // ep_size), n2_cols, num_lanes),
+            (num_twolevel_blocks * chunk_size * (top_k // ep_size), n2_cols, num_lanes),
             out_dtype,
         )
 
@@ -2374,15 +2380,15 @@ def gmm_v2_fused_rs(
         top_k=top_k,
         pack_indices=pack_indices,
         defer_writes=expert_tp,
-        # Expert TP's per-row writes (and pair exchange's) cover every out_buf row once.
+        # Expert TP's per-row writes (two-level ones too) cover every out_buf row once.
         skip_out_zero=expert_tp,
         weight_pingpong=expert_tp,
         gmm2_row_out=expert_tp,
         row_loop_unroll=row_loop_unroll,
         staging_slots=staging_slots,
-        pair_exchange=pair_exchange,
-        pair_meta_base=pair_meta_base,
-        pair_meta_stride=pair_meta_stride,
+        twolevel_rs=twolevel_rs,
+        twolevel_meta_base=twolevel_meta_base,
+        twolevel_meta_stride=twolevel_meta_stride,
     )
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
@@ -2395,23 +2401,23 @@ def gmm_v2_fused_rs(
     ]
 
     kernel_fn = functools.partial(kernel_main_fused_rs, **kernel_kwargs)
-    if pair_exchange:
+    if twolevel_rs:
         # Appended after the base scratch, passed by keyword.
         scratch_shapes = scratch_shapes + [
-            pltpu.VMEM((_PAIR_RING, tile_m, n2_cols, num_lanes), out_dtype),
+            pltpu.VMEM((_TWOLEVEL_RING, tile_m, n2_cols, num_lanes), out_dtype),
             pltpu.VMEM((staging_slots, tile_m, n2_cols, num_lanes), out_dtype),
-            pltpu.SemaphoreType.REGULAR((_PAIR_RING,)),
+            pltpu.SemaphoreType.REGULAR((_TWOLEVEL_RING,)),
             pltpu.SemaphoreType.REGULAR((1,)),
         ]
 
         def kernel_fn(*refs, _base=kernel_fn):
-            *base, ring, pair_sum, pair_recv, credit = refs
+            *base, ring, chip_sum, recv, credit = refs
             _base(
                 *base,
-                pair_ring_ref=ring,
-                pair_sum_ref=pair_sum,
-                pair_recv_sem_ref=pair_recv,
-                pair_credit_ref=credit,
+                twolevel_ring_ref=ring,
+                twolevel_sum_ref=chip_sum,
+                twolevel_recv_sem_ref=recv,
+                twolevel_credit_ref=credit,
             )
 
     result = pl.pallas_call(

@@ -35,7 +35,7 @@ from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     gmm_v2_fused_rs as gmm_v2_fused_rs_nodedup,
 )
-from sglang_tpu.moe.pallas.fused_rs.post_combine import pair_post_combine
+from sglang_tpu.moe.pallas.fused_rs.post_combine import twolevel_post_combine
 from sglang_tpu.moe.pallas.fused_rs.utils import (
     combine_partition_axes,
     get_mesh_shape_product,
@@ -135,9 +135,9 @@ def _compute_expert_tp_routing(
 
 
 def _ep_ranks_pair_cores(ep_size: int) -> bool:
-    """Whether expert ranks 2c and 2c + 1 are the two TensorCores of one chip, as fused-RS
-    pair exchange assumes. Holds for torch ranks under get_pallas_mesh on TPU7x (see
-    k3_megakernel/config.py); needs at least two chips."""
+    """Whether expert ranks 2c and 2c + 1 are the two TensorCores of one chip, as the
+    fused-RS two-level reduce-scatter assumes. Holds for torch ranks under get_pallas_mesh
+    on TPU7x (see k3_megakernel/config.py); needs at least two chips."""
     from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
 
     if ep_size < 4 or ep_size % 2:
@@ -148,7 +148,7 @@ def _ep_ranks_pair_cores(ep_size: int) -> bool:
         return False
 
 
-def _pair_post_combine(
+def _twolevel_post_combine(
     recv: jax.Array,  # [blocks * chunk * topk, ...] receive blocks, rows in owned-row rank order
     topk_indices: jax.Array,  # [num_tokens, topk], replicated
     topk_weights: jax.Array,  # [chunk, topk], this rank's tokens
@@ -183,7 +183,7 @@ def _pair_post_combine(
     token = flat // topk
     out_dtype = jnp.result_type(recv.dtype, topk_weights.dtype)
     if post_expert_norm_weight is not None and recv.ndim == 3:
-        weighted = pair_post_combine(
+        weighted = twolevel_post_combine(
             recv, post_expert_norm_weight, weight, rows=rows, eps=1e-8
         ).reshape(rows, hidden_size)
     else:
@@ -234,11 +234,11 @@ def moe_gmm_local_rs_nodedup(
     sp_enabled: bool = True,
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
-    allow_pair_exchange: bool = False,
+    allow_twolevel_rs: bool = False,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
-    ``allow_pair_exchange``: expert TP whose ranks 2c and 2c + 1 are one chip's two
+    ``allow_twolevel_rs``: expert TP whose ranks 2c and 2c + 1 are one chip's two
     cores (see _ep_ranks_pair_cores).
 
     Sends every row to its (local_row, topk_slot) slot via ICI direct-write,
@@ -372,11 +372,11 @@ def moe_gmm_local_rs_nodedup(
     )
 
     # Below 4096 tokens per call the extra sibling stage costs more than it saves (bench).
-    # The pair combine norms whole rows: a padded hidden takes the plain path.
+    # The two-level combine norms whole rows: a padded hidden takes the plain path.
     padded_hidden = (
         has_post_norm and post_expert_norm_weight_input.shape[0] < hidden_size
     )
-    pair_exchange = allow_pair_exchange and num_tokens >= 4096 and not padded_hidden
+    twolevel_rs = allow_twolevel_rs and num_tokens >= 4096 and not padded_hidden
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
         w1,
@@ -402,7 +402,7 @@ def moe_gmm_local_rs_nodedup(
         top_k=kernel_topk,
         expert_tp=expert_tp,
         fp4_w4a16=fp4_w4a16,
-        pair_exchange=pair_exchange,
+        twolevel_rs=twolevel_rs,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -417,8 +417,8 @@ def moe_gmm_local_rs_nodedup(
         )
     )
     post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
-    if pair_exchange:
-        return _pair_post_combine(
+    if twolevel_rs:
+        return _twolevel_post_combine(
             out_buf,
             topk_indices,
             local_topk_weights,
@@ -569,9 +569,9 @@ def expert_parallel_gmm_rs(
             sp_enabled=sp_enabled,
             expert_tp=expert_tp,
             fp4_w4a16=fp4_w4a16,
-            allow_pair_exchange=(
+            allow_twolevel_rs=(
                 expert_tp
-                and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE.get()
+                and tpu_envs.SGLANG_TPU_ENABLE_FUSED_RS_ETP_TWOLEVEL.get()
                 and _ep_ranks_pair_cores(ep_size)
             ),
         ),

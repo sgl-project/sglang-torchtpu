@@ -6,8 +6,8 @@ post-expert norm), prepared through the serving path. The fused-RS output, chunk
 the serving wrapper chunks expert-TP calls, is checked against the stock gmm_v2 MoE on
 the same weights dequantized, all-reduced, normed and combined in f32, with and without
 the post-expert norm. ``--weights bf16`` runs fused-RS on those dequantized weights
-instead. Set SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE=1 to cover pair exchange (4096 tokens
-reach it).
+instead. Set SGLANG_TPU_ENABLE_FUSED_RS_ETP_TWOLEVEL=1 to cover the two-level
+reduce-scatter (4096 tokens reach it).
 
     eval $(python3 -m torch.tpu.distributed)
     export TORCH_TPU_TOPOLOGY TORCH_TPU_SLICEBUILDER_ADDRESSES WORLD_SIZE

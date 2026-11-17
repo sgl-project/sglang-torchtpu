@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pair-exchange fused-RS post-kernel combine for models with a post-expert norm.
+"""Two-level fused-RS post-kernel combine for models with a post-expert norm.
 
 Sums the receive blocks, applies the post-expert RMS norm and each row's top-k weight in
 one Pallas pass. Every bf16 cast of the JAX reference is kept (torch_tpu compiles without
@@ -18,7 +18,7 @@ from jax.experimental.pallas import tpu as pltpu
 _BLOCK_BYTES = 8 << 20
 
 
-def _pair_combine_kernel(x_ref, gain_ref, w_ref, o_ref, *, eps):
+def _twolevel_combine_kernel(x_ref, gain_ref, w_ref, o_ref, *, eps):
     blocks = x_ref.shape[0]
     hidden = x_ref.shape[2] * x_ref.shape[3]
     acc = x_ref[0].astype(jnp.float32)
@@ -31,8 +31,8 @@ def _pair_combine_kernel(x_ref, gain_ref, w_ref, o_ref, *, eps):
     o_ref[...] = (z.astype(jnp.float32) * w[:, :, None]).astype(o_ref.dtype)
 
 
-def pair_post_combine(
-    recv: jax.Array,  # [blocks * rows, H1, H2] pair-exchange receive blocks, rank order
+def twolevel_post_combine(
+    recv: jax.Array,  # [blocks * rows, H1, H2] two-level receive blocks, rank order
     post_norm_weight: jax.Array,  # [H1 * H2], zero-centered gain
     rank_weight: jax.Array,  # [rows] f32: the top-k weight of each rank's (token, slot)
     *,
@@ -54,7 +54,7 @@ def pair_post_combine(
     gain = (post_norm_weight.astype(jnp.float32) + 1.0).reshape(h1, h2)
     w = jnp.broadcast_to(rank_weight.astype(jnp.float32)[:, None], (rows, 128))
     return pl.pallas_call(
-        functools.partial(_pair_combine_kernel, eps=eps),
+        functools.partial(_twolevel_combine_kernel, eps=eps),
         grid=(pl.cdiv(rows, rb),),
         in_specs=[
             pl.BlockSpec((blocks, rb, h1, h2), lambda i: (0, i, 0, 0)),

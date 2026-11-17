@@ -58,12 +58,12 @@ class TestNvfp4ExpertTpFusedRs(CustomTestCase):
         covers only quantized weights)."""
         self._run({}, "--weights bf16")
 
-    def test_pair_exchange_matches_reference(self):
-        """4096 tokens reach pair exchange (on-chip pair sums, one more bf16 rounding);
-        4100 pad to 4104 rows per rank, which the 256-row combine blocks must not drop
-        the tail of."""
+    def test_twolevel_rs_matches_reference(self):
+        """4096 tokens reach the two-level reduce-scatter (on-chip chip sums, one more
+        bf16 rounding); 4100 pad to 4104 rows per rank, which the 256-row combine blocks
+        must not drop the tail of."""
         self._run(
-            {"SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE": "1"}, "--tokens 64,4096,4100"
+            {"SGLANG_TPU_ENABLE_FUSED_RS_ETP_TWOLEVEL": "1"}, "--tokens 64,4096,4100"
         )
 
 
