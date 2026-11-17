@@ -8,6 +8,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.muse_megakernel import ops
 from sglang_tpu.muse_megakernel.common.plan import fold_fits
 from sglang_tpu.muse_megakernel.common.scratch import scratch_vmem_bytes
+from sglang_tpu.muse_megakernel.decode.spep.config import ep_mk_config
 
 register_tpu_ci(est_time=2, suite="stage-a-test-tpu-unit", chips=1)
 
@@ -178,6 +179,15 @@ class TestMuseMegakernelConfig(CustomTestCase):
                         )
                     )
                     self.assertLessEqual(scratch_vmem_bytes(cfg), budget)
+
+    def test_ep_steps_validate(self):
+        # the EP kernel validates ep_mk_config's config (no VMEM Y, no single-row collectives)
+        for q, n_req in ((1, 1), (8, 2), (8, 8), (8, 16)):
+            for pool in ({}, _FP8_SAL):
+                with self.subTest(q=q, n_req=n_req, **pool):
+                    cfg = _raw_config(_megakernel(moe_mode="ep"), q, n_req, **pool)
+                    self.assertEqual(cfg.row_tile, 16)
+                    ep_mk_config(cfg).validate()
 
     def test_expert_groups_of(self):
         groups = ops.expert_groups_of(_KINDS, 15)

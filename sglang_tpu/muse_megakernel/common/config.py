@@ -445,6 +445,8 @@ ATTN_OUT_TILE = 64
 POST_MOE_TILE = 128
 # post_moe tiles POST_MOE_TILE rows as POST_MOE_TILE / tp rows of each rank's token block.
 ROW_ALIGN = POST_MOE_TILE
+# the SP program has no post_moe tiling: rows split evenly over tp ranks, 2+ rows each
+SP_ROW_ALIGN = 16
 
 
 class PFConfig(MuseGeometry, frozen=True, kw_only=True):
@@ -454,15 +456,22 @@ class PFConfig(MuseGeometry, frozen=True, kw_only=True):
     fp8_gather: bool = False
     # layers whose fp4 experts are block-requantized (SGLANG_TPU_MUSE_MK_QBLOCK): W4A16 MoE
     w4a16_layers: tuple = ()
+    # sequence-parallel prefill (prefill/spep): rows / tp rows per rank, MoE on whole experts (EP)
+    sp: bool = False
+    # per layer "fp4" / "fp8": the SP program's expert dot kinds
+    expert_kinds: tuple = ()
+    # SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT: experts / pool / unpool in decode EP's layout
+    sp_ep_layout: bool = False
 
     def validate(self) -> "PFConfig":
         if self.tp != PREFILL_TP:
             raise ValueError(
                 f"the Muse prefill program runs at TP {PREFILL_TP}, got {self.tp}"
             )
-        if self.rows % ROW_ALIGN:
+        align = SP_ROW_ALIGN if self.sp else ROW_ALIGN
+        if self.rows % align:
             raise ValueError(
                 f"{self.rows}-row extend step: the Muse prefill program needs multiples of "
-                f"{ROW_ALIGN} (tpu_compile_tokens)"
+                f"{align} (tpu_compile_tokens)"
             )
         return self

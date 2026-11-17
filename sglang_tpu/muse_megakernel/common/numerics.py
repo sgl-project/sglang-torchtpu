@@ -21,6 +21,13 @@ def _heads_rms(x, n_heads, d, eps, gain=1.0):
     return parts[0] if n_heads == 1 else jnp.concatenate(parts, axis=1)
 
 
+def heads_rms_xla(x, n_heads, d, eps, gain=1.0):
+    """_heads_rms for XLA programs: one rms over [rows, heads, d] instead of a slice, rms and
+    concat per head (the per-head form suits Mosaic, where a 3-D reshape costs a relayout)."""
+    y = _rms(x.reshape(x.shape[0], n_heads, d), eps) * gain
+    return y.reshape(x.shape[0], n_heads * d)
+
+
 def _rope_roll(x, n_heads, d, cos_x, sin_x):
     """Interleaved rotary with lane-expanded tables: the pair partner is one lane roll away."""
     w = n_heads * d

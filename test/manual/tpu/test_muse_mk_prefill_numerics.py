@@ -32,6 +32,8 @@ import torch.distributed as dist
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_muse_megakernel_numerics as M  # noqa: E402
 
+from sglang_tpu.envs import envs as tpu_envs  # noqa: E402
+
 TP = M.TP
 # Measured (block-256 experts): per-row errors up to 2.6% / 3.6% on fp4 / fp8 layers, means
 # 1.6-1.8% / 2.7-3.0%. fp8 layers' fused-RS rows are fp8-quantized (~2^-4 per element) and
@@ -44,6 +46,9 @@ _NEAR_TIE = 1e-2
 # The fp8 gathers add one e4m3 rounding (~2^-4) of the expert input and the post-expert
 # projection per layer.
 _FP8_GATHER_TOL_SCALE = 1.5
+# Transposed RPA prefill tiles (SGLANG_TPU_RPA_TRANSPOSED): the fp8 MXU accumulates Q^T K at
+# ~bf16 precision even with the hi/lo Q^T split; measured means 3.5% / 3.7% (pf_c1q384).
+_TRANSPOSED_MEAN_REL = 4e-2
 
 
 class Case(msgspec.Struct, frozen=True):
@@ -591,6 +596,8 @@ def _set_tolerances(fp8_gather: bool) -> None:
     scale = _FP8_GATHER_TOL_SCALE if fp8_gather else 1.0
     M.TOL_ROW_REL = tuple(t * scale for t in _TOL_ROW_REL)
     M.TOL_MEAN_REL = tuple(t * scale for t in _TOL_MEAN_REL)
+    if tpu_envs.SGLANG_TPU_RPA_TRANSPOSED.get():
+        M.TOL_MEAN_REL = tuple(max(t, _TRANSPOSED_MEAN_REL) for t in M.TOL_MEAN_REL)
     M.NEAR_TIE = _NEAR_TIE
 
 
@@ -722,10 +729,13 @@ def main() -> None:
     args = ap.parse_args()
     if args.capture is not None and not args.bench_iters:
         raise ValueError("--capture is for --bench-iters; numerics checks every layer")
-    if args.sp or args.sp_ep_layout:
-        raise NotImplementedError(
-            "--sp: the SP program (prefill/spep) is not in this tree yet"
-        )
+    if args.sp:
+        os.environ["SGLANG_TPU_MUSE_MK_PREFILL_SP"] = "1"
+    if args.sp_ep_layout:
+        if not (args.sp and args.bench_iters):
+            raise ValueError("--sp-ep-layout needs --sp and --bench-iters")
+        os.environ["SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT"] = "1"
+        M._EP = True
     if M.tp_qblock() != 256:
         raise ValueError(
             "needs SGLANG_TPU_MUSE_MK_QBLOCK=256 (served block-256 experts)"

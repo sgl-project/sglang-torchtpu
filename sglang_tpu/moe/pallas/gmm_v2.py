@@ -307,6 +307,9 @@ class InputConfigs:
     scale_dtype: jnp.dtype | None = None
     dequantize_in_vmem: bool = False
     requantize_in_vmem: bool = False
+    # lhs only: one quantization scale per row over the whole tile_k; each rhs block's partial
+    # then takes only its rhs scale, and the row scale multiplies once per tile.
+    row_scale: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -612,15 +615,38 @@ def inner_kernel(
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_cols = tiled_rhs.shape[1]
+            row_scale = cfgs.lhs_cfgs.row_scale
+            k_step = q_block_size
+            scales_dtype = jnp.float32 if _FP32_MOE_SCALES else acc_ref.dtype
+            if row_scale:
+                # one scale per row over the tile's K: partials need only their rhs scale
+                row_abs_max = jnp.max(jnp.abs(tiled_lhs), axis=1, keepdims=True)
+                row_s = row_abs_max / dtype_max
+                row_s_inv = jnp.where(row_s == 0, 0, 1 / row_s)
+                lhs_q_all = (tiled_lhs * row_s_inv).astype(lhs_q_dtype)
+                k_step = cfgs.rhs_cfgs.quant_block_size
             for start_n in range(0, rhs_cols, mxu_size):
                 end_n = min(rhs_cols, start_n + mxu_size)
                 col_size = end_n - start_n
 
                 acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
-                    end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-                    block_lhs = tiled_lhs[:, start_k:end_k]
+                for start_k in range(0, cfgs.tiles.tile_k, k_step):
+                    end_k = min(cfgs.tiles.tile_k, start_k + k_step)
                     block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
+                    if row_scale:
+                        block_acc = jnp.matmul(
+                            lhs_q_all[:, start_k:end_k],
+                            block_rhs,
+                            preferred_element_type=preferred_element_type,
+                        ).astype(acc_ref.dtype)
+                        b_id = start_k // cfgs.rhs_cfgs.quant_block_size
+                        rs = tiled_rhs_ref.get_scale(b_id, cfgs.rhs_cfgs.scale_block_n)
+                        acc_n += (
+                            block_acc.astype(scales_dtype)
+                            * rs[..., start_n:end_n].astype(scales_dtype)
+                        ).astype(acc_ref.dtype)
+                        continue
+                    block_lhs = tiled_lhs[:, start_k:end_k]
 
                     # Perform lhs quantization. Note that for every block_lhs,
                     # same computation will be performed tiles_n//mxu_size times.
@@ -654,10 +680,12 @@ def inner_kernel(
                         block_acc,
                         block_scale,
                         rhs_scale,
-                        scales_dtype=(
-                            jnp.float32 if _FP32_MOE_SCALES else acc_ref.dtype
-                        ),
+                        scales_dtype=scales_dtype,
                     )
+                if row_scale:
+                    acc_n = (
+                        acc_n.astype(scales_dtype) * row_s.astype(scales_dtype)
+                    ).astype(acc_ref.dtype)
                 acc_list.append(acc_n)
             acc = jnp.concatenate(acc_list, axis=1)
 
@@ -1418,6 +1446,7 @@ def make_gmm_configs(
     rhs_quant_dtype: jnp.dtype | None = None,
     dequantize_rhs: bool = False,
     requantize_rhs: bool = False,
+    lhs_scale_per_row: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1551,7 +1580,15 @@ def make_gmm_configs(
             "Packed FP4 GMM requires TPU FP8 activation quantization support."
         )
 
-    if lhs_q_dtype is not None and num_blocks > 1 and not requantize_rhs:
+    row_scale = lhs_scale_per_row and lhs_q_dtype is not None and not requantize_rhs
+    if row_scale and rhs_scale is None:
+        raise ValueError("lhs_scale_per_row needs a block-scaled rhs (rhs_scale)")
+    if (
+        lhs_q_dtype is not None
+        and num_blocks > 1
+        and not requantize_rhs
+        and not row_scale
+    ):
         lhs_quant_block_size = min(lhs_quant_block_size, block_size)
 
     lhs_cfgs = InputConfigs(
@@ -1560,13 +1597,19 @@ def make_gmm_configs(
         # scale value. Since this operation is very memory intensive, we use a
         # block size that is small enough to minimize memory overhead but large
         # enough to minimize compute overhead of quantization.
-        quant_block_size=lhs_quant_block_size,
+        quant_block_size=dims.size_k if row_scale else lhs_quant_block_size,
         dtype=lhs.dtype,
+        row_scale=row_scale,
     )
     # For block quantization (num_blocks > 1), rhs block size must be a
     # multiple of lhs block size. Per-channel quantization (num_blocks == 1)
     # is always safe because a single scale covers the full contracting dim.
-    if lhs_q_dtype is not None and num_blocks > 1 and not requantize_rhs:
+    if (
+        lhs_q_dtype is not None
+        and num_blocks > 1
+        and not requantize_rhs
+        and not row_scale
+    ):
         assert rhs_cfgs.quant_block_size % lhs_cfgs.quant_block_size == 0, (
             "Unsupported quantization configuration: rhs_quant_block_size must "
             "be a multiple of lhs_quant_block_size for block quantization. Got "
@@ -1667,6 +1710,7 @@ def get_metadata(cfgs: GmmConfigs):
         "packed_fp4",
         "rhs_quant_dtype",
         "dequantize_rhs",
+        "lhs_scale_per_row",
     ]
 )
 def gmm_v2(
@@ -1689,6 +1733,7 @@ def gmm_v2(
     rhs_quant_dtype: jnp.dtype | None = None,  # set when rhs is pre-packed
     dequantize_rhs: bool = False,
     rhs_channel_scale: jax.Array | None = None,
+    lhs_scale_per_row: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1706,6 +1751,9 @@ def gmm_v2(
             [size_group, 1, out_size]; rhs_scale must contain FP32 group-32 scales
             divided by these multipliers. Additive rhs_bias is unsupported in
             this mode. Weights stay packed INT4 in HBM.
+        lhs_scale_per_row: Optional. Quantize lhs with one scale per row over each K tile
+            instead of per 512 columns: each rhs block's partial then takes only its rhs scale
+            and the row scale multiplies once per tile (fewer VALU ops on block-scaled rhs).
         group_offset: Optional. The group offset of shape [1,].
         tile_info: The tile sizes or tile function to use.
         vmem_limit_bytes: Optional vmem limit in bytes.
@@ -1759,6 +1807,7 @@ def gmm_v2(
         rhs_quant_dtype=rhs_quant_dtype,
         dequantize_rhs=dequantize_rhs,
         requantize_rhs=requantize_rhs,
+        lhs_scale_per_row=lhs_scale_per_row,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
