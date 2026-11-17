@@ -731,6 +731,32 @@ def _validate_dsa(server_args) -> None:
             "DSA on TPU does not support index_init_tokens or index_local_tokens "
             f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
         )
+    _validate_kpool_raw_ring(cfg)
+
+
+def _validate_kpool_raw_ring(cfg) -> None:
+    """The pooled indexer's raw ring (SGLANG_TPU_DSA_KPOOL_RAW_RING) keeps raw
+    rows by request slot, not by page, so nothing that moves pages can carry an
+    open pool's raw rows, and an unchunked prefill would overrun the ring."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_DSA_KPOOL_RAW_RING.get():
+        return
+    if cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING does not support --disaggregation-mode "
+            f"{cfg.disaggregation_mode!r}: a P/D transfer moves pages, and the "
+            "ring's raw rows are not paged."
+        )
+    if cfg.enable_prefill_cp:
+        raise ValueError(
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING does not support --enable-prefill-cp."
+        )
+    if cfg.chunked_prefill_size is None or cfg.chunked_prefill_size <= 0:
+        raise ValueError(
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING needs chunked prefill: the ring is sized "
+            "for one chunk per request per step."
+        )
 
 
 def _validate_mtp_index_share(cfg, hf_config) -> None:
