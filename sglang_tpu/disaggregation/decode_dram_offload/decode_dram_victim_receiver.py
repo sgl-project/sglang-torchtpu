@@ -171,7 +171,7 @@ class DecodeDramVictimReceiver:
     def _make_host_room(self, num_tokens: int, swa_tokens: int) -> None:
         """Evict until every rank has room for the push in each host pool. The
         manifest agreement made the push's tokens and blocks the same on every
-        rank; one collective finds the most room any rank is short of."""
+        rank; collective maxima find the room any rank is short of."""
         pool, swa_pool = self._host_pool, self._swa_host_pool
         short, swa_short = self._lockstep.reduce(
             [
@@ -184,6 +184,13 @@ class DecodeDramVictimReceiver:
         )[0]
         if short:
             self._cache.evict_host(short, ComponentType.FULL)
+            if swa_short:
+                # Removing a full host leaf also frees its SWA pages. Recheck
+                # every rank before evicting additional windows.
+                swa_short = self._lockstep.reduce(
+                    [[max(0, swa_tokens - swa_pool.available_size())]],
+                    dist.ReduceOp.MAX,
+                )[0][0]
         if swa_short:
             self._cache.evict_host(swa_short, ComponentType.SWA)
 
