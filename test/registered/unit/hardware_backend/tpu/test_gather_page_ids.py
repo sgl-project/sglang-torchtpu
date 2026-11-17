@@ -5,6 +5,8 @@ Covers the unrolled kernel (page table of at most 13 chunks of 128 pages) and th
 bounded-loop kernel used for wider tables (256k and 1M context at page 128).
 """
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -67,3 +69,7 @@ def test_matches_reference(pages_per_seq, seq_pages, num_tokens):
     np.testing.assert_array_equal(
         np.asarray(out), _reference(page_indices, seq_page_ids, seq_ids, max_num_seqs)
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
