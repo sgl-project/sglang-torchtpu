@@ -4524,6 +4524,12 @@ class SchedulerDisaggregationDecodeMixin:
         if len(self.waiting_queue) == 0:
             return None
 
+        # An idle probe can still be decoding when a user's KV transfer
+        # finishes. Let its tiny forward finish alone: merging the user into
+        # it would change the user's decode batch shape solely for liveness.
+        if any(is_health_check_req(req) for req in running_batch.reqs):
+            return None
+
         if self.enable_priority_scheduling:
             self.waiting_queue.reorder(
                 self.policy.calc_priority(self.waiting_queue, running_batch)
@@ -4543,10 +4549,16 @@ class SchedulerDisaggregationDecodeMixin:
 
         # pop req from waiting queue
         can_run_list: List[Req] = []
+        waiting_queue: List[Req] = []
+        has_traffic = not running_batch.is_empty() or any(
+            not is_health_check_req(req) for req in self.waiting_queue
+        )
 
         for req in self.waiting_queue:
-            # we can only add at least `num_not_used_batch` new batch to the running queue;
-            # a request restored from host memory waits until its copy has finished
+            if has_traffic and is_health_check_req(req):
+                waiting_queue.append(req)
+                continue
+            # A host-restored request joins only after the copy is ready.
             if len(can_run_list) < num_not_used_batch and (
                 not host_restore
                 or req.kv.restore_done_event is None
