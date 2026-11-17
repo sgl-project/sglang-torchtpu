@@ -125,6 +125,27 @@ def share_experts(prefiller: Any, decoder: Any) -> None:
     program.load_weights = load_weights
 
 
+def share_first_aux(prefiller: Any, decoder: Any) -> bool:
+    """First-step drafts (SGLANG_TPU_K3_PROGRAM_OPT_FIRST_STEP_DRAFTS): the
+    prefill program keeps each request's last prompt position's aux streams
+    and the decode program drafts from them before the request's first
+    verify, which then takes a speculative step's tokens instead of one.
+    Needs the MLA draft on both programs (its context in the draft pools, no
+    ring) and one-request speculation (attention DP1); returns whether it is
+    on. Before warmup: both programs warm the ops it adds."""
+    if getattr(prefiller, "draft_latents", None) is None:
+        return False
+    draft = getattr(decoder, "draft", None)
+    if draft is None or getattr(draft, "imports_ring", True):
+        return False
+    from sglang_tpu.k3_programs.kimi_k3.config import active
+
+    if getattr(active(), "attention_dp", 1) != 1:
+        return False
+    prefiller.first_aux = decoder.first_aux = {}
+    return True
+
+
 class ColocatedSteps:
     """Extend batches to the prefill program, decode batches to the decode
     program, over one set of unified pools."""
