@@ -45,6 +45,17 @@ class KernelConfig:
     # 8-row steps: stage a singleton route's active row with one select over
     # the 8-row latent tile instead of a branch per row (the same bits).
     b8_singleton_select: bool = False
+    # 8-row steps, grouped MXFP4 routes: an expert pair that is not two
+    # singletons and whose experts have at most 4 rows each runs on compact
+    # tiles of each expert's rows (both staged by one one-hot [16, 8] x [8, K]
+    # product; the source rows without local routes are zeroed first): the
+    # paired gate/up's register operands narrowed to 4 rows a tile (as B16's
+    # capacity-4 pairs), then each expert's finish on its tile (block-major
+    # down, a one-hot selector placing the BF16 rows) instead of the 8-row
+    # pair. Busier pairs and the tail keep the 8-row path. Each row's
+    # products, scale reductions and sums are unchanged (bit-identical when
+    # the routed rows' latents are finite).
+    b8_compact_experts: bool = False
     b16_compact_experts: bool = True
     # B16 compact experts: stage each tile's rows with a one-hot [8, 16] x
     # [16, K] product (as B64, B96 and B128 do) instead of a scalar scan of

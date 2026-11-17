@@ -14,8 +14,11 @@ does.
 The routed outputs must be bit-identical to the steal layout alone (each core
 running its own group's experts) at B8 and B16, on random MXFP4 experts and
 routings that give in both directions, up to the slot cap, with stolen
-experts on every stream path; also with eager DMAs. Perturbed plans (each
-core plans every other layer from fewer rows, so a receiver expects more or
+experts on every stream path; also with eager DMAs, and at B8 with compact
+expert pairs (KernelConfig.b8_compact_experts, stolen experts among them;
+latents and scales of a wide range, so FP32 sums round), whose steal-layout
+outputs must also match the eight-row pairs'. Perturbed plans (each core
+plans every other layer from fewer rows, so a receiver expects more or
 fewer or other experts than its sibling sends) must not hang: the receivers
 follow the senders' packets (counted as mismatches), every expert still runs
 once, and no DMA semaphore is left nonzero.
@@ -110,6 +113,41 @@ def _plan(winners, live, group, slots, timing):
     return d_mine, d_theirs, give, take, used[0][len(used[0]) - give :]
 
 
+def _receiver_pairs(routes, timing, capacity):
+    """Coverage tags of one core's expert pairs (its captured routes and
+    counts): compact pairs (both experts at most ``capacity`` rows, not two
+    singletons) and eight-row pairs, with or without a stolen expert, in the
+    stream's order (the stolen experts hoisted before the last own pair as
+    _run_routed_expert_stream's column())."""
+    counts = routes[:, 128]
+    # Slots that run nothing here hold expert_steal.UNROUTED (255).
+    rows = [{int(e) for e in r[:n] if e < 128} for r, n in zip(routes, counts)]
+    experts = sorted(set().union(*rows))
+    sizes = {e: sum(e in row for row in rows) for e in experts}
+    own = sum(e < GROUP_EXPERTS for e in experts)
+    moved = len(experts) - own
+    slab, lead, copy, _ = timing
+    hoist = moved > 0 and own >= 6 and (slab + copy) * moved - lead <= 10 * (own - 4)
+    order = []
+    for position in range(len(experts)):
+        entry = position
+        if hoist and position >= own - 2:
+            if position < own - 2 + moved:
+                entry = position + 2
+            elif position < own + moved:
+                entry = position - moved
+        order.append(experts[entry])
+    tags = set()
+    for first in range(0, len(order) - 1, 2):
+        pair = order[first : first + 2]
+        largest = max(sizes[e] for e in pair)
+        kind = "single" if largest == 1 else "compact" if largest <= capacity else ""
+        kind = kind or "eight-row"
+        stolen = any(e >= GROUP_EXPERTS for e in pair)
+        tags.add(f"{kind} pair" + (" with a stolen expert" if stolen else ""))
+    return tags
+
+
 def _child(mode, batch):
     os.environ["XLA_FLAGS"] = (
         "--xla_force_host_platform_device_count=2 --xla_cpu_max_isa=AVX "
@@ -118,12 +156,14 @@ def _child(mode, batch):
     os.environ["JAX_PLATFORMS"] = "cpu"
     from sglang_tpu.k3_programs.kimi_k3 import config
 
+    compact_pairs = mode == "compact"
     config.install(
         config.KernelConfig(
             expert_steal=True,
             expert_schedule=True,
             b8_singleton_select=True,
             b16_one_hot_staging=True,
+            b8_compact_experts=compact_pairs,
         )
     )
     import jax
@@ -143,6 +183,12 @@ def _child(mode, batch):
     perturbed = mode == "perturbed"
     winners, probabilities, totals, live, latents = _routing(batch, 7 + batch)
     rng = np.random.default_rng(11)
+    exponent_range = (119, 123)
+    if compact_pairs:
+        # A wide dynamic range (latents and scales): FP32 sums round, so a
+        # different order of any product or sum shows.
+        latents = latents * 2.0 ** rng.integers(-12, 13, latents.shape)
+        exponent_range = (112, 132)
 
     def mxfp4(rows, columns):
         """[2 groups, experts, rows / 8, columns] random packed MXFP4 codes."""
@@ -151,7 +197,7 @@ def _child(mode, batch):
 
     def exponents(rows, columns):
         shape = (2, GROUP_EXPERTS, rows // 32, columns)
-        return rng.integers(119, 123, shape).astype(np.uint8)
+        return rng.integers(*exponent_range, shape).astype(np.uint8)
 
     weights = (mxfp4(K, 2 * W), exponents(K, 2 * W), mxfp4(W, OUT), exponents(W, OUT))
     rows = dmk._expert_accumulator_rows(batch, jnp.uint32, group_pending_routes=True)
@@ -326,8 +372,16 @@ def _child(mode, batch):
 
     reference, reference_routes, _ = run(False)
     stolen, routes, info = run(True)
+    # Each interpreted call starts a new race state: read the steal's now.
     races = interpret_pallas_call.races
     raced = bool(races is not None and races.races_found)
+    if compact_pairs:
+        # The steal layout's eight-row pairs (no compact tiles).
+        dmk.B8_COMPACT_EXPERTS = False
+        rows = dmk._expert_accumulator_rows(batch, jnp.uint32, group_pending_routes=True)
+        sources = (pltpu.VMEM((1, K), jnp.bfloat16),) * 2
+        eight_row_reference, _, _ = run(False)
+        dmk.B8_COMPACT_EXPERTS = True
 
     ok = True
     # Without a steal the routes are the router's ownership pass: own group,
@@ -364,6 +418,16 @@ def _child(mode, batch):
             ok &= close
             continue
         ok &= exact
+        if compact_pairs:
+            same = np.array_equal(
+                eight_row_reference[:, layer].view(np.uint32),
+                reference[:, layer].view(np.uint32))
+            print(f"B{batch} layer {layer}: compact pairs match the eight-row pairs: "
+                  f"{same}", flush=True)
+            ok &= same
+            for core in (0, 1):
+                coverage |= _receiver_pairs(
+                    routes[core, layer], dmk.STEAL_TIMING[batch], dmk.B8_COMPACT_ROWS)
         for core in (0, 1):
             d_mine, d_theirs, give, take, given = plans[core]
             ok &= gives[core] == give and received[core] == take
@@ -407,6 +471,9 @@ def _child(mode, batch):
                   "stolen single-row", "stolen multi-row"}
         if batch == 16:
             wanted.add("stolen past a compact tile")
+        if compact_pairs:
+            wanted |= {"compact pair", "compact pair with a stolen expert",
+                       "eight-row pair with a stolen expert"}
         ok &= wanted <= coverage
     # Interpret mode prints any DMA semaphore left nonzero at kernel exit; the
     # test fails on it.
@@ -442,6 +509,9 @@ class TestK3ExpertStealMegakernel(CustomTestCase):
 
     def test_b8_eager_dmas(self):
         self._run("eager", 8)
+
+    def test_b8_compact_experts_bit_identical_to_the_steal_layout(self):
+        self._run("compact", 8)
 
     def test_perturbed_plan_neither_hangs_nor_drops_experts(self):
         self._run("perturbed", 16)
