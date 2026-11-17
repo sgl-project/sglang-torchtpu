@@ -23,8 +23,8 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 DRAFT_MODEL_PATH = resolve_tpu_model_path("lmsys/EAGLE3-gpt-oss-120b-bf16")
 
-# Backbone nightly measures 0.946 on the same sampling; greedy speculative
-# decoding should not move it past the tolerance.
+# Backbone nightly measures 0.946 on the same sampling; this config measured
+# 0.943 with accept length 3.06.
 GSM8K_ACCURACY = 0.946
 GSM8K_ATOL = 0.05
 SPEC_ACCEPT_LENGTH_THRESHOLD = float(
