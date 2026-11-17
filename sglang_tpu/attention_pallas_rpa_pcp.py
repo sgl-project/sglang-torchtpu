@@ -43,6 +43,7 @@ from dataclasses import dataclass, fields
 import torch
 
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import cdiv
 from sglang_tpu.cp_forward import all_gather_and_write_kv
 from sglang_tpu.kv_row_write import kv_write_segments, write_run_bound
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
@@ -786,7 +787,7 @@ def check_pcp_ring_schedule(runner, backend, host):
     config = runner.model_config
     attn_tp_size = get_parallel().attn_tp_size
     stride = backend.page_size * host.cp_size
-    pages_per_seq = -(-backend.max_context_len // stride)
+    pages_per_seq = cdiv(backend.max_context_len, stride)
     with tpu_info_for_cpu_export():
         check_pcp_fused_schedule(
             num_q_heads=config.get_num_attention_heads(attn_tp_size),

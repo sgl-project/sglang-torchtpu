@@ -40,6 +40,8 @@ from typing import NamedTuple, Sequence
 
 import numpy as np
 
+from sglang.srt.utils.common import cdiv, round_up
+
 
 class TpuCpHostLayout(NamedTuple):
     """Zigzag layout of one extend batch as seen from ``cp_rank``."""
@@ -297,9 +299,11 @@ def warmup_request_lengths(
 
 
 def ring_block_size(length: int, cp_size: int, page_size: int) -> int:
-    """Page-aligned zigzag block size of a request of ``length`` tokens."""
-    block = -(-int(length) // (2 * cp_size))
-    return -(-block // page_size) * page_size
+    """Size of each of a request's ``2 * cp_size`` zigzag blocks: its tokens
+    split evenly over the blocks, rounded up to whole pages (e.g. 6808 tokens,
+    cp 4, page 256: 851 per block -> 1024)."""
+    tokens_per_block = cdiv(int(length), 2 * cp_size)
+    return round_up(tokens_per_block, page_size)
 
 
 def ring_block_lens(length: int, cp_size: int, page_size: int) -> list[int]:
