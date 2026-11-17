@@ -231,6 +231,21 @@ class KernelConfig:
     # four chunks start right then (under the last down_proj all-reduce).
     # The same products in the same order (bit-identical).
     draft_lm_prefetch: bool = False
+    # MLA DSpark drafts with FP8 pools: the DCP attention stages its pages as
+    # [span * 512, 640] in the MXU's native tile (each page DMA retiles a pool
+    # block, as attention DP2's plain decode does) instead of the pool's
+    # [span * 128, 4, 640] blocks, whose loads relayout every tile before QK.
+    # The same FP8 bytes in the same token order reach the same products
+    # (bit-identical).
+    draft_native_pages: bool = False
+    # MLA DSpark drafts: the DCP attention runs each sequence's page steps
+    # but its last without the visibility mask and the stale-token zeroing
+    # (every token of an earlier step is visible; the last step, peeled from
+    # the loop, keeps both), and its probability-value products accumulate
+    # without the 1/256 of their scaled FP8 probabilities, which is applied
+    # once before the normalization (a power of two: the accumulator holds
+    # exactly 256 times its value at every step). Bit-identical.
+    draft_step_trims: bool = False
     # Decode MoE router (weight arena, unsharded top-k): every rank copies and
     # projects both router halves, its own and its pair peer's (14 MiB of
     # arena instead of 7), instead of exchanging score halves with the peer.

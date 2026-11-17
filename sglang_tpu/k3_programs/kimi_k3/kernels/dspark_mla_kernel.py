@@ -1095,6 +1095,7 @@ def _make_body(
             # sends 512 lanes, not 640.
             attention.lse_in_padding = block < rows
             attention.group_fold = True
+            attention.step_trims = _config().draft_step_trims
             if block < rows and mla_dcp.GROUP == RANKS:
                 # Merge each host's partials before crossing hosts (chunked
                 # calls, one request a chunk, even one request).
@@ -1341,6 +1342,13 @@ def fused_draft_local(
         plan = mla_dcp.page_plan(
             group_rows, heads, rows, cache_dtype, force_chunks=chunks
         )
+        # KernelConfig.draft_native_pages: [span * 512, 640] FP8 page buffers
+        # (None: the pool's packed blocks).
+        native = (
+            True
+            if _config().draft_native_pages and cache_dtype == jnp.float8_e4m3fn
+            else None
+        )
         if single is None:
             prefetch = (
                 jnp.concatenate(
@@ -1381,6 +1389,7 @@ def fused_draft_local(
                 sequence_rows=rows,
                 force_chunks=chunks,
                 chunk_rows=rows,
+                native=native,
             ),
             tpu.VMEM(
                 (c.q_lora, dp * c.heads_per_rank * (c.nope + TILE)), jnp.bfloat16

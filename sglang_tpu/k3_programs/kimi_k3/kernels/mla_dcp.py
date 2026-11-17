@@ -494,7 +494,11 @@ def scoped_scratch(
     sequence_rows=1,
     force_chunks=False,
     chunk_rows=None,
+    native=None,
 ):
+    """``native``: stage native pages (see ``native_pages``; None: as that
+    picks them, e.g. the MLA DSpark draft's ``KernelConfig.draft_native_pages``
+    passes True)."""
     rows = packet_layout(batch, heads)[0] * batch
     tile = head_rows(batch, group, heads)
     packing = 4 // jnp.dtype(cache_dtype).itemsize
@@ -520,9 +524,11 @@ def scoped_scratch(
     else:
         span = span * PAGE_TOKENS // page_tokens
     span = max(1, span) * staged_folds(batch, heads, sequence_rows, cache_dtype)
+    if native is None:
+        native = native_pages(batch, heads, sequence_rows, cache_dtype)
     pages = (
         (buffers, span * page_tokens, LANES)
-        if native_pages(batch, heads, sequence_rows, cache_dtype)
+        if native
         else (buffers, span * page_tokens // packing, packing, LANES)
     )
     held = (
@@ -853,10 +859,12 @@ class DcpAttention:
             mask = mask & self._active(row, local_step)
         return mask
 
-    def _attend_step(self, step, base=0):
+    def _attend_step(self, step, base=0, *, interior=False):
         """One step of the local attention: wait for its pages, prefetch
         ahead, and fold the pages' scores into its row's running softmax
-        (held at row - ``base``: the chunk's first row)."""
+        (held at row - ``base``: the chunk's first row). ``interior``
+        (static, ``_trimmed_steps``): a step before its row's last, every
+        token visible -- no mask, no stale-token zeroing."""
         self._wait_step(step)
 
         @pl.when(step + self.buffers - 1 < self.total)
@@ -865,7 +873,7 @@ class DcpAttention:
 
         if "pagecompute" in self.skip:
             return
-        row, visible, load = self._step_pages(step)
+        row, visible, load = self._step_pages(step, interior=interior)
         if self.cache_verify_rows:
             self._attend_cached_verify(step, row, load, base)
         elif (
@@ -1218,6 +1226,13 @@ class DcpAttention:
             and self.cache_verify_rows
             and _grouped_spec(self.batch, self.group, self.heads, self.sequence_rows)
         ):
+            if self._trimmed_steps():
+                # One sequence's steps: those before its last see every token.
+                pl.loop(first, end - 1)(
+                    lambda step: self._attend_step(step, base=base, interior=True)
+                )
+                pl.when(first < end)(lambda: self._attend_step(end - 1, base=base))
+                return
             pl.loop(first, end)(lambda step: self._attend_step(step, base=base))
             return
 
@@ -1236,10 +1251,15 @@ class DcpAttention:
             tpu.SMEM((1,), jnp.int32),
         )
 
-    def _step_pages(self, step):
+    def _step_pages(self, step, *, interior=False):
         """Step ``step``'s row, the mask of its visible tokens and a reader of
-        its pages (their stale bytes zeroed first)."""
+        its pages (their stale bytes zeroed first). ``interior`` (static): a
+        step whose tokens are all visible -- only lanes 576:640 are zeroed,
+        and the mask is None."""
         row, local_step, _ = self._locate(step)
+        if interior:
+            self._zero_step_pad_lanes(step % self.buffers)
+            return row, None, self._pages(step % self.buffers)
         offset = jax.lax.broadcasted_iota(
             jnp.int32, (1, self.span * self.page_tokens), 1
         )  # tokens on lanes
@@ -1495,7 +1515,8 @@ class DcpAttention:
             self.ws.queries[held] = query.astype(jnp.bfloat16)
 
     def _group_scores(self, load, visible, held, count):
-        """QK for adjacent queries, with independent head rows and scales."""
+        """QK for adjacent queries, with independent head rows and scales
+        (``visible`` None: every token visible)."""
         query = jnp.concatenate(
             [self.ws.queries[held + i] for i in range(count)], axis=0
         )
@@ -1506,10 +1527,13 @@ class DcpAttention:
         score = jax.lax.dot_general(
             query, latent, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
+        if visible is None:
+            return score * scales
         return jnp.where(visible, score * scales, -jnp.inf)
 
     def _group_fold(self, score, load, held, count):
-        """Fold grouped PV back into each query's own online state."""
+        """Fold grouped PV back into each query's own online state (under
+        ``_trimmed_steps`` the accumulator keeps 256 times the products)."""
         ws = self.ws
         previous = jnp.concatenate([ws.maximum[held + i] for i in range(count)], axis=0)
         new_maximum = jnp.maximum(previous, jnp.max(score, axis=1, keepdims=True))
@@ -1521,7 +1545,9 @@ class DcpAttention:
         values = load(pl.ds(0, LATENT))
         weighted = jax.lax.dot_general(
             high, values, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
-        ) * (1.0 / 256)
+        )
+        if not self._trimmed_steps():
+            weighted = weighted * (1.0 / 256)
         for i in range(count):
             rows = slice(i * self.tile, (i + 1) * self.tile)
             ws.denominator[held + i] = (
@@ -1654,7 +1680,8 @@ class DcpAttention:
 
     def _zero_step_pad_lanes(self, slot):
         """A dense step among compact ones zeroes its pages' lanes 576:640
-        itself (compact steps skip it: their gathered tiles are zeroed)."""
+        itself (compact steps skip it: their gathered tiles are zeroed), as
+        does an interior step of ``_trimmed_steps`` (its only stale bytes)."""
         self._zero_pad_lanes(self._slot_words(slot), self.span * self.page_tokens)
 
     def _slot_words(self, slot):
@@ -1734,8 +1761,11 @@ class DcpAttention:
             total_weight = ws.denominator[held]  # [head_rows, 1]
             row_maximum = ws.maximum[held]
             has = total_weight > 0
+            accumulator = ws.accumulator[held]
+            if self._trimmed_steps():  # the products' 1/256 (see _group_fold)
+                accumulator = accumulator * (1.0 / 256)
             normalized = jnp.where(
-                has, ws.accumulator[held] / jnp.where(has, total_weight, 1.0), 0.0
+                has, accumulator / jnp.where(has, total_weight, 1.0), 0.0
             )
             lse = jnp.where(
                 has, row_maximum + jnp.log(jnp.where(has, total_weight, 1.0)), NEG
@@ -1831,7 +1861,48 @@ class DcpAttention:
     # FP8 explicit-keys sequences: QK/PV for several rows in one
     # dot (the grouped path's arithmetic, per row as the ungrouped fold).
     group_fold = False
+    # group_fold calls whose step ranges each hold one sequence
+    # (KernelConfig.draft_step_trims, the MLA DSpark draft): see
+    # _trimmed_steps.
+    step_trims = False
     _lane_major = False  # packing for host_combine: send packet of peer p at (p % 8) hosts + p // 8
+
+    def _trimmed_steps(self):
+        """Whether ``step_trims`` applies: shared FP8 sequences on the
+        grouped fold without a selection, one sequence per step range (a
+        chunk, or a row group of an unchunked call).
+
+        A sequence's steps are its first row's local pages, ``span`` a step.
+        Every local page but the row's last holds only tokens below its limit
+        (the one partial global page is its owner's last), and the re-reads
+        of the last page fill only the last step, so every token of an
+        earlier step is visible: those steps fold without the mask and skip
+        the stale-token zeroing (they have none; lanes 576:640 are still
+        zeroed). The grouped PV accumulates without the 1/256 of its scaled
+        FP8 probabilities, which ``_pack_partials`` applies once: scaling by
+        a power of two commutes with each rounding of the update
+        ``acc * scale + PV``, so the accumulator holds exactly 256 times the
+        unscaled one (one below 2^-118, where the unscaled one may have
+        flushed to zero, flushes to zero itself when scaled). Both are exact
+        because every product and sum rounds on its own (Mosaic emits no
+        fused multiply-add: the select between the scaled score and the
+        softmax shift's subtraction changed no rounding)."""
+        if not (
+            self.step_trims
+            and self.shared
+            and self.fp8
+            and self.group_fold
+            and self.sequence_rows in (4, 8)
+            and self.selection is None
+            and not self.cache_verify_rows
+        ):
+            return False
+        if chunked(self.batch, self.force_chunked):
+            rows = chunk_layout(self.batch, self.heads, chunk_rows=self.chunk_rows)[0]
+            return rows == self.sequence_rows
+        return all(
+            end - first == self.sequence_rows for first, end in self.row_groups()
+        )
 
     def _send_index(self, peer):
         if not self._lane_major:

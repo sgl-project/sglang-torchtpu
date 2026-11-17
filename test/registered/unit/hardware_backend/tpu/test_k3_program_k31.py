@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=2300, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2800, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -1621,6 +1621,256 @@ class TestDraftPairCombine(CustomTestCase):
             timeout=2400,
         )
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
+
+
+class TestK31DraftNativePages(CustomTestCase):
+    """``KernelConfig.draft_native_pages`` and ``draft_step_trims``: the MLA
+    draft's attention (explicit keys, its lse in the padding row, FP8 pages,
+    the host combine) in Pallas interpret mode at DCP16 with ``HOST_LANES``
+    4, its pages staged native (each page DMA retiles a pool block) and / or
+    its step loop trimmed (interior steps unmasked, the last peeled, the PV's
+    1/256 applied once), gives the knob-off outputs and every rank's partials
+    bit for bit: one eight-row sequence (a chunk) with two to three steps a
+    rank (an odd page count re-reads its last page in the last step, which
+    also holds the partial last page), two chunks with the pair stage (ranks
+    without pages), four-row sequences, and attention DP2's draft (six
+    heads, one unchunked sequence). Stale pool bytes are NaN, so a step that
+    skips a zeroing it needs is not finite.
+
+    Interpret mode reads only indexed refs: a DMA source's trailing reshape
+    (``start_native_copies``) is applied to the data read, row-major as a ref
+    reshape reads it, and the bitcast staging methods are replaced by
+    value-level equivalents (packed pages; native pages load as plain refs).
+    The CPU runs without fused multiply-add (``--xla_cpu_max_isa=AVX``): the
+    TPU kernel rounds every product and sum (its bundles have no FMA), while
+    XLA:CPU contracts a product into the next add only where no select sits
+    between them, which the unmasked steps remove."""
+
+    SCRIPT = """
+        import os, time
+        G = 16
+        os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={G} --xla_cpu_max_isa=AVX"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3.kernels import mla_dcp
+        try:
+            from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
+            from jax._src.pallas.mosaic.interpret import utils as interpret_utils
+            from jax._src.state.types import ReshapeTransform
+            ipc.DMA.execute_read, interpret_utils.to_range
+        except (ImportError, AttributeError) as e:
+            print("SKIP: interpret-mode DMA internals moved:", e)
+            raise SystemExit(0)
+
+        T, FP8 = 512, jnp.float8_e4m3fn
+        mla_dcp.HOST_LANES = G // 4
+        mla_dcp.GROUPS = (G, 8, 16, 32)
+        LANES = mla_dcp.LANES
+
+        _to_range = interpret_utils.to_range
+
+        def to_range(transforms):  # a trailing reshape reads the indexed block
+            transforms = list(transforms)
+            while transforms and isinstance(transforms[-1], ReshapeTransform):
+                transforms.pop()
+            return _to_range(transforms)
+
+        _read = ipc.DMA.execute_read
+
+        def execute_read(self):  # ... reshaped row-major
+            _read(self)
+            with self.lock:
+                shapes = [t.shape for t in self.src_transforms if isinstance(t, ReshapeTransform)]
+                if shapes and self.data is not None:
+                    self.data = self.data.reshape(shapes[-1])
+
+        interpret_utils.to_range = to_range
+        ipc.DMA.execute_read = execute_read
+
+        def tokens(x):  # each element's token: packed [rows, 4, lanes] (row 4 r + k), native [tokens, lanes]
+            if x.ndim == 3:
+                return (jax.lax.broadcasted_iota(jnp.int32, x.shape, 0) * x.shape[1]
+                        + jax.lax.broadcasted_iota(jnp.int32, x.shape, 1))
+            return jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+
+        _native_pages = mla_dcp.DcpAttention._pages
+
+        def _pages(self, slot):
+            if self.native:
+                return _native_pages(self, slot)
+
+            def load(lanes, tokens=None):
+                x = self.ws.pages[slot]
+                x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+                if hasattr(lanes, "size"):  # pl.ds
+                    return jax.lax.dynamic_slice_in_dim(x, lanes.start, lanes.size, 1)
+                return x[:, lanes]
+            return load
+
+        def _clean_step(self, slot, row, local_step, tokens_=None, end=None, pad=True):
+            x = self.ws.pages[slot]
+            cut = 0
+            for k in range(self.span):
+                first = ((local_step * self.span + k) * self.group + self.owner) * self.page_tokens
+                cut = cut + jnp.clip(self._limit(row) - first, 0, self.page_tokens)
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, x.ndim - 1)
+            keep = (tokens(x) < cut) & ((lane < 576) if pad else True)
+            self.ws.pages[slot] = jnp.where(keep, x, jnp.zeros((), x.dtype))
+
+        def _zero_step_pad_lanes(self, slot):
+            x = self.ws.pages[slot]
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, x.ndim - 1)
+            self.ws.pages[slot] = jnp.where(lane < 576, x, jnp.zeros((), x.dtype))
+
+        def _zero_slot(self, slot):
+            self.ws.pages[slot] = jnp.zeros(self.ws.pages.shape[1:], self.ws.pages.dtype)
+
+        _pack = mla_dcp.DcpAttention._pack_partials
+
+        def _pack_partials(self, first, end, base=0):  # also keep each chunk's packets (every owner's partials)
+            _pack(self, first, end, base)
+            capture, counter = self._capture
+            capture[counter[0]] = self.ws.send[...].astype(jnp.float32)
+            counter[0] += 1
+
+        mla_dcp.DcpAttention._pack_partials = _pack_partials
+        mla_dcp.DcpAttention._pages = _pages
+        mla_dcp.DcpAttention._clean_step = _clean_step
+        mla_dcp.DcpAttention._zero_slot = _zero_slot
+        mla_dcp.DcpAttention._zero_step_pad_lanes = _zero_step_pad_lanes
+
+        def run(firsts, counts, seed, S, pairs, H, native, trims):
+            # Outputs [G, B, H, 512] and every rank's packets of each chunk [G, chunks, G, H S, 640]. Six heads:
+            # attention DP2's draft (one unchunked sequence of the DCP group, no host combine).
+            rng = np.random.default_rng(seed)
+            B = len(firsts) * S
+            hier = H == 3
+            positions = np.array([p0 + r for p0 in firsts for r in range(S)], np.int32)
+            plan = mla_dcp.page_plan(B, H, S, FP8, force_chunks=hier)
+            persistent = mla_dcp.persistent_scratch(B, G, H, cache_dtype=FP8, sequence_rows=S, fp8_wire=True,
+                                                    force_chunks=hier, chunk_rows=S)
+            scoped = mla_dcp.scoped_scratch(B, plan["span"], plan["buffers"], heads=H, group=G, cache_dtype=FP8,
+                                            page_tokens=T, sequence_rows=S, force_chunks=hier, chunk_rows=S,
+                                            native=True if native else None)
+            assert (scoped[1].shape[1:] == (plan["span"] * T, LANES)) == native
+            ring, hosts = persistent[0].shape[0], G // mla_dcp.HOST_LANES
+            stage2 = (pltpu.VMEM((ring, hosts, H * S, LANES), jnp.bfloat16),
+                      pltpu.VMEM((hosts, H * S, LANES), jnp.bfloat16), pltpu.SemaphoreType.DMA((2, ring)))
+            stage2 = stage2 if hier else ()
+            extra = (pltpu.SemaphoreType.DMA((2, ring)),) if pairs else ()
+            pages = max(-(-(int(p0) + T) // T) // G for p0 in firsts) + 1
+            # Stale bytes are NaN (e4m3fn 0x7f): tokens past a request's and lanes 576:640.
+            pool = np.full((G, 1 + len(firsts) * pages, 128, 4, LANES), 0x7F, np.uint8)
+            pool = pool.view(ml_dtypes.float8_e4m3fn)
+            tables = np.zeros((G, B, pages), np.int32)
+            for b in range(B):
+                s_, p0 = b // S, firsts[b // S]
+                tables[:, b] = 1 + s_ * pages + np.arange(pages)
+                if b % S == 0:
+                    t = np.arange(p0)
+                    g, j = (t // T) % G, (t // T) // G
+                    lat = (rng.standard_normal((p0, 576)) * 0.5).astype(ml_dtypes.float8_e4m3fn)
+                    pool[g, tables[g, b, j], (t % T) // 4, t % 4, :576] = lat
+            q = (rng.standard_normal((G, B, H, LANES)) * 0.08).astype(np.float32)
+            q[..., 576:] = 0
+            keys = (rng.standard_normal((len(firsts), 2 * S, LANES)) * 0.5).astype(np.float32)
+            keys[..., 576:] = 0
+            lane = np.arange(2 * S)
+            valid = np.stack([((lane < S) & (lane <= c)) | ((lane >= S) & (lane < 2 * S - 1)) for c in counts])
+            valid = valid[:, None, :].astype(np.int32)
+            n_p, n_s = len(persistent), len(scoped)
+            rows = persistent[1].shape[1]
+
+            def kernel(pos, table, q_r, keys_r, valid_r, pool_r, out_r, send_r, *scratch):
+                counter = scratch[-1]
+                counter[0] = 0
+                scratch = scratch[:-1]
+                cache = mla_dcp.DcpCache((pool_r,), table, pages, 0, group=G, global_pages=False)
+                ws = mla_dcp.DcpWorkspace(*scratch[:n_p], *scratch[n_p:n_p + n_s])
+                att = mla_dcp.DcpAttention(cache, ws, pos, B, sequence_rows=S, heads=H, chunk_rows=S)
+                att.lse_in_padding = True
+                att.group_fold = True
+                att.step_trims = trims
+                if hier:
+                    att.force_chunked = True
+                    att.host_combine = tuple(scratch[n_p + n_s : n_p + n_s + 3])
+                    att.host_pairs = scratch[n_p + n_s + 3] if pairs else None
+                assert att.native == native and att._trimmed_steps() == trims
+                att._capture = (send_r, counter)
+                att.prime()
+                out_r[...] = att.attend(q_r[...], jnp.zeros((B, LANES), jnp.float32), 0, keys=keys_r,
+                                        key_valid=valid_r)
+
+            def body(pos, table, q_, keys_, valid_, pool_):
+                vmem = pltpu.VMEM
+                out, send = pl.pallas_call(kernel,
+                    out_shape=(jax.ShapeDtypeStruct((B, H, 512), jnp.float32),
+                               jax.ShapeDtypeStruct((B // S if hier else 1, G, rows, LANES), jnp.float32)),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2,
+                        in_specs=[pl.BlockSpec(memory_space=vmem)] * 3 + [pl.BlockSpec(memory_space=pl.ANY)],
+                        out_specs=(pl.BlockSpec(memory_space=vmem),) * 2,
+                        scratch_shapes=[*persistent, *scoped, *stage2, *extra, pltpu.SMEM((1,), jnp.int32)]),
+                    compiler_params=pltpu.CompilerParams(has_side_effects=True),
+                    interpret=pltpu.InterpretParams())(pos, table[0], q_[0], keys_, valid_, pool_[0])
+                return out[None], send[None]
+
+            mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+            f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P("tp"), P("tp"), P(), P(), P("tp")),
+                                      out_specs=(P("tp"), P("tp")), check_vma=False))
+            out, send = f(positions, tables.reshape(G, -1), q, keys, valid, pool)
+            return np.asarray(out), np.asarray(send)
+
+        t0 = time.time()
+        ok = True
+        for firsts, counts, seed, S, pairs, H, variants in (
+            # 79 pages: 5 on ranks 0-14 (3 steps, the last re-reading its page), 4 on rank 15; page 78 holds 64
+            ([40000], [7], 1, 8, False, 3, ((True, True), (False, True), (True, False))),
+            # 51 pages (3-4 a rank), then 6 (one step on ranks 0-5, the sixth partial; none on 6-15)
+            ([26000, 3000], [3, 6], 2, 8, True, 3, ((True, True),)),
+            ([33000, 12000], [2, 3], 3, 4, False, 3, ((True, True),)),
+            ([40000], [7], 4, 8, False, 6, ((True, True),)),
+        ):
+            off, off_send = run(firsts, counts, seed, S, pairs, H, False, False)
+            good = bool(np.isfinite(off).all() and np.isfinite(off_send).all())
+            for native, trims in variants:
+                on, on_send = run(firsts, counts, seed, S, pairs, H, native, trims)
+                same = (np.array_equal(on.view(np.uint32), off.view(np.uint32)),
+                        np.array_equal(on_send.view(np.uint32), off_send.view(np.uint32)))
+                print(f"firsts {firsts} rows {S} heads {H} pairs {pairs} native {native} trims {trims}: outputs, "
+                      f"partials identical {same} ({time.time() - t0:.0f}s)", flush=True)
+                good &= all(same)
+            ok &= good
+        print("OK" if ok else "FAIL")
+    """
+
+    def test_native_pages_and_step_trims_are_bit_identical(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        # 16 interpret devices block in callbacks: give the CPU client enough
+        # threads (XLA reads NPROC for its pool size).
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=3600,
+        )
+        if "SKIP:" in result.stdout:
+            self.skipTest(result.stdout.strip().splitlines()[-1])
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
 
 
 class TestPrefillIndexRows(CustomTestCase):
