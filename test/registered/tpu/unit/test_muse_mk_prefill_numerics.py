@@ -24,8 +24,6 @@ register_tpu_ci(
     nightly=True,
     chips=4,
     labels=["singlehost", "muse-spark-open-816b-a42b", "seq-along-lane"],
-    disabled="transposed RPA prefill tile's fp8 Q^T is ~13% off; fixed in "
-    "https://github.com/sgl-project/sglang-torchtpu/pull/2222",
 )
 
 

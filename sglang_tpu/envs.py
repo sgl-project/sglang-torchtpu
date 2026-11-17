@@ -589,6 +589,12 @@ class TpuEnvs:
     # Prefill program: the expert-input and post-expert-projection all-gathers in e4m3, one
     # scale per block: half their ICI bytes, ~2^-4 relative error per element.
     SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER = EnvBool(False)
+    # Prefill program in the sequence-parallel layout (prefill/spep): each rank owns rows / tp of
+    # the chunk between layers, instead of every rank holding every row (prefill/tp).
+    SGLANG_TPU_MUSE_MK_PREFILL_SP = EnvBool(False)
+    # SP program reads decode EP's weight layout, so prefill SP and decode EP share one copy of
+    # the weights (w13 then runs unfused: silu * up after the gmm).
+    SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT = EnvBool(False)
     # Kernel-level weight layouts (anvil / numerics only); serving raises on them.
     SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
     SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
@@ -617,6 +623,11 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN = EnvInt(None)
     SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS = EnvInt(None)
     SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH = EnvInt(None)
+    # EP decode paradigm: gather (EP, rows replicated) | a2a (SP + EP, rows sharded).
+    SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("gather")
+    # a2a arm: up to this many rows, pool / unpool read a 1/tp column slice of the weights for
+    # every row (8 instead of 64 MiB per layer); above it, gathering every row costs more. 0: off.
+    SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS = EnvInt(16)
     # EP megakernel without Pallas bounds checks.
     SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
     # Decode megakernels (TP and EP): rows up to which global-layer chunk loops are hoisted

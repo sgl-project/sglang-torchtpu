@@ -53,7 +53,9 @@ from sglang_tpu.muse_megakernel.common.plan import (
     n_expert_refs,
 )
 from sglang_tpu.muse_megakernel.common.scratch import WEIGHT_NAMES, scratch_vmem_bytes
+from sglang_tpu.muse_megakernel.decode.spep.kernel import ep_arm, ep_megakernel_call
 from sglang_tpu.muse_megakernel.decode.tp import kernel as K
+from sglang_tpu.muse_megakernel.prefill import spep as PF_SP
 from sglang_tpu.muse_megakernel.prefill import tp as PF
 
 logger = logging.getLogger(__name__)
@@ -868,12 +870,19 @@ class MuseMegakernel(torch.nn.Module):
                 )
 
     def callable_for(self, cfg: MKConfig):
-        if cfg not in self._ops:
-            self._ops[cfg] = _build_callable(cfg, self.tp_size)
-        return self._ops[cfg]
+        arm = ep_arm() if self.moe_mode == "ep" else None
+        if (cfg, arm) not in self._ops:
+            self._ops[(cfg, arm)] = _build_callable(cfg, self.tp_size, arm)
+        return self._ops[(cfg, arm)]
 
     def prefill_config(self, *, rows: int, capture: tuple) -> PFConfig:
         g = self.geo
+        sp = tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_SP.get()
+        if sp and self.moe_mode != "ep":
+            raise NotImplementedError(
+                "SGLANG_TPU_MUSE_MK_PREFILL_SP runs the MoE on whole experts (EP): it needs "
+                f"moe_mode ep, got {self.moe_mode}"
+            )
         return PFConfig(
             hidden=g.hidden,
             head_dim=g.head_dim,
@@ -898,6 +907,9 @@ class MuseMegakernel(torch.nn.Module):
             fp8_gather=self.prefill_fp8_gather,
             expert_groups=self.expert_groups,
             w4a16_layers=self.w4a16_layers,
+            sp=sp,
+            expert_kinds=tuple(self.kinds) if sp else (),
+            sp_ep_layout=sp and tpu_envs.SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT.get(),
         ).validate()
 
     def prefill_callable_for(self, cfg: PFConfig):
@@ -1319,14 +1331,16 @@ def _check_prefill_setup() -> None:
         )
 
 
-def _build_callable(cfg: MKConfig, tp: int):
-    """The megakernel + KV scatter as one jitted ``shard_map`` program over the TP mesh."""
+def _build_callable(cfg: MKConfig, tp: int, ep: str | None = None):
+    """The megakernel + KV scatter as one jitted ``shard_map`` program over the TP mesh.
+
+    ep: an ep_arm of the EP megakernel (decode/spep), or None for the TP megakernel."""
     L = cfg.n_layers
     nw = len(WEIGHT_NAMES)
     ne = n_expert_refs(cfg)
     n_args = 5 + nw + ne + L
     kv0 = 5 + nw + ne
-    mk = K.megakernel_call(cfg)
+    mk = ep_megakernel_call(cfg, arm=ep) if ep else K.megakernel_call(cfg)
     kvw = K.kv_write_call(cfg)
 
     def body(*xs):
@@ -1341,11 +1355,12 @@ def _build_callable(cfg: MKConfig, tp: int):
         n_args=n_args,
         kv0=kv0,
         n_out=2 + L,
-        tag=f"muse_megakernel_{tag}",
+        tag=f"muse_{f'ep_{ep}_' if ep else ''}megakernel_{tag}",
     )
     logger.info(
-        "Muse megakernel built: rows=%d q=%d requests=%d capture=%s pages/seq=%d "
+        "Muse megakernel built: ep=%s rows=%d q=%d requests=%d capture=%s pages/seq=%d "
         "row_tile=%d ring=%d folds=%s",
+        ep,
         cfg.rows,
         cfg.rows_per_req,
         cfg.n_req,
@@ -1362,17 +1377,19 @@ def _build_prefill_callable(cfg: PFConfig):
     """The prefill program (prefill.build_forward) over the TP mesh; batched RPA updates the
     pools in place."""
     L = cfg.n_layers
-    n_args = PF.N_STEP_ARGS + len(WEIGHT_NAMES) + n_expert_refs(cfg) + L
+    n_experts = PF_SP.n_expert_refs(cfg) if cfg.sp else n_expert_refs(cfg)
+    n_args = PF.N_STEP_ARGS + len(WEIGHT_NAMES) + n_experts + L
     callable_ = _export_program(
-        PF.build_forward(cfg),
+        (PF_SP.build_forward if cfg.sp else PF.build_forward)(cfg),
         tp=cfg.tp,
         n_args=n_args,
         kv0=n_args - L,
         n_out=2 + L,
-        tag=f"muse_prefill_r{cfg.rows}_c{len(cfg.capture_layers)}",
+        tag=f"muse_prefill{'_sp' if cfg.sp else ''}_r{cfg.rows}_c{len(cfg.capture_layers)}",
     )
     logger.info(
-        "Muse prefill program built: rows=%d capture=%s fp8_gather=%s w4a16_layers=%d",
+        "Muse prefill program built: sp=%s rows=%d capture=%s fp8_gather=%s w4a16_layers=%d",
+        cfg.sp,
         cfg.rows,
         cfg.capture_layers,
         cfg.fp8_gather,

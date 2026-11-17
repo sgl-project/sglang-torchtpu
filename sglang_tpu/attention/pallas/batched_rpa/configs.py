@@ -142,7 +142,7 @@ class ServingConfigs:
     exp2_softmax: bool = False
     # Row sums from ones rows appended to V (l rides in the accumulator).
     ones_v: bool = False
-    # Transposed scores with fp8 q (see transposed.py), where use_transposed holds.
+    # Transposed scores with split fp8 q (see transposed.py), where use_transposed holds.
     transposed: bool = False
 
     def __post_init__(self):
@@ -501,9 +501,10 @@ class RpaConfigs:
 
     @property
     def qt_scratch_shape(self):
+        # Q^T as fp8 hi and lo terms stacked along the contraction.
         return (
             self.model.num_kv_heads,
-            self.aligned_kv_head_dim,
+            2 * self.aligned_kv_head_dim,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
         )
 

@@ -1388,10 +1388,6 @@ def main() -> None:
     args = ap.parse_args()
     global _EP, _QBLOCK_REF, _SERVED
     _EP, _QBLOCK_REF, _SERVED = args.ep, args.qblock_ref, args.served
-    if _EP:
-        raise NotImplementedError(
-            "--ep: the EP megakernel (decode/spep) is not in this tree yet"
-        )
     if _SERVED and (_EP or not (_QBLOCK_REF and tp_qblock())):
         raise ValueError(
             "--served needs SGLANG_TPU_MUSE_MK_QBLOCK and --qblock-ref (TP)"

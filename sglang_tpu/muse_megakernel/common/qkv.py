@@ -6,7 +6,12 @@ import jax.numpy as jnp
 
 from sglang_tpu.muse_megakernel.common.config import PFConfig
 from sglang_tpu.muse_megakernel.common.consts import small_row
-from sglang_tpu.muse_megakernel.common.numerics import _heads_rms, _rms, _rope_roll
+from sglang_tpu.muse_megakernel.common.numerics import (
+    _heads_rms,
+    _rms,
+    _rope_roll,
+    heads_rms_xla,
+)
 
 
 def attention_inputs(c: PFConfig, x, smn, wq, rope):
@@ -25,11 +30,13 @@ def qkv_from_input(c: PFConfig, a_in, smn, wq, rope):
     return qkv_from_proj(c, qkvg * small_row(smn, "wqkvg_s")[:, : c.qkvg_dim], rope)
 
 
-def qkv_from_proj(c: PFConfig, qkvg, rope):
-    """(q, kv, gate) rows (bf16) from the f32 qkvg projection; rope None: a NoPE layer."""
+def qkv_from_proj(c: PFConfig, qkvg, rope, *, xla: bool = False):
+    """(q, kv, gate) rows (bf16) from the f32 qkvg projection; rope None: a NoPE layer.
+    xla: called from an XLA program, not a Pallas kernel (where a 3-D reshape is a relayout)."""
     qd, kvd, hd = c.q_dim, c.kv_dim, c.head_dim
-    q = _heads_rms(qkvg[:, :qd], c.q_heads, hd, c.rms_eps, gain=c.scale_query_by)
-    k = _heads_rms(qkvg[:, qd : qd + kvd], c.kv_heads, hd, c.rms_eps)
+    heads_rms = heads_rms_xla if xla else _heads_rms
+    q = heads_rms(qkvg[:, :qd], c.q_heads, hd, c.rms_eps, gain=c.scale_query_by)
+    k = heads_rms(qkvg[:, qd : qd + kvd], c.kv_heads, hd, c.rms_eps)
     if rope is not None:
         q = _rope_roll(q, c.q_heads, hd, rope[:, :hd], rope[:, hd:])
         k = _rope_roll(k, c.kv_heads, hd, rope[:, :hd], rope[:, hd:])

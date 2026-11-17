@@ -585,26 +585,21 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
         )
 
     def test_seq_along_lane_transposed(self):
-        """The transposed prefill tile (scores^T, fp8 q), alone and with every other tile."""
-        # fp8 Q^T costs a few percent of score error; its precision fix is a follow-up.
-        self.TOLERANCE = 0.3
-        try:
-            self._check_prefill_tiles(
+        """The transposed prefill tile (scores^T, split fp8 q), alone and with every other tile."""
+        self._check_prefill_tiles(
+            (
+                ({"SGLANG_TPU_RPA_TRANSPOSED": "1"}, (None,)),
                 (
-                    ({"SGLANG_TPU_RPA_TRANSPOSED": "1"}, (None,)),
-                    (
-                        {
-                            "SGLANG_TPU_RPA_TRANSPOSED": "1",
-                            "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
-                            "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
-                            "SGLANG_TPU_RPA_ONES_V": "1",
-                        },
-                        (None, 128),
-                    ),
-                )
+                    {
+                        "SGLANG_TPU_RPA_TRANSPOSED": "1",
+                        "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
+                        "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
+                        "SGLANG_TPU_RPA_ONES_V": "1",
+                    },
+                    (None, 128),
+                ),
             )
-        finally:
-            del self.TOLERANCE
+        )
 
 
 if __name__ == "__main__":
