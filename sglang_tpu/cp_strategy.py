@@ -45,11 +45,11 @@ class TpuZigzagCPStrategy(ZigzagCPStrategy):
         # only re-reads it (see pinned_extend_seq_lens_cpu).
         from sglang.srt.runtime_context import get_schedule
         from sglang_tpu.cp_forward import get_tpu_cp_layout
-        from sglang_tpu.cp_layout import ring_local_rows
+        from sglang_tpu.cp_layout import max_local_rows
 
         if get_tpu_cp_layout(forward_batch) is not None:
             return True
-        rows = ring_local_rows(lengths, self.cp_size, get_schedule().page_size)
+        rows = max_local_rows(lengths, self.cp_size, get_schedule().page_size)
         return rows <= self.ring_max_local_rows
 
     # Ring mode (SGLANG_TPU_PCP_MODE=ring) only: the largest local token bucket
