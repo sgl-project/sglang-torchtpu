@@ -1876,10 +1876,9 @@ class TestContextParallelRingWarmup(_PolicyTestCase):
             patch(_CP_STRATEGY_PATH, return_value=strategy),
             patch(_PCP_RING_PATH, return_value=True),
         ):
-            policy._init_cp_ring_bucketer()
+            policy._configure_cp_ring()
             self.assertEqual(policy.cp_t_bucketer.buckets, [32, 64])
             self.assertEqual(policy._extend_cp_compile_cases(), [(32, cap), (64, cap)])
-            policy._configure_cp_ring()
         self.assertEqual(strategy.ring_max_local_rows, 64)
 
     def test_gather_mode_keeps_every_bucket_and_configures_nothing(self):
@@ -1889,13 +1888,11 @@ class TestContextParallelRingWarmup(_PolicyTestCase):
             patch(_CP_STRATEGY_PATH, return_value=strategy),
             patch(_PCP_RING_PATH, return_value=False),
         ):
-            policy._init_cp_ring_bucketer()
             self.assertIsNone(policy.cp_t_bucketer)
             self.assertEqual(
                 policy._extend_cp_compile_cases(),
                 [(tokens, cap) for tokens in (8, 32, 48, 64) if tokens >= cap],
             )
-            policy._configure_cp_ring()
         self.assertIsNone(strategy.ring_max_local_rows)
 
     def test_no_usable_bucket_fails_at_startup(self):
@@ -1905,7 +1902,7 @@ class TestContextParallelRingWarmup(_PolicyTestCase):
             patch(_PCP_RING_PATH, return_value=True),
             self.assertRaisesRegex(ValueError, "multiple of 2 x page size"),
         ):
-            policy._init_cp_ring_bucketer()
+            policy._configure_cp_ring()
 
     def test_warmup_batch_fills_the_bucket_behind_a_cached_logical_page(self):
         """One program serves first chunks and cached prefixes; the warmup has
@@ -1927,7 +1924,7 @@ class TestContextParallelRingWarmup(_PolicyTestCase):
             ),
             patch("sglang_tpu.compilation.decoder_compile_policy.prepare_cp_forward"),
         ):
-            policy._init_cp_ring_bucketer()
+            policy._configure_cp_ring()
             policy._make_cp_dummy_forward_batch(
                 local_tokens=64, bs=4, capture_hidden_mode=CaptureHiddenMode.NULL
             )

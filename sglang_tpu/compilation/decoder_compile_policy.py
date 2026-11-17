@@ -615,11 +615,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         cached, since the strategy may initialize after this policy is built."""
         return get_cp_strategy()
 
-    def _init_cp_ring_bucketer(self) -> None:
-        """Ring-mode PCP (SGLANG_TPU_PCP_MODE=ring)require token buckets that
-        are multiples of 2 x page size."""
-        if not current_platform.pcp_ring_enabled():
-            return
+    def _configure_cp_ring(self) -> None:
+        """Ring-mode PCP (SGLANG_TPU_PCP_MODE=ring) requires token buckets that
+        are multiples of 2 x page size; the zigzag strategy admits batches up
+        to the largest. Idempotent: runs at setup and again at warmup, as the
+        strategy may initialize later."""
+        if self.cp_t_bucketer is None:
+            self.cp_t_bucketer = self._build_cp_ring_bucketer()
+        if self._cp_strategy is not None:
+            self._cp_strategy.ring_max_local_rows = self.cp_t_bucketer.max_val
+
+    def _build_cp_ring_bucketer(self) -> Bucketer:
         page_size = self.model_runner.page_size
         assert self.t_bucketer is not None
         cap = self._extend_compile_cap()
@@ -635,13 +641,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 f"({2 * page_size}) and at least the extend batch cap {cap}; got "
                 f"buckets {list(self.t_bucketer.buckets)}."
             )
-        self.cp_t_bucketer = Bucketer(name="CpRingTokenBucketer", buckets=buckets)
-
-    def _configure_cp_ring(self) -> None:
-        """Tell the zigzag strategy the ring-mode capacity rule. Every rank runs
-        this with the same buckets, so admission stays identical across ranks."""
-        if self.cp_t_bucketer is not None and self._cp_strategy is not None:
-            self._cp_strategy.ring_max_local_rows = self.cp_t_bucketer.max_val
+        return Bucketer(name="CpRingTokenBucketer", buckets=buckets)
 
     def _record_compile_step(
         self,
@@ -855,9 +855,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 get_schedule().prefill_max_requests or b_bucketer.max_val,
                 b_bucketer.max_val,
             )
-        if not is_draft_worker:
-            # Needs the buckets above; before any batch is admitted.
-            self._init_cp_ring_bucketer()
+        # Needs the buckets above; before any batch is admitted. Ring mode
+        # refuses speculative decoding, so this is never a draft worker.
+        if current_platform.pcp_ring_enabled():
             self._configure_cp_ring()
 
         outer_model = self.model_runner.model
