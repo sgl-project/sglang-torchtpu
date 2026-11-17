@@ -6601,6 +6601,10 @@ ATTENTION_HOST_BF16 = _config().attention_host_bf16
 # its own half of its pair's rows (KernelConfig.attention_rank_rows; the stack
 # decides per step and passes ``rank_rows``).
 ATTENTION_RANK_ROWS = _config().attention_rank_rows
+# Rank-row steps: the gathers of the rows both ranks of a pair hold take each
+# pair's rows from the other core of its chip (KernelConfig.crossed_pair_gathers;
+# the stack decides per step).
+CROSSED_PAIR_GATHERS = _config().crossed_pair_gathers
 # Communication-workspace DMA semaphores of the rank-row layout, each signalled
 # by one round only: the output projection's local round, the eight-rank MoE
 # input gather and the prefix rows' copy to the pair peer (q9 to q0). The
@@ -7596,6 +7600,7 @@ def _gather_local_pair_rows(
     packed=False,
     semaphore=None,
     transpose_wires=False,
+    cross_cores=False,
 ):
     """All-gather the token shards of the ``owners`` local row owners.
 
@@ -7607,12 +7612,21 @@ def _gather_local_pair_rows(
     source row slice crosses a native BF16 tile. ``transpose_wires`` assembles
     one-row wires through FP32 (one owner's 128 columns a vreg row, then an
     owner/column swap) instead of BF16 reshapes: fewer sublane permutes, the
-    same bits.
+    same bits. ``cross_cores`` (four owners, rank pairs whose two ranks hold
+    the same rows): each rank sends to the other core of its counterpart's
+    chip (rank ^ 2k ^ 1), so every rank receives each other pair's rows from
+    the core of the other parity; slots and semaphores are unchanged.
     """
     rank = jax.lax.axis_index("tp")
     stride = 8 // owners
     owner = (rank % 8) // stride
     rows_per_owner = source.shape[0]
+    assert owners == 4 or not cross_cores, "cross_cores needs rank-pair owners"
+
+    def peer(offset):
+        # Owner ``owner ^ offset``'s rank on this core, or with ``cross_cores``
+        # on the other core of that chip (the pair's ranks are 2p and 2p + 1).
+        return rank ^ ((stride * offset) ^ int(cross_cores))
 
     def semaphore_index(offset):
         return offset - 1 if semaphore is None else semaphore
@@ -7634,7 +7648,7 @@ def _gather_local_pair_rows(
                 source_wire,
                 sends.at[semaphore_index(offset)],
                 recvs.at[semaphore_index(offset)],
-                device_id=(rank ^ (stride * offset),),
+                device_id=(peer(offset),),
                 device_id_type=pl.DeviceIdType.MESH,
             )
             copy.start()
@@ -7677,7 +7691,7 @@ def _gather_local_pair_rows(
                     destination.at[row_slice],
                     sends.at[semaphore_index(offset)],
                     recvs.at[semaphore_index(offset)],
-                    device_id=(rank ^ (stride * offset),),
+                    device_id=(peer(offset),),
                     device_id_type=pl.DeviceIdType.MESH,
                 )
                 copy.start()
@@ -8556,6 +8570,18 @@ def stack(
     )
     # One row a rank (8 rows): the gather's rows travel as flat wires.
     rank_row_wires = attention_rank_rows and owned_rows == 2
+    # KernelConfig.crossed_pair_gathers (rank-row steps): both ranks of a pair
+    # hold the same pre-attention rows (the same mixture of the same prefix
+    # and snapshot rows: the MoE output reaches both from every lane, and each
+    # rank's updated prefix rows reach its peer as bits). Gathers of those
+    # rows -- each layer's attention input, the aux capture after a layer and
+    # the final norm's rows -- take each other pair's rows from the core of
+    # the other parity. Their semaphores (0..2) are next used by the MoE's
+    # rounds, after the all-local MoE input gather of rank rows, and last by
+    # the previous MoE's, before its all-local output transport. The aux
+    # capture is crossed too: it and the next layer's input gather run back
+    # to back on those semaphores, so each keeps one sender per semaphore.
+    crossed_pair_gathers = CROSSED_PAIR_GATHERS and attention_rank_rows
     if attention_schedule not in ("auto", "pooled", "legacy", "overlap"):
         raise ValueError("attention_schedule must be auto, pooled, legacy, or overlap")
     if attention_dp not in (1, 2, 4):
@@ -9885,6 +9911,7 @@ def stack(
                                     communication_workspace.receive_semaphores,
                                     communication_workspace.shared_local_reduction_vmem,
                                     owners=sp_owners,
+                                    cross_cores=crossed_pair_gathers,
                                 )
                         aux_copy = tpu.make_async_copy(
                             source, aux_output_ref.at[aux_slot], aux_semaphore.at[0]
@@ -10081,6 +10108,7 @@ def stack(
                     communication_workspace.receive_semaphores,
                     communication_workspace.shared_local_reduction_vmem,
                     owners=sp_owners,
+                    cross_cores=crossed_pair_gathers,
                 )
             else:
                 normalize(normalized_vmem, attention_norm_vmem)
@@ -11627,6 +11655,7 @@ def stack(
                     communication_workspace.receive_semaphores,
                     communication_workspace.shared_local_reduction_vmem,
                     owners=sp_owners,
+                    cross_cores=crossed_pair_gathers,
                 )
 
             def store_output(semaphore):

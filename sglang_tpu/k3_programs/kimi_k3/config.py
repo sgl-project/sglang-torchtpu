@@ -79,6 +79,15 @@ class KernelConfig:
     # rows reach its pair peer before the MoE output is added. The same sums
     # in the same order (bit-identical).
     attention_rank_rows: bool = False
+    # Steps with attention_rank_rows (8 and 16 rows, four row owners): both
+    # ranks of a pair hold the same rows before attention, so the gathers of
+    # those rows (each layer's attention input, the aux hidden capture and the
+    # final norm's rows) take each other pair's rows from the core of the
+    # other parity of its chip (rank ^ 2k ^ 1) instead of the same parity
+    # (rank ^ 2k): every core-0 rank hears from core-1 ranks and vice versa
+    # (in traces same-parity rounds add ~0.8 us to the core-0 ranks' lag
+    # behind the core-1 ranks). The same slots and semaphores; the same bits.
+    crossed_pair_gathers: bool = False
     # Token-scattered decode MoE with the routed and shared reduce-scatters
     # (B6-B28 rows, pooled weights): before the experts only the shared
     # expert's gate/up projection runs; its down projection and the start of
