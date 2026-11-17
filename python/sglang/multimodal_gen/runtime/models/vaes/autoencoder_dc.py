@@ -35,6 +35,9 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
 
     layerwise_offload_dit_group_enabled = False
     layer_names = ["_inner_model.encoder.down_blocks", "_inner_model.decoder.up_blocks"]
+    # Read by the decode stages: the only parallel decode is the height shard
+    # that _ensure_inner_model may install, and every decode rank then joins it.
+    parallel_decode_mode = "spatial_shard"
 
     def __init__(self, config: SanaVAEConfig = None, **kwargs):
         super().__init__()
@@ -120,6 +123,10 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
         if can_install_spatial_shard_parallel_decode(self._config):
             enable_diffusers_decoder_spatial_parallel(self._inner_model.decoder)
             self._spatial_parallel_decode_enabled = True
+
+    @property
+    def use_parallel_decode(self) -> bool:
+        return self._spatial_parallel_decode_enabled
 
     @property
     def config(self):

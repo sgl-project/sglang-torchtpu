@@ -300,6 +300,22 @@ class TestDecodeUsesEveryRank(unittest.TestCase):
             ):
                 self.assertEqual(decoding.decode_uses_every_rank(stub), expected)
 
+    def test_sana_dc_ae_uses_every_rank_only_when_it_shards_the_height(self):
+        from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
+        from sglang.multimodal_gen.runtime.models.vaes.autoencoder_dc import (
+            AutoencoderDC,
+        )
+
+        vae = AutoencoderDC(SanaVAEConfig())
+        # A two-rank decode group, as CFG parallel on two devices gives.
+        with (
+            patch.object(decoding, "model_parallel_is_initialized", return_value=True),
+            patch.object(decoding, "get_decode_parallel_world_size", return_value=2),
+        ):
+            self.assertFalse(decoding.decode_uses_every_rank(vae))
+            vae._spatial_parallel_decode_enabled = True
+            self.assertTrue(decoding.decode_uses_every_rank(vae))
+
     def test_vae_policy_survives_an_arch_config_on_the_module(self):
         # AutoencoderKLQwenImage replaces .config with its arch config; the
         # policy comes from the VAEConfig given to ParallelTiledVAE.
