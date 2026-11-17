@@ -135,8 +135,13 @@ def _store_step(
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     distribution: jax.Array,
+    write_rope: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
-    """Store this step's tokens in the layer's two cache buffers."""
+    """Store this step's tokens in the layer's two cache buffers.
+
+    ``write_rope=False`` leaves the rope buffer untouched (see
+    ``update_sparse_mla_kv_cache``).
+    """
     # The pool allocates the buffers without importing the kernels. The writer
     # below checks them against these specs, so a buffer with the wrong shape
     # or dtype fails here instead of being written with a wrong layout.
@@ -157,6 +162,7 @@ def _store_step(
         active_cu_q_lens,
         nope_spec=nope_spec,
         rope_spec=rope_spec,
+        write_rope=write_rope,
     )
 
 
@@ -177,12 +183,18 @@ def sparse_mla_attention_fused(
     k_scale: float,
     qblock_kpool: int = 0,
     gather_chunk_tokens: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+    zero_rope: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run one step: store the new tokens in the cache, then attend.
 
     Each row of ``topk_indices`` lists the key positions one query token may
     attend to, counted from the start of its own sequence. The valid positions
     come first and the rest of the row is ``-1``.
+
+    ``zero_rope`` is for a model without rope, whose rope lane (``q_pe`` and
+    ``new_k_pe``) is identically zero. The rope cache is allocated zeroed, so
+    the step neither writes nor reads it: the rope score term is 0 either way,
+    and the output does not change.
 
     Returns ``(output, cache_nope, cache_rope)``: the attention output
     ``[max_num_tokens, num_q_heads, 512]`` and the two updated buffers.
@@ -201,6 +213,7 @@ def sparse_mla_attention_fused(
         page_indices,
         cu_q_lens,
         distribution,
+        write_rope=not zero_rope,
     )
 
     pages_per_seq = page_indices.shape[0] // (cu_q_lens.shape[0] - 1)
@@ -236,6 +249,7 @@ def sparse_mla_attention_fused(
             k_scale=k_scale,
             kpool=qblock_kpool,
             query_block=query_block,
+            read_rope=not zero_rope,
         )
         return out, cache_nope, cache_rope
 
@@ -254,9 +268,81 @@ def sparse_mla_attention_fused(
         gather_and_attention_chunk_size=min(
             gather_chunk_tokens, max(64, ql_nope.shape[0])
         ),
+        gather_rope=not zero_rope,
     )
     # The kernel returns 512 NoPE + 64 RoPE values per head. Only the NoPE part
     # is the attention output.
+    return out[..., :NOPE_DIM], cache_nope, cache_rope
+
+
+def qblock_tokens_supported(
+    num_tokens: int, pages_per_seq: int, page_size: int
+) -> bool:
+    """Whether sparse_mla_prefill_fused_tokens takes the query-blocked kernel."""
+    return (
+        num_tokens >= QBLOCK_MIN_TOKENS
+        and num_tokens % 128 == 0
+        and pages_per_seq <= QBLOCK_TOKENS_MAX_PAGES_PER_SEQ
+        and page_size % 128 == 0
+        and page_size & (page_size - 1) == 0
+    )
+
+
+def sparse_mla_prefill_window(
+    ql_nope: jax.Array,  # bf16[window, all heads, 512]
+    q_pe: jax.Array,  # bf16[window, all heads, 64]
+    new_kv_c: jax.Array,  # fp8[max_num_tokens, 512]
+    new_k_pe: jax.Array,  # fp8[max_num_tokens, 64]
+    cache_nope: jax.Array,  # u8[num_pages, page_size, 4, 128]
+    cache_rope: jax.Array,  # u8[num_pages, page_size // 4, 4, 128]
+    kv_lens: jax.Array,  # i32[max_num_seqs]; already counts this step's tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1], of the whole batch
+    window_cu_q_lens: jax.Array,  # i32[max_num_seqs + 1], of the window
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    topk_indices: jax.Array,  # i32[window, index_topk], the window's rows
+    *,
+    sm_scale: float,
+    k_scale: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Store every token of the step, then attend one window of it.
+
+    SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT: each attention-TP rank passes
+    its window's queries for every head and the indexer rows it selected for
+    them. ``window_cu_q_lens`` is ``clip(cu_q_lens - window_start, 0,
+    window)``: each request keeps its slot, with its tokens inside the window.
+    Each (token, head) then goes through the per-query path of
+    ``sparse_mla_attention_fused`` as it does there: the same gathered cache
+    rows, mask and softmax.
+
+    Returns ``(output, cache_nope, cache_rope)``: ``[window, all heads, 512]``
+    and the two updated buffers.
+    """
+    cache_nope, cache_rope = _store_step(
+        cache_nope,
+        cache_rope,
+        new_kv_c,
+        new_k_pe,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    )
+    out = sparse_ragged_paged_attention(
+        jnp.concatenate([ql_nope, q_pe], axis=-1),
+        cache_nope,
+        cache_rope,
+        topk_indices,
+        page_indices,
+        window_cu_q_lens,
+        distribution,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        cache_layout=TENSORCORE_CACHE_LAYOUT,
+        gather_and_attention_chunk_size=min(
+            DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE, max(64, ql_nope.shape[0])
+        ),
+    )
     return out[..., :NOPE_DIM], cache_nope, cache_rope
 
 
@@ -289,13 +375,7 @@ def sparse_mla_prefill_fused_tokens(
     num_tokens = ql_nope.shape[1]
     page_size = cache_nope.shape[1]
     pages_per_seq = page_indices.shape[0] // (cu_q_lens.shape[0] - 1)
-    if (
-        num_tokens >= QBLOCK_MIN_TOKENS
-        and num_tokens % 128 == 0
-        and pages_per_seq <= QBLOCK_TOKENS_MAX_PAGES_PER_SEQ
-        and page_size % 128 == 0
-        and page_size & (page_size - 1) == 0
-    ):
+    if qblock_tokens_supported(num_tokens, pages_per_seq, page_size):
         cache_nope, cache_rope = _store_step(
             cache_nope,
             cache_rope,

@@ -194,6 +194,97 @@ class TestKpoolIndexerStep(CustomTestCase):
                 kp._MAX_UNCHUNKED_SCORE_BYTES = default
         np.testing.assert_array_equal(outs[1], outs[0])
 
+    def test_token_split_matches_unsplit(self):
+        # The DSA indexer token split on one device: every rank's window
+        # (R = ceil(T / tp) rounded up to 8 rows, as the backend splits) picks
+        # pools; put together in rank order and expanded, they must be the
+        # unsplit rows bit for bit. Two 4096-token prefill chunks (the second
+        # scores against the first's pools), one and two requests, with
+        # padding rows in the bucket.
+        tokens, topk, width = 4096, 2048, 2176
+        rng = np.random.default_rng(2)
+
+        def f(*shape, dtype=jnp.bfloat16):
+            return jnp.asarray(rng.standard_normal(shape), jnp.float32).astype(dtype)
+
+        def run(args, **kw):
+            return jax.jit(
+                lambda *a: kp.kpool_indexer_step(
+                    *a,
+                    weight_scale=1.0,
+                    topk=topk,
+                    kpool=KPOOL,
+                    out_width=width,
+                    **kw,
+                )
+            )(*args)
+
+        for new in ((tokens,), (2500, 1000)):
+            num_seqs = len(new)
+            pages_per_seq = 2 * tokens // PAGE
+            pages = jnp.asarray(1 + np.arange(num_seqs * pages_per_seq), jnp.int32)
+            raw = jnp.zeros((num_seqs * pages_per_seq + 1, PAGE, 2 * D), jnp.bfloat16)
+            pooled = jnp.zeros(
+                (
+                    num_seqs * pages_per_seq + 1,
+                    PAGE // 16,
+                    4,
+                    kp.pooled_record_bytes(D),
+                ),
+                jnp.uint8,
+            )
+            cu = jnp.asarray(np.concatenate([[0], np.cumsum(new)]), jnp.int32)
+            dist = jnp.asarray([0, 0, num_seqs], jnp.int32)
+            for chunk in range(2):
+                kv_lens = jnp.asarray([(chunk + 1) * n for n in new], jnp.int32)
+                args = [
+                    f(tokens, HEADS, D),
+                    f(tokens, D),
+                    f(tokens, D),
+                    f(tokens, HEADS, dtype=jnp.float32),
+                    f(KPOOL, D, dtype=jnp.float32),
+                    raw,
+                    pooled,
+                    kv_lens,
+                    pages,
+                    cu,
+                    dist,
+                ]
+                full, raw_next, pooled_next = run(args)
+                full = np.asarray(full)
+                for tp in (8, 4):
+                    rows = -(-tokens // tp)
+                    rows = -(-rows // 8) * 8
+                    with self.subTest(new=new, chunk=chunk, tp=tp):
+                        slices = []
+                        for rank in range(tp):
+                            picked, raw_r, pooled_r = run(
+                                args,
+                                row_start=jnp.asarray([rank * rows], jnp.int32),
+                                row_count=rows,
+                            )
+                            self.assertEqual(picked.shape, (rows, topk // KPOOL))
+                            # Every rank stores the same caches as unsplit.
+                            np.testing.assert_array_equal(
+                                np.asarray(pooled_r), np.asarray(pooled_next)
+                            )
+                            slices.append(np.asarray(picked))
+                        picked = np.concatenate(slices)
+                        np.testing.assert_array_equal(picked[tokens:], -1)
+                        split = kp.kpool_expand_rows(
+                            jnp.asarray(picked[:tokens]),
+                            kv_lens,
+                            cu,
+                            dist,
+                            topk=topk,
+                            kpool=KPOOL,
+                            out_width=width,
+                        )
+                        np.testing.assert_array_equal(np.asarray(split), full)
+                # Padding rows of the bucket select nothing.
+                self.assertTrue((full[sum(new) :] == -1).all())
+                raw, pooled = raw_next, pooled_next
+
 
 def _scatter_pools(raw, old, ape, lens, pages, cu, distribution, tokens):
     """The generic gather/compress/scatter pooling that the fused writer replaces."""

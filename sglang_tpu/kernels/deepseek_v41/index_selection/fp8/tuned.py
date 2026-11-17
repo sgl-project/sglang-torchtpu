@@ -1,6 +1,5 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/fp8/tuned.py
-# Revision: 42c35ec6166a19b3f0db90f31807cc3df44602ec (epic/dsv41)
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TPU v7 tiles and pipeline depths for the packed FP8 indexer."""
@@ -82,7 +81,9 @@ def topk_reconstruction_threshold(k: int) -> int:
 
 
 # Rolling SparseCore gather: three buffers overlap reads and writes for 8-token blocks.
-PAGED_MQA_GATHER_CONFIG = {(8, 1): (96, 3), (8, 2): (64, 3)}
+# 64 pages per tile divides tokens * 2 * 2048 candidate blocks over 32 subcores, so the
+# gather output needs no trailing slice; 96 left a sliced 8.25 GiB copy at 2048 tokens.
+PAGED_MQA_GATHER_CONFIG = {(8, 1): (64, 3), (8, 2): (64, 3)}
 
 # (candidate block, physical page, banks): pages per tile and pipeline buffers.
 PAGED_MQA_FRAGMENT_GATHER_CONFIG = {(8, 128, 2): (64, 4)}
