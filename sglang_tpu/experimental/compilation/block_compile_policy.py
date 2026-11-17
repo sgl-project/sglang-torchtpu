@@ -16,9 +16,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
 from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.recompilation_checker import (
     install_recompilation_checker,
 )
+from sglang_tpu.compilation.warmup_queue import current_warmup_queue
 from sglang_tpu.dflash_utils_tpu import register_argmax_draft_top_k
 from sglang_tpu.experimental import runs_draft_prompt_pass
 from sglang_tpu.experimental.compilation.spec_compile_policy import (
@@ -59,16 +61,37 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         if self._compiled_kv_appender is None:
             self._compiled_kv_appender = self._compile_kv_appender(kv_writer)
         disagg_mode = get_disagg().disaggregation_mode
+        pending: list[PendingCall] = []
         if disagg_mode != "prefill":
-            self._precompile_draft_block(draft_attn_backend, block_width=block_width)
+            pending = self._precompile_draft_block(
+                draft_attn_backend, block_width=block_width
+            )
             self._precompile_draft_append_kv_verify()
         if runs_draft_prompt_pass(disagg_mode):
             self._precompile_draft_append_kv_extend()
+        queue = current_warmup_queue()
+        if pending and queue is not None:
+            # Async block warmups compile with the target's (shared under SPMD);
+            # the checker baselines only once they have run.
+            queue.calls.extend(pending)
+            queue.completions.append(self._install_draft_recompilation_checker)
+            logger.info(
+                "[spec compile policy] %s DRAFT queued %d warmups in %.1fs.",
+                self.algo_label,
+                len(pending),
+                time.perf_counter() - start,
+            )
+            return
+        for warmup in pending:
+            warmup.wait()
         logger.info(
             "[spec compile policy] %s DRAFT precompile done in %.1fs.",
             self.algo_label,
             time.perf_counter() - start,
         )
+        self._install_draft_recompilation_checker()
+
+    def _install_draft_recompilation_checker(self) -> None:
         install_recompilation_checker(
             policies=(self,),
             model_label=f"draft {type(self.model_runner.model).__name__}",
@@ -76,7 +99,7 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
 
     def _precompile_draft_block(
         self, draft_attn_backend: AttentionBackend, *, block_width: int
-    ) -> None:
+    ) -> list[PendingCall]:
         assert self.b_bucketer is not None
         width = block_width
         lm_head = self.model_runner.model.lm_head
@@ -91,9 +114,11 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             width,
         )
 
+        pending: list[PendingCall] = []
+
         def run(shape: tuple[int, int]) -> str:
             bs, num_tokens = shape
-            self._run_one(
+            warmup = self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.TARGET_VERIFY,
@@ -104,6 +129,9 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
                 ),
                 attn_backend=draft_attn_backend,
             )
+            if isinstance(warmup, PendingCall):
+                pending.append(warmup)
             return f"bs={bs}, tokens={num_tokens}"
 
         self._precompile_shapes(f"{self.algo_label} DRAFT BLOCK", shapes, run)
+        return pending

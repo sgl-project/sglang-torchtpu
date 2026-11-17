@@ -308,6 +308,13 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             )
         return model.get_input_embeddings()(input_ids)
 
+    def _supports_async_warmup(self) -> bool:
+        # The DSpark draft forward is one compiled program (no eager logits
+        # coordinator), so its block warmups can join the shared SPMD compile.
+        return super()._supports_async_warmup() or (
+            self.is_v41 and self.model_runner.is_draft_worker
+        )
+
     def _direct_compile(self, fn):
         if self.is_v41:
             from sglang_tpu.models.deepseek_v41.direct_tracer import (
