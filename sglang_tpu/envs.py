@@ -86,6 +86,9 @@ class TpuEnvs:
     # it the f32 summation order (13L Kimi-K3 greedy differs; Kimi-K3.1 is
     # bit-identical), so it is off by default and set by the Kimi-K3.1 recipe.
     SGLANG_TPU_PALLAS_VMEM_RIGHTSIZE = EnvBool(False)
+    # GLM selected-route EP MoE V2, bound after channelwise weight preparation.
+    SGLANG_TPU_USE_GLM_MOE_V2 = EnvBool(False)
+    SGLANG_TPU_GLM_MOE_V2_SHARED = EnvBool(True)
     # MoE: one fused kernel for single-token packed-MXFP4 decode
     # (moe/pallas/single_token_moe.py); False keeps the gmm_v2 path.
     SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL = EnvBool(True)
