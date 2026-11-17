@@ -1515,6 +1515,8 @@ class SchedulerDisaggregationPrefillMixin:
         if self.enable_overlap and _is_tpu:
             # TPU cannot send pages the in-flight forward might write, since
             # those pages might be partially updated.
+            # TODO(norx1991): PP turns overlap off and skips this clip; its stages need
+            # their own ordering of this send against in-flight forwards.
             cached_end = tpu_clip_cached_prefix_send_end(self, req, cached_end)
             if cached_end <= req.start_send_idx:
                 return

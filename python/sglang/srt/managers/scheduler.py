@@ -1785,6 +1785,9 @@ class Scheduler(
     def _forward_may_outlive_scheduling(self) -> bool:
         """Whether a launched forward can still run while the scheduler frees
         pages and forms the next batch: under overlap, and in the PP stage loops."""
+        # TODO(norx1991): after a PP check, move the other enable_overlap timing
+        # reads here (chunk-cache SWA eviction, prebuilt-row drain, finished or
+        # retracted result skip, mamba ping-pong buffers, PD early-send clip and event).
         return self.enable_overlap or get_parallel().pp_size > 1
 
     def _needs_kv_free_fence(self) -> bool:
@@ -1794,6 +1797,8 @@ class Scheduler(
             return False
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # The PP decode loop drives no fence hooks.
+            # TODO(norx1991): add the fence hooks there,
+            # or reject PP PD decode at startup.
             return get_parallel().pp_size == 1
         return self._uses_tpu_dma_hicache()
 
