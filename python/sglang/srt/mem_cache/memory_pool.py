@@ -1637,16 +1637,31 @@ class HybridReqToTokenPool(ReqToTokenPool):
             assert len(select_index) == len(mamba_ping_pong_track_buffers), (
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
+        # Build the indices on the host, upload them non_blocking and write with
+        # index_copy_. A blocking H2D copy, or a setitem indexed by a Python list
+        # (which transfers synchronously), makes the host wait for the forward
+        # still running on an async device (TPU). A continuing chunked request
+        # comes through here on every chunk, so that wait serialized the next
+        # chunk's launch behind the previous chunk's forward.
+        select_index_cpu = torch.tensor(select_index, dtype=torch.int64)
+        mapping = self.req_index_to_mamba_index_mapping
         mamba_index_tensor = torch.stack(mamba_indices).to(
-            device=self.device, dtype=torch.int32
+            device=mapping.device, dtype=mapping.dtype, non_blocking=True
         )
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        mapping.index_copy_(
+            0,
+            select_index_cpu.to(mapping.device, non_blocking=True),
+            mamba_index_tensor,
+        )
         if self.enable_mamba_extra_buffer:
+            pp_mapping = self.req_index_to_mamba_ping_pong_track_buffer_mapping
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers).to(
-                self.req_index_to_mamba_ping_pong_track_buffer_mapping.device
+                device=pp_mapping.device, dtype=pp_mapping.dtype, non_blocking=True
             )
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
-                ping_pong_tensor
+            pp_mapping.index_copy_(
+                0,
+                select_index_cpu.to(pp_mapping.device, non_blocking=True),
+                ping_pong_tensor,
             )
         return select_index
 
