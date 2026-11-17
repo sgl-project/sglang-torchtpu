@@ -47,6 +47,11 @@ from sglang_tpu.compilation.spmd_compiler import (
 )
 from sglang_tpu.compilation.warmup_queue import current_warmup_queue
 from sglang_tpu.rank_local import trace_rank
+from sglang_tpu.tpu_keepalive import (
+    keepalive_enabled,
+    keepalive_tick,
+    start_catch_up,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1005,6 +1010,21 @@ class CompiledFunction:
                 "[direct_compile] native async submission %.3fs",
                 time.perf_counter() - start,
             )
+        elif keepalive_enabled():
+            # One 93L prefill graph compiles for 10+ minutes; keep the chips busy
+            # from this thread while the native compiler runs in the background.
+            with dynamo_timed("direct_compile_traverse_and_compile"):
+                pending = tpu_torch_compile.async_traverse_and_compile(
+                    result_tensors,
+                    graph_inputs,
+                    argument_layouts=argument_layouts,
+                    donated_inputs=donated_inputs,
+                )
+                start_catch_up()
+                while not pending.is_ready():
+                    keepalive_tick(catch_up=True)
+                    time.sleep(1.0)
+                executable = pending.get()
         else:
             with dynamo_timed("direct_compile_traverse_and_compile"):
                 compile_result = tpu_torch_compile.traverse_and_compile(
