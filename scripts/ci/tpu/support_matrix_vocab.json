@@ -84,6 +84,9 @@
     },
     "wan2.2-ti2v-5b": {
       "name": "Wan2.2-TI2V-5B"
+    },
+    "glm-5.2": {
+      "name": "GLM-5.2"
     }
   },
   "kinds": {

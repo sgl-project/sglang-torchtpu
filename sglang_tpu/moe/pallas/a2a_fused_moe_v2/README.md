@@ -36,11 +36,10 @@ FP32-reference error bound.
 configuration uses prequantization, 128-wide TopK padding and ordinary routing
 metadata.
 
-The current EP32 comparison calls this bridge directly through
-`benchmark/tpu/glm52_moe_decode/run.sh`. It uses PR #2238's pinned
-JAX/JAXLIB 0.11.2, libtpu 0.0.50, Torch 2.11.0 and
-TorchTPU 0.2.1.dev20261028201649. See the benchmark README for inputs, timing,
-correctness checks and the other independent MoE implementations.
+The registered TorchTPU numerical test is
+`test/registered/kernels/ops/moe/test_a2a_fused_moe_v2.py`. It covers selected
+routes, invalid slots, padding, drain/refill, shared-expert gathering and full
+GLM dimensions. Runtime dependencies are pinned in `python/pyproject_tpu.toml`.
 
 ## Model integration
 
@@ -53,8 +52,8 @@ its attention-TP path. The shared expert is fused by default, controlled by
 `SGLANG_TPU_A2A_FUSED_MOE_V2_SHARED`.
 
 The binding requires PP1, EP=TP, attention-DP=TP, unsharded routed experts,
-channelwise FP8, SiLU, ordinary selected routes, and external shared-expert
-slots. SBO/TBO and EPLB are excluded by eligibility checks. The target model
+channelwise FP8, SiLU, ordinary selected routes, and separate shared MLP
+weights. SBO/TBO and EPLB are excluded by eligibility checks. The target model
 logs `A2A_FUSED_MOE_V2_PREPARED` and the exported row shapes log
 `A2A_FUSED_MOE_V2_EXPORT`. The FFN `summed_by_compute` contract consumes the
 already-combined output once.
