@@ -227,6 +227,19 @@ class KernelConfig:
     # scoring ring's first index-page copies while the index query/key gather
     # is in flight (neither needs the gathered queries) instead of after it.
     dsa_early_plan: bool = False
+    # Kimi-K3.1 decode MLA layers, 8-row verify calls (B1 x7): the index
+    # query/key gather leaves right after the indexer's own projections
+    # (q-down and its norm, the index heads, the key dims), and the MLA's
+    # kv-down projection and norm, q-up, the new row's hand-out and the
+    # absorbed queries with their query packet run while it is in flight,
+    # instead of before the indexer. The query packet's remote copies still
+    # leave once the gather has landed. Numerics: q-down runs alone in a
+    # block and sums as without the knob; the compiled kv-down sums its
+    # second column tile (latent columns 256-511) as two chains on the two
+    # MXUs instead of one, an f32 reassociation that changes about 4e-5 of
+    # the new latent rows' BF16 values by one ulp. Other calls keep the
+    # knob-off program.
+    dsa_gather_overlap: bool = False
     # Kimi-K3.1 decode selection: the step activity writes only the entries
     # the attention reads -- each sequence's first row's steps, up to the
     # longest row's live steps and one more -- instead of every row's steps
@@ -288,6 +301,11 @@ class KernelConfig:
     # the KDA path prefetches fits in IMEM beside the KDA path's code. The
     # same operations run in the same order (bit-identical).
     decode_mla_prefix_region: bool = False
+    # Decode MLA layers (attention DP1): the new rows' hand-out copies for the
+    # cache commit start as soon as q6 has written the rows and are waited in
+    # q8, after the attention, instead of starting and waiting back to back
+    # there. Nothing writes the rows in between (bit-identical).
+    decode_mla_early_handout: bool = False
     # 8- and 16-row decode steps: keep the small embedding all-reduce on the
     # TensorCore instead of the SparseCore collective offload.
     decode_tc_all_reduce: bool = False
