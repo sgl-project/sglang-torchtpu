@@ -15,6 +15,8 @@ and prepared wheelhouse mounts.
 The matrix uses H6144, I2048, E256, TopK8, EP32 and a shared expert. Local
 token counts 4, 6, 12, 18 and 24 cover ordinary C128 decode and MTP verification
 buckets with one through four requests per DP rank and six draft tokens.
+The C128 primary case with 24 local rows runs first. The standalone worker
+allows 32 Dynamo specializations for the intentional capacity/shape matrix.
 
 The five arms compare the current GMM path, the ported JAX GLM fused V2 path,
 and the repository's existing fused V2 with capacities 32, 64 and 128. Every

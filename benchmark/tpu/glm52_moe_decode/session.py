@@ -52,7 +52,7 @@ def main():
                         experts=256,
                         topk=8,
                         shared=True,
-                        local_rows=[4, 6, 12, 18, 24],
+                        local_rows=[24, 4, 6, 12, 18],
                     ),
                 ),
                 indent=2,

@@ -31,6 +31,9 @@ def main():
     )
 
     torch.set_num_threads(1)
+    # Three capacity variants across five static row shapes intentionally
+    # specialize the same partial-function wrapper more than Dynamo's default 8.
+    torch._dynamo.config.recompile_limit = 32
     dist.init_process_group(backend="tpu_dist")
     rank, ep = dist.get_rank(), dist.get_world_size()
     assert ep == 32
@@ -211,7 +214,7 @@ def main():
             for capacity in existing
         }
     )
-    for local_rows in (4, 6, 12, 18, 24):
+    for local_rows in (24, 4, 6, 12, 18):
         rows = local_rows * ep
         generator = torch.Generator().manual_seed(61442048 + local_rows)
         # Constant weight slabs project onto each row's sum. A positive mean
