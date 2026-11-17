@@ -220,6 +220,40 @@ class StealPlanner:
             ids=ids,
         )
 
+    def add_probabilities(self, selection, probabilities):
+        """Every row's probability of one selection (``add`` without them)."""
+        here = self.route_slots == selection
+        self.probabilities = jnp.where(here, probabilities[:, None], self.probabilities)
+
+    def vector_plan(self):
+        """:meth:`plan` with every value a [1, 1] int32 vector (each id
+        too): the same counts, moves and ids from the same reductions, kept
+        out of the scalar unit."""
+        lanes = self.lanes.astype(jnp.float32)
+        used_mine = jnp.any(self.mine, axis=0, keepdims=True).astype(jnp.float32)
+        used_theirs = jnp.any(self.theirs, axis=0, keepdims=True).astype(jnp.float32)
+        d_mine = jnp.sum(used_mine, axis=1, keepdims=True).astype(jnp.int32)
+        d_theirs = jnp.sum(used_theirs, axis=1, keepdims=True).astype(jnp.int32)
+        difference = d_mine - d_theirs
+        moved = modelled_moves(d_mine, d_theirs, self.slots, self.timing)
+        giving = (difference > 0).astype(jnp.float32)
+        heavy = used_theirs + giving * (used_mine - used_theirs)
+        candidates = jnp.where(heavy > 0, lanes, -1.0)
+        ids = []
+        for _ in range(self.slots):
+            top = jnp.max(candidates, axis=1, keepdims=True)
+            ids.append(top.astype(jnp.int32))
+            candidates = jnp.where(lanes < top, candidates, -1.0)
+        give = jnp.where(difference > 0, moved, 0)
+        return StealPlan(
+            used=used_mine > 0,
+            d_mine=d_mine,
+            d_theirs=d_theirs,
+            give=give,
+            take=moved - give,
+            ids=ids,
+        )
+
     def routes(self, plan, taken_ids, taken_count):
         """The local routes under the steal: [batch, top_k] experts in
         selection slots (UNROUTED where a slot runs nothing here), their

@@ -227,6 +227,138 @@ STEAL_PERSISTENT_NAMES = (
     "steal errors",
 )
 
+# KernelConfig.decode_presorted_routing: the B8/B16 router's presorted top-k
+# (_presorted_route_selections) and the latent all-gather started right after
+# the router products.
+PRESORTED_ROUTING = _config().decode_presorted_routing
+# A sorting network for seven inputs: 16 comparators in six layers.
+SORT_SEVEN = (
+    (0, 6),
+    (2, 3),
+    (4, 5),
+    (0, 2),
+    (1, 4),
+    (3, 6),
+    (0, 1),
+    (2, 5),
+    (3, 4),
+    (1, 2),
+    (4, 6),
+    (2, 3),
+    (4, 5),
+    (1, 2),
+    (3, 4),
+    (5, 6),
+)
+# A presorted candidate's code: this plus its expert id (FP32 lane sums of
+# such codes are exact; one holder sums to [base, 2 * base)).
+ROUTE_CODE_BASE = 4096
+
+
+def _argmax_route_selections(scores_vmem, expert_count):
+    """The router's top-k winners as the argmax loop of
+    ``_route_hidden_states`` picks them: per selection, every row's argmax
+    over the corrected scores in ``scores_vmem`` [batch, 1024] (its selected
+    scores become -inf). Returns a tuple of [batch] int32 per selection."""
+    expert_ids = jnp.arange(expert_count)[None, :]
+    winners_list = []
+    for unused_selection in range(16):
+        winners = jnp.argmax(scores_vmem[:, :expert_count], axis=1).astype(jnp.int32)
+        winner_mask = expert_ids == winners[:, None]
+        scores_vmem[:, :expert_count] = jnp.where(
+            winner_mask, -jnp.inf, scores_vmem[:, :expert_count]
+        )
+        winners_list.append(winners)
+    return tuple(winners_list)
+
+
+def _irregular_floats(values):
+    """NaN and subnormal elements, from the bits alone."""
+    bits = jax.lax.bitcast_convert_type(values, jnp.int32)
+    exponent = bits & 0x7F800000
+    mantissa = bits & 0x007FFFFF
+    return ((exponent == 0) | (exponent == 0x7F800000)) & (mantissa != 0)
+
+
+def _rows_on_sublanes(mask):
+    """``mask`` ([batch] bool) laid out as a lane reduction's result (each
+    row's value on its own sublane), from one lane reduction of the
+    diagonal: the same values. A mask stacked from scalars lies along lanes,
+    and each combination with per-row reduction results (the router's
+    winners) would otherwise take a lane gather."""
+    batch_size = mask.shape[0]
+    rows = jax.lax.broadcasted_iota(jnp.int32, (batch_size, batch_size), 0)
+    columns = jax.lax.broadcasted_iota(jnp.int32, (batch_size, batch_size), 1)
+    values = jnp.where(mask, 1.0, 0.0)[None, :]
+    return jnp.max(jnp.where(rows == columns, values, 0.0), axis=1) > 0
+
+
+def _presorted_route_selections(scores, *, after_selection):
+    """The top-16 winners of the corrected router ``scores`` [batch, 896]
+    with one cross-lane reduction on each selection's dependency chain.
+
+    Lane l's seven candidates (experts l, 128 + l, ..., 768 + l) are sorted
+    once, descending, with their codes (ROUTE_CODE_BASE + expert). A
+    selection takes each row's maximum of the lane heads; the lane holding it
+    pops its head, and a lane sum of the holder's code gives the winner.
+    Returns (winners, ambiguous): a tuple of [batch] int32 per selection, and
+    whether some row (null serving rows too, so every row's routes stay the
+    argmax loop's) is not decided by its values alone -- a selection's
+    maximum held by more than one candidate (more than one lane head holds
+    it, or the holder's next candidate does, which then makes the next
+    maximum equal: every maximum must exceed the next, the 16th the 17th),
+    or a NaN or subnormal score. Otherwise each argmax of today's loop
+    (_argmax_route_selections) has one candidate to pick whatever its tie
+    rule (the TPU's within-lane pre-reduce and cross-lane reduction do not
+    pick the lowest id), so the winners are the same."""
+    batch_size, expert_count = scores.shape
+    lists = expert_count // 128
+    if expert_count != 896:
+        raise ValueError("The presorted top-k sorts seven candidates a lane")
+    lanes = jax.lax.broadcasted_iota(jnp.int32, (batch_size, 128), 1)
+    values = [scores[:, 128 * j : 128 * (j + 1)] for j in range(lists)]
+    codes = [
+        (lanes + (ROUTE_CODE_BASE + 128 * j)).astype(jnp.float32) for j in range(lists)
+    ]
+    irregular = _irregular_floats(values[0])
+    for j in range(1, lists):
+        irregular |= _irregular_floats(values[j])
+    for first, second in SORT_SEVEN:
+        swap = values[second] > values[first]
+        for family in (values, codes):
+            family[first], family[second] = (
+                jnp.where(swap, family[second], family[first]),
+                jnp.where(swap, family[first], family[second]),
+            )
+    winners_list = []
+    single = jnp.ones((batch_size,), jnp.bool_)
+    descending = jnp.ones((batch_size,), jnp.bool_)
+    previous = None
+    for selection in range(16):
+        maximum = jnp.max(values[0], axis=1)
+        holder = values[0] == maximum[:, None]
+        code = jnp.sum(jnp.where(holder, codes[0], 0.0), axis=1)
+        single &= (code >= ROUTE_CODE_BASE) & (code < 2 * ROUTE_CODE_BASE)
+        if previous is not None:
+            descending &= previous > maximum
+        previous = maximum
+        winners_list.append(code.astype(jnp.int32) - ROUTE_CODE_BASE)
+        for family, empty in ((values, -jnp.inf), (codes, 0.0)):
+            for k in range(lists - 1):
+                family[k] = jnp.where(holder, family[k + 1], family[k])
+            family[-1] = jnp.where(holder, empty, family[-1])
+        after_selection(selection)
+    descending &= previous > jnp.max(values[0], axis=1)
+    regular = jnp.max(jnp.where(irregular, 1.0, 0.0), axis=1) == 0
+    decided = single & descending & regular
+    # A sublane maximum of the lane-broadcast flags, then one lane to a scalar.
+    undecided = jnp.max(
+        jnp.broadcast_to(jnp.where(decided, 0.0, 1.0)[:, None], (batch_size, 128)),
+        axis=0,
+        keepdims=True,
+    )
+    return tuple(winners_list), undecided[0, 0] > 0
+
 
 def _route_hidden_states(
     hidden_states,
@@ -246,6 +378,7 @@ def _route_hidden_states(
     live_rows=None,
     wait_for_projection_half=None,
     steal_planner=None,
+    presorted=False,
 ):
     """Project and select local expert routes through one shared B1/B2 path.
 
@@ -259,6 +392,15 @@ def _route_hidden_states(
     every selection instead of the ownership pass (inside the top-k loop, so
     its work fills the argmax chain); only the probability totals are
     returned then, with no ``on_local_selection`` calls.
+
+    ``presorted`` (KernelConfig.decode_presorted_routing) selects with
+    _presorted_route_selections and reruns the argmax loop
+    (_argmax_route_selections) only when that is ambiguous; the winners
+    then reach the probability sums and the ownership pass after the top-k,
+    in selection order, and ``after_selection`` runs inside the presorted
+    top-k. With ``steal_planner`` the planner takes the winners and a
+    function is returned that sums the probabilities (the argmax loop's sums
+    in its order), gives them to the planner and returns the totals.
     """
     rank = jax.lax.axis_index("tp")
     batch_size = hidden_states.shape[0]
@@ -291,20 +433,61 @@ def _route_hidden_states(
     probability_totals = jnp.zeros((batch_size,), jnp.float32)
     expert_ids = jnp.arange(expert_count)[None, :]
     route_slots = jnp.arange(selected_expert_count)[None, :]
+    if presorted:
+        if selected_expert_count != 16:
+            raise ValueError("The presorted top-k selects 16 experts")
+        if live_rows is not None:
+            live_rows = _rows_on_sublanes(live_rows)
+            if steal_planner is not None:
+                steal_planner.live_rows = live_rows
+        presorted_winners, ambiguous = _presorted_route_selections(
+            routing_scores_vmem[:, :expert_count], after_selection=after_selection
+        )
+        selected_winners = jax.lax.cond(
+            ambiguous,
+            lambda: _argmax_route_selections(routing_scores_vmem, expert_count),
+            lambda: presorted_winners,
+        )
+        after_selection = lambda unused_selection: None  # noqa: E731
+        if steal_planner is not None:
+            # The plan needs only the winners; the probabilities follow the
+            # expert copies (finish_probabilities, called by the MoE).
+            for selection in range(selected_expert_count):
+                steal_planner.add(selection, selected_winners[selection])
+
+            def finish_probabilities():
+                totals = probability_totals
+                for selection in range(selected_expert_count):
+                    winners = selected_winners[selection]
+                    winner_mask = expert_ids == winners[:, None]
+                    probabilities = jnp.sum(
+                        jnp.where(winner_mask, uncorrected_probabilities, 0), axis=1
+                    )
+                    totals += probabilities
+                    steal_planner.add_probabilities(selection, probabilities)
+                if live_rows is not None:
+                    totals = jnp.where(live_rows, totals, 1.0)
+                return totals
+
+            return finish_probabilities
     # Only top-k rank is sequential. Every score reduction and ownership
     # operation carries the leading batch dimension with no per-row control.
     for selection in range(selected_expert_count):
-        winners = jnp.argmax(routing_scores_vmem[:, :expert_count], axis=1).astype(
-            jnp.int32
-        )
+        if presorted:
+            winners = selected_winners[selection]
+        else:
+            winners = jnp.argmax(routing_scores_vmem[:, :expert_count], axis=1).astype(
+                jnp.int32
+            )
         winner_mask = expert_ids == winners[:, None]
         probabilities = jnp.sum(
             jnp.where(winner_mask, uncorrected_probabilities, 0), axis=1
         )
         probability_totals += probabilities
-        routing_scores_vmem[:, :expert_count] = jnp.where(
-            winner_mask, -jnp.inf, routing_scores_vmem[:, :expert_count]
-        )
+        if not presorted:
+            routing_scores_vmem[:, :expert_count] = jnp.where(
+                winner_mask, -jnp.inf, routing_scores_vmem[:, :expert_count]
+            )
         if steal_planner is not None:
             steal_planner.add(selection, winners, probabilities)
             after_selection(selection)
@@ -2930,6 +3113,93 @@ class _ExpertStealStep:
             self.timing,
         )
 
+    def begin_scheduled(
+        self, planner, tag, *, schedule, copy_expert, slot_count, gate_up_first_pair
+    ):
+        """``begin``, the initial expert copies and the expert schedule
+        (_start_initial_expert_weight_copies, _start_expert_schedule) with
+        batched vector-to-scalar moves (KernelConfig.decode_presorted_routing).
+
+        The initial copies run the first ``slot_count`` own experts in
+        ascending id order (the stolen experts sort after them and the copies
+        skip those), so slot k starts when k is below the own count. A giver
+        gives its highest ids, fewer than it routes, so its lowest used expert
+        always stays (slot 0), and its second lowest unless it routes two and
+        the sibling none (slot 1): those copies start right away, from the
+        planner's used lanes. The plan then stays in vectors
+        (StealPlanner.vector_plan) through the routes and the schedule table;
+        the give count, the moving ids, the table's first experts and its own
+        count move to scalars together (independent moves, no
+        vector-scalar-vector chain). Gate/up copies of the first pair go out
+        before the packet and the slab pushes when ``gate_up_first_pair``.
+        Returns the routes, as ``begin``."""
+        first_pair = min(2, slot_count)
+        # The first pair's families before the packet, and after it.
+        families = (
+            (dict(down=False), dict(gate_up=False)) if gate_up_first_pair else ({},)
+        )
+        lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1).astype(jnp.float32)
+        mine_used = jnp.any(planner.mine, axis=0, keepdims=True)
+        mine_count = jnp.sum(mine_used.astype(jnp.float32), axis=1, keepdims=True)
+        theirs_count = jnp.sum(
+            jnp.any(planner.theirs, axis=0, keepdims=True).astype(jnp.float32),
+            axis=1,
+            keepdims=True,
+        )
+        lowest = jnp.min(jnp.where(mine_used, lanes, 128.0), axis=1, keepdims=True)
+        second = jnp.min(
+            jnp.where(mine_used & (lanes > lowest), lanes, 128.0), axis=1, keepdims=True
+        )
+        kept = (
+            mine_count >= 1,
+            (mine_count >= 3) | ((mine_count == 2) & (theirs_count >= 1)),
+        )
+        early_experts = [lowest.astype(jnp.int32)[0, 0], second.astype(jnp.int32)[0, 0]]
+        early = [jnp.where(stays, 1, 0)[0, 0] != 0 for stays in kept]
+        for slot in range(first_pair):
+
+            @pl.when(early[slot])
+            def start_early(slot=slot):
+                _start_async_copies(
+                    copy_expert(early_experts[slot], slot, **families[0])
+                )
+
+        vector_plan = planner.vector_plan()
+        routes = planner.routes(vector_plan, vector_plan.ids, vector_plan.take)
+        table = _expert_schedule_table(routes[0], routes[2], self.local_expert_count)
+        give = vector_plan.give[0, 0]
+        ids = [expert[0, 0] for expert in vector_plan.ids]
+        experts = [table[SCHEDULE_EXPERT, slot] for slot in range(slot_count)]
+        own_count = table[SCHEDULE_OWN_COUNT, 0]
+        plan = expert_steal.StealPlan(
+            used=vector_plan.used,
+            d_mine=vector_plan.d_mine,
+            d_theirs=vector_plan.d_theirs,
+            give=give,
+            take=vector_plan.take,
+            ids=ids,
+        )
+
+        def start_copies(slot, predicate, families):
+            @pl.when(predicate)
+            def start_copy():
+                _start_async_copies(copy_expert(experts[slot], slot, **families))
+
+        if first_pair > 1:
+            # The second expert when a two-expert giver could give it away.
+            start_copies(1, ~early[1] & (1 < own_count), families[0])
+        self.planner_state, self.plan = planner, plan
+        self.protocol.begin(plan, tag)
+        self.expected = expert_steal.packet(plan.take, tag, plan.ids, self.slots)
+        if gate_up_first_pair:
+            for slot in range(first_pair):
+                start_copies(slot, slot < own_count, families[1])
+        for slot in range(first_pair, slot_count):
+            start_copies(slot, slot < own_count, {})
+        schedule.staging[...] = table
+        schedule.copy.start()
+        return routes
+
     def begin(self, planner, tag, plan=None):
         """``plan``: an override (tests perturb one core's plan)."""
         if plan is None:
@@ -3696,8 +3966,22 @@ def moe(
         weights.start_routing_projection_copy()
     latent_output_copy = weights.make_latent_output_copy()
     overlap_latent_gather = selected_expert_count >= 12
+    # KernelConfig.decode_presorted_routing: the presorted top-k at 8 and 16
+    # rows with both router halves; the latent all-gather starts after the
+    # router products (its 31 sends leave before the top-k).
+    presorted_routing = (
+        PRESORTED_ROUTING
+        and batch_size in (8, 16)
+        and router_slots == 2
+        and owned_hidden_ref is None
+        and group_pending_expert_routes
+        and selected_expert_count == 16
+        and expert_count == 896
+    )
     overlap_router_latent = (
-        overlap_router_latent and overlap_latent_gather and owned_hidden_ref is None
+        (overlap_router_latent or presorted_routing)
+        and overlap_latent_gather
+        and owned_hidden_ref is None
     )
     overlap_shared_routing = overlap_router_latent and shared_sharded
     # KernelConfig.decode_late_shared_down: with both reduce-scatters, the
@@ -3923,7 +4207,21 @@ def moe(
                     else None
                 ),
                 steal_planner=planner,
+                presorted=presorted_routing,
             )
+            if presorted_routing:
+                # Plan, start the copies and the schedule with one batch of
+                # scalar moves; the probabilities follow (probability_totals
+                # is finish_probabilities here).
+                routes = steal_step.begin_scheduled(
+                    planner,
+                    steal.tag,
+                    schedule=expert_schedule,
+                    copy_expert=copy_expert,
+                    slot_count=expert_prefetch_slot_count,
+                    gate_up_first_pair=late_shared_down,
+                )
+                return (*routes, probability_totals)
             # Plan, send the packet and push the given slabs first.
             routes = steal_step.begin(planner, steal.tag)
             return (*routes, probability_totals)
@@ -3978,6 +4276,7 @@ def moe(
                         if router_slots == 2
                         else None
                     ),
+                    presorted=presorted_routing,
                 )
             )
         if half_experts:
@@ -4003,23 +4302,33 @@ def moe(
             )
 
         store_routes(selected_experts, selected_probabilities, local_route_counts)
+        scheduled_steal = steal_step is not None and presorted_routing
+        if scheduled_steal:
+            # begin_scheduled started the copies and the schedule; now the
+            # probabilities (the planner's, in the routes' selection slots).
+            selected_probability_totals = selected_probability_totals()
+            selected_probabilities_vmem[...] = jnp.pad(
+                steal_step.planner_state.probabilities,
+                ((0, 0), (0, 128 - route_columns)),
+            )
         probability_totals_vmem[...] = jnp.broadcast_to(
             selected_probability_totals[:, None],
             probability_totals_vmem.shape,
         )
-        _start_initial_expert_weight_copies(
-            selected_experts,
-            local_route_counts,
-            copy_expert,
-            slot_count=expert_prefetch_slot_count,
-            already_started=prefetched_expert_count,
-            group_pending_routes=group_pending_expert_routes,
-            first_staged_expert=None if steal_step is None else local_expert_count,
-            # Without the shared down projection the experts start sooner: the
-            # first pair's gate/up slabs go ahead of its down slabs.
-            gate_up_first_pair=late_shared_down,
-        )
-        if expert_schedule is not None:
+        if not scheduled_steal:
+            _start_initial_expert_weight_copies(
+                selected_experts,
+                local_route_counts,
+                copy_expert,
+                slot_count=expert_prefetch_slot_count,
+                already_started=prefetched_expert_count,
+                group_pending_routes=group_pending_expert_routes,
+                first_staged_expert=None if steal_step is None else local_expert_count,
+                # Without the shared down projection the experts start sooner:
+                # the first pair's gate/up slabs go ahead of its down slabs.
+                gate_up_first_pair=late_shared_down,
+            )
+        if expert_schedule is not None and not scheduled_steal:
             # After the first expert copies, ahead of the shared expert.
             _start_expert_schedule(
                 expert_schedule,

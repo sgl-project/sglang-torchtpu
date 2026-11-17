@@ -304,6 +304,16 @@ class KernelConfig:
     # projects both router halves, its own and its pair peer's (14 MiB of
     # arena instead of 7), instead of exchanging score halves with the peer.
     decode_router_both_halves: bool = False
+    # Decode MoE at 8 and 16 rows with both router halves (attention DP1):
+    # the top-16 sorts each lane's seven candidates once and then takes one
+    # cross-lane max per selection instead of an argmax and a lane gather
+    # (any selection with an equal score, a NaN or a subnormal reruns
+    # today's argmax loop, so the experts, probabilities and sum order stay
+    # the same); the latent all-gather starts right after the router
+    # products; with the expert steal the plan stays in vectors, its scalars
+    # and the first experts move to the scalar unit in one batch and the
+    # first pair's gate/up copies start right after the top-k. Bit-identical.
+    decode_presorted_routing: bool = False
     # Decode KDA input (q|k|v|g|b) and output projections as FP8 e4m3 with one
     # FP32 scale per output column (amax / 448), converted from the pre-shard
     # at load (attention DP1). The activations stay BF16; the products run on
