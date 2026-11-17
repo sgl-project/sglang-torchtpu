@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=1600, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1850, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -1413,6 +1413,212 @@ class TestPairCombine(CustomTestCase):
             text=True,
             env=env,
             timeout=900,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
+
+
+class TestDraftPairCombine(CustomTestCase):
+    """``KernelConfig.draft_pair_combine``: the MLA draft's attention
+    (explicit keys, its lse in the padding row, FP8 pages) through the host
+    combine, its last chunk with the pair stage, in Pallas interpret mode at
+    DCP16 with ``HOST_LANES`` 4 (four hosts of two chips; the draft runs four
+    of four), one- and two-chunk calls: finite, an earlier chunk's rows the
+    knob-off bits, the last chunk's within the combine's BF16 roundings of
+    them -- |on - off| <= 3 2^-8 sum_i softmax(lse)_i |o_i| over every rank's
+    partial of the row (the pair merge's rounding, plus the host merge's
+    re-rounding of a value that moved)."""
+
+    SCRIPT = """
+        import os, time
+        G = 16
+        os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={G}"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3.kernels import mla_dcp
+
+        # The MLA draft's attention (explicit keys, lse in the padding row, FP8 pages) through the host combine,
+        # with and without its pair stage. HOST_LANES 4 at DCP16: 4 hosts of 2 chips (the draft: 4 hosts of 4 chips).
+        T, H, S, FP8 = 512, 3, 8, jnp.float8_e4m3fn
+        mla_dcp.HOST_LANES = G // 4
+        mla_dcp.GROUPS = (G, 8, 16, 32)
+        LANES = mla_dcp.LANES
+
+        def tokens(x):
+            return (jax.lax.broadcasted_iota(jnp.int32, x.shape, 0) * x.shape[1]
+                    + jax.lax.broadcasted_iota(jnp.int32, x.shape, 1))
+
+        def _pages(self, slot):  # interpret mode has no ref bitcasts (see TestSelectedAttention)
+            def load(lanes, tokens=None):
+                x = self.ws.pages[slot]
+                x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+                if hasattr(lanes, "size"):  # pl.ds
+                    return jax.lax.dynamic_slice_in_dim(x, lanes.start, lanes.size, 1)
+                return x[:, lanes]
+            return load
+
+        def _clean_step(self, slot, row, local_step, tokens_=None, end=None, pad=True):
+            x = self.ws.pages[slot]
+            cut = 0
+            for k in range(self.span):
+                first = ((local_step * self.span + k) * self.group + self.owner) * self.page_tokens
+                cut = cut + jnp.clip(self._limit(row) - first, 0, self.page_tokens)
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+            keep = (tokens(x) < cut) & ((lane < 576) if pad else True)
+            self.ws.pages[slot] = jnp.where(keep, x, jnp.zeros((), x.dtype))
+
+        def _zero_step_pad_lanes(self, slot):
+            x = self.ws.pages[slot]
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+            self.ws.pages[slot] = jnp.where(lane < 576, x, jnp.zeros((), x.dtype))
+
+        def _zero_slot(self, slot):
+            self.ws.pages[slot] = jnp.zeros(self.ws.pages.shape[1:], self.ws.pages.dtype)
+
+        _pack = mla_dcp.DcpAttention._pack_partials
+
+        def _pack_partials(self, first, end, base=0):  # also keep each chunk's packets (every owner's partials)
+            _pack(self, first, end, base)
+            capture, counter = self._capture
+            capture[counter[0]] = self.ws.send[...].astype(jnp.float32)
+            counter[0] += 1
+
+        mla_dcp.DcpAttention._pack_partials = _pack_partials
+        mla_dcp.DcpAttention._pages = _pages
+        mla_dcp.DcpAttention._clean_step = _clean_step
+        mla_dcp.DcpAttention._zero_slot = _zero_slot
+        mla_dcp.DcpAttention._zero_step_pad_lanes = _zero_step_pad_lanes
+
+        def run(firsts, counts, seed, pairs):
+            # Outputs [G, B, H, 512] and every rank's packets of each chunk [G, chunks, G, H S, 640].
+            rng = np.random.default_rng(seed)
+            B = len(firsts) * S
+            positions = np.array([p0 + r for p0 in firsts for r in range(S)], np.int32)
+            plan = mla_dcp.page_plan(B, H, S, FP8, force_chunks=True)
+            persistent = mla_dcp.persistent_scratch(B, G, H, cache_dtype=FP8, sequence_rows=S, fp8_wire=True,
+                                                    force_chunks=True, chunk_rows=S)
+            scoped = mla_dcp.scoped_scratch(B, plan["span"], plan["buffers"], heads=H, group=G, cache_dtype=FP8,
+                                            page_tokens=T, sequence_rows=S, force_chunks=True, chunk_rows=S)
+            ring, hosts = persistent[0].shape[0], G // mla_dcp.HOST_LANES
+            stage2 = (pltpu.VMEM((ring, hosts, H * S, LANES), jnp.bfloat16),
+                      pltpu.VMEM((hosts, H * S, LANES), jnp.bfloat16), pltpu.SemaphoreType.DMA((2, ring)))
+            extra = (pltpu.SemaphoreType.DMA((2, ring)),) if pairs else ()
+            pages = max(-(-(int(p0) + T) // T) // G for p0 in firsts) + 1
+            lat = (rng.standard_normal((len(firsts), pages * G * T, LANES)) * 0.5).astype(np.float32)
+            lat[..., 576:] = 0
+            pool = rng.standard_normal((G, 1 + len(firsts) * pages, 128, 4, LANES)).astype(ml_dtypes.float8_e4m3fn)
+            tables = np.zeros((G, B, pages), np.int32)
+            for b in range(B):
+                s_, p0 = b // S, firsts[b // S]
+                tables[:, b] = 1 + s_ * pages + np.arange(pages)
+                for t in range(p0):
+                    page = t // T; g, j = page % G, page // G
+                    pool[g, tables[g, b, j], (t % T) // 4, t % 4] = lat[s_, t].astype(ml_dtypes.float8_e4m3fn)
+            q = (rng.standard_normal((G, B, H, LANES)) * 0.08).astype(np.float32)
+            q[..., 576:] = 0
+            keys = (rng.standard_normal((len(firsts), 2 * S, LANES)) * 0.5).astype(np.float32)
+            keys[..., 576:] = 0
+            lane = np.arange(2 * S)
+            valid = np.stack([((lane < S) & (lane <= c)) | ((lane >= S) & (lane < 2 * S - 1)) for c in counts])
+            valid = valid[:, None, :].astype(np.int32)
+            n_p, n_s = len(persistent), len(scoped)
+            rows = persistent[1].shape[1]
+
+            def kernel(pos, table, q_r, keys_r, valid_r, pool_r, out_r, send_r, *scratch):
+                counter = scratch[-1]
+                counter[0] = 0
+                scratch = scratch[:-1]
+                cache = mla_dcp.DcpCache((pool_r,), table, pages, 0, group=G, global_pages=False)
+                ws = mla_dcp.DcpWorkspace(*scratch[:n_p], *scratch[n_p:n_p + n_s])
+                att = mla_dcp.DcpAttention(cache, ws, pos, B, sequence_rows=S, heads=H, chunk_rows=S)
+                att.lse_in_padding = True
+                att.group_fold = True
+                att.force_chunked = True
+                att.host_combine = tuple(scratch[n_p + n_s : n_p + n_s + 3])
+                att.host_pairs = scratch[n_p + n_s + 3] if pairs else None
+                att._capture = (send_r, counter)
+                att.prime()
+                out_r[...] = att.attend(q_r[...], jnp.zeros((B, LANES), jnp.float32), 0, keys=keys_r, key_valid=valid_r)
+
+            def body(pos, table, q_, keys_, valid_, pool_):
+                vmem = pltpu.VMEM
+                out, send = pl.pallas_call(kernel,
+                    out_shape=(jax.ShapeDtypeStruct((B, H, 512), jnp.float32),
+                               jax.ShapeDtypeStruct((B // S, G, rows, LANES), jnp.float32)),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2,
+                        in_specs=[pl.BlockSpec(memory_space=vmem)] * 3 + [pl.BlockSpec(memory_space=pl.ANY)],
+                        out_specs=(pl.BlockSpec(memory_space=vmem),) * 2,
+                        scratch_shapes=[*persistent, *scoped, *stage2, *extra, pltpu.SMEM((1,), jnp.int32)]),
+                    compiler_params=pltpu.CompilerParams(has_side_effects=True),
+                    interpret=pltpu.InterpretParams())(pos, table[0], q_[0], keys_, valid_, pool_[0])
+                return out[None], send[None]
+
+            mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+            f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P("tp"), P("tp"), P(), P(), P("tp")),
+                                      out_specs=(P("tp"), P("tp")), check_vma=False))
+            out, send = f(positions, tables.reshape(G, -1), q, keys, valid, pool)
+            return np.asarray(out), np.asarray(send)
+
+        def bound(send):
+            # 2^-8 sum_i softmax(lse)_i |o_i| over every rank's partial of each owner's real rows ([G, S - 1, H, 512];
+            # row S - 1 is the padding row, whose packet rows carry the lse's).
+            hl = mla_dcp.HOST_LANES
+            hosts = G // hl
+            out = np.zeros((G, S, H, 512))
+            for m in range(G):
+                idx = (m % hl) * hosts + m // hl  # the owner's packet in the lane-major send buffer
+                part = send[:, idx]  # [G ranks, H S, 640]
+                lse = part[..., 512] + part[..., 513]  # [G, rows]
+                w = np.exp(lse - lse.max(axis=0, keepdims=True)); w /= w.sum(axis=0, keepdims=True)
+                b = np.einsum("gr,gre->re", w, np.abs(part[..., :512]))  # [rows, 512]
+                out[m] = b.reshape(S, H, 512)
+            return 2.0 ** -8 * out[:, : S - 1]
+
+        t0 = time.time()
+        ok = True
+        for firsts, counts, seed in (([3000], [5], 1), ([5200], [7], 2), ([1500, 4100], [3, 7], 3)):
+            off, send = run(firsts, counts, seed, False)
+            on, _ = run(firsts, counts, seed, True)
+            B = len(firsts) * S
+            diff = np.abs(on.astype(np.float64) - off)  # [G, B, H, 512]
+            finite = bool(np.isfinite(on).all())
+            good, ratio, rel = finite, 0.0, 0.0
+            # Only the last chunk takes the pair stage: the earlier ones' outputs are the knob-off bits.
+            good &= bool(np.array_equal(on[:, : B - S], off[:, : B - S]))
+            for c in range(len(firsts)):  # each chunk's real rows against its partials' bound
+                bnd = bound(send[:, c])
+                d = diff[:, c * S : c * S + S - 1]
+                good &= bool((d <= 3 * bnd * (1 + 2.0**-6) + 1e-7 * bnd.max()).all())
+                ratio = max(ratio, float((d / np.maximum(bnd, 1e-30)).max()))
+                rel = max(rel, float(d.max() / np.abs(off[:, c * S : c * S + S - 1]).max()))
+            print(f"firsts {firsts} counts {counts}: identical {np.array_equal(on, off)} max |on - off| / (2^-8 bound) "
+                  f"{ratio:.3f} max rel {rel:.2e} finite {finite} -> {'ok' if good else 'FAIL'} ({time.time() - t0:.0f}s)",
+                  flush=True)
+            ok &= good
+        print("OK" if ok else "FAIL")
+    """
+
+    def test_pair_stage_within_its_roundings(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        # 16 interpret devices block in callbacks: give the CPU client enough
+        # threads (XLA reads NPROC for its pool size).
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=2400,
         )
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 

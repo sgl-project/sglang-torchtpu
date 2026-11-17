@@ -206,6 +206,16 @@ class KernelConfig:
     # from it), and the batched enter op returns its packet beside the ids.
     # One small program fewer a step; the same packet (bit-identical).
     draft_verify_packet: bool = False
+    # MLA DSpark drafts' two-stage DCP combine (host merge, then cross-host;
+    # mla_dcp.DcpAttention.host_combine) with a core-pair stage first on a
+    # call's last chunk (an earlier chunk's stage one is in flight under the
+    # next chunk's pages), as dcp_pair_combine does for the decoder: each
+    # core sends its chip mate the partials of the owners on the mate's
+    # parity's lanes (on-chip) and merges the two partials of each owner on
+    # its own parity's, so stage one sends one merged partial a chip instead
+    # of one a core -- half its cross-chip bytes within the host. The
+    # pair-merged partials round to BF16 once more (numerics change).
+    draft_pair_combine: bool = False
     # MLA DSpark drafts: the LM head streams through six chunk slots instead
     # of two -- the gate / up buffers' halves join the two scoped ones once
     # the last layer's gate and up products have read them, and the first

@@ -400,6 +400,7 @@ def _make_body(
             small_sems,
             sends,
             recvs,
+            *pair_sems,  # KernelConfig.draft_pair_combine: the combine's pair stage
         ) = scratch[n_persist + n_scoped :]
 
         rank = jax.lax.axis_index("tp")
@@ -1099,6 +1100,7 @@ def _make_body(
                 # calls, one request a chunk, even one request).
                 attention.force_chunked = True
                 attention.host_combine = (stage2_recv, stage2_send, stage2_sems)
+                attention.host_pairs = pair_sems[0] if pair_sems else None
             if PHASE_SCOPES:
                 attention.trace = "a_"
             attention.prime()
@@ -1436,6 +1438,8 @@ def fused_draft_local(
             tpu.SemaphoreType.DMA((2 * SEMS_PER_SLOT,)),
             tpu.SemaphoreType.DMA((2 * SEMS_PER_SLOT,)),
         )
+        if chunks and _config().draft_pair_combine:
+            scratch += (tpu.SemaphoreType.DMA((2, ring)),)  # the pair stage's
         out_shape = (
             jax.ShapeDtypeStruct((R, 128), jnp.int32),
             jax.ShapeDtypeStruct((c.layers, T, LANES), jnp.bfloat16),

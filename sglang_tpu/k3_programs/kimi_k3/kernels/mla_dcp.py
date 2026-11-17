@@ -1816,6 +1816,15 @@ class DcpAttention:
     # four. Cross-host combine bytes drop eightfold (the cross-host links
     # bound the exchange); the merged partials round to BF16 once more.
     host_combine: Any = None
+    # host_combine's pair stage (KernelConfig.draft_pair_combine), on the
+    # call's last chunk: DMA semaphores [2, ring], or None. Before stage one
+    # each core sends its chip mate (lane ^ 1) the partials of the owners on
+    # the mate's parity's lanes and merges the two partials of each owner on
+    # its own parity's; stage one then sends each same-parity host-mate on
+    # another chip one merged partial per owner (half stage one's cross-chip
+    # bytes) and each rank merges four per owner. The pair-merged partials
+    # round to BF16 once more.
+    host_pairs: Any = None
     force_chunked = (
         False  # run even one chunk through _attend_chunked (scratch: force_chunks)
     )
@@ -2257,6 +2266,35 @@ def _merge_pair(first, second):
     return jnp.concatenate((normalized, tail), axis=1).astype(jnp.bfloat16)
 
 
+def _merge_lse_packets(first, second, lse_rows):
+    """Two ``lse_in_padding`` partials' BF16 packets ``[rows, 640]`` (lanes
+    0:512 hold the outputs and the last ``lse_rows`` rows' lanes the lse's
+    high and low parts) merged by log-sum-exp into one such packet, as the
+    host combine's stage two merges a host's (``_attend_chunked``)."""
+    rows = first.shape[0]
+    pad = rows - lse_rows
+    packet_row = jax.lax.broadcasted_iota(jnp.int32, (rows, 128), 0)
+    packet_lane = jax.lax.broadcasted_iota(jnp.int32, (rows, 128), 1)
+
+    def lse_of(packet):
+        vector = packet[pad : pad + 1, :128].astype(jnp.float32) + packet[
+            pad + 1 : pad + 2, :128
+        ].astype(jnp.float32)  # [1, 128]
+        lse = jnp.sum(
+            jnp.where(packet_lane == packet_row, vector, 0.0), axis=1, keepdims=True
+        )  # [rows, 1]
+        return jnp.where(packet_row[:, :1] < pad, lse, NEG)
+
+    lse_a, lse_b = lse_of(first), lse_of(second)
+    top = jnp.maximum(lse_a, lse_b)
+    weight_a, weight_b = jnp.exp(lse_a - top), jnp.exp(lse_b - top)
+    total = weight_a + weight_b
+    accumulator = weight_a * first[:, :LATENT].astype(jnp.float32) + weight_b * second[
+        :, :LATENT
+    ].astype(jnp.float32)
+    return _lse_packet(accumulator / total, top + jnp.log(total), lse_rows)
+
+
 def _merge_received(received, own_rows, new_rows, group, *, unroll=1, own=None):
     """Log-sum-exp merge of the ``group`` peers' partials in ``received``
     [G, rows, 640] (a ref: normalized outputs, lse hi/lo in lanes 512:514)
@@ -2499,6 +2537,9 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
     ring_slots = ws.gathered.shape[0]
     count = batch // chunk
     hier = self.host_combine is not None
+    # The pair stage runs on the call's last chunk, whose stage one nothing
+    # hides (an earlier chunk's is in flight under the next one's pages).
+    pairs = hier and self.host_pairs is not None
     # The two-stage combine sends a chunk's merged partials a chunk later:
     # queries one chunk ahead leave its final merge three chunks behind.
     lookahead = 2 if ring_slots == 4 and not hier else 1
@@ -2509,6 +2550,7 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
             or not self.lse_in_padding
             or keys is None
             or "combine" in self.skip
+            or HOST_LANES % 2
         ):
             raise ValueError(
                 "host_combine: DCP32 explicit-keys sequences with lse_in_padding"
@@ -2517,6 +2559,11 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
         hosts = group // HOST_LANES
         host, lane = member // HOST_LANES, member % HOST_LANES
         lanes512 = self._combine_lanes()
+        # Pair stage: chip ``chip``'s cores are lanes 2 chip and 2 chip + 1.
+        # Receive slots [0, half): stage one's partials, by source chip (else
+        # by source lane); [half, group): the mate's, by the owner lane's chip.
+        chips, half, pair_sems = HOST_LANES // 2, group // 2, self.host_pairs
+        chip, parity = lane // 2, lane % 2
     rows = slots * chunk  # packet rows per chunk
     heads = group * slots
     layer = self.cache.layer if self.cache.layer is not None else 0
@@ -2569,6 +2616,19 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
         tpu.make_async_copy(others, others, ws.gather_semaphores.at[0, slot]).wait()
         tpu.make_async_copy(others, others, ws.gather_semaphores.at[1, slot]).wait()
 
+    def pair_sends(c):
+        """The pair stage's sends: the mate gets its parity's owners' partials."""
+        slot = ring(c)
+        for j in range(chips):
+            tpu.make_async_remote_copy(
+                ws.send.at[pl.ds((2 * j + 1 - parity) * hosts, hosts), :, lanes512],
+                ws.receive.at[slot, pl.ds(half + j * hosts, hosts), :, lanes512],
+                pair_sems.at[0, slot],
+                pair_sems.at[1, slot],
+                device_id=(base + host * HOST_LANES + (lane ^ 1),),
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+
     def send_partials(c):
         slot = ring(c)
         if hier:
@@ -2604,36 +2664,85 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
 
     peers_bytes = (HOST_LANES - 1) * (group // HOST_LANES) if hier else group - 1
 
-    def wait_sent(c):  # this rank's partials of chunk c have left the send buffer
+    def wait_sent(c, paired=False):
+        # This rank's partials of chunk c have left the send buffer.
         if "combine" in self.skip:
             return
-        others = ws.receive.at[ring(c), pl.ds(0, peers_bytes), :, self._combine_lanes()]
+        sent = (chips - 1) * hosts if paired else peers_bytes
+        others = ws.receive.at[ring(c), pl.ds(0, sent), :, self._combine_lanes()]
         tpu.make_async_copy(others, others, ws.combine_semaphores.at[0, ring(c)]).wait()
+        if paired:
+            mates = ws.receive.at[ring(c), pl.ds(half, half), :, lanes512]
+            tpu.make_async_copy(mates, mates, pair_sems.at[0, ring(c)]).wait()
 
-    def wait_received(c):
+    def wait_received(c, paired=False):
         if "combine" in self.skip:
             return
-        others = ws.receive.at[ring(c), pl.ds(0, peers_bytes), :, self._combine_lanes()]
+        received = (chips - 1) * hosts if paired else peers_bytes
+        others = ws.receive.at[ring(c), pl.ds(0, received), :, self._combine_lanes()]
         tpu.make_async_copy(others, others, ws.combine_semaphores.at[1, ring(c)]).wait()
 
-    def host_merge(c):
-        """Stage two of chunk ``c``: merge the host's eight partials of each
-        owner on this lane, send each owner its merged partial."""
+    def pair_stage(c):
+        """The pair stage of chunk ``c`` once the mate's partials are in:
+        merge each owner of this core's parity's partials, sending each other
+        chip's owners theirs as soon as they are merged (stage one)."""
+        slot = ring(c)
+        with self._scope("pair_wait"):
+            mates = ws.receive.at[slot, pl.ds(half, half), :, lanes512]
+            tpu.make_async_copy(mates, mates, pair_sems.at[1, slot]).wait()
+        with self._scope("pair_merge"):
+
+            @pl.loop(1, chips + 1)
+            def merge_and_send(k):  # chip + 1, ..., then this chip
+                j = (chip + k) % chips
+                target = 2 * j + parity  # the owners' lane
+                for owner_host in range(hosts):
+                    index = target * hosts + owner_host
+                    ws.send[index] = _merge_lse_packets(
+                        ws.send[index],
+                        ws.receive[slot, half + j * hosts + owner_host],
+                        self.slots,
+                    )
+
+                @pl.when(k < chips)
+                def send():
+                    tpu.make_async_remote_copy(
+                        ws.send.at[pl.ds(target * hosts, hosts), :, lanes512],
+                        ws.receive.at[slot, pl.ds(chip * hosts, hosts), :, lanes512],
+                        ws.combine_semaphores.at[0, slot],
+                        ws.combine_semaphores.at[1, slot],
+                        device_id=(base + host * HOST_LANES + target,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+            ws.receive[slot, pl.ds(chip * hosts, hosts)] = ws.send[
+                pl.ds(lane * hosts, hosts)
+            ]
+
+    def host_merge(c, paired=False):
+        """Stage two of chunk ``c``: merge the host's eight partials (after
+        the pair stage: four, one a chip) of each owner on this lane, send
+        each owner its merged partial."""
         slot = ring(c)
         # Every block's lse at once (packet row r at lane r of its padding rows).
         pad = rows - self.slots
-        tails = ws.receive[slot, :, pl.ds(pad, 2), pl.ds(0, 128)].astype(
-            jnp.float32
-        )  # [32, 2, 128]
+        received, sources_per_owner = (half, chips) if paired else (group, HOST_LANES)
+        tails = (
+            ws.receive[slot, :half, pl.ds(pad, 2), pl.ds(0, 128)]
+            if paired
+            else ws.receive[slot, :, pl.ds(pad, 2), pl.ds(0, 128)]
+        ).astype(jnp.float32)  # [32, 2, 128]
         vectors = tails[:, 0:1, :] + tails[:, 1:2, :]  # [32, 1, 128]
-        packet_row = jax.lax.broadcasted_iota(jnp.int32, (group, rows, 128), 1)
-        packet_lane = jax.lax.broadcasted_iota(jnp.int32, (group, rows, 128), 2)
+        packet_row = jax.lax.broadcasted_iota(jnp.int32, (received, rows, 128), 1)
+        packet_lane = jax.lax.broadcasted_iota(jnp.int32, (received, rows, 128), 2)
         lses = jnp.sum(
             jnp.where(packet_lane == packet_row, vectors, 0.0), axis=2, keepdims=True
         )  # [32, rows, 1]
         lses = jnp.where(packet_row[:, :, :1] < pad, lses, NEG)
         for owner_host in range(hosts):
-            sources = [source * hosts + owner_host for source in range(HOST_LANES)]
+            sources = [
+                source * hosts + owner_host for source in range(sources_per_owner)
+            ]
             top = lses[sources[0]]
             for index in sources[1:]:
                 top = jnp.maximum(top, lses[index])
@@ -2782,7 +2891,11 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
             self._pack_partials(
                 0, 0 if "pack" in self.skip else chunk
             )  # the chunk's rows: state rows 0..chunk
-            send_partials(c)
+            if pairs:
+                pl.when(c == count - 1)(lambda: pair_sends(c))
+                pl.when(c < count - 1)(lambda: send_partials(c))
+            else:
+                send_partials(c)
 
         if hier:
 
@@ -2798,14 +2911,17 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
                 with self._scope("host_merge"):
                     host_merge(c - 1)
 
+        if pairs:
+            pl.when(c == count - 1)(lambda: pair_stage(c))
+
     if hier:
         with self._scope("host_wait"):
-            wait_received(count - 1)
+            wait_received(count - 1, pairs)
             if count >= 2:
                 stage2_wait(count - 2, 0)
         with self._scope("host_merge"):
-            host_merge(count - 1)
-        wait_sent(count - 1)
+            host_merge(count - 1, pairs)
+        wait_sent(count - 1, pairs)
         for c in range(max(count - ring_slots + lookahead, 0), count):
             with self._scope("combine_wait"):
                 stage2_wait(c, 1)
