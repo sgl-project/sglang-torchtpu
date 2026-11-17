@@ -267,6 +267,10 @@ class TpuEnvs:
     # step launches while the scheduler processes the last one's tokens (as
     # vLLM's async scheduling runs it).
     SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP = EnvBool(False)
+    # Under that overlap scheduling: sglang's per-step decode bookkeeping on
+    # the host (k3_programs/sglang_host_relay.py): no device op between the
+    # program's steps; the scheduler reads the copied token rows.
+    SGLANG_TPU_K3_PROGRAM_OPT_HOST_BOOKKEEPING = EnvBool(False)
     # Prefix cache on the K3_PROGRAM P/D decode (KV pages only,
     # k3_programs/sglang_decode_cache.py): a session's next turn transfers only
     # the pages past the decode's local prefix hit.

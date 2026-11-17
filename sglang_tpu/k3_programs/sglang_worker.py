@@ -109,9 +109,10 @@ class K3ProgramAlgo(CustomSpecAlgo):
         return False
 
     def supports_kv_free_fence(self, *, copies_draft_tail: bool) -> bool:
-        # The tokens and accept lengths the result copies derive from the
-        # step's emitted tokens, the output of its last op (which commits the
-        # target's and the draft's KV); the device runs ops in launch order.
+        # The tokens (and accept lengths) the result copies are, or derive
+        # from, the step's emitted tokens, the output of its last op (which
+        # commits the target's and the draft's KV); the device runs ops in
+        # launch order.
         return True
 
     def create_future_map(
@@ -121,9 +122,22 @@ class K3ProgramAlgo(CustomSpecAlgo):
         needs_cpu_seq_lens: bool = True,
         needs_confidence_relay: bool = False,
     ):
+        """sglang's future map, or under host bookkeeping (no host length
+        mirror or confidence relay asked for, as the programs' worker asks
+        none) one that relays nothing (:mod:`sglang_host_relay`)."""
         from sglang.srt.managers.overlap_utils import FutureMap
+        from sglang_tpu.envs import envs as tpu_envs
 
-        return FutureMap(
+        cls = FutureMap
+        if (
+            tpu_envs.SGLANG_TPU_K3_PROGRAM_OPT_HOST_BOOKKEEPING.get()
+            and not needs_cpu_seq_lens
+            and not needs_confidence_relay
+        ):
+            from sglang_tpu.k3_programs.sglang_host_relay import HostRelayFutureMap
+
+            cls = HostRelayFutureMap
+        return cls(
             device, self, req_to_token_pool, needs_cpu_seq_lens, needs_confidence_relay
         )
 
@@ -233,7 +247,7 @@ def prefill_deferral_rounds(prefill_rows: int, running: int, share: float) -> in
     return max(1, min(512, math.ceil(prefill_s * (1 - share) / share / decode_s)))
 
 
-def dp_pages(plan) -> "sglang_dp.DpPages | None":
+def dp_pages(plan) -> sglang_dp.DpPages | None:
     """The DP2 page regions over ``plan``'s KV pages under ``attention_dp=2``
     (None without attention DP)."""
     from sglang_tpu.k3_programs.kimi_k3.config import active
@@ -314,7 +328,7 @@ class StepClock:
 _COLO_STEPS: list = []
 
 
-def colo_steps() -> "DecodeSteps | None":
+def colo_steps() -> DecodeSteps | None:
     """The process's colocated DP2 decode steps (B rows), once built."""
     return _COLO_STEPS[-1] if _COLO_STEPS else None
 
@@ -377,6 +391,14 @@ class DecodeSteps:
         scheduling a running request's committed length trails its device
         position by up to a step, so its tables reach a step further (within
         the KV sglang allocated); the program tracks its position itself."""
+        return self.launch_rows(reqs, starts, lagging=lagging)[: len(reqs)]
+
+    def launch_rows(
+        self, reqs: Sequence[Any], starts: np.ndarray, *, lagging: bool = False
+    ) -> torch.Tensor:
+        """:meth:`launch`'s step, returning the program's tokens as they are:
+        ``[>= len(reqs), WIDTH]``, request ``i`` in row ``i`` (no view, so a
+        copy to the host reads the program's output buffer itself)."""
         scheduled = 1 + drafts_for(self.schedule, len(reqs))
         requests = []
         swaps: list = []
@@ -478,7 +500,7 @@ class DecodeSteps:
         self.clock.mark("inputs")
         tokens = self.program.step(StepInput(requests, finished)).tokens
         self.clock.mark("dispatch")
-        return tokens[: len(reqs)]
+        return tokens
 
     def _swap(self, swaps) -> None:
         """Move each new request's rows that landed on the other DP group to
@@ -841,6 +863,14 @@ class K3ProgramWorker(BaseSpecWorker):
         # sglang's deferred writes since the last step run as a program of
         # their own, not inside the program's next op (sglang_deferred).
         future_map = getattr(getattr(on_publish, "func", None), "__self__", None)
+        # Host bookkeeping (sglang_host_relay): the future map relays nothing,
+        # so the step leaves no device work behind its program's ops.
+        from sglang_tpu.k3_programs.sglang_host_relay import (
+            HostRelayFutureMap,
+            HostRowsResult,
+        )
+
+        host_relay = isinstance(future_map, HostRelayFutureMap)
         self.guard(
             (
                 ("batch", batch),
@@ -866,7 +896,7 @@ class K3ProgramWorker(BaseSpecWorker):
             clock.mark("step")
             self._track_checkpoints(batch, state_pool)
             relay = K3ProgramInput()
-            if on_publish is not None:
+            if on_publish is not None and not host_relay:
                 on_publish(batch.seq_lens)
                 # Overlap scheduling relays each request's last token.
                 device = future_map.device if future_map is not None else "cpu"
@@ -879,6 +909,20 @@ class K3ProgramWorker(BaseSpecWorker):
                 new_seq_lens=batch.seq_lens,
                 next_draft_input=relay,
                 speculative_num_draft_tokens=WIDTH,
+            )
+        if host_relay:
+            # Overlap scheduling, host bookkeeping: the scheduler copies the
+            # program's rows out while the next step runs; the tokens and
+            # accept lengths it reads are built from the copy.
+            rows = steps.launch_rows(batch.reqs, starts, lagging=True)
+            clock.mark("result")
+            clock.stop(len(batch.reqs))
+            return HostRowsResult(
+                rows,
+                len(batch.reqs),
+                next_draft_input=K3ProgramInput(),
+                speculative_num_draft_tokens=WIDTH,
+                speculative_output_stride=WIDTH,
             )
         if on_publish is not None:
             # Overlap scheduling: everything stays on the device; the
