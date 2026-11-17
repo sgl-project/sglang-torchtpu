@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=4400, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5200, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -6745,6 +6745,280 @@ class TestSelectHooksSeededFills(CustomTestCase):
                     np.testing.assert_array_equal(
                         base[key], other[key], err_msg=f"{name}: {key}"
                     )
+
+
+class TestMlaQ6Knobs(CustomTestCase):
+    """The decode MLA layer with the DSA indexer (``decode_megakernel.mla``)
+    in Pallas interpret mode on a 4-rank DCP group, with the serving
+    selection, attention and prologue knobs, under its q6 knobs:
+    ``KernelConfig.decode_mla_early_handout`` (the new rows' hand-out copies
+    start once q6 has written them and are waited after the layer, as q8
+    does), also inside the one-trip prefix region (``decode_mla_prefix_region``).
+    The layer's output, handed-out rows, index keys and records and the
+    selection equal the knobs-off layer's bit for bit, with eager and with
+    on-wait DMA execution (a copy started before its source is written, or a
+    source written after its copy started, reads different bytes in the two
+    modes). The output projection's TP reduction is a local product in every
+    run."""
+
+    SCRIPT = r"""
+import dataclasses, os
+G = 4
+os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={G}"
+os.environ["JAX_PLATFORMS"] = "cpu"
+from types import SimpleNamespace
+import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import Mesh, PartitionSpec as P
+from sglang_tpu.k3_programs.kimi_k3 import config as kc
+kc.install(kc.KernelConfig(dsa_select_rounds=5, dsa_compact_tokens=128, dsa_compact_window=512,
+                           dcp_pair_combine=True, dsa_stage_slots=4, dsa_page_slots=8, dsa_resident_keys=True,
+                           dsa_patch_loop=True, dsa_early_plan=True, dsa_live_activity=True, dsa_odd_stride=True,
+                           dsa_prologue_in_select=True, dsa_row_block_masks=True, dcp_shift_scalars=True,
+                           dcp_query_tail_unpack=True, dsa_exchange_fill=True, dsa_vector_patch=True))
+from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel as dmk, dsa_dcp, dsa_decode, mla_dcp
+mla_dcp.GROUPS = (G, 8, 16, 32)
+mla_dcp._grouped_spec = lambda b, g, h, rows: rows in (4, 8) and b % 4 == 0
+dsa_dcp.ACTIVITY_MIN_STEPS = int(os.environ["ACTIVITY"])
+
+def tokens(x):
+    return (jax.lax.broadcasted_iota(jnp.int32, x.shape, 0) * x.shape[1]
+            + jax.lax.broadcasted_iota(jnp.int32, x.shape, 1))
+
+def _pages(self, slot):  # interpret mode has no ref bitcasts (see TestSelectedAttention)
+    def load(lanes, tokens=None):
+        x = self.ws.pages[slot]
+        return x.reshape(x.shape[0] * x.shape[1], x.shape[2])[:, lanes]
+    return load
+
+def _clean_step(self, slot, row, local_step, tokens_=None, end=None, pad=True):
+    x = self.ws.pages[slot]
+    cut = 0
+    for k in range(self.span):
+        first = ((local_step * self.span + k) * self.group + self.owner) * self.page_tokens
+        cut = cut + jnp.clip(self._limit(row) - first, 0, self.page_tokens)
+    lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+    keep = (tokens(x) < cut) & ((lane < 576) if pad else True)
+    self.ws.pages[slot] = jnp.where(keep, x, jnp.zeros((), x.dtype))
+
+def _cache_verify_row(self, slot, local_step, row):
+    position = self.position_ref[row]
+    page = position // self.page_tokens
+    local_page = page // self.group - local_step * self.span
+
+    @pl.when((page % self.group == self.owner) & (local_page >= 0) & (local_page < self.span))
+    def write():
+        if mla_dcp.chunked(self.batch):
+            chunk = mla_dcp.chunk_layout(self.batch, self.heads)[0]
+            latent = self.ws.new_rows[row // chunk, self.slots * (row % chunk)]
+        else:
+            latent = self.ws.new_rows[self.slots * row]
+        x = self.ws.pages[slot]
+        offset = local_page * self.page_tokens + position % self.page_tokens
+        self.ws.pages[slot] = jnp.where(tokens(x) == offset, latent.astype(x.dtype)[None, None, :], x)
+
+def _zero_step_pad_lanes(self, slot):
+    x = self.ws.pages[slot]
+    lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+    self.ws.pages[slot] = jnp.where(lane < 576, x, jnp.zeros((), x.dtype))
+
+def _zero_slot(self, slot):
+    self.ws.pages[slot] = jnp.zeros(self.ws.pages.shape[1:], self.ws.pages.dtype)
+
+mla_dcp.DcpAttention._pages = _pages
+mla_dcp.DcpAttention._clean_step = _clean_step
+mla_dcp.DcpAttention._zero_slot = _zero_slot
+mla_dcp.DcpAttention._zero_step_pad_lanes = _zero_step_pad_lanes
+mla_dcp.DcpAttention._cache_verify_row = _cache_verify_row
+
+def _project_local(attended, weight, out, *args, **kwargs):
+    out[...] = jnp.dot(attended, weight[...], preferred_element_type=jnp.float32)
+
+dmk._project_attention_2d = _project_local
+BF, FP8 = ml_dtypes.bfloat16, jnp.float8_e4m3fn
+S, TOPK = int(os.environ["S"]), int(os.environ["TOPK"])
+firsts = [int(x) for x in os.environ["POS"].split(",")]
+T, H, QL, PER, PAD = 512, 1024, 1536, 32 // G, 8
+positions = np.array([p0 + r for p0 in firsts for r in range(S)], np.int32)
+B = len(positions)
+rng = np.random.default_rng(0)
+bf = lambda x: np.asarray(x, np.float32).astype(BF)
+plan = mla_dcp.page_plan(B, 3, S, FP8, dsa=True)
+key_buf = mla_dcp.selection_scratch(B, page_tokens=T, sequence_rows=S, cache_dtype=FP8, **plan)[0]
+span = key_buf.shape[2] * 128 // T
+pages = -(-(max(-(-(int(p) + T) // T) // G for p in positions) + 1) // span) * span
+key_rows = dsa_dcp.key_rows_for(pages, T, span)
+
+hidden = bf(rng.standard_normal((B, H)))
+mla_w = [bf(rng.standard_normal((G, i, o)) * i**-0.5)
+         for i, o in ((H, QL), (H, 640), (QL, 768), (512, 768), (H, 384), (384, H))]
+qnorm, knorm_mla = bf(1 + 0.1 * rng.standard_normal((1, QL))), bf(1 + 0.1 * rng.standard_normal((1, 512)))
+wqb = bf(rng.standard_normal((QL, 32 * 128)) * QL**-0.5)
+wk = bf(rng.standard_normal((H, 128)) * H**-0.5)
+wproj = np.zeros((H, 128), np.float32)
+wproj[:, :32] = rng.standard_normal((H, 32)) * H**-0.5
+knorm = bf(np.stack([1 + 0.1 * rng.standard_normal(128), 0.1 * rng.standard_normal(128)]))
+wqb_ranks = np.stack([wqb[:, g * PER * 128:(g + 1) * PER * 128] for g in range(G)])
+wks_ranks = np.stack([dsa_decode.key_weight(wk, g, G) for g in range(G)])
+wpt = dsa_decode.gate_weight(wproj)
+ipool = rng.integers(0, 256, (G, 1 + len(firsts) * pages, 132, 4, 128), dtype=np.uint8)
+lpool = (rng.standard_normal((G, 1 + len(firsts) * pages, 128, 4, 640)) * 0.5).astype(ml_dtypes.float8_e4m3fn)
+tables = np.zeros((G, B, pages), np.int32)
+for s_, p0 in enumerate(firsts):
+    rec = np.asarray(dsa_dcp.key_records(jnp.asarray(rng.standard_normal((p0, 128)).astype(np.float32))))
+    for r in range(S):
+        tables[:, s_ * S + r] = 1 + s_ * pages + np.arange(pages)
+    for t in range(p0):
+        page = t // T; g = page % G
+        blk = tables[g, s_ * S, page // G]
+        (row, sub), (srow, lane) = dsa_dcp.record_place(t % T)
+        ipool[g, blk, row, sub] = rec[t, :128]; ipool[g, blk, srow, 0, lane] = rec[t, 128]
+
+n_dsa_p = len(dsa_decode.PERSISTENT_NAMES)
+dsa_scoped = dsa_decode.scoped_scratch(B, hidden=H, index_block_shape=(132, 4, 128), key_rows=key_rows,
+                                       page_tokens=T, sequence_rows=S, page_plan=plan)
+vmem, smem = pltpu.VMEM, pltpu.SMEM
+groups = [
+    (*dsa_decode.persistent_scratch(B, G), *mla_dcp.persistent_scratch(B, G, cache_dtype=FP8, sequence_rows=S)),
+    tuple(dsa_scoped.values()),
+    mla_dcp.scoped_scratch(B, group=G, cache_dtype=FP8, page_tokens=T, sequence_rows=S, **plan),
+    (vmem((8, 128), jnp.bfloat16), vmem((8, 128), jnp.bfloat16), pltpu.SemaphoreType.DMA((1,)),
+     vmem((B, 3, 256), jnp.bfloat16), vmem((B, 384), jnp.bfloat16), vmem((B, 3, 256), jnp.bfloat16),
+     vmem((B, 3, 128), jnp.bfloat16), vmem((B, 3, 1), jnp.float32), vmem((B, 3, 1), jnp.float32),
+     vmem((B, 3, 128), jnp.float32)),
+    (*(vmem(w.shape[1:], jnp.bfloat16) for w in mla_w), pltpu.SemaphoreType.DMA((6,))),
+    (smem((1,), jnp.int32), vmem((B, PAD, 256), jnp.bfloat16), vmem((B, PAD, 128), jnp.bfloat16),
+     pltpu.SemaphoreType.DMA((2,))),
+]
+bounds = np.cumsum([0] + [len(x) for x in groups])
+STEPS = key_rows // dsa_scoped["attend_keys"].shape[2]
+installed = kc.active()
+
+def run(knobs, params):
+    config = installed.replace(**knobs)
+    handout = config.decode_mla_early_handout
+
+    def kernel(pos_ref, table_ref, hidden_ref, qnorm_ref, knorm_ref, qa, ka, qb, kb, gate, o, wqb_ref, wks_ref,
+               wpt_ref, dknorm_ref, ipool_ref, lpool_ref, out_ref, tau_out, ptie_out, own_out, act_out, key_out,
+               value_out, rec_out, keys_out, *scratch):
+        persist, dscoped, dcps, mws, wv, (phase, new_key, new_value, sems) = (
+            scratch[bounds[i]:bounds[i + 1]] for i in range(len(groups)))
+        phase[0] = 0
+        sc = dict(zip(dsa_scoped, dscoped))
+        indexer = dsa_decode.DecodeIndexer(
+            weights={"d_wqb": wqb_ref, "d_wks": wks_ref, "d_wpt": wpt_ref, "d_knorm": dknorm_ref},
+            pools=(ipool_ref,), layer=0, keys=keys_out, records_out=rec_out, persistent=persist[:n_dsa_p],
+            scoped=sc, topk=TOPK, sequence_rows=S)
+        weights = dmk.MultiHeadLatentAttentionWeights(qa, wv[0], ka, wv[1], qb, wv[2], kb, wv[3], gate, wv[4],
+                                                      o, wv[5], qnorm_ref, knorm_ref, wv[6])
+        comm = SimpleNamespace(**dict.fromkeys(f.name for f in dataclasses.fields(dmk.AttentionCommunicationWorkspace)))
+        comm.reduction_phase = phase
+        copies = lambda: (pltpu.make_async_copy(new_key, key_out, sems.at[0]),
+                          pltpu.make_async_copy(new_value, value_out, sems.at[1]))
+
+        def start_hand_out():
+            for copy in copies():
+                copy.start()
+
+        dmk.mla(pos_ref, hidden_ref, out_ref, new_key, new_value, weights=weights,
+                workspace=dmk.MultiHeadLatentAttentionWorkspace(*mws), communication_workspace=comm,
+                dcp=(mla_dcp.DcpCache((lpool_ref,), table_ref, pages, 0, group=G, global_pages=False),
+                     mla_dcp.DcpWorkspace(*persist[n_dsa_p:], *dcps)),
+                synchronize_devices=False, output_projection_after_query_down=True, sequence_rows=S, dsa=indexer,
+                hand_out=start_hand_out if handout else None)
+        if not handout:  # q8 as compute() runs it
+            start_hand_out()
+        for copy in copies():
+            copy.wait()
+        for b in range(B):
+            tau_out[b] = sc["tau"][b]; ptie_out[b] = sc["p_tie"][b]; own_out[b] = sc["own"][b]
+        for i in range(B * STEPS):
+            act_out[i] = sc["active"][i]
+
+    def body(pos, table, hid, qn, kn, *rest):
+        w6, (wqb_, wks_, wpt_, dkn, ip, lp) = rest[:6], rest[6:]
+        out = pl.pallas_call(kernel,
+            out_shape=(jax.ShapeDtypeStruct((B, H), jnp.float32), *(jax.ShapeDtypeStruct((B,), jnp.int32),) * 3,
+                       jax.ShapeDtypeStruct((B * STEPS,), jnp.int32), jax.ShapeDtypeStruct((B, PAD, 256), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((B, PAD, 128), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((B, 24, 2, 128), jnp.int32),
+                       jax.ShapeDtypeStruct((B, key_rows, 128), jnp.int32)),
+            grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2,
+                in_specs=[pl.BlockSpec(memory_space=vmem)] * 3 + [pl.BlockSpec(memory_space=pl.ANY)] * 12,
+                out_specs=[pl.BlockSpec(memory_space=vmem)] + [pl.BlockSpec(memory_space=smem)] * 4
+                          + [pl.BlockSpec(memory_space=pl.ANY)] * 4,
+                scratch_shapes=[x for grp in groups for x in grp]),
+            compiler_params=pltpu.CompilerParams(has_side_effects=True),
+            interpret=params)(pos, table[0], hid, qn, kn, *(w[0] for w in w6), wqb_[0], wks_[0], wpt_, dkn,
+                              ip[0], lp[0])
+        return tuple(x[None] for x in out)
+
+    sharded = (P("tp"),) + (P(),) * 3 + (P("tp"),) * 8 + (P(), P(), P("tp"), P("tp"))
+    f = jax.jit(jax.shard_map(body, mesh=Mesh(np.asarray(jax.devices()), ("tp",)), in_specs=(P(), *sharded),
+                              out_specs=(P("tp"),) * 9, check_vma=False))
+    dmk._config = lambda: config  # the knobs mla() reads while tracing
+    try:
+        return [np.asarray(x) for x in f(positions, tables.reshape(G, -1), hidden, qnorm, knorm_mla, *mla_w,
+                                         wqb_ranks, wks_ranks, wpt, knorm, ipool, lpool)]
+    finally:
+        dmk._config = kc.active
+
+bits = lambda x: x.view(np.uint16 if x.dtype.itemsize == 2 else np.uint32)
+names = ("output", "tau", "p_tie", "own", "active", "key rows", "value rows", "records", "keys")
+ok, want = True, None
+for variant in os.environ["VARIANTS"].split(";"):
+    knobs = dict(kv.split("=") for kv in variant.split(",") if kv)
+    got = run(knobs, pltpu.InterpretParams(dma_execution_mode=os.environ["MODE"]))
+    if want is None:
+        want = got
+        out, rows = got[0], got[5][:, :, :3].astype(np.float32)
+        print(f"rms output {np.sqrt(np.mean(out ** 2)):.3f} rows {np.sqrt(np.mean(rows ** 2)):.3f}; "
+              f"tau {got[1][0].tolist()}; active {int(got[4].sum())} of {got[4].size}")
+        # Every row has more than TOPK tokens: a real threshold, a live layer.
+        ok &= bool(np.isfinite(out).all() and np.isfinite(rows).all() and np.abs(out).max() > 0)
+        ok &= bool((got[1][0] != -2**31).all())
+        continue
+    same = [np.array_equal(bits(a), bits(b)) for a, b in zip(want, got)]
+    print(f"{variant}: bitwise {all(same)}", [n for n, s in zip(names, same) if not s])
+    ok &= all(same)
+print("OK" if ok else "FAIL")
+"""
+
+    def test_layer_is_bitwise_unchanged(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        handout = "decode_mla_early_handout=1"
+        prefix = "decode_mla_prefix_region=1"
+        for case in (
+            # The B1 x7 verify shape, dense regime (every step active).
+            {"S": "8", "POS": "3000", "TOPK": "200", "ACTIVITY": "16", "MODE": "eager",
+             "VARIANTS": f";{handout};{prefix},{handout}"},
+            # Selection-driven step activity, copies executed at their waits.
+            {"S": "8", "POS": "3000", "TOPK": "200", "ACTIVITY": "0", "MODE": "on_wait",
+             "VARIANTS": f";{prefix},{handout}"},
+            # Two 8-row sequences (B2 x7): chunked attention.
+            {"S": "8", "POS": "1500,3000", "TOPK": "200", "ACTIVITY": "16", "MODE": "eager",
+             "VARIANTS": f";{prefix},{handout}"},
+        ):  # fmt: skip
+            with self.subTest(**case):
+                env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), **case)
+                result = subprocess.run(
+                    [sys.executable, "-c", self.SCRIPT],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=1800,
+                )
+                self.assertIn(
+                    "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+                )
 
 
 if __name__ == "__main__":

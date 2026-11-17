@@ -288,6 +288,11 @@ class KernelConfig:
     # the KDA path prefetches fits in IMEM beside the KDA path's code. The
     # same operations run in the same order (bit-identical).
     decode_mla_prefix_region: bool = False
+    # Decode MLA layers (attention DP1): the new rows' hand-out copies for the
+    # cache commit start as soon as q6 has written the rows and are waited in
+    # q8, after the attention, instead of starting and waiting back to back
+    # there. Nothing writes the rows in between (bit-identical).
+    decode_mla_early_handout: bool = False
     # 8- and 16-row decode steps: keep the small embedding all-reduce on the
     # TensorCore instead of the SparseCore collective offload.
     decode_tc_all_reduce: bool = False

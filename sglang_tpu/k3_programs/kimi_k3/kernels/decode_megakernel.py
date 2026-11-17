@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -6938,6 +6939,7 @@ def mla(
     output_projection_after_query_down: bool = False,
     streams: dict | None = None,
     dsa: "dsa_decode.DecodeIndexer | None" = None,
+    hand_out: Callable[[], None] | None = None,
 ) -> None:
     """Execute one multi-head latent-attention layer inside a Pallas program.
 
@@ -6962,6 +6964,10 @@ def mla(
     ``dsa`` (Kimi-K3.1): the layer's indexer (``dsa_decode.DecodeIndexer``);
     each row then attends only its selected tokens, and the attention's page
     reads start once the selection is known.
+
+    ``hand_out`` (KernelConfig.decode_mla_early_handout): called once the new
+    rows are in ``new_key_ref`` / ``new_value_ref`` (e.g. to start their
+    hand-out copies); nothing writes them afterwards.
     """
     batch_size, hidden_size = hidden_ref.shape
     context_length = (
@@ -7185,6 +7191,8 @@ def mla(
             (new_latent[:, 512:], jnp.zeros((batch_size, 128), jnp.bfloat16)), axis=1
         )
         new_value_ref[:, :3] = jnp.zeros((batch_size, 3, 128), jnp.bfloat16)
+        if hand_out is not None:
+            hand_out()
         if dsa is not None:
 
             def send_queries_early():
@@ -11613,7 +11621,13 @@ def stack(
                         ),
                     )
 
+                # KernelConfig.decode_mla_early_handout: mla() starts the new
+                # rows' hand-out as soon as they are written; q8 only waits.
+                early_handout = _config().decode_mla_early_handout and attention_dp == 1
+
                 def compute(new_key_vmem, new_value_vmem, *workspace):
+                    if early_handout:
+                        handout_semaphores, workspace = workspace[0], workspace[1:]
                     indexer = None
                     if dsa:
                         workspace, dsa_refs = (
@@ -11723,6 +11737,26 @@ def stack(
                         defer_host_round=host_round_after_join,
                         sequence_rows=sequence_rows,
                     )
+
+                    # The pool stays read-only: hand this layer's new rows out.
+                    def hand_out_copies(semaphores):
+                        return (
+                            tpu.make_async_copy(
+                                new_key_vmem,
+                                key_output_ref.at[:, state_index],
+                                semaphores.at[0],
+                            ),
+                            tpu.make_async_copy(
+                                new_value_vmem,
+                                value_output_ref.at[:, state_index],
+                                semaphores.at[1],
+                            ),
+                        )
+
+                    def start_hand_out():
+                        for copy in hand_out_copies(handout_semaphores):
+                            copy.start()
+
                     if attention_dp > 1:
                         data_group = jax.lax.axis_index("tp") // (32 // attention_dp)
 
@@ -11785,31 +11819,24 @@ def stack(
                                 mla_dcp.DcpWorkspace(*dcp_persistent, *dcp_scoped),
                             ),
                             dsa=indexer,
+                            hand_out=start_hand_out if early_handout else None,
                             **mla_options,
                         )
 
                     commit_scope = _phase_start("q8_mla_commit")
 
-                    # The pool stays read-only: hand this layer's new rows out.
                     def hand_out_rows(semaphores):
-                        copies = (
-                            tpu.make_async_copy(
-                                new_key_vmem,
-                                key_output_ref.at[:, state_index],
-                                semaphores.at[0],
-                            ),
-                            tpu.make_async_copy(
-                                new_value_vmem,
-                                value_output_ref.at[:, state_index],
-                                semaphores.at[1],
-                            ),
-                        )
+                        copies = hand_out_copies(semaphores)
                         for copy in copies:
                             copy.start()
                         for copy in copies:
                             copy.wait()
 
-                    pl.run_scoped(hand_out_rows, tpu.SemaphoreType.DMA((2,)))
+                    if early_handout:
+                        for copy in hand_out_copies(handout_semaphores):
+                            copy.wait()
+                    else:
+                        pl.run_scoped(hand_out_rows, tpu.SemaphoreType.DMA((2,)))
                     _phase_end(commit_scope)
 
                 pl.run_scoped(
@@ -11824,6 +11851,7 @@ def stack(
                         (batch_size, cache_handoff_head_count, 128),
                         jnp.bfloat16,
                     ),
+                    *((tpu.SemaphoreType.DMA((2,)),) if early_handout else ()),
                     *mla_scoped_scratch,
                 )
                 if dp_output is not None:
