@@ -40,6 +40,7 @@ from sglang_tpu.testing.decode_dram_offload import (
     ROOM,
     SWITCH,
     DecodeOffersItsPrefixFixture,
+    FakeHostPool,
     PrefillRecallsIntoItsHostPagesFixture,
     decode_manager,
     host_transfer_of,
@@ -136,16 +137,18 @@ class TestHybridWindowOnTheWire(DecodeOffersItsPrefixFixture, CustomTestCase):
         mgr = decode_manager()
         swa = Mock()
         swa.host_control_address.side_effect = lambda ip: f"{ip}:7002"
-        mgr.dram_offload_channel.bind_host_pools(
-            SimpleNamespace(transfer=host_transfer_of(mgr)),
-            SimpleNamespace(transfer=swa),
-        )
+        full_pool, swa_pool = FakeHostPool(64), FakeHostPool(16)
+        full_pool.transfer, swa_pool.transfer = host_transfer_of(mgr), swa
+        mgr.dram_offload_channel.bind_host_pools(full_pool, swa_pool)
         mgr.dram_offload_channel.offer_resident_prefix(ROOM, [3, 4, 5, 6], [8, 9])
         mgr.register_decode_request(ROOM, [21, 22, 23], [], None, [PREFILL_INFO])
         return mgr, swa
 
     def test_pull_req_names_the_window_and_a_pull_registers_both_page_sets(self):
         mgr, swa = self._hybrid_decode()
+        channel = mgr.dram_offload_channel
+        channel.restore_host_metadata([3, 4, 5, 6], [b"a", b"b", b"c", b"d"])
+        channel.restore_host_metadata([8, 9], [b"window0", b"window1"], swa=True)
         req = PullReq.from_frames(sent_frames(mgr)[-1][1])
         self.assertEqual(
             (req.prefix_blocks, req.prefix_swa_blocks), ([3, 4, 5, 6], [8, 9])
@@ -163,6 +166,8 @@ class TestHybridWindowOnTheWire(DecodeOffersItsPrefixFixture, CustomTestCase):
                 endpoint=DECODE_RAIDEN,
                 swa_uuid=swa_uuid,
                 swa_endpoint="10.0.0.2:7002",
+                page_metadata=[b"c", b"d"],
+                swa_page_metadata=[b"window0", b"window1"],
             ),
         )
         self.assertNotEqual(uuid, swa_uuid)

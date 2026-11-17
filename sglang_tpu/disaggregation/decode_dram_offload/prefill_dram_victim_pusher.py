@@ -263,6 +263,17 @@ class PrefillDramVictimPusher:
         )
         self._pushes[seq] = push
         self.stats["started"] += 1
+        # Snapshot under the same host pin as the KV read. A metadata owner may
+        # need to resolve an outstanding seal before the page can leave.
+        metadata = swa_metadata = None
+        try:
+            metadata = self._channel.export_host_metadata(pages)
+            swa_metadata = self._channel.export_host_metadata(swa_pages, swa=True)
+        except Exception:  # noqa: BLE001 - all ranks decline before registering
+            logger.exception("Cannot export host metadata for victim push %s", seq)
+        if not self._lockstep.all(metadata is not None and swa_metadata is not None):
+            push.stored = False
+            return
         push.registered = self._register_leaf_pages(push, uuid, pages, swa_pages)
         if not self._lockstep.all(push.registered) or not (
             self._channel.send_victim_push(
@@ -275,6 +286,8 @@ class PrefillDramVictimPusher:
                 uuid=uuid,
                 extra_key=leaf.key.extra_key,
                 cache_salt=leaf.key.cache_salt,
+                page_metadata=metadata,
+                swa_page_metadata=swa_metadata,
             )
         ):
             push.stored = False
