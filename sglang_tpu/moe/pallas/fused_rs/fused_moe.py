@@ -28,7 +28,10 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
+    EXPERT,
+    MLP_DATA,
     _select_fused_rs_block_sizes,
+    fused_rs_smem_rows,
 )
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     gmm_v2_fused_rs as gmm_v2_fused_rs_nodedup,
@@ -39,9 +42,6 @@ from sglang_tpu.moe.pallas.fused_rs.utils import (
     get_moe_expert_axis,
 )
 from sglang_tpu.moe.pallas.gmm_v2 import recover_quant_block_size
-
-EXPERT = "model"
-MLP_DATA = "data"
 
 # ============================================================================
 # SMEM safety guard
@@ -57,7 +57,7 @@ _FUSED_RS_MAX_SAFE_SIZE_M = 262144
 
 
 def _assert_fused_rs_smem_safe(size_m: int) -> None:
-    """Assert ``size_m`` fits the v7x SMEM budget for ``gmm_v2_fused_rs``."""
+    """Assert ``size_m`` SMEM routing rows (fused_rs_smem_rows) fit the v7x SMEM budget."""
     assert size_m < _FUSED_RS_MAX_SAFE_SIZE_M, (
         f"gmm_v2_fused_rs SMEM OOM at size_m={size_m} (>= "
         f"{_FUSED_RS_MAX_SAFE_SIZE_M}). Per-row scalar-prefetch arrays "
@@ -233,7 +233,7 @@ def moe_gmm_local_rs_nodedup(
             _compute_rs_routing(topk_indices, num_experts=num_experts, topk=topk)
         )
     size_m = lhs_indices.shape[0]
-    _assert_fused_rs_smem_safe(size_m)
+    _assert_fused_rs_smem_safe(fused_rs_smem_rows(size_m, ep_size, expert_tp))
 
     # Compute local row range [local_start, local_end) without per-row source
     # materialization. Avoids the heavy ``jnp.repeat -> scatter_add``.

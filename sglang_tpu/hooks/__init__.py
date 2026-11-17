@@ -94,8 +94,17 @@ from sglang_tpu.hooks.twolevel_allreduce import (
     row_parallel_linear_forward as twolevel_row_parallel_linear_forward,
 )
 from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
+from sglang_tpu.models.deepseek_v41.hooks import hook_specs as dsv41_hooks
 
 logger = logging.getLogger(__name__)
+
+
+def _select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
+    # The model-loader module is heavy; keep it out of plugin startup.
+    from sglang_tpu.ep_weight_shard import select_tpu_ep_local_runai_loader
+
+    return select_tpu_ep_local_runai_loader(result, load_config, model_config)
+
 
 # (target, hook, hook_type) triples.
 
@@ -346,6 +355,11 @@ HOOKS: list[tuple] = [
         broadcast_undeferred,
         HookType.AROUND,
     ),
+    (
+        "sglang.srt.model_loader.loader.get_model_loader",
+        _select_tpu_ep_local_runai_loader,
+        HookType.AFTER,
+    ),
 ]
 
 HOOKS.extend(dsv4_hooks())
@@ -361,6 +375,8 @@ HOOKS.extend(hook_specs())
 HOOKS.extend(padded_logits_sampling_hooks())
 
 HOOKS.extend(logprob_grid_hooks())
+# After dsv4_hooks: the V4.1 pool hooks must be the outer wrapper.
+HOOKS.extend(dsv41_hooks())
 
 _registered = False
 

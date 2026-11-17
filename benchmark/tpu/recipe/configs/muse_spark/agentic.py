@@ -16,6 +16,7 @@ an all-SWA hybrid_layer_pattern keeps the draft's KV in the target's SWA slots;
 main() writes it next to the checkpoint.
 
     bash benchmark/tpu/recipe/muse_spark_agentx_launcher.sh <mixed|prefill|decode> 16
+    bash benchmark/tpu/recipe/muse_spark_agentx_launcher.sh mixed 16 --mk-prefill
     python3 -m benchmark.tpu.launch_server \\
         --config recipe/configs/muse_spark/agentic.py --concurrency 16   # mixed only
 
@@ -183,6 +184,14 @@ _PATCHES_BY_CONCURRENCY: dict[int, dict[str, dict]] = {
 }
 
 
+# --mk-prefill (mixed only): extend steps run the megakernel's prefill program, its expert
+# input and post-expert projection gathered in e4m3. Needs the fp8 SEQ_ALONG_LANE pool.
+MK_PREFILL_ENV = {
+    "SGLANG_TPU_MUSE_MK_PREFILL": "1",
+    "SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER": "1",
+}
+
+
 def _apply(patch: dict[str, dict]) -> dict:
     config = deepcopy(_BASE)
     for section, overrides in patch.items():
@@ -238,7 +247,7 @@ _ROLES: dict[str, dict[str, dict]] = {
 }
 
 
-def get_config(concurrency: int, mode: str = "mixed") -> dict:
+def get_config(concurrency: int, mode: str = "mixed", mk_prefill: bool = False) -> dict:
     if concurrency not in _PATCHES_BY_CONCURRENCY:
         raise ValueError(
             f"no patch for concurrency {concurrency}; defined: {sorted(_PATCHES_BY_CONCURRENCY)}"
@@ -252,6 +261,17 @@ def get_config(concurrency: int, mode: str = "mixed") -> dict:
                 config[section].update(deepcopy(overrides))
         # One engine on this host; launch_server starts no router for it.
         config["group"] = {"hosts": 1}
+    if mk_prefill:
+        if mode != "mixed":
+            raise ValueError(
+                f"--mk-prefill runs extend steps on the megakernel: mixed only, not {mode}"
+            )
+        if config["runtime_env"].get("SGLANG_TPU_USE_SEQ_ALONG_LANE_KV") != "1":
+            raise ValueError(
+                f"--mk-prefill needs the fp8 SEQ_ALONG_LANE pool; concurrency {concurrency} "
+                "serves bf16 token-major KV"
+            )
+        config["runtime_env"].update(MK_PREFILL_ENV)
     return config
 
 
@@ -279,8 +299,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("mode", choices=MODES)
     parser.add_argument("concurrency", type=int)
     parser.add_argument("--dry-run", action="store_true", help="print the config only")
+    parser.add_argument(
+        "--mk-prefill",
+        action="store_true",
+        help="run extend steps on the megakernel's prefill program (MK_PREFILL_ENV)",
+    )
     args = parser.parse_args(argv)
-    config = get_config(args.concurrency, mode=args.mode)
+    config = get_config(args.concurrency, mode=args.mode, mk_prefill=args.mk_prefill)
     config["server_args"].update(
         model_path=str(MODEL_ROOT / MODEL),
         served_model_name=MODEL,

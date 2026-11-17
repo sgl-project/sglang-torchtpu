@@ -59,6 +59,11 @@ class TestCoreCompileAnnotations(CustomTestCase):
         modules_patch = patch.dict(sys.modules, _fake_policy_module())
         modules_patch.start()
         self.addCleanup(modules_patch.stop)
+        # Only the Qwen3-VL boundary is under test: hide the other listed model
+        # modules an earlier test may have loaded (restored with sys.modules).
+        for boundary in core_compile_annotations.CORE_COMPILE_BOUNDARIES:
+            if boundary.module != QWEN3_VL_MOE:
+                sys.modules.pop(boundary.module, None)
 
     def test_qwen3_vl_moe_decoder_gets_the_vl_decoder_policy(self):
         core_compile_annotations.annotate_core_compile_boundaries()

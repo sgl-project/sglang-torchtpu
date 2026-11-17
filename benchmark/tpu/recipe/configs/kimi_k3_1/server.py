@@ -96,6 +96,10 @@ CONFIG["runtime_env"].update(
             xla_tpu_offload_gather_to_sparsecore="true",
         ),
         "SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL": "1",
+        # DSA prefill: each rank attends only its own indexer rows, with all 96 heads,
+        # so each selected KV row is gathered by one rank instead of all 32. 16 chips,
+        # cold TTFT 32K/64K/128K 7.0/14.0/27.8 -> 5.4/10.9/21.9 s; GSM8K-200 0.995.
+        "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT": "1",
         # Text-only serving compiles only the token-id EXTEND graphs (host RAM at
         # startup); scheduler intake rejects image requests with a 400.
         "SGLANG_TPU_VL_TEXT_ONLY_EXTEND": "1",
