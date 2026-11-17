@@ -26,6 +26,7 @@ import importlib.metadata
 import json
 import os
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -42,7 +43,6 @@ from sglang_tpu.compilation.lowered_graph import (
     LoweredGraphRequest,
 )
 from sglang_tpu.compilation.source_digest import (
-    MANIFEST_ENV,
     PACKAGES_ENV,
     extra_source_packages,
     sources_digest,
@@ -138,9 +138,9 @@ ENV_GKE_DISCOVERY = frozenset(
 # own (ENV_UNKEYED).
 ENV_DELIVERY = frozenset({"TORCH_TPU_TIER2_NAME"})
 # The store's own settings: the salt is keyed on its own, the sources digest
-# covers what the packages setting and the manifest select, and the keyed env
-# shows what the unkeyed setting drops.
-ENV_STORE_SETTINGS = frozenset({ENV_SALT, ENV_UNKEYED, PACKAGES_ENV, MANIFEST_ENV})
+# covers what the packages setting selects, and the keyed env shows what the
+# unkeyed setting drops.
+ENV_STORE_SETTINGS = frozenset({ENV_SALT, ENV_UNKEYED, PACKAGES_ENV})
 _UNKEYED_ENV_NAMES = (
     ENV_PER_LAUNCH
     | ENV_PER_SLICE
@@ -424,11 +424,12 @@ def collect_process_components() -> dict[str, Any]:
         )
         if path
     }
-    sources, source_origin = sources_digest()
+    start = time.perf_counter()
+    sources = sources_digest()
     logger.info(
-        "%s source digest from the %s sources (deployment packages: %s)",
+        "%s hashed the sources in %.2fs (deployment packages: %s)",
         _LOG,
-        source_origin,
+        time.perf_counter() - start,
         ", ".join(extra_source_packages()) or "none",
     )
     return {

@@ -4,6 +4,7 @@ import dataclasses
 import enum
 import json
 import logging
+import os
 import sys
 import types
 
@@ -206,7 +207,6 @@ def test_keyed_inputs_drop_only_placement_and_secrets():
         "SGLANG_SHARED_CACHE_INSTALLED": "4242",
         "SGLANG_RING_MODE": "peer",
         "SGLANG_TPU_LOWERED_GRAPH_SOURCE_PACKAGES": "my_models",
-        "SGLANG_TPU_LOWERED_GRAPH_SOURCES_PATH": "/sgl-workspace/sources.json",
     }
     assert cache.keyed_environment(environ) == {
         "SGLANG_DIRECT_COMPILE_ASYNC": "1",
@@ -492,7 +492,7 @@ def _serve_server_args(monkeypatch):
     """Serves the given ServerArgs from the runtime context, with the compiler
     tag and the source digest stubbed."""
     monkeypatch.setattr(cache, "_compiler_tag", lambda: _COMPILER_TAG)
-    monkeypatch.setattr(cache, "sources_digest", lambda: ("src-digest", "manifest"))
+    monkeypatch.setattr(cache, "sources_digest", lambda: "src-digest")
     runtime_context = types.ModuleType("sglang.srt.runtime_context")
     monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", runtime_context)
 
@@ -557,6 +557,16 @@ def test_compiler_tag_adds_the_rank_assignment_first(monkeypatch, _cache_key_tag
     assert calls == ["add"]
 
 
+def test_a_same_size_edit_that_keeps_the_mtime_changes_the_digest(tmp_path):
+    source = tmp_path / "ops.py"
+    source.write_text("y = a + b\n")
+    before = source_digest.hash_sources({"pkg": tmp_path})
+    stat = source.stat()
+    source.write_text("y = a - b\n")
+    os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert source_digest.hash_sources({"pkg": tmp_path}) != before
+
+
 def test_source_hash_covers_data_files_but_not_bytecode(tmp_path):
     (tmp_path / "profiles").mkdir()
     (tmp_path / "__pycache__").mkdir()
@@ -567,27 +577,6 @@ def test_source_hash_covers_data_files_but_not_bytecode(tmp_path):
     assert source_digest.hash_sources({"pkg": tmp_path}) == before
     (tmp_path / "profiles" / "routing.json").write_text('{"expert": 3}')
     assert source_digest.hash_sources({"pkg": tmp_path}) != before
-
-
-def test_the_build_manifest_supplies_the_digest_until_a_source_changes(tmp_path):
-    package = tmp_path / "pkg"
-    package.mkdir()
-    (package / "mod.py").write_text("x = 1\n")
-    roots = {"pkg": package}
-    manifest = tmp_path / "sources.json"
-    built = source_digest.write_manifest(manifest, roots)
-    environ = {source_digest.MANIFEST_ENV: str(manifest)}
-
-    assert source_digest.sources_digest(roots, environ) == (built, "manifest")
-    # An overlay rewrites a file after the build: hash again.
-    (package / "mod.py").write_text("x = 22\n")
-    digest, origin = source_digest.sources_digest(roots, environ)
-    assert origin == "hashed"
-    assert digest == source_digest.hash_sources(roots) != built
-    # No manifest, or an unreadable one, hashes too.
-    assert source_digest.sources_digest(roots, {})[1] == "hashed"
-    manifest.write_text("not json")
-    assert source_digest.sources_digest(roots, environ)[1] == "hashed"
 
 
 def test_the_deployment_names_its_own_source_packages(monkeypatch):
