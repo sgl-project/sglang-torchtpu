@@ -31,7 +31,19 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
     ),
 ]
 
+_XGRAMMAR_DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
+    (
+        "xgrammar.kernels.apply_token_bitmask_inplace_torch_compile",
+        "apply_token_bitmask_inplace_kernel_no_indices_torch_compile",
+    ),
+    (
+        "xgrammar.kernels.apply_token_bitmask_inplace_torch_compile",
+        "apply_token_bitmask_inplace_kernel_indices_torch_compile",
+    ),
+]
+
 _dynamic_compile_unwrapped = False
+_xgrammar_compile_unwrapped = False
 
 # Important TPU env vars logged at the end of ``_prepare_tpu_env`` so
 # multi-process / multi-host init issues are diagnosable from a single line.
@@ -85,7 +97,14 @@ def _register_tpu_sampler_backend() -> None:
     from sglang.srt.layers.sampler import register_sampler_backend
     from sglang_tpu.sampler import TpuSampler
 
-    register_sampler_backend("tpu", TpuSampler)
+    def create_tpu_sampler():
+        # Samplers are constructed after distributed initialization. XGrammar
+        # is only needed for sampling; keep this import and compatibility patch
+        # out of the early distributed bootstrap.
+        _unwrap_xgrammar_compile_fns()
+        return TpuSampler()
+
+    register_sampler_backend("tpu", create_tpu_sampler)
     _tpu_sampler_backend_registered = True
 
 
@@ -95,7 +114,25 @@ def _unwrap_dynamic_compile_fns() -> None:
         return
     _dynamic_compile_unwrapped = True
 
-    for module_path, fn_name in _DYNAMIC_COMPILE_TARGETS:
+    _unwrap_compile_targets(_DYNAMIC_COMPILE_TARGETS)
+
+
+def _unwrap_xgrammar_compile_fns() -> None:
+    """Why: XGrammar's dynamic=True mask kernels are rejected by TorchTPU.
+
+    How: unwrap their pure Torch bodies once, when the TPU sampler is created.
+    Upstream PR or issue: not filed yet (XGrammar TorchTPU mask compatibility).
+    Remove when: XGrammar provides a masking backend compatible with TorchTPU.
+    """
+    global _xgrammar_compile_unwrapped
+    if _xgrammar_compile_unwrapped:
+        return
+    _unwrap_compile_targets(_XGRAMMAR_DYNAMIC_COMPILE_TARGETS)
+    _xgrammar_compile_unwrapped = True
+
+
+def _unwrap_compile_targets(targets: Sequence[tuple[str, str]]) -> None:
+    for module_path, fn_name in targets:
         try:
             mod = importlib.import_module(module_path)
         except (ImportError, ModuleNotFoundError):

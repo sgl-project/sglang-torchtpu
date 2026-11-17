@@ -44,6 +44,7 @@ class TestNodeNormalization(unittest.TestCase):
                 for original_index, physical_rank in enumerate(permutation):
                     env = ordered_config.environment(order.index(original_index))
                     self.assertEqual(env["NODE_RANK"], str(physical_rank))
+                    self.assertEqual(env["TPU_WORKER_ID"], str(physical_rank))
                     self.assertEqual(env["MASTER_ADDR"], "host-0")
                     self.assertEqual(
                         env["TPU_WORKER_HOSTNAMES"], "host-0,host-1,host-2,host-3"
@@ -266,6 +267,7 @@ class TestAutomaticTopologyLaunch(unittest.TestCase):
                 os.environ,
                 {
                     "TPU_WORKER_HOSTNAMES": "source,destination",
+                    "TPU_WORKER_ID": "0",
                     "TORCH_TPU_TOPOLOGY": "2,2,2,2",
                     "TORCH_TPU_DEVICES_PER_HOST": "8",
                     "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1",
@@ -304,6 +306,7 @@ class TestAutomaticTopologyLaunch(unittest.TestCase):
         self.assertEqual(self.server_args.node_rank, 0)
         self.assertEqual(self.server_args.dist_init_addr, "source:29500")
         self.assertEqual(os.environ["NODE_RANK"], "1")
+        self.assertEqual(os.environ["TPU_WORKER_ID"], "1")
         self.assertEqual(os.environ["MASTER_ADDR"], "destination")
         self.assertEqual(self.resolve.call_args.args[0].bootstrap_port, 29501)
         self.resolve.assert_called_once()
