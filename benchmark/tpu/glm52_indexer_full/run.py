@@ -58,6 +58,13 @@ runtime = dict(
 assert runtime["versions"]["jax"] == runtime["versions"]["jaxlib"] == "0.11.2"
 assert runtime["versions"]["libtpu"] == "0.0.50"
 (args.out / "runtime.json").write_text(json.dumps(runtime, indent=2))
+artifact_root = Path(os.environ["ARTIFACT_LOCAL_DIR"])
+(artifact_root / "manifest.json").write_text(json.dumps(dict(
+    schema_version=1, workflow="operator-optimization", operator_family="indexer",
+    operator_name="glm52_score_topk_slot_mapping", source=runtime["source"],
+    dimensions=dict(page_size=64, heads=32, head_dim=128, k=2048, capacity=92160,
+                    participating_jax_devices=1, allocation_physical_chips=4),
+), indent=2))
 
 
 def emit(record):
