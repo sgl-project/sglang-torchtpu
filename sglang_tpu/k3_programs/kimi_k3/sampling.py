@@ -23,6 +23,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from sglang_tpu.k3_programs.kimi_k3 import config as kernel_config
 from sglang_tpu.k3_programs.kimi_k3.program import TP_SIZE, kernel_modules
 
 AXIS = "tp"
@@ -297,6 +298,20 @@ def accept_batched(
     )
 
 
+def _decision_kernels(local_logits, rows):
+    """``kernels.token_kernels`` if ``KernelConfig.verify_greedy_kernel`` is on
+    and its greedy decisions take these logits, else None."""
+    if not kernel_config.active().verify_greedy_kernel:
+        return None
+    (token_kernels,) = kernel_modules("token_kernels")
+    fits = (
+        local_logits.dtype == jnp.float32
+        and rows >= 2
+        and local_logits.shape[0] <= token_kernels.GREEDY_MAX_ROWS
+    )
+    return token_kernels if fits else None
+
+
 def verify_acceptance(
     local_logits,
     tokens,
@@ -326,6 +341,9 @@ def verify_acceptance(
         forced = jnp.where(modes == 0, 0, drawn).astype(jnp.int32)
 
     def greedy_decision(_):
+        kernels = _decision_kernels(local_logits, rows)
+        if kernels is not None:
+            return kernels.greedy_decisions(local_logits, tokens, forced)
         targets = greedy(local_logits).reshape(requests, rows)
         match = tokens[:, 1:] == targets[:, :-1]
         first = jnp.min(jnp.where(match, rows - 1, jnp.arange(rows - 1)), axis=1)
