@@ -19,20 +19,8 @@ The layout is deterministic from CPU lengths, so every rank computes the same
 per-rank row counts and the same token bucket without communication. Only
 numpy is used here; the torch glue lives in ``cp_forward``.
 
-Ring mode (``SGLANG_TPU_PCP_MODE=ring``, ``build_tpu_cp_layout`` with
-``page_size``) keeps the block ownership but makes the blocks page-aligned and
-rank-uniform, because the fused ring kernel reads the all-gathered chunk by page
-and every rank must run the same ring schedule:
-
-* block size ``C = align_up(ceil(length / (2 * cp_size)), page_size)``; the
-  blocks are filled in order, so trailing blocks are short or empty;
-* every rank reserves ``2 * C`` local rows per request -- its early block at
-  the request's local offset and its late block ``C`` rows later -- whether or
-  not the blocks hold tokens. Rows past a block's tokens are padding: they are
-  attention queries whose output is discarded, and they sit at chunk positions
-  at or past the request's length, so no row reads them as keys and they are
-  never written to the KV cache (``RingLayout`` below).
-"""
+Ring mode (``SGLANG_TPU_PCP_MODE=ring``) makes the blocks page-aligned and
+rank-uniform."""
 
 from __future__ import annotations
 

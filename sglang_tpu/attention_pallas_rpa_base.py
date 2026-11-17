@@ -168,10 +168,7 @@ class PallasForwardMetadata:
     # Pooled DSA indexer with a raw ring (kv_pool.kpool_raw_ring_pages) only:
     # i32[max_num_seqs]  first ring page of each row's request slot
     raw_page_base: torch.Tensor | None = None
-    # Ring-mode prefill context parallelism only (SGLANG_TPU_PCP_MODE=ring):
-    # the fused ring kernel's operands. ``cp_write_segments`` then holds only
-    # the runs of the pages this rank owns, at their slots in its page stripe,
-    # and the fields above describe the new-token rows.
+    #Prefill context parallelism using ring attention (SGLANG_TPU_PCP_MODE=ring)
     cp_ring: PcpRingMetadata | None = None
 
 
@@ -623,7 +620,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # allocator hands out slots from a pool widened by dcp, so one logical
         # page spans page_size * dcp tokens over page_size physical slots per
         # rank: rank r's physical page holds the r-th page_size run of it.
-        # Ring-mode prefill CP stripes over the attention-CP group instead.
         parallel = get_parallel()
         pcp_ring = current_platform.pcp_ring_enabled()
         self._dcp = parallel.attn_dcp_size
