@@ -33,9 +33,18 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 def _mc(
-    full_ids, swa_ids, *, h=2, d=128, window=128, arch=AttentionArch.MHA, asym=False
+    full_ids,
+    swa_ids,
+    *,
+    h=2,
+    d=128,
+    window=128,
+    arch=AttentionArch.MHA,
+    asym=False,
+    nextn=None,
 ):
     win = window if swa_ids else None
+    n_layers = len(full_ids) + len(swa_ids)
     hf = types.SimpleNamespace(architectures=["Dummy"], sliding_window=win)
     hf.get_text_config = lambda: hf
     return types.SimpleNamespace(
@@ -43,8 +52,11 @@ def _mc(
         attention_arch=arch,
         has_asymmetric_kv=asym,
         is_hybrid_swa=bool(swa_ids),
+        is_deepseek_v4_arch=False,
         linear_attn_registry_result=None,
-        num_hidden_layers=len(full_ids) + len(swa_ids),
+        num_hidden_layers=n_layers,
+        num_attention_layers=n_layers,
+        num_nextn_predict_layers=nextn,
         full_attention_layer_ids=list(full_ids),
         swa_attention_layer_ids=list(swa_ids),
         head_dim=d,
@@ -149,31 +161,49 @@ class TestDraftCoPricingAndValidation(unittest.TestCase):
                 ev.clear()
 
     def test_copricing_and_model_config_resolution(self):
+        from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+            resolve_spec_aux_hidden_state_config,
+        )
+
         t_mc = _mc([0, 1], [2, 3, 4, 5, 6, 7])  # M_T = 3
         budget = 64 * 1024 * 1024
 
-        for algo_s, d_path, srv_kw, swa_aux in (
-            ("EAGLE3", "mock/e3", {}, 2),
-            ("EAGLE", None, {"model_path": "mock/step3p5", "revision": "r1"}, 6),
+        # Non-spec target with sliding_window_size=None keeps None (does not fall back
+        # to model_config.sliding_window_size for min-token / max_request_tokens).
+        with self._ctx(speculative_algorithm=None):
+            ns_kvc = _kvc(t_mc, algo=SA.NONE)
+            ns_kvc.sliding_window_size = None
+            ns_conf = ukp.TpuUnifiedSWAPoolConfigurator(ns_kvc)
+            self.assertIsNone(ns_conf._sliding_window_size)
+
+        for algo_s, d_path, srv_kw, nextn in (
+            ("EAGLE3", "mock/e3", {}, None),
+            ("EAGLE", None, {"model_path": "mock/step3p5", "revision": "r1"}, 1),
         ):
-            d_srv = _mc([], [0], h=1, d=64, window=64)
+            t_cur = _mc([0, 1], [2, 3, 4, 5, 6, 7], nextn=nextn)
+            d_srv = _mc([], [0], h=1, d=64, window=64, nextn=nextn)
             with self._ctx(
                 speculative_algorithm=algo_s, speculative_draft_model_path=d_path
             ):
                 with patch.object(
                     ModelConfig, "from_server_args", return_value=d_srv
                 ) as mf:
-                    kvc = _kvc(t_mc, algo=SA[algo_s])
+                    kvc = _kvc(t_cur, algo=SA[algo_s])
                     if srv_kw:
                         kvc.server_args = types.SimpleNamespace(**srv_kw)
-                    kvc.spec_aux_config = types.SimpleNamespace(
-                        eagle_draft_num_layers=1, eagle_draft_swa_num_layers=swa_aux
+                    kvc.spec_aux_config = resolve_spec_aux_hidden_state_config(
+                        server_args=kvc.server_args,
+                        model_config=t_cur,
+                        spec_algorithm=SA[algo_s],
+                        is_draft_worker=False,
                     )
+                    self.assertIs(kvc.spec_aux_config.draft_model_config, d_srv)
                     self.assertTrue(ukp.unified_kv_pool_enabled(kvc))
                     self.assertGreater(
                         ukp.resolve_unified_draft_kv_pricing(kvc).swa_compact_per_token,
                         0,
                     )
+                    mf.assert_called_once()
                     self.assertTrue(mf.call_args.kwargs["is_draft_model"])
 
         for algo, df, ds, dh, dd, ps, dt, runners in (
@@ -205,9 +235,7 @@ class TestDraftCoPricingAndValidation(unittest.TestCase):
                 d_pg = (
                     ukp._compute_draft_swa_pages(
                         n_tok // ps,
-                        page_size=ps,
                         num_swa_groups=3,
-                        sliding_window_size=kvc.sliding_window_size,
                     )
                     + 1
                     if ds
@@ -510,61 +538,13 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
         z0, neg1, s16 = torch.tensor([0]), torch.tensor([-1]), torch.tensor([16])
         ext1 = ta1.alloc_extend(z0, z0, s16, s16, neg1, 16)
         self.assertTrue(8 <= int(dp1.translate_loc_from_full_to_swa(ext1).max()) < 72)
-        ta1.free(ext1)
+        s17 = torch.tensor([17])
+        dec1 = ta1.alloc_decode(s17, s17, ext1[-1:])
+        self.assertIsNotNone(dec1)
+        self.assertTrue(8 <= int(dp1.translate_loc_from_full_to_swa(dec1).item()) < 72)
+        ta1.free(torch.cat([ext1, dec1]))
 
-    def test_hicache_window_sizing_and_sidecar_capacity_eviction(self):
-        from contextlib import nullcontext
-
-        from sglang_tpu.envs import envs as tpu_envs
-
-        self.assertEqual(
-            tpu_envs.SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER.get(), 4.0
-        )
-
-        # HiCache ON: mult * B * w_win + 2 * w_chunk (clamped by N_phys // (1 + M_T)).
-        for mult, expected in ((None, 192), (6.0, 272), (2.5, 136)):
-            env_ctx = (
-                nullcontext()
-                if mult is None
-                else tpu_envs.SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER.override(mult)
-            )
-            with (
-                env_ctx,
-                get_context().override_server_args(
-                    enable_hierarchical_cache=True,
-                    max_running_requests=4,
-                    speculative_num_draft_tokens=8,
-                    chunked_prefill_size=4096,
-                    page_size=256,
-                ),
-                get_parallel().override(attn_dp_size=1),
-            ):
-                pages = ukp._compute_draft_swa_pages(
-                    10000,
-                    page_size=256,
-                    num_swa_groups=3,
-                    sliding_window_size=2048,
-                )
-                self.assertEqual(pages, expected)
-                if mult is None:
-                    self.assertEqual(
-                        ukp._compute_draft_swa_pages(
-                            400,
-                            page_size=256,
-                            num_swa_groups=3,
-                            sliding_window_size=2048,
-                        ),
-                        96,
-                    )
-
-        with tpu_envs.SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER.override(0.0):
-            with self.assertRaisesRegex(
-                ValueError, "SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER"
-            ):
-                ukp._compute_draft_swa_pages(
-                    1000, page_size=256, num_swa_groups=3, sliding_window_size=2048
-                )
-
+    def test_sidecar_capacity_eviction(self):
         # Sidecar smaller than shared SWA capacity gates swa_available_size / can_reserve
         # and triggers SWA eviction via evict_to_free_tokens.
         ta, rp = self._build_target(32, 1)  # 32 shared pages, M_T = 1
@@ -597,6 +577,8 @@ class TestDraftSwaSidecarAndFence(unittest.TestCase):
         self.assertFalse(ta.new_pages_available(1, 1))
         self.assertFalse(ta.can_reserve(8, 8))
         self.assertTrue(ta.can_reserve(8, 8, swa_evictable_tokens=8))
+        with self.assertRaisesRegex(RuntimeError, "Draft SWA sidecar ran out of pages"):
+            ta.draft_swa_sidecar.bind_target_pages(torch.tensor([31]))
         self.assertIsNone(
             ta.alloc_extend(z0, z0, torch.tensor([8]), torch.tensor([8]), neg1, 8)
         )

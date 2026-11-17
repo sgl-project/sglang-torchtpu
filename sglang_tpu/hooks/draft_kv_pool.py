@@ -28,7 +28,7 @@ derive_unified_draft_pool_sizes, attach_unified_draft_kv_pool
        MemoryPoolConfig token capacities via allocator.derive_draft_pool_sizes;
        AROUND KVCacheConfigurator._build_token_to_kv_pool_allocator delegates
        draft pool attachment to allocator.attach_draft_kv_pool.
-  Upstream PR or issue: not filed yet.
+  Upstream PR or issue: sgl-project/sglang-torchtpu#2250.
   Remove when: BaseTokenToKVPoolAllocator declares draft pool sizing and
        attachment hooks upstream.
 """
