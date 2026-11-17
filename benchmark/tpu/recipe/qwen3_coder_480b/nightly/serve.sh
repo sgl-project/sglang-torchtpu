@@ -48,10 +48,10 @@ case "$ROLE" in
         # auto-detection sees TPU_WORKER_HOSTNAMES and builds a 2-host
         # rendezvous that would never form.
         export FORCE_SINGLE_HOST=${FORCE_SINGLE_HOST:-1}
-        # The TPU transfer backend moves KV over the torch_tpu DMA path; the
-        # bootstrap port is how the decode engine finds this one.
+        # Raiden moves KV over the TPU DMA engine; the bootstrap port is how
+        # the decode engine finds this one.
         ROLE_ARGS="--disaggregation-mode prefill \
---disaggregation-transfer-backend tpu \
+--disaggregation-transfer-backend raiden \
 --disaggregation-bootstrap-port $PD_BOOTSTRAP_PORT"
         ;;
     decode)
@@ -64,7 +64,7 @@ case "$ROLE" in
         # No bootstrap port of its own: the decode engine learns the prefill's
         # bootstrap address from the router-injected request.
         ROLE_ARGS="--disaggregation-mode decode \
---disaggregation-transfer-backend tpu"
+--disaggregation-transfer-backend raiden"
         ;;
     *)
         echo "ERROR: ROLE must be colocated|prefill|decode, got '$ROLE'" >&2

@@ -165,13 +165,7 @@ class RaidenKVManager(
     RaidenReceiverMixin,
     CommonKVManager,
 ):
-    """KV manager for the raiden prefill/decode transport.
-
-    FIXME: the ZMQ rendezvous scaffolding here (per-rank listener socket,
-    handshake message routing, poll draining) overlaps the tpu backend's
-    ``base.py`` control plane. Consolidate onto a shared base so raiden reuses it
-    instead of reimplementing the coordination.
-    """
+    """KV manager for the raiden prefill/decode transport."""
 
     # The legacy transport unless set_kv_caches builds a pipeline transfer.
     _pipeline = None
