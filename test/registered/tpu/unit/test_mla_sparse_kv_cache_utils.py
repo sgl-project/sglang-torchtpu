@@ -798,6 +798,9 @@ class SparseCoreRopePackingTest(parameterized.TestCase):
         rng = np.random.default_rng(3)
         raw = rng.integers(0, 256, (num_tokens, ROPE_DIM), np.uint8)
         k_pe = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+        # TPU XLA canonicalizes -NaN (0xFF) to +NaN (0x7F) on float8_e4m3fn
+        # bitcast; read back the surviving fp8 bytes for the host oracle.
+        raw = np.asarray(jax.lax.bitcast_convert_type(k_pe, jnp.uint8))
         kv_c = jnp.zeros((num_tokens, LKV_DIM), jnp.float8_e4m3fn)
         block_tables = np.array([6, 2, 0, 0], np.int32)
         _, rope = update_sparse_mla_kv_cache_jax(
@@ -830,6 +833,7 @@ class SparseCoreRopePackingTest(parameterized.TestCase):
         block_tables = rng.permutation(TOTAL_PAGES).astype(np.int32)
         raw = rng.integers(0, 256, (num_tokens, ROPE_DIM), np.uint8)
         k_pe = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+        raw = np.asarray(jax.lax.bitcast_convert_type(k_pe, jnp.uint8))
         kv_c = jnp.zeros((num_tokens, LKV_DIM), jnp.float8_e4m3fn)
         caches = {}
         for name, spec in (("packed", self.PACKED), ("padded", self.PADDED)):
