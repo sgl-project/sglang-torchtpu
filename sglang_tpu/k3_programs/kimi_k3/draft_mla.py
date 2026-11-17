@@ -430,7 +430,6 @@ class MlaDsparkDraft:
             # and table from the ids and writes the step's outputs.
             import jax
             import jax.numpy as jnp
-            from jax.experimental import pallas as pl
 
             weights = {name: args[i][0] for i, name in enumerate(names)}
             # The layer-norm stacks: [layers, 1, width] -> [layers, width].
@@ -443,10 +442,10 @@ class MlaDsparkDraft:
             )
 
             def step_outputs(ids_ref, vector_ref, state_ref, vector_out, *outs):
-                @pl.loop(0, 128)
                 def copy_vector(k):
                     vector_out[0, k] = vector_ref[0, k]
 
+                self.kernel.copy_words(0, 128, copy_vector)
                 self.kernel.single_epilogue(
                     epilogue, rows, ids_ref, state_ref, vector_ref, *outs
                 )
