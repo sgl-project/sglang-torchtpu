@@ -25,8 +25,7 @@ scales ``[E, K/512, 1, N]``) is converted once at load to the kernel's
 flat f32 scales ``[E * rows, N]`` (``host.fp4_scale_rows``).
 """
 
-from __future__ import annotations
-
+# No `from __future__ import annotations`: jax_op checks `annotation is jax.Array`.
 import functools
 
 import msgspec
