@@ -3,11 +3,8 @@
 draft: z_j = l_j + bias(d_{j-1}, h_j), d_0 = r, d_j ~ softmax(z_j / T), so
        q_j = softmax(z_j / T), with l_j = lm_head(h_j) the base logits.
 
-As core DSparkWorkerV2 does, the drafter reads only the interface every DSpark
-draft exposes (gamma, sample_from_anchor, markov_head, compute_base_logits,
-attach_shared_modules), so the dense DSparkDraftModel and the MoE
-DeepseekV4ForCausalLMDSpark share it; a subclass adds what its draft's backend
-needs (sglang_tpu/models/deepseek_v41/dspark_drafter.py).
+Serves the dense DSparkDraftModel; sglang_tpu/models/deepseek_v41/dspark_drafter.py
+subclasses it for the MoE DeepseekV4ForCausalLMDSpark.
 
 Not ported yet: the confidence verify budget (num_verify_drafts is always
 gamma).
@@ -20,9 +17,9 @@ from torch import nn
 
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.dspark_components.dspark_config import (
-    DSparkRuntimeConfig,
     resolve_runtime_config,
 )
 from sglang_tpu.experimental.speculative.block_draft_worker import (
@@ -31,15 +28,6 @@ from sglang_tpu.experimental.speculative.block_draft_worker import (
     SampledDrafts,
     TpuBlockDraftWorker,
     target_input_embedding,
-)
-
-# What the drafter calls on the draft model; both core DSpark drafts define them.
-_DSPARK_DRAFT_INTERFACE = (
-    "gamma",
-    "sample_from_anchor",
-    "markov_head",
-    "compute_base_logits",
-    "attach_shared_modules",
 )
 
 
@@ -65,21 +53,13 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
         )
         self.mask_token_id = runtime_config.mask_token_id
         self._dspark_model = draft_model
-        self._check_runtime_config(runtime_config)
         self._attach_target_vocab(target_runner)
 
     def _check_draft_model(self, draft_model: nn.Module) -> None:
-        """Reject a draft without the DSpark interface the drafter calls."""
-        missing = [a for a in _DSPARK_DRAFT_INTERFACE if not hasattr(draft_model, a)]
-        if missing:
+        if not isinstance(draft_model, DSparkDraftModel):
             raise TypeError(
-                f"{type(self).__name__} needs a DSpark draft; {type(draft_model)} "
-                f"has no {', '.join(missing)}."
+                f"TpuDsparkDraftWorker needs a dense DSparkDraftModel, got {type(draft_model)}."
             )
-
-    def _check_runtime_config(self, runtime_config: DSparkRuntimeConfig) -> None:
-        """Reject a runtime the draft's backend cannot serve. Noop."""
-        del runtime_config
 
     def _attach_target_vocab(self, target_runner: ModelRunner) -> None:
         """Share the target embedding and lm_head with the draft, as DSparkWorkerV2."""
@@ -92,8 +72,6 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
                 "logits_mup_width_multiplier"
             )
         )
-        if getattr(draft_model, "uses_own_vocab_modules", False):
-            return
         lm_head = unwrap_lora_layer(target_model.lm_head)
         embedding = target_input_embedding(target_model)
         if embedding is None:
@@ -118,7 +96,7 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
         # Anchor drafts read all gamma rows; the rest drop the anchor row, so
         # draft_hidden[:, j - 1] predicts d_j at position n + j.
         bs = block_hidden.shape[0]
-        draft_model: nn.Module = self._dspark_model
+        draft_model = self._dspark_model
         draft_hidden = (
             block_hidden if draft_model.sample_from_anchor else block_hidden[:, 1:]
         )

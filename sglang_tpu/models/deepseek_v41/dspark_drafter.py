@@ -19,9 +19,6 @@ from torch import nn
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.dspark_components.dspark_config import (
-    DSparkRuntimeConfig,
-)
 from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
@@ -45,19 +42,20 @@ class TpuDsv41DsparkDraftWorker(TpuDsparkDraftWorker):
     # the draft forward through _forward_idle_decode.
     _keeps_target_placement = True
 
-    def _check_draft_model(self, draft_model: nn.Module) -> None:
-        if not isinstance(draft_model, DeepseekV4ForCausalLMDSpark):
-            raise TypeError(
-                f"Expected the V4 DSpark MoE draft, got {type(draft_model)}."
-            )
-
-    def _check_runtime_config(self, runtime_config: DSparkRuntimeConfig) -> None:
+    def __init__(self, target_runner: ModelRunner) -> None:
+        super().__init__(target_runner)
         window = int(self._dspark_model.config.sliding_window)
-        rows = runtime_config.verify_num_draft_tokens
+        rows = self.num_drafts + 1
         if rows > min(window, _MAX_BLOCK_ROWS):
             raise ValueError(
                 f"DSpark block of {rows} rows exceeds the sliding window {window} "
                 f"or {_MAX_BLOCK_ROWS} CSA2 queries."
+            )
+
+    def _check_draft_model(self, draft_model: nn.Module) -> None:
+        if not isinstance(draft_model, DeepseekV4ForCausalLMDSpark):
+            raise TypeError(
+                f"Expected the V4 DSpark MoE draft, got {type(draft_model)}."
             )
 
     def _attach_target_vocab(self, target_runner: ModelRunner) -> None:
@@ -105,9 +103,6 @@ class TpuDsv41DsparkDraftWorker(TpuDsparkDraftWorker):
             accept_lens=accept.accept_lens,
             req_pool_indices=state.req_pool_indices,
         )
-
-    def _draft_model(self):
-        return self._dspark_model
 
     def _write_draft_kv_eager(
         self,
