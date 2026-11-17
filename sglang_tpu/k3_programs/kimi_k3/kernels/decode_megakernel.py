@@ -510,6 +510,7 @@ def _start_initial_expert_weight_copies(
     already_started,
     group_pending_routes,
     first_staged_expert=None,
+    gate_up_first_pair=False,
 ):
     """Prefetch the first routed experts in their execution order.
 
@@ -517,7 +518,10 @@ def _start_initial_expert_weight_copies(
     both shared and divergent routes without specializing on batch size.
     Experts from ``first_staged_expert`` on (stolen experts, read from the
     steal's staging slots) are left to the stream, which waits for their
-    slabs first.
+    slabs first. ``gate_up_first_pair`` issues the first two slots' gate/up
+    copies (and scales) before their down copies, then the other slots'
+    copies: a first pair of experts waits for both gate/up slabs before
+    either down slab.
     """
     selected_expert_count = selected_experts.shape[1]
     route_slots = jnp.arange(selected_expert_count)[None, :]
@@ -557,6 +561,29 @@ def _start_initial_expert_weight_copies(
             ] & current_slot_mask
         return expert, consumed, has_expert
 
+    if gate_up_first_pair:
+        starts = []
+        for slot in range(slot_count):
+            expert, consumed, has_expert = next_expert(processed)
+            start = has_expert & (slot >= already_started)
+            if first_staged_expert is not None:
+                start &= expert < first_staged_expert
+            starts.append((expert, slot, start))
+            processed |= consumed
+        first_pair = min(2, slot_count)
+        phases = [
+            (starts[:first_pair], dict(down=False)),
+            (starts[:first_pair], dict(gate_up=False)),
+            (starts[first_pair:], {}),
+        ]
+        for slots, families in phases:
+            for expert, slot, start in slots:
+
+                @pl.when(start)
+                def start_copy(expert=expert, slot=slot, families=families):
+                    _start_async_copies(copy_expert(expert, slot, **families))
+
+        return
     for slot in range(slot_count):
         expert, consumed, has_expert = next_expert(processed)
         start = has_expert & (slot >= already_started)
@@ -3246,6 +3273,12 @@ def _consume_completed_routed_chunks(
         consume(first, chunk_rows, first_lane, lanes_per_chunk)
 
 
+# Token-scattered steps with both reduce-scatters: the shared down projection
+# and the start of the shared reduce-scatter wait for the routed send
+# (KernelConfig.decode_late_shared_down).
+LATE_SHARED_DOWN = _config().decode_late_shared_down
+
+
 def moe(
     hidden_ref: TensorLike,  # [batch_size, hidden_size]
     output_ref: TensorLike,  # [batch_size, hidden_size] or owned token rows
@@ -3621,6 +3654,23 @@ def moe(
         overlap_router_latent and overlap_latent_gather and owned_hidden_ref is None
     )
     overlap_shared_routing = overlap_router_latent and shared_sharded
+    # KernelConfig.decode_late_shared_down: with both reduce-scatters, the
+    # shared down projection and the start of its reduce-scatter run after the
+    # routed send. Its pooled weight must outlive the experts (the caller
+    # keeps it clear of latent-up's region).
+    late_shared_down = (
+        LATE_SHARED_DOWN
+        and routed_reduce_scatter
+        and batch_size in (6, *SCATTER_BATCHES)
+        and group_pending_expert_routes
+        and not shared_sharded
+        and not overlap_shared_reduction
+        and not overlap_shared_routing
+        and not token_pipeline
+        and prepare_weights_vmem is not None
+        # Four shared transport rows a token: receive views, then send views.
+        and 2 * 4 * batch_size <= shared_local_reduction_vmem.shape[1]
+    )
     latent_slot = reduction_phase[0] % 2
 
     def latent_copy(offset):
@@ -3784,6 +3834,10 @@ def moe(
                 # The routed outputs are zeroed by the expert stream; until then
                 # they hold the BF16 activation (exact in FP32).
                 routed_outputs_vmem[:, :shared_width] = middle.astype(jnp.float32)
+            elif late_shared_down:
+                # The BF16 activation (exact in FP32) waits in the shared
+                # outputs for the down projection after the routed send.
+                shared_outputs_vmem[:, :shared_width] = middle.astype(jnp.float32)
             else:
                 shared_outputs_vmem[...] = _dot(
                     middle, shared_down_projection_vmem[...]
@@ -3915,6 +3969,9 @@ def moe(
             already_started=prefetched_expert_count,
             group_pending_routes=group_pending_expert_routes,
             first_staged_expert=None if steal_step is None else local_expert_count,
+            # Without the shared down projection the experts start sooner: the
+            # first pair's gate/up slabs go ahead of its down slabs.
+            gate_up_first_pair=late_shared_down,
         )
         if expert_schedule is not None:
             # After the first expert copies, ahead of the shared expert.
@@ -4084,6 +4141,18 @@ def moe(
         )
 
     def shared_shard_send_view(target_lane):
+        if late_shared_down:
+            # After the routed send, cross-host routed packets may already
+            # be landing in the expert host buffer: send from the rows past
+            # the receive views of the shared receive buffer instead.
+            return shared_local_reduction_vmem.at[
+                target_lane,
+                pl.ds(
+                    batch_size * shared_shard_payload,
+                    batch_size * shared_shard_payload,
+                ),
+                :,
+            ]
         # Reuse the expert host buffer until the routed local reduction
         # finishes and needs it for its normal role.
         send_rows = (
@@ -4235,6 +4304,11 @@ def moe(
         )
         expert_transport_payload = transport_batch_size * expert_payload
         assert shared_transport_payload <= shared_local_reduction_vmem.shape[1]
+        # The late shared sends leave from the rows past the receive views.
+        assert (
+            not late_shared_down
+            or 2 * shared_transport_payload <= shared_local_reduction_vmem.shape[1]
+        )
         assert (
             reduce_scatter_routed_output
             or expert_transport_payload <= expert_local_reduction_vmem.shape[1]
@@ -4265,9 +4339,20 @@ def moe(
         if after_experts is not None:
             after_experts()
 
+        if late_shared_down:
+            # While the routed shards travel: the shared down projection of
+            # the activation kept from before the experts, then the shared
+            # reduce-scatter's sends (the same shards as before the experts).
+            with _phase("t2_shared_down"):
+                shared_outputs_vmem[...] = _dot(
+                    shared_outputs_vmem[:, :shared_width].astype(jnp.bfloat16),
+                    shared_down_weights[...],
+                )
+                begin_shared_reduction(shared_outputs_vmem[...])
+
         # The polled path completes this during or immediately after experts.
         t2 = _phase_start("t2_shared_local")
-        if not overlap_shared_reduction:
+        if not overlap_shared_reduction and not late_shared_down:
             finish_shared_reduction(shared_transport_payload)
         _phase_end(t2)
 
@@ -4286,6 +4371,11 @@ def moe(
             t4 = _phase_start("t4_routed_host")
             for offset in range(3, 0, -1):
                 expert_copy(lane_payload, offset, True).start()
+            if late_shared_down:
+                # The shared local round lands during the cross-host wait;
+                # its host round starts before the routed gather.
+                with _phase("t2_shared_local"):
+                    finish_shared_reduction(shared_transport_payload)
             for offset in range(3, 0, -1):
                 expert_copy(lane_payload, offset, True).wait()
             _phase_end(t4)
@@ -4391,7 +4481,7 @@ def moe(
         begin_shared_reduction(
             routed_outputs_vmem[:, :shared_width].astype(jnp.bfloat16)
         )
-    else:
+    elif not late_shared_down:
         begin_shared_reduction(shared_outputs_vmem[...])
     if overlap_latent_gather:
         wait_for_latent_gather()
@@ -11237,6 +11327,18 @@ def stack(
         managed=pool_managed,
         dense_bytes=dense_slabs * dense_slab_bytes,
     )
+    if LATE_SHARED_DOWN and POOLED_WEIGHTS:
+        # The late shared down projection reads its pooled weight after
+        # latent-up starts loading into region B.
+        latent_up = pool_weights["latent_up"]
+        latent_up_end = pool_layout["latent_up"] + pool_alias.storage_size(
+            latent_up.shape, latent_up.dtype
+        )
+        if pool_layout["shared_down"] < latent_up_end:
+            raise ValueError(
+                "decode_late_shared_down needs the pooled shared down projection "
+                "past latent-up in region B"
+            )
     pool_bytes = pool_layout["pool_bytes"]
     if _config().vmem_report:
 
