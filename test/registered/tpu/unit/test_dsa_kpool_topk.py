@@ -422,7 +422,7 @@ class TestFusedPooling(CustomTestCase):
             "paged": jax.jit(lambda *a: kp.kpool_indexer_step(*a, **common)),
             "ring": jax.jit(
                 lambda *a, base: kp.kpool_indexer_step(
-                    *a, **common, raw_page_base=base, raw_ring_pages=ring
+                    *a, **common, raw_page_base=base, raw_ring_pages_cnt=ring
                 )
             ),
         }

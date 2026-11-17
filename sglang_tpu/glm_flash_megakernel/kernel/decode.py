@@ -94,7 +94,7 @@ class KernelConfig:
     # Pages per request slot of the pooled indexer's raw ring (kv_pool.kpool_raw_ring_pages);
     # 0: raw rows share the page table. With a ring, meta[META_RAW_BASE + b] is request
     # b's first ring page.
-    raw_ring_pages: int = 0
+    raw_ring_pages_cnt: int = 0
     # K-major weight tile width; the packed weights are shared by every bucket, so
     # a server sets it once (None: 512 for a one-row kernel, else 256).
     km_tile: int | None = None
@@ -1188,7 +1188,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             def page(b, pg):
                 return PL.page_of(tab_ref, b, pg, PPS)
 
-            RRP = cfg.raw_ring_pages
+            RRP = cfg.raw_ring_pages_cnt
 
             def raw_page(b, pg):
                 if not RRP:

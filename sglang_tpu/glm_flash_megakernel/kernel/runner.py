@@ -116,9 +116,9 @@ def _scatter_index_rows(spec, cfg, meta, pos, tab, nraw, nrec, raw, rec):
     b, qi = r // Q, r % Q
     live = b < meta[0]
     tok = pos[b] + qi
-    if cfg.raw_ring_pages:
+    if cfg.raw_ring_pages_cnt:
         raw_base = meta[D.META_RAW_BASE + b]
-        tpage = jnp.where(live, raw_base + (tok // ps) % cfg.raw_ring_pages, -1)
+        tpage = jnp.where(live, raw_base + (tok // ps) % cfg.raw_ring_pages_cnt, -1)
     else:
         tpage = jnp.where(live, tab[b * pps + jnp.minimum(tok // ps, pps - 1)], -1)
     fp0, fresh = PL.closing_pools(pos[b], Q, kp)

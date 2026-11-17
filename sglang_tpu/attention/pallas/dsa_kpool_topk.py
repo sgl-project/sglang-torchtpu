@@ -25,6 +25,7 @@ with a closed-pools-only causal mask.
 """
 
 import logging
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -116,13 +117,22 @@ def _page_slot(req, pos, page_indices, num_seqs, page_size, num_pages, valid):
     return page, pos % page_size
 
 
-def _raw_page_slot(req, pos, *, raw_page_base, raw_ring_pages, valid, loc, num_raw):
+def _raw_page_slot(
+    req: jax.Array,
+    pos: jax.Array,
+    *,
+    raw_page_base: jax.Array | None,
+    raw_ring_pages_cnt: int,
+    valid: jax.Array,
+    loc: dict[str, Any],
+    num_raw: int,
+) -> tuple[jax.Array, jax.Array]:
     """Physical (page, slot) of a raw key|gate row. With a raw ring, request
-    ``req`` keeps its rows at ``raw_page_base[req] + page % raw_ring_pages``;
+    ``req`` keeps its rows at ``raw_page_base[req] + page % raw_ring_pages_cnt``;
     otherwise they share the request's page ids."""
-    if not raw_ring_pages:
+    if not raw_ring_pages_cnt:
         return _page_slot(req, pos, valid=valid, **loc)
-    page = raw_page_base[req] + (pos // loc["page_size"]) % raw_ring_pages
+    page = raw_page_base[req] + (pos // loc["page_size"]) % raw_ring_pages_cnt
     page = jnp.where(valid, page, num_raw)
     return page, pos % loc["page_size"]
 
@@ -185,7 +195,7 @@ def kpool_indexer_step(
     row_start: jax.Array | None = None,  # i32[1]; first scored row (token split)
     row_count: int = 0,
     raw_page_base: jax.Array | None = None,  # i32[max_num_seqs]; raw ring only
-    raw_ring_pages: int = 0,
+    raw_ring_pages_cnt: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Returns (topk_indices i32[num_tokens, max(out_width, topk + kpool - 1)],
     raw_cache, pooled_cache). Rows list sequence-relative token positions: the
@@ -231,7 +241,7 @@ def kpool_indexer_step(
 
     raw_loc = dict(
         raw_page_base=raw_page_base,
-        raw_ring_pages=raw_ring_pages,
+        raw_ring_pages_cnt=raw_ring_pages_cnt,
         loc=loc,
         num_raw=num_raw,
     )
@@ -261,7 +271,7 @@ def kpool_indexer_step(
             num_tokens,
             max_query_length=max_query_length,
             raw_page_base=raw_page_base,
-            raw_ring_pages=raw_ring_pages,
+            raw_ring_pages_cnt=raw_ring_pages_cnt,
         )
     else:
         # Logged at trace time, once per compiled shape.

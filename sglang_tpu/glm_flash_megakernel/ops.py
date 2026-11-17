@@ -42,7 +42,7 @@ def _step_inputs_op(
     pages_per_seq: int,
     window_start: int,
     checkpoint_width: int,
-    raw_ring_pages: int,
+    raw_ring_pages_cnt: int,
     meta_head: int,
 ):
     """The kernel's int32 SMEM inputs for one call's n requests (inputs already
@@ -53,7 +53,7 @@ def _step_inputs_op(
     # meta: n, reserved words up to meta_head, then each request's first raw-ring page.
     head = torch.zeros(meta_head, dtype=torch.int32, device=req_rows.device)
     head[0] = n
-    raw_base = _pad((req_rows * raw_ring_pages).to(torch.int32), bucket)
+    raw_base = _pad((req_rows * raw_ring_pages_cnt).to(torch.int32), bucket)
     meta = torch.cat([head, raw_base])
     tok = _pad(input_ids.to(torch.int32), rows)
     pos = _pad(positions.to(torch.int32).reshape(n, q)[:, 0], bucket)
@@ -156,7 +156,7 @@ class GlmFlashMegakernel:
         full = backend.full_attn_backend
         self._full, self._lin = full, backend.linear_attn_backend
         self._pool = full.token_to_kv_pool
-        self.raw_ring_pages = full.raw_ring_pages
+        self.raw_ring_pages_cnt = full.raw_ring_pages_cnt
         self._meta_head = D.META_RAW_BASE
         self._req_pool = self._lin.req_to_token_pool
         self._mamba = self._req_pool.mamba_pool
@@ -212,7 +212,7 @@ class GlmFlashMegakernel:
                 unroll_periods=big,
                 single_slab=big or mid,
                 context_parallel=True,  # DSA phase split by score rows across the tp chips
-                raw_ring_pages=self.raw_ring_pages,
+                raw_ring_pages_cnt=self.raw_ring_pages_cnt,
             )
 
         self.cfgs = {b: cfg_for(b) for b in _buckets(self.call_req)}
@@ -360,7 +360,7 @@ class GlmFlashMegakernel:
             read_offsets=mamba.checkpoint_read_offsets,
             window_start=mamba.window_start or 0,
             checkpoint_width=mamba.checkpoint_width,
-            raw_ring_pages=self.raw_ring_pages,
+            raw_ring_pages_cnt=self.raw_ring_pages_cnt,
             meta_head=self._meta_head,
         )
 

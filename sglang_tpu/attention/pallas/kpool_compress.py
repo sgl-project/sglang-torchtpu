@@ -41,16 +41,16 @@ def _long_tile_rows(max_q, page_size):
 
 
 def _descriptors(
-    kv_lens,
-    page_indices,
-    cu_q_lens,
-    distribution,
-    num_tokens,
-    tile_rows,
-    max_q,
-    page_size,
-    raw_ring,
-):
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    num_tokens: int,
+    tile_rows: int,
+    max_q: int,
+    page_size: int,
+    raw_ring: tuple[jax.Array, int] | None,
+) -> tuple[jax.Array, jax.Array]:
     """Compact request tile slots in request order for the streaming schedule."""
     batch = kv_lens.shape[0]
     tiles = _request_descriptors(
@@ -76,15 +76,15 @@ def _descriptors(
 
 
 def _request_descriptors(
-    kv_lens,
-    page_indices,
-    cu_q_lens,
-    distribution,
-    tile_rows,
-    max_q,
-    page_size,
-    raw_ring,
-):
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    tile_rows: int,
+    max_q: int,
+    page_size: int,
+    raw_ring: tuple[jax.Array, int] | None,
+) -> jax.Array:
     """Fixed tile slots cover every newly completed pool, including verify Q>1."""
     batch = kv_lens.shape[0]
     # Closed groups end at 3 mod 4. A request's first end can be at the last
@@ -106,9 +106,9 @@ def _request_descriptors(
     page = page_indices[req * pages_per_seq + safe_start // page_size]
     raw_page = page
     if raw_ring is not None:
-        # (raw_page_base, raw_ring_pages): a request's raw rows live in its ring.
-        raw_page_base, raw_ring_pages = raw_ring
-        raw_page = raw_page_base[req] + (safe_start // page_size) % raw_ring_pages
+        # (raw_page_base, raw_ring_pages_cnt): a request's raw rows live in its ring.
+        raw_page_base, raw_ring_pages_cnt = raw_ring
+        raw_page = raw_page_base[req] + (safe_start // page_size) % raw_ring_pages_cnt
     # Tile-major order keeps the first tiles of different requests adjacent.
     # Request-major order would insert unused slots between Q=1 requests.
     return (
@@ -201,7 +201,7 @@ def compress_and_store(
     *,
     max_query_length=None,
     raw_page_base=None,
-    raw_ring_pages=0,
+    raw_ring_pages_cnt=0,
 ):
     """Compress newly closed K4 groups into the aliased native pooled cache.
 
@@ -218,7 +218,7 @@ def compress_and_store(
             "fused pooling requires K=4, D=128 and a page size that is a multiple "
             f"of {_SHORT_TILE_ROWS}"
         )
-    raw_ring = (raw_page_base, raw_ring_pages) if raw_ring_pages else None
+    raw_ring = (raw_page_base, raw_ring_pages_cnt) if raw_ring_pages_cnt else None
     pooled_pages = pooled_cache.shape[0] if raw_ring else raw_cache.shape[0]
     if pooled_cache.shape != (pooled_pages, page_size // 16, 4, 256):
         raise ValueError("unexpected pooled-cache layout")

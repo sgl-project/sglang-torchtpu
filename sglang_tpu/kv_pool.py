@@ -1344,8 +1344,8 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         self._index_key_layers = index_key_layers
         self._index_kpool = index_kpool
         # With a raw ring, request slot r keeps its raw rows at pages
-        # r * raw_ring_pages + p % raw_ring_pages, allocated by attach_raw_ring().
-        self.raw_ring_pages = kpool_raw_ring_pages(
+        # r * raw_ring_pages_cnt + p % raw_ring_pages_cnt, allocated by attach_raw_ring().
+        self.raw_ring_pages_cnt = kpool_raw_ring_pages(
             page_size=page_size, kpool=index_kpool
         )
         self._raw_ring_slots = 0
@@ -1450,8 +1450,8 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
     def _raw_buffers(self) -> list[Optional[torch.Tensor]]:
         """Each indexer layer's raw key|gate buffer: one row per pool token, or
         the ring once attach_raw_ring() has sized it (None until then)."""
-        if self.raw_ring_pages:
-            raw_pages = self._raw_ring_slots * self.raw_ring_pages
+        if self.raw_ring_pages_cnt:
+            raw_pages = self._raw_ring_slots * self.raw_ring_pages_cnt
         else:
             raw_pages = self.num_pages
         if self._index_kpool <= 1 or raw_pages == 0:
@@ -1470,7 +1470,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         """Allocate the raw ring for ``req_slots`` request-pool rows, padding row
         included. The request pool is built beside this pool, so the attention
         backend passes its size; a no-op without a ring."""
-        if not self.raw_ring_pages:
+        if not self.raw_ring_pages_cnt:
             return
         if self._raw_ring_slots:
             if self._raw_ring_slots != req_slots:
@@ -1485,7 +1485,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             "Pooled indexer raw rows in a ring: %d request slots x %d pages per "
             "indexer layer",
             req_slots,
-            self.raw_ring_pages,
+            self.raw_ring_pages_cnt,
         )
 
     def _clear_buffers(self):
@@ -1540,7 +1540,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
     def _paged_raw_buffers(self) -> list[Optional[torch.Tensor]]:
         """The raw key|gate buffers when a page id addresses them. A raw ring is
         indexed by request slot, so page copies (host tier, P/D) leave it out."""
-        if self.raw_ring_pages:
+        if self.raw_ring_pages_cnt:
             return [None] * len(self.kpool_raw_buffer)
         return self.kpool_raw_buffer
 

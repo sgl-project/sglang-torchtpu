@@ -336,12 +336,12 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         self._zero_rope = _has_zero_rope(hf_config)
         super().__init__(model_runner, speculative_step_id)
         self._topk = get_dsa_index_topk(hf_config)
-        self.raw_ring_pages = 0
+        self.raw_ring_pages_cnt = 0
         if self._kpool > 1:
             self._kpool_width = topk_row_width(hf_config)
             self._index_topk_op = build_dsa_kpool_topk_op()
             pool = _split_pool(self.token_to_kv_pool)
-            self.raw_ring_pages = pool.raw_ring_pages
+            self.raw_ring_pages_cnt = pool.raw_ring_pages_cnt
             pool.attach_raw_ring(self.req_to_token_pool.req_to_token.shape[0])
         else:
             self._index_topk_op = build_dsa_index_topk_op()
@@ -380,7 +380,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
-        if self.raw_ring_pages:
+        if self.raw_ring_pages_cnt:
             self.forward_metadata.raw_page_base = self._raw_page_base(forward_batch)
 
     def _raw_page_base(self, forward_batch: ForwardBatch) -> torch.Tensor:
@@ -395,15 +395,15 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         rows = forward_batch.req_pool_indices_cpu
         if rows is None:
             rows = forward_batch.req_pool_indices
-        base = rows.to(torch.int32) * self.raw_ring_pages
+        base = rows.to(torch.int32) * self.raw_ring_pages_cnt
         return base.to(forward_batch.seq_lens.device, non_blocking=True)
 
     def _raw_ring_args(self) -> tuple[torch.Tensor, int]:
-        """(raw_page_base, raw_ring_pages) for the pooled indexer ops. Without a
+        """(raw_page_base, raw_ring_pages_cnt) for the pooled indexer ops. Without a
         ring the op ignores the base, so kv_lens stands in as an i32[rows] input."""
         metadata = self.forward_metadata
-        if self.raw_ring_pages:
-            return metadata.raw_page_base, self.raw_ring_pages
+        if self.raw_ring_pages_cnt:
+            return metadata.raw_page_base, self.raw_ring_pages_cnt
         return metadata.kv_lens, 0
 
     def _init_indexer_token_split(self) -> None:
@@ -702,7 +702,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
                 kpool=kpool,
                 split_rows=split_rows,
             )
-        raw_page_base, raw_ring_pages = self._raw_ring_args()
+        raw_page_base, raw_ring_pages_cnt = self._raw_ring_args()
         return self._index_topk_op(
             query.contiguous(),
             key.contiguous(),
@@ -722,7 +722,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._kpool_width,
             metadata.decode_query_size,
             _kpool_query_bound(metadata, num_tokens=query.shape[0]),
-            raw_ring_pages,
+            raw_ring_pages_cnt,
         )
 
     def _index_topk_kpool_token_split(
@@ -757,7 +757,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         kv_lens = self._kv_lens(forward_batch)
         rank = _rank_tensor("attn_tp", query.device)
         row_start = (rank * split_rows).to(torch.int32).reshape(1)
-        raw_page_base, raw_ring_pages = self._raw_ring_args()
+        raw_page_base, raw_ring_pages_cnt = self._raw_ring_args()
         local_picked = self._index_topk_split_op(
             query.contiguous(),
             key.contiguous(),
@@ -777,7 +777,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             kpool,
             _kpool_query_bound(metadata, num_tokens=num_tokens),
             split_rows,
-            raw_ring_pages,
+            raw_ring_pages_cnt,
         )  # i32[split_rows, topk // kpool]
         picked = _assemble_split_rows(
             local_picked, rank, self._idx_split_size, self._idx_split_group.all_reduce

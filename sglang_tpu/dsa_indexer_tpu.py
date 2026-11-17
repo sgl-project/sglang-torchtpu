@@ -423,7 +423,7 @@ def build_dsa_kpool_topk_op():
         out_width: int,
         decode_query_size: int,
         max_query_length: int,
-        raw_ring_pages: int,
+        raw_ring_pages_cnt: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         return kpool_indexer_step(
             query,
@@ -444,7 +444,7 @@ def build_dsa_kpool_topk_op():
             decode_query_size=decode_query_size,
             max_query_length=max_query_length or None,
             raw_page_base=raw_page_base,
-            raw_ring_pages=raw_ring_pages,
+            raw_ring_pages_cnt=raw_ring_pages_cnt,
         )
 
     raw_argnum, pooled_argnum = argnums(_wrapped, "raw_cache", "pooled_cache")
@@ -459,7 +459,7 @@ def build_dsa_kpool_topk_op():
             "out_width",
             "decode_query_size",
             "max_query_length",
-            "raw_ring_pages",
+            "raw_ring_pages_cnt",
         ),
         # Both caches are updated in place: outputs 1 and 2 alias them.
         donate_argnums=(raw_argnum, pooled_argnum),
@@ -491,7 +491,7 @@ def build_dsa_kpool_topk_op():
         out_width: int,
         decode_query_size: int = 1,
         max_query_length: int = 0,
-        raw_ring_pages: int = 0,
+        raw_ring_pages_cnt: int = 0,
     ) -> torch.Tensor:
         # See build_dsa_index_topk_op: JAX needs the TPU info to compile here.
         with tpu_info_for_cpu_export():
@@ -514,7 +514,7 @@ def build_dsa_kpool_topk_op():
                 out_width,
                 decode_query_size,
                 max_query_length,
-                raw_ring_pages,
+                raw_ring_pages_cnt,
             )
         return topk_indices
 
@@ -573,7 +573,7 @@ def build_dsa_kpool_topk_split_op():
         kpool: int,
         max_query_length: int,
         row_count: int,
-        raw_ring_pages: int,
+        raw_ring_pages_cnt: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         return kpool_indexer_step(
             query,
@@ -594,7 +594,7 @@ def build_dsa_kpool_topk_split_op():
             row_start=row_start,
             row_count=row_count,
             raw_page_base=raw_page_base,
-            raw_ring_pages=raw_ring_pages,
+            raw_ring_pages_cnt=raw_ring_pages_cnt,
         )
 
     raw_argnum, pooled_argnum = argnums(_wrapped, "raw_cache", "pooled_cache")
@@ -608,7 +608,7 @@ def build_dsa_kpool_topk_split_op():
             "kpool",
             "max_query_length",
             "row_count",
-            "raw_ring_pages",
+            "raw_ring_pages_cnt",
         ),
         donate_argnums=(raw_argnum, pooled_argnum),
         input_output_aliases={raw_argnum: 1, pooled_argnum: 2},
@@ -639,7 +639,7 @@ def build_dsa_kpool_topk_split_op():
         kpool: int,
         max_query_length: int,
         row_count: int,
-        raw_ring_pages: int = 0,
+        raw_ring_pages_cnt: int = 0,
     ) -> torch.Tensor:
         # See build_dsa_index_topk_op: JAX needs the TPU info to compile here.
         with tpu_info_for_cpu_export():
@@ -662,7 +662,7 @@ def build_dsa_kpool_topk_split_op():
                 kpool,
                 max_query_length,
                 row_count,
-                raw_ring_pages,
+                raw_ring_pages_cnt,
             )
         return picked
 

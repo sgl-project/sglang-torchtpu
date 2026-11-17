@@ -327,7 +327,7 @@ class TestSparseIndexerKvLens(CustomTestCase):
             _index_topk_op=MagicMock(),
             _topk=4,
             _kpool_width=8,
-            raw_ring_pages=0,
+            raw_ring_pages_cnt=0,
             forward_metadata=SimpleNamespace(
                 kv_lens="kv_lens",
                 page_indices="page_indices",
@@ -393,7 +393,7 @@ class TestSparseIndexerKvLens(CustomTestCase):
 
     def test_index_topk_kpool_passes_the_raw_ring(self):
         backend = self._backend()
-        backend.raw_ring_pages = 66
+        backend.raw_ring_pages_cnt = 66
         t = torch.zeros(1)
         TpuPallasSparseMlaAttnBackend.index_topk_kpool(
             backend,
@@ -439,7 +439,7 @@ class TestSparseIndexerKvLens(CustomTestCase):
                     kpool=4,
                 )
                 # (decode_query_size, query bound) sit before the trailing
-                # raw_ring_pages argument.
+                # raw_ring_pages_cnt argument.
                 self.assertEqual(
                     backend._index_topk_op.call_args.args[-3:-1], (width, bound)
                 )
