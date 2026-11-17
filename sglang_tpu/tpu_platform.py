@@ -27,6 +27,7 @@ from sglang_tpu.dp_replicas import (
     prepare_host_session,
     validate_dp_replicas,
 )
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_dma_hicache import (
     is_tpu_dma_hicache_backend,
     tpu_dma_hicache_backends,
@@ -134,8 +135,6 @@ def _rpa_kernel_spec(backend: str | None):
 
 
 def _uses_block_major_kv() -> bool:
-    from sglang_tpu.envs import envs as tpu_envs
-
     return tpu_envs.SGLANG_TPU_USE_BLOCK_MAJOR_KV.get()
 
 
@@ -183,8 +182,6 @@ def _check_block_major_supported(server_args) -> None:
 
 
 def _check_block_major_disaggregation(cfg) -> None:
-    from sglang_tpu.envs import envs as tpu_envs
-
     if cfg.disaggregation_transfer_backend != "raiden":
         raise ValueError(
             "SGLANG_TPU_USE_BLOCK_MAJOR_KV supports P/D over the raiden "
@@ -318,8 +315,6 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
             f"{feature} requires --sampling-backend pytorch (the logits step runs on "
             f"the reduced last-token rows), got {cfg.sampling_backend!r}."
         )
-    from sglang_tpu.envs import envs as tpu_envs
-
     if tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
         raise NotImplementedError(
             f"{feature} does not support input (prompt) logprobs; unset "
@@ -343,18 +338,14 @@ _PREFILL_CP_RING_ARCHITECTURES = ("Qwen3MoeForCausalLM",)
 def _validate_prefill_context_parallel_ring(
     server_args: ServerArgs, architectures: list[str]
 ) -> None:
-    """Checks ``SGLANG_TPU_PCP_MODE=ring`` adds to the prefill-CP ones.
+    """Extra checks for ``SGLANG_TPU_PCP_MODE=ring`` on top of the prefill-CP
+    ones.
 
-    Ring mode stripes the KV cache across the CP ranks by page, exactly as
-    decode context parallelism does, so it requires ``--dcp-size ==
-    --attn-cp-size`` (an unset ``--dcp-size`` is set here) and inherits every
-    DCP restriction through ``_validate_decode_context_parallel``. The DCP
-    stripe group is the attention-CP group (ranks ``t, t + attn_tp, ...``),
-    not SGLang's consecutive-rank DCP group, so attention TP
-    (``--tp-size // --attn-cp-size``) may exceed 1: each rank keeps its
-    attention-TP head shard. The fused ring kernel runs as a mesh kernel over
-    the whole world (a ``(cp, tp)`` mesh ringing along ``cp``), on one host,
-    and covers causal full attention only.
+    Ring mode stripes the KV cache across the CP ranks by page, like decode
+    context parallelism, so it sets ``--dcp-size`` to ``--attn-cp-size`` and
+    inherits the DCP checks (``_validate_decode_context_parallel``). Attention
+    TP may exceed 1. ``--dp-size`` replicas are already refused with any CP
+    by ``validate_dp_replicas``.
     """
     from sglang.srt.arg_groups.overrides import (
         declare_resolution,
@@ -378,21 +369,16 @@ def _validate_prefill_context_parallel_ring(
             f"{feature} requires a power-of-two --attn-cp-size (2, 4 or 8): the "
             "ring's schedule ends on a rotation boundary only then."
         )
-    if cfg.dp_size > 1:
-        raise NotImplementedError(
-            f"{feature} does not support data-parallel replicas (got --dp-size "
-            f"{cfg.dp_size}): the ring kernel's mesh is the whole world."
-        )
-    if getattr(cfg, "nnodes", 1) > 1:
+    if cfg.nnodes > 1:
         raise NotImplementedError(
             f"{feature} runs on one host (got --nnodes {cfg.nnodes})."
         )
-    if getattr(cfg, "enable_mixed_chunk", False):
+    if cfg.enable_mixed_chunk:
         raise NotImplementedError(
             f"{feature} does not support --enable-mixed-chunk: a mixed batch "
             "runs neither the zigzag ring program nor a warmed striped one."
         )
-    if getattr(cfg, "dcp_replicate_q_proj", False):
+    if cfg.dcp_replicate_q_proj:
         raise NotImplementedError(
             f"{feature} does not take --dcp-replicate-q-proj: every rank of an "
             "attention-CP group already projects the same query heads."
@@ -425,8 +411,6 @@ def _pin_req_to_token_on_host(reason: str) -> None:
 
 def _pin_fused_moe_tensorcore_gather(reason: str) -> None:
     """Force SGLANG_TPU_FUSED_MOE_SC_GATHER off, warning if it was turned on."""
-    from sglang_tpu.envs import envs as tpu_envs
-
     if (
         tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.is_set()
         and tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
@@ -443,8 +427,6 @@ def _pin_moe_gather_permute_for_static_fp8(parts: frozenset[str]) -> None:
     the one-hot matmul where the combine runs on the SparseCore. That pairing
     gave wrong tokens there (DSpark verifying four requests, 32 tokens), while
     either path end to end was right."""
-    from sglang_tpu.envs import envs as tpu_envs
-
     if parts & {"moe_front", "latent_up"}:
         tpu_envs.SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE.set(True)
 
@@ -946,8 +928,6 @@ def _register_attention_backends() -> None:
         return DSV4TPUAttnBackend(runner)
 
     # Vision: opt in to block-skipping splash for the "tpu" backend.
-    from sglang_tpu.envs import envs as tpu_envs
-
     if tpu_envs.SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION.get():
         from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
         from sglang_tpu.attention.vision_splash import VisionTpuSplashAttention
@@ -1706,8 +1686,6 @@ class TpuSRTPlatform(SRTPlatform):
     @staticmethod
     def pcp_ring_enabled() -> bool:
         # Validation refuses ring mode without prefill context parallelism.
-        from sglang_tpu.envs import envs as tpu_envs
-
         return tpu_envs.SGLANG_TPU_PCP_MODE.get().lower() == "ring"
 
     def supports_moe_dp_pipeline_stages(self) -> bool:
@@ -1854,8 +1832,6 @@ class TpuSRTPlatform(SRTPlatform):
             rank_slice._load()
             traced_rank._load()
             _register_attention_backends()
-            from sglang_tpu.envs import envs as tpu_envs
-
             if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():
                 from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
 
@@ -1875,8 +1851,6 @@ class TpuSRTPlatform(SRTPlatform):
             arm_recompilation_checker,
             maybe_enable_site_tracing,
         )
-        from sglang_tpu.envs import envs as tpu_envs
-
         if get_exec().graph.enable_torch_compile:
             arm_recompilation_checker(reset_counters=False, overwrite_baseline=False)
         # Dispatch modes are thread-local; this runs on the scheduler thread.

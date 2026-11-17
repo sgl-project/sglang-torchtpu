@@ -37,7 +37,6 @@ from sglang_tpu.replica_group import ReplicaGroupCoordinator
 from sglang_tpu.tpu_platform import (
     TpuSRTPlatform,
     _validate_decode_context_parallel,
-    _validate_prefill_context_parallel,
 )
 
 # CPU suite: mocks torch_tpu, so it runs on the CPU runners -- never a TPU node.
@@ -968,18 +967,6 @@ class TestPrefillContextParallelRingValidation(CustomTestCase):
         self.assertEqual(self._resolved(args, "kv_cache_dtype"), "fp8_e4m3")
         with self.assertRaisesRegex(NotImplementedError, "requires --dcp-size 4"):
             self._apply_ring(tp_size=8, attn_cp_size=4, moe_dp_size=4, dcp_size=8)
-
-    def test_a_world_wider_than_the_cp_group_is_refused(self):
-        """The ring kernel's mesh is the whole world: no pipeline stages and no
-        data-parallel replicas next to the context-parallel group. (Earlier
-        gates of the full hook refuse these too, and the DCP gate refuses
-        pipeline stages; this pins the ring's own.)"""
-        for overrides, message in ((dict(dp_size=2), "data-parallel replicas"),):
-            with self.subTest(message=message):
-                with self.assertRaisesRegex(NotImplementedError, message):
-                    self._apply_ring(
-                        apply=_validate_prefill_context_parallel, **overrides
-                    )
 
     def test_inherits_the_dcp_chunk_rule(self):
         """Chunks are cut at logical pages of page_size * cp tokens."""
