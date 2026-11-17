@@ -5371,6 +5371,7 @@ def kda(
     weights_are_prefetched: bool = False,
     token_scatter_output: bool = False,
     rank_rows: bool = False,
+    defer_host_round: bool = False,
     sequence_rows: int = 1,
     wait_for_state=None,
     on_state_updated=None,
@@ -5393,6 +5394,8 @@ def kda(
 
     ``rank_rows`` (token scatter at 8 and 16 rows): the output projection
     leaves each rank its own half of its pair's rows (_project_attention_2d).
+    ``defer_host_round`` (with ``rank_rows``): the projection returns with its
+    cross-host round in flight; the caller runs finish_rank_rows_host_round.
 
     Attention DP runs one call per held TP32 shard (``shard_index``);
     ``attended_out`` ([batch, 384]) receives its gated features for the
@@ -5904,6 +5907,7 @@ def kda(
                 staging=communication_workspace.projection_staging_vmem,
                 gather_wire=communication_workspace.attention_gather_vmem,
                 weight_scale=weights.output_projection_scale,
+                defer_host_round=defer_host_round,
             )
 
     pl.run_scoped(
@@ -6033,6 +6037,7 @@ def mla(
     weights_are_prefetched: bool = False,
     token_scatter_output: bool = False,
     rank_rows: bool = False,
+    defer_host_round: bool = False,
     sequence_rows: int = 1,
     output_projection_after_query_down: bool = False,
     streams: dict | None = None,
@@ -6050,7 +6055,7 @@ def mla(
 
     ``streams`` optionally maps "query_up", "key_value_up", "output_gate" and
     "output" to ChunkedWeightStreams that own those projections' copies.
-    ``rank_rows``: as for :func:`kda`.
+    ``rank_rows``, ``defer_host_round``: as for :func:`kda`.
 
     Attention DP runs :func:`mla_dcp_shards` instead.
 
@@ -6415,6 +6420,7 @@ def mla(
                 weight_stream=output_stream,
                 staging=communication_workspace.projection_staging_vmem,
                 gather_wire=communication_workspace.attention_gather_vmem,
+                defer_host_round=defer_host_round,
             )
 
     pl.run_scoped(
@@ -6609,6 +6615,79 @@ ATTENTION_RANK_ROWS = _config().attention_rank_rows
 RANK_ROWS_LOCAL_SEMAPHORE = 12
 RANK_ROWS_GATHER_SEMAPHORE = 13
 RANK_ROWS_PREFIX_SEMAPHORE = 14
+# Rank-row steps: the decoder finishes the output projection's host round
+# after the layer's attention branches join
+# (KernelConfig.attention_host_round_after_join; finish_rank_rows_host_round).
+ATTENTION_HOST_ROUND_AFTER_JOIN = _config().attention_host_round_after_join
+
+
+def _attention_host_sum(host_receive):
+    """The four hosts' sums of the token-scattered output projection, added
+    in host order: ``[payload_rows, 128]`` BF16."""
+    host_sums = host_receive[...]
+    if ATTENTION_HOST_BF16:
+        host_sums = tpu.bitcast(
+            jax.lax.bitcast_convert_type(host_sums, jnp.uint32),
+            jnp.bfloat16,
+        ).astype(jnp.float32)
+    return jnp.sum(host_sums, axis=0).astype(jnp.bfloat16)
+
+
+def _store_rank_rows(owned_output, reduced_half):
+    """This rank's rows from its reduced payload: column half 0, then half 1."""
+    owned_rows, h = owned_output.shape
+    half = h // 2
+    lane_payload = reduced_half.shape[0] // 2
+    owned_output[:, :half] = reduced_half[:lane_payload].reshape(owned_rows, half)
+    owned_output[:, half:] = reduced_half[lane_payload:].reshape(owned_rows, half)
+
+
+def finish_rank_rows_host_round(
+    host_reduction,
+    output_backing,
+    sends,
+    recvs,
+    phase,
+    *,
+    batch_size,
+    h=7168,
+):
+    """The end of a rank-row output projection started with
+    ``_project_attention_2d(..., defer_host_round=True)``: wait for its
+    cross-host round, add the four hosts' sums in host order, store this
+    rank's rows at the start of ``output_backing`` and advance ``phase``,
+    exactly as the projection does without deferral.
+
+    The round uses only persistent storage (the host slots of
+    ``host_reduction`` and semaphores 3-5), and the KDA and MLA projections
+    start it into the same slots on the same semaphores, so the decoder
+    calls this once after the layer's attention branches join. Nothing
+    between the two may touch those slots, semaphores or rows."""
+    rank = jax.lax.axis_index("tp")
+    host = rank // 8
+    half = h // 2
+    tokens_per_pair = batch_size // 4
+    payload_rows = tokens_per_pair * half // 128
+    owned_rows = tokens_per_pair // 2
+    if ATTENTION_HOST_BF16:
+        host_receive = host_reduction.at[:, pl.ds(0, payload_rows // 2), :]
+    else:
+        host_receive = host_reduction.at[:, pl.ds(0, payload_rows), :]
+    host_view = host_receive.at[host]
+    for offset in range(3, 0, -1):
+        tpu.make_async_remote_copy(
+            host_view,
+            host_view,
+            sends.at[3 + offset - 1],
+            recvs.at[3 + offset - 1],
+            device_id=(rank ^ (8 * offset),),
+            device_id_type=pl.DeviceIdType.MESH,
+        ).wait()
+    _store_rank_rows(
+        _bf16_rows_view(output_backing, owned_rows, h),
+        _attention_host_sum(host_receive),
+    )
+    phase[0] += 1
 
 
 def _project_attention_2d(
@@ -6631,6 +6710,7 @@ def _project_attention_2d(
     staging=None,
     gather_wire=None,
     weight_scale=None,
+    defer_host_round=False,
 ):
     """``weight_stream`` (optional) is a row ChunkedWeightStream of ``weight``
     whose positions 0 and 1 are this rank's and its pair peer's feature rows.
@@ -6643,6 +6723,11 @@ def _project_attention_2d(
     both halves' four pair partials for its own rows; the host round is
     unchanged and the pair half-swap is dropped. Every element sums the same
     BF16 partials in the same pair and host order.
+
+    ``defer_host_round`` (with ``rank_rows``): return once the cross-host
+    round is started; the caller finishes it with
+    ``finish_rank_rows_host_round`` (the rows land in ``output_backing`` and
+    ``phase`` advances only then).
 
     ``weight_scale`` (FP32 [1, half], FP8 ``weight``) scales the output
     columns of each half's product."""
@@ -6660,6 +6745,8 @@ def _project_attention_2d(
         token_scatter_output and batch_size in (8, 16) and staging is None
     ):
         raise ValueError("Rank rows are token-scattered 8- and 16-row steps")
+    if defer_host_round and not rank_rows:
+        raise ValueError("Only rank-row projections defer their host round")
     width = attended.shape[-1]
     g = weight.shape[0] // width
     assert g == 2
@@ -6840,6 +6927,9 @@ def _project_attention_2d(
                 )
                 copy.start()
                 host_copies.append(copy)
+            if defer_host_round:
+                # finish_rank_rows_host_round waits for these copies.
+                return
             for copy in host_copies:
                 copy.wait()
 
@@ -6849,22 +6939,9 @@ def _project_attention_2d(
                 )
                 reduced_half = jnp.sum(rank_partials, axis=0).astype(jnp.bfloat16)
             else:
-                host_sums = host_receive[...]
-                if ATTENTION_HOST_BF16:
-                    host_sums = tpu.bitcast(
-                        jax.lax.bitcast_convert_type(host_sums, jnp.uint32),
-                        jnp.bfloat16,
-                    ).astype(jnp.float32)
-                reduced_half = jnp.sum(host_sums, axis=0).astype(jnp.bfloat16)
+                reduced_half = _attention_host_sum(host_receive)
             if rank_rows:
-                # This rank's rows: column half 0, then half 1.
-                lane_payload = payload_rows // 2
-                owned_output[:, :half] = reduced_half[:lane_payload].reshape(
-                    owned_rows, half
-                )
-                owned_output[:, half:] = reduced_half[lane_payload:].reshape(
-                    owned_rows, half
-                )
+                _store_rank_rows(owned_output, reduced_half)
             else:
                 pair_send = (
                     local.at[2].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]
@@ -8554,6 +8631,9 @@ def stack(
         and batch_size in (8, 16)
         and not shard_routing
     )
+    # KernelConfig.attention_host_round_after_join: the KDA and MLA branches
+    # start the output projection's host round; it finishes after their join.
+    host_round_after_join = ATTENTION_HOST_ROUND_AFTER_JOIN and attention_rank_rows
     # One row a rank (8 rows): the gather's rows travel as flat wires.
     rank_row_wires = attention_rank_rows and owned_rows == 2
     if attention_schedule not in ("auto", "pooled", "legacy", "overlap"):
@@ -10243,6 +10323,7 @@ def stack(
                             weights_are_prefetched=True,
                             token_scatter_output=attention_token_scatter,
                             rank_rows=attention_rank_rows,
+                            defer_host_round=host_round_after_join,
                             sequence_rows=sequence_rows,
                             wait_for_state=(
                                 wait_for_state if overlap_kda_state_reads else None
@@ -10454,6 +10535,7 @@ def stack(
                             weights_are_prefetched=True,
                             token_scatter_output=attention_token_scatter,
                             rank_rows=attention_rank_rows,
+                            defer_host_round=host_round_after_join,
                             sequence_rows=sequence_rows,
                             streams=kda_streams(state_index, attention_base),
                             state_stream=state_stream,
@@ -10639,6 +10721,7 @@ def stack(
                         weights_are_prefetched=True,
                         token_scatter_output=attention_token_scatter,
                         rank_rows=attention_rank_rows,
+                        defer_host_round=host_round_after_join,
                         sequence_rows=sequence_rows,
                     )
                     if attention_dp > 1:
@@ -10782,6 +10865,19 @@ def stack(
                         (layer_index % 4 == 3) | (layer_index == 92),
                         run_latent_attention,
                         run_delta_attention,
+                    )
+            if host_round_after_join:
+                # The first post-join code: the overlay this join may load on
+                # demand loads while the round is in flight.
+                with _phase("p2b_attn_host_round"):
+                    finish_rank_rows_host_round(
+                        communication_workspace.shared_host_reduction_vmem,
+                        communication_workspace.attention_output_vmem,
+                        communication_workspace.send_semaphores,
+                        communication_workspace.receive_semaphores,
+                        communication_workspace.reduction_phase,
+                        batch_size=batch_size,
+                        h=hidden_size,
                     )
             if pool is not None and not (
                 attention_dp > 1 and attention_schedule == "overlap"
