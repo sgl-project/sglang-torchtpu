@@ -385,24 +385,23 @@ def merge_across_ranks(
     group,
     world_size: int,
     rank_mask: torch.Tensor,
-    rank_index: torch.Tensor,
-    replicated_o_proj: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge one partial ``(out [T, H_all, D] fp32, lse [T, H_all])`` per rank.
+    """Merge one partial ``(out [T, H, D] fp32, lse [T, H])`` per rank into the
+    group-wide result, with the same ``H`` heads.
 
     Same protocol as ``layers.dcp.comm.cp_lse_ag_out_rs_mha``: gather the
-    LSEs, rescale the local output to the group-wide softmax, all-reduce, and
-    keep this rank's own head block. The log-sum-exp over ranks is written with
+    LSEs, rescale the local output to the group-wide softmax and all-reduce.
+    A caller whose ``H`` spans the whole group's heads keeps its own block
+    with :func:`own_heads`. The log-sum-exp over ranks is written with
     elementwise ops (pairwise max, exp, log) because torch_tpu implements
-    neither ``logsumexp`` nor ``logaddexp``. ``rank_mask`` / ``rank_index`` are
-    the rank as device tensors (``bool[world_size]`` one-hot, ``i64[1]``).
+    neither ``logsumexp`` nor ``logaddexp``. ``rank_mask`` is the rank as a
+    ``bool[world_size]`` one-hot device tensor.
     """
     if world_size == 1:
         return out, lse
     lse = lse.contiguous()
-    num_tokens, heads_all = lse.shape
     lses = _all_reduce_gather(lse, group, world_size, rank_mask, dim=0).view(
-        world_size, num_tokens, heads_all
+        world_size, *lse.shape
     )
     m = lses[0]
     for i in range(1, world_size):
@@ -414,17 +413,4 @@ def merge_across_ranks(
     global_lse = torch.where(torch.isfinite(m), m_safe + torch.log(total), m)
     scale = _zero_non_finite(torch.exp(lse - global_lse))
     out = _zero_non_finite(out) * scale[..., None]
-    out = group.all_reduce(out)
-    if replicated_o_proj:
-        return out, global_lse
-    heads = heads_all // world_size
-    return (
-        out.view(num_tokens, world_size, heads, -1)
-        .index_select(1, rank_index)
-        .reshape(num_tokens, heads, -1)
-        .contiguous(),
-        global_lse.view(num_tokens, world_size, heads)
-        .index_select(1, rank_index)
-        .reshape(num_tokens, heads)
-        .contiguous(),
-    )
+    return group.all_reduce(out), global_lse

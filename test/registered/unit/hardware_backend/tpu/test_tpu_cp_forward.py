@@ -890,22 +890,22 @@ class TestRingStripeGroup(CustomTestCase):
         the group {1, 3, 5, 7}, not DCP rank 1 of SGLang's group {4..7}."""
         parallel = self._parallel(tp_rank=5, attn_tp=2, cp=4, dcp=4)
         self.assertEqual(
-            dcp_stripe_group(parallel, pcp_ring=True), (2, "attn-cp-group", True)
+            dcp_stripe_group(parallel, pcp_ring=True), (2, "attn-cp-group", 1)
         )
 
     def test_ring_pcp8_is_unchanged(self):
         parallel = self._parallel(tp_rank=5, attn_tp=1, cp=8, dcp=8)
         self.assertEqual(
-            dcp_stripe_group(parallel, pcp_ring=True), (5, "attn-cp-group", True)
+            dcp_stripe_group(parallel, pcp_ring=True), (5, "attn-cp-group", 1)
         )
 
     def test_plain_dcp_keeps_sglang_dcp_group(self):
         parallel = self._parallel(tp_rank=5, attn_tp=8, cp=1, dcp=4)
         self.assertEqual(
-            dcp_stripe_group(parallel, pcp_ring=False), (1, "dcp-group", False)
+            dcp_stripe_group(parallel, pcp_ring=False), (1, "dcp-group", 4)
         )
         parallel = self._parallel(tp_rank=0, attn_tp=8, cp=1, dcp=1)
-        self.assertEqual(dcp_stripe_group(parallel, pcp_ring=False), (0, None, False))
+        self.assertEqual(dcp_stripe_group(parallel, pcp_ring=False), (0, None, 1))
 
 
 class TestRingForward(CustomTestCase):
