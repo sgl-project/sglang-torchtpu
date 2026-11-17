@@ -316,6 +316,7 @@ class EagerRunner(BaseRunner):
         ):
             if (
                 get_parallel().attn_dcp_size > 1
+                and not current_platform.dcp_attention_backend_merges_mla()
                 and hasattr(
                     model_runner.model, "prepare_context_parallel_metadata_for_dcp"
                 )

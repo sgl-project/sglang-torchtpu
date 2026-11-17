@@ -39,6 +39,8 @@ _COLLECTIVE_ID = 1
 _OPS: dict = {}
 # Plain bool, not dict truthiness: Dynamo traces the eligibility checks.
 _READY = False
+# Plain int read once: Dynamo traces it as a constant.
+_MAX_ROWS = tpu_envs.SGLANG_TPU_TWOLEVEL_ALLREDUCE_MAX_ROWS.get()
 # Set (while Dynamo traces / Python runs the decode forward) when a tagged
 # attention o_proj skipped its all-reduce so that the following attention-residual
 # aggregation runs it fused (all_reduce_attn_res); consumed by that aggregation.
@@ -551,10 +553,11 @@ def register_from_parallel_state() -> None:
 
 
 def eligible(t: torch.Tensor) -> bool:
-    # One decode token only: at 4 rows XLA's all-reduce measured faster.
+    # Single-token decode by default: at 4 rows XLA's all-reduce measured
+    # faster (SGLANG_TPU_TWOLEVEL_ALLREDUCE_MAX_ROWS raises the bound).
     return (
         t.dim() == 2
-        and t.shape[0] == 1
+        and t.shape[0] <= _MAX_ROWS
         and t.dtype == torch.bfloat16
         and t.shape[1] % 128 == 0
         and t.numel() <= MAX_ELEMS
@@ -600,7 +603,8 @@ def merged_moe_all_reduce_around(original, latent, shared, norm=None):
             return original(latent, shared)
         return original(latent, shared, norm)
     if norm is not None:
-        if "2n" in _OPS and _fusable_norm(norm, latent):
+        # The fused norm reshapes its [H] weight to the packed rows: one row only.
+        if "2n" in _OPS and latent.shape[0] == 1 and _fusable_norm(norm, latent):
             return _OPS["2n"](
                 latent,
                 shared,

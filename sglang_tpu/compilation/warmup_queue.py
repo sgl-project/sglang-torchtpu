@@ -15,6 +15,7 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.pending_call import PendingCall
+from sglang_tpu.tpu_keepalive import keepalive_tick
 
 SPMDCompiler = LazyImport("sglang_tpu.compilation.spmd_compiler", "SPMDCompiler")
 logger = get_logger(__name__)
@@ -53,6 +54,8 @@ class WarmupQueue:
             # Release completed calls' inputs before executing the next program.
             while self.calls:
                 self.calls.pop(0).wait()
+                # Each wait can be minutes of native compilation with the chips idle.
+                keepalive_tick(catch_up=True)
         for complete in self.completions:
             complete()
 

@@ -159,6 +159,15 @@ class PallasForwardMetadata:
     # Pooled DSA indexer with a raw ring (kv_pool.kpool_raw_ring_pages) only:
     # i32[max_num_seqs]  first ring page of each row's request slot
     raw_page_base: torch.Tensor | None = None
+    # Backends whose prefill gathers the DCP shards (pallas_tpu_mla_sparse):
+    # i64[G]  entries of page_indices to gather (the live sequences' widened
+    # pages; G is bucketed, so its shape keys the compiled prefill)
+    dcp_gather_index: torch.Tensor | None = None
+    # i32[max_num_seqs * pages_per_seq * dcp]  unsharded page table into the
+    # gathered pages
+    dcp_dense_pages: torch.Tensor | None = None
+    # dcp_dense_pages addresses the backend's prefill scratch, not gathered pages.
+    dcp_scratch: bool = False
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -573,6 +582,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     # Set by each subclass to select the kernel variant; None on the base only.
     kernel_spec: ClassVar[RpaKernelSpec | None] = None
 
+    # True on a subclass whose own forward handles the DCP-sharded cache and
+    # the cross-rank merge; it then gets the DCP metadata but not the MHA DCP op.
+    _dcp_owns_forward: ClassVar[bool] = False
+
     # The torch custom op exposes KV updates as an in-place mutation, so syncing
     # model outputs during TPU precompile is enough to execute the graph.
     requires_kv_sync_after_compile = False
@@ -627,7 +640,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                     "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 (the default)."
                 )
             cls = type(self)
-            if (
+            if not cls._dcp_owns_forward and (
                 cls.forward_decode is not BaseTpuPallasRpaAttnBackend.forward_decode
                 or cls.forward_extend is not BaseTpuPallasRpaAttnBackend.forward_extend
             ):
@@ -650,7 +663,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 torch.arange(self._dcp, dtype=torch.int64, device=self.device)
                 == self._dcp_rank
             )
-            self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
+            if not cls._dcp_owns_forward:
+                self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
 
         max_bs = get_exec().graph.torch_compile_max_bs
         if max_bs:
@@ -1209,7 +1223,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 target_host = torch.where(
                     is_single, seq_lens_host, seq_lens_host - ext_host
                 )
-                if forward_batch.forward_mode.is_mixed():
+                if forward_batch.forward_mode.is_mixed() and not self._dcp_owns_forward:
                     # SGLang appends the running (decode) rows after the
                     # prefill rows, which is the kernel's batch order: the
                     # trailing single-token run takes the decode tile and the

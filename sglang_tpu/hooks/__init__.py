@@ -54,6 +54,7 @@ from sglang_tpu.hooks.kda_weights import (
     bind_glm5_next_kda_weights,
     rehome_kimi_k3_kda_weights,
 )
+from sglang_tpu.hooks.keepalive import keepalive_after_idle, keepalive_while_loading
 from sglang_tpu.hooks.kimi_k3_latent_up import kimi_k3_latent_up_tail_add3
 from sglang_tpu.hooks.kimi_k3_vision import (
     attach_k3_vision_runner,
@@ -109,6 +110,16 @@ def _select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
 # (target, hook, hook_type) triples.
 
 HOOKS: list[tuple] = [
+    (
+        "sglang.srt.managers.scheduler.Scheduler.on_idle",
+        keepalive_after_idle,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.model_loader.loader.DefaultModelLoader._get_all_weights",
+        keepalive_while_loading,
+        HookType.AFTER,
+    ),
     (
         "sglang.srt.utils.common.set_gpu_proc_affinity",
         bind_rank_cpu_set,

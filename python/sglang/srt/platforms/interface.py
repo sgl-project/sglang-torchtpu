@@ -330,6 +330,12 @@ class SRTPlatform(DeviceMixin):
         """Whether ``--dcp-replicate-q-proj`` applies to GQA/MHA attention."""
         return False
 
+    def dcp_attention_backend_merges_mla(self) -> bool:
+        """Whether, under decode context parallelism, the MLA attention backend
+        itself gathers the query heads and merges the partial outputs, so
+        forward_mla skips its own q all-gather, extend KV gather and LSE merge."""
+        return False
+
     # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
     # entry until the seam PR merges upstream.
     def supports_moe_dp_pipeline_stages(self) -> bool:

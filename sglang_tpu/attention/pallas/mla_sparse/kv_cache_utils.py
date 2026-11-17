@@ -594,7 +594,38 @@ def _get_dcp_page_and_slot(
     """This rank's (page, slot) per token; `OOB_PAGE` for rows it does not own."""
     # `_check_inputs` asserts it equal to the rope page size, so one
     # (page, slot) addresses both caches.
-    page_size = nope_spec.page_size
+    return get_dcp_page_and_slot(
+        num_tokens,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        page_size=nope_spec.page_size,
+        num_pages=nope_spec.num_pages,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+
+
+def get_dcp_page_and_slot(
+    num_tokens: int,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    page_size: int,
+    num_pages: int,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """This rank's (page, slot) per token in a DCP position-sharded cache of
+    `num_pages` pages; `OOB_PAGE` for rows it does not own.
+
+    Shared by every cache the DCP readers address with one top-k coordinate
+    (MLA latents, DSA index keys), so a token sits at the same (page, slot) in
+    all of them.
+    """
     if interleave_size % WORD_BYTES:
         raise ValueError(
             f"interleave_size={interleave_size} must be a multiple of "
@@ -621,7 +652,7 @@ def _get_dcp_page_and_slot(
 
     # Virtual ordinal -> physical block in this rank's own shard, exactly as
     # the DCP readers resolve it.
-    local_block_tables = jnp.mod(block_tables, jnp.int32(nope_spec.num_pages)).reshape(
+    local_block_tables = jnp.mod(block_tables, jnp.int32(num_pages)).reshape(
         seq_lens.shape[0], -1
     )
     max_pages_per_seq = local_block_tables.shape[1]

@@ -50,6 +50,7 @@ from sglang_tpu.cp_forward import (
 )
 from sglang_tpu.envs import envs
 from sglang_tpu.host_upload import upload
+from sglang_tpu.tpu_keepalive import note_forward
 
 if TYPE_CHECKING:
     from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
@@ -1044,6 +1045,7 @@ class CompiledForwardShim:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        note_forward()
         return self._call(self.fn, input_ids, positions, forward_batch, *args, **kwargs)
 
     def warmup_async(self, *args: Any, **kwargs: Any) -> Any:

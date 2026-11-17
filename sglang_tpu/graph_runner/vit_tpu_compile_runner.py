@@ -23,6 +23,7 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.patches import _register_tpu_compile_backend
+from sglang_tpu.tpu_keepalive import keepalive_tick
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +325,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
                     )
                     if pending is not None:
                         pending_warmups.append(pending)
+                    keepalive_tick(catch_up=True)
         finally:
             torch.set_default_dtype(init_dtype)
 

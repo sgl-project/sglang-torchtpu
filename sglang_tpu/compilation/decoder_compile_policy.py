@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import inspect
@@ -86,6 +87,7 @@ from sglang_tpu.host_padding import (
     ordinary_compiled_forward,
 )
 from sglang_tpu.pp_wave import num_relayed_aux_slots
+from sglang_tpu.tpu_keepalive import keepalive_tick
 
 logger = get_logger(__name__)
 
@@ -1535,6 +1537,29 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
 
+    def _dcp_gather_backend(self) -> Any:
+        backend = self.model_runner.attn_backend
+        # Hybrid linear-attention models wrap the full-attention backend.
+        return getattr(backend, "full_attn_backend", backend)
+
+    def _dcp_gather_buckets(self, bs: int) -> list[int | None]:
+        """Gathered-page buckets to warm per extend shape (sparse MLA under
+        DCP: each is its own prefill graph), or ``[None]``."""
+        buckets = getattr(self._dcp_gather_backend(), "dcp_gather_buckets", None)
+        return (buckets(bs) if buckets is not None else []) or [None]
+
+    @contextlib.contextmanager
+    def _warm_dcp_gather_bucket(self, bucket: int | None):
+        if bucket is None:
+            yield
+            return
+        backend = self._dcp_gather_backend()
+        backend._dcp_gather_bucket_override = bucket
+        try:
+            yield
+        finally:
+            backend._dcp_gather_bucket_override = None
+
     def _precompile_extend(self) -> list[PendingCall]:
         """Compile extend at each token bucket and the fixed batch cap."""
         assert self.t_bucketer is not None
@@ -1549,12 +1574,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         compile_items = [
-            (num_tokens, bs, mode, "plain", logits_output_mode)
+            (num_tokens, bs, mode, "plain", logits_output_mode, gather_bucket)
             for num_tokens, bs, mode in compile_cases
             for logits_output_mode in self._warmup_logits_output_modes(bs)
+            for gather_bucket in self._dcp_gather_buckets(bs)
         ]
         cp_items = self._extend_cp_compile_items()
-        compile_items += cp_items
+        compile_items += [(*item, None) for item in cp_items]
         # Input (prompt) logprobs need every prefill row, so they warm the
         # FULL-capture variant instead of the NULL one -- a replacement, not an
         # addition, because the shim then presents FULL on every extend and a
@@ -1583,17 +1609,25 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             else compile_items
         )
         pending = []
-        for num_tokens, bs, mode, variant, logits_output_mode in compile_range:
+        for (
+            num_tokens,
+            bs,
+            mode,
+            variant,
+            logits_output_mode,
+            gather_bucket,
+        ) in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            warmup = self._run_one(
-                num_tokens=num_tokens,
-                bs=bs,
-                mode=mode,
-                variant=variant,
-                logits_output_mode=logits_output_mode,
-                capture_hidden_mode=extend_capture_hidden_mode,
-            )
+            with self._warm_dcp_gather_bucket(gather_bucket):
+                warmup = self._run_one(
+                    num_tokens=num_tokens,
+                    bs=bs,
+                    mode=mode,
+                    variant=variant,
+                    logits_output_mode=logits_output_mode,
+                    capture_hidden_mode=extend_capture_hidden_mode,
+                )
             elapsed = time.perf_counter() - start
             warmup = self._record_compile_step(
                 pending_call=warmup,
@@ -1819,10 +1853,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         ):
             started = time.perf_counter()
             async_warmup = getattr(self.owner.forward, "warmup_async_fn", None)
+            # An async warmup compiles at submission and skips the keep-alive below;
+            # with the keep-alive on, warm up synchronously so a burst follows every compile.
             if (
                 profile_prefix is None
                 and self.tracer == "direct"
                 and envs.SGLANG_DIRECT_COMPILE_ASYNC.get()
+                and tpu_envs.SGLANG_TPU_KEEPALIVE_SECONDS.get() <= 0
                 and self._supports_async_warmup()
                 and async_warmup is not None
             ):
@@ -1845,6 +1882,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 self.model_runner.token_to_kv_pool,
             )
 
+        # A cold precompile runs minutes per step with the chips idle.
+        keepalive_tick(catch_up=True)
         if profile_prefix is not None:
             return (time.perf_counter() - started) * 1000
         return None
@@ -2400,10 +2439,11 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         variants = self._extend_serving_variants()
 
         compile_items = [
-            (num_tokens, bs, mode, variant, logits_output_mode)
+            (num_tokens, bs, mode, variant, logits_output_mode, gather_bucket)
             for num_tokens, bs, mode in compile_cases
             for variant in variants
             for logits_output_mode in self._warmup_logits_output_modes(bs)
+            for gather_bucket in self._dcp_gather_buckets(bs)
         ]
         logger.info(
             "[decoder compile policy] VL EXTEND: %d graph variants "
@@ -2423,16 +2463,24 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             else compile_items
         )
         pending = []
-        for num_tokens, bs, mode, variant, logits_output_mode in compile_range:
+        for (
+            num_tokens,
+            bs,
+            mode,
+            variant,
+            logits_output_mode,
+            gather_bucket,
+        ) in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            warmup = self._run_one(
-                num_tokens=num_tokens,
-                bs=bs,
-                mode=mode,
-                variant=variant,
-                logits_output_mode=logits_output_mode,
-            )
+            with self._warm_dcp_gather_bucket(gather_bucket):
+                warmup = self._run_one(
+                    num_tokens=num_tokens,
+                    bs=bs,
+                    mode=mode,
+                    variant=variant,
+                    logits_output_mode=logits_output_mode,
+                )
             elapsed = time.perf_counter() - start
             warmup = self._record_compile_step(
                 pending_call=warmup,
