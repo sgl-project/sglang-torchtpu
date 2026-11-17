@@ -401,13 +401,19 @@ class MlaDsparkDraft:
             return self._ops[key]
         dspark, rows, names = self.dspark, self.dspark.ROWS, self.names
         count, layers, pages = len(names), self.config.layers, control.pages
+        # KernelConfig.draft_verify_packet: the next verify's packed operand
+        # ([ids | plan row 0 | verify mode 1], DecodeOps.verify_packed) too.
+        packet = kernel_config.active().draft_verify_packet
+        ids_size = 3 * rows + 1 + rows * pages
         epilogue = None
         if kernel_config.active().draft_fused_epilogue and self.attention_dp == 1:
             epilogue = self.kernel.SingleEpilogue(
                 slots=control.slots,
                 reset=control.plan_start + control.RESET,
                 state_size=control.size,
-                ids_size=3 * rows + 1 + rows * pages,
+                ids_size=ids_size,
+                plan=control.plan_start if packet else 0,
+                fields=control.FIELDS if packet else 0,
             )
         fused = self.kernel.fused_draft_local(
             self.config,
@@ -446,28 +452,29 @@ class MlaDsparkDraft:
                 )
 
             int32 = jnp.int32
-            *pools, vector, emitted, following_ids, state = (
-                self.paged.commit_draft_rows(
-                    pools,
-                    latents,
-                    ids,
-                    rows,
-                    pages,
-                    tuple(range(layers)),
-                    owner_table=self.owner_table,
-                    epilogue=(
-                        (vector, state),
-                        (
-                            jax.ShapeDtypeStruct((1, 128), int32),
-                            jax.ShapeDtypeStruct((1, rows), int32),
-                            jax.ShapeDtypeStruct((epilogue.ids_size,), int32),
-                            jax.ShapeDtypeStruct((epilogue.state_size,), int32),
-                        ),
-                        step_outputs,
+            sizes = (epilogue.ids_size, epilogue.state_size)
+            if packet:
+                sizes += (epilogue.ids_size + epilogue.fields + 1,)
+            committed = self.paged.commit_draft_rows(
+                pools,
+                latents,
+                ids,
+                rows,
+                pages,
+                tuple(range(layers)),
+                owner_table=self.owner_table,
+                epilogue=(
+                    (vector, state),
+                    (
+                        jax.ShapeDtypeStruct((1, 128), int32),
+                        jax.ShapeDtypeStruct((1, rows), int32),
+                        *(jax.ShapeDtypeStruct((size,), int32) for size in sizes),
                     ),
-                )
+                    step_outputs,
+                ),
             )
-            return (vector, *pools, emitted, following_ids, state)
+            vector, emitted, *outputs = committed[layers:]
+            return (vector, *committed[:layers], emitted, *outputs)
 
         def body(*args):
             import jax.numpy as jnp
@@ -519,10 +526,25 @@ class MlaDsparkDraft:
             state = state.at[2 * control.slots + slot].set(accepted)
             reset = control.plan_start + control.RESET
             state = state.at[reset].set(jnp.where(slot != 0, 0, state[reset]))
-            return (vector, *pools, emitted[None], following_ids, state)
+            if not packet:
+                return (vector, *pools, emitted[None], following_ids, state)
+            plan = state[control.plan_start : control.plan_start + control.FIELDS]
+            following_packet = jnp.concatenate(
+                (following_ids, plan, jnp.ones((1,), jnp.int32))
+            )
+            return (
+                vector,
+                *pools,
+                emitted[None],
+                following_ids,
+                state,
+                following_packet,
+            )
 
         in_specs = (P(AXIS),) * (count + layers) + (P(), P(AXIS), P(), P(), P(), P())
         out_specs = (P(),) + (P(AXIS),) * layers + (P(), P(), P())
+        if packet:
+            out_specs += (P(),)
         self._ops[key] = register_op(
             "pallas::k3_dspark_mla_draft_single",
             self.mesh,
@@ -627,6 +649,9 @@ class MlaDsparkDraft:
                 old.set_(fresh)
 
     def step_single(self, state, aux, logits, ids, control_state, decisions, control):
+        """``DsparkDraft.step_single``'s step; with
+        ``KernelConfig.draft_verify_packet`` a fifth output, the next
+        verify's packed operand (verify mode 1)."""
         op = self._build_single(control)
         out = op(
             *self._operands(),
@@ -640,9 +665,15 @@ class MlaDsparkDraft:
         )
         layers = self.config.layers
         vector, pools = out[0], out[1 : 1 + layers]
-        emitted, following, control_state = out[1 + layers :]
+        emitted, following, control_state, *packet = out[1 + layers :]
         self._adopt(pools)
-        return _settled(MlaDraftState(vector)), emitted, following, control_state
+        return (
+            _settled(MlaDraftState(vector)),
+            emitted,
+            following,
+            control_state,
+            *packet,
+        )
 
     def step_batched(
         self, states, aux, logits, ids, control_state, decisions, control, rows_per

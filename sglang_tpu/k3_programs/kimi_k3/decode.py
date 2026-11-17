@@ -40,6 +40,7 @@ from jax.sharding import PartitionSpec as P
 from sglang_tpu.k3_programs._support.logger import init_logger
 from sglang_tpu.k3_programs.bridge import hbm, materialize, register_global_op
 from sglang_tpu.k3_programs.config import MegakernelEngineConfig
+from sglang_tpu.k3_programs.kimi_k3 import config as kernel_config
 from sglang_tpu.k3_programs.kimi_k3.decode_ops import (
     GREEDY,
     Control,
@@ -109,6 +110,9 @@ class KimiDecoder:
         self.spec_req: str | None = None
         self.draft_state = None
         self.next_ids: torch.Tensor | None = None
+        # KernelConfig.draft_verify_packet: the next verify's packed operand
+        # (verify mode 1) from the draft op that made ``next_ids``.
+        self.next_packet: torch.Tensor | None = None
         # Rings the prefill computed, per request, for its first speculation.
         self._offered: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         # With a draft, the schedule (vLLM's per-batch-size draft count,
@@ -159,7 +163,14 @@ class KimiDecoder:
         self._zero: torch.Tensor | None = None
         self._modes: dict[int, torch.Tensor] = {}
         self._live_batches: set[int] = set()
-        self.stats = {"plans": 0, "enters": 0, "chained": 0, "plain": 0, "batched": 0}
+        self.stats = {
+            "plans": 0,
+            "enters": 0,
+            "chained": 0,
+            "packets": 0,
+            "plain": 0,
+            "batched": 0,
+        }
         self._group: dict[str, tuple[int, int]] = {}  # request -> (DP group, context)
         # Import each transferred request's DSpark ring: with a DSpark
         # speculative config the transfer carries one (backend.draft_ring_rows).
@@ -459,16 +470,20 @@ class KimiDecoder:
 
         return self.ops.cached_op(key, build)
 
-    def _enter_batched(self, requests: int, rows_per: int) -> Any:
+    def _enter_batched(self, requests: int, rows_per: int, packet: bool = False) -> Any:
         """``(control, vector_0.., modes) -> ids``: the batched verify operand
         (``DecodeOps.verify_batched``) of plan rows 0..requests-1: per
         request its next token, then the first drafts of its draft vector
         (``modes`` 1) or placeholders (0), at its next positions; every row
         its request's slot (``indices``: each row's logical entry); one table
-        per request."""
+        per request. ``packet`` (KernelConfig.draft_verify_packet): ``->
+        (ids, packet)``, the verify's packed operand from the same control
+        and modes too (``DecodeOps.pack_verify_metadata``)."""
         layout, k = self.layout, rows_per
         assert layout is not None
         key = ("enter_batched", layout.key(), requests, k)
+        if packet:
+            key += ("packet",)
 
         def build():
             import jax.numpy as jnp
@@ -499,15 +514,21 @@ class KimiDecoder:
                     slots.append(layout.state_slot(slot[j], entry))
                 ids = jnp.concatenate(
                     (*tokens, *positions, *slots, *indices, tables.reshape(-1))
+                ).astype(jnp.int32)
+                if not packet:
+                    return (ids,)
+                return (
+                    ids,
+                    DecodeOps.pack_verify_metadata(layout, R, ids, control, modes),
                 )
-                return (ids.astype(jnp.int32),)
 
             return register_global_op(
-                f"pallas::k3_decode_dspark_enter{requests}x{k}",
+                f"pallas::k3_decode_dspark_enter{requests}x{k}"
+                + ("_packet" if packet else ""),
                 self.ops.mesh,
                 fn,
                 (P(),) * (R + 2),
-                (P(),),
+                (P(),) * (2 if packet else 1),
                 export_key=repr(key),
             )
 
@@ -557,6 +578,7 @@ class KimiDecoder:
         if self.spec_req is not None and self.draft_state is not None:
             self._drafts[self.spec_req] = self.draft_state
         self.spec_req, self.draft_state, self.next_ids = None, None, None
+        self.next_packet = None
 
     def _sync_plan(self, entries, tables) -> bool:
         """Upload the plan for ``entries`` unless the device holds it; returns
@@ -609,6 +631,7 @@ class KimiDecoder:
             self._fresh.pop(req, None)
         if self.spec_req in finished:
             self.spec_req, self.draft_state, self.next_ids = None, None, None
+            self.next_packet = None
 
     # ------------------------------------------------------------ attention DP
     def _mla_table(self, request: RequestInput):
@@ -811,7 +834,8 @@ class KimiDecoder:
             self.spec_req = request.req_id
             self.draft_state = self._take_state(request.req_id)
         assert self.draft_state is not None and self.layout is not None
-        if continuing and not changed:
+        chained = continuing and not changed
+        if chained:
             ids = self.next_ids
             self.stats["chained"] += 1
         else:
@@ -823,24 +847,33 @@ class KimiDecoder:
             )
         # Accept drafts only when the rows carry this request's real drafts
         # and the scheduler scheduled them all.
-        mode = self._modes[1 if continuing and request.scheduled == self.WIDTH else 0]
+        accept = continuing and request.scheduled == self.WIDTH
+        # KernelConfig.draft_verify_packet: the last draft op packed this
+        # verify's operand from these ids and this control, for verify mode 1.
+        packet = self.next_packet if chained and accept else None
+        if packet is not None:
+            self.stats["packets"] += 1
         sharded, aux, decisions = self.ops.verify_packed(
             ids,
             self.draft.aux_layers,
             self.layout,
             self.control,
-            mode,
+            self._modes[1 if accept else 0],
             self.draft._synthetic_rates(self.WIDTH - 1),
+            packet=packet,
         )
-        self.draft_state, emitted, self.next_ids, self.control = self.draft.step_single(
-            self.draft_state,
-            aux,
-            sharded,
-            ids,
-            self.control,
-            decisions,
-            self.layout,
+        self.draft_state, emitted, self.next_ids, self.control, *packets = (
+            self.draft.step_single(
+                self.draft_state,
+                aux,
+                sharded,
+                ids,
+                self.control,
+                decisions,
+                self.layout,
+            )
         )
+        self.next_packet = packets[0] if packets else None
         if self.device_plan is not None:
             self.device_plan = self.layout.consumed(self.device_plan, 1)
         self._fresh[request.req_id] = self.WIDTH
@@ -902,7 +935,13 @@ class KimiDecoder:
         step reads it, as rejected rows' is)."""
         assert self.draft is not None and self.layout is not None
         vectors = [s.vector for s in states]
-        (ids,) = self._enter_batched(compiled, k)(self.control, *vectors, modes_t)
+        packet = None
+        if kernel_config.active().draft_verify_packet:
+            ids, packet = self._enter_batched(compiled, k, packet=True)(
+                self.control, *vectors, modes_t
+            )
+        else:
+            (ids,) = self._enter_batched(compiled, k)(self.control, *vectors, modes_t)
         sharded, aux, decisions = self.ops.verify_batched(
             ids,
             self.draft.aux_layers,
@@ -912,6 +951,7 @@ class KimiDecoder:
             self.control,
             modes_t,
             self.draft._synthetic_rates(k - 1),
+            packet=packet,
         )
         rows = draft_rows(k)
         if rows != k:
@@ -1059,7 +1099,7 @@ class KimiDecoder:
             (ids,) = self._enter()(
                 self.control, self.draft_state.vector, self._modes[0]
             )
-            emitted = None
+            emitted = packet = None
             for step in range(4):
                 # A new plan (a table grew): the operand rebuilt from the control.
                 if step == 2:
@@ -1068,6 +1108,10 @@ class KimiDecoder:
                     (ids,) = self._enter()(
                         self.control, self.draft_state.vector, self._modes[1]
                     )
+                    packet = None
+                # Steps 1 and 3 continue (verify mode 1): with
+                # KernelConfig.draft_verify_packet their packed operand is
+                # the draft op's, as in serving (another operand history).
                 sharded, aux, decisions = self.ops.verify_packed(
                     ids,
                     self.draft.aux_layers,
@@ -1075,16 +1119,20 @@ class KimiDecoder:
                     self.control,
                     self._modes[min(step, 1)],
                     self.draft._synthetic_rates(self.WIDTH - 1),
+                    packet=packet,
                 )
-                self.draft_state, emitted, ids, self.control = self.draft.step_single(
-                    self.draft_state,
-                    aux,
-                    sharded,
-                    ids,
-                    self.control,
-                    decisions,
-                    self.layout,
+                self.draft_state, emitted, ids, self.control, *packets = (
+                    self.draft.step_single(
+                        self.draft_state,
+                        aux,
+                        sharded,
+                        ids,
+                        self.control,
+                        decisions,
+                        self.layout,
+                    )
                 )
+                packet = packets[0] if packets else None
             materialize(emitted)
 
         def speculate_batched(
@@ -1177,6 +1225,7 @@ class KimiDecoder:
             None,
             None,
         )
+        self.next_packet = None
         self._drafts.clear()
         self._fresh.clear()
         if self.rank == 0:

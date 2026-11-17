@@ -680,10 +680,14 @@ class DecodeOps:
         return self._ops[key]
 
     def verify_packed(
-        self, ids, aux_layers, control, state, modes, synthetic_rates=None
+        self, ids, aux_layers, control, state, modes, synthetic_rates=None, packet=None
     ):
-        """Verify, decide acceptance and commit states before returning to Torch."""
-        (packet,) = self._build_verify_metadata(control, 1)(ids, state, modes)
+        """Verify, decide acceptance and commit states before returning to Torch.
+        ``packet``: the packed operand ``_build_verify_metadata`` would build
+        from ``ids``, ``state`` and ``modes``, already built (by the op
+        before; KernelConfig.draft_verify_packet)."""
+        if packet is None:
+            (packet,) = self._build_verify_metadata(control, 1)(ids, state, modes)
         op = self._build_verify(tuple(aux_layers), control, synthetic_rates)
         sharded, aux, decisions, conv, recurrent, *pools = self._run(
             op, self.VERIFY_ROWS, *self._operands(), packet
@@ -814,9 +818,14 @@ class DecodeOps:
         state,
         modes,
         synthetic_rates=None,
+        packet=None,
     ):
-        """Batched verify/accept/commit with only persistent state live out."""
-        (packet,) = self._build_verify_metadata(control, requests)(ids, state, modes)
+        """Batched verify/accept/commit with only persistent state live out
+        (``packet``: as ``verify_packed``'s)."""
+        if packet is None:
+            (packet,) = self._build_verify_metadata(control, requests)(
+                ids, state, modes
+            )
         op = self._build_verify_batched(
             tuple(aux_layers), requests, rows_per, control, synthetic_rates
         )
@@ -832,8 +841,9 @@ class DecodeOps:
         if key not in self._ops:
 
             def body(ids, state, modes):
-                plan, _ = control.fields(state, requests)
-                return (jnp.concatenate((ids, plan.reshape(-1), modes)),)
+                return (
+                    self.pack_verify_metadata(control, requests, ids, state, modes),
+                )
 
             self._ops[key] = register_op(
                 f"pallas::k3_verify_metadata_{requests}",
@@ -844,6 +854,12 @@ class DecodeOps:
                 export_key=repr(key),
             )
         return self._ops[key]
+
+    @staticmethod
+    def pack_verify_metadata(control, requests, ids, state, modes):
+        """The verify's packed operand ``[ids | plan rows | modes]`` (jax)."""
+        plan, _ = control.fields(state, requests)
+        return jnp.concatenate((ids, plan.reshape(-1), modes))
 
     @staticmethod
     def _unpack_verify_metadata(packet, control, requests):

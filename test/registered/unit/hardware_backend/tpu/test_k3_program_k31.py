@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=1600, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1850, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -1417,6 +1417,212 @@ class TestPairCombine(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+class TestDraftPairCombine(CustomTestCase):
+    """``KernelConfig.draft_pair_combine``: the MLA draft's attention
+    (explicit keys, its lse in the padding row, FP8 pages) through the host
+    combine, its last chunk with the pair stage, in Pallas interpret mode at
+    DCP16 with ``HOST_LANES`` 4 (four hosts of two chips; the draft runs four
+    of four), one- and two-chunk calls: finite, an earlier chunk's rows the
+    knob-off bits, the last chunk's within the combine's BF16 roundings of
+    them -- |on - off| <= 3 2^-8 sum_i softmax(lse)_i |o_i| over every rank's
+    partial of the row (the pair merge's rounding, plus the host merge's
+    re-rounding of a value that moved)."""
+
+    SCRIPT = """
+        import os, time
+        G = 16
+        os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={G}"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import ml_dtypes, numpy as np, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.k3_programs.kimi_k3.kernels import mla_dcp
+
+        # The MLA draft's attention (explicit keys, lse in the padding row, FP8 pages) through the host combine,
+        # with and without its pair stage. HOST_LANES 4 at DCP16: 4 hosts of 2 chips (the draft: 4 hosts of 4 chips).
+        T, H, S, FP8 = 512, 3, 8, jnp.float8_e4m3fn
+        mla_dcp.HOST_LANES = G // 4
+        mla_dcp.GROUPS = (G, 8, 16, 32)
+        LANES = mla_dcp.LANES
+
+        def tokens(x):
+            return (jax.lax.broadcasted_iota(jnp.int32, x.shape, 0) * x.shape[1]
+                    + jax.lax.broadcasted_iota(jnp.int32, x.shape, 1))
+
+        def _pages(self, slot):  # interpret mode has no ref bitcasts (see TestSelectedAttention)
+            def load(lanes, tokens=None):
+                x = self.ws.pages[slot]
+                x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+                if hasattr(lanes, "size"):  # pl.ds
+                    return jax.lax.dynamic_slice_in_dim(x, lanes.start, lanes.size, 1)
+                return x[:, lanes]
+            return load
+
+        def _clean_step(self, slot, row, local_step, tokens_=None, end=None, pad=True):
+            x = self.ws.pages[slot]
+            cut = 0
+            for k in range(self.span):
+                first = ((local_step * self.span + k) * self.group + self.owner) * self.page_tokens
+                cut = cut + jnp.clip(self._limit(row) - first, 0, self.page_tokens)
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+            keep = (tokens(x) < cut) & ((lane < 576) if pad else True)
+            self.ws.pages[slot] = jnp.where(keep, x, jnp.zeros((), x.dtype))
+
+        def _zero_step_pad_lanes(self, slot):
+            x = self.ws.pages[slot]
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+            self.ws.pages[slot] = jnp.where(lane < 576, x, jnp.zeros((), x.dtype))
+
+        def _zero_slot(self, slot):
+            self.ws.pages[slot] = jnp.zeros(self.ws.pages.shape[1:], self.ws.pages.dtype)
+
+        _pack = mla_dcp.DcpAttention._pack_partials
+
+        def _pack_partials(self, first, end, base=0):  # also keep each chunk's packets (every owner's partials)
+            _pack(self, first, end, base)
+            capture, counter = self._capture
+            capture[counter[0]] = self.ws.send[...].astype(jnp.float32)
+            counter[0] += 1
+
+        mla_dcp.DcpAttention._pack_partials = _pack_partials
+        mla_dcp.DcpAttention._pages = _pages
+        mla_dcp.DcpAttention._clean_step = _clean_step
+        mla_dcp.DcpAttention._zero_slot = _zero_slot
+        mla_dcp.DcpAttention._zero_step_pad_lanes = _zero_step_pad_lanes
+
+        def run(firsts, counts, seed, pairs):
+            # Outputs [G, B, H, 512] and every rank's packets of each chunk [G, chunks, G, H S, 640].
+            rng = np.random.default_rng(seed)
+            B = len(firsts) * S
+            positions = np.array([p0 + r for p0 in firsts for r in range(S)], np.int32)
+            plan = mla_dcp.page_plan(B, H, S, FP8, force_chunks=True)
+            persistent = mla_dcp.persistent_scratch(B, G, H, cache_dtype=FP8, sequence_rows=S, fp8_wire=True,
+                                                    force_chunks=True, chunk_rows=S)
+            scoped = mla_dcp.scoped_scratch(B, plan["span"], plan["buffers"], heads=H, group=G, cache_dtype=FP8,
+                                            page_tokens=T, sequence_rows=S, force_chunks=True, chunk_rows=S)
+            ring, hosts = persistent[0].shape[0], G // mla_dcp.HOST_LANES
+            stage2 = (pltpu.VMEM((ring, hosts, H * S, LANES), jnp.bfloat16),
+                      pltpu.VMEM((hosts, H * S, LANES), jnp.bfloat16), pltpu.SemaphoreType.DMA((2, ring)))
+            extra = (pltpu.SemaphoreType.DMA((2, ring)),) if pairs else ()
+            pages = max(-(-(int(p0) + T) // T) // G for p0 in firsts) + 1
+            lat = (rng.standard_normal((len(firsts), pages * G * T, LANES)) * 0.5).astype(np.float32)
+            lat[..., 576:] = 0
+            pool = rng.standard_normal((G, 1 + len(firsts) * pages, 128, 4, LANES)).astype(ml_dtypes.float8_e4m3fn)
+            tables = np.zeros((G, B, pages), np.int32)
+            for b in range(B):
+                s_, p0 = b // S, firsts[b // S]
+                tables[:, b] = 1 + s_ * pages + np.arange(pages)
+                for t in range(p0):
+                    page = t // T; g, j = page % G, page // G
+                    pool[g, tables[g, b, j], (t % T) // 4, t % 4] = lat[s_, t].astype(ml_dtypes.float8_e4m3fn)
+            q = (rng.standard_normal((G, B, H, LANES)) * 0.08).astype(np.float32)
+            q[..., 576:] = 0
+            keys = (rng.standard_normal((len(firsts), 2 * S, LANES)) * 0.5).astype(np.float32)
+            keys[..., 576:] = 0
+            lane = np.arange(2 * S)
+            valid = np.stack([((lane < S) & (lane <= c)) | ((lane >= S) & (lane < 2 * S - 1)) for c in counts])
+            valid = valid[:, None, :].astype(np.int32)
+            n_p, n_s = len(persistent), len(scoped)
+            rows = persistent[1].shape[1]
+
+            def kernel(pos, table, q_r, keys_r, valid_r, pool_r, out_r, send_r, *scratch):
+                counter = scratch[-1]
+                counter[0] = 0
+                scratch = scratch[:-1]
+                cache = mla_dcp.DcpCache((pool_r,), table, pages, 0, group=G, global_pages=False)
+                ws = mla_dcp.DcpWorkspace(*scratch[:n_p], *scratch[n_p:n_p + n_s])
+                att = mla_dcp.DcpAttention(cache, ws, pos, B, sequence_rows=S, heads=H, chunk_rows=S)
+                att.lse_in_padding = True
+                att.group_fold = True
+                att.force_chunked = True
+                att.host_combine = tuple(scratch[n_p + n_s : n_p + n_s + 3])
+                att.host_pairs = scratch[n_p + n_s + 3] if pairs else None
+                att._capture = (send_r, counter)
+                att.prime()
+                out_r[...] = att.attend(q_r[...], jnp.zeros((B, LANES), jnp.float32), 0, keys=keys_r, key_valid=valid_r)
+
+            def body(pos, table, q_, keys_, valid_, pool_):
+                vmem = pltpu.VMEM
+                out, send = pl.pallas_call(kernel,
+                    out_shape=(jax.ShapeDtypeStruct((B, H, 512), jnp.float32),
+                               jax.ShapeDtypeStruct((B // S, G, rows, LANES), jnp.float32)),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2,
+                        in_specs=[pl.BlockSpec(memory_space=vmem)] * 3 + [pl.BlockSpec(memory_space=pl.ANY)],
+                        out_specs=(pl.BlockSpec(memory_space=vmem),) * 2,
+                        scratch_shapes=[*persistent, *scoped, *stage2, *extra, pltpu.SMEM((1,), jnp.int32)]),
+                    compiler_params=pltpu.CompilerParams(has_side_effects=True),
+                    interpret=pltpu.InterpretParams())(pos, table[0], q_[0], keys_, valid_, pool_[0])
+                return out[None], send[None]
+
+            mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+            f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P("tp"), P("tp"), P(), P(), P("tp")),
+                                      out_specs=(P("tp"), P("tp")), check_vma=False))
+            out, send = f(positions, tables.reshape(G, -1), q, keys, valid, pool)
+            return np.asarray(out), np.asarray(send)
+
+        def bound(send):
+            # 2^-8 sum_i softmax(lse)_i |o_i| over every rank's partial of each owner's real rows ([G, S - 1, H, 512];
+            # row S - 1 is the padding row, whose packet rows carry the lse's).
+            hl = mla_dcp.HOST_LANES
+            hosts = G // hl
+            out = np.zeros((G, S, H, 512))
+            for m in range(G):
+                idx = (m % hl) * hosts + m // hl  # the owner's packet in the lane-major send buffer
+                part = send[:, idx]  # [G ranks, H S, 640]
+                lse = part[..., 512] + part[..., 513]  # [G, rows]
+                w = np.exp(lse - lse.max(axis=0, keepdims=True)); w /= w.sum(axis=0, keepdims=True)
+                b = np.einsum("gr,gre->re", w, np.abs(part[..., :512]))  # [rows, 512]
+                out[m] = b.reshape(S, H, 512)
+            return 2.0 ** -8 * out[:, : S - 1]
+
+        t0 = time.time()
+        ok = True
+        for firsts, counts, seed in (([3000], [5], 1), ([5200], [7], 2), ([1500, 4100], [3, 7], 3)):
+            off, send = run(firsts, counts, seed, False)
+            on, _ = run(firsts, counts, seed, True)
+            B = len(firsts) * S
+            diff = np.abs(on.astype(np.float64) - off)  # [G, B, H, 512]
+            finite = bool(np.isfinite(on).all())
+            good, ratio, rel = finite, 0.0, 0.0
+            # Only the last chunk takes the pair stage: the earlier ones' outputs are the knob-off bits.
+            good &= bool(np.array_equal(on[:, : B - S], off[:, : B - S]))
+            for c in range(len(firsts)):  # each chunk's real rows against its partials' bound
+                bnd = bound(send[:, c])
+                d = diff[:, c * S : c * S + S - 1]
+                good &= bool((d <= 3 * bnd * (1 + 2.0**-6) + 1e-7 * bnd.max()).all())
+                ratio = max(ratio, float((d / np.maximum(bnd, 1e-30)).max()))
+                rel = max(rel, float(d.max() / np.abs(off[:, c * S : c * S + S - 1]).max()))
+            print(f"firsts {firsts} counts {counts}: identical {np.array_equal(on, off)} max |on - off| / (2^-8 bound) "
+                  f"{ratio:.3f} max rel {rel:.2e} finite {finite} -> {'ok' if good else 'FAIL'} ({time.time() - t0:.0f}s)",
+                  flush=True)
+            ok &= good
+        print("OK" if ok else "FAIL")
+    """
+
+    def test_pair_stage_within_its_roundings(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        # 16 interpret devices block in callbacks: give the CPU client enough
+        # threads (XLA reads NPROC for its pool size).
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=2400,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
+
+
 class TestPrefillIndexRows(CustomTestCase):
     """A prefill window's index keys laid out as pool rows match the decode's
     per-token commit of the same keys, byte for byte."""
@@ -2038,12 +2244,15 @@ class TestK31DraftFusedEpilogue(CustomTestCase):
       past the table.
     * ``dspark_mla_kernel.single_epilogue`` gives ``_build_single``'s emitted
       tokens, next ids and control state, slot indices that wrap or drop
-      included.
+      included, and (``draft_verify_packet``) the packing op's next verify
+      operand, bank writes that land in the plan row included.
     * ``dspark_mla_kernel.stream_chunks``: the LM head through six slots
       (four started early) gives the two-slot ring's logits, race-free.
     * ``MlaDsparkDraft._build_single``'s op with the knob (the fused kernel
       stubbed) returns the knob-off op's vector, pools, emitted tokens, next
-      ids and control state."""
+      ids and control state; with ``draft_verify_packet`` (either epilogue)
+      also ``DecodeOps.pack_verify_metadata`` of its next ids, control state
+      and verify mode 1."""
 
     COMMIT = """
         import os
@@ -2110,7 +2319,7 @@ class TestK31DraftFusedEpilogue(CustomTestCase):
     """
 
     EPILOGUE = """
-        import os
+        import itertools, os
         os.environ["JAX_PLATFORMS"] = "cpu"
         import numpy as np, jax, jax.numpy as jnp
         from jax.experimental import pallas as pl
@@ -2118,7 +2327,7 @@ class TestK31DraftFusedEpilogue(CustomTestCase):
         from sglang_tpu.k3_programs.kimi_k3.kernels import dspark_mla_kernel as kern
         from sglang_tpu.k3_programs.kimi_k3.kernels.dspark import OUT_BONUS, OUT_COUNT, OUT_DRAFTS
 
-        ROWS = 8
+        ROWS, FIELDS = 8, 8
 
         def reference(vector, ids, state, slots, reset):  # MlaDsparkDraft._build_single's XLA epilogue
             rows = ROWS
@@ -2134,28 +2343,32 @@ class TestK31DraftFusedEpilogue(CustomTestCase):
             state = state.at[slots + slot].set(base + accepted + 1)
             state = state.at[2 * slots + slot].set(accepted)
             state = state.at[reset].set(jnp.where(slot != 0, 0, state[reset]))
-            return emitted[None], following_ids, state
+            # The packing op's next verify operand (verify mode 1).
+            packet = jnp.concatenate((following_ids, state[3 * slots : 3 * slots + FIELDS], jnp.ones(1, jnp.int32)))
+            return emitted[None], following_ids, state, packet
 
         def kernel_outputs(spec, vector, ids, state):
             def kernel(ids_ref, state_ref, vector_ref, *outs):
                 kern.single_epilogue(spec, ROWS, ids_ref, state_ref, vector_ref, *outs)
+            sizes = [spec.ids_size, spec.state_size] + [spec.ids_size + spec.fields + 1] * (spec.fields > 0)
             return pl.pallas_call(
                 kernel,
                 out_shape=(jax.ShapeDtypeStruct((1, ROWS), jnp.int32),
-                           jax.ShapeDtypeStruct((spec.ids_size,), jnp.int32),
-                           jax.ShapeDtypeStruct((spec.state_size,), jnp.int32)),
-                grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=3, in_specs=[],
-                                                       out_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)] * 3),
+                           *(jax.ShapeDtypeStruct((size,), jnp.int32) for size in sizes)),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=3, in_specs=[],
+                    out_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)] * (1 + len(sizes))),
                 interpret=pltpu.InterpretParams(),
             )(ids, state, vector)
 
         rng = np.random.default_rng(0)
-        for slots, plan_rows, pages in ((3, 1, 26), (9, 4, 7)):
+        for (slots, plan_rows, pages), fields in itertools.product(((3, 1, 26), (9, 4, 7)), (0, FIELDS)):
             size = 3 * slots + plan_rows * (8 + pages)
             spec = kern.SingleEpilogue(slots=slots, reset=3 * slots + 1, state_size=size,
-                                       ids_size=3 * ROWS + 1 + ROWS * pages)
+                                       ids_size=3 * ROWS + 1 + ROWS * pages, plan=3 * slots, fields=fields)
             for accepted in (-1, 0, 3, 7, 8):
-                for slot in (0, 1, -1, slots + 2, size + 5):
+                # slots + 1 / + 2: the row bank write lands in plan row 0 (the packet carries it)
+                for slot in (0, 1, -1, slots + 1, slots + 2, size + 5):
                     vector = rng.integers(-2**31, 2**31 - 1, (8, 128), dtype=np.int64).astype(np.int32)
                     vector[0, OUT_COUNT] = accepted
                     ids = rng.integers(0, 200000, spec.ids_size).astype(np.int32)
@@ -2164,8 +2377,9 @@ class TestK31DraftFusedEpilogue(CustomTestCase):
                     got = kernel_outputs(spec, *map(jnp.asarray, (vector, ids, state)))
                     want = reference(jnp.asarray(vector[:1]), jnp.asarray(ids), jnp.asarray(state), slots,
                                      spec.reset)
+                    assert len(got) == (4 if fields else 3)
                     for g, w in zip(got, want):
-                        assert np.array_equal(np.asarray(g), np.asarray(w)), (slots, accepted, slot)
+                        assert np.array_equal(np.asarray(g), np.asarray(w)), (slots, accepted, slot, fields)
         print("OK")
     """
 
@@ -2232,9 +2446,11 @@ class TestK31DraftFusedEpilogue(CustomTestCase):
         bridge = types.ModuleType("sglang_tpu.k3_programs.bridge")
         bridge.register_op = lambda name, mesh, body, ins, outs, donate_argnums=(), export_key=None: (
             captured.append((body, ins, outs)) or body)
-        bridge.hbm = bridge.kernel_mesh = bridge.materialize = bridge.upload = lambda *a, **k: None
+        for name in ("hbm", "kernel_mesh", "materialize", "upload", "report_load_stats", "stream_to_device"):
+            setattr(bridge, name, lambda *a, **k: None)
         sys.modules["sglang_tpu.k3_programs.bridge"] = bridge
         from sglang_tpu.k3_programs.kimi_k3 import config as kconfig, draft_mla
+        from sglang_tpu.k3_programs.kimi_k3.decode_ops import Control, DecodeOps
         from sglang_tpu.k3_programs.kimi_k3.kernels import dspark, dspark_mla_kernel as kern, mla_dcp, paged
 
         G, ROWS, PAGES, L, BLOCKS, PT, SLOTS = 4, 8, 6, 5, 7, 512, 3
@@ -2245,22 +2461,14 @@ class TestK31DraftFusedEpilogue(CustomTestCase):
         for fn in (paged.commit_latent_rows, paged.commit_draft_rows):
             fn.__kwdefaults__["group"] = G
 
-        class Control:
-            FIELDS, SLOT, RESET = 8, 0, 1
-            def __init__(self, slots, rows, pages):
-                self.slots, self.rows, self.pages = slots, rows, pages
-                self.plan_start = 3 * slots
-                self.size = self.plan_start + rows * (self.FIELDS + pages)
-            def key(self):
-                return self.slots, self.rows, self.pages
-
         @dataclasses.dataclass(frozen=True)
         class DraftConfig:
             layers: int = L
 
-        def run(knob, vector, latents, pools, ids, state, decisions):
+        def run(knob, vector, latents, pools, ids, state, decisions, packet=False):
             # The scatter commit as the reference (interpret mode has no aliased HBM refs).
-            config = dataclasses.replace(base_config, draft_fused_epilogue=knob, fused_cache_commit=False)
+            config = dataclasses.replace(base_config, draft_fused_epilogue=knob, draft_verify_packet=packet,
+                                         fused_cache_commit=False)
             kconfig.active = paged._config = lambda: config
             stub = types.SimpleNamespace(**{n: getattr(kern, n) for n in (
                 "WEIGHT_NAMES", "LEADING_NAMES", "SingleEpilogue", "single_epilogue")})
@@ -2281,7 +2489,7 @@ class TestK31DraftFusedEpilogue(CustomTestCase):
             return [np.asarray(x).view(np.uint8) if x.dtype == jnp.float8_e4m3fn else np.asarray(x) for x in out]
 
         rng = np.random.default_rng(0)
-        for base, accepted, slot in ((5, 3, 1), (PT - 3, 7, 2), (28, 0, 0), (4 * PT - 4, 5, -1)):
+        for base, accepted, slot in ((5, 3, 1), (PT - 3, 7, 2), (28, 0, 0), (4 * PT - 4, 5, -1), (40, 2, SLOTS + 2)):
             vector = rng.integers(0, 160000, (1, 128)).astype(np.int32)
             vector[0, dspark.OUT_COUNT] = accepted
             latents = (rng.standard_normal((L, ROWS, 640)) * 2).astype(ml_dtypes.bfloat16)
@@ -2291,12 +2499,20 @@ class TestK31DraftFusedEpilogue(CustomTestCase):
             ids[ROWS], ids[2 * ROWS] = base, slot
             state = rng.integers(-50, 50, 3 * SLOTS + 8 + PAGES).astype(np.int32)
             decisions = np.array([[-1, -1]], np.int32)
-            old = run(False, vector, latents, pools, ids, state, decisions)
-            new = run(True, vector, latents, pools, ids, state, decisions)
+            args = (vector, latents, pools, ids, state, decisions)
+            old = run(False, *args)
+            new = run(True, *args)
             assert len(old) == len(new) == 1 + L + 3
             for k, (a, b) in enumerate(zip(old, new)):
                 assert a.shape == b.shape and np.array_equal(a, b), (base, k)
             assert any((o != p.view(np.uint8)).any() for o, p in zip(old[1 : 1 + L], pools))
+            # KernelConfig.draft_verify_packet: the same outputs, then the packing op's next operand.
+            want = DecodeOps.pack_verify_metadata(Control(SLOTS, 1, PAGES), 1, jnp.asarray(old[-2]),
+                                                  jnp.asarray(old[-1]), jnp.ones(1, jnp.int32))
+            for knob in (False, True):
+                *outs, packet = run(knob, *args, packet=True)
+                assert all(np.array_equal(a, b) for a, b in zip(old, outs, strict=True)), (base, knob)
+                assert packet.dtype == np.int32 and np.array_equal(packet, np.asarray(want)), (base, knob)
         print("OK")
     """
 
@@ -2331,6 +2547,147 @@ class TestK31DraftFusedEpilogue(CustomTestCase):
 
     def test_lm_ring_matches_two_slots(self):
         self._run(self.LM_RING)
+
+
+class TestK31DraftVerifyPacket(CustomTestCase):
+    """``KernelConfig.draft_verify_packet`` in the decoder (the packets
+    themselves: ``TestK31DraftFusedEpilogue``): ``KimiDecoder._speculate``
+    verifies from the draft op's packet exactly when it chains (same
+    request, unchanged plan) at verify mode 1, and ``_enter_batched`` /
+    ``_verify_and_draft`` hand the verify the packet the packing op
+    (``DecodeOps.pack_verify_metadata``) builds from the same control and
+    modes."""
+
+    HOST = """
+        import os
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import sys, types
+        import numpy as np, jax, jax.numpy as jnp, torch
+
+        bridge = types.ModuleType("sglang_tpu.k3_programs.bridge")
+        bridge.register_op = bridge.register_global_op = (
+            lambda name, mesh, fn, ins, outs, donate_argnums=(), export_key=None: fn)
+        for name in ("hbm", "kernel_mesh", "materialize", "upload", "report_load_stats", "stream_to_device"):
+            setattr(bridge, name, lambda *a, **k: None)
+        sys.modules["sglang_tpu.k3_programs.bridge"] = bridge
+        from sglang_tpu.k3_programs.kimi_k3 import config as kconfig
+        kconfig.install(kconfig.KernelConfig().replace(draft_verify_packet=True))
+        from sglang_tpu.k3_programs.kimi_k3 import decode
+        from sglang_tpu.k3_programs.kimi_k3.decode_ops import Control, DecodeOps
+
+        class Ops:
+            mesh = None
+            def __init__(self):
+                self.calls = []
+            def cached_op(self, key, build):
+                return build()
+            def verify_packed(self, ids, aux_layers, control, state, modes, rates=None, packet=None):
+                self.calls.append((ids, int(modes[0]), packet))
+                return "sharded", "aux", "decisions"
+            def verify_batched(self, ids, aux_layers, requests, rows_per, control, state, modes, rates=None,
+                               packet=None):
+                self.calls.append((ids, modes, packet))
+                return "sharded", "aux", "decisions"
+
+        class Draft:  # step_single's outputs tagged with the step number
+            aux_layers = (1,)
+            def __init__(self, packets):
+                self.packets, self.steps = packets, 0
+            def _synthetic_rates(self, drafts):
+                return None
+            def step_single(self, state, aux, logits, ids, control_state, decisions, control):
+                self.steps += 1
+                out = (state, "emitted", ("ids", self.steps), ("control", self.steps))
+                return out + ((("packet", self.steps),) if self.packets else ())
+            def step_batched(self, states, aux, logits, ids, control_state, decisions, control, rows):
+                return states, "emitted", control_state
+
+        def decoder(packets):
+            d = object.__new__(decode.KimiDecoder)
+            d.ops, d.draft = Ops(), Draft(packets)
+            d.layout, d.control, d.device_plan = Control(5, 4, 3), ("control", 0), None
+            d.spec_req = d.draft_state = d.next_ids = d.next_packet = None
+            d._drafts, d._fresh, d._offered, d._group, d.tracked = {}, {}, {}, {}, set()
+            d.slot_map = types.SimpleNamespace(release=lambda finished: None)
+            d._modes = {0: torch.zeros(1, dtype=torch.int32), 1: torch.ones(1, dtype=torch.int32)}
+            d.stats = dict.fromkeys(("plans", "enters", "chained", "packets", "plain", "batched"), 0)
+            d._take_state = lambda req_id: types.SimpleNamespace(vector=("vector", req_id))
+            d._enter = lambda: (lambda control, vector, keep: (("entered", int(keep[0])),))
+            return d
+
+        def step(d, req_id, reset, scheduled, changed):
+            d._sync_plan = lambda entries, tables: changed
+            request = types.SimpleNamespace(req_id=req_id, scheduled=scheduled)
+            d._speculate(request, [(1, reset, 0, 0, None)], [None], False)
+            return d.ops.calls[-1]
+
+        d = decoder(True)
+        assert step(d, "a", True, 8, True) == (("entered", 0), 0, None)  # a new request: placeholders
+        assert step(d, "a", False, 8, False) == (("ids", 1), 1, ("packet", 1))  # chained: the draft op's packet
+        assert step(d, "a", False, 5, False) == (("ids", 2), 0, None)  # chained, fewer rows: mode 0, packed
+        assert step(d, "a", False, 8, True) == (("entered", 1), 1, None)  # a new plan: the operand rebuilt
+        assert step(d, "a", False, 8, False) == (("ids", 4), 1, ("packet", 4))
+        assert step(d, "b", False, 8, False) == (("entered", 0), 0, None)  # another request
+        assert d.next_packet == ("packet", 6)
+        d.forget(["b"])
+        assert d.next_ids is None and d.next_packet is None
+        assert step(d, "b", False, 8, False) == (("entered", 0), 0, None)
+        d._park_single()
+        assert d.next_packet is None
+        assert d.stats["packets"] == 2 and d.stats["chained"] == 3 and d.stats["enters"] == 4, d.stats
+        d = decoder(False)  # a draft without packets (or the knob off): always packed
+        step(d, "a", True, 8, True)
+        assert step(d, "a", False, 8, False) == (("ids", 1), 1, None) and d.stats["packets"] == 0
+
+        # The batched enter op's packet is the packing op's, from the same control and modes.
+        rng = np.random.default_rng(3)
+        d = decoder(True)
+        layout = d.layout
+        for requests, rows_per in ((2, 4), (4, 8)):
+            control = rng.integers(0, 200, layout.size).astype(np.int32)
+            fields = control[layout.plan_start : layout.tables_start].reshape(layout.rows, layout.FIELDS)
+            fields[:, layout.SLOT] = rng.integers(0, layout.slots, layout.rows)
+            fields[:, layout.RESET] = rng.integers(0, 2, layout.rows)
+            control[layout.plan_start : layout.tables_start] = fields.reshape(-1)
+            control = jnp.asarray(control)
+            vectors = [jnp.asarray(rng.integers(0, 160000, (1, 128)).astype(np.int32)) for _ in range(requests)]
+            modes = jnp.asarray(rng.integers(0, 2, requests).astype(np.int32))
+            (ids,) = d._enter_batched(requests, rows_per)(control, *vectors, modes)
+            ids2, packet = d._enter_batched(requests, rows_per, packet=True)(control, *vectors, modes)
+            want = DecodeOps.pack_verify_metadata(layout, requests, ids, control, modes)
+            assert np.array_equal(np.asarray(ids), np.asarray(ids2))
+            assert np.asarray(packet).dtype == np.int32 and np.array_equal(np.asarray(packet), np.asarray(want))
+            d.control = control
+            states = [types.SimpleNamespace(vector=v) for v in vectors]
+            d._verify_and_draft(requests, rows_per, states, modes)
+            got_ids, _, got_packet = d.ops.calls[-1]
+            assert np.array_equal(np.asarray(got_ids), np.asarray(ids))
+            assert np.array_equal(np.asarray(got_packet), np.asarray(want))
+        print("OK")
+    """
+
+    def _run(self, script):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(script)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
+
+    def test_decoder_verifies_from_the_packet(self):
+        self._run(self.HOST)
 
 
 class TestB16OneHotStaging(CustomTestCase):
