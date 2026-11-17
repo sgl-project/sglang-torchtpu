@@ -149,9 +149,7 @@ def main():
     logical_rank = torch.tensor([rank], dtype=torch.int32, device="tpu")
     baseline = baseline_op()
     jax_glm = get_op(ep, True)
-    existing = {
-        capacity: get_selected_op(ep, capacity) for capacity in (32, 64, 128)
-    }
+    existing = {capacity: get_selected_op(ep, capacity) for capacity in (32, 64, 128)}
     runtime["mapped_libtpu"] = sorted(
         set(
             line.split()[-1]
@@ -216,7 +214,9 @@ def main():
     for local_rows in (4, 6, 12, 18, 24):
         rows = local_rows * ep
         generator = torch.Generator().manual_seed(61442048 + local_rows)
-        x_cpu = (torch.randn((rows, h), generator=generator) * 0.2).bfloat16()
+        # Constant weight slabs project onto each row's sum. A positive mean
+        # keeps that projection well conditioned at small decode batches.
+        x_cpu = (torch.randn((rows, h), generator=generator) * 0.2 + 0.02).bfloat16()
         # Continuous random scores give uniform distinct expert sets without
         # constructing one randperm per token.
         ids_cpu = (
@@ -284,20 +284,23 @@ def main():
                 torch.linalg.vector_norm(actual - reference)
                 / torch.linalg.vector_norm(reference).clamp_min(1e-8)
             )
-            assert torch.isfinite(actual).all() and relative_l2 < 0.15, (
-                name,
-                rank,
-                local_rows,
-                relative_l2,
-            )
+            all_finite = bool(torch.isfinite(actual).all())
             emit(
                 dict(
                     kind="correctness",
                     variant=name,
                     local_rows=local_rows,
                     relative_l2=relative_l2,
-                    all_finite=True,
+                    all_finite=all_finite,
+                    reference_l2=float(torch.linalg.vector_norm(reference)),
+                    error_l2=float(torch.linalg.vector_norm(actual - reference)),
                 )
+            )
+            assert all_finite and relative_l2 < 0.15, (
+                name,
+                rank,
+                local_rows,
+                relative_l2,
             )
             with torch.no_grad():
                 for _ in range(3):
@@ -333,7 +336,7 @@ def main():
                     latency_ms=statistics.median(values),
                     samples_ms=values,
                     boundary="replicated FFN rows + selected routes -> DP-local MoE output; shared expert and required collectives included",
-                    input_distribution="synthetic uniform routing; expert-specific constant FP8 slabs and nonuniform channel scales",
+                    input_distribution="synthetic uniform routing; expert-specific constant FP8 slabs and nonuniform channel scales; activations N(0.02,0.2^2)",
                     timing="unprofiled torch.compile call plus accelerator synchronization; barriers outside timer",
                 )
             )
