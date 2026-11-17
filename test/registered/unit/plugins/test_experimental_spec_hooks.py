@@ -1163,6 +1163,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         )
 
         worker = object.__new__(TpuBlockSpecWorker)
+        worker._block_draft_worker = SimpleNamespace(kv_ring=None)
         greedy = torch.ones((4, 2), dtype=torch.int64)
         worker._forward_draft_block = lambda **kwargs: (None, greedy, None)
         worker._sync_greedy_drafts = lambda tokens: tokens

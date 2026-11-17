@@ -28,6 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
 from sglang.srt.speculative.ragged_verify import (
@@ -127,6 +128,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             draft_token_num=self._draft_block_width, device=self.device
         )
 
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        # The ring holds no prefix and spans no target locs: nothing to back up.
+        if self._block_draft_worker.kv_ring is not None:
+            return HiCacheDraftPlan()
+        return super()._build_hicache_draft_plan()
+
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
         # Under PP (pp_size > 1), TpuBlockSpecWorker only runs on the last stage
@@ -160,7 +167,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         block_hidden, graph_draft_tokens, draft_lattice = self._forward_draft_block(
             state=state,
             live_mask=bucket.live_mask,
-            rows=rows,
+            rows=self._draft_kv_rows(rows, verify_input, state.seq_lens),
             verify_input=verify_input,
         )
         # No confidence budget yet: every bucket verifies all gamma drafts.
@@ -242,6 +249,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 state.seq_lens,
                 self.num_verify_rows,
             )
+        rows = self._draft_kv_rows(rows, verify_input, state.seq_lens)
         # Padded rows commit 0 tokens, so the writer skips them.
         with self._block_draft_worker.draft_context():
             kv_fence_tail = self._block_draft_worker.write_draft_kv(
@@ -290,6 +298,31 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             return None
         return full_to_swa[verify_input.verify_cache_candidates_cpu].to(torch.int64)
 
+    def _draft_kv_rows(
+        self,
+        rows: VerifyRows,
+        verify_input: TpuSpecVerifyInput,
+        seq_lens: torch.Tensor,
+    ) -> VerifyRows:
+        """The verify rows' draft KV slots: the target's, or the draft ring's."""
+        kv_ring = self._block_draft_worker.kv_ring
+        if kv_ring is None:
+            return rows
+        target_candidates = verify_input.verify_cache_candidates_cpu
+        assert target_candidates is not None and verify_input.committed_lens is not None
+        bs = target_candidates.shape[0]
+        ring_candidates = kv_ring.verify_candidates(
+            req_rows=verify_input.req_pool_indices_cpu[:bs],
+            committed_lens=verify_input.seq_lens_cpu[:bs],
+            num_candidates=target_candidates.shape[1],
+        )
+        return select_verify_rows(
+            padded_h2d(ring_candidates, rows.cache_locs.shape[0], self.device),
+            verify_input.committed_lens,
+            seq_lens,
+            self.num_verify_rows,
+        )
+
     def extend(
         self, batch: ScheduleBatch, *, pp_proxy_tensors: PPProxyTensors | None
     ) -> GenerationBatchResult:
@@ -334,6 +367,14 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 ).to(cache_loc_cpu.dtype)
             elif full_to_swa is not None and not self.ships_pd_hidden:
                 cache_loc_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
+            kv_ring = self._block_draft_worker.kv_ring
+            if kv_ring is not None:
+                cache_loc_cpu = kv_ring.extend_slots(
+                    req_rows=batch.req_pool_indices_cpu[: len(batch.reqs)],
+                    prefix_lens=batch.prefix_lens,
+                    extend_lens=batch.extend_lens,
+                    positions=positions_cpu,
+                ).to(cache_loc_cpu.dtype)
         positions = pad_rows(positions_cpu, padded_rows).to(
             self.device, non_blocking=True
         )
