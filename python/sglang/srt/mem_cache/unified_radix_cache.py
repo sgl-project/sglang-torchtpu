@@ -1893,6 +1893,16 @@ class UnifiedRadixCache(BasePrefixCache):
                     ),
                 )
 
+        # After the last prefill chunk, decode retires the request's own window, so
+        # the rest of the forward must enter the tree now to keep a window at its end.
+        if (
+            not is_finished
+            and result.swa_branch_inserted
+            and effective_cache_len < len(token_ids)
+            and up_to >= len(req.origin_input_ids)
+        ):
+            self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+
     def finished_session_leaf(self, last_node: NodeId, prompt_len: int) -> NodeId:
         """The node a finished request registers as its session's leaf: the end of its
         inserted path, or with session_leaf_at_prompt_end the deepest node on that path
