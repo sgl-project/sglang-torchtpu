@@ -137,9 +137,14 @@ class ParallelExecutor(PipelineExecutor):
                         except Exception as e:
                             obj_list = [False, e]
 
-                    # Send batch to other ranks
+                    # Send batch to other ranks. Under CFG parallel every rank of
+                    # CFG rank 0 ran the stage; only world rank 0 sends, since
+                    # the broadcast spans the world group.
                     broadcasted_list = broadcast_pyobj(
-                        obj_list, rank=rank, dist_group=group.cpu_group, src=0
+                        obj_list,
+                        rank=get_world_rank(),
+                        dist_group=group.cpu_group,
+                        src=0,
                     )
                     success, broadcasted_batch = broadcasted_list
 
