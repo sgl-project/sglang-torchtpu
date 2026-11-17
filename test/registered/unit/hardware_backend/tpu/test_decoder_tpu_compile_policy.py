@@ -1870,19 +1870,22 @@ class TestContextParallelRingWarmup(_PolicyTestCase):
         )
         return policy, strategy
 
-    def test_cp_family_uses_only_buckets_of_whole_block_pairs(self):
-        """A request reserves two page-aligned blocks on every rank, so a
-        usable local bucket is a multiple of 2 x page size."""
-        policy, strategy = self._ring_policy(token_buckets=(8, 32, 48, 64))
+    def test_cp_buckets_round_up_to_whole_block_pairs(self):
+        """A request reserves two page-aligned blocks on every rank, so local
+        buckets round up to multiples of 2 x page size (32), never past the
+        largest token bucket."""
+        policy, strategy = self._ring_policy(token_buckets=(8, 40, 80, 100))
         cap = policy._extend_compile_cap()
         with (
             patch(_CP_STRATEGY_PATH, return_value=strategy),
             patch(_PCP_RING_PATH, return_value=True),
         ):
             policy._configure_cp_ring()
-            self.assertEqual(policy.cp_t_bucketer.buckets, [32, 64])
-            self.assertEqual(policy._extend_cp_compile_cases(), [(32, cap), (64, cap)])
-        self.assertEqual(strategy.ring_capacity, 64)
+            self.assertEqual(policy.cp_t_bucketer.buckets, [32, 64, 96])
+            self.assertEqual(
+                policy._extend_cp_compile_cases(), [(32, cap), (64, cap), (96, cap)]
+            )
+        self.assertEqual(strategy.ring_capacity, 96)
 
     def test_gather_mode_keeps_every_bucket_and_configures_nothing(self):
         policy, strategy = self._ring_policy(token_buckets=(8, 32, 48, 64))
@@ -1899,11 +1902,12 @@ class TestContextParallelRingWarmup(_PolicyTestCase):
         self.assertIsNone(strategy.ring_capacity)
 
     def test_no_usable_bucket_fails_at_startup(self):
-        policy, strategy = self._ring_policy(token_buckets=(8, 24, 48))
+        """Every token bucket is below one block pair (32 tokens)."""
+        policy, strategy = self._ring_policy(token_buckets=(8, 24))
         with (
             patch(_CP_STRATEGY_PATH, return_value=strategy),
             patch(_PCP_RING_PATH, return_value=True),
-            self.assertRaisesRegex(ValueError, "multiple of 2 x page size"),
+            self.assertRaisesRegex(ValueError, "row unit"),
         ):
             policy._configure_cp_ring()
 
