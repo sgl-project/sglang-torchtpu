@@ -218,9 +218,12 @@ def _ep_wo(weight: torch.Tensor, *, rank: int) -> tuple[torch.Tensor, torch.Tens
     from sglang.srt.distributed import tensor_model_parallel_all_gather
 
     qd = weight.shape[1]
-    whole, scale = _fp8_channelwise(
-        _k_major(tensor_model_parallel_all_gather(weight.detach().contiguous(), dim=1))
-    )
+    mine = _k_major(weight)
+    # K-major first, then the rank blocks stacked along dim 0 (rank order)
+    gathered = tensor_model_parallel_all_gather(mine, dim=0)
+    if not torch.equal(gathered[rank * qd : (rank + 1) * qd], mine):
+        raise RuntimeError(f"Muse EP: rank {rank}'s block of the gathered wo is not its own")
+    whole, scale = _fp8_channelwise(gathered)
     return whole, whole[rank * qd : (rank + 1) * qd].contiguous(), scale
 
 
