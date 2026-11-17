@@ -183,6 +183,9 @@ def load_ple_table_on_host(original: Any, model: Any, weights: Any, *args, **kwa
             yield name, loaded
 
     loaded_params = original(model, filtered(), *args, **kwargs)
+    for module in modules.values():
+        # The int32 hash's host constants, before any trace reads them.
+        _ngram_hash_limb_plan(module)
     for prefix, table in tables.items():
         emb = modules[prefix].ngram_embedding
         device = emb.weight.device
@@ -245,6 +248,9 @@ def gather_fp8_ple_rows(
 def _ngram_hash_limb_plan(ngram: Any) -> dict:
     """Host constants of the int32 n-gram hash, cached on the module.
 
+    Reads the module's buffers on the host, so build it eagerly (after the
+    weights load, see load_ple_table_on_host), never inside a trace.
+
     Products token * multiplier stay below 2^63 by construction (each
     multiplier is at most int64_max // vocab), so they are split into
     ``bits``-bit limbs small enough that token * limb + carry fits int32.
@@ -270,14 +276,23 @@ def _ngram_hash_limb_plan(ngram: Any) -> dict:
     offsets = [int(o) for o in ngram.ngram_heads_offsets.cpu().tolist()]
     if max(sizes) >= 1 << 25 or max(o + s for o, s in zip(offsets, sizes)) >= 1 << 31:
         raise NotImplementedError("n-gram head vocab too large for the int32 n-gram hash")
-    plan = dict(
-        bits=bits,
-        mask=mask,
-        num_p=num_p,
-        m_limbs=m_limbs,
-        sizes=torch.tensor(sizes, dtype=torch.int32),
-        offsets=torch.tensor(offsets, dtype=torch.int32),
-    )
+    plan = dict(bits=bits, mask=mask, num_p=num_p, m_limbs=m_limbs)
+    # Module buffers, so direct_compile lifts them as model inputs.
+    device = ngram.layer_multipliers.device
+    if hasattr(ngram, "register_buffer"):
+        ngram.register_buffer(
+            "_tpu_hash_sizes",
+            torch.tensor(sizes, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        ngram.register_buffer(
+            "_tpu_hash_offsets",
+            torch.tensor(offsets, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+    else:  # plain objects in unit tests
+        ngram._tpu_hash_sizes = torch.tensor(sizes, dtype=torch.int32, device=device)
+        ngram._tpu_hash_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
     ngram._tpu_hash_plan = plan
     return plan
 
@@ -318,8 +333,8 @@ def ngram_hash_int32(ngram: Any, contexts: Any) -> Any:
             carry = acc >> bits
         return limbs
 
-    sizes = plan["sizes"].to(device)
-    offsets = plan["offsets"].to(device)
+    sizes = ngram._tpu_hash_sizes
+    offsets = ngram._tpu_hash_offsets
     blocks = []
     mixed = None
     for pos in range(ngram.ngram_size):
