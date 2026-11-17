@@ -85,3 +85,6 @@ def merge_staged_pages(
             merges=merges,
             write_pages=write_pages,
         )
+    if write_pages is None and device.type == "tpu":
+        # Staging pages free right after poll(); Raiden DMAs bypass XLA ordering.
+        torch.accelerator.synchronize()

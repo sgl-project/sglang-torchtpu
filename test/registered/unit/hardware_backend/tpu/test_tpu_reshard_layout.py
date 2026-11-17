@@ -784,6 +784,79 @@ class TestTpuReshardMerge(unittest.TestCase):
             [([3, 5, 2, 0], b.untyped_storage().data_ptr()) for b in bufs],
         )
 
+    def test_merge_synchronizes_tpu_after_default_page_writes(self):
+        """TPU merges must synchronize after writing all layers so callers can
+        free staging pages without racing unordered Raiden DMAs."""
+        import sglang_tpu.kv_page_write as kv_page_write
+
+        tpu_device = SimpleNamespace(type="tpu")
+
+        class _FakeTpuBuffer:
+            device = tpu_device
+
+            def __init__(self, buf: torch.Tensor) -> None:
+                self._buf = buf.view(torch.uint8)
+                self.shape = buf.shape
+
+            def __getitem__(self, idx: torch.Tensor) -> torch.Tensor:
+                return self._buf[idx]
+
+        tpu_bufs = [
+            _FakeTpuBuffer(_fused_layer(dtype=FP8, heads=2)),
+            _FakeTpuBuffer(_fused_layer(dtype=FP8, heads=2)),
+        ]
+        cpu_bufs = [_fused_layer(dtype=FP8, heads=2)]
+        events: list[str] = []
+        real_tensor = torch.tensor
+
+        def index_tensor(data, *args, device=None, **kwargs):
+            return real_tensor(
+                data,
+                *args,
+                device="cpu" if device is tpu_device else device,
+                **kwargs,
+            )
+
+        with (
+            mock.patch.object(torch, "tensor", side_effect=index_tensor),
+            mock.patch.object(
+                kv_page_write,
+                "write_pages_torch",
+                side_effect=lambda *_: events.append("write"),
+            ),
+            mock.patch.object(
+                torch.accelerator,
+                "synchronize",
+                side_effect=lambda: events.append("sync"),
+            ),
+        ):
+            merge_staged_pages(
+                bufs=tpu_bufs,
+                real_pages=[3, 5],
+                staging_pages=[7, 1],
+                merges=((0, 2, 2),),
+            )
+            self.assertEqual(events, ["write", "write", "sync"])
+
+            events.clear()
+            merge_staged_pages(
+                bufs=tpu_bufs,
+                real_pages=[3, 5],
+                staging_pages=[7, 1],
+                merges=((0, 2, 2),),
+                write_pages=lambda *_: events.append("override"),
+            )
+            self.assertEqual(events, ["override", "override"])
+
+            events.clear()
+            merge_staged_pages(
+                bufs=cpu_bufs,
+                real_pages=[3, 5],
+                staging_pages=[7, 1],
+                merges=((0, 2, 2),),
+            )
+            self.assertEqual(events, ["write"])
+
 
 class _FakeAllocator:
     def __init__(self, pages):
