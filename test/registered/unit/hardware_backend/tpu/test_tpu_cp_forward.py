@@ -30,7 +30,6 @@ from sglang_tpu.cp_forward import (
     install_cp_logits_forward,
     pinned_extend_seq_lens_cpu,
     prepare_tpu_cp_forward_batch,
-    ring_token_buckets,
     wrap_cp_embedding_forward,
 )
 from sglang_tpu.cp_layout import (
@@ -635,10 +634,6 @@ class TestRingLayout(CustomTestCase):
 
 
 class TestRingBuckets(CustomTestCase):
-    def test_only_buckets_of_whole_block_pairs_are_usable(self):
-        bucketer = Bucketer(name="Token", buckets=[16, 32, 48, 96, 160])
-        self.assertEqual(ring_token_buckets(bucketer, RING_PAGE), [32, 96, 160])
-
     @staticmethod
     def _prepare(rank, token_buckets):
         batch = SimpleNamespace(
@@ -667,17 +662,18 @@ class TestRingBuckets(CustomTestCase):
         return batch, real
 
     def test_prepare_buckets_the_reserved_rows(self):
-        """The bucketed quantity is 2 * C per request, the same on every rank."""
+        """The bucketed quantity is 2 * C per request, the same on every rank,
+        bucketed by the ring-mode bucketer (multiples of 2 x page size)."""
         for rank in range(CP):
-            batch, real = self._prepare(rank, [64, 144, 160, 320])
+            batch, real = self._prepare(rank, [64, 160, 320])
             self.assertEqual(real, (243, 3))
             host = get_tpu_cp_layout(batch).host
-            # 128 reserved rows: 144 is not a multiple of two pages, 160 is.
+            # 128 reserved rows.
             self.assertEqual(host.local_rows_padded, 160)
             self.assertIsNotNone(host.ring)
             self.assertEqual(batch.attn_cp_metadata.max_rank_len, [160] * CP)
-        with self.assertRaisesRegex(ValueError, "above every usable token bucket"):
-            self._prepare(0, [64, 144])
+        with self.assertRaisesRegex(ValueError, "exceeds the maximum bucket size"):
+            self._prepare(0, [64, 96])
 
 
 class TestRingStrategy(TestTpuZigzagStrategy):
