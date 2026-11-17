@@ -443,12 +443,15 @@ class DecodeOps:
         spec_shapes: tuple[tuple[int, int], ...],
         synthetic_rates=None,
         masked_ops: bool = False,
+        draft: Any = None,
     ) -> list:
         """The configured primary decoder graphs, using shape-only operands.
         ``synthetic_rates``: the rates, or ``drafts -> rates`` (per draft
         width), the verify ops are built with. ``masked_ops``: also compile
         the grammar-masked plain steps (structured outputs; with DSpark, the
-        steps where a structured request decodes)."""
+        steps where a structured request decodes). ``draft``
+        (KernelConfig.draft_with_verify): the single verify compiles as
+        :meth:`_build_verify_draft`'s op with this draft's single op."""
         from sglang_tpu.k3_programs.compilation import CompileCall
 
         operands = self._operands()
@@ -523,7 +526,29 @@ class DecodeOps:
             )
             add(op, rows, ids_size + requests * (control.FIELDS + 1))
 
-        if spec_alone:
+        if spec_alone and draft is not None:
+            rows = self.VERIFY_ROWS
+            rates = (
+                synthetic_rates(rows - 1)
+                if callable(synthetic_rates)
+                else synthetic_rates
+            )
+            ids_size = 3 * rows + 1 + rows * control.pages
+            calls.append(
+                CompileCall(
+                    self._build_verify_draft(draft, aux_layers, control, rates),
+                    (
+                        *self._verify_draft_operands(draft),
+                        torch.empty((1, 128), dtype=torch.int32),  # previous
+                        torch.empty(ids_size, dtype=torch.int32),
+                        torch.empty(control.size, dtype=torch.int32),
+                        torch.empty(1, dtype=torch.int32),  # the verify mode
+                    ),
+                    self._compiler_options(rows),
+                    priority=2 * rows,
+                )
+            )
+        elif spec_alone:
             add_verify(1, self.VERIFY_ROWS, single=True)
         for requests, spec_rows in spec_shapes:
             add_verify(requests, spec_rows)
@@ -620,8 +645,26 @@ class DecodeOps:
         Temporary post-states stay inside the op. The input banks are donated
         only to the non-communicating commit after all native readers finish."""
         key = ("verify", aux_layers, control.key(), synthetic_rates)
-        if key in self._ops:
-            return self._ops[key]
+        if key not in self._ops:
+            body, in_specs, out_specs, donated, export_key = self._verify_parts(
+                aux_layers, control, synthetic_rates
+            )
+            self._ops[key] = register_op(
+                f"pallas::k3_decode_verify{self.VERIFY_ROWS}",
+                self.mesh,
+                body,
+                in_specs,
+                out_specs,
+                donate_argnums=donated,
+                export_key=repr(export_key),
+            )
+        return self._ops[key]
+
+    def _verify_parts(
+        self, aux_layers: tuple[int, ...], control, synthetic_rates=None
+    ) -> tuple:
+        """:meth:`_build_verify`'s op before registration: ``(body,
+        in_specs, out_specs, donated operands, export key)``."""
         rows, paged, names = self.VERIFY_ROWS, self.paged, self.names
         count = len(names)
         options = decode_options(rows)
@@ -696,30 +739,19 @@ class DecodeOps:
         out_specs = (P(AXIS), P(), P(), P(AXIS), P(AXIS)) + (P(AXIS),) * (
             pools + centres
         )
-        export_key = repr(
-            (
-                "verify",
-                rows,
-                NUM_LAYERS,
-                names,
-                sorted(options.items()),
-                control.key(),
-                synthetic_rates,
-                pool_map,
-                owner_table,
-            )
-            + (("centres",) if centres else ())
-        )
-        self._ops[key] = register_op(
-            f"pallas::k3_decode_verify{rows}",
-            self.mesh,
-            body,
-            in_specs,
-            out_specs,
-            donate_argnums=tuple(range(count, count + 2 + pools + centres)),
-            export_key=export_key,
-        )
-        return self._ops[key]
+        export_key = (
+            "verify",
+            rows,
+            NUM_LAYERS,
+            names,
+            sorted(options.items()),
+            control.key(),
+            synthetic_rates,
+            pool_map,
+            owner_table,
+        ) + (("centres",) if centres else ())
+        donated = tuple(range(count, count + 2 + pools + centres))
+        return body, in_specs, out_specs, donated, export_key
 
     def verify_packed(
         self, ids, aux_layers, control, state, modes, synthetic_rates=None, packet=None
@@ -736,6 +768,116 @@ class DecodeOps:
         )
         self._adopt(conv, recurrent, pools)
         return sharded, aux, decisions
+
+    def _build_verify_draft(
+        self, draft: Any, aux_layers: tuple[int, ...], control, synthetic_rates=None
+    ) -> Any:
+        """KernelConfig.draft_with_verify: :meth:`_build_verify`'s op and
+        ``draft``'s single-request op on its logits, aux hidden states and
+        decisions (``MlaDsparkDraft.single_parts``) as one op. Its operands:
+        :meth:`_operands` (with any window centres), the draft's weights
+        other than the target's (``draft.target_weights``: the decoder's LM
+        head and embedding, passed once) and the draft pools, then the
+        previous draft vector, the ids, the control state and the verify
+        mode, from which the op packs the verify's operand
+        (:meth:`pack_verify_metadata`). Returns the KDA banks, the pools and
+        any window centres, then the draft op's outputs (without the next
+        verify's packet). Those and the draft pools are donated, as by the
+        two ops."""
+        # The op captures the draft's static settings: one per draft.
+        key = ("verify_draft", id(draft), aux_layers, control.key(), synthetic_rates)
+        if key in self._ops:
+            return self._ops[key]
+        verify, v_in, v_out, v_donated, v_key = self._verify_parts(
+            aux_layers, control, synthetic_rates
+        )
+        step, d_in, d_out, d_donated, d_key = draft.single_parts(control, packet=False)
+        names, layers = tuple(draft.names), int(draft.config.layers)
+        operands = len(v_in) - 1  # the verify's operands before its packet
+        shared = {
+            i: self.names.index(draft.target_weights[name])
+            for i, name in enumerate(names)
+            if name in draft.target_weights
+        }
+        own = tuple(i for i in range(len(names)) if i not in shared)
+        start = operands + len(own)  # the first draft pool
+        if d_donated != tuple(range(len(names), len(names) + layers)):
+            raise ValueError("the draft op donates other operands than its pools")
+
+        def body(*args):
+            verify_args = args[:operands]
+            previous, ids, state, modes = args[start + layers :]
+            packet = self.pack_verify_metadata(control, 1, ids, state, modes)
+            logits, aux, decisions, *persistent = verify(*verify_args, packet)
+            weights = dict(zip(own, args[operands:start], strict=True))
+            weights.update((i, verify_args[j]) for i, j in shared.items())
+            outputs = step(
+                *(weights[i] for i in range(len(names))),
+                *args[start : start + layers],
+                aux,
+                logits,
+                previous,
+                ids,
+                state,
+                decisions,
+            )
+            return (*persistent, *outputs)
+
+        in_specs = (
+            v_in[:operands]
+            + tuple(d_in[i] for i in own)
+            + d_in[len(names) : len(names) + layers]
+            + d_in[-4:-1]  # previous, ids, state
+            + (P(),)  # the verify mode
+        )
+        self._ops[key] = register_op(
+            f"pallas::k3_decode_verify{self.VERIFY_ROWS}_draft",
+            self.mesh,
+            body,
+            in_specs,
+            v_out[3:] + d_out,
+            donate_argnums=v_donated + tuple(range(start, start + layers)),
+            export_key=repr(("verify_draft", v_key, d_key, sorted(shared.items()))),
+        )
+        return self._ops[key]
+
+    def _verify_draft_operands(self, draft: Any) -> tuple[torch.Tensor, ...]:
+        return (*self._operands(), *draft.single_operands())
+
+    def verify_and_draft(
+        self,
+        draft: Any,
+        ids,
+        aux_layers,
+        control,
+        state,
+        modes,
+        previous,
+        synthetic_rates=None,
+    ):
+        """KernelConfig.draft_with_verify: :meth:`verify_packed`, then
+        ``draft.step_single`` on its outputs, in one op
+        (:meth:`_build_verify_draft`; ``previous``: the draft state's
+        vector). Adopts the KDA banks, the pools and any window centres;
+        returns the draft op's outputs (``draft.finish_single`` adopts its
+        pools)."""
+        op = self._build_verify_draft(
+            draft, tuple(aux_layers), control, synthetic_rates
+        )
+        outputs = self._run(
+            op,
+            self.VERIFY_ROWS,
+            *self._verify_draft_operands(draft),
+            previous,
+            ids,
+            state,
+            modes,
+        )
+        # The KDA banks, the pools and any window centres (as _adopt takes them).
+        persistent = 2 + len(self.unified_pools) + len(self.centre_operands())
+        conv, recurrent, *pools = outputs[:persistent]
+        self._adopt(conv, recurrent, pools)
+        return outputs[persistent:]
 
     def _build_verify_batched(
         self,

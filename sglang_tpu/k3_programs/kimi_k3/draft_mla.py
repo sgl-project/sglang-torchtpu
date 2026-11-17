@@ -184,6 +184,9 @@ class MlaDsparkDraft:
     """The fused MLA DSpark draft: weights, pools and the step ops."""
 
     imports_ring = False  # the context is in the draft pools, not a KDA-row ring
+    # The decoder's weights among the draft's (draft name -> the decoder's;
+    # attach_target): KernelConfig.draft_with_verify's op takes them once.
+    target_weights = TARGET_WEIGHTS
 
     def __init__(
         self,
@@ -397,13 +400,34 @@ class MlaDsparkDraft:
 
     def _build_single(self, control: Any) -> Any:
         key = ("single", control.key())
-        if key in self._ops:
-            return self._ops[key]
+        if key not in self._ops:
+            # KernelConfig.draft_verify_packet: the next verify's packed operand
+            # ([ids | plan row 0 | verify mode 1], DecodeOps.verify_packed) too.
+            body, in_specs, out_specs, donated, export_key = self.single_parts(
+                control, kernel_config.active().draft_verify_packet
+            )
+            self._ops[key] = register_op(
+                "pallas::k3_dspark_mla_draft_single",
+                self.mesh,
+                body,
+                in_specs,
+                out_specs,
+                donate_argnums=donated,
+                export_key=repr(export_key),
+            )
+        return self._ops[key]
+
+    def single_parts(self, control: Any, packet: bool) -> tuple:
+        """The single-request draft op before registration: ``(body,
+        in_specs, out_specs, donated operands, export key)``. Operands: the
+        weights (``names``), the pools, the verify's aux hidden states and
+        logits, the previous vector, the ids, the control state and the
+        verify's decisions; outputs: the vector, the pools, the emitted
+        tokens, the next ids and the control state, then with ``packet`` the
+        next verify's packed operand. (KernelConfig.draft_with_verify runs
+        the body inside the verify's op: ``DecodeOps._build_verify_draft``.)"""
         dspark, rows, names = self.dspark, self.dspark.ROWS, self.names
         count, layers, pages = len(names), self.config.layers, control.pages
-        # KernelConfig.draft_verify_packet: the next verify's packed operand
-        # ([ids | plan row 0 | verify mode 1], DecodeOps.verify_packed) too.
-        packet = kernel_config.active().draft_verify_packet
         ids_size = 3 * rows + 1 + rows * pages
         epilogue = None
         if kernel_config.active().draft_fused_epilogue and self.attention_dp == 1:
@@ -544,25 +568,21 @@ class MlaDsparkDraft:
         out_specs = (P(),) + (P(AXIS),) * layers + (P(), P(), P())
         if packet:
             out_specs += (P(),)
-        self._ops[key] = register_op(
-            "pallas::k3_dspark_mla_draft_single",
-            self.mesh,
+        export_key = (
+            "dspark_mla_single",
+            control.key(),
+            names,
+            self.max_position,
+            dataclasses.astuple(self.config),
+            self.owner_table,
+        )
+        return (
             body if epilogue is None else fused_body,
             in_specs,
             out_specs,
-            donate_argnums=tuple(range(count, count + layers)),
-            export_key=repr(
-                (
-                    "dspark_mla_single",
-                    control.key(),
-                    names,
-                    self.max_position,
-                    dataclasses.astuple(self.config),
-                    self.owner_table,
-                )
-            ),
+            tuple(range(count, count + layers)),
+            export_key,
         )
-        return self._ops[key]
 
     @property
     def max_rows(self) -> int:
@@ -662,6 +682,21 @@ class MlaDsparkDraft:
             control_state,
             decisions,
         )
+        return self.finish_single(out)
+
+    def single_operands(self) -> tuple[torch.Tensor, ...]:
+        """KernelConfig.draft_with_verify: the single op's operands the
+        verify-and-draft op (``DecodeOps._build_verify_draft``) takes from
+        the draft: the weights not in ``target_weights``, then the pools."""
+        return (
+            *(self.weights[n] for n in self.names if n not in self.target_weights),
+            *self.pools,
+        )
+
+    def finish_single(self, out) -> tuple:
+        """The single op's outputs (``single_parts``) as :meth:`step_single`
+        returns them: ``(state, emitted, next ids, control state, *packet)``,
+        the pools adopted."""
         layers = self.config.layers
         vector, pools = out[0], out[1 : 1 + layers]
         emitted, following, control_state, *packet = out[1 + layers :]

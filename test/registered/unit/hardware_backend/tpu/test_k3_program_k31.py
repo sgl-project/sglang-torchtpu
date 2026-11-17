@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=4400, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5400, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -3813,6 +3813,533 @@ def _run_script(case, script):
         timeout=1800,
     )
     case.assertIn("OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:])
+
+
+class TestK31DraftWithVerify(CustomTestCase):
+    """``KernelConfig.draft_with_verify`` through the real op bodies on a
+    4-device CPU mesh, with stand-ins for the decoder and draft megakernels
+    that read every operand (each op deletes its donated operands).
+    ``KimiDecoder._speculate`` over chains of single-request steps (entering,
+    chained at verify mode 1 and 0, a table that grows, a second request,
+    the first one back from its parked state, a reset, sampled rows), with
+    Kimi-K3.1 index pools and window centres (``dsa_seeded_window``,
+    ``verify_fused_tail`` off and on) or without: at every step the one op
+    gives the emitted tokens, next ids, control, draft vector, KDA banks,
+    pools, centres and draft pools of the verify op then the draft op,
+    bitwise, alone after the enter and plan ops. ``KimiDecoder._warm_steps``
+    then serving steps: the precompiled step programs are those that run,
+    and serving runs the one op on warmed operand histories only."""
+
+    SCRIPT = """
+        import os
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import dataclasses, hashlib, sys, types
+        import numpy as np, ml_dtypes, jax, jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+
+        # KimiDecoder over chains of single-request steps, with the real op bodies (bridge stubbed: every op a jitted
+        # shard_map that deletes its donated operands) and stand-ins for the decoder and draft megakernels: the verify op then
+        # the draft op (draft_verify_packet off / on) against KernelConfig.draft_with_verify's one op, both draft epilogues,
+        # with Kimi-K3.1 index pools and window centres (dsa_seeded_window; verify_fused_tail off / on) or without them.
+        G, ROWS, PAGES, L, BLOCKS, SLOTS, V, H, IDX = 4, 8, 3, 5, 7, 5, 1024, 16, 2
+        mesh = Mesh(np.asarray(jax.devices()), ("tp",))
+        launched, source, kept, kinds = [], {}, [], {"host": "host"}
+        bridge = types.ModuleType("sglang_tpu.k3_programs.bridge")
+
+
+        def record(name, args, outputs):
+            # The launch with its operands' producers ("op:output", else "host"); its outputs recorded as the op's.
+            launched.append((name, tuple(source.get(id(a), "host") for a in args)))
+            for i, out in enumerate(outputs):
+                source[id(out)] = f"{name}:{i}"
+                kept.append(out)  # ids stay unique
+
+
+        def register_op(name, mesh_, body, ins, outs, donate_argnums=(), export_key=None):
+            assert export_key is not None, name
+            kinds[name] = "sharded"
+            f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=ins, out_specs=outs, check_vma=False),
+                        donate_argnums=tuple(donate_argnums))
+
+            def call(*args):
+                assert len(args) == len(ins), (name, len(args), len(ins))
+                outputs = f(*args)
+                record(name, args, outputs)
+                return outputs
+            call.specs, call.op_name, call.export_key = (ins, outs, tuple(donate_argnums)), name, export_key
+            return call
+
+
+        def register_global_op(name, mesh_, fn, ins, outs, donate_argnums=(), export_key=None):
+            kinds[name] = "global"
+            f = jax.jit(fn, donate_argnums=tuple(donate_argnums))
+
+            def call(*args):
+                outputs = f(*args)
+                record(name, args, outputs)
+                return outputs
+            call.op_name = name
+            return call
+
+
+        bridge.register_op, bridge.register_global_op = register_op, register_global_op
+        for name in ("hbm", "kernel_mesh", "materialize", "upload", "report_load_stats", "stream_to_device"):
+            setattr(bridge, name, lambda *a, **k: None)
+        sys.modules["sglang_tpu.k3_programs.bridge"] = bridge
+        from sglang_tpu.k3_programs.kimi_k3 import config as kconfig, decode, decode_ops, draft_mla
+        from sglang_tpu.k3_programs.kimi_k3.decode_ops import Control, DecodeOps
+        from sglang_tpu.k3_programs.kimi_k3.kernels import dsa_dcp, dspark, dspark_mla_kernel as kern, mla_dcp, paged
+
+        mla_dcp.GROUPS = (G, 8, 16, 32)
+        stock = pl.pallas_call
+        paged.pl.pallas_call = lambda *a, **k: stock(*a, **{"interpret": pltpu.InterpretParams(), **k})
+        for fn in (paged.commit_latent_rows, paged.commit_draft_rows):
+            fn.__kwdefaults__["group"] = G
+        draft_mla._settled = lambda state: state
+        base_config = kconfig.active()
+        VL = V // G
+
+
+        class Host:  # a host tensor the decoder builds: .to(device) gives the device array
+            def __init__(self, array):
+                self.array = array
+
+            def to(self, *args, **kwargs):
+                return self.array
+
+
+        decode.torch = types.SimpleNamespace(
+            int32=jnp.int32, float32=jnp.float32, Tensor=object, zeros=lambda shape, dtype=None: Host(jnp.zeros(shape, dtype)),
+            ones=lambda shape, dtype=None: Host(jnp.ones(shape, dtype)), from_numpy=lambda value: Host(jnp.asarray(value)),
+            tensor=lambda value, dtype=None: Host(jnp.asarray(value, dtype)),
+            full=lambda shape, value, dtype=None, device=None: jnp.full(shape, value, dtype))
+
+
+        def ints(x):  # an exact integer digest of an array (any order of summation)
+            x = jnp.asarray(x)
+            if x.dtype in (jnp.bfloat16, jnp.float8_e4m3fn):
+                x = jax.lax.bitcast_convert_type(x, jnp.int16 if x.dtype == jnp.bfloat16 else jnp.int8)
+            elif x.dtype == jnp.float32:
+                x = jax.lax.bitcast_convert_type(x, jnp.int32)
+            return jnp.sum((x.astype(jnp.int32) & 0xFFF) * 3 + 1) % 9973
+
+
+        def target_of(tokens, positions):  # the stand-in decoder's greedy token of a row
+            return (tokens * 5 + positions) % V
+
+
+        def owned_rows(tables, positions):  # each row's latent row on its owner (else past the pool)
+            rank = jax.lax.axis_index("tp")
+            row = jnp.arange(positions.shape[0], dtype=jnp.int32)
+            block = tables[row, jnp.minimum((positions // 16) // G, tables.shape[1] - 1)]
+            return jnp.where((positions // 16) % G == rank, block, G * BLOCKS), positions % 16
+
+
+        def decode_paged(weights, conv, recurrent, pool, tokens, positions, tables, slots, *, batch_size, dcp_pool_map,
+                         dcp_owner_table, dsa_pools, layers, state_row=None, dsa_centres=None, defer_kda_commit=False,
+                         defer_latent_commit=False, **options):
+            # Stand-in decoder: logits whose argmax is target_of (values carrying the input state, pools, centres and
+            # weights), aux rows (verifiers), per-row post-states (verifiers) or committed slots, each row's latent and index
+            # key committed on its owner (verify_fused_tail: left to commit_verify_tail), and the rows' next window centres
+            # scattered into their slots (paged.decode_paged's gather and scatter).
+            verify = state_row is not None
+            assert defer_kda_commit == verify and dsa_pools == len(pool) - 2, (defer_kda_commit, dsa_pools, len(pool))
+            assert (dsa_centres is not None) == (dsa_pools and kconfig.active().dsa_seeded_window)
+            assert defer_latent_commit == (verify and dsa_pools > 0 and kconfig.active().verify_fused_tail)
+            rows = options.get("sequence_rows", 1)
+            state = ints(conv[slots[0]]) + ints(recurrent[slots[0]]) + (7 * state_row if verify else 0)
+            if dsa_centres is not None:
+                state = state + 13 * ints(dsa_dcp.gather_centres(dsa_centres, slots, rows))
+            # Replicated results (aux) agree on every rank, as the decoder's: the per-rank digests summed.
+            mix = jax.lax.psum((state + ints(pool[0]) + 3 * ints(pool[1]) + 5 * ints(weights["w0"])
+                                + 7 * ints(weights["lm_head"]) + 11 * ints(weights["embedding"])
+                                + sum((17 + j) * ints(p) for j, p in enumerate(pool[2:]))) % 251, "tp") % 251
+            vocab = jax.lax.axis_index("tp") * VL + jnp.arange(VL, dtype=jnp.int32)
+            t = target_of(tokens, positions)
+            logits = -jnp.abs(vocab[None, :] - t[:, None]).astype(jnp.float32) + ((vocab[None, :] * 7 + mix) % 3).astype(
+                jnp.float32) * 0.125
+            row = jnp.arange(batch_size, dtype=jnp.int32)
+            new_conv = conv[slots] + ((tokens + row)[:, None, None] % 5).astype(conv.dtype)
+            new_recurrent = recurrent[slots] + ((positions * 3 + mix)[:, None, None] % 7).astype(recurrent.dtype)
+            if not verify:
+                new_conv, new_recurrent = conv.at[slots].set(new_conv), recurrent.at[slots].set(new_recurrent)
+            latents = (tokens + mix).astype(pool[0].dtype)[:, None]
+            keys = (tokens * 3 + positions + mix).astype(pool[0].dtype)[:, None]
+            pool, pending = list(pool), None
+            if defer_latent_commit:
+                pending = (latents, keys, tables, positions)
+            else:
+                first, offset = owned_rows(tables, positions)
+                pool[0] = pool[0].at[first, offset].set(latents, mode="drop")
+                if dsa_pools:
+                    pool[2] = pool[2].at[first, offset].set(keys, mode="drop")
+            extra = ()
+            if dsa_centres is not None:
+                new = (tokens[None, :] * 7 + positions[None, :] + mix + 31 * jnp.arange(dsa_pools)[:, None]) % 100003
+                extra = (dsa_dcp.scatter_centres(dsa_centres, slots, rows, new.reshape(-1).astype(jnp.int32)),)
+            if defer_latent_commit:
+                extra += (pending,)
+            if verify:
+                aux = ((tokens[None, :, None] + positions[None, :, None] * 3 + mix + jnp.arange(3)[:, None, None] * 11
+                        + jnp.arange(H)[None, None, :]) % 64).astype(jnp.bfloat16)
+                assert options["aux_hidden_layers"] == (1, 2, 3)
+                return logits, aux, new_conv, new_recurrent, tuple(pool), *extra
+            return logits, new_conv, new_recurrent, tuple(pool), *extra
+
+
+        def commit_verify_tail(conv, recurrent, new_conv, new_recurrent, targets, sources, latent_pools, index_pools, latents,
+                               keys, tables, positions, pool_map, owner_table=None):
+            # Stand-in for the fused tail: the accepted KDA rows (paged._commit_kda_states), the latents and index keys.
+            conv, recurrent = paged._commit_kda_states(conv, recurrent, new_conv, new_recurrent, targets, source_rows=sources)
+            first, offset = owned_rows(tables, positions)
+            latent_pools, index_pools = list(latent_pools), list(index_pools)
+            latent_pools[0] = latent_pools[0].at[first, offset].set(latents, mode="drop")
+            index_pools[0] = index_pools[0].at[first, offset].set(keys, mode="drop")
+            return conv, recurrent, *latent_pools, *index_pools
+
+
+        def fused_draft_local(config, *, requests, pages, owner_table, single):
+            # Stand-in draft kernel: the forced decisions' count and bonus, drafts that follow the decoder's greedy
+            # tokens where a digest of every operand says so, and latents from the aux rows.
+            def fused(weights, pools, aux, logits, previous, *rest):
+                if len(rest) == 2:  # draft_fused_epilogue: the packed ids and the decisions
+                    ids, decisions = rest
+                    base, count, bonus = ids[ROWS], decisions[0, 0], decisions[0, 1]
+                else:
+                    bases, counts, bonuses, _ = rest
+                    base, count, bonus = bases[0], counts[0], bonuses[0]
+                digest = (ints(aux) + 3 * ints(logits) + 5 * ints(previous)
+                          + sum((7 + j) * ints(p) for j, p in enumerate(pools))
+                          + sum((11 + j) * ints(weights[n]) for j, n in enumerate(sorted(weights)))) % 9973
+                digest = jax.lax.psum(digest, "tp") % 9973  # the vector is replicated, as the kernel's
+                start = base + count + 1
+                drafts, token = [], bonus
+                for k in range(ROWS - 1):
+                    follow = (digest + 13 * k + start) % 5 != 0
+                    token = jnp.where(follow, target_of(token, start + k), (token * 3 + digest + k) % V)
+                    drafts.append(token)
+                vector = jnp.full((1, 128), -1, jnp.int32)
+                vector = vector.at[0, dspark.OUT_DRAFTS : dspark.OUT_DRAFTS + ROWS - 1].set(jnp.stack(drafts))
+                vector = vector.at[0, dspark.OUT_COUNT].set(count).at[0, dspark.OUT_BONUS].set(bonus)
+                vector = vector.at[0, dspark.OUT_TARGETS].set(digest)
+                latents = ((aux[0][None, :, :1].astype(jnp.float32) + digest % 17 + jnp.arange(L)[:, None, None])
+                           * jnp.ones((L, ROWS, 640))) % 32
+                return vector, latents.astype(jnp.bfloat16)
+            return fused
+
+
+        @dataclasses.dataclass(frozen=True)
+        class DraftConfig:
+            layers: int = L
+            aux_layers: tuple = (1, 2, 3)
+            hidden: int = H
+            vocab: int = V
+
+
+        def build(knobs, rates, index=False):
+            # A decoder over the stand-ins; index: Kimi-K3.1 index pools (with window centres under dsa_seeded_window).
+            config = dataclasses.replace(base_config, fused_cache_commit=False, **knobs)
+            kconfig.active = paged._config = kern._config = lambda: config
+            rng = np.random.default_rng(7)
+            ops = object.__new__(DecodeOps)
+            ops.mesh, ops.rank, ops.attention_dp, ops.batch_sizes, ops.num_slots = mesh, 0, 1, (1, 2), SLOTS
+            ops.names = ("embedding", "lm_head", "w0")
+            ops.weights = {
+                "embedding": jnp.asarray(rng.standard_normal((G, VL, H)), jnp.bfloat16),
+                "lm_head": jnp.asarray(rng.standard_normal((G, H, VL)), jnp.bfloat16),
+                "w0": jnp.asarray(rng.standard_normal((G, 4, 4)), jnp.bfloat16),
+            }
+            ops.slots = [jnp.asarray(rng.integers(0, 4, (G, SLOTS, 2, 8)), jnp.bfloat16),
+                         jnp.asarray(rng.integers(0, 4, (G, SLOTS, 3, 8)), jnp.float32)]
+            pools = 2 + (IDX if index else 0)
+            ops.unified_pools = [jnp.asarray(rng.integers(0, 9, (G * BLOCKS, 16, 1)), jnp.float32) for _ in range(pools)]
+            ops.dsa_pools = IDX if index else 0
+            ops.dsa_centres = None
+            if index and config.dsa_seeded_window:  # the same array on every rank (DecodeOps.use_unified_pools' layout)
+                ops.dsa_centres = jnp.tile(jnp.asarray(rng.integers(-99, 99, (1, SLOTS, IDX, ROWS)), jnp.int32), (G, 1, 1, 1))
+            ops.pool_map, ops.owner_table, ops._ops, ops._shared = (0, 1), None, {}, {}
+            ops.paged = types.SimpleNamespace(decode_paged=decode_paged, _commit_kda_states=paged._commit_kda_states,
+                                              commit_verify_tail=commit_verify_tail)
+            ops._run = lambda op, rows, *args: op(*args)
+
+            def adopt(conv, recurrent, pools):  # DecodeOps._adopt, the pools a list (no torch storage swap)
+                pools = list(pools)
+                if ops.dsa_centres is not None:
+                    *pools, ops.dsa_centres = pools
+                assert len(pools) == len(ops.unified_pools)
+                ops.slots, ops.unified_pools = [conv, recurrent], pools
+            ops._adopt = adopt
+            d = object.__new__(draft_mla.MlaDsparkDraft)
+            stub = types.SimpleNamespace(**{n: getattr(kern, n) for n in (
+                "WEIGHT_NAMES", "LEADING_NAMES", "SingleEpilogue", "single_epilogue", "copy_words")})
+            stub.fused_draft_local = fused_draft_local
+            d.dspark, d.kernel, d.paged, d.config, d.mesh = dspark, stub, paged, DraftConfig(), mesh
+            d.attention_dp, d.max_position, d.owner_table, d._ops = 1, 1 << 20, None, {}
+            d.synthetic_rates, d.synthetic_rates_by_width, d._aux_layers = rates, None, (1, 2, 3)
+            d.names = tuple(kern.WEIGHT_NAMES)
+            d.weights = {n: jnp.asarray(rng.standard_normal((G, L, 1, 4) if n in kern.LEADING_NAMES else (G, 2, 4)),
+                                        jnp.bfloat16) for n in d.names}
+            d.weights["lm_head"], d.weights["embed"] = ops.weights["lm_head"], ops.weights["embedding"]
+            d.pools = [(jnp.asarray(rng.integers(0, 256, (G * BLOCKS, 128, 4, 640), dtype=np.uint8) & 0x7E)
+                        .view(jnp.float8_e4m3fn)) for _ in range(L)]
+
+            def draft_adopt(pools):
+                d.pools = list(pools)
+            d._adopt = draft_adopt
+            d.new_state = lambda anchor: draft_mla.MlaDraftState(
+                d._new_state_op()(jnp.asarray(anchor, jnp.int32).reshape(1))[0])
+            k = object.__new__(decode.KimiDecoder)
+            k.ops, k.draft, k.layout, k.sub_base = ops, d, Control(SLOTS, 2, PAGES), SLOTS
+            k.control = jnp.asarray(rng.integers(0, 50, k.layout.size), jnp.int32)
+            k.device_plan = k.spec_req = k.draft_state = k.next_ids = k.next_packet = None
+            k._drafts, k._fresh, k._offered, k._group, k.tracked = {}, {}, {}, {}, set()
+            k.slot_map = types.SimpleNamespace(release=lambda finished: None)
+            k._zero = jnp.zeros(1, jnp.int32)
+            k._modes = {0: jnp.zeros(1, jnp.int32), 1: jnp.ones(1, jnp.int32)}
+            k.stats = dict.fromkeys(("plans", "enters", "chained", "packets", "plain", "batched", "predrafts"), 0)
+            return k
+
+
+        def digest(arrays):  # the arrays' dtypes, shapes and bytes, hashed
+            return tuple((str(a.dtype), a.shape, hashlib.sha256(np.asarray(a).tobytes()).hexdigest())
+                         for a in map(np.asarray, arrays))
+
+
+        def same(a, b):
+            a, b = np.asarray(a), np.asarray(b)
+            if a.dtype != b.dtype or a.shape != b.shape:
+                return False
+            if a.dtype.itemsize == 1:
+                return np.array_equal(a.view(np.uint8), b.view(np.uint8))
+            return np.array_equal(a.view(f"u{a.dtype.itemsize}"), b.view(f"u{b.dtype.itemsize}"))
+
+
+        PART = os.environ.get("PART", "chain")
+        if PART == "chain":
+            # (request, reset, scheduled, table, sampling): entering, chained (mode 1 / fewer rows: mode 0), a table that
+            # grew (the operand rebuilt), another request, the first one back (its parked state), a reset, sampled rows.
+            GREEDY, SAMPLED = (0.0, 1.0, 0, 0), (0.7, 0.9, 20, 3)
+            CHAIN = [("a", True, 8, [1, 2], GREEDY)] + [("a", False, 8, [1, 2], GREEDY)] * 3 + [
+                ("a", False, 5, [1, 2], GREEDY), ("a", False, 8, [1, 2], GREEDY), ("a", False, 8, [1, 2, 3], GREEDY),
+                ("a", False, 8, [1, 2, 3], GREEDY), ("b", True, 8, [4, 5, 6], GREEDY), ("b", False, 8, [4, 5, 6], GREEDY),
+                ("a", False, 8, [1, 2, 3], GREEDY), ("a", False, 8, [1, 2, 3], GREEDY), ("a", True, 8, [3, 1, 2], GREEDY),
+                ("a", False, 8, [3, 1, 2], SAMPLED), ("a", False, 8, [3, 1, 2], SAMPLED), ("a", False, 8, [3, 1, 2], GREEDY),
+            ]
+
+
+            def run(knobs, rates, index):
+                source.clear(), kept.clear()  # (one run's outputs held at a time)
+                k = build(knobs, rates, index)
+                slot_of, position = {"a": 1, "b": 3}, {"a": 100, "b": 1500}
+                trace = []
+                for req, reset, scheduled, table, sampling in CHAIN:
+                    launched.clear()
+                    request = types.SimpleNamespace(req_id=req, scheduled=scheduled)
+                    entry = (slot_of[req], reset, 11 + len(trace), position[req], sampling)
+                    emitted = k._speculate(request, [entry], [np.asarray(table, np.int32)], sampling[0] > 0)
+                    accepted = int(np.sum(np.asarray(emitted) >= 0))
+                    position[req] += accepted
+                    for value in (emitted, k.next_ids, k.control, k.draft_state.vector):  # replicated on every rank
+                        shards = [np.asarray(s.data) for s in value.addressable_shards]
+                        assert len(shards) == G and all(np.array_equal(shards[0], s) for s in shards), (len(trace), shards)
+                    centres = k.ops.dsa_centres
+                    if centres is not None:  # the same array on every rank
+                        assert all(np.array_equal(np.asarray(centres)[0], c) for c in np.asarray(centres)), len(trace)
+                    trace.append(dict(
+                        emitted=np.asarray(emitted), ids=np.asarray(k.next_ids), control=np.asarray(k.control),
+                        vector=np.asarray(k.draft_state.vector), slots=digest(k.ops.slots), pools=digest(k.ops.unified_pools),
+                        centres=None if centres is None else digest([centres]), draft_pools=digest(k.draft.pools),
+                        ops=tuple(name for name, _ in launched)))
+                return trace, k
+
+
+            # (rates, draft_fused_epilogue, index pools, decoder knobs)
+            SEEDED, TAIL = dict(dsa_seeded_window=True), dict(dsa_seeded_window=True, verify_fused_tail=True)
+            RATES = (0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3)
+            COMBOS = [(None, False, False, {}), (None, True, False, {}), (RATES, False, False, {}), (RATES, True, False, {}),
+                      (None, True, True, SEEDED), (RATES, False, True, TAIL), (None, True, True, TAIL),
+                      (RATES, True, True, dict(TAIL, draft_epilogue_unroll=8)), (None, False, True, {})]
+            ARMS = (("separate", {}), ("packet", dict(draft_verify_packet=True)), ("one", dict(draft_with_verify=True)),
+                    ("one+packet", dict(draft_with_verify=True, draft_verify_packet=True)))
+            for combo in os.environ.get("COMBOS", "0,1,2,3,4,5,6,7,8").split(","):
+                rates, epilogue, index, extra = COMBOS[int(combo)]
+                arms = {}
+                for name, knobs in ARMS:
+                    if name not in os.environ.get("ARMS", "separate,packet,one,one+packet").split(","):
+                        continue
+                    arms[name] = run(dict(knobs, draft_fused_epilogue=epilogue, **extra), rates, index)
+                    print("ran", rates is not None, epilogue, index, extra, name, flush=True)
+                reference, _ = arms["separate"]
+                counts = [int(np.sum(np.asarray(s["emitted"]) >= 0)) - 1 for s in reference]
+                assert len(set(counts)) >= 3, counts  # accepted counts vary along the chain
+                for name, (trace, k) in arms.items():
+                    for i, (want, got) in enumerate(zip(reference, trace, strict=True)):
+                        for field in ("emitted", "ids", "control", "vector"):
+                            assert same(want[field], got[field]), (rates, epilogue, index, name, i, field)
+                        for field in ("slots", "pools", "centres", "draft_pools"):
+                            assert want[field] == got[field], (rates, epilogue, index, name, i, field)
+                    programs = [s["ops"] for s in trace]
+                    if name.startswith("one"):
+                        # One step program: the verify-and-draft op (after the splice / enter ops when they run).
+                        assert all(p[-1] == "pallas::k3_decode_verify8_draft" for p in programs), programs
+                        assert all("pallas::k3_decode_verify8" not in p and "pallas::k3_dspark_mla_draft_single" not in p
+                                   and "pallas::k3_verify_metadata_1" not in p for p in programs), programs
+                        assert k.stats["packets"] == 0, k.stats
+                    else:
+                        assert all(p[-2:] == ("pallas::k3_decode_verify8", "pallas::k3_dspark_mla_draft_single")
+                                   for p in programs), programs
+                    print(rates is not None, epilogue, index, extra, name, "steps", len(trace), "counts", counts, "stats",
+                          k.stats, "programs", sum(len(p) for p in programs), flush=True)
+                # The pools, states and centres moved along the chain (the comparison is not vacuous).
+                for field in ("slots", "pools", "draft_pools") + (("centres",) if reference[0]["centres"] else ()):
+                    assert len({s[field] for s in reference}) > len(CHAIN) // 2, field
+                assert (reference[0]["centres"] is not None) == bool(index and extra.get("dsa_seeded_window")), extra
+
+            # The one op's compilation call (KimiDecoder._warm_steps'; PART=warm checks which programs compile): operands as
+            # the op takes them (the window centres after the pools), the verify's compiler options, the KDA banks, pools,
+            # centres and draft pools donated (the separate verify's the same); it is the op verify_and_draft runs.
+            for index in (False, True):
+                k = build(dict(draft_with_verify=True, draft_fused_epilogue=True, **(SEEDED if index else {})), None, index)
+                (call,) = [c for c in k.ops.compilation_calls(k.layout, k.sub_base, (1, 2, 3), True, (), None, draft=k.draft)
+                           if c.op.op_name == "pallas::k3_decode_verify8_draft"]
+                ins, outs, donated = call.op.specs
+                first, persistent = len(k.ops.names), 2 + len(k.ops.unified_pools) + len(k.ops.centre_operands())
+                first_pool = first + persistent + len(k.draft.names) - len(k.draft.target_weights)
+                assert persistent == 4 + (IDX + 1 if index else 0) and call.options == DecodeOps._compiler_options(8)
+                assert call.op is k.ops._build_verify_draft(k.draft, (1, 2, 3), k.layout, None), call.op
+                assert len(call.operands) == len(ins), (len(call.operands), len(ins))
+                assert call.operands[first + persistent - 1] is (k.ops.dsa_centres if index else k.ops.unified_pools[-1])
+                assert all(call.operands[first_pool + j] is p for j, p in enumerate(k.draft.pools))
+                assert [tuple(t.shape) for t in call.operands[-4:]] == [
+                    (1, 128), (3 * ROWS + 1 + ROWS * PAGES,), (k.layout.size,), (1,)], call.operands[-4:]
+                assert donated == tuple(range(first, first + persistent)) + tuple(range(first_pool, first_pool + L)), donated
+                assert len(outs) == persistent + 1 + L + 3 and ("'centres'" in call.op.export_key) == index
+                assert k.ops._build_verify((1, 2, 3), k.layout, None).specs[2] == donated[:persistent]
+            print("OK")
+        if PART == "warm":
+            # KimiDecoder._warm_steps (one request, seven drafts; first-step drafts off / on) with the knob off and on, then a
+            # serving chain: the precompiled programs, the programs the warm-up runs and every launch's operand history (each
+            # operand's producing op output, else the host; torch_tpu compiles an op per operand history) against serving's.
+            from sglang_tpu.k3_programs import compilation
+            compiled = []
+            compilation.compile_ops = compiled.extend
+            export_cache = types.ModuleType("sglang_tpu.k3_programs.export_cache")
+            export_cache.prepare_distributed = lambda calls: None
+            sys.modules["sglang_tpu.k3_programs.export_cache"] = export_cache
+            sync = types.ModuleType("torch_tpu._internal.sync")
+            sync.synchronize = lambda *a, **k: None
+            sys.modules["torch_tpu._internal.sync"] = sync
+
+            decode.VOCAB = decode_ops.VOCAB = 32 * VL  # grammar masks over the stand-in vocabulary (32 shards' words)
+            TAIL = dict(dsa_seeded_window=True, verify_fused_tail=True)
+            ONE, SINGLE, DRAFT = ("pallas::k3_decode_verify8_draft", "pallas::k3_decode_verify8",
+                                  "pallas::k3_dspark_mla_draft_single")
+            prefill_aux = register_op(  # stands in for the prefill's first-step aux export (another op's output)
+                "pallas::k3_prefill_first_aux", mesh,
+                lambda x: (((x[0] + jnp.arange(3 * ROWS * H).reshape(3, ROWS, H)) % 64).astype(jnp.bfloat16),),
+                (P(),), (P(),), export_key="first_aux")
+
+            def warmed(knobs, first_aux):
+                compiled.clear(), launched.clear(), source.clear(), kept.clear()
+                k = build(dict(knobs, draft_fused_epilogue=True, **TAIL), None, index=True)
+                k.layout = k.control = k._zero = None
+                k._modes, k._mode_rows, k._pages, k._ring, k._compiled_layout, k.rank = {}, {}, PAGES, False, None, 1
+                k.spec_alone, k.spec_batches, k.spec_shapes, k.groups = True, (), (), 1
+                k.first_aux = {} if first_aux else None
+                k._predraft_logits = jnp.zeros((G, ROWS, VL), jnp.float32)  # (the decoder's, with the mesh's leading axis)
+                k._warm_steps()
+                k._warm_steps()  # warmup() runs the steps twice (around a KDA import)
+                return k, list(launched), [c.op.op_name for c in compiled]
+
+            def serve(k):
+                # Serving after the warm-up: new requests (first-step drafts when on), chained steps (mode 1 / mode 0),
+                # a table that grows, a second request, the first back from its parked state, a reset, sampled rows.
+                launched.clear()
+                slot_of, position, token = {"a": 1, "b": 3}, {"a": 100, "b": 1500}, 11
+                greedy, sampled = (0.0, 1.0, 0, 0), (0.7, 0.9, 20, 3)
+                chain = [("a", True, 8, [1, 2], greedy), ("a", False, 8, [1, 2], greedy), ("a", False, 5, [1, 2], greedy),
+                         ("a", False, 8, [1, 2, 3], greedy), ("a", False, 8, [1, 2, 3], greedy),
+                         ("b", True, 8, [4, 5, 6], greedy), ("b", False, 8, [4, 5, 6], sampled),
+                         ("a", False, 8, [1, 2, 3], greedy), ("a", False, 8, [1, 2, 3], greedy),
+                         ("a", True, 8, [3, 1, 2], greedy), ("a", False, 8, [3, 1, 2], greedy)]
+                for req, reset, scheduled, table, sampling in chain:
+                    if reset and k.first_aux is not None:
+                        k.first_aux[req] = prefill_aux(jnp.full((1,), token, jnp.int32))[0]
+                    request = types.SimpleNamespace(req_id=req, scheduled=scheduled, computed=position[req],
+                                                    num_prompt_tokens=position[req], token_ids=np.arange(position[req]) % V)
+                    entry = (slot_of[req], reset, token, position[req], sampling)
+                    emitted = np.asarray(k._speculate(request, [entry], [np.asarray(table, np.int32)], sampling[0] > 0))
+                    position[req] += int(np.sum(emitted >= 0))
+                    token = int(emitted[0, np.sum(emitted >= 0) - 1])
+                return list(launched)
+
+            CONFIGS = {"separate": ({}, False), "one": (dict(draft_with_verify=True), False), "separate+first": ({}, True),
+                       "one+first": (dict(draft_with_verify=True, draft_verify_packet=True), True)}
+            for name in os.environ.get("WARM", "separate,one,separate+first,one+first").split(","):
+                knobs, first = CONFIGS[name]
+                k, warm, precompiled = warmed(knobs, first)
+                served = serve(k)
+                assert (k.stats["predrafts"] >= 2) == first, k.stats
+                # Histories: each operand's producing op output (strict) or producer kind (the host, a global or a sharded
+                # op; hardware recompiled on these: KimiDecoder._warm_steps' control from the splice or the draft op).
+                report, kind = {}, lambda h: tuple(kinds[x.rsplit(":", 1)[0]] for x in h)
+                for op in (ONE, SINGLE, DRAFT):
+                    warm_h, serve_h = {h for n, h in warm if n == op}, {h for n, h in served if n == op}
+                    if warm_h or serve_h:
+                        report[op] = dict(precompiled=precompiled.count(op), warm_launches=sum(n == op for n, _ in warm),
+                                          serve_launches=sum(n == op for n, _ in served), warm_histories=len(warm_h),
+                                          serve_histories=len(serve_h), unwarmed=len(serve_h - warm_h),
+                                          warm_kinds=len(set(map(kind, warm_h))),
+                                          unwarmed_kinds=len(set(map(kind, serve_h)) - set(map(kind, warm_h))))
+                print(name, "precompiled", len(precompiled), "warm launches", len(warm), "served", len(served), k.stats)
+                for op, row in report.items():
+                    print("   ", op, row, flush=True)
+                # The step programs precompiled are those the warm-up or serving runs, once each.
+                assert all(row["precompiled"] == 1 for row in report.values()), (name, report)
+                assert set(precompiled) & {ONE, SINGLE, DRAFT} == set(report), (name, precompiled)
+                # Serving runs the step programs on warmed operand histories (producer kinds) only.
+                assert all(row["unwarmed_kinds"] == 0 for row in report.values()), (name, report)
+                if name.startswith("one"):
+                    # The one op runs on histories (producing ops) the warm-up ran it on; no separate verify runs; the
+                    # single draft op runs alone for first-step drafts only.
+                    assert report[ONE]["unwarmed"] == 0 and SINGLE not in report and (DRAFT in report) == first, report
+                    assert not first or report[DRAFT]["serve_launches"] == k.stats["predrafts"], (report, k.stats)
+                    assert k.stats["packets"] == 0, k.stats  # the one op packs its own operand
+                else:
+                    assert ONE not in report, report
+            print("OK")
+    """
+
+    def _run(self, **env_vars):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), **env_vars)
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=2400,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
+
+    def test_one_op_matches_the_verify_then_the_draft(self):
+        self._run(PART="chain", COMBOS="2,6", ARMS="separate,one,one+packet")
+
+    def test_warm_up_compiles_what_serving_runs(self):
+        self._run(PART="warm", WARM="one,one+first")
 
 
 class TestB16OneHotStaging(CustomTestCase):
