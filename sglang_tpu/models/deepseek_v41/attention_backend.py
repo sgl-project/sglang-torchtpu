@@ -37,6 +37,7 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.compilation.compiled_forward_shim import _REAL_B_KEY
 
 # The pool owns the page layout the kernels read; the backend only indexes it.
@@ -364,6 +365,9 @@ def build_forward_metadata(
 # =============================================================================
 
 
+_MAX_BLOCK_ROWS = 64
+
+
 def _check_supported(config) -> None:
     from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 
@@ -374,10 +378,19 @@ def _check_supported(config) -> None:
                 f"DeepSeek-V4.1 TPU attention needs {name} == 1 "
                 "(attention TP1 per DP rank)"
             )
-    algorithm = get_spec().speculative_algorithm
-    if algorithm is not None and str(algorithm).upper() != "DSPARK":
+    spec = get_spec()
+    algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    if not (algorithm.is_none() or algorithm.is_dspark()):
         raise NotImplementedError(
             f"DeepSeek-V4.1 TPU attention serves DSPARK speculation only, not {algorithm}"
+        )
+    # CSA2 serves non-causal requests of at most 64 queries; the draft block and
+    # the verify window are gamma + 1 rows.
+    rows = spec.speculative_num_draft_tokens
+    if algorithm.is_dspark() and rows is not None and rows > _MAX_BLOCK_ROWS:
+        raise ValueError(
+            f"DSpark verify of {rows} rows exceeds "
+            f"the {_MAX_BLOCK_ROWS} non-causal CSA2 queries"
         )
     features = get_exec().features
     if (

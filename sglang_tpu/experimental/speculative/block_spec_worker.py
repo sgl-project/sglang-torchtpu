@@ -26,7 +26,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
 )
-from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -41,7 +40,6 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
-from sglang_tpu.experimental import registered_block_draft_workers
 from sglang_tpu.experimental.speculative.base_spec_worker import (
     TpuSpecWorker,
 )
@@ -86,14 +84,15 @@ _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
 }
 
 
-def _create_draft_worker(
-    *, algorithm: SpeculativeAlgorithm, target_runner: ModelRunner
-) -> TpuBlockDraftWorker:
-    """A drafter from sglang_tpu.experimental.register_block_draft_worker, else the built-in one."""
-    for matches, factory in registered_block_draft_workers(algorithm):
-        if matches(target_runner):
-            return factory(target_runner)
-    return _DRAFT_WORKER_CLS[algorithm](target_runner)
+def committed_verify_ids(
+    bonus_tokens: torch.Tensor, accept_tokens: torch.Tensor
+) -> torch.Tensor:
+    """[pbs, N + 2] tokens whose first accept_lens columns are the committed verify rows.
+
+    The verify window is [r, d_1..d_N]; the committed prefix is r and the correct
+    drafts, which accept_tokens holds first (then the new bonus, -1 padded).
+    """
+    return torch.cat([bonus_tokens.view(-1, 1), accept_tokens.clamp_min(0)], dim=1)
 
 
 class TpuBlockSpecWorker(TpuSpecWorker):
@@ -112,9 +111,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             )
         target_runner = target_worker.model_runner
         self._spec_algorithm = target_runner.spec_algorithm
-        draft_worker = _create_draft_worker(
-            algorithm=self._spec_algorithm, target_runner=target_runner
-        )
+        draft_worker = _DRAFT_WORKER_CLS[self._spec_algorithm](target_runner)
         super().__init__(target_worker, draft_worker, draft_worker.num_drafts)
         # prepare_for_decode gathers the verify window and KV reserve at this width.
         if get_spec().speculative_num_draft_tokens != self.num_verify_rows:
@@ -260,7 +257,17 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 cache_loc_2d=rows.cache_locs,
                 commit_lens=accept.accept_lens,
             )
-        self._block_draft_worker.after_commit(state=state, accept=accept)
+        # As core DSparkWorkerV2: a verify forward commits nothing to the target's
+        # per-request Engram history.
+        ngram = self.target_worker.model_runner.ngram_embedding_manager
+        if ngram.engram_hasher is not None:
+            ngram.update_after_verify(
+                verify_ids_2d=committed_verify_ids(
+                    state.bonus_tokens, accept.accept_tokens
+                ),
+                req_pool_indices=state.req_pool_indices,
+                commit_lens=accept.accept_lens,
+            )
         # Verify rows past the new seq_lens become dead target KV; freeing them is the allocator's job.
         next_state = SpecState(
             bonus_tokens=accept.bonus_tokens,

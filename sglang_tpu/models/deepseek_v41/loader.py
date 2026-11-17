@@ -32,8 +32,8 @@ _DSPARK_DRAFT_ARCH = "DeepseekV4ForCausalLMDSpark"
 
 def is_bundled_dspark_draft(model_config) -> bool:
     """The DSpark head bundled in a V4-family checkpoint (core remaps its arch)."""
-    return bool(
-        getattr(model_config, "is_draft_model", False)
+    return (
+        model_config.is_draft_model
         and _DSPARK_DRAFT_ARCH in model_config.hf_config.architectures
     )
 
@@ -121,7 +121,7 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
 def _draft_ep_local_names(names: set[str], *, config) -> tuple[set[str], int]:
     """Drop the draft's routed experts outside this EP rank's range.
 
-    The draft MoE shards over the target's EP group (TpuDsv41DsparkDraftWorker),
+    The draft MoE shards over the target's EP group (TpuDsparkDraftWorker),
     so a rank keeps experts [rank * E / ep, (rank + 1) * E / ep), as the target's
     EP-local read (sglang_tpu.ep_weight_shard) does; vllm-torchtpu filters its
     draft the same way.

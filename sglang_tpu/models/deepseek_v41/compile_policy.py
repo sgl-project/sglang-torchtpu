@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TPU compile policy of ``DeepseekV4ForCausalLM`` (attached in
+"""TPU compile policy of ``DeepseekV4ForCausalLM`` and its bundled DSpark draft
+``DeepseekV4ForCausalLMDSpark`` (attached in
 ``sglang_tpu.compilation.core_compile_annotations``).
 
 After the batch is padded to its bucket and before attention planning, it
@@ -42,6 +43,7 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_forward_context
+from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.compilation.compiled_forward_shim import CompiledForwardShim
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
@@ -281,7 +283,6 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if image_token_id is not None and 0 <= image_token_id < config.vocab_size
             else config.engram_pad_token_id
         )
-        embed_tokens = model.get_input_embeddings()
         with torch.no_grad():
             ids = forward_batch.input_ids
             safe_ids = torch.where(
@@ -289,7 +290,7 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 fallback_id,
                 ids,
             )
-            forward_batch.input_embeds = embed_tokens(safe_ids)
+            forward_batch.input_embeds = self._embed(safe_ids)
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         super().prepare_forward_batch(forward_batch)
@@ -297,6 +298,15 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         # host Engram staging so the TPU gather overlaps with overlap-token
         # resolution and NumPy row packing.
         self._embed_outside_graph(forward_batch)
+
+    def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        model = self.model_runner.model
+        if isinstance(model, DeepseekV4ForCausalLMDSpark):
+            # As forward_embed: the draft's stages read hc_mult copies per token.
+            return (
+                model.embed_tokens(input_ids).unsqueeze(1).repeat(1, model.hc_mult, 1)
+            )
+        return model.get_input_embeddings()(input_ids)
 
     def _direct_compile(self, fn):
         if self.is_v41:

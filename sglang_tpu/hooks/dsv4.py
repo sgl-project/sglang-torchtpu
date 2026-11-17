@@ -333,7 +333,7 @@ def _tpu_deepseek_v4_env_adjustments(server_args: Any, previous) -> None:
     envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.set(False)
     envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.set(True)
     # The TPU DSpark drafter samples from full-vocab draft logits
-    # (deepseek_v41/dspark.py draft_base_logits); the TP-sharded Markov path
+    # (deepseek_v41/dspark.py tpu_compute_base_logits); the TP-sharded Markov path
     # expects vocab-local logits and gathers them over NCCL/NVLink.
     envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.set(False)
 

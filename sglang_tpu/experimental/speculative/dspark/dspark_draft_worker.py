@@ -3,8 +3,9 @@
 draft: z_j = l_j + bias(d_{j-1}, h_j), d_0 = r, d_j ~ softmax(z_j / T), so
        q_j = softmax(z_j / T), with l_j = lm_head(h_j) the base logits.
 
-Serves the dense DSparkDraftModel; sglang_tpu/models/deepseek_v41/dspark_drafter.py
-subclasses it for the MoE DeepseekV4ForCausalLMDSpark.
+As core DSparkWorkerV2, one drafter serves the dense DSparkDraftModel and the
+DeepSeek-V4 MoE DeepseekV4ForCausalLMDSpark; the MoE draft keeps the target's
+placement (draft_is_deepseek_v4).
 
 Not ported yet: the confidence verify budget (num_verify_drafts is always
 gamma).
@@ -12,14 +13,19 @@ gamma).
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
 from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    draft_is_deepseek_v4,
     resolve_runtime_config,
 )
 from sglang_tpu.experimental.speculative.block_draft_worker import (
@@ -35,7 +41,10 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
     def __init__(self, target_runner: ModelRunner) -> None:
         super().__init__(target_runner)
         draft_model = self.model_runner.model
-        self._check_draft_model(draft_model)
+        if not isinstance(draft_model, (DSparkDraftModel, DeepseekV4ForCausalLMDSpark)):
+            raise TypeError(
+                f"TpuDsparkDraftWorker needs a DSpark draft, got {type(draft_model)}."
+            )
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.model_runner.model_config.hf_config,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
@@ -53,36 +62,16 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
         )
         self.mask_token_id = runtime_config.mask_token_id
         self._dspark_model = draft_model
-        self._attach_target_vocab(target_runner)
-
-    def _check_draft_model(self, draft_model: nn.Module) -> None:
-        if not isinstance(draft_model, DSparkDraftModel):
-            raise TypeError(
-                f"TpuDsparkDraftWorker needs a dense DSparkDraftModel, got {type(draft_model)}."
-            )
-
-    def _attach_target_vocab(self, target_runner: ModelRunner) -> None:
-        """Share the target embedding and lm_head with the draft, as DSparkWorkerV2."""
-        draft_model = self._dspark_model
-        target_model = target_runner.model
-        # HF configs carry this key only for muP targets; the draft trained on
-        # the folded head, so its compute_base_logits divides.
-        draft_model.logits_mup_width_multiplier = (
-            target_runner.model_config.hf_text_config.to_dict().get(
-                "logits_mup_width_multiplier"
-            )
+        _attach_target_vocab(
+            draft_model=draft_model,
+            target_model=cast(nn.Module, target_runner.model),
+            target_hf_text_config=target_runner.model_config.hf_text_config,
         )
-        lm_head = unwrap_lora_layer(target_model.lm_head)
-        embedding = target_input_embedding(target_model)
-        if embedding is None:
-            draft_model.lm_head = lm_head
-            return
-        draft_model.attach_shared_modules(embed_tokens=embedding, lm_head=lm_head)
 
-    def _base_logits(self, draft_hidden: torch.Tensor) -> torch.Tensor:
-        """[rows, vocab] base logits l_j of the [rows, H] draft hidden."""
-        base_logits, _ = self._dspark_model.compute_base_logits(draft_hidden)
-        return base_logits
+    def _draft_owns_attention(self) -> bool:
+        # As core DSparkWorkerV2: the MoE draft's stages gather over DP and run
+        # the target's EP MoE, so it keeps the target placement.
+        return super()._draft_owns_attention() and not draft_is_deepseek_v4()
 
     def sample_drafts(
         self,
@@ -101,7 +90,7 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
             block_hidden if draft_model.sample_from_anchor else block_hidden[:, 1:]
         )
         with torch.no_grad():
-            base_logits = self._base_logits(
+            base_logits, _ = draft_model.compute_base_logits(
                 draft_hidden.reshape(bs * self.num_drafts, -1)
             )
         draft_tokens, draft_logits = draft_model.markov_head.sample_block(
@@ -112,3 +101,22 @@ class TpuDsparkDraftWorker(TpuBlockDraftWorker):
             collect_corrected=True,
         )
         return SampledDrafts(draft_tokens, draft_logits, None)
+
+
+def _attach_target_vocab(
+    *,
+    draft_model: DSparkDraftModel | DeepseekV4ForCausalLMDSpark,
+    target_model: nn.Module,
+    target_hf_text_config: PretrainedConfig,
+) -> None:
+    """Share the target embedding and lm_head with the draft, as DSparkWorkerV2."""
+    # HF configs carry this key only for muP targets; the draft trained on the folded head.
+    draft_model.logits_mup_width_multiplier = target_hf_text_config.to_dict().get(
+        "logits_mup_width_multiplier"
+    )
+    lm_head = unwrap_lora_layer(target_model.lm_head)
+    embedding = target_input_embedding(target_model)
+    if embedding is None:
+        draft_model.lm_head = lm_head
+        return
+    draft_model.attach_shared_modules(embed_tokens=embedding, lm_head=lm_head)

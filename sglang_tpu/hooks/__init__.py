@@ -108,7 +108,6 @@ from sglang_tpu.hooks.twolevel_allreduce import (
 )
 from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
 from sglang_tpu.models.deepseek_v41.hooks import hook_specs as dsv41_hooks
-from sglang_tpu.models.deepseek_v41.hooks import register_tpu_dsv41_draft_workers
 
 logger = logging.getLogger(__name__)
 
@@ -490,7 +489,6 @@ def register() -> None:
 
     register_muse_spark_processor()
     register_tpu_dsv4_resolution_hooks()
-    register_tpu_dsv41_draft_workers()
     register_unified_hicache_strategy()
 
     from sglang.srt.plugins.hook_registry import HookRegistry
