@@ -6,7 +6,10 @@ TP/attention-DP/EP16). It does not produce an offline quantized checkpoint.
 
 The startup settings are `SGLANG_PLATFORM=tpu`,
 `--tpu-fp8-runtime channelwise`, `--weight-loader-disable-mmap`, and
-`--tpu-compile-tracer direct`. `sglang_tpu.glm` registers exact GLM DSA classes
+`--tpu-compile-tracer direct`. The recipe also enables
+`SGLANG_TPU_ENABLE_EXPERT_HOST_STAGING=1` to reuse the existing host assembly
+and chunked expert upload path outside PP. This flag defaults off elsewhere.
+`sglang_tpu.glm` registers exact GLM DSA classes
 with the existing EP-local reader. Shared experts, EPLB and incompatible expert
 layouts retain the reader's fallback checks. The current attention-DP worker
 replicates its draft at EP1, so NEXTN correctly reads all experts.
@@ -28,7 +31,7 @@ and records imported paths and compiler settings. Falcon manifests must pin the
 source SHA and provide the model and wheel mounts. Do not set the source to an
 unpinned moving branch for a reported run.
 
-## Validated run: 2026-11-17
+## Initial validated run (without host staging): 2026-11-17
 
 - Main base: `e1c3e4369b5928de0ea4a073a152c375ec9a112b`.
 - Tested source: `d7605d6d315c74b9abbf786b5d5efdc6e3a9299b`.
@@ -81,3 +84,35 @@ falcon workflow analysis cat an-5ebgn4k01d summary.json --output json
 falcon workflow analysis cat an-5ebgn4k01d rank-1-startup.txt --output json
 falcon workflow analysis cat an-5ebgn4k01d rank-1-serving-compile.txt --output json
 ```
+
+## Host-staging follow-up: 2026-11-17
+
+- Tested source: `310b2eca55dcd043f83a785ccb730752d3909752`.
+- Experiment: `exp-lhz0s984yj`, artifact `art-0nqi25r7ym`, **SUCCEEDED**.
+- Application attempt 1; same block checkpoint, topology, NEXTN and serving recipe.
+- `SGLANG_TPU_ENABLE_EXPERT_HOST_STAGING=1` enables the existing PP staging
+  mechanism for TP/EP too, assembling expert slices on CPU before chunked uploads.
+  The production default remains off; this adds no GLM cases to shared loading.
+- Both hosts passed 12 staging tests, including the non-PP activation/flush test.
+- The 16-DP smoke summary reports PASS.
+
+| Phase | Observed time |
+| --- | --- |
+| Target model load, including conversion | 69.74–82.24 s across 16 ranks |
+| NEXTN model load, including conversion | 20.84–22.70 s across 16 ranks |
+| Global compile and warmup | 304.55–304.56 s wall time |
+| Launcher first timestamped runtime log to ready | Approximately 8 min 26 s |
+
+The last interval is 13:09:33–13:17:59 UTC and excludes environment installation
+and checkpoint pre-reading, as above. NEXTN loading is about 200 seconds shorter
+than the previous run; target loading did not improve. These are successive
+iteration results, not a controlled A/B. No quantization math or expert mapping
+was changed. The direct-compile and SPMD settings are unchanged.
+
+Result extraction is tracked by `an-dtjygnuy2w`; its final serving metrics are
+not yet available at the time of this update. The experiment runner only exits
+successfully after the serving client and both host results pass.
+
+Remaining work is draft asynchronous compilation (including deferred KV/DSA
+output ownership) and GLM target SPMD graph/layout verification. The current
+recipe does not enable either unvalidated change.
