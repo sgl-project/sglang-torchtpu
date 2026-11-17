@@ -1,37 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ring-mode prefill-context-parallel (PCP) op of the TPU batched RPA backend.
 
-Under ``SGLANG_TPU_PCP_MODE=ring`` the KV cache of a sequence is split across
-the ranks of the context-parallel group by page, exactly as under decode
-context parallelism: rank ``r`` stores global page ``l * P + r`` and every rank
-reads the same page table. A zigzag prefill then runs one fused kernel per
-layer on every rank:
+Used only under ``SGLANG_TPU_PCP_MODE=ring``
 
-* cache phase: each rank attends its own queries against the whole cached
-  prefix by rotating the KV blocks of the stripes around the ring (remote DMA
-  from rank to rank), so no rank ever holds more than its stripe;
-* new-token phase: the same queries continue the online softmax over the
-  chunk's own K/V, which the caller all-gathered across the group
-  (``cp_forward.all_gather_and_write_kv``) and the kernel reads by page through
-  ``new_kv_page_indices``.
+KV layout: each sequence's KV cache is split across the context-parallel ranks
+page by page, as in decode context parallelism. With ``P`` ranks, rank ``r``
+stores pages ``r, r + P, r + 2P, ...`` (its "stripe"), and all ranks share one
+page table.
 
-Because the ring uses remote DMA, the op is a mesh kernel: it is exported as a
-``jax.shard_map`` over the whole world with partition specs, every rank passes
-its own shard, and all ranks must launch it in the same order with the same
-static shapes. With attention TP 1 the mesh is one axis over the world; with
-attention TP ``t > 1`` it is ``(cp, t)`` in torch-rank order (rank
-``cp_rank * t + tp_rank``) and the ring runs along the ``cp`` axis, so the
-``t`` rings of one host (one per attention-TP head shard) run side by side. Everything rank-dependent (``cp_rank``, ``q_positions``) is a
-traced tensor, so all ranks trace one program.
+Prefill: every layer runs one fused kernel on every rank, in two phases.
 
-The op reads the KV pool and never writes it: XLA copies every operand that a
-kernel containing a remote DMA aliases (see ``muse_megakernel/kernel.py`` and
-``glm_flash_megakernel/kernel/decode.py``), which for a KV pool would be a
-whole-pool copy per layer. The caller writes the new pages this rank owns with
-the local in-place row writer instead (``cp_forward.all_gather_and_write_kv``).
+1. Cached prefix: the stripes are passed around the ring (remote DMA between
+   ranks), so each rank's queries see the whole prefix while each rank only
+   ever stores its own stripe.
+2. New tokens: the same queries then attend the chunk's own K/V, which the
+   caller has all-gathered across the group
+   (``cp_forward.all_gather_and_write_kv``).
 
-``attention_pallas_rpa_base`` drives the op; gather-mode PCP never calls in
-here. The host-side row layout is ``cp_layout.RingLayout``.
+Read-only KV pool: the op never writes the pool. XLA copies any input that a
+remote-DMA kernel writes in place, which for the pool would mean copying all of
+it every layer. Instead, the caller writes this rank's new pages beforehand
+with a local in-place write (``cp_forward.all_gather_and_write_kv``).
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
@@ -69,56 +58,55 @@ __all__ = [
 
 @dataclass
 class PcpRingMetadata:
-    """Operands of the fused ring kernel for one ring-mode context-parallel
-    extend (``cp_layout.RingLayout`` on the device, plus the page tables), in
-    the op's order.
+    """Device inputs of the ring kernel for one extend batch, in the op's
+    argument order: ``cp_layout.RingLayout`` uploaded, plus the page tables.
 
-    Lengths and positions are global token counts. Everything but
-    ``q_positions`` and ``cp_rank`` has the same value on every rank.
+    Lengths and positions count tokens of the whole (unsplit) sequence. Only
+    ``q_positions`` and ``cp_rank`` differ between ranks.
     """
 
-    # Cache (ring) phase rows, one per request.
+    # Phase 1, cached prefix: one row per request.
     # i32[pad_b]  cached prefix + the row's query length
     cache_kv_lens: torch.Tensor
-    # i32[pad_b * pages_per_seq]  striped page table of each row's request
+    # i32[pad_b * pages_per_seq]  page table of the row's request
     cache_page_indices: torch.Tensor
-    # i32[pad_b + 1]
+    # i32[pad_b + 1]  cumulative query lengths
     cache_cu_q_lens: torch.Tensor
-    # i32[3]
+    # i32[3]  RPA row distribution
     cache_distribution: torch.Tensor
-    # New-token phase rows (two per request).
+    # Phase 2, new tokens: two rows per request (one per owned block).
     # i32[2 * pad_b]  prefix + extend length of the row's request
     new_kv_lens: torch.Tensor
-    # i32[2 * pad_b * pages_per_seq]
+    # i32[2 * pad_b * pages_per_seq]  page table of the row's request
     new_page_indices: torch.Tensor
-    # i32[2 * pad_b + 1]
+    # i32[2 * pad_b + 1]  cumulative query lengths
     new_cu_q_lens: torch.Tensor
-    # i32[3]
+    # i32[3]  RPA row distribution
     new_distribution: torch.Tensor
-    # i32[2 * pad_b * gathered_pages]  page of the rank-major gathered K/V
-    # buffer holding each page of the row's chunk
+    # i32[2 * pad_b * gathered_pages]  where each page of the request's new
+    # tokens sits in the all-gathered K/V buffer
     new_kv_page_indices: torch.Tensor
-    # i32[2 * pad_b]  global position of each row's first query
+    # i32[2 * pad_b]  position of the row's first query in its sequence
     q_positions: torch.Tensor
-    # i32[2 * pad_b]  cached prefix of the row's request
+    # i32[2 * pad_b]  cached prefix length of the row's request
     kv_cache_lens: torch.Tensor
     # i32[1]  this rank's index in the context-parallel group
     cp_rank: torch.Tensor
 
 
 def dcp_stripe_group(parallel, *, pcp_ring: bool):
-    """``(stripe rank, stripe group, head blocks)`` of the page-striped KV cache.
+    """Which ranks share one sequence's page-striped KV cache.
 
-    Plain DCP stripes over SGLang's DCP group (consecutive ranks inside the
-    TP group). Ring-mode prefill CP stripes over the attention-CP group
-    instead: with attention TP ``t`` that is ranks ``r, r + t, ...``, which
-    share one attention-TP head shard and differ only in tokens, so the
-    attention-CP rank owns the stripe and decode merges over that group.
+    Returns ``(this rank's stripe index, the group, head blocks)``.
 
-    ``head blocks`` is the number of distinct query-head blocks the group's
-    ranks hold: 1 when every rank holds the same heads (attention TP 1, or ring
-    mode at any attention TP), the group size when each rank holds its own
-    attention-TP shard (plain DCP at attention TP > 1).
+    * Plain DCP uses SGLang's DCP group: consecutive ranks in the TP group.
+    * Ring mode uses the attention-CP group instead. With attention TP ``t``
+      that is ranks ``r, r + t, r + 2t, ...``: they hold the same heads and
+      differ only in which tokens they store.
+
+    ``head blocks`` is how many different query-head blocks the group's ranks
+    hold: 1 if they all hold the same heads (attention TP 1, or ring mode),
+    else the group size (plain DCP at attention TP > 1).
     """
     if parallel.attn_dcp_size <= 1:
         return 0, None, 1
@@ -129,30 +117,30 @@ def dcp_stripe_group(parallel, *, pcp_ring: bool):
 
 
 def init_pcp_ring_op(backend, device: str):
-    """Register the fused ring op for ``backend`` (``None`` off TPU).
-    ``--dcp-size == --attn-cp-size`` is enforced by server-args validation."""
+    """Build the ring op for ``backend``, or return None off TPU.
+
+    Fails for hybrid sliding-window KV pools, which the kernel does not support.
+    """
     parallel = get_parallel()
     if backend._is_hybrid_swa:
         raise NotImplementedError(
             "Ring-mode prefill context parallelism does not support hybrid "
             "sliding-window KV pools."
         )
-    if device != "tpu":
-        return None
-    return build_pcp_ring_op(
-        backend.kernel_spec, parallel.attn_cp_size, attn_tp_size=parallel.attn_tp_size
-    )
+    return build_pcp_ring_op(parallel.attn_cp_size, attn_tp_size=parallel.attn_tp_size)
 
 
 def build_pcp_ring_metadata(backend, forward_batch, host):
-    """``PallasForwardMetadata`` of a ring-mode context-parallel extend.
+    """Attention metadata for one ring-mode extend batch.
 
-    The KV cache is page-striped (rank ``r`` holds global page
-    ``l * cp + r``), so the page table is read at the logical page stride
-    ``page_size * cp`` and is identical on every rank, exactly as under
-    DCP; all lengths handed to the kernel are global. Built on the host and
-    uploaded once. ``cp_write_segments`` holds only the runs of the pages this
-    rank owns, and the plain fields describe the new-token rows.
+    Built on the host and uploaded once per batch. As under DCP, the page table
+    is read in logical pages of ``page_size * cp`` tokens, so it is the same on
+    every rank, and every length passed to the kernel counts the whole
+    sequence.
+
+    The ring kernel's inputs go in ``cp_ring``; the plain RPA fields describe
+    the new-token rows; ``cp_write_segments`` lists only the rows whose pages
+    this rank stores.
     """
     from sglang_tpu.attention_pallas_rpa_base import (
         _SCOPED_SMEM_BYTES,
@@ -255,18 +243,19 @@ def build_pcp_ring_metadata(backend, forward_batch, host):
 
 
 def _ring_write_runs(host, req_to_token, req_pool_indices, *, page_size, stride, rank):
-    """Write runs of the rank-major all-gathered rows ``rank`` owns, as slots
-    of its page stripe, and their i32[1] count.
+    """Which all-gathered K/V rows this rank writes into its pool, and where.
 
-    The allocator hands out locations in a space widened by the group size
-    (as under DCP): a logical page spans ``page_size * cp`` locations and
-    maps to one physical page id on every rank, whose rank-``r`` copy holds
-    the ``r``-th ``page_size`` run. So location ``loc`` belongs to rank
-    ``(loc % stride) // page_size`` and lands in that rank's pool at row
-    ``(loc // stride) * page_size + loc % page_size``. Rows of every other
-    rank's pages, padding rows and the reserved page 0 (warmup batches)
-    are left out. Which rows are written is data, not program structure:
-    the table has the same shape on every rank.
+    Returns write runs (``kv_write_segments``) and their count as i32[1].
+
+    As under DCP, the allocator's locations are widened by the group size: a
+    logical page is ``stride = page_size * cp`` locations, and rank ``r``
+    stores its ``r``-th ``page_size`` slice. So location ``loc`` belongs to
+    rank ``(loc % stride) // page_size`` and goes to row
+    ``(loc // stride) * page_size + loc % page_size`` of that rank's pool.
+
+    Skipped: rows of other ranks' pages, padding rows, and the reserved page 0
+    (used by warmup batches). The table has the same shape on every rank; only
+    its contents differ.
     """
     gathered_req = torch.from_numpy(host.gathered_req)
     gathered_pos = torch.from_numpy(host.gathered_pos)
@@ -326,15 +315,13 @@ def forward_pcp_ring(
     k_scale,
     v_scale,
 ) -> torch.Tensor:
-    """One layer of a ring-mode context-parallel extend, ``[T, H, D]``.
+    """Attention for one layer of a ring-mode extend; returns ``[T, H, D]``.
 
-    ``q`` is this rank's zigzag rows. ``k_all``/``v_all`` are the chunk's K/V
-    from ``all_gather_and_write_kv`` (rank-major, quantized for an fp8 pool),
-    which also wrote the new pages this rank owns into its stripe before this
-    call: the kernel reads cached positions only, and writing after a read of
-    the same buffer made XLA copy the whole per-layer pool. The fused kernel
-    attends the striped cached prefix around the ring and then the gathered
-    chunk; it only reads the pool.
+    ``q`` holds this rank's zigzag rows. ``k_all`` / ``v_all`` are the chunk's
+    K/V gathered from all ranks by ``all_gather_and_write_kv`` (quantized for an
+    fp8 pool). That call has already written this rank's new pages into the
+    pool; writing them here, after the kernel reads the pool, made XLA copy the
+    whole pool each layer.
     """
     check_pcp_ring_layer(
         layer,
@@ -350,22 +337,16 @@ def forward_pcp_ring(
     return op(q, k_all, v_all, kv_cache, *operands, sm_scale, k_scale, v_scale)
 
 
-# torch custom-op name. Distinct from the plain batched op and the DCP op so
-# all three can be registered in one process and are keyed separately by the
-# FX-graph compile cache; bump the suffix when the kernel source changes.
-PCP_RING_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_batched_pcp_ring_v1"
+PCP_RING_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_batched_pcp_ring"
 
-# Mesh axis the ring runs along with attention TP 1. The mesh is then
-# one-dimensional over the whole world, in torch-rank order
-# (``torch_tpu.get_pallas_mesh``).
+# Attention TP 1: a 1-D mesh over all ranks, and the ring runs along it.
 PCP_RING_AXIS = "model"
-# With attention TP > 1 the mesh is ``(PCP_RING_CP_AXIS, PCP_RING_AXIS)`` of
-# shape ``(cp, attn_tp)``; the ring runs along the first axis.
+# Attention TP > 1: a ``(cp, attn_tp)`` mesh with axes ``("pcp", "model")``;
+# the ring runs along ``"pcp"``.
 PCP_RING_CP_AXIS = "pcp"
 
-# Tensor operands of the op, in order. Every one is passed per rank and
-# partitioned along its first dimension, so nothing relies on two ranks holding
-# equal values.
+# Tensor arguments of the op, in order. Each rank passes its own copy, split
+# along the first dimension, so no rank relies on another holding equal values.
 _TENSOR_ARGS = (
     "queries",
     "keys",
@@ -373,19 +354,21 @@ _TENSOR_ARGS = (
     "kv_cache_fused",
     *(field.name for field in fields(PcpRingMetadata)),
 )
-# Static (non-traced) arguments after the tensors; they select the generated
-# kernel, so they key the export.
+# Plain Python arguments after the tensors. They change the generated kernel,
+# so each distinct value gets its own export.
 _STATIC_ARGS = ("sm_scale", "k_scale", "v_scale")
 
-# torch custom ops are process-global; cache the registration per
-# (CP size, attention TP size) so repeated backend construction reuses it.
+# Torch custom ops are process-global, so register once per
+# (CP size, attention TP size) and reuse it across backend instances.
 _OP_CACHE: dict = {}
 
 
 def pcp_kv_layout():
-    """The KV layout as the experimental ``batched_rpa_pcp`` kernel's own enum
-    (the production package's ``attention_pallas_rpa_batched.kv_layout`` returns
-    the production enum). Read at trace / check time."""
+    """The KV layout, as the ring kernel package's own enum.
+
+    Same answer as ``attention_pallas_rpa_batched.kv_layout``, but that one
+    returns the production package's enum type.
+    """
     from sglang_tpu.attention.pallas.batched_rpa_pcp import configs
     from sglang_tpu.attention_pallas_rpa_batched import uses_seq_along_lane_kv
 
@@ -395,20 +378,19 @@ def pcp_kv_layout():
 
 
 def pcp_ring_mesh_axes(attn_tp_size: int = 1) -> tuple[str, ...]:
-    """Mesh axis names, ring axis first: ``("model",)`` with attention TP 1,
-    else ``("pcp", "model")`` for a ``(cp, attn_tp)`` mesh."""
+    """Mesh axis names, ring axis first: ``("model",)`` at attention TP 1,
+    else ``("pcp", "model")``."""
     if attn_tp_size == 1:
         return (PCP_RING_AXIS,)
     return (PCP_RING_CP_AXIS, PCP_RING_AXIS)
 
 
 def pcp_ring_partition_specs(attn_tp_size: int = 1):
-    """``(input specs, output specs)`` of the exported mesh function.
+    """``(input specs, output specs)`` for the exported function.
 
-    Inputs: one spec per positional argument of the wrapped function (the
-    static ones included; they carry no array). Output: the attention output.
-    Every tensor is split along its first dimension over all mesh axes, in
-    torch-rank order, so each rank's shard is exactly what it passed.
+    Every tensor is split along its first dimension over all mesh axes, so
+    each rank's shard is exactly the tensor it passed. The static arguments
+    get an empty spec.
     """
     from jax.sharding import PartitionSpec as P
 
@@ -419,7 +401,7 @@ def pcp_ring_partition_specs(attn_tp_size: int = 1):
     return in_specs, out_specs
 
 
-# Static shapes whose block sizes were already logged (trace time, per process).
+# Shapes whose block sizes have been logged already (once per process).
 _LOGGED_BLOCK_SIZES: set = set()
 
 
@@ -437,9 +419,10 @@ def _log_block_sizes_once(
     k_scale,
     v_scale,
 ):
-    """Log, once per static shape, the block sizes the fused kernel resolves
-    (``pcp_fused_configs`` is what the kernel itself calls). Runs at trace time;
-    never fails the trace."""
+    """Log the kernel's block sizes once per shape, for debugging.
+
+    Runs at trace time and never raises.
+    """
     try:
         key = (
             tuple(queries.shape),
@@ -525,12 +508,11 @@ def _invoke_pcp_kernel(
     k_scale,
     v_scale,
 ):
-    """Call the fused kernel for one rank (inside ``shard_map``).
+    """Run the ring kernel on one rank's inputs (called inside ``shard_map``).
 
-    Returns this rank's attention output. The pool is read-only
-    (``update_kv_cache=False``): the kernel neither aliases nor returns it.
-    One program covers batches with and without a cached prefix (a request
-    without one gets no ring steps).
+    Returns this rank's attention output and leaves the pool untouched. The
+    same compiled program handles requests with and without a cached prefix;
+    one without a prefix just skips the ring.
     """
     _log_block_sizes_once(
         cp_size=cp_size,
@@ -570,38 +552,27 @@ def _invoke_pcp_kernel(
         v_scale=v_scale,
         kv_layout=pcp_kv_layout(),
         update_kv_cache=False,
-        # Ring-mode cached prefixes are whole stripes: the allocator page and
-        # the prefill chunk boundaries are page_size * cp tokens (checked on
-        # the host by `check_pcp_ring_schedule`).
+        # Cached prefixes are whole logical pages (page_size * cp tokens),
+        # since that is how the allocator and chunking cut them. Checked on
+        # the host by `check_pcp_ring_schedule`.
         cache_lens_cp_page_aligned=True,
     )
 
 
-def build_pcp_ring_op(
-    spec, cp_size: int, *, attn_tp_size: int = 1, mesh=None, kernel=None
-):
-    """Register the fused ring kernel as a torch custom op for ``cp_size`` ranks
-    per ring and ``attn_tp_size`` rings (one per attention-TP head shard).
+def build_pcp_ring_op(cp_size: int, *, attn_tp_size: int = 1, mesh=None, kernel=None):
+    """Wrap the ring kernel as a torch custom op.
 
-    Must be called from the backend constructor, never inside a traced region
-    (the registration inspects signatures, which dynamo cannot trace), and
-    after ``torch.distributed`` is initialized (the mesh is built from the
-    process group).
+    There are ``attn_tp_size`` rings (one per attention-TP head shard) of
+    ``cp_size`` ranks each. The op takes this rank's inputs, returns this
+    rank's attention output, and modifies nothing.
 
-    The op takes this rank's operands and returns this rank's attention
-    output; it mutates nothing (the KV pool is a read-only operand).
+    Call it from the backend constructor: registration can't run inside
+    ``torch.compile`` (dynamo cannot trace the signature inspection), and the
+    mesh needs ``torch.distributed`` to be initialized.
 
-    ``mesh`` and ``kernel`` exist for tests: a prebuilt JAX mesh and a stand-in
-    for ``ragged_paged_attention_pcp_fused``.
+    ``mesh`` and ``kernel`` are for tests: a prebuilt mesh and a stand-in
+    kernel.
     """
-    from sglang_tpu.attention_pallas_rpa_batched import RPA_BATCHED_SPEC
-
-    if spec is not RPA_BATCHED_SPEC:
-        raise NotImplementedError(
-            f"{spec.op_name} is not the batched RPA kernel; ring-mode prefill "
-            "context parallelism on TPU requires --attention-backend "
-            "pallas_tpu_rpa_batched."
-        )
     cache_key = (cp_size, attn_tp_size)
     cached = _OP_CACHE.get(cache_key)
     if cached is not None:
@@ -686,15 +657,15 @@ def build_pcp_ring_op(
         range(len(_TENSOR_ARGS), len(_TENSOR_ARGS) + len(_STATIC_ARGS))
     )
     out_sharding = NamedSharding(mesh, out_specs[0])
-    # No donation and no aliasing: see the module docstring.
+
     jit_fn = jax.jit(
         _wrapped,
         static_argnums=static_argnums,
         keep_unused=True,
         out_shardings=out_sharding,
     )
-    # The qualified name is unique within the process and stable across ranks
-    # and restarts; the callable additionally fingerprints the exported MLIR.
+    # The name is unique in the process and the same on every rank and across
+    # restarts; the exported program is also fingerprinted.
     trace_key = pallas_impl._get_kernel_invocation_key(
         f"jax_{PCP_RING_OP_NAME}",
         [],
@@ -721,8 +692,8 @@ def build_pcp_ring_op(
 
 
 def _register_torch_op(jax_kernel):
-    """The torch custom op around ``jax_kernel`` (split out so CPU tests can
-    exercise the argument plumbing with a stand-in callable)."""
+    """Register ``jax_kernel`` as the torch custom op. Separate so tests can
+    pass a stand-in kernel."""
 
     @torch.library.custom_op(PCP_RING_OP_NAME, mutates_args=(), device_types=["tpu"])
     def custom_op(
@@ -774,20 +745,18 @@ def _register_torch_op(jax_kernel):
 
 
 def _fake_impl(queries: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-    # Shapes only, without tracing JAX: this is what lets the dynamic token
-    # dimension flow through torch.compile.
+    # Shape-only version for torch.compile: same shape as the queries, without
+    # tracing JAX.
     return torch.empty_like(queries)
 
 
 def check_pcp_ring_schedule(runner, backend, host):
-    """Check a ring-mode context-parallel extend against the fused kernel's
-    schedule buffers before any rank launches it.
+    """Check on the host that a ring-mode extend batch fits the kernel's
+    schedule buffers, before any rank launches it.
 
-    The fused kernel runs two schedules (the ring over the cached prefix and
-    the new-token phase) with block sizes only the kernel package knows, so the
-    step accounting lives there; this hands it the host lengths of the rows
-    this rank will run. Every rank passes the same cache-phase rows, so the
-    ranks accept or refuse a batch together.
+    Only the kernel package knows its block sizes, so this passes it the row
+    lengths and lets it do the counting. All ranks pass the same cache-phase
+    rows, so they accept or reject a batch together.
     """
     from sglang_tpu.attention.pallas.batched_rpa_pcp.wrapper import (
         check_pcp_fused_schedule,

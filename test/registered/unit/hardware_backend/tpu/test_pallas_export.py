@@ -671,5 +671,178 @@ class TestPallasExportEnvironment(CustomTestCase):
         )
 
 
+_PCP_RING_TENSOR_ARGS = (
+    "queries",
+    "keys",
+    "values",
+    "kv_cache_fused",
+    "cache_kv_lens",
+    "cache_page_indices",
+    "cache_cu_q_lens",
+    "cache_distribution",
+    "new_kv_lens",
+    "new_page_indices",
+    "new_cu_q_lens",
+    "new_distribution",
+    "new_kv_page_indices",
+    "q_positions",
+    "kv_cache_lens",
+    "cp_rank",
+)
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+    "requires JAX and TorchTPU",
+)
+class TestPcpRingOpExport(CustomTestCase):
+    """The ring-mode prefill-CP op (``attention_pallas_rpa_pcp``): the torch op,
+    the exported JAX function and the kernel agree only by position and by
+    partition spec, which no CPU test exercises otherwise."""
+
+    def test_kernel_gets_every_operand_by_its_contract_name(self):
+        from sglang_tpu import attention_pallas_rpa_pcp as pcp
+        from sglang_tpu.attention.pallas.batched_rpa_pcp import configs
+
+        self.assertEqual(pcp._TENSOR_ARGS, _PCP_RING_TENSOR_ARGS)
+        operands = {name: object() for name in _PCP_RING_TENSOR_ARGS}
+        calls = []
+
+        def kernel(*args, **kwargs):
+            calls.append((args, kwargs))
+
+        with patch.dict(os.environ, {"SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "0"}):
+            pcp._invoke_pcp_kernel(
+                kernel, cp_size=8, sm_scale=0.25, k_scale=0.5, v_scale=2.0, **operands
+            )
+        args, kwargs = calls[0]
+        self.assertEqual(
+            args, tuple(operands[name] for name in _PCP_RING_TENSOR_ARGS[:4])
+        )
+        for name in _PCP_RING_TENSOR_ARGS[4:]:
+            self.assertIs(kwargs.pop(name), operands[name], name)
+        self.assertEqual(
+            kwargs,
+            dict(
+                cp_group_size=8,
+                ring_axis_name="model",
+                ring_mesh_axis_names=("model",),
+                sm_scale=0.25,
+                k_scale=0.5,
+                v_scale=2.0,
+                kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+                # The pool is read-only: the caller writes the owned pages.
+                update_kv_cache=False,
+                # Cached prefixes are whole stripes in ring mode.
+                cache_lens_cp_page_aligned=True,
+            ),
+        )
+
+    def test_each_rank_passes_and_gets_its_own_shard(self):
+        """PCP4 on a 1-D mesh and PCP4 x attention TP 2 on a ``(pcp, model)``
+        mesh ringing along ``pcp``; nothing is donated or aliased (a remote-DMA
+        kernel would make XLA copy an aliased pool)."""
+        for attn_tp in (1, 2):
+            with self.subTest(attn_tp=attn_tp):
+                self._check_export(cp=4, attn_tp=attn_tp)
+
+    def _check_export(self, *, cp, attn_tp):
+        import jax
+        import torch
+
+        from sglang.test.cpu_test_utils import get_cpu_export_mesh
+        from sglang_tpu import attention_pallas_rpa_pcp as pcp
+        from sglang_tpu.pallas_jax_op import _jax_placeholders
+
+        tokens, q_heads, kv_heads, dim, page, pad_b, pages_per_seq = (
+            64, 8, 2, 128, 16, 2, 3
+        )  # fmt: skip
+        axes = pcp.pcp_ring_mesh_axes(attn_tp)
+        mesh = get_cpu_export_mesh(axes, (cp,) if attn_tp == 1 else (cp, attn_tp))
+        seen = {}
+
+        def kernel(queries, keys, values, kv_cache, **kwargs):
+            seen["shapes"] = dict(
+                queries=queries.shape,
+                keys=keys.shape,
+                values=values.shape,
+                kv_cache_fused=kv_cache.shape,
+            )
+            seen["shapes"].update(
+                (k, v.shape) for k, v in kwargs.items() if hasattr(v, "shape")
+            )
+            seen["ring_axis_name"] = kwargs["ring_axis_name"]
+            # Depends on the ring axis, as the real kernel's neighbour ids do.
+            rank = jax.lax.axis_index(axes[0]) + kwargs["cp_rank"][0]
+            return queries + rank.astype(queries.dtype)
+
+        captured = {}
+        with (
+            patch.object(pcp, "_OP_CACHE", {}),
+            patch.object(
+                pcp,
+                "_register_torch_op",
+                side_effect=lambda fn: captured.setdefault("fn", fn),
+            ),
+        ):
+            pcp.build_pcp_ring_op(cp, attn_tp_size=attn_tp, mesh=mesh, kernel=kernel)
+        jax_kernel = captured["fn"]
+
+        fp8 = torch.float8_e4m3fn
+
+        def tensor(*shape, dtype=torch.int32):
+            return torch.zeros(*shape, dtype=dtype)
+
+        local = dict(
+            queries=tensor(tokens, q_heads, dim, dtype=torch.bfloat16),
+            keys=tensor(cp * tokens, kv_heads, dim, dtype=fp8),
+            values=tensor(cp * tokens, kv_heads, dim, dtype=fp8),
+            kv_cache_fused=tensor(5, page, 1, 4, 128, dtype=fp8),
+            cache_kv_lens=tensor(pad_b),
+            cache_page_indices=tensor(pad_b * pages_per_seq),
+            cache_cu_q_lens=tensor(pad_b + 1),
+            cache_distribution=tensor(3),
+            new_kv_lens=tensor(2 * pad_b),
+            new_page_indices=tensor(2 * pad_b * pages_per_seq),
+            new_cu_q_lens=tensor(2 * pad_b + 1),
+            new_distribution=tensor(3),
+            new_kv_page_indices=tensor(2 * pad_b * cp * tokens // page),
+            q_positions=tensor(2 * pad_b),
+            kv_cache_lens=tensor(2 * pad_b),
+            cp_rank=tensor(1),
+        )
+        args = tuple(local[name] for name in _PCP_RING_TENSOR_ARGS) + (0.125, 0.5, 0.25)
+        in_specs, _ = pcp.pcp_ring_partition_specs(attn_tp)
+        placeholders = _jax_placeholders(args, mesh=mesh, partition_specs=in_specs)
+        with (
+            pallas_export.tpu_info_for_cpu_export(),
+            jax._src.config.export_ignore_forward_compatibility(True),
+        ):
+            lowered = jax_kernel.exported(*placeholders)
+
+        # Inside shard_map the kernel sees exactly the tensors each rank passed,
+        # and the ring runs along the CP axis.
+        for name in _PCP_RING_TENSOR_ARGS:
+            self.assertEqual(
+                tuple(seen["shapes"][name]), tuple(local[name].shape), name
+            )
+        self.assertEqual(seen["ring_axis_name"], axes[0])
+        # The exported program takes one shard per rank along dim 0 and returns
+        # this rank's attention rows only.
+        world = cp * attn_tp
+        for name, aval in zip(_PCP_RING_TENSOR_ARGS, lowered.in_avals):
+            shape = tuple(local[name].shape)
+            self.assertEqual(tuple(aval.shape), (world * shape[0], *shape[1:]), name)
+        self.assertEqual(
+            [tuple(aval.shape) for aval in lowered.out_avals],
+            [(world * tokens, q_heads, dim)],
+        )
+        self.assertEqual(list(jax_kernel.donate_argnums), [])
+        self.assertEqual(dict(jax_kernel.input_output_aliases), {})
+        mlir = lowered.mlir_module()
+        self.assertNotIn("jax.buffer_donor", mlir)
+        self.assertNotIn("tf.aliasing_output", mlir)
+
+
 if __name__ == "__main__":
     unittest.main()

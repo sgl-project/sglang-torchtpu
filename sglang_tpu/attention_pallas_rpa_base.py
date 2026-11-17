@@ -1790,15 +1790,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self, metadata: PallasForwardMetadata
     ) -> Callable[[_LayerAttention], torch.Tensor]:
         """The attention of this forward's layers: the fused ring kernel for a
-        ring-mode PCP extend, the striped kernels under DCP, else the plain
+        ring-mode PCP extend, the striped kernels under DCP, else the default
         kernel (gather-mode PCP included)."""
         if metadata.cp_ring is not None:
             return self._attend_pcp_ring
         if self._dcp > 1:
             return self._attend_dcp
-        return self._attend_plain
+        return self._attend_default
 
-    def _attend_plain(self, a: _LayerAttention) -> torch.Tensor:
+    def _attend_default(self, a: _LayerAttention) -> torch.Tensor:
         md = self.forward_metadata
         return self._op(
             a.q,
