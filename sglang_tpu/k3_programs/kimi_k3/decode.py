@@ -1036,7 +1036,13 @@ class KimiDecoder:
             # do not cover: start it first so that compile overlaps theirs.
             first = plain_step(self.ops.batch_sizes[0], False)
             synchronize(
-                [first, self.control, *self.ops.slots, *self.ops.unified_pools],
+                [
+                    first,
+                    self.control,
+                    *self.ops.slots,
+                    *self.ops.unified_pools,
+                    *self.ops.centre_operands(),
+                ],
                 wait=False,
             )
             calls = self.ops.compilation_calls(

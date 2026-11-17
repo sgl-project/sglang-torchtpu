@@ -129,6 +129,14 @@ class KernelConfig:
     # select every key at or above the threshold bin's lower bound -- a
     # superset of the top-k, ~2048 + the bin's other keys.
     dsa_select_rounds: int = 8
+    # Kimi-K3.1 decode selection, 5-round bin selection of up to 16 rows: the
+    # first count round takes 63 coarse thresholds (2^26 apart) and 64 fine
+    # ones (2^19 apart) centred on each row's threshold of the previous step
+    # (per MLA layer, row and request, carried between steps by the decode
+    # ops). When every row's top-k threshold lands in a fine bin one more
+    # round finishes (two count exchanges instead of three); otherwise two
+    # more rounds, as before. The same thresholds whatever the centres.
+    dsa_seeded_window: bool = False
     # Kimi-K3.1 decode attention (grouped FP8 verifies): a step whose rows
     # select at most this many of its tokens (their union) attends only them,
     # gathered into that many slots by a one-hot matmul; busier steps run
