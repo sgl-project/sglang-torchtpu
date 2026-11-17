@@ -28,14 +28,9 @@ calls every installed `activate()` and errors when two answer.
 
 ## Expert weight loading
 
-GLM DSA target and NEXTN models opt into EP-local routed-expert reads with
-`--weight-loader-disable-mmap` or Run:AI. Existing compatibility checks retain
-whole-shard loading when filtering is unsafe. A replicated EP1 draft still
-loads all its experts.
-
 Set `SGLANG_TPU_ENABLE_EXPERT_HOST_STAGING=1` to assemble expert slices on CPU
 before chunked TPU uploads outside pipeline parallelism. This uses additional
-host memory and can reduce replicated NEXTN loading time. It defaults off;
+host memory and can reduce loading time for replicated experts. It defaults off;
 pipeline-parallel loading continues to use host staging as before.
 
 ## Mode-B divergences (gates that take a different arm under OOT)
