@@ -138,6 +138,9 @@ def apply_ep(config, *, running, adaptive, simulate_acceptance, ep_arm):
         raise ValueError("MOE_MODE=ep: no adaptive verify width")
     args, env = config["server_args"], config["runtime_env"]
     args["ep_size"] = 8
+    # The replicated wo (64 MiB/layer/rank) eats the 0.95 headroom: the logits program
+    # failed to load 60 MB short at extend precompile.
+    args["mem_fraction_static"] = 0.93
     args["speculative_num_draft_tokens"] = EP_VERIFY
     for name in EP_DROPPED_ENV:
         env.pop(name, None)
