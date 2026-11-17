@@ -256,6 +256,7 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
             _prefill_op=None,
             # A model with rope: the op gets both caches.
             _zero_rope=False,
+            mla_shards=1,  # replicated latent cache: the unsharded path
             # _mla_kernel_args passes these through, so names stand in for them.
             forward_metadata=SimpleNamespace(
                 kv_lens="kv_lens",
