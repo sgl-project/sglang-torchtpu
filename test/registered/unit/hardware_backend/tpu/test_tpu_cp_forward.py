@@ -19,6 +19,7 @@ from sglang_tpu.attention_pallas_rpa_batched import (
 )
 from sglang_tpu.attention_pallas_rpa_pcp import (
     PcpRingMetadata,
+    build_pcp_ring_metadata,
     dcp_stripe_group,
     forward_pcp_ring,
 )
@@ -749,9 +750,8 @@ class TestRingMetadata(CustomTestCase):
             seq_lens=torch.zeros(RING_PAD_B, dtype=torch.int32),
             req_pool_indices_cpu=torch.tensor((pool_rows or self.POOL_ROWS) + [0]),
         )
-        layout = TpuCpBatchLayout(host=host, local_rows=torch.zeros(1).long())
         backend = self._backend(rank, req_to_token)
-        return host, backend._build_cp_metadata(batch, layout)
+        return host, build_pcp_ring_metadata(backend, batch, host)
 
     def test_page_tables_use_the_logical_stride_and_match_on_every_rank(self):
         req_to_token = self._req_to_token()

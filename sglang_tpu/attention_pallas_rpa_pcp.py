@@ -195,6 +195,7 @@ def build_pcp_ring_metadata(backend, forward_batch, host):
     assert req_pool_indices.shape[0] == host.pad_b
     req_pool_indices = req_pool_indices.to(torch.int64)
     req_to_token = backend.req_to_token_pool.req_to_token
+    assert req_to_token.device.type == "cpu"  # pinned at start-up for PCP
     page_cols = backend._host_page_columns(pages_per_seq, stride)
     per_seq = req_to_token[req_pool_indices[:, None], page_cols[None, :]]
     req_pages = (per_seq // stride).to(torch.int32)
