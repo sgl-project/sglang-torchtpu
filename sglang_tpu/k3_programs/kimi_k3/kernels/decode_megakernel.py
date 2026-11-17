@@ -1114,6 +1114,11 @@ def _stage_singleton_row(
         picked = jnp.sum(
             jnp.where(active_rows[:, None], bits, 0), axis=0, keepdims=True
         )
+        if destination.dtype == jnp.float32:
+            # FP32 staging (B8 compact tiles): the BF16 bits shifted up are
+            # that value's FP32 bits.
+            destination[...] = jax.lax.bitcast_convert_type(picked << 16, jnp.float32)
+            return
         destination[...] = jax.lax.bitcast_convert_type(
             picked.astype(jnp.int16), jnp.bfloat16
         ).astype(destination.dtype)
@@ -1240,6 +1245,13 @@ def _run_routed_expert_stream(
             **options,
         )
 
+    # The full-batch paths' gate/up rows (B8 compact pairs add a second tile).
+    full_gate_up = (
+        gate_up_accumulator.at[:batch_size]
+        if gate_up_accumulator.shape[0] > batch_size
+        else gate_up_accumulator
+    )
+
     if PHASE_SCOPES:
         # Profiling: time spent waiting for expert weights (e_wait).
         unscoped_copy_expert = copy_expert
@@ -1310,7 +1322,7 @@ def _run_routed_expert_stream(
         expert=None,
     ):
         gate_up = (
-            gate_up_accumulator[
+            full_gate_up[
                 :,
                 (
                     pl.ds(pl.multiple_of(column, 128), 2 * expert_width)
@@ -1322,11 +1334,11 @@ def _run_routed_expert_stream(
             .astype(jnp.float32)
         )
         middle = _gated_activation(gate_up[:, :expert_width], gate_up[:, expert_width:])
-        gate_up_accumulator[:, :expert_width] = middle.astype(jnp.float32)
+        full_gate_up[:, :expert_width] = middle.astype(jnp.float32)
         copies.down.wait()
         copies.down_scales.wait()
         expert_dot(
-            gate_up_accumulator.at[:, :expert_width],
+            full_gate_up.at[:, :expert_width],
             expert_down_vmem.at[slot],
             expert_down_scale_vmem.at[slot],
             down_accumulator,
@@ -1444,14 +1456,12 @@ def _run_routed_expert_stream(
 
     reuse_row_plan = stage_blocks and batch_size in (32, 48, 64, 80, 96, 128)
     # KernelConfig.b16_one_hot_staging: B16 stages compact rows with a one-hot
-    # product. It reads every source row, and 0 x inf is NaN, so the rows
-    # without local routes (null serving slots among them) are zeroed first;
-    # no expert stages them.
-    one_hot_rows = (
-        B16_ONE_HOT_STAGING
-        and stage_blocks
-        and batch_size == 16
-        and compact_capacity > 1
+    # product, and B8's compact tiles (KernelConfig.b8_compact_experts) always
+    # do. It reads every source row, and 0 x inf is NaN, so the rows without
+    # local routes (null serving slots among them) are zeroed first; no expert
+    # stages them.
+    one_hot_rows = compact_capacity > 1 and (
+        (B16_ONE_HOT_STAGING and stage_blocks and batch_size == 16) or batch_size == 8
     )
     if one_hot_rows:
         source[:, :expert_input_size] = jnp.where(
@@ -1653,6 +1663,29 @@ def _run_routed_expert_stream(
                 ].astype(jnp.float32)
 
             position = position + bit
+
+    def stage_compact_pair(first_rows, second_rows):
+        """B8: both experts' compact tiles from one one-hot [2C, 8] product
+        (tile rows C.. hold the second expert's)."""
+        tile_row = jax.lax.broadcasted_iota(
+            jnp.int32, (2 * compact_capacity, batch_size), 0
+        )
+        first = tile_row < compact_capacity
+        # Masks select as int32 (no mask selects).
+        rows = jnp.where(
+            first,
+            first_rows.astype(jnp.int32)[None, :],
+            second_rows.astype(jnp.int32)[None, :],
+        )
+        before = jnp.where(
+            first,
+            compact_row_positions(first_rows)[None, :],
+            compact_row_positions(second_rows)[None, :],
+        )
+        one_hot = (rows != 0) & (before == tile_row % compact_capacity)
+        staged = _dot(one_hot.astype(jnp.bfloat16), source[:, :expert_input_size])
+        first_compact_source_vmem[...] = staged[:compact_capacity]
+        second_compact_source_vmem[...] = staged[compact_capacity:]
 
     def compact_route_data(active_rows, current_slot_mask, offset=0, row_plan=None):
         route_probabilities = (
@@ -1863,17 +1896,17 @@ def _run_routed_expert_stream(
 
         def finish_shared_expert(index, slot, column):
             gate_up = (
-                gate_up_accumulator[:, column : column + 2 * expert_width]
+                full_gate_up[:, column : column + 2 * expert_width]
                 .astype(jnp.bfloat16)
                 .astype(jnp.float32)
             )
             middle = _gated_activation(
                 gate_up[:, :expert_width], gate_up[:, expert_width:]
             )
-            gate_up_accumulator[:, :expert_width] = middle.astype(jnp.float32)
+            full_gate_up[:, :expert_width] = middle.astype(jnp.float32)
             wait_for_down(index, slot)
             expert_dot(
-                gate_up_accumulator.at[:, :expert_width],
+                full_gate_up.at[:, :expert_width],
                 expert_down_vmem.at[slot],
                 expert_down_scale_vmem.at[slot],
                 down_accumulator,
@@ -1904,7 +1937,7 @@ def _run_routed_expert_stream(
                 source,
                 expert_gate_up_vmem,
                 expert_gate_up_scale_vmem,
-                gate_up_accumulator,
+                full_gate_up,
                 first_slot,
                 second_slot,
                 expert_input_size,
@@ -1921,7 +1954,7 @@ def _run_routed_expert_stream(
                 source,
                 expert_gate_up_vmem.at[slot],
                 expert_gate_up_scale_vmem.at[slot],
-                gate_up_accumulator.at[:, : 2 * expert_width],
+                full_gate_up.at[:, : 2 * expert_width],
                 expert_input_size,
                 2 * expert_width,
             )
@@ -2143,7 +2176,7 @@ def _run_routed_expert_stream(
                         source,
                         expert_gate_up_vmem,
                         expert_gate_up_scale_vmem,
-                        gate_up_accumulator,
+                        full_gate_up,
                         current_base_slot,
                         current_base_slot + 1,
                         expert_input_size,
@@ -2173,7 +2206,7 @@ def _run_routed_expert_stream(
                         source,
                         expert_gate_up_vmem.at[current_base_slot],
                         expert_gate_up_scale_vmem.at[current_base_slot],
-                        gate_up_accumulator.at[:, : 2 * expert_width],
+                        full_gate_up.at[:, : 2 * expert_width],
                         expert_input_size,
                         2 * expert_width,
                     )
@@ -2255,12 +2288,16 @@ def _run_routed_expert_stream(
                         )
 
                     if compact_capacity > 1:
+                        # B8 pairs take compact tiles up to B8_COMPACT_ROWS rows.
+                        pair_rows = (
+                            B8_COMPACT_ROWS if batch_size == 8 else compact_capacity
+                        )
                         multi_pair = (
                             has_first
                             & has_second
                             & ~compact_pair
-                            & (first_row_count <= compact_capacity)
-                            & (second_row_count <= compact_capacity)
+                            & (first_row_count <= pair_rows)
+                            & (second_row_count <= pair_rows)
                         )
 
                         @pl.when(multi_pair)
@@ -2270,18 +2307,21 @@ def _run_routed_expert_stream(
                             first_copies.gate_up_scales.wait()
                             second_copies.gate_up.wait()
                             second_copies.gate_up_scales.wait()
-                            stage_compact_rows(
-                                first_rows,
-                                first_compact_source_vmem,
-                                row_plan=first_plan,
-                                row_words=scheduled_row_words(0),
-                            )
-                            stage_compact_rows(
-                                second_rows,
-                                second_compact_source_vmem,
-                                row_plan=second_plan,
-                                row_words=scheduled_row_words(1),
-                            )
+                            if batch_size == 8:
+                                stage_compact_pair(first_rows, second_rows)
+                            else:
+                                stage_compact_rows(
+                                    first_rows,
+                                    first_compact_source_vmem,
+                                    row_plan=first_plan,
+                                    row_words=scheduled_row_words(0),
+                                )
+                                stage_compact_rows(
+                                    second_rows,
+                                    second_compact_source_vmem,
+                                    row_plan=second_plan,
+                                    row_words=scheduled_row_words(1),
+                                )
 
                             def project_pair(capacity=None):
                                 _paired_expert_gate_up(
@@ -2312,7 +2352,11 @@ def _run_routed_expert_stream(
 
                                     previous = capacity
                             else:
-                                project_pair()
+                                # B8: narrow the gate/up's register operands
+                                # to B8_COMPACT_ROWS rows of each tile.
+                                project_pair(
+                                    B8_COMPACT_ROWS if batch_size == 8 else None
+                                )
                                 finish_compact_expert(
                                     first_rows,
                                     first_slot_mask,
@@ -2396,7 +2440,9 @@ def _run_routed_expert_stream(
                             expert=first_expert,
                         )
 
-                    if compact_capacity > 1:
+                    # B8 narrows only pairs: its multi-row tail keeps the
+                    # eight-row path (less expert-loop code).
+                    if compact_capacity > 1 and batch_size > 8:
                         multi_tail = (
                             has_first
                             & ~has_second
@@ -3466,6 +3512,9 @@ def moe(
         weights.expert_gate_up_projection.dtype,
         group_pending_routes=group_pending_expert_routes,
     )
+    compact_rows = max(
+        1, _compact_rows(batch_size, group_pending_routes=group_pending_expert_routes)
+    )
     expected_workspace_shapes = (
         (workspace.selected_experts_vmem.shape, (batch_size, 128)),
         (workspace.selected_probabilities_vmem.shape, (batch_size, 128)),
@@ -3486,14 +3535,8 @@ def moe(
             (accumulator_rows[1], expert_output_size),
         ),
         (workspace.processed_routes_vmem.shape, (batch_size, 128)),
-        (
-            workspace.first_compact_source_vmem.shape,
-            (max(1, _compact_rows(batch_size)), expert_input_size),
-        ),
-        (
-            workspace.second_compact_source_vmem.shape,
-            (max(1, _compact_rows(batch_size)), expert_input_size),
-        ),
+        (workspace.first_compact_source_vmem.shape, (compact_rows, expert_input_size)),
+        (workspace.second_compact_source_vmem.shape, (compact_rows, expert_input_size)),
     )
     if any(actual != expected for actual, expected in expected_workspace_shapes):
         raise ValueError("MoE workspace has an invalid shape")
@@ -7906,10 +7949,24 @@ B16_COMPACT_EXPERTS = (
 # KernelConfig.b16_one_hot_staging: B16 stages the compact tiles' rows with a
 # one-hot product, as B64, B96 and B128 do.
 B16_ONE_HOT_STAGING = _config().b16_one_hot_staging
+# KernelConfig.b8_compact_experts: B8 grouped routes run expert pairs of at
+# most B8_COMPACT_ROWS rows an expert on 8-row compact tiles, the gate/up's
+# register operands narrowed to B8_COMPACT_ROWS rows (MXFP4 only).
+B8_COMPACT_EXPERTS = (
+    _config().b8_compact_experts and _config().expert_gate_up == "mxfp4"
+)
+B8_COMPACT_ROWS = 4
 
 
-def _compact_rows(batch_size):
+def _compact_rows(batch_size, *, group_pending_routes=True):
     if batch_size == 16 and B16_COMPACT_EXPERTS and not COMPACT_ONLY:
+        return 8
+    if (
+        batch_size == 8
+        and B8_COMPACT_EXPERTS
+        and group_pending_routes
+        and not COMPACT_ONLY
+    ):
         return 8
     return COMPACT_ROWS if batch_size >= 32 else 0
 
@@ -7980,7 +8037,10 @@ def _expert_accumulator_rows(
     batch_size, gate_up_dtype=None, *, group_pending_routes=False
 ):
     """(gate/up, down) accumulator rows: the batch, or only the compact tiles."""
-    capacity = _compact_rows(batch_size)
+    capacity = _compact_rows(batch_size, group_pending_routes=group_pending_routes)
+    if batch_size == 8 and capacity:
+        # B8 compact pairs: two 8-row gate/up tiles; full pairs use rows 0..7.
+        return 2 * capacity, batch_size
     if capacity and (
         COMPACT_ONLY
         or _use_compact_overflow(
@@ -8214,6 +8274,7 @@ def _moe_scoped_scratch(
     accumulator_rows = _expert_accumulator_rows(
         batch_size, gate_up.dtype, group_pending_routes=group_pending_routes
     )
+    compact_rows = _compact_rows(batch_size, group_pending_routes=group_pending_routes)
     scale_scratch = (
         ()
         if alias_expert_scales
@@ -8265,8 +8326,8 @@ def _moe_scoped_scratch(
         tpu.VMEM((accumulator_rows[1], expert_output_size), jnp.float32),
         tpu.VMEM((batch_size, 128), jnp.int32),
         *(
-            (tpu.VMEM((_compact_rows(batch_size), expert_input_size), jnp.float32),) * 2
-            if _compact_rows(batch_size)
+            (tpu.VMEM((compact_rows, expert_input_size), jnp.float32),) * 2
+            if compact_rows
             else (tpu.VMEM((1, expert_input_size), jnp.bfloat16),) * 2
         ),
         tpu.SemaphoreType.DMA((10,)),
