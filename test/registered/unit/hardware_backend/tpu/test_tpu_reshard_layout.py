@@ -1249,25 +1249,6 @@ class TestTpuUnifiedSwaReshardStaging(unittest.TestCase):
     def test_unified_swa_staging_allocates_exact_physical_pages(self):
         """Unified SWA staging must allocate one physical page per full and SWA page,
         without multiplying SWA pages by num_swa_groups."""
-        pool, alloc = self._build_unified_pool_and_allocator(num_phys_pages=64)
-        mgr = self._build_decode_mgr(pool=pool, allocator=alloc)
-        f_page = (
-            int(alloc.full_attn_allocator.alloc(self.PAGE_SIZE)[0].item())
-            // self.PAGE_SIZE
-        )
-        s_page = (
-            int(alloc.swa_attn_allocator.alloc(self.PAGE_SIZE)[0].item())
-            // self.PAGE_SIZE
-        )
-        free_before = alloc._free_page_count()
-
-        self._send_unified_metadata(mgr=mgr, room=51, f_page=f_page, s_page=s_page)
-        taken = free_before - alloc._free_page_count()
-        self.assertEqual(taken, 7, f"Expected 1 + 6 = 7 physical pages, got {taken}")
-
-    def test_unified_swa_staging_fits_tight_shared_pool(self):
-        """Unified SWA staging must succeed whenever enough shared physical pages remain,
-        instead of failing the room with spurious out-of-pages."""
         pool, alloc = self._build_unified_pool_and_allocator(num_phys_pages=24)
         mgr = self._build_decode_mgr(pool=pool, allocator=alloc)
         f_page = (
@@ -1278,16 +1259,19 @@ class TestTpuUnifiedSwaReshardStaging(unittest.TestCase):
             int(alloc.swa_attn_allocator.alloc(self.PAGE_SIZE)[0].item())
             // self.PAGE_SIZE
         )
-        self.assertEqual(alloc._free_page_count(), 17)
+        free_before = alloc._free_page_count()
+        self.assertEqual(free_before, 17)
 
         recv = self._send_unified_metadata(
-            mgr=mgr, room=52, f_page=f_page, s_page=s_page
+            mgr=mgr, room=51, f_page=f_page, s_page=s_page
         )
         self.assertNotEqual(
             recv.poll(),
             KVPoll.Failed,
-            f"Spurious OOM with 17 free physical pages: {mgr.failure_records.get(52)}",
+            f"Spurious OOM with 17 free physical pages: {mgr.failure_records.get(51)}",
         )
+        taken = free_before - alloc._free_page_count()
+        self.assertEqual(taken, 7, f"Expected 1 + 6 = 7 physical pages, got {taken}")
 
     def test_unified_swa_staging_merges_swa_pages(self):
         """Unified SWA staging must merge staged SWA slots in the shared pool buffer,
