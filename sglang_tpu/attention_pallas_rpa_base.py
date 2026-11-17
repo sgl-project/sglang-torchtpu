@@ -36,7 +36,7 @@ Design notes
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol
 
 import torch
 
@@ -108,6 +108,31 @@ def _validate_kv_len_capacity(max_kv_len: int, capacity: int) -> None:
             "RPA KV length exceeds the per-request page-table capacity: "
             f"required={max_kv_len}, available={capacity}."
         )
+
+
+class _LayerAttention(NamedTuple):
+    """Operands of one layer's attention call (see ``_attention_impl``)."""
+
+    layer: "RadixAttention"
+    forward_batch: ForwardBatch
+    q: torch.Tensor
+    # This rank's new K/V (pool dtype) and, under prefill context parallelism,
+    # the group's all-gathered chunk K/V (None otherwise).
+    k: torch.Tensor
+    v: torch.Tensor
+    k_all: torch.Tensor | None
+    v_all: torch.Tensor | None
+    kv_cache: torch.Tensor
+    kv_layer_idx: Any
+    page_indices: torch.Tensor
+    uses_swa_pool: bool
+    sinks: torch.Tensor | None
+    sliding_window: int | None
+    soft_cap: float | None
+    k_scale: float | None
+    v_scale: float | None
+    use_causal_mask: bool
+    pack: int
 
 
 @dataclass
@@ -1652,8 +1677,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             self.token_to_kv_pool, layer.layer_id
         )
 
-        op = self._op
-
         sliding_window = getattr(layer, "sliding_window_size", None)
         if sliding_window is not None and sliding_window <= 0:
             sliding_window = None
@@ -1723,72 +1746,29 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 quantize=quantize_kv,
             )
 
-        kv_lens = self._kv_lens(forward_batch)
-        if self.forward_metadata.cp_ring is not None:
-            out = forward_pcp_ring(
-                self.forward_metadata,
-                self._pcp_ring_op,
-                layer,
-                q,
-                k_all,
-                v_all,
-                kv_cache,
+        attend = self._attention_impl(self.forward_metadata)
+        out = attend(
+            _LayerAttention(
+                layer=layer,
+                forward_batch=forward_batch,
+                q=q,
+                k=k,
+                v=v,
+                k_all=k_all,
+                v_all=v_all,
+                kv_cache=kv_cache,
+                kv_layer_idx=kv_layer_idx,
+                page_indices=page_indices,
+                uses_swa_pool=uses_swa_pool,
                 sinks=sinks,
                 sliding_window=sliding_window,
                 soft_cap=soft_cap,
-                causal=use_causal_mask,
-                pack=pack,
                 k_scale=k_scale,
                 v_scale=v_scale,
-            )
-        elif self._dcp > 1:
-            if not use_causal_mask:
-                raise NotImplementedError(
-                    "Decode context parallelism supports only causal attention."
-                )
-            pool = self.token_to_kv_pool
-            _check_dcp_kv_heads(
-                layer=layer,
-                pool_kv_heads=(pool.swa_kv_pool if uses_swa_pool else pool).head_num,
-            )
-            # SWA layers of a hybrid model read and write the SWA sub-pool
-            # through its own page table (``page_indices`` above).
-            out = self._forward_dcp(
-                q,
-                k,
-                v,
-                kv_cache,
-                page_indices,
-                forward_batch,
-                sinks,
-                float(layer.scaling),
-                sliding_window,
-                soft_cap,
-                k_scale,
-                v_scale,
-                layer.tp_q_head_num,
-            )
-        else:
-            out = op(
-                q,
-                k,
-                v,
-                kv_cache,
-                kv_lens,
-                page_indices,
-                self.forward_metadata.cu_q_lens,
-                self.forward_metadata.cu_kv_lens,
-                self.forward_metadata.distribution,
-                sinks,
-                float(layer.scaling),
-                sliding_window,
-                soft_cap,
-                k_scale,
-                v_scale,
-                self.forward_metadata.decode_query_size,
                 use_causal_mask=use_causal_mask,
-                layer_idx=kv_layer_idx,
+                pack=pack,
             )
+        )
 
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
         # FULL capture retains padded rows for later EAGLE steps.
@@ -1804,6 +1784,87 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             out = _unpack_out_heads(out, pack, layer.qk_head_dim)
         out = out[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _attention_impl(
+        self, metadata: PallasForwardMetadata
+    ) -> Callable[[_LayerAttention], torch.Tensor]:
+        """The attention of this forward's layers: the fused ring kernel for a
+        ring-mode PCP extend, the striped kernels under DCP, else the plain
+        kernel (gather-mode PCP included)."""
+        if metadata.cp_ring is not None:
+            return self._attend_pcp_ring
+        if self._dcp > 1:
+            return self._attend_dcp
+        return self._attend_plain
+
+    def _attend_plain(self, a: _LayerAttention) -> torch.Tensor:
+        md = self.forward_metadata
+        return self._op(
+            a.q,
+            a.k,
+            a.v,
+            a.kv_cache,
+            self._kv_lens(a.forward_batch),
+            a.page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+            a.sinks,
+            float(a.layer.scaling),
+            a.sliding_window,
+            a.soft_cap,
+            a.k_scale,
+            a.v_scale,
+            md.decode_query_size,
+            use_causal_mask=a.use_causal_mask,
+            layer_idx=a.kv_layer_idx,
+        )
+
+    def _attend_dcp(self, a: _LayerAttention) -> torch.Tensor:
+        if not a.use_causal_mask:
+            raise NotImplementedError(
+                "Decode context parallelism supports only causal attention."
+            )
+        pool = self.token_to_kv_pool
+        _check_dcp_kv_heads(
+            layer=a.layer,
+            pool_kv_heads=(pool.swa_kv_pool if a.uses_swa_pool else pool).head_num,
+        )
+        # SWA layers of a hybrid model read and write the SWA sub-pool
+        # through its own page table (``page_indices``).
+        return self._forward_dcp(
+            a.q,
+            a.k,
+            a.v,
+            a.kv_cache,
+            a.page_indices,
+            a.forward_batch,
+            a.sinks,
+            float(a.layer.scaling),
+            a.sliding_window,
+            a.soft_cap,
+            a.k_scale,
+            a.v_scale,
+            a.layer.tp_q_head_num,
+        )
+
+    def _attend_pcp_ring(self, a: _LayerAttention) -> torch.Tensor:
+        return forward_pcp_ring(
+            self.forward_metadata,
+            self._pcp_ring_op,
+            a.layer,
+            a.q,
+            a.k_all,
+            a.v_all,
+            a.kv_cache,
+            sinks=a.sinks,
+            sliding_window=a.sliding_window,
+            soft_cap=a.soft_cap,
+            causal=a.use_causal_mask,
+            pack=a.pack,
+            k_scale=a.k_scale,
+            v_scale=a.v_scale,
+        )
 
     def _forward_dcp(
         self,
