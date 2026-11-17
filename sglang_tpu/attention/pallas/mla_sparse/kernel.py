@@ -112,37 +112,22 @@ def _gather_page_ids_kernel(windows_ref, logical_ref, out_ref, *, num_chunks):
     out_ref[...] = out
 
 
-# Cycle costs of a chunk step and of the loop, from the TensorCore LLO schedule on tpu7x.
-# A chunk step is bound by the cross-lane unit (XLU): one lane gather per (8, 128) vreg of the
-# block's top-k indices. The permute reserves an XLU for 4 cycles and the all-sublanes
-# set-pattern for 4 more, but every chunk gathers with the same lane indices, so the compiler
-# reuses about a quarter of the patterns (187 set-patterns for 256 gathers in a 16-chunk body):
-# ~7 cycles per gather.
-_XLU_LANE_GATHER_CYCLES = 7
-# Share of the gathers that lands on the busier of the two XLUs: the compiler assigns these
-# independent gathers about 1:2, which makes the busier XLU the critical path.
-# NOTE(b/586649669): 1/2 once the assignment is balanced.
-_BUSIER_XLU_GATHER_SHARE = 2 / 3
-# Per-iteration overhead of the fori_loop: the last gather's push-to-pop latency plus the final
-# select and copies (44-49 bundles after the last XLU issue in every loop body), plus about as
-# much loop control that the static schedule does not show (per-iteration time over 8, 11, 16
-# and 22 chunks per iteration fits this + 73 cycles per chunk).
-_GATHER_PAGE_LOOP_ITERATION_CYCLES = 100
-# Per-step work outside the chunk steps: load and split the block's top-k tile, store its
-# output tile, drain the last gathers (both kernels' time fits this + chunk steps).
-_GATHER_PAGE_STEP_FIXED_CYCLES = 330
-# A grid step also waits on its DMAs (top-k tile in, page-table row in, output tile out): a
-# 1-chunk step takes this long although its body is ~120 bundles ...
-_GATHER_PAGE_STEP_FLOOR_CYCLES = 1030
-# ... plus the page-table row, 4 KB per 128-page chunk per block (the floor is ~1700 cycles at
-# 64 chunks).
-_GATHER_PAGE_ROW_DMA_CYCLES_PER_CHUNK = 10
-
-
 def _gather_page_chunk_step_cycles(block_tokens: int, topk: int) -> float:
-    """Cycles of one chunk step for one token block: its lane gathers on the busier XLU."""
+    """Cycles of one chunk step for one token block, from the TensorCore LLO schedule on tpu7x.
+
+    A chunk step is bound by the cross-lane unit (XLU): one lane gather per (8, 128) vreg of the
+    block's top-k indices.
+    """
     num_vregs = cdiv(block_tokens, 8) * cdiv(topk, _GATHER_PAGE_CHUNK)
-    return num_vregs * _BUSIER_XLU_GATHER_SHARE * _XLU_LANE_GATHER_CYCLES
+    # The permute reserves an XLU for 4 cycles and the all-sublanes set-pattern for 4 more, but
+    # every chunk gathers with the same lane indices, so the compiler reuses about a quarter of
+    # the patterns (187 set-patterns for 256 gathers in a 16-chunk body): ~7 cycles per gather.
+    gather_cycles = 7
+    # Share of the gathers that lands on the busier of the two XLUs: the compiler assigns these
+    # independent gathers about 1:2, which makes the busier XLU the critical path.
+    # NOTE(b/586649669): 1/2 once the assignment is balanced.
+    busier_xlu_share = 2 / 3
+    return num_vregs * busier_xlu_share * gather_cycles
 
 
 def _gather_page_chunks_per_iteration(
@@ -159,12 +144,18 @@ def _gather_page_chunks_per_iteration(
       bounded:  max(floor, fixed + ceil(c / g) * (o + g * u))
     """
     u = _gather_page_chunk_step_cycles(block_tokens, topk)
-    o = _GATHER_PAGE_LOOP_ITERATION_CYCLES
-    fixed = _GATHER_PAGE_STEP_FIXED_CYCLES
-    floor = (
-        _GATHER_PAGE_STEP_FLOOR_CYCLES
-        + num_chunks * _GATHER_PAGE_ROW_DMA_CYCLES_PER_CHUNK
-    )
+    # Per-iteration overhead of the fori_loop: the last gather's push-to-pop latency plus the
+    # final select and copies (44-49 bundles after the last XLU issue in every loop body), plus
+    # about as much loop control that the static schedule does not show (per-iteration time
+    # over 8, 11, 16 and 22 chunks per iteration fits this + 73 cycles per chunk).
+    o = 100
+    # Per-step work outside the chunk steps: load and split the block's top-k tile, store its
+    # output tile, drain the last gathers (both kernels' time fits this + chunk steps).
+    fixed = 330
+    # A grid step also waits on its DMAs (top-k tile in, page-table row in, output tile out): a
+    # 1-chunk step takes ~1030 cycles although its body is ~120 bundles, plus ~10 per chunk for
+    # the page-table row (4 KB per 128-page chunk per block; ~1700 cycles at 64 chunks).
+    floor = 1030 + 10 * num_chunks
     best_cycles = max(floor, fixed + num_chunks * u)
     best_g = None
     for g in range(1, num_chunks):
