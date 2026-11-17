@@ -41,13 +41,8 @@ class DSV41RunaiModelStreamerLoader(EPLocalRunaiModelStreamerLoader):
         self, *, kept: frozenset[str], shard_of: Mapping[str, str]
     ) -> tuple[frozenset[str], Iterator[tuple[str, torch.Tensor]]]:
         from sglang.srt.runtime_context import get_parallel
-        from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
         tables = frozenset(name for name in kept if is_engram_table(name))
-        if any(is_runai_obj_uri(shard_of[name]) for name in tables):
-            raise ValueError(
-                "V4.1 Engram row reads need a local or mounted checkpoint path"
-            )
         streamed = frozenset(
             name
             for name in kept

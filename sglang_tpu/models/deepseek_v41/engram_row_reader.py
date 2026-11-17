@@ -68,14 +68,28 @@ def _read_range(path: str, offset: int, out: torch.Tensor) -> None:
             out[start : start + sizes[index]].copy_(chunk.view(-1))
 
 
+def _read_safetensors_header(path: str) -> tuple[int, dict]:
+    """(header length, header) of a local, mounted or object-storage shard."""
+    from sglang.srt.utils.runai_utils import is_runai_obj_uri
+
+    if not is_runai_obj_uri(path):
+        with open(path, "rb") as f:
+            header_len = int.from_bytes(f.read(8), "little")
+            return header_len, json.loads(f.read(header_len))
+    size = torch.empty(8, dtype=torch.uint8)
+    _read_range(path, 0, size)
+    header_len = int.from_bytes(size.numpy().tobytes(), "little")
+    raw = torch.empty(header_len, dtype=torch.uint8)
+    _read_range(path, 8, raw)
+    return header_len, json.loads(raw.numpy().tobytes())
+
+
 def _read_row_ranges(
     path: str, names: set[str], *, tp_rank: int, tp_size: int
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield this TP rank's rows of each 2-D tensor in ``names`` in blocks of at
     most ``_ROW_BLOCK_BYTES``, each tagged with its first row in ``ROW_START_ATTR``."""
-    with open(path, "rb") as f:
-        header_len = int.from_bytes(f.read(8), "little")
-        header = json.loads(f.read(header_len))
+    header_len, header = _read_safetensors_header(path)
     data_base = 8 + header_len
     for name in sorted(names):
         meta = header[name]
