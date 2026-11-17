@@ -32,7 +32,10 @@ def get_selected_op(ep_size: int, capacity: int = 128):
         _pack_routing_exchange,
         fused_ep_moe_v2,
     )
-    from sglang_tpu.moe.pallas.fused_moe_v2.token_parallel import TokenReplicaLayout
+    from sglang_tpu.moe.pallas.fused_moe_v2.token_parallel import (
+        TokenReplicaLayout,
+        replica_wire_rows,
+    )
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     axis = "d"
@@ -59,8 +62,10 @@ def get_selected_op(ep_size: int, capacity: int = 128):
             row_alignment=U32_SUBLANE_TILE,
         )
         rows = layout.local_rows
+        wire_rows = replica_wire_rows(layout.input_rows, ep_size, U32_SUBLANE_TILE)
         block = routing_block(rows, topk)
         payload_layout = _exchange_layout(rows, topk, experts, True)
+        wire_width = _exchange_layout(wire_rows, topk, experts, True)[-1]
         logger.info(
             "GLM_FUSED_MOE_V2_EXPORT ep=%d rows=%d hidden=%d topk=%d capacity=%d",
             ep_size,
@@ -102,6 +107,12 @@ def get_selected_op(ep_size: int, capacity: int = 128):
                 histogram.sum(axis=0),
                 payload_layout,
             )
+            # Match stage="route"'s transport contract. At four local rows,
+            # the compute layout is four but its symbolic wire shape is eight.
+            padding = wire_rows - rows
+            quantized = jnp.pad(quantized, ((0, padding), (0, 0), (0, 0)))
+            local_coefficients = jnp.pad(local_coefficients, ((0, padding), (0, 0)))
+            payload = jnp.pad(payload, (0, wire_width - payload_layout[-1]))
             gathered = lax.all_gather(quantized, axis, axis=0, tiled=True)
             return gathered, local_coefficients, payload[None, :], me.reshape(1, 1)
 
