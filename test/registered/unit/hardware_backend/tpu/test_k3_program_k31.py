@@ -2717,7 +2717,9 @@ class TestAttentionHostBf16(CustomTestCase):
     to BF16, an FP32 sum of the four hosts in host order, a BF16 output. The four
     hosts' copies of every row are bitwise equal."""
 
-    SCRIPT = r"""
+    # The interpret harness (shared with TestAttentionRankRows): bitcast and
+    # reshape views, ``project`` and the rounding-point reference.
+    PRELUDE = r"""
 import math, os
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=32"
 os.environ["JAX_PLATFORMS"] = "cpu"
@@ -2811,7 +2813,7 @@ ipc.get, ipc.store, ipc.swap = get, store, swap
 mesh = Mesh(np.asarray(jax.devices()), ("tp",))
 
 
-def project(attended, weight, host_bf16):
+def project(attended, weight, host_bf16, rank_rows=False):
     # Every rank's owned rows (native 16-row backing) and FP32 partial.
     B = attended.shape[1]
     dmk.ATTENTION_HOST_BF16 = host_bf16  # read when the kernel is traced
@@ -2827,7 +2829,8 @@ def project(attended, weight, host_bf16):
         outputs[...] = jnp.full(outputs.shape, jnp.nan, jnp.bfloat16)
         dmk._project_attention_2d(
             attended_ref[...], weight_ref, out, comm, local, host, features, outputs,
-            sends, recvs, phase, dmk._dot, token_scatter_output=True)
+            sends, recvs, phase, dmk._dot, token_scatter_output=True,
+            rank_rows=rank_rows)
         owned_out[...] = outputs[...]
         partial_out[...] = comm[...]
 
@@ -2880,8 +2883,9 @@ def reference(partial, B, host_bf16):
         for h in range(4):
             out[8 * h + 2 * t: 8 * h + 2 * t + 2] = np.concatenate(halves, axis=1)
     return out
+"""
 
-
+    SCRIPT = PRELUDE + r"""
 rng = np.random.default_rng(0)
 for B in (8, 16, 24):
     tpp = B // 4
@@ -2925,6 +2929,106 @@ print("OK")
             text=True,
             env=env,
             timeout=1200,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
+
+
+class TestAttentionRankRows(CustomTestCase):
+    """``KernelConfig.attention_rank_rows`` in the token-scattered attention
+    output projection (``_project_attention_2d(rank_rows=True)``) at B8 and
+    B16 in Pallas interpret mode on 32 host devices (TestAttentionHostBf16's
+    harness, stale NaN bytes wherever a round lands). With FP32 and with BF16
+    host sums, rank 2p + q's rows (one at B8, two at B16) equal, bit for bit,
+    rows q r .. q r + r - 1 of the rows its pair holds without the knob (the
+    same inputs) and the reduction's rounding points; the hosts' copies are
+    bitwise equal. The MoE input gather of those rows (eight local owners on
+    one semaphore, one-row wires in private storage) delivers every local
+    rank's rows in owner order."""
+
+    SCRIPT = TestAttentionHostBf16.PRELUDE + r"""
+rng = np.random.default_rng(1)
+for B in (8, 16):
+    tpp, rows = B // 4, B // 8
+    attended = (rng.standard_normal((32, B, W)) * rng.uniform(0.2, 2.0, (32, 1, W))
+                / (1 + np.exp(-rng.standard_normal((32, B, W))))).astype(BF16)
+    full = (rng.standard_normal((32 * W, H)) * 0.01).astype(BF16)
+    weight = np.stack([full[768 * (r // 2):768 * (r // 2 + 1), (r % 2) * HALF:(r % 2 + 1) * HALF]
+                       for r in range(32)])
+    for host_bf16 in (False, True):
+        pair_owned, partial = project(attended, weight, host_bf16)
+        rank_owned, rank_partial = project(attended, weight, host_bf16, rank_rows=True)
+        assert np.array_equal(partial.view(np.uint32), rank_partial.view(np.uint32))
+        want = reference(partial, B, host_bf16)
+        for r in range(32):
+            mine = slice((r % 2) * rows, (r % 2 + 1) * rows)
+            got = rank_owned[r, :rows].view(np.uint16)
+            assert np.array_equal(got, want[r, mine].view(np.uint16)), (B, host_bf16, r)
+            assert np.array_equal(got, pair_owned[r, mine].view(np.uint16)), (B, host_bf16, r)
+            for offset in (8, 16, 24):
+                assert np.array_equal(got, rank_owned[r ^ offset, :rows].view(np.uint16))
+        print(f"B{B} host_bf16={host_bf16}: rank rows bit-exact")
+
+
+def gather(rows_in):
+    # The MoE input gather of rank rows: eight local owners, one semaphore,
+    # one-row wires in private storage (B8) or in-place copies (B16).
+    rows = rows_in.shape[1]
+
+    def kernel(rows_ref, out_ref, wires, dest, sends, recvs):
+        wires[...] = jnp.full(wires.shape, jnp.nan, jnp.float32)
+        dest[...] = jnp.full(dest.shape, jnp.nan, jnp.bfloat16)
+        dmk._gather_local_pair_rows(
+            rows_ref, dest, sends, recvs, wires, owners=8,
+            semaphore=dmk.RANK_ROWS_GATHER_SEMAPHORE, transpose_wires=True)
+        out_ref[...] = dest[...]
+
+    vmem = pltpu.VMEM
+
+    def body(x):
+        return pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((8 * rows, H), jnp.bfloat16),
+            in_specs=[pl.BlockSpec(memory_space=vmem)],
+            out_specs=pl.BlockSpec(memory_space=vmem),
+            scratch_shapes=[vmem((8, 32, 128), jnp.float32), vmem((8 * rows, H), jnp.bfloat16),
+                            pltpu.SemaphoreType.DMA((16,)), pltpu.SemaphoreType.DMA((16,))],
+            compiler_params=pltpu.CompilerParams(has_side_effects=True),
+            interpret=pltpu.InterpretParams(),
+        )(x[0])[None]
+
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=P("tp"), out_specs=P("tp"),
+                              check_vma=False))
+    return np.asarray(f(rows_in))
+
+
+for rows in (1, 2):
+    rows_in = rng.standard_normal((32, rows, H)).astype(BF16)
+    got = gather(rows_in)
+    for r in range(32):
+        want = rows_in[8 * (r // 8):8 * (r // 8) + 8].reshape(8 * rows, H)
+        assert np.array_equal(got[r].view(np.uint16), want.view(np.uint16)), (rows, r)
+    print(f"gather of {rows}-row owners bit-exact")
+print("OK")
+"""
+
+    def test_rank_rows_match_the_pair_rows(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [sys.executable, "-c", self.SCRIPT],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1500,
         )
         self.assertIn(
             "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
