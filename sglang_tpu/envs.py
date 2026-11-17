@@ -267,6 +267,11 @@ class TpuEnvs:
     # step launches while the scheduler processes the last one's tokens (as
     # vLLM's async scheduling runs it).
     SGLANG_TPU_K3_PROGRAM_OPT_OVERLAP = EnvBool(False)
+    # Colocated K3_PROGRAM engines: a request's first decode step verifies
+    # drafts made after its prefill token (the draft op run once on the aux
+    # streams the prefill keeps for the prompt's last position) instead of
+    # placeholder rows, so it takes a speculative step's tokens, not one.
+    SGLANG_TPU_K3_PROGRAM_OPT_FIRST_STEP_DRAFTS = EnvBool(False)
     # Prefix cache on the K3_PROGRAM P/D decode (KV pages only,
     # k3_programs/sglang_decode_cache.py): a session's next turn transfers only
     # the pages past the decode's local prefix hit.

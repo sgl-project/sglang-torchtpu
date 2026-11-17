@@ -50,6 +50,51 @@ def stream_source(layer: int) -> str:
     )
 
 
+# Verify rows of the decode's single-request draft op (kernels.dspark.ROWS).
+FIRST_AUX_ROWS = 8
+
+
+def first_aux_fn(aux_layers: tuple[int, ...], axis: str, picks: int, rows: int):
+    """``(blocks, *entering taps, picked) -> picks x [aux layers, rows,
+    hidden]``: window row ``picked[s]`` (its index in ownership order, -1:
+    none) of every aux layer's residual stream, replicated and repeated over
+    ``rows``, the decode's single draft op's aux operand (its verify rows' aux
+    streams; the decoder's first speculation reads row 0, the prompt's last
+    position). The owning rank contributes the row, the others zeros, so the
+    sum is exact. Module-level so tests can run it on a CPU mesh."""
+    kept = [layer for layer in aux_layers if stream_source(layer) == "entering"]
+
+    def fn(blocks, *args):
+        import jax
+        import jax.numpy as jnp
+
+        taps, picked = args[: len(kept)], args[len(kept)]
+        rank = jax.lax.axis_index(axis)
+        local = blocks.shape[2]
+        streams = {layer: tap[0] for layer, tap in zip(kept, taps)}
+        streams.update(
+            {
+                layer: blocks[0, layer // 12]
+                for layer in aux_layers
+                if stream_source(layer) == "block"
+            }
+        )
+        stacked = jnp.stack([streams[layer] for layer in aux_layers])  # [A, local, H]
+        owner = jnp.where(picked >= 0, picked // local, -1)
+        chosen = jnp.take(stacked, jnp.clip(picked % local, 0, local - 1), axis=1)
+        mine = (owner == rank)[None, :, None]
+        chosen = jnp.where(mine, chosen.astype(jnp.float32), 0.0)
+        chosen = jax.lax.psum(chosen, axis).astype(stacked.dtype)  # [A, picks, H]
+        return tuple(
+            jnp.broadcast_to(
+                chosen[:, s : s + 1], (len(aux_layers), rows, chosen.shape[-1])
+            )
+            for s in range(picks)
+        )
+
+    return fn
+
+
 class PrefillDraftLatents:
     """See the module docstring."""
 
@@ -264,6 +309,40 @@ class PrefillDraftLatents:
             torch.from_numpy(inverse).to("tpu"),
         )
         return latents
+
+    def first_aux(
+        self, window: int, blocks, entering: dict, picked: np.ndarray
+    ) -> tuple[torch.Tensor, ...]:
+        """The decode's first-speculation aux operand (:func:`first_aux_fn`)
+        of each of the window's slots: ``picked[s]`` slot ``s``'s last prompt
+        row in ownership order (``PrefillProgram.sp_order``), -1 for none."""
+        key = ("first_aux", window, len(picked))
+        if key not in self._ops:
+            c, axis = self.config, self.axis
+            kept = [
+                layer for layer in c.aux_layers if stream_source(layer) == "entering"
+            ]
+            self._ops[key] = register_op(
+                f"pallas::k3_dspark_mla_prefill_first_aux_w{window}_s{len(picked)}",
+                self.mesh,
+                first_aux_fn(tuple(c.aux_layers), axis, len(picked), FIRST_AUX_ROWS),
+                (P(axis),) * (1 + len(kept)) + (P(),),
+                (P(),) * len(picked),
+                export_key=repr(
+                    ("dspark_mla_prefill_first_aux", window, len(picked), c.aux_layers)
+                ),
+            )
+        return tuple(
+            self._ops[key](
+                blocks,
+                *(
+                    entering[layer]
+                    for layer in self.config.aux_layers
+                    if stream_source(layer) == "entering"
+                ),
+                torch.from_numpy(np.ascontiguousarray(picked, np.int32)).to("tpu"),
+            )
+        )
 
     def _write_op(self, window: int, block_shape: tuple[int, ...]) -> Any:
         key = ("write", window, block_shape)

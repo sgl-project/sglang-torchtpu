@@ -183,10 +183,20 @@ def build_from_server():
         r: k3.build(configs[r], Path(presharded), draft, tp_rank=tp_rank) for r in roles
     }
     if role == COLOCATED:
-        from sglang_tpu.k3_programs.sglang_colocated import share_experts
+        from sglang_tpu.k3_programs.sglang_colocated import (
+            share_experts,
+            share_first_aux,
+        )
 
         # The decode program's experts serve the prefill program too.
         share_experts(programs["prefill"], programs["decode"])
+        if tpu_envs.SGLANG_TPU_K3_PROGRAM_OPT_FIRST_STEP_DRAFTS.get():
+            on = share_first_aux(programs["prefill"], programs["decode"])
+            if tp_rank == 0:
+                logger.info(
+                    "K3_PROGRAM: first-step drafts %s",
+                    "on" if on else "off (needs the MLA draft at attention DP1)",
+                )
     for program in programs.values():
         program.load_weights()
     _program, _config = programs, configs
