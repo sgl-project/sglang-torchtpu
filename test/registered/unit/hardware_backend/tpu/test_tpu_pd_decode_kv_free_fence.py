@@ -16,7 +16,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
@@ -144,8 +144,9 @@ def _unfenceable_overrides():
 
 class TestPdDecodeFenceInstall(CustomTestCase):
     def setUp(self):
+        super().setUp()
         # Single-stage servers; the PP gate is tested with the PP fence.
-        self.enterContext(get_parallel().override(pp_size=1))
+        enter_scope(self, get_parallel().override(pp_size=1))
 
     def test_pd_decode_installs_the_fence_without_hicache(self):
         scheduler = _scheduler()
@@ -229,8 +230,9 @@ class TestPdDecodeFenceInstall(CustomTestCase):
 
 class TestHicacheBackupFence(CustomTestCase):
     def setUp(self):
+        super().setUp()
         # Single-stage servers; the PP gate is tested with the PP fence.
-        self.enterContext(get_parallel().override(pp_size=1))
+        enter_scope(self, get_parallel().override(pp_size=1))
 
     def test_backups_are_fenced_on_every_raiden_hicache_server(self):
         controller = object()
