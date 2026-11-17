@@ -46,6 +46,8 @@ EP_ENV = {
 
 def config_for(conc: int, *, draft_model_path: str | None, moe_mode: str, ep_arm: str) -> dict:
     running, interval, compile_bs = PROFILES[conc]
+    # PDI: decode steps between prefill batches, overriding the profile's
+    interval = int(os.environ.get("PDI") or interval)
     # agentic's c16 patch carries the fp8 SEQ_ALONG_LANE pool --mk-prefill needs
     config = get_config(16, mode="mixed", mk_prefill=True)
     args, env = config["server_args"], config["runtime_env"]
