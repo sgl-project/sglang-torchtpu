@@ -66,6 +66,9 @@ def _largest_divisor(x: int, cap: int) -> int:
 
 
 _GATHER_PAGE_CHUNK = 128
+# Rows of an int32 (8, 128) VMEM tile: the page table is read 8 chunks of one sequence at a
+# time.
+_PAGE_TABLE_TILE_CHUNKS = 8
 
 
 def _lane_gather(window_chunk: jax.Array, lane: jax.Array) -> jax.Array:
@@ -138,7 +141,7 @@ def _gather_page_chunk_step_cycles(block_tokens: int, topk: int) -> float:
 
 
 def _gather_page_chunks_per_iteration(
-    num_chunks: int, block_tokens: int, topk: int
+    num_chunks: int, block_tokens: int, topk: int, *, table_in_vmem: bool = False
 ) -> int | None:
     """Chunks per loop iteration for the bounded kernel, or None to use the unrolled kernel.
 
@@ -150,11 +153,17 @@ def _gather_page_chunks_per_iteration(
       unrolled: max(floor, fixed + num_chunks * u)
       bounded:  max(floor, fixed + ceil(c / g) * (o + g * u))
 
+    With the page table resident in VMEM (``table_in_vmem``), a grid step no longer DMAs a
+    page-table row, so ``floor`` loses its per-chunk term, and chunks are read as aligned
+    (8, 128) tiles of 8 chunks, so ``g`` is a multiple of 8 and there is no unrolled kernel.
+
     Args:
       num_chunks: Width of a page-table row in 128-page chunks (static, from
         ``context_length``).
       block_tokens: Query tokens per grid step.
       topk: Top-k page ids per query token.
+      table_in_vmem: Whether the kernel reads the page table from VMEM
+        (``_gather_page_ids_vmem_table_kernel``).
 
     Returns:
       The number of chunk steps to unroll per ``fori_loop`` iteration of the bounded kernel,
@@ -172,10 +181,16 @@ def _gather_page_chunks_per_iteration(
     # A grid step also waits on its DMAs (top-k tile in, page-table row in, output tile out): a
     # 1-chunk step takes ~1030 cycles although its body is ~120 bundles, plus ~10 per chunk for
     # the page-table row (4 KB per 128-page chunk per block; ~1700 cycles at 64 chunks).
-    floor = 1030 + 10 * num_chunks
-    best_cycles = max(floor, fixed + num_chunks * u)
-    best_g = None
-    for g in range(1, num_chunks):
+    floor = 1030
+    if table_in_vmem:
+        tile = _PAGE_TABLE_TILE_CHUNKS
+        best_cycles, best_g = float("inf"), None
+        candidates = range(tile, align_to(num_chunks, tile) + 1, tile)
+    else:
+        floor += 10 * num_chunks
+        best_cycles, best_g = max(floor, fixed + num_chunks * u), None
+        candidates = range(1, num_chunks)
+    for g in candidates:
         cycles = (
             sum(
                 max(floor, fixed + -(-c // g) * (o + g * u))
@@ -211,6 +226,104 @@ def _gather_page_ids_bounded_kernel(
     out_ref[...] = lax.fori_loop(0, num_iterations, body, jnp.zeros_like(lane))
 
 
+def _gather_page_ids_vmem_table_kernel(
+    nchunks_ref,
+    seq_ids_ref,
+    page_table_ref,
+    logical_ref,
+    out_ref,
+    *,
+    chunks_per_iteration,
+):
+    """Bounded kernel that reads the page table from VMEM instead of a per-token row.
+
+    ``page_table_ref`` is the whole table as i32[max_num_seqs, padded_chunks, 128], so a
+    sequence's 8 consecutive chunks are one aligned (8, 128) tile and only the tiles a block
+    visits are read. A block of one sequence broadcasts each tile row to all its tokens; a block
+    spanning sequences builds each chunk's window from its tokens' tiles.
+    """
+    t = pl.program_id(0)
+    block_tokens = out_ref.shape[0]
+    tile = _PAGE_TABLE_TILE_CHUNKS
+    last_tile_start = page_table_ref.shape[1] - tile
+    g = chunks_per_iteration
+    lane, chunk = _split_logical_pages(logical_ref[...])  # i32[block_tokens, topk]
+    seq_ids = [seq_ids_ref[t * block_tokens + r] for r in range(block_tokens)]
+    row = lax.broadcasted_iota(jnp.int32, (block_tokens, _GATHER_PAGE_CHUNK), 0)
+    one_seq = seq_ids[0] == seq_ids[1]
+    for r in range(2, block_tokens):
+        one_seq = jnp.logical_and(one_seq, seq_ids[0] == seq_ids[r])
+
+    def make_body(token_seq_ids):
+        def body(i, out):
+            for k in range(g // tile):
+                # Tail tiles past the table repeat its last tile, which selects the same values.
+                c0 = pl.multiple_of(
+                    jnp.minimum(i * g + k * tile, last_tile_start), tile
+                )
+                tiles = [page_table_ref[s, pl.ds(c0, tile), :] for s in token_seq_ids]
+                for j in range(tile):
+                    window_chunk = jnp.broadcast_to(tiles[0][j : j + 1], row.shape)
+                    for r in range(1, len(tiles)):
+                        window_chunk = jnp.where(
+                            row == r,
+                            jnp.broadcast_to(tiles[r][j : j + 1], row.shape),
+                            window_chunk,
+                        )
+                    out = jnp.where(
+                        chunk == c0 + j, _lane_gather(window_chunk, lane), out
+                    )
+            return out
+
+        return body
+
+    num_iterations = (nchunks_ref[t] + g - 1) // g
+
+    @pl.when(one_seq)
+    def _():
+        out_ref[...] = lax.fori_loop(
+            0, num_iterations, make_body(seq_ids[:1]), jnp.zeros_like(lane)
+        )
+
+    @pl.when(jnp.logical_not(one_seq))
+    def _():
+        out_ref[...] = lax.fori_loop(
+            0, num_iterations, make_body(seq_ids), jnp.zeros_like(lane)
+        )
+
+
+def _page_table_fits_in_vmem(
+    max_num_seqs: int,
+    padded_chunks: int,
+    padded_tokens: int,
+    block_tokens: int,
+    topk: int,
+) -> bool:
+    """Whether ``_gather_page_ids_vmem_table_kernel`` fits this TPU's VMEM and SMEM.
+
+    Args:
+      max_num_seqs: Rows of the page table.
+      padded_chunks: Width of a page-table row in 128-page chunks, a multiple of 8.
+      padded_tokens: Query tokens, a multiple of ``block_tokens``.
+      block_tokens: Query tokens per grid step.
+      topk: Top-k page ids per query token.
+
+    Returns:
+      True if the single-buffered page table plus the double-buffered top-k and output blocks
+      fit in VMEM, and the per-token sequence ids plus per-block chunk counts fit in SMEM.
+    """
+    info = pltpu.get_tpu_info()
+    vmem = 4 * (
+        max_num_seqs * padded_chunks * _GATHER_PAGE_CHUNK + 2 * 2 * block_tokens * topk
+    )
+    smem = 4 * (padded_tokens + padded_tokens // block_tokens)
+    # Same SMEM reserve as the batched RPA schedule (batched_rpa/configs.py).
+    return (
+        vmem <= info.vmem_capacity_bytes
+        and smem <= info.smem_capacity_bytes - 32 * 1024
+    )
+
+
 def gather_page_ids(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     seq_page_ids: jax.Array,  # i32[num_tokens, topk]  (logical page within seq)
@@ -224,6 +337,61 @@ def gather_page_ids(
     pages_per_seq = page_indices.shape[0] // max_num_seqs
     num_chunks = cdiv(pages_per_seq, _GATHER_PAGE_CHUNK)
     padded_pps = num_chunks * _GATHER_PAGE_CHUNK
+    padded_tokens = align_to(num_tokens, block_tokens)
+    nblocks = padded_tokens // block_tokens
+
+    def chunks_needed(logical):
+        """i32[nblocks]: chunks up to each block's largest logical page."""
+        return (
+            logical.reshape(nblocks, block_tokens * topk).max(axis=1)
+            // _GATHER_PAGE_CHUNK
+            + 1
+        ).astype(jnp.int32)
+
+    padded_chunks = align_to(num_chunks, _PAGE_TABLE_TILE_CHUNKS)
+    if _page_table_fits_in_vmem(
+        max_num_seqs, padded_chunks, padded_tokens, block_tokens, topk
+    ):
+        pad = padded_tokens - num_tokens
+        logical = jnp.pad(
+            jnp.clip(seq_page_ids, 0, pages_per_seq - 1), ((0, pad), (0, 0))
+        )
+        seq_ids = jnp.pad(seq_ids_segment.astype(jnp.int32), (0, pad))
+        page_table = jnp.pad(
+            page_indices.reshape(max_num_seqs, pages_per_seq),
+            ((0, 0), (0, padded_chunks * _GATHER_PAGE_CHUNK - pages_per_seq)),
+        ).reshape(max_num_seqs, padded_chunks, _GATHER_PAGE_CHUNK)
+        chunks_per_iteration = _gather_page_chunks_per_iteration(
+            num_chunks, block_tokens, topk, table_in_vmem=True
+        )
+        out = pl.pallas_call(
+            functools.partial(
+                _gather_page_ids_vmem_table_kernel,
+                chunks_per_iteration=chunks_per_iteration,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                in_specs=[
+                    # Same block every step: fetched once, so one buffer is enough.
+                    pl.BlockSpec(
+                        page_table.shape,
+                        lambda t, n, s: (0, 0, 0),
+                        pipeline_mode=pl.Buffered(1),
+                    ),
+                    pl.BlockSpec((block_tokens, topk), lambda t, n, s: (t, 0)),
+                ],
+                out_specs=pl.BlockSpec((block_tokens, topk), lambda t, n, s: (t, 0)),
+                grid=(nblocks,),
+            ),
+            out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                disable_bounds_checks=True,
+                vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+            ),
+            name="gather_page_ids_vmem_table",
+        )(chunks_needed(logical), seq_ids, page_table, logical)
+        return out[:num_tokens]
 
     page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
     if padded_pps != pages_per_seq:
@@ -232,7 +400,6 @@ def gather_page_ids(
     windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
     logical = jnp.clip(seq_page_ids, 0, pages_per_seq - 1)
 
-    padded_tokens = align_to(num_tokens, block_tokens)
     if padded_tokens != num_tokens:
         pad = padded_tokens - num_tokens
         windows = jnp.pad(windows, ((0, pad), (0, 0)))
@@ -242,12 +409,6 @@ def gather_page_ids(
         num_chunks, block_tokens, topk
     )
     if chunks_per_iteration is not None:
-        nblocks = padded_tokens // block_tokens
-        nchunks = (
-            logical.reshape(nblocks, block_tokens * topk).max(axis=1)
-            // _GATHER_PAGE_CHUNK
-            + 1
-        ).astype(jnp.int32)
         out = pl.pallas_call(
             functools.partial(
                 _gather_page_ids_bounded_kernel,
@@ -269,7 +430,7 @@ def gather_page_ids(
                 disable_bounds_checks=True,
             ),
             name="gather_page_ids_bounded",
-        )(nchunks, windows, logical)
+        )(chunks_needed(logical), windows, logical)
         return out[:num_tokens]
 
     out = pl.pallas_call(
