@@ -241,12 +241,14 @@ def _child(mode, batch):
                     selected, counts, copy_expert, slot_count=4,
                     already_started=jnp.int32(0), group_pending_routes=True,
                     first_staged_expert=GROUP_EXPERTS if steal else None)
-                dmk._start_expert_schedule(schedule, selected, counts)
+                dmk._start_expert_schedule(
+                    schedule, selected, counts, GROUP_EXPERTS if steal else None)
                 if steal:
                     def replace_routes(routes):
                         store_routes(*routes)
                         schedule.copy.wait()
-                        dmk._start_expert_schedule(schedule, routes[0], routes[2])
+                        dmk._start_expert_schedule(
+                            schedule, routes[0], routes[2], GROUP_EXPERTS)
 
                     step.receive(replace_routes)
                 routes_ref[layer, :, :128] = experts_vmem[...]
@@ -375,6 +377,10 @@ def _child(mode, batch):
                 "first stolen in the initial window"
                 if plans[light][0] < 4
                 else "first stolen in the prefetch window")
+            slab, lead, copy, _ = dmk.STEAL_TIMING[batch]
+            own = plans[light][0]
+            if own >= 6 and (slab + copy) * give - lead <= 10 * (own - 4):
+                coverage.add("stolen before the last own pair")
             for e in given:
                 n = sum(
                     bool(live[layer, r]) and core * GROUP_EXPERTS + e in winners[layer, r]
@@ -397,6 +403,7 @@ def _child(mode, batch):
         wanted = {"give from core 0", "give from core 1", "capped", "under the cap",
                   "first stolen in the initial window",
                   "first stolen in the prefetch window",
+                  "stolen before the last own pair",
                   "stolen single-row", "stolen multi-row"}
         if batch == 16:
             wanted.add("stolen past a compact tile")

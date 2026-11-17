@@ -578,17 +578,19 @@ def _start_initial_expert_weight_copies(
     SCHEDULE_ROW_MASK_LOW,
     SCHEDULE_ROW_MASK_HIGH,
     SCHEDULE_EXPERT_COUNT,
-) = range(6)
+    SCHEDULE_OWN_COUNT,
+) = range(7)
 
 
-def _expert_schedule_table(selected_experts, local_route_counts):
+def _expert_schedule_table(selected_experts, local_route_counts, first_stolen=None):
     """The grouped expert loop's schedule as an [8, 128] int32 table.
 
     Lane k describes the k-th used local expert in ascending id order (the
     grouped loop's pending-route minimum): its id, its row count, its row if
     it has one (else 0) and the low and high bytes of its row bitmask. Lanes
     past the last used expert are zero; every lane of SCHEDULE_EXPERT_COUNT
-    holds the used-expert count. Each value is an integer below 256 (exact in
+    holds the used-expert count and, with ``first_stolen`` (the expert
+    steal), every lane of SCHEDULE_OWN_COUNT the used experts below it. Each value is an integer below 256 (exact in
     BF16), and each one-hot product sums one nonzero term, so it is exact.
     """
     batch_size, route_count = selected_experts.shape
@@ -641,6 +643,11 @@ def _expert_schedule_table(selected_experts, local_route_counts):
     )
     expert_count = jnp.sum(used.astype(jnp.float32), axis=1, keepdims=True)
     table = jnp.where(table_rows == SCHEDULE_EXPERT_COUNT, expert_count, table)
+    if first_stolen is not None:
+        own_count = jnp.sum(
+            jnp.where(used & (lanes < first_stolen), 1.0, 0.0), axis=1, keepdims=True
+        )
+        table = jnp.where(table_rows == SCHEDULE_OWN_COUNT, own_count, table)
     return table[:8].astype(jnp.int32)
 
 
@@ -653,9 +660,13 @@ def _expert_schedule(staging_vmem, table_smem, semaphore):
     )
 
 
-def _start_expert_schedule(schedule, selected_experts, local_route_counts):
+def _start_expert_schedule(
+    schedule, selected_experts, local_route_counts, first_stolen=None
+):
     """Build the schedule after routing; the expert stream waits for its copy."""
-    schedule.staging[...] = _expert_schedule_table(selected_experts, local_route_counts)
+    schedule.staging[...] = _expert_schedule_table(
+        selected_experts, local_route_counts, first_stolen
+    )
     schedule.copy.start()
 
 
@@ -1134,7 +1145,10 @@ def _run_routed_expert_stream(
     slab has landed by then, else at the start of its own iteration after
     waiting for the slab. Each one's output goes to its own FP32 accumulator
     ``stolen.accumulators[1 + slot]`` (``accumulators[0]`` is
-    ``expert_output``).
+    ``expert_output``), returned (``stolen.send``) at the end of its
+    iteration. With ``stolen.timing`` (expert_steal.modelled_moves) they run
+    just before the last own pair when that pair starts at position 4 or
+    later and the model has their slabs landed in time (SCHEDULE_OWN_COUNT).
     """
     batch_size, selected_expert_count = selected_experts.shape
     if stolen is not None and expert_schedule is None:
@@ -1885,10 +1899,36 @@ def _run_routed_expert_stream(
             )
             finish_shared_expert(index, slot, 0)
 
+    def column(position):
+        return position
+
     if expert_schedule is not None:
         expert_schedule.copy.wait()
         schedule = expert_schedule.table
         pair_count = (schedule[SCHEDULE_EXPERT_COUNT, 0] + 1) // 2
+        if stolen is not None and stolen.timing is not None:
+            # The stolen experts run just before the last own pair when that
+            # pair starts past the initial copies and the timing model has
+            # their slabs landed by then: their returns cross while it runs.
+            own = schedule[SCHEDULE_OWN_COUNT, 0]
+            moved = schedule[SCHEDULE_EXPERT_COUNT, 0] - own
+            slab, lead, copy, _ = stolen.timing
+            first_moved = own - 2
+            hoist = (
+                (moved > 0)
+                & (own >= 6)
+                & ((slab + copy) * moved - lead <= 10 * (own - 4))
+            )
+
+            def column(position):
+                early = hoist & (position >= first_moved)
+                stolen_here = early & (position < first_moved + moved)
+                own_after = early & ~stolen_here & (position < own + moved)
+                return jnp.where(
+                    stolen_here,
+                    position + 2,
+                    jnp.where(own_after, position - moved, position),
+                )
     elif group_pending_routes:
         # Each iteration serves every pending route of its two experts, so the
         # loop needs one iteration per two distinct experts, not per two
@@ -1933,8 +1973,9 @@ def _run_routed_expert_stream(
         def scheduled_expert(position):
             """The schedule's position-th expert: its id (0 past the last),
             whether it exists, and its row count."""
-            row_count = schedule[SCHEDULE_ROW_COUNT, position]
-            return schedule[SCHEDULE_EXPERT, position], row_count > 0, row_count
+            entry = column(position)
+            row_count = schedule[SCHEDULE_ROW_COUNT, entry]
+            return schedule[SCHEDULE_EXPERT, entry], row_count > 0, row_count
 
         def scheduled_routes(position):
             """A scheduled expert with its active rows and route slots: every
@@ -1954,7 +1995,7 @@ def _run_routed_expert_stream(
                 entry; None without a schedule."""
                 if expert_schedule is None:
                     return None
-                return schedule[table_row, 2 * iteration + index]
+                return schedule[table_row, column(2 * iteration + index)]
 
             def scheduled_row_words(index):
                 if expert_schedule is None:
@@ -2521,6 +2562,16 @@ def _run_routed_expert_stream(
                     def execute_tail():
                         execute_full_tail()
 
+                if stolen is not None:
+                    # This pair's stolen experts are done: return them now.
+                    @pl.loop(2 * iteration, 2 * iteration + 2)
+                    def return_stolen(position):
+                        expert, has_expert, _ = scheduled_expert(position)
+
+                        @pl.when(has_expert & (expert >= stolen.first_expert))
+                        def _():
+                            stolen.send(expert - stolen.first_expert)
+
                 if expert_schedule is None:
                     processed_routes_vmem[:, :selected_expert_count] = jnp.where(
                         first_consumed | second_consumed,
@@ -2784,8 +2835,10 @@ class _ExpertStealStep:
         self.accumulators = accumulators
         self.weights = weights
         self.slots = protocol.slots
+        self.timing = None
 
     def planner(self, batch_size, top_k):
+        self.timing = STEAL_TIMING.get(batch_size)
         return expert_steal.StealPlanner(
             batch_size,
             top_k,
@@ -2793,7 +2846,7 @@ class _ExpertStealStep:
             self.group,
             self.local_expert_count,
             self.slots,
-            STEAL_TIMING.get(batch_size),
+            self.timing,
         )
 
     def begin(self, planner, tag, plan=None):
@@ -2836,6 +2889,10 @@ class _ExpertStealStep:
             first_expert=self.local_expert_count,
             accumulators=self.accumulators,
             start=self.start_stolen_copy,
+            send=lambda index: self.protocol.send_return(
+                self.accumulators.at[pl.ds(1, self.slots)], index
+            ),
+            timing=self.timing,
         )
 
     def combine(self, routed_outputs, width):
@@ -3857,7 +3914,10 @@ def moe(
         if expert_schedule is not None:
             # After the first expert copies, ahead of the shared expert.
             _start_expert_schedule(
-                expert_schedule, selected_experts, local_route_counts
+                expert_schedule,
+                selected_experts,
+                local_route_counts,
+                None if steal_step is None else local_expert_count,
             )
 
         if not overlap_latent_gather:
@@ -3878,7 +3938,9 @@ def moe(
             def replace_routes(routes):
                 store_routes(*routes)
                 expert_schedule.copy.wait()
-                _start_expert_schedule(expert_schedule, routes[0], routes[2])
+                _start_expert_schedule(
+                    expert_schedule, routes[0], routes[2], local_expert_count
+                )
 
             steal_step.receive(replace_routes)
 

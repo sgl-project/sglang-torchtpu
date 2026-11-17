@@ -397,7 +397,8 @@ class ExpertSteal:
     slab receives [slots]); ``errors``: SMEM int32 [1] mismatch counter.
 
     Variant B (the decode megakernel) adds ``ready`` (SMEM int32 [slots]:
-    staging slot j waited for this layer, :meth:`stage`), ``returns`` (VMEM
+    1 once staging slot j is waited for this layer, :meth:`stage`, 2 once its
+    output is returned, :meth:`send_return`), ``returns`` (VMEM
     [slots, ...] FP32, the sibling's returned outputs of this core's given
     experts), ``return_semaphores`` (send, receive) and optionally ``landed``
     (:meth:`landed`).
@@ -545,11 +546,18 @@ class ExpertSteal:
             device_id_type=pl.DeviceIdType.MESH,
         )
 
+    def send_return(self, outputs, slot):
+        """Return stolen expert ``slot``'s output (``outputs[slot]``) into the
+        sibling's ``returns`` now (``ready`` 2: sent)."""
+        self._return_copy(outputs, slot).start()
+        self.ready[slot] = 2
+
     def send_returns(self, count, outputs):
         """Return the stolen experts' outputs (``outputs[j]``, j < ``count``,
-        the received packet's count) into the sibling's ``returns``. A slot
-        the stream did not stage (only after a plan mismatch) is waited for
-        and returned as zeros."""
+        the received packet's count) into the sibling's ``returns``, except
+        those already sent (:meth:`send_return`). A slot the stream did not
+        stage (only after a plan mismatch) is waited for and returned as
+        zeros."""
         assert outputs.shape[1:] == self.returns.shape[1:], "return shapes"
 
         @pl.loop(0, count)
@@ -560,7 +568,9 @@ class ExpertSteal:
                 self.ready[slot] = 1
                 outputs.at[slot][...] = jnp.zeros(outputs.shape[1:], outputs.dtype)
 
-            self._return_copy(outputs, slot).start()
+            @pl.when(self.ready[slot] != 2)
+            def _():
+                self.send_return(outputs, slot)
 
     def wait_returns(self, give):
         """Wait for the sibling's returns of this core's ``give`` experts."""
