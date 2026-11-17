@@ -72,8 +72,13 @@ def tpu_compute_base_logits(
     lm_head = model.lm_head
     x_post_hc = model.collapse_hc_head(x)
     x = model.stages[-1].norm(x_post_hc)
-    logits = project_through_lm_head(x, lm_head)[..., : int(lm_head.org_vocab_size)]
-    return logits, x_post_hc
+    weight = lm_head.weight
+    # As core _logits_from_x_post_hc: SGLANG_DSPARK_FP32_LM_HEAD projects in fp32.
+    if model._use_fp32_lm_head and weight.is_floating_point():
+        logits = torch.nn.functional.linear(x.float(), weight.float())
+    else:
+        logits = project_through_lm_head(x, lm_head)
+    return logits[..., : int(lm_head.org_vocab_size)], x_post_hc
 
 
 def greedy_markov_drafts(
