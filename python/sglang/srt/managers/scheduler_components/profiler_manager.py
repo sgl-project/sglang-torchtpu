@@ -367,10 +367,15 @@ class SchedulerProfilerManager:
             self._apply_detailed_annotations(False)
             return self._profile_manager.manual_stop()
 
+        if stage is None:
+            self.profile_by_stage = False
+            self.profiler_start_forward_ct = None
+            self.profiler_target_forward_ct = None
+
         if not self.profile_in_progress:
             return ProfileReqOutput(
-                success=False,
-                message="Profiling is not in progress. Call /start_profile first.",
+                success=True,
+                message="Profiling is not in progress.",
             )
 
         self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)

@@ -9,12 +9,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import ProfileReq
 from sglang.srt.managers.scheduler_components import (
     profiler_manager as scheduler_profiler,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import profiler as tpu_profiler
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.profiler import (
     _tpu_profile_options,
@@ -64,6 +66,9 @@ def _fake_torch_tpu(profile_options_cls=_BaseProfileOptions, calls=None):
 
 
 class TestTpuProfileOptions(CustomTestCase):
+    def setUp(self):
+        self.enterContext(patch.object(tpu_profiler.tpu_profiler, "_module", None))
+
     def _options(
         self,
         *,
@@ -165,6 +170,21 @@ class TestStartStopUsesLibtpuTrace(CustomTestCase):
     since a capture with the wrong ones still succeeds.
     """
 
+    def setUp(self):
+        self.enterContext(patch.object(tpu_profiler.tpu_profiler, "_module", None))
+        self.parallel = types.SimpleNamespace(
+            tp_rank=0,
+            dp_rank=0,
+            pp_rank=0,
+            moe_ep_rank=0,
+            num_dp_ranks=1,
+            pp_size=1,
+            moe_ep_size=1,
+        )
+        self.enterContext(
+            patch.object(tpu_profiler, "get_parallel", return_value=self.parallel)
+        )
+
     def test_start_calls_start_trace_with_output_dir(self):
         calls = []
         with (
@@ -191,12 +211,87 @@ class TestStartStopUsesLibtpuTrace(CustomTestCase):
         self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
         self.assertEqual(options.tpu_num_sparse_core_tiles_to_trace, 1)
 
-    def test_stop_calls_stop_trace(self):
+    def test_stop_drains_before_export(self):
         calls = []
-        with patch.dict(sys.modules, _fake_torch_tpu(calls=calls)):
-            stop_tpu_profile(None)
+        with (
+            patch.dict(sys.modules, _fake_torch_tpu(calls=calls)),
+            patch.object(
+                tpu_profiler.current_platform,
+                "synchronize",
+                side_effect=lambda: calls.append(("drain",)),
+            ),
+        ):
+            trace = start_tpu_profile(output_dir=Path("/tmp/xprof-unit-test"))
+            stop_tpu_profile(trace)
 
-        self.assertEqual([c[0] for c in calls], ["stop"])
+        self.assertEqual([c[0] for c in calls], ["start", "drain", "stop"])
+
+    def test_nonprimary_ranks_do_not_create_collectors_or_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for rank in ("tp_rank", "dp_rank", "pp_rank", "moe_ep_rank"):
+                with self.subTest(rank=rank), patch.object(self.parallel, rank, 1):
+                    output = Path(directory) / rank
+                    trace = start_tpu_profile(output_dir=output)
+                    self.assertIsNone(trace)
+                    stop_tpu_profile(trace)
+                    self.assertFalse(output.exists())
+                    self.assertIsNone(tpu_profiler.tpu_profiler._module)
+
+    def test_shared_manager_keeps_prefill_and_decode_in_one_bounded_capture(self):
+        calls = []
+        forward_ct = 0
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            envs.SGLANG_PROFILE_V2.override(False),
+            patch.object(
+                scheduler_profiler,
+                "get_dp_tp_group",
+                return_value=types.SimpleNamespace(cpu_group=None),
+            ),
+            patch.object(
+                scheduler_profiler, "get_parallel", return_value=self.parallel
+            ),
+            patch.object(scheduler_profiler, "_is_tpu", True),
+            patch.dict(sys.modules, _fake_torch_tpu(calls=calls)),
+            patch.object(
+                tpu_profiler.current_platform,
+                "synchronize",
+                side_effect=lambda: calls.append(("drain",)),
+            ),
+        ):
+            manager = scheduler_profiler.SchedulerProfilerManager(
+                get_forward_ct=lambda: forward_ct
+            )
+            request = ProfileReq(
+                output_dir=directory,
+                num_steps=3,
+                activities=["TPU"],
+                profile_by_stage=False,
+            )
+            self.assertTrue(manager._profile(request).success)
+            for mode in (ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.DECODE):
+                forward_ct += 1
+                manager._profile_batch_predicate(
+                    types.SimpleNamespace(forward_mode=mode)
+                )
+            self.assertEqual([c[0] for c in calls], ["start"])
+            forward_ct += 1
+            manager._profile_batch_predicate(
+                types.SimpleNamespace(forward_mode=ForwardMode.DECODE)
+            )
+            self.assertTrue(manager._stop_profile().success)
+            self.assertEqual([c[0] for c in calls], ["start", "drain", "stop"])
+            self.assertTrue(manager._profile(request).success)
+            self.assertTrue(manager._stop_profile().success)
+            self.assertEqual([c[0] for c in calls], ["start", "drain", "stop"] * 2)
+            request.start_step = 100
+            self.assertTrue(manager._profile(request).success)
+            self.assertTrue(manager._stop_profile().success)
+            forward_ct = 100
+            manager._profile_batch_predicate(
+                types.SimpleNamespace(forward_mode=ForwardMode.DECODE)
+            )
+            self.assertEqual([c[0] for c in calls], ["start", "drain", "stop"] * 2)
 
 
 class TestStopProfileSynchronization(CustomTestCase):
