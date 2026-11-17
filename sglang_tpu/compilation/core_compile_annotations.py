@@ -43,6 +43,14 @@ def _bailing_vl_decoder_policy() -> type[CompilePolicy]:
     return BailingVLDecoderTpuCompilePolicy
 
 
+def _deepseek_v4_decoder_policy() -> type[CompilePolicy]:
+    from sglang_tpu.models.deepseek_v41.compile_policy import (
+        DeepseekV4DecoderTpuCompilePolicy,
+    )
+
+    return DeepseekV4DecoderTpuCompilePolicy
+
+
 def _kimi_k3_vision_policy() -> type[CompilePolicy]:
     from sglang_tpu.graph_runner.kimi_k3_vit_tpu_compile_runner import (
         KimiK3VisionTpuCompilePolicy,
@@ -72,6 +80,14 @@ CORE_COMPILE_BOUNDARIES: tuple[_CoreCompileBoundary, ...] = (
         module="sglang.srt.models.bailing_mm_v3",
         class_name="BailingMoeV3VLModel",
         policy=_bailing_vl_decoder_policy,
+    ),
+    # DeepSeek-V4 and V4.1 share this class. The policy pads like the generic
+    # whole-model fallback, then stages host Engram rows (Engram models) and,
+    # under attention DP, the token embedding before attention planning.
+    _CoreCompileBoundary(
+        module="sglang.srt.models.deepseek_v4",
+        class_name="DeepseekV4ForCausalLM",
+        policy=_deepseek_v4_decoder_policy,
     ),
     # Kimi-K3's vision encoder. Its layer loop runs on the TPU runner the
     # plugin attaches as graph_runners (sglang_tpu.hooks.kimi_k3_vision); this

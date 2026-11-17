@@ -296,9 +296,12 @@ class RaidenReceiverMixin:
             if aux_index is not None:
                 self._decode.decode_aux_index[room] = aux_index
             prefix_blocks: List[int] = []
+            prefix_swa_blocks: List[int] = []
             if self.dram_offload_channel is not None:
-                prefix_blocks = self.dram_offload_channel.offered_blocks_locked(
-                    room, bootstrap_infos
+                prefix_blocks, prefix_swa_blocks = (
+                    self.dram_offload_channel.offered_blocks_locked(
+                        room, bootstrap_infos
+                    )
                 )
         payload = PullReq(
             room=room,
@@ -307,6 +310,7 @@ class RaidenReceiverMixin:
             decode_pages=len(local_blocks),
             decode_swa_pages=len(local_swa_blocks),
             prefix_blocks=prefix_blocks,
+            prefix_swa_blocks=prefix_swa_blocks,
             kv_offload=self.dram_offload_channel is not None,
         ).to_frames()
         for info in bootstrap_infos:
@@ -505,6 +509,24 @@ class RaidenReceiverMixin:
         if self.chunked_transfer:
             return self._start_chunked_pull(room)
         return self._start_whole_pull(room)
+
+    def _sweep_pulls(self) -> None:
+        """Settle finished reads and start the queued chunks they unblock.
+
+        Runs on the listener. A room keeps one chunk read in flight and a read
+        holds its staging until a drain settles it, so a scheduler stalled
+        between polls would otherwise leave every later announcement queued
+        until it outwaits the transfer deadline.
+        """
+        # Pipeline transfer leaves chunked_transfer False.
+        if not self.chunked_transfer:
+            return
+        if not self._try_drain_engine():
+            return
+        with self._state_lock:
+            rooms = [room for room, queue in self._decode.chunk_queue.items() if queue]
+        for room in rooms:
+            self._start_chunked_pull(room)
 
     def _start_chunked_pull(self, room: int) -> bool:
         """Issue the next announced chunk once the pool can seat it.

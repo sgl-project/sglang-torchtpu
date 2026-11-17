@@ -66,8 +66,10 @@ class LoweredGraph:
     ``NO_CALLBACKS``), and ``direct_compile`` checks it against the live inputs
     exactly as a consumer checks its owner's. Its arguments are the retained
     model inputs, the KV-pool state and the explicit tensor inputs, in that
-    order; its results are the output leaves followed by the updated KV-pool
-    state. ``executable`` is ``spmd_compiler.serialize_executable`` of the
+    order; its results are the output leaves, the updated KV-pool state, then
+    the new values of the explicit inputs it writes in place:
+    ``mutated_inputs`` holds their positions among the explicit tensor inputs,
+    in order. ``executable`` is ``spmd_compiler.serialize_executable`` of the
     compiled graph, and ``fingerprint`` its ``fingerprint_executable()``; a
     loaded executable with another fingerprint is not reused.
     ``subslice_origin`` is its ``subslice_origin()``, the TPU subslice's chip
@@ -79,3 +81,4 @@ class LoweredGraph:
     executable: bytes
     fingerprint: str
     subslice_origin: Any
+    mutated_inputs: tuple[int, ...]

@@ -43,6 +43,7 @@ class TestKimiK31Server(unittest.TestCase):
         for name, value in K3_CONFIG["runtime_env"].items():
             if name != "LIBTPU_INIT_ARGS":
                 self.assertEqual(env[name], value, name)
+        self.assertEqual(env["SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT"], "1")
 
     def test_with_libtpu_flags_replaces_and_moves_to_the_end(self):
         self.assertEqual(

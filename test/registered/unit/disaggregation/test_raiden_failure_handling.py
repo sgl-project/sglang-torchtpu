@@ -24,7 +24,7 @@ from sglang_tpu.disaggregation.raiden.conn import (
     RaidenKVReceiver,
     RaidenKVSender,
 )
-from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
+from sglang_tpu.disaggregation.raiden.pool_transfer import RaidenPoolTransfer
 from sglang_tpu.disaggregation.raiden.serde import (
     MessageTag,
     PullReq,
@@ -78,6 +78,7 @@ def _prefill_manager():
     mgr.failure_records = {}
     mgr.failure_lock = threading.Lock()
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr._announce_lock = threading.Lock()
     mgr._completed_send = set()
@@ -122,6 +123,7 @@ def _decode_manager():
     mgr.failure_records = {}
     mgr.failure_lock = threading.Lock()
     mgr._state_lock = threading.Lock()
+    mgr._drain_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr._aborted = {}
     mgr._failed = set()
@@ -365,6 +367,7 @@ def _decode_manager_stub(**overrides):
         failure_lock=threading.Lock(),
         waiting_timeout=300,
         _state_lock=threading.Lock(),
+        _drain_lock=threading.Lock(),
         _aborted={},
         _prefill=None,
         _failed=set(),
@@ -433,6 +436,7 @@ class TestReceiverFailurePaths(unittest.TestCase):
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._aborted = {}
         mgr._failed = set()
@@ -563,6 +567,7 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
             bootstrap_timeout=bootstrap_timeout,
             waiting_timeout=300,
             _state_lock=threading.Lock(),
+            _drain_lock=threading.Lock(),
             _aborted={},
             _prefill=PrefillState(
                 announce_pages=1,
@@ -639,8 +644,8 @@ def _gate_sender(mgr, room):
 
 
 def _producer_pipeline(mgr):
-    """A prefill-side PipelineTransfer that records requests but never replies."""
-    pipe = PipelineTransfer.__new__(PipelineTransfer)
+    """A prefill-side RaidenPoolTransfer that records requests but never replies."""
+    pipe = RaidenPoolTransfer.__new__(RaidenPoolTransfer)
     pipe.manager = mgr
     pipe.producer = True
     pipe.lock = threading.RLock()
@@ -2052,6 +2057,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         mgr = RaidenKVManager.__new__(RaidenKVManager)
         mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
         mgr.connection_pool = {
@@ -2094,6 +2100,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         mgr = RaidenKVManager.__new__(RaidenKVManager)
         mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
+        mgr._drain_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
         mgr.connection_pool = {}

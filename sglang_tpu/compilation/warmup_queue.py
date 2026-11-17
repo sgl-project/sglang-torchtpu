@@ -91,7 +91,7 @@ def current_lowered_graph_store() -> FileLoweredGraphStore | None:
 @contextmanager
 def eager_warmup() -> Iterator[Callable[[torch.Tensor], None]]:
     """Submit the usual D2H boundaries, then join before releasing their buffers."""
-    stream = torch.tpu.current_stream()
+    stream = torch.accelerator.current_stream()
     host_outputs: list[torch.Tensor] = []
 
     def materialize(value: torch.Tensor) -> None:

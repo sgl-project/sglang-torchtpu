@@ -182,8 +182,9 @@ class NgramEmbeddingManager:
                 # decode paths, which a PD decode request has not run yet.
                 fill_ids = req.origin_input_ids + req.output_ids
                 end = len(fill_ids) - 1
-                ids = fill_ids[max(0, end - n1) : end]
-                rows.append([0] * (n1 - len(ids)) + list(ids))
+                rows.append(
+                    self.engram_hasher.history_row(fill_ids[max(0, end - n1) : end])
+                )
             slots = torch.tensor(
                 [req.kv.req_pool_idx for req in batch.reqs],
                 dtype=torch.int64,
@@ -200,7 +201,7 @@ class NgramEmbeddingManager:
             start = req.extend_range.start
             lo = max(0, start - n1)
             ids = req.full_untruncated_fill_ids[lo:start]
-            rows.append([0] * (n1 - len(ids)) + list(ids))
+            rows.append(self.engram_hasher.history_row(ids))
         # The forward stream waits on the schedule stream, which orders this copy.
         batch.engram_history = async_h2d(
             rows, dtype=torch.int32, device=self.engram_hasher.history.device

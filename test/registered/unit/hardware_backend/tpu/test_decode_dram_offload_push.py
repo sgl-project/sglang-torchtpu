@@ -663,6 +663,28 @@ class TestRecallLandingReclaimsHostDuplicates(CustomTestCase):
         )
         self.assertEqual(radix_host_ops.reclaim_full_host_duplicates(cache, 8), 0)
 
+    def test_host_insert_hashes_pages_only_when_the_tree_keeps_hashes(self):
+        # Hashes feed L3 storage and the cache linker only; computing them for
+        # every recall loaded the native hash extension on every pull, which
+        # rebuilt it each time on a host whose ranks share its build directory.
+        cache, host, tokens = self._write_through_cache()
+        from array import array as _array
+
+        from sglang.srt.mem_cache.radix_cache import RadixKey as _RadixKey
+
+        host.capacity += 16
+        with patch.object(radix_host_ops, "get_hash_str") as hash_str:
+            radix_host_ops.insert_host_prefix(
+                cache, _RadixKey(_array("q", tokens + [7] * 8)), host.alloc(8), 1
+            )
+            hash_str.assert_not_called()
+            cache.tree_core.enable_storage = True
+            hash_str.return_value = ["h"] * 8
+            radix_host_ops.insert_host_prefix(
+                cache, _RadixKey(_array("q", tokens + [9] * 8)), host.alloc(8), 1
+            )
+            hash_str.assert_called_once()
+
     def test_reclaim_is_a_no_op_without_pressure(self):
         cache, host, _ = self._write_through_cache()
         self.assertEqual(radix_host_ops.reclaim_full_host_duplicates(cache, 0), 0)
@@ -708,7 +730,7 @@ class TestEvictionWalkSkipsDeletedLeaves(CustomTestCase):
             cache.tree_core.root_node.id,
             key,
             host.alloc(16),
-            radix_host_ops._page_hashes(list(key.token_ids), 1),
+            radix_host_ops._page_hashes(cache.tree_core, list(key.token_ids), 1),
         )
         self.assertFalse(node.backuped)
         return cache, node

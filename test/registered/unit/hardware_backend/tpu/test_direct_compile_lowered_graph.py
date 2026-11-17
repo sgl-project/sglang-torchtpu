@@ -239,6 +239,45 @@ class TestDirectCompileLoweredGraph(CustomTestCase):
                 self.assertIs(inputs[1], model.bias)
                 self.assertIs(inputs[3], value)
 
+    def test_stored_graph_writes_back_the_inputs_it_writes(self):
+        def compiled(traces):
+            model, pool = _Model(), _KVPool()
+
+            def fn(value):
+                traces.append(tuple(value.shape))
+                pool.value.add_(model.bias)
+                value.mul_(2)
+                return {"out": value + model.weight}
+
+            return direct_compile.direct_compile(
+                fn,
+                specialization_key=lambda value: tuple(value.shape),
+                model=model,
+                kv_pool=pool,
+                name="test/writes",
+            )
+
+        def execute(executable, inputs):
+            weight, bias, kv, value = inputs
+            return [value * 2 + weight, kv + bias, value * 2]
+
+        store, traces = _MemoryStore(), []
+        with self._cpu_compile(store) as mocks:
+            mocks.execute.side_effect = execute
+            compiled(traces)(torch.full((2,), 2.0))
+        # Traced again once it saw the write; that graph is the one stored.
+        self.assertEqual(traces, [(2,), (2,)])
+        (graph,) = store.records
+        self.assertEqual(graph.mutated_inputs, (0,))
+
+        traces, value = [], torch.full((2,), 5.0)
+        with self._cpu_compile(store) as mocks:
+            mocks.execute.side_effect = execute
+            result = compiled(traces)(value)
+        self.assertEqual(traces, [])
+        torch.testing.assert_close(value, torch.full((2,), 10.0))
+        torch.testing.assert_close(result["out"], torch.full((2,), 11.0))
+
     def test_stored_graph_loads_with_its_subslice_origin(self):
         # Serialized executables omit a subslice TP group's chip coordinates.
         store = _MemoryStore()

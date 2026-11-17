@@ -87,6 +87,7 @@ def _graph(
     executable=b"\x00executable-bytes",
     fingerprint="fp-1",
     subslice_origin=None,
+    mutated_inputs=(),
     **changes,
 ):
     interface = ExecutableInterface(
@@ -107,6 +108,7 @@ def _graph(
         executable=executable,
         fingerprint=fingerprint,
         subslice_origin=subslice_origin,
+        mutated_inputs=mutated_inputs,
     )
 
 
@@ -120,6 +122,7 @@ def _assert_same_graph(actual, expected):
     assert actual.interface == expected.interface
     assert actual.subslice_origin == expected.subslice_origin
     assert type(actual.subslice_origin) is type(expected.subslice_origin)
+    assert actual.mutated_inputs == expected.mutated_inputs
     # The store rebuilds the SPMD compiler's types, not plain tuples.
     assert all(type(spec) is InputSpec for spec in actual.interface.input_specs)
 
@@ -315,6 +318,12 @@ def test_the_deployment_packages_may_supply_output_node_types(monkeypatch):
     assert cache.encode_treedef(treedef)["children"][0]["type"] == (
         "my_models.outputs:" + Downstream.__qualname__
     )
+
+
+def test_the_inputs_a_graph_writes_round_trip(tmp_path):
+    _store(tmp_path, cache.Mode.SAVE).record(_request(), _graph(mutated_inputs=(0,)))
+    loaded = _store(tmp_path, cache.Mode.LOAD).lookup(_request())
+    assert loaded.mutated_inputs == (0,)
 
 
 def test_save_then_load_round_trips_the_graph(tmp_path):

@@ -62,7 +62,7 @@ SAVE_FLAG = "unsafe_save_torch_compile_bundle"
 LOAD_FLAG = "unsafe_load_torch_compile_bundle"
 
 # Bump on any change to the key composition or the on-disk format.
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
 _LOG = "[lowered-graph-cache]"
 
@@ -714,6 +714,7 @@ class FileLoweredGraphStore:
             executable=executable,
             fingerprint=meta["fingerprint"],
             subslice_origin=_decode_aux(meta["subslice_origin"]),
+            mutated_inputs=tuple(int(index) for index in meta["mutated_inputs"]),
         )
 
     def _write(
@@ -747,6 +748,7 @@ class FileLoweredGraphStore:
             "executable_size": len(graph.executable),
             "fingerprint": graph.fingerprint,
             "subslice_origin": subslice_origin,
+            "mutated_inputs": graph.mutated_inputs,
             "input_digest": interface.input_digest,
             "input_specs": interface.input_specs,
             "argument_layouts": interface.argument_layouts,
