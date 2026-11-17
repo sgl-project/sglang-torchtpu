@@ -106,6 +106,17 @@ def _select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
     return select_tpu_ep_local_runai_loader(result, load_config, model_config)
 
 
+def _select_glm_nextn_loader(result, load_config, model_config=None):
+    # Keep loader/model imports out of plugin startup and the default-off path.
+    from sglang_tpu.envs import envs
+
+    if not envs.SGLANG_ENABLE_MTP_SHARD_FILTER.get():
+        return result
+    from sglang_tpu.mtp_shard_filter import select_glm_nextn_loader
+
+    return select_glm_nextn_loader(result, load_config, model_config)
+
+
 # (target, hook, hook_type) triples.
 
 HOOKS: list[tuple] = [
@@ -358,6 +369,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.model_loader.loader.get_model_loader",
         _select_tpu_ep_local_runai_loader,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.model_loader.loader.get_model_loader",
+        _select_glm_nextn_loader,
         HookType.AFTER,
     ),
 ]

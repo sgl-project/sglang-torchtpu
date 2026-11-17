@@ -301,9 +301,6 @@ class Envs:
     #        group at offset (r * k), improving multi-rank I/O concurrency while
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
-    # Opt in only for audited, complete NextN checkpoint indexes. Partial
-    # indexes can hide draft tensors in apparently target-only shards.
-    SGLANG_ENABLE_MTP_SHARD_FILTER = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.

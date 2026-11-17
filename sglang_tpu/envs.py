@@ -28,6 +28,9 @@ EnvField._allow_set_name = True
 class TpuEnvs:
     # Parent-selected rendezvous port for the host-wide DP replica process group.
     SGLANG_TPU_DP_SESSION_PORT = EnvInt(None)
+    # Experimental GLM NextN shard reads; enable only with an audited, complete
+    # tensor index. Partial indexes can hide draft weights in target shards.
+    SGLANG_ENABLE_MTP_SHARD_FILTER = EnvBool(False)
     # Opt-in, request-tagged benchmark admission (benchmark_batch_gate.py).
     # Zero preserves ordinary scheduling, including continuous batching.
     SGLANG_TPU_BENCHMARK_BATCH_SIZE = EnvInt(0)

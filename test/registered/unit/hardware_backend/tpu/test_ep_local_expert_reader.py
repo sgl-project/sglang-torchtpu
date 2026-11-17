@@ -399,7 +399,8 @@ class TestTpuLocalRoutedExpertRange(CustomTestCase):
             self.assertEqual(local != -1, rng[0] <= eid < rng[1], eid)
 
     def test_glm_target_exact_class_and_runtime_guards(self):
-        """GLM target reads one EP range; draft/subclasses and unsafe layouts read all."""
+        """Plugin targets read one EP range; drafts/subclasses and unsafe layouts read all."""
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
         from sglang.srt.models.glm4_moe import (
             GlmMoeDsaForCausalLM,
             GlmMoeDsaForCausalLMNextN,
@@ -409,6 +410,7 @@ class TestTpuLocalRoutedExpertRange(CustomTestCase):
             pass
 
         for cls in (
+            DeepseekV4ForCausalLM,
             GlmMoeDsaForCausalLM,
             GlmMoeDsaForCausalLMNextN,
             UnreviewedSubclass,
@@ -419,7 +421,10 @@ class TestTpuLocalRoutedExpertRange(CustomTestCase):
             with self.subTest(cls=cls), self._env():
                 result = ep_local_expert_reader.tpu_local_routed_expert_range(model)
                 self.assertEqual(
-                    result, (48, 64) if cls is GlmMoeDsaForCausalLM else None
+                    result,
+                    (48, 64)
+                    if cls in (DeepseekV4ForCausalLM, GlmMoeDsaForCausalLM)
+                    else None,
                 )
             if cls is GlmMoeDsaForCausalLM:
                 for env in (dict(tpu=False), dict(eplb=object()), dict(join="scale")):

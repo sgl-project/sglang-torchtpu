@@ -123,7 +123,6 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
-    prepare_mtp_safetensors,
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
@@ -651,14 +650,11 @@ class DefaultModelLoader(BaseModelLoader):
                 source.allow_patterns_overrides,
             )
             if use_safetensors and source.model_config is not None:
-                hf_weights_files = prepare_mtp_safetensors(
+                hf_weights_files = maybe_add_mtp_safetensors(
                     hf_weights_files,
                     hf_folder,
                     "model.safetensors.index.json",
                     source.model_config.hf_config,
-                    allow_shard_filter=(
-                        not source.prefix and self.load_config.draft_model_idx is None
-                    ),
                 )
         else:
             hf_folder = resolved_source.hf_folder
@@ -824,14 +820,11 @@ class DefaultModelLoader(BaseModelLoader):
                 source.allow_patterns_overrides,
             )
             if use_safetensors and source.model_config is not None:
-                weight_files = prepare_mtp_safetensors(
+                weight_files = maybe_add_mtp_safetensors(
                     weight_files,
                     hf_folder,
                     "model.safetensors.index.json",
                     source.model_config.hf_config,
-                    allow_shard_filter=(
-                        not source.prefix and self.load_config.draft_model_idx is None
-                    ),
                 )
             resolved_sources.append(
                 DefaultModelLoader.ResolvedSource(
