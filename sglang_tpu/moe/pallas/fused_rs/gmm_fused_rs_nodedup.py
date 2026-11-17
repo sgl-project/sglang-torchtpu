@@ -1715,8 +1715,10 @@ def _pair_exchange_metadata(
         [jnp.zeros((1, ep_size), jnp.int32), jnp.cumsum(onehot, axis=0)]
     )
     m_offset = group_start[4 + num_slots : 4 + 2 * num_slots + 1]
-    run_rank = counts[m_offset[:num_slots]]
-    run_len = counts[m_offset[1:]] - run_rank
+    # local_idx starts at the aligned window base, before this rank's first row
+    # (group_start[0]); rank runs among this rank's rows only.
+    run_rank = counts[m_offset[:num_slots]] - counts[group_start[0]][None, :]
+    run_len = counts[m_offset[1:]] - counts[m_offset[:num_slots]]
     my_rank = group_offset[0] // size_group
     my_len = jnp.take(run_len, my_rank, axis=1)
     pieces = sum(
