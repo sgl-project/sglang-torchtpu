@@ -7,6 +7,9 @@ from typing import Any
 
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_schedule
+from sglang_tpu.cp_forward import get_tpu_cp_layout
+from sglang_tpu.cp_layout import max_local_rows
 
 
 class TpuZigzagCPStrategy(ZigzagCPStrategy):
@@ -17,7 +20,26 @@ class TpuZigzagCPStrategy(ZigzagCPStrategy):
     prefix-cache hit, keeps the rest of its batch context-parallel. A batch
     needs one request of at least ``cp_size`` tokens, which gives every rank
     an attention row.
+
+    Ring mode (``SGLANG_TPU_PCP_MODE=ring``) adds a capacity rule; see
+    ``set_ring_capacity``.
     """
+
+    def __init__(self, cp_size: int):
+        super().__init__(cp_size)
+        # Ring mode only: the largest local token bucket the ring layout can
+        # use. None in gather mode, whose layout fits any admitted batch.
+        self._ring_max_local_rows: int | None = None
+
+    def set_ring_capacity(self, max_local_rows: int) -> None:
+        """Enable the ring-mode capacity rule.
+
+        Ring mode reserves two page-aligned blocks per request on every rank,
+        so many short requests can need more local rows than the largest
+        compiled token bucket; such a batch must fall back to the striped (DCP)
+        extend program. 
+        """
+        self._ring_max_local_rows = max_local_rows
 
     def can_apply(self, num_tokens: int, forward_batch: Any) -> bool:
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
@@ -34,24 +56,23 @@ class TpuZigzagCPStrategy(ZigzagCPStrategy):
         if extend_lens is None:
             return True
         lengths = [int(length) for length in extend_lens]
-        if not (min(lengths) > 0 and max(lengths) >= self.cp_size):
+        if min(lengths) == 0:
             return False
-        if self.ring_max_local_rows is None:
-            return True
-        # Ring mode reserves two page-aligned blocks per request on every rank,
-        # so many short requests can overflow the largest token bucket; such a
-        # batch runs the striped (DCP) extend program instead. The decision is
-        # made on the host before the layout is attached; the compiled forward
-        # only re-reads it (see pinned_extend_seq_lens_cpu).
-        from sglang.srt.runtime_context import get_schedule
-        from sglang_tpu.cp_forward import get_tpu_cp_layout
-        from sglang_tpu.cp_layout import max_local_rows
+        # Every rank needs at least one attention row.
+        if max(lengths) < self.cp_size:
+            return False
+        return self._fits_ring_capacity(lengths, forward_batch)
 
+    def _fits_ring_capacity(self, lengths: list[int], forward_batch: Any) -> bool:
+        """Whether the ring layout of ``lengths`` fits a compiled token bucket;
+        always True in gather mode."""
+        if self._ring_max_local_rows is None: #gather mode
+            return True
+        # The decision is made on the host before the layout is attached; the
+        # compiled forward only re-reads it (see pinned_extend_seq_lens_cpu),
+        # so an attached layout means the batch was already admitted.
         if get_tpu_cp_layout(forward_batch) is not None:
             return True
-        rows = max_local_rows(lengths, self.cp_size, get_schedule().page_size)
-        return rows <= self.ring_max_local_rows
-
-    # Ring mode (SGLANG_TPU_PCP_MODE=ring) only: the largest local token bucket
-    # its layout can use, set by the compile policy on every rank alike.
-    ring_max_local_rows: int | None = None
+        page_size = get_schedule().page_size
+        rows = max_local_rows(lengths, self.cp_size, page_size)
+        return rows <= self._ring_max_local_rows

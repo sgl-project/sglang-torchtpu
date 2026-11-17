@@ -682,11 +682,11 @@ class TestRingStrategy(TestTpuZigzagStrategy):
     def setUp(self):
         super().setUp()
         schedule = patch(
-            "sglang.srt.runtime_context.get_schedule", return_value=_RING_SCHEDULE
+            "sglang_tpu.cp_strategy.get_schedule", return_value=_RING_SCHEDULE
         )
         schedule.start()
         self.addCleanup(schedule.stop)
-        get_cp_strategy().ring_max_local_rows = 160
+        get_cp_strategy().set_ring_capacity(160)
 
     def test_batch_that_fits_a_bucket_is_context_parallel(self):
         self.assertTrue(is_cp_active(self._batch(RING_EXTEND)))

@@ -1860,7 +1860,10 @@ class TestContextParallelRingWarmup(_PolicyTestCase):
         policy = _make_policy(
             model_runner, token_buckets=token_buckets, bs_buckets=bs_buckets
         )
-        strategy = SimpleNamespace(cp_size=2, cp_rank=0, ring_max_local_rows=None)
+        strategy = SimpleNamespace(cp_size=2, cp_rank=0, ring_capacity=None)
+        strategy.set_ring_capacity = lambda rows: setattr(
+            strategy, "ring_capacity", rows
+        )
         return policy, strategy
 
     def test_cp_family_uses_only_buckets_of_whole_block_pairs(self):
@@ -1875,7 +1878,7 @@ class TestContextParallelRingWarmup(_PolicyTestCase):
             policy._configure_cp_ring()
             self.assertEqual(policy.cp_t_bucketer.buckets, [32, 64])
             self.assertEqual(policy._extend_cp_compile_cases(), [(32, cap), (64, cap)])
-        self.assertEqual(strategy.ring_max_local_rows, 64)
+        self.assertEqual(strategy.ring_capacity, 64)
 
     def test_gather_mode_keeps_every_bucket_and_configures_nothing(self):
         policy, strategy = self._ring_policy(token_buckets=(8, 32, 48, 64))
@@ -1889,7 +1892,7 @@ class TestContextParallelRingWarmup(_PolicyTestCase):
                 policy._extend_cp_compile_cases(),
                 [(tokens, cap) for tokens in (8, 32, 48, 64) if tokens >= cap],
             )
-        self.assertIsNone(strategy.ring_max_local_rows)
+        self.assertIsNone(strategy.ring_capacity)
 
     def test_no_usable_bucket_fails_at_startup(self):
         policy, strategy = self._ring_policy(token_buckets=(8, 24, 48))
@@ -1934,7 +1937,7 @@ class TestContextParallelRingWarmup(_PolicyTestCase):
         self.assertEqual(layout.extend_prefix_lens_cpu, [prefix] * len(lens))
         self.assertEqual(layout.seq_lens_cpu.tolist(), [prefix + n for n in lens])
         self.assertEqual(layout.positions[0].item(), prefix)
-        self.assertEqual(strategy.ring_max_local_rows, 64)
+        self.assertEqual(strategy.ring_capacity, 64)
 
     def test_gather_warmup_batch_is_prefix_free(self):
         policy, strategy = self._ring_policy(token_buckets=(8, 64))
