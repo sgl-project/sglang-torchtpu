@@ -222,6 +222,14 @@ class KernelConfig:
     # first-index maxima and lowest-rank ties, NaN counting as the maximum
     # (bit-identical decisions).
     verify_greedy_kernel: bool = False
+    # Kimi-K3.1 DSpark verify ops (attention DP1, with dsa_fused_commit): the
+    # accepted KDA states, latent rows and DSA index keys commit in one
+    # kernel (paged.commit_verify_tail) instead of the KDA state commit and
+    # the fused DSA commit. It builds the FP8 latent rows from the decoder's
+    # BF16 handoff in VMEM (no XLA convert, slices and concatenation) and
+    # runs the DSA commit under the first KDA post-state's reads. The same
+    # bytes (bit-identical).
+    verify_fused_tail: bool = False
     # 16-row decode steps: records in the instruction-overlay allocation table
     # (XLA's xla_tpu_overlay_allocation_table_size; 0: the compiler's 10). At
     # 16 rows the KDA layers' overlays are larger than IMEM. With 2 records

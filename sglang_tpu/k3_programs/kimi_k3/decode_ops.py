@@ -633,6 +633,7 @@ class DecodeOps:
             sequence_parallel_pre_attention=True,
             sequence_rows=rows,
             aux_hidden_layers=tuple(aux_layers),
+            **self._fused_tail_options(),
         )
         pool_map, owner_table = self.pool_map, self.owner_table
         pools = len(self.unified_pools)
@@ -670,8 +671,9 @@ class DecodeOps:
                 **extra,
                 **options,
             )
+            outputs, pending = self._pending_commit(outputs, options)
             (logits, aux, conv, recurrent), pool = self._step_outputs(outputs)
-            decisions, conv, recurrent = self._finish_verify(
+            decisions, conv, recurrent, pool = self._finish_verify(
                 control,
                 old_conv,
                 old_recurrent,
@@ -685,6 +687,8 @@ class DecodeOps:
                 modes,
                 synthetic_rates,
                 True,
+                pool=pool,
+                pending=pending,
             )
             return (logits[None], aux, decisions, conv[None], recurrent[None], *pool)
 
@@ -763,6 +767,7 @@ class DecodeOps:
         options.update(
             sequence_rows=rows_per,
             aux_hidden_layers=tuple(aux_layers),
+            **self._fused_tail_options(),
         )
         pool_map, owner_table = self.pool_map, self.owner_table
         pools = len(self.unified_pools)
@@ -803,10 +808,11 @@ class DecodeOps:
                 **extra,
                 **options,
             )
+            outputs, pending = self._pending_commit(outputs, options)
             (logits, aux, conv, recurrent), pool = self._step_outputs(outputs)
             if placed is not None:
                 logits, aux = logits[placed], aux[:, placed]
-            decisions, conv, recurrent = self._finish_verify(
+            decisions, conv, recurrent, pool = self._finish_verify(
                 control,
                 old_conv,
                 old_recurrent,
@@ -820,6 +826,8 @@ class DecodeOps:
                 modes,
                 synthetic_rates,
                 False,
+                pool=pool,
+                pending=pending,
             )
             return (logits[None], aux, decisions, conv[None], recurrent[None], *pool)
 
@@ -880,6 +888,25 @@ class DecodeOps:
         self._adopt(conv, recurrent, pools)
         return sharded, aux, decisions
 
+    def _fused_tail_options(self) -> dict:
+        """The verifiers' ``decode_paged`` option for
+        KernelConfig.verify_fused_tail (attention DP1, Kimi-K3.1 pools)."""
+        if (
+            kernel_config.active().verify_fused_tail
+            and self.attention_dp == 1
+            and self.dsa_pools
+        ):
+            return {"defer_latent_commit": True}
+        return {}
+
+    @staticmethod
+    def _pending_commit(outputs, options):
+        """A verifier's ``decode_paged`` outputs and its pending latent commit
+        (``defer_latent_commit``: the last output; None when committed)."""
+        if not options.get("defer_latent_commit"):
+            return outputs, None
+        return outputs[:-1], outputs[-1]
+
     def _build_verify_metadata(self, control, requests):
         """Keep the verifier within Torch's 64-operand limit."""
         key = ("verify_metadata", control.key(), requests)
@@ -930,7 +957,15 @@ class DecodeOps:
         modes,
         synthetic_rates,
         single,
+        *,
+        pool=(),
+        pending=None,
     ):
+        """Acceptance and the commits: returns ``(decisions, conv, recurrent,
+        pool)``. ``pending`` (``decode_paged``'s deferred latent commit):
+        the latents and index keys commit into ``pool`` (the op's pools, then
+        any window centres) with the accepted KDA states
+        (``paged.commit_verify_tail``)."""
         from sglang_tpu.k3_programs.kimi_k3 import sampling
 
         requests = modes.shape[0]
@@ -970,10 +1005,27 @@ class DecodeOps:
             group_rows = share * rows_per
             sources = jnp.concatenate([rows + k * group_rows for k in range(dp)])
             targets = jnp.concatenate([local + k * bank for k in range(dp)])
+        if pending is not None:
+            pools = len(self.unified_pools)
+            latent = pools - self.dsa_pools
+            conv, recurrent, *committed = self.paged.commit_verify_tail(
+                conv,
+                recurrent,
+                new_conv,
+                new_recurrent,
+                targets,
+                sources,
+                pool[:latent],
+                pool[latent:pools],
+                *pending,
+                self.pool_map,
+                owner_table=self.owner_table,
+            )
+            return decisions, conv, recurrent, (*committed, *pool[pools:])
         conv, recurrent = self.paged._commit_kda_states(
             conv, recurrent, new_conv, new_recurrent, targets, source_rows=sources
         )
-        return decisions, conv, recurrent
+        return decisions, conv, recurrent, pool
 
 
 # Sampling parameters of a greedy plan entry: temperature, top_p, top_k, seed.

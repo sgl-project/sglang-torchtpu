@@ -412,7 +412,62 @@ def _commit_dsa_rows_fused(
     flight together; a run whose block is in flight starts the next wave
     after the writes land, so rows sharing a tile (repeated null-block
     targets) land in row order."""
-    batch, layers = rows.shape[:2]
+    batch = rows.shape[0]
+    commit, scratch = _dsa_commit_parts(
+        pools, index_pools, batch, block_tables, pool_map, owner_table=owner_table
+    )
+    count = len(pools) + len(index_pools)
+    lat_count = len(pools)
+
+    def kernel(position_ref, table_ref, rows_hbm, records_hbm, *refs):
+        commit(
+            position_ref,
+            table_ref,
+            rows_hbm,
+            records_hbm,
+            refs[count : count + lat_count],
+            refs[count + lat_count : 2 * count],
+            refs[2 * count :],
+        )
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=tuple(
+            jax.ShapeDtypeStruct(p.shape, p.dtype) for p in (*pools, *index_pools)
+        ),
+        grid_spec=tpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=(pl.BlockSpec(memory_space=pl.ANY),) * (2 + count),
+            out_specs=(pl.BlockSpec(memory_space=pl.ANY),) * count,
+            scratch_shapes=scratch,
+        ),
+        input_output_aliases={4 + i: i for i in range(count)},
+        compiler_params=tpu.CompilerParams(
+            disable_bounds_checks=not _config().bounds_checks
+        ),
+        name="kimi_commit_dsa_pools",
+    )(
+        positions[:batch],
+        block_tables.reshape(-1),
+        rows.astype(pools[0].dtype),
+        records,
+        *pools,
+        *index_pools,
+    )
+
+
+def _dsa_commit_parts(
+    pools, index_pools, batch, block_tables, pool_map, *, owner_table=None, handoff=None
+):
+    """:func:`_commit_dsa_rows_fused`'s kernel body and its VMEM/SMEM scratch:
+    ``(commit, scratch)``, ``commit(position_ref, table_ref, rows_hbm,
+    records_hbm, lat_out, idx_out, scratch_refs)``. ``handoff`` (the
+    decoder's new-key handoff shape ``[batch, 24, H, 256]``, BF16; see
+    ``latent_rows_from_handoff``): ``rows_hbm`` is the handoff and the rows
+    are built in VMEM, ``[batch, 24, 640]`` in the pool dtype (FP8: the
+    convert XLA's ``astype`` lowers to), on the first wave (ranks without
+    owned rows read neither)."""
+    layers = len(pool_map)
     packing, dtype = pools[0].shape[-2], pools[0].dtype
     block_rows = pools[0].shape[-3]
     page_tokens = block_rows * packing
@@ -423,7 +478,6 @@ def _commit_dsa_rows_fused(
     key_window = (run + 2) // 4 + 1
     lat_blocks, idx_blocks = pools[0].shape[0], index_pools[0].shape[0]
     sub_tokens, sub_rows = INDEX_SUBPAGE_TOKENS, INDEX_SUBPAGE_ROWS
-    lat_count, count = len(pools), len(pools) + len(index_pools)
     group = mla_dcp.GROUP
     global_pages = mla_dcp.GLOBAL_PAGES
 
@@ -433,15 +487,41 @@ def _commit_dsa_rows_fused(
     def mod(x, d):
         return x & (d - 1) if d & (d - 1) == 0 else x % d
 
-    def kernel(position_ref, table_ref, rows_hbm, records_hbm, *refs):
-        lat_out = refs[count : count + lat_count]
-        idx_out = refs[count + lat_count : 2 * count]
-        (lat_buf, key_buf, scale_buf, row_buf, record_buf) = refs[2 * count : -3]
+    def commit(
+        position_ref, table_ref, rows_hbm, records_hbm, lat_out, idx_out, scratch_refs
+    ):
+        (lat_buf, key_buf, scale_buf, row_buf, record_buf) = scratch_refs[:5]
         # slot: the wave's runs (first row, rows, targets); wave: (runs, loaded)
-        slot, wave, sems = refs[-3:]
+        slot, wave, sems = scratch_refs[5:8]
         member = mla_dcp.owner_index(owner_table) % group
-        row_copy = tpu.make_async_copy(rows_hbm, row_buf, sems.at[3])
+        if handoff is None:
+            row_copy = tpu.make_async_copy(rows_hbm, row_buf, sems.at[3])
+        else:
+            handoff_buf, staging = scratch_refs[8:10]
+            row_copy = tpu.make_async_copy(rows_hbm, handoff_buf, sems.at[3])
         record_copy = tpu.make_async_copy(records_hbm, record_buf, sems.at[4])
+
+        def build_rows():  # the handoff's latent rows, a row at a time
+            def build_row(b, carry):
+                # Each layer's three handoff rows as FP32 128-lane tiles
+                # (staging tile 2 m + j: lanes 128 j.. of layer m's rows),
+                # then each part of the 640 lanes for every layer at once.
+                for layer in range(layers):
+                    value = handoff_buf[b, layer, 0:3].astype(jnp.float32)
+                    for j in range(2):
+                        staging[pl.ds(8 * (2 * layer + j), 3), :] = value[
+                            :, 128 * j : 128 * (j + 1)
+                        ]
+                parts = [
+                    staging[pl.ds(8 * j + k, layers, stride=16), :]
+                    for k, j in ((0, 0), (0, 1), (1, 0), (1, 1), (2, 0))
+                ]
+                row_buf[b] = (
+                    jnp.concatenate(parts, axis=1).astype(jnp.bfloat16).astype(dtype)
+                )
+                return carry
+
+            jax.lax.fori_loop(0, batch, build_row, 0)
 
         def place(b):  # (position, block, owned) of row b, as the XLA commits
             position = position_ref[b]
@@ -554,6 +634,8 @@ def _commit_dsa_rows_fused(
             def _():
                 row_copy.wait()
                 record_copy.wait()
+                if handoff is not None:
+                    build_rows()
 
             pl.loop(0, waiting)(settle)
             pl.loop(0, waiting)(merge)
@@ -611,39 +693,22 @@ def _commit_dsa_rows_fused(
         zero = jnp.int32(0)
         jax.lax.fori_loop(0, batch + 2, plan, (zero,) * 4)
 
-    return pl.pallas_call(
-        kernel,
-        out_shape=tuple(
-            jax.ShapeDtypeStruct(p.shape, p.dtype) for p in (*pools, *index_pools)
-        ),
-        grid_spec=tpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            in_specs=(pl.BlockSpec(memory_space=pl.ANY),) * (2 + count),
-            out_specs=(pl.BlockSpec(memory_space=pl.ANY),) * count,
-            scratch_shapes=(
-                tpu.VMEM((slots, layers, lat_window, packing, 640), dtype),
-                tpu.VMEM((slots, layers, key_window, 4, 128), jnp.uint8),
-                tpu.VMEM((slots, layers, 4, 128), jnp.uint8),
-                tpu.VMEM(rows.shape, dtype),
-                tpu.VMEM(records.shape, jnp.int32),
-                tpu.SMEM((4, slots), jnp.int32),
-                tpu.SMEM((2,), jnp.int32),
-                tpu.SemaphoreType.DMA((5,)),
-            ),
-        ),
-        input_output_aliases={4 + i: i for i in range(count)},
-        compiler_params=tpu.CompilerParams(
-            disable_bounds_checks=not _config().bounds_checks
-        ),
-        name="kimi_commit_dsa_pools",
-    )(
-        positions[:batch],
-        block_tables.reshape(-1),
-        rows.astype(dtype),
-        records,
-        *pools,
-        *index_pools,
+    scratch = (
+        tpu.VMEM((slots, layers, lat_window, packing, 640), dtype),
+        tpu.VMEM((slots, layers, key_window, 4, 128), jnp.uint8),
+        tpu.VMEM((slots, layers, 4, 128), jnp.uint8),
+        tpu.VMEM((batch, layers, 640), dtype),
+        tpu.VMEM((batch, layers, 2, 128), jnp.int32),
+        tpu.SMEM((4, slots), jnp.int32),
+        tpu.SMEM((2,), jnp.int32),
+        tpu.SemaphoreType.DMA((5,)),
     )
+    if handoff is not None:
+        scratch += (
+            tpu.VMEM(tuple(handoff), jnp.bfloat16),
+            tpu.VMEM((layers * 16, 128), jnp.float32),
+        )
+    return commit, scratch
 
 
 def _commit_kda_states(
@@ -731,6 +796,160 @@ def _commit_kda_states(
     )
 
 
+def commit_verify_tail(
+    conv_slots,
+    recurrent_slots,
+    conv,
+    recurrent,
+    slots,
+    source_rows,
+    pools,
+    index_pools,
+    handoff,
+    records,
+    block_tables,
+    positions,
+    pool_map,
+    *,
+    owner_table=None,
+):
+    """A verify's commits in one non-communicating kernel
+    (KernelConfig.verify_fused_tail): the accepted KDA post-states
+    (:func:`_commit_kda_states` with ``source_rows``) and the step's latent
+    rows and DSA index keys (:func:`_commit_dsa_rows_fused`), the latent rows
+    built in VMEM from the decoder's BF16 new-key ``handoff`` (``[batch, 24,
+    H, 256]``, ``latent_rows_from_handoff``; FP8 pools: the same converts).
+    The first KDA row's post-state reads start before the DSA commit, which
+    runs under them; then the rows' writes, in row order. Returns
+    ``(conv_slots, recurrent_slots, *pools, *index_pools)`` with every
+    operand aliased (the same bytes as the two kernels)."""
+    batch, requests = handoff.shape[0], slots.shape[0]
+    pools, index_pools = tuple(pools), tuple(index_pools)
+    commit, dsa_scratch = _dsa_commit_parts(
+        pools,
+        index_pools,
+        batch,
+        block_tables,
+        pool_map,
+        owner_table=owner_table,
+        handoff=handoff.shape,
+    )
+    count = len(pools) + len(index_pools)
+    lat_count = len(pools)
+    dsa_count = len(dsa_scratch)
+
+    def kernel(
+        position_ref,
+        table_ref,
+        target_ref,
+        source_ref,
+        handoff_hbm,
+        records_hbm,
+        old_conv,
+        old_state,
+        new_conv,
+        new_state,
+        *refs,
+    ):
+        del old_conv, old_state  # aliased by out_conv / out_state
+        out_conv, out_state = refs[count : count + 2]
+        lat_out = refs[count + 2 : count + 2 + lat_count]
+        idx_out = refs[count + 2 + lat_count : 2 * count + 2]
+        scratch = refs[2 * count + 2 :]
+        conv_buffer, state_buffer, semaphores = scratch[dsa_count:]
+
+        def reads(i):
+            source = source_ref[i]
+            return (
+                tpu.make_async_copy(
+                    new_conv.at[pl.ds(source, 1)], conv_buffer, semaphores.at[0]
+                ),
+                tpu.make_async_copy(
+                    new_state.at[pl.ds(source, 1)], state_buffer, semaphores.at[1]
+                ),
+            )
+
+        def writes(i):
+            target = target_ref[i]
+            return (
+                tpu.make_async_copy(
+                    conv_buffer, out_conv.at[pl.ds(target, 1)], semaphores.at[0]
+                ),
+                tpu.make_async_copy(
+                    state_buffer, out_state.at[pl.ds(target, 1)], semaphores.at[1]
+                ),
+            )
+
+        for item in reads(0):
+            item.start()
+        commit(
+            position_ref,
+            table_ref,
+            handoff_hbm,
+            records_hbm,
+            lat_out,
+            idx_out,
+            scratch[:dsa_count],
+        )
+
+        @pl.loop(0, requests)
+        def row(i):
+            @pl.when(i > 0)
+            def _():
+                for item in reads(i):
+                    item.start()
+
+            for item in reads(i):
+                item.wait()
+            for item in writes(i):
+                item.start()
+            for item in writes(i):
+                item.wait()
+
+    operands = (conv_slots, recurrent_slots, *pools, *index_pools)
+    # The decoder's outputs stay in HBM (with pl.ANY XLA stages the ones that
+    # fit into VMEM with copies first); the aliased banks and pools as the
+    # two kernels take them.
+    hbm, anywhere = (
+        pl.BlockSpec(memory_space=tpu.HBM),
+        pl.BlockSpec(memory_space=pl.ANY),
+    )
+    return pl.pallas_call(
+        kernel,
+        out_shape=tuple(jax.ShapeDtypeStruct(p.shape, p.dtype) for p in operands),
+        grid_spec=tpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            in_specs=(hbm, hbm, anywhere, anywhere, hbm, hbm) + (anywhere,) * count,
+            out_specs=(pl.BlockSpec(memory_space=pl.ANY),) * (2 + count),
+            scratch_shapes=(
+                *dsa_scratch,
+                tpu.VMEM((1, *conv.shape[1:]), conv.dtype),
+                tpu.VMEM((1, *recurrent.shape[1:]), recurrent.dtype),
+                tpu.SemaphoreType.DMA((2,)),
+            ),
+        ),
+        input_output_aliases={6: 0, 7: 1, **{10 + i: 2 + i for i in range(count)}},
+        compiler_params=tpu.CompilerParams(
+            disable_bounds_checks=not _config().bounds_checks,
+            vmem_limit_bytes=_config().vmem_limit_mb * 1024**2,
+        ),
+        name="kimi_commit_verify_tail",
+    )(
+        positions[:batch],
+        block_tables.reshape(-1),
+        slots,
+        source_rows,
+        handoff,
+        records,
+        conv_slots,
+        recurrent_slots,
+        conv,
+        recurrent,
+        *pools,
+        *index_pools,
+    )
+
+
 def decode_paged(
     weights,
     conv_slots,
@@ -746,6 +965,7 @@ def decode_paged(
     dcp_owner_table=None,
     state_row=None,
     defer_kda_commit=False,
+    defer_latent_commit=False,
     dsa_pools=0,
     dsa_centres=None,
     **decode_options,
@@ -781,6 +1001,12 @@ def decode_paged(
     the same selection: they only decide whether the selection takes two
     count exchanges or three. Without ``dsa_centres`` a seeded selection
     starts every row from the constant centre 0.
+
+    ``defer_latent_commit`` (verifiers with ``defer_kda_commit``,
+    KernelConfig.verify_fused_tail): where the fused DSA commit applies, the
+    pools come back uncommitted and the outputs end with ``(handoff,
+    records, block_tables, positions)`` for :func:`commit_verify_tail` (else
+    None: committed here).
     """
     if (
         tokens.shape != (batch_size,)
@@ -885,6 +1111,7 @@ def decode_paged(
             block_tables[group_rows],
             positions[group_rows],
         )
+    pending = None
     if (
         index_pools is not None
         and group_rows is None
@@ -892,16 +1119,21 @@ def decode_paged(
             pools, index_pools, latents, records[0], block_tables, dcp_pool_map
         )
     ):
-        pool = _commit_dsa_rows_fused(
-            pools,
-            index_pools,
-            latents,
-            records[0],
-            block_tables,
-            positions,
-            dcp_pool_map,
-            owner_table=dcp_owner_table,
-        )
+        if defer_latent_commit and defer_kda_commit:
+            # The caller commits them with the accepted KDA states.
+            pending = (new_keys, records[0], block_tables, positions)
+            pool = (*pools, *index_pools)
+        else:
+            pool = _commit_dsa_rows_fused(
+                pools,
+                index_pools,
+                latents,
+                records[0],
+                block_tables,
+                positions,
+                dcp_pool_map,
+                owner_table=dcp_owner_table,
+            )
         index_pools = None  # committed with the latents
     else:
         pool = commit_latent_rows(
@@ -928,6 +1160,8 @@ def decode_paged(
         )
         pool = (*pool, *index_pools)
     extra = () if dsa_centres is None else (dsa_centres,)
+    if defer_latent_commit:
+        extra += (pending,)
     if aux is not None:
         return logits[0], aux, conv_slots, recurrent_slots, pool, *extra
     return logits[0], conv_slots, recurrent_slots, pool, *extra
