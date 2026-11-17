@@ -5,6 +5,7 @@ eligibility gate, the fallbacks to the original collective and
 the default (concatenating) merged_moe_all_reduce.
 """
 
+import os
 import unittest
 from unittest import mock
 
@@ -112,6 +113,7 @@ class TestRegistration(CustomTestCase):
         with (
             tpu_envs.SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE.override(enabled),
             mock.patch.object(tl, "register") as reg,
+            mock.patch.object(tl, "_register_twoshot_from_parallel_state"),
             mock.patch(
                 "sglang.srt.distributed.parallel_state.get_world_group",
                 return_value=mock.Mock(world_size=world, cpu_group="cpu"),
@@ -172,6 +174,120 @@ class TestMergedMoeAllReduceDefault(CustomTestCase):
         ar.assert_called_once()  # one collective for both
         torch.testing.assert_close(got_latent, latent * 2)
         torch.testing.assert_close(got_shared, (shared * 2).to(torch.bfloat16))
+
+
+class TestTwoShotRoute(CustomTestCase):
+    """Single-host TP: decode-sized bf16 TP all-reduces go to the two-shot op."""
+
+    def test_eligibility_cap_and_layout(self):
+        cap_rows = tl.TWOSHOT_TP_ALLREDUCE_MAX_BYTES // (4096 * 2)
+        for shape, dtype, want in (
+            ((1, 4096), torch.bfloat16, True),
+            ((cap_rows, 4096), torch.bfloat16, True),
+            ((cap_rows + 1, 4096), torch.bfloat16, False),  # over the cap
+            ((32, 4096), torch.float32, False),
+            ((32, 4000), torch.bfloat16, False),  # columns not 128 per rank
+            ((0, 4096), torch.bfloat16, False),
+            ((4096,), torch.bfloat16, False),
+        ):
+            with self.subTest(shape=shape, dtype=dtype):
+                t = torch.zeros(shape, dtype=dtype)
+                self.assertEqual(tl.twoshot_eligible(t, 8), want)
+
+    def _dispatch(self, x, *, group_is_tp=True, ready=False):
+        tp_group, other = mock.Mock(), mock.Mock()
+        original = mock.Mock(return_value="xla")
+        twoshot, twolevel = (
+            mock.Mock(return_value="twoshot"),
+            mock.Mock(return_value="twolevel"),
+        )
+        with (
+            mock.patch.object(tl, "_TWOSHOT_WORLD", 8),
+            mock.patch.object(tl, "_READY", ready),
+            mock.patch.dict(tl._OPS, {1: twolevel}),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.get_tp_group",
+                return_value=tp_group,
+            ),
+            mock.patch(
+                "sglang_tpu.twoshot_all_reduce.get_twoshot_all_reduce_op",
+                return_value=twoshot,
+            ) as get_op,
+        ):
+            out = tl.all_reduce_around(original, tp_group if group_is_tp else other, x)
+        return out, get_op
+
+    def test_dispatch(self):
+        small = torch.zeros(32, 4096, dtype=torch.bfloat16)
+        out, get_op = self._dispatch(small)
+        self.assertEqual(out, "twoshot")
+        get_op.assert_called_once_with(8)
+        self.assertEqual(self._dispatch(small, group_is_tp=False)[0], "xla")
+        large = torch.zeros(4096, 4096, dtype=torch.bfloat16)
+        self.assertEqual(self._dispatch(large)[0], "xla")
+
+    def test_single_row_prefers_the_two_level_op(self):
+        row = torch.zeros(1, 4096, dtype=torch.bfloat16)
+        self.assertEqual(self._dispatch(row, ready=True)[0], "twolevel")
+
+    def _register(self, enabled, *, world=8, nnodes=1, ep_size=8, seen=None):
+        """``enabled=None`` leaves the flag unset (its default)."""
+
+        def gather(out, value, group=None):
+            out[:] = seen if seen is not None else [value] * len(out)
+
+        flag = tpu_envs.SGLANG_TPU_ENABLE_TWOSHOT_TP_ALLREDUCE
+        env = mock.patch.dict(os.environ) if enabled is None else flag.override(enabled)
+        with (
+            mock.patch.object(tl, "_TWOSHOT_WORLD", 0),
+            env,
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.get_world_group",
+                return_value=mock.Mock(world_size=world, cpu_group="cpu"),
+            ),
+            mock.patch("torch.distributed.all_gather_object", side_effect=gather),
+            mock.patch("torch.distributed.get_world_size", return_value=world),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state."
+                "get_tensor_model_parallel_world_size",
+                return_value=world,
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_server_args",
+                return_value=mock.Mock(nnodes=nnodes, ep_size=ep_size),
+            ),
+            mock.patch(
+                "sglang_tpu.twoshot_all_reduce.get_twoshot_all_reduce_op"
+            ) as build,
+        ):
+            if enabled is None:
+                os.environ.pop(flag.name, None)
+            tl._register_twoshot_from_parallel_state()
+            return tl._TWOSHOT_WORLD, build
+
+    def test_registration(self):
+        world, build = self._register(False)
+        self.assertEqual(world, 0)
+        build.assert_not_called()
+        world, build = self._register(True)
+        self.assertEqual(world, 8)
+        build.assert_called_once_with(8)
+        world, build = self._register(True, world=32, nnodes=4)
+        self.assertEqual(world, 0)  # the exchange is host-local
+        build.assert_not_called()
+
+    def test_default_follows_expert_parallelism(self):
+        """Unset, the op is built with MoE expert parallelism only (like vllm's
+        TPU_SMALL_ALL_REDUCE); an explicit 1 builds it without."""
+        self.assertEqual(self._register(None, ep_size=8)[0], 8)
+        world, build = self._register(None, ep_size=1)
+        self.assertEqual(world, 0)
+        build.assert_not_called()
+        self.assertEqual(self._register(True, ep_size=1)[0], 8)
+
+    def test_ranks_must_agree(self):
+        with self.assertRaisesRegex(RuntimeError, "same on every rank"):
+            self._register(True, seen=[True] * 7 + [False])
 
 
 if __name__ == "__main__":

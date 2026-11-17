@@ -183,6 +183,12 @@ class TpuEnvs:
     # layer also runs the MLP-side aggregation (kimi_attn_res_decode with the
     # pending add) in the same kernel. Same ops in the same order (exact).
     SGLANG_TPU_TWOLEVEL_ALLREDUCE_FUSE_ATTN_RES = EnvBool(True)
+    # Single-host TP: decode-sized bf16 TP all-reduces (up to
+    # TWOSHOT_TP_ALLREDUCE_MAX_BYTES per rank) run the two-shot Pallas kernel
+    # (twoshot_all_reduce.py) instead of XLA's all-reduce (twolevel_allreduce.py).
+    # Unset, it applies only with MoE expert parallelism (ep_size > 1); set it to
+    # 1 or 0 to force it on or off.
+    SGLANG_TPU_ENABLE_TWOSHOT_TP_ALLREDUCE = EnvBool(True)
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
     # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)

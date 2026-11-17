@@ -39,6 +39,10 @@ _COLLECTIVE_ID = 1
 _OPS: dict = {}
 # Plain bool, not dict truthiness: Dynamo traces the eligibility checks.
 _READY = False
+# TP world size the two-shot op was built for; 0 = off. Plain int for Dynamo.
+_TWOSHOT_WORLD = 0
+# Largest per-rank payload sent to the two-shot op.
+TWOSHOT_TP_ALLREDUCE_MAX_BYTES = 512 * 1024
 # Set (while Dynamo traces / Python runs the decode forward) when a tagged
 # attention o_proj skipped its all-reduce so that the following attention-residual
 # aggregation runs it fused (all_reduce_attn_res); consumed by that aggregation.
@@ -461,18 +465,12 @@ def _check_ranks_agree(enabled: bool) -> None:
 
     from sglang.srt.distributed.parallel_state import get_world_group
 
+    _check_flag_agrees("SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE", enabled)
     world_group = get_world_group()
     if world_group.world_size <= 1:
         return
-    seen = [None] * world_group.world_size
-    dist.all_gather_object(seen, bool(enabled), group=world_group.cpu_group)
-    if len(set(seen)) > 1:
-        on = [rank for rank, flag in enumerate(seen) if flag]
-        raise RuntimeError(
-            "SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE must be set the same on every "
-            f"rank; it is on for ranks {on} only."
-        )
     # The barrier protocol (signal weights) must match too.
+    seen = [None] * world_group.world_size
     split = bool(tpu_envs.SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER.get())
     dist.all_gather_object(seen, split, group=world_group.cpu_group)
     if len(set(seen)) > 1:
@@ -498,6 +496,65 @@ def register(world: int, local: int) -> None:
 def register_from_parallel_state() -> None:
     """Called from TpuPlatform.prepare_model_parallel_groups (every rank, after
     the groups exist, before the first collective)."""
+    _register_twolevel_from_parallel_state()
+    _register_twoshot_from_parallel_state()
+
+
+def _register_twoshot_from_parallel_state() -> None:
+    """Build the two-shot op when TP spans one host; every rank must agree.
+    Left at its default (on), the op is built only with MoE expert parallelism,
+    setting the flag explicitly overrides that."""
+    global _TWOSHOT_WORLD
+    import torch.distributed as dist
+
+    from sglang.srt.distributed.parallel_state import (
+        get_tensor_model_parallel_world_size,
+    )
+    from sglang.srt.runtime_context import get_server_args
+    from sglang_tpu.twoshot_all_reduce import get_twoshot_all_reduce_op
+
+    flag = tpu_envs.SGLANG_TPU_ENABLE_TWOSHOT_TP_ALLREDUCE
+    enabled = bool(flag.get()) and (flag.is_set() or get_server_args().ep_size > 1)
+    _check_flag_agrees("SGLANG_TPU_ENABLE_TWOSHOT_TP_ALLREDUCE", enabled)
+    if not enabled:
+        return
+
+    world = get_tensor_model_parallel_world_size()
+    # The kernel's mesh is the whole world and its exchange is host-local.
+    if world <= 1 or world != dist.get_world_size() or get_server_args().nnodes != 1:
+        logger.info(
+            "Two-shot TP all-reduce off: TP %d over %d ranks, %d hosts; it needs "
+            "TP to span one host.",
+            world,
+            dist.get_world_size(),
+            get_server_args().nnodes,
+        )
+        return
+    get_twoshot_all_reduce_op(world)
+    _TWOSHOT_WORLD = world
+    logger.info(
+        "Two-shot TP all-reduce on: bf16 TP all-reduces up to %d KB per rank.",
+        TWOSHOT_TP_ALLREDUCE_MAX_BYTES // 1024,
+    )
+
+
+def _check_flag_agrees(name: str, enabled: bool) -> None:
+    """A rank off the Pallas path would leave the others waiting in its barrier."""
+    import torch.distributed as dist
+
+    from sglang.srt.distributed.parallel_state import get_world_group
+
+    world_group = get_world_group()
+    if world_group.world_size <= 1:
+        return
+    seen = [None] * world_group.world_size
+    dist.all_gather_object(seen, enabled, group=world_group.cpu_group)
+    if len(set(seen)) > 1:
+        on = [rank for rank, flag in enumerate(seen) if flag]
+        raise RuntimeError(f"{name} must be set the same on every rank; on for {on}.")
+
+
+def _register_twolevel_from_parallel_state() -> None:
     enabled = tpu_envs.SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE.get()
     _check_ranks_agree(enabled)
     if not enabled:
@@ -561,13 +618,30 @@ def eligible(t: torch.Tensor) -> bool:
     )
 
 
+def twoshot_eligible(t: torch.Tensor, world: int) -> bool:
+    """A bf16 [rows, cols] payload within the size cap whose columns split into
+    128-lane chunks per rank (the kernel's reduce-scatter unit)."""
+    return (
+        t.dim() == 2
+        and t.dtype == torch.bfloat16
+        and t.shape[1] % (128 * world) == 0
+        and 0 < t.numel() * t.element_size() <= TWOSHOT_TP_ALLREDUCE_MAX_BYTES
+    )
+
+
 def all_reduce_around(original, group, input_: torch.Tensor) -> torch.Tensor:
     """AROUND hook for ``GroupCoordinator.all_reduce``."""
     from sglang.srt.distributed.parallel_state import get_tp_group
 
-    if not (_READY and group is get_tp_group() and eligible(input_)):
+    if not (_READY or _TWOSHOT_WORLD) or group is not get_tp_group():
         return original(group, input_)
-    return _OPS[1](input_)
+    if _READY and eligible(input_):
+        return _OPS[1](input_)
+    if _TWOSHOT_WORLD and twoshot_eligible(input_, _TWOSHOT_WORLD):
+        from sglang_tpu.twoshot_all_reduce import get_twoshot_all_reduce_op
+
+        return get_twoshot_all_reduce_op(_TWOSHOT_WORLD)(input_)
+    return original(group, input_)
 
 
 def _fusable_norm(norm, latent: torch.Tensor) -> bool:
