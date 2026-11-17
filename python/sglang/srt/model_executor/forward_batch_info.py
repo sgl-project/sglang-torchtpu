@@ -322,6 +322,9 @@ class LogitsOutputMode(IntEnum):
 
     FULL_VOCAB = auto()
     DISTRIBUTED_TOP_K = auto()
+    # This rank's vocab shard, ungathered; the sampler draws one token per row with
+    # a vocab-parallel Gumbel-max and exchanges one (value, id) pair per rank.
+    VOCAB_SHARD = auto()
 
 
 @total_ordering
