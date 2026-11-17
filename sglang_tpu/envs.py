@@ -496,8 +496,10 @@ class TpuEnvs:
     # rank's routed experts with --weight-loader-disable-mmap or Run:AI).
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
-    SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
+    SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(0)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
+    # libtpu tpu_trace_mode; empty leaves the libtpu default.
+    SGLANG_TPU_PROFILE_TRACE_MODE = EnvStr("TRACE_COMPUTE")
     # xprof python tracer. Off by default: it dominates host busy time.
     SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
     # Read the RPA KV cache in the SEQ_ALONG_LANE layout (token index on the
