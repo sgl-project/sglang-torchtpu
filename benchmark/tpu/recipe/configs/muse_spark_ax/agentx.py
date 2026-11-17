@@ -27,10 +27,10 @@ PROFILES = {
     24: (24, 48, [1, 2, 4, 8, 12, 16, 24]),
     24: (24, 48, [1, 2, 4, 8, 12, 16, 24]),
     32: (32, 40, [1, 2, 4, 8, 12, 16, 24, 32]),
-    # VR200 nov03 single-host points; past 64 running requests the KV pool, not the step,
-    # bounds the batch, so conc 96 caps admission at 64 (512-row verify steps)
-    48: (48, 32, [1, 2, 4, 8, 16, 24, 32, 48]),
-    96: (64, 32, [1, 2, 4, 8, 16, 32, 48, 64]),
+    # VR200 nov03 single-host points. Past 256 rows the row-tiled megakernel needs a multiple
+    # of mv_rows (256): no 33-63 request buckets, so both cap admission at 64 (512 rows)
+    48: (64, 32, [1, 2, 4, 8, 16, 24, 32, 64]),
+    96: (64, 32, [1, 2, 4, 8, 16, 24, 32, 64]),
 }
 
 EP_ENV = {
