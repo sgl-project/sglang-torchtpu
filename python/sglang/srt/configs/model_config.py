@@ -1891,11 +1891,8 @@ class ModelConfig:
         """Number of KV heads per GPU.
 
         DCP ranks replicate KV, so heads shard across ``tp // dcp`` groups.
-        Drafts never join the group and ignore ``dcp_size``, and so does a
-        platform running ring-mode prefill context parallelism
-        (``pcp_ring_enabled``): its DCP ranks are the attention-CP ranks,
-        outside attention TP, so heads shard over attention TP alone. With fewer heads than groups,
-        each GPU keeps one.
+        Drafts never join the group and ignore ``dcp_size``. With fewer heads
+        than groups, each GPU keeps one.
         """
         total_num_kv_heads = self.get_total_num_kv_heads()
         if self.is_draft_model or current_platform.pcp_ring_enabled():
