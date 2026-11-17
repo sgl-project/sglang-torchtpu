@@ -1771,6 +1771,11 @@ class TestHiCacheReloadGate(CustomTestCase):
         counter = BatchDoneCounter()
         slot = counter.update_producer()
         counter.set_event(slot, RaidenFutureEvent(dma))
+        # A later batch's reload owns the newest slot; this batch must wait on its own.
+        counter.set_event(
+            counter.update_producer(),
+            RaidenFutureEvent(_PendingDma(polls_before_landing=0)),
+        )
         landed_at_forward = []
         shim = self._shim(
             counter, fn=lambda *a, **k: landed_at_forward.append(dma.landed)
