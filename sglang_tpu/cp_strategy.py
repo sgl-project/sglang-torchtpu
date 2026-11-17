@@ -9,7 +9,7 @@ from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_schedule
 from sglang_tpu.cp_forward import get_tpu_cp_layout
-from sglang_tpu.cp_layout import max_local_rows
+from sglang_tpu.cp_layout import ring_max_local_rows
 
 
 class TpuZigzagCPStrategy(ZigzagCPStrategy):
@@ -37,7 +37,7 @@ class TpuZigzagCPStrategy(ZigzagCPStrategy):
         Ring mode reserves two page-aligned blocks per request on every rank,
         so many short requests can need more local rows than the largest
         compiled token bucket; such a batch must fall back to the striped (DCP)
-        extend program. 
+        extend program.
         """
         self._ring_max_local_rows = max_local_rows
 
@@ -66,7 +66,7 @@ class TpuZigzagCPStrategy(ZigzagCPStrategy):
     def _fits_ring_capacity(self, lengths: list[int], forward_batch: Any) -> bool:
         """Whether the ring layout of ``lengths`` fits a compiled token bucket;
         always True in gather mode."""
-        if self._ring_max_local_rows is None: #gather mode
+        if self._ring_max_local_rows is None:  # gather mode
             return True
         # The decision is made on the host before the layout is attached; the
         # compiled forward only re-reads it (see pinned_extend_seq_lens_cpu),
@@ -74,5 +74,5 @@ class TpuZigzagCPStrategy(ZigzagCPStrategy):
         if get_tpu_cp_layout(forward_batch) is not None:
             return True
         page_size = get_schedule().page_size
-        rows = max_local_rows(lengths, self.cp_size, page_size)
+        rows = ring_max_local_rows(lengths, self.cp_size, page_size)
         return rows <= self._ring_max_local_rows

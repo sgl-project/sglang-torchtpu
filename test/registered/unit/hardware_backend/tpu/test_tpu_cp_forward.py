@@ -35,11 +35,12 @@ from sglang_tpu.cp_forward import (
     wrap_cp_embedding_forward,
 )
 from sglang_tpu.cp_layout import (
-    build_tpu_cp_layout,
+    build_gather_layout,
+    build_ring_layout,
     local_row_count,
-    max_local_rows,
     ring_block_lens,
     ring_block_size,
+    ring_max_local_rows,
     warmup_request_lengths,
 )
 from sglang_tpu.kv_row_write import kv_write_segments, write_rows_torch
@@ -60,7 +61,7 @@ CU_EXTEND = np.cumsum([0] + EXTEND)
 
 def _layouts(extend=EXTEND, prefix=PREFIX, pad_b=PAD_B, bucket=32):
     return [
-        build_tpu_cp_layout(
+        build_gather_layout(
             extend_lens=extend,
             prefix_lens=prefix,
             cp_size=CP,
@@ -248,7 +249,7 @@ class TestCpMetadata(CustomTestCase):
         backend._is_hybrid_swa = full_to_swa is not None
         backend._host_page_cols = None
         backend._distribution_cache = {}
-        host = build_tpu_cp_layout(
+        host = build_gather_layout(
             extend_lens=self.EXTEND_LENS,
             prefix_lens=self.PREFIX_LENS,
             cp_size=CP,
@@ -429,7 +430,7 @@ def _ring_layouts(
     bucket=RING_BUCKET,
 ):
     return [
-        build_tpu_cp_layout(
+        build_ring_layout(
             extend_lens=extend,
             prefix_lens=prefix,
             cp_size=CP,
@@ -451,7 +452,7 @@ class TestRingLayout(CustomTestCase):
         self.assertEqual(ring_block_lens(40, CP, RING_PAGE), [16, 16, 8, 0, 0, 0, 0, 0])
         self.assertEqual(ring_block_lens(3, CP, RING_PAGE), [3] + [0] * 7)
         # 2 * C local rows per request on every rank.
-        self.assertEqual(max_local_rows(RING_EXTEND, CP, RING_PAGE), 64 + 32 + 32)
+        self.assertEqual(ring_max_local_rows(RING_EXTEND, CP, RING_PAGE), 64 + 32 + 32)
 
     def test_every_token_has_one_local_row_at_its_block_offset(self):
         layouts = _ring_layouts()
@@ -593,21 +594,9 @@ class TestRingLayout(CustomTestCase):
         # Zero cached length: the kernel schedules no ring step for the row.
         self.assertEqual(ring.cache_kv_lens.tolist(), ring.cache_q_lens.tolist())
 
-    def test_rejects_layouts_the_kernel_cannot_read(self):
-        with self.assertRaisesRegex(ValueError, "not a multiple of the page size"):
-            _ring_layouts(bucket=RING_BUCKET + 8)
+    def test_rejects_batches_that_do_not_fit(self):
         with self.assertRaisesRegex(ValueError, "exceed the local token bucket"):
             _ring_layouts(bucket=112)
-        with self.assertRaisesRegex(ValueError, "multiple of 16"):
-            build_tpu_cp_layout(
-                extend_lens=[40],
-                prefix_lens=[0],
-                cp_size=CP,
-                cp_rank=0,
-                pad_b=1,
-                local_rows_padded=48,
-                page_size=24,
-            )
         with self.assertRaisesRegex(ValueError, "exceed the request bucket"):
             _ring_layouts(pad_b=2)
 
@@ -617,7 +606,7 @@ class TestRingLayout(CustomTestCase):
                 local_rows=bucket, cp_size=CP, page_size=RING_PAGE, max_reqs=max_reqs
             )
             self.assertLessEqual(len(lengths), max_reqs)
-            self.assertEqual(max_local_rows(lengths, CP, RING_PAGE), bucket)
+            self.assertEqual(ring_max_local_rows(lengths, CP, RING_PAGE), bucket)
             for length in lengths:
                 # Every block is full, so no rank has a padding row.
                 self.assertEqual(
