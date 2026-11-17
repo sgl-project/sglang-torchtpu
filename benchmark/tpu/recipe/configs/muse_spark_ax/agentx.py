@@ -62,6 +62,9 @@ def config_for(conc: int, *, draft_model_path: str | None, moe_mode: str, ep_arm
     rows = running * DRAFT_TOKENS
     env["SGLANG_TPU_MUSE_MK_MAX_ROWS"] = str(max(32, -(-rows // 16) * 16))
     env["SGLANG_TIMEOUT_KEEP_ALIVE"] = "900"
+    if os.environ.get("NO_CKPT_PREFETCH") == "1":
+        # many hosts reading one bucket: a prefetch read can outlast the loader's 60 s stop wait
+        args["weight_loader_prefetch_checkpoints"] = False
     if moe_mode == "ep":
         args["ep_size"] = 8
         env.update(EP_ENV)
