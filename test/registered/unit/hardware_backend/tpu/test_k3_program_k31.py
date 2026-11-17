@@ -709,6 +709,7 @@ class TestIndexSelectBins(CustomTestCase):
                 assert np.all(got[dsa.topk_mask(kk, t, topk)]), b  # a superset of the top-k
                 assert bool(own[0, b]) == bool(got[-1]), b
             print("superset extra tokens", extra)
+            return tau, ptie, own, keys
 
         case([300, 2500], 1, 256, 0)
         case([1500, 2600], 2, 300, 1)
@@ -743,6 +744,114 @@ class TestIndexSelectBins(CustomTestCase):
 
     def test_four_rounds(self):
         self._run(4)
+
+
+class TestSelectExchangeHook(CustomTestCase):
+    """``IndexSelect.select(in_exchange, keys_ready)`` (the decode's
+    ``dsa_prologue_in_select`` runs the attention's prologue in the first and
+    its first key copies in the second): ``in_exchange`` runs once, in the
+    second exchange round after its sends and before its wait; ``keys_ready``
+    once, after the last round and the resident keys' copies out; work in
+    them leaves the thresholds, own flags and keys bit for bit unchanged
+    (``TestIndexSelectBins``' harness with the recipe's scoring knobs: an
+    8-row sequence and two one-row sequences with five bin rounds, the
+    8-row sequence with the eight exact rounds)."""
+
+    TAIL = """
+        from jax.experimental import pallas as pl
+        events = []
+        real_remote, real_copy = pltpu.make_async_remote_copy, pltpu.make_async_copy
+        real_wide, real_round = dsa_dcp.IndexSelect._key_round_wide, dsa_dcp.IndexSelect._key_round
+
+        def remote(*args, **kwargs):
+            events.append("send")
+            return real_remote(*args, **kwargs)
+
+        def copy(*args, **kwargs):
+            events.append("copy")
+            return real_copy(*args, **kwargs)
+
+        def logged(real):
+            def round_(self, *args, **kwargs):
+                events.append("round")
+                return real(self, *args, **kwargs)
+            return round_
+
+        def work(name):  # independent work: a scoped buffer written
+            def run():
+                events.append(name)
+                def body(buf):
+                    buf[...] = jnp.full(buf.shape, 1.0, jnp.float32)
+                pl.run_scoped(body, pltpu.VMEM((8, 128), jnp.float32))
+            return run
+
+        pltpu.make_async_remote_copy, pltpu.make_async_copy = remote, copy
+        dsa_dcp.IndexSelect._key_round_wide = logged(real_wide)
+        dsa_dcp.IndexSelect._key_round = logged(real_round)
+        real_select = dsa_dcp.IndexSelect.select
+        cases = (([3100], 8, 400, 2), ([300, 2500], 1, 256, 0))
+        for firsts, S, topk, seed in cases[: int(os.environ["HOOK_CASES"])]:
+            dsa_dcp.IndexSelect.select = real_select
+            plain = case(firsts, S, topk, seed)
+            events.clear()
+            dsa_dcp.IndexSelect.select = lambda self: real_select(
+                self, in_exchange=work("hook"), keys_ready=work("ready"))
+            hooked = case(firsts, S, topk, seed)
+            for a, b in zip(plain, hooked):
+                np.testing.assert_array_equal(a, b)
+            assert events.count("hook") == 1, events.count("hook")
+            rounds = [i for i, e in enumerate(events) if e == "round"]
+            second = events[rounds[1] : rounds[2] if len(rounds) > 2 else len(events)]
+            at = second.index("hook")
+            assert "send" in second[:at] and "send" not in second[at:], second
+            assert "copy" in second[at:], second  # the round's wait follows
+            ready = events.index("ready")  # after every DMA wait (the keys' copies out too)
+            assert events.count("ready") == 1 and ready > rounds[-1], events
+            assert not {"send", "copy"} & set(events[ready:]), events[ready:]
+        print("OK")
+    """
+
+    def _run(self, rounds, cases):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        harness = textwrap.dedent(TestIndexSelectBins.SCRIPT)
+        harness = harness[: harness.index("\ncase([300, 2500], 1, 256, 0)\n") + 1]
+        install = "kc.install(kc.KernelConfig(dsa_select_rounds=ROUNDS))"
+        assert install in harness
+        harness = harness.replace(  # resident keys: their copies out precede keys_ready
+            install,
+            "kc.install(kc.KernelConfig(dsa_select_rounds=ROUNDS, dsa_resident_keys=True, "
+            "dsa_stage_slots=4, dsa_page_slots=8, dsa_patch_loop=True))",
+        )
+        env = dict(
+            os.environ,
+            PYTHONPATH=os.pathsep.join(sys.path),
+            ROUNDS=str(rounds),
+            HOOK_CASES=str(cases),
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", harness + textwrap.dedent(self.TAIL)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1800,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
+
+    def test_hook_in_the_second_bin_round(self):
+        self._run(5, cases=2)
+
+    def test_hook_in_the_second_exact_round(self):
+        self._run(8, cases=1)  # the 8-row sequence (the exact rounds compile slowly)
 
 
 class TestIndexSelectGatherFinish(CustomTestCase):
@@ -1053,8 +1162,11 @@ class TestSelectedAttention(CustomTestCase):
         base_config = mla_dcp._config()
 
         def case(firsts, S, topk, seed, grouped=False, activity="exact", poison=False, compact=0, expect=None,
-                 window=0):
-            config = dataclasses.replace(base_config, dsa_compact_tokens=compact, dsa_compact_window=window)
+                 window=0, knobs=(), sent=False):
+            # knobs: KernelConfig flags on; sent: the queries leave early (send_queries) and, with
+            # dsa_prologue_in_select, another attention stages them as the decode's selection does.
+            config = dataclasses.replace(base_config, dsa_compact_tokens=compact, dsa_compact_window=window,
+                                         **{knob: True for knob in knobs})
             mla_dcp._config = lambda: config
             mla_dcp._grouped_spec = ((lambda b, g, h, rows: rows in (4, 8) and b % 4 == 0) if grouped
                                      else (lambda *a: False))
@@ -1074,6 +1186,8 @@ class TestSelectedAttention(CustomTestCase):
             tables = np.zeros((G, B, pages), np.int32)
             keys = np.full((G, B, key_rows, 128), -2**31, np.int32)
             tok = rng.integers(-2**31 + 1, 2**31 - 1, (B, pages * G * T), dtype=np.int64)
+            for b in range(B):  # a sequence's new tokens rank first: its cached rows and own tokens matter
+                tok[b, firsts[b // S] : firsts[b // S] + S] = 2**31 - 2 - np.arange(S)
             for b in range(B):
                 s, p0 = b // S, firsts[b // S]
                 tables[:, b] = 1 + s * pages + np.arange(pages)
@@ -1081,6 +1195,9 @@ class TestSelectedAttention(CustomTestCase):
                     page = t // T; g, j = page % G, page // G
                     if t < p0:
                         pool[g, tables[g, b, j], (t % T) // 4, t % 4] = lat[s, t].astype(ml_dtypes.float8_e4m3fn)
+                    keys[g, b, j * (T // 128) + (t % T) // 128, t % 128] = tok[b, t]
+                for t in range(positions[b], p0 + S - 1):  # later rows' cached tokens pass: the causal bound
+                    page = t // T; g, j = page % G, page // G
                     keys[g, b, j * (T // 128) + (t % T) // 128, t % 128] = tok[b, t]
             tau = np.zeros(B, np.int32); ptie = np.zeros(B, np.int32); own = np.zeros(B, np.int32); masks = []
             for b in range(B):
@@ -1128,7 +1245,15 @@ class TestSelectedAttention(CustomTestCase):
                 if poison:  # another scoped region's bytes: NaN where no step loads a page
                     ws.pages[...] = jnp.full(ws.pages.shape, jnp.nan, ws.pages.dtype)
                 att.prime()
-                out_r[...] = att.attend(q_r[...], new_r[...], 0)
+                if not sent:
+                    out_r[...] = att.attend(q_r[...], new_r[...], 0)
+                    return
+                att.send_queries(q_r[...], new_r[...], 0)
+                staged = "dsa_prologue_in_select" in knobs
+                if staged:
+                    mla_dcp.DcpAttention(cache, ws, pos, B, sequence_rows=S,
+                                         cache_verify_rows=S > 1).stage_queries(0)
+                out_r[...] = att.attend(None, new_r[...], 0, queries_sent=True, queries_staged=staged)
 
             def body(pos, table, tau_, ptie_, own_, act_, q_, new_, pool_, keys_):
                 vmem = pltpu.VMEM
@@ -1152,7 +1277,7 @@ class TestSelectedAttention(CustomTestCase):
                 p = np.exp(np.where(masks[-1], s_, -np.inf) - s_[masks[-1]].max()); p /= p.sum()
                 ref = p @ vals[:, :512]
                 assert np.abs(out[0, B - 1, 0] - ref).max() / np.abs(ref).max() > 0.3
-                return
+                return out
             for b in range(B):
                 L = positions[b] + 1
                 vals = lat[b // S, :L]
@@ -1166,6 +1291,7 @@ class TestSelectedAttention(CustomTestCase):
                             errs.append(np.abs(out[d, b, j] - ref).max() / np.abs(ref).max())
                         assert errs[0] < 6e-2, (b, d, j, errs)
                         assert L <= topk or errs[1] > 0.3, (b, d, j, errs)  # the mask matters
+            return out
 
         case([700, 2000], 1, 64, 0)
         case([1500, 3000], 4, 200, 1, grouped=True)
@@ -1202,6 +1328,65 @@ class TestSelectedAttention(CustomTestCase):
             text=True,
             env=env,
             timeout=900,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
+
+
+class TestAttentionExactKnobs(CustomTestCase):
+    """Default-off rewrites of the DSA verify attention that must not change
+    a bit (``TestSelectedAttention``'s harness, interpret mode, 4-rank group):
+    ``dsa_row_block_masks`` (row-block score masks in compact, window and
+    dense folds), ``dcp_shift_scalars`` (shift/mask step scalars, the cached
+    rows' step found before the loop), ``dcp_query_tail_unpack`` (FP8 query
+    packets widen only the last lane tile) and ``dsa_prologue_in_select``
+    (the gather wait, query unpack and state reset staged by another
+    attention after ``send_queries``, as the decode's selection runs them).
+    Every case runs with all of them off and on and compares the outputs
+    bit for bit: B1 x7 (one 8-row sequence), two 4-row sequences with dense
+    and compact steps, a small window with flushes, poisoned page slots,
+    the chunked 16-row verifies of two 8-row sequences (B2 x7) and of four
+    4-row sequences (B4 x3, two a chunk) and plain rows in two row groups;
+    early-query cases with and without staging."""
+
+    TAIL = """
+        KNOBS = ("dsa_row_block_masks", "dsa_prologue_in_select", "dcp_shift_scalars",
+                 "dcp_query_tail_unpack")
+        for args, kwargs, modes in (
+            (([2600], 8, 40, 7), dict(grouped=True, compact=128, window=512), (False, True)),
+            (([1500, 3000], 4, 200, 1), dict(grouped=True, compact=128, window=512, expect=("compact", "dense")),
+             (False, True)),
+            (([900, 2600], 8, 40, 6), dict(grouped=True, compact=64, window=64), (False,)),
+            (([700, 9000], 4, 8, 4), dict(grouped=True, compact=64, poison=True, window=256), (True,)),
+            (([1500, 3000], 4, 24, 5), dict(grouped=True, compact=64, expect=("compact",)), (True,)),
+            (([700, 2000], 1, 64, 0), dict(), (True,)),
+            (([700, 1500, 2600, 3000], 4, 24, 8), dict(grouped=True, compact=64, window=128), (False,)),
+        ):
+            for sent in modes:
+                off = case(*args, **kwargs, sent=sent)
+                on = case(*args, **kwargs, sent=sent, knobs=KNOBS)
+                assert np.array_equal(off.view(np.uint32), on.view(np.uint32)), (args, sent, np.abs(off - on).max())
+        print("OK")
+    """
+
+    def test_knobs_leave_the_outputs_bit_identical(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        harness = textwrap.dedent(TestSelectedAttention.SCRIPT)
+        harness = harness[: harness.index("\ncase([700, 2000], 1, 64, 0)\n") + 1]
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", harness + textwrap.dedent(self.TAIL)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=2400,
         )
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 

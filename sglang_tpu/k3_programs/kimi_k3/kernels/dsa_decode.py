@@ -392,19 +392,46 @@ class DecodeIndexer:
         ) // span_rows <= dsa_dcp.ACTIVITY_MIN_STEPS
 
     def selection(
-        self, cache, position_ref, hidden, query_latent, parity, after_gather=None
+        self,
+        cache,
+        position_ref,
+        hidden,
+        query_latent,
+        parity,
+        after_gather=None,
+        in_exchange=None,
+        keys_ready=None,
     ) -> mla_dcp.DcpSelection:
         """``hidden`` [B, hidden] and ``query_latent`` [B, 1536] (normalized,
         BF16) values; ``cache`` the layer's ``mla_dcp.DcpCache``.
         PROTOTYPE ``after_gather``: runs once the index query gather has
-        landed (e.g. the attention's own query gather, under the scoring)."""
+        landed (e.g. the attention's own query gather, under the scoring).
+        ``in_exchange``: runs in the selection's second exchange round
+        (``dsa_dcp.IndexSelect.select``), e.g. the attention's prologue;
+        ``keys_ready(selection)``: once the keys scratch is complete, before
+        the thresholds and the step activity, e.g. the first key copies."""
         with dsa_dcp._scope("d_indexer"):
             return self._selection(
-                cache, position_ref, hidden, query_latent, parity, after_gather
+                cache,
+                position_ref,
+                hidden,
+                query_latent,
+                parity,
+                after_gather,
+                in_exchange,
+                keys_ready,
             )
 
     def _selection(
-        self, cache, position_ref, hidden, query_latent, parity, after_gather=None
+        self,
+        cache,
+        position_ref,
+        hidden,
+        query_latent,
+        parity,
+        after_gather=None,
+        in_exchange=None,
+        keys_ready=None,
     ) -> mla_dcp.DcpSelection:
         s, batch = self.scoped, hidden.shape[0]
         group = cache.group
@@ -525,12 +552,9 @@ class DecodeIndexer:
             lambda first: s["q8"][pl.ds(first, S)].reshape(S * HEADS, DIM),
             pages_started=early,
         )
-        select.select()
         span_rows = s["attend_keys"].shape[2]
         steps = self.keys.shape[1] // span_rows
-        select.step_activity(span_rows, s["active"], steps)
-        record_copy.wait()
-        return mla_dcp.DcpSelection(
+        selection = mla_dcp.DcpSelection(
             self.keys,
             s["tau"],
             s["p_tie"],
@@ -540,6 +564,13 @@ class DecodeIndexer:
             active=s["active"],
             steps=steps,
         )
+        select.select(
+            in_exchange,
+            None if keys_ready is None else lambda: keys_ready(selection),
+        )
+        select.step_activity(span_rows, s["active"], steps)
+        record_copy.wait()
+        return selection
 
 
 for _name, _method in (
