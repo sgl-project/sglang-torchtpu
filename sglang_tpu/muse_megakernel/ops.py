@@ -211,7 +211,9 @@ def _check_ep_serving(parallel) -> None:
         )
 
 
-def _ep_wo(weight: torch.Tensor, *, rank: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _ep_wo(
+    weight: torch.Tensor, *, rank: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Under EP, the whole o_proj (RowParallel, [H, qd] per rank as loaded) as fp8 K-major
     [tp * qd, H], which prefill/spep reads, this rank's row block of it, which decode reads,
     and their shared per-output-channel scales [H] (one quantization of the whole matrix)."""
@@ -222,7 +224,9 @@ def _ep_wo(weight: torch.Tensor, *, rank: int) -> tuple[torch.Tensor, torch.Tens
     # K-major first, then the rank blocks stacked along dim 0 (rank order)
     gathered = tensor_model_parallel_all_gather(mine, dim=0)
     if not torch.equal(gathered[rank * qd : (rank + 1) * qd], mine):
-        raise RuntimeError(f"Muse EP: rank {rank}'s block of the gathered wo is not its own")
+        raise RuntimeError(
+            f"Muse EP: rank {rank}'s block of the gathered wo is not its own"
+        )
     whole, scale = _fp8_channelwise(gathered)
     return whole, whole[rank * qd : (rank + 1) * qd].contiguous(), scale
 
@@ -238,8 +242,12 @@ def _pool_weight(weight: torch.Tensor, *, ep: bool) -> torch.Tensor:
         return _k_major(weight)
     from sglang.srt.distributed import tensor_model_parallel_all_gather
 
-    whole = _k_major(tensor_model_parallel_all_gather(weight.detach().contiguous(), dim=0))
-    return whole.index_select(1, _kperm_index(whole.shape[1], whole.device)).contiguous()
+    whole = _k_major(
+        tensor_model_parallel_all_gather(weight.detach().contiguous(), dim=0)
+    )
+    return whole.index_select(
+        1, _kperm_index(whole.shape[1], whole.device)
+    ).contiguous()
 
 
 def _unpool_weight(weight: torch.Tensor, *, ep: bool) -> torch.Tensor:
@@ -248,7 +256,9 @@ def _unpool_weight(weight: torch.Tensor, *, ep: bool) -> torch.Tensor:
         return _k_major(weight)
     from sglang.srt.distributed import tensor_model_parallel_all_gather
 
-    return _k_major(tensor_model_parallel_all_gather(weight.detach().contiguous(), dim=0))
+    return _k_major(
+        tensor_model_parallel_all_gather(weight.detach().contiguous(), dim=0)
+    )
 
 
 def w4a16_layers_of(kinds: tuple, qblock: int) -> tuple:
@@ -454,7 +464,9 @@ class MuseMegakernel(torch.nn.Module):
             for layer in decoder.layers:
                 if _expert_kind(layer.mlp.experts) == "fp4":
                     requant_tpu_nvfp4_experts(
-                        layer.mlp.experts, qblock, ep_ranks=parallel.moe_ep_size if ep else 0
+                        layer.mlp.experts,
+                        qblock,
+                        ep_ranks=parallel.moe_ep_size if ep else 0,
                     )
             torch.accelerator.synchronize()
             logger.info("Muse megakernel: fp4 experts requantized to block %d", qblock)
@@ -468,7 +480,9 @@ class MuseMegakernel(torch.nn.Module):
                 )
             )
             if ep:
-                whole, mine, wo_scale = _ep_wo(attn.o_proj.weight, rank=parallel.tp_rank)
+                whole, mine, wo_scale = _ep_wo(
+                    attn.o_proj.weight, rank=parallel.tp_rank
+                )
                 wo_full.append(whole)
                 wo.append(mine)
             else:
@@ -1125,7 +1139,9 @@ class MuseMegakernel(torch.nn.Module):
         meta = torch.cat([md.active_num_tokens.reshape(1).to(torch.int32), self.rank_t])
         kv = [pool.get_fused_kv_buffer(i) for i in range(self.geo.n_layers)]
         weights = [
-            self.w_wo_full if n == "wo" and self.prefill_whole_wo else getattr(self, f"w_{n}")
+            self.w_wo_full
+            if n == "wo" and self.prefill_whole_wo
+            else getattr(self, f"w_{n}")
             for n in WEIGHT_NAMES
         ]
         experts = [getattr(self, f"expert_{i}") for i in range(self.n_expert_refs)]

@@ -90,7 +90,9 @@ def ep_arm(rows: int | None = None) -> str:
     arm = tpu_envs.SGLANG_TPU_MUSE_MK_EP_ARM.get()
     if arm == "mixed":
         if rows is None:
-            raise ValueError("SGLANG_TPU_MUSE_MK_EP_ARM=mixed picks the arm by the step's rows")
+            raise ValueError(
+                "SGLANG_TPU_MUSE_MK_EP_ARM=mixed picks the arm by the step's rows"
+            )
         return "gather" if rows <= MIXED_GATHER_MAX_ROWS else "a2a"
     if arm not in ARMS:
         raise ValueError(f"SGLANG_TPU_MUSE_MK_EP_ARM={arm!r}: a2a, gather or mixed")

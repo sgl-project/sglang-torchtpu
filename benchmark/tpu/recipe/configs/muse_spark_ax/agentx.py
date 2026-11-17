@@ -25,7 +25,6 @@ PROFILES = {
     # the best single-host TP line peaks here (junyanxu q4mk sweeps)
     22: (22, 48, [1, 2, 4, 8, 12, 16, 22]),
     24: (24, 48, [1, 2, 4, 8, 12, 16, 24]),
-    24: (24, 48, [1, 2, 4, 8, 12, 16, 24]),
     32: (32, 40, [1, 2, 4, 8, 12, 16, 24, 32]),
     # VR200 nov03 single-host points. Past 256 rows the row-tiled megakernel needs a multiple
     # of mv_rows (256): no 33-63 request buckets, so both cap admission at 64 (512 rows)
@@ -43,7 +42,9 @@ EP_ENV = {
 }
 
 
-def config_for(conc: int, *, draft_model_path: str | None, moe_mode: str, ep_arm: str) -> dict:
+def config_for(
+    conc: int, *, draft_model_path: str | None, moe_mode: str, ep_arm: str
+) -> dict:
     running, interval, compile_bs = PROFILES[conc]
     # PDI: decode steps between prefill batches, overriding the profile's
     interval = int(os.environ.get("PDI") or interval)
