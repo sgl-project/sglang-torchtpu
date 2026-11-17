@@ -2392,7 +2392,34 @@ class IndexSelect:
         copies), before the thresholds are extracted; ``fill``: work that
         needs no threshold, run in the first count exchange's wait with the
         selection's own (``KernelConfig.dsa_exchange_fill``, which also runs
-        ``keys_ready`` there, right after the resident keys' copy wait)."""
+        ``keys_ready`` there, right after the resident keys' copy wait).
+        Each hook is traced once whatever the rounds (seeded or not, bins or
+        exact, the gather finish); a hook another path skipped or repeated
+        raises here."""
+        traced = {}
+
+        def once(name, hook):
+            if hook is None:
+                return None
+            traced[name] = 0
+
+            def run():
+                traced[name] += 1
+                hook()
+
+            return run
+
+        self._select(
+            once("in_exchange", in_exchange),
+            once("keys_ready", keys_ready),
+            once("fill", fill),
+        )
+        wrong = {name: count for name, count in traced.items() if count != 1}
+        if wrong:
+            raise RuntimeError(f"selection hooks traced other than once: {wrong}")
+
+    def _select(self, in_exchange, keys_ready, fill):
+        """``select``'s rounds."""
         refs, topk = self.refs, self.topk
         cand = jax.lax.broadcasted_iota(jnp.int32, (COUNT_ROWS, LANES), 0)
         rounds = select_rounds()

@@ -165,8 +165,11 @@ class KernelConfig:
     # Kimi-K3.1 decode attention whose query gather leaves during the indexer
     # (unchunked DSA calls, up to 8 rows): the gather wait, the FP8 query
     # unpack and the softmax state reset run inside the selection's second
-    # exchange round (between its sends and its wait) instead of at the
-    # start of the attention. The same values in the same buffers, earlier.
+    # exchange round (between its sends and its wait; seeded window: the
+    # round after the window round) instead of at the start of the
+    # attention, and the first steps' key copies start once the keys scratch
+    # is complete (dsa_exchange_fill: in the first exchange's wait). The same
+    # values in the same buffers, earlier.
     dsa_prologue_in_select: bool = False
     # Kimi-K3.1 decode epilogue: commit the step's latent rows and DSA
     # index keys in one kernel (paged._commit_dsa_rows_fused) instead of the

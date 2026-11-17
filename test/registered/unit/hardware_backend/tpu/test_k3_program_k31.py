@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=3700, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4300, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -5307,6 +5307,231 @@ class TestSeededWindowMath(CustomTestCase):
                 if slots[b]:
                     expect[slots[b], m, b % 4] = new[m * 8 + b]
         np.testing.assert_array_equal(out, expect)  # slot 0 unchanged
+
+
+class TestSelectHooksSeededFills(CustomTestCase):
+    """The selection's hooks under the seeded window and the first wait's
+    fill together: ``select_call`` in interpret mode on a 4-rank group over
+    ``TestIndexSelectSeededWindow``'s streams (8 rows of one sequence for 5
+    steps, two 8-row sequences for 4; window hits and misses), with
+    ``select`` given the decode's three hooks (``in_exchange``: the
+    attention's prologue under ``dsa_prologue_in_select``; ``keys_ready``:
+    its first key copies; ``fill``: the dense step activity under
+    ``dsa_exchange_fill``), each a scoped buffer written. The exchanges'
+    sends and the hooks count themselves in an SMEM counter (interpret mode
+    runs loads and stores in program order; its prints may move) and print
+    their place. Every rank runs each hook once a selection, on a hit (two
+    exchanges), a miss (three) and the unseeded rounds alike:
+    ``in_exchange`` after the second exchange's sends (before its wait);
+    with the fill, ``fill`` and then ``keys_ready`` after the first
+    exchange's sends, else ``keys_ready`` after the last exchange. The
+    thresholds, tie positions, own flags and keys equal the run with every
+    knob off bit for bit (the seeded window, the hooks and the fill in four
+    combinations, with the vector patch and the odd count stride)."""
+
+    PATCH = """
+        HOOKS = os.environ.get("HOOKS") == "1"
+        _inside, _counter = [], []
+
+        def _event(self, name, exchange=False):
+            # [exchanges so far, events so far] in SMEM, printed with the event.
+            counter = _counter[-1]
+            if exchange:
+                counter[0] = counter[0] + 1
+            counter[1] = counter[1] + 1
+            pl.debug_print("EVENT {} " + name + " {} {}", self.member, counter[1], counter[0])
+
+        def _exchanging(real):
+            def exchange(self, *args, **kwargs):
+                _inside.append(1)
+                try:
+                    return real(self, *args, **kwargs)
+                finally:
+                    _inside.pop()
+            return exchange
+
+        dsa_dcp.IndexSelect._exchange_wide = _exchanging(dsa_dcp.IndexSelect._exchange_wide)
+        dsa_dcp.IndexSelect._all_reduce = _exchanging(dsa_dcp.IndexSelect._all_reduce)
+        _fill_wait = dsa_dcp.IndexSelect._fill_wait
+
+        def _marked_fill_wait(self):
+            if _inside:  # an exchange's sends are out (its queued work and hook, then its wait)
+                _event(self, "XCHG", exchange=True)
+            return _fill_wait(self)
+
+        dsa_dcp.IndexSelect._fill_wait = _marked_fill_wait
+        _select = dsa_dcp.IndexSelect.select
+
+        def _hooked(self):
+            def work(name):
+                def run():
+                    _event(self, name)
+                    def body(buf):
+                        buf[...] = jnp.full(buf.shape, 1.0, jnp.float32)
+                    pl.run_scoped(body, pltpu.VMEM((8, 128), jnp.float32))
+                return run
+
+            def selection(counter):
+                counter[0] = jnp.int32(0)
+                counter[1] = jnp.int32(0)
+                _counter.append(counter)
+                if HOOKS:
+                    fill = work("FILL") if kc.active().dsa_exchange_fill else None
+                    _select(self, work("IN_EXCHANGE"), work("KEYS_READY"), fill)
+                else:
+                    _select(self)
+                _counter.pop()
+
+            pl.run_scoped(selection, pltpu.SMEM((2,), jnp.int32))
+
+        dsa_dcp.IndexSelect.select = _hooked
+    """
+
+    @staticmethod
+    def runs():
+        """``{name: (knobs, hooks)}``: every knob off, then the seeded window,
+        the hooks and the fill in combination (the other knobs on)."""
+        base = TestIndexSelectSeededWindow.KNOBS
+        on = base + ",dsa_vector_patch=1,dsa_odd_stride=1"
+        seeded, fill = ",dsa_seeded_window=1", ",dsa_exchange_fill=1"
+        return {
+            "off": (base, False),
+            "all": (on + seeded + fill, True),
+            "seeded_hooks": (on + seeded, True),
+            "seeded_fill": (on + seeded + fill, False),
+            "hooks_fill": (on + fill, True),
+        }
+
+    @classmethod
+    def script(cls):
+        import textwrap
+
+        script = textwrap.dedent(TestIndexSelectSeededWindow.SCRIPT)
+        anchor = "dsa_dcp.IndexSelect._exchange_wide = _counted\n"
+        streams = (
+            'stream("b8s8", 8, plan8, 0, 2900)\n',
+            'stream("b8s1", 1, plan1, 1, 3200)\n',
+        )
+        assert script.count(anchor) == 1 and all(script.count(s) == 1 for s in streams)
+        script = script.replace(anchor, anchor + textwrap.dedent(cls.PATCH))
+        script = script.replace(streams[0], 'stream("b8s8", 8, plan8[:5], 0, 2900)\n')
+        return script.replace(streams[1], "")
+
+    @staticmethod
+    def events(stdout):
+        """``[(stream, step, {rank: [event, ...]})]`` from a run's output, each
+        rank's events in program order (their counts, not the print order)."""
+        import re
+
+        steps, current = [], {}
+        for line in stdout.splitlines():
+            event = re.search(r"EVENT (\d+) (\w+) (\d+) (\d+)", line)
+            if event:
+                rank, name, seq, sent = event.groups()
+                current.setdefault(int(rank), []).append((int(seq), name, int(sent)))
+                continue
+            done = re.match(r"(\w+) (\d+) taus", line)
+            if done:
+                ranks = {}
+                for rank, got in current.items():
+                    got.sort()
+                    seqs = [seq for seq, _, _ in got]
+                    assert seqs == list(range(1, len(got) + 1)), got
+                    # Each event's exchange count matches its place.
+                    count = 0
+                    for _, name, sent in got:
+                        count += name == "XCHG"
+                        assert sent == count, got
+                    ranks[rank] = [name for _, name, _ in got]
+                steps.append((done[1], int(done[2]), ranks))
+                current = {}
+        return steps
+
+    def _check_events(self, name, ranks, exchanges, hooks, filled):
+        """One selection's events on every rank (``exchanges``: its count)."""
+        for rank, got in ranks.items():
+            where = f"{name} rank {rank}: {got}"
+            self.assertEqual(got.count("XCHG"), exchanges, where)
+            hook_events = [e for e in got if e != "XCHG"]
+            if not hooks:
+                self.assertEqual(hook_events, [], where)
+                continue
+            if filled:
+                order = ["FILL", "KEYS_READY", "IN_EXCHANGE"]
+            else:
+                order = ["IN_EXCHANGE", "KEYS_READY"]
+            self.assertEqual(hook_events, order, where)
+            # The exchanges whose sends precede each hook.
+            sent = {e: got[: got.index(e)].count("XCHG") for e in hook_events}
+            self.assertEqual(sent["IN_EXCHANGE"], 2, where)
+            if filled:
+                self.assertEqual((sent["FILL"], sent["KEYS_READY"]), (1, 1), where)
+            else:
+                self.assertEqual(sent["KEYS_READY"], exchanges, where)
+                self.assertEqual(got[-1], "KEYS_READY", where)
+
+    def test_hooks_run_once_on_every_path_bit_for_bit(self):
+        import ast
+        import os
+        import re
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        script = self.script()
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs, exchanges = {}, {}
+            for name, (knobs, hooks) in self.runs().items():
+                env = dict(
+                    os.environ,
+                    PYTHONPATH=os.pathsep.join(sys.path),
+                    KNOBS=knobs,
+                    HOOKS="1" if hooks else "0",
+                    OUT=f"{tmp}/{name}.npz",
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", script],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=2400,
+                )
+                self.assertIn(
+                    "OK",
+                    result.stdout,
+                    f"{name}: {result.stdout[-2000:]}{result.stderr[-3000:]}",
+                )
+                outputs[name] = np.load(f"{tmp}/{name}.npz")
+                seeded = "seeded_window=1" in knobs
+                filled = "exchange_fill=1" in knobs
+                # Seeded: two exchanges on a hit (or with no active row), else three.
+                flags = {}
+                if seeded:
+                    line = re.search(r"^flags (.*)$", result.stdout, re.M)[1]
+                    for stream, step, active, hit in ast.literal_eval(line):
+                        flags[stream, step] = 2 if hit or not active else 3
+                steps = self.events(result.stdout)
+                self.assertEqual(len(steps), 9, name)
+                exchanges[name] = []
+                for stream, step, ranks in steps:
+                    where = f"{name} {stream} step {step}"
+                    self.assertEqual(sorted(ranks), [0, 1, 2, 3], where)
+                    count = flags.get((stream, step), 3)
+                    exchanges[name].append(count)
+                    self._check_events(where, ranks, count, hooks, filled)
+            for name in ("all", "seeded_hooks", "seeded_fill"):  # hits and misses
+                self.assertIn(2, exchanges[name], name)
+                self.assertIn(3, exchanges[name], name)
+            base = outputs["off"]
+            for name, other in outputs.items():
+                self.assertEqual(sorted(base.files), sorted(other.files), name)
+                for key in base.files:
+                    np.testing.assert_array_equal(
+                        base[key], other[key], err_msg=f"{name}: {key}"
+                    )
 
 
 class TestIndexSelectSeededWindow(CustomTestCase):
