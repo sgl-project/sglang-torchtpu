@@ -1300,6 +1300,7 @@ def fused_ep_moe_v2(
         mesh_ep_ranks,
         token_layout,
         bool(sharded_plan),
+        preprocess_topology if use_split_sc else None,
         x.dtype,
         w1.dtype,
         w2.dtype,

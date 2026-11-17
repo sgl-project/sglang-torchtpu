@@ -47,6 +47,7 @@ PUSH_OPTIONS = (
     "light_prepush",
     "single_barrier",
     "early_scale_scatter",
+    "fuse_metadata",
 )
 
 __all__ = ["PUSH_OPTIONS", "fused_ep_moe_push"]

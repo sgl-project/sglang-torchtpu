@@ -15,8 +15,9 @@
 # limitations under the License.
 """Routing all-gather and optional row gather using TensorCore remote DMA.
 
-Two cores split the peer set. Rows use padded HBM slabs; all copies complete
-before return. Collective ID 2 is separate from MoE (0) and SparseCore (1)."""
+Each shard loops over its peers and issues remote copies. Rows use padded HBM
+slabs. All copies complete before return. Collective ID 2 is separate from
+MoE (0) and SparseCore (1)."""
 
 import functools
 import threading

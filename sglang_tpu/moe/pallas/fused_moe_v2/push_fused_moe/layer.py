@@ -224,6 +224,7 @@ def fused_ep_moe_push(
     light_prepush=0,
     single_barrier=False,
     early_scale_scatter=0,
+    fuse_metadata=True,
     expert_slot=None,
     expert_load=None,
     shared_expert=None,
@@ -250,11 +251,19 @@ def fused_ep_moe_push(
     - light_prepush (1 or 2): visit light experts first.
     - early_scale_scatter: release scale scatter before the shared expert
       (1), or before both the shared expert and SparseCore pre-push (2).
+    - fuse_metadata allows routing metadata fusion in its measured envelope.
 
     The optional replicated FP8 shared_expert runs while pre-push is in
     flight; its output is returned separately, last. The caller owns the
     static expert layout and load accumulator."""
     del preprocess_topology
+    if early_scale_scatter not in (0, 1, 2):
+        raise ValueError(f"early_scale_scatter is 0, 1 or 2; got {early_scale_scatter}")
+    dispatch_ahead = int(dispatch_ahead)
+    if dispatch_ahead < 1:
+        raise ValueError(f"dispatch_ahead must be >= 1; got {dispatch_ahead}")
+    if shared_limit is not None and shared_expert is None:
+        raise ValueError("shared_limit requires shared_expert")
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
     for name, w in (("w1", w1), ("w2", w2)):
@@ -413,7 +422,7 @@ def fused_ep_moe_push(
     tail_barrier = bool(tail_barrier)
     hbm_staging = bool(hbm_staging)
     # Every window past the last visit position issues the same program.
-    dispatch_ahead = min(int(dispatch_ahead), g_local)
+    dispatch_ahead = min(dispatch_ahead, g_local)
     kfn = build_push_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -749,7 +758,9 @@ def fused_ep_moe_push(
             # The sharded plan's consumer inputs, through the fused routing
             # metadata (routing.prepare_routing) where it admits the shape.
             assert gathered is not None
-            routing_inputs = prepare_routing(me, gathered, tuple(runs), **plan_kw)
+            routing_inputs = prepare_routing(
+                me, gathered, tuple(runs), fuse_metadata=fuse_metadata, **plan_kw
+            )
             slab_row = routing_inputs.slab_row
         else:
             if sharded_plan:
@@ -1046,6 +1057,7 @@ def fused_ep_moe_push(
         int(light_prepush),
         bool(single_barrier),
         int(early_scale_scatter),
+        bool(fuse_metadata),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]

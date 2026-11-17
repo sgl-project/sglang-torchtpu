@@ -14,8 +14,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
     est_time=240,
-    suite="nightly-tpu-4-v7",
-    nightly=True,
+    suite="stage-a-test-tpu-unit",
     chips=4,
     labels=["singlehost", "infra"],
 )

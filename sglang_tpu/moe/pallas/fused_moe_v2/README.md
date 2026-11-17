@@ -71,6 +71,8 @@ Push's fused routing metadata additionally requires
 `(topk, E_physical, EP, tile_m) == (6, 384, 16, 128)` and a measured token
 bucket. Adding replica slots changes `E_physical`, so that metadata fusion
 falls back while static placement and push dispatch remain available.
+Set `push_options={"fuse_metadata": False}` to use native routing tables even
+inside the measured envelope. The default is `True`.
 `preprocess_topology` is opt-in, applies only to all-gather, and describes the
 validated single-host eight-rank topology.
 
@@ -128,9 +130,11 @@ not establish checkpoint loading, model E2E accuracy or multi-host support.
 ## Test cadence
 
 Kernel checks live under `test/registered/tpu/kernels/moe/`; the standalone
-shared-expert check lives under `test/registered/tpu/kernels/gemm/`. These
-checks run in `nightly-tpu-4-v7`, with explicit chip requirements and `infra`
-labels. They use synthetic weights and do not claim model accuracy coverage.
+shared-expert check lives under `test/registered/tpu/kernels/gemm/`. Router,
+routing-table, TP-token and weight-slot checks run in `stage-a-test-tpu-unit`.
+Full MoE and shared-expert numerical checks run in `nightly-tpu-4-v7`.
+Registrations carry explicit chip requirements and `infra` labels.
+The checks use synthetic weights and do not claim model accuracy coverage.
 The push suite keeps one FP8 parity case, the public dispatch entry point,
 and the full-expert V4.1 verify/draft/prefill cases; broader tuning sweeps are
 outside this basic-function suite.

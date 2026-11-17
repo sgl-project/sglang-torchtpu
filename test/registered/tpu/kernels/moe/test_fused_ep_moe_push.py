@@ -19,6 +19,7 @@
 import os
 import shlex
 import sys
+from unittest.mock import patch
 
 if __name__ == "__main__":
     # The DP8 topology-preprocessing path uses remote DMA between SparseCores.
@@ -411,6 +412,7 @@ def test_four_chip_full_experts_and_static_eplb(four_chip_weights, experts, rows
     np.testing.assert_array_equal(np.asarray(load), np.arange(physical_count) + counts)
 
     if rows == 288:
+        from sglang_tpu.moe.pallas.fused_moe_v2 import topology_all_gather
         from sglang_tpu.moe.pallas.fused_moe_v2.preprocessing import (
             topology_for_coordinates,
         )
@@ -419,9 +421,18 @@ def test_four_chip_full_experts_and_static_eplb(four_chip_weights, experts, rows
             tuple((*d.coords, d.core_on_chip) for d in mesh.devices.flat)
         )
         assert topology is not None
-        placed, load = fused_ep_moe_v2(
-            x, *physical, gating, preprocess_topology=topology, **placement, **common
-        )
+        with patch.object(
+            topology_all_gather, "all_gather", wraps=topology_all_gather.all_gather
+        ) as activation_gather:
+            placed, load = fused_ep_moe_v2(
+                x,
+                *physical,
+                gating,
+                preprocess_topology=topology,
+                **placement,
+                **common,
+            )
+            assert activation_gather.call_count > 0
         np.testing.assert_array_equal(np.asarray(placed), plain)
         np.testing.assert_array_equal(
             np.asarray(load), np.arange(physical_count) + counts

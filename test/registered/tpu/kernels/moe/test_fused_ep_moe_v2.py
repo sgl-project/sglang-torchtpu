@@ -408,6 +408,42 @@ def test_small_shape_tracks_a_dense_reference(weight_format):
     )
 
 
+@pytest.mark.parametrize("dispatch", ["all_gather", "push"])
+def test_per_token_score_bias_tracks_dense_reference(dispatch):
+    """Each token selects with its own bias and combines unbiased scores."""
+    mesh = _mesh()
+    tokens, experts, topk = SMALL["tokens"], SMALL["e_total"], SMALL["topk"]
+    weights = _make_weights(
+        mesh, 12, hidden=512, inter=256, e_total=experts, weight_format=WeightFormat.FP8
+    )
+    x, gating = _make_inputs(mesh, 13, tokens=tokens, hidden=512, e_total=experts)
+    rng = np.random.default_rng(14)
+    bias = rng.uniform(-1, 1, (tokens, experts)).astype(np.float32)
+    logits = np.asarray(gating)
+    scores = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    scores /= scores.sum(axis=-1, keepdims=True)
+    ids = np.argsort(-(scores + bias), axis=-1, kind="stable")[:, :topk]
+    broadcast_ids = np.argsort(-(scores + bias[0]), axis=-1, kind="stable")[:, :topk]
+    assert not np.array_equal(ids, broadcast_ids)
+    want = _dense_reference(
+        mesh, x, *weights, gating, topk=topk, hash_ids=jnp.asarray(ids, jnp.int32)
+    )
+    got = fused_ep_moe_v2(
+        x,
+        *weights,
+        gating,
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        sharded_plan=True,
+        score_bias=jax.device_put(bias, NamedSharding(mesh, P(AXIS))),
+        dispatch=dispatch,
+    )
+    assert _relative_l2(got, want) < FP8_RELATIVE_BOUND
+    assert _worst_token_relative_l2(got, want) < FP8_TOKEN_BOUND
+
+
 def _make_hash_ids(mesh, seed, *, tokens, topk, e_total):
     """Per-token expert ids, as DeepSeek-V4's table would hand them over.
 

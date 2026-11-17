@@ -15,17 +15,17 @@
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: tests/kernels/fused_moe/test_fused_ep_moe_v2_tables.py
 # Source: tests/kernels/fused_moe/test_fused_ep_moe_v2_exchange.py
-"""CPU routing-table identities, payload layout and rank-order round trips."""
+"""Routing-table identities, payload round trips and fused metadata parity."""
 
 import sys
+from functools import partial
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
     est_time=60,
-    suite="nightly-tpu-4-v7",
-    nightly=True,
+    suite="stage-a-test-tpu-unit",
     chips=1,
     labels=["singlehost", "infra"],
 )
@@ -544,6 +544,19 @@ def test_push_segments_preserve_row_counts_and_destinations():
             {"dispatch": "push", "push_options": {"sc_pre_push": 1}},
             "unknown push_options",
         ),
+        (
+            {"dispatch": "push", "push_options": {"early_scale_scatter": 3}},
+            "early_scale_scatter is 0, 1 or 2",
+        ),
+        (
+            {"dispatch": "push", "push_options": {"dispatch_ahead": 0}},
+            "dispatch_ahead must be >= 1",
+        ),
+        (
+            {"dispatch": "push", "push_options": {"dispatch_ahead": -1}},
+            "dispatch_ahead must be >= 1",
+        ),
+        ({"dispatch": "push", "shared_limit": 10.0}, "requires shared_expert"),
     ],
 )
 def test_public_dispatch_rejects_invalid_options(options, match):
@@ -610,6 +623,85 @@ def test_push_metadata_admission_checks_geometry_and_target(
         fusion.admit("routing", problem, tokens=tokens, buckets=fusion.ROUTING_TOKENS)
         is expected
     )
+
+
+@pytest.mark.parametrize("interpret", [True, False], ids=["interpret", "tpu"])
+@pytest.mark.parametrize("scenario", ["uniform", "padded", "all_padded"])
+def test_ep16_fused_metadata_matches_native_tables(monkeypatch, interpret, scenario):
+    """Compare all consumer tables at the admitted EP16 geometry on one chip."""
+    if interpret:
+        device = jax.devices("cpu")[0]
+        monkeypatch.setattr(fusion, "get_tpu_generation", lambda: 7)
+    else:
+        devices = jax.devices()
+        if devices[0].platform != "tpu":
+            pytest.skip("requires a v7 TPU for routing metadata lowering")
+        device = devices[0]
+        with jax.default_device(device):
+            if fusion.get_tpu_generation() != 7:
+                pytest.skip("requires a v7 TPU for routing metadata lowering")
+    ep, tokens, experts, topk = 16, 288, 384, 6
+    block = host.routing_block(tokens, topk)
+    kwargs = dict(
+        e_total=experts,
+        ep=ep,
+        t_local=tokens,
+        block=block,
+        tile_m=128,
+        shard_stride=host.ragged_stride_bound(ep * tokens, topk, experts, 128),
+    )
+    rng = np.random.default_rng(42)
+    choices = experts if scenario == "uniform" else 24
+    ids = np.stack(
+        [rng.choice(choices, topk, replace=False) for _ in range(ep * tokens)]
+    )
+    if scenario == "padded":
+        ids[::3] = experts
+        ids[7 * tokens : 8 * tokens] = experts
+    elif scenario == "all_padded":
+        ids[:] = experts
+    counts = np.stack(
+        [
+            np.bincount(rows.ravel(), minlength=experts + 1)[:experts]
+            for rows in ids.reshape(ep, tokens, topk)
+        ]
+    ).astype(np.int32)
+    fused_calls = []
+    fuse = partial(routing.fuse_function, interpret=interpret)
+
+    def record_fusion(fn, args, *, name):
+        fused_calls.append(name)
+        return fuse(fn, args, name=name)
+
+    monkeypatch.setattr(routing, "fuse_function", record_fusion)
+    with jax.default_device(device):
+        blocks = jnp.asarray(ids, jnp.int32).reshape(-1, block)
+        rows_by_dest = jnp.asarray(counts)
+        runs = push_host.run_tables(rows_by_dest)
+        for rank in (0, 7, 15):
+            local = blocks[
+                rank * tokens * topk // block : (rank + 1) * tokens * topk // block
+            ]
+            gathered = host.GatheredPairs(
+                blocks,
+                local,
+                host.pair_block_hist(local, experts),
+                rows_by_dest,
+                ep * tokens,
+                topk,
+            )
+            me = jnp.int32(rank)
+            fused_calls.clear()
+            actual = routing.prepare_routing(me, gathered, runs, **kwargs)
+            assert fused_calls == ["moe_push_routing_position_metadata"]
+            fused_calls.clear()
+            expected = routing.prepare_routing(
+                me, gathered, runs, fuse_metadata=False, **kwargs
+            )
+            assert not fused_calls
+            _assert_arrays_equal(
+                jax.tree.leaves(actual), jax.tree.leaves(expected), shard=rank
+            )
 
 
 if __name__ == "__main__":
