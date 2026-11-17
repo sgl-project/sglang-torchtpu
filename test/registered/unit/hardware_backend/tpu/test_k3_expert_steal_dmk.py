@@ -14,7 +14,9 @@ does.
 The routed outputs must be bit-identical to the steal layout alone (each core
 running its own group's experts) at B8 and B16, on random MXFP4 experts and
 routings that give in both directions, up to the slot cap, with stolen
-experts on every stream path; also with eager DMAs. Perturbed plans (each
+experts on every stream path; also with eager DMAs, and with the plan, the
+initial copies and the schedule started by _ExpertStealStep.begin_scheduled
+(KernelConfig.decode_presorted_routing). Perturbed plans (each
 core plans every other layer from fewer rows, so a receiver expects more or
 fewer or other experts than its sibling sends) must not hang: the receivers
 follow the senders' packets (counted as mismatches), every expert still runs
@@ -36,24 +38,27 @@ import unittest
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=600, suite="base-a-test-cpu")
+register_cpu_ci(est_time=900, suite="base-a-test-cpu")
 
 GROUP_EXPERTS, TOP_K = 112, 16
 K, W, OUT = 512, 256, 128
 LAYERS = 8
 
 
-def _routing(batch, seed):
+def _routing(batch, seed, two_expert_giver=False):
     """Per layer: every row's 16 distinct global experts (top-k order), their
     probabilities and totals, the live rows and the latents. Groups 0 and 1
     (cores 0 and 1) draw from per-layer pools of varied size and skew, the
-    other experts from groups 2-7."""
+    other experts from groups 2-7. ``two_expert_giver`` adds a last layer in
+    which group 0 routes two experts and group 1 none (the case where
+    begin_scheduled cannot start the second expert's copy before the plan)."""
     import numpy as np
 
     rng = np.random.default_rng(seed)
-    winners = np.zeros((LAYERS, batch, TOP_K), np.int32)
-    probabilities = np.zeros((LAYERS, batch, TOP_K), np.float32)
-    live = np.ones((LAYERS, batch), np.int32)
+    layers = LAYERS + two_expert_giver
+    winners = np.zeros((layers, batch, TOP_K), np.int32)
+    probabilities = np.zeros((layers, batch, TOP_K), np.float32)
+    live = np.ones((layers, batch), np.int32)
     # (pool size, most routes a row) for groups 0 and 1, per layer.
     shapes = {
         8: [((9, 4), (2, 1)), ((1, 1), (10, 5)), ((12, 6), (12, 6)), ((14, 3), (3, 3)),
@@ -61,6 +66,8 @@ def _routing(batch, seed):
         16: [((14, 5), (3, 2)), ((2, 1), (16, 6)), ((20, 4), (6, 6)), ((9, 9), (2, 2)),
              ((5, 2), (22, 5)), ((12, 3), (11, 3)), ((24, 6), (1, 1)), ((4, 4), (18, 3))],
     }[batch]
+    if two_expert_giver:
+        shapes = [*shapes, ((2, 2), (0, 0))]
     for layer, pools in enumerate(shapes):
         if batch == 16 and layer % 3 == 1:
             live[layer, 13:] = 0  # null serving slots
@@ -89,7 +96,7 @@ def _routing(batch, seed):
             winners[layer, row] = row_picks[rng.permutation(TOP_K)]
             probabilities[layer, row] = rng.uniform(0.01, 0.2, TOP_K)
     totals = np.where(live > 0, probabilities.sum(2), 1.0).astype(np.float32)
-    latents = rng.standard_normal((LAYERS, batch, K)).astype(np.float32)
+    latents = rng.standard_normal((layers, batch, K)).astype(np.float32)
     return winners, probabilities, totals, live, latents
 
 
@@ -141,7 +148,13 @@ def _child(mode, batch):
 
     slots = es.steal_slots(batch)
     perturbed = mode == "perturbed"
-    winners, probabilities, totals, live, latents = _routing(batch, 7 + batch)
+    # KernelConfig.decode_presorted_routing: begin_scheduled plans in vectors
+    # and starts the initial copies and the schedule from one batch of scalars
+    # (the first pair's gate/up copies first at B8).
+    scheduled = mode.startswith("scheduled")
+    winners, probabilities, totals, live, latents = _routing(
+        batch, 7 + batch, two_expert_giver=scheduled)
+    layers = winners.shape[0]
     rng = np.random.default_rng(11)
 
     def mxfp4(rows, columns):
@@ -192,7 +205,7 @@ def _child(mode, batch):
                     selected_probabilities, ((0, 0), (0, 128 - TOP_K)))
                 counts_vmem[...] = jnp.broadcast_to(counts[:, None], counts_vmem.shape)
 
-            @pl.loop(0, LAYERS)
+            @pl.loop(0, layers)
             def layer_step(layer):
                 layer_winners = winners_ref[layer]
                 layer_probabilities = probabilities_ref[layer]
@@ -224,12 +237,25 @@ def _child(mode, batch):
                             layer_winners, rows_live & ~dropped, group, GROUP_EXPERTS, slots)
                     # The router feeds the planner one selection at a time.
                     planner = step.planner(batch, TOP_K)
-                    for selection in range(TOP_K):
-                        planner.add(selection, layer_winners[:, selection],
-                                    layer_probabilities[:, selection])
-                    selected, selected_probabilities, counts = step.begin(
-                        planner, layer, plan=plan)
                     copy_expert = dmk._steal_copy_expert(moe_weights, GROUP_EXPERTS)
+                    if scheduled:
+                        # The presorted router gives the winners first and the
+                        # probabilities after the copies.
+                        for selection in range(TOP_K):
+                            planner.add(selection, layer_winners[:, selection])
+                        selected, unused_probabilities, counts = step.begin_scheduled(
+                            planner, layer, schedule=schedule, copy_expert=copy_expert,
+                            slot_count=4, gate_up_first_pair=batch == 8)
+                        for selection in range(TOP_K):
+                            planner.add_probabilities(
+                                selection, layer_probabilities[:, selection])
+                        selected_probabilities = planner.probabilities
+                    else:
+                        for selection in range(TOP_K):
+                            planner.add(selection, layer_winners[:, selection],
+                                        layer_probabilities[:, selection])
+                        selected, selected_probabilities, counts = step.begin(
+                            planner, layer, plan=plan)
                 else:
                     nothing = jnp.zeros((1, 128), jnp.int32)
                     selected, selected_probabilities, counts = es.steal_routes(
@@ -237,12 +263,13 @@ def _child(mode, batch):
                         GROUP_EXPERTS, nothing != 0, nothing, 0)
                     copy_expert = moe_weights.make_expert_copies
                 store_routes(selected, selected_probabilities, counts)
-                dmk._start_initial_expert_weight_copies(
-                    selected, counts, copy_expert, slot_count=4,
-                    already_started=jnp.int32(0), group_pending_routes=True,
-                    first_staged_expert=GROUP_EXPERTS if steal else None)
-                dmk._start_expert_schedule(
-                    schedule, selected, counts, GROUP_EXPERTS if steal else None)
+                if not (steal and scheduled):
+                    dmk._start_initial_expert_weight_copies(
+                        selected, counts, copy_expert, slot_count=4,
+                        already_started=jnp.int32(0), group_pending_routes=True,
+                        first_staged_expert=GROUP_EXPERTS if steal else None)
+                    dmk._start_expert_schedule(
+                        schedule, selected, counts, GROUP_EXPERTS if steal else None)
                 if steal:
                     def replace_routes(routes):
                         store_routes(*routes)
@@ -278,9 +305,9 @@ def _child(mode, batch):
         call = pl.pallas_call(
             kernel,
             out_shape=(
-                jax.ShapeDtypeStruct((LAYERS, batch, OUT), jnp.float32),
-                jax.ShapeDtypeStruct((LAYERS, batch, 256), jnp.int32),
-                jax.ShapeDtypeStruct((LAYERS, 8), jnp.int32),
+                jax.ShapeDtypeStruct((layers, batch, OUT), jnp.float32),
+                jax.ShapeDtypeStruct((layers, batch, 256), jnp.int32),
+                jax.ShapeDtypeStruct((layers, 8), jnp.int32),
                 *(jax.ShapeDtypeStruct((slots, *w.shape[2:]), w.dtype) for w in weights),
             ),
             in_specs=[vmem, vmem, vmem, smem, vmem] + [anywhere] * 4,
@@ -306,7 +333,7 @@ def _child(mode, batch):
             compiler_params=pltpu.CompilerParams(collective_id=9),
             interpret=pltpu.InterpretParams(
                 detect_races=True,
-                dma_execution_mode="eager" if mode == "eager" else "on_wait",
+                dma_execution_mode="eager" if mode.endswith("eager") else "on_wait",
             ),
         )
 
@@ -333,7 +360,7 @@ def _child(mode, batch):
     # Without a steal the routes are the router's ownership pass: own group,
     # live rows, selection order.
     for core in (0, 1):
-        for layer in range(LAYERS):
+        for layer in range(layers):
             expect = np.zeros((batch, 128), np.int32)
             counts = np.zeros(batch, np.int32)
             for row in range(batch):
@@ -345,7 +372,7 @@ def _child(mode, batch):
             ok &= np.array_equal(reference_routes[core, layer, :, 128], counts)
     print(f"reference routes match the router's ownership: {ok}", flush=True)
     coverage = set()
-    for layer in range(LAYERS):
+    for layer in range(layers):
         plans = [
             _plan(winners[layer], live[layer], core, slots, dmk.STEAL_TIMING[batch])
             for core in (0, 1)
@@ -445,6 +472,12 @@ class TestK3ExpertStealMegakernel(CustomTestCase):
 
     def test_perturbed_plan_neither_hangs_nor_drops_experts(self):
         self._run("perturbed", 16)
+
+    def test_b8_scheduled_begin(self):
+        self._run("scheduled", 8)
+
+    def test_b16_scheduled_begin_eager_dmas(self):
+        self._run("scheduled_eager", 16)
 
 
 if __name__ == "__main__":
