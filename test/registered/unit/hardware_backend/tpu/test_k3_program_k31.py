@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=2800, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2900, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -5975,6 +5975,168 @@ class TestIndexSelectSeededWindow(CustomTestCase):
             self.assertEqual(sorted(base.files), sorted(seeded.files))
             for name in base.files:
                 np.testing.assert_array_equal(base[name], seeded[name], err_msg=name)
+
+
+class TestCrossedPairGathers(CustomTestCase):
+    """``KernelConfig.crossed_pair_gathers``: the four-owner gathers of the
+    pairs' rows (``_gather_local_pair_rows(cross_cores=True)``) in Pallas
+    interpret mode on 32 host devices (TestAttentionHostBf16's harness, stale
+    NaN bytes in the destinations and the transport wires), at 2, 3 and 4 rows
+    a pair (B8 and B16 copy in place, B12 through flat wires). Each rank's
+    slot of every other pair holds the rows of that pair's rank of the other
+    parity (rank ^ 2k ^ 1) and its own slot its own rows (without the knob:
+    the same parity, rank ^ 2k). With both ranks of each pair holding the
+    same rows (the decoder's rows before attention) the gather equals the
+    same-parity gather bit for bit. Then the decoder's order on rank-row
+    steps: the aux capture's gather of a layer's rows and the next layer's
+    input gather back to back on the same semaphores, each read as it returns,
+    with the core-0 ranks starting late (eager DMAs: each sender's copies land
+    in issue order). Both crossed, each read sees its own round's rows
+    (crossing only one of the two fails here: one round's copy completes the
+    other round's wait)."""
+
+    SCRIPT = TestAttentionHostBf16.PRELUDE + r"""
+rng = np.random.default_rng(2)
+vmem = pltpu.VMEM
+LAG = int(os.environ.get("LAG", "100"))  # core-0 lag: loop trips a pair index
+
+
+def run(kernel, rows_in, outputs, **interpret):
+    rows = rows_in.shape[1]
+
+    def body(x):
+        return pl.pallas_call(
+            kernel,
+            out_shape=[jax.ShapeDtypeStruct((4 * rows, H), jnp.bfloat16)] * outputs,
+            in_specs=[pl.BlockSpec(memory_space=vmem)],
+            out_specs=[pl.BlockSpec(memory_space=vmem)] * outputs,
+            scratch_shapes=[vmem((8, 224, 128), jnp.float32), vmem((8, 128), jnp.float32),
+                            pltpu.SemaphoreType.DMA((16,)), pltpu.SemaphoreType.DMA((16,)),
+                            pltpu.SemaphoreType.REGULAR],
+            compiler_params=pltpu.CompilerParams(has_side_effects=True),
+            interpret=pltpu.InterpretParams(**interpret),
+        )(x[0])
+
+    f = jax.jit(jax.shard_map(lambda x: [y[None] for y in body(x)], mesh=mesh,
+                              in_specs=P("tp"), out_specs=[P("tp")] * outputs,
+                              check_vma=False))
+    return [np.asarray(y) for y in f(rows_in)]
+
+
+def handshake(ready):
+    # Every local rank has filled its buffers before any copy lands (the
+    # decoder's previous all-local round).
+    rank = jax.lax.axis_index("tp")
+    for offset in range(1, 8):
+        pltpu.semaphore_signal(ready, 1, device_id=(rank ^ offset,),
+                               device_id_type=pl.DeviceIdType.MESH)
+    pltpu.semaphore_wait(ready, 7)
+
+
+def gather(rows_in, cross):
+    def kernel(rows_ref, out_ref, wires, spin, sends, recvs, ready):
+        wires[...] = jnp.full(wires.shape, jnp.nan, jnp.float32)
+        out_ref[...] = jnp.full(out_ref.shape, jnp.nan, jnp.bfloat16)
+        handshake(ready)
+        dmk._gather_local_pair_rows(rows_ref, out_ref, sends, recvs, wires, owners=4,
+                                    cross_cores=cross)
+
+    return run(kernel, rows_in, 1)[0]
+
+
+def expected(rows_in, cross):
+    # Rank r's slot of pair p: rank 8 h + 2 p + (r % 2), or its other core.
+    rows = rows_in.shape[1]
+    out = np.empty((32, 4 * rows, H), rows_in.dtype)
+    for r in range(32):
+        for p in range(4):
+            source = 8 * (r // 8) + 2 * p + (r % 2)
+            if cross and p != (r % 8) // 2:
+                source ^= 1
+            out[r, p * rows:(p + 1) * rows] = rows_in[source]
+    return out
+
+
+bits = lambda x: x.view(np.uint16)
+for rows in (2, 3, 4):
+    distinct = rng.standard_normal((32, rows, H)).astype(BF16)
+    assert not np.array_equal(bits(expected(distinct, True)), bits(expected(distinct, False)))
+    for cross in (False, True):
+        got = gather(distinct, cross)
+        assert np.array_equal(bits(got), bits(expected(distinct, cross))), (rows, cross)
+    print(f"{rows} rows a pair: same-parity and crossed sources", flush=True)
+for rows in (2, 4):
+    paired = np.repeat(rng.standard_normal((16, rows, H)).astype(BF16), 2, axis=0)
+    same, crossed = gather(paired, False), gather(paired, True)
+    assert np.array_equal(bits(same), bits(expected(paired, False))), rows
+    assert np.array_equal(bits(crossed), bits(same)), rows
+    print(f"{rows} rows a pair: crossed gather bit-exact", flush=True)
+
+
+def back_to_back(rows_in, aux_cross=True, input_cross=True):
+    # The aux capture's gather of the rows, then the next layer's input gather
+    # of new rows (here negated) on semaphores 0..2, no round between them;
+    # each gather's rows are read as soon as it returns (the capture's copy,
+    # the attention). After the handshake core 0 of pair p starts
+    # (p + 1) * LAG loop trips late.
+    def kernel(rows_ref, aux_out, input_out, wires, spin, sends, recvs, ready):
+        def gathered(aux, inputs):
+            for rows in (aux, inputs):
+                rows[...] = jnp.full(rows.shape, jnp.nan, jnp.bfloat16)
+            wires[...] = jnp.full(wires.shape, jnp.nan, jnp.float32)
+            handshake(ready)
+            rank = jax.lax.axis_index("tp")
+            spin[...] = jnp.zeros(spin.shape, jnp.float32)
+
+            def lag(i, carry):
+                spin[0:1, :] = spin[0:1, :] + 1.0
+                return carry
+
+            trips = jnp.where(rank % 2 == 0, (rank % 8) // 2 + 1, 0) * LAG
+            jax.lax.fori_loop(0, trips, lag, 0)
+            dmk._gather_local_pair_rows(rows_ref, aux, sends, recvs, wires, owners=4,
+                                        cross_cores=aux_cross)
+            aux_out[...] = aux[...]
+            rows_ref[...] = -rows_ref[...]
+            dmk._gather_local_pair_rows(rows_ref, inputs, sends, recvs, wires, owners=4,
+                                        cross_cores=input_cross)
+            input_out[...] = inputs[...]
+
+        pl.run_scoped(gathered, vmem(aux_out.shape, jnp.bfloat16),
+                      vmem(input_out.shape, jnp.bfloat16))
+
+    return run(kernel, rows_in, 2, dma_execution_mode="eager")
+
+
+for rows in (2, 4):
+    paired = np.repeat(rng.standard_normal((16, rows, H)).astype(BF16), 2, axis=0)
+    aux, inputs = back_to_back(paired)
+    assert np.array_equal(bits(aux), bits(expected(paired, False))), rows
+    assert np.array_equal(bits(inputs), bits(expected(-paired, False))), rows
+    print(f"{rows} rows a pair: back-to-back crossed gathers bit-exact", flush=True)
+print("OK")
+"""
+
+    def test_crossed_gathers_match_the_same_parity_gathers(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [sys.executable, "-c", self.SCRIPT],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1500,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
 
 
 if __name__ == "__main__":
