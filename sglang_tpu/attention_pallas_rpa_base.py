@@ -795,15 +795,21 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # Use the backend's cached pool: upstream moved token_to_kv_pool off
         # ForwardBatch onto the attn backend (see self.token_to_kv_pool above).
         self.token_to_kv_pool.tpu_commit_pending_loads()
+        self.forward_metadata = self._build_forward_metadata(forward_batch)
 
+    def _build_forward_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> PallasForwardMetadata:
+        """Metadata of this forward: ring-mode PCP extend, gather-mode PCP
+        extend, or everything else (plain and DCP batches)."""
         cp_layout = get_tpu_cp_layout(forward_batch)
+        if cp_layout is not None and cp_layout.host.ring is not None:
+            return build_pcp_ring_metadata(self, forward_batch, cp_layout.host)
         if cp_layout is not None:
-            self.forward_metadata = self._build_cp_metadata(forward_batch, cp_layout)
-            return
-
+            return self._build_cp_metadata(forward_batch, cp_layout)
         # Build metadata and its cached distribution from the same active width.
         non_empty_bs = self._non_empty_batch_size(forward_batch)
-        self.forward_metadata = self._build_metadata(forward_batch, non_empty_bs)
+        return self._build_metadata(forward_batch, non_empty_bs)
 
     @staticmethod
     def _pre_bucket_padded_batch_size(forward_batch: ForwardBatch) -> int:
@@ -1354,8 +1360,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 "req_to_token (SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1)."
             )
         host = cp_layout.host
-        if host.ring is not None:
-            return build_pcp_ring_metadata(self, forward_batch, host)
         page_size = self.page_size
         pages_per_seq = _get_pages_per_seq(self.max_context_len, page_size)
         num_rows = 2 * host.pad_b
