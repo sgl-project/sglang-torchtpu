@@ -187,6 +187,10 @@ class TpuEnvs:
     # worker): target verify runs on the sharded decode path, and the draft
     # keeps an unsharded KV pool. False refuses the combination at startup.
     SGLANG_TPU_DCP_SPEC_VERIFY = EnvBool(False)
+    # A DFlash draft whose layers all use a sliding window keeps its KV in a
+    # per-request ring instead of one slot per target token (under DCP the
+    # unsharded draft pool otherwise spans dcp_size times the target capacity).
+    SGLANG_TPU_DFLASH_DRAFT_KV_RING = EnvBool(False)
     # Sparse MLA DCP: merge the group's DSA top-k by a score threshold, so only
     # scores cross the group and no rank gathers another rank's indices; the
     # index-gathering merge costs ~1 ms per DSA layer at 64 rows on tpu7x.

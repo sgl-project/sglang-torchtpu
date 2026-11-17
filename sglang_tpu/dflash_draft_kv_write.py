@@ -307,29 +307,33 @@ def _extend_spans(
     # Stay in int32 end to end: the TPU backend fails to lower a dynamic gather
     # over int64, and both slots and token counts fit comfortably.
     loc = cache_loc.to(torch.int32)
-    # Pages handed out back to back are address-adjacent, so a page start ends a
-    # run even where the addresses continue -- otherwise a span could outrun
-    # max_span_len.
-    breaks = (loc[1:] != loc[:-1] + 1) | (loc[1:] % page_size == 0)
-    run_ids = torch.cat(
+    # Page 0 is the pool's dummy page, so slot 0 marks a token not to write:
+    # padding at the tail, or a row the draft KV ring drops, anywhere.
+    valid = loc != 0
+    # A run starts at a written token after a skipped one, after a jump, or at
+    # a page start: pages handed out back to back are address-adjacent, and a
+    # span must not outrun max_span_len.
+    starts = torch.cat(
         [
-            torch.zeros(1, dtype=torch.int32, device=device),
-            torch.cumsum(breaks.to(torch.int32), dim=0, dtype=torch.int32),
+            valid[:1],
+            valid[1:]
+            & (~valid[:-1] | (loc[1:] != loc[:-1] + 1) | (loc[1:] % page_size == 0)),
         ]
     )
+    # Skipped tokens take the id of the run before them, so ids are
+    # non-decreasing over all tokens and counting the tokens below each edge
+    # gives every run's source offset; only written tokens count toward lengths.
+    run_ids = torch.cumsum(starts.to(torch.int32), dim=0, dtype=torch.int32) - 1
     num_spans = num_tokens // page_size + min(max_num_reqs, num_tokens) + 1
-    # Page 0 is the pool's dummy page, so slot 0 only ever marks a token the
-    # caller padded in. Park those past the last span rather than writing them.
-    run_ids = torch.where(loc != 0, run_ids, num_spans)
-    edges = torch.arange(num_spans + 1, device=device, dtype=torch.int32)
-    # run_ids is non-decreasing over the real tokens, so counting the tokens
-    # below each edge gives every run's source offset.
-    bounds = (run_ids[None, :] < edges[:, None]).sum(dim=1, dtype=torch.int32)
-    src_starts = bounds[:-1]
+    edges = torch.arange(num_spans, device=device, dtype=torch.int32)
+    src_starts = (run_ids[None, :] < edges[:, None]).sum(dim=1, dtype=torch.int32)
+    span_lens = ((run_ids[None, :] == edges[:, None]) & valid[None, :]).sum(
+        dim=1, dtype=torch.int32
+    )
     return (
         torch.index_select(loc, 0, src_starts.clamp(max=num_tokens - 1)),
         src_starts,
-        bounds[1:] - src_starts,
+        span_lens,
         page_size,
     )
 
