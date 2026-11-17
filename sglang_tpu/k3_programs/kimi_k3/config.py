@@ -401,6 +401,15 @@ class KernelConfig:
     # prefill keeps its own BF16 input projection (colocated programs no
     # longer share it). Changes numerics: weight quantization.
     kda_fp8_projections: bool = False
+    # Decode MoE router as FP8 e4m3 with one FP32 scale per expert column
+    # (amax / 448), converted from the pre-shard at load (attention DP1):
+    # each router copy moves half the bytes (both halves: 7 MiB of arena
+    # instead of 14) and each product runs on the MXU's FP8 weight path. The
+    # activations stay BF16, the products accumulate in FP32 and the scales
+    # multiply them before the sigmoid. The prefill keeps its own BF16 router
+    # (colocated programs no longer share it). Changes numerics: weight
+    # quantization, so near-tied experts can change places.
+    decode_router_fp8: bool = False
     # Decode weights in shapes XLA passes to the megakernel without a relayout
     # copy (attention DP1), converted at load: the BF16 norm stacks
     # (attn_norm, ffn_norm, m_qnorm, m_knorm [layers, 1, width] and
@@ -459,6 +468,8 @@ class KernelConfig:
             raise ValueError("expert_steal needs attention_dp=1")
         if self.kda_fp8_projections and self.attention_dp != 1:
             raise ValueError("kda_fp8_projections needs attention_dp=1")
+        if self.decode_router_fp8 and self.attention_dp != 1:
+            raise ValueError("decode_router_fp8 needs attention_dp=1")
         if self.decode_copy_free_weights and self.attention_dp != 1:
             raise ValueError("decode_copy_free_weights needs attention_dp=1")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):

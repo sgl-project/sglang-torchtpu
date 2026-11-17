@@ -351,8 +351,10 @@ def iter_decode_rank(
     ``family@index/count``, layer ranges in order -- the caller joins them),
     then every dense family (``k_projection`` split into ``k_gate`` and the
     rest; with ``KernelConfig.kda_fp8_projections`` ``k_projection`` and
-    ``k_o`` in FP8 with their column scales, :func:`kda_fp8_families`), with
-    at most ``KernelConfig.load_inflight_gb`` of host buffers in flight.
+    ``k_o`` in FP8 with their column scales, :func:`kda_fp8_families`; with
+    ``KernelConfig.decode_router_fp8`` ``router`` in FP8 with its expert
+    scales, :func:`router_fp8_families`), with at most
+    ``KernelConfig.load_inflight_gb`` of host buffers in flight.
     With ``attention_dp`` > 1 the head-sharded attention families hold the
     rank's held TP32 shards (see :func:`attention_dp_families`).
     """
@@ -375,6 +377,8 @@ def iter_decode_rank(
                 families.update(decode_indexer_families(families, rank))
             if _config().kda_fp8_projections:
                 families.update(kda_fp8_families(families))
+            if _config().decode_router_fp8:
+                families.update(router_fp8_families(families))
             if _config().decode_copy_free_weights:
                 families.update(copy_free_families(families))
             if attention_dp > 1:
@@ -438,6 +442,21 @@ def kda_fp8_families(families: dict) -> dict:
             values[layer], scales[layer] = quantize_columns_fp8(weight[layer])
         result[name], result[f"{name}_scale"] = values, scales
     return result
+
+
+def router_fp8_families(families: dict) -> dict:
+    """KernelConfig.decode_router_fp8: the decode's FP8 MoE router from the
+    pre-shard's BF16 one (popped from ``families``), a layer at a time:
+    ``router`` ``[layers, hidden, 896]`` FP8 and ``router_scale``
+    ``[layers, 1, 896]`` FP32, one scale per expert (:func:`quantize_columns_fp8`)."""
+    import ml_dtypes
+
+    weight = families.pop("router")
+    values = np.empty(weight.shape, ml_dtypes.float8_e4m3fn)
+    scales = np.empty((weight.shape[0], 1, weight.shape[-1]), np.float32)
+    for layer in range(weight.shape[0]):
+        values[layer], scales[layer] = quantize_columns_fp8(weight[layer])
+    return {"router": values, "router_scale": scales}
 
 
 # KernelConfig.decode_copy_free_weights: the decode families converted at
