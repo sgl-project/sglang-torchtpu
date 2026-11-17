@@ -355,13 +355,6 @@ def ring_block_lens(length: int, cp_size: int, page_size: int) -> list[int]:
 
 
 def _check_ring_shapes(page_size: int, local_rows_padded: int) -> None:
-    if page_size < 16 or page_size % 16:
-        # The kernel hands the cache phase's softmax state to the new-token
-        # phase in 16-row units, so every row must start on one.
-        raise ValueError(
-            f"Ring-mode context parallelism needs a page size that is a multiple "
-            f"of 16, got {page_size}."
-        )
     if local_rows_padded % page_size:
         raise ValueError(
             f"The local token bucket {local_rows_padded} is not a multiple of the "

@@ -623,7 +623,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if self.cp_t_bucketer is None:
             self.cp_t_bucketer = self._build_cp_ring_bucketer()
         if self._cp_strategy is not None:
-            self._cp_strategy.ring_max_local_rows = self.cp_t_bucketer.max_val
+            self._cp_strategy.set_ring_capacity(self.cp_t_bucketer.max_val)
 
     def _build_cp_ring_bucketer(self) -> Bucketer:
         page_size = self.model_runner.page_size
