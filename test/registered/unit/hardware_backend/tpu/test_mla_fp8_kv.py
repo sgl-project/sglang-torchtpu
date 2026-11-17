@@ -362,6 +362,9 @@ class TestSparseIndexerKvLens(CustomTestCase):
         backend._raw_ring_args = functools.partial(
             TpuPallasSparseMlaAttnBackend._raw_ring_args, backend
         )
+        backend._dcp_gathered = functools.partial(
+            TpuPallasSparseMlaAttnBackend._dcp_gathered, backend
+        )
         # No split group here, so the indexer runs unsplit.
         backend._indexer_split_rows = functools.partial(
             TpuPallasSparseMlaAttnBackend._indexer_split_rows, backend
