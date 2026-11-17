@@ -112,12 +112,10 @@ def prepare(model: Path, output: Path):
         enable_dp_lm_head=True,
         grammar_backend="none",
         watchdog_timeout=1800,
-        weight_loader_disable_mmap=True,
+        weight_loader_disable_mmap=False,
         weight_loader_prefetch_checkpoints=False,
         enable_eplb=False,
-        model_loader_extra_config=json.dumps(
-            {"enable_multithread_load": True, "num_threads": 1}
-        ),
+        model_loader_extra_config=json.dumps({"enable_multithread_load": False}),
         enable_metrics=True,
         log_level="info",
         decode_log_interval=1,
