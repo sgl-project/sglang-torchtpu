@@ -21,6 +21,7 @@ import importlib.util
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -134,6 +135,31 @@ class TestTpuOOTPlatformContract(CustomTestCase):
     def test_subclasses_the_in_tree_platform(self):
         """Every factory is inherited, not copied."""
         self.assertTrue(issubclass(self.TpuOOTPlatform, self.TpuSRTPlatform))
+
+    def test_short_conv_factories_resolve_the_backend_and_kernel(self):
+        """The platform gate must resolve importable implementations after moves."""
+        from sglang.srt.layers.attention.linear.short_conv_backend import (
+            ShortConvAttnBackend,
+        )
+        from sglang_tpu.attention_short_conv import TpuShortConvAttnBackend, short_conv
+
+        self.assertIs(
+            self.SRTPlatform().get_short_conv_backend_cls(), ShortConvAttnBackend
+        )
+        self.assertIsNone(self.SRTPlatform().get_short_conv_kernel())
+        for platform in (self.TpuSRTPlatform(), self.platform):
+            with self.subTest(platform=type(platform).__name__):
+                self.assertIs(
+                    platform.get_short_conv_backend_cls(), TpuShortConvAttnBackend
+                )
+                self.assertIs(platform.get_short_conv_kernel(), short_conv)
+
+    def test_lfm2_shortconv_claims_no_buffer_prefix_cache_support(self):
+        """LFM2 prefix reuse uses the shared TPU state-copy path."""
+        from sglang.srt.configs.lfm2 import Lfm2Config
+
+        model_config = SimpleNamespace(hf_config=object.__new__(Lfm2Config))
+        self.assertTrue(self.platform.supports_mamba_prefix_cache(model_config))
 
     # -- the gate contract -------------------------------------------------
 
@@ -740,6 +766,125 @@ class TestTpuPatchInventory(CustomTestCase):
             "Retarget a patch whose core attribute is gone; list one the patch adds "
             "on purpose in ADDED_BY_PATCHES, and drop it once core defines it.",
         )
+
+
+class TestShortConvPlatformKernel(CustomTestCase):
+    def test_lfm2_uses_the_platform_kernel_between_its_gates(self):
+        """In-tree overrides must reach the same sidecar and kernel as OOT ones."""
+        for out_of_tree in (False, True):
+            with self.subTest(out_of_tree=out_of_tree):
+                self._check_lfm2_platform_kernel(out_of_tree)
+
+    def _check_lfm2_platform_kernel(self, out_of_tree):
+        import torch
+
+        from sglang.srt.configs.lfm2 import Lfm2Config
+        from sglang.srt.layers.attention import attention_registry
+        from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models import lfm2
+        from sglang.srt.platforms.interface import SRTPlatform
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(linear_attn_backend="triton")
+        override.install()
+        self.addCleanup(override.restore)
+
+        state = torch.zeros(2, 2, 1, 3)
+        metadata = SimpleNamespace(
+            layer_cache=SimpleNamespace(conv=[state]),
+            cache_indices=torch.tensor([1]),
+        )
+
+        class CpuShortConvBackend(AttentionBackend):
+            def __init__(self, runner):
+                super().__init__()
+
+            def conv_state_metadata(self, layer_id, batch):
+                return metadata
+
+        def cpu_short_conv(x, weight, bias, metadata, forward_mode):
+            assert forward_mode.is_decode()
+            state = metadata.layer_cache.conv[0]
+            slots = metadata.cache_indices
+            history = state.index_select(0, slots).squeeze(2)
+            window = torch.cat((history, x.unsqueeze(1)), dim=1)
+            output = torch.nn.functional.conv1d(
+                window.transpose(1, 2),
+                weight.unsqueeze(1),
+                bias,
+                groups=x.shape[1],
+            ).squeeze(-1)
+            state.index_copy_(0, slots, window[:, 1:].unsqueeze(2))
+            return output
+
+        class Platform(SRTPlatform):
+            def is_out_of_tree(self):
+                return out_of_tree
+
+            def get_short_conv_backend_cls(self):
+                return CpuShortConvBackend
+
+            def get_short_conv_kernel(self):
+                return cpu_short_conv
+
+        class Linear(torch.nn.Linear):
+            # Replace the distributed projection boundary with a real CPU GEMM.
+            def __init__(self, input_size, output_size, **kwargs):
+                if isinstance(output_size, list):
+                    output_size = sum(output_size)
+                super().__init__(input_size, output_size, bias=False)
+
+            def forward(self, x):
+                return super().forward(x), None
+
+        config = Lfm2Config(
+            hidden_size=3,
+            num_hidden_layers=2,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            layer_types=["conv", "full_attention"],
+            conv_L_cache=3,
+            conv_bias=False,
+        )
+        full_backend = AttentionBackend()
+        full_backend.req_to_token_pool = None
+        full_backend.token_to_kv_pool = None
+        runner = SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=config, hf_text_config=config),
+            use_mla_backend=False,
+            is_draft_worker=False,
+        )
+        platform = Platform()
+        with (
+            patch.object(attention_registry, "current_platform", platform),
+            patch.object(lfm2, "current_platform", platform),
+            patch.object(lfm2, "get_parallel", return_value=SimpleNamespace(tp_size=1)),
+            patch.object(lfm2, "MergedColumnParallelLinear", Linear),
+            patch.object(lfm2, "RowParallelLinear", Linear),
+        ):
+            backend = attention_registry.attn_backend_wrapper(runner, full_backend)
+            layer = lfm2.Lfm2ShortConv(config, layer_idx=0)
+
+        with torch.no_grad():
+            identity = torch.eye(3)
+            layer.in_proj.weight.copy_(
+                torch.cat((identity, 2 * identity, 3 * identity))
+            )
+            layer.out_proj.weight.copy_(identity)
+            layer.conv_weight.fill_(1)
+
+        x = torch.tensor([[1.0, 2.0, 3.0]])
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        with (
+            torch.no_grad(),
+            patch.object(lfm2, "get_attn_backend", return_value=backend),
+        ):
+            actual = layer(x, batch)
+
+        # B=x, C=2x, input=3x, so fresh-state convolution gives C*(B*input).
+        torch.testing.assert_close(actual, 6 * x**3)
+        torch.testing.assert_close(state[1, -1, 0], 3 * x[0] ** 2)
 
 
 if __name__ == "__main__":

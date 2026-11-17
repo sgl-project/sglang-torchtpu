@@ -409,29 +409,35 @@ class TpuMambaPool(MambaPool):
         ]
 
     def get_state(self) -> list[torch.Tensor]:
-        """The per-layer conv and recurrent tensors the GDN/KDA kernels mutate."""
-        return self._copy_states()
+        """Return non-empty state tensors used by compilation and copies."""
+        return [state for state in self._copy_states() if state.numel() > 0]
 
     def set_state(self, state: list[torch.Tensor]) -> None:
-        """Install a list laid out like get_state."""
-        num_layers = self.num_mamba_layers
-        num_kinds = len(self.mamba_cache.conv)
-        assert len(state) == (num_kinds + 1) * num_layers, len(state)
+        """Install state tensors while preserving empty buffers."""
+        expected = len(self.get_state())
+        if len(state) != expected:
+            raise ValueError(
+                f"state length changed: expected {expected}, got {len(state)}"
+            )
+
+        replacements = iter(state)
+
+        def replace(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor if tensor.numel() == 0 else next(replacements)
+
         self.mamba_cache = TpuPerLayerState(
             conv=[
-                state[kind * num_layers : (kind + 1) * num_layers]
-                for kind in range(num_kinds)
+                [replace(tensor) for tensor in per_layer]
+                for per_layer in self.mamba_cache.conv
             ],
-            temporal=state[num_kinds * num_layers :],
+            temporal=[replace(tensor) for tensor in self.mamba_cache.temporal],
         )
 
     @torch.no_grad()
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         if src_indices.numel() == 0:
             return
-        # Slot rows only: with extra_buffer radix caching, copies run between
-        # snapshot slots and a request's slot before its extend.
-        states = self._copy_states()
+        states = self.get_state()
         if states[0].device.type == "cpu":
             # CPU reference for layout and allocator tests.
             for state in states:
@@ -468,7 +474,7 @@ class TpuMambaPool(MambaPool):
             copy_bucket_size,
         )
 
-        states = self._copy_states()
+        states = self.get_state()
         # Pool initialization must finish before its buffers are first donated.
         synchronize(states, wait=True)
         size = 8

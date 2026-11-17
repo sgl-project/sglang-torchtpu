@@ -464,14 +464,14 @@ def _gdn_metadata(fill: int) -> GdnTracedMetadata:
     )
 
 
-def _cpu_mamba_pool(num_layers: int) -> TpuMambaPool:
+def _cpu_mamba_pool(num_layers: int, *, conv_only: bool = False) -> TpuMambaPool:
     shape = Mamba2StateShape.create(
         tp_world_size=1,
         intermediate_size=8,
         n_groups=1,
-        num_heads=1,
-        head_dim=8,
-        state_size=8,
+        num_heads=0 if conv_only else 1,
+        head_dim=0 if conv_only else 8,
+        state_size=0 if conv_only else 8,
         conv_kernel=4,
     )
     layers = list(range(num_layers))
@@ -552,40 +552,58 @@ class TestHybridLinearDirectCompile(CustomTestCase):
     def test_kv_pool_swaps_full_kv_then_linear_state(self):
         """get_state and set_state must agree on one layout.
 
-        A split at the wrong index still traces, but hands KV buffers to the GDN
-        layers (or the reverse) and silently corrupts both caches.
+        A split at the wrong index still traces, but hands KV buffers to the linear
+        layers (or the reverse). Conv-only pools must omit empty recurrent buffers.
         """
         num_layers = 2
-        full_kv_pool = _FullKVPool(num_layers)
-        mamba_pool = _cpu_mamba_pool(num_layers)
-        model_runner = _model_runner()
-        model_runner.model.gdn = _linear_attention()
-        model_runner.token_to_kv_pool = _HybridKVPool(full_kv_pool)
-        model_runner.req_to_token_pool = _HybridReqPool(mamba_pool)
-        policy = DecoderTpuCompilePolicy(
-            model_runner=model_runner, owner=model_runner.model
-        )
+        for conv_only in (False, True):
+            with self.subTest(conv_only=conv_only):
+                full_kv_pool = _FullKVPool(num_layers)
+                mamba_pool = _cpu_mamba_pool(num_layers, conv_only=conv_only)
+                original_cache = mamba_pool.mamba_cache
+                model_runner = _model_runner()
+                model_runner.model.linear = _linear_attention()
+                model_runner.token_to_kv_pool = _HybridKVPool(full_kv_pool)
+                model_runner.req_to_token_pool = _HybridReqPool(mamba_pool)
+                policy = DecoderTpuCompilePolicy(
+                    model_runner=model_runner, owner=model_runner.model
+                )
 
-        kv_pool = policy.get_direct_compile_kv_pool()
-        expected = [
-            *full_kv_pool.k_buffer,
-            *full_kv_pool.v_buffer,
-            *mamba_pool.get_state(),
-        ]
-        self.assertEqual(
-            [id(t) for t in kv_pool.get_state()], [id(t) for t in expected]
-        )
-        replacement = [torch.empty_like(t) for t in expected]
-        kv_pool.set_state(replacement)
-        num_full = 2 * num_layers
-        self.assertEqual(
-            [id(t) for t in [*full_kv_pool.k_buffer, *full_kv_pool.v_buffer]],
-            [id(t) for t in replacement[:num_full]],
-        )
-        self.assertEqual(
-            [id(t) for t in mamba_pool.get_state()],
-            [id(t) for t in replacement[num_full:]],
-        )
+                kv_pool = policy.get_direct_compile_kv_pool()
+                expected = [
+                    *full_kv_pool.k_buffer,
+                    *full_kv_pool.v_buffer,
+                    *original_cache.conv[0],
+                    *([] if conv_only else original_cache.temporal),
+                ]
+                self.assertEqual(
+                    [id(t) for t in kv_pool.get_state()], [id(t) for t in expected]
+                )
+                replacement = [torch.empty_like(t) for t in expected]
+                kv_pool.set_state(replacement)
+                num_full = 2 * num_layers
+                self.assertEqual(
+                    [id(t) for t in [*full_kv_pool.k_buffer, *full_kv_pool.v_buffer]],
+                    [id(t) for t in replacement[:num_full]],
+                )
+                self.assertEqual(
+                    [id(t) for t in mamba_pool.get_state()],
+                    [id(t) for t in replacement[num_full:]],
+                )
+                for layer in range(num_layers):
+                    per = mamba_pool.mamba2_layer_cache(layer)
+                    self.assertIs(per.conv[0], replacement[num_full + layer])
+                    temporal = (
+                        original_cache.temporal[layer]
+                        if conv_only
+                        else replacement[num_full + num_layers + layer]
+                    )
+                    self.assertIs(per.temporal, temporal)
+
+                kv_pool.set_state(expected)
+                self.assertEqual(
+                    [id(t) for t in kv_pool.get_state()], [id(t) for t in expected]
+                )
 
     def test_kv_pool_without_linear_layers_leaves_linear_state_out(self):
         """An MTP draft shares the target's hybrid pools but runs no GDN layer.

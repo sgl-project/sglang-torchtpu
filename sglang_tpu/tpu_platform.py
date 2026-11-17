@@ -1335,10 +1335,16 @@ class TpuSRTPlatform(SRTPlatform):
 
     def supports_mamba_prefix_cache(self, model_config) -> bool:
         from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, hybrid_kda_config
+        from sglang.srt.configs.lfm2 import Lfm2Config
 
         # GDN and KDA run the same kernel and pass it the same snapshot plan.
+        # LFM2 uses the simpler no_buffer strategy: the shared radix-cache COW
+        # path copies the TPU-resident ShortConv state through TpuMambaPool.
+        # Its extra_buffer tracking path remains rejected by the ShortConv
+        # backend, so this capability is intentionally limited to no_buffer.
         return (
-            hybrid_gdn_config(model_config) is not None
+            isinstance(model_config.hf_config, Lfm2Config)
+            or hybrid_gdn_config(model_config) is not None
             or hybrid_kda_config(model_config) is not None
         )
 
@@ -1347,13 +1353,15 @@ class TpuSRTPlatform(SRTPlatform):
         # checkpoint depths, so the radix tree could cache unwritten states.
         if view.enable_mixed_chunk and not view.disable_radix_cache:
             raise ValueError(
-                "TPU GDN/KDA prefix caching does not support --enable-mixed-chunk. "
+                "TPU recurrent/ShortConv prefix caching does not support "
+                "--enable-mixed-chunk. "
                 "Remove --enable-mixed-chunk or use --disable-radix-cache."
             )
         # Lazy slot allocation/release has not been validated with TPU snapshots.
         if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
             raise ValueError(
-                "extra_buffer_lazy is not supported for TPU GDN/KDA prefix caching. "
+                "extra_buffer_lazy is not supported for TPU recurrent/ShortConv "
+                "prefix caching. "
                 "Use --mamba-radix-cache-strategy extra_buffer."
             )
         # The torch-copy host and int8 stores expect stacked GPU-layout states;
@@ -1362,12 +1370,14 @@ class TpuSRTPlatform(SRTPlatform):
             view.hicache_io_backend
         ):
             raise ValueError(
-                "TPU GDN/KDA prefix caching offloads states to host only with a "
+                "TPU recurrent/ShortConv prefix caching offloads states to host "
+                "only with a "
                 f"DMA --hicache-io-backend ({', '.join(tpu_dma_hicache_backends())})."
             )
         if view.enable_int8_mamba_checkpoint:
             raise ValueError(
-                "--enable-int8-mamba-checkpoint is not supported for TPU GDN/KDA prefix caching. "
+                "--enable-int8-mamba-checkpoint is not supported for TPU "
+                "recurrent/ShortConv prefix caching. "
                 "Use device-resident, uncompressed Mamba states."
             )
         if hf_config is not None:
@@ -1389,6 +1399,16 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang_tpu.mamba_pool import TpuMambaPool
 
         return TpuMambaPool
+
+    def get_short_conv_backend_cls(self) -> type:
+        from sglang_tpu.attention_short_conv import TpuShortConvAttnBackend
+
+        return TpuShortConvAttnBackend
+
+    def get_short_conv_kernel(self):
+        from sglang_tpu.attention_short_conv import short_conv
+
+        return short_conv
 
     def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
         from sglang.srt.mem_cache.pool_host.base import (

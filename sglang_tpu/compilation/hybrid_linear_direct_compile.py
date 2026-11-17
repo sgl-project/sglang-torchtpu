@@ -1,9 +1,4 @@
-"""direct_compile inputs for hybrid full + linear attention (GDN/KDA) models.
-
-HybridLinearAttnBackend has no forward_metadata of its own and the linear state
-lives outside the KV pool, so both children's metadata and the TpuMambaPool
-tensors are lifted here as graph inputs.
-"""
+"""Metadata and cache state passed to direct_compile for hybrid models."""
 
 from __future__ import annotations
 
@@ -23,10 +18,8 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
-    ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang_tpu.attention_gdn_pallas import GdnTracedMetadata, TpuGDNAttnBackend
 from sglang_tpu.mamba_pool import TpuMambaPool
 
 
@@ -49,19 +42,20 @@ class HybridLinearKVPoolState:
 
 
 def hybrid_linear_kv_pool_state(
-    *, kv_pool: HybridLinearKVPool, req_to_token_pool: ReqToTokenPool
+    *, kv_pool: HybridLinearKVPool, req_to_token_pool: HybridReqToTokenPool
 ) -> HybridLinearKVPoolState:
-    # The GDN layers read state through the request pool, so lift that one.
-    assert isinstance(req_to_token_pool, HybridReqToTokenPool)
-    mamba_pool = req_to_token_pool.mamba_pool
-    assert isinstance(mamba_pool, TpuMambaPool), type(mamba_pool)
-    full_kv_pool = kv_pool.full_kv_pool
-    assert isinstance(full_kv_pool, MHATokenToKVPool), type(full_kv_pool)
-    return HybridLinearKVPoolState(full_kv_pool=full_kv_pool, mamba_pool=mamba_pool)
+    return HybridLinearKVPoolState(
+        full_kv_pool=kv_pool.full_kv_pool, mamba_pool=req_to_token_pool.mamba_pool
+    )
 
 
 def has_linear_attention(model: nn.Module) -> bool:
-    return any(isinstance(module, RadixLinearAttention) for module in model.modules())
+    from sglang.srt.models.lfm2 import Lfm2ShortConv
+
+    return any(
+        isinstance(module, (RadixLinearAttention, Lfm2ShortConv))
+        for module in model.modules()
+    )
 
 
 def _conv_weight_owners(
@@ -101,18 +95,12 @@ def bind_traced_conv_weights(model: nn.Module) -> Iterator[None]:
             attn.conv_weights = view
 
 
-def _linear_backend(backend: HybridLinearAttnBackend) -> TpuGDNAttnBackend:
-    linear = backend.linear_attn_backend
-    assert isinstance(linear, TpuGDNAttnBackend), type(linear)
-    return linear
-
-
 def traced_attention_metadata(backend: AttentionBackend) -> Any:
     """The attention metadata direct_compile passes as graph inputs."""
     if isinstance(backend, HybridLinearAttnBackend):
         return (
             backend.full_attn_backend.forward_metadata,
-            _linear_backend(backend).traced_metadata(),
+            backend.linear_attn_backend.traced_metadata(),
         )
     return backend.forward_metadata
 
@@ -127,9 +115,8 @@ def bind_traced_attention_metadata(
             yield
         return
     full_metadata, linear_metadata = metadata
-    assert isinstance(linear_metadata, GdnTracedMetadata)
     with (
         backend.full_attn_backend.bind_forward_metadata(full_metadata, forward_mode),
-        _linear_backend(backend).bind_traced_metadata(linear_metadata),
+        backend.linear_attn_backend.bind_traced_metadata(linear_metadata),
     ):
         yield

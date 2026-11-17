@@ -18,6 +18,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -239,7 +240,6 @@ def create_flashmla_backend(runner):
 
 @register_attention_backend("fa3")
 def create_flashattention_v3_backend(runner):
-
     major, minor = get_device_capability()
     if not _is_musa:
         assert (major == 8 and not runner.use_mla_backend) or major == 9, (
@@ -522,11 +522,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
                     ShortConvHybridAttnBackend,
                 )
-                from sglang.srt.layers.attention.linear.short_conv_backend import (
-                    ShortConvAttnBackend,
-                )
 
-                linear_attn_backend = ShortConvAttnBackend(runner)
+                linear_attn_backend = current_platform.get_short_conv_backend_cls()(
+                    runner
+                )
                 hybrid_backend_cls = ShortConvHybridAttnBackend
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)

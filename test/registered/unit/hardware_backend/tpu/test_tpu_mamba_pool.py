@@ -283,6 +283,55 @@ class TestTpuMambaPool(CustomTestCase):
             [id(t) for t in pool.get_state()], [id(t) for t in replacement]
         )
 
+    def test_state_swap_omits_empty_temporal_buffers(self):
+        """ShortConv's empty recurrent buffers must not become XLA inputs."""
+        shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=8,
+            n_groups=1,
+            num_heads=0,
+            head_dim=0,
+            state_size=0,
+            conv_kernel=4,
+        )
+        layers = [0, 1]
+        pool = TpuMambaPool(
+            size=2,
+            spec_state_size=0,
+            cache_params=Mamba2CacheParams(
+                dtype=Mamba2StateDType(conv=torch.float32, temporal=torch.float32),
+                layers=layers,
+                shape=shape,
+            ),
+            mamba_layer_ids=layers,
+            device="cpu",
+        )
+
+        original_cache = pool.mamba_cache
+        state = pool.get_state()
+        self.assertEqual(len(state), 2)
+        self.assertTrue(all(t.numel() > 0 for t in state))
+        for invalid in (state[:-1], [*state, state[0]]):
+            with self.subTest(state_length=len(invalid)):
+                with self.assertRaisesRegex(ValueError, "state length changed"):
+                    pool.set_state(invalid)
+                self.assertIs(pool.mamba_cache, original_cache)
+
+        replacement = [torch.full_like(t, 3) for t in state]
+        pool.set_state(replacement)
+        self.assertEqual(
+            [id(t) for t in pool.get_state()],
+            [id(t) for t in replacement],
+        )
+        for layer in range(len(layers)):
+            per = pool.mamba2_layer_cache(layer)
+            self.assertIs(per.conv[0], replacement[layer])
+            self.assertIs(per.temporal, original_cache.temporal[layer])
+            self.assertEqual(per.temporal.numel(), 0)
+
+        pool.set_state(state)
+        self.assertEqual([id(t) for t in pool.get_state()], [id(t) for t in state])
+
     def test_total_bytes_match_stacked_layout(self):
         """Per-layer allocation must not change the memory footprint."""
         pool = self._pool()
