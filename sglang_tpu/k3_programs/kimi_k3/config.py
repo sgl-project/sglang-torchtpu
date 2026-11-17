@@ -81,6 +81,13 @@ class KernelConfig:
     # too and adds the four hosts in the same order, so the host copies of a
     # row stay bitwise equal. Changes numerics: one more BF16 rounding.
     attention_host_bf16: bool = False
+    # Steps with attention_rank_rows (below): the output projection starts its
+    # cross-host round in the layer's KDA or MLA branch, and the decoder waits
+    # for it, adds the four hosts' sums and stores the rank's rows after the
+    # branches join. The instruction overlay of the post-join code (loaded on
+    # demand in the first KDA layer after each MLA layer) then loads while the
+    # round is in flight. The same sums in the same order (bit-identical).
+    attention_host_round_after_join: bool = False
     # Token-scattered decode attention at 8 and 16 rows (attention DP1, four
     # row owners): each rank of a pair reduces its own half of the pair's rows
     # at full width (the local round gives each rank both column halves' pair

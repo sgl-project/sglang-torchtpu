@@ -4379,6 +4379,156 @@ print("OK")
         )
 
 
+class TestAttentionHostRoundAfterJoin(CustomTestCase):
+    """``KernelConfig.attention_host_round_after_join``: rank-row output
+    projections (B8 and B16, FP32 and BF16 host sums) that return with their
+    cross-host round in flight inside one branch of a two-branch ``cond``
+    (each branch its own inputs, as the decoder's KDA and MLA branches), then,
+    after the join and NaN written over the projection's other storage (the
+    reduction buffer, the local-round and feature buffers, the output rows),
+    ``finish_rank_rows_host_round``. Pallas interpret mode on 32 host devices
+    (TestAttentionHostBf16's harness), with DMAs executed on wait and eagerly;
+    barriers follow the NaN fill and each projection, standing in for the
+    decoder's start and its cross-host rounds between two layers'
+    projections (no rank starts its next host round before its host peers
+    have read this one). Each deferred projection's rows equal, bit for bit,
+    the same branch's projection finished in line and the reduction's
+    rounding points (in one branch two hosts' sums cancel, so the rows
+    show the hosts' order); the phase advances once a projection and no DMA
+    semaphore is left nonzero."""
+
+    SCRIPT = TestAttentionHostBf16.PRELUDE + r"""
+import sys
+
+from sglang_tpu.k3_programs.common import collectives32
+
+DMA_MODE = sys.argv[1]
+
+
+def project_after_join(attended, weight, host_bf16):
+    # attended [32, 2, B, W] and weight [32, 2, 768, HALF]: two branches'
+    # inputs. One kernel runs each branch's projection in line, then each
+    # branch through the cond with the host round deferred (select [0, 1]).
+    B = attended.shape[2]
+    dmk.ATTENTION_HOST_BF16 = host_bf16  # read when the kernel is traced
+    scratch = dmk.communication_scratch(B)
+    nan = lambda ref: jnp.full(ref.shape, jnp.nan, ref.dtype)
+
+    def kernel(select_ref, attended_ref, weight_ref, rows_out, partial_out, phase_out,
+               out, comm, local, host, features, outputs, sends, recvs, phase):
+        phase[0] = 0
+        for ref in (local, host, features, outputs):
+            ref[...] = nan(ref)
+        collectives32.barrier()  # eager DMAs: no peer writes before these stores
+
+        def projection(index, defer):
+            dmk._project_attention_2d(
+                attended_ref[index], weight_ref.at[index], out, comm, local, host,
+                features, outputs, sends, recvs, phase, dmk._dot,
+                token_scatter_output=True, rank_rows=True, defer_host_round=defer)
+
+        for index in range(2):
+            projection(index, False)
+            rows_out[index] = outputs[...]
+            partial_out[index] = comm[...]
+            collectives32.barrier()
+        for slot in range(2):
+            jax.lax.cond(select_ref[slot] == 0,
+                         lambda: projection(0, True), lambda: projection(1, True))
+            for ref in (comm, local, features, outputs):
+                ref[...] = nan(ref)
+            dmk.finish_rank_rows_host_round(host, outputs, sends, recvs, phase,
+                                            batch_size=B)
+            rows_out[2 + slot] = outputs[...]
+            collectives32.barrier()
+        phase_out[0] = phase[0]
+
+    vmem, smem = pltpu.VMEM, pltpu.SMEM
+
+    def body(select, attended, weight):
+        rows, partial, phase = pl.pallas_call(
+            kernel,
+            out_shape=(jax.ShapeDtypeStruct((4, 16, H), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((2, B, 8192), jnp.float32),
+                       jax.ShapeDtypeStruct((1,), jnp.int32)),
+            in_specs=[pl.BlockSpec(memory_space=smem)] + [pl.BlockSpec(memory_space=vmem)] * 2,
+            out_specs=[pl.BlockSpec(memory_space=vmem)] * 2 + [pl.BlockSpec(memory_space=smem)],
+            scratch_shapes=[vmem((B, H), jnp.bfloat16), vmem((B, 8192), jnp.float32),
+                            scratch[0], scratch[2], vmem((16, 1024), jnp.bfloat16),
+                            vmem((16, H), jnp.bfloat16), pltpu.SemaphoreType.DMA((16,)),
+                            pltpu.SemaphoreType.DMA((16,)), pltpu.SMEM((1,), jnp.int32)],
+            compiler_params=pltpu.CompilerParams(has_side_effects=True, collective_id=0),
+            interpret=pltpu.InterpretParams(dma_execution_mode=DMA_MODE),
+        )(select[0], attended[0], weight[0])
+        return rows[None], partial[None], phase[None]
+
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("tp"), P("tp"), P("tp")),
+                              out_specs=(P("tp"), P("tp"), P("tp")), check_vma=False))
+    select = np.tile(np.arange(2, dtype=np.int32), (32, 1))
+    return [np.asarray(x) for x in f(select, attended, weight)]
+
+
+rng = np.random.default_rng(2)
+for B in (8, 16):
+    rows = B // 8
+    attended = (rng.standard_normal((32, 2, B, W)) * rng.uniform(0.2, 2.0, (32, 2, 1, W))
+                / (1 + np.exp(-rng.standard_normal((32, 2, B, W))))).astype(BF16)
+    fulls = [(rng.standard_normal((32 * W, H)) * 0.01).astype(BF16) for _ in range(2)]
+    # Branch 1: host 1's ranks repeat host 0's features (2^18 times hosts 2
+    # and 3's) on negated weights, so host 1's sums negate host 0's and the
+    # rows are hosts 2 and 3's sum only when the hosts add in order.
+    attended[:8, 1] *= 2.0 ** 18
+    attended[8:16, 1] = attended[:8, 1]
+    fulls[1][4 * 768:8 * 768] = -fulls[1][:4 * 768]
+    weight = np.stack([
+        np.stack([full[768 * (r // 2):768 * (r // 2 + 1), (r % 2) * HALF:(r % 2 + 1) * HALF]
+                  for r in range(32)])
+        for full in fulls
+    ], axis=1)
+    for host_bf16 in (False, True):
+        got, partial, phase = project_after_join(attended, weight, host_bf16)
+        assert (phase == 4).all(), phase
+        for branch in range(2):
+            want = reference(partial[:, branch], B, host_bf16)
+            inline = got[:, branch, :rows].view(np.uint16)
+            deferred = got[:, 2 + branch, :rows].view(np.uint16)
+            for r in range(32):
+                mine = slice((r % 2) * rows, (r % 2 + 1) * rows)
+                assert np.array_equal(inline[r], want[r, mine].view(np.uint16)), (B, branch, r)
+            assert np.array_equal(deferred, inline), (B, host_bf16, branch)
+        assert not np.array_equal(got[:, 0, :rows], got[:, 1, :rows])
+        print(f"B{B} host_bf16={host_bf16} dma={DMA_MODE}: deferred rows bit-exact")
+print("OK")
+"""
+
+    def _run(self, dma_mode):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [sys.executable, "-c", self.SCRIPT, dma_mode],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1500,
+        )
+        output = result.stdout[-2000:] + result.stderr[-3000:]
+        self.assertIn("OK", result.stdout, output)
+        self.assertNotIn("non-zero count", result.stdout, output)
+
+    def test_deferred_rows_match_the_inline_rows(self):
+        self._run("on_wait")
+
+    def test_deferred_rows_with_eager_dmas(self):
+        self._run("eager")
+
+
 class TestAttentionRankRows(CustomTestCase):
     """``KernelConfig.attention_rank_rows`` in the token-scattered attention
     output projection (``_project_attention_2d(rank_rows=True)``) at B8 and
