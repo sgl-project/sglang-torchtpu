@@ -26,6 +26,7 @@ from sglang.srt.layers.quantization.base_config import LinearMethodBase
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
+from sglang_tpu.glm.quantization import _remap_glm_nextn_ignored_layers
 
 
 class TpuFp8Config(Fp8Config):
@@ -43,27 +44,6 @@ class TpuFp8Config(Fp8Config):
         if config.get("is_checkpoint_fp8_serialized") is False:
             raise ValueError("Channelwise weight scales require serialized FP8 weights")
         return TpuChannelwiseFp8Config.from_fp8_config(config)
-
-
-def _remap_glm_nextn_ignored_layers(config: Fp8Config, hf_config) -> None:
-    """Use the model's mapping for checkpoint-named GLM NextN exclusions."""
-    if "GlmMoeDsaForCausalLMNextN" not in (
-        getattr(hf_config, "architectures", None) or []
-    ):
-        return
-    from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
-
-    num_layers = hf_config.num_hidden_layers
-    layer_id = 0 if num_layers == 1 else num_layers
-    prefix = f"model.layers.{layer_id}"
-    mapped = []
-    for name in config.ignored_layers:
-        normalized = name if name.startswith("model.") else f"model.{name}"
-        if normalized == prefix or normalized.startswith(prefix + "."):
-            mapped.append(
-                GlmMoeDsaForCausalLMNextN._map_mtp_ckpt_name(normalized, prefix)
-            )
-    config.ignored_layers = list(dict.fromkeys([*config.ignored_layers, *mapped]))
 
 
 class TpuChannelwiseFp8Config(Fp8Config):

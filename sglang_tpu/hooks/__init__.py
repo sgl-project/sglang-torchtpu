@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.glm.hooks import _select_glm_nextn_loader
 from sglang_tpu.hooks.all_gather_via_all_reduce import (
     gather_and_crop_vocab,
     gather_attn_tp_logits,
@@ -104,17 +105,6 @@ def _select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
     from sglang_tpu.ep_weight_shard import select_tpu_ep_local_runai_loader
 
     return select_tpu_ep_local_runai_loader(result, load_config, model_config)
-
-
-def _select_glm_nextn_loader(result, load_config, model_config=None):
-    # Keep loader/model imports out of plugin startup and the default-off path.
-    from sglang_tpu.envs import envs
-
-    if not envs.SGLANG_ENABLE_MTP_SHARD_FILTER.get():
-        return result
-    from sglang_tpu.mtp_shard_filter import select_glm_nextn_loader
-
-    return select_glm_nextn_loader(result, load_config, model_config)
 
 
 # (target, hook, hook_type) triples.
