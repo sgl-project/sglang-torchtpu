@@ -64,7 +64,7 @@ def refresh_qt(
     @pl.when(changed)
     def _():
         q = load_q()
-        scale = cfgs.model.sm_scale * LOG2E
+        scale = cfgs.model.sm_scale * LOG2E * (cfgs.serve.scale_k or 1.0)
         hd = cfgs.aligned_kv_head_dim
         for kv_head in range(cfgs.model.num_kv_heads):
             qh = q[0, kv_head].astype(jnp.float32) * scale  # [rows, aligned_q_head_dim]
@@ -100,6 +100,8 @@ def tile(
     bkv = cfgs.bkv_sz
     lanes = cfgs.bq_c_sz * heads
     offset = processed_kv_len - processed_q_len  # kv index of the first query
+    # The scores are bf16: an f32 minimum would round to -inf (exp2 of -inf - -inf).
+    mask_value = max(cfgs.model.mask_value, float(jnp.finfo(jnp.bfloat16).min))
 
     if apply_mask:
         kv_iota = lax.broadcasted_iota(jnp.int32, (bkv, lanes), 0)
@@ -119,7 +121,7 @@ def tile(
             mask = q_kv_diff >= offset - bq_start
             if (window := cfgs.model.sliding_window) is not None:
                 mask = jnp.logical_and(mask, q_kv_diff < window + offset - bq_start)
-            s = jnp.where(mask, s, cfgs.model.mask_value)
+            s = jnp.where(mask, s, mask_value)
         m_prev = m_ref[kv_head, :, cs]  # [1, lanes]
         m_cur = jnp.max(s, axis=0, keepdims=True).astype(jnp.float32)
         m_new = jnp.maximum(m_prev, m_cur)
@@ -175,6 +177,8 @@ def store_tile(
             acc = acc_ref[kv_head]  # [acc rows, rows]
             l = acc[hd : hd + 1]
             o_t = acc[:hd] * pltpu.reciprocal(l, approx=True)
+            if cfgs.serve.scale_v is not None:
+                o_t = o_t * cfgs.serve.scale_v
             pad = cfgs.aligned_q_head_dim - hd
             if pad:
                 o_t = jnp.concatenate([o_t, jnp.zeros((pad, rows), o_t.dtype)], axis=0)
