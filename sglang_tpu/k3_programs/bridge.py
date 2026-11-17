@@ -318,14 +318,19 @@ def register_global_op(
     )
 
 
-def upload(value: np.ndarray) -> torch.Tensor:
-    """Host array -> ``[1, ...]`` device tensor (bf16 via its uint16 view)."""
+def host_tensor(value: np.ndarray) -> torch.Tensor:
+    """Host array -> host tensor (bf16 / FP8 e4m3 via their unsigned views)."""
     value = np.ascontiguousarray(value)
     if value.dtype.name == "bfloat16":
-        tensor = torch.from_numpy(value.view(np.uint16)).view(torch.bfloat16)
-    else:
-        tensor = torch.from_numpy(value)
-    return tensor.unsqueeze(0).to("tpu")
+        return torch.from_numpy(value.view(np.uint16)).view(torch.bfloat16)
+    if value.dtype.name == "float8_e4m3fn":
+        return torch.from_numpy(value.view(np.uint8)).view(torch.float8_e4m3fn)
+    return torch.from_numpy(value)
+
+
+def upload(value: np.ndarray) -> torch.Tensor:
+    """Host array -> ``[1, ...]`` device tensor (see :func:`host_tensor`)."""
+    return host_tensor(value).unsqueeze(0).to("tpu")
 
 
 UPLOAD_THREADS = 4

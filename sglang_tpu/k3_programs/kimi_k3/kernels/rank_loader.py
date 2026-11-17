@@ -350,7 +350,9 @@ def iter_decode_rank(
     (largest first; with ``split_experts`` one array per file, named
     ``family@index/count``, layer ranges in order -- the caller joins them),
     then every dense family (``k_projection`` split into ``k_gate`` and the
-    rest), with at most ``KernelConfig.load_inflight_gb`` of host buffers in flight.
+    rest; with ``KernelConfig.kda_fp8_projections`` ``k_projection`` and
+    ``k_o`` in FP8 with their column scales, :func:`kda_fp8_families`), with
+    at most ``KernelConfig.load_inflight_gb`` of host buffers in flight.
     With ``attention_dp`` > 1 the head-sharded attention families hold the
     rank's held TP32 shards (see :func:`attention_dp_families`).
     """
@@ -371,6 +373,8 @@ def iter_decode_rank(
             families = split_kda_projection(value)
             if "d_wk" in families:
                 families.update(decode_indexer_families(families, rank))
+            if _config().kda_fp8_projections:
+                families.update(kda_fp8_families(families))
             if attention_dp > 1:
                 families.update(
                     attention_dp_families(
@@ -381,6 +385,42 @@ def iter_decode_rank(
                 yield "decode", name, family
         else:
             yield "decode", key, value
+
+
+FP8_E4M3_MAX = 448.0
+# KernelConfig.kda_fp8_projections: the decode's FP8 KDA projections (each
+# with a ``<name>_scale`` family; decode_megakernel.KDA_FP8_SCALES).
+KDA_FP8_FAMILIES = ("k_projection", "k_o")
+
+
+def quantize_columns_fp8(weight: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``[K, N]`` -> FP8 e4m3 ``[K, N]`` and FP32 column scales ``[1, N]``:
+    each column divided by its absolute maximum / 448 and rounded to nearest
+    (an all-zero column keeps scale 1)."""
+    import ml_dtypes
+
+    values = weight.astype(np.float32)
+    peak = np.abs(values).max(axis=0, keepdims=True)
+    scale = np.where(peak > 0, peak / np.float32(FP8_E4M3_MAX), 1).astype(np.float32)
+    return (values / scale).astype(ml_dtypes.float8_e4m3fn), scale
+
+
+def kda_fp8_families(families: dict) -> dict:
+    """The decode's FP8 KDA input and output projections from the pre-shard's
+    BF16 ones (popped from ``families``), a layer at a time: ``k_projection``
+    / ``k_o`` ``[layers, K, N]`` FP8 and ``k_projection_scale`` /
+    ``k_o_scale`` ``[layers, 1, N]`` FP32 (:func:`quantize_columns_fp8`)."""
+    import ml_dtypes
+
+    result = {}
+    for name in KDA_FP8_FAMILIES:
+        weight = families.pop(name)
+        values = np.empty(weight.shape, ml_dtypes.float8_e4m3fn)
+        scales = np.empty((weight.shape[0], 1, weight.shape[-1]), np.float32)
+        for layer in range(weight.shape[0]):
+            values[layer], scales[layer] = quantize_columns_fp8(weight[layer])
+        result[name], result[f"{name}_scale"] = values, scales
+    return result
 
 
 def decode_indexer_families(families: dict, rank: int) -> dict:

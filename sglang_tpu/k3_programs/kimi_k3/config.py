@@ -208,6 +208,13 @@ class KernelConfig:
     # projects both router halves, its own and its pair peer's (14 MiB of
     # arena instead of 7), instead of exchanging score halves with the peer.
     decode_router_both_halves: bool = False
+    # Decode KDA input (q|k|v|g|b) and output projections as FP8 e4m3 with one
+    # FP32 scale per output column (amax / 448), converted from the pre-shard
+    # at load (attention DP1). The activations stay BF16; the products run on
+    # the MXU's FP8 weight path. The decay-gate projections stay BF16. The
+    # prefill keeps its own BF16 input projection (colocated programs no
+    # longer share it). Changes numerics: weight quantization.
+    kda_fp8_projections: bool = False
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
@@ -251,6 +258,8 @@ class KernelConfig:
             raise ValueError("expert_steal needs decode_expert_parallel=8")
         if self.expert_steal and self.attention_dp != 1:
             raise ValueError("expert_steal needs attention_dp=1")
+        if self.kda_fp8_projections and self.attention_dp != 1:
+            raise ValueError("kda_fp8_projections needs attention_dp=1")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
             raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):

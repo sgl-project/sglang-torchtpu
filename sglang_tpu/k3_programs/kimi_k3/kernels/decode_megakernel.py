@@ -5312,6 +5312,11 @@ class KimiDeltaAttentionWeights:
     time_step_bias: TensorLike  # [3, 128]
     output_normalization: TensorLike  # [128] or [8, 128]
     projection_copy_semaphores: Any  # [4]
+    # FP8 input / output projections (KernelConfig.kda_fp8_projections): their
+    # FP32 column scales in VMEM, [1, 1664] / [1, hidden_size / 2]. None with
+    # BF16 projections.
+    input_projection_scale: Any = None
+    output_projection_scale: Any = None
 
     def make_projection_copies(self) -> SimpleNamespace:
         """Create the asynchronous projection-weight copies."""
@@ -5425,6 +5430,19 @@ def kda(
         )
     if batch_size % sequence_rows:
         raise ValueError("sequence_rows must divide the KDA batch")
+    input_scale = weights.input_projection_scale
+    if input_scale is not None and (
+        shard_index is not None or projected_rows is not None
+    ):
+        raise ValueError("FP8 KDA projections run without attention DP")
+
+    def input_product(product):
+        """The input projection's FP32 product in BF16, column-scaled first
+        for FP8 weights."""
+        if input_scale is not None:
+            product = product * input_scale[...]
+        return product.astype(jnp.bfloat16)
+
     if synchronize_devices:
         collectives32.barrier()
         communication_workspace.reduction_phase[0] = 0
@@ -5517,19 +5535,17 @@ def kda(
                 communication_workspace.reduction_phase[0] >= 0,
             ).astype(jnp.bfloat16)
         elif "input" in streams:
-            projected = (
-                streams["input"]
-                .dot(
+            projected = input_product(
+                streams["input"].dot(
                     hidden_ref[...],
                     communication_workspace.reduction_phase[0] >= 0,
                 )
-                .astype(jnp.bfloat16)
             )
         else:
             weight_copies.input.wait()
-            projected = _dot(
-                hidden_ref[...], weights.input_projection_vmem[...]
-            ).astype(jnp.bfloat16)
+            projected = input_product(
+                _dot(hidden_ref[...], weights.input_projection_vmem[...])
+            )
         if rolled:
             projected_vmem[...] = projected.reshape(chunk_count, row_chunk, -1)
             output_gate_vmem[...] = projected[
@@ -5879,6 +5895,7 @@ def kda(
                 weight_stream=output_stream,
                 staging=communication_workspace.projection_staging_vmem,
                 gather_wire=communication_workspace.attention_gather_vmem,
+                weight_scale=weights.output_projection_scale,
             )
 
     pl.run_scoped(
@@ -6589,10 +6606,17 @@ def _project_attention_2d(
     weight_stream=None,
     staging=None,
     gather_wire=None,
+    weight_scale=None,
 ):
     """``weight_stream`` (optional) is a row ChunkedWeightStream of ``weight``
-    whose positions 0 and 1 are this rank's and its pair peer's feature rows."""
+    whose positions 0 and 1 are this rank's and its pair peer's feature rows.
+    ``weight_scale`` (FP32 [1, half], FP8 ``weight``) scales the output
+    columns of each half's product."""
     rank = jax.lax.axis_index("tp")
+
+    def scaled(product):
+        return product if weight_scale is None else product * weight_scale[...]
+
     slot = phase[0] % 2
     batch_size = attended.shape[0]
     ordered_full_output = (
@@ -6628,7 +6652,7 @@ def _project_attention_2d(
         else:
             weight_stream.wait(0)
             own_weight = weight_stream.view(0)[...]
-        comm[:, :half] = dot(attended, own_weight)
+        comm[:, :half] = scaled(dot(attended, own_weight))
         if weight_stream is not None:
             weight_stream.release(0, phase[0] >= 0)
         count = features.at[:, : (g - 1) * width]
@@ -6640,7 +6664,9 @@ def _project_attention_2d(
         else:
             weight_stream.wait(1)
             peer_weight = weight_stream.view(1)[...]
-        comm[:, :half] += dot(features[:, pl.ds(peer_lane * width, width)], peer_weight)
+        comm[:, :half] += scaled(
+            dot(features[:, pl.ds(peer_lane * width, width)], peer_weight)
+        )
         if token_scatter_output or ordered_full_output:
             assert batch_size in (4, *SCATTER_BATCHES)
             tokens_per_pair = batch_size // 4
@@ -7572,6 +7598,9 @@ KDA = (
     "k_norm",
 )
 MLA = ("m_qa", "m_ka", "m_qb", "m_kb", "m_gate", "m_o", "m_qnorm", "m_knorm")
+# FP8 KDA input and output projections (KernelConfig.kda_fp8_projections):
+# their FP32 column scales, [layers, 1, columns] decode weight families.
+KDA_FP8_SCALES = ("k_projection_scale", "k_o_scale")
 NORMS = ("attn_res", "mlp_res", "attn_norm", "ffn_norm")
 EPILOGUE = ("output_res", "final_norm")
 DENSE = (
@@ -8246,7 +8275,20 @@ def stack(
     # layers' index-key pools; ``weights`` holds the indexer families).
     dsa = index_pools is not None
     dsa_names = dsa_decode.FAMILIES if dsa else ()
-    layer_names = NAMES + dsa_names
+    # FP8 KDA input and output projections with their column scales
+    # (rank_loader.kda_fp8_families).
+    kda_fp8 = weights["k_projection"].dtype == jnp.float8_e4m3fn
+    kda_scale_names = KDA_FP8_SCALES if kda_fp8 else ()
+    layer_names = NAMES + dsa_names + kda_scale_names
+    if kda_fp8 and (
+        weights["k_o"].dtype != jnp.float8_e4m3fn
+        or any(name not in weights for name in KDA_FP8_SCALES)
+        or attention_dp != 1
+    ):
+        raise ValueError(
+            "FP8 KDA projections take FP8 k_projection and k_o with their column "
+            "scales, without attention DP"
+        )
     if dsa and (
         len(index_pools) != MLA_LAYERS or any(name not in weights for name in dsa_names)
     ):
@@ -8745,6 +8787,23 @@ def stack(
         if steal_slots:
             steal_persistent = tuple(common[: len(STEAL_PERSISTENT_NAMES)])
             common = common[len(STEAL_PERSISTENT_NAMES) :]
+        kda_scale_vmem = tuple(common[: len(kda_scale_names)])
+        common = common[len(kda_scale_names) :]
+        # FP8 KDA projections: the layer's column scales (aux semaphores 6, 7).
+        kda_scale_slots = tuple(
+            (name, vmem, slot)
+            for slot, (name, vmem) in enumerate(
+                zip(kda_scale_names, kda_scale_vmem, strict=True), 6
+            )
+        )
+        kda_scales = (
+            dict(
+                input_projection_scale=kda_scale_vmem[0],
+                output_projection_scale=kda_scale_vmem[1],
+            )
+            if kda_fp8
+            else {}
+        )
         if _config().vmem_pad_kb:
             headroom_pad = common[-1]
             headroom_pad[...] = jnp.zeros(headroom_pad.shape, jnp.float32)
@@ -9512,6 +9571,12 @@ def stack(
                         destination,
                         auxiliary_semaphores.at[slot],
                     ).start()
+                for name, destination, slot in kda_scale_slots:
+                    tpu.make_async_copy(
+                        layer_weights[name].at[state_index],
+                        destination,
+                        auxiliary_semaphores.at[slot],
+                    ).start()
 
         def prefetch_metadata(index, *, mixture_metadata=True):
             buffer_slot = index % 2
@@ -9834,6 +9899,13 @@ def stack(
                     for index, (source, destination) in enumerate(
                         zip(auxiliary_sources, auxiliary_vmem[:4], strict=True)
                     )
+                ) + tuple(
+                    tpu.make_async_copy(
+                        layer_weights[name].at[state_index],
+                        destination,
+                        auxiliary_semaphores.at[slot],
+                    )
+                    for name, destination, slot in kda_scale_slots
                 )
                 for copy in pending:
                     copy.wait()
@@ -9948,6 +10020,7 @@ def stack(
                                 kda_projection_vmem[3],
                                 *auxiliary_vmem[:4],
                                 pool_semaphores,
+                                **kda_scales,
                             ),
                             convolution_history_ref=history_vmem,
                             recurrent_state_ref=state_vmem,
@@ -10157,6 +10230,7 @@ def stack(
                                 kda_projection_vmem[3],
                                 *auxiliary_vmem[:4],
                                 pool_semaphores,
+                                **kda_scales,
                             ),
                             convolution_history_ref=convolution_ref.at[:, state_index],
                             recurrent_state_ref=recurrent_ref.at[:, state_index],
@@ -11427,7 +11501,9 @@ def stack(
                 tpu.VMEM((1,), jnp.uint8),
             )
         ),
-        tpu.SemaphoreType.DMA((6,)),
+        # KDA auxiliary copies: the small weights (0-3), the persisted states
+        # (4, 5) and the FP8 projections' column scales (6, 7).
+        tpu.SemaphoreType.DMA((6 + len(kda_scale_names),)),
         *(
             tpu.VMEM((2, *local_weights[name].shape), local_weights[name].dtype)
             for name in ("m_qnorm", "m_knorm", "router_bias", "latent_norm")
@@ -11465,6 +11541,11 @@ def stack(
         # The steal's packets and semaphores the sibling signals (it may run
         # ahead into the next layer's MoE).
         *(expert_steal.scratch_shapes(steal_slots) if steal_slots else ()),
+        # The FP8 KDA projections' column scales (one KDA layer's).
+        *(
+            tpu.VMEM(local_weights[name].shape, local_weights[name].dtype)
+            for name in kda_scale_names
+        ),
         *communication_scratch(batch_size, attention_dp)[:-1],
         tpu.VMEM((batch_size, 4096), jnp.bfloat16),
         *projection_staging_scratch(batch_size, attention_dp),
@@ -11518,6 +11599,7 @@ def stack(
         *mla_dcp.PERSISTENT_NAMES,
         *(dsa_decode.PERSISTENT_NAMES if dsa else ()),
         *(STEAL_PERSISTENT_NAMES if steal_slots else ()),
+        *kda_scale_names,
         "shared_local_reduction",
         "expert_local_reduction",
         "shared_host_reduction",
