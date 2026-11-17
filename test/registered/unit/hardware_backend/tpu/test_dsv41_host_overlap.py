@@ -75,11 +75,12 @@ def _reference_capture(
     )
 
 
-def _request(prompt, output=(), *, beam_group=None):
+def _request(prompt, output=(), *, beam_group=None, req_pool_idx=None):
     return SimpleNamespace(
         origin_input_ids=list(prompt),
         output_ids=list(output),
         beam_group=beam_group,
+        kv=SimpleNamespace(req_pool_idx=req_pool_idx),
     )
 
 
@@ -618,6 +619,7 @@ def test_hooks_end_to_end_overlap_fallback_idle_and_pending_call():
     )
     hf_config = SimpleNamespace(
         model_type="deepseek_v41",
+        vision_n_layers=0,
         vocab_size=8,
         image_token_id=None,
         engram_pad_token_id=3,
@@ -962,10 +964,10 @@ def test_fast_path_commits_hasher_history_for_fallback_decode():
     # 4 requests exercising: normal prompt (A), 1-token prompt pos<n-1 (B),
     # 2-chunk prefill with prefetch hit (C), and wide 62-bit MM pad sentinel (D).
     wide_mm_pad = (1 << 50) + 4
-    req_a = _request([1, 2, 3, 4])
-    req_b = _request([6])
-    req_c = _request([0, 1, 2, 3, 4, 5, 6, 7])
-    req_d = _request([1, wide_mm_pad, 5])
+    req_a = _request([1, 2, 3, 4], req_pool_idx=1)
+    req_b = _request([6], req_pool_idx=2)
+    req_c = _request([0, 1, 2, 3, 4, 5, 6, 7], req_pool_idx=3)
+    req_d = _request([1, wide_mm_pad, 5], req_pool_idx=4)
     slots = [1, 2, 3, 4]
 
     # Step 1: fast-path prefill for A, B, D + chunk 1 of C ([0:4]).
@@ -1005,14 +1007,15 @@ def test_fast_path_commits_hasher_history_for_fallback_decode():
     coordinator.record_consumers(uploads_c2, [torch.tensor([3])])
     coordinator.clear_step()
 
-    # Step 3: fast-path overlap decode on A (token 7 at pos 4) and B (token 2 at pos 1).
+    # Step 3: fast-path overlap decode on A (token 7 at pos 4) and B (token 2 at pos 1),
+    # exercising the req.kv.req_pool_idx fallback when req_pool_indices_cpu is None.
     res_prev, _ = _result([7, 2])
     coordinator.remember([req_a, req_b], [4, 1], res_prev)
     b_dec_fast = _batch(
         [req_a, req_b],
         decode=True,
         starts=[4, 1],
-        req_pool_indices_cpu=torch.tensor([1, 2], dtype=torch.int64),
+        req_pool_indices_cpu=None,
     )
     coordinator.prepare(b_dec_fast)
     _, uploads_df, _ = coordinator.stage_all(4)

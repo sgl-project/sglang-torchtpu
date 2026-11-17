@@ -234,14 +234,10 @@ def tpu_dsv41_engram_gate(original, x, kv, q_weight, k_weight, eps, clamp_value)
 def tpu_dsv41_engram_worker_forward(original, worker, batch, *args, **kwargs):
     """AROUND TpModelWorker.forward_batch_generation: capture host Engram inputs."""
     runner = worker.model_runner
-    model_config = getattr(runner, "model_config", None)
-    if not getattr(model_config, "use_engram", False) or getattr(
-        runner, "is_draft_worker", False
-    ):
+    if not runner.model_config.use_engram or runner.is_draft_worker:
         return original(worker, batch, *args, **kwargs)
-    model = getattr(runner, "model", None)
-    inner = getattr(model, "model", None)
-    hasher = getattr(inner, "engram_hasher", None)
+    model = runner.model
+    hasher = model.model.engram_hasher
     if hasher is None:
         return original(worker, batch, *args, **kwargs)
     from sglang.srt.runtime_context import get_exec, get_parallel
