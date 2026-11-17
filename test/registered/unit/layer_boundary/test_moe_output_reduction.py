@@ -203,6 +203,7 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                         self.assertEqual(get_forward().mlp_reduce_scatter, use_rsv)
                         return reduce(value) if non_cuda and not use_rsv else value
 
+                    compute.dp_local_forward = None
                     group = types.SimpleNamespace(reduce_scatterv=rsv)
                     parallel = types.SimpleNamespace(
                         attn_dp_size=2, attn_tp_size=1, tp_size=2, tp_group=group

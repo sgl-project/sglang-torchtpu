@@ -679,6 +679,13 @@ class TpuEnvs:
     # per global layer. 0 (default): one shared loop with tree-walk KV refill, which keeps
     # the loops in IMEM overlays (q8 32k: TP -3 to -6.5%); 64 restores the previous hoisting.
     SGLANG_TPU_MUSE_MK_ATTN_HOIST_MAX_ROWS = EnvInt(0)
+    # DeepSeek-V4.1 Flash (text, attention DP == EP == world, FP4 experts): run
+    # the routed experts of every top-k MoE layer through fused_ep_moe_v2 on
+    # this rank's own rows, without the DP gather/scatter and post-experts
+    # all-reduce (models/deepseek_v41/fused_ep_op.py). Needs
+    # SGLANG_SHARED_EXPERT_TP1=1 (checked at startup). Read when the plugin
+    # hooks are built; False registers nothing.
+    SGLANG_TPU_DSV41_FUSED_EP = EnvBool(False)
 
     # DP routing by pending uncached prompt tokens (dp_prompt_backlog.py,
     # hooks/dp_prompt_backlog.py). 0 disables. m > 0: leave the stock rank when its

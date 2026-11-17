@@ -333,6 +333,25 @@ class NonCudaDecoderMixin:
         input_ids_global: Optional[torch.Tensor],
         return_moe_output: bool = False,
     ) -> Union[torch.Tensor, deepseek_v2.MoEOutput]:
+        # A MoE backend that exchanges tokens across attention-DP ranks itself (e.g. a
+        # fused expert-parallel kernel) may set ``mlp.dp_local_forward`` after loading.
+        # It gets this rank's own rows, before any DP gather, and returns their complete
+        # MoE output (routed plus shared experts, fully reduced): no DP gather, scatter
+        # or post-experts all-reduce runs here. Returning None takes the ordinary path.
+        # The attribute is None unless a backend sets it, so every in-tree platform
+        # keeps today's path.
+        dp_local_forward = self.mlp.dp_local_forward
+        if dp_local_forward is not None:
+            out = dp_local_forward(hidden_states, forward_batch, input_ids=input_ids)
+            if out is not None:
+                if return_moe_output:
+                    # The output is already reduced; a deferred-finalize caller
+                    # would reduce it again.
+                    raise RuntimeError(
+                        "mlp.dp_local_forward returned a complete output, but the "
+                        "caller asked for a deferred MoEOutput (return_moe_output)"
+                    )
+                return out
         prepared = MoeRowTransport(
             self.mlp,
             hidden_states,
