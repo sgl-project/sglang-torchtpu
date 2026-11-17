@@ -10,8 +10,7 @@ and the existing block-FP8 runtime selection are unchanged.
 
 Channel-scale checkpoints require serialized e4m3fn weights, dynamic
 activations, no weight blocks, and direct target-device construction with the
-default loader. GLM NextN exclusion remapping is a model-loading adaptation;
-it does not select a checkpoint format or a kernel.
+default loader. Model-specific checkpoint naming is owned by model adapters.
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ from sglang.srt.layers.quantization.base_config import LinearMethodBase
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
-from sglang_tpu.glm.quantization import _remap_glm_nextn_ignored_layers
 
 
 class TpuFp8Config(Fp8Config):
@@ -51,7 +49,6 @@ class TpuChannelwiseFp8Config(Fp8Config):
 
     @classmethod
     def from_fp8_config(cls, config: dict[str, Any]) -> TpuChannelwiseFp8Config:
-        hf_config = config.get("hf_config")
         if (
             config.get("quant_method") != "fp8"
             or config.get("activation_scheme") != "dynamic"
@@ -75,7 +72,6 @@ class TpuChannelwiseFp8Config(Fp8Config):
         # Reuse upstream parsing/normalization without changing the input metadata.
         result = Fp8Config.from_config.__func__(cls, config)
         result.weight_scale_granularity = config["weight_scale_granularity"]
-        _remap_glm_nextn_ignored_layers(result, hf_config)
         return result
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):

@@ -37,14 +37,29 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
+from sglang.srt.plugins.hook_registry import _wrap_fn
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang_tpu.fp8 import (
     TpuChannelwiseFp8Config,
     TpuChannelwiseFp8LinearMethod,
     TpuFp8Config,
 )
+from sglang_tpu.hooks import HOOKS
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def _glm_nextn_resolver():
+    from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
+
+    resolver = GlmMoeDsaForCausalLMNextN._resolve_nextn_quant_config
+    for target, hook, hook_type in HOOKS:
+        if target == (
+            "sglang.srt.models.glm4_moe."
+            "GlmMoeDsaForCausalLMNextN._resolve_nextn_quant_config"
+        ):
+            resolver = _wrap_fn(resolver, hook, hook_type)
+    return resolver
 
 
 def _metadata(**overrides):
@@ -782,6 +797,36 @@ class TestChannelwiseMoeAndNextN(_TpuMoETestCase):
                         "DP attention", layer._tpu_fused_rs_unsupported_reason
                     )
 
+    def test_nextn_quant_config_hook_preserves_other_models_and_formats(self):
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
+
+        class UnreviewedNextN(GlmMoeDsaForCausalLMNextN):
+            pass
+
+        resolver = _glm_nextn_resolver()
+        for layers, checkpoint_layer in ((3, 3), (1, 0)):
+            hf_config = SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLMNextN"],
+                num_hidden_layers=layers,
+            )
+            excluded = f"model.layers.{checkpoint_layer}.self_attn.o_proj"
+            config = _config(hf_config=hf_config, ignored_layers=[excluded])
+            original_exclusions = list(config.ignored_layers)
+            model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+            with self.subTest(layers=layers):
+                # Upstream normalizes prefixes, but only the GLM hook maps NextN.
+                self.assertNotIn(
+                    "model.decoder.self_attn.o_proj", config.ignored_layers
+                )
+                resolved = resolver(model, hf_config, config)
+                self.assertIn("model.decoder.self_attn.o_proj", resolved.ignored_layers)
+                self.assertEqual(config.ignored_layers, original_exclusions)
+                self.assertIs(resolver(model, hf_config, None), None)
+                legacy = _block_config()
+                self.assertIs(resolver(model, hf_config, legacy), legacy)
+                other = UnreviewedNextN.__new__(UnreviewedNextN)
+                self.assertIs(resolver(other, hf_config, config), config)
+
     def test_nextn_loads_channel_experts_and_preserves_exclusions_and_bridge(self):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
@@ -799,6 +844,13 @@ class TestChannelwiseMoeAndNextN(_TpuMoETestCase):
                 hf_config=hf_config,
                 ignored_layers=["model.layers.3.self_attn.o_proj"],
             )
+            model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+            resolver = _glm_nextn_resolver()
+            original = config
+            original_exclusions = list(original.ignored_layers)
+            config = resolver(model, hf_config, original)
+            self.assertIsNot(config, original)
+            self.assertEqual(original.ignored_layers, original_exclusions)
             skipped = ReplicatedLinear.__new__(ReplicatedLinear)
             torch.nn.Module.__init__(skipped)
             self.assertIsInstance(

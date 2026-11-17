@@ -25,6 +25,7 @@ from sglang.srt.models.glm4_moe import (
 from sglang.srt.plugins.hook_registry import _wrap_fn
 from sglang.srt.runtime_context import get_context
 from sglang_tpu.envs import envs
+from sglang_tpu.glm.loader import GlmNextNModelLoader
 from sglang_tpu.hooks import HOOKS
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
@@ -128,6 +129,7 @@ class TestMtpShardFilter(CustomTestCase):
             model = _model(config)
             for multithread in (False, True):
                 loader = _loader(model_config=config, multithread=multithread)
+                self.assertIs(type(loader), GlmNextNModelLoader)
                 # The ordinary load path must initialize the policy itself.
                 ordinary = dict(loader._get_all_weights(config, model))
                 resolved = loader.resolve_model_weights(config, model)[0]
