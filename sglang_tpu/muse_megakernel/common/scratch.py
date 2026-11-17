@@ -97,7 +97,7 @@ def _can_w2_attn_scratch(c: MKConfig) -> bool:
 
 def _use_attn_p_fp8(c: MKConfig) -> bool:
     return bool(
-        (c.attn_head_fp8 >= 2 and _can_w2_attn_scratch(c))
+        (c.attn_head_fp8 == 2 and _can_w2_attn_scratch(c))
         and c.attn_pipe
         and c.attn_opt in (3, 4, 5)
         and c.kv_sal

@@ -511,17 +511,25 @@ class MuseMegakernel(torch.nn.Module):
         )
         if swa_chunk_pages >= chunk_pages:
             swa_chunk_pages = 0
+        b2_fp8q = (
+            opt
+            and kv_sal
+            and kv_sal_fp8
+            and q > 4
+            and tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_B2_FP8Q.get()
+        )
         attn_opt = 0
-        if opt:
-            attn_opt = (
-                5
-                if (
-                    tiled
-                    and rows > 64
-                    and self.max_position >= _ATTN_HOIST_GLOBAL_MIN_POS
-                )
-                else 3
-            )
+        if b2_fp8q:
+            attn_opt = 4
+        elif (
+            opt
+            and tiled
+            and rows > 64
+            and self.max_position >= _ATTN_HOIST_GLOBAL_MIN_POS
+        ):
+            attn_opt = 5
+        elif opt:
+            attn_opt = 3
         cfg = MKConfig(
             hidden=g.hidden,
             head_dim=g.head_dim,
@@ -608,7 +616,9 @@ class MuseMegakernel(torch.nn.Module):
             pair_o_rs=opt and tiled,
             alias_oag_f=opt and tiled,
             sal_kv_split=opt and kv_sal and kv_sal_fp8,
-            attn_head_fp8=1 if (opt and kv_sal and kv_sal_fp8) else 0,
+            attn_head_fp8=4
+            if b2_fp8q
+            else (1 if (opt and kv_sal and kv_sal_fp8) else 0),
             topk_xpose=opt and rows >= 64,
             pair_y_stream=opt and tiled and rows > 64,
             ex_w2_stage=opt and tiled,
