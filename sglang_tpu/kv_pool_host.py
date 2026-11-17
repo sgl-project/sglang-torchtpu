@@ -484,6 +484,17 @@ class TpuDMAHostKVPool(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
+    def set_page_translators(
+        self,
+        *,
+        host: Optional[Callable[[List[int]], List[int]]] = None,
+        device: Optional[Callable[[List[int]], List[int]]] = None,
+    ) -> None:
+        if host is not None:
+            self._host_page_translator = host
+        if device is not None:
+            self._device_page_translator = device
+
     # ------------------------------------------------------------------ #
     # Sizing
     # ------------------------------------------------------------------ #
@@ -991,20 +1002,22 @@ class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
             self._state.release()
         super().destroy()
 
-    def bind_draft_swa_sidecar(self, draft_swa_host_pool: TpuDMAHostKVPool) -> None:
+    def bind_draft_swa_sidecar(self, draft_swa_host_pool: HostKVCache) -> None:
         if not self._is_swa:
             return
-        if self._pages_per_logical > 1:
-            draft_swa_host_pool._host_page_translator = (
-                self._state.translate_swa_host_pages
+        if not isinstance(draft_swa_host_pool, TpuDMAHostKVPool):
+            raise TypeError(
+                "Unified SWA draft sidecar host pool must be a TpuDMAHostKVPool, "
+                f"got {type(draft_swa_host_pool).__name__}."
             )
-        sidecar = getattr(self._unified_pool, "_draft_swa_sidecar", None)
-        if sidecar is not None:
-            draft_swa_host_pool._device_page_translator = lambda pages: (
-                sidecar.translate_pages(
-                    torch.as_tensor(pages, dtype=torch.int64)
-                ).tolist()
-            )
+        host_tr = (
+            self._state.translate_swa_host_pages
+            if self._pages_per_logical > 1
+            else None
+        )
+        sidecar = self._unified_pool.draft_swa_sidecar
+        dev_tr = sidecar.translate_page_list if sidecar is not None else None
+        draft_swa_host_pool.set_page_translators(host=host_tr, device=dev_tr)
 
     def _expand_pages(
         self, token_indices: torch.Tensor, group_pages: Optional[torch.Tensor]

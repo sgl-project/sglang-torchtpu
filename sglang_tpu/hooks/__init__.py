@@ -30,6 +30,7 @@ from sglang_tpu.hooks.draft_kv_pool import (
     derive_unified_draft_pool_sizes,
     draft_cell_size_per_token,
     draft_mha_pool_class,
+    price_unified_hicache_draft_bytes,
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
 from sglang_tpu.hooks.dsv4 import hook_specs as dsv4_hooks
@@ -390,6 +391,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.build_swa_draft_pools",
         bind_unified_swa_draft_host_pool,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.mem_cache.hicache_auto_size._draft_bytes",
+        price_unified_hicache_draft_bytes,
+        HookType.AROUND,
     ),
     (
         "sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator.__init__",

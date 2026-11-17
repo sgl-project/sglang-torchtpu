@@ -150,9 +150,10 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         publish(ServerArgs(model_path="dummy"), role="scheduler")
         self.addCleanup(reset_context)
         kph.register_unified_hicache_strategy()
-        op, os_fn = (
+        op, os_fn, od_fn = (
             bsw.BaseSpecWorker._build_hicache_draft_plan,
             hpa.build_swa_draft_pools,
+            hicache_auto_size._draft_bytes,
         )
         mem = NS(
             hicache_io_backend="raiden",
@@ -164,10 +165,14 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         wrap_swa = lambda *a, **kw: dkp_hooks.bind_unified_swa_draft_host_pool(
             os_fn(*a, **kw), *a, **kw
         )
+        wrap_draft_bytes = lambda t, d: dkp_hooks.price_unified_hicache_draft_bytes(
+            od_fn, t, d
+        )
         host_cls = lambda *_, **__: kph.tpu_dma_host_kv_pool_cls("raiden")
         for p in (
             patch.object(bsw.BaseSpecWorker, "_build_hicache_draft_plan", wrap_plan),
             patch.object(hpa, "build_swa_draft_pools", wrap_swa),
+            patch.object(hicache_auto_size, "_draft_bytes", wrap_draft_bytes),
             patch.object(kph, "create_tpu_dma_kv_transfer", side_effect=_InMemoryDMA),
             patch.object(kph, "host_memory_budget_bytes", return_value=1 << 40),
             patch(
@@ -282,18 +287,39 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
 
     def test_copricing_plan_and_gates(self):
         with patch.object(kph, "sync_fixed_hicache_size", side_effect=lambda t, _: t):
-            kv0, _ = _pair(make_target()[0], host_size=0.01)
+            kv0, _ = _pair(make_target(size=192)[0], host_size=0.01)
             for fl, sl in (((), (0, 1, 2, 3)), ((0, 1), ())):
-                p, a = make_target()
+                p, a = make_target(size=192)
                 d = attach_draft(a, fl, sl, head_dim=128)
+                if sl:
+                    # Shrink device SWA working set below target SWA logical capacity
+                    # (192 // 3 = 64 tokens) to verify host auto-size scales to 64.
+                    d = SWAKVPool(
+                        size=p.size,
+                        size_swa=32,
+                        page_size=4,
+                        dtype=torch.bfloat16,
+                        head_num=4,
+                        head_dim=128,
+                        swa_attention_layer_ids=list(sl),
+                        full_attention_layer_ids=[],
+                        device="cpu",
+                        enable_memory_saver=False,
+                        token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+                    )
                 # Draft host sidecars stay outside --hicache-size (matching separate).
                 self.assertEqual(_pair(p, host_size=0.01)[0].page_num, kv0.page_num)
-                exp = hicache_auto_size._pool_bytes(d.swa_kv_pool if sl else d) * (
-                    1 if sl else p.size // d.size
+                target_cap = (
+                    ((p.size // p.page_size) // p.layout.num_swa_groups) * p.page_size
+                    if sl
+                    else p.size
                 )
+                sub = d.swa_kv_pool if sl else d
+                exp = hicache_auto_size._pool_bytes(sub) * target_cap // sub.size
                 self.assertEqual(hicache_auto_size._draft_bytes(p, d), exp)
 
         tp, ta = make_target()
+        self.assertFalse(tp.supports_packed_hicache_draft)
         dp = attach_draft(ta, (0,))
         r1 = NS(
             token_to_kv_pool=dp,
@@ -312,7 +338,7 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
         mem_on = NS(
             enable_hierarchical_cache=True, enable_unified_cache_external_linker=False
         )
-        with patch("sglang.srt.runtime_context.get_memory", return_value=mem_on):
+        with patch.object(bsw, "get_memory", return_value=mem_on):
             plan = w._build_hicache_draft_plan()
             self.assertEqual(
                 (plan.mode, plan.device_pools), (bsw.HiCacheDraftMode.SIDECAR, (dp,))
@@ -322,13 +348,14 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
                 w._build_hicache_draft_plan()
 
         empty_tc = NS(cache_controller=NS(mem_pool_host=NS(entry_map={})))
-        self.assertEqual(
+        with self.assertRaises(KeyError):
             hpa.build_swa_draft_pools(
                 draft_kv_pool=attach_draft(make_target()[1], (), (0, 1)),
                 tree_cache=empty_tc,
-            ),
-            ([], []),
-        )
+            )
+        _, swa_h_chk = _pair(make_target()[0])
+        with self.assertRaisesRegex(TypeError, "TpuDMAHostKVPool"):
+            swa_h_chk.bind_draft_swa_sidecar(NS())
         bm = attach_draft(
             make_target()[1], (), (0, 1), pool_cls=TpuBlockMajorMHATokenToKVPool
         )
@@ -503,6 +530,142 @@ class TestUnifiedSpecHiCacheSidecars(unittest.TestCase):
                 ukp._compute_draft_swa_pages(
                     1000, page_size=256, num_swa_groups=3, sliding_window_size=2048
                 )
+
+    def test_multi_runner_precheck_and_dflash_hicache_roundtrip(self):
+        from sglang_tpu.dflash_draft_kv_write import _scatter_layer_kv
+
+        ctx = _draft_ut.TestDraftCoPricingAndValidation()._ctx
+        t_mc = _draft_ut._mc([0, 1], [2, 3, 4, 5, 6, 7])
+
+        # Multi-runner MTP + HiCache fails fast in _unsupported_reason before load.
+        kvc_mr = _draft_ut._kvc(
+            t_mc, algo=SA.EAGLE, draft_mc=_draft_ut._mc([0], []), runners=2
+        )
+        with ctx(
+            enable_hierarchical_cache=True,
+            hicache_io_backend="raiden",
+            enable_multi_layer_eagle=True,
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+        ):
+            with self.assertRaisesRegex(ValueError, "multi-runner MTP"):
+                ukp.unified_kv_pool_enabled(kvc_mr)
+
+        # DFLASH & DSPARK pass unified HiCache gates, build SIDECAR plans via
+        # BaseSpecWorker._draft_model_runners(), and survive DFLASH KV scatter +
+        # DMA backup -> clear -> reload.
+        mem_on = NS(
+            enable_hierarchical_cache=True, enable_unified_cache_external_linker=False
+        )
+        for algo in (SA.DFLASH, SA.DSPARK):
+            kvc_df = _draft_ut._kvc(
+                t_mc, algo=algo, draft_mc=_draft_ut._mc([], [0, 1], window=64)
+            )
+            with ctx(
+                exp_spec=True,
+                speculative_algorithm=algo.name,
+                enable_hierarchical_cache=True,
+                hicache_io_backend="raiden",
+            ):
+                self.assertTrue(ukp.unified_kv_pool_enabled(kvc_df))
+
+            tp, ta = make_target(size=64)
+            dp = attach_draft(ta, (), (0, 1))
+            r_df = NS(
+                token_to_kv_pool=dp,
+                model_config=NS(
+                    num_nextn_predict_layers=None,
+                    hf_config=NS(architectures=["DFlash2DraftModel"]),
+                ),
+            )
+            w = object.__new__(bsw.BaseSpecWorker)
+            w._target_worker = NS(
+                model_runner=NS(
+                    token_to_kv_pool=tp, mtp_draft_device_pools=(), spec_algorithm=algo
+                )
+            )
+            w._draft_worker = NS(model_runner=r_df)
+            with patch.object(bsw, "get_memory", return_value=mem_on):
+                plan = w._build_hicache_draft_plan()
+                self.assertEqual(
+                    (plan.mode, plan.device_pools),
+                    (bsw.HiCacheDraftMode.SIDECAR, (dp,)),
+                )
+
+        # End-to-end DFLASH _scatter_layer_kv + unified HiCache backup & reload.
+        tp, ta = make_target(size=64)
+        dp = attach_draft(ta, (), (0,))
+        kv_h, swa_h = _pair(tp)
+        fm, sm = kph._unified_swa_layer_mappings(tp)
+        mx, sa = max(fm.keys() | sm.keys()) + 1, ta.swa_attn_allocator
+        grp = HostPoolGroup(
+            [
+                _entry(PN.KV, kv_h, tp, fm, mx, is_anchor=True),
+                _entry(
+                    PN.SWA,
+                    swa_h,
+                    tp,
+                    sm,
+                    mx,
+                    device_alloc_fn=sa.alloc,
+                    device_free_fn=sa.free,
+                ),
+            ]
+        )
+        ctrl = object.__new__(TpuDMAHybridCacheController)
+        ctrl.mem_pool_device_allocator, ctrl.mem_pool_host = ta, grp
+        ctrl.page_size, ctrl.io_backend, ctrl.device = 4, "raiden", "cpu"
+        ctrl.write_queue, ctrl.load_queue, ctrl.ack_write_queue, ctrl.ack_load_queue = (
+            [],
+            [],
+            [],
+            [],
+        )
+        ctrl.layer_done_counter = BatchDoneCounter()
+        specs, entries = hpa.build_hicache_draft_sidecars(
+            draft_device_pools=(dp,), tree_cache=NS(cache_controller=ctrl)
+        )
+        for e in entries:
+            grp.add_entry(e)
+        df, ds = ta.full_attn_allocator.alloc(8), sa.alloc(8)
+        ta.set_full_to_swa_mapping(df, ds)
+        locs = dp.translate_loc_from_full_to_swa(df)
+        k_tok = torch.randn((8, 4, 64), dtype=torch.bfloat16)
+        v_tok = torch.randn((8, 4, 64), dtype=torch.bfloat16)
+        _scatter_layer_kv(
+            kv_pool=dp.swa_kv_pool, layer_idx=0, loc=locs, k=k_tok, v=v_tok
+        )
+
+        hf = grp.alloc(8, pool=PN.KV)
+        xfers = [PT(name=PN.SWA, device_indices=ds)] + [
+            PT(name=s.pool_name, indices_from_pool=s.indices_from_pool) for s in specs
+        ]
+        res = grp.resolve_host_transfers(
+            xfers, primary_device_indices=df, primary_host_indices=hf
+        )
+        hs = next(t.host_indices for t in res if t.name == PN.SWA)
+        ctrl.write_queue.append(CacheOperation(hf, df, node_id=1, pool_transfers=res))
+        ctrl.start_writing()
+        for b in pm_tensors(dp.swa_kv_pool):
+            b.zero_()
+
+        nf, ns = ta.full_attn_allocator.alloc(8), sa.alloc(8)
+        ta.set_full_to_swa_mapping(nf, ns)
+        r_xf = [PT(name=PN.SWA, host_indices=hs, device_indices=ns)] + [
+            PT(
+                name=s.pool_name,
+                indices_from_pool=s.indices_from_pool,
+                host_indices=hs,
+                device_indices=ns,
+            )
+            for s in specs
+        ]
+        ctrl.load_queue.append(CacheOperation(hf, nf, node_id=2, pool_transfers=r_xf))
+        ctrl.start_loading()
+        new_locs = dp.translate_loc_from_full_to_swa(nf)
+        flat = dp.swa_kv_pool.get_fused_kv_buffer(0).flatten(0, 1)
+        self.assertTrue(torch.equal(flat[new_locs, :4, 0, :64], k_tok))
+        self.assertTrue(torch.equal(flat[new_locs, :4, 1, :64], v_tok))
 
 
 if __name__ == "__main__":

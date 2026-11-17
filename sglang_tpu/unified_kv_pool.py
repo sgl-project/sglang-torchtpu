@@ -409,6 +409,17 @@ def _unsupported_reason(kvc) -> Optional[str]:
             "sliding-window attention layers.",
         ),
         (
+            _is_supported_eagle_spec(spec_algo)
+            and bool(getattr(get_spec(), "enable_multi_layer_eagle", False))
+            and int(getattr(get_spec(), "speculative_num_steps", 0) or 0) > 1
+            and (
+                memory.enable_hierarchical_cache
+                or getattr(disagg, "disaggregation_decode_retraction_backup", None)
+                == "host_pool"
+            ),
+            "does not support multi-runner MTP draft KV offload with HiCache.",
+        ),
+        (
             draft_mc is not None
             and draft_mc.is_hybrid_swa
             and bool(draft_mc.swa_attention_layer_ids)
@@ -557,6 +568,7 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
     """Unified Hybrid Full/SWA KV pool backed by ``G = full.num_layers`` shared 5D buffers."""
 
     AttnSpec = AttnLayerSpec
+    supports_packed_hicache_draft = False
 
     def __init__(
         self,
@@ -638,7 +650,6 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             self._swa_layer_group[gid] = j // G
 
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
-        self._attached_draft_pools: List[KVCache] = []
         self._draft_swa_sidecar: Optional[_DraftSwaSidecar] = None
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
@@ -650,6 +661,10 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             G,
             self.layout.num_swa_groups,
         )
+
+    @property
+    def draft_swa_sidecar(self) -> Optional[_DraftSwaSidecar]:
+        return self._draft_swa_sidecar
 
     def _buffer_idx(self, layer_id: int) -> int:
         idx, is_swa = self.layers_mapping[layer_id]
@@ -867,6 +882,9 @@ class _DraftSwaSidecar:
             self.target_to_draft_page[pages.clamp(min=0)],
             torch.zeros_like(pages),
         )
+
+    def translate_page_list(self, pages: List[int]) -> List[int]:
+        return self.translate_pages(torch.as_tensor(pages, dtype=torch.int64)).tolist()
 
     def translate_slots(self, target_swa_slots: torch.Tensor) -> torch.Tensor:
         slots = target_swa_slots.to(device="cpu", dtype=torch.int64)
@@ -1274,11 +1292,6 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return full_tokens, full_tokens, swa_tokens
 
     def attach_draft_kv_pool(self, draft_kvc, draft_pool) -> None:
-        if (
-            draft_pool is not None
-            and draft_pool not in self._kvcache._attached_draft_pools
-        ):
-            self._kvcache._attached_draft_pools.append(draft_pool)
         if not getattr(draft_kvc, "is_hybrid_swa", False):
             return
         self._validate_draft_swa_window(draft_kvc)
