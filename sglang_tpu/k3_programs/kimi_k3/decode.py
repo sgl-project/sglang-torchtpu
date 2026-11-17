@@ -89,6 +89,10 @@ class KimiDecoder:
     holds the compiled (padded request count, verify rows per request) pairs."""
 
     WIDTH = DecodeOps.VERIFY_ROWS  # tokens per row of a step's result
+    # First-step drafts off unless sglang_colocated.share_first_aux sets the
+    # dict (also for decoders built without __init__).
+    first_aux: dict[str, torch.Tensor] | None = None
+    _predraft_logits: torch.Tensor | None = None
 
     def __init__(
         self,
