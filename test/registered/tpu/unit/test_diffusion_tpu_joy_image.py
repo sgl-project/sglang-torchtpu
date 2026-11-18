@@ -6,6 +6,7 @@ import inspect
 import os
 import socket
 import tempfile
+import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -32,6 +33,7 @@ from sglang.multimodal_gen.runtime.layers import elementwise, layernorm
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits import joy_image as dit
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
 from sglang.multimodal_gen.runtime.pipelines import joy_image as pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageEncodingStage,
@@ -70,6 +72,7 @@ def _installed():
             (dit.MMDoubleStreamBlock, "forward"),
             (pipeline.JoyImageEditPipeline, "create_pipeline_stages"),
             (ImageEncodingStage, "encoding_image_edit"),
+            (Qwen3VLModel, "get_rope_index"),
         ):
             stack.enter_context(patch.object(owner, name, getattr(owner, name)))
         joy_image.install()
@@ -372,7 +375,53 @@ class TestJoyImagePromptPadding(_TestBase):
         self.assertTrue(torch.equal(got, want))
 
 
-if __name__ == "__main__":
-    import unittest
+def _tpu_device() -> bool:
+    try:
+        torch.zeros(1, device="tpu")
+    except Exception:
+        return False
+    return True
 
+
+class TestJoyImageRopeIndex(_TestBase):
+    def _inputs(self, device):
+        config = SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            image_token_id=7,
+            video_token_id=8,
+            vision_start_token_id=6,
+        )
+        # [text | vision start | 2x4 image grid merged to 2 tokens | prompt | padding]
+        ids = [1, 2, 6, 7, 7] + list(range(10, 50)) + [0] * 24
+        mask = [1] * 45 + [0] * 24
+        grid = torch.tensor([[1, 2, 4]], device=device)
+        ids = torch.tensor([ids], device=device)
+        mask = torch.tensor([mask], device=device)
+        return SimpleNamespace(config=config), ids, grid, mask
+
+    def _rope_index(self, device):
+        model, ids, grid, mask = self._inputs(device)
+        original, seen = joy_image._STOCK_GET_ROPE_INDEX, []
+
+        def stock(self, input_ids, *args):
+            seen.extend(t.device.type for t in (input_ids, *args) if t is not None)
+            return original(self, input_ids, *args)
+
+        with _installed(), patch.object(joy_image, "_STOCK_GET_ROPE_INDEX", stock):
+            got = Qwen3VLModel.get_rope_index(model, ids, grid, None, mask)
+        want = original(model, ids.cpu(), grid.cpu(), None, mask.cpu())
+        for g, w in zip(got, want):
+            self.assertEqual(g.device.type, device)
+            self.assertTrue(torch.equal(g.cpu(), w))
+        return seen
+
+    def test_cpu_ids_take_the_stock_path(self):
+        self.assertEqual(self._rope_index("cpu"), ["cpu"] * 3)
+
+    @unittest.skipUnless(_tpu_device(), "needs a TPU device")
+    def test_tpu_ids_build_the_stock_positions_on_the_host(self):
+        self.assertEqual(self._rope_index("tpu"), ["cpu"] * 3)
+
+
+if __name__ == "__main__":
     unittest.main()

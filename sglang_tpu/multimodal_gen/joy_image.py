@@ -24,7 +24,10 @@ Runtime patch, tracked debt:
   (3) right-pads the encoder's prompt tokens to a multiple of 256. The encoder
       is causal, so real tokens never see the padding, and only the real rows
       reach the DiT;
-  (4) marks the regionally compiled blocks spmd-safe.
+  (4) builds the encoder's multimodal RoPE positions (``get_rope_index``) on
+      the host: the stock code indexes the tokens by their mask and reads them
+      back, which on the device compiles its ops again for every prompt length;
+  (5) marks the regionally compiled blocks spmd-safe.
 - Upstream PR or issue: none.
 - Remove when: the DiT takes a platform-provided prompt bucket and key counts
   and shards its prompt rows under SP, and RoPE goes through a platform
@@ -54,6 +57,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_output_all_to_all,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
 from sglang.multimodal_gen.runtime.models.dits import joy_image as dit
 from sglang.multimodal_gen.runtime.pipelines import joy_image as pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
@@ -73,6 +77,7 @@ _STOCK_BLOCK_FORWARD = dit.MMDoubleStreamBlock.forward
 _STOCK_ROPE = dit.JoyTransformer3DModel._compute_rope_for_local_shard
 _STOCK_CREATE_STAGES = pipeline.JoyImageEditPipeline.create_pipeline_stages
 _STOCK_ENCODING_IMAGE_EDIT = ImageEncodingStage.encoding_image_edit
+_STOCK_GET_ROPE_INDEX = Qwen3VLModel.get_rope_index
 
 
 class Layout(NamedTuple):
@@ -379,6 +384,22 @@ def encoding_image_edit(self, outputs, image_inputs, pipeline_config):
     return _STOCK_ENCODING_IMAGE_EDIT(self, outputs, image_inputs, pipeline_config)
 
 
+def get_rope_index(
+    self, input_ids=None, image_grid_thw=None, video_grid_thw=None, attention_mask=None
+):
+    """The stock positions, computed on the host for device token ids."""
+    if input_ids is None or input_ids.device.type != "tpu":
+        return _STOCK_GET_ROPE_INDEX(
+            self, input_ids, image_grid_thw, video_grid_thw, attention_mask
+        )
+    host = (
+        t.cpu() if t is not None else None
+        for t in (input_ids, image_grid_thw, video_grid_thw, attention_mask)
+    )
+    position_ids, deltas = _STOCK_GET_ROPE_INDEX(self, *host)
+    return position_ids.to(input_ids.device), deltas.to(input_ids.device)
+
+
 def install() -> None:
     dit.JoyTransformer3DModel.__call__ = _dit_call
     dit.JoyTransformer3DModel.forward = forward
@@ -387,3 +408,4 @@ def install() -> None:
     dit.JoyTransformer3DModel._compile_regions_spmd_safe = True
     pipeline.JoyImageEditPipeline.create_pipeline_stages = create_pipeline_stages
     ImageEncodingStage.encoding_image_edit = encoding_image_edit
+    Qwen3VLModel.get_rope_index = get_rope_index
