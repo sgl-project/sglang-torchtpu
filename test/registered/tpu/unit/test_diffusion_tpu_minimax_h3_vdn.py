@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as dit
+from sglang.multimodal_gen.runtime.models.dits import minimax_h3_vdn as branch_ops
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
     VDNH3Layout,
     cholesky_spd_inverse,
@@ -247,9 +248,10 @@ class TestTpuHybridCore(CustomTestCase):
 
 
 class TestTpuHybridCompile(CustomTestCase):
-    def test_compiled_attention_leaves_the_branch_eager_and_compiles_once(self):
-        # torch_tpu miscompiles the branch: it runs between compiled graphs. The
-        # prompt length is device data only, so no graph recompiles for it.
+    def test_compiled_attention_stages_the_branch_and_compiles_once(self):
+        # torch_tpu miscompiles the branch whole: it runs between compiled
+        # graphs, a graph per stage. The prompt length is device data only, so
+        # no graph recompiles for it.
         _init_parallel_state()
         attn = _attention()
         with compiler_config.patch(cache_key_tag=""):
@@ -258,7 +260,12 @@ class TestTpuHybridCompile(CustomTestCase):
             region(vdn._rows_to_window),
             region(vdn._window_to_rows),
         )
-        graphs = []
+        graphs, stage_graphs = [], []
+
+        def stage_backend(gm, example_inputs):
+            trace = [n.meta.get("stack_trace") or "" for n in gm.graph.nodes]
+            stage_graphs.append(" ".join(trace))
+            return gm.forward
 
         def backend(gm, example_inputs):
             tensors = [t for t in example_inputs if isinstance(t, torch.Tensor)]
@@ -275,17 +282,31 @@ class TestTpuHybridCompile(CustomTestCase):
                 return module(x, rope_cache=rope, cu_seqlens=cu, max_seqlen=SEQ_LEN)
 
         torch._dynamo.reset()
+        vdn._compiled_branch_stages.cache_clear()
         compiled = torch.compile(attn, backend=backend, dynamic=False)
+        eager_stages = {n: getattr(branch_ops, n) for n in vdn.BRANCH_STAGES}
         counts = []
-        with torch.no_grad():
+        kwargs = {"backend": stage_backend, "dynamic": False}
+        with (
+            torch.no_grad(),
+            patch.object(vdn, "build_torch_compile_kwargs", lambda **_: kwargs),
+        ):
             for text_len in (30, 50, 30):
                 torch.testing.assert_close(run(compiled, text_len), run(attn, text_len))
-                counts.append(len(graphs))
+                counts.append((len(graphs), len(stage_graphs)))
+        vdn._compiled_branch_stages.cache_clear()
         self.assertEqual(counts, [counts[0]] * 3)
+        self.assertEqual(
+            {n: getattr(branch_ops, n) for n in eager_stages}, eager_stages
+        )
+        # frame statistics (text and video), then one each; the features stay eager
+        self.assertEqual(len(stage_graphs), 6)
+        self.assertFalse([g for g in stage_graphs if "in linear_features" in g])
+        self.assertTrue(all(g.strip() for g in stage_graphs))
         ops = [
             [n for n in gm.graph.nodes if n.op == "call_function"] for gm, _ in graphs
         ]
-        # the short conv is the branch's own op
+        # the branch is not in the block's graphs
         self.assertFalse(any("conv" in str(n.target) for g in ops for n in g))
         marked = [
             i

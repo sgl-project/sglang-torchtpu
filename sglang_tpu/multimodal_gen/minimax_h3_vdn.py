@@ -19,9 +19,10 @@ only what is fixed for a video size:
 - Every Ulysses exchange is a lane-dense all-to-all (the frame sums and the
   gate hidden too), and each rank's linear-branch heads are cut and cloned
   once per process, so all ranks run the same program.
-- The linear branch runs eagerly between the compiled graphs of a block:
-  torch_tpu compiles it to wrong values (see ``_linear_branch_eagerly``). The
-  core's parts before and after it keep their collectives in one program each.
+- The linear branch runs between the compiled graphs of a block, one graph
+  per stage: torch_tpu compiles it whole to wrong values (see
+  ``_linear_branch``). The core's parts before and after it keep their
+  collectives in one program each.
 - The delta rule inverts I + A by a Newton-Schulz iteration (matmuls only);
   ``--attention-backend-config '{"vdn_spd_inverse": "cholesky"}'`` keeps the
   core's Cholesky chain.
@@ -33,6 +34,7 @@ host-bounds SDPA path.
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 import torch
 
@@ -52,6 +54,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_output_all_to_all,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.models.dits import minimax_h3_vdn as branch_ops
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
     VDNH3Layout,
     cholesky_spd_inverse,
@@ -59,6 +62,9 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
+)
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    build_torch_compile_kwargs,
 )
 from sglang_tpu.multimodal_gen.tpu_splash_attn import (
     TpuSplashAttentionBackend,
@@ -248,15 +254,46 @@ def _window_softmax(q, k, v, used, *, hybrid, frames, tpf, scale):
     return torch.cat([dense[0, :, :globals_]] + [pieces[f] for f in sorted(pieces)], 1)
 
 
-@torch.compiler.disable
-def _linear_branch_eagerly(branch, layout, q, k, v, beta, gate, frame_mean, *text):
-    """``branch`` on its video rows, eagerly between compiled block graphs.
+# The branch's stages, compiled one graph each: torch_tpu compiles each alone
+# to the eager values, but not chained (the features into the frame statistics:
+# rel_l2 0.44 at 1344x768). linear_features stays eager: compiled at the video
+# shape it moves from the eager values (rel_l2 0.0028), which the (I + A)
+# inverse then grows to 0.0058 in the branch output (CDK j-aa3608d0).
+BRANCH_STAGES = (
+    "frame_statistics",
+    "delta_factor_apply",
+    "run_boundary_scans",
+    "gather_linear_state",
+    "linear_epilogue",
+)
 
-    torch_tpu (0.2.1.dev20261028) compiles the branch to wrong values: rel_l2
-    0.56 against float32 at 1344x768 (block 0, both inverses), 3e-3 eager; the
-    window softmax compiles correctly. The output is a fresh tensor. Drop the
-    eager island once a compiled branch matches it on TPU.
+
+@functools.cache
+def _compiled_branch_stages() -> dict:
+    kwargs = build_torch_compile_kwargs(mode=None)
+    return {n: torch.compile(getattr(branch_ops, n), **kwargs) for n in BRANCH_STAGES}
+
+
+@torch.compiler.disable
+@torch._dynamo.config.patch(recompile_limit=64)
+def _linear_branch(branch, layout, staged, *inputs):
+    """``branch`` on its video rows between compiled block graphs, its stages
+    compiled one graph each when ``staged`` (the block is compiled).
+
+    torch_tpu (0.2.1.dev20261028) compiles the whole branch to wrong values:
+    rel_l2 0.56 against float32 at 1344x768 (block 0, both inverses), 3e-3
+    eager. The output is a fresh tensor.
     """
+    stages = _compiled_branch_stages() if staged else {}
+    eager = {name: getattr(branch_ops, name) for name in stages}
+    vars(branch_ops).update(stages)
+    try:
+        return _run_branch(branch, layout, *inputs)
+    finally:
+        vars(branch_ops).update(eager)
+
+
+def _run_branch(branch, layout, q, k, v, beta, gate, frame_mean, *text):
     text_k, text_v, text_beta = text
     return branch(
         q_raw=q,
@@ -411,10 +448,11 @@ def tpu_hybrid_attention_core(
             f"forward context (got {type(meta).__name__})"
         )
     ws = get_ulysses_parallel_world_size() if ulysses_active else 1
-    # Under torch.compile the parts around the eager branch are graphs of their
+    # Under torch.compile the parts around the branch are graphs of their
     # own; spmd_parts keep each one's collectives in one torch_tpu program.
     parts = attention._attention_impl.spmd_parts
-    if parts is None or not torch.compiler.is_compiling():
+    staged = parts is not None and torch.compiler.is_compiling()
+    if not staged:
         parts = (_rows_to_window, _window_to_rows)
     softmax, weight, src, branch_inputs = parts[0](
         attention, meta, x, q, k, v, softmax_gate, beta, gate_hidden,
@@ -423,7 +461,7 @@ def tpu_hybrid_attention_core(
     linear = None
     if branch_inputs is not None:
         branch = attention.hybrid.linear_attention
-        linear = _linear_branch_eagerly(branch, meta.video_layout, *branch_inputs)
+        linear = _linear_branch(branch, meta.video_layout, staged, *branch_inputs)
     return parts[1](softmax, weight, src, linear, ws)
 
 
