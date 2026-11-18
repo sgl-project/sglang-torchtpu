@@ -729,13 +729,15 @@ def _validate_dsa(server_args) -> None:
             f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
         )
     _validate_kpool_raw_ring(cfg)
-    _validate_mla_kv_shards(cfg)
+    _validate_mla_kv_shards(cfg, hf_config)
 
 
-def _validate_mla_kv_shards(cfg) -> None:
-    """A sparse-MLA latent cache sharded by page (SGLANG_TPU_DSA_MLA_KV_SHARDS):
-    groups of consecutive attention-TP ranks, attention TP only, and nothing
-    that addresses the latent cache by page id or decodes outside the backend."""
+def _validate_mla_kv_shards(cfg, hf_config) -> None:
+    """A sparse-MLA latent cache split inside every page (SGLANG_TPU_DSA_MLA_KV_SHARDS):
+    groups of consecutive attention-TP ranks, attention TP only, a page that
+    splits into whole RoPE rows and indexer pools, one compiled program per
+    rank, and nothing that reads the latent cache outside the sparse backend."""
+    from sglang.srt.configs.model_config import get_dsa_index_kpool
     from sglang_tpu.envs import envs as tpu_envs
 
     shards = tpu_envs.SGLANG_TPU_DSA_MLA_KV_SHARDS.get()
@@ -745,7 +747,7 @@ def _validate_mla_kv_shards(cfg) -> None:
     if shards & (shards - 1):
         raise ValueError(
             f"SGLANG_TPU_DSA_MLA_KV_SHARDS={shards} must be a power of two: the "
-            "kernels split page ids with a mask and a shift."
+            "kernels split pages with a mask and a shift."
         )
     if tp % shards or attn_cp > 1 or cfg.attn_dp_size > 1 or cfg.pp_size > 1:
         raise ValueError(
@@ -753,21 +755,31 @@ def _validate_mla_kv_shards(cfg) -> None:
             f"multiple of {shards} ranks (got tp {tp}, attention CP {attn_cp}, "
             f"attention DP {cfg.attn_dp_size}, PP {cfg.pp_size})."
         )
+    unit = shards * max(4, get_dsa_index_kpool(hf_config))  # RoPE row, indexer pool
+    if cfg.page_size and cfg.page_size % unit:
+        raise ValueError(
+            f"SGLANG_TPU_DSA_MLA_KV_SHARDS={shards} needs --page-size a multiple of "
+            f"{unit}: each rank's share of a page holds whole RoPE rows and indexer "
+            f"pools (got {cfg.page_size})."
+        )
     refused = {
-        "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
+        # Both sides would have to split pages the same way; not validated.
         "--disaggregation-mode": cfg.disaggregation_mode != "null",
         "--enable-prefill-cp": cfg.enable_prefill_cp,
+        # Its decode reads every page whole.
         "SGLANG_TPU_GLM_FLASH_MEGAKERNEL": tpu_envs.SGLANG_TPU_GLM_FLASH_MEGAKERNEL.get(),
         # Its window op stores every token on every rank's whole cache.
         "SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT": (
             tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.get()
         ),
+        # A rank's share is a compile-time constant of its program; one shared
+        # program would make every rank attend rank 0's share.
+        "--use-spmd-compile": cfg.use_spmd_compile,
     }
     on = [name for name, active in refused.items() if active]
     if on:
         raise ValueError(
-            f"SGLANG_TPU_DSA_MLA_KV_SHARDS={shards} does not support {', '.join(on)}: "
-            "the sharded latent cache is not addressed by page id."
+            f"SGLANG_TPU_DSA_MLA_KV_SHARDS={shards} does not support {', '.join(on)}."
         )
 
 

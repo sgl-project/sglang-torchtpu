@@ -136,11 +136,12 @@ def _store_step(
     cu_q_lens: jax.Array,
     distribution: jax.Array,
     write_rope: bool = True,
+    kv_shards: tuple[int, int] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Store this step's tokens in the layer's two cache buffers.
 
-    ``write_rope=False`` leaves the rope buffer untouched (see
-    ``update_sparse_mla_kv_cache``).
+    ``write_rope=False`` leaves the rope buffer untouched and ``kv_shards``
+    stores only this rank's offsets (see ``update_sparse_mla_kv_cache``).
     """
     # The pool allocates the buffers without importing the kernels. The writer
     # below checks them against these specs, so a buffer with the wrong shape
@@ -163,6 +164,7 @@ def _store_step(
         nope_spec=nope_spec,
         rope_spec=rope_spec,
         write_rope=write_rope,
+        kv_shards=kv_shards,
     )
 
 
@@ -282,8 +284,8 @@ def sparse_mla_attention_kv_shard(
     q_pe: jax.Array,  # bf16[max_num_tokens, group_heads, 64]
     new_kv_c: jax.Array,  # fp8[max_num_tokens, 512]
     new_k_pe: jax.Array,  # fp8[max_num_tokens, 64]
-    cache_nope: jax.Array,  # u8[shard_pages, page_size, 4, 128]; this rank's pages
-    cache_rope: jax.Array,  # u8[shard_pages, page_size // 4, 4, 128]
+    cache_nope: jax.Array,  # u8[num_pages, page_size // shards, 4, 128]; this rank's share
+    cache_rope: jax.Array,  # u8[num_pages, page_size // shards // 4, 4, 128]
     kv_lens: jax.Array,
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]; allocator page ids
     cu_q_lens: jax.Array,
@@ -298,31 +300,26 @@ def sparse_mla_attention_kv_shard(
     zero_rope: bool = False,
     gather_chunk_tokens: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """``sparse_mla_attention_fused`` on a latent cache sharded by page
-    (mla_sparse/kv_shard.py): store the step's tokens that land on this rank's
-    pages, then attend this rank's candidates (``kpool`` consecutive entries
-    of a row share a page).
+    """``sparse_mla_attention_fused`` on a latent cache split inside every page
+    (mla_sparse/kv_shard.py): store the step's tokens at this rank's offsets,
+    then attend this rank's candidates (``kpool`` consecutive entries of a row
+    share a pool, which lies inside one rank's offsets).
 
     Returns ``(output, lse, cache_nope, cache_rope)``: the partial output
     ``[max_num_tokens, group_heads, 512]`` normalized over this rank's
     candidates, and its f32 natural-log sum (``-inf`` with no candidate).
     """
-    from sglang_tpu.attention.pallas.mla_sparse import kv_shard
-
-    # Writers skip other ranks' pages; the reader keeps this rank's candidates.
-    store_pages = kv_shard.mla_page_indices(
-        page_indices, shards=shards, role=role, oob_page=kv_cache_utils.OOB_PAGE
-    )
     cache_nope, cache_rope = _store_step(
         cache_nope,
         cache_rope,
         new_kv_c,
         new_k_pe,
         kv_lens,
-        store_pages,
+        page_indices,
         cu_q_lens,
         distribution,
         write_rope=not zero_rope,
+        kv_shards=(shards, role),
     )
     out, lse = sparse_ragged_paged_attention(
         jnp.concatenate([ql_nope, q_pe], axis=-1),

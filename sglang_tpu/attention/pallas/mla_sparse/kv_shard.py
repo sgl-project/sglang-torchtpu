@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sparse MLA KV sharded by page across a group of attention ranks.
+"""Sparse MLA latent cache split inside every page across a group of attention ranks.
 
-Page id ``g`` of the MLA latent cache lives only on the rank with role
-``g % shards``, at physical page ``g // shards``; the DSA indexer caches stay
-whole on every rank. A rank attends the candidates on its own pages for every
-head of its group and returns a partial output with its log-sum-exp; the
-group merges the partials in FP32. The page ids are the allocator's, so the
-scheduler and the radix tree see no change.
+With ``shards`` ranks and ``page_size`` tokens per page, rank ``role`` holds token
+offsets ``[role * sub, (role + 1) * sub)`` of every page, ``sub = page_size //
+shards``, at row ``offset - role * sub`` of that page; the DSA indexer caches
+stay whole on every rank. Every buffer is indexed by the allocator's page id, so
+the scheduler, the radix tree and page copies (host tier) see no change. A rank
+attends the candidates at its own offsets for every head of its group and
+returns a partial output with its log-sum-exp; the group merges the partials in
+FP32.
 """
 
 from __future__ import annotations
@@ -15,17 +17,17 @@ import jax
 import jax.numpy as jnp
 
 
-def mla_page_indices(
-    page_indices: jax.Array, *, shards: int, role: int | jax.Array, oob_page: int
-) -> jax.Array:
-    """This rank's physical MLA page for each page id; ``oob_page`` where another
-    rank owns the page, so writers skip it."""
-    return jnp.where(page_indices % shards == role, page_indices // shards, oob_page)
-
-
-def mla_shard_pages(num_pages: int, shards: int) -> int:
-    """Physical MLA pages one rank allocates for ``num_pages`` page ids."""
-    return -(-num_pages // shards)
+def own_page_slots(
+    page: jax.Array,
+    slot: jax.Array,
+    *,
+    sub_page: int,
+    role: int | jax.Array,
+    oob_page: int,
+) -> tuple[jax.Array, jax.Array]:
+    """A token's (page, offset in the page) -> (page, row in this rank's share);
+    ``oob_page`` where another rank owns the offset, so writers skip it."""
+    return jnp.where(slot // sub_page == role, page, oob_page), slot % sub_page
 
 
 def compact_left(values: jax.Array, keep: jax.Array) -> jax.Array:

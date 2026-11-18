@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sparse MLA with the latent cache sharded by page across a group of ranks.
+"""Sparse MLA with the latent cache split inside every page across a group of ranks.
 
 The ops behind ``TpuPallasSparseMlaAttnBackend`` when
 ``SGLANG_TPU_DSA_MLA_KV_SHARDS`` > 1 (layout and math: attention/pallas/
 mla_sparse/kv_shard.py). Each rank of a group gathers the group's queries,
-keeps the top-k candidates on its own pages, attends them for every head of
-the group with the log-sum-exp, and the group merges the partials in FP32,
-each rank keeping its own heads.
+keeps the top-k candidates at its own offsets of each page, attends them for
+every head of the group with the log-sum-exp, and the group merges the
+partials in FP32, each rank keeping its own heads.
 """
 
 # custom_jax_kernel reads the op wrappers' jax.Array annotations as objects: no
@@ -19,7 +19,7 @@ _OPS: dict = {}
 
 
 def build_kv_shard_attention_op(*, zero_rope: bool, gather_chunk_tokens: int):
-    """Torch op: store this step's tokens on their owners' pages, then attend
+    """Torch op: store this step's tokens at this rank's offsets, then attend
     this rank's candidates of the indexer's rows; returns (output
     bf16[T, Hg, 512], lse f32[T, Hg])."""
     key = ("attention", zero_rope, gather_chunk_tokens)
