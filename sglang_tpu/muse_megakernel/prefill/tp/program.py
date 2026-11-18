@@ -56,24 +56,20 @@ def build_forward(c: PFConfig, axis: str = "model"):
         r: post_moe_call(c, POST_MOE_TILE, next_rope=r, axis=axis)
         for r in (True, False, None)
     }
-    # the refkernel's expert-TP prefill tuning; None: the SGLANG_TPU_FUSED_RS_* envs
-    fused_rs = (
-        FusedRsOptions(
-            staging_slots=10,
-            row_loop_unroll=8,
-            etp_skip_out_zero=True,
-            etp_tiled_reduce=True,
-            etp_fused_combine=True,
-            etp_local_rows=True,
-            etp_pair_exchange=True,
-            pair_fwd_psum=True,
-            pair_fast_issue=True,
-            pair_scatter_combine=True,
-            direct_stage=2,
-            weight_pingpong=True,
-        )
-        if c.opt
-        else None
+    # the refkernel's expert-TP prefill tuning
+    fused_rs = FusedRsOptions(
+        staging_slots=10,
+        row_loop_unroll=8,
+        etp_skip_out_zero=True,
+        etp_tiled_reduce=True,
+        etp_fused_combine=True,
+        etp_local_rows=True,
+        etp_pair_exchange=True,
+        pair_fwd_psum=True,
+        pair_fast_issue=True,
+        pair_scatter_combine=True,
+        direct_stage=2,
+        weight_pingpong=True,
     )
 
     def attention(l, q, kvs, kv_pool, kv_lens, pf, psw, cu_q, dist):
@@ -93,12 +89,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
             v_scale=1.0,
             kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
             # no running max: Muse's per-head RMS-normed q and k bound the scores
-            no_max=c.opt or None,
-            skip_pad_q=c.opt or None,
-            skip_pad_q_group=PREFILL_RPA_SKIP_PAD_Q_GROUP if c.opt else None,
-            prefill_bq_bkv=(
-                PREFILL_RPA_SWA_BLOCKS if c.opt and not is_global else None
-            ),
+            no_max=True,
+            skip_pad_q=True,
+            skip_pad_q_group=PREFILL_RPA_SKIP_PAD_Q_GROUP,
+            prefill_bq_bkv=None if is_global else PREFILL_RPA_SWA_BLOCKS,
         )
 
     def moe(l, xe, ids, tw, experts, group_offset, smalls_l):

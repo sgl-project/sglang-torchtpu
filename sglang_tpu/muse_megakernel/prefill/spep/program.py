@@ -140,12 +140,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
             v_scale=1.0,
             kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
             # no running max: Muse's per-head RMS-normed q and k bound the scores
-            no_max=c.opt or None,
-            skip_pad_q=c.opt or None,
-            skip_pad_q_group=PREFILL_RPA_SKIP_PAD_Q_GROUP if c.opt else None,
-            prefill_bq_bkv=(
-                PREFILL_RPA_SWA_BLOCKS if c.opt and not is_global else None
-            ),
+            no_max=True,
+            skip_pad_q=True,
+            skip_pad_q_group=PREFILL_RPA_SKIP_PAD_Q_GROUP,
+            prefill_bq_bkv=None if is_global else PREFILL_RPA_SWA_BLOCKS,
         )
 
     def route(ffn, wrouter, sm):

@@ -447,7 +447,7 @@ POST_MOE_TILE = 128
 ROW_ALIGN = POST_MOE_TILE
 # the SP program has no post_moe tiling: rows split evenly over tp ranks, 2+ rows each
 SP_ROW_ALIGN = 16
-# Batched RPA knobs the programs pass under PFConfig.opt: padded-query skip group and the
+# Batched RPA knobs the prefill programs pass: padded-query skip group and the
 # sliding-window layers' (bq, bkv) prefill blocks.
 PREFILL_RPA_SKIP_PAD_Q_GROUP = 256
 PREFILL_RPA_SWA_BLOCKS = (512, 512)
@@ -466,9 +466,6 @@ class PFConfig(MuseGeometry, frozen=True, kw_only=True):
     expert_kinds: tuple = ()
     # SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT: experts / pool / unpool in decode EP's layout
     sp_ep_layout: bool = False
-    # SGLANG_TPU_MUSE_MK_PREFILL_OPT: RPA / fused-RS calls take the tuned prefill knobs
-    # explicitly; off, they read the global SGLANG_TPU_RPA_* / SGLANG_TPU_FUSED_RS_* envs.
-    opt: bool = True
 
     def validate(self) -> "PFConfig":
         if self.tp != PREFILL_TP:
