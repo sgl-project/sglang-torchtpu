@@ -80,9 +80,9 @@ def shard_deepseek_nextn_eh_proj(
         return result
 
     parallel = get_parallel()
-    dp_attn = is_dp_attention_enabled()
-    tp_size = parallel.attn_tp_size if dp_attn else parallel.tp_size
-    tp_rank = parallel.attn_tp_rank if dp_attn else parallel.tp_rank
+    sub_tp = is_dp_attention_enabled() or getattr(parallel, "attn_cp_size", 1) > 1
+    tp_size = parallel.attn_tp_size if sub_tp else parallel.tp_size
+    tp_rank = parallel.attn_tp_rank if sub_tp else parallel.tp_rank
     if tp_size <= 1 or eh_proj.out_features % tp_size != 0:
         return result
 
@@ -94,6 +94,6 @@ def shard_deepseek_nextn_eh_proj(
             prefix=add_prefix("eh_proj", prefix),
             tp_rank=tp_rank,
             tp_size=tp_size,
-            use_attn_tp_group=dp_attn,
+            use_attn_tp_group=sub_tp,
         )
     return result

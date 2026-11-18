@@ -186,6 +186,22 @@ class TestColumnParallelMtpFusionProj(CustomTestCase):
             hook_shard_eh_proj(None, model_dp8, prefix="model")
         self.assertIs(model_dp8.eh_proj, orig_linear)
 
+        # PCP (attn_cp_size > 1) with attn_tp_size == 1: distinct zigzag rows, skip.
+        model_cp8 = _make_stub_model(64, 32, dtype=torch.bfloat16)
+        orig_cp_linear = model_cp8.eh_proj
+        cp_par = _parallel(tp_size=8, attn_tp_size=1)
+        cp_par.attn_cp_size = 8
+        with (
+            mock.patch.object(
+                mtp_fusion_proj, "is_dp_attention_enabled", return_value=False
+            ),
+            mock.patch.object(
+                mtp_fusion_proj, "get_parallel", return_value=cp_par
+            ),
+        ):
+            hook_shard_eh_proj(None, model_cp8, prefix="model")
+        self.assertIs(model_cp8.eh_proj, orig_cp_linear)
+
         # DP2 x AttnTP4 -> shard 4-way within attn_tp_group, gather on attn_tp_group.
         hidden = 16
         full = nn.Linear(2 * hidden, hidden, bias=False, dtype=torch.float32)
