@@ -227,11 +227,13 @@ def sparse_mla_attention_fused(
     if (
         qblock_kpool
         and query_block is not None
-        and ql_nope.shape[0] >= QBLOCK_MIN_TOKENS
-        and pages_per_seq <= QBLOCK_MAX_PAGES_PER_SEQ
-        # One 32-bit selection word per page: page_size // kpool pools.
-        and cache_nope.shape[1] // qblock_kpool == 32
-        and topk_indices.shape[1] % qblock_kpool == 0
+        and qblock_kpool_supported(
+            ql_nope.shape[0],
+            pages_per_seq,
+            cache_nope.shape[1],
+            qblock_kpool,
+            topk_indices.shape[1],
+        )
     ):
         # Rows from the pooled indexer (pool size qblock_kpool): one program per
         # block of queries reads the union of their pages once.
@@ -343,6 +345,20 @@ def sparse_mla_attention_kv_shard(
     return out[..., :NOPE_DIM], lse, cache_nope, cache_rope
 
 
+def qblock_kpool_supported(
+    num_tokens: int, pages_per_seq: int, page_size: int, kpool: int, width: int
+) -> bool:
+    """Whether a pooled-indexer batch fits the query-blocked kernel's shapes
+    (sparse_mla_attention_fused also needs a query block that fits VMEM)."""
+    return (
+        num_tokens >= QBLOCK_MIN_TOKENS
+        and pages_per_seq <= QBLOCK_MAX_PAGES_PER_SEQ
+        # One 32-bit selection word per page: page_size // kpool pools.
+        and page_size // kpool == 32
+        and width % kpool == 0
+    )
+
+
 def qblock_tokens_supported(
     num_tokens: int, pages_per_seq: int, page_size: int
 ) -> bool:
@@ -372,6 +388,8 @@ def sparse_mla_prefill_window(
     *,
     sm_scale: float,
     k_scale: float,
+    gather_chunk_tokens: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+    zero_rope: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Store every token of the step, then attend one window of it.
 
@@ -381,7 +399,8 @@ def sparse_mla_prefill_window(
     window)``: each request keeps its slot, with its tokens inside the window.
     Each (token, head) then goes through the per-query path of
     ``sparse_mla_attention_fused`` as it does there: the same gathered cache
-    rows, mask and softmax.
+    rows, mask and softmax. ``gather_chunk_tokens`` and ``zero_rope`` are
+    that op's.
 
     Returns ``(output, cache_nope, cache_rope)``: ``[window, all heads, 512]``
     and the two updated buffers.
@@ -395,6 +414,7 @@ def sparse_mla_prefill_window(
         page_indices,
         cu_q_lens,
         distribution,
+        write_rope=not zero_rope,
     )
     out = sparse_ragged_paged_attention(
         jnp.concatenate([ql_nope, q_pe], axis=-1),
@@ -408,8 +428,9 @@ def sparse_mla_prefill_window(
         k_scale=k_scale,
         cache_layout=TENSORCORE_CACHE_LAYOUT,
         gather_and_attention_chunk_size=min(
-            DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE, max(64, ql_nope.shape[0])
+            gather_chunk_tokens, max(64, ql_nope.shape[0])
         ),
+        gather_rope=not zero_rope,
     )
     return out[..., :NOPE_DIM], cache_nope, cache_rope
 

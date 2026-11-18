@@ -123,8 +123,8 @@ class TpuEnvs:
     # Sparse MLA, on top of the indexer token split: each rank attends only the
     # rows it selected, with every head, so each selected cache row is gathered
     # by one rank instead of all; a Pallas all-to-all (kernels/oneshot_all_to_all.py)
-    # moves queries and outputs, and the rows' all-reduce is skipped. Plain DSA
-    # prefill batches of the per-query kernel; attention TP must span the world.
+    # moves queries and outputs, and the rows' all-reduce is skipped. Prefill
+    # batches of the per-query kernel; attention TP must span the world.
     SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT = EnvBool(False)
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
