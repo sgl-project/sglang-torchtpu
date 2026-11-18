@@ -96,7 +96,11 @@ def _decode_main(words, scales):
 # a replay minimum hiding part of the window, an empty request, a long prefix.
 _PREFILL = ((0, 70, 0), (301, 45, 200), (50, 0, 0), (900, 20, 0))
 _DECODE = ((5, 1, 0), (130, 1, 0), (700, 1, 0), (1500, 1, 0))
-_PADDED_TOKENS = {_PREFILL: 144, _DECODE: 8}
+# Over 512 tokens the main records are gathered in chunks; 1152 rows end in a
+# partial chunk.
+_LONG_PREFILL = ((0, 700, 0), (500, 420, 300), (1200, 30, 0), (60, 0, 0))
+_PADDED_TOKENS = {_PREFILL: 144, _DECODE: 8, _LONG_PREFILL: 1152}
+_PHASES = {"prefill": _PREFILL, "decode": _DECODE, "long_prefill": _LONG_PREFILL}
 
 
 class _Case:
@@ -339,9 +343,9 @@ def tpu_ops():
 
 @requires_tpu
 @pytest.mark.parametrize("ratio", [0, 1, 2])
-@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("phase", list(_PHASES))
 def test_attention_matches_dense_reference(tpu_ops, phase, ratio):
-    case = _Case(_PREFILL if phase == "prefill" else _DECODE, ratio, seed=ratio)
+    case = _Case(_PHASES[phase], ratio, seed=ratio)
     inputs = _inputs(case)
     out, swa_records = _step(case, inputs)
     _check(case, inputs, out, swa_records)
