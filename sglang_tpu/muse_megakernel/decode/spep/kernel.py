@@ -20,6 +20,8 @@ def ep_megakernel_call(cfg: MKConfig, axis: str = "model", *, arm: EPArm):
     smalls rows) and the pooled width in kperm order (wpool's columns, wpool_s, pre_expert_w).
     An arm that cannot serve the step raises."""
     cfg = ep_mk_config(cfg)
+    # callers outside sglang (anvil cases) pass the arm's string value
+    arm = EPArm(arm)
     if arm is EPArm.A2A:
         hook: EPExperts | EPGatherExperts = EPExperts(cfg)
     elif arm is EPArm.GATHER:
