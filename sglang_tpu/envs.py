@@ -633,6 +633,10 @@ class TpuEnvs:
     # SP program reads decode EP's weight layout, so prefill SP and decode EP share one copy of
     # the weights (w13 then runs unfused: silu * up after the gmm).
     SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT = EnvBool(False)
+    # Prefill programs: batched RPA (NO_MAX, SKIP_PAD_Q group 256, SWA blocks 512:512) and the
+    # TP program's fused-RS MoE take the tuned knobs explicitly, leaving the global envs to
+    # other callers. 0: the prefill calls read those envs (stock kernels when unset).
+    SGLANG_TPU_MUSE_MK_PREFILL_OPT = EnvBool(True)
     # Kernel-level weight layouts (anvil / numerics only); serving raises on them.
     SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
     SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)

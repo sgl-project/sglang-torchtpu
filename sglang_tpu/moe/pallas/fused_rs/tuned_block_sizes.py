@@ -6,7 +6,6 @@ import logging
 
 import jax.numpy as jnp
 
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.pallas_export import get_pallas_tpu_device_kind
 
 from .v2_fused_rs_tuned_block_sizes import (
@@ -58,6 +57,7 @@ def get_fused_rs_tuned_block_sizes(
     default_block_sizes: tuple[int, int, int, int, int, int, int],
     fuse_act: str | None = None,
     fp8_direct_write: bool = False,
+    local_rows: bool = False,
 ) -> tuple[int, int, int, int, int, int, int]:
     device_name = _device_kind()
     dtype_key = _dtype_key(lhs_dtype, rhs_dtype)
@@ -93,7 +93,7 @@ def get_fused_rs_tuned_block_sizes(
         except KeyError:
             pass
 
-    if not fp8_direct_write and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS.get():
+    if not fp8_direct_write and local_rows:
         try:
             return FUSED_RS_TUNED_BLOCK_SIZES_ETP_LOCAL_ROWS[device_name][dtype_key][
                 joint_key

@@ -732,6 +732,10 @@ def calculate_block_sizes(
         "attention_scope",
         "rpa_cases",
         "out_head_norm_eps",
+        "no_max",
+        "skip_pad_q",
+        "skip_pad_q_group",
+        "prefill_bq_bkv",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -772,6 +776,10 @@ def ragged_paged_attention(
     attention_scope: configs.AttentionScope | int = configs.AttentionScope.FULL,
     rpa_cases: tuple[configs.RpaCase, ...] | configs.RpaCase | None = None,
     out_head_norm_eps: float | None = None,
+    no_max: bool | None = None,
+    skip_pad_q: bool | None = None,
+    skip_pad_q_group: int | None = None,
+    prefill_bq_bkv: tuple[int, int] | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -844,6 +852,15 @@ def ragged_paged_attention(
             None); a case whose ``distribution`` range is empty can be skipped.
         out_head_norm_eps: When set, each head's output is stored RMS-normalized
             (weightless, this eps) after rounding to out_dtype.
+        no_max: Softmax without the running max (bounded scores only); None reads
+            SGLANG_TPU_RPA_NO_MAX.
+        skip_pad_q: Skip a partial q block's padded query groups; None reads
+            SGLANG_TPU_RPA_SKIP_PAD_Q.
+        skip_pad_q_group: Tokens per skipped group; None reads
+            SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP.
+        prefill_bq_bkv: (bq, bkv) prefill blocks overriding the search, unless
+            prefill_block_sizes is given; None reads SGLANG_TPU_RPA_PREFILL_BLOCKS
+            (SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS with a sliding window).
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -926,12 +943,18 @@ def ragged_paged_attention(
         skip_full_tile_mask=envs.SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK.get(),
         # The sink term and the LSE read the running max.
         no_max=(
-            envs.SGLANG_TPU_RPA_NO_MAX.get()
+            (envs.SGLANG_TPU_RPA_NO_MAX.get() if no_max is None else no_max)
             and attention_sink is None
             and not return_lse
         ),
-        skip_pad_q=envs.SGLANG_TPU_RPA_SKIP_PAD_Q.get(),
-        skip_pad_q_group=envs.SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP.get(),
+        skip_pad_q=(
+            envs.SGLANG_TPU_RPA_SKIP_PAD_Q.get() if skip_pad_q is None else skip_pad_q
+        ),
+        skip_pad_q_group=(
+            envs.SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP.get()
+            if skip_pad_q_group is None
+            else skip_pad_q_group
+        ),
         out_head_norm_eps=out_head_norm_eps,
         # Base-2 m and l would reach the soft cap, the sink term and the LSE.
         exp2_softmax=(
@@ -983,13 +1006,17 @@ def ragged_paged_attention(
         default_decode, default_prefill = calculate_block_sizes(
             model_cfgs, serve_cfgs, vmem_limit_bytes
         )
-    blocks_env = (
-        envs.SGLANG_TPU_RPA_PREFILL_BLOCKS
-        if sliding_window is None
-        else envs.SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS
-    ).get()
-    if prefill_block_sizes is None and blocks_env:
-        bq_sz, bkv_sz = (int(x) for x in blocks_env.split(":"))
+    if prefill_bq_bkv is None:
+        blocks_env = (
+            envs.SGLANG_TPU_RPA_PREFILL_BLOCKS
+            if sliding_window is None
+            else envs.SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS
+        ).get()
+        if blocks_env:
+            bq_env, bkv_env = (int(x) for x in blocks_env.split(":"))
+            prefill_bq_bkv = (bq_env, bkv_env)
+    if prefill_block_sizes is None and prefill_bq_bkv is not None:
+        bq_sz, bkv_sz = prefill_bq_bkv
         prefill_block_sizes = dataclasses.replace(
             default_prefill,
             bq_sz=bq_sz,

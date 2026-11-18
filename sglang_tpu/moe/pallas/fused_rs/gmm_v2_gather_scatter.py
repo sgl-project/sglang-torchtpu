@@ -277,6 +277,7 @@ def inner_kernel(
     _num_k: int | None = None,
     _gm_id: int | None = None,
     _n_id: int | None = None,
+    share_lhs: bool = False,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -296,6 +297,7 @@ def inner_kernel(
         acc_ref: Reference to the accumulator.
         metadata_ref: Reference to the metadata.
         cfgs: GmmConfigs.
+        share_lhs: direct stage loads each LHS block once for a column group.
     """
     # Do not feed an unquantized LHS directly into MXU with a quantized RHS:
     # that mixed-dtype matmul has produced numerically wrong TPU results
@@ -505,8 +507,6 @@ def inner_kernel(
                     if has_gs
                     else None
                 )
-                # Mode 2 loads each LHS block once for the group's column blocks.
-                share_lhs = envs.SGLANG_TPU_FUSED_RS_DIRECT_STAGE.get() == 2
                 n_grp = cols_per_grp // mxu_size
                 for g_col in range(0, rhs_tile_n, cols_per_grp):
                     accs = [

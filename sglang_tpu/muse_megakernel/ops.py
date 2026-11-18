@@ -910,6 +910,7 @@ class MuseMegakernel(torch.nn.Module):
             sp=sp,
             expert_kinds=tuple(self.kinds) if sp else (),
             sp_ep_layout=sp and tpu_envs.SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT.get(),
+            opt=tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_OPT.get(),
         ).validate()
 
     def prefill_callable_for(self, cfg: PFConfig):

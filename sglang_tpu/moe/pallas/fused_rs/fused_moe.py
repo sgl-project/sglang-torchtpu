@@ -20,6 +20,7 @@ ICI traffic without a host roundtrip. Per-expert post-normalization is applied
 before the post-kernel top-k weighted reduction.
 """
 
+import dataclasses
 import functools
 
 import jax
@@ -49,6 +50,42 @@ from sglang_tpu.moe.pallas.fused_rs.utils import (
     get_moe_expert_axis,
 )
 from sglang_tpu.moe.pallas.gmm_v2 import recover_quant_block_size
+
+
+@dataclasses.dataclass(frozen=True)
+class FusedRsOptions:
+    """Fused-RS tuning knobs, one per SGLANG_TPU_FUSED_RS_* env (see envs.py)."""
+
+    staging_slots: int
+    row_loop_unroll: int
+    etp_skip_out_zero: bool
+    etp_tiled_reduce: bool
+    etp_fused_combine: bool
+    etp_local_rows: bool
+    etp_pair_exchange: bool
+    pair_fwd_psum: bool
+    pair_fast_issue: bool
+    pair_scatter_combine: bool
+    direct_stage: int
+    weight_pingpong: bool
+
+    @classmethod
+    def from_env(cls) -> "FusedRsOptions":
+        return cls(
+            staging_slots=tpu_envs.SGLANG_TPU_FUSED_RS_STAGING_SLOTS.get(),
+            row_loop_unroll=tpu_envs.SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL.get(),
+            etp_skip_out_zero=tpu_envs.SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO.get(),
+            etp_tiled_reduce=tpu_envs.SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE.get(),
+            etp_fused_combine=tpu_envs.SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE.get(),
+            etp_local_rows=tpu_envs.SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS.get(),
+            etp_pair_exchange=tpu_envs.SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE.get(),
+            pair_fwd_psum=tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_FWD_PSUM.get(),
+            pair_fast_issue=tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_FAST_ISSUE.get(),
+            pair_scatter_combine=tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_SCATTER_COMBINE.get(),
+            direct_stage=tpu_envs.SGLANG_TPU_FUSED_RS_DIRECT_STAGE.get(),
+            weight_pingpong=tpu_envs.SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG.get(),
+        )
+
 
 # ============================================================================
 # SMEM safety guard
@@ -151,6 +188,7 @@ def _pair_post_combine(
     chunk_size: int,
     topk: int,
     hidden_size: int,
+    fused_scatter: bool,
 ) -> jax.Array:
     """[chunk, hidden]: sum the source blocks, post-expert norm, top-k weighted sum.
 
@@ -158,7 +196,6 @@ def _pair_post_combine(
     then token-sorted).
     """
     rows = chunk_size * topk
-    fused_scatter = tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_SCATTER_COMBINE.get()
     if fused_scatter:
         # The owned rows are exactly this rank's (token, slot) pairs.
         local_topk = jax.lax.dynamic_slice_in_dim(
@@ -246,12 +283,15 @@ def moe_gmm_local_rs_nodedup(
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
+    options: FusedRsOptions | None = None,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
     Sends every row to its (local_row, topk_slot) slot via ICI direct-write,
     then applies topk weights and reduces over the top_k dim post-kernel.
+    options: tuning knobs; None reads the SGLANG_TPU_FUSED_RS_* envs.
     """
+    opt = FusedRsOptions.from_env() if options is None else options
     num_tokens = hidden_states_local.shape[0]
     # Rank-4 weights stack layers (Muse megakernel expert groups): group_offset[1] picks one.
     if w1.ndim == 4 and group_offset.shape[0] < 2:
@@ -301,7 +341,7 @@ def moe_gmm_local_rs_nodedup(
         and ep_size % 2 == 0
         and ep_size >= 4
         and not fp8_direct_write
-        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE.get()
+        and opt.etp_pair_exchange
     )
     if pair_exchange:
         # An out-of-range id (the Muse router's NaN-score token) would drop out of
@@ -337,11 +377,8 @@ def moe_gmm_local_rs_nodedup(
         )
     size_m = lhs_indices.shape[0]
     _assert_fused_rs_smem_safe(fused_rs_smem_rows(size_m, ep_size, expert_tp))
-    tiled_output = (
-        expert_tp
-        and not fp8_direct_write
-        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE.get()
-    )
+    local_rows = expert_tp and opt.etp_local_rows
+    tiled_output = expert_tp and not fp8_direct_write and opt.etp_tiled_reduce
 
     # Compute local row range [local_start, local_end) without per-row source
     # materialization. Avoids the heavy ``jnp.repeat -> scatter_add``.
@@ -384,6 +421,7 @@ def moe_gmm_local_rs_nodedup(
         ),
         act_fn=activation,
         fp8_direct_write=fp8_direct_write,
+        local_rows=local_rows,
     )
     tile_m = block_sizes.tile_m
     # Every device must execute the same padded GM loop. Use a static upper
@@ -431,14 +469,16 @@ def moe_gmm_local_rs_nodedup(
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
         fp4_w4a16=fp4_w4a16,
-        local_rows=expert_tp and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS.get(),
+        local_rows=local_rows,
         tiled_output=tiled_output,
-        skip_out_zero=expert_tp
-        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO.get(),
-        row_loop_unroll=tpu_envs.SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL.get(),
-        staging_slots=tpu_envs.SGLANG_TPU_FUSED_RS_STAGING_SLOTS.get(),
+        skip_out_zero=expert_tp and opt.etp_skip_out_zero,
+        row_loop_unroll=opt.row_loop_unroll,
+        staging_slots=opt.staging_slots,
         pair_exchange=pair_exchange,
-        direct_stage=tpu_envs.SGLANG_TPU_FUSED_RS_DIRECT_STAGE.get(),
+        direct_stage=opt.direct_stage,
+        weight_pingpong=opt.weight_pingpong,
+        pair_fwd_psum=opt.pair_fwd_psum,
+        pair_fast_issue=opt.pair_fast_issue,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -463,11 +503,12 @@ def moe_gmm_local_rs_nodedup(
             chunk_size=chunk_size,
             topk=topk,
             hidden_size=hidden_size,
+            fused_scatter=opt.pair_scatter_combine,
         )
     if (
         expert_tp
         and post_expert_norm_weight is not None
-        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE.get()
+        and opt.etp_fused_combine
         and supports_fused_post_combine(
             out_buf, chunk_size, post_expert_norm_weight.shape[0]
         )
@@ -779,6 +820,7 @@ def fused_moe_func_rs(
 
 
 __all__ = [
+    "FusedRsOptions",
     "fused_moe_func_rs",
     "expert_parallel_gmm_rs",
     "moe_gmm_local_rs_nodedup",

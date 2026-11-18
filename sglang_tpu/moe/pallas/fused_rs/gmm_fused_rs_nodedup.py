@@ -24,7 +24,6 @@ from jax import lax
 from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
     Dimensions,
     FusedDims,
@@ -132,6 +131,7 @@ def _select_fused_rs_block_sizes(
     act_fn: str | None,
     vmem_limit_bytes: int | None = None,
     fp8_direct_write: bool = False,
+    local_rows: bool = False,
 ) -> FusedRsBlockSizes:
     """Deterministic selection of all tile/block sizes for fused_rs.
 
@@ -256,6 +256,7 @@ def _select_fused_rs_block_sizes(
             default_tiles,
             fuse_act=act_fn,
             fp8_direct_write=fp8_direct_write,
+            local_rows=local_rows,
         )
     )
     # --- Step 4b: bound the W1/W2 VMEM buffers by their real element width ---
@@ -547,7 +548,9 @@ def kernel_main_fused_rs(
     skip_out_zero: bool = False,
     row_loop_unroll: int = 1,
     staging_slots: int = 3,
+    weight_pingpong: bool = False,
     direct_stage: bool = False,
+    direct_stage_share_lhs: bool = False,
     pair_exchange: bool = False,
     pair_fwd_psum: bool = False,
     pair_fast_issue: bool = False,
@@ -1018,6 +1021,7 @@ def kernel_main_fused_rs(
             gs_gate_ref=w2_gs_ref,
             gs_up_ref=w2_gs_ref,
             scatter_mode=True,
+            share_lhs=direct_stage_share_lhs,
             _k_id=k_id,
             _num_k=num_k2,
             _gm_id=0,
@@ -1405,7 +1409,7 @@ def kernel_main_fused_rs(
             # expert's are fetched at the start of this tile unless it shares the parity
             # (an expert without rows in between), then they follow the matmuls instead.
             pingpong = (
-                tpu_envs.SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG.get()
+                weight_pingpong
                 and total_w1_steps == 1
                 and total_w2_steps == 1
                 and num_w1_bufs >= 2
@@ -1934,6 +1938,7 @@ def kernel_main_fused_rs_fp8(
     defer_writes: bool = False,
     row_loop_unroll: int = 1,
     staging_slots: int = 3,
+    weight_pingpong: bool = False,
 ):
     """FP8 direct-write wrapper with output refs ordered for pallas_call."""
     return kernel_main_fused_rs(
@@ -2007,6 +2012,7 @@ def kernel_main_fused_rs_fp8(
         defer_writes=defer_writes,
         row_loop_unroll=row_loop_unroll,
         staging_slots=staging_slots,
+        weight_pingpong=weight_pingpong,
     )
 
 
@@ -2082,6 +2088,9 @@ def _pair_exchange_metadata(
         "staging_slots",
         "pair_exchange",
         "direct_stage",
+        "weight_pingpong",
+        "pair_fwd_psum",
+        "pair_fast_issue",
     ],
 )
 def gmm_v2_fused_rs(
@@ -2119,6 +2128,9 @@ def gmm_v2_fused_rs(
     staging_slots: int = 3,
     pair_exchange: bool = False,
     direct_stage: int = 0,
+    weight_pingpong: bool = False,
+    pair_fwd_psum: bool = False,
+    pair_fast_issue: bool = False,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -2134,7 +2146,8 @@ def gmm_v2_fused_rs(
     on-chip into a VMEM ring) to its own and sends the pair sum. The output then holds
     1 + ep_size / 2 receive blocks (self, sibling, one per other chip) in owned-row rank
     order instead of one row per (token, slot, rank).
-    direct_stage: see SGLANG_TPU_FUSED_RS_DIRECT_STAGE.
+    direct_stage, weight_pingpong, pair_fwd_psum, pair_fast_issue: see the
+    SGLANG_TPU_FUSED_RS_* knob of the same name.
 
     Output: (chunk_size * top_k, size_n2) per chip — raw expert contributions.
     Post-kernel reduction applies topk_weights and sums over top_k dim.
@@ -2223,6 +2236,7 @@ def gmm_v2_fused_rs(
         act_fn=act_fn,
         vmem_limit_bytes=vmem_limit_bytes,
         fp8_direct_write=fp8_direct_write,
+        local_rows=local_rows,
     )
     tile_m = block_sizes.tile_m
     # The caller sizes max_num_gm from an independent block-size lookup. A
@@ -2468,6 +2482,7 @@ def gmm_v2_fused_rs(
     max_num_gm_static = size_group + pl.cdiv(meta_rows, tile_m) - 1
     n2_cols = aligned_n2 // num_lanes
     _sls_out = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
+    share_lhs = direct_stage == 2
     direct_stage = (
         direct_stage in (1, 2)
         and not fp8_direct_write
@@ -2723,14 +2738,16 @@ def gmm_v2_fused_rs(
         defer_writes=expert_tp,
         row_loop_unroll=row_loop_unroll,
         staging_slots=staging_slots,
+        weight_pingpong=weight_pingpong,
     )
     # Pair exchange writes every receive row exactly once.
     bf16_kwargs = dict(
         skip_out_zero=(skip_out_zero and expert_tp) or pair_exchange,
         direct_stage=direct_stage,
+        direct_stage_share_lhs=share_lhs,
         pair_exchange=pair_exchange,
-        pair_fwd_psum=tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_FWD_PSUM.get(),
-        pair_fast_issue=tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_FAST_ISSUE.get(),
+        pair_fwd_psum=pair_fwd_psum,
+        pair_fast_issue=pair_fast_issue,
         pair_meta_base=pair_meta_base,
         pair_meta_stride=pair_meta_stride,
     )
