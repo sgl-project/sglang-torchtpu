@@ -7,7 +7,7 @@ MTP verify on the decode megakernel up to 128k of context, the model path beyond
 Then `agentx profile --concurrency $AGENTX_CONC --public-dataset
 semianalysis_cc_traces_weka_062126 --benchmark-duration 3600 ...` against port 30000.
 
-AGENTX_KV_SHARDS=8 splits the sparse-MLA latent cache across the 8 ranks
+MLA_KV_SHARDS=8 splits the sparse-MLA latent cache across the 8 ranks
 (SGLANG_TPU_DSA_MLA_KV_SHARDS): no host tier, and decode on the model path.
 """
 
@@ -30,7 +30,7 @@ BUCKETS = [b for b in (1, 4, 8, 16, 32) if b < MAX_RUNNING] + [MAX_RUNNING]
 # 4,804 / 6,707 / 7,964 / 7,040 with this cap; every step on the kernel at 1M was slower.
 MEGAKERNEL_MAX_LEN = int(os.environ.get("AGENTX_MK_MAX_LEN", 131072))
 # Attention-TP ranks that split the sparse-MLA latent cache by page; 1 keeps it replicated.
-KV_SHARDS = int(os.environ.get("AGENTX_KV_SHARDS", 1))
+KV_SHARDS = int(os.environ.get("MLA_KV_SHARDS", 1))
 # 1M tokens = 13 GB per chip of fp8 DSA KV; two requests' worth of pool. Split eight
 # ways, 9.4M tokens plus 800 KDA checkpoint slots take about the HBM of this pool
 # plus its 144 slots (only 8 was measured).
