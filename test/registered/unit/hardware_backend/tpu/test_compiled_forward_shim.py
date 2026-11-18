@@ -925,6 +925,41 @@ class TestCompiledForwardShim(CustomTestCase):
         torch.testing.assert_close(seen_by_graph[0][:3], embeds)
         torch.testing.assert_close(fb.mm_input_embeds[:3], embeds)
 
+    def test_prompt_logprobs_leave_the_draft_extend_capture_alone(self):
+        """With prompt logprobs on, a target extend runs with FULL capture, but an
+        MTP draft's prompt extend keeps LAST (one row per request): FULL returned
+        every bucket row and broke the draft's per-request seed copy."""
+        seen = []
+
+        def compiled(input_ids, positions, forward_batch, *args, **kwargs):
+            seen.append(forward_batch.capture_hidden_mode)
+            return torch.zeros(8, 4)
+
+        for is_draft, want in (
+            (False, CaptureHiddenMode.FULL),
+            (True, CaptureHiddenMode.LAST),
+        ):
+            with self.subTest(draft=is_draft):
+                seen.clear()
+                policy = DecoderTpuCompilePolicy()
+                if is_draft:
+                    policy.model_runner = SimpleNamespace(
+                        model=SimpleNamespace(),
+                        token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None),
+                        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+                        is_draft_worker=True,
+                    )
+                with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
+                    shim = CompiledForwardShim(compiled, policy=policy)
+                fb = self._forward_batch(
+                    input_ids=torch.arange(8, dtype=torch.int32),
+                    forward_mode=_ForwardModeMock("extend"),
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                )
+                shim(None, None, fb)
+                self.assertEqual(seen, [want])
+                self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.LAST)
+
     def test_recompilation_check_runs_when_forward_raises(self):
         """A compile that raises mid-forward must still be reported."""
         error = torch._dynamo.exc.RecompileError("fail_on_recompile")
