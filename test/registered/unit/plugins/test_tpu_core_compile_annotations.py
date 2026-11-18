@@ -74,8 +74,9 @@ class TestCoreCompileAnnotations(CustomTestCase):
         modules_patch = patch.dict(sys.modules, _fake_policy_module())
         modules_patch.start()
         self.addCleanup(modules_patch.stop)
-        # Only the Qwen3-VL and GLM-5.3 boundaries are under test: hide the other
-        # listed model modules an earlier test may have loaded (restored with sys.modules).
+        # Only the Qwen3-VL and GLM-5.x-Next boundaries are under test: hide the
+        # other listed model modules an earlier test may have loaded (restored
+        # with sys.modules).
         for boundary in core_compile_annotations.CORE_COMPILE_BOUNDARIES:
             if boundary.module not in (QWEN3_VL_MOE, GLM5_NEXT):
                 sys.modules.pop(boundary.module, None)
