@@ -140,6 +140,27 @@ class TestHostControlPortRace(RaidenHostTransferFixture, CustomTestCase):
         self.assertGreater(ports[0], 31000 + 8 * 6)
         self.assertLess(base + 7 * 2 + 1, 32768)
 
+    def test_each_stage_of_a_single_host_pipeline_gets_its_own_ports(self) -> None:
+        """Every stage is TP rank 0 on the same host; without the stage in the
+        port they would all ask for the same two."""
+        ports = set()
+        for stage in range(8):
+            with (
+                patch(
+                    "sglang_tpu.raiden_transfer.get_tensor_model_parallel_rank",
+                    return_value=0,
+                ),
+                patch(
+                    "sglang_tpu.raiden_transfer._pipeline_stage_offset",
+                    return_value=stage,
+                ),
+                patch.object(raiden_transfer, "_host_pools_built", 0),
+            ):
+                for _ in range(raiden_transfer.HOST_POOLS_PER_RANK):
+                    ports.add(next(raiden_transfer.host_control_port_candidates()))
+        self.assertEqual(len(ports), 8 * raiden_transfer.HOST_POOLS_PER_RANK)
+        self.assertLess(max(ports), 32768)
+
     def test_each_host_pool_of_a_rank_gets_its_own_port(self) -> None:
         """The native server binds a port another manager of the process already
         serves; a hybrid model's full and window pools must not share one."""

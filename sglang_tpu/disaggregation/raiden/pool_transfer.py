@@ -1210,9 +1210,12 @@ class RaidenPoolTransfer:
                 ),
             )
         endpoint = NetworkAddress(mgr.local_ip, mgr.rank_port).to_tcp()
-        consumer = json.dumps(
-            dict(attn_tp_size=mgr.attn_tp_size, attn_tp_rank=mgr.attn_tp_rank)
-        ).encode()
+        consumer = dict(attn_tp_size=mgr.attn_tp_size, attn_tp_rank=mgr.attn_tp_rank)
+        offload = getattr(mgr, "dram_offload_channel", None)
+        if offload is not None:
+            # The KV offload to decode DRAM names the stored prefix it offers.
+            consumer.update(offload.pipeline_consumer_fields(room))
+        consumer = json.dumps(consumer).encode()
         for info in infos:
             peer = NetworkAddress(info["rank_ip"], int(info["rank_port"])).to_tcp()
             self._send(
@@ -1311,6 +1314,11 @@ class RaidenPoolTransfer:
         mgr._require_frames(msg, MessageTag.PIPELINE_REQ, 4)
         if not self.producer:
             raise ValueError("A pipeline request must target a prefill worker")
+        offload = getattr(mgr, "dram_offload_channel", None)
+        if offload is not None:
+            # Before the request counts: an offered prefix holds the room in
+            # bootstrap until its recall settles.
+            offload.on_pipeline_request(room, msg[2].decode(), json.loads(msg[3]))
         self.replies.setdefault(room, {})[msg[2].decode()] = json.loads(msg[3])
         for part in self.early.get(room, {}).get("parts", []):
             self._reply_part(room, part)

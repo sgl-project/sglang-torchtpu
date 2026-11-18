@@ -16,6 +16,11 @@ A hybrid sliding-window model moves two page sets, each through its own host
 pool: the full-attention KV and the last sliding window, which ends where the
 full pages end. A recall takes the whole offered window or nothing.
 
+A pipeline-parallel prefill's stages hold other block layouts than a
+tensor-parallel decode rank. Such a decode keeps each stage's pages in a pool
+of that stage's layout (``bind_stage_pools``): a stage pushes to and pulls
+from the rank that hosts its pool, with the same messages marked by stage.
+
 A pair that cannot offload fails its requests with the reason instead of
 running without the offload (``peer_switch_mismatch``, ``resharding_refusal``).
 """
@@ -38,6 +43,13 @@ from typing import (
 import msgspec
 import zmq
 
+from sglang_tpu.disaggregation.decode_dram_offload.decode_stage_branches import (
+    StagePush,
+)
+from sglang_tpu.disaggregation.decode_dram_offload.stage_layout_store import (
+    StagePoolLayout,
+    hosting_rank,
+)
 from sglang_tpu.disaggregation.raiden import sender as raiden_sender
 from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
 from sglang_tpu.disaggregation.raiden.serde import (
@@ -90,6 +102,9 @@ class PrefixRegistration(msgspec.Struct, frozen=True):
     endpoint: str = ""
     swa_uuid: int = 0
     swa_endpoint: str = ""
+    # Draft sidecars of a pipeline stage, under the same UUIDs and page ids.
+    draft_endpoint: str = ""
+    draft_swa_endpoint: str = ""
 
     @property
     def refused(self) -> bool:
@@ -123,6 +138,64 @@ class _OfferState(msgspec.Struct):
     prefill_addr: str = ""
 
 
+class StagePushPart(msgspec.Struct, frozen=True):
+    """Decode: one stage's share of a pushed branch, as the receiver reads it."""
+
+    seq: int
+    stage: int
+    ack_endpoint: str
+    blocks: List[int]
+    swa_blocks: List[int]
+    uuid: int
+    address: str
+    swa_address: str
+    layout: StagePoolLayout
+    swa_layout: StagePoolLayout
+    # The stage's draft sidecars, None on a stage without draft layers.
+    draft_address: str = ""
+    draft_layout: Optional[StagePoolLayout] = None
+    draft_swa_address: str = ""
+    draft_swa_layout: Optional[StagePoolLayout] = None
+
+    @classmethod
+    def of(cls, push: VictimPush) -> StagePushPart:
+        def layout(tensors: list, page_bytes: int, window: bool) -> StagePoolLayout:
+            return StagePoolLayout(
+                stage=push.stage,
+                stages=push.stages,
+                tensors=tuple(
+                    (str(d), tuple(int(x) for x in shape)) for d, shape in tensors
+                ),
+                page_bytes=page_bytes,
+                window=window,
+            )
+
+        return cls(
+            seq=push.seq,
+            stage=push.stage,
+            ack_endpoint=push.ack_endpoint,
+            blocks=list(push.blocks),
+            swa_blocks=list(push.swa_blocks),
+            uuid=push.uuid,
+            address=push.address,
+            swa_address=push.swa_address,
+            layout=layout(push.layout, push.page_bytes, False),
+            swa_layout=layout(push.swa_layout, push.swa_page_bytes, True),
+            draft_address=push.draft_address,
+            draft_layout=(
+                layout(push.draft_layout, push.draft_page_bytes, False)
+                if push.draft_address
+                else None
+            ),
+            draft_swa_address=push.draft_swa_address,
+            draft_swa_layout=(
+                layout(push.draft_swa_layout, push.draft_swa_page_bytes, True)
+                if push.draft_swa_address
+                else None
+            ),
+        )
+
+
 class DramOffloadChannel:
     # Shares the manager's listener socket, state lock and room bookkeeping,
     # so it takes the manager itself. Built early in the manager's __init__:
@@ -138,6 +211,9 @@ class DramOffloadChannel:
         # The HiCache host pools whose pages move, (full, sliding window or
         # None), bound by the L2 extension.
         self._host_pools: Tuple[Any, Any] = (None, None)
+        # A pipeline stage's draft sidecar pools (draft KV, draft window),
+        # addressed by the page ids of the pools above.
+        self._draft_pools: Tuple[Any, Any] = (None, None)
         # This engine's native host reads by request id, as source or as
         # destination: None while raiden may still read or write the pages,
         # then whether the read succeeded. A room's reads outlive its cleanup
@@ -151,6 +227,15 @@ class DramOffloadChannel:
         self._replies: Dict[int, Optional[bool]] = {}
         # Push, decode: pushes received and not yet taken, by (prefill, seq).
         self._pushes: Dict[Tuple[str, int], VictimPush] = {}
+        # A pipeline-parallel prefill's pushes, by (prefill, seq), and the
+        # pools in its stages' layouts (decode_stage_branches.StagePoolSet).
+        self._stage_pushes: Dict[Tuple[str, int], StagePush] = {}
+        self._stage_pools: Any = None
+        # Decode: the page ids a room offers out of the stage pools.
+        self._stage_offers: Dict[int, _OfferState] = {}
+        # Pipeline stage: the decode ranks that asked for a room's KV, as
+        # (ranks of the decode, {rank: endpoint}); a push goes to them.
+        self._stage_peers: Dict[int, Tuple[int, Dict[int, str]]] = {}
 
     @property
     def _lock(self) -> Any:
@@ -167,9 +252,18 @@ class DramOffloadChannel:
     def forget_room_locked(self, room: int) -> None:
         self._recalls.pop(room, None)
         self._offers.pop(room, None)
-        for req_id in (self.prefix_req_id(room), self.prefix_req_id(room, swa=True)):
-            if self._reads.get(req_id) is not None:
-                del self._reads[req_id]
+        self._stage_offers.pop(room, None)
+        # A leaf's route keeps its own reference to the peers.
+        self._stage_peers.pop(room, None)
+        for req_id in [
+            req_id
+            for req_id, done in self._reads.items()
+            if done is not None and self._is_prefix_read(req_id, room)
+        ]:
+            del self._reads[req_id]
+
+    def _is_prefix_read(self, req_id: str, room: int) -> bool:
+        return req_id.startswith((f"{room}#px", f"{room}#pxs"))
 
     def _send(self, *, endpoint: str, message: Any) -> bool:
         # A peer that cannot be reached costs only this recall or push; the
@@ -192,28 +286,48 @@ class DramOffloadChannel:
 
     # ----- native host reads, shared by recall and push -------------------------
 
-    def bind_host_pools(self, full: Any, swa: Any = None) -> None:
+    def bind_host_pools(
+        self, full: Any, swa: Any = None, *, draft: Any = None, draft_swa: Any = None
+    ) -> None:
         with self._lock:
             self._host_pools = (full, swa)
+            self._draft_pools = (draft, draft_swa)
 
-    def host_control_address(self, *, swa: bool = False) -> str:
+    def _host_pool(self, *, swa: bool, draft: bool) -> Any:
+        return (self._draft_pools if draft else self._host_pools)[swa]
+
+    def host_control_address(self, *, swa: bool = False, draft: bool = False) -> str:
         """Where a peer reads this engine's registered host pages from."""
-        transfer = self._host_pools[swa].transfer
+        transfer = self._host_pool(swa=swa, draft=draft).transfer
         return transfer.host_control_address(self._mgr.local_ip)
 
     def register_host_read(
-        self, req_id: str, uuid: int, pages: List[int], *, swa: bool = False
+        self,
+        req_id: str,
+        uuid: int,
+        pages: List[int],
+        *,
+        swa: bool = False,
+        draft: bool = False,
     ) -> bool:
         """Register this engine's host ``pages`` (of its SWA pool with ``swa``)
         as the source of a peer's read. An accepted registration keeps the
         pages owned by the native read until it settles."""
         with self._lock:
-            return self._register_host_read_locked(req_id, uuid, pages, swa=swa)
+            return self._register_host_read_locked(
+                req_id, uuid, pages, swa=swa, draft=draft
+            )
 
     def _register_host_read_locked(
-        self, req_id: str, uuid: int, pages: List[int], *, swa: bool = False
+        self,
+        req_id: str,
+        uuid: int,
+        pages: List[int],
+        *,
+        swa: bool = False,
+        draft: bool = False,
     ) -> bool:
-        transfer = self._host_pools[swa].transfer
+        transfer = self._host_pool(swa=swa, draft=draft).transfer
         try:
             transfer.register_read(req_id, uuid, pages)
         except Exception as exc:  # noqa: BLE001 - the caller declines the transfer
@@ -232,14 +346,32 @@ class DramOffloadChannel:
         local: List[int],
         *,
         swa: bool = False,
+        draft: bool = False,
     ) -> bool:
         """Read a peer's registered host pages into this engine's host pages
         (of its SWA pool with ``swa``); no device page and no staging slot is
         involved."""
+        return self._start_read(
+            req_id,
+            uuid,
+            endpoint,
+            remote,
+            local,
+            self._host_pool(swa=swa, draft=draft).transfer,
+        )
+
+    def _start_read(
+        self,
+        req_id: str,
+        uuid: int,
+        endpoint: str,
+        remote: List[int],
+        local: List[int],
+        transfer: Any,
+    ) -> bool:
         with self._lock:
             if self._mgr._room_of(req_id) in self._mgr._aborted:
                 return False
-            transfer = self._host_pools[swa].transfer
             try:
                 transfer.start_read(req_id, uuid, endpoint, remote, local)
             except Exception as exc:  # noqa: BLE001 - the caller gives the read up
@@ -248,6 +380,296 @@ class DramOffloadChannel:
             self._reads[req_id] = None
             self._read_transfers[req_id] = transfer
             return True
+
+    # ----- stage-layout pools of a pipeline-parallel prefill, decode side -----------
+
+    def bind_stage_pools(self, pools: Any) -> None:
+        with self._lock:
+            self._stage_pools = pools
+
+    def start_stage_read(
+        self,
+        req_id: str,
+        uuid: int,
+        endpoint: str,
+        remote: List[int],
+        local: List[int],
+        *,
+        stage: int,
+        swa: bool = False,
+        draft: bool = False,
+    ) -> bool:
+        """Read a prefill stage's registered host pages into the pool this
+        rank keeps in that stage's layout."""
+        return self._start_read(
+            req_id,
+            uuid,
+            endpoint,
+            remote,
+            local,
+            self._stage_pools.transfer(stage, swa=swa, draft=draft),
+        )
+
+    def received_stage_pushes(self) -> Dict[Tuple[str, int], StagePush]:
+        """A pipeline-parallel prefill's pushes received and not yet taken."""
+        with self._lock:
+            return dict(self._stage_pushes)
+
+    def take_stage_push(self, key: Tuple[str, int]) -> Optional[StagePush]:
+        with self._lock:
+            return self._stage_pushes.pop(key, None)
+
+    def offer_stage_prefix(
+        self, room: int, page_ids: Sequence[int], window_ids: Sequence[int] = ()
+    ) -> None:
+        """Offer the page ids of the room's stored prefix: the same ids in
+        every stage pool, so every stage asks its hosting rank for them."""
+        with self._lock:
+            if page_ids and room not in self._mgr._aborted:
+                self._stage_offers[room] = _OfferState(
+                    pages=[int(x) for x in page_ids],
+                    swa_pages=[int(x) for x in window_ids],
+                )
+
+    def stage_offer_locked(self, room: int) -> Tuple[List[int], List[int]]:
+        """The page ids the room's request for KV names to the stages."""
+        offer = self._stage_offers.get(room)
+        return ([], []) if offer is None else (offer.pages, offer.swa_pages)
+
+    def _on_stage_prefix_pull(self, req: PrefixPull) -> None:
+        """A stage asks for its share of offered pages; any refusal answers
+        with uuid 0, so the stage lets the prefill compute the prompt."""
+        room, stage = req.room, req.stage
+        registration = PrefixRegistration()
+        with self._lock:
+            offer = self._stage_offers.get(room)
+            wanted = (
+                offer.pages[req.first_page : req.first_page + req.num_pages]
+                if offer is not None
+                else []
+            )
+            if room in self._mgr._aborted or len(wanted) != req.num_pages:
+                logger.warning(
+                    "RaidenKVManager rank%d room %s: stage %d PREFIX_PULL for "
+                    "pages [%d, %d) cannot be served, refusing",
+                    self._mgr.attn_tp_rank,
+                    room,
+                    stage,
+                    req.first_page,
+                    req.first_page + req.num_pages,
+                )
+            else:
+                registration = self._register_stage_pull_locked(
+                    room, stage, wanted, offer.swa_pages
+                )
+        self._send(
+            endpoint=req.reply_endpoint,
+            message=PrefixReady(
+                room=room,
+                uuid=registration.uuid,
+                endpoint=registration.endpoint,
+                swa_uuid=registration.swa_uuid,
+                swa_endpoint=registration.swa_endpoint,
+                draft_endpoint=registration.draft_endpoint,
+                draft_swa_endpoint=registration.draft_swa_endpoint,
+            ),
+        )
+
+    def _register_stage_pull_locked(
+        self, room: int, stage: int, pages: List[int], window: List[int]
+    ) -> PrefixRegistration:
+        pools = self._stage_pools
+        if pools is None or not pools.has(stage):
+            # This rank hosts no pool of that stage.
+            return PrefixRegistration()
+        # (window, draft sidecar, pages): a sidecar is registered at the page
+        # ids, and under the UUID, of the pool it follows.
+        wanted = [(False, False, pages)]
+        if window:
+            wanted.append((True, False, window))
+        if pools.has(stage, draft=True):
+            wanted.append((False, True, pages))
+        if window and pools.has(stage, swa=True, draft=True):
+            wanted.append((True, True, window))
+        uuids = {
+            swa: secrets.randbelow((1 << 63) - 1) + 1
+            for swa in {swa for swa, _, _ in wanted}
+        }
+        endpoints = {}
+        for swa, draft, part in wanted:
+            transfer = pools.transfer(stage, swa=swa, draft=draft)
+            req_id = self.stage_prefix_req_id(room, stage, swa=swa, draft=draft)
+            try:
+                transfer.register_read(req_id, uuids[swa], part)
+            except Exception as exc:  # noqa: BLE001 - the stage computes instead
+                logger.warning("Cannot register host read %s: %s", req_id, exc)
+                # An accepted registration stays owned by its native read.
+                return PrefixRegistration()
+            self._reads[req_id] = None
+            self._read_transfers[req_id] = transfer
+            endpoints[(swa, draft)] = transfer.host_control_address(self._mgr.local_ip)
+        return PrefixRegistration(
+            uuid=uuids[False],
+            endpoint=endpoints[(False, False)],
+            swa_uuid=uuids.get(True, 0),
+            swa_endpoint=endpoints.get((True, False), ""),
+            draft_endpoint=endpoints.get((False, True), ""),
+            draft_swa_endpoint=endpoints.get((True, True), ""),
+        )
+
+    @staticmethod
+    def stage_prefix_req_id(
+        room: int, stage: int, *, swa: bool = False, draft: bool = False
+    ) -> str:
+        # Room-shaped, like prefix_req_id; the stage keeps a rank that hosts
+        # several stages apart.
+        return f"{room}#px{'s' * swa}{'d' * draft}.s{stage}"
+
+    # ----- pipeline-parallel prefill, stage side --------------------------------------
+
+    def pipeline_consumer_fields(self, room: int) -> Dict[str, Any]:
+        """Decode: what a room's pipeline request adds for the offload, the
+        same to every stage: the offered page ids name a page in every stage
+        pool."""
+        with self._lock:
+            pages, window = self.stage_offer_locked(room)
+            return dict(kv_offload=True, offer=list(pages), offer_window=list(window))
+
+    def on_pipeline_request(
+        self, room: int, endpoint: str, consumer: Dict[str, Any]
+    ) -> None:
+        """Stage: a decode rank asked for the room's KV. Record the rank, and
+        the prefix it offers before the room can leave bootstrap."""
+        with self._lock:
+            ranks = int(consumer["attn_tp_size"])
+            peers = self._stage_peers.setdefault(room, (ranks, {}))
+            peers[1][int(consumer["attn_tp_rank"])] = endpoint
+            offer = consumer.get("offer")
+            if offer and room not in self._mgr._aborted:
+                self.accept_prefix_offer_locked(
+                    room, offer, consumer.get("offer_window") or []
+                )
+
+    def stage_decode_peers(self, room: int) -> Optional[Tuple[int, Dict[int, str]]]:
+        with self._lock:
+            return self._stage_peers.get(room)
+
+    def ask_stage_prefix_pull(
+        self, room: int, first_page: int, num_pages: int, *, stage: int
+    ) -> bool:
+        """Ask the decode rank that hosts this stage's pool to register the
+        stage's share of offered pages [first_page, +num_pages)."""
+        with self._lock:
+            peers = self._stage_peers.get(room)
+            if room in self._mgr._aborted or peers is None:
+                return False
+            endpoint = peers[1].get(hosting_rank(stage, peers[0]))
+        if endpoint is None:
+            return False
+        return self._send(
+            endpoint=endpoint,
+            message=PrefixPull(
+                room=room,
+                first_page=first_page,
+                num_pages=num_pages,
+                stage=stage,
+                reply_endpoint=_tcp_endpoint(
+                    ip=self._mgr.local_ip, port=self._mgr.rank_port
+                ),
+            ),
+        )
+
+    def send_stage_push(
+        self,
+        *,
+        peers: Tuple[int, Dict[int, str]],
+        prefill: str,
+        seq: int,
+        stage: int,
+        stages: int,
+        tokens: List[int],
+        blocks: List[int],
+        swa_blocks: Sequence[int],
+        uuid: int,
+        extra_key: Optional[str],
+        cache_salt: Optional[str],
+        window_pages: int,
+        layout: StagePoolLayout,
+        swa_layout: Optional[StagePoolLayout],
+        draft_layout: Optional[StagePoolLayout] = None,
+        draft_swa_layout: Optional[StagePoolLayout] = None,
+    ) -> bool:
+        """Offer this stage's registered host pages to the decode rank that
+        hosts its pool. Stage zero also sends the branch's tokens to every
+        decode rank, which is what the ranks agree on."""
+        ranks, endpoints = peers
+        host = hosting_rank(stage, ranks)
+        with self._lock:
+            self._replies[seq] = None
+        ack_endpoint = _tcp_endpoint(ip=self._mgr.local_ip, port=self._mgr.rank_port)
+
+        def wire(pool_layout: Optional[StagePoolLayout]) -> list:
+            return [
+                [d, list(shape)]
+                for d, shape in (pool_layout.tensors if pool_layout else ())
+            ]
+
+        ok = True
+        for rank in range(ranks) if stage == 0 else (host,):
+            endpoint = endpoints.get(rank)
+            if endpoint is None:
+                return False
+            carries_pages = rank == host
+            ok = ok and self._send(
+                endpoint=endpoint,
+                message=VictimPush(
+                    prefill=prefill,
+                    seq=seq,
+                    ack_endpoint=ack_endpoint,
+                    tokens=list(tokens) if stage == 0 else [],
+                    blocks=list(blocks) if carries_pages else [],
+                    uuid=uuid if carries_pages else 0,
+                    address=self.host_control_address() if carries_pages else "",
+                    swa_blocks=list(swa_blocks) if carries_pages else [],
+                    swa_address=(
+                        self.host_control_address(swa=True)
+                        if carries_pages and swa_blocks
+                        else ""
+                    ),
+                    extra_key=extra_key,
+                    cache_salt=cache_salt,
+                    stage=stage,
+                    stages=stages,
+                    window_pages=window_pages,
+                    layout=wire(layout) if carries_pages else [],
+                    page_bytes=layout.page_bytes if carries_pages else 0,
+                    swa_layout=wire(swa_layout) if carries_pages else [],
+                    swa_page_bytes=(
+                        swa_layout.page_bytes if carries_pages and swa_layout else 0
+                    ),
+                    **(
+                        dict(
+                            draft_address=self.host_control_address(draft=True),
+                            draft_layout=wire(draft_layout),
+                            draft_page_bytes=draft_layout.page_bytes,
+                        )
+                        if carries_pages and draft_layout is not None
+                        else {}
+                    ),
+                    **(
+                        dict(
+                            draft_swa_address=self.host_control_address(
+                                swa=True, draft=True
+                            ),
+                            draft_swa_layout=wire(draft_swa_layout),
+                            draft_swa_page_bytes=draft_swa_layout.page_bytes,
+                        )
+                        if carries_pages and swa_blocks and draft_swa_layout is not None
+                        else {}
+                    ),
+                ),
+            )
+        return ok
 
     def poll_host_reads(self, req_ids: Sequence[str]) -> Optional[bool]:
         """None while raiden may still read or write any of the reads' pages,
@@ -326,9 +748,9 @@ class DramOffloadChannel:
     # ----- recall, prefill side (prefill_dram_prefix_puller.PrefillDramPrefixPuller) --------------
 
     @staticmethod
-    def prefix_req_id(room: int, *, swa: bool = False) -> str:
+    def prefix_req_id(room: int, *, swa: bool = False, draft: bool = False) -> str:
         # Shaped like a chunk id so the manager's room bookkeeping covers it.
-        return f"{room}#pxs" if swa else f"{room}#px"
+        return f"{room}#px{'s' * swa}{'d' * draft}"
 
     def accept_prefix_offer_locked(
         self, room: int, blocks: List[int], swa_blocks: List[int]
@@ -404,6 +826,8 @@ class DramOffloadChannel:
                     endpoint=ready.endpoint,
                     swa_uuid=ready.swa_uuid,
                     swa_endpoint=ready.swa_endpoint,
+                    draft_endpoint=ready.draft_endpoint,
+                    draft_swa_endpoint=ready.draft_swa_endpoint,
                 )
 
     # ----- recall, decode side (decode_dram_prefix_offerer.DecodeDramPrefixOfferer) ---------------
@@ -425,9 +849,9 @@ class DramOffloadChannel:
         # A late PREFIX_PULL must not register pages the queue relinquished;
         # it is still answered, with a refusal.
         with self._lock:
-            offer = self._offers.get(room)
-            if offer is not None:
-                offer.pages = offer.swa_pages = []
+            for offer in (self._offers.get(room), self._stage_offers.get(room)):
+                if offer is not None:
+                    offer.pages = offer.swa_pages = []
 
     def host_prefix_pending(self, room: int) -> bool:
         with self._lock:
@@ -450,6 +874,9 @@ class DramOffloadChannel:
         # Any refusal answers with uuid 0, so the prefill computes the prompt
         # at once; a prefix read never fails the decode's own room.
         req = PrefixPull.from_frames(msg)
+        if req.stage >= 0:
+            self._on_stage_prefix_pull(req)
+            return
         room = req.room
         registration = PrefixRegistration()
         with self._lock:
@@ -569,7 +996,14 @@ class DramOffloadChannel:
     def _on_victim_push(self, msg: List[bytes]) -> None:
         push = VictimPush.from_frames(msg)
         with self._lock:
-            self._pushes[(push.prefill, push.seq)] = push
+            if push.stages <= 0:
+                self._pushes[(push.prefill, push.seq)] = push
+                return
+            entry = self._stage_pushes.setdefault((push.prefill, push.seq), StagePush())
+            if push.tokens:
+                entry.header = push
+            if push.uuid:
+                entry.parts[push.stage] = StagePushPart.of(push)
 
     def received_pushes(self) -> Dict[Tuple[str, int], VictimPush]:
         """Pushes received and not yet taken."""

@@ -132,9 +132,10 @@ SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM=1
 
 Unsupported settings are refused, never run without the offload. An engine
 stops at start, naming the setting, with: a GDN/Mamba model, the unified KV
-pool, pipeline parallelism (`--pp-size` above 1) or the Raiden pipeline
-transfer, context or data parallelism,
-speculative decoding, `--sleep-on-idle`, a transfer or HiCache I/O backend
+pool, a pipeline-parallel decode, a pipeline-parallel prefill above attention
+TP 1, context or data parallelism,
+speculative decoding, `--sleep-on-idle`, a
+transfer or HiCache I/O backend
 other than raiden, an
 L3 storage backend, HiCache or the radix cache off, the Rust radix tree, or a
 tpu-sync build without the host-to-host read API
@@ -169,6 +170,59 @@ non-idle. Set them on both roles (either role sends KV):
 export TPU_RAIDEN_PREFILL_{HANDSHAKE_ACK_READ,FINAL_ACK_READ,PAYLOAD_READ,HANDSHAKE_WRITE,PAYLOAD_WRITE}_TIMEOUT_S=60
 export TPU_RAIDEN_DECODE_{HANDSHAKE_READ,PAYLOAD_READ,ACK_WRITE,PAYLOAD_WRITE}_TIMEOUT_S=60
 ```
+
+### Pipeline-parallel prefill
+
+A pipeline-parallel prefill at attention TP 1 (`--pp-size 8 --tp-size 1`)
+offloads to a tensor-parallel decode that consumes it over the Raiden pipeline
+transfer (`SGLANG_RAIDEN_PIPELINE_TRANSFER=1`). The switch and the HiCache and
+radix cache flags are the same as above.
+
+A stage's host block holds every KV head of the stage's own layers, and a
+decode rank's block holds one head slice of every layer, so a pushed page
+cannot live in the decode's own host pool. The decode keeps one host-only pool
+per prefill stage, in that stage's layout: stage `s` is hosted by decode rank
+`s mod <decode ranks>`, every pool holds the same number of pages, and one page
+id names a page in all of them. Each stage pushes its share to, and recalls it
+from, the rank that hosts its pool; a page goes back to the stage it came from
+as whole blocks. The pools are built at the first push and take
+`SGLANG_PD_OFFLOAD_STAGE_STORE_GB` of host RAM per decode rank (default: the
+size of the rank's own HiCache host pool); with sliding windows it buys whole
+branches of one window and four full pages per window page; the `[dram-offload] stage landing` log line reports pages and windows
+in use.
+
+What differs from the tensor-parallel pairing:
+
+- The decode cannot load a stage's page into its own HBM. The pushed branches
+  are outside its radix cache, a recall is matched in their own index, and on
+  a recall turn the decode receives the whole prompt from the prefill, as for
+  any other request. Its radix cache holds its own requests, as upstream.
+- The stages agree through the pipeline's own bootstrap consensus: each stage
+  adds marked entries to the ready and failed request lists the ring already
+  carries, so a step of a push or a recall is taken by every stage in the same
+  micro-batch slot, one loop after the last stage was ready for it.
+- A recall reads the whole offered prefix even when a stage still holds part
+  of it, and a stored branch is not made the next eviction victim.
+- An engine paused with a push or a recall in flight stays non-idle until the
+  pipeline steps again.
+- The decode reads only the pages of a push it does not hold yet. A push it
+  had no page to read from stays in flight on the prefill until the native
+  transfer deadline (60 s by default), and a cache flush is refused that long.
+
+Speculative decoding is refused by default. The draft KV of a cached prefix is
+in HiCache's draft sidecar pools, which are addressed by the page ids of the
+full-attention and window pools. With `SGLANG_PD_OFFLOAD_ALLOW_DRAFT=1` on both
+roles a stage moves its sidecars with the pages: it registers them at the same
+ids, the decode keeps one more pool per sidecar, and a recall reads each
+sidecar into the host page ids of its landing. Status: opt-in, byte-verified
+live on the Muse Spark nightly config in one run; the gate stays pending
+answer-level and acceptance evidence.
+`SGLANG_PD_OFFLOAD_VERIFY_PAGES=1` on the prefill counts the
+recalled pages, sidecars included, whose bytes the stage never pushed.
+
+Not supported yet, and refused or not offered: attention DP on the prefill
+(`--enable-dp-attention`), a pipeline decode, and the block-major KV layout
+between the two roles.
 
 ## Muse Spark multimodal
 

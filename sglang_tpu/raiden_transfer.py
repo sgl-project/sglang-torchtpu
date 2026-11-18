@@ -111,6 +111,19 @@ HOST_POOLS_PER_RANK = 2
 _host_pools_built = 0
 
 
+def _pipeline_stage_offset() -> int:
+    """Ranks before this worker's on the node when it is a pipeline stage:
+    every stage of a single-host pipeline is TP rank 0, and each needs its own
+    port. 0 without a pipeline."""
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        return int(parallel.pp_group.rank_in_group) * int(parallel.tp_size)
+    except Exception:  # noqa: BLE001 - no pipeline group in this process
+        return 0
+
+
 def host_control_port_candidates():
     """Ports for a host pool's control server: a deterministic one per TP rank
     and host pool above the Raiden KV ports first, then free ephemeral ports.
@@ -126,7 +139,7 @@ def host_control_port_candidates():
     global _host_pools_built
     index, _host_pools_built = _host_pools_built, _host_pools_built + 1
     if index < HOST_POOLS_PER_RANK:
-        rank = get_tensor_model_parallel_rank()
+        rank = get_tensor_model_parallel_rank() + _pipeline_stage_offset()
         yield (
             envs.SGLANG_RAIDEN_KV_PORT.get()
             + HOST_POOL_CONTROL_PORT_OFFSET

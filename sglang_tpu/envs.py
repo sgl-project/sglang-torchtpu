@@ -345,6 +345,19 @@ class TpuEnvs:
 
     # Raiden: a DP or TP decode receives KV from a pipeline-parallel prefill.
     SGLANG_RAIDEN_PIPELINE_TRANSFER = EnvBool(False)
+    # KV offload to decode DRAM behind a pipeline-parallel prefill: host RAM per
+    # decode rank for the pools that keep pushed branches in the prefill
+    # stages' layouts. 0 takes the size of the rank's own HiCache host pool.
+    SGLANG_PD_OFFLOAD_STAGE_STORE_GB = EnvFloat(0.0)
+    # Debugging: a pipeline prefill hashes the bytes of every host page it
+    # pushes to decode DRAM and of every page it recalls, and counts the
+    # recalled pages whose bytes it never pushed.
+    SGLANG_PD_OFFLOAD_VERIFY_PAGES = EnvBool(False)
+    # KV offload to decode DRAM behind a pipeline-parallel prefill, with
+    # speculative decoding: the draft KV of a cached prefix (HiCache's draft
+    # sidecar pools) moves with the pages. Opt-in on both roles; without it
+    # the offload refuses a draft.
+    SGLANG_PD_OFFLOAD_ALLOW_DRAFT = EnvBool(False)
     # Raiden: stage each transfer (and reshard plan) in its own host-pool pages
     # instead of fixed max-length slots; asymmetric attention TP needs it.
     SGLANG_RAIDEN_DYNAMIC_HOST_STAGING = EnvBoolWithAlias(

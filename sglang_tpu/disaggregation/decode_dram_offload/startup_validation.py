@@ -62,6 +62,14 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
     # whose transfer manager would hold sliding-window or recurrent-state
     # tensors besides the full-attention KV.
     hybrid_swa = model_config.is_hybrid_swa
+    # A pipeline prefill and the tensor-parallel decode it feeds; there the
+    # draft sidecar pools can move with the pages (stage_prefill_ops.py).
+    pipeline_pairing = (
+        server_args.pp_size > 1
+        if role == "prefill"
+        else bool(tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get())
+    )
+    draft_moves = pipeline_pairing and tpu_envs.SGLANG_PD_OFFLOAD_ALLOW_DRAFT.get()
     requirements = [
         (
             server_args.disaggregation_transfer_backend == "raiden",
@@ -108,14 +116,20 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
             "the Python unified radix tree is required (the Rust tree core is not supported)",
         ),
         (
-            server_args.pp_size == 1,
-            f"pipeline parallelism is not supported (--pp-size {server_args.pp_size})",
+            # A pipeline prefill pushes to a tensor-parallel decode, which
+            # keeps each stage's pages in that stage's layout
+            # (stage_layout_store.py); a decode pipeline has no such store.
+            role != "decode" or server_args.pp_size == 1,
+            "a pipeline-parallel decode is not supported "
+            f"(--pp-size {server_args.pp_size})",
         ),
         (
-            # A decode opts in to consume from a pipeline prefill with the env.
-            role != "decode" or not tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get(),
-            "the Raiden pipeline transfer is not supported "
-            f"({tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name} is set)",
+            # The stages agree through the pipeline's ring, the ranks of a
+            # stage would need a second agreement inside it.
+            server_args.pp_size == 1
+            or int(getattr(get_parallel(), "attn_tp_size", 1)) == 1,
+            "a pipeline-parallel prefill needs attention TP 1 (--tp-size 1) "
+            f"(--pp-size {server_args.pp_size})",
         ),
         (
             server_args.dp_size == 1 and server_args.attn_dp_size == 1,
@@ -126,8 +140,18 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
             "context parallelism is not supported",
         ),
         (
-            scheduler.spec_algorithm.is_none(),
-            "speculative decoding is not supported",
+            # The draft KV of a cached prefix lives in HiCache's draft sidecar
+            # pool, by the same host slots as the pages. Neither pairing
+            # moves the sidecar, so a recalled prefix would hand the draft
+            # model bytes that were never transferred.
+            scheduler.spec_algorithm.is_none() or draft_moves,
+            "speculative decoding is not supported"
+            + (
+                f" (a pipeline prefill and its decode can opt in with "
+                f"{tpu_envs.SGLANG_PD_OFFLOAD_ALLOW_DRAFT.name}=1 on both roles)"
+                if pipeline_pairing
+                else ""
+            ),
         ),
         (
             mambaish_config(model_config) is None,
