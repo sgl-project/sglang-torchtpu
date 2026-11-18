@@ -138,7 +138,9 @@ class XGrammarGrammar(BaseGrammarObject):
 
             torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
         elif logits.device.type == "tpu":
-            apply_token_bitmask_inplace(logits, vocab_mask, backend="torch_compile")
+            # Eager: xgrammar's torch.compile'd kernel recompiles per batch shape,
+            # which the server's post-warmup fail_on_recompile stance rejects.
+            apply_token_bitmask_inplace(logits, vocab_mask, backend="torch_native")
         elif logits.device.type == "cpu":
             # Used by the MLX backend, which builds its additive mask rows
             # on the CPU before inserting them into the lazy graph.
@@ -268,7 +270,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "tpu":
-            apply_token_bitmask_inplace(logits, vocab_mask, backend="torch_compile")
+            # Eager: xgrammar's torch.compile'd kernel recompiles per batch shape,
+            # which the server's post-warmup fail_on_recompile stance rejects.
+            apply_token_bitmask_inplace(logits, vocab_mask, backend="torch_native")
         elif logits.device.type == "npu":
             import sgl_kernel_npu  # noqa: F401
 
