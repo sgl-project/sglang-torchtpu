@@ -972,12 +972,12 @@ def sparse_ragged_paged_attention(
       gather_rope: TensorCore layout only (ignored otherwise). False skips the
         rope cache in the gather and attends with zero rope keys; exact only
         when the queries' rope lane is identically zero (a model without rope).
-      kv_shards: ``(shards, role, group)`` for a cache sharded by page
-        (mla_sparse/kv_shard.py): ``page_indices`` holds allocator page ids,
-        this rank attends only the candidates whose page id is ``role`` mod
-        ``shards`` (at page id // shards), and ``group`` consecutive top-k
-        entries share a page (the pooled indexer's pools). Use with
-        ``return_lse`` and merge the ranks' partials.
+      kv_shards: ``(shards, role, group)`` for a cache split inside every page
+        (mla_sparse/kv_shard.py): the caches hold this rank's
+        ``page_size`` offsets of each ``page_size * shards``-token page, this
+        rank attends only the candidates at those offsets, and ``group``
+        consecutive top-k entries share an owner (the pooled indexer's pools).
+        Use with ``return_lse`` and merge the ranks' partials.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1162,22 +1162,29 @@ def _spread(hashed: jax.Array, bound: int) -> jax.Array:
     return hashed & ((1 << (bound.bit_length() - 1)) - 1)
 
 
-def _own_shard_entries(page_ids, token_offset, is_padding, kv_shards):
-    """This rank's entries (page id = role mod shards) moved to the front of each
-    row in their order, at page id // shards; padding marks the rest."""
+def _own_shard_entries(page_ids, token_offset, is_padding, kv_shards, sub_page):
+    """This rank's entries (offset in its ``sub_page`` share of the page) moved to
+    the front of each row in their order, at their row in the share; padding
+    marks the rest."""
     from sglang_tpu.attention.pallas.mla_sparse.kv_shard import compact_left
 
     shards, role, group = kv_shards
     if shards & (shards - 1):
         raise ValueError(f"kv_shards: shards must be a power of two, got {shards}")
+    if sub_page % group:
+        raise ValueError(
+            f"kv_shards: a {group}-entry group straddles {sub_page}-token shares"
+        )
     num_tokens, topk = page_ids.shape
     width = -(-topk // group) * group
-    owned = ~is_padding & ((page_ids & (shards - 1)) == role)
-    local = jnp.where(owned, page_ids // shards, -1)
-    packed = jnp.stack([local, token_offset], axis=-1)
+    owned = ~is_padding & (token_offset // sub_page == role)
+    packed = jnp.stack(
+        [jnp.where(owned, page_ids, -1), jnp.where(owned, token_offset % sub_page, -1)],
+        axis=-1,
+    )
     packed = jnp.pad(packed, ((0, 0), (0, width - topk), (0, 0)), constant_values=-1)
     owned = jnp.pad(owned, ((0, 0), (0, width - topk)))
-    # A group's entries share a page, so the group's first entry decides.
+    # A group's entries share an owner, so the group's first entry decides.
     packed = compact_left(
         packed.reshape(num_tokens, width // group, group * 2),
         owned.reshape(num_tokens, width // group, group)[..., 0],
@@ -1221,14 +1228,16 @@ def prepare_gather_indices(
         seq_ids_segment = jnp.repeat(
             jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
         )
-        seq_page_ids = topk_indices // page_size
-        token_offset = topk_indices % page_size
+        # A split cache's page holds page_size of the shards * page_size offsets.
+        seq_page_size = page_size * (kv_shards[0] if kv_shards is not None else 1)
+        seq_page_ids = topk_indices // seq_page_size
+        token_offset = topk_indices % seq_page_size
         page_ids = gather_page_ids(
             page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
         )
         if kv_shards is not None:
             page_ids, token_offset, is_padding = _own_shard_entries(
-                page_ids, token_offset, is_padding, kv_shards
+                page_ids, token_offset, is_padding, kv_shards, page_size
             )
             kv_lens = jnp.sum(~is_padding, axis=-1)
 

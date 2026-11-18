@@ -393,6 +393,7 @@ def update_sparse_mla_kv_cache(
     nope_spec: SparseMLAKVCacheSpec,
     rope_spec: SparseMLAKVCacheSpec,
     write_rope: bool = True,
+    kv_shards: tuple[int, int] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Scatter this step's new MLA latents into the split sparse-MLA cache.
 
@@ -416,6 +417,10 @@ def update_sparse_mla_kv_cache(
         whose rope lane is identically zero (GLM-5.3-Flash has no rope; the
         backend attends with a zero lane): the cache is allocated zeroed, so
         skipping the write changes nothing.
+      kv_shards: ``(shards, role)`` for a cache split inside every page
+        (mla_sparse/kv_shard.py): the caches hold this rank's ``page_size``
+        offsets of each ``page_size * shards``-token page, and tokens at other
+        ranks' offsets are skipped.
 
     Returns:
       The updated (nope, rope) kv caches, same shapes/dtypes as the inputs.
@@ -428,13 +433,20 @@ def update_sparse_mla_kv_cache(
         rope_spec,
         check_rope_shape=write_rope,
     )
+    shards, role = kv_shards or (1, 0)
     page, slot = get_page_and_slot(
         kv_c_normed.shape[0],
         seq_lens,
         block_tables,
         query_start_loc,
-        nope_spec.page_size,
+        nope_spec.page_size * shards,
     )
+    if shards > 1:
+        from sglang_tpu.attention.pallas.mla_sparse.kv_shard import own_page_slots
+
+        page, slot = own_page_slots(
+            page, slot, sub_page=nope_spec.page_size, role=role, oob_page=OOB_PAGE
+        )
     return _scatter_caches(
         kv_cache_nope,
         kv_cache_rope,
