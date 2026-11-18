@@ -197,7 +197,15 @@ class TestRuntimeEnvironment(unittest.TestCase):
         from benchmark.tpu.recipe.configs.muse_spark.agentic import get_config
 
         prefill, decode = (get_config(24, mode=m) for m in ("prefill", "decode"))
-        self.assertEqual(prefill["server_args"]["pp_size"], 2)
+        self.assertEqual(prefill["server_args"]["pp_size"], 8)
+        # Raiden's pipeline producer and PP on TPU both need TP=1, so MoE leaves fused-RS.
+        self.assertEqual(prefill["server_args"]["tp_size"], 1)
+        self.assertNotIn("enable_dp_attention", prefill["server_args"])
+        self.assertEqual(prefill["server_args"]["moe_runner_backend"], "auto")
+        # HiCache on the decode needs the decode radix cache.
+        self.assertTrue(
+            decode["server_args"]["disaggregation_decode_enable_radix_cache"]
+        )
         for config in (prefill, decode):
             # A rank != 0 in a one-host group makes launch_server start nothing.
             self.assertEqual(config["runtime_env"]["SGLANG_LAUNCHER_RANK"], "0")
