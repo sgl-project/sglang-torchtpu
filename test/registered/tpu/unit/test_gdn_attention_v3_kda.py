@@ -772,7 +772,9 @@ class TestGDNAttentionV3KDA(CustomTestCase):
             [q + c for q, c in zip(query_lens, context_lens)], dtype=jnp.int32
         )
 
-        for n_v, gate_lower_bound in ((3, -5.0), (12, -5.0), (4, None)):
+        # 64 heads is GLM-5.3-Flash KDA under attention DP8: one sequence's
+        # four-position window must still fit VMEM at tile size 1.
+        for n_v, gate_lower_bound in ((3, -5.0), (12, -5.0), (4, None), (64, -5.0)):
             with self.subTest(n_v=n_v, gate_lower_bound=gate_lower_bound):
                 n_kq = n_v
                 dim = 2 * n_kq * d_k + n_v * d_v
