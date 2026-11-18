@@ -116,10 +116,13 @@ def _fp8_to_ep(experts: torch.nn.Module, chunk: int) -> None:
             for e0 in range(0, u13.shape[0], _EXPERT_CHUNK)
         ]
     )
-    # Rebound to its own fp8 storage, neither an fp8 view of the uint8 result nor copy_'d
-    # into the same-shape param: TorchTPU 0.2 re-materializes either with an eager
-    # as_strided before every compiled call (1 GiB per fp8 layer, #357).
-    new13 = new13.view(torch.float8_e4m3fn).clone()
+    # Materialized into its own fp8 buffer, as _materialize_packed_fp4 does for fp4: an fp8
+    # view of the uint8 result (even cloned) makes TorchTPU 0.2 run an eager as_strided
+    # bitcast of the 1 GiB slab before every compiled call.
+    new13_u8 = new13
+    new13 = torch.empty_like(new13_u8, dtype=torch.float8_e4m3fn)
+    new13.copy_(new13_u8.view(torch.float8_e4m3fn))
+    del new13_u8
     s13 = _channel_scales(experts.w13_weight_scale.data).index_select(2, cols)
     s2 = _channel_scales(experts.w2_weight_scale.data)
     _wait_for(new13, s13, s2)
