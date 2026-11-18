@@ -78,6 +78,7 @@ PATCHED = (
     (Stage, "_prepare_causal_dmd_timesteps"),
     (Stage, "_add_noise_for_next_timestep"),
     (LingBotWorldI2VConfig, "prepare_world_condition"),
+    (lingbot_world.config, "camera_poses_to_plucker"),
 )
 
 
@@ -523,9 +524,9 @@ class TestRenoise(_TestBase):
 
 
 class TestCameraCondition(_TestBase):
-    def _conditions(self, device, chunks=4):
+    def _conditions(self, device, chunks=4, scripts=None):
         config, session, out = LingBotWorldV2CausalDMDConfig(), RealtimeSession(), []
-        scripts = (
+        scripts = scripts or (
             [["w"], ["w", "j"], ["i"]],
             [["d", "k"]],
             [[], ["s"], ["l"]],
@@ -557,6 +558,19 @@ class TestCameraCondition(_TestBase):
             self._conditions(META, chunks=1)
         with _installed(("meta",)):
             self.assertEqual(self._conditions(META, chunks=1)[0].device, META)
+
+    def test_still_camera_reuses_the_condition(self):
+        still = ([["w"], ["w"], []], [[], [], []], [[], [], []])
+        expected = self._conditions(CPU, 3, still)
+        stock = lingbot_world._STOCK_PLUCKER
+        with (
+            _installed(),
+            patch.object(lingbot_world, "_last_plucker", [None, None]),
+            patch.object(lingbot_world, "_STOCK_PLUCKER", wraps=stock) as build,
+        ):
+            actual = self._conditions(CPU, 3, still)
+        self.assertEqual(build.call_count, 2)  # the last two chunks' poses match
+        self.assertTrue(all(map(torch.equal, actual, expected)))
 
 
 class TestPatch(_TestBase):

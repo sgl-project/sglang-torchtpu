@@ -36,7 +36,8 @@ Runtime patch, tracked debt:
       generator's device and casts it, as CUDA's bfloat16 ``randn`` samples in
       float32; a CPU generator (``generator_device="cpu"``) works too;
   (5) builds ``prepare_world_condition``'s camera condition with the stock code
-      on the host and copies it over.
+      on the host and copies it over; a chunk whose poses repeat the previous
+      chunk's (a still camera) reuses its Plucker condition.
 - Upstream PR or issue: none.
 - Remove when: (1) the causal KV cache takes its write position and visible
   length as device tensors over a fixed-size window; (2), (3) and (5) torch_tpu
@@ -48,6 +49,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs import lingbot_world as config
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldI2VConfig,
 )
@@ -69,6 +71,8 @@ _STOCK_SHARD_ROPE = _Model._compute_rope_for_sequence_shard_with_offset
 _STOCK_TIMESTEPS = _Stage._prepare_causal_dmd_timesteps
 _STOCK_ADD_NOISE = _Stage._add_noise_for_next_timestep
 _STOCK_WORLD_CONDITION = LingBotWorldI2VConfig.prepare_world_condition
+_STOCK_PLUCKER = config.camera_poses_to_plucker
+_last_plucker = [None, None]  # key, condition
 
 
 def _on_tpu(device) -> bool:
@@ -139,6 +143,19 @@ def prepare_world_condition(self, batch, device, dtype):
     return {name: value.to(device) for name, value in condition.items()}
 
 
+def camera_poses_to_plucker(*, c2ws, Ks, **kwargs):
+    """The stock Plucker condition, reused while the poses repeat (the chunks
+    of a still camera)."""
+    key = [kwargs] + [(t.dtype, t.shape, _bytes(t)) for t in (c2ws, Ks)]
+    if _last_plucker[0] != key:
+        _last_plucker[:] = key, _STOCK_PLUCKER(c2ws=c2ws, Ks=Ks, **kwargs)
+    return _last_plucker[1]
+
+
+def _bytes(tensor) -> bytes:
+    return tensor.contiguous().view(torch.uint8).numpy().tobytes()
+
+
 def install() -> None:
     LingBotWorldCausalSelfAttention._attend_with_kv_cache = _attend_with_kv_cache
     _Model._compute_rope_for_sequence_shard_with_offset = (
@@ -147,3 +164,4 @@ def install() -> None:
     _Stage._prepare_causal_dmd_timesteps = _prepare_causal_dmd_timesteps
     _Stage._add_noise_for_next_timestep = _add_noise_for_next_timestep
     LingBotWorldI2VConfig.prepare_world_condition = prepare_world_condition
+    config.camera_poses_to_plucker = camera_poses_to_plucker
