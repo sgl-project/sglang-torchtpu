@@ -211,7 +211,12 @@ def _softmax_stats(
     with no key in range then keeps l == 0 instead of weighting masked keys by
     exp(mask_value - mask_value)); the scopes whose rows can be empty set it."""
     exp_fn = jnp.exp2 if cfgs.serve.exp2_softmax else jnp.exp
-    m_curr = jnp.max(qk, axis=-1, keepdims=True)
+    if cfgs.serve.no_max:
+        # m is -inf at a q block's first k block (alpha clears l and acc), 0 after:
+        # no row-max barrier between QK and exp.
+        m_curr = jnp.zeros(qk.shape[:-1] + (1,), qk.dtype)
+    else:
+        m_curr = jnp.max(qk, axis=-1, keepdims=True)
 
     alpha_list = []
     m_next_list = []
@@ -225,11 +230,14 @@ def _softmax_stats(
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    m_b = utils.broadcast_minor(m_next, qk.shape)
-    if m_b.dtype != qk.dtype:
-        # f32 carries (ones_v): the scores and p stay in the output dtype.
-        m_b = m_b.astype(qk.dtype)
-    p = exp_fn(qk - m_b)
+    if cfgs.serve.no_max:
+        p = exp_fn(qk)
+    else:
+        m_b = utils.broadcast_minor(m_next, qk.shape)
+        if m_b.dtype != qk.dtype:
+            # f32 carries (ones_v): the scores and p stay in the output dtype.
+            m_b = m_b.astype(qk.dtype)
+        p = exp_fn(qk - m_b)
     if zero_masked:
         p = jnp.where(jnp.stack(masks, axis=0), p, 0)
     if cfgs.serve.ones_v:

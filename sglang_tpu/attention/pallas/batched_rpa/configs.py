@@ -144,6 +144,15 @@ class ServingConfigs:
     ones_v: bool = False
     # Transposed scores with split fp8 q (see transposed.py), where use_transposed holds.
     transposed: bool = False
+    # Softmax without the running row max: exp cannot overflow only for bounded
+    # scores (QK-normed q and k). Transposed tiles then stream key chunks.
+    no_max: bool = False
+    # Transposed tiles skip a partial q block's padded queries, looping over
+    # groups of skip_pad_q_group tokens; exact.
+    skip_pad_q: bool = False
+    skip_pad_q_group: int = 128
+    # Weightless per-head RMS norm (this eps) of the output-dtype rows.
+    out_head_norm_eps: float | None = None
 
     def __post_init__(self):
         if self.cache_only and self.attention_scope == AttentionScope.FULL:
