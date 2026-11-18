@@ -85,7 +85,6 @@ from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
 from sglang_tpu.hooks.qwen4_exp import (
     check_dense_qsa_context,
     dense_qsa_config,
-    gather_fp8_ple_rows,
     hash_ngrams_int32,
     load_ple_table_on_host,
 )
@@ -135,11 +134,6 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.qwen4_exp.Qwen4ExpForConditionalGeneration.load_weights",
         load_ple_table_on_host,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.models.qwen4_exp.Qwen4ExpNGramEmbedding._embed_ngram_ids",
-        gather_fp8_ple_rows,
         HookType.AROUND,
     ),
     (

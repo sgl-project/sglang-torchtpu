@@ -29,8 +29,15 @@ class TestTpuShortConvPool(unittest.TestCase):
         for _, tensor, axis, _ in entries:
             self.assertIsNone(tensor._base)
             self.assertIsNone(axis)
-            self.assertEqual(tuple(tensor.shape), (5, 6, 3))
-        self.assertIs(pool.layer_cache(5), pool.layer_states[1])
+            # Kernel-native: [slots, state_len, 1, channels].
+            self.assertEqual(tuple(tensor.shape), (5, 3, 1, 6))
+        # The model sees core's [slots, channels, state_len] and writes through it.
+        view = pool.layer_cache(5)
+        self.assertEqual(tuple(view.shape), (5, 6, 3))
+        view[2] = torch.arange(18, dtype=torch.float32).view(6, 3)
+        self.assertTrue(
+            torch.equal(pool.layer_states[1][2, :, 0, :], torch.arange(18.0).view(6, 3).T)
+        )
 
     def test_slot_reset_copy_and_cpu_round_trip(self):
         pool = self._pool()

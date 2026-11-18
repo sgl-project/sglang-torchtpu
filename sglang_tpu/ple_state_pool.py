@@ -8,8 +8,9 @@ whose leading axis is the block (here, the slot) and refuses a view that folds
 the buffer's leading axes: "Tensor's leading (block) dimension does not match
 its base storage buffer: the tensor's shape [97, 10240, 9] folds leading
 dimensions of the buffer's [1, 97, 10240, 9]". This pool allocates each
-layer's ``[slots + 1, channels, state_len]`` state as its own tensor, as
-:class:`~sglang_tpu.mamba_pool.TpuMambaPool` does for GDN state.
+layer's state as its own ``[slots + 1, state_len, 1, channels]`` tensor, the
+kernel-native shape :class:`~sglang_tpu.mamba_pool.TpuMambaPool` uses for GDN
+conv state, and gives the model core's ``[slots, channels, state_len]`` view.
 
 Speculative decoding's intermediate state is not supported here.
 """
@@ -49,8 +50,13 @@ class TpuShortConvPool(ShortConvPool):
         self.layer_states: List[torch.Tensor] = []
         if not layer_ids or state_shape is None:
             return
+        channels, state_len = state_shape
+        # Kernel-native like TpuMambaPool's GDN conv state: slot-major, the
+        # channels on the lane axis. As [slots, channels, state_len] TPU tiled
+        # the slot axis (97 padded to 104; Raiden: "on-device size ... is not a
+        # whole number of blocks at major dimension 97").
         self.layer_states = [
-            torch.zeros((size + 1, *state_shape), dtype=dtype, device=device)
+            torch.zeros((size + 1, state_len, 1, channels), dtype=dtype, device=device)
             for _ in layer_ids
         ]
 
@@ -58,8 +64,13 @@ class TpuShortConvPool(ShortConvPool):
     def enabled(self) -> bool:
         return bool(self.layer_states)
 
+    @staticmethod
+    def _logical(state: torch.Tensor) -> torch.Tensor:
+        """Core's [slots, channels, state_len] view of a stored layer state."""
+        return state.squeeze(2).transpose(1, 2)
+
     def layer_cache(self, layer_id: int) -> torch.Tensor:
-        return self.layer_states[self.layer_map[layer_id]]
+        return self._logical(self.layer_states[self.layer_map[layer_id]])
 
     def layer_intermediate_cache(self, layer_id: int) -> Optional[torch.Tensor]:
         return None
@@ -81,14 +92,16 @@ class TpuShortConvPool(ShortConvPool):
     def get_cpu_slots(self, indices: torch.Tensor) -> Any:
         if not self.layer_states:
             return None
-        # Core's layout: [layers, slots, ...].
-        return torch.stack([state[indices].to("cpu") for state in self.layer_states])
+        # Core's layout: [layers, slots, channels, state_len].
+        return torch.stack(
+            [self._logical(state)[indices].to("cpu") for state in self.layer_states]
+        )
 
     def load_cpu_slots(self, data: Any, indices: torch.Tensor) -> None:
         if not self.layer_states or data is None:
             return
         for state, rows in zip(self.layer_states, data):
-            state[indices] = rows.to(state.device)
+            state[indices] = rows.to(state.device).transpose(1, 2).unsqueeze(2)
 
     def iter_transfer_state_entries(self):
         """Yield each layer's replicated root state tensor for PD transfer."""
