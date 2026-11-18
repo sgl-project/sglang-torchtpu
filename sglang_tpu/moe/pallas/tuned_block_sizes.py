@@ -518,6 +518,9 @@ TUNED_BLOCK_SIZES = {
 GMM_V2_TUNED_BLOCK_SIZES = {
     (65536, 4096, 512, 288, 288, "bfloat16", "float8_e4m3fn", 4096): (256, 4096, 512),
     (65536, 256, 4096, 288, 288, "bfloat16", "float8_e4m3fn", 256): (256, 256, 4096),
+    # 8192 / 16384 rows: calculate_tiling's tile_m 128 measured as fast or faster.
+    (32768, 4096, 512, 288, 288, "bfloat16", "float8_e4m3fn", 4096): (256, 4096, 512),
+    (32768, 256, 4096, 288, 288, "bfloat16", "float8_e4m3fn", 256): (256, 256, 4096),
 }
 
 
