@@ -7038,6 +7038,7 @@ def mla(
     dsa: "dsa_decode.DecodeIndexer | None" = None,
     hand_out: Callable[[], None] | None = None,
     after_query_up: Callable[[], None] | None = None,
+    wait_for_input: Callable[[], None] | None = None,
 ) -> None:
     """Execute one multi-head latent-attention layer inside a Pallas program.
 
@@ -7069,6 +7070,11 @@ def mla(
 
     ``after_query_up`` (KernelConfig.decode_latent_down_prefetch): called once
     q-up has run; nothing reads the q-up weight afterwards.
+
+    ``wait_for_input`` (KernelConfig.attention_input_gather_in_branches):
+    called once the q/kv-up, output gate and indexer weight copies have
+    started and before the first read of ``hidden_ref`` (e.g. to wait for
+    the copies that fill it); nothing before it reads ``hidden_ref``.
     """
     batch_size, hidden_size = hidden_ref.shape
     context_length = (
@@ -7223,6 +7229,9 @@ def mla(
             @pl.when(early_prime)
             def prime_pages():
                 make_attention()
+
+        if wait_for_input is not None:
+            wait_for_input()
 
         def query_down():
             """q-down and its norm: the normalized q-latent (BF16)."""
@@ -7702,6 +7711,11 @@ RANK_ROWS_PREFIX_SEMAPHORE = 14
 # after the layer's attention branches join
 # (KernelConfig.attention_host_round_after_join; finish_rank_rows_host_round).
 ATTENTION_HOST_ROUND_AFTER_JOIN = _config().attention_host_round_after_join
+# Rank-row steps: the attention input gather starts before the layer's
+# attention branches and each branch waits for it
+# (KernelConfig.attention_input_gather_in_branches; the stack decides per
+# step).
+ATTENTION_INPUT_GATHER_IN_BRANCHES = _config().attention_input_gather_in_branches
 
 
 def _attention_host_sum(host_receive):
@@ -8757,6 +8771,7 @@ def _gather_local_pair_rows(
     semaphore=None,
     transpose_wires=False,
     cross_cores=False,
+    defer_waits=False,
 ):
     """All-gather the token shards of the ``owners`` local row owners.
 
@@ -8772,6 +8787,12 @@ def _gather_local_pair_rows(
     the same rows): each rank sends to the other core of its counterpart's
     chip (rank ^ 2k ^ 1), so every rank receives each other pair's rows from
     the core of the other parity; slots and semaphores are unchanged.
+
+    ``defer_waits`` (row counts copied in place: a power of two above one,
+    unpacked): return once the copies have started, with a function that
+    waits for them. The other owners' rows are in ``destination``, and
+    ``source`` may be written again, only once it has returned; until then
+    nothing may touch either buffer or the copies' semaphores.
     """
     rank = jax.lax.axis_index("tp")
     stride = 8 // owners
@@ -8792,6 +8813,7 @@ def _gather_local_pair_rows(
     # transport scratch and assemble the destination from values.
     if packed or rows_per_owner == 1 or rows_per_owner & (rows_per_owner - 1):
         assert scratch is not None
+        assert not defer_waits, "only gathers copied in place defer their waits"
         payload_rows = rows_per_owner * source.shape[1] // 128
         source_wire = (
             scratch.at[owner].bitcast(jnp.bfloat16).at[pl.ds(0, payload_rows), :]
@@ -8834,6 +8856,19 @@ def _gather_local_pair_rows(
                 axis=0,
             )
         return
+
+    def owner_copy(offset, row_slice):
+        # This rank's rows to owner ``owner ^ offset``'s rank, landing in the
+        # slot ``row_slice`` of this rank's owner.
+        return tpu.make_async_remote_copy(
+            source,
+            destination.at[row_slice],
+            sends.at[semaphore_index(offset)],
+            recvs.at[semaphore_index(offset)],
+            device_id=(peer(offset),),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
     for owner_index in range(owners):
 
         @pl.when(owner == owner_index)
@@ -8842,18 +8877,24 @@ def _gather_local_pair_rows(
             destination[row_slice] = source[...]
             copies = []
             for offset in range(owners - 1, 0, -1):
-                copy = tpu.make_async_remote_copy(
-                    source,
-                    destination.at[row_slice],
-                    sends.at[semaphore_index(offset)],
-                    recvs.at[semaphore_index(offset)],
-                    device_id=(peer(offset),),
-                    device_id_type=pl.DeviceIdType.MESH,
-                )
+                copy = owner_copy(offset, row_slice)
                 copy.start()
                 copies.append(copy)
-            for copy in copies:
-                copy.wait()
+            if not defer_waits:
+                for copy in copies:
+                    copy.wait()
+
+    if defer_waits:
+
+        def wait_for_rows():
+            # The same waits as each owner's above: every owner's copy on a
+            # semaphore moves the same bytes (a slot of rows_per_owner rows),
+            # and a wait names only its semaphores and byte count.
+            for offset in range(owners - 1, 0, -1):
+                owner_copy(offset, pl.ds(0, rows_per_owner)).wait()
+
+        return wait_for_rows
+    return None
 
 
 # Repeating-stack composition.
@@ -9779,6 +9820,12 @@ def stack(
     # KernelConfig.attention_host_round_after_join: the KDA and MLA branches
     # start the output projection's host round; it finishes after their join.
     host_round_after_join = ATTENTION_HOST_ROUND_AFTER_JOIN and attention_rank_rows
+    # KernelConfig.attention_input_gather_in_branches: q2's gather of the
+    # attention input rows (pairs' rows copied in place: 2 or 4 rows a pair)
+    # is waited for in the KDA and MLA branches.
+    input_gather_in_branches = (
+        ATTENTION_INPUT_GATHER_IN_BRANCHES and attention_rank_rows
+    )
     # One row a rank (8 rows): the gather's rows travel as flat wires.
     rank_row_wires = attention_rank_rows and owned_rows == 2
     # KernelConfig.crossed_pair_gathers (rank-row steps): both ranks of a pair
@@ -11309,6 +11356,9 @@ def stack(
 
             _phase_end(layer_scope.pop())
             layer_scope.append(_phase_start("q2_pre_norm_gather"))
+            # KernelConfig.attention_input_gather_in_branches: the gather's
+            # waits (wait_for_attention_input), run first in each branch.
+            finish_input_gather = None
             if kda_shard_swap:
                 # Every row is the swapped projection's input; attention reads
                 # the group's.
@@ -11382,7 +11432,7 @@ def stack(
                 _phase_end(t0)
             elif sequence_parallel_pre_attention:
                 normalize(owned_rows_vmem, attention_norm_vmem)
-                _gather_local_pair_rows(
+                finish_input_gather = _gather_local_pair_rows(
                     owned_rows_vmem,
                     normalized_vmem,
                     communication_workspace.send_semaphores,
@@ -11390,11 +11440,22 @@ def stack(
                     communication_workspace.shared_local_reduction_vmem,
                     owners=sp_owners,
                     cross_cores=crossed_pair_gathers,
+                    defer_waits=input_gather_in_branches,
                 )
             else:
                 normalize(normalized_vmem, attention_norm_vmem)
 
             _phase_end(layer_scope.pop())
+
+            def wait_for_attention_input():
+                # The first work of each attention branch (in the MLA branch,
+                # once its weight copies have started): nothing between the
+                # gather's start and here touches normalized_vmem,
+                # owned_rows_vmem or the communication semaphores 0..2, and
+                # each branch reads normalized_vmem only after this.
+                if finish_input_gather is not None:
+                    with _phase("q2b_pre_norm_gather_wait"):
+                        finish_input_gather()
 
             def release_kda_inputs():
                 if attention_schedule == "overlap":
@@ -11408,6 +11469,7 @@ def stack(
                     )
 
             def run_delta_attention():
+                wait_for_attention_input()
                 state_index = layer_index - layer_index // 4
                 auxiliary_sources = tuple(
                     layer_weights[name].at[state_index] for name in KDA[4:]
@@ -12049,6 +12111,11 @@ def stack(
                             after_query_up=(
                                 functools.partial(start_latent_down_copy, layer_index)
                                 if latent_down_prefetch and not dense_layer
+                                else None
+                            ),
+                            wait_for_input=(
+                                wait_for_attention_input
+                                if finish_input_gather is not None
                                 else None
                             ),
                             **mla_options,

@@ -106,6 +106,14 @@ class KernelConfig:
     # (in traces same-parity rounds add ~0.8 us to the core-0 ranks' lag
     # behind the core-1 ranks). The same slots and semaphores; the same bits.
     crossed_pair_gathers: bool = False
+    # Steps with attention_rank_rows: each layer's gather of the attention
+    # input rows (q2) starts its copies before the layer's KDA/MLA branch,
+    # and each branch waits for them as its first work (the MLA branch once
+    # its q/kv-up, gate and indexer weight copies have started). The MLA
+    # branch's entry runs the instruction-overlay handler (its first overlay
+    # and the next one's prefetch), which then overlaps the gather instead of
+    # following it. The same rows (bit-identical).
+    attention_input_gather_in_branches: bool = False
     # Token-scattered decode MoE with the routed and shared reduce-scatters
     # (B6-B28 rows, pooled weights): before the experts only the shared
     # expert's gate/up projection runs; its down projection and the start of

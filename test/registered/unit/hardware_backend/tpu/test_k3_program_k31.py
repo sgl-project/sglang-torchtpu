@@ -7064,6 +7064,258 @@ print("OK")
         )
 
 
+class TestAttentionInputGatherInBranches(CustomTestCase):
+    """``KernelConfig.attention_input_gather_in_branches``: the rank-row
+    steps' gather of the attention input rows
+    (``_gather_local_pair_rows(defer_waits=True)``: the four pairs' rows
+    copied in place, crossed and same-parity) started before a two-branch
+    ``cond`` and waited for in each branch through the returned function, in
+    Pallas interpret mode on 32 host devices (TestAttentionHostBf16's
+    harness, stale NaN bytes in the rows and the transport wires). One
+    branch waits first (the decoder's KDA branch); the other first starts
+    and waits a local copy, holds the core-0 ranks back and waits inside a
+    loop of one trip (the MLA branch's weight copies, overlay handler and
+    prefix region). At 2 and 4 rows a pair (B8, B16), in two rounds with
+    different rows and both branches taken in each, the rows read in either
+    branch equal the in-line gather's bit for bit; each rank then writes NaN
+    over its source (free once the waits return: a copy still reading it
+    would deliver NaN). Then the decoder's order on these steps: the aux
+    capture's in-line gather and the next layer's input gather waited in the
+    branch, back to back on semaphores 0..2 with the core-0 ranks starting
+    late (eager DMAs). DMAs on wait and eager; no DMA semaphore is left
+    nonzero; with happens-before race detection no read of the rows races
+    a copy."""
+
+    SCRIPT = (
+        TestAttentionHostBf16.PRELUDE
+        + r"""
+import sys
+
+DMA_MODE = sys.argv[1]
+# Happens-before race detection (slower): the crossed 2-row cases only.
+RACES = len(sys.argv) > 2 and sys.argv[2] == "races"
+rng = np.random.default_rng(3)
+vmem = pltpu.VMEM
+LAG = int(os.environ.get("LAG", "100"))  # core-0 lag: loop trips a pair index
+bits = lambda x: x.view(np.uint16)
+nan = lambda ref: jnp.full(ref.shape, jnp.nan, ref.dtype)
+
+
+def run(kernel, inputs, out_shapes, scratch, mode=None):
+    def body(*xs):
+        outs = pl.pallas_call(
+            kernel,
+            out_shape=out_shapes,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)]
+            + [pl.BlockSpec(memory_space=vmem)] * (len(xs) - 1),
+            out_specs=[pl.BlockSpec(memory_space=vmem)] * len(out_shapes),
+            scratch_shapes=scratch,
+            compiler_params=pltpu.CompilerParams(has_side_effects=True),
+            interpret=pltpu.InterpretParams(dma_execution_mode=mode or DMA_MODE,
+                                            detect_races=RACES),
+        )(*(x[0] for x in xs))
+        return [y[None] for y in outs]
+
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("tp"),) * len(inputs),
+                              out_specs=[P("tp")] * len(out_shapes), check_vma=False))
+    return [np.asarray(y) for y in f(*inputs)]
+
+
+def handshake(ready):
+    # Every local rank has filled its buffers before any copy lands. One
+    # semaphore per handshake, so a fast rank's next handshake cannot count
+    # towards this one.
+    rank = jax.lax.axis_index("tp")
+    for offset in range(1, 8):
+        pltpu.semaphore_signal(ready, 1, device_id=(rank ^ offset,),
+                               device_id_type=pl.DeviceIdType.MESH)
+    pltpu.semaphore_wait(ready, 7)
+
+
+def lag(spin, trips):
+    spin[...] = jnp.zeros(spin.shape, jnp.float32)
+
+    def trip(i, carry):
+        spin[0:1, :] = spin[0:1, :] + 1.0
+        return carry
+
+    jax.lax.fori_loop(0, trips, trip, 0)
+
+
+def expected(rows_in, cross):
+    # Rank r's slot of pair p: rank 8 h + 2 p + (r % 2), or its other core.
+    rows = rows_in.shape[1]
+    out = np.empty((32, 4 * rows, H), rows_in.dtype)
+    for r in range(32):
+        for p in range(4):
+            source = 8 * (r // 8) + 2 * p + (r % 2)
+            if cross and p != (r % 8) // 2:
+                source ^= 1
+            out[r, p * rows:(p + 1) * rows] = rows_in[source]
+    return out
+
+
+def in_branches(rows_in, select, cross):
+    # rows_in [32, 2, r, H]: two rounds' rows; select [32, 2]: each round's
+    # branch. Each round gathers its rows in line, then again with the waits
+    # deferred into a two-branch cond: branch 0 waits first (the KDA
+    # branch); branch 1 first starts and waits a local copy and spins the
+    # core-0 ranks (the MLA branch's weight copies and overlay handler) and
+    # waits for the rows inside a loop of one trip (the MLA prefix region).
+    # After the waits each rank reads the rows, then writes NaN over its
+    # source (free once the waits have returned) and the rows.
+    rows = rows_in.shape[2]
+
+    def kernel(select_ref, rows_ref, inline_out, deferred_out, source, rows_vmem, wires,
+               spin, other, sends, recvs, local_sems, ready):
+        rank = jax.lax.axis_index("tp")
+        for rnd in range(2):
+            source[...] = rows_ref[rnd]
+            rows_vmem[...] = nan(rows_vmem)
+            wires[...] = nan(wires)
+            handshake(ready.at[3 * rnd])
+            dmk._gather_local_pair_rows(source, rows_vmem, sends, recvs, wires, owners=4,
+                                        cross_cores=cross)
+            inline_out[rnd] = rows_vmem[...]
+            rows_vmem[...] = nan(rows_vmem)
+            handshake(ready.at[3 * rnd + 1])
+            wait_for_rows = dmk._gather_local_pair_rows(
+                source, rows_vmem, sends, recvs, wires, owners=4, cross_cores=cross,
+                defer_waits=True)
+
+            def wait_first():
+                wait_for_rows()
+                deferred_out[rnd] = rows_vmem[...]
+
+            def wait_later():
+                copy = pltpu.make_async_copy(rows_ref.at[1 - rnd], other, local_sems.at[0])
+                copy.start()
+                lag(spin, jnp.where(rank % 2 == 0, (rank % 8) // 2 + 1, 0) * LAG)
+                copy.wait()
+
+                def one_trip(_, carry):
+                    wait_for_rows()
+                    deferred_out[rnd] = rows_vmem[...]
+                    return carry
+
+                jax.lax.fori_loop(0, jnp.minimum(select_ref[rnd], 1), one_trip, 0)
+
+            jax.lax.cond(select_ref[rnd] == 0, wait_first, wait_later)
+            source[...] = nan(source)
+            rows_vmem[...] = nan(rows_vmem)
+            handshake(ready.at[3 * rnd + 2])
+
+    out = [jax.ShapeDtypeStruct((2, 4 * rows, H), jnp.bfloat16)] * 2
+    scratch = [vmem((rows, H), jnp.bfloat16), vmem((4 * rows, H), jnp.bfloat16),
+               vmem((8, 224, 128), jnp.float32), vmem((8, 128), jnp.float32),
+               vmem((rows, H), jnp.bfloat16), pltpu.SemaphoreType.DMA((16,)),
+               pltpu.SemaphoreType.DMA((16,)), pltpu.SemaphoreType.DMA((1,)),
+               pltpu.SemaphoreType.REGULAR((6,))]
+    return run(kernel, (select, rows_in), out, scratch)
+
+
+for rows in (2,) if RACES else (2, 4):  # B8 and B16 rank-row steps
+    distinct = rng.standard_normal((32, 2, rows, H)).astype(BF16)
+    distinct[:, 1] = -distinct[:, 1]
+    # Every pair of rounds through both branches, on different ranks.
+    select = np.stack([np.array([r % 2, 1 - r % 2]) for r in range(32)]).astype(np.int32)
+    select[8:16] = select[8:16, ::-1]
+    for cross in (True,) if RACES else (False, True):
+        inline, deferred = in_branches(distinct, select, cross)
+        for rnd in range(2):
+            want = expected(distinct[:, rnd], cross)
+            assert np.array_equal(bits(inline[:, rnd]), bits(want)), (rows, cross, rnd)
+            assert np.array_equal(bits(deferred[:, rnd]), bits(inline[:, rnd])), (rows, cross, rnd)
+        print(f"{rows} rows a pair, crossed={cross}, dma={DMA_MODE}: rows waited in either "
+              "branch bit-exact", flush=True)
+
+
+def back_to_back(rows_in, select):
+    # The decoder's order on rank-row steps: the aux capture's gather of a
+    # layer's rows (in line), then the next layer's input gather of new rows
+    # (here negated) with its waits in the attention branch, both crossed, on
+    # semaphores 0..2 with no round between them; each read as soon as its
+    # waits return. After the handshake core 0 of pair p starts
+    # (p + 1) * LAG loop trips late. Eager DMAs: each sender's copies land in
+    # issue order (on wait, the interpreter may run a semaphore's later copy
+    # first).
+    rows = rows_in.shape[1]
+
+    def kernel(select_ref, rows_ref, aux_out, input_out, source, aux, inputs, wires, spin,
+               sends, recvs, ready):
+        for ref in (aux, inputs):
+            ref[...] = nan(ref)
+        wires[...] = nan(wires)
+        source[...] = rows_ref[...]
+        handshake(ready.at[0])
+        rank = jax.lax.axis_index("tp")
+        lag(spin, jnp.where(rank % 2 == 0, (rank % 8) // 2 + 1, 0) * LAG)
+        dmk._gather_local_pair_rows(source, aux, sends, recvs, wires, owners=4,
+                                    cross_cores=True)
+        aux_out[...] = aux[...]
+        source[...] = -source[...]
+        wait_for_rows = dmk._gather_local_pair_rows(
+            source, inputs, sends, recvs, wires, owners=4, cross_cores=True,
+            defer_waits=True)
+
+        def branch():
+            wait_for_rows()
+            input_out[...] = inputs[...]
+
+        jax.lax.cond(select_ref[0] == 0, branch, branch)
+
+    out = [jax.ShapeDtypeStruct((4 * rows, H), jnp.bfloat16)] * 2
+    scratch = [vmem((rows, H), jnp.bfloat16), vmem((4 * rows, H), jnp.bfloat16),
+               vmem((4 * rows, H), jnp.bfloat16), vmem((8, 224, 128), jnp.float32),
+               vmem((8, 128), jnp.float32), pltpu.SemaphoreType.DMA((16,)),
+               pltpu.SemaphoreType.DMA((16,)), pltpu.SemaphoreType.REGULAR((1,))]
+    return run(kernel, (select, rows_in), out, scratch, mode="eager")
+
+
+for rows in (2,) if RACES else (2, 4):
+    paired = np.repeat(rng.standard_normal((16, rows, H)).astype(BF16), 2, axis=0)
+    select = (np.arange(32, dtype=np.int32) % 2)[:, None]
+    aux, inputs = back_to_back(paired, select)
+    assert np.array_equal(bits(aux), bits(expected(paired, False))), rows
+    assert np.array_equal(bits(inputs), bits(expected(-paired, False))), rows
+    print(f"{rows} rows a pair: aux capture then input gather waited in the branch "
+          "bit-exact", flush=True)
+print("OK")
+"""
+    )
+
+    def _run(self, *args):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [sys.executable, "-c", self.SCRIPT, *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1500,
+        )
+        output = result.stdout[-2000:] + result.stderr[-3000:]
+        self.assertIn("OK", result.stdout, output)
+        self.assertNotIn("non-zero count", result.stdout, output)
+        self.assertNotIn("RACE DETECTED", result.stdout, output)
+
+    def test_rows_waited_in_either_branch(self):
+        self._run("on_wait")
+
+    def test_rows_waited_in_either_branch_with_eager_dmas(self):
+        self._run("eager")
+
+    def test_rows_waited_in_either_branch_race_free(self):
+        self._run("eager", "races")
+
+
 class TestSelectExchangeHook(CustomTestCase):
     """``IndexSelect.select(in_exchange, keys_ready)`` (the decode's
     ``dsa_prologue_in_select`` runs the attention's prologue in the first and
