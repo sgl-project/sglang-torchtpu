@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=9950, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10850, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -8876,7 +8876,23 @@ class TestDecodeKnobsTogether(CustomTestCase):
     still in flight at entry (``KernelConfig.attention_input_gather_in_branches``:
     a copy into NaN rows, waited once by ``wait_for_input``) and the q-up hook
     of ``decode_latent_down_prefetch`` (NaNs copied over the q-up weight) in
-    the same layer, with the serving q6 knobs and ``dcp_pair_lse_rows``."""
+    the same layer, with the serving q6 knobs and ``dcp_pair_lse_rows``.
+
+    The layer chain (``moe``'s harness at B1 x7's 8 rows, layers 1..4 of a
+    loop) runs each layer's pieces in the decoder's order: the pair's rows
+    from its prefix rows, the crossed pre-attention gather, an attention
+    stand-in by layer (the delta branch: the gather's wait, its state reads,
+    the latent-down copy; the latent branch: its q-up copy into the
+    latent-down storage, the wait, q-up, the latent-down copy), a TP32 sum
+    into the pair's prefix rows, the MoE, the residual rows and the aux
+    captures after layers 1 and 3. With ``decode_latent_down_prefetch``,
+    ``moe_routed_send_in_expert_region``, ``attention_input_gather_in_branches``,
+    ``moe_output_round_next_layer`` (the round and the residual rows finished
+    in the next layer's first code) and ``aux_capture_in_flight`` on, eager
+    and with DMAs at their waits, every layer's finished and gathered rows,
+    the gathered latents, the aux slots and the last rows are those of the
+    run with them off, byte for byte. Each MoE's scoped buffers and region B
+    are poisoned after it (with the deferred round, the owned rows too)."""
 
     MOE_SETUP = r"""
 import os
@@ -8998,6 +9014,226 @@ for name, x in (("rows", rows), ("latents", latents)):
 print("OK")
 """
 
+    CHAIN_MAIN = r"""# After MOE_MAIN's setup with LAYERS = 5: layers 1..4 run in the loop.
+from sglang_tpu.k3_programs.common import collectives32
+
+T, AUX = 2, (4, 2)  # the pair's rows; captures after layers 3 and 1 (slots out of layer order)
+CAPTURES = sorted(a - 1 for a in AUX)
+x0 = hidden[0]
+qup = bf(rng.standard_normal((32, H, 128)) * H**-0.5)  # the "MLA" layers' q-up (in region B)
+state = (rng.standard_normal((32, LAYERS, B, H)) * 0.05).astype(np.float32)  # "KDA" state reads
+noise = (rng.standard_normal((32, LAYERS, B, H)) * 0.01).astype(np.float32)
+ROUND = 14  # WS index of the output round's transport (then its two semaphore arrays)
+# owned, prefix, mixture (AUX staging), attention input, "KDA" state, state / q-up semaphores,
+# aux semaphore, AUX's remote pair, the attention stand-in's reduction buffers and semaphores.
+MINE = (vmem((T, H), jnp.bfloat16), vmem((B, H), jnp.bfloat16), vmem((B, H), jnp.bfloat16),
+        vmem((B, H), F32), vmem((B, H), F32), dma(()), dma(()), dma((1,)), dma((2,)),
+        COMM[0], COMM[2], dma((16,)), dma((16,)))
+
+
+def run(knobs, mode, args):
+    on = knobs == "on"
+    prefetch = region = ovb = aux_flight = input_wait = on
+    dmk.ROUTED_SEND_IN_EXPERT_REGION = region  # read when moe() is traced
+    dmk.OUTPUT_ROUND_NEXT_LAYER = ovb
+
+    def kernel(x0_ref, bias_ref, norm_ref, noise_ref, router_hbm, ld_hbm, qup_hbm, lu_hbm, sgu_hbm,
+               sd_hbm, egu_hbm, egus_hbm, ed_hbm, eds_hbm, state_hbm, aux_in, owned_out,
+               gathered_out, latent_out, final_out, aux_out, phase_out, *scratch):
+        del aux_in  # aliased to aux_out (NaN)
+        own = scratch[:len(OWN)]
+        ws = scratch[len(OWN):len(OWN) + len(WS)]
+        comm = scratch[len(OWN) + len(WS):len(OWN) + len(WS) + len(COMM)]
+        (owned, prefix, mixture, att_in, kst_v, kst_sem, qup_sem, aux_sem, aux_remote, att_local,
+         att_host, att_send, att_recv) = scratch[len(OWN) + len(WS) + len(COMM):]
+        (router_v, router_sems, lu_v, lu_sem, egu_v, egus_v, ed_v, eds_v, e_sems, ld_v, sgu_v,
+         sd_v, ld_sems, schedule, schedule_sem, rows_v) = own
+        comm_ws = dmk.AttentionCommunicationWorkspace(*comm)
+        workspace = dmk.MixtureOfExpertsWorkspace(
+            *ws, expert_schedule_smem=schedule, expert_schedule_semaphore=schedule_sem)
+        outv, osend, orecv = ws[ROUND:ROUND + 3]
+        phase = comm_ws.reduction_phase
+        phase[0] = 0
+        rank = jax.lax.axis_index("tp")
+        pair = (rank % 8) // 2
+        def poison(ref):  # NaN, or -1 in integer buffers
+            bad = jnp.nan if jnp.issubdtype(ref.dtype, jnp.floating) else -1
+            ref[...] = jnp.full(ref.shape, bad, ref.dtype)
+        stage = mixture.at[pl.ds(0, T)]
+        prefix[...] = x0_ref[...]
+        collectives32.barrier()
+
+        def latent_down_copy(index):  # as the stack's: the layer parity's semaphore
+            return pltpu.make_async_copy(ld_hbm.at[index], ld_v, ld_sems.at[index % 2])
+
+        def start_latent_down_copy(index):  # the stack's region on a never-false condition
+            pl.when(phase[0] >= 0)(lambda: latent_down_copy(index).start())
+
+        def finish(index, capture=True):  # q0 (prefix rows + MoE rows), then the aux capture
+            for o in range(4):
+                @pl.when(pair == o)
+                def q0(o=o):
+                    rows = pl.ds(o * T, T)
+                    finished = (prefix[rows].astype(F32) + owned[...].astype(F32)).astype(jnp.bfloat16)
+                    owned[...] = finished
+                    prefix[rows] = finished
+            owned_out[index] = owned[...]
+            if not capture:
+                return
+            if aux_flight:
+                dmk.capture_aux_rows(index, AUX, CAPTURES[0], owned, stage, aux_out, aux_sem.at[0],
+                                     aux_remote, owners=4, cross_cores=True)
+            else:
+                for slot, aux_layer in enumerate(AUX):
+                    @pl.when(index == aux_layer - 1)
+                    def gather_capture(slot=slot):
+                        dmk._gather_local_pair_rows(
+                            owned, prefix, comm_ws.send_semaphores, comm_ws.receive_semaphores,
+                            comm_ws.shared_local_reduction_vmem, owners=4, cross_cores=True)
+                        copy = pltpu.make_async_copy(prefix, aux_out.at[slot], aux_sem.at[0])
+                        copy.start()
+                        copy.wait()
+
+        @pl.loop(1, LAYERS)
+        def layer(index):
+            if ovb:
+                @pl.when(index > 1)
+                def finish_previous_layer():  # the stack's first code with the knob
+                    dmk.finish_token_parallel_outputs(outv, osend, orecv, owned)
+                    phase[0] += 3
+                    finish(index - 1)
+
+            for o in range(4):  # q1: the pair's attention rows from its prefix rows
+                @pl.when(pair == o)
+                def q1(o=o):
+                    owned[...] = (prefix[pl.ds(o * T, T)].astype(F32) * 0.75 + 0.25).astype(jnp.bfloat16)
+            # q2: the crossed pre-attention gather (communication semaphores 0..2).
+            wait_input = dmk._gather_local_pair_rows(
+                owned, rows_v, comm_ws.send_semaphores, comm_ws.receive_semaphores,
+                comm_ws.shared_local_reduction_vmem, owners=4, cross_cores=True,
+                defer_waits=input_wait)
+
+            def wait_for_attention_input():
+                if wait_input is not None:
+                    wait_input()
+
+            def delta_attention():  # waits first, then the state reads and the latent-down copy
+                wait_for_attention_input()
+                state_copy = pltpu.make_async_copy(state_hbm.at[index], kst_v, kst_sem)
+                state_copy.start()
+                if prefetch:
+                    start_latent_down_copy(index)
+                state_copy.wait()
+                gathered_out[index] = rows_v[...]
+                att_in[...] = rows_v[...].astype(F32) * 0.5 + kst_v[...]
+
+            def latent_attention():  # its q-up copy into region B, the wait, q-up, the copy after it
+                qup_copy = pltpu.make_async_copy(qup_hbm, ld_v, qup_sem)
+                qup_copy.start()
+                wait_for_attention_input()
+                qup_copy.wait()
+                rows = rows_v[...]
+                query = jnp.dot(rows, ld_v[...], preferred_element_type=F32)
+                if prefetch:
+                    start_latent_down_copy(index)
+                gathered_out[index] = rows
+                att_in[...] = rows.astype(F32) * 0.5 + jnp.tile(query, (1, H // 128))
+
+            jax.lax.cond(index % 2 == 1, latent_attention, delta_attention)
+            att = dmk._all_reduce_rows(noise_ref[index] + att_in[...], att_local, att_host,
+                                       att_send, att_recv)
+            for o in range(4):  # q9: the attention rows into the pair's prefix rows
+                @pl.when(pair == o)
+                def q9(o=o):
+                    rows = pl.ds(o * T, T)
+                    prefix[rows] = (prefix[rows].astype(F32) + att[o * T:(o + 1) * T]).astype(jnp.bfloat16)
+            rows_v[...] = (rows_v[...].astype(F32) + att).astype(jnp.bfloat16)  # the MoE input
+            collectives32.barrier()  # the MoE input gather (t10) and the routing rounds
+            weights = dmk.MixtureOfExpertsWeights(
+                router_hbm, router_v, router_sems, bias_ref, ld_hbm.at[index], lu_hbm, lu_v,
+                lu_sem, norm_ref, sgu_hbm, sd_hbm, egu_hbm, egu_v, egus_hbm, egus_v, ed_hbm, ed_v,
+                eds_hbm, eds_v, e_sems)
+            dmk.moe(rows_v, owned, weights=weights, workspace=workspace,
+                    communication_workspace=comm_ws, synchronize_devices=False,
+                    group_pending_expert_routes=True, token_scatter_output=True,
+                    routed_reduce_scatter=True, token_parallel_up=True,
+                    prepare_weights_vmem=(ld_v, sgu_v, sd_v),
+                    latent_input_prefetch=latent_down_copy(index) if prefetch else None,
+                    output_round_next_layer=ovb)
+            latent_out[index] = comm_ws.latent_gather_vmem[...]
+            # The MoE's scoped buffers and region B hold other data from here on (the round's
+            # transport is persistent); with the deferred round, so do the owned rows.
+            for ref in (*ws[:12], ld_v, sgu_v, sd_v, lu_v, *((owned,) if ovb else ())):
+                poison(ref)
+            if not ovb:
+                finish(index)
+
+        if ovb:  # the last layer's round and finish (no capture)
+            dmk.finish_token_parallel_outputs(outv, osend, orecv, owned)
+            phase[0] += 3
+            finish(jnp.int32(LAYERS - 1), capture=False)
+        if aux_flight:  # the last capture's copies
+            dmk.wait_aux_rows(stage, aux_out, aux_sem.at[0], aux_remote, owners=4, cross_cores=True)
+        owned[...] = (owned[...].astype(F32) * 0.5).astype(jnp.bfloat16)
+        dmk._gather_local_pair_rows(owned, rows_v, comm_ws.send_semaphores, comm_ws.receive_semaphores,
+                                    comm_ws.shared_local_reduction_vmem, owners=4, cross_cores=True)
+        final_out[...] = rows_v[...]
+        phase_out[0] = phase[0]
+
+    def body(x, b, n, z, *hbm):
+        out = pl.pallas_call(
+            kernel,
+            out_shape=(jax.ShapeDtypeStruct((LAYERS, T, H), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((LAYERS, B, H), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((LAYERS, B, LAT), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((B, H), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((len(AUX), B, H), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((1,), jnp.int32)),
+            in_specs=[pl.BlockSpec(memory_space=vmem)] * 4 + [pl.BlockSpec(memory_space=pl.ANY)] * 12,
+            out_specs=[pl.BlockSpec(memory_space=vmem)] * 4 + [pl.BlockSpec(memory_space=pl.ANY),
+                                                               pl.BlockSpec(memory_space=smem)],
+            scratch_shapes=[*OWN, *WS, *COMM, *MINE],
+            input_output_aliases={15: 4},
+            compiler_params=pltpu.CompilerParams(has_side_effects=True, collective_id=7),
+            interpret=pltpu.InterpretParams(detect_races=True, dma_execution_mode=mode,
+                                            uninitialized_memory="nan"),
+        )(x, b, n, z[0], *(h[0] for h in hbm))
+        return tuple(o[None] for o in out)
+
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P(), P(), *(P("tp"),) * 13),
+                              out_specs=(P("tp"),) * 6, check_vma=False))
+    return [np.asarray(x) for x in f(*args)]
+
+
+# The operands on their devices; the host copies go (32 interpret devices peak at about 9 GB).
+put = lambda x, spec: jax.device_put(x, jax.sharding.NamedSharding(mesh, spec))
+args = [put(x0, P()), put(bias, P()), put(norm, P())]
+for name in ("noise", "router", "ld", "qup", "lu", "sgu", "sd", "egu", "egus", "edown", "eds", "state"):
+    args.append(put(globals().pop(name), P("tp")))
+args.append(put(np.full((32, len(AUX), B, H), np.nan, BF16), P("tp")))
+del hidden
+knobs, mode = os.environ["RUN"].split(",")
+owned_rows, gathered, latents, final, aux, phase = run(knobs, mode, args)
+assert not ipc.races.races_found  # reset by every interpreted call
+for name, x in (("owned", owned_rows), ("gathered", gathered), ("latents", latents), ("final", final),
+                ("aux", aux)):
+    assert np.isfinite(x[:, 1:].astype(np.float32) if name in ("owned", "gathered", "latents")
+                       else x.astype(np.float32)).all(), name
+assert len(set(phase[:, 0].tolist())) == 1, phase[:, 0]
+for r in range(32):  # both ranks of a pair and every host hold the pair's rows
+    assert owned_rows[r].tobytes() == owned_rows[r % 8 // 2 * 2].tobytes(), r
+# Each aux slot: the four pairs' finished rows of its layer, on every rank.
+want = np.stack([np.concatenate([owned_rows[2 * o, a - 1] for o in range(4)]) for a in AUX])
+assert all(aux[r].tobytes() == want.tobytes() for r in range(32))
+for layer in range(2, LAYERS):  # the layers differ
+    assert owned_rows[0, layer].tobytes() != owned_rows[0, layer - 1].tobytes(), layer
+for name, x in (("owned", owned_rows), ("gathered", gathered), ("latents", latents), ("final", final),
+                ("aux", aux), ("phase", phase)):
+    np.save(os.path.join(os.environ["OUT"], name + ".npy"), x.view(np.int32 if name == "phase" else np.uint16))
+print(f"{knobs} {mode}: phase {phase[0, 0]}")
+print("OK")
+"""
+
     def test_moe_latent_down_with_the_expert_region(self):
         import os
         import subprocess
@@ -9053,6 +9289,60 @@ print("OK")
                     outputs["both"],
                 ):
                     self.assertEqual(want.tobytes(), got.tobytes(), (mode, what))
+
+    def test_layer_chain_with_the_knobs_together(self):
+        import os
+        import subprocess
+        import sys
+        import tempfile
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        prelude, setup = TestAttentionHostBf16.PRELUDE, self.MOE_MAIN
+        setup = setup[: setup.index("def run(")].replace("LAYERS = 3\n", "LAYERS = 5\n")
+        script = (
+            self.MOE_SETUP
+            + prelude[: prelude.index("def project(")]
+            + setup
+            + self.CHAIN_MAIN
+        )
+        names = ("owned", "gathered", "latents", "final", "aux", "phase")
+        outputs = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            # One process a run (32 interpret devices peak at about 9 GB).
+            for run in ("off,eager", "on,eager", "on,on_wait"):
+                out = os.path.join(tmp, run.replace(",", "-"))
+                os.makedirs(out)
+                env = dict(
+                    os.environ,
+                    PYTHONPATH=os.pathsep.join(sys.path),
+                    NPROC="128",
+                    RUN=run,
+                    OUT=out,
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", script],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=3600,
+                )
+                self.assertIn(
+                    "OK",
+                    result.stdout,
+                    f"{run}: {result.returncode} "
+                    + result.stdout[-2000:]
+                    + result.stderr[-3000:],
+                )
+                self.assertNotIn("non-zero count", result.stdout + result.stderr)
+                outputs[run] = [
+                    np.load(os.path.join(out, f"{name}.npy")) for name in names
+                ]
+        for run in ("on,eager", "on,on_wait"):
+            for name, want, got in zip(names, outputs["off,eager"], outputs[run]):
+                self.assertEqual(want.tobytes(), got.tobytes(), (run, name))
 
     @staticmethod
     def _mla_script():
