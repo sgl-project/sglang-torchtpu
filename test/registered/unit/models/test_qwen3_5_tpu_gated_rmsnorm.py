@@ -24,12 +24,12 @@ from sglang.srt.layers.attention.native_torch.layernorm_gated import RMSNormGate
 from sglang.test.test_utils import CustomTestCase
 
 
-def _ref(x, weight, z, eps):
+def _ref(x, weight, z, eps, gate=torch.nn.functional.silu):
     xf = x.float()
     var = xf.pow(2).mean(-1, keepdim=True)
     out = xf * torch.rsqrt(var + eps) * weight.float()
     if z is not None:
-        out = out * torch.nn.functional.silu(z.float())
+        out = out * gate(z.float())
     return out.to(x.dtype)
 
 
@@ -69,9 +69,20 @@ class TestTpuGatedRMSNorm(CustomTestCase):
         expected = _ref(x, norm.weight, z, self.EPS)
         torch.testing.assert_close(norm(x, z), expected)
 
+    def test_qwen4_exp_sigmoid_gate_matches_reference(self):
+        """Qwen4-Exp GDN gates its output norm with sigmoid, as FLA does."""
+        torch.manual_seed(0)
+        norm = self._norm("sigmoid")
+        x = torch.randn(4, self.H)
+        z = torch.randn(4, self.H)
+        expected = _ref(x, norm.weight, z, self.EPS, gate=torch.sigmoid)
+        torch.testing.assert_close(norm(x, z), expected, rtol=1e-5, atol=1e-5)
+        # Not the SiLU gate.
+        self.assertFalse(torch.allclose(norm(x, z), _ref(x, norm.weight, z, self.EPS)))
+
     def test_unsupported_activation_raises(self):
-        # A non-silu gate must fail loudly, not silently drop the gate.
-        with self.assertRaises(NotImplementedError):
+        # Any other gate must fail loudly, not silently drop the gate.
+        with self.assertRaisesRegex(NotImplementedError, "sigmoid"):
             RMSNormGated(self.H, activation="gelu")
 
     def test_tpu_attention_gate_without_npu_kernel(self):
