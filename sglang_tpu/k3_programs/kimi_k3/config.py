@@ -281,6 +281,15 @@ class KernelConfig:
     # partial per chip -- half the cross-chip combine bytes. Merged partials
     # round to BF16 once more.
     dcp_pair_combine: bool = False
+    # dcp_pair_combine's stage two (the cross-chip sends): each merged
+    # partial leaves as its 512 latent lanes plus two lse rows -- its packet
+    # rows' log-sum-exp high and low BF16 parts lane-major in the first two
+    # rows of lanes 512:640 -- two copies on the same semaphores, instead of
+    # all 640 lanes (126 of them zero): at 24 packet rows (B1 x7) 784
+    # instead of 960 granules a packet, 18% fewer cross-chip combine bytes.
+    # The owner reads its partials' log-sum-exps from those rows. The same
+    # values and merge order (bit-identical).
+    dcp_pair_lse_rows: bool = False
     # DCP attention step loop: power-of-two divisions and remainders of
     # positions, pages and steps as arithmetic shifts and masks (floor
     # division for every int32, without the sign fixups), and the step that
