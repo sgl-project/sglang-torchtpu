@@ -1530,6 +1530,12 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
 
     def set_state(self, state: list[torch.Tensor]) -> None:
         """Install a list laid out like ``get_state``; absent buffers stay None."""
+        expected = len(self.get_state())
+        if len(state) != expected:
+            raise ValueError(
+                f"TpuSplitMLATokenToKVPool.set_state expects {expected} tensors, "
+                f"got {len(state)}"
+            )
         it = iter(state)
 
         def take(kind: list) -> list:
@@ -1539,8 +1545,6 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         self.rope_buffer = take(self.rope_buffer)
         self.index_key_buffer = take(self.index_key_buffer)
         self.kpool_raw_buffer = take(self.kpool_raw_buffer)
-        leftover = sum(1 for _ in it)
-        assert leftover == 0, f"set_state got {leftover} extra tensors"
 
     def get_page_buffers(self, layer_id: int) -> list[torch.Tensor]:
         """Layer ``layer_id``'s buffers in a fixed order: NoPE, RoPE, then the
