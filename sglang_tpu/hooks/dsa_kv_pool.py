@@ -20,6 +20,18 @@ size_tpu_dsa_kv_pool
 from __future__ import annotations
 
 
+def _qk_rope_head_dim(model_config) -> int:
+    rope_dim = getattr(model_config, "qk_rope_head_dim", None)
+    if rope_dim is None:
+        hf_config = getattr(model_config, "hf_config", None)
+        rope_dim = getattr(hf_config, "qk_rope_head_dim", None)
+        if rope_dim is None:
+            text_config = getattr(hf_config, "text_config", None)
+            rope_dim = getattr(text_config, "qk_rope_head_dim", None)
+    # Default to a positive dim (budget the RoPE lane) if unspecified.
+    return 64 if rope_dim is None else int(rope_dim)
+
+
 def _split_pool_bytes(kvc, *, layer_ids, all_index_layers: bool) -> int:
     from sglang.srt.configs.model_config import (
         dsa_layer_skips_topk,
@@ -39,7 +51,7 @@ def _split_pool_bytes(kvc, *, layer_ids, all_index_layers: bool) -> int:
         ],
         index_kpool=kpool,
         raw_ring=kpool_raw_ring_pages(page_size=1, kpool=kpool) > 0,
-        qk_rope_head_dim=kvc.model_config.qk_rope_head_dim,
+        qk_rope_head_dim=_qk_rope_head_dim(kvc.model_config),
     )
 
 

@@ -1379,7 +1379,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         index_key_layers: list[bool],
         index_kpool: int,
         raw_ring: bool = False,
-        qk_rope_head_dim: int,
+        qk_rope_head_dim: int = 64,
     ) -> int:
         """Bytes one token takes across all layers' buffers, as allocated.
         A raw ring is sized by request slots, not tokens, so it is not counted."""
