@@ -1042,12 +1042,15 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
+    # A TensorCore call with gather_rope=False never reads the rope cache, so
+    # it may be a placeholder (a model without rope allocates one row).
+    rope_read = sparsecore_layout or gather_rope
+    if rope_read and cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
         raise ValueError(
             f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
             f"{rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
         )
-    if (
+    if rope_read and (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
         or cache_kv_nope.shape[1] != rope_tokens_per_row * cache_kv_rope.shape[1]
     ):

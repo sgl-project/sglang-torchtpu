@@ -49,6 +49,9 @@ CONFIG["server_args"].update(
         "tpu_compile_bs": sorted(set(BUCKETS)),
         # One prefill program: at 1M the chunk cost is the context scan, not the padding.
         "tpu_compile_tokens": [8192],
+        "tpu_compile_tracer": "direct",  # trace graphs from the module, not through Dynamo
+        "use_spmd_compile": True,  # compile each graph on one rank, broadcast it to the rest
+        "enable_attn_tp_input_scattered": False,  # off for SPMD: scattered prefill slices rows at a per-rank offset
         "max_total_tokens": int(os.environ.get("AGENTX_POOL_TOKENS", POOL_TOKENS)),
         "max_mamba_cache_size": 5 * MAX_RUNNING + 64,
         "enable_metrics": True,

@@ -40,10 +40,16 @@ class _FakeQwen3VLDecoderTpuCompilePolicy(CompilePolicy):
     pass
 
 
+class _FakeGlm5NextDecoderTpuCompilePolicy(CompilePolicy):
+    pass
+
+
 def _fake_decoder_policy_module() -> dict[str, types.ModuleType]:
     module = types.ModuleType("sglang_tpu.compilation.decoder_compile_policy")
     module.Qwen3VLDecoderTpuCompilePolicy = _FakeQwen3VLDecoderTpuCompilePolicy
-    return {module.__name__: module}
+    glm = types.ModuleType("sglang_tpu.models.glm5_next_compile_policy")
+    glm.Glm5NextDecoderTpuCompilePolicy = _FakeGlm5NextDecoderTpuCompilePolicy
+    return {module.__name__: module, glm.__name__: glm}
 
 
 class TestGlm5NextVisionHooks(CustomTestCase):
@@ -124,16 +130,39 @@ class TestGlm5NextVisionHooks(CustomTestCase):
             _FakeQwen3VLDecoderTpuCompilePolicy,
         )
 
-    def test_compile_decoder_only_skips_language_model_only_and_encoder_only(self):
+    def test_compile_decoder_only_annotates_text_only_whole_model(self):
+        """--language-model-only compiles the whole model, as the fallback does,
+        under the GLM policy that declares it spmd_safe."""
+
         class _DummyDecoder(torch.nn.Module):
             pass
 
-        language_model_only = SimpleNamespace(
-            visual=None,
-            model=_DummyDecoder(),
-            mm_config=SimpleNamespace(language_only=True, language_model_only=True),
-            decode_embeds_in_language_model=True,
+        def text_only():
+            return SimpleNamespace(
+                visual=None,
+                model=_DummyDecoder(),
+                mm_config=SimpleNamespace(language_only=True, language_model_only=True),
+                decode_embeds_in_language_model=True,
+            )
+
+        language_model_only, dp_attention = text_only(), text_only()
+        with patch.dict(sys.modules, _fake_decoder_policy_module()):
+            with get_flags().dp.override(enabled=False):
+                hooks.compile_glm5_next_decoder_only(None, language_model_only)
+            with get_flags().dp.override(enabled=True):
+                hooks.compile_glm5_next_decoder_only(None, dp_attention)
+
+        self.assertIs(
+            get_torch_compile_policy(language_model_only),
+            _FakeGlm5NextDecoderTpuCompilePolicy,
         )
+        self.assertIsNone(get_torch_compile_policy(language_model_only.model))
+        self.assertTrue(language_model_only.decode_embeds_in_language_model)
+        # DP attention keeps TpuGraphRunner's whole-model fallback.
+        self.assertIsNone(get_torch_compile_policy(dp_attention))
+        self.assertIsNone(get_torch_compile_policy(dp_attention.model))
+
+    def test_compile_decoder_only_skips_encoder_only(self):
         encoder_only = SimpleNamespace(
             visual=torch.nn.Linear(2, 2),
             model=None,
@@ -144,11 +173,9 @@ class TestGlm5NextVisionHooks(CustomTestCase):
             get_flags().dp.override(enabled=False),
             patch.dict(sys.modules, _fake_decoder_policy_module()),
         ):
-            hooks.compile_glm5_next_decoder_only(None, language_model_only)
             hooks.compile_glm5_next_decoder_only(None, encoder_only)
 
-        self.assertIsNone(get_torch_compile_policy(language_model_only.model))
-        self.assertTrue(language_model_only.decode_embeds_in_language_model)
+        self.assertIsNone(get_torch_compile_policy(encoder_only))
         self.assertTrue(encoder_only.keeps_mm_features_on_host)
 
     def test_compile_decoder_only_skips_when_dp_attention_enabled(self):

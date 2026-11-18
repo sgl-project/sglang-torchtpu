@@ -19,6 +19,7 @@ from sglang_tpu.compilation import core_compile_annotations
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 QWEN3_VL_MOE = "sglang.srt.models.qwen3_vl_moe"
+GLM5_NEXT = "sglang.srt.models.glm5_next"
 
 
 class FakeQwen3VLDecoderTpuCompilePolicy(CompilePolicy):
@@ -57,7 +58,7 @@ class TestCoreCompileAnnotations(CustomTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.qwen3_vl_moe = importlib.import_module(QWEN3_VL_MOE)
-        cls.glm5_next = importlib.import_module("sglang.srt.models.glm5_next")
+        cls.glm5_next = importlib.import_module(GLM5_NEXT)
 
     def setUp(self):
         # Annotations are class attributes: undo them so other tests in this
@@ -73,10 +74,11 @@ class TestCoreCompileAnnotations(CustomTestCase):
         modules_patch = patch.dict(sys.modules, _fake_policy_module())
         modules_patch.start()
         self.addCleanup(modules_patch.stop)
-        # Only the Qwen3-VL boundary is under test: hide the other listed model
-        # modules an earlier test may have loaded (restored with sys.modules).
+        # Only the Qwen3-VL and GLM-5.x-Next boundaries are under test: hide the
+        # other listed model modules an earlier test may have loaded (restored
+        # with sys.modules).
         for boundary in core_compile_annotations.CORE_COMPILE_BOUNDARIES:
-            if boundary.module != QWEN3_VL_MOE:
+            if boundary.module not in (QWEN3_VL_MOE, GLM5_NEXT):
                 sys.modules.pop(boundary.module, None)
 
     def test_qwen3_vl_moe_decoder_gets_the_vl_decoder_policy(self):
