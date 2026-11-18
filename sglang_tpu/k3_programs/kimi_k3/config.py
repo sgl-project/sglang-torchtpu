@@ -190,6 +190,15 @@ class KernelConfig:
     # that row's own token mask, instead of a [4 x 96, tokens] mask built by
     # a select chain over the row index. The same masked scores.
     dsa_row_block_masks: bool = False
+    # Kimi-K3.1 decode attention, DSA verifies of 8-row sequences (B1 x7 and
+    # B2 x7: 8 and 16 rows): the DCP attention stages its pages as
+    # [span * 512, 640] FP8 buffers in the MXU's native tile (each page DMA
+    # retiles a pool block, as attention DP2's plain decode and
+    # draft_native_pages do) instead of the pool's [span * 128, 4, 640]
+    # blocks, whose loads relayout every tile (the compact steps' one-hot
+    # gather, dense steps). The same FP8 bytes in the same token order reach
+    # the same products (bit-identical).
+    dsa_native_pages: bool = False
     # Kimi-K3.1 decode attention whose query gather leaves during the indexer
     # (unchunked DSA calls, up to 8 rows): the gather wait, the FP8 query
     # unpack and the softmax state reset run inside the selection's second

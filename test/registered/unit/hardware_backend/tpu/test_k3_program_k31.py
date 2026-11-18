@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=7400, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8200, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -1485,7 +1485,11 @@ class TestSelectedAttention(CustomTestCase):
     own token through the merge), at the FP8 attention's accuracy, and far
     from dense attention. Interpret mode has no ref bitcasts, so the FP8 page
     staging (``_pages``, ``_clean_step``, ``_cache_verify_row``) is replaced
-    by value-level equivalents."""
+    by value-level equivalents (packed ``[rows, 4, 640]`` or native
+    ``[tokens, 640]`` page slots), unless ``K31_INTERPRET_VIEWS=1`` runs the
+    kernel's own staging on an emulation of ref views (``TestDsaNativePages``).
+    A native page DMA's source reshape (``start_native_copies``) reads the
+    indexed pool block, reshaped row-major."""
 
     SCRIPT = """
         import os
@@ -1501,11 +1505,116 @@ class TestSelectedAttention(CustomTestCase):
         G, T, H, FP8 = 4, 512, 3, jnp.float8_e4m3fn
         mla_dcp.GROUPS = (G, 8, 16, 32)
 
-        def tokens(x):
-            return (jax.lax.broadcasted_iota(jnp.int32, x.shape, 0) * x.shape[1]
-                    + jax.lax.broadcasted_iota(jnp.int32, x.shape, 1))
+        # Interpret mode reads and writes only indexed refs. Native page DMAs read a reshaped pool block,
+        # and VIEWS (the kernel's own FP8 staging) loads and stores through bitcast and reshape views.
+        VIEWS = os.environ.get("K31_INTERPRET_VIEWS") == "1"
+        try:
+            from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
+            from jax._src.pallas.mosaic.interpret import utils as interpret_utils
+            from jax._src.state.types import BitcastTransform, ReshapeTransform
+            ipc.get, ipc.swap, ipc.DMA.execute_read, interpret_utils.to_range
+            INTERNALS = True
+        except (ImportError, AttributeError):
+            INTERNALS = False
+        assert INTERNALS or not VIEWS, "interpret-mode views need the interpret internals"
+
+        if INTERNALS:
+            _to_range, _read = interpret_utils.to_range, ipc.DMA.execute_read
+
+            def to_range(transforms):  # a DMA source's trailing reshape reads the indexed block
+                transforms = list(transforms)
+                while transforms and isinstance(transforms[-1], ReshapeTransform):
+                    transforms.pop()
+                return _to_range(transforms)
+
+            def execute_read(self):  # ... reshaped row-major
+                _read(self)
+                with self.lock:
+                    shapes = [t.shape for t in self.src_transforms if isinstance(t, ReshapeTransform)]
+                    if shapes and self.data is not None:
+                        self.data = self.data.reshape(shapes[-1])
+
+            interpret_utils.to_range = to_range
+            ipc.DMA.execute_read = execute_read
+
+        def bitcast_value(x, dtype):  # pltpu.bitcast: a wider element packs consecutive second-minor rows
+            dtype = np.dtype(dtype)
+            x = np.ascontiguousarray(x)
+            if x.dtype.itemsize == dtype.itemsize:
+                return x.view(dtype)
+            *lead, m, n = x.shape
+            if x.dtype.itemsize < dtype.itemsize:
+                k = dtype.itemsize // x.dtype.itemsize
+                x = np.ascontiguousarray(np.swapaxes(x.reshape(*lead, m // k, k, n), -1, -2))
+                return x.view(dtype).reshape(*lead, m // k, n)
+            k = x.dtype.itemsize // dtype.itemsize
+            x = x.view(dtype).reshape(*lead, m, n, k)
+            return np.ascontiguousarray(np.swapaxes(x, -1, -2)).reshape(*lead, m * k, n)
+
+        def view(x, t):  # the value of view t of array x
+            if isinstance(t, BitcastTransform):
+                return bitcast_value(x, t.dtype)
+            if isinstance(t, ReshapeTransform):
+                return x.reshape(t.shape)
+            return x[interpret_utils.to_range([t])]
+
+        def unview(x, t, y):  # array x with its view t replaced by y
+            if isinstance(t, BitcastTransform):
+                return bitcast_value(y, x.dtype)
+            if isinstance(t, ReshapeTransform):
+                return y.reshape(x.shape)
+            x = x.copy()
+            x[interpret_utils.to_range([t])] = y
+            return x
+
+        def split_views(transforms):  # (the indexers before the first view, the rest)
+            transforms = tuple(transforms)
+            for i, t in enumerate(transforms):
+                if isinstance(t, (BitcastTransform, ReshapeTransform)):
+                    return transforms[:i], jax.tree.map(int, transforms[i:])
+            return transforms, ()
+
+        if VIEWS:
+            _get, _swap = ipc.get, ipc.swap
+
+            def get(token, device, core, space, buffer, transforms, *args, **kwargs):
+                lead, views = split_views(transforms)
+                token, x = _get(token, device, core, space, buffer, lead if views else transforms, *args, **kwargs)
+                for t in views:
+                    x = view(x, t)
+                return token, x
+
+            def swap(token, device, core, space, buffer, transforms, val, mask, **kwargs):
+                lead, views = split_views(transforms)
+                if not views:
+                    return _swap(token, device, core, space, buffer, transforms, val, mask, **kwargs)
+                token, x = _get(token, device, core, space, buffer, lead, **kwargs)
+                stages = [x]
+                for t in views[:-1]:
+                    stages.append(view(stages[-1], t))
+                old = view(stages[-1], views[-1])
+                new = np.asarray(val) if mask is None else np.where(np.asarray(mask), np.asarray(val), old)
+                y = unview(stages[-1], views[-1], new)
+                for t, x in zip(reversed(views[:-1]), reversed(stages[:-1])):
+                    y = unview(x, t, y)
+                token, _ = _swap(token, device, core, space, buffer, lead, y, None, **kwargs)
+                return token, old
+
+            get.__wrapped__ = _get.__wrapped__  # DMAs read indexed refs as before
+            ipc.get, ipc.swap = get, swap
+
+        def tokens(x):  # each element's token: packed [rows, 4, lanes] (row 4 r + k), native [tokens, lanes]
+            if x.ndim == 3:
+                return (jax.lax.broadcasted_iota(jnp.int32, x.shape, 0) * x.shape[1]
+                        + jax.lax.broadcasted_iota(jnp.int32, x.shape, 1))
+            return jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+
+        _native_pages = mla_dcp.DcpAttention._pages
 
         def _pages(self, slot):
+            if self.native:  # plain ref loads
+                return _native_pages(self, slot)
+
             def load(lanes, tokens=None):
                 x = self.ws.pages[slot]
                 return x.reshape(x.shape[0] * x.shape[1], x.shape[2])[:, lanes]
@@ -1517,7 +1626,7 @@ class TestSelectedAttention(CustomTestCase):
             for k in range(self.span):
                 first = ((local_step * self.span + k) * self.group + self.owner) * self.page_tokens
                 cut = cut + jnp.clip(self._limit(row) - first, 0, self.page_tokens)
-            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, x.ndim - 1)
             keep = tokens(x) < cut
             if pad:  # compact steps (pad=False) leave the stale lanes 576:640 to their gathered tiles
                 keep = keep & (lane < 576)
@@ -1537,22 +1646,24 @@ class TestSelectedAttention(CustomTestCase):
                     latent = self.ws.new_rows[self.slots * row]
                 x = self.ws.pages[slot]
                 offset = local_page * self.page_tokens + position % self.page_tokens
-                self.ws.pages[slot] = jnp.where(tokens(x) == offset, latent.astype(x.dtype)[None, None, :], x)
+                latent = latent.astype(x.dtype).reshape((1,) * (x.ndim - 1) + latent.shape)
+                self.ws.pages[slot] = jnp.where(tokens(x) == offset, latent, x)
 
         def _zero_step_pad_lanes(self, slot):
             x = self.ws.pages[slot]
-            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
+            lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, x.ndim - 1)
             self.ws.pages[slot] = jnp.where(lane < 576, x, jnp.zeros((), x.dtype))
 
         def _zero_slot(self, slot):
             x = self.ws.pages[slot]
             self.ws.pages[slot] = jnp.zeros(x.shape, x.dtype)
 
-        mla_dcp.DcpAttention._pages = _pages
-        mla_dcp.DcpAttention._clean_step = _clean_step
-        mla_dcp.DcpAttention._zero_slot = _zero_slot
-        mla_dcp.DcpAttention._zero_step_pad_lanes = _zero_step_pad_lanes
-        mla_dcp.DcpAttention._cache_verify_row = _cache_verify_row
+        if not VIEWS:
+            mla_dcp.DcpAttention._pages = _pages
+            mla_dcp.DcpAttention._clean_step = _clean_step
+            mla_dcp.DcpAttention._zero_slot = _zero_slot
+            mla_dcp.DcpAttention._zero_step_pad_lanes = _zero_step_pad_lanes
+            mla_dcp.DcpAttention._cache_verify_row = _cache_verify_row
 
         # Every step activity entry the attention reads, recorded (the reads of
         # KernelConfig.dsa_live_activity's entries: dsa_dcp.live_activity_steps).
@@ -1570,9 +1681,11 @@ class TestSelectedAttention(CustomTestCase):
         base_config = mla_dcp._config()
 
         def case(firsts, S, topk, seed, grouped=False, activity="exact", poison=False, compact=0, expect=None,
-                 window=0, wide=0, knobs=(), sent=False):
+                 window=0, wide=0, knobs=(), sent=False, native=False, stale=False):
             # knobs: KernelConfig flags on; sent: the queries leave early (send_queries) and, with
-            # dsa_prologue_in_select, another attention stages them as the decode's selection does.
+            # dsa_prologue_in_select, another attention stages them as the decode's selection does;
+            # native: native page buffers (KernelConfig.dsa_native_pages), each page DMA retiling a pool block;
+            # stale: the pool's stale bytes (lanes 576:640, tokens no request wrote) are NaN, as vLLM's can be.
             config = dataclasses.replace(base_config, dsa_compact_tokens=compact, dsa_compact_window=window,
                                          **{knob: True for knob in knobs})
             mla_dcp._config = lambda: config
@@ -1582,7 +1695,9 @@ class TestSelectedAttention(CustomTestCase):
             positions = np.array([p0 + r for p0 in firsts for r in range(S)], np.int32)
             B = len(positions)
             persistent = mla_dcp.persistent_scratch(B, G, cache_dtype=FP8, sequence_rows=S)
-            scoped = mla_dcp.scoped_scratch(B, group=G, cache_dtype=FP8, page_tokens=T, sequence_rows=S)
+            assert INTERNALS or not native, "native page DMAs need the interpret internals"
+            scoped = mla_dcp.scoped_scratch(B, group=G, cache_dtype=FP8, page_tokens=T, sequence_rows=S,
+                                            native=True if native else None)
             selection = mla_dcp.selection_scratch(B, page_tokens=T, sequence_rows=S)
             span = selection[0].shape[2] * 128 // T
             pages = -(-(max(-(-(int(p) + T) // T) // G for p in positions) + 1) // span) * span
@@ -1592,6 +1707,8 @@ class TestSelectedAttention(CustomTestCase):
             lat[..., 576:] = 0
             lat = lat.astype(ml_dtypes.float8_e4m3fn).astype(np.float32)
             pool = rng.standard_normal((G, 1 + len(firsts) * pages, 128, 4, 640)).astype(ml_dtypes.float8_e4m3fn)
+            if stale:  # e4m3fn 0x7f
+                pool.view(np.uint8)[...] = 0x7F
             tables = np.zeros((G, B, pages), np.int32)
             keys = np.full((G, B, key_rows, 128), -2**31, np.int32)
             tok = rng.integers(-2**31 + 1, 2**31 - 1, (B, pages * G * T), dtype=np.int64)
@@ -1608,6 +1725,8 @@ class TestSelectedAttention(CustomTestCase):
                 for t in range(positions[b], p0 + S - 1):  # later rows' cached tokens pass: the causal bound
                     page = t // T; g, j = page % G, page // G
                     keys[g, b, j * (T // 128) + (t % T) // 128, t % 128] = tok[b, t]
+            if stale:
+                pool.view(np.uint8)[..., 576:] = 0x7F
             tau = np.zeros(B, np.int32); ptie = np.zeros(B, np.int32); own = np.zeros(B, np.int32); masks = []
             for b in range(B):
                 L = positions[b] + 1
@@ -1655,6 +1774,7 @@ class TestSelectedAttention(CustomTestCase):
                                            active=act_r, steps=steps)
                 att = mla_dcp.DcpAttention(cache, ws, pos, B, selection=sel, sequence_rows=S,
                                            cache_verify_rows=S > 1)
+                assert att.native == native
                 if poison:  # another scoped region's bytes: NaN where no step loads a page
                     ws.pages[...] = jnp.full(ws.pages.shape, jnp.nan, ws.pages.dtype)
                 att.prime()
@@ -6977,6 +7097,95 @@ class TestAttentionExactKnobs(CustomTestCase):
             env=env,
             timeout=2400,
         )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
+
+
+class TestDsaNativePages(CustomTestCase):
+    """``KernelConfig.dsa_native_pages``: the DSA verify attention with its
+    pages staged native (``[span * 512, 640]`` FP8 buffers, each page DMA
+    retiling a pool block in ``DcpCache.start_native_copies``) gives the
+    packed pages' outputs bit for bit (``TestSelectedAttention``'s harness
+    and reference checks, interpret mode, 4-rank group). The kernel's own
+    page staging runs on both layouts -- the stale-token and pad-lane
+    zeroing, the cached verify rows and the slot zeroing store through
+    32-bit word views -- on an emulation of ref views
+    (``K31_INTERPRET_VIEWS=1``: a bitcast packs consecutive rows into each
+    word, as ``pltpu.bitcast`` does), and the pool's stale bytes (lanes
+    576:640, tokens no request wrote) are NaN, so a zeroing that either
+    layout skips is not finite. Cases: B1 x7 with compact and dense steps
+    (early queries, the staged prologue and the other exact knobs on; and
+    all off), the chunked B2 x7 with a small window, poisoned page slots
+    (compact steps, and two-row sequences on the ungrouped fold, whose
+    skipped steps read their zeroed slots), two 4-row sequences, B4 x3,
+    two-row sequences and plain rows. The knob stages native pages for the
+    8- and 16-row verifies of 8-row sequences only."""
+
+    TAIL = """
+        if not INTERNALS:
+            print("SKIP: interpret-mode DMA internals moved")
+            raise SystemExit(0)
+        assert VIEWS
+        from sglang_tpu.k3_programs.kimi_k3.kernels import decode_megakernel
+
+        on = dataclasses.replace(base_config, dsa_native_pages=True)
+        pages_at = len(mla_dcp.SCOPED_NAMES) - mla_dcp.SCOPED_NAMES.index("dcp latent pages")
+        for config, shapes in ((base_config, ()), (on, ((8, 8), (16, 8)))):
+            mla_dcp._config = lambda config=config: config
+            for b, s in ((8, 8), (16, 8), (16, 4), (8, 4), (32, 8), (8, 1)):
+                assert mla_dcp.native_pages(b, H, s, FP8, dsa=True) == ((b, s) in shapes), (b, s)
+                assert not mla_dcp.native_pages(b, H, s, FP8), (b, s)  # K3's verifies keep packed pages
+                for indexer in (False, True):  # the decode's MLA scratch (DSA: the K3.1 decode)
+                    pages = decode_megakernel._mla_scoped_scratch(
+                        None, batch_size=b, sequence_rows=s, dcp_dtype=FP8, dcp_page_tokens=T, dsa=indexer
+                    )[-pages_at]
+                    assert (len(pages.shape) == 3) == (indexer and (b, s) in shapes), (b, s, indexer, pages.shape)
+            assert not mla_dcp.native_pages(8, H, 8, jnp.bfloat16, dsa=True)
+        KNOBS = ("dsa_row_block_masks", "dsa_prologue_in_select", "dcp_shift_scalars",
+                 "dcp_query_tail_unpack")
+        for args, kwargs in (
+            (([2600], 8, 40, 7), dict(grouped=True, compact=128, window=512, knobs=KNOBS, sent=True)),
+            (([2600], 8, 40, 7), dict(grouped=True, compact=128, window=512)),
+            (([3069], 8, 400, 7), dict(grouped=True, compact=128, window=512, wide=3, knobs=KNOBS, sent=True)),
+            (([900, 2600], 8, 40, 6), dict(grouped=True, compact=64, window=64, knobs=KNOBS)),
+            (([700, 9000], 4, 8, 4), dict(grouped=True, compact=64, poison=True, window=256)),
+            (([1500, 3000], 4, 200, 1), dict(grouped=True, compact=128, window=512, expect=("compact", "dense"),
+                                             knobs=KNOBS)),
+            (([700, 1500, 2600, 3000], 4, 24, 8), dict(grouped=True, compact=64, window=128, knobs=KNOBS)),
+            (([2047, 600, 64, 3000], 2, 128, 2), dict()),
+            (([700, 9000], 2, 8, 4), dict(poison=True)),  # skipped steps read their zeroed slots
+            (([700, 2000], 1, 64, 0), dict()),
+        ):
+            packed = case(*args, **kwargs, stale=True)
+            native = case(*args, **kwargs, stale=True, native=True)
+            assert np.isfinite(packed).all(), args
+            assert np.array_equal(packed.view(np.uint32), native.view(np.uint32)), (args, np.abs(packed - native).max())
+        print("OK")
+    """
+
+    def test_native_pages_are_bit_identical(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        harness = textwrap.dedent(TestSelectedAttention.SCRIPT)
+        harness = harness[: harness.index("\ncase([700, 2000], 1, 64, 0)\n") + 1]
+        env = dict(
+            os.environ, PYTHONPATH=os.pathsep.join(sys.path), K31_INTERPRET_VIEWS="1"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", harness + textwrap.dedent(self.TAIL)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=2400,
+        )
+        if "SKIP:" in result.stdout:
+            self.skipTest(result.stdout.strip().splitlines()[-1])
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
