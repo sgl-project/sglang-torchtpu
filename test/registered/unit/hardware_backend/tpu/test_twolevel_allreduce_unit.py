@@ -179,7 +179,7 @@ class TestTwoShotRoute(CustomTestCase):
     """Single-host TP: decode-sized bf16 TP all-reduces go to the two-shot op."""
 
     def test_eligibility_cap_and_layout(self):
-        cap_rows = tl.TWOSHOT_TP_ALLREDUCE_MAX_BYTES // (4096 * 2)
+        cap_rows = tl.TWOSHOT_ALL_REDUCE_MAX_BYTES // (4096 * 2)
         for shape, dtype, want in (
             ((1, 4096), torch.bfloat16, True),
             ((cap_rows, 4096), torch.bfloat16, True),

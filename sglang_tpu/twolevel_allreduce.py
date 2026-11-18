@@ -24,6 +24,7 @@ import logging
 import torch
 
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.kernels.twoshot_all_reduce import TWOSHOT_ALL_REDUCE_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +42,6 @@ _OPS: dict = {}
 _READY = False
 # TP world size the two-shot op was built for; 0 = off. Plain int for Dynamo.
 _TWOSHOT_WORLD = 0
-# Largest per-rank payload sent to the two-shot op.
-TWOSHOT_TP_ALLREDUCE_MAX_BYTES = 512 * 1024
 # Set (while Dynamo traces / Python runs the decode forward) when a tagged
 # attention o_proj skipped its all-reduce so that the following attention-residual
 # aggregation runs it fused (all_reduce_attn_res); consumed by that aggregation.
@@ -533,7 +532,7 @@ def _register_twoshot_from_parallel_state() -> None:
     _TWOSHOT_WORLD = world
     logger.info(
         "Two-shot TP all-reduce on: bf16 TP all-reduces up to %d KB per rank.",
-        TWOSHOT_TP_ALLREDUCE_MAX_BYTES // 1024,
+        TWOSHOT_ALL_REDUCE_MAX_BYTES // 1024,
     )
 
 
@@ -608,7 +607,7 @@ def twoshot_eligible(t: torch.Tensor, world: int) -> bool:
         t.dim() == 2
         and t.dtype == torch.bfloat16
         and t.shape[1] % (128 * world) == 0
-        and 0 < t.numel() * t.element_size() <= TWOSHOT_TP_ALLREDUCE_MAX_BYTES
+        and 0 < t.numel() * t.element_size() <= TWOSHOT_ALL_REDUCE_MAX_BYTES
     )
 
 
