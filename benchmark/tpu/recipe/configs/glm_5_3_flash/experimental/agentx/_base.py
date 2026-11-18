@@ -42,8 +42,8 @@ def agentx_config(
             "torch_compile_max_bs": max_running,
             "tpu_compile_bs": [b for b in (1, 4, 8, 16, 32) if b < max_running]
             + [max_running],
-            # One prefill program: at 1M the chunk cost is the context scan, not the padding.
-            "tpu_compile_tokens": [8192],
+            # Short turns run a small program instead of a padded 8192-token chunk.
+            "tpu_compile_tokens": [1024, 2048, 4096, 8192],
             "max_total_tokens": pool_tokens,
             "max_mamba_cache_size": mamba_slots,
             "enable_metrics": True,
