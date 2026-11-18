@@ -201,6 +201,9 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
     new_ext = [x + r for x, r in zip(ext, replay)]
     req_to_token = runner.req_to_token_pool.req_to_token
     ids, locs, keep, cpu_ids = [], [], [], []
+    # Keep the scheduled dtype: TPU allocates int32 slots and its compiled
+    # extend graph rejects an int64 out_cache_loc.
+    loc_dtype = batch.out_cache_loc.dtype
     off = fold_off = 0
     for i, req in enumerate(batch.reqs):
         r, n = replay[i], ext[i]
@@ -214,13 +217,13 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
                 )
             )
             locs.append(
-                req_to_token[batch.req_pool_indices[i], pre[i] : pre[i] + r]
-                .to(batch.out_cache_loc.device)
-                .long()
+                req_to_token[batch.req_pool_indices[i], pre[i] : pre[i] + r].to(
+                    device=batch.out_cache_loc.device, dtype=loc_dtype
+                )
             )
             cpu_ids.append(torch.tensor(head, dtype=torch.int64))
         ids.append(batch.input_ids[off : off + n])
-        locs.append(batch.out_cache_loc[off : off + n].long())
+        locs.append(batch.out_cache_loc[off : off + n])
         if batch.prefill_input_ids_cpu is not None:
             cpu_ids.append(batch.prefill_input_ids_cpu[off : off + n].to(torch.int64))
         keep.append(torch.arange(fold_off + r, fold_off + r + n))
