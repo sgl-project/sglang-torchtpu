@@ -19,6 +19,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.envs import dev_int
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel.common.coll import (
     _count_wait,
     direct_all_gather_start,
@@ -170,11 +172,20 @@ PAIR_AG_MIN_ROWS = 48
 
 def _pair_ag(c: MKConfig) -> bool:
     """Collectives pair the two cores of each chip (4 chips x 2 cores: half the ICI bytes)."""
-    return c.tp == 8 and c.rows >= PAIR_AG_MIN_ROWS
+    min_rows = dev_int(tpu_envs.SGLANG_TPU_MUSE_MK_DEV_EP_PAIR_AG_MIN_ROWS, PAIR_AG_MIN_ROWS)
+    return c.tp == 8 and c.rows >= min_rows
+
+
+def _dev_skipped(name: str) -> bool:
+    """SGLANG_TPU_MUSE_MK_DEV_EP_SKIP lists collectives every rank skips (timing ablation only:
+    the receiving buffers keep stale data)."""
+    return name in tpu_envs.SGLANG_TPU_MUSE_MK_DEV_EP_SKIP.get().split(",")
 
 
 def _all_gather_start(c: MKConfig, S: dict, me, buf, ph: int) -> Callable[[], None]:
     """Starts buf[me] into every rank's buf[me]; returns its wait."""
+    if _dev_skipped(_PH_NAMES[ph]):
+        return lambda: None
     ssem = S["eg_ssems"].at[ph]
     with _phase(_PH_NAMES[ph]):
         if _pair_ag(c):
@@ -630,7 +641,10 @@ def _u_reduce(step: EPLayerStep) -> None:
     def partial(src, rows):
         return urs[src, rows]
 
+    skip = _dev_skipped("u_rs")
     for d in range(1, tp):
+        if skip:
+            break
         peer = (me + d) % tp
         pltpu.make_async_remote_copy(
             src_ref=block(peer),
@@ -640,9 +654,10 @@ def _u_reduce(step: EPLayerStep) -> None:
             device_id=(peer,),
         ).start()
     _local_copy(S, block(me), urs.at[me])
-    with _phase("u_rs_wait"):
-        _count_wait(pltpu.make_async_copy(urs.at[0], urs.at[0], rsem), tp - 1)
-        _count_wait(pltpu.make_async_copy(urs.at[0], urs.at[0], ssem), tp - 1)
+    if not skip:
+        with _phase("u_rs_wait"):
+            _count_wait(pltpu.make_async_copy(urs.at[0], urs.at[0], rsem), tp - 1)
+            _count_wait(pltpu.make_async_copy(urs.at[0], urs.at[0], ssem), tp - 1)
     uag = S["eg_uag"]
 
     def u_sum(rows):
