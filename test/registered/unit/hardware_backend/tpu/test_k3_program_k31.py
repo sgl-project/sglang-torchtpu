@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=7800, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7950, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -517,6 +517,136 @@ print("OK")
 
     def test_deferred_round_with_eager_dmas(self):
         self._run("eager", "8")
+
+
+class TestAuxCaptureInFlight(CustomTestCase):
+    """``KernelConfig.aux_capture_in_flight``: the aux hidden capture of
+    rank-row steps (both ranks of a pair hold its rows) over a loop of seven
+    layers with captures after layers 1, 2 and 5 (aux ids 6, 2, 3: slots out
+    of layer order), each layer's rows different on every host and pair, in
+    Pallas interpret mode on 32 host devices (TestAttentionHostBf16's
+    harness) with race detection, DMAs executed on wait and eagerly.
+    ``capture_aux_rows`` after every layer and ``wait_aux_rows`` after the
+    loop (with NaN over the pair's rows after each capture, as the next
+    layer's mixture overwrites them, a barrier standing in for its rounds,
+    and the aux output starting as NaN) give every rank's aux output bit for
+    bit as the gather-and-copy capture (_gather_local_pair_rows with the
+    crossed peers, then the batch's rows to the slot) and as the host
+    reference (slot s: the four pairs' rows of the rank's host at the slot's
+    layer), at 8 rows (the steps the stack takes it at) and 16, and no DMA
+    semaphore is left nonzero."""
+
+    MAIN = r"""
+import sys
+
+from sglang_tpu.k3_programs.common import collectives32
+
+DMA_MODE, BATCHES = sys.argv[1], tuple(int(b) for b in sys.argv[2].split(","))
+LAYERS, AUX = 7, (6, 2, 3)  # captures after layers 5, 1, 2
+CAPTURES = sorted(a - 1 for a in AUX)
+
+
+def captures(B, X, in_flight):
+    R = B // 4
+    nan = lambda ref: jnp.full(ref.shape, jnp.nan, ref.dtype)
+
+    def kernel(x_ref, aux_in, aux_out, owned, prefix, mixture, sends, recvs, aux_sem, remote):
+        del aux_in  # aliased to aux_out (NaN)
+        for ref in (owned, prefix, mixture):
+            ref[...] = nan(ref)
+        stage = mixture.at[pl.ds(0, R)]
+
+        @pl.loop(0, LAYERS)
+        def layer(index):
+            collectives32.barrier()  # the layer's rounds
+            owned[...] = x_ref[index]  # q0: the pair's finished rows
+            if in_flight:
+                dmk.capture_aux_rows(index, AUX, CAPTURES[0], owned, stage, aux_out,
+                                     aux_sem.at[0], remote, owners=4, cross_cores=True)
+            else:
+                for slot, aux_layer in enumerate(AUX):
+                    @pl.when(index == aux_layer - 1)
+                    def capture(slot=slot):
+                        dmk._gather_local_pair_rows(owned, prefix, sends, recvs, None, owners=4,
+                                                    cross_cores=True)
+                        copy = pltpu.make_async_copy(prefix, aux_out.at[slot], aux_sem.at[0])
+                        copy.start()
+                        copy.wait()
+            owned[...] = nan(owned)  # the next layer's mixture overwrites the rows
+
+        if in_flight:
+            dmk.wait_aux_rows(stage, aux_out, aux_sem.at[0], remote, owners=4, cross_cores=True)
+
+    vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
+
+    def body(x, aux):
+        out = pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((len(AUX), B, H), jnp.bfloat16),
+            in_specs=[pl.BlockSpec(memory_space=vmem), pl.BlockSpec(memory_space=pl.ANY)],
+            out_specs=pl.BlockSpec(memory_space=pl.ANY),
+            scratch_shapes=[vmem((R, H), jnp.bfloat16), vmem((B, H), jnp.bfloat16),
+                            vmem((B, H), jnp.bfloat16), dma((16,)), dma((16,)), dma((1,)), dma((2,))],
+            input_output_aliases={1: 0},
+            compiler_params=pltpu.CompilerParams(has_side_effects=True, collective_id=5),
+            interpret=pltpu.InterpretParams(detect_races=True, dma_execution_mode=DMA_MODE),
+        )(x[0], aux[0])
+        return out[None]
+
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("tp"), P("tp")), out_specs=P("tp"),
+                              check_vma=False))
+    aux = np.full((32, len(AUX), B, H), np.nan, BF16)
+    return np.asarray(f(X, aux))
+
+
+rng = np.random.default_rng(5)
+for B in BATCHES:
+    R = B // 4
+    # rows[host, layer, pair]: the pair's finished rows, held by both of its ranks
+    rows = (rng.standard_normal((4, LAYERS, 4, R, H)) * 2.0 ** rng.integers(-8, 9, (4, LAYERS, 4, R, 1))).astype(BF16)
+    X = np.stack([rows[r // 8, :, r % 8 // 2] for r in range(32)])
+    want = np.stack([np.stack([rows[r // 8, a - 1].reshape(B, H) for a in AUX]) for r in range(32)])
+    gathered = captures(B, X, False)
+    in_flight = captures(B, X, True)
+    assert gathered.tobytes() == want.tobytes(), (B, DMA_MODE, "gather")
+    assert in_flight.tobytes() == want.tobytes(), (B, DMA_MODE)
+    print(f"B{B} {DMA_MODE}: in-flight captures bit-exact", flush=True)
+assert not ipc.races.races_found
+print("OK")
+"""
+
+    def _run(self, dma_mode, batches):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                TestAttentionHostBf16.PRELUDE + self.MAIN,
+                dma_mode,
+                batches,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1800,
+        )
+        output = result.stdout[-2000:] + result.stderr[-3000:]
+        self.assertIn("OK", result.stdout, output)
+        self.assertNotIn("non-zero count", result.stdout + result.stderr, output)
+
+    def test_in_flight_captures_match_the_gathered_captures(self):
+        self._run("on_wait", "8,16")
+
+    def test_in_flight_captures_with_eager_dmas(self):
+        self._run("eager", "8,16")
 
 
 class TestDsaReference(CustomTestCase):

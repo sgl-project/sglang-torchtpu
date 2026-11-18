@@ -8843,6 +8843,122 @@ def _gather_local_pair_rows(
                 copy.wait()
 
 
+# Rank-row steps: the aux capture's rows go straight to every local rank's aux
+# output, waited at the next capture (KernelConfig.aux_capture_in_flight; the
+# stack decides per step).
+AUX_CAPTURE_IN_FLIGHT = _config().aux_capture_in_flight
+
+
+def _aux_row_copies(
+    stage, aux_slot, local_semaphore, remote_semaphores, *, owners, cross_cores
+):
+    """KernelConfig.aux_capture_in_flight: the copies of this rank pair's rows
+    ``stage`` [r, hidden] into rows o * r .. o * r + r - 1 (o: the pair) of
+    ``aux_slot`` [owners * r, hidden] (an aux output slot, HBM) on this rank
+    and on the pair gather's peers (_gather_local_pair_rows: rank ^ 2k, with
+    ``cross_cores`` rank ^ 2k ^ 1; both ranks of a pair hold its rows).
+    Returns the local copy (``local_semaphore``) and the remote copies
+    (``remote_semaphores`` [2]: sends, receives)."""
+    assert owners == 4, "rank-pair owners"
+    rank = jax.lax.axis_index("tp")
+    rows = stage.shape[0]
+    target = aux_slot.at[pl.ds(pl.multiple_of((rank % 8) // 2 * rows, rows), rows)]
+    local = tpu.make_async_copy(stage, target, local_semaphore)
+    remote = tuple(
+        tpu.make_async_remote_copy(
+            stage,
+            target,
+            remote_semaphores.at[0],
+            remote_semaphores.at[1],
+            device_id=(rank ^ ((2 * offset) ^ int(cross_cores)),),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+        for offset in range(owners - 1, 0, -1)
+    )
+    return local, remote
+
+
+def wait_aux_rows(
+    stage,
+    aux_output,
+    local_semaphore,
+    remote_semaphores,
+    *,
+    owners=4,
+    cross_cores=False,
+):
+    """Wait for one capture's copies (_aux_row_copies, rebuilt on slot 0: the
+    same byte counts): this rank's local copy and sends (``stage`` is free
+    again) and the other pairs' rows into this rank's aux output."""
+    local, remote = _aux_row_copies(
+        stage,
+        aux_output.at[0],
+        local_semaphore,
+        remote_semaphores,
+        owners=owners,
+        cross_cores=cross_cores,
+    )
+    local.wait()
+    for copy in remote:
+        copy.wait_send()
+    for copy in remote:
+        copy.wait_recv()
+
+
+def capture_aux_rows(
+    index,
+    aux_layers,
+    first_capture,
+    source,
+    stage,
+    aux_output,
+    local_semaphore,
+    remote_semaphores,
+    *,
+    owners=4,
+    cross_cores=False,
+):
+    """KernelConfig.aux_capture_in_flight's capture after layer ``index``
+    (aux id L: the residual stream entering layer L, captured after layer
+    L - 1, into slot ``aux_layers.index(L)`` of ``aux_output``): one block
+    for every capture layer, with the slot looked up by layer. It waits for
+    the previous capture's copies (wait_aux_rows; none before
+    ``first_capture``, the first capture layer), stages this rank pair's
+    rows ``source`` [r, hidden] and starts their copies (_aux_row_copies).
+    The caller waits for the last capture's copies."""
+    slot, captured = 0, False
+    for aux_slot, aux_layer in enumerate(aux_layers):
+        hit = index == aux_layer - 1
+        slot = jnp.where(hit, aux_slot, slot)
+        captured = captured | hit
+
+    @pl.when(captured)
+    def capture():
+        @pl.when(index != first_capture)
+        def wait_previous_capture():
+            wait_aux_rows(
+                stage,
+                aux_output,
+                local_semaphore,
+                remote_semaphores,
+                owners=owners,
+                cross_cores=cross_cores,
+            )
+
+        stage[...] = source[...]
+        local, remote = _aux_row_copies(
+            stage,
+            aux_output.at[slot],
+            local_semaphore,
+            remote_semaphores,
+            owners=owners,
+            cross_cores=cross_cores,
+        )
+        local.start()
+        for copy in remote:
+            copy.start()
+
+
 # Repeating-stack composition.
 
 MOE = (
@@ -10083,6 +10199,22 @@ def stack(
             ("output round send semaphores", tpu.SemaphoreType.DMA((7,))),
             ("output round receive semaphores", tpu.SemaphoreType.DMA((7,))),
         ]
+    # KernelConfig.aux_capture_in_flight: the capture layers this program runs
+    # (each capture waits for the one before; the last one's copies are
+    # waited after the loop). 8-row steps only: at 16 rows the staging copy's
+    # register spills overflow VMEM (~60 KB).
+    aux_captures = sorted(
+        layer - 1 for layer in aux_hidden_layers if layer - 1 >= first_layer
+    )
+    aux_in_flight = bool(
+        AUX_CAPTURE_IN_FLIGHT
+        and attention_rank_rows
+        and batch_size == 8
+        and aux_capture == "layer"
+        and aux_captures
+    )
+    if aux_in_flight:
+        tail_scratch += [("aux capture semaphores", tpu.SemaphoreType.DMA((2,)))]
 
     def body(position_ref, state_row_ref, *refs):
         if tail_scratch:
@@ -10240,6 +10372,13 @@ def stack(
         # KernelConfig.moe_output_round_next_layer: the output round's
         # transport and semaphores (moe()'s output_vmem and output semaphores).
         output_round = tuple(tail_refs[:3]) if output_round_next_layer else None
+        # KernelConfig.aux_capture_in_flight: the captures' sends and receives,
+        # and their staging rows in the mixture buffer (unused at these steps:
+        # the MoE output goes to the owned rows).
+        aux_capture_semaphores = (
+            tail_refs[len(tail_refs) - 1] if aux_in_flight else None
+        )
+        aux_stage = mixture_vmem.at[pl.ds(0, owned_rows)] if aux_in_flight else None
         if compact_outputs:
             # Attention's whole-batch output argument is shape-checked but
             # unused with token scatter; the normalized input has its shape.
@@ -11151,6 +11290,20 @@ def stack(
                 # ``index``: the layer just finished (the previous one when
                 # the next layer's first code finishes it).
                 index = layer_index if index is None else index
+                if aux_in_flight and gather_owned_rows:
+                    capture_aux_rows(
+                        index,
+                        aux_hidden_layers,
+                        aux_captures[0],
+                        owned_rows_vmem,
+                        aux_stage,
+                        aux_output_ref,
+                        aux_semaphore.at[0],
+                        aux_capture_semaphores,
+                        owners=sp_owners,
+                        cross_cores=crossed_pair_gathers,
+                    )
+                    return
                 source = prefix_vmem if source is None else source
                 if gather_owned_rows and attention_dp_ownership:
                     # DP ranks hold only their own prefix rows.
@@ -12909,6 +13062,16 @@ def stack(
             # layers - 1: nothing to capture).
             finish_output_round()
             finish_layer(None)
+        if aux_in_flight:
+            # The last capture's copies.
+            wait_aux_rows(
+                aux_stage,
+                aux_output_ref,
+                aux_semaphore.at[0],
+                aux_capture_semaphores,
+                owners=sp_owners,
+                cross_cores=crossed_pair_gathers,
+            )
         if headroom_pad is not None:
             # Keep the pad live through the whole program (it holds zeros).
             prefix_vmem[0:8, 0:128] += jnp.sum(

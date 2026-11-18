@@ -136,6 +136,16 @@ class KernelConfig:
     # the epilogue overlay's load then run while the round is in flight. The
     # same operations in the same order between the copies (bit-identical).
     moe_output_round_next_layer: bool = False
+    # 8-row steps with attention_rank_rows that capture aux hidden states
+    # (DSpark verifies): a capture copies the rank pair's rows straight into
+    # the aux output of this rank and of its counterpart in each other local
+    # pair (the capture gather's peers), staged in the mixture buffer these
+    # steps leave unused, on semaphores of its own, instead of gathering the
+    # batch's rows and copying them; its copies are waited at the next
+    # capture (the last one's after the last layer). One capture block takes
+    # the aux slot by layer. The same bytes in the same aux rows
+    # (bit-identical).
+    aux_capture_in_flight: bool = False
     # Serving batches beyond the powers of two, by request count: plain
     # decode and three-draft verifies (e.g. "48" / "12"; multiples of 16 rows
     # take the staged MoE paths).
