@@ -165,6 +165,24 @@ CASES = {
             tuple(900 + 97 * i for i in range(28)),
             opt_in=True,
         ),
+        # AgentX single-host decode (--bench-iters): ~4 / 8 running requests x 4 verify rows
+        # at ~110k cached tokens (c16 steady state)
+        Case(
+            "ax_c4q4_l",
+            "sal_fp8",
+            4,
+            4,
+            tuple(110000 + 4099 * i for i in range(4)),
+            opt_in=True,
+        ),
+        Case(
+            "ax_c8q4_l",
+            "sal_fp8",
+            8,
+            4,
+            tuple(110000 + 4099 * i for i in range(8)),
+            opt_in=True,
+        ),
     )
 }
 DEFAULT_CASES = tuple(c for c in CASES if not CASES[c].opt_in)
@@ -588,13 +606,11 @@ class StepInputs(msgspec.Struct):
 
 
 def step_inputs(case: Case) -> StepInputs:
+    from sglang_tpu.muse_megakernel import ops
+
     ps = _PAGES[case.kv]
-    # ops.step_rows: the TP size, and past 32 rows (every EP step) the 16-row tile of the
-    # row-tiled program
-    rows = -(-case.n_req * case.q // TP) * TP
-    if rows > 32 or _EP:
-        rows = -(-case.n_req * case.q // math.lcm(16, TP)) * math.lcm(16, TP)
     n_live = case.n_req * case.q
+    rows = ops.step_rows(n_live, TP, "ep" if _EP else "tp")
     pps = -(-(max(case.ctx) + case.q) // ps)
     swa_pages = _SWA_TOKENS // ps
     g = _gen("step", case.name)
@@ -782,12 +798,31 @@ class _Runner:
         self, case: Case, st: StepInputs, kv: list, expert_group: int, overrides: dict
     ):
         """(hidden [rows, H] bf16, aux [rows, L * H] bf16, the MKConfig used); kv updated in place."""
+        compiled, args = self.compile_step(
+            case, st, kv, expert_group, overrides, list(range(self.n_layers))
+        )
+        hid, aux = compiled(*args)
+        if self.last_cfg is None:
+            raise RuntimeError(
+                "the step ran a cached executable: the op was not traced"
+            )
+        return hid.cpu(), aux.cpu(), self.last_cfg
+
+    def compile_step(
+        self,
+        case: Case,
+        st: StepInputs,
+        kv: list,
+        expert_group: int,
+        overrides: dict,
+        capture: list,
+    ):
+        """(the compiled step, its arguments); the op traces on the first call."""
         self.overrides = dict(overrides)
         self.last_cfg = None
         experts = self.experts(expert_group)
         d = self.device
         meta = torch.tensor([st.n_live, self.rank], dtype=torch.int32, device=d)
-        capture = list(range(self.n_layers))
         op = torch.ops.sglang_tpu_pallas.muse_megakernel
 
         def run(meta, pos, pf, psw, emb, weights, experts, kv):
@@ -810,7 +845,7 @@ class _Runner:
         # while tracing: an override step would replay the previous step's executable
         torch.tpu._clear_cache()
         compiled = torch.compile(run, fullgraph=True, dynamic=False)
-        hid, aux = compiled(
+        args = (
             meta,
             st.pos.to(d),
             st.pf.to(d),
@@ -820,11 +855,7 @@ class _Runner:
             experts,
             kv,
         )
-        if self.last_cfg is None:
-            raise RuntimeError(
-                "the step ran a cached executable: the op was not traced"
-            )
-        return hid.cpu(), aux.cpu(), self.last_cfg
+        return compiled, args
 
     def new_kv(self, case: Case, st: StepInputs, kv: list) -> torch.Tensor:
         """This step's K/V rows read back from the pools: [L, n_live, kv_heads, 2, head_dim]."""
@@ -1243,6 +1274,52 @@ def _parse_flag(s: str) -> tuple:
     return k, ast.literal_eval(v)
 
 
+# Layers the served DFlash draft captures, mapped into a shorter bench model.
+_SERVED_CAPTURE = (1, 16, 30, 44, 59)
+_SERVED_LAYERS = 62
+_BENCH_WARMUP = 3
+
+
+def bench_case(
+    runner: _Runner, case: Case, rank: int, iters: int, base: dict, variant: str
+) -> None:
+    """Wall time per decode step of one compiled executable (``iters`` back-to-back calls,
+    one sync); prints MK_BENCH with this rank's ms and the step config's ablation fields."""
+    st = step_inputs(case)
+    kv = runner.pools(case, st)
+    L = runner.n_layers
+    capture = sorted({l * L // _SERVED_LAYERS for l in _SERVED_CAPTURE})
+    # serving stacks experts by this env (ops.from_model); the numerics cases by Case
+    group = int(os.environ.get("SGLANG_TPU_MUSE_MK_EXPERT_GROUP", case.expert_group))
+    compiled, args = runner.compile_step(case, st, kv, group, base, capture)
+    for _ in range(_BENCH_WARMUP):
+        hid, _aux = compiled(*args)
+    hid.cpu()
+    cfg = runner.last_cfg
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        hid, _aux = compiled(*args)
+    hid.cpu()
+    ms = (time.perf_counter() - t0) / iters * 1e3
+    fields = ("rows", "row_tile", "ex_opt", "y_quant", "tiled_vmem_y", "expert_groups")
+    rec = {
+        "variant": variant,
+        "case": case.name,
+        "rank": rank,
+        "ep": _EP,
+        "layers": L,
+        "ms": round(ms, 4),
+        "ms_per_layer": round(ms / L, 5),
+        "env": {
+            k: os.environ[k]
+            for k in sorted(os.environ)
+            if k.startswith(("SGLANG_TPU_MUSE_MK_", "SGLANG_TPU_EP_"))
+        },
+        **{f: getattr(cfg, f) for f in fields},
+    }
+    print("MK_BENCH " + json.dumps(rec, default=str), flush=True)
+
+
 def run_case(
     runner: _Runner, case: Case, rank: int, out_dir: str, exact: list, base: dict
 ) -> None:
@@ -1385,6 +1462,10 @@ def main() -> None:
     ap.add_argument("--ep", action="store_true")
     ap.add_argument("--qblock-ref", action="store_true")
     ap.add_argument("--served", action="store_true")
+    # > 0: time the selected cases (MK_BENCH lines) instead of checking numerics
+    ap.add_argument("--bench-iters", type=int, default=0)
+    # with --bench-iters: JSON [{"name": ..., "env": {VAR: value}}], each timed in turn
+    ap.add_argument("--variants", default="")
     args = ap.parse_args()
     global _EP, _QBLOCK_REF, _SERVED
     _EP, _QBLOCK_REF, _SERVED = args.ep, args.qblock_ref, args.served
@@ -1423,6 +1504,22 @@ def main() -> None:
     if rank == 0:
         print(f"MK_NUMERICS_SETUP weights {time.time() - t0:.1f}s", flush=True)
     dist.barrier()
+    if args.bench_iters > 0:
+        # the knobs are read when a step traces, so one weight build serves every variant
+        variants = json.loads(args.variants) if args.variants else [{"name": "default", "env": {}}]
+        for v in variants:
+            saved = {k: os.environ.get(k) for k in v["env"]}
+            os.environ.update({k: str(x) for k, x in v["env"].items()})
+            for case in cases:
+                bench_case(runner, case, rank, args.bench_iters, base, v["name"])
+                dist.barrier()
+            for k, old in saved.items():
+                if old is None:
+                    os.environ.pop(k)
+                else:
+                    os.environ[k] = old
+        print(f"MK_BENCH_DONE rank={rank}", flush=True)
+        return
     for case in cases:
         t0 = time.time()
         run_case(runner, case, rank, args.out_dir, exact[case.name], base)

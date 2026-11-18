@@ -100,12 +100,21 @@ def _row_tile() -> int:
     return dev_int(tpu_envs.SGLANG_TPU_MUSE_MK_DEV_ROW_TILE, _ROW_TILE)
 
 
+def _row_tiled(rows: int, moe_mode: MoeMode) -> bool:
+    """Whether a step of ``rows`` runs the row-tiled program (every EP step does)."""
+    return (
+        rows > BASE_STEP_MAX_ROWS
+        or moe_mode == "ep"
+        or tpu_envs.SGLANG_TPU_MUSE_MK_DEV_FORCE_TILED.get()
+    )
+
+
 def step_rows(n_tokens: int, tp: int, moe_mode: MoeMode) -> int:
     """Padded rows of a step: a multiple of the TP size; row-tiled steps (every EP step) also
     of the row tile (each device then owns rows / tp rows of the expert reduce-scatter and u
     all-gather)."""
     rows = _round_up(n_tokens, tp)
-    if rows > BASE_STEP_MAX_ROWS or moe_mode == "ep":
+    if _row_tiled(rows, moe_mode):
         rows = _round_up(n_tokens, math.lcm(_row_tile(), tp))
     return rows
 
@@ -628,7 +637,9 @@ class MuseMegakernel(torch.nn.Module):
         opt = tpu_envs.SGLANG_TPU_MUSE_MK_OPT.get()
         fold_env = tpu_envs.SGLANG_TPU_MUSE_MK_FOLD.get()
         # the EP layout runs the row-tiled program at every size
-        tiled = rows > BASE_STEP_MAX_ROWS or self.moe_mode == "ep"
+        tiled = _row_tiled(rows, self.moe_mode)
+        dev_moe_opt = tpu_envs.SGLANG_TPU_MUSE_MK_DEV_MOE_OPT.get()
+        moe_opt = opt if dev_moe_opt is None else bool(dev_moe_opt)
         # few-row steps (decode) gather their rows in one round and have nothing to fold
         fold_base = fold_env and n_req * q > 2 and not tiled
         unshifted = 1.02 * g.scale_query_by * g.head_dim * g.attn_scale <= UNSHIFTED_MAX
@@ -712,20 +723,20 @@ class MuseMegakernel(torch.nn.Module):
             and math.frexp(g.attn_scale)[0] == 0.5,
             kv_group=_FUSED_KV_GROUP,
             row_tile=_row_tile() if tiled else 0,
-            ex_opt=opt,
+            ex_opt=moe_opt,
             qblock=tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get(),
-            ex_via_fp8=opt,
-            bd_n_tile=1024 if opt else 0,
+            ex_via_fp8=moe_opt,
+            bd_n_tile=1024 if moe_opt else 0,
             attn_carry=2 if opt else 0,
             alias_tiled_temps=opt and tiled,
-            combine_loop=opt and tiled,
+            combine_loop=moe_opt and tiled,
             untiled_max_rows=48 if opt else 128,
-            y_quant=1 if (opt and tiled) else 0,
+            y_quant=1 if (moe_opt and tiled) else 0,
             alias_oy=tiled,
             alias_p=tiled,
             xfull_packed=False,
             attn_opt=attn_opt,
-            tiled_vmem_y=2 if (opt and tiled) else 0,
+            tiled_vmem_y=2 if (moe_opt and tiled) else 0,
             tiled_o_rot=opt and tiled,
             tiled_fold=opt and tiled and fold_env,
             pair_ag=1 if (opt and tiled) else 0,
@@ -733,17 +744,17 @@ class MuseMegakernel(torch.nn.Module):
                 tpu_envs.SGLANG_TPU_MUSE_MK_DEV_TILED_PAIR_Y,
                 _default_tiled_pair_y(rows),
             )
-            if (opt and tiled)
+            if (moe_opt and tiled)
             else 0,
             pair_o_rs=opt and tiled,
             alias_oag_f=opt and tiled,
             sal_kv_split=opt and kv_sal and kv_sal_fp8,
             attn_head_fp8=1 if (opt and kv_sal and kv_sal_fp8) else 0,
             topk_xpose=opt and rows >= 64,
-            pair_y_stream=opt and tiled and rows > 64,
-            ex_w2_stage=opt and tiled,
+            pair_y_stream=moe_opt and tiled and rows > 64,
+            ex_w2_stage=moe_opt and tiled,
             # fp8 x fp8 expert LHS loses accuracy at R >= 256 (8K cc=64 verify).
-            ex_lhs_fp8=1 if (opt and (tiled or rows >= 32) and rows <= 128) else 0,
+            ex_lhs_fp8=1 if (moe_opt and (tiled or rows >= 32) and rows <= 128) else 0,
             expert_chunk=dev_int(
                 tpu_envs.SGLANG_TPU_MUSE_MK_DEV_EXPERT_CHUNK,
                 64 if (opt and tiled and rows > 128) else 32,
@@ -752,7 +763,7 @@ class MuseMegakernel(torch.nn.Module):
         n_units = len(expert_units(cfg))
         ex_split = (
             4
-            if (opt and rows >= _EXPERT_SPLIT_MIN_ROWS and n_units <= _ARMS5_MAX_UNITS)
+            if (moe_opt and rows >= _EXPERT_SPLIT_MIN_ROWS and n_units <= _ARMS5_MAX_UNITS)
             else 0
         )
         use_c8 = tiled or not cfg.ex_w2_stage

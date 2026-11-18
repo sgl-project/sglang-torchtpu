@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel.common.consts import LANE
 
 
@@ -81,6 +82,9 @@ def _topk_iter(scores, k):
     """
     R, E = scores.shape
     idx = jax.lax.broadcasted_iota(jnp.int32, (R, E), 1)
+    route = tpu_envs.SGLANG_TPU_MUSE_MK_DEV_ROUTE.get()
+    if route:
+        scores = _dev_route_scores(scores, idx)
     ids, picks = [], []
     for _ in range(k):
         m = jnp.max(scores, axis=1, keepdims=True)
@@ -88,8 +92,27 @@ def _topk_iter(scores, k):
         pick = idx == sel
         ids.append(sel)
         picks.append(pick)
+        if route == "balanced":
+            # one pick per EP rank group: drop the picked expert's whole group
+            pick = idx // (E // _DEV_ROUTE_GROUPS) == sel // (E // _DEV_ROUTE_GROUPS)
         scores = jnp.where(pick, -jnp.inf, scores)
     return ids, picks
+
+
+# SGLANG_TPU_MUSE_MK_DEV_ROUTE=balanced assumes 8 EP ranks (one host)
+_DEV_ROUTE_GROUPS = 8
+
+
+def _dev_route_scores(scores, idx):
+    """Pseudo-random scores [R, E] for the top-k override: a hash of each score's bf16 bits
+    and its expert lane, so steps differ and ranks agree; masked lanes (bias -1e30) stay out."""
+    bits = jax.lax.bitcast_convert_type(scores.astype(jnp.float32), jnp.int32)
+    h = (bits >> 16) * jnp.int32(-1640531535) + idx * jnp.int32(-2048144777)
+    h = h ^ jax.lax.shift_right_logical(h, jnp.int32(15))
+    h = h * jnp.int32(-1028477379)
+    h = h ^ jax.lax.shift_right_logical(h, jnp.int32(13))
+    rnd = (h & jnp.int32(0x7FFFFF)).astype(jnp.float32)
+    return jnp.where(scores < -1e29, -jnp.inf, rnd)
 
 
 def _topk_xpose(sc, bias, k, router_eps, route_scale):
