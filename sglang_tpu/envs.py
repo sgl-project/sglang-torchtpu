@@ -413,6 +413,10 @@ class TpuEnvs:
     # (independent of the Full leaf window when set). Unset: 131072 on the unified
     # KV pool, else 1/4 of SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS.
     SGLANG_TPU_HICACHE_WRITE_BACK_SWA_COPY_AHEAD_TOKENS = EnvInt(None)
+    # HiCache host slots for recurrent (GDN/KDA) states as a multiple of the device
+    # state slots, so host RAM can go to states or KV pages; unset: --hicache-ratio.
+    # Ignored under --hicache-size, which splits by device bytes.
+    SGLANG_TPU_HICACHE_STATE_RATIO = EnvFloat(None)
 
     # TPU PD KV transfer (disaggregation/tpu/conn.py)
     # Transfers between logged latency summaries; 0 disables.
