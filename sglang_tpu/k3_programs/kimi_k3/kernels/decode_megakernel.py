@@ -3610,6 +3610,9 @@ LATE_SHARED_DOWN = _config().decode_late_shared_down
 
 # The token-parallel MoE latent-up (KernelConfig.moe_token_parallel_up).
 TOKEN_PARALLEL_UP = _config().moe_token_parallel_up
+# Its expert stream, steal combine and routed send in one overlay region
+# (KernelConfig.moe_routed_send_in_expert_region).
+ROUTED_SEND_IN_EXPERT_REGION = _config().moe_routed_send_in_expert_region
 # Its output round's peers (XOR rank offsets): the rank pair on every host.
 _TOKEN_PARALLEL_PEERS = (25, 24, 17, 16, 9, 8, 1)
 # The routed pair round's seven messages count on one semaphore that none of
@@ -3994,6 +3997,15 @@ class _TokenParallelUp:
             ].reshape(self.tokens, self.block)
 
 
+def _one_trip_region(phase, body):
+    """Run ``body()`` in a loop of one trip whose count is read at run time
+    (``phase[0] >= 0``; ``phase`` is the SMEM reduction phase, never
+    negative), so the compiler keeps the loop. The instruction overlays then
+    place the loop as one region: code after a loop inside it stays in that
+    loop's overlay instead of starting the next one."""
+    pl.loop(0, (phase[0] >= 0).astype(jnp.int32))(lambda _: body())
+
+
 def moe(
     hidden_ref: TensorLike,  # [batch_size, hidden_size]
     output_ref: TensorLike,  # [batch_size, hidden_size] or owned token rows
@@ -4046,6 +4058,8 @@ def moe(
     ``token_parallel_up`` (KernelConfig.moe_token_parallel_up): the
     token-scattered tail of _TokenParallelUp; ``weights`` then carries the
     rank's ``latent_up_tp`` block, whose copy starts with the last expert pair.
+    With KernelConfig.moe_routed_send_in_expert_region the stream, the steal
+    combine and the routed send run in one region (_one_trip_region).
     """
     batch_size, hidden_size = hidden_ref.shape
     expert_count = weights.routing_projection.shape[1]
@@ -5384,6 +5398,17 @@ def moe(
                 stolen=None if steal_step is None else steal_step.stream_hooks(),
             )
 
+    # KernelConfig.moe_routed_send_in_expert_region: the token-parallel tail's
+    # steal combine and routed send end the expert loop's overlay.
+    send_in_expert_region = ROUTED_SEND_IN_EXPERT_REGION and token_parallel is not None
+
+    def send_routed_partials():
+        if steal_step is not None:
+            # Before the reductions: the given experts' outputs after the own.
+            steal_step.combine(routed_outputs_vmem, expert_output_size)
+        with _phase("t1_routed_send"):
+            token_parallel.routed_send(routed_outputs_vmem[...])
+
     def run_with_latent_up_copy(started):
         # The token-parallel tail leaves the latent-up copy no routed gather
         # to land behind, and its region-B storage holds the routing weights
@@ -5413,6 +5438,15 @@ def moe(
         pl.run_scoped(
             run_with_shared_progress, progress_state=tpu.SMEM((1,), jnp.int32)
         )
+    elif token_parallel is not None and send_in_expert_region:
+        # The combine and the sends then end the expert loop's instruction
+        # overlay: its switch to the next overlay runs while they are in
+        # flight.
+        def expert_region():
+            pl.run_scoped(run_with_latent_up_copy, tpu.SMEM((1,), jnp.int32))
+            send_routed_partials()
+
+        _one_trip_region(reduction_phase, expert_region)
     elif token_parallel is not None:
         pl.run_scoped(run_with_latent_up_copy, tpu.SMEM((1,), jnp.int32))
     else:
@@ -5449,12 +5483,13 @@ def moe(
             # storage is disjoint from the still-live routed gather packets.
             latent_vmem[row_slice, :1024] = local_output
 
-    if steal_step is not None:
+    if steal_step is not None and token_parallel is None:
         # Before the reductions: the given experts' outputs after the own.
         steal_step.combine(routed_outputs_vmem, expert_output_size)
     if token_parallel is not None:
-        with _phase("t1_routed_send"):
-            token_parallel.routed_send(routed_outputs_vmem[...])
+        if not send_in_expert_region:
+            # (Else the expert region combined and sent.)
+            send_routed_partials()
         if after_experts is not None:
             after_experts()
         if late_shared_down:

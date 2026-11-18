@@ -127,6 +127,13 @@ class KernelConfig:
     # ``latent_up_tp`` (the latent_up blocks indexed by host and core). The
     # same products, sums and rounding points (bit-identical).
     moe_token_parallel_up: bool = False
+    # Steps with moe_token_parallel_up: the expert stream, the expert steal's
+    # combine and the routed send run in a loop of one trip (its count read
+    # at run time), which the instruction overlays place as one region: the
+    # combine and the sends end the expert loop's overlay, so its switch to
+    # the next overlay runs while the routed sends are in flight. The same
+    # operations in the same order (bit-identical).
+    moe_routed_send_in_expert_region: bool = False
     # Serving batches beyond the powers of two, by request count: plain
     # decode and three-draft verifies (e.g. "48" / "12"; multiples of 16 rows
     # take the staged MoE paths).

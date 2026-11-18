@@ -25,6 +25,19 @@ fewer or other experts than its sibling sends) must not hang: the receivers
 follow the senders' packets (counted as mismatches), every expert still runs
 once, and no DMA semaphore is left nonzero.
 
+KernelConfig.moe_routed_send_in_expert_region: as moe()'s token-parallel tail,
+the stream (a stand-in for the latent-up copy started with the last pair, or
+after the loop when no pair ran), the combine and a stand-in for the routed
+send (the combined outputs sent into the sibling's buffer, waited for after
+the region as the routed reduction does) run in
+decode_megakernel._one_trip_region; with the B8 compact pairs and the
+scheduled begin, with eager DMAs, and with perturbed plans; the routings add
+a layer in which one core runs no expert and one in which neither does. The
+outputs must be bit-identical to the combine after the loop on the same
+plans (and, unperturbed, to the steal layout alone), each core must receive
+its sibling's combined outputs, and every layer must run the region once,
+start the copy once and send once.
+
 A stolen expert runs on the receiver in another pairing and path (pair or
 tail, single-row or full) than it would on the giver, so this also checks
 that a row's expert output does not depend on them. XLA:CPU runs without FMA
@@ -41,24 +54,27 @@ import unittest
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=900, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1300, suite="base-a-test-cpu")
 
 GROUP_EXPERTS, TOP_K = 112, 16
 K, W, OUT = 512, 256, 128
 LAYERS = 8
 
 
-def _routing(batch, seed, two_expert_giver=False):
+def _routing(batch, seed, two_expert_giver=False, zero_pair_layers=False):
     """Per layer: every row's 16 distinct global experts (top-k order), their
     probabilities and totals, the live rows and the latents. Groups 0 and 1
     (cores 0 and 1) draw from per-layer pools of varied size and skew, the
     other experts from groups 2-7. ``two_expert_giver`` adds a last layer in
     which group 0 routes two experts and group 1 none (the case where
-    begin_scheduled cannot start the second expert's copy before the plan)."""
+    begin_scheduled cannot start the second expert's copy before the plan).
+    ``zero_pair_layers`` then adds one in which group 0 routes one expert
+    (too few to give) and group 1 none, and one in which neither routes any:
+    expert loops without a pair."""
     import numpy as np
 
     rng = np.random.default_rng(seed)
-    layers = LAYERS + two_expert_giver
+    layers = LAYERS + two_expert_giver + 2 * zero_pair_layers
     winners = np.zeros((layers, batch, TOP_K), np.int32)
     probabilities = np.zeros((layers, batch, TOP_K), np.float32)
     live = np.ones((layers, batch), np.int32)
@@ -71,6 +87,8 @@ def _routing(batch, seed, two_expert_giver=False):
     }[batch]
     if two_expert_giver:
         shapes = [*shapes, ((2, 2), (0, 0))]
+    if zero_pair_layers:
+        shapes = [*shapes, ((1, 1), (0, 0)), ((0, 0), (0, 0))]
     for layer, pools in enumerate(shapes):
         if batch == 16 and layer % 3 == 1:
             live[layer, 13:] = 0  # null serving slots
@@ -163,7 +181,10 @@ def _child(mode, batch):
     os.environ["JAX_PLATFORMS"] = "cpu"
     from sglang_tpu.k3_programs.kimi_k3 import config
 
-    compact_pairs = mode == "compact"
+    # KernelConfig.moe_routed_send_in_expert_region's region, on the B8
+    # compact pairs (as the 8-row verify step).
+    region = mode.startswith("region")
+    compact_pairs = mode == "compact" or region
     config.install(
         config.KernelConfig(
             expert_steal=True,
@@ -171,6 +192,7 @@ def _child(mode, batch):
             b8_singleton_select=True,
             b16_one_hot_staging=True,
             b8_compact_experts=compact_pairs,
+            moe_routed_send_in_expert_region=region,
         )
     )
     import jax
@@ -187,13 +209,13 @@ def _child(mode, batch):
     from sglang_tpu.k3_programs.kimi_k3.kernels import expert_steal as es
 
     slots = es.steal_slots(batch)
-    perturbed = mode == "perturbed"
+    perturbed = mode.endswith("perturbed")
     # KernelConfig.decode_presorted_routing: begin_scheduled plans in vectors
     # and starts the initial copies and the schedule from one batch of scalars
     # (the first pair's gate/up copies first at B8).
-    scheduled = mode.startswith("scheduled")
+    scheduled = mode.startswith("scheduled") or (region and not perturbed)
     winners, probabilities, totals, live, latents = _routing(
-        batch, 7 + batch, two_expert_giver=scheduled)
+        batch, 7 + batch, two_expert_giver=scheduled, zero_pair_layers=region)
     layers = winners.shape[0]
     rng = np.random.default_rng(11)
     exponent_range = (119, 123)
@@ -221,15 +243,18 @@ def _child(mode, batch):
         else (pltpu.VMEM((1, K), jnp.bfloat16),) * 2
     )
 
-    def run(steal):
+    def run(steal, in_region=False):
         def kernel(winners_ref, probabilities_ref, totals_ref, live_ref, latents_ref, *refs):
             hbm, refs = refs[:4], refs[4:]
             out_ref, routes_ref, info_ref, *refs = refs
             staging, refs = refs[:4], refs[4:]
+            if in_region:
+                received_out, *refs = refs
             slot_vmem, refs = refs[:4], refs[4:]
             (expert_semaphores, gate_up_acc, down_acc, processed, first_compact,
              second_compact, table, table_semaphore, experts_vmem, probabilities_vmem,
-             counts_vmem, source, accumulators, handshake, *protocol) = refs
+             counts_vmem, source, accumulators, handshake, *refs) = refs
+            protocol, region_scratch = refs[:12], refs[12:]
             (packets, packet_tables, packet_send, packet_receive, slab_send, table_copies,
              slab_receives, errors, ready, returns, return_send, return_receive) = protocol
             rank = jax.lax.axis_index("x")
@@ -326,16 +351,68 @@ def _child(mode, batch):
                     step.receive(replace_routes)
                 routes_ref[layer, :, :128] = experts_vmem[...]
                 routes_ref[layer, :, 128:] = counts_vmem[...]
-                dmk._run_routed_expert_stream(
-                    source, experts_vmem[:, :TOP_K], probabilities_vmem[:, :TOP_K],
-                    counts_vmem[:, 0], totals_ref[layer][:, 0], *slot_vmem,
-                    accumulators.at[0], gate_up_acc, down_acc, processed, first_compact,
-                    second_compact, copy_expert, expert_input_size=K, expert_width=W,
-                    expert_output_size=OUT, group_pending_routes=True,
-                    expert_schedule=schedule,
-                    stolen=step.stream_hooks() if steal else None)
+
+                def stream(progress=None):
+                    dmk._run_routed_expert_stream(
+                        source, experts_vmem[:, :TOP_K], probabilities_vmem[:, :TOP_K],
+                        counts_vmem[:, 0], totals_ref[layer][:, 0], *slot_vmem,
+                        accumulators.at[0], gate_up_acc, down_acc, processed, first_compact,
+                        second_compact, copy_expert, expert_input_size=K, expert_width=W,
+                        expert_output_size=OUT, group_pending_routes=True,
+                        progress=progress, expert_schedule=schedule,
+                        stolen=step.stream_hooks() if steal else None)
+
+                if in_region:
+                    # moe()'s token-parallel tail: the stream (the latent-up
+                    # copy started with the last pair, or after the loop when
+                    # no pair ran), the combine and the routed send (a copy of
+                    # the combined outputs into the sibling's buffer) in one
+                    # region. Counters: region trips, copy starts, sends.
+                    phase, started, counters, sent, received, latent_vmem, \
+                        latent_semaphore, routed_semaphores = region_scratch
+                    phase[0] = layer  # never negative, as the reduction phase
+                    for counter in range(3):
+                        counters[counter] = 0
+                    latent_copy = pltpu.make_async_copy(
+                        latents_ref.at[layer], latent_vmem, latent_semaphore)
+                    routed_copy = pltpu.make_async_remote_copy(
+                        sent, received, routed_semaphores.at[0], routed_semaphores.at[1],
+                        device_id=(sibling,), device_id_type=pl.DeviceIdType.MESH)
+
+                    def start_latent_copy():
+                        counters[1] += 1
+                        latent_copy.start()
+                        started[0] = 1
+
+                    def start_with_last_pair(iteration):
+                        count = schedule.table[dmk.SCHEDULE_EXPERT_COUNT, 0]
+                        pl.when((2 * iteration + 2 >= count) & (started[0] == 0))(
+                            start_latent_copy)
+
+                    def expert_region():
+                        counters[0] += 1
+                        started[0] = 0
+                        stream(start_with_last_pair)
+                        pl.when(started[0] == 0)(start_latent_copy)
+                        counters[2] += 1
+                        step.combine(accumulators.at[0], OUT)
+                        sent[...] = accumulators[0]
+                        routed_copy.start()
+
+                    dmk._one_trip_region(phase, expert_region)
+                    # After the region, as the routed reduction and the
+                    # latent-up product wait for them.
+                    routed_copy.wait_send()
+                    routed_copy.wait_recv()
+                    latent_copy.wait()
+                    received_out[layer] = received[...]
+                    for counter in range(3):
+                        info_ref[layer, 3 + counter] = counters[counter]
+                else:
+                    stream()
+                    if steal:
+                        step.combine(accumulators.at[0], OUT)
                 if steal:
-                    step.combine(accumulators.at[0], OUT)
                     info_ref[layer, 0] = packet_tables[0, es.HEADER_ROW, es.GIVE_LANE]
                     info_ref[layer, 1] = packet_tables[1, es.HEADER_ROW, es.GIVE_LANE]
                     info_ref[layer, 2] = errors[0]
@@ -355,9 +432,10 @@ def _child(mode, batch):
                 jax.ShapeDtypeStruct((layers, batch, 256), jnp.int32),
                 jax.ShapeDtypeStruct((layers, 8), jnp.int32),
                 *(jax.ShapeDtypeStruct((slots, *w.shape[2:]), w.dtype) for w in weights),
+                *([jax.ShapeDtypeStruct((layers, batch, OUT), jnp.float32)] if in_region else []),
             ),
             in_specs=[vmem, vmem, vmem, smem, vmem] + [anywhere] * 4,
-            out_specs=(vmem, vmem, smem, *(anywhere,) * 4),
+            out_specs=(vmem, vmem, smem, *(anywhere,) * 4, *((vmem,) if in_region else ())),
             scratch_shapes=[
                 *(pltpu.VMEM((4, *w.shape[2:]), w.dtype) for w in weights),
                 pltpu.SemaphoreType.DMA((4, 4)),
@@ -375,6 +453,13 @@ def _child(mode, batch):
                 pltpu.SemaphoreType.REGULAR,
                 *es.scratch_shapes(slots),
                 *es.return_scratch_shapes(slots, batch, OUT),
+                # The region's phase, copy flag, counters, send and receive
+                # buffers, copy destination and semaphores.
+                *([pltpu.SMEM((1,), jnp.int32), pltpu.SMEM((1,), jnp.int32),
+                   pltpu.SMEM((3,), jnp.int32), pltpu.VMEM((batch, OUT), jnp.float32),
+                   pltpu.VMEM((batch, OUT), jnp.float32),
+                   pltpu.VMEM((batch, K), jnp.bfloat16), pltpu.SemaphoreType.DMA,
+                   pltpu.SemaphoreType.DMA((2,))] if in_region else []),
             ],
             compiler_params=pltpu.CompilerParams(collective_id=9),
             interpret=pltpu.InterpretParams(
@@ -384,14 +469,14 @@ def _child(mode, batch):
         )
 
         def body(winners, probabilities, totals, live, latents, *weights):
-            out, routes, info, *_ = call(
+            out, routes, info, *rest = call(
                 winners, probabilities, totals, live, latents, *(w[0] for w in weights))
-            return out[None], routes[None], info[None]
+            return out[None], routes[None], info[None], *(x[None] for x in rest[4:])
 
         mesh = Mesh(np.asarray(jax.devices()), ("x",))
         f = jax.jit(jax.shard_map(
             body, mesh=mesh, in_specs=(P(),) * 5 + (P("x"),) * 4,
-            out_specs=(P("x"),) * 3, check_vma=False))
+            out_specs=(P("x"),) * (3 + in_region), check_vma=False))
         wide_totals = np.broadcast_to(totals[..., None], (*totals.shape, 128)).copy()
         return [np.asarray(x) for x in f(
             winners, probabilities, wide_totals, live,
@@ -402,7 +487,11 @@ def _child(mode, batch):
     # Each interpreted call starts a new race state: read the steal's now.
     races = interpret_pallas_call.races
     raced = bool(races is not None and races.races_found)
-    if compact_pairs:
+    if region:
+        region_outputs, region_routes, region_info, sibling_outputs = run(True, in_region=True)
+        races = interpret_pallas_call.races
+        raced |= bool(races is not None and races.races_found)
+    if mode == "compact":
         # The steal layout's eight-row pairs (no compact tiles).
         dmk.B8_COMPACT_EXPERTS = False
         rows = dmk._expert_accumulator_rows(batch, jnp.uint32, group_pending_routes=True)
@@ -446,12 +535,13 @@ def _child(mode, batch):
             continue
         ok &= exact
         if compact_pairs:
-            same = np.array_equal(
-                eight_row_reference[:, layer].view(np.uint32),
-                reference[:, layer].view(np.uint32))
-            print(f"B{batch} layer {layer}: compact pairs match the eight-row pairs: "
-                  f"{same}", flush=True)
-            ok &= same
+            if mode == "compact":
+                same = np.array_equal(
+                    eight_row_reference[:, layer].view(np.uint32),
+                    reference[:, layer].view(np.uint32))
+                print(f"B{batch} layer {layer}: compact pairs match the eight-row pairs: "
+                      f"{same}", flush=True)
+                ok &= same
             for core in (0, 1):
                 coverage |= _receiver_pairs(
                     routes[core, layer], dmk.STEAL_TIMING[batch], dmk.B8_COMPACT_ROWS)
@@ -484,6 +574,30 @@ def _child(mode, batch):
             stolen_ids = (light_routes >= GROUP_EXPERTS) & (light_routes != es.UNROUTED)
             taken = set(light_routes[stolen_ids].tolist())
             ok &= taken == set(range(GROUP_EXPERTS, GROUP_EXPERTS + give))
+    if region:
+        # The region: the same plans and outputs as the combine after the
+        # loop, the sibling's combined outputs received, and one trip, one
+        # copy start and one send a layer.
+        same = (np.array_equal(region_outputs.view(np.uint32), stolen.view(np.uint32))
+                and np.array_equal(region_routes, routes)
+                and np.array_equal(region_info[..., :3], info[..., :3]))
+        delivered = all(
+            np.array_equal(sibling_outputs[c].view(np.uint32),
+                           region_outputs[c ^ 1].view(np.uint32))
+            for c in (0, 1))
+        once = bool((region_info[..., 3:6] == 1).all())
+        for core in (0, 1):
+            for layer in range(layers):
+                layer_routes = region_routes[core, layer]
+                used = {int(e) for r, n in zip(layer_routes[:, :128], layer_routes[:, 128])
+                        for e in r[:n] if e < 128}
+                if not used:
+                    coverage.add("a core without experts")
+        print(f"expert region: same as the combine after the loop {same}, "
+              f"sibling outputs received {delivered}, once a layer {once}", flush=True)
+        ok &= same and delivered and once
+        if not perturbed:
+            ok &= "a core without experts" in coverage
     coverage.discard("")
     print(f"coverage {sorted(coverage)}", flush=True)
     errors = info[:, -1, 2].tolist()
@@ -548,6 +662,15 @@ class TestK3ExpertStealMegakernel(CustomTestCase):
 
     def test_b16_scheduled_begin_eager_dmas(self):
         self._run("scheduled_eager", 16)
+
+    def test_b8_expert_region(self):
+        self._run("region", 8)
+
+    def test_b8_expert_region_eager_dmas(self):
+        self._run("region_eager", 8)
+
+    def test_b8_expert_region_perturbed_plans(self):
+        self._run("region_perturbed", 8)
 
 
 if __name__ == "__main__":
