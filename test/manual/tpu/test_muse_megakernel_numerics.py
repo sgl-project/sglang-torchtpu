@@ -1278,6 +1278,7 @@ def _parse_flag(s: str) -> tuple:
 _SERVED_CAPTURE = (1, 16, 30, 44, 59)
 _SERVED_LAYERS = 62
 _BENCH_WARMUP = 3
+_RETIRED_CALLABLES: list = []
 
 
 def bench_case(
@@ -1286,7 +1287,9 @@ def bench_case(
     """Wall time per decode step of one compiled executable (``iters`` back-to-back calls,
     one sync); prints MK_BENCH with this rank's ms and the step config's ablation fields."""
     # built kernels are cached by MKConfig, which does not carry the trace-time dev knobs
-    # (SGLANG_TPU_MUSE_MK_DEV_ROUTE): rebuild for every variant
+    # (SGLANG_TPU_MUSE_MK_DEV_ROUTE): rebuild for every variant, keeping the old callables
+    # alive so a new one cannot reuse their id() in its executable cache key
+    _RETIRED_CALLABLES.extend(runner.mk._ops.values())
     runner.mk._ops.clear()
     st = step_inputs(case)
     kv = runner.pools(case, st)
