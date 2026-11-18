@@ -692,9 +692,13 @@ def derive_tpu_dsv41_pool_sizes(original, kvc, *, config):
 
     import msgspec
 
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
+    # Wraps every model's sizing; ModelConfig sets compress_ratios only for V4.
     if (
         kvc.is_draft_worker
         or kvc.device != "tpu"
+        or not is_deepseek_v4(kvc.model_config.hf_config)
         or not uses_dsv41_pool(kvc.model_config.compress_ratios)
         or not get_exec().features.enable_encoder_swa_bounded_replay
         or config.swa_max_total_num_tokens != 0
