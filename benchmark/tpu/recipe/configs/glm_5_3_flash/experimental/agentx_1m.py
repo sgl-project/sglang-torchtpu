@@ -35,6 +35,9 @@ KV_SHARDS = int(os.environ.get("MLA_KV_SHARDS", 1))
 # ways, 9.4M tokens plus 800 KDA checkpoint slots take about the HBM of this pool
 # plus its 144 slots (only 8 was measured).
 POOL_TOKENS = 9437184 if KV_SHARDS == 8 else 2097152
+# KDA checkpoint slots, sized for the conversations AgentX keeps cached, not the running
+# cap. 144 = the MRR 16 points; the 11-17 MRR 2 / 4 / 8 points ran 74 / 84 / 104.
+MAMBA_SLOTS = int(os.environ.get("AGENTX_MAMBA_SLOTS", 144))
 
 CONFIG = deepcopy(MTP_CONFIG)
 CONFIG["server_args"].update(
@@ -53,7 +56,7 @@ CONFIG["server_args"].update(
         "use_spmd_compile": True,  # compile each graph on one rank, broadcast it to the rest
         "enable_attn_tp_input_scattered": False,  # off for SPMD: scattered prefill slices rows at a per-rank offset
         "max_total_tokens": int(os.environ.get("AGENTX_POOL_TOKENS", POOL_TOKENS)),
-        "max_mamba_cache_size": 5 * MAX_RUNNING + 64,
+        "max_mamba_cache_size": MAMBA_SLOTS,
         "enable_metrics": True,
         "enable_cache_report": True,
         "scheduler_recv_interval": 8,

@@ -20,15 +20,19 @@ def agentx_config(
     *,
     max_running: int,
     pool_tokens: int,
+    mamba_slots: int,
     kv_shards: int = 1,
-    mamba_slots: int | None = None,
+    hicache_ratio: float | None = None,
+    state_host_ratio: float | None = None,
 ) -> dict:
     """max_running: running-request cap (the rest queue); pool_tokens: KV pool size;
-    kv_shards: attention-TP ranks that split the MLA latent cache by page (>1: no
-    host tier, decode on the model path); mamba_slots: device KDA checkpoint slots
-    (default 5 * max_running + 64)."""
-    if mamba_slots is None:
-        mamba_slots = 5 * max_running + 64
+    mamba_slots: device KDA checkpoint slots, sized for the conversations AgentX keeps
+    cached (concurrency and memory budget), independent of max_running; kv_shards:
+    attention-TP ranks that split every page of the MLA latent cache (>1: decode on
+    the model path); hicache_ratio: host tier (latent share, index keys and KDA
+    states) as a multiple of the device pools; None: HICACHE_ARGS' ratio unsplit, no
+    host tier split; state_host_ratio: host KDA states as a multiple of the device
+    slots instead (SGLANG_TPU_HICACHE_STATE_RATIO)."""
     config = deepcopy(MTP_CONFIG)
     args, env = config["server_args"], config["runtime_env"]
     args.update(
@@ -73,11 +77,16 @@ def agentx_config(
         }
     )
     if kv_shards > 1:
-        # The split latent cache refuses the host tier and the decode megakernel.
-        for key in HICACHE_ARGS:
-            args.pop(key)
+        # The split latent cache refuses the decode megakernel.
         env["SGLANG_TPU_GLM_FLASH_MEGAKERNEL"] = "0"
         env["SGLANG_TPU_DSA_MLA_KV_SHARDS"] = str(kv_shards)
+        if hicache_ratio is None:
+            for key in HICACHE_ARGS:
+                args.pop(key)
+    if hicache_ratio is not None:
+        args["hicache_ratio"] = hicache_ratio
+    if state_host_ratio is not None:
+        env["SGLANG_TPU_HICACHE_STATE_RATIO"] = str(state_host_ratio)
     if os.environ.get("AGENTX_DUMMY") == "1":
         args["load_format"] = "dummy"
         args.pop("weight_loader_prefetch_checkpoints")

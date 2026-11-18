@@ -23,4 +23,4 @@ from benchmark.tpu.recipe.configs.glm_5_3_flash.experimental.agentx._base import
     agentx_config,
 )
 
-CONFIG = agentx_config(max_running=2, pool_tokens=3407872)
+CONFIG = agentx_config(max_running=2, pool_tokens=3407872, mamba_slots=74)
