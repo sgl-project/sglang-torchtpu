@@ -1,5 +1,6 @@
 """CPU checks of which router top-k calls the TPU hooks hand to the kernel."""
 
+import types
 import unittest
 from unittest import mock
 
@@ -106,6 +107,44 @@ class TestRouterTopkHooks(CustomTestCase):
             rt.register_router_topk_op()
             self.assertFalse(rt._OP_READY)
         build.assert_not_called()
+
+
+class TestMuseSparkRouteGating(CustomTestCase):
+    def test_switch_off_restores_the_sort_at_every_batch_size(self):
+        """SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL=0 must take Muse back to the sort
+        for prefill as well as decode; on, each size takes its own path."""
+        from sglang_tpu.models import muse_spark as ms
+
+        cases = (
+            (False, 8, "sort"),
+            (False, 1024, "sort"),
+            (True, 8, "kernel"),
+            (True, 65, "sort"),
+            (True, 1024, "argmax"),
+        )
+        for enabled, tokens, want in cases:
+            with self.subTest(enabled=enabled, tokens=tokens):
+                moe = types.SimpleNamespace(
+                    gate=lambda _x, t=tokens: (torch.randn(t, 256), None),
+                    router_multiplier=1.0,
+                    e_score_correction_bias=torch.zeros(256),
+                    top_k=8,
+                    route_eps=ms._ROUTE_EPS,
+                    route_scale=1.0,
+                )
+                ids = torch.zeros(tokens, 8, dtype=torch.int32)
+                kernel = mock.Mock(return_value=(torch.zeros(tokens, 8), ids))
+                argmax = mock.Mock(return_value=(torch.zeros(tokens, 8), ids))
+                with (
+                    mock.patch.object(rt, "_OP_READY", enabled),
+                    mock.patch.object(ms, "sigmoid_router_topk", kernel),
+                    mock.patch.object(ms, "argmax_router_topk", argmax),
+                ):
+                    ms.MuseSparkMoE._route(moe, None)
+                taken = (
+                    "kernel" if kernel.called else "argmax" if argmax.called else "sort"
+                )
+                self.assertEqual(taken, want)
 
 
 if __name__ == "__main__":

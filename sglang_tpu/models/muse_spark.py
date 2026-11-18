@@ -64,6 +64,7 @@ from sglang_tpu.moe.router_topk_tpu import (
     argmax_router_topk,
     fits_sigmoid_router_topk,
     register_router_topk_op,
+    router_topk_enabled,
     sigmoid_router_topk,
 )
 
@@ -622,7 +623,7 @@ class MuseSparkMoE(nn.Module):
         tokens = router_logits.shape[0]
         if fits_sigmoid_router_topk(tokens):
             select = sigmoid_router_topk
-        elif tokens >= _ARGMAX_TOPK_MIN_TOKENS:
+        elif router_topk_enabled() and tokens >= _ARGMAX_TOPK_MIN_TOKENS:
             select = argmax_router_topk
         else:
             select = _sort_router_topk

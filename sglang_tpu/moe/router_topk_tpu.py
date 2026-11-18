@@ -74,9 +74,15 @@ def register_router_topk_op() -> None:
         _OP_READY = True
 
 
+def router_topk_enabled() -> bool:
+    """SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL, as registered: gates every fast
+    router path here, so turning it off restores the generic top-k."""
+    return _OP_READY
+
+
 def fits_sigmoid_router_topk(num_tokens: int) -> bool:
     """True when ``sigmoid_router_topk`` takes a batch of this many tokens."""
-    return _OP_READY and 0 < num_tokens <= MAX_TOKENS
+    return router_topk_enabled() and 0 < num_tokens <= MAX_TOKENS
 
 
 def sigmoid_router_topk(
