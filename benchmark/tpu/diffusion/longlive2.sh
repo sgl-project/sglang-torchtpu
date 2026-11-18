@@ -9,4 +9,7 @@ export PARALLEL_ARGS="${PARALLEL_ARGS-}"
 # first request once as warmup at its own size: the server warmup of this TI2V model conditions
 # on a 64x64 image, which sets 960x928.
 export MODEL_ARGS="${MODEL_ARGS---regional-compile --dit-cpu-offload false --warmup-mode request}"
+# The VAE decoder calls after the second, which run with full causal caches, compile to one graph
+# per frame size; the first two calls stay eager.
+export SGLANG_DIFFUSION_ENABLE_WAN_VAE_DECODER_COMPILE="${SGLANG_DIFFUSION_ENABLE_WAN_VAE_DECODER_COMPILE:-1}"
 exec bash "$(dirname "$0")/launch.sh" "$@"
