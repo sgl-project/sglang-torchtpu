@@ -69,7 +69,8 @@ def _fp8_rows(x):
 
 def build_forward(c: PFConfig, axis: str = "model"):
     """prefill/tp's (meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights, *experts, *kv) ->
-    (hidden, aux, *kv), computed in the sequence-parallel layout with an EP MoE."""
+    (hidden, aux, *kv), computed in the sequence-parallel layout with an EP MoE; with
+    c.expert_counts, (hidden, aux, counts [n_layers, n_experts] int32 per rank, *kv)."""
     from sglang_tpu.attention.pallas.batched_rpa import configs
     from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
         ragged_paged_attention,
@@ -270,6 +271,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
         # the native decoder streams the bf16-rounded normalized embedding
         stream = _bf(_rms(own, c.rms_eps))
         aux = []
+        counts = []
+        # meta[0]: the step's valid tokens; this rank owns global rows [me * Ts, (me + 1) * Ts)
+        valid = (me * Ts + jnp.arange(Ts, dtype=jnp.int32)) < meta[0]
         for l in range(L):
             sm = smalls[l]
             a8, a_s = _fp8_rows(_rms(stream, c.rms_eps) * small_row(sm, "pre_attn_w"))
@@ -287,6 +291,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
 
             ffn = _rms(stream, c.rms_eps) * small_row(sm, "pre_ffn_w")
             ids, tw = route(ffn.astype(_BF16), wrouter[l], sm)
+            if c.expert_counts:
+                # padding rows count into a dropped bucket n_experts
+                dest = jnp.where(valid[:, None], ids, c.n_experts).reshape(-1)
+                counts.append(_counts(dest, c.n_experts + 1)[: c.n_experts])
             f8, f_s = _fp8_rows(ffn)
             pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
             xe8, xs = _fp8_rows(
@@ -302,6 +310,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 aux.append(stream.astype(_BF16))
         hidden = (_rms(stream.astype(_BF16), c.rms_eps) * final_norm[0]).astype(_BF16)
         aux_out = jnp.concatenate(aux, axis=1) if aux else jnp.zeros((Ts, LANE), _BF16)
+        if c.expert_counts:
+            return (ag(hidden), ag(aux_out), jnp.stack(counts), *kv)
         return (ag(hidden), ag(aux_out), *kv)
 
     return forward

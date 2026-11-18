@@ -65,6 +65,10 @@ from sglang_tpu.muse_megakernel.decode.spep.kernel import (
     ep_megakernel_call,
 )
 from sglang_tpu.muse_megakernel.decode.tp import kernel as K
+from sglang_tpu.muse_megakernel.common.expert_counts import (
+    expert_counts_enabled,
+    record_expert_counts,
+)
 from sglang_tpu.muse_megakernel.prefill import spep as PF_SP
 from sglang_tpu.muse_megakernel.prefill import tp as PF
 
@@ -406,6 +410,7 @@ class MuseMegakernel(torch.nn.Module):
         for i, t in enumerate(experts):
             self.register_buffer(f"expert_{i}", t, persistent=False)
         self.n_expert_refs = len(experts)
+        self.tp_rank = tp_rank
         self.register_buffer(
             "rank_t",
             torch.tensor([tp_rank], dtype=torch.int32, device=weights["smalls"].device),
@@ -1033,6 +1038,7 @@ class MuseMegakernel(torch.nn.Module):
             sp=sp,
             expert_kinds=tuple(self.kinds) if sp else (),
             sp_ep_layout=sp and tpu_envs.SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT.get(),
+            expert_counts=sp and expert_counts_enabled(),
         ).validate()
 
     def prefill_callable_for(self, cfg: PFConfig):
@@ -1260,6 +1266,8 @@ def _register_prefill_op() -> None:
             outs = callable_(
                 meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights, *experts, *kv
             )
+        if cfg.expert_counts:
+            record_expert_counts(counts=outs[2], rank=mk.tp_rank)
         return outs[0], outs[1]
 
     @op.register_fake
@@ -1512,8 +1520,11 @@ def _build_prefill_callable(cfg: PFConfig):
         tp=cfg.tp,
         n_args=n_args,
         kv0=n_args - L,
-        n_out=2 + L,
-        tag=f"muse_prefill{'_sp' if cfg.sp else ''}_r{cfg.rows}_c{len(cfg.capture_layers)}",
+        n_out=(3 if cfg.expert_counts else 2) + L,
+        tag=(
+            f"muse_prefill{'_sp' if cfg.sp else ''}_r{cfg.rows}_c{len(cfg.capture_layers)}"
+            f"{'_cnt' if cfg.expert_counts else ''}"
+        ),
     )
     logger.info(
         "Muse prefill program built: sp=%s rows=%d capture=%s fp8_gather=%s w4a16_layers=%d",

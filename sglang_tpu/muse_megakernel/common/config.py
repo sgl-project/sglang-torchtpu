@@ -462,6 +462,9 @@ class PFConfig(MuseGeometry, frozen=True, kw_only=True):
     expert_kinds: tuple = ()
     # SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT: experts / pool / unpool in decode EP's layout
     sp_ep_layout: bool = False
+    # SGLANG_TPU_MUSE_EXPERT_COUNTS_DIR: the SP program also returns [n_layers, n_experts] int32
+    # routed-slot counts of this rank's valid rows
+    expert_counts: bool = False
 
     def validate(self) -> "PFConfig":
         if self.tp != PREFILL_TP:

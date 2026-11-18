@@ -635,6 +635,12 @@ class TpuEnvs:
     # a2a arm: up to this many rows, pool / unpool read a 1/tp column slice of the weights for
     # every row (8 instead of 64 MiB per layer); above it, gathering every row costs more. 0: off.
     SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS = EnvInt(16)
+    # Directory: the SP prefill program also returns per-layer routed-expert counts of the
+    # valid rows, and each rank dumps their running sum there (expert_counts.py). Empty: off.
+    SGLANG_TPU_MUSE_EXPERT_COUNTS_DIR = EnvStr("")
+    # JSON of a static expert placement (models/muse_expert_placement.py): physical expert
+    # slot -> checkpoint expert per layer, applied at weight load. Empty: identity.
+    SGLANG_TPU_MUSE_EXPERT_PLACEMENT = EnvStr("")
     # EP megakernel without Pallas bounds checks.
     SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
     # Decode megakernels (TP and EP): rows up to which global-layer chunk loops are hoisted
