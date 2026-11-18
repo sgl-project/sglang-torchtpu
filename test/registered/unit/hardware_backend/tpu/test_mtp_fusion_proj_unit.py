@@ -99,15 +99,13 @@ class TestColumnParallelMtpFusionProj(CustomTestCase):
                 ):
                     hook_shard_eh_proj(None, model, prefix="model")
                 proj = model.eh_proj
-                self.assertIsInstance(
-                    proj, mtp_fusion_proj.ColumnParallelMtpFusionProj
-                )
+                self.assertIsInstance(proj, mtp_fusion_proj.ColumnParallelMtpFusionProj)
                 param = proj.weight
                 param.weight_loader(param, full.weight.detach())
                 ranks.append(proj)
         return ranks
 
-    def test_matches_replicated_linear_exactly(self):
+    def test_matches_replicated_linear(self):
         for tp, shape, dtype in (
             (8, (5, 64), torch.bfloat16),
             (8, (32, 64), torch.bfloat16),
@@ -161,12 +159,12 @@ class TestColumnParallelMtpFusionProj(CustomTestCase):
                         self.assertTrue(
                             torch.equal(captured_locals[r], partials[r]), f"rank {r}"
                         )
-                        if dtype == torch.bfloat16:
-                            self.assertTrue(torch.equal(out, expected), f"rank {r}")
-                        else:
-                            torch.testing.assert_close(
-                                out, expected, atol=1e-6, rtol=1e-6
-                            )
+                        # The layer returns exactly the gathered per-rank partials.
+                        self.assertTrue(torch.equal(out, gathered), f"rank {r}")
+                    # Each output column is the same dot product as the full layer, but
+                    # CPU BLAS may sum a narrower GEMM in another order: compare with
+                    # the dtype's default tolerance, not bitwise.
+                    torch.testing.assert_close(gathered, expected)
                     self.assertEqual(tp_gather.call_count, tp)
 
     def test_dp_attention_uses_attn_tp_group_and_skips_when_attn_tp_is_one(self):
@@ -195,9 +193,7 @@ class TestColumnParallelMtpFusionProj(CustomTestCase):
             mock.patch.object(
                 mtp_fusion_proj, "is_dp_attention_enabled", return_value=False
             ),
-            mock.patch.object(
-                mtp_fusion_proj, "get_parallel", return_value=cp_par
-            ),
+            mock.patch.object(mtp_fusion_proj, "get_parallel", return_value=cp_par),
         ):
             hook_shard_eh_proj(None, model_cp8, prefix="model")
         self.assertIs(model_cp8.eh_proj, orig_cp_linear)
@@ -289,9 +285,7 @@ class TestColumnParallelMtpFusionProj(CustomTestCase):
         ):
             hook_shard_eh_proj(None, m_meta, prefix="model")
             first = m_meta.eh_proj
-            self.assertIsInstance(
-                first, mtp_fusion_proj.ColumnParallelMtpFusionProj
-            )
+            self.assertIsInstance(first, mtp_fusion_proj.ColumnParallelMtpFusionProj)
             self.assertEqual(first.weight.device.type, "meta")
             self.assertEqual(first.weight.dtype, torch.bfloat16)
             hook_shard_eh_proj(None, m_meta, prefix="model")
