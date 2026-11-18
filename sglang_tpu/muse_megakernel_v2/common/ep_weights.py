@@ -109,20 +109,15 @@ def _fp8_to_ep(experts: torch.nn.Module, chunk: int) -> None:
     dev = w13.device
     kp_he = _index(kperm(he), dev)
     cols = _index(chunk_cols(two_i, chunk), dev)
-    u13 = w13.view(torch.uint8)
+    # Gathered in fp8, not through a uint8 view: TorchTPU 0.2 keeps any tensor derived from
+    # a dtype view (even cloned or copy_'d into an fp8 buffer) bound to the uint8 buffer and
+    # runs an eager as_strided bitcast of the 1 GiB slab before every compiled call.
     new13 = torch.cat(
         [
-            _rows(u13[e0 : e0 + _EXPERT_CHUNK], kp_he).index_select(2, cols)
-            for e0 in range(0, u13.shape[0], _EXPERT_CHUNK)
+            _rows(w13[e0 : e0 + _EXPERT_CHUNK], kp_he).index_select(2, cols)
+            for e0 in range(0, w13.shape[0], _EXPERT_CHUNK)
         ]
     )
-    # Materialized into its own fp8 buffer, as _materialize_packed_fp4 does for fp4: an fp8
-    # view of the uint8 result (even cloned) makes TorchTPU 0.2 run an eager as_strided
-    # bitcast of the 1 GiB slab before every compiled call.
-    new13_u8 = new13
-    new13 = torch.empty_like(new13_u8, dtype=torch.float8_e4m3fn)
-    new13.copy_(new13_u8.view(torch.float8_e4m3fn))
-    del new13_u8
     s13 = _channel_scales(experts.w13_weight_scale.data).index_select(2, cols)
     s2 = _channel_scales(experts.w2_weight_scale.data)
     _wait_for(new13, s13, s2)
