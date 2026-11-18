@@ -602,15 +602,25 @@ def canonical_candidate_blocks(
 
 
 def _stable_sort_rows_by_key(key: jax.Array, *payloads: jax.Array) -> list[jax.Array]:
-    """Stable per-row sort of ``payloads`` by ``key`` (axis 1) in one ``lax.sort``.
+    """Stable per-row sort of ``payloads`` by ``key`` (axis 1), one ``lax.sort`` per payload.
 
     Equivalent to ``take_along_axis(x, argsort(key, stable=True))`` for each
-    payload. Carrying the payloads through the sort avoids the row gathers that
+    payload. Carrying a payload through the sort avoids the row gathers that
     argsort + take_along_axis lowers to: at prefill sizes ([1024, 4096] int32)
     XLA offloads those gathers to SparseCore at ~50-210 ms each on TPU7x, while
-    the sort itself takes under 1 ms.
+    each sort takes about 1 ms.
+
+    Each payload gets its own (key, payload) sort instead of one sort carrying
+    every payload: on libtpu 0.0.50 a stable ``lax.sort`` with two or more
+    payloads at widths 3072/4096 corrupts rows 8-15 of every 16 once there are
+    more than 8 rows (fixed in libtpu 0.0.52), while single-payload sorts are
+    correct. A stable sort by the same key moves every payload by the same
+    permutation, so the results match the multi-payload form exactly.
     """
-    return list(lax.sort((key, *payloads), dimension=1, is_stable=True, num_keys=1)[1:])
+    return [
+        lax.sort((key, payload), dimension=1, is_stable=True, num_keys=1)[1]
+        for payload in payloads
+    ]
 
 
 def _rotate_rows_left(values: jax.Array, shift: jax.Array) -> jax.Array:
