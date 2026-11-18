@@ -410,6 +410,7 @@ class PreparedEngramUpload:
         dev = torch.device(device)
         self._sync_fn = sync_fn
         self.pending: Any = None
+        self.consumer_event: Any = None
         self.consumers: list[torch.Tensor] = []
         self.needs_consumer = False
         if num_words == 0 or (dev.type == "cpu" and batch_transfer_mod is None):
@@ -449,6 +450,10 @@ class PreparedEngramUpload:
         return self.host_words
 
     def release_consumers(self) -> None:
+        if self.consumer_event is not None:
+            with torch.profiler.record_function("engram::slot_consumer_wait"):
+                self.consumer_event.synchronize()
+            self.consumer_event = None
         if self.consumers:
             if self._sync_fn is not None:
                 with torch.profiler.record_function("engram::slot_consumer_wait"):
@@ -472,10 +477,19 @@ class PreparedEngramUpload:
         self.wait()
         self.needs_consumer = True
 
+    def record_consumer_event(self, event: Any) -> None:
+        if self.needs_consumer:
+            if event is None:
+                raise ValueError("Engram slot reuse requires a consumer event")
+            self.consumer_event = event
+            self.consumers = []
+            self.needs_consumer = False
+
     def record_consumers(self, tensors: list[torch.Tensor]) -> None:
         if self.needs_consumer:
             if not tensors:
                 raise ValueError("Engram slot reuse requires a consumer output")
+            self.consumer_event = None
             self.consumers = tensors
             self.needs_consumer = False
 
@@ -541,6 +555,7 @@ class HostEngramCoordinator:
         batch_transfer_mod: Any = None,
         layout_mod: Any = None,
         sync_fn: Any = None,
+        event_cls: Any = None,
     ):
         self._hasher = hasher
         self.ngram = hasher.max_ngram_size
@@ -559,6 +574,9 @@ class HostEngramCoordinator:
         self.device = torch.device(device)
         self._batch_transfer_mod = batch_transfer_mod
         self._layout_mod = layout_mod
+        if event_cls is None and sync_fn is None and self.device.type == "tpu":
+            event_cls = torch.get_device_module("tpu").Event
+        self._event_cls = event_cls
         if sync_fn is None and self.device.type != "cpu":
             from torch_tpu._internal.sync.sync import synchronize as sync_fn
         self._sync_fn = sync_fn
@@ -883,6 +901,41 @@ class HostEngramCoordinator:
     ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int]:
         """Stage precomputed CPU hash ids through the same packed double buffers."""
         return self._stage_layers(hashes, padded_tokens, use_prestaged=False)
+
+    def make_consumer_event(self) -> Any:
+        """Record a stream completion event on TPU without retaining output tensors.
+
+        Holding output ``next_token_logits`` (e.g. ``[64, 129280]`` float32 =
+        33 MiB per slot) across inactive bucket slots pins hundreds of MiB of
+        HBM; a recorded TPU ``Event`` tracks the PJRT execution future directly
+        with zero HBM buffer retention and flushes the stream for prefetching.
+        """
+        if self._event_cls is None:
+            return None
+        event = self._event_cls()
+        event.record()
+        return event
+
+    def record_consumer_event(
+        self,
+        uploads: list[PreparedEngramUpload],
+        event: Any,
+    ) -> None:
+        """Bind a stream completion event to active slots without pinning outputs."""
+        for upload in uploads:
+            if upload.needs_consumer:
+                upload.record_consumer_event(event)
+
+    def bind_consumer_event(
+        self,
+        uploads: list[PreparedEngramUpload],
+        event: Any,
+    ) -> None:
+        """Bind a deferred warmup call's stream completion event to its slots."""
+        for upload in uploads:
+            upload.consumer_event = event
+            upload.consumers = []
+            upload.needs_consumer = False
 
     def record_consumers(
         self,

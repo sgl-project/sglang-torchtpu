@@ -1116,5 +1116,305 @@ def test_direct_tracer_carrying_packed_engram_tensors_end_to_end():
     assert torch.equal(out, unpack_rows(packed, tokens=4, heads=4, dim=weight.shape[1]))
 
 
+def test_tpu_consumer_event_releases_output_tensors_across_slots_and_warmup():
+    """TPU stream Events gate slot reuse without pinning output tensors in HBM."""
+    import gc
+    import sys
+    import weakref
+
+    from sglang_tpu.compilation.compiled_forward_shim import CompiledForwardShim
+    from sglang_tpu.models.deepseek_v41.compile_policy import (
+        DeepseekV4DecoderTpuCompilePolicy,
+        _EngramCompiledForwardShim,
+    )
+
+    # 1. Default TPU coordinator selects torch.get_device_module("tpu").Event
+    #    unless a custom sync_fn overrides synchronization.
+    fake_tpu_event_cls = type("FakeTpuEvent", (), {})
+    fake_sync_mod = SimpleNamespace(synchronize=lambda tensors, wait=True: None)
+    _, default_embeddings, default_hasher = _coordinator()
+    with (
+        patch(
+            "sglang_tpu.models.deepseek_v41.engram_host.torch.device",
+            return_value=SimpleNamespace(type="tpu"),
+        ),
+        patch(
+            "sglang_tpu.models.deepseek_v41.engram_host.torch.get_device_module",
+            return_value=SimpleNamespace(Event=fake_tpu_event_cls),
+        ) as get_dev_mod,
+        patch.dict(
+            sys.modules,
+            {
+                "torch_tpu": SimpleNamespace(),
+                "torch_tpu._internal": SimpleNamespace(),
+                "torch_tpu._internal.sync": SimpleNamespace(),
+                "torch_tpu._internal.sync.sync": fake_sync_mod,
+            },
+        ),
+    ):
+        tpu_coord = HostEngramCoordinator(default_hasher, default_embeddings, "tpu")
+        get_dev_mod.assert_called_once_with("tpu")
+        assert tpu_coord._event_cls is fake_tpu_event_cls
+        custom_sync_coord = HostEngramCoordinator(
+            default_hasher, default_embeddings, "tpu", sync_fn=lambda t, wait=True: None
+        )
+        assert custom_sync_coord._event_cls is None
+
+    # 2. End-to-end shim + coordinator with recorded stream Events.
+    bt_mod, layout_mod, sync_fn, _, synced, events = _fake_transport(defer_h2d=True)
+    created_events = []
+
+    class FakeEvent:
+        def __init__(self):
+            self.idx = len(created_events)
+            self.recorded = 0
+            self.synced = 0
+            created_events.append(self)
+
+        def record(self):
+            self.recorded += 1
+            events.append(("event_record", self.idx))
+
+        def synchronize(self):
+            self.synced += 1
+            events.append(("event_sync", self.idx))
+
+    _, embeddings, hasher = _coordinator()
+    coordinator = HostEngramCoordinator(
+        hasher,
+        embeddings,
+        "cpu",
+        batch_transfer_mod=bt_mod,
+        layout_mod=layout_mod,
+        sync_fn=sync_fn,
+        event_cls=FakeEvent,
+    )
+    layers = [
+        SimpleNamespace(engram=SimpleNamespace(layer_hash_index=idx, embed=emb))
+        for idx, emb in embeddings
+    ]
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=layers, engram_hasher=hasher),
+        vision=None,
+        get_input_embeddings=lambda: (
+            lambda ids: torch.zeros(ids.shape[0], 8, dtype=torch.bfloat16)
+        ),
+        _tpu_host_engram_coordinator=coordinator,
+    )
+    runner = SimpleNamespace(
+        model=model,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                model_type="deepseek_v41",
+                vision_n_layers=0,
+                vocab_size=8,
+                image_token_id=None,
+                engram_pad_token_id=3,
+            ),
+            use_engram=True,
+        ),
+        is_draft_worker=False,
+        device="cpu",
+    )
+    policy = object.__new__(DeepseekV4DecoderTpuCompilePolicy)
+    policy.model_runner = runner
+    policy._engram_hasher = hasher
+    policy._embeds_outside_graph = False
+    shim = object.__new__(_EngramCompiledForwardShim)
+    shim.policy = policy
+    worker = SimpleNamespace(model_runner=runner)
+
+    def make_fb(mode, n_tokens):
+        return SimpleNamespace(
+            input_ids=torch.zeros(n_tokens, dtype=torch.int64),
+            positions=torch.arange(n_tokens, dtype=torch.int64),
+            req_pool_indices=torch.zeros(1, dtype=torch.int64),
+            out_cache_loc=torch.arange(n_tokens, dtype=torch.int64),
+            extend_seq_lens=torch.tensor([n_tokens], dtype=torch.int64),
+            extend_start_loc=torch.tensor([0], dtype=torch.int64),
+            engram_history=None,
+            spec_info=None,
+            input_embeds=None,
+            mm_inputs=None,
+            forward_mode=mode,
+            tpu_engram_local_ids=None,
+            tpu_engram_staged=None,
+        )
+
+    def run_shim(fb, fn, *, unpad_idle=False):
+        def orig_shim(s, wrapped_fn, ids, pos, fbatch, *a, **kw):
+            out = wrapped_fn(ids, pos, fbatch)
+            if unpad_idle and not isinstance(out, PendingCall):
+                return _FakeLogitsOutput(next_token_logits=out.next_token_logits[:0])
+            return out
+
+        with patch.object(CompiledForwardShim, "_forward", orig_shim):
+            return shim._forward(fn, fb.input_ids, fb.positions, fb)
+
+    fake_parallel = SimpleNamespace(
+        pp_size=1, attn_cp_size=1, attn_dcp_size=1, attn_dp_size=1
+    )
+    fake_exec = SimpleNamespace(
+        features=SimpleNamespace(enable_encoder_swa_bounded_replay=False)
+    )
+    weak_outputs = []
+
+    with (
+        patch("sglang.srt.runtime_context.get_parallel", return_value=fake_parallel),
+        patch("sglang.srt.runtime_context.get_exec", return_value=fake_exec),
+    ):
+        # Step 1 (chunked prefill): event.record() precedes prefetch h2d_async,
+        # sync_fn is never called, and next_token_logits is NOT retained.
+        prompt_req = _request([1, 2, 3, 4, 5, 6, 7, 0])
+        b1 = _batch([prompt_req], starts=[0], lengths=[4])
+        fb1 = make_fb(b1.forward_mode, 4)
+        events.clear()
+
+        def step1_worker(w, b):
+            def _fn(ids, pos, fb):
+                logits = torch.ones(4, 16)
+                weak_outputs.append(weakref.ref(logits))
+                return _FakeLogitsOutput(next_token_logits=logits)
+
+            out = run_shim(fb1, _fn)
+            del out
+            return SimpleNamespace(copy_done=None, next_token_ids=[5])
+
+        hooks.tpu_dsv41_engram_worker_forward(step1_worker, worker, b1)
+        gc.collect()
+        assert weak_outputs[-1]() is None
+        assert len(synced) == 0
+        rec_idx = events.index(("event_record", 0))
+        assert events[rec_idx + 1 :] == ["h2d_async", "h2d_async"]
+        ev0 = created_events[0]
+        assert ev0.recorded == 1 and ev0.synced == 0
+        for upload in coordinator._active_uploads.values():
+            assert upload.consumer_event is ev0
+            assert upload.consumers == []
+
+        # Step 2 (chunk-2 prefetch hit on alternate slots): does NOT wait on ev0.
+        b2 = _batch([prompt_req], starts=[4], lengths=[4])
+        fb2 = make_fb(b2.forward_mode, 4)
+        hooks.tpu_dsv41_engram_worker_forward(
+            lambda w, b: (
+                run_shim(
+                    fb2,
+                    lambda ids, pos, fb: _FakeLogitsOutput(
+                        next_token_logits=torch.ones(4, 16)
+                    ),
+                ),
+                SimpleNamespace(copy_done=None, next_token_ids=[6]),
+            )[1],
+            worker,
+            b2,
+        )
+        assert ev0.synced == 0
+        ev1 = created_events[1]
+        assert ev1.recorded == 1 and ev1.synced == 0
+
+        # Step 3 (reuses Step 1's slots on bucket 4): synchronizes ev0 per layer.
+        other_req = _request([3, 1, 4, 2])
+        b3 = _batch([other_req], starts=[0], lengths=[4])
+        fb3 = make_fb(b3.forward_mode, 4)
+        events.clear()
+        hooks.tpu_dsv41_engram_worker_forward(
+            lambda w, b: (
+                run_shim(
+                    fb3,
+                    lambda ids, pos, fb: _FakeLogitsOutput(
+                        next_token_logits=torch.ones(4, 16)
+                    ),
+                ),
+                SimpleNamespace(copy_done=None, next_token_ids=[7]),
+            )[1],
+            worker,
+            b3,
+        )
+        assert ev0.synced == 2
+        assert ev1.synced == 0
+        # Both slot waits happen before their replacement h2d_async transfers.
+        assert events[:4] == [
+            ("event_sync", 0),
+            "h2d_async",
+            ("event_sync", 0),
+            "h2d_async",
+        ]
+
+        # Step 4 (IDLE DP unpadding on bucket 16): drops un-sliced output tensor.
+        idle_b = _batch([], idle=True)
+        idle_fb = make_fb(idle_b.forward_mode, 16)
+
+        def idle_worker(w, b):
+            def _fn(ids, pos, fb):
+                logits = torch.full((16, 16), 9.0)
+                weak_outputs.append(weakref.ref(logits))
+                return _FakeLogitsOutput(next_token_logits=logits)
+
+            out = run_shim(idle_fb, _fn, unpad_idle=True)
+            assert out.next_token_logits.shape[0] == 0
+            del out
+            return SimpleNamespace(copy_done=None, next_token_ids=torch.empty(0))
+
+        hooks.tpu_dsv41_engram_worker_forward(idle_worker, worker, idle_b)
+        gc.collect()
+        assert weak_outputs[-1]() is None
+        ev_idle = created_events[-1]
+        for upload in coordinator._active_uploads.values():
+            assert upload.consumer_event is ev_idle
+            assert upload.consumers == []
+        assert len(synced) == 0
+
+        # Step 5 (PendingCall warmup on bucket 8): 2 executed variants + 1 no-op
+        # compile-only PendingCall(lambda: None) preserve real consumer_events
+        # and retain zero warmup output tensors.
+        warm_mode = SimpleNamespace(
+            is_decode=lambda: False,
+            is_extend_without_speculative=lambda: False,
+            is_extend=lambda: False,
+            is_target_verify=lambda: False,
+            is_idle=lambda: True,
+        )
+        warmup_calls = []
+        for idx in range(3):
+            w_fb = make_fb(warm_mode, 8)
+
+            def make_warm_fn(call_idx):
+                def _fn(ids, pos, fb):
+                    if call_idx == 2:
+                        return PendingCall(lambda: None)
+
+                    def _exec():
+                        logits = torch.full((8, 16), float(call_idx + 1))
+                        weak_outputs.append(weakref.ref(logits))
+                        return _FakeLogitsOutput(next_token_logits=logits)
+
+                    return PendingCall(_exec)
+
+                return _fn
+
+            warmup_calls.append(run_shim(w_fb, make_warm_fn(idx)))
+
+        event_count_before_wait = len(created_events)
+        for pending in warmup_calls:
+            res = pending.wait()
+            del res
+        gc.collect()
+        # Only the 2 executed warmup variants recorded events; the 3rd no-op
+        # PendingCall left Slot 0's recorded event intact.
+        assert len(created_events) == event_count_before_wait + 2
+        ev_w0, ev_w1 = created_events[-2], created_events[-1]
+        for layer_slots in coordinator._uploads_by_layer.values():
+            slot0, slot1 = layer_slots[8]
+            assert slot0.consumer_event is ev_w0 and slot0.consumers == []
+            assert slot1.consumer_event is ev_w1 and slot1.consumers == []
+        assert all(ref() is None for ref in weak_outputs)
+        # Only pre-wait slot reuse during PendingCall queuing touched sync_fn
+        # (on the pre-allocated upload.device buffers, never output tensors).
+        assert [t for t, _ in synced] == [
+            [coordinator._uploads_by_layer[0][8][0].device],
+            [coordinator._uploads_by_layer[1][8][0].device],
+        ]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))

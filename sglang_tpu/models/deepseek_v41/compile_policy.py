@@ -16,10 +16,11 @@ prepares eager DP token embeddings, and right before the compiled forward its
   Remove once torch_tpu compiles that gather correctly.
 - Engram, when the model has Engram layers: ``_EngramCompiledForwardShim``
   resolves any deferred overlap tokens, packs rows with single-threaded NumPy
-  and uploads via double-buffered async raw DMA (``engram_host``), captures
-  un-sliced forward outputs as DMA slot consumers (safe on IDLE DP ranks and
-  async warmup ``PendingCall``), and triggers next-chunk prefill prefetch after
-  dispatching the compiled forward.
+  and uploads via double-buffered async raw DMA (``engram_host``), records a
+  TPU stream ``Event`` (or output tensors on non-event devices) to gate DMA
+  slot reuse without retaining forward output buffers in HBM (safe on IDLE DP
+  ranks and async warmup ``PendingCall``), and triggers next-chunk prefill
+  prefetch after dispatching the compiled forward.
 
 Warmup pads through the same ``prepare_forward_batch`` and shim, so precompiled
 and serving graphs share one signature.
@@ -109,19 +110,30 @@ class _EngramCompiledForwardShim(CompiledForwardShim):
                     fn, input_ids, positions, forward_batch, *args, **kwargs
                 )
             raw_consumers: list[torch.Tensor] = []
+            recorded_events: list[Any] = []
 
             def wrapped_fn(*f_args, **f_kwargs):
                 raw_out = fn(*f_args, **f_kwargs)
                 if not isinstance(raw_out, PendingCall):
-                    raw_consumers.extend(
-                        engram_host.collect_output_tensors(raw_out, device=device)
-                    )
+                    event = coordinator.make_consumer_event()
+                    if event is not None:
+                        recorded_events.append(event)
+                    else:
+                        raw_consumers.extend(
+                            engram_host.collect_output_tensors(raw_out, device=device)
+                        )
                     return raw_out
 
                 def _capture_pending(res):
-                    raw_consumers.extend(
-                        engram_host.collect_output_tensors(res, device=device)
-                    )
+                    if res is None:
+                        return res
+                    event = coordinator.make_consumer_event()
+                    if event is not None:
+                        recorded_events.append(event)
+                    else:
+                        raw_consumers.extend(
+                            engram_host.collect_output_tensors(res, device=device)
+                        )
                     return res
 
                 return raw_out.then(_capture_pending)
@@ -149,24 +161,36 @@ class _EngramCompiledForwardShim(CompiledForwardShim):
                     finally:
                         forward_batch.tpu_engram_local_ids = prev_ids
                         forward_batch.tpu_engram_staged = prev_staged
-                    consumers = raw_consumers or engram_host.collect_output_tensors(
-                        res, device=device
-                    )
-                    if consumers:
-                        for upload in uploads_for_call:
-                            upload.consumers = consumers
-                            upload.needs_consumer = False
+                    if recorded_events:
+                        coordinator.bind_consumer_event(
+                            uploads_for_call, recorded_events[-1]
+                        )
+                    else:
+                        consumers = raw_consumers or engram_host.collect_output_tensors(
+                            res, device=device
+                        )
+                        if consumers:
+                            for upload in uploads_for_call:
+                                upload.consumers = consumers
+                                upload.needs_consumer = False
                     return res
 
                 return PendingCall(_run_pending)
-            consumers = raw_consumers or engram_host.collect_output_tensors(
-                out, device=device
-            )
-            coordinator.record_consumers(active_uploads, consumers)
-            active_uploads = None
-            if coordinator.has_next_prompt_prefetch():
-                coordinator.flush_consumers(consumers)
-                coordinator.finish_forward(padded_tokens)
+            if recorded_events:
+                coordinator.record_consumer_event(active_uploads, recorded_events[-1])
+                active_uploads = None
+                if coordinator.has_next_prompt_prefetch():
+                    # event.record() already flushed the compiled forward to PJRT.
+                    coordinator.finish_forward(padded_tokens)
+            else:
+                consumers = raw_consumers or engram_host.collect_output_tensors(
+                    out, device=device
+                )
+                coordinator.record_consumers(active_uploads, consumers)
+                active_uploads = None
+                if coordinator.has_next_prompt_prefetch():
+                    coordinator.flush_consumers(consumers)
+                    coordinator.finish_forward(padded_tokens)
             return out
         finally:
             if active_uploads:
