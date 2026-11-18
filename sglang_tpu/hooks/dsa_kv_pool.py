@@ -4,7 +4,8 @@
 size_tpu_dsa_kv_pool
   Why: DefaultPoolConfigurator sizes a DSA pool with the GPU layout (an
        FP8-scaled MLA latent and a 132-byte index key per layer). The TPU split
-       pool stores a rope row padded to one lane, a 256-byte index-key record
+       pool stores a rope row padded to one lane (none for a model without
+       rope dims), a 256-byte index-key record
        and, for a pooled indexer, a bf16 key + gate per token. Sized from free
        memory, the pool then oversubscribes HBM (2.1x for GLM-5.3-Flash) and the
        first compile runs out of memory.
@@ -17,6 +18,18 @@ size_tpu_dsa_kv_pool
 """
 
 from __future__ import annotations
+
+
+def _qk_rope_head_dim(model_config) -> int:
+    rope_dim = getattr(model_config, "qk_rope_head_dim", None)
+    if rope_dim is None:
+        hf_config = getattr(model_config, "hf_config", None)
+        rope_dim = getattr(hf_config, "qk_rope_head_dim", None)
+        if rope_dim is None:
+            text_config = getattr(hf_config, "text_config", None)
+            rope_dim = getattr(text_config, "qk_rope_head_dim", None)
+    # Default to a positive dim (budget the RoPE lane) if unspecified.
+    return 64 if rope_dim is None else int(rope_dim)
 
 
 def _split_pool_bytes(kvc, *, layer_ids, all_index_layers: bool) -> int:
@@ -38,6 +51,7 @@ def _split_pool_bytes(kvc, *, layer_ids, all_index_layers: bool) -> int:
         ],
         index_kpool=kpool,
         raw_ring=kpool_raw_ring_pages(page_size=1, kpool=kpool) > 0,
+        qk_rope_head_dim=_qk_rope_head_dim(kvc.model_config),
     )
 
 
