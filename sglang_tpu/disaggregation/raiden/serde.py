@@ -210,12 +210,13 @@ class ReshardChunkReady(WireMessage):
         require_non_negative(self.uuid, "uuid")
 
 
-class ReshardLandReady(WireMessage):
+class ReshardLandReady(WireMessage, omit_defaults=True):
     """ReshardReady for a closing plan with landing entries.
 
     ``scratch[i]`` is the decode scratch block that landing sources write for
-    ``pages[i]``; direct sources ignore it. ``land_version`` names the
-    classification both sides must share.
+    ``pages[i]``; ``swa_scratch[i]`` pairs with the room's SWA window pages;
+    direct sources ignore them. ``land_version`` names the classification both
+    sides must share.
     """
 
     TAG: ClassVar[bytes] = MessageTag.RESHARD_LAND_READY
@@ -223,6 +224,7 @@ class ReshardLandReady(WireMessage):
     pages: list[int]
     scratch: list[int]
     land_version: int
+    swa_scratch: list[int] = msgspec.field(default_factory=list)
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")

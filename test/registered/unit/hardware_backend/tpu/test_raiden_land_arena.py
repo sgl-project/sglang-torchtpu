@@ -121,22 +121,21 @@ class TestArenaSizing(CustomTestCase):
 
     def test_other_deployments_reserve_nothing(self):
         cases = {
-            "bf16 target": (dict(kv_cache_dtype="bfloat16"), {}),
-            "auto target": (dict(kv_cache_dtype="auto"), {}),
-            "seq_along_lane": (dict(pool_cls=TpuSeqAlongLaneKVPool), {}),
-            "generic pool": (dict(pool_cls=MHATokenToKVPool), {}),
-            "swa": ({}, dict(swa=True)),
-            "prefill": (dict(mode="prefill"), {}),
-            "no disagg": (dict(mode="null"), {}),
-            "mooncake": (dict(backend="mooncake"), {}),
-            "env off": (dict(arena=False), {}),
+            "bf16 target": dict(kv_cache_dtype="bfloat16"),
+            "auto target": dict(kv_cache_dtype="auto"),
+            "seq_along_lane": dict(pool_cls=TpuSeqAlongLaneKVPool),
+            "generic pool": dict(pool_cls=MHATokenToKVPool),
+            "prefill": dict(mode="prefill"),
+            "no disagg": dict(mode="null"),
+            "mooncake": dict(backend="mooncake"),
+            "env off": dict(arena=False),
             # The sizer charges nothing for MLA; an MHA draft must match.
-            "mla target": (dict(mla=True), {}),
-            "unified pool": (dict(unified=True), {}),
+            "mla target": dict(mla=True),
+            "unified pool": dict(unified=True),
         }
-        for name, (deployment, kwargs) in cases.items():
+        for name, deployment in cases.items():
             with self.subTest(name), _deployment(**deployment):
-                self.assertEqual(land_arena_blocks(**kwargs), 0)
+                self.assertEqual(land_arena_blocks(), 0)
 
     def test_unified_pool_reserves_nothing(self):
         # --enable-unified-memory: the unified configurator charges no arena,
@@ -182,19 +181,28 @@ class TestArenaUniformAcrossGroups(CustomTestCase):
         groups = get_raiden_kv_caches(target, draft)
         self.assertEqual({int(t.shape[0]) for t in groups.full}, {target.num_blocks})
 
-    def test_swa_group_gets_none(self):
+    def test_swa_group_reserves_arena(self):
+        """Both full and sliding-window sub-pools reserve the group arena, keeping
+        target and draft block counts uniform across each group."""
         with _deployment():
             pool = _swa_pool()
-            draft = _pool()
+            draft = _swa_pool(torch.bfloat16)
+            plain = _pool()
         self.assertEqual(pool.full_kv_pool.land_arena_blocks, ARENA)
-        self.assertEqual(pool.swa_kv_pool.land_arena_blocks, 0)
-        self.assertEqual(pool.swa_kv_pool.num_blocks, SIZE // PAGE + 1)
+        self.assertEqual(pool.swa_kv_pool.land_arena_blocks, ARENA)
+        self.assertEqual(pool.swa_kv_pool.num_blocks, SIZE // PAGE + 1 + ARENA)
         self.assertEqual(ScratchArena.from_pool(pool).capacity, ARENA)
+        swa_arena = ScratchArena.from_pool(pool, swa=True)
+        self.assertEqual(swa_arena.first_block, SIZE // PAGE + 1)
+        self.assertEqual(swa_arena.capacity, ARENA)
+        self.assertIsNone(ScratchArena.from_pool(plain, swa=True))
         groups = get_raiden_kv_caches(pool, draft)
         self.assertEqual(
             {int(t.shape[0]) for t in groups.full}, {SIZE // PAGE + 1 + ARENA}
         )
-        self.assertEqual({int(t.shape[0]) for t in groups.swa}, {SIZE // PAGE + 1})
+        self.assertEqual(
+            {int(t.shape[0]) for t in groups.swa}, {SIZE // PAGE + 1 + ARENA}
+        )
 
     def test_non_fp8_draft_takes_the_target_arena(self):
         # --speculative-draft-kv-cache-dtype may leave the draft non-fp8; it

@@ -140,10 +140,9 @@ class SRTPlatform(DeviceMixin):
         return None
 
     def get_kv_pool_reserved_blocks(self, *, use_mla_backend: bool) -> int:
-        """Blocks every full-attention KV pool, target and draft alike, reserves
-        past its allocator's pages, which the KV budget charges per layer; SWA
-        pools reserve none. Called when sizing pools, after the schedule is
-        published."""
+        """Blocks every KV pool, target and draft alike, reserves past its
+        allocator's pages, which the KV budget charges per layer. Called when
+        sizing pools, after the schedule is published."""
         del use_mla_backend
         return 0
 

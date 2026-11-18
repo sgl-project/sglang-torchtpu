@@ -860,24 +860,30 @@ class RaidenSenderMixin:
             ).to_frames()
             self._send_multipart_locked(endpoint, payload)
 
-    def _land_kinds(self, dst_attn_tp: int) -> Tuple[bool, Tuple[bool, ...]]:
+    def _land_kinds(
+        self, dst_attn_tp: int, *, swa: bool = False
+    ) -> Tuple[bool, Tuple[bool, ...]]:
         """For pushes to decode attention TP ``dst_attn_tp`` (#829): whether
         any source of the room lands, and per decode rank whether its plan
         has a landing source. All False without
         SGLANG_RAIDEN_RESHARD_LAND_ARENA."""
         cache = self.__dict__.setdefault("_land_kinds_cache", {})
-        if dst_attn_tp not in cache:
+        key = (dst_attn_tp, swa)
+        if key not in cache:
             kinds: Tuple[bool, ...] = ()
-            if self._land_ok():
+            if self._land_ok(swa=swa):
                 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
                     LandEntry,
                     source_ranks_for,
                 )
 
                 try:
-                    geom = self._make_geometry(
-                        self.attn_tp_size, dst_attn_tp
-                    ).with_land()
+                    base_geom = (
+                        self._make_geometry(self.attn_tp_size, dst_attn_tp, swa=True)
+                        if swa
+                        else self._make_geometry(self.attn_tp_size, dst_attn_tp)
+                    )
+                    geom = base_geom.with_land()
                     kinds = tuple(
                         any(
                             isinstance(geom.entry_bytes(p, d), LandEntry)
@@ -885,10 +891,10 @@ class RaidenSenderMixin:
                         )
                         for d in range(dst_attn_tp)
                     )
-                except ValueError:
+                except (ValueError, RuntimeError):
                     kinds = ()
-            cache[dst_attn_tp] = (any(kinds), kinds)
-        return cache[dst_attn_tp]
+            cache[key] = (any(kinds), kinds)
+        return cache[key]
 
     def _land_room(self, dst_attn_tp: Optional[int]) -> bool:
         # The env check first: without it nothing here reads the geometry.
@@ -898,9 +904,9 @@ class RaidenSenderMixin:
             and self._land_kinds(dst_attn_tp)[0]
         )
 
-    def _plan_lands(self, dst_attn_tp: int) -> bool:
+    def _plan_lands(self, dst_attn_tp: int, *, swa: bool = False) -> bool:
         """Whether the plan of the decode rank this rank pushes to lands."""
-        kinds = self._land_kinds(dst_attn_tp)[1]
+        kinds = self._land_kinds(dst_attn_tp, swa=swa)[1]
         d = self.attn_tp_rank * dst_attn_tp // self.attn_tp_size
         return bool(kinds) and kinds[d]
 
@@ -911,18 +917,31 @@ class RaidenSenderMixin:
         land_version: Optional[int],
         scratch: Optional[List[int]],
         pages: int,
+        swa_scratch: Optional[List[int]] = None,
+        is_closing: bool = False,
     ) -> Optional[str]:
         """Why a READY does not fit the room's plan kind, or None. A plain
         READY with pages for a landing plan, or a landing READY for a direct
         one, means the two sides classified differently."""
-        if scratch is None and not self._land_ok():
+        if land_version is None and not self._land_ok() and not self._land_ok(swa=True):
             return None
         req = self._prefill.reshard_req.get(room)
         if req is None or req.get("dst_attn_tp") is None:
             return None
-        lands = self._land_ok() and self._plan_lands(req["dst_attn_tp"])
-        if scratch is None:
-            if lands and pages:
+        dst_attn_tp = req["dst_attn_tp"]
+        full_lands = self._land_ok() and self._plan_lands(dst_attn_tp)
+        decode_swa_blocks = list(req.get("decode_swa_blocks") or [])
+        swa_lands = (
+            is_closing
+            and bool(self._swa_kv_caches)
+            and bool(decode_swa_blocks)
+            and self._land_ok(swa=True)
+            and self._plan_lands(dst_attn_tp, swa=True)
+        )
+        want_full = pages if full_lands else 0
+        want_swa = len(decode_swa_blocks) if swa_lands else 0
+        if land_version is None:
+            if want_full or want_swa:
                 return (
                     f"Raiden reshard: room {room}'s decode asked for a plain push "
                     "of a plan this prefill lands (#829); is the decode missing "
@@ -934,15 +953,34 @@ class RaidenSenderMixin:
                 f"Raiden reshard: room {room}'s decode lands with version "
                 f"{land_version}, this prefill with {LAND_VERSION}"
             )
-        if not lands:
+        scratch_list = scratch or []
+        swa_scratch_list = swa_scratch or []
+        if (not is_closing and not full_lands) or (
+            is_closing and not want_full and not want_swa
+        ):
             return (
                 f"Raiden reshard: room {room}'s decode sent scratch blocks for "
                 "a plan this prefill pushes directly"
             )
-        if len(scratch) != pages:
+        if len(scratch_list) != want_full:
+            if not full_lands:
+                return (
+                    f"Raiden reshard: room {room}'s decode sent scratch blocks for "
+                    "a plan this prefill pushes directly"
+                )
             return (
-                f"Raiden reshard: room {room}'s decode sent {len(scratch)} "
-                f"scratch blocks for {pages} pages"
+                f"Raiden reshard: room {room}'s decode sent {len(scratch_list)} "
+                f"scratch blocks for {want_full} pages"
+            )
+        if is_closing and len(swa_scratch_list) != want_swa:
+            if not swa_lands:
+                return (
+                    f"Raiden reshard: room {room}'s decode sent SWA scratch "
+                    "blocks for a plan this prefill pushes directly"
+                )
+            return (
+                f"Raiden reshard: room {room}'s decode sent {len(swa_scratch_list)} "
+                f"SWA scratch blocks for {want_swa} pages"
             )
         return None
 
@@ -1072,7 +1110,11 @@ class RaidenSenderMixin:
     def _on_reshard_land_ready(self, msg: List[bytes]) -> None:
         req = ReshardLandReady.from_frames(msg)
         self._accept_reshard_ready(
-            req.room, req.pages, scratch=req.scratch, land_version=req.land_version
+            req.room,
+            req.pages,
+            scratch=req.scratch,
+            swa_scratch=req.swa_scratch,
+            land_version=req.land_version,
         )
 
     def _accept_reshard_ready(
@@ -1081,13 +1123,19 @@ class RaidenSenderMixin:
         pages: List[int],
         *,
         scratch: Optional[List[int]] = None,
+        swa_scratch: Optional[List[int]] = None,
         land_version: Optional[int] = None,
     ) -> None:
         with self._state_lock:
             if room in self._aborted:
                 return
             reason = self._land_ready_mismatch_locked(
-                room, land_version=land_version, scratch=scratch, pages=len(pages)
+                room,
+                land_version=land_version,
+                scratch=scratch,
+                pages=len(pages),
+                swa_scratch=swa_scratch,
+                is_closing=True,
             )
             if reason is not None:
                 logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
@@ -1097,8 +1145,10 @@ class RaidenSenderMixin:
                 return
             self._prefill.reshard_ready.add(room)
             self._prefill.reshard_ready_pages[room] = pages
-            if scratch is not None:
+            if scratch:
                 self._prefill.reshard_ready_scratch[room] = scratch
+            if swa_scratch:
+                self._prefill.reshard_ready_swa_scratch[room] = swa_scratch
         self._maybe_reshard_push(room)
 
     def _maybe_reshard_push(self, room: int) -> None:
@@ -1184,7 +1234,12 @@ class RaidenSenderMixin:
         return swa_blocks[-n_swa:], decode_swa_blocks
 
     def _run_reshard_swa_push(
-        self, room: int, req_meta: dict, swa_blocks: List[int]
+        self,
+        room: int,
+        req_meta: dict,
+        swa_blocks: List[int],
+        *,
+        scratch: Optional[List[int]] = None,
     ) -> None:
         """Push a resharded room's sliding-window pages on the second engine.
 
@@ -1245,6 +1300,7 @@ class RaidenSenderMixin:
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+            _target_blocks,
             build_sender_request,
         )
 
@@ -1254,6 +1310,8 @@ class RaidenSenderMixin:
             geom = self._make_geometry(
                 self.attn_tp_size, req_meta["dst_attn_tp"], swa=True
             )
+            if scratch is not None:
+                geom = geom.with_land()
             req = build_sender_request(
                 pb2,
                 uuid=room,
@@ -1265,7 +1323,19 @@ class RaidenSenderMixin:
                 src_block_ids=swa_blocks,
                 dst_block_ids=decode_swa_blocks,
                 live_tokens=[self.kv_args.page_size] * n,
+                scratch_block_ids=scratch,
             )
+            if scratch is not None:
+                decode_swa_blocks = list(
+                    _target_blocks(
+                        geom.entry_bytes(
+                            self.attn_tp_rank % geom.src_tp,
+                            self.attn_tp_rank // geom.ratio,
+                        ),
+                        decode_swa_blocks,
+                        scratch,
+                    )
+                )
             self._check_reshard_bounds(
                 req, self.attn_tp_size, req_meta["dst_attn_tp"], swa=True
             )
@@ -1353,9 +1423,11 @@ class RaidenSenderMixin:
                 prefill_blocks = list(self._prefill.send_blocks[room])
                 ready_pages = list(self._prefill.reshard_ready_pages.get(room, []))
                 scratch = self._prefill.reshard_ready_scratch.get(room)
+                swa_scratch = self._prefill.reshard_ready_swa_scratch.get(room)
                 swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
                 start = 0
             else:
+                swa_scratch = None
                 start, prefill_blocks = self._prefill.reshard_chunks[room].pop(chunk)
             # The room's page count, never the chunk's: a landing room's
             # closing reply announces unoffered pages as chunks (no
@@ -1370,7 +1442,7 @@ class RaidenSenderMixin:
         # returning early below would strand it and is_send_done would never
         # settle.
         if chunk is None:
-            self._run_reshard_swa_push(room, req_meta, swa_blocks)
+            self._run_reshard_swa_push(room, req_meta, swa_blocks, scratch=swa_scratch)
             if self._unified_swa_pool is not None:
                 unified_swa_pair = self._pair_unified_reshard_swa_push(
                     room, req_meta, swa_blocks

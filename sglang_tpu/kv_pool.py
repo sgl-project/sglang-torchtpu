@@ -317,7 +317,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
             return 0
         from sglang_tpu.disaggregation.raiden.land import land_arena_blocks
 
-        return land_arena_blocks(swa=self.allocation_label == "SWA")
+        return land_arena_blocks()
 
     def _synchronize_device(self) -> None:
         device = getattr(self, "device", None)

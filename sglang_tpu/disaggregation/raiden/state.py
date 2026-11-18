@@ -44,6 +44,7 @@ class PrefillState:
     reshard_ready_pages: Dict[int, List[int]] = field(default_factory=dict)
     # Scratch blocks paired with them, when RESHARD_LAND_READY asked (#829).
     reshard_ready_scratch: Dict[int, List[int]] = field(default_factory=dict)
+    reshard_ready_swa_scratch: Dict[int, List[int]] = field(default_factory=dict)
 
     # Rooms whose closing reshard push has completed.
     reshard_final_pushed: Set[int] = field(default_factory=set)

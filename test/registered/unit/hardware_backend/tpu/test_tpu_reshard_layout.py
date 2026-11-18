@@ -1230,40 +1230,42 @@ class TestRefusalWithSlidingWindow(unittest.TestCase):
                         )
                         self.assertEqual(allowed, exact)
 
-    def test_land_full_group_only(self):
-        """The policy commit (iii) wires: land_ok for the full-attention
-        group only. A cell is then allowed iff the full group's merged replay
-        and the SWA group's plain replay are exact, so SWA cells that need
-        landing stay refused."""
+    def test_land_both_groups(self):
+        """With SGLANG_RAIDEN_RESHARD_LAND_ARENA set and both arenas attached,
+        reshard_refusal allows a hybrid SWA cell iff both groups replay byte
+        for byte under landing."""
+        from sglang_tpu.disaggregation.raiden.land import LandState, ScratchArena
+        from sglang_tpu.envs import envs
+
+        cap = -(-8192 // PAGE)
         swa_land = 0
         for full_heads, swa_heads in itertools.product((2, 4, 8, 16), repeat=2):
             for src_tp, dst_tp in ((2, 1), (4, 2), (8, 4), (8, 2), (16, 4)):
                 cell = (full_heads, swa_heads, src_tp, dst_tp)
                 with self.subTest(cell=cell):
                     full = _replay(*cell, dtype=_FP8, swa=False, land=True)
+                    swa = _replay(*cell, dtype=_FP8, swa=True, land=True)
                     try:
-                        swa = _replay(*cell, dtype=_FP8, swa=True)
+                        _replay(*cell, dtype=_FP8, swa=True)
                     except LandRequired:
-                        swa = False
-                        swa_land += _replay(*cell, dtype=_FP8, swa=True, land=True)
+                        swa_land += int(swa)
                     allowed = True
-                    for tp in (dst_tp, src_tp):
+                    for tp, mode in (
+                        (dst_tp, DisaggregationMode.DECODE),
+                        (src_tp, DisaggregationMode.PREFILL),
+                    ):
                         mgr = _manager(_FP8, full_heads, swa_heads, tp)
-                        for group, heads in ((False, full_heads), (True, swa_heads)):
-                            t = (mgr._swa_kv_caches if group else mgr._kv_caches)[0]
-                            reason = rs.push_reshard_refusal(
-                                mgr._make_geometry(src_tp, dst_tp, swa=group),
-                                t.shape,
-                                1,
-                                total_heads=heads,
-                                own_tp=tp,
-                                page_size=PAGE,
-                                seq_along_lane=False,
-                                land_ok=not group,
-                            )
-                            allowed &= reason is None
+                        mgr.attn_tp_size = tp
+                        mgr.kv_args.page_size = PAGE
+                        mgr.disaggregation_mode = mode
+                        mgr._kv_head_nums = (max(1, full_heads // tp),)
+                        mgr._swa_kv_head_nums = (max(1, swa_heads // tp),)
+                        if mode == DisaggregationMode.DECODE:
+                            mgr._land = LandState(ScratchArena(1, cap))
+                            mgr._swa_land = LandState(ScratchArena(1, cap))
+                        with envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.override(True):
+                            allowed &= mgr.reshard_refusal(src_tp, dst_tp) is None
                     self.assertEqual(allowed, full and swa)
-        # Some refused SWA groups would have landed exactly.
         self.assertGreater(swa_land, 0)
 
     def test_seq_along_lane_refusal_matches_both_groups_bytes(self):
