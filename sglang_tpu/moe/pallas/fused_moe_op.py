@@ -942,12 +942,12 @@ def _fused_moe_jax(
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
     # W4A16 runs GMM1 unfused: the fused gate/up split mis-applies multi-block
     # rhs scales, so the activation is applied in JAX below.
-    clamp_limit = (
-        float(activation_name.split(":", 1)[1])
-        if activation_name.startswith("silu_and_mul_clamp:")
-        else None
+    # Packed FP4 keeps the clamped SiLU in JAX: fusing it is not measured there.
+    unfused_gmm1 = (
+        compact_block_scales
+        or bool(w_quant_bits)
+        or (w1_packed and activation_name.startswith("silu_and_mul_clamp:"))
     )
-    unfused_gmm1 = compact_block_scales or bool(w_quant_bits) or clamp_limit is not None
     gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
 
     gmm1_tile_info = None
@@ -1041,12 +1041,7 @@ def _fused_moe_jax(
         rhs_quant_dtype=rhs_quant_dtype,
         dequantize_rhs=dequantize_int4_in_vmem,
     )
-    if clamp_limit is not None:
-        gate, up = jnp.split(gmm1_out, 2, axis=-1)
-        gate = jnp.minimum(gate, clamp_limit)
-        up = jnp.clip(up, -clamp_limit, clamp_limit)
-        gmm1_out = (jax.nn.silu(gate.astype(jnp.float32)) * up).astype(out_dtype)
-    elif unfused_gmm1:
+    if unfused_gmm1:
         gmm1_out = apply_act_fn(
             gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
         )

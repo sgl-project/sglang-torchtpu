@@ -111,8 +111,11 @@ def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
         case "silu_and_mul_clamp":
             return silu_and_mul_clamp(acc_gate, acc_up)
         case str() if fuse_act.startswith("silu_and_mul_clamp:"):
-            _, limit = fuse_act.split(":")
-            return silu_and_mul_clamp(acc_gate, acc_up, limit=float(limit))
+            limit = float(fuse_act.split(":")[1])
+            # SiLU in f32 whatever the accumulator dtype, as moe_stream does.
+            gate = jnp.minimum(acc_gate, limit)
+            up = jnp.clip(acc_up, -limit, limit)
+            return (jax.nn.silu(gate.astype(jnp.float32)) * up).astype(acc.dtype)
         case "gelu":
             return jax.nn.gelu(acc_gate) * acc_up
         case "swigluoai":
