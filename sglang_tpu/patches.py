@@ -452,11 +452,22 @@ def _patch_compute_position_torch() -> None:
     from sglang.srt.model_executor import forward_batch_info
 
     def compute_position_torch_cpu_staged(
-        extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+        extend_prefix_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        *,
+        extend_prefix_lens_cpu=None,
+        extend_seq_lens_cpu=None,
     ):
         device = extend_prefix_lens.device
-        prefix_lens = extend_prefix_lens.tolist()
-        seq_lens = extend_seq_lens.tolist()
+        if extend_prefix_lens_cpu is not None and extend_seq_lens_cpu is not None:
+            # The caller's host copies: reading the device tensors back would
+            # wait for all queued device work, e.g. the target forward a
+            # speculative draft extend builds its batch right after.
+            prefix_lens = list(extend_prefix_lens_cpu)
+            seq_lens = list(extend_seq_lens_cpu)
+        else:
+            prefix_lens = extend_prefix_lens.tolist()
+            seq_lens = extend_seq_lens.tolist()
         positions_cpu = torch.cat(
             [
                 torch.arange(p, p + s, device="cpu")
