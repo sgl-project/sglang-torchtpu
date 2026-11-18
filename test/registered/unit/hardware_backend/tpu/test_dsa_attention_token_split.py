@@ -1,10 +1,12 @@
 """DSA attention token split (SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT), host side.
 
-Which batches split; index_topk keeping a rank's rows local; and the
-all-to-all layout with the ranks simulated as threads: each window op gets its
-window's queries for every head, its rows and the window's cu_q_lens, and each
-rank ends with its heads' outputs for every token. The kernels on hardware:
-test/registered/tpu/unit/test_{oneshot_all_to_all,mla_sparse_prefill_window}.py.
+Which batches split; index_topk keeping a rank's rows local (plain and pooled
+indexer), or whole when they leave the layer; and the all-to-all layout with the
+ranks simulated as threads: each window op gets its window's queries for every
+head, its rows and the window's cu_q_lens, and each rank ends with its heads'
+outputs for every token. The kernels on hardware:
+test/registered/tpu/unit/test_{oneshot_all_to_all,mla_sparse_prefill_window,
+dsa_kpool_attention_token_split}.py.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
@@ -45,10 +47,13 @@ class _Mode:
         return self.extend and not self.verify
 
 
-def _backend(tp, *, pages_per_seq=1089, qblock_op=True, split=True, dqs=1):
+def _backend(tp, *, pages_per_seq=1089, qblock_op=True, split=True, dqs=1, kpool=1):
     """A backend as the K3.1 recipe sets it up (139264 context, the q-block
-    flag on), built without __init__."""
+    flag on), built without __init__; kpool 4 as GLM-5.3-Flash's."""
     backend = TpuPallasSparseMlaAttnBackend.__new__(TpuPallasSparseMlaAttnBackend)
+    backend._kpool = kpool
+    backend._kpool_width = 2176
+    backend._zero_rope = False
     backend._idx_split_group = SimpleNamespace(world_size=tp)
     backend._idx_split_size = tp
     backend._idx_split_min_tokens = max(1024, 32 * tp)
@@ -87,19 +92,25 @@ class TestAttentionSplitRows(CustomTestCase):
         self.assertEqual(_rows(bare, 4096), 0)
 
     def test_rows_that_leave_the_layer(self):
-        # MTP top-k sharing and the top-k capturer need every token's rows.
+        # MTP top-k sharing and the top-k capturer need every token's rows: the
+        # forward still splits, with whole rows.
         backend = _backend(32, qblock_op=False)
         seed = SimpleNamespace(dsa_seed_topk_capture=torch.zeros(1))
+        plain = SimpleNamespace(forward_mode=_Mode())
+        self.assertFalse(backend._split_rows_whole(plain))
         for batch in (
             SimpleNamespace(forward_mode=_Mode(), reuse_dsa_topk_indices=True),
             SimpleNamespace(forward_mode=_Mode(), spec_info=seed),
         ):
-            self.assertEqual(backend._attention_split_rows(batch, 4096), 0)
+            self.assertEqual(backend._attention_split_rows(batch, 4096), 128)
+            self.assertTrue(backend._split_rows_whole(batch))
+            self.assertFalse(backend._keep_window_rows(batch, 4096))
         with mock.patch(
             "sglang.srt.state_capturer.indexer_topk.get_global_indexer_capturer",
             lambda: object(),
         ):
-            self.assertEqual(_rows(backend, 4096), 0)
+            self.assertEqual(_rows(backend, 4096), 128)
+            self.assertTrue(backend._split_rows_whole(plain))
 
 
 @unittest.skipUnless(_HAS_JAX, "requires JAX")
@@ -112,15 +123,21 @@ class TestAttentionSplitRowsQblockGate(CustomTestCase):
         backend = _backend(32, pages_per_seq=256, qblock_op=False)
         self.assertEqual(_rows(backend, 4096), 128)
 
+    def test_pooled_gate(self):
+        # The pooled q-block kernel takes up to 128 pages per request.
+        self.assertEqual(_rows(_backend(8, pages_per_seq=128, kpool=4), 8192), 0)
+        self.assertEqual(_rows(_backend(8, pages_per_seq=256, kpool=4), 8192), 1024)
+        self.assertEqual(_rows(_backend(8, pages_per_seq=8192, kpool=4), 8192), 1024)
+
 
 class TestAttentionSplitNeedsTheIndexerSplit(CustomTestCase):
-    def test_flag_without_a_plain_indexer_split_raises(self):
+    def test_flag_without_a_world_indexer_split_raises(self):
         from sglang_tpu.envs import envs as tpu_envs
 
-        # Attention TP 1 (no indexer split), and the pooled indexer's split.
-        for kpool, group, size in ((1, None, 1), (4, SimpleNamespace(), 4)):
-            backend = _backend(size)
-            backend._kpool, backend._idx_split_group = kpool, group
+        # Attention TP 1 (no indexer split), and a group short of the world.
+        for kpool, group, size in ((1, None, 1), (4, SimpleNamespace(), 2)):
+            backend = _backend(size, kpool=kpool)
+            backend._idx_split_group = group
             with (
                 tpu_envs.SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT.override(True),
                 mock.patch("torch.distributed.get_world_size", return_value=4),
@@ -130,7 +147,7 @@ class TestAttentionSplitNeedsTheIndexerSplit(CustomTestCase):
                     return_value=SimpleNamespace(attn_tp_rank=0),
                 ),
             ):
-                with self.assertRaisesRegex(RuntimeError, "plain DSA"):
+                with self.assertRaisesRegex(RuntimeError, "indexer token split"):
                     backend._init_attention_token_split()
 
 
@@ -168,6 +185,60 @@ class TestIndexTopkKeepsLocalRows(CustomTestCase):
         all_reduce.assert_called_once()
         self.assertEqual(tuple(out.shape), (2048, 16))
         self.assertTrue(torch.equal(out[512:1024], local))  # rank 1's slot
+
+
+class TestIndexTopkKpoolKeepsLocalRows(CustomTestCase):
+    def _index_topk_kpool(self, attention_split, *, whole=False):
+        # T=2048 at TP4: rank 1 picks pools for rows [512, 1024).
+        backend = _backend(4, split=attention_split, qblock_op=False, kpool=4)
+        local = torch.arange(512 * 4, dtype=torch.int32).view(512, 4)
+        backend._index_topk_split_op = mock.MagicMock(return_value=local)
+        backend._kpool_expand_op = mock.MagicMock(return_value="rows")
+        backend._idx_split_group.all_reduce = mock.MagicMock(side_effect=lambda t: t)
+        backend.token_to_kv_pool = mock.MagicMock()
+        backend._kv_lens = lambda forward_batch: "kv_lens"
+        backend._raw_ring_args = lambda: ("base", 4)
+        backend._topk = 16
+        spec_info = SimpleNamespace(
+            dsa_seed_topk_capture=torch.zeros(1) if whole else None
+        )
+        with mock.patch(
+            "sglang.srt.layers.dp_attention._rank_tensor",
+            lambda axis, device: torch.tensor(1),
+        ):
+            out = backend.index_topk_kpool(
+                forward_batch=SimpleNamespace(
+                    forward_mode=_Mode(), spec_info=spec_info
+                ),
+                layer_id=0,
+                query=torch.zeros(2048, 32, 128),
+                key=torch.zeros(2048, 128),
+                gate=torch.zeros(2048, 128),
+                head_weights=torch.zeros(2048, 32),
+                ape=torch.zeros(4, 128),
+                weight_scale=1.0,
+                kpool=4,
+            )
+        self.assertEqual(out, "rows")
+        picked, _, _, _, row_start = backend._kpool_expand_op.call_args.args[:5]
+        return picked, row_start, local, backend._idx_split_group.all_reduce
+
+    def test_split_expands_this_ranks_window(self):
+        picked, row_start, local, all_reduce = self._index_topk_kpool(True)
+        self.assertIs(picked, local)
+        self.assertEqual(row_start.tolist(), [512])
+        all_reduce.assert_not_called()
+
+    def test_rows_that_leave_the_layer_are_assembled(self):
+        for attention_split, whole in ((False, False), (True, True)):
+            with self.subTest(attention_split=attention_split, whole=whole):
+                picked, row_start, local, all_reduce = self._index_topk_kpool(
+                    attention_split, whole=whole
+                )
+                all_reduce.assert_called_once()
+                self.assertEqual(tuple(picked.shape), (2048, 4))
+                self.assertTrue(torch.equal(picked[512:1024], local))
+                self.assertEqual(row_start.tolist(), [0])
 
 
 class _Ranks:
@@ -219,7 +290,7 @@ class TestForwardMlaTokenSplit(CustomTestCase):
     # ranks light; the layout code reads the widths from the tensors.
     NOPE, ROPE, TOPK = 16, 8, 16
 
-    def _run(self, world, num_tokens, cu_q_lens, heads=3):
+    def _run(self, world, num_tokens, cu_q_lens, heads=3, zero_rope=False, whole=False):
         rows = _split_rows(num_tokens, world)
         g = torch.Generator().manual_seed(world * 10_000 + num_tokens)
         ql = [
@@ -246,9 +317,14 @@ class TestForwardMlaTokenSplit(CustomTestCase):
             )
             backend._attn_split_world = world
             backend._window_op = window_op
+            backend._zero_rope = zero_rope
             args = (ql[rank], qpe[rank]) + (None,) * 6 + (cu_q_lens, None, None)
             args += (0.1, 1.0, 1.0)
-            local_topk = topk[rank * rows : (rank + 1) * rows]
+            if whole:
+                # Rows that leave the layer: every token's, cut to this window.
+                local_topk = backend._window_of_rows(topk[:num_tokens], rows)
+            else:
+                local_topk = topk[rank * rows : (rank + 1) * rows]
             return backend._forward_mla_token_split(args, local_topk, rows)
 
         with (
@@ -268,14 +344,19 @@ class TestForwardMlaTokenSplit(CustomTestCase):
         all_ql = torch.nn.functional.pad(torch.stack(ql, 1), pad)
         all_qpe = torch.nn.functional.pad(torch.stack(qpe, 1), pad)
         tokens = torch.arange(num_tokens).view(-1, 1, 1).float()
+        topk[num_tokens:] = -1  # whole rows end at T; the window pads with -1
         for rank in range(world):
             ql_w, qpe_w, window_cu, topk_w = seen[rank]
             win = slice(rank * rows, (rank + 1) * rows)
             with self.subTest(world=world, T=num_tokens, rank=rank):
                 # Its window, every rank's heads in rank order.
                 self.assertTrue(torch.equal(ql_w, all_ql[win].flatten(1, 2)))
-                self.assertTrue(torch.equal(qpe_w, all_qpe[win].flatten(1, 2)))
-                self.assertTrue(torch.equal(topk_w, topk[win]))
+                want_qpe = all_qpe[win].flatten(1, 2)
+                if zero_rope:
+                    want_qpe = torch.zeros_like(want_qpe)
+                self.assertTrue(torch.equal(qpe_w, want_qpe))
+                if whole or rows * world == num_tokens:
+                    self.assertTrue(torch.equal(topk_w, topk[win]))
                 want_cu = (cu_q_lens - rank * rows).clamp(0, rows)
                 self.assertTrue(torch.equal(window_cu, want_cu.int()))
                 self.assertEqual(
@@ -291,6 +372,13 @@ class TestForwardMlaTokenSplit(CustomTestCase):
         self._run(32, 4096, [0, 37, 1000, 4083, 4083, 4083, 4083, 4083, 4083])
         self._run(8, 4096, [0, 3000, 4096, 4096, 4096, 4096, 4096, 4096, 4096])
         self._run(4, 200, [0, 10, 170, 170, 170])
+
+    def test_zero_rope_and_whole_rows(self):
+        # A model without rope sends only the NoPE lanes; rows that leave the
+        # layer arrive whole and each rank attends its window of them.
+        cu = [0, 3000, 4096, 4096, 4096, 4096, 4096, 4096, 4096]
+        self._run(8, 4096, cu, heads=8, zero_rope=True, whole=True)
+        self._run(4, 200, [0, 10, 170, 170, 170], whole=True)
 
 
 if __name__ == "__main__":
