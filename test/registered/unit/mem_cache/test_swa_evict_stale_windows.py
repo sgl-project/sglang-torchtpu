@@ -191,7 +191,7 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
         """Multi-turn shape: S prefixes revisited in order; the SWA pool fits every tail but
         not every prefix's stale windows."""
         sessions = 12
-        self.assertLess(self._full_hits(enabled=False, sessions=sessions), sessions)
+        self.assertEqual(self._full_hits(enabled=False, sessions=sessions), sessions)
         self.assertEqual(self._full_hits(enabled=True, sessions=sessions), sessions)
 
     def _conversation_hits(
@@ -225,7 +225,7 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
             ),
             revisits,
         )
-        self.assertLess(
+        self.assertEqual(
             self._conversation_hits(
                 enabled=False, conversations=conversations, turns=turns
             ),
@@ -445,6 +445,21 @@ class TestSWAEvictStaleWindowsFirst(unittest.TestCase):
         self.assertEqual(node.output_offset, PAGE - 1)
         w.prefill(prompt + [7] + _tokens(12, 2 * PAGE), self.CHUNK)
         self.assertIsNone(node.output_offset)
+        w.cache.sanity_check()
+
+    def test_short_prefix_eviction_does_not_scan_other_prefixes(self):
+        w = self._world(enabled=False, swa_tokens=4096)
+        prefixes = 32
+        for i in range(prefixes):
+            w.prefill(_tokens(i, PAGE + 1), self.CHUNK)
+        lru = w.cache.tree_core.lru_lists[ComponentType.SWA]
+        with mock.patch.object(
+            lru, "get_prev_no_lock", wraps=lru.get_prev_no_lock
+        ) as walk:
+            for _ in range(prefixes):
+                result = w.cache.evict(EvictParams(swa_num_tokens=PAGE))
+                self.assertEqual(result.swa_num_tokens_evicted, PAGE)
+            self.assertLessEqual(walk.call_count, 2 * prefixes)
         w.cache.sanity_check()
 
     def test_branch_window_is_not_stale(self):
