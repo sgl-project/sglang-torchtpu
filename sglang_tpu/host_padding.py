@@ -12,8 +12,10 @@ def ordinary_compiled_forward(
 ) -> bool:
     """Generation forward whose staged inputs the TPU padder consumes.
 
-    Only extend lengths and their derived positions opt into PP here. Other
-    parallel paths and token-indexing models retain their placement contracts.
+    Callers that pass ``allow_pipeline_parallel`` (prefill token placement,
+    extend lengths and their derived positions) include PP; the rest keep the PP
+    exclusion. Other parallel paths and token-indexing models retain their
+    placement contracts.
     """
     parallel = get_parallel()
     if (

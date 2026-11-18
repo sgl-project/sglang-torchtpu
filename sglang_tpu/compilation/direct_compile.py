@@ -282,6 +282,16 @@ def direct_compile(
     return functools.update_wrapper(compiled, fn)
 
 
+def _input_spec(tensor: torch.Tensor) -> tuple:
+    """(shape, dtype, device, device layout) a compiled executable binds."""
+    layout = (
+        tpu_torch_compile.get_device_layout_if_materialized(tensor)
+        if tensor.device.type == "tpu"
+        else None
+    )
+    return (tuple(tensor.shape), tensor.dtype, tensor.device, layout)
+
+
 class CompiledFunction:
     """A CompiledFunction is a collection of 0+ CompiledArtifacts.
 
@@ -316,6 +326,17 @@ class CompiledFunction:
             self._model_extra_tensor_attrs
         ):
             raise ValueError("model_extra_tensor_attrs contains duplicate paths")
+        if self._model_extra_tensor_attrs:
+            err = getattr(self._model, "_derived_weight_cache_error", None)
+            if not err:
+                # Compiled artifacts retain load-time extra tensors; load_weights
+                # rebinds plain attributes to new tensors, leaving graphs stale.
+                self._model._derived_weight_cache_error = (
+                    "Online weight updates are not supported with "
+                    "--tpu-compile-tracer direct when model_extra_tensor_attrs "
+                    "are bound at compile time. Restart the server or use "
+                    "--tpu-compile-tracer dynamo to update weights online."
+                )
         self._kv_pool = kv_pool
         self._ignored_argnames = ignored_argnames
         self._prune_unused_inputs = prune_unused_inputs
@@ -326,6 +347,10 @@ class CompiledFunction:
         self._spmd_safe = spmd_safe
         self._lift_rank = lift_rank
         self._rank_input: torch.Tensor | None = None
+        # Explicit tensor inputs the traced fn writes in place (e.g. a capture
+        # buffer the forward fills). Learned on first trace; traced on clones and
+        # copied back after each execute, like KV state.
+        self._mutated_input_paths: set[tree_util.KeyPath] = set()
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         artifact = self._get_artifact(args, kwargs)
@@ -375,6 +400,79 @@ class CompiledFunction:
                 kwargs = {name: placeholders[name] for name in kwargs}
         artifact = self._get_artifact(args, kwargs, async_compile=async_compile)
         return PendingCall(artifact.wait_for_compile)
+
+    def release_model_inputs(self) -> None:
+        """Drop every artifact's references to its model-input tensors, keeping
+        their shape, dtype, device and device layout, so the caller can free and
+        rebuild the parameters; refresh_model_inputs re-attaches them. "keep"
+        inputs (the lifted rank) stay attached."""
+        for artifact in self.cache.values():
+            if (
+                artifact is None
+                or artifact.released_input_specs is not None
+                or not artifact.model_input_sources
+            ):
+                continue
+            specs, kept = [], []
+            for tensor, source in zip(
+                artifact.model_inputs, artifact.model_input_sources, strict=True
+            ):
+                specs.append(_input_spec(tensor))
+                kept.append(tensor if source[0] == "keep" else None)
+            artifact.released_input_specs = tuple(specs)
+            artifact.model_inputs = tuple(kept)
+            if artifact.unbound_inputs is not None:
+                full, flat = artifact.unbound_inputs
+                for index, tensor in enumerate(kept):
+                    full[index] = tensor
+                    flat[index] = tensor
+
+    def refresh_model_inputs(self) -> int:
+        """Re-resolve every compiled artifact's model inputs from the model.
+
+        For callers that rebind parameters after compiling (e.g. load the real
+        weights while the compile runs): each input is looked up again by the
+        name or attribute it was traced from, and must keep the shape, dtype,
+        device and device layout it was traced with. Returns the number of
+        inputs that changed."""
+        if self._model is None:
+            return 0
+        changed = 0
+        for artifact in self.cache.values():
+            if artifact is None or not artifact.model_input_sources:
+                continue
+            specs = artifact.released_input_specs
+            fresh = []
+            for position, (old, source) in enumerate(
+                zip(artifact.model_inputs, artifact.model_input_sources, strict=True)
+            ):
+                if source[0] == "module":
+                    try:
+                        new = self._model.get_parameter(source[1])
+                    except AttributeError:
+                        new = self._model.get_buffer(source[1])
+                elif source[0] == "attr":
+                    new = getattr(source[1], source[2])
+                else:
+                    new = old
+                want = specs[position] if specs is not None else _input_spec(old)
+                got = _input_spec(new)
+                if got != want:
+                    raise ValueError(
+                        f"refresh_model_inputs: {source[1:]} was traced as {want}, "
+                        f"now {got}"
+                    )
+                if new is not old:
+                    changed += 1
+                fresh.append(new)
+            artifact.model_inputs = tuple(fresh)
+            artifact.released_input_specs = None
+            if artifact.unbound_inputs is not None:
+                full, flat = artifact.unbound_inputs
+                for index, tensor in enumerate(fresh):
+                    full[index] = tensor
+                    flat[index] = tensor
+        return changed
 
     def _get_artifact(
         self,
@@ -464,6 +562,9 @@ class CompiledFunction:
         registered_model_inputs: list[tuple[str, int]] = []
         extra_model_inputs: list[tuple[object, str, int]] = []
         model_inputs: list[torch.Tensor] = []
+        # Where each model input comes from, aligned with model_inputs, so a
+        # compiled artifact can re-resolve them (refresh_model_inputs).
+        model_input_sources: list[tuple] = []
         if self._model is not None:
             all_names_and_tensors = [
                 *self._model.named_parameters(remove_duplicate=False),
@@ -478,6 +579,7 @@ class CompiledFunction:
                 tensor_index = len(model_inputs)
                 tensor_indices[tensor_id] = tensor_index
                 model_inputs.append(tensor)
+                model_input_sources.append(("module", name))
                 registered_model_inputs.append((name, tensor_index))
 
             for path in self._model_extra_tensor_attrs:
@@ -498,6 +600,7 @@ class CompiledFunction:
                     tensor_index = len(model_inputs)
                     tensor_indices[tensor_id] = tensor_index
                     model_inputs.append(tensor)
+                    model_input_sources.append(("attr", parent, attr_name))
                 extra_model_inputs.append((parent, attr_name, tensor_index))
 
         rank_input_index = None
@@ -510,6 +613,7 @@ class CompiledFunction:
                 self._rank_input.cpu()
             rank_input_index = len(model_inputs)
             model_inputs.append(self._rank_input)
+            model_input_sources.append(("keep",))
 
         kv_pool_inputs = self._kv_pool.get_state() if self._kv_pool is not None else []
 
@@ -576,6 +680,10 @@ class CompiledFunction:
                     output_treespec=None,
                     output_count=0,
                     pending_compile=submission,
+                    model_input_sources=tuple(model_input_sources),
+                    # bind() narrows these lists to the owner's live inputs; until
+                    # then release/refresh update them in place.
+                    unbound_inputs=(model_inputs, flat_inputs),
                 )
 
                 def bind(owner_interface: ExecutableInterface) -> None:
@@ -616,6 +724,11 @@ class CompiledFunction:
                             f"local_layouts={layouts}"
                         )
                     artifact.model_inputs = live_model_inputs
+                    artifact.unbound_inputs = None
+                    artifact.model_input_sources = tuple(
+                        model_input_sources[index]
+                        for index in owner_interface.model_indices
+                    )
                     artifact.output_treespec = owner_interface.output_treespec
                     artifact.output_count = owner_interface.output_treespec.num_leaves
                     artifact.callbacks = tuple(
@@ -640,10 +753,25 @@ class CompiledFunction:
         for input_index in range(kv_pool_input_start, kv_pool_input_stop):
             trace_inputs[input_index] = graph_inputs[input_index].clone()
         kv_pool_trace_inputs = trace_inputs[kv_pool_input_start:kv_pool_input_stop]
-        for input_index, leaf_index in enumerate(
-            tensor_leaf_indices, start=kv_pool_input_stop
+        mutated_leaf_positions: set[int] = set()
+        for position, (input_index, leaf_index) in enumerate(
+            zip(
+                range(
+                    kv_pool_input_stop, kv_pool_input_stop + len(tensor_leaf_indices)
+                ),
+                tensor_leaf_indices,
+            )
         ):
+            if tensor_inputs_key_paths[position] in self._mutated_input_paths:
+                # Trace in-place writes on a clone: a mutated placeholder would
+                # carry deferred ops into argument binding.
+                trace_inputs[input_index] = graph_inputs[input_index].clone()
+                mutated_leaf_positions.add(position)
             trace_leaves[leaf_index] = trace_inputs[input_index]
+        explicit_trace_inputs = trace_inputs[
+            kv_pool_input_stop : kv_pool_input_stop + len(tensor_leaf_indices)
+        ]
+        explicit_versions = [_tensor_version(t) for t in explicit_trace_inputs]
 
         rng_device = flat_inputs[0].device if self._uses_rng else None
         rng_output = None
@@ -719,10 +847,46 @@ class CompiledFunction:
             if rng_device is not None:
                 rng_output = tpu_torch_compile.get_device_state_tensor(trace_generator)
 
+        newly_mutated = {
+            tensor_inputs_key_paths[position]
+            for position, (tensor, version) in enumerate(
+                zip(explicit_trace_inputs, explicit_versions, strict=True)
+            )
+            if position not in mutated_leaf_positions
+            and version is not None
+            and _tensor_version(tensor) != version
+        }
+        if newly_mutated:
+            if spmd_compiler is not None:
+                raise NotImplementedError(
+                    "Shared TPU compilation does not support in-place writes to "
+                    f"explicit inputs: {[tree_util.keystr(p) for p in newly_mutated]}"
+                )
+            logger.info(
+                "[direct_compile] retracing: fn writes explicit inputs in place: %s",
+                [tree_util.keystr(p) for p in newly_mutated],
+            )
+            self._mutated_input_paths |= newly_mutated
+            return self._compile(
+                args,
+                kwargs,
+                async_compile=async_compile,
+                spmd_compiler=spmd_compiler,
+                graph=graph,
+            )
+        # Paths and graph outputs must line up; keep them in input order.
+        ordered_mutated_positions = sorted(mutated_leaf_positions)
+        mutated_input_paths = tuple(
+            tensor_inputs_key_paths[position] for position in ordered_mutated_positions
+        )
+        mutated_trace_inputs = [
+            explicit_trace_inputs[position] for position in ordered_mutated_positions
+        ]
+
         output_leaves, output_treespec = tree_util.tree_flatten(outputs)
         if not all(_is_tpu_tensor(leaf) for leaf in output_leaves):
             raise TypeError("All direct_compile output leaves must be TPU tensors")
-        result_tensors = output_leaves + kv_pool_trace_inputs
+        result_tensors = output_leaves + kv_pool_trace_inputs + mutated_trace_inputs
         # Forward hooks see Torch tensors here, not JAX values, and JAX export
         # cannot serialize host callbacks. Preserve callback values as extra
         # executable outputs, then invoke their Python callbacks after execute.
@@ -750,6 +914,9 @@ class CompiledFunction:
                 *range(model_input_count, len(graph_inputs)),
             )
             model_inputs = [model_inputs[index] for index in live_model_indices]
+            model_input_sources = [
+                model_input_sources[index] for index in live_model_indices
+            ]
             graph_inputs = [graph_inputs[index] for index in retained_indices]
             flat_inputs = [
                 flat_inputs[index]
@@ -768,7 +935,7 @@ class CompiledFunction:
             "and %d callbacks",
             len(graph_inputs),
             len(output_leaves),
-            len(kv_pool_inputs),
+            len(kv_pool_inputs) + len(mutated_trace_inputs),
             len(inserted_callbacks),
         )
         # Placeholders do not retain the physical layout of their buffers.
@@ -843,6 +1010,7 @@ class CompiledFunction:
         return _CompiledArtifact(
             executable=executable,
             model_inputs=tuple(model_inputs),
+            model_input_sources=tuple(model_input_sources),
             kv_pool=self._kv_pool,
             tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
             tensor_inputs_traced_shapes=tuple(
@@ -850,10 +1018,19 @@ class CompiledFunction:
             ),
             output_treespec=output_treespec,
             output_count=len(output_leaves),
+            mutated_input_paths=mutated_input_paths,
             callbacks=callbacks,
             pending_compile=pending_compile,
             rng_device=rng_device,
         )
+
+
+def _tensor_version(tensor: torch.Tensor) -> int | None:
+    """The in-place version counter, or None when the tensor has none."""
+    try:
+        return tensor._version
+    except RuntimeError:  # Inference tensors carry no version counter.
+        return None
 
 
 def _tensor_specs(tensors: Sequence[torch.Tensor]) -> tuple[InputSpec, ...]:
@@ -880,9 +1057,17 @@ class _CompiledArtifact:
     tensor_inputs_traced_shapes: tuple[tuple[int, ...], ...]
     output_treespec: Any
     output_count: int
+    mutated_input_paths: tuple[tree_util.KeyPath, ...] = ()
     callbacks: tuple[Callable[[torch.Tensor], None], ...] = ()
     pending_compile: Any | None = None
     rng_device: torch.device | None = None
+    # Aligned with model_inputs: ("module", name) | ("attr", owner, name) | ("keep",).
+    model_input_sources: tuple = ()
+    # (shape, dtype, device, layout) per model input while released.
+    released_input_specs: tuple | None = None
+    # SPMD consumer before bind(): (model_inputs, flat_inputs) lists its bind
+    # closure reads; their model-input entries are released/refreshed in place.
+    unbound_inputs: tuple | None = None
 
     def wait_for_compile(self) -> None:
         if self.pending_compile is not None:
@@ -950,8 +1135,17 @@ class _CompiledArtifact:
                 kv_pool_inputs, outputs[self.output_count :]
             ):
                 tensor.copy_(replacement)
+            mutated_start = self.output_count + len(kv_pool_inputs)
+            for path, replacement in zip(
+                self.mutated_input_paths,
+                outputs[mutated_start : mutated_start + len(self.mutated_input_paths)],
+                strict=True,
+            ):
+                _get_path(call, path).copy_(replacement)
 
-        callback_outputs = outputs[self.output_count + len(kv_pool_inputs) :]
+        callback_outputs = outputs[
+            self.output_count + len(kv_pool_inputs) + len(self.mutated_input_paths) :
+        ]
         if len(callback_outputs) != len(self.callbacks):
             raise RuntimeError(
                 "direct_compile callback output count changed: "

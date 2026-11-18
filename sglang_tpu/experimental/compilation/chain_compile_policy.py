@@ -54,6 +54,18 @@ from sglang_tpu.experimental.speculative.chain_draft_input import (
 logger = get_logger(__name__)
 
 
+def _publishes_dsa_topk(forward_batch: ForwardBatch | None) -> bool:
+    """Whether forward_draft_rows expects IndexTopKShareState.publish to populate spec_info."""
+    if forward_batch is None or not forward_batch.forward_mode.is_target_verify():
+        return False
+    spec_info = forward_batch.spec_info
+    return bool(
+        forward_batch.reuse_dsa_topk_indices
+        and spec_info is not None
+        and spec_info.dsa_topk_indices is None
+    )
+
+
 class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
     """The draft warms its chain forwards per batch bucket.
 
@@ -143,9 +155,10 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             trace,
             specialization_key=specialization_key,
             model=self.model_runner.model,
-            model_extra_tensor_attrs=(
-                *self.get_model_extra_tensor_attrs(),
-                *model_extra_tensor_attrs,
+            model_extra_tensor_attrs=tuple(
+                dict.fromkeys(
+                    (*self.get_model_extra_tensor_attrs(), *model_extra_tensor_attrs)
+                )
             ),
             kv_pool=self.get_direct_compile_kv_pool(),
             ignored_argnames=self._ignored_argnames(),
@@ -188,18 +201,53 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
                 # hidden; skip the lm_head and its full-vocab all-gather over every row.
                 logits_processor = self.owner.logits_processor
                 logits_processor.forward = _hidden_only_logits
-                return eager_model(input_ids, positions, forward_batch, *args, **kwargs)
+                publishes_topk = _publishes_dsa_topk(forward_batch)
+                out = eager_model(input_ids, positions, forward_batch, *args, **kwargs)
+                if publishes_topk:
+                    # IndexTopKShareState.publish writes onto the traced copy of
+                    # spec_info; return it so direct_compile keeps it live.
+                    return out, forward_batch.spec_info.dsa_topk_indices
+                return out
 
-        return self._direct_compile_draft(
+        compiled = self._direct_compile_draft(
             trace, specialization_key=self._draft_forward_specialization_key
         )
 
+        def call(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            forward_batch: ForwardBatch,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            publishes_topk = _publishes_dsa_topk(forward_batch)
+            result = compiled(input_ids, positions, forward_batch, *args, **kwargs)
+            if not publishes_topk:
+                return result
+            out, dsa_topk = result
+            assert forward_batch.spec_info is not None
+            forward_batch.spec_info.dsa_topk_indices = dsa_topk
+            return out
+
+        return call
+
     def _draft_forward_specialization_key(
-        self, *args: Any, **kwargs: Any
+        self,
+        attention_metadata: Any,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *args: Any,
+        **kwargs: Any,
     ) -> tuple[Any, ...]:
+        # Same arguments as trace(): (attention_metadata, input_ids, positions,
+        # forward_batch, ...).
         return (
-            *self._direct_compile_specialization_key(*args, **kwargs),
+            *self._direct_compile_specialization_key(
+                attention_metadata, input_ids, positions, forward_batch, *args, **kwargs
+            ),
             kwargs.get("input_embeds") is not None,
+            _publishes_dsa_topk(forward_batch),
         )
 
     def compile_fused_draft(

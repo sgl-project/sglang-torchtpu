@@ -155,7 +155,11 @@ def _qblock_kernel(
     # Page views of the two caches. HBM refs are DMA-addressed, so the view
     # is free; it keeps a page one contiguous copy per cache.
     nope_pages = cache_nope_hbm.reshape(num_pages, page_size * 4, 128)
-    rope_pages = cache_rope_hbm.reshape(num_pages, page_size, ROPE_LANES)
+    # read_rope=False never touches the rope cache, which may then be a
+    # placeholder (a model without rope allocates one row).
+    rope_pages = (
+        cache_rope_hbm.reshape(num_pages, page_size, ROPE_LANES) if read_rope else None
+    )
 
     @pl.when(b < num_live_ref[0])
     def _block():
