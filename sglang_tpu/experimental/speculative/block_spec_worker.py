@@ -234,37 +234,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         assert target_hidden.shape[0] == rows.cache_locs.numel(), (
             "verify hidden must keep the batch bucket rows"
         )
-        ring_pool = self._block_draft_worker.swa_ring_pool
-        full_to_swa = self._block_draft_worker.full_to_swa
-        if ring_pool is not None:
-            # Built on the host and uploaded, as the full-to-SWA map below.
-            bs = verify_input.seq_lens_cpu.shape[0]
-            width = rows.positions.shape[1]
-            positions_cpu = verify_input.seq_lens_cpu.to(torch.int64)[
-                :, None
-            ] + torch.arange(width, dtype=torch.int64)
-            ring_locs = ring_pool.swa_ring_rows(
-                slots=verify_input.req_pool_indices_cpu[:bs, None],
-                positions=positions_cpu,
-            )
-            padded = rows.positions.shape[0]
-            rows = VerifyRows(
-                positions=rows.positions,
-                cache_locs=padded_h2d(ring_locs, padded, self.device),
-                flat_positions=rows.flat_positions,
-                flat_cache_locs=padded_h2d(
-                    pad_rows(ring_locs, padded).reshape(-1), padded * width, self.device
-                ),
-            )
-        elif full_to_swa is not None:
-            # A hybrid-SWA draft writes the SWA slots of the same window, mapped on host.
-            swa_candidates = full_to_swa[verify_input.verify_cache_candidates_cpu]
+        swa_candidates = self._draft_swa_candidates(verify_input)
+        if swa_candidates is not None:
             rows = select_verify_rows(
-                padded_h2d(
-                    swa_candidates.to(torch.int64),
-                    rows.cache_locs.shape[0],
-                    self.device,
-                ),
+                padded_h2d(swa_candidates, rows.cache_locs.shape[0], self.device),
                 verify_input.committed_lens,
                 state.seq_lens,
                 self.num_verify_rows,
@@ -296,6 +269,26 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             req_pool_indices=state.req_pool_indices,
         )
         return CommitResult(state=next_state, kv_fence_tail=kv_fence_tail)
+
+    def _draft_swa_candidates(
+        self, verify_input: TpuSpecVerifyInput
+    ) -> torch.Tensor | None:
+        """Host [bs, 2 * capacity] int64 draft SWA slots of the verify candidate
+        window, or None when the draft writes the target's slots."""
+        # The window starts at the host committed base; select_verify_rows picks the
+        # active rows on device, where seq_lens may lead the host by one commit.
+        ring_pool = self._block_draft_worker.swa_ring_pool
+        if ring_pool is not None:
+            bs = verify_input.seq_lens_cpu.shape[0]
+            offsets = torch.arange(2 * self.verify_window_rows, dtype=torch.int64)
+            return ring_pool.swa_ring_rows(
+                slots=verify_input.req_pool_indices_cpu[:bs, None],
+                positions=verify_input.seq_lens_cpu.to(torch.int64)[:, None] + offsets,
+            )
+        full_to_swa = self._block_draft_worker.full_to_swa
+        if full_to_swa is None:
+            return None
+        return full_to_swa[verify_input.verify_cache_candidates_cpu].to(torch.int64)
 
     def extend(
         self, batch: ScheduleBatch, *, pp_proxy_tensors: PPProxyTensors | None
