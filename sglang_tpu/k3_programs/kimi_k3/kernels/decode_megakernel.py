@@ -3610,6 +3610,9 @@ LATE_SHARED_DOWN = _config().decode_late_shared_down
 
 # The token-parallel MoE latent-up (KernelConfig.moe_token_parallel_up).
 TOKEN_PARALLEL_UP = _config().moe_token_parallel_up
+# Its output round waited in the next layer (KernelConfig.
+# moe_output_round_next_layer; the stack decides per step).
+OUTPUT_ROUND_NEXT_LAYER = _config().moe_output_round_next_layer
 # Its output round's peers (XOR rank offsets): the rank pair on every host.
 _TOKEN_PARALLEL_PEERS = (25, 24, 17, 16, 9, 8, 1)
 # The routed pair round's seven messages count on one semaphore that none of
@@ -3954,6 +3957,18 @@ class _TokenParallelUp:
         [batch, 1024], send this rank's BF16 block of the pair's tokens to
         their other seven owners and assemble the owned rows [tokens, hidden]
         in ``output_ref``."""
+        finish_token_parallel_outputs(
+            self.output_vmem,
+            self.output_send_semaphores,
+            self.output_receive_semaphores,
+            output_ref,
+            self.start_outputs(up, tile),
+        )
+
+    def start_outputs(self, up, tile):
+        """send_outputs up to its seven copies, started and returned
+        (KernelConfig.moe_output_round_next_layer leaves them in flight past
+        the MoE: finish_token_parallel_outputs)."""
         # The lane-block tail's ``(up + shared).astype(bf16)``: the compiler
         # picks the product's MXU accumulation (result-buffer or popped and
         # added per pass) by how the product is used, so it is used the same
@@ -3975,23 +3990,60 @@ class _TokenParallelUp:
         # buffers) before this rank has sent, past its last read of them.
         copies = []
         for offset in _TOKEN_PARALLEL_PEERS:
-            slot = _token_parallel_peer_slot(offset)
-            copy = tpu.make_async_remote_copy(
-                send,
-                receive.at[self.producer],
-                self.output_send_semaphores.at[slot],
-                self.output_receive_semaphores.at[slot],
-                device_id=(self.rank ^ offset,),
-                device_id_type=pl.DeviceIdType.MESH,
+            copy = _token_parallel_output_copy(
+                self.output_vmem,
+                self.output_send_semaphores,
+                self.output_receive_semaphores,
+                self.rank,
+                offset,
             )
             copy.start()
             copies.append(copy)
-        for copy in copies:
-            copy.wait()
-        for block in range(self.hidden // self.block):
-            output_ref[:, pl.ds(block * self.block, self.block)] = receive[
-                block
-            ].reshape(self.tokens, self.block)
+        return copies
+
+
+def _token_parallel_output_copy(
+    output_vmem, send_semaphores, receive_semaphores, rank, offset
+):
+    """The token-parallel output round's copy to rank ``rank ^ offset``: this
+    rank's BF16 block (send slot 0) into the peer's receive slot of this
+    rank's latent_up block (2 * host + core)."""
+    receive = output_vmem.at[pl.ds(4, 8)]
+    slot = _token_parallel_peer_slot(offset)
+    return tpu.make_async_remote_copy(
+        output_vmem.at[0],
+        receive.at[2 * (rank // 8) + rank % 2],
+        send_semaphores.at[slot],
+        receive_semaphores.at[slot],
+        device_id=(rank ^ offset,),
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+
+
+def finish_token_parallel_outputs(
+    output_vmem, send_semaphores, receive_semaphores, output_ref, copies=None
+):
+    """The token-parallel output round's end: wait for its seven copies
+    (``copies``: as started; without them, rebuilt from the round's
+    buffer and semaphores, as the next layer does with
+    KernelConfig.moe_output_round_next_layer) and assemble the owned rows
+    [tokens, hidden] in ``output_ref`` from the eight blocks' receive slots."""
+    if copies is None:
+        rank = jax.lax.axis_index("tp")
+        copies = [
+            _token_parallel_output_copy(
+                output_vmem, send_semaphores, receive_semaphores, rank, offset
+            )
+            for offset in _TOKEN_PARALLEL_PEERS
+        ]
+    for copy in copies:
+        copy.wait()
+    receive = output_vmem.at[pl.ds(4, 8)]
+    block, tokens = _TokenParallelUp.block, output_ref.shape[0]
+    for index in range(_TokenParallelUp.hidden // block):
+        output_ref[:, pl.ds(index * block, block)] = receive[index].reshape(
+            tokens, block
+        )
 
 
 def moe(
@@ -4021,6 +4073,7 @@ def moe(
     live_rows=None,
     steal=None,
     token_parallel_up: bool = False,
+    output_round_next_layer: bool = False,
 ) -> None:
     """Execute one mixture-of-experts layer inside a Pallas program.
 
@@ -4046,6 +4099,10 @@ def moe(
     ``token_parallel_up`` (KernelConfig.moe_token_parallel_up): the
     token-scattered tail of _TokenParallelUp; ``weights`` then carries the
     rank's ``latent_up_tp`` block, whose copy starts with the last expert pair.
+    ``output_round_next_layer`` (KernelConfig.moe_output_round_next_layer,
+    with ``token_parallel_up``) returns once the output round's copies have
+    started; the caller finishes it (finish_token_parallel_outputs) and
+    advances the reduction phase by 3.
     """
     batch_size, hidden_size = hidden_ref.shape
     expert_count = weights.routing_projection.shape[1]
@@ -4325,6 +4382,11 @@ def moe(
     latent_vmem = communication_workspace.latent_gather_vmem
     rank = jax.lax.axis_index("tp")
     token_parallel = None
+    if output_round_next_layer and not (OUTPUT_ROUND_NEXT_LAYER and token_parallel_up):
+        raise ValueError(
+            "output_round_next_layer takes KernelConfig.moe_output_round_next_layer "
+            "and the token-parallel latent-up"
+        )
     if token_parallel_up:
         if not (
             TOKEN_PARALLEL_UP
@@ -5492,6 +5554,9 @@ def moe(
             # (no routed gather to hide it behind).
             token_parallel.finish_shared_host(routed_outputs_vmem)
         with _phase("t8_output_transport"):
+            if output_round_next_layer:
+                token_parallel.start_outputs(up, routed_outputs_vmem)
+                return
             token_parallel.send_outputs(up, routed_outputs_vmem, output_ref)
         # The lane-block tail's three reduction phases.
         reduction_phase[0] += 3
@@ -10001,8 +10066,28 @@ def stack(
         group_pending_routes=group_pending_expert_routes,
         steal_slots=steal_slots,
     )
+    # KernelConfig.moe_output_round_next_layer: the token-parallel output
+    # round finishes in the next layer's first code (the last layer's in the
+    # epilogue), so its transport and semaphores outlive the MoE's scope.
+    output_round_next_layer = (
+        OUTPUT_ROUND_NEXT_LAYER and token_parallel_up and attention_rank_rows
+    )
+    # Persistent scratch after the stack's own: (name, spec).
+    tail_scratch = []
+    if output_round_next_layer:
+        tail_scratch += [
+            (
+                "output round transport",
+                tpu.VMEM((12, batch_size // 4 * 8, 128), jnp.bfloat16),
+            ),
+            ("output round send semaphores", tpu.SemaphoreType.DMA((7,))),
+            ("output round receive semaphores", tpu.SemaphoreType.DMA((7,))),
+        ]
 
     def body(position_ref, state_row_ref, *refs):
+        if tail_scratch:
+            tail_refs = refs[len(refs) - len(tail_scratch) :]
+            refs = refs[: len(refs) - len(tail_scratch)]
         table_ref, *refs = refs
         slots_ref = None
         if slot_reads:
@@ -10152,6 +10237,9 @@ def stack(
         communication_workspace = AttentionCommunicationWorkspace(
             *common, attention_gather_vmem=gather_wire
         )
+        # KernelConfig.moe_output_round_next_layer: the output round's
+        # transport and semaphores (moe()'s output_vmem and output semaphores).
+        output_round = tuple(tail_refs[:3]) if output_round_next_layer else None
         if compact_outputs:
             # Attention's whole-batch output argument is shape-checked but
             # unused with token scatter; the normalized input has its shape.
@@ -11041,6 +11129,14 @@ def stack(
         if pool is not None and not include_layer_zero:
             request_router(jnp.int32(1))
 
+        def finish_output_round():
+            """KernelConfig.moe_output_round_next_layer: the previous MoE's
+            output round (its owned rows) and the reduction phases moe()
+            leaves to the caller."""
+            with _phase("t8b_output_round"):
+                finish_token_parallel_outputs(*output_round, owned_rows_vmem)
+                communication_workspace.reduction_phase[0] += 3
+
         # Layer 0 (dense MLP) is peeled out of the loop as straight-line code
         # so the loop body stays the routed-expert body without a conditional
         # around the mixture (a control-flow region there costs the scheduler
@@ -11051,7 +11147,10 @@ def stack(
             attention_base = pool.offset("attention") if pool is not None else 0
             kda_projection_vmem, mla_projection_vmem = attention_views(attention_base)
 
-            def capture_aux_hidden(source=None, gather_owned_rows=False):
+            def capture_aux_hidden(source=None, gather_owned_rows=False, index=None):
+                # ``index``: the layer just finished (the previous one when
+                # the next layer's first code finishes it).
+                index = layer_index if index is None else index
                 source = prefix_vmem if source is None else source
                 if gather_owned_rows and attention_dp_ownership:
                     # DP ranks hold only their own prefix rows.
@@ -11061,7 +11160,7 @@ def stack(
                     # which is the prefix after layer L - 1 completes (or, with
                     # aux_capture="attention", after its attention).
                     # The rows go to HBM so the capture costs no VMEM.
-                    @pl.when(layer_index == aux_layer - 1)
+                    @pl.when(index == aux_layer - 1)
                     def capture(aux_slot=aux_slot):
                         if gather_owned_rows:
                             # Sequence-parallel layers keep only this pair's
@@ -11083,6 +11182,17 @@ def stack(
                         )
                         aux_copy.start()
                         aux_copy.wait()
+
+            if output_round_next_layer and not dense_layer:
+                # The previous layer's output round and finish (layer 0's ran
+                # at its end), while the overlay call of the back-edge has
+                # run under the round.
+                @pl.when(layer_index > 1)
+                def finish_previous_layer():
+                    finish_output_round()
+                    finish_layer(
+                        functools.partial(capture_aux_hidden, index=layer_index - 1)
+                    )
 
             norm_copies = [
                 tpu.make_async_copy(
@@ -12363,6 +12473,15 @@ def stack(
                 moe_workspace = MixtureOfExpertsWorkspace(
                     *workspace_resources, **schedule_resources
                 )
+                if output_round_next_layer:
+                    # The round outlives this scope (whose own transport and
+                    # semaphores stay unused): the next layer waits for it.
+                    moe_workspace = dataclasses.replace(
+                        moe_workspace,
+                        output_vmem=output_round[0],
+                        output_send_semaphores=output_round[1],
+                        output_receive_semaphores=output_round[2],
+                    )
                 steal = None
                 if steal_slots:
                     (
@@ -12461,6 +12580,7 @@ def stack(
                     live_rows=active_rows,
                     steal=steal,
                     token_parallel_up=token_parallel_up,
+                    output_round_next_layer=output_round_next_layer,
                 )
 
             def run_dense_mlp():
@@ -12672,6 +12792,14 @@ def stack(
                 with _phase("p0_moe"):
                     if "moe" not in DEBUG_SKIP:
                         pl.run_scoped(run_mixture, *moe_scoped_scratch)
+            if not output_round_next_layer or dense_layer:
+                finish_layer(capture_aux_hidden)
+
+        def finish_layer(capture_aux_hidden):
+            """A layer's last code (q0, then the aux capture), at its end or,
+            with KernelConfig.moe_output_round_next_layer, after its output
+            round's finish at the start of the next layer (the last layer's
+            in the epilogue, which captures nothing: ``None``)."""
             finish_scope = _phase_start("q0_finish_rows")
             if attention_dp_ownership:
                 # The MoE delivered the pair's rows of every DP group (with
@@ -12765,7 +12893,7 @@ def stack(
             else:
                 prefix_vmem[...] += mixture_vmem[...]
             _phase_end(finish_scope)
-            if aux_capture == "layer":
+            if aux_capture == "layer" and capture_aux_hidden is not None:
                 capture_aux_hidden(gather_owned_rows=sequence_parallel_pre_attention)
 
         if include_layer_zero:
@@ -12776,6 +12904,11 @@ def stack(
                 print(pool.timeline(), flush=True)
         else:
             pl.loop(1, layers)(layer)
+        if output_round_next_layer and layers > 1:
+            # The last layer's output round and finish (aux ids stop at
+            # layers - 1: nothing to capture).
+            finish_output_round()
+            finish_layer(None)
         if headroom_pad is not None:
             # Keep the pad live through the whole program (it holds zeros).
             prefix_vmem[0:8, 0:128] += jnp.sum(
@@ -13216,6 +13349,7 @@ def stack(
     persistent = [
         ("output window 1", tpu.VMEM(output_shapes[1].shape, output_shapes[1].dtype)),
         *zip(scratch_names, scratch),
+        *tail_scratch,
     ]
     # Attention DP projects the group's rows (after the MLA workspace).
     projection_reduction = (
@@ -13479,7 +13613,7 @@ def stack(
                     for _ in range(len(steal_families) if steal_slots else 0)
                 ),
             ],
-            scratch_shapes=scratch,
+            scratch_shapes=(*scratch, *(spec for _, spec in tail_scratch)),
         ),
         compiler_params=tpu.CompilerParams(
             collective_id=21,

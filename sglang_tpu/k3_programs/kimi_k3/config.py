@@ -127,6 +127,15 @@ class KernelConfig:
     # ``latent_up_tp`` (the latent_up blocks indexed by host and core). The
     # same products, sums and rounding points (bit-identical).
     moe_token_parallel_up: bool = False
+    # Steps with moe_token_parallel_up and attention_rank_rows (8 rows): a
+    # layer's MoE ends once its output round's seven copies have started, and
+    # the next layer's first code (the last layer's: the epilogue's) waits for
+    # them, assembles the owned rows and runs the layer's finish (the
+    # residual rows and the aux capture). The round's buffer and semaphores
+    # are persistent. The loop's back-edge (its instruction-overlay call) and
+    # the epilogue overlay's load then run while the round is in flight. The
+    # same operations in the same order between the copies (bit-identical).
+    moe_output_round_next_layer: bool = False
     # Serving batches beyond the powers of two, by request count: plain
     # decode and three-draft verifies (e.g. "48" / "12"; multiples of 16 rows
     # take the staged MoE paths).

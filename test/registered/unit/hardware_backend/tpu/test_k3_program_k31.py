@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=7400, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7800, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -362,6 +362,161 @@ print("OK")
         )
         self.assertNotIn("non-zero count", result.stdout + result.stderr)
 
+
+class TestOutputRoundNextLayer(CustomTestCase):
+    """``KernelConfig.moe_output_round_next_layer``: the token-parallel MoE
+    tail (decode_late_shared_down's order) over three layers of a loop, each
+    layer with its own routed partials and shared outputs, as in the
+    decoder: every layer starts its output round
+    (``_TokenParallelUp.start_outputs``) and the next layer's first code (the
+    last layer's: the code after the loop) runs
+    ``finish_token_parallel_outputs`` from the round's transport and
+    semaphores alone, after NaN has been written over every other buffer the
+    tail uses and over the owned rows. A barrier after it stands in for the
+    next layer's attention rounds, and each layer's round lands on stale NaN
+    bytes. Pallas interpret mode on 32 host devices (TestAttentionHostBf16's
+    harness) with race detection, DMAs executed on wait and eagerly: every
+    rank's owned rows of every layer equal those of ``send_outputs`` (the
+    round finished in its own layer) bit for bit, and no DMA semaphore is
+    left nonzero."""
+
+    MAIN = r"""
+import sys
+
+from sglang_tpu.k3_programs.common import collectives32
+from sglang_tpu.k3_programs.kimi_k3.kernels import load
+
+F32, EPS, LAYERS = jnp.float32, 1e-5, 3
+DMA_MODE, BATCHES = sys.argv[1], tuple(int(b) for b in sys.argv[2].split(","))
+
+
+def tails(B, E, Sh, norm, blocks, deferred):
+    T = B // 4
+    nan = lambda ref: jnp.full(ref.shape, jnp.nan, ref.dtype)
+
+    def kernel(e_ref, sh_ref, norm_ref, up_hbm, out_ref, sl, el, shh, eh, ssend, srecv,
+               send, recv, outv, osend, orecv, routed, up_vmem, up_sem, rows):
+        rank = jax.lax.axis_index("tp")
+        for ref in (sl, el, shh, eh, outv, rows):
+            ref[...] = nan(ref)
+        tp = dmk._TokenParallelUp(B, HALF, rank, sl, shh, el, eh, ssend, srecv, send,
+                                  recv, outv, osend, orecv)
+
+        def finish(layer):
+            if deferred:
+                # Only the round's transport and semaphores are still live.
+                for ref in (sl, el, shh, eh, routed, up_vmem, rows):
+                    ref[...] = nan(ref)
+                dmk.finish_token_parallel_outputs(outv, osend, orecv, rows)
+            out_ref[layer] = rows[...]
+
+        @pl.loop(0, LAYERS)
+        def layer(index):
+            if deferred:
+                pl.when(index > 0)(lambda: finish(index - 1))
+            outv[...] = nan(outv)
+            collectives32.barrier()
+            copy = pltpu.make_async_copy(up_hbm, up_vmem, up_sem)
+            copy.start()
+            routed[...] = e_ref[index]
+            tp.routed_send(routed[...])
+            tp.begin_shared(sh_ref.at[index])
+            tp.routed_local_reduce()
+            tp.start_routed_host()
+            tp.finish_shared_local()
+            tp.routed_host_reduce(routed)
+            up = tp.project(routed, norm_ref, up_vmem, copy, epsilon=EPS,
+                            latent_feature_count=HALF)
+            tp.finish_shared_host(routed)
+            if deferred:
+                tp.start_outputs(up, routed)
+            else:
+                tp.send_outputs(up, routed, rows)
+                finish(index)
+
+        if deferred:
+            finish(LAYERS - 1)
+
+    vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
+    scratch = [*dmk.communication_scratch(B)[:4], dma((10,)), dma((10,)), dma((16,)),
+               dma((16,)), vmem((12, T * 8, 128), jnp.bfloat16), dma((7,)), dma((7,)),
+               vmem((B, 4096), F32), vmem((HALF, 1024), jnp.bfloat16), dma(()),
+               vmem((T, H), jnp.bfloat16)]
+
+    def body(e, sh, nm, up):
+        out = pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((LAYERS, T, H), jnp.bfloat16),
+            in_specs=[pl.BlockSpec(memory_space=vmem)] * 3 + [pl.BlockSpec(memory_space=pl.ANY)],
+            out_specs=pl.BlockSpec(memory_space=vmem),
+            scratch_shapes=scratch,
+            compiler_params=pltpu.CompilerParams(has_side_effects=True, collective_id=7),
+            interpret=pltpu.InterpretParams(detect_races=True, dma_execution_mode=DMA_MODE),
+        )(e[0], sh[0], nm, up[0])
+        return out[None]
+
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("tp"), P("tp"), P(), P("tp")),
+                              out_specs=P("tp"), check_vma=False))
+    return np.asarray(f(E, Sh, norm, blocks))
+
+
+rng = np.random.default_rng(3)
+U = (rng.standard_normal((HALF, H)) * HALF ** -0.5).astype(BF16)
+U_pad = np.concatenate([U, np.zeros((HALF, 1024), BF16)], axis=1)
+norm = np.zeros((1, 4096), np.float32)
+norm[0, :HALF] = 1 + 0.1 * rng.standard_normal(HALF)
+blocks = np.stack([U_pad[:, 1024 * load.token_parallel_up_block(r):][:, :1024]
+                   for r in range(32)])
+spread = lambda shape: np.where(rng.random(shape) < 0.25, 2.0 ** rng.integers(-12, 13, shape), 1.0)
+for B in BATCHES:
+    E = np.zeros((32, LAYERS, B, 4096), np.float32)
+    E[..., :HALF] = rng.standard_normal((32, LAYERS, B, HALF)) * 0.05 * spread((32, LAYERS, B, HALF))
+    Sh = (rng.standard_normal((32, LAYERS, B, H)) * 0.02 * spread((32, LAYERS, B, H))).astype(np.float32)
+    inline = tails(B, E, Sh, norm, blocks, False)
+    deferred = tails(B, E, Sh, norm, blocks, True)
+    assert not np.isnan(inline.astype(np.float32)).any(), B
+    for layer in range(1, LAYERS):  # each layer its own rows
+        assert not np.array_equal(inline[:, layer], inline[:, layer - 1]), (B, layer)
+    for r in range(32):  # the pair's ranks on every host hold the same rows
+        assert inline[r].tobytes() == inline[r % 8 // 2 * 2].tobytes(), (B, r)
+    assert deferred.tobytes() == inline.tobytes(), (B, DMA_MODE)
+    print(f"B{B} {DMA_MODE}: deferred rounds bit-exact over {LAYERS} layers", flush=True)
+assert not ipc.races.races_found
+print("OK")
+"""
+
+    def _run(self, dma_mode, batches):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                TestAttentionHostBf16.PRELUDE + self.MAIN,
+                dma_mode,
+                batches,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1800,
+        )
+        output = result.stdout[-2000:] + result.stderr[-3000:]
+        self.assertIn("OK", result.stdout, output)
+        self.assertNotIn("non-zero count", result.stdout + result.stderr, output)
+
+    def test_deferred_round_matches_the_inline_round(self):
+        self._run("on_wait", "8,16")
+
+    def test_deferred_round_with_eager_dmas(self):
+        self._run("eager", "8")
 
 
 class TestDsaReference(CustomTestCase):
