@@ -1,10 +1,12 @@
 """Registered router top-k op (through the biased_topk hook) vs biased_topk_impl
-on torch_tpu, for bf16 and f32 router logits, with random and tied scores."""
+on torch_tpu, for bf16 and f32 router logits, with random and tied scores; and
+Muse Spark's batch-size routing branches vs its sort path."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=30, suite="stage-a-test-tpu-unit", chips=1)
 
+import types
 import unittest
 
 from sglang.test.test_utils import CustomTestCase
@@ -13,7 +15,7 @@ try:
     import torch
     import torch_tpu  # noqa: F401
 
-    _HAS_TPU = torch.tpu.is_available()
+    _HAS_TPU = torch.accelerator.current_accelerator().type == "tpu"
 except Exception:  # pragma: no cover - non-TPU host
     _HAS_TPU = False
 
@@ -59,6 +61,44 @@ class TestRouterTopkTorchParity(CustomTestCase):
                         msg = f"{dtype} {case} {tokens=} {apply_on_output=}"
                         with self.subTest(msg=msg):
                             self._compare(logits.to(dtype), bias, apply_on_output, msg)
+
+    def test_muse_spark_route_matches_sort(self):
+        """Muse's _route at each batch-size branch (Pallas op, sort, argmax rounds)
+        vs the sort path: f32 logits scaled before the sigmoid, top-8 of 256."""
+        from sglang_tpu.models import muse_spark as ms
+
+        mult = 0.17677669529663687
+        g = torch.Generator().manual_seed(0)
+        for case in ("random", "ties"):
+            for tokens in (1, 2, 8, 64, 65, 1024):
+                logits = torch.randn(tokens, 256, generator=g) * 8.0
+                bias = torch.randn(256, generator=g) * 0.05
+                if case == "ties":
+                    logits = torch.round(logits)
+                lt, bt = logits.float().to("tpu"), bias.float().to("tpu")
+                moe = types.SimpleNamespace(
+                    gate=lambda _x, lt=lt: (lt, None),
+                    router_multiplier=mult,
+                    e_score_correction_bias=bt,
+                    top_k=8,
+                    route_eps=ms._ROUTE_EPS,
+                    route_scale=1.0,
+                )
+                msg = f"{case} {tokens=}"
+                with self.subTest(msg=msg):
+                    out = ms.MuseSparkMoE._route(moe, None)
+                    ref_w, ref_ids = ms._sort_router_topk(
+                        lt * mult, bt, 8, eps=ms._ROUTE_EPS, scale=1.0
+                    )
+                    self.assertEqual(out.topk_ids.dtype, torch.int32)
+                    got_w, got_ids = out.topk_weights.cpu(), out.topk_ids.cpu()
+                    ref_w, ref_ids = ref_w.cpu(), ref_ids.cpu()
+                    for t in range(tokens):
+                        want = dict(zip(ref_ids[t].tolist(), ref_w[t].tolist()))
+                        got = dict(zip(got_ids[t].tolist(), got_w[t].tolist()))
+                        self.assertEqual(set(got), set(want), f"{msg} row {t}")
+                        for i, x in want.items():
+                            self.assertAlmostEqual(got[i], x, delta=1e-6)
 
 
 if __name__ == "__main__":

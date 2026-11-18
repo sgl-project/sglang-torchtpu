@@ -74,6 +74,20 @@ def register_router_topk_op() -> None:
         _OP_READY = True
 
 
+def fits_sigmoid_router_topk(num_tokens: int) -> bool:
+    """True when ``sigmoid_router_topk`` takes a batch of this many tokens."""
+    return _OP_READY and 0 < num_tokens <= MAX_TOKENS
+
+
+def sigmoid_router_topk(
+    logits: torch.Tensor, bias: torch.Tensor, k: int, eps: float, scale: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """For models that route outside ``biased_topk_impl``: top-k of
+    ``sigmoid(logits) + bias``, weights renormalized over the top-k and scaled.
+    logits [T, E] f32, bias [E] f32; returns f32 weights and i32 ids, [T, k]."""
+    return _OP[0](logits, bias, k, True, eps, scale)
+
+
 def _eligible(gating_output, correction_bias, topk, num_fused_shared_experts) -> bool:
     return (
         _OP_READY
@@ -136,6 +150,33 @@ def _large_batch_eligible(
     )
 
 
+def _argmax_rounds(
+    scores: torch.Tensor, bias: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """k argmax-and-mask rounds over ``scores + bias``; each pick's score by a
+    one-hot reduce (one nonzero term, so exact). Ties go to the lowest id."""
+    remaining = scores + bias.view(1, -1)
+    experts = torch.arange(scores.shape[1], device=scores.device)
+    picks, weights = [], []
+    for _ in range(k):
+        pick = remaining.argmax(dim=-1, keepdim=True)
+        hit = experts == pick
+        picks.append(pick)
+        weights.append(torch.where(hit, scores, 0).sum(dim=-1, keepdim=True))
+        remaining = remaining.masked_fill(hit, float("-inf"))
+    return torch.cat(weights, dim=-1), torch.cat(picks, dim=-1)
+
+
+def argmax_router_topk(
+    logits: torch.Tensor, bias: torch.Tensor, k: int, eps: float, scale: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``sigmoid_router_topk`` for batches past MAX_TOKENS, in torch, without
+    XLA's sort; the caller picks the batch sizes where it beats the sort."""
+    weights, ids = _argmax_rounds(logits.sigmoid(), bias, k)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + eps) * scale
+    return weights, ids.to(torch.int32)
+
+
 def _large_batch_topk(
     gating_output,
     correction_bias,
@@ -151,18 +192,9 @@ def _large_batch_topk(
     to the lowest expert id."""
     from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
 
-    scores = gating_output.sigmoid()
-    remaining = scores + correction_bias.view(1, -1)
-    experts = torch.arange(scores.shape[1], device=scores.device)
-    picks, weights = [], []
-    for _ in range(topk):
-        pick = remaining.argmax(dim=-1, keepdim=True)
-        hit = experts == pick
-        picks.append(pick)
-        weights.append(torch.where(hit, scores, 0).sum(dim=-1, keepdim=True))
-        remaining = remaining.masked_fill(hit, float("-inf"))
-    topk_ids = torch.cat(picks, dim=-1)
-    topk_weights = torch.cat(weights, dim=-1)
+    topk_weights, topk_ids = _argmax_rounds(
+        gating_output.sigmoid(), correction_bias, topk
+    )
     if renormalize:
         topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
