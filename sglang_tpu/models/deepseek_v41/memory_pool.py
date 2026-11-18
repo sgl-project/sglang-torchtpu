@@ -569,7 +569,7 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         def add_list(owner, attr):
             slots.extend((owner, attr, i) for i in range(len(getattr(owner, attr))))
 
-        add_list(self.swa_kv_pool, "kv_buffer")
+        add_list(self._swa_storage(), "kv_buffer")
         for ratio in sorted(self.kv_pools):
             pool = self.kv_pools[ratio]
             if pool is not None:
