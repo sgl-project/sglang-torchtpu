@@ -30,11 +30,13 @@ def extra_groups_for_head_shards(ngroups: int, tp_size: int):
     """Compute the increase in group numbers to account for
     replication in order to accompany the head shards."""
 
-    # in the case ngoups % tp_size == 0, this will be zero
+    # in the case ngroups % tp_size == 0, this will be zero
     if ngroups % tp_size == 0:
         return 0
 
-    # for n_groups == 1, this is exactly tp_size - n_groups
+    # Otherwise tp_size must be a multiple of ngroups so each group is
+    # replicated evenly across (tp_size // ngroups) consecutive TP ranks.
+    divide(tp_size, ngroups)
     return tp_size - ngroups
 
 
