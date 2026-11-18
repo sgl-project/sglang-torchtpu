@@ -96,10 +96,11 @@ def quantize_ue8m0(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     return q, scale, scale_byte
 
 
-def _token_rows(kv_lens, cu_q_lens, distribution, num_tokens):
-    """Per token: request index, position in its sequence, and whether it is real."""
+def _token_rows(kv_lens, cu_q_lens, distribution, num_tokens, row_start=0):
+    """Per token ``row_start + i``: request index, position in its sequence,
+    and whether it is real."""
     num_reqs = distribution[2]
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    tok = row_start + jnp.arange(num_tokens, dtype=jnp.int32)
     req = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32)
     req = jnp.minimum(req, kv_lens.shape[0] - 1)
     q_len = cu_q_lens[req + 1] - cu_q_lens[req]
@@ -396,18 +397,26 @@ def expand_picked(
 
 
 def kpool_expand_rows(
-    picked: jax.Array,  # i32[num_tokens, topk // kpool], all ranks' slices
+    picked: jax.Array,  # i32[rows, topk // kpool]; batch rows from row_start
     kv_lens: jax.Array,  # i32[max_num_seqs]; already counts this step's tokens
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    row_start: jax.Array | int = 0,  # i32[1] or 0; batch row of picked[0]
     *,
     topk: int,
     kpool: int,
     out_width: int = 0,
 ) -> jax.Array:
     """The token rows of ``kpool_indexer_step`` from the pools its token split
-    picked, put together over the ranks (``row_count``)."""
-    _, pos, valid = _token_rows(kv_lens, cu_q_lens, distribution, picked.shape[0])
+    picked: every rank's slices put together (``row_start`` 0), or one rank's
+    window (its ``row_start``); rows past the batch are all -1."""
+    _, pos, valid = _token_rows(
+        kv_lens,
+        cu_q_lens,
+        distribution,
+        picked.shape[0],
+        row_start=jnp.asarray(row_start, jnp.int32).reshape(()),
+    )
     return expand_picked(
         picked, pos, valid, topk=topk, kpool=kpool, out_width=out_width
     )

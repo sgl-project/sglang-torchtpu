@@ -6,6 +6,9 @@ MTP verify on the decode megakernel up to 128k of context, the model path beyond
 
 Then `agentx profile --concurrency $AGENTX_CONC --public-dataset
 semianalysis_cc_traces_weka_062126 --benchmark-duration 3600 ...` against port 30000.
+
+AGENTX_KV_SHARDS=8 splits the sparse-MLA latent cache across the 8 ranks
+(SGLANG_TPU_DSA_MLA_KV_SHARDS): no host tier, and decode on the model path.
 """
 
 import os
@@ -13,6 +16,7 @@ from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.glm_5_3_flash.mtp import CONFIG as MTP_CONFIG
 from benchmark.tpu.recipe.configs.glm_5_3_flash.mtp import NUM_STEPS
+from benchmark.tpu.recipe.configs.glm_5_3_flash.server import HICACHE_ARGS
 
 CONCURRENCY = int(os.environ["AGENTX_CONC"])
 CONTEXT_LENGTH = int(os.environ.get("AGENTX_CTX", 1048576))
@@ -25,6 +29,12 @@ BUCKETS = [b for b in (1, 4, 8, 16, 32) if b < MAX_RUNNING] + [MAX_RUNNING]
 # page-table prefetch sizes with max_len. Measured 1 h windows (tok/s per chip, c1/c4/c8/c16):
 # 4,804 / 6,707 / 7,964 / 7,040 with this cap; every step on the kernel at 1M was slower.
 MEGAKERNEL_MAX_LEN = int(os.environ.get("AGENTX_MK_MAX_LEN", 131072))
+# Attention-TP ranks that split the sparse-MLA latent cache by page; 1 keeps it replicated.
+KV_SHARDS = int(os.environ.get("AGENTX_KV_SHARDS", 1))
+# 1M tokens = 13 GB per chip of fp8 DSA KV; two requests' worth of pool. Split eight
+# ways, 9.4M tokens plus 800 KDA checkpoint slots take about the HBM of this pool
+# plus its 144 slots (only 8 was measured).
+POOL_TOKENS = 9437184 if KV_SHARDS == 8 else 2097152
 
 CONFIG = deepcopy(MTP_CONFIG)
 CONFIG["server_args"].update(
@@ -39,8 +49,7 @@ CONFIG["server_args"].update(
         "tpu_compile_bs": sorted(set(BUCKETS)),
         # One prefill program: at 1M the chunk cost is the context scan, not the padding.
         "tpu_compile_tokens": [8192],
-        # 1M tokens = 13 GB per chip of fp8 DSA KV; two requests' worth of pool.
-        "max_total_tokens": int(os.environ.get("AGENTX_POOL_TOKENS", 2097152)),
+        "max_total_tokens": int(os.environ.get("AGENTX_POOL_TOKENS", POOL_TOKENS)),
         "max_mamba_cache_size": 5 * MAX_RUNNING + 64,
         "enable_metrics": True,
         "enable_cache_report": True,
@@ -64,3 +73,16 @@ CONFIG["runtime_env"].update(
         "SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING": "1",
     }
 )
+if KV_SHARDS > 1:
+    # Without a host tier every radix checkpoint of the KDA state stays on device:
+    # 144 slots bounded prefix reuse at AgentX c8 to c32, 800 did not (measured).
+    for key in HICACHE_ARGS:
+        CONFIG["server_args"].pop(key, None)
+    CONFIG["server_args"]["max_mamba_cache_size"] = 800
+    CONFIG["runtime_env"].update(
+        {
+            "SGLANG_TPU_GLM_FLASH_MEGAKERNEL": "0",
+            "SGLANG_TPU_DSA_MLA_KV_SHARDS": str(KV_SHARDS),
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING": "1",
+        }
+    )

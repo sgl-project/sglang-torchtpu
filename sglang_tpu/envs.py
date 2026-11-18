@@ -120,8 +120,8 @@ class TpuEnvs:
     # Sparse MLA, on top of the indexer token split: each rank attends only the
     # rows it selected, with every head, so each selected cache row is gathered
     # by one rank instead of all; a Pallas all-to-all (kernels/oneshot_all_to_all.py)
-    # moves queries and outputs, and the rows' all-reduce is skipped. Plain DSA
-    # prefill batches of the per-query kernel; attention TP must span the world.
+    # moves queries and outputs, and the rows' all-reduce is skipped. Prefill
+    # batches of the per-query kernel; attention TP must span the world.
     SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT = EnvBool(False)
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
@@ -210,6 +210,10 @@ class TpuEnvs:
     # Pooled DSA indexer: keep each request's raw key|gate rows in a ring of pages per
     # request slot instead of one row per pool token; only the open pool is read back.
     SGLANG_TPU_DSA_KPOOL_RAW_RING = EnvBool(False)
+    # Experimental: shard the sparse-MLA latent cache by page across groups of this
+    # many attention-TP ranks (page g on rank g % shards, at page g // shards); each
+    # rank attends its own pages and the group merges partials. 1 = replicated.
+    SGLANG_TPU_DSA_MLA_KV_SHARDS = EnvInt(1)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)

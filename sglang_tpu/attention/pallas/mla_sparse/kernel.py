@@ -880,6 +880,7 @@ def prepare_outputs(
         "live_gather_all_chunks",
         "topk_cap",
         "gather_rope",
+        "kv_shards",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -913,6 +914,7 @@ def sparse_ragged_paged_attention(
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
     gather_rope: bool = True,
+    kv_shards: tuple[int, int, int] | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -970,6 +972,12 @@ def sparse_ragged_paged_attention(
       gather_rope: TensorCore layout only (ignored otherwise). False skips the
         rope cache in the gather and attends with zero rope keys; exact only
         when the queries' rope lane is identically zero (a model without rope).
+      kv_shards: ``(shards, role, group)`` for a cache sharded by page
+        (mla_sparse/kv_shard.py): ``page_indices`` holds allocator page ids,
+        this rank attends only the candidates whose page id is ``role`` mod
+        ``shards`` (at page id // shards), and ``group`` consecutive top-k
+        entries share a page (the pooled indexer's pools). Use with
+        ``return_lse`` and merge the ranks' partials.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1083,6 +1091,7 @@ def sparse_ragged_paged_attention(
         cu_q_lens,
         page_size=page_size,
         total_num_pages=cache_kv_nope.shape[0],
+        kv_shards=kv_shards,
     )
 
     # Rows the grid never reaches (padding past `batch_end`) keep this
@@ -1150,6 +1159,31 @@ def _spread(hashed: jax.Array, bound: int) -> jax.Array:
     return hashed & ((1 << (bound.bit_length() - 1)) - 1)
 
 
+def _own_shard_entries(page_ids, token_offset, is_padding, kv_shards):
+    """This rank's entries (page id = role mod shards) moved to the front of each
+    row in their order, at page id // shards; padding marks the rest."""
+    from sglang_tpu.attention.pallas.mla_sparse.kv_shard import compact_left
+
+    shards, role, group = kv_shards
+    if shards & (shards - 1):
+        raise ValueError(f"kv_shards: shards must be a power of two, got {shards}")
+    num_tokens, topk = page_ids.shape
+    width = -(-topk // group) * group
+    owned = ~is_padding & ((page_ids & (shards - 1)) == role)
+    local = jnp.where(owned, page_ids // shards, -1)
+    packed = jnp.stack([local, token_offset], axis=-1)
+    packed = jnp.pad(packed, ((0, 0), (0, width - topk), (0, 0)), constant_values=-1)
+    owned = jnp.pad(owned, ((0, 0), (0, width - topk)))
+    # A group's entries share a page, so the group's first entry decides.
+    packed = compact_left(
+        packed.reshape(num_tokens, width // group, group * 2),
+        owned.reshape(num_tokens, width // group, group)[..., 0],
+    )
+    packed = packed.reshape(num_tokens, width, 2)[:, :topk]
+    page_ids, token_offset = packed[..., 0], packed[..., 1]
+    return page_ids, token_offset, page_ids < 0
+
+
 def prepare_gather_indices(
     topk_indices: jax.Array,  # i32[max_num_tokens, csa_topk]
     page_indices: jax.Array | None,  # i32[max_num_seqs * pages_per_seq]
@@ -1157,10 +1191,13 @@ def prepare_gather_indices(
     *,
     page_size: int,
     total_num_pages: int,
+    kv_shards: tuple[int, int, int] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Per-token valid top-k counts and flat cache row indices to gather.
 
     Depends only on the indexer output and the page table, not on the query.
+    With ``kv_shards`` (see sparse_ragged_paged_attention), only this rank's
+    candidates are kept, as a prefix in their order.
     """
     max_num_seqs = cu_q_lens.shape[0] - 1
     num_tokens, topk = topk_indices.shape
@@ -1186,6 +1223,11 @@ def prepare_gather_indices(
         page_ids = gather_page_ids(
             page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
         )
+        if kv_shards is not None:
+            page_ids, token_offset, is_padding = _own_shard_entries(
+                page_ids, token_offset, is_padding, kv_shards
+            )
+            kv_lens = jnp.sum(~is_padding, axis=-1)
 
         # Scatter "-1" padding across the cache to avoid read hot spots.
         scattered_page_ids = _spread(flat_element_index * 104729, total_num_pages)
