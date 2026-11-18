@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.k3_programs.kimi_k3.kernels import Config, load
 
-register_cpu_ci(est_time=8200, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9400, suite="base-a-test-cpu")
 
 FULL = [4 * i for i in range(1, 24)] + [93]  # 1-based, as the HF config
 DSA = {
@@ -8568,6 +8568,331 @@ class TestK31DraftPrologueOverlap(CustomTestCase):
 
     def test_two_requests_match_knob_off(self):
         self._run("two")
+
+
+class TestDecodeKnobsTogether(CustomTestCase):
+    """Decode layer pieces that several knobs change at once, in Pallas
+    interpret mode, bit for bit against the same pieces with those knobs off.
+
+    ``moe`` (TestLatentDownPrefetch's 8-row harness: presorted router, expert
+    schedule, late shared down, token-parallel latent-up; 32 host devices,
+    race detection) for three consecutive layers, the reduction phase carried
+    from layer to layer and a barrier between layers (the attention's place).
+    ``KernelConfig.decode_latent_down_prefetch`` (each layer's own latent-down
+    weight copied before its MoE on the semaphore of the layer's parity, as
+    the attention starts it) and ``moe_routed_send_in_expert_region`` (the
+    token-parallel tail's stream and routed send in one region) run together,
+    with eager DMAs and with DMAs executed at their waits (each run in its own
+    process). Between layers the latent-down, shared-expert and latent-up
+    storage holds NaNs (region B holds other weights then), and so does every
+    scratch buffer at the start.
+
+    ``mla`` (TestMlaQ6Knobs's harness, B1 x7 and B2 x7) with its input rows
+    still in flight at entry (``KernelConfig.attention_input_gather_in_branches``:
+    a copy into NaN rows, waited once by ``wait_for_input``) and the q-up hook
+    of ``decode_latent_down_prefetch`` (NaNs copied over the q-up weight) in
+    the same layer, with the serving q6 knobs and ``dcp_pair_lse_rows``."""
+
+    MOE_SETUP = r"""
+import os
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=32"
+os.environ["JAX_PLATFORMS"] = "cpu"
+from sglang_tpu.k3_programs.kimi_k3 import config as kc
+kc.install(kc.KernelConfig(decode_presorted_routing=True, decode_router_both_halves=True,
+                           expert_schedule=True, moe_token_parallel_up=True,
+                           decode_late_shared_down=True))
+"""
+
+    MOE_MAIN = r"""
+assert dmk.PRESORTED_ROUTING and dmk.TOKEN_PARALLEL_UP and dmk.EXPERT_SCHEDULE
+F32 = jnp.float32
+LAYERS = 3
+B, E, LOC, K, WD, OUT, LAT, SW = 8, 896, 28, 512, 256, 3584, 4096, 192
+rng = np.random.default_rng(1)
+bf = lambda x: np.asarray(x, np.float32).astype(BF16)
+hidden = bf(rng.standard_normal((LAYERS, B, H)))
+router = np.broadcast_to(bf(rng.standard_normal((H, E)) * H**-0.5), (32, H, E))
+bias = (0.01 * rng.standard_normal((1, E))).astype(np.float32)
+norm = np.zeros((1, LAT), np.float32)
+norm[0, :OUT] = 1 + 0.1 * rng.standard_normal(OUT)
+# Each layer's own latent-down weight.
+ld = bf(rng.standard_normal((32, LAYERS, H, 128)) * H**-0.5)
+lu = bf(rng.standard_normal((32, OUT, 1024)) * OUT**-0.5)
+sgu = bf(rng.standard_normal((32, H, 2 * SW)) * H**-0.5)
+sd = bf(rng.standard_normal((32, SW, H)) * SW**-0.5)
+egu = rng.integers(0, 2**32, (32, LOC, K // 8, 2 * WD), dtype=np.uint32)
+egus = rng.integers(118, 124, (32, LOC, K // 32, 2 * WD), dtype=np.uint8)
+edown = rng.integers(0, 2**32, (32, LOC, WD // 8, OUT), dtype=np.uint32)
+eds = rng.integers(118, 124, (32, LOC, WD // 32, OUT), dtype=np.uint8)
+
+acc_rows = dmk._expert_accumulator_rows(B, jnp.uint32, group_pending_routes=True)
+crows = dmk._compact_rows(B, group_pending_routes=True)
+vmem, dma, smem = pltpu.VMEM, pltpu.SemaphoreType.DMA, pltpu.SMEM
+WS = (vmem((B, 128), jnp.int32), vmem((B, 128), F32), vmem((B, 128), jnp.int32),
+      vmem((B, 128), F32), vmem((B, 1024), F32), vmem((B, H), F32), vmem((B, LAT), F32),
+      vmem((acc_rows[0], 4 * WD), F32), vmem((acc_rows[1], OUT), F32),
+      vmem((B, 128), jnp.int32),
+      *((vmem((crows, K), F32),) * 2 if crows else (vmem((1, K), jnp.bfloat16),) * 2),
+      dma((10,)), dma((10,)), vmem((12, B // 4 * 8, 128), jnp.bfloat16), dma((7,)),
+      dma((7,)), dma((2,)), dma((2,)))
+OWN = (vmem((2, H, 512), jnp.bfloat16), dma((2,)), vmem((OUT, 1024), jnp.bfloat16), dma(()),
+       vmem((4, K // 8, 2 * WD), jnp.uint32), vmem((4, K // 32, 2 * WD), jnp.uint8),
+       vmem((4, WD // 8, OUT), jnp.uint32), vmem((4, WD // 32, OUT), jnp.uint8), dma((4, 4)),
+       vmem((H, 128), jnp.bfloat16), vmem((H, 2 * SW), jnp.bfloat16),
+       vmem((SW, H), jnp.bfloat16), dma((2,)), smem((8, 128), jnp.int32), dma(()),
+       vmem((B, H), jnp.bfloat16))
+COMM = dmk.communication_scratch(B)
+
+
+def run(prefetch, region, mode):
+    dmk.ROUTED_SEND_IN_EXPERT_REGION = region  # read when moe() is traced
+
+    def kernel(hidden_ref, bias_ref, norm_ref, router_hbm, ld_hbm, lu_hbm, sgu_hbm, sd_hbm,
+               egu_hbm, egus_hbm, ed_hbm, eds_hbm, out_ref, latent_out, *scratch):
+        own, ws, comm = scratch[:len(OWN)], scratch[len(OWN):-len(COMM)], scratch[-len(COMM):]
+        (router_v, router_sems, lu_v, lu_sem, egu_v, egus_v, ed_v, eds_v, e_sems, ld_v, sgu_v,
+         sd_v, ld_sems, schedule, schedule_sem, rows_v) = own
+        comm_ws = dmk.AttentionCommunicationWorkspace(*comm)
+        comm_ws.reduction_phase[0] = 0
+        for layer in range(LAYERS):
+            if layer:
+                # The attention's place: no rank starts the next layer's MoE
+                # before every rank has finished this one.
+                dmk.collectives32.barrier()
+            # Region B between layers: other weights' bytes until a copy lands.
+            for view in (ld_v, sgu_v, sd_v, lu_v):
+                view[...] = jnp.full(view.shape, jnp.nan, view.dtype)
+            rows_v[...] = hidden_ref[layer]
+            weights = dmk.MixtureOfExpertsWeights(
+                router_hbm, router_v, router_sems, bias_ref, ld_hbm.at[layer], lu_hbm, lu_v,
+                lu_sem, norm_ref, sgu_hbm, sd_hbm, egu_hbm, egu_v, egus_hbm, egus_v, ed_hbm, ed_v,
+                eds_hbm, eds_v, e_sems)
+            copy = None
+            if prefetch:  # as the attention starts it, on its layer parity's semaphore
+                copy = pltpu.make_async_copy(ld_hbm.at[layer], ld_v, ld_sems.at[layer % 2])
+                copy.start()
+            dmk.moe(rows_v, out_ref.at[layer], weights=weights,
+                    workspace=dmk.MixtureOfExpertsWorkspace(
+                        *ws, expert_schedule_smem=schedule, expert_schedule_semaphore=schedule_sem),
+                    communication_workspace=comm_ws, synchronize_devices=layer == 0,
+                    group_pending_expert_routes=True, token_scatter_output=True,
+                    routed_reduce_scatter=True, token_parallel_up=True,
+                    prepare_weights_vmem=(ld_v, sgu_v, sd_v), latent_input_prefetch=copy)
+            latent_out[layer] = comm_ws.latent_gather_vmem[...]
+
+    def body(h, b, n, *hbm):
+        out = pl.pallas_call(
+            kernel,
+            out_shape=(jax.ShapeDtypeStruct((LAYERS, B // 4, H), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((LAYERS, B, LAT), jnp.bfloat16)),
+            in_specs=[pl.BlockSpec(memory_space=vmem)] * 3 + [pl.BlockSpec(memory_space=pl.ANY)] * 9,
+            out_specs=[pl.BlockSpec(memory_space=vmem)] * 2,
+            scratch_shapes=[*OWN, *WS, *COMM],
+            compiler_params=pltpu.CompilerParams(has_side_effects=True, collective_id=7),
+            interpret=pltpu.InterpretParams(detect_races=True, dma_execution_mode=mode,
+                                            uninitialized_memory="nan"),
+        )(h, b, n, *(x[0] for x in hbm))
+        return tuple(x[None] for x in out)
+
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P(), P(), *(P("tp"),) * 9),
+                              out_specs=(P("tp"),) * 2, check_vma=False))
+    return [np.asarray(x) for x in f(hidden, bias, norm, router, ld, lu, sgu, sd, egu, egus,
+                                     edown, eds)]
+
+
+prefetch, region, mode = os.environ["RUN"].split(",")
+rows, latents = run(prefetch == "1", region == "1", mode)
+assert not ipc.races.races_found  # reset by every interpreted call
+out = rows.astype(np.float32)
+assert np.isfinite(out).all() and (np.abs(out).max(axis=(0, 2, 3)) > 0).all()
+assert np.isfinite(latents.astype(np.float32)).all()
+# The layers differ (their rows and latent-down weights do).
+assert not np.array_equal(rows[:, 0], rows[:, 1])
+for name, x in (("rows", rows), ("latents", latents)):
+    np.save(os.path.join(os.environ["OUT"], name + ".npy"), x.view(np.uint16))
+print("OK")
+"""
+
+    def test_moe_latent_down_with_the_expert_region(self):
+        import os
+        import subprocess
+        import sys
+        import tempfile
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        prelude = TestAttentionHostBf16.PRELUDE
+        script = (
+            self.MOE_SETUP + prelude[: prelude.index("def project(")] + self.MOE_MAIN
+        )
+        knobs = {"off": "0,0", "both": "1,1"}
+        with tempfile.TemporaryDirectory() as tmp:
+            for mode in ("eager", "on_wait"):
+                outputs = {}
+                for name in knobs:
+                    # One process a run: 32 interpret devices with race
+                    # detection peak at about 9 GB.
+                    out = os.path.join(tmp, f"{mode}-{name}")
+                    os.makedirs(out)
+                    env = dict(
+                        os.environ,
+                        PYTHONPATH=os.pathsep.join(sys.path),
+                        NPROC="128",
+                        RUN=f"{knobs[name]},{mode}",
+                        OUT=out,
+                    )
+                    result = subprocess.run(
+                        [sys.executable, "-c", script],
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=3600,
+                    )
+                    self.assertIn(
+                        "OK",
+                        result.stdout,
+                        f"{mode} {name}: {result.returncode} "
+                        + result.stdout[-2000:]
+                        + result.stderr[-3000:],
+                    )
+                    self.assertNotIn("non-zero count", result.stdout + result.stderr)
+                    outputs[name] = [
+                        np.load(os.path.join(out, f"{what}.npy"))
+                        for what in ("rows", "latents")
+                    ]
+                for what, want, got in zip(
+                    ("output rows", "gathered latents"),
+                    outputs["off"],
+                    outputs["both"],
+                ):
+                    self.assertEqual(want.tobytes(), got.tobytes(), (mode, what))
+
+    @staticmethod
+    def _mla_script():
+        """TestMlaQ6Knobs's harness with two more variant keys: ``input_wait``
+        (mla()'s input rows copied into NaN rows before the layer and waited
+        by ``wait_for_input``) and the knobs reaching ``mla_dcp`` too; race
+        detection with RACES=1."""
+        script = TestMlaQ6Knobs.SCRIPT
+        edits = (
+            (
+                "from jax.sharding import Mesh, PartitionSpec as P\n",
+                "from jax.sharding import Mesh, PartitionSpec as P\n"
+                "from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc\n"
+                'RACES = os.environ.get("RACES") == "1"\n',
+            ),
+            (
+                "    (vmem((QL, 768), jnp.bfloat16), pltpu.SemaphoreType.DMA(())),\n]\n",
+                "    (vmem((QL, 768), jnp.bfloat16), pltpu.SemaphoreType.DMA(())),\n"
+                "    (vmem((B, H), jnp.bfloat16), pltpu.SemaphoreType.DMA(())),\n]\n",
+            ),
+            (
+                '    clobber = knobs.pop("qup_clobber", None) is not None\n',
+                '    clobber = knobs.pop("qup_clobber", None) is not None\n'
+                '    input_wait = knobs.pop("input_wait", None) is not None\n',
+            ),
+            (
+                "(phase, new_key, new_value, sems), (nans, nan_sem) = (\n",
+                "(phase, new_key, new_value, sems), (nans, nan_sem), (rows_v, rows_sem) = (\n",
+            ),
+            (
+                "        dmk.mla(pos_ref, hidden_ref, out_ref,",
+                "        waits = []\n"
+                "        rows_copy = pltpu.make_async_copy(hidden_ref, rows_v, rows_sem)\n"
+                "        if input_wait:  # the rows still in flight at entry, into stale bytes\n"
+                "            rows_v[...] = jnp.full(rows_v.shape, jnp.nan, rows_v.dtype)\n"
+                "            rows_copy.start()\n"
+                "\n"
+                "        def wait_rows():\n"
+                "            waits.append(1)\n"
+                "            rows_copy.wait()\n"
+                "\n"
+                "        dmk.mla(pos_ref, rows_v if input_wait else hidden_ref, out_ref,",
+            ),
+            (
+                "                after_query_up=clobber_query_up if clobber else None)\n",
+                "                after_query_up=clobber_query_up if clobber else None,\n"
+                "                wait_for_input=wait_rows if input_wait else None)\n"
+                "        assert len(waits) == int(input_wait), waits  # traced once\n",
+            ),
+            (
+                "    dmk._config = lambda: config  # the knobs mla() reads while tracing\n",
+                "    dmk._config = lambda: config  # the knobs mla() reads while tracing\n"
+                "    mla_dcp._config = lambda: config\n",
+            ),
+            (
+                "        dmk._config = kc.active\n",
+                "        dmk._config = kc.active\n        mla_dcp._config = kc.active\n",
+            ),
+            (
+                '    got = run(knobs, pltpu.InterpretParams(dma_execution_mode=os.environ["MODE"]))\n',
+                '    lse_rows = "dcp_pair_lse_rows" in knobs\n'
+                "    LSE_CALLS.clear()\n"
+                '    got = run(knobs, pltpu.InterpretParams(dma_execution_mode=os.environ["MODE"],\n'
+                '                                           detect_races=RACES, uninitialized_memory="nan"))\n'
+                "    ok &= not ipc.races.races_found\n"
+                "    # The knob's stage two was traced (8-row calls; 16 rows run chunked,\n"
+                "    # without the pair stage).\n"
+                "    ok &= bool(LSE_CALLS) == (lse_rows and B <= mla_dcp.MAX_ROWS)\n",
+            ),
+            (
+                "bits = lambda x:",
+                "LSE_CALLS = []\n"
+                "_lse_rows = mla_dcp._merge_pair_lse_rows\n"
+                "\n"
+                "def _counted_lse_rows(*args):\n"
+                "    LSE_CALLS.append(1)\n"
+                "    return _lse_rows(*args)\n"
+                "\n"
+                "mla_dcp._merge_pair_lse_rows = _counted_lse_rows\n"
+                "bits = lambda x:",
+            ),
+        )
+        for old, new in edits:
+            assert script.count(old) == 1, old
+            script = script.replace(old, new)
+        return script
+
+    def test_mla_input_wait_with_the_query_up_hook(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        script = self._mla_script()
+        hooks = "qup_clobber=1,input_wait=1,dcp_pair_lse_rows=1"
+        serving = (
+            "dsa_gather_overlap=1,decode_mla_prefix_region=1,decode_mla_early_handout=1"
+        )
+        for case in (
+            # B1 x7, eager copies, race detection.
+            {"S": "8", "POS": "3000", "TOPK": "200", "ACTIVITY": "16", "MODE": "eager",
+             "RACES": "1", "VARIANTS": f";{serving},{hooks}"},
+            # Copies executed at their waits: a read of the rows before
+            # wait_for_input sees NaNs.
+            {"S": "8", "POS": "3000", "TOPK": "200", "ACTIVITY": "0", "MODE": "on_wait",
+             "RACES": "0", "VARIANTS": f";input_wait=1;{serving},{hooks}"},
+            # B2 x7 (chunked attention; no gather overlap at 16 rows).
+            {"S": "8", "POS": "1500,3000", "TOPK": "200", "ACTIVITY": "16", "MODE": "on_wait",
+             "RACES": "0", "VARIANTS": f";decode_mla_prefix_region=1,decode_mla_early_handout=1,{hooks}"},
+        ):  # fmt: skip
+            with self.subTest(**case):
+                env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), **case)
+                result = subprocess.run(
+                    [sys.executable, "-c", script],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=3600,
+                )
+                self.assertIn(
+                    "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+                )
 
 
 if __name__ == "__main__":
