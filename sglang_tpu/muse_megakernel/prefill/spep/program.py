@@ -172,8 +172,6 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 tile_info=TileSizes(*expert_tiles),
             )
 
-        if s13.ndim == 3:  # [E, K / block, N] -> gmm_v2's [E, K / block, 1, N]
-            s13, s2 = s13[:, :, None, :], s2[:, :, None, :]
         if not c.sp_ep_layout:
             # silu(gate) * up in the w13 kernel's epilogue
             return gmm(gmm(x, w13, s13, fuse_act="silu"), w2, s2)
