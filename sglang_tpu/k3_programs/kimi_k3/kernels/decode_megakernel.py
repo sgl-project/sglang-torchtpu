@@ -232,6 +232,10 @@ STEAL_PERSISTENT_NAMES = (
 # (_presorted_route_selections) and the latent all-gather started right after
 # the router products.
 PRESORTED_ROUTING = _config().decode_presorted_routing
+# KernelConfig.decode_latent_down_prefetch: with the presorted router, the
+# latent-down copy starts during the layer's attention and the MoE starts the
+# latent all-gather before the router products.
+LATENT_DOWN_PREFETCH = _config().decode_latent_down_prefetch
 # A sorting network for seven inputs: 16 comparators in six layers.
 SORT_SEVEN = (
     (0, 6),
@@ -4021,6 +4025,7 @@ def moe(
     live_rows=None,
     steal=None,
     token_parallel_up: bool = False,
+    latent_input_prefetch=None,
 ) -> None:
     """Execute one mixture-of-experts layer inside a Pallas program.
 
@@ -4046,6 +4051,12 @@ def moe(
     ``token_parallel_up`` (KernelConfig.moe_token_parallel_up): the
     token-scattered tail of _TokenParallelUp; ``weights`` then carries the
     rank's ``latent_up_tp`` block, whose copy starts with the last expert pair.
+
+    ``latent_input_prefetch`` (KernelConfig.decode_latent_down_prefetch, with
+    the presorted router): the caller's copy of the latent-down weight into
+    ``prepare_weights_vmem[0]``, already started; the MoE waits for it and
+    runs the latent product and the latent all-gather's sends before the
+    router products.
     """
     batch_size, hidden_size = hidden_ref.shape
     expert_count = weights.routing_projection.shape[1]
@@ -4434,6 +4445,19 @@ def moe(
         and owned_hidden_ref is None
     )
     overlap_shared_routing = overlap_router_latent and shared_sharded
+    # KernelConfig.decode_latent_down_prefetch: the latent-down weight was
+    # copied during the attention, so the latent product and its sends lead.
+    latent_first = latent_input_prefetch is not None
+    if latent_first and not (
+        presorted_routing
+        and overlap_router_latent
+        and not overlap_shared_routing
+        and prepare_weights_vmem is not None
+    ):
+        raise ValueError(
+            "A prefetched latent-down copy needs the presorted router and "
+            "pooled MoE weights"
+        )
     # KernelConfig.decode_late_shared_down: with both reduce-scatters, the
     # shared down projection and the start of its reduce-scatter run after the
     # routed send. Its pooled weight must outlive the experts (the caller
@@ -4518,12 +4542,15 @@ def moe(
         shared_down_projection_vmem,
         dense_copy_semaphores,
     ):
-        latent_input_copy = tpu.make_async_copy(
-            weights.latent_input_projection,
-            latent_input_projection_vmem,
-            latent_input_copy_semaphore,
-        )
-        latent_input_copy.start()
+        if latent_first:
+            latent_input_copy = latent_input_prefetch
+        else:
+            latent_input_copy = tpu.make_async_copy(
+                weights.latent_input_projection,
+                latent_input_projection_vmem,
+                latent_input_copy_semaphore,
+            )
+            latent_input_copy.start()
         dense_copies = SimpleNamespace(
             gate_up=None
             if shared_gate_up_stream is not None
@@ -4541,6 +4568,11 @@ def moe(
         _start_async_copies(dense_copies)
         if shared_gate_up_stream is not None:
             shared_gate_up_stream.start()
+        if latent_first:
+            # The latent product reads only the hidden rows and the latent-down
+            # weight (resident since the attention): its 31 sends leave before
+            # the router products instead of after them.
+            start_latent_gather(latent_input_projection_vmem, latent_input_copy)
 
         if router_slots == 1:
             weights.wait_for_routing_projection_copy()
@@ -4648,7 +4680,9 @@ def moe(
                 after_selection=overlap_routing_with_latent_gather,
                 after_scores=after_routing_scores,
                 after_score_send=(
-                    overlap_router_score_exchange if overlap_router_latent else None
+                    overlap_router_score_exchange
+                    if overlap_router_latent and not latent_first
+                    else None
                 ),
                 live_rows=live_rows,
                 wait_for_projection_half=(
@@ -4719,7 +4753,9 @@ def moe(
                     after_selection=overlap_routing_with_latent_gather,
                     after_scores=after_routing_scores,
                     after_score_send=(
-                        overlap_router_score_exchange if overlap_router_latent else None
+                        overlap_router_score_exchange
+                        if overlap_router_latent and not latent_first
+                        else None
                     ),
                     live_rows=live_rows,
                     wait_for_projection_half=(
@@ -6965,6 +7001,7 @@ def mla(
     streams: dict | None = None,
     dsa: "dsa_decode.DecodeIndexer | None" = None,
     hand_out: Callable[[], None] | None = None,
+    after_query_up: Callable[[], None] | None = None,
 ) -> None:
     """Execute one multi-head latent-attention layer inside a Pallas program.
 
@@ -6993,6 +7030,9 @@ def mla(
     ``hand_out`` (KernelConfig.decode_mla_early_handout): called once the new
     rows are in ``new_key_ref`` / ``new_value_ref`` (e.g. to start their
     hand-out copies); nothing writes them afterwards.
+
+    ``after_query_up`` (KernelConfig.decode_latent_down_prefetch): called once
+    q-up has run; nothing reads the q-up weight afterwards.
     """
     batch_size, hidden_size = hidden_ref.shape
     context_length = (
@@ -7236,6 +7276,8 @@ def mla(
                 .astype(jnp.bfloat16)
                 .reshape(batch_size, 3, 256)
             )
+            if after_query_up is not None:
+                after_query_up()
             new_latent = jnp.concatenate(
                 (
                     key_value_latent,
@@ -9990,6 +10032,23 @@ def stack(
                 "(latent_up's shape)"
             )
         layer_names = (*layer_names, "latent_up_tp")
+    # KernelConfig.decode_latent_down_prefetch where the MoE runs the presorted
+    # router (moe checks): each layer's latent-down copy starts during its
+    # attention into the pooled region-B view it shares with the MLA q-up and
+    # latent-up weights, once nothing reads that storage any more (KDA layers
+    # never use region B; the previous layer's latent-up product has run).
+    latent_down_prefetch = bool(
+        LATENT_DOWN_PREFETCH
+        and PRESORTED_ROUTING
+        and POOLED_WEIGHTS
+        and batch_size in (8, 16)
+        and router_slots == 2
+        and weights["router"].shape[-1] == 896
+        and group_pending_expert_routes
+        and attention_dp == 1
+        and not persist_kda_state
+        and not stream_kda_state
+    )
     steal_families = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
     moe_scoped_scratch = _moe_scoped_scratch(
         local_weights,
@@ -10282,6 +10341,24 @@ def stack(
                 index=index,
                 predicate=predicate,
             )
+
+        def latent_down_copy(index):
+            """Layer ``index``'s latent-down copy into its pooled view
+            (KernelConfig.decode_latent_down_prefetch)."""
+            return tpu.make_async_copy(
+                layer_weights["latent_down"].at[index - 1],
+                pool_view("latent_down"),
+                metadata_semaphores.at[index % 2, 4 + len(router_scale_names)],
+            )
+
+        def start_latent_down_copy(index):
+            # The pool views are reinterpret casts, so the compiler need not see
+            # that this copy overwrites storage read before it (MLA's q-up
+            # weight); a region (on a runtime condition that is never false)
+            # keeps it from being hoisted over those reads.
+            @pl.when(communication_workspace.reduction_phase[0] >= 0)
+            def start():
+                latent_down_copy(index).start()
 
         auxiliary_vmem = (
             convolution_filter_vmem,
@@ -11691,6 +11768,9 @@ def stack(
                         )
                         for copy in state_copies:
                             copy.start()
+                        if latent_down_prefetch and not dense_layer:
+                            # Behind the state reads; KDA leaves region B alone.
+                            start_latent_down_copy(layer_index)
                         if not overlap_kda_state_reads:
                             for copy in state_copies:
                                 copy.wait()
@@ -11926,6 +12006,12 @@ def stack(
                             ),
                             dsa=indexer,
                             hand_out=start_hand_out if early_handout else None,
+                            # The latent-down storage is q-up's weight's.
+                            after_query_up=(
+                                functools.partial(start_latent_down_copy, layer_index)
+                                if latent_down_prefetch and not dense_layer
+                                else None
+                            ),
                             **mla_options,
                         )
 
@@ -12461,6 +12547,9 @@ def stack(
                     live_rows=active_rows,
                     steal=steal,
                     token_parallel_up=token_parallel_up,
+                    latent_input_prefetch=(
+                        latent_down_copy(layer_index) if latent_down_prefetch else None
+                    ),
                 )
 
             def run_dense_mlp():
@@ -13093,8 +13182,10 @@ def stack(
             for name in ("m_qnorm", "m_knorm", "router_bias", "latent_norm")
         ),
         # MLA norms (0, 1), router bias (2), latent norm (3), FP8 router
-        # scales (4).
-        tpu.SemaphoreType.DMA((2, 4 + len(router_scale_names))),
+        # scales (4), then the prefetched latent-down copy.
+        tpu.SemaphoreType.DMA(
+            (2, 4 + len(router_scale_names) + int(latent_down_prefetch))
+        ),
         tpu.VMEM(
             (owned_rows, hidden_size) if attention_token_scatter else (1,),
             jnp.bfloat16,

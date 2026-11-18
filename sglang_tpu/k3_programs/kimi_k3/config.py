@@ -454,6 +454,14 @@ class KernelConfig:
     # and the first experts move to the scalar unit in one batch and the
     # first pair's gate/up copies start right after the top-k. Bit-identical.
     decode_presorted_routing: bool = False
+    # With decode_presorted_routing (8 and 16 rows, pooled weights, attention
+    # DP1): each layer's latent-down copy starts during its attention, into
+    # its region-B storage once that is free (KDA layers: after the state
+    # reads start; MLA layers: after q-up, whose weight that storage held),
+    # instead of at MoE entry, and the MoE runs the latent product and the
+    # latent all-gather's 31 sends before the router products instead of
+    # after them. The same bytes in the same products (bit-identical).
+    decode_latent_down_prefetch: bool = False
     # Decode KDA input (q|k|v|g|b) and output projections as FP8 e4m3 with one
     # FP32 scale per output column (amax / 448), converted from the pre-shard
     # at load (attention DP1). The activations stay BF16; the products run on

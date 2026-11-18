@@ -5461,6 +5461,154 @@ print("OK")
         )
 
 
+class TestLatentDownPrefetch(CustomTestCase):
+    """``KernelConfig.decode_latent_down_prefetch``: the decode MoE
+    (``decode_megakernel.moe``) at 8 rows with the presorted router, the
+    expert schedule, the late shared down projection and the token-parallel
+    latent-up, in Pallas interpret mode on 32 host devices (TestAttentionHostBf16's
+    views), race detection on. With the latent-down copy started before the
+    MoE (``latent_input_prefetch``: the latent product and its 31 sends then
+    run before the router products) every rank's output rows and gathered
+    latents equal the plain MoE's bit for bit, with eager DMAs and with DMAs
+    executed at their waits; the latent-down storage holds NaNs until a copy
+    lands, so a product that does not wait for it shows."""
+
+    SETUP = r"""
+import os
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=32"
+os.environ["JAX_PLATFORMS"] = "cpu"
+from sglang_tpu.k3_programs.kimi_k3 import config as kc
+kc.install(kc.KernelConfig(decode_presorted_routing=True, decode_router_both_halves=True,
+                           expert_schedule=True, moe_token_parallel_up=True,
+                           decode_late_shared_down=True))
+"""
+
+    MAIN = r"""
+assert dmk.PRESORTED_ROUTING and dmk.TOKEN_PARALLEL_UP and dmk.EXPERT_SCHEDULE
+F32 = jnp.float32
+# EP32 routed experts (28 a rank) with a small MXFP4 shape; the latent and
+# shared shapes are the decode's.
+B, E, LOC, K, WD, OUT, LAT, SW = 8, 896, 28, 512, 256, 3584, 4096, 192
+rng = np.random.default_rng(0)
+bf = lambda x: np.asarray(x, np.float32).astype(BF16)
+hidden = bf(rng.standard_normal((B, H)))
+router = np.broadcast_to(bf(rng.standard_normal((H, E)) * H**-0.5), (32, H, E))
+bias = (0.01 * rng.standard_normal((1, E))).astype(np.float32)
+norm = np.zeros((1, LAT), np.float32)
+norm[0, :OUT] = 1 + 0.1 * rng.standard_normal(OUT)
+ld = bf(rng.standard_normal((32, H, 128)) * H**-0.5)
+lu = bf(rng.standard_normal((32, OUT, 1024)) * OUT**-0.5)
+sgu = bf(rng.standard_normal((32, H, 2 * SW)) * H**-0.5)
+sd = bf(rng.standard_normal((32, SW, H)) * SW**-0.5)
+egu = rng.integers(0, 2**32, (32, LOC, K // 8, 2 * WD), dtype=np.uint32)
+egus = rng.integers(118, 124, (32, LOC, K // 32, 2 * WD), dtype=np.uint8)
+edn = rng.integers(0, 2**32, (32, LOC, WD // 8, OUT), dtype=np.uint32)
+eds = rng.integers(118, 124, (32, LOC, WD // 32, OUT), dtype=np.uint8)
+
+acc_rows = dmk._expert_accumulator_rows(B, jnp.uint32, group_pending_routes=True)
+crows = dmk._compact_rows(B, group_pending_routes=True)
+vmem, dma, smem = pltpu.VMEM, pltpu.SemaphoreType.DMA, pltpu.SMEM
+WS = (vmem((B, 128), jnp.int32), vmem((B, 128), F32), vmem((B, 128), jnp.int32),
+      vmem((B, 128), F32), vmem((B, 1024), F32), vmem((B, H), F32), vmem((B, LAT), F32),
+      vmem((acc_rows[0], 4 * WD), F32), vmem((acc_rows[1], OUT), F32),
+      vmem((B, 128), jnp.int32),
+      *((vmem((crows, K), F32),) * 2 if crows else (vmem((1, K), jnp.bfloat16),) * 2),
+      dma((10,)), dma((10,)), vmem((12, B // 4 * 8, 128), jnp.bfloat16), dma((7,)),
+      dma((7,)), dma((2,)), dma((2,)))
+OWN = (vmem((2, H, 512), jnp.bfloat16), dma((2,)), vmem((OUT, 1024), jnp.bfloat16), dma(()),
+       vmem((4, K // 8, 2 * WD), jnp.uint32), vmem((4, K // 32, 2 * WD), jnp.uint8),
+       vmem((4, WD // 8, OUT), jnp.uint32), vmem((4, WD // 32, OUT), jnp.uint8), dma((4, 4)),
+       vmem((H, 128), jnp.bfloat16), vmem((H, 2 * SW), jnp.bfloat16),
+       vmem((SW, H), jnp.bfloat16), dma(()), smem((8, 128), jnp.int32), dma(()))
+COMM = dmk.communication_scratch(B)
+
+
+def run(prefetch, mode):
+    def kernel(hidden_ref, bias_ref, norm_ref, router_hbm, ld_hbm, lu_hbm, sgu_hbm, sd_hbm,
+               egu_hbm, egus_hbm, ed_hbm, eds_hbm, out_ref, latent_out, *scratch):
+        own, ws, comm = scratch[:len(OWN)], scratch[len(OWN):-len(COMM)], scratch[-len(COMM):]
+        (router_v, router_sems, lu_v, lu_sem, egu_v, egus_v, ed_v, eds_v, e_sems, ld_v, sgu_v,
+         sd_v, ld_sem, schedule, schedule_sem) = own
+        comm_ws = dmk.AttentionCommunicationWorkspace(*comm)
+        comm_ws.reduction_phase[0] = 0
+        ld_v[...] = jnp.full(ld_v.shape, jnp.nan, ld_v.dtype)
+        weights = dmk.MixtureOfExpertsWeights(
+            router_hbm, router_v, router_sems, bias_ref, ld_hbm, lu_hbm, lu_v, lu_sem, norm_ref,
+            sgu_hbm, sd_hbm, egu_hbm, egu_v, egus_hbm, egus_v, ed_hbm, ed_v, eds_hbm, eds_v,
+            e_sems)
+        copy = None
+        if prefetch:  # as the decoder starts it during the attention
+            copy = pltpu.make_async_copy(ld_hbm, ld_v, ld_sem)
+            copy.start()
+        dmk.moe(hidden_ref, out_ref, weights=weights,
+                workspace=dmk.MixtureOfExpertsWorkspace(
+                    *ws, expert_schedule_smem=schedule, expert_schedule_semaphore=schedule_sem),
+                communication_workspace=comm_ws, group_pending_expert_routes=True,
+                token_scatter_output=True, routed_reduce_scatter=True, token_parallel_up=True,
+                prepare_weights_vmem=(ld_v, sgu_v, sd_v), latent_input_prefetch=copy)
+        latent_out[...] = comm_ws.latent_gather_vmem[...]
+
+    def body(h, b, n, *hbm):
+        out = pl.pallas_call(
+            kernel,
+            out_shape=(jax.ShapeDtypeStruct((B // 4, H), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((B, LAT), jnp.bfloat16)),
+            in_specs=[pl.BlockSpec(memory_space=vmem)] * 3 + [pl.BlockSpec(memory_space=pl.ANY)] * 9,
+            out_specs=[pl.BlockSpec(memory_space=vmem)] * 2,
+            scratch_shapes=[*OWN, *WS, *COMM],
+            compiler_params=pltpu.CompilerParams(has_side_effects=True, collective_id=7),
+            interpret=pltpu.InterpretParams(detect_races=True, dma_execution_mode=mode),
+        )(h, b, n, *(x[0] for x in hbm))
+        return tuple(x[None] for x in out)
+
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(), P(), P(), *(P("tp"),) * 9),
+                              out_specs=(P("tp"),) * 2, check_vma=False))
+    return [np.asarray(x) for x in f(hidden, bias, norm, router, ld, lu, sgu, sd, egu, egus,
+                                     edn, eds)]
+
+
+for mode in ("eager", "on_wait"):
+    want = run(False, mode)
+    assert not ipc.races.races_found, mode  # reset by every interpreted call
+    got = run(True, mode)
+    assert not ipc.races.races_found, mode
+    out = want[0].astype(np.float32)
+    assert np.isfinite(out).all() and np.abs(out).max() > 0, mode
+    assert np.isfinite(want[1].astype(np.float32)).all(), mode
+    for name, a, b in zip(("output rows", "gathered latents"), want, got):
+        assert a.tobytes() == b.tobytes(), (mode, name)
+    print(f"{mode}: bit-exact (rms {np.sqrt(np.mean(out ** 2)):.3f})", flush=True)
+print("OK")
+"""
+
+    def test_prefetched_latent_down_moe_is_bitwise_unchanged(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        prelude = TestAttentionHostBf16.PRELUDE
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), NPROC="128")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                self.SETUP + prelude[: prelude.index("def project(")] + self.MAIN,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1800,
+        )
+        self.assertIn(
+            "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+        )
+        self.assertNotIn("non-zero count", result.stdout + result.stderr)
+
+
 class TestFirstPairGateUpCopies(CustomTestCase):
     """The initial routed-expert copies with ``gate_up_first_pair``
     (``KernelConfig.decode_late_shared_down``) in Pallas interpret mode: on
@@ -7291,7 +7439,12 @@ class TestMlaQ6Knobs(CustomTestCase):
     modes). Interpret mode sums every product in program order, so this
     checks the moved operations and the buffers they share, not the compiled
     program's MXU accumulation order. The output projection's TP reduction is
-    a local product in every run."""
+    a local product in every run.
+
+    ``after_query_up`` (``KernelConfig.decode_latent_down_prefetch``, whose
+    latent-down copy overwrites the q-up weight's pooled storage there): a
+    hook that copies NaNs over the q-up weight runs exactly once and leaves
+    the layer bit-identical, so nothing reads that weight after it."""
 
     SCRIPT = r"""
 import dataclasses, os
@@ -7422,19 +7575,21 @@ groups = [
     (*(vmem(w.shape[1:], jnp.bfloat16) for w in mla_w), pltpu.SemaphoreType.DMA((6,))),
     (smem((1,), jnp.int32), vmem((B, PAD, 256), jnp.bfloat16), vmem((B, PAD, 128), jnp.bfloat16),
      pltpu.SemaphoreType.DMA((2,))),
+    (vmem((QL, 768), jnp.bfloat16), pltpu.SemaphoreType.DMA(())),
 ]
 bounds = np.cumsum([0] + [len(x) for x in groups])
 STEPS = key_rows // dsa_scoped["attend_keys"].shape[2]
 installed = kc.active()
 
 def run(knobs, params):
+    clobber = knobs.pop("qup_clobber", None) is not None
     config = installed.replace(**knobs)
     handout = config.decode_mla_early_handout
 
     def kernel(pos_ref, table_ref, hidden_ref, qnorm_ref, knorm_ref, qa, ka, qb, kb, gate, o, wqb_ref, wks_ref,
                wpt_ref, dknorm_ref, ipool_ref, lpool_ref, out_ref, tau_out, ptie_out, own_out, act_out, key_out,
-               value_out, rec_out, keys_out, *scratch):
-        persist, dscoped, dcps, mws, wv, (phase, new_key, new_value, sems) = (
+               value_out, rec_out, keys_out, clobbered_out, *scratch):
+        persist, dscoped, dcps, mws, wv, (phase, new_key, new_value, sems), (nans, nan_sem) = (
             scratch[bounds[i]:bounds[i + 1]] for i in range(len(groups)))
         phase[0] = 0
         sc = dict(zip(dsa_scoped, dscoped))
@@ -7453,12 +7608,26 @@ def run(knobs, params):
             for copy in copies():
                 copy.start()
 
+        calls = []
+        nan_copy = pltpu.make_async_copy(nans, wv[2], nan_sem)
+
+        def clobber_query_up():
+            calls.append(1)
+            nans[...] = jnp.full(nans.shape, jnp.nan, nans.dtype)
+            nan_copy.start()
+
         dmk.mla(pos_ref, hidden_ref, out_ref, new_key, new_value, weights=weights,
                 workspace=dmk.MultiHeadLatentAttentionWorkspace(*mws), communication_workspace=comm,
                 dcp=(mla_dcp.DcpCache((lpool_ref,), table_ref, pages, 0, group=G, global_pages=False),
                      mla_dcp.DcpWorkspace(*persist[n_dsa_p:], *dcps)),
                 synchronize_devices=False, output_projection_after_query_down=True, sequence_rows=S, dsa=indexer,
-                hand_out=start_hand_out if handout else None)
+                hand_out=start_hand_out if handout else None,
+                after_query_up=clobber_query_up if clobber else None)
+        clobbered_out[0] = 0
+        if clobber:
+            assert len(calls) == 1, calls  # traced once, on every q6 path
+            nan_copy.wait()
+            clobbered_out[0] = jnp.isnan(wv[2][...].astype(jnp.float32)).all().astype(jnp.int32)
         if not handout:  # q8 as compute() runs it
             start_hand_out()
         for copy in copies():
@@ -7475,11 +7644,12 @@ def run(knobs, params):
                        jax.ShapeDtypeStruct((B * STEPS,), jnp.int32), jax.ShapeDtypeStruct((B, PAD, 256), jnp.bfloat16),
                        jax.ShapeDtypeStruct((B, PAD, 128), jnp.bfloat16),
                        jax.ShapeDtypeStruct((B, 24, 2, 128), jnp.int32),
-                       jax.ShapeDtypeStruct((B, key_rows, 128), jnp.int32)),
+                       jax.ShapeDtypeStruct((B, key_rows, 128), jnp.int32),
+                       jax.ShapeDtypeStruct((1,), jnp.int32)),
             grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2,
                 in_specs=[pl.BlockSpec(memory_space=vmem)] * 3 + [pl.BlockSpec(memory_space=pl.ANY)] * 12,
                 out_specs=[pl.BlockSpec(memory_space=vmem)] + [pl.BlockSpec(memory_space=smem)] * 4
-                          + [pl.BlockSpec(memory_space=pl.ANY)] * 4,
+                          + [pl.BlockSpec(memory_space=pl.ANY)] * 4 + [pl.BlockSpec(memory_space=smem)],
                 scratch_shapes=[x for grp in groups for x in grp]),
             compiler_params=pltpu.CompilerParams(has_side_effects=True),
             interpret=params)(pos, table[0], hid, qn, kn, *(w[0] for w in w6), wqb_[0], wks_[0], wpt_, dkn,
@@ -7488,7 +7658,7 @@ def run(knobs, params):
 
     sharded = (P("tp"),) + (P(),) * 3 + (P("tp"),) * 8 + (P(), P(), P("tp"), P("tp"))
     f = jax.jit(jax.shard_map(body, mesh=Mesh(np.asarray(jax.devices()), ("tp",)), in_specs=(P(), *sharded),
-                              out_specs=(P("tp"),) * 9, check_vma=False))
+                              out_specs=(P("tp"),) * 10, check_vma=False))
     dmk._config = lambda: config  # the knobs mla() reads while tracing
     try:
         return [np.asarray(x) for x in f(positions, tables.reshape(G, -1), hidden, qnorm, knorm_mla, *mla_w,
@@ -7501,7 +7671,10 @@ names = ("output", "tau", "p_tie", "own", "active", "key rows", "value rows", "r
 ok, want = True, None
 for variant in os.environ["VARIANTS"].split(";"):
     knobs = dict(kv.split("=") for kv in variant.split(",") if kv)
+    clobber = "qup_clobber" in knobs
     got = run(knobs, pltpu.InterpretParams(dma_execution_mode=os.environ["MODE"]))
+    # The hook's copy landed: every rank's q-up weight holds NaNs after the layer.
+    ok &= bool((got.pop()[:, 0] == int(clobber)).all())
     if want is None:
         want = got
         out, rows = got[0], got[5][:, :, :3].astype(np.float32)
@@ -7541,6 +7714,43 @@ print("OK" if ok else "FAIL")
             # overlap stays off (8-row verify calls only).
             {"S": "8", "POS": "1500,3000", "TOPK": "200", "ACTIVITY": "16", "MODE": "eager",
              "VARIANTS": f";{overlap},{prefix},{handout}"},
+        ):  # fmt: skip
+            with self.subTest(**case):
+                env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), **case)
+                result = subprocess.run(
+                    [sys.executable, "-c", self.SCRIPT],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=1800,
+                )
+                self.assertIn(
+                    "OK", result.stdout, result.stdout[-2000:] + result.stderr[-3000:]
+                )
+
+    def test_query_up_weight_is_dead_after_its_hook(self):
+        import os
+        import subprocess
+        import sys
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        clobber = "qup_clobber=1"
+        serving = (
+            "dsa_gather_overlap=1,decode_mla_prefix_region=1,decode_mla_early_handout=1"
+        )
+        for case in (
+            # B1 x7 with eager copies: the NaNs land as the hook runs.
+            {"S": "8", "POS": "3000", "TOPK": "200", "ACTIVITY": "16", "MODE": "eager",
+             "VARIANTS": f";{clobber};{serving},{clobber}"},
+            # Copies executed at their waits (after the layer).
+            {"S": "8", "POS": "3000", "TOPK": "200", "ACTIVITY": "0", "MODE": "on_wait",
+             "VARIANTS": f";{serving},{clobber}"},
+            # B2 x7 (chunked attention; no gather overlap at 16 rows).
+            {"S": "8", "POS": "1500,3000", "TOPK": "200", "ACTIVITY": "16", "MODE": "eager",
+             "VARIANTS": f";{serving},{clobber}"},
         ):  # fmt: skip
             with self.subTest(**case):
                 env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path), **case)
