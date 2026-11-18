@@ -341,6 +341,15 @@ def register_tpu_dsv4_resolution_hooks() -> None:
         hooks.append(_tpu_deepseek_v4_env_adjustments)
 
 
+def disable_tpu_draft_swa_ring() -> bool:
+    """TPU keeps the DSpark draft SWA in the target's paged full-to-SWA mapping.
+
+    The TPU draft neither writes ring rows in extend/commit nor masks reads with
+    ``swa_valid_from``; drop this hook once it does (upstream sglang#44673).
+    """
+    return False
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -350,6 +359,11 @@ def hook_specs():
     htk = "sglang.srt.layers.moe.hash_topk.HashTopK"
     dsv4 = "sglang.srt.models.deepseek_v4"
     return [
+        (
+            "sglang.srt.mem_cache.deepseek_v4_memory_pool.uses_draft_swa_ring",
+            disable_tpu_draft_swa_ring,
+            HookType.REPLACE,
+        ),
         (
             f"{kvc}._build_dsv4_kv_pool",
             build_tpu_dsv4_kv_pool,

@@ -384,5 +384,117 @@ class TestGmmV2ActivationWeightQuantized(
         )
 
 
+@unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
+@unittest.skipUnless(_HAS_PARAMETERIZED, "Requires absl.testing.parameterized")
+class TestGmmV2LhsScalePerRow(
+    parameterized.TestCase if _HAS_PARAMETERIZED else unittest.TestCase
+):
+    """lhs_scale_per_row: one lhs scale per row over each K tile against block-256 rhs scales.
+    Must track the f32 reference as closely as the default per-block lhs quantization."""
+
+    @parameterized.product(
+        weight_dtype=[jnp.float8_e4m3fn, jnp.int8],
+        group_offset=[0, 3],
+    )
+    def test_lhs_scale_per_row(self, weight_dtype, group_offset):
+        from sglang_tpu.moe.pallas.gmm_v2 import gmm_v2
+
+        batch_size, in_size, out_size, num_groups = 256, 1024, 1024, 16
+        num_local_groups = num_groups - group_offset
+        key_l, key_r = jax.random.split(jax.random.key(0))
+        lhs = jax.random.uniform(key_l, (batch_size, in_size), jnp.bfloat16, -1, 1)
+        rhs = jax.random.uniform(
+            key_r, (num_local_groups, in_size, out_size), jnp.bfloat16, -1, 1
+        )
+        # 4 quant blocks along K: every tile rescales several partials
+        rhs_q, rhs_scale = _quantize_tensor(rhs, weight_dtype, axis=1, block_size=256)
+        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+        # random sizes: most groups start off a 16-row boundary
+        group_sizes = _get_group_sizes(batch_size, num_groups)
+        offset = jnp.array(group_offset, dtype=jnp.int32)
+
+        expected = _reference_gmm(
+            lhs.astype(jnp.float32),
+            rhs_q,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            group_offset=offset,
+        )
+
+        def run(per_row):
+            return gmm_v2(
+                lhs,
+                rhs_q,
+                group_sizes,
+                rhs_scale=rhs_scale,
+                group_offset=offset,
+                maybe_quantize_lhs=True,
+                lhs_scale_per_row=per_row,
+                preferred_element_type=jnp.float32,
+            )
+
+        def rel_rms(actual):
+            diff = actual.astype(jnp.float32) - expected.astype(jnp.float32)
+            return float(
+                jnp.sqrt(
+                    jnp.mean(diff**2) / jnp.mean(expected.astype(jnp.float32) ** 2)
+                )
+            )
+
+        err_row, err_block = rel_rms(run(True)), rel_rms(run(False))
+        # an e4m3 lhs rounding costs a few % rms; the row scale may cost slightly more
+        self.assertLess(err_row, 0.05, f"per-row lhs scale: rel rms {err_row}")
+        self.assertLess(
+            err_row,
+            err_block * 1.2 + 1e-3,
+            f"per-row {err_row} vs per-block {err_block}",
+        )
+
+
+@unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
+class TestGmmV2ThreeDScales(unittest.TestCase):
+    """Block scales given 3-D [G, blocks, N] must give the 4-D [G, blocks, 1, N] result bit
+    for bit. Regression: Muse EP prefill passes its experts' 3-D scales as they are; when
+    gmm_v2 took only 4-D, the program reshaped them in-line and served GSM8K fell from 0.95
+    to about 0.47."""
+
+    def test_fp4_block256_3d_scales(self):
+        from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
+
+        # prefill/spep's expert call: a leading receive-padding group behind group_offset 1,
+        # per-row e4m3 lhs, bf16 block-256 scales
+        num_groups, pad, batch_size, in_size, out_size = 4, 16, 1024, 512, 1024
+        key_l, key_r, key_s = jax.random.split(jax.random.key(0), 3)
+        lhs = jax.random.uniform(key_l, (batch_size, in_size), jnp.bfloat16, -1, 1)
+        rhs = jax.random.normal(
+            key_r, (num_groups, in_size, out_size), jnp.float32
+        ).astype(jnp.float4_e2m1fn)
+        scale_3d = jax.random.uniform(
+            key_s, (num_groups, in_size // 256, out_size), jnp.float32, 0.005, 0.02
+        ).astype(jnp.bfloat16)
+        per_group = (batch_size - pad) // num_groups
+        group_sizes = jnp.array([pad] + [per_group] * num_groups, jnp.int32)
+
+        def run(scale):
+            return gmm_v2(
+                lhs,
+                rhs,
+                group_sizes,
+                rhs_scale=scale,
+                group_offset=jnp.ones((1,), jnp.int32),
+                zero_initialize=False,
+                preferred_element_type=jnp.bfloat16,
+                rhs_quant_dtype=jnp.float4_e2m1fn,
+                maybe_quantize_lhs=True,
+                lhs_scale_per_row=True,
+                tile_info=TileSizes(64, in_size, out_size // 2),
+            )
+
+        rows = slice(pad, pad + per_group * num_groups)
+        y3 = run(scale_3d)[rows]
+        y4 = run(scale_3d[:, :, None, :])[rows]
+        self.assertTrue(bool(jnp.array_equal(y3, y4)), "3-D scales differ from 4-D")
+
+
 if __name__ == "__main__":
     unittest.main()

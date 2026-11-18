@@ -7,6 +7,7 @@ import math
 import os
 import sys
 import unittest
+import unittest.mock
 
 import numpy as np
 
@@ -545,6 +546,60 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                     sliding_window=sliding_window,
                     seq_along_lane=seq_along_lane,
                 )
+
+    def _check_prefill_tiles(self, variants):
+        """Runs the fp8 SEQ_ALONG_LANE extend batch under each (env, sliding windows) variant."""
+        import jax
+
+        from sglang_tpu.envs import envs as tpu_envs
+
+        for env, windows in variants:
+            for sliding_window in windows:
+                with (
+                    self.subTest(env=env, sliding_window=sliding_window),
+                    unittest.mock.patch.dict(os.environ, env),
+                ):
+                    # The wrapper reads the flags while tracing; drop cached traces.
+                    jax.clear_caches()
+                    self.assertTrue(all(getattr(tpu_envs, name).get() for name in env))
+                    self._check(
+                        seqs=self.EXTEND_SEQS,
+                        padded_tokens=self.EXTEND_TOKENS,
+                        kv_dtype_name="float8_e4m3fn",
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        sliding_window=sliding_window,
+                        seq_along_lane=True,
+                    )
+        jax.clear_caches()
+
+    def test_seq_along_lane_softmax_variants(self):
+        """exp2 softmax, ones-in-V row sums and the full-tile mask skip, each alone."""
+        # Each variant recompiles; the combination is covered by the transposed test.
+        self._check_prefill_tiles(
+            (
+                ({"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1"}, (None,)),
+                ({"SGLANG_TPU_RPA_ONES_V": "1"}, (None,)),
+                ({"SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1"}, (None,)),
+            )
+        )
+
+    def test_seq_along_lane_transposed(self):
+        """The transposed prefill tile (scores^T, split fp8 q), alone and with every other tile."""
+        self._check_prefill_tiles(
+            (
+                ({"SGLANG_TPU_RPA_TRANSPOSED": "1"}, (None,)),
+                (
+                    {
+                        "SGLANG_TPU_RPA_TRANSPOSED": "1",
+                        "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1",
+                        "SGLANG_TPU_RPA_EXP2_SOFTMAX": "1",
+                        "SGLANG_TPU_RPA_ONES_V": "1",
+                    },
+                    (None, 128),
+                ),
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -731,15 +731,31 @@ def _validate_dsa(server_args) -> None:
             "DSA on TPU does not support index_init_tokens or index_local_tokens "
             f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
         )
-    # The direct tracer gets the KV cache buffers from the pool's get_state and
-    # set_state. TpuSplitMLATokenToKVPool does not implement them for its own
-    # buffers, so the first compile would fail.
-    # TODO(sglang-torchtpu#1072): implement them and run DSA with the direct
-    # tracer.
-    if cfg.tpu_compile_tracer != "dynamo":
+    _validate_kpool_raw_ring(cfg)
+
+
+def _validate_kpool_raw_ring(cfg) -> None:
+    """The pooled indexer's raw ring (SGLANG_TPU_DSA_KPOOL_RAW_RING) keeps raw
+    rows by request slot, not by page, so nothing that moves pages can carry an
+    open pool's raw rows, and an unchunked prefill would overrun the ring."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_DSA_KPOOL_RAW_RING.get():
+        return
+    if cfg.disaggregation_mode != "null":
         raise ValueError(
-            "DSA on TPU needs --tpu-compile-tracer dynamo, got "
-            f"{cfg.tpu_compile_tracer!r}."
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING does not support --disaggregation-mode "
+            f"{cfg.disaggregation_mode!r}: a P/D transfer moves pages, and the "
+            "ring's raw rows are not paged."
+        )
+    if cfg.enable_prefill_cp:
+        raise ValueError(
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING does not support --enable-prefill-cp."
+        )
+    if cfg.chunked_prefill_size is None or cfg.chunked_prefill_size <= 0:
+        raise ValueError(
+            "SGLANG_TPU_DSA_KPOOL_RAW_RING needs chunked prefill: the ring is sized "
+            "for one chunk per request per step."
         )
 
 
@@ -830,6 +846,14 @@ def _register_attention_backends() -> None:
 
     @register_attention_backend("dsv4")
     def create_tpu_dsv4_backend(runner):
+        from sglang_tpu.models.deepseek_v41.memory_pool import uses_dsv41_pool
+
+        if uses_dsv41_pool(runner.model_config.compress_ratios):
+            from sglang_tpu.models.deepseek_v41.attention_backend import (
+                DSV41TPUAttnBackend,
+            )
+
+            return DSV41TPUAttnBackend(runner)
         from sglang_tpu.dsv4 import DSV4TPUAttnBackend
 
         return DSV4TPUAttnBackend(runner)
@@ -1501,14 +1525,21 @@ class TpuSRTPlatform(SRTPlatform):
     def get_batch_input_device(self, batch) -> str | None:
         """Keep eligible prefill inputs on CPU until backend padding."""
         from sglang.srt.layers.cp.base import get_cp_strategy
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.utils.common import print_warning_once
         from sglang_tpu.allocator_tpu import host_return_allocators
         from sglang_tpu.host_padding import _can_stage_forward_metadata
 
         # TBO, hisparse and beam search have no TPU path, so they need no opt-out.
         allocator = batch.token_to_kv_pool_allocator
+        # Pipeline stages pad prefill to the same buckets, so host-pad it too. A
+        # PD decode server's prebuilt first token keeps the device placement.
+        staged = _can_stage_forward_metadata(batch) or (
+            _can_stage_forward_metadata(batch, allow_pipeline_parallel=True)
+            and batch.forward_mode == ForwardMode.EXTEND
+        )
         checks = (
-            ("forward metadata is not staged", _can_stage_forward_metadata(batch)),
+            ("forward metadata is not staged", staged),
             ("context parallelism is on", get_cp_strategy() is None),
             ("the allocator returns device indices", host_return_allocators(allocator)),
             # Page size 1 uses alloc(), which has no host-return contract.
