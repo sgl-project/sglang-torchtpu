@@ -603,6 +603,44 @@ class TestHybridLinearDirectCompile(CustomTestCase):
 
         self.assertIs(policy.get_direct_compile_kv_pool(), full_kv_pool)
 
+    def test_kv_pool_lifts_topk_capture_buffers(self):
+        """Routed-experts / indexer capture writes process-global buffers in forward.
+
+        Unless direct_compile carries them as mutable state, tracing leaves a
+        placeholder write in the live buffer and the first read after a forward fails.
+        """
+        full_kv_pool = _FullKVPool(2)
+        model_runner = _model_runner()
+        model_runner.token_to_kv_pool = full_kv_pool
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+        experts = SimpleNamespace(device_cache=SimpleNamespace(buffer=torch.zeros(3)))
+        indexer = SimpleNamespace(device_cache=SimpleNamespace(buffer=torch.zeros(4)))
+        module = "sglang_tpu.compilation.decoder_compile_policy"
+
+        with (
+            patch(f"{module}.get_global_experts_capturer", return_value=experts),
+            patch(f"{module}.get_global_indexer_capturer", return_value=indexer),
+        ):
+            kv_pool = policy.get_direct_compile_kv_pool()
+        expected = [
+            *full_kv_pool.get_state(),
+            experts.device_cache.buffer,
+            indexer.device_cache.buffer,
+        ]
+        self.assertEqual(
+            [id(t) for t in kv_pool.get_state()], [id(t) for t in expected]
+        )
+        replacement = [torch.empty_like(t) for t in expected]
+        kv_pool.set_state(replacement)
+        self.assertEqual(
+            [id(t) for t in full_kv_pool.get_state()],
+            [id(t) for t in replacement[:4]],
+        )
+        self.assertIs(experts.device_cache.buffer, replacement[4])
+        self.assertIs(indexer.device_cache.buffer, replacement[5])
+
     def test_trace_derives_conv_weights_from_the_traced_conv1d_weight(self):
         """RadixLinearAttention keeps conv_weights as a view of conv1d.weight.
 
