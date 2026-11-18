@@ -88,6 +88,17 @@ def _empty(spec: SparseMLAKVCacheSpec) -> jax.Array:
     return jnp.zeros(spec.shape, spec.jax_dtype)
 
 
+def _random_fp8_bytes(rng: np.random.Generator, shape) -> np.ndarray:
+    """Random uint8 bytes that are not float8_e4m3fn NaN codes (0x7F / 0xFF).
+
+    The TPU writer canonicalizes NaN (0xFF -> 0x7F) on the fp8 path, so NaN
+    codes do not survive a byte-exact round trip there; real FP8 K/V never
+    holds them (quantization clips to +-448).
+    """
+    raw = rng.integers(0, 256, shape, np.uint8)
+    return np.where((raw & 0x7F) == 0x7F, raw ^ 0x01, raw).astype(np.uint8)
+
+
 def unpack4(words_u32: np.ndarray) -> np.ndarray:
     """Unpack uint32 words `[..., n]` into four uint8 bands `[..., 4, n]`."""
     w = np.asarray(words_u32).astype(np.uint32)
