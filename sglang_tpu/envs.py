@@ -637,7 +637,8 @@ class TpuEnvs:
     # needs); unset follows MK_OPT.
     SGLANG_TPU_MUSE_MK_DEV_MOE_OPT = EnvInt(None)
     # Megakernel top-k override (numerics._topk_iter): "uniform" picks pseudo-random experts
-    # (a hash of the scores), "balanced" also one expert per EP rank group per row. Empty: off.
+    # (a hash of the scores), "balanced" also one expert per EP rank group per row, "fixed"
+    # pseudo-random by row index (ignores the activations). Empty: off.
     SGLANG_TPU_MUSE_MK_DEV_ROUTE = EnvStr("")
     # EP gather arm: comma list of collectives every rank skips (o_ag, pool_ag, u_rs, u_ag, f_ag),
     # to time them by removal; outputs are wrong.

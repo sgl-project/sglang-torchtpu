@@ -84,7 +84,7 @@ def _topk_iter(scores, k):
     idx = jax.lax.broadcasted_iota(jnp.int32, (R, E), 1)
     route = tpu_envs.SGLANG_TPU_MUSE_MK_DEV_ROUTE.get()
     if route:
-        scores = _dev_route_scores(scores, idx)
+        scores = _dev_route_scores(scores, idx, fixed=route == "fixed")
     ids, picks = [], []
     for _ in range(k):
         m = jnp.max(scores, axis=1, keepdims=True)
@@ -103,10 +103,14 @@ def _topk_iter(scores, k):
 _DEV_ROUTE_GROUPS = 8
 
 
-def _dev_route_scores(scores, idx):
+def _dev_route_scores(scores, idx, *, fixed: bool = False):
     """Pseudo-random scores [R, E] for the top-k override: a hash of each score's bf16 bits
-    and its expert lane, so steps differ and ranks agree; masked lanes (bias -1e30) stay out."""
-    bits = jax.lax.bitcast_convert_type(scores.astype(jnp.float32), jnp.int32)
+    and its expert lane, so steps differ and ranks agree; masked lanes (bias -1e30) stay out.
+    fixed: hash the row index instead of the score, so routing ignores the activations."""
+    if fixed:
+        bits = jax.lax.broadcasted_iota(jnp.int32, scores.shape, 0) << 16
+    else:
+        bits = jax.lax.bitcast_convert_type(scores.astype(jnp.float32), jnp.int32)
     h = (bits >> 16) * jnp.int32(-1640531535) + idx * jnp.int32(-2048144777)
     h = h ^ jax.lax.shift_right_logical(h, jnp.int32(15))
     h = h * jnp.int32(-1028477379)
