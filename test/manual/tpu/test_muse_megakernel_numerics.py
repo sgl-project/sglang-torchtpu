@@ -1285,6 +1285,9 @@ def bench_case(
 ) -> None:
     """Wall time per decode step of one compiled executable (``iters`` back-to-back calls,
     one sync); prints MK_BENCH with this rank's ms and the step config's ablation fields."""
+    # built kernels are cached by MKConfig, which does not carry the trace-time dev knobs
+    # (SGLANG_TPU_MUSE_MK_DEV_ROUTE): rebuild for every variant
+    runner.mk._ops.clear()
     st = step_inputs(case)
     kv = runner.pools(case, st)
     L = runner.n_layers
