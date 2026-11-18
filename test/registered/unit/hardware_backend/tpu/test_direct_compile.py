@@ -948,6 +948,7 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(runtime_inputs[0], model.weight)
         self.assertIs(runtime_inputs[1], original_value)
         self.assertIs(runtime_inputs[2], value)
+        self.assertIn("Online weight updates", model._derived_weight_cache_error)
 
     def test_model_extra_tensor_attrs_require_model_and_tensor_values(self):
         with self.assertRaisesRegex(ValueError, "requires model"):

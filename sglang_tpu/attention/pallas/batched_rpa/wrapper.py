@@ -215,6 +215,123 @@ def get_kv_cache_shape(
     )
 
 
+def _transposed_prefill_block_sizes(
+    model_cfgs: configs.ModelConfigs,
+    serve_cfgs: configs.ServingConfigs,
+    capped_vmem_limit_bytes: float,
+) -> configs.BlockSizes:
+    """Prefill blocks for the transposed tile (one sequence per tile).
+
+    Power-of-2 q blocks divide the power-of-2 prefill chunk buckets without a
+    padded tail block; k blocks grow in page steps. Both are capped so the
+    unrolled compute blocks fit IMEM and V^T plus the scores stay in VREGs.
+    """
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
+    num_sublanes = tpu_info.num_sublanes
+    mxu_column_size = tpu_info.mxu_column_size
+    page = serve_cfgs.page_size
+
+    aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
+    aligned_kv_head_dim = utils.align_to(
+        model_cfgs.head_dim, num_lanes // serve_cfgs.packing_kv
+    )
+    heads_per_kv = utils.align_to(
+        model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
+    )
+    aligned_num_q_heads = heads_per_kv * model_cfgs.num_kv_heads
+    bkv_stride = pl.cdiv(model_cfgs.num_kv_heads * 2, serve_cfgs.packing_kv)
+    if utils.has_bank_conflicts(bkv_stride):
+        bkv_stride += 1
+    aligned_num_kv_heads_x2 = bkv_stride * serve_cfgs.packing_kv
+    q_bytes = jnp.dtype(serve_cfgs.dtype_q).itemsize
+    kv_bytes = jnp.dtype(serve_cfgs.dtype_kv).itemsize
+    out_bytes = jnp.dtype(serve_cfgs.dtype_out).itemsize
+    # One MXU-wide compute block of (token, q head) lanes.
+    lanes_c = max(num_lanes, mxu_column_size)
+
+    def vmem_usage(n_buffer: int, bq_sz: int, bkv_sz: int) -> int:
+        bq_array = bq_sz * aligned_num_q_heads * aligned_head_dim
+        bkv_array = (bkv_sz + 2 * page) * aligned_num_kv_heads_x2 * aligned_head_dim
+        buffer_bytes = (
+            bq_array * q_bytes * n_buffer
+            + bkv_array * kv_bytes * n_buffer
+            + bq_array * out_bytes * 2
+        )
+        loaded_bytes = (
+            bq_sz * model_cfgs.num_q_heads * aligned_head_dim * q_bytes
+            + bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim * kv_bytes
+        )
+        # One KV head and compute block of f32 + bf16 scores at a time, V^T with
+        # its ones rows, and the Q^T scratch.
+        qt_bytes = (
+            model_cfgs.num_kv_heads * aligned_kv_head_dim * bq_sz * heads_per_kv
+        ) * kv_bytes
+        vt_bytes = (aligned_kv_head_dim + 2 * num_sublanes) * bkv_sz * 2
+        qk_bytes = bkv_sz * lanes_c * (4 + 2) + vt_bytes + qt_bytes
+        # f32 m and O^T / l carries as rows of lanes.
+        carry_rows = model_cfgs.num_kv_heads * bq_sz * heads_per_kv
+        carry_bytes = carry_rows * (aligned_head_dim // 2 + 3 * num_sublanes) * 4
+        return buffer_bytes + loaded_bytes + qk_bytes + carry_bytes
+
+    def fits(n_buffer: int, bq_sz: int, bkv_sz: int) -> bool:
+        return vmem_usage(n_buffer, bq_sz, bkv_sz) < capped_vmem_limit_bytes
+
+    bkv_step = max(page, utils.align_to(mxu_column_size, page))
+    total_q_pow2 = max(
+        2, 1 << max(1, (max(2, serve_cfgs.total_q_tokens) - 1).bit_length())
+    )
+    bq_sz = min(1 << (mxu_column_size - 1).bit_length(), total_q_pow2)
+    bkv_sz = mxu_column_size
+    # A lookahead ref needs two buffers; 1 token would read as decode.
+    while bq_sz > 2 and vmem_usage(2, bq_sz, bkv_sz) > capped_vmem_limit_bytes:
+        bq_sz //= 2
+    n_buffer = 3
+    while (
+        n_buffer > 2 and vmem_usage(n_buffer, bq_sz, bkv_sz) > capped_vmem_limit_bytes
+    ):
+        n_buffer -= 1
+    if vmem_usage(n_buffer, bq_sz, bkv_sz) > capped_vmem_limit_bytes:
+        raise ValueError(f"Cannot fit a transposed {bq_sz=}, {bkv_sz=} prefill tile.")
+    if bkv_sz < bkv_step and fits(n_buffer, bq_sz, bkv_step):
+        bkv_sz = bkv_step
+
+    # IMEM: at most 64 unrolled compute blocks in the hot full tile.
+    imem_row_cap = max(bq_sz, (64 * lanes_c) // aligned_num_q_heads)
+    max_bq_sz = min(total_q_pow2, 1 << (imem_row_cap.bit_length() - 1))
+    # VREGs: V^T [acc rows, bkv] bf16 and the f32 scores [bkv, lanes_c].
+    max_bkv_sz = utils.align_to(4 * mxu_column_size, page)
+    if model_cfgs.sliding_window is not None:
+        # ~window / 4 tiles waste less masked work outside the band.
+        win_q = max(2, model_cfgs.sliding_window // 4)
+        swa_pow2 = 1 << (win_q.bit_length() - 1)
+        max_bq_sz = min(max_bq_sz, max(min(256, total_q_pow2), swa_pow2))
+        max_bkv_sz = min(max_bkv_sz, max(page, utils.align_to(swa_pow2, page)))
+
+    if bkv_sz >= bkv_step:
+        while bq_sz * 2 <= max_bq_sz:
+            next_bq = bq_sz * 2
+            next_bkv = min(max_bkv_sz, max(bkv_sz, utils.align_to(next_bq, page)))
+            if not fits(n_buffer, next_bq, next_bkv):
+                break
+            bq_sz, bkv_sz = next_bq, next_bkv
+        while bkv_sz + bkv_step <= max_bkv_sz and fits(
+            n_buffer, bq_sz, bkv_sz + bkv_step
+        ):
+            bkv_sz += bkv_step
+
+    # One MXU column width of lanes per compute chunk.
+    lane_unit = max(1, num_lanes // heads_per_kv)
+    target_bq_c = utils.align_to(max(1, lanes_c // heads_per_kv), lane_unit)
+    return configs.BlockSizes(
+        bq_sz=bq_sz,
+        bq_c_sz=math.gcd(bq_sz, min(bq_sz, target_bq_c)),
+        bkv_sz=bkv_sz,
+        batch_size=1,
+        n_buffer=n_buffer,
+    )
+
+
 def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
@@ -564,7 +681,12 @@ def calculate_block_sizes(
     decode_block_sizes = cover_whole_pages(
         find_best_block_sizes(decode_batch_size, n_buffer, 1)
     )
-    prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
+    if serve_cfgs.transposed:
+        prefill_block_sizes = _transposed_prefill_block_sizes(
+            model_cfgs, serve_cfgs, capped_vmem_limit_bytes
+        )
+    else:
+        prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
     # Operator escape hatch. The search above works from a VMEM estimate that
     # does not model everything the compiled program allocates, so on a shape or
@@ -795,6 +917,33 @@ def ragged_paged_attention(
         return_lse=return_lse,
         cp_group_size=cp_group_size,
         attention_scope=attention_scope,
+        skip_full_tile_mask=envs.SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK.get(),
+        # Base-2 m and l would reach the soft cap, the sink term and the LSE.
+        exp2_softmax=(
+            envs.SGLANG_TPU_RPA_EXP2_SOFTMAX.get()
+            and soft_cap is None
+            and attention_sink is None
+            and not return_lse
+        ),
+        ones_v=(
+            envs.SGLANG_TPU_RPA_ONES_V.get()
+            and kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            and head_dim <= 64
+            and attention_sink is None
+            and not return_lse
+        ),
+        # The transposed tile has only the causal mask of a FULL scope.
+        transposed=(
+            envs.SGLANG_TPU_RPA_TRANSPOSED.get()
+            and kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            and head_dim <= 64
+            and q_scale is None
+            and soft_cap is None
+            and attention_sink is None
+            and not return_lse
+            and attention_scope == configs.AttentionScope.FULL
+            and cp_group_size is None
+        ),
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(

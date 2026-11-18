@@ -347,11 +347,17 @@ class TestQblockZeroRope(CustomTestCase):
                     read_rope=read_rope,
                 ).astype(jnp.float32)
             )
-            for read_rope, rope_cache in ((True, cr), (False, cr_nan))
+            for read_rope, rope_cache in (
+                (True, cr),
+                (False, cr_nan),
+                # A model without rope allocates a one-row placeholder.
+                (False, jnp.full((1, 1, 4, 128), 0x7F, jnp.uint8)),
+            )
         ]
         self.assertFalse(np.isnan(outs[0]).any())
         self.assertTrue(outs[0][: sum(q_lens)].any())
         np.testing.assert_array_equal(outs[0], outs[1])
+        np.testing.assert_array_equal(outs[0], outs[2])
 
 
 if __name__ == "__main__":
