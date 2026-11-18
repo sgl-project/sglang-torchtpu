@@ -317,8 +317,10 @@ def _embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            pad_values = [item.pad_value for item in items]
-            placeholder_tensor = torch.as_tensor(pad_values, device="cpu")
+            pad_values = [value for item in items for value in item.padding_values()]
+            placeholder_tensor = torch.as_tensor(
+                pad_values, dtype=torch.int64, device="cpu"
+            )
             # calculate per request items length offset
             items_size = [0]
             items_offsets = []

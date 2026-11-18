@@ -54,6 +54,14 @@ DEFAULT_TIMEOUT = 600
 REPLAY_TEXT_DATASETS = ("sharegpt", "custom")
 
 
+def get_last_gen_throughput(internal_states: List[dict]) -> float:
+    """Sum DP schedulers' recent decode rates; -1 means unavailable."""
+    throughputs = [state.get("last_gen_throughput") for state in internal_states]
+    if not throughputs or any(value is None for value in throughputs):
+        return -1
+    return sum(throughputs)
+
+
 def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
     """
     Get cached_tokens_total and prompt_tokens_total from Prometheus /metrics endpoint.
@@ -492,6 +500,7 @@ def _warmup_cache(
     image_data: Optional[List] = None,
     backend: str = "sglang",
     model_name: Optional[str] = None,
+    num_dp_ranks: int = 1,
 ):
     """Warm up the cache by sending prefix tokens to populate the radix/prefix cache.
 
@@ -504,6 +513,7 @@ def _warmup_cache(
         image_data: Optional image data for VLM models
         backend: Backend server type ("sglang" or "vllm")
         model_name: Model name (required for vllm backend)
+        num_dp_ranks: Number of SGLang DP ranks with separate prefix caches
     """
     cached_token_len = int(input_len * cache_hit_rate)
     if cached_token_len <= 0:
@@ -540,12 +550,25 @@ def _warmup_cache(
             cache_warmup_payload["image_data"] = image_data
         gen_url = url + "/generate"
 
-    warmup_response = requests.post(
-        gen_url,
-        json=cache_warmup_payload,
-        timeout=DEFAULT_TIMEOUT,
+    # An undersized batch may be measured on a different replica than it warmed.
+    # Populate every replica so the measurement does not depend on the router cursor.
+    warmup_ranks = (
+        range(num_dp_ranks)
+        if backend == "sglang" and len(input_ids) < num_dp_ranks
+        else [None]
     )
-    warmup_response.raise_for_status()
+    for rank in warmup_ranks:
+        payload = (
+            cache_warmup_payload
+            if rank is None
+            else {**cache_warmup_payload, "routed_dp_rank": rank}
+        )
+        warmup_response = requests.post(
+            gen_url,
+            json=payload,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        warmup_response.raise_for_status()
     print("Cache warmup completed")
 
 
@@ -643,6 +666,7 @@ def run_one_case(
     apply_chat_template: bool = False,
     flush_hicache_storage: bool = False,
     input_len_list: str = "",
+    num_dp_ranks: int = 1,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -834,6 +858,7 @@ def run_one_case(
             image_data=image_data,
             backend=backend,
             model_name=model_name,
+            num_dp_ranks=num_dp_ranks,
         )
 
     # Turn on profiler
@@ -967,14 +992,11 @@ def run_one_case(
         server_info = response.json()
         internal_states = server_info.get("internal_states", [])
         acc_length = -1
-        last_gen_throughput = -1
+        last_gen_throughput = get_last_gen_throughput(internal_states)
         for internal_state in internal_states:
             val_acc = internal_state.get("avg_spec_accept_length")
             if val_acc is not None:
                 acc_length = val_acc
-            val_thr = internal_state.get("last_gen_throughput")
-            if val_thr is not None:
-                last_gen_throughput = val_thr
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)
@@ -1426,6 +1448,26 @@ def run_benchmark_internal(
         print("=" * 8 + " Warmup Begin " + "=" * 8)
         print(f"Warmup with batch_size={batch_size_unique}")
         for bs in batch_size_unique:
+            kv_footprint_bs = (
+                bs if effective_running_cap is None else min(bs, effective_running_cap)
+            )
+            # Do not warm batches that every measured shape will skip.
+            if should_skip_due_to_max_running_requests(
+                bs, skip_max_running_requests_threshold
+            ) or all(
+                should_skip_due_to_token_capacity(
+                    kv_footprint_bs,
+                    il,
+                    ol,
+                    skip_token_capacity_threshold,
+                    bench_args.input_len_list,
+                    num_dp_ranks,
+                )
+                for il, ol in itertools.product(
+                    bench_args.input_len, bench_args.output_len
+                )
+            ):
+                continue
             run_one_case(
                 base_url,
                 batch_size=bs,
@@ -1446,6 +1488,7 @@ def run_benchmark_internal(
                 model_name=model_name,
                 fake_prefill=bench_args.fake_prefill,
                 flush_hicache_storage=bench_args.flush_hicache_storage,
+                num_dp_ranks=num_dp_ranks,
                 lora_name=bench_args.lora_name,
                 lora_request_distribution=bench_args.lora_request_distribution,
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
@@ -1498,6 +1541,7 @@ def run_benchmark_internal(
                     model_name=model_name,
                     fake_prefill=bench_args.fake_prefill,
                     flush_hicache_storage=bench_args.flush_hicache_storage,
+                    num_dp_ranks=num_dp_ranks,
                     lora_name=bench_args.lora_name,
                     lora_request_distribution=bench_args.lora_request_distribution,
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
@@ -1562,6 +1606,7 @@ def run_benchmark_internal(
                             model_name=model_name,
                             fake_prefill=bench_args.fake_prefill,
                             flush_hicache_storage=bench_args.flush_hicache_storage,
+                            num_dp_ranks=num_dp_ranks,
                             lora_name=bench_args.lora_name,
                             lora_request_distribution=bench_args.lora_request_distribution,
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,

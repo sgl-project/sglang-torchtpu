@@ -46,7 +46,7 @@ class TestFusedActScales(CustomTestCase):
     # N2: 2 * intermediate (gate || up).
     G, M, K, N2 = 4, 512, 256, 512
 
-    def _fused_vs_unfused(self, quant_mode, fuse_act="silu"):
+    def _fused_vs_unfused(self, quant_mode, fuse_act="silu", max_rel_diff=0.02):
         from sglang_tpu.moe.pallas.gmm_v2 import apply_act_fn, gmm_v2
 
         key = jax.random.key(0)
@@ -81,7 +81,7 @@ class TestFusedActScales(CustomTestCase):
         scale_ = jnp.max(jnp.abs(ref.astype(jnp.float32))) + 1e-9
         self.assertLess(
             float(diff / scale_),
-            0.02,
+            max_rel_diff,
             f"fused act diverges from unfused reference for {quant_mode} scales",
         )
 
@@ -97,6 +97,15 @@ class TestFusedActScales(CustomTestCase):
     def test_fused_situ_bf16(self):
         # Kimi-K3's SiTU params, encoded as gmm_v2 parses them.
         self._fused_vs_unfused("bf16", fuse_act="situ:4.0:25.0")
+
+    def test_fused_clamped_silu_runs_in_f32(self):
+        # GLM's clamped SiLU, encoded as fused_moe_op passes it, with the limit
+        # inside the pre-activation range. The unfused op and moe_stream apply
+        # it in f32: fused in f32 it differs by 5e-4 here (rare bf16 ulps), in
+        # the bf16 accumulator dtype by 7e-3.
+        self._fused_vs_unfused(
+            "channelwise", fuse_act="silu_and_mul_clamp:0.25", max_rel_diff=2e-3
+        )
 
     def test_misaligned_gate_up_boundary_asserts(self):
         from sglang_tpu.moe.pallas.gmm_v2 import gmm_v2

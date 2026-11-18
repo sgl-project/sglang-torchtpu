@@ -11,7 +11,11 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
-from sglang_tpu.hooks.all_gather_via_all_reduce import all_gather_into_tensor
+from sglang_tpu.hooks.all_gather_via_all_reduce import (
+    gather_and_crop_vocab,
+    gather_attn_tp_logits,
+    wrap_logits_gatherer,
+)
 from sglang_tpu.hooks.attn_residual import register_attn_residual_ops
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
 from sglang_tpu.hooks.cpu_pinning import bind_rank_cpu_set, pin_scheduler_main_thread
@@ -20,6 +24,8 @@ from sglang_tpu.hooks.dflash_mla import (
     select_dflash_mla_attention,
 )
 from sglang_tpu.hooks.draft_kv_pool import (
+    attach_unified_draft_kv_pool,
+    derive_unified_draft_pool_sizes,
     draft_cell_size_per_token,
     draft_mha_pool_class,
 )
@@ -35,11 +41,14 @@ from sglang_tpu.hooks.encoder import (
     reject_encoder_dp,
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
-from sglang_tpu.hooks.glm_flash_megakernel import (
-    drop_freed_glm_flash_megakernel_request,
-    flush_glm_flash_megakernel_request,
-    route_glm_flash_megakernel,
+from sglang_tpu.hooks.glm5_next_vision import (
+    attach_glm5_next_vision_runner,
+    compile_glm5_next_decoder_only,
+    defer_host_staged_mm_feature_move,
+    encode_glm5_next_vision_on_host,
+    encode_with_glm5_next_vision_runner,
 )
+from sglang_tpu.hooks.glm_flash_megakernel import route_glm_flash_megakernel
 from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.k3_megakernel import (
@@ -81,6 +90,7 @@ from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
+from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
@@ -93,8 +103,17 @@ from sglang_tpu.hooks.twolevel_allreduce import (
     row_parallel_linear_forward as twolevel_row_parallel_linear_forward,
 )
 from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
+from sglang_tpu.models.deepseek_v41.hooks import hook_specs as dsv41_hooks
 
 logger = logging.getLogger(__name__)
+
+
+def _select_tpu_ep_local_runai_loader(result, load_config, model_config=None):
+    # The model-loader module is heavy; keep it out of plugin startup.
+    from sglang_tpu.ep_weight_shard import select_tpu_ep_local_runai_loader
+
+    return select_tpu_ep_local_runai_loader(result, load_config, model_config)
+
 
 # (target, hook, hook_type) triples.
 
@@ -231,6 +250,36 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
+        "sglang.srt.models.glm5_next.Glm5NextVisionModel.__init__",
+        attach_glm5_next_vision_runner,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextVisionModel.forward",
+        encode_with_glm5_next_vision_runner,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.__init__",
+        compile_glm5_next_decoder_only,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.get_image_feature",
+        encode_glm5_next_vision_on_host,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.get_video_feature",
+        encode_glm5_next_vision_on_host,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.managers.mm_schedule._can_skip_pre_embed_feature_move",
+        defer_host_staged_mm_feature_move,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.load_weights",
         bind_glm5_next_kda_weights,
         HookType.AFTER,
@@ -244,16 +293,6 @@ HOOKS: list[tuple] = [
         "sglang_tpu.graph_runner.tpu_graph_runner.TpuGraphRunner.__init__",
         route_glm_flash_megakernel,
         HookType.AFTER,
-    ),
-    (
-        "sglang.srt.mem_cache.memory_pool.ReqToTokenPool.free_rows",
-        drop_freed_glm_flash_megakernel_request,
-        HookType.BEFORE,
-    ),
-    (
-        "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.checkpoint",
-        flush_glm_flash_megakernel_request,
-        HookType.BEFORE,
     ),
     (
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",
@@ -276,8 +315,18 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
-        "sglang.srt.distributed.parallel_state.GroupCoordinator.all_gather_into_tensor",
-        all_gather_into_tensor,
+        "sglang.srt.layers.logits_processor.LogitsProcessor.__init__",
+        wrap_logits_gatherer,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.layers.logits_processor.LogitsProcessor._gather_attn_tp_logits",
+        gather_attn_tp_logits,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.dspark.gather_and_crop_vocab",
+        gather_and_crop_vocab,
         HookType.AROUND,
     ),
     (
@@ -316,6 +365,21 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._profile_available_bytes",
+        reserve_pp_buffered_handoff,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._derive_pool_sizes",
+        derive_unified_draft_pool_sizes,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_token_to_kv_pool_allocator",
+        attach_unified_draft_kv_pool,
+        HookType.AROUND,
+    ),
+    (
         "sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator.__init__",
         size_tpu_dsa_kv_pool,
         HookType.AFTER,
@@ -340,6 +404,11 @@ HOOKS: list[tuple] = [
         broadcast_undeferred,
         HookType.AROUND,
     ),
+    (
+        "sglang.srt.model_loader.loader.get_model_loader",
+        _select_tpu_ep_local_runai_loader,
+        HookType.AFTER,
+    ),
 ]
 
 HOOKS.extend(dsv4_hooks())
@@ -355,6 +424,8 @@ HOOKS.extend(hook_specs())
 HOOKS.extend(padded_logits_sampling_hooks())
 
 HOOKS.extend(logprob_grid_hooks())
+# After dsv4_hooks: the V4.1 pool hooks must be the outer wrapper.
+HOOKS.extend(dsv41_hooks())
 
 _registered = False
 

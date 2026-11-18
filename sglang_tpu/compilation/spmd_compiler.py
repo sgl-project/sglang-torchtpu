@@ -127,6 +127,8 @@ class SPMDCompiler:
         self.group = group
         self.rank = dist.get_rank(group)
         self.size = dist.get_world_size(group)
+        self.global_rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
         self.verify_spmd_safe = verify_spmd_safe
         self.submissions: dict[str, Submission] = {}
         self.mlirs: dict[str, str] = {}
@@ -141,9 +143,12 @@ class SPMDCompiler:
             Path(os.environ["VERIFY_SPMD_SAFE_DUMP_DIR"]) if verify_spmd_safe else None
         )
         self._serializer: ThreadPoolExecutor | None = None
+        self._verification_group = None
         if verify_spmd_safe:
-            if self.size != dist.get_world_size():
-                raise ValueError("SPMD verification requires the full TPU TP group")
+            # All engines must finish tracing before any worker exits: the
+            # serving launcher treats an early worker exit as startup failure.
+            if self.size != self.world_size:
+                self._verification_group = dist.new_group(backend="gloo")
             return
         runtime = None
         error: str | None = None
@@ -164,8 +169,8 @@ class SPMDCompiler:
                 LIBTPU_INIT_ARGS=os.environ.get("LIBTPU_INIT_ARGS", ""),
                 cost_profile=cost_profile,
             )
-            if self.size != len(mapping) or self.size != dist.get_world_size():
-                error = "only the full TPU TP group is supported"
+            if len(mapping) != self.world_size:
+                error = "the TPU session and distributed world must have the same size"
         except Exception as caught:
             error = f"cannot {stage}: {type(caught).__name__}: {caught}"
         records = self.gather((runtime, error))
@@ -330,13 +335,16 @@ class SPMDCompiler:
         for graph in self.mlirs.keys() & (
             differences.keys() | layout_differences.keys()
         ):
-            prefix = self.directory / f"{digest(graph)}-rank-{self.rank}"
+            prefix = self.directory / f"{digest(graph)}-rank-{self.global_rank}"
             with gzip.open(f"{prefix}.mlir.gz", "wt") as output:
                 output.write(self.mlirs[graph])
         result = {
             "passed": not errors,
-            "world_size": self.size,
-            "rank": self.rank,
+            "world_size": self.world_size,
+            "rank": self.global_rank,
+            "group_ranks": [
+                dist.get_global_rank(self.group, i) for i in range(self.size)
+            ],
             "pid": os.getpid(),
             "keys": keys,
             "mlir_hashes": mlir_hashes,
@@ -345,11 +353,12 @@ class SPMDCompiler:
             "layout_differences": layout_differences,
             "errors": errors,
         }
-        (self.directory / f"worker-{self.rank}.json").write_text(
-            canonical(result) + "\n"
-        )
-        # Every worker has retained its evidence before the parent observes exits.
-        dist.barrier(group=self.group)
+        marker = self.directory / f"worker-{self.global_rank}.json.tmp"
+        marker.write_text(canonical(result) + "\n")
+        # Parents may stop the launcher as soon as all local results are visible.
+        # Retain every rank's diagnostics and finish collectives before publishing.
+        dist.barrier(group=self._verification_group or self.group)
+        marker.replace(self.directory / f"worker-{self.global_rank}.json")
         if self.rank == 0:
             logger.info("SPMD_VERIFICATION_GRAPHS %s", canonical(result))
         # Verification never executes pending calls or announces server readiness.
@@ -395,12 +404,17 @@ class SPMDCompiler:
                     header[0] = (
                         True,
                         len(serialized) if serialized is not None else None,
+                        executable.subslice_origin(),
                     )
                 except Exception as caught:
-                    header[0] = (False, f"{type(caught).__name__}: {str(caught)[:512]}")
+                    header[0] = (
+                        False,
+                        f"{type(caught).__name__}: {str(caught)[:512]}",
+                        None,
+                    )
             source = dist.get_global_rank(self.group, item.owner)
             dist.broadcast_object_list(header, src=source, group=self.group)
-            success, length = header[0]
+            success, length, subslice_origin = header[0]
             with self.coordinate_errors("preparing transfer"):
                 if not success:
                     raise RuntimeError(length)
@@ -414,15 +428,21 @@ class SPMDCompiler:
                 dist.broadcast(buffer, src=source, group=self.group)
             with self.coordinate_errors("loading executable"):
                 if executable is None:
+                    # Serialized bytes omit the TPU subslice's chip coordinates.
+                    # Preserve the owner's origin when loading on its TP peers.
                     executable = tc.load_serialized_executable(
                         zstandard.ZstdDecompressor().decompress(
                             buffer.numpy().tobytes()
-                        )
+                        ),
+                        subslice_origin=subslice_origin,
                     )
                 item.executable = executable
 
     def clear(self) -> None:
         """Wait for native work and release this queue's graphs and submissions."""
+        if self._verification_group is not None:
+            dist.destroy_process_group(self._verification_group)
+            self._verification_group = None
         if self._serializer is not None:
             self._serializer.shutdown(wait=True, cancel_futures=True)
         for item in self.submissions.values():

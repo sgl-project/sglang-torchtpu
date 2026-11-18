@@ -31,6 +31,7 @@ ROUTES = {
     "qwen3_coder": (20, 160, 3, 8, 2048),  # EP8, top-8, recipe threshold
     "qwen35": (64, 512, 2, 10, 1024),  # EP8, top-10, recipe threshold
     "k3": (28, 896, 5, 16, 512),  # EP32, top-16, recipe threshold
+    "glm53": (36, 288, 3, 8, 512),  # GLM-5.3-Flash EP8, top-8, recipe threshold
 }
 
 
@@ -335,12 +336,99 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
             with self.subTest(route=route_name, m=20, ep=ep, sc=1):
                 self._check("bf16", route_name, 20, ep=ep, dense=False, sc=1)
 
-    def test_dense_permute_with_gather_unpermute(self):
-        # m < threshold <= m * topk: one-hot permute, gather combine.
-        for ep in (True, False):
-            for sc in (0, 1):
-                with self.subTest(ep=ep, sc=sc):
-                    self._check("bf16", "k3", 40, ep=ep, dense=True, sc=sc)
+    def test_non_finite_live_token_stays_in_its_own_row(self):
+        """The one-hot permute is a matmul over every token, so one live token
+        with a NaN/inf hidden state (0 * NaN) turned every token's output NaN."""
+        m, poisoned = 5, 2
+        others = [i for i in range(m) if i != poisoned]
+        for route_name, ep in itertools.product(ROUTES, (True, False)):
+            recipe_thr = ROUTES[route_name][4]
+            run = self._fn("bf16", route_name, ep, False, recipe_thr, 0, False)
+            rng = np.random.default_rng(7)
+            ids, w = _routing(m, ROUTES[route_name], ep, rng)
+            hidden = rng.standard_normal((m, H)).astype(np.float32)
+            clean = run(hidden, ids, w)
+            bad_h, bad_w = hidden.copy(), w.copy()
+            bad_h[poisoned] = np.nan
+            bad_h[poisoned, ::5] = np.inf
+            # The router derives the weights from the same hidden state, so in
+            # serving they are NaN too; poisoning them alone isolates the combine.
+            bad_w[poisoned] = np.nan
+            inputs = {
+                "hidden": (bad_h, w),
+                "hidden+weights": (bad_h, bad_w),
+                "weights": (hidden, bad_w),
+            }
+            for poison, (h, tw) in inputs.items():
+                with self.subTest(route=route_name, ep=ep, poison=poison):
+                    bad = run(h, ids, tw)
+                    self.assertTrue(np.all(np.isfinite(bad[others])))
+                    np.testing.assert_array_equal(bad[others], clean[others])
+
+    def test_gather_permute_with_the_sparse_core_combine(self):
+        # m < threshold <= m * topk: the permute is one-hot and the combine
+        # gathers. With gather_permute_with_sc_combine (Kimi-K3 static fp8
+        # moe_front / latent_up) and the SparseCore combine, the permute gathers
+        # too: the one-hot permute feeding that combine gave wrong tokens there.
+        from sglang_tpu.moe.pallas import fused_moe_op
+
+        e_local, e_global, rank, topk, thr = ROUTES["k3"]
+        m = 40
+        self.assertLess(m, thr)
+        self.assertGreaterEqual(m * topk, thr)
+        w1, w2, kw, _ = self._weights_for("bf16", "k3")
+        rng = np.random.default_rng(m)
+        hidden = jnp.asarray(rng.standard_normal((m, H)), jnp.bfloat16)
+        for ep, sc, force in itertools.product((True, False), (0, 1), (0, 1)):
+            with self.subTest(ep=ep, sc=sc, force=force):
+                ids, w = _routing(m, ROUTES["k3"], ep, rng)
+                route_kw = (
+                    dict(
+                        global_num_experts=e_global, expert_group_offset=rank * e_local
+                    )
+                    if ep
+                    else {}
+                )
+
+                def run(threshold):
+                    # A fresh jit per call, so the spy sees the trace.
+                    fn = jax.jit(
+                        lambda h: fused_moe_op._fused_moe_jax(
+                            h,
+                            w1,
+                            w2,
+                            jnp.asarray(w, jnp.bfloat16),
+                            jnp.asarray(ids),
+                            kw["w1_scale"],
+                            kw["w2_scale"],
+                            None,
+                            None,
+                            topk,
+                            kw["act"],
+                            use_sc_gather=sc,
+                            w_quant_bits=kw["w_quant_bits"],
+                            permute_dense_threshold=threshold,
+                            gather_permute_with_sc_combine=force,
+                            **route_kw,
+                        )
+                    )
+                    with mock.patch.object(
+                        jax.nn, "one_hot", wraps=jax.nn.one_hot
+                    ) as one_hot:
+                        out = jax.block_until_ready(fn(hidden))
+                    classes = [call.args[1] for call in one_hot.call_args_list]
+                    return np.asarray(out.astype(jnp.float32)), classes
+
+                mixed, classes = run(thr)
+                # Traced (the group-size count is a one-hot over experts); a
+                # one-hot over the m tokens is the permute.
+                self.assertTrue(classes)
+                if sc and force:
+                    self.assertNotIn(m, classes)
+                else:
+                    self.assertIn(m, classes)
+                gather, _ = run(0)
+                np.testing.assert_array_equal(mixed, gather)
 
     def test_quantized_weights(self):
         cases = [
@@ -369,6 +457,40 @@ class TestFusedMoEPaddedTokens(CustomTestCase):
                         dense=False,
                         sc=sc,
                         no_combine=True,
+                    )
+
+    def test_live_nonfinite_token_stays_local(self):
+        """A live token with a non-finite hidden state or routing weight must not
+        change any other token's output, on the one-hot and the gather paths."""
+        cases = (
+            ("glm53", 64, True),  # one-hot permute, gather combine (c=64 decode)
+            ("glm53", 20, True),  # one-hot permute and combine
+            ("k3", 20, True),
+            ("glm53", 64, False),
+        )
+        for (route_name, m, dense), ep in itertools.product(cases, (True, False)):
+            thr = ROUTES[route_name][4] if dense else 0
+            run = self._fn("bf16", route_name, ep, False, thr, 0, False)
+            rng = np.random.default_rng(31 * m + thr)
+            ids, w = _routing(m, ROUTES[route_name], ep, rng)
+            hidden = rng.standard_normal((m, H)).astype(np.float32)
+            clean = run(hidden, ids, w)
+            bad_tok = m // 3
+            others = np.arange(m) != bad_tok
+            for poison in ("hidden_nan", "hidden_inf", "weight_nan"):
+                tag = f"{route_name} m={m} thr={thr} ep={ep} {poison}"
+                bad_h, bad_w = hidden.copy(), w.copy()
+                if poison == "hidden_nan":
+                    bad_h[bad_tok] = np.nan
+                elif poison == "hidden_inf":
+                    bad_h[bad_tok, ::5] = np.inf
+                else:
+                    bad_w[bad_tok, 0] = np.nan
+                with self.subTest(tag):
+                    bad = run(bad_h, ids, bad_w)
+                    self.assertTrue(np.all(np.isfinite(bad[others])), tag)
+                    np.testing.assert_array_equal(
+                        bad[others], clean[others], err_msg=tag
                     )
 
     def test_local_ids_with_dropped_slots_match_global_ids(self):

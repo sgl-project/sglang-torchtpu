@@ -289,6 +289,65 @@ class TestPrefillBlockSizes(CustomTestCase):
         self.assertEqual(tp2_blocks.bq_sz, 512)
         self.assertEqual(tp2_blocks.bkv_sz, 512)
 
+    def test_128_head_pp8_shrinks_bq_and_grows_bkv(self):
+        """Muse Spark PP8 (128q/16kv, d=64) overflows VMEM at bq_sz=256 and
+        bq_sz=128; prefill shrinks bq_sz to 64 while preserving triple
+        buffering and grows full-attention bkv_sz to 512 (keeping SWA at 256)."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        for kv_layout in (
+            configs.KVLayout.SEQ_ALONG_LANE,
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+        ):
+            for dtype_kv in (jnp.float8_e4m3fn, jnp.bfloat16):
+                with tpu_info_for_cpu_export():
+                    full_model = configs.ModelConfigs(
+                        num_q_heads=128,
+                        num_kv_heads=16,
+                        head_dim=64,
+                        mask_value=float("-inf"),
+                    )
+                    swa_model = configs.ModelConfigs(
+                        num_q_heads=128,
+                        num_kv_heads=16,
+                        head_dim=64,
+                        mask_value=float("-inf"),
+                        sliding_window=2048,
+                    )
+                    serve = configs.ServingConfigs(
+                        num_seqs=8,
+                        num_page_indices=8 * 256,
+                        total_q_tokens=1024,
+                        dtype_q=jnp.bfloat16,
+                        dtype_kv=dtype_kv,
+                        dtype_out=jnp.bfloat16,
+                        page_size=256,
+                        kv_layout=kv_layout,
+                    )
+                    _, full_prefill = wrapper.calculate_block_sizes(
+                        full_model, serve, 67108864
+                    )
+                    _, swa_prefill = wrapper.calculate_block_sizes(
+                        swa_model, serve, 67108864
+                    )
+                self.assertEqual(
+                    (
+                        full_prefill.bq_sz,
+                        full_prefill.bq_c_sz,
+                        full_prefill.bkv_sz,
+                        full_prefill.batch_size,
+                        full_prefill.n_buffer,
+                    ),
+                    (64, 16, 512, 1, 3),
+                )
+                self.assertEqual(
+                    (swa_prefill.bq_sz, swa_prefill.bkv_sz, swa_prefill.n_buffer),
+                    (64, 256, 3),
+                )
+
     def test_k_block_grows_by_at_most_one_q_block(self):
         """Wider bkv_sz / bq_sz ratios are unmeasured, so 32q/2kv stops at 512
         even though VMEM would fit a wider k block."""

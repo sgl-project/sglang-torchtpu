@@ -226,6 +226,34 @@ class TestLogitsProcessorGating(CustomTestCase):
         policy.owner = runner.model.language_model
         self.assertFalse(policy._compiles_logits_processor())
 
+    def test_a_model_mounted_owner_is_classified_by_its_own_logits_stack(self):
+        # Bailing/Ling-3 VL mounts a full ForCausalLM (logits stack inside)
+        # on `.model`; Qwen3-VL mounts a bare LLM there and keeps the stack
+        # on the wrapper. With both attributes present, the bare
+        # `.language_model` owner stays eager even though the sibling
+        # `.model` carries its own stack — the gate checks the owner
+        # itself, not any mounted model.
+        runner = _model_runner()
+        runner.model = SimpleNamespace(model=SimpleNamespace(logits_processor=object()))
+        policy = _policy(runner)
+        policy.owner = runner.model.model
+        self.assertTrue(policy._compiles_logits_processor())
+
+        runner.model = SimpleNamespace(
+            model=SimpleNamespace(), logits_processor=object()
+        )
+        policy = _policy(runner)
+        policy.owner = runner.model.model
+        self.assertFalse(policy._compiles_logits_processor())
+
+        runner.model = SimpleNamespace(
+            model=SimpleNamespace(logits_processor=object()),
+            language_model=SimpleNamespace(),
+        )
+        policy = _policy(runner)
+        policy.owner = runner.model.language_model
+        self.assertFalse(policy._compiles_logits_processor())
+
     def test_non_last_stage_key_ignores_the_logits_mode(self):
         policy = _policy(_model_runner(_pp_group(first=False, last=False)))
         forward_batch = SimpleNamespace(

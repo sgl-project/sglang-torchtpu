@@ -151,7 +151,15 @@ class TestSharedCompileProfileAgreement(CustomTestCase):
             json.dumps({"schema_version": 1, "default_seconds": 2, "families": {}})
         )
 
-    def _start(self, profile, peer=lambda record: record, **kwargs):
+    def _start(
+        self,
+        profile,
+        peer=lambda record: record,
+        *,
+        world_size=2,
+        device_count=None,
+        **kwargs,
+    ):
         """Rank 0 of two; ``peer`` maps rank 0's gathered record to rank 1's."""
         env = {
             "SGLANG_TPU_SHARED_COMPILE_COST_PROFILE": profile,
@@ -161,15 +169,21 @@ class TestSharedCompileProfileAgreement(CustomTestCase):
         with (
             patch.dict(os.environ, env),
             patch.object(spmd_compiler.dist, "get_rank", return_value=0),
-            patch.object(spmd_compiler.dist, "get_world_size", return_value=2),
+            patch.object(
+                spmd_compiler.dist,
+                "get_world_size",
+                side_effect=lambda group=None: world_size if group is None else 2,
+            ),
             patch.object(
                 spmd_compiler.device_mesh,
                 "get_device_assignment",
-                return_value=[0, 1],
+                return_value=list(
+                    range(world_size if device_count is None else device_count)
+                ),
             ),
             patch.object(SPMDCompiler, "gather", gather),
         ):
-            compiler = SPMDCompiler(None, **kwargs)
+            compiler = SPMDCompiler(object(), **kwargs)
         if compiler._serializer is not None:
             compiler._serializer.shutdown()
         return compiler
@@ -177,6 +191,15 @@ class TestSharedCompileProfileAgreement(CustomTestCase):
     def test_ranks_sharing_a_profile_load_it(self):
         compiler = self._start(str(self.path))
         self.assertEqual(compiler._estimate("any:[[[1]]]"), 2.0)
+
+    def test_tp_subgroup_shares_within_the_native_session(self):
+        compiler = self._start(str(self.path), world_size=4)
+        self.assertEqual((compiler.size, compiler.world_size), (2, 4))
+        self.assertEqual(_owners(compiler, ["g:1", "g:2", "g:3"]), [0, 1, 0])
+
+    def test_native_session_must_match_the_distributed_world(self):
+        with self.assertRaisesRegex(ValueError, "session and distributed world"):
+            self._start(str(self.path), world_size=4, device_count=2)
 
     def test_a_rank_that_cannot_load_the_profile_fails_every_rank(self):
         # Rank 0 reports its failure through the gather instead of raising

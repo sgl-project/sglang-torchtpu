@@ -227,26 +227,22 @@ class TestKimiK3StaticFp8Selector(CustomTestCase):
                 TpuSRTPlatform().apply_server_args_defaults(mock.Mock())
 
 
-class TestKimiK3StaticFp8SpecBatch(CustomTestCase):
-    def test_latent_up_needs_one_request_under_speculation(self):
-        from sglang_tpu.kimi_k3 import check_static_fp8_spec_batch as check
-
-        latent_up = frozenset({"moe_front", "latent_up"})
-        check(latent_up, speculative_algorithm="DSPARK", max_running_requests=1)
-        check(latent_up, speculative_algorithm=None, max_running_requests=4)
-        check(
-            frozenset({"moe_front"}),
-            speculative_algorithm="DSPARK",
-            max_running_requests=4,
+class TestKimiK3StaticFp8MoePermute(CustomTestCase):
+    def test_moe_front_or_latent_up_pins_the_gather_permute(self):
+        from sglang_tpu.tpu_platform import (
+            _pin_moe_gather_permute_for_static_fp8 as pin,
         )
-        for n in (4, None):
-            with self.subTest(max_running_requests=n):
-                with self.assertRaisesRegex(ValueError, "max-running-requests 1"):
-                    check(
-                        latent_up,
-                        speculative_algorithm="DSPARK",
-                        max_running_requests=n,
-                    )
+
+        flag = tpu_envs.SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE
+        for parts, expected in (
+            (frozenset(), False),
+            (frozenset({"kda_qkvg"}), False),
+            (frozenset({"moe_front"}), True),
+            (frozenset({"latent_up", "kda_qkvg"}), True),
+        ):
+            with self.subTest(parts=sorted(parts)), flag.override(False):
+                pin(parts)
+                self.assertIs(flag.get(), expected)
 
 
 class TestStaticFp8PallasGemvGate(CustomTestCase):

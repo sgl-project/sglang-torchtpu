@@ -60,6 +60,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.envs import envs
+from sglang_tpu.host_padding import ordinary_compiled_forward
 from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 # Pure-logic tests: CPU tensors only, and the shim's import chain is
@@ -210,6 +211,25 @@ class TestHostStagedPrefillInputs(CustomTestCase):
             )
             platform = TpuSRTPlatform()
             self.assertEqual(platform.get_batch_input_device(batch), "cpu")
+            # Pipeline stages pad prefill to the same buckets; a PD decode
+            # server's prebuilt first token and DP attention still do not.
+            with get_context().override_server_args(
+                enable_torch_compile=True, pp_size=2
+            ):
+                batch.forward_mode = ForwardMode.EXTEND
+                self.assertEqual(platform.get_batch_input_device(batch), "cpu")
+                batch.forward_mode = ForwardMode.PREBUILT
+                self.assertIsNone(platform.get_batch_input_device(batch))
+                batch.forward_mode = ForwardMode.EXTEND
+            with get_context().override_server_args(
+                enable_torch_compile=True, pp_size=2, tp_size=2, attn_dp_size=2
+            ):
+                self.assertFalse(
+                    ordinary_compiled_forward(
+                        batch.model_config, allow_pipeline_parallel=True
+                    )
+                )
+                self.assertIsNone(platform.get_batch_input_device(batch))
             with get_schedule().override(enable_mixed_chunk=True):
                 self.assertIsNone(platform.get_batch_input_device(batch))
             batch.spec_algorithm = SpeculativeAlgorithm.EAGLE

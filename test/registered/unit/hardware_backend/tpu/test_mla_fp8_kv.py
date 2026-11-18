@@ -102,29 +102,40 @@ class TestZerosKvBuffer(CustomTestCase):
         # The KV budget divides free memory by bytes_per_token, so it must count
         # every buffer, the pooled indexer's bf16 raw buffer included.
         for index_kpool in (1, 4):
-            with self.subTest(index_kpool=index_kpool):
-                kwargs = dict(
-                    index_head_dim=128,
-                    index_key_layers=[True, False, True],
-                    index_kpool=index_kpool,
-                )
-                pool = TpuSplitMLATokenToKVPool(
-                    size=64,
-                    page_size=32,
-                    dtype=FP8,
-                    kv_lora_rank=512,
-                    qk_rope_head_dim=0,
-                    layer_num=3,
-                    device="cpu",
-                    enable_memory_saver=False,
-                    **kwargs,
-                )
-                self.assertEqual(
-                    pool.get_kv_size_bytes(),
-                    TpuSplitMLATokenToKVPool.bytes_per_token(**kwargs)
-                    * pool.num_pages
-                    * pool.page_size,
-                )
+            for qk_rope_head_dim in (64, 0):
+                with self.subTest(
+                    index_kpool=index_kpool, qk_rope_head_dim=qk_rope_head_dim
+                ):
+                    kwargs = dict(
+                        index_head_dim=128,
+                        index_key_layers=[True, False, True],
+                        index_kpool=index_kpool,
+                    )
+                    pool = TpuSplitMLATokenToKVPool(
+                        size=64,
+                        page_size=32,
+                        dtype=FP8,
+                        kv_lora_rank=512,
+                        qk_rope_head_dim=qk_rope_head_dim,
+                        layer_num=3,
+                        device="cpu",
+                        enable_memory_saver=False,
+                        **kwargs,
+                    )
+                    placeholder_bytes = (
+                        0
+                        if qk_rope_head_dim > 0
+                        else sum(buf.nbytes for buf in pool.rope_buffer)
+                    )
+                    self.assertEqual(
+                        pool.get_kv_size_bytes(),
+                        TpuSplitMLATokenToKVPool.bytes_per_token(
+                            qk_rope_head_dim=qk_rope_head_dim, **kwargs
+                        )
+                        * pool.num_pages
+                        * pool.page_size
+                        + placeholder_bytes,
+                    )
 
 
 class TestQuantizeKvToFp8(CustomTestCase):
@@ -254,6 +265,8 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
             kv_cache_quant_dtype=FP8,
             _op=op,
             _prefill_op=None,
+            # A model with rope: the op gets both caches.
+            _zero_rope=False,
             # _mla_kernel_args passes these through, so names stand in for them.
             forward_metadata=SimpleNamespace(
                 kv_lens="kv_lens",
@@ -275,6 +288,9 @@ class TestSparseForwardMlaCacheBuffers(CustomTestCase):
         )
         backend._kv_lens = functools.partial(
             TpuPallasSparseMlaAttnBackend._kv_lens, backend
+        )
+        backend._attention_split_rows = functools.partial(
+            TpuPallasSparseMlaAttnBackend._attention_split_rows, backend
         )
         layer = SimpleNamespace(
             v_head_dim=R,
@@ -322,6 +338,7 @@ class TestSparseIndexerKvLens(CustomTestCase):
             _index_topk_op=MagicMock(),
             _topk=4,
             _kpool_width=8,
+            raw_ring_pages_cnt=0,
             forward_metadata=SimpleNamespace(
                 kv_lens="kv_lens",
                 page_indices="page_indices",
@@ -329,6 +346,7 @@ class TestSparseIndexerKvLens(CustomTestCase):
                 distribution="distribution",
                 decode_query_size=1,
                 segments="all",
+                raw_page_base="raw_page_base",
             ),
             token_to_kv_pool=SimpleNamespace(
                 get_index_key_cache=lambda layer_id: f"index{layer_id}",
@@ -337,6 +355,9 @@ class TestSparseIndexerKvLens(CustomTestCase):
         )
         backend._kv_lens = functools.partial(
             TpuPallasSparseMlaAttnBackend._kv_lens, backend
+        )
+        backend._raw_ring_args = functools.partial(
+            TpuPallasSparseMlaAttnBackend._raw_ring_args, backend
         )
         # No split group here, so the indexer runs unsplit.
         backend._indexer_split_rows = functools.partial(
@@ -378,6 +399,27 @@ class TestSparseIndexerKvLens(CustomTestCase):
         )
         args = backend._index_topk_op.call_args.args
         self.assertEqual(args[5:8], ("raw2", "index2", "draft"))
+        # Without a raw ring the op ignores the base; kv_lens stands in.
+        self.assertEqual((args[11], args[-1]), ("kv_lens", 0))
+
+    def test_index_topk_kpool_passes_the_raw_ring(self):
+        backend = self._backend()
+        backend.raw_ring_pages_cnt = 66
+        t = torch.zeros(1)
+        TpuPallasSparseMlaAttnBackend.index_topk_kpool(
+            backend,
+            forward_batch=_forward_batch(),
+            layer_id=2,
+            query=t,
+            key=t,
+            gate=t,
+            head_weights=t,
+            ape=t,
+            weight_scale=1.0,
+            kpool=4,
+        )
+        args = backend._index_topk_op.call_args.args
+        self.assertEqual((args[11], args[-1]), ("raw_page_base", 66))
 
     def test_kpool_query_bound_tracks_the_compiled_metadata_mode(self):
         # Decode and uniform verify/draft extend take their static per-request
@@ -407,8 +449,10 @@ class TestSparseIndexerKvLens(CustomTestCase):
                     weight_scale=1.0,
                     kpool=4,
                 )
+                # (decode_query_size, query bound) sit before the trailing
+                # raw_ring_pages_cnt argument.
                 self.assertEqual(
-                    backend._index_topk_op.call_args.args[-2:], (width, bound)
+                    backend._index_topk_op.call_args.args[-3:-1], (width, bound)
                 )
 
 

@@ -240,16 +240,22 @@ def _build_step(
     )
 
 
-def _to_layout(*, nope_rows, rope_rows, step, layout):
+def _to_layout(*, nope_rows, rope_rows, step, layout, rope_spec):
     """Byte rows -> the physical cache arrays of ``layout``."""
     nope = nope_rows.reshape(step.total_pages, step.page_size, 4, 128)
-    rope = rope_rows.reshape(step.total_pages, step.page_size // 4, 4, 128)
     if layout is KVCacheLayout.SPARSECORE:
+        # SparseCore reserves `token_bytes` per token, which the spec narrows
+        # below the padded row when the page packs evenly.
+        packed = np.ascontiguousarray(
+            rope_rows[:, : rope_spec.token_bytes].reshape(
+                step.total_pages, step.page_size, rope_spec.token_bytes
+            )
+        )
         return (
             native_sc_cache_layout.pack_nope(nope),
-            native_sc_cache_layout.pack_rope_banded(rope),
+            native_sc_cache_layout.pack_rope_packed(packed),
         )
-    return nope, rope
+    return nope, rope_rows.reshape(step.total_pages, step.page_size // 4, 4, 128)
 
 
 # Fresh prefill, a chunk continuing a prefix across a page boundary, and a
@@ -280,6 +286,7 @@ class TestSparseMlaWriteThenAttend(CustomTestCase):
             rope_rows=step.rope_before,
             step=step,
             layout=layout,
+            rope_spec=specs[1],
         )
         self.assertEqual([c.shape for c in before], [s.shape for s in specs])
 
@@ -316,6 +323,7 @@ class TestSparseMlaWriteThenAttend(CustomTestCase):
             rope_rows=step.rope_after,
             step=step,
             layout=layout,
+            rope_spec=specs[1],
         )
         np.testing.assert_array_equal(np.asarray(nope), nope_after)
         np.testing.assert_array_equal(np.asarray(rope), rope_after)

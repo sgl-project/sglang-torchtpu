@@ -750,13 +750,15 @@ _future_map_direct_handoff_patched = False
 def _patch_future_map_direct_handoff() -> None:
     """Route FutureMap.stash/publish through the TPU direct handoff, so an
     unchanged EAGLE3 top-k-1 decode batch skips the store/gather round trip.
-    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu."""
+    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu.
+    stash also keeps the chain drafter's DSA top-k seeds out of FutureMap."""
     global _future_map_direct_handoff_patched
     if _future_map_direct_handoff_patched:
         return
     _future_map_direct_handoff_patched = True
 
     from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang_tpu.experimental import is_experimental_chain
     from sglang_tpu.overlap_utils_tpu import (
         flush_direct_handoff_tpu,
         publish_tpu,
@@ -771,6 +773,10 @@ def _patch_future_map_direct_handoff() -> None:
     FutureMap.tpu_published_seq_lens = None
 
     def stash(self, future_indices, payload):
+        if is_experimental_chain(self.spec_algo):
+            # The chain drafter keeps its DSA seeds in a req-pool-indexed table. A PD
+            # prefill's draft input holds them at the extend cap only for core to ship.
+            payload.dsa_topk_indices = None
         if not stash_tpu(self, future_indices, payload):
             orig_stash(self, future_indices, payload)
 
@@ -910,6 +916,16 @@ def _patch_hicache_write_back_copy_ahead() -> None:
     hicache_write_back_copy_ahead.install()
 
 
+def _patch_hicache_async_ready_counts() -> None:
+    """Defer the TP ready-count reduce by one step so the scheduler never waits on rank skew.
+
+    See ``hicache_async_ready_counts``.
+    """
+    from sglang_tpu import hicache_async_ready_counts
+
+    hicache_async_ready_counts.install()
+
+
 def _patch_pd_decode_async_prefill_info() -> None:
     """Fetch PD prefill parallel info off the decode scheduler thread.
 
@@ -918,6 +934,24 @@ def _patch_pd_decode_async_prefill_info() -> None:
     from sglang_tpu import pd_decode_async_prefill_info
 
     pd_decode_async_prefill_info.install()
+
+
+def _patch_prefill_kv_offload_to_decode_dram() -> None:
+    """Offload cold prefill KV to the decode's host RAM, as a tier below the
+    prefill's own host RAM (the HiCache L2 extension of the P/D pair).
+
+    Why: core has no disaggregation queue/cache lifecycle extension yet.
+    How: install the small wrappers listed in
+    disaggregation/decode_dram_offload/dram_offload_hooks.py (``_patch_targets``).
+    Upstream PR or issue: none yet; tracked with the hooks module.
+    Remove when: equivalent lifecycle callbacks are available upstream.
+    """
+    # Off: not even the modules' imports.
+    if not envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get():
+        return
+    from sglang_tpu.disaggregation.decode_dram_offload import dram_offload_hooks
+
+    dram_offload_hooks.install()
 
 
 def _patch_host_heap_trim() -> None:
@@ -1030,7 +1064,9 @@ def apply_tpu_patches() -> None:
     _patch_pd_decode_swa_hicache()
     _install_hybrid_linear_hicache()
     _patch_hicache_write_back_copy_ahead()
+    _patch_hicache_async_ready_counts()
     _patch_pd_decode_async_prefill_info()
+    _patch_prefill_kv_offload_to_decode_dram()
     from sglang_tpu.benchmark_batch_gate import install as install_benchmark_batch_gate
 
     install_benchmark_batch_gate()

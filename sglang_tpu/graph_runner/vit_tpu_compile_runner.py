@@ -227,10 +227,14 @@ class VisionTpuCompilePolicy(CompilePolicy):
                         (tuple(t.shape), t.dtype) for t in args
                     ),
                     model=model,
+                    # Subgroup rank inputs require the recipe's SPMD safety contract.
                     lift_rank=(
                         torch.distributed.is_initialized()
-                        and get_parallel().tp_group.world_size
-                        == torch.distributed.get_world_size()
+                        and (
+                            get_parallel().tp_group.world_size
+                            == torch.distributed.get_world_size()
+                            or get_exec().graph.use_spmd_compile
+                        )
                     ),
                 )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile

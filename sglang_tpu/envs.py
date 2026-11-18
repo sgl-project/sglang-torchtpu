@@ -104,18 +104,25 @@ class TpuEnvs:
     # not only pooled DSA. Not bit-exact with the per-query kernel (summation
     # order); False keeps it.
     SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL = EnvBool(False)
-    # DSA indexer token split for prefill (EXTEND / MIXED batches of at least
-    # _MIN_TOKENS tokens; the minimum is also 32 rows per rank): every
-    # attention-TP rank stores the index keys of all tokens but scores and
-    # top-k-selects only its contiguous slice of ceil(T / attn_tp) query rows
-    # (rounded up to 8); an int32 all-reduce over the attention-TP group puts
-    # the [T, topk] rows together (attention_pallas_mla_sparse.py). Same rows
-    # bit for bit; attention is unchanged. _MAX_ROWS caps the rows per rank
-    # (the all-reduce buffer is [attn_tp, rows, topk] int32 per DSA layer);
-    # larger batches keep the replicated path, as do decode and verify.
-    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT = EnvBool(False)
+    # DSA indexer token split, always on with attention TP > 1: prefill
+    # (EXTEND / MIXED) batches of at least this many tokens (and at least 32
+    # rows per rank) have every attention-TP rank store the index keys of all
+    # tokens but score and top-k-select only its contiguous slice of
+    # ceil(T / attn_tp) query rows (rounded up to 8); an int32 all-reduce over
+    # the attention-TP group puts the [T, topk] rows together
+    # (attention_pallas_mla_sparse.py). Same rows bit for bit; attention is
+    # unchanged. The pooled (kpool) indexer (GLM-5.3-Flash) splits the same
+    # way, and the ranks exchange their rows' picked pools ([T, topk // kpool])
+    # and expand them to tokens afterwards. No cap on the rows per rank (the
+    # all-reduce buffer, [attn_tp, rows, topk] int32 per DSA layer, grows with
+    # the chunk); decode and verify keep the replicated path.
     SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MIN_TOKENS = EnvInt(1024)
-    SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MAX_ROWS = EnvInt(512)
+    # Sparse MLA, on top of the indexer token split: each rank attends only the
+    # rows it selected, with every head, so each selected cache row is gathered
+    # by one rank instead of all; a Pallas all-to-all (kernels/oneshot_all_to_all.py)
+    # moves queries and outputs, and the rows' all-reduce is skipped. Plain DSA
+    # prefill batches of the per-query kernel; attention TP must span the world.
+    SGLANG_TPU_ENABLE_DSA_ATTENTION_TOKEN_SPLIT = EnvBool(False)
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
@@ -185,12 +192,24 @@ class TpuEnvs:
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
     # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
-    # GLM-5.3-Flash: single-request target steps (the MTP verify, or decode
-    # without speculation) as one Pallas call per device (glm_flash_megakernel/);
-    # other steps run the model as usual. ..._MAX_LEN caps the request length the
-    # kernel takes (default: the context length).
+    # GLM-5.3-Flash: target steps (the MTP verify, or decode without speculation)
+    # as one Pallas call per device (glm_flash_megakernel/); other steps run the
+    # model as usual. ..._MAX_LEN caps the request length the kernel takes
+    # (default: the context length); ..._MAX_ROWS the rows (requests x draft
+    # tokens) of one step; a larger step runs as several calls of at most
+    # ..._CALL_ROWS rows each. With the context-parallel DSA, 16 rows is the largest
+    # bucket that fits tpu7x's 64 MiB VMEM with 256-column dense tiles; steps with more
+    # requests run on the model path (measured 2026-11-12).
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL = EnvBool(False)
     SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(None)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_ROWS = EnvInt(16)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_CALL_ROWS = EnvInt(32)
+    # Experimental: the kpool indexer's StreamIndex page table stays in HBM with
+    # one row per sequence in SMEM, so a context past ~262k fits the 1 MiB SMEM.
+    SGLANG_TPU_GLM_FLASH_PAGE_TABLE_HBM = EnvBool(False)
+    # Pooled DSA indexer: keep each request's raw key|gate rows in a ring of pages per
+    # request slot instead of one row per pool token; only the open pool is read back.
+    SGLANG_TPU_DSA_KPOOL_RAW_RING = EnvBool(False)
     # Pin each scheduler's main thread to one CPU of its rank's set and keep its
     # other threads off that physical core (hooks/cpu_pinning.py).
     SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)
@@ -310,7 +329,7 @@ class TpuEnvs:
     SGLANG_RAIDEN_PUSH_WORKERS = EnvInt(1)
 
     # Host staging budget per node, split across local ranks.
-    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(24.0)
+    SGLANG_RAIDEN_HOST_POOL_GB = EnvFloat(64.0)
     # Host layer buffers across full-attention and SWA engines, split by layer
     # count with at least one each. 0 keeps full mirrors.
     # More buffers, or 0, make each slot larger. Raise SGLANG_RAIDEN_HOST_POOL_GB
@@ -334,6 +353,10 @@ class TpuEnvs:
     # Raiden: a decode starts a room's next read as soon as the prefill
     # announces it; 0 starts reads only on the next scheduler poll.
     SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(True)
+    # Raiden: seconds between the decode listener's sweeps, which settle reads
+    # and start queued chunks while the scheduler is not draining. Must be
+    # > 0 and below SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.
+    SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S = EnvFloat(1.0)
     # Raiden: deadline of each KV chunk transfer, not of the whole request; the
     # closing read counts as a chunk, and a non-chunked transfer is one chunk.
     # Counted from registration on the prefill and from start_read on the
@@ -354,6 +377,12 @@ class TpuEnvs:
     # Pipeline prefill: each stage registers its share of the closing transfer
     # at the final chunk's launch, the last stage once its tokens are copied.
     SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE = EnvBool(False)
+
+    # Pipeline parallelism: hand activations between stages point to point
+    # (isend/irecv, pp_buffered.py) instead of the lockstep collective-permute wave.
+    SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF = EnvBool(False)
+    # Buffered hand-off: forwards a stage may queue for sending before it blocks.
+    SGLANG_TPU_PP_BUFFERED_SEND_DEPTH = EnvInt(2)
 
     # raiden KV-offload backend
     # Seconds a raiden DMA may stay pending, from each blocking wait or, when
@@ -413,6 +442,10 @@ class TpuEnvs:
     # Store INT4 MoE group scales as f32 instead of bf16 (66 MB per layer per
     # device on Kimi-K2.6). vmem-fp8 always uses f32.
     SGLANG_TPU_INT4_MOE_FP32_SCALES = EnvBool(False)
+    # Store NVFP4 MoE group scales as f32 instead of bf16 on the non-fused-RS
+    # gmm_v2 path (e.g. PP with TP=1) so gmm_v2 uses Mosaic 32-bit zero-stride
+    # scale loads instead of VPU broadcast expansion.
+    SGLANG_TPU_NVFP4_MOE_FP32_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
@@ -449,16 +482,24 @@ class TpuEnvs:
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
     # 0 = SparseCore always. Measured crossover is 1024 (Kimi, R1, Qwen3-480B).
     SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)
+    # MoE under EP, off the dense permute, with the SparseCore gather and combine:
+    # route on local expert ids (counting sort) and gather only this rank's rows.
+    SGLANG_TPU_FUSED_MOE_EP_COUNTING_ROUTE = EnvBool(True)
     # MoE: use onehot dense matmul for small permute and unpermute/combine
     # paths instead of gather. When set to 0, this is disabled. When set
-    # to a positive integer, this is the threshold for tokens per rank below
-    # which the dense matmul path is taken. Suggset to start with 1024 or 2048
-    # and tune from there. Below it, batches of up to 2048 routed rows also
-    # take the sort-free dense rank route, and one-token batches the
-    # route-meta kernel.
+    # to a positive integer, the permute is dense below this many tokens per
+    # rank and the combine below this many routed rows (tokens x topk).
+    # Suggest to start with 1024 or 2048 and tune from there. Below it,
+    # batches of up to 2048 routed rows also take the sort-free dense rank
+    # route, and one-token batches the route-meta kernel.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
+    # MoE: where the permute is dense and the combine is the SparseCore gather
+    # (threshold / topk <= tokens < threshold), permute with the gather too.
+    # Set at startup by SGLANG_TPU_K3_STATIC_FP8 moe_front or latent_up: there a
+    # one-hot permute feeding the SparseCore combine gave wrong tokens.
+    SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE = EnvBool(False)
     # Turn off EP-local expert reads (models that opt in read only their EP
-    # rank's routed experts with --weight-loader-disable-mmap).
+    # rank's routed experts with --weight-loader-disable-mmap or Run:AI).
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
@@ -496,6 +537,109 @@ class TpuEnvs:
     # assigns each shared graph to the least-loaded rank (shared_compile_cost.py).
     # Empty: round-robin owners.
     SGLANG_TPU_SHARED_COMPILE_COST_PROFILE = EnvStr("")
+    # Use the decode's DRAM as the KV offload tier below the prefill's own RAM,
+    # one switch on both roles: the prefill pushes cold cached branches into
+    # the decode's host pool and recalls them when they return. Settings the
+    # offload does not support are refused at startup
+    # (disaggregation/decode_dram_offload/startup_validation.py).
+    SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM = EnvBool(False)
+    # Muse expert layout for the megakernel: tp | ep | auto
+    # (auto: ep when the server's EP size > 1). muse_megakernel/common/moe_mode.py.
+    SGLANG_TPU_MUSE_MOE_MODE = EnvStr("auto")
+    # Largest megakernel step in rows (running requests x verify tokens, padded to the
+    # TP size); larger steps run the native decoder. Steps above 32 rows run the
+    # megakernel's row-tiled program (ops.BASE_STEP_MAX_ROWS) and pad to 16 rows.
+    SGLANG_TPU_MUSE_MK_MAX_ROWS = EnvInt(32)
+    # Muse megakernel: stack the NVFP4 expert slabs of this many consecutive layers into one
+    # operand per slab (0 = one operand per layer); the layer params become views into it.
+    # 15 measured 3-4% faster decode / verify steps (cc = 1, q = 1 and 8, 128k-512k).
+    SGLANG_TPU_MUSE_MK_EXPERT_GROUP = EnvInt(0)
+    # > 0: megakernel sliding-window layers on SEQ_ALONG_LANE pools use KV chunks of this many
+    # tokens (a divisor of the 2 * inter_local-token chunk); their 2048-token window gains nothing.
+    SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS = EnvInt(0)
+    # Megakernel attention: a softmax stream past the request's last chunk skips its iteration
+    # (MKConfig.attn_skip_idle_streams); and, with SWA chunks set, a full-attention layer's last
+    # chunk is masked by key column only (MKConfig.attn_col_mask).
+    SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE = EnvBool(False)
+    SGLANG_TPU_MUSE_MK_ATTN_COL_MASK = EnvBool(False)
+    # pages_swa windows DMA'd into SMEM instead of the whole table: "auto" (when the two page
+    # tables exceed the SMEM budget), "1" or "0" (forced, e.g. to A/B the two paths)
+    SGLANG_TPU_MUSE_MK_SWA_WINDOW_TABLE = EnvStr("auto")
+    # Megakernel attention on fp8 SEQ_ALONG_LANE pools: feed K (and V) to the MXU as fp8
+    # instead of widening each chunk to bf16 on the VPU first. 0 = off, 1 = K only, 2 = K and V
+    # (exact). With the 2026-10-27 megakernel, 2 saves 0.09 / 0.20 / 0.40 ms per q = 1 step at
+    # 128k / 256k / 512k and nothing at q = 8.
+    SGLANG_TPU_MK_SAL_FP8_DOT = EnvInt(0)
+    # Profiling only: name the megakernel's in-kernel regions for xprof (needs libtpu
+    # --xla_enable_custom_call_region_trace=true and a device tracer level above 1): 1 per
+    # phase; 2 also per chunk / expert, which distorts the timing they show.
+    SGLANG_TPU_MK_TRACE_REGIONS = EnvInt(0)
+    # Megakernel attention: fold a power-of-two attn_scale into the bf16 queries instead of
+    # scaling every score (exact).
+    SGLANG_TPU_MK_FOLD_ATTN_SCALE = EnvBool(False)
+    # Muse megakernel: fold the f / o all-gathers into the next qkvg and the pool + router
+    # matvecs (not bit-exact: the matvec input rounding moves; verify steps only).
+    SGLANG_TPU_MUSE_MK_FOLD = EnvBool(True)
+    # Muse megakernel Wave 1-4 optimizations (hoisted SAL refill, stack2 QK/PV, all-VMEM
+    # collective/expert scratch on row-tiled steps, pair-route collectives, vectorized routing).
+    SGLANG_TPU_MUSE_MK_OPT = EnvBool(True)
+    # Muse megakernels (decode, prefill): fp4 experts requantized at load to one bf16 scale per
+    # this many K rows (0 off, 256), shared with the native fused-RS MoE (W4A16); the expert
+    # dots push raw e2m1 codes to the MXU (MKConfig.qblock).
+    SGLANG_TPU_MUSE_MK_QBLOCK = EnvInt(0)
+    # Muse megakernel: extend and mixed steps run the prefill program (muse_megakernel/prefill/)
+    # on the kernel's weights. Needs TP 8, fp8 SEQ_ALONG_LANE pools, pallas_tpu_rpa_batched
+    # and tpu_compile_tokens in multiples of 128: the model load refuses anything else (the
+    # pool dtype on the first extend step).
+    SGLANG_TPU_MUSE_MK_PREFILL = EnvBool(False)
+    # Prefill program: the expert-input and post-expert-projection all-gathers in e4m3, one
+    # scale per block: half their ICI bytes, ~2^-4 relative error per element.
+    SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER = EnvBool(False)
+    # Prefill program in the sequence-parallel layout (prefill/spep): each rank owns rows / tp of
+    # the chunk between layers, instead of every rank holding every row (prefill/tp).
+    SGLANG_TPU_MUSE_MK_PREFILL_SP = EnvBool(False)
+    # SP program reads decode EP's weight layout, so prefill SP and decode EP share one copy of
+    # the weights (w13 then runs unfused: silu * up after the gmm).
+    SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT = EnvBool(False)
+    # Kernel-level weight layouts (anvil / numerics only); serving raises on them.
+    SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
+    SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
+    # Batched RPA prefill tiles (P/D prefill; the Muse Spark recipe sets all four).
+    # Softmax exp2 with log2e folded into the q scale, one VALU op per score fewer.
+    # Off with an attention sink or an LSE output, which would see base-2 m and l;
+    # the folded scale rounds q in bf16, so the output is not bit-identical.
+    SGLANG_TPU_RPA_EXP2_SOFTMAX = EnvBool(False)
+    # Row sums from the PV matmul: V tiles get ones rows in the lanes head_dim 64
+    # leaves idle on the MXU, so the accumulator carries l and the vector row-sum
+    # reduce and the separate l rescale go away. SEQ_ALONG_LANE, head_dim <= 64.
+    SGLANG_TPU_RPA_ONES_V = EnvBool(False)
+    # Tiles whose keys all precede their queries skip the causal (and sliding-window)
+    # mask, and a power-of-two sm_scale is folded into q. Exact.
+    SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)
+    # Prefill attention tiles with transposed scores (keys along sublanes) and
+    # fp8 q; not bit-exact with the default tile. Mixed/prefill, SEQ_ALONG_LANE,
+    # head_dim <= 64, no sink / LSE / soft cap / q scale / DCP attention scopes.
+    SGLANG_TPU_RPA_TRANSPOSED = EnvBool(False)
+    # Kernel-sweep knobs (anvil --env), read here so the compile cache keys them; unset = the
+    # tuned default (dev_int). Muse megakernel tile / plan knobs (ops.py).
+    SGLANG_TPU_MUSE_MK_DEV_ROW_TILE = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_PAIR_Y = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_EXPERT_CHUNK = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILE_LOOPS_BUDGET_MIB = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS = EnvInt(None)
+    SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH = EnvInt(None)
+    # EP decode paradigm: gather (EP, rows replicated) | a2a (SP + EP, rows sharded).
+    SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("gather")
+    # a2a arm: up to this many rows, pool / unpool read a 1/tp column slice of the weights for
+    # every row (8 instead of 64 MiB per layer); above it, gathering every row costs more. 0: off.
+    SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS = EnvInt(16)
+    # EP megakernel without Pallas bounds checks.
+    SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
+    # Decode megakernels (TP and EP): rows up to which global-layer chunk loops are hoisted
+    # per global layer. 0 (default): one shared loop with tree-walk KV refill, which keeps
+    # the loops in IMEM overlays (q8 32k: TP -3 to -6.5%); 64 restores the previous hoisting.
+    SGLANG_TPU_MUSE_MK_ATTN_HOIST_MAX_ROWS = EnvInt(0)
 
     @classmethod
     def names(cls) -> list[str]:
@@ -506,3 +650,9 @@ class TpuEnvs:
 
 envs = TpuEnvs()
 EnvField._allow_set_name = False
+
+
+def dev_int(field: EnvInt, default: int) -> int:
+    """A kernel-sweep knob: its value if set, else the tuned default."""
+    value = field.get()
+    return default if value is None else value

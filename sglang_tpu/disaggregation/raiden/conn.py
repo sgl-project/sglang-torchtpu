@@ -66,6 +66,7 @@ from sglang_tpu.disaggregation.raiden.common import (
     kv_layout_of,
     logger,
 )
+from sglang_tpu.disaggregation.raiden.dram_offload_channel import DramOffloadChannel
 from sglang_tpu.disaggregation.raiden.host_pool import (
     WINDOW_SLOTS_PER_FULL_SLOT,
     StagingAdmission,
@@ -75,7 +76,7 @@ from sglang_tpu.disaggregation.raiden.host_pool import (
     slots_within_budget,
     split_staging_layers,
 )
-from sglang_tpu.disaggregation.raiden.pp_common import (
+from sglang_tpu.disaggregation.raiden.pool_spans import (
     _BLOCK_MAJOR_KV_RANK,
     _FUSED_KV_RANK,
 )
@@ -172,12 +173,20 @@ class RaidenKVManager(
 
     # The legacy transport unless set_kv_caches builds a pipeline transfer.
     _pipeline = None
+    # Channel of the KV offload to decode DRAM (dram_offload_channel.py);
+    # None unless __init__ finds the switch on.
+    dram_offload_channel: Optional[DramOffloadChannel] = None
     _pipeline_enabled = False
     # Host layer buffers per transfer, from SGLANG_TPU_RAIDEN_STAGING_LAYERS.
     _staging_layers_total = 0
     # Whether an engine stages through fewer host buffers than device layers.
     _bounded_staging = False
     _listener_start_read = False
+    # Seconds between decode listener sweeps, from
+    # SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.
+    _listener_sweep_interval_s = 1.0
+    _stop_listener: Optional[threading.Event] = None
+    _last_scheduler_drain = float("-inf")
     # Layout tag of the registered KV tensors, sent with every CHUNK and BLOCKS.
     kv_layout: str = PER_LAYER_KV_LAYOUT
     # Shared-buffer Full+SWA pool when --enable-unified-memory is active.
@@ -214,6 +223,9 @@ class RaidenKVManager(
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
             RoomFailed.TAG: self._on_room_failed,
         }
+        if tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get():
+            self.dram_offload_channel = DramOffloadChannel(self)
+            self._message_handlers.update(self.dram_offload_channel.message_handlers())
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
         self._swa_engine: Optional[Any] = None
@@ -344,6 +356,8 @@ class RaidenKVManager(
         # skipped -- its pages then ride the closing transfer.
         self._announce_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._drain_lock = threading.Lock()
+        self._stop_listener = threading.Event()
 
         self._prefill: Optional[PrefillState] = None
         self._decode: Optional[DecodeState] = None
@@ -358,6 +372,7 @@ class RaidenKVManager(
             self._start_heartbeat_checker_thread()
             self._decode = DecodeState()
             self._listener_start_read = tpu_envs.SGLANG_RAIDEN_LISTENER_START_READ.get()
+            self._listener_sweep_interval_s = self._read_listener_sweep_interval()
 
         # Native I/O tracking stays on the manager: it survives room cleanup.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -484,9 +499,11 @@ class RaidenKVManager(
                     "pipeline parallelism or "
                     f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
                 )
-            from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
+            from sglang_tpu.disaggregation.raiden.pool_transfer import (
+                RaidenPoolTransfer,
+            )
 
-            pipeline = PipelineTransfer(self, kv_caches)
+            pipeline = RaidenPoolTransfer(self, kv_caches)
             self._engine = pipeline.engine
             self.raiden_endpoint = pipeline.controller
             self.chunked_transfer = False
@@ -667,12 +684,12 @@ class RaidenKVManager(
             Every engine gets at least one slot, even over the budget.
 
         Example:
-            With a 24 GiB node budget and eight local ranks, each rank gets 3 GiB.
+            With a 64 GiB node budget and eight local ranks, each rank gets 8 GiB.
             For Muse Spark with two full-attention buffers and six SWA buffers:
                 Full slot: 2 * 1120 pages * 128 KiB = 280 MiB.
                 SWA slot:  6 *    9 pages * 128 KiB = 6.75 MiB.
-            Fixed-slot mode fits floor(3072 / 286.75) = 10 slots per engine,
-            returning [(10, 2), (10, 6)].
+            Fixed-slot mode fits floor(8192 / 286.75) = 28 slots per engine,
+            returning [(28, 2), (28, 6)].
         """
         slot_bytes = []
         for (tensors, max_blocks), num_layers in zip(engines, layers):
@@ -860,6 +877,35 @@ class RaidenKVManager(
         return start, tail
 
     def _drain_engine(self) -> None:
+        """Take the engines' settled transfers into the room tables.
+
+        The scheduler's poll and the listener's stall sweep both drain here;
+        the lock keeps two callers from interleaving one engine's poll with
+        the bookkeeping of another. Host reads of the DRAM offload channel
+        drain only here, on the scheduler: HiCache's wrapper owns their
+        native reports, and the listener sweep must not poll it.
+        """
+        if self.dram_offload_channel is not None:
+            self.dram_offload_channel.drain_host_reads()
+        self._last_scheduler_drain = time.monotonic()
+        with self._drain_lock:
+            self._drain_engine_serialized()
+
+    def _try_drain_engine(self) -> bool:
+        """Drain settled transfers unless another caller is already draining.
+
+        Used by the decode listener sweep so a scheduler blocked inside a
+        native poll or unregister cannot stall listener message dispatch.
+        """
+        if not self._drain_lock.acquire(blocking=False):
+            return False
+        try:
+            self._drain_engine_serialized()
+        finally:
+            self._drain_lock.release()
+        return True
+
+    def _drain_engine_serialized(self) -> None:
         if self._pipeline is not None:
             sent, received, failed = self._pipeline.poll()
             with self._state_lock:
@@ -979,13 +1025,15 @@ class RaidenKVManager(
         """One engine's sent, received and failed transfers, or None if the
         poll raised.
 
-        Runs inside the scheduler's poll, so an escaping exception would take
-        down every request on this worker. Raiden raises from
-        ``poll_stats_with_details`` only before it takes any completion, so a
-        failed poll loses nothing and the next one reports it. Raiden's
-        transfer deadlines are reported through it too: once polls have failed
-        for longer than one deadline no transfer can settle, and that is raised
-        rather than left to hang every request with its pages held.
+        Runs inside ``_drain_engine_serialized`` on both the scheduler's poll
+        and the decode listener's stall sweep. In the scheduler's poll, an
+        escaping exception takes down every request on this worker. Raiden
+        raises from ``poll_stats_with_details`` only before it takes any
+        completion, so a failed poll loses nothing and the next one reports
+        it. Raiden's transfer deadlines are reported through it too: once
+        polls have failed for longer than one deadline no transfer can settle,
+        and that raises ``RuntimeError`` (fatal on the scheduler's poll;
+        logged and retried on the listener sweep until the scheduler polls).
         """
         try:
             stats = engine.poll_stats_with_details()
@@ -1204,17 +1252,51 @@ class RaidenKVManager(
 
     # ----- rendezvous (ZMQ over the existing per-rank PULL socket) -----------
 
+    def _read_listener_sweep_interval(self) -> float:
+        """SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S, checked against the chunk
+        transfer deadline: a sweep that comes later than the deadline cannot
+        save a read the stalled scheduler is holding."""
+        interval = tpu_envs.SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.get()
+        if not (math.isfinite(interval) and 0 < interval < self._timeout_s):
+            raise ValueError(
+                f"{tpu_envs.SGLANG_RAIDEN_LISTENER_SWEEP_INTERVAL_S.name} must be "
+                f"> 0 and below {tpu_envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.name}"
+                f" ({self._timeout_s:g} s), got {interval!r}"
+            )
+        return interval
+
     def _listen(self) -> None:
-        while True:
+        # chunked_transfer and _pipeline are only known after set_kv_caches,
+        # which runs after this thread starts; _sweep_pulls checks them per sweep.
+        sweeps = self._decode is not None and self._listener_start_read
+        stop = self._stop_listener
+        next_sweep = time.monotonic() + self._listener_sweep_interval_s
+        while stop is None or not stop.is_set():
             try:
-                msg = self.server_socket.recv_multipart()
+                ready = not sweeps or self.server_socket.poll(
+                    max(0, int((next_sweep - time.monotonic()) * 1000))
+                )
+                if stop is not None and stop.is_set():
+                    break
+                msg = self.server_socket.recv_multipart() if ready else None
             except Exception as e:
                 logger.error("RaidenKVManager listener error: %s", e)
                 continue
-            try:
-                self._dispatch(msg)
-            except Exception as e:
-                logger.error("RaidenKVManager message handling error: %s", e)
+            if msg is not None:
+                try:
+                    self._dispatch(msg)
+                except Exception as e:
+                    logger.error("RaidenKVManager message handling error: %s", e)
+            if sweeps and time.monotonic() >= next_sweep:
+                now = time.monotonic()
+                interval = self._listener_sweep_interval_s
+                next_sweep = now + interval
+                if now - self._last_scheduler_drain < interval:
+                    continue
+                try:
+                    self._sweep_pulls()
+                except Exception as e:
+                    logger.error("RaidenKVManager pull sweep error: %s", e)
 
     def _dispatch(self, msg: List[bytes]) -> None:
         """Route one multipart message from the per-rank PULL socket by its tag."""
@@ -1380,6 +1462,11 @@ class RaidenKVManager(
         if self._pipeline is not None:
             return self._pipeline.active(room)
         with self._state_lock:
+            if (
+                self.dram_offload_channel is not None
+                and self.dram_offload_channel.host_read_pending_locked(room)
+            ):
+                return True
             if self._pulling is not None:
                 for key in self._pulling.rooms():
                     if self._is_room_transfer(
@@ -1417,6 +1504,12 @@ class RaidenKVManager(
             # still delivering keeps its receiver plan, each with the
             # completion that will settle it, until the engine reports it.
             held: Set[str] = set()
+            if self.dram_offload_channel is not None:
+                held.update(
+                    k
+                    for k in self.dram_offload_channel.pending_host_reads_locked()
+                    if belongs(k)
+                )
             if self._pulling is not None:
                 for key in self._pulling.rooms():
                     if not belongs(key):
@@ -1511,6 +1604,8 @@ class RaidenKVManager(
                     self._decode.reshard_registered,
                 ):
                     table.discard(room)
+            if self.dram_offload_channel is not None:
+                self.dram_offload_channel.forget_room_locked(room)
             if clear_failure_record:
                 # Failure publication takes _state_lock before failure_lock as
                 # well, so clear and publication have one total order.
