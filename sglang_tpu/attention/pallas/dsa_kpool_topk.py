@@ -58,6 +58,10 @@ _CHUNK_TOKENS = 2048
 # Row-chunk only when one pass's f32 score buffer would exceed this; an
 # unchunked 8k prefill at 10k context is ~84 MiB.
 _MAX_UNCHUNKED_SCORE_BYTES = 512 << 20
+# The raw rows are written a page at a time from this many tokens per step into
+# a raw cache of this many pages; on TPU7x the row scatter is as fast below either.
+_PAGE_WRITE_MIN_TOKENS = 1024
+_PAGE_WRITE_MIN_PAGES = 1024
 
 
 def _hadamard_matrix(n: int) -> np.ndarray:
@@ -135,6 +139,25 @@ def _raw_page_slot(
     page = raw_page_base[req] + (pos // loc["page_size"]) % raw_ring_pages_cnt
     page = jnp.where(valid, page, num_raw)
     return page, pos % loc["page_size"]
+
+
+def _write_raw_pages(raw_cache, raw, req, page, slot, valid, max_runs):
+    """``raw_cache.at[page, slot].set(raw, mode="drop")`` a page at a time.
+
+    A request fills consecutive slots of pages no other request writes, so a
+    step is one run of rows per (request, page), each on its own page. The
+    runs' pages are read into a small buffer, the rows scattered there (far
+    cheaper on a small table than on the cache), and written back by one scatter.
+    """
+    num_raw = raw_cache.shape[0]
+    tok = jnp.arange(raw.shape[0], dtype=jnp.int32)
+    first = valid & ((tok == 0) | (req != jnp.roll(req, 1)) | (slot == 0))
+    run = jnp.where(valid, jnp.cumsum(first) - 1, max_runs)
+    run_page = jnp.full((max_runs,), num_raw, page.dtype)
+    run_page = run_page.at[run].set(page, mode="drop")
+    pages = raw_cache[jnp.minimum(run_page, num_raw - 1)]
+    pages = pages.at[run, slot].set(raw, mode="drop")
+    return raw_cache.at[run_page].set(pages, mode="drop")
 
 
 def _align(x: int, m: int) -> int:
@@ -248,7 +271,16 @@ def kpool_indexer_step(
     # 1. Raw key | gate records of this step's tokens.
     page, slot = _raw_page_slot(req, pos, valid=valid, **raw_loc)
     raw = jnp.concatenate([key, gate], axis=-1).astype(raw_cache.dtype)
-    raw_cache = raw_cache.at[page, slot].set(raw, mode="drop")
+    # Runs: a page per page_size tokens and two partial pages per request.
+    max_runs = num_tokens // page_size + 2 * num_seqs
+    if (
+        num_tokens >= _PAGE_WRITE_MIN_TOKENS
+        and num_raw >= _PAGE_WRITE_MIN_PAGES
+        and 4 * max_runs <= min(num_tokens, num_raw)
+    ):
+        raw_cache = _write_raw_pages(raw_cache, raw, req, page, slot, valid, max_runs)
+    else:
+        raw_cache = raw_cache.at[page, slot].set(raw, mode="drop")
 
     # 2. Compress the pools this step closes, reading the cache just written.
     fused = (

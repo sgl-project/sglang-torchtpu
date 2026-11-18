@@ -285,6 +285,57 @@ class TestKpoolIndexerStep(CustomTestCase):
                 self.assertTrue((full[sum(new) :] == -1).all())
                 raw, pooled = raw_next, pooled_next
 
+    def test_prefill_raw_cache_matches_the_row_scatter(self):
+        # Three requests (mid-page, whole-page, and empty prefix) plus bucket
+        # padding on a >= 1,024-page cache so the page-wise write runs.
+        tokens, pages_per_seq, num_pages = 4096, 16, 1280
+        prefix, new = (77, 2 * PAGE, 0), (1500, 700, 1203)
+        rng = np.random.default_rng(3)
+
+        def f(*shape, dtype=jnp.bfloat16):
+            return jnp.asarray(rng.standard_normal(shape), jnp.float32).astype(dtype)
+
+        key, gate, raw = f(tokens, D), f(tokens, D), f(num_pages, PAGE, 2 * D)
+        pooled = jnp.zeros(
+            (num_pages, PAGE // 16, 4, kp.pooled_record_bytes(D)), jnp.uint8
+        )
+        kv_lens = jnp.asarray(np.add(prefix, new), jnp.int32)
+        pages = 1 + rng.permutation(num_pages - 1)[: len(new) * pages_per_seq]
+        pages = jnp.asarray(pages, jnp.int32)
+        cu = jnp.asarray(np.concatenate([[0], np.cumsum(new)]), jnp.int32)
+        dist = jnp.asarray([0, 0, len(new)], jnp.int32)
+        _, got, _ = jax.jit(
+            lambda *a: kp.kpool_indexer_step(
+                *a, weight_scale=1.0, topk=TOPK, kpool=KPOOL
+            )
+        )(
+            f(tokens, HEADS, D),
+            key,
+            gate,
+            f(tokens, HEADS, dtype=jnp.float32),
+            f(KPOOL, D, dtype=jnp.float32),
+            raw,
+            pooled,
+            kv_lens,
+            pages,
+            cu,
+            dist,
+        )
+        req, pos, valid = kp._token_rows(kv_lens, cu, dist, tokens)
+        page, slot = kp._page_slot(
+            req,
+            pos,
+            page_indices=pages,
+            num_seqs=len(new),
+            page_size=PAGE,
+            num_pages=num_pages,
+            valid=valid,
+        )
+        want = raw.at[page, slot].set(jnp.concatenate([key, gate], -1), mode="drop")
+        np.testing.assert_array_equal(
+            np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+        )
+
 
 def _scatter_pools(raw, old, ape, lens, pages, cu, distribution, tokens):
     """The generic gather/compress/scatter pooling that the fused writer replaces."""
