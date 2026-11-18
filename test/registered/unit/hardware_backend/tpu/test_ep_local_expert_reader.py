@@ -174,6 +174,45 @@ class TestEpLocalExpertReads(CustomTestCase):
             loaded = _read(files + [mtp_file], "single", (2, 4))
             self.assertTrue(set(mtp) <= set(loaded))
 
+    def test_indexed_mtp_tensors_are_skipped_on_target_load(self):
+        # Checkpoints like Qwen3.8-2.4T-A95B-FP8 index mtp.* (including
+        # mtp.layers.0.mlp.experts.<id>.*) alongside target weights.
+        for iterator in _ITERATORS:
+            with self.subTest(iterator=iterator), tempfile.TemporaryDirectory() as d:
+                files, tensors = _write_checkpoint(
+                    d,
+                    extra={
+                        "mtp.fc.weight": torch.ones(4, 4),
+                        "mtp.layers.0.mlp.experts.2.down_proj.weight": torch.ones(4, 4),
+                        "model.mtp.layers.0.mlp.experts.3.down_proj.weight": torch.ones(
+                            4, 4
+                        ),
+                    },
+                )
+                pure_mtp_shard = os.path.join(d, "model-00003-of-00003.safetensors")
+                safetensors.torch.save_file(
+                    {"mtp.norm.weight": torch.ones(4)}, pure_mtp_shard
+                )
+                index_path = os.path.join(d, "model.safetensors.index.json")
+                with open(index_path) as f:
+                    meta = json.load(f)
+                meta["weight_map"]["mtp.norm.weight"] = os.path.basename(pure_mtp_shard)
+                with open(index_path, "w") as f:
+                    json.dump(meta, f)
+
+                loaded = _read(files + [pure_mtp_shard], iterator, (2, 4))
+                self.assertFalse(
+                    any(n.startswith(("mtp.", "model.mtp.")) for n in loaded),
+                    loaded.keys(),
+                )
+                expected = {
+                    n
+                    for n in tensors
+                    if not n.startswith(("mtp.", "model.mtp."))
+                    and _expert_id(n) in (None, 2, 3)
+                }
+                self.assertEqual(set(loaded), expected)
+
     def test_missing_local_expert_raises(self):
         for iterator in _ITERATORS:
             with self.subTest(iterator=iterator), tempfile.TemporaryDirectory() as d:
@@ -515,6 +554,108 @@ class TestLoaderPassesTheRange(CustomTestCase):
                 else:
                     expert_range.assert_not_called()
                     self.assertIsNone(source.local_expert_range)
+
+
+class TestQwen35PluginOptInAndRunaiFetchPlan(CustomTestCase):
+    def test_qwen3_5_moe_models_opt_into_ep_local_reads(self):
+        from sglang.srt.models import qwen3_5, qwen3_5_text
+
+        for cls in (
+            qwen3_5_text.Qwen3_5MoeForCausalLM,
+            qwen3_5.Qwen3_5MoeForConditionalGeneration,
+            qwen3_5.Qwen3_5TextForCausalLM,
+        ):
+            with self.subTest(cls=f"{cls.__module__}.{cls.__qualname__}"):
+                inst = cls.__new__(cls)
+                torch.nn.Module.__init__(inst)
+                inst.layers = torch.nn.ModuleList([_fused_moe(32, 5, 16, 512)])
+                with TestTpuLocalRoutedExpertRange._env():
+                    rng = ep_local_expert_reader.tpu_local_routed_expert_range(inst)
+                self.assertEqual(rng, (80, 96))
+
+    def test_runai_plan_expert_fetch_skips_non_local_and_mtp_keys(self):
+        from sglang_tpu.ep_weight_shard import plan_expert_fetch
+
+        names = [
+            "lm_head.weight",
+            "model.embed_tokens.weight",
+            "model.layers.0.mlp.shared_expert.down_proj.weight",
+            "model.layers.0.mlp.experts.0.gate_proj.weight",
+            "model.layers.0.mlp.experts.16.gate_proj.weight",
+            "model.layers.0.mlp.experts.16.gate_proj.weight_scale_inv",
+            "mtp.fc.weight",
+            "mtp.layers.0.mlp.experts.16.gate_proj.weight",
+        ]
+        plan = plan_expert_fetch(names, (16, 32), skip_unused_target_keys=True)
+        self.assertEqual(
+            plan.kept,
+            frozenset(
+                {
+                    "lm_head.weight",
+                    "model.embed_tokens.weight",
+                    "model.layers.0.mlp.shared_expert.down_proj.weight",
+                    "model.layers.0.mlp.experts.16.gate_proj.weight",
+                    "model.layers.0.mlp.experts.16.gate_proj.weight_scale_inv",
+                }
+            ),
+        )
+        self.assertEqual(
+            plan.local_experts,
+            frozenset(
+                {
+                    "model.layers.0.mlp.experts.16.gate_proj.weight",
+                    "model.layers.0.mlp.experts.16.gate_proj.weight_scale_inv",
+                }
+            ),
+        )
+        self.assertEqual(
+            plan.skipped,
+            frozenset(
+                {
+                    "model.layers.0.mlp.experts.0.gate_proj.weight",
+                    "mtp.fc.weight",
+                    "mtp.layers.0.mlp.experts.16.gate_proj.weight",
+                }
+            ),
+        )
+
+    def test_qwen3_5_text_load_weights_normalizes_and_skips_lazily(self):
+        from sglang.srt.models.qwen3_5_text import Qwen3_5ForCausalLM
+
+        seen_body = []
+
+        class _Body(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = torch.nn.Embedding(4, 2)
+
+            def load_weights(self, weights):
+                for name, tensor in weights:
+                    seen_body.append((name, tensor.clone()))
+                return {name for name, _ in seen_body}
+
+        model = Qwen3_5ForCausalLM.__new__(Qwen3_5ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(tie_word_embeddings=False)
+        model.pp_group = SimpleNamespace(is_last_rank=True, world_size=1)
+        model.pooler = None
+        model.model = _Body()
+        model.lm_head = torch.nn.Linear(2, 4, bias=False)
+
+        streamed = [
+            ("model.language_model.layers.0.input_layernorm.weight", torch.ones(2)),
+            ("model.visual.patch_embed.weight", torch.ones(2)),
+            ("mtp.fc.weight", torch.ones(2)),
+            ("mtp.layers.0.mlp.experts.0.down_proj.weight", torch.ones(2)),
+            ("lm_head.weight", torch.full((4, 2), 3.0)),
+        ]
+        loaded = model.load_weights(iter(streamed))
+        self.assertEqual(
+            loaded,
+            {"model.layers.0.input_layernorm.weight", "lm_head.weight"},
+        )
+        self.assertEqual([n for n, _ in seen_body], ["layers.0.input_layernorm.weight"])
+        self.assertTrue(torch.equal(model.lm_head.weight, torch.full((4, 2), 3.0)))
 
 
 if __name__ == "__main__":

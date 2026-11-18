@@ -37,6 +37,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang_tpu._logging import get_logger
 from sglang_tpu.ep_local_expert_reader import (
+    is_unused_target_key,
     local_expert_id,
     tpu_local_routed_expert_range,
 )
@@ -56,11 +57,17 @@ class ExpertFetchPlan(msgspec.Struct, frozen=True):
 
 
 def plan_expert_fetch(
-    names: Iterable[str], expert_range: tuple[int, int] | None
+    names: Iterable[str],
+    expert_range: tuple[int, int] | None,
+    *,
+    skip_unused_target_keys: bool = False,
 ) -> ExpertFetchPlan:
     """Skip the routed experts outside ``expert_range``; None skips nothing."""
     kept, skipped, local = set(), set(), set()
     for name in names:
+        if skip_unused_target_keys and is_unused_target_key(name):
+            skipped.add(name)
+            continue
         eid = None if expert_range is None else local_expert_id(name, expert_range)
         if eid == -1:
             skipped.add(name)
@@ -108,10 +115,17 @@ class EPLocalRunaiModelStreamerLoader(RunaiModelStreamerLoader):
 
         with SafetensorsStreamer() as streamer:
             shard_of = self._shard_of_names(streamer, files)
+            is_target_load = not getattr(
+                self._primary_model_config, "is_draft_model", False
+            )
             plan = (
                 None
                 if shard_of is None
-                else plan_expert_fetch(shard_of, self._expert_range)
+                else plan_expert_fetch(
+                    shard_of,
+                    self._expert_range,
+                    skip_unused_target_keys=is_target_load,
+                )
             )
             streamed, extra = (
                 (None, iter(()))
@@ -129,17 +143,23 @@ class EPLocalRunaiModelStreamerLoader(RunaiModelStreamerLoader):
                     setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
                     yield name, tensor
                 return
-            self._log_plan(plan=plan, streamed=streamed, num_files=len(files))
+            kept_shards = {shard_of[name] for name in streamed if name in shard_of}
+            active_files = [f for f in files if f in kept_shards]
+            self._log_plan(plan=plan, streamed=streamed, num_files=len(active_files))
             # Run:AI distributed streaming needs identical tensor_names on every
             # rank, and EP ranks keep different experts.
-            streamer.stream_files(
-                files, device="cpu", is_distributed=False, tensor_names=streamed
-            )
             seen = set()
-            for name, tensor in streamer.get_tensors():
-                seen.add(name)
-                setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
-                yield name, tensor
+            if active_files:
+                streamer.stream_files(
+                    active_files,
+                    device="cpu",
+                    is_distributed=False,
+                    tensor_names=streamed,
+                )
+                for name, tensor in streamer.get_tensors():
+                    seen.add(name)
+                    setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+                    yield name, tensor
         missing = sorted((plan.local_experts & streamed) - seen)
         if missing:
             raise RuntimeError(
