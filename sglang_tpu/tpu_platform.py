@@ -19,14 +19,11 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.utils import LazyImport
-from sglang_tpu import shared_slice
+
+# By module: importing dp_replicas first runs platform discovery from its own
+# sglang import, which loads this module before dp_replicas defines its names.
+from sglang_tpu import dp_replicas, shared_slice
 from sglang_tpu._logging import get_logger
-from sglang_tpu.dp_replicas import (
-    ReplicaSession,
-    get_replica_session,
-    prepare_host_session,
-    validate_dp_replicas,
-)
 from sglang_tpu.tpu_dma_hicache import (
     is_tpu_dma_hicache_backend,
     tpu_dma_hicache_backends,
@@ -1106,8 +1103,8 @@ class TpuSRTPlatform(SRTPlatform):
         # torch_tpu.
         # One device per scheduler process across all pipeline stages.
         if cfg.dp_size > 1:
-            validate_dp_replicas(cfg)
-            prepare_host_session(
+            dp_replicas.validate_dp_replicas(cfg)
+            dp_replicas.prepare_host_session(
                 cfg.dp_size,
                 cfg.tp_size,
                 cfg.dist_init_addr if cfg.nnodes > 1 else None,
@@ -1647,7 +1644,7 @@ class TpuSRTPlatform(SRTPlatform):
     # Initialization
     # ------------------------------------------------------------------
 
-    _dp_replica_session: Optional[ReplicaSession] = None
+    _dp_replica_session: Optional[dp_replicas.ReplicaSession] = None
 
     def prepare_worker(
         self, server_args, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
@@ -1655,10 +1652,10 @@ class TpuSRTPlatform(SRTPlatform):
         cfg = _resolving_view(server_args)
         if cfg.dp_size <= 1:
             return
-        validate_dp_replicas(cfg)
+        dp_replicas.validate_dp_replicas(cfg)
         if dp_rank is None or not 0 <= dp_rank < cfg.dp_size:
             raise ValueError(f"Invalid TPU engine DP rank: {dp_rank}")
-        self._dp_replica_session = ReplicaSession(
+        self._dp_replica_session = dp_replicas.ReplicaSession(
             dp_rank,
             cfg.dp_size,
             cfg.tp_size,
@@ -1673,7 +1670,7 @@ class TpuSRTPlatform(SRTPlatform):
         os.environ.pop("TPU_VISIBLE_DEVICES", None)
 
     def get_group_coordinator_cls(self) -> Type[GroupCoordinator]:
-        if get_replica_session() is not None:
+        if dp_replicas.get_replica_session() is not None:
             return _ReplicaGroupCoordinator._load()
         return super().get_group_coordinator_cls()
 
