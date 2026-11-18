@@ -482,6 +482,49 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
                 for output in outputs:
                     torch.testing.assert_close(output, expected)
 
+    def test_wan_causal_decode_shards_chunks_in_spatial_mode(self):
+        # Realtime sessions (LingBot-World) decode 3-latent-frame chunks with
+        # causal_decode, keeping the feature cache across chunks: auto mode
+        # leaves a chunk this small whole, spatial mode shards it.
+        from sglang.multimodal_gen.runtime.models.vaes import common
+
+        arch = dict(base_dim=8, z_dim=4, dim_mult=(1, 2, 2), num_res_blocks=1)
+        arch.update(latents_mean=(0.0,) * 4, latents_std=(1.0,) * 4)
+
+        def build(mode, rank=0):
+            _thread_rank.value = rank
+            config = WanVAEConfig(load_encoder=False, parallel_decode_mode=mode)
+            config.arch_config = type(config.arch_config)(**arch)
+            return wanvae.AutoencoderKLWan(config).eval()
+
+        torch.manual_seed(0)
+        world_size, reference = 3, build("auto")
+        chunks = torch.randn(1, 4, 6, 10, 6).chunk(2, dim=2)
+        with torch.no_grad():  # the session as one decode
+            expected = reference.decode(torch.cat(chunks, dim=2))
+        with (
+            _collectives_only_decode_group(world_size) as group,
+            patch.object(wanvae.dist, "is_initialized", return_value=True),
+            patch.object(wanvae, "get_decode_parallel_world_size", lambda: world_size),
+            patch.object(
+                wanvae, "get_decode_parallel_rank", lambda: _thread_rank.value
+            ),
+            patch.object(common, "_decode_parallel_world_size", lambda: world_size),
+            patch.object(group, "all_gather", wraps=group.all_gather) as gather,
+        ):
+            should_shard = common.should_run_spatial_shard_parallel_decode
+            self.assertFalse(should_shard(reference.config, chunks[0]))
+            vaes = [build("spatial", rank) for rank in range(world_size)]
+            for vae in vaes:
+                vae.load_state_dict(reference.state_dict())
+            with torch.no_grad():
+                outputs = _run_on_thread_ranks(
+                    group, lambda r: [vaes[r].causal_decode(z) for z in chunks]
+                )
+        self.assertTrue(gather.called)
+        for output in outputs:
+            torch.testing.assert_close(torch.cat(output, dim=2), expected)
+
     def _encode_on_thread_ranks(self, is_residual, x, world_size=3):
         """The unsharded Wan encoder's output, and each thread rank's when the
         encoder shards over a collectives-only decode group."""

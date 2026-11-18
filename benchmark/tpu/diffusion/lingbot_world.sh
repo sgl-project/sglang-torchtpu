@@ -13,6 +13,7 @@ export PARALLEL_ARGS="${PARALLEL_ARGS---cfg-parallel-size 1 --ulysses-degree ${N
 # halves. --dit-cpu-offload false keeps the DiT resident on each core. Realtime serving has no
 # server warmup: the first session compiles. Warm up with an 8-chunk session whose camera script
 # ends mid-session, as the blocks compile for chunks with and without a camera condition; it
-# covers the six K/V lengths and the cache roll too.
-export MODEL_ARGS="${MODEL_ARGS---pipeline-class-name LingBotWorldCausalDMDPipeline --regional-compile --dit-cpu-offload false}"
+# covers the six K/V lengths and the cache roll too. In spatial decode mode each core decodes its
+# rows of a chunk; auto mode decodes a chunk this small whole on every core.
+export MODEL_ARGS="${MODEL_ARGS---pipeline-class-name LingBotWorldCausalDMDPipeline --regional-compile --dit-cpu-offload false --vae-config.parallel-decode-mode spatial}"
 exec bash "$(dirname "$0")/launch.sh" "$@"
