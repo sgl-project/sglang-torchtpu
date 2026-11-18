@@ -415,6 +415,18 @@ class TestSequenceParallelShard(_TestBase):
             self._forward(model, _dit_inputs(), 2)  # 9 x 4 x 4 = 144 current tokens
         self.assertEqual(caught.exception.args, (72, False))
 
+    def test_output_norm_takes_the_step_timestep_under_sp(self):
+        model, inputs, temb = _model(), _dit_inputs(), []
+        model.norm_out.register_forward_pre_hook(lambda m, a: temb.append(a[1]))
+        gather = lambda x, dim: x.repeat(1, 2, 1)  # noqa: E731
+        with (
+            patch.object(model, "blocks", torch.nn.ModuleList()),
+            patch.object(dit, "sequence_model_parallel_all_gather", gather),
+        ):
+            self._forward(model, inputs, 2)  # history rows hold timestep 0
+            _run_dit(model, inputs)
+        self.assertTrue(torch.equal(temb[0][:, -1], temb[1][:, -1]))
+
     def test_indivisible_current_tokens_run_unsharded(self):
         model = _model()
         inputs = _dit_inputs(height=6, width=6)  # 9 x 3 x 3 = 81 current tokens

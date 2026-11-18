@@ -979,7 +979,7 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             current_tokens = hidden_states[:, -local_seq_len:, :].contiguous()
             hidden_states = sequence_model_parallel_all_gather(current_tokens, dim=1)
             # Re-create temb for norm_out (all current tokens share same timestep)
-            temb = temb[:, :1, :].expand(batch_size, original_context_length, -1)
+            temb = temb[:, -1:, :].expand(batch_size, original_context_length, -1)
 
         # 8. Output norm & projection
         hidden_states = self.norm_out(hidden_states, temb, original_context_length)
