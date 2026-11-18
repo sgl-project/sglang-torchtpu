@@ -293,6 +293,16 @@ def gather_page_ids(
     return out[:num_tokens]
 
 
+def _expand_rope_half_rows(words):
+    """Unpair the two 32-token halves of each 64-token atom into ordinary quad rows."""
+    # Staying at 128 uint32 lanes and eight rows per atom half keeps reshapes
+    # tile-aligned; a [rows, 2*64] -> [2*rows, 64] shape cast is not needed.
+    lane = lax.broadcasted_iota(jnp.int32, words.shape, 1)
+    lo = jnp.where(lane < 64, words, 0).reshape(-1, 8, 128)
+    hi = jnp.where(lane < 64, pltpu.roll(words, 64, axis=1), 0).reshape(-1, 8, 128)
+    return jnp.concatenate((lo, hi), axis=1).reshape(-1, 128)
+
+
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_tokens] valid top-k count per query token
@@ -566,6 +576,8 @@ def _attention_kernel(
 
         bkv_rope = bkv_rope_ref[...]
         if sparsecore_layout:
+            if bkv_rope.shape[0] * 8 == bkv_sz:
+                bkv_rope = _expand_rope_half_rows(bkv_rope)
             # The native gather's delta-swap produces four-token grouped
             # uint32[128] rows. Expanding their byte lanes recovers one
             # contiguous 128-byte row per selected token.
@@ -871,6 +883,10 @@ def prepare_outputs(
         "return_lse",
         "cache_layout",
         "sparsecore_atoms_per_batch",
+        "sparsecore_phase_stride",
+        "compact_rope_output",
+        "sparsecore_rows_per_dma",
+        "sparsecore_batch_fold",
         "sparsecore_gather_wait_mode",
         "sparsecore_gather_pipelined",
         "small_chunk_tokens",
@@ -904,6 +920,10 @@ def sparse_ragged_paged_attention(
     return_lse: bool = False,
     cache_layout: str = TENSORCORE_CACHE_LAYOUT,
     sparsecore_atoms_per_batch: int = 16,
+    sparsecore_phase_stride: int = 0,
+    compact_rope_output: bool = False,
+    sparsecore_rows_per_dma: int = 16,
+    sparsecore_batch_fold: int = 1,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
     small_chunk_tokens: int = 16,
@@ -939,6 +959,13 @@ def sparse_ragged_paged_attention(
         the same sparse attention computation.
       sparsecore_atoms_per_batch: Native SparseCore gather pipeline atoms per
         owner batch.
+      sparsecore_phase_stride: Optional query-dependent atom issue rotation
+        for uncapped SparseCore gather. Zero preserves the original schedule.
+      compact_rope_output: Store two four-token RoPE quads in each 128-word
+        intermediate HBM row; requires uncapped native SC and 64-byte RoPE.
+      sparsecore_rows_per_dma: Number of indirect rows per native SparseCore
+        read. Windows partition a 64-row atom without changing output order.
+      sparsecore_batch_fold: Group owner rounds in the compact32 prefill experiment.
       sparsecore_gather_wait_mode: Whether native SparseCore NOPE output DMA
         overlaps ROPE work.
       sparsecore_gather_pipelined: Whether to pipeline native SparseCore gather
@@ -981,6 +1008,14 @@ def sparse_ragged_paged_attention(
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    if sparsecore_batch_fold != 1 and (not compact_rope_output or topk_cap is not None or not sparsecore_layout):
+        raise ValueError("folded gather requires uncapped compact SparseCore output")
+    if compact_rope_output and (not sparsecore_layout or topk_cap is not None):
+        raise ValueError("compact_rope_output is supported only for uncapped native SC gather")
+    if sparsecore_phase_stride and (not sparsecore_layout or topk_cap is not None):
+        raise ValueError("phase rotation currently requires uncapped SparseCore gather")
+    if sparsecore_rows_per_dma != 16 and (not sparsecore_layout or topk_cap is not None):
+        raise ValueError("wide DMA windows currently require uncapped SparseCore gather")
     if sparsecore_layout:
         if (
             cache_kv_nope.dtype != jnp.uint32
@@ -1120,6 +1155,10 @@ def sparse_ragged_paged_attention(
             vmem_limit_bytes=vmem_limit_bytes,
             cache_layout=cache_layout,
             sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
+            sparsecore_phase_stride=sparsecore_phase_stride,
+            compact_rope_output=compact_rope_output,
+            sparsecore_rows_per_dma=sparsecore_rows_per_dma,
+            sparsecore_batch_fold=sparsecore_batch_fold,
             sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
             sparsecore_gather_pipelined=sparsecore_gather_pipelined,
             small_chunk_tokens=small_chunk_tokens,
@@ -1227,6 +1266,10 @@ def sparse_attention_chunk(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     cache_layout: str = TENSORCORE_CACHE_LAYOUT,
     sparsecore_atoms_per_batch: int = 16,
+    sparsecore_phase_stride: int = 0,
+    compact_rope_output: bool = False,
+    sparsecore_rows_per_dma: int = 16,
+    sparsecore_batch_fold: int = 1,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
     small_chunk_tokens: int = 0,
@@ -1506,12 +1549,16 @@ def sparse_attention_chunk(
                 atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                phase_stride=sparsecore_phase_stride,
+                compact_rope_output=compact_rope_output,
+                rows_per_dma=sparsecore_rows_per_dma,
+                batch_fold=sparsecore_batch_fold,
                 **live_kwargs,
             )
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
         gathered_rope_buffer = gathered_rope_buffer.reshape(
-            chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
+            chunk_size, topk // (native_sc_gather.ROPE_PACKING * (2 if compact_rope_output else 1)), 128
         )
     else:
         assert indices is not None
