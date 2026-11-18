@@ -162,7 +162,9 @@ class TestTpuGraphRunner(CustomTestCase):
         self.addCleanup(platform_patcher.stop)
         backend_patcher = patch(
             "sglang_tpu.compilation.decoder_compile_policy.current_platform",
-            SimpleNamespace(get_compile_backend=lambda: "tpu"),
+            SimpleNamespace(
+                get_compile_backend=lambda: "tpu", pcp_ring_enabled=lambda: False
+            ),
         )
         backend_patcher.start()
         self.addCleanup(backend_patcher.stop)
