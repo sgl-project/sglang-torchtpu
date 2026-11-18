@@ -17,9 +17,11 @@ class Glm5NextDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
     ``spmd_safe``: rank-dependent values reach the graph as inputs (the lifted
     rank for the DSA indexer split and the vocab shards, per-rank weights and
-    pools). Verify a recipe with ``VERIFY_SPMD_SAFE=1`` before it enables
-    --use-spmd-compile: a rank-dependent constant would ship the owner rank's
-    executable to every rank with no error.
+    pools). Verified with ``VERIFY_SPMD_SAFE=1`` on
+    glm_5_3_flash/server_direct_spmd.py. --enable-attn-tp-input-scattered is
+    not rank-uniform: its prefill slices each rank's rows at a constant offset.
+    Verify a recipe before it enables --use-spmd-compile: a rank-dependent
+    constant would ship the owner rank's executable to every rank with no error.
     """
 
     spmd_safe = True
