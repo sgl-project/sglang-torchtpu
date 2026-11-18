@@ -28,6 +28,9 @@ EnvField._allow_set_name = True
 class TpuEnvs:
     # Parent-selected rendezvous port for the host-wide DP replica process group.
     SGLANG_TPU_DP_SESSION_PORT = EnvInt(None)
+    # Chip box (XxYxZ) of each --dp-size replica of a multi-host launch, e.g. 2x2x4 for
+    # one replica per z column of a 4x4x4 (node_normalization.order_hosts_by_replica).
+    SGLANG_TPU_DP_REPLICA_SHAPE = EnvStr(None)
     # Opt-in, request-tagged benchmark admission (benchmark_batch_gate.py).
     # Zero preserves ordinary scheduling, including continuous batching.
     SGLANG_TPU_BENCHMARK_BATCH_SIZE = EnvInt(0)
