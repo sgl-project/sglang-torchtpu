@@ -2,6 +2,8 @@
 
 Why: filter/merge and H2D staging must be intercepted before device operations,
 not repaired afterward. All non-experimental calls delegate unchanged.
+Grammar prefill sampling normalizes logits and sampling state to live rows at
+ModelRunner.sample, after the target has chosen its physical output extent.
 kimi_spec_defaults: core refuses speculation for Kimi hybrid (KDA) targets on
 TPU and otherwise pins GPU verify/draft backends; the experimental worker
 serves DSPARK and DFLASH on the TPU KDA checkpoint verify, so it skips both.
@@ -20,11 +22,13 @@ Remove when: the experiment is removed or those upstream seams are available.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 
 import torch
 
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_disagg, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang_tpu._logging import get_logger
@@ -36,6 +40,7 @@ from sglang_tpu.experimental import (
     is_experimental_spec_worker,
     uses_host_batch,
 )
+from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
 logger = get_logger(__name__)
@@ -123,8 +128,6 @@ def filter_spec_input(original, batch, keep_indices, keep_indices_device):
             # A PP PD prefill keeps the relayed draft state on host; index it there.
             keep_indices_device = torch.tensor(keep_indices, dtype=torch.int64)
         return original(batch, keep_indices, keep_indices_device)
-    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
-
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.filter_batch(
         new_indices=keep_indices_device,
@@ -136,8 +139,6 @@ def filter_spec_input(original, batch, keep_indices, keep_indices_device):
 def merge_spec_input(original, batch, other):
     if not _relays_rows(batch):
         return original(batch, other)
-    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
-
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.merge_batch(other.spec_info, future_indices=batch.req_pool_indices)
 
@@ -148,8 +149,6 @@ def prepare_spec_decode(original, batch):
     # plans the bucketed verify window.
     if not uses_host_batch(batch) or batch.spec_algorithm.is_dflash_family():
         return original(batch)
-    from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
-
     assert isinstance(batch.spec_info, HostPaddedDraftInput)
     batch.spec_info.prepare_for_decode(batch)
 
@@ -324,9 +323,6 @@ def keep_host_padded_extend_outputs(original, forward_batch, logits_output):
     # finalize_forward_batch left HOST_PADDED extend logits at the batch bucket
     # and hidden at the token bucket; DP attention's unpadding would trim them
     # to the live rows, which the samplers and the draft prefill do not take.
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
-
     sampling_info = forward_batch.sampling_info
     if (
         logits_output is None
@@ -339,6 +335,36 @@ def keep_host_padded_extend_outputs(original, forward_batch, logits_output):
     result = original(forward_batch, logits_output)
     logits_output.next_token_logits, logits_output.hidden_states = logits, hidden
     return result
+
+
+def sample_host_padded_grammar(original, model_runner, logits_output, forward_batch):
+    sampling_info = forward_batch.sampling_info
+    if (
+        sampling_info is None
+        or not is_host_padded(sampling_info)
+        or not sampling_info.grammars
+        or forward_batch.forward_mode != ForwardMode.EXTEND
+    ):
+        return original(model_runner, logits_output, forward_batch)
+
+    # Grammar and the sampler consume live rows, while either the target head
+    # or host sampling metadata can retain padding from a different bucket.
+    rows = len(sampling_info)
+    logits = logits_output.next_token_logits
+    if logits.shape[0] != rows:
+        logits_output.next_token_logits = logits[:rows]
+    row_tensors = {
+        name: value[:rows] if value.shape[0] != rows else value
+        for name in ("acc_additive_penalties", "acc_scaling_penalties", "logit_bias")
+        if (value := getattr(sampling_info, name)) is not None
+    }
+    forward_batch.sampling_info = replace(
+        sampling_info, **sampling_info.host_params_at(rows), **row_tensors
+    )
+    try:
+        return original(model_runner, logits_output, forward_batch)
+    finally:
+        forward_batch.sampling_info = sampling_info
 
 
 def sample_draft_tokens(original, model, hidden_states, input_ids):
@@ -580,6 +606,11 @@ def hook_specs():
                 "sglang.srt.speculative.dspark_disaggregation."
                 "build_dspark_disagg_draft_input",
                 build_disagg_block_input,
+                HookType.AROUND,
+            ),
+            (
+                "sglang.srt.model_executor.model_runner.ModelRunner.sample",
+                sample_host_padded_grammar,
                 HookType.AROUND,
             ),
             (

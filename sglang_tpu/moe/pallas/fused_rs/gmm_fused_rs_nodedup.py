@@ -430,6 +430,34 @@ def _precompute_fused_rs_metadata(
     return jnp.concatenate([head, gm_group, gm_m_offset]).astype(jnp.int32)
 
 
+# Base alignment of an expert-TP rank's SMEM row window: a multiple of every dtype's sublane
+# tiling, so rebased row offsets keep their position within a sublane tile.
+_LOCAL_ROWS_ALIGN = 128
+
+
+def fused_rs_smem_rows(size_m: int, ep_size: int, expert_tp: bool) -> int:
+    """Rows of the routing arrays the kernel holds in SMEM: expert TP keeps only this rank's
+    size_m / ep_size routed rows (in a 128-aligned window), the other layouts every row."""
+    return size_m // ep_size + _LOCAL_ROWS_ALIGN if expert_tp else size_m
+
+
+def _local_expert_tp_rows(
+    meta, lhs_indices, topk_indices, *, ep_size: int, num_slots: int
+):
+    """Expert TP routes every (token, slot) to one contiguous block of rows per rank, but the
+    routing arrays cover all ranks' blocks. Keep this rank's window [base, base + n) of them,
+    base the aligned floor of local_start, and rebase meta's row offsets (local_start,
+    local_end, gm_id_to_m_offset) by base; total_recv was counted on the whole arrays."""
+    n = fused_rs_smem_rows(lhs_indices.shape[0], ep_size, True)
+    base = (meta[0] // _LOCAL_ROWS_ALIGN) * _LOCAL_ROWS_ALIGN
+
+    def window(a):
+        return lax.dynamic_slice_in_dim(jnp.pad(a, (0, _LOCAL_ROWS_ALIGN)), base, n)
+
+    shift = jnp.zeros_like(meta).at[0:2].set(base).at[4 + num_slots :].set(base)
+    return meta - shift, window(lhs_indices), window(topk_indices)
+
+
 def kernel_main_fused_rs(
     # Scalar prefetch (10) — `output_indices` was dropped (== lhs_indices for EP).
     # `topk_indices_ref` is included but conditionally used:
@@ -2108,17 +2136,6 @@ def gmm_v2_fused_rs(
     # Two int32[size_m] arrays + internal scratch (~10-20 KB) need to fit in
     # 1 MB SMEM. Pack when 2 separate refs would exceed ~960 KB (2 * size_m * 4).
     # That's size_m > 120K (e.g., prefill_16384 with top_k=8 has size_m=131K).
-    pack_indices = size_m > 120_000
-    if pack_indices:
-        # combined = lhs_idx * top_k + topk_slot
-        primary_idx_ref = lhs_indices.astype(jnp.int32) * top_k + topk_indices.astype(
-            jnp.int32
-        )
-        secondary_idx_ref = jnp.zeros((1,), dtype=jnp.int32)  # dummy
-    else:
-        primary_idx_ref = lhs_indices
-        secondary_idx_ref = topk_indices
-
     # Expert TP builds the routing metadata ahead of the kernel in XLA and
     # leaves each tile's output writes in flight until its staging slot is reused.
     if expert_tp:
@@ -2133,6 +2150,24 @@ def gmm_v2_fused_rs(
             chunk_size=chunk_size,
             num_slots=max_num_gm_static,
         )
+        group_start, lhs_indices, topk_indices = _local_expert_tp_rows(
+            group_start,
+            lhs_indices,
+            topk_indices,
+            ep_size=ep_size,
+            num_slots=max_num_gm_static,
+        )
+
+    pack_indices = lhs_indices.shape[0] > 120_000
+    if pack_indices:
+        # combined = lhs_idx * top_k + topk_slot
+        primary_idx_ref = lhs_indices.astype(jnp.int32) * top_k + topk_indices.astype(
+            jnp.int32
+        )
+        secondary_idx_ref = jnp.zeros((1,), dtype=jnp.int32)  # dummy
+    else:
+        primary_idx_ref = lhs_indices
+        secondary_idx_ref = topk_indices
 
     pallas_inputs = (
         group_sizes,

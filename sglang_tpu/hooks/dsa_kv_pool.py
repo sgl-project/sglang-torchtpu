@@ -25,9 +25,10 @@ def _split_pool_bytes(kvc, *, layer_ids, all_index_layers: bool) -> int:
         get_dsa_index_head_dim,
         get_dsa_index_kpool,
     )
-    from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
+    from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool, kpool_raw_ring_pages
 
     hf_config = kvc.model_config.hf_config
+    kpool = get_dsa_index_kpool(hf_config)
     return TpuSplitMLATokenToKVPool.bytes_per_token(
         index_head_dim=get_dsa_index_head_dim(hf_config),
         # As the pool builders: a draft computes its own top-k.
@@ -35,7 +36,8 @@ def _split_pool_bytes(kvc, *, layer_ids, all_index_layers: bool) -> int:
             all_index_layers or not dsa_layer_skips_topk(hf_config, layer_id)
             for layer_id in layer_ids
         ],
-        index_kpool=get_dsa_index_kpool(hf_config),
+        index_kpool=kpool,
+        raw_ring=kpool_raw_ring_pages(page_size=1, kpool=kpool) > 0,
     )
 
 

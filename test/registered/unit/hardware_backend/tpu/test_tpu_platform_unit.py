@@ -890,15 +890,13 @@ class TestDsaValidation(CustomTestCase):
                         attention_backend="pallas_tpu_mla_sparse", **{field: 4}
                     )
 
-    def test_dsa_needs_the_dynamo_tracer(self):
-        """The direct tracer reads the KV cache through the pool's get_state,
-        which the split MLA pool does not implement. The launch must say so
-        instead of failing at the first compile."""
-        with self.assertRaisesRegex(ValueError, "tpu-compile-tracer dynamo"):
-            self._apply_dsa(
-                attention_backend="pallas_tpu_mla_sparse",
-                tpu_compile_tracer="direct",
-            )
+    def test_dsa_accepts_the_direct_tracer(self):
+        """TpuSplitMLATokenToKVPool implements get_state/set_state, so DSA runs
+        under both the dynamo and direct compile tracers."""
+        self._apply_dsa(
+            attention_backend="pallas_tpu_mla_sparse",
+            tpu_compile_tracer="direct",
+        )
 
     def test_mtp_index_share_runs_only_on_the_chain_worker(self):
         """Only the experimental chain worker reuses the MTP draft's DSA top-k
