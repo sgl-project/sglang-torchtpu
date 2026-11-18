@@ -189,12 +189,14 @@ _METADATA_INPUT_FIELDS = (
     "token_rows",
     "token_req_pool",
     "valid",
+    "compress_valid",
     "out_cache_loc",
     "full_pages",
     "swa_pages",
     "swa_minimum",
     "low_ratio",
     "engram",
+    "swa_window_plan",
 )
 
 
