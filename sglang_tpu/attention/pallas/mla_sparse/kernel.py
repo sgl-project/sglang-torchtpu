@@ -522,7 +522,9 @@ def _attention_kernel(
             _async_copy(src=bq_vmem_ref, dst=bq_vmem_ref, sem=sem, wait=True)
             if split_q:
                 qr_ref = bq_rope_x2_ref.at[bq_sem_idx, :]
-                _async_copy(src=qr_ref, dst=qr_ref, sem=qr_sems.at[bq_sem_idx], wait=True)
+                _async_copy(
+                    src=qr_ref, dst=qr_ref, sem=qr_sems.at[bq_sem_idx], wait=True
+                )
 
     def _send_bo_batch(seq_idx_start, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
@@ -1050,14 +1052,22 @@ def sparse_ragged_paged_attention(
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
-    if sparsecore_batch_fold != 1 and (not compact_rope_output or topk_cap is not None or not sparsecore_layout):
+    if sparsecore_batch_fold != 1 and (
+        not compact_rope_output or topk_cap is not None or not sparsecore_layout
+    ):
         raise ValueError("folded gather requires uncapped compact SparseCore output")
     if compact_rope_output and (not sparsecore_layout or topk_cap is not None):
-        raise ValueError("compact_rope_output is supported only for uncapped native SC gather")
+        raise ValueError(
+            "compact_rope_output is supported only for uncapped native SC gather"
+        )
     if sparsecore_phase_stride and (not sparsecore_layout or topk_cap is not None):
         raise ValueError("phase rotation currently requires uncapped SparseCore gather")
-    if sparsecore_rows_per_dma != 16 and (not sparsecore_layout or topk_cap is not None):
-        raise ValueError("wide DMA windows currently require uncapped SparseCore gather")
+    if sparsecore_rows_per_dma != 16 and (
+        not sparsecore_layout or topk_cap is not None
+    ):
+        raise ValueError(
+            "wide DMA windows currently require uncapped SparseCore gather"
+        )
     if sparsecore_layout:
         if (
             cache_kv_nope.dtype != jnp.uint32
@@ -1456,7 +1466,9 @@ def sparse_attention_chunk(
             ]
         if q_rope is not None:
             scratch_shapes += [
-                pltpu.VMEM((2, batch_size, num_q_heads, q_rope.shape[-1]), q_rope.dtype),
+                pltpu.VMEM(
+                    (2, batch_size, num_q_heads, q_rope.shape[-1]), q_rope.dtype
+                ),
                 pltpu.SemaphoreType.DMA((2,)),
             ]
 
@@ -1644,7 +1656,9 @@ def sparse_attention_chunk(
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
         gathered_rope_buffer = gathered_rope_buffer.reshape(
-            chunk_size, topk // (native_sc_gather.ROPE_PACKING * (2 if compact_rope_output else 1)), 128
+            chunk_size,
+            topk // (native_sc_gather.ROPE_PACKING * (2 if compact_rope_output else 1)),
+            128,
         )
     else:
         assert indices is not None
