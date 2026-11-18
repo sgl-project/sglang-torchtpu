@@ -328,7 +328,7 @@ def _attention_kernel(
     narrow_output: int = 0,
     split_q: bool = False,
 ):
-    # split_q (test only, needs narrow_output): q_hbm_ref is the 512-wide NoPE
+    # split_q (needs narrow_output): q_hbm_ref is the 512-wide NoPE
     # part; the RoPE part arrives as a separate [T, H, 64] input and both are
     # joined (and zero-padded to 640) in registers, so XLA does no concat/pad.
     # narrow_output: 0 = the output aliases q (head_dim wide, sliced by the
@@ -972,7 +972,7 @@ def sparse_ragged_paged_attention(
     topk_cap: int | None = None,
     gather_rope: bool = True,
     narrow_output: bool = False,
-    # Test only: q is the 512-wide NoPE part and q_rope [T, H, 64] the RoPE
+    # Optional: q is the 512-wide NoPE part and q_rope [T, H, 64] the RoPE
     # part; the kernel joins them in VMEM (needs narrow_output).
     q_rope: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
@@ -1131,7 +1131,7 @@ def sparse_ragged_paged_attention(
 
     if q_rope is not None:
         if not narrow_output or q.shape[-1] != NARROW_OUT_DIM:
-            raise ValueError("q_rope (test only) needs narrow_output and a 512-wide q")
+            raise ValueError("q_rope needs narrow_output and a 512-wide q")
     else:
         q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
 
@@ -1338,7 +1338,7 @@ def sparse_attention_chunk(
     gather_rope: bool = True,
     narrow_output: bool = False,
     o: jax.Array | None = None,
-    q_rope: jax.Array | None = None,  # test only: split q (see split_q)
+    q_rope: jax.Array | None = None,  # split q (see split_q)
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 

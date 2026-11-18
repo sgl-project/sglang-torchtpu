@@ -113,7 +113,12 @@ def qblock_query_block(
 # sweep's fastest extend setting (exp-cdkg2zm04b: chunk 128, 16 atoms,
 # overlap_rope; 3577 vs 4329 us at extend 2048 on a 49K prefix).
 SPARSECORE_GATHER_CHUNK_TOKENS = 128
-SPARSECORE_ATOMS_PER_BATCH = 16
+# 32 atoms with 32-row DMAs, phase stride 5 and the compact RoPE output
+# (_sparsecore_gather_kwargs): 3.300 / 3.259 / 3.209 ms vs 3.526 / 3.460 /
+# 3.478 ms at extend 2048 on the GLM-5.2 layer 0 / 10 / 40 top-k (exp-vomtfje770).
+SPARSECORE_ATOMS_PER_BATCH = 32
+SPARSECORE_ROWS_PER_DMA = 32
+SPARSECORE_PHASE_STRIDE = 5
 
 
 def _sparsecore_atoms(num_tokens: int, chunk_tokens: int, topk: int) -> int:
@@ -133,6 +138,28 @@ def _sparsecore_atoms(num_tokens: int, chunk_tokens: int, topk: int) -> int:
     ):
         atoms //= 2
     return atoms
+
+
+def _sparsecore_gather_kwargs(
+    cache_nope: jax.Array, cache_rope: jax.Array, topk: int, atoms: int
+) -> dict:
+    """Native SparseCore gather schedule for the SparseCore cache layout.
+
+    Every query's top-k is a whole number of 64-row atoms here (the packed RoPE
+    lanes need it), so the compact RoPE output applies whenever the RoPE cache
+    holds 64 B per token. The phase stride rotates each query's atom issue
+    order and needs a power-of-two count of owner batches per query.
+    """
+    from sglang_tpu.attention.pallas.mla_sparse import native_sc_gather as nsc
+
+    kwargs = dict(sparsecore_rows_per_dma=SPARSECORE_ROWS_PER_DMA)
+    rope_words = cache_rope.size // (cache_nope.size // 128)
+    if rope_words == 16 and topk % nsc.OCCURRENCES_PER_ATOM == 0:
+        kwargs["compact_rope_output"] = True
+    batches, tail = divmod(topk, atoms * nsc.OCCURRENCES_PER_ATOM)
+    if not tail and batches >= 1 and batches & (batches - 1) == 0:
+        kwargs["sparsecore_phase_stride"] = SPARSECORE_PHASE_STRIDE
+    return kwargs
 
 
 def cache_layout_of(cache_nope: jax.Array) -> KVCacheLayout:
@@ -302,6 +329,35 @@ def sparse_mla_attention_fused(
         )
         return out, cache_nope, cache_rope
 
+    if sparsecore:
+        chunk_tokens = min(SPARSECORE_GATHER_CHUNK_TOKENS, max(64, ql_nope.shape[0]))
+        atoms = _sparsecore_atoms(ql_nope.shape[0], chunk_tokens, topk_indices.shape[1])
+        # The kernel takes q in two parts and joins them in VMEM (no XLA
+        # concat / 576 -> 640 pad), and writes the 512-wide NoPE output
+        # directly (no trailing slice of a 640-wide buffer).
+        out = sparse_ragged_paged_attention(
+            ql_nope,
+            cache_nope,
+            cache_rope,
+            topk_indices,
+            # None: the rows are already flat cache slots (prepare_gather_indices).
+            None if topk_is_physical else page_indices,
+            cu_q_lens,
+            distribution,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            gather_rope=not zero_rope,
+            cache_layout=SPARSECORE_CACHE_LAYOUT,
+            gather_and_attention_chunk_size=chunk_tokens,
+            sparsecore_atoms_per_batch=atoms,
+            narrow_output=True,
+            q_rope=q_pe,
+            **_sparsecore_gather_kwargs(
+                cache_nope, cache_rope, topk_indices.shape[1], atoms
+            ),
+        )
+        return out, cache_nope, cache_rope
+
     # out: bf16[max_num_tokens, num_q_heads, 576].
     out = sparse_ragged_paged_attention(
         jnp.concatenate([ql_nope, q_pe], axis=-1),
@@ -315,25 +371,9 @@ def sparse_mla_attention_fused(
         sm_scale=sm_scale,
         k_scale=k_scale,
         gather_rope=not zero_rope,
-        **(
-            dict(
-                cache_layout=SPARSECORE_CACHE_LAYOUT,
-                gather_and_attention_chunk_size=min(
-                    SPARSECORE_GATHER_CHUNK_TOKENS, max(64, ql_nope.shape[0])
-                ),
-                sparsecore_atoms_per_batch=_sparsecore_atoms(
-                    ql_nope.shape[0],
-                    min(SPARSECORE_GATHER_CHUNK_TOKENS, max(64, ql_nope.shape[0])),
-                    topk_indices.shape[1],
-                ),
-            )
-            if sparsecore
-            else dict(
-                cache_layout=TENSORCORE_CACHE_LAYOUT,
-                gather_and_attention_chunk_size=min(
-                    gather_chunk_tokens, max(64, ql_nope.shape[0])
-                ),
-            )
+        cache_layout=TENSORCORE_CACHE_LAYOUT,
+        gather_and_attention_chunk_size=min(
+            gather_chunk_tokens, max(64, ql_nope.shape[0])
         ),
     )
     # The kernel returns 512 NoPE + 64 RoPE values per head. Only the NoPE part
