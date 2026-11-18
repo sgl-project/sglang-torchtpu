@@ -1101,7 +1101,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
             tpu_envs.SGLANG_TPU_MUSE_MEGAKERNEL.get() and self.pp_group.world_size == 1
         )
         self._megakernel = None
-        # SGLANG_TPU_MUSE_MOE_MODE=ep: the megakernel is muse_megakernel_v2's EP stack.
+        # SGLANG_TPU_MUSE_MOE_MODE=ep: the experts hold the EP layout only the megakernel reads.
         self._megakernel_ep = False
 
     @property
@@ -1118,29 +1118,15 @@ class MuseSparkForConditionalGeneration(nn.Module):
         if not self._megakernel_enabled:
             return
         from sglang_tpu.fp8_lm_head import TpuFp8LmHeadMethod
+        from sglang_tpu.muse_megakernel_v2.ops import MuseMegakernel
 
-        if _muse_moe_mode_is_ep():
-            from sglang_tpu.muse_megakernel_v2.ops import MuseMegakernel as EpMegakernel
-
-            if tpu_envs.SGLANG_TPU_MUSE_SHARED_DENSE.get():
-                raise NotImplementedError(
-                    "SGLANG_TPU_MUSE_SHARED_DENSE: not supported by the Muse EP megakernel"
-                )
-            self._megakernel = EpMegakernel.from_model(self)
-            self._megakernel_ep = True
-            self.lm_head.quant_method = TpuFp8LmHeadMethod(self.lm_head)
-            torch.accelerator.synchronize()
-            return
-        from sglang_tpu.muse_megakernel.ops import MuseMegakernel
-
-        self._megakernel = MuseMegakernel.from_model(self)
+        # muse_megakernel_v2 serves both expert layouts (TP and EP).
         if tpu_envs.SGLANG_TPU_MUSE_SHARED_DENSE.get():
-            dropped = self._megakernel.share_dense_weights(self.model)
-            logger.info(
-                "Muse dense linears share the megakernel's copies: %.2f GiB of weights "
-                "freed per device",
-                dropped / 2**30,
+            raise NotImplementedError(
+                "SGLANG_TPU_MUSE_SHARED_DENSE: not supported by muse_megakernel_v2"
             )
+        self._megakernel = MuseMegakernel.from_model(self)
+        self._megakernel_ep = _muse_moe_mode_is_ep()
         # The megakernel path also takes the fp8 weight-only LM head.
         self.lm_head.quant_method = TpuFp8LmHeadMethod(self.lm_head)
         torch.accelerator.synchronize()

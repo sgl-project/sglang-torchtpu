@@ -46,11 +46,15 @@ All rows: 3600 s window, 0 failed requests, `submission_valid` true unless noted
 
 ### This branch's engine (refkernel MK_PREFILL + QBLOCK 256, TP)
 
-| Conc | tok/s/chip | p90 interactivity | p50 interactivity | p90 TTFT | p90 E2E | Requests | Run |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 22 | 31,055 | 117.1 | 161.0 | 13.1 s | 30.1 s | 2982 | j-9dae2f55, 2026-11-13 |
-| 22 | 31,253 | 119.2 | - | 12.7 s | 28.9 s | 2985 | j-955acea7, 2026-11-18 (rerun) |
-| 26 | 31,447 | 111.7 | 151.6 | 38.1 s | 50.7 s | 3155 | j-9dae2f55, 2026-11-13 |
+TP serves on `muse_megakernel_v2` (the same stack as EP); the v1 rows below ran the
+retired `muse_megakernel`.
+
+| Conc | Megakernel | tok/s/chip | p90 interactivity | p50 interactivity | p90 TTFT | p90 E2E | Requests | Run |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 22 | v2 | 31,039 | 115.8 | 163.0 | 12.7 s | 29.2 s | 2979 | j-955acea7, 2026-11-18 |
+| 22 | v1 | 31,055 | 117.1 | 161.0 | 13.1 s | 30.1 s | 2982 | j-9dae2f55, 2026-11-13 |
+| 22 | v1 | 31,253 | 119.2 | - | 12.7 s | 28.9 s | 2985 | j-955acea7, 2026-11-18 (rerun) |
+| 26 | v1 | 31,447 | 111.7 | 151.6 | 38.1 s | 50.7 s | 3155 | j-9dae2f55, 2026-11-13 |
 
 ### EP (`MOE_MODE=ep`, EP_ARM mixed, q8), 1200 s window
 
