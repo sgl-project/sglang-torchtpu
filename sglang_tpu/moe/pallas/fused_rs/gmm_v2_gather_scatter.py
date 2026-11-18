@@ -417,6 +417,137 @@ def inner_kernel(
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_tile_n = tiled_rhs.shape[-1]
+
+            def _quant_col_step(block_lhs, start_k, end_k, start_n, end_n):
+                block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
+
+                if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
+                    scaled_rhs_slices = []
+                    rhs_k_start = start_k
+                    while rhs_k_start < end_k:
+                        b_id = rhs_k_start // rhs_qbs
+                        rhs_k_end = min((b_id + 1) * rhs_qbs, end_k)
+                        local_k_start = rhs_k_start - start_k
+                        local_k_end = rhs_k_end - start_k
+                        rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
+                        block_rhs_slice = block_rhs[local_k_start:local_k_end]
+                        scaled_rhs_slice = block_rhs_slice.astype(
+                            jnp.bfloat16
+                        ) * rhs_scale_slice.astype(jnp.bfloat16)
+                        scaled_rhs_slices.append(scaled_rhs_slice)
+                        rhs_k_start = rhs_k_end
+                    block_rhs_for_quant = jnp.concatenate(scaled_rhs_slices, axis=0)
+                else:
+                    block_rhs_for_quant = block_rhs.astype(jnp.bfloat16)
+
+                if fp8_activation_quant:
+                    block_lhs_for_matmul, lhs_scale = _online_quantize(
+                        block_lhs, axis=1, quant_dtype=cfgs.lhs_cfgs.quant_dtype
+                    )
+                    if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
+                        # Fold small RHS scale blocks into RHS first, then
+                        # requantize to the activation quant dtype so
+                        # matmul uses fp8 x fp8.
+                        block_rhs_for_matmul, rhs_online_scale = _online_quantize(
+                            block_rhs_for_quant,
+                            axis=0,
+                            quant_dtype=cfgs.lhs_cfgs.quant_dtype,
+                        )
+                    else:
+                        block_rhs_for_matmul = block_rhs
+                        rhs_online_scale = None
+                else:
+                    block_lhs_for_matmul = block_lhs.astype(jnp.bfloat16)
+                    block_rhs_for_matmul = block_rhs_for_quant
+
+                block_acc = jnp.matmul(
+                    block_lhs_for_matmul,
+                    block_rhs_for_matmul,
+                    preferred_element_type=jnp.float32,
+                ).astype(acc_ref.dtype)
+
+                if fp8_activation_quant:
+                    block_acc *= lhs_scale.astype(acc_ref.dtype)
+                    if rhs_online_scale is not None:
+                        block_acc *= rhs_online_scale.astype(acc_ref.dtype)
+
+                if apply_rhs_scale_after_matmul:
+                    b_id = start_k // rhs_qbs
+                    rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
+                    block_acc *= rhs_scale_slice.astype(acc_ref.dtype)
+
+                return block_acc
+
+            # Direct stage: a 3D (tile_m, n // lanes, lanes) out ref takes each
+            # sublane-aligned column group as soon as its matmuls finish.
+            if (
+                scatter_mode
+                and len(tiled_out_ref.shape) == 3
+                and is_first_k_step
+                and is_last_k_step
+                and cfgs.fuse_act is None
+                and not cfgs.rhs_cfgs.has_bias
+            ):
+                num_lanes = pltpu.get_tpu_info().num_lanes
+                sls_out = pltpu.get_tpu_info().get_sublane_tiling(tiled_out_ref.dtype)
+                cols_per_grp = sls_out * num_lanes
+                if rhs_tile_n % cols_per_grp or cols_per_grp % mxu_size:
+                    raise ValueError(
+                        f"direct stage needs tile_n {rhs_tile_n} in groups of "
+                        f"{cols_per_grp} columns, a multiple of the MXU {mxu_size}"
+                    )
+                mask_col = _valid_m_mask((cfgs.tiles.tile_m, mxu_size))
+                has_gs = cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None
+                gs_2 = (
+                    gs_gate_ref[metadata_ref.gm_id_to_group_id[_resolved_gm_id]].astype(
+                        acc_ref.dtype
+                    )
+                    if has_gs
+                    else None
+                )
+                # Mode 2 loads each LHS block once for the group's column blocks.
+                share_lhs = envs.SGLANG_TPU_FUSED_RS_DIRECT_STAGE.get() == 2
+                n_grp = cols_per_grp // mxu_size
+                for g_col in range(0, rhs_tile_n, cols_per_grp):
+                    accs = [
+                        jnp.zeros((cfgs.tiles.tile_m, mxu_size), dtype=acc_ref.dtype)
+                        for _ in range(n_grp)
+                    ]
+                    if share_lhs:
+                        for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
+                            end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
+                            block_lhs = tiled_lhs[:, start_k:end_k]
+                            for c in range(n_grp):
+                                sn = g_col + c * mxu_size
+                                accs[c] += _quant_col_step(
+                                    block_lhs, start_k, end_k, sn, sn + mxu_size
+                                )
+                    else:
+                        for c in range(n_grp):
+                            sn = g_col + c * mxu_size
+                            for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
+                                end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
+                                accs[c] += _quant_col_step(
+                                    tiled_lhs[:, start_k:end_k],
+                                    start_k,
+                                    end_k,
+                                    sn,
+                                    sn + mxu_size,
+                                )
+                    grp_outs = []
+                    for acc_n in accs:
+                        if gs_2 is not None:
+                            acc_n *= gs_2
+                        grp_outs.append(
+                            jnp.where(mask_col, acc_n, 0).astype(tiled_out_ref.dtype)
+                        )
+                    tiled_out_ref[:, pl.ds(g_col // num_lanes, sls_out), :] = (
+                        jnp.concatenate(grp_outs, axis=1).reshape(
+                            cfgs.tiles.tile_m, sls_out, num_lanes
+                        )
+                    )
+                return
+
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
@@ -425,66 +556,8 @@ def inner_kernel(
 
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-
                     block_lhs = tiled_lhs[:, start_k:end_k]
-                    block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
-
-                    if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
-                        scaled_rhs_slices = []
-                        rhs_k_start = start_k
-                        while rhs_k_start < end_k:
-                            b_id = rhs_k_start // rhs_qbs
-                            rhs_k_end = min((b_id + 1) * rhs_qbs, end_k)
-                            local_k_start = rhs_k_start - start_k
-                            local_k_end = rhs_k_end - start_k
-                            rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
-                            block_rhs_slice = block_rhs[local_k_start:local_k_end]
-                            scaled_rhs_slice = block_rhs_slice.astype(
-                                jnp.bfloat16
-                            ) * rhs_scale_slice.astype(jnp.bfloat16)
-                            scaled_rhs_slices.append(scaled_rhs_slice)
-                            rhs_k_start = rhs_k_end
-                        block_rhs_for_quant = jnp.concatenate(scaled_rhs_slices, axis=0)
-                    else:
-                        block_rhs_for_quant = block_rhs.astype(jnp.bfloat16)
-
-                    if fp8_activation_quant:
-                        block_lhs_for_matmul, lhs_scale = _online_quantize(
-                            block_lhs, axis=1, quant_dtype=cfgs.lhs_cfgs.quant_dtype
-                        )
-                        if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
-                            # Fold small RHS scale blocks into RHS first, then
-                            # requantize to the activation quant dtype so
-                            # matmul uses fp8 x fp8.
-                            block_rhs_for_matmul, rhs_online_scale = _online_quantize(
-                                block_rhs_for_quant,
-                                axis=0,
-                                quant_dtype=cfgs.lhs_cfgs.quant_dtype,
-                            )
-                        else:
-                            block_rhs_for_matmul = block_rhs
-                            rhs_online_scale = None
-                    else:
-                        block_lhs_for_matmul = block_lhs.astype(jnp.bfloat16)
-                        block_rhs_for_matmul = block_rhs_for_quant
-
-                    block_acc = jnp.matmul(
-                        block_lhs_for_matmul,
-                        block_rhs_for_matmul,
-                        preferred_element_type=jnp.float32,
-                    ).astype(acc_ref.dtype)
-
-                    if fp8_activation_quant:
-                        block_acc *= lhs_scale.astype(acc_ref.dtype)
-                        if rhs_online_scale is not None:
-                            block_acc *= rhs_online_scale.astype(acc_ref.dtype)
-
-                    if apply_rhs_scale_after_matmul:
-                        b_id = start_k // rhs_qbs
-                        rhs_scale_slice = _get_scale_slice(b_id, start_n, end_n)
-                        block_acc *= rhs_scale_slice.astype(acc_ref.dtype)
-
-                    acc_n += block_acc
+                    acc_n += _quant_col_step(block_lhs, start_k, end_k, start_n, end_n)
 
                 acc_list.append(acc_n)
             acc = jnp.concatenate(acc_list, axis=1)
@@ -595,6 +668,10 @@ def inner_kernel(
     is_first_k_step = k_id == 0
     is_last_k_step = k_id == (num_k - 1)
 
+    if scatter_mode and len(tiled_out_ref.shape) == 3:
+        # Direct stage: the 3D out ref only fits the single-K-step branch.
+        _matmul(is_first_k_step=is_first_k_step, is_last_k_step=is_last_k_step)
+        return
     lax.cond(
         is_first_k_step,
         lambda: lax.cond(
@@ -949,12 +1026,21 @@ def _can_dma_rows(size, dtype):
 
 @jax.named_scope("dma_gather_gm_start")
 def dma_gather_gm_start(
-    src_ref, dst_ref, indices_ref, sem_ref, gm_id, metadata_ref, divisor: int = 1
+    src_ref,
+    dst_ref,
+    indices_ref,
+    sem_ref,
+    gm_id,
+    metadata_ref,
+    divisor: int = 1,
+    unroll: int = 1,
 ):
     """Start gathering rows for a specific gm tile via DMA.
 
     src_ref and dst_ref must be 3D: (rows, k // num_lanes, num_lanes).
     No reshape — reshape on refs breaks dynamic pl.ds offsets.
+
+    `unroll`: rows issued per loop iteration (the remainder runs one by one).
 
     `divisor`: optional integer divisor applied to indices_ref values before
     use. Set > 1 when indices_ref contains packed values (e.g.,
@@ -978,7 +1064,20 @@ def dma_gather_gm_start(
         ).start()
         return _
 
-    lax.fori_loop(0, m_end - m_start, _gather_body, 0)
+    num_rows = m_end - m_start
+    if unroll == 1:
+        lax.fori_loop(0, num_rows, _gather_body, 0)
+        return
+
+    # Fewer loop branches per row.
+    def _block(b, _):
+        for u in range(unroll):
+            _gather_body(b * unroll + u, None)
+        return _
+
+    num_blocks = num_rows // unroll
+    lax.fori_loop(0, num_blocks, _block, 0)
+    lax.fori_loop(num_blocks * unroll, num_rows, _gather_body, 0)
 
 
 @jax.named_scope("dma_gather_gm_wait")

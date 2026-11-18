@@ -523,6 +523,38 @@ class TpuEnvs:
     # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
     # (likely 0.0.48).
     SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
+    # Fused-RS MoE (moe/pallas/fused_rs) tuning knobs; every default keeps the stock kernel.
+    # Output staging buffers a tile's deferred row writes stay in flight across.
+    SGLANG_TPU_FUSED_RS_STAGING_SLOTS = EnvInt(3)
+    # Rows issued per iteration of the per-row gather and write DMA loops.
+    SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL = EnvInt(1)
+    # Expert TP: skip zeroing out_buf, which the per-row writes cover exactly once.
+    SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO = EnvBool(False)
+    # Expert TP: sum the ep partials in the kernel's (rows, hidden // 128, 128) layout.
+    SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE = EnvBool(False)
+    # Expert TP with a post-expert norm: ep sum, norm and top-k combine in one Pallas pass
+    # (equal up to f32 summation order).
+    SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE = EnvBool(False)
+    # Expert TP: size the tile loop and SMEM metadata by this rank's routed rows, and take
+    # the tile_m 256 entries tuned for prefill calls above 131072 routed rows.
+    SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS = EnvBool(False)
+    # Expert TP (>= 4096 tokens): the two cores of a chip add their partials on-chip and
+    # send one pair sum per row off-chip (half the ICI bytes, one extra bf16 rounding).
+    SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE = EnvBool(False)
+    # Pair exchange: pair-sum only the rows forwarded off-chip (same numerics).
+    SGLANG_TPU_FUSED_RS_PAIR_FWD_PSUM = EnvBool(False)
+    # Pair exchange: issue only the 5 owner runs a core sends, each from a static
+    # source and receive block (same numerics; needs PAIR_FWD_PSUM).
+    SGLANG_TPU_FUSED_RS_PAIR_FAST_ISSUE = EnvBool(False)
+    # Pair exchange combine: Pallas block sum + norm + top-k scatter-add in VMEM instead
+    # of an argsort over every row and a 0/1 matmul (chunks of 8..1024 tokens).
+    SGLANG_TPU_FUSED_RS_PAIR_SCATTER_COMBINE = EnvBool(False)
+    # GMM2 writes the row-DMA staging layout directly, skipping the f32 spill and the
+    # relayout pass (bit-identical). 1: per column block, 2: LHS loads shared by a group.
+    SGLANG_TPU_FUSED_RS_DIRECT_STAGE = EnvInt(0)
+    # When W1 and W2 each fit one DMA, experts alternate weight buffers by parity and the
+    # next expert's weights stream behind the whole tile (exact).
+    SGLANG_TPU_FUSED_RS_WEIGHT_PINGPONG = EnvBool(False)
     # Share one page pool between full-attention and sliding-window KV on TPU
     # (equivalent to --enable-unified-memory; see unified_kv_pool.py).
     SGLANG_TPU_UNIFIED_KV_POOL = EnvBool(False)
