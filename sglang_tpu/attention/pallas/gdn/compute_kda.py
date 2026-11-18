@@ -23,6 +23,9 @@ which is what drives the split intra-chunk solve in
 `chunked_kda_per_seq`.
 """
 
+import functools
+from typing import Callable
+
 import jax
 import jax.numpy as jnp
 
@@ -370,17 +373,21 @@ def recurrent_kda_per_seq(
     beta: jax.Array,  # (num_v_heads, chunk, 1)
     state: jax.Array,  # (num_v_heads, kq_head_dim, v_head_dim)
     cfgs: config.GDNConfig,
+    store_checkpoint: Callable[[int, jax.Array], None],
 ) -> tuple[jax.Array, jax.Array]:
-    """Run the token recurrence and retain one state per verify position.
+    """Run the token recurrence and store one state per verify position.
 
     BATCHED speculative decode sets ``chunk_size == window_size`` so every
     post-token state is retained.  The ordinary decode case is the degenerate
     one-token window.  Invalid ragged tail rows have q/k/v/beta zeroed and a
     unit decay, therefore their output is zero and their state is unchanged;
     memory_ref only writes checkpoints belonging to real rows.
+
+    Each checkpoint goes to ``store_checkpoint(t, state)`` as soon as it
+    exists, so only one f32 state per sequence is live in VMEM. Returns the
+    outputs and the final state.
     """
     out_list = []
-    state_list = []
     contract_dk = (((2,), (1,)), ((0,), (0,)))
 
     for c_idx in range(cfgs.chunk_size):
@@ -419,10 +426,11 @@ def recurrent_kda_per_seq(
         ).astype(cfgs.dtypes.compute)
         out_list.append(out[:, 0, :])
 
-        if c_idx >= cfgs.chunk_size - cfgs.window_size:
-            state_list.append(state)
+        window_start = cfgs.chunk_size - cfgs.window_size
+        if c_idx >= window_start:
+            store_checkpoint(c_idx - window_start, state)
 
-    return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
+    return jnp.stack(out_list, axis=0), state
 
 
 def recurrent_kda(
@@ -436,7 +444,13 @@ def recurrent_kda(
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
+    store_checkpoint: Callable[[int, int, jax.Array], None],
 ) -> tuple[jax.Array, jax.Array]:
+    """Token-recurrent KDA over one tile.
+
+    Checkpoint ``t`` of sequence ``idx`` goes to ``store_checkpoint(idx, t,
+    state)``. Returns the outputs and each sequence's final state.
+    """
     mask_dtype = compute_gdn.get_mask_dtype(cfg.dtypes.compute)
     iota = jax.lax.broadcasted_iota(
         mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2
@@ -476,7 +490,7 @@ def recurrent_kda(
     v = v[:, :, :, 0, :]
 
     out_list = []
-    new_state_list = []
+    final_state_list = []
     for idx in range(cfg.seq_tile_size):
         out, state = recurrent_kda_per_seq(
             q[idx],
@@ -486,10 +500,9 @@ def recurrent_kda(
             beta[idx],
             state_prev[idx],
             cfg,
+            store_checkpoint=functools.partial(store_checkpoint, idx),
         )
         out_list.append(out)
-        new_state_list.append(state)
+        final_state_list.append(state)
 
-    out = jnp.stack(out_list, axis=0)
-    new_recurrent_state = jnp.stack(new_state_list, axis=0)
-    return out, new_recurrent_state
+    return jnp.stack(out_list, axis=0), jnp.stack(final_state_list, axis=0)

@@ -177,13 +177,22 @@ def inner_kernel(
         a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
         dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
 
+    def store_recurrent_checkpoint(idx: int, t: int, state: jax.Array) -> None:
+        if cfg.state_plan is None:
+            recurrent_out_slot_ref[idx, t] = state.astype(recurrent_out_slot_ref.dtype)
+            return
+        args = (recurrent_out_slot_ref.at[idx, t], cfg.state_plan.recurrent, state)
+        if carry_recurrent_scratch_ref is None:
+            vmem_ldst.store_state_region(*args)
+        else:
+            pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
+                functools.partial(vmem_ldst.store_state_region, *args)
+            )
+
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
     # Passing refs into gdn.py breaks strict separation of concerns.
     if cfg.use_recurrent:
-        recurrent_fn = (
-            compute_kda.recurrent_kda if cfg.is_kda else compute_gdn.recurrent_gdn
-        )
         q_compact, k_compact, v_compact, b_compact, a_compact = (
             vmem_ldst.load_activation_as_compact(
                 qkv_vreg=qkv_out_compact,
@@ -193,8 +202,7 @@ def inner_kernel(
                 cfgs=cfg,
             )
         )
-
-        out, new_recurrent_state = recurrent_fn(
+        recurrent_kwargs = dict(
             q_compact=q_compact,
             k_compact=k_compact,
             v_compact=v_compact,
@@ -206,6 +214,15 @@ def inner_kernel(
             cfg=cfg,
             real_sizes=real_sizes,
         )
+        if cfg.is_kda:
+            # Stored per position: holding all window_size f32 states at once
+            # overflows VMEM for 64-head KDA verify.
+            out, final_recurrent_state = compute_kda.recurrent_kda(
+                **recurrent_kwargs, store_checkpoint=store_recurrent_checkpoint
+            )
+            new_recurrent_state = None
+        else:
+            out, new_recurrent_state = compute_gdn.recurrent_gdn(**recurrent_kwargs)
 
     else:
         chunked_fn = compute_kda.chunked_kda if cfg.is_kda else compute_gdn.chunked_gdn
@@ -234,27 +251,19 @@ def inner_kernel(
 
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
-    if cfg.state_plan is None:
-        recurrent_out_slot_ref[...] = new_recurrent_state.astype(
-            recurrent_out_slot_ref.dtype
-        )
-    else:
-        for idx in range(cfg.seq_tile_size):
-            for t in range(cfg.window_size):
-                args = (
-                    recurrent_out_slot_ref.at[idx, t],
-                    cfg.state_plan.recurrent,
-                    new_recurrent_state[idx, t],
-                )
-                if carry_recurrent_scratch_ref is None:
-                    vmem_ldst.store_state_region(*args)
-                else:
-                    pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
-                        functools.partial(vmem_ldst.store_state_region, *args)
-                    )
+    if new_recurrent_state is not None:
+        final_recurrent_state = new_recurrent_state[:, -1]
+        if cfg.state_plan is None:
+            recurrent_out_slot_ref[...] = new_recurrent_state.astype(
+                recurrent_out_slot_ref.dtype
+            )
+        else:
+            for idx in range(cfg.seq_tile_size):
+                for t in range(cfg.window_size):
+                    store_recurrent_checkpoint(idx, t, new_recurrent_state[idx, t])
 
     if carry_recurrent_scratch_ref is not None:
-        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+        carry_recurrent_scratch_ref[...] = final_recurrent_state
 
 
 def outer_kernel(
