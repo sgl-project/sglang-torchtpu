@@ -657,6 +657,13 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
             )
 
 
+def _random_fp8_bytes(rng: np.random.Generator, shape: tuple[int, ...]) -> np.ndarray:
+    """Random finite non-negative-zero float8_e4m3fn bit patterns."""
+    # Exclude 0x7f/0xff (NaN) and 0x80 (-0.0), which TPU XLA may canonicalize.
+    valid = np.array([b for b in range(256) if b not in (0x7F, 0x80, 0xFF)], np.uint8)
+    return rng.choice(valid, size=shape)
+
+
 def _emulate_native_rope_gather(
     cache: jax.Array, spec: SparseMLAKVCacheSpec, flat_indices: np.ndarray
 ) -> np.ndarray:
@@ -796,7 +803,7 @@ class SparseCoreRopePackingTest(parameterized.TestCase):
         byte contract the native gather is tested against on TPU."""
         num_tokens = PAGE_SIZE * 2
         rng = np.random.default_rng(3)
-        raw = rng.integers(0, 256, (num_tokens, ROPE_DIM), np.uint8)
+        raw = _random_fp8_bytes(rng, (num_tokens, ROPE_DIM))
         k_pe = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
         kv_c = jnp.zeros((num_tokens, LKV_DIM), jnp.float8_e4m3fn)
         block_tables = np.array([6, 2, 0, 0], np.int32)
@@ -828,7 +835,7 @@ class SparseCoreRopePackingTest(parameterized.TestCase):
         num_tokens = sum(q_lens)
         query_start_loc = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
         block_tables = rng.permutation(TOTAL_PAGES).astype(np.int32)
-        raw = rng.integers(0, 256, (num_tokens, ROPE_DIM), np.uint8)
+        raw = _random_fp8_bytes(rng, (num_tokens, ROPE_DIM))
         k_pe = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
         kv_c = jnp.zeros((num_tokens, LKV_DIM), jnp.float8_e4m3fn)
         caches = {}

@@ -27,6 +27,7 @@ if importlib.util.find_spec("torch_tpu") is None:
     sys.modules.setdefault("torch_tpu._internal.compile", _compile_mod)
 
 from sglang.srt.environ import envs as sglang_envs
+from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import is_tpu
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
@@ -365,15 +366,19 @@ class TestGlm5NextVitTpuCompileRunnerOnTpu(CustomTestCase):
             )
             stack.enter_context(get_flags().dp.override(enabled=False))
 
-            tpu_vit = glm5_next.Glm5NextVisionModel(
-                vision_config,
-                quant_config=None,
-                prefix="visual",
-                use_data_parallel=True,
-            )
+            # Build under a bf16 default dtype, as the model loader does, rather
+            # than casting every parameter: LayerNorm keeps the fp32 weights its
+            # forward casts to, so its layer_norm sees one dtype.
+            with set_default_torch_dtype(torch.bfloat16):
+                tpu_vit = glm5_next.Glm5NextVisionModel(
+                    vision_config,
+                    quant_config=None,
+                    prefix="visual",
+                    use_data_parallel=True,
+                )
             tpu_vit.use_data_parallel = False
             tpu_vit.load_state_dict(state_dict)
-            tpu_vit = tpu_vit.to(device="tpu", dtype=torch.bfloat16)
+            tpu_vit = tpu_vit.to(device="tpu")
             for block in tpu_vit.blocks:
                 self.assertIsInstance(block.attn.qkv_backend, VisionTpuAttention)
 

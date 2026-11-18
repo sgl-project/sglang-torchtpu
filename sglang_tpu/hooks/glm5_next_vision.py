@@ -23,9 +23,11 @@ encode_glm5_next_vision_on_host
        is present and registers Qwen3VLDecoderTpuCompilePolicy on model.model
        (Glm5NextModel) unless mm_config.language_model_only or
        --enable-dp-attention is set (covering both standard multimodal and EPD
-       language-only servers, while keeping --language-model-only,
-       --encoder-only, and --enable-dp-attention on default/whole-model
-       behavior). AROUND mm_schedule._can_skip_pre_embed_feature_move honors
+       language-only servers). Under --language-model-only without DP
+       attention it registers Glm5NextDecoderTpuCompilePolicy (spmd_safe) on
+       the whole model; --encoder-only and --enable-dp-attention keep the
+       default whole-model fallback. AROUND
+       mm_schedule._can_skip_pre_embed_feature_move honors
        owner.keeps_mm_features_on_host so non-DP host-staged vision avoids an
        H2D -> blocking D2H -> H2D round-trip while DP encoder keeps device H2D.
        AROUND Glm5NextVisionModel.forward stages each frame on the host at a
@@ -84,12 +86,24 @@ def compile_glm5_next_decoder_only(result: None, model: Any, *args, **kwargs) ->
         )
         model.keeps_mm_features_on_host = not use_dp_encoder
 
-    if getattr(model, "model", None) is None or bool(
-        getattr(getattr(model, "mm_config", None), "language_model_only", False)
-    ):
-        return  # --language-model-only or encoder-only: keep default behavior.
+    if getattr(model, "model", None) is None:
+        return  # encoder-only: no decoder.
 
+    from sglang.srt.compilation.support_torch_compile import support_torch_compile
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+    language_model_only = bool(
+        getattr(getattr(model, "mm_config", None), "language_model_only", False)
+    )
+    if language_model_only:
+        if not is_dp_attention_enabled():
+            from sglang_tpu.models.glm5_next_compile_policy import (
+                Glm5NextDecoderTpuCompilePolicy,
+            )
+
+            # The whole-model boundary of the fallback, declared spmd_safe.
+            support_torch_compile(model, policy=Glm5NextDecoderTpuCompilePolicy)
+        return
 
     if is_dp_attention_enabled():
         logger.warning(
@@ -99,7 +113,6 @@ def compile_glm5_next_decoder_only(result: None, model: Any, *args, **kwargs) ->
         )
         return
 
-    from sglang.srt.compilation.support_torch_compile import support_torch_compile
     from sglang_tpu.compilation.decoder_compile_policy import (
         Qwen3VLDecoderTpuCompilePolicy,
     )
