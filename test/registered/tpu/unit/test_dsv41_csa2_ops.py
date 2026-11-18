@@ -225,7 +225,7 @@ def _host(x):
 
 def _step(case, inputs):
     """One layer step: SWA metadata, SWA and main publication, attention."""
-    meta, bounds, swa_records = ops.swa_metadata(
+    meta, _, swa_records = ops.swa_metadata(
         inputs["swa_table"], inputs["starts"], inputs["positions"], inputs["minimum"]
     )
     inputs["swa_pages"].copy_(
@@ -252,7 +252,8 @@ def _step(case, inputs):
         inputs["q"],
         inputs["swa_pages"],
         meta,
-        bounds,
+        # Causal visibility: non-None bounds select the DSpark non-causal window.
+        None,
         inputs["starts"],
         inputs["positions"],
         inputs["sink"],
