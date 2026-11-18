@@ -27,7 +27,6 @@ from sglang_tpu.dp_replicas import (
     prepare_host_session,
     validate_dp_replicas,
 )
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_dma_hicache import (
     is_tpu_dma_hicache_backend,
     tpu_dma_hicache_backends,
@@ -135,6 +134,8 @@ def _rpa_kernel_spec(backend: str | None):
 
 
 def _uses_block_major_kv() -> bool:
+    from sglang_tpu.envs import envs as tpu_envs
+
     return tpu_envs.SGLANG_TPU_USE_BLOCK_MAJOR_KV.get()
 
 
@@ -182,6 +183,8 @@ def _check_block_major_supported(server_args) -> None:
 
 
 def _check_block_major_disaggregation(cfg) -> None:
+    from sglang_tpu.envs import envs as tpu_envs
+
     if cfg.disaggregation_transfer_backend != "raiden":
         raise ValueError(
             "SGLANG_TPU_USE_BLOCK_MAJOR_KV supports P/D over the raiden "
@@ -315,6 +318,8 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
             f"{feature} requires --sampling-backend pytorch (the logits step runs on "
             f"the reduced last-token rows), got {cfg.sampling_backend!r}."
         )
+    from sglang_tpu.envs import envs as tpu_envs
+
     if tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
         raise NotImplementedError(
             f"{feature} does not support input (prompt) logprobs; unset "
@@ -411,6 +416,8 @@ def _pin_req_to_token_on_host(reason: str) -> None:
 
 def _pin_fused_moe_tensorcore_gather(reason: str) -> None:
     """Force SGLANG_TPU_FUSED_MOE_SC_GATHER off, warning if it was turned on."""
+    from sglang_tpu.envs import envs as tpu_envs
+
     if (
         tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.is_set()
         and tpu_envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()
@@ -427,6 +434,8 @@ def _pin_moe_gather_permute_for_static_fp8(parts: frozenset[str]) -> None:
     the one-hot matmul where the combine runs on the SparseCore. That pairing
     gave wrong tokens there (DSpark verifying four requests, 32 tokens), while
     either path end to end was right."""
+    from sglang_tpu.envs import envs as tpu_envs
+
     if parts & {"moe_front", "latent_up"}:
         tpu_envs.SGLANG_TPU_FORCE_MOE_GATHER_PERMUTE_WITH_SC_COMBINE.set(True)
 
@@ -928,6 +937,8 @@ def _register_attention_backends() -> None:
         return DSV4TPUAttnBackend(runner)
 
     # Vision: opt in to block-skipping splash for the "tpu" backend.
+    from sglang_tpu.envs import envs as tpu_envs
+
     if tpu_envs.SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION.get():
         from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
         from sglang_tpu.attention.vision_splash import VisionTpuSplashAttention
@@ -1686,6 +1697,8 @@ class TpuSRTPlatform(SRTPlatform):
     @staticmethod
     def pcp_ring_enabled() -> bool:
         # Validation refuses ring mode without prefill context parallelism.
+        from sglang_tpu.envs import envs as tpu_envs
+
         return tpu_envs.SGLANG_TPU_PCP_MODE.get().lower() == "ring"
 
     def supports_moe_dp_pipeline_stages(self) -> bool:
@@ -1832,6 +1845,8 @@ class TpuSRTPlatform(SRTPlatform):
             rank_slice._load()
             traced_rank._load()
             _register_attention_backends()
+            from sglang_tpu.envs import envs as tpu_envs
+
             if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():
                 from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
 
@@ -1851,6 +1866,7 @@ class TpuSRTPlatform(SRTPlatform):
             arm_recompilation_checker,
             maybe_enable_site_tracing,
         )
+        from sglang_tpu.envs import envs as tpu_envs
 
         if get_exec().graph.enable_torch_compile:
             arm_recompilation_checker(reset_counters=False, overwrite_baseline=False)
