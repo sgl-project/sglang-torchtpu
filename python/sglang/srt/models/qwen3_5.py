@@ -1028,7 +1028,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             with torch.cuda.stream(self.alt_stream):
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
             current_stream.wait_stream(self.alt_stream)
-        elif self._fused_input_proj_cpu_enabled.value:
+        elif _is_cpu and self._fused_input_proj_cpu_enabled.value:
             projected_states_qkvz, projected_states_ba = (
                 torch.ops.sgl_kernel.fused_input_proj_cpu(
                     hidden_states,
@@ -3308,7 +3308,12 @@ class Qwen3_5TextForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+        )
         # The backbone returns a bare tensor normally, but a
         # (hidden_states, aux_hidden_states) tuple when aux/EAGLE capture is on.
         # Spec/EAGLE is rejected up the stack today, but unpack defensively so a

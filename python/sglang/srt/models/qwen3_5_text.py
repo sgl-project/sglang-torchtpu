@@ -196,7 +196,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             input_ids,
             positions,
             forward_batch,
-            input_embeds,
+            input_embeds=input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
 

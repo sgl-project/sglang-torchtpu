@@ -132,6 +132,51 @@ def _static_default_kwargs(fn: Callable[..., Any]) -> dict[str, Any]:
     }
 
 
+def _static_default_positional_tail(
+    fn: Callable[..., Any],
+) -> tuple[tuple[bool, Any], ...]:
+    """Static defaults for positional parameters beyond ``(input_ids, positions, forward_batch)``."""
+    signature = getattr(fn, "__signature__", None)
+    if signature is None:
+        return ()
+    positional = [
+        param
+        for param in signature.parameters.values()
+        if param.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    if len(positional) <= 3:
+        return ()
+    return tuple(
+        (
+            param.default is not inspect.Parameter.empty
+            and isinstance(param.default, _DEFAULT_KWARG_TYPES),
+            param.default,
+        )
+        for param in positional[3:]
+    )
+
+
+def _trim_default_positional_args(
+    args: tuple[Any, ...],
+    default_tail: tuple[tuple[bool, Any], ...],
+) -> tuple[Any, ...]:
+    """Drop trailing positional args matching static parameter defaults."""
+    if not args or not default_tail or len(args) > len(default_tail):
+        return args
+    end = len(args)
+    while end > 0:
+        has_default, default_val = default_tail[end - 1]
+        if has_default and _matches_default(args[end - 1], default_val):
+            end -= 1
+        else:
+            break
+    return args[:end] if end != len(args) else args
+
+
 def _matches_default(value: Any, default: Any) -> bool:
     if default is None:
         return value is None
@@ -975,6 +1020,7 @@ class CompiledForwardShim:
         if signature is not None:
             self.__signature__ = signature
         self._default_kwargs = _static_default_kwargs(compiled_fn)
+        self._default_positional_tail = _static_default_positional_tail(compiled_fn)
         from sglang_tpu.envs import envs as tpu_envs
 
         self._skip_guard_stance = (
@@ -1072,6 +1118,12 @@ class CompiledForwardShim:
         if not torch.compiler.is_compiling():
             self.wait_for_hicache_reload()
 
+        if self._default_positional_tail and args:
+            # Outer CausalLM wrappers often pass trailing default None args
+            # positionally (e.g. ``self.model(ids, pos, fb, input_embeds)``)
+            # while precompile invokes ``self.model(ids, pos, fb)``. Trim
+            # trailing static defaults so both share one Dynamo arity guard.
+            args = _trim_default_positional_args(args, self._default_positional_tail)
         if self._default_kwargs and kwargs:
             # Dynamo treats omitted kwargs and explicit defaults as different
             # call shapes; drop explicit default values.
@@ -1146,7 +1198,10 @@ class CompiledForwardShim:
                 embed_tokens=self.policy.model_runner.model.get_input_embeddings(),
             )
         if forward_batch.input_embeds is not None:
-            kwargs["input_embeds"] = forward_batch.input_embeds
+            if args and isinstance(args[0], torch.Tensor):
+                args = (forward_batch.input_embeds,) + args[1:]
+            else:
+                kwargs["input_embeds"] = forward_batch.input_embeds
         # Pin is_prefill_only for the compiled forward. An idle batch computes
         # it as True (all() over zero requests) while real batches are False;
         # the compiled forward reads the value, so it must be identical across

@@ -411,6 +411,72 @@ class TestQwen35GdnQkReplication(CustomTestCase):
         self.assertEqual(attn.attn.tp_k_head_num, pool_kv_heads)
         self.assertEqual(attn.attn.tp_q_head_num % attn.attn.tp_k_head_num, 0)
 
+    def test_dynamo_guard_stability_input_proj_and_text_wrapper(self):
+        """Regression test for Dynamo guard stability under fail_on_recompile:
+        1. _forward_input_proj on non-CPU must not evaluate LazyValue
+           _fused_input_proj_cpu_enabled inside the first compiled trace
+           (which previously mutated _creator=None and invalidated graph 0/0).
+        2. Qwen3_5ForCausalLM (qwen3_5_text) and Qwen3_5TextForCausalLM (qwen3_5)
+           must pass input_embeds by keyword rather than as a 4th positional None.
+        """
+        from unittest.mock import patch
+
+        from sglang.srt.models import qwen3_5 as qwen3_5_mod
+        from sglang.srt.models import qwen3_5_text as qwen3_5_text_mod
+
+        gdn = _build_gdn_layer(_gdn_config(dtype=torch.bfloat16), tp_size=4, tp_rank=0)
+        gdn.in_proj_qkvz.weight.data.normal_(0, 0.02)
+        gdn.in_proj_ba.weight.data.normal_(0, 0.02)
+        x = torch.randn(4, 64, dtype=torch.bfloat16)
+
+        with patch.object(qwen3_5_mod, "_is_cpu", False):
+            self.assertIsNotNone(gdn._fused_input_proj_cpu_enabled._creator)
+            compiled_proj = torch.compile(
+                gdn._forward_input_proj, backend="eager", fullgraph=False
+            )
+            qkvz_0, ba_0 = compiled_proj(x)
+            self.assertIsNotNone(gdn._fused_input_proj_cpu_enabled._creator)
+            with torch.compiler.set_stance("fail_on_recompile"):
+                qkvz_1, ba_1 = compiled_proj(x)
+            torch.testing.assert_close(qkvz_0, qkvz_1)
+            torch.testing.assert_close(ba_0, ba_1)
+
+        recorded_calls = []
+
+        def spy_backbone(*args, **kwargs):
+            recorded_calls.append((args, kwargs))
+            return args[0].to(torch.bfloat16).unsqueeze(-1)
+
+        fb = SimpleNamespace(mrope_positions=None)
+        ids = torch.tensor([3, 5], dtype=torch.int64)
+        pos = torch.tensor([1, 2], dtype=torch.int64)
+
+        outer = qwen3_5_text_mod.Qwen3_5ForCausalLM.__new__(
+            qwen3_5_text_mod.Qwen3_5ForCausalLM
+        )
+        torch.nn.Module.__init__(outer)
+        outer.is_mrope_enabled = False
+        outer.pp_group = SimpleNamespace(is_last_rank=True)
+        outer.model = spy_backbone
+        outer.lm_head = None
+        outer.logits_processor = lambda input_ids, hs, lm_head, batch, aux: hs
+        outer.forward(ids, pos, fb)
+
+        text_outer = qwen3_5_mod.Qwen3_5TextForCausalLM.__new__(
+            qwen3_5_mod.Qwen3_5TextForCausalLM
+        )
+        torch.nn.Module.__init__(text_outer)
+        text_outer.model = spy_backbone
+        text_outer.lm_head = None
+        text_outer.logits_processor = lambda input_ids, hs, lm_head, batch: hs
+        text_outer.forward(ids, pos, fb)
+
+        self.assertEqual(len(recorded_calls), 2)
+        for call_args, call_kwargs in recorded_calls:
+            self.assertEqual(len(call_args), 3)
+            self.assertIn("input_embeds", call_kwargs)
+            self.assertIsNone(call_kwargs["input_embeds"])
+
 
 if __name__ == "__main__":
     unittest.main()
