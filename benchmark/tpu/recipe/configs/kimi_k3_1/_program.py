@@ -33,6 +33,19 @@ def apply(config: dict) -> dict:
     env["SGLANG_TPU_K3_PROGRAM_PRESHARDED"] = os.environ.get(
         "SGLANG_TPU_K3_PROGRAM_PRESHARDED", "/presharded-k31"
     )
+    # K3_PROGRAM_LIBTPU_EXTRA: libtpu flags (space- or comma-separated) set on
+    # top of the recipe's LIBTPU_INIT_ARGS, replacing a flag of the same name
+    # (runtime_env overrides the inherited environment, so exporting
+    # LIBTPU_INIT_ARGS itself has no effect), e.g. --xla_tpu_dvfs_p_state=7.
+    extra = os.environ.get("K3_PROGRAM_LIBTPU_EXTRA", "").replace(",", " ").split()
+    if extra:
+        names = {flag.split("=", 1)[0] for flag in extra}
+        kept = [
+            flag
+            for flag in (env.get("LIBTPU_INIT_ARGS") or "").split()
+            if flag.split("=", 1)[0] not in names
+        ]
+        env["LIBTPU_INIT_ARGS"] = " ".join(kept + extra)
     kernel = env.get("SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG") or ""
     if "dsa_select_rounds=" not in kernel:
         env["SGLANG_TPU_K3_PROGRAM_KERNEL_CONFIG"] = ";".join(
