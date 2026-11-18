@@ -127,6 +127,14 @@ class KernelConfig:
     # ``latent_up_tp`` (the latent_up blocks indexed by host and core). The
     # same products, sums and rounding points (bit-identical).
     moe_token_parallel_up: bool = False
+    # 8-row steps with moe_token_parallel_up: both cores of a chip hold the
+    # same eight-lane routed sum of their pair's tokens, so only the core-1
+    # rank sends it across hosts, to both cores of its chip on each other host
+    # (six copies, their send waits after the latent-up product); the core-0
+    # ranks only receive (in traces their own cross-host sends and the slower
+    # core-0-to-core-0 delivery hold every token owner's output round). The
+    # same bits in the same host slots (bit-identical).
+    moe_host_round_odd_cores: bool = False
     # Serving batches beyond the powers of two, by request count: plain
     # decode and three-draft verifies (e.g. "48" / "12"; multiples of 16 rows
     # take the staged MoE paths).

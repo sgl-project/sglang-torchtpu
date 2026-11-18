@@ -3614,6 +3614,9 @@ LATE_SHARED_DOWN = _config().decode_late_shared_down
 
 # The token-parallel MoE latent-up (KernelConfig.moe_token_parallel_up).
 TOKEN_PARALLEL_UP = _config().moe_token_parallel_up
+# Its routed host round sent by the core-1 ranks only
+# (KernelConfig.moe_host_round_odd_cores; _TokenParallelUp.odd_host_round).
+TOKEN_PARALLEL_ODD_HOST_ROUND = _config().moe_host_round_odd_cores
 # Its output round's peers (XOR rank offsets): the rank pair on every host.
 _TOKEN_PARALLEL_PEERS = (25, 24, 17, 16, 9, 8, 1)
 # The routed pair round's seven messages count on one semaphore that none of
@@ -3651,6 +3654,13 @@ class _TokenParallelUp:
     blocks' rows); the latent RMS norm runs on the same [batch, padded latent]
     tile (the pair's tokens repeated over its rows); and the latent-up product
     is the same [batch, latent] x [latent, 1024] product on the same block.
+
+    ``odd_host_round`` (KernelConfig.moe_host_round_odd_cores): after the
+    routed pair round both cores of a chip hold the same eight slots (lane
+    l's partial of their pair's tokens in slot l), so their host slots are
+    bitwise equal. Only the core-1 rank sends its slot across hosts, to both
+    cores of its chip on each other host; the core-0 ranks only receive.
+    Every rank adds the same four host slots in the same order.
     """
 
     batch_size: int
@@ -3667,6 +3677,7 @@ class _TokenParallelUp:
     output_vmem: Any  # [12, batch / 4 * 8, 128] BF16
     output_send_semaphores: Any  # [7]
     output_receive_semaphores: Any  # [7]
+    odd_host_round: bool = False
 
     block = 1024  # latent_up / shared-expert columns of a lane block
     hidden = 7168  # seven blocks; the eighth is padding
@@ -3773,14 +3784,16 @@ class _TokenParallelUp:
             device_id_type=pl.DeviceIdType.MESH,
         )
 
-    def _routed_host_copy(self, offset):
+    def _routed_host_copy(self, offset, sibling=False):
         view = self.expert_host.at[self.host, : self.routed_rows, :]
+        target = self.rank ^ (8 * offset)
         return tpu.make_async_remote_copy(
             view,
             view,
             self.send_semaphores.at[6 + offset],
             self.receive_semaphores.at[6 + offset],
-            device_id=(self.rank ^ (8 * offset),),
+            # ``sibling``: the other core of that host's chip.
+            device_id=(target ^ 1 if sibling else target,),
             device_id_type=pl.DeviceIdType.MESH,
         )
 
@@ -3809,15 +3822,52 @@ class _TokenParallelUp:
                 local, self.shard_rows
             )
 
+    # The core-1 host round (odd_host_round): rank S = (host h, lane 2p + 1)
+    # sends slot expert_host[h] to R = (h', 2p) and (h', 2p + 1) for every
+    # h' != h on semaphore 6 + (h ^ h'), so every rank receives one copy an
+    # offset, from its chip's core-1 rank on that host.
+    # (a) Slot reuse: R reads slot h in layer L's t4 and only then starts its
+    #     output round to the seven other owners of pair p, S among them (R ^ S
+    #     is 8x or 8x + 1, both in _TOKEN_PARALLEL_PEERS). S's output round
+    #     waits for all seven before S leaves layer L, so S's layer L + 1 copy
+    #     lands after R's read and cannot signal R's semaphore 6 + x before
+    #     R's layer-L wait.
+    # (b) Layer 0's dense all-reduce also counts on semaphores 7..9 (other
+    #     byte counts). S's layer-1 t4 follows its layer-1 attention host round
+    #     (p2b), which waits for the p2b send of (h', 2p + 1). That send follows
+    #     the layer-1 output projection's local round of host h' (all eight of
+    #     its ranks, R among them), which needs R's layer-1 send, issued after
+    #     R finished layer 0's all-reduce.
+    # (c) S rewrites expert_host[h] only in the next layer's t3, and it waits
+    #     for its six sends after the latent-up product (in the last layer too,
+    #     so nothing is in flight at exit). Core-0 ranks start nothing on 7..9.
+    #     A layer's balance: core 1 sends six and waits for six sends; every
+    #     rank receives three and waits for three.
     def start_routed_host(self):
-        for offset in range(3, 0, -1):
-            self._routed_host_copy(offset).start()
+        if not self.odd_host_round:
+            for offset in range(3, 0, -1):
+                self._routed_host_copy(offset).start()
+            return
+
+        @pl.when(self.rank % 2 == 1)
+        def send():
+            # The three core-0 copies first (the longer path): each core-0
+            # rank's last copy is the third issued, each core-1 rank's the
+            # sixth.
+            for sibling in (True, False):
+                for offset in range(3, 0, -1):
+                    self._routed_host_copy(offset, sibling=sibling).start()
 
     def routed_host_reduce(self, tile):
         """The pair's latents summed over the four hosts, FP32, into every
         group of ``tile`` [batch, >= latent] (row r: token r % tokens)."""
         for offset in range(3, 0, -1):
-            self._routed_host_copy(offset).wait()
+            if self.odd_host_round:
+                # The copy from that host's core-1 rank of this chip; the
+                # core-1 ranks wait for their sends in finish_routed_host_sends.
+                self._routed_host_copy(offset).wait_recv()
+            else:
+                self._routed_host_copy(offset).wait()
         per_shard = self.tokens // 2
         for shard in range(2):
             view = self.expert_host[
@@ -3827,6 +3877,19 @@ class _TokenParallelUp:
             for group in self._groups():
                 first = group + shard * per_shard
                 tile[first : first + per_shard, : self.latent] = sums
+
+    def finish_routed_host_sends(self):
+        """odd_host_round: the core-1 ranks wait for their six host-round sends
+        (two an offset on its send semaphore). Nothing without it."""
+        if not self.odd_host_round:
+            return
+        with _phase("t4b_routed_host_sends"):
+
+            @pl.when(self.rank % 2 == 1)
+            def wait():
+                for sibling in (True, False):
+                    for offset in range(3, 0, -1):
+                        self._routed_host_copy(offset, sibling=sibling).wait_send()
 
     # Shared expert: reduce-scatter to (tokens, block) owners.
     def _shared_send_view(self, target_lane):
@@ -4370,6 +4433,7 @@ def moe(
             output_vmem,
             output_send_semaphores,
             output_receive_semaphores,
+            odd_host_round=TOKEN_PARALLEL_ODD_HOST_ROUND,
         )
     if synchronize_devices:
         collectives32.barrier()
@@ -5523,6 +5587,9 @@ def moe(
                 epsilon=epsilon,
                 latent_feature_count=latent_feature_count,
             )
+        # KernelConfig.moe_host_round_odd_cores: the core-1 ranks' host-round
+        # sends drain during the product.
+        token_parallel.finish_routed_host_sends()
         with _phase("t6_shared_host"):
             # Started in t4, the shared host round lands during the product
             # (no routed gather to hide it behind).
