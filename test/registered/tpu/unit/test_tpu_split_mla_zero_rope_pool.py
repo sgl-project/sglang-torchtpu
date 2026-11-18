@@ -38,9 +38,7 @@ class TestSplitMlaZeroRopeBytes(CustomTestCase):
         from sglang_tpu.hooks.dsa_kv_pool import _qk_rope_head_dim
 
         # Direct attribute on model_config (standard MLA/DSA ModelConfig).
-        self.assertEqual(
-            _qk_rope_head_dim(SimpleNamespace(qk_rope_head_dim=0)), 0
-        )
+        self.assertEqual(_qk_rope_head_dim(SimpleNamespace(qk_rope_head_dim=0)), 0)
         # Missing on model_config; falls back to hf_config / hf_config.text_config.
         self.assertEqual(
             _qk_rope_head_dim(
