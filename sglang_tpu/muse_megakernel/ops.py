@@ -736,7 +736,8 @@ class MuseMegakernel(torch.nn.Module):
             alias_p=tiled,
             xfull_packed=False,
             attn_opt=attn_opt,
-            tiled_vmem_y=2 if (moe_opt and tiled) else 0,
+            # follows opt, not moe_opt: pair_o_rs on tiled VMEM pads needs VMEM Y (validate)
+            tiled_vmem_y=2 if (opt and tiled) else 0,
             tiled_o_rot=opt and tiled,
             tiled_fold=opt and tiled and fold_env,
             pair_ag=1 if (opt and tiled) else 0,

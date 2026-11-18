@@ -633,7 +633,8 @@ class TpuEnvs:
     # 1: TP steps of <= 32 rows also run the row-tiled program (and pad to the row tile).
     SGLANG_TPU_MUSE_MK_DEV_FORCE_TILED = EnvBool(False)
     # 0: MK_OPT's MoE-side flags off (expert loop / split / w2 staging, fp8 expert x, int8 y
-    # RS, VMEM / pair y) while attention and collective flags stay on; unset follows MK_OPT.
+    # RS, pair y) while attention and collective flags stay on (and VMEM y, which pair o RS
+    # needs); unset follows MK_OPT.
     SGLANG_TPU_MUSE_MK_DEV_MOE_OPT = EnvInt(None)
     # Megakernel top-k override (numerics._topk_iter): "uniform" picks pseudo-random experts
     # (a hash of the scores), "balanced" also one expert per EP rank group per row. Empty: off.
