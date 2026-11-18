@@ -473,6 +473,35 @@ class TestDecodeLandsAndMerges(unittest.TestCase):
             )
         self.assertEqual(seen, [[1, 2, 2, 2, 2, 2, 2, 2]] * 2)
 
+    def test_bf16_draft_tensor_skipped_during_land_merge(self):
+        """Merging a landing room leaves a trailing bf16 draft KV tensor untouched,
+        while fp8 target layers merge byte for byte."""
+        mgr = _decode()
+        bf16 = (
+            torch.arange(
+                (1 + ALLOC_BLOCKS + 8) * PAGE * 2 * 2 * HEAD_DIM, dtype=torch.int32
+            )
+            .to(torch.bfloat16)
+            .view(1 + ALLOC_BLOCKS + 8, PAGE, 2, 2, HEAD_DIM)
+        )
+        before = bf16.clone()
+        mgr._kv_caches.append(bf16)
+        _closing(mgr)
+        plans = _registered(mgr)
+        for req in plans.values():
+            _replay(req, mgr.test_sources, mgr._kv_caches[:2])
+        _settle(mgr, received=list(plans))
+        mgr.land_prepass()
+        self.assertFalse(mgr.is_failed(ROOM), mgr.failure_records.get(ROOM))
+        self.assertTrue(mgr.land_merged(ROOM))
+        self.assertEqual(mgr._land.arena.held, 0)
+        for layer in range(2):
+            want = _expected_page(mgr.test_heads, layer)
+            for b in FINAL:
+                got = mgr._kv_caches[layer].view(torch.uint8)[b].reshape(want.shape)
+                self.assertTrue(torch.equal(got, want), f"layer {layer} block {b}")
+        self.assertTrue(torch.equal(bf16, before))
+
 
 class TestScratchFreePaths(unittest.TestCase):
     """Every scratch id goes back exactly once, on every terminal path."""

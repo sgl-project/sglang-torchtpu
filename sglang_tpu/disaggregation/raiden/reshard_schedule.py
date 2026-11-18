@@ -657,6 +657,10 @@ def _typed(schedule: Optional[List[Tuple[int, ...]]]) -> Optional[List[Any]]:
     return [(isinstance(e, LandEntry), tuple(e)) for e in schedule]
 
 
+def needs_land_merge(*, layout: KVLayoutGeometry) -> bool:
+    return layout.kind == TOKEN_MAJOR and layout.kv_packing == _LAND_PACKING
+
+
 def land_merge_slots(layout: KVLayoutGeometry) -> Tuple[slice, slice]:
     """``(final, scratch)`` slices of the kv_packing axis that the merge
     moves, on the logical ``[blocks, page, granules, kv_packing, head_dim]``
