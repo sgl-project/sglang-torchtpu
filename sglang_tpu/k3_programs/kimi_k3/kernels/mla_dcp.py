@@ -442,13 +442,23 @@ PERSISTENT_NAMES = (
 
 
 def native_pages(
-    batch, heads=HEADS_PER_RANK, sequence_rows=1, cache_dtype=jnp.bfloat16
+    batch, heads=HEADS_PER_RANK, sequence_rows=1, cache_dtype=jnp.bfloat16, *, dsa=False
 ) -> bool:
     """Whether a call stages pages as ``[span * page_tokens, 640]`` in the
     MXU's native tile (retiled by the DMA) rather than as the pool's
     ``[span * 128, packing, 640]`` blocks, whose loads relayout every tile:
     attention DP2's plain B96 and B128 (48 and 64 group rows of six heads)
-    and FP8 B64 (32; not under the opt-in ``mla_decode_ktile=2048``)."""
+    and FP8 B64 (32; not under the opt-in ``mla_decode_ktile=2048``), and
+    (``dsa``: Kimi-K3.1's selection) the FP8 verifies of 8-row sequences at
+    8 and 16 rows under ``KernelConfig.dsa_native_pages``."""
+    if (
+        dsa
+        and _config().dsa_native_pages
+        and heads == HEADS_PER_RANK
+        and cache_dtype == jnp.float8_e4m3fn
+        and (batch, sequence_rows) in ((8, 8), (16, 8))
+    ):
+        return True
     return (
         heads == 6
         and sequence_rows == 1
@@ -688,12 +698,9 @@ class DcpAttention:
         self.starts, self.total = starts, starts[-1]
         self.selection = selection
         if selection is not None:
-            if (
-                not self.fp8
-                or self.native
-                or self.folds != 1
-                or heads != HEADS_PER_RANK
-            ):
+            # Native pages (KernelConfig.dsa_native_pages) take the same steps:
+            # only the page buffer's layout differs.
+            if not self.fp8 or self.folds != 1 or heads != HEADS_PER_RANK:
                 raise ValueError(
                     "DSA selection: FP8 DCP32 decode with three heads per rank"
                 )
@@ -2051,6 +2058,12 @@ class DcpAttention:
 
     def prime(self):
         """Issue the first page DMAs (call as early as the positions allow)."""
+        if self.native and self.cache_verify_rows:
+            # Native verify pages (KernelConfig.dsa_native_pages): a step's
+            # copies pick the layer's pool by a tree of branches, so the
+            # primed steps share one copy of it (a loop) rather than one each.
+            pl.loop(0, jnp.minimum(self.buffers - 1, self.total))(self._start_step)
+            return
         for step in range(self.buffers - 1):
 
             @pl.when(step < self.total)

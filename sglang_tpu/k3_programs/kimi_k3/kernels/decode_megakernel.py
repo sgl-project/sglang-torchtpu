@@ -9327,13 +9327,16 @@ def _mla_scoped_scratch(
         tpu.VMEM((batch_size, 3, 1), jnp.float32),
         tpu.VMEM((batch_size, 3, 128), jnp.float32),
         # The DCP page buffers by batch (mla_dcp.page_plan; DcpAttention
-        # reads the span and the buffers from the shape).
+        # reads the span, the buffers and the native layout from the shape).
         *mla_dcp.scoped_scratch(
             batch_size,
             heads=dcp_heads,
             cache_dtype=dcp_dtype,
             page_tokens=dcp_page_tokens,
             sequence_rows=sequence_rows,
+            native=mla_dcp.native_pages(
+                batch_size, dcp_heads, sequence_rows, dcp_dtype, dsa=dsa
+            ),
             **mla_dcp.page_plan(
                 batch_size, dcp_heads, sequence_rows, dcp_dtype, dsa=dsa
             ),
