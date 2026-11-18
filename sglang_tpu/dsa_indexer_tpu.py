@@ -680,7 +680,10 @@ def build_dsa_kpool_topk_split_op():
 
 def build_dsa_kpool_expand_op():
     """Register ``kpool_expand_rows`` (picked pools -> token rows) as a torch
-    custom op, once: the last step of the pooled indexer's token split."""
+    custom op, once: the last step of the pooled indexer's token split.
+    ``row_start`` (i32[1]) is the batch row of the first picked row: 0 for
+    every rank's slices put together, the rank's window start under the
+    attention token split."""
     global _PALLAS_DSA_KPOOL_EXPAND_OP
     if _PALLAS_DSA_KPOOL_EXPAND_OP is not None:
         return _PALLAS_DSA_KPOOL_EXPAND_OP
@@ -697,6 +700,7 @@ def build_dsa_kpool_expand_op():
         kv_lens: jax.Array,
         cu_q_lens: jax.Array,
         distribution: jax.Array,
+        row_start: jax.Array,
         topk: int,
         kpool: int,
         out_width: int,
@@ -706,6 +710,7 @@ def build_dsa_kpool_expand_op():
             kv_lens,
             cu_q_lens,
             distribution,
+            row_start,
             topk=topk,
             kpool=kpool,
             out_width=out_width,
@@ -724,13 +729,21 @@ def build_dsa_kpool_expand_op():
         kv_lens: torch.Tensor,
         cu_q_lens: torch.Tensor,
         distribution: torch.Tensor,
+        row_start: torch.Tensor,
         topk: int,
         kpool: int,
         out_width: int,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             return jax_kernel(
-                picked, kv_lens, cu_q_lens, distribution, topk, kpool, out_width
+                picked,
+                kv_lens,
+                cu_q_lens,
+                distribution,
+                row_start,
+                topk,
+                kpool,
+                out_width,
             )
 
     def _fake_impl(
@@ -738,6 +751,7 @@ def build_dsa_kpool_expand_op():
         kv_lens: torch.Tensor,
         cu_q_lens: torch.Tensor,
         distribution: torch.Tensor,
+        row_start: torch.Tensor,
         topk: int,
         kpool: int,
         out_width: int,
