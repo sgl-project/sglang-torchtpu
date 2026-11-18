@@ -155,7 +155,9 @@ def _gather_page_chunks_per_iteration(
 
     With the page table resident in VMEM (``table_in_vmem``), a grid step no longer DMAs a
     page-table row, so ``floor`` loses its per-chunk term, and chunks are read as aligned
-    (8, 128) tiles of 8 chunks, so ``g`` is a multiple of 8 and there is no unrolled kernel.
+    (8, 128) tiles of 8 chunks, so a loop iteration covers a multiple of 8 chunks; the one
+    exception is a single iteration over the whole table (``g = num_chunks``, the unrolled
+    kernel's equivalent), which steps only through the table's chunks.
 
     Args:
       num_chunks: Width of a page-table row in 128-page chunks (static, from
@@ -167,7 +169,8 @@ def _gather_page_chunks_per_iteration(
 
     Returns:
       The number of chunk steps to unroll per ``fori_loop`` iteration of the bounded kernel,
-      or None if the unrolled kernel is expected to be cheaper.
+      or None if the unrolled kernel is expected to be cheaper (never None with
+      ``table_in_vmem``).
     """
     u = _gather_page_chunk_step_cycles(block_tokens, topk)
     # Per-iteration overhead of the fori_loop: the last gather's push-to-pop latency plus the
@@ -184,7 +187,7 @@ def _gather_page_chunks_per_iteration(
     if table_in_vmem:
         tile = _PAGE_TABLE_TILE_CHUNKS
         best_cycles, best_g = float("inf"), None
-        candidates = range(tile, align_to(num_chunks, tile) + 1, tile)
+        candidates = [*range(tile, num_chunks, tile), num_chunks]
     else:
         # If not table_in_vmem, each chunk needs ~10 cycles for the page-table row (4 KB per
         # 128-page chunk per block; ~1700 cycles at 64 chunks).
@@ -235,6 +238,7 @@ def _gather_page_ids_vmem_table_kernel(
     out_ref,  # VMEM i32[num_tokens_per_block, topk]: this block's physical page ids
     *,
     chunks_per_iteration,
+    num_chunks,
 ):
     """Bounded kernel that reads the page table from VMEM instead of a per-token row.
 
@@ -242,6 +246,9 @@ def _gather_page_ids_vmem_table_kernel(
     sequence's 8 consecutive chunks are one aligned (8, 128) tile and only the tiles a block
     visits are read. A block of one sequence broadcasts each tile row to all its tokens; a block
     spanning sequences builds each chunk's window from its tokens' tiles.
+
+    ``chunks_per_iteration`` is a multiple of 8, or ``num_chunks`` for a single iteration over
+    the whole table, which skips the padding chunks of its last tile.
     """
     # Grid step: one block of num_tokens_per_block query tokens.
     block_idx = pl.program_id(0)
@@ -262,7 +269,7 @@ def _gather_page_ids_vmem_table_kernel(
 
     def make_body(token_seq_ids):
         def body(i, out):
-            for k in range(g // tile_size):
+            for k in range(cdiv(g, tile_size)):
                 # Tail tiles past the table repeat its last tile, which selects the same values.
                 c0 = pl.multiple_of(
                     jnp.minimum(i * g + k * tile_size, last_tile_start), tile_size
@@ -270,7 +277,8 @@ def _gather_page_ids_vmem_table_kernel(
                 tiles = [
                     page_table_ref[s, pl.ds(c0, tile_size), :] for s in token_seq_ids
                 ]
-                for j in range(tile_size):
+                # Only a whole-table iteration (g == num_chunks) has a partial tile.
+                for j in range(min(tile_size, g - k * tile_size)):
                     window_chunk = jnp.broadcast_to(tiles[0][j : j + 1], row.shape)
                     for r in range(1, len(tiles)):
                         window_chunk = jnp.where(
@@ -318,16 +326,19 @@ def _page_table_fits_in_vmem(
 
     Returns:
       True if the single-buffered page table plus the double-buffered top-k and output blocks
-      fit in VMEM, and the per-token sequence ids plus per-block chunk counts fit in SMEM.
+      fit in the default scoped VMEM limit, and the per-token sequence ids plus per-block chunk
+      counts fit in SMEM.
     """
     info = pltpu.get_tpu_info()
     vmem = 4 * (
         max_num_seqs * padded_chunks * _GATHER_PAGE_CHUNK + 2 * 2 * block_tokens * topk
     )
     smem = 4 * (padded_tokens + padded_tokens // block_tokens)
+    # Stay within the default scoped VMEM limit (half of VMEM): raising the limit to all of VMEM
+    # made this kernel ~4x slower on short tables on tpu7x.
     # Same SMEM reserve as the batched RPA schedule (batched_rpa/configs.py).
     return (
-        vmem <= info.vmem_capacity_bytes
+        vmem <= info.vmem_capacity_bytes // 2
         and smem <= info.smem_capacity_bytes - 32 * 1024
     )
 
@@ -357,9 +368,11 @@ def gather_page_ids(
         ).astype(jnp.int32)
 
     padded_chunks = align_to(num_chunks, _PAGE_TABLE_TILE_CHUNKS)
-    # If the whole page table fits in VMEM, load it once per call instead of copying a
-    # page-table row for every token and DMAing it to every token block.
-    if _page_table_fits_in_vmem(
+    # Load the whole page table into VMEM once per call when it is smaller than the per-token
+    # rows it replaces (fewer sequences than tokens, i.e. prefill) and fits. With a token per
+    # sequence (decode), the rows are no bigger and every token block mixes sequences, so the
+    # row-window kernels are cheaper.
+    if max_num_seqs < num_tokens and _page_table_fits_in_vmem(
         max_num_seqs, padded_chunks, padded_tokens, block_tokens, topk
     ):
         pad = padded_tokens - num_tokens
@@ -378,6 +391,7 @@ def gather_page_ids(
             functools.partial(
                 _gather_page_ids_vmem_table_kernel,
                 chunks_per_iteration=chunks_per_iteration,
+                num_chunks=num_chunks,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=2,
@@ -397,7 +411,6 @@ def gather_page_ids(
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=("arbitrary",),
                 disable_bounds_checks=True,
-                vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
             ),
             name="gather_page_ids_vmem_table",
         )(chunks_needed(logical), seq_ids, page_table, logical)

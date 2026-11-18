@@ -50,6 +50,7 @@ def table_in_vmem(request, monkeypatch):
             1000,
             [1000, 7],
         ),  # 8 chunks, page table not a multiple of 128 (row windows: unrolled)
+        (300, [300, 40]),  # 3 chunks (VMEM table: part of one tile)
         (8192, [256, 1170]),  # short prefixes in a 1M-context table
         (8192, [8192, 5000]),  # full-length prefix
         (
