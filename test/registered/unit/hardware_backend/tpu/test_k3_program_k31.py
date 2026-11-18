@@ -2094,6 +2094,118 @@ class TestPairCombine(CustomTestCase):
         self.assertIn("OK", result.stdout, result.stderr[-3000:])
 
 
+class TestPairLseRows(CustomTestCase):
+    """``KernelConfig.dcp_pair_lse_rows`` (the pair combine's stage two as
+    the latent lanes plus two lse rows) must not change a bit. The
+    attention: ``TestSelectedAttention``'s harness (interpret mode, a 4-rank
+    group of chips 0/1 and 2/3, scratch NaN until written) with
+    ``dcp_pair_combine``, the knob off and on, outputs compared bit for bit:
+    B1 x7 (one 8-row sequence, compact steps, a 512-slot window) with and
+    without early queries, two 4-row sequences (dense and compact steps),
+    poisoned page slots, plain B4 and B1 rows (12- and 3-row packets) and a
+    step activity that attends nothing (every partial empty). The lse rows'
+    helpers: the same bits as the 640-lane packets' for any values."""
+
+    TAIL = """
+        PAIR = ("dcp_pair_combine",)
+        for args, kwargs, modes in (
+            (([2600], 8, 40, 7), dict(grouped=True, compact=128, window=512), (False, True)),
+            (([1500, 3000], 4, 200, 1), dict(grouped=True, compact=128, window=512, expect=("compact", "dense")),
+             (False,)),
+            (([700, 9000], 4, 8, 4), dict(grouped=True, compact=64, poison=True, window=256), (True,)),
+            (([2047, 600, 64, 3000], 1, 128, 2), dict(), (False,)),
+            (([3000], 1, 64, 9), dict(wide=3), (True,)),
+            (([700, 5000, 1200, 2600], 1, 64, 3), dict(activity="none"), (False,)),
+        ):
+            for sent in modes:
+                off = case(*args, **kwargs, sent=sent, knobs=PAIR)
+                on = case(*args, **kwargs, sent=sent, knobs=PAIR + ("dcp_pair_lse_rows",))
+                assert np.isfinite(on).all(), (args, sent)
+                assert np.array_equal(off.view(np.uint32), on.view(np.uint32)), (args, sent, np.abs(off - on).max())
+                print(args, sent, "bit-identical", flush=True)
+        print("OK")
+    """
+
+    def test_lse_rows_hold_the_packets_bits(self):
+        """The helpers alone (XLA on CPU), at 24, 12 and 3 packet rows:
+        ``_merge_pair_lse_rows`` gives ``_merge_pair``'s latent lanes and the
+        BF16 values of its lse lanes 512 and 513 lane-major (zeros past the
+        rows), and ``_lse_of_rows`` the FP32 sums lanes 512 + 513 give: bit
+        for bit for nonzero values and infinities, NaNs as NaNs and zeros as
+        zeros of either sign (see ``mla_dcp._lse_of_rows``)."""
+        import jax
+        import jax.numpy as jnp
+        import ml_dtypes
+
+        from sglang_tpu.k3_programs.kimi_k3.kernels import mla_dcp
+
+        bf16 = ml_dtypes.bfloat16
+        rng = np.random.default_rng(7)
+
+        def bits(x):
+            x = np.asarray(x)
+            return x.view(np.uint16 if x.dtype == bf16 else np.uint32)
+
+        def packet(lse):
+            out = rng.standard_normal((len(lse), 640)).astype(np.float32)
+            high = lse.astype(bf16).astype(np.float32)
+            out[:, 512], out[:, 513], out[:, 514:] = high, lse - high, 0
+            return out.astype(bf16)
+
+        merge = jax.jit(mla_dcp._merge_pair)
+        merge_rows = jax.jit(mla_dcp._merge_pair_lse_rows)
+        lse_of_rows = jax.jit(mla_dcp._lse_of_rows, static_argnums=1)
+        f32 = jnp.float32
+        add = jax.jit(lambda x: x[:, 0].astype(f32) + x[:, 1].astype(f32))
+        inf, nan = np.inf, np.nan
+        high = [-0.0, -0.0, 1e-40, 0.0, inf, -inf, nan, 3.5, -1e-39, 1.0, 1e-40]
+        low = [-0.0, 0.0, 1e-40, -1e-40, 1.0, 0.0, 0.0, 2.0**-10, 0.0, -0.0, -1e-40]
+        for rows in (24, 12, 3):
+            for scale in (1.0, 40.0):
+                first = packet(rng.standard_normal(rows).astype(np.float32) * scale)
+                second = packet(rng.standard_normal(rows).astype(np.float32) * scale)
+                merged = bits(merge(first, second))
+                outputs, lse_rows = (bits(x) for x in merge_rows(first, second))
+                np.testing.assert_array_equal(outputs, merged[:, :512])
+                np.testing.assert_array_equal(lse_rows[:, :rows], merged[:, 512:514].T)
+                self.assertFalse(lse_rows[:, rows:].any())
+            parts = rng.standard_normal((16, 2, 128)).astype(np.float32)
+            parts[:, 0, : min(rows, len(high))] = high[:rows]
+            parts[:, 1, : min(rows, len(low))] = low[:rows]
+            parts = parts.astype(bf16)
+            got = np.asarray(lse_of_rows(parts, rows))
+            want = np.asarray(add(parts))[:, :rows]
+            self.assertEqual(got.shape, (16, rows, 1))
+            got = got[:, :, 0]
+            nans, zeros = np.isnan(want), want == 0
+            np.testing.assert_array_equal(np.isnan(got), nans)
+            np.testing.assert_array_equal(got[zeros], 0.0)  # either sign
+            other = ~nans & ~zeros
+            np.testing.assert_array_equal(bits(got)[other], bits(want)[other])
+
+    def test_lse_rows_leave_the_outputs_bit_identical(self):
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        from jax.experimental.pallas import tpu as pltpu
+
+        if not hasattr(pltpu, "InterpretParams"):
+            self.skipTest("Pallas TPU interpret mode unavailable")
+        harness = textwrap.dedent(TestSelectedAttention.SCRIPT)
+        harness = harness[: harness.index("\ncase([700, 2000], 1, 64, 0)\n") + 1]
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", harness + textwrap.dedent(self.TAIL)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=2400,
+        )
+        self.assertIn("OK", result.stdout, result.stderr[-3000:])
+
+
 class TestDraftPairCombine(CustomTestCase):
     """``KernelConfig.draft_pair_combine``: the MLA draft's attention
     (explicit keys, its lse in the padding row, FP8 pages) through the host
