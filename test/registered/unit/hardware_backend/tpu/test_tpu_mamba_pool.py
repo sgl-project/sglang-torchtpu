@@ -304,6 +304,44 @@ class TestTpuMambaPool(CustomTestCase):
         # Kernel handles fresh-slot masking; pool must not touch the buffer.
         self.assertTrue(all(torch.all(t == 7.0) for t in pool.mamba_cache.temporal))
 
+    def _pool_with_ple_siblings(self):
+        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+
+        pool = self._pool()
+        short_conv = ShortConvPool(
+            size=self.SIZE,
+            state_shape=(8, 3),
+            layer_ids=[2],
+            dtype=torch.float32,
+            device="cpu",
+        )
+        ngram = NGramPool(size=self.SIZE, context_len=2, eos_token_id=99, device="cpu")
+        pool.register_slot_state(short_conv)
+        pool.register_slot_state(ngram)
+        return pool, short_conv, ngram
+
+    def test_clear_slots_resets_ple_side_states(self):
+        """The Qwen4-Exp PLE layer reads its slot unmasked, so a reused slot
+        must not carry the previous request's short-conv state or n-gram
+        context, unlike GDN state, which the kernel masks."""
+        pool, short_conv, ngram = self._pool_with_ple_siblings()
+        short_conv.conv_state.fill_(5.0)
+        ngram.context.fill_(7)
+        pool.clear_slots(torch.tensor([1, 2]))
+        self.assertTrue(torch.all(short_conv.conv_state[:, 1:3] == 0))
+        self.assertTrue(torch.all(short_conv.conv_state[:, 3:] == 5.0))
+        self.assertTrue(torch.all(ngram.context[1:3] == 99))
+        self.assertTrue(torch.all(ngram.context[3:] == 7))
+
+    def test_copy_from_copies_ple_side_states(self):
+        pool, short_conv, ngram = self._pool_with_ple_siblings()
+        short_conv.conv_state[:, 1].fill_(3.0)
+        ngram.context[1] = torch.tensor([11, 12])
+        pool.copy_from(torch.tensor([1]), torch.tensor([4]))
+        self.assertTrue(torch.all(short_conv.conv_state[:, 4] == 3.0))
+        self.assertTrue(torch.equal(ngram.context[4], torch.tensor([11, 12])))
+        self.assertTrue(torch.all(short_conv.conv_state[:, 5] == 0))
+
     def test_copy_from_preserves_sources_and_other_slots(self):
         pool = self._pool()
         states = [*pool.mamba_cache.conv[0], *pool.mamba_cache.temporal]

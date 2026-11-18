@@ -315,6 +315,22 @@ class TpuMambaPool(MambaPool):
             self.checkpoint_read_offsets.index_fill_(
                 0, indices.to(device=self.device, dtype=torch.int64), AT_SLOT
             )
+        # Unlike GDN, the slot-indexed side states (Qwen4-Exp PLE short-conv
+        # state and n-gram context) read a slot unmasked, so a reused slot must
+        # be reset or it carries the previous request's state.
+        if self._slot_siblings and indices.numel() > 0:
+            rows = self._sibling_rows(indices)
+            for sibling in self._slot_siblings:
+                sibling.reset_slots(rows)
+
+    def _sibling_rows(self, indices: torch.Tensor) -> torch.Tensor:
+        """Slot ids for the side states' eager index ops, padded with the null
+        slot 0 to a copy bucket so the ops compile once per bucket."""
+        from sglang_tpu.mamba_state_copy import copy_bucket_size
+
+        indices = indices.reshape(-1).to(torch.int64)
+        padding = copy_bucket_size(indices.numel()) - indices.numel()
+        return upload(torch.nn.functional.pad(indices.cpu(), (0, padding)), self.device)
 
     def window_bases(self, req_pool_indices: torch.Tensor) -> torch.Tensor:
         """First state row of each request's checkpoint window."""
@@ -438,6 +454,8 @@ class TpuMambaPool(MambaPool):
                 state.index_copy_(
                     0, dst_indices.long(), state.index_select(0, src_indices.long())
                 )
+            for sibling in self._slot_siblings:
+                sibling.copy_slots(src_indices.long(), dst_indices.long())
             return
         from sglang_tpu.mamba_state_copy import (
             compiled_state_copy,
@@ -456,6 +474,12 @@ class TpuMambaPool(MambaPool):
         compiled_state_copy()(
             states, upload(src, self.device), upload(dst, self.device), copy_count
         )
+        if self._slot_siblings:
+            # Padding pairs copy the null slot 0 onto itself.
+            src_rows = upload(src.to(torch.int64), self.device)
+            dst_rows = upload(dst.to(torch.int64), self.device)
+            for sibling in self._slot_siblings:
+                sibling.copy_slots(src_rows, dst_rows)
 
     @torch.no_grad()
     def warmup_state_copy(self, max_requests: int):
