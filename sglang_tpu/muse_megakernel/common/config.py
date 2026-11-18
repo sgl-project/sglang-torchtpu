@@ -447,10 +447,6 @@ POST_MOE_TILE = 128
 ROW_ALIGN = POST_MOE_TILE
 # the SP program has no post_moe tiling: rows split evenly over tp ranks, 2+ rows each
 SP_ROW_ALIGN = 16
-# Batched RPA knobs the prefill programs pass: padded-query skip group and the
-# sliding-window layers' (bq, bkv) prefill blocks.
-PREFILL_RPA_SKIP_PAD_Q_GROUP = 256
-PREFILL_RPA_SWA_BLOCKS = (512, 512)
 
 
 class PFConfig(MuseGeometry, frozen=True, kw_only=True):

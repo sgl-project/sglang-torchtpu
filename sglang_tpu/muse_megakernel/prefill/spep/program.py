@@ -27,11 +27,7 @@ import jax
 import jax.numpy as jnp
 
 from sglang_tpu.muse_megakernel.common import a2a
-from sglang_tpu.muse_megakernel.common.config import (
-    PREFILL_RPA_SKIP_PAD_Q_GROUP,
-    PREFILL_RPA_SWA_BLOCKS,
-    PFConfig,
-)
+from sglang_tpu.muse_megakernel.common.config import PFConfig
 from sglang_tpu.muse_megakernel.common.consts import LANE, small_row
 from sglang_tpu.muse_megakernel.common.numerics import _rms, _topk_iter, heads_rms_xla
 from sglang_tpu.muse_megakernel.common.qkv import qkv_from_proj
@@ -139,11 +135,6 @@ def build_forward(c: PFConfig, axis: str = "model"):
             k_scale=1.0,
             v_scale=1.0,
             kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
-            # no running max: Muse's per-head RMS-normed q and k bound the scores
-            no_max=True,
-            skip_pad_q=True,
-            skip_pad_q_group=PREFILL_RPA_SKIP_PAD_Q_GROUP,
-            prefill_bq_bkv=None if is_global else PREFILL_RPA_SWA_BLOCKS,
         )
 
     def route(ffn, wrouter, sm):

@@ -6,8 +6,6 @@ import jax.numpy as jnp
 from sglang_tpu.muse_megakernel.common.config import (
     ATTN_OUT_TILE,
     POST_MOE_TILE,
-    PREFILL_RPA_SKIP_PAD_Q_GROUP,
-    PREFILL_RPA_SWA_BLOCKS,
     PFConfig,
 )
 from sglang_tpu.muse_megakernel.common.consts import LANE, SMALL
@@ -41,10 +39,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
     from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
         ragged_paged_attention,
     )
-    from sglang_tpu.moe.pallas.fused_rs.fused_moe import (
-        FusedRsOptions,
-        moe_gmm_local_rs_nodedup,
-    )
+    from sglang_tpu.moe.pallas.fused_rs.fused_moe import moe_gmm_local_rs_nodedup
 
     c.validate()
     L, T, hd = c.n_layers, c.rows, c.head_dim
@@ -56,21 +51,6 @@ def build_forward(c: PFConfig, axis: str = "model"):
         r: post_moe_call(c, POST_MOE_TILE, next_rope=r, axis=axis)
         for r in (True, False, None)
     }
-    # the refkernel's expert-TP prefill tuning
-    fused_rs = FusedRsOptions(
-        staging_slots=10,
-        row_loop_unroll=8,
-        etp_skip_out_zero=True,
-        etp_tiled_reduce=True,
-        etp_fused_combine=True,
-        etp_local_rows=True,
-        etp_pair_exchange=True,
-        pair_fwd_psum=True,
-        pair_fast_issue=True,
-        pair_scatter_combine=True,
-        direct_stage=2,
-        weight_pingpong=True,
-    )
 
     def attention(l, q, kvs, kv_pool, kv_lens, pf, psw, cu_q, dist):
         is_global = l in c.global_layers
@@ -88,11 +68,6 @@ def build_forward(c: PFConfig, axis: str = "model"):
             k_scale=1.0,
             v_scale=1.0,
             kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
-            # no running max: Muse's per-head RMS-normed q and k bound the scores
-            no_max=True,
-            skip_pad_q=True,
-            skip_pad_q_group=PREFILL_RPA_SKIP_PAD_Q_GROUP,
-            prefill_bq_bkv=None if is_global else PREFILL_RPA_SWA_BLOCKS,
         )
 
     def moe(l, xe, ids, tw, experts, group_offset, smalls_l):
@@ -127,7 +102,6 @@ def build_forward(c: PFConfig, axis: str = "model"):
             sp_enabled=False,
             expert_tp=True,
             fp4_w4a16=l in c.w4a16_layers,
-            options=fused_rs,
         )
 
     def forward(
