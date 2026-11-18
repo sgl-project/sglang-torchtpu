@@ -7,6 +7,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch._dynamo
+import torch.fx
+import torch.utils._pytree as pytree
+from torch._dynamo.backends.common import aot_autograd
+from torch._dynamo.utils import counters
 from torch.overrides import TorchFunctionMode
 
 from sglang.multimodal_gen.configs.models.dits.sana_wm import (
@@ -15,7 +20,10 @@ from sglang.multimodal_gen.configs.models.dits.sana_wm import (
 )
 from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.models.dits import sana_wm_components as components
-from sglang.multimodal_gen.runtime.models.dits.sana_wm import SanaWMTransformer3DModel
+from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
+    SanaWMBlock,
+    SanaWMTransformer3DModel,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     base,
     streaming,
@@ -30,7 +38,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.multimodal_gen import sana_wm
 
 # Nightly: the stage-a unit suite is at its time budget.
-register_tpu_ci(est_time=60, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(est_time=120, suite="nightly-tpu-4-v7", nightly=True)
 
 _ROPE = components.WanRotaryPosEmbed
 _CPU = torch.device("cpu")
@@ -57,10 +65,15 @@ def _installed(device_types=("tpu",)):
             (components, "_apply_rotary_emb_dn"),
             (components, "_apply_rotary_emb_bhnd"),
             (components, "_apply_complex_rope"),
+            (components, "_sana_wm_reverse_scan"),
+            (components.BidirectionalGDNUCPESinglePathLiteLA, "_get_cam_qkv_params"),
+            (SanaWMBlock, "forward"),
+            (SanaWMBlock, "forward_long"),
             *sana_wm.NOISE_METHODS,
         ):
             stack.enter_context(patch.object(owner, name, getattr(owner, name)))
         stack.enter_context(patch.object(sana_wm, "_DEVICE_TYPES", device_types))
+        stack.enter_context(patch.object(sana_wm, "_EAGER_PATHS", set()))
         sana_wm.install()
         sana_wm.install()  # idempotent
         yield
@@ -93,7 +106,7 @@ class _ZeroCross(torch.nn.Module):
         return torch.zeros_like(x)
 
 
-def _tiny_dit(num_layers):
+def _tiny_dit(num_layers, **arch_overrides):
     arch = SanaWMArchConfig(
         in_channels=8,
         out_channels=8,
@@ -107,6 +120,7 @@ def _tiny_dit(num_layers):
         caption_channels=32,
         model_max_length=8,
         chunk_size=None,
+        **arch_overrides,
     )
     dit = SanaWMTransformer3DModel(SanaWMConfig(arch_config=arch)).eval()
     for block in dit.blocks:
@@ -273,6 +287,112 @@ class TestSanaWMCompiledBlocks(CustomTestCase):
                     graphs.append(len(layouts))
         self.assertEqual(graphs[0], graphs[1])
         self.assertTrue(all(len(seen) == 1 for seen in layouts.values()), layouts)
+
+
+_VIEW_OPS = frozenset(
+    "view _unsafe_view permute transpose t expand slice select unsqueeze squeeze "
+    "alias as_strided split split_with_sizes unbind narrow detach unflatten "
+    "flatten getitem".split()
+)
+
+
+class _RowMajorOutputs(torch.fx.Interpreter):
+    """torch_tpu exports a graph by running its ATen ops: compute ops return
+    row-major tensors (a flip of a permuted view too), so a view the fake trace
+    found legal can fail (wm_pr_bidi, j-a59c2834). Attention keeps its layout,
+    as TPU-compiled Wan blocks transpose and flatten SDPA outputs."""
+
+    def run_node(self, n):
+        out = super().run_node(n)
+        name = getattr(n.target, "__name__", "").split(".")[0]
+        if n.op != "call_function" or name in _VIEW_OPS or "dot_product" in name:
+            return out
+        return pytree.tree_map_only(torch.Tensor, torch.Tensor.contiguous, out)
+
+
+def _tpu_like_backend(graphs):
+    def compile_graph(gm, example_inputs):
+        graphs.append(gm)
+        return lambda *args: _RowMajorOutputs(gm).run(*args)
+
+    return aot_autograd(fw_compiler=compile_graph)
+
+
+def _random_dit():
+    # Two GDN blocks and a softmax block; random weights reach every branch.
+    torch.manual_seed(0)
+    dit = _tiny_dit(3, softmax_every_n=3)
+    with torch.no_grad():
+        for param in dit.parameters():
+            param.copy_(torch.randn_like(param) * 0.05)
+    return dit
+
+
+def _stream(dit, segments=(0, 4, 7, 10)):
+    # Chunk 0, chunk 1 over its cache, chunk 2 over the sink and the window.
+    inputs, outs = _dit_inputs(segments[-1]), []
+    kv = [[[None] * 10 for _ in dit.blocks] for _ in segments[1:]]
+    with torch.no_grad():
+        for i, (start, end) in enumerate(zip(segments, segments[1:])):
+            chunk_kv, sink = SanaWMSelfForcingSampler.accumulate_kv_cache(
+                kv, i, list(segments), 2, True, len(dit.blocks)
+            )
+            kwargs = dict(
+                inputs,
+                hidden_states=inputs["hidden_states"][:, :, start:end],
+                kv_cache=chunk_kv,
+                start_f=start,
+                end_f=end,
+                frame_index=torch.arange(start, end) if sink else None,
+            )
+            timestep = torch.full((1, end - start), 900.0)
+            outs.append(dit.forward_long(**kwargs, timestep=timestep)[0])
+            zeros = torch.zeros(1, end - start)
+            _, kv[i] = dit.forward_long(**kwargs, timestep=zeros, save_kv_cache=True)
+    return torch.cat(outs, dim=2)
+
+
+class TestSanaWMCompiledStreaming(CustomTestCase):
+    def setUp(self):
+        torch._dynamo.reset()
+        counters.clear()
+
+    def test_streaming_blocks_run_compiled_and_match_stock(self):
+        want = _stream(_random_dit())  # stock: complex RoPE, flipped scans, eager
+        with _installed(("cpu",)):
+            dit, graphs = _random_dit(), []
+            backend = _tpu_like_backend(graphs)
+            for block in dit.blocks:
+                block.compile(backend=backend, dynamic=False)
+            got, again = _stream(dit), _stream(dit)
+            self.assertEqual(sana_wm._EAGER_PATHS, set())  # no eager fallback
+        torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-4)
+        self.assertTrue(torch.equal(again, got))
+        # Per block kind: chunk 0, chunk 1 and the full window, step and save;
+        # the repeat compiles nothing.
+        self.assertEqual(len(graphs), 8)
+        self.assertEqual(dict(counters["graph_break"]), {})
+        # The cache type flags stay host tensors outside the graphs.
+        targets = {str(n.target) for g in graphs for n in g.graph.nodes}
+        self.assertFalse([t for t in targets if "lift_fresh" in t])
+
+    def test_a_failing_compiled_block_runs_eagerly(self):
+        calls = []
+
+        def failing_backend(gm, example_inputs):
+            calls.append(gm)
+            raise RuntimeError("view(): cannot create a view")
+
+        with _installed(("cpu",)):
+            want = _stream(_random_dit())
+            dit = _random_dit()
+            for block in dit.blocks:
+                block.compile(backend=failing_backend, dynamic=False)
+            with self.assertLogs(sana_wm.logger.name, "WARNING"):
+                got = _stream(dit)
+            self.assertEqual(sana_wm._EAGER_PATHS, {"stage-1 block"})
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(torch.equal(got, want))
 
 
 class TestSanaWMNoise(CustomTestCase):

@@ -303,7 +303,7 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   rows, only the 50 DiT blocks compiled, the breakable-CUDA-graph break point
   skipped, regionally compiled blocks marked spmd-safe) and `sana_wm.py`
   (SANA-WM's complex RoPE table as float32 cos/sin pairs, its noise drawn in
-  float32); worker init also
+  float32, its streaming blocks compiled); worker init also
   registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
   `logaddexp`).
 

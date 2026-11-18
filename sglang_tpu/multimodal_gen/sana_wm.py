@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SANA-WM on TPU workers: real-valued RoPE tables, float32 noise draws.
+"""SANA-WM on TPU workers: real-valued RoPE tables, float32 noise draws,
+compiled streaming blocks.
 
 Runtime patch, tracked debt:
 - Why: SANA-WM's DiT keeps its 3D RoPE table as a complex128 buffer and
@@ -7,7 +8,9 @@ Runtime patch, tracked debt:
   torch_tpu cannot move complex128 tensors to the device (MOVA failed at that
   move, CDK j-bc9336da). Separately, the SANA-WM stages draw their starting,
   refiner and realtime noise in bfloat16 from a device generator, and torch_tpu
-  builds a bfloat16 normal from 7 random bits (128 values).
+  builds a bfloat16 normal from 7 random bits (128 values). The streaming
+  stage calls ``SanaWMBlock.forward_long``, which bypasses the compiled
+  ``__call__`` of a regionally compiled block: stage 1 runs eagerly.
 - How: :func:`install` (1) keeps ``WanRotaryPosEmbed``'s table as float32
   ``(cos, sin)`` pairs of the same float64 frequencies, in a plain attribute
   that ``Module.to`` neither moves nor casts, and returns per-token tables as
@@ -16,10 +19,16 @@ Runtime patch, tracked debt:
   softmax and camera rotations to a float32 rotation (the pair-swap form of
   ``sglang_tpu.multimodal_gen.rope`` for bfloat16 inputs) that rounds once to
   the input dtype; (3) has the methods holding SANA-WM's noise draws draw
-  bfloat16 and float16 normals on a TPU device in float32 and round them.
+  bfloat16 and float16 normals on a TPU device in float32 and round them;
+  (4) routes a regionally compiled block's ``forward_long`` through its
+  compiled ``__call__``, with the streaming scans' backward pass by reverse
+  indexing (torch_tpu fails to compile a view of the flipped copies, j-a59c2834)
+  and the fused camera weights cached outside the graph. A compiled path
+  whose call raises runs eagerly from then on.
 - Upstream PR or issue: none.
-- Remove when: SANA-WM builds real RoPE tables on every platform and torch_tpu
-  draws low-precision normals from float32 samples.
+- Remove when: SANA-WM builds real RoPE tables on every platform, torch_tpu
+  draws low-precision normals from float32 samples, and the streaming stage
+  calls compiled modules.
 """
 
 from __future__ import annotations
@@ -33,13 +42,17 @@ from sglang.kernels.ops.diffusion.common.fallback_torch import (
     apply_rotary_embedding_native,
 )
 from sglang.multimodal_gen.runtime.models.dits import sana_wm_components as components
+from sglang.multimodal_gen.runtime.models.dits.sana_wm import SanaWMBlock
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     base,
     realtime_chain,
     refiner,
     streaming_refiner,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang_tpu.multimodal_gen.rope import apply_rotary_embedding_pair_swap
+
+logger = init_logger(__name__)
 
 # Devices whose low-precision normals are drawn in float32.
 _DEVICE_TYPES = ("tpu",)
@@ -49,6 +62,14 @@ _STOCK_INIT_FREQS = components.WanRotaryPosEmbed._init_freqs_buffer
 _STOCK_ROTARY_EMB_DN = components._apply_rotary_emb_dn
 _STOCK_ROTARY_EMB_BHND = components._apply_rotary_emb_bhnd
 _STOCK_COMPLEX_ROPE = components._apply_complex_rope
+_STOCK_REVERSE_SCAN = components._sana_wm_reverse_scan
+_STOCK_CAM_QKV_PARAMS = (
+    components.BidirectionalGDNUCPESinglePathLiteLA._get_cam_qkv_params
+)
+_STOCK_BLOCK_FORWARD = SanaWMBlock.forward
+_STOCK_BLOCK_FORWARD_LONG = SanaWMBlock.forward_long
+# Compiled paths whose call raised once: they run eagerly from then on.
+_EAGER_PATHS = set()
 
 # The methods that hold SANA-WM's random draws.
 NOISE_METHODS = (
@@ -131,6 +152,67 @@ def apply_complex_rope(
     return _rotate(hidden_states.transpose(1, 2), freqs, inverse).transpose(1, 2)
 
 
+def _compiled_or_eager(path, compiled, eager, *args, **kwargs):
+    """Run ``compiled``; once a call raises, ``path`` runs ``eager`` from then on."""
+    if path not in _EAGER_PATHS:
+        try:
+            return compiled(*args, **kwargs)
+        except Exception:
+            logger.warning(
+                "SANA-WM compiled %s failed; it runs eagerly from now on.",
+                path,
+                exc_info=True,
+            )
+            _EAGER_PATHS.add(path)
+    return eager(*args, **kwargs)
+
+
+def block_forward(self, *args, kv_cache=None, save_kv_cache=False, **kwargs):
+    """``SanaWMBlock.forward``; given a stream cache, the streaming ``forward_long``."""
+    if kv_cache is None:
+        return _STOCK_BLOCK_FORWARD(self, *args, **kwargs)
+    return _STOCK_BLOCK_FORWARD_LONG(
+        self, *args, kv_cache=kv_cache, save_kv_cache=save_kv_cache
+    )
+
+
+def block_forward_long(self, x, *args, kv_cache, save_kv_cache):
+    """``SanaWMBlock.forward_long`` through a regionally compiled block's
+    ``__call__`` for TPU tensors."""
+    stock = functools.partial(_STOCK_BLOCK_FORWARD_LONG, self)
+    if self._compiled_call_impl is None or x.device.type not in _DEVICE_TYPES:
+        return stock(x, *args, kv_cache=kv_cache, save_kv_cache=save_kv_cache)
+    self.attn._get_cam_qkv_params()  # fills the fused camera weights' cache
+    # Block 0 takes the patch embedding's transposed output: one input layout.
+    return _compiled_or_eager(
+        "stage-1 block",
+        self,
+        stock,
+        x.contiguous(),
+        *args,
+        kv_cache=kv_cache,
+        save_kv_cache=save_kv_cache,
+    )
+
+
+def get_cam_qkv_params(self):
+    """``_get_cam_qkv_params``; compiled blocks take the fused weights the eager
+    caller cached (the cache key reads data pointers, a graph break)."""
+    cached = self._cam_qkv_params_cache
+    if cached is not None and torch.compiler.is_compiling():
+        return cached[1]
+    return _STOCK_CAM_QKV_PARAMS(self)
+
+
+def reverse_scan(q_rot, k_rot, v, beta, decay, *, reference, q=None, k=None):
+    """``_sana_wm_reverse_scan``: TPU tensors take the reverse-indexed scan."""
+    if q_rot.device.type not in _DEVICE_TYPES:
+        return _STOCK_REVERSE_SCAN(
+            q_rot, k_rot, v, beta, decay, reference=reference, q=q, k=k
+        )
+    return components._sana_wm_reverse_scan_impl(q_rot, k_rot, v, beta, decay, q, k)
+
+
 def _float32_randn(stock):
     @functools.wraps(stock)
     def randn(*size, dtype=None, device=None, **kwargs):
@@ -169,6 +251,12 @@ def install() -> None:
     components._apply_rotary_emb_dn = apply_rotary_emb_dn
     components._apply_rotary_emb_bhnd = apply_rotary_emb_bhnd
     components._apply_complex_rope = apply_complex_rope
+    components._sana_wm_reverse_scan = reverse_scan
+    components.BidirectionalGDNUCPESinglePathLiteLA._get_cam_qkv_params = (
+        get_cam_qkv_params
+    )
+    SanaWMBlock.forward = block_forward
+    SanaWMBlock.forward_long = block_forward_long
     # ``with torch.device(...)`` routes the constructors in this cached set; fill
     # it first so it holds the stock torch.randn the draws swap out.
     _device_constructors()

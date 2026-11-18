@@ -48,6 +48,10 @@ _SLOT_TYPE_FLAG = 6
 _SLOT_FFN_TCONV = 9
 _CACHE_TYPE_CONCAT = 0.0
 _CACHE_TYPE_STATE = 1.0
+# Host tensors: the chunk accumulator reads them once per block. Module
+# constants stay out of compiled block graphs.
+_CONCAT_TYPE_FLAG = torch.tensor([_CACHE_TYPE_CONCAT], device="cpu")
+_STATE_TYPE_FLAG = torch.tensor([_CACHE_TYPE_STATE], device="cpu")
 
 
 def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
@@ -2903,8 +2907,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if save_kv_cache:
             kv_cache[_SLOT_K] = state_kv.detach().clone()
             kv_cache[_SLOT_V] = state_z.detach().clone()
-            # A host tensor: the chunk accumulator reads it once per block.
-            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor([_CACHE_TYPE_STATE])
+            kv_cache[_SLOT_TYPE_FLAG] = _STATE_TYPE_FLAG
 
         out = out.permute(0, 3, 1, 2).reshape(B, N, C)
         return out, beta, decay
@@ -2952,7 +2955,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if save_kv_cache:
             kv_cache[_SLOT_K] = k_in.detach().clone()
             kv_cache[_SLOT_V] = v_in.detach().clone()
-            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor([_CACHE_TYPE_CONCAT])
+            kv_cache[_SLOT_TYPE_FLAG] = _CONCAT_TYPE_FLAG
         if cached_k is not None:
             k_in = torch.cat([cached_k.to(k_in.dtype), k_in], dim=1)
             v_in = torch.cat([cached_v.to(v_in.dtype), v_in], dim=1)
