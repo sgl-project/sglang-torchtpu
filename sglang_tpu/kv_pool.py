@@ -23,6 +23,7 @@ buffer.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional, Tuple
 
 import numpy as np
@@ -1381,7 +1382,7 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
                 f"{self.TOKENS_PER_ROW * index_kpool} for the TPU split MLA pool."
             )
         # A rank's share holds whole RoPE rows and whole indexer pools.
-        share_unit = self.mla_shards * max(self.TOKENS_PER_ROW, index_kpool)
+        share_unit = self.mla_shards * math.lcm(self.TOKENS_PER_ROW, index_kpool)
         if self.page_size % share_unit != 0:
             raise ValueError(
                 f"page_size ({self.page_size}) must be divisible by {share_unit} "

@@ -161,7 +161,9 @@ class TestMlaKvShard(CustomTestCase):
         self.assertEqual(len(seen), page.shape[0])  # no two tokens share a row
 
 
-def _split_pool(*, shards: int, role: int, page_size: int = 128, rope: int = 0):
+def _split_pool(
+    *, shards: int, role: int, page_size: int = 128, rope: int = 0, kpool: int = 4
+):
     from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
 
     with (
@@ -179,7 +181,7 @@ def _split_pool(*, shards: int, role: int, page_size: int = 128, rope: int = 0):
             enable_memory_saver=False,
             index_head_dim=128,
             index_key_layers=[True, False, True],
-            index_kpool=4,
+            index_kpool=kpool,
         )
 
 
@@ -226,6 +228,9 @@ class TestSplitPoolLayout(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "split the latent cache"):
             _split_pool(shards=8, role=0, page_size=16)  # 2-token shares
         _split_pool(shards=8, role=0, page_size=32)  # one RoPE row, one pool
+        with self.assertRaisesRegex(ValueError, "split the latent cache"):
+            # 6-token shares: one pool but 1.5 RoPE rows.
+            _split_pool(shards=8, role=0, page_size=48, kpool=6)
 
 
 class TestSplitValidator(CustomTestCase):
@@ -241,6 +246,7 @@ class TestSplitValidator(CustomTestCase):
             disaggregation_mode="null",
             enable_prefill_cp=False,
             use_spmd_compile=False,
+            hicache_storage_backend=None,
         )
         cfg.update(overrides)
         return SimpleNamespace(**cfg)
@@ -263,11 +269,18 @@ class TestSplitValidator(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "--use-spmd-compile"):
             self._validate(self._cfg(use_spmd_compile=True))
 
+    def test_refuses_storage_that_writes_rank_0s_share_only(self):
+        with self.assertRaisesRegex(ValueError, "--hicache-storage-backend"):
+            self._validate(self._cfg(hicache_storage_backend="file"))
+
     def test_refuses_pd_and_a_page_that_does_not_split(self):
         with self.assertRaisesRegex(ValueError, "--disaggregation-mode"):
             self._validate(self._cfg(disaggregation_mode="prefill"))
         with self.assertRaisesRegex(ValueError, "--page-size a multiple of 64"):
             self._validate(self._cfg(page_size=96), kpool=8)
+        # kpool 6: shares need lcm(4, 6) = 12 tokens, not max(4, 6) = 6.
+        with self.assertRaisesRegex(ValueError, "--page-size a multiple of 96"):
+            self._validate(self._cfg(page_size=48), kpool=6)
 
 
 if __name__ == "__main__":
