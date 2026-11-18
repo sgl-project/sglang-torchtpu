@@ -1,4 +1,4 @@
-"""AgentX c16 on GLM-5.3-Flash: MLA latent cache split by page over the 8 ranks,
+"""AgentX c16 on GLM-5.3-Flash: MLA latent cache split inside every page over the 8 ranks,
 raw ring, no host tier, model-path decode, 9.4M-token pool, 800 KDA checkpoint slots,
 16 running (measured 20,093 tok/s/chip).
 
