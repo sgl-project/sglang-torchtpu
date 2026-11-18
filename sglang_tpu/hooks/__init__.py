@@ -81,7 +81,7 @@ from sglang_tpu.hooks.moe_topk import (
     biased_topk,
     register_router_topk,
 )
-from sglang_tpu.hooks.mtp_fusion_proj import shard_deepseek_nextn_eh_proj
+from sglang_tpu.hooks.mtp_fusion_proj import shard_nextn_eh_proj
 from sglang_tpu.hooks.padded_logits_sampling import (
     hook_specs as padded_logits_sampling_hooks,
 )
@@ -174,7 +174,17 @@ HOOKS: list[tuple] = [
     ),
     (
         "sglang.srt.models.deepseek_nextn.DeepseekModelNextN.__init__",
-        shard_deepseek_nextn_eh_proj,
+        shard_nextn_eh_proj,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.glm4_moe_nextn.Glm4MoeModelNextN.__init__",
+        shard_nextn_eh_proj,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.glm4_moe_lite_nextn.Glm4MoeLiteModelNextN.__init__",
+        shard_nextn_eh_proj,
         HookType.AFTER,
     ),
     (

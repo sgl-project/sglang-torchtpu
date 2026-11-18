@@ -63,7 +63,7 @@ class ColumnParallelMtpFusionProj(ColumnParallelLinear):
         return output
 
 
-def shard_deepseek_nextn_eh_proj(
+def shard_nextn_eh_proj(
     result: None,
     model: Any,
     config: Any = None,
@@ -72,7 +72,7 @@ def shard_deepseek_nextn_eh_proj(
     *args: Any,
     **kwargs: Any,
 ) -> None:
-    """Replace ``DeepseekModelNextN``'s replicated ``nn.Linear`` ``eh_proj``
+    """Replace a NextN draft model's replicated ``nn.Linear`` ``eh_proj``
     with ``ColumnParallelMtpFusionProj`` when token-sharing TP divides it."""
     del config, quant_config, args, kwargs
     eh_proj = getattr(model, "eh_proj", None)

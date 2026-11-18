@@ -16,9 +16,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import mtp_fusion_proj
 from sglang_tpu.hooks import HOOKS
-from sglang_tpu.hooks.mtp_fusion_proj import (
-    shard_deepseek_nextn_eh_proj as hook_shard_eh_proj,
-)
+from sglang_tpu.hooks.mtp_fusion_proj import shard_nextn_eh_proj as hook_shard_eh_proj
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -56,10 +54,17 @@ def _parallel(
 
 
 class TestMtpFusionProjHookRegistration(CustomTestCase):
-    def test_hook_is_registered_and_target_resolves(self):
-        target = "sglang.srt.models.deepseek_nextn.DeepseekModelNextN.__init__"
-        self.assertIn((target, hook_shard_eh_proj, HookType.AFTER), HOOKS)
-        self.assertTrue(callable(pkgutil.resolve_name(target)))
+    def test_hook_is_registered_and_targets_resolve(self):
+        # Every NextN draft that builds eh_proj as a replicated nn.Linear;
+        # DeepseekModelNextN also backs the GLM-5.2 and GLM-5.3-Flash drafts.
+        for target in (
+            "sglang.srt.models.deepseek_nextn.DeepseekModelNextN.__init__",
+            "sglang.srt.models.glm4_moe_nextn.Glm4MoeModelNextN.__init__",
+            "sglang.srt.models.glm4_moe_lite_nextn.Glm4MoeLiteModelNextN.__init__",
+        ):
+            with self.subTest(target=target):
+                self.assertIn((target, hook_shard_eh_proj, HookType.AFTER), HOOKS)
+                self.assertTrue(callable(pkgutil.resolve_name(target)))
 
 
 class TestColumnParallelMtpFusionProj(CustomTestCase):
