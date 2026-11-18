@@ -15,6 +15,7 @@ runs, and the requests' state between steps, are :class:`KimiDecoder`'s
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -222,6 +223,8 @@ class DecodeOps:
             ),
             lambda _group, name, tensor: self.weights.__setitem__(name, tensor),
         )
+        if kernel_config.active().decode_embedding_replicated:
+            self.weights["embedding_full"] = self._full_embedding()
         self.names = tuple(sorted(self.weights))
         materialize(self.weights[self.names[-1]])
         # Attention DP: bank entry s + k * n holds held shard k's heads of its
@@ -248,6 +251,56 @@ class DecodeOps:
             )
         report_load_stats("decode", self.rank, stats)
         return stats["wall"]
+
+    def _full_embedding(self) -> torch.Tensor:
+        """KernelConfig.decode_embedding_replicated: the whole embedding table
+        ``[1, V, hidden]`` on every rank (family ``embedding_full``), gathered
+        from the ranks' vocabulary shards in mesh order and resident before
+        sglang sizes the pools from the HBM left. The gather moves the rows'
+        bits as unsigned integers: a float collective may canonicalize NaNs
+        (XLA:CPU's BF16 all-gather does)."""
+        started = time.perf_counter()
+        shard = self.weights.get("embedding")
+        if shard is None or shard.ndim != 3 or shard.shape[1] * TP_SIZE != VOCAB:
+            raise RuntimeError(
+                "K3 decode: decode_embedding_replicated needs the vocabulary-sharded "
+                f"embedding [1, {VOCAB // TP_SIZE}, hidden], not "
+                f"{None if shard is None else tuple(shard.shape)}"
+            )
+        hidden, dtype = int(shard.shape[2]), str(shard.dtype)
+
+        def body(rows):
+            bits = jax.lax.bitcast_convert_type(
+                rows[0], jnp.dtype(f"uint{8 * rows.dtype.itemsize}")
+            )
+            full = jax.lax.all_gather(bits, AXIS, tiled=True)
+            return (jax.lax.bitcast_convert_type(full, rows.dtype)[None],)
+
+        op = register_op(
+            "pallas::k3_decode_embedding_full",
+            self.mesh,
+            body,
+            (P(AXIS),),
+            (P(AXIS),),
+            export_key=repr(("decode_embedding_full", VOCAB, hidden, dtype, TP_SIZE)),
+        )
+        (full,) = op(shard)
+        expected = (shard.shape[0], VOCAB, hidden)  # [1, ...]: this worker's copy
+        if tuple(full.shape) != expected or full.dtype != shard.dtype:
+            raise RuntimeError(
+                f"K3 decode: the full embedding came out {tuple(full.shape)} {full.dtype}"
+            )
+        materialize(full)
+        if self.rank == 0:
+            logger.info(
+                "K3 decode: rank 0 full embedding resident (%.2f GiB, %s) in %.1f s; "
+                "HBM %s",
+                full.nbytes / 2**30,
+                dtype,
+                time.perf_counter() - started,
+                hbm(self.rank),
+            )
+        return full
 
     def use_unified_pools(
         self,
