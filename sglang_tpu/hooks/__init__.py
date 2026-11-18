@@ -25,9 +25,12 @@ from sglang_tpu.hooks.dflash_mla import (
 )
 from sglang_tpu.hooks.draft_kv_pool import (
     attach_unified_draft_kv_pool,
+    bind_unified_swa_draft_host_pool,
+    build_unified_hicache_draft_plan,
     derive_unified_draft_pool_sizes,
     draft_cell_size_per_token,
     draft_mha_pool_class,
+    price_unified_hicache_draft_bytes,
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
 from sglang_tpu.hooks.dsv4 import hook_specs as dsv4_hooks
@@ -377,6 +380,21 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._build_token_to_kv_pool_allocator",
         attach_unified_draft_kv_pool,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.speculative.base_spec_worker.BaseSpecWorker._build_hicache_draft_plan",
+        build_unified_hicache_draft_plan,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.build_swa_draft_pools",
+        bind_unified_swa_draft_host_pool,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.mem_cache.hicache_auto_size._draft_bytes",
+        price_unified_hicache_draft_bytes,
         HookType.AROUND,
     ),
     (

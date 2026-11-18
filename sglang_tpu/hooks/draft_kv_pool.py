@@ -31,6 +31,21 @@ derive_unified_draft_pool_sizes, attach_unified_draft_kv_pool
   Upstream PR or issue: sgl-project/sglang-torchtpu#2250.
   Remove when: BaseTokenToKVPoolAllocator declares draft pool sizing and
        attachment hooks upstream.
+
+build_unified_hicache_draft_plan, bind_unified_swa_draft_host_pool, price_unified_hicache_draft_bytes
+  Why: TpuUnifiedSWAKVPool shares one buffer across Full and M_T-group SWA pages
+       without sub-pool attributes, so multi-runner MTP HiCache offload must be
+       rejected, compact DRAFT_SWA host/device pages require TpuDMAHostKVPool
+       page translators bound after build_swa_draft_pools, and HiCache
+       auto-sizing must scale SWA draft bytes by target SWA logical capacity.
+  How: AROUND BaseSpecWorker._build_hicache_draft_plan rejects multi-runner MTP
+       sidecars on TpuUnifiedSWAKVPool; AFTER build_swa_draft_pools calls
+       target_swa_host_pool.bind_draft_swa_sidecar; AROUND
+       hicache_auto_size._draft_bytes prices unified target sidecars against
+       target Full or SWA logical capacity.
+  Upstream PR or issue: sgl-project/sglang-torchtpu#2250.
+  Remove when: BaseSWAKVPool and BaseKVPoolHost expose first-class HiCache
+       sidecar sizing and page-translator binding protocols upstream.
 """
 
 from __future__ import annotations
@@ -124,3 +139,59 @@ def attach_unified_draft_kv_pool(original, configurator, *args, **kwargs):
             alloc.attach_draft_kv_pool(configurator, kwargs["token_to_kv_pool"])
             return alloc
     return original(configurator, *args, **kwargs)
+
+
+def build_unified_hicache_draft_plan(original, worker):
+    plan = original(worker)
+    if plan.mode.value == "sidecar":
+        target_runner = getattr(
+            getattr(worker, "target_worker", None), "model_runner", None
+        )
+        target_pool = getattr(target_runner, "token_to_kv_pool", None)
+        if target_pool is not None:
+            from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+
+            if (
+                isinstance(target_pool, TpuUnifiedSWAKVPool)
+                and len(worker._draft_model_runners()) > 1
+            ):
+                raise NotImplementedError(
+                    "Multi-runner MTP HiCache offload is not supported on unified SWA KV pools."
+                )
+    return plan
+
+
+def price_unified_hicache_draft_bytes(original, target, draft) -> int:
+    from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
+
+    if not isinstance(target, TpuUnifiedSWAKVPool):
+        return original(target, draft)
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.hicache_auto_size import _pool_bytes
+
+    if isinstance(draft, BaseSWAKVPool):
+        draft_swa = getattr(draft, "swa_kv_pool", None)
+        if draft_swa is None or draft_swa.layer_num == 0 or draft_swa.size <= 0:
+            return 0
+        swa_pages = (target.size // target.page_size) // target.layout.num_swa_groups
+        target_swa_tokens = swa_pages * target.page_size
+        return _pool_bytes(draft_swa) * target_swa_tokens // draft_swa.size
+    if getattr(draft, "layer_num", 0) == 0 or draft.size <= 0:
+        return 0
+    return _pool_bytes(draft) * target.size // draft.size
+
+
+def bind_unified_swa_draft_host_pool(result, *, draft_kv_pool, tree_cache):
+    _, entries = result
+    if entries:
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang_tpu.kv_pool_host import TpuDMAUnifiedHostKVPool
+
+        swa_entry = tree_cache.cache_controller.mem_pool_host.entry_map.get(
+            PoolName.SWA
+        )
+        if swa_entry is not None and isinstance(
+            swa_entry.host_pool, TpuDMAUnifiedHostKVPool
+        ):
+            swa_entry.host_pool.bind_draft_swa_sidecar(entries[0].host_pool)
+    return result

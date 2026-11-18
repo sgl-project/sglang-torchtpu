@@ -75,9 +75,11 @@ logger = logging.getLogger(__name__)
 _COPY_AHEAD_CHUNKS = 4
 # Stands in for the chunk when chunked prefill is off.
 _DEFAULT_CHUNK_TOKENS = 4096
-# The SWA eviction order gets 1/_SWA_WINDOW_DIVISOR of the window. Arbitrary
-# starting point; no measurement behind it yet.
+# The SWA eviction order gets 1/_SWA_WINDOW_DIVISOR of the window when no
+# dedicated SWA copy-ahead budget is configured.
 _SWA_WINDOW_DIVISOR = 4
+# Default independent SWA copy-ahead budget on the unified KV pool.
+_DEFAULT_UNIFIED_SWA_COPY_AHEAD_TOKENS = 131072
 
 
 def resolve_copy_ahead_tokens(
@@ -94,12 +96,32 @@ def resolve_copy_ahead_tokens(
     return -(-tokens // page_size) * page_size
 
 
+def resolve_swa_copy_ahead_tokens(
+    *, is_unified_pool: bool, page_size: int
+) -> Optional[int]:
+    tokens = tpu_envs.SGLANG_TPU_HICACHE_WRITE_BACK_SWA_COPY_AHEAD_TOKENS.get()
+    if tokens is None:
+        if not is_unified_pool:
+            return None
+        tokens = _DEFAULT_UNIFIED_SWA_COPY_AHEAD_TOKENS
+    if tokens <= 0:
+        return 0
+    return -(-tokens // page_size) * page_size
+
+
 class WriteBackCopyAhead:
     """Keeps the eviction frontier of a write_back unified cache copied to host."""
 
-    def __init__(self, *, cache: UnifiedRadixCache, copy_ahead_tokens: int) -> None:
+    def __init__(
+        self,
+        *,
+        cache: UnifiedRadixCache,
+        copy_ahead_tokens: int,
+        swa_copy_ahead_tokens: Optional[int] = None,
+    ) -> None:
         self._cache = cache
         self.copy_ahead_tokens = copy_ahead_tokens
+        self.swa_copy_ahead_tokens = swa_copy_ahead_tokens
         # ack id (= node id) -> tokens of a window copy not yet acked.
         self._pending: dict[int, int] = {}
         # The pending copies the SWA order issued; each order has its own cap
@@ -168,15 +190,20 @@ class WriteBackCopyAhead:
         # Before the walk, so this step's copies can take the freed host slots.
         self._release_host_locks(window=None)
         core: UnifiedTreeCore = cache.tree_core
-        # The SWA order gets a reserved share: the Full order alone fills the
-        # window whenever many leaves are evictable.
-        swa_share = 0
+        # The SWA order gets either its own configured share or a reserved
+        # fraction of the Full window whenever many leaves are evictable.
+        full_cap = self.copy_ahead_tokens
+        swa_cap = 0
         if cache.is_swa_enabled and core.has_swa_host_pool:
-            swa_share = self.copy_ahead_tokens // _SWA_WINDOW_DIVISOR
+            if self.swa_copy_ahead_tokens is None:
+                swa_cap = self.copy_ahead_tokens // _SWA_WINDOW_DIVISOR
+                full_cap = self.copy_ahead_tokens - swa_cap
+            else:
+                swa_cap = self.swa_copy_ahead_tokens
         self._prune_acked()
         window: set[int] = set()
         # Copies in flight are locked, so neither walk sees them: subtract them.
-        self._caps = {False: self.copy_ahead_tokens - swa_share, True: swa_share}
+        self._caps = {False: full_cap, True: swa_cap}
         full_budget = self._caps[False] - self._inflight(swa=False)
         if full_budget > 0:
             self._cover_full(core=core, budget=full_budget, window=window)
@@ -379,8 +406,22 @@ def attach_copy_ahead(
             "HiCache write_back copy-ahead off: evictions back up synchronously."
         )
         return
+    from sglang_tpu.unified_kv_pool import TpuUnifiedSWATokenToKVPoolAllocator
+
+    is_unified = isinstance(
+        cache.token_to_kv_pool_allocator, TpuUnifiedSWATokenToKVPoolAllocator
+    )
+    swa_copy_ahead_tokens = (
+        resolve_swa_copy_ahead_tokens(
+            is_unified_pool=is_unified, page_size=cache.page_size
+        )
+        if cache.is_swa_enabled
+        else None
+    )
     cache._write_back_copy_ahead = WriteBackCopyAhead(
-        cache=cache, copy_ahead_tokens=copy_ahead_tokens
+        cache=cache,
+        copy_ahead_tokens=copy_ahead_tokens,
+        swa_copy_ahead_tokens=swa_copy_ahead_tokens,
     )
     logger.info(
         "HiCache write_back copy-ahead: %d tokens copied to host ahead of eviction.",

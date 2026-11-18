@@ -272,6 +272,9 @@ class TpuEnvs:
     # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
     # keep the bf16 weights. Changes the draft's proposals, not verification.
     SGLANG_TPU_DFLASH_FP8_DRAFT = EnvBool(False)
+    # Multiplier applied to max_running_requests * sliding_window when sizing the
+    # compact SWA draft KV pool on TpuUnifiedSWAKVPool under hierarchical cache.
+    SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER = EnvFloat(4.0)
 
     # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
     # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
@@ -397,6 +400,10 @@ class TpuEnvs:
     # of the next eviction victims kept copied to host. Unset: four chunked-prefill
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
+    # Separate copy-ahead token budget for the SWA eviction order under write_back
+    # (independent of the Full leaf window when set). Unset: 131072 on the unified
+    # KV pool, else 1/4 of SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS.
+    SGLANG_TPU_HICACHE_WRITE_BACK_SWA_COPY_AHEAD_TOKENS = EnvInt(None)
 
     # TPU PD KV transfer (disaggregation/tpu/conn.py)
     # Transfers between logged latency summaries; 0 disables.

@@ -383,9 +383,8 @@ def _unsupported_reason(kvc) -> Optional[str]:
         ),
         (dflash_reason is not None, dflash_reason or ""),
         (
-            not spec_algo.is_none()
-            and (memory.enable_hierarchical_cache or disagg_mode != "null"),
-            "does not yet support speculative draft KV caches with HiCache or PD disaggregation.",
+            not spec_algo.is_none() and disagg_mode != "null",
+            "does not yet support speculative draft KV caches with PD disaggregation.",
         ),
         (
             draft_mc is not None
@@ -408,6 +407,17 @@ def _unsupported_reason(kvc) -> Optional[str]:
             mixed_draft_layers,
             "does not support speculative draft models that mix full and "
             "sliding-window attention layers.",
+        ),
+        (
+            _is_supported_eagle_spec(spec_algo)
+            and bool(getattr(get_spec(), "enable_multi_layer_eagle", False))
+            and int(getattr(get_spec(), "speculative_num_steps", 0) or 0) > 1
+            and (
+                memory.enable_hierarchical_cache
+                or getattr(disagg, "disaggregation_decode_retraction_backup", None)
+                == "host_pool"
+            ),
+            "does not support multi-runner MTP draft KV offload with HiCache.",
         ),
         (
             draft_mc is not None
@@ -558,6 +568,7 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
     """Unified Hybrid Full/SWA KV pool backed by ``G = full.num_layers`` shared 5D buffers."""
 
     AttnSpec = AttnLayerSpec
+    supports_packed_hicache_draft = False
 
     def __init__(
         self,
@@ -639,6 +650,7 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             self._swa_layer_group[gid] = j // G
 
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+        self._draft_swa_sidecar: Optional[_DraftSwaSidecar] = None
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
         logger.info(
@@ -649,6 +661,10 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             G,
             self.layout.num_swa_groups,
         )
+
+    @property
+    def draft_swa_sidecar(self) -> Optional[_DraftSwaSidecar]:
+        return self._draft_swa_sidecar
 
     def _buffer_idx(self, layer_id: int) -> int:
         idx, is_swa = self.layers_mapping[layer_id]
@@ -858,6 +874,17 @@ class _DraftSwaSidecar:
         valid = draft_pages[draft_pages > 0]
         if valid.numel() > 0:
             self.allocator._release_page_ids(valid)
+
+    def translate_pages(self, target_swa_pages: torch.Tensor) -> torch.Tensor:
+        pages = target_swa_pages.to(device="cpu", dtype=torch.int64)
+        return torch.where(
+            pages > 0,
+            self.target_to_draft_page[pages.clamp(min=0)],
+            torch.zeros_like(pages),
+        )
+
+    def translate_page_list(self, pages: List[int]) -> List[int]:
+        return self.translate_pages(torch.as_tensor(pages, dtype=torch.int64)).tolist()
 
     def translate_slots(self, target_swa_slots: torch.Tensor) -> torch.Tensor:
         slots = target_swa_slots.to(device="cpu", dtype=torch.int64)
@@ -1254,6 +1281,12 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         draft_swa_pages = _compute_draft_swa_pages(
             full_tokens // self.page_size,
             num_swa_groups=self._swa_groups,
+            page_size=self.page_size,
+            sliding_window_size=(
+                self._target_sliding_window_size
+                if self._target_sliding_window_size is not None
+                else self._target_cfg_sliding_window
+            ),
         )
         swa_tokens = min(full_tokens, draft_swa_pages * self.page_size)
         return full_tokens, full_tokens, swa_tokens
@@ -1281,6 +1314,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 kvcache=getattr(draft_pool, "swa_kv_pool", None),
                 need_sort=self.need_sort,
             )
+            self._kvcache._draft_swa_sidecar = self._draft_swa_sidecar
             self.swa_attn_allocator._sidecar = self._draft_swa_sidecar
             if self.kv_free_fence is not None:
                 self.kv_free_fence.attach(self._draft_swa_sidecar.allocator)
@@ -1601,20 +1635,77 @@ def resolve_unified_draft_kv_pricing(kvc) -> DraftKVPricing:
     return DraftKVPricing(full_per_token=total_layers * full_bpt)
 
 
+_DRAFT_SWA_HICACHE_WINDOW_MULT = 4.0
+_DRAFT_SWA_HICACHE_CHUNK_MULT = 2
+
+
+def _draft_swa_runtime_budget() -> Tuple[bool, int, int, int, float]:
+    """Return ``(enable_hicache, per_worker_mrr, spec_draft_tokens, chunked_prefill_size, window_mult)``."""
+    from sglang_tpu.compilation.compiled_forward_shim import DEFAULT_TPU_COMPILE_MAX_BS
+
+    raw_mult = tpu_envs.SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER.get()
+    window_mult = (
+        _DRAFT_SWA_HICACHE_WINDOW_MULT if raw_mult is None else float(raw_mult)
+    )
+    if window_mult <= 0:
+        raise ValueError(
+            "SGLANG_TPU_SPEC_DRAFT_SWA_WINDOW_MULTIPLIER must be positive, "
+            f"got {window_mult}."
+        )
+    try:
+        enable_hicache = bool(get_memory().enable_hierarchical_cache)
+        sched = get_schedule()
+        dp = max(int(get_parallel().attn_dp_size or 1), 1)
+        mrr = getattr(sched, "max_running_requests", None)
+        per_worker_mrr = (
+            max(int(mrr) // dp, 1) if mrr is not None else DEFAULT_TPU_COMPILE_MAX_BS
+        )
+        chunk_tokens = max(int(getattr(sched, "chunked_prefill_size", 0) or 0), 0)
+        spec_ctx = get_spec()
+        draft_tokens = max(
+            int(
+                getattr(spec_ctx, "speculative_num_draft_tokens", 0)
+                or getattr(spec_ctx, "speculative_dflash_block_size", 0)
+                or 0
+            ),
+            0,
+        )
+    except ValueError:
+        return False, DEFAULT_TPU_COMPILE_MAX_BS, 0, 0, window_mult
+    return enable_hicache, per_worker_mrr, draft_tokens, chunk_tokens, window_mult
+
+
 def _compute_draft_swa_pages(
     total_target_pages: int,
     *,
     num_swa_groups: int,
+    page_size: int = 1,
+    sliding_window_size: Optional[int] = None,
 ) -> int:
     """Compute compact SWA draft page count for ``total_target_pages`` unified pages.
 
-    Uses the lossless bound ``floor(N_phys / (1 + M_T))`` so SWA leaf eviction
-    never cascade-deletes cached Full prefixes.
+    Device-only uses the lossless bound ``floor(N_phys / (1 + M_T))`` so SWA leaf
+    eviction never cascade-deletes cached Full prefixes. With HiCache enabled,
+    cold SWA leaf windows spill to host RAM, so device HBM only needs
+    ``window_mult * B * w_win + 2 * w_chunk`` pages (clamped by the lossless bound).
     """
     if total_target_pages <= 0:
         return 0
     raw_ceil = max(1, total_target_pages // (1 + num_swa_groups))
-    return (raw_ceil // 8) * 8 if raw_ceil >= 8 else raw_ceil
+    ceil_pages = (raw_ceil // 8) * 8 if raw_ceil >= 8 else raw_ceil
+    enable_hicache, per_worker_mrr, draft_tokens, chunk_tokens, window_mult = (
+        _draft_swa_runtime_budget()
+    )
+    if not enable_hicache or sliding_window_size is None:
+        return ceil_pages
+    w_win = _cdiv(int(sliding_window_size) + draft_tokens + page_size, page_size)
+    w_chunk = _cdiv(chunk_tokens, page_size)
+    working_pages = (
+        math.ceil(window_mult * per_worker_mrr * w_win)
+        + _DRAFT_SWA_HICACHE_CHUNK_MULT * w_chunk
+    )
+    aligned_working = _cdiv(max(8, working_pages), 8) * 8
+    return min(aligned_working, ceil_pages)
 
 
 class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
@@ -1624,6 +1715,13 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
         _raise_if_unsupported(kvc)
         layout = _kvc_unified_layout(kvc)
         self._sliding_window_size = kvc.sliding_window_size
+        self._draft_swa_sliding_window = (
+            kvc.sliding_window_size
+            if kvc.sliding_window_size is not None
+            else getattr(
+                getattr(kvc, "model_config", None), "sliding_window_size", None
+            )
+        )
         self._num_swa_groups = layout.num_swa_groups
         self._full_layers_num = layout.num_shared_buffers
         self._full_per_token = self._compute_full_per_token(kvc, layout)
@@ -1692,6 +1790,8 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
             d_pages = _compute_draft_swa_pages(
                 n_phys,
                 num_swa_groups=self._num_swa_groups,
+                page_size=page_size,
+                sliding_window_size=self._draft_swa_sliding_window,
             )
             return n_phys * base_page_bytes + d_pages * draft_swa_page_bytes
 
