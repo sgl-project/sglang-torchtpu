@@ -234,8 +234,29 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         assert target_hidden.shape[0] == rows.cache_locs.numel(), (
             "verify hidden must keep the batch bucket rows"
         )
+        ring_pool = self._block_draft_worker.swa_ring_pool
         full_to_swa = self._block_draft_worker.full_to_swa
-        if full_to_swa is not None:
+        if ring_pool is not None:
+            # Built on the host and uploaded, as the full-to-SWA map below.
+            bs = verify_input.seq_lens_cpu.shape[0]
+            width = rows.positions.shape[1]
+            positions_cpu = verify_input.seq_lens_cpu.to(torch.int64)[
+                :, None
+            ] + torch.arange(width, dtype=torch.int64)
+            ring_locs = ring_pool.swa_ring_rows(
+                slots=verify_input.req_pool_indices_cpu[:bs, None],
+                positions=positions_cpu,
+            )
+            padded = rows.positions.shape[0]
+            rows = VerifyRows(
+                positions=rows.positions,
+                cache_locs=padded_h2d(ring_locs, padded, self.device),
+                flat_positions=rows.flat_positions,
+                flat_cache_locs=padded_h2d(
+                    pad_rows(ring_locs, padded).reshape(-1), padded * width, self.device
+                ),
+            )
+        elif full_to_swa is not None:
             # A hybrid-SWA draft writes the SWA slots of the same window, mapped on host.
             swa_candidates = full_to_swa[verify_input.verify_cache_candidates_cpu]
             rows = select_verify_rows(
@@ -311,8 +332,14 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             )
             cache_loc_cpu = batch.out_cache_loc
             assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
+            ring_pool = self._block_draft_worker.swa_ring_pool
             full_to_swa = self._block_draft_worker.full_to_swa
-            if full_to_swa is not None and not self.ships_pd_hidden:
+            if ring_pool is not None:
+                assert not self.ships_pd_hidden, "PD does not serve a draft SWA ring"
+                cache_loc_cpu = _extend_ring_rows(
+                    ring_pool=ring_pool, batch=batch, positions=positions_cpu
+                ).to(cache_loc_cpu.dtype)
+            elif full_to_swa is not None and not self.ships_pd_hidden:
                 cache_loc_cpu = full_to_swa[cache_loc_cpu].to(cache_loc_cpu.dtype)
         positions = pad_rows(positions_cpu, padded_rows).to(
             self.device, non_blocking=True
@@ -366,7 +393,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         bonus_tokens: torch.Tensor,
     ) -> None:
         del bonus_tokens
-        if self._block_draft_worker.full_to_swa is not None:
+        if (
+            self._block_draft_worker.full_to_swa is not None
+            or self._block_draft_worker.swa_ring_pool is not None
+        ):
             raise NotImplementedError(
                 "PD decode-side draft prefill does not support a hybrid-SWA draft."
             )
@@ -560,3 +590,22 @@ class TpuBlockSpecWorker(TpuSpecWorker):
     # return the info records once the confidence budget is ported.
     def dump_info_records(self) -> dict | None:
         return None
+
+
+def _extend_ring_rows(*, ring_pool, batch: ScheduleBatch, positions: torch.Tensor):
+    """[T] int64 draft ring rows of an extend's tokens. Restarts the ring of each
+    newly placed request at its cached prefix: the replayed rows' hidden states
+    never reach the draft, so the ring holds nothing below it."""
+    if batch.encoder_swa_reset is not None:
+        placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
+        if placed:
+            ring_pool.reset_swa_req_ring(
+                batch.req_pool_indices_cpu[placed],
+                torch.tensor([batch.prefix_lens[i] for i in placed], dtype=torch.int64),
+            )
+    lens = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    slots = torch.repeat_interleave(batch.req_pool_indices_cpu.to(torch.int64), lens)
+    ends = torch.repeat_interleave(
+        torch.tensor(batch.prefix_lens, dtype=torch.int64) + lens, lens
+    )
+    return ring_pool.swa_ring_rows(slots=slots, positions=positions, ends=ends)
