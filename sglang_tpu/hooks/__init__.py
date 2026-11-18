@@ -43,6 +43,7 @@ from sglang_tpu.hooks.encoder import (
     install_encoder_vision_compile,
     reject_encoder_dp,
 )
+from sglang_tpu.hooks.evict_cause_metrics import hook_specs as evict_cause_metrics_hooks
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm5_next_vision import (
     attach_glm5_next_nextn_multimodal_forward,
@@ -476,6 +477,8 @@ HOOKS.extend(host_padding_hooks())
 HOOKS.extend(hicache_swa_metrics_hooks())
 
 HOOKS.extend(swa_miss_metrics_hooks())
+
+HOOKS.extend(evict_cause_metrics_hooks())
 
 HOOKS.extend(hook_specs())
 
