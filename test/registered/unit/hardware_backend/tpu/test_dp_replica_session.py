@@ -31,7 +31,12 @@ def reset_session(monkeypatch):
     monkeypatch.delenv("TPU_WORKER_HOSTNAMES", raising=False)
 
 
-@pytest.mark.parametrize("first_module", ["sglang_tpu.envs", "sglang.srt.platforms"])
+# dp_replicas first: its own sglang import discovers the platform, which imports
+# it back half-initialized unless the platform reads its names at call time.
+@pytest.mark.parametrize(
+    "first_module",
+    ["sglang_tpu.envs", "sglang.srt.platforms", "sglang_tpu.dp_replicas"],
+)
 def test_platform_discovery_without_portpicker(first_module):
     result = subprocess.run(
         [
