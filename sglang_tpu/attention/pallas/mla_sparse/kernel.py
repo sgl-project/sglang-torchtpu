@@ -1168,10 +1168,10 @@ def sparse_ragged_paged_attention(
       gather_rope: TensorCore layout only (ignored otherwise). False skips the
         rope cache in the gather and attends with zero rope keys; exact only
         when the queries' rope lane is identically zero (a model without rope).
-      kv_shards: ``(shards, role, group)`` for a cache split inside every page
-        (mla_sparse/kv_shard.py): the caches hold this rank's
-        ``page_size`` offsets of each ``page_size * shards``-token page, this
-        rank attends only the candidates at those offsets, and ``group``
+      kv_shards: ``(shards, role, group)`` for a cache split inside every
+        allocator page (mla_sparse/kv_shard.py): the caches' page dim is this
+        rank's share, so an allocator page has ``shards`` times its offsets;
+        this rank attends only the candidates in its share, and ``group``
         consecutive top-k entries share an owner (the pooled indexer's pools).
         Use with ``return_lse`` and merge the ranks' partials.
 
@@ -1424,7 +1424,7 @@ def prepare_gather_indices(
         seq_ids_segment = jnp.repeat(
             jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
         )
-        # A split cache's page holds page_size of the shards * page_size offsets.
+        # page_size is the cache's page dim: a rank's share of an allocator page.
         seq_page_size = page_size * (kv_shards[0] if kv_shards is not None else 1)
         seq_page_ids = topk_indices // seq_page_size
         token_offset = topk_indices % seq_page_size

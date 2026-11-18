@@ -8,6 +8,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 from __future__ import annotations
 
 import json
+import math
 import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Optional, Type
@@ -755,7 +756,8 @@ def _validate_mla_kv_shards(cfg, hf_config) -> None:
             f"multiple of {shards} ranks (got tp {tp}, attention CP {attn_cp}, "
             f"attention DP {cfg.attn_dp_size}, PP {cfg.pp_size})."
         )
-    unit = shards * max(4, get_dsa_index_kpool(hf_config))  # RoPE row, indexer pool
+    # A rank's share holds whole RoPE rows (4 tokens) and indexer pools.
+    unit = shards * math.lcm(4, get_dsa_index_kpool(hf_config))
     if cfg.page_size and cfg.page_size % unit:
         raise ValueError(
             f"SGLANG_TPU_DSA_MLA_KV_SHARDS={shards} needs --page-size a multiple of "
@@ -775,6 +777,8 @@ def _validate_mla_kv_shards(cfg, hf_config) -> None:
         # A rank's share is a compile-time constant of its program; one shared
         # program would make every rank attend rank 0's share.
         "--use-spmd-compile": cfg.use_spmd_compile,
+        # Storage takes an MLA pool as rank-identical and writes rank 0's share only.
+        "--hicache-storage-backend": cfg.hicache_storage_backend is not None,
     }
     on = [name for name, active in refused.items() if active]
     if on:

@@ -417,10 +417,10 @@ def update_sparse_mla_kv_cache(
         whose rope lane is identically zero (GLM-5.3-Flash has no rope; the
         backend attends with a zero lane): the cache is allocated zeroed, so
         skipping the write changes nothing.
-      kv_shards: ``(shards, role)`` for a cache split inside every page
-        (mla_sparse/kv_shard.py): the caches hold this rank's ``page_size``
-        offsets of each ``page_size * shards``-token page, and tokens at other
-        ranks' offsets are skipped.
+      kv_shards: ``(shards, role)`` for a cache split inside every allocator
+        page (mla_sparse/kv_shard.py): the specs' page size is this rank's
+        share, an allocator page has ``shards`` times its offsets, and tokens
+        at other ranks' offsets are skipped.
 
     Returns:
       The updated (nope, rope) kv caches, same shapes/dtypes as the inputs.

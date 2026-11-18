@@ -688,7 +688,9 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
 
         from sglang_tpu import hybrid_linear_hicache
 
-        memory = SimpleNamespace(hicache_io_backend="raiden", hicache_ratio=2)
+        memory = SimpleNamespace(
+            hicache_io_backend="raiden", hicache_ratio=2, hicache_size=0
+        )
         pool = object()
         for env, ratio in (({}, 2), ({"SGLANG_TPU_HICACHE_STATE_RATIO": "3.5"}, 3.5)):
             with (
@@ -701,6 +703,31 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
                     mamba_pool=pool, host_size=0
                 )
             cls.return_value.assert_called_once_with(pool, ratio, 0)
+
+    def test_state_host_ratio_is_checked(self):
+        import os
+
+        from sglang_tpu import hybrid_linear_hicache
+
+        strategy = hybrid_linear_hicache.TpuDmaMambaStrategy()
+
+        def build(env, hicache_size=0):
+            memory = SimpleNamespace(
+                hicache_io_backend="raiden", hicache_ratio=2, hicache_size=hicache_size
+            )
+            with (
+                patch.dict(os.environ, env),
+                patch.object(hybrid_linear_hicache, "get_memory", return_value=memory),
+                patch("sglang_tpu.kv_pool_host.tpu_dma_mamba_pool_host_cls"),
+            ):
+                strategy.mamba_host_pool_fn(mamba_pool=object(), host_size=0)
+
+        for bad in ("0", "-1", "nan"):
+            with self.subTest(ratio=bad), self.assertRaisesRegex(ValueError, "> 0"):
+                build({"SGLANG_TPU_HICACHE_STATE_RATIO": bad})
+        with self.assertLogs(hybrid_linear_hicache.logger, "WARNING") as logs:
+            build({"SGLANG_TPU_HICACHE_STATE_RATIO": "3"}, hicache_size=100)
+        self.assertIn("ignored under --hicache-size", logs.output[0])
 
     def test_split_pool_host_sizing_matches_its_allocation(self):
         """A host page holds every DSA buffer of the page, so host bytes per token
