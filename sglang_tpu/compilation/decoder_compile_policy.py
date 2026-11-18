@@ -2716,3 +2716,262 @@ class BailingVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
                 "on TPU yet."
             )
         return super().install()
+
+
+class Glm5NextVLDecoderTpuCompilePolicy(Qwen3VLDecoderTpuCompilePolicy):
+    """Dedicated TPU decoder compile policy for multimodal GLM-5.3-Flash.
+
+    Compiles ``_Glm5NextLanguageModel`` (embedding + 45 hybrid KDA/DSA/MoE/mHC
+    layers + final norm + ``logits_processor``) in one XLA graph without dead
+    ``text_ids`` variants, while warming eager multimodal prompt embedding and
+    row placement and preserving padded ``mm_input_embeds`` for ``NEXTN`` MTP.
+    """
+
+    spmd_safe = False
+
+    def install(self) -> bool:
+        if self.model_runner is None:
+            return super().install()
+
+        parallel = get_parallel()
+        if parallel.pp_size > 1:
+            raise ValueError(
+                "GLM-5.3-Flash's multimodal model does not support "
+                "pipeline parallelism with --enable-torch-compile on TPU yet."
+            )
+        if (
+            getattr(self.model_runner.server_args, "tpu_compile_tracer", None)
+            == "direct"
+        ):
+            raise ValueError(
+                "GLM-5.3-Flash's multimodal model does not support "
+                "--tpu-compile-tracer direct with --enable-torch-compile "
+                "on TPU yet."
+            )
+        if self._cp_strategy is not None:
+            raise NotImplementedError(
+                "GLM-5.3-Flash's multimodal model does not support prefill "
+                "context parallelism with --enable-torch-compile on TPU yet."
+            )
+        input_scattered_enabled = bool(
+            getattr(
+                self.model_runner.server_args,
+                "enable_attn_tp_input_scattered",
+                False,
+            )
+        )
+        if input_scattered_enabled and parallel.attn_tp_size != parallel.tp_size:
+            raise NotImplementedError(
+                "GLM-5.3-Flash's multimodal model requires "
+                "attn_tp_size == tp_size when --enable-attn-tp-input-scattered "
+                "is enabled on TPU."
+            )
+        if (torch.distributed.is_initialized() or input_scattered_enabled) and getattr(
+            self.model_runner, "device", None
+        ) is not None:
+            from sglang.srt.layers import dp_attention
+
+            device = torch.device(self.model_runner.device)
+            if ("attn_tp", device) not in dp_attention._RANK_TENSORS:
+                dp_attention._init_rank_tensors(device)
+
+        return super().install()
+
+    def _extend_input_variants(self) -> tuple[str, ...]:
+        if not self._uses_input_embeds(self.owner):
+            return super()._extend_input_variants()
+        return ("text_only",)
+
+    def _extend_serving_variants(self) -> tuple[str, ...]:
+        if not self._uses_input_embeds(self.owner):
+            return super()._extend_serving_variants()
+        if tpu_envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.get():
+            return ("text_ids",)
+        return ("text_only",)
+
+    def _make_warmup_inputs(
+        self,
+        *,
+        num_tokens: int,
+        bs: int,
+        mode: ForwardMode,
+        variant: str = "plain",
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        spec_info: Any | None = None,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        if variant == "text_ids" and self._uses_input_embeds(self.owner):
+            forward_batch = self._make_dummy_forward_batch(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=mode,
+                capture_hidden_mode=capture_hidden_mode,
+                spec_info=spec_info,
+            )
+            positions = (
+                forward_batch.mrope_positions
+                if self._model_is_mrope
+                else forward_batch.positions
+            )
+            return (
+                (forward_batch.input_ids, positions, forward_batch),
+                self._pp_warmup_kwargs(num_tokens),
+            )
+        return super()._make_warmup_inputs(
+            num_tokens=num_tokens,
+            bs=bs,
+            mode=mode,
+            variant=variant,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=spec_info,
+        )
+
+    def _extend_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
+        """Pin EXTEND to FULL_VOCAB to avoid duplicating 45-layer prefill graphs.
+
+        Next-token logits on EXTEND gather at most ``extend_bs`` rows (<0.01% of
+        prefill time), whereas compiling ``DISTRIBUTED_TOP_K`` across token
+        buckets doubles prefill compile time and executable HBM. ``DECODE`` still
+        warms ``DISTRIBUTED_TOP_K`` via ``_warmup_logits_output_modes(bs)``.
+        """
+        return (LogitsOutputMode.FULL_VOCAB,)
+
+    def _precompile_extend(self) -> list[PendingCall]:
+        if not self._uses_input_embeds(self.owner):
+            return super()._precompile_extend()
+
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+
+        compile_cases = self._extend_compile_cases()
+        if not compile_cases:
+            raise ValueError(
+                "No TPU extend compile shapes are valid: token buckets "
+                f"{list(self.t_bucketer.buckets)} are all smaller than the "
+                f"extend batch cap {self._extend_compile_cap()}."
+            )
+
+        variants = self._extend_serving_variants()
+        extend_capture_hidden_mode = (
+            CaptureHiddenMode.FULL
+            if tpu_envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+            else CaptureHiddenMode.NULL
+        )
+        compile_items = [
+            (num_tokens, bs, mode, variant, logits_output_mode)
+            for num_tokens, bs, mode in compile_cases
+            for variant in variants
+            for logits_output_mode in self._extend_logits_output_modes()
+        ]
+        logger.info(
+            "[decoder compile policy] GLM5-VL EXTEND: %d graph variants "
+            "(batch_caps=%s, token_buckets=%s, variants=%s)",
+            len(compile_items),
+            sorted({(mode.name, batch_size) for _, batch_size, mode in compile_cases}),
+            list(self.t_bucketer.buckets),
+            variants,
+        )
+        compile_range = (
+            tqdm.tqdm(
+                compile_items,
+                desc="Compiling GLM5-VL EXTEND",
+                bar_format=_COMPILE_BAR_FORMAT,
+            )
+            if get_parallel().tp_rank == 0
+            else compile_items
+        )
+        pending = []
+        for num_tokens, bs, mode, variant, logits_output_mode in compile_range:
+            hbm_before = _get_hbm_usage_mb()
+            start = time.perf_counter()
+            warmup = self._run_one(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=mode,
+                variant=variant,
+                logits_output_mode=logits_output_mode,
+                capture_hidden_mode=extend_capture_hidden_mode,
+            )
+            elapsed = time.perf_counter() - start
+            warmup = self._record_compile_step(
+                pending_call=warmup,
+                phase=mode.name.lower(),
+                duration_seconds=elapsed,
+                batch_size=bs,
+                num_tokens=num_tokens,
+                input_variant=variant,
+                logits_output_mode=logits_output_mode.name.lower(),
+                capture_hidden_mode=extend_capture_hidden_mode.name.lower(),
+            )
+            if warmup is not None:
+                pending.append(warmup)
+            if get_parallel().tp_rank == 0:
+                status, elapsed, hbm_str = _warmup_progress(warmup, start, hbm_before)
+                compile_range.set_description(
+                    f"{status} GLM5-VL {mode.name} (tokens={num_tokens}, bs={bs}, "
+                    f"variant={variant}, logits={logits_output_mode.name}) "
+                    f"in {elapsed:.1f}s{hbm_str}"
+                )
+        self._precompile_mm_embed_placement()
+        return pending
+
+    def _precompile_mm_embed_placement(self) -> None:
+        """Warm eager prompt token embedding and multimodal row placement."""
+        if tpu_envs.SGLANG_TPU_VL_TEXT_ONLY_EXTEND.get():
+            return
+        pp_group = self.model_runner.pp_group
+        if pp_group is not None and not pp_group.is_first_rank:
+            return
+
+        from sglang_tpu.mm_embed_tpu import apply_host_mm_embeds, merge_mm_rows
+
+        assert self.t_bucketer is not None
+
+        embed_tokens = self.owner.get_input_embeddings()
+        hidden = embed_tokens.embedding_dim
+        dtype = embed_tokens.weight.dtype
+        device = self.model_runner.device
+        buckets = list(self.t_bucketer.buckets)
+        on_device = bool(envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get())
+
+        start = time.perf_counter()
+        with torch.no_grad():
+            for num_tokens in buckets:
+                ids = torch.zeros(num_tokens, dtype=torch.int64).to(device)
+                ids.clamp_(min=0, max=embed_tokens.num_embeddings - 1)
+                ids.cpu()
+                text_embeds = embed_tokens(ids)
+                text_embeds.cpu()
+                if on_device:
+                    merge_mm_rows(
+                        text_embeds,
+                        torch.zeros((num_tokens, hidden), dtype=dtype).to(device),
+                        torch.arange(num_tokens, dtype=torch.int32).to(device),
+                        torch.zeros((num_tokens, 1), dtype=torch.bool).to(device),
+                    ).cpu()
+                else:
+                    apply_host_mm_embeds(
+                        input_embeds=text_embeds,
+                        host_src=torch.zeros((num_tokens, hidden), dtype=dtype),
+                        host_mask=torch.zeros((num_tokens, 1), dtype=torch.bool),
+                    ).cpu()
+        elapsed = time.perf_counter() - start
+        logger.info(
+            "[decoder compile policy] GLM5-VL MM EMBED PLACEMENT: "
+            "%d token buckets in %.1fs (mode=%s)",
+            len(buckets),
+            elapsed,
+            "device_scatter" if on_device else "host_placement",
+        )
+        self._record_compile_step(
+            phase="mm_embed_placement",
+            duration_seconds=elapsed,
+            input_variant="device_scatter" if on_device else "host_placement",
+        )
+
+    def keeps_padded_mm_embeds(self, batch: ForwardBatch) -> bool:
+        """Keep multimodal embeds at the token bucket for HOST_PADDED draft extend."""
+        return (
+            batch.sampling_info is not None
+            and is_host_padded(batch.sampling_info)
+            and not batch.forward_mode.is_target_verify()
+        )
