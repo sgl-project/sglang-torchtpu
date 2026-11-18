@@ -1768,13 +1768,42 @@ class RaidenReceiverMixin:
         with self._state_lock:
             covered = list(self._decode.reshard_covered.get(room, []))
         missing = [pg for pg in self._uncovered_pages(total, covered) if pg >= base]
+        has_closing_full = bool(missing) or (
+            self._unified_swa_pool is not None and bool(local_swa_blocks)
+        )
         with self._state_lock:
             if room not in self._decode.reshard_meta:
                 return  # cleared while the complement was computed
             # Owed from the moment the room can look complete, as below.
-            if missing:
+            if has_closing_full:
                 self._decode.chunk_reads.setdefault(room, []).append(str(room))
             self._decode.final_seen.add(room)
+        if self._unified_swa_pool is not None:
+            unified_swa_sources = self._pair_unified_reshard_swa_receiver(
+                room, local_swa_blocks, swa_sources_map
+            )
+            if unified_swa_sources is None:
+                return
+            unified_sources = [
+                (
+                    p_rank,
+                    [sources_map[p_rank][pg] for pg in missing]
+                    + unified_swa_sources[p_rank],
+                )
+                for p_rank in sorted(sources_map)
+            ]
+            dst = [local_blocks[pg - base] for pg in missing]
+            self._land_unified_closing(
+                room,
+                geom,
+                src_attn_tp,
+                unified_sources,
+                dst,
+                list(local_swa_blocks),
+                missing,
+                ready_endpoints,
+            )
+            return
         if not missing and not swa_lands:
             if not self._register_reshard_swa_receiver(
                 room, src_attn_tp, local_swa_blocks, swa_sources_map
@@ -1973,6 +2002,80 @@ class RaidenReceiverMixin:
                 self._land_free(req_id)
             if swa_scratch is not None and not published:
                 self._land_free(swa_req_id, swa=True)
+
+    def _land_unified_closing(
+        self,
+        room: int,
+        geom: Any,
+        src_attn_tp: int,
+        unified_sources: List[Tuple[int, List[int]]],
+        dst: List[int],
+        local_swa_blocks: List[int],
+        missing: List[int],
+        ready_endpoints: List[str],
+    ) -> None:
+        args = (
+            room,
+            geom,
+            src_attn_tp,
+            unified_sources,
+            dst,
+            local_swa_blocks,
+            missing,
+            ready_endpoints,
+        )
+        req_id = str(room)
+        combined_dst = dst + local_swa_blocks
+        all_scratch = self._land_take(
+            room,
+            req_id,
+            len(combined_dst),
+            retry=functools.partial(self._retry_land_unified_closing, *args),
+            expire=functools.partial(
+                self._fail_reshard_room, room, self._land_hold_error()
+            ),
+        )
+        if all_scratch is None:
+            return
+        published = False
+        registered = False
+        try:
+            if not self._stage_closing_full_plan(
+                room=room,
+                req_id=req_id,
+                src_attn_tp=src_attn_tp,
+                geom=geom,
+                sources=unified_sources,
+                dst=combined_dst,
+                scratch=all_scratch,
+            ):
+                return
+            registered = True
+            payload = ReshardLandReady(
+                room=room,
+                pages=missing,
+                scratch=all_scratch[: len(dst)],
+                land_version=LAND_VERSION,
+                swa_scratch=all_scratch[len(dst) :],
+            ).to_frames()
+            with self._state_lock:
+                if room in self._decode.reshard_meta and room not in self._aborted:
+                    self._reshard_plans.setdefault(room, {})[req_id] = room
+                    self._land.publish(req_id, combined_dst)
+                    for endpoint in ready_endpoints:
+                        self._send_multipart_locked(endpoint, payload)
+                    published = True
+        finally:
+            if not published and registered:
+                self._unregister_plan(room)
+            if not published:
+                self._land_free(req_id)
+
+    def _retry_land_unified_closing(self, room: int, *args: Any) -> None:
+        try:
+            self._land_unified_closing(room, *args)
+        except Exception as error:
+            self._fail_reshard_room(room, error)
 
     def _retry_land_closing(self, room: int, *args: Any) -> None:
         try:

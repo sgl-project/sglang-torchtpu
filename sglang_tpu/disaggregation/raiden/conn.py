@@ -577,6 +577,12 @@ class RaidenKVManager(
         of a landing room at one announcement (C)."""
         return -(-CHUNK_ANNOUNCE_TOKENS // int(self.kv_args.page_size))
 
+    def _land_min_arena_blocks(self, *, swa: bool = False) -> int:
+        chunk = self._land_chunk_pages()
+        if not swa and self._unified_swa_pool is not None:
+            return (1 + self._unified_swa_pool.layout.num_swa_groups) * chunk
+        return chunk
+
     def _land_ok(self, *, swa: bool = False) -> bool:
         """Whether this side can serve a push reshard that needs landing
         (#829): a decode whose arena holds a whole chunk, or a prefill with
@@ -586,7 +592,9 @@ class RaidenKVManager(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             return True
         land = self._swa_land if swa else self._land
-        return land is not None and land.arena.capacity >= self._land_chunk_pages()
+        return land is not None and land.arena.capacity >= self._land_min_arena_blocks(
+            swa=swa
+        )
 
     def _land_hint(self, *, swa: bool = False) -> str:
         """What would let a refused landing cell through on this side."""
@@ -596,12 +604,6 @@ class RaidenKVManager(
                 "prefill and the decode to land it in scratch blocks)"
             )
         land = self._swa_land if swa else self._land
-        if land is None and self._unified_swa_pool is not None:
-            return (
-                f" ({tpu_envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.name} is set, but "
-                "--enable-unified-memory reserves no landing arena: run the decode "
-                "without it to land)"
-            )
         group = "SWA KV pool" if swa else "KV pool"
         if land is None:
             return (
@@ -609,10 +611,16 @@ class RaidenKVManager(
                 f"decode's {group} reserved no landing arena: it needs a token-major "
                 "fp8 --kv-cache-dtype)"
             )
+        needed = self._land_min_arena_blocks(swa=swa)
+        if not swa and self._unified_swa_pool is not None:
+            return (
+                f" (the unified landing arena holds {land.arena.capacity} blocks, "
+                f"under the {needed} blocks one chunk and its SWA groups need)"
+            )
         label = "SWA landing arena" if swa else "landing arena"
         return (
             f" (the {label} holds {land.arena.capacity} blocks, under one "
-            f"{self._land_chunk_pages()}-page chunk)"
+            f"{needed}-page chunk)"
         )
 
     def _check_reshard_bounds(

@@ -131,24 +131,67 @@ class TestArenaSizing(CustomTestCase):
             "env off": dict(arena=False),
             # The sizer charges nothing for MLA; an MHA draft must match.
             "mla target": dict(mla=True),
-            "unified pool": dict(unified=True),
         }
         for name, deployment in cases.items():
             with self.subTest(name), _deployment(**deployment):
                 self.assertEqual(land_arena_blocks(), 0)
 
-    def test_unified_pool_reserves_nothing(self):
-        # --enable-unified-memory: the unified configurator charges no arena,
-        # so neither the pool nor the platform budget may reserve one. The
-        # unified=False rows are the negative control.
+    def test_unified_pool_scales_arena_by_swa_groups(self):
+        """TpuUnifiedSWAKVPool reserves (1 + M_swa) * ARENA blocks past the
+        allocator's pages, and the unified allocator never hands them out."""
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang_tpu.tpu_platform import TpuSRTPlatform
+        from sglang_tpu.unified_kv_pool import (
+            AttnLayerSpec,
+            TpuUnifiedSWAKVPool,
+            TpuUnifiedSWATokenToKVPoolAllocator,
+        )
 
         hook = TpuSRTPlatform.get_kv_pool_reserved_blocks
-        for unified, blocks in ((False, ARENA), (True, 0)):
-            with self.subTest(unified=unified), _deployment(unified=unified):
-                self.assertEqual(land_arena_blocks(), blocks)
-                self.assertEqual(hook(None, use_mla_backend=False), blocks)
-                self.assertEqual(_pool().land_arena_blocks, blocks)
+        with _deployment(unified=True):
+            self.assertEqual(land_arena_blocks(), ARENA)
+            self.assertEqual(hook(None, use_mla_backend=False), ARENA)
+            size = 16 * PAGE
+            pool = TpuUnifiedSWAKVPool(
+                size=size,
+                page_size=PAGE,
+                dtype=_FP8,
+                full=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=[0, 1]),
+                swa=AttnLayerSpec(
+                    head_num=2, head_dim=128, layer_ids=list(range(2, 12))
+                ),
+                device="cpu",
+            )
+        # M_swa = ceil(10 / 2) = 5 -> (1 + 5) * ARENA = 6 * ARENA.
+        want = 6 * ARENA
+        self.assertEqual(pool.land_arena_blocks, want)
+        self.assertEqual(pool.kv_pool.num_blocks, 16 + 1 + want)
+        arena = ScratchArena.from_pool(pool)
+        self.assertEqual(arena.first_block, 17)
+        self.assertEqual(arena.capacity, want)
+        self.assertIsNone(ScratchArena.from_pool(pool, swa=True))
+        req_pool = ReqToTokenPool(
+            size=4, max_context_len=size, device="cpu", enable_memory_saver=False
+        )
+        allocator = TpuUnifiedSWATokenToKVPoolAllocator(
+            size,
+            page_size=PAGE,
+            dtype=_FP8,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+            req_to_token_pool=req_pool,
+        )
+        self.assertEqual(
+            allocator.full_attn_allocator.free_pages.tolist(), list(range(1, 17))
+        )
+        full_loc = allocator.full_attn_allocator.alloc(2 * PAGE)
+        swa_loc = allocator.swa_attn_allocator.alloc(2 * PAGE)
+        swa_pages = sorted({int(x) // PAGE for x in swa_loc})
+        expanded = pool.expand_swa_pages(swa_pages)
+        self.assertEqual(len(expanded), 2 * 5)
+        self.assertTrue(all(1 <= int(x) // PAGE < 17 for x in full_loc))
+        self.assertTrue(all(1 <= p < 17 for p in expanded))
 
     def test_bf16_target_leaves_pools_unchanged_with_env_on(self):
         with _deployment(kv_cache_dtype="bfloat16"):

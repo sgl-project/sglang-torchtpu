@@ -50,18 +50,14 @@ def land_arena_blocks() -> int:
     decode whose target pool is token-major fused with an fp8 store dtype, the
     only layout whose push reshard needs landing. A target resolved to fp8 from
     ``--kv-cache-dtype auto`` (a checkpoint's kv quant) is not seen here and
-    gets no arena, so its LAND schedules stay refused. Neither does the
-    unified Full+SWA pool (--enable-unified-memory): its configurator charges
-    no arena, so the pool reserves none and its LAND schedules stay refused.
+    gets no arena, so its LAND schedules stay refused. ``TpuUnifiedSWAKVPool``
+    scales this count by ``1 + num_swa_groups`` so one plan's full and expanded
+    SWA companion pages fit in its shared arena.
 
     The size is two announcement chunks of schedule pages,
     ``2 * ceil(8192 / page_size)``.
     """
     if not envs.SGLANG_RAIDEN_RESHARD_LAND_ARENA.get():
-        return 0
-    from sglang_tpu.unified_kv_pool import unified_kv_pool_requested
-
-    if unified_kv_pool_requested():
         return 0
     from sglang.srt.runtime_context import (
         get_disagg,
@@ -119,11 +115,14 @@ class ScratchArena:
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
         from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
         if swa:
             if not isinstance(pool, SWAKVPool):
                 return None
             pool = pool.swa_kv_pool
+        elif isinstance(pool, TpuUnifiedSWAKVPool):
+            pool = pool.kv_pool
         elif isinstance(pool, (SWAKVPool, HybridLinearKVPool)):
             pool = pool.full_kv_pool
         if not isinstance(pool, TpuFusedMHATokenToKVPool):

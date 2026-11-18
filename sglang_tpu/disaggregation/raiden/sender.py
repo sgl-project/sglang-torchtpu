@@ -933,10 +933,16 @@ class RaidenSenderMixin:
         decode_swa_blocks = list(req.get("decode_swa_blocks") or [])
         swa_lands = (
             is_closing
-            and bool(self._swa_kv_caches)
             and bool(decode_swa_blocks)
-            and self._land_ok(swa=True)
-            and self._plan_lands(dst_attn_tp, swa=True)
+            and (
+                full_lands
+                if self._unified_swa_pool is not None
+                else (
+                    bool(self._swa_kv_caches)
+                    and self._land_ok(swa=True)
+                    and self._plan_lands(dst_attn_tp, swa=True)
+                )
+            )
         )
         want_full = pages if full_lands else 0
         want_swa = len(decode_swa_blocks) if swa_lands else 0
@@ -1450,6 +1456,8 @@ class RaidenSenderMixin:
                 if unified_swa_pair is None:
                     return
                 swa_src, swa_dst = unified_swa_pair
+                if scratch is not None or swa_scratch is not None:
+                    scratch = list(scratch or []) + list(swa_scratch or [])
             else:
                 swa_src, swa_dst = [], []
         else:

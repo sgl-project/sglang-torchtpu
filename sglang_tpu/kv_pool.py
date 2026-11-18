@@ -192,6 +192,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
         allocation_label: Optional[str] = None,
+        land_arena_scale: int = 1,
     ):
         # We deliberately do *not* call ``MHATokenToKVPool.__init__`` here:
         # its ``_create_buffers`` allocates the legacy two-buffer (K / V) layout
@@ -279,6 +280,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
             )
         # Pad with one extra page so loc == 0 (the padded-token slot) is harmless.
         # Raiden's reshard landing arena follows the allocator's pages.
+        self._land_arena_scale = int(land_arena_scale)
         self.land_arena_blocks = self._land_arena_blocks()
         self.num_blocks = self.size // self.page_size + 1 + self.land_arena_blocks
 
@@ -317,7 +319,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
             return 0
         from sglang_tpu.disaggregation.raiden.land import land_arena_blocks
 
-        return land_arena_blocks()
+        return self._land_arena_scale * land_arena_blocks()
 
     def _synchronize_device(self) -> None:
         device = getattr(self, "device", None)
