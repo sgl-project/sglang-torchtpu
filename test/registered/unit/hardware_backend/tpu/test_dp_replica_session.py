@@ -28,6 +28,7 @@ def reset_session(monkeypatch):
     monkeypatch.setattr(dp_replicas, "_active_session", None)
     monkeypatch.setenv("SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "0")
     monkeypatch.delenv("TPU_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("TPU_WORKER_HOSTNAMES", raising=False)
 
 
 @pytest.mark.parametrize("first_module", ["sglang_tpu.envs", "sglang.srt.platforms"])
@@ -98,6 +99,25 @@ def test_ep_and_expert_tp_groups_stay_inside_engine():
     assert len(groups) == len(set(groups))
 
 
+def test_replica_boxes_tile_a_4x4x4(monkeypatch):
+    order = list(range(16))
+    # Host rank r sits at host (x, y, z) = (r % 2, r // 2 % 2, r // 4).
+    tile = lambda: dp_replicas.order_hosts_by_replica(order, (4, 4, 4, 2), (2, 2, 1), 4)
+    monkeypatch.setenv("SGLANG_TPU_DP_REPLICA_SHAPE", "2x2x4")
+    assert tile() == [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15]
+    monkeypatch.setenv("SGLANG_TPU_DP_REPLICA_SHAPE", "4x4x1")
+    assert tile() == order
+    monkeypatch.setenv("SGLANG_TPU_DP_REPLICA_SHAPE", "2x2x2")
+    with pytest.raises(ValueError, match="must tile"):
+        tile()
+
+
+def test_dcp_pairs_stay_inside_engine():
+    groups = dp_replicas.device_group_ranks(2, 4, 4, dcp_size=2)
+    assert {(0, 1), (2, 3), (4, 5), (6, 7)} <= set(groups)
+    assert all(len({rank // 4 for rank in group}) == 1 for group in groups)
+
+
 def test_session_restores_engine_rank_even_when_backend_fails(monkeypatch):
     monkeypatch.setenv("RANK", "2")
     monkeypatch.setenv("WORLD_SIZE", "4")
@@ -138,6 +158,52 @@ def test_parent_preserves_ports_and_libtpu_args(monkeypatch, tp_size):
     assert os.environ["LIBTPU_INIT_ARGS"] == "--unrelated=false"
 
 
+def test_multi_host_parent_derives_session_port_and_disables_tier2_cache(monkeypatch):
+    for name in (
+        "SGLANG_TPU_DP_SESSION_PORT",
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TORCH_TPU_TIER2_COMPILATION_CACHE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    dp_replicas.prepare_host_session(4, 32, "h0:29500")
+    # Every host computes the same port from --dist-init-addr's.
+    assert os.environ["SGLANG_TPU_DP_SESSION_PORT"] == "29520"
+    assert os.environ["TORCH_TPU_TIER2_COMPILATION_CACHE"] == "disabled"
+    assert "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ
+
+
+def test_multi_host_session_binds_local_devices_and_meets_on_first_host(monkeypatch):
+    # DP2 x TP4 on four two-device hosts: engine 1 owns hosts h2 and h3.
+    monkeypatch.setenv("TPU_WORKER_HOSTNAMES", "h0,h1,h2,h3")
+    monkeypatch.setenv("TORCH_TPU_DEVICES_PER_HOST", "2")
+    monkeypatch.setenv("RANK", "3")
+    monkeypatch.setenv("SGLANG_TPU_DP_SESSION_PORT", "29520")
+    monkeypatch.setattr(
+        dp_replicas,
+        "_resolve_single_host_tpu_topology",
+        Mock(side_effect=AssertionError("multi-host topology comes from the launcher")),
+    )
+    monkeypatch.setattr(dp_replicas.torch, "ones", Mock())
+    monkeypatch.setattr(dp_replicas.dist, "is_initialized", lambda: False)
+    initialize = Mock()
+    monkeypatch.setattr(dp_replicas.dist, "init_process_group", initialize)
+    monkeypatch.setattr(
+        dp_replicas.dist,
+        "new_group",
+        Mock(side_effect=lambda ranks, **kw: tuple(ranks)),
+    )
+    default_mesh = Mock()
+    monkeypatch.setattr(dp_replicas, "_default_pallas_mesh_to_engine", default_mesh)
+
+    session = dp_replicas.ReplicaSession(1, 2, 4, 4, device=7)
+    with session.initialize():
+        assert os.environ["RANK"] == "7"
+        assert os.environ["LOCAL_RANK"] == "1"
+        assert os.environ["LOCAL_WORLD_SIZE"] == "2"
+    assert initialize.call_args.kwargs["init_method"] == "tcp://h0:29520"
+    default_mesh.assert_called_once_with((4, 5, 6, 7), 4)
+
+
 def test_session_applies_timeout_to_borrowed_groups(monkeypatch):
     monkeypatch.setenv("RANK", "2")
     monkeypatch.setenv("WORLD_SIZE", "4")
@@ -152,6 +218,7 @@ def test_session_applies_timeout_to_borrowed_groups(monkeypatch):
     create_group = Mock(side_effect=lambda ranks, **kwargs: tuple(ranks))
     monkeypatch.setattr(dp_replicas.dist, "init_process_group", initialize)
     monkeypatch.setattr(dp_replicas.dist, "new_group", create_group)
+    monkeypatch.setattr(dp_replicas, "_default_pallas_mesh_to_engine", Mock())
 
     session = dp_replicas.ReplicaSession(1, 2, 4, 4, 6, timeout_seconds=17)
     with session.initialize():

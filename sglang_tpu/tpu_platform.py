@@ -1107,7 +1107,11 @@ class TpuSRTPlatform(SRTPlatform):
         # One device per scheduler process across all pipeline stages.
         if cfg.dp_size > 1:
             validate_dp_replicas(cfg)
-            prepare_host_session(cfg.dp_size, cfg.tp_size)
+            prepare_host_session(
+                cfg.dp_size,
+                cfg.tp_size,
+                cfg.dist_init_addr if cfg.nnodes > 1 else None,
+            )
         _prepare_tpu_env(
             cfg.dp_size * cfg.tp_size * cfg.pp_size,
             setup_slicebuilder=not cfg.use_ray,
@@ -1661,6 +1665,7 @@ class TpuSRTPlatform(SRTPlatform):
             cfg.ep_size,
             dp_rank * cfg.tp_size + tp_rank,
             cfg.dist_timeout or 7200,
+            cfg.dcp_size,
         )
         # The session rank chooses the physical device. Engine-local co-location
         # binding would put every replica on the first engine's devices.
