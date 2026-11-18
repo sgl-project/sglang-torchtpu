@@ -23,6 +23,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.runtime_context import ParallelContext
 from sglang_tpu.envs import dev_int
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import (
@@ -58,7 +59,11 @@ from sglang_tpu.muse_megakernel.common.plan import (
     n_expert_refs,
 )
 from sglang_tpu.muse_megakernel.common.scratch import WEIGHT_NAMES, scratch_vmem_bytes
-from sglang_tpu.muse_megakernel.decode.spep.kernel import ep_arm, ep_megakernel_call
+from sglang_tpu.muse_megakernel.decode.spep.kernel import (
+    EPArm,
+    ep_arm,
+    ep_megakernel_call,
+)
 from sglang_tpu.muse_megakernel.decode.tp import kernel as K
 from sglang_tpu.muse_megakernel.prefill import spep as PF_SP
 from sglang_tpu.muse_megakernel.prefill import tp as PF
@@ -116,8 +121,8 @@ def _stack(tensors: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack(tensors, dim=0)
 
 
-class _ModelGeometry:
-    """Static model numbers the kernel needs, read from the loaded model."""
+class _ModelSpec:
+    """The loaded model's shapes and constants the kernels need (per device under TP)."""
 
     def __init__(self, model, *, ep_ranks: int = 1) -> None:
         cfg = model.text_config
@@ -173,7 +178,7 @@ def _expert_refs(experts, kind: str) -> list[torch.Tensor]:
     return [experts.w13_weight, s13, experts.w2_weight, s2]
 
 
-def _check_ep_serving(parallel) -> None:
+def _validate_ep_serving(parallel: ParallelContext) -> None:
     """The EP layout replaces the experts the native MoE reads, so every forward must run a
     Muse EP program: decode/spep for decode and verify, prefill/spep for extend."""
     if not (
@@ -354,7 +359,7 @@ class MuseMegakernel(torch.nn.Module):
     def __init__(
         self,
         *,
-        geo: _ModelGeometry,
+        geo: _ModelSpec,
         weights: dict,
         experts: list,
         kinds: tuple,
@@ -426,7 +431,7 @@ class MuseMegakernel(torch.nn.Module):
         moe_mode = resolve_moe_mode(parallel.moe_ep_size)
         ep = moe_mode == "ep"
         if ep:
-            _check_ep_serving(parallel)
+            _validate_ep_serving(parallel)
         elif not (
             parallel.moe_ep_size == 1
             and parallel.moe_tp_size == parallel.tp_size == parallel.attn_tp_size
@@ -450,7 +455,7 @@ class MuseMegakernel(torch.nn.Module):
             )
         if prefill:
             _check_prefill_setup()
-        geo = _ModelGeometry(model, ep_ranks=parallel.moe_ep_size if ep else 1)
+        geo = _ModelSpec(model, ep_ranks=parallel.moe_ep_size if ep else 1)
         decoder = model.model
         L, H = geo.n_layers, geo.hidden
         Ep = -(-geo.n_experts // LANE) * LANE
@@ -1454,10 +1459,10 @@ def _check_prefill_setup() -> None:
         )
 
 
-def _build_callable(cfg: MKConfig, tp: int, ep: str | None = None):
+def _build_callable(cfg: MKConfig, tp: int, ep: EPArm | None = None):
     """The megakernel + KV scatter as one jitted ``shard_map`` program over the TP mesh.
 
-    ep: an ep_arm of the EP megakernel (decode/spep), or None for the TP megakernel."""
+    ep: the EP megakernel's arm (decode/spep), or None for the TP megakernel."""
     L = cfg.n_layers
     nw = len(WEIGHT_NAMES)
     ne = n_expert_refs(cfg)

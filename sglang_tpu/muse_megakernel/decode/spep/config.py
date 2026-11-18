@@ -2,6 +2,7 @@
 """The EP plans of one row-tiled step, 32 whole experts per rank: a2a (own rows R / tp behind
 two ragged all-to-alls) or gather (every row on every rank), and the scratch each adds."""
 
+import enum
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -21,7 +22,14 @@ from sglang_tpu.muse_megakernel.decode.spep.experts import (
     scale_group,
 )
 
-ARMS = ("a2a", "gather")
+
+class EPArm(enum.StrEnum):
+    """An EP decode program: every row on every rank, or own rows behind ragged all-to-alls."""
+
+    GATHER = "gather"
+    A2A = "a2a"
+
+
 TAB_ROWS = 32  # route.slot_tables' rows
 DN_TK, DN_TN = 2048, 1024  # a replicated pool / unpool tile: one fp4 expert-ring slot
 # TP's expert-section buffers the EP hooks drop (past SMEM capacity scalars spill into HBM)
@@ -83,20 +91,23 @@ def ep_mk_config(c: MKConfig) -> MKConfig:
 MIXED_GATHER_MAX_ROWS = 128
 
 
-def ep_arm(rows: int | None = None) -> str:
-    """The EP decode paradigm, SGLANG_TPU_MUSE_MK_EP_ARM: gather (EP, every row on every rank),
-    a2a (SP + EP, own rows behind ragged all-to-alls) or mixed (gather for steps of at most
-    MIXED_GATHER_MAX_ROWS rows, a2a above; both read the same EP weights). Read at trace time."""
-    arm = tpu_envs.SGLANG_TPU_MUSE_MK_EP_ARM.get()
-    if arm == "mixed":
+def ep_arm(rows: int | None = None) -> EPArm:
+    """The EP decode program for a step, from SGLANG_TPU_MUSE_MK_EP_ARM: gather, a2a, or mixed
+    (gather for steps of at most MIXED_GATHER_MAX_ROWS rows, a2a above; both read the same EP
+    weights). Read at trace time."""
+    setting = tpu_envs.SGLANG_TPU_MUSE_MK_EP_ARM.get()
+    if setting == "mixed":
         if rows is None:
             raise ValueError(
                 "SGLANG_TPU_MUSE_MK_EP_ARM=mixed picks the arm by the step's rows"
             )
-        return "gather" if rows <= MIXED_GATHER_MAX_ROWS else "a2a"
-    if arm not in ARMS:
-        raise ValueError(f"SGLANG_TPU_MUSE_MK_EP_ARM={arm!r}: a2a, gather or mixed")
-    return arm
+        return EPArm.GATHER if rows <= MIXED_GATHER_MAX_ROWS else EPArm.A2A
+    try:
+        return EPArm(setting)
+    except ValueError:
+        raise ValueError(
+            f"SGLANG_TPU_MUSE_MK_EP_ARM={setting!r}: a2a, gather or mixed"
+        ) from None
 
 
 def ep_plan(c: MKConfig, item_rows: int = 32) -> EPPlan:

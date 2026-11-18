@@ -30,11 +30,40 @@ from sglang_tpu.muse_megakernel.common.ep_layout import (
 _EXPERT_CHUNK = 4
 
 
-def mark_ep_layout(experts: torch.nn.Module) -> None:
+def convert_experts_to_ep(experts: torch.nn.Module, kind: str, chunk: int) -> None:
+    """Rewrite one layer's local whole experts to the EP layout in place (chunk: the
+    MKConfig's inter_local, I / tp)."""
+    if _is_ep_layout(experts):
+        raise NotImplementedError("experts already in the EP layout")
+    if kind == "fp4":
+        _fp4_to_ep(experts, chunk)
+    elif kind == "fp8":
+        _fp8_to_ep(experts, chunk)
+    else:
+        raise NotImplementedError(f"EP expert layout for {kind} experts")
+    _mark_ep_layout(experts)
+
+
+def ep_expert_refs(experts: torch.nn.Module) -> list[torch.Tensor]:
+    """(w13, w13_scale, w2, w2_scale) of converted experts, as decode/spep reads them."""
+    if not _is_ep_layout(experts):
+        raise NotImplementedError("experts not converted to the EP layout")
+    return [
+        experts.w13_weight,
+        experts.w13_weight_scale,
+        experts.w2_weight,
+        experts.w2_weight_scale,
+    ]
+
+
+# ===== Helpers =====
+
+
+def _mark_ep_layout(experts: torch.nn.Module) -> None:
     experts.__dict__["_tpu_muse_ep_layout"] = True
 
 
-def ep_layout(experts: torch.nn.Module) -> bool:
+def _is_ep_layout(experts: torch.nn.Module) -> bool:
     """Whether the experts hold the EP megakernel layout, which no native MoE reads."""
     return experts.__dict__.get("_tpu_muse_ep_layout", False)
 
@@ -121,29 +150,3 @@ def _fp8_to_ep(experts: torch.nn.Module, chunk: int) -> None:
     copy_or_rebind_param(experts, "w13_weight", new13.contiguous())
     copy_or_rebind_param(experts, "w13_weight_scale", s13.contiguous())
     copy_or_rebind_param(experts, "w2_weight_scale", s2)
-
-
-def convert_experts_to_ep(experts: torch.nn.Module, kind: str, chunk: int) -> None:
-    """Rewrite one layer's local whole experts to the EP layout in place (chunk: the
-    MKConfig's inter_local, I / tp)."""
-    if ep_layout(experts):
-        raise NotImplementedError("experts already in the EP layout")
-    if kind == "fp4":
-        _fp4_to_ep(experts, chunk)
-    elif kind == "fp8":
-        _fp8_to_ep(experts, chunk)
-    else:
-        raise NotImplementedError(f"EP expert layout for {kind} experts")
-    mark_ep_layout(experts)
-
-
-def ep_expert_refs(experts: torch.nn.Module) -> list[torch.Tensor]:
-    """(w13, w13_scale, w2, w2_scale) of converted experts, as decode/spep reads them."""
-    if not ep_layout(experts):
-        raise NotImplementedError("experts not converted to the EP layout")
-    return [
-        experts.w13_weight,
-        experts.w13_weight_scale,
-        experts.w2_weight,
-        experts.w2_weight_scale,
-    ]
