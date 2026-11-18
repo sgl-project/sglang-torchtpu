@@ -39,7 +39,7 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Wan2.2-T2V-A14B | T2V 1280x720, 81 frames, 40 steps | 8 | 115.6 s | 2.77 s | 4.0 s | 68.8 GB |
 | Wan2.2-I2V-A14B | I2V 624x624, 81 frames, 20 steps | 8 | 18.4 s | 0.730 s | 1.9 s | 64.3 GB |
 | LTX-2 | T2V+audio 1280x720, 121 frames, 40 steps | 8 | 27.2 s | 0.431 s | 7.4 s | 60.8 GB |
-| LingBot-World v2 14B | realtime I2V session 832x480, 12-frame chunks, 4 DMD steps | 8 | 2.07 s / chunk | — | — | 78.8 GB |
+| LingBot-World v2 14B | realtime I2V session 832x480, 12-frame chunks, 4 DMD steps | 8 | 0.85 s / chunk | — | — | 51.0 GB |
 | LingBot-World v2 14B | realtime I2V session 832x480, 12-frame chunks, 4 DMD steps | 1 | 4.09 s / chunk | — | — | 96.8 GB |
 
 
@@ -82,32 +82,26 @@ msgpack messages: an `init` request with the first frame, then each chunk's fram
 closes the session after `max_chunks`. `camera_actions` holds one list of keys per latent frame, three a chunk:
 
 ```python
-import asyncio
-
-import msgspec.msgpack
-import websockets
+import asyncio, msgspec.msgpack, websockets
 
 init = {"type": "init", "prompt": "A slow aerial orbit around a pastel floating island hotel in the open ocean",
         "first_frame": open("first_frame.png", "rb").read(), "size": "832x480", "fps": 16, "max_chunks": 8,
         "seed": 42, "generator_device": "cpu", "condition_inputs": {"camera_actions": [["w"]] * 6 + [[]] * 6}}
 
-
 async def session(url="ws://127.0.0.1:30000/v1/realtime_video/generate"):
     async with websockets.connect(url, max_size=None) as ws:
         await ws.send(msgspec.msgpack.encode(init))
-        header = None
-        async for message in ws:
-            if header is not None:  # the payload of a frame_batch_header
-                header = None
+        skip = False  # the binary payload after a frame_batch_header
+        async for raw in ws:
+            if skip:
+                skip = False
                 continue
-            message = msgspec.msgpack.decode(message)
-            if message["type"] == "frame_batch_header":
-                header = message
-            elif message["type"] == "chunk_stats":
+            message = msgspec.msgpack.decode(raw)
+            skip = message["type"] == "frame_batch_header"
+            if message["type"] == "chunk_stats":
                 print(message["chunk_index"], message["scheduler_forward_ms"])
             elif message["type"] == "error":
                 raise RuntimeError(message["content"])
-
 
 asyncio.run(session())
 ```
